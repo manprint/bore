@@ -249,3 +249,46 @@ async fn many_concurrent_connections() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn tunnel_survives_aborted_connections() -> Result<()> {
+    // A burst of external connections that hang up immediately must not tear
+    // down the tunnel: a normal connection still has to work afterwards. Guards
+    // the server's accept loop staying alive through connection churn.
+    let _guard = SERIAL_GUARD.lock().await;
+
+    spawn_server(None).await;
+    let (listener, addr) = spawn_client(None).await?;
+
+    // Local echo service, tolerant of peers that close before sending.
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4];
+                if stream.read_exact(&mut buf).await.is_ok() {
+                    let _ = stream.write_all(&buf).await;
+                }
+                anyhow::Ok(())
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+
+    // Churn: connect then immediately drop, without sending anything.
+    for _ in 0..20 {
+        let s = TcpStream::connect(addr).await?;
+        drop(s);
+    }
+    time::sleep(Duration::from_millis(100)).await;
+
+    // The tunnel must still serve a normal request.
+    let mut stream = TcpStream::connect(addr).await?;
+    stream.write_all(b"ping").await?;
+    let mut buf = [0u8; 4];
+    stream.read_exact(&mut buf).await?;
+    assert_eq!(&buf, b"ping");
+
+    Ok(())
+}

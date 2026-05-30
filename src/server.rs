@@ -45,12 +45,12 @@ impl Server {
         }
     }
 
-    /// Set the IP address where tunnels will listen on.
+    /// Set the IP address where the control server will bind to.
     pub fn set_bind_addr(&mut self, bind_addr: IpAddr) {
         self.bind_addr = bind_addr;
     }
 
-    /// Set the IP address where the control server will bind to.
+    /// Set the IP address where tunnels will listen on.
     pub fn set_bind_tunnels(&mut self, bind_tunnels: IpAddr) {
         self.bind_tunnels = bind_tunnels;
     }
@@ -153,7 +153,19 @@ impl Server {
                     }
                     const TIMEOUT: Duration = Duration::from_millis(500);
                     if let Ok(result) = timeout(TIMEOUT, listener.accept()).await {
-                        let (stream2, addr) = result?;
+                        let (stream2, addr) = match result {
+                            Ok(pair) => pair,
+                            Err(err) => {
+                                // A transient accept error (e.g. EMFILE when the
+                                // process is out of file descriptors, or a peer
+                                // that reset before we accepted) must not tear
+                                // down the whole tunnel. Back off briefly to
+                                // avoid busy-spinning, then keep serving.
+                                warn!(%err, "failed to accept tunnel connection");
+                                sleep(Duration::from_millis(100)).await;
+                                continue;
+                            }
+                        };
                         let _ = stream2.set_nodelay(true);
                         info!(?addr, ?port, "new connection");
 

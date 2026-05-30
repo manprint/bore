@@ -70,7 +70,20 @@ proxied/control socket so middleboxes don't drop a long but quiet transfer
 - **`--max-conns`** bounds concurrently proxied connections via a semaphore; over the cap, new external connections are dropped. yamux's own stream limit is set generous so the semaphore is the real bound.
 - The control channel still caps JSON frames at `MAX_FRAME_LENGTH` (`very_long_frame` test).
 
-## Deployment
+## Deployment & builds
 
-- `Dockerfile` produces a static binary in a `scratch` image (AMD64), published per release.
-- Releases (binaries via `mean_bean_*` workflows, Docker via `docker.yml`) are tagged from version bumps in `Cargo.toml`.
+- `Dockerfile` produces a static (musl) binary in a `scratch` image. `build-base`
+  is installed so `ring` (TLS) compiles on Alpine.
+- **`justfile`** (`just --list`): `build-amd64`/`build-arm64` (Linux, via
+  `docker buildx --platform`), `macos-m5`/`windows-amd64` (via `cargo-zigbuild`,
+  `docker/Dockerfile.cross`), `android-arm64` (via the Android NDK,
+  `docker/Dockerfile.android` — zig can't build `ring` for Android). All write to
+  `./bin/` (gitignored). `push` builds + pushes a multi-arch (amd64+arm64) image;
+  set `repo`. `_builder` creates a docker-container buildx builder; `setup-qemu`
+  registers binfmt for arm64 emulation.
+- **`docker/docker-compose.{server,client,secret-proxy}.yml`**: ready-to-run
+  compose files. Server uses a bridge network with explicit port forwards
+  (control port + tunnel range; the scheme depends on the cert, not the port —
+  `80`=plain, `443`=TLS); client and secret-proxy use `network_mode: host`. All
+  env vars present (optional ones commented).
+- Upstream release machinery (`mean_bean_*` workflows, `docker.yml`) is unchanged.

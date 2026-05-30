@@ -71,6 +71,32 @@ We also publish versioned Docker images for each release. The image is built for
 docker run -it --init --rm --network host ekzhang/bore <ARGS>
 ```
 
+#### Docker Compose
+
+Ready-to-run compose files live in [`docker/`](docker/): `docker-compose.server.yml`
+(bridge network, control port + tunnel range forwarded explicitly),
+`docker-compose.client.yml` and `docker-compose.secret-proxy.yml` (host network).
+All environment variables are present (optional ones commented).
+
+```shell
+docker compose -f docker/docker-compose.server.yml up -d
+```
+
+### Building from source (cross-compilation)
+
+A [`justfile`](justfile) builds release binaries into `./bin/` via Docker for
+several targets (`just --list`):
+
+```shell
+just build-amd64       # Linux x86_64
+just build-arm64       # Linux aarch64
+just macos-m5          # macOS Apple Silicon (aarch64-apple-darwin)
+just windows-amd64     # Windows x86_64
+just android-arm64     # Android aarch64
+just build             # all of the above
+just push              # build + push a multi-arch (amd64+arm64) image to Docker Hub
+```
+
 ## Detailed Usage
 
 This section describes detailed usage for the `bore` CLI command.

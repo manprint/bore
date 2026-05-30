@@ -2,7 +2,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use bore_cli::{client::Client, server::Server, shared::CONTROL_PORT};
+use bore_cli::{
+    client::Client,
+    server::Server,
+    shared::{ClientMessage, Delimited, ServerMessage, CONTROL_PORT},
+};
 use lazy_static::lazy_static;
 use rstest::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,10 +19,27 @@ lazy_static! {
     static ref SERIAL_GUARD: Mutex<()> = Mutex::new(());
 }
 
-/// Spawn the server, giving some time for the control port TcpListener to start.
+/// Wait until the control port is either accepting connections (`listening`) or
+/// fully released. All tests share the fixed `CONTROL_PORT`, so this gates each
+/// test on a clean port state rather than racing a previous test's teardown.
+async fn wait_for_control_port(listening: bool) {
+    for _ in 0..500 {
+        if TcpStream::connect(("localhost", CONTROL_PORT))
+            .await
+            .is_ok()
+            == listening
+        {
+            return;
+        }
+        time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Spawn the server, waiting until the control port is actually accepting.
 async fn spawn_server(secret: Option<&str>) {
+    wait_for_control_port(false).await;
     tokio::spawn(Server::new(1024..=65535, secret).listen());
-    time::sleep(Duration::from_millis(50)).await;
+    wait_for_control_port(true).await;
 }
 
 /// Spawns a client with randomly assigned ports, returning the listener and remote address.
@@ -289,6 +310,61 @@ async fn tunnel_survives_aborted_connections() -> Result<()> {
     let mut buf = [0u8; 4];
     stream.read_exact(&mut buf).await?;
     assert_eq!(&buf, b"ping");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_connections_are_bounded() -> Result<()> {
+    // With a client that registers a tunnel but never accepts connections, a
+    // flood of external connections must be bounded: the server queues at most
+    // `max_conns` and drops the rest instead of growing memory without limit.
+    let _guard = SERIAL_GUARD.lock().await;
+
+    const MAX: usize = 5;
+    const EXTRA: usize = 20;
+
+    wait_for_control_port(false).await;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_max_conns(MAX);
+    tokio::spawn(server.listen());
+    wait_for_control_port(true).await;
+
+    // Raw control client: register a tunnel, then never send Accept.
+    let mut control = Delimited::new(TcpStream::connect(("localhost", CONTROL_PORT)).await?);
+    control.send(ClientMessage::Hello(0)).await?;
+    let port = match control.recv().await? {
+        Some(ServerMessage::Hello(port)) => port,
+        other => return Err(anyhow!("expected hello, got {other:?}")),
+    };
+
+    // Drain the control stream so the server's send side never blocks, but never
+    // reply with Accept — emulating a stalled client.
+    tokio::spawn(async move { while let Ok(Some(_)) = control.recv::<ServerMessage>().await {} });
+
+    // Flood the tunnel with more connections than the cap allows.
+    let mut socks = Vec::new();
+    for _ in 0..(MAX + EXTRA) {
+        socks.push(TcpStream::connect(("localhost", port)).await?);
+    }
+
+    // Excess connections (beyond MAX) must be closed by the server. Poll until
+    // at least EXTRA of them have observed EOF.
+    let mut closed = 0;
+    for _ in 0..40 {
+        closed = 0;
+        for s in &mut socks {
+            let mut buf = [0u8; 1];
+            if let Ok(Ok(0)) = time::timeout(Duration::from_millis(10), s.read(&mut buf)).await {
+                closed += 1; // EOF: server dropped this connection.
+            }
+        }
+        if closed >= EXTRA {
+            break;
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(closed >= EXTRA, "expected >= {EXTRA} dropped, got {closed}");
 
     Ok(())
 }

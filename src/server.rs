@@ -7,12 +7,18 @@ use anyhow::Result;
 use dashmap::DashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep, timeout};
 use tracing::{info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
 use crate::shared::{ClientMessage, Delimited, ServerMessage, CONTROL_PORT, PROXY_BUFFER_SIZE};
+
+/// Default cap on the number of accepted-but-not-yet-proxied connections held
+/// across all tunnels at once. Bounds memory and file-descriptor use under a
+/// connection flood. Overridable with `Server::set_max_conns`.
+pub const DEFAULT_MAX_CONNS: usize = 1024;
 
 /// State structure for the server.
 pub struct Server {
@@ -22,8 +28,13 @@ pub struct Server {
     /// Optional secret used to authenticate clients.
     auth: Option<Authenticator>,
 
-    /// Concurrent map of IDs to incoming connections.
-    conns: Arc<DashMap<Uuid, TcpStream>>,
+    /// Concurrent map of IDs to incoming connections. Each entry also holds a
+    /// semaphore permit that bounds the total number of pending connections; the
+    /// permit is released when the entry is removed (accepted or expired).
+    conns: Arc<DashMap<Uuid, (TcpStream, OwnedSemaphorePermit)>>,
+
+    /// Limits the number of pending connections held in `conns` at once.
+    conn_permits: Arc<Semaphore>,
 
     /// IP address where the control server will bind to.
     bind_addr: IpAddr,
@@ -39,10 +50,17 @@ impl Server {
         Server {
             port_range,
             conns: Arc::new(DashMap::new()),
+            conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
             auth: secret.map(Authenticator::new),
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             bind_tunnels: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         }
+    }
+
+    /// Set the maximum number of pending (accepted but not yet proxied)
+    /// connections held across all tunnels at once. See [`DEFAULT_MAX_CONNS`].
+    pub fn set_max_conns(&mut self, max_conns: usize) {
+        self.conn_permits = Arc::new(Semaphore::new(max_conns));
     }
 
     /// Set the IP address where the control server will bind to.
@@ -167,12 +185,24 @@ impl Server {
                             }
                         };
                         let _ = stream2.set_nodelay(true);
+
+                        // Bound the number of pending connections. If we are at
+                        // capacity, drop this connection rather than growing the
+                        // map unboundedly under a flood. The permit is released
+                        // when the entry is removed (accepted or expired).
+                        let permit = match Arc::clone(&self.conn_permits).try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                warn!(?addr, ?port, "too many pending connections, dropping");
+                                continue;
+                            }
+                        };
                         info!(?addr, ?port, "new connection");
 
                         let id = Uuid::new_v4();
                         let conns = Arc::clone(&self.conns);
 
-                        conns.insert(id, stream2);
+                        conns.insert(id, (stream2, permit));
                         tokio::spawn(async move {
                             // Remove stale entries to avoid memory leaks.
                             sleep(Duration::from_secs(10)).await;
@@ -187,7 +217,7 @@ impl Server {
             Some(ClientMessage::Accept(id)) => {
                 info!(%id, "forwarding connection");
                 match self.conns.remove(&id) {
-                    Some((_, mut stream2)) => {
+                    Some((_, (mut stream2, _permit))) => {
                         let mut parts = stream.into_parts();
                         debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
                         stream2.write_all(&parts.read_buf).await?;

@@ -4,48 +4,33 @@ on:
   push:
     branches:
       - main
+      - dev
   pull_request:
 
 jobs:
-  rust:
-    name: Build and Test
+  test:
+    name: Build, test & lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
+          components: rustfmt, clippy
 
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --all-features
+      - run: cargo test --all-features
 
-      - run: cargo test
-
-  rustfmt:
-    name: Rustfmt
+  audit:
+    name: Security audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions-rs/toolchain@v1
+      - uses: taiki-e/install-action@v2
         with:
-          profile: minimal
-          toolchain: stable
-          components: rustfmt
-
-      - run: cargo fmt -- --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          components: clippy
-
-      - run: cargo clippy -- -D warnings
+          tool: cargo-audit
+      - run: cargo audit

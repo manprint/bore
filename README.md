@@ -110,8 +110,16 @@ Options:
       --insecure               Skip TLS certificate verification [env: BORE_INSECURE=]
       --https                  Terminate TLS on the tunnel port [env: BORE_HTTPS=]
       --force-https            Redirect plain HTTP to https:// (requires --https) [env: BORE_FORCE_HTTPS=]
+      --auto-reconnect         Reconnect automatically with backoff if the connection drops [env: BORE_AUTO_RECONNECT=]
   -h, --help                   Print help
 ```
+
+#### Automatic reconnection
+
+Both `bore local` and `bore proxy` accept `--auto-reconnect`. When the connection
+fails to establish or drops, the client reconnects on its own with a capped
+exponential backoff of 1, 2, 4, 8, 16, 32 seconds, then every 32 seconds
+indefinitely; a successful connection resets the backoff.
 
 #### HTTPS on the tunnel port
 
@@ -220,6 +228,8 @@ Options:
   -t, --to <TO>                  Address of the remote server [env: BORE_SERVER=]
   -s, --secret <SECRET>          Optional secret for authentication [env: BORE_SECRET]
       --tcp-secret-id <ID>       Identifier of the secret tunnel to connect to [env: BORE_TCP_SECRET_ID=]
+      --insecure                 Skip TLS certificate verification [env: BORE_INSECURE=]
+      --auto-reconnect           Reconnect automatically with backoff if the connection drops [env: BORE_AUTO_RECONNECT=]
   -h, --help                     Print help
 ```
 

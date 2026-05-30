@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Context, Result};
-use bore_cli::{client::Client, secret::Proxy, server::Server, shared::TunnelOptions};
+use bore_cli::{client::Client, reconnect, secret::Proxy, server::Server, shared::TunnelOptions};
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -55,6 +55,10 @@ enum Command {
         /// --https). Raw TCP and https:// keep working.
         #[clap(long, requires = "https", env = "BORE_FORCE_HTTPS")]
         force_https: bool,
+
+        /// Reconnect automatically with backoff if the connection fails or drops.
+        #[clap(long, env = "BORE_AUTO_RECONNECT")]
+        auto_reconnect: bool,
     },
 
     /// Connects to a named secret tunnel and exposes it on a local port.
@@ -79,6 +83,10 @@ enum Command {
         /// Skip TLS certificate verification (for self-signed https:// servers).
         #[clap(long, env = "BORE_INSECURE")]
         insecure: bool,
+
+        /// Reconnect automatically with backoff if the connection fails or drops.
+        #[clap(long, env = "BORE_AUTO_RECONNECT")]
+        auto_reconnect: bool,
     },
 
     /// Runs the remote proxy server.
@@ -138,46 +146,63 @@ async fn run(command: Command) -> Result<()> {
             insecure,
             https,
             force_https,
-        } => {
-            let client = match tcp_secret_id {
-                Some(id) => {
-                    Client::new_secret_provider(
-                        &local_host,
-                        local_port,
-                        &to,
-                        &id,
-                        secret.as_deref(),
-                        insecure,
-                    )
-                    .await?
-                }
-                None => {
-                    let options = TunnelOptions { https, force_https };
-                    Client::new(
-                        &local_host,
-                        local_port,
-                        &to,
-                        port,
-                        secret.as_deref(),
-                        insecure,
-                        options,
-                    )
-                    .await?
-                }
-            };
-            client.listen().await?;
-        }
+            auto_reconnect,
+        } => match tcp_secret_id {
+            Some(id) => {
+                let connect = move || {
+                    let (local_host, to, id, secret) =
+                        (local_host.clone(), to.clone(), id.clone(), secret.clone());
+                    async move {
+                        Client::new_secret_provider(
+                            &local_host,
+                            local_port,
+                            &to,
+                            &id,
+                            secret.as_deref(),
+                            insecure,
+                        )
+                        .await
+                    }
+                };
+                reconnect::run(auto_reconnect, connect, serve_client).await?;
+            }
+            None => {
+                let options = TunnelOptions { https, force_https };
+                let connect = move || {
+                    let (local_host, to, secret) = (local_host.clone(), to.clone(), secret.clone());
+                    async move {
+                        Client::new(
+                            &local_host,
+                            local_port,
+                            &to,
+                            port,
+                            secret.as_deref(),
+                            insecure,
+                            options,
+                        )
+                        .await
+                    }
+                };
+                reconnect::run(auto_reconnect, connect, serve_client).await?;
+            }
+        },
         Command::Proxy {
             local_proxy_port,
             to,
             secret,
             tcp_secret_id,
             insecure,
+            auto_reconnect,
         } => {
             let bind_addr = parse_proxy_addr(&local_proxy_port)?;
-            let proxy =
-                Proxy::new(&to, bind_addr, &tcp_secret_id, secret.as_deref(), insecure).await?;
-            proxy.listen().await?;
+            let connect = move || {
+                let (to, tcp_secret_id, secret) =
+                    (to.clone(), tcp_secret_id.clone(), secret.clone());
+                async move {
+                    Proxy::new(&to, bind_addr, &tcp_secret_id, secret.as_deref(), insecure).await
+                }
+            };
+            reconnect::run(auto_reconnect, connect, serve_proxy).await?;
         }
         Command::Server {
             min_port,
@@ -225,6 +250,16 @@ async fn run(command: Command) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Run a connected client until its connection ends.
+async fn serve_client(client: Client) -> Result<()> {
+    client.listen().await
+}
+
+/// Run a connected proxy until its connection ends.
+async fn serve_proxy(proxy: Proxy) -> Result<()> {
+    proxy.listen().await
 }
 
 /// Parse a proxy bind address. A leading ":" (e.g. ":5555") binds all interfaces.

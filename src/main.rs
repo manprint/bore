@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Context, Result};
-use bore_cli::{client::Client, secret::Proxy, server::Server};
+use bore_cli::{client::Client, secret::Proxy, server::Server, shared::TunnelOptions};
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -45,6 +45,16 @@ enum Command {
         /// Skip TLS certificate verification (for self-signed https:// servers).
         #[clap(long, env = "BORE_INSECURE")]
         insecure: bool,
+
+        /// Terminate TLS on the tunnel port, so it is reachable over https://
+        /// (the server must have a certificate). Plain and raw access still work.
+        #[clap(long, env = "BORE_HTTPS")]
+        https: bool,
+
+        /// Redirect plain HTTP requests on the tunnel port to https:// (requires
+        /// --https). Raw TCP and https:// keep working.
+        #[clap(long, requires = "https", env = "BORE_FORCE_HTTPS")]
+        force_https: bool,
     },
 
     /// Connects to a named secret tunnel and exposes it on a local port.
@@ -126,6 +136,8 @@ async fn run(command: Command) -> Result<()> {
             secret,
             tcp_secret_id,
             insecure,
+            https,
+            force_https,
         } => {
             let client = match tcp_secret_id {
                 Some(id) => {
@@ -140,6 +152,7 @@ async fn run(command: Command) -> Result<()> {
                     .await?
                 }
                 None => {
+                    let options = TunnelOptions { https, force_https };
                     Client::new(
                         &local_host,
                         local_port,
@@ -147,6 +160,7 @@ async fn run(command: Command) -> Result<()> {
                         port,
                         secret.as_deref(),
                         insecure,
+                        options,
                     )
                     .await?
                 }

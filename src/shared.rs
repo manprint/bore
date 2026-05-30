@@ -27,14 +27,23 @@ pub const PROXY_BUFFER_SIZE: usize = 64 * 1024;
 /// Timeout for network connections and initial protocol messages.
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Per-tunnel options requested by the client for a public-port tunnel.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct TunnelOptions {
+    /// Terminate TLS on the tunnel port (the server must have a certificate).
+    pub https: bool,
+    /// Redirect plain HTTP requests on the tunnel port to `https://`.
+    pub force_https: bool,
+}
+
 /// A message from the client on the control substream.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
     /// Response to an authentication challenge from the server.
     Authenticate(String),
 
-    /// Initial client message specifying a port to forward.
-    Hello(u16),
+    /// Initial client message specifying a port to forward and its options.
+    Hello(u16, TunnelOptions),
 
     /// Register as the provider for a named secret tunnel (no public port).
     HelloSecret(String),

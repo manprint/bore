@@ -9,7 +9,9 @@ use tracing::{error, info, info_span, warn, Instrument};
 
 use crate::auth::Authenticator;
 use crate::mux;
-use crate::shared::{ClientMessage, Delimited, ServerMessage, NETWORK_TIMEOUT, PROXY_BUFFER_SIZE};
+use crate::shared::{
+    ClientMessage, Delimited, ServerMessage, TunnelOptions, NETWORK_TIMEOUT, PROXY_BUFFER_SIZE,
+};
 use crate::transport::{self, Endpoint};
 
 /// State structure for the client.
@@ -39,6 +41,7 @@ impl Client {
         port: u16,
         secret: Option<&str>,
         insecure: bool,
+        options: TunnelOptions,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
@@ -58,7 +61,7 @@ impl Client {
         // what announces the control substream (SYN) to the server. During
         // authentication the server speaks first, so without this the server would
         // never see the stream and both sides would deadlock.
-        control.send(ClientMessage::Hello(port)).await?;
+        control.send(ClientMessage::Hello(port, options)).await?;
         if let Some(secret) = secret {
             Authenticator::new(secret)
                 .client_handshake(&mut control)

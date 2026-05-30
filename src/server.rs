@@ -12,9 +12,12 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{info, info_span, trace, warn, Instrument};
 
 use crate::auth::Authenticator;
+use crate::edge;
 use crate::mux;
 use crate::secret::{self, Registry};
-use crate::shared::{ClientMessage, Delimited, ServerMessage, CONTROL_PORT, PROXY_BUFFER_SIZE};
+use crate::shared::{
+    ClientMessage, Delimited, ServerMessage, TunnelOptions, CONTROL_PORT, PROXY_BUFFER_SIZE,
+};
 
 /// Default cap on the number of concurrently proxied connections per tunnel
 /// connection. Bounds memory and file-descriptor use under a connection flood.
@@ -202,7 +205,9 @@ impl Server {
         }
 
         match request {
-            Some(ClientMessage::Hello(port)) => self.serve_tunnel(control, opener, port).await,
+            Some(ClientMessage::Hello(port, opts)) => {
+                self.serve_tunnel(control, opener, port, opts).await
+            }
             Some(ClientMessage::HelloSecret(id)) => {
                 secret::serve_provider(control, opener, self.providers.clone(), id).await
             }
@@ -231,7 +236,18 @@ impl Server {
         mut control: Delimited<mux::Stream>,
         opener: mux::Opener,
         port: u16,
+        opts: TunnelOptions,
     ) -> Result<()> {
+        // TLS termination on the tunnel port reuses the server's certificate.
+        if opts.https && self.tls.is_none() {
+            control
+                .send(ServerMessage::Error(
+                    "server has no TLS certificate configured".into(),
+                ))
+                .await?;
+            return Ok(());
+        }
+
         let listener = match self.create_listener(port).await {
             Ok(listener) => listener,
             Err(err) => {
@@ -241,7 +257,7 @@ impl Server {
         };
         let host = listener.local_addr()?.ip();
         let port = listener.local_addr()?.port();
-        info!(?host, ?port, "new client");
+        info!(?host, ?port, https = opts.https, "new client");
         control.send(ServerMessage::Hello(port)).await?;
 
         let mut heartbeat = interval(HEARTBEAT_INTERVAL);
@@ -255,7 +271,7 @@ impl Server {
                     }
                 }
                 result = listener.accept() => {
-                    let (mut stream2, addr) = match result {
+                    let (stream2, addr) = match result {
                         Ok(pair) => pair,
                         Err(err) => {
                             // A transient accept error (e.g. EMFILE when out of file
@@ -283,8 +299,22 @@ impl Server {
                     info!(?addr, ?port, "new connection");
 
                     let opener = opener.clone();
+                    let tls = self.tls.clone();
+                    let domain = self.bind_domain.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
+                        // Terminate TLS / handle redirects at the edge as needed.
+                        let mut edge =
+                            match edge::accept(stream2, opts, tls.as_ref(), port, domain.as_deref())
+                                .await
+                            {
+                                Ok(Some(edge)) => edge,
+                                Ok(None) => return, // redirected or closed at the edge
+                                Err(err) => {
+                                    trace!(%err, "edge handling failed");
+                                    return;
+                                }
+                            };
                         match opener.open().await {
                             Ok(mut stream) => {
                                 // Announce the lazily-opened substream so the client
@@ -294,7 +324,7 @@ impl Server {
                                     return;
                                 }
                                 let result = tokio::io::copy_bidirectional_with_sizes(
-                                    &mut stream2,
+                                    &mut edge,
                                     &mut stream,
                                     PROXY_BUFFER_SIZE,
                                     PROXY_BUFFER_SIZE,

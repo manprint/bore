@@ -42,7 +42,16 @@ async fn spawn_server(secret: Option<&str>) {
 async fn spawn_client(secret: Option<&str>) -> Result<(TcpListener, SocketAddr)> {
     let listener = TcpListener::bind("localhost:0").await?;
     let local_port = listener.local_addr()?.port();
-    let client = Client::new("localhost", local_port, "localhost", 0, secret, false).await?;
+    let client = Client::new(
+        "localhost",
+        local_port,
+        "localhost",
+        0,
+        secret,
+        false,
+        Default::default(),
+    )
+    .await?;
     let remote_addr = ([127, 0, 0, 1], client.remote_port()).into();
     tokio::spawn(client.listen());
     Ok((listener, remote_addr))
@@ -108,6 +117,7 @@ async fn invalid_address() -> Result<()> {
             0,
             use_secret.then_some("a secret"),
             false,
+            Default::default(),
         )
         .await
         {
@@ -349,7 +359,16 @@ async fn concurrent_connections_are_bounded() -> Result<()> {
         anyhow::Ok(())
     });
 
-    let client = Client::new("localhost", local_port, "localhost", 0, None, false).await?;
+    let client = Client::new(
+        "localhost",
+        local_port,
+        "localhost",
+        0,
+        None,
+        false,
+        Default::default(),
+    )
+    .await?;
     let addr: SocketAddr = ([127, 0, 0, 1], client.remote_port()).into();
     tokio::spawn(client.listen());
 

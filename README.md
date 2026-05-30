@@ -85,7 +85,13 @@ bore local 5000 --to bore.pub
 
 You can optionally pass in a `--port` option to pick a specific port on the remote to expose, although the command will fail if this port is not available. Also, passing `--local-host` allows you to expose a different host on your local area network besides the loopback address `localhost`.
 
-The full options are shown below.
+The `--to` value selects the transport for the control connection:
+
+- `bore.pub` — plain TCP on the control port (default `7835`).
+- `bore.pub:1000` — plain TCP on an explicit control port.
+- `http://bore.tld` — plain TCP, default port `80`.
+- `https://bore.tld` — TLS, default port `443`. Use `--insecure` to accept a
+  self-signed server certificate.
 
 ```shell
 Starts a local proxy to the remote server
@@ -96,11 +102,13 @@ Arguments:
   <LOCAL_PORT>  The local port to expose [env: BORE_LOCAL_PORT=]
 
 Options:
-  -l, --local-host <HOST>  The local host to expose [default: localhost]
-  -t, --to <TO>            Address of the remote server to expose local ports to [env: BORE_SERVER=]
-  -p, --port <PORT>        Optional port on the remote server to select [default: 0]
-  -s, --secret <SECRET>    Optional secret for authentication [env: BORE_SECRET]
-  -h, --help               Print help
+  -l, --local-host <HOST>      The local host to expose [default: localhost]
+  -t, --to <TO>                Address of the remote server [env: BORE_SERVER=]
+  -p, --port <PORT>            Optional port on the remote server to select [default: 0]
+  -s, --secret <SECRET>        Optional secret for authentication [env: BORE_SECRET]
+      --tcp-secret-id <ID>     Register as a named secret tunnel [env: BORE_TCP_SECRET_ID=]
+      --insecure               Skip TLS certificate verification [env: BORE_INSECURE=]
+  -h, --help                   Print help
 ```
 
 ### Self-Hosting
@@ -115,7 +123,21 @@ That's all it takes! After the server starts running at a given address, you can
 
 It's possible to specify different IP addresses for the control server and for the tunnels. This setup is useful for cases where you might want the control server to be on a private network while allowing tunnel connections over a public interface, or vice versa.
 
-The full options for the `bore server` command are shown below.
+The control port defaults to `7835` but is configurable with `--control-port`; clients then connect with `--to host:port`.
+
+#### Serving over HTTPS/HTTP
+
+Pass a certificate and key to serve the control connection over TLS; clients connect with `https://`:
+
+```shell
+# HTTPS (clients: --to https://bore.tld)
+bore server --bind-domain bore.tld --cert-file /var/bore/cert.pem --key-file /var/bore/key.pem
+
+# Plain HTTP addressing, no TLS (clients: --to http://bore.tld)
+bore server --bind-domain bore.tld
+```
+
+A self-signed certificate requires `--insecure` on the client. The full options:
 
 ```shell
 Runs the remote proxy server
@@ -126,6 +148,11 @@ Options:
       --min-port <MIN_PORT>          Minimum accepted TCP port number [env: BORE_MIN_PORT=] [default: 1024]
       --max-port <MAX_PORT>          Maximum accepted TCP port number [env: BORE_MAX_PORT=] [default: 65535]
   -s, --secret <SECRET>              Optional secret for authentication [env: BORE_SECRET]
+      --max-conns <MAX_CONNS>        Max concurrently proxied connections per client [env: BORE_MAX_CONNS=] [default: 1024]
+      --control-port <CONTROL_PORT>  TCP port the control connection listens on [env: BORE_CONTROL_PORT=] [default: 7835]
+      --bind-domain <BIND_DOMAIN>    Public domain advertised to clients [env: BORE_BIND_DOMAIN=]
+      --cert-file <CERT_FILE>        TLS certificate chain (PEM); with --key-file, serves HTTPS [env: BORE_CERT_FILE=]
+      --key-file <KEY_FILE>          TLS private key (PEM); with --cert-file, serves HTTPS [env: BORE_KEY_FILE=]
       --bind-addr <BIND_ADDR>        IP address to bind to, clients must reach this [default: 0.0.0.0]
       --bind-tunnels <BIND_TUNNELS>  IP address where tunnels will listen on, defaults to --bind-addr
   -h, --help                         Print help
@@ -172,7 +199,7 @@ Options:
 
 ## Protocol
 
-There is an implicit _control port_ at `7835`. The client opens a single TCP connection to it and [multiplexes](https://github.com/hashicorp/yamux/blob/master/spec.md) everything over that one connection. At initialization, the client opens a control stream and sends a "Hello" message asking to proxy a selected remote port. The server responds with an acknowledgement and begins listening for external TCP connections.
+There is a _control port_, `7835` by default (configurable with `--control-port`). The client opens a single connection to it — plain TCP, or TLS when reached via `https://` — and [multiplexes](https://github.com/hashicorp/yamux/blob/master/spec.md) everything over that one connection. At initialization, the client opens a control stream and sends a "Hello" message asking to proxy a selected remote port. The server responds with an acknowledgement and begins listening for external TCP connections.
 
 Whenever the server obtains a connection on the remote port, it opens a new multiplexed stream to the client over the existing connection, and proxies the external connection over it. This avoids a fresh TCP (and authentication) handshake per proxied connection. The number of concurrently proxied connections per client is bounded by `--max-conns`.
 

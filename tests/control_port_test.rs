@@ -39,7 +39,7 @@ async fn custom_control_port_round_trip() -> Result<()> {
 
     // Client reaches the server via "host:port" using the custom control port.
     let to = format!("localhost:{CTRL}");
-    let client = Client::new("localhost", local_port, &to, 0, Some("sec")).await?;
+    let client = Client::new("localhost", local_port, &to, 0, Some("sec"), false).await?;
     let tunnel_port = client.remote_port();
     tokio::spawn(client.listen());
 

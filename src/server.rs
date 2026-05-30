@@ -5,9 +5,10 @@ use std::{io, ops::RangeInclusive, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::{interval, sleep, MissedTickBehavior};
+use tokio_rustls::TlsAcceptor;
 use tracing::{info, info_span, trace, warn, Instrument};
 
 use crate::auth::Authenticator;
@@ -40,6 +41,12 @@ pub struct Server {
     /// TCP port the control listener binds to.
     control_port: u16,
 
+    /// TLS acceptor for the control connection; `None` means plain TCP.
+    tls: Option<TlsAcceptor>,
+
+    /// Public domain advertised for this server (informational).
+    bind_domain: Option<String>,
+
     /// IP address where the control server will bind to.
     bind_addr: IpAddr,
 
@@ -56,6 +63,8 @@ impl Server {
             conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
             providers: Registry::default(),
             control_port: CONTROL_PORT,
+            tls: None,
+            bind_domain: None,
             auth: secret.map(Authenticator::new),
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             bind_tunnels: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -65,6 +74,16 @@ impl Server {
     /// Set the TCP port the control listener binds to (default [`CONTROL_PORT`]).
     pub fn set_control_port(&mut self, control_port: u16) {
         self.control_port = control_port;
+    }
+
+    /// Enable TLS on the control connection using the given acceptor.
+    pub fn set_tls(&mut self, acceptor: TlsAcceptor) {
+        self.tls = Some(acceptor);
+    }
+
+    /// Set the public domain advertised for this server (informational).
+    pub fn set_bind_domain(&mut self, domain: String) {
+        self.bind_domain = Some(domain);
     }
 
     /// Set the maximum number of concurrently proxied connections held per client
@@ -87,7 +106,13 @@ impl Server {
     pub async fn listen(self) -> Result<()> {
         let this = Arc::new(self);
         let listener = TcpListener::bind((this.bind_addr, this.control_port)).await?;
-        info!(addr = ?this.bind_addr, port = this.control_port, "server listening");
+        info!(
+            addr = ?this.bind_addr,
+            port = this.control_port,
+            domain = ?this.bind_domain,
+            tls = this.tls.is_some(),
+            "server listening"
+        );
 
         loop {
             let (stream, addr) = listener.accept().await?;
@@ -96,10 +121,20 @@ impl Server {
             tokio::spawn(
                 async move {
                     info!("incoming connection");
-                    if let Err(err) = this.handle_connection(stream).await {
-                        warn!(%err, "connection exited with error");
-                    } else {
-                        info!("connection exited");
+                    // The TLS handshake (if any) runs here, off the accept path.
+                    let result = match &this.tls {
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(tls) => this.handle_connection(tls).await,
+                            Err(err) => {
+                                warn!(%err, "TLS handshake failed");
+                                return;
+                            }
+                        },
+                        None => this.handle_connection(stream).await,
+                    };
+                    match result {
+                        Ok(_) => info!("connection exited"),
+                        Err(err) => warn!(%err, "connection exited with error"),
                     }
                 }
                 .instrument(info_span!("control", ?addr)),
@@ -144,7 +179,7 @@ impl Server {
         }
     }
 
-    async fn handle_connection(&self, socket: TcpStream) -> Result<()> {
+    async fn handle_connection<S: mux::Transport>(&self, socket: S) -> Result<()> {
         // Multiplex everything over this single connection. The client opens the
         // control substream first; what it requests on it selects the role.
         let (opener, mut acceptor) = mux::server(socket);

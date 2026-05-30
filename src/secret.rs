@@ -173,8 +173,9 @@ impl Proxy {
         bind_addr: SocketAddr,
         tcp_secret_id: &str,
         secret: Option<&str>,
+        insecure: bool,
     ) -> Result<Self> {
-        let socket = transport::connect(&Endpoint::parse(to)).await?;
+        let socket = transport::connect(&Endpoint::parse(to), insecure).await?;
         let (opener, _acceptor) = mux::client(socket);
         let mut control = Delimited::new(
             opener

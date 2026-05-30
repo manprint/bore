@@ -14,13 +14,17 @@ use std::future::poll_fn;
 use std::io;
 use std::task::Poll;
 
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use yamux::{Config, Connection, Mode};
 
 /// A multiplexed substream exposing Tokio's async I/O traits.
 pub type Stream = Compat<yamux::Stream>;
+
+/// Any byte stream `yamux` can run over (a plain TCP socket, a TLS stream, ...).
+pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for T {}
 
 /// Readiness marker the substream opener writes immediately after opening.
 ///
@@ -29,9 +33,6 @@ pub type Stream = Compat<yamux::Stream>;
 /// payload flows (the local service may speak first), so the opener writes this
 /// byte to announce the substream, and the acceptor consumes it before splicing.
 pub const STREAM_READY: u8 = 0;
-
-/// The TCP socket wrapped for `yamux`, which expects `futures` I/O traits.
-type Socket = Compat<TcpStream>;
 
 /// Generous cap on concurrent substreams. The meaningful bound on proxied
 /// connections is enforced by the server's `--max-conns` semaphore; this only
@@ -79,16 +80,16 @@ impl Acceptor {
 }
 
 /// Start multiplexing as the connection initiator (dialer).
-pub fn client(socket: TcpStream) -> (Opener, Acceptor) {
+pub fn client<S: Transport>(socket: S) -> (Opener, Acceptor) {
     spawn_driver(Connection::new(socket.compat(), config(), Mode::Client))
 }
 
 /// Start multiplexing as the connection responder (listener).
-pub fn server(socket: TcpStream) -> (Opener, Acceptor) {
+pub fn server<S: Transport>(socket: S) -> (Opener, Acceptor) {
     spawn_driver(Connection::new(socket.compat(), config(), Mode::Server))
 }
 
-fn spawn_driver(conn: Connection<Socket>) -> (Opener, Acceptor) {
+fn spawn_driver<S: Transport>(conn: Connection<Compat<S>>) -> (Opener, Acceptor) {
     let (open_tx, open_rx) = mpsc::channel(32);
     let (inbound_tx, inbound_rx) = mpsc::channel(32);
     tokio::spawn(drive(conn, open_rx, inbound_tx));
@@ -106,8 +107,8 @@ fn spawn_driver(conn: Connection<Socket>) -> (Opener, Acceptor) {
 /// while the connection is polled, and every poll method needs `&mut`. So all of
 /// it happens in one task, interleaving outbound-open requests with the inbound
 /// driver inside a single `poll_fn`.
-async fn drive(
-    mut conn: Connection<Socket>,
+async fn drive<S: Transport>(
+    mut conn: Connection<Compat<S>>,
     mut open_rx: mpsc::Receiver<oneshot::Sender<io::Result<Stream>>>,
     inbound_tx: mpsc::Sender<Stream>,
 ) {

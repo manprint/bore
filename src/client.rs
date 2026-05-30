@@ -38,9 +38,10 @@ impl Client {
         to: &str,
         port: u16,
         secret: Option<&str>,
+        insecure: bool,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
-        let socket = transport::connect(&endpoint).await?;
+        let socket = transport::connect(&endpoint, insecure).await?;
         let (opener, acceptor) = mux::client(socket);
 
         // The control substream carries the handshake and heartbeats. It is the
@@ -95,8 +96,9 @@ impl Client {
         to: &str,
         tcp_secret_id: &str,
         secret: Option<&str>,
+        insecure: bool,
     ) -> Result<Self> {
-        let socket = transport::connect(&Endpoint::parse(to)).await?;
+        let socket = transport::connect(&Endpoint::parse(to), insecure).await?;
         let (opener, acceptor) = mux::client(socket);
         let mut control = Delimited::new(
             opener

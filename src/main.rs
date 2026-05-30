@@ -41,6 +41,10 @@ enum Command {
         /// id. When set, --port is ignored.
         #[clap(long, env = "BORE_TCP_SECRET_ID")]
         tcp_secret_id: Option<String>,
+
+        /// Skip TLS certificate verification (for self-signed https:// servers).
+        #[clap(long, env = "BORE_INSECURE")]
+        insecure: bool,
     },
 
     /// Connects to a named secret tunnel and exposes it on a local port.
@@ -61,6 +65,10 @@ enum Command {
         /// Identifier of the secret tunnel to connect to (must match the provider).
         #[clap(long, env = "BORE_TCP_SECRET_ID")]
         tcp_secret_id: String,
+
+        /// Skip TLS certificate verification (for self-signed https:// servers).
+        #[clap(long, env = "BORE_INSECURE")]
+        insecure: bool,
     },
 
     /// Runs the remote proxy server.
@@ -85,6 +93,18 @@ enum Command {
         #[clap(long, default_value_t = bore_cli::shared::CONTROL_PORT, env = "BORE_CONTROL_PORT")]
         control_port: u16,
 
+        /// Public domain advertised to clients (informational).
+        #[clap(long, env = "BORE_BIND_DOMAIN")]
+        bind_domain: Option<String>,
+
+        /// Path to a TLS certificate chain (PEM). With --key-file, serves HTTPS.
+        #[clap(long, env = "BORE_CERT_FILE")]
+        cert_file: Option<String>,
+
+        /// Path to the TLS private key (PEM). With --cert-file, serves HTTPS.
+        #[clap(long, env = "BORE_KEY_FILE")]
+        key_file: Option<String>,
+
         /// IP address to bind to, clients must reach this.
         #[clap(long, default_value = "0.0.0.0")]
         bind_addr: IpAddr,
@@ -105,6 +125,7 @@ async fn run(command: Command) -> Result<()> {
             port,
             secret,
             tcp_secret_id,
+            insecure,
         } => {
             let client = match tcp_secret_id {
                 Some(id) => {
@@ -114,10 +135,21 @@ async fn run(command: Command) -> Result<()> {
                         &to,
                         &id,
                         secret.as_deref(),
+                        insecure,
                     )
                     .await?
                 }
-                None => Client::new(&local_host, local_port, &to, port, secret.as_deref()).await?,
+                None => {
+                    Client::new(
+                        &local_host,
+                        local_port,
+                        &to,
+                        port,
+                        secret.as_deref(),
+                        insecure,
+                    )
+                    .await?
+                }
             };
             client.listen().await?;
         }
@@ -126,9 +158,11 @@ async fn run(command: Command) -> Result<()> {
             to,
             secret,
             tcp_secret_id,
+            insecure,
         } => {
             let bind_addr = parse_proxy_addr(&local_proxy_port)?;
-            let proxy = Proxy::new(&to, bind_addr, &tcp_secret_id, secret.as_deref()).await?;
+            let proxy =
+                Proxy::new(&to, bind_addr, &tcp_secret_id, secret.as_deref(), insecure).await?;
             proxy.listen().await?;
         }
         Command::Server {
@@ -137,6 +171,9 @@ async fn run(command: Command) -> Result<()> {
             secret,
             max_conns,
             control_port,
+            bind_domain,
+            cert_file,
+            key_file,
             bind_addr,
             bind_tunnels,
         } => {
@@ -149,6 +186,24 @@ async fn run(command: Command) -> Result<()> {
             let mut server = Server::new(port_range, secret.as_deref());
             server.set_max_conns(max_conns);
             server.set_control_port(control_port);
+            if let Some(domain) = bind_domain {
+                server.set_bind_domain(domain);
+            }
+            match (cert_file, key_file) {
+                (Some(cert), Some(key)) => {
+                    let acceptor = bore_cli::transport::load_server_tls(&cert, &key)?;
+                    server.set_tls(acceptor);
+                }
+                (None, None) => {}
+                _ => {
+                    Args::command()
+                        .error(
+                            ErrorKind::ArgumentConflict,
+                            "--cert-file and --key-file must be provided together",
+                        )
+                        .exit();
+                }
+            }
             server.set_bind_addr(bind_addr);
             server.set_bind_tunnels(bind_tunnels.unwrap_or(bind_addr));
             server.listen().await?;

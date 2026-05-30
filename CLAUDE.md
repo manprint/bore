@@ -29,17 +29,18 @@ CI (`.github/workflows/ci.yml`) runs three separate jobs: build+test, `cargo fmt
 
 ## Architecture
 
-The client and server share **one** long-lived TCP connection (on `CONTROL_PORT = 7835`) and multiplex everything over it with yamux. There is no longer a separate TCP connection (or auth handshake) per proxied connection.
+The client and server share **one** long-lived connection (on the control port, `7835` by default, `--control-port` to change) and multiplex everything over it with yamux. The connection is plain TCP, or TLS when the client's `--to` is an `https://` URL. There is no longer a separate connection (or auth handshake) per proxied connection.
 
 Modules under `src/`:
 
 - **`shared.rs`** — control-channel protocol. `ClientMessage`/`ServerMessage` enums (serde JSON) and the `Delimited<U>` transport (null-byte-delimited JSON frames via `AnyDelimiterCodec`). Constants `CONTROL_PORT`, `MAX_FRAME_LENGTH = 256`, `NETWORK_TIMEOUT = 3s`, `PROXY_BUFFER_SIZE = 64 KiB`.
-- **`mux.rs`** — yamux wrapper. `mux::client`/`mux::server` spawn a single driver task that owns the `yamux::Connection` (its poll API needs `&mut`, so one owner only). `Opener::open()` requests outbound substreams over a channel; `Acceptor::accept()` yields inbound ones. `Stream` is `Compat<yamux::Stream>` (yamux is `futures`-IO; `tokio_util::compat` adapts it to Tokio traits).
+- **`mux.rs`** — yamux wrapper, generic over any `Transport` (the `AsyncRead+AsyncWrite+Unpin+Send+'static` blanket trait — TCP or TLS). `mux::client`/`mux::server` spawn a single driver task that owns the `yamux::Connection` (its poll API needs `&mut`, so one owner only). `Opener::open()` requests outbound substreams over a channel; `Acceptor::accept()` yields inbound ones. `Stream` is `Compat<yamux::Stream>` (yamux is `futures`-IO; `tokio_util::compat` adapts it to Tokio traits).
 - **`server.rs`** — `Server`: accepts the single connection, dispatches on the first control message into one of three roles (public-port tunnel, secret provider, secret consumer). Holds the `providers` registry and the `--max-conns` `Semaphore`.
 - **`client.rs`** — `Client`: dials the server, opens the control substream, accepts data substreams and splices each to a fresh local connection. `Client::new` = public-port mode; `Client::new_secret_provider` = secret-provider mode (shares `listen`/`handle_connection`).
 - **`secret.rs`** — named "secret" tunnels (no public port). Server-side `serve_provider` (register under id) / `serve_consumer` + `relay` (splice each consumer substream to a provider substream); `Registry = Arc<DashMap<id, mux::Opener>>`; and the consumer-side `Proxy` (`bore proxy`) which binds a local listener and opens one substream per local connection.
+- **`transport.rs`** — control-connection endpoint. `Endpoint::parse` turns `--to` into host/port/tls (`https://`→TLS:443, `http://`→plain:80, bare→plain:control-port; explicit `:port` overrides). `connect` dials and, for TLS, wraps with rustls (**ring** provider, for musl/scratch builds; `--insecure` skips verification, else webpki-roots). `ControlStream` is the plain-or-TLS enum (implements `mux::Transport`); `load_server_tls`/`server_tls_from_pem` build the server `TlsAcceptor`.
 - **`auth.rs`** — `Authenticator`: optional HMAC-SHA256 challenge/response, run **once** on the control substream.
-- **`main.rs`** — clap CLI (`local` / `proxy` / `server`). Flags also read env vars (`BORE_SERVER`, `BORE_SECRET`, `BORE_LOCAL_PORT`, `BORE_MIN_PORT`, `BORE_MAX_PORT`, `BORE_MAX_CONNS`, `BORE_TCP_SECRET_ID`, `BORE_LOCAL_PROXY_PORT`).
+- **`main.rs`** — clap CLI (`local` / `proxy` / `server`). Flags also read env vars (`BORE_SERVER`, `BORE_SECRET`, `BORE_LOCAL_PORT`, `BORE_MIN_PORT`, `BORE_MAX_PORT`, `BORE_MAX_CONNS`, `BORE_CONTROL_PORT`, `BORE_BIND_DOMAIN`, `BORE_CERT_FILE`, `BORE_KEY_FILE`, `BORE_INSECURE`, `BORE_TCP_SECRET_ID`, `BORE_LOCAL_PROXY_PORT`).
 
 ### Connection protocol (key flow to understand)
 

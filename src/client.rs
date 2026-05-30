@@ -10,7 +10,8 @@ use tracing::{error, info, info_span, warn, Instrument};
 use crate::auth::Authenticator;
 use crate::mux;
 use crate::shared::{
-    ClientMessage, Delimited, ServerMessage, TunnelOptions, NETWORK_TIMEOUT, PROXY_BUFFER_SIZE,
+    tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions, NETWORK_TIMEOUT,
+    PROXY_BUFFER_SIZE,
 };
 use crate::transport::{self, Endpoint};
 
@@ -206,8 +207,7 @@ pub(crate) async fn connect_with_timeout(to: &str, port: u16) -> Result<TcpStrea
         Err(err) => Err(err.into()),
     }
     .with_context(|| format!("could not connect to {to}:{port}"))?;
-    // Disable Nagle's algorithm: proxied traffic is latency-sensitive and we do
-    // our own buffering, so delaying small writes only adds latency.
-    stream.set_nodelay(true)?;
+    // TCP_NODELAY (latency) + keepalive (stability on long, quiet transfers).
+    tune_tcp(&stream);
     Ok(stream)
 }

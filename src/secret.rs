@@ -24,7 +24,7 @@ use tracing::{error, info, info_span, trace, warn, Instrument};
 
 use crate::auth::Authenticator;
 use crate::mux;
-use crate::shared::{ClientMessage, Delimited, ServerMessage, PROXY_BUFFER_SIZE};
+use crate::shared::{tune_tcp, ClientMessage, Delimited, ServerMessage, PROXY_BUFFER_SIZE};
 use crate::transport::{self, Endpoint};
 
 /// Heartbeat interval on secret-tunnel control substreams.
@@ -248,7 +248,7 @@ impl Proxy {
                             continue;
                         }
                     };
-                    let _ = local.set_nodelay(true);
+                    tune_tcp(&local);
                     let opener = opener.clone();
                     tokio::spawn(
                         async move {

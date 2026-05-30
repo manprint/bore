@@ -53,6 +53,15 @@ Modules under `src/`:
 
 **Secret tunnels** (role chosen by the first control message — `HelloSecret(id)` / `ConnectSecret(id)` instead of `Hello(port)`; ack is `ServerMessage::Ok`): the provider connection is registered in `providers[id]` and bound by no port. A consumer (`bore proxy`) opens one substream per local connection; the server reads its readiness marker, looks up the provider, opens a substream to it, and `copy_bidirectional`s the two substreams. Direction is inverted vs. the public-port path: here the **consumer opens** data substreams and the **server accepts** them.
 
+### Connection stability (long transfers)
+
+No timeout in the code closes an **established** data stream — `recv_timeout`/
+`connect_with_timeout`/the edge peek are all setup-only, and `copy_bidirectional`
+has no idle timeout. The mux carrier TCP is kept busy by the 500ms control
+heartbeat. `shared::tune_tcp` sets `TCP_NODELAY` + `SO_KEEPALIVE` (15s) on every
+proxied/control socket so middleboxes don't drop a long but quiet transfer
+(e.g. `tar | rclone rcat`). Apply `tune_tcp` to any new accepted/dialed socket.
+
 ### Things to preserve when editing
 
 - **Client sends `Hello` before authenticating.** yamux opens substreams *lazily* — the peer sees nothing until the opener writes. The server speaks first during auth, so if the client opened the control substream and waited to read, neither side would ever see it (deadlock). Sending `Hello` first is the eager write that announces the substream. The server still authenticates before binding any port.

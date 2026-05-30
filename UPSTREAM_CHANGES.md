@@ -147,6 +147,11 @@ Each bullet = one or more commits on `perf-hardening`.
 11. **Auto-reconnect** (`f73ee0a`, `1da7d4c`): `--auto-reconnect` for `local` and
     `proxy` with the backoff above. `reconnect.rs`.
 12. **Docker/justfile** (`a159bec`, `06ed233`, `3eaf109`): see below.
+13. **Connection stability / keepalive**: `shared::tune_tcp` (socket2) sets
+    `TCP_NODELAY` + `SO_KEEPALIVE` (15s idle/interval) on every accepted/dialed
+    socket (client/server control, public tunnel external socket, secret-proxy
+    local socket, local dial). No code path times out an established data
+    stream; this protects long, quiet transfers from middlebox idle-drops.
 
 ## CLI flags & env vars (all flags read env where present)
 

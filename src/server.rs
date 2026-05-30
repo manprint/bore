@@ -16,7 +16,8 @@ use crate::edge;
 use crate::mux;
 use crate::secret::{self, Registry};
 use crate::shared::{
-    ClientMessage, Delimited, ServerMessage, TunnelOptions, CONTROL_PORT, PROXY_BUFFER_SIZE,
+    tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions, CONTROL_PORT,
+    PROXY_BUFFER_SIZE,
 };
 
 /// Default cap on the number of concurrently proxied connections per tunnel
@@ -119,7 +120,7 @@ impl Server {
 
         loop {
             let (stream, addr) = listener.accept().await?;
-            let _ = stream.set_nodelay(true);
+            tune_tcp(&stream);
             let this = Arc::clone(&this);
             tokio::spawn(
                 async move {
@@ -283,7 +284,7 @@ impl Server {
                             continue;
                         }
                     };
-                    let _ = stream2.set_nodelay(true);
+                    tune_tcp(&stream2);
 
                     // Bound the number of concurrently proxied connections. At
                     // capacity, drop the connection rather than exhausting memory

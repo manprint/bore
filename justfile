@@ -1,10 +1,15 @@
 # Docker Hub repository to build and push. Edit to your own namespace.
-repo := "yourusername/bore"
-tag := "latest"
+repo := "fabiop85/bore"
+tag := "dev-opus-48"
 
 # Dedicated buildx builder. The docker-container driver is required both for
 # writing build outputs to the filesystem and for multi-arch images.
 builder := "bore-builder"
+
+# Apple Silicon target CPU for the macOS build. Current Rust/LLVM toolchains do
+# not yet know "apple-m5", so this uses the newest available CPU (M-series
+# optimizations); bump to "apple-m5" once your toolchain supports it.
+macos_target_cpu := "apple-m4"
 
 # Show the available recipes.
 default:
@@ -35,8 +40,31 @@ build-arm64: _builder
     mv bin/bore bin/bore-arm64
     @echo "built -> bin/bore-arm64"
 
-# Build both architecture binaries.
-build: build-amd64 build-arm64
+# Build the macOS Apple Silicon binary into ./bin/bore-macos-arm64 (cross via zig).
+macos-m5: _builder
+    mkdir -p bin
+    docker buildx build --builder {{builder}} \
+        -f docker/Dockerfile.cross \
+        --build-arg TARGET=aarch64-apple-darwin \
+        --build-arg BIN=bore \
+        --build-arg RUSTFLAGS="-C target-cpu={{macos_target_cpu}}" \
+        --output type=local,dest=bin .
+    mv bin/bore bin/bore-macos-arm64
+    @echo "built -> bin/bore-macos-arm64"
+
+# Build the Windows amd64 binary into ./bin/bore-windows-amd64.exe (cross via zig).
+windows-amd64: _builder
+    mkdir -p bin
+    docker buildx build --builder {{builder}} \
+        -f docker/Dockerfile.cross \
+        --build-arg TARGET=x86_64-pc-windows-gnu \
+        --build-arg BIN=bore.exe \
+        --output type=local,dest=bin .
+    mv bin/bore.exe bin/bore-windows-amd64.exe
+    @echo "built -> bin/bore-windows-amd64.exe"
+
+# Build all architecture binaries (Linux amd64/arm64, macOS, Windows).
+build: build-amd64 build-arm64 macos-m5 windows-amd64
 
 # Run `docker login` first and set `repo` above.
 # Build and push a multi-arch (amd64 + arm64) image to Docker Hub.

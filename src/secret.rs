@@ -23,9 +23,9 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info, info_span, trace, warn, Instrument};
 
 use crate::auth::Authenticator;
-use crate::client::connect_with_timeout;
 use crate::mux;
-use crate::shared::{ClientMessage, Delimited, ServerMessage, CONTROL_PORT, PROXY_BUFFER_SIZE};
+use crate::shared::{ClientMessage, Delimited, ServerMessage, PROXY_BUFFER_SIZE};
+use crate::transport::{self, Endpoint};
 
 /// Heartbeat interval on secret-tunnel control substreams.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
@@ -174,7 +174,7 @@ impl Proxy {
         tcp_secret_id: &str,
         secret: Option<&str>,
     ) -> Result<Self> {
-        let socket = connect_with_timeout(to, CONTROL_PORT).await?;
+        let socket = transport::connect(&Endpoint::parse(to)).await?;
         let (opener, _acceptor) = mux::client(socket);
         let mut control = Delimited::new(
             opener

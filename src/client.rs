@@ -9,9 +9,8 @@ use tracing::{error, info, info_span, warn, Instrument};
 
 use crate::auth::Authenticator;
 use crate::mux;
-use crate::shared::{
-    ClientMessage, Delimited, ServerMessage, CONTROL_PORT, NETWORK_TIMEOUT, PROXY_BUFFER_SIZE,
-};
+use crate::shared::{ClientMessage, Delimited, ServerMessage, NETWORK_TIMEOUT, PROXY_BUFFER_SIZE};
+use crate::transport::{self, Endpoint};
 
 /// State structure for the client.
 pub struct Client {
@@ -40,7 +39,8 @@ impl Client {
         port: u16,
         secret: Option<&str>,
     ) -> Result<Self> {
-        let socket = connect_with_timeout(to, CONTROL_PORT).await?;
+        let endpoint = Endpoint::parse(to);
+        let socket = transport::connect(&endpoint).await?;
         let (opener, acceptor) = mux::client(socket);
 
         // The control substream carries the handshake and heartbeats. It is the
@@ -73,7 +73,7 @@ impl Client {
             None => bail!("unexpected EOF"),
         };
         info!(remote_port, "connected to server");
-        info!("listening at {to}:{remote_port}");
+        info!("listening at {}:{remote_port}", endpoint.host);
 
         Ok(Client {
             control: Some(control),
@@ -96,7 +96,7 @@ impl Client {
         tcp_secret_id: &str,
         secret: Option<&str>,
     ) -> Result<Self> {
-        let socket = connect_with_timeout(to, CONTROL_PORT).await?;
+        let socket = transport::connect(&Endpoint::parse(to)).await?;
         let (opener, acceptor) = mux::client(socket);
         let mut control = Delimited::new(
             opener

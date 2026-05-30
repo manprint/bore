@@ -37,6 +37,9 @@ pub struct Server {
     /// Registry of named secret-tunnel providers, keyed by `tcp-secret-id`.
     providers: Registry,
 
+    /// TCP port the control listener binds to.
+    control_port: u16,
+
     /// IP address where the control server will bind to.
     bind_addr: IpAddr,
 
@@ -52,10 +55,16 @@ impl Server {
             port_range,
             conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
             providers: Registry::default(),
+            control_port: CONTROL_PORT,
             auth: secret.map(Authenticator::new),
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             bind_tunnels: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         }
+    }
+
+    /// Set the TCP port the control listener binds to (default [`CONTROL_PORT`]).
+    pub fn set_control_port(&mut self, control_port: u16) {
+        self.control_port = control_port;
     }
 
     /// Set the maximum number of concurrently proxied connections held per client
@@ -77,8 +86,8 @@ impl Server {
     /// Start the server, listening for new connections.
     pub async fn listen(self) -> Result<()> {
         let this = Arc::new(self);
-        let listener = TcpListener::bind((this.bind_addr, CONTROL_PORT)).await?;
-        info!(addr = ?this.bind_addr, "server listening");
+        let listener = TcpListener::bind((this.bind_addr, this.control_port)).await?;
+        info!(addr = ?this.bind_addr, port = this.control_port, "server listening");
 
         loop {
             let (stream, addr) = listener.accept().await?;

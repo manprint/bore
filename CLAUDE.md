@@ -35,10 +35,11 @@ Modules under `src/`:
 
 - **`shared.rs`** — control-channel protocol. `ClientMessage`/`ServerMessage` enums (serde JSON) and the `Delimited<U>` transport (null-byte-delimited JSON frames via `AnyDelimiterCodec`). Constants `CONTROL_PORT`, `MAX_FRAME_LENGTH = 256`, `NETWORK_TIMEOUT = 3s`, `PROXY_BUFFER_SIZE = 64 KiB`.
 - **`mux.rs`** — yamux wrapper. `mux::client`/`mux::server` spawn a single driver task that owns the `yamux::Connection` (its poll API needs `&mut`, so one owner only). `Opener::open()` requests outbound substreams over a channel; `Acceptor::accept()` yields inbound ones. `Stream` is `Compat<yamux::Stream>` (yamux is `futures`-IO; `tokio_util::compat` adapts it to Tokio traits).
-- **`server.rs`** — `Server`: accepts the single connection, allocates tunnel ports, opens one substream per external connection. A `Semaphore` (`--max-conns`) bounds concurrently proxied connections.
-- **`client.rs`** — `Client`: dials the server, opens the control substream, accepts data substreams and splices each to a fresh local connection.
+- **`server.rs`** — `Server`: accepts the single connection, dispatches on the first control message into one of three roles (public-port tunnel, secret provider, secret consumer). Holds the `providers` registry and the `--max-conns` `Semaphore`.
+- **`client.rs`** — `Client`: dials the server, opens the control substream, accepts data substreams and splices each to a fresh local connection. `Client::new` = public-port mode; `Client::new_secret_provider` = secret-provider mode (shares `listen`/`handle_connection`).
+- **`secret.rs`** — named "secret" tunnels (no public port). Server-side `serve_provider` (register under id) / `serve_consumer` + `relay` (splice each consumer substream to a provider substream); `Registry = Arc<DashMap<id, mux::Opener>>`; and the consumer-side `Proxy` (`bore proxy`) which binds a local listener and opens one substream per local connection.
 - **`auth.rs`** — `Authenticator`: optional HMAC-SHA256 challenge/response, run **once** on the control substream.
-- **`main.rs`** — clap CLI (`local` / `server`). Flags also read env vars (`BORE_SERVER`, `BORE_SECRET`, `BORE_LOCAL_PORT`, `BORE_MIN_PORT`, `BORE_MAX_PORT`, `BORE_MAX_CONNS`).
+- **`main.rs`** — clap CLI (`local` / `proxy` / `server`). Flags also read env vars (`BORE_SERVER`, `BORE_SECRET`, `BORE_LOCAL_PORT`, `BORE_MIN_PORT`, `BORE_MAX_PORT`, `BORE_MAX_CONNS`, `BORE_TCP_SECRET_ID`, `BORE_LOCAL_PROXY_PORT`).
 
 ### Connection protocol (key flow to understand)
 
@@ -46,6 +47,8 @@ Modules under `src/`:
 2. Server sends `Heartbeat` every 500ms on the control substream; if the send fails the client is gone and the tunnel (and its port) is torn down.
 3. For each external connection to the tunnel port, the server acquires a permit and opens a new **data** substream, writes a one-byte readiness marker (`mux::STREAM_READY`), and splices the external socket to the substream with `copy_bidirectional_with_sizes`.
 4. The client accepts the data substream, consumes the marker byte, dials the local service, and splices.
+
+**Secret tunnels** (role chosen by the first control message — `HelloSecret(id)` / `ConnectSecret(id)` instead of `Hello(port)`; ack is `ServerMessage::Ok`): the provider connection is registered in `providers[id]` and bound by no port. A consumer (`bore proxy`) opens one substream per local connection; the server reads its readiness marker, looks up the provider, opens a substream to it, and `copy_bidirectional`s the two substreams. Direction is inverted vs. the public-port path: here the **consumer opens** data substreams and the **server accepts** them.
 
 ### Things to preserve when editing
 

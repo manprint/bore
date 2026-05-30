@@ -131,11 +131,52 @@ Options:
   -h, --help                         Print help
 ```
 
+### Secret tunnels (no public port)
+
+Instead of exposing your service on a public port, you can publish it under a
+named _secret id_ and reach it only through a dedicated `bore proxy`. No port is
+allocated on the server — the entire path stays internal to the multiplexed
+connection.
+
+There are three machines:
+
+```shell
+# Machine A — the server (optionally with a shared secret)
+bore server --secret mysecret
+
+# Machine B — the service to expose (e.g. on port 8080). Registers the id, no
+# public port is opened on the server.
+bore local 8080 --to bore.tld --secret mysecret --tcp-secret-id my-8080-secret-service
+
+# Machine C — open the tunnel locally. Now localhost:5555 reaches B's service.
+bore proxy --to bore.tld --local-proxy-port :5555 --secret mysecret --tcp-secret-id my-8080-secret-service
+```
+
+`--local-proxy-port :5555` binds all interfaces (so other machines on C's network
+can reach it too); use `127.0.0.1:5555` to bind loopback only. The `--tcp-secret-id`
+on the proxy must match the one used by the provider. Each id may have a single
+provider at a time; a second registration of the same id is rejected.
+
+```shell
+Connects to a named secret tunnel and exposes it on a local port
+
+Usage: bore proxy [OPTIONS] --local-proxy-port <LOCAL_PROXY_PORT> --to <TO> --tcp-secret-id <TCP_SECRET_ID>
+
+Options:
+      --local-proxy-port <HOST>  Local address to listen on, e.g. ":5555" or "127.0.0.1:5555" [env: BORE_LOCAL_PROXY_PORT=]
+  -t, --to <TO>                  Address of the remote server [env: BORE_SERVER=]
+  -s, --secret <SECRET>          Optional secret for authentication [env: BORE_SECRET]
+      --tcp-secret-id <ID>       Identifier of the secret tunnel to connect to [env: BORE_TCP_SECRET_ID=]
+  -h, --help                     Print help
+```
+
 ## Protocol
 
 There is an implicit _control port_ at `7835`. The client opens a single TCP connection to it and [multiplexes](https://github.com/hashicorp/yamux/blob/master/spec.md) everything over that one connection. At initialization, the client opens a control stream and sends a "Hello" message asking to proxy a selected remote port. The server responds with an acknowledgement and begins listening for external TCP connections.
 
 Whenever the server obtains a connection on the remote port, it opens a new multiplexed stream to the client over the existing connection, and proxies the external connection over it. This avoids a fresh TCP (and authentication) handshake per proxied connection. The number of concurrently proxied connections per client is bounded by `--max-conns`.
+
+Secret tunnels reuse the same machinery without a public port. A provider (`bore local --tcp-secret-id`) registers its connection under the id; a consumer (`bore proxy`) opens a stream per local connection, and the server relays each one to the provider over a freshly opened stream — splicing the two multiplexed streams together internally.
 
 ## Authentication
 

@@ -108,7 +108,33 @@ Options:
   -s, --secret <SECRET>        Optional secret for authentication [env: BORE_SECRET]
       --tcp-secret-id <ID>     Register as a named secret tunnel [env: BORE_TCP_SECRET_ID=]
       --insecure               Skip TLS certificate verification [env: BORE_INSECURE=]
+      --https                  Terminate TLS on the tunnel port [env: BORE_HTTPS=]
+      --force-https            Redirect plain HTTP to https:// (requires --https) [env: BORE_FORCE_HTTPS=]
   -h, --help                   Print help
+```
+
+#### HTTPS on the tunnel port
+
+By default a tunnel port forwards raw TCP. With `--https`, the server terminates
+TLS on the tunnel port using its certificate, so the exposed service is reachable
+over `https://` — while plain `http://` and raw TCP keep working on the same port:
+
+```shell
+# Server has a certificate (see "Serving over HTTPS/HTTP" below).
+bore local 8080 --to https://bore.tld -p 9000 -s mysecret --https
+# -> https://bore.tld:9000   (TLS, terminated at the server)
+# -> http://bore.tld:9000    (plain)
+# -> bore.tld:9000           (raw TCP)
+```
+
+Add `--force-https` to redirect plain HTTP requests to `https://` (raw TCP and
+`https://` keep working):
+
+```shell
+bore local 8080 --to https://bore.tld -p 9000 -s mysecret --https --force-https
+# -> https://bore.tld:9000   (TLS)
+# -> http://bore.tld:9000    (308 redirect to https://bore.tld:9000)
+# -> bore.tld:9000           (raw TCP)
 ```
 
 ### Self-Hosting
@@ -204,6 +230,8 @@ There is a _control port_, `7835` by default (configurable with `--control-port`
 Whenever the server obtains a connection on the remote port, it opens a new multiplexed stream to the client over the existing connection, and proxies the external connection over it. This avoids a fresh TCP (and authentication) handshake per proxied connection. The number of concurrently proxied connections per client is bounded by `--max-conns`.
 
 Secret tunnels reuse the same machinery without a public port. A provider (`bore local --tcp-secret-id`) registers its connection under the id; a consumer (`bore proxy`) opens a stream per local connection, and the server relays each one to the provider over a freshly opened stream — splicing the two multiplexed streams together internally.
+
+When a tunnel sets `--https`, the server inspects the first bytes of each connection on the tunnel port: a TLS `ClientHello` is terminated with the server's certificate (and the decrypted stream forwarded), a plain HTTP request is redirected to `https://` if `--force-https` is set, and anything else is forwarded as raw TCP.
 
 ## Authentication
 

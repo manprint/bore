@@ -215,3 +215,66 @@ async fn tunnel_port_terminates_tls_and_keeps_plain() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn force_https_redirects_plain_http() -> Result<()> {
+    const PORT: u16 = 17904;
+    wait_port(PORT, false).await;
+
+    let (cert_pem, key_pem) = self_signed()?;
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+    let mut server = Server::new(1024..=65535, Some("sec"));
+    server.set_control_port(PORT);
+    server.set_tls(acceptor);
+    server.set_bind_domain("bore.tld".to_string());
+    tokio::spawn(server.listen());
+    wait_port(PORT, true).await;
+
+    let echo = echo_service_loop().await?;
+    let to = format!("https://localhost:{PORT}");
+    let options = TunnelOptions {
+        https: true,
+        force_https: true,
+    };
+    let client = Client::new("localhost", echo, &to, 0, Some("sec"), true, options).await?;
+    let tunnel = client.remote_port();
+    tokio::spawn(client.listen());
+
+    // 1) A plain HTTP request is answered with a 308 redirect to https://, keeping
+    //    the Host authority and the request path.
+    let mut http = TcpStream::connect(("127.0.0.1", tunnel)).await?;
+    let request = format!("GET /path?x=1 HTTP/1.1\r\nHost: example.com:{tunnel}\r\n\r\n");
+    http.write_all(request.as_bytes()).await?;
+    let mut buf = vec![0u8; 512];
+    let n = http.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.starts_with("HTTP/1.1 308"),
+        "expected 308 redirect, got: {response}"
+    );
+    assert!(
+        response.contains(&format!("Location: https://example.com:{tunnel}/path?x=1")),
+        "unexpected redirect target: {response}"
+    );
+
+    // 2) TLS still works on the same port.
+    let endpoint = Endpoint {
+        host: "127.0.0.1".to_string(),
+        port: tunnel,
+        tls: true,
+    };
+    let mut tls = transport::connect(&endpoint, true).await?;
+    tls.write_all(b"tls-ok").await?;
+    let mut buf = [0u8; 6];
+    tls.read_exact(&mut buf).await?;
+    assert_eq!(&buf, b"tls-ok");
+
+    // 3) Non-HTTP raw TCP is forwarded, not redirected.
+    let mut raw = TcpStream::connect(("127.0.0.1", tunnel)).await?;
+    raw.write_all(b"RAWDATA!").await?;
+    let mut buf = [0u8; 8];
+    raw.read_exact(&mut buf).await?;
+    assert_eq!(&buf, b"RAWDATA!");
+
+    Ok(())
+}

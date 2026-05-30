@@ -26,7 +26,10 @@ services:
     ports:
       - "7835:7835"            # control port
       - "6000-7000:6000-7000"  # tunnel port range
-      # - "443:7835"           # expose the control port over standard HTTPS
+      # Optionally expose the control port on a standard web port. The scheme is
+      # decided by the certificate, not the port:
+      # - "80:7835"            # plain HTTP (no cert/key set) -> clients use http://bore.tld
+      # - "443:7835"           # HTTPS (set BORE_CERT_FILE/BORE_KEY_FILE) -> clients use https://bore.tld
     environment:
       - BORE_SECRET=change-me
       - BORE_CONTROL_PORT=7835

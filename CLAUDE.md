@@ -29,30 +29,31 @@ CI (`.github/workflows/ci.yml`) runs three separate jobs: build+test, `cargo fmt
 
 ## Architecture
 
-Five modules under `src/`:
+The client and server share **one** long-lived TCP connection (on `CONTROL_PORT = 7835`) and multiplex everything over it with yamux. There is no longer a separate TCP connection (or auth handshake) per proxied connection.
 
-- **`shared.rs`** — the protocol. Defines `ClientMessage`/`ServerMessage` enums (serde JSON), the `Delimited<U>` transport (null-byte-delimited JSON frames over any `AsyncRead+AsyncWrite`, via `AnyDelimiterCodec`), and constants `CONTROL_PORT = 7835`, `MAX_FRAME_LENGTH = 256`, `NETWORK_TIMEOUT = 3s`. Start here to understand any change touching the wire format.
-- **`server.rs`** — `Server`: listens on the control port, manages a `DashMap<Uuid, TcpStream>` of pending incoming connections, allocates tunnel ports.
-- **`client.rs`** — `Client`: connects to the server, requests a port, and opens a fresh proxy stream per forwarded connection.
-- **`auth.rs`** — `Authenticator`: optional HMAC-SHA256 challenge/response handshake gating the control connection.
-- **`main.rs`** — clap CLI (`local` / `server` subcommands) wiring args into the library. All flags also read from env vars (`BORE_SERVER`, `BORE_SECRET`, `BORE_LOCAL_PORT`, `BORE_MIN_PORT`, `BORE_MAX_PORT`).
+Modules under `src/`:
+
+- **`shared.rs`** — control-channel protocol. `ClientMessage`/`ServerMessage` enums (serde JSON) and the `Delimited<U>` transport (null-byte-delimited JSON frames via `AnyDelimiterCodec`). Constants `CONTROL_PORT`, `MAX_FRAME_LENGTH = 256`, `NETWORK_TIMEOUT = 3s`, `PROXY_BUFFER_SIZE = 64 KiB`.
+- **`mux.rs`** — yamux wrapper. `mux::client`/`mux::server` spawn a single driver task that owns the `yamux::Connection` (its poll API needs `&mut`, so one owner only). `Opener::open()` requests outbound substreams over a channel; `Acceptor::accept()` yields inbound ones. `Stream` is `Compat<yamux::Stream>` (yamux is `futures`-IO; `tokio_util::compat` adapts it to Tokio traits).
+- **`server.rs`** — `Server`: accepts the single connection, allocates tunnel ports, opens one substream per external connection. A `Semaphore` (`--max-conns`) bounds concurrently proxied connections.
+- **`client.rs`** — `Client`: dials the server, opens the control substream, accepts data substreams and splices each to a fresh local connection.
+- **`auth.rs`** — `Authenticator`: optional HMAC-SHA256 challenge/response, run **once** on the control substream.
+- **`main.rs`** — clap CLI (`local` / `server`). Flags also read env vars (`BORE_SERVER`, `BORE_SECRET`, `BORE_LOCAL_PORT`, `BORE_MIN_PORT`, `BORE_MAX_PORT`, `BORE_MAX_CONNS`).
 
 ### Connection protocol (key flow to understand)
 
-The control connection is long-lived; each proxied TCP connection gets its own short-lived stream:
-
-1. Client opens control connection to `CONTROL_PORT`, optionally completes the auth handshake, then sends `Hello(port)` (port 0 = "any").
-2. Server binds a tunnel listener and replies `Hello(actual_port)`. For port 0, it probes up to 150 random ports in range (see the probability comment in `create_listener`).
-3. Server sends periodic `Heartbeat` (every 500ms) on the control connection to detect a dead client.
-4. On an external connection to the tunnel port, the server stores the stream in `conns` under a fresh `Uuid` and sends `Connection(uuid)` to the client. **Stored connections are dropped after 10s** if the client never accepts (prevents memory leaks).
-5. Client opens a *new* stream to the control port, (re-)authenticates, sends `Accept(uuid)`. The server matches the UUID, then `copy_bidirectional` splices the external stream to the client's stream.
+1. Client dials `CONTROL_PORT` and opens the **control** substream. It sends `Hello(port)` **first** (this matters — see below), then, if a secret is set, completes the auth challenge/response. Server replies `Hello(actual_port)` (port 0 ⇒ probe up to 150 random ports, see `create_listener`).
+2. Server sends `Heartbeat` every 500ms on the control substream; if the send fails the client is gone and the tunnel (and its port) is torn down.
+3. For each external connection to the tunnel port, the server acquires a permit and opens a new **data** substream, writes a one-byte readiness marker (`mux::STREAM_READY`), and splices the external socket to the substream with `copy_bidirectional_with_sizes`.
+4. The client accepts the data substream, consumes the marker byte, dials the local service, and splices.
 
 ### Things to preserve when editing
 
-- **Drain framed buffers before splicing.** Both `server.rs` and `client.rs` call `Delimited::into_parts()` and write the leftover `read_buf` to the peer before `copy_bidirectional`. Skipping this drops buffered bytes. There's a `debug_assert!` that `write_buf` is empty.
-- **Half-closed TCP must keep working.** `copy_bidirectional` (not a hand-rolled copy) is used deliberately so one direction closing doesn't tear down the other — covered by the `half_closed_tcp_stream` test.
-- **Frame length is capped** at `MAX_FRAME_LENGTH` to reject malicious oversized frames (`very_long_frame` test).
-- Auth, when enabled, runs on *every* control stream (initial Hello and each Accept), not just once.
+- **Client sends `Hello` before authenticating.** yamux opens substreams *lazily* — the peer sees nothing until the opener writes. The server speaks first during auth, so if the client opened the control substream and waited to read, neither side would ever see it (deadlock). Sending `Hello` first is the eager write that announces the substream. The server still authenticates before binding any port.
+- **The data substream's readiness marker is mandatory** for the same lazy-open reason: without it a connection whose local service speaks first (SSH/SMTP banners), or that sends no data, would never be established. Server writes `mux::STREAM_READY`; client reads exactly one byte before splicing.
+- **Half-closed streams must keep working** — `copy_bidirectional_with_sizes` propagates EOF/shutdown across the substream (regression tests: `half_closed_tcp_stream`, and `mux_*` in `tests/mux_test.rs`).
+- **`--max-conns`** bounds concurrently proxied connections via a semaphore; over the cap, new external connections are dropped. yamux's own stream limit is set generous so the semaphore is the real bound.
+- The control channel still caps JSON frames at `MAX_FRAME_LENGTH` (`very_long_frame` test).
 
 ## Deployment
 

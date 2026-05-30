@@ -2,11 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use bore_cli::{
-    client::Client,
-    server::Server,
-    shared::{ClientMessage, Delimited, ServerMessage, CONTROL_PORT},
-};
+use bore_cli::{client::Client, server::Server, shared::CONTROL_PORT};
 use lazy_static::lazy_static;
 use rstest::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -315,10 +311,11 @@ async fn tunnel_survives_aborted_connections() -> Result<()> {
 }
 
 #[tokio::test]
-async fn pending_connections_are_bounded() -> Result<()> {
-    // With a client that registers a tunnel but never accepts connections, a
-    // flood of external connections must be bounded: the server queues at most
-    // `max_conns` and drops the rest instead of growing memory without limit.
+async fn concurrent_connections_are_bounded() -> Result<()> {
+    // The local service holds every connection open without responding, so each
+    // proxied connection keeps its server permit. A flood beyond `max_conns` must
+    // then be dropped rather than growing memory and file descriptors without
+    // limit.
     let _guard = SERIAL_GUARD.lock().await;
 
     const MAX: usize = 5;
@@ -330,28 +327,36 @@ async fn pending_connections_are_bounded() -> Result<()> {
     tokio::spawn(server.listen());
     wait_for_control_port(true).await;
 
-    // Raw control client: register a tunnel, then never send Accept.
-    let mut control = Delimited::new(TcpStream::connect(("localhost", CONTROL_PORT)).await?);
-    control.send(ClientMessage::Hello(0)).await?;
-    let port = match control.recv().await? {
-        Some(ServerMessage::Hello(port)) => port,
-        other => return Err(anyhow!("expected hello, got {other:?}")),
-    };
+    // Local service that accepts and then holds connections open indefinitely.
+    let local = TcpListener::bind("localhost:0").await?;
+    let local_port = local.local_addr()?.port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (stream, _) = local.accept().await?;
+            held.push(stream); // keep alive, never read or write
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
 
-    // Drain the control stream so the server's send side never blocks, but never
-    // reply with Accept — emulating a stalled client.
-    tokio::spawn(async move { while let Ok(Some(_)) = control.recv::<ServerMessage>().await {} });
+    let client = Client::new("localhost", local_port, "localhost", 0, None).await?;
+    let addr: SocketAddr = ([127, 0, 0, 1], client.remote_port()).into();
+    tokio::spawn(client.listen());
 
-    // Flood the tunnel with more connections than the cap allows.
+    // Open more connections than the cap allows, nudging each so the server
+    // actually forwards it and takes a permit.
     let mut socks = Vec::new();
     for _ in 0..(MAX + EXTRA) {
-        socks.push(TcpStream::connect(("localhost", port)).await?);
+        let mut s = TcpStream::connect(addr).await?;
+        let _ = s.write_all(b"x").await;
+        socks.push(s);
     }
 
-    // Excess connections (beyond MAX) must be closed by the server. Poll until
+    // Excess connections (beyond MAX) must be dropped by the server. Poll until
     // at least EXTRA of them have observed EOF.
     let mut closed = 0;
-    for _ in 0..40 {
+    for _ in 0..60 {
         closed = 0;
         for s in &mut socks {
             let mut buf = [0u8; 1];

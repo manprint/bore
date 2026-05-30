@@ -27,7 +27,7 @@ pub const PROXY_BUFFER_SIZE: usize = 64 * 1024;
 /// Timeout for network connections and initial protocol messages.
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// A message from the client on the control connection.
+/// A message from the client on the control substream.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
     /// Response to an authentication challenge from the server.
@@ -35,12 +35,9 @@ pub enum ClientMessage {
 
     /// Initial client message specifying a port to forward.
     Hello(u16),
-
-    /// Accepts an incoming TCP connection, using this stream as a proxy.
-    Accept(Uuid),
 }
 
-/// A message from the server on the control connection.
+/// A message from the server on the control substream.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMessage {
     /// Authentication challenge, sent as the first message, if enabled.
@@ -51,9 +48,6 @@ pub enum ServerMessage {
 
     /// No-op used to test if the client is still reachable.
     Heartbeat,
-
-    /// Asks the client to accept a forwarded TCP connection.
-    Connection(Uuid),
 
     /// Indicates a server error that terminates the connection.
     Error(String),

@@ -4,21 +4,23 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::{io, ops::RangeInclusive, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use dashmap::DashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::time::{sleep, timeout};
-use tracing::{info, info_span, warn, Instrument};
-use uuid::Uuid;
+use tokio::sync::Semaphore;
+use tokio::time::{interval, sleep, MissedTickBehavior};
+use tracing::{info, info_span, trace, warn, Instrument};
 
 use crate::auth::Authenticator;
+use crate::mux;
 use crate::shared::{ClientMessage, Delimited, ServerMessage, CONTROL_PORT, PROXY_BUFFER_SIZE};
 
-/// Default cap on the number of accepted-but-not-yet-proxied connections held
-/// across all tunnels at once. Bounds memory and file-descriptor use under a
-/// connection flood. Overridable with `Server::set_max_conns`.
+/// Default cap on the number of concurrently proxied connections per tunnel
+/// connection. Bounds memory and file-descriptor use under a connection flood.
+/// Overridable with [`Server::set_max_conns`].
 pub const DEFAULT_MAX_CONNS: usize = 1024;
+
+/// Interval at which the server sends heartbeats to detect a dead client.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// State structure for the server.
 pub struct Server {
@@ -28,12 +30,7 @@ pub struct Server {
     /// Optional secret used to authenticate clients.
     auth: Option<Authenticator>,
 
-    /// Concurrent map of IDs to incoming connections. Each entry also holds a
-    /// semaphore permit that bounds the total number of pending connections; the
-    /// permit is released when the entry is removed (accepted or expired).
-    conns: Arc<DashMap<Uuid, (TcpStream, OwnedSemaphorePermit)>>,
-
-    /// Limits the number of pending connections held in `conns` at once.
+    /// Limits the number of concurrently proxied connections per client.
     conn_permits: Arc<Semaphore>,
 
     /// IP address where the control server will bind to.
@@ -49,7 +46,6 @@ impl Server {
         assert!(!port_range.is_empty(), "must provide at least one port");
         Server {
             port_range,
-            conns: Arc::new(DashMap::new()),
             conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
             auth: secret.map(Authenticator::new),
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -57,8 +53,8 @@ impl Server {
         }
     }
 
-    /// Set the maximum number of pending (accepted but not yet proxied)
-    /// connections held across all tunnels at once. See [`DEFAULT_MAX_CONNS`].
+    /// Set the maximum number of concurrently proxied connections held per client
+    /// connection at once. See [`DEFAULT_MAX_CONNS`].
     pub fn set_max_conns(&mut self, max_conns: usize) {
         self.conn_permits = Arc::new(Semaphore::new(max_conns));
     }
@@ -81,8 +77,6 @@ impl Server {
 
         loop {
             let (stream, addr) = listener.accept().await?;
-            // Latency-sensitive: this stream becomes either a control channel or,
-            // after an Accept, a proxied data stream. Best-effort, never fatal.
             let _ = stream.set_nodelay(true);
             let this = Arc::clone(&this);
             tokio::spawn(
@@ -136,104 +130,112 @@ impl Server {
         }
     }
 
-    async fn handle_connection(&self, stream: TcpStream) -> Result<()> {
-        let mut stream = Delimited::new(stream);
+    async fn handle_connection(&self, socket: TcpStream) -> Result<()> {
+        // Multiplex everything over this single connection. The client opens
+        // exactly one inbound substream, the control channel; the server opens an
+        // outbound substream for each forwarded connection.
+        let (opener, mut acceptor) = mux::server(socket);
+        let mut control = match acceptor.accept().await {
+            Some(stream) => Delimited::new(stream),
+            None => return Ok(()),
+        };
+
+        // The client sends Hello first (it must write to announce the lazily
+        // opened substream). The requested port is only acted on after auth.
+        let port = match control.recv_timeout().await? {
+            Some(ClientMessage::Hello(port)) => port,
+            Some(ClientMessage::Authenticate(_)) => {
+                warn!("unexpected authenticate");
+                return Ok(());
+            }
+            None => return Ok(()),
+        };
+
         if let Some(auth) = &self.auth {
-            if let Err(err) = auth.server_handshake(&mut stream).await {
+            if let Err(err) = auth.server_handshake(&mut control).await {
                 warn!(%err, "server handshake failed");
-                stream.send(ServerMessage::Error(err.to_string())).await?;
+                control.send(ServerMessage::Error(err.to_string())).await?;
                 return Ok(());
             }
         }
 
-        match stream.recv_timeout().await? {
-            Some(ClientMessage::Authenticate(_)) => {
-                warn!("unexpected authenticate");
-                Ok(())
+        let listener = match self.create_listener(port).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                control.send(ServerMessage::Error(err.into())).await?;
+                return Ok(());
             }
-            Some(ClientMessage::Hello(port)) => {
-                let listener = match self.create_listener(port).await {
-                    Ok(listener) => listener,
-                    Err(err) => {
-                        stream.send(ServerMessage::Error(err.into())).await?;
+        };
+        let host = listener.local_addr()?.ip();
+        let port = listener.local_addr()?.port();
+        info!(?host, ?port, "new client");
+        control.send(ServerMessage::Hello(port)).await?;
+
+        let mut heartbeat = interval(HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    if control.send(ServerMessage::Heartbeat).await.is_err() {
+                        // Assume that the client connection has been dropped.
                         return Ok(());
                     }
-                };
-                let host = listener.local_addr()?.ip();
-                let port = listener.local_addr()?.port();
-                info!(?host, ?port, "new client");
-                stream.send(ServerMessage::Hello(port)).await?;
+                }
+                result = listener.accept() => {
+                    let (mut stream2, addr) = match result {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            // A transient accept error (e.g. EMFILE when out of file
+                            // descriptors, or a peer that reset before we accepted)
+                            // must not tear down the whole tunnel. Back off briefly to
+                            // avoid busy-spinning, then keep serving.
+                            warn!(%err, "failed to accept tunnel connection");
+                            sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
+                    let _ = stream2.set_nodelay(true);
 
-                loop {
-                    if stream.send(ServerMessage::Heartbeat).await.is_err() {
-                        // Assume that the TCP connection has been dropped.
-                        return Ok(());
-                    }
-                    const TIMEOUT: Duration = Duration::from_millis(500);
-                    if let Ok(result) = timeout(TIMEOUT, listener.accept()).await {
-                        let (stream2, addr) = match result {
-                            Ok(pair) => pair,
-                            Err(err) => {
-                                // A transient accept error (e.g. EMFILE when the
-                                // process is out of file descriptors, or a peer
-                                // that reset before we accepted) must not tear
-                                // down the whole tunnel. Back off briefly to
-                                // avoid busy-spinning, then keep serving.
-                                warn!(%err, "failed to accept tunnel connection");
-                                sleep(Duration::from_millis(100)).await;
-                                continue;
+                    // Bound the number of concurrently proxied connections. At
+                    // capacity, drop the connection rather than exhausting memory
+                    // and file descriptors under a flood. The permit is released
+                    // when the proxied connection finishes.
+                    let permit = match Arc::clone(&self.conn_permits).try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            warn!(?addr, ?port, "too many active connections, dropping");
+                            continue;
+                        }
+                    };
+                    info!(?addr, ?port, "new connection");
+
+                    let opener = opener.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        match opener.open().await {
+                            Ok(mut stream) => {
+                                // Announce the lazily-opened substream so the client
+                                // dials the local service before any payload flows.
+                                if let Err(err) = stream.write_all(&[mux::STREAM_READY]).await {
+                                    trace!(%err, "failed to establish multiplexed stream");
+                                    return;
+                                }
+                                let result = tokio::io::copy_bidirectional_with_sizes(
+                                    &mut stream2,
+                                    &mut stream,
+                                    PROXY_BUFFER_SIZE,
+                                    PROXY_BUFFER_SIZE,
+                                )
+                                .await;
+                                if let Err(err) = result {
+                                    trace!(%err, "proxied connection closed");
+                                }
                             }
-                        };
-                        let _ = stream2.set_nodelay(true);
-
-                        // Bound the number of pending connections. If we are at
-                        // capacity, drop this connection rather than growing the
-                        // map unboundedly under a flood. The permit is released
-                        // when the entry is removed (accepted or expired).
-                        let permit = match Arc::clone(&self.conn_permits).try_acquire_owned() {
-                            Ok(permit) => permit,
-                            Err(_) => {
-                                warn!(?addr, ?port, "too many pending connections, dropping");
-                                continue;
-                            }
-                        };
-                        info!(?addr, ?port, "new connection");
-
-                        let id = Uuid::new_v4();
-                        let conns = Arc::clone(&self.conns);
-
-                        conns.insert(id, (stream2, permit));
-                        tokio::spawn(async move {
-                            // Remove stale entries to avoid memory leaks.
-                            sleep(Duration::from_secs(10)).await;
-                            if conns.remove(&id).is_some() {
-                                warn!(%id, "removed stale connection");
-                            }
-                        });
-                        stream.send(ServerMessage::Connection(id)).await?;
-                    }
+                            Err(err) => warn!(%err, "failed to open multiplexed stream"),
+                        }
+                    });
                 }
             }
-            Some(ClientMessage::Accept(id)) => {
-                info!(%id, "forwarding connection");
-                match self.conns.remove(&id) {
-                    Some((_, (mut stream2, _permit))) => {
-                        let mut parts = stream.into_parts();
-                        debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
-                        stream2.write_all(&parts.read_buf).await?;
-                        tokio::io::copy_bidirectional_with_sizes(
-                            &mut parts.io,
-                            &mut stream2,
-                            PROXY_BUFFER_SIZE,
-                            PROXY_BUFFER_SIZE,
-                        )
-                        .await?;
-                    }
-                    None => warn!(%id, "missing connection"),
-                }
-                Ok(())
-            }
-            None => Ok(()),
         }
     }
 }

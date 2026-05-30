@@ -50,7 +50,7 @@ enum Command {
         #[clap(short, long, env = "BORE_SECRET", hide_env_values = true)]
         secret: Option<String>,
 
-        /// Maximum number of pending connections buffered across all tunnels.
+        /// Maximum number of concurrently proxied connections per client.
         #[clap(long, default_value_t = bore_cli::server::DEFAULT_MAX_CONNS, env = "BORE_MAX_CONNS")]
         max_conns: usize,
 

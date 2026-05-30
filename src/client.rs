@@ -84,6 +84,57 @@ impl Client {
         })
     }
 
+    /// Create a client that registers as the provider of a named secret tunnel.
+    ///
+    /// Unlike [`Client::new`], no public port is allocated on the server: the
+    /// service is reached only through a `bore proxy` referencing the same
+    /// `tcp-secret-id`. The forwarding behaviour ([`Client::listen`]) is shared.
+    pub async fn new_secret_provider(
+        local_host: &str,
+        local_port: u16,
+        to: &str,
+        tcp_secret_id: &str,
+        secret: Option<&str>,
+    ) -> Result<Self> {
+        let socket = connect_with_timeout(to, CONTROL_PORT).await?;
+        let (opener, acceptor) = mux::client(socket);
+        let mut control = Delimited::new(
+            opener
+                .open()
+                .await
+                .context("failed to open control stream")?,
+        );
+
+        // Send the registration first so the lazily-opened substream is announced
+        // before the (server-initiated) auth handshake (see client `new`).
+        control
+            .send(ClientMessage::HelloSecret(tcp_secret_id.to_string()))
+            .await?;
+        if let Some(secret) = secret {
+            Authenticator::new(secret)
+                .client_handshake(&mut control)
+                .await?;
+        }
+        match control.recv_timeout().await? {
+            Some(ServerMessage::Ok) => {}
+            Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+            Some(ServerMessage::Challenge(_)) => {
+                bail!("server requires authentication, but no client secret was provided");
+            }
+            Some(_) => bail!("unexpected response to secret registration"),
+            None => bail!("unexpected EOF"),
+        }
+        info!(tcp_secret_id, "registered secret tunnel");
+
+        Ok(Client {
+            control: Some(control),
+            acceptor: Some(acceptor),
+            local_host: local_host.to_string(),
+            local_port,
+            remote_port: 0,
+        })
+    }
+
     /// Returns the port publicly available on the remote.
     pub fn remote_port(&self) -> u16 {
         self.remote_port
@@ -104,6 +155,7 @@ impl Client {
                         Some(ServerMessage::Error(err)) => error!(%err, "server error"),
                         Some(ServerMessage::Hello(_)) => warn!("unexpected hello"),
                         Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
+                        Some(ServerMessage::Ok) => warn!("unexpected ok"),
                         None => return Ok(()),
                     }
                 }
@@ -143,7 +195,7 @@ impl Client {
     }
 }
 
-async fn connect_with_timeout(to: &str, port: u16) -> Result<TcpStream> {
+pub(crate) async fn connect_with_timeout(to: &str, port: u16) -> Result<TcpStream> {
     let stream = match timeout(NETWORK_TIMEOUT, TcpStream::connect((to, port))).await {
         Ok(res) => res,
         Err(err) => Err(err.into()),

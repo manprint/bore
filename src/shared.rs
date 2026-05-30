@@ -35,6 +35,13 @@ pub enum ClientMessage {
 
     /// Initial client message specifying a port to forward.
     Hello(u16),
+
+    /// Register as the provider for a named secret tunnel (no public port).
+    HelloSecret(String),
+
+    /// Connect as a consumer of a named secret tunnel; data substreams opened on
+    /// this connection are routed to the matching provider.
+    ConnectSecret(String),
 }
 
 /// A message from the server on the control substream.
@@ -45,6 +52,10 @@ pub enum ServerMessage {
 
     /// Response to a client's initial message, with actual public port.
     Hello(u16),
+
+    /// Acknowledges a secret-tunnel registration ([`ClientMessage::HelloSecret`]
+    /// or [`ClientMessage::ConnectSecret`]).
+    Ok,
 
     /// No-op used to test if the client is still reachable.
     Heartbeat,

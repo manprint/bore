@@ -12,6 +12,7 @@ use tracing::{info, info_span, trace, warn, Instrument};
 
 use crate::auth::Authenticator;
 use crate::mux;
+use crate::secret::{self, Registry};
 use crate::shared::{ClientMessage, Delimited, ServerMessage, CONTROL_PORT, PROXY_BUFFER_SIZE};
 
 /// Default cap on the number of concurrently proxied connections per tunnel
@@ -33,6 +34,9 @@ pub struct Server {
     /// Limits the number of concurrently proxied connections per client.
     conn_permits: Arc<Semaphore>,
 
+    /// Registry of named secret-tunnel providers, keyed by `tcp-secret-id`.
+    providers: Registry,
+
     /// IP address where the control server will bind to.
     bind_addr: IpAddr,
 
@@ -47,6 +51,7 @@ impl Server {
         Server {
             port_range,
             conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
+            providers: Registry::default(),
             auth: secret.map(Authenticator::new),
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             bind_tunnels: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -131,25 +136,18 @@ impl Server {
     }
 
     async fn handle_connection(&self, socket: TcpStream) -> Result<()> {
-        // Multiplex everything over this single connection. The client opens
-        // exactly one inbound substream, the control channel; the server opens an
-        // outbound substream for each forwarded connection.
+        // Multiplex everything over this single connection. The client opens the
+        // control substream first; what it requests on it selects the role.
         let (opener, mut acceptor) = mux::server(socket);
         let mut control = match acceptor.accept().await {
             Some(stream) => Delimited::new(stream),
             None => return Ok(()),
         };
 
-        // The client sends Hello first (it must write to announce the lazily
-        // opened substream). The requested port is only acted on after auth.
-        let port = match control.recv_timeout().await? {
-            Some(ClientMessage::Hello(port)) => port,
-            Some(ClientMessage::Authenticate(_)) => {
-                warn!("unexpected authenticate");
-                return Ok(());
-            }
-            None => return Ok(()),
-        };
+        // The client sends its first message before authenticating (it must write
+        // to announce the lazily-opened substream; the server speaks first during
+        // auth). The request is only acted on once auth succeeds.
+        let request = control.recv_timeout().await?;
 
         if let Some(auth) = &self.auth {
             if let Err(err) = auth.server_handshake(&mut control).await {
@@ -159,6 +157,37 @@ impl Server {
             }
         }
 
+        match request {
+            Some(ClientMessage::Hello(port)) => self.serve_tunnel(control, opener, port).await,
+            Some(ClientMessage::HelloSecret(id)) => {
+                secret::serve_provider(control, opener, self.providers.clone(), id).await
+            }
+            Some(ClientMessage::ConnectSecret(id)) => {
+                secret::serve_consumer(
+                    control,
+                    acceptor,
+                    self.providers.clone(),
+                    self.conn_permits.clone(),
+                    id,
+                )
+                .await
+            }
+            Some(ClientMessage::Authenticate(_)) => {
+                warn!("unexpected authenticate");
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Serve a public-port tunnel: bind a remote port and forward each incoming
+    /// connection to the client over a fresh multiplexed substream.
+    async fn serve_tunnel(
+        &self,
+        mut control: Delimited<mux::Stream>,
+        opener: mux::Opener,
+        port: u16,
+    ) -> Result<()> {
         let listener = match self.create_listener(port).await {
             Ok(listener) => listener,
             Err(err) => {

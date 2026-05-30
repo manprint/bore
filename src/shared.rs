@@ -17,6 +17,13 @@ pub const CONTROL_PORT: u16 = 7835;
 /// Maximum byte length for a JSON frame in the stream.
 pub const MAX_FRAME_LENGTH: usize = 256;
 
+/// Per-direction buffer size used when proxying data between two TCP streams.
+///
+/// Larger than Tokio's 8 KiB default to improve throughput on connections with a
+/// high bandwidth-delay product, at a modest, bounded memory cost per proxied
+/// connection.
+pub const PROXY_BUFFER_SIZE: usize = 64 * 1024;
+
 /// Timeout for network connections and initial protocol messages.
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 

@@ -8,7 +8,9 @@ use tracing::{error, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
-use crate::shared::{ClientMessage, Delimited, ServerMessage, CONTROL_PORT, NETWORK_TIMEOUT};
+use crate::shared::{
+    ClientMessage, Delimited, ServerMessage, CONTROL_PORT, NETWORK_TIMEOUT, PROXY_BUFFER_SIZE,
+};
 
 /// State structure for the client.
 pub struct Client {
@@ -113,15 +115,25 @@ impl Client {
         let mut parts = remote_conn.into_parts();
         debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
         local_conn.write_all(&parts.read_buf).await?; // mostly of the cases, this will be empty
-        tokio::io::copy_bidirectional(&mut local_conn, &mut parts.io).await?;
+        tokio::io::copy_bidirectional_with_sizes(
+            &mut local_conn,
+            &mut parts.io,
+            PROXY_BUFFER_SIZE,
+            PROXY_BUFFER_SIZE,
+        )
+        .await?;
         Ok(())
     }
 }
 
 async fn connect_with_timeout(to: &str, port: u16) -> Result<TcpStream> {
-    match timeout(NETWORK_TIMEOUT, TcpStream::connect((to, port))).await {
+    let stream = match timeout(NETWORK_TIMEOUT, TcpStream::connect((to, port))).await {
         Ok(res) => res,
         Err(err) => Err(err.into()),
     }
-    .with_context(|| format!("could not connect to {to}:{port}"))
+    .with_context(|| format!("could not connect to {to}:{port}"))?;
+    // Disable Nagle's algorithm: proxied traffic is latency-sensitive and we do
+    // our own buffering, so delaying small writes only adds latency.
+    stream.set_nodelay(true)?;
+    Ok(stream)
 }

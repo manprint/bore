@@ -12,7 +12,7 @@ use tracing::{info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
-use crate::shared::{ClientMessage, Delimited, ServerMessage, CONTROL_PORT};
+use crate::shared::{ClientMessage, Delimited, ServerMessage, CONTROL_PORT, PROXY_BUFFER_SIZE};
 
 /// State structure for the server.
 pub struct Server {
@@ -63,6 +63,9 @@ impl Server {
 
         loop {
             let (stream, addr) = listener.accept().await?;
+            // Latency-sensitive: this stream becomes either a control channel or,
+            // after an Accept, a proxied data stream. Best-effort, never fatal.
+            let _ = stream.set_nodelay(true);
             let this = Arc::clone(&this);
             tokio::spawn(
                 async move {
@@ -151,6 +154,7 @@ impl Server {
                     const TIMEOUT: Duration = Duration::from_millis(500);
                     if let Ok(result) = timeout(TIMEOUT, listener.accept()).await {
                         let (stream2, addr) = result?;
+                        let _ = stream2.set_nodelay(true);
                         info!(?addr, ?port, "new connection");
 
                         let id = Uuid::new_v4();
@@ -175,7 +179,13 @@ impl Server {
                         let mut parts = stream.into_parts();
                         debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
                         stream2.write_all(&parts.read_buf).await?;
-                        tokio::io::copy_bidirectional(&mut parts.io, &mut stream2).await?;
+                        tokio::io::copy_bidirectional_with_sizes(
+                            &mut parts.io,
+                            &mut stream2,
+                            PROXY_BUFFER_SIZE,
+                            PROXY_BUFFER_SIZE,
+                        )
+                        .await?;
                     }
                     None => warn!(%id, "missing connection"),
                 }

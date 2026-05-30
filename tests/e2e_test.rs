@@ -162,3 +162,90 @@ async fn half_closed_tcp_stream() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn large_payload_transfer() -> Result<()> {
+    // Proxy a payload larger than any internal copy buffer, in both directions,
+    // and assert it arrives byte-for-byte intact. Guards against regressions in
+    // the bidirectional copy / buffer sizing.
+    let _guard = SERIAL_GUARD.lock().await;
+
+    spawn_server(None).await;
+    let (listener, addr) = spawn_client(None).await?;
+
+    const LEN: usize = 1 << 20; // 1 MiB, larger than the proxy copy buffers.
+    let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+
+    // Local service drains the full payload, then echoes it back.
+    let expected = payload.clone();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut buf = vec![0u8; LEN];
+        stream.read_exact(&mut buf).await?;
+        assert_eq!(buf, expected);
+        stream.write_all(&expected).await?;
+        anyhow::Ok(())
+    });
+
+    let mut stream = TcpStream::connect(addr).await?;
+    let (mut rd, mut wr) = stream.split();
+    let mut received = vec![0u8; LEN];
+    let writer = async {
+        wr.write_all(&payload).await?;
+        wr.shutdown().await?;
+        anyhow::Ok(())
+    };
+    let reader = async {
+        rd.read_exact(&mut received).await?;
+        anyhow::Ok(())
+    };
+    tokio::try_join!(writer, reader)?;
+    assert_eq!(received, payload);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn many_concurrent_connections() -> Result<()> {
+    // Drive many simultaneous proxied connections through a single tunnel and
+    // assert each one round-trips its own distinct message. Guards concurrency.
+    let _guard = SERIAL_GUARD.lock().await;
+
+    spawn_server(None).await;
+    let (listener, addr) = spawn_client(None).await?;
+
+    const N: u32 = 30;
+
+    // Local service: echo a 4-byte message for every incoming connection.
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4];
+                stream.read_exact(&mut buf).await?;
+                stream.write_all(&buf).await?;
+                anyhow::Ok(())
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+
+    let mut handles = Vec::new();
+    for i in 0..N {
+        handles.push(tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await?;
+            let msg = i.to_be_bytes();
+            stream.write_all(&msg).await?;
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await?;
+            assert_eq!(buf, msg);
+            anyhow::Ok(())
+        }));
+    }
+    for h in handles {
+        h.await??;
+    }
+
+    Ok(())
+}

@@ -1,0 +1,32 @@
+# bore client (`bore local`) — host network.
+#
+#   docker compose -f docker-compose.client.yml up -d
+#
+# Host networking lets the client reach services on the host's localhost and
+# avoids per-port forwarding.
+
+services:
+  bore-client:
+    image: ${BORE_IMAGE:-yourusername/bore:latest}
+    # build:
+    #   context: ..
+    #   dockerfile: Dockerfile
+    container_name: bore-client
+    command: ["local"]
+    # --port and --local-host have no env vars; set them in the command instead:
+    # command: ["local", "--port", "9000", "--local-host", "127.0.0.1"]
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - BORE_SERVER=bore.tld          # --to; may be http(s)://bore.tld[:port]
+      - BORE_LOCAL_PORT=8080          # local service port to expose
+      - BORE_SECRET=change-me
+      - BORE_AUTO_RECONNECT=true
+      # Register as a named secret tunnel (no public port; reach via bore proxy):
+      # - BORE_TCP_SECRET_ID=my-service
+      # Terminate TLS on the tunnel port (the server must have a certificate):
+      # - BORE_HTTPS=true
+      # Redirect plain HTTP on the tunnel port to https:// (requires BORE_HTTPS):
+      # - BORE_FORCE_HTTPS=true
+      # Accept a self-signed server certificate for an https:// control address:
+      # - BORE_INSECURE=true

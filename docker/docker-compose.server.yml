@@ -1,0 +1,43 @@
+# bore server — bridge network with explicit port forwarding.
+#
+#   docker compose -f docker-compose.server.yml up -d
+#
+# The image defaults to $BORE_IMAGE (see the justfile `repo`); override with
+#   BORE_IMAGE=youruser/bore:latest docker compose ... up -d
+
+networks:
+  bore:
+    driver: bridge
+
+services:
+  bore-server:
+    image: ${BORE_IMAGE:-yourusername/bore:latest}
+    # To build locally instead of pulling, comment `image:` and uncomment:
+    # build:
+    #   context: ..
+    #   dockerfile: Dockerfile
+    container_name: bore-server
+    command: ["server"]
+    restart: unless-stopped
+    networks:
+      - bore
+    # The control port and the tunnel port range must be forwarded explicitly,
+    # and MUST match BORE_CONTROL_PORT and BORE_MIN_PORT/BORE_MAX_PORT below.
+    ports:
+      - "7835:7835"            # control port
+      - "6000-7000:6000-7000"  # tunnel port range
+      # - "443:7835"           # expose the control port over standard HTTPS
+    environment:
+      - BORE_SECRET=change-me
+      - BORE_CONTROL_PORT=7835
+      - BORE_MIN_PORT=6000
+      - BORE_MAX_PORT=7000
+      - BORE_MAX_CONNS=1024
+      # Public domain advertised to clients (enables http(s):// addressing):
+      # - BORE_BIND_DOMAIN=bore.tld
+      # Serve the control connection over TLS (also used for --https tunnels);
+      # mount the files via the `volumes:` block below.
+      # - BORE_CERT_FILE=/certs/cert.pem
+      # - BORE_KEY_FILE=/certs/key.pem
+    # volumes:
+    #   - ./certs:/certs:ro

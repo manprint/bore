@@ -186,11 +186,14 @@ RUSTSEC-2025-0134) — PEM parsing uses `rustls-pki-types`.
   commented). `image: ${BORE_IMAGE:-yourusername/bore:latest}`.
 - `Dockerfile` (root): unchanged scratch/musl build, now also installs
   `build-base` so `ring` compiles on Alpine.
-- `docker/Dockerfile.cross`: `cargo-zigbuild` builder for non-Linux targets.
+- `docker/Dockerfile.cross`: `cargo-zigbuild` builder for non-Linux targets
+  (macOS, Windows). NOTE: zig cannot build `ring` for Android, so Android uses a
+  separate `docker/Dockerfile.android` with the Android NDK as the C toolchain.
 - `justfile` (repo `repo := "fabiop85/bore"`): `build-amd64`/`build-arm64`
   (Linux, `docker buildx --platform`), `macos-m5` (aarch64-apple-darwin) and
-  `windows-amd64` (x86_64-pc-windows-gnu) via `cargo-zigbuild`, all output to
-  `./bin/` (gitignored). `push` builds + pushes a multi-arch (amd64+arm64) image.
+  `windows-amd64` (x86_64-pc-windows-gnu) via `cargo-zigbuild`, and `android-arm64`
+  (aarch64-linux-android, via the NDK Dockerfile; `android_api` var), all output
+  to `./bin/` (gitignored). `push` builds + pushes a multi-arch (amd64+arm64) image.
   `_builder` creates a `docker-container` buildx builder; `setup-qemu` registers
   binfmt for arm64 emulation.
 

@@ -11,6 +11,9 @@ builder := "bore-builder"
 # optimizations); bump to "apple-m5" once your toolchain supports it.
 macos_target_cpu := "apple-m4"
 
+# Minimum Android API level for the android-arm64 build.
+android_api := "24"
+
 # Show the available recipes.
 default:
     @just --list
@@ -63,8 +66,18 @@ windows-amd64: _builder
     mv bin/bore.exe bin/bore-windows-amd64.exe
     @echo "built -> bin/bore-windows-amd64.exe"
 
-# Build all architecture binaries (Linux amd64/arm64, macOS, Windows).
-build: build-amd64 build-arm64 macos-m5 windows-amd64
+# Build the Android arm64 binary into ./bin/bore-android-arm64 (cross via the NDK).
+android-arm64: _builder
+    mkdir -p bin
+    docker buildx build --builder {{builder}} \
+        -f docker/Dockerfile.android \
+        --build-arg ANDROID_API={{android_api}} \
+        --output type=local,dest=bin .
+    mv bin/bore bin/bore-android-arm64
+    @echo "built -> bin/bore-android-arm64"
+
+# Build all architecture binaries (Linux amd64/arm64, macOS, Windows, Android).
+build: build-amd64 build-arm64 macos-m5 windows-amd64 android-arm64
 
 # Run `docker login` first and set `repo` above.
 # Build and push a multi-arch (amd64 + arm64) image to Docker Hub.

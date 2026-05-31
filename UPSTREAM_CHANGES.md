@@ -15,7 +15,9 @@ architecture or repeating mistakes already solved.
   keyed by UUID, with a `DashMap<Uuid, TcpStream>` and a 10s pending-conn TTL.
   **That per-connection model is gone** — replaced by yamux multiplexing.
 - Companion docs: `CLAUDE.md` (architecture cheat-sheet, kept current),
-  `README.md` (user-facing). Agent memories also exist under the session memory
+  `README.md` (user-facing), `TEST_UDP.md` (e2e UDP test scenarios),
+  `NAT_TRAVERSAL.md` (Italian: hole-punch internals + full provider×consumer NAT
+  matrix + admin remediation). Agent memories also exist under the session memory
   dir: `yamux-lazy-open-gotcha`, `tls-uses-ring-for-musl`,
   `e2e-tests-fixed-control-port`.
 

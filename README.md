@@ -345,6 +345,11 @@ For the genuinely untraversable cases (e.g. CGNAT on both ends), the **server
 relay is the reliable fallback** and the tunnel keeps working over it — `--udp`
 never makes a tunnel fail.
 
+For the full theory and an exhaustive **A×B (provider × consumer) matrix** of NAT
+/ firewall combinations — when the direct path works, when it doesn't, and the
+admin fixes (which ports to open, where) — see **[`NAT_TRAVERSAL.md`](NAT_TRAVERSAL.md)**
+(in Italian).
+
 #### Diagnosing UDP / NAT (`bore test-udp`)
 
 Before blaming the tunnel, find out what *your* network allows. `bore test-udp`

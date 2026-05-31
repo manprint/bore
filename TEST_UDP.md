@@ -5,6 +5,10 @@ fallback al relay. Segui gli scenari in ordine: il primo è un *smoke test* su u
 sola macchina; gli ultimi richiedono due host (dietro NAT) per provare la vera
 traversata.
 
+> Per la **teoria** (come funziona l'hole-punch) e la **matrice completa
+> provider×consumer** di NAT/firewall con i rimedi da amministratore, vedi
+> [`NAT_TRAVERSAL.md`](NAT_TRAVERSAL.md).
+
 ---
 
 ## 0. Build

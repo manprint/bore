@@ -148,7 +148,13 @@ pub async fn gather_candidates(
                 );
             }
         }
-        Err(err) => debug!(%err, "STUN reflexive discovery failed"),
+        Err(err) => warn!(
+            %err, %stun,
+            "STUN reflexive discovery FAILED — no public address, offering only a local \
+             candidate; the direct UDP path is unlikely (peer can't route to it). Check UDP \
+             egress to the STUN server, or pass --stun-server with a public STUN (e.g. \
+             stun.l.google.com:19302). Falling back to the relay if the peer can't reach us."
+        ),
     }
 
     // Router-mapped candidate via UPnP-IGD, when explicitly enabled.

@@ -3,8 +3,7 @@ name: Docker (GHCR)
 on:
   push:
     branches:
-      - dev
-      - main
+      - "**" # every branch
     tags:
       - "v*"
   workflow_dispatch:

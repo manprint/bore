@@ -84,3 +84,7 @@ build: build-amd64 build-arm64 macos-m5 windows-amd64 android-arm64
 push: _builder
     docker buildx build --builder {{builder}} --platform linux/amd64,linux/arm64 \
         -f Dockerfile -t {{repo}}:{{tag}} --push .
+
+push_amd64: _builder
+    docker buildx build --builder {{builder}} --platform linux/amd64 \
+        -f Dockerfile -t {{repo}}:{{tag}} --push .

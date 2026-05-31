@@ -70,7 +70,11 @@ impl Authenticator {
     ) -> Result<()> {
         let challenge = match stream.recv_timeout().await? {
             Some(ServerMessage::Challenge(challenge)) => challenge,
-            _ => bail!("expected authentication challenge, but no secret was required"),
+            Some(_) => bail!("expected authentication challenge, but no secret was required"),
+            None => bail!(
+                "connection closed before authentication — wrong --to scheme? \
+                 a TLS control server needs an https:// address (plain host:port won't work)"
+            ),
         };
         let tag = self.answer(&challenge);
         stream.send(ClientMessage::Authenticate(tag)).await?;

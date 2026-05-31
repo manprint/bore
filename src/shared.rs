@@ -1,5 +1,6 @@
 //! Shared data structures, utilities, and protocol definitions.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -17,7 +18,15 @@ use uuid::Uuid;
 pub const CONTROL_PORT: u16 = 7835;
 
 /// Maximum byte length for a JSON frame in the stream.
-pub const MAX_FRAME_LENGTH: usize = 256;
+///
+/// Large enough to hold a small list of UDP hole-punch candidate addresses
+/// (IPv6 + a nonce) used by the `udp` feature's signaling, while still bounding
+/// untrusted input on the control channel.
+pub const MAX_FRAME_LENGTH: usize = 1024;
+
+/// Number of random bytes in a UDP hole-punch session nonce. The shared QUIC
+/// authentication token is derived from this nonce and the tunnel secret.
+pub const UDP_NONCE_LEN: usize = 16;
 
 /// Per-direction buffer size used when proxying data between two TCP streams.
 ///
@@ -74,6 +83,11 @@ pub enum ClientMessage {
     /// Connect as a consumer of a named secret tunnel; data substreams opened on
     /// this connection are routed to the matching provider.
     ConnectSecret(String),
+
+    /// Offer this peer's UDP hole-punch candidate addresses to the server, which
+    /// brokers them to the other peer of the same secret tunnel. Sent only when
+    /// both ends opt into the `udp` direct-path mode.
+    UdpCandidates(Vec<SocketAddr>),
 }
 
 /// A message from the server on the control substream.
@@ -94,6 +108,21 @@ pub enum ServerMessage {
 
     /// Indicates a server error that terminates the connection.
     Error(String),
+
+    /// Begin a UDP hole-punch toward the other peer: `nonce` seeds the shared
+    /// QUIC authentication token, `peer` lists the other peer's candidate
+    /// addresses to punch toward. The provider acts as the QUIC server, the
+    /// consumer as the QUIC client.
+    UdpPunch {
+        /// Session nonce; both peers derive the same token from it + the secret.
+        nonce: [u8; UDP_NONCE_LEN],
+        /// The other peer's candidate addresses to send hole-punch packets to.
+        peer: Vec<SocketAddr>,
+    },
+
+    /// The direct UDP path is unavailable (the other peer did not opt in, or no
+    /// peer is registered yet); proceed over the server relay instead.
+    UdpUnavailable,
 }
 
 /// Transport stream with JSON frames delimited by null characters.

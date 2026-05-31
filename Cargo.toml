@@ -15,6 +15,14 @@ edition = "2021"
 name = "bore"
 path = "src/main.rs"
 
+[features]
+default = ["udp"]
+# Direct peer-to-peer secret tunnels via UDP hole-punching + STUN, carried over
+# QUIC, with automatic fallback to the server relay. On by default; pulls `quinn`
+# (and `quinn-udp`). Build with `--no-default-features` to drop it (e.g. for a
+# target where `quinn` does not compile).
+udp = ["dep:quinn", "dep:rcgen"]
+
 [dependencies]
 anyhow = { version = "1.0.56", features = ["backtrace"] }
 clap = { version = "4.5.0", features = ["derive", "env"] }
@@ -35,6 +43,10 @@ tracing-subscriber = "0.3.18"
 uuid = { version = "1.2.1", features = ["serde", "v4"] }
 webpki-roots = "1.0.7"
 yamux = "0.13.10"
+
+# Optional, enabled by the `udp` feature (see [features]).
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
+rcgen = { version = "0.14.8", optional = true }
 
 [dev-dependencies]
 lazy_static = "1.4.0"

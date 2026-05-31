@@ -24,6 +24,14 @@ services:
       - BORE_AUTO_RECONNECT=true
       # Register as a named secret tunnel (no public port; reach via bore proxy):
       # - BORE_TCP_SECRET_ID=my-service
+      # Prefer a direct UDP hole-punched path to the consumer. Takes effect only
+      # together with BORE_TCP_SECRET_ID (secret-tunnel provider); ignored for a
+      # public-port tunnel. Falls back to the relay if it can't be established.
+      # Requires the server to run with BORE_UDP=true.
+      - BORE_PREFER_UDP=true
+      # STUN server for UDP candidate discovery; defaults to the bore server's
+      # control endpoint. Override only if the server is not also the STUN server:
+      # - BORE_STUN_SERVER=stun.l.google.com:19302
       # Terminate TLS on the tunnel port (the server must have a certificate):
       # - BORE_HTTPS=true
       # Redirect plain HTTP on the tunnel port to https:// (requires BORE_HTTPS):

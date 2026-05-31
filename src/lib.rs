@@ -18,6 +18,7 @@
 pub mod auth;
 pub mod client;
 pub mod edge;
+pub mod holepunch;
 pub mod mux;
 pub mod reconnect;
 pub mod secret;

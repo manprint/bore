@@ -40,9 +40,10 @@ Modules under `src/`:
 - **`edge.rs`** — per-connection handling on the public tunnel port when a tunnel sets `--https`/`--force-https`. Peeks the first bytes (bounded by a timeout; a no-options tunnel skips peeking entirely and forwards as before): a TLS `ClientHello` (`0x16`) is terminated with the server cert (`TunnelStream::Tls`), a plain HTTP request is answered with a `308` redirect to `https://` when `force_https`, otherwise the connection is forwarded plain. `TunnelOptions` rides in the `Hello` message.
 - **`secret.rs`** — named "secret" tunnels (no public port). Server-side `serve_provider` (register under id) / `serve_consumer` + `relay` (splice each consumer substream to a provider substream); `Registry = Arc<DashMap<id, mux::Opener>>`; and the consumer-side `Proxy` (`bore proxy`) which binds a local listener and opens one substream per local connection.
 - **`transport.rs`** — control-connection endpoint. `Endpoint::parse` turns `--to` into host/port/tls (`https://`→TLS:443, `http://`→plain:80, bare→plain:control-port; explicit `:port` overrides). `connect` dials and, for TLS, wraps with rustls (**ring** provider, for musl/scratch builds; `--insecure` skips verification, else webpki-roots). `ControlStream` is the plain-or-TLS enum (implements `mux::Transport`); `load_server_tls`/`server_tls_from_pem` build the server `TlsAcceptor`.
+- **`holepunch.rs`** — optional `udp` feature: UDP hole-punching + STUN with a QUIC carrier for a **direct** consumer↔provider path in secret tunnels (bypassing the relay). Split so the *server* parts (STUN reflexive discovery `discover_reflexive`/`resolve_stun`, STUN responder `run_stun_responder`, token `derive_token`) carry no `quinn` dependency and compile unconditionally; the *client* QUIC parts (`connect_direct`, `DirectListener`, `QuicTransport`, configs) are `#[cfg(feature = "udp")]` and pull `quinn`. `QuicTransport` is just another `mux::Transport`, so `yamux` runs over one QUIC bidi stream unchanged. Both peers authenticate the direct path with a shared token = HMAC(secret, server-issued nonce) exchanged on the first 32 bytes of the QUIC stream. `udp` is a **default** feature (on for `cargo build`/`test`); build `--no-default-features` to drop `quinn`/`quinn-udp` (e.g. a target where `quinn` won't compile). The server-side brokering + STUN still compile without the feature.
 - **`reconnect.rs`** — `--auto-reconnect` support. `Backoff` yields 1,2,4,8,16,32 then 32s indefinitely (reset on a successful connect); generic `run(auto, connect, serve)` runs the connect/serve cycle once (errors propagate — the original behaviour) or loops forever reconnecting. Used by `local` (normal + provider) and `proxy` in `main.rs`.
 - **`auth.rs`** — `Authenticator`: optional HMAC-SHA256 challenge/response, run **once** on the control substream.
-- **`main.rs`** — clap CLI (`local` / `proxy` / `server`). Flags also read env vars (`BORE_SERVER`, `BORE_SECRET`, `BORE_LOCAL_PORT`, `BORE_MIN_PORT`, `BORE_MAX_PORT`, `BORE_MAX_CONNS`, `BORE_CONTROL_PORT`, `BORE_BIND_DOMAIN`, `BORE_CERT_FILE`, `BORE_KEY_FILE`, `BORE_INSECURE`, `BORE_HTTPS`, `BORE_FORCE_HTTPS`, `BORE_AUTO_RECONNECT`, `BORE_TCP_SECRET_ID`, `BORE_LOCAL_PROXY_PORT`).
+- **`main.rs`** — clap CLI (`local` / `proxy` / `server`). Flags also read env vars (`BORE_SERVER`, `BORE_SECRET`, `BORE_LOCAL_PORT`, `BORE_MIN_PORT`, `BORE_MAX_PORT`, `BORE_MAX_CONNS`, `BORE_CONTROL_PORT`, `BORE_BIND_DOMAIN`, `BORE_CERT_FILE`, `BORE_KEY_FILE`, `BORE_INSECURE`, `BORE_HTTPS`, `BORE_FORCE_HTTPS`, `BORE_AUTO_RECONNECT`, `BORE_TCP_SECRET_ID`, `BORE_LOCAL_PROXY_PORT`, `BORE_PREFER_UDP`, `BORE_STUN_SERVER`, `BORE_UDP`).
 
 ### Connection protocol (key flow to understand)
 
@@ -52,6 +53,10 @@ Modules under `src/`:
 4. The client accepts the data substream, consumes the marker byte, dials the local service, and splices.
 
 **Secret tunnels** (role chosen by the first control message — `HelloSecret(id)` / `ConnectSecret(id)` instead of `Hello(port)`; ack is `ServerMessage::Ok`): the provider connection is registered in `providers[id]` and bound by no port. A consumer (`bore proxy`) opens one substream per local connection; the server reads its readiness marker, looks up the provider, opens a substream to it, and `copy_bidirectional`s the two substreams. Direction is inverted vs. the public-port path: here the **consumer opens** data substreams and the **server accepts** them.
+
+### UDP direct path (optional `udp` feature)
+
+Only for **secret tunnels** (provider+consumer both dial the server = rendezvous; the public-port path is not hole-punchable). When both ends pass `--udp` and the server runs `--udp`: each peer opens a UDP socket, learns its reflexive address via STUN (the server's own STUN responder by default, or `--stun-server`), and offers candidates over the control channel (`ClientMessage::UdpCandidates`). The server brokers (`secret::broker_udp`): it mints a nonce, tells the provider to punch (`ServerMessage::UdpPunch` via a per-provider `mpsc` channel held in `UdpRegistry`) and replies to the consumer with the provider's candidates. Both punch; provider = QUIC server (`DirectListener`), consumer = QUIC client (`connect_direct`). On success the consumer routes data over the direct `mux::Opener` (provider serves it via the same `handle_connection` as relay); **any failure falls back to the relay** — the relay path is always available, so `--udp` never breaks a tunnel. The server-side brokering compiles without the feature (no `quinn`), so a lean server can rendezvous for `quinn`-enabled clients. The provider keeps a **persistent** `DirectListener` and re-punches its NAT toward each new/reconnecting consumer (`punch_via_endpoint`, since the raw socket is owned by quinn after setup); a **stable per-provider nonce** (in `UdpReg`) means every consumer derives the same token, so reconnecting and multiple consumers all work.
 
 ### Connection stability (long transfers)
 
@@ -85,5 +90,19 @@ proxied/control socket so middleboxes don't drop a long but quiet transfer
   compose files. Server uses a bridge network with explicit port forwards
   (control port + tunnel range; the scheme depends on the cert, not the port —
   `80`=plain, `443`=TLS); client and secret-proxy use `network_mode: host`. All
-  env vars present (optional ones commented).
-- Upstream release machinery (`mean_bean_*` workflows, `docker.yml`) is unchanged.
+  env vars present (optional ones commented). UDP direct paths are enabled
+  (`BORE_UDP=true` on the server with a `7835/udp` forward, `BORE_PREFER_UDP=true`
+  on client/proxy); see the server file's NAT caveat about bridge vs host.
+- **CI/release on every branch.** All four workflows run on **any branch** push
+  (plus `v*` tags). `ci.yml` (host: fmt/clippy/build/test `--all-features` + audit)
+  and `mean_bean_ci.yml` (cross build with `udp` + test relay-only) gate quality.
+  `mean_bean_deploy.yml` produces a **GitHub Release** per push — a `create-release`
+  job makes it (named `<branch>-<sha7>`, or the tag; branch builds are pre-releases,
+  only tags become "latest") via `softprops/action-gh-release`, then the matrix
+  jobs (macOS×2, Linux×7, Windows×2, Android) upload each binary as a release asset
+  (`bore-<name>-<target>.{tar.gz,zip}`). `docker.yml` builds+pushes the multi-arch
+  (amd64+arm64) image to GHCR Packages, tagged by branch and sha. `ci/version.bash`
+  computes the release name/tag. Releases need a git tag, so branch builds create a
+  lightweight tag `<branch>-<sha7>` — this accumulates tags/releases per push (prune
+  if noisy); the created tag doesn't match `v*` and the `GITHUB_TOKEN` can't
+  re-trigger workflows, so there is no trigger loop.

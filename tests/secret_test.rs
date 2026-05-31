@@ -53,6 +53,8 @@ async fn secret_provider_registers() -> Result<()> {
         "svc-a",
         Some("s3cr3t"),
         false,
+        false,
+        None,
     )
     .await;
     if let Err(err) = provider {
@@ -68,15 +70,31 @@ async fn secret_duplicate_id_rejected() -> Result<()> {
     spawn_server(Some("s3cr3t")).await;
 
     let (_local, port) = local_port().await?;
-    let first =
-        Client::new_secret_provider("localhost", port, "localhost", "dup", Some("s3cr3t"), false)
-            .await?;
+    let first = Client::new_secret_provider(
+        "localhost",
+        port,
+        "localhost",
+        "dup",
+        Some("s3cr3t"),
+        false,
+        false,
+        None,
+    )
+    .await?;
     tokio::spawn(first.listen()); // keep the registration alive
     time::sleep(Duration::from_millis(50)).await;
 
-    let second =
-        Client::new_secret_provider("localhost", port, "localhost", "dup", Some("s3cr3t"), false)
-            .await;
+    let second = Client::new_secret_provider(
+        "localhost",
+        port,
+        "localhost",
+        "dup",
+        Some("s3cr3t"),
+        false,
+        false,
+        None,
+    )
+    .await;
     assert!(second.is_err(), "duplicate tcp-secret-id must be rejected");
 
     Ok(())
@@ -88,13 +106,30 @@ async fn secret_registration_requires_correct_secret() -> Result<()> {
     spawn_server(Some("right")).await;
 
     let (_local, port) = local_port().await?;
-    let wrong =
-        Client::new_secret_provider("localhost", port, "localhost", "svc", Some("wrong"), false)
-            .await;
+    let wrong = Client::new_secret_provider(
+        "localhost",
+        port,
+        "localhost",
+        "svc",
+        Some("wrong"),
+        false,
+        false,
+        None,
+    )
+    .await;
     assert!(wrong.is_err(), "wrong secret must be rejected");
 
-    let missing =
-        Client::new_secret_provider("localhost", port, "localhost", "svc2", None, false).await;
+    let missing = Client::new_secret_provider(
+        "localhost",
+        port,
+        "localhost",
+        "svc2",
+        None,
+        false,
+        false,
+        None,
+    )
+    .await;
     assert!(missing.is_err(), "missing secret must be rejected");
 
     Ok(())
@@ -130,11 +165,29 @@ async fn spawn_secret_tunnel(id: &str, secret: Option<&str>) -> Result<std::net:
     spawn_server(secret).await;
 
     let echo_port = spawn_echo_service().await?;
-    let provider =
-        Client::new_secret_provider("localhost", echo_port, "localhost", id, secret, false).await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo_port,
+        "localhost",
+        id,
+        secret,
+        false,
+        false,
+        None,
+    )
+    .await?;
     tokio::spawn(provider.listen());
 
-    let proxy = Proxy::new("localhost", "127.0.0.1:0".parse()?, id, secret, false).await?;
+    let proxy = Proxy::new(
+        "localhost",
+        "127.0.0.1:0".parse()?,
+        id,
+        secret,
+        false,
+        false,
+        None,
+    )
+    .await?;
     let addr = proxy.local_addr()?;
     tokio::spawn(proxy.listen());
 
@@ -199,6 +252,8 @@ async fn secret_proxy_without_provider_closes() -> Result<()> {
         "ghost",
         Some("s3cr3t"),
         false,
+        false,
+        None,
     )
     .await?;
     let addr = proxy.local_addr()?;
@@ -227,6 +282,8 @@ async fn secret_proxy_requires_correct_secret() -> Result<()> {
         "svc",
         Some("wrong"),
         false,
+        false,
+        None,
     )
     .await;
     assert!(bad.is_err(), "proxy with wrong secret must be rejected");

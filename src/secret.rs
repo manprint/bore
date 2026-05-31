@@ -9,6 +9,7 @@
 //! - The **server** relays each consumer substream to the registered provider
 //!   over a freshly opened substream, splicing the two together. No port is bound.
 
+use std::future::pending;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,30 +19,77 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info, info_span, trace, warn, Instrument};
 
 use crate::auth::Authenticator;
 use crate::mux;
-use crate::shared::{tune_tcp, ClientMessage, Delimited, ServerMessage, PROXY_BUFFER_SIZE};
+use crate::shared::{
+    tune_tcp, ClientMessage, Delimited, ServerMessage, PROXY_BUFFER_SIZE, UDP_NONCE_LEN,
+};
 use crate::transport::{self, Endpoint};
 
 /// Heartbeat interval on secret-tunnel control substreams.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How long a consumer waits for the server to broker a UDP direct path before
+/// falling back to the relay.
+#[cfg(feature = "udp")]
+const UDP_NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Registry mapping each `tcp-secret-id` to the provider's substream opener.
 pub type Registry = Arc<DashMap<String, mux::Opener>>;
+
+/// Registry of UDP-capable providers, keyed by `tcp-secret-id`, used to broker a
+/// direct hole-punched path. Independent of [`Registry`] (which always carries
+/// the relay path) and free of any QUIC dependency, so the server brokers UDP
+/// regardless of whether it was built with the `udp` feature.
+pub type UdpRegistry = Arc<DashMap<String, UdpReg>>;
+
+/// A UDP-capable provider's registration: its candidate addresses, a stable
+/// per-provider session nonce, and a channel to deliver a consumer's offer to
+/// the provider's control task.
+pub struct UdpReg {
+    /// The provider's hole-punch candidate addresses.
+    pub candidates: Vec<SocketAddr>,
+    /// Stable session nonce for this provider; every consumer derives the same
+    /// QUIC token from it, so the provider's persistent QUIC listener can
+    /// authenticate any of them (and reconnecting consumers).
+    pub nonce: [u8; UDP_NONCE_LEN],
+    /// Delivers a consumer offer to the provider's control task.
+    pub to_provider: mpsc::Sender<UdpOffer>,
+}
+
+/// A consumer's offer relayed to a provider so it can punch back and accept a
+/// direct connection.
+pub struct UdpOffer {
+    /// The provider's stable session nonce (so the relayed `UdpPunch` carries it).
+    pub nonce: [u8; UDP_NONCE_LEN],
+    /// The consumer's candidate addresses to punch toward.
+    pub peer_candidates: Vec<SocketAddr>,
+}
+
+/// Generate a fresh random session nonce.
+fn new_nonce() -> [u8; UDP_NONCE_LEN] {
+    let mut nonce = [0u8; UDP_NONCE_LEN];
+    for b in nonce.iter_mut() {
+        *b = fastrand::u8(..);
+    }
+    nonce
+}
 
 /// Removes a provider registration when the provider connection ends.
 struct Deregister {
     registry: Registry,
+    udp_registry: UdpRegistry,
     id: String,
 }
 
 impl Drop for Deregister {
     fn drop(&mut self) {
         self.registry.remove(&self.id);
+        self.udp_registry.remove(&self.id);
     }
 }
 
@@ -51,6 +99,7 @@ pub async fn serve_provider(
     mut control: Delimited<mux::Stream>,
     opener: mux::Opener,
     registry: Registry,
+    udp_registry: UdpRegistry,
     id: String,
 ) -> Result<()> {
     // Register atomically, rejecting a duplicate id rather than hijacking it.
@@ -67,20 +116,68 @@ pub async fn serve_provider(
     }
     let _guard = Deregister {
         registry: registry.clone(),
+        udp_registry: udp_registry.clone(),
         id: id.clone(),
     };
     info!(%id, "secret provider registered");
     control.send(ServerMessage::Ok).await?;
 
-    // The provider sends nothing after registering; a failed heartbeat send means
-    // the connection is gone, at which point `_guard` deregisters it.
+    // After registering, the provider only sends a `UdpCandidates` message if it
+    // opted into the direct-path mode; otherwise it sends nothing. We heartbeat
+    // to detect a dead provider, watch for its candidates, and forward any
+    // consumer offer to it as a `UdpPunch` so it can punch back and accept a
+    // direct connection.
+    let mut offers: Option<mpsc::Receiver<UdpOffer>> = None;
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        heartbeat.tick().await;
-        if control.send(ServerMessage::Heartbeat).await.is_err() {
-            return Ok(());
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                if control.send(ServerMessage::Heartbeat).await.is_err() {
+                    return Ok(());
+                }
+            }
+            message = control.recv() => {
+                match message? {
+                    Some(ClientMessage::UdpCandidates(candidates)) => {
+                        info!(%id, ?candidates, "provider offered udp candidates");
+                        let (tx, rx) = mpsc::channel(4);
+                        udp_registry.insert(
+                            id.clone(),
+                            UdpReg {
+                                candidates,
+                                nonce: new_nonce(),
+                                to_provider: tx,
+                            },
+                        );
+                        offers = Some(rx);
+                    }
+                    Some(_) => warn!(%id, "unexpected message from provider"),
+                    None => return Ok(()),
+                }
+            }
+            offer = recv_offer(&mut offers) => {
+                let msg = ServerMessage::UdpPunch {
+                    nonce: offer.nonce,
+                    peer: offer.peer_candidates,
+                };
+                if control.send(msg).await.is_err() {
+                    return Ok(());
+                }
+            }
         }
+    }
+}
+
+/// Await the next consumer offer, or stay pending when no UDP channel exists yet
+/// (so it never resolves and the `select!` waits on the other branches).
+async fn recv_offer(offers: &mut Option<mpsc::Receiver<UdpOffer>>) -> UdpOffer {
+    match offers {
+        Some(rx) => match rx.recv().await {
+            Some(offer) => offer,
+            None => pending().await,
+        },
+        None => pending().await,
     }
 }
 
@@ -90,6 +187,7 @@ pub async fn serve_consumer(
     mut control: Delimited<mux::Stream>,
     mut acceptor: mux::Acceptor,
     registry: Registry,
+    udp_registry: UdpRegistry,
     permits: Arc<Semaphore>,
     id: String,
 ) -> Result<()> {
@@ -103,6 +201,18 @@ pub async fn serve_consumer(
             _ = heartbeat.tick() => {
                 if control.send(ServerMessage::Heartbeat).await.is_err() {
                     return Ok(());
+                }
+            }
+            // A direct-path consumer offers its candidates here; broker them to
+            // the registered provider (if it is UDP-capable) and reply with the
+            // provider's candidates + a shared nonce, else say it is unavailable.
+            message = control.recv() => {
+                match message? {
+                    Some(ClientMessage::UdpCandidates(consumer_cands)) => {
+                        broker_udp(&mut control, &udp_registry, &id, consumer_cands).await?;
+                    }
+                    Some(_) => warn!(%id, "unexpected message from consumer"),
+                    None => return Ok(()),
                 }
             }
             inbound = acceptor.accept() => {
@@ -131,6 +241,47 @@ pub async fn serve_consumer(
             }
         }
     }
+}
+
+/// Broker a UDP direct path: look up the provider, mint a shared nonce, tell the
+/// provider to punch toward the consumer, and reply to the consumer with the
+/// provider's candidates. Replies `UdpUnavailable` if no UDP-capable provider is
+/// registered, so the consumer falls back to the relay.
+async fn broker_udp(
+    control: &mut Delimited<mux::Stream>,
+    udp_registry: &UdpRegistry,
+    id: &str,
+    consumer_cands: Vec<SocketAddr>,
+) -> Result<()> {
+    // Clone out so no DashMap guard is held across an await point.
+    let provider = udp_registry
+        .get(id)
+        .map(|e| (e.candidates.clone(), e.nonce, e.to_provider.clone()));
+    let Some((provider_cands, nonce, to_provider)) = provider else {
+        info!(%id, "no udp-capable provider; consumer will use relay");
+        control.send(ServerMessage::UdpUnavailable).await?;
+        return Ok(());
+    };
+
+    info!(%id, ?provider_cands, ?consumer_cands, "brokering udp direct path");
+    // Tell the provider first so its QUIC listener is up before the consumer dials.
+    let offer = UdpOffer {
+        nonce,
+        peer_candidates: consumer_cands,
+    };
+    if to_provider.send(offer).await.is_err() {
+        // Provider task is gone; fall back to relay.
+        control.send(ServerMessage::UdpUnavailable).await?;
+        return Ok(());
+    }
+    info!(%id, "brokered udp direct path (consumer told to punch)");
+    control
+        .send(ServerMessage::UdpPunch {
+            nonce,
+            peer: provider_cands,
+        })
+        .await?;
+    Ok(())
 }
 
 /// Splice one consumer substream to a freshly opened provider substream.
@@ -163,6 +314,8 @@ pub struct Proxy {
     control: Delimited<mux::Stream>,
     opener: mux::Opener,
     listener: TcpListener,
+    /// Whether data flows over a direct UDP path rather than the server relay.
+    direct: bool,
 }
 
 impl Proxy {
@@ -174,8 +327,11 @@ impl Proxy {
         tcp_secret_id: &str,
         secret: Option<&str>,
         insecure: bool,
+        udp: bool,
+        stun_server: Option<&str>,
     ) -> Result<Self> {
-        let socket = transport::connect(&Endpoint::parse(to), insecure).await?;
+        let endpoint = Endpoint::parse(to);
+        let socket = transport::connect(&endpoint, insecure).await?;
         let (opener, _acceptor) = mux::client(socket);
         let mut control = Delimited::new(
             opener
@@ -204,6 +360,22 @@ impl Proxy {
             None => bail!("unexpected EOF"),
         }
 
+        // Optionally negotiate a direct UDP path; on any failure keep the relay
+        // opener so the tunnel still works through the server.
+        let mut data_opener = opener;
+        let mut direct = false;
+        if udp {
+            match negotiate_direct_consumer(&mut control, &endpoint, secret, stun_server).await {
+                Ok(Some(opener)) => {
+                    info!(%tcp_secret_id, "using direct udp path");
+                    data_opener = opener;
+                    direct = true;
+                }
+                Ok(None) => info!(%tcp_secret_id, "udp unavailable, using relay"),
+                Err(err) => warn!(%err, "udp negotiation failed, using relay"),
+            }
+        }
+
         let listener = TcpListener::bind(bind_addr)
             .await
             .with_context(|| format!("failed to bind {bind_addr}"))?;
@@ -211,8 +383,9 @@ impl Proxy {
 
         Ok(Proxy {
             control,
-            opener,
+            opener: data_opener,
             listener,
+            direct,
         })
     }
 
@@ -221,13 +394,20 @@ impl Proxy {
         Ok(self.listener.local_addr()?)
     }
 
+    /// Whether the proxy negotiated a direct UDP path (vs. the server relay).
+    pub fn is_direct(&self) -> bool {
+        self.direct
+    }
+
     /// Start forwarding: accept local connections, relay each to the provider.
     pub async fn listen(self) -> Result<()> {
         let Proxy {
             mut control,
             opener,
             listener,
+            direct,
         } = self;
+        let path = if direct { "direct-udp" } else { "relay" };
         loop {
             tokio::select! {
                 // Drain control so server heartbeats are read; surfaces teardown.
@@ -237,6 +417,8 @@ impl Proxy {
                         Some(ServerMessage::Error(err)) => error!(%err, "server error"),
                         Some(ServerMessage::Hello(_)) => warn!("unexpected hello"),
                         Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
+                        Some(ServerMessage::UdpPunch { .. }) => warn!("unexpected udp punch"),
+                        Some(ServerMessage::UdpUnavailable) => warn!("unexpected udp unavailable"),
                         None => return Ok(()),
                     }
                 }
@@ -250,18 +432,82 @@ impl Proxy {
                     };
                     tune_tcp(&local);
                     let opener = opener.clone();
+                    info!(?addr, %path, "forwarding local connection over secret tunnel");
                     tokio::spawn(
                         async move {
                             if let Err(err) = forward(local, opener).await {
                                 warn!(%err, "proxy connection closed with error");
                             }
                         }
-                        .instrument(info_span!("proxy", ?addr)),
+                        .instrument(info_span!("proxy", ?addr, %path)),
                     );
                 }
             }
         }
     }
+}
+
+/// Negotiate a direct UDP path as the consumer (QUIC client). Returns the direct
+/// substream opener on success, or `None` to fall back to the server relay.
+#[cfg(feature = "udp")]
+async fn negotiate_direct_consumer(
+    control: &mut Delimited<mux::Stream>,
+    endpoint: &Endpoint,
+    secret: Option<&str>,
+    stun_server: Option<&str>,
+) -> Result<Option<mux::Opener>> {
+    use crate::holepunch;
+
+    let stun = holepunch::resolve_stun(&endpoint.host, endpoint.port, stun_server).await?;
+    let socket = holepunch::bind_socket().await?;
+    let candidates = holepunch::gather_candidates(&socket, stun).await;
+    if candidates.is_empty() {
+        bail!("no local UDP candidates discovered");
+    }
+    info!(?candidates, %stun, "consumer offering udp candidates (a public IP here means STUN worked)");
+    control
+        .send(ClientMessage::UdpCandidates(candidates))
+        .await?;
+
+    // Await the server's brokering decision, draining heartbeats meanwhile.
+    let outcome = tokio::time::timeout(UDP_NEGOTIATE_TIMEOUT, async {
+        loop {
+            match control.recv().await? {
+                Some(ServerMessage::UdpPunch { nonce, peer }) => {
+                    return Ok::<_, anyhow::Error>(Some((nonce, peer)));
+                }
+                Some(ServerMessage::UdpUnavailable) => return Ok(None),
+                Some(ServerMessage::Heartbeat) | Some(ServerMessage::Ok) => continue,
+                Some(ServerMessage::Error(err)) => bail!("server error: {err}"),
+                Some(_) => continue,
+                None => bail!("unexpected EOF during udp negotiation"),
+            }
+        }
+    })
+    .await;
+    let (nonce, peer) = match outcome {
+        Ok(Ok(Some(value))) => value,
+        Ok(Ok(None)) => return Ok(None),
+        Ok(Err(err)) => return Err(err),
+        Err(_) => return Ok(None), // negotiation timed out → relay
+    };
+    info!(peer_candidates = ?peer, "consumer received peer candidates, punching + connecting QUIC");
+
+    let token = holepunch::derive_token(secret, &nonce);
+    let quic = holepunch::connect_direct(socket, peer, token).await?;
+    let (opener, _acceptor) = mux::client(quic);
+    Ok(Some(opener))
+}
+
+#[cfg(not(feature = "udp"))]
+async fn negotiate_direct_consumer(
+    _control: &mut Delimited<mux::Stream>,
+    _endpoint: &Endpoint,
+    _secret: Option<&str>,
+    _stun_server: Option<&str>,
+) -> Result<Option<mux::Opener>> {
+    warn!("built without the `udp` feature; ignoring direct-path request");
+    Ok(None)
 }
 
 /// Forward one accepted local connection over a new substream to the server.

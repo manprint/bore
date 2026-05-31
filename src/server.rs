@@ -13,8 +13,9 @@ use tracing::{info, info_span, trace, warn, Instrument};
 
 use crate::auth::Authenticator;
 use crate::edge;
+use crate::holepunch;
 use crate::mux;
-use crate::secret::{self, Registry};
+use crate::secret::{self, Registry, UdpRegistry};
 use crate::shared::{
     tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions, CONTROL_PORT,
     PROXY_BUFFER_SIZE,
@@ -42,6 +43,13 @@ pub struct Server {
     /// Registry of named secret-tunnel providers, keyed by `tcp-secret-id`.
     providers: Registry,
 
+    /// Registry of UDP-capable providers, used to broker direct hole-punched
+    /// paths between a provider and a consumer.
+    udp_providers: UdpRegistry,
+
+    /// Whether to broker UDP direct paths and run the STUN responder.
+    udp: bool,
+
     /// TCP port the control listener binds to.
     control_port: u16,
 
@@ -66,6 +74,8 @@ impl Server {
             port_range,
             conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
             providers: Registry::default(),
+            udp_providers: UdpRegistry::default(),
+            udp: false,
             control_port: CONTROL_PORT,
             tls: None,
             bind_domain: None,
@@ -78,6 +88,12 @@ impl Server {
     /// Set the TCP port the control listener binds to (default [`CONTROL_PORT`]).
     pub fn set_control_port(&mut self, control_port: u16) {
         self.control_port = control_port;
+    }
+
+    /// Enable brokering of UDP direct paths and the STUN responder (bound on the
+    /// control port over UDP). See [`crate::holepunch`].
+    pub fn set_udp(&mut self, udp: bool) {
+        self.udp = udp;
     }
 
     /// Enable TLS on the control connection using the given acceptor.
@@ -115,8 +131,22 @@ impl Server {
             port = this.control_port,
             domain = ?this.bind_domain,
             tls = this.tls.is_some(),
+            udp = this.udp,
             "server listening"
         );
+
+        // When UDP direct paths are enabled, run a STUN responder on the control
+        // port over UDP so clients can discover their reflexive address without
+        // any external infrastructure.
+        if this.udp {
+            match tokio::net::UdpSocket::bind((this.bind_addr, this.control_port)).await {
+                Ok(udp) => {
+                    info!(port = this.control_port, "STUN responder listening");
+                    tokio::spawn(holepunch::run_stun_responder(udp));
+                }
+                Err(err) => warn!(%err, "failed to bind STUN responder; udp disabled"),
+            }
+        }
 
         loop {
             let (stream, addr) = listener.accept().await?;
@@ -210,13 +240,21 @@ impl Server {
                 self.serve_tunnel(control, opener, port, opts).await
             }
             Some(ClientMessage::HelloSecret(id)) => {
-                secret::serve_provider(control, opener, self.providers.clone(), id).await
+                secret::serve_provider(
+                    control,
+                    opener,
+                    self.providers.clone(),
+                    self.udp_providers.clone(),
+                    id,
+                )
+                .await
             }
             Some(ClientMessage::ConnectSecret(id)) => {
                 secret::serve_consumer(
                     control,
                     acceptor,
                     self.providers.clone(),
+                    self.udp_providers.clone(),
                     self.conn_permits.clone(),
                     id,
                 )
@@ -224,6 +262,10 @@ impl Server {
             }
             Some(ClientMessage::Authenticate(_)) => {
                 warn!("unexpected authenticate");
+                Ok(())
+            }
+            Some(ClientMessage::UdpCandidates(_)) => {
+                warn!("unexpected udp candidates as first message");
                 Ok(())
             }
             None => Ok(()),

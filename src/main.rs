@@ -56,6 +56,16 @@ enum Command {
         #[clap(long, requires = "https", env = "BORE_FORCE_HTTPS")]
         force_https: bool,
 
+        /// Prefer a direct UDP hole-punched path (secret tunnels only, requires
+        /// --tcp-secret-id); falls back to the server relay if unavailable.
+        #[clap(long, env = "BORE_PREFER_UDP")]
+        udp: bool,
+
+        /// STUN server (host:port) for UDP candidate discovery; defaults to the
+        /// bore server's control endpoint.
+        #[clap(long, env = "BORE_STUN_SERVER")]
+        stun_server: Option<String>,
+
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
         auto_reconnect: bool,
@@ -83,6 +93,16 @@ enum Command {
         /// Skip TLS certificate verification (for self-signed https:// servers).
         #[clap(long, env = "BORE_INSECURE")]
         insecure: bool,
+
+        /// Prefer a direct UDP hole-punched path; falls back to the server relay
+        /// if unavailable.
+        #[clap(long, env = "BORE_PREFER_UDP")]
+        udp: bool,
+
+        /// STUN server (host:port) for UDP candidate discovery; defaults to the
+        /// bore server's control endpoint.
+        #[clap(long, env = "BORE_STUN_SERVER")]
+        stun_server: Option<String>,
 
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
@@ -130,6 +150,11 @@ enum Command {
         /// IP address where tunnels will listen on, defaults to --bind-addr.
         #[clap(long)]
         bind_tunnels: Option<IpAddr>,
+
+        /// Broker UDP direct (hole-punched) paths for secret tunnels and run a
+        /// STUN responder on the control port.
+        #[clap(long, env = "BORE_UDP")]
+        udp: bool,
     },
 }
 
@@ -146,12 +171,19 @@ async fn run(command: Command) -> Result<()> {
             insecure,
             https,
             force_https,
+            udp,
+            stun_server,
             auto_reconnect,
         } => match tcp_secret_id {
             Some(id) => {
                 let connect = move || {
-                    let (local_host, to, id, secret) =
-                        (local_host.clone(), to.clone(), id.clone(), secret.clone());
+                    let (local_host, to, id, secret, stun_server) = (
+                        local_host.clone(),
+                        to.clone(),
+                        id.clone(),
+                        secret.clone(),
+                        stun_server.clone(),
+                    );
                     async move {
                         Client::new_secret_provider(
                             &local_host,
@@ -160,6 +192,8 @@ async fn run(command: Command) -> Result<()> {
                             &id,
                             secret.as_deref(),
                             insecure,
+                            udp,
+                            stun_server.as_deref(),
                         )
                         .await
                     }
@@ -192,14 +226,29 @@ async fn run(command: Command) -> Result<()> {
             secret,
             tcp_secret_id,
             insecure,
+            udp,
+            stun_server,
             auto_reconnect,
         } => {
             let bind_addr = parse_proxy_addr(&local_proxy_port)?;
             let connect = move || {
-                let (to, tcp_secret_id, secret) =
-                    (to.clone(), tcp_secret_id.clone(), secret.clone());
+                let (to, tcp_secret_id, secret, stun_server) = (
+                    to.clone(),
+                    tcp_secret_id.clone(),
+                    secret.clone(),
+                    stun_server.clone(),
+                );
                 async move {
-                    Proxy::new(&to, bind_addr, &tcp_secret_id, secret.as_deref(), insecure).await
+                    Proxy::new(
+                        &to,
+                        bind_addr,
+                        &tcp_secret_id,
+                        secret.as_deref(),
+                        insecure,
+                        udp,
+                        stun_server.as_deref(),
+                    )
+                    .await
                 }
             };
             reconnect::run(auto_reconnect, connect, serve_proxy).await?;
@@ -215,6 +264,7 @@ async fn run(command: Command) -> Result<()> {
             key_file,
             bind_addr,
             bind_tunnels,
+            udp,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -245,6 +295,7 @@ async fn run(command: Command) -> Result<()> {
             }
             server.set_bind_addr(bind_addr);
             server.set_bind_tunnels(bind_tunnels.unwrap_or(bind_addr));
+            server.set_udp(udp);
             server.listen().await?;
         }
     }

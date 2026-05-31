@@ -24,7 +24,8 @@ services:
     # The control port and the tunnel port range must be forwarded explicitly,
     # and MUST match BORE_CONTROL_PORT and BORE_MIN_PORT/BORE_MAX_PORT below.
     ports:
-      - "7835:7835"            # control port
+      - "7835:7835"            # control port (TCP)
+      - "7835:7835/udp"        # STUN responder (UDP) — required for BORE_UDP direct paths
       - "6000-7000:6000-7000"  # tunnel port range
       # Optionally expose the control port on a standard web port. The scheme is
       # decided by the certificate, not the port:
@@ -36,6 +37,15 @@ services:
       - BORE_MIN_PORT=6000
       - BORE_MAX_PORT=7000
       - BORE_MAX_CONNS=1024
+      # Broker UDP hole-punched direct paths for secret tunnels and run a STUN
+      # responder on the control port (UDP). The 7835/udp forward above is
+      # required. The direct data path is peer-to-peer and does NOT traverse this
+      # container; only STUN + control do.
+      - BORE_UDP=true
+      # NAT caveat: behind docker's bridge, the STUN responder must see each
+      # client's real source address. If reflexive discovery misbehaves (clients
+      # always fall back to relay), run the server with `network_mode: host`
+      # instead of bridge, or point clients at an external --stun-server.
       # Public domain advertised to clients (enables http(s):// addressing):
       # - BORE_BIND_DOMAIN=bore.tld
       # Serve the control connection over TLS (also used for --https tunnels);

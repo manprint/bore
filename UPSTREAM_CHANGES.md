@@ -8,7 +8,7 @@ architecture or repeating mistakes already solved.
 
 - **Fork base (upstream):** `ekzhang/bore`, commit `00a735a` ("updated slab"),
   crate version `0.6.0`. The base is also the local `main` branch (unchanged).
-- **All work lives on branch `perf-hardening`** (nothing pushed). HEAD: see
+- **Work lives on branch `dev`** (pushed; CI runs on `main` and `dev`). HEAD: see
   `git log --oneline main..HEAD`.
 - The upstream was ~400 lines: one TCP control connection on a fixed port `7835`,
   and a **separate TCP connection (re-authenticated) per proxied connection**,
@@ -23,10 +23,27 @@ architecture or repeating mistakes already solved.
 
 ```bash
 cargo fmt -- --check
-cargo clippy --all-targets -- -D warnings    # warnings are errors (CI gate)
-cargo test                                    # all suites
+cargo clippy --all-targets -- -D warnings                 # warnings are errors (CI gate)
+cargo clippy --no-default-features --all-targets -- -D warnings  # udp-off build must also lint
+cargo test                                    # all suites (udp on by default)
 cargo audit                                   # must stay clean (0 vulns/warnings)
 ```
+
+The `udp` feature (UDP hole-punching, pulls `quinn`) is **on by default**, so
+plain `cargo build`/`test` include it. Build/test `--no-default-features` to
+exercise the lean (relay-only) build. CI `ci.yml` builds & tests `--all-features`
+on the host; the cross matrix (`mean_bean_*`) builds **with** default features
+(so release binaries include `udp`) but tests **without** it (cross `ci/test.bash`
+passes `--no-default-features`) to avoid QUIC flakiness under qemu emulation.
+
+**Workflows run on every branch** (plus `v*` tags). `mean_bean_deploy.yml`
+creates a GitHub Release per push (`create-release` job → `softprops/action-gh-release`,
+named via `ci/version.bash`: `<branch>-<sha7>` pre-release, or the tag = latest)
+and the matrix jobs upload each target binary as a release asset. `docker.yml`
+pushes the multi-arch image to GHCR Packages (tagged by branch + sha). Branch
+builds create a lightweight tag `<branch>-<sha7>` (releases require a tag); it
+doesn't match `v*` and `GITHUB_TOKEN` can't re-trigger workflows → no loop, but
+tags/releases accumulate per push (prune if noisy).
 
 **Tests bind real ports and the e2e/secret suites use the fixed `CONTROL_PORT`
 (7835).** Two hard-won testing rules:
@@ -46,10 +63,12 @@ cargo audit                                   # must stay clean (0 vulns/warning
    command substitution and the commit aborts. Use `git commit -F -` with a
    heredoc.
 
-Current test inventory (≈42): `e2e_test` (12 rstest cases → 13 runs), `auth_test`
-(2), `mux_test` (2), `secret_test` (7), `control_port_test` (1), `tls_test` (5),
-`reconnect_test` (2), lib unit tests in `transport.rs` (7) and `reconnect.rs` (2),
-plus 1 doctest. Baseline before this work was 12 e2e + 2 auth + 1 doctest.
+Current test inventory: `e2e_test` (13 runs), `auth_test` (2), `mux_test` (2),
+`secret_test` (7), `control_port_test` (1), `tls_test` (5), `reconnect_test` (2),
+`udp_test` (3, `#![cfg(feature = "udp")]` — direct round-trip, consumer
+reconnect, relay fallback on loopback), lib unit tests (14: `transport.rs` 7,
+`reconnect.rs` 2, `shared.rs` 1, `holepunch.rs` 4), plus 1 doctest. Baseline before this work was 12 e2e + 2 auth
++ 1 doctest.
 
 ## Architecture (after the rewrite)
 
@@ -62,9 +81,12 @@ Modules in `src/`:
   TunnelOptions)`, `HelloSecret(String)`, `ConnectSecret(String)`),
   `ServerMessage` (`Challenge`, `Hello(u16)`, `Ok`, `Heartbeat`, `Error`),
   `TunnelOptions { https, force_https }`, the null-delimited-JSON `Delimited<U>`
-  transport, and constants `CONTROL_PORT=7835`, `MAX_FRAME_LENGTH=256`,
-  `NETWORK_TIMEOUT=3s`, `PROXY_BUFFER_SIZE=64 KiB`. (serde_json is name-tagged, so
-  adding enum variants is backward-compatible.)
+  transport, and constants `CONTROL_PORT=7835`, `MAX_FRAME_LENGTH=1024` (raised
+  from 256 to fit udp candidate lists), `NETWORK_TIMEOUT=3s`,
+  `PROXY_BUFFER_SIZE=64 KiB`, `UDP_NONCE_LEN=16`. (serde_json is name-tagged, so
+  adding enum variants is backward-compatible.) The `udp` feature adds
+  `ClientMessage::UdpCandidates(Vec<SocketAddr>)` and `ServerMessage::UdpPunch
+  { nonce, peer }` / `UdpUnavailable` for direct-path signaling.
 - **`mux.rs`** — yamux wrapper, generic over a `Transport` trait (`AsyncRead +
   AsyncWrite + Unpin + Send + 'static`, so TCP or TLS). A single driver task owns
   `yamux::Connection` (its poll API needs `&mut`); `Opener::open()` requests
@@ -94,7 +116,21 @@ Modules in `src/`:
   `serve_provider` (register under id in `Registry = Arc<DashMap<String,
   mux::Opener>>`) / `serve_consumer` + `relay` (splice consumer substream to a
   provider substream). Consumer-side `Proxy` (`bore proxy`): binds a local
-  listener, opens one substream per local connection.
+  listener, opens one substream per local connection. **udp direct path:**
+  `UdpRegistry`/`UdpReg` (provider candidates + an `mpsc` back-channel to the
+  provider task), `broker_udp` (server brokers candidates + a nonce between the
+  two peers), `negotiate_direct_consumer` (consumer gathers/exchanges/connects
+  QUIC). `Proxy::is_direct()` reports whether the direct path was selected. The
+  server-side brokering compiles **without** the `udp` feature (no quinn).
+- **`holepunch.rs`** (always compiled; quinn parts gated on `udp`) — UDP
+  hole-punching + STUN with a QUIC carrier. No-quinn parts (so the server can
+  rendezvous in a lean build): `discover_reflexive`/`resolve_stun`/
+  `gather_candidates`, the `stun` submodule (RFC 5389 client + responder),
+  `run_stun_responder`, `derive_token` (HMAC(secret, nonce)). Gated quinn parts:
+  `connect_direct` (consumer/QUIC-client), `DirectListener` (provider/QUIC-server),
+  `QuicTransport` (a `mux::Transport` so yamux runs over one QUIC bidi stream),
+  rustls configs (accept-any cert; token authenticates). `resolve_stun` maps a
+  443/80 control port to the control port `7835` for the STUN default.
 - **`reconnect.rs`** — `Backoff` (1,2,4,8,16,32 then 32s; reset on success) and
   generic `run(auto, connect, serve)` — single-shot (errors propagate, original
   behaviour) or infinite reconnect loop. Has unit tests.
@@ -152,6 +188,18 @@ Each bullet = one or more commits on `perf-hardening`.
     socket (client/server control, public tunnel external socket, secret-proxy
     local socket, local dial). No code path times out an established data
     stream; this protects long, quiet transfers from middlebox idle-drops.
+14. **UDP hole-punching direct path** (`udp` feature, default-on): for secret
+    tunnels, provider and consumer establish a **direct** peer-to-peer QUIC path
+    via UDP hole-punching + STUN, with the server only as signaling/STUN and
+    automatic fallback to the relay on any failure. New `holepunch.rs`, signaling
+    messages, server STUN responder + brokering, `--udp`/`--stun-server` flags.
+    yamux runs over one QUIC bidi stream (`QuicTransport: mux::Transport`), so the
+    per-connection data path is reused unchanged. Token = HMAC(secret, **stable
+    per-provider** nonce) verified on the first 32 bytes of the QUIC stream. The
+    provider keeps a persistent `DirectListener` and re-punches (`punch_via_endpoint`)
+    toward each new/reconnecting consumer, so reconnects and multiple consumers
+    work. Only secret tunnels (not public-port); both peers symmetric-NAT → relay.
+    See `TEST_UDP.md`.
 
 ## CLI flags & env vars (all flags read env where present)
 
@@ -159,15 +207,18 @@ Each bullet = one or more commits on `perf-hardening`.
   `-s`/`BORE_SECRET`, `--max-conns`/`BORE_MAX_CONNS`,
   `--control-port`/`BORE_CONTROL_PORT` (default 7835),
   `--bind-domain`/`BORE_BIND_DOMAIN`, `--cert-file`/`BORE_CERT_FILE`,
-  `--key-file`/`BORE_KEY_FILE`, `--bind-addr`, `--bind-tunnels` (last two: no env).
+  `--key-file`/`BORE_KEY_FILE`, `--bind-addr`, `--bind-tunnels` (last two: no env),
+  `--udp`/`BORE_UDP` (broker direct paths + STUN responder on the control port/UDP).
 - **local:** positional `LOCAL_PORT`/`BORE_LOCAL_PORT`, `--local-host` (no env),
   `--to`/`BORE_SERVER`, `--port` (no env), `-s`/`BORE_SECRET`,
   `--tcp-secret-id`/`BORE_TCP_SECRET_ID`, `--insecure`/`BORE_INSECURE`,
   `--https`/`BORE_HTTPS`, `--force-https`/`BORE_FORCE_HTTPS` (requires `--https`),
+  `--udp`/`BORE_PREFER_UDP`, `--stun-server`/`BORE_STUN_SERVER`,
   `--auto-reconnect`/`BORE_AUTO_RECONNECT`.
 - **proxy:** `--local-proxy-port`/`BORE_LOCAL_PROXY_PORT` (`:5555` = all
   interfaces), `--to`/`BORE_SERVER`, `-s`/`BORE_SECRET`,
   `--tcp-secret-id`/`BORE_TCP_SECRET_ID`, `--insecure`/`BORE_INSECURE`,
+  `--udp`/`BORE_PREFER_UDP`, `--stun-server`/`BORE_STUN_SERVER`,
   `--auto-reconnect`/`BORE_AUTO_RECONNECT`.
 
 ## Dependencies added
@@ -176,6 +227,14 @@ Each bullet = one or more commits on `perf-hardening`.
 `tokio-util` `compat` feature, tokio `sync` feature; dev: `rcgen` (self-signed
 certs in tls tests). `rustls-pemfile` was deliberately NOT used (unmaintained,
 RUSTSEC-2025-0134) — PEM parsing uses `rustls-pki-types`.
+
+Under the **`udp` feature (default-on)**: `quinn` (0.11, `rustls-ring` +
+`runtime-tokio`, shares rustls 0.23 with tokio-rustls) and `rcgen` (promoted to an
+optional normal dep for the self-signed QUIC cert). `[features] default = ["udp"]`;
+`udp = ["dep:quinn", "dep:rcgen"]`. quinn/quinn-udp internally use `unsafe`, which
+is fine — `#![forbid(unsafe_code)]` constrains only our crate, not deps. quinn
+cross-compiles on all CI targets (verified: arm-gnueabi, arm-musleabi, i686-musl,
+aarch64-musl, android via NDK).
 
 ## Docker & justfile
 
@@ -215,6 +274,15 @@ RUSTSEC-2025-0134) — PEM parsing uses `rustls-pki-types`.
 - **e2e/secret tests share the fixed control port** — any new server-spawning
   test must gate on `wait_for_control_port(false/true)` (free, then up) or it
   flakes under the parallel runner.
+- **`udp` STUN responder binds the control port over UDP** — a TLS control
+  server on `:443` (`https://`) still runs STUN on `7835/udp`, so `resolve_stun`
+  maps 443/80 → `CONTROL_PORT`. Open **UDP** on the control port, not just TCP.
+- **plain `host:port` vs TLS server** — a bare `--to host:port` is plaintext; a
+  TLS control server drops it (the client now reports "connection closed before
+  authentication — wrong --to scheme?"). Use `https://host[:port]`.
+- **cross CI tests run `--no-default-features`** (relay-only) to avoid QUIC-over-
+  qemu flakiness; the cross *build* still compiles `udp` and the host CI tests
+  `--all-features`. Don't "fix" a missing udp_test on cross — it's intentional.
 
 ## Known limitations / candidate next steps
 

@@ -55,6 +55,13 @@ sudo emerge net-proxy/bore
 
 Otherwise, the easiest way to install bore is from prebuilt binaries. These are available on the [releases page](https://github.com/ekzhang/bore/releases) for macOS, Windows, and Linux. Just unzip the appropriate file for your platform and move the `bore` executable into a folder on your PATH.
 
+> **This fork** publishes a GitHub Release for **every push** (any branch): named
+> `<branch>-<sha7>` (branch builds are marked pre-release; `vX.Y.Z` tags are full
+> releases), with binaries attached for macOS (x86_64/arm64), Linux (x86_64,
+> aarch64, arm, armv7, i686), Windows (x86_64/i686) and Android (aarch64). Container
+> images are pushed to the GitHub **Packages** registry (`ghcr.io/<owner>/bore`),
+> tagged by branch and commit (amd64 + arm64).
+
 ### Cargo
 
 You also can build `bore` from source using [Cargo](https://doc.rust-lang.org/cargo/), the Rust package manager. This command installs the `bore` binary at a user-accessible path.
@@ -136,6 +143,8 @@ Options:
       --insecure               Skip TLS certificate verification [env: BORE_INSECURE=]
       --https                  Terminate TLS on the tunnel port [env: BORE_HTTPS=]
       --force-https            Redirect plain HTTP to https:// (requires --https) [env: BORE_FORCE_HTTPS=]
+      --udp                    Prefer a direct UDP hole-punched path (secret tunnels only) [env: BORE_PREFER_UDP=]
+      --stun-server <HOST:PORT> STUN server for the direct path [env: BORE_STUN_SERVER=]
       --auto-reconnect         Reconnect automatically with backoff if the connection drops [env: BORE_AUTO_RECONNECT=]
   -h, --help                   Print help
 ```
@@ -215,6 +224,7 @@ Options:
       --key-file <KEY_FILE>          TLS private key (PEM); with --cert-file, serves HTTPS [env: BORE_KEY_FILE=]
       --bind-addr <BIND_ADDR>        IP address to bind to, clients must reach this [default: 0.0.0.0]
       --bind-tunnels <BIND_TUNNELS>  IP address where tunnels will listen on, defaults to --bind-addr
+      --udp                          Broker UDP direct paths and run a STUN responder on the control port [env: BORE_UDP=]
   -h, --help                         Print help
 ```
 
@@ -255,9 +265,51 @@ Options:
   -s, --secret <SECRET>          Optional secret for authentication [env: BORE_SECRET]
       --tcp-secret-id <ID>       Identifier of the secret tunnel to connect to [env: BORE_TCP_SECRET_ID=]
       --insecure                 Skip TLS certificate verification [env: BORE_INSECURE=]
+      --udp                      Prefer a direct UDP hole-punched path [env: BORE_PREFER_UDP=]
+      --stun-server <HOST:PORT>  STUN server for the direct path [env: BORE_STUN_SERVER=]
       --auto-reconnect           Reconnect automatically with backoff if the connection drops [env: BORE_AUTO_RECONNECT=]
   -h, --help                     Print help
 ```
+
+#### Direct UDP path (hole-punching)
+
+By default a secret tunnel relays all data through the server. With `--udp` on the
+server **and** on both ends, `bore` instead tries to establish a **direct**
+peer-to-peer path between the provider and the consumer using UDP hole-punching,
+carried over [QUIC](https://github.com/quinn-rs/quinn) — the server is then only a
+rendezvous/signaling point and steps out of the data path (lower latency, no server
+bandwidth). If the direct path can't be established (e.g. a symmetric NAT, UDP
+blocked), it **automatically falls back to the relay**, so `--udp` never breaks a
+tunnel.
+
+```shell
+# Server: broker direct paths + run a STUN responder on the control port (UDP).
+bore server --secret mysecret --udp
+
+# Provider and consumer both opt in with --udp:
+bore local 8080 --to https://bore.tld --secret mysecret --tcp-secret-id svc --udp
+bore proxy --to https://bore.tld --local-proxy-port :5555 --secret mysecret --tcp-secret-id svc --udp
+```
+
+Notes:
+
+- **Requires the `udp` feature**, which is **on by default**. Build
+  `--no-default-features` to drop it (and the `quinn` dependency).
+- **Reflexive discovery (STUN).** Each peer learns its public address from the
+  server's built-in STUN responder, bound on the control port over **UDP** — so
+  open **UDP** on the control port too (e.g. `7835/udp`), not just TCP. For an
+  `https://`/`http://` server address the STUN target defaults to the control
+  port `7835`, not `443`/`80`; override with `--stun-server host:port` (any
+  standard STUN server works).
+- **Authentication.** The direct path is authenticated by a token derived from
+  `--secret` and a server-issued nonce, verified before any data flows.
+- **Scope & limits.** Only secret tunnels are hole-punchable (not public-port
+  tunnels). Reconnecting and multiple consumers are supported (the provider keeps
+  a persistent QUIC listener and re-punches toward each one). Both peers behind a
+  symmetric NAT → relay.
+- To confirm the direct path is in use, look for `using direct udp path` /
+  `direct udp carrier established (… token verified)` in the logs
+  (`RUST_LOG=bore_cli=info`).
 
 ## Protocol
 

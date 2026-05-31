@@ -21,6 +21,7 @@
 //! token derivation — carry no `quinn` dependency and are always compiled, so a
 //! lean-built server can still rendezvous for `udp`-enabled clients.
 
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::time::Duration;
 
@@ -99,11 +100,33 @@ fn tokens_match(a: &[u8; TOKEN_LEN], b: &[u8; TOKEN_LEN]) -> bool {
     diff == 0
 }
 
-/// Bind a fresh UDP socket on an ephemeral port for a hole-punch session.
-pub async fn bind_socket() -> Result<UdpSocket> {
-    UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .await
-        .context("failed to bind UDP socket")
+/// Bind a UDP socket for a hole-punch session. `port` 0 picks a random ephemeral
+/// port (the default); a fixed port lets a strict *egress* firewall be opened for
+/// exactly that port (use the same value on both peers) and makes the public
+/// mapping predictable on a port-preserving NAT. A fixed port is bound with
+/// `SO_REUSEADDR` so an `--auto-reconnect` cycle can re-bind it immediately after
+/// the previous socket closes. (A fixed port does not help symmetric NATs, which
+/// remap per destination regardless of the local port.)
+pub async fn bind_socket(port: u16) -> Result<UdpSocket> {
+    if port == 0 {
+        return UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .context("failed to bind UDP socket");
+    }
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .context("failed to create UDP socket")?;
+    // Reuse the address so a reconnect can rebind the fixed port without waiting
+    // for the previous socket to be fully released.
+    let _ = socket.set_reuse_address(true);
+    socket
+        .set_nonblocking(true)
+        .context("failed to set UDP socket non-blocking")?;
+    let addr: SocketAddr = (Ipv4Addr::UNSPECIFIED, port).into();
+    socket
+        .bind(&addr.into())
+        .with_context(|| format!("failed to bind fixed UDP port {port} (free? allowed?)"))?;
+    UdpSocket::from_std(socket.into()).context("failed to register UDP socket with tokio")
 }
 
 /// Gather this peer's candidate addresses: the STUN-discovered reflexive address
@@ -275,6 +298,308 @@ pub async fn discover_reflexive(socket: &UdpSocket, stun: SocketAddr) -> Result<
         }
     }
     bail!("no STUN response from {stun}")
+}
+
+/// Public STUN servers (distinct providers) probed by [`diagnose`]. Two different
+/// IPs are enough to tell endpoint-independent (cone) from endpoint-dependent
+/// (symmetric) mapping; a third adds confidence and a sequential-port sample.
+const PUBLIC_STUN: &[&str] = &[
+    "stun.l.google.com:19302",
+    "stun1.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+];
+
+/// One STUN server's view of our public (reflexive) mapping, gathered on a single
+/// shared socket so the *variation* across servers reveals the NAT's mapping
+/// behaviour.
+#[derive(Debug, Clone)]
+pub struct StunObservation {
+    /// The STUN server queried (host:port).
+    pub server: String,
+    /// The reflexive address that server reported for our socket.
+    pub reflexive: SocketAddr,
+}
+
+/// NAT mapping behaviour classified from multiple [`StunObservation`]s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NatClass {
+    /// No STUN server answered — UDP is most likely blocked outbound.
+    Blocked,
+    /// A reflexive address equals a local address: a public IP, no NAT.
+    Open,
+    /// Only one server answered: egress works but mapping can't be classified.
+    Inconclusive,
+    /// Same public `ip:port` toward every server: endpoint-independent mapping
+    /// (full/restricted cone). Hole-punching works.
+    Cone,
+    /// Public port varies per destination: endpoint-dependent mapping (symmetric
+    /// NAT). `sequential` is true when the observed ports increase in small,
+    /// regular steps (so `--try-port-prediction` has a chance).
+    Symmetric {
+        /// Whether the per-destination ports look sequentially allocated.
+        sequential: bool,
+    },
+}
+
+/// Whether an IPv4 address is in the carrier-grade NAT range `100.64.0.0/10`.
+fn is_cgnat(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (o[1] & 0xc0) == 0x40
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// Whether an address is non-routable on the public internet (RFC1918, loopback,
+/// link-local, or CGNAT) — a "public" reflexive in this range means another NAT
+/// sits upstream.
+fn is_non_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local() || is_cgnat(ip),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+    }
+}
+
+/// Short parenthetical tag describing an address's routability, for the report.
+fn routability_note(ip: IpAddr) -> &'static str {
+    if is_cgnat(ip) {
+        " (CGNAT 100.64/10)"
+    } else if is_non_routable(ip) {
+        " (private)"
+    } else {
+        ""
+    }
+}
+
+/// Classify NAT mapping behaviour from STUN observations taken on one socket.
+/// `local_ips` are this host's own addresses (to detect a public IP with no NAT).
+pub fn classify_nat(local_ips: &[IpAddr], obs: &[StunObservation]) -> NatClass {
+    if obs.is_empty() {
+        return NatClass::Blocked;
+    }
+    if obs.iter().any(|o| local_ips.contains(&o.reflexive.ip())) {
+        return NatClass::Open;
+    }
+    if obs.len() == 1 {
+        return NatClass::Inconclusive;
+    }
+    let ports: BTreeSet<u16> = obs.iter().map(|o| o.reflexive.port()).collect();
+    let ips: BTreeSet<IpAddr> = obs.iter().map(|o| o.reflexive.ip()).collect();
+    if ports.len() == 1 && ips.len() == 1 {
+        return NatClass::Cone;
+    }
+    let sorted: Vec<u16> = ports.into_iter().collect();
+    let sequential = sorted
+        .windows(2)
+        .all(|w| (1..=8).contains(&w[1].saturating_sub(w[0])));
+    NatClass::Symmetric { sequential }
+}
+
+/// Resolve `host:port` and run one STUN reflexive probe on `socket`.
+async fn probe_one(socket: &UdpSocket, hostport: &str) -> Result<SocketAddr> {
+    let addr = tokio::net::lookup_host(hostport)
+        .await
+        .with_context(|| format!("resolve {hostport}"))?
+        .next()
+        .with_context(|| format!("no addresses for {hostport}"))?;
+    discover_reflexive(socket, addr).await
+}
+
+/// Query the local UPnP-IGD gateway for its external (WAN) IP, without creating a
+/// mapping — a diagnostic probe for whether `--upnp` can do anything here.
+#[cfg(feature = "udp")]
+async fn upnp_external_ip() -> Result<IpAddr> {
+    use igd_next::aio::tokio as igd;
+    use igd_next::SearchOptions;
+    let options = SearchOptions {
+        timeout: Some(Duration::from_secs(2)),
+        ..Default::default()
+    };
+    let gateway = igd::search_gateway(options)
+        .await
+        .context("no UPnP-IGD gateway found")?;
+    gateway
+        .get_external_ip()
+        .await
+        .context("UPnP-IGD external IP query failed")
+}
+
+/// Probe this host's UDP / NAT / firewall situation for hole-punching and print a
+/// human-readable report with actionable advice. Opens no tunnel; reachable via
+/// `bore test-udp`.
+///
+/// `bore_target` is the `--to` server's `(host, port)` — when given, the bore
+/// server's own STUN responder is probed too (testing reachability of *your*
+/// deployment's UDP). `stun_override` is an extra `--stun-server host:port`.
+/// `preferred_port` mirrors `--nat-udp-preferred-port`: when non-zero the probe
+/// binds that exact UDP port, so you can test whether the port you intend to open
+/// in a firewall actually works (0 = a random ephemeral port).
+pub async fn diagnose(
+    bore_target: Option<(String, u16)>,
+    stun_override: Option<&str>,
+    preferred_port: u16,
+) -> Result<()> {
+    println!("bore UDP / NAT diagnostic");
+    println!("=========================");
+
+    // 1. Socket + local address.
+    let socket = bind_socket(preferred_port).await?;
+    let local_port = socket.local_addr()?.port();
+    let local_ip = primary_local_ip();
+    let port_kind = if preferred_port == 0 {
+        "ephemeral"
+    } else {
+        "fixed (--nat-udp-preferred-port)"
+    };
+    println!();
+    println!("Local UDP socket : 0.0.0.0:{local_port} ({port_kind})");
+    match local_ip {
+        Some(ip) => println!("Primary local IP : {ip}{}", routability_note(ip)),
+        None => println!("Primary local IP : <none found>"),
+    }
+
+    // 2. Probe public STUN servers on the SAME socket — the variation across
+    //    servers is what reveals cone vs symmetric mapping.
+    println!();
+    println!("STUN probes (a public IP here means UDP egress works):");
+    let mut public_obs: Vec<StunObservation> = Vec::new();
+    for server in PUBLIC_STUN {
+        match probe_one(&socket, server).await {
+            Ok(refl) => {
+                println!("  [ ok ] {server:<26} -> {refl}");
+                public_obs.push(StunObservation {
+                    server: (*server).to_string(),
+                    reflexive: refl,
+                });
+            }
+            Err(err) => println!("  [FAIL] {server:<26} -> {err}"),
+        }
+    }
+    if let Some(server) = stun_override {
+        match probe_one(&socket, server).await {
+            Ok(refl) => println!("  [ ok ] {server:<26} -> {refl}  (--stun-server)"),
+            Err(err) => println!("  [FAIL] {server:<26} -> {err}  (--stun-server)"),
+        }
+    }
+
+    // 3. Probe the bore server's own STUN responder, if --to was given.
+    let mut bore_reachable: Option<bool> = None;
+    if let Some((host, port)) = bore_target.as_ref() {
+        match resolve_stun(host, *port, None).await {
+            Ok(addr) => match discover_reflexive(&socket, addr).await {
+                Ok(refl) => {
+                    println!("  [ ok ] bore server {addr:<20} -> {refl}  (your --to)");
+                    bore_reachable = Some(true);
+                }
+                Err(err) => {
+                    println!("  [FAIL] bore server {addr:<20} -> {err}  (your --to)");
+                    bore_reachable = Some(false);
+                }
+            },
+            Err(err) => println!("  [FAIL] bore server resolve -> {err}  (your --to)"),
+        }
+    }
+
+    // 4. Classify and report a verdict.
+    let local_ips: Vec<IpAddr> = local_ip.into_iter().collect();
+    let class = classify_nat(&local_ips, &public_obs);
+    println!();
+    println!("Verdict");
+    println!("-------");
+    match &class {
+        NatClass::Blocked => {
+            println!("UDP appears BLOCKED outbound: no public STUN server answered.");
+            println!("  -> Direct UDP hole-punching is impossible from this host.");
+            println!("  -> Tunnels still work over the TCP relay (--udp simply has no effect).");
+            println!("  Fix: allow outbound UDP, or run from a network that permits it.");
+        }
+        NatClass::Open => {
+            println!("PUBLIC IP / no NAT: this socket is directly reachable.");
+            println!("  -> Hole-punching trivially works; an ideal provider.");
+        }
+        NatClass::Inconclusive => {
+            println!("UDP egress WORKS but only one server answered — cannot classify the");
+            println!("  NAT mapping (need >=2 distinct STUN servers). Re-run to retry.");
+        }
+        NatClass::Cone => {
+            println!("CONE NAT (endpoint-independent mapping): same public port to every server.");
+            println!("  -> Hole-punching WORKS from your side. If the direct path still fails,");
+            println!("     the *peer* is the blocker (symmetric/CGNAT/UDP-blocked on their end).");
+        }
+        NatClass::Symmetric { sequential } => {
+            println!(
+                "SYMMETRIC NAT (endpoint-dependent mapping): public port changes per destination."
+            );
+            if *sequential {
+                println!(
+                    "  Ports look SEQUENTIAL -> --try-port-prediction has a chance (best-effort)."
+                );
+            } else {
+                println!("  Ports look RANDOM -> port prediction is unlikely to help.");
+            }
+            println!(
+                "  -> Direct path works only if the *other* peer is cone/open. Symmetric+symmetric"
+            );
+            println!("     or symmetric+CGNAT cannot punch and falls back to the relay.");
+        }
+    }
+
+    // 5. Extra signals: port preservation, CGNAT/double-NAT, bore-server hairpin.
+    if let Some(first) = public_obs.first() {
+        let refl = first.reflexive;
+        println!();
+        if refl.port() == local_port {
+            println!(
+                "Port preservation: YES (local {local_port} == public {}).",
+                refl.port()
+            );
+        } else {
+            println!(
+                "Port preservation: no  (local {local_port} -> public {}).",
+                refl.port()
+            );
+        }
+        if is_cgnat(refl.ip()) {
+            println!(
+                "CGNAT detected: public address {} is in 100.64.0.0/10.",
+                refl.ip()
+            );
+            println!("  -> P2P is unlikely; the relay is the reliable path here.");
+        } else if is_non_routable(refl.ip()) {
+            println!(
+                "Double-NAT: the 'public' address {} is itself private — another NAT upstream.",
+                refl.ip()
+            );
+        }
+    }
+    if bore_reachable == Some(false) && !public_obs.is_empty() {
+        println!();
+        println!("Note: public STUN works but YOUR bore server's UDP did NOT answer.");
+        println!("  Likely co-location/hairpin (this host shares the server's machine/LAN),");
+        println!("  or UDP to the control port is not open server-side. Run the provider from a");
+        println!("  different network, or pass --stun-server <public:port> so candidates still");
+        println!("  get a public IP.");
+    }
+
+    // 6. UPnP-IGD reachability (home routers).
+    println!();
+    #[cfg(feature = "udp")]
+    match upnp_external_ip().await {
+        Ok(ip) => {
+            println!(
+                "UPnP-IGD router : FOUND, external IP {ip}{}.",
+                routability_note(ip)
+            );
+            println!("  -> --upnp can map a router port here (helps strict home NATs).");
+        }
+        Err(err) => println!("UPnP-IGD router : none ({err}); --upnp would have no effect here."),
+    }
+    #[cfg(not(feature = "udp"))]
+    println!("UPnP-IGD router : probe skipped (built without the `udp` feature).");
+
+    Ok(())
 }
 
 /// Open NAT mappings toward every peer candidate by sending a few small
@@ -794,7 +1119,7 @@ mod tests {
         let stun = responder.local_addr().unwrap();
         tokio::spawn(run_stun_responder(responder));
 
-        let socket = bind_socket().await.unwrap();
+        let socket = bind_socket(0).await.unwrap();
         let port = socket.local_addr().unwrap().port();
         let candidates = gather_candidates(&socket, stun, false, true).await;
 
@@ -821,7 +1146,7 @@ mod tests {
         let stun = responder.local_addr().unwrap();
         tokio::spawn(run_stun_responder(responder));
 
-        let socket = bind_socket().await.unwrap();
+        let socket = bind_socket(0).await.unwrap();
         let port = socket.local_addr().unwrap().port();
         let candidates = gather_candidates(&socket, stun, false, false).await;
         // No predicted port should appear when prediction is disabled.
@@ -834,5 +1159,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn obs(server: &str, addr: &str) -> StunObservation {
+        StunObservation {
+            server: server.to_string(),
+            reflexive: addr.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn classify_blocked_when_no_observations() {
+        assert_eq!(classify_nat(&[], &[]), NatClass::Blocked);
+    }
+
+    #[test]
+    fn classify_open_when_reflexive_is_a_local_ip() {
+        let local: IpAddr = "203.0.113.9".parse().unwrap();
+        let obs = [obs("a", "203.0.113.9:40000")];
+        assert_eq!(classify_nat(&[local], &obs), NatClass::Open);
+    }
+
+    #[test]
+    fn classify_inconclusive_with_single_observation() {
+        let obs = [obs("a", "198.51.100.1:40000")];
+        assert_eq!(classify_nat(&[], &obs), NatClass::Inconclusive);
+    }
+
+    #[test]
+    fn classify_cone_when_mapping_is_stable() {
+        // Endpoint-independent: same public ip:port toward every server.
+        let obs = [
+            obs("a", "198.51.100.1:40000"),
+            obs("b", "198.51.100.1:40000"),
+            obs("c", "198.51.100.1:40000"),
+        ];
+        assert_eq!(classify_nat(&[], &obs), NatClass::Cone);
+    }
+
+    #[test]
+    fn classify_symmetric_sequential() {
+        // Endpoint-dependent with small regular steps -> prediction has a chance.
+        let obs = [
+            obs("a", "198.51.100.1:40000"),
+            obs("b", "198.51.100.1:40001"),
+            obs("c", "198.51.100.1:40002"),
+        ];
+        assert_eq!(
+            classify_nat(&[], &obs),
+            NatClass::Symmetric { sequential: true }
+        );
+    }
+
+    #[test]
+    fn classify_symmetric_random() {
+        // Endpoint-dependent with large/irregular gaps -> prediction won't help.
+        let obs = [
+            obs("a", "198.51.100.1:40000"),
+            obs("b", "198.51.100.1:51234"),
+            obs("c", "198.51.100.1:33001"),
+        ];
+        assert_eq!(
+            classify_nat(&[], &obs),
+            NatClass::Symmetric { sequential: false }
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_socket_honours_fixed_port_and_ephemeral() {
+        // A fixed port binds exactly that port.
+        let fixed = bind_socket(0).await.unwrap();
+        let want = fixed.local_addr().unwrap().port(); // grab a free port, then reuse it
+        drop(fixed);
+        let sock = bind_socket(want).await.unwrap();
+        assert_eq!(sock.local_addr().unwrap().port(), want);
+        // SO_REUSEADDR lets a fresh socket rebind the same port after the first drops.
+        drop(sock);
+        let again = bind_socket(want).await.unwrap();
+        assert_eq!(again.local_addr().unwrap().port(), want);
+        // Port 0 is ephemeral (non-zero, and almost surely different).
+        let eph = bind_socket(0).await.unwrap();
+        assert_ne!(eph.local_addr().unwrap().port(), 0);
+    }
+
+    #[test]
+    fn cgnat_range_is_detected() {
+        assert!(is_cgnat("100.64.0.1".parse().unwrap()));
+        assert!(is_cgnat("100.127.255.255".parse().unwrap()));
+        assert!(!is_cgnat("100.63.0.1".parse().unwrap()));
+        assert!(!is_cgnat("100.128.0.1".parse().unwrap()));
+        assert!(!is_cgnat("8.8.8.8".parse().unwrap()));
     }
 }

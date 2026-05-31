@@ -60,7 +60,7 @@ Otherwise, the easiest way to install bore is from prebuilt binaries. These are 
 > releases), with binaries attached for macOS (x86_64/arm64), Linux (x86_64,
 > aarch64, arm, armv7, i686), Windows (x86_64/i686) and Android (aarch64). Container
 > images are pushed to the GitHub **Packages** registry (`ghcr.io/<owner>/bore`),
-> tagged by branch and commit (amd64 + arm64).
+> tagged by branch and commit (amd64; build `just push` locally for multi-arch).
 
 ### Cargo
 
@@ -147,6 +147,7 @@ Options:
       --stun-server <HOST:PORT> STUN server for the direct path [env: BORE_STUN_SERVER=]
       --upnp                   Map a router port via UPnP-IGD for the direct path [env: BORE_UPNP=]
       --try-port-prediction    Advertise predicted symmetric-NAT ports (opt-in, best-effort) [env: BORE_TRY_PORT_PREDICTION=]
+      --nat-udp-preferred-port <PORT> Bind the UDP hole-punch socket to a fixed port (0=random) [env: BORE_NAT_UDP_PORT=]
       --auto-reconnect         Reconnect automatically with backoff if the connection drops [env: BORE_AUTO_RECONNECT=]
   -h, --help                   Print help
 ```
@@ -271,6 +272,7 @@ Options:
       --stun-server <HOST:PORT>  STUN server for the direct path [env: BORE_STUN_SERVER=]
       --upnp                     Map a router port via UPnP-IGD for the direct path [env: BORE_UPNP=]
       --try-port-prediction      Advertise predicted symmetric-NAT ports (opt-in, best-effort) [env: BORE_TRY_PORT_PREDICTION=]
+      --nat-udp-preferred-port <PORT> Bind the UDP hole-punch socket to a fixed port (0=random) [env: BORE_NAT_UDP_PORT=]
       --auto-reconnect           Reconnect automatically with backoff if the connection drops [env: BORE_AUTO_RECONNECT=]
   -h, --help                     Print help
 ```
@@ -330,10 +332,50 @@ peers punch):
   scan to strict firewalls** — so it is off unless you set the flag, and logs a
   clear `port prediction ENABLED` line when used. Often won't help random-port
   NATs.
+- `--nat-udp-preferred-port <PORT>` — bind the UDP hole-punch socket to a **fixed**
+  port instead of a random one (0 = random, the default). Set the *same* value on
+  both peers and open it for **egress** in a strict firewall, and the direct path
+  uses exactly that port. On a port-preserving NAT it also fixes the public
+  mapping to that port (predictable). Does **not** help symmetric NATs (they remap
+  per destination regardless of the local port). Tip: run `bore test-udp
+  --nat-udp-preferred-port <PORT>` on each host first to confirm the port punches
+  through.
 
 For the genuinely untraversable cases (e.g. CGNAT on both ends), the **server
 relay is the reliable fallback** and the tunnel keeps working over it — `--udp`
 never makes a tunnel fail.
+
+#### Diagnosing UDP / NAT (`bore test-udp`)
+
+Before blaming the tunnel, find out what *your* network allows. `bore test-udp`
+opens no tunnel — it probes public STUN servers (and, with `--to`, your own bore
+server's STUN responder), classifies the NAT, and prints advice:
+
+```shell
+bore test-udp                              # probe public STUN only
+bore test-udp --to https://bore.example.com   # also test your server's UDP reachability
+bore test-udp --stun-server stun.l.google.com:19302  # add an explicit STUN server
+```
+
+What it tells you:
+
+- **UDP egress** — whether any STUN server answers at all (if none do, UDP is
+  blocked outbound and only the relay can work).
+- **NAT class** — `open` (public IP), `cone` (endpoint-independent mapping →
+  hole-punching works), or `symmetric` (endpoint-dependent → needs the *other*
+  peer to be cone/open, and possibly `--try-port-prediction`). For symmetric it
+  also reports whether the ports look **sequential** (so prediction has a chance)
+  or random.
+- **Port preservation**, **CGNAT** (`100.64.0.0/10`) / double-NAT detection, and
+  whether a **UPnP-IGD** router is present (so `--upnp` would do something).
+- A **co-location/hairpin** note when public STUN works but your own bore
+  server's UDP does not — the classic "provider runs on the same host/LAN as the
+  server" case, where you should run the provider from a different network or
+  pass `--stun-server`.
+
+Run it on **both** peers: a direct path needs each side to be punchable. A cone
+consumer that can't reach a provider almost always means the *provider's* host
+is the blocker (symmetric/CGNAT/UDP-blocked), not the consumer's.
 
 ## Protocol
 

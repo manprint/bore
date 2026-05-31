@@ -131,6 +131,7 @@ impl Client {
         stun_server: Option<&str>,
         port_map: bool,
         port_prediction: bool,
+        udp_port: u16,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
@@ -174,6 +175,7 @@ impl Client {
                 stun_server,
                 port_map,
                 port_prediction,
+                udp_port,
             )
             .await
             {
@@ -312,10 +314,11 @@ async fn offer_provider_candidates(
     stun_server: Option<&str>,
     port_map: bool,
     port_prediction: bool,
+    udp_port: u16,
 ) -> Result<UdpSocket> {
     use crate::holepunch;
     let stun = holepunch::resolve_stun(&endpoint.host, endpoint.port, stun_server).await?;
-    let socket = holepunch::bind_socket().await?;
+    let socket = holepunch::bind_socket(udp_port).await?;
     let candidates = holepunch::gather_candidates(&socket, stun, port_map, port_prediction).await;
     if candidates.is_empty() {
         bail!("no local UDP candidates discovered");

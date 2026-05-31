@@ -340,6 +340,10 @@ pub struct Proxy {
     /// Whether to advertise predicted symmetric-NAT ports during (re)negotiation.
     #[cfg(feature = "udp")]
     port_prediction: bool,
+    /// Fixed UDP source port for hole-punching (0 = ephemeral), retained so the
+    /// upgrade re-negotiation binds the same port.
+    #[cfg(feature = "udp")]
+    udp_port: u16,
 }
 
 /// How often a relay-mode consumer retries the direct UDP path (so it upgrades
@@ -361,6 +365,7 @@ impl Proxy {
         stun_server: Option<&str>,
         port_map: bool,
         port_prediction: bool,
+        udp_port: u16,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
@@ -405,6 +410,7 @@ impl Proxy {
                 stun_server,
                 port_map,
                 port_prediction,
+                udp_port,
             )
             .await
             {
@@ -442,6 +448,8 @@ impl Proxy {
             port_map,
             #[cfg(feature = "udp")]
             port_prediction,
+            #[cfg(feature = "udp")]
+            udp_port,
         })
     }
 
@@ -476,6 +484,8 @@ impl Proxy {
             port_map,
             #[cfg(feature = "udp")]
             port_prediction,
+            #[cfg(feature = "udp")]
+            udp_port,
         } = self;
         let mut path = if direct { "direct-udp" } else { "relay" };
         #[cfg(feature = "udp")]
@@ -495,6 +505,7 @@ impl Proxy {
                     stun_server.as_deref(),
                     port_map,
                     port_prediction,
+                    udp_port,
                 )
                 .await
                 {
@@ -579,11 +590,12 @@ async fn negotiate_direct_consumer(
     stun_server: Option<&str>,
     port_map: bool,
     port_prediction: bool,
+    udp_port: u16,
 ) -> Result<Option<(mux::Opener, mux::Acceptor)>> {
     use crate::holepunch;
 
     let stun = holepunch::resolve_stun(&endpoint.host, endpoint.port, stun_server).await?;
-    let socket = holepunch::bind_socket().await?;
+    let socket = holepunch::bind_socket(udp_port).await?;
     let candidates = holepunch::gather_candidates(&socket, stun, port_map, port_prediction).await;
     if candidates.is_empty() {
         bail!("no local UDP candidates discovered");
@@ -631,6 +643,7 @@ async fn negotiate_direct_consumer(
     _stun_server: Option<&str>,
     _port_map: bool,
     _port_prediction: bool,
+    _udp_port: u16,
 ) -> Result<Option<(mux::Opener, mux::Acceptor)>> {
     warn!("built without the `udp` feature; ignoring direct-path request");
     Ok(None)

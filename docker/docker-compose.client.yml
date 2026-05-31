@@ -32,6 +32,9 @@ services:
       # STUN server for UDP candidate discovery; defaults to the bore server's
       # control endpoint. Override only if the server is not also the STUN server:
       # - BORE_STUN_SERVER=stun.l.google.com:19302
+      # Bind the UDP hole-punch socket to a fixed port (0=random). Open it for
+      # egress in a strict firewall, same value on both peers, for the direct path:
+      # - BORE_NAT_UDP_PORT=41641
       # Terminate TLS on the tunnel port (the server must have a certificate):
       # - BORE_HTTPS=true
       # Redirect plain HTTP on the tunnel port to https:// (requires BORE_HTTPS):

@@ -57,6 +57,7 @@ async fn secret_provider_registers() -> Result<()> {
         None,
         false,
         false,
+        0,
     )
     .await;
     if let Err(err) = provider {
@@ -83,6 +84,7 @@ async fn secret_duplicate_id_rejected() -> Result<()> {
         None,
         false,
         false,
+        0,
     )
     .await?;
     tokio::spawn(first.listen()); // keep the registration alive
@@ -99,6 +101,7 @@ async fn secret_duplicate_id_rejected() -> Result<()> {
         None,
         false,
         false,
+        0,
     )
     .await;
     assert!(second.is_err(), "duplicate tcp-secret-id must be rejected");
@@ -123,6 +126,7 @@ async fn secret_registration_requires_correct_secret() -> Result<()> {
         None,
         false,
         false,
+        0,
     )
     .await;
     assert!(wrong.is_err(), "wrong secret must be rejected");
@@ -138,6 +142,7 @@ async fn secret_registration_requires_correct_secret() -> Result<()> {
         None,
         false,
         false,
+        0,
     )
     .await;
     assert!(missing.is_err(), "missing secret must be rejected");
@@ -186,6 +191,7 @@ async fn spawn_secret_tunnel(id: &str, secret: Option<&str>) -> Result<std::net:
         None,
         false,
         false,
+        0,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -200,6 +206,7 @@ async fn spawn_secret_tunnel(id: &str, secret: Option<&str>) -> Result<std::net:
         None,
         false,
         false,
+        0,
     )
     .await?;
     let addr = proxy.local_addr()?;
@@ -270,6 +277,7 @@ async fn secret_proxy_without_provider_closes() -> Result<()> {
         None,
         false,
         false,
+        0,
     )
     .await?;
     let addr = proxy.local_addr()?;
@@ -302,6 +310,7 @@ async fn secret_proxy_requires_correct_secret() -> Result<()> {
         None,
         false,
         false,
+        0,
     )
     .await;
     assert!(bad.is_err(), "proxy with wrong secret must be rejected");

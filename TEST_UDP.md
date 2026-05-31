@@ -285,6 +285,52 @@ Da provare su **due reti reali** (come S4). Aggiungi i flag su `local` E `proxy`
 
 Se nemmeno questi bastano (es. CGNAT su entrambi i lati) → **relay** (atteso).
 
+**Porta UDP fissa (`--nat-udp-preferred-port`).** Dietro un firewall che filtra
+l'**uscita** per porta: apri una porta UDP in egress su entrambi gli host, usa lo
+**stesso** valore sui due peer e passa il flag — il direct usa esattamente quella
+porta (su NAT port-preserving fissa anche il mapping pubblico). `41641` = default
+Tailscale, scelta sensata. Non aiuta i NAT simmetrici. Verifica prima con
+`bore test-udp --nat-udp-preferred-port 41641` (la riga `Local UDP socket` deve
+mostrare `:41641 (fixed ...)` e gli STUN devono rispondere).
+
+```shell
+./bore local 8000 --tcp-secret-id svc --to https://SRV --udp --secret S --nat-udp-preferred-port 41641
+./bore proxy --local-proxy-port :5555 --tcp-secret-id svc --to https://SRV --udp --secret S --nat-udp-preferred-port 41641
+```
+
+### S9 — Diagnostica NAT/UDP (`bore test-udp`)
+
+**Prima** di sospettare il tunnel, capisci cosa permette la tua rete. `bore
+test-udp` non apre tunnel: sonda STUN pubblici (e, con `--to`, lo STUN del *tuo*
+server), classifica il NAT e dà consigli. Lancialo su **entrambi** i peer.
+
+```shell
+./bore test-udp                                  # solo STUN pubblici
+./bore test-udp --to https://SRV                 # testa anche l'UDP del tuo server
+./bore test-udp --stun-server stun.l.google.com:19302   # STUN esplicito extra
+```
+
+**Come leggere il verdetto:**
+- `STUN probes` tutti `[FAIL]` → **UDP egress bloccato**: solo relay possibile.
+- `CONE NAT` → bucabile dal tuo lato; se il diretto fallisce comunque, il blocco
+  è il **peer** (symmetric/CGNAT/UDP-bloccato dall'altra parte).
+- `SYMMETRIC NAT` → diretto solo se l'altro peer è cone/open; riporta se le porte
+  sono **SEQUENTIAL** (allora `--try-port-prediction` ha una chance) o **RANDOM**.
+- `PUBLIC IP / no NAT` → provider ideale.
+- `CGNAT detected` (`100.64/10`) → P2P improbabile, relay affidabile.
+- **Nota hairpin**: se STUN pubblico funziona ma l'UDP del *tuo* server NO →
+  provider co-locato col server / UDP non aperto lato server. Lancia il provider
+  da una rete diversa, o passa `--stun-server <pubblico>`.
+- `UPnP-IGD router: FOUND` → `--upnp` può mappare una porta sul router.
+
+Esempio reale (consumer dietro NAT cone, port-preserving):
+```
+Verdict
+-------
+CONE NAT (endpoint-independent mapping): same public port to every server.
+Port preservation: YES (local 41991 == public 41991).
+```
+
 ---
 
 ## 4. Checklist rapida
@@ -298,6 +344,7 @@ Se nemmeno questi bastano (es. CGNAT su entrambi i lati) → **relay** (atteso).
 - [ ] S6 trasferimento lungo: regge l'inattività
 - [ ] S7 secret errato: rifiutato
 - [ ] S8 NAT difficili: `--upnp` / `--try-port-prediction` loggano l'attivazione
+- [ ] S9 `bore test-udp` su entrambi i peer: verdetto NAT coerente + consigli
 
 ---
 

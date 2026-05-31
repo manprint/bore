@@ -76,6 +76,13 @@ enum Command {
         #[clap(long, env = "BORE_TRY_PORT_PREDICTION")]
         try_port_prediction: bool,
 
+        /// Bind the UDP hole-punch socket to this fixed port instead of a random
+        /// one. Open it for egress in a strict firewall (and use the same value on
+        /// the peer) to allow the direct path; on a port-preserving NAT it also
+        /// makes the public mapping predictable. 0 = random. Direct path only.
+        #[clap(long, env = "BORE_NAT_UDP_PORT", default_value_t = 0)]
+        nat_udp_preferred_port: u16,
+
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
         auto_reconnect: bool,
@@ -123,6 +130,13 @@ enum Command {
         /// Opt-in, best-effort: it may look like a port scan to strict firewalls.
         #[clap(long, env = "BORE_TRY_PORT_PREDICTION")]
         try_port_prediction: bool,
+
+        /// Bind the UDP hole-punch socket to this fixed port instead of a random
+        /// one. Open it for egress in a strict firewall (and use the same value on
+        /// the peer) to allow the direct path; on a port-preserving NAT it also
+        /// makes the public mapping predictable. 0 = random. Direct path only.
+        #[clap(long, env = "BORE_NAT_UDP_PORT", default_value_t = 0)]
+        nat_udp_preferred_port: u16,
 
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
@@ -176,6 +190,25 @@ enum Command {
         #[clap(long, env = "BORE_UDP")]
         udp: bool,
     },
+
+    /// Diagnose this host's UDP / NAT / firewall for hole-punching (opens no
+    /// tunnel). Probes public STUN servers (and your --to server's STUN, if
+    /// given), classifies the NAT, and prints advice.
+    TestUdp {
+        /// Optional bore server (host:port or http(s):// URL) to also test the
+        /// reachability of its STUN responder.
+        #[clap(short, long, env = "BORE_SERVER")]
+        to: Option<String>,
+
+        /// Extra STUN server (host:port) to probe alongside the public ones.
+        #[clap(long, env = "BORE_STUN_SERVER")]
+        stun_server: Option<String>,
+
+        /// Bind the probe to this fixed UDP port (mirrors --nat-udp-preferred-port)
+        /// to test whether exactly that port works through a firewall. 0 = random.
+        #[clap(long, env = "BORE_NAT_UDP_PORT", default_value_t = 0)]
+        nat_udp_preferred_port: u16,
+    },
 }
 
 #[tokio::main]
@@ -195,6 +228,7 @@ async fn run(command: Command) -> Result<()> {
             stun_server,
             upnp,
             try_port_prediction,
+            nat_udp_preferred_port,
             auto_reconnect,
         } => match tcp_secret_id {
             Some(id) => {
@@ -218,6 +252,7 @@ async fn run(command: Command) -> Result<()> {
                             stun_server.as_deref(),
                             upnp,
                             try_port_prediction,
+                            nat_udp_preferred_port,
                         )
                         .await
                     }
@@ -254,6 +289,7 @@ async fn run(command: Command) -> Result<()> {
             stun_server,
             upnp,
             try_port_prediction,
+            nat_udp_preferred_port,
             auto_reconnect,
         } => {
             let bind_addr = parse_proxy_addr(&local_proxy_port)?;
@@ -275,6 +311,7 @@ async fn run(command: Command) -> Result<()> {
                         stun_server.as_deref(),
                         upnp,
                         try_port_prediction,
+                        nat_udp_preferred_port,
                     )
                     .await
                 }
@@ -325,6 +362,22 @@ async fn run(command: Command) -> Result<()> {
             server.set_bind_tunnels(bind_tunnels.unwrap_or(bind_addr));
             server.set_udp(udp);
             server.listen().await?;
+        }
+        Command::TestUdp {
+            to,
+            stun_server,
+            nat_udp_preferred_port,
+        } => {
+            let bore_target = to.map(|t| {
+                let ep = bore_cli::transport::Endpoint::parse(&t);
+                (ep.host, ep.port)
+            });
+            bore_cli::holepunch::diagnose(
+                bore_target,
+                stun_server.as_deref(),
+                nat_udp_preferred_port,
+            )
+            .await?;
         }
     }
 

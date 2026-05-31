@@ -93,6 +93,7 @@ async fn udp_direct_round_trip() -> Result<()> {
         Some(&stun),
         false,
         false,
+        0,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -109,6 +110,7 @@ async fn udp_direct_round_trip() -> Result<()> {
         Some(&stun),
         false,
         false,
+        0,
     )
     .await?;
     assert!(
@@ -144,6 +146,7 @@ async fn udp_direct_survives_consumer_reconnect() -> Result<()> {
         Some(&stun),
         false,
         false,
+        0,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -162,6 +165,7 @@ async fn udp_direct_survives_consumer_reconnect() -> Result<()> {
                 Some(&stun),
                 false,
                 false,
+                0,
             )
             .await
         }
@@ -212,6 +216,7 @@ async fn udp_consumer_detects_provider_drop() -> Result<()> {
         Some(&stun),
         false,
         false,
+        0,
     )
     .await?;
     let h_provider = tokio::spawn(provider.listen());
@@ -227,6 +232,7 @@ async fn udp_consumer_detects_provider_drop() -> Result<()> {
         Some(&stun),
         false,
         false,
+        0,
     )
     .await?;
     assert!(proxy.is_direct(), "consumer should be direct");
@@ -270,6 +276,7 @@ async fn udp_relay_upgrades_to_direct_when_provider_appears() -> Result<()> {
         Some(&stun),
         false,
         false,
+        0,
     )
     .await?;
     assert!(!proxy.is_direct(), "consumer should start on the relay");
@@ -288,6 +295,7 @@ async fn udp_relay_upgrades_to_direct_when_provider_appears() -> Result<()> {
         Some(&stun),
         false,
         false,
+        0,
     )
     .await?;
     let h_provider = tokio::spawn(provider.listen());
@@ -325,6 +333,7 @@ async fn udp_falls_back_to_relay_without_udp_provider() -> Result<()> {
         None,
         false,
         false,
+        0,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -341,6 +350,7 @@ async fn udp_falls_back_to_relay_without_udp_provider() -> Result<()> {
         Some(&stun),
         false,
         false,
+        0,
     )
     .await?;
     assert!(

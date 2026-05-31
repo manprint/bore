@@ -40,7 +40,8 @@ passes `--no-default-features`) to avoid QUIC flakiness under qemu emulation.
 creates a GitHub Release per push (`create-release` job → `softprops/action-gh-release`,
 named via `ci/version.bash`: `<branch>-<sha7>` pre-release, or the tag = latest)
 and the matrix jobs upload each target binary as a release asset. `docker.yml`
-pushes the multi-arch image to GHCR Packages (tagged by branch + sha). Branch
+pushes an **amd64-only** image to GHCR Packages (tagged by branch + sha; arm64
+dropped — QEMU emulation cost ~20 min, `just push` still builds multi-arch). Branch
 builds create a lightweight tag `<branch>-<sha7>` (releases require a tag); it
 doesn't match `v*` and `GITHUB_TOKEN` can't re-trigger workflows → no loop, but
 tags/releases accumulate per push (prune if noisy).
@@ -209,6 +210,21 @@ Each bullet = one or more commits on `perf-hardening`.
     port mapping via `igd-next`; home routers only, not CGNAT) and
     `--try-port-prediction` (advertise predicted symmetric-NAT ports; best-effort,
     logged, may look like a scan). See `TEST_UDP.md`.
+15. **`bore test-udp` diagnostic** (`holepunch::diagnose`, compiles without the
+    `udp` feature): opens no tunnel; probes public STUN (Google×2 + Cloudflare) on
+    one socket plus, with `--to`, the bore server's own STUN responder, and prints
+    a verdict. `classify_nat` (pure, unit-tested) reads the mapping variation
+    across servers → `Blocked`/`Open`/`Inconclusive`/`Cone`/`Symmetric{sequential}`;
+    also reports port-preservation, CGNAT (`100.64/10`)/double-NAT, a
+    co-location/hairpin note (public STUN OK but own server's UDP dead), and a
+    UPnP-IGD presence probe. Companion to the elevated STUN-failure log in
+    `gather_candidates` (now `warn!`, so a missing public candidate is visible).
+16. **Fixed UDP hole-punch port** (`--nat-udp-preferred-port`/`BORE_NAT_UDP_PORT`,
+    0=random): `bind_socket(port)` binds an exact UDP source port (`socket2` +
+    `SO_REUSEADDR` for clean reconnect rebind). Open that one port for egress in a
+    strict firewall (same value on both peers) and the direct path uses it; on a
+    port-preserving NAT it also fixes the public mapping. No help for symmetric
+    NATs. On `local`+`proxy`+`test-udp`. (41641 = Tailscale's default, a sane pick.)
 
 ## CLI flags & env vars (all flags read env where present)
 
@@ -224,13 +240,17 @@ Each bullet = one or more commits on `perf-hardening`.
   `--https`/`BORE_HTTPS`, `--force-https`/`BORE_FORCE_HTTPS` (requires `--https`),
   `--udp`/`BORE_PREFER_UDP`, `--stun-server`/`BORE_STUN_SERVER`,
   `--upnp`/`BORE_UPNP`, `--try-port-prediction`/`BORE_TRY_PORT_PREDICTION`,
+  `--nat-udp-preferred-port`/`BORE_NAT_UDP_PORT` (fixed UDP hole-punch port, 0=random),
   `--auto-reconnect`/`BORE_AUTO_RECONNECT`.
 - **proxy:** `--local-proxy-port`/`BORE_LOCAL_PROXY_PORT` (`:5555` = all
   interfaces), `--to`/`BORE_SERVER`, `-s`/`BORE_SECRET`,
   `--tcp-secret-id`/`BORE_TCP_SECRET_ID`, `--insecure`/`BORE_INSECURE`,
   `--udp`/`BORE_PREFER_UDP`, `--stun-server`/`BORE_STUN_SERVER`,
   `--upnp`/`BORE_UPNP`, `--try-port-prediction`/`BORE_TRY_PORT_PREDICTION`,
+  `--nat-udp-preferred-port`/`BORE_NAT_UDP_PORT` (fixed UDP hole-punch port, 0=random),
   `--auto-reconnect`/`BORE_AUTO_RECONNECT`.
+- **test-udp:** `--to`/`BORE_SERVER` (optional), `--stun-server`/`BORE_STUN_SERVER`,
+  `--nat-udp-preferred-port`/`BORE_NAT_UDP_PORT`.
 
 ## Dependencies added
 

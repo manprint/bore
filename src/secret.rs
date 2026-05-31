@@ -320,7 +320,26 @@ pub struct Proxy {
     /// yields `None` when the QUIC connection to the provider closes (e.g. the
     /// provider restarted), which tears the proxy down so it re-negotiates.
     direct_acceptor: Option<mux::Acceptor>,
+    /// Whether the direct UDP path was requested (`--udp`). When set and we are
+    /// currently on the relay, `listen` periodically retries the direct path and
+    /// upgrades to it without dropping the session.
+    #[cfg(feature = "udp")]
+    udp: bool,
+    /// Control endpoint, retained to re-negotiate a direct path for the upgrade.
+    #[cfg(feature = "udp")]
+    endpoint: Endpoint,
+    /// Tunnel secret, retained to derive the direct-path token on upgrade.
+    #[cfg(feature = "udp")]
+    secret: Option<String>,
+    /// Explicit STUN server, retained for the upgrade negotiation.
+    #[cfg(feature = "udp")]
+    stun_server: Option<String>,
 }
+
+/// How often a relay-mode consumer retries the direct UDP path (so it upgrades
+/// to direct as soon as the provider becomes reachable, without dropping).
+#[cfg(feature = "udp")]
+const UDP_UPGRADE_INTERVAL: Duration = Duration::from_secs(10);
 
 impl Proxy {
     /// Connect to the server, register as a consumer of `tcp_secret_id`, and bind
@@ -393,6 +412,14 @@ impl Proxy {
             listener,
             direct,
             direct_acceptor,
+            #[cfg(feature = "udp")]
+            udp,
+            #[cfg(feature = "udp")]
+            endpoint,
+            #[cfg(feature = "udp")]
+            secret: secret.map(str::to_string),
+            #[cfg(feature = "udp")]
+            stun_server: stun_server.map(str::to_string),
         })
     }
 
@@ -407,16 +434,54 @@ impl Proxy {
     }
 
     /// Start forwarding: accept local connections, relay each to the provider.
+    #[cfg_attr(not(feature = "udp"), allow(unused_mut))]
     pub async fn listen(self) -> Result<()> {
         let Proxy {
             mut control,
-            opener,
+            mut opener,
             listener,
-            direct,
+            mut direct,
             mut direct_acceptor,
+            #[cfg(feature = "udp")]
+            udp,
+            #[cfg(feature = "udp")]
+            endpoint,
+            #[cfg(feature = "udp")]
+            secret,
+            #[cfg(feature = "udp")]
+            stun_server,
         } = self;
-        let path = if direct { "direct-udp" } else { "relay" };
+        let mut path = if direct { "direct-udp" } else { "relay" };
+        #[cfg(feature = "udp")]
+        let mut last_upgrade = tokio::time::Instant::now();
         loop {
+            // Relay → direct upgrade: while on the relay, periodically retry the
+            // direct path and switch to it in place (no dropped session) as soon
+            // as the provider becomes reachable. Runs outside the `select!` so it
+            // has exclusive use of `control` (no double mutable borrow).
+            #[cfg(feature = "udp")]
+            if udp && !direct && last_upgrade.elapsed() >= UDP_UPGRADE_INTERVAL {
+                last_upgrade = tokio::time::Instant::now();
+                match negotiate_direct_consumer(
+                    &mut control,
+                    &endpoint,
+                    secret.as_deref(),
+                    stun_server.as_deref(),
+                )
+                .await
+                {
+                    Ok(Some((new_opener, new_acceptor))) => {
+                        info!("upgraded relay → direct udp path");
+                        opener = new_opener;
+                        direct_acceptor = Some(new_acceptor);
+                        direct = true;
+                        path = "direct-udp";
+                    }
+                    Ok(None) => {} // provider still unreachable for udp; stay on relay
+                    Err(err) => warn!(%err, "udp upgrade attempt failed; staying on relay"),
+                }
+            }
+
             tokio::select! {
                 // Drain control so server heartbeats are read; surfaces teardown.
                 message = control.recv() => {

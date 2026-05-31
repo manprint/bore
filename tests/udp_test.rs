@@ -237,6 +237,60 @@ async fn udp_consumer_detects_provider_drop() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_relay_upgrades_to_direct_when_provider_appears() -> Result<()> {
+    // A consumer that starts on the relay (no UDP provider yet) must upgrade to
+    // the direct path on its own once a UDP provider appears — without dropping.
+    // Proven indirectly: after the upgrade, killing the provider makes the
+    // consumer's listen() return (it now tracks the direct path); a still-relay
+    // consumer would keep running because its control channel stays up.
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+
+    // Consumer connects first, with no provider yet → starts on the relay.
+    let proxy = Proxy::new(
+        "localhost",
+        "127.0.0.1:0".parse()?,
+        "up",
+        None,
+        false,
+        true,
+        Some(&stun),
+    )
+    .await?;
+    assert!(!proxy.is_direct(), "consumer should start on the relay");
+    let h_proxy = tokio::spawn(proxy.listen());
+
+    // Now a UDP provider appears.
+    let echo = spawn_echo_service().await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo,
+        "localhost",
+        "up",
+        None,
+        false,
+        true,
+        Some(&stun),
+    )
+    .await?;
+    let h_provider = tokio::spawn(provider.listen());
+
+    // Wait past one upgrade interval for the consumer to switch to direct.
+    time::sleep(Duration::from_secs(13)).await;
+
+    // Kill the provider: only a consumer that upgraded to direct will notice and
+    // return from listen().
+    h_provider.abort();
+    let returned = time::timeout(Duration::from_secs(8), h_proxy).await;
+    assert!(
+        returned.is_ok(),
+        "consumer should have upgraded to direct and then detected the provider drop"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn udp_falls_back_to_relay_without_udp_provider() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
     spawn_server(true).await; // STUN available so the consumer gathers quickly

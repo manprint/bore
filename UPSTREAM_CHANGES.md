@@ -65,10 +65,10 @@ tags/releases accumulate per push (prune if noisy).
 
 Current test inventory: `e2e_test` (13 runs), `auth_test` (2), `mux_test` (2),
 `secret_test` (7), `control_port_test` (1), `tls_test` (5), `reconnect_test` (2),
-`udp_test` (4, `#![cfg(feature = "udp")]` — direct round-trip, consumer
-reconnect, **consumer detects provider drop**, relay fallback on loopback), lib
-unit tests (14: `transport.rs` 7, `reconnect.rs` 2, `shared.rs` 1,
-`holepunch.rs` 4), plus 1 doctest. Baseline before this work was 12 e2e + 2 auth
+`udp_test` (5, `#![cfg(feature = "udp")]` — direct round-trip, consumer
+reconnect, consumer detects provider drop, **relay→direct upgrade**, relay
+fallback on loopback), lib unit tests (14: `transport.rs` 7, `reconnect.rs` 2,
+`shared.rs` 1, `holepunch.rs` 4), plus 1 doctest. Baseline before this work was 12 e2e + 2 auth
 + 1 doctest.
 
 ## Architecture (after the rewrite)
@@ -199,7 +199,11 @@ Each bullet = one or more commits on `perf-hardening`.
     per-provider** nonce) verified on the first 32 bytes of the QUIC stream. The
     provider keeps a persistent `DirectListener` and re-punches (`punch_via_endpoint`)
     toward each new/reconnecting consumer, so reconnects and multiple consumers
-    work. Only secret tunnels (not public-port); both peers symmetric-NAT → relay.
+    work. **Resilience:** the consumer detects the direct path dying (provider
+    restart) via the direct mux acceptor and reconnects; a relay-mode consumer
+    retries the direct negotiation every 10s and upgrades in place when the
+    provider becomes reachable, so it always converges to direct without dropping.
+    Only secret tunnels (not public-port); both peers symmetric-NAT → relay.
     See `TEST_UDP.md`.
 
 ## CLI flags & env vars (all flags read env where present)

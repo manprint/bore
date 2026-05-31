@@ -291,6 +291,10 @@ ancora dell'UDP): errore tipo `server requires authentication` / `server error`.
     riconnette → ri-negozia (diretto se il provider è tornato, altrimenti relay).
     Rilevamento immediato su chiusura pulita, entro ~10s (idle timeout QUIC) su
     kill brutale.
+  - **Upgrade relay→diretto automatico:** se il consumer è finito in relay
+    (provider non raggiungibile al momento), ogni ~10s ritenta il path diretto e,
+    appena il provider è raggiungibile, **passa al diretto senza cadere**. Quindi
+    converge sempre al diretto entro ~10s, non resta bloccato in relay.
   - **Consumer cade/riavvia:** il provider ri-buca verso il nuovo consumer →
     torna diretto.
   - **Server cade:** entrambi perdono il canale di controllo → riconnessione con

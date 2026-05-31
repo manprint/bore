@@ -15,17 +15,43 @@ lazy_static! {
     static ref SERIAL_GUARD: Mutex<()> = Mutex::new(());
 }
 
-/// Spawn the server, giving some time for the control port TcpListener to start.
+/// Wait until the control port is either accepting connections (`listening`) or
+/// fully released. All tests share the fixed `CONTROL_PORT`, so this gates each
+/// test on a clean port state rather than racing a previous test's teardown.
+async fn wait_for_control_port(listening: bool) {
+    for _ in 0..500 {
+        if TcpStream::connect(("localhost", CONTROL_PORT))
+            .await
+            .is_ok()
+            == listening
+        {
+            return;
+        }
+        time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Spawn the server, waiting until the control port is actually accepting.
 async fn spawn_server(secret: Option<&str>) {
+    wait_for_control_port(false).await;
     tokio::spawn(Server::new(1024..=65535, secret).listen());
-    time::sleep(Duration::from_millis(50)).await;
+    wait_for_control_port(true).await;
 }
 
 /// Spawns a client with randomly assigned ports, returning the listener and remote address.
 async fn spawn_client(secret: Option<&str>) -> Result<(TcpListener, SocketAddr)> {
     let listener = TcpListener::bind("localhost:0").await?;
     let local_port = listener.local_addr()?.port();
-    let client = Client::new("localhost", local_port, "localhost", 0, secret).await?;
+    let client = Client::new(
+        "localhost",
+        local_port,
+        "localhost",
+        0,
+        secret,
+        false,
+        Default::default(),
+    )
+    .await?;
     let remote_addr = ([127, 0, 0, 1], client.remote_port()).into();
     tokio::spawn(client.listen());
     Ok((listener, remote_addr))
@@ -84,7 +110,17 @@ async fn mismatched_secret(
 async fn invalid_address() -> Result<()> {
     // We don't need the serial guard for this test because it doesn't create a server.
     async fn check_address(to: &str, use_secret: bool) -> Result<()> {
-        match Client::new("localhost", 5000, to, 0, use_secret.then_some("a secret")).await {
+        match Client::new(
+            "localhost",
+            5000,
+            to,
+            0,
+            use_secret.then_some("a secret"),
+            false,
+            Default::default(),
+        )
+        .await
+        {
             Ok(_) => Err(anyhow!("expected error for {to}, use_secret={use_secret}")),
             Err(_) => Ok(()),
         }
@@ -159,6 +195,214 @@ async fn half_closed_tcp_stream() -> Result<()> {
     // We don't have to think about CLOSE_RD handling because that's not really
     // part of the TCP protocol, just the POSIX streams API. It is implemented by
     // the OS ignoring future packets received on that stream.
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn large_payload_transfer() -> Result<()> {
+    // Proxy a payload larger than any internal copy buffer, in both directions,
+    // and assert it arrives byte-for-byte intact. Guards against regressions in
+    // the bidirectional copy / buffer sizing.
+    let _guard = SERIAL_GUARD.lock().await;
+
+    spawn_server(None).await;
+    let (listener, addr) = spawn_client(None).await?;
+
+    const LEN: usize = 1 << 20; // 1 MiB, larger than the proxy copy buffers.
+    let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+
+    // Local service drains the full payload, then echoes it back.
+    let expected = payload.clone();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut buf = vec![0u8; LEN];
+        stream.read_exact(&mut buf).await?;
+        assert_eq!(buf, expected);
+        stream.write_all(&expected).await?;
+        anyhow::Ok(())
+    });
+
+    let mut stream = TcpStream::connect(addr).await?;
+    let (mut rd, mut wr) = stream.split();
+    let mut received = vec![0u8; LEN];
+    let writer = async {
+        wr.write_all(&payload).await?;
+        wr.shutdown().await?;
+        anyhow::Ok(())
+    };
+    let reader = async {
+        rd.read_exact(&mut received).await?;
+        anyhow::Ok(())
+    };
+    tokio::try_join!(writer, reader)?;
+    assert_eq!(received, payload);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn many_concurrent_connections() -> Result<()> {
+    // Drive many simultaneous proxied connections through a single tunnel and
+    // assert each one round-trips its own distinct message. Guards concurrency.
+    let _guard = SERIAL_GUARD.lock().await;
+
+    spawn_server(None).await;
+    let (listener, addr) = spawn_client(None).await?;
+
+    const N: u32 = 30;
+
+    // Local service: echo a 4-byte message for every incoming connection.
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4];
+                stream.read_exact(&mut buf).await?;
+                stream.write_all(&buf).await?;
+                anyhow::Ok(())
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+
+    let mut handles = Vec::new();
+    for i in 0..N {
+        handles.push(tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await?;
+            let msg = i.to_be_bytes();
+            stream.write_all(&msg).await?;
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await?;
+            assert_eq!(buf, msg);
+            anyhow::Ok(())
+        }));
+    }
+    for h in handles {
+        h.await??;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tunnel_survives_aborted_connections() -> Result<()> {
+    // A burst of external connections that hang up immediately must not tear
+    // down the tunnel: a normal connection still has to work afterwards. Guards
+    // the server's accept loop staying alive through connection churn.
+    let _guard = SERIAL_GUARD.lock().await;
+
+    spawn_server(None).await;
+    let (listener, addr) = spawn_client(None).await?;
+
+    // Local echo service, tolerant of peers that close before sending.
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4];
+                if stream.read_exact(&mut buf).await.is_ok() {
+                    let _ = stream.write_all(&buf).await;
+                }
+                anyhow::Ok(())
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+
+    // Churn: connect then immediately drop, without sending anything.
+    for _ in 0..20 {
+        let s = TcpStream::connect(addr).await?;
+        drop(s);
+    }
+    time::sleep(Duration::from_millis(100)).await;
+
+    // The tunnel must still serve a normal request.
+    let mut stream = TcpStream::connect(addr).await?;
+    stream.write_all(b"ping").await?;
+    let mut buf = [0u8; 4];
+    stream.read_exact(&mut buf).await?;
+    assert_eq!(&buf, b"ping");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_connections_are_bounded() -> Result<()> {
+    // The local service holds every connection open without responding, so each
+    // proxied connection keeps its server permit. A flood beyond `max_conns` must
+    // then be dropped rather than growing memory and file descriptors without
+    // limit.
+    let _guard = SERIAL_GUARD.lock().await;
+
+    const MAX: usize = 5;
+    const EXTRA: usize = 20;
+
+    wait_for_control_port(false).await;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_max_conns(MAX);
+    tokio::spawn(server.listen());
+    wait_for_control_port(true).await;
+
+    // Local service that accepts and then holds connections open indefinitely.
+    let local = TcpListener::bind("localhost:0").await?;
+    let local_port = local.local_addr()?.port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (stream, _) = local.accept().await?;
+            held.push(stream); // keep alive, never read or write
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+
+    let client = Client::new(
+        "localhost",
+        local_port,
+        "localhost",
+        0,
+        None,
+        false,
+        Default::default(),
+    )
+    .await?;
+    let addr: SocketAddr = ([127, 0, 0, 1], client.remote_port()).into();
+    tokio::spawn(client.listen());
+
+    // Open more connections than the cap allows, nudging each so the server
+    // actually forwards it and takes a permit.
+    let mut socks = Vec::new();
+    for _ in 0..(MAX + EXTRA) {
+        let mut s = TcpStream::connect(addr).await?;
+        let _ = s.write_all(b"x").await;
+        socks.push(s);
+    }
+
+    // Excess connections (beyond MAX) must be dropped by the server. Poll until
+    // at least EXTRA of them have observed EOF.
+    let mut closed = 0;
+    for _ in 0..60 {
+        closed = 0;
+        for s in &mut socks {
+            let mut buf = [0u8; 1];
+            // A dropped connection shows up as a graceful EOF (`Ok(0)`, a FIN) or a
+            // reset (`Err`, an RST — Windows sends one when the socket is closed
+            // with our unread "x" still buffered). Both mean the server dropped it;
+            // a still-proxied connection just times out with no data ready.
+            match time::timeout(Duration::from_millis(10), s.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => closed += 1,
+                _ => {}
+            }
+        }
+        if closed >= EXTRA {
+            break;
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(closed >= EXTRA, "expected >= {EXTRA} dropped, got {closed}");
 
     Ok(())
 }

@@ -4,15 +4,29 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::{io, ops::RangeInclusive, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use dashmap::DashMap;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{sleep, timeout};
-use tracing::{info, info_span, warn, Instrument};
-use uuid::Uuid;
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio::time::{interval, sleep, MissedTickBehavior};
+use tokio_rustls::TlsAcceptor;
+use tracing::{info, info_span, trace, warn, Instrument};
 
 use crate::auth::Authenticator;
-use crate::shared::{ClientMessage, Delimited, ServerMessage, CONTROL_PORT};
+use crate::edge;
+use crate::mux;
+use crate::secret::{self, Registry};
+use crate::shared::{
+    tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions, CONTROL_PORT,
+    PROXY_BUFFER_SIZE,
+};
+
+/// Default cap on the number of concurrently proxied connections per tunnel
+/// connection. Bounds memory and file-descriptor use under a connection flood.
+/// Overridable with [`Server::set_max_conns`].
+pub const DEFAULT_MAX_CONNS: usize = 1024;
+
+/// Interval at which the server sends heartbeats to detect a dead client.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// State structure for the server.
 pub struct Server {
@@ -22,8 +36,20 @@ pub struct Server {
     /// Optional secret used to authenticate clients.
     auth: Option<Authenticator>,
 
-    /// Concurrent map of IDs to incoming connections.
-    conns: Arc<DashMap<Uuid, TcpStream>>,
+    /// Limits the number of concurrently proxied connections per client.
+    conn_permits: Arc<Semaphore>,
+
+    /// Registry of named secret-tunnel providers, keyed by `tcp-secret-id`.
+    providers: Registry,
+
+    /// TCP port the control listener binds to.
+    control_port: u16,
+
+    /// TLS acceptor for the control connection; `None` means plain TCP.
+    tls: Option<TlsAcceptor>,
+
+    /// Public domain advertised for this server (informational).
+    bind_domain: Option<String>,
 
     /// IP address where the control server will bind to.
     bind_addr: IpAddr,
@@ -38,19 +64,44 @@ impl Server {
         assert!(!port_range.is_empty(), "must provide at least one port");
         Server {
             port_range,
-            conns: Arc::new(DashMap::new()),
+            conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
+            providers: Registry::default(),
+            control_port: CONTROL_PORT,
+            tls: None,
+            bind_domain: None,
             auth: secret.map(Authenticator::new),
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             bind_tunnels: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         }
     }
 
-    /// Set the IP address where tunnels will listen on.
+    /// Set the TCP port the control listener binds to (default [`CONTROL_PORT`]).
+    pub fn set_control_port(&mut self, control_port: u16) {
+        self.control_port = control_port;
+    }
+
+    /// Enable TLS on the control connection using the given acceptor.
+    pub fn set_tls(&mut self, acceptor: TlsAcceptor) {
+        self.tls = Some(acceptor);
+    }
+
+    /// Set the public domain advertised for this server (informational).
+    pub fn set_bind_domain(&mut self, domain: String) {
+        self.bind_domain = Some(domain);
+    }
+
+    /// Set the maximum number of concurrently proxied connections held per client
+    /// connection at once. See [`DEFAULT_MAX_CONNS`].
+    pub fn set_max_conns(&mut self, max_conns: usize) {
+        self.conn_permits = Arc::new(Semaphore::new(max_conns));
+    }
+
+    /// Set the IP address where the control server will bind to.
     pub fn set_bind_addr(&mut self, bind_addr: IpAddr) {
         self.bind_addr = bind_addr;
     }
 
-    /// Set the IP address where the control server will bind to.
+    /// Set the IP address where tunnels will listen on.
     pub fn set_bind_tunnels(&mut self, bind_tunnels: IpAddr) {
         self.bind_tunnels = bind_tunnels;
     }
@@ -58,19 +109,36 @@ impl Server {
     /// Start the server, listening for new connections.
     pub async fn listen(self) -> Result<()> {
         let this = Arc::new(self);
-        let listener = TcpListener::bind((this.bind_addr, CONTROL_PORT)).await?;
-        info!(addr = ?this.bind_addr, "server listening");
+        let listener = TcpListener::bind((this.bind_addr, this.control_port)).await?;
+        info!(
+            addr = ?this.bind_addr,
+            port = this.control_port,
+            domain = ?this.bind_domain,
+            tls = this.tls.is_some(),
+            "server listening"
+        );
 
         loop {
             let (stream, addr) = listener.accept().await?;
+            tune_tcp(&stream);
             let this = Arc::clone(&this);
             tokio::spawn(
                 async move {
                     info!("incoming connection");
-                    if let Err(err) = this.handle_connection(stream).await {
-                        warn!(%err, "connection exited with error");
-                    } else {
-                        info!("connection exited");
+                    // The TLS handshake (if any) runs here, off the accept path.
+                    let result = match &this.tls {
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(tls) => this.handle_connection(tls).await,
+                            Err(err) => {
+                                warn!(%err, "TLS handshake failed");
+                                return;
+                            }
+                        },
+                        None => this.handle_connection(stream).await,
+                    };
+                    match result {
+                        Ok(_) => info!("connection exited"),
+                        Err(err) => warn!(%err, "connection exited with error"),
                     }
                 }
                 .instrument(info_span!("control", ?addr)),
@@ -115,73 +183,163 @@ impl Server {
         }
     }
 
-    async fn handle_connection(&self, stream: TcpStream) -> Result<()> {
-        let mut stream = Delimited::new(stream);
+    async fn handle_connection<S: mux::Transport>(&self, socket: S) -> Result<()> {
+        // Multiplex everything over this single connection. The client opens the
+        // control substream first; what it requests on it selects the role.
+        let (opener, mut acceptor) = mux::server(socket);
+        let mut control = match acceptor.accept().await {
+            Some(stream) => Delimited::new(stream),
+            None => return Ok(()),
+        };
+
+        // The client sends its first message before authenticating (it must write
+        // to announce the lazily-opened substream; the server speaks first during
+        // auth). The request is only acted on once auth succeeds.
+        let request = control.recv_timeout().await?;
+
         if let Some(auth) = &self.auth {
-            if let Err(err) = auth.server_handshake(&mut stream).await {
+            if let Err(err) = auth.server_handshake(&mut control).await {
                 warn!(%err, "server handshake failed");
-                stream.send(ServerMessage::Error(err.to_string())).await?;
+                control.send(ServerMessage::Error(err.to_string())).await?;
                 return Ok(());
             }
         }
 
-        match stream.recv_timeout().await? {
+        match request {
+            Some(ClientMessage::Hello(port, opts)) => {
+                self.serve_tunnel(control, opener, port, opts).await
+            }
+            Some(ClientMessage::HelloSecret(id)) => {
+                secret::serve_provider(control, opener, self.providers.clone(), id).await
+            }
+            Some(ClientMessage::ConnectSecret(id)) => {
+                secret::serve_consumer(
+                    control,
+                    acceptor,
+                    self.providers.clone(),
+                    self.conn_permits.clone(),
+                    id,
+                )
+                .await
+            }
             Some(ClientMessage::Authenticate(_)) => {
                 warn!("unexpected authenticate");
                 Ok(())
             }
-            Some(ClientMessage::Hello(port)) => {
-                let listener = match self.create_listener(port).await {
-                    Ok(listener) => listener,
-                    Err(err) => {
-                        stream.send(ServerMessage::Error(err.into())).await?;
-                        return Ok(());
-                    }
-                };
-                let host = listener.local_addr()?.ip();
-                let port = listener.local_addr()?.port();
-                info!(?host, ?port, "new client");
-                stream.send(ServerMessage::Hello(port)).await?;
-
-                loop {
-                    if stream.send(ServerMessage::Heartbeat).await.is_err() {
-                        // Assume that the TCP connection has been dropped.
-                        return Ok(());
-                    }
-                    const TIMEOUT: Duration = Duration::from_millis(500);
-                    if let Ok(result) = timeout(TIMEOUT, listener.accept()).await {
-                        let (stream2, addr) = result?;
-                        info!(?addr, ?port, "new connection");
-
-                        let id = Uuid::new_v4();
-                        let conns = Arc::clone(&self.conns);
-
-                        conns.insert(id, stream2);
-                        tokio::spawn(async move {
-                            // Remove stale entries to avoid memory leaks.
-                            sleep(Duration::from_secs(10)).await;
-                            if conns.remove(&id).is_some() {
-                                warn!(%id, "removed stale connection");
-                            }
-                        });
-                        stream.send(ServerMessage::Connection(id)).await?;
-                    }
-                }
-            }
-            Some(ClientMessage::Accept(id)) => {
-                info!(%id, "forwarding connection");
-                match self.conns.remove(&id) {
-                    Some((_, mut stream2)) => {
-                        let mut parts = stream.into_parts();
-                        debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
-                        stream2.write_all(&parts.read_buf).await?;
-                        tokio::io::copy_bidirectional(&mut parts.io, &mut stream2).await?;
-                    }
-                    None => warn!(%id, "missing connection"),
-                }
-                Ok(())
-            }
             None => Ok(()),
+        }
+    }
+
+    /// Serve a public-port tunnel: bind a remote port and forward each incoming
+    /// connection to the client over a fresh multiplexed substream.
+    async fn serve_tunnel(
+        &self,
+        mut control: Delimited<mux::Stream>,
+        opener: mux::Opener,
+        port: u16,
+        opts: TunnelOptions,
+    ) -> Result<()> {
+        // TLS termination on the tunnel port reuses the server's certificate.
+        if opts.https && self.tls.is_none() {
+            control
+                .send(ServerMessage::Error(
+                    "server has no TLS certificate configured".into(),
+                ))
+                .await?;
+            return Ok(());
+        }
+
+        let listener = match self.create_listener(port).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                control.send(ServerMessage::Error(err.into())).await?;
+                return Ok(());
+            }
+        };
+        let host = listener.local_addr()?.ip();
+        let port = listener.local_addr()?.port();
+        info!(?host, ?port, https = opts.https, "new client");
+        control.send(ServerMessage::Hello(port)).await?;
+
+        let mut heartbeat = interval(HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    if control.send(ServerMessage::Heartbeat).await.is_err() {
+                        // Assume that the client connection has been dropped.
+                        return Ok(());
+                    }
+                }
+                result = listener.accept() => {
+                    let (stream2, addr) = match result {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            // A transient accept error (e.g. EMFILE when out of file
+                            // descriptors, or a peer that reset before we accepted)
+                            // must not tear down the whole tunnel. Back off briefly to
+                            // avoid busy-spinning, then keep serving.
+                            warn!(%err, "failed to accept tunnel connection");
+                            sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
+                    tune_tcp(&stream2);
+
+                    // Bound the number of concurrently proxied connections. At
+                    // capacity, drop the connection rather than exhausting memory
+                    // and file descriptors under a flood. The permit is released
+                    // when the proxied connection finishes.
+                    let permit = match Arc::clone(&self.conn_permits).try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            warn!(?addr, ?port, "too many active connections, dropping");
+                            continue;
+                        }
+                    };
+                    info!(?addr, ?port, "new connection");
+
+                    let opener = opener.clone();
+                    let tls = self.tls.clone();
+                    let domain = self.bind_domain.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        // Terminate TLS / handle redirects at the edge as needed.
+                        let mut edge =
+                            match edge::accept(stream2, opts, tls.as_ref(), port, domain.as_deref())
+                                .await
+                            {
+                                Ok(Some(edge)) => edge,
+                                Ok(None) => return, // redirected or closed at the edge
+                                Err(err) => {
+                                    trace!(%err, "edge handling failed");
+                                    return;
+                                }
+                            };
+                        match opener.open().await {
+                            Ok(mut stream) => {
+                                // Announce the lazily-opened substream so the client
+                                // dials the local service before any payload flows.
+                                if let Err(err) = stream.write_all(&[mux::STREAM_READY]).await {
+                                    trace!(%err, "failed to establish multiplexed stream");
+                                    return;
+                                }
+                                let result = tokio::io::copy_bidirectional_with_sizes(
+                                    &mut edge,
+                                    &mut stream,
+                                    PROXY_BUFFER_SIZE,
+                                    PROXY_BUFFER_SIZE,
+                                )
+                                .await;
+                                if let Err(err) = result {
+                                    trace!(%err, "proxied connection closed");
+                                }
+                            }
+                            Err(err) => warn!(%err, "failed to open multiplexed stream"),
+                        }
+                    });
+                }
+            }
         }
     }
 }

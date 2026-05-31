@@ -1,0 +1,37 @@
+# Cross-compile the `bore` binary for Android (aarch64-linux-android) using the
+# Android NDK as the C toolchain — required because `ring` compiles C/asm that
+# zig cannot build for Android. Used by the `android-arm64` justfile recipe.
+#
+# Build args:
+#   ANDROID_API  — minimum Android API level (default 24)
+#   NDK_VERSION  — Android NDK release (default r27c)
+
+FROM rust:bookworm AS builder
+ARG ANDROID_API=24
+ARG NDK_VERSION=r27c
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the NDK.
+RUN curl -fsSL -o /tmp/ndk.zip \
+        "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip" \
+    && unzip -q /tmp/ndk.zip -d /opt \
+    && rm /tmp/ndk.zip
+ENV ANDROID_NDK_HOME="/opt/android-ndk-${NDK_VERSION}"
+ENV PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}"
+
+RUN rustup target add aarch64-linux-android
+
+WORKDIR /src
+COPY . .
+
+# Point cc-rs (ring) and the Rust linker at the NDK's clang for the target.
+ENV CC_aarch64_linux_android="aarch64-linux-android${ANDROID_API}-clang" \
+    AR_aarch64_linux_android="llvm-ar" \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="aarch64-linux-android${ANDROID_API}-clang"
+RUN cargo build --release --target aarch64-linux-android
+
+FROM scratch
+COPY --from=builder /src/target/aarch64-linux-android/release/bore /bore

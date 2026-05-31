@@ -5,7 +5,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_util::codec::{AnyDelimiterCodec, Framed, FramedParts};
 use tracing::trace;
@@ -17,23 +19,64 @@ pub const CONTROL_PORT: u16 = 7835;
 /// Maximum byte length for a JSON frame in the stream.
 pub const MAX_FRAME_LENGTH: usize = 256;
 
+/// Per-direction buffer size used when proxying data between two TCP streams.
+///
+/// Larger than Tokio's 8 KiB default to improve throughput on connections with a
+/// high bandwidth-delay product, at a modest, bounded memory cost per proxied
+/// connection.
+pub const PROXY_BUFFER_SIZE: usize = 64 * 1024;
+
 /// Timeout for network connections and initial protocol messages.
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// A message from the client on the control connection.
+/// Idle time before the first TCP keepalive probe, and the interval between
+/// probes. Kept well under common NAT/firewall idle timeouts so that long but
+/// quiet transfers (e.g. a slow `tar | rclone rcat`) keep their middlebox
+/// mappings alive and dead peers are detected — bore itself never times out an
+/// established data stream.
+const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(15);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Apply the standard socket options to a proxied or control TCP stream:
+/// `TCP_NODELAY` (latency) and `SO_KEEPALIVE` with a short interval (stability).
+///
+/// Best-effort: failures to set an option are ignored rather than dropping the
+/// connection.
+pub fn tune_tcp(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let keepalive = TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_TIME)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    let _ = SockRef::from(stream).set_tcp_keepalive(&keepalive);
+}
+
+/// Per-tunnel options requested by the client for a public-port tunnel.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct TunnelOptions {
+    /// Terminate TLS on the tunnel port (the server must have a certificate).
+    pub https: bool,
+    /// Redirect plain HTTP requests on the tunnel port to `https://`.
+    pub force_https: bool,
+}
+
+/// A message from the client on the control substream.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
     /// Response to an authentication challenge from the server.
     Authenticate(String),
 
-    /// Initial client message specifying a port to forward.
-    Hello(u16),
+    /// Initial client message specifying a port to forward and its options.
+    Hello(u16, TunnelOptions),
 
-    /// Accepts an incoming TCP connection, using this stream as a proxy.
-    Accept(Uuid),
+    /// Register as the provider for a named secret tunnel (no public port).
+    HelloSecret(String),
+
+    /// Connect as a consumer of a named secret tunnel; data substreams opened on
+    /// this connection are routed to the matching provider.
+    ConnectSecret(String),
 }
 
-/// A message from the server on the control connection.
+/// A message from the server on the control substream.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMessage {
     /// Authentication challenge, sent as the first message, if enabled.
@@ -42,11 +85,12 @@ pub enum ServerMessage {
     /// Response to a client's initial message, with actual public port.
     Hello(u16),
 
+    /// Acknowledges a secret-tunnel registration ([`ClientMessage::HelloSecret`]
+    /// or [`ClientMessage::ConnectSecret`]).
+    Ok,
+
     /// No-op used to test if the client is still reachable.
     Heartbeat,
-
-    /// Asks the client to accept a forwarded TCP connection.
-    Connection(Uuid),
 
     /// Indicates a server error that terminates the connection.
     Error(String),
@@ -95,5 +139,24 @@ impl<U: AsyncRead + AsyncWrite + Unpin> Delimited<U> {
     /// Consume this object, returning current buffers and the inner transport.
     pub fn into_parts(self) -> FramedParts<U, AnyDelimiterCodec> {
         self.0.into_parts()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn tune_tcp_sets_nodelay_and_keepalive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        tune_tcp(&stream);
+        assert!(stream.nodelay().unwrap(), "TCP_NODELAY must be set");
+        assert!(
+            SockRef::from(&stream).keepalive().unwrap(),
+            "SO_KEEPALIVE must be set"
+        );
     }
 }

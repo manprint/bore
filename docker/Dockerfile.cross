@@ -1,0 +1,21 @@
+# Cross-compile the `bore` binary to non-Linux targets via cargo-zigbuild (zig as
+# the cross-linker). Used by the `macos-m5` and `windows-amd64` justfile recipes.
+#
+# Build args:
+#   TARGET    — Rust target triple (e.g. aarch64-apple-darwin, x86_64-pc-windows-gnu)
+#   BIN       — output binary name (bore or bore.exe)
+#   RUSTFLAGS — extra flags (e.g. -C target-cpu=apple-m4)
+
+FROM messense/cargo-zigbuild:latest AS builder
+ARG TARGET
+ARG RUSTFLAGS=""
+WORKDIR /src
+COPY . .
+RUN rustup target add "${TARGET}"
+RUN RUSTFLAGS="${RUSTFLAGS}" cargo zigbuild --release --target "${TARGET}"
+
+# Export just the binary, so `buildx --output type=local` writes only it.
+FROM scratch
+ARG TARGET
+ARG BIN=bore
+COPY --from=builder /src/target/${TARGET}/release/${BIN} /${BIN}

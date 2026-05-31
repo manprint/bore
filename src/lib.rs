@@ -17,5 +17,10 @@
 
 pub mod auth;
 pub mod client;
+pub mod edge;
+pub mod mux;
+pub mod reconnect;
+pub mod secret;
 pub mod server;
 pub mod shared;
+pub mod transport;

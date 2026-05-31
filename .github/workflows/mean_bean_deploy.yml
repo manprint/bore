@@ -1,18 +1,23 @@
 on:
   push:
-    # # Sequence of patterns matched against refs/tags
+    branches:
+      - dev
+      - main
     tags:
       - "v*" # Push events to matching v*, i.e. v1.0, v20.15.10
+  workflow_dispatch:
 
 name: Mean Bean Deploy
 env:
   BIN: bore
 
+# On a version tag, binaries are attached to a GitHub Release. On branch pushes
+# they are uploaded as workflow artifacts (downloadable from the run), so `dev`
+# builds are available without creating a release.
+
 jobs:
   # This job downloads and stores `cross` as an artifact, so that it can be
-  # redownloaded across all of the jobs. Currently this copied pasted between
-  # `mean_bean_ci.yml` and `mean_bean_deploy.yml`. Make sure to update both places when making
-  # changes.
+  # redownloaded across all of the jobs.
   install-cross:
     runs-on: ubuntu-latest
     steps:
@@ -41,18 +46,17 @@ jobs:
     strategy:
       matrix:
         target:
-          # macOS
           - x86_64-apple-darwin
           - aarch64-apple-darwin
     steps:
-      - name: Get tag
-        id: tag
-        uses: dawidd6/action-get-tag@v1
-
       - name: Setup | Checkout
         uses: actions/checkout@v4
 
-      # Cache files between builds
+      - name: Setup | Version
+        id: ver
+        shell: bash
+        run: bash ci/version.bash
+
       - name: Setup | Cache Cargo
         uses: actions/cache@v4
         with:
@@ -62,22 +66,24 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.target }}
 
       - name: Setup | Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          override: true
-          profile: minimal
-          target: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
 
       - name: Build | Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - run: tar -czvf ${{ env.BIN }}.tar.gz --directory=target/${{ matrix.target }}/release ${{ env.BIN }}
+
+      - name: Upload | Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}
+          path: ${{ env.BIN }}.tar.gz
+
       - uses: XAMPPRocky/create-release@v1.0.2
         id: create_release
+        if: steps.ver.outputs.release == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -87,13 +93,13 @@ jobs:
           prerelease: false
 
       - uses: actions/upload-release-asset@v1
-        id: upload-release-asset
+        if: steps.ver.outputs.release == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: ${{ env.BIN }}.tar.gz
-          asset_name: ${{ env.BIN }}-${{steps.tag.outputs.tag}}-${{ matrix.target }}.tar.gz
+          asset_name: ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz
           asset_content_type: application/gzip
 
   linux:
@@ -110,11 +116,12 @@ jobs:
           - i686-unknown-linux-musl
           - x86_64-unknown-linux-musl
     steps:
-      - name: Get tag
-        id: tag
-        uses: dawidd6/action-get-tag@v1
-
       - uses: actions/checkout@v4
+
+      - name: Setup | Version
+        id: ver
+        run: bash ci/version.bash
+
       - uses: actions/download-artifact@v4
         with:
           name: cross-linux-musl
@@ -125,8 +132,15 @@ jobs:
       - run: ci/build.bash /tmp/cross ${{ matrix.target }} RELEASE
       - run: tar -czvf ${{ env.BIN }}.tar.gz --directory=target/${{ matrix.target }}/release ${{ env.BIN }}
 
+      - name: Upload | Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}
+          path: ${{ env.BIN }}.tar.gz
+
       - uses: XAMPPRocky/create-release@v1.0.2
         id: create_release
+        if: steps.ver.outputs.release == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -136,14 +150,14 @@ jobs:
           prerelease: false
 
       - name: Upload Release Asset
-        id: upload-release-asset
         uses: actions/upload-release-asset@v1
+        if: steps.ver.outputs.release == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: ${{ env.BIN }}.tar.gz
-          asset_name: ${{ env.BIN }}-${{steps.tag.outputs.tag}}-${{ matrix.target }}.tar.gz
+          asset_name: ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz
           asset_content_type: application/gzip
 
   windows:
@@ -155,15 +169,14 @@ jobs:
           # MSVC
           - i686-pc-windows-msvc
           - x86_64-pc-windows-msvc
-          # GNU
-          # - i686-pc-windows-gnu
-          # - x86_64-pc-windows-gnu
     steps:
-      - name: Get tag
-        id: tag
-        uses: dawidd6/action-get-tag@v1
-
       - uses: actions/checkout@v4
+
+      - name: Setup | Version
+        id: ver
+        shell: bash
+        run: bash ci/version.bash
+
       - run: bash ci/set_rust_version.bash stable ${{ matrix.target }}
       - run: bash ci/build.bash cargo ${{ matrix.target }} RELEASE
       - run: |
@@ -171,25 +184,76 @@ jobs:
           7z a "${{ env.BIN }}.zip" "${{ env.BIN }}.exe"
           mv "${{ env.BIN }}.zip" $GITHUB_WORKSPACE
         shell: bash
-        # We're using using a fork of `actions/create-release` that detects
-        # whether a release is already available or not first.
+
+      - name: Upload | Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}
+          path: ${{ env.BIN }}.zip
+
       - uses: XAMPPRocky/create-release@v1.0.2
         id: create_release
+        if: steps.ver.outputs.release == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref }}
           release_name: ${{ github.ref }}
-          # Draft should **always** be false. GitHub doesn't provide a way to
-          # get draft releases from its API, so there's no point using it.
           draft: false
           prerelease: false
+
       - uses: actions/upload-release-asset@v1
-        id: upload-release-asset
+        if: steps.ver.outputs.release == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: ${{ env.BIN }}.zip
-          asset_name: ${{ env.BIN }}-${{steps.tag.outputs.tag}}-${{ matrix.target }}.zip
+          asset_name: ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.zip
           asset_content_type: application/zip
+
+  # Android is built with the NDK (zig/cross cannot build `ring` for Android).
+  android:
+    name: android (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup | Version
+        id: ver
+        run: bash ci/version.bash
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build via the Android NDK
+        run: |
+          docker buildx build -f docker/Dockerfile.android --output type=local,dest=bin .
+          tar -czvf ${{ env.BIN }}.tar.gz --directory=bin ${{ env.BIN }}
+
+      - name: Upload | Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN }}-${{ steps.ver.outputs.name }}-aarch64-linux-android
+          path: ${{ env.BIN }}.tar.gz
+
+      - uses: XAMPPRocky/create-release@v1.0.2
+        id: create_release
+        if: steps.ver.outputs.release == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: ${{ github.ref }}
+          draft: false
+          prerelease: false
+
+      - uses: actions/upload-release-asset@v1
+        if: steps.ver.outputs.release == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ env.BIN }}.tar.gz
+          asset_name: ${{ env.BIN }}-${{ steps.ver.outputs.name }}-aarch64-linux-android.tar.gz
+          asset_content_type: application/gzip

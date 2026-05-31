@@ -17,22 +17,32 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { version = "1.0.56", features = ["backtrace"] }
-clap = { version = "4.0.22", features = ["derive", "env"] }
+clap = { version = "4.5.0", features = ["derive", "env"] }
 dashmap = "5.2.0"
-fastrand = "1.9.0"
+fastrand = "2"
 futures-util = { version = "0.3.21", features = ["sink"] }
 hex = "0.4.3"
 hmac = "0.12.1"
 serde = { version = "1.0.136", features = ["derive"] }
 serde_json = "1.0.79"
 sha2 = "0.10.2"
-tokio = { version = "1.17.0", features = ["rt-multi-thread", "io-util", "macros", "net", "time"] }
-tokio-util = { version = "0.7.1", features = ["codec"] }
+socket2 = "0.6.4"
+tokio = { version = "1.41.0", features = ["rt-multi-thread", "io-util", "macros", "net", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-util = { version = "0.7.1", features = ["codec", "compat"] }
 tracing = "0.1.32"
 tracing-subscriber = "0.3.18"
 uuid = { version = "1.2.1", features = ["serde", "v4"] }
+webpki-roots = "1.0.7"
+yamux = "0.13.10"
 
 [dev-dependencies]
 lazy_static = "1.4.0"
+rcgen = "0.14.8"
 rstest = "0.15.0"
-tokio = { version = "1.17.0", features = ["sync"] }
+tokio = { version = "1.41.0", features = ["sync"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

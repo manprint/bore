@@ -388,8 +388,13 @@ async fn concurrent_connections_are_bounded() -> Result<()> {
         closed = 0;
         for s in &mut socks {
             let mut buf = [0u8; 1];
-            if let Ok(Ok(0)) = time::timeout(Duration::from_millis(10), s.read(&mut buf)).await {
-                closed += 1; // EOF: server dropped this connection.
+            // A dropped connection shows up as a graceful EOF (`Ok(0)`, a FIN) or a
+            // reset (`Err`, an RST — Windows sends one when the socket is closed
+            // with our unread "x" still buffered). Both mean the server dropped it;
+            // a still-proxied connection just times out with no data ready.
+            match time::timeout(Duration::from_millis(10), s.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => closed += 1,
+                _ => {}
             }
         }
         if closed >= EXTRA {

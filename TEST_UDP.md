@@ -43,8 +43,10 @@ Flag rilevanti:
 - `--stun-server host:port` — STUN esterno; default = host di `--to` sulla control port (il server stesso fa da STUN).
 - `--secret S` — se il server ha `--secret`, provider e consumer devono passare lo stesso. Il token del path diretto è derivato dal secret.
 - `--tcp-secret-id ID` — deve combaciare tra provider e consumer.
+- `--upnp` (su `local` e `proxy`) — prova ad aprire una porta sul **router casalingo** via UPnP-IGD e la aggiunge come candidato. Aiuta router casalinghi strict con IP WAN pubblico; **inutile dietro CGNAT**. Log: `UPnP-IGD port mapping ENABLED`.
+- `--try-port-prediction` (su `local` e `proxy`) — per NAT **simmetrici**: annuncia qualche porta oltre quella reflexive. **Opt-in**, best-effort, **può sembrare un port scan** ai firewall strict. Log: `port prediction ENABLED`.
 
-Variabili d'ambiente equivalenti: `BORE_UDP`, `BORE_PREFER_UDP`, `BORE_STUN_SERVER`, `BORE_SECRET`, `BORE_TCP_SECRET_ID`, `BORE_SERVER`.
+Variabili d'ambiente equivalenti: `BORE_UDP`, `BORE_PREFER_UDP`, `BORE_STUN_SERVER`, `BORE_SECRET`, `BORE_TCP_SECRET_ID`, `BORE_SERVER`, `BORE_UPNP`, `BORE_TRY_PORT_PREDICTION`.
 
 > **Schema TLS vs plain.** Se il server ha un certificato (control in TLS), `--to`
 > deve usare `https://` — anche con porta esplicita: `--to https://host:7835`.
@@ -263,6 +265,28 @@ ancora dell'UDP): errore tipo `server requires authentication` / `server error`.
 
 ---
 
+### S8 — NAT difficili (UPnP + port prediction)
+
+Da provare su **due reti reali** (come S4). Aggiungi i flag su `local` E `proxy`:
+
+```shell
+# provider e consumer, su reti diverse:
+./bore local 8000 --tcp-secret-id svc --to https://SRV --udp --secret S --upnp --try-port-prediction
+./bore proxy --local-proxy-port :5555 --tcp-secret-id svc --to https://SRV --udp --secret S --upnp --try-port-prediction
+```
+
+**Atteso nei log** (`RUST_LOG=bore_cli=info`):
+- con `--upnp` su un router casalingo con UPnP attivo e IP WAN pubblico:
+  `UPnP-IGD port mapping ENABLED — added router-mapped candidate`. Dietro CGNAT
+  mobile: nessun effetto (il candidato mappato è comunque privato).
+- con `--try-port-prediction`: `port prediction ENABLED — advertising predicted
+  symmetric-NAT ports`. **Best-effort**: aiuta solo NAT simmetrici sequenziali;
+  può non funzionare e può apparire come uno scan a firewall strict.
+
+Se nemmeno questi bastano (es. CGNAT su entrambi i lati) → **relay** (atteso).
+
+---
+
 ## 4. Checklist rapida
 
 - [ ] S0 loopback: `using direct udp path` + curl OK
@@ -273,6 +297,7 @@ ancora dell'UDP): errore tipo `server requires authentication` / `server error`.
 - [ ] S5 tcpdump: in diretto i dati NON passano dal server
 - [ ] S6 trasferimento lungo: regge l'inattività
 - [ ] S7 secret errato: rifiutato
+- [ ] S8 NAT difficili: `--upnp` / `--try-port-prediction` loggano l'attivazione
 
 ---
 

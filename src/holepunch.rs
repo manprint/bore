@@ -29,9 +29,13 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::shared::CONTROL_PORT;
+
+/// Number of consecutive ports predicted past the reflexive one when
+/// `--try-port-prediction` is enabled (best-effort symmetric-NAT traversal).
+const PREDICT_RANGE: u16 = 4;
 
 #[cfg(feature = "udp")]
 use crate::shared::NETWORK_TIMEOUT;
@@ -104,8 +108,15 @@ pub async fn bind_socket() -> Result<UdpSocket> {
 
 /// Gather this peer's candidate addresses: the STUN-discovered reflexive address
 /// (for traversal across NATs) plus the primary local address (for same-LAN
-/// peers). Best-effort: an empty list means no usable candidate was found.
-pub async fn gather_candidates(socket: &UdpSocket, stun: SocketAddr) -> Vec<SocketAddr> {
+/// peers). Optionally adds a router-mapped candidate (`port_map`, UPnP-IGD) and
+/// predicted symmetric-NAT ports (`port_prediction`). Best-effort: an empty list
+/// means no usable candidate was found.
+pub async fn gather_candidates(
+    socket: &UdpSocket,
+    stun: SocketAddr,
+    port_map: bool,
+    port_prediction: bool,
+) -> Vec<SocketAddr> {
     let mut candidates = Vec::new();
     let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
 
@@ -113,9 +124,48 @@ pub async fn gather_candidates(socket: &UdpSocket, stun: SocketAddr) -> Vec<Sock
         Ok(addr) => {
             debug!(%addr, "discovered reflexive address");
             candidates.push(addr);
+
+            // Symmetric NATs allocate a *different* external port per
+            // destination, so the port toward the peer differs from the one seen
+            // by STUN — often sequentially. When explicitly enabled, advertise a
+            // few ports just past the reflexive one as extra candidates. Strictly
+            // opt-in: advertising/punching extra ports may look like a scan to
+            // strict firewalls.
+            if port_prediction {
+                let base = addr.port();
+                let mut added = 0u16;
+                for delta in 1..=PREDICT_RANGE {
+                    if let Some(port) = base.checked_add(delta) {
+                        candidates.push(SocketAddr::new(addr.ip(), port));
+                        added += 1;
+                    }
+                }
+                warn!(
+                    reflexive_port = base,
+                    predicted = added,
+                    "port prediction ENABLED — advertising predicted symmetric-NAT ports \
+                     (best-effort; may look like a scan to strict firewalls)"
+                );
+            }
         }
         Err(err) => debug!(%err, "STUN reflexive discovery failed"),
     }
+
+    // Router-mapped candidate via UPnP-IGD, when explicitly enabled.
+    #[cfg(feature = "udp")]
+    if port_map {
+        match upnp_candidate(local_port).await {
+            Ok(addr) => {
+                warn!(%addr, "UPnP-IGD port mapping ENABLED — added router-mapped candidate");
+                if !candidates.contains(&addr) {
+                    candidates.push(addr);
+                }
+            }
+            Err(err) => debug!(%err, "UPnP-IGD port mapping failed; skipping that candidate"),
+        }
+    }
+    #[cfg(not(feature = "udp"))]
+    let _ = port_map;
 
     // A local candidate lets two peers behind the same NAT connect directly.
     if let Some(ip) = primary_local_ip() {
@@ -125,6 +175,35 @@ pub async fn gather_candidates(socket: &UdpSocket, stun: SocketAddr) -> Vec<Sock
         }
     }
     candidates
+}
+
+/// Ask the local router (UPnP-IGD) to map an external UDP port to our socket and
+/// return the resulting public `ip:port` candidate. Helps strict *home* routers
+/// with a public WAN IP; useless behind carrier-grade NAT (the mapped address is
+/// then itself a private/CGNAT address).
+#[cfg(feature = "udp")]
+async fn upnp_candidate(local_port: u16) -> Result<SocketAddr> {
+    use igd_next::aio::tokio as igd;
+    use igd_next::{PortMappingProtocol, SearchOptions};
+
+    let local_ip = primary_local_ip().context("no local IPv4 for UPnP mapping")?;
+    let local = SocketAddr::new(local_ip, local_port);
+    let options = SearchOptions {
+        timeout: Some(Duration::from_secs(2)),
+        ..Default::default()
+    };
+    let gateway = igd::search_gateway(options)
+        .await
+        .context("no UPnP-IGD gateway found")?;
+    let external_port = gateway
+        .add_any_port(PortMappingProtocol::UDP, local, 120, "bore")
+        .await
+        .context("UPnP-IGD port mapping request failed")?;
+    let wan = gateway
+        .get_external_ip()
+        .await
+        .context("UPnP-IGD external IP query failed")?;
+    Ok(SocketAddr::new(wan, external_port))
 }
 
 /// Resolve the STUN server address: the explicit override (`host:port`), or the
@@ -700,5 +779,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(over, "127.0.0.1:1234".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn port_prediction_advertises_consecutive_ports() {
+        // Stand up a local STUN responder and gather with prediction on.
+        let responder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stun = responder.local_addr().unwrap();
+        tokio::spawn(run_stun_responder(responder));
+
+        let socket = bind_socket().await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let candidates = gather_candidates(&socket, stun, false, true).await;
+
+        // The reflexive candidate (loopback source) and PREDICT_RANGE ports past it.
+        let reflexive: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        assert!(
+            candidates.contains(&reflexive),
+            "missing reflexive candidate"
+        );
+        for delta in 1..=PREDICT_RANGE {
+            if let Some(p) = port.checked_add(delta) {
+                let predicted: SocketAddr = format!("127.0.0.1:{p}").parse().unwrap();
+                assert!(
+                    candidates.contains(&predicted),
+                    "missing predicted port {p}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn port_prediction_off_adds_no_extra_ports() {
+        let responder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stun = responder.local_addr().unwrap();
+        tokio::spawn(run_stun_responder(responder));
+
+        let socket = bind_socket().await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let candidates = gather_candidates(&socket, stun, false, false).await;
+        // No predicted port should appear when prediction is disabled.
+        for delta in 1..=PREDICT_RANGE {
+            if let Some(p) = port.checked_add(delta) {
+                let predicted: SocketAddr = format!("127.0.0.1:{p}").parse().unwrap();
+                assert!(
+                    !candidates.contains(&predicted),
+                    "unexpected predicted port {p}"
+                );
+            }
+        }
     }
 }

@@ -67,8 +67,9 @@ Current test inventory: `e2e_test` (13 runs), `auth_test` (2), `mux_test` (2),
 `secret_test` (7), `control_port_test` (1), `tls_test` (5), `reconnect_test` (2),
 `udp_test` (5, `#![cfg(feature = "udp")]` — direct round-trip, consumer
 reconnect, consumer detects provider drop, **relay→direct upgrade**, relay
-fallback on loopback), lib unit tests (14: `transport.rs` 7, `reconnect.rs` 2,
-`shared.rs` 1, `holepunch.rs` 4), plus 1 doctest. Baseline before this work was 12 e2e + 2 auth
+fallback on loopback), lib unit tests (16: `transport.rs` 7, `reconnect.rs` 2,
+`shared.rs` 1, `holepunch.rs` 6 incl. port-prediction candidate generation),
+plus 1 doctest. Baseline before this work was 12 e2e + 2 auth
 + 1 doctest.
 
 ## Architecture (after the rewrite)
@@ -204,7 +205,10 @@ Each bullet = one or more commits on `perf-hardening`.
     retries the direct negotiation every 10s and upgrades in place when the
     provider becomes reachable, so it always converges to direct without dropping.
     Only secret tunnels (not public-port); both peers symmetric-NAT → relay.
-    See `TEST_UDP.md`.
+    **Hard-NAT extras** (opt-in, on `local` + `proxy`): `--upnp` (UPnP-IGD router
+    port mapping via `igd-next`; home routers only, not CGNAT) and
+    `--try-port-prediction` (advertise predicted symmetric-NAT ports; best-effort,
+    logged, may look like a scan). See `TEST_UDP.md`.
 
 ## CLI flags & env vars (all flags read env where present)
 
@@ -219,11 +223,13 @@ Each bullet = one or more commits on `perf-hardening`.
   `--tcp-secret-id`/`BORE_TCP_SECRET_ID`, `--insecure`/`BORE_INSECURE`,
   `--https`/`BORE_HTTPS`, `--force-https`/`BORE_FORCE_HTTPS` (requires `--https`),
   `--udp`/`BORE_PREFER_UDP`, `--stun-server`/`BORE_STUN_SERVER`,
+  `--upnp`/`BORE_UPNP`, `--try-port-prediction`/`BORE_TRY_PORT_PREDICTION`,
   `--auto-reconnect`/`BORE_AUTO_RECONNECT`.
 - **proxy:** `--local-proxy-port`/`BORE_LOCAL_PROXY_PORT` (`:5555` = all
   interfaces), `--to`/`BORE_SERVER`, `-s`/`BORE_SECRET`,
   `--tcp-secret-id`/`BORE_TCP_SECRET_ID`, `--insecure`/`BORE_INSECURE`,
   `--udp`/`BORE_PREFER_UDP`, `--stun-server`/`BORE_STUN_SERVER`,
+  `--upnp`/`BORE_UPNP`, `--try-port-prediction`/`BORE_TRY_PORT_PREDICTION`,
   `--auto-reconnect`/`BORE_AUTO_RECONNECT`.
 
 ## Dependencies added
@@ -234,8 +240,9 @@ certs in tls tests). `rustls-pemfile` was deliberately NOT used (unmaintained,
 RUSTSEC-2025-0134) — PEM parsing uses `rustls-pki-types`.
 
 Under the **`udp` feature (default-on)**: `quinn` (0.11, `rustls-ring` +
-`runtime-tokio`, shares rustls 0.23 with tokio-rustls) and `rcgen` (promoted to an
-optional normal dep for the self-signed QUIC cert). `[features] default = ["udp"]`;
+`runtime-tokio`, shares rustls 0.23 with tokio-rustls), `rcgen` (promoted to an
+optional normal dep for the self-signed QUIC cert), and `igd-next` (0.16,
+`aio_tokio`; UPnP-IGD for `--upnp`). `[features] default = ["udp"]`;
 `udp = ["dep:quinn", "dep:rcgen"]`. quinn/quinn-udp internally use `unsafe`, which
 is fine — `#![forbid(unsafe_code)]` constrains only our crate, not deps. quinn
 cross-compiles on all CI targets (verified: arm-gnueabi, arm-musleabi, i686-musl,

@@ -21,7 +21,7 @@ default = ["udp"]
 # QUIC, with automatic fallback to the server relay. On by default; pulls `quinn`
 # (and `quinn-udp`). Build with `--no-default-features` to drop it (e.g. for a
 # target where `quinn` does not compile).
-udp = ["dep:quinn", "dep:rcgen"]
+udp = ["dep:quinn", "dep:rcgen", "dep:igd-next"]
 
 [dependencies]
 anyhow = { version = "1.0.56", features = ["backtrace"] }
@@ -47,6 +47,7 @@ yamux = "0.13.10"
 # Optional, enabled by the `udp` feature (see [features]).
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 rcgen = { version = "0.14.8", optional = true }
+igd-next = { version = "0.16", default-features = false, features = ["aio_tokio"], optional = true }
 
 [dev-dependencies]
 lazy_static = "1.4.0"

@@ -145,6 +145,8 @@ Options:
       --force-https            Redirect plain HTTP to https:// (requires --https) [env: BORE_FORCE_HTTPS=]
       --udp                    Prefer a direct UDP hole-punched path (secret tunnels only) [env: BORE_PREFER_UDP=]
       --stun-server <HOST:PORT> STUN server for the direct path [env: BORE_STUN_SERVER=]
+      --upnp                   Map a router port via UPnP-IGD for the direct path [env: BORE_UPNP=]
+      --try-port-prediction    Advertise predicted symmetric-NAT ports (opt-in, best-effort) [env: BORE_TRY_PORT_PREDICTION=]
       --auto-reconnect         Reconnect automatically with backoff if the connection drops [env: BORE_AUTO_RECONNECT=]
   -h, --help                   Print help
 ```
@@ -267,6 +269,8 @@ Options:
       --insecure                 Skip TLS certificate verification [env: BORE_INSECURE=]
       --udp                      Prefer a direct UDP hole-punched path [env: BORE_PREFER_UDP=]
       --stun-server <HOST:PORT>  STUN server for the direct path [env: BORE_STUN_SERVER=]
+      --upnp                     Map a router port via UPnP-IGD for the direct path [env: BORE_UPNP=]
+      --try-port-prediction      Advertise predicted symmetric-NAT ports (opt-in, best-effort) [env: BORE_TRY_PORT_PREDICTION=]
       --auto-reconnect           Reconnect automatically with backoff if the connection drops [env: BORE_AUTO_RECONNECT=]
   -h, --help                     Print help
 ```
@@ -310,6 +314,26 @@ Notes:
 - To confirm the direct path is in use, look for `using direct udp path` /
   `direct udp carrier established (… token verified)` in the logs
   (`RUST_LOG=bore_cli=info`).
+
+**Hard NATs and firewalls.** Two extra, opt-in candidate sources help with
+difficult networks (both flags go on `bore local` and `bore proxy`, since both
+peers punch):
+
+- `--upnp` — ask the local **home** router to open a port via UPnP-IGD and
+  advertise it as a candidate. Helps strict home routers that have a public WAN
+  IP; **no effect behind carrier-grade NAT** (mobile/CGNAT), where the mapped
+  address is itself private. When active you'll see `UPnP-IGD port mapping
+  ENABLED` in the logs.
+- `--try-port-prediction` — for **symmetric** NATs (which use a different
+  external port per destination), advertise a few ports just past the
+  STUN-observed one. **Strictly opt-in**, best-effort, and **may look like a port
+  scan to strict firewalls** — so it is off unless you set the flag, and logs a
+  clear `port prediction ENABLED` line when used. Often won't help random-port
+  NATs.
+
+For the genuinely untraversable cases (e.g. CGNAT on both ends), the **server
+relay is the reliable fallback** and the tunnel keeps working over it — `--udp`
+never makes a tunnel fail.
 
 ## Protocol
 

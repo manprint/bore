@@ -334,6 +334,12 @@ pub struct Proxy {
     /// Explicit STUN server, retained for the upgrade negotiation.
     #[cfg(feature = "udp")]
     stun_server: Option<String>,
+    /// Whether to attempt UPnP-IGD router port mapping during (re)negotiation.
+    #[cfg(feature = "udp")]
+    port_map: bool,
+    /// Whether to advertise predicted symmetric-NAT ports during (re)negotiation.
+    #[cfg(feature = "udp")]
+    port_prediction: bool,
 }
 
 /// How often a relay-mode consumer retries the direct UDP path (so it upgrades
@@ -344,6 +350,7 @@ const UDP_UPGRADE_INTERVAL: Duration = Duration::from_secs(10);
 impl Proxy {
     /// Connect to the server, register as a consumer of `tcp_secret_id`, and bind
     /// the local proxy listener.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         to: &str,
         bind_addr: SocketAddr,
@@ -352,6 +359,8 @@ impl Proxy {
         insecure: bool,
         udp: bool,
         stun_server: Option<&str>,
+        port_map: bool,
+        port_prediction: bool,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
@@ -389,7 +398,16 @@ impl Proxy {
         let mut direct = false;
         let mut direct_acceptor = None;
         if udp {
-            match negotiate_direct_consumer(&mut control, &endpoint, secret, stun_server).await {
+            match negotiate_direct_consumer(
+                &mut control,
+                &endpoint,
+                secret,
+                stun_server,
+                port_map,
+                port_prediction,
+            )
+            .await
+            {
                 Ok(Some((opener, acceptor))) => {
                     info!(%tcp_secret_id, "using direct udp path");
                     data_opener = opener;
@@ -420,6 +438,10 @@ impl Proxy {
             secret: secret.map(str::to_string),
             #[cfg(feature = "udp")]
             stun_server: stun_server.map(str::to_string),
+            #[cfg(feature = "udp")]
+            port_map,
+            #[cfg(feature = "udp")]
+            port_prediction,
         })
     }
 
@@ -450,6 +472,10 @@ impl Proxy {
             secret,
             #[cfg(feature = "udp")]
             stun_server,
+            #[cfg(feature = "udp")]
+            port_map,
+            #[cfg(feature = "udp")]
+            port_prediction,
         } = self;
         let mut path = if direct { "direct-udp" } else { "relay" };
         #[cfg(feature = "udp")]
@@ -467,6 +493,8 @@ impl Proxy {
                     &endpoint,
                     secret.as_deref(),
                     stun_server.as_deref(),
+                    port_map,
+                    port_prediction,
                 )
                 .await
                 {
@@ -549,12 +577,14 @@ async fn negotiate_direct_consumer(
     endpoint: &Endpoint,
     secret: Option<&str>,
     stun_server: Option<&str>,
+    port_map: bool,
+    port_prediction: bool,
 ) -> Result<Option<(mux::Opener, mux::Acceptor)>> {
     use crate::holepunch;
 
     let stun = holepunch::resolve_stun(&endpoint.host, endpoint.port, stun_server).await?;
     let socket = holepunch::bind_socket().await?;
-    let candidates = holepunch::gather_candidates(&socket, stun).await;
+    let candidates = holepunch::gather_candidates(&socket, stun, port_map, port_prediction).await;
     if candidates.is_empty() {
         bail!("no local UDP candidates discovered");
     }
@@ -599,6 +629,8 @@ async fn negotiate_direct_consumer(
     _endpoint: &Endpoint,
     _secret: Option<&str>,
     _stun_server: Option<&str>,
+    _port_map: bool,
+    _port_prediction: bool,
 ) -> Result<Option<(mux::Opener, mux::Acceptor)>> {
     warn!("built without the `udp` feature; ignoring direct-path request");
     Ok(None)

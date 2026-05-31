@@ -66,6 +66,16 @@ enum Command {
         #[clap(long, env = "BORE_STUN_SERVER")]
         stun_server: Option<String>,
 
+        /// Try UPnP-IGD to map a port on the local router (helps strict home
+        /// routers; no effect behind carrier-grade NAT). Direct UDP path only.
+        #[clap(long, env = "BORE_UPNP")]
+        upnp: bool,
+
+        /// Also advertise predicted symmetric-NAT ports as hole-punch candidates.
+        /// Opt-in, best-effort: it may look like a port scan to strict firewalls.
+        #[clap(long, env = "BORE_TRY_PORT_PREDICTION")]
+        try_port_prediction: bool,
+
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
         auto_reconnect: bool,
@@ -103,6 +113,16 @@ enum Command {
         /// bore server's control endpoint.
         #[clap(long, env = "BORE_STUN_SERVER")]
         stun_server: Option<String>,
+
+        /// Try UPnP-IGD to map a port on the local router (helps strict home
+        /// routers; no effect behind carrier-grade NAT). Direct UDP path only.
+        #[clap(long, env = "BORE_UPNP")]
+        upnp: bool,
+
+        /// Also advertise predicted symmetric-NAT ports as hole-punch candidates.
+        /// Opt-in, best-effort: it may look like a port scan to strict firewalls.
+        #[clap(long, env = "BORE_TRY_PORT_PREDICTION")]
+        try_port_prediction: bool,
 
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
@@ -173,6 +193,8 @@ async fn run(command: Command) -> Result<()> {
             force_https,
             udp,
             stun_server,
+            upnp,
+            try_port_prediction,
             auto_reconnect,
         } => match tcp_secret_id {
             Some(id) => {
@@ -194,6 +216,8 @@ async fn run(command: Command) -> Result<()> {
                             insecure,
                             udp,
                             stun_server.as_deref(),
+                            upnp,
+                            try_port_prediction,
                         )
                         .await
                     }
@@ -228,6 +252,8 @@ async fn run(command: Command) -> Result<()> {
             insecure,
             udp,
             stun_server,
+            upnp,
+            try_port_prediction,
             auto_reconnect,
         } => {
             let bind_addr = parse_proxy_addr(&local_proxy_port)?;
@@ -247,6 +273,8 @@ async fn run(command: Command) -> Result<()> {
                         insecure,
                         udp,
                         stun_server.as_deref(),
+                        upnp,
+                        try_port_prediction,
                     )
                     .await
                 }

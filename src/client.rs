@@ -129,6 +129,8 @@ impl Client {
         insecure: bool,
         udp: bool,
         stun_server: Option<&str>,
+        port_map: bool,
+        port_prediction: bool,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
@@ -166,7 +168,15 @@ impl Client {
         // a consumer arrives and the server replies with `UdpPunch`.
         #[cfg(feature = "udp")]
         let udp_socket = if udp {
-            match offer_provider_candidates(&mut control, &endpoint, stun_server).await {
+            match offer_provider_candidates(
+                &mut control,
+                &endpoint,
+                stun_server,
+                port_map,
+                port_prediction,
+            )
+            .await
+            {
                 Ok(socket) => Some(socket),
                 Err(err) => {
                     warn!(%err, "udp candidate offer failed, relay only");
@@ -300,11 +310,13 @@ async fn offer_provider_candidates(
     control: &mut Delimited<mux::Stream>,
     endpoint: &Endpoint,
     stun_server: Option<&str>,
+    port_map: bool,
+    port_prediction: bool,
 ) -> Result<UdpSocket> {
     use crate::holepunch;
     let stun = holepunch::resolve_stun(&endpoint.host, endpoint.port, stun_server).await?;
     let socket = holepunch::bind_socket().await?;
-    let candidates = holepunch::gather_candidates(&socket, stun).await;
+    let candidates = holepunch::gather_candidates(&socket, stun, port_map, port_prediction).await;
     if candidates.is_empty() {
         bail!("no local UDP candidates discovered");
     }

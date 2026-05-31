@@ -120,7 +120,7 @@ async fn proxy_reconnects_when_server_appears() -> Result<()> {
         let connect = move || async move {
             let to = format!("localhost:{CONTROL}");
             let bind = format!("127.0.0.1:{LOCAL_PROXY}").parse().unwrap();
-            Proxy::new(&to, bind, "svc", None, false, false, None).await
+            Proxy::new(&to, bind, "svc", None, false, false, None, false, false).await
         };
         let serve = |proxy: Proxy| async move { proxy.listen().await };
         let _ = reconnect::run(true, connect, serve).await;
@@ -134,9 +134,19 @@ async fn proxy_reconnects_when_server_appears() -> Result<()> {
     wait_port(CONTROL, true).await;
 
     let to = format!("localhost:{CONTROL}");
-    let provider =
-        Client::new_secret_provider("localhost", echo, &to, "svc", None, false, false, None)
-            .await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo,
+        &to,
+        "svc",
+        None,
+        false,
+        false,
+        None,
+        false,
+        false,
+    )
+    .await?;
     tokio::spawn(provider.listen());
 
     assert!(

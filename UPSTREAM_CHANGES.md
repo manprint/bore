@@ -65,9 +65,10 @@ tags/releases accumulate per push (prune if noisy).
 
 Current test inventory: `e2e_test` (13 runs), `auth_test` (2), `mux_test` (2),
 `secret_test` (7), `control_port_test` (1), `tls_test` (5), `reconnect_test` (2),
-`udp_test` (3, `#![cfg(feature = "udp")]` — direct round-trip, consumer
-reconnect, relay fallback on loopback), lib unit tests (14: `transport.rs` 7,
-`reconnect.rs` 2, `shared.rs` 1, `holepunch.rs` 4), plus 1 doctest. Baseline before this work was 12 e2e + 2 auth
+`udp_test` (4, `#![cfg(feature = "udp")]` — direct round-trip, consumer
+reconnect, **consumer detects provider drop**, relay fallback on loopback), lib
+unit tests (14: `transport.rs` 7, `reconnect.rs` 2, `shared.rs` 1,
+`holepunch.rs` 4), plus 1 doctest. Baseline before this work was 12 e2e + 2 auth
 + 1 doctest.
 
 ## Architecture (after the rewrite)

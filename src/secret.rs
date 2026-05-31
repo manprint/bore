@@ -316,6 +316,10 @@ pub struct Proxy {
     listener: TcpListener,
     /// Whether data flows over a direct UDP path rather than the server relay.
     direct: bool,
+    /// The direct path's mux acceptor, kept only to detect that path dying: it
+    /// yields `None` when the QUIC connection to the provider closes (e.g. the
+    /// provider restarted), which tears the proxy down so it re-negotiates.
+    direct_acceptor: Option<mux::Acceptor>,
 }
 
 impl Proxy {
@@ -364,12 +368,14 @@ impl Proxy {
         // opener so the tunnel still works through the server.
         let mut data_opener = opener;
         let mut direct = false;
+        let mut direct_acceptor = None;
         if udp {
             match negotiate_direct_consumer(&mut control, &endpoint, secret, stun_server).await {
-                Ok(Some(opener)) => {
+                Ok(Some((opener, acceptor))) => {
                     info!(%tcp_secret_id, "using direct udp path");
                     data_opener = opener;
                     direct = true;
+                    direct_acceptor = Some(acceptor);
                 }
                 Ok(None) => info!(%tcp_secret_id, "udp unavailable, using relay"),
                 Err(err) => warn!(%err, "udp negotiation failed, using relay"),
@@ -386,6 +392,7 @@ impl Proxy {
             opener: data_opener,
             listener,
             direct,
+            direct_acceptor,
         })
     }
 
@@ -406,6 +413,7 @@ impl Proxy {
             opener,
             listener,
             direct,
+            mut direct_acceptor,
         } = self;
         let path = if direct { "direct-udp" } else { "relay" };
         loop {
@@ -421,6 +429,13 @@ impl Proxy {
                         Some(ServerMessage::UdpUnavailable) => warn!("unexpected udp unavailable"),
                         None => return Ok(()),
                     }
+                }
+                // Detect the direct UDP path dying (provider restart / QUIC close)
+                // even while the server control channel stays up: tear down so
+                // auto-reconnect re-negotiates a fresh path (direct or relay).
+                _ = direct_path_closed(&mut direct_acceptor) => {
+                    warn!("direct udp path closed; reconnecting");
+                    return Ok(());
                 }
                 accepted = listener.accept() => {
                     let (local, addr) = match accepted {
@@ -447,15 +462,29 @@ impl Proxy {
     }
 }
 
+/// Resolve when the direct UDP path closes: the direct mux's acceptor yields
+/// `None` once the QUIC connection to the provider is gone (or, unexpectedly, an
+/// inbound substream). Stays pending forever in relay mode (no direct acceptor),
+/// so the `select!` only watches the control channel there.
+async fn direct_path_closed(acceptor: &mut Option<mux::Acceptor>) {
+    match acceptor {
+        Some(a) => {
+            let _ = a.accept().await;
+        }
+        None => pending().await,
+    }
+}
+
 /// Negotiate a direct UDP path as the consumer (QUIC client). Returns the direct
-/// substream opener on success, or `None` to fall back to the server relay.
+/// substream opener **and** acceptor (the latter only to detect the path dying)
+/// on success, or `None` to fall back to the server relay.
 #[cfg(feature = "udp")]
 async fn negotiate_direct_consumer(
     control: &mut Delimited<mux::Stream>,
     endpoint: &Endpoint,
     secret: Option<&str>,
     stun_server: Option<&str>,
-) -> Result<Option<mux::Opener>> {
+) -> Result<Option<(mux::Opener, mux::Acceptor)>> {
     use crate::holepunch;
 
     let stun = holepunch::resolve_stun(&endpoint.host, endpoint.port, stun_server).await?;
@@ -495,8 +524,8 @@ async fn negotiate_direct_consumer(
 
     let token = holepunch::derive_token(secret, &nonce);
     let quic = holepunch::connect_direct(socket, peer, token).await?;
-    let (opener, _acceptor) = mux::client(quic);
-    Ok(Some(opener))
+    let (opener, acceptor) = mux::client(quic);
+    Ok(Some((opener, acceptor)))
 }
 
 #[cfg(not(feature = "udp"))]
@@ -505,7 +534,7 @@ async fn negotiate_direct_consumer(
     _endpoint: &Endpoint,
     _secret: Option<&str>,
     _stun_server: Option<&str>,
-) -> Result<Option<mux::Opener>> {
+) -> Result<Option<(mux::Opener, mux::Acceptor)>> {
     warn!("built without the `udp` feature; ignoring direct-path request");
     Ok(None)
 }

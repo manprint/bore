@@ -286,9 +286,17 @@ ancora dell'UDP): errore tipo `server requires authentication` / `server error`.
   QUIC persistente e ri-buca verso ogni nuovo consumer; nonce stabile per-provider
   → tutti i consumer derivano lo stesso token. Un `bore proxy` che si riconnette
   (o un secondo proxy sullo stesso id) ritorna sul path diretto.
-- Se la connessione QUIC cade a metà sessione, non c'è re-fallback "a caldo" per le
-  connessioni già aperte: cadono, le nuove ripartono (diretto o relay con
-  `--auto-reconnect`).
+- **Resilienza alle cadute (usa `--auto-reconnect` su client e proxy):**
+  - **Provider cade/riavvia:** il consumer rileva la morte del path diretto e si
+    riconnette → ri-negozia (diretto se il provider è tornato, altrimenti relay).
+    Rilevamento immediato su chiusura pulita, entro ~10s (idle timeout QUIC) su
+    kill brutale.
+  - **Consumer cade/riavvia:** il provider ri-buca verso il nuovo consumer →
+    torna diretto.
+  - **Server cade:** entrambi perdono il canale di controllo → riconnessione con
+    backoff finché il server torna, poi ri-negoziazione.
+- Le connessioni TCP locali **già aperte** quando un peer cade vengono interrotte
+  (non c'è migrazione a caldo); le nuove ripartono sul path ristabilito.
 - `--stun-server` accetta IPv4; i candidati raccolti sono IPv4.
 
 ---

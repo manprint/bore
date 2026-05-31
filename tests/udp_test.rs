@@ -183,6 +183,60 @@ async fn udp_direct_survives_consumer_reconnect() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_consumer_detects_provider_drop() -> Result<()> {
+    // When the provider dies, the consumer's direct QUIC path dies too. The
+    // consumer must notice (even though its control channel to the server stays
+    // up) and return from `listen()` so `--auto-reconnect` can re-negotiate —
+    // regression: it used to keep using the dead path ("failed to open stream").
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+
+    let echo = spawn_echo_service().await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo,
+        "localhost",
+        "drop",
+        None,
+        false,
+        true,
+        Some(&stun),
+    )
+    .await?;
+    let h_provider = tokio::spawn(provider.listen());
+    time::sleep(Duration::from_millis(300)).await;
+
+    let proxy = Proxy::new(
+        "localhost",
+        "127.0.0.1:0".parse()?,
+        "drop",
+        None,
+        false,
+        true,
+        Some(&stun),
+    )
+    .await?;
+    assert!(proxy.is_direct(), "consumer should be direct");
+    let addr = proxy.local_addr()?;
+    let h_proxy = tokio::spawn(proxy.listen());
+    time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(round_trip(addr, b"alive").await?, b"alive");
+
+    // Kill the provider: aborting its listen drops the punch channel, the direct
+    // QUIC endpoint closes, and the consumer's path dies.
+    h_provider.abort();
+
+    // The consumer's listen() must return (not hang on the dead path).
+    let returned = time::timeout(Duration::from_secs(10), h_proxy).await;
+    assert!(
+        returned.is_ok(),
+        "consumer should detect the dead direct path and stop serving"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn udp_falls_back_to_relay_without_udp_provider() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
     spawn_server(true).await; // STUN available so the consumer gathers quickly

@@ -63,12 +63,14 @@ const STUN_TIMEOUT: Duration = Duration::from_secs(1);
 const ALPN: &[u8] = b"bore-udp";
 
 /// How long to keep a quiet QUIC connection alive with keep-alive pings, and the
-/// idle timeout after which it is considered dead. Mirrors the TCP keepalive
-/// intent: never drop a long but quiet established transfer.
+/// idle timeout after which it is considered dead. The keep-alive (every 3s)
+/// keeps a long but quiet transfer alive; the idle timeout (10s) makes a peer
+/// that vanished without a graceful close (hard kill, network partition) be
+/// detected within ~10s so the consumer can re-negotiate or fall back.
 #[cfg(feature = "udp")]
-const QUIC_KEEPALIVE: Duration = Duration::from_secs(15);
+const QUIC_KEEPALIVE: Duration = Duration::from_secs(3);
 #[cfg(feature = "udp")]
-const QUIC_MAX_IDLE: Duration = Duration::from_secs(60);
+const QUIC_MAX_IDLE: Duration = Duration::from_secs(10);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -307,6 +309,12 @@ impl DirectListener {
         punch(&socket, &peers).await;
         let endpoint = server_endpoint(socket)?;
         Ok(DirectListener { endpoint })
+    }
+
+    /// Gracefully close the endpoint and all its connections, so the peer detects
+    /// the shutdown immediately instead of waiting for the idle timeout.
+    pub fn close(&self) {
+        self.endpoint.close(0u32.into(), b"provider shutting down");
     }
 
     /// Re-open this endpoint's NAT mapping toward a new (e.g. reconnecting)

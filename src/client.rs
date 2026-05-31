@@ -368,8 +368,12 @@ async fn provider_direct(
                     info!(?peers, "re-punching direct udp path toward consumer");
                     listener.punch_via_endpoint(&peers);
                 }
-                // Control connection gone: tear the direct path down.
-                None => return Ok(()),
+                // Control connection gone: close the endpoint gracefully so the
+                // consumer detects the teardown at once, then stop.
+                None => {
+                    listener.close();
+                    return Ok(());
+                }
             }
         }
     }

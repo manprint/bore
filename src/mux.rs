@@ -37,7 +37,24 @@ pub const STREAM_READY: u8 = 0;
 /// Generous cap on concurrent substreams. The meaningful bound on proxied
 /// connections is enforced by the server's `--max-conns` semaphore; this only
 /// keeps `yamux` itself from ever being the limiting factor.
+///
+/// `yamux` asserts `max_connection_receive_window >= max_num_streams * 256 KiB`
+/// (computed even when the window is unbounded). On 32-bit targets that product
+/// must stay under `usize::MAX` (~4 GiB), so the cap is lowered there — still
+/// far above the default `--max-conns` of 1024.
+#[cfg(target_pointer_width = "64")]
 const MAX_NUM_STREAMS: usize = 1 << 16;
+#[cfg(not(target_pointer_width = "64"))]
+const MAX_NUM_STREAMS: usize = 1 << 13;
+
+// Guard against re-introducing the 32-bit overflow: this is exactly the product
+// `yamux` multiplies (and would panic on) in its config assertions.
+const _: () = assert!(
+    MAX_NUM_STREAMS
+        .checked_mul(yamux::DEFAULT_CREDIT as usize)
+        .is_some(),
+    "MAX_NUM_STREAMS * yamux::DEFAULT_CREDIT must not overflow usize on this target",
+);
 
 fn config() -> Config {
     let mut cfg = Config::default();

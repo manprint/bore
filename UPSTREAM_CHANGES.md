@@ -251,6 +251,25 @@ Each bullet = one or more commits on `perf-hardening`.
     SIGTERM (`tokio::signal`) → clean exit with a log line. **Help** made uniform:
     short `value_name`s on every flag so all subcommands render the same compact
     layout. New `CHANGELOG.md` + `CONTRIBUTING.md`; README help blocks synced.
+19. **Basic auth, notes, and an admin status page** (new modules `admin.rs`,
+    `admin_http.rs`, `basicauth.rs`, `prefixed.rs`; `admin_status.html` embedded):
+    - **`--basic-auth user:pass`** (`local`, `BORE_BASIC_AUTH`) — HTTP Basic auth.
+      Public tunnels enforced **server-side** in `edge.rs` (creds travel in
+      `TunnelOptions`); secret tunnels enforced **provider-side** in
+      `client::handle_connection` (relay + direct; creds stay local). `basicauth::
+      gate` reads the HTTP head, returns `401` or forwards it via `Prefixed`; non-
+      HTTP is passed through unprotected. Hand-rolled base64 + constant-time compare
+      (no new dep). `ClientMessage` grew struct variants (`HelloSecret`/
+      `ConnectSecret`) and `TunnelOptions` grew `basic_auth`/`notes`; `MAX_FRAME_
+      LENGTH` is 1024 (notes clamped to `MAX_NOTES_LEN = 256`).
+    - **`--notes`** (`local` + `proxy`, `BORE_NOTES`) — operator label for the page.
+    - **`--admin-token`** (`server`, `BORE_ADMIN_TOKEN`, ≥32 chars) — enables a
+      read-only dashboard at `/admin/status` on the control port (http/https per the
+      control scheme). `server::route_connection` peeks the first byte (HTTP →
+      `admin_http`, else bore protocol via `Prefixed`); **disabled = exact original
+      path**. `AdminRegistry` is in-memory/stateless with RAII deregistration;
+      `serve_*`/`serve_tunnel` register entries and count live connections. The page
+      polls JSON every ~2s, is embedded (`include_str!`), fetches no external assets.
 
 ## CLI flags & env vars (all flags read env where present)
 
@@ -352,6 +371,13 @@ aarch64-musl, android via NDK).
   `secret_multiple_consumers_concurrent`, `udp_multiple_consumers_concurrent_direct`,
   `udp_mixed_direct_and_relay_consumers`, `udp_consumer_reconnects_while_others_active`,
   `udp_multiple_consumers_detect_provider_drop`.
+- **The admin page must never change the protocol path when disabled** — with no
+  `--admin-token`, `server::route_connection` is a pure pass-through to
+  `handle_connection`; only a configured token enables the first-byte peek. Keep it
+  that way (the peek uses a single `read` + `Prefixed` replay so no bytes are lost,
+  and `0x00`/non-HTTP always falls through to the bore protocol). Basic auth is
+  **HTTP-only by design**: non-HTTP connections are forwarded unprotected, so do not
+  rely on `--basic-auth` to gate raw-TCP services.
 
 ## Known limitations / candidate next steps
 

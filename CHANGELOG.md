@@ -9,6 +9,28 @@ was a ~400-line TCP tunnel (one connection per proxied connection). The fork
 re-architects the transport and adds secret tunnels, a UDP direct path, and NAT
 tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
 
+## [Unreleased]
+
+### Added
+- **HTTP Basic auth on tunnels** (`--basic-auth "user:pass"` on `bore local`,
+  env `BORE_BASIC_AUTH`): HTTP requests without valid credentials get a `401`;
+  non-HTTP traffic is forwarded unprotected (Basic auth is HTTP-only). Public
+  tunnels are enforced on the **server** (creds ride in `TunnelOptions`); secret
+  tunnels on the **provider** (covering relay *and* direct paths; creds never
+  leave the provider). Tokens are compared in constant time.
+- **`--notes "<text>"`** on `bore local` and `bore proxy` (env `BORE_NOTES`):
+  a free-form label associated with the tunnel and shown on the admin page.
+- **Admin status page** at `/admin/status` on the control port, enabled with
+  `bore server --admin-token <token>` (min 32 chars; env `BORE_ADMIN_TOKEN`).
+  Served over the same scheme as the control connection (http/https) and on any
+  control port. A token-guarded JSON endpoint (`/admin/status/data`) feeds an
+  embedded, dependency-free page that auto-refreshes (~2s polling) and lists every
+  connected tunnel — public tunnels, and for secret tunnels both the provider and
+  all attached `bore proxy` consumers — with client address, options, notes, live
+  connection count, and uptime. **Stateless** (no persistence): it reflects only
+  what is connected right now. Disabled (and invisible) without a token, leaving
+  the control port's bore-protocol behaviour byte-for-byte unchanged.
+
 ## [1.0.0]
 
 First stable release of the fork.

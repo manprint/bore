@@ -1,7 +1,12 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use bore_cli::{client::Client, reconnect, secret::Proxy, server::Server};
+use bore_cli::{
+    client::{Client, ProviderMeta},
+    reconnect,
+    secret::Proxy,
+    server::Server,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time;
@@ -120,7 +125,10 @@ async fn proxy_reconnects_when_server_appears() -> Result<()> {
         let connect = move || async move {
             let to = format!("localhost:{CONTROL}");
             let bind = format!("127.0.0.1:{LOCAL_PROXY}").parse().unwrap();
-            Proxy::new(&to, bind, "svc", None, false, false, None, false, false, 0).await
+            Proxy::new(
+                &to, bind, "svc", None, false, false, None, false, false, 0, None,
+            )
+            .await
         };
         let serve = |proxy: Proxy| async move { proxy.listen().await };
         let _ = reconnect::run(true, connect, serve).await;
@@ -147,6 +155,7 @@ async fn proxy_reconnects_when_server_appears() -> Result<()> {
         false,
         0,
         1024,
+        ProviderMeta::default(),
     )
     .await?;
     tokio::spawn(provider.listen());

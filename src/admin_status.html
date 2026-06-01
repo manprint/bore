@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bore · admin status</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --border: #e3e6ea;
+    --text: #1c2330;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --ok: #15803d;
+    --ok-bg: #dcfce7;
+    --warn: #b45309;
+    --warn-bg: #fef3c7;
+    --off: #6b7280;
+    --off-bg: #eceff3;
+    --row: #fafbfc;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .08);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header.bar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 20px; background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  header.bar .logo { font-weight: 700; letter-spacing: .2px; }
+  header.bar .logo span { color: var(--accent); }
+  header.bar .spacer { flex: 1; }
+  header.bar .meta { color: var(--muted); font-size: 12.5px; display: flex; gap: 14px; flex-wrap: wrap; }
+  header.bar .meta b { color: var(--text); font-weight: 600; }
+  button {
+    font: inherit; cursor: pointer; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text);
+    border-radius: 8px; padding: 7px 13px;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:hover { filter: brightness(.98); }
+  main { padding: 20px; max-width: 1180px; margin: 0 auto; }
+
+  /* Login */
+  #login { max-width: 380px; margin: 64px auto; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 14px; padding: 26px; box-shadow: var(--shadow); }
+  #login h1 { margin: 0 0 4px; font-size: 18px; }
+  #login p { margin: 0 0 18px; color: var(--muted); font-size: 13px; }
+  #login input {
+    width: 100%; font: inherit; padding: 10px 12px; border: 1px solid var(--border);
+    border-radius: 9px; margin-bottom: 12px; background: #fff;
+  }
+  #login input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  #login button { width: 100%; }
+  #login .err { color: #b91c1c; font-size: 13px; min-height: 18px; margin-bottom: 8px; }
+
+  .section { margin-bottom: 26px; }
+  .section h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: .6px;
+    color: var(--muted); margin: 0 0 10px; display: flex; align-items: center; gap: 8px;
+  }
+  .count { background: var(--off-bg); color: var(--off); border-radius: 999px;
+    padding: 1px 9px; font-size: 12px; font-weight: 600; letter-spacing: 0; }
+
+  .card { background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; overflow: hidden; box-shadow: var(--shadow); }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  th { background: #fbfcfd; color: var(--muted); font-weight: 600; font-size: 12px;
+    position: sticky; top: 0; }
+  tbody tr:nth-child(even) { background: var(--row); }
+  tbody tr:last-child td { border-bottom: none; }
+  td.notes { color: var(--text); }
+  .empty { padding: 18px 12px; color: var(--muted); font-style: italic; }
+
+  .badge { display: inline-block; border-radius: 6px; padding: 1px 8px;
+    font-size: 11.5px; font-weight: 600; letter-spacing: .2px; }
+  .b-on { color: var(--ok); background: var(--ok-bg); }
+  .b-off { color: var(--off); background: var(--off-bg); }
+  .b-warn { color: var(--warn); background: var(--warn-bg); }
+  .b-role { color: var(--accent); background: #e0ecff; }
+
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--ok); margin-right: 6px; vertical-align: middle; }
+  .updated { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div id="login" hidden>
+  <h1>bore admin</h1>
+  <p>Enter the admin token to view the status page.</p>
+  <div class="err" id="loginErr"></div>
+  <input id="token" type="password" placeholder="admin token" autocomplete="off" />
+  <button class="primary" id="loginBtn">View status</button>
+</div>
+
+<div id="dash" hidden>
+  <header class="bar">
+    <div class="logo">bore<span>·</span>admin</div>
+    <div class="meta" id="serverMeta"></div>
+    <div class="spacer"></div>
+    <span class="updated" id="updated"></span>
+    <button id="logout">Sign out</button>
+  </header>
+  <main>
+    <div class="section">
+      <h2>Public tunnels <span class="count" id="pubCount">0</span></h2>
+      <div class="card">
+        <table>
+          <colgroup>
+            <col style="width:9%"><col style="width:21%"><col style="width:10%">
+            <col style="width:10%"><col><col style="width:9%"><col style="width:12%">
+          </colgroup>
+          <thead><tr>
+            <th>Port</th><th>Client</th><th>TLS</th><th>Auth</th>
+            <th>Notes</th><th>Conns</th><th>Uptime</th>
+          </tr></thead>
+          <tbody id="pubRows"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Secret tunnels <span class="count" id="secCount">0</span></h2>
+      <div class="card">
+        <table>
+          <colgroup>
+            <col style="width:11%"><col style="width:16%"><col style="width:19%">
+            <col style="width:8%"><col style="width:9%"><col><col style="width:8%"><col style="width:11%">
+          </colgroup>
+          <thead><tr>
+            <th>Role</th><th>ID</th><th>Client</th><th>UDP</th>
+            <th>Auth</th><th>Notes</th><th>Conns</th><th>Uptime</th>
+          </tr></thead>
+          <tbody id="secRows"></tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+"use strict";
+const KEY = "bore_admin_token";
+let timer = null;
+
+const $ = (id) => document.getElementById(id);
+
+function esc(s) {
+  if (s === null || s === undefined) return "";
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function fmtUptime(secs) {
+  secs = Math.max(0, secs | 0);
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (d) return d + "d " + h + "h";
+  if (h) return h + "h " + m + "m";
+  if (m) return m + "m " + s + "s";
+  return s + "s";
+}
+
+function onOff(v, onText, offText) {
+  return v
+    ? '<span class="badge b-on">' + esc(onText) + "</span>"
+    : '<span class="badge b-off">' + esc(offText) + "</span>";
+}
+
+function cell(text) { return '<td title="' + esc(text) + '">' + esc(text) + "</td>"; }
+
+function showLogin(msg) {
+  if (timer) { clearInterval(timer); timer = null; }
+  $("dash").hidden = true;
+  $("login").hidden = false;
+  $("loginErr").textContent = msg || "";
+  $("token").focus();
+}
+
+function showDash() {
+  $("login").hidden = true;
+  $("dash").hidden = false;
+}
+
+function render(data) {
+  const m = data.server || {};
+  $("serverMeta").innerHTML =
+    "<span>control port <b>" + esc(m.control_port) + "</b></span>" +
+    "<span>scheme <b>" + (m.tls ? "https" : "http") + "</b></span>" +
+    "<span>udp <b>" + (m.udp ? "on" : "off") + "</b></span>";
+
+  const tunnels = data.tunnels || [];
+  const pub = tunnels.filter((t) => t.role === "public");
+  const sec = tunnels.filter((t) => t.role !== "public");
+  sec.sort((a, b) => (a.secret_id || "").localeCompare(b.secret_id || "")
+    || a.role.localeCompare(b.role));
+
+  $("pubCount").textContent = pub.length;
+  $("secCount").textContent = sec.length;
+
+  $("pubRows").innerHTML = pub.length ? pub.map((t) =>
+    "<tr>" +
+    '<td class="mono">' + esc(t.public_port) + "</td>" +
+    cell(t.peer) +
+    "<td>" + onOff(t.https, "https", "plain") + "</td>" +
+    "<td>" + onOff(t.basic_auth, "basic", "none") + "</td>" +
+    '<td class="notes" title="' + esc(t.notes) + '">' + esc(t.notes) + "</td>" +
+    '<td class="mono">' + esc(t.active) + "</td>" +
+    "<td>" + esc(fmtUptime(t.uptime_secs)) + "</td>" +
+    "</tr>").join("")
+    : '<tr><td class="empty" colspan="7">No public tunnels.</td></tr>';
+
+  $("secRows").innerHTML = sec.length ? sec.map((t) => {
+    const role = t.role === "secret-provider"
+      ? '<span class="badge b-role">provider</span>'
+      : '<span class="badge b-off">consumer</span>';
+    const udp = t.role === "secret-provider"
+      ? onOff(t.udp, "capable", "relay")
+      : onOff(t.udp, "direct?", "relay");
+    return "<tr>" +
+      "<td>" + role + "</td>" +
+      '<td class="mono" title="' + esc(t.secret_id) + '">' + esc(t.secret_id) + "</td>" +
+      cell(t.peer) +
+      "<td>" + udp + "</td>" +
+      "<td>" + onOff(t.basic_auth, "basic", "none") + "</td>" +
+      '<td class="notes" title="' + esc(t.notes) + '">' + esc(t.notes) + "</td>" +
+      '<td class="mono">' + esc(t.active) + "</td>" +
+      "<td>" + esc(fmtUptime(t.uptime_secs)) + "</td>" +
+      "</tr>";
+  }).join("")
+    : '<tr><td class="empty" colspan="8">No secret tunnels.</td></tr>';
+
+  $("updated").innerHTML = '<span class="dot"></span>updated ' +
+    new Date().toLocaleTimeString();
+}
+
+async function refresh() {
+  const token = sessionStorage.getItem(KEY);
+  if (!token) { showLogin(); return; }
+  try {
+    const res = await fetch("status/data", {
+      headers: { "Authorization": "Bearer " + token },
+      cache: "no-store",
+    });
+    if (res.status === 401) {
+      sessionStorage.removeItem(KEY);
+      showLogin("Invalid token.");
+      return;
+    }
+    if (!res.ok) { $("updated").textContent = "error " + res.status; return; }
+    render(await res.json());
+  } catch (e) {
+    $("updated").textContent = "connection error";
+  }
+}
+
+function start() {
+  showDash();
+  refresh();
+  if (timer) clearInterval(timer);
+  timer = setInterval(refresh, 2000);
+}
+
+function login() {
+  const t = $("token").value.trim();
+  if (!t) { $("loginErr").textContent = "Token required."; return; }
+  sessionStorage.setItem(KEY, t);
+  $("token").value = "";
+  start();
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  $("loginBtn").addEventListener("click", login);
+  $("token").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
+  $("logout").addEventListener("click", () => {
+    sessionStorage.removeItem(KEY);
+    showLogin("Signed out.");
+  });
+  if (sessionStorage.getItem(KEY)) start();
+  else showLogin();
+});
+</script>
+</body>
+</html>

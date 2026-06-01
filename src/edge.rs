@@ -20,6 +20,8 @@ use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tracing::trace;
 
+use crate::basicauth::{self, BasicAuth, Gate};
+use crate::prefixed::Prefixed;
 use crate::shared::{TunnelOptions, NETWORK_TIMEOUT};
 
 /// First byte of a TLS handshake record (`ContentType::handshake`).
@@ -33,12 +35,20 @@ const HTTP_METHODS: [&[u8]; 9] = [
 /// Maximum number of request bytes read while building a redirect.
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
 
-/// A forwarded edge connection: plain TCP, or a server-terminated TLS stream.
+/// A stream the edge can forward: anything readable, writable, and `Send`. Used
+/// to type-erase a [`Prefixed`] wrapper over either a plain or a TLS stream.
+pub trait EdgeIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> EdgeIo for T {}
+
+/// A forwarded edge connection: plain TCP, a server-terminated TLS stream, or a
+/// stream whose buffered head must be replayed (after the basic-auth gate read it).
 pub enum TunnelStream {
     /// Plain TCP, forwarded as-is.
     Plain(TcpStream),
     /// TLS terminated at the server (boxed: much larger than a bare socket).
     Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    /// A stream with an already-read prefix to replay (basic-auth gated).
+    Buffered(Box<dyn EdgeIo>),
 }
 
 impl AsyncRead for TunnelStream {
@@ -50,6 +60,7 @@ impl AsyncRead for TunnelStream {
         match self.get_mut() {
             TunnelStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
             TunnelStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            TunnelStream::Buffered(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -63,6 +74,7 @@ impl AsyncWrite for TunnelStream {
         match self.get_mut() {
             TunnelStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
             TunnelStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            TunnelStream::Buffered(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
@@ -70,6 +82,7 @@ impl AsyncWrite for TunnelStream {
         match self.get_mut() {
             TunnelStream::Plain(s) => Pin::new(s).poll_flush(cx),
             TunnelStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            TunnelStream::Buffered(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
@@ -77,6 +90,7 @@ impl AsyncWrite for TunnelStream {
         match self.get_mut() {
             TunnelStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
             TunnelStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            TunnelStream::Buffered(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 
@@ -88,6 +102,7 @@ impl AsyncWrite for TunnelStream {
         match self.get_mut() {
             TunnelStream::Plain(s) => Pin::new(s).poll_write_vectored(cx, bufs),
             TunnelStream::Tls(s) => Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
+            TunnelStream::Buffered(s) => Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
         }
     }
 
@@ -95,6 +110,7 @@ impl AsyncWrite for TunnelStream {
         match self {
             TunnelStream::Plain(s) => s.is_write_vectored(),
             TunnelStream::Tls(s) => s.is_write_vectored(),
+            TunnelStream::Buffered(s) => s.is_write_vectored(),
         }
     }
 }
@@ -110,10 +126,14 @@ pub async fn accept(
     port: u16,
     fallback_host: Option<&str>,
 ) -> Result<Option<TunnelStream>> {
+    // Parse the optional basic-auth credentials once (validated at startup, so a
+    // malformed value here is treated as "no auth").
+    let auth = opts.basic_auth.as_deref().and_then(BasicAuth::parse);
+
     // Fast path: with no inspection requested, forward immediately. This both
     // preserves the original behaviour and lets the local service speak first
     // (peeking would otherwise block until the remote peer sends something).
-    if !opts.https && !opts.force_https {
+    if !opts.https && !opts.force_https && auth.is_none() {
         return Ok(Some(TunnelStream::Plain(stream)));
     }
 
@@ -125,26 +145,46 @@ pub async fn accept(
         Ok(result) => result.context("failed to peek connection")?,
         Err(_) => 0,
     };
-    if n == 0 {
-        return Ok(Some(TunnelStream::Plain(stream)));
-    }
     let head = &head[..n];
 
-    if opts.https && head[0] == TLS_HANDSHAKE {
+    if n > 0 && opts.https && head[0] == TLS_HANDSHAKE {
         let acceptor = tls.context("TLS requested but no certificate is configured")?;
         let tls_stream = acceptor
             .accept(stream)
             .await
             .context("TLS handshake failed")?;
+        // Basic auth is checked on the decrypted HTTP stream.
+        if let Some(auth) = &auth {
+            return gate_stream(tls_stream, auth).await;
+        }
         return Ok(Some(TunnelStream::Tls(Box::new(tls_stream))));
     }
 
-    if opts.force_https && looks_like_http(head) {
+    if n > 0 && opts.force_https && looks_like_http(head) {
         redirect_to_https(stream, port, fallback_host).await?;
         return Ok(None);
     }
 
+    // Plain forward path: gate basic auth on the raw HTTP stream if requested.
+    if let Some(auth) = &auth {
+        return gate_stream(stream, auth).await;
+    }
+
     Ok(Some(TunnelStream::Plain(stream)))
+}
+
+/// Run the basic-auth gate on `stream`, returning a [`TunnelStream::Buffered`]
+/// (head replayed) to forward, or `None` when the request was rejected with `401`.
+async fn gate_stream<S: EdgeIo + 'static>(
+    mut stream: S,
+    auth: &BasicAuth,
+) -> Result<Option<TunnelStream>> {
+    match basicauth::gate(&mut stream, auth).await? {
+        Gate::Forward(prefix) => Ok(Some(TunnelStream::Buffered(Box::new(Prefixed::new(
+            prefix, stream,
+        ))))),
+        Gate::Reject => Ok(None),
+    }
 }
 
 fn looks_like_http(head: &[u8]) -> bool {

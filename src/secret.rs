@@ -25,6 +25,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::debug;
 use tracing::{error, info, info_span, trace, warn, Instrument};
 
+use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Role};
 use crate::auth::Authenticator;
 use crate::mux;
 use crate::shared::{
@@ -100,12 +101,17 @@ impl Drop for Deregister {
 
 /// Server side: register this connection as the provider for `id`, then keep it
 /// alive with heartbeats until it disconnects (which deregisters it).
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_provider(
     mut control: Delimited<mux::Stream>,
     opener: mux::Opener,
     registry: Registry,
     udp_registry: UdpRegistry,
     id: String,
+    admin: AdminRegistry,
+    peer: SocketAddr,
+    notes: Option<String>,
+    basic_auth: bool,
 ) -> Result<()> {
     // Register atomically, rejecting a duplicate id rather than hijacking it.
     match registry.entry(id.clone()) {
@@ -124,6 +130,18 @@ pub async fn serve_provider(
         udp_registry: udp_registry.clone(),
         id: id.clone(),
     };
+    // Live admin entry for this provider; dropped (removed) when it disconnects.
+    let admin_reg = admin.register(NewEntry {
+        role: Role::SecretProvider,
+        peer,
+        secret_id: Some(id.clone()),
+        public_port: None,
+        notes,
+        basic_auth,
+        https: false,
+        force_https: false,
+        udp: false,
+    });
     info!(%id, "secret provider registered");
     control.send(ServerMessage::Ok).await?;
 
@@ -146,6 +164,7 @@ pub async fn serve_provider(
                 match message? {
                     Some(ClientMessage::UdpCandidates(candidates)) => {
                         info!(%id, ?candidates, "provider offered udp candidates");
+                        admin_reg.mark_udp();
                         let (tx, rx) = mpsc::channel(4);
                         udp_registry.insert(
                             id.clone(),
@@ -188,6 +207,7 @@ async fn recv_offer(offers: &mut Option<mpsc::Receiver<UdpOffer>>) -> UdpOffer {
 
 /// Server side: relay every substream the consumer opens to the provider
 /// registered under `id`. No port is bound; the server is a pure substream relay.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_consumer(
     mut control: Delimited<mux::Stream>,
     mut acceptor: mux::Acceptor,
@@ -195,9 +215,26 @@ pub async fn serve_consumer(
     udp_registry: UdpRegistry,
     permits: Arc<Semaphore>,
     id: String,
+    admin: AdminRegistry,
+    peer: SocketAddr,
+    notes: Option<String>,
 ) -> Result<()> {
     info!(%id, "secret consumer connected");
     control.send(ServerMessage::Ok).await?;
+
+    // Live admin entry for this consumer; dropped (removed) when it disconnects.
+    let admin_reg = admin.register(NewEntry {
+        role: Role::SecretConsumer,
+        peer,
+        secret_id: Some(id.clone()),
+        public_port: None,
+        notes,
+        basic_auth: false,
+        https: false,
+        force_https: false,
+        udp: false,
+    });
+    let active = admin_reg.active();
 
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -214,6 +251,10 @@ pub async fn serve_consumer(
             message = control.recv() => {
                 match message? {
                     Some(ClientMessage::UdpCandidates(consumer_cands)) => {
+                        // Flag for the admin page that this consumer attempted a
+                        // direct path (success is established peer-to-peer, off the
+                        // server, so the relay can only record the attempt).
+                        admin_reg.mark_udp();
                         broker_udp(&mut control, &udp_registry, &id, consumer_cands).await?;
                     }
                     Some(_) => warn!(%id, "unexpected message from consumer"),
@@ -234,9 +275,11 @@ pub async fn serve_consumer(
                 };
                 let registry = registry.clone();
                 let id = id.clone();
+                let active = Arc::clone(&active);
                 tokio::spawn(
                     async move {
                         let _permit = permit;
+                        let _active = ActiveGuard::new(active);
                         if let Err(err) = relay(consumer_stream, registry, &id).await {
                             trace!(%err, "secret relay closed");
                         }
@@ -371,6 +414,7 @@ impl Proxy {
         port_map: bool,
         port_prediction: bool,
         udp_port: u16,
+        notes: Option<String>,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
@@ -383,9 +427,13 @@ impl Proxy {
         );
 
         // Send the registration first so the lazily-opened substream is announced
-        // before the (server-initiated) auth handshake.
+        // before the (server-initiated) auth handshake. The note rides along for
+        // the admin status page.
         control
-            .send(ClientMessage::ConnectSecret(tcp_secret_id.to_string()))
+            .send(ClientMessage::ConnectSecret {
+                id: tcp_secret_id.to_string(),
+                notes,
+            })
             .await?;
         if let Some(secret) = secret {
             Authenticator::new(secret)

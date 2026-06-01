@@ -48,6 +48,10 @@ services:
       # instead of bridge, or point clients at an external --stun-server.
       # Public domain advertised to clients (enables http(s):// addressing):
       # - BORE_BIND_DOMAIN=bore.tld
+      # Enable the read-only admin status page at /admin/status on the control
+      # port (min 32 chars). It is served over the same scheme as the control
+      # connection (http or https). Leave unset to disable the page entirely.
+      # - BORE_ADMIN_TOKEN=change-me-to-a-long-random-token-32+chars
       # Serve the control connection over TLS (also used for --https tunnels);
       # mount the files via the `volumes:` block below.
       # - BORE_CERT_FILE=/certs/cert.pem

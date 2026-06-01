@@ -3,13 +3,14 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{net::TcpStream, time::timeout};
 #[cfg(feature = "udp")]
 use tracing::{debug, trace};
 use tracing::{error, info, info_span, warn, Instrument};
 
 use crate::auth::Authenticator;
+use crate::basicauth::{self, BasicAuth, Gate};
 use crate::mux;
 use crate::shared::{
     tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions, NETWORK_TIMEOUT,
@@ -24,6 +25,16 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 #[cfg(feature = "udp")]
 use tokio::sync::{mpsc, Semaphore};
+
+/// Optional operator-supplied metadata for a secret-tunnel provider.
+#[derive(Clone, Default)]
+pub struct ProviderMeta {
+    /// Free-form note shown on the server's admin status page.
+    pub notes: Option<String>,
+    /// HTTP Basic auth credentials (`"user:pass"`) the provider enforces itself on
+    /// each proxied HTTP connection (both relay and direct). `None` = no auth.
+    pub basic_auth: Option<String>,
+}
 
 /// State structure for the client.
 pub struct Client {
@@ -56,6 +67,11 @@ pub struct Client {
     /// candidates if the initial offer failed, and bound direct substreams.
     #[cfg(feature = "udp")]
     udp_cfg: Option<UdpProviderCfg>,
+
+    /// HTTP Basic auth enforced on each proxied connection. `Some` only for a
+    /// secret-tunnel provider with `--basic-auth` (public tunnels are enforced on
+    /// the server instead). Applies to both relay and direct paths.
+    basic_auth: Option<BasicAuth>,
 }
 
 /// Provider-side direct-path configuration, retained on the [`Client`] so the
@@ -131,6 +147,8 @@ impl Client {
             secret: secret.map(str::to_string),
             #[cfg(feature = "udp")]
             udp_cfg: None,
+            // Public tunnels are basic-auth-gated on the server, not the client.
+            basic_auth: None,
         })
     }
 
@@ -154,6 +172,7 @@ impl Client {
         port_prediction: bool,
         udp_port: u16,
         max_conns: usize,
+        meta: ProviderMeta,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
@@ -166,9 +185,15 @@ impl Client {
         );
 
         // Send the registration first so the lazily-opened substream is announced
-        // before the (server-initiated) auth handshake (see client `new`).
+        // before the (server-initiated) auth handshake (see client `new`). The
+        // note and a Basic-auth-enabled flag ride along for the admin page; the
+        // credentials themselves never leave this provider.
         control
-            .send(ClientMessage::HelloSecret(tcp_secret_id.to_string()))
+            .send(ClientMessage::HelloSecret {
+                id: tcp_secret_id.to_string(),
+                notes: meta.notes.clone(),
+                basic_auth: meta.basic_auth.is_some(),
+            })
             .await?;
         if let Some(secret) = secret {
             Authenticator::new(secret)
@@ -244,6 +269,7 @@ impl Client {
             secret: secret.map(str::to_string),
             #[cfg(feature = "udp")]
             udp_cfg,
+            basic_auth: meta.basic_auth.as_deref().and_then(BasicAuth::parse),
         })
     }
 
@@ -375,7 +401,23 @@ impl Client {
         // Consume the server's readiness marker before splicing (see mux module).
         let mut marker = [0u8; 1];
         stream.read_exact(&mut marker).await?;
+
+        // Enforce HTTP Basic auth (secret-tunnel providers only). The gate reads
+        // the request head off the substream; on success that head is replayed to
+        // the local service, on failure a 401 was already returned to the visitor.
+        let prefix = if let Some(auth) = &self.basic_auth {
+            match basicauth::gate(&mut stream, auth).await? {
+                Gate::Forward(prefix) => prefix,
+                Gate::Reject => return Ok(()),
+            }
+        } else {
+            Vec::new()
+        };
+
         let mut local_conn = connect_with_timeout(&self.local_host, self.local_port).await?;
+        if !prefix.is_empty() {
+            local_conn.write_all(&prefix).await?;
+        }
         tokio::io::copy_bidirectional_with_sizes(
             &mut local_conn,
             &mut stream,

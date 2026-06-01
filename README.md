@@ -150,6 +150,8 @@ Options:
       --try-port-prediction    Advertise predicted symmetric-NAT ports (opt-in, best-effort) [env: BORE_TRY_PORT_PREDICTION=]
       --nat-udp-preferred-port <PORT> Bind the UDP hole-punch socket to a fixed port (0=random) [env: BORE_NAT_UDP_PORT=]
       --max-conns <N>          Max concurrent connections on the direct UDP path (default 1024) [env: BORE_MAX_CONNS=]
+      --basic-auth <USER:PASS> Protect the tunnel with HTTP Basic auth [env: BORE_BASIC_AUTH]
+      --notes <TEXT>           Note shown on the server's admin status page [env: BORE_NOTES=]
       --auto-reconnect         Reconnect automatically with backoff if the connection drops [env: BORE_AUTO_RECONNECT=]
   -h, --help                   Print help
 ```
@@ -231,8 +233,47 @@ Options:
       --bind-addr <IP>       IP address to bind to, clients must reach this [default: 0.0.0.0]
       --bind-tunnels <IP>    IP address where tunnels will listen on, defaults to --bind-addr
       --udp                  Broker UDP direct paths and run a STUN responder on the control port [env: BORE_UDP=]
+      --admin-token <TOKEN>  Enable the admin status page at /admin/status (min 32 chars) [env: BORE_ADMIN_TOKEN]
   -h, --help                 Print help
 ```
+
+#### Basic auth on tunnels
+
+Any tunnel — public or secret — can be protected with HTTP Basic auth via
+`--basic-auth "user:pass"` on `bore local`. HTTP requests without valid
+credentials get a `401`; non-HTTP traffic is forwarded unprotected (Basic auth is
+HTTP-only). For a **public** tunnel the server enforces it; for a **secret** tunnel
+the provider enforces it (covering both the relay and the direct UDP path), so the
+credentials never leave the provider. Use it over TLS so the credentials are not
+sent in the clear.
+
+```shell
+bore local 8080 --to https://bore.tld -p 9000 --https --basic-auth "admin:s3cr3t"
+```
+
+#### Admin status page
+
+Start the server with `--admin-token <TOKEN>` (at least 32 characters) to enable a
+read-only status dashboard at **`/admin/status`** on the control port. It is served
+over the same scheme as the control connection — `http://host:7835/admin/status`,
+`https://bore.tld/admin/status`, etc. (the control port is configurable, the path
+is the same). Without `--admin-token` the page is disabled and the control port
+speaks only the bore protocol.
+
+```shell
+bore server --secret mysecret --admin-token "$(openssl rand -hex 24)"
+# open http://your-server:7835/admin/status and paste the token
+```
+
+The page lists every connected tunnel — public tunnels and, for secret tunnels,
+both the provider and all attached `bore proxy` consumers — with their client
+address, options, `--notes`, live connection count, and uptime. It refreshes
+automatically (polling every ~2s) and keeps **no** persistent state: it reflects
+exactly what is connected right now. The frontend is embedded in the binary; no
+external assets are fetched.
+
+Annotate any tunnel with `--notes "..."` (on `bore local` or `bore proxy`) to label
+it on this page.
 
 ### Secret tunnels (no public port)
 
@@ -277,6 +318,7 @@ Options:
       --upnp                     Map a router port via UPnP-IGD for the direct path [env: BORE_UPNP=]
       --try-port-prediction      Advertise predicted symmetric-NAT ports (opt-in, best-effort) [env: BORE_TRY_PORT_PREDICTION=]
       --nat-udp-preferred-port <PORT> Bind the UDP hole-punch socket to a fixed port (0=random) [env: BORE_NAT_UDP_PORT=]
+      --notes <TEXT>             Note shown on the server's admin status page [env: BORE_NOTES=]
       --auto-reconnect           Reconnect automatically with backoff if the connection drops [env: BORE_AUTO_RECONNECT=]
   -h, --help                     Print help
 ```

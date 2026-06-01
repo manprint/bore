@@ -1,24 +1,27 @@
 //! Server implementation for the `bore` service.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{io, ops::RangeInclusive, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
-use tokio::time::{interval, sleep, MissedTickBehavior};
+use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, info_span, trace, warn, Instrument};
 
+use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Role};
+use crate::admin_http::{self, ServerStatus};
 use crate::auth::Authenticator;
 use crate::edge;
 use crate::holepunch;
 use crate::mux;
+use crate::prefixed::Prefixed;
 use crate::secret::{self, Registry, UdpRegistry};
 use crate::shared::{
     tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions, CONTROL_PORT,
-    PROXY_BUFFER_SIZE,
+    NETWORK_TIMEOUT, PROXY_BUFFER_SIZE,
 };
 
 /// Default cap on the number of concurrently proxied connections per tunnel
@@ -64,6 +67,14 @@ pub struct Server {
 
     /// IP address where tunnels will listen on.
     bind_tunnels: IpAddr,
+
+    /// Live registry of connected tunnels, exposed by the admin status page.
+    admin: AdminRegistry,
+
+    /// Admin status-page access token. `None` disables the admin page entirely
+    /// (and the HTTP detection on the control port), preserving the plain
+    /// bore-protocol behaviour.
+    admin_token: Option<String>,
 }
 
 impl Server {
@@ -82,6 +93,8 @@ impl Server {
             auth: secret.map(Authenticator::new),
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             bind_tunnels: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            admin: AdminRegistry::default(),
+            admin_token: None,
         }
     }
 
@@ -122,6 +135,17 @@ impl Server {
         self.bind_tunnels = bind_tunnels;
     }
 
+    /// Enable the admin status page on the control port, guarded by `token`.
+    /// `None` (the default) leaves it disabled.
+    pub fn set_admin_token(&mut self, token: Option<String>) {
+        self.admin_token = token;
+    }
+
+    /// Shared handle to the live tunnel registry (for the admin status page).
+    pub fn admin_registry(&self) -> AdminRegistry {
+        self.admin.clone()
+    }
+
     /// Start the server, listening for new connections.
     pub async fn listen(self) -> Result<()> {
         let this = Arc::new(self);
@@ -158,13 +182,13 @@ impl Server {
                     // The TLS handshake (if any) runs here, off the accept path.
                     let result = match &this.tls {
                         Some(acceptor) => match acceptor.accept(stream).await {
-                            Ok(tls) => this.handle_connection(tls).await,
+                            Ok(tls) => this.route_connection(tls, addr).await,
                             Err(err) => {
                                 warn!(%err, "TLS handshake failed");
                                 return;
                             }
                         },
-                        None => this.handle_connection(stream).await,
+                        None => this.route_connection(stream, addr).await,
                     };
                     match result {
                         Ok(_) => info!("connection exited"),
@@ -213,7 +237,56 @@ impl Server {
         }
     }
 
-    async fn handle_connection<S: mux::Transport>(&self, socket: S) -> Result<()> {
+    /// Route an accepted (and TLS-terminated, if applicable) control connection.
+    ///
+    /// When the admin status page is enabled, the first byte is inspected: an HTTP
+    /// request is served by the admin handler, anything else falls through to the
+    /// bore protocol. When the admin page is disabled this is a thin pass-through
+    /// to [`Server::handle_connection`], so the plain protocol path is unchanged.
+    async fn route_connection<S: mux::Transport>(
+        &self,
+        mut socket: S,
+        peer: SocketAddr,
+    ) -> Result<()> {
+        // No admin token → never inspect; behave exactly as before.
+        let Some(token) = self.admin_token.clone() else {
+            return self.handle_connection(socket, peer).await;
+        };
+
+        // Peek the first byte to tell an HTTP request (admin page) from the bore
+        // protocol (yamux, first byte 0x00). A bore client writes its Hello
+        // eagerly and an HTTP client sends its request line, so this arrives
+        // promptly; on timeout we hand the untouched socket to the protocol path.
+        let mut first = [0u8; 1];
+        match timeout(NETWORK_TIMEOUT, socket.read(&mut first)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => Ok(()), // EOF or read error: drop
+            Ok(Ok(_)) => {
+                let stream = Prefixed::new(first.to_vec(), socket);
+                if admin_http::is_http_first_byte(first[0]) {
+                    let server = ServerStatus {
+                        control_port: self.control_port,
+                        tls: self.tls.is_some(),
+                        udp: self.udp,
+                    };
+                    if let Err(err) = admin_http::serve(stream, &self.admin, &token, server).await {
+                        trace!(%err, "admin request failed");
+                    }
+                    Ok(())
+                } else {
+                    self.handle_connection(stream, peer).await
+                }
+            }
+            // Timed out waiting for the first byte: the byte (if any) is still
+            // pending, so forward the untouched socket to the protocol path.
+            Err(_) => self.handle_connection(socket, peer).await,
+        }
+    }
+
+    async fn handle_connection<S: mux::Transport>(
+        &self,
+        socket: S,
+        peer: SocketAddr,
+    ) -> Result<()> {
         // Multiplex everything over this single connection. The client opens the
         // control substream first; what it requests on it selects the role.
         let (opener, mut acceptor) = mux::server(socket);
@@ -237,19 +310,27 @@ impl Server {
 
         match request {
             Some(ClientMessage::Hello(port, opts)) => {
-                self.serve_tunnel(control, opener, port, opts).await
+                self.serve_tunnel(control, opener, port, opts, peer).await
             }
-            Some(ClientMessage::HelloSecret(id)) => {
+            Some(ClientMessage::HelloSecret {
+                id,
+                notes,
+                basic_auth,
+            }) => {
                 secret::serve_provider(
                     control,
                     opener,
                     self.providers.clone(),
                     self.udp_providers.clone(),
                     id,
+                    self.admin.clone(),
+                    peer,
+                    notes,
+                    basic_auth,
                 )
                 .await
             }
-            Some(ClientMessage::ConnectSecret(id)) => {
+            Some(ClientMessage::ConnectSecret { id, notes }) => {
                 secret::serve_consumer(
                     control,
                     acceptor,
@@ -257,6 +338,9 @@ impl Server {
                     self.udp_providers.clone(),
                     self.conn_permits.clone(),
                     id,
+                    self.admin.clone(),
+                    peer,
+                    notes,
                 )
                 .await
             }
@@ -280,6 +364,7 @@ impl Server {
         opener: mux::Opener,
         port: u16,
         opts: TunnelOptions,
+        peer: SocketAddr,
     ) -> Result<()> {
         // TLS termination on the tunnel port reuses the server's certificate.
         if opts.https && self.tls.is_none() {
@@ -302,6 +387,21 @@ impl Server {
         let port = listener.local_addr()?.port();
         info!(?host, ?port, https = opts.https, "new client");
         control.send(ServerMessage::Hello(port)).await?;
+
+        // Register this tunnel in the admin registry for its whole lifetime; the
+        // registration is removed when this function returns (client gone).
+        let registration = self.admin.register(NewEntry {
+            role: Role::Public,
+            peer,
+            secret_id: None,
+            public_port: Some(port),
+            notes: opts.notes.clone(),
+            basic_auth: opts.basic_auth.is_some(),
+            https: opts.https,
+            force_https: opts.force_https,
+            udp: false,
+        });
+        let active = registration.active();
 
         let mut heartbeat = interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -344,8 +444,11 @@ impl Server {
                     let opener = opener.clone();
                     let tls = self.tls.clone();
                     let domain = self.bind_domain.clone();
+                    let opts = opts.clone();
+                    let active = Arc::clone(&active);
                     tokio::spawn(async move {
                         let _permit = permit;
+                        let _active = ActiveGuard::new(active);
                         // Terminate TLS / handle redirects at the edge as needed.
                         let mut edge =
                             match edge::accept(stream2, opts, tls.as_ref(), port, domain.as_deref())

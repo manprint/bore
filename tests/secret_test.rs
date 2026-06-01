@@ -1,7 +1,13 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use bore_cli::{client::Client, secret::Proxy, server::Server, shared::CONTROL_PORT};
+use bore_cli::{
+    admin::Role,
+    client::{Client, ProviderMeta},
+    secret::Proxy,
+    server::Server,
+    shared::{TunnelOptions, CONTROL_PORT},
+};
 use lazy_static::lazy_static;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -59,6 +65,7 @@ async fn secret_provider_registers() -> Result<()> {
         false,
         0,
         1024,
+        ProviderMeta::default(),
     )
     .await;
     if let Err(err) = provider {
@@ -87,6 +94,7 @@ async fn secret_duplicate_id_rejected() -> Result<()> {
         false,
         0,
         1024,
+        ProviderMeta::default(),
     )
     .await?;
     tokio::spawn(first.listen()); // keep the registration alive
@@ -105,6 +113,7 @@ async fn secret_duplicate_id_rejected() -> Result<()> {
         false,
         0,
         1024,
+        ProviderMeta::default(),
     )
     .await;
     assert!(second.is_err(), "duplicate tcp-secret-id must be rejected");
@@ -131,6 +140,7 @@ async fn secret_registration_requires_correct_secret() -> Result<()> {
         false,
         0,
         1024,
+        ProviderMeta::default(),
     )
     .await;
     assert!(wrong.is_err(), "wrong secret must be rejected");
@@ -148,6 +158,7 @@ async fn secret_registration_requires_correct_secret() -> Result<()> {
         false,
         0,
         1024,
+        ProviderMeta::default(),
     )
     .await;
     assert!(missing.is_err(), "missing secret must be rejected");
@@ -198,6 +209,7 @@ async fn spawn_secret_tunnel(id: &str, secret: Option<&str>) -> Result<std::net:
         false,
         0,
         1024,
+        ProviderMeta::default(),
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -213,6 +225,7 @@ async fn spawn_secret_tunnel(id: &str, secret: Option<&str>) -> Result<std::net:
         false,
         false,
         0,
+        None,
     )
     .await?;
     let addr = proxy.local_addr()?;
@@ -289,6 +302,7 @@ async fn secret_multiple_consumers_concurrent() -> Result<()> {
         false,
         0,
         1024,
+        ProviderMeta::default(),
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -307,6 +321,7 @@ async fn secret_multiple_consumers_concurrent() -> Result<()> {
             false,
             false,
             0,
+            None,
         )
         .await?;
         addrs.push(proxy.local_addr()?);
@@ -390,6 +405,7 @@ async fn secret_proxy_without_provider_closes() -> Result<()> {
         false,
         false,
         0,
+        None,
     )
     .await?;
     let addr = proxy.local_addr()?;
@@ -423,9 +439,123 @@ async fn secret_proxy_requires_correct_secret() -> Result<()> {
         false,
         false,
         0,
+        None,
     )
     .await;
     assert!(bad.is_err(), "proxy with wrong secret must be rejected");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_registry_reflects_connections() -> Result<()> {
+    // The in-memory admin registry must reflect live connections: a public
+    // tunnel, a secret provider (with notes + a basic-auth flag), and a secret
+    // consumer (with notes) all appear with the right fields, and an entry
+    // disappears when its connection ends.
+    let _guard = SERIAL_GUARD.lock().await;
+    wait_for_control_port(false).await;
+    let server = Server::new(1024..=65535, None);
+    let admin = server.admin_registry();
+    tokio::spawn(server.listen());
+    wait_for_control_port(true).await;
+
+    let echo = spawn_echo_service().await?;
+
+    // Public tunnel with basic-auth + notes.
+    let pub_client = Client::new(
+        "localhost",
+        echo,
+        "localhost",
+        0,
+        None,
+        false,
+        TunnelOptions {
+            https: false,
+            force_https: false,
+            basic_auth: Some("a:b".into()),
+            notes: Some("pub note".into()),
+        },
+    )
+    .await?;
+    let pub_port = pub_client.remote_port();
+    tokio::spawn(pub_client.listen());
+
+    // Secret provider with notes + basic-auth flag.
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo,
+        "localhost",
+        "admined",
+        None,
+        false,
+        false,
+        None,
+        false,
+        false,
+        0,
+        1024,
+        ProviderMeta {
+            notes: Some("prov note".into()),
+            basic_auth: Some("u:p".into()),
+        },
+    )
+    .await?;
+    tokio::spawn(provider.listen());
+
+    // Secret consumer with notes.
+    let proxy = Proxy::new(
+        "localhost",
+        "127.0.0.1:0".parse()?,
+        "admined",
+        None,
+        false,
+        false,
+        None,
+        false,
+        false,
+        0,
+        Some("cons note".into()),
+    )
+    .await?;
+    let consumer = tokio::spawn(proxy.listen());
+
+    time::sleep(Duration::from_millis(200)).await;
+    let snap = admin.snapshot();
+
+    let public = snap
+        .iter()
+        .find(|e| e.role == Role::Public)
+        .expect("public entry");
+    assert_eq!(public.public_port, Some(pub_port));
+    assert_eq!(public.notes.as_deref(), Some("pub note"));
+    assert!(public.basic_auth, "public basic_auth flag must be set");
+
+    let prov = snap
+        .iter()
+        .find(|e| e.role == Role::SecretProvider)
+        .expect("provider entry");
+    assert_eq!(prov.secret_id.as_deref(), Some("admined"));
+    assert_eq!(prov.notes.as_deref(), Some("prov note"));
+    assert!(prov.basic_auth, "provider basic_auth flag must be set");
+
+    let cons = snap
+        .iter()
+        .find(|e| e.role == Role::SecretConsumer)
+        .expect("consumer entry");
+    assert_eq!(cons.secret_id.as_deref(), Some("admined"));
+    assert_eq!(cons.notes.as_deref(), Some("cons note"));
+
+    // Drop the consumer; its entry must disappear from the registry.
+    consumer.abort();
+    time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        admin
+            .snapshot()
+            .iter()
+            .all(|e| e.role != Role::SecretConsumer),
+        "consumer entry must be removed after disconnect"
+    );
 
     Ok(())
 }

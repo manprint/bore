@@ -15,11 +15,15 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod admin;
+pub mod admin_http;
 pub mod auth;
+pub mod basicauth;
 pub mod client;
 pub mod edge;
 pub mod holepunch;
 pub mod mux;
+pub mod prefixed;
 pub mod reconnect;
 pub mod secret;
 pub mod server;

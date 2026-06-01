@@ -189,6 +189,7 @@ async fn tunnel_port_terminates_tls_and_keeps_plain() -> Result<()> {
     let options = TunnelOptions {
         https: true,
         force_https: false,
+        ..Default::default()
     };
     let client = Client::new("localhost", echo, &to, 0, Some("sec"), true, options).await?;
     let tunnel = client.remote_port();
@@ -235,6 +236,7 @@ async fn force_https_redirects_plain_http() -> Result<()> {
     let options = TunnelOptions {
         https: true,
         force_https: true,
+        ..Default::default()
     };
     let client = Client::new("localhost", echo, &to, 0, Some("sec"), true, options).await?;
     let tunnel = client.remote_port();

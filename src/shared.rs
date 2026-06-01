@@ -59,13 +59,27 @@ pub fn tune_tcp(stream: &TcpStream) {
     let _ = SockRef::from(stream).set_tcp_keepalive(&keepalive);
 }
 
+/// Maximum length (in characters) of a user-supplied `--notes` string. Kept well
+/// within [`MAX_FRAME_LENGTH`] so the control-channel frame carrying it (alongside
+/// the tunnel id / options) never exceeds the codec's limit.
+pub const MAX_NOTES_LEN: usize = 256;
+
 /// Per-tunnel options requested by the client for a public-port tunnel.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+///
+/// No longer `Copy`: it now carries owned `String`s (basic-auth credentials and a
+/// free-form note), so the server clones it per proxied connection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TunnelOptions {
     /// Terminate TLS on the tunnel port (the server must have a certificate).
     pub https: bool,
     /// Redirect plain HTTP requests on the tunnel port to `https://`.
     pub force_https: bool,
+    /// Optional HTTP Basic auth credentials (`"user:pass"`) the **server** enforces
+    /// on the public tunnel port: HTTP requests without valid credentials get a
+    /// `401`. Non-HTTP connections are forwarded unprotected. `None` = no auth.
+    pub basic_auth: Option<String>,
+    /// Optional free-form note shown on the admin status page (no behavior).
+    pub notes: Option<String>,
 }
 
 /// A message from the client on the control substream.
@@ -78,11 +92,27 @@ pub enum ClientMessage {
     Hello(u16, TunnelOptions),
 
     /// Register as the provider for a named secret tunnel (no public port).
-    HelloSecret(String),
+    /// `notes` is shown on the admin page; `basic_auth` only flags (for display)
+    /// that the **provider** enforces HTTP Basic auth itself — the credentials
+    /// never leave the provider.
+    HelloSecret {
+        /// The secret-tunnel identifier to register under.
+        id: String,
+        /// Optional operator note for the admin status page.
+        notes: Option<String>,
+        /// Whether the provider enforces HTTP Basic auth itself (display only).
+        basic_auth: bool,
+    },
 
     /// Connect as a consumer of a named secret tunnel; data substreams opened on
-    /// this connection are routed to the matching provider.
-    ConnectSecret(String),
+    /// this connection are routed to the matching provider. `notes` is shown on
+    /// the admin page.
+    ConnectSecret {
+        /// The secret-tunnel identifier to connect to.
+        id: String,
+        /// Optional operator note for the admin status page.
+        notes: Option<String>,
+    },
 
     /// Offer this peer's UDP hole-punch candidate addresses to the server, which
     /// brokers them to the other peer of the same secret tunnel. Sent only when

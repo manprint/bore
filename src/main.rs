@@ -1,7 +1,13 @@
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Context, Result};
-use bore_cli::{client::Client, reconnect, secret::Proxy, server::Server, shared::TunnelOptions};
+use bore_cli::{
+    client::{Client, ProviderMeta},
+    reconnect,
+    secret::Proxy,
+    server::Server,
+    shared::{TunnelOptions, MAX_NOTES_LEN},
+};
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand};
 use tracing::info;
 
@@ -103,6 +109,21 @@ enum Command {
         #[clap(long, value_name = "N", default_value_t = bore_cli::server::DEFAULT_MAX_CONNS, env = "BORE_MAX_CONNS")]
         max_conns: usize,
 
+        /// Protect the tunnel with HTTP Basic auth ("user:pass"): HTTP requests
+        /// without valid credentials get a 401. Public tunnels are enforced on the
+        /// server; secret tunnels on this provider. Non-HTTP traffic is unaffected.
+        #[clap(
+            long,
+            value_name = "USER:PASS",
+            env = "BORE_BASIC_AUTH",
+            hide_env_values = true
+        )]
+        basic_auth: Option<String>,
+
+        /// Free-form note shown on the server's admin status page (no behaviour).
+        #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
+        notes: Option<String>,
+
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
         auto_reconnect: bool,
@@ -168,6 +189,10 @@ enum Command {
             default_value_t = 0
         )]
         nat_udp_preferred_port: u16,
+
+        /// Free-form note shown on the server's admin status page (no behaviour).
+        #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
+        notes: Option<String>,
 
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
@@ -236,6 +261,16 @@ enum Command {
         /// STUN responder on the control port.
         #[clap(long, env = "BORE_UDP")]
         udp: bool,
+
+        /// Enable the admin status page at /admin/status on the control port,
+        /// guarded by this token (min 32 chars). Unset = the page is disabled.
+        #[clap(
+            long,
+            value_name = "TOKEN",
+            env = "BORE_ADMIN_TOKEN",
+            hide_env_values = true
+        )]
+        admin_token: Option<String>,
     },
 
     /// Diagnose this host's UDP / NAT / firewall for hole-punching (opens no
@@ -318,57 +353,85 @@ async fn dispatch(command: Command) -> Result<()> {
             try_port_prediction,
             nat_udp_preferred_port,
             max_conns,
+            basic_auth,
+            notes,
             auto_reconnect,
-        } => match tcp_secret_id {
-            Some(id) => {
-                let connect = move || {
-                    let (local_host, to, id, secret, stun_server) = (
-                        local_host.clone(),
-                        to.clone(),
-                        id.clone(),
-                        secret.clone(),
-                        stun_server.clone(),
-                    );
-                    async move {
-                        Client::new_secret_provider(
-                            &local_host,
-                            local_port,
-                            &to,
-                            &id,
-                            secret.as_deref(),
-                            insecure,
-                            udp,
-                            stun_server.as_deref(),
-                            upnp,
-                            try_port_prediction,
-                            nat_udp_preferred_port,
-                            max_conns,
+        } => {
+            let notes = clamp_notes(notes);
+            if let Some(creds) = &basic_auth {
+                if !creds.contains(':') {
+                    Args::command()
+                        .error(
+                            ErrorKind::InvalidValue,
+                            "--basic-auth must be in the form \"user:pass\"",
                         )
-                        .await
-                    }
-                };
-                reconnect::run(auto_reconnect, connect, serve_client).await?;
+                        .exit();
+                }
             }
-            None => {
-                let options = TunnelOptions { https, force_https };
-                let connect = move || {
-                    let (local_host, to, secret) = (local_host.clone(), to.clone(), secret.clone());
-                    async move {
-                        Client::new(
-                            &local_host,
-                            local_port,
-                            &to,
-                            port,
-                            secret.as_deref(),
-                            insecure,
-                            options,
-                        )
-                        .await
-                    }
-                };
-                reconnect::run(auto_reconnect, connect, serve_client).await?;
+            match tcp_secret_id {
+                Some(id) => {
+                    let meta = ProviderMeta { notes, basic_auth };
+                    let connect = move || {
+                        let (local_host, to, id, secret, stun_server, meta) = (
+                            local_host.clone(),
+                            to.clone(),
+                            id.clone(),
+                            secret.clone(),
+                            stun_server.clone(),
+                            meta.clone(),
+                        );
+                        async move {
+                            Client::new_secret_provider(
+                                &local_host,
+                                local_port,
+                                &to,
+                                &id,
+                                secret.as_deref(),
+                                insecure,
+                                udp,
+                                stun_server.as_deref(),
+                                upnp,
+                                try_port_prediction,
+                                nat_udp_preferred_port,
+                                max_conns,
+                                meta,
+                            )
+                            .await
+                        }
+                    };
+                    reconnect::run(auto_reconnect, connect, serve_client).await?;
+                }
+                None => {
+                    let options = TunnelOptions {
+                        https,
+                        force_https,
+                        basic_auth,
+                        notes,
+                    };
+                    let connect = move || {
+                        let (local_host, to, secret, options) = (
+                            local_host.clone(),
+                            to.clone(),
+                            secret.clone(),
+                            options.clone(),
+                        );
+                        async move {
+                            Client::new(
+                                &local_host,
+                                local_port,
+                                &to,
+                                port,
+                                secret.as_deref(),
+                                insecure,
+                                options,
+                            )
+                            .await
+                        }
+                    };
+                    reconnect::run(auto_reconnect, connect, serve_client).await?;
+                }
             }
-        },
+        }
         Command::Proxy {
             local_proxy_port,
             to,
@@ -380,15 +443,18 @@ async fn dispatch(command: Command) -> Result<()> {
             upnp,
             try_port_prediction,
             nat_udp_preferred_port,
+            notes,
             auto_reconnect,
         } => {
             let bind_addr = parse_proxy_addr(&local_proxy_port)?;
+            let notes = clamp_notes(notes);
             let connect = move || {
-                let (to, tcp_secret_id, secret, stun_server) = (
+                let (to, tcp_secret_id, secret, stun_server, notes) = (
                     to.clone(),
                     tcp_secret_id.clone(),
                     secret.clone(),
                     stun_server.clone(),
+                    notes.clone(),
                 );
                 async move {
                     Proxy::new(
@@ -402,6 +468,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         upnp,
                         try_port_prediction,
                         nat_udp_preferred_port,
+                        notes,
                     )
                     .await
                 }
@@ -420,6 +487,7 @@ async fn dispatch(command: Command) -> Result<()> {
             bind_addr,
             bind_tunnels,
             udp,
+            admin_token,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -427,7 +495,19 @@ async fn dispatch(command: Command) -> Result<()> {
                     .error(ErrorKind::InvalidValue, "port range is empty")
                     .exit();
             }
+            // The admin token must be hard to guess; enforce a minimum length.
+            if let Some(token) = &admin_token {
+                if token.chars().count() < 32 {
+                    Args::command()
+                        .error(
+                            ErrorKind::InvalidValue,
+                            "--admin-token must be at least 32 characters",
+                        )
+                        .exit();
+                }
+            }
             let mut server = Server::new(port_range, secret.as_deref());
+            server.set_admin_token(admin_token);
             server.set_max_conns(max_conns);
             server.set_control_port(control_port);
             if let Some(domain) = bind_domain {
@@ -472,6 +552,17 @@ async fn dispatch(command: Command) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Truncate an operator note to [`MAX_NOTES_LEN`] characters (on a char boundary)
+/// so it always fits the control-channel frame.
+fn clamp_notes(notes: Option<String>) -> Option<String> {
+    notes.map(|mut n| {
+        if n.chars().count() > MAX_NOTES_LEN {
+            n = n.chars().take(MAX_NOTES_LEN).collect();
+        }
+        n
+    })
 }
 
 /// Run a connected client until its connection ends.

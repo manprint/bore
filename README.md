@@ -129,14 +129,15 @@ The `--to` value selects the transport for the control connection:
 ```shell
 Starts a local proxy to the remote server
 
-Usage: bore local [OPTIONS] --to <TO> <LOCAL_PORT>
+Usage: bore local [OPTIONS] --to <ADDR> <PORT>
 
 Arguments:
-  <LOCAL_PORT>  The local port to expose [env: BORE_LOCAL_PORT=]
+  <PORT>  The local port to expose [env: BORE_LOCAL_PORT=]
 
 Options:
   -l, --local-host <HOST>      The local host to expose [default: localhost]
-  -t, --to <TO>                Address of the remote server [env: BORE_SERVER=]
+  -v, --verbose...             Increase log verbosity (-v debug, -vv trace; RUST_LOG overrides)
+  -t, --to <ADDR>              Address of the remote server [env: BORE_SERVER=]
   -p, --port <PORT>            Optional port on the remote server to select [default: 0]
   -s, --secret <SECRET>        Optional secret for authentication [env: BORE_SECRET]
       --tcp-secret-id <ID>     Register as a named secret tunnel [env: BORE_TCP_SECRET_ID=]
@@ -218,18 +219,19 @@ Runs the remote proxy server
 Usage: bore server [OPTIONS]
 
 Options:
-      --min-port <MIN_PORT>          Minimum accepted TCP port number [env: BORE_MIN_PORT=] [default: 1024]
-      --max-port <MAX_PORT>          Maximum accepted TCP port number [env: BORE_MAX_PORT=] [default: 65535]
-  -s, --secret <SECRET>              Optional secret for authentication [env: BORE_SECRET]
-      --max-conns <MAX_CONNS>        Max concurrently proxied connections per client [env: BORE_MAX_CONNS=] [default: 1024]
-      --control-port <CONTROL_PORT>  TCP port the control connection listens on [env: BORE_CONTROL_PORT=] [default: 7835]
-      --bind-domain <BIND_DOMAIN>    Public domain advertised to clients [env: BORE_BIND_DOMAIN=]
-      --cert-file <CERT_FILE>        TLS certificate chain (PEM); with --key-file, serves HTTPS [env: BORE_CERT_FILE=]
-      --key-file <KEY_FILE>          TLS private key (PEM); with --cert-file, serves HTTPS [env: BORE_KEY_FILE=]
-      --bind-addr <BIND_ADDR>        IP address to bind to, clients must reach this [default: 0.0.0.0]
-      --bind-tunnels <BIND_TUNNELS>  IP address where tunnels will listen on, defaults to --bind-addr
-      --udp                          Broker UDP direct paths and run a STUN responder on the control port [env: BORE_UDP=]
-  -h, --help                         Print help
+      --min-port <PORT>      Minimum accepted TCP port number [env: BORE_MIN_PORT=] [default: 1024]
+      --max-port <PORT>      Maximum accepted TCP port number [env: BORE_MAX_PORT=] [default: 65535]
+  -v, --verbose...           Increase log verbosity (-v debug, -vv trace; RUST_LOG overrides)
+  -s, --secret <SECRET>      Optional secret for authentication [env: BORE_SECRET]
+      --max-conns <N>        Max concurrently proxied connections per client [env: BORE_MAX_CONNS=] [default: 1024]
+      --control-port <PORT>  TCP port the control connection listens on [env: BORE_CONTROL_PORT=] [default: 7835]
+      --bind-domain <DOMAIN> Public domain advertised to clients [env: BORE_BIND_DOMAIN=]
+      --cert-file <PATH>     TLS certificate chain (PEM); with --key-file, serves HTTPS [env: BORE_CERT_FILE=]
+      --key-file <PATH>      TLS private key (PEM); with --cert-file, serves HTTPS [env: BORE_KEY_FILE=]
+      --bind-addr <IP>       IP address to bind to, clients must reach this [default: 0.0.0.0]
+      --bind-tunnels <IP>    IP address where tunnels will listen on, defaults to --bind-addr
+      --udp                  Broker UDP direct paths and run a STUN responder on the control port [env: BORE_UDP=]
+  -h, --help                 Print help
 ```
 
 ### Secret tunnels (no public port)
@@ -261,11 +263,12 @@ provider at a time; a second registration of the same id is rejected.
 ```shell
 Connects to a named secret tunnel and exposes it on a local port
 
-Usage: bore proxy [OPTIONS] --local-proxy-port <LOCAL_PROXY_PORT> --to <TO> --tcp-secret-id <TCP_SECRET_ID>
+Usage: bore proxy [OPTIONS] --local-proxy-port <ADDR> --to <ADDR> --tcp-secret-id <ID>
 
 Options:
-      --local-proxy-port <HOST>  Local address to listen on, e.g. ":5555" or "127.0.0.1:5555" [env: BORE_LOCAL_PROXY_PORT=]
-  -t, --to <TO>                  Address of the remote server [env: BORE_SERVER=]
+      --local-proxy-port <ADDR>  Local address to listen on, e.g. ":5555" or "127.0.0.1:5555" [env: BORE_LOCAL_PROXY_PORT=]
+  -v, --verbose...               Increase log verbosity (-v debug, -vv trace; RUST_LOG overrides)
+  -t, --to <ADDR>                Address of the remote server [env: BORE_SERVER=]
   -s, --secret <SECRET>          Optional secret for authentication [env: BORE_SECRET]
       --tcp-secret-id <ID>       Identifier of the secret tunnel to connect to [env: BORE_TCP_SECRET_ID=]
       --insecure                 Skip TLS certificate verification [env: BORE_INSECURE=]

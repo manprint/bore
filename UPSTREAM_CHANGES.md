@@ -241,6 +241,16 @@ Each bullet = one or more commits on `perf-hardening`.
     (f) the direct-path session nonce + STUN txid use the system CSPRNG (`ring::rand`,
     was `fastrand`); the client warns on `--udp` without `--secret`. IPv6 dual-stack
     (the review's remaining item) is deliberately deferred.
+18. **Production-grade pass** (toward 1.0.0): version `1.0.0`, crate metadata now
+    identifies the fork (`repository = manprint/bore`, `authors`, no stale
+    `documentation`). **Logging** rebuilt (`init_logging`): `EnvFilter` default
+    `info` with `-v`/`-vv` (debug/trace) and `RUST_LOG` override, to **stderr**,
+    ANSI **only on a TTY** (no escape-code junk in Docker/journald/files); the
+    per-attempt "consumer offering udp candidates" line dropped to `debug` (the
+    10s upgrade loop was spamming `info`). **Graceful shutdown** on Ctrl-C +
+    SIGTERM (`tokio::signal`) → clean exit with a log line. **Help** made uniform:
+    short `value_name`s on every flag so all subcommands render the same compact
+    layout. New `CHANGELOG.md` + `CONTRIBUTING.md`; README help blocks synced.
 
 ## CLI flags & env vars (all flags read env where present)
 

@@ -1,11 +1,13 @@
 [package]
 name = "bore-cli"
-version = "0.6.0"
-authors = ["Eric Zhang <ekzhang1@gmail.com>"]
+version = "1.0.0"
+authors = [
+    "Fabio Pierri <fabio.pierri@synclab.it>",
+    "Eric Zhang <ekzhang1@gmail.com> (original bore)",
+]
 license = "MIT"
-description = "A modern, simple TCP tunnel in Rust that exposes local ports to a remote server, bypassing standard NAT connection firewalls."
-repository = "https://github.com/ekzhang/bore"
-documentation = "https://docs.rs/bore-cli"
+description = "A modern, simple TCP tunnel in Rust that exposes local ports to a remote server, bypassing standard NAT connection firewalls. Fork adding UDP hole-punching (QUIC), secret tunnels, and NAT diagnostics."
+repository = "https://github.com/manprint/bore"
 keywords = ["network", "cli", "tunnel", "tcp"]
 categories = ["network-programming", "web-programming", "command-line-utilities"]
 readme = "README.md"
@@ -38,11 +40,11 @@ serde = { version = "1.0.136", features = ["derive"] }
 serde_json = "1.0.79"
 sha2 = "0.10.2"
 socket2 = "0.6.4"
-tokio = { version = "1.41.0", features = ["rt-multi-thread", "io-util", "macros", "net", "sync", "time"] }
+tokio = { version = "1.41.0", features = ["rt-multi-thread", "io-util", "macros", "net", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-util = { version = "0.7.1", features = ["codec", "compat"] }
 tracing = "0.1.32"
-tracing-subscriber = "0.3.18"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = { version = "1.2.1", features = ["serde", "v4"] }
 webpki-roots = "1.0.7"
 yamux = "0.13.10"

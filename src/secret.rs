@@ -685,7 +685,10 @@ async fn gather_consumer_candidates(
     if candidates.is_empty() {
         bail!("no local UDP candidates discovered");
     }
-    info!(?candidates, %stun, "consumer offering udp candidates (a public IP here means STUN worked)");
+    // debug, not info: the relay→direct upgrade re-gathers every 10s, so an info
+    // line here would spam a relay-mode consumer. The outcome is logged at info by
+    // the caller ("using direct udp path" / "udp unavailable" / "upgraded …").
+    debug!(?candidates, %stun, "consumer offering udp candidates (a public IP here means STUN worked)");
     Ok((socket, candidates))
 }
 

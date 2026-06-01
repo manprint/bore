@@ -83,6 +83,12 @@ enum Command {
         #[clap(long, env = "BORE_NAT_UDP_PORT", default_value_t = 0)]
         nat_udp_preferred_port: u16,
 
+        /// Maximum concurrent connections served over a direct UDP path (the
+        /// direct-path analog of the server's --max-conns; bounds this provider's
+        /// resources). Secret-tunnel providers only.
+        #[clap(long, default_value_t = bore_cli::server::DEFAULT_MAX_CONNS, env = "BORE_MAX_CONNS")]
+        max_conns: usize,
+
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
         auto_reconnect: bool,
@@ -229,6 +235,7 @@ async fn run(command: Command) -> Result<()> {
             upnp,
             try_port_prediction,
             nat_udp_preferred_port,
+            max_conns,
             auto_reconnect,
         } => match tcp_secret_id {
             Some(id) => {
@@ -253,6 +260,7 @@ async fn run(command: Command) -> Result<()> {
                             upnp,
                             try_port_prediction,
                             nat_udp_preferred_port,
+                            max_conns,
                         )
                         .await
                     }

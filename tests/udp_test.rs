@@ -94,6 +94,7 @@ async fn udp_direct_round_trip() -> Result<()> {
         false,
         false,
         0,
+        1024,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -147,6 +148,7 @@ async fn udp_direct_survives_consumer_reconnect() -> Result<()> {
         false,
         false,
         0,
+        1024,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -217,6 +219,7 @@ async fn udp_consumer_detects_provider_drop() -> Result<()> {
         false,
         false,
         0,
+        1024,
     )
     .await?;
     let h_provider = tokio::spawn(provider.listen());
@@ -296,6 +299,7 @@ async fn udp_relay_upgrades_to_direct_when_provider_appears() -> Result<()> {
         false,
         false,
         0,
+        1024,
     )
     .await?;
     let h_provider = tokio::spawn(provider.listen());
@@ -334,6 +338,7 @@ async fn udp_falls_back_to_relay_without_udp_provider() -> Result<()> {
         false,
         false,
         0,
+        1024,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -362,5 +367,108 @@ async fn udp_falls_back_to_relay_without_udp_provider() -> Result<()> {
     time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(round_trip(addr, b"relay hi").await?, b"relay hi");
+    Ok(())
+}
+
+/// The consumer dials all provider candidates concurrently under one total budget
+/// (not a full timeout per candidate), so a long list of dead candidates fails
+/// fast instead of summing `N * NETWORK_TIMEOUT`. No server is needed: this drives
+/// `connect_direct` directly with unreachable peers.
+#[tokio::test]
+async fn udp_connect_budget_bounded() {
+    use bore_cli::holepunch;
+
+    let socket = holepunch::bind_socket(0).await.unwrap();
+    // 8 non-routable TEST-NET-3 addresses (RFC 5737) that never answer.
+    let peers: Vec<std::net::SocketAddr> = (1..=8)
+        .map(|i| format!("203.0.113.{i}:9").parse().unwrap())
+        .collect();
+    let token = holepunch::derive_token(Some("s"), &[0u8; 16]);
+
+    let start = std::time::Instant::now();
+    let res = holepunch::connect_direct(socket, peers, token).await;
+    let elapsed = start.elapsed();
+
+    assert!(res.is_err(), "dial to dead candidates must fail");
+    // Serial worst case would be 8 * NETWORK_TIMEOUT (~24s); the concurrent dial
+    // caps the whole attempt near one NETWORK_TIMEOUT (3s) + the brief punch.
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "connect budget not bounded: took {elapsed:?}"
+    );
+}
+
+/// The direct path enforces the provider's `--max-conns` (parity with the relay):
+/// connections beyond the cap are dropped, not served. Here the provider's cap is
+/// 2; two held-open connections consume both permits, and a third is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_direct_respects_max_conns() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+
+    let echo = spawn_echo_service().await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo,
+        "localhost",
+        "cap",
+        None,
+        false,
+        true,
+        Some(&stun),
+        false,
+        false,
+        0,
+        2, // max_conns = 2
+    )
+    .await?;
+    tokio::spawn(provider.listen());
+    time::sleep(Duration::from_millis(300)).await;
+
+    let proxy = Proxy::new(
+        "localhost",
+        "127.0.0.1:0".parse()?,
+        "cap",
+        None,
+        false,
+        true,
+        Some(&stun),
+        false,
+        false,
+        0,
+    )
+    .await?;
+    assert!(proxy.is_direct(), "consumer should be direct");
+    let addr = proxy.local_addr()?;
+    tokio::spawn(proxy.listen());
+    time::sleep(Duration::from_millis(100)).await;
+
+    // Open and hold two connections, confirming each is served (consuming a
+    // permit that stays held while the connection is open).
+    let mut held = Vec::new();
+    for i in 0..2u8 {
+        let mut c = TcpStream::connect(addr).await?;
+        c.write_all(&[i]).await?;
+        let mut b = [0u8; 1];
+        time::timeout(Duration::from_secs(2), c.read_exact(&mut b))
+            .await
+            .expect("held connection should be served within the cap")?;
+        assert_eq!(b[0], i);
+        held.push(c);
+    }
+
+    // A third connection is over the cap: the provider drops its substream, so it
+    // is never echoed — the local side sees EOF (or, at worst, no data).
+    let mut over = TcpStream::connect(addr).await?;
+    over.write_all(&[42]).await?;
+    let mut b = [0u8; 1];
+    let res = time::timeout(Duration::from_secs(2), over.read_exact(&mut b)).await;
+    assert!(
+        matches!(res, Ok(Err(_)) | Err(_)),
+        "connection over --max-conns must not be served, got {res:?}"
+    );
+
+    drop(held);
     Ok(())
 }

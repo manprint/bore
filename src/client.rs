@@ -19,12 +19,11 @@ use crate::transport::{self, Endpoint};
 
 #[cfg(feature = "udp")]
 use std::net::SocketAddr;
-#[cfg(feature = "udp")]
 use std::time::Duration;
 #[cfg(feature = "udp")]
 use tokio::net::UdpSocket;
 #[cfg(feature = "udp")]
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 /// State structure for the client.
 pub struct Client {
@@ -51,6 +50,26 @@ pub struct Client {
     /// Tunnel secret, retained to derive the direct-path token.
     #[cfg(feature = "udp")]
     secret: Option<String>,
+
+    /// Provider-side direct-path config; `Some` only for a secret provider that
+    /// requested `--udp`. Retained so [`Client::listen`] can re-offer UDP
+    /// candidates if the initial offer failed, and bound direct substreams.
+    #[cfg(feature = "udp")]
+    udp_cfg: Option<UdpProviderCfg>,
+}
+
+/// Provider-side direct-path configuration, retained on the [`Client`] so the
+/// listen loop can (re)offer candidates and bound concurrent direct substreams.
+#[cfg(feature = "udp")]
+struct UdpProviderCfg {
+    endpoint: Endpoint,
+    stun_server: Option<String>,
+    port_map: bool,
+    port_prediction: bool,
+    udp_port: u16,
+    /// Bounds concurrently served direct-path substreams — the direct-path analog
+    /// of the server's relay `--max-conns` (here it protects the provider host).
+    permits: Arc<Semaphore>,
 }
 
 impl Client {
@@ -110,6 +129,8 @@ impl Client {
             udp_socket: None,
             #[cfg(feature = "udp")]
             secret: secret.map(str::to_string),
+            #[cfg(feature = "udp")]
+            udp_cfg: None,
         })
     }
 
@@ -132,6 +153,7 @@ impl Client {
         port_map: bool,
         port_prediction: bool,
         udp_port: u16,
+        max_conns: usize,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
@@ -169,6 +191,13 @@ impl Client {
         // a consumer arrives and the server replies with `UdpPunch`.
         #[cfg(feature = "udp")]
         let udp_socket = if udp {
+            if secret.is_none() {
+                warn!(
+                    "--udp without --secret: the direct-path token derives from an empty key, so \
+                     its security rests only on the (random) server nonce and the control channel. \
+                     Pass --secret for a strong token."
+                );
+            }
             match offer_provider_candidates(
                 &mut control,
                 &endpoint,
@@ -193,6 +222,16 @@ impl Client {
             warn!("built without the `udp` feature; ignoring direct-path request");
         }
 
+        #[cfg(feature = "udp")]
+        let udp_cfg = udp.then(|| UdpProviderCfg {
+            endpoint: endpoint.clone(),
+            stun_server: stun_server.map(str::to_string),
+            port_map,
+            port_prediction,
+            udp_port,
+            permits: Arc::new(Semaphore::new(max_conns)),
+        });
+
         Ok(Client {
             control: Some(control),
             acceptor: Some(acceptor),
@@ -203,6 +242,8 @@ impl Client {
             udp_socket,
             #[cfg(feature = "udp")]
             secret: secret.map(str::to_string),
+            #[cfg(feature = "udp")]
+            udp_cfg,
         })
     }
 
@@ -222,8 +263,13 @@ impl Client {
         // Once the direct path is up, later `UdpPunch` messages (a new or
         // reconnecting consumer) are forwarded here to re-punch the NAT.
         #[cfg(feature = "udp")]
-        let mut punch_tx: Option<mpsc::Sender<Vec<SocketAddr>>> = None;
+        let mut punch_tx: Option<mpsc::UnboundedSender<Vec<SocketAddr>>> = None;
         let this = Arc::new(self);
+        // Retry the provider's UDP candidate offer if the initial one failed, so a
+        // transient bootstrap problem does not leave the provider relay-only for
+        // the whole session (the consumer already retries; the provider did not).
+        // The first tick fires immediately, re-offering at once if needed.
+        let mut udp_retry = tokio::time::interval(Duration::from_secs(15));
         loop {
             tokio::select! {
                 // Drain the control substream so the server's heartbeats are read;
@@ -241,16 +287,24 @@ impl Client {
                                 if let Some(tx) = &punch_tx {
                                     // Direct path already up: re-punch toward the
                                     // new/reconnecting consumer (the nonce is stable).
-                                    let _ = tx.try_send(peer);
+                                    // Unbounded so a burst of consumers never drops a
+                                    // re-punch (payloads are tiny, peers bounded).
+                                    let _ = tx.send(peer);
                                 } else if let Some(socket) = udp_socket.take() {
                                     let token =
                                         crate::holepunch::derive_token(secret.as_deref(), &nonce);
-                                    let (tx, rx) = mpsc::channel(8);
+                                    let (tx, rx) = mpsc::unbounded_channel();
                                     punch_tx = Some(tx);
+                                    let permits = this
+                                        .udp_cfg
+                                        .as_ref()
+                                        .map(|c| Arc::clone(&c.permits))
+                                        .expect("provider udp cfg present when a socket exists");
                                     let this = Arc::clone(&this);
                                     tokio::spawn(async move {
                                         if let Err(err) =
-                                            provider_direct(socket, peer, token, this, rx).await
+                                            provider_direct(socket, peer, token, this, rx, permits)
+                                                .await
                                         {
                                             warn!(%err, "direct provider path ended");
                                         }
@@ -267,6 +321,34 @@ impl Client {
                         }
                         Some(ServerMessage::UdpUnavailable) => warn!("unexpected udp unavailable"),
                         None => return Ok(()),
+                    }
+                }
+                // Periodically re-offer UDP candidates if the provider requested
+                // `--udp` but has no active socket yet (initial offer failed and no
+                // direct path is up). Bounded by STUN's own short timeouts.
+                _ = udp_retry.tick() => {
+                    #[cfg(feature = "udp")]
+                    if punch_tx.is_none() && udp_socket.is_none() {
+                        if let Some(cfg) = this.udp_cfg.as_ref() {
+                            match offer_provider_candidates(
+                                &mut control,
+                                &cfg.endpoint,
+                                cfg.stun_server.as_deref(),
+                                cfg.port_map,
+                                cfg.port_prediction,
+                                cfg.udp_port,
+                            )
+                            .await
+                            {
+                                Ok(socket) => {
+                                    info!("provider udp candidate offer succeeded on retry");
+                                    udp_socket = Some(socket);
+                                }
+                                Err(err) => {
+                                    debug!(%err, "provider udp re-offer failed; will retry")
+                                }
+                            }
+                        }
                     }
                 }
                 stream = acceptor.accept() => {
@@ -342,7 +424,8 @@ async fn provider_direct(
     peers: Vec<SocketAddr>,
     token: [u8; crate::holepunch::TOKEN_LEN],
     client: Arc<Client>,
-    mut punch_rx: mpsc::Receiver<Vec<SocketAddr>>,
+    mut punch_rx: mpsc::UnboundedReceiver<Vec<SocketAddr>>,
+    permits: Arc<Semaphore>,
 ) -> Result<()> {
     let listener = crate::holepunch::DirectListener::new(socket, peers).await?;
     info!("direct udp path ready, accepting connections");
@@ -355,11 +438,23 @@ async fn provider_direct(
                         // provider is the yamux server and dials the local service.
                         let (_opener, mut acceptor) = mux::server(quic);
                         let client = Arc::clone(&client);
+                        let permits = Arc::clone(&permits);
                         tokio::spawn(async move {
                             while let Some(stream) = acceptor.accept().await {
+                                // Bound concurrently served direct substreams, the
+                                // direct-path analog of the relay's `--max-conns`;
+                                // over the cap, drop (as the relay does).
+                                let permit = match Arc::clone(&permits).try_acquire_owned() {
+                                    Ok(permit) => permit,
+                                    Err(_) => {
+                                        warn!("direct path at max-conns, dropping connection");
+                                        continue;
+                                    }
+                                };
                                 let client = Arc::clone(&client);
                                 tokio::spawn(
                                     async move {
+                                        let _permit = permit;
                                         debug!("serving local connection over direct udp path");
                                         if let Err(err) = client.handle_connection(stream).await {
                                             warn!(%err, "direct connection closed with error");

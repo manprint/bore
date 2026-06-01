@@ -666,19 +666,23 @@ pub async fn connect_direct(
     peers: Vec<SocketAddr>,
     token: [u8; TOKEN_LEN],
 ) -> Result<QuicTransport> {
+    if peers.is_empty() {
+        bail!("no peer candidates to connect to");
+    }
     punch(&socket, &peers).await;
     let endpoint = client_endpoint(socket)?;
 
-    // Try each candidate (reflexive first) until one completes the handshake.
-    let mut last_err = None;
-    for peer in &peers {
-        match timeout(NETWORK_TIMEOUT, async {
-            let conn = endpoint.connect(*peer, "bore")?.await?;
-            anyhow::Ok(conn)
-        })
-        .await
-        {
-            Ok(Ok(conn)) => {
+    // Try all candidates concurrently under a single total budget (not a full
+    // timeout *per* candidate): with N candidates the serial worst case was
+    // N * NETWORK_TIMEOUT (6-21s for predicted/UPnP/local lists). `select_ok`
+    // returns the first handshake that completes and verifies its token; the
+    // losing connects are dropped (cancelled).
+    let attempts: Vec<_> = peers
+        .iter()
+        .map(|&peer| {
+            let endpoint = endpoint.clone();
+            Box::pin(async move {
+                let conn = endpoint.connect(peer, "bore")?.await?;
                 trace!(%peer, "QUIC connected");
                 let (mut send, mut recv) = conn.open_bi().await.context("open_bi failed")?;
                 // Consumer writes its token first, then reads the peer's.
@@ -691,18 +695,21 @@ pub async fn connect_direct(
                 }
                 info!(target_addr = %peer, peer = %conn.remote_address(),
                     "direct udp carrier established (consumer, token verified)");
-                return Ok(QuicTransport {
+                anyhow::Ok(QuicTransport {
                     recv,
                     send,
                     _conn: conn,
                     _endpoint: endpoint,
-                });
-            }
-            Ok(Err(err)) => last_err = Some(err),
-            Err(_) => last_err = Some(anyhow::anyhow!("connect to {peer} timed out")),
-        }
+                })
+            })
+        })
+        .collect();
+
+    match timeout(NETWORK_TIMEOUT, futures_util::future::select_ok(attempts)).await {
+        Ok(Ok((transport, _losers))) => Ok(transport),
+        Ok(Err(err)) => Err(err).context("all direct candidates failed"),
+        Err(_) => bail!("direct connect exhausted the {NETWORK_TIMEOUT:?} budget"),
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no peer candidates to connect to")))
 }
 
 /// Provider side: a long-lived QUIC server endpoint that accepts direct
@@ -928,10 +935,11 @@ pub mod stun {
 
     /// Build a STUN binding request, returning the bytes and the transaction id.
     pub fn binding_request() -> (Vec<u8>, [u8; 12]) {
+        use ring::rand::{SecureRandom, SystemRandom};
         let mut txid = [0u8; 12];
-        for b in txid.iter_mut() {
-            *b = fastrand::u8(..);
-        }
+        SystemRandom::new()
+            .fill(&mut txid)
+            .expect("system CSPRNG must not fail");
         let mut msg = Vec::with_capacity(20);
         msg.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
         msg.extend_from_slice(&0u16.to_be_bytes()); // message length: no attributes

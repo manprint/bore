@@ -146,6 +146,7 @@ async fn proxy_reconnects_when_server_appears() -> Result<()> {
         false,
         false,
         0,
+        1024,
     )
     .await?;
     tokio::spawn(provider.listen());

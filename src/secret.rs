@@ -19,8 +19,10 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{interval, MissedTickBehavior};
+#[cfg(feature = "udp")]
+use tracing::debug;
 use tracing::{error, info, info_span, trace, warn, Instrument};
 
 use crate::auth::Authenticator;
@@ -70,12 +72,15 @@ pub struct UdpOffer {
     pub peer_candidates: Vec<SocketAddr>,
 }
 
-/// Generate a fresh random session nonce.
+/// Generate a fresh random session nonce from the system CSPRNG. The nonce keys
+/// the direct-path token; with no `--secret` it is the *only* entropy, so it must
+/// be cryptographically unpredictable (not a fast PRNG).
 fn new_nonce() -> [u8; UDP_NONCE_LEN] {
+    use ring::rand::{SecureRandom, SystemRandom};
     let mut nonce = [0u8; UDP_NONCE_LEN];
-    for b in nonce.iter_mut() {
-        *b = fastrand::u8(..);
-    }
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .expect("system CSPRNG must not fail");
     nonce
 }
 
@@ -403,6 +408,14 @@ impl Proxy {
         let mut direct = false;
         let mut direct_acceptor = None;
         if udp {
+            #[cfg(feature = "udp")]
+            if secret.is_none() {
+                warn!(
+                    "--udp without --secret: the direct-path token derives from an empty key, so \
+                     its security rests only on the (random) server nonce and the control channel. \
+                     Pass --secret for a strong token."
+                );
+            }
             match negotiate_direct_consumer(
                 &mut control,
                 &endpoint,
@@ -490,35 +503,47 @@ impl Proxy {
         let mut path = if direct { "direct-udp" } else { "relay" };
         #[cfg(feature = "udp")]
         let mut last_upgrade = tokio::time::Instant::now();
+        // Relay → direct upgrade state. The slow work (STUN gather, punch, QUIC
+        // dial) runs in a spawned `upgrade_task` so the accept/forward loop never
+        // stalls; this loop only does the quick control I/O. The receivers are
+        // separate locals (not one struct) so the `select!` arms borrow disjoint
+        // fields, and are declared unconditionally because `tokio::select!` does
+        // not allow `#[cfg]` on its branches. An attempt is "in flight" exactly
+        // while `nego_done_rx` is `Some`. Without the `udp` feature nothing ever
+        // sets them, so the arms stay dormant.
+        let mut nego_cand_rx: Option<oneshot::Receiver<Vec<SocketAddr>>> = None;
+        #[allow(clippy::type_complexity)]
+        let mut nego_punch_tx: Option<
+            oneshot::Sender<Option<([u8; UDP_NONCE_LEN], Vec<SocketAddr>)>>,
+        > = None;
+        let mut nego_done_rx: Option<oneshot::Receiver<(mux::Opener, mux::Acceptor)>> = None;
         loop {
-            // Relay → direct upgrade: while on the relay, periodically retry the
-            // direct path and switch to it in place (no dropped session) as soon
-            // as the provider becomes reachable. Runs outside the `select!` so it
-            // has exclusive use of `control` (no double mutable borrow).
+            // Kick off an upgrade attempt on the timer. Non-blocking: the attempt
+            // runs in `upgrade_task`; this loop keeps accepting and forwarding.
             #[cfg(feature = "udp")]
-            if udp && !direct && last_upgrade.elapsed() >= UDP_UPGRADE_INTERVAL {
+            if udp
+                && !direct
+                && nego_done_rx.is_none()
+                && last_upgrade.elapsed() >= UDP_UPGRADE_INTERVAL
+            {
                 last_upgrade = tokio::time::Instant::now();
-                match negotiate_direct_consumer(
-                    &mut control,
-                    &endpoint,
-                    secret.as_deref(),
-                    stun_server.as_deref(),
+                let (cand_tx, cand_rx) = oneshot::channel();
+                let (punch_tx, punch_rx) = oneshot::channel();
+                let (done_tx, done_rx) = oneshot::channel();
+                tokio::spawn(upgrade_task(
+                    endpoint.clone(),
+                    secret.clone(),
+                    stun_server.clone(),
                     port_map,
                     port_prediction,
                     udp_port,
-                )
-                .await
-                {
-                    Ok(Some((new_opener, new_acceptor))) => {
-                        info!("upgraded relay → direct udp path");
-                        opener = new_opener;
-                        direct_acceptor = Some(new_acceptor);
-                        direct = true;
-                        path = "direct-udp";
-                    }
-                    Ok(None) => {} // provider still unreachable for udp; stay on relay
-                    Err(err) => warn!(%err, "udp upgrade attempt failed; staying on relay"),
-                }
+                    cand_tx,
+                    punch_rx,
+                    done_tx,
+                ));
+                nego_cand_rx = Some(cand_rx);
+                nego_punch_tx = Some(punch_tx);
+                nego_done_rx = Some(done_rx);
             }
 
             tokio::select! {
@@ -529,9 +554,56 @@ impl Proxy {
                         Some(ServerMessage::Error(err)) => error!(%err, "server error"),
                         Some(ServerMessage::Hello(_)) => warn!("unexpected hello"),
                         Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
-                        Some(ServerMessage::UdpPunch { .. }) => warn!("unexpected udp punch"),
-                        Some(ServerMessage::UdpUnavailable) => warn!("unexpected udp unavailable"),
+                        // Deliver the brokered candidates to the in-flight upgrade
+                        // task (which then punches + dials QUIC); else it is stray.
+                        Some(ServerMessage::UdpPunch { nonce, peer }) => match nego_punch_tx.take() {
+                            Some(tx) => {
+                                let _ = tx.send(Some((nonce, peer)));
+                            }
+                            None => warn!("unexpected udp punch"),
+                        },
+                        Some(ServerMessage::UdpUnavailable) => match nego_punch_tx.take() {
+                            // Provider not UDP-capable right now; tell the task to
+                            // give up so it stops and we stay on the relay.
+                            Some(tx) => {
+                                let _ = tx.send(None);
+                            }
+                            None => warn!("unexpected udp unavailable"),
+                        },
                         None => return Ok(()),
+                    }
+                }
+                // The upgrade task gathered its candidates: send them on control
+                // (this loop owns `control`, so no shared-mutable conflict).
+                cands = recv_opt(&mut nego_cand_rx) => {
+                    match cands {
+                        Some(cands) => {
+                            if control.send(ClientMessage::UdpCandidates(cands)).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        // Gather failed (task dropped the sender): abort this attempt.
+                        None => {
+                            nego_punch_tx = None;
+                            nego_done_rx = None;
+                        }
+                    }
+                }
+                // The upgrade task established a direct path: swap to it in place.
+                done = recv_opt(&mut nego_done_rx) => {
+                    nego_cand_rx = None;
+                    nego_punch_tx = None;
+                    // `Some` = upgraded; `None` = attempt failed, stay on relay
+                    // and retry next interval.
+                    if let Some((new_opener, new_acceptor)) = done {
+                        info!("upgraded relay → direct udp path");
+                        opener = new_opener;
+                        direct_acceptor = Some(new_acceptor);
+                        #[cfg(feature = "udp")]
+                        {
+                            direct = true;
+                        }
+                        path = "direct-udp";
                     }
                 }
                 // Detect the direct UDP path dying (provider restart / QUIC close)
@@ -579,9 +651,65 @@ async fn direct_path_closed(acceptor: &mut Option<mux::Acceptor>) {
     }
 }
 
-/// Negotiate a direct UDP path as the consumer (QUIC client). Returns the direct
-/// substream opener **and** acceptor (the latter only to detect the path dying)
-/// on success, or `None` to fall back to the server relay.
+/// Resolve when an optional one-shot receiver completes, consuming it. Yields the
+/// value (or `None` if the sender was dropped) and clears the slot; stays pending
+/// forever when the slot is empty, so an idle `select!` arm never fires.
+async fn recv_opt<T>(slot: &mut Option<oneshot::Receiver<T>>) -> Option<T> {
+    use std::future::{poll_fn, Future};
+    use std::pin::Pin;
+    match slot {
+        Some(rx) => {
+            let res = poll_fn(|cx| Pin::new(&mut *rx).poll(cx)).await;
+            *slot = None;
+            res.ok()
+        }
+        None => pending().await,
+    }
+}
+
+/// Bind a UDP socket and gather this consumer's candidates via STUN (no control
+/// channel needed). Shared by the synchronous initial negotiation and the
+/// background upgrade task.
+#[cfg(feature = "udp")]
+async fn gather_consumer_candidates(
+    endpoint: &Endpoint,
+    stun_server: Option<&str>,
+    port_map: bool,
+    port_prediction: bool,
+    udp_port: u16,
+) -> Result<(tokio::net::UdpSocket, Vec<SocketAddr>)> {
+    use crate::holepunch;
+    let stun = holepunch::resolve_stun(&endpoint.host, endpoint.port, stun_server).await?;
+    let socket = holepunch::bind_socket(udp_port).await?;
+    let candidates = holepunch::gather_candidates(&socket, stun, port_map, port_prediction).await;
+    if candidates.is_empty() {
+        bail!("no local UDP candidates discovered");
+    }
+    info!(?candidates, %stun, "consumer offering udp candidates (a public IP here means STUN worked)");
+    Ok((socket, candidates))
+}
+
+/// Punch toward the brokered peer candidates and bring up the direct QUIC mux (no
+/// control channel needed). Shared by the initial negotiation and the upgrade task.
+#[cfg(feature = "udp")]
+async fn finish_direct_consumer(
+    socket: tokio::net::UdpSocket,
+    secret: Option<&str>,
+    nonce: [u8; UDP_NONCE_LEN],
+    peer: Vec<SocketAddr>,
+) -> Result<(mux::Opener, mux::Acceptor)> {
+    use crate::holepunch;
+    info!(peer_candidates = ?peer, "consumer received peer candidates, punching + connecting QUIC");
+    let token = holepunch::derive_token(secret, &nonce);
+    let quic = holepunch::connect_direct(socket, peer, token).await?;
+    Ok(mux::client(quic))
+}
+
+/// Negotiate a direct UDP path as the consumer (QUIC client), synchronously.
+/// Used at startup in [`Proxy::new`] (blocking is fine there: no service is live
+/// yet). Returns the direct opener+acceptor on success, or `None` for the relay.
+/// The relay→direct upgrade uses [`upgrade_task`] instead so it never blocks the
+/// forwarding loop.
 #[cfg(feature = "udp")]
 async fn negotiate_direct_consumer(
     control: &mut Delimited<mux::Stream>,
@@ -592,15 +720,9 @@ async fn negotiate_direct_consumer(
     port_prediction: bool,
     udp_port: u16,
 ) -> Result<Option<(mux::Opener, mux::Acceptor)>> {
-    use crate::holepunch;
-
-    let stun = holepunch::resolve_stun(&endpoint.host, endpoint.port, stun_server).await?;
-    let socket = holepunch::bind_socket(udp_port).await?;
-    let candidates = holepunch::gather_candidates(&socket, stun, port_map, port_prediction).await;
-    if candidates.is_empty() {
-        bail!("no local UDP candidates discovered");
-    }
-    info!(?candidates, %stun, "consumer offering udp candidates (a public IP here means STUN worked)");
+    let (socket, candidates) =
+        gather_consumer_candidates(endpoint, stun_server, port_map, port_prediction, udp_port)
+            .await?;
     control
         .send(ClientMessage::UdpCandidates(candidates))
         .await?;
@@ -627,12 +749,58 @@ async fn negotiate_direct_consumer(
         Ok(Err(err)) => return Err(err),
         Err(_) => return Ok(None), // negotiation timed out → relay
     };
-    info!(peer_candidates = ?peer, "consumer received peer candidates, punching + connecting QUIC");
+    Ok(Some(
+        finish_direct_consumer(socket, secret, nonce, peer).await?,
+    ))
+}
 
-    let token = holepunch::derive_token(secret, &nonce);
-    let quic = holepunch::connect_direct(socket, peer, token).await?;
-    let (opener, acceptor) = mux::client(quic);
-    Ok(Some((opener, acceptor)))
+/// Background relay→direct upgrade attempt. Runs the slow work (STUN gather,
+/// punch, QUIC dial) off the forwarding loop. The control I/O is split with the
+/// loop, which owns `control`: this task gathers candidates and hands them to the
+/// loop via `cand_tx` (the loop sends them on control); the loop forwards the
+/// brokered reply back via `punch_rx`; on success this task returns the direct
+/// mux over `done_tx`. Dropping any sender signals "give up, stay on relay".
+#[cfg(feature = "udp")]
+#[allow(clippy::too_many_arguments)]
+async fn upgrade_task(
+    endpoint: Endpoint,
+    secret: Option<String>,
+    stun_server: Option<String>,
+    port_map: bool,
+    port_prediction: bool,
+    udp_port: u16,
+    cand_tx: oneshot::Sender<Vec<SocketAddr>>,
+    punch_rx: oneshot::Receiver<Option<([u8; UDP_NONCE_LEN], Vec<SocketAddr>)>>,
+    done_tx: oneshot::Sender<(mux::Opener, mux::Acceptor)>,
+) {
+    let (socket, candidates) = match gather_consumer_candidates(
+        &endpoint,
+        stun_server.as_deref(),
+        port_map,
+        port_prediction,
+        udp_port,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            debug!(%err, "udp upgrade gather failed; staying on relay");
+            return;
+        }
+    };
+    if cand_tx.send(candidates).is_err() {
+        return; // loop gone
+    }
+    let (nonce, peer) = match punch_rx.await {
+        Ok(Some(v)) => v,
+        _ => return, // unavailable / loop dropped the sender
+    };
+    match finish_direct_consumer(socket, secret.as_deref(), nonce, peer).await {
+        Ok(pair) => {
+            let _ = done_tx.send(pair);
+        }
+        Err(err) => warn!(%err, "udp upgrade attempt failed; staying on relay"),
+    }
 }
 
 #[cfg(not(feature = "udp"))]
@@ -666,4 +834,18 @@ async fn forward(mut local: TcpStream, opener: mux::Opener) -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonce_is_random_and_nonzero() {
+        // CSPRNG-backed: successive nonces differ and are not all-zero.
+        let a = new_nonce();
+        let b = new_nonce();
+        assert_ne!(a, b, "two nonces must differ");
+        assert_ne!(a, [0u8; UDP_NONCE_LEN], "nonce must not be all-zero");
+    }
 }

@@ -177,6 +177,7 @@ dependencies = [
  "lazy_static",
  "quinn",
  "rcgen",
+ "ring",
  "rstest",
  "serde",
  "serde_json",

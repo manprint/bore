@@ -31,6 +31,9 @@ fastrand = "2"
 futures-util = { version = "0.3.21", features = ["sink"] }
 hex = "0.4.3"
 hmac = "0.12.1"
+# CSPRNG for the direct-path session nonce and STUN transaction id. `ring` is
+# already compiled (tokio-rustls/quinn ring provider), so this adds no build cost.
+ring = "0.17"
 serde = { version = "1.0.136", features = ["derive"] }
 serde_json = "1.0.79"
 sha2 = "0.10.2"

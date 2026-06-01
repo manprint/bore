@@ -227,6 +227,20 @@ Each bullet = one or more commits on `perf-hardening`.
     strict firewall (same value on both peers) and the direct path uses it; on a
     port-preserving NAT it also fixes the public mapping. No help for symmetric
     NATs. On `local`+`proxy`+`test-udp`. (41641 = Tailscale's default, a sane pick.)
+17. **Direct-path hardening** (from a third-party review, `COPILOT_ANALISYS.md`):
+    (a) provider `--max-conns`/`BORE_MAX_CONNS` on `local` bounds concurrent
+    **direct** substreams (`Semaphore` in `provider_direct`) — parity with the
+    relay's server-wide cap, protecting the provider host. (b) The consumer's QUIC
+    dial (`connect_direct`) now tries all candidates **concurrently under one total
+    `NETWORK_TIMEOUT` budget** (`futures_util::select_ok`) instead of N×3s serial.
+    (c) The relay→direct upgrade runs in a spawned `upgrade_task` so `Proxy::listen`
+    never stalls the accept/forward loop (control I/O stays in the loop via
+    `cand`/`oneshot`/`done` channels). (d) The provider re-offers UDP candidates on
+    a 15s timer if the initial offer failed (was one-shot). (e) re-punch channel is
+    now `unbounded` (was `mpsc(8)` + `try_send`, could silently drop under a burst).
+    (f) the direct-path session nonce + STUN txid use the system CSPRNG (`ring::rand`,
+    was `fastrand`); the client warns on `--udp` without `--secret`. IPv6 dual-stack
+    (the review's remaining item) is deliberately deferred.
 
 ## CLI flags & env vars (all flags read env where present)
 
@@ -243,6 +257,7 @@ Each bullet = one or more commits on `perf-hardening`.
   `--udp`/`BORE_PREFER_UDP`, `--stun-server`/`BORE_STUN_SERVER`,
   `--upnp`/`BORE_UPNP`, `--try-port-prediction`/`BORE_TRY_PORT_PREDICTION`,
   `--nat-udp-preferred-port`/`BORE_NAT_UDP_PORT` (fixed UDP hole-punch port, 0=random),
+  `--max-conns`/`BORE_MAX_CONNS` (direct-path concurrency cap, default 1024),
   `--auto-reconnect`/`BORE_AUTO_RECONNECT`.
 - **proxy:** `--local-proxy-port`/`BORE_LOCAL_PROXY_PORT` (`:5555` = all
   interfaces), `--to`/`BORE_SERVER`, `-s`/`BORE_SECRET`,

@@ -26,6 +26,7 @@ CI (`.github/workflows/ci.yml`) runs three separate jobs: build+test, `cargo fmt
 - **Integration tests bind real ports and must run serially.** `tests/e2e_test.rs` spins up an actual `Server` on `CONTROL_PORT` (7835) plus tunnel ports. Tests share a `SERIAL_GUARD` mutex (`lazy_static`) to avoid port races — any new test that starts a server must take this lock. This means tests fail if port 7835 is already in use.
 - Tests use `rstest` for parameterized cases (e.g. `basic_proxy` runs across `None`/`Some("")`/`Some("abc")` secrets).
 - Doctests exist (see `auth.rs`) and run under `cargo test`.
+- **Multi-consumer is a supported invariant and is tested**: many `bore proxy` consumers may attach to one provider id, on the relay *and* the UDP direct path. Coverage — relay: `secret_multiple_consumers_concurrent` (3 concurrent consumers, distinct payloads, no cross-talk), `secret_single_consumer_many_connections` (16 conns over one consumer); direct: `udp_multiple_consumers_concurrent_direct` (3 direct on one provider endpoint via the stable per-provider nonce), `udp_mixed_direct_and_relay_consumers` (direct + relay against the same provider), `udp_consumer_reconnects_while_others_active`, `udp_multiple_consumers_detect_provider_drop`. The direct path scales because the provider runs one persistent `DirectListener` (one QUIC endpoint) that accepts every consumer's connection; the stable nonce means all derive the same token.
 
 ## Architecture
 

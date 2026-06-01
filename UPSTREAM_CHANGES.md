@@ -342,6 +342,16 @@ aarch64-musl, android via NDK).
 - **cross CI tests run `--no-default-features`** (relay-only) to avoid QUIC-over-
   qemu flakiness; the cross *build* still compiles `udp` and the host CI tests
   `--all-features`. Don't "fix" a missing udp_test on cross — it's intentional.
+- **Multi-consumer per provider id is a supported invariant** — many `bore proxy`
+  consumers may attach to one provider, on the relay and the direct path. Two
+  things keep it working: the **stable per-provider nonce** (`UdpReg.nonce`, minted
+  once when the provider offers) so every consumer derives the *same* direct-path
+  token, and the **single persistent `DirectListener`** whose `accept` loop takes
+  one QUIC connection per consumer. Do not regress to a per-consumer nonce or a
+  per-consumer endpoint — it breaks the 2nd consumer and reconnects. Covered by
+  `secret_multiple_consumers_concurrent`, `udp_multiple_consumers_concurrent_direct`,
+  `udp_mixed_direct_and_relay_consumers`, `udp_consumer_reconnects_while_others_active`,
+  `udp_multiple_consumers_detect_provider_drop`.
 
 ## Known limitations / candidate next steps
 

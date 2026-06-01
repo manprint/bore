@@ -370,6 +370,308 @@ async fn udp_falls_back_to_relay_without_udp_provider() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_multiple_consumers_concurrent_direct() -> Result<()> {
+    // Many consumers must share the provider's single persistent QUIC endpoint: the
+    // stable per-provider nonce means every consumer derives the same token, so the
+    // one `DirectListener` accepts all of them, each as its own QUIC connection +
+    // mux. All must be direct and serve traffic concurrently without cross-talk.
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+
+    let echo = spawn_echo_service().await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo,
+        "localhost",
+        "multidirect",
+        None,
+        false,
+        true,
+        Some(&stun),
+        false,
+        false,
+        0,
+        1024,
+    )
+    .await?;
+    tokio::spawn(provider.listen());
+    time::sleep(Duration::from_millis(300)).await;
+
+    let mut addrs = Vec::new();
+    for n in 0..3u8 {
+        let proxy = Proxy::new(
+            "localhost",
+            "127.0.0.1:0".parse()?,
+            "multidirect",
+            None,
+            false,
+            true,
+            Some(&stun),
+            false,
+            false,
+            0,
+        )
+        .await?;
+        assert!(
+            proxy.is_direct(),
+            "consumer {n} should negotiate a direct path"
+        );
+        addrs.push(proxy.local_addr()?);
+        tokio::spawn(proxy.listen());
+    }
+    time::sleep(Duration::from_millis(150)).await;
+
+    // Drive every direct path at once; each must echo exactly its own bytes.
+    let mut tasks = Vec::new();
+    for (i, addr) in addrs.into_iter().enumerate() {
+        tasks.push(tokio::spawn(async move {
+            let payload: Vec<u8> = (0..64 * 1024usize)
+                .map(|j| (j.wrapping_add(i) % 251) as u8)
+                .collect();
+            let got = round_trip(addr, &payload).await?;
+            anyhow::ensure!(got == payload, "consumer {i} got mismatched bytes");
+            anyhow::Ok(())
+        }));
+    }
+    for t in tasks {
+        t.await??;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_mixed_direct_and_relay_consumers() -> Result<()> {
+    // Against one UDP-capable provider, a `--udp` consumer (direct) and a plain
+    // consumer (relay) must both work at the same time. The provider serves both
+    // through the same `handle_connection` regardless of carrier.
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+
+    let echo = spawn_echo_service().await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo,
+        "localhost",
+        "mix",
+        None,
+        false,
+        true,
+        Some(&stun),
+        false,
+        false,
+        0,
+        1024,
+    )
+    .await?;
+    tokio::spawn(provider.listen());
+    time::sleep(Duration::from_millis(300)).await;
+
+    let direct = Proxy::new(
+        "localhost",
+        "127.0.0.1:0".parse()?,
+        "mix",
+        None,
+        false,
+        true,
+        Some(&stun),
+        false,
+        false,
+        0,
+    )
+    .await?;
+    assert!(direct.is_direct(), "udp consumer should be direct");
+    let direct_addr = direct.local_addr()?;
+    tokio::spawn(direct.listen());
+
+    let relay = Proxy::new(
+        "localhost",
+        "127.0.0.1:0".parse()?,
+        "mix",
+        None,
+        false,
+        false,
+        None,
+        false,
+        false,
+        0,
+    )
+    .await?;
+    assert!(!relay.is_direct(), "non-udp consumer should use the relay");
+    let relay_addr = relay.local_addr()?;
+    tokio::spawn(relay.listen());
+    time::sleep(Duration::from_millis(150)).await;
+
+    let (a, b) = tokio::join!(
+        round_trip(direct_addr, b"via-direct"),
+        round_trip(relay_addr, b"via-relay"),
+    );
+    assert_eq!(a?, b"via-direct");
+    assert_eq!(b?, b"via-relay");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_consumer_reconnects_while_others_active() -> Result<()> {
+    // One consumer drops and a fresh one reconnects while two others stay up. The
+    // provider's persistent listener must keep serving the survivors throughout and
+    // grant the reconnecting consumer a direct path again (stable nonce).
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+
+    let echo = spawn_echo_service().await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo,
+        "localhost",
+        "rcmulti",
+        None,
+        false,
+        true,
+        Some(&stun),
+        false,
+        false,
+        0,
+        1024,
+    )
+    .await?;
+    tokio::spawn(provider.listen());
+    time::sleep(Duration::from_millis(300)).await;
+
+    let mk = || {
+        let stun = stun.clone();
+        async move {
+            Proxy::new(
+                "localhost",
+                "127.0.0.1:0".parse().unwrap(),
+                "rcmulti",
+                None,
+                false,
+                true,
+                Some(&stun),
+                false,
+                false,
+                0,
+            )
+            .await
+        }
+    };
+
+    // Two long-lived consumers.
+    let keep1 = mk().await?;
+    assert!(keep1.is_direct());
+    let keep1_addr = keep1.local_addr()?;
+    tokio::spawn(keep1.listen());
+    let keep2 = mk().await?;
+    assert!(keep2.is_direct());
+    let keep2_addr = keep2.local_addr()?;
+    tokio::spawn(keep2.listen());
+
+    // A third consumer that we will drop.
+    let trans = mk().await?;
+    assert!(trans.is_direct());
+    let h_trans = tokio::spawn(trans.listen());
+    time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(round_trip(keep1_addr, b"k1").await?, b"k1");
+    assert_eq!(round_trip(keep2_addr, b"k2").await?, b"k2");
+
+    // Drop the third; the survivors must keep working.
+    h_trans.abort();
+    time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(round_trip(keep1_addr, b"k1-again").await?, b"k1-again");
+    assert_eq!(round_trip(keep2_addr, b"k2-again").await?, b"k2-again");
+
+    // A fresh consumer reconnects and must get a direct path again.
+    let trans2 = mk().await?;
+    assert!(
+        trans2.is_direct(),
+        "reconnecting consumer should be direct again"
+    );
+    let trans2_addr = trans2.local_addr()?;
+    tokio::spawn(trans2.listen());
+    time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(round_trip(trans2_addr, b"reborn").await?, b"reborn");
+
+    // Survivors still fine after the reconnect.
+    assert_eq!(round_trip(keep1_addr, b"k1-final").await?, b"k1-final");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_multiple_consumers_detect_provider_drop() -> Result<()> {
+    // When the provider dies, *every* direct consumer's QUIC path dies and each
+    // `listen()` must return so `--auto-reconnect` can re-negotiate (regression:
+    // a consumer used to keep using the dead path).
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+
+    let echo = spawn_echo_service().await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo,
+        "localhost",
+        "multidrop",
+        None,
+        false,
+        true,
+        Some(&stun),
+        false,
+        false,
+        0,
+        1024,
+    )
+    .await?;
+    let h_provider = tokio::spawn(provider.listen());
+    time::sleep(Duration::from_millis(300)).await;
+
+    let mut handles = Vec::new();
+    let mut addrs = Vec::new();
+    for n in 0..3u8 {
+        let proxy = Proxy::new(
+            "localhost",
+            "127.0.0.1:0".parse()?,
+            "multidrop",
+            None,
+            false,
+            true,
+            Some(&stun),
+            false,
+            false,
+            0,
+        )
+        .await?;
+        assert!(proxy.is_direct(), "consumer {n} should be direct");
+        addrs.push(proxy.local_addr()?);
+        handles.push(tokio::spawn(proxy.listen()));
+    }
+    time::sleep(Duration::from_millis(150)).await;
+    for (i, addr) in addrs.iter().enumerate() {
+        let msg = format!("c{i}");
+        assert_eq!(round_trip(*addr, msg.as_bytes()).await?, msg.as_bytes());
+    }
+
+    // Kill the provider: its teardown drops the punch channel, the direct QUIC
+    // endpoint closes, and every consumer's path dies.
+    h_provider.abort();
+    for (i, h) in handles.into_iter().enumerate() {
+        let returned = time::timeout(Duration::from_secs(12), h).await;
+        assert!(
+            returned.is_ok(),
+            "consumer {i} should detect the dead direct path and stop serving"
+        );
+    }
+
+    Ok(())
+}
+
 /// The consumer dials all provider candidates concurrently under one total budget
 /// (not a full timeout per candidate), so a long list of dead candidates fails
 /// fast instead of summing `N * NETWORK_TIMEOUT`. No server is needed: this drives

@@ -266,6 +266,112 @@ async fn secret_tunnel_large_payload() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secret_multiple_consumers_concurrent() -> Result<()> {
+    // One provider must serve many simultaneous `bore proxy` consumers on the same
+    // id. Each consumer is its own server-side `serve_consumer`; the server relays
+    // every consumer's substreams to the *one* shared provider connection over
+    // yamux. Distinct per-consumer payloads assert there is no cross-talk.
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(Some("s3cr3t")).await;
+
+    let echo_port = spawn_echo_service().await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo_port,
+        "localhost",
+        "multi",
+        Some("s3cr3t"),
+        false,
+        false,
+        None,
+        false,
+        false,
+        0,
+        1024,
+    )
+    .await?;
+    tokio::spawn(provider.listen());
+
+    // Bring up three independent consumers on the same id.
+    let mut addrs = Vec::new();
+    for _ in 0..3 {
+        let proxy = Proxy::new(
+            "localhost",
+            "127.0.0.1:0".parse()?,
+            "multi",
+            Some("s3cr3t"),
+            false,
+            false,
+            None,
+            false,
+            false,
+            0,
+        )
+        .await?;
+        addrs.push(proxy.local_addr()?);
+        tokio::spawn(proxy.listen());
+    }
+    time::sleep(Duration::from_millis(100)).await;
+
+    // Drive all three concurrently with a large, distinct payload each; every
+    // consumer must get exactly its own bytes back.
+    let mut tasks = Vec::new();
+    for (i, addr) in addrs.into_iter().enumerate() {
+        tasks.push(tokio::spawn(async move {
+            const LEN: usize = 256 * 1024;
+            let payload: Vec<u8> = (0..LEN).map(|j| (j.wrapping_add(i) % 251) as u8).collect();
+            let mut conn = TcpStream::connect(addr).await?;
+            let (mut rd, mut wr) = conn.split();
+            let mut received = vec![0u8; LEN];
+            let expected = payload.clone();
+            let writer = async {
+                wr.write_all(&payload).await?;
+                wr.shutdown().await?;
+                anyhow::Ok(())
+            };
+            let reader = async {
+                rd.read_exact(&mut received).await?;
+                anyhow::Ok(())
+            };
+            tokio::try_join!(writer, reader)?;
+            anyhow::ensure!(received == expected, "consumer {i} got mismatched bytes");
+            anyhow::Ok(())
+        }));
+    }
+    for t in tasks {
+        t.await??;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secret_single_consumer_many_connections() -> Result<()> {
+    // A single consumer opening many simultaneous connections must have each one
+    // served independently (per-connection substream over the consumer's mux).
+    let _guard = SERIAL_GUARD.lock().await;
+    let addr = spawn_secret_tunnel("fanout", Some("s3cr3t")).await?;
+
+    let mut tasks = Vec::new();
+    for i in 0..16u8 {
+        tasks.push(tokio::spawn(async move {
+            let mut conn = TcpStream::connect(addr).await?;
+            let msg = [i; 32];
+            conn.write_all(&msg).await?;
+            let mut buf = [0u8; 32];
+            time::timeout(Duration::from_secs(5), conn.read_exact(&mut buf)).await??;
+            anyhow::ensure!(buf == msg, "connection {i} got mismatched bytes");
+            anyhow::Ok(())
+        }));
+    }
+    for t in tasks {
+        t.await??;
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn secret_proxy_without_provider_closes() -> Result<()> {
     // A consumer connecting for an unregistered id must have its connection

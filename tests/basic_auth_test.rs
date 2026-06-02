@@ -98,6 +98,7 @@ async fn public_basic_auth_rejects_and_allows() -> Result<()> {
             force_https: false,
             basic_auth: Some(CREDS.into()),
             notes: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -152,6 +153,7 @@ async fn public_basic_auth_passes_non_http() -> Result<()> {
             force_https: false,
             basic_auth: Some(CREDS.into()),
             notes: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -187,6 +189,7 @@ async fn secret_provider_basic_auth_rejects_and_allows() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta {
             notes: None,
             basic_auth: Some(CREDS.into()),
@@ -206,6 +209,7 @@ async fn secret_provider_basic_auth_rejects_and_allows() -> Result<()> {
         false,
         false,
         0,
+        1, // carriers
         None,
     )
     .await?;

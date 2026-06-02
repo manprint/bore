@@ -119,6 +119,7 @@ systemd): chiudono in modo ordinato con una riga di log, senza troncare i trasfe
 | `--bind-addr <IP>` | — | 0.0.0.0 | IP su cui ascolta la control port. |
 | `--bind-tunnels <IP>` | — | = `--bind-addr` | IP su cui ascoltano le porte dei tunnel. |
 | `--udp` | `BORE_UDP` | off | Abilita i path diretti UDP + responder STUN. |
+| `--max-carriers <N>` | `BORE_MAX_CARRIERS` | 16 | Cap sui carrier paralleli per tunnel (1 = pool disabilitato). |
 | `--admin-token <TOKEN>` | `BORE_ADMIN_TOKEN` | — | Abilita la pagina admin (min 32 caratteri). |
 | `-v`, `-vv` | — | — | Verbosità log. |
 
@@ -143,6 +144,7 @@ systemd): chiudono in modo ordinato con una riga di log, senza troncare i trasfe
 | `--max-conns <N>` | `BORE_MAX_CONNS` | Cap connessioni concorrenti sul path diretto. |
 | `--basic-auth <USER:PASS>` | `BORE_BASIC_AUTH` | Protegge il tunnel con HTTP Basic auth. |
 | `--notes <TEXT>` | `BORE_NOTES` | Nota mostrata nella pagina admin del server. |
+| `--carriers <N>` | `BORE_CARRIERS` | Connessioni TCP parallele per la tratta relay (tunnel pubblico server→client o provider server→provider; default 1). |
 | `--auto-reconnect` | `BORE_AUTO_RECONNECT` | Riconnessione automatica con backoff. |
 
 ### `bore proxy` (consumatore di tunnel segreto)
@@ -160,6 +162,7 @@ systemd): chiudono in modo ordinato con una riga di log, senza troncare i trasfe
 | `--try-port-prediction` | `BORE_TRY_PORT_PREDICTION` | Porte predette per NAT simmetrici. |
 | `--nat-udp-preferred-port <PORT>` | `BORE_NAT_UDP_PORT` | Porta UDP fissa per il punch. |
 | `--notes <TEXT>` | `BORE_NOTES` | Nota mostrata nella pagina admin. |
+| `--carriers <N>` | `BORE_CARRIERS` | Connessioni TCP parallele per la tratta relay consumer→server (default 1). |
 | `--auto-reconnect` | `BORE_AUTO_RECONNECT` | Riconnessione automatica con backoff. |
 
 ### `bore test-udp` (diagnostica NAT/UDP — non apre tunnel)
@@ -699,14 +702,58 @@ Etichetta libera mostrata nella [pagina admin](#46-server-con-pagina-di-amminist
 Disponibile su `bore local` e `bore proxy`. Senza effetti sul traffico. Viene troncata
 a 256 caratteri.
 
-### 5.3 Riconnessione automatica (`--auto-reconnect`)
+### 5.3 Carrier paralleli (`--carriers`)
+
+Di default un tunnel fa passare **tutte** le connessioni proxate su **una sola**
+connessione TCP (multiplexing yamux). Sotto perdita di pacchetti questo causa
+*head-of-line blocking* tra connessioni (la perdita di un flusso blocca tutti gli
+altri che condividono quella TCP) e un unico controllo di congestione per tutti.
+
+`--carriers N` apre **N connessioni TCP parallele** e distribuisce le connessioni
+proxate su di esse (round-robin): la perdita su un carrier blocca solo ~1/N dei
+flussi e ogni carrier ha la propria finestra di congestione.
+
+Si applica a **tutte le tratte relay** (il server è sempre nel data path del relay):
+
+```shell
+# Tunnel pubblico (tratta server→client)
+bore local 8080 --to bore.tld --port 9000 --secret hunter2 --carriers 4
+# Provider segreto (tratta server→provider, condivisa da tutti i consumer)
+bore local 8080 --to bore.tld --tcp-secret-id app --secret hunter2 --carriers 4
+# Consumer segreto (tratta consumer→server)
+bore proxy --to bore.tld --tcp-secret-id app --secret hunter2 --local-proxy-port :5555 --carriers 4
+```
+
+Quando conviene:
+
+- **Conviene** con tanti flussi concorrenti: upload/download paralleli con `rclone`,
+  S3/WebDAV, browser (molte richieste), streaming — soprattutto su un link verso il
+  server con perdita o alta latenza.
+- **Non cambia nulla** per un singolo trasferimento bulk (un flusso = un carrier).
+  Per il caso flusso-singolo su link con perdita/alta-BDP, agisci sull'**host**:
+  `sysctl net.ipv4.tcp_congestion_control=bbr` (bore non imposta il congestion
+  control per-socket — richiederebbe codice `unsafe`).
+- Il server resta **sempre** nel data path del relay: questo **non** aggiunge banda
+  né lo bypassa — rimuove solo il collo di bottiglia della singola TCP sulla tratta.
+
+Il server limita `N` al proprio `--max-carriers` (default 16) per pubblici e provider;
+una richiesta più grande viene troncata, e `--max-carriers 1` disabilita il pool. Un
+carrier che cade viene ri-aperto automaticamente: il tunnel non si interrompe mai.
+Default `1` = comportamento invariato.
+
+> **Il path diretto UDP non usa `--carriers`.** Quando un tunnel segreto gira su path
+> diretto (`--udp`), ogni connessione proxata viaggia già su una **stream QUIC
+> nativa** indipendente (niente HOL). `--carriers` ottimizza il **relay**; `--udp`
+> ottimizza il **diretto**. Si combinano: il pool relay serve da fallback.
+
+### 5.4 Riconnessione automatica (`--auto-reconnect`)
 
 Su `bore local` e `bore proxy`. Se la connessione cade o non si stabilisce, il client
 riprova da solo con backoff esponenziale (1, 2, 4, 8, 16, 32 s, poi ogni 32 s); una
 connessione riuscita azzera il backoff. Per un tunnel segreto su UDP, dopo un riavvio
 del provider il proxy si riconnette e rinegozia (di nuovo diretto, o relay).
 
-### 5.4 Log e verbosità
+### 5.5 Log e verbosità
 
 ```shell
 bore local 8080 --to bore.tld -v       # debug
@@ -714,7 +761,7 @@ bore server --udp -vv                   # trace
 RUST_LOG=warn bore server               # filtro esplicito
 ```
 
-### 5.5 Variabili d'ambiente / Docker
+### 5.6 Variabili d'ambiente / Docker
 
 Ogni flag ha un equivalente `BORE_*` (vedi [Riferimento rapido](#2-riferimento-rapido-dei-comandi)).
 Nella cartella `docker/` trovi compose pronti per server, client e secret-proxy con
@@ -789,6 +836,36 @@ ssh -p 22000 utente@bore.tld
 > Per i servizi non-HTTP, `--basic-auth` non protegge nulla (passa inalterato): usa
 > `--secret` lato server e/o un tunnel **segreto** per limitarne l'accesso.
 
+### 6.5 Tunnel pubblico ad alta concorrenza (download/upload paralleli, web, streaming)
+
+Per workload con molte connessioni simultanee — `rclone` con upload/download
+paralleli, S3/WebDAV, browser, streaming — usa il **pool di carrier** per evitare
+l'head-of-line blocking della singola TCP (vedi [§5.3](#5-funzionalità-trasversali)).
+
+```shell
+# Server (alza il cap se vuoi pool più larghi)
+bore server --secret hunter2 --max-carriers 16
+
+# Client: 8 connessioni TCP parallele per i dati
+bore local 8080 --to bore.tld --port 9000 --secret hunter2 --carriers 8 --auto-reconnect
+
+# Chiunque: http://bore.tld:9000 — i flussi vengono distribuiti sugli 8 carrier
+```
+
+> Per un **singolo** trasferimento bulk il pool non cambia nulla (un flusso = un
+> carrier); su link con perdita imposta `bbr` sull'host:
+> `sysctl -w net.ipv4.tcp_congestion_control=bbr`.
+
+Stessa cosa per un **tunnel segreto** ad alta concorrenza — metti `--carriers` su
+provider e consumer (e, se vuoi, `--udp` per il path diretto P2P che già usa stream
+QUIC indipendenti):
+
+```shell
+bore server --secret hunter2 --udp --max-carriers 16
+bore local 8080 --to bore.tld --tcp-secret-id app --secret hunter2 --carriers 8 --udp --auto-reconnect
+bore proxy --to bore.tld --tcp-secret-id app --secret hunter2 --local-proxy-port :5555 --carriers 8 --udp --auto-reconnect
+```
+
 ---
 
 ## 7. Risoluzione dei problemi
@@ -802,6 +879,8 @@ ssh -p 22000 utente@bore.tld
 | Il path diretto UDP non parte, resta sempre relay | NAT/firewall, STUN non raggiungibile, `--udp` mancante su un lato | Esegui `bore test-udp` su entrambi; assicura `--udp` su server, provider e proxy e apri `control-port/udp`. Vedi [`NAT_TRAVERSAL.md`](NAT_TRAVERSAL.md). |
 | `/admin/status` non risponde | `--admin-token` non impostato o < 32 caratteri, o porta/schema sbagliati | Imposta un token ≥ 32 char; usa lo schema corretto (`http`/`https`) e la giusta control port. |
 | Token admin non accettato dalla pagina | Token errato | Reinserisci il valore esatto passato a `--admin-token`. |
+| `--carriers N` non sembra aprire N connessioni | Server con `--max-carriers` più basso (vale per pubblici e provider) | Alza `--max-carriers` sul server. Il consumer (`bore proxy`) apre le sue da sé, non è limitato dal server. |
+| `--carriers` non migliora un singolo download | Un flusso usa un solo carrier (il pool aiuta la concorrenza) | Imposta `bbr` sull'host (`sysctl net.ipv4.tcp_congestion_control=bbr`). |
 | `tcp-secret-id '<id>' already in use` | Esiste già un provider con quell'id | Un id ha un solo provider: scegli un id diverso o chiudi il provider esistente (i **proxy** multipli sono invece consentiti). |
 | Le credenziali Basic auth passano in chiaro | Tunnel/controllo non cifrato | Usa un server TLS e `--https` sul tunnel pubblico. |
 | Connessioni rifiutate sotto carico | Raggiunto `--max-conns` | Aumenta `--max-conns` (server e/o provider). |

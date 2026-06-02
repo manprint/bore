@@ -65,6 +65,7 @@ async fn secret_provider_registers() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await;
@@ -94,6 +95,7 @@ async fn secret_duplicate_id_rejected() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await?;
@@ -113,6 +115,7 @@ async fn secret_duplicate_id_rejected() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await;
@@ -140,6 +143,7 @@ async fn secret_registration_requires_correct_secret() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await;
@@ -158,6 +162,7 @@ async fn secret_registration_requires_correct_secret() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await;
@@ -209,6 +214,7 @@ async fn spawn_secret_tunnel(id: &str, secret: Option<&str>) -> Result<std::net:
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await?;
@@ -225,6 +231,7 @@ async fn spawn_secret_tunnel(id: &str, secret: Option<&str>) -> Result<std::net:
         false,
         false,
         0,
+        1, // carriers
         None,
     )
     .await?;
@@ -302,6 +309,7 @@ async fn secret_multiple_consumers_concurrent() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await?;
@@ -321,6 +329,7 @@ async fn secret_multiple_consumers_concurrent() -> Result<()> {
             false,
             false,
             0,
+            1, // carriers
             None,
         )
         .await?;
@@ -405,6 +414,7 @@ async fn secret_proxy_without_provider_closes() -> Result<()> {
         false,
         false,
         0,
+        1, // carriers
         None,
     )
     .await?;
@@ -439,6 +449,7 @@ async fn secret_proxy_requires_correct_secret() -> Result<()> {
         false,
         false,
         0,
+        1, // carriers
         None,
     )
     .await;
@@ -475,6 +486,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
             force_https: false,
             basic_auth: Some("a:b".into()),
             notes: Some("pub note".into()),
+            ..Default::default()
         },
     )
     .await?;
@@ -495,6 +507,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta {
             notes: Some("prov note".into()),
             basic_auth: Some("u:p".into()),
@@ -515,6 +528,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
         false,
         false,
         0,
+        1, // carriers
         Some("cons note".into()),
     )
     .await?;

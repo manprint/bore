@@ -10,14 +10,18 @@
 //!   over a freshly opened substream, splicing the two together. No port is bound.
 
 use std::future::pending;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{interval, MissedTickBehavior};
@@ -28,10 +32,12 @@ use tracing::{error, info, info_span, trace, warn, Instrument};
 use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Role};
 use crate::auth::Authenticator;
 use crate::mux;
+use crate::pool::{self, Carrier, CarrierPool, PendingCarriers, TokenGuard};
 use crate::shared::{
     tune_tcp, ClientMessage, Delimited, ServerMessage, PROXY_BUFFER_SIZE, UDP_NONCE_LEN,
 };
 use crate::transport::{self, Endpoint};
+use uuid::Uuid;
 
 /// Heartbeat interval on secret-tunnel control substreams.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
@@ -41,8 +47,21 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 #[cfg(feature = "udp")]
 const UDP_NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Registry mapping each `tcp-secret-id` to the provider's substream opener.
-pub type Registry = Arc<DashMap<String, mux::Opener>>;
+/// Payload of a successful relay→direct upgrade: the authenticated direct QUIC
+/// connection. Without the `udp` feature there is no direct path, so it is the
+/// uninhabited [`std::convert::Infallible`] — the upgrade channels are still
+/// declared (so `tokio::select!`, which forbids `#[cfg]` on arms, type-checks) but
+/// nothing ever sends on them.
+#[cfg(feature = "udp")]
+type DirectUpgrade = crate::holepunch::DirectConn;
+#[cfg(not(feature = "udp"))]
+type DirectUpgrade = std::convert::Infallible;
+
+/// Registry mapping each `tcp-secret-id` to the provider's carrier pool. The pool
+/// holds one substream opener per parallel provider connection (`--carriers`);
+/// [`relay`] round-robins across the live ones. With the default single connection
+/// the pool simply has one member.
+pub type Registry = Arc<DashMap<String, Arc<CarrierPool>>>;
 
 /// Registry of UDP-capable providers, keyed by `tcp-secret-id`, used to broker a
 /// direct hole-punched path. Independent of [`Registry`] (which always carries
@@ -112,9 +131,14 @@ pub async fn serve_provider(
     peer: SocketAddr,
     notes: Option<String>,
     basic_auth: bool,
+    pending_carriers: PendingCarriers,
+    max_carriers: u16,
+    carriers: u16,
 ) -> Result<()> {
-    // Register atomically, rejecting a duplicate id rather than hijacking it.
-    match registry.entry(id.clone()) {
+    // Register atomically, rejecting a duplicate id rather than hijacking it. The
+    // registration is a carrier pool seeded with this connection's opener; extra
+    // provider connections (`--carriers`) join the pool via `JoinCarrier`.
+    let pool = match registry.entry(id.clone()) {
         Entry::Occupied(_) => {
             warn!(%id, "secret tunnel id already in use");
             let msg = format!("tcp-secret-id '{id}' already in use");
@@ -122,9 +146,11 @@ pub async fn serve_provider(
             return Ok(());
         }
         Entry::Vacant(slot) => {
-            slot.insert(opener);
+            let pool = Arc::new(CarrierPool::new(opener));
+            slot.insert(Arc::clone(&pool));
+            pool
         }
-    }
+    };
     let _guard = Deregister {
         registry: registry.clone(),
         udp_registry: udp_registry.clone(),
@@ -145,11 +171,32 @@ pub async fn serve_provider(
     info!(%id, "secret provider registered");
     control.send(ServerMessage::Ok).await?;
 
+    // Carrier pool: if the provider requested more than one carrier, issue a token
+    // and tell it how many extra connections to open. They arrive as `JoinCarrier`
+    // handshakes and their openers are delivered here (via `carrier_rx`) and added
+    // to the pool, so `relay` round-robins relayed substreams across them.
+    let effective = carriers.clamp(1, max_carriers.max(1));
+    let mut carrier_rx = if carriers > 1 {
+        let extra = effective - 1;
+        let token = Uuid::new_v4().to_string();
+        let (tx, rx) = mpsc::unbounded_channel();
+        pending_carriers.insert(token.clone(), tx);
+        control
+            .send(ServerMessage::CarrierToken {
+                token: token.clone(),
+                extra,
+            })
+            .await?;
+        info!(%id, extra, "provider carrier pool offered");
+        Some((rx, TokenGuard::new(pending_carriers.clone(), token)))
+    } else {
+        None
+    };
+
     // After registering, the provider only sends a `UdpCandidates` message if it
     // opted into the direct-path mode; otherwise it sends nothing. We heartbeat
-    // to detect a dead provider, watch for its candidates, and forward any
-    // consumer offer to it as a `UdpPunch` so it can punch back and accept a
-    // direct connection.
+    // to detect a dead provider, watch for its candidates, forward any consumer
+    // offer to it as a `UdpPunch`, and add joined carrier connections to the pool.
     let mut offers: Option<mpsc::Receiver<UdpOffer>> = None;
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -187,6 +234,13 @@ pub async fn serve_provider(
                 };
                 if control.send(msg).await.is_err() {
                     return Ok(());
+                }
+            }
+            joined = pool::recv_carrier(carrier_rx.as_mut()) => {
+                if let Some(carrier) = joined {
+                    if pool.push(carrier, effective as usize) {
+                        info!(%id, size = pool.len(), "provider carrier joined pool");
+                    }
                 }
             }
         }
@@ -338,11 +392,13 @@ async fn relay(mut consumer: mux::Stream, registry: Registry, id: &str) -> Resul
     let mut marker = [0u8; 1];
     consumer.read_exact(&mut marker).await?;
 
-    // Clone the opener out so no DashMap guard is held across an await point.
-    let opener = match registry.get(id).map(|entry| entry.value().clone()) {
-        Some(opener) => opener,
+    // Clone the pool handle out so no DashMap guard is held across an await point,
+    // then round-robin to a live provider carrier.
+    let pool = match registry.get(id).map(|entry| Arc::clone(entry.value())) {
+        Some(pool) => pool,
         None => bail!("no provider registered for '{id}'"),
     };
+    let opener = pool.pick().context("no live provider carrier")?;
     let mut provider = opener.open().await.context("provider unavailable")?;
     provider.write_all(&[mux::STREAM_READY]).await?;
 
@@ -356,18 +412,122 @@ async fn relay(mut consumer: mux::Stream, registry: Registry, id: &str) -> Resul
     Ok(())
 }
 
+/// The consumer's data path for forwarding a proxied connection: either the server
+/// relay (a pool of one or more connections, round-robined to avoid single-TCP
+/// head-of-line blocking) or a direct UDP path (native QUIC streams, one per
+/// proxied connection).
+enum DataPath {
+    /// Server relay: round-robin a substream opener from the carrier pool.
+    Relay(Arc<CarrierPool>),
+    /// Direct UDP path: open a native QUIC stream per proxied connection.
+    #[cfg(feature = "udp")]
+    Direct(crate::holepunch::DirectConn),
+}
+
+impl DataPath {
+    /// A per-connection handle used to open one forwarded stream. Cloned out so the
+    /// open + splice can run in a spawned task without borrowing the path.
+    fn opener(&self) -> Result<StreamOpener> {
+        match self {
+            DataPath::Relay(pool) => Ok(StreamOpener::Mux(
+                pool.pick().context("no live relay carrier")?,
+            )),
+            #[cfg(feature = "udp")]
+            DataPath::Direct(conn) => Ok(StreamOpener::Direct(conn.clone())),
+        }
+    }
+}
+
+/// A per-connection handle to open one forwarded stream (relay substream or direct
+/// QUIC stream).
+#[derive(Clone)]
+enum StreamOpener {
+    Mux(mux::Opener),
+    #[cfg(feature = "udp")]
+    Direct(crate::holepunch::DirectConn),
+}
+
+impl StreamOpener {
+    async fn open(self) -> Result<DataStream> {
+        match self {
+            StreamOpener::Mux(opener) => Ok(DataStream::Mux(
+                opener
+                    .open()
+                    .await
+                    .context("failed to open stream to server")?,
+            )),
+            #[cfg(feature = "udp")]
+            StreamOpener::Direct(conn) => Ok(DataStream::Quic(conn.open_stream().await?)),
+        }
+    }
+}
+
+/// One forwarded stream — a yamux substream (relay) or a native QUIC bidi (direct).
+/// Both are `Unpin`, so the trait impls delegate by matching on `&mut self`.
+enum DataStream {
+    Mux(mux::Stream),
+    #[cfg(feature = "udp")]
+    Quic(crate::holepunch::QuicTransport),
+}
+
+impl AsyncRead for DataStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            DataStream::Mux(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "udp")]
+            DataStream::Quic(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for DataStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            DataStream::Mux(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "udp")]
+            DataStream::Quic(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            DataStream::Mux(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "udp")]
+            DataStream::Quic(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            DataStream::Mux(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "udp")]
+            DataStream::Quic(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 /// Client side of a secret tunnel consumer (`bore proxy`): binds a local listener
 /// and forwards each accepted connection to the provider through the server.
 pub struct Proxy {
     control: Delimited<mux::Stream>,
-    opener: mux::Opener,
+    /// Current data path: the server relay (a carrier pool of one or more
+    /// connections) or, after a successful negotiation, the direct UDP path.
+    data_path: DataPath,
     listener: TcpListener,
     /// Whether data flows over a direct UDP path rather than the server relay.
     direct: bool,
-    /// The direct path's mux acceptor, kept only to detect that path dying: it
-    /// yields `None` when the QUIC connection to the provider closes (e.g. the
-    /// provider restarted), which tears the proxy down so it re-negotiates.
-    direct_acceptor: Option<mux::Acceptor>,
+    /// Resolves once when the direct QUIC connection closes (provider restart /
+    /// QUIC idle timeout), tearing the proxy down so it re-negotiates. `None` on
+    /// the relay path; set when the direct path comes up (at startup or on upgrade).
+    direct_closed_rx: Option<oneshot::Receiver<()>>,
     /// Whether the direct UDP path was requested (`--udp`). When set and we are
     /// currently on the relay, `listen` periodically retries the direct path and
     /// upgrades to it without dropping the session.
@@ -403,6 +563,8 @@ impl Proxy {
     /// Connect to the server, register as a consumer of `tcp_secret_id`, and bind
     /// the local proxy listener.
     #[allow(clippy::too_many_arguments)]
+    // Without the `udp` feature the data path never upgrades, so these stay `Relay`.
+    #[cfg_attr(not(feature = "udp"), allow(unused_mut))]
     pub async fn new(
         to: &str,
         bind_addr: SocketAddr,
@@ -414,6 +576,7 @@ impl Proxy {
         port_map: bool,
         port_prediction: bool,
         udp_port: u16,
+        carriers: u16,
         notes: Option<String>,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
@@ -450,11 +613,14 @@ impl Proxy {
             None => bail!("unexpected EOF"),
         }
 
-        // Optionally negotiate a direct UDP path; on any failure keep the relay
-        // opener so the tunnel still works through the server.
-        let mut data_opener = opener;
+        // The relay carrier pool seeded with this (main) connection's opener.
+        let pool = Arc::new(CarrierPool::new(opener));
+        let mut data_path = DataPath::Relay(Arc::clone(&pool));
         let mut direct = false;
-        let mut direct_acceptor = None;
+        let mut direct_closed_rx = None;
+
+        // Optionally negotiate a direct UDP path; on any failure keep the relay so
+        // the tunnel still works through the server.
         if udp {
             #[cfg(feature = "udp")]
             if secret.is_none() {
@@ -475,15 +641,41 @@ impl Proxy {
             )
             .await
             {
-                Ok(Some((opener, acceptor))) => {
+                #[cfg(feature = "udp")]
+                Ok(Some(conn)) => {
                     info!(%tcp_secret_id, "using direct udp path");
-                    data_opener = opener;
+                    direct_closed_rx = Some(spawn_closed_monitor(conn.clone()));
+                    data_path = DataPath::Direct(conn);
                     direct = true;
-                    direct_acceptor = Some(acceptor);
                 }
+                // Unreachable without the `udp` feature (no direct path exists).
+                #[cfg(not(feature = "udp"))]
+                Ok(Some(_)) => {}
                 Ok(None) => info!(%tcp_secret_id, "udp unavailable, using relay"),
                 Err(err) => warn!(%err, "udp negotiation failed, using relay"),
             }
+        }
+
+        // On the relay path with `--carriers > 1`, open extra connections and add
+        // their openers to the pool so the consumer's forwarded substreams spread
+        // across several TCP connections (avoiding single-connection HOL). Each
+        // extra is drained of heartbeats and pruned when it drops.
+        if matches!(data_path, DataPath::Relay(_)) && carriers > 1 {
+            for _ in 1..carriers {
+                if let Err(err) = open_consumer_carrier(
+                    &endpoint,
+                    insecure,
+                    secret,
+                    tcp_secret_id,
+                    &pool,
+                    carriers,
+                )
+                .await
+                {
+                    warn!(%err, "failed to open extra relay carrier");
+                }
+            }
+            info!(%tcp_secret_id, size = pool.len(), "consumer carrier pool established");
         }
 
         let listener = TcpListener::bind(bind_addr)
@@ -493,10 +685,10 @@ impl Proxy {
 
         Ok(Proxy {
             control,
-            opener: data_opener,
+            data_path,
             listener,
             direct,
-            direct_acceptor,
+            direct_closed_rx,
             #[cfg(feature = "udp")]
             udp,
             #[cfg(feature = "udp")]
@@ -529,10 +721,10 @@ impl Proxy {
     pub async fn listen(self) -> Result<()> {
         let Proxy {
             mut control,
-            mut opener,
+            mut data_path,
             listener,
             mut direct,
-            mut direct_acceptor,
+            mut direct_closed_rx,
             #[cfg(feature = "udp")]
             udp,
             #[cfg(feature = "udp")]
@@ -564,7 +756,7 @@ impl Proxy {
         let mut nego_punch_tx: Option<
             oneshot::Sender<Option<([u8; UDP_NONCE_LEN], Vec<SocketAddr>)>>,
         > = None;
-        let mut nego_done_rx: Option<oneshot::Receiver<(mux::Opener, mux::Acceptor)>> = None;
+        let mut nego_done_rx: Option<oneshot::Receiver<DirectUpgrade>> = None;
         loop {
             // Kick off an upgrade attempt on the timer. Non-blocking: the attempt
             // runs in `upgrade_task`; this loop keeps accepting and forwarding.
@@ -601,6 +793,7 @@ impl Proxy {
                         Some(ServerMessage::Heartbeat) | Some(ServerMessage::Ok) => (),
                         Some(ServerMessage::Error(err)) => error!(%err, "server error"),
                         Some(ServerMessage::Hello(_)) => warn!("unexpected hello"),
+                        Some(ServerMessage::CarrierToken { .. }) => warn!("unexpected carrier token"),
                         Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
                         // Deliver the brokered candidates to the in-flight upgrade
                         // task (which then punches + dials QUIC); else it is stray.
@@ -643,21 +836,21 @@ impl Proxy {
                     nego_punch_tx = None;
                     // `Some` = upgraded; `None` = attempt failed, stay on relay
                     // and retry next interval.
-                    if let Some((new_opener, new_acceptor)) = done {
-                        info!("upgraded relay → direct udp path");
-                        opener = new_opener;
-                        direct_acceptor = Some(new_acceptor);
+                    if let Some(_conn) = done {
                         #[cfg(feature = "udp")]
                         {
+                            info!("upgraded relay → direct udp path");
+                            direct_closed_rx = Some(spawn_closed_monitor(_conn.clone()));
+                            data_path = DataPath::Direct(_conn);
                             direct = true;
+                            path = "direct-udp";
                         }
-                        path = "direct-udp";
                     }
                 }
                 // Detect the direct UDP path dying (provider restart / QUIC close)
                 // even while the server control channel stays up: tear down so
                 // auto-reconnect re-negotiates a fresh path (direct or relay).
-                _ = direct_path_closed(&mut direct_acceptor) => {
+                _ = recv_opt(&mut direct_closed_rx) => {
                     warn!("direct udp path closed; reconnecting");
                     return Ok(());
                 }
@@ -670,7 +863,13 @@ impl Proxy {
                         }
                     };
                     tune_tcp(&local);
-                    let opener = opener.clone();
+                    let opener = match data_path.opener() {
+                        Ok(opener) => opener,
+                        Err(err) => {
+                            warn!(%err, "no data path available, dropping connection");
+                            continue;
+                        }
+                    };
                     info!(?addr, %path, "forwarding local connection over secret tunnel");
                     tokio::spawn(
                         async move {
@@ -686,17 +885,67 @@ impl Proxy {
     }
 }
 
-/// Resolve when the direct UDP path closes: the direct mux's acceptor yields
-/// `None` once the QUIC connection to the provider is gone (or, unexpectedly, an
-/// inbound substream). Stays pending forever in relay mode (no direct acceptor),
-/// so the `select!` only watches the control channel there.
-async fn direct_path_closed(acceptor: &mut Option<mux::Acceptor>) {
-    match acceptor {
-        Some(a) => {
-            let _ = a.accept().await;
-        }
-        None => pending().await,
+/// Spawn a task that resolves the returned receiver once the direct QUIC
+/// connection closes (provider restart / idle timeout / graceful close), so the
+/// listen loop can tear down and re-negotiate.
+#[cfg(feature = "udp")]
+fn spawn_closed_monitor(conn: crate::holepunch::DirectConn) -> oneshot::Receiver<()> {
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        conn.closed().await;
+        let _ = tx.send(());
+    });
+    rx
+}
+
+/// Open one extra relay connection for the consumer's carrier pool: dial the
+/// server, register as a consumer of `id`, and add its substream opener to `pool`.
+/// A drain task reads (and discards) the server heartbeats so the connection stays
+/// alive, and marks the carrier dead when it drops (so the pool prunes it).
+async fn open_consumer_carrier(
+    endpoint: &Endpoint,
+    insecure: bool,
+    secret: Option<&str>,
+    id: &str,
+    pool: &Arc<CarrierPool>,
+    max: u16,
+) -> Result<()> {
+    let socket = transport::connect(endpoint, insecure).await?;
+    let (opener, _acceptor) = mux::client(socket);
+    let mut control = Delimited::new(
+        opener
+            .open()
+            .await
+            .context("failed to open carrier control stream")?,
+    );
+    control
+        .send(ClientMessage::ConnectSecret {
+            id: id.to_string(),
+            notes: None,
+        })
+        .await?;
+    if let Some(secret) = secret {
+        Authenticator::new(secret)
+            .client_handshake(&mut control)
+            .await?;
     }
+    match control.recv_timeout().await? {
+        Some(ServerMessage::Ok) => {}
+        Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+        _ => bail!("unexpected response to carrier connect"),
+    }
+    let carrier = Carrier::new(opener);
+    let alive = Arc::clone(&carrier.alive);
+    if !pool.push(carrier, max as usize) {
+        return Ok(()); // pool already at capacity
+    }
+    tokio::spawn(async move {
+        // The server only sends heartbeats here; drain them so flow control does
+        // not stall, and mark the carrier dead when the connection drops.
+        while let Ok(Some(_)) = control.recv::<ServerMessage>().await {}
+        alive.store(false, Ordering::Relaxed);
+    });
+    Ok(())
 }
 
 /// Resolve when an optional one-shot receiver completes, consuming it. Yields the
@@ -748,19 +997,18 @@ async fn finish_direct_consumer(
     secret: Option<&str>,
     nonce: [u8; UDP_NONCE_LEN],
     peer: Vec<SocketAddr>,
-) -> Result<(mux::Opener, mux::Acceptor)> {
+) -> Result<crate::holepunch::DirectConn> {
     use crate::holepunch;
     info!(peer_candidates = ?peer, "consumer received peer candidates, punching + connecting QUIC");
     let token = holepunch::derive_token(secret, &nonce);
-    let quic = holepunch::connect_direct(socket, peer, token).await?;
-    Ok(mux::client(quic))
+    holepunch::connect_direct(socket, peer, token).await
 }
 
 /// Negotiate a direct UDP path as the consumer (QUIC client), synchronously.
 /// Used at startup in [`Proxy::new`] (blocking is fine there: no service is live
-/// yet). Returns the direct opener+acceptor on success, or `None` for the relay.
-/// The relay→direct upgrade uses [`upgrade_task`] instead so it never blocks the
-/// forwarding loop.
+/// yet). Returns the authenticated direct connection on success, or `None` for the
+/// relay. The relay→direct upgrade uses [`upgrade_task`] instead so it never blocks
+/// the forwarding loop.
 #[cfg(feature = "udp")]
 async fn negotiate_direct_consumer(
     control: &mut Delimited<mux::Stream>,
@@ -770,7 +1018,7 @@ async fn negotiate_direct_consumer(
     port_map: bool,
     port_prediction: bool,
     udp_port: u16,
-) -> Result<Option<(mux::Opener, mux::Acceptor)>> {
+) -> Result<Option<crate::holepunch::DirectConn>> {
     let (socket, candidates) =
         gather_consumer_candidates(endpoint, stun_server, port_map, port_prediction, udp_port)
             .await?;
@@ -822,7 +1070,7 @@ async fn upgrade_task(
     udp_port: u16,
     cand_tx: oneshot::Sender<Vec<SocketAddr>>,
     punch_rx: oneshot::Receiver<Option<([u8; UDP_NONCE_LEN], Vec<SocketAddr>)>>,
-    done_tx: oneshot::Sender<(mux::Opener, mux::Acceptor)>,
+    done_tx: oneshot::Sender<crate::holepunch::DirectConn>,
 ) {
     let (socket, candidates) = match gather_consumer_candidates(
         &endpoint,
@@ -863,20 +1111,20 @@ async fn negotiate_direct_consumer(
     _port_map: bool,
     _port_prediction: bool,
     _udp_port: u16,
-) -> Result<Option<(mux::Opener, mux::Acceptor)>> {
+) -> Result<Option<DirectUpgrade>> {
     warn!("built without the `udp` feature; ignoring direct-path request");
     Ok(None)
 }
 
-/// Forward one accepted local connection over a new substream to the server.
-async fn forward(mut local: TcpStream, opener: mux::Opener) -> Result<()> {
-    let mut stream = opener
-        .open()
-        .await
-        .context("failed to open stream to server")?;
-    // Announce the substream so the server routes it even if the local peer waits
-    // for the service to speak first; the server consumes this marker byte.
+/// Forward one accepted local connection over a freshly opened data stream — a
+/// relay substream or a direct native QUIC stream, depending on the path.
+async fn forward(mut local: TcpStream, opener: StreamOpener) -> Result<()> {
+    let mut stream = opener.open().await?;
+    // Announce the stream so the peer routes it even if the local service waits
+    // to speak first; the marker is consumed on the other end. Flush it so the
+    // peer sees the stream promptly (a fresh QUIC stream is silent until flushed).
     stream.write_all(&[mux::STREAM_READY]).await?;
+    stream.flush().await?;
     tokio::io::copy_bidirectional_with_sizes(
         &mut local,
         &mut stream,

@@ -173,6 +173,7 @@ async fn admin_data_reflects_live_tunnels() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta {
             notes: Some("hello-note".into()),
             basic_auth: None,
@@ -192,6 +193,7 @@ async fn admin_data_reflects_live_tunnels() -> Result<()> {
         false,
         false,
         0,
+        1, // carriers
         Some("consumer-note".into()),
     )
     .await?;

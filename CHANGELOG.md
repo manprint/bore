@@ -12,6 +12,29 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
 ## [Unreleased]
 
 ### Added
+- **Carrier pool on every relay leg** (`--carriers N` on `bore local` and
+  `bore proxy`, env `BORE_CARRIERS`; `--max-carriers` on `bore server`, env
+  `BORE_MAX_CARRIERS`): open N parallel TCP connections and round-robin proxied
+  connections across them instead of multiplexing everything over one TCP. Removes
+  yamux's single-connection head-of-line blocking and gives each carrier its own
+  congestion window — for **concurrent** workloads (parallel rclone/S3/WebDAV
+  transfers, many web requests, streaming). Applies to **all three relay legs**: a
+  public tunnel (server→client), a secret provider (server→provider, the leg shared
+  by all consumers), and a secret consumer (consumer→server). A single bulk flow is
+  unaffected (one flow = one carrier); for single-flow loss/high-BDP, tune the host
+  (`sysctl net.ipv4.tcp_congestion_control=bbr`). Default `1` keeps the current
+  single-connection behaviour; the server clamps a request to `--max-carriers`
+  (public/provider pools), a too-large request degrades gracefully, and a dropped
+  carrier is pruned + re-dialed automatically — the tunnel never breaks. The server
+  stays in the relay data path (this is not the UDP direct path).
+- **UDP direct path now uses native QUIC streams.** A secret tunnel's direct
+  (hole-punched) path multiplexes each proxied connection over its **own** QUIC
+  bidirectional stream — independently flow-controlled and loss-isolated by QUIC —
+  instead of running yamux over a single QUIC stream. This removes head-of-line
+  blocking on the direct path with no extra connections (so `--carriers` is for the
+  relay; the direct path is fixed automatically). The connection is authenticated
+  once (token on a dedicated stream); behaviour, multi-consumer support, reconnect,
+  and relay fallback are unchanged.
 - **HTTP Basic auth on tunnels** (`--basic-auth "user:pass"` on `bore local`,
   env `BORE_BASIC_AUTH`): HTTP requests without valid credentials get a `401`;
   non-HTTP traffic is forwarded unprotected (Basic auth is HTTP-only). Public

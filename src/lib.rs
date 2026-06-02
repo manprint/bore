@@ -23,6 +23,7 @@ pub mod client;
 pub mod edge;
 pub mod holepunch;
 pub mod mux;
+pub mod pool;
 pub mod prefixed;
 pub mod reconnect;
 pub mod secret;

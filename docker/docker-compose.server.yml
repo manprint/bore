@@ -37,6 +37,9 @@ services:
       - BORE_MIN_PORT=6000
       - BORE_MAX_PORT=7000
       - BORE_MAX_CONNS=1024
+      # Cap on the parallel TCP "carrier" connections a public tunnel may use
+      # (a client's --carriers request is clamped to this). 1 disables the pool.
+      - BORE_MAX_CARRIERS=16
       # Broker UDP hole-punched direct paths for secret tunnels and run a STUN
       # responder on the control port (UDP). The 7835/udp forward above is
       # required. The direct data path is peer-to-peer and does NOT traverse this

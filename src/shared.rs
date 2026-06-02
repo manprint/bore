@@ -80,6 +80,15 @@ pub struct TunnelOptions {
     pub basic_auth: Option<String>,
     /// Optional free-form note shown on the admin status page (no behavior).
     pub notes: Option<String>,
+    /// Number of parallel TCP carrier connections the client wants for this
+    /// tunnel's data path. `0`/`1` mean the single-connection default (current
+    /// behavior). `>1` requests a carrier pool: the server replies with a
+    /// [`ServerMessage::CarrierToken`] and the client opens extra connections that
+    /// join the pool, spreading proxied connections across several TCP streams to
+    /// avoid yamux's single-connection head-of-line blocking. `#[serde(default)]`
+    /// keeps the wire format backward-compatible (a missing field reads as `0`).
+    #[serde(default)]
+    pub carriers: u16,
 }
 
 /// A message from the client on the control substream.
@@ -118,6 +127,16 @@ pub enum ClientMessage {
     /// brokers them to the other peer of the same secret tunnel. Sent only when
     /// both ends opt into the `udp` direct-path mode.
     UdpCandidates(Vec<SocketAddr>),
+
+    /// First message on an extra connection that joins a public tunnel's carrier
+    /// pool. `token` is the per-tunnel value issued in [`ServerMessage::CarrierToken`];
+    /// the server matches it to the pending tunnel and adds this connection's
+    /// substream opener to the pool. Sent before authenticating (lazy-open reason,
+    /// like `Hello`).
+    JoinCarrier {
+        /// The carrier token issued by the server for this tunnel.
+        token: String,
+    },
 }
 
 /// A message from the server on the control substream.
@@ -128,6 +147,18 @@ pub enum ServerMessage {
 
     /// Response to a client's initial message, with actual public port.
     Hello(u16),
+
+    /// Sent after [`ServerMessage::Hello`] when the client requested a carrier
+    /// pool (`TunnelOptions::carriers > 1`). `token` authorizes extra connections
+    /// to join this tunnel's pool via [`ClientMessage::JoinCarrier`]; `extra` is
+    /// how many additional carrier connections the client should open (after the
+    /// server clamps the request to its `--max-carriers`; may be `0`).
+    CarrierToken {
+        /// Per-tunnel token an extra connection presents to join the pool.
+        token: String,
+        /// Number of additional carrier connections to open.
+        extra: u16,
+    },
 
     /// Acknowledges a secret-tunnel registration ([`ClientMessage::HelloSecret`]
     /// or [`ClientMessage::ConnectSecret`]).

@@ -152,9 +152,44 @@ Options:
       --max-conns <N>          Max concurrent connections on the direct UDP path (default 1024) [env: BORE_MAX_CONNS=]
       --basic-auth <USER:PASS> Protect the tunnel with HTTP Basic auth [env: BORE_BASIC_AUTH]
       --notes <TEXT>           Note shown on the server's admin status page [env: BORE_NOTES=]
+      --carriers <N>           Parallel TCP carrier connections for the data path (public tunnels; default 1) [env: BORE_CARRIERS=]
       --auto-reconnect         Reconnect automatically with backoff if the connection drops [env: BORE_AUTO_RECONNECT=]
   -h, --help                   Print help
 ```
+
+#### Parallel carriers (`--carriers`)
+
+By default a public tunnel multiplexes **every** proxied connection over a
+**single** TCP connection to the server. Under packet loss that causes
+cross-connection head-of-line blocking (one flow's lost segment stalls all the
+others sharing the TCP), and every flow shares one TCP congestion window.
+
+`--carriers N` opens **N parallel TCP connections** and spreads proxied connections
+across them (round-robin). A lost segment then only stalls the ~1/N flows on that
+carrier, and each carrier gets its own congestion window:
+
+```shell
+bore local 8080 --to bore.tld -p 9000 -s mysecret --carriers 4
+```
+
+When it helps and when it doesn't:
+
+- **Helps** concurrent workloads: parallel `rclone`/S3/WebDAV transfers, browsers
+  (many requests), streaming — especially on a lossy or high-latency link to the
+  server.
+- **No change** for a single bulk transfer (one flow = one carrier). For single-flow
+  loss/high-BDP, tune the **host** instead: `sysctl net.ipv4.tcp_congestion_control=bbr`
+  (bore can't set per-socket congestion control without `unsafe`).
+- The server is always in a public tunnel's data path, so this does **not** add
+  bandwidth or bypass the server — it removes the single-TCP bottleneck on the
+  server↔client leg only.
+
+The server caps `N` at its `--max-carriers` (default 16); a larger request is
+clamped, and if the server has the pool disabled (`--max-carriers 1`) the tunnel
+falls back to a single connection. A carrier that drops mid-session is re-dialed
+automatically; the tunnel never breaks (it just runs with fewer carriers until the
+re-dial succeeds). Secret tunnels ignore `--carriers`. Default `1` = unchanged
+behaviour.
 
 #### Automatic reconnection
 
@@ -226,6 +261,7 @@ Options:
   -v, --verbose...           Increase log verbosity (-v debug, -vv trace; RUST_LOG overrides)
   -s, --secret <SECRET>      Optional secret for authentication [env: BORE_SECRET]
       --max-conns <N>        Max concurrently proxied connections per client [env: BORE_MAX_CONNS=] [default: 1024]
+      --max-carriers <N>     Max parallel TCP carriers a tunnel may use (1 disables the pool) [env: BORE_MAX_CARRIERS=] [default: 16]
       --control-port <PORT>  TCP port the control connection listens on [env: BORE_CONTROL_PORT=] [default: 7835]
       --bind-domain <DOMAIN> Public domain advertised to clients [env: BORE_BIND_DOMAIN=]
       --cert-file <PATH>     TLS certificate chain (PEM); with --key-file, serves HTTPS [env: BORE_CERT_FILE=]
@@ -433,6 +469,8 @@ is the blocker (symmetric/CGNAT/UDP-blocked), not the consumer's.
 There is a _control port_, `7835` by default (configurable with `--control-port`). The client opens a single connection to it — plain TCP, or TLS when reached via `https://` — and [multiplexes](https://github.com/hashicorp/yamux/blob/master/spec.md) everything over that one connection. At initialization, the client opens a control stream and sends a "Hello" message asking to proxy a selected remote port. The server responds with an acknowledgement and begins listening for external TCP connections.
 
 Whenever the server obtains a connection on the remote port, it opens a new multiplexed stream to the client over the existing connection, and proxies the external connection over it. This avoids a fresh TCP (and authentication) handshake per proxied connection. The number of concurrently proxied connections per client is bounded by `--max-conns`.
+
+With `--carriers N` (public tunnels), the client opens `N` connections instead of one: after the "Hello" the server returns a `CarrierToken`, the client opens `N-1` more connections that present it (`JoinCarrier`), and the server round-robins each external connection's multiplexed stream across the pool. The proxied data path is identical — only *which* connection carries each stream changes — so a lost segment stalls only the streams on that one TCP, and each carrier has its own congestion window. The server clamps `N` to `--max-carriers`.
 
 Secret tunnels reuse the same machinery without a public port. A provider (`bore local --tcp-secret-id`) registers its connection under the id; a consumer (`bore proxy`) opens a stream per local connection, and the server relays each one to the provider over a freshly opened stream — splicing the two multiplexed streams together internally.
 

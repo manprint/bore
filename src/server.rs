@@ -1,15 +1,18 @@
 //! Server implementation for the `bore` service.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, ops::RangeInclusive, sync::Arc, time::Duration};
 
 use anyhow::Result;
+use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, info_span, trace, warn, Instrument};
+use uuid::Uuid;
 
 use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Role};
 use crate::admin_http::{self, ServerStatus};
@@ -29,8 +32,33 @@ use crate::shared::{
 /// Overridable with [`Server::set_max_conns`].
 pub const DEFAULT_MAX_CONNS: usize = 1024;
 
+/// Default cap on the number of parallel TCP carrier connections a single tunnel
+/// may use for its data path. Overridable with [`Server::set_max_carriers`].
+pub const DEFAULT_MAX_CARRIERS: u16 = 16;
+
 /// Interval at which the server sends heartbeats to detect a dead client.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// One member of a public tunnel's carrier pool: an [`mux::Opener`] for a TCP
+/// connection over which the server opens proxied-connection substreams. `alive`
+/// is cleared when that connection drops, so [`Server::serve_tunnel`] can prune it.
+struct Carrier {
+    opener: mux::Opener,
+    alive: Arc<AtomicBool>,
+}
+
+/// Removes a pending carrier token from the registry when the tunnel ends, so the
+/// token map does not leak entries across tunnel lifetimes.
+struct TokenGuard {
+    registry: Arc<DashMap<String, mpsc::UnboundedSender<Carrier>>>,
+    token: String,
+}
+
+impl Drop for TokenGuard {
+    fn drop(&mut self) {
+        self.registry.remove(&self.token);
+    }
+}
 
 /// State structure for the server.
 pub struct Server {
@@ -42,6 +70,15 @@ pub struct Server {
 
     /// Limits the number of concurrently proxied connections per client.
     conn_permits: Arc<Semaphore>,
+
+    /// Maximum number of parallel TCP carrier connections a tunnel may use.
+    max_carriers: u16,
+
+    /// Pending carrier pools, keyed by the per-tunnel token issued in
+    /// [`ServerMessage::CarrierToken`]. An extra connection presenting the token
+    /// (via [`ClientMessage::JoinCarrier`]) has its substream opener delivered to
+    /// the matching tunnel's [`Server::serve_tunnel`] loop.
+    pending_carriers: Arc<DashMap<String, mpsc::UnboundedSender<Carrier>>>,
 
     /// Registry of named secret-tunnel providers, keyed by `tcp-secret-id`.
     providers: Registry,
@@ -84,6 +121,8 @@ impl Server {
         Server {
             port_range,
             conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
+            max_carriers: DEFAULT_MAX_CARRIERS,
+            pending_carriers: Arc::new(DashMap::new()),
             providers: Registry::default(),
             udp_providers: UdpRegistry::default(),
             udp: false,
@@ -123,6 +162,13 @@ impl Server {
     /// connection at once. See [`DEFAULT_MAX_CONNS`].
     pub fn set_max_conns(&mut self, max_conns: usize) {
         self.conn_permits = Arc::new(Semaphore::new(max_conns));
+    }
+
+    /// Set the maximum number of parallel TCP carrier connections a single tunnel
+    /// may use for its data path (the cap on a client's `carriers` request). See
+    /// [`DEFAULT_MAX_CARRIERS`].
+    pub fn set_max_carriers(&mut self, max_carriers: u16) {
+        self.max_carriers = max_carriers;
     }
 
     /// Set the IP address where the control server will bind to.
@@ -312,6 +358,9 @@ impl Server {
             Some(ClientMessage::Hello(port, opts)) => {
                 self.serve_tunnel(control, opener, port, opts, peer).await
             }
+            Some(ClientMessage::JoinCarrier { token }) => {
+                self.serve_carrier(control, opener, token).await
+            }
             Some(ClientMessage::HelloSecret {
                 id,
                 notes,
@@ -388,6 +437,36 @@ impl Server {
         info!(?host, ?port, https = opts.https, "new client");
         control.send(ServerMessage::Hello(port)).await?;
 
+        // Carrier pool: when the client requests more than one carrier, issue a
+        // per-tunnel token and tell it how many extra connections to open (clamped
+        // to `--max-carriers`). Those connections arrive as separate `JoinCarrier`
+        // handshakes and deliver their substream openers through `carrier_rx`. The
+        // data path is unchanged — only *which* connection opens each substream.
+        let mut carriers: Vec<Carrier> = vec![Carrier {
+            opener,
+            alive: Arc::new(AtomicBool::new(true)),
+        }];
+        let effective = opts.carriers.clamp(1, self.max_carriers.max(1));
+        let mut carrier_rx = if opts.carriers > 1 {
+            let extra = effective - 1;
+            let token = Uuid::new_v4().to_string();
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.pending_carriers.insert(token.clone(), tx);
+            // Drop guard removes the token when this tunnel ends.
+            let _guard = TokenGuard {
+                registry: Arc::clone(&self.pending_carriers),
+                token: token.clone(),
+            };
+            control
+                .send(ServerMessage::CarrierToken { token, extra })
+                .await?;
+            info!(extra, "carrier pool offered");
+            Some((rx, _guard))
+        } else {
+            None
+        };
+        let mut next_carrier: usize = 0;
+
         // Register this tunnel in the admin registry for its whole lifetime; the
         // registration is removed when this function returns (client gone).
         let registration = self.admin.register(NewEntry {
@@ -411,6 +490,16 @@ impl Server {
                     if control.send(ServerMessage::Heartbeat).await.is_err() {
                         // Assume that the client connection has been dropped.
                         return Ok(());
+                    }
+                }
+                // An extra connection joined the carrier pool. Cap the pool at the
+                // effective size so a misbehaving client cannot grow it without bound.
+                joined = recv_carrier(carrier_rx.as_mut()) => {
+                    if let Some(carrier) = joined {
+                        if carriers.len() < effective as usize {
+                            carriers.push(carrier);
+                            info!(size = carriers.len(), "carrier joined pool");
+                        }
                     }
                 }
                 result = listener.accept() => {
@@ -441,7 +530,15 @@ impl Server {
                     };
                     info!(?addr, ?port, "new connection");
 
-                    let opener = opener.clone();
+                    // Round-robin across the live carriers (prunes dead ones); the
+                    // control connection is always carrier 0 and always live here.
+                    let opener = match pick_carrier(&mut carriers, &mut next_carrier) {
+                        Some(opener) => opener,
+                        None => {
+                            warn!("no live carrier, dropping connection");
+                            continue;
+                        }
+                    };
                     let tls = self.tls.clone();
                     let domain = self.bind_domain.clone();
                     let opts = opts.clone();
@@ -486,5 +583,66 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Serve an extra connection that joins a public tunnel's carrier pool: match
+    /// its `token` to the pending tunnel, hand that tunnel this connection's
+    /// substream opener, then hold the connection open (reading the control
+    /// substream only to detect teardown) so the pool can use it. When the
+    /// connection drops, the carrier is marked dead and pruned by the tunnel loop.
+    async fn serve_carrier(
+        &self,
+        mut control: Delimited<mux::Stream>,
+        opener: mux::Opener,
+        token: String,
+    ) -> Result<()> {
+        // The token is a 122-bit random UUID, so a hash-map lookup is adequate (it
+        // cannot be feasibly guessed; a constant-time scan would only leak the
+        // pool count via timing). An unknown/expired token is rejected quietly.
+        let Some(tx) = self.pending_carriers.get(&token).map(|e| e.value().clone()) else {
+            warn!("carrier join with unknown token");
+            return Ok(());
+        };
+        let alive = Arc::new(AtomicBool::new(true));
+        if tx
+            .send(Carrier {
+                opener,
+                alive: Arc::clone(&alive),
+            })
+            .is_err()
+        {
+            // The tunnel ended between the lookup and the send.
+            return Ok(());
+        }
+        info!("carrier connection joined");
+        // The client sends nothing more on this substream; recv resolves only when
+        // the connection drops (gracefully → None, hard kill → keepalive → Err).
+        while let Ok(Some(_)) = control.recv::<ClientMessage>().await {}
+        alive.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// Pick the next live carrier opener round-robin, pruning any that have died. The
+/// control connection (carrier 0) is always live while [`Server::serve_tunnel`]
+/// runs, so this returns `None` only if the whole pool somehow drained.
+fn pick_carrier(carriers: &mut Vec<Carrier>, next: &mut usize) -> Option<mux::Opener> {
+    carriers.retain(|c| c.alive.load(Ordering::Relaxed));
+    if carriers.is_empty() {
+        return None;
+    }
+    let idx = *next % carriers.len();
+    *next = next.wrapping_add(1);
+    Some(carriers[idx].opener.clone())
+}
+
+/// Await the next pooled carrier, or pend forever when there is no pool (so it can
+/// sit harmlessly in the `select!`). Borrows the receiver + its drop guard tuple.
+async fn recv_carrier(
+    rx: Option<&mut (mpsc::UnboundedReceiver<Carrier>, TokenGuard)>,
+) -> Option<Carrier> {
+    match rx {
+        Some((rx, _guard)) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }

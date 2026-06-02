@@ -475,6 +475,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
             force_https: false,
             basic_auth: Some("a:b".into()),
             notes: Some("pub note".into()),
+            ..Default::default()
         },
     )
     .await?;

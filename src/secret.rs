@@ -601,6 +601,7 @@ impl Proxy {
                         Some(ServerMessage::Heartbeat) | Some(ServerMessage::Ok) => (),
                         Some(ServerMessage::Error(err)) => error!(%err, "server error"),
                         Some(ServerMessage::Hello(_)) => warn!("unexpected hello"),
+                        Some(ServerMessage::CarrierToken { .. }) => warn!("unexpected carrier token"),
                         Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
                         // Deliver the brokered candidates to the in-flight upgrade
                         // task (which then punches + dials QUIC); else it is stray.

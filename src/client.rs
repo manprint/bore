@@ -1,13 +1,15 @@
 //! Client implementation for the `bore` service.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tokio::{net::TcpStream, time::timeout};
 #[cfg(feature = "udp")]
-use tracing::{debug, trace};
-use tracing::{error, info, info_span, warn, Instrument};
+use tracing::trace;
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use crate::auth::Authenticator;
 use crate::basicauth::{self, BasicAuth, Gate};
@@ -24,7 +26,10 @@ use std::time::Duration;
 #[cfg(feature = "udp")]
 use tokio::net::UdpSocket;
 #[cfg(feature = "udp")]
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::Semaphore;
+
+/// Interval at which the client tops the carrier pool back up after a drop.
+const CARRIER_REDIAL_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Optional operator-supplied metadata for a secret-tunnel provider.
 #[derive(Clone, Default)]
@@ -72,6 +77,27 @@ pub struct Client {
     /// secret-tunnel provider with `--basic-auth` (public tunnels are enforced on
     /// the server instead). Applies to both relay and direct paths.
     basic_auth: Option<BasicAuth>,
+
+    /// Extra carrier connections opened for a public tunnel's pool (each a held-open
+    /// control substream + its data acceptor). Empty unless `--carriers > 1`. The
+    /// data acceptors are pumped into the listen loop alongside the main one.
+    carrier_acceptors: Vec<(Delimited<mux::Stream>, mux::Acceptor)>,
+
+    /// Parameters to re-dial a dropped carrier and keep the pool at full width.
+    /// `Some` only for a public tunnel that established a pool.
+    carrier_dialer: Option<CarrierDialer>,
+}
+
+/// Parameters retained to (re)open a carrier connection for a public tunnel's
+/// pool: dial the same server endpoint and present the per-tunnel carrier token.
+#[derive(Clone)]
+struct CarrierDialer {
+    endpoint: Endpoint,
+    insecure: bool,
+    secret: Option<String>,
+    token: String,
+    /// Target number of extra carriers (the pool is topped back up to this).
+    target_extra: usize,
 }
 
 /// Provider-side direct-path configuration, retained on the [`Client`] so the
@@ -117,6 +143,7 @@ impl Client {
         // what announces the control substream (SYN) to the server. During
         // authentication the server speaks first, so without this the server would
         // never see the stream and both sides would deadlock.
+        let carriers = options.carriers;
         control.send(ClientMessage::Hello(port, options)).await?;
         if let Some(secret) = secret {
             Authenticator::new(secret)
@@ -135,6 +162,41 @@ impl Client {
         info!(remote_port, "connected to server");
         info!("listening at {}:{remote_port}", endpoint.host);
 
+        // Carrier pool: if more than one carrier was requested, the server replies
+        // with a token and how many extra connections to open. Each extra dials the
+        // same endpoint and joins the pool; failures are non-fatal (degrade to the
+        // carriers that did connect, the re-dial timer tops up later).
+        let mut carrier_acceptors = Vec::new();
+        let mut carrier_dialer = None;
+        if carriers > 1 {
+            match control.recv_timeout().await? {
+                Some(ServerMessage::CarrierToken { token, extra }) => {
+                    for _ in 0..extra {
+                        match open_carrier(&endpoint, insecure, secret, &token).await {
+                            Ok(pair) => carrier_acceptors.push(pair),
+                            Err(err) => warn!(%err, "failed to open carrier connection"),
+                        }
+                    }
+                    info!(
+                        opened = carrier_acceptors.len(),
+                        requested = extra,
+                        "carrier pool established"
+                    );
+                    if extra > 0 {
+                        carrier_dialer = Some(CarrierDialer {
+                            endpoint: endpoint.clone(),
+                            insecure,
+                            secret: secret.map(str::to_string),
+                            token,
+                            target_extra: extra as usize,
+                        });
+                    }
+                }
+                Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+                other => bail!("expected carrier token, got {other:?}"),
+            }
+        }
+
         Ok(Client {
             control: Some(control),
             acceptor: Some(acceptor),
@@ -149,6 +211,8 @@ impl Client {
             udp_cfg: None,
             // Public tunnels are basic-auth-gated on the server, not the client.
             basic_auth: None,
+            carrier_acceptors,
+            carrier_dialer,
         })
     }
 
@@ -270,6 +334,9 @@ impl Client {
             #[cfg(feature = "udp")]
             udp_cfg,
             basic_auth: meta.basic_auth.as_deref().and_then(BasicAuth::parse),
+            // Secret-tunnel providers do not use the public-tunnel carrier pool.
+            carrier_acceptors: Vec::new(),
+            carrier_dialer: None,
         })
     }
 
@@ -282,6 +349,8 @@ impl Client {
     pub async fn listen(mut self) -> Result<()> {
         let mut control = self.control.take().unwrap();
         let mut acceptor = self.acceptor.take().unwrap();
+        let carrier_acceptors = std::mem::take(&mut self.carrier_acceptors);
+        let carrier_dialer = self.carrier_dialer.take();
         #[cfg(feature = "udp")]
         let mut udp_socket = self.udp_socket.take();
         #[cfg(feature = "udp")]
@@ -291,6 +360,22 @@ impl Client {
         #[cfg(feature = "udp")]
         let mut punch_tx: Option<mpsc::UnboundedSender<Vec<SocketAddr>>> = None;
         let this = Arc::new(self);
+
+        // Carrier pool: pump each extra carrier's accepted data substreams into a
+        // shared channel the listen loop drains exactly like the main acceptor. A
+        // liveness counter drives the re-dial timer that keeps the pool full.
+        let (carrier_tx, mut carrier_rx) = mpsc::unbounded_channel::<mux::Stream>();
+        let carrier_live = Arc::new(AtomicUsize::new(0));
+        for (control_keepalive, acc) in carrier_acceptors {
+            spawn_carrier_pump(
+                control_keepalive,
+                acc,
+                carrier_tx.clone(),
+                Arc::clone(&carrier_live),
+            );
+        }
+        let carrier_redial_inflight = Arc::new(AtomicBool::new(false));
+        let mut carrier_redial = tokio::time::interval(CARRIER_REDIAL_INTERVAL);
         // Retry the provider's UDP candidate offer if the initial one failed, so a
         // transient bootstrap problem does not leave the provider relay-only for
         // the whole session (the consumer already retries; the provider did not).
@@ -305,6 +390,7 @@ impl Client {
                         Some(ServerMessage::Heartbeat) => (),
                         Some(ServerMessage::Error(err)) => error!(%err, "server error"),
                         Some(ServerMessage::Hello(_)) => warn!("unexpected hello"),
+                        Some(ServerMessage::CarrierToken { .. }) => warn!("unexpected carrier token"),
                         Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
                         Some(ServerMessage::Ok) => warn!("unexpected ok"),
                         Some(ServerMessage::UdpPunch { nonce, peer }) => {
@@ -377,21 +463,31 @@ impl Client {
                         }
                     }
                 }
+                // A data substream from one of the extra carrier connections. We
+                // hold `carrier_tx`, so `recv` never yields `None` spuriously; a
+                // dead carrier just stops feeding (and is re-dialed below).
+                stream = carrier_rx.recv() => {
+                    if let Some(stream) = stream {
+                        spawn_handle(&this, stream);
+                    }
+                }
+                // Keep the carrier pool topped up: if any carrier dropped, re-dial
+                // the shortfall off the loop so accept/forward never stalls.
+                _ = carrier_redial.tick() => {
+                    if let Some(dialer) = &carrier_dialer {
+                        maybe_redial_carriers(
+                            dialer,
+                            &carrier_tx,
+                            &carrier_live,
+                            &carrier_redial_inflight,
+                        );
+                    }
+                }
                 stream = acceptor.accept() => {
                     let Some(stream) = stream else {
                         return Ok(());
                     };
-                    let this = Arc::clone(&this);
-                    tokio::spawn(
-                        async move {
-                            info!("new connection");
-                            match this.handle_connection(stream).await {
-                                Ok(_) => info!("connection exited"),
-                                Err(err) => warn!(%err, "connection exited with error"),
-                            }
-                        }
-                        .instrument(info_span!("proxy")),
-                    );
+                    spawn_handle(&this, stream);
                 }
             }
         }
@@ -427,6 +523,125 @@ impl Client {
         .await?;
         Ok(())
     }
+}
+
+/// Spawn a task that dials the local service for a forwarded substream and splices
+/// the two together. Shared by the main acceptor and every carrier-pool acceptor
+/// so they handle a forwarded connection identically.
+fn spawn_handle(this: &Arc<Client>, stream: mux::Stream) {
+    let this = Arc::clone(this);
+    tokio::spawn(
+        async move {
+            info!("new connection");
+            match this.handle_connection(stream).await {
+                Ok(_) => info!("connection exited"),
+                Err(err) => warn!(%err, "connection exited with error"),
+            }
+        }
+        .instrument(info_span!("proxy")),
+    );
+}
+
+/// Open one extra carrier connection for a public tunnel's pool: dial the server,
+/// present the carrier `token`, and authenticate (if a secret is set), mirroring
+/// the order [`Client::new`] uses. Returns the held-open control substream (kept
+/// alive so the server keeps this carrier in the pool) and the data acceptor.
+async fn open_carrier(
+    endpoint: &Endpoint,
+    insecure: bool,
+    secret: Option<&str>,
+    token: &str,
+) -> Result<(Delimited<mux::Stream>, mux::Acceptor)> {
+    let socket = transport::connect(endpoint, insecure).await?;
+    let (opener, acceptor) = mux::client(socket);
+    let mut control = Delimited::new(
+        opener
+            .open()
+            .await
+            .context("failed to open carrier control stream")?,
+    );
+    // Send JoinCarrier first to announce the lazily-opened substream (see `new`),
+    // then complete the auth challenge if the server requires a secret.
+    control
+        .send(ClientMessage::JoinCarrier {
+            token: token.to_string(),
+        })
+        .await?;
+    if let Some(secret) = secret {
+        Authenticator::new(secret)
+            .client_handshake(&mut control)
+            .await?;
+    }
+    Ok((control, acceptor))
+}
+
+/// Pump a carrier connection's accepted data substreams into the shared channel
+/// until the connection drops. Holds the control substream open for the carrier's
+/// lifetime (the server uses it to keep the carrier in the pool) and maintains the
+/// liveness counter so [`maybe_redial_carriers`] can top the pool back up.
+fn spawn_carrier_pump(
+    control: Delimited<mux::Stream>,
+    mut acceptor: mux::Acceptor,
+    tx: mpsc::UnboundedSender<mux::Stream>,
+    live: Arc<AtomicUsize>,
+) {
+    live.fetch_add(1, Ordering::Relaxed);
+    tokio::spawn(async move {
+        // Held only to keep the substream (and thus the carrier) open; never read.
+        let _control = control;
+        while let Some(stream) = acceptor.accept().await {
+            if tx.send(stream).is_err() {
+                break;
+            }
+        }
+        live.fetch_sub(1, Ordering::Relaxed);
+    });
+}
+
+/// If the carrier pool has dropped below its target width, re-dial the shortfall in
+/// a spawned task so the listen loop never blocks on the dial. `inflight` prevents
+/// stacking re-dial batches when a carrier stays unreachable.
+fn maybe_redial_carriers(
+    dialer: &CarrierDialer,
+    tx: &mpsc::UnboundedSender<mux::Stream>,
+    live: &Arc<AtomicUsize>,
+    inflight: &Arc<AtomicBool>,
+) {
+    let current = live.load(Ordering::Relaxed);
+    if current >= dialer.target_extra {
+        return;
+    }
+    // Skip if a previous re-dial batch is still running.
+    if inflight.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let need = dialer.target_extra - current;
+    let dialer = dialer.clone();
+    let tx = tx.clone();
+    let live = Arc::clone(live);
+    let inflight = Arc::clone(inflight);
+    tokio::spawn(async move {
+        for _ in 0..need {
+            match open_carrier(
+                &dialer.endpoint,
+                dialer.insecure,
+                dialer.secret.as_deref(),
+                &dialer.token,
+            )
+            .await
+            {
+                Ok((control, acceptor)) => {
+                    spawn_carrier_pump(control, acceptor, tx.clone(), Arc::clone(&live));
+                    info!("re-dialed a carrier connection");
+                }
+                Err(err) => {
+                    debug!(%err, "carrier re-dial failed; will retry");
+                    break;
+                }
+            }
+        }
+        inflight.store(false, Ordering::Release);
+    });
 }
 
 /// Provider side: bind a UDP socket, discover candidates via STUN, and offer

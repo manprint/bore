@@ -45,5 +45,11 @@ services:
       # - BORE_BASIC_AUTH=admin:s3cr3t
       # Label this tunnel on the server's admin status page:
       # - BORE_NOTES=dev box A
+      # Public tunnels only: open N parallel TCP carrier connections for the data
+      # path and spread proxied connections across them (round-robin), avoiding
+      # yamux's single-connection head-of-line blocking under concurrency (e.g.
+      # parallel rclone/S3 transfers, many web requests). 1 = single connection.
+      # The server clamps this to its BORE_MAX_CARRIERS. Ignored for secret tunnels.
+      # - BORE_CARRIERS=4
       # Accept a self-signed server certificate for an https:// control address:
       # - BORE_INSECURE=true

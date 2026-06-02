@@ -124,6 +124,14 @@ enum Command {
         #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
         notes: Option<String>,
 
+        /// Number of parallel TCP carrier connections for the data path (public
+        /// tunnels only). 1 = current single-connection behaviour. >1 spreads
+        /// proxied connections across several TCP streams to avoid head-of-line
+        /// blocking under concurrency (e.g. many parallel transfers); the server
+        /// caps it at its --max-carriers. Ignored for secret tunnels.
+        #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
+        carriers: u16,
+
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
         auto_reconnect: bool,
@@ -232,6 +240,12 @@ enum Command {
         /// Maximum number of concurrently proxied connections per client.
         #[clap(long, value_name = "N", default_value_t = bore_cli::server::DEFAULT_MAX_CONNS, env = "BORE_MAX_CONNS")]
         max_conns: usize,
+
+        /// Maximum number of parallel TCP carrier connections a single tunnel may
+        /// use for its data path (the cap on a client's --carriers request). 1
+        /// disables the carrier pool server-wide.
+        #[clap(long, value_name = "N", default_value_t = bore_cli::server::DEFAULT_MAX_CARRIERS, env = "BORE_MAX_CARRIERS")]
+        max_carriers: u16,
 
         /// TCP port the control connection listens on.
         #[clap(long, value_name = "PORT", default_value_t = bore_cli::shared::CONTROL_PORT, env = "BORE_CONTROL_PORT")]
@@ -355,9 +369,13 @@ async fn dispatch(command: Command) -> Result<()> {
             max_conns,
             basic_auth,
             notes,
+            carriers,
             auto_reconnect,
         } => {
             let notes = clamp_notes(notes);
+            if tcp_secret_id.is_some() && carriers > 1 {
+                info!("--carriers applies to public tunnels only; ignored for a secret tunnel");
+            }
             if let Some(creds) = &basic_auth {
                 if !creds.contains(':') {
                     Args::command()
@@ -407,6 +425,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         force_https,
                         basic_auth,
                         notes,
+                        carriers,
                     };
                     let connect = move || {
                         let (local_host, to, secret, options) = (
@@ -480,6 +499,7 @@ async fn dispatch(command: Command) -> Result<()> {
             max_port,
             secret,
             max_conns,
+            max_carriers,
             control_port,
             bind_domain,
             cert_file,
@@ -509,6 +529,7 @@ async fn dispatch(command: Command) -> Result<()> {
             let mut server = Server::new(port_range, secret.as_deref());
             server.set_admin_token(admin_token);
             server.set_max_conns(max_conns);
+            server.set_max_carriers(max_carriers);
             server.set_control_port(control_port);
             if let Some(domain) = bind_domain {
                 server.set_bind_domain(domain);

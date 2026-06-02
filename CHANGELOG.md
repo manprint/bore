@@ -12,6 +12,19 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
 ## [Unreleased]
 
 ### Added
+- **Carrier pool for public tunnels** (`--carriers N` on `bore local`, env
+  `BORE_CARRIERS`; `--max-carriers` on `bore server`, env `BORE_MAX_CARRIERS`):
+  open N parallel TCP connections and spread proxied connections across them
+  (round-robin) instead of multiplexing everything over one TCP. Removes yamux's
+  single-connection head-of-line blocking and gives each carrier its own congestion
+  window — aimed at **concurrent** workloads (parallel rclone/S3/WebDAV transfers,
+  many web requests, streaming). A single bulk flow is unaffected (one flow = one
+  carrier); for single-flow loss/high-BDP, tune the host
+  (`sysctl net.ipv4.tcp_congestion_control=bbr`). Default `1` keeps the current
+  single-connection behaviour byte-for-byte; the server clamps a request to
+  `--max-carriers`, and a too-large request degrades gracefully (never breaks the
+  tunnel). A dropped carrier is pruned and re-dialed automatically. Public tunnels
+  only; the server stays in the data path (this is not the secret UDP direct path).
 - **HTTP Basic auth on tunnels** (`--basic-auth "user:pass"` on `bore local`,
   env `BORE_BASIC_AUTH`): HTTP requests without valid credentials get a `401`;
   non-HTTP traffic is forwarded unprotected (Basic auth is HTTP-only). Public

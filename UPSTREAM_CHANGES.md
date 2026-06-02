@@ -270,6 +270,34 @@ Each bullet = one or more commits on `perf-hardening`.
       path**. `AdminRegistry` is in-memory/stateless with RAII deregistration;
       `serve_*`/`serve_tunnel` register entries and count live connections. The page
       polls JSON every ~2s, is embedded (`include_str!`), fetches no external assets.
+20. **Carrier pool for public tunnels** (`--carriers N` on `local`, `BORE_CARRIERS`;
+    `--max-carriers` on `server`, `BORE_MAX_CARRIERS`, default
+    `DEFAULT_MAX_CARRIERS = 16`): open `N` parallel TCP connections and round-robin
+    proxied connections across them instead of multiplexing all over one TCP —
+    removing yamux's single-connection head-of-line blocking and giving each carrier
+    its own congestion window. For **concurrent** workloads (parallel rclone/S3/WebDAV,
+    many web requests, streaming); a single bulk flow is unchanged. The server stays
+    in a public tunnel's data path, so this is **not** the secret UDP direct path (no
+    bypass, no bandwidth gain) — it only fixes the server↔client carrier bottleneck.
+    - Protocol (additive, backward-compatible): `TunnelOptions.carriers: u16`
+      (`#[serde(default)]`); `ServerMessage::CarrierToken { token, extra }` (after
+      `Hello` when `carriers > 1`); `ClientMessage::JoinCarrier { token }` (first
+      message on each extra connection, authenticated like `Hello`). Token is a random
+      `Uuid`; an unknown token is rejected. **The data path is unchanged — only which
+      connection opens each substream** — so `carriers <= 1` (incl. the default) is the
+      original path byte-for-byte and the whole existing suite is the regression guard.
+    - Server (`serve_tunnel`/`serve_carrier`): `pending_carriers` `DashMap<token,
+      Sender<Carrier>>` matches `JoinCarrier`s to the tunnel; `pick_carrier`
+      round-robins live `Opener`s (dead ones pruned via `AtomicBool`); a `TokenGuard`
+      frees the token on teardown. Client (`open_carrier`/`spawn_carrier_pump`/
+      `maybe_redial_carriers`): opens the extra connections, pumps each acceptor into
+      a shared channel the listen loop drains like the main one, and re-dials a dropped
+      carrier on a 15s timer (non-blocking, `inflight`-guarded).
+    - Tests: `tests/carrier_test.rs` (round-trip × 4 carriers/40 conns, half-close,
+      1 MiB payload, request-above-cap clamp, cap-1 degrade-to-single).
+    - Not done: per-socket congestion control (`TCP_CONGESTION` needs `unsafe`
+      `setsockopt`; use host `sysctl net.ipv4.tcp_congestion_control=bbr`). Scope is
+      public tunnels; the secret consumer/relay path could adopt the same pattern later.
 
 ## CLI flags & env vars (all flags read env where present)
 
@@ -278,7 +306,9 @@ Each bullet = one or more commits on `perf-hardening`.
   `--control-port`/`BORE_CONTROL_PORT` (default 7835),
   `--bind-domain`/`BORE_BIND_DOMAIN`, `--cert-file`/`BORE_CERT_FILE`,
   `--key-file`/`BORE_KEY_FILE`, `--bind-addr`, `--bind-tunnels` (last two: no env),
-  `--udp`/`BORE_UDP` (broker direct paths + STUN responder on the control port/UDP).
+  `--udp`/`BORE_UDP` (broker direct paths + STUN responder on the control port/UDP),
+  `--max-carriers`/`BORE_MAX_CARRIERS` (cap on a tunnel's carrier pool, default 16),
+  `--admin-token`/`BORE_ADMIN_TOKEN` (admin status page, ≥32 chars).
 - **local:** positional `LOCAL_PORT`/`BORE_LOCAL_PORT`, `--local-host` (no env),
   `--to`/`BORE_SERVER`, `--port` (no env), `-s`/`BORE_SECRET`,
   `--tcp-secret-id`/`BORE_TCP_SECRET_ID`, `--insecure`/`BORE_INSECURE`,
@@ -287,6 +317,8 @@ Each bullet = one or more commits on `perf-hardening`.
   `--upnp`/`BORE_UPNP`, `--try-port-prediction`/`BORE_TRY_PORT_PREDICTION`,
   `--nat-udp-preferred-port`/`BORE_NAT_UDP_PORT` (fixed UDP hole-punch port, 0=random),
   `--max-conns`/`BORE_MAX_CONNS` (direct-path concurrency cap, default 1024),
+  `--basic-auth`/`BORE_BASIC_AUTH`, `--notes`/`BORE_NOTES`,
+  `--carriers`/`BORE_CARRIERS` (parallel TCP carriers, public tunnels, default 1),
   `--auto-reconnect`/`BORE_AUTO_RECONNECT`.
 - **proxy:** `--local-proxy-port`/`BORE_LOCAL_PROXY_PORT` (`:5555` = all
   interfaces), `--to`/`BORE_SERVER`, `-s`/`BORE_SECRET`,

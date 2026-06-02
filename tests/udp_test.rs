@@ -100,6 +100,7 @@ async fn udp_direct_round_trip() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await?;
@@ -118,6 +119,7 @@ async fn udp_direct_round_trip() -> Result<()> {
         false,
         false,
         0,
+        1, // carriers
         None,
     )
     .await?;
@@ -130,6 +132,71 @@ async fn udp_direct_round_trip() -> Result<()> {
     time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(round_trip(addr, b"udp hello").await?, b"udp hello");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_direct_many_concurrent_streams() -> Result<()> {
+    // One direct consumer driving many simultaneous connections: each rides its
+    // own native QUIC stream (no yamux-over-one-stream), so they multiplex without
+    // cross-talk. Asserts the per-connection native-stream model works under load.
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+
+    let echo = spawn_echo_service().await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo,
+        "localhost",
+        "udpmany",
+        None,
+        false,
+        true,
+        Some(&stun),
+        false,
+        false,
+        0,
+        1024,
+        1, // carriers
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(provider.listen());
+    time::sleep(Duration::from_millis(300)).await;
+
+    let proxy = Proxy::new(
+        "localhost",
+        "127.0.0.1:0".parse()?,
+        "udpmany",
+        None,
+        false,
+        true,
+        Some(&stun),
+        false,
+        false,
+        0,
+        1, // carriers
+        None,
+    )
+    .await?;
+    assert!(proxy.is_direct(), "consumer should negotiate a direct path");
+    let addr = proxy.local_addr()?;
+    tokio::spawn(proxy.listen());
+    time::sleep(Duration::from_millis(100)).await;
+
+    let mut handles = Vec::new();
+    for i in 0..30u32 {
+        handles.push(tokio::spawn(async move {
+            let msg = i.to_be_bytes();
+            let got = round_trip(addr, &msg).await?;
+            assert_eq!(got, msg, "connection {i} round-tripped the wrong bytes");
+            anyhow::Ok(())
+        }));
+    }
+    for h in handles {
+        h.await??;
+    }
     Ok(())
 }
 
@@ -156,6 +223,7 @@ async fn udp_direct_survives_consumer_reconnect() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await?;
@@ -176,6 +244,7 @@ async fn udp_direct_survives_consumer_reconnect() -> Result<()> {
                 false,
                 false,
                 0,
+                1, // carriers
                 None,
             )
             .await
@@ -229,6 +298,7 @@ async fn udp_consumer_detects_provider_drop() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await?;
@@ -246,6 +316,7 @@ async fn udp_consumer_detects_provider_drop() -> Result<()> {
         false,
         false,
         0,
+        1, // carriers
         None,
     )
     .await?;
@@ -291,6 +362,7 @@ async fn udp_relay_upgrades_to_direct_when_provider_appears() -> Result<()> {
         false,
         false,
         0,
+        1, // carriers
         None,
     )
     .await?;
@@ -312,6 +384,7 @@ async fn udp_relay_upgrades_to_direct_when_provider_appears() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await?;
@@ -352,6 +425,7 @@ async fn udp_falls_back_to_relay_without_udp_provider() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await?;
@@ -370,6 +444,7 @@ async fn udp_falls_back_to_relay_without_udp_provider() -> Result<()> {
         false,
         false,
         0,
+        1, // carriers
         None,
     )
     .await?;
@@ -409,6 +484,7 @@ async fn udp_multiple_consumers_concurrent_direct() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await?;
@@ -428,6 +504,7 @@ async fn udp_multiple_consumers_concurrent_direct() -> Result<()> {
             false,
             false,
             0,
+            1, // carriers
             None,
         )
         .await?;
@@ -482,6 +559,7 @@ async fn udp_mixed_direct_and_relay_consumers() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await?;
@@ -499,6 +577,7 @@ async fn udp_mixed_direct_and_relay_consumers() -> Result<()> {
         false,
         false,
         0,
+        1, // carriers
         None,
     )
     .await?;
@@ -517,6 +596,7 @@ async fn udp_mixed_direct_and_relay_consumers() -> Result<()> {
         false,
         false,
         0,
+        1, // carriers
         None,
     )
     .await?;
@@ -558,6 +638,7 @@ async fn udp_consumer_reconnects_while_others_active() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await?;
@@ -578,6 +659,7 @@ async fn udp_consumer_reconnects_while_others_active() -> Result<()> {
                 false,
                 false,
                 0,
+                1, // carriers
                 None,
             )
             .await
@@ -649,6 +731,7 @@ async fn udp_multiple_consumers_detect_provider_drop() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta::default(),
     )
     .await?;
@@ -669,6 +752,7 @@ async fn udp_multiple_consumers_detect_provider_drop() -> Result<()> {
             false,
             false,
             0,
+            1, // carriers
             None,
         )
         .await?;
@@ -747,6 +831,7 @@ async fn udp_direct_respects_max_conns() -> Result<()> {
         false,
         0,
         2, // max_conns = 2
+        1, // carriers
         ProviderMeta::default(),
     )
     .await?;
@@ -764,6 +849,7 @@ async fn udp_direct_respects_max_conns() -> Result<()> {
         false,
         false,
         0,
+        1, // carriers
         None,
     )
     .await?;

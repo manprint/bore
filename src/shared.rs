@@ -111,6 +111,13 @@ pub enum ClientMessage {
         notes: Option<String>,
         /// Whether the provider enforces HTTP Basic auth itself (display only).
         basic_auth: bool,
+        /// Number of parallel TCP carrier connections the provider wants for the
+        /// relay data path (server→provider). `0`/`1` = single connection; `>1`
+        /// requests a carrier pool (server replies with [`ServerMessage::CarrierToken`]
+        /// and round-robins relayed substreams across the joined connections).
+        /// `#[serde(default)]` keeps the wire format backward-compatible.
+        #[serde(default)]
+        carriers: u16,
     },
 
     /// Connect as a consumer of a named secret tunnel; data substreams opened on

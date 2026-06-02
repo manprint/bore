@@ -1,7 +1,7 @@
 //! Server implementation for the `bore` service.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::{io, ops::RangeInclusive, sync::Arc, time::Duration};
 
 use anyhow::Result;
@@ -20,6 +20,7 @@ use crate::auth::Authenticator;
 use crate::edge;
 use crate::holepunch;
 use crate::mux;
+use crate::pool::{self, Carrier, CarrierPool, PendingCarriers, TokenGuard};
 use crate::prefixed::Prefixed;
 use crate::secret::{self, Registry, UdpRegistry};
 use crate::shared::{
@@ -39,27 +40,6 @@ pub const DEFAULT_MAX_CARRIERS: u16 = 16;
 /// Interval at which the server sends heartbeats to detect a dead client.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
-/// One member of a public tunnel's carrier pool: an [`mux::Opener`] for a TCP
-/// connection over which the server opens proxied-connection substreams. `alive`
-/// is cleared when that connection drops, so [`Server::serve_tunnel`] can prune it.
-struct Carrier {
-    opener: mux::Opener,
-    alive: Arc<AtomicBool>,
-}
-
-/// Removes a pending carrier token from the registry when the tunnel ends, so the
-/// token map does not leak entries across tunnel lifetimes.
-struct TokenGuard {
-    registry: Arc<DashMap<String, mpsc::UnboundedSender<Carrier>>>,
-    token: String,
-}
-
-impl Drop for TokenGuard {
-    fn drop(&mut self) {
-        self.registry.remove(&self.token);
-    }
-}
-
 /// State structure for the server.
 pub struct Server {
     /// Range of TCP ports that can be forwarded.
@@ -77,8 +57,9 @@ pub struct Server {
     /// Pending carrier pools, keyed by the per-tunnel token issued in
     /// [`ServerMessage::CarrierToken`]. An extra connection presenting the token
     /// (via [`ClientMessage::JoinCarrier`]) has its substream opener delivered to
-    /// the matching tunnel's [`Server::serve_tunnel`] loop.
-    pending_carriers: Arc<DashMap<String, mpsc::UnboundedSender<Carrier>>>,
+    /// whoever registered the token — a public tunnel ([`Server::serve_tunnel`]) or
+    /// a secret provider ([`secret::serve_provider`]).
+    pending_carriers: PendingCarriers,
 
     /// Registry of named secret-tunnel providers, keyed by `tcp-secret-id`.
     providers: Registry,
@@ -365,6 +346,7 @@ impl Server {
                 id,
                 notes,
                 basic_auth,
+                carriers,
             }) => {
                 secret::serve_provider(
                     control,
@@ -376,6 +358,9 @@ impl Server {
                     peer,
                     notes,
                     basic_auth,
+                    self.pending_carriers.clone(),
+                    self.max_carriers,
+                    carriers,
                 )
                 .await
             }
@@ -442,30 +427,28 @@ impl Server {
         // to `--max-carriers`). Those connections arrive as separate `JoinCarrier`
         // handshakes and deliver their substream openers through `carrier_rx`. The
         // data path is unchanged — only *which* connection opens each substream.
-        let mut carriers: Vec<Carrier> = vec![Carrier {
-            opener,
-            alive: Arc::new(AtomicBool::new(true)),
-        }];
         let effective = opts.carriers.clamp(1, self.max_carriers.max(1));
+        let pool = CarrierPool::new(opener);
         let mut carrier_rx = if opts.carriers > 1 {
             let extra = effective - 1;
             let token = Uuid::new_v4().to_string();
             let (tx, rx) = mpsc::unbounded_channel();
             self.pending_carriers.insert(token.clone(), tx);
-            // Drop guard removes the token when this tunnel ends.
-            let _guard = TokenGuard {
-                registry: Arc::clone(&self.pending_carriers),
-                token: token.clone(),
-            };
             control
-                .send(ServerMessage::CarrierToken { token, extra })
+                .send(ServerMessage::CarrierToken {
+                    token: token.clone(),
+                    extra,
+                })
                 .await?;
             info!(extra, "carrier pool offered");
-            Some((rx, _guard))
+            // The guard removes the token when this tunnel ends.
+            Some((
+                rx,
+                TokenGuard::new(Arc::clone(&self.pending_carriers), token),
+            ))
         } else {
             None
         };
-        let mut next_carrier: usize = 0;
 
         // Register this tunnel in the admin registry for its whole lifetime; the
         // registration is removed when this function returns (client gone).
@@ -494,11 +477,10 @@ impl Server {
                 }
                 // An extra connection joined the carrier pool. Cap the pool at the
                 // effective size so a misbehaving client cannot grow it without bound.
-                joined = recv_carrier(carrier_rx.as_mut()) => {
+                joined = pool::recv_carrier(carrier_rx.as_mut()) => {
                     if let Some(carrier) = joined {
-                        if carriers.len() < effective as usize {
-                            carriers.push(carrier);
-                            info!(size = carriers.len(), "carrier joined pool");
+                        if pool.push(carrier, effective as usize) {
+                            info!(size = pool.len(), "carrier joined pool");
                         }
                     }
                 }
@@ -532,7 +514,7 @@ impl Server {
 
                     // Round-robin across the live carriers (prunes dead ones); the
                     // control connection is always carrier 0 and always live here.
-                    let opener = match pick_carrier(&mut carriers, &mut next_carrier) {
+                    let opener = match pool.pick() {
                         Some(opener) => opener,
                         None => {
                             warn!("no live carrier, dropping connection");
@@ -603,14 +585,9 @@ impl Server {
             warn!("carrier join with unknown token");
             return Ok(());
         };
-        let alive = Arc::new(AtomicBool::new(true));
-        if tx
-            .send(Carrier {
-                opener,
-                alive: Arc::clone(&alive),
-            })
-            .is_err()
-        {
+        let carrier = Carrier::new(opener);
+        let alive = Arc::clone(&carrier.alive);
+        if tx.send(carrier).is_err() {
             // The tunnel ended between the lookup and the send.
             return Ok(());
         }
@@ -620,29 +597,5 @@ impl Server {
         while let Ok(Some(_)) = control.recv::<ClientMessage>().await {}
         alive.store(false, Ordering::Relaxed);
         Ok(())
-    }
-}
-
-/// Pick the next live carrier opener round-robin, pruning any that have died. The
-/// control connection (carrier 0) is always live while [`Server::serve_tunnel`]
-/// runs, so this returns `None` only if the whole pool somehow drained.
-fn pick_carrier(carriers: &mut Vec<Carrier>, next: &mut usize) -> Option<mux::Opener> {
-    carriers.retain(|c| c.alive.load(Ordering::Relaxed));
-    if carriers.is_empty() {
-        return None;
-    }
-    let idx = *next % carriers.len();
-    *next = next.wrapping_add(1);
-    Some(carriers[idx].opener.clone())
-}
-
-/// Await the next pooled carrier, or pend forever when there is no pool (so it can
-/// sit harmlessly in the `select!`). Borrows the receiver + its drop guard tuple.
-async fn recv_carrier(
-    rx: Option<&mut (mpsc::UnboundedReceiver<Carrier>, TokenGuard)>,
-) -> Option<Carrier> {
-    match rx {
-        Some((rx, _guard)) => rx.recv().await,
-        None => std::future::pending().await,
     }
 }

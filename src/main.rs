@@ -202,6 +202,14 @@ enum Command {
         #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
         notes: Option<String>,
 
+        /// Number of parallel TCP carrier connections for the relay data path
+        /// (consumer→server). 1 = single connection. >1 spreads forwarded
+        /// connections across several TCP streams to avoid head-of-line blocking
+        /// under concurrency. Applies to the relay path; the direct UDP path
+        /// (`--udp`) already uses independent QUIC streams.
+        #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
+        carriers: u16,
+
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
         auto_reconnect: bool,
@@ -373,9 +381,6 @@ async fn dispatch(command: Command) -> Result<()> {
             auto_reconnect,
         } => {
             let notes = clamp_notes(notes);
-            if tcp_secret_id.is_some() && carriers > 1 {
-                info!("--carriers applies to public tunnels only; ignored for a secret tunnel");
-            }
             if let Some(creds) = &basic_auth {
                 if !creds.contains(':') {
                     Args::command()
@@ -412,6 +417,7 @@ async fn dispatch(command: Command) -> Result<()> {
                                 try_port_prediction,
                                 nat_udp_preferred_port,
                                 max_conns,
+                                carriers,
                                 meta,
                             )
                             .await
@@ -463,6 +469,7 @@ async fn dispatch(command: Command) -> Result<()> {
             try_port_prediction,
             nat_udp_preferred_port,
             notes,
+            carriers,
             auto_reconnect,
         } => {
             let bind_addr = parse_proxy_addr(&local_proxy_port)?;
@@ -487,6 +494,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         upnp,
                         try_port_prediction,
                         nat_udp_preferred_port,
+                        carriers,
                         notes,
                     )
                     .await

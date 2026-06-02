@@ -172,6 +172,19 @@ carrier, and each carrier gets its own congestion window:
 bore local 8080 --to bore.tld -p 9000 -s mysecret --carriers 4
 ```
 
+It applies to **every relay leg**, because the server is always in the relay data path:
+
+- **Public tunnel** (`bore local --carriers`): the server→client leg.
+- **Secret provider** (`bore local --tcp-secret-id --carriers`): the server→provider
+  leg (the bottleneck shared by *all* consumers of that provider).
+- **Secret consumer** (`bore proxy --carriers`): the consumer→server leg.
+
+```shell
+bore local 8080 --to bore.tld -p 9000 -s mysecret --carriers 4          # public
+bore local 8080 --to bore.tld --tcp-secret-id app -s mysecret --carriers 4   # provider
+bore proxy --to bore.tld --tcp-secret-id app -s mysecret --local-proxy-port :5555 --carriers 4
+```
+
 When it helps and when it doesn't:
 
 - **Helps** concurrent workloads: parallel `rclone`/S3/WebDAV transfers, browsers
@@ -180,16 +193,21 @@ When it helps and when it doesn't:
 - **No change** for a single bulk transfer (one flow = one carrier). For single-flow
   loss/high-BDP, tune the **host** instead: `sysctl net.ipv4.tcp_congestion_control=bbr`
   (bore can't set per-socket congestion control without `unsafe`).
-- The server is always in a public tunnel's data path, so this does **not** add
-  bandwidth or bypass the server — it removes the single-TCP bottleneck on the
-  server↔client leg only.
+- The server is always in the relay data path, so this does **not** add bandwidth or
+  bypass the server — it removes the single-TCP bottleneck on the relay leg only.
 
-The server caps `N` at its `--max-carriers` (default 16); a larger request is
-clamped, and if the server has the pool disabled (`--max-carriers 1`) the tunnel
-falls back to a single connection. A carrier that drops mid-session is re-dialed
-automatically; the tunnel never breaks (it just runs with fewer carriers until the
-re-dial succeeds). Secret tunnels ignore `--carriers`. Default `1` = unchanged
-behaviour.
+The server caps `N` at its `--max-carriers` (default 16) for public tunnels and
+providers; a larger request is clamped, and `--max-carriers 1` disables the pool
+(single connection). A carrier that drops mid-session is re-dialed automatically; the
+tunnel never breaks (it just runs with fewer carriers until the re-dial succeeds).
+Default `1` = unchanged behaviour.
+
+**The UDP direct path needs no `--carriers`.** When a secret tunnel runs over a
+direct hole-punched path (`--udp`), each proxied connection already rides its **own
+native QUIC stream**, which QUIC keeps independently loss-isolated — so there is no
+single-stream head-of-line blocking to fix. `--carriers` widens the relay; `--udp`
+fixes the direct path. They compose (the relay pool is used whenever a tunnel is on
+the relay fallback).
 
 #### Automatic reconnection
 
@@ -355,6 +373,7 @@ Options:
       --try-port-prediction      Advertise predicted symmetric-NAT ports (opt-in, best-effort) [env: BORE_TRY_PORT_PREDICTION=]
       --nat-udp-preferred-port <PORT> Bind the UDP hole-punch socket to a fixed port (0=random) [env: BORE_NAT_UDP_PORT=]
       --notes <TEXT>             Note shown on the server's admin status page [env: BORE_NOTES=]
+      --carriers <N>             Parallel TCP carrier connections for the relay data path (default 1) [env: BORE_CARRIERS=]
       --auto-reconnect           Reconnect automatically with backoff if the connection drops [env: BORE_AUTO_RECONNECT=]
   -h, --help                     Print help
 ```

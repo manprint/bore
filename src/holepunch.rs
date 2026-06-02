@@ -77,6 +77,13 @@ const QUIC_KEEPALIVE: Duration = Duration::from_secs(3);
 #[cfg(feature = "udp")]
 const QUIC_MAX_IDLE: Duration = Duration::from_secs(10);
 
+/// Max concurrent native QUIC bidi streams the provider lets a consumer open on a
+/// direct connection (one stream per proxied connection). Set generous so the
+/// provider's `--max-conns` semaphore is the real bound, mirroring how the relay
+/// leaves yamux's stream limit generous.
+#[cfg(feature = "udp")]
+const MAX_DIRECT_STREAMS: u32 = 4096;
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// Derive the shared QUIC authentication token from the tunnel secret (if any)
@@ -614,14 +621,59 @@ async fn punch(socket: &UdpSocket, peers: &[SocketAddr]) {
     }
 }
 
-/// Reusable handle to a QUIC connection that keeps the endpoint and connection
-/// alive for as long as the `yamux` carrier stream is in use.
+/// One native QUIC bidirectional stream wrapped as an `AsyncRead`/`AsyncWrite`
+/// carrier for a single proxied connection. Keeps the connection and endpoint
+/// alive for as long as the stream is in use.
 #[cfg(feature = "udp")]
 pub struct QuicTransport {
     recv: quinn::RecvStream,
     send: quinn::SendStream,
     _conn: Connection,
     _endpoint: Endpoint,
+}
+
+/// An authenticated direct QUIC connection between a consumer and a provider.
+/// Proxied connections are carried over **native QUIC streams** (one bidi each,
+/// via [`DirectConn::open_stream`] / [`DirectConn::accept_stream`]), so a lost
+/// packet on one connection's stream does not stall the others (no head-of-line
+/// blocking — unlike multiplexing yamux over a single QUIC stream). Cheap to clone
+/// (both fields are handles).
+#[cfg(feature = "udp")]
+#[derive(Clone)]
+pub struct DirectConn {
+    conn: Connection,
+    endpoint: Endpoint,
+}
+
+#[cfg(feature = "udp")]
+impl DirectConn {
+    /// Open a new native QUIC bidi stream for one proxied connection (consumer).
+    pub async fn open_stream(&self) -> Result<QuicTransport> {
+        let (send, recv) = self.conn.open_bi().await.context("open_bi failed")?;
+        Ok(QuicTransport {
+            recv,
+            send,
+            _conn: self.conn.clone(),
+            _endpoint: self.endpoint.clone(),
+        })
+    }
+
+    /// Accept the next native QUIC bidi stream for one proxied connection (provider).
+    pub async fn accept_stream(&self) -> Result<QuicTransport> {
+        let (send, recv) = self.conn.accept_bi().await.context("accept_bi failed")?;
+        Ok(QuicTransport {
+            recv,
+            send,
+            _conn: self.conn.clone(),
+            _endpoint: self.endpoint.clone(),
+        })
+    }
+
+    /// Resolve when the QUIC connection closes (peer gone, idle timeout, or a
+    /// graceful close), so the consumer can re-negotiate or fall back to the relay.
+    pub async fn closed(&self) {
+        self.conn.closed().await;
+    }
 }
 
 // quinn's streams carry inherent `poll_read`/`poll_write` methods (with quinn's
@@ -658,14 +710,15 @@ impl AsyncWrite for QuicTransport {
 }
 
 /// Consumer side: punch toward `peers`, connect a QUIC client over `socket`, and
-/// authenticate with `token`. Returns a carrier usable as a [`crate::mux`]
-/// transport. The consumer opens the bidirectional stream.
+/// authenticate the connection with `token` on a dedicated stream. Returns the
+/// authenticated [`DirectConn`]; proxied connections then ride native QUIC streams
+/// opened on it. The consumer opens the auth stream.
 #[cfg(feature = "udp")]
 pub async fn connect_direct(
     socket: UdpSocket,
     peers: Vec<SocketAddr>,
     token: [u8; TOKEN_LEN],
-) -> Result<QuicTransport> {
+) -> Result<DirectConn> {
     if peers.is_empty() {
         bail!("no peer candidates to connect to");
     }
@@ -684,8 +737,10 @@ pub async fn connect_direct(
             Box::pin(async move {
                 let conn = endpoint.connect(peer, "bore")?.await?;
                 trace!(%peer, "QUIC connected");
-                let (mut send, mut recv) = conn.open_bi().await.context("open_bi failed")?;
-                // Consumer writes its token first, then reads the peer's.
+                // Authenticate the connection once, on a dedicated stream: consumer
+                // writes its token first, then reads the peer's. Data streams opened
+                // afterward are trusted (same authenticated QUIC connection).
+                let (mut send, mut recv) = conn.open_bi().await.context("auth open_bi failed")?;
                 send.write_all(&token).await?;
                 send.flush().await?;
                 let mut peer_token = [0u8; TOKEN_LEN];
@@ -693,20 +748,16 @@ pub async fn connect_direct(
                 if !tokens_match(&token, &peer_token) {
                     bail!("direct path token mismatch");
                 }
+                let _ = send.finish();
                 info!(target_addr = %peer, peer = %conn.remote_address(),
-                    "direct udp carrier established (consumer, token verified)");
-                anyhow::Ok(QuicTransport {
-                    recv,
-                    send,
-                    _conn: conn,
-                    _endpoint: endpoint,
-                })
+                    "direct udp connection established (consumer, token verified)");
+                anyhow::Ok(DirectConn { conn, endpoint })
             })
         })
         .collect();
 
     match timeout(NETWORK_TIMEOUT, futures_util::future::select_ok(attempts)).await {
-        Ok(Ok((transport, _losers))) => Ok(transport),
+        Ok(Ok((conn, _losers))) => Ok(conn),
         Ok(Err(err)) => Err(err).context("all direct candidates failed"),
         Err(_) => bail!("direct connect exhausted the {NETWORK_TIMEOUT:?} budget"),
     }
@@ -749,10 +800,11 @@ impl DirectListener {
         }
     }
 
-    /// Accept the next direct connection and authenticate it with `token`. The
-    /// provider reads the peer's token first, then sends its own. Returns a
-    /// carrier usable as a [`crate::mux`] transport.
-    pub async fn accept(&self, token: [u8; TOKEN_LEN]) -> Result<QuicTransport> {
+    /// Accept the next direct connection and authenticate it with `token` on a
+    /// dedicated stream. The provider reads the peer's token first, then sends its
+    /// own. Returns the authenticated [`DirectConn`]; the provider then accepts
+    /// native QUIC streams on it (one per proxied connection).
+    pub async fn accept(&self, token: [u8; TOKEN_LEN]) -> Result<DirectConn> {
         let incoming = self
             .endpoint
             .accept()
@@ -761,7 +813,7 @@ impl DirectListener {
         let conn = incoming.await.context("QUIC handshake failed")?;
         let peer = conn.remote_address();
         trace!(%peer, "QUIC accepted");
-        let (mut send, mut recv) = conn.accept_bi().await.context("accept_bi failed")?;
+        let (mut send, mut recv) = conn.accept_bi().await.context("auth accept_bi failed")?;
         let mut peer_token = [0u8; TOKEN_LEN];
         recv.read_exact(&mut peer_token).await?;
         if !tokens_match(&token, &peer_token) {
@@ -769,12 +821,11 @@ impl DirectListener {
         }
         send.write_all(&token).await?;
         send.flush().await?;
+        let _ = send.finish();
         info!(%peer, "accepted direct udp connection (provider, token verified)");
-        Ok(QuicTransport {
-            recv,
-            send,
-            _conn: conn,
-            _endpoint: self.endpoint.clone(),
+        Ok(DirectConn {
+            conn,
+            endpoint: self.endpoint.clone(),
         })
     }
 }
@@ -826,6 +877,9 @@ fn transport_config() -> quinn::TransportConfig {
     let mut cfg = quinn::TransportConfig::default();
     cfg.keep_alive_interval(Some(QUIC_KEEPALIVE));
     cfg.max_idle_timeout(Some(QUIC_MAX_IDLE.try_into().expect("valid idle timeout")));
+    // One native QUIC stream per proxied connection: raise the concurrent-stream
+    // limit well above quinn's small default so it is not the bottleneck.
+    cfg.max_concurrent_bidi_streams(MAX_DIRECT_STREAMS.into());
     cfg
 }
 

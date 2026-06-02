@@ -189,6 +189,7 @@ async fn secret_provider_basic_auth_rejects_and_allows() -> Result<()> {
         false,
         0,
         1024,
+        1, // carriers
         ProviderMeta {
             notes: None,
             basic_auth: Some(CREDS.into()),
@@ -208,6 +209,7 @@ async fn secret_provider_basic_auth_rejects_and_allows() -> Result<()> {
         false,
         false,
         0,
+        1, // carriers
         None,
     )
     .await?;

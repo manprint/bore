@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::{net::TcpStream, time::timeout};
 #[cfg(feature = "udp")]
@@ -236,6 +236,7 @@ impl Client {
         port_prediction: bool,
         udp_port: u16,
         max_conns: usize,
+        carriers: u16,
         meta: ProviderMeta,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
@@ -257,6 +258,7 @@ impl Client {
                 id: tcp_secret_id.to_string(),
                 notes: meta.notes.clone(),
                 basic_auth: meta.basic_auth.is_some(),
+                carriers,
             })
             .await?;
         if let Some(secret) = secret {
@@ -274,6 +276,42 @@ impl Client {
             None => bail!("unexpected EOF"),
         }
         info!(tcp_secret_id, "registered secret tunnel");
+
+        // Carrier pool: like a public tunnel, if more than one carrier is requested
+        // the server replies with a token and how many extra connections to open.
+        // Each extra joins the pool; the server round-robins relayed substreams
+        // across them. Failures are non-fatal (degrade to those that connected; the
+        // re-dial timer tops up later).
+        let mut carrier_acceptors = Vec::new();
+        let mut carrier_dialer = None;
+        if carriers > 1 {
+            match control.recv_timeout().await? {
+                Some(ServerMessage::CarrierToken { token, extra }) => {
+                    for _ in 0..extra {
+                        match open_carrier(&endpoint, insecure, secret, &token).await {
+                            Ok(pair) => carrier_acceptors.push(pair),
+                            Err(err) => warn!(%err, "failed to open carrier connection"),
+                        }
+                    }
+                    info!(
+                        opened = carrier_acceptors.len(),
+                        requested = extra,
+                        "provider carrier pool established"
+                    );
+                    if extra > 0 {
+                        carrier_dialer = Some(CarrierDialer {
+                            endpoint: endpoint.clone(),
+                            insecure,
+                            secret: secret.map(str::to_string),
+                            token,
+                            target_extra: extra as usize,
+                        });
+                    }
+                }
+                Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+                other => bail!("expected carrier token, got {other:?}"),
+            }
+        }
 
         // When the direct-path mode is requested, gather UDP candidates and offer
         // them to the server now; the actual punch happens later in `listen` when
@@ -334,9 +372,8 @@ impl Client {
             #[cfg(feature = "udp")]
             udp_cfg,
             basic_auth: meta.basic_auth.as_deref().and_then(BasicAuth::parse),
-            // Secret-tunnel providers do not use the public-tunnel carrier pool.
-            carrier_acceptors: Vec::new(),
-            carrier_dialer: None,
+            carrier_acceptors,
+            carrier_dialer,
         })
     }
 
@@ -493,7 +530,13 @@ impl Client {
         }
     }
 
-    async fn handle_connection(&self, mut stream: mux::Stream) -> Result<()> {
+    /// Splice one forwarded stream (a yamux substream on the relay path, or a
+    /// native QUIC bidi on the direct path) to a fresh local connection. Generic
+    /// over the carrier stream so both data paths share the same logic.
+    async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        mut stream: S,
+    ) -> Result<()> {
         // Consume the server's readiness marker before splicing (see mux module).
         let mut marker = [0u8; 1];
         stream.read_exact(&mut marker).await?;
@@ -690,17 +733,25 @@ async fn provider_direct(
         tokio::select! {
             res = listener.accept(token) => {
                 match res {
-                    Ok(quic) => {
-                        // The consumer is the yamux client (opens substreams); the
-                        // provider is the yamux server and dials the local service.
-                        let (_opener, mut acceptor) = mux::server(quic);
+                    Ok(conn) => {
+                        // Each proxied connection rides its own native QUIC stream
+                        // (no yamux): accept them and dial the local service per
+                        // stream. The consumer opens the streams.
                         let client = Arc::clone(&client);
                         let permits = Arc::clone(&permits);
                         tokio::spawn(async move {
-                            while let Some(stream) = acceptor.accept().await {
-                                // Bound concurrently served direct substreams, the
+                            loop {
+                                let stream = match conn.accept_stream().await {
+                                    Ok(stream) => stream,
+                                    // Connection closed (consumer gone): stop.
+                                    Err(err) => {
+                                        trace!(%err, "direct connection closed");
+                                        break;
+                                    }
+                                };
+                                // Bound concurrently served direct streams, the
                                 // direct-path analog of the relay's `--max-conns`;
-                                // over the cap, drop (as the relay does).
+                                // over the cap, drop the stream (as the relay does).
                                 let permit = match Arc::clone(&permits).try_acquire_owned() {
                                     Ok(permit) => permit,
                                     Err(_) => {

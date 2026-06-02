@@ -296,8 +296,37 @@ Each bullet = one or more commits on `perf-hardening`.
     - Tests: `tests/carrier_test.rs` (round-trip × 4 carriers/40 conns, half-close,
       1 MiB payload, request-above-cap clamp, cap-1 degrade-to-single).
     - Not done: per-socket congestion control (`TCP_CONGESTION` needs `unsafe`
-      `setsockopt`; use host `sysctl net.ipv4.tcp_congestion_control=bbr`). Scope is
-      public tunnels; the secret consumer/relay path could adopt the same pattern later.
+      `setsockopt`; use host `sysctl net.ipv4.tcp_congestion_control=bbr`).
+21. **Carrier pool extended to secret tunnels + native-QUIC direct path.** The pool
+    primitives moved to a shared `src/pool.rs` (`Carrier`, `CarrierPool` with
+    thread-safe round-robin `pick()`, `PendingCarriers`, `TokenGuard`, `recv_carrier`);
+    `server::serve_tunnel` was refactored onto it. `--carriers` now applies to all
+    three relay legs:
+    - **Secret provider** (`bore local --tcp-secret-id --carriers`): `HelloSecret`
+      gained `carriers: u16`; `Registry` is now `DashMap<id, Arc<CarrierPool>>`;
+      `serve_provider` issues a `CarrierToken` (reusing the same `pending_carriers`/
+      `serve_carrier` path) and adds joined provider connections to the pool; `relay`
+      round-robins (`pool.pick()`). The provider client reuses `open_carrier`/
+      `spawn_carrier_pump`/re-dial.
+    - **Secret consumer** (`bore proxy --carriers`): opens N `ConnectSecret`
+      connections (`open_consumer_carrier`, each drained of heartbeats + pruned on
+      drop) into a client-side `CarrierPool`; `Proxy`'s new `DataPath::Relay(pool)`
+      round-robins `forward` across them. No server change (reuses multi-consumer).
+    - **Native QUIC direct streams** (leg 3): `holepunch::connect_direct`/
+      `DirectListener::accept` now return an authenticated `DirectConn` (token on a
+      dedicated stream) instead of a single-stream `QuicTransport`; each proxied
+      connection rides its **own** QUIC bidi (`open_stream`/`accept_stream`), removing
+      HOL on the direct path (was yamux-over-one-stream). `Client::handle_connection`
+      is now generic over the stream type; `provider_direct` loops `accept_stream`.
+      `Proxy`'s `DataPath` is `Relay(CarrierPool)` | `Direct(DirectConn)`; `DataStream`
+      is the `AsyncRead`/`AsyncWrite` enum; direct death is detected via
+      `DirectConn::closed()`; the relay→direct upgrade swaps the `DataPath` in place
+      (a `DirectUpgrade`/`Infallible` alias keeps the upgrade channels nameable without
+      the `udp` feature). `transport_config` raises `max_concurrent_bidi_streams` to
+      `MAX_DIRECT_STREAMS`.
+    - Tests: `tests/secret_pool_test.rs` (provider pool, consumer pool, both pools);
+      `tests/udp_test.rs::udp_direct_many_concurrent_streams`; all existing `udp_test`
+      cases still pass over the native-stream path.
 
 ## CLI flags & env vars (all flags read env where present)
 
@@ -318,7 +347,7 @@ Each bullet = one or more commits on `perf-hardening`.
   `--nat-udp-preferred-port`/`BORE_NAT_UDP_PORT` (fixed UDP hole-punch port, 0=random),
   `--max-conns`/`BORE_MAX_CONNS` (direct-path concurrency cap, default 1024),
   `--basic-auth`/`BORE_BASIC_AUTH`, `--notes`/`BORE_NOTES`,
-  `--carriers`/`BORE_CARRIERS` (parallel TCP carriers, public tunnels, default 1),
+  `--carriers`/`BORE_CARRIERS` (parallel TCP relay carriers, default 1),
   `--auto-reconnect`/`BORE_AUTO_RECONNECT`.
 - **proxy:** `--local-proxy-port`/`BORE_LOCAL_PROXY_PORT` (`:5555` = all
   interfaces), `--to`/`BORE_SERVER`, `-s`/`BORE_SECRET`,
@@ -326,6 +355,7 @@ Each bullet = one or more commits on `perf-hardening`.
   `--udp`/`BORE_PREFER_UDP`, `--stun-server`/`BORE_STUN_SERVER`,
   `--upnp`/`BORE_UPNP`, `--try-port-prediction`/`BORE_TRY_PORT_PREDICTION`,
   `--nat-udp-preferred-port`/`BORE_NAT_UDP_PORT` (fixed UDP hole-punch port, 0=random),
+  `--notes`/`BORE_NOTES`, `--carriers`/`BORE_CARRIERS` (parallel relay carriers, default 1),
   `--auto-reconnect`/`BORE_AUTO_RECONNECT`.
 - **test-udp:** `--to`/`BORE_SERVER` (optional), `--stun-server`/`BORE_STUN_SERVER`,
   `--nat-udp-preferred-port`/`BORE_NAT_UDP_PORT`.

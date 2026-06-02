@@ -83,7 +83,9 @@ docker run -it --init --rm --network host ekzhang/bore <ARGS>
 Ready-to-run compose files live in [`docker/`](docker/): `docker-compose.server.yml`
 (bridge network, control port + tunnel range forwarded explicitly),
 `docker-compose.client.yml` and `docker-compose.secret-proxy.yml` (host network).
-All environment variables are present (optional ones commented).
+All environment variables are present (optional ones commented). Server-side UDP,
+relay, Docker networking, carrier and file-descriptor tuning notes are in
+[`SERVER_UDP_OPTIMIZATION.md`](SERVER_UDP_OPTIMIZATION.md).
 
 ```shell
 docker compose -f docker/docker-compose.server.yml up -d
@@ -208,6 +210,15 @@ native QUIC stream**, which QUIC keeps independently loss-isolated — so there 
 single-stream head-of-line blocking to fix. `--carriers` widens the relay; `--udp`
 fixes the direct path. They compose (the relay pool is used whenever a tunnel is on
 the relay fallback).
+
+For bulk transfers, the direct QUIC path is tuned in code with larger flow-control
+windows than Quinn's defaults: `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` (16 MiB),
+`DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` (64 MiB), and `DIRECT_QUIC_SEND_WINDOW`
+(64 MiB) in `src/holepunch.rs`. If `bore test-udp --test-bandwidth` shows UDP
+direct with lower latency but less throughput than TCP relay, that is not
+automatically a bug: QUIC is reliable and congestion-controlled over UDP, while the
+relay uses highly optimized kernel TCP and may sit close to one peer. Tune those
+constants only after measuring both directions with a realistic quota.
 
 #### Automatic reconnection
 

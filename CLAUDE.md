@@ -109,8 +109,14 @@ degrades to N-1, never breaks the tunnel.
 it bypasses the server, so there is no relay leg to widen. Instead it multiplexes
 each proxied connection over its **own native QUIC stream** (`DirectConn::open_stream`),
 which QUIC keeps independently flow-controlled and loss-isolated — eliminating HOL on
-the direct path without any extra connections. So `--udp` and `--carriers` are
-complementary: the former fixes the direct path, the latter the relay fallback.
+the direct path without any extra connections. `holepunch::transport_config` also
+sets the direct QUIC flow-control windows via named constants:
+`DIRECT_QUIC_STREAM_RECEIVE_WINDOW` (16 MiB),
+`DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` (64 MiB), and `DIRECT_QUIC_SEND_WINDOW`
+(64 MiB). If `test-udp --test-bandwidth` shows bulk-transfer stalls on high-BDP
+links, tune those constants first and balance throughput against memory. So `--udp`
+and `--carriers` are complementary: the former fixes the direct path, the latter the
+relay fallback.
 
 ### Things to preserve when editing
 

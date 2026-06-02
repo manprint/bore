@@ -84,6 +84,36 @@ const QUIC_MAX_IDLE: Duration = Duration::from_secs(10);
 #[cfg(feature = "udp")]
 const MAX_DIRECT_STREAMS: u32 = 4096;
 
+/// Per-stream QUIC receive window for the direct UDP path.
+///
+/// Quinn's default is deliberately conservative (roughly sized for a 100 Mbit/s,
+/// 100 ms path). Bore's direct path is often used for large file transfers and
+/// high-BDP links, so keep this value near the transport config rather than
+/// buried in `transport_config()`. If a future agent is tuning bulk throughput,
+/// start here: this is the main single-stream flow-control window advertised to
+/// the peer. Raising it improves high-latency/high-bandwidth transfers at the
+/// cost of more worst-case buffering per active QUIC stream.
+#[cfg(feature = "udp")]
+const DIRECT_QUIC_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// Total QUIC receive window for one direct connection.
+///
+/// This caps aggregate data buffered across all native QUIC streams on the same
+/// direct peer connection. Keep it comfortably above the per-stream window so a
+/// single bulk stream can fill the pipe while still leaving room for concurrent
+/// proxied connections. Increase with care on small machines: this is a memory
+/// budget, not just a speed knob.
+#[cfg(feature = "udp")]
+const DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
+
+/// Upper bound on bytes sent but not yet acknowledged on the direct QUIC path.
+///
+/// Match the aggregate receive window by default. If paired `test-udp` shows the
+/// sender stalling below the expected bandwidth-delay product while CPU and loss
+/// are low, this is the companion knob to raise after the receive windows.
+#[cfg(feature = "udp")]
+const DIRECT_QUIC_SEND_WINDOW: u64 = 64 * 1024 * 1024;
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// Derive the shared QUIC authentication token from the tunnel secret (if any)
@@ -881,6 +911,15 @@ fn transport_config() -> quinn::TransportConfig {
     let mut cfg = quinn::TransportConfig::default();
     cfg.keep_alive_interval(Some(QUIC_KEEPALIVE));
     cfg.max_idle_timeout(Some(QUIC_MAX_IDLE.try_into().expect("valid idle timeout")));
+
+    // High-throughput direct transfers need flow-control windows larger than
+    // Quinn's defaults. These are deliberately constants above, not inline
+    // literals, so the next person tuning real-world UDP/QUIC performance can
+    // adjust the BDP/memory trade-off in one obvious place.
+    cfg.stream_receive_window(DIRECT_QUIC_STREAM_RECEIVE_WINDOW.into());
+    cfg.receive_window(DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW.into());
+    cfg.send_window(DIRECT_QUIC_SEND_WINDOW);
+
     // One native QUIC stream per proxied connection: raise the concurrent-stream
     // limit well above quinn's small default so it is not the bottleneck.
     cfg.max_concurrent_bidi_streams(MAX_DIRECT_STREAMS.into());

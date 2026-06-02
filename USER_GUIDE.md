@@ -529,6 +529,15 @@ bore test-udp --to https://bore.tld --secret hunter2 --tcp-secret-id svc \
 La quota è per direzione e per path: con `500MB` vengono trasferiti 500 MB A->B e
 500 MB B->A su UDP diretto, poi lo stesso sul TCP relay fallback.
 
+Interpretazione delle prestazioni: il diretto UDP/QUIC dovrebbe spesso ridurre la
+latenza e togliere il server dal data path, ma non è garantito che superi sempre il
+fallback TCP in throughput single-stream. QUIC è un trasporto affidabile e
+congestion-controlled in user space; il relay usa TCP del kernel, molto ottimizzato,
+e il server può essere vicino a uno dei peer. Il direct path usa finestre QUIC
+high-throughput definite in `src/holepunch.rs` (`DIRECT_QUIC_STREAM_RECEIVE_WINDOW`,
+`DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW`, `DIRECT_QUIC_SEND_WINDOW`): sono i primi
+valori da ritoccare se test reali su link high-BDP mostrano stalli di flow-control.
+
 > Regola d'oro: il **provider** è il lato che deve essere *raggiungibile* (fa da
 > server QUIC); il **proxy** è il lato che *contatta*. Se il provider è dietro un NAT
 > simmetrico/CGNAT il path diretto può non riuscire e si resta sul relay.
@@ -776,14 +785,40 @@ Default `1` = comportamento invariato.
 > nativa** indipendente (niente HOL). `--carriers` ottimizza il **relay**; `--udp`
 > ottimizza il **diretto**. Si combinano: il pool relay serve da fallback.
 
-### 5.4 Riconnessione automatica (`--auto-reconnect`)
+Il path diretto QUIC usa finestre interne più ampie dei default Quinn (16 MiB per
+stream, 64 MiB aggregate/send) per evitare che trasferimenti bulk si fermino sotto
+il bandwidth-delay product. Sono costanti in `src/holepunch.rs`, non flag CLI:
+alzale solo dopo misure `test-udp --test-bandwidth` e tenendo conto della memoria
+peggiore per connessione/stream.
+
+### 5.4 Parametri server/host per throughput
+
+Sul **relay TCP**, i parametri più importanti sono fuori dal protocollo:
+
+- abilita BBR/fq sull'host o nel namespace che ospita il server, se supportato:
+  `sysctl -w net.core.default_qdisc=fq` e
+  `sysctl -w net.ipv4.tcp_congestion_control=bbr`;
+- alza i buffer massimi se fai relay ad alta banda/RTT:
+  `net.core.rmem_max`, `net.core.wmem_max`, `net.ipv4.tcp_rmem`,
+  `net.ipv4.tcp_wmem`;
+- imposta `--max-conns` in base a CPU/RAM/file descriptor e aumenta `nofile`
+  (`ulimit -n`) se ospiti molti tunnel;
+- alza `--max-carriers` solo se i client usano davvero `--carriers N`; più carrier
+  significano più socket e più lavoro sul server;
+- per STUN/UDP affidabile in Docker, preferisci `network_mode: host` o verifica che
+  `7835/udp` esponga il vero source address dei client.
+
+Questi parametri migliorano il relay/fallback. Il direct UDP, quando riesce, bypassa
+il server per i dati: il server resta solo rendezvous/STUN/control.
+
+### 5.5 Riconnessione automatica (`--auto-reconnect`)
 
 Su `bore local` e `bore proxy`. Se la connessione cade o non si stabilisce, il client
 riprova da solo con backoff esponenziale (1, 2, 4, 8, 16, 32 s, poi ogni 32 s); una
 connessione riuscita azzera il backoff. Per un tunnel segreto su UDP, dopo un riavvio
 del provider il proxy si riconnette e rinegozia (di nuovo diretto, o relay).
 
-### 5.5 Log e verbosità
+### 5.6 Log e verbosità
 
 ```shell
 bore local 8080 --to bore.tld -v       # debug
@@ -791,7 +826,7 @@ bore server --udp -vv                   # trace
 RUST_LOG=warn bore server               # filtro esplicito
 ```
 
-### 5.6 Variabili d'ambiente / Docker
+### 5.7 Variabili d'ambiente / Docker
 
 Ogni flag ha un equivalente `BORE_*` (vedi [Riferimento rapido](#2-riferimento-rapido-dei-comandi)).
 Nella cartella `docker/` trovi compose pronti per server, client e secret-proxy con

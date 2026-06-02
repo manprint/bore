@@ -374,6 +374,14 @@ La quota è **per direzione e per path**: `500MB` significa A->B e B->A su UDP
 diretto, poi A->B e B->A sul TCP relay. Usa una quota piccola (`16MB`, `64MB`) per
 smoke test, più alta per misure realistiche.
 
+Come leggere i risultati di banda: UDP diretto più lento del TCP relay non è, da
+solo, un fallimento. Il test misura QUIC affidabile/congestion-controlled sopra UDP,
+non UDP raw; il relay TCP può beneficiare del kernel, di BBR/offload e di un server
+molto vicino a uno dei peer. Considera il diretto sano quando `UDP direct: working`,
+la latenza è coerente e i trasferimenti completano in entrambe le direzioni. Per
+tuning bulk, i primi knob sono le costanti `DIRECT_QUIC_*_WINDOW` in
+`src/holepunch.rs`.
+
 ---
 
 ## 4. Checklist rapida

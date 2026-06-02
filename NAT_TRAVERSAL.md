@@ -110,10 +110,10 @@ mai un tunnel.
 
 6. **QUIC + autenticazione.** Il **consumer è il client QUIC**: prova i candidati
    del provider (riflessivo per primo) finché uno completa l'handshake. Il
-   **provider è il server QUIC** (`DirectListener`). Sui primi 32 byte i due si
-   scambiano un **token = HMAC(secret, nonce)**: se non combacia, si chiude. Poi
-   `yamux` gira su **una** bidi-stream QUIC, identico al relay → tutta la logica
-   per-connessione è riusata.
+  **provider è il server QUIC** (`DirectListener`). Sui primi 32 byte i due si
+  scambiano un **token = HMAC(secret, nonce)**: se non combacia, si chiude. Poi
+  ogni connessione proxata usa una **bidi-stream QUIC nativa** indipendente,
+  mantenendo isolamento da perdita e flow-control per flusso.
 
 **Robustezza.**
 - Il provider tiene un `DirectListener` **persistente** e **ri-buca** verso ogni
@@ -124,6 +124,10 @@ mai un tunnel.
   persa). Il sistema **converge** sempre al diretto entro ~10 s.
 - **Keep-alive QUIC ogni 3 s** (idle 10 s): tiene viva la mappatura NAT durante
   trasferimenti lunghi e quieti, e rileva un peer sparito entro ~10 s.
+- **Finestre QUIC high-throughput:** il direct path usa costanti in
+  `src/holepunch.rs` (16 MiB per stream, 64 MiB aggregate/send) più alte dei
+  default Quinn, così un singolo trasferimento non viene limitato troppo presto
+  dal flow-control su link high-BDP. Aumentarle consuma più memoria.
 - **Fallimento di qualsiasi passo → relay.** Mai un tunnel rotto.
 
 ---
@@ -417,6 +421,12 @@ Procedura consigliata: `bore test-udp` su provider **e** consumer → se serve u
 prova end-to-end lancia la modalità paired con lo stesso id sui due host → applica
 il rimedio della sezione 7 corrispondente.
 
+Se il report mostra UDP diretto con latenza più bassa ma throughput inferiore al
+TCP relay, non significa automaticamente che il diretto sia guasto: QUIC sopra UDP
+resta affidabile e congestion-controlled, mentre TCP del kernel può essere più
+veloce su single-stream e il server relay può essere topologicamente vicino a un
+peer. Confronta sempre entrambe le direzioni e ripeti con quote realistiche.
+
 ---
 
 ## 12. Checklist amministratore
@@ -451,6 +461,10 @@ Per ottenere il **diretto** in modo affidabile:
   consumer symmetric, assumi **port-restricted** e applica 7.1.
 - **Port prediction**: best-effort, aiuta solo NAT simmetrici sequenziali, può
   apparire come uno scan a firewall stringenti (per questo è opt-in e loggato).
+- **Throughput UDP vs TCP**: il path diretto elimina il relay e spesso riduce RTT,
+  ma non promette più banda di TCP in ogni scenario. Path UDP filtrati/shapati,
+  CPU user-space QUIC, MTU e topologia del server possono rendere il relay TCP più
+  veloce in un benchmark single-stream.
 
 ---
 

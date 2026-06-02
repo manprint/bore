@@ -4,6 +4,8 @@
 #
 # The image defaults to $BORE_IMAGE (see the justfile `repo`); override with
 #   BORE_IMAGE=youruser/bore:latest docker compose ... up -d
+#
+# Performance / UDP notes: see ../SERVER_UDP_OPTIMIZATION.md.
 
 networks:
   bore:
@@ -19,8 +21,35 @@ services:
     container_name: bore-server
     command: ["server"]
     restart: unless-stopped
+
+    # Default: Docker bridge network. This keeps Docker isolation and requires
+    # explicit `ports:` below. For public STUN/UDP deployments, bridge NAT can
+    # sometimes hide details of the client's real UDP source address. If paired
+    # `bore test-udp` always falls back to relay despite reachable UDP, try host
+    # networking on Linux.
+    #
+    # Host networking alternative:
+    #   1. Uncomment `network_mode: host`.
+    #   2. Comment out `networks:` and the whole `ports:` block below.
+    #   3. Open BORE_CONTROL_PORT/tcp, BORE_CONTROL_PORT/udp, and the tunnel
+    #      range on the host firewall / cloud security group.
+    #
+    # Trade-off: host networking is usually best for STUN correctness and lowest
+    # overhead, but it shares the host network namespace and gives less Docker
+    # isolation. It is primarily a Linux production option.
+    # network_mode: host
     networks:
       - bore
+
+    # Raise this when BORE_MAX_CONNS / BORE_MAX_CARRIERS are increased. Each
+    # relayed connection and carrier consumes file descriptors; too low a limit
+    # causes accept/connect failures under load. The host/Docker daemon must also
+    # allow the requested value.
+    # ulimits:
+    #   nofile:
+    #     soft: 1048576
+    #     hard: 1048576
+
     # The control port and the tunnel port range must be forwarded explicitly,
     # and MUST match BORE_CONTROL_PORT and BORE_MIN_PORT/BORE_MAX_PORT below.
     ports:
@@ -36,9 +65,15 @@ services:
       - BORE_CONTROL_PORT=7835
       - BORE_MIN_PORT=6000
       - BORE_MAX_PORT=7000
+      # Max concurrently proxied connections through the server relay/public
+      # data path. Raising it allows more load, but requires CPU, RAM and enough
+      # file descriptors (`ulimits.nofile`). It does NOT increase direct UDP
+      # bandwidth: successful UDP direct data bypasses the server.
       - BORE_MAX_CONNS=1024
-      # Cap on the parallel TCP "carrier" connections a public tunnel may use
-      # (a client's --carriers request is clamped to this). 1 disables the pool.
+      # Cap on parallel TCP "carrier" connections for public tunnels and secret
+      # providers using --carriers. Helps concurrent relay workloads, not single
+      # bulk flows, and has no effect on the UDP direct data path. Higher values
+      # mean more sockets and scheduler work; 1 disables server-side pools.
       - BORE_MAX_CARRIERS=16
       # Broker UDP hole-punched direct paths for secret tunnels and run a STUN
       # responder on the control port (UDP). The 7835/udp forward above is

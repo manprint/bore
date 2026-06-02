@@ -63,6 +63,13 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
   what is connected right now. Disabled (and invisible) without a token, leaving
   the control port's bore-protocol behaviour byte-for-byte unchanged.
 
+### Changed
+- **Direct QUIC throughput tuning**: the UDP direct path now sets explicit
+  high-throughput flow-control windows in `src/holepunch.rs` (16 MiB per stream,
+  64 MiB aggregate receive, 64 MiB send) instead of relying on Quinn's conservative
+  defaults. The constants are documented in code so future tuning can adjust the
+  BDP/memory trade-off in one place.
+
 ## [1.0.0]
 
 First stable release of the fork.

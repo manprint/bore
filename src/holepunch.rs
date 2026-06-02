@@ -6,9 +6,9 @@
 //! secret tunnel each open a UDP socket, learn their public (reflexive) mapping
 //! via STUN, exchange candidates through the server, simultaneously send UDP
 //! packets to open their NAT mappings, then establish a QUIC connection over that
-//! socket. `yamux` runs over a single QUIC bidirectional stream exactly as it
-//! does over TCP, so the rest of the data path is reused unchanged. If any step
-//! fails the caller falls back to the server relay.
+//! socket. Each proxied connection uses its own native QUIC bidirectional stream,
+//! so the direct path avoids TCP/yamux head-of-line blocking. If any step fails
+//! the caller falls back to the server relay.
 //!
 //! Authentication of the direct path is a shared token derived from the tunnel
 //! secret and a server-issued nonce ([`derive_token`]): both peers prove
@@ -114,6 +114,22 @@ const DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
 #[cfg(feature = "udp")]
 const DIRECT_QUIC_SEND_WINDOW: u64 = 64 * 1024 * 1024;
 
+/// UDP socket receive buffer requested for every direct-path socket.
+///
+/// This is intentionally an application default, not a deployment instruction:
+/// bore asks the OS for enough UDP buffering to absorb QUIC bursts without users
+/// needing per-peer sysctl tuning. Kernels may clamp the effective value to their
+/// `rmem_max`, but requesting it here fixes the common case and makes `-v` logs
+/// show what the OS actually granted.
+const DIRECT_UDP_SOCKET_RECV_BUFFER: usize = 16 * 1024 * 1024;
+
+/// UDP socket send buffer requested for every direct-path socket.
+///
+/// Keep this paired with the receive buffer: QUIC pacing and congestion control
+/// still decide what goes on the wire, but a tiny OS send buffer can throttle the
+/// userspace endpoint before QUIC reaches its intended pacing behavior.
+const DIRECT_UDP_SOCKET_SEND_BUFFER: usize = 16 * 1024 * 1024;
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// Derive the shared QUIC authentication token from the tunnel secret (if any)
@@ -145,25 +161,45 @@ fn tokens_match(a: &[u8; TOKEN_LEN], b: &[u8; TOKEN_LEN]) -> bool {
 /// the previous socket closes. (A fixed port does not help symmetric NATs, which
 /// remap per destination regardless of the local port.)
 pub async fn bind_socket(port: u16) -> Result<UdpSocket> {
-    if port == 0 {
-        return UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-            .await
-            .context("failed to bind UDP socket");
-    }
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .context("failed to create UDP socket")?;
+    configure_udp_socket_buffers(&socket);
+
     // Reuse the address so a reconnect can rebind the fixed port without waiting
     // for the previous socket to be fully released.
-    let _ = socket.set_reuse_address(true);
+    if port != 0 {
+        let _ = socket.set_reuse_address(true);
+    }
     socket
         .set_nonblocking(true)
         .context("failed to set UDP socket non-blocking")?;
     let addr: SocketAddr = (Ipv4Addr::UNSPECIFIED, port).into();
-    socket
-        .bind(&addr.into())
-        .with_context(|| format!("failed to bind fixed UDP port {port} (free? allowed?)"))?;
+    socket.bind(&addr.into()).with_context(|| {
+        if port == 0 {
+            "failed to bind UDP socket".to_string()
+        } else {
+            format!("failed to bind fixed UDP port {port} (free? allowed?)")
+        }
+    })?;
     UdpSocket::from_std(socket.into()).context("failed to register UDP socket with tokio")
+}
+
+fn configure_udp_socket_buffers(socket: &socket2::Socket) {
+    if let Err(err) = socket.set_recv_buffer_size(DIRECT_UDP_SOCKET_RECV_BUFFER) {
+        debug!(%err, requested = DIRECT_UDP_SOCKET_RECV_BUFFER, "failed to raise UDP receive buffer");
+    }
+    if let Err(err) = socket.set_send_buffer_size(DIRECT_UDP_SOCKET_SEND_BUFFER) {
+        debug!(%err, requested = DIRECT_UDP_SOCKET_SEND_BUFFER, "failed to raise UDP send buffer");
+    }
+
+    debug!(
+        requested_recv = DIRECT_UDP_SOCKET_RECV_BUFFER,
+        actual_recv = ?socket.recv_buffer_size().ok(),
+        requested_send = DIRECT_UDP_SOCKET_SEND_BUFFER,
+        actual_send = ?socket.send_buffer_size().ok(),
+        "configured UDP socket buffers"
+    );
 }
 
 /// Gather this peer's candidate addresses: the STUN-discovered reflexive address
@@ -919,6 +955,11 @@ fn transport_config() -> quinn::TransportConfig {
     cfg.stream_receive_window(DIRECT_QUIC_STREAM_RECEIVE_WINDOW.into());
     cfg.receive_window(DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW.into());
     cfg.send_window(DIRECT_QUIC_SEND_WINDOW);
+
+    // TCP relay often benefits from kernel BBR. Use Quinn's BBR controller for
+    // the direct QUIC path too, so high-BDP peer-to-peer transfers are not stuck
+    // with the default CUBIC behavior when the network favors model-based pacing.
+    cfg.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 
     // One native QUIC stream per proxied connection: raise the concurrent-stream
     // limit well above quinn's small default so it is not the bottleneck.

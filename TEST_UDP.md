@@ -379,8 +379,8 @@ solo, un fallimento. Il test misura QUIC affidabile/congestion-controlled sopra 
 non UDP raw; il relay TCP può beneficiare del kernel, di BBR/offload e di un server
 molto vicino a uno dei peer. Considera il diretto sano quando `UDP direct: working`,
 la latenza è coerente e i trasferimenti completano in entrambe le direzioni. Per
-tuning bulk, i primi knob sono le costanti `DIRECT_QUIC_*_WINDOW` in
-`src/holepunch.rs`.
+tuning bulk, i primi knob sono le costanti `DIRECT_QUIC_*_WINDOW` e
+`DIRECT_UDP_SOCKET_*_BUFFER` in `src/holepunch.rs`; il direct path usa gia BBR.
 
 ---
 

@@ -537,6 +537,8 @@ e il server può essere vicino a uno dei peer. Il direct path usa finestre QUIC
 high-throughput definite in `src/holepunch.rs` (`DIRECT_QUIC_STREAM_RECEIVE_WINDOW`,
 `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW`, `DIRECT_QUIC_SEND_WINDOW`): sono i primi
 valori da ritoccare se test reali su link high-BDP mostrano stalli di flow-control.
+Bore inoltre richiede buffer UDP send/receive da 16 MiB e usa BBR per QUIC direct,
+cosi il comportamento di base non dipende dai default piu piccoli del sistema.
 
 > Regola d'oro: il **provider** è il lato che deve essere *raggiungibile* (fa da
 > server QUIC); il **proxy** è il lato che *contatta*. Se il provider è dietro un NAT
@@ -786,10 +788,10 @@ Default `1` = comportamento invariato.
 > ottimizza il **diretto**. Si combinano: il pool relay serve da fallback.
 
 Il path diretto QUIC usa finestre interne più ampie dei default Quinn (16 MiB per
-stream, 64 MiB aggregate/send) per evitare che trasferimenti bulk si fermino sotto
-il bandwidth-delay product. Sono costanti in `src/holepunch.rs`, non flag CLI:
-alzale solo dopo misure `test-udp --test-bandwidth` e tenendo conto della memoria
-peggiore per connessione/stream.
+stream, 64 MiB aggregate/send), richiede buffer UDP send/receive da 16 MiB e usa
+BBR come congestion controller. Sono costanti/configurazioni in `src/holepunch.rs`,
+non flag CLI: alzale solo dopo misure `test-udp --test-bandwidth` e tenendo conto
+della memoria peggiore per connessione/stream.
 
 ### 5.4 Parametri server/host per throughput
 

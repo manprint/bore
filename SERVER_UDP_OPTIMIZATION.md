@@ -18,6 +18,11 @@ veloce in throughput single-stream, non e automaticamente un guasto: QUIC e
 affidabile/congestion-controlled in user space, mentre TCP usa il kernel e puo
 beneficiare di BBR/offload/topologia favorevole del server.
 
+Il binario prova gia a comportarsi bene senza tuning puntuale sui peer: il socket
+UDP del direct path richiede buffer send/receive da 16 MiB e QUIC usa BBR come
+congestion controller. I sysctl di questa guida servono a rimuovere cap del kernel
+o a migliorare il relay TCP/server, non sono prerequisiti per ogni client.
+
 ## Docker networking: bridge vs host
 
 Il compose server usa di default una rete bridge con port forwarding esplicito:
@@ -146,6 +151,12 @@ Implicazioni:
 Questi parametri contano per il **relay TCP** e i tunnel pubblici. Sono meglio
 impostati sull'host, non nel compose, perche il supporto ai sysctl network dentro
 container varia e con `network_mode: host` alcuni non sono namespaced.
+
+Per il direct UDP, bore richiede autonomamente buffer UDP piu ampi sul socket. Se
+il kernel limita `rmem_max`/`wmem_max`, il valore effettivo puo essere piu basso:
+con `-v` i log mostrano i buffer richiesti e quelli concessi. In quel caso questi
+sysctl diventano un modo per alzare il tetto del sistema, non una configurazione
+manuale obbligatoria per far funzionare il tunnel.
 
 Profilo di partenza per Linux moderno:
 

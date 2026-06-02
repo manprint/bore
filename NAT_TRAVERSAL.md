@@ -128,6 +128,9 @@ mai un tunnel.
   `src/holepunch.rs` (16 MiB per stream, 64 MiB aggregate/send) più alte dei
   default Quinn, così un singolo trasferimento non viene limitato troppo presto
   dal flow-control su link high-BDP. Aumentarle consuma più memoria.
+- **Buffer UDP e BBR applicativi:** bore richiede buffer UDP send/receive da 16
+  MiB sul socket usato da QUIC e imposta BBR come congestion controller del direct
+  path. I cap del kernel possono comunque limitare il valore effettivo.
 - **Fallimento di qualsiasi passo → relay.** Mai un tunnel rotto.
 
 ---

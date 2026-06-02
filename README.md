@@ -214,11 +214,13 @@ the relay fallback).
 For bulk transfers, the direct QUIC path is tuned in code with larger flow-control
 windows than Quinn's defaults: `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` (16 MiB),
 `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` (64 MiB), and `DIRECT_QUIC_SEND_WINDOW`
-(64 MiB) in `src/holepunch.rs`. If `bore test-udp --test-bandwidth` shows UDP
-direct with lower latency but less throughput than TCP relay, that is not
-automatically a bug: QUIC is reliable and congestion-controlled over UDP, while the
-relay uses highly optimized kernel TCP and may sit close to one peer. Tune those
-constants only after measuring both directions with a realistic quota.
+(64 MiB) in `src/holepunch.rs`. Bore also requests 16 MiB UDP socket buffers and
+uses Quinn's BBR congestion controller for the direct path. If
+`bore test-udp --test-bandwidth` shows UDP direct with lower latency but less
+throughput than TCP relay, that is not automatically a bug: QUIC is reliable and
+congestion-controlled over UDP, while the relay uses highly optimized kernel TCP
+and may sit close to one peer. Tune those constants only after measuring both
+directions with a realistic quota.
 
 #### Automatic reconnection
 

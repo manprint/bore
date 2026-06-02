@@ -6,7 +6,7 @@ use bore_cli::{
     reconnect,
     secret::Proxy,
     server::Server,
-    shared::{TunnelOptions, MAX_NOTES_LEN},
+    shared::{TunnelOptions, UdpTestOptions, MAX_NOTES_LEN},
 };
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand};
 use tracing::info;
@@ -300,13 +300,41 @@ enum Command {
     /// given), classifies the NAT, and prints advice.
     TestUdp {
         /// Optional bore server (host:port or http(s):// URL) to also test the
-        /// reachability of its STUN responder.
+        /// reachability of its STUN responder. Required with --tcp-secret-id.
         #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER")]
         to: Option<String>,
+
+        /// Optional secret for server authentication and direct-path token derivation.
+        #[clap(
+            short,
+            long,
+            value_name = "SECRET",
+            env = "BORE_SECRET",
+            hide_env_values = true
+        )]
+        secret: Option<String>,
+
+        /// Pair with another test-udp peer using this diagnostic id. When set,
+        /// the command connects to --to, waits for the peer, tests UDP direct and
+        /// TCP relay paths, and prints a paired report.
+        #[clap(long, value_name = "ID", env = "BORE_TCP_SECRET_ID")]
+        tcp_secret_id: Option<String>,
+
+        /// Skip TLS certificate verification for https:// servers.
+        #[clap(long, env = "BORE_INSECURE")]
+        insecure: bool,
 
         /// Extra STUN server (host:port) to probe alongside the public ones.
         #[clap(long, value_name = "HOST:PORT", env = "BORE_STUN_SERVER")]
         stun_server: Option<String>,
+
+        /// Try UPnP-IGD to add a router-mapped UDP candidate in paired mode.
+        #[clap(long, env = "BORE_UPNP")]
+        upnp: bool,
+
+        /// Also advertise predicted symmetric-NAT ports in paired mode.
+        #[clap(long, env = "BORE_TRY_PORT_PREDICTION")]
+        try_port_prediction: bool,
 
         /// Bind the probe to this fixed UDP port (mirrors --nat-udp-preferred-port)
         /// to test whether exactly that port works through a firewall. 0 = random.
@@ -317,6 +345,15 @@ enum Command {
             default_value_t = 0
         )]
         nat_udp_preferred_port: u16,
+
+        /// Also run bidirectional bandwidth tests. Alias: --test-bandwith.
+        #[clap(long = "test-bandwidth", alias = "test-bandwith")]
+        test_bandwidth: bool,
+
+        /// Bytes to transfer per direction and per path for --test-bandwidth.
+        /// Accepts raw bytes or KB/MB/GB/KiB/MiB/GiB suffixes.
+        #[clap(long, value_name = "SIZE", default_value = "64MB")]
+        test_transfer_quota: String,
     },
 }
 
@@ -564,19 +601,61 @@ async fn dispatch(command: Command) -> Result<()> {
         }
         Command::TestUdp {
             to,
+            secret,
+            tcp_secret_id,
+            insecure,
             stun_server,
+            upnp,
+            try_port_prediction,
             nat_udp_preferred_port,
+            test_bandwidth,
+            test_transfer_quota,
         } => {
-            let bore_target = to.map(|t| {
-                let ep = bore_cli::transport::Endpoint::parse(&t);
-                (ep.host, ep.port)
-            });
-            bore_cli::holepunch::diagnose(
-                bore_target,
-                stun_server.as_deref(),
-                nat_udp_preferred_port,
-            )
-            .await?;
+            if let Some(id) = tcp_secret_id {
+                let Some(to) = to else {
+                    Args::command()
+                        .error(
+                            ErrorKind::MissingRequiredArgument,
+                            "--to is required with --tcp-secret-id",
+                        )
+                        .exit();
+                };
+                let transfer_quota = parse_transfer_quota(&test_transfer_quota)?;
+                bore_cli::udp_diagnostic::run_peer_test(
+                    &to,
+                    &id,
+                    secret.as_deref(),
+                    insecure,
+                    stun_server.as_deref(),
+                    upnp,
+                    try_port_prediction,
+                    nat_udp_preferred_port,
+                    UdpTestOptions {
+                        bandwidth: test_bandwidth,
+                        transfer_quota,
+                    },
+                )
+                .await?;
+            } else {
+                if test_bandwidth {
+                    Args::command()
+                        .error(
+                            ErrorKind::ArgumentConflict,
+                            "--test-bandwidth requires --tcp-secret-id so two peers can be paired",
+                        )
+                        .exit();
+                }
+                let bore_target = to.map(|t| {
+                    let ep = bore_cli::transport::Endpoint::parse(&t);
+                    (ep.host, ep.port)
+                });
+                bore_cli::holepunch::diagnose(
+                    bore_target,
+                    stun_server.as_deref(),
+                    nat_udp_preferred_port,
+                )
+                .await?;
+            }
         }
     }
 
@@ -613,6 +692,33 @@ fn parse_proxy_addr(value: &str) -> Result<SocketAddr> {
     normalized
         .parse()
         .with_context(|| format!("invalid --local-proxy-port: {value}"))
+}
+
+fn parse_transfer_quota(value: &str) -> Result<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--test-transfer-quota cannot be empty");
+    }
+    let split_at = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (number, suffix) = trimmed.split_at(split_at);
+    let bytes: u64 = number
+        .parse()
+        .with_context(|| format!("invalid --test-transfer-quota: {value}"))?;
+    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1_000,
+        "m" | "mb" => 1_000_000,
+        "g" | "gb" => 1_000_000_000,
+        "ki" | "kib" => 1024,
+        "mi" | "mib" => 1024 * 1024,
+        "gi" | "gib" => 1024 * 1024 * 1024,
+        other => anyhow::bail!("unsupported --test-transfer-quota suffix: {other}"),
+    };
+    bytes
+        .checked_mul(multiplier)
+        .context("--test-transfer-quota is too large")
 }
 
 /// Initialize logging: `RUST_LOG` wins if set; otherwise default to `info`, or

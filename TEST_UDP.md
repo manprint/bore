@@ -49,6 +49,8 @@ Flag rilevanti:
 - `--tcp-secret-id ID` — deve combaciare tra provider e consumer.
 - `--upnp` (su `local` e `proxy`) — prova ad aprire una porta sul **router casalingo** via UPnP-IGD e la aggiunge come candidato. Aiuta router casalinghi strict con IP WAN pubblico; **inutile dietro CGNAT**. Log: `UPnP-IGD port mapping ENABLED`.
 - `--try-port-prediction` (su `local` e `proxy`) — per NAT **simmetrici**: annuncia qualche porta oltre quella reflexive. **Opt-in**, best-effort, **può sembrare un port scan** ai firewall strict. Log: `port prediction ENABLED`.
+- `test-udp --tcp-secret-id ID` — modalità diagnostica **a due peer**: due host lanciano lo stesso comando, il server li abbina, prova UDP diretto e TCP relay, e stampa un report A<->B.
+- `test-udp --test-bandwidth --test-transfer-quota 500MB` — aggiunge banda e latenza bidirezionali su entrambi i path. `--test-bandwith` (senza la seconda `d`) è accettato come alias.
 
 Variabili d'ambiente equivalenti: `BORE_UDP`, `BORE_PREFER_UDP`, `BORE_STUN_SERVER`, `BORE_SECRET`, `BORE_TCP_SECRET_ID`, `BORE_SERVER`, `BORE_UPNP`, `BORE_TRY_PORT_PREDICTION`.
 
@@ -335,6 +337,43 @@ CONE NAT (endpoint-independent mapping): same public port to every server.
 Port preservation: YES (local 41991 == public 41991).
 ```
 
+### S10 — Diagnostica coordinata A<->B (`test-udp --tcp-secret-id`)
+
+Questa modalità verifica davvero **entrambi i lati** senza avviare un tunnel di
+servizio. Il server deve essere avviato con `--udp` e raggiungibile su TCP e UDP
+della control port. Le due macchine usano lo stesso id; la prima resta in attesa,
+la seconda fa partire il pairing.
+
+Su **SRV**:
+```shell
+./bore server --udp --secret hunter2
+```
+
+Su **A**:
+```shell
+./bore test-udp --to https://SRV --secret hunter2 --tcp-secret-id svc
+```
+
+Su **B**:
+```shell
+./bore test-udp --to https://SRV --secret hunter2 --tcp-secret-id svc
+```
+
+**Cosa viene testato:** diagnosi NAT locale, sintesi del NAT del peer, candidate
+UDP, hole-punch QUIC diretto, fallback TCP relay, latenza in entrambe le
+direzioni. Se il diretto fallisce ma il relay TCP passa, il report lo dichiara e
+consiglia il fallback.
+
+Con misure di banda:
+```shell
+./bore test-udp --to https://SRV --secret hunter2 --tcp-secret-id svc \
+  --test-bandwidth --test-transfer-quota 500MB
+```
+
+La quota è **per direzione e per path**: `500MB` significa A->B e B->A su UDP
+diretto, poi A->B e B->A sul TCP relay. Usa una quota piccola (`16MB`, `64MB`) per
+smoke test, più alta per misure realistiche.
+
 ---
 
 ## 4. Checklist rapida
@@ -349,6 +388,8 @@ Port preservation: YES (local 41991 == public 41991).
 - [ ] S7 secret errato: rifiutato
 - [ ] S8 NAT difficili: `--upnp` / `--try-port-prediction` loggano l'attivazione
 - [ ] S9 `bore test-udp` su entrambi i peer: verdetto NAT coerente + consigli
+- [ ] S10 `test-udp --tcp-secret-id`: pairing A<->B, UDP diretto o fallback TCP, report bidirezionale
+- [ ] S10 con `--test-bandwidth`: banda/latenza misurate su UDP e TCP
 
 ---
 

@@ -483,6 +483,27 @@ Run it on **both** peers: a direct path needs each side to be punchable. A cone
 consumer that can't reach a provider almost always means the *provider's* host
 is the blocker (symmetric/CGNAT/UDP-blocked), not the consumer's.
 
+For a real A<->B check, run paired mode on two machines with the same id. The
+server pairs them, exchanges candidates, tests the direct UDP/QUIC path, then
+tests the TCP relay fallback. Add `--test-bandwidth` (alias:
+`--test-bandwith`) to measure bidirectional throughput and latency on both paths:
+
+```shell
+# Machine A
+bore test-udp --to https://bore.example.com --secret mysecret --tcp-secret-id svc
+
+# Machine B, same command/id
+bore test-udp --to https://bore.example.com --secret mysecret --tcp-secret-id svc
+
+# With bidirectional bandwidth tests (500 MB per direction and per path)
+bore test-udp --to https://bore.example.com --secret mysecret --tcp-secret-id svc \
+  --test-bandwidth --test-transfer-quota 500MB
+```
+
+Paired mode also accepts `--upnp`, `--try-port-prediction`,
+`--nat-udp-preferred-port`, `--stun-server`, and `--insecure`, mirroring the
+direct-path options used by `local`/`proxy`.
+
 ## Protocol
 
 There is a _control port_, `7835` by default (configurable with `--control-port`). The client opens a single connection to it — plain TCP, or TLS when reached via `https://` — and [multiplexes](https://github.com/hashicorp/yamux/blob/master/spec.md) everything over that one connection. At initialization, the client opens a control stream and sends a "Hello" message asking to proxy a selected remote port. The server responds with an acknowledgement and begins listening for external TCP connections.

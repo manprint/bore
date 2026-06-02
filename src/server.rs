@@ -27,6 +27,7 @@ use crate::shared::{
     tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions, CONTROL_PORT,
     NETWORK_TIMEOUT, PROXY_BUFFER_SIZE,
 };
+use crate::udp_diagnostic;
 
 /// Default cap on the number of concurrently proxied connections per tunnel
 /// connection. Bounds memory and file-descriptor use under a connection flood.
@@ -71,6 +72,9 @@ pub struct Server {
     /// Whether to broker UDP direct paths and run the STUN responder.
     udp: bool,
 
+    /// Pending paired `bore test-udp` sessions, keyed by diagnostic id.
+    udp_tests: udp_diagnostic::Registry,
+
     /// TCP port the control listener binds to.
     control_port: u16,
 
@@ -107,6 +111,7 @@ impl Server {
             providers: Registry::default(),
             udp_providers: UdpRegistry::default(),
             udp: false,
+            udp_tests: udp_diagnostic::Registry::default(),
             control_port: CONTROL_PORT,
             tls: None,
             bind_domain: None,
@@ -385,6 +390,25 @@ impl Server {
             Some(ClientMessage::UdpCandidates(_)) => {
                 warn!("unexpected udp candidates as first message");
                 Ok(())
+            }
+            Some(ClientMessage::TestUdpJoin {
+                id,
+                candidates,
+                summary,
+                options,
+            }) => {
+                udp_diagnostic::serve_peer(
+                    control,
+                    opener,
+                    acceptor,
+                    self.udp_tests.clone(),
+                    id,
+                    peer,
+                    candidates,
+                    summary,
+                    options,
+                )
+                .await
             }
             None => Ok(()),
         }

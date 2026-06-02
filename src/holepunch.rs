@@ -276,7 +276,9 @@ pub async fn resolve_stun(
 
 /// Determine the primary local IPv4 address by inspecting the kernel's chosen
 /// source address for an outbound (unconnected, never-sent) socket.
-fn primary_local_ip() -> Option<IpAddr> {
+/// Determine this host's primary local IPv4 address for diagnostic reports and
+/// same-LAN UDP candidates.
+pub fn primary_local_ip() -> Option<IpAddr> {
     let probe = StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     // No packets are sent; `connect` only sets the default peer so the kernel
     // resolves a route and assigns a source address we can read back.
@@ -310,7 +312,9 @@ pub async fn discover_reflexive(socket: &UdpSocket, stun: SocketAddr) -> Result<
 /// Public STUN servers (distinct providers) probed by [`diagnose`]. Two different
 /// IPs are enough to tell endpoint-independent (cone) from endpoint-dependent
 /// (symmetric) mapping; a third adds confidence and a sequential-port sample.
-const PUBLIC_STUN: &[&str] = &[
+/// Public STUN servers (distinct providers) used by `bore test-udp` to classify
+/// local NAT mapping behaviour.
+pub const PUBLIC_STUN: &[&str] = &[
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
     "stun.cloudflare.com:3478",

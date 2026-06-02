@@ -30,3 +30,4 @@ pub mod secret;
 pub mod server;
 pub mod shared;
 pub mod transport;
+pub mod udp_diagnostic;

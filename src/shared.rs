@@ -91,6 +91,46 @@ pub struct TunnelOptions {
     pub carriers: u16,
 }
 
+/// Options negotiated by two `bore test-udp` peers once the server pairs them.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct UdpTestOptions {
+    /// Whether to run throughput tests in addition to the latency checks.
+    pub bandwidth: bool,
+    /// Bytes sent per direction and per path when [`UdpTestOptions::bandwidth`] is enabled.
+    pub transfer_quota: u64,
+}
+
+/// Role assigned by the server to a paired `bore test-udp` peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UdpTestRole {
+    /// Wait for the peer's direct QUIC connection.
+    Listener,
+    /// Dial the peer's direct QUIC listener.
+    Dialer,
+}
+
+/// Compact NAT/candidate summary exchanged between paired `bore test-udp` peers.
+///
+/// The local command prints the detailed STUN verdict directly; this summary is
+/// intentionally small enough to fit comfortably inside the bounded control frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpTestPeerSummary {
+    /// NAT class derived from this peer's public STUN probes.
+    pub nat_class: String,
+    /// Local UDP socket used by the peer for the direct-path test.
+    pub local_udp: String,
+    /// Primary local IP, if one could be discovered.
+    pub primary_local_ip: Option<String>,
+    /// Public reflexive mappings reported by public STUN servers.
+    pub reflexive: Vec<String>,
+    /// Whether the bore server's own STUN responder answered this peer.
+    pub bore_stun: Option<bool>,
+    /// Number of candidate addresses offered for hole punching.
+    pub candidate_count: usize,
+    /// Whether the first reflexive mapping preserved the local UDP port.
+    pub port_preserved: Option<bool>,
+}
+
 /// A message from the client on the control substream.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -144,6 +184,21 @@ pub enum ClientMessage {
         /// The carrier token issued by the server for this tunnel.
         token: String,
     },
+
+    /// Join a two-peer UDP/NAT diagnostic session. The first peer waits; the
+    /// second peer with the same `id` triggers server coordination. This is used
+    /// only by `bore test-udp --tcp-secret-id` and is separate from production
+    /// tunnel registration.
+    TestUdpJoin {
+        /// Diagnostic session identifier; both peers must use the same value.
+        id: String,
+        /// Candidate addresses this peer can be punched at.
+        candidates: Vec<SocketAddr>,
+        /// Compact local NAT summary shown in the peer's final report.
+        summary: UdpTestPeerSummary,
+        /// Requested diagnostic options.
+        options: UdpTestOptions,
+    },
 }
 
 /// A message from the server on the control substream.
@@ -191,6 +246,25 @@ pub enum ServerMessage {
     /// The direct UDP path is unavailable (the other peer did not opt in, or no
     /// peer is registered yet); proceed over the server relay instead.
     UdpUnavailable,
+
+    /// A `bore test-udp` peer is registered and waiting for another peer with the
+    /// same diagnostic id.
+    TestUdpWaiting,
+
+    /// Start the paired `bore test-udp` run with the peer's candidates and the
+    /// assigned direct-QUIC role.
+    TestUdpStart {
+        /// This peer's role for direct QUIC establishment.
+        role: UdpTestRole,
+        /// Shared nonce used to derive the direct-path authentication token.
+        nonce: [u8; UDP_NONCE_LEN],
+        /// The other peer's candidate addresses.
+        peer_candidates: Vec<SocketAddr>,
+        /// The other peer's compact NAT summary.
+        peer_summary: UdpTestPeerSummary,
+        /// Effective options both peers will use.
+        options: UdpTestOptions,
+    },
 }
 
 /// Transport stream with JSON frames delimited by null characters.

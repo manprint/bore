@@ -13,7 +13,8 @@ e quando no**, con le **azioni di rimedio** per chi amministra la rete.
 >   NAT **cone**, o router domestico con **port-forward/UPnP** sulla porta UDP.
 > - Se il diretto non è possibile (symmetric↔symmetric, CGNAT su entrambi, UDP
 >   bloccato), si usa **il relay del server**: il tunnel **funziona comunque**.
-> - Diagnostica su ogni host con `bore test-udp`.
+> - Diagnostica su ogni host con `bore test-udp`; per verificare la coppia reale
+>   A<->B usa `bore test-udp --tcp-secret-id <id>` su entrambe le macchine.
 
 Indice:
 1. [Ambito](#1-ambito)
@@ -406,13 +407,15 @@ punch. Due peer IPv6 si connettono in diretto anche da reti mobile.
 |---|---|---|
 | `--udp` (`BORE_PREFER_UDP`) | local, proxy | Abilita il tentativo diretto (server con `--udp`/`BORE_UDP`). |
 | `--stun-server` (`BORE_STUN_SERVER`) | local, proxy, test-udp | STUN esterno: risolve hairpin/co-locazione (7.5) o server UDP irraggiungibile. |
-| `--upnp` (`BORE_UPNP`) | local, proxy | Mappa una porta sul **router domestico** (IP WAN pubblico): rende il provider raggiungibile (7.1). Inutile su CGNAT. |
-| `--try-port-prediction` (`BORE_TRY_PORT_PREDICTION`) | local, proxy | Annuncia porte predette sul lato **symmetric sequenziale** (i casi `⚠ seq`). Best-effort, può sembrare uno scan. |
+| `--upnp` (`BORE_UPNP`) | local, proxy, test-udp paired | Mappa una porta sul **router domestico** (IP WAN pubblico): rende il provider raggiungibile (7.1). Inutile su CGNAT. |
+| `--try-port-prediction` (`BORE_TRY_PORT_PREDICTION`) | local, proxy, test-udp paired | Annuncia porte predette sul lato **symmetric sequenziale** (i casi `⚠ seq`). Best-effort, può sembrare uno scan. |
 | `--nat-udp-preferred-port` (`BORE_NAT_UDP_PORT`) | local, proxy, test-udp | Porta UDP **fissa** (0=random): da aprire in egress/ingress nel firewall (7.3, 7.4); su NAT port-preserving rende l'esterno prevedibile. |
 | `bore test-udp [--to … --stun-server … --nat-udp-preferred-port …]` | — | **Diagnostica**: egress UDP, classe NAT (cone/symmetric), CGNAT/doppio-NAT, hairpin, UPnP. Lancialo su **entrambi** i peer. |
+| `bore test-udp --to <srv> --secret <s> --tcp-secret-id <id>` | test-udp paired | **Diagnostica coordinata A<->B**: il server abbina due peer, scambia candidati, prova UDP diretto e TCP relay, e stampa un report bidirezionale. Con `--test-bandwidth --test-transfer-quota 500MB` misura anche banda e latenza su entrambi i path. |
 
-Procedura consigliata: `bore test-udp` su provider **e** consumer → individua quale
-lato è il blocco → applica il rimedio della sezione 7 corrispondente.
+Procedura consigliata: `bore test-udp` su provider **e** consumer → se serve una
+prova end-to-end lancia la modalità paired con lo stesso id sui due host → applica
+il rimedio della sezione 7 corrispondente.
 
 ---
 

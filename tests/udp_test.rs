@@ -13,7 +13,8 @@ use bore_cli::{
     client::{Client, ProviderMeta},
     secret::Proxy,
     server::Server,
-    shared::CONTROL_PORT,
+    shared::{UdpTestOptions, CONTROL_PORT},
+    udp_diagnostic,
 };
 use lazy_static::lazy_static;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,11 +41,63 @@ async fn wait_for_control_port(listening: bool) {
 }
 
 async fn spawn_server(udp: bool) {
+    spawn_server_with_secret(udp, None).await;
+}
+
+async fn spawn_server_with_secret(udp: bool, secret: Option<&str>) {
     wait_for_control_port(false).await;
-    let mut server = Server::new(1024..=65535, None);
+    let mut server = Server::new(1024..=65535, secret);
     server.set_udp(udp);
     tokio::spawn(server.listen());
     wait_for_control_port(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paired_test_udp_diagnostic_exercises_direct_and_relay() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server_with_secret(true, Some("diag-secret")).await;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+    let options = UdpTestOptions {
+        bandwidth: true,
+        transfer_quota: 64 * 1024,
+    };
+
+    let first_stun = stun.clone();
+    let first = tokio::spawn(async move {
+        udp_diagnostic::run_peer_test(
+            "localhost",
+            "diag-pair",
+            Some("diag-secret"),
+            false,
+            Some(&first_stun),
+            false,
+            false,
+            0,
+            options,
+        )
+        .await
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    let second_stun = stun.clone();
+    let second = tokio::spawn(async move {
+        udp_diagnostic::run_peer_test(
+            "localhost",
+            "diag-pair",
+            Some("diag-secret"),
+            false,
+            Some(&second_stun),
+            false,
+            false,
+            0,
+            options,
+        )
+        .await
+    });
+
+    first.await??;
+    second.await??;
+    Ok(())
 }
 
 /// Spawn an echoing local service and return the port it listens on.

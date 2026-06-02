@@ -66,14 +66,14 @@ tags/releases accumulate per push (prune if noisy).
    command substitution and the commit aborts. Use `git commit -F -` with a
    heredoc.
 
-Current test inventory: `e2e_test` (13 runs), `auth_test` (2), `mux_test` (2),
-`secret_test` (7), `control_port_test` (1), `tls_test` (5), `reconnect_test` (2),
-`udp_test` (5, `#![cfg(feature = "udp")]` — direct round-trip, consumer
-reconnect, consumer detects provider drop, **relay→direct upgrade**, relay
-fallback on loopback), lib unit tests (16: `transport.rs` 7, `reconnect.rs` 2,
-`shared.rs` 1, `holepunch.rs` 6 incl. port-prediction candidate generation),
-plus 1 doctest. Baseline before this work was 12 e2e + 2 auth
-+ 1 doctest.
+Current test inventory includes `e2e_test`, `auth_test`, `mux_test`,
+`secret_test`, `control_port_test`, `tls_test`, `reconnect_test`, carrier and
+admin/basic-auth suites, plus `udp_test` (`#![cfg(feature = "udp")]`) covering
+direct round-trip, many native QUIC streams, multi-consumer direct, reconnect,
+provider drop detection, relay→direct upgrade, fallback, max-conns, and the
+paired `bore test-udp --tcp-secret-id` diagnostic (`paired_test_udp_diagnostic_exercises_direct_and_relay`).
+Lib unit tests cover transport/reconnect/shared/holepunch/udp_diagnostic helpers,
+plus doctests.
 
 ## Architecture (after the rewrite)
 
@@ -91,7 +91,9 @@ Modules in `src/`:
   `PROXY_BUFFER_SIZE=64 KiB`, `UDP_NONCE_LEN=16`. (serde_json is name-tagged, so
   adding enum variants is backward-compatible.) The `udp` feature adds
   `ClientMessage::UdpCandidates(Vec<SocketAddr>)` and `ServerMessage::UdpPunch
-  { nonce, peer }` / `UdpUnavailable` for direct-path signaling.
+  { nonce, peer }` / `UdpUnavailable` for direct-path signaling. Later additions
+  include carrier-pool messages, admin/basic-auth/notes fields, and paired
+  diagnostics (`TestUdpJoin`, `TestUdpWaiting`, `TestUdpStart`).
 - **`mux.rs`** — yamux wrapper, generic over a `Transport` trait (`AsyncRead +
   AsyncWrite + Unpin + Send + 'static`, so TCP or TLS). A single driver task owns
   `yamux::Connection` (its poll API needs `&mut`); `Opener::open()` requests
@@ -112,7 +114,8 @@ Modules in `src/`:
 - **`server.rs`** — `Server`: accepts the single connection (optional TLS
   handshake off the accept path), dispatches on the first control message into
   three roles: public-port tunnel (`serve_tunnel`), secret provider, secret
-  consumer. Holds the `providers` registry, `conn_permits` semaphore
+  consumer, plus newer carrier-join and paired UDP diagnostic roles. Holds the
+  `providers` registry, `udp_tests` registry, `conn_permits` semaphore
   (`--max-conns`), `control_port`, optional `tls` acceptor, `bind_domain`.
 - **`client.rs`** — `Client::new` (public-port mode) and
   `Client::new_secret_provider` (secret provider); both share `listen` /
@@ -136,13 +139,19 @@ Modules in `src/`:
   `QuicTransport` (a `mux::Transport` so yamux runs over one QUIC bidi stream),
   rustls configs (accept-any cert; token authenticates). `resolve_stun` maps a
   443/80 control port to the control port `7835` for the STUN default.
+- **`udp_diagnostic.rs`** — paired `bore test-udp --tcp-secret-id` mode: server
+  pairs two diagnostic peers, relays TCP diagnostic substreams between them, and
+  clients test direct QUIC plus TCP fallback with latency and optional bandwidth
+  probes (`--test-bandwidth`, alias `--test-bandwith`).
 - **`reconnect.rs`** — `Backoff` (1,2,4,8,16,32 then 32s; reset on success) and
   generic `run(auto, connect, serve)` — single-shot (errors propagate, original
   behaviour) or infinite reconnect loop. Has unit tests.
 - **`auth.rs`** — unchanged `Authenticator` (HMAC-SHA256 challenge/response), now
   run **once** on the control substream.
-- **`main.rs`** — clap CLI: `local`, `proxy`, `server`. Builds connect/serve
-  closures and routes through `reconnect::run`.
+- **`main.rs`** — clap CLI: `local`, `proxy`, `server`, `test-udp`. Builds
+  connect/serve closures and routes long-running client/proxy modes through
+  `reconnect::run`; `test-udp` dispatches to standalone NAT diagnosis or paired
+  A<->B diagnostics depending on `--tcp-secret-id`.
 
 ### Connection flow
 

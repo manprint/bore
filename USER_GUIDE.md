@@ -165,13 +165,20 @@ systemd): chiudono in modo ordinato con una riga di log, senza troncare i trasfe
 | `--carriers <N>` | `BORE_CARRIERS` | Connessioni TCP parallele per la tratta relay consumer→server (default 1). |
 | `--auto-reconnect` | `BORE_AUTO_RECONNECT` | Riconnessione automatica con backoff. |
 
-### `bore test-udp` (diagnostica NAT/UDP — non apre tunnel)
+### `bore test-udp` (diagnostica NAT/UDP — non espone tunnel)
 
 | Flag | Env | Descrizione |
 |------|-----|-------------|
-| `-t, --to <ADDR>` | `BORE_SERVER` | Testa anche lo STUN del tuo server bore. |
+| `-t, --to <ADDR>` | `BORE_SERVER` | Testa anche lo STUN del tuo server bore; richiesto per la modalità a due peer. |
+| `-s, --secret <SECRET>` | `BORE_SECRET` | Secret del server e token del path diretto nella modalità a due peer. |
+| `--tcp-secret-id <ID>` | `BORE_TCP_SECRET_ID` | Abbina due istanze `test-udp` con lo stesso id e coordina il test A<->B. |
+| `--insecure` | `BORE_INSECURE` | Accetta certificati self-signed per `https://`. |
 | `--stun-server <HOST:PORT>` | `BORE_STUN_SERVER` | STUN extra da sondare. |
+| `--upnp` | `BORE_UPNP` | Aggiunge un candidato UPnP-IGD nella modalità a due peer. |
+| `--try-port-prediction` | `BORE_TRY_PORT_PREDICTION` | Aggiunge porte predette per NAT simmetrici nella modalità a due peer. |
 | `--nat-udp-preferred-port <PORT>` | `BORE_NAT_UDP_PORT` | Testa esattamente quella porta UDP. |
+| `--test-bandwidth` | — | Misura anche banda e latenza bidirezionali su UDP diretto e TCP relay (`--test-bandwith` è accettato come alias). |
+| `--test-transfer-quota <SIZE>` | — | Quota per direzione/per path (`500MB`, `1GiB`, byte raw; default `64MB`). |
 
 ---
 
@@ -498,6 +505,29 @@ bore test-udp
 # Includi lo STUN del tuo server bore e testa una porta UDP fissa:
 bore test-udp --to bore.tld --nat-udp-preferred-port 41641
 ```
+
+Per testare davvero **entrambi i lati insieme**, usa lo stesso comando su A e B
+con lo stesso `--tcp-secret-id`. La prima istanza resta in attesa, la seconda fa
+partire il test coordinato dal server:
+
+```shell
+# Macchina A
+bore test-udp --to https://bore.tld --secret hunter2 --tcp-secret-id svc
+
+# Macchina B, stesso id e stesso secret
+bore test-udp --to https://bore.tld --secret hunter2 --tcp-secret-id svc
+```
+
+Il report indica NAT locale e peer, candidate UDP, esito del direct QUIC,
+fallback TCP relay e latenza in entrambe le direzioni. Con la banda:
+
+```shell
+bore test-udp --to https://bore.tld --secret hunter2 --tcp-secret-id svc \
+  --test-bandwidth --test-transfer-quota 500MB
+```
+
+La quota è per direzione e per path: con `500MB` vengono trasferiti 500 MB A->B e
+500 MB B->A su UDP diretto, poi lo stesso sul TCP relay fallback.
 
 > Regola d'oro: il **provider** è il lato che deve essere *raggiungibile* (fa da
 > server QUIC); il **proxy** è il lato che *contatta*. Se il provider è dietro un NAT

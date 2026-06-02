@@ -49,6 +49,7 @@ I moduli chiave sono questi:
 | [src/client.rs](src/client.rs) | client per tunnel pubblici e provider dei tunnel segreti |
 | [src/secret.rs](src/secret.rs) | consumer dei tunnel segreti, relay server-side, broker UDP, upgrade relay -> direct |
 | [src/holepunch.rs](src/holepunch.rs) | STUN, candidate gathering, NAT diagnostics, QUIC direct path, token derivation |
+| [src/udp_diagnostic.rs](src/udp_diagnostic.rs) | diagnostica coordinata `test-udp` A<->B, test UDP diretto/TCP relay, latenza e banda |
 | [src/transport.rs](src/transport.rs) | parsing endpoint e trasporto TCP/TLS del control channel |
 | [src/reconnect.rs](src/reconnect.rs) | auto reconnect con backoff |
 

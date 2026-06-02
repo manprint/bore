@@ -811,6 +811,8 @@ impl Proxy {
                             }
                             None => warn!("unexpected udp unavailable"),
                         },
+                        Some(ServerMessage::TestUdpWaiting) => warn!("unexpected udp diagnostic wait"),
+                        Some(ServerMessage::TestUdpStart { .. }) => warn!("unexpected udp diagnostic start"),
                         None => return Ok(()),
                     }
                 }

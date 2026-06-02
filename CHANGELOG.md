@@ -12,6 +12,15 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
 ## [Unreleased]
 
 ### Added
+- **Paired `bore test-udp` diagnostics** (`--tcp-secret-id <id>`): two machines
+  run the same command against a UDP-enabled server, the server pairs them,
+  exchanges candidate addresses, tests the direct UDP/QUIC path, verifies the TCP
+  relay fallback, and prints a bidirectional report with local/peer NAT summaries.
+  `--test-bandwidth` (alias `--test-bandwith`) plus `--test-transfer-quota <SIZE>`
+  adds latency and throughput measurements in both directions on both UDP direct
+  and TCP relay paths. Paired diagnostics also support `--upnp`,
+  `--try-port-prediction`, `--nat-udp-preferred-port`, `--stun-server`,
+  `--secret`, and `--insecure`.
 - **Carrier pool on every relay leg** (`--carriers N` on `bore local` and
   `bore proxy`, env `BORE_CARRIERS`; `--max-carriers` on `bore server`, env
   `BORE_MAX_CARRIERS`): open N parallel TCP connections and round-robin proxied

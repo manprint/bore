@@ -45,5 +45,13 @@ Notes:
 ## Reporting NAT / hole-punch issues
 
 Run `bore test-udp` (and `bore test-udp --to <your server>`) on **both** peers and
-include the output — it classifies the NAT and is the fastest way to triage a
-direct-path problem. See `NAT_TRAVERSAL.md` for how to read it.
+include the output. When both machines can reach the same server, prefer the
+paired report too:
+
+```shell
+bore test-udp --to <your server> --secret <secret> --tcp-secret-id <id>
+```
+
+It classifies both NATs, tests the real UDP direct path, verifies the TCP relay
+fallback, and is the fastest way to triage a direct-path problem. See
+`NAT_TRAVERSAL.md` for how to read it.

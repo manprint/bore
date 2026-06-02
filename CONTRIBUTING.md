@@ -33,6 +33,12 @@ Notes:
 - The **`udp`** feature is on by default and pulls `quinn`. Keep the server-side
   signaling (STUN, brokering) compiling **without** the feature — verify with
   `--no-default-features`.
+- When touching direct UDP/QUIC performance, update every relevant doc with the
+  actual `src/holepunch.rs` tuning values: `DIRECT_QUIC_STREAM_RECEIVE_WINDOW`
+  (16 MiB), `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` / `DIRECT_QUIC_SEND_WINDOW`
+  (64 MiB), `DIRECT_UDP_SOCKET_RECV_BUFFER` /
+  `DIRECT_UDP_SOCKET_SEND_BUFFER` (16 MiB), `MAX_DIRECT_STREAMS` (4096), and
+  `quinn::congestion::BbrConfig`.
 - Keep `#![forbid(unsafe_code)]`.
 - Add a test with any behavior change; UDP direct-path tests are in
   `tests/udp_test.rs` (loopback), relay/secret tests in `tests/secret_test.rs`.

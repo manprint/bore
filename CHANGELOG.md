@@ -65,11 +65,15 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
 
 ### Changed
 - **Direct QUIC throughput tuning**: the UDP direct path now sets explicit
-  high-throughput flow-control windows in `src/holepunch.rs` (16 MiB per stream,
-  64 MiB aggregate receive, 64 MiB send), requests 16 MiB UDP socket send/receive
-  buffers, and uses Quinn's BBR congestion controller instead of relying on Quinn's
-  conservative defaults. The constants are documented in code so future tuning can
-  adjust the BDP/memory trade-off in one place.
+  high-throughput flow-control windows in `src/holepunch.rs`:
+  `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` = 16 MiB,
+  `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` = 64 MiB, and
+  `DIRECT_QUIC_SEND_WINDOW` = 64 MiB. It also requests
+  `DIRECT_UDP_SOCKET_RECV_BUFFER` / `DIRECT_UDP_SOCKET_SEND_BUFFER` = 16 MiB,
+  keeps `MAX_DIRECT_STREAMS` at 4096, and uses Quinn's
+  `quinn::congestion::BbrConfig` instead of relying on Quinn's conservative
+  defaults. The constants are documented in code so future tuning can adjust the
+  BDP/memory trade-off in one place.
 
 ## [1.0.0]
 

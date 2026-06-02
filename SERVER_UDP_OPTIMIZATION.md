@@ -23,6 +23,26 @@ UDP del direct path richiede buffer send/receive da 16 MiB e QUIC usa BBR come
 congestion controller. I sysctl di questa guida servono a rimuovere cap del kernel
 o a migliorare il relay TCP/server, non sono prerequisiti per ogni client.
 
+## Profilo direct UDP applicato nel codice
+
+Questi valori sono in `src/holepunch.rs` e valgono per `bore local --udp`,
+`bore proxy --udp` e `bore test-udp --tcp-secret-id`:
+
+| Parametro | Valore | Effetto |
+|---|---:|---|
+| `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` | 16 MiB | Flow-control per singola stream QUIC. |
+| `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` | 64 MiB | Flow-control aggregato per connessione QUIC. |
+| `DIRECT_QUIC_SEND_WINDOW` | 64 MiB | Byte inviabili senza ACK prima di bloccare il sender. |
+| `DIRECT_UDP_SOCKET_RECV_BUFFER` | 16 MiB | Buffer UDP richiesto al kernel in ricezione. |
+| `DIRECT_UDP_SOCKET_SEND_BUFFER` | 16 MiB | Buffer UDP richiesto al kernel in invio. |
+| `quinn::congestion::BbrConfig` | BBR | Congestion controller QUIC del path diretto. |
+| `MAX_DIRECT_STREAMS` | 4096 | Numero massimo di bidi-stream QUIC concorrenti. |
+| `QUIC_KEEPALIVE` / `QUIC_MAX_IDLE` | 3 s / 10 s | Keep-alive NAT e rilevamento peer morto. |
+
+Con `-v` i log mostrano i buffer UDP effettivi concessi dal kernel (`actual_recv`,
+`actual_send`). Se sono molto inferiori a 16 MiB, alza `rmem_max`/`wmem_max`
+sull'host; bore ha gia richiesto il valore corretto.
+
 ## Docker networking: bridge vs host
 
 Il compose server usa di default una rete bridge con port forwarding esplicito:

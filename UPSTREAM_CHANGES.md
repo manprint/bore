@@ -336,6 +336,17 @@ Each bullet = one or more commits on `perf-hardening`.
     - Tests: `tests/secret_pool_test.rs` (provider pool, consumer pool, both pools);
       `tests/udp_test.rs::udp_direct_many_concurrent_streams`; all existing `udp_test`
       cases still pass over the native-stream path.
+22. **Direct UDP/QUIC throughput profile**: `holepunch::transport_config` and
+    `bind_socket` now apply the same tuning everywhere the direct path is used
+    (`local --udp`, `proxy --udp`, and paired `test-udp`):
+    `DIRECT_QUIC_STREAM_RECEIVE_WINDOW = 16 MiB`,
+    `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW = 64 MiB`,
+    `DIRECT_QUIC_SEND_WINDOW = 64 MiB`,
+    `DIRECT_UDP_SOCKET_RECV_BUFFER = 16 MiB`,
+    `DIRECT_UDP_SOCKET_SEND_BUFFER = 16 MiB`, `MAX_DIRECT_STREAMS = 4096`,
+    `QUIC_KEEPALIVE`/`QUIC_MAX_IDLE = 3s/10s`, and Quinn BBR via
+    `quinn::congestion::BbrConfig`. The OS may clamp socket buffers below the
+    requested 16 MiB; `-v` logs the actual values.
 
 ## CLI flags & env vars (all flags read env where present)
 

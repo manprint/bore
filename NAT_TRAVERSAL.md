@@ -129,8 +129,13 @@ mai un tunnel.
   default Quinn, così un singolo trasferimento non viene limitato troppo presto
   dal flow-control su link high-BDP. Aumentarle consuma più memoria.
 - **Buffer UDP e BBR applicativi:** bore richiede buffer UDP send/receive da 16
-  MiB sul socket usato da QUIC e imposta BBR come congestion controller del direct
-  path. I cap del kernel possono comunque limitare il valore effettivo.
+  MiB sul socket usato da QUIC (`DIRECT_UDP_SOCKET_RECV_BUFFER` /
+  `DIRECT_UDP_SOCKET_SEND_BUFFER`) e imposta `quinn::congestion::BbrConfig` come
+  congestion controller del direct path. Le finestre QUIC sono
+  `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` = 16 MiB,
+  `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` = 64 MiB e `DIRECT_QUIC_SEND_WINDOW` =
+  64 MiB. I cap del kernel possono comunque limitare il valore effettivo dei
+  buffer UDP.
 - **Fallimento di qualsiasi passo → relay.** Mai un tunnel rotto.
 
 ---

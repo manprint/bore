@@ -19,6 +19,17 @@ Validazioni eseguite:
 
 Tutte e tre le validazioni sono passate.
 
+Aggiornamento tuning direct UDP/QUIC: il path diretto non si affida piu ai default
+Quinn/OS per throughput bulk. In [src/holepunch.rs](src/holepunch.rs) sono fissati
+`DIRECT_QUIC_STREAM_RECEIVE_WINDOW` = 16 MiB,
+`DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` = 64 MiB, `DIRECT_QUIC_SEND_WINDOW` =
+64 MiB, `DIRECT_UDP_SOCKET_RECV_BUFFER` = 16 MiB,
+`DIRECT_UDP_SOCKET_SEND_BUFFER` = 16 MiB, `MAX_DIRECT_STREAMS` = 4096,
+`QUIC_KEEPALIVE`/`QUIC_MAX_IDLE` = 3 s / 10 s, e
+`quinn::congestion::BbrConfig` come congestion controller. Questi valori valgono
+per provider, proxy e `test-udp`, perche tutti usano `holepunch::bind_socket()` e
+`transport_config()`.
+
 ## Executive summary
 
 Il repository e ben strutturato e la parte piu importante del design e coerente: esiste un percorso relay sempre disponibile e un percorso diretto UDP opzionale che non rompe mai il servizio, ma si innesta sopra il relay con fallback esplicito. Questo e il punto piu forte del fork.
@@ -92,7 +103,8 @@ Il percorso UDP si appoggia sempre al control channel gia esistente.
 3. Entrambi inviano datagrammi di punch verso i candidati dell'altro peer.
 4. Il consumer apre la connessione QUIC verso il provider.
 5. I peer si autenticano con token HMAC derivato da secret + nonce.
-6. Sopra QUIC gira yamux, quindi il resto della logica rimane invariato.
+6. Ogni connessione proxata gira su una bidi-stream QUIC nativa; il resto della
+	logica sopra lo stream rimane condiviso con il relay.
 
 I riferimenti principali:
 

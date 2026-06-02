@@ -114,11 +114,12 @@ sets the direct QUIC flow-control windows via named constants:
 `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` (16 MiB),
 `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` (64 MiB), and `DIRECT_QUIC_SEND_WINDOW`
 (64 MiB), requests `DIRECT_UDP_SOCKET_RECV_BUFFER`/`DIRECT_UDP_SOCKET_SEND_BUFFER`
-(16 MiB each) on every direct UDP socket, and uses Quinn BBR for the direct path.
-If `test-udp --test-bandwidth` shows bulk-transfer stalls on high-BDP links, tune
-those constants first and balance throughput against memory. So `--udp` and
-`--carriers` are complementary: the former fixes the direct path, the latter the
-relay fallback.
+(16 MiB each) on every direct UDP socket, keeps `MAX_DIRECT_STREAMS` at 4096,
+uses `QUIC_KEEPALIVE`/`QUIC_MAX_IDLE` = 3s/10s, and uses
+`quinn::congestion::BbrConfig` for the direct path. If `test-udp --test-bandwidth`
+shows bulk-transfer stalls on high-BDP links, tune those constants first and
+balance throughput against memory. So `--udp` and `--carriers` are complementary:
+the former fixes the direct path, the latter the relay fallback.
 
 ### Things to preserve when editing
 

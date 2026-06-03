@@ -31,7 +31,9 @@ setup-qemu:
 build-amd64: _builder
     mkdir -p bin
     docker buildx build --builder {{builder}} --platform linux/amd64 \
-        -f Dockerfile --output type=local,dest=bin .
+        -f Dockerfile --output type=local,dest=bin \
+        --build-arg BORE_GIT_BRANCH="$$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)" \
+        --build-arg BORE_GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo unknown)" .
     mv bin/bore bin/bore-amd64
     @echo "built -> bin/bore-amd64"
 
@@ -39,7 +41,9 @@ build-amd64: _builder
 build-arm64: _builder
     mkdir -p bin
     docker buildx build --builder {{builder}} --platform linux/arm64 \
-        -f Dockerfile --output type=local,dest=bin .
+        -f Dockerfile --output type=local,dest=bin \
+        --build-arg BORE_GIT_BRANCH="$$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)" \
+        --build-arg BORE_GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo unknown)" .
     mv bin/bore bin/bore-arm64
     @echo "built -> bin/bore-arm64"
 
@@ -51,6 +55,8 @@ macos-m5: _builder
         --build-arg TARGET=aarch64-apple-darwin \
         --build-arg BIN=bore \
         --build-arg RUSTFLAGS="-C target-cpu={{macos_target_cpu}}" \
+        --build-arg BORE_GIT_BRANCH="$$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)" \
+        --build-arg BORE_GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
         --output type=local,dest=bin .
     mv bin/bore bin/bore-macos-arm64
     @echo "built -> bin/bore-macos-arm64"
@@ -62,6 +68,8 @@ windows-amd64: _builder
         -f docker/Dockerfile.cross \
         --build-arg TARGET=x86_64-pc-windows-gnu \
         --build-arg BIN=bore.exe \
+        --build-arg BORE_GIT_BRANCH="$$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)" \
+        --build-arg BORE_GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
         --output type=local,dest=bin .
     mv bin/bore.exe bin/bore-windows-amd64.exe
     @echo "built -> bin/bore-windows-amd64.exe"
@@ -72,6 +80,8 @@ android-arm64: _builder
     docker buildx build --builder {{builder}} \
         -f docker/Dockerfile.android \
         --build-arg ANDROID_API={{android_api}} \
+        --build-arg BORE_GIT_BRANCH="$$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)" \
+        --build-arg BORE_GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
         --output type=local,dest=bin .
     mv bin/bore bin/bore-android-arm64
     @echo "built -> bin/bore-android-arm64"

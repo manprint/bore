@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `bore` is a minimal TCP tunnel: a client exposes a local port to the public internet through a remote server, bypassing NAT/firewalls. The whole thing is ~400 lines of safe async Rust (`#![forbid(unsafe_code)]`). The crate ships both the library (`bore_cli`) and a single `bore` binary that runs as either client or server.
 
+`bore --version` prints `bore <semver> - <branch> - <sha8>` (e.g. `bore 1.0.0 - main - a1b2c3d4`). The branch and commit SHA are embedded at compile time via `build.rs`, which prefers `BORE_GIT_BRANCH`/`BORE_GIT_SHA` env vars (set by Docker `--build-arg`), then `GITHUB_REF_NAME`/`GITHUB_SHA` (CI), then `git` CLI (local dev). Run `cargo build` to regenerate when HEAD changes.
+
 ## Commands
 
 ```shell

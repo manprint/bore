@@ -11,8 +11,17 @@ use bore_cli::{
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand};
 use tracing::info;
 
+/// Full version string: "bore 1.0.0 - <branch> - <sha8>".
+const FULL_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " - ",
+    env!("GIT_BRANCH"),
+    " - ",
+    env!("GIT_SHA_SHORT"),
+);
+
 #[derive(Parser, Debug)]
-#[clap(name = "bore", author, version, about)]
+#[clap(name = "bore", author, version = FULL_VERSION, about)]
 struct Args {
     /// Increase log verbosity: -v for debug, -vv for trace (RUST_LOG overrides).
     #[clap(short, long, global = true, action = ArgAction::Count)]

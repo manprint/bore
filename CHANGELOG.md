@@ -12,6 +12,13 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
 ## [Unreleased]
 
 ### Added
+- **Git metadata in `--version`**: `bore --version` now prints
+  `bore <version> - <branch> - <sha8>` (e.g. `bore 1.0.0 - main - a1b2c3d4`).
+  Branch and commit SHA are embedded at compile time via `build.rs`. In CI
+  (GitHub Actions, Docker buildx) the values come from `GITHUB_REF_NAME` and
+  `GITHUB_SHA` env vars, so shallow/detached checkouts work correctly. Local
+  `just build-*` targets and the Dockerfiles forward `--build-arg` to set the
+  same metadata when `.git` is absent from the build context.
 - **Paired `bore test-udp` diagnostics** (`--tcp-secret-id <id>`): two machines
   run the same command against a UDP-enabled server, the server pairs them,
   exchanges candidate addresses, tests the direct UDP/QUIC path, verifies the TCP

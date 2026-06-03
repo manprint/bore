@@ -218,7 +218,10 @@ Se BBR non compare, serve un kernel/modulo che lo supporti. Su alcuni VPS basta
 Per server UDP-enabled:
 
 - apri la control port in TCP (`7835/tcp` o `443/tcp` se usi TLS su 443);
-- apri la stessa control port in UDP per STUN (`7835/udp` o la tua control port);
+- apri la stessa control port in UDP per lo STUN self-hosted/fallback (`7835/udp`
+  o la tua control port). I peer provano prima STUN pubblici comuni
+  (`stun.cloudflare.com:3478`, poi Google) e usano quello del server come ultimo
+  fallback;
 - apri il range tunnel TCP (`BORE_MIN_PORT`-`BORE_MAX_PORT`) se usi tunnel
   pubblici;
 - per Docker bridge, i mapping `ports:` devono corrispondere alle env

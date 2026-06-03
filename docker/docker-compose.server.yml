@@ -54,7 +54,7 @@ services:
     # and MUST match BORE_CONTROL_PORT and BORE_MIN_PORT/BORE_MAX_PORT below.
     ports:
       - "7835:7835"            # control port (TCP)
-      - "7835:7835/udp"        # STUN responder (UDP) — required for BORE_UDP direct paths
+      - "7835:7835/udp"        # STUN responder fallback (UDP) for BORE_UDP direct paths
       - "6000-7000:6000-7000"  # tunnel port range
       # Optionally expose the control port on a standard web port. The scheme is
       # decided by the certificate, not the port:
@@ -76,9 +76,10 @@ services:
       # mean more sockets and scheduler work; 1 disables server-side pools.
       - BORE_MAX_CARRIERS=16
       # Broker UDP hole-punched direct paths for secret tunnels and run a STUN
-      # responder on the control port (UDP). The 7835/udp forward above is
-      # required. The direct data path is peer-to-peer and does NOT traverse this
-      # container; only STUN + control do.
+      # responder on the control port (UDP). Clients try public STUN first
+      # (Cloudflare/Google) and use this 7835/udp responder as the self-hosted
+      # fallback. The direct data path is peer-to-peer and does NOT traverse this
+      # container; only STUN/brokering + control do.
       - BORE_UDP=true
       # NAT caveat: behind docker's bridge, the STUN responder must see each
       # client's real source address. If reflexive discovery misbehaves (clients

@@ -84,11 +84,13 @@ mai un tunnel.
    / `ConnectSecret(id)`), con auth opzionale (HMAC challenge/response).
 
 2. **Scoperta STUN.** Ogni peer apre un **socket UDP** (porta effimera, oppure
-   fissa con `--nat-udp-preferred-port`) e invia una **STUN binding request**
-   (RFC 5389) al server (di default sulla porta di controllo UDP) o al
-   `--stun-server` indicato. La risposta contiene l'**indirizzo riflessivo** =
-   l'`IP:porta` pubblico come visto da fuori. Se lo STUN non risponde → niente
-   indirizzo pubblico → di norma solo relay.
+  fissa con `--nat-udp-preferred-port`) e invia una **STUN binding request**
+  (RFC 5389). Senza override prova una chain pensata per firewall reali:
+  Cloudflare `stun.cloudflare.com:3478`, poi Google `19302`, poi lo STUN del
+  server bore sulla porta di controllo UDP. Con `--stun-server` usa solo
+  l'endpoint indicato. La risposta contiene l'**indirizzo riflessivo** =
+  l'`IP:porta` pubblico come visto da fuori. Se nessuno STUN risponde → niente
+  indirizzo pubblico → di norma solo relay.
 
 3. **Raccolta e offerta dei candidati.** Ogni peer compone la lista:
    - **riflessivo** (pubblico, da STUN) — il candidato principale per il traversal;

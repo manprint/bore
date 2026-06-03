@@ -44,7 +44,7 @@ Tre processi:
 Flag rilevanti:
 
 - `--udp` — attiva la modalità diretta (su tutti e tre i processi).
-- `--stun-server host:port` — STUN esterno; default = host di `--to` sulla control port (il server stesso fa da STUN).
+- `--stun-server host:port` — override STUN per il path diretto; senza override i peer provano Cloudflare `3478/udp`, poi Google, poi il server bore sulla control port UDP.
 - `--secret S` — se il server ha `--secret`, provider e consumer devono passare lo stesso. Il token del path diretto è derivato dal secret.
 - `--tcp-secret-id ID` — deve combaciare tra provider e consumer.
 - `--upnp` (su `local` e `proxy`) — prova ad aprire una porta sul **router casalingo** via UPnP-IGD e la aggiunge come candidato. Aiuta router casalinghi strict con IP WAN pubblico; **inutile dietro CGNAT**. Log: `UPnP-IGD port mapping ENABLED`.
@@ -60,10 +60,11 @@ Variabili d'ambiente equivalenti: `BORE_UDP`, `BORE_PREFER_UDP`, `BORE_STUN_SERV
 > errore fuorviante (`connection closed before authentication — wrong --to
 > scheme?`). Nei log del server vedi `TLS handshake failed`.
 >
-> **STUN default.** Per un `--to https://host` (porta 443) lo STUN punta
-> automaticamente alla **control port `7835`/UDP** (lì sta il responder), non alla
-> 443. Quindi basta aprire UDP 7835 in ingresso; `--stun-server` serve solo per
-> deployment non standard.
+> **STUN default.** Il tunnel live prova prima STUN pubblici su porte comuni:
+> `stun.cloudflare.com:3478`, poi Google su `19302`; solo come ultimo fallback usa
+> lo STUN del server bore sulla **control port UDP** (`7835/udp` di default, non
+> `443/udp` quando `--to` è `https://host`). `--stun-server` sostituisce questa
+> chain con un endpoint esplicito.
 
 ---
 
@@ -84,21 +85,25 @@ Frasi chiave da cercare:
 - `no udp-capable provider; consumer will use relay` → il provider non è in modalità udp → relay.
 
 **Provider** (`bore local … --udp`)
-- `registered secret tunnel`
-- `discovered reflexive address` (debug) → STUN ha risposto.
+- `provider UDP candidate discovery configured` → chain STUN e porta UDP locale.
+- `selected STUN server for UDP candidates` → STUN scelto e indirizzo reflexive.
+- `provider offering udp candidates` → candidati inviati al server.
 - `direct udp path ready, accepting connections` → QUIC server su.
 
 **Consumer** (`bore proxy … --udp`)
-- `discovered reflexive address` (debug)
+- `consumer UDP candidate discovery configured` → chain STUN e porta UDP locale.
+- `selected STUN server for UDP candidates` → STUN scelto e indirizzo reflexive.
+- `consumer offering udp candidates` → candidati inviati al server.
 - ✅ `using direct udp path` → **percorso diretto attivo**.
 - ↩️ `udp unavailable, using relay` oppure `udp negotiation failed, using relay` → **fallback al relay** (il tunnel funziona lo stesso).
 
 Il segnale principale "diretto vs relay" è la riga del **consumer**.
 
 > **Su singola macchina usa `127.0.0.1`, non `localhost`.** `localhost` può
-> risolvere prima a IPv6 (`::1`): lo STUN responder del server è su IPv4, quindi
-> la scoperta reflexive fallirebbe e vedresti un fallback inatteso. Con
-> `127.0.0.1` lo STUN di default punta a `127.0.0.1:7835`.
+> risolvere prima a IPv6 (`::1`): il direct path attuale usa socket IPv4. Con
+> `127.0.0.1` il fallback STUN del server resta `127.0.0.1:7835`, utile nei test
+> locali quando passi `--stun-server 127.0.0.1:7835` o quando la chain pubblica
+> non e raggiungibile.
 
 ---
 

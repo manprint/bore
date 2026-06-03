@@ -30,7 +30,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::shared::CONTROL_PORT;
 
@@ -54,7 +54,7 @@ use std::{
 #[cfg(feature = "udp")]
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 #[cfg(feature = "udp")]
-use tracing::{info, trace};
+use tracing::trace;
 
 /// Length of the shared authentication token (HMAC-SHA256 output).
 pub const TOKEN_LEN: usize = 32;
@@ -202,6 +202,160 @@ fn configure_udp_socket_buffers(socket: &socket2::Socket) {
     );
 }
 
+/// Where a STUN target came from. This is used only for logging/diagnostics: the
+/// candidate addresses themselves remain plain `SocketAddr`s on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StunSource {
+    /// User supplied `--stun-server` / `BORE_STUN_SERVER`.
+    Override,
+    /// Built-in public STUN default (Cloudflare/Google).
+    PublicDefault,
+    /// The bore server's own UDP control/STUN endpoint, used last.
+    BoreFallback,
+    /// A single explicitly resolved target used by legacy/internal callers.
+    Single,
+}
+
+impl StunSource {
+    /// Stable lowercase label used in logs and human-readable diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StunSource::Override => "override",
+            StunSource::PublicDefault => "public-default",
+            StunSource::BoreFallback => "bore-fallback",
+            StunSource::Single => "single",
+        }
+    }
+}
+
+/// A resolved STUN endpoint plus the original host:port that produced it.
+#[derive(Debug, Clone)]
+pub struct StunTarget {
+    /// The configured host:port, before DNS resolution.
+    pub requested: String,
+    /// The resolved UDP endpoint used for the binding request.
+    pub addr: SocketAddr,
+    /// Why this target is in the candidate chain.
+    pub source: StunSource,
+}
+
+/// The STUN server that successfully produced this peer's reflexive address.
+#[derive(Debug, Clone)]
+pub struct SelectedStun {
+    /// Configured host:port before DNS resolution.
+    pub requested: String,
+    /// Resolved UDP endpoint that answered the binding request.
+    pub addr: SocketAddr,
+    /// Why this STUN target was part of the chain.
+    pub source: StunSource,
+    /// Public reflexive address reported by the STUN server.
+    pub reflexive: SocketAddr,
+}
+
+/// Candidate gathering result with enough metadata for useful operator logs.
+#[derive(Debug, Clone)]
+pub struct CandidateDiscovery {
+    /// Candidate addresses to send over the bore control channel.
+    pub candidates: Vec<SocketAddr>,
+    /// Local UDP socket address used for discovery and punching.
+    pub local_addr: Option<SocketAddr>,
+    /// STUN server that produced the selected reflexive candidate, if any.
+    pub selected_stun: Option<SelectedStun>,
+    /// Number of resolved STUN targets attempted.
+    pub attempted_stun: usize,
+}
+
+/// Host:port of the bore server's own STUN responder for a control endpoint.
+/// `https://`/`http://` endpoints may front TCP on 443/80, while the STUN
+/// responder still lives on bore's control UDP port.
+pub fn bore_stun_target(host: &str, port: u16) -> String {
+    let stun_port = if port == 443 || port == 80 {
+        CONTROL_PORT
+    } else {
+        port
+    };
+    format!("{host}:{stun_port}")
+}
+
+fn live_stun_target_specs(
+    host: &str,
+    port: u16,
+    override_server: Option<&str>,
+) -> Vec<(String, StunSource)> {
+    if let Some(server) = override_server {
+        return vec![(server.to_string(), StunSource::Override)];
+    }
+
+    let mut targets: Vec<(String, StunSource)> = PUBLIC_STUN
+        .iter()
+        .map(|server| ((*server).to_string(), StunSource::PublicDefault))
+        .collect();
+    let bore = bore_stun_target(host, port);
+    if !targets.iter().any(|(target, _)| target == &bore) {
+        targets.push((bore, StunSource::BoreFallback));
+    }
+    targets
+}
+
+/// The live tunnel STUN chain before DNS resolution. Useful for logs/help/tests.
+pub fn live_stun_target_names(host: &str, port: u16, override_server: Option<&str>) -> Vec<String> {
+    live_stun_target_specs(host, port, override_server)
+        .into_iter()
+        .map(|(target, _)| target)
+        .collect()
+}
+
+async fn resolve_stun_target(target: &str) -> Result<SocketAddr> {
+    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host(target)
+        .await
+        .with_context(|| format!("failed to resolve STUN server {target}"))?
+        .collect();
+    addrs
+        .iter()
+        .copied()
+        .find(|addr| addr.is_ipv4())
+        .or_else(|| addrs.pop())
+        .with_context(|| format!("no addresses for STUN server {target}"))
+}
+
+/// Resolve the live tunnel STUN chain. With an explicit override the chain has a
+/// single element. Without one, public STUN on common ports is tried first and
+/// the bore server's own STUN endpoint is kept as the final fallback.
+pub async fn resolve_live_stun_targets(
+    host: &str,
+    port: u16,
+    override_server: Option<&str>,
+) -> Result<Vec<StunTarget>> {
+    let mut targets = Vec::new();
+    for (requested, source) in live_stun_target_specs(host, port, override_server) {
+        match resolve_stun_target(&requested).await {
+            Ok(addr) => {
+                debug!(
+                    stun_server = %requested,
+                    %addr,
+                    stun_source = source.as_str(),
+                    "resolved STUN server"
+                );
+                targets.push(StunTarget {
+                    requested,
+                    addr,
+                    source,
+                });
+            }
+            Err(err) => warn!(
+                %err,
+                stun_server = %requested,
+                stun_source = source.as_str(),
+                "failed to resolve STUN server; trying next candidate"
+            ),
+        }
+    }
+    if targets.is_empty() {
+        bail!("no STUN servers could be resolved")
+    }
+    Ok(targets)
+}
+
 /// Gather this peer's candidate addresses: the STUN-discovered reflexive address
 /// (for traversal across NATs) plus the primary local address (for same-LAN
 /// peers). Optionally adds a router-mapped candidate (`port_map`, UPnP-IGD) and
@@ -213,44 +367,104 @@ pub async fn gather_candidates(
     port_map: bool,
     port_prediction: bool,
 ) -> Vec<SocketAddr> {
+    let target = StunTarget {
+        requested: stun.to_string(),
+        addr: stun,
+        source: StunSource::Single,
+    };
+    gather_candidates_from_stun_targets(socket, &[target], port_map, port_prediction)
+        .await
+        .candidates
+}
+
+/// Gather this peer's candidate addresses using a fallback chain of STUN
+/// targets. The first STUN server that returns a reflexive address is selected;
+/// later servers are skipped to keep live tunnel setup fast. The local candidate
+/// is still added even if every STUN probe fails, so same-LAN peers can connect
+/// and all other cases fall back to the relay cleanly.
+pub async fn gather_candidates_from_stun_targets(
+    socket: &UdpSocket,
+    stun_targets: &[StunTarget],
+    port_map: bool,
+    port_prediction: bool,
+) -> CandidateDiscovery {
     let mut candidates = Vec::new();
-    let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let local_addr = socket.local_addr().ok();
+    let local_port = local_addr.map(|a| a.port()).unwrap_or(0);
+    let mut selected_stun = None;
 
-    match discover_reflexive(socket, stun).await {
-        Ok(addr) => {
-            debug!(%addr, "discovered reflexive address");
-            candidates.push(addr);
+    info!(
+        udp_local_addr = ?local_addr,
+        requested_stun = stun_targets.len(),
+        "starting UDP candidate discovery"
+    );
 
-            // Symmetric NATs allocate a *different* external port per
-            // destination, so the port toward the peer differs from the one seen
-            // by STUN — often sequentially. When explicitly enabled, advertise a
-            // few ports just past the reflexive one as extra candidates. Strictly
-            // opt-in: advertising/punching extra ports may look like a scan to
-            // strict firewalls.
-            if port_prediction {
-                let base = addr.port();
-                let mut added = 0u16;
-                for delta in 1..=PREDICT_RANGE {
-                    if let Some(port) = base.checked_add(delta) {
-                        candidates.push(SocketAddr::new(addr.ip(), port));
-                        added += 1;
-                    }
-                }
-                warn!(
-                    reflexive_port = base,
-                    predicted = added,
-                    "port prediction ENABLED — advertising predicted symmetric-NAT ports \
-                     (best-effort; may look like a scan to strict firewalls)"
+    for target in stun_targets {
+        debug!(
+            stun_server = %target.requested,
+            stun_addr = %target.addr,
+            stun_source = target.source.as_str(),
+            "probing STUN server for UDP candidates"
+        );
+        match discover_reflexive(socket, target.addr).await {
+            Ok(addr) => {
+                info!(
+                    stun_server = %target.requested,
+                    stun_addr = %target.addr,
+                    stun_source = target.source.as_str(),
+                    reflexive = %addr,
+                    udp_local_addr = ?local_addr,
+                    "selected STUN server for UDP candidates"
                 );
+                candidates.push(addr);
+                selected_stun = Some(SelectedStun {
+                    requested: target.requested.clone(),
+                    addr: target.addr,
+                    source: target.source,
+                    reflexive: addr,
+                });
+
+                // Symmetric NATs allocate a *different* external port per
+                // destination, so the port toward the peer differs from the one seen
+                // by STUN — often sequentially. When explicitly enabled, advertise a
+                // few ports just past the reflexive one as extra candidates. Strictly
+                // opt-in: advertising/punching extra ports may look like a scan to
+                // strict firewalls.
+                if port_prediction {
+                    let base = addr.port();
+                    let mut added = 0u16;
+                    for delta in 1..=PREDICT_RANGE {
+                        if let Some(port) = base.checked_add(delta) {
+                            candidates.push(SocketAddr::new(addr.ip(), port));
+                            added += 1;
+                        }
+                    }
+                    warn!(
+                        reflexive_port = base,
+                        predicted = added,
+                        "port prediction ENABLED — advertising predicted symmetric-NAT ports \
+                         (best-effort; may look like a scan to strict firewalls)"
+                    );
+                }
+                break;
             }
+            Err(err) => warn!(
+                %err,
+                stun_server = %target.requested,
+                stun_addr = %target.addr,
+                stun_source = target.source.as_str(),
+                "STUN reflexive discovery failed; trying next STUN server"
+            ),
         }
-        Err(err) => warn!(
-            %err, %stun,
-            "STUN reflexive discovery FAILED — no public address, offering only a local \
-             candidate; the direct UDP path is unlikely (peer can't route to it). Check UDP \
-             egress to the STUN server, or pass --stun-server with a public STUN (e.g. \
-             stun.l.google.com:19302). Falling back to the relay if the peer can't reach us."
-        ),
+    }
+
+    if selected_stun.is_none() {
+        warn!(
+            attempted = stun_targets.len(),
+            "all STUN probes failed — no public address discovered; offering only non-STUN \
+             candidates. Direct UDP is unlikely across NAT/firewalls and will fall back to \
+             the relay if the peer cannot reach them"
+        );
     }
 
     // Router-mapped candidate via UPnP-IGD, when explicitly enabled.
@@ -276,7 +490,18 @@ pub async fn gather_candidates(
             candidates.push(local);
         }
     }
-    candidates
+    info!(
+        udp_local_addr = ?local_addr,
+        selected_stun = selected_stun.as_ref().map(|s| s.requested.as_str()),
+        candidates = ?candidates,
+        "finished UDP candidate discovery"
+    );
+    CandidateDiscovery {
+        candidates,
+        local_addr,
+        selected_stun,
+        attempted_stun: stun_targets.len(),
+    }
 }
 
 /// Ask the local router (UPnP-IGD) to map an external UDP port to our socket and
@@ -324,20 +549,9 @@ pub async fn resolve_stun(
 ) -> Result<SocketAddr> {
     let target = match override_server {
         Some(server) => server.to_string(),
-        None => {
-            let stun_port = if port == 443 || port == 80 {
-                CONTROL_PORT
-            } else {
-                port
-            };
-            format!("{host}:{stun_port}")
-        }
+        None => bore_stun_target(host, port),
     };
-    let mut addrs = tokio::net::lookup_host(&target)
-        .await
-        .with_context(|| format!("failed to resolve STUN server {target}"))?;
-    let addr = addrs.next();
-    addr.with_context(|| format!("no addresses for STUN server {target}"))
+    resolve_stun_target(&target).await
 }
 
 /// Determine the primary local IPv4 address by inspecting the kernel's chosen
@@ -375,15 +589,15 @@ pub async fn discover_reflexive(socket: &UdpSocket, stun: SocketAddr) -> Result<
     bail!("no STUN response from {stun}")
 }
 
-/// Public STUN servers (distinct providers) probed by [`diagnose`]. Two different
-/// IPs are enough to tell endpoint-independent (cone) from endpoint-dependent
-/// (symmetric) mapping; a third adds confidence and a sequential-port sample.
-/// Public STUN servers (distinct providers) used by `bore test-udp` to classify
-/// local NAT mapping behaviour.
+/// Public STUN servers (distinct providers) used first by live UDP candidate
+/// discovery (unless `--stun-server` overrides it) and probed by `bore test-udp`
+/// to classify local NAT mapping behaviour. Cloudflare uses the standard STUN
+/// port (3478), which commonly passes firewall policy that blocks bore's control
+/// UDP port; Google adds provider diversity and fallback coverage.
 pub const PUBLIC_STUN: &[&str] = &[
+    "stun.cloudflare.com:3478",
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
-    "stun.cloudflare.com:3478",
 ];
 
 /// One STUN server's view of our public (reflexive) mapping, gathered on a single
@@ -792,6 +1006,12 @@ pub async fn connect_direct(
     if peers.is_empty() {
         bail!("no peer candidates to connect to");
     }
+    let local_addr = socket.local_addr().ok();
+    info!(
+        udp_local_addr = ?local_addr,
+        peer_candidates = ?peers,
+        "consumer punching UDP peer candidates"
+    );
     punch(&socket, &peers).await;
     let endpoint = client_endpoint(socket)?;
 
@@ -805,7 +1025,21 @@ pub async fn connect_direct(
         .map(|&peer| {
             let endpoint = endpoint.clone();
             Box::pin(async move {
-                let conn = endpoint.connect(peer, "bore")?.await?;
+                debug!(%peer, "attempting direct QUIC candidate");
+                let connecting = match endpoint.connect(peer, "bore") {
+                    Ok(connecting) => connecting,
+                    Err(err) => {
+                        debug!(%peer, %err, "failed to start direct QUIC candidate");
+                        return Err(err.into());
+                    }
+                };
+                let conn = match connecting.await {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        debug!(%peer, %err, "direct QUIC candidate failed");
+                        return Err(err.into());
+                    }
+                };
                 trace!(%peer, "QUIC connected");
                 // Authenticate the connection once, on a dedicated stream: consumer
                 // writes its token first, then reads the peer's. Data streams opened
@@ -816,6 +1050,7 @@ pub async fn connect_direct(
                 let mut peer_token = [0u8; TOKEN_LEN];
                 recv.read_exact(&mut peer_token).await?;
                 if !tokens_match(&token, &peer_token) {
+                    warn!(%peer, "direct QUIC candidate failed token verification");
                     bail!("direct path token mismatch");
                 }
                 let _ = send.finish();
@@ -844,6 +1079,12 @@ pub struct DirectListener {
 impl DirectListener {
     /// Punch toward `peers` and start a QUIC server endpoint over `socket`.
     pub async fn new(socket: UdpSocket, peers: Vec<SocketAddr>) -> Result<Self> {
+        let local_addr = socket.local_addr().ok();
+        info!(
+            udp_local_addr = ?local_addr,
+            peer_candidates = ?peers,
+            "provider punching UDP peer candidates and starting QUIC listener"
+        );
         punch(&socket, &peers).await;
         let endpoint = server_endpoint(socket)?;
         Ok(DirectListener { endpoint })
@@ -861,6 +1102,7 @@ impl DirectListener {
     /// the consumer is a QUIC client and won't complete it, but the outbound
     /// packets punch the mapping so the consumer's own connection gets through.
     pub fn punch_via_endpoint(&self, peers: &[SocketAddr]) {
+        info!(peer_candidates = ?peers, "provider re-punching UDP peer candidates");
         for &peer in peers {
             if let Ok(connecting) = self.endpoint.connect(peer, "bore") {
                 tokio::spawn(async move {
@@ -1256,6 +1498,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(over, "127.0.0.1:1234".parse().unwrap());
+    }
+
+    #[test]
+    fn live_stun_chain_prefers_public_servers_then_bore_fallback() {
+        let chain = live_stun_target_names("bore.example.com", 443, None);
+        assert_eq!(
+            chain,
+            vec![
+                "stun.cloudflare.com:3478".to_string(),
+                "stun.l.google.com:19302".to_string(),
+                "stun1.l.google.com:19302".to_string(),
+                format!("bore.example.com:{CONTROL_PORT}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn live_stun_chain_override_is_absolute() {
+        assert_eq!(
+            live_stun_target_names("bore.example.com", 443, Some("stun.example.net:3478")),
+            vec!["stun.example.net:3478".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_discovery_tries_next_stun_after_failed_probe() {
+        let bad = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bad_addr = bad.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for _ in 0..3 {
+                if let Ok((_, from)) = bad.recv_from(&mut buf).await {
+                    let _ = bad.send_to(b"not a stun response", from).await;
+                }
+            }
+        });
+
+        let good = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = good.local_addr().unwrap();
+        tokio::spawn(run_stun_responder(good));
+
+        let socket = bind_socket(0).await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let targets = [
+            StunTarget {
+                requested: "bad-stun".to_string(),
+                addr: bad_addr,
+                source: StunSource::PublicDefault,
+            },
+            StunTarget {
+                requested: "good-stun".to_string(),
+                addr: good_addr,
+                source: StunSource::BoreFallback,
+            },
+        ];
+
+        let discovery = gather_candidates_from_stun_targets(&socket, &targets, false, false).await;
+        let selected = discovery
+            .selected_stun
+            .expect("second STUN target should be selected");
+        let reflexive: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        assert_eq!(selected.requested, "good-stun");
+        assert_eq!(selected.addr, good_addr);
+        assert_eq!(selected.source, StunSource::BoreFallback);
+        assert_eq!(selected.reflexive, reflexive);
+        assert_eq!(discovery.attempted_stun, 2);
+        assert!(discovery.candidates.contains(&reflexive));
     }
 
     #[tokio::test]

@@ -76,8 +76,9 @@ enum Command {
         #[clap(long, env = "BORE_PREFER_UDP")]
         udp: bool,
 
-        /// STUN server (host:port) for UDP candidate discovery; defaults to the
-        /// bore server's control endpoint.
+        /// STUN server (host:port) for UDP candidate discovery. Overrides the
+        /// default chain (Cloudflare, Google, then the bore server's UDP control
+        /// endpoint).
         #[clap(long, value_name = "HOST:PORT", env = "BORE_STUN_SERVER")]
         stun_server: Option<String>,
 
@@ -171,8 +172,9 @@ enum Command {
         #[clap(long, env = "BORE_PREFER_UDP")]
         udp: bool,
 
-        /// STUN server (host:port) for UDP candidate discovery; defaults to the
-        /// bore server's control endpoint.
+        /// STUN server (host:port) for UDP candidate discovery. Overrides the
+        /// default chain (Cloudflare, Google, then the bore server's UDP control
+        /// endpoint).
         #[clap(long, value_name = "HOST:PORT", env = "BORE_STUN_SERVER")]
         stun_server: Option<String>,
 
@@ -324,7 +326,9 @@ enum Command {
         #[clap(long, env = "BORE_INSECURE")]
         insecure: bool,
 
-        /// Extra STUN server (host:port) to probe alongside the public ones.
+        /// STUN server (host:port). In standalone diagnostics it is probed in
+        /// addition to the public list; in paired mode it overrides the live
+        /// tunnel STUN chain for candidate discovery.
         #[clap(long, value_name = "HOST:PORT", env = "BORE_STUN_SERVER")]
         stun_server: Option<String>,
 

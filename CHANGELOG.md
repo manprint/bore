@@ -64,6 +64,13 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
   the control port's bore-protocol behaviour byte-for-byte unchanged.
 
 ### Changed
+- **Live UDP STUN discovery now defaults to public STUN first.** Secret-tunnel
+  provider/consumer direct paths and paired `test-udp` candidate gathering try
+  `stun.cloudflare.com:3478` first, then Google STUN, then the bore server's own
+  UDP control-port STUN responder as the final fallback. `--stun-server` remains
+  an absolute override. Logs now show the STUN chain, selected STUN server,
+  local UDP socket, reflexive address, offered candidates, peer candidates, and
+  direct QUIC candidate attempts to make firewall/NAT debugging easier.
 - **Direct QUIC throughput tuning**: the UDP direct path now sets explicit
   high-throughput flow-control windows in `src/holepunch.rs`:
   `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` = 16 MiB,

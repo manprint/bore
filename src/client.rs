@@ -433,6 +433,11 @@ impl Client {
                         Some(ServerMessage::UdpPunch { nonce, peer }) => {
                             #[cfg(feature = "udp")]
                             {
+                                info!(
+                                    role = "provider",
+                                    peer_candidates = ?peer,
+                                    "provider received udp punch request"
+                                );
                                 if let Some(tx) = &punch_tx {
                                     // Direct path already up: re-punch toward the
                                     // new/reconnecting consumer (the nonce is stable).
@@ -701,13 +706,59 @@ async fn offer_provider_candidates(
     udp_port: u16,
 ) -> Result<UdpSocket> {
     use crate::holepunch;
-    let stun = holepunch::resolve_stun(&endpoint.host, endpoint.port, stun_server).await?;
     let socket = holepunch::bind_socket(udp_port).await?;
-    let candidates = holepunch::gather_candidates(&socket, stun, port_map, port_prediction).await;
+    let local_addr = socket.local_addr().ok();
+    let stun_chain = holepunch::live_stun_target_names(&endpoint.host, endpoint.port, stun_server);
+    info!(
+        role = "provider",
+        udp_local_addr = ?local_addr,
+        requested_udp_port = udp_port,
+        stun_override = stun_server.is_some(),
+        stun_chain = ?stun_chain,
+        "provider UDP candidate discovery configured"
+    );
+    let stun_targets = match holepunch::resolve_live_stun_targets(
+        &endpoint.host,
+        endpoint.port,
+        stun_server,
+    )
+    .await
+    {
+        Ok(targets) => targets,
+        Err(err) => {
+            warn!(%err, "no STUN targets resolved for provider; offering non-STUN candidates only");
+            Vec::new()
+        }
+    };
+    let discovery = holepunch::gather_candidates_from_stun_targets(
+        &socket,
+        &stun_targets,
+        port_map,
+        port_prediction,
+    )
+    .await;
+    let selected_stun = discovery.selected_stun.as_ref();
+    let selected_stun_name = selected_stun.map(|s| s.requested.as_str());
+    let selected_stun_addr = selected_stun.map(|s| s.addr);
+    let stun_source = selected_stun.map(|s| s.source.as_str());
+    let reflexive = selected_stun.map(|s| s.reflexive);
+    let discovery_local_addr = discovery.local_addr;
+    let attempted_stun = discovery.attempted_stun;
+    let candidates = discovery.candidates;
     if candidates.is_empty() {
         bail!("no local UDP candidates discovered");
     }
-    info!(?candidates, %stun, "provider offering udp candidates (a public IP here means STUN worked)");
+    info!(
+        role = "provider",
+        udp_local_addr = ?discovery_local_addr,
+        selected_stun = selected_stun_name,
+        selected_stun_addr = ?selected_stun_addr,
+        stun_source,
+        reflexive = ?reflexive,
+        attempted_stun,
+        ?candidates,
+        "provider offering udp candidates"
+    );
     control
         .send(ClientMessage::UdpCandidates(candidates))
         .await?;

@@ -241,8 +241,40 @@ pub async fn run_peer_test(
     let socket = holepunch::bind_socket(preferred_port).await?;
     let mut local =
         inspect_local_nat(&socket, Some((&endpoint.host, endpoint.port)), stun_server).await;
-    let stun = holepunch::resolve_stun(&endpoint.host, endpoint.port, stun_server).await?;
-    let candidates = holepunch::gather_candidates(&socket, stun, port_map, port_prediction).await;
+    let stun_chain = holepunch::live_stun_target_names(&endpoint.host, endpoint.port, stun_server);
+    println!();
+    println!("Live tunnel STUN chain : {}", stun_chain.join(", "));
+    let stun_targets = match holepunch::resolve_live_stun_targets(
+        &endpoint.host,
+        endpoint.port,
+        stun_server,
+    )
+    .await
+    {
+        Ok(targets) => targets,
+        Err(err) => {
+            println!("Live tunnel STUN resolve: FAILED ({err}); using non-STUN candidates only");
+            Vec::new()
+        }
+    };
+    let discovery = holepunch::gather_candidates_from_stun_targets(
+        &socket,
+        &stun_targets,
+        port_map,
+        port_prediction,
+    )
+    .await;
+    match &discovery.selected_stun {
+        Some(stun) => println!(
+            "Live tunnel STUN used  : {} ({}, {}) -> {}",
+            stun.requested,
+            stun.addr,
+            stun.source.as_str(),
+            stun.reflexive
+        ),
+        None => println!("Live tunnel STUN used  : <none>"),
+    }
+    let candidates = discovery.candidates;
     local.summary.candidate_count = candidates.len();
     print_local_nat_report(&local, &candidates);
 

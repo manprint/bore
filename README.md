@@ -417,12 +417,12 @@ Notes:
 
 - **Requires the `udp` feature**, which is **on by default**. Build
   `--no-default-features` to drop it (and the `quinn` dependency).
-- **Reflexive discovery (STUN).** Each peer learns its public address from the
-  server's built-in STUN responder, bound on the control port over **UDP** — so
-  open **UDP** on the control port too (e.g. `7835/udp`), not just TCP. For an
-  `https://`/`http://` server address the STUN target defaults to the control
-  port `7835`, not `443`/`80`; override with `--stun-server host:port` (any
-  standard STUN server works).
+- **Reflexive discovery (STUN).** Each peer learns its public address from a STUN
+  chain: Cloudflare on the standard `3478/udp` first, then Google, then the
+  server's built-in STUN responder on the control port over **UDP** as the final
+  fallback. Open **UDP** on the control port too (e.g. `7835/udp`) if you want
+  that self-hosted fallback; override the whole chain with `--stun-server
+  host:port`.
 - **Authentication.** The direct path is authenticated by a token derived from
   `--secret` and a server-issued nonce, verified before any data flows.
 - **Scope & limits.** Only secret tunnels are hole-punchable (not public-port

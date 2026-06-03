@@ -137,7 +137,7 @@ systemd): chiudono in modo ordinato con una riga di log, senza troncare i trasfe
 | `--https` | `BORE_HTTPS` | Termina TLS sulla porta del tunnel (server con cert). |
 | `--force-https` | `BORE_FORCE_HTTPS` | Reindirizza HTTP→HTTPS sul tunnel (richiede `--https`). |
 | `--udp` | `BORE_PREFER_UDP` | Preferisci il path diretto UDP (solo tunnel segreti). |
-| `--stun-server <HOST:PORT>` | `BORE_STUN_SERVER` | STUN per il path diretto (default: il server bore). |
+| `--stun-server <HOST:PORT>` | `BORE_STUN_SERVER` | Override STUN per il path diretto (default: Cloudflare, Google, poi server bore). |
 | `--upnp` | `BORE_UPNP` | Mappa una porta sul router via UPnP-IGD. |
 | `--try-port-prediction` | `BORE_TRY_PORT_PREDICTION` | Annuncia porte predette per NAT simmetrici. |
 | `--nat-udp-preferred-port <PORT>` | `BORE_NAT_UDP_PORT` | Porta UDP fissa per il punch (0 = casuale). |
@@ -157,7 +157,7 @@ systemd): chiudono in modo ordinato con una riga di log, senza troncare i trasfe
 | `--tcp-secret-id <ID>` | `BORE_TCP_SECRET_ID` | Id del tunnel segreto (deve combaciare col provider). |
 | `--insecure` | `BORE_INSECURE` | Accetta certificati self-signed. |
 | `--udp` | `BORE_PREFER_UDP` | Preferisci il path diretto UDP. |
-| `--stun-server <HOST:PORT>` | `BORE_STUN_SERVER` | STUN per il path diretto. |
+| `--stun-server <HOST:PORT>` | `BORE_STUN_SERVER` | Override STUN per il path diretto (default: Cloudflare, Google, poi server bore). |
 | `--upnp` | `BORE_UPNP` | Mappa una porta sul router via UPnP-IGD. |
 | `--try-port-prediction` | `BORE_TRY_PORT_PREDICTION` | Porte predette per NAT simmetrici. |
 | `--nat-udp-preferred-port <PORT>` | `BORE_NAT_UDP_PORT` | Porta UDP fissa per il punch. |
@@ -173,7 +173,7 @@ systemd): chiudono in modo ordinato con una riga di log, senza troncare i trasfe
 | `-s, --secret <SECRET>` | `BORE_SECRET` | Secret del server e token del path diretto nella modalità a due peer. |
 | `--tcp-secret-id <ID>` | `BORE_TCP_SECRET_ID` | Abbina due istanze `test-udp` con lo stesso id e coordina il test A<->B. |
 | `--insecure` | `BORE_INSECURE` | Accetta certificati self-signed per `https://`. |
-| `--stun-server <HOST:PORT>` | `BORE_STUN_SERVER` | STUN extra da sondare. |
+| `--stun-server <HOST:PORT>` | `BORE_STUN_SERVER` | STUN extra in diagnostica standalone; override della chain live in modalità paired. |
 | `--upnp` | `BORE_UPNP` | Aggiunge un candidato UPnP-IGD nella modalità a due peer. |
 | `--try-port-prediction` | `BORE_TRY_PORT_PREDICTION` | Aggiunge porte predette per NAT simmetrici nella modalità a due peer. |
 | `--nat-udp-preferred-port <PORT>` | `BORE_NAT_UDP_PORT` | Testa esattamente quella porta UDP. |
@@ -459,8 +459,11 @@ Serve `--udp` su **tutti e tre**: server, provider (`bore local`) e proxy (`bore
 bore server --secret hunter2 --udp
 ```
 
-Apri **anche** la control port in **UDP** (`7835/udp`): ci gira il responder STUN.
-Con Docker, aggiungi il forward `7835:7835/udp`.
+Apri **anche** la control port in **UDP** (`7835/udp`) se vuoi usare il responder
+STUN self-hosted come fallback finale. Di default i peer provano prima STUN
+pubblici comuni (`stun.cloudflare.com:3478`, poi Google), poi il server bore. Con
+Docker, aggiungi il forward `7835:7835/udp` per mantenere disponibile il fallback
+del server.
 
 #### Avvio dei client (`bore local`) — provider
 
@@ -471,8 +474,8 @@ bore local 8080 --to bore.tld --tcp-secret-id my-web --secret hunter2 --udp
 Opzioni utili per NAT difficili (vedi [`NAT_TRAVERSAL.md`](NAT_TRAVERSAL.md)):
 
 ```shell
-# STUN esplicito (se il server non funge anche da STUN):
-bore local 8080 --to bore.tld --tcp-secret-id my-web --udp --stun-server stun.l.google.com:19302
+# STUN esplicito (override della chain Cloudflare -> Google -> server):
+bore local 8080 --to bore.tld --tcp-secret-id my-web --udp --stun-server stun.cloudflare.com:3478
 
 # Porta UDP fissa (apri quella in uscita sul firewall; stesso valore sui due peer):
 bore local 8080 --to bore.tld --tcp-secret-id my-web --udp --nat-udp-preferred-port 41641

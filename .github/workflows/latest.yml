@@ -72,22 +72,31 @@ jobs:
       
       - name: Deploy to binaries branch
         run: |
-          # Fetch the binaries branch (create if doesn't exist)
-          git fetch origin binaries || git checkout --orphan binaries
-          
-          # Switch to binaries branch
-          git checkout binaries
-          
+          # Check if binaries branch exists locally or remotely
+          if git show-ref --verify --quiet refs/heads/binaries; then
+            # Branch exists locally, check it out
+            git checkout binaries
+          elif git show-ref --verify --quiet refs/remotes/origin/binaries; then
+            # Branch exists remotely but not locally, fetch and check it out
+            git fetch origin binaries:binaries
+            git checkout binaries
+          else
+            # Branch doesn't exist anywhere, create a new orphan branch
+            git checkout --orphan binaries
+            # Commit an empty initial commit so we can rm files later
+            git commit --allow-empty -m "Initial empty commit"
+          fi
+
           # Remove any existing files (clean slate approach)
           git rm -rf . || true
-          
+
           # Copy new binaries
           cp -r binaries/* .
-          
+
           # Add and commit
           git add .
           git commit -m "Update binaries from ${{ github.sha }} (${{ github.ref_name }})" || echo "No changes to commit"
-          
+
           # Force push to overwrite previous binaries
           git push origin binaries --force
 
@@ -145,22 +154,31 @@ jobs:
       
       - name: Deploy to binaries branch
         run: |
-          # Fetch the binaries branch (create if doesn't exist)
-          git fetch origin binaries || git checkout --orphan binaries
-          
-          # Switch to binaries branch
-          git checkout binaries
-          
+          # Check if binaries branch exists locally or remotely
+          if git show-ref --verify --quiet refs/heads/binaries; then
+            # Branch exists locally, check it out
+            git checkout binaries
+          elif git show-ref --verify --quiet refs/remotes/origin/binaries; then
+            # Branch exists remotely but not locally, fetch and check it out
+            git fetch origin binaries:binaries
+            git checkout binaries
+          else
+            # Branch doesn't exist anywhere, create a new orphan branch
+            git checkout --orphan binaries
+            # Commit an empty initial commit so we can rm files later
+            git commit --allow-empty -m "Initial empty commit"
+          fi
+
           # Remove any existing files (clean slate approach)
           git rm -rf . || true
-          
+
           # Copy new binaries
           cp -r binaries/* .
-          
+
           # Add and commit
           git add .
           git commit -m "Update binaries from ${{ github.sha }} (${{ github.ref_name }})" || echo "No changes to commit"
-          
+
           # Force push to overwrite previous binaries
           git push origin binaries --force
 
@@ -208,22 +226,31 @@ jobs:
       
       - name: Deploy to binaries branch
         run: |
-          # Fetch the binaries branch (create if doesn't exist)
-          git fetch origin binaries || git checkout --orphan binaries
-          
-          # Switch to binaries branch
-          git checkout binaries
-          
+          # Check if binaries branch exists locally or remotely
+          if git show-ref --verify --quiet refs/heads/binaries; then
+            # Branch exists locally, check it out
+            git checkout binaries
+          elif git show-ref --verify --quiet refs/remotes/origin/binaries; then
+            # Branch exists remotely but not locally, fetch and check it out
+            git fetch origin binaries:binaries
+            git checkout binaries
+          else
+            # Branch doesn't exist anywhere, create a new orphan branch
+            git checkout --orphan binaries
+            # Commit an empty initial commit so we can rm files later
+            git commit --allow-empty -m "Initial empty commit"
+          fi
+
           # Remove any existing files (clean slate approach)
           git rm -rf . || true
-          
+
           # Copy new binaries
           cp -r binaries/* .
-          
+
           # Add and commit
           git add .
           git commit -m "Update binaries from ${{ github.sha }} (${{ github.ref_name }})" || echo "No changes to commit"
-          
+
           # Force push to overwrite previous binaries
           git push origin binaries --force
 
@@ -261,21 +288,30 @@ jobs:
       
       - name: Deploy to binaries branch
         run: |
-          # Fetch the binaries branch (create if doesn't exist)
-          git fetch origin binaries || git checkout --orphan binaries
-          
-          # Switch to binaries branch
-          git checkout binaries
-          
+          # Check if binaries branch exists locally or remotely
+          if git show-ref --verify --quiet refs/heads/binaries; then
+            # Branch exists locally, check it out
+            git checkout binaries
+          elif git show-ref --verify --quiet refs/remotes/origin/binaries; then
+            # Branch exists remotely but not locally, fetch and check it out
+            git fetch origin binaries:binaries
+            git checkout binaries
+          else
+            # Branch doesn't exist anywhere, create a new orphan branch
+            git checkout --orphan binaries
+            # Commit an empty initial commit so we can rm files later
+            git commit --allow-empty -m "Initial empty commit"
+          fi
+
           # Remove any existing files (clean slate approach)
           git rm -rf . || true
-          
+
           # Copy new binaries
           cp -r binaries/* .
-          
+
           # Add and commit
           git add .
           git commit -m "Update binaries from ${{ github.sha }} (${{ github.ref_name }})" || echo "No changes to commit"
-          
+
           # Force push to overwrite previous binaries
           git push origin binaries --force

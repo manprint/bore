@@ -465,6 +465,12 @@ pubblici comuni (`stun.cloudflare.com:3478`, poi Google), poi il server bore. Co
 Docker, aggiungi il forward `7835:7835/udp` per mantenere disponibile il fallback
 del server.
 
+Nei tunnel secret il provider comunica al server quale STUN ha davvero selezionato
+per il proprio candidato riflessivo. Quando un `bore proxy --udp` si collega,
+chiede questo hint al server e lo prova come primo STUN, poi continua con la chain
+standard se fallisce. `--stun-server` resta un override esplicito e sostituisce la
+chain automatica.
+
 #### Avvio dei client (`bore local`) — provider
 
 ```shell

@@ -387,7 +387,9 @@ impl Server {
                 warn!("unexpected authenticate");
                 Ok(())
             }
-            Some(ClientMessage::UdpCandidates(_)) => {
+            Some(ClientMessage::UdpCandidates(_))
+            | Some(ClientMessage::UdpCandidateOffer(_))
+            | Some(ClientMessage::UdpStunHintRequest) => {
                 warn!("unexpected udp candidates as first message");
                 Ok(())
             }

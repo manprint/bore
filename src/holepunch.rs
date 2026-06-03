@@ -212,6 +212,8 @@ pub enum StunSource {
     PublicDefault,
     /// The bore server's own UDP control/STUN endpoint, used last.
     BoreFallback,
+    /// STUN server selected by the peer and advertised by the rendezvous server.
+    PeerHint,
     /// A single explicitly resolved target used by legacy/internal callers.
     Single,
 }
@@ -223,6 +225,7 @@ impl StunSource {
             StunSource::Override => "override",
             StunSource::PublicDefault => "public-default",
             StunSource::BoreFallback => "bore-fallback",
+            StunSource::PeerHint => "peer-hint",
             StunSource::Single => "single",
         }
     }
@@ -282,24 +285,65 @@ fn live_stun_target_specs(
     port: u16,
     override_server: Option<&str>,
 ) -> Vec<(String, StunSource)> {
+    live_stun_target_specs_with_hint(host, port, override_server, None)
+}
+
+fn push_unique_stun_target(
+    targets: &mut Vec<(String, StunSource)>,
+    target: String,
+    source: StunSource,
+) {
+    if !targets.iter().any(|(existing, _)| existing == &target) {
+        targets.push((target, source));
+    }
+}
+
+fn live_stun_target_specs_with_hint(
+    host: &str,
+    port: u16,
+    override_server: Option<&str>,
+    peer_hint: Option<&str>,
+) -> Vec<(String, StunSource)> {
     if let Some(server) = override_server {
         return vec![(server.to_string(), StunSource::Override)];
     }
 
-    let mut targets: Vec<(String, StunSource)> = PUBLIC_STUN
-        .iter()
-        .map(|server| ((*server).to_string(), StunSource::PublicDefault))
-        .collect();
-    let bore = bore_stun_target(host, port);
-    if !targets.iter().any(|(target, _)| target == &bore) {
-        targets.push((bore, StunSource::BoreFallback));
+    let mut targets = Vec::new();
+    if let Some(peer_hint) = peer_hint.filter(|hint| !hint.is_empty()) {
+        push_unique_stun_target(&mut targets, peer_hint.to_string(), StunSource::PeerHint);
     }
+    for server in PUBLIC_STUN {
+        push_unique_stun_target(
+            &mut targets,
+            (*server).to_string(),
+            StunSource::PublicDefault,
+        );
+    }
+    push_unique_stun_target(
+        &mut targets,
+        bore_stun_target(host, port),
+        StunSource::BoreFallback,
+    );
     targets
 }
 
 /// The live tunnel STUN chain before DNS resolution. Useful for logs/help/tests.
 pub fn live_stun_target_names(host: &str, port: u16, override_server: Option<&str>) -> Vec<String> {
     live_stun_target_specs(host, port, override_server)
+        .into_iter()
+        .map(|(target, _)| target)
+        .collect()
+}
+
+/// The live STUN chain with an optional peer-selected STUN server tried first.
+/// An explicit local override still wins and disables both defaults and hints.
+pub fn live_stun_target_names_with_hint(
+    host: &str,
+    port: u16,
+    override_server: Option<&str>,
+    peer_hint: Option<&str>,
+) -> Vec<String> {
+    live_stun_target_specs_with_hint(host, port, override_server, peer_hint)
         .into_iter()
         .map(|(target, _)| target)
         .collect()
@@ -326,8 +370,22 @@ pub async fn resolve_live_stun_targets(
     port: u16,
     override_server: Option<&str>,
 ) -> Result<Vec<StunTarget>> {
+    resolve_live_stun_targets_with_hint(host, port, override_server, None).await
+}
+
+/// Resolve the live tunnel STUN chain, optionally trying the peer-selected STUN
+/// first. If the hinted STUN is unreachable, candidate gathering continues with
+/// the remaining public/default and bore-server fallback targets.
+pub async fn resolve_live_stun_targets_with_hint(
+    host: &str,
+    port: u16,
+    override_server: Option<&str>,
+    peer_hint: Option<&str>,
+) -> Result<Vec<StunTarget>> {
     let mut targets = Vec::new();
-    for (requested, source) in live_stun_target_specs(host, port, override_server) {
+    for (requested, source) in
+        live_stun_target_specs_with_hint(host, port, override_server, peer_hint)
+    {
         match resolve_stun_target(&requested).await {
             Ok(addr) => {
                 debug!(
@@ -1522,6 +1580,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn live_stun_chain_uses_peer_hint_first_and_deduplicates() {
+        let chain = live_stun_target_names_with_hint(
+            "bore.example.com",
+            443,
+            None,
+            Some("stun.l.google.com:19302"),
+        );
+        assert_eq!(
+            chain,
+            vec![
+                "stun.l.google.com:19302".to_string(),
+                "stun.cloudflare.com:3478".to_string(),
+                "stun1.l.google.com:19302".to_string(),
+                format!("bore.example.com:{CONTROL_PORT}"),
+            ]
+        );
+
+        let specs = live_stun_target_specs_with_hint(
+            "bore.example.com",
+            443,
+            None,
+            Some("stun.l.google.com:19302"),
+        );
+        assert_eq!(specs[0].1, StunSource::PeerHint);
+    }
+
+    #[test]
+    fn live_stun_chain_override_ignores_peer_hint() {
+        assert_eq!(
+            live_stun_target_names_with_hint(
+                "bore.example.com",
+                443,
+                Some("stun.operator.example:3478"),
+                Some("stun.l.google.com:19302"),
+            ),
+            vec!["stun.operator.example:3478".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn candidate_discovery_tries_next_stun_after_failed_probe() {
         let bad = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1566,6 +1664,45 @@ mod tests {
         assert_eq!(selected.reflexive, reflexive);
         assert_eq!(discovery.attempted_stun, 2);
         assert!(discovery.candidates.contains(&reflexive));
+    }
+
+    #[tokio::test]
+    async fn candidate_discovery_falls_back_after_failed_peer_hint() {
+        let bad = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bad_addr = bad.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            if let Ok((_, from)) = bad.recv_from(&mut buf).await {
+                let _ = bad.send_to(b"not a stun response", from).await;
+            }
+        });
+
+        let good = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = good.local_addr().unwrap();
+        tokio::spawn(run_stun_responder(good));
+
+        let socket = bind_socket(0).await.unwrap();
+        let targets = [
+            StunTarget {
+                requested: "provider-hinted-stun".to_string(),
+                addr: bad_addr,
+                source: StunSource::PeerHint,
+            },
+            StunTarget {
+                requested: "fallback-stun".to_string(),
+                addr: good_addr,
+                source: StunSource::PublicDefault,
+            },
+        ];
+
+        let discovery = gather_candidates_from_stun_targets(&socket, &targets, false, false).await;
+        let selected = discovery
+            .selected_stun
+            .expect("fallback STUN target should be selected");
+
+        assert_eq!(selected.requested, "fallback-stun");
+        assert_eq!(selected.source, StunSource::PublicDefault);
+        assert_eq!(discovery.attempted_stun, 2);
     }
 
     #[tokio::test]

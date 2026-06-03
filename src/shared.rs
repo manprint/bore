@@ -131,6 +131,19 @@ pub struct UdpTestPeerSummary {
     pub port_preserved: Option<bool>,
 }
 
+/// UDP candidate offer with optional metadata about the STUN server that
+/// produced the primary reflexive candidate. The metadata is advisory: the wire
+/// path still brokers plain candidate addresses, and peers fall back to the
+/// normal STUN chain if the hinted server is unreachable from their network.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpCandidateOffer {
+    /// Candidate addresses this peer can be punched at.
+    pub candidates: Vec<SocketAddr>,
+    /// STUN host:port selected by this peer, if a STUN probe succeeded.
+    #[serde(default)]
+    pub selected_stun: Option<String>,
+}
+
 /// A message from the client on the control substream.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -172,8 +185,19 @@ pub enum ClientMessage {
 
     /// Offer this peer's UDP hole-punch candidate addresses to the server, which
     /// brokers them to the other peer of the same secret tunnel. Sent only when
-    /// both ends opt into the `udp` direct-path mode.
+    /// both ends opt into the `udp` direct-path mode. Legacy format without STUN
+    /// metadata; new clients should prefer [`ClientMessage::UdpCandidateOffer`].
     UdpCandidates(Vec<SocketAddr>),
+
+    /// Offer UDP candidates plus the selected STUN server metadata. The server
+    /// stores the provider's selected STUN and returns it to consumers as a
+    /// first-choice hint before they gather their own candidates.
+    UdpCandidateOffer(UdpCandidateOffer),
+
+    /// Ask the server which STUN server the registered provider selected, if the
+    /// provider is already UDP-capable. Consumers send this before gathering
+    /// candidates so the provider's STUN can be tried first.
+    UdpStunHintRequest,
 
     /// First message on an extra connection that joins a public tunnel's carrier
     /// pool. `token` is the per-tunnel value issued in [`ServerMessage::CarrierToken`];
@@ -241,6 +265,18 @@ pub enum ServerMessage {
         nonce: [u8; UDP_NONCE_LEN],
         /// The other peer's candidate addresses to send hole-punch packets to.
         peer: Vec<SocketAddr>,
+        /// STUN server selected by the other peer, when known. Log-only metadata
+        /// used to confirm whether both sides aligned on the same STUN server.
+        #[serde(default)]
+        peer_selected_stun: Option<String>,
+    },
+
+    /// Provider-selected STUN server hint returned to a consumer before it
+    /// gathers candidates. `None` means no UDP-capable provider or no successful
+    /// provider STUN probe is known yet; the consumer should use its normal chain.
+    UdpStunHint {
+        /// STUN host:port selected by the provider, if available.
+        stun_server: Option<String>,
     },
 
     /// The direct UDP path is unavailable (the other peer did not opt in, or no
@@ -329,5 +365,25 @@ mod tests {
             SockRef::from(&stream).keepalive().unwrap(),
             "SO_KEEPALIVE must be set"
         );
+    }
+
+    #[test]
+    fn udp_punch_defaults_missing_peer_selected_stun() {
+        let msg: ServerMessage = serde_json::from_str(
+            r#"{"UdpPunch":{"nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"peer":["127.0.0.1:3478"]}}"#,
+        )
+        .unwrap();
+        match msg {
+            ServerMessage::UdpPunch {
+                nonce,
+                peer,
+                peer_selected_stun,
+            } => {
+                assert_eq!(nonce, [0; UDP_NONCE_LEN]);
+                assert_eq!(peer, vec!["127.0.0.1:3478".parse().unwrap()]);
+                assert_eq!(peer_selected_stun, None);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 }

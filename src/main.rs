@@ -173,8 +173,8 @@ enum Command {
         udp: bool,
 
         /// STUN server (host:port) for UDP candidate discovery. Overrides the
-        /// default chain (Cloudflare, Google, then the bore server's UDP control
-        /// endpoint).
+        /// provider-selected STUN hint and the default chain (Cloudflare, Google,
+        /// then the bore server's UDP control endpoint).
         #[clap(long, value_name = "HOST:PORT", env = "BORE_STUN_SERVER")]
         stun_server: Option<String>,
 

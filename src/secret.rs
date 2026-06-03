@@ -29,12 +29,13 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::debug;
 use tracing::{error, info, info_span, trace, warn, Instrument};
 
-use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Role};
+use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Registration, Role};
 use crate::auth::Authenticator;
 use crate::mux;
 use crate::pool::{self, Carrier, CarrierPool, PendingCarriers, TokenGuard};
 use crate::shared::{
-    tune_tcp, ClientMessage, Delimited, ServerMessage, PROXY_BUFFER_SIZE, UDP_NONCE_LEN,
+    tune_tcp, ClientMessage, Delimited, ServerMessage, UdpCandidateOffer, PROXY_BUFFER_SIZE,
+    UDP_NONCE_LEN,
 };
 use crate::transport::{self, Endpoint};
 use uuid::Uuid;
@@ -75,6 +76,8 @@ pub type UdpRegistry = Arc<DashMap<String, UdpReg>>;
 pub struct UdpReg {
     /// The provider's hole-punch candidate addresses.
     pub candidates: Vec<SocketAddr>,
+    /// STUN server selected by the provider, if known.
+    pub selected_stun: Option<String>,
     /// Stable session nonce for this provider; every consumer derives the same
     /// QUIC token from it, so the provider's persistent QUIC listener can
     /// authenticate any of them (and reconnecting consumers).
@@ -90,6 +93,62 @@ pub struct UdpOffer {
     pub nonce: [u8; UDP_NONCE_LEN],
     /// The consumer's candidate addresses to punch toward.
     pub peer_candidates: Vec<SocketAddr>,
+    /// STUN server selected by the consumer, if known.
+    pub peer_selected_stun: Option<String>,
+}
+
+fn udp_offer_from_legacy(candidates: Vec<SocketAddr>) -> UdpCandidateOffer {
+    UdpCandidateOffer {
+        candidates,
+        selected_stun: None,
+    }
+}
+
+fn register_provider_udp_offer(
+    udp_registry: &UdpRegistry,
+    id: &str,
+    admin_reg: &Registration,
+    offers: &mut Option<mpsc::Receiver<UdpOffer>>,
+    offer: UdpCandidateOffer,
+) {
+    info!(
+        %id,
+        candidates = ?offer.candidates,
+        selected_stun = ?offer.selected_stun,
+        "provider offered udp candidates"
+    );
+    admin_reg.mark_udp();
+
+    let (to_provider, rx) = match udp_registry.get(id) {
+        Some(existing) => (existing.to_provider.clone(), None),
+        None => {
+            let (tx, rx) = mpsc::channel(4);
+            (tx, Some(rx))
+        }
+    };
+    let nonce = udp_registry
+        .get(id)
+        .map(|existing| existing.nonce)
+        .unwrap_or_else(new_nonce);
+
+    udp_registry.insert(
+        id.to_string(),
+        UdpReg {
+            candidates: offer.candidates,
+            selected_stun: offer.selected_stun,
+            nonce,
+            to_provider,
+        },
+    );
+    if let Some(rx) = rx {
+        *offers = Some(rx);
+    }
+}
+
+fn provider_stun_hint(udp_registry: &UdpRegistry, id: &str) -> Option<String> {
+    udp_registry
+        .get(id)
+        .and_then(|provider| provider.selected_stun.clone())
 }
 
 /// Generate a fresh random session nonce from the system CSPRNG. The nonce keys
@@ -210,18 +269,25 @@ pub async fn serve_provider(
             message = control.recv() => {
                 match message? {
                     Some(ClientMessage::UdpCandidates(candidates)) => {
-                        info!(%id, ?candidates, "provider offered udp candidates");
-                        admin_reg.mark_udp();
-                        let (tx, rx) = mpsc::channel(4);
-                        udp_registry.insert(
-                            id.clone(),
-                            UdpReg {
-                                candidates,
-                                nonce: new_nonce(),
-                                to_provider: tx,
-                            },
+                        register_provider_udp_offer(
+                            &udp_registry,
+                            &id,
+                            &admin_reg,
+                            &mut offers,
+                            udp_offer_from_legacy(candidates),
                         );
-                        offers = Some(rx);
+                    }
+                    Some(ClientMessage::UdpCandidateOffer(offer)) => {
+                        register_provider_udp_offer(
+                            &udp_registry,
+                            &id,
+                            &admin_reg,
+                            &mut offers,
+                            offer,
+                        );
+                    }
+                    Some(ClientMessage::UdpStunHintRequest) => {
+                        warn!(%id, "unexpected udp stun hint request from provider")
                     }
                     Some(_) => warn!(%id, "unexpected message from provider"),
                     None => return Ok(()),
@@ -231,6 +297,7 @@ pub async fn serve_provider(
                 let msg = ServerMessage::UdpPunch {
                     nonce: offer.nonce,
                     peer: offer.peer_candidates,
+                    peer_selected_stun: offer.peer_selected_stun,
                 };
                 if control.send(msg).await.is_err() {
                     return Ok(());
@@ -309,7 +376,26 @@ pub async fn serve_consumer(
                         // direct path (success is established peer-to-peer, off the
                         // server, so the relay can only record the attempt).
                         admin_reg.mark_udp();
-                        broker_udp(&mut control, &udp_registry, &id, consumer_cands).await?;
+                        broker_udp(
+                            &mut control,
+                            &udp_registry,
+                            &id,
+                            udp_offer_from_legacy(consumer_cands),
+                        )
+                        .await?;
+                    }
+                    Some(ClientMessage::UdpCandidateOffer(consumer_offer)) => {
+                        admin_reg.mark_udp();
+                        broker_udp(&mut control, &udp_registry, &id, consumer_offer).await?;
+                    }
+                    Some(ClientMessage::UdpStunHintRequest) => {
+                        let stun_server = provider_stun_hint(&udp_registry, &id);
+                        info!(
+                            %id,
+                            provider_selected_stun = ?stun_server,
+                            "consumer requested provider stun hint"
+                        );
+                        control.send(ServerMessage::UdpStunHint { stun_server }).await?;
                     }
                     Some(_) => warn!(%id, "unexpected message from consumer"),
                     None => return Ok(()),
@@ -353,23 +439,39 @@ async fn broker_udp(
     control: &mut Delimited<mux::Stream>,
     udp_registry: &UdpRegistry,
     id: &str,
-    consumer_cands: Vec<SocketAddr>,
+    consumer_offer: UdpCandidateOffer,
 ) -> Result<()> {
     // Clone out so no DashMap guard is held across an await point.
-    let provider = udp_registry
-        .get(id)
-        .map(|e| (e.candidates.clone(), e.nonce, e.to_provider.clone()));
-    let Some((provider_cands, nonce, to_provider)) = provider else {
+    let provider = udp_registry.get(id).map(|e| {
+        (
+            e.candidates.clone(),
+            e.selected_stun.clone(),
+            e.nonce,
+            e.to_provider.clone(),
+        )
+    });
+    let Some((provider_cands, provider_selected_stun, nonce, to_provider)) = provider else {
         info!(%id, "no udp-capable provider; consumer will use relay");
         control.send(ServerMessage::UdpUnavailable).await?;
         return Ok(());
     };
 
-    info!(%id, ?provider_cands, ?consumer_cands, "brokering udp direct path");
+    let stun_aligned =
+        provider_selected_stun.is_some() && provider_selected_stun == consumer_offer.selected_stun;
+    info!(
+        %id,
+        provider_candidates = ?provider_cands,
+        provider_selected_stun = ?provider_selected_stun,
+        consumer_candidates = ?consumer_offer.candidates,
+        consumer_selected_stun = ?consumer_offer.selected_stun,
+        stun_aligned,
+        "brokering udp direct path"
+    );
     // Tell the provider first so its QUIC listener is up before the consumer dials.
     let offer = UdpOffer {
         nonce,
-        peer_candidates: consumer_cands,
+        peer_candidates: consumer_offer.candidates,
+        peer_selected_stun: consumer_offer.selected_stun,
     };
     if to_provider.send(offer).await.is_err() {
         // Provider task is gone; fall back to relay.
@@ -381,6 +483,7 @@ async fn broker_udp(
         .send(ServerMessage::UdpPunch {
             nonce,
             peer: provider_cands,
+            peer_selected_stun: provider_selected_stun,
         })
         .await?;
     Ok(())
@@ -751,10 +854,12 @@ impl Proxy {
         // not allow `#[cfg]` on its branches. An attempt is "in flight" exactly
         // while `nego_done_rx` is `Some`. Without the `udp` feature nothing ever
         // sets them, so the arms stay dormant.
-        let mut nego_cand_rx: Option<oneshot::Receiver<Vec<SocketAddr>>> = None;
+        #[cfg(feature = "udp")]
+        let mut waiting_for_stun_hint = false;
+        let mut nego_cand_rx: Option<oneshot::Receiver<UdpCandidateOffer>> = None;
         #[allow(clippy::type_complexity)]
         let mut nego_punch_tx: Option<
-            oneshot::Sender<Option<([u8; UDP_NONCE_LEN], Vec<SocketAddr>)>>,
+            oneshot::Sender<Option<([u8; UDP_NONCE_LEN], Vec<SocketAddr>, Option<String>)>>,
         > = None;
         let mut nego_done_rx: Option<oneshot::Receiver<DirectUpgrade>> = None;
         loop {
@@ -764,28 +869,19 @@ impl Proxy {
             if udp
                 && !direct
                 && nego_done_rx.is_none()
+                && !waiting_for_stun_hint
                 && last_upgrade.elapsed() >= UDP_UPGRADE_INTERVAL
             {
                 last_upgrade = tokio::time::Instant::now();
-                let (cand_tx, cand_rx) = oneshot::channel();
-                let (punch_tx, punch_rx) = oneshot::channel();
-                let (done_tx, done_rx) = oneshot::channel();
-                tokio::spawn(upgrade_task(
-                    endpoint.clone(),
-                    secret.clone(),
-                    stun_server.clone(),
-                    port_map,
-                    port_prediction,
-                    udp_port,
-                    cand_tx,
-                    punch_rx,
-                    done_tx,
-                ));
-                nego_cand_rx = Some(cand_rx);
-                nego_punch_tx = Some(punch_tx);
-                nego_done_rx = Some(done_rx);
+                if control
+                    .send(ClientMessage::UdpStunHintRequest)
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                waiting_for_stun_hint = true;
             }
-
             tokio::select! {
                 // Drain control so server heartbeats are read; surfaces teardown.
                 message = control.recv() => {
@@ -797,12 +893,38 @@ impl Proxy {
                         Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
                         // Deliver the brokered candidates to the in-flight upgrade
                         // task (which then punches + dials QUIC); else it is stray.
-                        Some(ServerMessage::UdpPunch { nonce, peer }) => match nego_punch_tx.take() {
+                        Some(ServerMessage::UdpPunch { nonce, peer, peer_selected_stun }) => match nego_punch_tx.take() {
                             Some(tx) => {
-                                let _ = tx.send(Some((nonce, peer)));
+                                let _ = tx.send(Some((nonce, peer, peer_selected_stun)));
                             }
                             None => warn!("unexpected udp punch"),
                         },
+                        Some(ServerMessage::UdpStunHint { stun_server: provider_stun_hint }) => {
+                            #[cfg(feature = "udp")]
+                            if waiting_for_stun_hint {
+                                waiting_for_stun_hint = false;
+                                info!(
+                                    provider_selected_stun = ?provider_stun_hint,
+                                    "consumer received provider stun hint for udp upgrade"
+                                );
+                                let (cand_rx, punch_tx, done_rx) = spawn_upgrade_attempt(
+                                    endpoint.clone(),
+                                    secret.clone(),
+                                    stun_server.clone(),
+                                    provider_stun_hint,
+                                    port_map,
+                                    port_prediction,
+                                    udp_port,
+                                );
+                                nego_cand_rx = Some(cand_rx);
+                                nego_punch_tx = Some(punch_tx);
+                                nego_done_rx = Some(done_rx);
+                            } else {
+                                warn!(?provider_stun_hint, "unexpected udp stun hint");
+                            }
+                            #[cfg(not(feature = "udp"))]
+                            warn!(?provider_stun_hint, "unexpected udp stun hint");
+                        }
                         Some(ServerMessage::UdpUnavailable) => match nego_punch_tx.take() {
                             // Provider not UDP-capable right now; tell the task to
                             // give up so it stops and we stay on the relay.
@@ -818,10 +940,10 @@ impl Proxy {
                 }
                 // The upgrade task gathered its candidates: send them on control
                 // (this loop owns `control`, so no shared-mutable conflict).
-                cands = recv_opt(&mut nego_cand_rx) => {
-                    match cands {
-                        Some(cands) => {
-                            if control.send(ClientMessage::UdpCandidates(cands)).await.is_err() {
+                offer = recv_opt(&mut nego_cand_rx) => {
+                    match offer {
+                        Some(offer) => {
+                            if control.send(ClientMessage::UdpCandidateOffer(offer)).await.is_err() {
                                 return Ok(());
                             }
                         }
@@ -973,26 +1095,34 @@ async fn recv_opt<T>(slot: &mut Option<oneshot::Receiver<T>>) -> Option<T> {
 async fn gather_consumer_candidates(
     endpoint: &Endpoint,
     stun_server: Option<&str>,
+    provider_stun_hint: Option<&str>,
     port_map: bool,
     port_prediction: bool,
     udp_port: u16,
-) -> Result<(tokio::net::UdpSocket, Vec<SocketAddr>)> {
+) -> Result<(tokio::net::UdpSocket, UdpCandidateOffer)> {
     use crate::holepunch;
     let socket = holepunch::bind_socket(udp_port).await?;
     let local_addr = socket.local_addr().ok();
-    let stun_chain = holepunch::live_stun_target_names(&endpoint.host, endpoint.port, stun_server);
+    let stun_chain = holepunch::live_stun_target_names_with_hint(
+        &endpoint.host,
+        endpoint.port,
+        stun_server,
+        provider_stun_hint,
+    );
     info!(
         role = "consumer",
         udp_local_addr = ?local_addr,
         requested_udp_port = udp_port,
         stun_override = stun_server.is_some(),
+        provider_stun_hint,
         stun_chain = ?stun_chain,
         "consumer UDP candidate discovery configured"
     );
-    let stun_targets = match holepunch::resolve_live_stun_targets(
+    let stun_targets = match holepunch::resolve_live_stun_targets_with_hint(
         &endpoint.host,
         endpoint.port,
         stun_server,
+        provider_stun_hint,
     )
     .await
     {
@@ -1011,6 +1141,7 @@ async fn gather_consumer_candidates(
     .await;
     let selected_stun = discovery.selected_stun.as_ref();
     let selected_stun_name = selected_stun.map(|s| s.requested.as_str());
+    let selected_stun_owned = selected_stun.map(|s| s.requested.clone());
     let selected_stun_addr = selected_stun.map(|s| s.addr);
     let stun_source = selected_stun.map(|s| s.source.as_str());
     let reflexive = selected_stun.map(|s| s.reflexive);
@@ -1023,15 +1154,50 @@ async fn gather_consumer_candidates(
     info!(
         role = "consumer",
         udp_local_addr = ?discovery_local_addr,
+        provider_stun_hint,
         selected_stun = selected_stun_name,
         selected_stun_addr = ?selected_stun_addr,
         stun_source,
         reflexive = ?reflexive,
         attempted_stun,
+        stun_aligned = provider_stun_hint.is_some() && provider_stun_hint == selected_stun_name,
         ?candidates,
         "consumer offering udp candidates"
     );
-    Ok((socket, candidates))
+    Ok((
+        socket,
+        UdpCandidateOffer {
+            candidates,
+            selected_stun: selected_stun_owned,
+        },
+    ))
+}
+
+#[cfg(feature = "udp")]
+async fn request_provider_stun_hint(
+    control: &mut Delimited<mux::Stream>,
+) -> Result<Option<String>> {
+    control.send(ClientMessage::UdpStunHintRequest).await?;
+    let hint = tokio::time::timeout(UDP_NEGOTIATE_TIMEOUT, async {
+        loop {
+            match control.recv().await? {
+                Some(ServerMessage::UdpStunHint { stun_server }) => {
+                    return Ok::<_, anyhow::Error>(stun_server);
+                }
+                Some(ServerMessage::Heartbeat) | Some(ServerMessage::Ok) => continue,
+                Some(ServerMessage::Error(err)) => bail!("server error: {err}"),
+                Some(other) => warn!(
+                    ?other,
+                    "unexpected response while waiting for udp stun hint"
+                ),
+                None => bail!("server closed during udp stun hint request"),
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for provider STUN hint")??;
+    info!(provider_selected_stun = ?hint, "consumer received provider stun hint");
+    Ok(hint)
 }
 
 /// Punch toward the brokered peer candidates and bring up the direct QUIC mux (no
@@ -1064,19 +1230,30 @@ async fn negotiate_direct_consumer(
     port_prediction: bool,
     udp_port: u16,
 ) -> Result<Option<crate::holepunch::DirectConn>> {
-    let (socket, candidates) =
-        gather_consumer_candidates(endpoint, stun_server, port_map, port_prediction, udp_port)
-            .await?;
+    let provider_stun_hint = request_provider_stun_hint(control).await?;
+    let (socket, offer) = gather_consumer_candidates(
+        endpoint,
+        stun_server,
+        provider_stun_hint.as_deref(),
+        port_map,
+        port_prediction,
+        udp_port,
+    )
+    .await?;
     control
-        .send(ClientMessage::UdpCandidates(candidates))
+        .send(ClientMessage::UdpCandidateOffer(offer))
         .await?;
 
     // Await the server's brokering decision, draining heartbeats meanwhile.
     let outcome = tokio::time::timeout(UDP_NEGOTIATE_TIMEOUT, async {
         loop {
             match control.recv().await? {
-                Some(ServerMessage::UdpPunch { nonce, peer }) => {
-                    return Ok::<_, anyhow::Error>(Some((nonce, peer)));
+                Some(ServerMessage::UdpPunch {
+                    nonce,
+                    peer,
+                    peer_selected_stun,
+                }) => {
+                    return Ok::<_, anyhow::Error>(Some((nonce, peer, peer_selected_stun)));
                 }
                 Some(ServerMessage::UdpUnavailable) => return Ok(None),
                 Some(ServerMessage::Heartbeat) | Some(ServerMessage::Ok) => continue,
@@ -1087,15 +1264,60 @@ async fn negotiate_direct_consumer(
         }
     })
     .await;
-    let (nonce, peer) = match outcome {
+    let (nonce, peer, peer_selected_stun) = match outcome {
         Ok(Ok(Some(value))) => value,
         Ok(Ok(None)) => return Ok(None),
         Ok(Err(err)) => return Err(err),
         Err(_) => return Ok(None), // negotiation timed out → relay
     };
+    info!(
+        provider_selected_stun = ?peer_selected_stun,
+        "consumer received provider metadata for udp negotiation"
+    );
     Ok(Some(
         finish_direct_consumer(socket, secret, nonce, peer).await?,
     ))
+}
+
+/// Background relay→direct upgrade attempt. Runs the slow work (STUN gather,
+/// punch, QUIC dial) off the forwarding loop. The control I/O is split with the
+/// loop, which owns `control`: this task gathers candidates and hands them to the
+/// loop via `cand_tx` (the loop sends them on control); the loop forwards the
+/// brokered reply back via `punch_rx`; on success this task returns the direct
+/// mux over `done_tx`. Dropping any sender signals "give up, stay on relay".
+#[cfg(feature = "udp")]
+type UdpPunchResult = Option<([u8; UDP_NONCE_LEN], Vec<SocketAddr>, Option<String>)>;
+
+#[cfg(feature = "udp")]
+fn spawn_upgrade_attempt(
+    endpoint: Endpoint,
+    secret: Option<String>,
+    stun_server: Option<String>,
+    provider_stun_hint: Option<String>,
+    port_map: bool,
+    port_prediction: bool,
+    udp_port: u16,
+) -> (
+    oneshot::Receiver<UdpCandidateOffer>,
+    oneshot::Sender<UdpPunchResult>,
+    oneshot::Receiver<crate::holepunch::DirectConn>,
+) {
+    let (cand_tx, cand_rx) = oneshot::channel();
+    let (punch_tx, punch_rx) = oneshot::channel();
+    let (done_tx, done_rx) = oneshot::channel();
+    tokio::spawn(upgrade_task(
+        endpoint,
+        secret,
+        stun_server,
+        provider_stun_hint,
+        port_map,
+        port_prediction,
+        udp_port,
+        cand_tx,
+        punch_rx,
+        done_tx,
+    ));
+    (cand_rx, punch_tx, done_rx)
 }
 
 /// Background relay→direct upgrade attempt. Runs the slow work (STUN gather,
@@ -1110,16 +1332,18 @@ async fn upgrade_task(
     endpoint: Endpoint,
     secret: Option<String>,
     stun_server: Option<String>,
+    provider_stun_hint: Option<String>,
     port_map: bool,
     port_prediction: bool,
     udp_port: u16,
-    cand_tx: oneshot::Sender<Vec<SocketAddr>>,
-    punch_rx: oneshot::Receiver<Option<([u8; UDP_NONCE_LEN], Vec<SocketAddr>)>>,
+    cand_tx: oneshot::Sender<UdpCandidateOffer>,
+    punch_rx: oneshot::Receiver<UdpPunchResult>,
     done_tx: oneshot::Sender<crate::holepunch::DirectConn>,
 ) {
     let (socket, candidates) = match gather_consumer_candidates(
         &endpoint,
         stun_server.as_deref(),
+        provider_stun_hint.as_deref(),
         port_map,
         port_prediction,
         udp_port,
@@ -1135,10 +1359,14 @@ async fn upgrade_task(
     if cand_tx.send(candidates).is_err() {
         return; // loop gone
     }
-    let (nonce, peer) = match punch_rx.await {
+    let (nonce, peer, peer_selected_stun) = match punch_rx.await {
         Ok(Some(v)) => v,
         _ => return, // unavailable / loop dropped the sender
     };
+    info!(
+        provider_selected_stun = ?peer_selected_stun,
+        "consumer received provider metadata for udp upgrade"
+    );
     match finish_direct_consumer(socket, secret.as_deref(), nonce, peer).await {
         Ok(pair) => {
             let _ = done_tx.send(pair);
@@ -1191,5 +1419,26 @@ mod tests {
         let b = new_nonce();
         assert_ne!(a, b, "two nonces must differ");
         assert_ne!(a, [0u8; UDP_NONCE_LEN], "nonce must not be all-zero");
+    }
+
+    #[test]
+    fn provider_stun_hint_reads_registered_metadata() {
+        let udp_registry = UdpRegistry::default();
+        let (to_provider, _rx) = mpsc::channel(1);
+        udp_registry.insert(
+            "svc".to_string(),
+            UdpReg {
+                candidates: vec!["127.0.0.1:3478".parse().unwrap()],
+                selected_stun: Some("stun.cloudflare.com:3478".to_string()),
+                nonce: [1u8; UDP_NONCE_LEN],
+                to_provider,
+            },
+        );
+
+        assert_eq!(
+            provider_stun_hint(&udp_registry, "svc"),
+            Some("stun.cloudflare.com:3478".to_string())
+        );
+        assert_eq!(provider_stun_hint(&udp_registry, "missing"), None);
     }
 }

@@ -14,6 +14,8 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 use crate::auth::Authenticator;
 use crate::basicauth::{self, BasicAuth, Gate};
 use crate::mux;
+#[cfg(feature = "udp")]
+use crate::shared::UdpCandidateOffer;
 use crate::shared::{
     tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions, NETWORK_TIMEOUT,
     PROXY_BUFFER_SIZE,
@@ -430,12 +432,17 @@ impl Client {
                         Some(ServerMessage::CarrierToken { .. }) => warn!("unexpected carrier token"),
                         Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
                         Some(ServerMessage::Ok) => warn!("unexpected ok"),
-                        Some(ServerMessage::UdpPunch { nonce, peer }) => {
+                        Some(ServerMessage::UdpPunch {
+                            nonce,
+                            peer,
+                            peer_selected_stun,
+                        }) => {
                             #[cfg(feature = "udp")]
                             {
                                 info!(
                                     role = "provider",
                                     peer_candidates = ?peer,
+                                    peer_selected_stun = ?peer_selected_stun,
                                     "provider received udp punch request"
                                 );
                                 if let Some(tx) = &punch_tx {
@@ -469,9 +476,12 @@ impl Client {
                             }
                             #[cfg(not(feature = "udp"))]
                             {
-                                let _ = (nonce, peer);
+                                let _ = (nonce, peer, peer_selected_stun);
                                 warn!("unexpected udp punch");
                             }
+                        }
+                        Some(ServerMessage::UdpStunHint { stun_server }) => {
+                            warn!(?stun_server, "unexpected udp stun hint")
                         }
                         Some(ServerMessage::UdpUnavailable) => warn!("unexpected udp unavailable"),
                         Some(ServerMessage::TestUdpWaiting) => warn!("unexpected udp diagnostic wait"),
@@ -739,6 +749,7 @@ async fn offer_provider_candidates(
     .await;
     let selected_stun = discovery.selected_stun.as_ref();
     let selected_stun_name = selected_stun.map(|s| s.requested.as_str());
+    let selected_stun_owned = selected_stun.map(|s| s.requested.clone());
     let selected_stun_addr = selected_stun.map(|s| s.addr);
     let stun_source = selected_stun.map(|s| s.source.as_str());
     let reflexive = selected_stun.map(|s| s.reflexive);
@@ -760,7 +771,10 @@ async fn offer_provider_candidates(
         "provider offering udp candidates"
     );
     control
-        .send(ClientMessage::UdpCandidates(candidates))
+        .send(ClientMessage::UdpCandidateOffer(UdpCandidateOffer {
+            candidates,
+            selected_stun: selected_stun_owned,
+        }))
         .await?;
     Ok(socket)
 }

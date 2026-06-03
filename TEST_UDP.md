@@ -65,6 +65,10 @@ Variabili d'ambiente equivalenti: `BORE_UDP`, `BORE_PREFER_UDP`, `BORE_STUN_SERV
 > lo STUN del server bore sulla **control port UDP** (`7835/udp` di default, non
 > `443/udp` quando `--to` è `https://host`). `--stun-server` sostituisce questa
 > chain con un endpoint esplicito.
+> Nei tunnel secret live il provider manda al server lo STUN che ha selezionato;
+> il proxy lo richiede e lo prova come primo STUN se non hai impostato
+> `--stun-server`. Se quell'hint non risponde dalla rete del proxy, la chain
+> continua con Cloudflare, Google e fallback bore.
 
 ---
 
@@ -81,6 +85,7 @@ Frasi chiave da cercare:
 **Server**
 - `STUN responder listening` → UDP bindato OK.
 - `provider offered udp candidates` → il provider ha mandato i candidati.
+- `consumer requested provider stun hint` → il proxy ha chiesto al server lo STUN selezionato dal provider.
 - `brokered udp direct path` → il server ha messo in contatto i due peer.
 - `no udp-capable provider; consumer will use relay` → il provider non è in modalità udp → relay.
 
@@ -91,9 +96,10 @@ Frasi chiave da cercare:
 - `direct udp path ready, accepting connections` → QUIC server su.
 
 **Consumer** (`bore proxy … --udp`)
+- `consumer received provider stun hint` → hint STUN del provider ricevuto dal server.
 - `consumer UDP candidate discovery configured` → chain STUN e porta UDP locale.
 - `selected STUN server for UDP candidates` → STUN scelto e indirizzo reflexive.
-- `consumer offering udp candidates` → candidati inviati al server.
+- `consumer offering udp candidates` → candidati inviati al server; il campo `stun_aligned=true` conferma che proxy e provider hanno selezionato lo stesso STUN.
 - ✅ `using direct udp path` → **percorso diretto attivo**.
 - ↩️ `udp unavailable, using relay` oppure `udp negotiation failed, using relay` → **fallback al relay** (il tunnel funziona lo stesso).
 

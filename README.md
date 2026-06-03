@@ -423,6 +423,12 @@ Notes:
   fallback. Open **UDP** on the control port too (e.g. `7835/udp`) if you want
   that self-hosted fallback; override the whole chain with `--stun-server
   host:port`.
+  For secret tunnels, the provider also advertises the STUN server that actually
+  produced its reflexive candidate. A `bore proxy --udp` consumer asks the server
+  for that provider-selected STUN and, when no explicit `--stun-server` override
+  is set, tries it first before continuing with Cloudflare, Google, and the bore
+  fallback. A bad or unreachable hint is non-blocking; the relay fallback remains
+  available.
 - **Authentication.** The direct path is authenticated by a token derived from
   `--secret` and a server-issued nonce, verified before any data flows.
 - **Scope & limits.** Only secret tunnels are hole-punchable (not public-port

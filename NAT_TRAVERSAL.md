@@ -92,6 +92,12 @@ mai un tunnel.
   l'`IP:porta` pubblico come visto da fuori. Se nessuno STUN risponde → niente
   indirizzo pubblico → di norma solo relay.
 
+  Nei tunnel secret live, il provider allega ai suoi candidati anche lo STUN che
+  ha selezionato. Il server conserva questo metadata e lo dà ai consumer
+  `bore proxy --udp` prima che raccolgano i propri candidati: il proxy prova
+  quello STUN come primo target, poi continua con Cloudflare, Google e fallback
+  bore se non risponde. Un `--stun-server` esplicito resta un override assoluto.
+
 3. **Raccolta e offerta dei candidati.** Ogni peer compone la lista:
    - **riflessivo** (pubblico, da STUN) — il candidato principale per il traversal;
    - **locale** (es. `192.168.x.y:porta`) — per due peer sulla **stessa LAN**;

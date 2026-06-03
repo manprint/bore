@@ -71,6 +71,12 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
   an absolute override. Logs now show the STUN chain, selected STUN server,
   local UDP socket, reflexive address, offered candidates, peer candidates, and
   direct QUIC candidate attempts to make firewall/NAT debugging easier.
+- **Secret UDP consumers now prefer the provider-selected STUN server.** A
+  `bore local --udp --tcp-secret-id` provider sends its selected STUN metadata to
+  the server with its candidates. A `bore proxy --udp` consumer asks the server
+  for that hint before gathering candidates and tries it first, then falls back
+  through the normal public/bore chain if it fails. `--stun-server` remains an
+  explicit absolute override.
 - **Direct QUIC throughput tuning**: the UDP direct path now sets explicit
   high-throughput flow-control windows in `src/holepunch.rs`:
   `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` = 16 MiB,

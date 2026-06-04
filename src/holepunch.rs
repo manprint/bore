@@ -987,6 +987,16 @@ impl DirectConn {
     pub async fn closed(&self) {
         self.conn.closed().await;
     }
+
+    /// Snapshot the current QUIC connection statistics for diagnostics.
+    pub fn stats(&self) -> quinn::ConnectionStats {
+        self.conn.stats()
+    }
+
+    /// Snapshot the current path MTU-dependent datagram size, if available.
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        self.conn.max_datagram_size()
+    }
 }
 
 // quinn's streams carry inherent `poll_read`/`poll_write` methods (with quinn's

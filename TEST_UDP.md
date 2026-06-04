@@ -49,7 +49,7 @@ Flag rilevanti:
 - `--tcp-secret-id ID` — deve combaciare tra provider e consumer.
 - `--upnp` (su `local` e `proxy`) — prova ad aprire una porta sul **router casalingo** via UPnP-IGD e la aggiunge come candidato. Aiuta router casalinghi strict con IP WAN pubblico; **inutile dietro CGNAT**. Log: `UPnP-IGD port mapping ENABLED`.
 - `--try-port-prediction` (su `local` e `proxy`) — per NAT **simmetrici**: annuncia qualche porta oltre quella reflexive. **Opt-in**, best-effort, **può sembrare un port scan** ai firewall strict. Log: `port prediction ENABLED`.
-- `test-udp --tcp-secret-id ID` — modalità diagnostica **a due peer**: due host lanciano lo stesso comando, il server li abbina, prova UDP diretto e TCP relay, e stampa un report A<->B.
+- `test-udp --tcp-secret-id ID` — modalità diagnostica **a due peer**: due host lanciano lo stesso comando, il server li abbina, prova UDP diretto e TCP relay, e stampa un report A<->B con snapshot host CPU/RAM/load, RTT/loss/MTU QUIC e hint sui colli di bottiglia.
 - `test-udp --test-bandwidth --test-transfer-quota 500MB` — aggiunge banda e latenza bidirezionali su entrambi i path. `--test-bandwith` (senza la seconda `d`) è accettato come alias.
 
 Variabili d'ambiente equivalenti: `BORE_UDP`, `BORE_PREFER_UDP`, `BORE_STUN_SERVER`, `BORE_SECRET`, `BORE_TCP_SECRET_ID`, `BORE_SERVER`, `BORE_UPNP`, `BORE_TRY_PORT_PREDICTION`.
@@ -372,8 +372,10 @@ Su **B**:
 
 **Cosa viene testato:** diagnosi NAT locale, sintesi del NAT del peer, candidate
 UDP, hole-punch QUIC diretto, fallback TCP relay, latenza in entrambe le
-direzioni. Se il diretto fallisce ma il relay TCP passa, il report lo dichiara e
-consiglia il fallback.
+direzioni. Il report finale aggiunge anche snapshot host CPU/RAM/load e le
+metriche QUIC del path diretto (`rtt`, `cwnd`, loss, MTU, flow-control). Se il
+diretto fallisce ma il relay TCP passa, il report lo dichiara e consiglia il
+fallback.
 
 Con misure di banda:
 ```shell
@@ -395,6 +397,10 @@ tuning bulk, i primi knob sono in `src/shared.rs` (consumati da `src/holepunch.r
 `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` e `DIRECT_QUIC_SEND_WINDOW`, 16 MiB per
 `DIRECT_UDP_SOCKET_RECV_BUFFER` e `DIRECT_UDP_SOCKET_SEND_BUFFER`, più
 `quinn::congestion::BbrConfig` per il congestion control QUIC.
+
+Se vedi `Peer metrics : unavailable`, l'ultimo scambio tra i due peer è fallito o
+è scaduto; i risultati locali e i path testati restano comunque validi, quindi il
+report non è da buttare.
 
 ---
 

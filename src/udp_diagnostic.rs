@@ -21,6 +21,14 @@ use tokio::time::timeout;
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
+#[cfg(target_os = "linux")]
+use procfs::process::Process;
+#[cfg(target_os = "linux")]
+use procfs::{
+    page_size, ticks_per_second, CpuInfo, CpuTime, Current, CurrentSI, KernelStats, LoadAverage,
+    Meminfo,
+};
+
 use crate::auth::Authenticator;
 use crate::holepunch::{self, NatClass, StunObservation};
 use crate::mux;
@@ -241,6 +249,8 @@ pub async fn run_peer_test(
     println!("bore paired UDP / NAT diagnostic");
     println!("================================");
     println!("Session id        : {tcp_secret_id}");
+    let host_start = capture_host_sample();
+    let run_started = Instant::now();
 
     let endpoint = Endpoint::parse(to);
     let socket = holepunch::bind_socket(preferred_port).await?;
@@ -342,9 +352,19 @@ pub async fn run_peer_test(
         }
     };
 
-    let local_metrics = PeerMetrics { udp, tcp };
+    let host_end = capture_host_sample();
+    let host_metrics = build_host_metrics(
+        host_start.as_ref(),
+        host_end.as_ref(),
+        run_started.elapsed(),
+    );
+    let local_metrics = PeerMetrics {
+        host: host_metrics,
+        udp,
+        tcp,
+    };
     let peer_metrics = match timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         exchange_metrics(&mut tcp_path, start.role, &local_metrics),
     )
     .await
@@ -545,6 +565,8 @@ async fn run_path_suite(
         }
     }
 
+    metrics.transport = path.transport_snapshot();
+
     print_path_metrics(label, &metrics);
     Ok(metrics)
 }
@@ -726,6 +748,14 @@ impl TestPath {
             }
             #[cfg(feature = "udp")]
             TestPath::Direct(conn) => Ok(TestStream::Quic(conn.accept_stream().await?)),
+        }
+    }
+
+    fn transport_snapshot(&self) -> Option<DirectTransportMetrics> {
+        match self {
+            TestPath::Tcp { .. } => None,
+            #[cfg(feature = "udp")]
+            TestPath::Direct(conn) => Some(DirectTransportMetrics::from_direct(conn)),
         }
     }
 }
@@ -935,48 +965,168 @@ fn merge_options(a: UdpTestOptions, b: UdpTestOptions) -> UdpTestOptions {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 struct PeerMetrics {
+    host: HostMetrics,
     udp: Option<PathMetrics>,
     tcp: Option<PathMetrics>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 struct PathMetrics {
     latency_send: Option<LatencyMetrics>,
     bandwidth_send: Option<BandwidthMetrics>,
     bandwidth_recv: Option<BandwidthMetrics>,
+    transport: Option<DirectTransportMetrics>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct HostMetrics {
+    duration_secs: f64,
+    process_cpu_seconds: Option<f64>,
+    process_cpu_pct: Option<f64>,
+    process_rss_bytes: Option<u64>,
+    process_vsize_bytes: Option<u64>,
+    process_threads: Option<u64>,
+    process_minor_faults: Option<u64>,
+    process_major_faults: Option<u64>,
+    system_cpu_busy_pct: Option<f64>,
+    system_cpu_idle_pct: Option<f64>,
+    system_load: Option<LoadAverageMetrics>,
+    memory: Option<MemoryMetrics>,
+    cpu_cores: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct LoadAverageMetrics {
+    one: f32,
+    five: f32,
+    fifteen: f32,
+    cur: u32,
+    max: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct MemoryMetrics {
+    mem_total_bytes: u64,
+    mem_free_bytes: u64,
+    mem_available_bytes: Option<u64>,
+    swap_total_bytes: u64,
+    swap_free_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct DirectTransportMetrics {
+    udp_tx: UdpStatsMetrics,
+    udp_rx: UdpStatsMetrics,
+    frame_tx: FrameStatsMetrics,
+    frame_rx: FrameStatsMetrics,
+    path: PathStatsMetrics,
+    max_datagram_size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct UdpStatsMetrics {
+    datagrams: u64,
+    bytes: u64,
+    ios: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct FrameStatsMetrics {
+    acks: u64,
+    ack_frequency: u64,
+    crypto: u64,
+    connection_close: u64,
+    data_blocked: u64,
+    datagram: u64,
+    handshake_done: u64,
+    immediate_ack: u64,
+    max_data: u64,
+    max_stream_data: u64,
+    max_streams_bidi: u64,
+    max_streams_uni: u64,
+    new_connection_id: u64,
+    new_token: u64,
+    path_challenge: u64,
+    path_response: u64,
+    ping: u64,
+    reset_stream: u64,
+    retire_connection_id: u64,
+    stream_data_blocked: u64,
+    streams_blocked_bidi: u64,
+    streams_blocked_uni: u64,
+    stop_sending: u64,
+    stream: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct PathStatsMetrics {
+    rtt_ms: f64,
+    cwnd_bytes: u64,
+    congestion_events: u64,
+    lost_packets: u64,
+    lost_bytes: u64,
+    sent_packets: u64,
+    sent_plpmtud_probes: u64,
+    lost_plpmtud_probes: u64,
+    black_holes_detected: u64,
+    current_mtu_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct LatencyMetrics {
     samples: u16,
     min_ms: f64,
+    median_ms: f64,
     avg_ms: f64,
+    stdev_ms: f64,
     max_ms: f64,
 }
 
 impl LatencyMetrics {
     fn from_samples(samples: &[Duration]) -> Self {
-        let mut min = f64::MAX;
-        let mut max: f64 = 0.0;
-        let mut sum = 0.0;
-        for sample in samples {
-            let ms = sample.as_secs_f64() * 1000.0;
-            min = min.min(ms);
-            max = max.max(ms);
-            sum += ms;
-        }
+        let mut values: Vec<f64> = samples
+            .iter()
+            .map(|sample| sample.as_secs_f64() * 1000.0)
+            .collect();
+        values.sort_by(|a, b| a.total_cmp(b));
+        let min = *values.first().unwrap_or(&0.0);
+        let max = *values.last().unwrap_or(&0.0);
+        let sum: f64 = values.iter().sum();
+        let avg = sum / values.len().max(1) as f64;
+        let median = match values.len() {
+            0 => 0.0,
+            len if len % 2 == 0 => {
+                let upper = len / 2;
+                (values[upper - 1] + values[upper]) / 2.0
+            }
+            len => values[len / 2],
+        };
+        let variance = if values.is_empty() {
+            0.0
+        } else {
+            values
+                .iter()
+                .map(|value| {
+                    let diff = *value - avg;
+                    diff * diff
+                })
+                .sum::<f64>()
+                / values.len() as f64
+        };
         Self {
-            samples: samples.len() as u16,
+            samples: values.len() as u16,
             min_ms: min,
-            avg_ms: sum / samples.len().max(1) as f64,
+            median_ms: median,
+            avg_ms: avg,
+            stdev_ms: variance.sqrt(),
             max_ms: max,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct BandwidthMetrics {
     bytes: u64,
     seconds: f64,
@@ -993,6 +1143,233 @@ impl BandwidthMetrics {
             seconds,
             mbps,
             ack_observed,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct HostSample {
+    process: Option<ProcessSample>,
+    kernel_stats: Option<KernelStats>,
+    load: Option<LoadAverage>,
+    memory: Option<Meminfo>,
+    cpu_cores: Option<usize>,
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone)]
+struct HostSample;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct ProcessSample {
+    cpu_ticks: u64,
+    rss_bytes: u64,
+    vsize_bytes: u64,
+    threads: u64,
+    minor_faults: u64,
+    major_faults: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn capture_host_sample() -> Option<HostSample> {
+    let process = Process::myself()
+        .ok()
+        .and_then(|process| process.stat().ok())
+        .map(|stat| {
+            let page_size = page_size();
+            ProcessSample {
+                cpu_ticks: stat.utime + stat.stime,
+                rss_bytes: stat.rss.saturating_mul(page_size),
+                vsize_bytes: stat.vsize,
+                threads: stat.num_threads.max(0) as u64,
+                minor_faults: stat.minflt,
+                major_faults: stat.majflt,
+            }
+        });
+    Some(HostSample {
+        process,
+        kernel_stats: KernelStats::current().ok(),
+        load: LoadAverage::current().ok(),
+        memory: Meminfo::current().ok(),
+        cpu_cores: CpuInfo::current().ok().map(|info| info.num_cores()),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn capture_host_sample() -> Option<HostSample> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn build_host_metrics(
+    start: Option<&HostSample>,
+    end: Option<&HostSample>,
+    elapsed: Duration,
+) -> HostMetrics {
+    let duration_secs = elapsed.as_secs_f64().max(0.000_001);
+    let mut metrics = HostMetrics {
+        duration_secs,
+        ..HostMetrics::default()
+    };
+
+    let Some(end) = end else {
+        return metrics;
+    };
+
+    if let Some(process) = &end.process {
+        metrics.process_rss_bytes = Some(process.rss_bytes);
+        metrics.process_vsize_bytes = Some(process.vsize_bytes);
+        metrics.process_threads = Some(process.threads);
+        metrics.process_minor_faults = Some(process.minor_faults);
+        metrics.process_major_faults = Some(process.major_faults);
+    }
+    metrics.cpu_cores = end.cpu_cores.or(start.and_then(|sample| sample.cpu_cores));
+    metrics.memory = end.memory.as_ref().map(|memory| MemoryMetrics {
+        mem_total_bytes: memory.mem_total,
+        mem_free_bytes: memory.mem_free,
+        mem_available_bytes: memory.mem_available,
+        swap_total_bytes: memory.swap_total,
+        swap_free_bytes: memory.swap_free,
+    });
+    metrics.system_load = end.load.as_ref().map(|load| LoadAverageMetrics {
+        one: load.one,
+        five: load.five,
+        fifteen: load.fifteen,
+        cur: load.cur,
+        max: load.max,
+    });
+
+    if let (Some(start), Some(end_process)) = (
+        start.and_then(|sample| sample.process.as_ref()),
+        end.process.as_ref(),
+    ) {
+        let ticks = ticks_per_second() as f64;
+        let cpu_ticks = end_process.cpu_ticks.saturating_sub(start.cpu_ticks);
+        let process_cpu_seconds = cpu_ticks as f64 / ticks;
+        metrics.process_cpu_seconds = Some(process_cpu_seconds);
+        metrics.process_cpu_pct = Some(process_cpu_seconds / duration_secs * 100.0);
+    }
+
+    if let (Some(start), Some(end_stats)) = (
+        start.and_then(|sample| sample.kernel_stats.as_ref()),
+        end.kernel_stats.as_ref(),
+    ) {
+        let start_cpu = &start.total;
+        let end_cpu = &end_stats.total;
+        let start_busy = cpu_busy_ticks(start_cpu);
+        let end_busy = cpu_busy_ticks(end_cpu);
+        let start_total = cpu_total_ticks(start_cpu);
+        let end_total = cpu_total_ticks(end_cpu);
+        let busy_delta = end_busy.saturating_sub(start_busy) as f64;
+        let total_delta = end_total.saturating_sub(start_total) as f64;
+        if total_delta > 0.0 {
+            metrics.system_cpu_busy_pct = Some(busy_delta / total_delta * 100.0);
+            metrics.system_cpu_idle_pct = Some(100.0 - metrics.system_cpu_busy_pct.unwrap_or(0.0));
+        }
+    }
+
+    metrics
+}
+
+#[cfg(not(target_os = "linux"))]
+fn build_host_metrics(
+    _start: Option<&HostSample>,
+    _end: Option<&HostSample>,
+    elapsed: Duration,
+) -> HostMetrics {
+    HostMetrics {
+        duration_secs: elapsed.as_secs_f64().max(0.000_001),
+        ..HostMetrics::default()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_busy_ticks(cpu: &CpuTime) -> u64 {
+    cpu.user
+        + cpu.nice
+        + cpu.system
+        + cpu.irq.unwrap_or(0)
+        + cpu.softirq.unwrap_or(0)
+        + cpu.steal.unwrap_or(0)
+        + cpu.guest.unwrap_or(0)
+        + cpu.guest_nice.unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_total_ticks(cpu: &CpuTime) -> u64 {
+    cpu_busy_ticks(cpu) + cpu.idle + cpu.iowait.unwrap_or(0)
+}
+
+impl DirectTransportMetrics {
+    fn from_direct(conn: &crate::holepunch::DirectConn) -> Self {
+        let stats = conn.stats();
+        Self {
+            udp_tx: UdpStatsMetrics::from(stats.udp_tx),
+            udp_rx: UdpStatsMetrics::from(stats.udp_rx),
+            frame_tx: FrameStatsMetrics::from(stats.frame_tx),
+            frame_rx: FrameStatsMetrics::from(stats.frame_rx),
+            path: PathStatsMetrics::from(stats.path),
+            max_datagram_size_bytes: conn.max_datagram_size().map(|size| size as u64),
+        }
+    }
+}
+
+impl From<quinn::UdpStats> for UdpStatsMetrics {
+    fn from(stats: quinn::UdpStats) -> Self {
+        Self {
+            datagrams: stats.datagrams,
+            bytes: stats.bytes,
+            ios: stats.ios,
+        }
+    }
+}
+
+impl From<quinn::PathStats> for PathStatsMetrics {
+    fn from(stats: quinn::PathStats) -> Self {
+        Self {
+            rtt_ms: stats.rtt.as_secs_f64() * 1000.0,
+            cwnd_bytes: stats.cwnd,
+            congestion_events: stats.congestion_events,
+            lost_packets: stats.lost_packets,
+            lost_bytes: stats.lost_bytes,
+            sent_packets: stats.sent_packets,
+            sent_plpmtud_probes: stats.sent_plpmtud_probes,
+            lost_plpmtud_probes: stats.lost_plpmtud_probes,
+            black_holes_detected: stats.black_holes_detected,
+            current_mtu_bytes: stats.current_mtu as u64,
+        }
+    }
+}
+
+impl FrameStatsMetrics {
+    fn from(stats: quinn::FrameStats) -> Self {
+        Self {
+            acks: stats.acks,
+            ack_frequency: stats.ack_frequency,
+            crypto: stats.crypto,
+            connection_close: stats.connection_close,
+            data_blocked: stats.data_blocked,
+            datagram: stats.datagram,
+            handshake_done: stats.handshake_done as u64,
+            immediate_ack: stats.immediate_ack,
+            max_data: stats.max_data,
+            max_stream_data: stats.max_stream_data,
+            max_streams_bidi: stats.max_streams_bidi,
+            max_streams_uni: stats.max_streams_uni,
+            new_connection_id: stats.new_connection_id,
+            new_token: stats.new_token,
+            path_challenge: stats.path_challenge,
+            path_response: stats.path_response,
+            ping: stats.ping,
+            reset_stream: stats.reset_stream,
+            retire_connection_id: stats.retire_connection_id,
+            stream_data_blocked: stats.stream_data_blocked,
+            streams_blocked_bidi: stats.streams_blocked_bidi,
+            streams_blocked_uni: stats.streams_blocked_uni,
+            stop_sending: stats.stop_sending,
+            stream: stats.stream,
         }
     }
 }
@@ -1099,8 +1476,8 @@ fn print_pairing_report(
 fn print_path_metrics(label: &str, metrics: &PathMetrics) {
     if let Some(latency) = &metrics.latency_send {
         println!(
-            "{label} : latency sent avg {:.2} ms (min {:.2}, max {:.2}, n={})",
-            latency.avg_ms, latency.min_ms, latency.max_ms, latency.samples
+            "{label} : latency sent avg {:.2} ms (median {:.2}, stdev {:.2}, min {:.2}, max {:.2}, n={})",
+            latency.avg_ms, latency.median_ms, latency.stdev_ms, latency.min_ms, latency.max_ms, latency.samples
         );
     }
     if let Some(bw) = &metrics.bandwidth_send {
@@ -1123,6 +1500,9 @@ fn print_path_metrics(label: &str, metrics: &PathMetrics) {
             bw.seconds,
             bw.mbps
         );
+    }
+    if let Some(transport) = &metrics.transport {
+        print_transport_metrics(label, transport);
     }
 }
 
@@ -1159,7 +1539,9 @@ fn print_final_report(
             "FAILED"
         }
     );
+    print_host_metrics("Local host", &metrics.host);
     if let Some(peer_metrics) = peer_metrics {
+        print_host_metrics("Peer host", &peer_metrics.host);
         println!(
             "Peer UDP direct   : {}",
             if peer_metrics.udp.is_some() {
@@ -1177,12 +1559,208 @@ fn print_final_report(
             }
         );
     }
+    if let Some(udp) = &metrics.udp {
+        print_path_bottleneck_hints("UDP direct path", udp);
+    }
+    if let Some(tcp) = &metrics.tcp {
+        print_path_bottleneck_hints("TCP relay fallback", tcp);
+    }
     if metrics.udp.is_none() && metrics.tcp.is_some() {
         println!("Recommendation    : use the TCP relay fallback; direct UDP failed on this pair.");
     } else if metrics.udp.is_some() {
         println!(
             "Recommendation    : direct UDP is usable; TCP relay remains available as fallback."
         );
+    }
+}
+
+fn print_host_metrics(label: &str, host: &HostMetrics) {
+    println!("{label}          : sampled over {:.2}s", host.duration_secs);
+    if let Some(cpu_seconds) = host.process_cpu_seconds {
+        let pct = host.process_cpu_pct.unwrap_or(0.0);
+        println!(
+            "{label} CPU      : {:.2}s ({:.1}% of one core)",
+            cpu_seconds, pct
+        );
+    }
+    if let Some(rss) = host.process_rss_bytes {
+        println!("{label} RSS      : {}", format_bytes(rss));
+    }
+    if let Some(vsize) = host.process_vsize_bytes {
+        println!("{label} VSIZE    : {}", format_bytes(vsize));
+    }
+    if let Some(threads) = host.process_threads {
+        println!("{label} threads  : {threads}");
+    }
+    if let Some(minor_faults) = host.process_minor_faults {
+        println!("{label} faults   : minor {minor_faults}");
+    }
+    if let Some(major_faults) = host.process_major_faults {
+        println!("{label} faults   : major {major_faults}");
+    }
+    if let Some(system_cpu_busy_pct) = host.system_cpu_busy_pct {
+        println!(
+            "{label} system   : busy {:.1}%, idle {:.1}%",
+            system_cpu_busy_pct,
+            host.system_cpu_idle_pct.unwrap_or(0.0)
+        );
+    }
+    if let Some(load) = &host.system_load {
+        println!(
+            "{label} load     : {:.2} / {:.2} / {:.2} (cur {}, max {})",
+            load.one, load.five, load.fifteen, load.cur, load.max
+        );
+    }
+    if let Some(memory) = &host.memory {
+        println!(
+            "{label} memory   : avail {} / total {}, swap free {} / total {}",
+            memory
+                .mem_available_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "<n/a>".to_string()),
+            format_bytes(memory.mem_total_bytes),
+            format_bytes(memory.swap_free_bytes),
+            format_bytes(memory.swap_total_bytes)
+        );
+    }
+
+    let hints = host_bottleneck_hints(host);
+    if !hints.is_empty() {
+        println!("{label} hint    : {}", hints.join(", "));
+    }
+}
+
+fn print_path_bottleneck_hints(label: &str, metrics: &PathMetrics) {
+    let hints = path_bottleneck_hints(metrics);
+    if !hints.is_empty() {
+        println!("{label} analysis : {}", hints.join(", "));
+    }
+}
+
+fn host_bottleneck_hints(host: &HostMetrics) -> Vec<String> {
+    let mut hints = Vec::new();
+    if host.process_cpu_pct.is_some_and(|pct| pct >= 85.0) {
+        hints.push("process CPU saturation".to_string());
+    }
+    if host.system_cpu_busy_pct.is_some_and(|pct| pct >= 85.0) {
+        hints.push("machine CPU saturation".to_string());
+    }
+    if let Some(memory) = &host.memory {
+        if memory
+            .mem_available_bytes
+            .is_some_and(|available| available < memory.mem_total_bytes / 10)
+        {
+            hints.push("low available RAM".to_string());
+        }
+    }
+    if host
+        .system_load
+        .as_ref()
+        .and_then(|load| host.cpu_cores.map(|cores| (load.one, cores)))
+        .is_some_and(|(load_one, cores)| load_one > cores as f32)
+    {
+        hints.push("load average above core count".to_string());
+    }
+    if host.process_major_faults.is_some_and(|faults| faults > 0) {
+        hints.push("major page faults observed".to_string());
+    }
+    hints
+}
+
+fn transport_bottleneck_hints(transport: &DirectTransportMetrics) -> Vec<String> {
+    let mut hints = Vec::new();
+    if transport.path.rtt_ms >= 100.0 {
+        hints.push(format!("high QUIC RTT ({:.2} ms)", transport.path.rtt_ms));
+    }
+    if transport.path.lost_packets > 0 || transport.path.lost_bytes > 0 {
+        hints.push("QUIC loss visible".to_string());
+    }
+    if transport.path.black_holes_detected > 0 {
+        hints.push("PMTUD black holes detected".to_string());
+    }
+    if transport.frame_tx.data_blocked > 0 || transport.frame_rx.data_blocked > 0 {
+        hints.push("connection flow-control pressure".to_string());
+    }
+    if transport.frame_tx.stream_data_blocked > 0 || transport.frame_rx.stream_data_blocked > 0 {
+        hints.push("stream flow-control pressure".to_string());
+    }
+    if transport.frame_tx.streams_blocked_bidi > 0 || transport.frame_rx.streams_blocked_bidi > 0 {
+        hints.push("bidi stream limit pressure".to_string());
+    }
+    if transport.path.current_mtu_bytes < 1200 {
+        hints.push("small MTU may cap throughput".to_string());
+    }
+    hints
+}
+
+fn path_bottleneck_hints(metrics: &PathMetrics) -> Vec<String> {
+    let mut hints = Vec::new();
+    if let Some(latency) = &metrics.latency_send {
+        if latency.avg_ms >= 100.0 {
+            hints.push(format!("high latency ({:.2} ms avg)", latency.avg_ms));
+        } else if latency.stdev_ms >= latency.avg_ms.max(1.0) {
+            hints.push(format!(
+                "jittery latency ({:.2} ms stdev)",
+                latency.stdev_ms
+            ));
+        }
+    }
+    if let Some(bw) = &metrics.bandwidth_send {
+        if bw.mbps < 1.0 {
+            hints.push(format!("slow send throughput ({:.2} Mbit/s)", bw.mbps));
+        }
+    }
+    if let Some(bw) = &metrics.bandwidth_recv {
+        if bw.mbps < 1.0 {
+            hints.push(format!("slow receive throughput ({:.2} Mbit/s)", bw.mbps));
+        }
+    }
+    if let Some(transport) = &metrics.transport {
+        hints.extend(transport_bottleneck_hints(transport));
+    }
+    hints
+}
+
+fn print_transport_metrics(label: &str, transport: &DirectTransportMetrics) {
+    println!(
+        "{label} QUIC    : rtt {:.2} ms, cwnd {}, mtu {}, max datagram {}, loss {} pkts / {} B, sent {} pkts",
+        transport.path.rtt_ms,
+        format_bytes(transport.path.cwnd_bytes),
+        format_bytes(transport.path.current_mtu_bytes),
+        transport
+            .max_datagram_size_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "<n/a>".to_string()),
+        transport.path.lost_packets,
+        format_bytes(transport.path.lost_bytes),
+        transport.path.sent_packets,
+    );
+    println!(
+        "{label} UDP     : tx {} datagrams / {} B / {} ios, rx {} datagrams / {} B / {} ios",
+        transport.udp_tx.datagrams,
+        format_bytes(transport.udp_tx.bytes),
+        transport.udp_tx.ios,
+        transport.udp_rx.datagrams,
+        format_bytes(transport.udp_rx.bytes),
+        transport.udp_rx.ios,
+    );
+    println!(
+        "{label} frames  : tx acks {}, stream {}, datagram {}, blocked {} / {}, rx acks {}, stream {}, datagram {}, blocked {} / {}",
+        transport.frame_tx.acks,
+        transport.frame_tx.stream,
+        transport.frame_tx.datagram,
+        transport.frame_tx.data_blocked,
+        transport.frame_tx.stream_data_blocked,
+        transport.frame_rx.acks,
+        transport.frame_rx.stream,
+        transport.frame_rx.datagram,
+        transport.frame_rx.data_blocked,
+        transport.frame_rx.stream_data_blocked,
+    );
+
+    let hints = transport_bottleneck_hints(transport);
+    if !hints.is_empty() {
+        println!("{label} hint    : {}", hints.join(", "));
     }
 }
 
@@ -1228,7 +1806,227 @@ mod tests {
         ]);
         assert_eq!(metrics.samples, 3);
         assert_eq!(metrics.min_ms, 1.0);
+        assert_eq!(metrics.median_ms, 2.0);
         assert_eq!(metrics.avg_ms, 2.0);
+        assert!((metrics.stdev_ms - 0.816_496_580_927_726).abs() < 1e-12);
         assert_eq!(metrics.max_ms, 3.0);
+    }
+
+    #[test]
+    fn host_bottleneck_hints_flag_cpu_and_memory_pressure() {
+        let host = HostMetrics {
+            duration_secs: 12.0,
+            process_cpu_seconds: Some(10.5),
+            process_cpu_pct: Some(87.5),
+            process_rss_bytes: Some(512 * 1024 * 1024),
+            process_vsize_bytes: Some(768 * 1024 * 1024),
+            process_threads: Some(12),
+            process_minor_faults: Some(42),
+            process_major_faults: Some(1),
+            system_cpu_busy_pct: Some(91.0),
+            system_cpu_idle_pct: Some(9.0),
+            system_load: Some(LoadAverageMetrics {
+                one: 5.0,
+                five: 4.0,
+                fifteen: 3.0,
+                cur: 6,
+                max: 8,
+            }),
+            memory: Some(MemoryMetrics {
+                mem_total_bytes: 1_000,
+                mem_free_bytes: 120,
+                mem_available_bytes: Some(80),
+                swap_total_bytes: 256,
+                swap_free_bytes: 128,
+            }),
+            cpu_cores: Some(4),
+        };
+
+        let hints = host_bottleneck_hints(&host);
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("process CPU saturation")));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("machine CPU saturation")));
+        assert!(hints.iter().any(|hint| hint.contains("low available RAM")));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("load average above core count")));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("major page faults observed")));
+    }
+
+    #[test]
+    fn path_bottleneck_hints_flag_transport_pressure() {
+        let transport = DirectTransportMetrics {
+            udp_tx: UdpStatsMetrics {
+                datagrams: 10,
+                bytes: 1_000,
+                ios: 2,
+            },
+            udp_rx: UdpStatsMetrics {
+                datagrams: 8,
+                bytes: 900,
+                ios: 1,
+            },
+            frame_tx: FrameStatsMetrics {
+                data_blocked: 2,
+                stream_data_blocked: 1,
+                streams_blocked_bidi: 1,
+                ..FrameStatsMetrics::default()
+            },
+            frame_rx: FrameStatsMetrics::default(),
+            path: PathStatsMetrics {
+                rtt_ms: 150.0,
+                cwnd_bytes: 64 * 1024,
+                congestion_events: 1,
+                lost_packets: 3,
+                lost_bytes: 256,
+                sent_packets: 42,
+                sent_plpmtud_probes: 1,
+                lost_plpmtud_probes: 0,
+                black_holes_detected: 1,
+                current_mtu_bytes: 1100,
+            },
+            max_datagram_size_bytes: Some(1200),
+        };
+        let metrics = PathMetrics {
+            latency_send: Some(LatencyMetrics {
+                samples: 3,
+                min_ms: 110.0,
+                median_ms: 150.0,
+                avg_ms: 140.0,
+                stdev_ms: 16.0,
+                max_ms: 160.0,
+            }),
+            bandwidth_send: Some(BandwidthMetrics {
+                bytes: 10,
+                seconds: 1.0,
+                mbps: 0.08,
+                ack_observed: false,
+            }),
+            bandwidth_recv: Some(BandwidthMetrics {
+                bytes: 12,
+                seconds: 1.0,
+                mbps: 0.10,
+                ack_observed: true,
+            }),
+            transport: Some(transport),
+        };
+
+        let hints = path_bottleneck_hints(&metrics);
+        assert!(hints.iter().any(|hint| hint.contains("high latency")));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("slow send throughput")));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("slow receive throughput")));
+        assert!(hints.iter().any(|hint| hint.contains("high QUIC RTT")));
+        assert!(hints.iter().any(|hint| hint.contains("QUIC loss visible")));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("PMTUD black holes detected")));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("connection flow-control pressure")));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("stream flow-control pressure")));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("bidi stream limit pressure")));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("small MTU may cap throughput")));
+    }
+
+    #[test]
+    fn telemetry_round_trips_through_json() {
+        let peer = PeerMetrics {
+            host: HostMetrics {
+                duration_secs: 9.5,
+                process_cpu_seconds: Some(3.25),
+                process_cpu_pct: Some(34.2),
+                process_rss_bytes: Some(123_456),
+                process_vsize_bytes: Some(234_567),
+                process_threads: Some(4),
+                process_minor_faults: Some(11),
+                process_major_faults: Some(0),
+                system_cpu_busy_pct: Some(28.0),
+                system_cpu_idle_pct: Some(72.0),
+                system_load: Some(LoadAverageMetrics {
+                    one: 0.5,
+                    five: 0.4,
+                    fifteen: 0.3,
+                    cur: 1,
+                    max: 4,
+                }),
+                memory: Some(MemoryMetrics {
+                    mem_total_bytes: 8_000,
+                    mem_free_bytes: 2_000,
+                    mem_available_bytes: Some(3_000),
+                    swap_total_bytes: 1_000,
+                    swap_free_bytes: 900,
+                }),
+                cpu_cores: Some(8),
+            },
+            udp: Some(PathMetrics {
+                latency_send: Some(LatencyMetrics {
+                    samples: 2,
+                    min_ms: 1.0,
+                    median_ms: 1.5,
+                    avg_ms: 1.5,
+                    stdev_ms: 0.5,
+                    max_ms: 2.0,
+                }),
+                bandwidth_send: Some(BandwidthMetrics {
+                    bytes: 2048,
+                    seconds: 1.0,
+                    mbps: 0.016,
+                    ack_observed: true,
+                }),
+                bandwidth_recv: None,
+                transport: Some(DirectTransportMetrics {
+                    udp_tx: UdpStatsMetrics {
+                        datagrams: 1,
+                        bytes: 2,
+                        ios: 3,
+                    },
+                    udp_rx: UdpStatsMetrics {
+                        datagrams: 4,
+                        bytes: 5,
+                        ios: 6,
+                    },
+                    frame_tx: FrameStatsMetrics {
+                        acks: 7,
+                        ack_frequency: 8,
+                        stream: 9,
+                        ..FrameStatsMetrics::default()
+                    },
+                    frame_rx: FrameStatsMetrics::default(),
+                    path: PathStatsMetrics {
+                        rtt_ms: 23.0,
+                        cwnd_bytes: 64_000,
+                        congestion_events: 0,
+                        lost_packets: 0,
+                        lost_bytes: 0,
+                        sent_packets: 10,
+                        sent_plpmtud_probes: 0,
+                        lost_plpmtud_probes: 0,
+                        black_holes_detected: 0,
+                        current_mtu_bytes: 1400,
+                    },
+                    max_datagram_size_bytes: Some(1350),
+                }),
+            }),
+            tcp: None,
+        };
+
+        let encoded = serde_json::to_string(&peer).expect("serialize telemetry");
+        let decoded: PeerMetrics = serde_json::from_str(&encoded).expect("deserialize telemetry");
+        assert_eq!(decoded, peer);
     }
 }

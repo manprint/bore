@@ -398,6 +398,8 @@ impl Client {
         // reconnecting consumer) are forwarded here to re-punch the NAT.
         #[cfg(feature = "udp")]
         let mut punch_tx: Option<mpsc::UnboundedSender<Vec<SocketAddr>>> = None;
+        #[cfg(feature = "udp")]
+        let mut udp_reoffer_failures: u32 = 0;
         let this = Arc::new(self);
 
         // Carrier pool: pump each extra carrier's accepted data substreams into a
@@ -509,9 +511,15 @@ impl Client {
                                 Ok(socket) => {
                                     info!("provider udp candidate offer succeeded on retry");
                                     udp_socket = Some(socket);
+                                    udp_reoffer_failures = 0;
                                 }
                                 Err(err) => {
-                                    debug!(%err, "provider udp re-offer failed; will retry")
+                                    udp_reoffer_failures += 1;
+                                    if udp_reoffer_failures == 1 {
+                                        warn!(%err, "provider udp re-offer failed; will retry in 15s");
+                                    } else {
+                                        debug!(%err, "provider udp re-offer failed (attempt {})", udp_reoffer_failures);
+                                    }
                                 }
                             }
                         }
@@ -757,7 +765,21 @@ async fn offer_provider_candidates(
     let attempted_stun = discovery.attempted_stun;
     let candidates = discovery.candidates;
     if candidates.is_empty() {
-        bail!("no local UDP candidates discovered");
+        let stun_info = if attempted_stun == 0 {
+            "no STUN targets resolved".to_string()
+        } else if selected_stun.is_none() {
+            format!("all {attempted_stun} STUN probes failed")
+        } else {
+            "STUN returned no candidate addresses".to_string()
+        };
+        bail!(
+            "no UDP candidates for provider: {stun_info} \
+             (port_map={port_map}, port_prediction={port_prediction}, \
+             local_addr={}); direct path unavailable, using relay",
+            discovery_local_addr
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
+        );
     }
     info!(
         role = "provider",
@@ -843,7 +865,7 @@ async fn provider_direct(
                     // A single bad handshake (e.g. token mismatch from a stray
                     // peer) must not tear down the listener; log and keep serving.
                     Err(err) => {
-                        trace!(%err, "direct accept failed");
+                        warn!(%err, "direct udp accept failed (will retry in 100ms)");
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }

@@ -89,6 +89,13 @@ android-arm64: _builder
 # Build all architecture binaries (Linux amd64/arm64, macOS, Windows, Android).
 build: build-amd64 build-arm64 macos-m5 windows-amd64 android-arm64
 
+# Pre-commit: build + test + fmt + clippy (CI gate).
+test_all:
+    cargo build --all-features
+    cargo test --all-features
+    cargo fmt -- --check
+    cargo clippy --all-features -- -D warnings
+
 # Run `docker login` first and set `repo` above.
 # Build and push a multi-arch (amd64 + arm64) image to Docker Hub.
 push: _builder

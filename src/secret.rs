@@ -25,8 +25,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{interval, MissedTickBehavior};
-#[cfg(feature = "udp")]
-use tracing::debug;
 use tracing::{error, info, info_span, trace, warn, Instrument};
 
 use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Registration, Role};
@@ -474,7 +472,11 @@ async fn broker_udp(
         peer_selected_stun: consumer_offer.selected_stun,
     };
     if to_provider.send(offer).await.is_err() {
-        // Provider task is gone; fall back to relay.
+        warn!(
+            %id,
+            "provider task vanished during UDP brokering — provider connection \
+             closed between candidate offer and punch; consumer falls back to relay"
+        );
         control.send(ServerMessage::UdpUnavailable).await?;
         return Ok(());
     }
@@ -1149,7 +1151,21 @@ async fn gather_consumer_candidates(
     let attempted_stun = discovery.attempted_stun;
     let candidates = discovery.candidates;
     if candidates.is_empty() {
-        bail!("no local UDP candidates discovered");
+        let stun_info = if attempted_stun == 0 {
+            "no STUN targets resolved".to_string()
+        } else if selected_stun.is_none() {
+            format!("all {attempted_stun} STUN probes failed")
+        } else {
+            "STUN returned no addresses".to_string()
+        };
+        bail!(
+            "no UDP candidates for consumer: {stun_info} \
+             (port_map={port_map}, port_prediction={port_prediction}, \
+             local_addr={}); direct path unavailable",
+            discovery_local_addr
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
+        );
     }
     info!(
         role = "consumer",
@@ -1268,7 +1284,15 @@ async fn negotiate_direct_consumer(
         Ok(Ok(Some(value))) => value,
         Ok(Ok(None)) => return Ok(None),
         Ok(Err(err)) => return Err(err),
-        Err(_) => return Ok(None), // negotiation timed out → relay
+        Err(_) => {
+            warn!(
+                timeout = ?UDP_NEGOTIATE_TIMEOUT,
+                "direct udp negotiation timed out after {UDP_NEGOTIATE_TIMEOUT:?}; \
+                 falling back to relay — no UdpPunch received within timeout. \
+                 Check STUN server reachability and provider connectivity"
+            );
+            return Ok(None);
+        }
     };
     info!(
         provider_selected_stun = ?peer_selected_stun,
@@ -1352,7 +1376,11 @@ async fn upgrade_task(
     {
         Ok(v) => v,
         Err(err) => {
-            debug!(%err, "udp upgrade gather failed; staying on relay");
+            warn!(
+                %err,
+                "udp upgrade attempt failed at candidate gathering phase; \
+                 staying on relay, will retry in {UDP_UPGRADE_INTERVAL:?}"
+            );
             return;
         }
     };

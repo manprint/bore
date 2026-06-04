@@ -631,19 +631,31 @@ pub fn primary_local_ip() -> Option<IpAddr> {
 pub async fn discover_reflexive(socket: &UdpSocket, stun: SocketAddr) -> Result<SocketAddr> {
     let (request, txid) = stun::binding_request();
     let mut buf = [0u8; 512];
-    for _ in 0..3 {
+    for attempt in 0..3 {
         socket.send_to(&request, stun).await?;
         match timeout(STUN_TIMEOUT, socket.recv_from(&mut buf)).await {
             Ok(Ok((n, from))) if from.ip() == stun.ip() => {
                 if let Some(addr) = stun::parse_response(&buf[..n], &txid) {
                     return Ok(addr);
                 }
+                debug!(%stun, attempt, "STUN response has mismatched txid; retrying");
             }
-            Ok(Ok(_)) => continue, // stray datagram; keep waiting
-            Ok(Err(err)) => return Err(err).context("STUN recv failed"),
-            Err(_) => continue, // timed out; retry
+            Ok(Ok((_n, from))) => {
+                debug!(%stun, %from, attempt, "STUN response from unexpected source; retrying");
+                continue;
+            }
+            Ok(Err(err)) => {
+                return Err(err).context(format!("STUN recv failed (attempt {attempt})"))
+            }
+            Err(_) => {
+                if attempt < 2 {
+                    debug!(%stun, retry = attempt + 1, "STUN request timed out, retrying");
+                }
+                continue;
+            }
         }
     }
+    warn!(%stun, "no STUN response after 3 attempts");
     bail!("no STUN response from {stun}")
 }
 
@@ -1121,8 +1133,25 @@ pub async fn connect_direct(
 
     match timeout(NETWORK_TIMEOUT, futures_util::future::select_ok(attempts)).await {
         Ok(Ok((conn, _losers))) => Ok(conn),
-        Ok(Err(err)) => Err(err).context("all direct candidates failed"),
-        Err(_) => bail!("direct connect exhausted the {NETWORK_TIMEOUT:?} budget"),
+        Ok(Err(err)) => {
+            warn!(
+                candidates = ?peers,
+                "all {n} direct QUIC candidates failed; falling back to relay. \
+                 Use -v for per-candidate errors",
+                n = peers.len(),
+            );
+            Err(err).context("all direct candidates failed")
+        }
+        Err(_) => {
+            warn!(
+                timeout = ?NETWORK_TIMEOUT,
+                candidates = ?peers,
+                "direct QUIC connect exhausted {NETWORK_TIMEOUT:?} budget \
+                 across {n} candidates; falling back to relay",
+                n = peers.len(),
+            );
+            bail!("direct connect exhausted the {NETWORK_TIMEOUT:?} budget")
+        }
     }
 }
 
@@ -1187,6 +1216,11 @@ impl DirectListener {
         let mut peer_token = [0u8; TOKEN_LEN];
         recv.read_exact(&mut peer_token).await?;
         if !tokens_match(&token, &peer_token) {
+            warn!(
+                %peer,
+                "rejected direct QUIC connection: token mismatch \
+                 (stray connection or mismatched secrets)"
+            );
             bail!("direct path token mismatch");
         }
         send.write_all(&token).await?;

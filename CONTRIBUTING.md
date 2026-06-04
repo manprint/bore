@@ -34,7 +34,7 @@ Notes:
   signaling (STUN, brokering) compiling **without** the feature — verify with
   `--no-default-features`.
 - When touching direct UDP/QUIC performance, update every relevant doc with the
-  actual `src/holepunch.rs` tuning values: `DIRECT_QUIC_STREAM_RECEIVE_WINDOW`
+  actual `src/shared.rs` tuning values (consumed by `src/holepunch.rs`): `DIRECT_QUIC_STREAM_RECEIVE_WINDOW`
   (16 MiB), `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` / `DIRECT_QUIC_SEND_WINDOW`
   (64 MiB), `DIRECT_UDP_SOCKET_RECV_BUFFER` /
   `DIRECT_UDP_SOCKET_SEND_BUFFER` (16 MiB), `MAX_DIRECT_STREAMS` (4096), and

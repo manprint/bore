@@ -43,6 +43,26 @@ pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 /// ephemeral port so the NAT entry for the preferred port expires naturally.
 pub const NAT_UDP_RELEASE_TIMEOUT: u64 = 600;
 
+/// Default per-stream QUIC receive window for the direct UDP path.
+pub const DIRECT_QUIC_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// Default total QUIC receive window for one direct UDP connection.
+pub const DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
+
+/// Default upper bound on bytes sent but not yet acknowledged on the direct
+/// UDP path.
+pub const DIRECT_QUIC_SEND_WINDOW: u64 = 64 * 1024 * 1024;
+
+/// Default UDP socket receive buffer requested for each direct-path socket.
+pub const DIRECT_UDP_SOCKET_RECV_BUFFER: usize = 16 * 1024 * 1024;
+
+/// Default UDP socket send buffer requested for each direct-path socket.
+pub const DIRECT_UDP_SOCKET_SEND_BUFFER: usize = 16 * 1024 * 1024;
+
+/// Default cap on the number of concurrent native QUIC streams on a direct
+/// connection.
+pub const MAX_DIRECT_STREAMS: u32 = 4096;
+
 /// Idle time before the first TCP keepalive probe, and the interval between
 /// probes. Kept well under common NAT/firewall idle timeouts so that long but
 /// quiet transfers (e.g. a slow `tar | rclone rcat`) keep their middlebox
@@ -147,6 +167,36 @@ pub struct UdpCandidateOffer {
     /// STUN host:port selected by this peer, if a STUN probe succeeded.
     #[serde(default)]
     pub selected_stun: Option<String>,
+}
+
+/// Bandwidth-oriented tuning for the direct UDP path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpDirectTuning {
+    /// Per-stream QUIC receive window.
+    pub stream_receive_window: u32,
+    /// Total QUIC receive window for one direct connection.
+    pub connection_receive_window: u32,
+    /// Bytes sent but not yet acknowledged before the sender blocks.
+    pub send_window: u64,
+    /// Requested UDP receive buffer.
+    pub udp_socket_recv_buffer: usize,
+    /// Requested UDP send buffer.
+    pub udp_socket_send_buffer: usize,
+    /// Max concurrent QUIC bidi streams on the direct connection.
+    pub max_direct_streams: u32,
+}
+
+impl Default for UdpDirectTuning {
+    fn default() -> Self {
+        Self {
+            stream_receive_window: DIRECT_QUIC_STREAM_RECEIVE_WINDOW,
+            connection_receive_window: DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW,
+            send_window: DIRECT_QUIC_SEND_WINDOW,
+            udp_socket_recv_buffer: DIRECT_UDP_SOCKET_RECV_BUFFER,
+            udp_socket_send_buffer: DIRECT_UDP_SOCKET_SEND_BUFFER,
+            max_direct_streams: MAX_DIRECT_STREAMS,
+        }
+    }
 }
 
 /// A message from the client on the control substream.
@@ -274,6 +324,9 @@ pub enum ServerMessage {
         /// used to confirm whether both sides aligned on the same STUN server.
         #[serde(default)]
         peer_selected_stun: Option<String>,
+        /// Direct-UDP transport tuning requested by the server.
+        #[serde(default)]
+        tuning: UdpDirectTuning,
     },
 
     /// Provider-selected STUN server hint returned to a consumer before it
@@ -305,6 +358,9 @@ pub enum ServerMessage {
         peer_summary: UdpTestPeerSummary,
         /// Effective options both peers will use.
         options: UdpTestOptions,
+        /// Direct-UDP transport tuning requested by the server.
+        #[serde(default)]
+        tuning: UdpDirectTuning,
     },
 }
 
@@ -383,10 +439,39 @@ mod tests {
                 nonce,
                 peer,
                 peer_selected_stun,
+                tuning,
             } => {
                 assert_eq!(nonce, [0; UDP_NONCE_LEN]);
                 assert_eq!(peer, vec!["127.0.0.1:3478".parse().unwrap()]);
                 assert_eq!(peer_selected_stun, None);
+                assert_eq!(tuning, UdpDirectTuning::default());
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_udp_start_defaults_tuning() {
+        let msg: ServerMessage = serde_json::from_str(
+            r#"{"TestUdpStart":{"role":"Listener","nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"peer_candidates":["127.0.0.1:3478"],"peer_summary":{"nat_class":"Open","local_udp":"127.0.0.1:12345","primary_local_ip":null,"reflexive":[],"bore_stun":null,"candidate_count":1,"port_preserved":null},"options":{"bandwidth":false,"transfer_quota":1024}}}"#,
+        )
+        .unwrap();
+        match msg {
+            ServerMessage::TestUdpStart {
+                role,
+                nonce,
+                peer_candidates,
+                peer_summary,
+                options,
+                tuning,
+            } => {
+                assert_eq!(role, UdpTestRole::Listener);
+                assert_eq!(nonce, [0; UDP_NONCE_LEN]);
+                assert_eq!(peer_candidates, vec!["127.0.0.1:3478".parse().unwrap()]);
+                assert_eq!(peer_summary.nat_class, "Open");
+                assert!(!options.bandwidth);
+                assert_eq!(options.transfer_quota, 1024);
+                assert_eq!(tuning, UdpDirectTuning::default());
             }
             other => panic!("unexpected message: {other:?}"),
         }

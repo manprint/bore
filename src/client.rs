@@ -447,6 +447,7 @@ impl Client {
                             nonce,
                             peer,
                             peer_selected_stun,
+                            tuning,
                         }) => {
                             #[cfg(feature = "udp")]
                             {
@@ -475,8 +476,16 @@ impl Client {
                                     let this = Arc::clone(&this);
                                     tokio::spawn(async move {
                                         if let Err(err) =
-                                            provider_direct(socket, peer, token, this, rx, permits)
-                                                .await
+                                            provider_direct(
+                                                socket,
+                                                peer,
+                                                token,
+                                                tuning,
+                                                this,
+                                                rx,
+                                                permits,
+                                            )
+                                            .await
                                         {
                                             warn!(%err, "direct provider path ended");
                                         }
@@ -853,11 +862,12 @@ async fn provider_direct(
     socket: UdpSocket,
     peers: Vec<SocketAddr>,
     token: [u8; crate::holepunch::TOKEN_LEN],
+    tuning: crate::shared::UdpDirectTuning,
     client: Arc<Client>,
     mut punch_rx: mpsc::UnboundedReceiver<Vec<SocketAddr>>,
     permits: Arc<Semaphore>,
 ) -> Result<()> {
-    let listener = crate::holepunch::DirectListener::new(socket, peers).await?;
+    let listener = crate::holepunch::DirectListener::new(socket, peers, tuning).await?;
     info!("direct udp path ready, accepting connections");
     loop {
         tokio::select! {

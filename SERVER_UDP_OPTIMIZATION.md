@@ -22,11 +22,14 @@ Il binario prova gia a comportarsi bene senza tuning puntuale sui peer: il socke
 UDP del direct path richiede buffer send/receive da 16 MiB e QUIC usa BBR come
 congestion controller. I sysctl di questa guida servono a rimuovere cap del kernel
 o a migliorare il relay TCP/server, non sono prerequisiti per ogni client.
+I valori possono anche essere sovrascritti al bootstrap del server con i flag
+`--udp-*` omologhi o le env var `BORE_UDP_*`; il server li brokera ai peer del
+path diretto e alla diagnostica `test-udp` paired.
 
 ## Profilo direct UDP applicato nel codice
 
-Questi valori sono in `src/holepunch.rs` e valgono per `bore local --udp`,
-`bore proxy --udp` e `bore test-udp --tcp-secret-id`:
+Questi valori sono definiti in `src/shared.rs` e usati da `src/holepunch.rs`; valgono
+per `bore local --udp`, `bore proxy --udp` e `bore test-udp --tcp-secret-id`:
 
 | Parametro | Valore | Effetto |
 |---|---:|---|
@@ -39,9 +42,156 @@ Questi valori sono in `src/holepunch.rs` e valgono per `bore local --udp`,
 | `MAX_DIRECT_STREAMS` | 4096 | Numero massimo di bidi-stream QUIC concorrenti. |
 | `QUIC_KEEPALIVE` / `QUIC_MAX_IDLE` | 3 s / 10 s | Keep-alive NAT e rilevamento peer morto. |
 
+### Override lato server
+
+I valori nella tabella sopra sono i default. `bore server` puo sovrascriverli con
+questi flag/env:
+
+| Flag / env | Parametro |
+|---|---|
+| `--udp-stream-receive-window` / `BORE_UDP_STREAM_RECEIVE_WINDOW` | `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` |
+| `--udp-connection-receive-window` / `BORE_UDP_CONNECTION_RECEIVE_WINDOW` | `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` |
+| `--udp-send-window` / `BORE_UDP_SEND_WINDOW` | `DIRECT_QUIC_SEND_WINDOW` |
+| `--udp-socket-recv-buffer` / `BORE_UDP_SOCKET_RECV_BUFFER` | `DIRECT_UDP_SOCKET_RECV_BUFFER` |
+| `--udp-socket-send-buffer` / `BORE_UDP_SOCKET_SEND_BUFFER` | `DIRECT_UDP_SOCKET_SEND_BUFFER` |
+| `--udp-max-streams` / `BORE_UDP_MAX_STREAMS` | `MAX_DIRECT_STREAMS` |
+
 Con `-v` i log mostrano i buffer UDP effettivi concessi dal kernel (`actual_recv`,
 `actual_send`). Se sono molto inferiori a 16 MiB, alza `rmem_max`/`wmem_max`
 sull'host; bore ha gia richiesto il valore corretto.
+
+## TUNING UDP
+
+Se vuoi piu banda sul path diretto, la regola non e "alzare tutto": serve
+abbastanza finestra da coprire il BDP del percorso, ma non molto di piu.
+
+In prima approssimazione:
+
+- `BDP = banda desiderata * RTT`
+- se la finestra e sotto il BDP, il sender si ferma prima di saturare la linea
+- se la finestra e molto sopra il BDP, la banda non cresce, ma crescono memoria
+  e lavoro di buffering
+
+I riferimenti esterni sono coerenti su questo punto: RFC 9000 dice che il
+throughput viene limitato quando il credit di flow control e inferiore al BDP,
+RFC 9002 insiste sul pacing e sulle raffiche troppo grandi, e la doc di Quinn
+nota che le finestre andrebbero dimensionate rispetto a latenza, throughput e
+memoria disponibile.
+
+### Cosa fa davvero ogni leva
+
+| Parametro | Se lo alzi | Se lo abbassi | Memoria | CPU | Nota critica |
+|---|---|---|---|---|---|
+| `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` | migliora il singolo flusso che sta saturando la sua stream | blocca prima i writer su quella stream | cresce per stream attiva | quasi neutra, salvo piu reassembly e wakeup | e il primo knob quando un singolo stream non riempie il link |
+| `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` | permette a piu stream di sommare piu bytes in flight | limita il throughput aggregato della connessione | cresce per connessione | neutra o leggermente peggiore se produce burst | serve quando una stream non basta o ci sono piu flussi concorrenti |
+| `DIRECT_QUIC_SEND_WINDOW` | il sender puo tenere piu dati in volo prima dell'ACK | il sender si auto-limita anche se il peer offre credito | cresce sul lato che trasmette | quasi neutra, ma piu buffering lato sender | se e troppo basso, il peer resta con credito ma il sender non lo usa |
+| `DIRECT_UDP_SOCKET_RECV_BUFFER` | assorbe burst UDP e riduce drop kernel | aumenta il rischio di drop o riordino persi | cresce per socket | puo scendere perche ci sono meno drop, ma cresce la pressione di memoria | e il primo knob se vedi `actual_recv` molto sotto il richiesto |
+| `DIRECT_UDP_SOCKET_SEND_BUFFER` | evita che il sender resti corto di coda nel kernel | limita il burst in uscita | cresce per socket | di solito neutra; troppo alto puo peggiorare la burstiness | utile su path con jitter o scheduling irregolare |
+| `MAX_DIRECT_STREAMS` | aumenta la concorrenza per connessione | blocca l'apertura di nuove stream | cresce con il numero di stream attive | cresce il bookkeeping e la scheduler pressure | non aumenta la banda di un singolo flusso; serve solo per tante connessioni |
+| `QUIC_KEEPALIVE` / `QUIC_MAX_IDLE` | piu liveness, meno NAT drop | meno traffico di mantenimento, ma piu rischio di idle timeout | cambia poco la memoria | piu keepalive = piu wakeup; meno keepalive = meno CPU | non e una leva di banda; cambia solo se hai problemi di NAT o di timeout |
+
+Due punti sono facili da sbagliare:
+
+- `MAX_DIRECT_STREAMS` non e una leva per un singolo bulk transfer. Se hai una
+  sola stream attiva, alzarlo non aumenta la banda.
+- le finestre QUIC e i buffer UDP non sono equivalenti: una finestra grande senza
+  buffer kernel adeguati produce comunque drop o stalli, e buffer enormi senza
+  finestre adeguate non aumentano la banda.
+
+### Lettura pratica dei numeri
+
+Le dimensioni attuali hanno senso come profilo di partenza per link internet
+comuni. Per capire se sono abbastanza, conviene confrontarle con il BDP reale.
+
+| Finestra | ~40 ms RTT | ~100 ms RTT |
+|---|---:|---:|
+| 16 MiB | ~3.3 Gbit/s | ~1.3 Gbit/s |
+| 64 MiB | ~13.4 Gbit/s | ~5.4 Gbit/s |
+
+Questa tabella non dice che il tunnel andra davvero a quelle velocita: dice che
+quelle finestre smettono di essere il collo di bottiglia solo fino a quel livello.
+Se il link e piu lento, la finestra non e il problema; se il link e piu veloce o
+la RTT e piu alta, i valori di default diventano presto stretti.
+
+### Perche i default non vanno sempre alzati
+
+Alzare i valori aumenta il margine per la banda, ma il costo non e gratis:
+
+- la memoria cresce quasi linearmente con il numero di connessioni e stream che
+  usano davvero quel credito;
+- il kernel puo dover trattenere piu pacchetti e piu buffering per socket;
+- la CPU non cresce solo per il numero assoluto del buffer, ma cresce quando il
+  traffico diventa piu bursty, quando i datagrammi sono piu frammentati o quando
+  la reassembly queue si allunga;
+- oltre il BDP utile, il guadagno di banda tende a fermarsi mentre la pressione
+  di memoria continua a salire.
+
+Quindi il tuning giusto non e "piu grande possibile", ma "abbastanza grande da
+non limitare il path".
+
+### Caso MAX_BANDWIDTH
+
+Questo e il profilo per quando vuoi spremere il piu possibile il tunnel diretto
+su un path stabile e con memoria disponibile.
+
+Obiettivo:
+
+- tenere la finestra sopra il BDP reale del percorso;
+- evitare che una singola stream monopolizzi il credito;
+- evitare drop UDP sul kernel;
+- lasciare al congestion controller abbastanza spazio per lavorare senza
+  strozzarlo con buffer troppo piccoli.
+
+Profilo di partenza ragionevole:
+
+| Parametro | Valore aggressivo | Perche |
+|---|---:|---|
+| `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` | 32-64 MiB | una singola stream puo riempire anche link ad alta latenza |
+| `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` | 128-256 MiB | piu stream o una stream molto larga senza stallo aggregato |
+| `DIRECT_QUIC_SEND_WINDOW` | 128-256 MiB | il sender non deve restare indietro rispetto al credit ricevuto |
+| `DIRECT_UDP_SOCKET_RECV_BUFFER` | 32-64 MiB | meno drop kernel quando arrivano raffiche o burst di ACK/data |
+| `DIRECT_UDP_SOCKET_SEND_BUFFER` | 32-64 MiB | meno blocchi del sender per coda kernel corta |
+| `MAX_DIRECT_STREAMS` | lascia 4096, o scendi se hai poche connessioni | non e il primo collo di bottiglia della banda |
+
+Se vuoi massimizzare davvero la banda, la sequenza giusta e questa:
+
+1. Misura il RTT reale del path.
+2. Stima il BDP e porta `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` sopra quel valore.
+3. Alza `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` e `DIRECT_QUIC_SEND_WINDOW` in
+   modo coerente, senza lasciare il sender sotto il receiver.
+4. Alza i buffer UDP finche `actual_recv` e `actual_send` non sono vicini ai
+   valori richiesti e i drop kernel restano nulli o marginali.
+5. Solo dopo valuta se il numero di stream concorrenti richiede piu di 4096.
+
+Il punto piu importante: se il tunnel finisce sul relay TCP invece che sul path
+diretto, questo profilo non basta da solo. In quel caso entrano in gioco i
+sysctl dell'host, `fq`/BBR e i carrier paralleli descritti piu sotto.
+
+### Quando il profilo MAX_BANDWIDTH peggiora le cose
+
+Il profilo aggressivo puo diventare controproducente se:
+
+- la RTT e bassa e la banda richiesta non giustifica buffer cosi grandi;
+- il peer o l'host hanno poca RAM e molte connessioni contemporanee;
+- il path perde pacchetti o ha MTU instabile, perche piu credito significa piu
+  dati che restano in giro quando si verifica perdita;
+- il carico e fatto di tanti stream piccoli, perche il guadagno vero viene dal
+  parallelismo, non dal gonfiare i buffer di ogni singola connessione.
+
+In altre parole: il profilo MAX_BANDWIDTH e corretto solo quando il collo di
+bottiglia e davvero la finestra, non la CPU dell'applicazione, la RAM del peer o
+la qualita del path.
+
+### Riferimenti utili
+
+- [RFC 9000 - QUIC: A UDP-Based Multiplexed and Secure Transport](https://www.rfc-editor.org/rfc/rfc9000)
+- [RFC 9002 - QUIC Loss Detection and Congestion Control](https://www.rfc-editor.org/rfc/rfc9002)
+- [Quinn TransportConfig](https://docs.rs/quinn/latest/quinn/struct.TransportConfig.html)
+- [Linux ip-sysctl](https://docs.kernel.org/networking/ip-sysctl.html)
+
+Se vuoi un ordine di tuning pratico: prima sistema il BDP con le finestre QUIC,
+poi verifica i buffer UDP reali con i log `-v`, e solo alla fine tocca i limiti
+di concorrenza o il fallback relay.
 
 ## Docker networking: bridge vs host
 

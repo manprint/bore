@@ -32,7 +32,7 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::shared::CONTROL_PORT;
+use crate::shared::{UdpDirectTuning, CONTROL_PORT};
 
 /// Number of consecutive ports predicted past the reflexive one when
 /// `--try-port-prediction` is enabled (best-effort symmetric-NAT traversal).
@@ -77,59 +77,6 @@ const QUIC_KEEPALIVE: Duration = Duration::from_secs(3);
 #[cfg(feature = "udp")]
 const QUIC_MAX_IDLE: Duration = Duration::from_secs(10);
 
-/// Max concurrent native QUIC bidi streams the provider lets a consumer open on a
-/// direct connection (one stream per proxied connection). Set generous so the
-/// provider's `--max-conns` semaphore is the real bound, mirroring how the relay
-/// leaves yamux's stream limit generous.
-#[cfg(feature = "udp")]
-const MAX_DIRECT_STREAMS: u32 = 4096;
-
-/// Per-stream QUIC receive window for the direct UDP path.
-///
-/// Quinn's default is deliberately conservative (roughly sized for a 100 Mbit/s,
-/// 100 ms path). Bore's direct path is often used for large file transfers and
-/// high-BDP links, so keep this value near the transport config rather than
-/// buried in `transport_config()`. If a future agent is tuning bulk throughput,
-/// start here: this is the main single-stream flow-control window advertised to
-/// the peer. Raising it improves high-latency/high-bandwidth transfers at the
-/// cost of more worst-case buffering per active QUIC stream.
-#[cfg(feature = "udp")]
-const DIRECT_QUIC_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
-
-/// Total QUIC receive window for one direct connection.
-///
-/// This caps aggregate data buffered across all native QUIC streams on the same
-/// direct peer connection. Keep it comfortably above the per-stream window so a
-/// single bulk stream can fill the pipe while still leaving room for concurrent
-/// proxied connections. Increase with care on small machines: this is a memory
-/// budget, not just a speed knob.
-#[cfg(feature = "udp")]
-const DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
-
-/// Upper bound on bytes sent but not yet acknowledged on the direct QUIC path.
-///
-/// Match the aggregate receive window by default. If paired `test-udp` shows the
-/// sender stalling below the expected bandwidth-delay product while CPU and loss
-/// are low, this is the companion knob to raise after the receive windows.
-#[cfg(feature = "udp")]
-const DIRECT_QUIC_SEND_WINDOW: u64 = 64 * 1024 * 1024;
-
-/// UDP socket receive buffer requested for every direct-path socket.
-///
-/// This is intentionally an application default, not a deployment instruction:
-/// bore asks the OS for enough UDP buffering to absorb QUIC bursts without users
-/// needing per-peer sysctl tuning. Kernels may clamp the effective value to their
-/// `rmem_max`, but requesting it here fixes the common case and makes `-v` logs
-/// show what the OS actually granted.
-const DIRECT_UDP_SOCKET_RECV_BUFFER: usize = 16 * 1024 * 1024;
-
-/// UDP socket send buffer requested for every direct-path socket.
-///
-/// Keep this paired with the receive buffer: QUIC pacing and congestion control
-/// still decide what goes on the wire, but a tiny OS send buffer can throttle the
-/// userspace endpoint before QUIC reaches its intended pacing behavior.
-const DIRECT_UDP_SOCKET_SEND_BUFFER: usize = 16 * 1024 * 1024;
-
 type HmacSha256 = Hmac<Sha256>;
 
 /// Derive the shared QUIC authentication token from the tunnel secret (if any)
@@ -164,7 +111,7 @@ pub async fn bind_socket(port: u16) -> Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .context("failed to create UDP socket")?;
-    configure_udp_socket_buffers(&socket);
+    configure_udp_socket_buffers(&socket, &UdpDirectTuning::default());
 
     // Reuse the address so a reconnect can rebind the fixed port without waiting
     // for the previous socket to be fully released.
@@ -185,18 +132,19 @@ pub async fn bind_socket(port: u16) -> Result<UdpSocket> {
     UdpSocket::from_std(socket.into()).context("failed to register UDP socket with tokio")
 }
 
-fn configure_udp_socket_buffers(socket: &socket2::Socket) {
-    if let Err(err) = socket.set_recv_buffer_size(DIRECT_UDP_SOCKET_RECV_BUFFER) {
-        debug!(%err, requested = DIRECT_UDP_SOCKET_RECV_BUFFER, "failed to raise UDP receive buffer");
+fn configure_udp_socket_buffers<S: std::os::fd::AsFd>(socket: &S, tuning: &UdpDirectTuning) {
+    let socket = socket2::SockRef::from(socket);
+    if let Err(err) = socket.set_recv_buffer_size(tuning.udp_socket_recv_buffer) {
+        debug!(%err, requested = tuning.udp_socket_recv_buffer, "failed to raise UDP receive buffer");
     }
-    if let Err(err) = socket.set_send_buffer_size(DIRECT_UDP_SOCKET_SEND_BUFFER) {
-        debug!(%err, requested = DIRECT_UDP_SOCKET_SEND_BUFFER, "failed to raise UDP send buffer");
+    if let Err(err) = socket.set_send_buffer_size(tuning.udp_socket_send_buffer) {
+        debug!(%err, requested = tuning.udp_socket_send_buffer, "failed to raise UDP send buffer");
     }
 
     debug!(
-        requested_recv = DIRECT_UDP_SOCKET_RECV_BUFFER,
+        requested_recv = tuning.udp_socket_recv_buffer,
         actual_recv = ?socket.recv_buffer_size().ok(),
-        requested_send = DIRECT_UDP_SOCKET_SEND_BUFFER,
+        requested_send = tuning.udp_socket_send_buffer,
         actual_send = ?socket.send_buffer_size().ok(),
         "configured UDP socket buffers"
     );
@@ -1083,10 +1031,12 @@ pub async fn connect_direct(
     socket: UdpSocket,
     peers: Vec<SocketAddr>,
     token: [u8; TOKEN_LEN],
+    tuning: UdpDirectTuning,
 ) -> Result<DirectConn> {
     if peers.is_empty() {
         bail!("no peer candidates to connect to");
     }
+    configure_udp_socket_buffers(&socket, &tuning);
     let local_addr = socket.local_addr().ok();
     info!(
         udp_local_addr = ?local_addr,
@@ -1094,7 +1044,7 @@ pub async fn connect_direct(
         "consumer punching UDP peer candidates"
     );
     punch(&socket, &peers).await;
-    let endpoint = client_endpoint(socket)?;
+    let endpoint = client_endpoint(socket, &tuning)?;
 
     // Try all candidates concurrently under a single total budget (not a full
     // timeout *per* candidate): with N candidates the serial worst case was
@@ -1193,7 +1143,12 @@ pub struct DirectListener {
 #[cfg(feature = "udp")]
 impl DirectListener {
     /// Punch toward `peers` and start a QUIC server endpoint over `socket`.
-    pub async fn new(socket: UdpSocket, peers: Vec<SocketAddr>) -> Result<Self> {
+    pub async fn new(
+        socket: UdpSocket,
+        peers: Vec<SocketAddr>,
+        tuning: UdpDirectTuning,
+    ) -> Result<Self> {
+        configure_udp_socket_buffers(&socket, &tuning);
         let local_addr = socket.local_addr().ok();
         info!(
             udp_local_addr = ?local_addr,
@@ -1201,7 +1156,7 @@ impl DirectListener {
             "provider punching UDP peer candidates and starting QUIC listener"
         );
         punch(&socket, &peers).await;
-        let endpoint = server_endpoint(socket)?;
+        let endpoint = server_endpoint(socket, &tuning)?;
         Ok(DirectListener { endpoint })
     }
 
@@ -1264,7 +1219,7 @@ impl DirectListener {
 
 /// Build a QUIC client endpoint over an already-bound UDP socket.
 #[cfg(feature = "udp")]
-fn client_endpoint(socket: UdpSocket) -> Result<Endpoint> {
+fn client_endpoint(socket: UdpSocket, tuning: &UdpDirectTuning) -> Result<Endpoint> {
     let socket = into_std(socket)?;
     let mut endpoint = Endpoint::new(
         EndpointConfig::default(),
@@ -1273,7 +1228,7 @@ fn client_endpoint(socket: UdpSocket) -> Result<Endpoint> {
         Arc::new(TokioRuntime),
     )
     .context("failed to create QUIC client endpoint")?;
-    endpoint.set_default_client_config(client_config()?);
+    endpoint.set_default_client_config(client_config(tuning)?);
     Ok(endpoint)
 }
 
@@ -1281,16 +1236,16 @@ fn client_endpoint(socket: UdpSocket) -> Result<Endpoint> {
 /// a default client config so it can fire outbound connections to punch its NAT
 /// toward reconnecting consumers (see [`DirectListener::punch_via_endpoint`]).
 #[cfg(feature = "udp")]
-fn server_endpoint(socket: UdpSocket) -> Result<Endpoint> {
+fn server_endpoint(socket: UdpSocket, tuning: &UdpDirectTuning) -> Result<Endpoint> {
     let socket = into_std(socket)?;
     let mut endpoint = Endpoint::new(
         EndpointConfig::default(),
-        Some(server_config()?),
+        Some(server_config(tuning)?),
         socket,
         Arc::new(TokioRuntime),
     )
     .context("failed to create QUIC server endpoint")?;
-    endpoint.set_default_client_config(client_config()?);
+    endpoint.set_default_client_config(client_config(tuning)?);
     Ok(endpoint)
 }
 
@@ -1305,18 +1260,17 @@ fn into_std(socket: UdpSocket) -> Result<StdUdpSocket> {
 }
 
 #[cfg(feature = "udp")]
-fn transport_config() -> quinn::TransportConfig {
+fn transport_config(tuning: &UdpDirectTuning) -> quinn::TransportConfig {
     let mut cfg = quinn::TransportConfig::default();
     cfg.keep_alive_interval(Some(QUIC_KEEPALIVE));
     cfg.max_idle_timeout(Some(QUIC_MAX_IDLE.try_into().expect("valid idle timeout")));
 
     // High-throughput direct transfers need flow-control windows larger than
-    // Quinn's defaults. These are deliberately constants above, not inline
-    // literals, so the next person tuning real-world UDP/QUIC performance can
-    // adjust the BDP/memory trade-off in one obvious place.
-    cfg.stream_receive_window(DIRECT_QUIC_STREAM_RECEIVE_WINDOW.into());
-    cfg.receive_window(DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW.into());
-    cfg.send_window(DIRECT_QUIC_SEND_WINDOW);
+    // Quinn's defaults. The values come from the brokered tuning struct, so the
+    // server can override them without changing the code path that consumes it.
+    cfg.stream_receive_window(tuning.stream_receive_window.into());
+    cfg.receive_window(tuning.connection_receive_window.into());
+    cfg.send_window(tuning.send_window);
 
     // TCP relay often benefits from kernel BBR. Use Quinn's BBR controller for
     // the direct QUIC path too, so high-BDP peer-to-peer transfers are not stuck
@@ -1325,14 +1279,14 @@ fn transport_config() -> quinn::TransportConfig {
 
     // One native QUIC stream per proxied connection: raise the concurrent-stream
     // limit well above quinn's small default so it is not the bottleneck.
-    cfg.max_concurrent_bidi_streams(MAX_DIRECT_STREAMS.into());
+    cfg.max_concurrent_bidi_streams(tuning.max_direct_streams.into());
     cfg
 }
 
 /// QUIC client config: accept any server certificate (the token handshake, not
 /// the certificate, authenticates the peer).
 #[cfg(feature = "udp")]
-fn client_config() -> Result<ClientConfig> {
+fn client_config(tuning: &UdpDirectTuning) -> Result<ClientConfig> {
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -1346,13 +1300,13 @@ fn client_config() -> Result<ClientConfig> {
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .context("invalid QUIC client crypto")?;
     let mut config = ClientConfig::new(Arc::new(quic));
-    config.transport_config(Arc::new(transport_config()));
+    config.transport_config(Arc::new(transport_config(tuning)));
     Ok(config)
 }
 
 /// QUIC server config with a self-signed certificate.
 #[cfg(feature = "udp")]
-fn server_config() -> Result<ServerConfig> {
+fn server_config(tuning: &UdpDirectTuning) -> Result<ServerConfig> {
     let cert = rcgen::generate_simple_self_signed(vec!["bore".to_string()])
         .context("failed to generate self-signed certificate")?;
     let cert_der = cert.cert.der().clone();
@@ -1374,7 +1328,7 @@ fn server_config() -> Result<ServerConfig> {
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
         .context("invalid QUIC server crypto")?;
     let mut config = ServerConfig::with_crypto(Arc::new(quic));
-    config.transport_config(Arc::new(transport_config()));
+    config.transport_config(Arc::new(transport_config(tuning)));
     Ok(config)
 }
 

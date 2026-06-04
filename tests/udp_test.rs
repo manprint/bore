@@ -868,9 +868,10 @@ async fn udp_connect_budget_bounded() {
         .map(|i| format!("203.0.113.{i}:9").parse().unwrap())
         .collect();
     let token = holepunch::derive_token(Some("s"), &[0u8; 16]);
+    let tuning = bore_cli::shared::UdpDirectTuning::default();
 
     let start = std::time::Instant::now();
-    let res = holepunch::connect_direct(socket, peers, token).await;
+    let res = holepunch::connect_direct(socket, peers, token, tuning).await;
     let elapsed = start.elapsed();
 
     assert!(res.is_err(), "dial to dead candidates must fail");

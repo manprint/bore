@@ -25,8 +25,8 @@ use crate::auth::Authenticator;
 use crate::holepunch::{self, NatClass, StunObservation};
 use crate::mux;
 use crate::shared::{
-    ClientMessage, Delimited, ServerMessage, UdpTestOptions, UdpTestPeerSummary, UdpTestRole,
-    PROXY_BUFFER_SIZE, UDP_NONCE_LEN,
+    ClientMessage, Delimited, ServerMessage, UdpDirectTuning, UdpTestOptions, UdpTestPeerSummary,
+    UdpTestRole, PROXY_BUFFER_SIZE, UDP_NONCE_LEN,
 };
 use crate::transport::{self, Endpoint};
 
@@ -58,6 +58,7 @@ struct PeerStart {
     peer_candidates: Vec<SocketAddr>,
     peer_summary: UdpTestPeerSummary,
     options: UdpTestOptions,
+    tuning: UdpDirectTuning,
 }
 
 struct PendingGuard {
@@ -87,6 +88,7 @@ pub async fn serve_peer(
     candidates: Vec<SocketAddr>,
     summary: UdpTestPeerSummary,
     options: UdpTestOptions,
+    tuning: UdpDirectTuning,
 ) -> Result<()> {
     if let Some((_key, pending)) = registry.remove(&id) {
         let nonce = new_nonce();
@@ -98,6 +100,7 @@ pub async fn serve_peer(
             peer_candidates: candidates.clone(),
             peer_summary: summary.clone(),
             options: effective,
+            tuning,
         };
         if pending.start_tx.send(first).is_ok() {
             info!(%id, first = %pending.peer, second = %peer, "paired udp diagnostic peers");
@@ -108,6 +111,7 @@ pub async fn serve_peer(
                     peer_candidates: pending.candidates,
                     peer_summary: pending.summary,
                     options: effective,
+                    tuning,
                 })
                 .await?;
             return relay_loop(control, acceptor, pending.opener).await;
@@ -173,6 +177,7 @@ async fn wait_for_peer(
             peer_candidates: start.peer_candidates,
             peer_summary: start.peer_summary,
             options: start.options,
+            tuning: start.tuning,
         })
         .await?;
     relay_loop(control, acceptor, start.peer_opener).await
@@ -316,6 +321,7 @@ pub async fn run_peer_test(
         start.role,
         start.peer_candidates.clone(),
         token,
+        start.tuning,
         start.options,
     )
     .await;
@@ -377,6 +383,7 @@ async fn wait_for_start(control: &mut Delimited<mux::Stream>) -> Result<StartInf
                 peer_candidates,
                 peer_summary,
                 options,
+                tuning,
             }) => {
                 return Ok(StartInfo {
                     role,
@@ -384,6 +391,7 @@ async fn wait_for_start(control: &mut Delimited<mux::Stream>) -> Result<StartInf
                     peer_candidates,
                     peer_summary,
                     options,
+                    tuning,
                 });
             }
             Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
@@ -403,6 +411,7 @@ struct StartInfo {
     peer_candidates: Vec<SocketAddr>,
     peer_summary: UdpTestPeerSummary,
     options: UdpTestOptions,
+    tuning: UdpDirectTuning,
 }
 
 #[cfg(feature = "udp")]
@@ -411,11 +420,12 @@ async fn run_udp_path(
     role: UdpTestRole,
     peer_candidates: Vec<SocketAddr>,
     token: [u8; holepunch::TOKEN_LEN],
+    tuning: UdpDirectTuning,
     options: UdpTestOptions,
 ) -> Option<PathMetrics> {
     println!();
     println!("UDP direct path    : trying QUIC hole punching");
-    let conn = match establish_direct(socket, role, peer_candidates, token).await {
+    let conn = match establish_direct(socket, role, peer_candidates, token, tuning).await {
         Ok(conn) => conn,
         Err(err) => {
             println!("UDP direct path    : FAILED ({err})");
@@ -439,6 +449,7 @@ async fn run_udp_path(
     _role: UdpTestRole,
     _peer_candidates: Vec<SocketAddr>,
     _token: [u8; holepunch::TOKEN_LEN],
+    _tuning: UdpDirectTuning,
     _options: UdpTestOptions,
 ) -> Option<PathMetrics> {
     println!();
@@ -452,17 +463,20 @@ async fn establish_direct(
     role: UdpTestRole,
     peer_candidates: Vec<SocketAddr>,
     token: [u8; holepunch::TOKEN_LEN],
+    tuning: UdpDirectTuning,
 ) -> Result<holepunch::DirectConn> {
     match role {
         UdpTestRole::Listener => {
-            let listener = holepunch::DirectListener::new(socket, peer_candidates)
+            let listener = holepunch::DirectListener::new(socket, peer_candidates, tuning)
                 .await
                 .context("start diagnostic QUIC listener")?;
             Ok(timeout(Duration::from_secs(10), listener.accept(token))
                 .await
                 .context("timed out waiting for direct QUIC peer")??)
         }
-        UdpTestRole::Dialer => holepunch::connect_direct(socket, peer_candidates, token).await,
+        UdpTestRole::Dialer => {
+            holepunch::connect_direct(socket, peer_candidates, token, tuning).await
+        }
     }
 }
 

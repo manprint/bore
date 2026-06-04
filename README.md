@@ -215,7 +215,11 @@ the relay fallback).
 For bulk transfers, the direct QUIC path is tuned in code with larger flow-control
 windows than Quinn's defaults: `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` (16 MiB),
 `DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` (64 MiB), and `DIRECT_QUIC_SEND_WINDOW`
-(64 MiB) in `src/holepunch.rs`. Bore also requests
+(64 MiB) in `src/shared.rs`. The same defaults can now be overridden on
+`bore server` with `--udp-stream-receive-window`, `--udp-connection-receive-window`,
+`--udp-send-window`, `--udp-socket-recv-buffer`, `--udp-socket-send-buffer`, and
+`--udp-max-streams` (or the matching `BORE_...` env vars); the server brokers the
+chosen tuning to the direct-path peers. Bore also requests
 `DIRECT_UDP_SOCKET_RECV_BUFFER` and `DIRECT_UDP_SOCKET_SEND_BUFFER` (16 MiB each),
 sets `MAX_DIRECT_STREAMS` to 4096, keeps QUIC alive every 3s with a 10s idle
 timeout, and uses `quinn::congestion::BbrConfig` for the direct path. If

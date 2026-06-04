@@ -6,7 +6,7 @@ use bore_cli::{
     reconnect,
     secret::Proxy,
     server::Server,
-    shared::{TunnelOptions, UdpTestOptions, MAX_NOTES_LEN},
+    shared::{TunnelOptions, UdpDirectTuning, UdpTestOptions, MAX_DIRECT_STREAMS, MAX_NOTES_LEN},
 };
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand};
 use tracing::info;
@@ -317,6 +317,61 @@ enum Command {
         #[clap(long, env = "BORE_UDP")]
         udp: bool,
 
+        /// QUIC receive window per direct-UDP stream on the server-brokered
+        /// direct path. Accepts raw bytes or KB/MB/GB/KiB/MiB/GiB suffixes.
+        #[clap(
+            long,
+            value_name = "SIZE",
+            default_value = "16MiB",
+            env = "BORE_UDP_STREAM_RECEIVE_WINDOW"
+        )]
+        udp_stream_receive_window: String,
+
+        /// Aggregate QUIC receive window per direct-UDP connection. Accepts raw
+        /// bytes or KB/MB/GB/KiB/MiB/GiB suffixes.
+        #[clap(
+            long,
+            value_name = "SIZE",
+            default_value = "64MiB",
+            env = "BORE_UDP_CONNECTION_RECEIVE_WINDOW"
+        )]
+        udp_connection_receive_window: String,
+
+        /// QUIC send window for the server-brokered direct UDP path. Accepts raw
+        /// bytes or KB/MB/GB/KiB/MiB/GiB suffixes.
+        #[clap(
+            long,
+            value_name = "SIZE",
+            default_value = "64MiB",
+            env = "BORE_UDP_SEND_WINDOW"
+        )]
+        udp_send_window: String,
+
+        /// UDP socket receive buffer requested by the server for direct UDP.
+        /// Accepts raw bytes or KB/MB/GB/KiB/MiB/GiB suffixes.
+        #[clap(
+            long,
+            value_name = "SIZE",
+            default_value = "16MiB",
+            env = "BORE_UDP_SOCKET_RECV_BUFFER"
+        )]
+        udp_socket_recv_buffer: String,
+
+        /// UDP socket send buffer requested by the server for direct UDP.
+        /// Accepts raw bytes or KB/MB/GB/KiB/MiB/GiB suffixes.
+        #[clap(
+            long,
+            value_name = "SIZE",
+            default_value = "16MiB",
+            env = "BORE_UDP_SOCKET_SEND_BUFFER"
+        )]
+        udp_socket_send_buffer: String,
+
+        /// Max native QUIC bidi streams the server allows on a direct UDP
+        /// connection. 4096 matches the current default.
+        #[clap(long, value_name = "N", default_value_t = MAX_DIRECT_STREAMS, env = "BORE_UDP_MAX_STREAMS")]
+        udp_max_streams: u32,
+
         /// Enable the admin status page at /admin/status on the control port,
         /// guarded by this token (min 32 chars). Unset = the page is disabled.
         #[clap(
@@ -464,6 +519,21 @@ async fn dispatch(command: Command) -> Result<()> {
                         .exit();
                 }
             }
+            if udp {
+                info!(
+                    mode = "local",
+                    secret_tunnel = tcp_secret_id.is_some(),
+                    udp,
+                    stun_server = ?stun_server.as_deref(),
+                    upnp,
+                    try_port_prediction,
+                    nat_udp_preferred_port,
+                    nat_udp_release_timeout,
+                    max_conns,
+                    carriers,
+                    "resolved UDP optimization settings",
+                );
+            }
             match tcp_secret_id {
                 Some(id) => {
                     let meta = ProviderMeta { notes, basic_auth };
@@ -549,6 +619,19 @@ async fn dispatch(command: Command) -> Result<()> {
         } => {
             let bind_addr = parse_proxy_addr(&local_proxy_port)?;
             let notes = clamp_notes(notes);
+            if udp {
+                info!(
+                    mode = "proxy",
+                    udp,
+                    stun_server = ?stun_server.as_deref(),
+                    upnp,
+                    try_port_prediction,
+                    nat_udp_preferred_port,
+                    nat_udp_release_timeout,
+                    carriers,
+                    "resolved UDP optimization settings",
+                );
+            }
             let connect = move || {
                 let (to, tcp_secret_id, secret, stun_server, notes) = (
                     to.clone(),
@@ -591,6 +674,12 @@ async fn dispatch(command: Command) -> Result<()> {
             bind_addr,
             bind_tunnels,
             udp,
+            udp_stream_receive_window,
+            udp_connection_receive_window,
+            udp_send_window,
+            udp_socket_recv_buffer,
+            udp_socket_send_buffer,
+            udp_max_streams,
             admin_token,
         } => {
             let port_range = min_port..=max_port;
@@ -614,6 +703,14 @@ async fn dispatch(command: Command) -> Result<()> {
             server.set_admin_token(admin_token);
             server.set_max_conns(max_conns);
             server.set_max_carriers(max_carriers);
+            server.set_udp_tuning(parse_udp_tuning(
+                &udp_stream_receive_window,
+                &udp_connection_receive_window,
+                &udp_send_window,
+                &udp_socket_recv_buffer,
+                &udp_socket_send_buffer,
+                udp_max_streams,
+            )?);
             server.set_control_port(control_port);
             if let Some(domain) = bind_domain {
                 server.set_bind_domain(domain);
@@ -660,6 +757,15 @@ async fn dispatch(command: Command) -> Result<()> {
                         .exit();
                 };
                 let transfer_quota = parse_transfer_quota(&test_transfer_quota)?;
+                info!(
+                    mode = "test-udp",
+                    paired = true,
+                    stun_server = ?stun_server.as_deref(),
+                    upnp,
+                    try_port_prediction,
+                    nat_udp_preferred_port,
+                    "resolved UDP optimization settings",
+                );
                 bore_cli::udp_diagnostic::run_peer_test(
                     &to,
                     &id,
@@ -684,6 +790,15 @@ async fn dispatch(command: Command) -> Result<()> {
                         )
                         .exit();
                 }
+                info!(
+                    mode = "test-udp",
+                    paired = false,
+                    stun_server = ?stun_server.as_deref(),
+                    upnp,
+                    try_port_prediction,
+                    nat_udp_preferred_port,
+                    "resolved UDP optimization settings",
+                );
                 let bore_target = to.map(|t| {
                     let ep = bore_cli::transport::Endpoint::parse(&t);
                     (ep.host, ep.port)
@@ -760,6 +875,32 @@ fn parse_transfer_quota(value: &str) -> Result<u64> {
         .context("--test-transfer-quota is too large")
 }
 
+fn parse_udp_tuning(
+    stream_receive_window: &str,
+    connection_receive_window: &str,
+    send_window: &str,
+    udp_socket_recv_buffer: &str,
+    udp_socket_send_buffer: &str,
+    max_direct_streams: u32,
+) -> Result<UdpDirectTuning> {
+    Ok(UdpDirectTuning {
+        stream_receive_window: parse_transfer_quota(stream_receive_window)?
+            .try_into()
+            .context("--udp-stream-receive-window is too large")?,
+        connection_receive_window: parse_transfer_quota(connection_receive_window)?
+            .try_into()
+            .context("--udp-connection-receive-window is too large")?,
+        send_window: parse_transfer_quota(send_window)?,
+        udp_socket_recv_buffer: parse_transfer_quota(udp_socket_recv_buffer)?
+            .try_into()
+            .context("--udp-socket-recv-buffer is too large")?,
+        udp_socket_send_buffer: parse_transfer_quota(udp_socket_send_buffer)?
+            .try_into()
+            .context("--udp-socket-send-buffer is too large")?,
+        max_direct_streams,
+    })
+}
+
 /// Initialize logging: `RUST_LOG` wins if set; otherwise default to `info`, or
 /// `debug`/`trace` with `-v`/`-vv`. Logs go to stderr (keeping stdout clean), and
 /// ANSI colors are enabled only on a terminal so redirected/Docker/journald logs
@@ -788,4 +929,176 @@ fn main() -> Result<()> {
     let args = Args::parse();
     init_logging(args.verbose);
     run(args.command)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use lazy_static::lazy_static;
+    use std::sync::Mutex;
+
+    lazy_static! {
+        static ref ENV_GUARD: Mutex<()> = Mutex::new(());
+    }
+
+    #[test]
+    fn server_udp_tuning_defaults_match_current_values() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let args = Args::parse_from(["bore", "server"]);
+        let Command::Server {
+            udp_stream_receive_window,
+            udp_connection_receive_window,
+            udp_send_window,
+            udp_socket_recv_buffer,
+            udp_socket_send_buffer,
+            udp_max_streams,
+            ..
+        } = args.command
+        else {
+            panic!("expected server command");
+        };
+        let tuning = parse_udp_tuning(
+            &udp_stream_receive_window,
+            &udp_connection_receive_window,
+            &udp_send_window,
+            &udp_socket_recv_buffer,
+            &udp_socket_send_buffer,
+            udp_max_streams,
+        )
+        .unwrap();
+        assert_eq!(tuning, UdpDirectTuning::default());
+    }
+
+    #[test]
+    fn server_udp_tuning_flags_override_defaults() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let args = Args::parse_from([
+            "bore",
+            "server",
+            "--udp-stream-receive-window",
+            "32MiB",
+            "--udp-connection-receive-window",
+            "96MiB",
+            "--udp-send-window",
+            "128MiB",
+            "--udp-socket-recv-buffer",
+            "8MiB",
+            "--udp-socket-send-buffer",
+            "12MiB",
+            "--udp-max-streams",
+            "512",
+        ]);
+        let Command::Server {
+            udp_stream_receive_window,
+            udp_connection_receive_window,
+            udp_send_window,
+            udp_socket_recv_buffer,
+            udp_socket_send_buffer,
+            udp_max_streams,
+            ..
+        } = args.command
+        else {
+            panic!("expected server command");
+        };
+        let tuning = parse_udp_tuning(
+            &udp_stream_receive_window,
+            &udp_connection_receive_window,
+            &udp_send_window,
+            &udp_socket_recv_buffer,
+            &udp_socket_send_buffer,
+            udp_max_streams,
+        )
+        .unwrap();
+        assert_eq!(
+            tuning,
+            UdpDirectTuning {
+                stream_receive_window: 32 * 1024 * 1024,
+                connection_receive_window: 96 * 1024 * 1024,
+                send_window: 128 * 1024 * 1024,
+                udp_socket_recv_buffer: 8 * 1024 * 1024,
+                udp_socket_send_buffer: 12 * 1024 * 1024,
+                max_direct_streams: 512,
+            }
+        );
+    }
+
+    #[test]
+    fn server_udp_tuning_env_overrides_defaults() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = [
+            (
+                "BORE_UDP_STREAM_RECEIVE_WINDOW",
+                std::env::var_os("BORE_UDP_STREAM_RECEIVE_WINDOW"),
+            ),
+            (
+                "BORE_UDP_CONNECTION_RECEIVE_WINDOW",
+                std::env::var_os("BORE_UDP_CONNECTION_RECEIVE_WINDOW"),
+            ),
+            (
+                "BORE_UDP_SEND_WINDOW",
+                std::env::var_os("BORE_UDP_SEND_WINDOW"),
+            ),
+            (
+                "BORE_UDP_SOCKET_RECV_BUFFER",
+                std::env::var_os("BORE_UDP_SOCKET_RECV_BUFFER"),
+            ),
+            (
+                "BORE_UDP_SOCKET_SEND_BUFFER",
+                std::env::var_os("BORE_UDP_SOCKET_SEND_BUFFER"),
+            ),
+            (
+                "BORE_UDP_MAX_STREAMS",
+                std::env::var_os("BORE_UDP_MAX_STREAMS"),
+            ),
+        ];
+
+        std::env::set_var("BORE_UDP_STREAM_RECEIVE_WINDOW", "48MiB");
+        std::env::set_var("BORE_UDP_CONNECTION_RECEIVE_WINDOW", "112MiB");
+        std::env::set_var("BORE_UDP_SEND_WINDOW", "80MiB");
+        std::env::set_var("BORE_UDP_SOCKET_RECV_BUFFER", "24MiB");
+        std::env::set_var("BORE_UDP_SOCKET_SEND_BUFFER", "20MiB");
+        std::env::set_var("BORE_UDP_MAX_STREAMS", "2048");
+
+        let args = Args::parse_from(["bore", "server"]);
+        let Command::Server {
+            udp_stream_receive_window,
+            udp_connection_receive_window,
+            udp_send_window,
+            udp_socket_recv_buffer,
+            udp_socket_send_buffer,
+            udp_max_streams,
+            ..
+        } = args.command
+        else {
+            panic!("expected server command");
+        };
+        let tuning = parse_udp_tuning(
+            &udp_stream_receive_window,
+            &udp_connection_receive_window,
+            &udp_send_window,
+            &udp_socket_recv_buffer,
+            &udp_socket_send_buffer,
+            udp_max_streams,
+        )
+        .unwrap();
+        assert_eq!(
+            tuning,
+            UdpDirectTuning {
+                stream_receive_window: 48 * 1024 * 1024,
+                connection_receive_window: 112 * 1024 * 1024,
+                send_window: 80 * 1024 * 1024,
+                udp_socket_recv_buffer: 24 * 1024 * 1024,
+                udp_socket_send_buffer: 20 * 1024 * 1024,
+                max_direct_streams: 2048,
+            }
+        );
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
 }

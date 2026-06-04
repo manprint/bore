@@ -75,6 +75,14 @@ services:
       # bulk flows, and has no effect on the UDP direct data path. Higher values
       # mean more sockets and scheduler work; 1 disables server-side pools.
       - BORE_MAX_CARRIERS=16
+      # Direct-UDP tuning defaults (match src/shared.rs; override here if you
+      # want to change the brokered QUIC and socket profile on the server).
+      - BORE_UDP_STREAM_RECEIVE_WINDOW=16MiB
+      - BORE_UDP_CONNECTION_RECEIVE_WINDOW=64MiB
+      - BORE_UDP_SEND_WINDOW=64MiB
+      - BORE_UDP_SOCKET_RECV_BUFFER=16MiB
+      - BORE_UDP_SOCKET_SEND_BUFFER=16MiB
+      - BORE_UDP_MAX_STREAMS=4096
       # Broker UDP hole-punched direct paths for secret tunnels and run a STUN
       # responder on the control port (UDP). Clients try public STUN first
       # (Cloudflare/Google) and use this 7835/udp responder as the self-hosted

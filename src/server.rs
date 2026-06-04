@@ -24,8 +24,8 @@ use crate::pool::{self, Carrier, CarrierPool, PendingCarriers, TokenGuard};
 use crate::prefixed::Prefixed;
 use crate::secret::{self, Registry, UdpRegistry};
 use crate::shared::{
-    tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions, CONTROL_PORT,
-    NETWORK_TIMEOUT, PROXY_BUFFER_SIZE,
+    tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions, UdpDirectTuning,
+    CONTROL_PORT, NETWORK_TIMEOUT, PROXY_BUFFER_SIZE,
 };
 use crate::udp_diagnostic;
 
@@ -54,6 +54,9 @@ pub struct Server {
 
     /// Maximum number of parallel TCP carrier connections a tunnel may use.
     max_carriers: u16,
+
+    /// Direct-UDP transport tuning brokered to peers.
+    udp_tuning: UdpDirectTuning,
 
     /// Pending carrier pools, keyed by the per-tunnel token issued in
     /// [`ServerMessage::CarrierToken`]. An extra connection presenting the token
@@ -107,6 +110,7 @@ impl Server {
             port_range,
             conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
             max_carriers: DEFAULT_MAX_CARRIERS,
+            udp_tuning: UdpDirectTuning::default(),
             pending_carriers: Arc::new(DashMap::new()),
             providers: Registry::default(),
             udp_providers: UdpRegistry::default(),
@@ -155,6 +159,11 @@ impl Server {
     /// [`DEFAULT_MAX_CARRIERS`].
     pub fn set_max_carriers(&mut self, max_carriers: u16) {
         self.max_carriers = max_carriers;
+    }
+
+    /// Set the direct-UDP transport tuning brokered to peers.
+    pub fn set_udp_tuning(&mut self, udp_tuning: UdpDirectTuning) {
+        self.udp_tuning = udp_tuning;
     }
 
     /// Set the IP address where the control server will bind to.
@@ -366,6 +375,7 @@ impl Server {
                     self.pending_carriers.clone(),
                     self.max_carriers,
                     carriers,
+                    self.udp_tuning,
                 )
                 .await
             }
@@ -380,6 +390,7 @@ impl Server {
                     self.admin.clone(),
                     peer,
                     notes,
+                    self.udp_tuning,
                 )
                 .await
             }
@@ -409,6 +420,7 @@ impl Server {
                     candidates,
                     summary,
                     options,
+                    self.udp_tuning,
                 )
                 .await
             }

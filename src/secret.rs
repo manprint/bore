@@ -33,8 +33,8 @@ use crate::mux;
 use crate::pool::{self, Carrier, CarrierPool, PendingCarriers, TokenGuard};
 use crate::reconnect;
 use crate::shared::{
-    tune_tcp, ClientMessage, Delimited, ServerMessage, UdpCandidateOffer, PROXY_BUFFER_SIZE,
-    UDP_NONCE_LEN,
+    tune_tcp, ClientMessage, Delimited, ServerMessage, UdpCandidateOffer, UdpDirectTuning,
+    PROXY_BUFFER_SIZE, UDP_NONCE_LEN,
 };
 use crate::transport::{self, Endpoint};
 use uuid::Uuid;
@@ -192,6 +192,7 @@ pub async fn serve_provider(
     pending_carriers: PendingCarriers,
     max_carriers: u16,
     carriers: u16,
+    udp_tuning: UdpDirectTuning,
 ) -> Result<()> {
     // Register atomically, rejecting a duplicate id rather than hijacking it. The
     // registration is a carrier pool seeded with this connection's opener; extra
@@ -297,6 +298,7 @@ pub async fn serve_provider(
                     nonce: offer.nonce,
                     peer: offer.peer_candidates,
                     peer_selected_stun: offer.peer_selected_stun,
+                    tuning: udp_tuning,
                 };
                 if control.send(msg).await.is_err() {
                     return Ok(());
@@ -338,6 +340,7 @@ pub async fn serve_consumer(
     admin: AdminRegistry,
     peer: SocketAddr,
     notes: Option<String>,
+    udp_tuning: UdpDirectTuning,
 ) -> Result<()> {
     info!(%id, "secret consumer connected");
     control.send(ServerMessage::Ok).await?;
@@ -380,12 +383,14 @@ pub async fn serve_consumer(
                             &udp_registry,
                             &id,
                             udp_offer_from_legacy(consumer_cands),
+                            udp_tuning,
                         )
                         .await?;
                     }
                     Some(ClientMessage::UdpCandidateOffer(consumer_offer)) => {
                         admin_reg.mark_udp();
-                        broker_udp(&mut control, &udp_registry, &id, consumer_offer).await?;
+                        broker_udp(&mut control, &udp_registry, &id, consumer_offer, udp_tuning)
+                            .await?;
                     }
                     Some(ClientMessage::UdpStunHintRequest) => {
                         let stun_server = provider_stun_hint(&udp_registry, &id);
@@ -439,6 +444,7 @@ async fn broker_udp(
     udp_registry: &UdpRegistry,
     id: &str,
     consumer_offer: UdpCandidateOffer,
+    tuning: UdpDirectTuning,
 ) -> Result<()> {
     // Clone out so no DashMap guard is held across an await point.
     let provider = udp_registry.get(id).map(|e| {
@@ -487,6 +493,7 @@ async fn broker_udp(
             nonce,
             peer: provider_cands,
             peer_selected_stun: provider_selected_stun,
+            tuning,
         })
         .await?;
     Ok(())
@@ -904,9 +911,7 @@ impl Proxy {
         let mut effective_udp_port = udp_port;
         let mut nego_cand_rx: Option<oneshot::Receiver<UdpCandidateOffer>> = None;
         #[allow(clippy::type_complexity)]
-        let mut nego_punch_tx: Option<
-            oneshot::Sender<Option<([u8; UDP_NONCE_LEN], Vec<SocketAddr>, Option<String>)>>,
-        > = None;
+        let mut nego_punch_tx: Option<oneshot::Sender<UdpPunchResult>> = None;
         let mut nego_done_rx: Option<oneshot::Receiver<DirectUpgrade>> = None;
         // Periodic timer that fires every nat_udp_release_timeout to re-check
         // whether the preferred port has been released by the NAT.
@@ -970,9 +975,9 @@ impl Proxy {
                         Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
                         // Deliver the brokered candidates to the in-flight upgrade
                         // task (which then punches + dials QUIC); else it is stray.
-                        Some(ServerMessage::UdpPunch { nonce, peer, peer_selected_stun }) => match nego_punch_tx.take() {
+                        Some(ServerMessage::UdpPunch { nonce, peer, peer_selected_stun, tuning }) => match nego_punch_tx.take() {
                             Some(tx) => {
-                                let _ = tx.send(Some((nonce, peer, peer_selected_stun)));
+                                let _ = tx.send(Some((nonce, peer, peer_selected_stun, tuning)));
                             }
                             None => warn!("unexpected udp punch"),
                         },
@@ -1384,11 +1389,12 @@ async fn finish_direct_consumer(
     secret: Option<&str>,
     nonce: [u8; UDP_NONCE_LEN],
     peer: Vec<SocketAddr>,
+    tuning: UdpDirectTuning,
 ) -> Result<crate::holepunch::DirectConn> {
     use crate::holepunch;
     info!(peer_candidates = ?peer, "consumer received peer candidates, punching + connecting QUIC");
     let token = holepunch::derive_token(secret, &nonce);
-    holepunch::connect_direct(socket, peer, token).await
+    holepunch::connect_direct(socket, peer, token, tuning).await
 }
 
 /// Negotiate a direct UDP path as the consumer (QUIC client), synchronously.
@@ -1428,8 +1434,9 @@ async fn negotiate_direct_consumer(
                     nonce,
                     peer,
                     peer_selected_stun,
+                    tuning,
                 }) => {
-                    return Ok::<_, anyhow::Error>(Some((nonce, peer, peer_selected_stun)));
+                    return Ok::<_, anyhow::Error>(Some((nonce, peer, peer_selected_stun, tuning)));
                 }
                 Some(ServerMessage::UdpUnavailable) => return Ok(None),
                 Some(ServerMessage::Heartbeat) | Some(ServerMessage::Ok) => continue,
@@ -1440,7 +1447,7 @@ async fn negotiate_direct_consumer(
         }
     })
     .await;
-    let (nonce, peer, peer_selected_stun) = match outcome {
+    let (nonce, peer, peer_selected_stun, tuning) = match outcome {
         Ok(Ok(Some(value))) => value,
         Ok(Ok(None)) => return Ok(None),
         Ok(Err(err)) => return Err(err),
@@ -1459,7 +1466,7 @@ async fn negotiate_direct_consumer(
         "consumer received provider metadata for udp negotiation"
     );
     Ok(Some(
-        finish_direct_consumer(socket, secret, nonce, peer).await?,
+        finish_direct_consumer(socket, secret, nonce, peer, tuning).await?,
     ))
 }
 
@@ -1470,7 +1477,12 @@ async fn negotiate_direct_consumer(
 /// brokered reply back via `punch_rx`; on success this task returns the direct
 /// mux over `done_tx`. Dropping any sender signals "give up, stay on relay".
 #[cfg(feature = "udp")]
-type UdpPunchResult = Option<([u8; UDP_NONCE_LEN], Vec<SocketAddr>, Option<String>)>;
+type UdpPunchResult = Option<(
+    [u8; UDP_NONCE_LEN],
+    Vec<SocketAddr>,
+    Option<String>,
+    UdpDirectTuning,
+)>;
 
 #[cfg(feature = "udp")]
 fn spawn_upgrade_attempt(
@@ -1547,7 +1559,7 @@ async fn upgrade_task(
     if cand_tx.send(candidates).is_err() {
         return; // loop gone
     }
-    let (nonce, peer, peer_selected_stun) = match punch_rx.await {
+    let (nonce, peer, peer_selected_stun, tuning) = match punch_rx.await {
         Ok(Some(v)) => v,
         _ => return, // unavailable / loop dropped the sender
     };
@@ -1555,7 +1567,7 @@ async fn upgrade_task(
         provider_selected_stun = ?peer_selected_stun,
         "consumer received provider metadata for udp upgrade"
     );
-    match finish_direct_consumer(socket, secret.as_deref(), nonce, peer).await {
+    match finish_direct_consumer(socket, secret.as_deref(), nonce, peer, tuning).await {
         Ok(pair) => {
             let _ = done_tx.send(pair);
         }

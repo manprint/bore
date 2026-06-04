@@ -132,6 +132,7 @@ pub async fn bind_socket(port: u16) -> Result<UdpSocket> {
     UdpSocket::from_std(socket.into()).context("failed to register UDP socket with tokio")
 }
 
+#[cfg(feature = "udp")]
 fn configure_udp_socket_buffers<S: std::os::fd::AsFd>(socket: &S, tuning: &UdpDirectTuning) {
     let socket = socket2::SockRef::from(socket);
     if let Err(err) = socket.set_recv_buffer_size(tuning.udp_socket_recv_buffer) {
@@ -149,6 +150,9 @@ fn configure_udp_socket_buffers<S: std::os::fd::AsFd>(socket: &S, tuning: &UdpDi
         "configured UDP socket buffers"
     );
 }
+
+#[cfg(not(feature = "udp"))]
+fn configure_udp_socket_buffers<S>(_socket: &S, _tuning: &UdpDirectTuning) {}
 
 /// Where a STUN target came from. This is used only for logging/diagnostics: the
 /// candidate addresses themselves remain plain `SocketAddr`s on the wire.

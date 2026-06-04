@@ -25,7 +25,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{debug, error, info, info_span, trace, warn, Instrument};
+#[cfg(feature = "udp")]
+use tracing::debug;
+use tracing::{error, info, info_span, trace, warn, Instrument};
 
 use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Registration, Role};
 use crate::auth::Authenticator;
@@ -679,9 +681,11 @@ pub struct Proxy {
 }
 
 /// Initial delay (s) for the UDP upgrade exponential backoff: 2, 4, 8, 16, …
+#[cfg(feature = "udp")]
 const UDP_UPGRADE_INITIAL_SECS: u64 = 2;
 
 /// Maximum delay (s) for the UDP upgrade backoff — retry at most every ~4.3 min.
+#[cfg(feature = "udp")]
 const UDP_UPGRADE_MAX_SECS: u64 = 256;
 
 impl Proxy {
@@ -705,6 +709,8 @@ impl Proxy {
         carriers: u16,
         notes: Option<String>,
     ) -> Result<Self> {
+        #[cfg(not(feature = "udp"))]
+        let _ = nat_udp_release_timeout;
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
         let (opener, _acceptor) = mux::client(socket);
@@ -884,9 +890,13 @@ impl Proxy {
         let mut path = if direct { "direct-udp" } else { "relay" };
         #[cfg(feature = "udp")]
         let mut last_upgrade = tokio::time::Instant::now();
+        #[cfg(not(feature = "udp"))]
+        let _last_upgrade = tokio::time::Instant::now();
         // Port-release detection: when the preferred port was remapped by NAT,
         // switch to ephemeral probes and periodically re-check the preferred port.
         #[cfg(feature = "udp")]
+        let mut preferred_port_remapped = false;
+        #[cfg(not(feature = "udp"))]
         let mut preferred_port_remapped = false;
         // Pre-resolve one STUN target for the lightweight port-release check.
         #[cfg(feature = "udp")]
@@ -898,6 +908,8 @@ impl Proxy {
         .await
         .ok()
         .and_then(|t| t.into_iter().next().map(|t| t.addr));
+        #[cfg(not(feature = "udp"))]
+        let _check_stun_addr: Option<SocketAddr> = None;
         // Relay → direct upgrade state. The slow work (STUN gather, punch, QUIC
         // dial) runs in a spawned `upgrade_task` so the accept/forward loop never
         // stalls; this loop only does the quick control I/O. The receivers are
@@ -908,7 +920,12 @@ impl Proxy {
         // sets them, so the arms stay dormant.
         #[cfg(feature = "udp")]
         let mut waiting_for_stun_hint = false;
+        #[cfg(not(feature = "udp"))]
+        let _waiting_for_stun_hint = false;
+        #[cfg(feature = "udp")]
         let mut effective_udp_port = udp_port;
+        #[cfg(not(feature = "udp"))]
+        let _effective_udp_port = 0u16;
         let mut nego_cand_rx: Option<oneshot::Receiver<UdpCandidateOffer>> = None;
         #[allow(clippy::type_complexity)]
         let mut nego_punch_tx: Option<oneshot::Sender<UdpPunchResult>> = None;
@@ -921,6 +938,20 @@ impl Proxy {
             t.set_missed_tick_behavior(MissedTickBehavior::Delay);
             t
         };
+        #[cfg(not(feature = "udp"))]
+        let mut release_check = {
+            let mut t = tokio::time::interval(Duration::from_secs(3600));
+            t.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            t
+        };
+        #[cfg(not(feature = "udp"))]
+        let udp_port = 0u16;
+        #[cfg(not(feature = "udp"))]
+        let nat_udp_release_timeout = Duration::ZERO;
+        #[cfg(not(feature = "udp"))]
+        let mut upgrade_backoff = reconnect::Backoff::new_with(1, 1);
+        #[cfg(not(feature = "udp"))]
+        let mut upgrade_attempt = 0;
         loop {
             // Kick off an upgrade attempt on the timer. Non-blocking: the attempt
             // runs in `upgrade_task`; this loop keeps accepting and forwarding.
@@ -1477,6 +1508,14 @@ async fn negotiate_direct_consumer(
 /// brokered reply back via `punch_rx`; on success this task returns the direct
 /// mux over `done_tx`. Dropping any sender signals "give up, stay on relay".
 #[cfg(feature = "udp")]
+type UdpPunchResult = Option<(
+    [u8; UDP_NONCE_LEN],
+    Vec<SocketAddr>,
+    Option<String>,
+    UdpDirectTuning,
+)>;
+
+#[cfg(not(feature = "udp"))]
 type UdpPunchResult = Option<(
     [u8; UDP_NONCE_LEN],
     Vec<SocketAddr>,

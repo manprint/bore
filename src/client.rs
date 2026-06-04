@@ -496,6 +496,7 @@ impl Client {
                             }
                             #[cfg(not(feature = "udp"))]
                             {
+                                    let _ = tuning;
                                 let _ = (nonce, peer, peer_selected_stun);
                                 warn!("unexpected udp punch");
                             }

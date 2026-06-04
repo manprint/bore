@@ -16,7 +16,7 @@ ENV BORE_GIT_SHA=${BORE_GIT_SHA}
 WORKDIR /src
 COPY . .
 RUN rustup target add "${TARGET}"
-RUN RUSTFLAGS="${RUSTFLAGS}" cargo zigbuild --release --target "${TARGET}"
+RUN RUSTFLAGS="${RUSTFLAGS}" cargo zigbuild --all-features --release --target "${TARGET}"
 
 # Export just the binary, so `buildx --output type=local` writes only it.
 FROM scratch

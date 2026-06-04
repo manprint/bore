@@ -1302,6 +1302,7 @@ fn cpu_total_ticks(cpu: &CpuTime) -> u64 {
     cpu_busy_ticks(cpu) + cpu.idle + cpu.iowait.unwrap_or(0)
 }
 
+#[cfg(feature = "udp")]
 impl DirectTransportMetrics {
     fn from_direct(conn: &crate::holepunch::DirectConn) -> Self {
         let stats = conn.stats();
@@ -1316,6 +1317,7 @@ impl DirectTransportMetrics {
     }
 }
 
+#[cfg(feature = "udp")]
 impl From<quinn::UdpStats> for UdpStatsMetrics {
     fn from(stats: quinn::UdpStats) -> Self {
         Self {
@@ -1326,6 +1328,7 @@ impl From<quinn::UdpStats> for UdpStatsMetrics {
     }
 }
 
+#[cfg(feature = "udp")]
 impl From<quinn::PathStats> for PathStatsMetrics {
     fn from(stats: quinn::PathStats) -> Self {
         Self {
@@ -1343,6 +1346,7 @@ impl From<quinn::PathStats> for PathStatsMetrics {
     }
 }
 
+#[cfg(feature = "udp")]
 impl FrameStatsMetrics {
     fn from(stats: quinn::FrameStats) -> Self {
         Self {

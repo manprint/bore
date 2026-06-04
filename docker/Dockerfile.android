@@ -35,7 +35,7 @@ COPY . .
 ENV CC_aarch64_linux_android="aarch64-linux-android${ANDROID_API}-clang" \
     AR_aarch64_linux_android="llvm-ar" \
     CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="aarch64-linux-android${ANDROID_API}-clang"
-RUN cargo build --release --target aarch64-linux-android
+RUN cargo build --all-features --release --target aarch64-linux-android
 
 FROM scratch
 COPY --from=builder /src/target/aarch64-linux-android/release/bore /bore

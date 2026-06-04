@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod adaptive_nat;
 pub mod admin;
 pub mod admin_http;
 pub mod auth;

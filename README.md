@@ -1,6 +1,6 @@
 # bore (forked from ekzhang/bore)
 
-[![Build status](https://img.shields.io/github/actions/workflow/status/ekzhang/bore/ci.yml)](https://github.com/ekzhang/bore/actions)
+[![Build status](https://img.shields.io/github/actions/workflow/status/manprint/bore/ci.yml)](https://github.com/manprint/bore/actions)
 [![Crates.io](https://img.shields.io/crates/v/bore-cli.svg)](https://crates.io/crates/bore-cli)
 
 A modern, simple TCP tunnel in Rust that exposes local ports to a remote server, bypassing standard NAT connection firewalls. **That's all it does: no more, and no less.**
@@ -53,18 +53,16 @@ sudo emerge net-proxy/bore
 
 ### Binary Distribution
 
-Otherwise, the easiest way to install bore is from prebuilt binaries. These are available on the [releases page](https://github.com/ekzhang/bore/releases) for macOS, Windows, and Linux. Just unzip the appropriate file for your platform and move the `bore` executable into a folder on your PATH.
+Otherwise, the easiest way to install bore is from prebuilt binaries. These are available on the [releases page](https://github.com/manprint/bore/releases) for macOS, Windows, and Linux. Just unzip the appropriate file for your platform and move the `bore` executable into a folder on your PATH.
 
 > **This fork** publishes a GitHub Release for **every push** (any branch): named
 > `<branch>-<sha7>` (branch builds are marked pre-release; `vX.Y.Z` tags are full
 > releases), with binaries attached for macOS (x86_64/arm64), Linux (x86_64,
 > aarch64, arm, armv7, i686), Windows (x86_64/i686) and Android (aarch64). Container
-> images are pushed to the GitHub **Packages** registry (`ghcr.io/<owner>/bore`),
+> images are pushed to the GitHub **Packages** registry (`ghcr.io/manprint/bore`),
 > tagged by branch and commit (amd64; build `just push` locally for multi-arch).
 
-### Cargo
 
-You also can build `bore` from source using [Cargo](https://doc.rust-lang.org/cargo/), the Rust package manager. This command installs the `bore` binary at a user-accessible path.
 
 ```shell
 cargo install bore-cli
@@ -75,14 +73,11 @@ cargo install bore-cli
 We also publish versioned Docker images for each release. The image is built for an AMD 64-bit architecture. They're tagged with the specific version and allow you to run the statically-linked `bore` binary from a minimal "scratch" container.
 
 ```shell
-docker run -it --init --rm --network host ekzhang/bore <ARGS>
-```
+docker run -it --init --rm --network host ghcr.io/manprint/bore <ARGS>
 
-#### Docker Compose
 
 Ready-to-run compose files live in [`docker/`](docker/): `docker-compose.server.yml`
 (bridge network, control port + tunnel range forwarded explicitly),
-`docker-compose.client.yml` and `docker-compose.secret-proxy.yml` (host network).
 All environment variables are present (optional ones commented). Server-side UDP,
 relay, Docker networking, carrier and file-descriptor tuning notes are in
 [`SERVER_UDP_OPTIMIZATION.md`](SERVER_UDP_OPTIMIZATION.md).
@@ -90,18 +85,15 @@ relay, Docker networking, carrier and file-descriptor tuning notes are in
 ```shell
 docker compose -f docker/docker-compose.server.yml up -d
 ```
-
 ### Building from source (cross-compilation)
 
 A [`justfile`](justfile) builds release binaries into `./bin/` via Docker for
 several targets (`just --list`):
-
 ```shell
 just build-amd64       # Linux x86_64
 just build-arm64       # Linux aarch64
 just macos-m5          # macOS Apple Silicon (aarch64-apple-darwin)
 just windows-amd64     # Windows x86_64
-just android-arm64     # Android aarch64
 just build             # all of the above
 just push              # build + push a multi-arch (amd64+arm64) image to Docker Hub
 ```
@@ -442,8 +434,10 @@ Notes:
   a persistent QUIC listener and re-punches toward each one). Both peers behind a
   symmetric NAT → relay.
 - To confirm the direct path is in use, look for `using direct udp path` /
-  `direct udp carrier established (… token verified)` in the logs
-  (`RUST_LOG=bore_cli=info`).
+  `direct udp carrier established (… token verified)` in the logs. For the full
+  control-plane story, use `-vv` or `RUST_LOG=bore_cli=trace,bore=trace`: the
+  trace log includes labeled `tx`/`rx` frames for the server/client/proxy/test-udp
+  control channels.
 
 **Hard NATs and firewalls.** Two extra, opt-in candidate sources help with
 difficult networks (both flags go on `bore local` and `bore proxy`, since both

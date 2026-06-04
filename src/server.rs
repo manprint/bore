@@ -332,7 +332,7 @@ impl Server {
         // control substream first; what it requests on it selects the role.
         let (opener, mut acceptor) = mux::server(socket);
         let mut control = match acceptor.accept().await {
-            Some(stream) => Delimited::new(stream),
+            Some(stream) => Delimited::with_label(stream, "server/control"),
             None => return Ok(()),
         };
 

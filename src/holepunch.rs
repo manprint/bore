@@ -32,7 +32,7 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::shared::{UdpDirectTuning, CONTROL_PORT};
+use crate::shared::{UdpCandidateKind, UdpDirectTuning, CONTROL_PORT};
 
 /// Number of consecutive ports predicted past the reflexive one when
 /// `--try-port-prediction` is enabled (best-effort symmetric-NAT traversal).
@@ -234,6 +234,8 @@ pub struct SelectedStun {
 pub struct CandidateDiscovery {
     /// Candidate addresses to send over the bore control channel.
     pub candidates: Vec<SocketAddr>,
+    /// Roles for the candidate list, in the same order as `candidates`.
+    pub candidate_kinds: Vec<UdpCandidateKind>,
     /// Local UDP socket address used for discovery and punching.
     pub local_addr: Option<SocketAddr>,
     /// STUN server that produced the selected reflexive candidate, if any.
@@ -421,6 +423,7 @@ pub async fn gather_candidates_from_stun_targets(
     port_prediction: bool,
 ) -> CandidateDiscovery {
     let mut candidates = Vec::new();
+    let mut candidate_kinds = Vec::new();
     let local_addr = socket.local_addr().ok();
     let local_port = local_addr.map(|a| a.port()).unwrap_or(0);
     let mut selected_stun = None;
@@ -449,6 +452,7 @@ pub async fn gather_candidates_from_stun_targets(
                     "selected STUN server for UDP candidates"
                 );
                 candidates.push(addr);
+                candidate_kinds.push(UdpCandidateKind::Reflexive);
                 selected_stun = Some(SelectedStun {
                     requested: target.requested.clone(),
                     addr: target.addr,
@@ -468,6 +472,7 @@ pub async fn gather_candidates_from_stun_targets(
                     for delta in 1..=PREDICT_RANGE {
                         if let Some(port) = base.checked_add(delta) {
                             candidates.push(SocketAddr::new(addr.ip(), port));
+                            candidate_kinds.push(UdpCandidateKind::Predicted);
                             added += 1;
                         }
                     }
@@ -507,6 +512,7 @@ pub async fn gather_candidates_from_stun_targets(
                 warn!(%addr, "UPnP-IGD port mapping ENABLED — added router-mapped candidate");
                 if !candidates.contains(&addr) {
                     candidates.push(addr);
+                    candidate_kinds.push(UdpCandidateKind::RouterMapped);
                 }
             }
             Err(err) => debug!(%err, "UPnP-IGD port mapping failed; skipping that candidate"),
@@ -520,6 +526,7 @@ pub async fn gather_candidates_from_stun_targets(
         let local = SocketAddr::new(ip, local_port);
         if !candidates.contains(&local) {
             candidates.push(local);
+            candidate_kinds.push(UdpCandidateKind::Local);
         }
     }
     info!(
@@ -530,6 +537,7 @@ pub async fn gather_candidates_from_stun_targets(
     );
     CandidateDiscovery {
         candidates,
+        candidate_kinds,
         local_addr,
         selected_stun,
         attempted_stun: stun_targets.len(),

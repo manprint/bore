@@ -714,11 +714,12 @@ impl Proxy {
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
         let (opener, _acceptor) = mux::client(socket);
-        let mut control = Delimited::new(
+        let mut control = Delimited::with_label(
             opener
                 .open()
                 .await
                 .context("failed to open control stream")?,
+            "proxy/consumer",
         );
 
         // Send the registration first so the lazily-opened substream is announced
@@ -1234,11 +1235,12 @@ async fn open_consumer_carrier(
 ) -> Result<()> {
     let socket = transport::connect(endpoint, insecure).await?;
     let (opener, _acceptor) = mux::client(socket);
-    let mut control = Delimited::new(
+    let mut control = Delimited::with_label(
         opener
             .open()
             .await
             .context("failed to open carrier control stream")?,
+        "server/secret/provider",
     );
     control
         .send(ClientMessage::ConnectSecret {

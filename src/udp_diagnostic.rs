@@ -29,15 +29,16 @@ use procfs::{
     Meminfo,
 };
 
+use crate::adaptive_nat;
 use crate::auth::Authenticator;
 use crate::holepunch::{self, NatClass, StunObservation};
 use crate::mux;
 use crate::shared::{
-    ClientMessage, Delimited, ServerMessage, UdpDirectTuning, UdpTestOptions, UdpTestPeerSummary,
+    ClientMessage, Delimited, ServerMessage, UdpAdaptiveCandidateKind, UdpAdaptiveMode,
+    UdpAdaptivePlan, UdpCandidateKind, UdpDirectTuning, UdpTestOptions, UdpTestPeerSummary,
     UdpTestRole, PROXY_BUFFER_SIZE, UDP_NONCE_LEN,
 };
 use crate::transport::{self, Endpoint};
-
 const LATENCY_SAMPLES: u16 = 8;
 const OP_LATENCY: u8 = 1;
 const OP_BANDWIDTH: u8 = 2;
@@ -65,6 +66,7 @@ struct PeerStart {
     peer_opener: mux::Opener,
     peer_candidates: Vec<SocketAddr>,
     peer_summary: UdpTestPeerSummary,
+    adaptive_plan: UdpAdaptivePlan,
     options: UdpTestOptions,
     tuning: UdpDirectTuning,
 }
@@ -84,7 +86,7 @@ impl Drop for PendingGuard {
     }
 }
 
-/// Serve one server-side `test-udp` diagnostic peer.
+/// Serve one server-side paired `bore test-udp` peer.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_peer(
     mut control: Delimited<mux::Stream>,
@@ -101,12 +103,18 @@ pub async fn serve_peer(
     if let Some((_key, pending)) = registry.remove(&id) {
         let nonce = new_nonce();
         let effective = merge_options(pending.options, options);
+        let adaptive_plan = adaptive_nat::plan_for_pair(
+            &adaptive_nat::NatProfile::from_summary(&pending.summary),
+            &adaptive_nat::NatProfile::from_summary(&summary),
+        )
+        .to_wire();
         let first = PeerStart {
             role: UdpTestRole::Listener,
             nonce,
             peer_opener: opener.clone(),
             peer_candidates: candidates.clone(),
             peer_summary: summary.clone(),
+            adaptive_plan: adaptive_plan.clone(),
             options: effective,
             tuning,
         };
@@ -118,6 +126,7 @@ pub async fn serve_peer(
                     nonce,
                     peer_candidates: pending.candidates,
                     peer_summary: pending.summary,
+                    adaptive_plan: Some(adaptive_plan),
                     options: effective,
                     tuning,
                 })
@@ -184,6 +193,7 @@ async fn wait_for_peer(
             nonce: start.nonce,
             peer_candidates: start.peer_candidates,
             peer_summary: start.peer_summary,
+            adaptive_plan: Some(start.adaptive_plan),
             options: start.options,
             tuning: start.tuning,
         })
@@ -290,16 +300,18 @@ pub async fn run_peer_test(
         None => println!("Live tunnel STUN used  : <none>"),
     }
     let candidates = discovery.candidates;
+    local.summary.candidate_kinds = discovery.candidate_kinds.clone();
     local.summary.candidate_count = candidates.len();
     print_local_nat_report(&local, &candidates);
 
     let socket_tcp = transport::connect(&endpoint, insecure).await?;
     let (opener, acceptor) = mux::client(socket_tcp);
-    let mut control = Delimited::new(
+    let mut control = Delimited::with_label(
         opener
             .open()
             .await
             .context("failed to open diagnostic control stream")?,
+        "test-udp/peer",
     );
     control
         .send(ClientMessage::TestUdpJoin {
@@ -315,12 +327,28 @@ pub async fn run_peer_test(
             .await?;
     }
 
+    let local_profile = adaptive_nat::NatProfile::from_summary(&local.summary);
     let start = wait_for_start(&mut control).await?;
+    let peer_profile = adaptive_nat::NatProfile::from_summary(&start.peer_summary);
+    let local_plan = adaptive_nat::plan_for_pair(&local_profile, &peer_profile);
+    let adaptive_plan = start.adaptive_plan.unwrap_or_else(|| local_plan.to_wire());
+    trace!(
+        ?local_profile,
+        ?peer_profile,
+        local_plan = %local_plan.summary(),
+        adaptive_plan = %adaptive_plan.summary(),
+        "adaptive NAT preview"
+    );
+
+    let ordered_peer_candidates =
+        order_peer_candidates(&start.peer_candidates, &start.peer_summary, &adaptive_plan);
+
     print_pairing_report(
         &start.peer_summary,
         &start.peer_candidates,
         start.role,
         start.options,
+        &adaptive_plan,
     );
 
     let token = holepunch::derive_token(secret, &start.nonce);
@@ -329,10 +357,12 @@ pub async fn run_peer_test(
     let udp = run_udp_path(
         socket,
         start.role,
-        start.peer_candidates.clone(),
+        ordered_peer_candidates,
         token,
         start.tuning,
         start.options,
+        &adaptive_plan,
+        preferred_port,
     )
     .await;
 
@@ -410,6 +440,7 @@ async fn wait_for_start(control: &mut Delimited<mux::Stream>) -> Result<StartInf
                 nonce,
                 peer_candidates,
                 peer_summary,
+                adaptive_plan,
                 options,
                 tuning,
             }) => {
@@ -418,6 +449,7 @@ async fn wait_for_start(control: &mut Delimited<mux::Stream>) -> Result<StartInf
                     nonce,
                     peer_candidates,
                     peer_summary,
+                    adaptive_plan,
                     options,
                     tuning,
                 });
@@ -438,11 +470,13 @@ struct StartInfo {
     nonce: [u8; UDP_NONCE_LEN],
     peer_candidates: Vec<SocketAddr>,
     peer_summary: UdpTestPeerSummary,
+    adaptive_plan: Option<UdpAdaptivePlan>,
     options: UdpTestOptions,
     tuning: UdpDirectTuning,
 }
 
 #[cfg(feature = "udp")]
+#[allow(clippy::too_many_arguments)]
 async fn run_udp_path(
     socket: tokio::net::UdpSocket,
     role: UdpTestRole,
@@ -450,28 +484,81 @@ async fn run_udp_path(
     token: [u8; holepunch::TOKEN_LEN],
     tuning: UdpDirectTuning,
     options: UdpTestOptions,
+    adaptive_plan: &UdpAdaptivePlan,
+    preferred_port: u16,
 ) -> Option<PathMetrics> {
     println!();
-    println!("UDP direct path    : trying QUIC hole punching");
-    let conn = match establish_direct(socket, role, peer_candidates, token, tuning).await {
-        Ok(conn) => conn,
-        Err(err) => {
-            println!("UDP direct path    : FAILED ({err})");
-            println!("                    TCP relay fallback will still be tested.");
-            return None;
-        }
-    };
-    let mut path = TestPath::Direct(conn);
-    match run_path_suite("UDP direct path", &mut path, role, options, Some(tuning)).await {
-        Ok(metrics) => Some(metrics),
-        Err(err) => {
-            println!("UDP direct tests   : FAILED ({err})");
-            None
-        }
+    if adaptive_plan.mode == UdpAdaptiveMode::RelayOnly || peer_candidates.is_empty() {
+        println!("UDP direct path    : skipped (adaptive plan prefers relay)");
+        return None;
     }
+    println!("UDP direct path    : trying QUIC hole punching");
+    let attempts = adaptive_plan.retry_budget.max(1);
+    let mut socket = Some(socket);
+    for attempt in 0..attempts {
+        if attempt > 0 && adaptive_plan.send_delay_ms > 0 {
+            println!(
+                "UDP direct path    : retry {}/{} after {}ms",
+                attempt + 1,
+                attempts,
+                adaptive_plan.send_delay_ms
+            );
+            tokio::time::sleep(Duration::from_millis(adaptive_plan.send_delay_ms)).await;
+        } else if attempt > 0 {
+            println!("UDP direct path    : retry {}/{}", attempt + 1, attempts);
+        }
+
+        let attempt_socket = if attempt == 0 {
+            socket
+                .take()
+                .expect("direct UDP socket available for first attempt")
+        } else {
+            match holepunch::bind_socket(preferred_port).await {
+                Ok(socket) => socket,
+                Err(err) => {
+                    println!("UDP direct path    : retry socket bind failed ({err})");
+                    continue;
+                }
+            }
+        };
+
+        let conn = match establish_direct(
+            attempt_socket,
+            role,
+            peer_candidates.clone(),
+            token,
+            tuning,
+            adaptive_plan.read_timeout_ms,
+        )
+        .await
+        {
+            Ok(conn) => conn,
+            Err(err) => {
+                if attempt + 1 < attempts {
+                    println!("UDP direct path    : failed ({err}); retrying");
+                    continue;
+                }
+                println!("UDP direct path    : FAILED ({err})");
+                println!("                    TCP relay fallback will still be tested.");
+                return None;
+            }
+        };
+
+        let mut path = TestPath::Direct(conn);
+        return match run_path_suite("UDP direct path", &mut path, role, options, Some(tuning)).await
+        {
+            Ok(metrics) => Some(metrics),
+            Err(err) => {
+                println!("UDP direct tests   : FAILED ({err})");
+                None
+            }
+        };
+    }
+    None
 }
 
 #[cfg(not(feature = "udp"))]
+#[allow(clippy::too_many_arguments)]
 async fn run_udp_path(
     _socket: tokio::net::UdpSocket,
     _role: UdpTestRole,
@@ -479,6 +566,8 @@ async fn run_udp_path(
     _token: [u8; holepunch::TOKEN_LEN],
     _tuning: UdpDirectTuning,
     _options: UdpTestOptions,
+    _adaptive_plan: &UdpAdaptivePlan,
+    _preferred_port: u16,
 ) -> Option<PathMetrics> {
     println!();
     println!("UDP direct path    : skipped (binary built without the `udp` feature)");
@@ -492,15 +581,19 @@ async fn establish_direct(
     peer_candidates: Vec<SocketAddr>,
     token: [u8; holepunch::TOKEN_LEN],
     tuning: UdpDirectTuning,
+    read_timeout_ms: u64,
 ) -> Result<holepunch::DirectConn> {
     match role {
         UdpTestRole::Listener => {
             let listener = holepunch::DirectListener::new(socket, peer_candidates, tuning)
                 .await
                 .context("start diagnostic QUIC listener")?;
-            Ok(timeout(Duration::from_secs(10), listener.accept(token))
-                .await
-                .context("timed out waiting for direct QUIC peer")??)
+            Ok(timeout(
+                Duration::from_millis(read_timeout_ms.max(1)),
+                listener.accept(token),
+            )
+            .await
+            .context("timed out waiting for direct QUIC peer")??)
         }
         UdpTestRole::Dialer => {
             holepunch::connect_direct(socket, peer_candidates, token, tuning).await
@@ -914,6 +1007,11 @@ async fn inspect_local_nat(
         local_udp,
         primary_local_ip: local_ips.first().map(ToString::to_string),
         reflexive,
+        candidate_kinds: Vec::new(),
+        selected_stun: probes
+            .iter()
+            .find(|probe| probe.ok)
+            .map(|probe| probe.server.clone()),
         bore_stun,
         candidate_count: 0,
         port_preserved,
@@ -1443,6 +1541,14 @@ fn print_local_nat_report(report: &LocalNatReport, candidates: &[SocketAddr]) {
             .as_deref()
             .unwrap_or("<none>")
     );
+    println!(
+        "Selected STUN     : {}",
+        report.summary.selected_stun.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "Candidate roles   : {}",
+        candidate_roles_label(&report.summary.candidate_kinds)
+    );
     println!("NAT class         : {}", nat_class_label(&report.class));
     for probe in &report.probes {
         if probe.ok {
@@ -1465,18 +1571,97 @@ fn print_local_nat_report(report: &LocalNatReport, candidates: &[SocketAddr]) {
     }
 }
 
+fn candidate_roles_label(kinds: &[UdpCandidateKind]) -> String {
+    if kinds.is_empty() {
+        return "<implicit>".to_string();
+    }
+    kinds
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn adaptive_candidate_rank(kind: UdpCandidateKind, plan: &UdpAdaptivePlan) -> Option<usize> {
+    let wire_kind = match kind {
+        UdpCandidateKind::Reflexive => UdpAdaptiveCandidateKind::Reflexive,
+        UdpCandidateKind::RouterMapped => UdpAdaptiveCandidateKind::RouterMapped,
+        UdpCandidateKind::Predicted => UdpAdaptiveCandidateKind::Predicted,
+        UdpCandidateKind::Local => UdpAdaptiveCandidateKind::Local,
+    };
+    plan.candidate_order
+        .iter()
+        .position(|candidate| *candidate == wire_kind)
+}
+
+fn order_peer_candidates(
+    peer_candidates: &[SocketAddr],
+    peer_summary: &UdpTestPeerSummary,
+    plan: &UdpAdaptivePlan,
+) -> Vec<SocketAddr> {
+    if peer_candidates.len() != peer_summary.candidate_kinds.len() || peer_candidates.is_empty() {
+        return peer_candidates.to_vec();
+    }
+
+    let fallback_rank = plan.candidate_order.len();
+    let mut ordered: Vec<_> = peer_candidates
+        .iter()
+        .enumerate()
+        .map(|(idx, addr)| {
+            let rank = peer_summary
+                .candidate_kinds
+                .get(idx)
+                .and_then(|kind| adaptive_candidate_rank(*kind, plan))
+                .unwrap_or(fallback_rank);
+            (rank, idx, *addr)
+        })
+        .collect();
+    ordered.sort_by_key(|(rank, idx, _)| (*rank, *idx));
+    ordered.into_iter().map(|(_, _, addr)| addr).collect()
+}
+
+fn bool_summary_label(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "<unknown>",
+    }
+}
+
 fn print_pairing_report(
     peer: &UdpTestPeerSummary,
     peer_candidates: &[SocketAddr],
     role: UdpTestRole,
     options: UdpTestOptions,
+    adaptive_plan: &UdpAdaptivePlan,
 ) {
     println!();
     println!("Server pairing     : paired");
     println!("Local role         : {role:?}");
     println!("Peer NAT class     : {}", peer.nat_class);
     println!("Peer UDP socket    : {}", peer.local_udp);
-    println!("Peer candidates    : {}", peer_candidates.len());
+    println!(
+        "Peer candidate roles: {}",
+        candidate_roles_label(&peer.candidate_kinds)
+    );
+    println!(
+        "Peer selected STUN : {}",
+        peer.selected_stun.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "Peer candidates    : {} (summary {})",
+        peer_candidates.len(),
+        peer.candidate_count
+    );
+    println!(
+        "Peer port preserved: {}",
+        bool_summary_label(peer.port_preserved)
+    );
+    println!(
+        "Peer bore STUN     : {}",
+        bool_summary_label(peer.bore_stun)
+    );
+    println!("Adaptive plan      : {}", adaptive_plan.summary());
     println!(
         "Bandwidth test     : {}",
         if options.bandwidth {
@@ -1831,9 +2016,7 @@ fn bandwidth_balance(metrics: &PathMetrics) -> Option<(f64, f64, f64, &'static s
 fn recommended_tuning(
     metrics: &PathMetrics,
 ) -> Option<(&'static str, UdpDirectTuning, &'static str)> {
-    let Some(tuning) = metrics.tuning.as_ref() else {
-        return None;
-    };
+    let tuning = metrics.tuning.as_ref()?;
 
     let defaults = UdpDirectTuning::default();
     let transport = metrics.transport.as_ref();
@@ -1851,7 +2034,7 @@ fn recommended_tuning(
             || transport.frame_rx.stream_data_blocked > 0
     });
     if has_loss_or_mtu_issue {
-        return Some((
+        Some((
             "stability/default",
             defaults,
             if skewed_bandwidth {
@@ -1859,13 +2042,13 @@ fn recommended_tuning(
             } else {
                 "loss/MTU instability: return to the default profile before trying bigger values"
             },
-        ));
+        ))
     } else if has_flow_control_pressure {
         let mut target = defaults;
         target.stream_receive_window = tuning
             .stream_receive_window
             .max(defaults.stream_receive_window.saturating_mul(2));
-        return Some((
+        Some((
             "throughput-leaning",
             target,
             if skewed_bandwidth {
@@ -1873,7 +2056,7 @@ fn recommended_tuning(
             } else {
                 "clean path with flow-control pressure: increase stream_receive_window first"
             },
-        ));
+        ))
     } else if transport.is_some_and(|transport| {
         transport.frame_tx.streams_blocked_bidi > 0 || transport.frame_rx.streams_blocked_bidi > 0
     }) {
@@ -1881,7 +2064,7 @@ fn recommended_tuning(
         target.max_direct_streams = tuning
             .max_direct_streams
             .max(defaults.max_direct_streams.saturating_mul(2));
-        return Some((
+        Some((
             "stream-heavy",
             target,
             if skewed_bandwidth {
@@ -1889,9 +2072,9 @@ fn recommended_tuning(
             } else {
                 "bidi stream limit pressure: raise max_direct_streams only if you truly run many concurrent direct flows"
             },
-        ));
+        ))
     } else {
-        return Some((
+        Some((
             "balanced/default",
             defaults,
             if skewed_bandwidth {
@@ -1899,7 +2082,7 @@ fn recommended_tuning(
             } else {
                 "no clear pressure signal: keep the default profile"
             },
-        ));
+        ))
     }
 }
 
@@ -2096,6 +2279,53 @@ mod tests {
         assert!(merged.bandwidth);
         assert_eq!(merged.transfer_quota, 200);
         assert!(merged.udp_only);
+    }
+
+    #[test]
+    fn order_peer_candidates_respects_adaptive_plan() {
+        let peer_summary = UdpTestPeerSummary {
+            nat_class: "cone".to_string(),
+            local_udp: "127.0.0.1:50000".to_string(),
+            primary_local_ip: Some("127.0.0.1".to_string()),
+            reflexive: vec!["198.51.100.20:50000".to_string()],
+            candidate_kinds: vec![
+                UdpCandidateKind::Local,
+                UdpCandidateKind::Predicted,
+                UdpCandidateKind::Reflexive,
+            ],
+            selected_stun: Some("stun.cloudflare.com:3478".to_string()),
+            bore_stun: Some(true),
+            candidate_count: 3,
+            port_preserved: Some(true),
+        };
+        let candidates = vec![
+            "127.0.0.1:50000".parse().unwrap(),
+            "127.0.0.1:50001".parse().unwrap(),
+            "198.51.100.20:50000".parse().unwrap(),
+        ];
+        let plan = UdpAdaptivePlan {
+            mode: UdpAdaptiveMode::DirectFirst,
+            candidate_order: vec![
+                UdpAdaptiveCandidateKind::Reflexive,
+                UdpAdaptiveCandidateKind::Predicted,
+                UdpAdaptiveCandidateKind::Local,
+                UdpAdaptiveCandidateKind::RelayFallback,
+            ],
+            retry_budget: 1,
+            read_timeout_ms: 750,
+            send_delay_ms: 0,
+        };
+
+        let ordered = order_peer_candidates(&candidates, &peer_summary, &plan);
+
+        assert_eq!(
+            ordered,
+            vec![
+                "198.51.100.20:50000".parse().unwrap(),
+                "127.0.0.1:50001".parse().unwrap(),
+                "127.0.0.1:50000".parse().unwrap(),
+            ]
+        );
     }
 
     #[test]

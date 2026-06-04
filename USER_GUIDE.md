@@ -94,6 +94,10 @@ BORE_SERVER=https://bore.tld BORE_SECRET=hunter2 bore local 8080
 - `-v` → log a livello `debug`, `-vv` → `trace`. `RUST_LOG` ha la precedenza.
 - I log vanno su **stderr**; i colori ANSI sono attivi solo su terminale (output
   pulito sotto Docker/journald/redirezioni).
+- A `-vv`, bore stampa anche i frame del control plane con direzione (`tx`/`rx`),
+  etichetta del canale (`server/control`, `client/public`, `proxy/consumer`,
+  `test-udp/peer`, ecc.) e un summary redatto del messaggio, così il flusso
+  server/client/proxy si può ricostruire dai log senza andare a intuito.
 
 ### Arresto pulito
 

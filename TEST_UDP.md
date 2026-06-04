@@ -50,7 +50,8 @@ Flag rilevanti:
 - `--upnp` (su `local` e `proxy`) — prova ad aprire una porta sul **router casalingo** via UPnP-IGD e la aggiunge come candidato. Aiuta router casalinghi strict con IP WAN pubblico; **inutile dietro CGNAT**. Log: `UPnP-IGD port mapping ENABLED`.
 - `--try-port-prediction` (su `local` e `proxy`) — per NAT **simmetrici**: annuncia qualche porta oltre quella reflexive. **Opt-in**, best-effort, **può sembrare un port scan** ai firewall strict. Log: `port prediction ENABLED`.
 - `--udp-only` (solo `test-udp --tcp-secret-id`) — salta il benchmark TCP relay e misura solo il path UDP diretto. Utile per capire i knob UDP senza far intervenire il fallback.
-- `test-udp --tcp-secret-id ID` — modalità diagnostica **a due peer**: due host lanciano lo stesso comando, il server li abbina, prova UDP diretto e TCP relay, e stampa un report A<->B con snapshot host CPU/RAM/load, RTT/loss/MTU/PLPMTUD QUIC, skew upload/download, preset consigliato, valori del tuning usato e hint sui colli di bottiglia.
+- `test-udp --tcp-secret-id ID` — modalità diagnostica **a due peer**: due host lanciano lo stesso comando, il server li abbina, prova UDP diretto e TCP relay, e stampa un report A<->B con snapshot host CPU/RAM/load, RTT/loss/MTU/PLPMTUD QUIC, skew upload/download, preset consigliato, valori del tuning usato e hint sui colli di bottiglia. Il summary scambiato nel pairing include anche lo STUN selezionato quando disponibile, cosi il piano NAT adattivo puo vedere quale server ha funzionato su ciascun lato.
+- Nel report paired, `Local NAT report` e `Server pairing` mostrano anche `Selected STUN`, `Candidate roles`, `Peer selected STUN`, `Peer candidate roles`, `Peer candidates` con il conteggio del summary, e gli hint `port preserved` / `bore STUN` cosi la metadata NAT rimane leggibile nell'output. Viene anche stampato un `Adaptive plan` sintetico con mode, retry budget e ordine dei candidati; il client usa quel piano per riordinare i candidati del punch diretto e per ritentare l'handshake QUIC entro il budget previsto.
 - `test-udp --test-bandwidth --test-transfer-quota 500MB` — aggiunge banda e latenza bidirezionali su entrambi i path. `--test-bandwith` (senza la seconda `d`) è accettato come alias.
 
 Variabili d'ambiente equivalenti: `BORE_UDP`, `BORE_PREFER_UDP`, `BORE_STUN_SERVER`, `BORE_SECRET`, `BORE_TCP_SECRET_ID`, `BORE_SERVER`, `BORE_UPNP`, `BORE_TRY_PORT_PREDICTION`.
@@ -80,6 +81,11 @@ Attiva i log (default sono quasi muti):
 ```shell
 export RUST_LOG=bore_cli=debug,bore=info
 ```
+
+Se vuoi ricostruire lo scambio preciso dei messaggi control-plane, usa `-vv` o
+`RUST_LOG=bore_cli=trace,bore=trace`: i log mostrano anche i frame `tx`/`rx`
+con label del canale (`server/control`, `client/public`, `proxy/consumer`,
+`test-udp/peer`, …) e summary redatti dei messaggi.
 
 Frasi chiave da cercare:
 

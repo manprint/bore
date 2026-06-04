@@ -136,11 +136,12 @@ impl Client {
         // The control substream carries the handshake and heartbeats. It is the
         // only stream the client opens; the server opens one per forwarded
         // connection, which arrive through the acceptor.
-        let mut control = Delimited::new(
+        let mut control = Delimited::with_label(
             opener
                 .open()
                 .await
                 .context("failed to open control stream")?,
+            "client/public",
         );
 
         // Send Hello first: yamux opens substreams lazily, so this first write is
@@ -247,11 +248,12 @@ impl Client {
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
         let (opener, acceptor) = mux::client(socket);
-        let mut control = Delimited::new(
+        let mut control = Delimited::with_label(
             opener
                 .open()
                 .await
                 .context("failed to open control stream")?,
+            "client/provider",
         );
 
         // Send the registration first so the lazily-opened substream is announced
@@ -673,11 +675,12 @@ async fn open_carrier(
 ) -> Result<(Delimited<mux::Stream>, mux::Acceptor)> {
     let socket = transport::connect(endpoint, insecure).await?;
     let (opener, acceptor) = mux::client(socket);
-    let mut control = Delimited::new(
+    let mut control = Delimited::with_label(
         opener
             .open()
             .await
             .context("failed to open carrier control stream")?,
+        "client/relay-carrier",
     );
     // Send JoinCarrier first to announce the lazily-opened substream (see `new`),
     // then complete the auth challenge if the server requires a secret.

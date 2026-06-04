@@ -1,12 +1,12 @@
 # Contributing
 
-Thanks for your interest in this fork of [bore](https://github.com/ekzhang/bore).
+Thanks for your interest in this fork of bore.
 
 ## Development
 
 ```shell
 cargo build --all-features          # build (CI builds with --all-features)
-cargo test                          # run all tests
+cargo test --all-features           # run all tests (matches CI)
 cargo test basic_proxy              # run a single test by name
 ```
 
@@ -21,7 +21,7 @@ All three CI gates must pass locally (warnings are errors):
 
 ```shell
 cargo fmt -- --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-features --all-targets -- -D warnings
 cargo clippy --no-default-features --all-targets -- -D warnings   # `udp` off
 cargo test
 ```

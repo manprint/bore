@@ -21,7 +21,7 @@ cargo run -- local 8000 --to bore.pub      # run client
 cargo run -- server                        # run server
 ```
 
-CI (`.github/workflows/ci.yml`) runs three separate jobs: build+test, `cargo fmt --check`, and `cargo clippy -D warnings`. All three must pass.
+CI (`.github/workflows/ci.yml`) runs three separate jobs: build+test, `cargo fmt --check`, and `cargo clippy --all-features --all-targets -- -D warnings`. All three must pass.
 
 ### Testing caveats
 
@@ -150,9 +150,11 @@ the former fixes the direct path, the latter the relay fallback.
   env vars present (optional ones commented). UDP direct paths are enabled
   (`BORE_UDP=true` on the server with a `7835/udp` forward, `BORE_PREFER_UDP=true`
   on client/proxy); see the server file's NAT caveat about bridge vs host.
-- **CI/release on every branch.** All four workflows run on **any branch** push
-  (plus `v*` tags). `ci.yml` (host: fmt/clippy/build/test `--all-features` + audit)
-  and `mean_bean_ci.yml` (cross build with `udp` + test relay-only) gate quality.
+- **CI/release split.** `ci.yml` and `mean_bean_ci.yml` gate quality on the
+  main/dev branches (plus pull requests); `mean_bean_deploy.yml` and `docker.yml`
+  run on **any branch** push (plus `v*` tags). `ci.yml` (host: fmt/clippy/build/test
+  `--all-features` + audit) and `mean_bean_ci.yml` (cross build with `udp` + test
+  relay-only) gate quality.
   `mean_bean_deploy.yml` produces a **GitHub Release** per push — a `create-release`
   job makes it (named `<branch>-<sha7>`, or the tag; branch builds are pre-releases,
   only tags become "latest") via `softprops/action-gh-release`, then the matrix

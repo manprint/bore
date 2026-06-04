@@ -155,12 +155,132 @@ pub struct UdpTestPeerSummary {
     pub primary_local_ip: Option<String>,
     /// Public reflexive mappings reported by public STUN servers.
     pub reflexive: Vec<String>,
+    /// Classified roles of the candidate list, in the same order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_kinds: Vec<UdpCandidateKind>,
+    /// STUN host:port selected by this peer, if a STUN probe succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_stun: Option<String>,
     /// Whether the bore server's own STUN responder answered this peer.
     pub bore_stun: Option<bool>,
     /// Number of candidate addresses offered for hole punching.
     pub candidate_count: usize,
     /// Whether the first reflexive mapping preserved the local UDP port.
     pub port_preserved: Option<bool>,
+}
+
+/// Role assigned to a paired-UDP candidate address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UdpCandidateKind {
+    /// STUN-discovered reflexive address.
+    Reflexive,
+    /// Router-mapped candidate (UPnP-IGD or equivalent).
+    RouterMapped,
+    /// Predicted port near the reflexive one for symmetric NATs.
+    Predicted,
+    /// Primary local address for same-LAN peers.
+    Local,
+}
+
+impl UdpCandidateKind {
+    /// Stable lowercase label used in logs and reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UdpCandidateKind::Reflexive => "reflexive",
+            UdpCandidateKind::RouterMapped => "router-mapped",
+            UdpCandidateKind::Predicted => "predicted",
+            UdpCandidateKind::Local => "local",
+        }
+    }
+}
+
+/// Adaptive-plan mode negotiated for a paired `bore test-udp` session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UdpAdaptiveMode {
+    /// Try the direct path first and keep the relay as fallback.
+    DirectFirst,
+    /// Try the direct path with a small retry budget.
+    DirectWithRetry,
+    /// Prefer the relay first, but still retain the direct candidates.
+    RelayFirst,
+    /// Skip the direct path and use the relay only.
+    RelayOnly,
+}
+
+impl UdpAdaptiveMode {
+    /// Stable lowercase label used in logs and reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UdpAdaptiveMode::DirectFirst => "direct-first",
+            UdpAdaptiveMode::DirectWithRetry => "direct-with-retry",
+            UdpAdaptiveMode::RelayFirst => "relay-first",
+            UdpAdaptiveMode::RelayOnly => "relay-only",
+        }
+    }
+}
+
+/// Candidate kinds carried by the adaptive plan ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UdpAdaptiveCandidateKind {
+    /// STUN-discovered reflexive address.
+    Reflexive,
+    /// Primary local address for same-LAN peers.
+    Local,
+    /// Router-mapped candidate (UPnP-IGD or equivalent).
+    RouterMapped,
+    /// Predicted port near the reflexive one for symmetric NATs.
+    Predicted,
+    /// Relay fallback if the direct path should be skipped or exhausted.
+    RelayFallback,
+}
+
+impl UdpAdaptiveCandidateKind {
+    /// Stable lowercase label used in logs and reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UdpAdaptiveCandidateKind::Reflexive => "reflexive",
+            UdpAdaptiveCandidateKind::Local => "local",
+            UdpAdaptiveCandidateKind::RouterMapped => "router-mapped",
+            UdpAdaptiveCandidateKind::Predicted => "predicted",
+            UdpAdaptiveCandidateKind::RelayFallback => "relay",
+        }
+    }
+}
+
+/// Compact adaptive plan for a paired `bore test-udp` session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpAdaptivePlan {
+    /// Overall strategy chosen for the pair.
+    pub mode: UdpAdaptiveMode,
+    /// Candidate kinds, in the order the direct path should consider them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_order: Vec<UdpAdaptiveCandidateKind>,
+    /// Number of direct-path attempts before falling back.
+    pub retry_budget: u8,
+    /// Preferred read timeout for the direct-path handshake, in milliseconds.
+    pub read_timeout_ms: u64,
+    /// Delay before retrying a failed direct-path attempt, in milliseconds.
+    pub send_delay_ms: u64,
+}
+
+impl UdpAdaptivePlan {
+    /// Compact human-readable summary used in the paired diagnostic.
+    pub fn summary(&self) -> String {
+        let order = self
+            .candidate_order
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        format!(
+            "{} (retry {}, read {}ms, delay {}ms, order {})",
+            self.mode.as_str(),
+            self.retry_budget,
+            self.read_timeout_ms,
+            self.send_delay_ms,
+            order
+        )
+    }
 }
 
 /// UDP candidate offer with optional metadata about the STUN server that
@@ -203,6 +323,97 @@ impl Default for UdpDirectTuning {
             udp_socket_send_buffer: DIRECT_UDP_SOCKET_SEND_BUFFER,
             max_direct_streams: MAX_DIRECT_STREAMS,
         }
+    }
+}
+
+impl TunnelOptions {
+    fn control_frame_summary(&self) -> String {
+        format!(
+            "https={}, force_https={}, basic_auth={}, notes={}, carriers={}",
+            if self.https { "on" } else { "off" },
+            if self.force_https { "on" } else { "off" },
+            if self.basic_auth.is_some() {
+                "on"
+            } else {
+                "off"
+            },
+            if self.notes.is_some() {
+                "present"
+            } else {
+                "none"
+            },
+            self.carriers,
+        )
+    }
+}
+
+impl UdpTestOptions {
+    fn control_frame_summary(&self) -> String {
+        format!(
+            "bandwidth={}, transfer_quota={}, udp_only={}",
+            if self.bandwidth { "on" } else { "off" },
+            self.transfer_quota,
+            if self.udp_only { "on" } else { "off" },
+        )
+    }
+}
+
+impl UdpTestPeerSummary {
+    fn control_frame_summary(&self) -> String {
+        let candidate_kinds = if self.candidate_kinds.is_empty() {
+            "none".to_string()
+        } else {
+            self.candidate_kinds
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "nat_class={}, local_udp={}, primary_local_ip={}, selected_stun={}, bore_stun={}, candidate_count={}, port_preserved={}, candidate_kinds=[{}], reflexive={:?}",
+            self.nat_class,
+            self.local_udp,
+            self.primary_local_ip.as_deref().unwrap_or("<none>"),
+            self.selected_stun.as_deref().unwrap_or("<none>"),
+            match self.bore_stun {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown",
+            },
+            self.candidate_count,
+            match self.port_preserved {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown",
+            },
+            candidate_kinds,
+            self.reflexive,
+        )
+    }
+}
+
+impl UdpCandidateOffer {
+    fn control_frame_summary(&self) -> String {
+        format!(
+            "selected_stun={}, candidate_count={}, candidates={:?}",
+            self.selected_stun.as_deref().unwrap_or("<none>"),
+            self.candidates.len(),
+            self.candidates,
+        )
+    }
+}
+
+impl UdpDirectTuning {
+    fn control_frame_summary(&self) -> String {
+        format!(
+            "stream_recv={}, conn_recv={}, send={}, sock_recv={}, sock_send={}, max_streams={}",
+            self.stream_receive_window,
+            self.connection_receive_window,
+            self.send_window,
+            self.udp_socket_recv_buffer,
+            self.udp_socket_send_buffer,
+            self.max_direct_streams,
+        )
     }
 }
 
@@ -288,6 +499,7 @@ pub enum ClientMessage {
 }
 
 /// A message from the server on the control substream.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMessage {
     /// Authentication challenge, sent as the first message, if enabled.
@@ -368,28 +580,180 @@ pub enum ServerMessage {
         /// Direct-UDP transport tuning requested by the server.
         #[serde(default)]
         tuning: UdpDirectTuning,
+        /// Adaptive NAT plan chosen by the server for this paired diagnostic.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adaptive_plan: Option<UdpAdaptivePlan>,
     },
 }
 
+#[doc(hidden)]
+pub trait ControlFrameSummary {
+    fn control_frame_summary(&self) -> String;
+}
+
+impl ControlFrameSummary for ClientMessage {
+    fn control_frame_summary(&self) -> String {
+        match self {
+            ClientMessage::Authenticate(_) => "Authenticate { tag=<redacted> }".to_string(),
+            ClientMessage::Hello(port, options) => {
+                format!(
+                    "Hello {{ port={}, options={{ {} }} }}",
+                    port,
+                    options.control_frame_summary()
+                )
+            }
+            ClientMessage::HelloSecret {
+                id,
+                notes,
+                basic_auth,
+                carriers,
+            } => {
+                format!(
+                    "HelloSecret {{ id={}, notes={}, basic_auth={}, carriers={} }}",
+                    id,
+                    if notes.is_some() { "present" } else { "none" },
+                    if *basic_auth { "on" } else { "off" },
+                    carriers,
+                )
+            }
+            ClientMessage::ConnectSecret { id, notes } => {
+                format!(
+                    "ConnectSecret {{ id={}, notes={} }}",
+                    id,
+                    if notes.is_some() { "present" } else { "none" },
+                )
+            }
+            ClientMessage::UdpCandidates(candidates) => {
+                format!("UdpCandidates {{ candidates={:?} }}", candidates)
+            }
+            ClientMessage::UdpCandidateOffer(offer) => {
+                format!("UdpCandidateOffer {{ {} }}", offer.control_frame_summary())
+            }
+            ClientMessage::UdpStunHintRequest => "UdpStunHintRequest".to_string(),
+            ClientMessage::JoinCarrier { .. } => "JoinCarrier { token=<redacted> }".to_string(),
+            ClientMessage::TestUdpJoin {
+                id,
+                candidates,
+                summary,
+                options,
+            } => {
+                format!(
+                    "TestUdpJoin {{ id={}, candidates={:?}, summary={{ {} }}, options={{ {} }} }}",
+                    id,
+                    candidates,
+                    summary.control_frame_summary(),
+                    options.control_frame_summary(),
+                )
+            }
+        }
+    }
+}
+
+impl ControlFrameSummary for ServerMessage {
+    fn control_frame_summary(&self) -> String {
+        match self {
+            ServerMessage::Challenge(challenge) => {
+                format!("Challenge {{ challenge={} }}", challenge)
+            }
+            ServerMessage::Hello(port) => format!("Hello {{ port={} }}", port),
+            ServerMessage::CarrierToken { token: _, extra } => {
+                format!("CarrierToken {{ token=<redacted>, extra={} }}", extra)
+            }
+            ServerMessage::Ok => "Ok".to_string(),
+            ServerMessage::Heartbeat => "Heartbeat".to_string(),
+            ServerMessage::Error(err) => format!("Error {{ message={} }}", err),
+            ServerMessage::UdpPunch {
+                nonce,
+                peer,
+                peer_selected_stun,
+                tuning,
+            } => {
+                format!(
+                    "UdpPunch {{ nonce={}, peer={:?}, peer_selected_stun={}, tuning={{ {} }} }}",
+                    hex::encode(nonce),
+                    peer,
+                    peer_selected_stun.as_deref().unwrap_or("<none>"),
+                    tuning.control_frame_summary(),
+                )
+            }
+            ServerMessage::UdpStunHint { stun_server } => {
+                format!(
+                    "UdpStunHint {{ stun_server={} }}",
+                    stun_server.as_deref().unwrap_or("<none>")
+                )
+            }
+            ServerMessage::UdpUnavailable => "UdpUnavailable".to_string(),
+            ServerMessage::TestUdpWaiting => "TestUdpWaiting".to_string(),
+            ServerMessage::TestUdpStart {
+                role,
+                nonce,
+                peer_candidates,
+                peer_summary,
+                options,
+                tuning,
+                adaptive_plan,
+            } => {
+                format!(
+                    "TestUdpStart {{ role={:?}, nonce={}, peer_candidates={:?}, peer_summary={{ {} }}, options={{ {} }}, tuning={{ {} }}, adaptive_plan={} }}",
+                    role,
+                    hex::encode(nonce),
+                    peer_candidates,
+                    peer_summary.control_frame_summary(),
+                    options.control_frame_summary(),
+                    tuning.control_frame_summary(),
+                    adaptive_plan.as_ref().map(|plan| plan.summary()).unwrap_or_else(|| "<none>".to_string()),
+                )
+            }
+        }
+    }
+}
+
 /// Transport stream with JSON frames delimited by null characters.
-pub struct Delimited<U>(Framed<U, AnyDelimiterCodec>);
+pub struct Delimited<U> {
+    framed: Framed<U, AnyDelimiterCodec>,
+    label: &'static str,
+}
 
 impl<U: AsyncRead + AsyncWrite + Unpin> Delimited<U> {
     /// Construct a new delimited stream.
     pub fn new(stream: U) -> Self {
+        Self::with_label(stream, "control")
+    }
+
+    /// Construct a new delimited stream with a log label.
+    pub fn with_label(stream: U, label: &'static str) -> Self {
         let codec = AnyDelimiterCodec::new_with_max_length(vec![0], vec![0], MAX_FRAME_LENGTH);
-        Self(Framed::new(stream, codec))
+        Self {
+            framed: Framed::new(stream, codec),
+            label,
+        }
     }
 
     /// Read the next null-delimited JSON instruction from a stream.
-    pub async fn recv<T: DeserializeOwned>(&mut self) -> Result<Option<T>> {
-        trace!("waiting to receive json message");
-        if let Some(next_message) = self.0.next().await {
+    pub async fn recv<T: DeserializeOwned + ControlFrameSummary>(&mut self) -> Result<Option<T>> {
+        trace!(
+            control = self.label,
+            direction = "rx",
+            "waiting for control frame"
+        );
+        if let Some(next_message) = self.framed.next().await {
             let byte_message = next_message.context("frame error, invalid byte length")?;
-            let serialized_obj =
+            let serialized_obj: T =
                 serde_json::from_slice(&byte_message).context("unable to parse message")?;
-            Ok(serialized_obj)
+            trace!(
+                control = self.label,
+                direction = "rx",
+                frame = %serialized_obj.control_frame_summary(),
+                "control frame received"
+            );
+            Ok(Some(serialized_obj))
         } else {
+            trace!(
+                control = self.label,
+                direction = "rx",
+                frame = "<eof>",
+                "control frame closed"
+            );
             Ok(None)
         }
     }
@@ -398,22 +762,29 @@ impl<U: AsyncRead + AsyncWrite + Unpin> Delimited<U> {
     ///
     /// This is useful for parsing the initial message of a stream for handshake or
     /// other protocol purposes, where we do not want to wait indefinitely.
-    pub async fn recv_timeout<T: DeserializeOwned>(&mut self) -> Result<Option<T>> {
+    pub async fn recv_timeout<T: DeserializeOwned + ControlFrameSummary>(
+        &mut self,
+    ) -> Result<Option<T>> {
         timeout(NETWORK_TIMEOUT, self.recv())
             .await
             .context("timed out waiting for initial message")?
     }
 
     /// Send a null-terminated JSON instruction on a stream.
-    pub async fn send<T: Serialize>(&mut self, msg: T) -> Result<()> {
-        trace!("sending json message");
-        self.0.send(serde_json::to_string(&msg)?).await?;
+    pub async fn send<T: Serialize + ControlFrameSummary>(&mut self, msg: T) -> Result<()> {
+        trace!(
+            control = self.label,
+            direction = "tx",
+            frame = %msg.control_frame_summary(),
+            "control frame sent"
+        );
+        self.framed.send(serde_json::to_string(&msg)?).await?;
         Ok(())
     }
 
     /// Consume this object, returning current buffers and the inner transport.
     pub fn into_parts(self) -> FramedParts<U, AnyDelimiterCodec> {
-        self.0.into_parts()
+        self.framed.into_parts()
     }
 }
 
@@ -471,17 +842,80 @@ mod tests {
                 peer_summary,
                 options,
                 tuning,
+                adaptive_plan,
             } => {
                 assert_eq!(role, UdpTestRole::Listener);
                 assert_eq!(nonce, [0; UDP_NONCE_LEN]);
                 assert_eq!(peer_candidates, vec!["127.0.0.1:3478".parse().unwrap()]);
                 assert_eq!(peer_summary.nat_class, "Open");
+                assert!(peer_summary.candidate_kinds.is_empty());
+                assert_eq!(peer_summary.selected_stun, None);
                 assert!(!options.bandwidth);
                 assert_eq!(options.transfer_quota, 1024);
                 assert!(!options.udp_only);
                 assert_eq!(tuning, UdpDirectTuning::default());
+                assert!(adaptive_plan.is_none());
             }
             other => panic!("unexpected message: {other:?}"),
         }
     }
+}
+
+#[test]
+fn control_frame_summary_redacts_sensitive_fields() {
+    assert_eq!(
+        ClientMessage::Authenticate("secret-tag".into()).control_frame_summary(),
+        "Authenticate { tag=<redacted> }"
+    );
+    assert_eq!(
+        ClientMessage::JoinCarrier {
+            token: "carrier-token".into(),
+        }
+        .control_frame_summary(),
+        "JoinCarrier { token=<redacted> }"
+    );
+    assert!(ServerMessage::CarrierToken {
+        token: "server-token".into(),
+        extra: 2,
+    }
+    .control_frame_summary()
+    .contains("token=<redacted>"));
+}
+
+#[test]
+fn control_frame_summary_includes_test_udp_plan() {
+    let msg = ServerMessage::TestUdpStart {
+        role: UdpTestRole::Dialer,
+        nonce: [1; UDP_NONCE_LEN],
+        peer_candidates: vec!["127.0.0.1:3478".parse().unwrap()],
+        peer_summary: UdpTestPeerSummary {
+            nat_class: "Cone".to_string(),
+            local_udp: "127.0.0.1:12345".to_string(),
+            primary_local_ip: Some("127.0.0.1".to_string()),
+            reflexive: vec!["198.51.100.10:12345".to_string()],
+            candidate_kinds: vec![UdpCandidateKind::Reflexive],
+            selected_stun: Some("stun.cloudflare.com:3478".to_string()),
+            bore_stun: Some(true),
+            candidate_count: 1,
+            port_preserved: Some(true),
+        },
+        options: UdpTestOptions {
+            bandwidth: true,
+            transfer_quota: 1024,
+            udp_only: true,
+        },
+        tuning: UdpDirectTuning::default(),
+        adaptive_plan: Some(UdpAdaptivePlan {
+            mode: UdpAdaptiveMode::DirectFirst,
+            candidate_order: vec![UdpAdaptiveCandidateKind::Reflexive],
+            retry_budget: 1,
+            read_timeout_ms: 750,
+            send_delay_ms: 0,
+        }),
+    };
+
+    let summary = msg.control_frame_summary();
+    assert!(summary.contains("TestUdpStart"));
+    assert!(summary.contains("adaptive_plan=direct-first"));
+    assert!(summary.contains("nonce=01010101010101010101010101010101"));
 }

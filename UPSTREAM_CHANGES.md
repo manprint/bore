@@ -38,15 +38,17 @@ on the host; the cross matrix (`mean_bean_*`) builds **with** default features
 (so release binaries include `udp`) but tests **without** it (cross `ci/test.bash`
 passes `--no-default-features`) to avoid QUIC flakiness under qemu emulation.
 
-**Workflows run on every branch** (plus `v*` tags). `mean_bean_deploy.yml`
-creates a GitHub Release per push (`create-release` job → `softprops/action-gh-release`,
-named via `ci/version.bash`: `<branch>-<sha7>` pre-release, or the tag = latest)
-and the matrix jobs upload each target binary as a release asset. `docker.yml`
-pushes an **amd64-only** image to GHCR Packages (tagged by branch + sha; arm64
-dropped — QEMU emulation cost ~20 min, `just push` still builds multi-arch). Branch
-builds create a lightweight tag `<branch>-<sha7>` (releases require a tag); it
-doesn't match `v*` and `GITHUB_TOKEN` can't re-trigger workflows → no loop, but
-tags/releases accumulate per push (prune if noisy).
+- **Workflow split:** `ci.yml` and `mean_bean_ci.yml` gate main/dev branches (plus
+  pull requests), while `mean_bean_deploy.yml` and `docker.yml` run on every branch
+  push (plus `v*` tags). `mean_bean_deploy.yml` creates a GitHub Release per push
+  (`create-release` job → `softprops/action-gh-release`, named via `ci/version.bash`:
+  `<branch>-<sha7>` pre-release, or the tag = latest) and the matrix jobs upload
+  each target binary as a release asset. `docker.yml` pushes an **amd64-only** image
+  to GHCR Packages (tagged by branch + sha; arm64 dropped — QEMU emulation cost ~20
+  min, `just push` still builds multi-arch). Branch builds create a lightweight tag
+  `<branch>-<sha7>` (releases require a tag); it doesn't match `v*` and
+  `GITHUB_TOKEN` can't re-trigger workflows → no loop, but tags/releases accumulate
+  per push (prune if noisy).
 
 **Tests bind real ports and the e2e/secret suites use the fixed `CONTROL_PORT`
 (7835).** Two hard-won testing rules:

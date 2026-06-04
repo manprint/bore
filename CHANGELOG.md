@@ -106,6 +106,11 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
   Xs` when the preferred port becomes PRESERVED again.
 
 ### Changed
+- **Labeled control-plane trace logging**: `Delimited::with_label` now traces
+  `tx`/`rx` control frames at `trace` level with role labels (`server/control`,
+  `client/public`, `client/provider`, `proxy/consumer`, `test-udp/peer`, ...)
+  and redacted summaries, so a `-vv` / `RUST_LOG=...trace` log can be read as a
+  full message exchange between server, client, proxy, and paired diagnostics.
 - **Live UDP STUN discovery now defaults to public STUN first.** Secret-tunnel
   provider/consumer direct paths and paired `test-udp` candidate gathering try
   `stun.cloudflare.com:3478` first, then Google STUN, then the bore server's own

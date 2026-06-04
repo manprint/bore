@@ -48,7 +48,7 @@ use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, To
 use std::{
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 #[cfg(feature = "udp")]
@@ -1089,24 +1089,31 @@ pub async fn connect_direct(
     // timeout *per* candidate): with N candidates the serial worst case was
     // N * NETWORK_TIMEOUT (6-21s for predicted/UPnP/local lists). `select_ok`
     // returns the first handshake that completes and verifies its token; the
-    // losing connects are dropped (cancelled).
+    // losing connects are dropped (cancelled). Per-candidate errors are collected
+    // in a shared Vec so the final warn includes each candidate's failure reason.
+    let errors: Arc<Mutex<Vec<(SocketAddr, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let attempts: Vec<_> = peers
         .iter()
         .map(|&peer| {
             let endpoint = endpoint.clone();
+            let errors = Arc::clone(&errors);
             Box::pin(async move {
                 debug!(%peer, "attempting direct QUIC candidate");
                 let connecting = match endpoint.connect(peer, "bore") {
                     Ok(connecting) => connecting,
                     Err(err) => {
+                        let msg = format!("start failed: {err}");
                         debug!(%peer, %err, "failed to start direct QUIC candidate");
+                        errors.lock().unwrap().push((peer, msg));
                         return Err(err.into());
                     }
                 };
                 let conn = match connecting.await {
                     Ok(conn) => conn,
                     Err(err) => {
+                        let msg = format!("{err}");
                         debug!(%peer, %err, "direct QUIC candidate failed");
+                        errors.lock().unwrap().push((peer, msg));
                         return Err(err.into());
                     }
                 };
@@ -1120,7 +1127,9 @@ pub async fn connect_direct(
                 let mut peer_token = [0u8; TOKEN_LEN];
                 recv.read_exact(&mut peer_token).await?;
                 if !tokens_match(&token, &peer_token) {
+                    let msg = "token mismatch".to_string();
                     warn!(%peer, "direct QUIC candidate failed token verification");
+                    errors.lock().unwrap().push((peer, msg));
                     bail!("direct path token mismatch");
                 }
                 let _ = send.finish();
@@ -1134,18 +1143,31 @@ pub async fn connect_direct(
     match timeout(NETWORK_TIMEOUT, futures_util::future::select_ok(attempts)).await {
         Ok(Ok((conn, _losers))) => Ok(conn),
         Ok(Err(err)) => {
+            let err_summary: Vec<String> = errors
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(addr, msg)| format!("{addr} → {msg}"))
+                .collect();
             warn!(
                 candidates = ?peers,
-                "all {n} direct QUIC candidates failed; falling back to relay. \
-                 Use -v for per-candidate errors",
+                errors = ?err_summary,
+                "all {n} direct QUIC candidates failed; falling back to relay",
                 n = peers.len(),
             );
             Err(err).context("all direct candidates failed")
         }
         Err(_) => {
+            let err_summary: Vec<String> = errors
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(addr, msg)| format!("{addr} → {msg}"))
+                .collect();
             warn!(
                 timeout = ?NETWORK_TIMEOUT,
                 candidates = ?peers,
+                candidate_errors = ?err_summary,
                 "direct QUIC connect exhausted {NETWORK_TIMEOUT:?} budget \
                  across {n} candidates; falling back to relay",
                 n = peers.len(),

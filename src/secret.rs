@@ -31,6 +31,7 @@ use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Registration, Role};
 use crate::auth::Authenticator;
 use crate::mux;
 use crate::pool::{self, Carrier, CarrierPool, PendingCarriers, TokenGuard};
+use crate::reconnect;
 use crate::shared::{
     tune_tcp, ClientMessage, Delimited, ServerMessage, UdpCandidateOffer, PROXY_BUFFER_SIZE,
     UDP_NONCE_LEN,
@@ -657,12 +658,20 @@ pub struct Proxy {
     /// upgrade re-negotiation binds the same port.
     #[cfg(feature = "udp")]
     udp_port: u16,
+    /// Capped exponential backoff for relay→direct upgrade retries.
+    /// Sequence: 2, 4, 8, 16, … up to 256 s, then every ~4.3 min.
+    #[cfg(feature = "udp")]
+    upgrade_backoff: reconnect::Backoff,
+    /// Monotonically increasing attempt counter for upgrade retry logs.
+    #[cfg(feature = "udp")]
+    upgrade_attempt: u64,
 }
 
-/// How often a relay-mode consumer retries the direct UDP path (so it upgrades
-/// to direct as soon as the provider becomes reachable, without dropping).
-#[cfg(feature = "udp")]
-const UDP_UPGRADE_INTERVAL: Duration = Duration::from_secs(10);
+/// Initial delay (s) for the UDP upgrade exponential backoff: 2, 4, 8, 16, …
+const UDP_UPGRADE_INITIAL_SECS: u64 = 2;
+
+/// Maximum delay (s) for the UDP upgrade backoff — retry at most every ~4.3 min.
+const UDP_UPGRADE_MAX_SECS: u64 = 256;
 
 impl Proxy {
     /// Connect to the server, register as a consumer of `tcp_secret_id`, and bind
@@ -808,6 +817,13 @@ impl Proxy {
             port_prediction,
             #[cfg(feature = "udp")]
             udp_port,
+            #[cfg(feature = "udp")]
+            upgrade_backoff: reconnect::Backoff::new_with(
+                UDP_UPGRADE_INITIAL_SECS,
+                UDP_UPGRADE_MAX_SECS,
+            ),
+            #[cfg(feature = "udp")]
+            upgrade_attempt: 0,
         })
     }
 
@@ -844,6 +860,10 @@ impl Proxy {
             port_prediction,
             #[cfg(feature = "udp")]
             udp_port,
+            #[cfg(feature = "udp")]
+            mut upgrade_backoff,
+            #[cfg(feature = "udp")]
+            mut upgrade_attempt,
         } = self;
         let mut path = if direct { "direct-udp" } else { "relay" };
         #[cfg(feature = "udp")]
@@ -872,9 +892,18 @@ impl Proxy {
                 && !direct
                 && nego_done_rx.is_none()
                 && !waiting_for_stun_hint
-                && last_upgrade.elapsed() >= UDP_UPGRADE_INTERVAL
+                && last_upgrade.elapsed() >= upgrade_backoff.peek()
             {
                 last_upgrade = tokio::time::Instant::now();
+                upgrade_attempt += 1;
+                let backoff_delay = upgrade_backoff.next_delay();
+                info!(
+                    attempt = upgrade_attempt,
+                    next_retry_s = backoff_delay.as_secs(),
+                    "starting udp upgrade attempt #{upgrade_attempt}; \
+                     will retry in {}s on failure",
+                    backoff_delay.as_secs(),
+                );
                 if control
                     .send(ClientMessage::UdpStunHintRequest)
                     .await
@@ -951,6 +980,13 @@ impl Proxy {
                         }
                         // Gather failed (task dropped the sender): abort this attempt.
                         None => {
+                            let next_s = upgrade_backoff.peek().as_secs();
+                            info!(
+                                attempt = upgrade_attempt,
+                                next_retry_s = next_s,
+                                "udp upgrade candidate gathering failed; \
+                                 will retry in {next_s}s"
+                            );
                             nego_punch_tx = None;
                             nego_done_rx = None;
                         }
@@ -960,12 +996,20 @@ impl Proxy {
                 done = recv_opt(&mut nego_done_rx) => {
                     nego_cand_rx = None;
                     nego_punch_tx = None;
-                    // `Some` = upgraded; `None` = attempt failed, stay on relay
-                    // and retry next interval.
+                    if done.is_none() {
+                        let next_s = upgrade_backoff.peek().as_secs();
+                        info!(
+                            attempt = upgrade_attempt,
+                            next_retry_s = next_s,
+                            "udp upgrade attempt failed; will retry in {next_s}s"
+                        );
+                    }
                     if let Some(_conn) = done {
                         #[cfg(feature = "udp")]
                         {
                             info!("upgraded relay → direct udp path");
+                            upgrade_backoff.reset();
+                            upgrade_attempt = 0;
                             direct_closed_rx = Some(spawn_closed_monitor(_conn.clone()));
                             data_path = DataPath::Direct(_conn);
                             direct = true;
@@ -1379,7 +1423,7 @@ async fn upgrade_task(
             warn!(
                 %err,
                 "udp upgrade attempt failed at candidate gathering phase; \
-                 staying on relay, will retry in {UDP_UPGRADE_INTERVAL:?}"
+                 staying on relay, will retry on next backoff tick"
             );
             return;
         }
@@ -1399,7 +1443,7 @@ async fn upgrade_task(
         Ok(pair) => {
             let _ = done_tx.send(pair);
         }
-        Err(err) => warn!(%err, "udp upgrade attempt failed; staying on relay"),
+        Err(err) => warn!(%err, "udp upgrade punch/connect phase failed; staying on relay"),
     }
 }
 

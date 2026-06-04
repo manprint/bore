@@ -2,8 +2,10 @@
 //!
 //! Client roles (`bore local`, `bore proxy`) can run a connect/serve cycle once,
 //! or — with `--auto-reconnect` — forever: when a connection fails to establish
-//! or drops, it is retried after a backoff of 1, 2, 4, 8, 16, 32 seconds, then
-//! every 32 seconds indefinitely. A successful connection resets the backoff.
+//! or drops, it is retried after a backoff (default sequence: 1, 2, 4, 8, 16, 32
+//! seconds, then every 32 seconds indefinitely). The sequence, cap, and initial
+//! delay are configurable via [`Backoff::new_with`] for use cases like the UDP
+//! direct-path upgrade retry. A successful connection resets the backoff.
 
 use std::future::Future;
 use std::time::Duration;
@@ -12,36 +14,53 @@ use anyhow::Result;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-/// Initial backoff delay, in seconds.
-const INITIAL_BACKOFF_SECS: u64 = 1;
+/// Default initial backoff delay, in seconds.
+const DEFAULT_INITIAL_BACKOFF_SECS: u64 = 1;
 
-/// Maximum backoff delay, in seconds.
-const MAX_BACKOFF_SECS: u64 = 32;
+/// Default maximum backoff delay, in seconds.
+const DEFAULT_MAX_BACKOFF_SECS: u64 = 32;
 
-/// Capped exponential backoff yielding 1, 2, 4, 8, 16, 32, then 32 indefinitely.
+/// Capped exponential backoff: yields `initial, initial*2, initial*4, ...`
+/// up to `max_secs`, then stays at `max_secs` indefinitely.
+/// A successful connection resets back to the initial delay.
 #[derive(Debug)]
 pub struct Backoff {
     next_secs: u64,
+    max_secs: u64,
+    initial_secs: u64,
 }
 
 impl Backoff {
-    /// Create a backoff positioned at the initial delay.
+    /// Create a backoff with the default sequence (1 → 32 s).
     pub fn new() -> Self {
+        Self::new_with(DEFAULT_INITIAL_BACKOFF_SECS, DEFAULT_MAX_BACKOFF_SECS)
+    }
+
+    /// Create a backoff that starts at `initial_secs` and caps at `max_secs`.
+    pub fn new_with(initial_secs: u64, max_secs: u64) -> Self {
+        let next_secs = initial_secs.min(max_secs);
         Self {
-            next_secs: INITIAL_BACKOFF_SECS,
+            next_secs,
+            max_secs,
+            initial_secs,
         }
     }
 
-    /// Return the next delay and advance the sequence (doubling up to the cap).
+    /// Return the next delay without advancing the sequence.
+    pub fn peek(&self) -> Duration {
+        Duration::from_secs(self.next_secs)
+    }
+
+    /// Return the next delay and advance (doubling up to the cap).
     pub fn next_delay(&mut self) -> Duration {
         let delay = Duration::from_secs(self.next_secs);
-        self.next_secs = self.next_secs.saturating_mul(2).min(MAX_BACKOFF_SECS);
+        self.next_secs = self.next_secs.saturating_mul(2).min(self.max_secs);
         delay
     }
 
     /// Reset to the initial delay (after a successful connection).
     pub fn reset(&mut self) {
-        self.next_secs = INITIAL_BACKOFF_SECS;
+        self.next_secs = self.initial_secs;
     }
 }
 
@@ -114,5 +133,37 @@ mod tests {
         assert_eq!(backoff.next_delay().as_secs(), 32);
         backoff.reset();
         assert_eq!(backoff.next_delay().as_secs(), 1);
+    }
+
+    #[test]
+    fn backoff_new_with_custom_params() {
+        let mut backoff = Backoff::new_with(2, 256);
+        // peek without advancing
+        assert_eq!(backoff.peek().as_secs(), 2);
+        // sequence: 2, 4, 8, 16, 32, 64, 128, 256, 256…
+        let seconds: Vec<u64> = (0..9).map(|_| backoff.next_delay().as_secs()).collect();
+        assert_eq!(seconds, vec![2, 4, 8, 16, 32, 64, 128, 256, 256]);
+        // peek after advance shows current (not next)
+        assert_eq!(backoff.peek().as_secs(), 256);
+        // reset goes back to custom initial
+        backoff.reset();
+        assert_eq!(backoff.peek().as_secs(), 2);
+        assert_eq!(backoff.next_delay().as_secs(), 2);
+    }
+
+    #[test]
+    fn backoff_initial_clamped_to_max() {
+        let mut backoff = Backoff::new_with(500, 100);
+        assert_eq!(backoff.peek().as_secs(), 100);
+        assert_eq!(backoff.next_delay().as_secs(), 100);
+    }
+
+    #[test]
+    fn backoff_peek_does_not_advance() {
+        let mut backoff = Backoff::new_with(5, 100);
+        assert_eq!(backoff.peek().as_secs(), 5);
+        assert_eq!(backoff.peek().as_secs(), 5); // still 5
+        backoff.next_delay();
+        assert_eq!(backoff.peek().as_secs(), 10); // advanced to 10
     }
 }

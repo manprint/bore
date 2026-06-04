@@ -132,7 +132,29 @@ pub async fn bind_socket(port: u16) -> Result<UdpSocket> {
     UdpSocket::from_std(socket.into()).context("failed to register UDP socket with tokio")
 }
 
-#[cfg(feature = "udp")]
+#[cfg(all(feature = "udp", windows))]
+fn configure_udp_socket_buffers<S: std::os::windows::io::AsSocket>(
+    socket: &S,
+    tuning: &UdpDirectTuning,
+) {
+    let socket = socket2::SockRef::from(socket);
+    if let Err(err) = socket.set_recv_buffer_size(tuning.udp_socket_recv_buffer) {
+        debug!(%err, requested = tuning.udp_socket_recv_buffer, "failed to raise UDP receive buffer");
+    }
+    if let Err(err) = socket.set_send_buffer_size(tuning.udp_socket_send_buffer) {
+        debug!(%err, requested = tuning.udp_socket_send_buffer, "failed to raise UDP send buffer");
+    }
+
+    debug!(
+        requested_recv = tuning.udp_socket_recv_buffer,
+        actual_recv = ?socket.recv_buffer_size().ok(),
+        requested_send = tuning.udp_socket_send_buffer,
+        actual_send = ?socket.send_buffer_size().ok(),
+        "configured UDP socket buffers"
+    );
+}
+
+#[cfg(all(feature = "udp", not(windows)))]
 fn configure_udp_socket_buffers<S: std::os::fd::AsFd>(socket: &S, tuning: &UdpDirectTuning) {
     let socket = socket2::SockRef::from(socket);
     if let Err(err) = socket.set_recv_buffer_size(tuning.udp_socket_recv_buffer) {

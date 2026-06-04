@@ -341,6 +341,7 @@ pub async fn run_peer_test(
         &mut tcp_path,
         start.role,
         start.options,
+        None,
     )
     .await
     {
@@ -454,11 +455,8 @@ async fn run_udp_path(
         }
     };
     let mut path = TestPath::Direct(conn);
-    match run_path_suite("UDP direct path", &mut path, role, options).await {
-        Ok(mut metrics) => {
-            metrics.tuning = Some(tuning);
-            Some(metrics)
-        }
+    match run_path_suite("UDP direct path", &mut path, role, options, Some(tuning)).await {
+        Ok(metrics) => Some(metrics),
         Err(err) => {
             println!("UDP direct tests   : FAILED ({err})");
             None
@@ -508,6 +506,7 @@ async fn run_path_suite(
     path: &mut TestPath,
     role: UdpTestRole,
     options: UdpTestOptions,
+    tuning: Option<UdpDirectTuning>,
 ) -> Result<PathMetrics> {
     println!();
     println!("{label} : running bidirectional latency");
@@ -568,6 +567,7 @@ async fn run_path_suite(
         }
     }
 
+    metrics.tuning = tuning;
     metrics.transport = path.transport_snapshot();
 
     print_path_metrics(label, &metrics);

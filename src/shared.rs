@@ -38,6 +38,11 @@ pub const PROXY_BUFFER_SIZE: usize = 64 * 1024;
 /// Timeout for network connections and initial protocol messages.
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Default timeout (seconds) before re-checking the preferred UDP port after
+/// detecting it was remapped by NAT. During this window the socket binds on an
+/// ephemeral port so the NAT entry for the preferred port expires naturally.
+pub const NAT_UDP_RELEASE_TIMEOUT: u64 = 600;
+
 /// Idle time before the first TCP keepalive probe, and the interval between
 /// probes. Kept well under common NAT/firewall idle timeouts so that long but
 /// quiet transfers (e.g. a slow `tar | rclone rcat`) keep their middlebox

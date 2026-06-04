@@ -87,6 +87,7 @@ async fn spawn_provider(id: &str, echo_port: u16, provider_carriers: u16) -> Res
         false,
         false,
         0,
+        0, // release timeout
         1024,
         provider_carriers,
         ProviderMeta::default(),
@@ -138,6 +139,7 @@ async fn provider_pool_relays_concurrent_connections() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1, // carriers
         None,
     )
@@ -163,6 +165,7 @@ async fn spawn_consumer(id: &str, consumer_carriers: u16) -> Result<SocketAddr> 
         false,
         false,
         0,
+        0, // release timeout
         consumer_carriers,
         None,
     )

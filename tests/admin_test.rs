@@ -172,6 +172,7 @@ async fn admin_data_reflects_live_tunnels() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1024,
         1, // carriers
         ProviderMeta {
@@ -193,6 +194,7 @@ async fn admin_data_reflects_live_tunnels() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1, // carriers
         Some("consumer-note".into()),
     )

@@ -627,6 +627,17 @@ pub fn primary_local_ip() -> Option<IpAddr> {
     }
 }
 
+/// Quick STUN probe: bind PORT, discover reflexive via a single STUN server,
+/// return Some(true) if the NAT preserved the port, Some(false) if remapped,
+/// None if the STUN probe itself failed. The socket is closed on return.
+pub async fn check_reflexive_port(port: u16, stun_addr: SocketAddr) -> Option<bool> {
+    let socket = bind_socket(port).await.ok()?;
+    match discover_reflexive(&socket, stun_addr).await {
+        Ok(addr) => Some(addr.port() == port),
+        Err(_) => None,
+    }
+}
+
 /// Send a STUN binding request and parse the reflexive address from the reply.
 pub async fn discover_reflexive(socket: &UdpSocket, stun: SocketAddr) -> Result<SocketAddr> {
     let (request, txid) = stun::binding_request();

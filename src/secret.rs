@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{error, info, info_span, trace, warn, Instrument};
+use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 
 use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Registration, Role};
 use crate::auth::Authenticator;
@@ -658,6 +658,10 @@ pub struct Proxy {
     /// upgrade re-negotiation binds the same port.
     #[cfg(feature = "udp")]
     udp_port: u16,
+    /// Seconds before re-checking if the preferred UDP port was released by NAT.
+    /// 0 = disable port-release detection.
+    #[cfg(feature = "udp")]
+    nat_udp_release_timeout: Duration,
     /// Capped exponential backoff for relay→direct upgrade retries.
     /// Sequence: 2, 4, 8, 16, … up to 256 s, then every ~4.3 min.
     #[cfg(feature = "udp")]
@@ -690,6 +694,7 @@ impl Proxy {
         port_map: bool,
         port_prediction: bool,
         udp_port: u16,
+        nat_udp_release_timeout: u64,
         carriers: u16,
         notes: Option<String>,
     ) -> Result<Self> {
@@ -818,6 +823,8 @@ impl Proxy {
             #[cfg(feature = "udp")]
             udp_port,
             #[cfg(feature = "udp")]
+            nat_udp_release_timeout: Duration::from_secs(nat_udp_release_timeout),
+            #[cfg(feature = "udp")]
             upgrade_backoff: reconnect::Backoff::new_with(
                 UDP_UPGRADE_INITIAL_SECS,
                 UDP_UPGRADE_MAX_SECS,
@@ -864,10 +871,26 @@ impl Proxy {
             mut upgrade_backoff,
             #[cfg(feature = "udp")]
             mut upgrade_attempt,
+            #[cfg(feature = "udp")]
+            nat_udp_release_timeout,
         } = self;
         let mut path = if direct { "direct-udp" } else { "relay" };
         #[cfg(feature = "udp")]
         let mut last_upgrade = tokio::time::Instant::now();
+        // Port-release detection: when the preferred port was remapped by NAT,
+        // switch to ephemeral probes and periodically re-check the preferred port.
+        #[cfg(feature = "udp")]
+        let mut preferred_port_remapped = false;
+        // Pre-resolve one STUN target for the lightweight port-release check.
+        #[cfg(feature = "udp")]
+        let check_stun_addr = crate::holepunch::resolve_live_stun_targets(
+            &endpoint.host,
+            endpoint.port,
+            stun_server.as_deref(),
+        )
+        .await
+        .ok()
+        .and_then(|t| t.into_iter().next().map(|t| t.addr));
         // Relay → direct upgrade state. The slow work (STUN gather, punch, QUIC
         // dial) runs in a spawned `upgrade_task` so the accept/forward loop never
         // stalls; this loop only does the quick control I/O. The receivers are
@@ -878,12 +901,21 @@ impl Proxy {
         // sets them, so the arms stay dormant.
         #[cfg(feature = "udp")]
         let mut waiting_for_stun_hint = false;
+        let mut effective_udp_port = udp_port;
         let mut nego_cand_rx: Option<oneshot::Receiver<UdpCandidateOffer>> = None;
         #[allow(clippy::type_complexity)]
         let mut nego_punch_tx: Option<
             oneshot::Sender<Option<([u8; UDP_NONCE_LEN], Vec<SocketAddr>, Option<String>)>>,
         > = None;
         let mut nego_done_rx: Option<oneshot::Receiver<DirectUpgrade>> = None;
+        // Periodic timer that fires every nat_udp_release_timeout to re-check
+        // whether the preferred port has been released by the NAT.
+        #[cfg(feature = "udp")]
+        let mut release_check = {
+            let mut t = tokio::time::interval(nat_udp_release_timeout.max(Duration::from_secs(1)));
+            t.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            t
+        };
         loop {
             // Kick off an upgrade attempt on the timer. Non-blocking: the attempt
             // runs in `upgrade_task`; this loop keeps accepting and forwarding.
@@ -897,13 +929,27 @@ impl Proxy {
                 last_upgrade = tokio::time::Instant::now();
                 upgrade_attempt += 1;
                 let backoff_delay = upgrade_backoff.next_delay();
-                info!(
-                    attempt = upgrade_attempt,
-                    next_retry_s = backoff_delay.as_secs(),
-                    "starting udp upgrade attempt #{upgrade_attempt}; \
-                     will retry in {}s on failure",
-                    backoff_delay.as_secs(),
-                );
+                // When the preferred port was remapped, use ephemeral so the
+                // NAT entry for the preferred port expires naturally.
+                effective_udp_port = if preferred_port_remapped { 0 } else { udp_port };
+                if effective_udp_port != udp_port {
+                    info!(
+                        attempt = upgrade_attempt,
+                        next_retry_s = backoff_delay.as_secs(),
+                        "udp upgrade attempt #{upgrade_attempt}: preferred port :{udp_port} \
+                         still REMAPPED on NAT, using ephemeral port to avoid refreshing \
+                         the NAT entry; will re-check in {:?}",
+                        nat_udp_release_timeout,
+                    );
+                } else {
+                    info!(
+                        attempt = upgrade_attempt,
+                        next_retry_s = backoff_delay.as_secs(),
+                        "starting udp upgrade attempt #{upgrade_attempt}; \
+                         will retry in {}s on failure",
+                        backoff_delay.as_secs(),
+                    );
+                }
                 if control
                     .send(ClientMessage::UdpStunHintRequest)
                     .await
@@ -945,7 +991,7 @@ impl Proxy {
                                     provider_stun_hint,
                                     port_map,
                                     port_prediction,
-                                    udp_port,
+                                    effective_udp_port,
                                 );
                                 nego_cand_rx = Some(cand_rx);
                                 nego_punch_tx = Some(punch_tx);
@@ -974,6 +1020,28 @@ impl Proxy {
                 offer = recv_opt(&mut nego_cand_rx) => {
                     match offer {
                         Some(offer) => {
+                            // Detect NAT remap of the preferred port so we stop
+                            // refreshing it and let the entry expire.
+                            if !preferred_port_remapped
+                                && udp_port != 0
+                                && nat_udp_release_timeout.as_secs() > 0
+                            {
+                                if let Some(first) = offer.candidates.first() {
+                                    if first.port() != udp_port {
+                                        preferred_port_remapped = true;
+                                        info!(
+                                            port = udp_port,
+                                            reflexive_port = first.port(),
+                                            recheck_s = nat_udp_release_timeout.as_secs(),
+                                            "port :{udp_port} was REMAPPED to :{reflexive_port} \
+                                             by NAT; switching to ephemeral probes. \
+                                             Will re-check in {:?}",
+                                            nat_udp_release_timeout,
+                                            reflexive_port = first.port(),
+                                        );
+                                    }
+                                }
+                            }
                             if control.send(ClientMessage::UdpCandidateOffer(offer)).await.is_err() {
                                 return Ok(());
                             }
@@ -1023,6 +1091,54 @@ impl Proxy {
                 _ = recv_opt(&mut direct_closed_rx) => {
                     warn!("direct udp path closed; reconnecting");
                     return Ok(());
+                }
+                // Periodic check: when the preferred port was remapped, try
+                // to bind it again to see if the NAT has released it.
+                _ = release_check.tick() => {
+                    #[cfg(feature = "udp")]
+                    if preferred_port_remapped && udp_port != 0
+                        && nat_udp_release_timeout.as_secs() > 0
+                    {
+                        if let Some(ref stun_addr) = check_stun_addr {
+                            match crate::holepunch::check_reflexive_port(
+                                udp_port, *stun_addr,
+                            ).await {
+                                Some(true) => {
+                                    info!(
+                                        port = udp_port,
+                                        "port :{udp_port} is now PRESERVED on NAT! \
+                                         Scheduling immediate direct path upgrade",
+                                    );
+                                    preferred_port_remapped = false;
+                                    upgrade_backoff.reset();
+                                    effective_udp_port = udp_port;
+                                    // Force an immediate upgrade attempt.
+                                    last_upgrade = tokio::time::Instant::now()
+                                        .checked_sub(
+                                            upgrade_backoff.peek()
+                                                + Duration::from_millis(100),
+                                        )
+                                        .unwrap_or(tokio::time::Instant::now());
+                                }
+                                Some(false) => {
+                                    info!(
+                                        port = udp_port,
+                                        recheck_s = nat_udp_release_timeout.as_secs(),
+                                        "port :{udp_port} still REMAPPED on NAT; \
+                                         will re-check in {:?}",
+                                        nat_udp_release_timeout,
+                                    );
+                                }
+                                None => {
+                                    debug!(
+                                        port = udp_port,
+                                        "STUN probe for preferred port :{udp_port} \
+                                         failed (server unreachable); will retry",
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 accepted = listener.accept() => {
                     let (local, addr) = match accepted {

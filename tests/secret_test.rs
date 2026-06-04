@@ -64,6 +64,7 @@ async fn secret_provider_registers() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1024,
         1, // carriers
         ProviderMeta::default(),
@@ -94,6 +95,7 @@ async fn secret_duplicate_id_rejected() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1024,
         1, // carriers
         ProviderMeta::default(),
@@ -114,6 +116,7 @@ async fn secret_duplicate_id_rejected() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1024,
         1, // carriers
         ProviderMeta::default(),
@@ -142,6 +145,7 @@ async fn secret_registration_requires_correct_secret() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1024,
         1, // carriers
         ProviderMeta::default(),
@@ -161,6 +165,7 @@ async fn secret_registration_requires_correct_secret() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1024,
         1, // carriers
         ProviderMeta::default(),
@@ -213,6 +218,7 @@ async fn spawn_secret_tunnel(id: &str, secret: Option<&str>) -> Result<std::net:
         false,
         false,
         0,
+        0, // release timeout
         1024,
         1, // carriers
         ProviderMeta::default(),
@@ -231,6 +237,7 @@ async fn spawn_secret_tunnel(id: &str, secret: Option<&str>) -> Result<std::net:
         false,
         false,
         0,
+        0, // release timeout
         1, // carriers
         None,
     )
@@ -308,6 +315,7 @@ async fn secret_multiple_consumers_concurrent() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1024,
         1, // carriers
         ProviderMeta::default(),
@@ -329,6 +337,7 @@ async fn secret_multiple_consumers_concurrent() -> Result<()> {
             false,
             false,
             0,
+            0, // release timeout
             1, // carriers
             None,
         )
@@ -414,6 +423,7 @@ async fn secret_proxy_without_provider_closes() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1, // carriers
         None,
     )
@@ -449,6 +459,7 @@ async fn secret_proxy_requires_correct_secret() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1, // carriers
         None,
     )
@@ -506,6 +517,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1024,
         1, // carriers
         ProviderMeta {
@@ -528,6 +540,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1, // carriers
         Some("cons note".into()),
     )

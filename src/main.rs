@@ -113,6 +113,17 @@ enum Command {
         )]
         nat_udp_preferred_port: u16,
 
+        /// How long (seconds) to wait before re-checking the preferred UDP port
+        /// after the NAT remapped it. During this window ephemeral ports are used
+        /// so the NAT entry for the preferred port expires naturally. 0 = disable.
+        #[clap(
+            long,
+            value_name = "SECS",
+            env = "BORE_NAT_UDP_RELEASE_TIMEOUT",
+            default_value_t = bore_cli::shared::NAT_UDP_RELEASE_TIMEOUT,
+        )]
+        nat_udp_release_timeout: u64,
+
         /// Maximum concurrent connections served over a direct UDP path (the
         /// direct-path analog of the server's --max-conns; bounds this provider's
         /// resources). Secret-tunnel providers only.
@@ -208,6 +219,17 @@ enum Command {
             default_value_t = 0
         )]
         nat_udp_preferred_port: u16,
+
+        /// How long (seconds) to wait before re-checking the preferred UDP port
+        /// after the NAT remapped it. During this window ephemeral ports are used
+        /// so the NAT entry for the preferred port expires naturally. 0 = disable.
+        #[clap(
+            long,
+            value_name = "SECS",
+            env = "BORE_NAT_UDP_RELEASE_TIMEOUT",
+            default_value_t = bore_cli::shared::NAT_UDP_RELEASE_TIMEOUT,
+        )]
+        nat_udp_release_timeout: u64,
 
         /// Free-form note shown on the server's admin status page (no behaviour).
         #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
@@ -424,6 +446,7 @@ async fn dispatch(command: Command) -> Result<()> {
             upnp,
             try_port_prediction,
             nat_udp_preferred_port,
+            nat_udp_release_timeout,
             max_conns,
             basic_auth,
             notes,
@@ -466,6 +489,7 @@ async fn dispatch(command: Command) -> Result<()> {
                                 upnp,
                                 try_port_prediction,
                                 nat_udp_preferred_port,
+                                nat_udp_release_timeout,
                                 max_conns,
                                 carriers,
                                 meta,
@@ -518,6 +542,7 @@ async fn dispatch(command: Command) -> Result<()> {
             upnp,
             try_port_prediction,
             nat_udp_preferred_port,
+            nat_udp_release_timeout,
             notes,
             carriers,
             auto_reconnect,
@@ -544,6 +569,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         upnp,
                         try_port_prediction,
                         nat_udp_preferred_port,
+                        nat_udp_release_timeout,
                         carriers,
                         notes,
                     )

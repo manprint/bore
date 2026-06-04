@@ -114,6 +114,8 @@ struct UdpProviderCfg {
     /// Bounds concurrently served direct-path substreams — the direct-path analog
     /// of the server's relay `--max-conns` (here it protects the provider host).
     permits: Arc<Semaphore>,
+    /// Seconds before re-checking if the preferred UDP port was released by NAT.
+    nat_udp_release_timeout: Duration,
 }
 
 impl Client {
@@ -237,6 +239,7 @@ impl Client {
         port_map: bool,
         port_prediction: bool,
         udp_port: u16,
+        nat_udp_release_timeout: u64,
         max_conns: usize,
         carriers: u16,
         meta: ProviderMeta,
@@ -359,6 +362,7 @@ impl Client {
             port_prediction,
             udp_port,
             permits: Arc::new(Semaphore::new(max_conns)),
+            nat_udp_release_timeout: Duration::from_secs(nat_udp_release_timeout),
         });
 
         Ok(Client {
@@ -400,6 +404,11 @@ impl Client {
         let mut punch_tx: Option<mpsc::UnboundedSender<Vec<SocketAddr>>> = None;
         #[cfg(feature = "udp")]
         let mut udp_reoffer_failures: u32 = 0;
+        // Port-release detection state for the preferred UDP port.
+        #[cfg(feature = "udp")]
+        let mut preferred_port_remapped = false;
+        #[cfg(feature = "udp")]
+        let mut next_preferred_port_check = tokio::time::Instant::now();
         let this = Arc::new(self);
 
         // Carrier pool: pump each extra carrier's accepted data substreams into a
@@ -498,20 +507,52 @@ impl Client {
                     #[cfg(feature = "udp")]
                     if punch_tx.is_none() && udp_socket.is_none() {
                         if let Some(cfg) = this.udp_cfg.as_ref() {
+                            // Decide which port to use for this offer attempt.
+                            let now = tokio::time::Instant::now();
+                            let use_preferred = !preferred_port_remapped
+                                || now >= next_preferred_port_check;
+                            let effective_port = if use_preferred {
+                                cfg.udp_port
+                            } else {
+                                0u16
+                            };
+                            if use_preferred && preferred_port_remapped {
+                                next_preferred_port_check = now + cfg.nat_udp_release_timeout;
+                            }
+                            let was_checking_preferred = use_preferred && cfg.udp_port != 0
+                                && preferred_port_remapped;
                             match offer_provider_candidates(
                                 &mut control,
                                 &cfg.endpoint,
                                 cfg.stun_server.as_deref(),
                                 cfg.port_map,
                                 cfg.port_prediction,
-                                cfg.udp_port,
+                                effective_port,
                             )
                             .await
                             {
                                 Ok(socket) => {
-                                    info!("provider udp candidate offer succeeded on retry");
                                     udp_socket = Some(socket);
                                     udp_reoffer_failures = 0;
+                                    // When checking the preferred port, verify preservation.
+                                    if was_checking_preferred {
+                                        resolve_stun_and_check(
+                                            &cfg.endpoint, cfg.stun_server.as_deref(),
+                                            cfg.udp_port, cfg.nat_udp_release_timeout,
+                                            &mut preferred_port_remapped,
+                                        ).await;
+                                    } else if effective_port != 0 && !preferred_port_remapped {
+                                        let was_remapped = resolve_stun_and_check(
+                                            &cfg.endpoint, cfg.stun_server.as_deref(),
+                                            cfg.udp_port, cfg.nat_udp_release_timeout,
+                                            &mut preferred_port_remapped,
+                                        ).await;
+                                        if !was_remapped {
+                                            info!("provider udp candidate offer succeeded on retry");
+                                        }
+                                    } else {
+                                        info!("provider udp candidate offer succeeded on retry");
+                                    }
                                 }
                                 Err(err) => {
                                     udp_reoffer_failures += 1;
@@ -882,6 +923,57 @@ async fn provider_direct(
                     return Ok(());
                 }
             }
+        }
+    }
+}
+
+/// Resolve one STUN target, probe the preferred port, and update the remap
+/// flag. Returns true if the port was found to be remapped.
+#[cfg(feature = "udp")]
+async fn resolve_stun_and_check(
+    endpoint: &Endpoint,
+    stun_server: Option<&str>,
+    preferred_port: u16,
+    release_timeout: Duration,
+    preferred_port_remapped: &mut bool,
+) -> bool {
+    let stun_chain =
+        crate::holepunch::live_stun_target_names(&endpoint.host, endpoint.port, stun_server);
+    let Some(first) = stun_chain.into_iter().next() else {
+        return false;
+    };
+    let Ok(mut addrs) = tokio::net::lookup_host(&first).await else {
+        return false;
+    };
+    let Some(addr) = addrs.find(|a| a.is_ipv4()) else {
+        return false;
+    };
+    match crate::holepunch::check_reflexive_port(preferred_port, addr).await {
+        Some(true) => {
+            *preferred_port_remapped = false;
+            info!(
+                port = preferred_port,
+                "preferred port :{preferred_port} is now PRESERVED on NAT",
+            );
+            false
+        }
+        Some(false) => {
+            *preferred_port_remapped = true;
+            info!(
+                port = preferred_port,
+                recheck_s = release_timeout.as_secs(),
+                "port :{preferred_port} REMAPPED by NAT; \
+                 switching to ephemeral, will re-check in {:?}",
+                release_timeout,
+            );
+            true
+        }
+        None => {
+            debug!(
+                port = preferred_port,
+                "STUN check for preferred port :{preferred_port} failed (unreachable)",
+            );
+            *preferred_port_remapped
         }
     }
 }

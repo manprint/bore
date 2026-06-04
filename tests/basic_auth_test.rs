@@ -188,6 +188,7 @@ async fn secret_provider_basic_auth_rejects_and_allows() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1024,
         1, // carriers
         ProviderMeta {
@@ -209,6 +210,7 @@ async fn secret_provider_basic_auth_rejects_and_allows() -> Result<()> {
         false,
         false,
         0,
+        0, // release timeout
         1, // carriers
         None,
     )

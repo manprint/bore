@@ -244,133 +244,75 @@ Ritentare dopo 256s è identico a ritentare dopo 2s: il socket è sempre su
 
 ---
 
-## TODO: Re-bind del socket UDP su fallimento strutturale
+## Implementato: Port-release detection (porta preferita)
 
-### Idea
+### Observer effect
 
-Quando connect_direct fallisce con timeout su tutti i candidati, il consumer
-potrebbe chiudere il socket UDP corrente e riaprirne uno su una porta
-diversa, nella speranza di ottenere una porta riflessiva che passi il
-firewall.
-
-```
-Scenario attuale:
-  B apre 0.0.0.0:3478 → NAT assegna 82.54.81.19:1026 → ❌ firewall blocca
-
-Con re-bind:
-  B apre 0.0.0.0:3478 → NAT assegna 82.54.81.19:1026 → ❌
-  B chiude socket
-  B apre 0.0.0.0:0 (ephemeral) → NAT assegna 82.54.81.19:XXXXX → ?
-  B apre 0.0.0.0:6000  → NAT assegna 82.54.81.19:6000 → ?
-```
-
-### Varianti
-
-| Variante | Meccanismo | Complessità | Efficacia |
-|----------|-----------|-------------|-----------|
-| **Full-bind** | Chiudi socket, ri-binda su porta random | Media | Alta — cambia porta riflessiva |
-| **Port-scan** | Prova N porte fisse in sequenza | Alta | Alta — ma sembra un port scan |
-| **Fallback-no-udp** | Disabilita `--udp`, solo relay | Bassa | Bassa — perde direct path |
-| **Bind-dopo-timeout** | Riapri con porta diversa e rioffri | Alta | Media — richiede rioffrire candidati |
-
-### Valutazione applicabilità
-
-**Stato attuale del flusso:**
+Un bind socket sulla porta preferita (`--nat-udp-preferred-port`) e la
+conseguente sonda STUN **rinnovano il timeout NAT** per quella porta,
+impedendone il rilascio. Misurato: ~620s di attesa se la porta non viene
+toccata, vs MAI rilasciata se viene toccata ogni 15-30s.
 
 ```
-connect_direct() fallisce (timeout su tutti i candidati)
-  → upgrade_task termina (done_tx droppato)
-  → Proxy::listen vede nego_done_rx = None
-  → log: "udp upgrade attempt failed; will retry in Xs"
-  → dopo Xs: riprova da capo (stun hint → gather → offer → punch)
+Scenario:
+  B bind 0.0.0.0:3478 → STUN probe → NAT rinnova timeout :3478 → ❌ mai rilasciata
+  B bind porta ephemeral → STUN probe → NAT non vede :3478 → :3478 rilasciata dopo ~10 min
 ```
 
-Il re-bind si innesterebbe a livello `gather_consumer_candidates()`: quando
-la discovery fallisce (o il passo successivo fallisce), si può chiudere il
-socket e rioffrire.
+### Soluzione implementata
 
-**Problemi e rischi:**
+Quando il NAT rimappa la porta preferita (reflexive ≠ preferred), il peer
+passa automaticamente a **porte ephemeral** per tutti i successivi tentativi
+STUN/offerta, in modo che la NAT entry per la porta preferita scada
+naturalmente. Ogni `--nat-udp-release-timeout` secondi (default 600 = 10 min),
+riprova la porta preferita con una sonda STUN leggera (`check_reflexive_port`).
 
-1. **Il socket UDP è già stato offerto al server.** Se lo chiudiamo e
-   riapriamo, dobbiamo rioffrire i candidati — ma l'offerta è già stata
-   inviata e il server ha già risposto con `UdpPunch`. Il server ha uno
-   stato (nonce, peer candidates). Un cambio a metà negoziazione richiederebbe
-   una nuova negoziazione completa — cosa che l'upgrade retry già fa.
+Se la porta è tornata PRESERVED, il backoff di upgrade viene resettato e il
+prossimo tentativo userà la porta preferita. Se ancora REMAPPED, continua con
+porte ephemeral.
 
-2. **Il binding del socket è in `Proxy::new` / `Proxy::listen`.** Nel flusso
-   attuale, il socket è creato da `gather_consumer_candidates()` e
-   consumato da `finish_direct_consumer()`. Se `finish_direct_consumer`
-   fallisce, il socket viene droppato con lo scope. Il retry successivo
-   creerà un nuovo socket. Questo **già accade** — è gratis!
+### Nuovo flag
 
-3. **Solo l'upgrade task soffre del problema.** All'avvio (`Proxy::new`),
-   il socket è creato una volta sola. Se il primo tentativo fallisce, si va
-   su relay e l'upgrade task periodico è l'unico meccanismo di retry.
-   **Bindare una porta diversa a ogni retry** dell'upgrade è banale:
-   basta usare `udp_port = 0` invece di `udp_port` nel retry, cambiando
-   così la porta riflessiva a ogni ciclo.
+| Flag | Default | Env | Dove |
+|------|---------|-----|------|
+| `--nat-udp-release-timeout SECS` | 600 | `BORE_NAT_UDP_RELEASE_TIMEOUT` | `local` + `proxy` |
 
-4. **Regressioni potenziali:**
-   - Con `--nat-udp-preferred-port N`, l'utente ha scelto ESATTAMENTE quella
-     porta (es. per aprire un firewall). Cambiare porta al retry vanifica
-     la scelta dell'utente.
-   - La porta riflessiva assegnata dal NAT è imprevedibile — potremmo
-     finire su una porta che SEMBRA funzionare (non bloccata dal firewall)
-     ma è in conflitto con altre applicazioni.
-   - Il NAT simmetrico assegna porta diversa per OGNI destinazione,
-     quindi re-bindare non cambia nulla se il problema è simmetrico.
+### Dettaglio implementazione
 
-### Proposta di implementazione (basso rischio)
+**Consumer side (`secret.rs` - Proxy::listen):**
+- `preferred_port_remapped: bool` flag nello stato del loop
+- Calcolo `effective_udp_port` a ogni upgrade attempt: se remappato → 0
+- Rilevamento remap quando `offer.candidates.first().port() != udp_port`
+- Timer `release_check` (interval = `nat_udp_release_timeout`) con sonda
+  `check_reflexive_port()`
+- Quando preserved: reset backoff, `last_upgrade` forzato nel passato →
+  upgrade immediato
 
-Aggiungere un flag `upgrade_use_ephemeral_port` in `Proxy`: dopo N fallimenti
-consecutivi (es. 3) dell'upgrade task, passare `udp_port = 0` invece di
-`udp_port` in `gather_consumer_candidates()`. Così:
+**Provider side (`client.rs` - Client::listen):**
+- Stessa logica nel `udp_retry.tick()` (timer 15s di re-offer)
+- `resolve_stun_and_check()` helper function: risolve STUN, bind, probe, update flag
+- Quando preserved: disabilita flag → prossimo re-offer usa porta preferita
 
-- Primi 3 tentativi: usano la porta preferita dall'utente (3478)
-- Tentativi successivi: usano porta ephemeral (0), sperando in una porta
-  riflessiva diversa
+**Nuova funzione `holepunch::check_reflexive_port(port, stun_addr) -> Option<bool>`:**
+- Bind porta, unica sonda STUN, return `Some(true)` se preserved,
+  `Some(false)` se remapped, `None` se STUN unreachable
 
-Il server accetta qualsiasi nuova offerta di candidati — non c'è invalidazione
-dello stato server. Basta inviare `UdpCandidateOffer` di nuovo.
+**Modifiche protocollo:** 0 (nessun nuovo messaggio server/client)
 
-**Dettaglio implementazione:**
+### Log
 
-```rust
-// In Proxy::listen, nel ramo upgrade:
-#[cfg(feature = "udp")]
-let upgrade_use_ephemeral = upgrade_attempt > 3;
-
-// spawn_upgrade_attempt prende udp_port
-let effective_udp_port = if upgrade_use_ephemeral { 0 } else { udp_port };
+```
+INFO  port :3478 was REMAPPED to :1026 by NAT; switching to ephemeral probes.
+      Will re-check in 600s
+WARN  port :3478 is now PRESERVED on NAT! Scheduling immediate direct path upgrade
+INFO  port :3478 still REMAPPED on NAT; will re-check in 600s
 ```
 
-Il socket viene chiuso e riaperto automaticamente perché
-`gather_consumer_candidates()` chiama `bind_socket(effective_udp_port)`
-creando un nuovo socket.
+### Limiti
 
-**Vantaggi:**
-- 0 modifiche al server
-- 0 modifiche al protocollo
-- Nessun messaggio aggiuntivo sul control channel (si rioffrono candidati)
-- Compatibile con `--auto-reconnect` (lo stato è nel Proxy, non globale)
-- Non rompe la porta preferita dell'utente (primi 3 tentativi la usano)
-
-**Svantaggi:**
-- Porta ephemeral può NON avere port preservation (sempre 1024-65535 random)
-- Aggiunge latenza (ogni retry = STUN + offer + punch)
-- Il log deve chiarire perché si sta cambiando porta
-
-### Conclusione
-
-Il re-bind su porta diversa è **fattibile** e **a basso rischio di
-regressione**. La complessità è bassa. L'efficacia dipende dallo scenario:
-
-| Scenario | Re-bind aiuta? |
-|----------|---------------|
-| Conflitto porta tra A e B sullo stesso NAT | ✅ Sì — porta diversa risolve |
-| Firewall blocca una specifica DST_PORT range | ✅ Forse — se la nuova porta è permessa |
-| NAT simmetrico | ❌ No — porta cambia comunque per destinazione |
-| Firewall blocca tutto UDP fuori dalle porte note | ❌ No — non c'è porta che passi |
-
-Implementazione rimandata per mancanza di priorità. Il workaround attuale
-(relay TCP + `--carriers`) è funzionante e stabile.
+- Il primo tentativo usa sempre la porta preferita (potrebbe rinnovare il NAT
+  una volta prima di rilevare il remap)
+- `nat_udp_release_timeout=0` disabilita la funzionalità (default test)
+- Non risolve il caso di NAT simmetrico (la porta cambia comunque)
+- Provider side: dopo la rilevazione preserved, il prossimo re-offer (max 15s)
+  deve propagarsi al consumer via upgrade retry (backoff 2→256s)

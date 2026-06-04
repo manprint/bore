@@ -1158,18 +1158,13 @@ pub async fn connect_direct(
             Err(err).context("all direct candidates failed")
         }
         Err(_) => {
-            let err_summary: Vec<String> = errors
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(addr, msg)| format!("{addr} → {msg}"))
-                .collect();
             warn!(
                 timeout = ?NETWORK_TIMEOUT,
                 candidates = ?peers,
-                candidate_errors = ?err_summary,
                 "direct QUIC connect exhausted {NETWORK_TIMEOUT:?} budget \
-                 across {n} candidates; falling back to relay",
+                 across {n} candidates; none responded — all candidates timed out \
+                 (firewall/UDP blocked on both ends, or peer IP unreachable). \
+                 Falling back to relay",
                 n = peers.len(),
             );
             bail!("direct connect exhausted the {NETWORK_TIMEOUT:?} budget")

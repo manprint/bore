@@ -430,6 +430,7 @@ punch. Due peer IPv6 si connettono in diretto anche da reti mobile.
 | `--upnp` (`BORE_UPNP`) | local, proxy, test-udp paired | Mappa una porta sul **router domestico** (IP WAN pubblico): rende il provider raggiungibile (7.1). Inutile su CGNAT. |
 | `--try-port-prediction` (`BORE_TRY_PORT_PREDICTION`) | local, proxy, test-udp paired | Annuncia porte predette sul lato **symmetric sequenziale** (i casi `⚠ seq`). Best-effort, può sembrare uno scan. |
 | `--nat-udp-preferred-port` (`BORE_NAT_UDP_PORT`) | local, proxy, test-udp | Porta UDP **fissa** (0=random): da aprire in egress/ingress nel firewall (7.3, 7.4); su NAT port-preserving rende l'esterno prevedibile. |
+| `--nat-udp-release-timeout` (`BORE_NAT_UDP_RELEASE_TIMEOUT`) | local, proxy | Secondi tra re-check dopo rimappatura NAT della porta preferita (default 600, 0=disabilita). Quando la porta è rimappata il peer usa porte effimere per non rinnovare la NAT entry. Utile quando due host sullo stesso NAT competono per la stessa porta fissa. |
 | `bore test-udp [--to … --stun-server … --nat-udp-preferred-port …]` | — | **Diagnostica**: egress UDP, classe NAT (cone/symmetric), CGNAT/doppio-NAT, hairpin, UPnP. Lancialo su **entrambi** i peer. |
 | `bore test-udp --to <srv> --secret <s> --tcp-secret-id <id>` | test-udp paired | **Diagnostica coordinata A<->B**: il server abbina due peer, scambia candidati, prova UDP diretto e TCP relay, e stampa un report bidirezionale. Con `--test-bandwidth --test-transfer-quota 500MB` misura anche banda e latenza su entrambi i path. |
 

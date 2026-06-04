@@ -70,6 +70,41 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
   what is connected right now. Disabled (and invisible) without a token, leaving
   the control port's bore-protocol behaviour byte-for-byte unchanged.
 
+### Added
+- **UDP upgrade retry: exponential backoff** (2→256 s, cap at ~4.3 min) replaces
+  the fixed 10 s interval. Uses `reconnect::Backoff::new_with(2, 256)` stored in
+  `Proxy::upgrade_backoff`. Log now includes attempt number and next retry delay:
+  `starting udp upgrade attempt #3; will retry in 16s on failure`.
+- **Per-candidate error collection in `connect_direct`**: each QUIC candidate's
+  failure reason is captured and logged in the final `warn!` as a structured
+  `errors` field (`["addr1 → TimedOut", "addr2 → ConnectionRefused"]`). The
+  timeout case now logs explicitly `none responded — all candidates timed out
+  (firewall/UDP blocked)` instead of showing an empty `candidate_errors=[]`.
+- **Port-release detection** (`--nat-udp-release-timeout SECS`, env
+  `BORE_NAT_UDP_RELEASE_TIMEOUT`, default 600 s, on `local` + `proxy`): when the
+  NAT remaps the preferred `--nat-udp-preferred-port` (reflexive port ≠ local port),
+  the peer switches to ephemeral ports so the NAT entry expires naturally. A
+  periodic check (`check_reflexive_port` in `holepunch.rs`) re-probes the preferred
+  port every N seconds; when it becomes PRESERVED, the upgrade backoff is reset and
+  the next negotiation uses the preferred port. Applies to both consumer
+  (`Proxy::listen` in `secret.rs`) and provider (`Client::listen` in `client.rs`
+  via `resolve_stun_and_check()`).
+- **`reconnect::Backoff::new_with(initial, max)`** and **`Backoff::peek()`**:
+  `Backoff` is now parameterized with `initial_secs` and `max_secs` fields.
+  `new_with(2, 256)` is used by the UDP upgrade retry. `peek()` returns the
+  current delay without advancing the sequence. `reset()` uses the stored initial
+  value. The default `new()` keeps the original 1→32 s sequence for
+  `--auto-reconnect`.
+- **`holepunch::check_reflexive_port(port, stun_addr) -> Option<bool>`**: lightweight
+  single-STUN-probe function that returns `Some(true)` if port was preserved,
+  `Some(false)` if remapped, `None` if STUN unreachable. Used by both consumer and
+  provider port-release detection.
+- **`utils/check-reflexive-ports.py` rewritten**: now supports `--port|-p`,
+  `--server|-s`, `--timeout|-t`, `--watch|-w` (repeat interval), `--count|-c` (stop
+  after N). In watch mode with REMAPPED detection, switches to ephemeral probes to
+  avoid refreshing the NAT entry (the observer effect), and reports `released after
+  Xs` when the preferred port becomes PRESERVED again.
+
 ### Changed
 - **Live UDP STUN discovery now defaults to public STUN first.** Secret-tunnel
   provider/consumer direct paths and paired `test-udp` candidate gathering try

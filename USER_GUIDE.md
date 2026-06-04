@@ -141,6 +141,7 @@ systemd): chiudono in modo ordinato con una riga di log, senza troncare i trasfe
 | `--upnp` | `BORE_UPNP` | Mappa una porta sul router via UPnP-IGD. |
 | `--try-port-prediction` | `BORE_TRY_PORT_PREDICTION` | Annuncia porte predette per NAT simmetrici. |
 | `--nat-udp-preferred-port <PORT>` | `BORE_NAT_UDP_PORT` | Porta UDP fissa per il punch (0 = casuale). |
+| `--nat-udp-release-timeout <SECS>` | `BORE_NAT_UDP_RELEASE_TIMEOUT` | Secondi tra re-check della porta preferita rimappata (default 600; 0=disabilita). |
 | `--max-conns <N>` | `BORE_MAX_CONNS` | Cap connessioni concorrenti sul path diretto. |
 | `--basic-auth <USER:PASS>` | `BORE_BASIC_AUTH` | Protegge il tunnel con HTTP Basic auth. |
 | `--notes <TEXT>` | `BORE_NOTES` | Nota mostrata nella pagina admin del server. |
@@ -161,6 +162,7 @@ systemd): chiudono in modo ordinato con una riga di log, senza troncare i trasfe
 | `--upnp` | `BORE_UPNP` | Mappa una porta sul router via UPnP-IGD. |
 | `--try-port-prediction` | `BORE_TRY_PORT_PREDICTION` | Porte predette per NAT simmetrici. |
 | `--nat-udp-preferred-port <PORT>` | `BORE_NAT_UDP_PORT` | Porta UDP fissa per il punch. |
+| `--nat-udp-release-timeout <SECS>` | `BORE_NAT_UDP_RELEASE_TIMEOUT` | Secondi tra re-check della porta preferita rimappata (default 600). |
 | `--notes <TEXT>` | `BORE_NOTES` | Nota mostrata nella pagina admin. |
 | `--carriers <N>` | `BORE_CARRIERS` | Connessioni TCP parallele per la tratta relay consumer→server (default 1). |
 | `--auto-reconnect` | `BORE_AUTO_RECONNECT` | Riconnessione automatica con backoff. |
@@ -499,8 +501,20 @@ bore local 8080 --to bore.tld --tcp-secret-id my-web --udp --try-port-prediction
 bore proxy --to bore.tld --tcp-secret-id my-web --local-proxy-port :5555 --secret hunter2 --udp
 ```
 
-Le stesse opzioni NAT (`--stun-server`, `--nat-udp-preferred-port`, `--upnp`,
-`--try-port-prediction`) sono disponibili anche qui.
+Le stesse opzioni NAT (`--stun-server`, `--nat-udp-preferred-port`,
+`--nat-udp-release-timeout`, `--upnp`, `--try-port-prediction`) sono
+disponibili anche qui.
+
+##### Port-release detection
+
+Quando il NAT rimappa la porta preferita (es. `:3478 → :1026`), il peer
+passa automaticamente a **porte ephemeral** per tutti i successivi tentativi
+STUN/offerta, in modo che la NAT entry per la porta preferita scada
+naturalmente. Ogni `--nat-udp-release-timeout` secondi (default 600 = 10 min),
+riprova la porta preferita con una sonda STUN leggera. Quando torna PRESERVED,
+l'upgrade backoff viene resettato e il prossimo tentativo usa la porta
+preferita. Questo risolve il conflitto tra due host sullo stesso NAT che
+competono per la stessa porta fissa (`--nat-udp-preferred-port`).
 
 #### Diagnostica (`bore test-udp`)
 

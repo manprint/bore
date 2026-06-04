@@ -455,7 +455,10 @@ async fn run_udp_path(
     };
     let mut path = TestPath::Direct(conn);
     match run_path_suite("UDP direct path", &mut path, role, options).await {
-        Ok(metrics) => Some(metrics),
+        Ok(mut metrics) => {
+            metrics.tuning = Some(tuning);
+            Some(metrics)
+        }
         Err(err) => {
             println!("UDP direct tests   : FAILED ({err})");
             None
@@ -978,6 +981,8 @@ struct PathMetrics {
     bandwidth_send: Option<BandwidthMetrics>,
     bandwidth_recv: Option<BandwidthMetrics>,
     transport: Option<DirectTransportMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tuning: Option<UdpDirectTuning>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -1508,6 +1513,39 @@ fn print_path_metrics(label: &str, metrics: &PathMetrics) {
     if let Some(transport) = &metrics.transport {
         print_transport_metrics(label, transport);
     }
+    if let Some(tuning) = &metrics.tuning {
+        print_tuning_metrics(label, tuning);
+        print_tuning_advice(label, metrics);
+    }
+}
+
+fn print_tuning_metrics(label: &str, tuning: &UdpDirectTuning) {
+    let defaults = UdpDirectTuning::default();
+    println!(
+        "{label} tuning   : stream recv {} (default {}), conn recv {} (default {}), send {} (default {})",
+        format_bytes(tuning.stream_receive_window as u64),
+        format_bytes(defaults.stream_receive_window as u64),
+        format_bytes(tuning.connection_receive_window as u64),
+        format_bytes(defaults.connection_receive_window as u64),
+        format_bytes(tuning.send_window),
+        format_bytes(defaults.send_window),
+    );
+    println!(
+        "{label} tuning   : sock recv {} (default {}), sock send {} (default {}), max streams {} (default {})",
+        format_bytes(tuning.udp_socket_recv_buffer as u64),
+        format_bytes(defaults.udp_socket_recv_buffer as u64),
+        format_bytes(tuning.udp_socket_send_buffer as u64),
+        format_bytes(defaults.udp_socket_send_buffer as u64),
+        tuning.max_direct_streams,
+        defaults.max_direct_streams,
+    );
+}
+
+fn print_tuning_advice(label: &str, metrics: &PathMetrics) {
+    let hints = tuning_recommendations(metrics);
+    if !hints.is_empty() {
+        println!("{label} advice   : {}", hints.join("; "));
+    }
 }
 
 fn print_final_report(
@@ -1641,6 +1679,78 @@ fn print_path_bottleneck_hints(label: &str, metrics: &PathMetrics) {
     }
 }
 
+fn tuning_recommendations(metrics: &PathMetrics) -> Vec<String> {
+    let Some(tuning) = metrics.tuning.as_ref() else {
+        return Vec::new();
+    };
+
+    let defaults = UdpDirectTuning::default();
+    let transport = metrics.transport.as_ref();
+    let has_loss_or_mtu_issue = transport.is_some_and(|transport| {
+        transport.path.lost_packets > 0
+            || transport.path.lost_bytes > 0
+            || transport.path.black_holes_detected > 0
+            || transport.path.current_mtu_bytes < 1200
+    });
+    let has_flow_control_pressure = transport.is_some_and(|transport| {
+        transport.frame_tx.data_blocked > 0
+            || transport.frame_rx.data_blocked > 0
+            || transport.frame_tx.stream_data_blocked > 0
+            || transport.frame_rx.stream_data_blocked > 0
+    });
+    let has_stream_limit_pressure = transport.is_some_and(|transport| {
+        transport.frame_tx.streams_blocked_bidi > 0 || transport.frame_rx.streams_blocked_bidi > 0
+    });
+    let tuning_is_above_defaults = tuning.stream_receive_window > defaults.stream_receive_window
+        || tuning.connection_receive_window > defaults.connection_receive_window
+        || tuning.send_window > defaults.send_window
+        || tuning.udp_socket_recv_buffer > defaults.udp_socket_recv_buffer
+        || tuning.udp_socket_send_buffer > defaults.udp_socket_send_buffer;
+
+    let mut advice = Vec::new();
+    if has_loss_or_mtu_issue {
+        advice.push(
+            "loss/MTU instability: decrease stream_receive_window, connection_receive_window, send_window, and socket buffers toward the defaults before trying bigger values".to_string(),
+        );
+        if tuning_is_above_defaults {
+            advice.push(
+                "your current tuning is already above the project defaults, so it is more likely to amplify queued data than to fix this path".to_string(),
+            );
+        }
+    } else if has_flow_control_pressure {
+        advice.push(
+            "flow-control pressure: increase stream_receive_window first, then connection_receive_window and send_window".to_string(),
+        );
+        if tuning.udp_socket_recv_buffer <= defaults.udp_socket_recv_buffer
+            || tuning.udp_socket_send_buffer <= defaults.udp_socket_send_buffer
+        {
+            advice.push(
+                "socket buffers are at or below the defaults; raise them only if kernel queueing or drops are suspected".to_string(),
+            );
+        }
+    } else {
+        advice.push(
+            "no clear pressure signal: keep buffers near the defaults and change one knob at a time".to_string(),
+        );
+    }
+
+    if has_stream_limit_pressure {
+        advice.push(
+            "bidi stream limit pressure: increase max_direct_streams only if you need many concurrent direct flows".to_string(),
+        );
+    } else if tuning.max_direct_streams > defaults.max_direct_streams {
+        advice.push(
+            "max_direct_streams is already above the project default; leave it alone unless stream-limit pressure appears".to_string(),
+        );
+    } else {
+        advice.push(
+            "max_direct_streams can stay at the default unless the report shows bidi stream limit pressure".to_string(),
+        );
+    }
+
+    advice
+}
+
 fn host_bottleneck_hints(host: &HostMetrics) -> Vec<String> {
     let mut hints = Vec::new();
     if host.process_cpu_pct.is_some_and(|pct| pct >= 85.0) {
@@ -1676,8 +1786,31 @@ fn transport_bottleneck_hints(transport: &DirectTransportMetrics) -> Vec<String>
     if transport.path.rtt_ms >= 100.0 {
         hints.push(format!("high QUIC RTT ({:.2} ms)", transport.path.rtt_ms));
     }
+    if transport.path.congestion_events > 0 {
+        hints.push(format!(
+            "QUIC congestion events observed ({})",
+            transport.path.congestion_events
+        ));
+    }
     if transport.path.lost_packets > 0 || transport.path.lost_bytes > 0 {
-        hints.push("QUIC loss visible".to_string());
+        let loss_pct = if transport.path.sent_packets > 0 {
+            (transport.path.lost_packets as f64 * 100.0) / transport.path.sent_packets as f64
+        } else {
+            0.0
+        };
+        if transport.path.sent_packets > 0 {
+            hints.push(format!("QUIC loss visible ({:.1}% packet loss)", loss_pct));
+        } else {
+            hints.push("QUIC loss visible".to_string());
+        }
+    }
+    if transport.path.sent_plpmtud_probes > 0 || transport.path.black_holes_detected > 0 {
+        hints.push(format!(
+            "PLPMTUD probes {} sent / {} lost / {} black holes",
+            transport.path.sent_plpmtud_probes,
+            transport.path.lost_plpmtud_probes,
+            transport.path.black_holes_detected,
+        ));
     }
     if transport.path.black_holes_detected > 0 {
         hints.push("PMTUD black holes detected".to_string());
@@ -1692,7 +1825,10 @@ fn transport_bottleneck_hints(transport: &DirectTransportMetrics) -> Vec<String>
         hints.push("bidi stream limit pressure".to_string());
     }
     if transport.path.current_mtu_bytes < 1200 {
-        hints.push("small MTU may cap throughput".to_string());
+        hints.push(format!(
+            "small MTU may cap throughput ({} B)",
+            transport.path.current_mtu_bytes
+        ));
     }
     hints
 }
@@ -1738,6 +1874,12 @@ fn print_transport_metrics(label: &str, transport: &DirectTransportMetrics) {
         transport.path.lost_packets,
         format_bytes(transport.path.lost_bytes),
         transport.path.sent_packets,
+    );
+    println!(
+        "{label} PLPMTUD : sent {}, lost {}, black holes {}",
+        transport.path.sent_plpmtud_probes,
+        transport.path.lost_plpmtud_probes,
+        transport.path.black_holes_detected,
     );
     println!(
         "{label} UDP     : tx {} datagrams / {} B / {} ios, rx {} datagrams / {} B / {} ios",
@@ -1918,6 +2060,7 @@ mod tests {
                 ack_observed: true,
             }),
             transport: Some(transport),
+            tuning: None,
         };
 
         let hints = path_bottleneck_hints(&metrics);
@@ -1930,6 +2073,10 @@ mod tests {
             .any(|hint| hint.contains("slow receive throughput")));
         assert!(hints.iter().any(|hint| hint.contains("high QUIC RTT")));
         assert!(hints.iter().any(|hint| hint.contains("QUIC loss visible")));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("QUIC congestion events observed")));
+        assert!(hints.iter().any(|hint| hint.contains("PLPMTUD probes")));
         assert!(hints
             .iter()
             .any(|hint| hint.contains("PMTUD black holes detected")));
@@ -1945,6 +2092,69 @@ mod tests {
         assert!(hints
             .iter()
             .any(|hint| hint.contains("small MTU may cap throughput")));
+    }
+
+    #[test]
+    fn tuning_recommendations_decrease_on_loss_and_mtu_pressure() {
+        let metrics = PathMetrics {
+            transport: Some(DirectTransportMetrics {
+                udp_tx: UdpStatsMetrics::default(),
+                udp_rx: UdpStatsMetrics::default(),
+                frame_tx: FrameStatsMetrics::default(),
+                frame_rx: FrameStatsMetrics::default(),
+                path: PathStatsMetrics {
+                    lost_packets: 4,
+                    black_holes_detected: 1,
+                    current_mtu_bytes: 1100,
+                    ..PathStatsMetrics::default()
+                },
+                max_datagram_size_bytes: Some(1200),
+            }),
+            tuning: Some(UdpDirectTuning {
+                stream_receive_window: 64 * 1024 * 1024,
+                connection_receive_window: 128 * 1024 * 1024,
+                send_window: 128 * 1024 * 1024,
+                udp_socket_recv_buffer: 32 * 1024 * 1024,
+                udp_socket_send_buffer: 32 * 1024 * 1024,
+                max_direct_streams: 4096,
+            }),
+            ..PathMetrics::default()
+        };
+
+        let hints = tuning_recommendations(&metrics);
+        assert!(hints.iter().any(|hint| hint.contains("decrease")));
+        assert!(hints.iter().any(|hint| hint.contains("project defaults")));
+    }
+
+    #[test]
+    fn tuning_recommendations_increase_on_flow_control_pressure() {
+        let metrics = PathMetrics {
+            transport: Some(DirectTransportMetrics {
+                udp_tx: UdpStatsMetrics::default(),
+                udp_rx: UdpStatsMetrics::default(),
+                frame_tx: FrameStatsMetrics {
+                    data_blocked: 2,
+                    stream_data_blocked: 1,
+                    ..FrameStatsMetrics::default()
+                },
+                frame_rx: FrameStatsMetrics::default(),
+                path: PathStatsMetrics {
+                    current_mtu_bytes: 1400,
+                    ..PathStatsMetrics::default()
+                },
+                max_datagram_size_bytes: Some(1200),
+            }),
+            tuning: Some(UdpDirectTuning::default()),
+            ..PathMetrics::default()
+        };
+
+        let hints = tuning_recommendations(&metrics);
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("increase stream_receive_window")));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("socket buffers are at or below the defaults")));
     }
 
     #[test]
@@ -1993,6 +2203,7 @@ mod tests {
                     ack_observed: true,
                 }),
                 bandwidth_recv: None,
+                tuning: None,
                 transport: Some(DirectTransportMetrics {
                     udp_tx: UdpStatsMetrics {
                         datagrams: 1,

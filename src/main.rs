@@ -444,6 +444,10 @@ enum Command {
         /// Accepts raw bytes or KB/MB/GB/KiB/MiB/GiB suffixes.
         #[clap(long, value_name = "SIZE", default_value = "64MB")]
         test_transfer_quota: String,
+
+        /// Skip the TCP relay benchmark and only test the direct UDP path.
+        #[clap(long)]
+        udp_only: bool,
     },
 }
 
@@ -746,6 +750,7 @@ async fn dispatch(command: Command) -> Result<()> {
             nat_udp_preferred_port,
             test_bandwidth,
             test_transfer_quota,
+            udp_only,
         } => {
             if let Some(id) = tcp_secret_id {
                 let Some(to) = to else {
@@ -763,6 +768,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     stun_server = ?stun_server.as_deref(),
                     upnp,
                     try_port_prediction,
+                    udp_only,
                     nat_udp_preferred_port,
                     "resolved UDP optimization settings",
                 );
@@ -778,6 +784,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     UdpTestOptions {
                         bandwidth: test_bandwidth,
                         transfer_quota,
+                        udp_only,
                     },
                 )
                 .await?;
@@ -796,6 +803,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     stun_server = ?stun_server.as_deref(),
                     upnp,
                     try_port_prediction,
+                    udp_only,
                     nat_udp_preferred_port,
                     "resolved UDP optimization settings",
                 );
@@ -1100,5 +1108,14 @@ mod tests {
                 None => std::env::remove_var(key),
             }
         }
+    }
+
+    #[test]
+    fn test_udp_accepts_udp_only_flag() {
+        let args = Args::parse_from(["bore", "test-udp", "--udp-only"]);
+        let Command::TestUdp { udp_only, .. } = args.command else {
+            panic!("expected test-udp command");
+        };
+        assert!(udp_only);
     }
 }

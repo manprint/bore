@@ -123,6 +123,13 @@ pub struct UdpTestOptions {
     pub bandwidth: bool,
     /// Bytes sent per direction and per path when [`UdpTestOptions::bandwidth`] is enabled.
     pub transfer_quota: u64,
+    /// Skip the TCP relay benchmark and only run the direct UDP path.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub udp_only: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Role assigned by the server to a paired `bore test-udp` peer.
@@ -471,6 +478,7 @@ mod tests {
                 assert_eq!(peer_summary.nat_class, "Open");
                 assert!(!options.bandwidth);
                 assert_eq!(options.transfer_quota, 1024);
+                assert!(!options.udp_only);
                 assert_eq!(tuning, UdpDirectTuning::default());
             }
             other => panic!("unexpected message: {other:?}"),

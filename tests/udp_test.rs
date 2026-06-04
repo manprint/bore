@@ -60,6 +60,7 @@ async fn paired_test_udp_diagnostic_exercises_direct_and_relay() -> Result<()> {
     let options = UdpTestOptions {
         bandwidth: true,
         transfer_quota: 64 * 1024,
+        udp_only: false,
     };
 
     let first_stun = stun.clone();

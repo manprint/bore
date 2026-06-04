@@ -336,20 +336,26 @@ pub async fn run_peer_test(
     )
     .await;
 
-    let tcp = match run_path_suite(
-        "TCP relay fallback",
-        &mut tcp_path,
-        start.role,
-        start.options,
-        None,
-    )
-    .await
-    {
-        Ok(metrics) => Some(metrics),
-        Err(err) => {
-            println!();
-            println!("TCP relay fallback : FAILED ({err})");
-            None
+    let tcp = if start.options.udp_only {
+        println!();
+        println!("TCP relay fallback : skipped (--udp-only)");
+        None
+    } else {
+        match run_path_suite(
+            "TCP relay fallback",
+            &mut tcp_path,
+            start.role,
+            start.options,
+            None,
+        )
+        .await
+        {
+            Ok(metrics) => Some(metrics),
+            Err(err) => {
+                println!();
+                println!("TCP relay fallback : FAILED ({err})");
+                None
+            }
         }
     };
 
@@ -387,6 +393,7 @@ pub async fn run_peer_test(
         &start.peer_summary,
         &local_metrics,
         peer_metrics.as_ref(),
+        start.options.udp_only,
     );
     Ok(())
 }
@@ -965,6 +972,7 @@ fn merge_options(a: UdpTestOptions, b: UdpTestOptions) -> UdpTestOptions {
     UdpTestOptions {
         bandwidth: a.bandwidth || b.bandwidth,
         transfer_quota,
+        udp_only: a.udp_only || b.udp_only,
     }
 }
 
@@ -1542,9 +1550,73 @@ fn print_tuning_metrics(label: &str, tuning: &UdpDirectTuning) {
 }
 
 fn print_tuning_advice(label: &str, metrics: &PathMetrics) {
-    let hints = tuning_recommendations(metrics);
-    if !hints.is_empty() {
-        println!("{label} advice   : {}", hints.join("; "));
+    let Some(current) = metrics.tuning.as_ref() else {
+        return;
+    };
+
+    if let Some((send_mbps, recv_mbps, ratio, slower)) = bandwidth_balance(metrics) {
+        if ratio >= 1.25 {
+            println!(
+                "{label} balance  : send {:.2} Mbit/s, recv {:.2} Mbit/s ({:.2}x skew, slower {})",
+                send_mbps, recv_mbps, ratio, slower
+            );
+        }
+    }
+
+    let Some((preset, target, note)) = recommended_tuning(metrics) else {
+        return;
+    };
+
+    println!("{label} preset   : {preset}");
+    println!(
+        "{label} target   : stream recv {}, conn recv {}, send {}, sock recv {}, sock send {}, max streams {}",
+        tuning_target_entry(current.stream_receive_window as u64, target.stream_receive_window as u64),
+        tuning_target_entry(
+            current.connection_receive_window as u64,
+            target.connection_receive_window as u64
+        ),
+        tuning_target_entry(current.send_window, target.send_window),
+        tuning_target_entry(
+            current.udp_socket_recv_buffer as u64,
+            target.udp_socket_recv_buffer as u64
+        ),
+        tuning_target_entry(
+            current.udp_socket_send_buffer as u64,
+            target.udp_socket_send_buffer as u64
+        ),
+        tuning_target_count_entry(current.max_direct_streams, target.max_direct_streams),
+    );
+    println!("{label} note     : {note}");
+}
+
+fn tuning_target_entry(current: u64, target: u64) -> String {
+    let direction = tuning_direction(current, target);
+    if current == target {
+        format!("{} (keep)", format_bytes(target))
+    } else {
+        format!(
+            "{} {} from {}",
+            format_bytes(target),
+            direction,
+            format_bytes(current)
+        )
+    }
+}
+
+fn tuning_target_count_entry(current: u32, target: u32) -> String {
+    let direction = tuning_direction(current as u64, target as u64);
+    if current == target {
+        format!("{target} (keep)")
+    } else {
+        format!("{target} {direction} from {current}")
+    }
+}
+
+fn tuning_direction(current: u64, target: u64) -> &'static str {
+    match target.cmp(&current) {
+        std::cmp::Ordering::Less => "↓",
+        std::cmp::Ordering::Equal => "=",
+        std::cmp::Ordering::Greater => "↑",
     }
 }
 
@@ -1553,6 +1625,7 @@ fn print_final_report(
     peer: &UdpTestPeerSummary,
     metrics: &PeerMetrics,
     peer_metrics: Option<&PeerMetrics>,
+    udp_only: bool,
 ) {
     println!();
     println!("Final report");
@@ -1575,11 +1648,7 @@ fn print_final_report(
     );
     println!(
         "TCP fallback      : {}",
-        if metrics.tcp.is_some() {
-            "working"
-        } else {
-            "FAILED"
-        }
+        tcp_fallback_status(metrics.tcp.as_ref(), udp_only)
     );
     print_host_metrics("Local host", &metrics.host);
     if let Some(peer_metrics) = peer_metrics {
@@ -1594,11 +1663,7 @@ fn print_final_report(
         );
         println!(
             "Peer TCP fallback : {}",
-            if peer_metrics.tcp.is_some() {
-                "working"
-            } else {
-                "FAILED"
-            }
+            tcp_fallback_status(peer_metrics.tcp.as_ref(), udp_only)
         );
     }
     if let Some(udp) = &metrics.udp {
@@ -1679,13 +1744,100 @@ fn print_path_bottleneck_hints(label: &str, metrics: &PathMetrics) {
     }
 }
 
+fn tcp_fallback_status(tcp: Option<&PathMetrics>, udp_only: bool) -> &'static str {
+    if udp_only && tcp.is_none() {
+        "skipped (--udp-only)"
+    } else if tcp.is_some() {
+        "working"
+    } else {
+        "FAILED"
+    }
+}
+
+#[cfg(test)]
 fn tuning_recommendations(metrics: &PathMetrics) -> Vec<String> {
-    let Some(tuning) = metrics.tuning.as_ref() else {
+    let Some(current) = metrics.tuning.as_ref() else {
         return Vec::new();
     };
 
     let defaults = UdpDirectTuning::default();
+    let Some((preset, _target, note)) = recommended_tuning(metrics) else {
+        return Vec::new();
+    };
+
+    let mut hints = vec![note.to_string()];
+    if preset == "stability/default" {
+        hints.push(
+            "loss/MTU instability: decrease stream_receive_window, connection_receive_window, send_window, and socket buffers toward the defaults before trying bigger values".to_string(),
+        );
+        if current.stream_receive_window > defaults.stream_receive_window
+            || current.connection_receive_window > defaults.connection_receive_window
+            || current.send_window > defaults.send_window
+            || current.udp_socket_recv_buffer > defaults.udp_socket_recv_buffer
+            || current.udp_socket_send_buffer > defaults.udp_socket_send_buffer
+        {
+            hints.push(
+                "your current tuning is already above the project defaults, so it is more likely to amplify queued data than to fix this path".to_string(),
+            );
+        }
+    } else if preset == "throughput-leaning" {
+        hints.push(
+            "flow-control pressure: increase stream_receive_window first, then connection_receive_window and send_window".to_string(),
+        );
+        if current.udp_socket_recv_buffer <= defaults.udp_socket_recv_buffer
+            || current.udp_socket_send_buffer <= defaults.udp_socket_send_buffer
+        {
+            hints.push(
+                "socket buffers are at or below the defaults; raise them only if kernel queueing or drops are suspected".to_string(),
+            );
+        }
+    } else if preset == "stream-heavy" {
+        hints.push(
+            "bidi stream limit pressure: increase max_direct_streams only if you need many concurrent direct flows".to_string(),
+        );
+    } else {
+        hints.push(
+            "no clear pressure signal: keep buffers near the defaults and change one knob at a time".to_string(),
+        );
+    }
+
+    if current.max_direct_streams > defaults.max_direct_streams {
+        hints.push(
+            "max_direct_streams is already above the project default; leave it alone unless stream-limit pressure appears".to_string(),
+        );
+    } else {
+        hints.push(
+            "max_direct_streams can stay at the default unless the report shows bidi stream limit pressure".to_string(),
+        );
+    }
+
+    hints
+}
+
+fn bandwidth_balance(metrics: &PathMetrics) -> Option<(f64, f64, f64, &'static str)> {
+    let send = metrics.bandwidth_send.as_ref()?.mbps;
+    let recv = metrics.bandwidth_recv.as_ref()?.mbps;
+    if send <= 0.0 || recv <= 0.0 {
+        return None;
+    }
+
+    if send >= recv {
+        Some((send, recv, send / recv, "receive"))
+    } else {
+        Some((send, recv, recv / send, "send"))
+    }
+}
+
+fn recommended_tuning(
+    metrics: &PathMetrics,
+) -> Option<(&'static str, UdpDirectTuning, &'static str)> {
+    let Some(tuning) = metrics.tuning.as_ref() else {
+        return None;
+    };
+
+    let defaults = UdpDirectTuning::default();
     let transport = metrics.transport.as_ref();
+    let skewed_bandwidth = bandwidth_balance(metrics).is_some_and(|(_, _, ratio, _)| ratio >= 1.25);
     let has_loss_or_mtu_issue = transport.is_some_and(|transport| {
         transport.path.lost_packets > 0
             || transport.path.lost_bytes > 0
@@ -1698,57 +1850,57 @@ fn tuning_recommendations(metrics: &PathMetrics) -> Vec<String> {
             || transport.frame_tx.stream_data_blocked > 0
             || transport.frame_rx.stream_data_blocked > 0
     });
-    let has_stream_limit_pressure = transport.is_some_and(|transport| {
-        transport.frame_tx.streams_blocked_bidi > 0 || transport.frame_rx.streams_blocked_bidi > 0
-    });
-    let tuning_is_above_defaults = tuning.stream_receive_window > defaults.stream_receive_window
-        || tuning.connection_receive_window > defaults.connection_receive_window
-        || tuning.send_window > defaults.send_window
-        || tuning.udp_socket_recv_buffer > defaults.udp_socket_recv_buffer
-        || tuning.udp_socket_send_buffer > defaults.udp_socket_send_buffer;
-
-    let mut advice = Vec::new();
     if has_loss_or_mtu_issue {
-        advice.push(
-            "loss/MTU instability: decrease stream_receive_window, connection_receive_window, send_window, and socket buffers toward the defaults before trying bigger values".to_string(),
-        );
-        if tuning_is_above_defaults {
-            advice.push(
-                "your current tuning is already above the project defaults, so it is more likely to amplify queued data than to fix this path".to_string(),
-            );
-        }
+        return Some((
+            "stability/default",
+            defaults,
+            if skewed_bandwidth {
+                "loss/MTU instability on a skewed path: return to the default profile before trying bigger values"
+            } else {
+                "loss/MTU instability: return to the default profile before trying bigger values"
+            },
+        ));
     } else if has_flow_control_pressure {
-        advice.push(
-            "flow-control pressure: increase stream_receive_window first, then connection_receive_window and send_window".to_string(),
-        );
-        if tuning.udp_socket_recv_buffer <= defaults.udp_socket_recv_buffer
-            || tuning.udp_socket_send_buffer <= defaults.udp_socket_send_buffer
-        {
-            advice.push(
-                "socket buffers are at or below the defaults; raise them only if kernel queueing or drops are suspected".to_string(),
-            );
-        }
+        let mut target = defaults;
+        target.stream_receive_window = tuning
+            .stream_receive_window
+            .max(defaults.stream_receive_window.saturating_mul(2));
+        return Some((
+            "throughput-leaning",
+            target,
+            if skewed_bandwidth {
+                "clean path with flow-control pressure on a skewed path: increase stream_receive_window first, then recheck the slower direction"
+            } else {
+                "clean path with flow-control pressure: increase stream_receive_window first"
+            },
+        ));
+    } else if transport.is_some_and(|transport| {
+        transport.frame_tx.streams_blocked_bidi > 0 || transport.frame_rx.streams_blocked_bidi > 0
+    }) {
+        let mut target = defaults;
+        target.max_direct_streams = tuning
+            .max_direct_streams
+            .max(defaults.max_direct_streams.saturating_mul(2));
+        return Some((
+            "stream-heavy",
+            target,
+            if skewed_bandwidth {
+                "bidi stream limit pressure on a skewed path: raise max_direct_streams only if you truly run many concurrent direct flows"
+            } else {
+                "bidi stream limit pressure: raise max_direct_streams only if you truly run many concurrent direct flows"
+            },
+        ));
     } else {
-        advice.push(
-            "no clear pressure signal: keep buffers near the defaults and change one knob at a time".to_string(),
-        );
+        return Some((
+            "balanced/default",
+            defaults,
+            if skewed_bandwidth {
+                "directional throughput skew without flow-control pressure: keep the default profile; this looks more like path asymmetry than a tuning issue"
+            } else {
+                "no clear pressure signal: keep the default profile"
+            },
+        ));
     }
-
-    if has_stream_limit_pressure {
-        advice.push(
-            "bidi stream limit pressure: increase max_direct_streams only if you need many concurrent direct flows".to_string(),
-        );
-    } else if tuning.max_direct_streams > defaults.max_direct_streams {
-        advice.push(
-            "max_direct_streams is already above the project default; leave it alone unless stream-limit pressure appears".to_string(),
-        );
-    } else {
-        advice.push(
-            "max_direct_streams can stay at the default unless the report shows bidi stream limit pressure".to_string(),
-        );
-    }
-
-    advice
 }
 
 fn host_bottleneck_hints(host: &HostMetrics) -> Vec<String> {
@@ -1933,14 +2085,25 @@ mod tests {
         let a = UdpTestOptions {
             bandwidth: false,
             transfer_quota: 500,
+            udp_only: false,
         };
         let b = UdpTestOptions {
             bandwidth: true,
             transfer_quota: 200,
+            udp_only: true,
         };
         let merged = merge_options(a, b);
         assert!(merged.bandwidth);
         assert_eq!(merged.transfer_quota, 200);
+        assert!(merged.udp_only);
+    }
+
+    #[test]
+    fn tcp_fallback_status_honors_udp_only() {
+        let metrics = PathMetrics::default();
+        assert_eq!(tcp_fallback_status(None, true), "skipped (--udp-only)");
+        assert_eq!(tcp_fallback_status(None, false), "FAILED");
+        assert_eq!(tcp_fallback_status(Some(&metrics), true), "working");
     }
 
     #[test]

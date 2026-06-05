@@ -472,6 +472,70 @@ For the full theory and an exhaustive **A×B (provider × consumer) matrix** of 
 admin fixes (which ports to open, where) — see **[`NAT_TRAVERSAL.md`](NAT_TRAVERSAL.md)**
 (in Italian).
 
+#### Secure file transfer (`bore transfer`)
+
+`bore transfer` builds on the existing secret-tunnel transport: it registers a
+temporary secret id, tries the direct UDP path by default, and falls back to the
+server relay automatically. The server never stores the payload; it only relays
+the byte stream when a direct path is unavailable.
+
+Receiver side:
+
+```shell
+bore transfer listener \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id nightly-backup \
+  --dest-path /srv/inbox
+```
+
+Sender side:
+
+```shell
+# Single file
+bore transfer sender \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id nightly-backup \
+  --source /home/alice/archive.tar.gz
+
+# Directory (preserves the directory root and relative layout)
+bore transfer sender \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id nightly-backup \
+  --source /home/alice/project
+
+# stdin stream (requires an explicit output file name)
+tar -cvpzf - project | bore transfer sender \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id nightly-backup \
+  --source stdin \
+  --output project.tar.gz
+```
+
+What the transfer command guarantees in v1:
+
+- **End-to-end verification** with BLAKE3 across every transferred file/stream.
+- **Staging + commit** on the receiver: files are written into a temporary tree
+  under the destination root and published only after the hashes match.
+- **Collision policy** is fail-safe by default. Use `--overwrite` or `--rename`
+  on `bore transfer listener` to opt into replacement/renaming.
+- **Live path visibility** in the logs: the sender and listener report whether
+  the transfer is on `direct-udp` or `relay`, plus `quic-encrypted`, `tls`, or
+  `plain` transport security.
+
+Notes:
+
+- `--source stdin` verifies the exact byte stream that `bore` reads and the
+  receiver writes. It cannot know whether the producer command earlier in the
+  shell pipeline succeeded semantically; use shell `pipefail` if you need that.
+- Symlinks and Unix device nodes are opt-in/opt-out on the sender with
+  `--symlinks include|exclude` and `--devices include|exclude`.
+- `bore transfer listener` also accepts the legacy `--tcp-secret-id` flag as an
+  alias of `--transfer-id`, so existing tooling can reuse the same identifier.
+
 #### Diagnosing UDP / NAT (`bore test-udp`)
 
 Before blaming the tunnel, find out what *your* network allows. `bore test-udp`

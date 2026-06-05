@@ -7,6 +7,10 @@ use bore_cli::{
     secret::Proxy,
     server::Server,
     shared::{TunnelOptions, UdpDirectTuning, UdpTestOptions, MAX_DIRECT_STREAMS, MAX_NOTES_LEN},
+    transfer::{
+        CollisionPolicy, DeviceMode, ListenerOptions as TransferListenerOptions,
+        SenderOptions as TransferSenderOptions, SymlinkMode,
+    },
 };
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand};
 use tracing::info;
@@ -248,6 +252,12 @@ enum Command {
         auto_reconnect: bool,
     },
 
+    /// Secure file and directory transfer over secret tunnels.
+    Transfer {
+        #[clap(subcommand)]
+        command: TransferCommand,
+    },
+
     /// Runs the remote proxy server.
     Server {
         /// Minimum accepted TCP port number.
@@ -448,6 +458,164 @@ enum Command {
         /// Skip the TCP relay benchmark and only test the direct UDP path.
         #[clap(long)]
         udp_only: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TransferCommand {
+    /// Receive a transfer into a destination directory.
+    #[clap(visible_alias = "listner")]
+    Listener {
+        /// Destination directory where the transfer is committed.
+        #[clap(long, value_name = "DIR")]
+        dest_path: String,
+
+        /// Address of the remote server hosting the transfer rendezvous.
+        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER")]
+        to: String,
+
+        /// Optional secret for authentication.
+        #[clap(
+            short,
+            long,
+            value_name = "SECRET",
+            env = "BORE_SECRET",
+            hide_env_values = true
+        )]
+        secret: Option<String>,
+
+        /// Transfer identifier; aliases the existing --tcp-secret-id flag.
+        #[clap(long = "transfer-id", alias = "tcp-secret-id", value_name = "ID")]
+        transfer_id: Option<String>,
+
+        /// Skip TLS certificate verification (for self-signed https:// servers).
+        #[clap(long, env = "BORE_INSECURE")]
+        insecure: bool,
+
+        /// Disable the default direct-UDP attempt and force the relay path.
+        #[clap(long)]
+        relay_only: bool,
+
+        /// STUN server (host:port) for UDP candidate discovery.
+        #[clap(long, value_name = "HOST:PORT", env = "BORE_STUN_SERVER")]
+        stun_server: Option<String>,
+
+        /// Try UPnP-IGD to map a port on the local router.
+        #[clap(long, env = "BORE_UPNP")]
+        upnp: bool,
+
+        /// Also advertise predicted symmetric-NAT ports as hole-punch candidates.
+        #[clap(long, env = "BORE_TRY_PORT_PREDICTION")]
+        try_port_prediction: bool,
+
+        /// Bind the UDP hole-punch socket to this fixed port.
+        #[clap(
+            long,
+            value_name = "PORT",
+            env = "BORE_NAT_UDP_PORT",
+            default_value_t = 0
+        )]
+        nat_udp_preferred_port: u16,
+
+        /// How long (seconds) to wait before re-checking the preferred UDP port.
+        #[clap(
+            long,
+            value_name = "SECS",
+            env = "BORE_NAT_UDP_RELEASE_TIMEOUT",
+            default_value_t = bore_cli::shared::NAT_UDP_RELEASE_TIMEOUT,
+        )]
+        nat_udp_release_timeout: u64,
+
+        /// Number of relay carrier connections for fallback mode.
+        #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
+        carriers: u16,
+
+        /// Overwrite an existing destination root.
+        #[clap(long, conflicts_with = "rename")]
+        overwrite: bool,
+
+        /// Rename the destination root if it already exists.
+        #[clap(long, conflicts_with = "overwrite")]
+        rename: bool,
+    },
+
+    /// Send a file, directory, or stdin stream.
+    Sender {
+        /// Source path or the literal string "stdin".
+        #[clap(long, value_name = "PATH|stdin")]
+        source: String,
+
+        /// Output file name when --source stdin is used.
+        #[clap(long, value_name = "NAME")]
+        output: Option<String>,
+
+        /// Address of the remote server hosting the transfer rendezvous.
+        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER")]
+        to: String,
+
+        /// Optional secret for authentication.
+        #[clap(
+            short,
+            long,
+            value_name = "SECRET",
+            env = "BORE_SECRET",
+            hide_env_values = true
+        )]
+        secret: Option<String>,
+
+        /// Transfer identifier; aliases the existing --tcp-secret-id flag.
+        #[clap(long = "transfer-id", alias = "tcp-secret-id", value_name = "ID")]
+        transfer_id: Option<String>,
+
+        /// Skip TLS certificate verification (for self-signed https:// servers).
+        #[clap(long, env = "BORE_INSECURE")]
+        insecure: bool,
+
+        /// Disable the default direct-UDP attempt and force the relay path.
+        #[clap(long)]
+        relay_only: bool,
+
+        /// STUN server (host:port) for UDP candidate discovery.
+        #[clap(long, value_name = "HOST:PORT", env = "BORE_STUN_SERVER")]
+        stun_server: Option<String>,
+
+        /// Try UPnP-IGD to map a port on the local router.
+        #[clap(long, env = "BORE_UPNP")]
+        upnp: bool,
+
+        /// Also advertise predicted symmetric-NAT ports as hole-punch candidates.
+        #[clap(long, env = "BORE_TRY_PORT_PREDICTION")]
+        try_port_prediction: bool,
+
+        /// Bind the UDP hole-punch socket to this fixed port.
+        #[clap(
+            long,
+            value_name = "PORT",
+            env = "BORE_NAT_UDP_PORT",
+            default_value_t = 0
+        )]
+        nat_udp_preferred_port: u16,
+
+        /// How long (seconds) to wait before re-checking the preferred UDP port.
+        #[clap(
+            long,
+            value_name = "SECS",
+            env = "BORE_NAT_UDP_RELEASE_TIMEOUT",
+            default_value_t = bore_cli::shared::NAT_UDP_RELEASE_TIMEOUT,
+        )]
+        nat_udp_release_timeout: u64,
+
+        /// Number of relay carrier connections for fallback mode.
+        #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
+        carriers: u16,
+
+        /// Include or exclude symlinks while scanning the source.
+        #[clap(long, value_enum, default_value_t = SymlinkMode::Exclude)]
+        symlinks: SymlinkMode,
+
+        /// Include or exclude Unix device nodes while scanning the source.
+        #[clap(long, value_enum, default_value_t = DeviceMode::Exclude)]
+        devices: DeviceMode,
     },
 }
 
@@ -665,6 +833,106 @@ async fn dispatch(command: Command) -> Result<()> {
             };
             reconnect::run(auto_reconnect, connect, serve_proxy).await?;
         }
+        Command::Transfer { command } => match command {
+            TransferCommand::Listener {
+                dest_path,
+                to,
+                secret,
+                transfer_id,
+                insecure,
+                relay_only,
+                stun_server,
+                upnp,
+                try_port_prediction,
+                nat_udp_preferred_port,
+                nat_udp_release_timeout,
+                carriers,
+                overwrite,
+                rename,
+            } => {
+                let collision = match (overwrite, rename) {
+                    (true, false) => CollisionPolicy::Overwrite,
+                    (false, true) => CollisionPolicy::Rename,
+                    _ => CollisionPolicy::Fail,
+                };
+                if !relay_only {
+                    info!(
+                        mode = "transfer-listener",
+                        stun_server = ?stun_server.as_deref(),
+                        upnp,
+                        try_port_prediction,
+                        nat_udp_preferred_port,
+                        nat_udp_release_timeout,
+                        carriers,
+                        "resolved transfer UDP settings"
+                    );
+                }
+                bore_cli::transfer::run_listener(TransferListenerOptions {
+                    to,
+                    secret,
+                    insecure,
+                    transfer_id,
+                    dest_path: dest_path.into(),
+                    relay_only,
+                    stun_server,
+                    upnp,
+                    try_port_prediction,
+                    nat_udp_preferred_port,
+                    nat_udp_release_timeout,
+                    carriers,
+                    collision,
+                })
+                .await?;
+            }
+            TransferCommand::Sender {
+                source,
+                output,
+                to,
+                secret,
+                transfer_id,
+                insecure,
+                relay_only,
+                stun_server,
+                upnp,
+                try_port_prediction,
+                nat_udp_preferred_port,
+                nat_udp_release_timeout,
+                carriers,
+                symlinks,
+                devices,
+            } => {
+                if !relay_only {
+                    info!(
+                        mode = "transfer-sender",
+                        stun_server = ?stun_server.as_deref(),
+                        upnp,
+                        try_port_prediction,
+                        nat_udp_preferred_port,
+                        nat_udp_release_timeout,
+                        carriers,
+                        "resolved transfer UDP settings"
+                    );
+                }
+                bore_cli::transfer::run_sender(TransferSenderOptions {
+                    to,
+                    secret,
+                    insecure,
+                    transfer_id,
+                    source,
+                    output,
+                    relay_only,
+                    stun_server,
+                    upnp,
+                    try_port_prediction,
+                    nat_udp_preferred_port,
+                    nat_udp_release_timeout,
+                    carriers,
+                    symlinks,
+                    devices,
+                })
+                .await?;
+            }
+        },
         Command::Server {
             min_port,
             max_port,
@@ -1117,5 +1385,49 @@ mod tests {
             panic!("expected test-udp command");
         };
         assert!(udp_only);
+    }
+
+    #[test]
+    fn transfer_listener_accepts_rename_policy() {
+        let args = Args::parse_from([
+            "bore",
+            "transfer",
+            "listener",
+            "--dest-path",
+            "/tmp/inbox",
+            "--rename",
+        ]);
+        let Command::Transfer { command } = args.command else {
+            panic!("expected transfer command");
+        };
+        let TransferCommand::Listener {
+            rename, overwrite, ..
+        } = command
+        else {
+            panic!("expected transfer listener command");
+        };
+        assert!(rename);
+        assert!(!overwrite);
+    }
+
+    #[test]
+    fn transfer_sender_accepts_stdin_and_output() {
+        let args = Args::parse_from([
+            "bore",
+            "transfer",
+            "sender",
+            "--source",
+            "stdin",
+            "--output",
+            "archive.tar.gz",
+        ]);
+        let Command::Transfer { command } = args.command else {
+            panic!("expected transfer command");
+        };
+        let TransferCommand::Sender { source, output, .. } = command else {
+            panic!("expected transfer sender command");
+        };
+        assert_eq!(source, "stdin");
+        assert_eq!(output.as_deref(), Some("archive.tar.gz"));
     }
 }

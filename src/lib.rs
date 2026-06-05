@@ -30,5 +30,6 @@ pub mod reconnect;
 pub mod secret;
 pub mod server;
 pub mod shared;
+pub mod transfer;
 pub mod transport;
 pub mod udp_diagnostic;

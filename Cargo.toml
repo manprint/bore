@@ -40,7 +40,8 @@ serde = { version = "1.0.136", features = ["derive"] }
 serde_json = "1.0.79"
 sha2 = "0.10.2"
 socket2 = "0.6.4"
-tokio = { version = "1.41.0", features = ["rt-multi-thread", "io-util", "macros", "net", "signal", "sync", "time"] }
+blake3 = "1.5.5"
+tokio = { version = "1.41.0", features = ["fs", "rt-multi-thread", "io-std", "io-util", "macros", "net", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-util = { version = "0.7.1", features = ["codec", "compat"] }
 tracing = "0.1.32"
@@ -48,6 +49,9 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = { version = "1.2.1", features = ["serde", "v4"] }
 webpki-roots = "1.0.7"
 yamux = "0.13.10"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29.0", features = ["fs"] }
 
 # Optional, enabled by the `udp` feature (see [features]).
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }

@@ -3,6 +3,7 @@
 #![allow(missing_docs)]
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
@@ -75,8 +76,8 @@ pub struct SenderOptions {
     pub secret: Option<String>,
     pub insecure: bool,
     pub transfer_id: Option<String>,
-    pub source: String,
-    pub output: Option<String>,
+    pub source: PathBuf,
+    pub output: Option<PathBuf>,
     pub relay_only: bool,
     pub stun_server: Option<String>,
     pub upnp: bool,
@@ -453,7 +454,7 @@ async fn send_transfer(
             }
             EntryKind::RegularFile => {
                 counts.regular_files += 1;
-                progress.start_path(display_rel_path(&entry.manifest.rel_path));
+                progress.start_path(&display_rel_path(&entry.manifest.rel_path));
                 if plan.root_source == RootSourceKind::Stdin && entry.manifest.size.is_none() {
                     send_stdin_payload(&mut stream, &entry.manifest, &mut progress).await?;
                     let frame = expect_frame(&mut stream).await?;
@@ -506,7 +507,7 @@ async fn send_transfer(
                         Some(hash.as_str()),
                     )?;
                 }
-                progress.finish_file(display_rel_path(&entry.manifest.rel_path));
+                progress.finish_file(&display_rel_path(&entry.manifest.rel_path));
             }
         }
     }
@@ -529,7 +530,7 @@ async fn send_transfer(
     progress.finish();
     Ok(TransferOutcome {
         transfer_id: plan.transfer_id,
-        final_path: PathBuf::from(completed.final_path),
+        final_path: decode_native_path_string(&completed.final_path)?,
         total_bytes: completed.total_bytes,
         regular_files: completed.regular_files,
         transport,
@@ -626,7 +627,7 @@ async fn receive_payload(
             }
             EntryKind::RegularFile => {
                 counts.regular_files += 1;
-                progress.start_path(display_rel_path(&entry.rel_path));
+                progress.start_path(&display_rel_path(&entry.rel_path));
                 if plan.begin.root_source == RootSourceKind::Stdin && entry.size.is_none() {
                     let (size, hash) = receive_stdin_payload(
                         stream,
@@ -688,7 +689,7 @@ async fn receive_payload(
                         other => bail!("unexpected frame after file payload: {other:?}"),
                     }
                 }
-                progress.finish_file(display_rel_path(&entry.rel_path));
+                progress.finish_file(&display_rel_path(&entry.rel_path));
             }
         }
     }
@@ -715,7 +716,7 @@ async fn receive_payload(
         bail!("sender summary does not match receiver state");
     }
     let completed = CompletedFrame {
-        final_path: plan.final_path.display().to_string(),
+        final_path: path_to_platform_string(&plan.final_path)?,
         total_bytes: local_summary.total_bytes,
         regular_files: local_summary.regular_files,
         transfer_hash: local_summary.transfer_hash.clone(),
@@ -744,9 +745,10 @@ async fn receive_manifest(
     }
     validate_manifest(&begin, &entries)?;
     let final_name = resolve_final_name(dest_root, &begin.root_name, collision).await?;
+    let final_name_local = decode_component_string(&final_name)?;
     let transfer_nonce = Uuid::new_v4().to_string();
     let stage_base = dest_root.join(format!(".bore-transfer-{transfer_nonce}.part"));
-    let stage_root = stage_base.join(&final_name);
+    let stage_root = stage_base.join(&final_name_local);
     fs::create_dir_all(&stage_base).await.with_context(|| {
         format!(
             "failed to create staging directory {}",
@@ -757,7 +759,7 @@ async fn receive_manifest(
         begin,
         entries,
         final_name: final_name.clone(),
-        final_path: dest_root.join(final_name),
+        final_path: dest_root.join(final_name_local),
         stage_base,
         stage_root,
     })
@@ -858,7 +860,7 @@ async fn send_regular_file(
         stream.write_all(&buf[..n]).await?;
         hasher.update(&buf[..n]);
         remaining -= n as u64;
-        progress.advance_bytes(n as u64, display_rel_path(rel_path));
+        progress.advance_bytes(n as u64, &display_rel_path(rel_path));
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -883,7 +885,7 @@ async fn receive_regular_file(
         file.write_all(&buf[..to_read]).await?;
         hasher.update(&buf[..to_read]);
         remaining -= to_read as u64;
-        progress.advance_bytes(to_read as u64, display_rel_path(rel_path));
+        progress.advance_bytes(to_read as u64, &display_rel_path(rel_path));
     }
     file.flush().await?;
     file.sync_all().await?;
@@ -909,7 +911,7 @@ async fn send_stdin_payload(
         stream.write_all(&buf[..n]).await?;
         hasher.update(&buf[..n]);
         total += n as u64;
-        progress.advance_bytes(n as u64, display_rel_path(&entry.rel_path));
+        progress.advance_bytes(n as u64, &display_rel_path(&entry.rel_path));
     }
     send_frame(
         stream,
@@ -942,7 +944,7 @@ async fn receive_stdin_payload(
                 file.write_all(&buf).await?;
                 hasher.update(&buf);
                 total += len as u64;
-                progress.advance_bytes(len as u64, display_rel_path(rel_path));
+                progress.advance_bytes(len as u64, &display_rel_path(rel_path));
             }
             Frame::StreamEnd { size, blake3 } => {
                 file.flush().await?;
@@ -964,18 +966,18 @@ async fn receive_stdin_payload(
 
 async fn plan_transfer(
     transfer_id: String,
-    source: &str,
-    output: Option<&str>,
+    source: &Path,
+    output: Option<&Path>,
     symlinks: SymlinkMode,
     devices: DeviceMode,
 ) -> Result<PlannedTransfer> {
     match parse_sender_source(source) {
         SenderSource::Stdin => {
             let output = output.context("--output is required when --source stdin")?;
-            validate_root_name(output)?;
+            let root_name = single_component_string(output)?;
             Ok(PlannedTransfer {
                 transfer_id,
-                root_name: output.to_string(),
+                root_name,
                 root_source: RootSourceKind::Stdin,
                 entries: vec![PlannedEntry {
                     manifest: ManifestEntry {
@@ -1217,7 +1219,9 @@ async fn resolve_final_name(
     root_name: &str,
     collision: CollisionPolicy,
 ) -> Result<String> {
-    let candidate = dest_root.join(root_name);
+    let requested = decode_component_string(root_name)?;
+    validate_local_component(&requested)?;
+    let candidate = dest_root.join(&requested);
     if !fs::try_exists(&candidate).await? {
         return Ok(root_name.to_string());
     }
@@ -1227,32 +1231,27 @@ async fn resolve_final_name(
             candidate.display()
         ),
         CollisionPolicy::Overwrite => Ok(root_name.to_string()),
-        CollisionPolicy::Rename => pick_renamed_root(dest_root, root_name).await,
+        CollisionPolicy::Rename => {
+            let renamed = pick_renamed_root(dest_root, &requested).await?;
+            encode_component_string(&renamed)
+        }
     }
 }
 
-async fn pick_renamed_root(dest_root: &Path, root_name: &str) -> Result<String> {
+async fn pick_renamed_root(dest_root: &Path, root_name: &OsStr) -> Result<OsString> {
     let root_path = Path::new(root_name);
-    let stem = root_path
-        .file_stem()
-        .and_then(|part| part.to_str())
-        .unwrap_or(root_name);
-    let ext = root_path.extension().and_then(|part| part.to_str());
+    let stem = root_path.file_stem();
+    let ext = root_path.extension();
     for idx in 1..10_000u32 {
-        let renamed = match ext {
-            Some(ext)
-                if root_path.file_name() == Some(root_path.as_os_str())
-                    && !root_name.ends_with('/') =>
-            {
-                format!("{stem} ({idx}).{ext}")
-            }
-            _ => format!("{root_name} ({idx})"),
-        };
+        let renamed = renamed_component(root_name, stem, ext, idx);
         if !fs::try_exists(dest_root.join(&renamed)).await? {
             return Ok(renamed);
         }
     }
-    bail!("unable to find a free renamed destination for {root_name}")
+    bail!(
+        "unable to find a free renamed destination for {}",
+        root_path.display()
+    )
 }
 
 async fn connect_local(addr: std::net::SocketAddr) -> Result<TcpStream> {
@@ -1271,11 +1270,11 @@ async fn connect_local(addr: std::net::SocketAddr) -> Result<TcpStream> {
         .unwrap_or_else(|| anyhow!("failed to connect local transfer socket")))
 }
 
-fn parse_sender_source(source: &str) -> SenderSource {
-    if source.eq_ignore_ascii_case("stdin") {
+fn parse_sender_source(source: &Path) -> SenderSource {
+    if is_stdin_keyword(source) {
         SenderSource::Stdin
     } else {
-        SenderSource::Filesystem(PathBuf::from(source))
+        SenderSource::Filesystem(source.to_path_buf())
     }
 }
 
@@ -1381,14 +1380,8 @@ fn update_transfer_hash(
 }
 
 fn validate_root_name(root_name: &str) -> Result<()> {
-    if root_name.is_empty() {
-        bail!("transfer root name cannot be empty");
-    }
-    let path = Path::new(root_name);
-    if path.is_absolute() || path.components().count() != 1 {
-        bail!("transfer root name must be a single path component");
-    }
-    Ok(())
+    let component = decode_component_string(root_name)?;
+    validate_local_component(&component)
 }
 
 fn validate_relative_path(path: &Path) -> Result<()> {
@@ -1405,11 +1398,7 @@ fn rel_path_to_string(path: &Path) -> Result<String> {
     let mut parts = Vec::new();
     for component in path.components() {
         match component {
-            Component::Normal(part) => parts.push(
-                part.to_str()
-                    .context("path contains non UTF-8 data, which transfer v1 does not support")?
-                    .to_string(),
-            ),
+            Component::Normal(part) => parts.push(encode_component_string(part)?),
             _ => bail!("invalid relative path {}", path.display()),
         }
     }
@@ -1425,30 +1414,36 @@ fn rel_string_to_path(value: &str) -> Result<PathBuf> {
         if part.is_empty() {
             bail!("invalid relative path {value}");
         }
-        path.push(part);
+        let component = decode_component_string(part)?;
+        validate_local_component(&component)?;
+        path.push(component);
     }
     Ok(path)
 }
 
 fn file_name_string(path: &Path) -> Result<String> {
-    path.file_name()
-        .and_then(|part| part.to_str())
-        .map(ToOwned::to_owned)
-        .with_context(|| format!("{} has no valid UTF-8 file name", path.display()))
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("{} does not end with a file name", path.display()))?;
+    encode_component_string(file_name)
 }
 
 fn path_to_platform_string(path: &Path) -> Result<String> {
-    path.to_str()
-        .map(ToOwned::to_owned)
-        .context("path contains non UTF-8 data, which transfer v1 does not support")
+    encode_native_path_string(path)
 }
 
-fn display_rel_path(rel_path: &str) -> &str {
+fn display_rel_path(rel_path: &str) -> String {
     if rel_path.is_empty() {
-        "."
-    } else {
-        rel_path
+        return ".".to_string();
     }
+    let mut parts = Vec::new();
+    for part in rel_path.split('/') {
+        match decode_component_string(part) {
+            Ok(component) => parts.push(PathBuf::from(component).display().to_string()),
+            Err(_) => parts.push(part.to_string()),
+        }
+    }
+    parts.join("/")
 }
 
 fn file_mode(metadata: &std::fs::Metadata) -> Option<u32> {
@@ -1482,13 +1477,17 @@ async fn set_file_mode(path: &Path, mode: Option<u32>) -> Result<()> {
 }
 
 async fn create_symlink(target: &str, link: &Path) -> Result<()> {
-    let target = target.to_string();
+    let target = decode_native_path_string(target)?;
     let link = link.to_path_buf();
     tokio::task::spawn_blocking(move || {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&target, &link).with_context(|| {
-                format!("failed to create symlink {} -> {}", link.display(), target)
+                format!(
+                    "failed to create symlink {} -> {}",
+                    link.display(),
+                    target.display()
+                )
             })
         }
         #[cfg(windows)]
@@ -1496,7 +1495,11 @@ async fn create_symlink(target: &str, link: &Path) -> Result<()> {
             std::os::windows::fs::symlink_file(&target, &link)
                 .or_else(|_| std::os::windows::fs::symlink_dir(&target, &link))
                 .with_context(|| {
-                    format!("failed to create symlink {} -> {}", link.display(), target)
+                    format!(
+                        "failed to create symlink {} -> {}",
+                        link.display(),
+                        target.display()
+                    )
                 })
         }
         #[cfg(not(any(unix, windows)))]
@@ -1628,6 +1631,258 @@ fn human_bytes(value: u64) -> String {
         format!("{}{}", value as u64, UNITS[unit])
     } else {
         format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+fn is_stdin_keyword(path: &Path) -> bool {
+    path.components().count() == 1 && path.as_os_str() == OsStr::new("stdin")
+}
+
+fn single_component_string(path: &Path) -> Result<String> {
+    let components: Vec<_> = path.components().collect();
+    if components.len() != 1 {
+        bail!("transfer root name must be a single path component");
+    }
+    match components[0] {
+        Component::Normal(part) => encode_component_string(part),
+        _ => bail!("transfer root name must be a single path component"),
+    }
+}
+
+fn encode_component_string(component: &OsStr) -> Result<String> {
+    validate_local_component(component)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        if let Ok(text) = std::str::from_utf8(component.as_bytes()) {
+            return Ok(format!("u:{}", hex::encode(text.as_bytes())));
+        }
+        return Ok(format!("b:{}", hex::encode(component.as_bytes())));
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        let wide: Vec<u16> = component.encode_wide().collect();
+        if let Ok(text) = String::from_utf16(&wide) {
+            return Ok(format!("u:{}", hex::encode(text.as_bytes())));
+        }
+        let mut bytes = Vec::with_capacity(wide.len() * 2);
+        for unit in wide {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        Ok(format!("w:{}", hex::encode(bytes)))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let text = component.to_string_lossy();
+        Ok(format!("u:{}", hex::encode(text.as_bytes())))
+    }
+}
+
+fn decode_component_string(value: &str) -> Result<OsString> {
+    let (kind, encoded) = value
+        .split_once(':')
+        .with_context(|| format!("invalid encoded path component {value:?}"))?;
+    match kind {
+        "u" => {
+            let bytes = hex::decode(encoded)
+                .with_context(|| format!("invalid UTF-8 component encoding {value:?}"))?;
+            let text = String::from_utf8(bytes)
+                .with_context(|| format!("invalid UTF-8 component payload {value:?}"))?;
+            let component = OsString::from(text);
+            validate_local_component(&component)?;
+            Ok(component)
+        }
+        "b" => decode_unix_component(encoded),
+        "w" => decode_windows_component(encoded),
+        _ => bail!("unknown encoded path component kind {kind:?}"),
+    }
+}
+
+fn encode_native_path_string(path: &Path) -> Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        if let Ok(text) = std::str::from_utf8(path.as_os_str().as_bytes()) {
+            return Ok(format!("u:{}", hex::encode(text.as_bytes())));
+        }
+        return Ok(format!("b:{}", hex::encode(path.as_os_str().as_bytes())));
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if let Ok(text) = String::from_utf16(&wide) {
+            return Ok(format!("u:{}", hex::encode(text.as_bytes())));
+        }
+        let mut bytes = Vec::with_capacity(wide.len() * 2);
+        for unit in wide {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        Ok(format!("w:{}", hex::encode(bytes)))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let text = path.to_string_lossy();
+        Ok(format!("u:{}", hex::encode(text.as_bytes())))
+    }
+}
+
+fn decode_native_path_string(value: &str) -> Result<PathBuf> {
+    let (kind, encoded) = value
+        .split_once(':')
+        .with_context(|| format!("invalid encoded native path {value:?}"))?;
+    match kind {
+        "u" => {
+            let bytes = hex::decode(encoded)
+                .with_context(|| format!("invalid UTF-8 path encoding {value:?}"))?;
+            let text = String::from_utf8(bytes)
+                .with_context(|| format!("invalid UTF-8 path payload {value:?}"))?;
+            Ok(PathBuf::from(text))
+        }
+        "b" => {
+            let bytes = hex::decode(encoded)
+                .with_context(|| format!("invalid unix path encoding {value:?}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                Ok(PathBuf::from(OsString::from_vec(bytes)))
+            }
+            #[cfg(not(unix))]
+            {
+                let text = String::from_utf8(bytes).context(
+                    "receiver platform cannot represent a non-UTF-8 unix path losslessly",
+                )?;
+                Ok(PathBuf::from(text))
+            }
+        }
+        "w" => {
+            let bytes = hex::decode(encoded)
+                .with_context(|| format!("invalid windows path encoding {value:?}"))?;
+            if bytes.len() % 2 != 0 {
+                bail!("invalid windows path payload length");
+            }
+            let wide: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStringExt;
+                Ok(PathBuf::from(OsString::from_wide(&wide)))
+            }
+            #[cfg(not(windows))]
+            {
+                let text = String::from_utf16(&wide).context(
+                    "receiver platform cannot represent this Windows path losslessly",
+                )?;
+                Ok(PathBuf::from(text))
+            }
+        }
+        _ => bail!("unknown encoded native path kind {kind:?}"),
+    }
+}
+
+fn decode_unix_component(encoded: &str) -> Result<OsString> {
+    let bytes = hex::decode(encoded).with_context(|| {
+        format!("invalid unix component encoding b:{encoded}")
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        let component = OsString::from_vec(bytes);
+        validate_local_component(&component)?;
+        Ok(component)
+    }
+    #[cfg(not(unix))]
+    {
+        let text = String::from_utf8(bytes)
+            .context("receiver platform cannot represent a non-UTF-8 unix component losslessly")?;
+        let component = OsString::from(text);
+        validate_local_component(&component)?;
+        Ok(component)
+    }
+}
+
+fn decode_windows_component(encoded: &str) -> Result<OsString> {
+    let bytes = hex::decode(encoded).with_context(|| {
+        format!("invalid windows component encoding w:{encoded}")
+    })?;
+    if bytes.len() % 2 != 0 {
+        bail!("invalid windows component payload length");
+    }
+    let wide: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+
+        let component = OsString::from_wide(&wide);
+        validate_local_component(&component)?;
+        Ok(component)
+    }
+    #[cfg(not(windows))]
+    {
+        let text = String::from_utf16(&wide)
+            .context("receiver platform cannot represent this Windows component losslessly")?;
+        let component = OsString::from(text);
+        validate_local_component(&component)?;
+        Ok(component)
+    }
+}
+
+fn validate_local_component(component: &OsStr) -> Result<()> {
+    if component.is_empty() {
+        bail!("transfer root name cannot be empty");
+    }
+    let mut components = Path::new(component).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => bail!("transfer root name must be a single path component"),
+    }
+}
+
+fn renamed_component(
+    root_name: &OsStr,
+    stem: Option<&OsStr>,
+    ext: Option<&OsStr>,
+    idx: u32,
+) -> OsString {
+    let suffix = format!(" ({idx})");
+    if let (Some(root_text), Some(stem_text)) = (root_name.to_str(), stem.and_then(|part| part.to_str())) {
+        if let Some(ext_text) = ext.and_then(|part| part.to_str()) {
+            let root_path = Path::new(root_text);
+            if root_path.file_name() == Some(root_name) {
+                return OsString::from(format!("{stem_text}{suffix}.{ext_text}"));
+            }
+        }
+        return OsString::from(format!("{root_text}{suffix}"));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let mut bytes = root_name.as_bytes().to_vec();
+        bytes.extend_from_slice(suffix.as_bytes());
+        OsString::from_vec(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut renamed = root_name.to_os_string();
+        renamed.push(suffix);
+        renamed
     }
 }
 /*

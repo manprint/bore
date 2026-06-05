@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use bore_cli::{
@@ -468,7 +469,7 @@ enum TransferCommand {
     Listener {
         /// Destination directory where the transfer is committed.
         #[clap(long, value_name = "DIR")]
-        dest_path: String,
+        dest_path: PathBuf,
 
         /// Address of the remote server hosting the transfer rendezvous.
         #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER")]
@@ -543,11 +544,11 @@ enum TransferCommand {
     Sender {
         /// Source path or the literal string "stdin".
         #[clap(long, value_name = "PATH|stdin")]
-        source: String,
+        source: PathBuf,
 
         /// Output file name when --source stdin is used.
         #[clap(long, value_name = "NAME")]
-        output: Option<String>,
+        output: Option<PathBuf>,
 
         /// Address of the remote server hosting the transfer rendezvous.
         #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER")]
@@ -608,6 +609,11 @@ enum TransferCommand {
         /// Number of relay carrier connections for fallback mode.
         #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
         carriers: u16,
+
+        /// Number of parallel file workers for chunked filesystem transfers.
+        /// 0 = automatic (carrier-aware default). Stdin always uses a single stream.
+        #[clap(long, value_name = "N", default_value_t = 0)]
+        parallel: u16,
 
         /// Include or exclude symlinks while scanning the source.
         #[clap(long, value_enum, default_value_t = SymlinkMode::Exclude)]
@@ -872,7 +878,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     secret,
                     insecure,
                     transfer_id,
-                    dest_path: dest_path.into(),
+                    dest_path,
                     relay_only,
                     stun_server,
                     upnp,
@@ -898,6 +904,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 nat_udp_preferred_port,
                 nat_udp_release_timeout,
                 carriers,
+                parallel,
                 symlinks,
                 devices,
             } => {
@@ -927,6 +934,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     nat_udp_preferred_port,
                     nat_udp_release_timeout,
                     carriers,
+                    parallel,
                     symlinks,
                     devices,
                 })
@@ -1395,6 +1403,8 @@ mod tests {
             "listener",
             "--dest-path",
             "/tmp/inbox",
+            "--to",
+            "localhost",
             "--rename",
         ]);
         let Command::Transfer { command } = args.command else {
@@ -1418,6 +1428,8 @@ mod tests {
             "sender",
             "--source",
             "stdin",
+            "--to",
+            "localhost",
             "--output",
             "archive.tar.gz",
         ]);
@@ -1427,7 +1439,10 @@ mod tests {
         let TransferCommand::Sender { source, output, .. } = command else {
             panic!("expected transfer sender command");
         };
-        assert_eq!(source, "stdin");
-        assert_eq!(output.as_deref(), Some("archive.tar.gz"));
+        assert_eq!(source, PathBuf::from("stdin"));
+        assert_eq!(
+            output.as_deref(),
+            Some(PathBuf::from("archive.tar.gz").as_path())
+        );
     }
 }

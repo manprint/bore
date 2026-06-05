@@ -476,8 +476,11 @@ admin fixes (which ports to open, where) — see **[`NAT_TRAVERSAL.md`](NAT_TRAV
 
 `bore transfer` builds on the existing secret-tunnel transport: it registers a
 temporary secret id, tries the direct UDP path by default, and falls back to the
-server relay automatically. The server never stores the payload; it only relays
-the byte stream when a direct path is unavailable.
+server relay automatically. Filesystem transfers use a V2 chunked protocol with
+resume state on the receiver, multiple worker streams, per-chunk BLAKE3 checks,
+and a final whole-transfer verification before the staged tree is committed. The
+server never stores the payload; it only brokers the rendezvous or relays the
+encrypted/plain byte streams when a direct path is unavailable.
 
 Receiver side:
 
@@ -497,14 +500,18 @@ bore transfer sender \
   --to https://bore.example.com \
   --secret mysecret \
   --transfer-id nightly-backup \
-  --source /home/alice/archive.tar.gz
+  --source /home/alice/archive.tar.gz \
+  --parallel 4 \
+  --carriers 4
 
 # Directory (preserves the directory root and relative layout)
 bore transfer sender \
   --to https://bore.example.com \
   --secret mysecret \
   --transfer-id nightly-backup \
-  --source /home/alice/project
+  --source /home/alice/project \
+  --parallel 4 \
+  --symlinks include
 
 # stdin stream (requires an explicit output file name)
 tar -cvpzf - project | bore transfer sender \
@@ -515,22 +522,43 @@ tar -cvpzf - project | bore transfer sender \
   --output project.tar.gz
 ```
 
-What the transfer command guarantees in v1:
+What the transfer command guarantees in V2:
 
-- **End-to-end verification** with BLAKE3 across every transferred file/stream.
+- **Chunked filesystem transfer with resume**: regular files are split into
+  deterministic chunks, transferred over one or more worker streams, and can be
+  resumed by re-running the same sender/listener pair with the same
+  `--transfer-id` and unchanged manifest. `stdin` remains a single-stream,
+  non-resumable byte stream by design.
+- **End-to-end verification** with BLAKE3 at three levels: per chunk, per full
+  file, and for the final aggregate transfer summary.
 - **Staging + commit** on the receiver: files are written into a temporary tree
   under the destination root and published only after the hashes match.
 - **Collision policy** is fail-safe by default. Use `--overwrite` or `--rename`
   on `bore transfer listener` to opt into replacement/renaming.
+- **Parallel filesystem workers** via `--parallel N` (`0` = automatic,
+  carrier-aware default). On the relay, `--carriers N` widens the data path; on
+  direct UDP, each transferred connection already uses an independent native
+  QUIC stream.
+- **Cross-platform path fidelity**: the wire format preserves Unix raw-byte path
+  components and Windows UTF-16 path components losslessly, so Linux/macOS raw
+  names and Windows names survive relay/direct transfer without forcing UTF-8.
 - **Live path visibility** in the logs: the sender and listener report whether
   the transfer is on `direct-udp` or `relay`, plus `quic-encrypted`, `tls`, or
   `plain` transport security.
 
 Notes:
 
+- Resume state lives under the destination root's staging directory until the
+  transfer commits. If the source manifest changes between attempts, the
+  listener rejects the resume and asks for a fresh transfer.
 - `--source stdin` verifies the exact byte stream that `bore` reads and the
   receiver writes. It cannot know whether the producer command earlier in the
   shell pipeline succeeded semantically; use shell `pipefail` if you need that.
+- `--source stdin` requires `--output`, always uses a single stream, and does
+  not participate in chunk resume or `--parallel`.
+- Cross-platform support is transport-safe, not name-translation magic: the
+  receiver still enforces its local filesystem rules, so a name invalid on the
+  destination OS is rejected instead of being silently rewritten.
 - Symlinks and Unix device nodes are opt-in/opt-out on the sender with
   `--symlinks include|exclude` and `--devices include|exclude`.
 - `bore transfer listener` also accepts the legacy `--tcp-secret-id` flag as an

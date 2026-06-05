@@ -751,51 +751,116 @@ Documentazione:
 
 - priorita delle policy
 
-## Fase G - Ottimizzazioni prestazionali future
+## Aggiornamento stato implementazione - V2 completata
 
-Questa fase non e necessaria per la prima release corretta, ma e quella che sblocca davvero performance superiori sul relay.
+La parte sopra resta valida come ragionamento architetturale, ma non descrive piu lo stato reale del repository. La V2 e ora implementata.
 
-### G1 - Parallelismo per file/chunk
+### Stato A - Protocollo e CLI
 
-Opzioni:
+Completato.
 
-- piu file in parallelo per directory
-- chunk striping di un singolo file su piu stream
+- subcomando `bore transfer listener|sender` attivo
+- `--transfer-id` come identificatore esplicito del rendezvous
+- alias legacy `--tcp-secret-id` mantenuto lato transfer
+- `--source stdin` + `--output NAME` supportati
 
-Test:
+### Stato B - Correttezza del transfer filesystem
 
-- benchmark comparativi
-- correttezza di ricomposizione chunk
-- assenza di corruzione/out-of-order bug
+Completato.
 
-Documentazione:
+- manifest applicativo dedicato
+- staging sotto la destinazione e commit finale solo dopo verifica
+- collision policy `fail` di default, con `--overwrite` e `--rename`
+- hash BLAKE3 finale per file e transfer
 
-- relazione tra chunking e carriers
+### Stato C - Portabilita path Linux / macOS / Windows
 
-## TODO futuro - resume
+Completato sul wire format.
 
-Non implementarlo ora e una scelta corretta.
+- i path non passano piu come UTF-8 obbligatorio
+- componenti Unix trasportati come byte raw codificati
+- componenti Windows trasportati come UTF-16LE codificato
+- il receiver ricostruisce `OsString`/`PathBuf` nativi
+- resta intenzionale il rifiuto di nomi non validi sul filesystem di destinazione
 
-Per farlo bene servirebbero:
+### Stato D - Chunking, resume e parallelismo reale
 
-- identificazione stabile del transfer e delle entry
-- chunking deterministico
-- bitmap o indice dei chunk gia completati
+Completato per i transfer filesystem.
+
+- chunking deterministico dei file regolari
+- resume state persistito lato receiver
 - handshake di resume tra sender e listener
-- stato persistito localmente almeno lato receiver
-- regole molto chiare su mutazione dei file sorgente tra tentativi
+- worker multipli su stream distinti
+- `--parallel N` per parallelismo applicativo vero
+- integrazione con `--carriers N` sul relay
 
-Finche non esiste chunking applicativo, il resume serio non e consigliabile.
+Nota importante:
 
-## Raccomandazione finale
+- il beneficio su file grossi in relay arriva dal chunking su piu stream, non dai carriers da soli
+- il path diretto UDP usa gia stream QUIC nativi indipendenti, quindi non ha bisogno di carrier pool
 
-Il progetto e fattibile e ha un buon fit con l'architettura attuale di bore, a condizione di rispettare questi principi:
+### Stato E - `stdin`
+
+Completato con vincoli espliciti.
+
+- `stdin` e trattato come byte-stream opaco verificato end-to-end
+- richiede `--output`
+- usa un solo stream
+- non fa resume
+- non usa `--parallel`
+
+### Stato F - Test e regressione
+
+Completato con copertura dedicata sia library-level sia subprocess reale.
+
+Copertura principale:
+
+- relay singolo file
+- directory con struttura preservata
+- diretto UDP
+- file zero-byte
+- file grande con `parallel + carriers`
+- resume dopo interruzione forzata
+- nomi/path non UTF-8 su Unix
+- `stdin` via subprocess reale: vuoto, piccolo, grande, overwrite, rename, errore senza `--output`, diretto UDP, output non UTF-8 su Unix
+
+### Stato G - Limiti residui della V2
+
+Ancora intenzionali:
+
+- niente resume per `stdin`
+- resume valido solo se `transfer-id` e manifest restano coerenti tra i tentativi
+- device nodes restano Unix-only
+- il receiver non fa traduzione automatica di nomi invalidi cross-OS; fallisce esplicitamente
+
+## Fase H - Lavoro futuro sensato
+
+La prossima fase non e piu "aggiungere resume", perche ormai c'e. Le evoluzioni sensate sono:
+
+### H1 - Scheduling e throughput
+
+- scheduler chunk piu sofisticato
+- bilanciamento migliore tra file grandi e molti file piccoli
+- benchmark comparativi relay/direct con varie combinazioni di `--parallel` e `--carriers`
+
+### H2 - Progress e osservabilita
+
+- progress piu ricco per chunk/file/throughput istantaneo
+- metriche di resume piu esplicite nei log
+- eventuale esposizione admin/telemetria del transfer
+
+### H3 - Hardening cross-platform
+
+- suite dedicata Windows/macOS in CI per casi path-edge
+- coverage piu ampia su collisioni e differenze di filesystem
+
+## Raccomandazione finale aggiornata
+
+La direzione architetturale si e rivelata corretta. Il progetto oggi ha una V2 coerente con il design di bore, a condizione di mantenere questi principi anche nelle prossime iterazioni:
 
 - riusare il trasporto secret esistente invece di reinventare UDP/relay
-- introdurre un protocollo applicativo di transfer, non uno stream opaco per tutti i casi
-- usare BLAKE3 e commit atomico/staging come fondamento della correttezza
-- trattare `stdin` come byte-stream identity, non come verifica semantica del producer
-- non promettere benefici dei carriers su un singolo file grosso senza chunking parallelo
-- tenere `fail` come default per collisioni e casi ambigui
-
-Se si segue questa linea, la V1 puo essere robusta, comprensibile e coerente con il design attuale del progetto.
+- tenere il protocollo di transfer esplicito e verificabile
+- mantenere staging + hash + commit come barriera di correttezza
+- trattare `stdin` come identita byte-stream, non come semantica del producer
+- distinguere chiaramente il valore dei carriers da quello del chunking parallelo
+- preferire failure esplicite a rinomini o adattamenti impliciti non richiesti

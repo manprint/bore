@@ -947,32 +947,50 @@ async fn receive_filesystem_streams(
         .context("filesystem transfer is missing resume state")?
         .clone();
     let mut workers = JoinSet::new();
-    let summary = loop {
-        tokio::select! {
-            maybe = incoming.recv() => {
-                let stream = maybe.context("worker channel closed before transfer summary")?;
-                let resume = resume.clone();
-                let progress = progress.clone();
-                workers.spawn(async move { handle_worker_connection(stream, resume, progress).await });
-            }
-            joined = workers.join_next(), if !workers.is_empty() => {
-                let joined = joined.context("worker join failed")?;
-                let joined = joined?;
-                joined?;
-            }
-            frame = expect_frame(control) => {
-                match frame? {
-                    Frame::TransferSummary(summary) => break summary,
-                    other => bail!("unexpected control frame while waiting for transfer summary: {other:?}"),
-                }
-            }
-        }
-    };
+    let expected_workers = expected_worker_connections(plan);
+
+    // `expect_frame(control)` is not cancellation-safe: if a `select!` branch drops it
+    // after the 4-byte length prefix was read, the next read starts at the JSON body.
+    // Accept worker streams first, then read the summary once all workers drained.
+    for _ in 0..expected_workers {
+        let stream = incoming
+            .recv()
+            .await
+            .context("worker channel closed before all worker streams connected")?;
+        let resume = resume.clone();
+        let progress = progress.clone();
+        workers.spawn(async move { handle_worker_connection(stream, resume, progress).await });
+    }
     while let Some(joined) = workers.join_next().await {
         let joined = joined.context("worker join failed")?;
         joined?;
     }
-    Ok(summary)
+    match expect_frame(control).await? {
+        Frame::TransferSummary(summary) => Ok(summary),
+        other => bail!("unexpected control frame while waiting for transfer summary: {other:?}"),
+    }
+}
+
+fn expected_worker_connections(plan: &ReceiverPlan) -> usize {
+    let completed: BTreeMap<u32, usize> = plan
+        .resume_plan
+        .iter()
+        .map(|entry| (entry.entry_id, entry.completed_chunks.len()))
+        .collect();
+    let pending_chunks = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.kind.is_regular_file())
+        .map(|entry| {
+            let done = completed.get(&entry.id).copied().unwrap_or_default() as u32;
+            entry.chunk_count.saturating_sub(done) as usize
+        })
+        .sum::<usize>();
+    if pending_chunks == 0 {
+        0
+    } else {
+        plan.begin.requested_parallel.clamp(1, MAX_PARALLEL) as usize
+    }
 }
 
 async fn handle_worker_connection(
@@ -2160,6 +2178,37 @@ fn is_safe_windows_component(text: &str) -> bool {
         && !text.chars().any(|ch| {
             matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || ch <= '\u{1F}'
         })
+        && !is_reserved_windows_component(text)
+}
+
+#[cfg(windows)]
+fn is_reserved_windows_component(text: &str) -> bool {
+    let stem = text.split('.').next().unwrap_or(text);
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 fn display_component(encoded: &str) -> String {
@@ -2602,5 +2651,61 @@ fn truncate_item(value: &str) -> String {
     } else {
         let prefix: String = value.chars().take(LIMIT - 3).collect();
         format!("{prefix}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_codec_round_trips_utf8_component() {
+        let original =
+            OsString::from("report-za\u{017c}\u{00f3}\u{0142}\u{0107}-\u{4f8b}\u{5b50}.txt");
+        let encoded = encode_component_os(original.as_os_str());
+
+        assert_eq!(decode_component(&encoded), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_codec_round_trips_unix_raw_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let original =
+            OsString::from_vec(vec![b'r', b'a', b'w', b'-', 0xff, b'.', b'b', b'i', b'n']);
+        let encoded = encode_component_os(OsStr::from_bytes(original.as_bytes()));
+
+        assert!(encoded.starts_with("b:"));
+        assert_eq!(decode_component(&encoded), original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_codec_sanitizes_windows_reserved_names() {
+        for reserved in ["CON", "con.txt", "PRN", "nul.log", "Com1", "lpt9.txt"] {
+            assert!(!is_safe_windows_component(reserved));
+
+            let encoded = format!("u:{}", hex::encode(reserved.as_bytes()));
+            let expected =
+                OsString::from(format!("_bore_utf8_{}", hex::encode(reserved.as_bytes())));
+            assert_eq!(decode_component(&encoded), expected);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_codec_round_trips_windows_wide_units() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let original = OsString::from_wide(&[0x0077, 0xD800, 0x0069, 0x0064, 0x0065]);
+        let encoded = encode_component_os(original.as_os_str());
+        let decoded = decode_component(&encoded);
+
+        assert!(encoded.starts_with("w:"));
+        assert_eq!(
+            decoded.encode_wide().collect::<Vec<_>>(),
+            original.encode_wide().collect::<Vec<_>>()
+        );
     }
 }

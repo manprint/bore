@@ -6,13 +6,15 @@ use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use bore_cli::{
     server::Server,
     shared::CONTROL_PORT,
     transfer::{CollisionPolicy, DeviceMode, ListenerOptions, SenderOptions, SymlinkMode},
+    transport,
 };
 use lazy_static::lazy_static;
+use rcgen::generate_simple_self_signed;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -23,6 +25,10 @@ use uuid::Uuid;
 lazy_static! {
     static ref SERIAL_GUARD: Mutex<()> = Mutex::new(());
 }
+
+const TEST_CHUNK_SIZE: usize = 256 * 1024;
+const TEST_MANIFEST_CHUNK: usize = 128;
+const TRANSFER_TLS_CONTROL_PORT: u16 = 17910;
 
 async fn wait_for_control_port(listening: bool) {
     for _ in 0..500 {
@@ -37,12 +43,26 @@ async fn wait_for_control_port(listening: bool) {
     }
 }
 
+async fn wait_port(port: u16, listening: bool) {
+    for _ in 0..500 {
+        if TcpStream::connect(("localhost", port)).await.is_ok() == listening {
+            return;
+        }
+        time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn spawn_server(udp: bool) {
     wait_for_control_port(false).await;
     let mut server = Server::new(1024..=65535, Some("transfer-secret"));
     server.set_udp(udp);
     tokio::spawn(server.listen());
     wait_for_control_port(true).await;
+}
+
+fn self_signed() -> Result<(String, String)> {
+    let key = generate_simple_self_signed(["localhost".to_string()])?;
+    Ok((key.cert.pem(), key.signing_key.serialize_pem()))
 }
 
 fn temp_path(label: &str) -> PathBuf {
@@ -71,6 +91,24 @@ fn listener_options(
     carriers: u16,
     stun_server: Option<String>,
 ) -> ListenerOptions {
+    listener_options_with_collision(
+        transfer_id,
+        dest_path,
+        relay_only,
+        carriers,
+        stun_server,
+        CollisionPolicy::Fail,
+    )
+}
+
+fn listener_options_with_collision(
+    transfer_id: String,
+    dest_path: PathBuf,
+    relay_only: bool,
+    carriers: u16,
+    stun_server: Option<String>,
+    collision: CollisionPolicy,
+) -> ListenerOptions {
     ListenerOptions {
         to: "localhost".to_string(),
         secret: Some("transfer-secret".to_string()),
@@ -84,7 +122,7 @@ fn listener_options(
         nat_udp_preferred_port: 0,
         nat_udp_release_timeout: 0,
         carriers,
-        collision: CollisionPolicy::Fail,
+        collision,
     }
 }
 
@@ -119,6 +157,28 @@ fn sender_options(
 
 fn patterned_bytes(size: usize) -> Vec<u8> {
     (0..size).map(|index| (index % 251) as u8).collect()
+}
+
+fn reserve_udp_port(exclude: Option<u16>) -> Result<u16> {
+    for _ in 0..32 {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let port = socket.local_addr()?.port();
+        if Some(port) != exclude {
+            return Ok(port);
+        }
+    }
+    bail!("failed to reserve a distinct UDP port")
+}
+
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|uid| uid.trim() == "0")
+        .unwrap_or(false)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -239,6 +299,315 @@ async fn transfer_zero_byte_file_over_relay() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_file_size_boundaries_over_relay() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    for (label, size) in [
+        ("one-byte", 1usize),
+        ("chunk-minus-one", TEST_CHUNK_SIZE - 1),
+        ("chunk-exact", TEST_CHUNK_SIZE),
+        ("chunk-plus-one", TEST_CHUNK_SIZE + 1),
+        ("chunk-multiple-exact", TEST_CHUNK_SIZE * 2),
+    ] {
+        let source_root = temp_path(&format!("{label}-source"));
+        let dest_root = temp_path(&format!("{label}-dest"));
+        fs::create_dir_all(&source_root).await?;
+        fs::create_dir_all(&dest_root).await?;
+        let source_file = source_root.join("payload.bin");
+        let payload = patterned_bytes(size);
+        write_file(&source_file, &payload).await?;
+
+        let transfer_id = format!("{label}-{}", Uuid::new_v4());
+        let listener = tokio::spawn({
+            let transfer_id = transfer_id.clone();
+            let dest_root = dest_root.clone();
+            async move {
+                bore_cli::transfer::run_listener(listener_options(
+                    transfer_id,
+                    dest_root,
+                    true,
+                    1,
+                    None,
+                ))
+                .await
+            }
+        });
+
+        time::sleep(Duration::from_millis(200)).await;
+        let sender = bore_cli::transfer::run_sender(sender_options(
+            transfer_id,
+            source_file,
+            None,
+            true,
+            1,
+            4,
+            None,
+        ))
+        .await?;
+        let listener = listener.await.context("listener task join failed")??;
+
+        assert!(
+            !sender.transport.direct_udp,
+            "unexpected direct UDP for {label}"
+        );
+        assert!(
+            !listener.transport.direct_udp,
+            "unexpected direct UDP for {label}"
+        );
+        assert_eq!(
+            read_file(&dest_root.join("payload.bin")).await?,
+            payload,
+            "payload mismatch for {label}"
+        );
+
+        let _ = fs::remove_dir_all(&source_root).await;
+        let _ = fs::remove_dir_all(&dest_root).await;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_manifest_spans_multiple_frames_over_relay() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_parent = temp_path("manifest-parent");
+    let source_root = source_parent.join("bundle");
+    let dest_root = temp_path("manifest-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+
+    for index in 0..=(TEST_MANIFEST_CHUNK + 1) {
+        let name = format!("file-{index:03}.bin");
+        write_file(&source_root.join(&name), &[index as u8]).await?;
+    }
+
+    let transfer_id = format!("manifest-dir-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                1,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    bore_cli::transfer::run_sender(sender_options(
+        transfer_id,
+        source_root.clone(),
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await?;
+    listener.await.context("listener task join failed")??;
+
+    for index in 0..=(TEST_MANIFEST_CHUNK + 1) {
+        let name = format!("file-{index:03}.bin");
+        assert_eq!(
+            read_file(&dest_root.join("bundle").join(&name)).await?,
+            vec![index as u8],
+            "manifest-chunked file missing or corrupted: {name}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&source_parent).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_fail_existing_file_over_relay() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("fail-existing-source");
+    let dest_root = temp_path("fail-existing-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+
+    let source_file = source_root.join("payload.txt");
+    write_file(&source_file, b"new payload").await?;
+    write_file(&dest_root.join("payload.txt"), b"old payload").await?;
+
+    let transfer_id = format!("fail-existing-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                1,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    let sender_err = bore_cli::transfer::run_sender(sender_options(
+        transfer_id,
+        source_file,
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await
+    .expect_err("transfer should fail when destination already exists");
+    assert!(
+        sender_err
+            .to_string()
+            .contains("destination already exists"),
+        "unexpected sender error: {sender_err}"
+    );
+    let listener_err = listener
+        .await
+        .context("listener task join failed")?
+        .expect_err("listener should reject an existing destination");
+    assert!(
+        listener_err
+            .to_string()
+            .contains("destination already exists"),
+        "unexpected listener error: {listener_err}"
+    );
+    assert_eq!(
+        read_file(&dest_root.join("payload.txt")).await?,
+        b"old payload"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_overwrite_existing_file_over_relay() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("overwrite-file-source");
+    let dest_root = temp_path("overwrite-file-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+
+    let source_file = source_root.join("payload.txt");
+    write_file(&source_file, b"new transfer payload").await?;
+    write_file(&dest_root.join("payload.txt"), b"old destination payload").await?;
+
+    let transfer_id = format!("overwrite-file-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options_with_collision(
+                transfer_id,
+                dest_root,
+                true,
+                1,
+                None,
+                CollisionPolicy::Overwrite,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    bore_cli::transfer::run_sender(sender_options(
+        transfer_id,
+        source_file,
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await?;
+    listener.await.context("listener task join failed")??;
+
+    assert_eq!(
+        read_file(&dest_root.join("payload.txt")).await?,
+        b"new transfer payload"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_rename_existing_file_over_relay() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("rename-file-source");
+    let dest_root = temp_path("rename-file-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+
+    let source_file = source_root.join("payload.txt");
+    write_file(&source_file, b"new renamed payload").await?;
+    write_file(&dest_root.join("payload.txt"), b"old destination payload").await?;
+
+    let transfer_id = format!("rename-file-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options_with_collision(
+                transfer_id,
+                dest_root,
+                true,
+                1,
+                None,
+                CollisionPolicy::Rename,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    bore_cli::transfer::run_sender(sender_options(
+        transfer_id,
+        source_file,
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await?;
+    listener.await.context("listener task join failed")??;
+
+    assert_eq!(
+        read_file(&dest_root.join("payload.txt")).await?,
+        b"old destination payload"
+    );
+    assert_eq!(
+        read_file(&dest_root.join("payload (1).txt")).await?,
+        b"new renamed payload"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfer_directory_preserves_structure() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
     spawn_server(false).await;
@@ -322,6 +691,178 @@ async fn transfer_directory_preserves_structure() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_directory_excludes_symlinks_when_requested() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_parent = temp_path("dir-exclude-parent");
+    let source_root = source_parent.join("tree");
+    let dest_root = temp_path("dir-exclude-dest");
+    fs::create_dir_all(source_root.join("nested")).await?;
+    fs::create_dir_all(&dest_root).await?;
+    write_file(&source_root.join("nested/data.bin"), b"nested-content").await?;
+    std::os::unix::fs::symlink("nested/data.bin", source_root.join("link.bin"))?;
+
+    let transfer_id = format!("relay-dir-exclude-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                1,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    let mut options = sender_options(transfer_id, source_root.clone(), None, true, 1, 0, None);
+    options.symlinks = SymlinkMode::Exclude;
+    bore_cli::transfer::run_sender(options).await?;
+    listener.await.context("listener task join failed")??;
+
+    assert_eq!(
+        read_file(&dest_root.join("tree/nested/data.bin")).await?,
+        b"nested-content"
+    );
+    assert!(!fs::try_exists(dest_root.join("tree/link.bin")).await?);
+
+    let _ = fs::remove_dir_all(&source_parent).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_root_symlink_is_rejected_when_symlinks_are_excluded() -> Result<()> {
+    let source_root = temp_path("root-symlink-source");
+    fs::create_dir_all(&source_root).await?;
+    write_file(&source_root.join("target.txt"), b"target").await?;
+    let source_link = source_root.join("target-link.txt");
+    std::os::unix::fs::symlink("target.txt", &source_link)?;
+
+    let transfer_id = format!("root-symlink-{}", Uuid::new_v4());
+    let sender_err = bore_cli::transfer::run_sender(sender_options(
+        transfer_id,
+        source_link,
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await
+    .expect_err("root symlink should be rejected when symlinks are excluded");
+    assert!(
+        sender_err
+            .to_string()
+            .contains("symlink but --symlinks=exclude"),
+        "unexpected sender error: {sender_err}"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_root_device_is_rejected_when_devices_are_excluded() -> Result<()> {
+    let transfer_id = format!("root-device-exclude-{}", Uuid::new_v4());
+    let sender_err = bore_cli::transfer::run_sender(sender_options(
+        transfer_id,
+        PathBuf::from("/dev/null"),
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await
+    .expect_err("root device should be rejected when devices are excluded");
+    assert!(
+        sender_err
+            .to_string()
+            .contains("device but --devices=exclude"),
+        "unexpected sender error: {sender_err}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_root_device_honors_devices_include_over_relay() -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let dest_root = temp_path("device-include-dest");
+    fs::create_dir_all(&dest_root).await?;
+    let transfer_id = format!("device-include-{}", Uuid::new_v4());
+
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                1,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    let mut options = sender_options(
+        transfer_id,
+        PathBuf::from("/dev/null"),
+        None,
+        true,
+        1,
+        0,
+        None,
+    );
+    options.devices = DeviceMode::Include;
+    let sender = bore_cli::transfer::run_sender(options).await;
+    let listener_result = listener.await.context("listener task join failed")?;
+
+    if running_as_root() {
+        let sender = sender?;
+        let listener = listener_result?;
+        assert!(!sender.transport.direct_udp);
+        assert!(!listener.transport.direct_udp);
+
+        let metadata = fs::metadata(dest_root.join("null")).await?;
+        assert!(
+            metadata.file_type().is_char_device(),
+            "expected a character device at the destination"
+        );
+    } else {
+        let sender_err = sender.expect_err("device include should fail without privileges");
+        let listener_err = listener_result.expect_err("listener should fail without privileges");
+        let combined = format!("{sender_err}\n{listener_err}");
+        assert!(
+            combined.contains("failed to create device")
+                || combined.contains("Operation not permitted")
+                || combined.contains("permission denied"),
+            "unexpected device-include failure: {combined}"
+        );
+        assert!(!fs::try_exists(dest_root.join("null")).await?);
+    }
+
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfer_large_file_parallel_over_relay() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
@@ -367,6 +908,60 @@ async fn transfer_large_file_parallel_over_relay() -> Result<()> {
     assert!(!sender.transport.direct_udp);
     assert!(!listener.transport.direct_udp);
     assert_eq!(read_file(&dest_root.join("large.bin")).await?, payload);
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_small_file_parallel_over_relay_when_workers_exceed_chunks() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("parallel-small-source");
+    let dest_root = temp_path("parallel-small-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let source_file = source_root.join("single-chunk.bin");
+    let payload = patterned_bytes(73_531);
+    write_file(&source_file, &payload).await?;
+
+    let transfer_id = format!("parallel-small-file-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                4,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    let sender = bore_cli::transfer::run_sender(sender_options(
+        transfer_id,
+        source_file,
+        None,
+        true,
+        4,
+        4,
+        None,
+    ))
+    .await?;
+    let listener = listener.await.context("listener task join failed")??;
+
+    assert!(!sender.transport.direct_udp);
+    assert!(!listener.transport.direct_udp);
+    assert_eq!(
+        read_file(&dest_root.join("single-chunk.bin")).await?,
+        payload
+    );
 
     let _ = fs::remove_dir_all(&source_root).await;
     let _ = fs::remove_dir_all(&dest_root).await;
@@ -458,6 +1053,108 @@ async fn transfer_resume_large_file_over_relay() -> Result<()> {
         .context("listener task join failed")??;
 
     assert_eq!(read_file(&dest_root.join("resume.bin")).await?, payload);
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_resume_rejects_changed_manifest_over_relay() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("resume-mismatch-source");
+    let dest_root = temp_path("resume-mismatch-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let source_file = source_root.join("resume.bin");
+    write_file(&source_file, &patterned_bytes(1_400_333)).await?;
+
+    let transfer_id = format!("resume-mismatch-{}", Uuid::new_v4());
+    let first_listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                4,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    std::env::set_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS", "2");
+    let interrupted = bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        source_file.clone(),
+        None,
+        true,
+        4,
+        4,
+        None,
+    ))
+    .await;
+    std::env::remove_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS");
+    assert!(
+        interrupted.is_err(),
+        "first sender run should be interrupted"
+    );
+    assert!(
+        first_listener
+            .await
+            .context("listener task join failed")?
+            .is_err(),
+        "first listener run should observe the interrupted transfer"
+    );
+
+    write_file(&source_file, &patterned_bytes(1_410_777)).await?;
+
+    let second_listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                4,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    let retry = bore_cli::transfer::run_sender(sender_options(
+        transfer_id,
+        source_file,
+        None,
+        true,
+        4,
+        4,
+        None,
+    ))
+    .await;
+    let retry_err = retry.expect_err("resume with a changed manifest should fail");
+    assert!(
+        retry_err
+            .to_string()
+            .contains("does not match the current manifest"),
+        "unexpected retry error: {retry_err}"
+    );
+    assert!(
+        second_listener
+            .await
+            .context("listener task join failed")?
+            .is_err(),
+        "second listener run should reject the changed manifest"
+    );
+    assert!(!fs::try_exists(dest_root.join("resume.bin")).await?);
 
     let _ = fs::remove_dir_all(&source_root).await;
     let _ = fs::remove_dir_all(&dest_root).await;
@@ -648,6 +1345,426 @@ async fn transfer_single_file_over_direct_udp() -> Result<()> {
         read_file(&dest_root.join("payload.txt")).await?,
         b"hello transfer over udp"
     );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_single_file_over_direct_udp_with_nat_flags_enabled() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+
+    let listener_udp_port = reserve_udp_port(None)?;
+    let sender_udp_port = reserve_udp_port(Some(listener_udp_port))?;
+    let source_root = temp_path("udp-nat-flags-source");
+    let dest_root = temp_path("udp-nat-flags-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let source_file = source_root.join("payload.txt");
+    write_file(&source_file, b"hello transfer with nat flags").await?;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+
+    let transfer_id = format!("udp-nat-flags-file-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        let stun_listener = stun.clone();
+        async move {
+            let mut options =
+                listener_options(transfer_id, dest_root, false, 1, Some(stun_listener));
+            options.upnp = true;
+            options.try_port_prediction = true;
+            options.nat_udp_preferred_port = listener_udp_port;
+            options.nat_udp_release_timeout = 1;
+            bore_cli::transfer::run_listener(options).await
+        }
+    });
+
+    time::sleep(Duration::from_millis(300)).await;
+    let mut options = sender_options(transfer_id, source_file, None, false, 1, 0, Some(stun));
+    options.upnp = true;
+    options.try_port_prediction = true;
+    options.nat_udp_preferred_port = sender_udp_port;
+    options.nat_udp_release_timeout = 1;
+    let sender = bore_cli::transfer::run_sender(options).await?;
+    let listener = listener.await.context("listener task join failed")??;
+
+    assert!(sender.transport.direct_udp);
+    assert!(listener.transport.direct_udp);
+    assert_eq!(
+        read_file(&dest_root.join("payload.txt")).await?,
+        b"hello transfer with nat flags"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_single_file_over_tls_control_with_insecure() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    wait_port(TRANSFER_TLS_CONTROL_PORT, false).await;
+
+    let (cert_pem, key_pem) = self_signed()?;
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+    let mut server = Server::new(1024..=65535, Some("transfer-secret"));
+    server.set_control_port(TRANSFER_TLS_CONTROL_PORT);
+    server.set_tls(acceptor);
+    tokio::spawn(server.listen());
+    wait_port(TRANSFER_TLS_CONTROL_PORT, true).await;
+
+    let source_root = temp_path("tls-source");
+    let dest_root = temp_path("tls-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let source_file = source_root.join("payload.txt");
+    write_file(&source_file, b"hello transfer over tls control").await?;
+    let to = format!("https://localhost:{TRANSFER_TLS_CONTROL_PORT}");
+
+    let transfer_id = format!("tls-file-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        let to = to.clone();
+        async move {
+            let mut options = listener_options(transfer_id, dest_root, true, 1, None);
+            options.to = to;
+            options.insecure = true;
+            bore_cli::transfer::run_listener(options).await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    let mut options = sender_options(transfer_id, source_file, None, true, 1, 0, None);
+    options.to = to;
+    options.insecure = true;
+    let sender = bore_cli::transfer::run_sender(options).await?;
+    let listener = listener.await.context("listener task join failed")??;
+
+    assert!(!sender.transport.direct_udp);
+    assert!(sender.transport.relay_tls);
+    assert!(!listener.transport.direct_udp);
+    assert!(listener.transport.relay_tls);
+    assert_eq!(
+        read_file(&dest_root.join("payload.txt")).await?,
+        b"hello transfer over tls control"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_single_file_falls_back_to_relay_when_listener_disables_direct_udp() -> Result<()>
+{
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+
+    let source_root = temp_path("udp-fallback-source");
+    let dest_root = temp_path("udp-fallback-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let source_file = source_root.join("payload.txt");
+    write_file(&source_file, b"hello transfer fallback").await?;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+
+    let transfer_id = format!("udp-fallback-file-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                1,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(300)).await;
+    let sender = bore_cli::transfer::run_sender(sender_options(
+        transfer_id,
+        source_file,
+        None,
+        false,
+        1,
+        0,
+        Some(stun),
+    ))
+    .await?;
+    let listener = listener.await.context("listener task join failed")??;
+
+    assert!(
+        !sender.transport.direct_udp,
+        "sender should fall back to relay when UDP is unavailable"
+    );
+    assert!(
+        !listener.transport.direct_udp,
+        "listener should report relay fallback when UDP is unavailable"
+    );
+    assert_eq!(
+        read_file(&dest_root.join("payload.txt")).await?,
+        b"hello transfer fallback"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_single_file_falls_back_to_relay_with_nat_flags_enabled() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+
+    let sender_udp_port = reserve_udp_port(None)?;
+    let source_root = temp_path("udp-nat-fallback-source");
+    let dest_root = temp_path("udp-nat-fallback-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let source_file = source_root.join("payload.txt");
+    write_file(&source_file, b"hello transfer nat fallback").await?;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+
+    let transfer_id = format!("udp-nat-fallback-file-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                1,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(300)).await;
+    let mut options = sender_options(transfer_id, source_file, None, false, 1, 0, Some(stun));
+    options.upnp = true;
+    options.try_port_prediction = true;
+    options.nat_udp_preferred_port = sender_udp_port;
+    options.nat_udp_release_timeout = 1;
+    let sender = bore_cli::transfer::run_sender(options).await?;
+    let listener = listener.await.context("listener task join failed")??;
+
+    assert!(!sender.transport.direct_udp);
+    assert!(!listener.transport.direct_udp);
+    assert_eq!(
+        read_file(&dest_root.join("payload.txt")).await?,
+        b"hello transfer nat fallback"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_resume_large_file_over_direct_udp() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+
+    let source_root = temp_path("resume-udp-source");
+    let dest_root = temp_path("resume-udp-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let source_file = source_root.join("resume.bin");
+    let payload = patterned_bytes(2_100_777);
+    write_file(&source_file, &payload).await?;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+
+    let transfer_id = format!("resume-udp-file-{}", Uuid::new_v4());
+    let first_listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        let stun_listener = stun.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                false,
+                1,
+                Some(stun_listener),
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(300)).await;
+    std::env::set_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS", "2");
+    let interrupted = bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        source_file.clone(),
+        None,
+        false,
+        1,
+        4,
+        Some(stun.clone()),
+    ))
+    .await;
+    std::env::remove_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS");
+    assert!(
+        interrupted.is_err(),
+        "first sender run should be interrupted"
+    );
+    assert!(
+        first_listener
+            .await
+            .context("listener task join failed")?
+            .is_err(),
+        "first listener run should observe the interrupted transfer"
+    );
+
+    let second_listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        let stun_listener = stun.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                false,
+                1,
+                Some(stun_listener),
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(300)).await;
+    let sender = bore_cli::transfer::run_sender(sender_options(
+        transfer_id,
+        source_file,
+        None,
+        false,
+        1,
+        4,
+        Some(stun),
+    ))
+    .await?;
+    let listener = second_listener
+        .await
+        .context("listener task join failed")??;
+
+    assert!(sender.transport.direct_udp);
+    assert!(listener.transport.direct_udp);
+    assert_eq!(read_file(&dest_root.join("resume.bin")).await?, payload);
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_resume_large_file_over_udp_request_fallback_relay() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+
+    let source_root = temp_path("resume-fallback-source");
+    let dest_root = temp_path("resume-fallback-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let source_file = source_root.join("resume.bin");
+    let payload = patterned_bytes(2_100_777);
+    write_file(&source_file, &payload).await?;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+
+    let transfer_id = format!("resume-fallback-file-{}", Uuid::new_v4());
+    let first_listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                4,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(300)).await;
+    std::env::set_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS", "2");
+    let interrupted = bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        source_file.clone(),
+        None,
+        false,
+        4,
+        4,
+        Some(stun.clone()),
+    ))
+    .await;
+    std::env::remove_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS");
+    assert!(
+        interrupted.is_err(),
+        "first sender run should be interrupted"
+    );
+    assert!(
+        first_listener
+            .await
+            .context("listener task join failed")?
+            .is_err(),
+        "first listener run should observe the interrupted transfer"
+    );
+
+    let second_listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                4,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(300)).await;
+    let sender = bore_cli::transfer::run_sender(sender_options(
+        transfer_id,
+        source_file,
+        None,
+        false,
+        4,
+        4,
+        Some(stun),
+    ))
+    .await?;
+    let listener = second_listener
+        .await
+        .context("listener task join failed")??;
+
+    assert!(
+        !sender.transport.direct_udp,
+        "sender should resume over relay fallback when direct UDP is unavailable"
+    );
+    assert!(
+        !listener.transport.direct_udp,
+        "listener should report relay fallback during resumed transfer"
+    );
+    assert_eq!(read_file(&dest_root.join("resume.bin")).await?, payload);
 
     let _ = fs::remove_dir_all(&source_root).await;
     let _ = fs::remove_dir_all(&dest_root).await;

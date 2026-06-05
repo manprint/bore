@@ -25,6 +25,37 @@ jobs:
       - run: cargo build --all-features
       - run: cargo test --all-features
 
+  transfer-paths:
+    name: Transfer path edges (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Transfer path codec unit tests
+        run: cargo test --all-features --lib path_codec_
+
+      - name: macOS transfer path integration tests
+        if: runner.os == 'macOS'
+        run: |
+          cargo test --all-features --test transfer_test transfer_non_utf8_
+          cargo test --all-features --test transfer_stdin_cli_test transfer_stdin_non_utf8_output_name_over_relay_cli
+
+      - name: Windows transfer path integration tests
+        if: runner.os == 'Windows'
+        run: |
+          cargo test --all-features --test transfer_stdin_cli_test transfer_stdin_reserved_windows_output_name_over_relay_cli
+          cargo test --all-features --test transfer_stdin_cli_test transfer_stdin_invalid_windows_char_output_name_over_relay_cli
+
   audit:
     name: Security audit
     runs-on: ubuntu-latest

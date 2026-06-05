@@ -611,8 +611,10 @@ enum TransferCommand {
         #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
         carriers: u16,
 
-        /// Number of parallel file workers for chunked filesystem transfers.
-        /// 0 = automatic (carrier-aware default). Stdin always uses a single stream.
+        /// Number of parallel data streams for chunked filesystem transfers.
+        /// Each stream maps to one QUIC bidi (direct path) or one yamux substream
+        /// (relay). 0 = automatic (cpu-count, min 4). On the relay path, matching
+        /// --carriers to --parallel avoids HOL blocking. Stdin always uses one stream.
         #[clap(long, value_name = "N", default_value_t = 0)]
         parallel: u16,
 

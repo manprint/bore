@@ -26,7 +26,7 @@ lazy_static! {
     static ref SERIAL_GUARD: Mutex<()> = Mutex::new(());
 }
 
-const TEST_CHUNK_SIZE: usize = 256 * 1024;
+const TEST_CHUNK_SIZE: usize = 1024 * 1024;
 const TEST_MANIFEST_CHUNK: usize = 128;
 const TRANSFER_TLS_CONTROL_PORT: u16 = 17910;
 
@@ -998,7 +998,7 @@ async fn transfer_resume_large_file_over_relay() -> Result<()> {
     });
 
     time::sleep(Duration::from_millis(200)).await;
-    std::env::set_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS", "2");
+    std::env::set_var("BORE_TRANSFER_TEST_MAX_CHUNKS", "2");
     let interrupted = bore_cli::transfer::run_sender(sender_options(
         transfer_id.clone(),
         source_file.clone(),
@@ -1009,7 +1009,7 @@ async fn transfer_resume_large_file_over_relay() -> Result<()> {
         None,
     ))
     .await;
-    std::env::remove_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS");
+    std::env::remove_var("BORE_TRANSFER_TEST_MAX_CHUNKS");
     assert!(
         interrupted.is_err(),
         "first sender run should be interrupted"
@@ -1088,7 +1088,7 @@ async fn transfer_resume_rejects_changed_manifest_over_relay() -> Result<()> {
     });
 
     time::sleep(Duration::from_millis(200)).await;
-    std::env::set_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS", "2");
+    std::env::set_var("BORE_TRANSFER_TEST_MAX_CHUNKS", "2");
     let interrupted = bore_cli::transfer::run_sender(sender_options(
         transfer_id.clone(),
         source_file.clone(),
@@ -1099,7 +1099,7 @@ async fn transfer_resume_rejects_changed_manifest_over_relay() -> Result<()> {
         None,
     ))
     .await;
-    std::env::remove_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS");
+    std::env::remove_var("BORE_TRANSFER_TEST_MAX_CHUNKS");
     assert!(
         interrupted.is_err(),
         "first sender run should be interrupted"
@@ -1606,7 +1606,7 @@ async fn transfer_resume_large_file_over_direct_udp() -> Result<()> {
     });
 
     time::sleep(Duration::from_millis(300)).await;
-    std::env::set_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS", "2");
+    std::env::set_var("BORE_TRANSFER_TEST_MAX_CHUNKS", "2");
     let interrupted = bore_cli::transfer::run_sender(sender_options(
         transfer_id.clone(),
         source_file.clone(),
@@ -1617,7 +1617,7 @@ async fn transfer_resume_large_file_over_direct_udp() -> Result<()> {
         Some(stun.clone()),
     ))
     .await;
-    std::env::remove_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS");
+    std::env::remove_var("BORE_TRANSFER_TEST_MAX_CHUNKS");
     assert!(
         interrupted.is_err(),
         "first sender run should be interrupted"
@@ -1702,7 +1702,7 @@ async fn transfer_resume_large_file_over_udp_request_fallback_relay() -> Result<
     });
 
     time::sleep(Duration::from_millis(300)).await;
-    std::env::set_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS", "2");
+    std::env::set_var("BORE_TRANSFER_TEST_MAX_CHUNKS", "2");
     let interrupted = bore_cli::transfer::run_sender(sender_options(
         transfer_id.clone(),
         source_file.clone(),
@@ -1713,7 +1713,7 @@ async fn transfer_resume_large_file_over_udp_request_fallback_relay() -> Result<
         Some(stun.clone()),
     ))
     .await;
-    std::env::remove_var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS");
+    std::env::remove_var("BORE_TRANSFER_TEST_MAX_CHUNKS");
     assert!(
         interrupted.is_err(),
         "first sender run should be interrupted"

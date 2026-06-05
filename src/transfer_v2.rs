@@ -2,10 +2,10 @@
 
 #![allow(missing_docs)]
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::{self as std_io, ErrorKind, IsTerminal, Read, Write};
+use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::fs::{self, File};
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::task::{spawn_blocking, JoinHandle, JoinSet};
@@ -26,12 +26,11 @@ use crate::secret::Proxy;
 use crate::server::DEFAULT_MAX_CONNS;
 use crate::transport::Endpoint;
 
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 const FRAME_LIMIT: usize = 16 * 1024 * 1024;
 const MANIFEST_CHUNK: usize = 128;
 const COPY_BUFFER: usize = 64 * 1024;
-const CHUNK_SIZE: u32 = 256 * 1024;
-const DEFAULT_PARALLEL: u16 = 4;
+const CHUNK_SIZE: u32 = 1024 * 1024;
 const MAX_PARALLEL: u16 = 32;
 const RESUME_FLUSH_EVERY_CHUNKS: u64 = 8;
 const LOCAL_BIND: &str = "127.0.0.1:0";
@@ -263,6 +262,7 @@ enum Frame {
         transfer_id: String,
     },
     WorkerDone,
+    WorkerComplete,
     ChunkStart {
         entry_id: u32,
         chunk_index: u32,
@@ -353,6 +353,7 @@ struct ResumeRuntime {
     state: ResumeState,
     dirty_paths: BTreeSet<PathBuf>,
     pending_persist: u64,
+    fresh_chunks: BTreeMap<u32, u32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -598,6 +599,13 @@ pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
         requested_parallel = plan.parallel,
         "transfer sender transport ready"
     );
+    if !transport.direct_udp && plan.parallel > options.carriers.max(1) {
+        warn!(
+            parallel = plan.parallel,
+            carriers = options.carriers,
+            "parallel workers exceed carrier connections; relay path may have HOL blocking — consider matching --carriers to --parallel"
+        );
+    }
 
     let local_addr = proxy.local_addr()?;
     let proxy_task = tokio::spawn(proxy.listen());
@@ -713,7 +721,7 @@ async fn send_chunked_files(
     progress: ProgressHandle,
 ) -> Result<()> {
     let injected_limit = injected_fail_after_chunks();
-    let acked = Arc::new(AtomicU64::new(0));
+    let sent = Arc::new(AtomicU64::new(0));
     let queue = Arc::new(AsyncMutex::new(VecDeque::from(tasks)));
     let mut joins = JoinSet::new();
     let workers = parallel.clamp(1, MAX_PARALLEL) as usize;
@@ -722,7 +730,7 @@ async fn send_chunked_files(
         let queue = Arc::clone(&queue);
         let transfer_id = transfer_id.to_string();
         let progress = progress.clone();
-        let acked = Arc::clone(&acked);
+        let sent = Arc::clone(&sent);
         joins.spawn(async move {
             let mut stream = connect_local(local_addr).await?;
             send_frame(
@@ -734,6 +742,7 @@ async fn send_chunked_files(
             .await?;
             progress.worker_started();
             let worker_result = async {
+                let mut file_cache: HashMap<PathBuf, tokio::fs::File> = HashMap::new();
                 loop {
                     let task = {
                         let mut guard = queue.lock().await;
@@ -744,7 +753,20 @@ async fn send_chunked_files(
                         break Ok::<(), anyhow::Error>(());
                     };
                     progress.set_current(display_rel_path(&task.rel_path));
-                    let chunk = read_chunk_from_file(&task.path, task.offset, task.len).await?;
+                    let chunk = {
+                        let file = if let Some(f) = file_cache.get_mut(&task.path) {
+                            f
+                        } else {
+                            let f = tokio::fs::File::open(&task.path).await.with_context(|| {
+                                format!("failed to open source file {}", task.path.display())
+                            })?;
+                            file_cache.entry(task.path.clone()).or_insert(f)
+                        };
+                        file.seek(std::io::SeekFrom::Start(task.offset)).await?;
+                        let mut buf = vec![0u8; task.len as usize];
+                        file.read_exact(&mut buf).await?;
+                        buf
+                    };
                     let digest = blake3::hash(&chunk).to_hex().to_string();
                     send_frame(
                         &mut stream,
@@ -758,35 +780,31 @@ async fn send_chunked_files(
                     )
                     .await?;
                     stream.write_all(&chunk).await?;
-                    match expect_frame(&mut stream).await? {
-                        Frame::ChunkAck {
-                            entry_id,
-                            chunk_index,
-                        } => {
-                            if entry_id != task.entry_id || chunk_index != task.chunk_index {
-                                bail!(
-                                    "chunk ack mismatch: expected entry {} chunk {}, got entry {} chunk {}",
-                                    task.entry_id,
-                                    task.chunk_index,
-                                    entry_id,
-                                    chunk_index
-                                );
-                            }
-                            progress.add_bytes(task.len as u64);
-                            let count = acked.fetch_add(1, Ordering::Relaxed) + 1;
-                            if let Some(limit) = injected_limit {
-                                if count >= limit {
-                                    bail!(
-                                        "forced transfer interruption after {limit} acknowledged chunks"
-                                    );
-                                }
-                            }
+                    progress.add_bytes(task.len as u64);
+                    let count = sent.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(limit) = injected_limit {
+                        if count >= limit {
+                            bail!("forced transfer interruption after {limit} chunks sent");
                         }
-                        other => bail!("unexpected worker reply: {other:?}"),
                     }
                 }
             }
             .await;
+            // Read terminal frame from receiver (WorkerComplete or Error)
+            if worker_result.is_ok() {
+                let terminal = async {
+                    match expect_frame(&mut stream).await? {
+                        Frame::WorkerComplete => Ok(()),
+                        Frame::Error { message } => {
+                            bail!("receiver worker reported error: {message}")
+                        }
+                        other => bail!("unexpected terminal worker frame: {other:?}"),
+                    }
+                }
+                .await;
+                progress.worker_finished();
+                return terminal;
+            }
             progress.worker_finished();
             if let Err(err) = &worker_result {
                 warn!(%err, "transfer worker failed");
@@ -1016,6 +1034,7 @@ async fn handle_worker_connection(
         other => bail!("unexpected first worker frame: {other:?}"),
     }
     progress.worker_started();
+    let mut file_cache: HashMap<u32, tokio::fs::File> = HashMap::new();
     let worker_result = async {
         loop {
             match recv_frame(&mut stream).await? {
@@ -1046,29 +1065,34 @@ async fn handle_worker_connection(
                     }
                     if !resume.is_chunk_complete(entry_id, chunk_index).await? {
                         let path = stage_path(&resume.stage_root, &entry.rel_path)?;
-                        write_chunk_to_file(
-                            &path,
-                            offset,
-                            &payload,
-                            entry.size.context("regular file missing size")?,
-                        )
-                        .await?;
+                        let file = if let Some(f) = file_cache.get_mut(&entry_id) {
+                            f
+                        } else {
+                            let f = tokio::fs::OpenOptions::new()
+                                .create(false)
+                                .truncate(false)
+                                .write(true)
+                                .open(&path)
+                                .await
+                                .with_context(|| {
+                                    format!("failed to open staged file {}", path.display())
+                                })?;
+                            file_cache.entry(entry_id).or_insert(f)
+                        };
+                        file.seek(std::io::SeekFrom::Start(offset)).await?;
+                        file.write_all(&payload).await?;
                         resume
                             .mark_chunk_complete(entry_id, chunk_index, &path)
                             .await?;
                     }
                     progress.set_current(display_rel_path(&entry.rel_path));
                     progress.add_bytes(len as u64);
-                    send_frame(
-                        &mut stream,
-                        &Frame::ChunkAck {
-                            entry_id,
-                            chunk_index,
-                        },
-                    )
-                    .await?;
                 }
-                Some(Frame::WorkerDone) => break Ok::<(), anyhow::Error>(()),
+                Some(Frame::WorkerDone) => {
+                    resume.flush_pending().await?;
+                    send_frame(&mut stream, &Frame::WorkerComplete).await?;
+                    break Ok::<(), anyhow::Error>(());
+                }
                 Some(Frame::Error { message }) => bail!("sender worker aborted: {message}"),
                 Some(other) => bail!("unexpected worker frame: {other:?}"),
                 None => break Ok(()),
@@ -1076,6 +1100,7 @@ async fn handle_worker_connection(
         }
     }
     .await;
+    // Ensure partial progress is persisted even on error/EOF paths
     let flush_result = resume.flush_pending().await;
     if let Err(err) = &worker_result {
         let _ = send_frame(
@@ -1267,6 +1292,7 @@ async fn receive_manifest(
             state,
             dirty_paths: BTreeSet::new(),
             pending_persist: 0,
+            fresh_chunks: BTreeMap::new(),
         })),
         persist_lock: Arc::new(AsyncMutex::new(())),
     });
@@ -1481,6 +1507,13 @@ async fn verify_summary(plan: &ReceiverPlan) -> Result<TransferSummary> {
                 .full_hash
                 .as_deref()
                 .context("regular file manifest is missing its hash")?;
+            // Skip full re-hash when all chunks were hash-verified during this run.
+            // Per-chunk blake3 verification already proves file content; re-reading
+            // the staged file would just double the I/O cost with no integrity gain.
+            if resume.all_chunks_fresh(entry.id, entry.chunk_count).await {
+                continue;
+            }
+            // Some chunks came from resume state (not verified this run) — re-hash.
             let actual = hash_file_async(&stage_path(&plan.stage_root, &entry.rel_path)?).await?;
             if expected != actual {
                 resume.reset_file(entry.id).await?;
@@ -1540,7 +1573,10 @@ async fn commit_stage(plan: &ReceiverPlan, collision: CollisionPolicy) -> Result
 
 async fn plan_transfer(transfer_id: String, options: &SenderOptions) -> Result<PlannedTransfer> {
     let parallel = if options.parallel == 0 {
-        options.carriers.clamp(1, DEFAULT_PARALLEL)
+        let cpu_count = std::thread::available_parallelism()
+            .map(|n| n.get() as u16)
+            .unwrap_or(4);
+        cpu_count.clamp(4, MAX_PARALLEL)
     } else {
         options.parallel.clamp(1, MAX_PARALLEL)
     };
@@ -1903,6 +1939,7 @@ impl ResumeShared {
                     )
                 })?;
             *slot = true;
+            *runtime.fresh_chunks.entry(entry_id).or_default() += 1;
             runtime.dirty_paths.insert(path.to_path_buf());
             runtime.pending_persist += 1;
             runtime.pending_persist >= RESUME_FLUSH_EVERY_CHUNKS
@@ -1934,6 +1971,11 @@ impl ResumeShared {
             persist_resume_state(&self.state_file, &state).await?;
         }
         Ok(())
+    }
+
+    async fn all_chunks_fresh(&self, entry_id: u32, chunk_count: u32) -> bool {
+        let runtime = self.runtime.lock().await;
+        runtime.fresh_chunks.get(&entry_id).copied().unwrap_or(0) >= chunk_count
     }
 
     async fn all_chunks_complete(&self, entry_id: u32) -> Result<bool> {
@@ -2372,41 +2414,6 @@ fn chunk_len(size: u64, chunk_index: u32) -> u64 {
     size.saturating_sub(offset).min(CHUNK_SIZE as u64)
 }
 
-async fn read_chunk_from_file(path: &Path, offset: u64, len: u32) -> Result<Vec<u8>> {
-    let path = path.to_path_buf();
-    spawn_blocking(move || {
-        let file = std::fs::File::open(&path)
-            .with_context(|| format!("failed to open source file {}", path.display()))?;
-        let mut buf = vec![0u8; len as usize];
-        read_exact_at(&file, offset, &mut buf)
-            .with_context(|| format!("failed to read chunk from {}", path.display()))?;
-        Ok::<Vec<u8>, anyhow::Error>(buf)
-    })
-    .await
-    .context("chunk read task failed")?
-}
-
-async fn write_chunk_to_file(path: &Path, offset: u64, payload: &[u8], size: u64) -> Result<()> {
-    let path = path.to_path_buf();
-    let payload = payload.to_vec();
-    spawn_blocking(move || {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("failed to open staged file {}", path.display()))?;
-        file.set_len(size)
-            .with_context(|| format!("failed to size staged file {}", path.display()))?;
-        write_all_at(&file, offset, &payload)
-            .with_context(|| format!("failed to write chunk into {}", path.display()))?;
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("chunk write task failed")?
-}
-
 async fn sync_staged_files(paths: &[PathBuf]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
@@ -2452,90 +2459,6 @@ fn hash_file_sync(path: &Path) -> Result<String> {
         hasher.update(&buf[..read]);
     }
     Ok(hasher.finalize().to_hex().to_string())
-}
-
-#[cfg(unix)]
-fn read_exact_at(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> std_io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    let mut read = 0usize;
-    while read < buf.len() {
-        let count = file.read_at(&mut buf[read..], offset + read as u64)?;
-        if count == 0 {
-            return Err(std_io::Error::new(
-                ErrorKind::UnexpectedEof,
-                "unexpected EOF while reading at offset",
-            ));
-        }
-        read += count;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn read_exact_at(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> std_io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    let mut read = 0usize;
-    while read < buf.len() {
-        let count = file.seek_read(&mut buf[read..], offset + read as u64)?;
-        if count == 0 {
-            return Err(std_io::Error::new(
-                ErrorKind::UnexpectedEof,
-                "unexpected EOF while reading at offset",
-            ));
-        }
-        read += count;
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn read_exact_at(_file: &std::fs::File, _offset: u64, _buf: &mut [u8]) -> std_io::Result<()> {
-    Err(std_io::Error::new(
-        ErrorKind::Unsupported,
-        "random-access reads are unsupported on this platform",
-    ))
-}
-
-#[cfg(unix)]
-fn write_all_at(file: &std::fs::File, offset: u64, buf: &[u8]) -> std_io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    let mut written = 0usize;
-    while written < buf.len() {
-        let count = file.write_at(&buf[written..], offset + written as u64)?;
-        if count == 0 {
-            return Err(std_io::Error::new(
-                ErrorKind::WriteZero,
-                "failed to write chunk at offset",
-            ));
-        }
-        written += count;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn write_all_at(file: &std::fs::File, offset: u64, buf: &[u8]) -> std_io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    let mut written = 0usize;
-    while written < buf.len() {
-        let count = file.seek_write(&buf[written..], offset + written as u64)?;
-        if count == 0 {
-            return Err(std_io::Error::new(
-                ErrorKind::WriteZero,
-                "failed to write chunk at offset",
-            ));
-        }
-        written += count;
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn write_all_at(_file: &std::fs::File, _offset: u64, _buf: &[u8]) -> std_io::Result<()> {
-    Err(std_io::Error::new(
-        ErrorKind::Unsupported,
-        "random-access writes are unsupported on this platform",
-    ))
 }
 
 async fn path_exists(path: &Path) -> Result<bool> {
@@ -2662,7 +2585,7 @@ async fn create_device(entry: &ManifestEntry, path: &Path) -> Result<()> {
 }
 
 fn injected_fail_after_chunks() -> Option<u64> {
-    std::env::var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS")
+    std::env::var("BORE_TRANSFER_TEST_MAX_CHUNKS")
         .ok()
         .and_then(|value| value.parse().ok())
 }

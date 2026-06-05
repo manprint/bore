@@ -386,6 +386,7 @@ struct ProgressShared {
     workers: AtomicU64,
     current: StdMutex<String>,
     finished: AtomicBool,
+    started_at: Instant,
 }
 
 impl ProgressTracker {
@@ -401,19 +402,19 @@ impl ProgressTracker {
             workers: AtomicU64::new(0),
             current: StdMutex::new(String::new()),
             finished: AtomicBool::new(false),
+            started_at: Instant::now(),
         });
         let task_shared = Arc::clone(&shared);
         let task = tokio::spawn(async move {
             if !task_shared.enabled {
                 return;
             }
-            let started = Instant::now();
             let mut interval = tokio::time::interval(PROGRESS_TICK);
             loop {
                 interval.tick().await;
-                render_progress(&task_shared, started.elapsed(), false);
+                render_progress(&task_shared, task_shared.started_at.elapsed(), false);
                 if task_shared.finished.load(Ordering::Relaxed) {
-                    render_progress(&task_shared, started.elapsed(), true);
+                    render_progress(&task_shared, task_shared.started_at.elapsed(), true);
                     break;
                 }
             }
@@ -430,11 +431,13 @@ impl ProgressTracker {
         }
     }
 
-    async fn finish(mut self) {
+    async fn finish(mut self) -> Duration {
+        let elapsed = self.shared.started_at.elapsed();
         self.shared.finished.store(true, Ordering::Relaxed);
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
+        elapsed
     }
 }
 
@@ -459,6 +462,10 @@ impl ProgressHandle {
 
     fn worker_finished(&self) {
         self.shared.workers.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn add_file(&self) {
+        self.shared.files_done.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -545,6 +552,8 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
 
     let outcome =
         receive_transfer(control, &mut conn_rx, options.dest_path, options.collision).await;
+    // Allow tunnel relay to drain before aborting — prevents spurious "channel closed" warnings
+    tokio::time::sleep(Duration::from_millis(50)).await;
     provider_task.abort();
     accept_task.abort();
     let _ = provider_task.await;
@@ -614,6 +623,8 @@ pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
         send_transfer(control, local_addr, plan, transport).await
     }
     .await;
+    // Allow tunnel relay to drain before aborting — prevents spurious "channel closed" warnings
+    tokio::time::sleep(Duration::from_millis(50)).await;
     proxy_task.abort();
     let _ = proxy_task.await;
     outcome
@@ -630,8 +641,10 @@ async fn send_transfer(
         .iter()
         .filter(|entry| entry.manifest.kind.is_regular_file())
         .count() as u64;
+    let root_name_display = display_component(&plan.root_name);
     let progress = ProgressTracker::new("sender", plan.total_bytes, regular_files_total);
     let handle = progress.handle();
+    handle.set_current(root_name_display.clone());
 
     send_frame(
         &mut control,
@@ -703,7 +716,15 @@ async fn send_transfer(
         bail!("receiver acknowledged a different transfer hash");
     }
 
-    progress.finish().await;
+    let elapsed = progress.finish().await;
+    print_transfer_done(
+        "sender",
+        &root_name_display,
+        completed.total_bytes,
+        elapsed,
+        None,
+    );
+    let _ = control.shutdown().await;
     Ok(TransferOutcome {
         transfer_id: plan.transfer_id,
         final_path: decode_native_path(&completed.final_path),
@@ -752,7 +773,12 @@ async fn send_chunked_files(
                         send_frame(&mut stream, &Frame::WorkerDone).await?;
                         break Ok::<(), anyhow::Error>(());
                     };
-                    progress.set_current(display_rel_path(&task.rel_path));
+                    if task.chunk_index == 0 {
+                        progress.add_file();
+                    }
+                    if !task.rel_path.is_empty() {
+                        progress.set_current(display_rel_path(&task.rel_path));
+                    }
                     let chunk = {
                         let file = if let Some(f) = file_cache.get_mut(&task.path) {
                             f
@@ -916,6 +942,7 @@ async fn receive_transfer(
         let progress = ProgressTracker::new("listener", plan.begin.total_bytes, total_files);
         let handle = progress.handle();
         handle.add_resumed_bytes(plan.resumed_bytes);
+        handle.set_current(display_component(&plan.final_name));
 
         let sender_summary = if plan.begin.root_source == RootSourceKind::Stdin {
             receive_stdin_stream(&mut control, &plan, &handle).await?
@@ -938,7 +965,20 @@ async fn receive_transfer(
             }),
         )
         .await?;
-        progress.finish().await;
+        let elapsed = progress.finish().await;
+        let dest_name = plan
+            .final_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| plan.final_path.to_string_lossy().to_string());
+        print_transfer_done(
+            "listener",
+            &dest_name,
+            local_summary.total_bytes,
+            elapsed,
+            Some(&plan.final_path),
+        );
+        let _ = control.shutdown().await;
 
         Ok(TransferOutcome {
             transfer_id: plan.begin.transfer_id,
@@ -1085,7 +1125,12 @@ async fn handle_worker_connection(
                             .mark_chunk_complete(entry_id, chunk_index, &path)
                             .await?;
                     }
-                    progress.set_current(display_rel_path(&entry.rel_path));
+                    if chunk_index == 0 {
+                        progress.add_file();
+                    }
+                    if !entry.rel_path.is_empty() {
+                        progress.set_current(display_rel_path(&entry.rel_path));
+                    }
                     progress.add_bytes(len as u64);
                 }
                 Some(Frame::WorkerDone) => {
@@ -2609,13 +2654,13 @@ fn render_progress(shared: &ProgressShared, elapsed: Duration, done: bool) {
     if !shared.enabled {
         return;
     }
-    let elapsed = elapsed.as_secs_f64().max(0.001);
+    let elapsed_secs = elapsed.as_secs_f64().max(0.001);
     let current = shared.current.lock().expect("progress mutex").clone();
     let bytes = shared.bytes_done.load(Ordering::Relaxed);
     let resumed = shared.resumed_bytes.load(Ordering::Relaxed);
     let files = shared.files_done.load(Ordering::Relaxed);
     let workers = shared.workers.load(Ordering::Relaxed);
-    let speed = human_bytes((bytes as f64 / elapsed) as u64);
+    let speed = human_bytes((bytes as f64 / elapsed_secs) as u64);
     let ratio = match shared.total_bytes {
         Some(total) if total > 0 => format!(
             " {}/{} {:>5.1}%",
@@ -2626,32 +2671,32 @@ fn render_progress(shared: &ProgressShared, elapsed: Duration, done: bool) {
         Some(total) => format!(" {}/{}", human_bytes(bytes + resumed), human_bytes(total)),
         None => format!(" {}", human_bytes(bytes)),
     };
-    let files = if shared.total_files > 0 {
+    let files_str = if shared.total_files > 0 {
         format!(" files {files}/{}", shared.total_files)
     } else {
         String::new()
     };
-    let resumed = if resumed > 0 {
+    let resumed_str = if resumed > 0 {
         format!(" resumed {}", human_bytes(resumed))
     } else {
         String::new()
     };
-    let workers = if workers > 0 {
+    let workers_str = if workers > 0 {
         format!(" workers {workers}")
     } else {
         String::new()
     };
+    // Show current file name only during transfer; skip if root entry (empty rel_path)
+    let file_str = if !done && !current.is_empty() {
+        format!(" {}", truncate_item(&current))
+    } else {
+        String::new()
+    };
+    // \x1b[K clears from cursor to end of line, removing leftover chars from shorter \r overwrites
     let suffix = if done { "\n" } else { "\r" };
     eprint!(
-        "[{}]{}{}{}{} speed {}/s current {}{}",
-        shared.label,
-        ratio,
-        files,
-        resumed,
-        workers,
-        speed,
-        truncate_item(&current),
-        suffix,
+        "[{}]{}{}{}{} {}/s{}\x1b[K{}",
+        shared.label, ratio, files_str, resumed_str, workers_str, speed, file_str, suffix,
     );
     let _ = std::io::stderr().flush();
 }
@@ -2669,6 +2714,35 @@ fn human_bytes(value: u64) -> String {
     } else {
         format!("{value:.1}{}", UNITS[unit])
     }
+}
+
+fn format_duration(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        let m = (secs / 60.0) as u64;
+        let s = secs as u64 % 60;
+        format!("{m}m{s:02}s")
+    }
+}
+
+fn print_transfer_done(
+    label: &str,
+    file_name: &str,
+    total_bytes: u64,
+    elapsed: Duration,
+    dest: Option<&Path>,
+) {
+    let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+    let avg_speed = human_bytes((total_bytes as f64 / elapsed_secs) as u64);
+    let dest_str = dest
+        .map(|p| format!(" → {}", p.display()))
+        .unwrap_or_default();
+    eprintln!(
+        "[{label}] complete: {file_name} — {} in {} — {avg_speed}/s avg — checksums ok{dest_str}",
+        human_bytes(total_bytes),
+        format_duration(elapsed_secs),
+    );
 }
 
 fn truncate_item(value: &str) -> String {

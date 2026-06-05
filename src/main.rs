@@ -24,6 +24,7 @@ const FULL_VERSION: &str = concat!(
     " - ",
     env!("GIT_SHA_SHORT"),
 );
+const DEFAULT_SERVER: &str = "https://bore.0912345.xyz";
 
 #[derive(Parser, Debug)]
 #[clap(name = "bore", author, version = FULL_VERSION, about)]
@@ -49,7 +50,7 @@ enum Command {
         local_host: String,
 
         /// Address of the remote server to expose local ports to.
-        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER")]
+        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER", default_value = DEFAULT_SERVER)]
         to: String,
 
         /// Optional port on the remote server to select.
@@ -171,7 +172,7 @@ enum Command {
         local_proxy_port: String,
 
         /// Address of the remote server hosting the secret tunnel.
-        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER")]
+        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER", default_value = DEFAULT_SERVER)]
         to: String,
 
         /// Optional secret for authentication.
@@ -400,7 +401,7 @@ enum Command {
     TestUdp {
         /// Optional bore server (host:port or http(s):// URL) to also test the
         /// reachability of its STUN responder. Required with --tcp-secret-id.
-        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER")]
+        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER", default_value = DEFAULT_SERVER)]
         to: Option<String>,
 
         /// Optional secret for server authentication and direct-path token derivation.
@@ -472,7 +473,7 @@ enum TransferCommand {
         dest_path: PathBuf,
 
         /// Address of the remote server hosting the transfer rendezvous.
-        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER")]
+        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER", default_value = DEFAULT_SERVER)]
         to: String,
 
         /// Optional secret for authentication.
@@ -551,7 +552,7 @@ enum TransferCommand {
         output: Option<PathBuf>,
 
         /// Address of the remote server hosting the transfer rendezvous.
-        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER")]
+        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER", default_value = DEFAULT_SERVER)]
         to: String,
 
         /// Optional secret for authentication.
@@ -1388,61 +1389,154 @@ mod tests {
 
     #[test]
     fn test_udp_accepts_udp_only_flag() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = std::env::var_os("BORE_SERVER");
+        std::env::remove_var("BORE_SERVER");
+
         let args = Args::parse_from(["bore", "test-udp", "--udp-only"]);
-        let Command::TestUdp { udp_only, .. } = args.command else {
+        let Command::TestUdp { to, udp_only, .. } = args.command else {
             panic!("expected test-udp command");
         };
+        assert_eq!(to.as_deref(), Some(DEFAULT_SERVER));
         assert!(udp_only);
+
+        match saved {
+            Some(value) => std::env::set_var("BORE_SERVER", value),
+            None => std::env::remove_var("BORE_SERVER"),
+        }
+    }
+
+    #[test]
+    fn local_uses_default_server_when_to_omitted() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = std::env::var_os("BORE_SERVER");
+        std::env::remove_var("BORE_SERVER");
+
+        let args = Args::parse_from(["bore", "local", "8080"]);
+        let Command::Local { to, .. } = args.command else {
+            panic!("expected local command");
+        };
+        assert_eq!(to, DEFAULT_SERVER);
+
+        match saved {
+            Some(value) => std::env::set_var("BORE_SERVER", value),
+            None => std::env::remove_var("BORE_SERVER"),
+        }
+    }
+
+    #[test]
+    fn proxy_uses_default_server_when_to_omitted() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = std::env::var_os("BORE_SERVER");
+        std::env::remove_var("BORE_SERVER");
+
+        let args = Args::parse_from([
+            "bore",
+            "proxy",
+            "--local-proxy-port",
+            ":5555",
+            "--tcp-secret-id",
+            "svc",
+        ]);
+        let Command::Proxy { to, .. } = args.command else {
+            panic!("expected proxy command");
+        };
+        assert_eq!(to, DEFAULT_SERVER);
+
+        match saved {
+            Some(value) => std::env::set_var("BORE_SERVER", value),
+            None => std::env::remove_var("BORE_SERVER"),
+        }
+    }
+
+    #[test]
+    fn local_server_env_overrides_default_server() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = std::env::var_os("BORE_SERVER");
+        std::env::set_var("BORE_SERVER", "https://env.example.test");
+
+        let args = Args::parse_from(["bore", "local", "8080"]);
+        let Command::Local { to, .. } = args.command else {
+            panic!("expected local command");
+        };
+        assert_eq!(to, "https://env.example.test");
+
+        match saved {
+            Some(value) => std::env::set_var("BORE_SERVER", value),
+            None => std::env::remove_var("BORE_SERVER"),
+        }
     }
 
     #[test]
     fn transfer_listener_accepts_rename_policy() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = std::env::var_os("BORE_SERVER");
+        std::env::remove_var("BORE_SERVER");
+
         let args = Args::parse_from([
             "bore",
             "transfer",
             "listener",
             "--dest-path",
             "/tmp/inbox",
-            "--to",
-            "localhost",
             "--rename",
         ]);
         let Command::Transfer { command } = args.command else {
             panic!("expected transfer command");
         };
         let TransferCommand::Listener {
-            rename, overwrite, ..
+            to,
+            rename,
+            overwrite,
+            ..
         } = command
         else {
             panic!("expected transfer listener command");
         };
+        assert_eq!(to, DEFAULT_SERVER);
         assert!(rename);
         assert!(!overwrite);
+
+        match saved {
+            Some(value) => std::env::set_var("BORE_SERVER", value),
+            None => std::env::remove_var("BORE_SERVER"),
+        }
     }
 
     #[test]
     fn transfer_sender_accepts_stdin_and_output() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = std::env::var_os("BORE_SERVER");
+        std::env::remove_var("BORE_SERVER");
+
         let args = Args::parse_from([
             "bore",
             "transfer",
             "sender",
             "--source",
             "stdin",
-            "--to",
-            "localhost",
             "--output",
             "archive.tar.gz",
         ]);
         let Command::Transfer { command } = args.command else {
             panic!("expected transfer command");
         };
-        let TransferCommand::Sender { source, output, .. } = command else {
+        let TransferCommand::Sender {
+            to, source, output, ..
+        } = command
+        else {
             panic!("expected transfer sender command");
         };
+        assert_eq!(to, DEFAULT_SERVER);
         assert_eq!(source, PathBuf::from("stdin"));
         assert_eq!(
             output.as_deref(),
             Some(PathBuf::from("archive.tar.gz").as_path())
         );
+
+        match saved {
+            Some(value) => std::env::set_var("BORE_SERVER", value),
+            None => std::env::remove_var("BORE_SERVER"),
+        }
     }
 }

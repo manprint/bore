@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self as std_io, ErrorKind, IsTerminal, Read, Write};
@@ -33,6 +33,7 @@ const COPY_BUFFER: usize = 64 * 1024;
 const CHUNK_SIZE: u32 = 256 * 1024;
 const DEFAULT_PARALLEL: u16 = 4;
 const MAX_PARALLEL: u16 = 32;
+const RESUME_FLUSH_EVERY_CHUNKS: u64 = 8;
 const LOCAL_BIND: &str = "127.0.0.1:0";
 const LOCAL_HOST: &str = "127.0.0.1";
 const LOCAL_CONNECT_RETRIES: usize = 50;
@@ -343,7 +344,15 @@ struct ResumeShared {
     state_file: PathBuf,
     stage_root: PathBuf,
     entries: Arc<BTreeMap<u32, ManifestEntry>>,
-    state: Arc<AsyncMutex<ResumeState>>,
+    runtime: Arc<AsyncMutex<ResumeRuntime>>,
+    persist_lock: Arc<AsyncMutex<()>>,
+}
+
+#[derive(Clone, Debug)]
+struct ResumeRuntime {
+    state: ResumeState,
+    dirty_paths: BTreeSet<PathBuf>,
+    pending_persist: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1044,7 +1053,9 @@ async fn handle_worker_connection(
                             entry.size.context("regular file missing size")?,
                         )
                         .await?;
-                        resume.mark_chunk_complete(entry_id, chunk_index).await?;
+                        resume
+                            .mark_chunk_complete(entry_id, chunk_index, &path)
+                            .await?;
                     }
                     progress.set_current(display_rel_path(&entry.rel_path));
                     progress.add_bytes(len as u64);
@@ -1065,6 +1076,7 @@ async fn handle_worker_connection(
         }
     }
     .await;
+    let flush_result = resume.flush_pending().await;
     if let Err(err) = &worker_result {
         let _ = send_frame(
             &mut stream,
@@ -1075,6 +1087,7 @@ async fn handle_worker_connection(
         .await;
     }
     progress.worker_finished();
+    flush_result?;
     worker_result
 }
 
@@ -1250,7 +1263,12 @@ async fn receive_manifest(
                 .map(|entry| (entry.id, entry))
                 .collect(),
         ),
-        state: Arc::new(AsyncMutex::new(state)),
+        runtime: Arc::new(AsyncMutex::new(ResumeRuntime {
+            state,
+            dirty_paths: BTreeSet::new(),
+            pending_persist: 0,
+        })),
+        persist_lock: Arc::new(AsyncMutex::new(())),
     });
 
     Ok(ReceiverPlan {
@@ -1847,8 +1865,9 @@ fn update_transfer_hash(
 
 impl ResumeShared {
     async fn is_chunk_complete(&self, entry_id: u32, chunk_index: u32) -> Result<bool> {
-        let state = self.state.lock().await;
-        let file = state
+        let runtime = self.runtime.lock().await;
+        let file = runtime
+            .state
             .files
             .iter()
             .find(|file| file.entry_id == entry_id)
@@ -1860,29 +1879,67 @@ impl ResumeShared {
             .unwrap_or(false))
     }
 
-    async fn mark_chunk_complete(&self, entry_id: u32, chunk_index: u32) -> Result<()> {
-        let mut state = self.state.lock().await;
-        let file = state
-            .files
-            .iter_mut()
-            .find(|file| file.entry_id == entry_id)
-            .with_context(|| format!("resume state missing entry {}", entry_id))?;
-        let slot = file
-            .completed
-            .get_mut(chunk_index as usize)
-            .with_context(|| {
-                format!(
-                    "chunk {} is out of range for entry {}",
-                    chunk_index, entry_id
-                )
-            })?;
-        *slot = true;
-        persist_resume_state(&self.state_file, &state).await
+    async fn mark_chunk_complete(
+        &self,
+        entry_id: u32,
+        chunk_index: u32,
+        path: &Path,
+    ) -> Result<()> {
+        let should_flush = {
+            let mut runtime = self.runtime.lock().await;
+            let file = runtime
+                .state
+                .files
+                .iter_mut()
+                .find(|file| file.entry_id == entry_id)
+                .with_context(|| format!("resume state missing entry {}", entry_id))?;
+            let slot = file
+                .completed
+                .get_mut(chunk_index as usize)
+                .with_context(|| {
+                    format!(
+                        "chunk {} is out of range for entry {}",
+                        chunk_index, entry_id
+                    )
+                })?;
+            *slot = true;
+            runtime.dirty_paths.insert(path.to_path_buf());
+            runtime.pending_persist += 1;
+            runtime.pending_persist >= RESUME_FLUSH_EVERY_CHUNKS
+        };
+        if should_flush {
+            self.flush_pending().await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_pending(&self) -> Result<()> {
+        let _persist = self.persist_lock.lock().await;
+        let snapshot = {
+            let mut runtime = self.runtime.lock().await;
+            if runtime.pending_persist == 0 && runtime.dirty_paths.is_empty() {
+                None
+            } else {
+                runtime.pending_persist = 0;
+                Some((
+                    runtime.state.clone(),
+                    std::mem::take(&mut runtime.dirty_paths)
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                ))
+            }
+        };
+        if let Some((state, paths)) = snapshot {
+            sync_staged_files(&paths).await?;
+            persist_resume_state(&self.state_file, &state).await?;
+        }
+        Ok(())
     }
 
     async fn all_chunks_complete(&self, entry_id: u32) -> Result<bool> {
-        let state = self.state.lock().await;
-        let file = state
+        let runtime = self.runtime.lock().await;
+        let file = runtime
+            .state
             .files
             .iter()
             .find(|file| file.entry_id == entry_id)
@@ -1891,22 +1948,28 @@ impl ResumeShared {
     }
 
     async fn reset_file(&self, entry_id: u32) -> Result<()> {
-        let mut state = self.state.lock().await;
-        let file = state
-            .files
-            .iter_mut()
-            .find(|file| file.entry_id == entry_id)
-            .with_context(|| format!("resume state missing entry {}", entry_id))?;
-        for done in &mut file.completed {
-            *done = false;
-        }
+        let _persist = self.persist_lock.lock().await;
+        let state = {
+            let mut runtime = self.runtime.lock().await;
+            let file = runtime
+                .state
+                .files
+                .iter_mut()
+                .find(|file| file.entry_id == entry_id)
+                .with_context(|| format!("resume state missing entry {}", entry_id))?;
+            for done in &mut file.completed {
+                *done = false;
+            }
+            runtime.pending_persist = 0;
+            runtime.state.clone()
+        };
         persist_resume_state(&self.state_file, &state).await
     }
 }
 
 async fn persist_resume_state(path: &Path, state: &ResumeState) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(state)?).await?;
+    fs::write(&tmp, serde_json::to_vec(state)?).await?;
     if fs::try_exists(path).await? {
         let _ = fs::remove_file(path).await;
     }
@@ -2338,12 +2401,33 @@ async fn write_chunk_to_file(path: &Path, offset: u64, payload: &[u8], size: u64
             .with_context(|| format!("failed to size staged file {}", path.display()))?;
         write_all_at(&file, offset, &payload)
             .with_context(|| format!("failed to write chunk into {}", path.display()))?;
-        file.sync_data()
-            .with_context(|| format!("failed to sync staged file {}", path.display()))?;
         Ok::<(), anyhow::Error>(())
     })
     .await
     .context("chunk write task failed")?
+}
+
+async fn sync_staged_files(paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let paths = paths.to_vec();
+    spawn_blocking(move || {
+        for path in paths {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .with_context(|| {
+                    format!("failed to reopen staged file {} for sync", path.display())
+                })?;
+            file.sync_data()
+                .with_context(|| format!("failed to sync staged file {}", path.display()))?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("stage file sync task failed")?
 }
 
 async fn hash_file_async(path: &Path) -> Result<String> {

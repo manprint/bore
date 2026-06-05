@@ -12,10 +12,10 @@ A modern, simple TCP tunnel in Rust that exposes local ports to a remote server,
 cargo install bore-cli
 
 # On your local machine
-bore local 8000 --to bore.pub
+bore local 8000
 ```
 
-This will expose your local port at `localhost:8000` to the public internet at `bore.pub:<PORT>`, where the port number is assigned randomly.
+This will expose your local port at `localhost:8000` to the public internet through the default server `https://bore.0912345.xyz`, with a public port assigned randomly.
 
 Similar to [localtunnel](https://github.com/localtunnel/localtunnel) and [ngrok](https://ngrok.io/), except `bore` is intended to be a highly efficient, unopinionated tool for forwarding TCP traffic that is simple to install and easy to self-host, with no frills attached.
 
@@ -104,18 +104,18 @@ This section describes detailed usage for the `bore` CLI command.
 
 ### Local Forwarding
 
-You can forward a port on your local machine by using the `bore local` command. This takes a positional argument, the local port to forward, as well as a mandatory `--to` option, which specifies the address of the remote server.
+You can forward a port on your local machine by using the `bore local` command. This takes a positional argument, the local port to forward. If you omit `--to`, the client defaults to `https://bore.0912345.xyz`; pass `--to` or `BORE_SERVER` to override it.
 
 ```shell
-bore local 5000 --to bore.pub
+bore local 5000
 ```
 
 You can optionally pass in a `--port` option to pick a specific port on the remote to expose, although the command will fail if this port is not available. Also, passing `--local-host` allows you to expose a different host on your local area network besides the loopback address `localhost`.
 
-The `--to` value selects the transport for the control connection:
+The `--to` value selects the transport for the control connection. When omitted, `bore` uses `https://bore.0912345.xyz` (TLS on port `443`):
 
-- `bore.pub` — plain TCP on the control port (default `7835`).
-- `bore.pub:1000` — plain TCP on an explicit control port.
+- `bore.0912345.xyz` — plain TCP on the control port (default `7835`).
+- `bore.0912345.xyz:1000` — plain TCP on an explicit control port.
 - `http://bore.tld` — plain TCP, default port `80`.
 - `https://bore.tld` — TLS, default port `443`. Use `--insecure` to accept a
   self-signed server certificate.
@@ -123,7 +123,7 @@ The `--to` value selects the transport for the control connection:
 ```shell
 Starts a local proxy to the remote server
 
-Usage: bore local [OPTIONS] --to <ADDR> <PORT>
+Usage: bore local [OPTIONS] <PORT>
 
 Arguments:
   <PORT>  The local port to expose [env: BORE_LOCAL_PORT=]
@@ -131,7 +131,7 @@ Arguments:
 Options:
   -l, --local-host <HOST>      The local host to expose [default: localhost]
   -v, --verbose...             Increase log verbosity (-v debug, -vv trace; RUST_LOG overrides)
-  -t, --to <ADDR>              Address of the remote server [env: BORE_SERVER=]
+  -t, --to <ADDR>              Address of the remote server [env: BORE_SERVER=] [default: https://bore.0912345.xyz]
   -p, --port <PORT>            Optional port on the remote server to select [default: 0]
   -s, --secret <SECRET>        Optional secret for authentication [env: BORE_SECRET]
       --tcp-secret-id <ID>     Register as a named secret tunnel [env: BORE_TCP_SECRET_ID=]
@@ -254,7 +254,7 @@ bore local 8080 --to https://bore.tld -p 9000 -s mysecret --https --force-https
 
 ### Self-Hosting
 
-As mentioned in the startup instructions, there is a public instance of the `bore` server running at `bore.pub`. However, if you want to self-host `bore` on your own network, you can do so with the following command:
+As mentioned in the startup instructions, the CLI now defaults to the public server `https://bore.0912345.xyz`. However, if you want to self-host `bore` on your own network, you can do so with the following command:
 
 ```shell
 bore server
@@ -380,13 +380,13 @@ provider at a time; a second registration of the same id is rejected.
 Connects to a named secret tunnel and exposes it on a local port
 
 ```
-Usage: bore proxy [OPTIONS] --local-proxy-port <ADDR> --to <ADDR> --tcp-secret-id <ID>
+Usage: bore proxy [OPTIONS] --local-proxy-port <ADDR> --tcp-secret-id <ID>
 ```shell
 
 Options:
       --local-proxy-port <ADDR>  Local address to listen on, e.g. ":5555" or "127.0.0.1:5555" [env: BORE_LOCAL_PROXY_PORT=]
   -v, --verbose...               Increase log verbosity (-v debug, -vv trace; RUST_LOG overrides)
-  -t, --to <ADDR>                Address of the remote server [env: BORE_SERVER=]
+  -t, --to <ADDR>                Address of the remote server [env: BORE_SERVER=] [default: https://bore.0912345.xyz]
   -s, --secret <SECRET>          Optional secret for authentication [env: BORE_SECRET]
       --tcp-secret-id <ID>       Identifier of the secret tunnel to connect to [env: BORE_TCP_SECRET_ID=]
       --insecure                 Skip TLS certificate verification [env: BORE_INSECURE=]
@@ -493,13 +493,14 @@ server relay automatically. Filesystem transfers use a V2 chunked protocol with
 resume state on the receiver, multiple worker streams, per-chunk BLAKE3 checks,
 and a final whole-transfer verification before the staged tree is committed. The
 server never stores the payload; it only brokers the rendezvous or relays the
-encrypted/plain byte streams when a direct path is unavailable.
+encrypted/plain byte streams when a direct path is unavailable. If `--to` is
+omitted, both listener and sender default to `https://bore.0912345.xyz`;
+explicit `--to` or `BORE_SERVER` overrides that.
 
 Common receiver:
 
 ```shell
 bore transfer listener \
-  --to https://bore.example.com \
   --secret mysecret \
   --transfer-id nightly-backup \
   --dest-path /srv/inbox
@@ -510,7 +511,6 @@ Try these transfer modes:
 ```shell
 # Single file
 bore transfer sender \
-  --to https://bore.example.com \
   --secret mysecret \
   --transfer-id nightly-backup \
   --source /home/alice/archive.tar.gz \
@@ -659,10 +659,12 @@ What the transfer command guarantees in V2:
   under the destination root and published only after the hashes match.
 - **Collision policy** is fail-safe by default. Use `--overwrite` or `--rename`
   on `bore transfer listener` to opt into replacement/renaming.
-- **Parallel filesystem workers** via `--parallel N` (`0` = automatic,
-  carrier-aware default). On the relay, `--carriers N` widens the data path; on
-  direct UDP, each transferred connection already uses an independent native
-  QUIC stream.
+- **Parallel filesystem workers** via `--parallel N`. `--parallel 0` is
+  automatic and currently resolves from `--carriers`, capped at 4 workers; with
+  the default `--carriers 1`, automatic mode starts one worker. Explicit
+  `--parallel` values are clamped to 32. On the relay, `--carriers N` widens
+  the data path; on direct UDP, each transferred connection already uses an
+  independent native QUIC stream.
 - **Cross-platform path fidelity**: the wire format preserves Unix raw-byte path
   components and Windows UTF-16 path components losslessly, so Linux/macOS raw
   names and Windows names survive relay/direct transfer without forcing UTF-8.
@@ -675,6 +677,9 @@ Notes:
 - Resume state lives under the destination root's staging directory until the
   transfer commits. If the source manifest changes between attempts, the
   listener rejects the resume and asks for a fresh transfer.
+- The listener batches staged-file syncs and resume-state persistence instead of
+  forcing one file sync plus one `state.json` rewrite per 256 KiB chunk, so
+  resume safety does not throttle large filesystem transfers on fast links.
 - `--source stdin` verifies the exact byte stream that `bore` reads and the
   receiver writes. It cannot know whether the producer command earlier in the
   shell pipeline succeeded semantically; use shell `pipefail` if you need that.
@@ -694,12 +699,13 @@ Notes:
 #### Diagnosing UDP / NAT (`bore test-udp`)
 
 Before blaming the tunnel, find out what *your* network allows. `bore test-udp`
-opens no tunnel — it probes public STUN servers (and, with `--to`, your own bore
-server's STUN responder), classifies the NAT, and prints advice:
+opens no tunnel — it probes public STUN servers and, by default, the bore STUN
+responder behind `https://bore.0912345.xyz`. Pass `--to` to probe a different
+server instead, then classify the NAT and print advice:
 
 ```shell
-bore test-udp                              # probe public STUN only
-bore test-udp --to https://bore.example.com   # also test your server's UDP reachability
+bore test-udp                                 # public STUN + default bore server
+bore test-udp --to https://bore.example.com   # public STUN + another bore server
 bore test-udp --stun-server stun.l.google.com:19302  # add an explicit STUN server
 ```
 
@@ -730,13 +736,13 @@ tests the TCP relay fallback. Add `--test-bandwidth` (alias:
 
 ```shell
 # Machine A
-bore test-udp --to https://bore.example.com --secret mysecret --tcp-secret-id svc
+bore test-udp --secret mysecret --tcp-secret-id svc
 
 # Machine B, same command/id
-bore test-udp --to https://bore.example.com --secret mysecret --tcp-secret-id svc
+bore test-udp --secret mysecret --tcp-secret-id svc
 
 # With bidirectional bandwidth tests (500 MB per direction and per path)
-bore test-udp --to https://bore.example.com --secret mysecret --tcp-secret-id svc \
+bore test-udp --secret mysecret --tcp-secret-id svc \
   --test-bandwidth --test-transfer-quota 500MB
 ```
 

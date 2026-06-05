@@ -72,6 +72,9 @@ Il valore di `--to` sul client/proxy determina **host, porta e se usare TLS**:
 | `https://bore.tld` | https | 443 | **sì** |
 | `https://bore.tld:7835` | https con porta | 7835 | **sì** |
 
+Se ometti `--to`, `local`, `proxy`, `transfer` e `test-udp` usano di default
+`https://bore.0912345.xyz`. Un `--to` esplicito o `BORE_SERVER` hanno la precedenza.
+
 > **Importante**: lo schema decide la porta di default. Se la tua control port **non**
 > è 80/443, indicala esplicitamente: es. `https://bore.tld:7835`. In alternativa avvia
 > il server direttamente su 443/80 (`--control-port 443`) o inoltra la porta (Docker:
@@ -81,7 +84,9 @@ Il valore di `--to` sul client/proxy determina **host, porta e se usare TLS**:
 
 **Ogni** opzione che vedi come flag può essere passata anche via variabile
 d'ambiente (comodo per Docker/systemd). Le trovi nelle tabelle del
-[Riferimento rapido](#2-riferimento-rapido-dei-comandi). Esempio equivalente:
+[Riferimento rapido](#2-riferimento-rapido-dei-comandi). Se ometti `--to`, il
+default CLI e' `https://bore.0912345.xyz`; `BORE_SERVER` o `--to` esplicito lo
+sovrascrivono. Esempio equivalente:
 
 ```shell
 bore local 8080 --to https://bore.tld --secret hunter2
@@ -133,7 +138,7 @@ systemd): chiudono in modo ordinato con una riga di log, senza troncare i trasfe
 |------|-----|-------------|
 | `<PORT>` | `BORE_LOCAL_PORT` | Porta locale da esporre (argomento posizionale). |
 | `-l, --local-host <HOST>` | — | Host locale da esporre (default `localhost`). |
-| `-t, --to <ADDR>` | `BORE_SERVER` | Indirizzo del server (vedi schema `--to`). |
+| `-t, --to <ADDR>` | `BORE_SERVER` | Indirizzo del server (default `https://bore.0912345.xyz`; vedi schema `--to`). |
 | `-p, --port <PORT>` | — | Porta pubblica desiderata (0 = assegnata dal server). |
 | `-s, --secret <SECRET>` | `BORE_SECRET` | Secret di autenticazione. |
 | `--tcp-secret-id <ID>` | `BORE_TCP_SECRET_ID` | Registra come **tunnel segreto** (ignora `--port`). |
@@ -157,7 +162,7 @@ systemd): chiudono in modo ordinato con una riga di log, senza troncare i trasfe
 | Flag | Env | Descrizione |
 |------|-----|-------------|
 | `--local-proxy-port <ADDR>` | `BORE_LOCAL_PROXY_PORT` | Indirizzo locale su cui esporre (`:5555` = tutte le interfacce). |
-| `-t, --to <ADDR>` | `BORE_SERVER` | Indirizzo del server. |
+| `-t, --to <ADDR>` | `BORE_SERVER` | Indirizzo del server (default `https://bore.0912345.xyz`). |
 | `-s, --secret <SECRET>` | `BORE_SECRET` | Secret di autenticazione. |
 | `--tcp-secret-id <ID>` | `BORE_TCP_SECRET_ID` | Id del tunnel segreto (deve combaciare col provider). |
 | `--insecure` | `BORE_INSECURE` | Accetta certificati self-signed. |
@@ -175,7 +180,7 @@ systemd): chiudono in modo ordinato con una riga di log, senza troncare i trasfe
 
 | Flag | Env | Descrizione |
 |------|-----|-------------|
-| `-t, --to <ADDR>` | `BORE_SERVER` | Testa anche lo STUN del tuo server bore; richiesto per la modalità a due peer. |
+| `-t, --to <ADDR>` | `BORE_SERVER` | Server bore da testare in aggiunta ai public STUN (default `https://bore.0912345.xyz`; richiesto in pratica per la modalità a due peer). |
 | `-s, --secret <SECRET>` | `BORE_SECRET` | Secret del server e token del path diretto nella modalità a due peer. |
 | `--tcp-secret-id <ID>` | `BORE_TCP_SECRET_ID` | Abbina due istanze `test-udp` con lo stesso id e coordina il test A<->B. |
 | `--insecure` | `BORE_INSECURE` | Accetta certificati self-signed per `https://`. |
@@ -747,13 +752,13 @@ path diretto UDP, fa fallback automatico al relay TCP e non memorizza mai il
 payload sul server. I transfer filesystem usano il protocollo V2: manifest,
 chunk deterministici, worker paralleli, staging lato listener, resume locale e
 verifica BLAKE3 per chunk, file e summary finale prima del commit. `stdin`
-resta invece uno stream singolo con `--output` obbligatorio.
+resta invece uno stream singolo con `--output` obbligatorio. Se ometti `--to`,
+listener e sender usano `https://bore.0912345.xyz`.
 
 #### Listener base
 
 ```shell
 bore transfer listener \
-  --to https://bore.tld \
   --secret hunter2 \
   --transfer-id nightly-backup \
   --dest-path /srv/inbox
@@ -763,7 +768,6 @@ bore transfer listener \
 
 ```shell
 bore transfer sender \
-  --to https://bore.tld \
   --secret hunter2 \
   --transfer-id nightly-backup \
   --source /home/alice/archive.tar.gz \
@@ -932,7 +936,8 @@ bore transfer sender \
 
 `--parallel N` governa i worker filesystem; `--carriers N` allarga solo la
 tratta relay. Sul direct UDP ogni connessione trasferita usa già il proprio
-stream QUIC nativo.
+stream QUIC nativo. In automatico, `--parallel 0` deriva oggi da `--carriers`
+ed è capato a 4; con il default `--carriers 1`, parte un solo worker.
 
 ```shell
 bore transfer sender \
@@ -948,6 +953,8 @@ bore transfer sender \
 
 - I file regolari sono chunked e riprendibili; `stdin` non partecipa al resume.
 - Il commit sul listener avviene solo dopo la verifica finale.
+- Il listener batcha sync dei file staged e persistenza del resume state: non
+  fa piu' un `fsync` e una riscrittura di `state.json` a ogni chunk.
 - I log mostrano se il path effettivo è `direct-udp` o `relay`, e se la control
   connection è `tls` o `plain`.
 - I percorsi Unix raw-byte e Windows UTF-16 sono preservati sul wire; su

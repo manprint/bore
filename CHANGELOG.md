@@ -123,6 +123,10 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
   Xs` when the preferred port becomes PRESERVED again.
 
 ### Changed
+- **Project-wide default server endpoint**: every client-side `--to` now falls
+  back to `https://bore.0912345.xyz` when omitted: `bore local`, `bore proxy`,
+  `bore transfer listener`, `bore transfer sender`, and `bore test-udp`.
+  Explicit `--to` values and `BORE_SERVER` still override the built-in default.
 - **Labeled control-plane trace logging**: `Delimited::with_label` now traces
   `tx`/`rx` control frames at `trace` level with role labels (`server/control`,
   `client/public`, `client/provider`, `proxy/consumer`, `test-udp/peer`, ...)
@@ -153,6 +157,11 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
   BDP/memory trade-off in one place.
 
 ### Fixed
+- Transfer filesystem throughput/resume hot path: the listener no longer forces
+  `sync_data()` plus a full `state.json` rewrite on every acknowledged chunk.
+  Staged-file syncs and resume-state persistence are now batched and serialized,
+  which removes a major throughput bottleneck on fast links and fixes the
+  intermittent resume-state race seen in fallback-resume tests.
 - Cross-platform transfer builds: optional UDP crates (`quinn`, `rcgen`,
   `igd-next`) stay in the top-level dependency set so Windows `--all-features`
   builds resolve them correctly, and Unix device handling in `src/transfer_v2.rs`

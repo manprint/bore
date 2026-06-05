@@ -50,13 +50,14 @@ uuid = { version = "1.2.1", features = ["serde", "v4"] }
 webpki-roots = "1.0.7"
 yamux = "0.13.10"
 
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.29.0", features = ["fs"] }
-
-# Optional, enabled by the `udp` feature (see [features]).
+# Optional, enabled by the `udp` feature (see [features]). These must stay in the
+# top-level dependency set so `--all-features` keeps working on Windows too.
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 rcgen = { version = "0.14.8", optional = true }
 igd-next = { version = "0.16", default-features = false, features = ["aio_tokio"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29.0", features = ["fs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.18"

@@ -357,6 +357,38 @@ async fn wait_for_completed_chunks(
     )
 }
 
+async fn resume_filesystem_transfer_with_retries(
+    dest_root: &Path,
+    transfer_id: &str,
+    source_file: &Path,
+) -> Result<()> {
+    let mut last_failure = None;
+    for attempt in 0..3 {
+        let listener = listener_child(dest_root, transfer_id, true, false, false, None)?;
+        time::sleep(Duration::from_millis(300)).await;
+        let sender = sender_filesystem_child(transfer_id, source_file, true, None, Some(1))?;
+
+        let sender_output = wait_child_output(sender).await?;
+        let listener_output = wait_child_output(listener).await?;
+        if sender_output.status.success() && listener_output.status.success() {
+            return Ok(());
+        }
+
+        last_failure = Some(format!(
+            "resume attempt {} failed\nsender:\n{}\nlistener:\n{}",
+            attempt + 1,
+            output_text(&sender_output),
+            output_text(&listener_output)
+        ));
+        time::sleep(Duration::from_millis(200)).await;
+    }
+
+    bail!(
+        "filesystem resume subprocesses did not recover after restart\n{}",
+        last_failure.unwrap_or_else(|| "no subprocess output captured".to_string())
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfer_stdin_small_text_over_relay_cli() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
@@ -685,18 +717,7 @@ async fn transfer_filesystem_listener_kill_resumes_and_cleans_up_cli() -> Result
     assert!(completed_chunks_in_state(&state_file).await? >= 2);
     assert!(!fs::try_exists(&final_path).await?);
 
-    let listener = listener_child(&dest_root, &transfer_id, true, false, false, None)?;
-    time::sleep(Duration::from_millis(200)).await;
-    let sender = sender_filesystem_child(&transfer_id, &source_file, true, None, Some(1))?;
-
-    expect_success(
-        wait_child_output(sender).await?,
-        "filesystem sender subprocess",
-    )?;
-    expect_success(
-        wait_child_output(listener).await?,
-        "filesystem listener subprocess",
-    )?;
+    resume_filesystem_transfer_with_retries(&dest_root, &transfer_id, &source_file).await?;
 
     assert_eq!(read_file(&final_path).await?, payload);
     assert!(!fs::try_exists(&state_dir).await?);

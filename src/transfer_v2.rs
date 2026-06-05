@@ -1738,8 +1738,8 @@ fn scan_entry(
                     chunk_count: 0,
                     symlink_target: None,
                     device: Some(DeviceDescriptor {
-                        major: nix::sys::stat::major(rdev),
-                        minor: nix::sys::stat::minor(rdev),
+                        major: device_major(rdev),
+                        minor: device_minor(rdev),
                     }),
                     mode,
                 },
@@ -2550,16 +2550,21 @@ async fn create_device(entry: &ManifestEntry, path: &Path) -> Result<()> {
         let entry = entry.clone();
         let path = path.to_path_buf();
         spawn_blocking(move || {
-            use nix::sys::stat::{makedev, mknod, Mode, SFlag};
+            use nix::sys::stat::{mknod, Mode, SFlag};
             let device = entry.device.context("device entry missing metadata")?;
             let flag = match entry.kind {
                 EntryKind::CharDevice => SFlag::S_IFCHR,
                 EntryKind::BlockDevice => SFlag::S_IFBLK,
                 _ => bail!("invalid device entry kind"),
             };
-            let mode = Mode::from_bits_truncate(entry.mode.unwrap_or(0o600));
-            mknod(&path, flag, mode, makedev(device.major, device.minor))
-                .with_context(|| format!("failed to create device {}", path.display()))?;
+            let mode = Mode::from_bits_truncate(entry.mode.unwrap_or(0o600) as nix::libc::mode_t);
+            mknod(
+                &path,
+                flag,
+                mode,
+                device_makedev(device.major, device.minor),
+            )
+            .with_context(|| format!("failed to create device {}", path.display()))?;
             Ok::<(), anyhow::Error>(())
         })
         .await
@@ -2576,6 +2581,21 @@ fn injected_fail_after_chunks() -> Option<u64> {
     std::env::var("BORE_TRANSFER_TEST_MAX_ACKED_CHUNKS")
         .ok()
         .and_then(|value| value.parse().ok())
+}
+
+#[cfg(unix)]
+fn device_major(device: u64) -> u64 {
+    nix::libc::major(device as nix::libc::dev_t) as u64
+}
+
+#[cfg(unix)]
+fn device_minor(device: u64) -> u64 {
+    nix::libc::minor(device as nix::libc::dev_t) as u64
+}
+
+#[cfg(unix)]
+fn device_makedev(major: u64, minor: u64) -> u64 {
+    nix::libc::makedev(major as _, minor as _) as u64
 }
 
 fn render_progress(shared: &ProgressShared, elapsed: Duration, done: bool) {

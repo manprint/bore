@@ -2594,8 +2594,8 @@ fn device_minor(device: u64) -> u64 {
 }
 
 #[cfg(unix)]
-fn device_makedev(major: u64, minor: u64) -> u64 {
-    nix::libc::makedev(major as _, minor as _) as u64
+fn device_makedev(major: u64, minor: u64) -> nix::libc::dev_t {
+    nix::libc::makedev(major as _, minor as _)
 }
 
 fn render_progress(shared: &ProgressShared, elapsed: Duration, done: bool) {

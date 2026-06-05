@@ -269,7 +269,7 @@ The control port defaults to `7835` but is configurable with `--control-port`; c
 #### Serving over HTTPS/HTTP
 
 Pass a certificate and key to serve the control connection over TLS; clients connect with `https://`:
-
+ Try these transfer modes:
 ```shell
 # HTTPS (clients: --to https://bore.tld)
 bore server --bind-domain bore.tld --cert-file /var/bore/cert.pem --key-file /var/bore/key.pem
@@ -282,6 +282,7 @@ A self-signed certificate requires `--insecure` on the client. The full options:
 
 ```shell
 Runs the remote proxy server
+```shell
 
 Usage: bore server [OPTIONS]
 
@@ -290,6 +291,7 @@ Options:
       --max-port <PORT>      Maximum accepted TCP port number [env: BORE_MAX_PORT=] [default: 65535]
   -v, --verbose...           Increase log verbosity (-v debug, -vv trace; RUST_LOG overrides)
   -s, --secret <SECRET>      Optional secret for authentication [env: BORE_SECRET]
+```
       --max-conns <N>        Max concurrently proxied connections per client [env: BORE_MAX_CONNS=] [default: 1024]
       --max-carriers <N>     Max parallel TCP carriers a tunnel may use (1 disables the pool) [env: BORE_MAX_CARRIERS=] [default: 16]
       --control-port <PORT>  TCP port the control connection listens on [env: BORE_CONTROL_PORT=] [default: 7835]
@@ -301,6 +303,7 @@ Options:
       --udp                  Broker UDP direct paths and run a STUN responder on the control port [env: BORE_UDP=]
       --admin-token <TOKEN>  Enable the admin status page at /admin/status (min 32 chars) [env: BORE_ADMIN_TOKEN]
   -h, --help                 Print help
+```shell
 ```
 
 #### Basic auth on tunnels
@@ -316,6 +319,8 @@ sent in the clear.
 ```shell
 bore local 8080 --to https://bore.tld -p 9000 --https --basic-auth "admin:s3cr3t"
 ```
+```
+```shell
 
 #### Admin status page
 
@@ -331,7 +336,9 @@ bore server --secret mysecret --admin-token "$(openssl rand -hex 24)"
 # open http://your-server:7835/admin/status and paste the token
 ```
 
+```
 The page lists every connected tunnel — public tunnels and, for secret tunnels,
+```shell
 both the provider and all attached `bore proxy` consumers — with their client
 address, options, `--notes`, live connection count, and uptime. It refreshes
 automatically (polling every ~2s) and keeps **no** persistent state: it reflects
@@ -355,7 +362,9 @@ There are three machines:
 bore server --secret mysecret
 
 # Machine B — the service to expose (e.g. on port 8080). Registers the id, no
+```
 # public port is opened on the server.
+```shell
 bore local 8080 --to bore.tld --secret mysecret --tcp-secret-id my-8080-secret-service
 
 # Machine C — open the tunnel locally. Now localhost:5555 reaches B's service.
@@ -370,7 +379,9 @@ provider at a time; a second registration of the same id is rejected.
 ```shell
 Connects to a named secret tunnel and exposes it on a local port
 
+```
 Usage: bore proxy [OPTIONS] --local-proxy-port <ADDR> --to <ADDR> --tcp-secret-id <ID>
+```shell
 
 Options:
       --local-proxy-port <ADDR>  Local address to listen on, e.g. ":5555" or "127.0.0.1:5555" [env: BORE_LOCAL_PROXY_PORT=]
@@ -380,7 +391,9 @@ Options:
       --tcp-secret-id <ID>       Identifier of the secret tunnel to connect to [env: BORE_TCP_SECRET_ID=]
       --insecure                 Skip TLS certificate verification [env: BORE_INSECURE=]
       --udp                      Prefer a direct UDP hole-punched path [env: BORE_PREFER_UDP=]
+```
       --stun-server <HOST:PORT>  STUN server for the direct path [env: BORE_STUN_SERVER=]
+```shell
       --upnp                     Map a router port via UPnP-IGD for the direct path [env: BORE_UPNP=]
       --try-port-prediction      Advertise predicted symmetric-NAT ports (opt-in, best-effort) [env: BORE_TRY_PORT_PREDICTION=]
       --nat-udp-preferred-port <PORT> Bind the UDP hole-punch socket to a fixed port (0=random) [env: BORE_NAT_UDP_PORT=]
@@ -395,18 +408,18 @@ Options:
 
 By default a secret tunnel relays all data through the server. With `--udp` on the
 server **and** on both ends, `bore` instead tries to establish a **direct**
+```
 peer-to-peer path between the provider and the consumer using UDP hole-punching,
-carried over [QUIC](https://github.com/quinn-rs/quinn) — the server is then only a
 rendezvous/signaling point and steps out of the data path (lower latency, no server
 bandwidth). If the direct path can't be established (e.g. a symmetric NAT, UDP
-blocked), it **automatically falls back to the relay**, so `--udp` never breaks a
 tunnel.
+- Cross-platform path handling is explicit, not lossy: Unix raw-byte path
+  components and Windows UTF-16 path components are encoded on the wire; on
+  Windows, reserved or otherwise invalid names are sanitized to
+  `_bore_utf8_<hex>` instead of being lossy-decoded.
 
-```shell
-# Server: broker direct paths + run a STUN responder on the control port (UDP).
-bore server --secret mysecret --udp
-
-# Provider and consumer both opt in with --udp:
+- Unix device transfer is meaningful only on Unix receivers and may require
+  elevated privileges to recreate the device node.
 bore local 8080 --to https://bore.tld --secret mysecret --tcp-secret-id svc --udp
 bore proxy --to https://bore.tld --local-proxy-port :5555 --secret mysecret --tcp-secret-id svc --udp
 ```
@@ -482,7 +495,7 @@ and a final whole-transfer verification before the staged tree is committed. The
 server never stores the payload; it only brokers the rendezvous or relays the
 encrypted/plain byte streams when a direct path is unavailable.
 
-Receiver side:
+Common receiver:
 
 ```shell
 bore transfer listener \
@@ -492,7 +505,7 @@ bore transfer listener \
   --dest-path /srv/inbox
 ```
 
-Sender side:
+Try these transfer modes:
 
 ```shell
 # Single file
@@ -503,7 +516,9 @@ bore transfer sender \
   --source /home/alice/archive.tar.gz \
   --parallel 4 \
   --carriers 4
+```
 
+```shell
 # Directory (preserves the directory root and relative layout)
 bore transfer sender \
   --to https://bore.example.com \
@@ -512,7 +527,9 @@ bore transfer sender \
   --source /home/alice/project \
   --parallel 4 \
   --symlinks include
+```
 
+```shell
 # stdin stream (requires an explicit output file name)
 tar -cvpzf - project | bore transfer sender \
   --to https://bore.example.com \
@@ -520,6 +537,113 @@ tar -cvpzf - project | bore transfer sender \
   --transfer-id nightly-backup \
   --source stdin \
   --output project.tar.gz
+```
+
+```shell
+# Resume a filesystem transfer after an interruption: rerun the same pair with
+# the same transfer id, destination root, and unchanged source manifest.
+bore transfer listener \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id nightly-backup \
+  --dest-path /srv/inbox
+
+bore transfer sender \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id nightly-backup \
+  --source /home/alice/archive.tar.gz \
+  --parallel 4
+```
+
+```shell
+# Force relay-only on both sides.
+bore transfer listener \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id relay-only-copy \
+  --dest-path /srv/inbox \
+  --relay-only
+
+bore transfer sender \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id relay-only-copy \
+  --source /home/alice/archive.tar.gz \
+  --relay-only \
+  --carriers 4
+```
+
+```shell
+# Try the direct UDP path with explicit NAT knobs on both peers; relay remains
+# the automatic fallback if hole-punching fails.
+bore transfer listener \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id udp-copy \
+  --dest-path /srv/inbox \
+  --stun-server stun.cloudflare.com:3478 \
+  --upnp \
+  --try-port-prediction \
+  --nat-udp-preferred-port 41641 \
+  --nat-udp-release-timeout 120
+
+bore transfer sender \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id udp-copy \
+  --source /home/alice/archive.tar.gz \
+  --stun-server stun.cloudflare.com:3478 \
+  --upnp \
+  --try-port-prediction \
+  --nat-udp-preferred-port 41641 \
+  --nat-udp-release-timeout 120
+```
+
+```shell
+# Control-channel TLS with a self-signed certificate.
+bore transfer listener \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id tls-copy \
+  --dest-path /srv/inbox \
+  --insecure
+
+bore transfer sender \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id tls-copy \
+  --source /home/alice/archive.tar.gz \
+  --insecure
+```
+
+```shell
+# Existing destination policy lives on the listener.
+bore transfer listener --to https://bore.example.com --secret mysecret \
+  --transfer-id collision-fail --dest-path /srv/inbox
+
+bore transfer listener --to https://bore.example.com --secret mysecret \
+  --transfer-id collision-overwrite --dest-path /srv/inbox --overwrite
+
+bore transfer listener --to https://bore.example.com --secret mysecret \
+  --transfer-id collision-rename --dest-path /srv/inbox --rename
+```
+
+```shell
+# Special files on Unix.
+bore transfer sender \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id symlink-tree \
+  --source /home/alice/project \
+  --symlinks include
+
+bore transfer sender \
+  --to https://bore.example.com \
+  --secret mysecret \
+  --transfer-id device-copy \
+  --source /dev/null \
+  --devices include
 ```
 
 What the transfer command guarantees in V2:
@@ -556,11 +680,14 @@ Notes:
   shell pipeline succeeded semantically; use shell `pipefail` if you need that.
 - `--source stdin` requires `--output`, always uses a single stream, and does
   not participate in chunk resume or `--parallel`.
-- Cross-platform support is transport-safe, not name-translation magic: the
-  receiver still enforces its local filesystem rules, so a name invalid on the
-  destination OS is rejected instead of being silently rewritten.
+- Cross-platform path handling is explicit, not lossy: Unix raw-byte path
+  components and Windows UTF-16 path components are encoded on the wire; on
+  Windows, reserved or otherwise invalid names are sanitized to
+  `_bore_utf8_<hex>` instead of being lossy-decoded.
 - Symlinks and Unix device nodes are opt-in/opt-out on the sender with
   `--symlinks include|exclude` and `--devices include|exclude`.
+- Unix device transfer is meaningful only on Unix receivers and may require
+  elevated privileges to recreate the device node.
 - `bore transfer listener` also accepts the legacy `--tcp-secret-id` flag as an
   alias of `--transfer-id`, so existing tooling can reuse the same identifier.
 

@@ -69,6 +69,23 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
   connection count, and uptime. **Stateless** (no persistence): it reflects only
   what is connected right now. Disabled (and invisible) without a token, leaving
   the control port's bore-protocol behaviour byte-for-byte unchanged.
+- **Secure file transfer V2** (`bore transfer listener|sender`): sends a file,
+  directory, or `stdin` stream over the existing secret-tunnel transport. The
+  command tries the direct UDP path by default and falls back to the relay
+  automatically; `--relay-only` disables the direct attempt. Filesystem mode uses
+  a manifest, deterministic chunking, receiver-side staging, persisted resume
+  state, `--parallel` workers, and BLAKE3 verification at chunk/file/final-summary
+  level before commit. `stdin` requires `--output` and remains single-stream /
+  non-resumable by design. Listener-side collision policy is fail by default with
+  `--overwrite` / `--rename`; sender-side scanning supports
+  `--symlinks include|exclude` and `--devices include|exclude`; path encoding
+  preserves Unix raw bytes and Windows UTF-16, sanitizing Windows reserved or
+  invalid names to `_bore_utf8_<hex>`.
+- **Transfer regression coverage**: `tests/transfer_test.rs` and
+  `tests/transfer_stdin_cli_test.rs` cover relay/direct/fallback, resume,
+  listener-kill recovery/cleanup, TLS control, collision policies, non-UTF8 path
+  handling, size boundaries, multi-frame manifests, symlink/device policies, and
+  NAT/UPnP flags.
 
 ### Added
 - **UDP upgrade retry: exponential backoff** (2→256 s, cap at ~4.3 min) replaces
@@ -134,6 +151,13 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
   `quinn::congestion::BbrConfig` instead of relying on Quinn's conservative
   defaults. The constants are documented in code so future tuning can adjust the
   BDP/memory trade-off in one place.
+
+### Fixed
+- Cross-platform transfer builds: optional UDP crates (`quinn`, `rcgen`,
+  `igd-next`) stay in the top-level dependency set so Windows `--all-features`
+  builds resolve them correctly, and Unix device handling in `src/transfer_v2.rs`
+  now uses portable `dev_t`/`major`/`minor`/`makedev` helpers so macOS and
+  Android no longer fail in the device-transfer path.
 
 ## [1.0.0]
 

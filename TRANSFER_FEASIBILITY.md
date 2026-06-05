@@ -1,5 +1,14 @@
 # Analisi di fattibilita: secure file transfer per bore
 
+> Stato aggiornato: `bore transfer` e ora implementato. Il comando supporta
+> file, directory e `stdin`, tenta UDP diretto con fallback relay automatico,
+> usa il protocollo V2 per i transfer filesystem (manifest + chunking + resume +
+> `--parallel` + staging + verifica BLAKE3 finale), espone `--overwrite` /
+> `--rename`, `--symlinks`, `--devices`, i flag NAT/UPnP e copertura e2e
+> dedicata. Il resto del file resta utile come razionale storico del design; per
+> il comportamento corrente vedi `README.md`, `USER_GUIDE.md`, `CHANGELOG.md` e
+> `CLAUDE.md`.
+
 ## Obiettivo
 
 Introdurre una nuova famiglia di comandi applicativi:

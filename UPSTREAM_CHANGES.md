@@ -77,6 +77,32 @@ paired `bore test-udp --tcp-secret-id` diagnostic (`paired_test_udp_diagnostic_e
 Lib unit tests cover transport/reconnect/shared/holepunch/udp_diagnostic helpers,
 plus doctests.
 
+## Current addition — secure file transfer V2
+
+- Added `bore transfer listener|sender` above the secret-tunnel transport. It
+  attempts the direct UDP path by default, falls back automatically to the relay,
+  and also supports `--relay-only` for deterministic fallback testing.
+- Filesystem mode lives in `src/transfer_v2.rs`: manifest + deterministic
+  chunking + receiver-side staging + persisted resume state + `--parallel`
+  worker streams + BLAKE3 verification per chunk/file/final summary + commit
+  only after verification. `stdin` is a separate single-stream path with
+  required `--output` and no resume.
+- Transfer flags mirror the transport stack: `--stun-server`, `--upnp`,
+  `--try-port-prediction`, `--nat-udp-preferred-port`,
+  `--nat-udp-release-timeout`, and relay `--carriers`. Listener-side collision
+  policy is fail by default with `--overwrite` / `--rename`; sender-side
+  scanning supports `--symlinks include|exclude` and `--devices include|exclude`.
+- Path fidelity is cross-platform: Unix raw-byte names and Windows UTF-16 names
+  are preserved on the wire; Windows invalid/reserved names sanitize to
+  `_bore_utf8_<hex>`. Unix device creation uses portable
+  `nix::libc::{major, minor, makedev}` + `dev_t` helpers instead of Linux-only
+  `nix::sys::stat::*`, which fixed macOS / Android build failures in the
+  device-transfer path.
+- Dedicated coverage lives in `tests/transfer_test.rs` (relay/direct/fallback,
+  resume, TLS control, boundaries, symlink/device policies, NAT flags,
+  multi-frame manifests) and `tests/transfer_stdin_cli_test.rs` (real subprocess
+  stdin plus listener-kill resume/cleanup).
+
 ## Architecture (after the rewrite)
 
 Client and server share **one** long-lived connection on the control port and

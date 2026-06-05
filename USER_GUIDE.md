@@ -740,6 +740,234 @@ le rispettive note e statistiche.
 
 ---
 
+### 4.9 Transfer sicuri (`bore transfer`)
+
+`bore transfer` usa lo stesso rendezvous dei tunnel segreti: tenta di default il
+path diretto UDP, fa fallback automatico al relay TCP e non memorizza mai il
+payload sul server. I transfer filesystem usano il protocollo V2: manifest,
+chunk deterministici, worker paralleli, staging lato listener, resume locale e
+verifica BLAKE3 per chunk, file e summary finale prima del commit. `stdin`
+resta invece uno stream singolo con `--output` obbligatorio.
+
+#### Listener base
+
+```shell
+bore transfer listener \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id nightly-backup \
+  --dest-path /srv/inbox
+```
+
+#### File singolo
+
+```shell
+bore transfer sender \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id nightly-backup \
+  --source /home/alice/archive.tar.gz \
+  --parallel 4 \
+  --carriers 4
+```
+
+#### Directory ricorsiva
+
+```shell
+bore transfer sender \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id project-tree \
+  --source /home/alice/project \
+  --parallel 4 \
+  --symlinks include
+```
+
+#### Stream da `stdin`
+
+```shell
+tar -cvpzf - project | bore transfer sender \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id project-stdin \
+  --source stdin \
+  --output project.tar.gz
+```
+
+#### Resume dopo interruzione
+
+Rilancia gli stessi due comandi con lo stesso `--transfer-id`, la stessa
+`--dest-path` e una sorgente invariata. Il listener riprende dai chunk già
+confermati.
+
+```shell
+bore transfer listener \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id nightly-backup \
+  --dest-path /srv/inbox
+
+bore transfer sender \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id nightly-backup \
+  --source /home/alice/archive.tar.gz \
+  --parallel 4
+```
+
+#### Relay-only forzato
+
+Utile per debug, per ambienti dove UDP è filtrato o per confrontare diretto vs
+fallback in modo deterministico.
+
+```shell
+bore transfer listener \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id relay-only-copy \
+  --dest-path /srv/inbox \
+  --relay-only
+
+bore transfer sender \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id relay-only-copy \
+  --source /home/alice/archive.tar.gz \
+  --relay-only \
+  --carriers 4
+```
+
+#### Diretto UDP con flag NAT / UPnP
+
+Le stesse opzioni NAT dei tunnel segreti sono disponibili anche sui transfer.
+Se il direct path non riesce, il comando torna automaticamente sul relay.
+
+```shell
+bore transfer listener \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id udp-copy \
+  --dest-path /srv/inbox \
+  --stun-server stun.cloudflare.com:3478 \
+  --upnp \
+  --try-port-prediction \
+  --nat-udp-preferred-port 41641 \
+  --nat-udp-release-timeout 120
+
+bore transfer sender \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id udp-copy \
+  --source /home/alice/archive.tar.gz \
+  --stun-server stun.cloudflare.com:3478 \
+  --upnp \
+  --try-port-prediction \
+  --nat-udp-preferred-port 41641 \
+  --nat-udp-release-timeout 120
+```
+
+#### TLS control con certificato self-signed
+
+Su server `https://` con certificato self-signed, sia listener sia sender devono
+passare `--insecure`.
+
+```shell
+bore transfer listener \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id tls-copy \
+  --dest-path /srv/inbox \
+  --insecure
+
+bore transfer sender \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id tls-copy \
+  --source /home/alice/archive.tar.gz \
+  --insecure
+```
+
+#### Destinazione esistente: fail, overwrite, rename
+
+La policy collisione è lato listener.
+
+```shell
+# Fail-safe di default: se la root finale esiste, il transfer fallisce.
+bore transfer listener --to https://bore.tld --secret hunter2 \
+  --transfer-id collision-fail --dest-path /srv/inbox
+
+# Sovrascrive la root esistente.
+bore transfer listener --to https://bore.tld --secret hunter2 \
+  --transfer-id collision-overwrite --dest-path /srv/inbox --overwrite
+
+# Rinomina la root finale in modo deterministico.
+bore transfer listener --to https://bore.tld --secret hunter2 \
+  --transfer-id collision-rename --dest-path /srv/inbox --rename
+```
+
+#### Symlink e device Unix
+
+Di default il sender esclude symlink e device. Puoi includerli esplicitamente.
+
+```shell
+# Include i symlink nel manifest.
+bore transfer sender \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id symlink-tree \
+  --source /home/alice/project \
+  --symlinks include
+
+# Include i device Unix nel manifest. Il receiver potrebbe richiedere privilegi
+# elevati per ricrearli.
+bore transfer sender \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id device-copy \
+  --source /dev/null \
+  --devices include
+```
+
+#### Molti file o relay ad alta concorrenza
+
+`--parallel N` governa i worker filesystem; `--carriers N` allarga solo la
+tratta relay. Sul direct UDP ogni connessione trasferita usa già il proprio
+stream QUIC nativo.
+
+```shell
+bore transfer sender \
+  --to https://bore.tld \
+  --secret hunter2 \
+  --transfer-id big-tree \
+  --source /data/big-tree \
+  --parallel 8 \
+  --carriers 4
+```
+
+#### Cosa garantisce il protocollo V2
+
+- I file regolari sono chunked e riprendibili; `stdin` non partecipa al resume.
+- Il commit sul listener avviene solo dopo la verifica finale.
+- I log mostrano se il path effettivo è `direct-udp` o `relay`, e se la control
+  connection è `tls` o `plain`.
+- I percorsi Unix raw-byte e Windows UTF-16 sono preservati sul wire; su
+  Windows i nomi riservati o invalidi vengono sanitizzati in
+  `_bore_utf8_<hex>`.
+- Il resume fallisce in modo esplicito se il manifest sorgente cambia tra due
+  tentativi.
+
+#### Casi coperti dai test end-to-end
+
+Le suite dedicate verificano: file singolo, zero-byte, directory, large file,
+resume relay/direct, fallback relay quando UDP è richiesto ma non disponibile,
+boundary di dimensione (`1`, `CHUNK_SIZE`, `CHUNK_SIZE±1`, multipli esatti),
+manifest multi-frame (>128 entry), policy `fail`/`overwrite`/`rename`, TLS sul
+control channel, symlink inclusi/esclusi, device inclusi/esclusi, flag NAT/UPnP,
+stdin reale via subprocess e kill del listener a metà transfer con resume e
+cleanup del state dir.
+
+---
+
 ## 5. Funzionalità trasversali
 
 Valgono in tutte le modalità della Sezione 4.

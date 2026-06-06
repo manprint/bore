@@ -1,20 +1,24 @@
-//! Secure file transfer built on top of bore's existing secret-tunnel transport.
+//! Secure file transfer built on top of bore's secret-tunnel transport.
 
 #![allow(missing_docs)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::{self, IsTerminal, Write};
+use std::io::{BufRead, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::fs::{self, File};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::info;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::task::{spawn_blocking, JoinHandle, JoinSet};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::client::{Client, ProviderMeta};
@@ -22,14 +26,19 @@ use crate::secret::Proxy;
 use crate::server::DEFAULT_MAX_CONNS;
 use crate::transport::Endpoint;
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 3;
 const FRAME_LIMIT: usize = 16 * 1024 * 1024;
 const MANIFEST_CHUNK: usize = 128;
 const COPY_BUFFER: usize = 64 * 1024;
+const CHUNK_SIZE: u32 = 1024 * 1024;
+const MAX_PARALLEL: u16 = 32;
+const RESUME_FLUSH_EVERY_CHUNKS: u64 = 8;
 const LOCAL_BIND: &str = "127.0.0.1:0";
 const LOCAL_HOST: &str = "127.0.0.1";
 const LOCAL_CONNECT_RETRIES: usize = 50;
 const LOCAL_CONNECT_DELAY: Duration = Duration::from_millis(20);
+const PROGRESS_TICK: Duration = Duration::from_millis(250);
+const RESUME_STATE_FILE: &str = "state.json";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
 pub enum CollisionPolicy {
@@ -68,6 +77,7 @@ pub struct ListenerOptions {
     pub nat_udp_release_timeout: u64,
     pub carriers: u16,
     pub collision: CollisionPolicy,
+    pub persistent: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -76,7 +86,9 @@ pub struct SenderOptions {
     pub secret: Option<String>,
     pub insecure: bool,
     pub transfer_id: Option<String>,
-    pub source: PathBuf,
+    pub sources: Vec<PathBuf>,
+    pub source_files: Vec<PathBuf>,
+    pub ask_confirm: bool,
     pub output: Option<PathBuf>,
     pub relay_only: bool,
     pub stun_server: Option<String>,
@@ -85,6 +97,7 @@ pub struct SenderOptions {
     pub nat_udp_preferred_port: u16,
     pub nat_udp_release_timeout: u64,
     pub carriers: u16,
+    pub parallel: u16,
     pub symlinks: SymlinkMode,
     pub devices: DeviceMode,
 }
@@ -164,13 +177,17 @@ struct BeginFrame {
     total_entries: u64,
     total_bytes: Option<u64>,
     transport: TransportMode,
+    requested_parallel: u16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ManifestEntry {
+    id: u32,
     rel_path: String,
     kind: EntryKind,
     size: Option<u64>,
+    full_hash: Option<String>,
+    chunk_count: u32,
     symlink_target: Option<String>,
     device: Option<DeviceDescriptor>,
     mode: Option<u32>,
@@ -182,7 +199,7 @@ struct DeviceDescriptor {
     minor: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct TransferSummary {
     regular_files: u64,
     directories: u64,
@@ -211,18 +228,71 @@ struct TransferRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct ResumeFilePlan {
+    entry_id: u32,
+    completed_chunks: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ResumeState {
+    protocol_version: u32,
+    transfer_id: String,
+    manifest_hash: String,
+    final_name: String,
+    files: Vec<FileResumeState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FileResumeState {
+    entry_id: u32,
+    completed: Vec<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum Frame {
     Begin(BeginFrame),
-    ManifestChunk { entries: Vec<ManifestEntry> },
+    ManifestChunk {
+        entries: Vec<ManifestEntry>,
+    },
     ManifestDone,
-    ManifestAccepted { final_name: String },
-    FileStart { rel_path: String, size: u64 },
-    FileEnd { rel_path: String, blake3: String },
-    StreamChunk { len: u32 },
-    StreamEnd { size: u64, blake3: String },
+    ManifestAccepted {
+        final_name: String,
+        parallel: u16,
+        resumed_bytes: u64,
+        resume: Vec<ResumeFilePlan>,
+    },
+    WorkerHello {
+        transfer_id: String,
+    },
+    WorkerDone,
+    WorkerComplete,
+    ChunkStart {
+        entry_id: u32,
+        chunk_index: u32,
+        offset: u64,
+        len: u32,
+        blake3: String,
+    },
+    ChunkAck {
+        entry_id: u32,
+        chunk_index: u32,
+    },
+    StreamChunk {
+        len: u32,
+    },
+    StreamEnd {
+        size: u64,
+        blake3: String,
+    },
+    StreamVerified {
+        size: u64,
+        blake3: String,
+    },
     TransferSummary(TransferSummary),
     Completed(CompletedFrame),
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +314,49 @@ struct PlannedTransfer {
     root_source: RootSourceKind,
     entries: Vec<PlannedEntry>,
     total_bytes: Option<u64>,
+    parallel: u16,
+}
+
+#[derive(Clone, Debug)]
+struct ChunkTask {
+    entry_id: u32,
+    path: PathBuf,
+    rel_path: String,
+    offset: u64,
+    len: u32,
+    chunk_index: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ReceiverPlan {
+    begin: BeginFrame,
+    entries: Vec<ManifestEntry>,
+    final_name: String,
+    final_path: PathBuf,
+    stage_dir: PathBuf,
+    stage_root: PathBuf,
+    _manifest_hash: String,
+    resume: Option<Arc<ResumeShared>>,
+    resumed_bytes: u64,
+    resume_plan: Vec<ResumeFilePlan>,
+}
+
+#[derive(Clone, Debug)]
+struct ResumeShared {
+    transfer_id: String,
+    state_file: PathBuf,
+    stage_root: PathBuf,
+    entries: Arc<BTreeMap<u32, ManifestEntry>>,
+    runtime: Arc<AsyncMutex<ResumeRuntime>>,
+    persist_lock: Arc<AsyncMutex<()>>,
+}
+
+#[derive(Clone, Debug)]
+struct ResumeRuntime {
+    state: ResumeState,
+    dirty_paths: BTreeSet<PathBuf>,
+    pending_persist: u64,
+    fresh_chunks: BTreeMap<u32, u32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -255,14 +368,108 @@ struct TransferCounts {
     total_bytes: u64,
 }
 
-#[derive(Debug)]
-struct ReceiverPlan {
-    begin: BeginFrame,
-    entries: Vec<ManifestEntry>,
-    final_name: String,
-    final_path: PathBuf,
-    stage_base: PathBuf,
-    stage_root: PathBuf,
+struct ProgressTracker {
+    shared: Arc<ProgressShared>,
+    task: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct ProgressHandle {
+    shared: Arc<ProgressShared>,
+}
+
+struct ProgressShared {
+    label: &'static str,
+    enabled: bool,
+    total_bytes: Option<u64>,
+    total_files: u64,
+    bytes_done: AtomicU64,
+    resumed_bytes: AtomicU64,
+    files_done: AtomicU64,
+    workers: AtomicU64,
+    current: StdMutex<String>,
+    finished: AtomicBool,
+    started_at: Instant,
+}
+
+impl ProgressTracker {
+    fn new(label: &'static str, total_bytes: Option<u64>, total_files: u64) -> Self {
+        let shared = Arc::new(ProgressShared {
+            label,
+            enabled: std::io::stderr().is_terminal(),
+            total_bytes,
+            total_files,
+            bytes_done: AtomicU64::new(0),
+            resumed_bytes: AtomicU64::new(0),
+            files_done: AtomicU64::new(0),
+            workers: AtomicU64::new(0),
+            current: StdMutex::new(String::new()),
+            finished: AtomicBool::new(false),
+            started_at: Instant::now(),
+        });
+        let task_shared = Arc::clone(&shared);
+        let task = tokio::spawn(async move {
+            if !task_shared.enabled {
+                return;
+            }
+            let mut interval = tokio::time::interval(PROGRESS_TICK);
+            loop {
+                interval.tick().await;
+                render_progress(&task_shared, task_shared.started_at.elapsed(), false);
+                if task_shared.finished.load(Ordering::Relaxed) {
+                    render_progress(&task_shared, task_shared.started_at.elapsed(), true);
+                    break;
+                }
+            }
+        });
+        Self {
+            shared,
+            task: Some(task),
+        }
+    }
+
+    fn handle(&self) -> ProgressHandle {
+        ProgressHandle {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    async fn finish(mut self) -> Duration {
+        let elapsed = self.shared.started_at.elapsed();
+        self.shared.finished.store(true, Ordering::Relaxed);
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+        elapsed
+    }
+}
+
+impl ProgressHandle {
+    fn set_current(&self, value: impl Into<String>) {
+        *self.shared.current.lock().expect("progress mutex") = value.into();
+    }
+
+    fn add_bytes(&self, bytes: u64) {
+        self.shared.bytes_done.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn add_resumed_bytes(&self, bytes: u64) {
+        self.shared
+            .resumed_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn worker_started(&self) {
+        self.shared.workers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn worker_finished(&self) {
+        self.shared.workers.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn add_file(&self) {
+        self.shared.files_done.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
@@ -281,21 +488,21 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
                 options.dest_path.display()
             )
         })?;
+
     let endpoint = Endpoint::parse(&options.to);
     info!(
         transfer_id = %transfer_id,
         dest_path = %options.dest_path.display(),
         udp = !options.relay_only,
-        stun_server = ?options.stun_server.as_deref(),
         carriers = options.carriers,
         relay_security = if endpoint.tls { "tls" } else { "plain" },
         "transfer listener starting"
     );
 
-    let listener = TcpListener::bind(LOCAL_BIND)
+    let internal = TcpListener::bind(LOCAL_BIND)
         .await
         .context("failed to bind transfer listener loopback port")?;
-    let local_port = listener.local_addr()?.port();
+    let local_port = internal.local_addr()?.port();
     let provider = Client::new_secret_provider(
         LOCAL_HOST,
         local_port,
@@ -310,29 +517,99 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
         options.nat_udp_preferred_port,
         options.nat_udp_release_timeout,
         DEFAULT_MAX_CONNS,
-        options.carriers,
+        options.carriers.max(1),
         ProviderMeta::default(),
     )
     .await?;
-    let provider_task = tokio::spawn(provider.listen());
+    let mut provider_task = tokio::spawn(provider.listen());
+
+    let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+    let mut accept_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = internal.accept().await?;
+            if conn_tx.send(stream).is_err() {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
 
     println!(
         "waiting for transfer {transfer_id} into {}",
         options.dest_path.display()
     );
-    let outcome = async {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .context("failed to accept transfer stream")?;
-        receive_transfer(stream, options.dest_path.clone(), options.collision).await
+
+    loop {
+        let control = tokio::select! {
+            maybe = conn_rx.recv() => match maybe {
+                Some(s) => s,
+                None => bail!("accept channel closed unexpectedly"),
+            },
+            result = &mut provider_task => match result {
+                Ok(Ok(())) => bail!("transfer listener transport ended before a sender connected"),
+                Ok(Err(err)) => return Err(err).context("transfer listener transport failed"),
+                Err(err) => bail!("transfer listener task failed: {err}"),
+            },
+            result = &mut accept_task => match result {
+                Ok(Ok(())) => bail!("transfer listener stopped accepting before a sender connected"),
+                Ok(Err(err)) => return Err(err).context("transfer listener accept loop failed"),
+                Err(err) => bail!("transfer listener accept task failed: {err}"),
+            },
+        };
+
+        let outcome = receive_transfer(
+            control,
+            &mut conn_rx,
+            options.dest_path.clone(),
+            options.collision,
+        )
+        .await;
+
+        match outcome {
+            Ok(mut o) => {
+                o.transfer_id = transfer_id.clone();
+                if !options.persistent {
+                    // Allow tunnel relay to drain before aborting — prevents spurious "channel closed" warnings
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    provider_task.abort();
+                    accept_task.abort();
+                    let _ = provider_task.await;
+                    let _ = accept_task.await;
+                    return Ok(o);
+                }
+                println!(
+                    "transfer complete, waiting for next transfer {transfer_id} into {}",
+                    options.dest_path.display()
+                );
+                // Drain leftover connections from completed transfer
+                let drain_end = tokio::time::Instant::now() + Duration::from_millis(200);
+                while let Ok(maybe) = tokio::time::timeout_at(drain_end, conn_rx.recv()).await {
+                    if maybe.is_none() {
+                        break;
+                    }
+                }
+            }
+            Err(err) => {
+                if !options.persistent {
+                    // Allow tunnel relay to drain before aborting — prevents spurious "channel closed" warnings
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    provider_task.abort();
+                    accept_task.abort();
+                    let _ = provider_task.await;
+                    let _ = accept_task.await;
+                    return Err(err);
+                }
+                warn!(%err, "transfer error in persistent mode, waiting for next sender");
+                // Drain leftover connections
+                let drain_end = tokio::time::Instant::now() + Duration::from_millis(500);
+                while let Ok(maybe) = tokio::time::timeout_at(drain_end, conn_rx.recv()).await {
+                    if maybe.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
     }
-    .await;
-    provider_task.abort();
-    outcome.map(|mut transfer| {
-        transfer.transfer_id = transfer_id;
-        transfer
-    })
 }
 
 pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
@@ -343,14 +620,30 @@ pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
     if options.transfer_id.is_none() {
         println!("transfer id: {transfer_id}");
     }
-    let plan = plan_transfer(
-        transfer_id.clone(),
-        &options.source,
-        options.output.as_deref(),
-        options.symlinks,
-        options.devices,
-    )
-    .await?;
+
+    // Gather all sources
+    let mut all_sources = options.sources.clone();
+    if !options.source_files.is_empty() {
+        let source_files = options.source_files.clone();
+        let extra = spawn_blocking(move || read_source_files(&source_files))
+            .await
+            .context("source-files read task failed")??;
+        all_sources.extend(extra);
+    }
+    if all_sources.is_empty() {
+        bail!("no sources specified; use --sources or --source-files");
+    }
+    if options.ask_confirm {
+        let sources_for_confirm = all_sources.clone();
+        let confirmed = spawn_blocking(move || confirm_sources_sync(&sources_for_confirm))
+            .await
+            .context("confirmation task failed")??;
+        if !confirmed {
+            bail!("transfer cancelled by user");
+        }
+    }
+
+    let plan = plan_transfer(transfer_id.clone(), &options, &all_sources).await?;
     let endpoint = Endpoint::parse(&options.to);
     let proxy = Proxy::new(
         &options.to,
@@ -364,7 +657,7 @@ pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
         options.try_port_prediction,
         options.nat_udp_preferred_port,
         options.nat_udp_release_timeout,
-        options.carriers,
+        options.carriers.max(1),
         None,
     )
     .await?;
@@ -383,22 +676,34 @@ pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
         transfer_id = %plan.transfer_id,
         transport = %transport,
         carriers = options.carriers,
+        requested_parallel = plan.parallel,
         "transfer sender transport ready"
     );
+    if !transport.direct_udp && plan.parallel > options.carriers.max(1) {
+        warn!(
+            parallel = plan.parallel,
+            carriers = options.carriers,
+            "parallel workers exceed carrier connections; relay path may have HOL blocking — consider matching --carriers to --parallel"
+        );
+    }
 
     let local_addr = proxy.local_addr()?;
     let proxy_task = tokio::spawn(proxy.listen());
     let outcome = async {
-        let stream = connect_local(local_addr).await?;
-        send_transfer(stream, plan, transport).await
+        let control = connect_local(local_addr).await?;
+        send_transfer(control, local_addr, plan, transport).await
     }
     .await;
+    // Allow tunnel relay to drain before aborting — prevents spurious "channel closed" warnings
+    tokio::time::sleep(Duration::from_millis(50)).await;
     proxy_task.abort();
+    let _ = proxy_task.await;
     outcome
 }
 
 async fn send_transfer(
-    mut stream: TcpStream,
+    mut control: TcpStream,
+    local_addr: std::net::SocketAddr,
     plan: PlannedTransfer,
     transport: TransportMode,
 ) -> Result<TransferOutcome> {
@@ -407,145 +712,273 @@ async fn send_transfer(
         .iter()
         .filter(|entry| entry.manifest.kind.is_regular_file())
         .count() as u64;
-    let mut progress = ProgressPrinter::new("sender", plan.total_bytes, regular_files_total);
-    let begin = BeginFrame {
-        protocol_version: PROTOCOL_VERSION,
-        transfer_id: plan.transfer_id.clone(),
-        root_name: plan.root_name.clone(),
-        root_source: plan.root_source,
-        total_entries: plan.entries.len() as u64,
-        total_bytes: plan.total_bytes,
-        transport,
-    };
-    send_frame(&mut stream, &Frame::Begin(begin.clone())).await?;
+    let root_name_display = display_component(&plan.root_name);
+    let progress = ProgressTracker::new("sender", plan.total_bytes, regular_files_total);
+    let handle = progress.handle();
+    handle.set_current(root_name_display.clone());
+
+    send_frame(
+        &mut control,
+        &Frame::Begin(BeginFrame {
+            protocol_version: PROTOCOL_VERSION,
+            transfer_id: plan.transfer_id.clone(),
+            root_name: plan.root_name.clone(),
+            root_source: plan.root_source,
+            total_entries: plan.entries.len() as u64,
+            total_bytes: plan.total_bytes,
+            transport,
+            requested_parallel: plan.parallel,
+        }),
+    )
+    .await?;
     for chunk in plan.entries.chunks(MANIFEST_CHUNK) {
         send_frame(
-            &mut stream,
+            &mut control,
             &Frame::ManifestChunk {
                 entries: chunk.iter().map(|entry| entry.manifest.clone()).collect(),
             },
         )
         .await?;
     }
-    send_frame(&mut stream, &Frame::ManifestDone).await?;
-    let accepted = expect_manifest_accepted(&mut stream).await?;
+    send_frame(&mut control, &Frame::ManifestDone).await?;
+
+    let (final_name, parallel, resumed_bytes, resume_plan) =
+        match expect_frame(&mut control).await? {
+            Frame::ManifestAccepted {
+                final_name,
+                parallel,
+                resumed_bytes,
+                resume,
+            } => (final_name, parallel, resumed_bytes, resume),
+            other => bail!("unexpected manifest response: {other:?}"),
+        };
     info!(
         transfer_id = %plan.transfer_id,
-        final_name = %accepted,
-        transport = %transport,
+        final_name = %display_component(&final_name),
+        resumed_bytes,
+        parallel,
         "transfer manifest accepted"
     );
+    handle.add_resumed_bytes(resumed_bytes);
 
-    let mut transfer_hasher = blake3::Hasher::new();
-    let mut counts = TransferCounts::default();
-    for entry in &plan.entries {
-        match entry.manifest.kind {
-            EntryKind::Directory => {
-                counts.directories += 1;
-                update_transfer_hash(&mut transfer_hasher, &entry.manifest, None)?;
-            }
-            EntryKind::Symlink => {
-                counts.symlinks += 1;
-                update_transfer_hash(&mut transfer_hasher, &entry.manifest, None)?;
-            }
-            EntryKind::CharDevice | EntryKind::BlockDevice => {
-                counts.devices += 1;
-                update_transfer_hash(&mut transfer_hasher, &entry.manifest, None)?;
-            }
-            EntryKind::RegularFile => {
-                counts.regular_files += 1;
-                progress.start_path(&display_rel_path(&entry.manifest.rel_path));
-                if plan.root_source == RootSourceKind::Stdin && entry.manifest.size.is_none() {
-                    send_stdin_payload(&mut stream, &entry.manifest, &mut progress).await?;
-                    let frame = expect_frame(&mut stream).await?;
-                    let (size, hash) = match frame {
-                        Frame::StreamEnd { size, blake3 } => (size, blake3),
-                        other => bail!("unexpected frame after stdin payload: {other:?}"),
-                    };
-                    counts.total_bytes += size;
-                    let manifest = ManifestEntry {
-                        size: Some(size),
-                        ..entry.manifest.clone()
-                    };
-                    update_transfer_hash(&mut transfer_hasher, &manifest, Some(hash.as_str()))?;
-                } else {
-                    let size = entry
-                        .manifest
-                        .size
-                        .context("regular file missing manifest size")?;
-                    send_frame(
-                        &mut stream,
-                        &Frame::FileStart {
-                            rel_path: entry.manifest.rel_path.clone(),
-                            size,
-                        },
-                    )
-                    .await?;
-                    let hash = send_regular_file(
-                        &mut stream,
-                        entry
-                            .source_path
-                            .as_deref()
-                            .context("regular file missing source path")?,
-                        size,
-                        &entry.manifest.rel_path,
-                        &mut progress,
-                    )
-                    .await?;
-                    send_frame(
-                        &mut stream,
-                        &Frame::FileEnd {
-                            rel_path: entry.manifest.rel_path.clone(),
-                            blake3: hash.clone(),
-                        },
-                    )
-                    .await?;
-                    counts.total_bytes += size;
-                    update_transfer_hash(
-                        &mut transfer_hasher,
-                        &entry.manifest,
-                        Some(hash.as_str()),
-                    )?;
-                }
-                progress.finish_file(&display_rel_path(&entry.manifest.rel_path));
-            }
+    let summary = if plan.root_source == RootSourceKind::Stdin {
+        send_stdin_stream(&mut control, &plan, &handle).await?
+    } else {
+        let tasks = build_chunk_tasks(&plan, &resume_plan)?;
+        if !tasks.is_empty() {
+            send_chunked_files(
+                local_addr,
+                &plan.transfer_id,
+                tasks,
+                parallel,
+                handle.clone(),
+            )
+            .await?;
         }
-    }
-    let summary = TransferSummary {
-        regular_files: counts.regular_files,
-        directories: counts.directories,
-        symlinks: counts.symlinks,
-        devices: counts.devices,
-        total_bytes: counts.total_bytes,
-        transfer_hash: transfer_hasher.finalize().to_hex().to_string(),
+        summary_from_entries(&plan.entries)?
     };
-    send_frame(&mut stream, &Frame::TransferSummary(summary.clone())).await?;
-    let completed = match expect_frame(&mut stream).await? {
+
+    send_frame(&mut control, &Frame::TransferSummary(summary.clone())).await?;
+    let completed = match expect_frame(&mut control).await? {
         Frame::Completed(done) => done,
         other => bail!("unexpected final frame from receiver: {other:?}"),
     };
     if completed.transfer_hash != summary.transfer_hash {
         bail!("receiver acknowledged a different transfer hash");
     }
-    progress.finish();
+
+    let elapsed = progress.finish().await;
+    print_transfer_done(
+        "sender",
+        &root_name_display,
+        completed.total_bytes,
+        elapsed,
+        None,
+    );
+    let _ = control.shutdown().await;
     Ok(TransferOutcome {
         transfer_id: plan.transfer_id,
-        final_path: decode_native_path_string(&completed.final_path)?,
+        final_path: decode_native_path(&completed.final_path),
         total_bytes: completed.total_bytes,
         regular_files: completed.regular_files,
         transport,
     })
 }
 
+async fn send_chunked_files(
+    local_addr: std::net::SocketAddr,
+    transfer_id: &str,
+    tasks: Vec<ChunkTask>,
+    parallel: u16,
+    progress: ProgressHandle,
+) -> Result<()> {
+    let injected_limit = injected_fail_after_chunks();
+    let sent = Arc::new(AtomicU64::new(0));
+    let queue = Arc::new(AsyncMutex::new(VecDeque::from(tasks)));
+    let mut joins = JoinSet::new();
+    let workers = parallel.clamp(1, MAX_PARALLEL) as usize;
+
+    for _ in 0..workers {
+        let queue = Arc::clone(&queue);
+        let transfer_id = transfer_id.to_string();
+        let progress = progress.clone();
+        let sent = Arc::clone(&sent);
+        joins.spawn(async move {
+            let mut stream = connect_local(local_addr).await?;
+            send_frame(
+                &mut stream,
+                &Frame::WorkerHello {
+                    transfer_id: transfer_id.clone(),
+                },
+            )
+            .await?;
+            progress.worker_started();
+            let worker_result = async {
+                let mut file_cache: HashMap<PathBuf, tokio::fs::File> = HashMap::new();
+                loop {
+                    let task = {
+                        let mut guard = queue.lock().await;
+                        guard.pop_front()
+                    };
+                    let Some(task) = task else {
+                        send_frame(&mut stream, &Frame::WorkerDone).await?;
+                        break Ok::<(), anyhow::Error>(());
+                    };
+                    if task.chunk_index == 0 {
+                        progress.add_file();
+                    }
+                    if !task.rel_path.is_empty() {
+                        progress.set_current(display_rel_path(&task.rel_path));
+                    }
+                    let chunk = {
+                        let file = if let Some(f) = file_cache.get_mut(&task.path) {
+                            f
+                        } else {
+                            let f = tokio::fs::File::open(&task.path).await.with_context(|| {
+                                format!("failed to open source file {}", task.path.display())
+                            })?;
+                            file_cache.entry(task.path.clone()).or_insert(f)
+                        };
+                        file.seek(std::io::SeekFrom::Start(task.offset)).await?;
+                        let mut buf = vec![0u8; task.len as usize];
+                        file.read_exact(&mut buf).await?;
+                        buf
+                    };
+                    let digest = blake3::hash(&chunk).to_hex().to_string();
+                    send_frame(
+                        &mut stream,
+                        &Frame::ChunkStart {
+                            entry_id: task.entry_id,
+                            chunk_index: task.chunk_index,
+                            offset: task.offset,
+                            len: task.len,
+                            blake3: digest,
+                        },
+                    )
+                    .await?;
+                    stream.write_all(&chunk).await?;
+                    progress.add_bytes(task.len as u64);
+                    let count = sent.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(limit) = injected_limit {
+                        if count >= limit {
+                            bail!("forced transfer interruption after {limit} chunks sent");
+                        }
+                    }
+                }
+            }
+            .await;
+            // Read terminal frame from receiver (WorkerComplete or Error)
+            if worker_result.is_ok() {
+                let terminal = async {
+                    match expect_frame(&mut stream).await? {
+                        Frame::WorkerComplete => Ok(()),
+                        Frame::Error { message } => {
+                            bail!("receiver worker reported error: {message}")
+                        }
+                        other => bail!("unexpected terminal worker frame: {other:?}"),
+                    }
+                }
+                .await;
+                progress.worker_finished();
+                return terminal;
+            }
+            progress.worker_finished();
+            if let Err(err) = &worker_result {
+                warn!(%err, "transfer worker failed");
+            }
+            worker_result
+        });
+    }
+
+    while let Some(joined) = joins.join_next().await {
+        joined.context("worker join failed")??;
+    }
+    Ok(())
+}
+
+async fn send_stdin_stream(
+    control: &mut TcpStream,
+    plan: &PlannedTransfer,
+    progress: &ProgressHandle,
+) -> Result<TransferSummary> {
+    let entry = plan
+        .entries
+        .first()
+        .context("stdin transfer is missing its manifest entry")?;
+    progress.set_current("stdin");
+    let mut stdin = io::stdin();
+    let mut buffer = vec![0u8; COPY_BUFFER];
+    let mut total = 0u64;
+    let mut hasher = blake3::Hasher::new();
+    loop {
+        let read = stdin
+            .read(&mut buffer)
+            .await
+            .context("failed to read stdin")?;
+        if read == 0 {
+            break;
+        }
+        send_frame(control, &Frame::StreamChunk { len: read as u32 }).await?;
+        control.write_all(&buffer[..read]).await?;
+        hasher.update(&buffer[..read]);
+        total += read as u64;
+        progress.add_bytes(read as u64);
+    }
+    let digest = hasher.finalize().to_hex().to_string();
+    send_frame(
+        control,
+        &Frame::StreamEnd {
+            size: total,
+            blake3: digest.clone(),
+        },
+    )
+    .await?;
+    match expect_frame(control).await? {
+        Frame::StreamVerified { size, blake3 } => {
+            if size != total || blake3 != digest {
+                bail!("receiver did not verify the same stdin stream");
+            }
+        }
+        other => bail!("unexpected stdin verification frame: {other:?}"),
+    }
+    let manifest = ManifestEntry {
+        size: Some(total),
+        full_hash: Some(digest),
+        ..entry.manifest.clone()
+    };
+    summary_from_materialized_entries(&[manifest])
+}
+
 async fn receive_transfer(
-    mut stream: TcpStream,
+    mut control: TcpStream,
+    incoming: &mut mpsc::UnboundedReceiver<TcpStream>,
     dest_root: PathBuf,
     collision: CollisionPolicy,
 ) -> Result<TransferOutcome> {
     let outcome = async {
-        let begin = match expect_frame(&mut stream).await? {
+        let begin = match expect_frame(&mut control).await? {
             Frame::Begin(begin) => begin,
-            other => bail!("unexpected first frame: {other:?}"),
+            other => bail!("unexpected first control frame: {other:?}"),
         };
         if begin.protocol_version != PROTOCOL_VERSION {
             bail!(
@@ -559,31 +992,70 @@ async fn receive_transfer(
             relay_security = begin.transport.security(),
             "transfer incoming"
         );
-        let plan = receive_manifest(&mut stream, begin, &dest_root, collision).await?;
+
+        let plan = receive_manifest(&mut control, begin, &dest_root, collision).await?;
         send_frame(
-            &mut stream,
+            &mut control,
             &Frame::ManifestAccepted {
                 final_name: plan.final_name.clone(),
+                parallel: plan.begin.requested_parallel.clamp(1, MAX_PARALLEL),
+                resumed_bytes: plan.resumed_bytes,
+                resume: plan.resume_plan.clone(),
             },
         )
         .await?;
-        let mut progress = ProgressPrinter::new(
+
+        let total_files = plan
+            .entries
+            .iter()
+            .filter(|entry| entry.kind.is_regular_file())
+            .count() as u64;
+        let progress = ProgressTracker::new("listener", plan.begin.total_bytes, total_files);
+        let handle = progress.handle();
+        handle.add_resumed_bytes(plan.resumed_bytes);
+        handle.set_current(display_component(&plan.final_name));
+
+        let sender_summary = if plan.begin.root_source == RootSourceKind::Stdin {
+            receive_stdin_stream(&mut control, &plan, &handle).await?
+        } else {
+            receive_filesystem_streams(&mut control, incoming, &plan, &handle).await?
+        };
+
+        let local_summary = verify_summary(&plan).await?;
+        if sender_summary != local_summary {
+            bail!("sender summary does not match receiver state");
+        }
+        commit_stage(&plan, collision).await?;
+        send_frame(
+            &mut control,
+            &Frame::Completed(CompletedFrame {
+                final_path: encode_native_path(&plan.final_path),
+                total_bytes: local_summary.total_bytes,
+                regular_files: local_summary.regular_files,
+                transfer_hash: local_summary.transfer_hash.clone(),
+            }),
+        )
+        .await?;
+        let elapsed = progress.finish().await;
+        let dest_name = plan
+            .final_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| plan.final_path.to_string_lossy().to_string());
+        print_transfer_done(
             "listener",
-            plan.begin.total_bytes,
-            plan.entries
-                .iter()
-                .filter(|entry| entry.kind.is_regular_file())
-                .count() as u64,
+            &dest_name,
+            local_summary.total_bytes,
+            elapsed,
+            Some(&plan.final_path),
         );
-        let (summary, completed) = receive_payload(&mut stream, &plan, &mut progress).await?;
-        commit_receiver_plan(&plan).await?;
-        send_frame(&mut stream, &Frame::Completed(completed.clone())).await?;
-        progress.finish();
+        let _ = control.shutdown().await;
+
         Ok(TransferOutcome {
-            transfer_id: plan.begin.transfer_id.clone(),
+            transfer_id: plan.begin.transfer_id,
             final_path: plan.final_path,
-            total_bytes: summary.total_bytes,
-            regular_files: summary.regular_files,
+            total_bytes: local_summary.total_bytes,
+            regular_files: local_summary.regular_files,
             transport: plan.begin.transport,
         })
     }
@@ -591,7 +1063,7 @@ async fn receive_transfer(
 
     if let Err(err) = &outcome {
         let _ = send_frame(
-            &mut stream,
+            &mut control,
             &Frame::Error {
                 message: err.to_string(),
             },
@@ -601,142 +1073,237 @@ async fn receive_transfer(
     outcome
 }
 
-async fn receive_payload(
-    stream: &mut TcpStream,
+async fn receive_filesystem_streams(
+    control: &mut TcpStream,
+    incoming: &mut mpsc::UnboundedReceiver<TcpStream>,
     plan: &ReceiverPlan,
-    progress: &mut ProgressPrinter,
-) -> Result<(TransferSummary, CompletedFrame)> {
-    let mut transfer_hasher = blake3::Hasher::new();
-    let mut counts = TransferCounts::default();
+    progress: &ProgressHandle,
+) -> Result<TransferSummary> {
+    let resume = plan
+        .resume
+        .as_ref()
+        .context("filesystem transfer is missing resume state")?
+        .clone();
+    let mut workers = JoinSet::new();
+    let expected_workers = expected_worker_connections(plan);
 
-    create_stage_entries(plan).await?;
+    // `expect_frame(control)` is not cancellation-safe: if a `select!` branch drops it
+    // after the 4-byte length prefix was read, the next read starts at the JSON body.
+    // Accept worker streams first, then read the summary once all workers drained.
+    for _ in 0..expected_workers {
+        let stream = incoming
+            .recv()
+            .await
+            .context("worker channel closed before all worker streams connected")?;
+        let resume = resume.clone();
+        let progress = progress.clone();
+        workers.spawn(async move { handle_worker_connection(stream, resume, progress).await });
+    }
+    while let Some(joined) = workers.join_next().await {
+        let joined = joined.context("worker join failed")?;
+        joined?;
+    }
+    match expect_frame(control).await? {
+        Frame::TransferSummary(summary) => Ok(summary),
+        other => bail!("unexpected control frame while waiting for transfer summary: {other:?}"),
+    }
+}
 
-    for entry in &plan.entries {
-        match entry.kind {
-            EntryKind::Directory => {
-                counts.directories += 1;
-                update_transfer_hash(&mut transfer_hasher, entry, None)?;
+fn expected_worker_connections(plan: &ReceiverPlan) -> usize {
+    let completed: BTreeMap<u32, usize> = plan
+        .resume_plan
+        .iter()
+        .map(|entry| (entry.entry_id, entry.completed_chunks.len()))
+        .collect();
+    let pending_chunks = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.kind.is_regular_file())
+        .map(|entry| {
+            let done = completed.get(&entry.id).copied().unwrap_or_default() as u32;
+            entry.chunk_count.saturating_sub(done) as usize
+        })
+        .sum::<usize>();
+    if pending_chunks == 0 {
+        0
+    } else {
+        plan.begin.requested_parallel.clamp(1, MAX_PARALLEL) as usize
+    }
+}
+
+async fn handle_worker_connection(
+    mut stream: TcpStream,
+    resume: Arc<ResumeShared>,
+    progress: ProgressHandle,
+) -> Result<()> {
+    match expect_frame(&mut stream).await? {
+        Frame::WorkerHello { transfer_id } => {
+            if transfer_id != resume.transfer_id {
+                bail!("worker connected for unexpected transfer id {transfer_id}");
             }
-            EntryKind::Symlink => {
-                counts.symlinks += 1;
-                update_transfer_hash(&mut transfer_hasher, entry, None)?;
-            }
-            EntryKind::CharDevice | EntryKind::BlockDevice => {
-                counts.devices += 1;
-                update_transfer_hash(&mut transfer_hasher, entry, None)?;
-            }
-            EntryKind::RegularFile => {
-                counts.regular_files += 1;
-                progress.start_path(&display_rel_path(&entry.rel_path));
-                if plan.begin.root_source == RootSourceKind::Stdin && entry.size.is_none() {
-                    let (size, hash) = receive_stdin_payload(
-                        stream,
-                        stage_path(plan, entry),
-                        entry.mode,
-                        &entry.rel_path,
-                        progress,
-                    )
-                    .await?;
-                    counts.total_bytes += size;
-                    let materialized = ManifestEntry {
-                        size: Some(size),
-                        ..entry.clone()
-                    };
-                    update_transfer_hash(&mut transfer_hasher, &materialized, Some(hash.as_str()))?;
-                    send_frame(stream, &Frame::StreamEnd { size, blake3: hash }).await?;
-                } else {
-                    let size = entry.size.context("receiver manifest missing file size")?;
-                    let (rel_path, announced_size) = match expect_frame(stream).await? {
-                        Frame::FileStart { rel_path, size } => (rel_path, size),
-                        other => bail!("unexpected frame before file payload: {other:?}"),
-                    };
-                    if rel_path != entry.rel_path {
+        }
+        other => bail!("unexpected first worker frame: {other:?}"),
+    }
+    progress.worker_started();
+    let mut file_cache: HashMap<u32, tokio::fs::File> = HashMap::new();
+    let worker_result = async {
+        loop {
+            match recv_frame(&mut stream).await? {
+                Some(Frame::ChunkStart {
+                    entry_id,
+                    chunk_index,
+                    offset,
+                    len,
+                    blake3,
+                }) => {
+                    let entry = resume
+                        .entries
+                        .get(&entry_id)
+                        .with_context(|| format!("unknown entry id {entry_id}"))?
+                        .clone();
+                    if !entry.kind.is_regular_file() {
+                        bail!("chunk data is only valid for regular files");
+                    }
+                    let mut payload = vec![0u8; len as usize];
+                    stream.read_exact(&mut payload).await?;
+                    let local_hash = blake3::hash(&payload).to_hex().to_string();
+                    if local_hash != blake3 {
                         bail!(
-                            "sender file order mismatch: expected {}, got {}",
+                            "chunk hash mismatch for {} chunk {}",
                             display_rel_path(&entry.rel_path),
-                            display_rel_path(&rel_path)
+                            chunk_index
                         );
                     }
-                    if announced_size != size {
-                        bail!(
-                            "sender announced an unexpected file size for {}",
-                            display_rel_path(&rel_path)
-                        );
+                    if !resume.is_chunk_complete(entry_id, chunk_index).await? {
+                        let path = stage_path(&resume.stage_root, &entry.rel_path)?;
+                        let file = if let Some(f) = file_cache.get_mut(&entry_id) {
+                            f
+                        } else {
+                            let f = tokio::fs::OpenOptions::new()
+                                .create(false)
+                                .truncate(false)
+                                .write(true)
+                                .open(&path)
+                                .await
+                                .with_context(|| {
+                                    format!("failed to open staged file {}", path.display())
+                                })?;
+                            file_cache.entry(entry_id).or_insert(f)
+                        };
+                        file.seek(std::io::SeekFrom::Start(offset)).await?;
+                        file.write_all(&payload).await?;
+                        resume
+                            .mark_chunk_complete(entry_id, chunk_index, &path)
+                            .await?;
                     }
-                    let hash = receive_regular_file(
-                        stream,
-                        stage_path(plan, entry),
-                        size,
-                        entry.mode,
-                        &entry.rel_path,
-                        progress,
-                    )
-                    .await?;
-                    match expect_frame(stream).await? {
-                        Frame::FileEnd { rel_path, blake3 } => {
-                            if rel_path != entry.rel_path {
-                                bail!(
-                                    "file end path mismatch for {}",
-                                    display_rel_path(&entry.rel_path)
-                                );
-                            }
-                            if blake3 != hash {
-                                bail!("hash mismatch for {}", display_rel_path(&entry.rel_path));
-                            }
-                            counts.total_bytes += size;
-                            update_transfer_hash(&mut transfer_hasher, entry, Some(hash.as_str()))?;
-                        }
-                        other => bail!("unexpected frame after file payload: {other:?}"),
+                    if chunk_index == 0 {
+                        progress.add_file();
                     }
+                    if !entry.rel_path.is_empty() {
+                        progress.set_current(display_rel_path(&entry.rel_path));
+                    }
+                    progress.add_bytes(len as u64);
                 }
-                progress.finish_file(&display_rel_path(&entry.rel_path));
+                Some(Frame::WorkerDone) => {
+                    resume.flush_pending().await?;
+                    send_frame(&mut stream, &Frame::WorkerComplete).await?;
+                    break Ok::<(), anyhow::Error>(());
+                }
+                Some(Frame::Error { message }) => bail!("sender worker aborted: {message}"),
+                Some(other) => bail!("unexpected worker frame: {other:?}"),
+                None => break Ok(()),
             }
         }
     }
-
-    let summary = match expect_frame(stream).await? {
-        Frame::TransferSummary(summary) => summary,
-        other => bail!("unexpected frame before transfer completion: {other:?}"),
-    };
-    let local_summary = TransferSummary {
-        regular_files: counts.regular_files,
-        directories: counts.directories,
-        symlinks: counts.symlinks,
-        devices: counts.devices,
-        total_bytes: counts.total_bytes,
-        transfer_hash: transfer_hasher.finalize().to_hex().to_string(),
-    };
-    if summary.regular_files != local_summary.regular_files
-        || summary.directories != local_summary.directories
-        || summary.symlinks != local_summary.symlinks
-        || summary.devices != local_summary.devices
-        || summary.total_bytes != local_summary.total_bytes
-        || summary.transfer_hash != local_summary.transfer_hash
-    {
-        bail!("sender summary does not match receiver state");
+    .await;
+    // Ensure partial progress is persisted even on error/EOF paths
+    let flush_result = resume.flush_pending().await;
+    if let Err(err) = &worker_result {
+        let _ = send_frame(
+            &mut stream,
+            &Frame::Error {
+                message: err.to_string(),
+            },
+        )
+        .await;
     }
-    let completed = CompletedFrame {
-        final_path: path_to_platform_string(&plan.final_path)?,
-        total_bytes: local_summary.total_bytes,
-        regular_files: local_summary.regular_files,
-        transfer_hash: local_summary.transfer_hash.clone(),
-    };
-    Ok((local_summary, completed))
+    progress.worker_finished();
+    flush_result?;
+    worker_result
+}
+
+async fn receive_stdin_stream(
+    control: &mut TcpStream,
+    plan: &ReceiverPlan,
+    progress: &ProgressHandle,
+) -> Result<TransferSummary> {
+    let entry = plan
+        .entries
+        .first()
+        .context("stdin receiver plan is missing its manifest entry")?
+        .clone();
+    progress.set_current("stdin");
+    let path = stage_path(&plan.stage_root, &entry.rel_path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let mut file = File::create(&path)
+        .await
+        .with_context(|| format!("failed to create destination file {}", path.display()))?;
+    let mut total = 0u64;
+    let mut hasher = blake3::Hasher::new();
+    loop {
+        match expect_frame(control).await? {
+            Frame::StreamChunk { len } => {
+                let mut buf = vec![0u8; len as usize];
+                control.read_exact(&mut buf).await?;
+                file.write_all(&buf).await?;
+                hasher.update(&buf);
+                total += len as u64;
+                progress.add_bytes(len as u64);
+            }
+            Frame::StreamEnd { size, blake3 } => {
+                file.flush().await?;
+                file.sync_all().await?;
+                set_file_mode(&path, entry.mode).await?;
+                let local = hasher.finalize().to_hex().to_string();
+                if size != total {
+                    bail!("stdin byte count mismatch");
+                }
+                if blake3 != local {
+                    bail!("stdin stream hash mismatch");
+                }
+                send_frame(
+                    control,
+                    &Frame::StreamVerified {
+                        size,
+                        blake3: local.clone(),
+                    },
+                )
+                .await?;
+                let materialized = ManifestEntry {
+                    size: Some(size),
+                    full_hash: Some(local),
+                    ..entry
+                };
+                return summary_from_materialized_entries(&[materialized]);
+            }
+            other => bail!("unexpected frame in stdin stream: {other:?}"),
+        }
+    }
 }
 
 async fn receive_manifest(
-    stream: &mut TcpStream,
+    control: &mut TcpStream,
     begin: BeginFrame,
     dest_root: &Path,
     collision: CollisionPolicy,
 ) -> Result<ReceiverPlan> {
-    validate_root_name(&begin.root_name)?;
     let mut entries = Vec::with_capacity(begin.total_entries as usize);
     loop {
-        match expect_frame(stream).await? {
+        match expect_frame(control).await? {
             Frame::ManifestChunk { entries: chunk } => entries.extend(chunk),
             Frame::ManifestDone => break,
-            Frame::Error { message } => bail!("sender reported an error: {message}"),
             other => bail!("unexpected frame while receiving manifest: {other:?}"),
         }
     }
@@ -744,260 +1311,592 @@ async fn receive_manifest(
         bail!("manifest entry count mismatch");
     }
     validate_manifest(&begin, &entries)?;
-    let final_name = resolve_final_name(dest_root, &begin.root_name, collision).await?;
-    let final_name_local = decode_component_string(&final_name)?;
-    let transfer_nonce = Uuid::new_v4().to_string();
-    let stage_base = dest_root.join(format!(".bore-transfer-{transfer_nonce}.part"));
-    let stage_root = stage_base.join(&final_name_local);
-    fs::create_dir_all(&stage_base).await.with_context(|| {
-        format!(
-            "failed to create staging directory {}",
-            stage_base.display()
+    let manifest_hash = manifest_hash(&begin.root_name, begin.root_source, &entries)?;
+
+    if begin.root_source == RootSourceKind::Stdin {
+        let requested = decode_component(&begin.root_name);
+        let final_name_local = resolve_final_name_local(dest_root, &requested, collision).await?;
+        let final_name = encode_component_os(&final_name_local);
+        let stage_dir = temp_stage_dir(dest_root, &begin.transfer_id);
+        let stage_root = stage_dir.join(&final_name_local);
+        fs::create_dir_all(&stage_dir)
+            .await
+            .with_context(|| format!("failed to create stage dir {}", stage_dir.display()))?;
+        return Ok(ReceiverPlan {
+            begin,
+            entries,
+            final_name,
+            final_path: dest_root.join(final_name_local),
+            stage_dir,
+            stage_root,
+            _manifest_hash: manifest_hash,
+            resume: None,
+            resumed_bytes: 0,
+            resume_plan: Vec::new(),
+        });
+    }
+
+    let stage_dir = resume_state_dir(dest_root, &begin.transfer_id);
+    let state_file = stage_dir.join(RESUME_STATE_FILE);
+    let (final_name, final_name_local, state, resumed_bytes, resume_plan) = if fs::try_exists(
+        &state_file,
+    )
+    .await?
+    {
+        let state = load_resume_state(&state_file).await?;
+        if state.protocol_version != PROTOCOL_VERSION {
+            bail!(
+                "resume state for transfer {} was created by protocol version {}",
+                begin.transfer_id,
+                state.protocol_version
+            );
+        }
+        if state.transfer_id != begin.transfer_id || state.manifest_hash != manifest_hash {
+            bail!(
+                "resume state for transfer {} does not match the current manifest; remove {} to start fresh",
+                begin.transfer_id,
+                stage_dir.display()
+            );
+        }
+        let (resumed_bytes, resume_plan) = build_resume_plan(&entries, &state)?;
+        let final_name_local = decode_component(&state.final_name);
+        (
+            state.final_name.clone(),
+            final_name_local,
+            state,
+            resumed_bytes,
+            resume_plan,
         )
-    })?;
+    } else {
+        fs::create_dir_all(&stage_dir)
+            .await
+            .with_context(|| format!("failed to create state directory {}", stage_dir.display()))?;
+        let requested = decode_component(&begin.root_name);
+        let final_name_local = resolve_final_name_local(dest_root, &requested, collision).await?;
+        let final_name = encode_component_os(&final_name_local);
+        let state = ResumeState {
+            protocol_version: PROTOCOL_VERSION,
+            transfer_id: begin.transfer_id.clone(),
+            manifest_hash: manifest_hash.clone(),
+            final_name: final_name.clone(),
+            files: entries
+                .iter()
+                .filter(|entry| entry.kind.is_regular_file())
+                .map(|entry| FileResumeState {
+                    entry_id: entry.id,
+                    completed: vec![false; entry.chunk_count as usize],
+                })
+                .collect(),
+        };
+        persist_resume_state(&state_file, &state).await?;
+        (final_name, final_name_local, state, 0, Vec::new())
+    };
+    let stage_root = stage_dir.join(&final_name_local);
+    prepare_stage_entries(&stage_root, &entries).await?;
+    let resume = Arc::new(ResumeShared {
+        transfer_id: begin.transfer_id.clone(),
+        state_file,
+        stage_root: stage_root.clone(),
+        entries: Arc::new(
+            entries
+                .iter()
+                .cloned()
+                .map(|entry| (entry.id, entry))
+                .collect(),
+        ),
+        runtime: Arc::new(AsyncMutex::new(ResumeRuntime {
+            state,
+            dirty_paths: BTreeSet::new(),
+            pending_persist: 0,
+            fresh_chunks: BTreeMap::new(),
+        })),
+        persist_lock: Arc::new(AsyncMutex::new(())),
+    });
+
     Ok(ReceiverPlan {
         begin,
         entries,
-        final_name: final_name.clone(),
+        final_name,
         final_path: dest_root.join(final_name_local),
-        stage_base,
+        stage_dir,
         stage_root,
+        _manifest_hash: manifest_hash,
+        resume: Some(resume),
+        resumed_bytes,
+        resume_plan,
     })
 }
 
-async fn create_stage_entries(plan: &ReceiverPlan) -> Result<()> {
-    for entry in &plan.entries {
-        let path = stage_path(plan, entry);
+async fn prepare_stage_entries(stage_root: &Path, entries: &[ManifestEntry]) -> Result<()> {
+    for entry in entries {
+        let path = stage_path(stage_root, &entry.rel_path)?;
         match entry.kind {
             EntryKind::Directory => {
-                fs::create_dir_all(&path)
-                    .await
-                    .with_context(|| format!("failed to create directory {}", path.display()))?;
+                fs::create_dir_all(&path).await?;
+            }
+            EntryKind::RegularFile => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).await?;
+                }
+                prepare_regular_file(&path, entry.size.unwrap_or(0)).await?;
             }
             EntryKind::Symlink => {
-                let target = entry
-                    .symlink_target
-                    .as_ref()
-                    .context("symlink entry missing target")?
-                    .clone();
-                ensure_parent_dir(&path).await?;
+                if path_exists(&path).await? {
+                    continue;
+                }
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).await?;
+                }
+                let target = decode_native_path(
+                    entry
+                        .symlink_target
+                        .as_deref()
+                        .context("symlink entry is missing its target")?,
+                );
                 create_symlink(&target, &path).await?;
             }
             EntryKind::CharDevice | EntryKind::BlockDevice => {
-                ensure_parent_dir(&path).await?;
+                if path_exists(&path).await? {
+                    continue;
+                }
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).await?;
+                }
                 create_device(entry, &path).await?;
-            }
-            EntryKind::RegularFile => {
-                ensure_parent_dir(&path).await?;
             }
         }
     }
     Ok(())
 }
 
-async fn commit_receiver_plan(plan: &ReceiverPlan) -> Result<()> {
-    let final_exists = fs::try_exists(&plan.final_path).await?;
-    let mut backup = None;
-    if final_exists {
-        let backup_path = plan
-            .stage_base
-            .join(format!(".overwrite-backup-{}", plan.final_name));
-        fs::rename(&plan.final_path, &backup_path)
+async fn prepare_regular_file(path: &Path, size: u64) -> Result<()> {
+    let path = path.to_path_buf();
+    spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open staged file {}", path.display()))?;
+        file.set_len(size)
+            .with_context(|| format!("failed to resize staged file {}", path.display()))?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("regular file preparation task failed")?
+}
+
+fn validate_manifest(begin: &BeginFrame, entries: &[ManifestEntry]) -> Result<()> {
+    if entries.is_empty() {
+        bail!("manifest is empty");
+    }
+    let root = entries.first().context("manifest is empty")?;
+    if !root.rel_path.is_empty() {
+        bail!("manifest root entry must use an empty relative path");
+    }
+    let mut seen_ids = BTreeMap::new();
+    let mut seen_paths = BTreeMap::<PathBuf, EntryKind>::new();
+    for entry in entries {
+        if seen_ids.insert(entry.id, ()).is_some() {
+            bail!("duplicate manifest entry id {}", entry.id);
+        }
+        let path = decode_relative_path(&entry.rel_path)?;
+        validate_relative_path(&path)?;
+        if seen_paths.insert(path.clone(), entry.kind).is_some() {
+            bail!(
+                "duplicate manifest entry {}",
+                display_rel_path(&entry.rel_path)
+            );
+        }
+        let mut parent = path.parent();
+        while let Some(ancestor) = parent {
+            if let Some(kind) = seen_paths.get(ancestor) {
+                if !kind.is_directory() {
+                    bail!(
+                        "manifest entry {} would descend through a non-directory ancestor",
+                        display_rel_path(&entry.rel_path)
+                    );
+                }
+            }
+            parent = ancestor.parent();
+        }
+        if entry.kind.is_regular_file() {
+            match begin.root_source {
+                RootSourceKind::Filesystem => {
+                    if entry.size.is_none() || entry.full_hash.is_none() {
+                        bail!(
+                            "regular file {} is missing size or hash metadata",
+                            display_rel_path(&entry.rel_path)
+                        );
+                    }
+                    if entry.chunk_count != chunk_count_for(entry.size.unwrap()) {
+                        bail!(
+                            "regular file {} has an invalid chunk count",
+                            display_rel_path(&entry.rel_path)
+                        );
+                    }
+                }
+                RootSourceKind::Stdin => {
+                    if !entry.rel_path.is_empty() || entry.size.is_some() {
+                        bail!("stdin transfers must have a single root file with unknown size");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn manifest_hash(
+    root_name: &str,
+    root_source: RootSourceKind,
+    entries: &[ManifestEntry],
+) -> Result<String> {
+    let payload = serde_json::to_vec(&(root_name, root_source, entries))?;
+    Ok(blake3::hash(&payload).to_hex().to_string())
+}
+
+fn build_resume_plan(
+    entries: &[ManifestEntry],
+    state: &ResumeState,
+) -> Result<(u64, Vec<ResumeFilePlan>)> {
+    let by_id: BTreeMap<u32, &ManifestEntry> =
+        entries.iter().map(|entry| (entry.id, entry)).collect();
+    let mut resumed_bytes = 0u64;
+    let mut plans = Vec::new();
+    for file in &state.files {
+        let entry = by_id
+            .get(&file.entry_id)
+            .with_context(|| format!("resume state references unknown entry {}", file.entry_id))?;
+        if file.completed.len() != entry.chunk_count as usize {
+            bail!(
+                "resume state chunk layout does not match entry {}",
+                file.entry_id
+            );
+        }
+        let mut completed_chunks = Vec::new();
+        for (index, done) in file.completed.iter().copied().enumerate() {
+            if done {
+                completed_chunks.push(index as u32);
+                resumed_bytes += chunk_len(entry.size.unwrap_or(0), index as u32);
+            }
+        }
+        plans.push(ResumeFilePlan {
+            entry_id: file.entry_id,
+            completed_chunks,
+        });
+    }
+    Ok((resumed_bytes, plans))
+}
+
+async fn verify_summary(plan: &ReceiverPlan) -> Result<TransferSummary> {
+    if plan.begin.root_source == RootSourceKind::Stdin {
+        let entry = plan
+            .entries
+            .first()
+            .context("stdin receiver plan is missing its manifest entry")?
+            .clone();
+        let path = stage_path(&plan.stage_root, &entry.rel_path)?;
+        let metadata = fs::metadata(&path)
+            .await
+            .with_context(|| format!("failed to stat staged stdin file {}", path.display()))?;
+        let materialized = ManifestEntry {
+            size: Some(metadata.len()),
+            full_hash: Some(hash_file_async(&path).await?),
+            ..entry
+        };
+        return summary_from_materialized_entries(&[materialized]);
+    }
+    if let Some(resume) = &plan.resume {
+        for entry in &plan.entries {
+            if !entry.kind.is_regular_file() {
+                continue;
+            }
+            if !resume.all_chunks_complete(entry.id).await? {
+                bail!(
+                    "receiver is still missing chunks for {}",
+                    display_rel_path(&entry.rel_path)
+                );
+            }
+            let expected = entry
+                .full_hash
+                .as_deref()
+                .context("regular file manifest is missing its hash")?;
+            // Skip full re-hash when all chunks were hash-verified during this run.
+            // Per-chunk blake3 verification already proves file content; re-reading
+            // the staged file would just double the I/O cost with no integrity gain.
+            if resume.all_chunks_fresh(entry.id, entry.chunk_count).await {
+                continue;
+            }
+            // Some chunks came from resume state (not verified this run) — re-hash.
+            let actual = hash_file_async(&stage_path(&plan.stage_root, &entry.rel_path)?).await?;
+            if expected != actual {
+                resume.reset_file(entry.id).await?;
+                bail!(
+                    "final file hash mismatch for {}",
+                    display_rel_path(&entry.rel_path)
+                );
+            }
+        }
+    }
+    summary_from_materialized_entries(&plan.entries)
+}
+
+async fn commit_stage(plan: &ReceiverPlan, collision: CollisionPolicy) -> Result<()> {
+    if fs::try_exists(&plan.final_path).await? {
+        match collision {
+            CollisionPolicy::Fail | CollisionPolicy::Rename => {
+                bail!("destination already exists: {}", plan.final_path.display());
+            }
+            CollisionPolicy::Overwrite => {
+                let backup = plan.stage_dir.join("overwrite-backup");
+                fs::rename(&plan.final_path, &backup)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to stage existing destination {}",
+                            plan.final_path.display()
+                        )
+                    })?;
+                if let Err(err) = fs::rename(&plan.stage_root, &plan.final_path).await {
+                    let _ = fs::rename(&backup, &plan.final_path).await;
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to commit staged transfer to {}",
+                            plan.final_path.display()
+                        )
+                    });
+                }
+                remove_any(&backup).await?;
+            }
+        }
+    } else {
+        fs::rename(&plan.stage_root, &plan.final_path)
             .await
             .with_context(|| {
                 format!(
-                    "failed to stage existing destination {}",
+                    "failed to commit staged transfer to {}",
                     plan.final_path.display()
                 )
             })?;
-        backup = Some(backup_path);
     }
-    if let Err(err) = fs::rename(&plan.stage_root, &plan.final_path)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to commit staged transfer to {}",
-                plan.final_path.display()
-            )
-        })
-    {
-        if let Some(backup_path) = &backup {
-            let _ = fs::rename(backup_path, &plan.final_path).await;
-        }
-        return Err(err);
-    }
-    if let Some(backup_path) = backup {
-        remove_any(&backup_path).await?;
-    }
-    if fs::try_exists(&plan.stage_base).await? {
-        let _ = fs::remove_dir_all(&plan.stage_base).await;
+    if fs::try_exists(&plan.stage_dir).await? {
+        let _ = fs::remove_dir_all(&plan.stage_dir).await;
     }
     Ok(())
 }
 
-async fn send_regular_file(
-    stream: &mut TcpStream,
-    path: &Path,
-    size: u64,
-    rel_path: &str,
-    progress: &mut ProgressPrinter,
-) -> Result<String> {
-    let mut file = File::open(path)
-        .await
-        .with_context(|| format!("failed to open source file {}", path.display()))?;
-    let mut buf = vec![0u8; COPY_BUFFER];
-    let mut remaining = size;
-    let mut hasher = blake3::Hasher::new();
-    while remaining > 0 {
-        let to_read = remaining.min(buf.len() as u64) as usize;
-        let n = file
-            .read(&mut buf[..to_read])
-            .await
-            .with_context(|| format!("failed reading {}", path.display()))?;
-        if n == 0 {
-            bail!("unexpected EOF while reading {}", path.display());
+fn read_source_files(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for file in files {
+        let content = std::fs::read_to_string(file)
+            .with_context(|| format!("failed to read source list file {}", file.display()))?;
+        for line in content.lines() {
+            if line.contains('#') {
+                continue;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            paths.push(PathBuf::from(trimmed));
         }
-        stream.write_all(&buf[..n]).await?;
-        hasher.update(&buf[..n]);
-        remaining -= n as u64;
-        progress.advance_bytes(n as u64, &display_rel_path(rel_path));
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(paths)
 }
 
-async fn receive_regular_file(
-    stream: &mut TcpStream,
-    path: PathBuf,
-    size: u64,
-    mode: Option<u32>,
-    rel_path: &str,
-    progress: &mut ProgressPrinter,
-) -> Result<String> {
-    let mut file = File::create(&path)
-        .await
-        .with_context(|| format!("failed to create destination file {}", path.display()))?;
-    let mut buf = vec![0u8; COPY_BUFFER];
-    let mut remaining = size;
-    let mut hasher = blake3::Hasher::new();
-    while remaining > 0 {
-        let to_read = remaining.min(buf.len() as u64) as usize;
-        stream.read_exact(&mut buf[..to_read]).await?;
-        file.write_all(&buf[..to_read]).await?;
-        hasher.update(&buf[..to_read]);
-        remaining -= to_read as u64;
-        progress.advance_bytes(to_read as u64, &display_rel_path(rel_path));
-    }
-    file.flush().await?;
-    file.sync_all().await?;
-    set_file_mode(&path, mode).await?;
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
-async fn send_stdin_payload(
-    stream: &mut TcpStream,
-    entry: &ManifestEntry,
-    progress: &mut ProgressPrinter,
-) -> Result<()> {
-    let mut stdin = tokio::io::stdin();
-    let mut buf = vec![0u8; COPY_BUFFER];
-    let mut hasher = blake3::Hasher::new();
+fn compute_dir_size_sync(path: &Path) -> u64 {
     let mut total = 0u64;
-    loop {
-        let n = stdin.read(&mut buf).await.context("failed to read stdin")?;
-        if n == 0 {
-            break;
+    let mut queue = vec![path.to_path_buf()];
+    while let Some(dir) = queue.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Ok(m) = std::fs::symlink_metadata(&p) {
+                if m.is_dir() {
+                    queue.push(p);
+                } else if m.is_file() {
+                    total += m.len();
+                }
+            }
         }
-        send_frame(stream, &Frame::StreamChunk { len: n as u32 }).await?;
-        stream.write_all(&buf[..n]).await?;
-        hasher.update(&buf[..n]);
-        total += n as u64;
-        progress.advance_bytes(n as u64, &display_rel_path(&entry.rel_path));
     }
-    send_frame(
-        stream,
-        &Frame::StreamEnd {
-            size: total,
-            blake3: hasher.finalize().to_hex().to_string(),
+    total
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn confirm_sources_sync(sources: &[PathBuf]) -> Result<bool> {
+    use std::io::Write as _;
+    println!("Sources to be transferred:");
+    for source in sources {
+        let meta = std::fs::symlink_metadata(source)
+            .with_context(|| format!("failed to stat {}", source.display()))?;
+        if meta.is_dir() {
+            let size = compute_dir_size_sync(source);
+            println!("  DIR  {} ({})", source.display(), format_bytes(size));
+        } else if meta.is_file() {
+            println!("  FILE {} ({})", source.display(), format_bytes(meta.len()));
+        } else {
+            println!("  OTHER {}", source.display());
+        }
+    }
+    print!("Proceed? [y/N] ");
+    std::io::stdout()
+        .flush()
+        .context("failed to flush stdout")?;
+    let mut input = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut input)
+        .context("failed to read confirmation")?;
+    Ok(input.trim().eq_ignore_ascii_case("y"))
+}
+
+fn scan_multi_filesystem_transfer(
+    transfer_id: String,
+    sources: Vec<PathBuf>,
+    output: Option<PathBuf>,
+    symlinks: SymlinkMode,
+    devices: DeviceMode,
+    parallel: u16,
+) -> Result<PlannedTransfer> {
+    let root_name = if let Some(out) = output {
+        encode_root_name(&out)?
+    } else {
+        source_file_name_string(&sources[0])?
+    };
+
+    let mut entries = Vec::new();
+    let mut total_bytes = 0u64;
+
+    // Virtual root directory (rel_path="")
+    entries.push(PlannedEntry {
+        manifest: ManifestEntry {
+            id: 0,
+            rel_path: String::new(),
+            kind: EntryKind::Directory,
+            size: None,
+            full_hash: None,
+            chunk_count: 0,
+            symlink_target: None,
+            device: None,
+            mode: None,
         },
-    )
-    .await?;
-    Ok(())
-}
+        source_path: None,
+    });
+    let mut next_id = 1u32;
 
-async fn receive_stdin_payload(
-    stream: &mut TcpStream,
-    path: PathBuf,
-    mode: Option<u32>,
-    rel_path: &str,
-    progress: &mut ProgressPrinter,
-) -> Result<(u64, String)> {
-    let mut file = File::create(&path)
-        .await
-        .with_context(|| format!("failed to create destination file {}", path.display()))?;
-    let mut total = 0u64;
-    let mut hasher = blake3::Hasher::new();
-    loop {
-        match expect_frame(stream).await? {
-            Frame::StreamChunk { len } => {
-                let mut buf = vec![0u8; len as usize];
-                stream.read_exact(&mut buf).await?;
-                file.write_all(&buf).await?;
-                hasher.update(&buf);
-                total += len as u64;
-                progress.advance_bytes(len as u64, &display_rel_path(rel_path));
-            }
-            Frame::StreamEnd { size, blake3 } => {
-                file.flush().await?;
-                file.sync_all().await?;
-                set_file_mode(&path, mode).await?;
-                let local_hash = hasher.finalize().to_hex().to_string();
-                if size != total {
-                    bail!("stdin byte count mismatch");
-                }
-                if blake3 != local_hash {
-                    bail!("stdin stream hash mismatch");
-                }
-                return Ok((total, local_hash));
-            }
-            other => bail!("unexpected frame in stdin payload: {other:?}"),
-        }
+    for source in &sources {
+        let name = source
+            .file_name()
+            .with_context(|| format!("{} has no file name", source.display()))?;
+        let rel = PathBuf::from(name);
+        scan_entry(
+            source,
+            &rel,
+            symlinks,
+            devices,
+            &mut entries,
+            &mut total_bytes,
+            &mut next_id,
+        )?;
     }
+
+    if entries.len() <= 1 {
+        bail!("nothing to transfer from the specified sources");
+    }
+
+    Ok(PlannedTransfer {
+        transfer_id,
+        root_name,
+        root_source: RootSourceKind::Filesystem,
+        entries,
+        total_bytes: Some(total_bytes),
+        parallel,
+    })
 }
 
 async fn plan_transfer(
     transfer_id: String,
-    source: &Path,
-    output: Option<&Path>,
-    symlinks: SymlinkMode,
-    devices: DeviceMode,
+    options: &SenderOptions,
+    all_sources: &[PathBuf],
 ) -> Result<PlannedTransfer> {
-    match parse_sender_source(source) {
-        SenderSource::Stdin => {
-            let output = output.context("--output is required when --source stdin")?;
-            let root_name = single_component_string(output)?;
-            Ok(PlannedTransfer {
-                transfer_id,
-                root_name,
-                root_source: RootSourceKind::Stdin,
-                entries: vec![PlannedEntry {
-                    manifest: ManifestEntry {
-                        rel_path: String::new(),
-                        kind: EntryKind::RegularFile,
-                        size: None,
-                        symlink_target: None,
-                        device: None,
-                        mode: None,
-                    },
-                    source_path: None,
-                }],
-                total_bytes: None,
+    let parallel = if options.parallel == 0 {
+        let cpu_count = std::thread::available_parallelism()
+            .map(|n| n.get() as u16)
+            .unwrap_or(4);
+        cpu_count.clamp(4, MAX_PARALLEL)
+    } else {
+        options.parallel.clamp(1, MAX_PARALLEL)
+    };
+    let symlinks = options.symlinks;
+    let devices = options.devices;
+
+    if all_sources.len() == 1 {
+        match parse_sender_source(&all_sources[0]) {
+            SenderSource::Stdin => {
+                let output = options
+                    .output
+                    .as_ref()
+                    .context("--output is required when --source stdin")?;
+                let root_name = encode_root_name(output)?;
+                Ok(PlannedTransfer {
+                    transfer_id,
+                    root_name,
+                    root_source: RootSourceKind::Stdin,
+                    entries: vec![PlannedEntry {
+                        manifest: ManifestEntry {
+                            id: 0,
+                            rel_path: String::new(),
+                            kind: EntryKind::RegularFile,
+                            size: None,
+                            full_hash: None,
+                            chunk_count: 0,
+                            symlink_target: None,
+                            device: None,
+                            mode: None,
+                        },
+                        source_path: None,
+                    }],
+                    total_bytes: None,
+                    parallel: 1,
+                })
+            }
+            SenderSource::Filesystem(path) => spawn_blocking(move || {
+                scan_filesystem_transfer(transfer_id, path, symlinks, devices, parallel)
             })
+            .await
+            .context("filesystem scan task failed")?,
         }
-        SenderSource::Filesystem(path) => tokio::task::spawn_blocking(move || {
-            scan_filesystem_transfer(transfer_id, path, symlinks, devices)
+    } else {
+        let sources = all_sources.to_vec();
+        let output = options.output.clone();
+        spawn_blocking(move || {
+            scan_multi_filesystem_transfer(
+                transfer_id,
+                sources,
+                output,
+                symlinks,
+                devices,
+                parallel,
+            )
         })
         .await
-        .context("filesystem scan task failed")?,
+        .context("multi-source filesystem scan task failed")?
     }
 }
 
@@ -1006,10 +1905,12 @@ fn scan_filesystem_transfer(
     source: PathBuf,
     symlinks: SymlinkMode,
     devices: DeviceMode,
+    parallel: u16,
 ) -> Result<PlannedTransfer> {
-    let root_name = file_name_string(&source)?;
+    let root_name = source_file_name_string(&source)?;
     let mut entries = Vec::new();
     let mut total_bytes = 0u64;
+    let mut next_id = 0u32;
     scan_entry(
         &source,
         Path::new(""),
@@ -1017,7 +1918,7 @@ fn scan_filesystem_transfer(
         devices,
         &mut entries,
         &mut total_bytes,
-        true,
+        &mut next_id,
     )?;
     if entries.is_empty() {
         bail!("nothing to transfer from {}", source.display());
@@ -1028,6 +1929,7 @@ fn scan_filesystem_transfer(
         root_source: RootSourceKind::Filesystem,
         entries,
         total_bytes: Some(total_bytes),
+        parallel,
     })
 }
 
@@ -1038,25 +1940,33 @@ fn scan_entry(
     devices: DeviceMode,
     entries: &mut Vec<PlannedEntry>,
     total_bytes: &mut u64,
-    is_root: bool,
+    next_id: &mut u32,
 ) -> Result<()> {
+    let is_root = rel_path.as_os_str().is_empty();
     let metadata = std::fs::symlink_metadata(source)
         .with_context(|| format!("failed to stat {}", source.display()))?;
     let file_type = metadata.file_type();
-    let rel_path_string = rel_path_to_string(rel_path)?;
+    let rel_path_string = encode_relative_path(rel_path)?;
     let mode = file_mode(&metadata);
+    let id = *next_id;
+    *next_id = next_id
+        .checked_add(1)
+        .context("too many manifest entries")?;
 
     if file_type.is_dir() {
         entries.push(PlannedEntry {
             manifest: ManifestEntry {
+                id,
                 rel_path: rel_path_string,
                 kind: EntryKind::Directory,
                 size: None,
+                full_hash: None,
+                chunk_count: 0,
                 symlink_target: None,
                 device: None,
                 mode,
             },
-            source_path: Some(source.to_path_buf()),
+            source_path: None,
         });
         let mut children = std::fs::read_dir(source)
             .with_context(|| format!("failed to read directory {}", source.display()))?
@@ -1064,11 +1974,10 @@ fn scan_entry(
             .with_context(|| format!("failed to enumerate directory {}", source.display()))?;
         children.sort_by_key(|entry| entry.file_name());
         for child in children {
-            let child_name = child.file_name();
             let child_rel = if rel_path.as_os_str().is_empty() {
-                PathBuf::from(child_name)
+                PathBuf::from(child.file_name())
             } else {
-                rel_path.join(child_name)
+                rel_path.join(child.file_name())
             };
             scan_entry(
                 &child.path(),
@@ -1077,7 +1986,7 @@ fn scan_entry(
                 devices,
                 entries,
                 total_bytes,
-                false,
+                next_id,
             )?;
         }
         return Ok(());
@@ -1085,12 +1994,18 @@ fn scan_entry(
 
     if file_type.is_file() {
         let size = metadata.len();
-        *total_bytes = total_bytes.saturating_add(size);
+        let full_hash = hash_file_sync(source)?;
+        *total_bytes = total_bytes
+            .checked_add(size)
+            .context("transfer size overflow")?;
         entries.push(PlannedEntry {
             manifest: ManifestEntry {
+                id,
                 rel_path: rel_path_string,
                 kind: EntryKind::RegularFile,
                 size: Some(size),
+                full_hash: Some(full_hash),
+                chunk_count: chunk_count_for(size),
                 symlink_target: None,
                 device: None,
                 mode,
@@ -1114,10 +2029,13 @@ fn scan_entry(
             .with_context(|| format!("failed to read symlink {}", source.display()))?;
         entries.push(PlannedEntry {
             manifest: ManifestEntry {
+                id,
                 rel_path: rel_path_string,
                 kind: EntryKind::Symlink,
                 size: None,
-                symlink_target: Some(path_to_platform_string(&target)?),
+                full_hash: None,
+                chunk_count: 0,
+                symlink_target: Some(encode_native_path(&target)),
                 device: None,
                 mode,
             },
@@ -1129,7 +2047,6 @@ fn scan_entry(
     #[cfg(unix)]
     {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
-
         if file_type.is_char_device() || file_type.is_block_device() {
             if devices == DeviceMode::Exclude {
                 if is_root {
@@ -1140,21 +2057,24 @@ fn scan_entry(
                 }
                 return Ok(());
             }
-            let rdev = metadata.rdev();
             let kind = if file_type.is_char_device() {
                 EntryKind::CharDevice
             } else {
                 EntryKind::BlockDevice
             };
+            let rdev = metadata.rdev();
             entries.push(PlannedEntry {
                 manifest: ManifestEntry {
+                    id,
                     rel_path: rel_path_string,
                     kind,
                     size: None,
+                    full_hash: None,
+                    chunk_count: 0,
                     symlink_target: None,
                     device: Some(DeviceDescriptor {
-                        major: nix::sys::stat::major(rdev),
-                        minor: nix::sys::stat::minor(rdev),
+                        major: device_major(rdev),
+                        minor: device_minor(rdev),
                     }),
                     mode,
                 },
@@ -1167,91 +2087,221 @@ fn scan_entry(
     bail!("unsupported special file {}", source.display())
 }
 
-fn validate_manifest(begin: &BeginFrame, entries: &[ManifestEntry]) -> Result<()> {
-    if entries.is_empty() {
-        bail!("empty manifest");
-    }
-    let root = entries.first().context("manifest missing root entry")?;
-    if !root.rel_path.is_empty() {
-        bail!("manifest root entry must use an empty relative path");
-    }
-    match begin.root_source {
-        RootSourceKind::Stdin => {
-            if root.kind != EntryKind::RegularFile || root.size.is_some() {
-                bail!("stdin transfers must have a single file root with unknown size");
-            }
+fn build_chunk_tasks(
+    plan: &PlannedTransfer,
+    resume_plan: &[ResumeFilePlan],
+) -> Result<Vec<ChunkTask>> {
+    let completed: BTreeMap<u32, Vec<u32>> = resume_plan
+        .iter()
+        .map(|entry| (entry.entry_id, entry.completed_chunks.clone()))
+        .collect();
+    let mut tasks = Vec::new();
+    for entry in &plan.entries {
+        if !entry.manifest.kind.is_regular_file() {
+            continue;
         }
-        RootSourceKind::Filesystem => {
-            if root.kind == EntryKind::RegularFile && root.size.is_none() {
-                bail!("regular file manifest entry is missing its size");
+        let size = entry.manifest.size.unwrap_or(0);
+        let chunk_count = entry.manifest.chunk_count;
+        let done = completed
+            .get(&entry.manifest.id)
+            .cloned()
+            .unwrap_or_default();
+        let done: BTreeMap<u32, ()> = done.into_iter().map(|index| (index, ())).collect();
+        for chunk_index in 0..chunk_count {
+            if done.contains_key(&chunk_index) {
+                continue;
             }
+            tasks.push(ChunkTask {
+                entry_id: entry.manifest.id,
+                path: entry
+                    .source_path
+                    .clone()
+                    .context("regular file is missing its source path")?,
+                rel_path: entry.manifest.rel_path.clone(),
+                offset: chunk_index as u64 * CHUNK_SIZE as u64,
+                len: chunk_len(size, chunk_index) as u32,
+                chunk_index,
+            });
         }
     }
-    let mut seen = BTreeMap::<PathBuf, EntryKind>::new();
+    Ok(tasks)
+}
+
+fn summary_from_entries(entries: &[PlannedEntry]) -> Result<TransferSummary> {
+    summary_from_materialized_entries(
+        &entries
+            .iter()
+            .map(|entry| entry.manifest.clone())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn summary_from_materialized_entries(entries: &[ManifestEntry]) -> Result<TransferSummary> {
+    let mut counts = TransferCounts::default();
+    let mut hasher = blake3::Hasher::new();
     for entry in entries {
-        let path = rel_string_to_path(&entry.rel_path)?;
-        validate_relative_path(&path)?;
-        if seen.contains_key(&path) {
-            bail!(
-                "manifest contains a duplicate entry for {}",
-                display_rel_path(&entry.rel_path)
-            );
-        }
-        let mut parent = path.parent();
-        while let Some(ancestor) = parent {
-            if let Some(kind) = seen.get(ancestor) {
-                if !kind.is_directory() {
-                    bail!(
-                        "manifest entry {} would descend through a non-directory ancestor",
-                        display_rel_path(&entry.rel_path)
-                    );
-                }
+        match entry.kind {
+            EntryKind::RegularFile => {
+                counts.regular_files += 1;
+                counts.total_bytes += entry.size.unwrap_or(0);
             }
-            parent = ancestor.parent();
+            EntryKind::Directory => counts.directories += 1,
+            EntryKind::Symlink => counts.symlinks += 1,
+            EntryKind::CharDevice | EntryKind::BlockDevice => counts.devices += 1,
         }
-        seen.insert(path, entry.kind);
+        update_transfer_hash(&mut hasher, entry, entry.full_hash.as_deref())?;
     }
+    Ok(TransferSummary {
+        regular_files: counts.regular_files,
+        directories: counts.directories,
+        symlinks: counts.symlinks,
+        devices: counts.devices,
+        total_bytes: counts.total_bytes,
+        transfer_hash: hasher.finalize().to_hex().to_string(),
+    })
+}
+
+fn update_transfer_hash(
+    hasher: &mut blake3::Hasher,
+    entry: &ManifestEntry,
+    content_hash: Option<&str>,
+) -> Result<()> {
+    let record = TransferRecord {
+        rel_path: entry.rel_path.clone(),
+        kind: entry.kind,
+        size: entry.size,
+        symlink_target: entry.symlink_target.clone(),
+        device: entry.device.clone(),
+        content_hash: content_hash.map(ToOwned::to_owned),
+    };
+    let payload = serde_json::to_vec(&record)?;
+    hasher.update(&(payload.len() as u32).to_le_bytes());
+    hasher.update(&payload);
     Ok(())
 }
 
-async fn resolve_final_name(
-    dest_root: &Path,
-    root_name: &str,
-    collision: CollisionPolicy,
-) -> Result<String> {
-    let requested = decode_component_string(root_name)?;
-    validate_local_component(&requested)?;
-    let candidate = dest_root.join(&requested);
-    if !fs::try_exists(&candidate).await? {
-        return Ok(root_name.to_string());
+impl ResumeShared {
+    async fn is_chunk_complete(&self, entry_id: u32, chunk_index: u32) -> Result<bool> {
+        let runtime = self.runtime.lock().await;
+        let file = runtime
+            .state
+            .files
+            .iter()
+            .find(|file| file.entry_id == entry_id)
+            .with_context(|| format!("resume state missing entry {}", entry_id))?;
+        Ok(file
+            .completed
+            .get(chunk_index as usize)
+            .copied()
+            .unwrap_or(false))
     }
-    match collision {
-        CollisionPolicy::Fail => bail!(
-            "destination already exists: {} (use --overwrite or --rename)",
-            candidate.display()
-        ),
-        CollisionPolicy::Overwrite => Ok(root_name.to_string()),
-        CollisionPolicy::Rename => {
-            let renamed = pick_renamed_root(dest_root, &requested).await?;
-            encode_component_string(&renamed)
+
+    async fn mark_chunk_complete(
+        &self,
+        entry_id: u32,
+        chunk_index: u32,
+        path: &Path,
+    ) -> Result<()> {
+        let should_flush = {
+            let mut runtime = self.runtime.lock().await;
+            let file = runtime
+                .state
+                .files
+                .iter_mut()
+                .find(|file| file.entry_id == entry_id)
+                .with_context(|| format!("resume state missing entry {}", entry_id))?;
+            let slot = file
+                .completed
+                .get_mut(chunk_index as usize)
+                .with_context(|| {
+                    format!(
+                        "chunk {} is out of range for entry {}",
+                        chunk_index, entry_id
+                    )
+                })?;
+            *slot = true;
+            *runtime.fresh_chunks.entry(entry_id).or_default() += 1;
+            runtime.dirty_paths.insert(path.to_path_buf());
+            runtime.pending_persist += 1;
+            runtime.pending_persist >= RESUME_FLUSH_EVERY_CHUNKS
+        };
+        if should_flush {
+            self.flush_pending().await?;
         }
+        Ok(())
+    }
+
+    async fn flush_pending(&self) -> Result<()> {
+        let _persist = self.persist_lock.lock().await;
+        let snapshot = {
+            let mut runtime = self.runtime.lock().await;
+            if runtime.pending_persist == 0 && runtime.dirty_paths.is_empty() {
+                None
+            } else {
+                runtime.pending_persist = 0;
+                Some((
+                    runtime.state.clone(),
+                    std::mem::take(&mut runtime.dirty_paths)
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                ))
+            }
+        };
+        if let Some((state, paths)) = snapshot {
+            sync_staged_files(&paths).await?;
+            persist_resume_state(&self.state_file, &state).await?;
+        }
+        Ok(())
+    }
+
+    async fn all_chunks_fresh(&self, entry_id: u32, chunk_count: u32) -> bool {
+        let runtime = self.runtime.lock().await;
+        runtime.fresh_chunks.get(&entry_id).copied().unwrap_or(0) >= chunk_count
+    }
+
+    async fn all_chunks_complete(&self, entry_id: u32) -> Result<bool> {
+        let runtime = self.runtime.lock().await;
+        let file = runtime
+            .state
+            .files
+            .iter()
+            .find(|file| file.entry_id == entry_id)
+            .with_context(|| format!("resume state missing entry {}", entry_id))?;
+        Ok(file.completed.iter().all(|done| *done))
+    }
+
+    async fn reset_file(&self, entry_id: u32) -> Result<()> {
+        let _persist = self.persist_lock.lock().await;
+        let state = {
+            let mut runtime = self.runtime.lock().await;
+            let file = runtime
+                .state
+                .files
+                .iter_mut()
+                .find(|file| file.entry_id == entry_id)
+                .with_context(|| format!("resume state missing entry {}", entry_id))?;
+            for done in &mut file.completed {
+                *done = false;
+            }
+            runtime.pending_persist = 0;
+            runtime.state.clone()
+        };
+        persist_resume_state(&self.state_file, &state).await
     }
 }
 
-async fn pick_renamed_root(dest_root: &Path, root_name: &OsStr) -> Result<OsString> {
-    let root_path = Path::new(root_name);
-    let stem = root_path.file_stem();
-    let ext = root_path.extension();
-    for idx in 1..10_000u32 {
-        let renamed = renamed_component(root_name, stem, ext, idx);
-        if !fs::try_exists(dest_root.join(&renamed)).await? {
-            return Ok(renamed);
-        }
+async fn persist_resume_state(path: &Path, state: &ResumeState) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, serde_json::to_vec(state)?).await?;
+    if fs::try_exists(path).await? {
+        let _ = fs::remove_file(path).await;
     }
-    bail!(
-        "unable to find a free renamed destination for {}",
-        root_path.display()
-    )
+    fs::rename(&tmp, path).await?;
+    Ok(())
+}
+
+async fn load_resume_state(path: &Path) -> Result<ResumeState> {
+    Ok(serde_json::from_slice(&fs::read(path).await?)?)
 }
 
 async fn connect_local(addr: std::net::SocketAddr) -> Result<TcpStream> {
@@ -1270,64 +2320,28 @@ async fn connect_local(addr: std::net::SocketAddr) -> Result<TcpStream> {
         .unwrap_or_else(|| anyhow!("failed to connect local transfer socket")))
 }
 
-fn parse_sender_source(source: &Path) -> SenderSource {
-    if is_stdin_keyword(source) {
-        SenderSource::Stdin
-    } else {
-        SenderSource::Filesystem(source.to_path_buf())
-    }
-}
-
-fn generate_transfer_id() -> String {
-    Uuid::new_v4().to_string()
-}
-
-fn stage_path(plan: &ReceiverPlan, entry: &ManifestEntry) -> PathBuf {
-    if entry.rel_path.is_empty() {
-        plan.stage_root.clone()
-    } else {
-        plan.stage_root
-            .join(rel_string_to_path(&entry.rel_path).expect("validated relative path"))
-    }
-}
-
-async fn ensure_parent_dir(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
-    }
-    Ok(())
-}
-
-async fn remove_any(path: &Path) -> Result<()> {
-    match fs::metadata(path).await {
-        Ok(meta) if meta.is_dir() => {
-            fs::remove_dir_all(path)
-                .await
-                .with_context(|| format!("failed to remove directory {}", path.display()))?;
-        }
-        Ok(_) => {
-            fs::remove_file(path)
-                .await
-                .with_context(|| format!("failed to remove file {}", path.display()))?;
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to inspect {}", path.display()))
-        }
-    }
-    Ok(())
-}
-
 async fn send_frame<S: AsyncWrite + Unpin>(stream: &mut S, frame: &Frame) -> Result<()> {
-    let payload = serde_json::to_vec(frame).context("failed to serialize transfer frame")?;
+    let payload = serde_json::to_vec(frame).context("failed to encode transfer frame")?;
     if payload.len() > FRAME_LIMIT {
         bail!("transfer frame exceeds configured limit");
     }
     stream.write_u32_le(payload.len() as u32).await?;
     stream.write_all(&payload).await?;
     Ok(())
+}
+
+async fn recv_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Option<Frame>> {
+    let len = match stream.read_u32_le().await {
+        Ok(len) => len as usize,
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err).context("failed to read transfer frame header"),
+    };
+    if len > FRAME_LIMIT {
+        bail!("peer sent an oversized transfer frame ({len} bytes)");
+    }
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;
+    Ok(Some(serde_json::from_slice(&buf)?))
 }
 
 async fn expect_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Frame> {
@@ -1338,50 +2352,63 @@ async fn expect_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Frame> {
     }
 }
 
-async fn expect_manifest_accepted<S: AsyncRead + Unpin>(stream: &mut S) -> Result<String> {
-    match expect_frame(stream).await? {
-        Frame::ManifestAccepted { final_name } => Ok(final_name),
-        other => bail!("unexpected manifest response: {other:?}"),
+fn generate_transfer_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+fn parse_sender_source(source: &Path) -> SenderSource {
+    if source.as_os_str() == OsStr::new("stdin") && source.components().count() == 1 {
+        SenderSource::Stdin
+    } else {
+        SenderSource::Filesystem(source.to_path_buf())
     }
 }
 
-async fn recv_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Option<Frame>> {
-    let len = match stream.read_u32_le().await {
-        Ok(len) => len as usize,
-        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err).context("failed to read transfer frame header"),
-    };
-    if len > FRAME_LIMIT {
-        bail!("peer sent an oversized transfer frame ({len} bytes)");
+fn encode_root_name(path: &Path) -> Result<String> {
+    let mut components = path.components();
+    let first = components.next().context("output path is empty")?;
+    if components.next().is_some() {
+        bail!("transfer root name must be a single path component");
     }
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    let frame = serde_json::from_slice(&buf).context("failed to decode transfer frame")?;
-    Ok(Some(frame))
+    match first {
+        Component::Normal(name) => Ok(encode_component_os(name)),
+        _ => bail!("transfer root name must be a single path component"),
+    }
 }
 
-fn update_transfer_hash(
-    hasher: &mut blake3::Hasher,
-    entry: &ManifestEntry,
-    content_hash: Option<&str>,
-) -> Result<()> {
-    let record = TransferRecord {
-        rel_path: entry.rel_path.clone(),
-        kind: entry.kind,
-        size: entry.size,
-        symlink_target: entry.symlink_target.clone(),
-        device: entry.device.clone(),
-        content_hash: content_hash.map(ToOwned::to_owned),
-    };
-    let payload = serde_json::to_vec(&record).context("failed to encode transfer hash record")?;
-    hasher.update(&(payload.len() as u32).to_le_bytes());
-    hasher.update(&payload);
-    Ok(())
+fn source_file_name_string(path: &Path) -> Result<String> {
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("{} does not end with a file name", path.display()))?;
+    Ok(encode_component_os(file_name))
 }
 
-fn validate_root_name(root_name: &str) -> Result<()> {
-    let component = decode_component_string(root_name)?;
-    validate_local_component(&component)
+fn encode_relative_path(path: &Path) -> Result<String> {
+    if path.as_os_str().is_empty() {
+        return Ok(String::new());
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => parts.push(encode_component_os(name)),
+            _ => bail!("invalid relative path {}", path.display()),
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+fn decode_relative_path(encoded: &str) -> Result<PathBuf> {
+    if encoded.is_empty() {
+        return Ok(PathBuf::new());
+    }
+    let mut path = PathBuf::new();
+    for part in encoded.split('/') {
+        if part.is_empty() {
+            bail!("invalid relative path encoding {encoded}");
+        }
+        path.push(decode_component(part));
+    }
+    Ok(path)
 }
 
 fn validate_relative_path(path: &Path) -> Result<()> {
@@ -1394,56 +2421,349 @@ fn validate_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rel_path_to_string(path: &Path) -> Result<String> {
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => parts.push(encode_component_string(part)?),
-            _ => bail!("invalid relative path {}", path.display()),
+fn encode_component_os(value: &OsStr) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        match std::str::from_utf8(value.as_bytes()) {
+            Ok(text) => format!("u:{}", hex::encode(text.as_bytes())),
+            Err(_) => format!("b:{}", hex::encode(value.as_bytes())),
         }
     }
-    Ok(parts.join("/"))
-}
-
-fn rel_string_to_path(value: &str) -> Result<PathBuf> {
-    if value.is_empty() {
-        return Ok(PathBuf::new());
-    }
-    let mut path = PathBuf::new();
-    for part in value.split('/') {
-        if part.is_empty() {
-            bail!("invalid relative path {value}");
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = value.encode_wide().collect();
+        match String::from_utf16(&wide) {
+            Ok(text) => format!("u:{}", hex::encode(text.as_bytes())),
+            Err(_) => {
+                let mut bytes = Vec::with_capacity(wide.len() * 2);
+                for unit in wide {
+                    bytes.extend_from_slice(&unit.to_le_bytes());
+                }
+                format!("w:{}", hex::encode(bytes))
+            }
         }
-        let component = decode_component_string(part)?;
-        validate_local_component(&component)?;
-        path.push(component);
     }
-    Ok(path)
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!("u:{}", hex::encode(value.to_string_lossy().as_bytes()))
+    }
 }
 
-fn file_name_string(path: &Path) -> Result<String> {
-    let file_name = path
-        .file_name()
-        .with_context(|| format!("{} does not end with a file name", path.display()))?;
-    encode_component_string(file_name)
+fn decode_component(encoded: &str) -> OsString {
+    if let Some(payload) = encoded.strip_prefix("u:") {
+        return match hex::decode(payload)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
+            Some(text) => safe_component(text),
+            None => OsString::from(format!("_bore_bad_utf8_{payload}")),
+        };
+    }
+    if let Some(payload) = encoded.strip_prefix("b:") {
+        return decode_unix_component(payload);
+    }
+    if let Some(payload) = encoded.strip_prefix("w:") {
+        return decode_windows_component(payload);
+    }
+    OsString::from(format!("_bore_invalid_{encoded}"))
 }
 
-fn path_to_platform_string(path: &Path) -> Result<String> {
-    encode_native_path_string(path)
+fn encode_native_path(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        match std::str::from_utf8(path.as_os_str().as_bytes()) {
+            Ok(text) => format!("u:{}", hex::encode(text.as_bytes())),
+            Err(_) => format!("b:{}", hex::encode(path.as_os_str().as_bytes())),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        match String::from_utf16(&wide) {
+            Ok(text) => format!("u:{}", hex::encode(text.as_bytes())),
+            Err(_) => {
+                let mut bytes = Vec::with_capacity(wide.len() * 2);
+                for unit in wide {
+                    bytes.extend_from_slice(&unit.to_le_bytes());
+                }
+                format!("w:{}", hex::encode(bytes))
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!("u:{}", hex::encode(path.to_string_lossy().as_bytes()))
+    }
 }
 
-fn display_rel_path(rel_path: &str) -> String {
+fn decode_native_path(encoded: &str) -> PathBuf {
+    PathBuf::from(decode_component(encoded))
+}
+
+fn decode_unix_component(payload: &str) -> OsString {
+    let bytes = hex::decode(payload).unwrap_or_default();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        match String::from_utf8(bytes) {
+            Ok(text) => safe_component(text),
+            Err(_) => OsString::from(format!("_bore_bytes_{payload}")),
+        }
+    }
+}
+
+fn decode_windows_component(payload: &str) -> OsString {
+    let bytes = hex::decode(payload).unwrap_or_default();
+    let mut wide = Vec::new();
+    for chunk in bytes.chunks_exact(2) {
+        wide.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        return OsString::from_wide(&wide);
+    }
+    #[cfg(not(windows))]
+    {
+        match String::from_utf16(&wide) {
+            Ok(text) => safe_component(text),
+            Err(_) => OsString::from(format!("_bore_wide_{payload}")),
+        }
+    }
+}
+
+fn safe_component(text: String) -> OsString {
+    #[cfg(windows)]
+    {
+        if is_safe_windows_component(&text) {
+            return OsString::from(text);
+        }
+        return OsString::from(format!("_bore_utf8_{}", hex::encode(text.as_bytes())));
+    }
+    #[cfg(not(windows))]
+    {
+        OsString::from(text)
+    }
+}
+
+#[cfg(windows)]
+fn is_safe_windows_component(text: &str) -> bool {
+    !text.is_empty()
+        && text != "."
+        && text != ".."
+        && !text.ends_with(' ')
+        && !text.ends_with('.')
+        && !text.chars().any(|ch| {
+            matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || ch <= '\u{1F}'
+        })
+        && !is_reserved_windows_component(text)
+}
+
+#[cfg(windows)]
+fn is_reserved_windows_component(text: &str) -> bool {
+    let stem = text.split('.').next().unwrap_or(text);
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+fn display_component(encoded: &str) -> String {
+    decode_component(encoded).to_string_lossy().to_string()
+}
+
+fn display_rel_path(encoded: &str) -> String {
+    if encoded.is_empty() {
+        ".".to_string()
+    } else {
+        decode_relative_path(encoded)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| encoded.to_string())
+    }
+}
+
+async fn resolve_final_name_local(
+    dest_root: &Path,
+    requested: &OsStr,
+    collision: CollisionPolicy,
+) -> Result<OsString> {
+    let candidate = dest_root.join(requested);
+    if !fs::try_exists(&candidate).await? {
+        return Ok(requested.to_os_string());
+    }
+    match collision {
+        CollisionPolicy::Fail => bail!(
+            "destination already exists: {} (use --overwrite or --rename)",
+            candidate.display()
+        ),
+        CollisionPolicy::Overwrite => Ok(requested.to_os_string()),
+        CollisionPolicy::Rename => {
+            for idx in 1..10_000u32 {
+                let renamed = rename_component(requested, idx);
+                if !fs::try_exists(dest_root.join(&renamed)).await? {
+                    return Ok(renamed);
+                }
+            }
+            bail!("unable to find a free renamed destination")
+        }
+    }
+}
+
+fn rename_component(name: &OsStr, idx: u32) -> OsString {
+    let suffix = format!(" ({idx})");
+    if let Some(text) = name.to_str() {
+        let path = Path::new(text);
+        if let (Some(stem), Some(ext)) = (
+            path.file_stem().and_then(|part| part.to_str()),
+            path.extension().and_then(|part| part.to_str()),
+        ) {
+            return OsString::from(format!("{stem}{suffix}.{ext}"));
+        }
+        return OsString::from(format!("{text}{suffix}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let mut bytes = name.as_bytes().to_vec();
+        bytes.extend_from_slice(suffix.as_bytes());
+        OsString::from_vec(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut value = name.to_os_string();
+        value.push(&suffix);
+        value
+    }
+}
+
+fn resume_state_dir(dest_root: &Path, transfer_id: &str) -> PathBuf {
+    let digest = blake3::hash(transfer_id.as_bytes()).to_hex().to_string();
+    dest_root.join(format!(".bore-transfer-state-{digest}"))
+}
+
+fn temp_stage_dir(dest_root: &Path, transfer_id: &str) -> PathBuf {
+    dest_root.join(format!(".bore-transfer-{transfer_id}-{}", Uuid::new_v4()))
+}
+
+fn stage_path(stage_root: &Path, rel_path: &str) -> Result<PathBuf> {
     if rel_path.is_empty() {
-        return ".".to_string();
+        Ok(stage_root.to_path_buf())
+    } else {
+        Ok(stage_root.join(decode_relative_path(rel_path)?))
     }
-    let mut parts = Vec::new();
-    for part in rel_path.split('/') {
-        match decode_component_string(part) {
-            Ok(component) => parts.push(PathBuf::from(component).display().to_string()),
-            Err(_) => parts.push(part.to_string()),
+}
+
+fn chunk_count_for(size: u64) -> u32 {
+    if size == 0 {
+        0
+    } else {
+        size.div_ceil(CHUNK_SIZE as u64) as u32
+    }
+}
+
+fn chunk_len(size: u64, chunk_index: u32) -> u64 {
+    let offset = chunk_index as u64 * CHUNK_SIZE as u64;
+    size.saturating_sub(offset).min(CHUNK_SIZE as u64)
+}
+
+async fn sync_staged_files(paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let paths = paths.to_vec();
+    spawn_blocking(move || {
+        for path in paths {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .with_context(|| {
+                    format!("failed to reopen staged file {} for sync", path.display())
+                })?;
+            file.sync_data()
+                .with_context(|| format!("failed to sync staged file {}", path.display()))?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("stage file sync task failed")?
+}
+
+async fn hash_file_async(path: &Path) -> Result<String> {
+    let path = path.to_path_buf();
+    spawn_blocking(move || hash_file_sync(&path))
+        .await
+        .context("file hash task failed")?
+}
+
+fn hash_file_sync(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open {} for hashing", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; COPY_BUFFER];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .with_context(|| format!("failed to read {} for hashing", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+async fn path_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+async fn remove_any(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path).await {
+        Ok(meta) if meta.file_type().is_dir() => fs::remove_dir_all(path)
+            .await
+            .with_context(|| format!("failed to remove directory {}", path.display()))?,
+        Ok(_) => fs::remove_file(path)
+            .await
+            .with_context(|| format!("failed to remove file {}", path.display()))?,
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", path.display()))
         }
     }
-    parts.join("/")
+    Ok(())
 }
 
 fn file_mode(metadata: &std::fs::Metadata) -> Option<u32> {
@@ -1476,10 +2796,10 @@ async fn set_file_mode(path: &Path, mode: Option<u32>) -> Result<()> {
     Ok(())
 }
 
-async fn create_symlink(target: &str, link: &Path) -> Result<()> {
-    let target = decode_native_path_string(target)?;
+async fn create_symlink(target: &Path, link: &Path) -> Result<()> {
+    let target = target.to_path_buf();
     let link = link.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking(move || {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&target, &link).with_context(|| {
@@ -1517,18 +2837,23 @@ async fn create_device(entry: &ManifestEntry, path: &Path) -> Result<()> {
     {
         let entry = entry.clone();
         let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            use nix::sys::stat::{makedev, mknod, Mode, SFlag};
+        spawn_blocking(move || {
+            use nix::sys::stat::{mknod, Mode, SFlag};
             let device = entry.device.context("device entry missing metadata")?;
             let flag = match entry.kind {
                 EntryKind::CharDevice => SFlag::S_IFCHR,
                 EntryKind::BlockDevice => SFlag::S_IFBLK,
                 _ => bail!("invalid device entry kind"),
             };
-            let mode = Mode::from_bits_truncate(entry.mode.unwrap_or(0o600));
-            mknod(&path, flag, mode, makedev(device.major, device.minor))
-                .with_context(|| format!("failed to create device {}", path.display()))?;
-            Ok(())
+            let mode = Mode::from_bits_truncate(entry.mode.unwrap_or(0o600) as nix::libc::mode_t);
+            mknod(
+                &path,
+                flag,
+                mode,
+                device_makedev(device.major, device.minor),
+            )
+            .with_context(|| format!("failed to create device {}", path.display()))?;
+            Ok::<(), anyhow::Error>(())
         })
         .await
         .context("device creation task failed")?
@@ -1540,83 +2865,76 @@ async fn create_device(entry: &ManifestEntry, path: &Path) -> Result<()> {
     }
 }
 
-struct ProgressPrinter {
-    label: &'static str,
-    enabled: bool,
-    total_bytes: Option<u64>,
-    total_files: u64,
-    bytes_done: u64,
-    files_done: u64,
-    started: Instant,
-    last_print: Instant,
+fn injected_fail_after_chunks() -> Option<u64> {
+    std::env::var("BORE_TRANSFER_TEST_MAX_CHUNKS")
+        .ok()
+        .and_then(|value| value.parse().ok())
 }
 
-impl ProgressPrinter {
-    fn new(label: &'static str, total_bytes: Option<u64>, total_files: u64) -> Self {
-        let now = Instant::now();
-        Self {
-            label,
-            enabled: std::io::stderr().is_terminal(),
-            total_bytes,
-            total_files,
-            bytes_done: 0,
-            files_done: 0,
-            started: now,
-            last_print: now,
-        }
-    }
+#[cfg(unix)]
+fn device_major(device: u64) -> u64 {
+    nix::libc::major(device as nix::libc::dev_t) as u64
+}
 
-    fn start_path(&mut self, current: &str) {
-        self.render(current, false);
-    }
+#[cfg(unix)]
+fn device_minor(device: u64) -> u64 {
+    nix::libc::minor(device as nix::libc::dev_t) as u64
+}
 
-    fn advance_bytes(&mut self, delta: u64, current: &str) {
-        self.bytes_done = self.bytes_done.saturating_add(delta);
-        if self.last_print.elapsed() >= Duration::from_millis(250) {
-            self.render(current, false);
-        }
-    }
+#[cfg(unix)]
+fn device_makedev(major: u64, minor: u64) -> nix::libc::dev_t {
+    nix::libc::makedev(major as _, minor as _)
+}
 
-    fn finish_file(&mut self, current: &str) {
-        self.files_done = self.files_done.saturating_add(1);
-        self.render(current, false);
+fn render_progress(shared: &ProgressShared, elapsed: Duration, done: bool) {
+    if !shared.enabled {
+        return;
     }
-
-    fn finish(&mut self) {
-        self.render("done", true);
-    }
-
-    fn render(&mut self, current: &str, done: bool) {
-        if !self.enabled {
-            return;
-        }
-        let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
-        let speed = self.bytes_done as f64 / elapsed;
-        let bytes = human_bytes(self.bytes_done);
-        let speed = human_bytes(speed as u64);
-        let files = if self.total_files > 0 {
-            format!(" files {}/{}", self.files_done, self.total_files)
-        } else {
-            String::new()
-        };
-        let ratio = match self.total_bytes {
-            Some(total) if total > 0 => format!(
-                " {}/{} {:>5.1}%",
-                bytes,
-                human_bytes(total),
-                (self.bytes_done as f64 / total as f64) * 100.0
-            ),
-            Some(total) => format!(" {}/{}", bytes, human_bytes(total)),
-            None => format!(" {}", bytes),
-        };
-        let suffix = if done { "\n" } else { "\r" };
-        eprint!(
-            "[{}]{}{} speed {}/s current {}{}",
-            self.label, ratio, files, speed, current, suffix
-        );
-        let _ = std::io::stderr().flush();
-        self.last_print = Instant::now();
-    }
+    let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+    let current = shared.current.lock().expect("progress mutex").clone();
+    let bytes = shared.bytes_done.load(Ordering::Relaxed);
+    let resumed = shared.resumed_bytes.load(Ordering::Relaxed);
+    let files = shared.files_done.load(Ordering::Relaxed);
+    let workers = shared.workers.load(Ordering::Relaxed);
+    let speed = human_bytes((bytes as f64 / elapsed_secs) as u64);
+    let ratio = match shared.total_bytes {
+        Some(total) if total > 0 => format!(
+            " {}/{} {:>5.1}%",
+            human_bytes(bytes + resumed),
+            human_bytes(total),
+            ((bytes + resumed) as f64 / total as f64) * 100.0
+        ),
+        Some(total) => format!(" {}/{}", human_bytes(bytes + resumed), human_bytes(total)),
+        None => format!(" {}", human_bytes(bytes)),
+    };
+    let files_str = if shared.total_files > 0 {
+        format!(" files {files}/{}", shared.total_files)
+    } else {
+        String::new()
+    };
+    let resumed_str = if resumed > 0 {
+        format!(" resumed {}", human_bytes(resumed))
+    } else {
+        String::new()
+    };
+    let workers_str = if workers > 0 {
+        format!(" workers {workers}")
+    } else {
+        String::new()
+    };
+    // Show current file name only during transfer; skip if root entry (empty rel_path)
+    let file_str = if !done && !current.is_empty() {
+        format!(" {}", truncate_item(&current))
+    } else {
+        String::new()
+    };
+    // \x1b[K clears from cursor to end of line, removing leftover chars from shorter \r overwrites
+    let suffix = if done { "\n" } else { "\r" };
+    eprint!(
+        "[{}]{}{}{}{} {}/s{}\x1b[K{}",
+        shared.label, ratio, files_str, resumed_str, workers_str, speed, file_str, suffix,
+    );
+    let _ = std::io::stderr().flush();
 }
 
 fn human_bytes(value: u64) -> String {
@@ -1634,2014 +2952,97 @@ fn human_bytes(value: u64) -> String {
     }
 }
 
-fn is_stdin_keyword(path: &Path) -> bool {
-    path.components().count() == 1 && path.as_os_str() == OsStr::new("stdin")
-}
-
-fn single_component_string(path: &Path) -> Result<String> {
-    let components: Vec<_> = path.components().collect();
-    if components.len() != 1 {
-        bail!("transfer root name must be a single path component");
-    }
-    match components[0] {
-        Component::Normal(part) => encode_component_string(part),
-        _ => bail!("transfer root name must be a single path component"),
+fn format_duration(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        let m = (secs / 60.0) as u64;
+        let s = secs as u64 % 60;
+        format!("{m}m{s:02}s")
     }
 }
 
-fn encode_component_string(component: &OsStr) -> Result<String> {
-    validate_local_component(component)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-
-        if let Ok(text) = std::str::from_utf8(component.as_bytes()) {
-            return Ok(format!("u:{}", hex::encode(text.as_bytes())));
-        }
-        return Ok(format!("b:{}", hex::encode(component.as_bytes())));
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-
-        let wide: Vec<u16> = component.encode_wide().collect();
-        if let Ok(text) = String::from_utf16(&wide) {
-            return Ok(format!("u:{}", hex::encode(text.as_bytes())));
-        }
-        let mut bytes = Vec::with_capacity(wide.len() * 2);
-        for unit in wide {
-            bytes.extend_from_slice(&unit.to_le_bytes());
-        }
-        Ok(format!("w:{}", hex::encode(bytes)))
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let text = component.to_string_lossy();
-        Ok(format!("u:{}", hex::encode(text.as_bytes())))
-    }
-}
-
-fn decode_component_string(value: &str) -> Result<OsString> {
-    let (kind, encoded) = value
-        .split_once(':')
-        .with_context(|| format!("invalid encoded path component {value:?}"))?;
-    match kind {
-        "u" => {
-            let bytes = hex::decode(encoded)
-                .with_context(|| format!("invalid UTF-8 component encoding {value:?}"))?;
-            let text = String::from_utf8(bytes)
-                .with_context(|| format!("invalid UTF-8 component payload {value:?}"))?;
-            let component = OsString::from(text);
-            validate_local_component(&component)?;
-            Ok(component)
-        }
-        "b" => decode_unix_component(encoded),
-        "w" => decode_windows_component(encoded),
-        _ => bail!("unknown encoded path component kind {kind:?}"),
-    }
-}
-
-fn encode_native_path_string(path: &Path) -> Result<String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-
-        if let Ok(text) = std::str::from_utf8(path.as_os_str().as_bytes()) {
-            return Ok(format!("u:{}", hex::encode(text.as_bytes())));
-        }
-        return Ok(format!("b:{}", hex::encode(path.as_os_str().as_bytes())));
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-
-        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if let Ok(text) = String::from_utf16(&wide) {
-            return Ok(format!("u:{}", hex::encode(text.as_bytes())));
-        }
-        let mut bytes = Vec::with_capacity(wide.len() * 2);
-        for unit in wide {
-            bytes.extend_from_slice(&unit.to_le_bytes());
-        }
-        Ok(format!("w:{}", hex::encode(bytes)))
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let text = path.to_string_lossy();
-        Ok(format!("u:{}", hex::encode(text.as_bytes())))
-    }
-}
-
-fn decode_native_path_string(value: &str) -> Result<PathBuf> {
-    let (kind, encoded) = value
-        .split_once(':')
-        .with_context(|| format!("invalid encoded native path {value:?}"))?;
-    match kind {
-        "u" => {
-            let bytes = hex::decode(encoded)
-                .with_context(|| format!("invalid UTF-8 path encoding {value:?}"))?;
-            let text = String::from_utf8(bytes)
-                .with_context(|| format!("invalid UTF-8 path payload {value:?}"))?;
-            Ok(PathBuf::from(text))
-        }
-        "b" => {
-            let bytes = hex::decode(encoded)
-                .with_context(|| format!("invalid unix path encoding {value:?}"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::ffi::OsStringExt;
-                Ok(PathBuf::from(OsString::from_vec(bytes)))
-            }
-            #[cfg(not(unix))]
-            {
-                let text = String::from_utf8(bytes).context(
-                    "receiver platform cannot represent a non-UTF-8 unix path losslessly",
-                )?;
-                Ok(PathBuf::from(text))
-            }
-        }
-        "w" => {
-            let bytes = hex::decode(encoded)
-                .with_context(|| format!("invalid windows path encoding {value:?}"))?;
-            if bytes.len() % 2 != 0 {
-                bail!("invalid windows path payload length");
-            }
-            let wide: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-                .collect();
-            #[cfg(windows)]
-            {
-                use std::os::windows::ffi::OsStringExt;
-                Ok(PathBuf::from(OsString::from_wide(&wide)))
-            }
-            #[cfg(not(windows))]
-            {
-                let text = String::from_utf16(&wide).context(
-                    "receiver platform cannot represent this Windows path losslessly",
-                )?;
-                Ok(PathBuf::from(text))
-            }
-        }
-        _ => bail!("unknown encoded native path kind {kind:?}"),
-    }
-}
-
-fn decode_unix_component(encoded: &str) -> Result<OsString> {
-    let bytes = hex::decode(encoded).with_context(|| {
-        format!("invalid unix component encoding b:{encoded}")
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-
-        let component = OsString::from_vec(bytes);
-        validate_local_component(&component)?;
-        Ok(component)
-    }
-    #[cfg(not(unix))]
-    {
-        let text = String::from_utf8(bytes)
-            .context("receiver platform cannot represent a non-UTF-8 unix component losslessly")?;
-        let component = OsString::from(text);
-        validate_local_component(&component)?;
-        Ok(component)
-    }
-}
-
-fn decode_windows_component(encoded: &str) -> Result<OsString> {
-    let bytes = hex::decode(encoded).with_context(|| {
-        format!("invalid windows component encoding w:{encoded}")
-    })?;
-    if bytes.len() % 2 != 0 {
-        bail!("invalid windows component payload length");
-    }
-    let wide: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect();
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStringExt;
-
-        let component = OsString::from_wide(&wide);
-        validate_local_component(&component)?;
-        Ok(component)
-    }
-    #[cfg(not(windows))]
-    {
-        let text = String::from_utf16(&wide)
-            .context("receiver platform cannot represent this Windows component losslessly")?;
-        let component = OsString::from(text);
-        validate_local_component(&component)?;
-        Ok(component)
-    }
-}
-
-fn validate_local_component(component: &OsStr) -> Result<()> {
-    if component.is_empty() {
-        bail!("transfer root name cannot be empty");
-    }
-    let mut components = Path::new(component).components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(_)), None) => Ok(()),
-        _ => bail!("transfer root name must be a single path component"),
-    }
-}
-
-fn renamed_component(
-    root_name: &OsStr,
-    stem: Option<&OsStr>,
-    ext: Option<&OsStr>,
-    idx: u32,
-) -> OsString {
-    let suffix = format!(" ({idx})");
-    if let (Some(root_text), Some(stem_text)) = (root_name.to_str(), stem.and_then(|part| part.to_str())) {
-        if let Some(ext_text) = ext.and_then(|part| part.to_str()) {
-            let root_path = Path::new(root_text);
-            if root_path.file_name() == Some(root_name) {
-                return OsString::from(format!("{stem_text}{suffix}.{ext_text}"));
-            }
-        }
-        return OsString::from(format!("{root_text}{suffix}"));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-        let mut bytes = root_name.as_bytes().to_vec();
-        bytes.extend_from_slice(suffix.as_bytes());
-        OsString::from_vec(bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        let mut renamed = root_name.to_os_string();
-        renamed.push(suffix);
-        renamed
-    }
-}
-/*
-//! Secure file transfer built on top of bore secret tunnels.
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
-use std::io::IsTerminal;
-use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use anyhow::{anyhow, bail, Context, Result};
-use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
-use tokio::fs;
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
-use tracing::{info, warn};
-use uuid::Uuid;
-
-use crate::client::{Client, ProviderMeta};
-use crate::secret::Proxy;
-use crate::server::DEFAULT_MAX_CONNS;
-use crate::transport::Endpoint;
-
-const INTERNAL_BIND_ADDR: &str = "127.0.0.1:0";
-const INTERNAL_HOST: &str = "127.0.0.1";
-const FRAME_LIMIT: usize = 16 * 1024 * 1024;
-const MANIFEST_CHUNK_SIZE: usize = 128;
-const COPY_BUFFER_SIZE: usize = 64 * 1024;
-const PROGRESS_TICK: Duration = Duration::from_millis(500);
-const TRANSFER_PROTOCOL_VERSION: u32 = 1;
-
-/// Transfer conflict handling for an already existing destination.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CollisionPolicy {
-    /// Abort the transfer if the destination root already exists.
-    Fail,
-    /// Replace the destination root with the staged transfer.
-    Overwrite,
-    /// Pick a new destination root name when the requested one already exists.
-    Rename,
-}
-
-/// Whether symlinks should be transferred or skipped.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum SymlinkMode {
-    /// Preserve symlinks as symlinks.
-    Include,
-    /// Skip symlinks during the source scan.
-    Exclude,
-}
-
-/// Whether Unix device nodes should be transferred or skipped.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum DeviceMode {
-    /// Preserve supported Unix device nodes.
-    Include,
-    /// Skip device nodes during the source scan.
-    Exclude,
-}
-
-/// Transport settings for `bore transfer listener`.
-#[derive(Clone, Debug)]
-pub struct ListenerOptions {
-    /// Bore server endpoint.
-    pub to: String,
-    /// Optional shared secret.
-    pub secret: Option<String>,
-    /// Skip TLS certificate verification for `https://` endpoints.
-    pub insecure: bool,
-    /// Transfer identifier. If omitted, one is generated locally and printed.
-    pub transfer_id: Option<String>,
-    /// Destination directory on the receiver host.
-    pub dest_path: PathBuf,
-    /// Disable the direct UDP attempt and stay on relay only.
-    pub relay_only: bool,
-    /// Optional STUN override.
-    pub stun_server: Option<String>,
-    /// Enable UPnP-assisted direct UDP discovery.
-    pub upnp: bool,
-    /// Enable symmetric-NAT port prediction.
-    pub try_port_prediction: bool,
-    /// Preferred local UDP port for direct mode.
-    pub nat_udp_preferred_port: u16,
-    /// Preferred-port re-check timeout in seconds.
-    pub nat_udp_release_timeout: u64,
-    /// Relay carrier pool size.
-    pub carriers: u16,
-    /// Collision policy for the destination root.
-    pub collision_policy: CollisionPolicy,
-}
-
-/// Transport and source settings for `bore transfer sender`.
-#[derive(Clone, Debug)]
-pub struct SenderOptions {
-    /// Bore server endpoint.
-    pub to: String,
-    /// Optional shared secret.
-    pub secret: Option<String>,
-    /// Skip TLS certificate verification for `https://` endpoints.
-    pub insecure: bool,
-    /// Transfer identifier. If omitted, one is generated locally and printed.
-    pub transfer_id: Option<String>,
-    /// Source path or the literal string `stdin`.
-    pub source: String,
-    /// Output file name for `stdin` transfers.
-    pub output: Option<String>,
-    /// Disable the direct UDP attempt and stay on relay only.
-    pub relay_only: bool,
-    /// Optional STUN override.
-    pub stun_server: Option<String>,
-    /// Enable UPnP-assisted direct UDP discovery.
-    pub upnp: bool,
-    /// Enable symmetric-NAT port prediction.
-    pub try_port_prediction: bool,
-    /// Preferred local UDP port for direct mode.
-    pub nat_udp_preferred_port: u16,
-    /// Preferred-port re-check timeout in seconds.
-    pub nat_udp_release_timeout: u64,
-    /// Relay carrier pool size.
-    pub carriers: u16,
-    /// How to handle symlinks while scanning the source.
-    pub symlink_mode: SymlinkMode,
-    /// How to handle Unix device nodes while scanning the source.
-    pub device_mode: DeviceMode,
-}
-
-/// Result of one completed transfer command.
-#[derive(Clone, Debug)]
-pub struct TransferOutcome {
-    /// Transfer identifier used for the session.
-    pub transfer_id: String,
-    /// Final destination path on the receiver.
-    pub final_path: PathBuf,
-    /// Number of transferred regular files.
-    pub files: u64,
-    /// Number of transferred payload bytes.
-    pub bytes: u64,
-    /// Whether the transfer used the direct UDP path.
-    pub direct: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct BeginFrame {
-    protocol_version: u32,
-    transfer_id: String,
-    root_name: String,
-    stdin_source: bool,
-    total_entries: u64,
-    total_bytes: Option<u64>,
-    path: TransferPathInfo,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct TransferPathInfo {
-    direct: bool,
-    relay_tls: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum EntryKind {
-    File,
-    Directory,
-    Symlink,
-    CharDevice,
-    BlockDevice,
-}
-
-impl EntryKind {
-    fn is_regular_file(self) -> bool {
-        matches!(self, Self::File)
-    }
-
-    fn is_directory(self) -> bool {
-        matches!(self, Self::Directory)
-    }
-
-    fn is_static(self) -> bool {
-        matches!(
-            self,
-            Self::Directory | Self::Symlink | Self::CharDevice | Self::BlockDevice
-        )
-    }
-}
-
-impl fmt::Display for EntryKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::File => "file",
-            Self::Directory => "directory",
-            Self::Symlink => "symlink",
-            Self::CharDevice => "char-device",
-            Self::BlockDevice => "block-device",
-        };
-        f.write_str(value)
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct DeviceDescriptor {
-    major: u64,
-    minor: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ManifestEntry {
-    rel_path: String,
-    kind: EntryKind,
-    size: Option<u64>,
-    symlink_target: Option<String>,
-    device: Option<DeviceDescriptor>,
-    mode: Option<u32>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct SummaryFrame {
-    files: u64,
-    dirs: u64,
-    symlinks: u64,
-    devices: u64,
-    bytes: u64,
-    blake3: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CompletedFrame {
-    final_path: String,
-    files: u64,
-    bytes: u64,
-    blake3: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum Frame {
-    Begin(BeginFrame),
-    ManifestChunk { entries: Vec<ManifestEntry> },
-    ManifestDone,
-    ManifestAccepted { final_name: String },
-    FileStart { rel_path: String, size: u64 },
-    FileEnd { rel_path: String, blake3: String },
-    StreamStart { rel_path: String },
-    StreamChunk { len: u32 },
-    StreamEnd {
-        rel_path: String,
-        size: u64,
-        blake3: String,
-    },
-    Summary(SummaryFrame),
-    Completed(CompletedFrame),
-    Error { message: String },
-}
-
-#[derive(Clone, Debug)]
-struct PlannedTransfer {
-    root_name: String,
-    stdin_source: bool,
-    entries: Vec<PlannedEntry>,
-    total_bytes: Option<u64>,
-}
-
-#[derive(Clone, Debug)]
-struct PlannedEntry {
-    manifest: ManifestEntry,
-    source_path: Option<PathBuf>,
-}
-
-#[derive(Clone, Debug)]
-struct ReceiverPlan {
-    final_name: String,
-    final_path: PathBuf,
-    stage_base: PathBuf,
-    stage_root: PathBuf,
-    entries: Vec<ManifestEntry>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct TransferStats {
-    files: u64,
-    dirs: u64,
-    symlinks: u64,
-    devices: u64,
-    bytes: u64,
-}
-
-#[derive(Serialize)]
-struct TransferRecord<'a> {
-    rel_path: &'a str,
-    kind: EntryKind,
-    size: Option<u64>,
-    blake3: Option<&'a str>,
-    symlink_target: Option<&'a str>,
-    device: Option<&'a DeviceDescriptor>,
-}
-
-struct ProgressTracker {
-    enabled: bool,
-    bytes_done: Arc<AtomicU64>,
-    files_done: Arc<AtomicU64>,
-    current_item: Arc<Mutex<String>>,
-    finished: Arc<AtomicBool>,
-    task: Option<JoinHandle<()>>,
-}
-
-impl ProgressTracker {
-    fn new(label: &'static str, total_bytes: Option<u64>, total_files: u64) -> Self {
-        if !std::io::stderr().is_terminal() {
-            return Self {
-                enabled: false,
-                bytes_done: Arc::new(AtomicU64::new(0)),
-                files_done: Arc::new(AtomicU64::new(0)),
-                current_item: Arc::new(Mutex::new(String::new())),
-                finished: Arc::new(AtomicBool::new(false)),
-                task: None,
-            };
-        }
-
-        let bytes_done = Arc::new(AtomicU64::new(0));
-        let files_done = Arc::new(AtomicU64::new(0));
-        let current_item = Arc::new(Mutex::new(String::new()));
-        let finished = Arc::new(AtomicBool::new(false));
-        let task_bytes = Arc::clone(&bytes_done);
-        let task_files = Arc::clone(&files_done);
-        let task_item = Arc::clone(&current_item);
-        let task_finished = Arc::clone(&finished);
-
-        let task = tokio::spawn(async move {
-            let started = Instant::now();
-            let mut interval = tokio::time::interval(PROGRESS_TICK);
-            loop {
-                interval.tick().await;
-                let done = task_bytes.load(Ordering::Relaxed);
-                let files = task_files.load(Ordering::Relaxed);
-                let elapsed = started.elapsed().as_secs_f64().max(0.001);
-                let speed = done as f64 / elapsed;
-                let item = task_item.lock().expect("progress mutex").clone();
-                let line = if let Some(total) = total_bytes {
-                    let pct = if total == 0 {
-                        100.0
-                    } else {
-                        (done as f64 / total as f64) * 100.0
-                    };
-                    format!(
-                        "\r{label}: {files}/{total_files} files, {} / {} ({pct:.1}%), {}/s {}",
-                        format_bytes(done),
-                        format_bytes(total),
-                        format_bytes(speed as u64),
-                        truncate_item(&item),
-                    )
-                } else {
-                    format!(
-                        "\r{label}: {files}/{total_files} files, {}, {}/s {}",
-                        format_bytes(done),
-                        format_bytes(speed as u64),
-                        truncate_item(&item),
-                    )
-                };
-                eprint!("{line}");
-                let _ = std::io::stderr().flush();
-                if task_finished.load(Ordering::Relaxed) {
-                    eprintln!();
-                    break;
-                }
-            }
-        });
-
-        Self {
-            enabled: true,
-            bytes_done,
-            files_done,
-            current_item,
-            finished,
-            task: Some(task),
-        }
-    }
-
-    fn set_current(&self, path: &str) {
-        if !self.enabled {
-            return;
-        }
-        *self.current_item.lock().expect("progress mutex") = path.to_string();
-    }
-
-    fn add_bytes(&self, bytes: u64) {
-        self.bytes_done.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    fn file_completed(&self) {
-        self.files_done.fetch_add(1, Ordering::Relaxed);
-    }
-
-    async fn finish(mut self) {
-        if !self.enabled {
-            return;
-        }
-        self.finished.store(true, Ordering::Relaxed);
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-    }
-}
-
-/// Run `bore transfer listener` once.
-pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
-    let transfer_id = options.transfer_id.unwrap_or_else(generate_transfer_id);
-    if options.transfer_id.is_none() {
-        println!("Generated transfer id: {transfer_id}");
-    }
-    fs::create_dir_all(&options.dest_path)
-        .await
-        .with_context(|| format!("failed to create destination root {}", options.dest_path.display()))?;
-
-    let internal = TcpListener::bind(INTERNAL_BIND_ADDR)
-        .await
-        .context("failed to start internal transfer listener")?;
-    let internal_port = internal.local_addr()?.port();
-
-    let provider = Client::new_secret_provider(
-        INTERNAL_HOST,
-        internal_port,
-        &options.to,
-        &transfer_id,
-        options.secret.as_deref(),
-        options.insecure,
-        !options.relay_only,
-        options.stun_server.as_deref(),
-        options.upnp,
-        options.try_port_prediction,
-        options.nat_udp_preferred_port,
-        options.nat_udp_release_timeout,
-        DEFAULT_MAX_CONNS,
-        options.carriers.max(1),
-        ProviderMeta::default(),
-    )
-    .await
-    .with_context(|| format!("failed to register transfer listener '{transfer_id}'"))?;
-
-    info!(
-        transfer_id,
-        udp = !options.relay_only,
-        relay_tls = Endpoint::parse(&options.to).tls,
-        carriers = options.carriers,
-        dest = %options.dest_path.display(),
-        "transfer listener ready"
+fn print_transfer_done(
+    label: &str,
+    file_name: &str,
+    total_bytes: u64,
+    elapsed: Duration,
+    dest: Option<&Path>,
+) {
+    let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+    let avg_speed = human_bytes((total_bytes as f64 / elapsed_secs) as u64);
+    let dest_str = dest
+        .map(|p| format!(" → {}", p.display()))
+        .unwrap_or_default();
+    eprintln!(
+        "[{label}] complete: {file_name} — {} in {} — {avg_speed}/s avg — checksums ok{dest_str}",
+        human_bytes(total_bytes),
+        format_duration(elapsed_secs),
     );
-    println!("Waiting for sender on transfer id: {transfer_id}");
-
-    let mut provider_task = tokio::spawn(provider.listen());
-    let (stream, _) = tokio::select! {
-        accepted = internal.accept() => accepted.context("internal transfer listener stopped before a sender connected")?,
-        result = &mut provider_task => {
-            match result {
-                Ok(Ok(())) => bail!("transfer listener transport ended unexpectedly"),
-                Ok(Err(err)) => return Err(err).context("transfer listener transport failed"),
-                Err(err) => bail!("transfer listener transport task failed: {err}"),
-            }
-        }
-    };
-
-    let received = receive_transfer(stream, &transfer_id, &options.dest_path, options.collision_policy).await;
-    provider_task.abort();
-    let _ = provider_task.await;
-    received
 }
 
-/// Run `bore transfer sender` once.
-pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
-    let transfer_id = options.transfer_id.unwrap_or_else(generate_transfer_id);
-    if options.transfer_id.is_none() {
-        println!("Generated transfer id: {transfer_id}");
-    }
-
-    let plan = build_plan(
-        &options.source,
-        options.output.as_deref(),
-        options.symlink_mode,
-        options.device_mode,
-    )
-    .await?;
-    let endpoint = Endpoint::parse(&options.to);
-    let proxy = Proxy::new(
-        &options.to,
-        INTERNAL_BIND_ADDR.parse().expect("valid internal bind addr"),
-        &transfer_id,
-        options.secret.as_deref(),
-        options.insecure,
-        !options.relay_only,
-        options.stun_server.as_deref(),
-        options.upnp,
-        options.try_port_prediction,
-        options.nat_udp_preferred_port,
-        options.nat_udp_release_timeout,
-        options.carriers.max(1),
-        None,
-    )
-    .await
-    .with_context(|| format!("failed to connect transfer sender '{transfer_id}'"))?;
-
-    let direct = proxy.is_direct();
-    let local_addr = proxy.local_addr()?;
-    let path_info = TransferPathInfo {
-        direct,
-        relay_tls: !direct && endpoint.tls,
-    };
-
-    if direct {
-        info!(transfer_id, transport = "direct-udp", security = "quic-encrypted", "transfer sender path selected");
-    } else if options.relay_only {
-        info!(transfer_id, transport = "relay", security = if endpoint.tls { "tls" } else { "plain" }, "transfer sender path selected");
-    } else {
-        info!(transfer_id, transport = "relay", security = if endpoint.tls { "tls" } else { "plain" }, "direct udp unavailable, falling back to relay");
-    }
-
-    let mut proxy_task = tokio::spawn(proxy.listen());
-    let stream = tokio::select! {
-        connected = TcpStream::connect(local_addr) => connected.context("failed to connect internal transfer sender socket")?,
-        result = &mut proxy_task => {
-            match result {
-                Ok(Ok(())) => bail!("transfer sender transport ended before the local session started"),
-                Ok(Err(err)) => return Err(err).context("transfer sender transport failed"),
-                Err(err) => bail!("transfer sender transport task failed: {err}"),
-            }
-        }
-    };
-
-    let sent = send_transfer(stream, &transfer_id, plan, path_info).await;
-    proxy_task.abort();
-    let _ = proxy_task.await;
-    sent
-}
-
-async fn send_transfer(
-    mut stream: TcpStream,
-    transfer_id: &str,
-    plan: PlannedTransfer,
-    path: TransferPathInfo,
-) -> Result<TransferOutcome> {
-    let total_files = plan
-        .entries
-        .iter()
-        .filter(|entry| entry.manifest.kind.is_regular_file())
-        .count() as u64;
-    let progress = ProgressTracker::new("send", plan.total_bytes, total_files.max(1));
-
-    send_frame(
-        &mut stream,
-        &Frame::Begin(BeginFrame {
-            protocol_version: TRANSFER_PROTOCOL_VERSION,
-            transfer_id: transfer_id.to_string(),
-            root_name: plan.root_name.clone(),
-            stdin_source: plan.stdin_source,
-            total_entries: plan.entries.len() as u64,
-            total_bytes: plan.total_bytes,
-            path,
-        }),
-    )
-    .await?;
-
-    for chunk in plan.entries.chunks(MANIFEST_CHUNK_SIZE) {
-        let entries = chunk.iter().map(|entry| entry.manifest.clone()).collect();
-        send_frame(&mut stream, &Frame::ManifestChunk { entries }).await?;
-    }
-    send_frame(&mut stream, &Frame::ManifestDone).await?;
-
-    let final_name = match recv_frame(&mut stream).await? {
-        Some(Frame::ManifestAccepted { final_name }) => final_name,
-        Some(Frame::Error { message }) => bail!("listener rejected transfer: {message}"),
-        Some(other) => bail!("unexpected frame after manifest: {:?}", other),
-        None => bail!("listener closed during manifest negotiation"),
-    };
-    info!(transfer_id, final_name, "transfer manifest accepted");
-
-    let mut aggregate = blake3::Hasher::new();
-    let mut stats = TransferStats::default();
-
-    for entry in &plan.entries {
-        let rel_path = &entry.manifest.rel_path;
-        if entry.manifest.kind.is_static() {
-            update_transfer_hash(&mut aggregate, &entry.manifest, None, entry.manifest.size)?;
-            bump_static_stats(&mut stats, entry.manifest.kind);
-            continue;
-        }
-
-        progress.set_current(display_rel_path(rel_path));
-        if let Some(size) = entry.manifest.size {
-            let source_path = entry
-                .source_path
-                .as_ref()
-                .context("missing source path for regular file")?;
-            send_frame(
-                &mut stream,
-                &Frame::FileStart {
-                    rel_path: rel_path.clone(),
-                    size,
-                },
-            )
-            .await?;
-            let digest = send_file_bytes(&mut stream, source_path, size, &progress).await?;
-            send_frame(
-                &mut stream,
-                &Frame::FileEnd {
-                    rel_path: rel_path.clone(),
-                    blake3: digest.clone(),
-                },
-            )
-            .await?;
-            update_transfer_hash(&mut aggregate, &entry.manifest, Some(digest.as_str()), Some(size))?;
-            stats.files += 1;
-            stats.bytes += size;
-            progress.file_completed();
-        } else {
-            send_frame(
-                &mut stream,
-                &Frame::StreamStart {
-                    rel_path: rel_path.clone(),
-                },
-            )
-            .await?;
-            let (size, digest) = send_stdin_bytes(&mut stream, &progress).await?;
-            send_frame(
-                &mut stream,
-                &Frame::StreamEnd {
-                    rel_path: rel_path.clone(),
-                    size,
-                    blake3: digest.clone(),
-                },
-            )
-            .await?;
-            update_transfer_hash(&mut aggregate, &entry.manifest, Some(digest.as_str()), Some(size))?;
-            stats.files += 1;
-            stats.bytes += size;
-            progress.file_completed();
-        }
-    }
-
-    progress.finish().await;
-    let summary = SummaryFrame {
-        files: stats.files,
-        dirs: stats.dirs,
-        symlinks: stats.symlinks,
-        devices: stats.devices,
-        bytes: stats.bytes,
-        blake3: aggregate.finalize().to_hex().to_string(),
-    };
-    send_frame(&mut stream, &Frame::Summary(summary.clone())).await?;
-
-    match recv_frame(&mut stream).await? {
-        Some(Frame::Completed(done)) => {
-            if done.blake3 != summary.blake3 {
-                bail!(
-                    "listener acknowledged transfer with mismatched digest: expected {}, got {}",
-                    summary.blake3,
-                    done.blake3
-                );
-            }
-            info!(transfer_id, final_path = %done.final_path, bytes = done.bytes, files = done.files, "transfer completed");
-            Ok(TransferOutcome {
-                transfer_id: transfer_id.to_string(),
-                final_path: PathBuf::from(done.final_path),
-                files: done.files,
-                bytes: done.bytes,
-                direct: path.direct,
-            })
-        }
-        Some(Frame::Error { message }) => bail!("transfer failed: {message}"),
-        Some(other) => bail!("unexpected completion frame: {:?}", other),
-        None => bail!("listener closed before confirming transfer completion"),
-    }
-}
-
-async fn receive_transfer(
-    mut stream: TcpStream,
-    transfer_id: &str,
-    dest_path: &Path,
-    collision_policy: CollisionPolicy,
-) -> Result<TransferOutcome> {
-    let begin = match recv_frame(&mut stream).await? {
-        Some(Frame::Begin(begin)) => begin,
-        Some(Frame::Error { message }) => bail!("sender aborted before begin: {message}"),
-        Some(other) => bail!("unexpected frame at transfer start: {:?}", other),
-        None => bail!("sender closed before sending a transfer header"),
-    };
-    if begin.protocol_version != TRANSFER_PROTOCOL_VERSION {
-        send_protocol_error(
-            &mut stream,
-            format!(
-                "unsupported transfer protocol version {}",
-                begin.protocol_version
-            ),
-        )
-        .await;
-        bail!("unsupported transfer protocol version {}", begin.protocol_version);
-    }
-    if begin.transfer_id != transfer_id {
-        send_protocol_error(
-            &mut stream,
-            format!(
-                "transfer id mismatch: expected {transfer_id}, got {}",
-                begin.transfer_id
-            ),
-        )
-        .await;
-        bail!(
-            "transfer id mismatch: expected {transfer_id}, got {}",
-            begin.transfer_id
-        );
-    }
-
-    info!(
-        transfer_id,
-        transport = if begin.path.direct { "direct-udp" } else { "relay" },
-        security = transfer_security(&begin.path),
-        stdin_source = begin.stdin_source,
-        "transfer receiver accepted session"
-    );
-
-    let receiver_plan = match receive_manifest(&mut stream, dest_path, &begin, collision_policy).await {
-        Ok(plan) => plan,
-        Err(err) => {
-            send_protocol_error(&mut stream, err.to_string()).await;
-            return Err(err);
-        }
-    };
-
-    send_frame(
-        &mut stream,
-        &Frame::ManifestAccepted {
-            final_name: receiver_plan.final_name.clone(),
-        },
-    )
-    .await?;
-
-    let total_files = receiver_plan
-        .entries
-        .iter()
-        .filter(|entry| entry.kind.is_regular_file())
-        .count() as u64;
-    let progress = ProgressTracker::new("recv", begin.total_bytes, total_files.max(1));
-
-    let mut aggregate = blake3::Hasher::new();
-    let mut stats = TransferStats::default();
-    let transfer_result = receive_payload(
-        &mut stream,
-        &receiver_plan,
-        &progress,
-        &mut aggregate,
-        &mut stats,
-    )
-    .await;
-    progress.finish().await;
-
-    let summary = match transfer_result {
-        Ok(summary) => summary,
-        Err(err) => {
-            let _ = cleanup_stage(&receiver_plan.stage_base).await;
-            send_protocol_error(&mut stream, err.to_string()).await;
-            return Err(err);
-        }
-    };
-
-    let expected = SummaryFrame {
-        files: stats.files,
-        dirs: stats.dirs,
-        symlinks: stats.symlinks,
-        devices: stats.devices,
-        bytes: stats.bytes,
-        blake3: aggregate.finalize().to_hex().to_string(),
-    };
-    if summary != expected {
-        let _ = cleanup_stage(&receiver_plan.stage_base).await;
-        let message = format!(
-            "summary mismatch: expected files={}, dirs={}, symlinks={}, devices={}, bytes={}, blake3={}, got files={}, dirs={}, symlinks={}, devices={}, bytes={}, blake3={}",
-            expected.files,
-            expected.dirs,
-            expected.symlinks,
-            expected.devices,
-            expected.bytes,
-            expected.blake3,
-            summary.files,
-            summary.dirs,
-            summary.symlinks,
-            summary.devices,
-            summary.bytes,
-            summary.blake3,
-        );
-        send_protocol_error(&mut stream, message.clone()).await;
-        bail!(message);
-    }
-
-    let final_path = match commit_stage(&receiver_plan, collision_policy).await {
-        Ok(path) => path,
-        Err(err) => {
-            let _ = cleanup_stage(&receiver_plan.stage_base).await;
-            send_protocol_error(&mut stream, err.to_string()).await;
-            return Err(err);
-        }
-    };
-    let final_path_string = final_path.to_string_lossy().to_string();
-    send_frame(
-        &mut stream,
-        &Frame::Completed(CompletedFrame {
-            final_path: final_path_string.clone(),
-            files: expected.files,
-            bytes: expected.bytes,
-            blake3: expected.blake3.clone(),
-        }),
-    )
-    .await?;
-
-    Ok(TransferOutcome {
-        transfer_id: transfer_id.to_string(),
-        final_path: PathBuf::from(final_path_string),
-        files: expected.files,
-        bytes: expected.bytes,
-        direct: begin.path.direct,
-    })
-}
-
-async fn receive_manifest(
-    stream: &mut TcpStream,
-    dest_path: &Path,
-    begin: &BeginFrame,
-    collision_policy: CollisionPolicy,
-) -> Result<ReceiverPlan> {
-    let mut entries = Vec::new();
-    loop {
-        match recv_frame(stream).await? {
-            Some(Frame::ManifestChunk { entries: chunk }) => entries.extend(chunk),
-            Some(Frame::ManifestDone) => break,
-            Some(Frame::Error { message }) => bail!("sender aborted during manifest: {message}"),
-            Some(other) => bail!("unexpected frame while receiving manifest: {:?}", other),
-            None => bail!("sender closed during manifest transfer"),
-        }
-    }
-
-    if entries.len() as u64 != begin.total_entries {
-        bail!(
-            "manifest entry count mismatch: expected {}, got {}",
-            begin.total_entries,
-            entries.len()
-        );
-    }
-    let root = entries.first().context("manifest is empty")?;
-    if !root.rel_path.is_empty() {
-        bail!("manifest root entry must use an empty relative path");
-    }
-    if begin.stdin_source && (root.kind != EntryKind::File || root.size.is_some()) {
-        bail!("stdin transfers must expose a single root regular file with unknown size");
-    }
-    if !begin.stdin_source && root.kind == EntryKind::File && root.size.is_none() {
-        bail!("regular file entries require a known size");
-    }
-    validate_manifest(&entries)?;
-
-    let final_name = resolve_final_name(dest_path, &begin.root_name, collision_policy).await?;
-    let stage_base = dest_path.join(format!(".bore-transfer-{}.part", Uuid::new_v4()));
-    let stage_root = stage_base.join(&final_name);
-    Ok(ReceiverPlan {
-        final_name,
-        final_path: dest_path.join(begin.root_name.clone()),
-        stage_base,
-        stage_root,
-        entries,
-    })
-}
-
-async fn receive_payload(
-    stream: &mut TcpStream,
-    plan: &ReceiverPlan,
-    progress: &ProgressTracker,
-    aggregate: &mut blake3::Hasher,
-    stats: &mut TransferStats,
-) -> Result<SummaryFrame> {
-    fs::create_dir_all(&plan.stage_base)
-        .await
-        .with_context(|| format!("failed to create staging directory {}", plan.stage_base.display()))?;
-
-    for entry in &plan.entries {
-        if entry.kind.is_static() {
-            apply_static_entry(&plan.stage_root, entry).await?;
-            update_transfer_hash(aggregate, entry, None, entry.size)?;
-            bump_static_stats(stats, entry.kind);
-            continue;
-        }
-
-        let rel_path = entry.rel_path.clone();
-        progress.set_current(display_rel_path(&rel_path));
-        if let Some(size) = entry.size {
-            let start = match recv_frame(stream).await? {
-                Some(Frame::FileStart { rel_path, size }) => (rel_path, size),
-                Some(Frame::Error { message }) => bail!("sender aborted during file payload: {message}"),
-                Some(other) => bail!("unexpected frame before file payload: {:?}", other),
-                None => bail!("sender closed during file payload"),
-            };
-            if start.0 != entry.rel_path || start.1 != size {
-                bail!(
-                    "payload header mismatch for '{}': expected size {}, got '{}' size {}",
-                    entry.rel_path,
-                    size,
-                    start.0,
-                    start.1
-                );
-            }
-            let path = stage_entry_path(&plan.stage_root, entry)?;
-            let digest = receive_file_bytes(stream, &path, size, entry.mode, progress).await?;
-            match recv_frame(stream).await? {
-                Some(Frame::FileEnd { rel_path, blake3 }) => {
-                    if rel_path != entry.rel_path {
-                        bail!(
-                            "file trailer mismatch: expected '{}', got '{}'",
-                            entry.rel_path,
-                            rel_path
-                        );
-                    }
-                    if blake3 != digest {
-                        bail!(
-                            "digest mismatch for '{}': sender={}, receiver={digest}",
-                            entry.rel_path,
-                            blake3
-                        );
-                    }
-                    update_transfer_hash(aggregate, entry, Some(digest.as_str()), Some(size))?;
-                    stats.files += 1;
-                    stats.bytes += size;
-                    progress.file_completed();
-                }
-                Some(Frame::Error { message }) => bail!("sender aborted during file trailer: {message}"),
-                Some(other) => bail!("unexpected frame after file payload: {:?}", other),
-                None => bail!("sender closed before file trailer"),
-            }
-        } else {
-            match recv_frame(stream).await? {
-                Some(Frame::StreamStart { rel_path }) => {
-                    if rel_path != entry.rel_path {
-                        bail!(
-                            "stream header mismatch: expected '{}', got '{}'",
-                            entry.rel_path,
-                            rel_path
-                        );
-                    }
-                }
-                Some(Frame::Error { message }) => bail!("sender aborted during stream start: {message}"),
-                Some(other) => bail!("unexpected frame before stdin stream: {:?}", other),
-                None => bail!("sender closed before stdin stream"),
-            }
-            let path = stage_entry_path(&plan.stage_root, entry)?;
-            let (size, digest) = receive_stream_bytes(stream, &path, entry.mode, progress).await?;
-            update_transfer_hash(aggregate, entry, Some(digest.as_str()), Some(size))?;
-            stats.files += 1;
-            stats.bytes += size;
-            progress.file_completed();
-        }
-    }
-
-    match recv_frame(stream).await? {
-        Some(Frame::Summary(summary)) => Ok(summary),
-        Some(Frame::Error { message }) => bail!("sender aborted before summary: {message}"),
-        Some(other) => bail!("unexpected frame after payload: {:?}", other),
-        None => bail!("sender closed before transfer summary"),
-    }
-}
-
-async fn build_plan(
-    source: &str,
-    output: Option<&str>,
-    symlink_mode: SymlinkMode,
-    device_mode: DeviceMode,
-) -> Result<PlannedTransfer> {
-    if source == "stdin" {
-        let output = output.context("--output is required when --source stdin")?;
-        validate_output_name(output)?;
-        return Ok(PlannedTransfer {
-            root_name: output.to_string(),
-            stdin_source: true,
-            entries: vec![PlannedEntry {
-                manifest: ManifestEntry {
-                    rel_path: String::new(),
-                    kind: EntryKind::File,
-                    size: None,
-                    symlink_target: None,
-                    device: None,
-                    mode: None,
-                },
-                source_path: None,
-            }],
-            total_bytes: None,
-        });
-    }
-
-    let source_path = PathBuf::from(source);
-    let path_for_scan = source_path.clone();
-    tokio::task::spawn_blocking(move || scan_source(path_for_scan, symlink_mode, device_mode))
-        .await
-        .context("source scan task failed")?
-}
-
-fn scan_source(
-    source_path: PathBuf,
-    symlink_mode: SymlinkMode,
-    device_mode: DeviceMode,
-) -> Result<PlannedTransfer> {
-    let metadata = std::fs::symlink_metadata(&source_path)
-        .with_context(|| format!("failed to inspect source {}", source_path.display()))?;
-    let root_name = source_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_string)
-        .with_context(|| format!("source path {} must end with a valid UTF-8 file name", source_path.display()))?;
-
-    let mut entries = Vec::new();
-    let mut total_bytes = 0u64;
-    scan_path(
-        &source_path,
-        Path::new(""),
-        &metadata,
-        symlink_mode,
-        device_mode,
-        &mut entries,
-        &mut total_bytes,
-    )?;
-
-    Ok(PlannedTransfer {
-        root_name,
-        stdin_source: false,
-        entries,
-        total_bytes: Some(total_bytes),
-    })
-}
-
-fn scan_path(
-    abs_path: &Path,
-    rel_path: &Path,
-    metadata: &std::fs::Metadata,
-    symlink_mode: SymlinkMode,
-    device_mode: DeviceMode,
-    entries: &mut Vec<PlannedEntry>,
-    total_bytes: &mut u64,
-) -> Result<()> {
-    let file_type = metadata.file_type();
-    let rel = rel_path_to_string(rel_path)?;
-    let mode = unix_mode(metadata);
-
-    if file_type.is_dir() {
-        entries.push(PlannedEntry {
-            manifest: ManifestEntry {
-                rel_path: rel,
-                kind: EntryKind::Directory,
-                size: None,
-                symlink_target: None,
-                device: None,
-                mode,
-            },
-            source_path: None,
-        });
-
-        let mut children = std::fs::read_dir(abs_path)
-            .with_context(|| format!("failed to read directory {}", abs_path.display()))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .with_context(|| format!("failed to enumerate directory {}", abs_path.display()))?;
-        children.sort_by_key(|entry| entry.file_name());
-        for child in children {
-            let child_abs = child.path();
-            let child_name = child
-                .file_name()
-                .into_string()
-                .map_err(|_| anyhow!("path {} is not valid UTF-8", child_abs.display()))?;
-            let child_rel = if rel_path.as_os_str().is_empty() {
-                PathBuf::from(child_name)
-            } else {
-                rel_path.join(child_name)
-            };
-            let child_meta = std::fs::symlink_metadata(&child_abs)
-                .with_context(|| format!("failed to inspect {}", child_abs.display()))?;
-            scan_path(
-                &child_abs,
-                &child_rel,
-                &child_meta,
-                symlink_mode,
-                device_mode,
-                entries,
-                total_bytes,
-            )?;
-        }
-        return Ok(());
-    }
-
-    if file_type.is_file() {
-        let size = metadata.len();
-        *total_bytes = total_bytes
-            .checked_add(size)
-            .context("transfer size exceeds u64")?;
-        entries.push(PlannedEntry {
-            manifest: ManifestEntry {
-                rel_path: rel,
-                kind: EntryKind::File,
-                size: Some(size),
-                symlink_target: None,
-                device: None,
-                mode,
-            },
-            source_path: Some(abs_path.to_path_buf()),
-        });
-        return Ok(());
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        if file_type.is_symlink() {
-            if symlink_mode == SymlinkMode::Exclude {
-                if rel_path.as_os_str().is_empty() {
-                    bail!("source is a symlink but --symlinks exclude was selected");
-                }
-                return Ok(());
-            }
-            let target = std::fs::read_link(abs_path)
-                .with_context(|| format!("failed to read symlink {}", abs_path.display()))?;
-            let target = target
-                .to_str()
-                .map(str::to_string)
-                .with_context(|| format!("symlink target for {} is not valid UTF-8", abs_path.display()))?;
-            entries.push(PlannedEntry {
-                manifest: ManifestEntry {
-                    rel_path: rel,
-                    kind: EntryKind::Symlink,
-                    size: None,
-                    symlink_target: Some(target),
-                    device: None,
-                    mode,
-                },
-                source_path: None,
-            });
-            return Ok(());
-        }
-        if file_type.is_char_device() || file_type.is_block_device() {
-            if device_mode == DeviceMode::Exclude {
-                if rel_path.as_os_str().is_empty() {
-                    bail!("source is a device node but --devices exclude was selected");
-                }
-                return Ok(());
-            }
-            let descriptor = describe_device(metadata)?;
-            entries.push(PlannedEntry {
-                manifest: ManifestEntry {
-                    rel_path: rel,
-                    kind: if file_type.is_char_device() {
-                        EntryKind::CharDevice
-                    } else {
-                        EntryKind::BlockDevice
-                    },
-                    size: None,
-                    symlink_target: None,
-                    device: Some(descriptor),
-                    mode,
-                },
-                source_path: None,
-            });
-            return Ok(());
-        }
-    }
-
-    bail!("unsupported special file type at {}", abs_path.display())
-}
-
-fn validate_manifest(entries: &[ManifestEntry]) -> Result<()> {
-    let mut seen = BTreeSet::new();
-    let mut kinds = BTreeMap::new();
-    for entry in entries {
-        validate_rel_path(&entry.rel_path)?;
-        if !seen.insert(entry.rel_path.clone()) {
-            bail!("duplicate manifest path '{}'", display_rel_path(&entry.rel_path));
-        }
-        let path = PathBuf::from(&entry.rel_path);
-        if !entry.rel_path.is_empty() {
-            let mut ancestor = path.parent();
-            while let Some(parent) = ancestor {
-                if let Some(kind) = kinds.get(parent) {
-                    if !kind.is_directory() {
-                        bail!(
-                            "manifest path '{}' is nested under non-directory '{}'",
-                            display_rel_path(&entry.rel_path),
-                            display_path(parent)
-                        );
-                    }
-                }
-                ancestor = parent.parent();
-            }
-        }
-        kinds.insert(path, entry.kind);
-    }
-    Ok(())
-}
-
-async fn resolve_final_name(
-    dest_path: &Path,
-    requested_name: &str,
-    collision_policy: CollisionPolicy,
-) -> Result<String> {
-    let requested_path = dest_path.join(requested_name);
-    if !path_exists(&requested_path).await? {
-        return Ok(requested_name.to_string());
-    }
-    match collision_policy {
-        CollisionPolicy::Fail => bail!(
-            "destination '{}' already exists",
-            requested_path.display()
-        ),
-        CollisionPolicy::Overwrite => Ok(requested_name.to_string()),
-        CollisionPolicy::Rename => unique_name(dest_path, requested_name).await,
-    }
-}
-
-async fn unique_name(dest_path: &Path, requested_name: &str) -> Result<String> {
-    let requested = Path::new(requested_name);
-    let stem = requested
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(requested_name);
-    let ext = requested.extension().and_then(|ext| ext.to_str());
-
-    for idx in 1..10_000u32 {
-        let candidate = match ext {
-            Some(ext) if !ext.is_empty() => format!("{stem} ({idx}).{ext}"),
-            _ => format!("{requested_name} ({idx})"),
-        };
-        if !path_exists(&dest_path.join(&candidate)).await? {
-            return Ok(candidate);
-        }
-    }
-
-    bail!("unable to find a unique destination name for '{requested_name}'")
-}
-
-async fn commit_stage(plan: &ReceiverPlan, collision_policy: CollisionPolicy) -> Result<PathBuf> {
-    let final_path = plan
-        .stage_root
-        .parent()
-        .context("staged root has no parent")?
-        .parent()
-        .context("staged root has no destination parent")?
-        .join(&plan.final_name);
-
-    if path_exists(&final_path).await? {
-        match collision_policy {
-            CollisionPolicy::Fail => bail!("destination '{}' already exists", final_path.display()),
-            CollisionPolicy::Rename => bail!("rename policy should have selected a unique name before commit"),
-            CollisionPolicy::Overwrite => {
-                let backup = final_path
-                    .parent()
-                    .context("destination has no parent")?
-                    .join(format!(".{}.bore-backup-{}", plan.final_name, Uuid::new_v4()));
-                fs::rename(&final_path, &backup)
-                    .await
-                    .with_context(|| format!("failed to move existing destination {} out of the way", final_path.display()))?;
-                if let Err(err) = fs::rename(&plan.stage_root, &final_path).await {
-                    let _ = fs::rename(&backup, &final_path).await;
-                    return Err(err).with_context(|| {
-                        format!(
-                            "failed to replace destination {} with staged transfer",
-                            final_path.display()
-                        )
-                    });
-                }
-                cleanup_path(&backup).await?;
-            }
-        }
-    } else {
-        fs::rename(&plan.stage_root, &final_path)
-            .await
-            .with_context(|| format!("failed to publish staged transfer to {}", final_path.display()))?;
-    }
-
-    let _ = cleanup_path(&plan.stage_base).await;
-    Ok(final_path)
-}
-
-async fn apply_static_entry(stage_root: &Path, entry: &ManifestEntry) -> Result<()> {
-    let path = stage_entry_path(stage_root, entry)?;
-    match entry.kind {
-        EntryKind::Directory => {
-            fs::create_dir_all(&path)
-                .await
-                .with_context(|| format!("failed to create directory {}", path.display()))?;
-            apply_mode(&path, entry.mode).await?;
-        }
-        EntryKind::Symlink => {
-            let target = entry
-                .symlink_target
-                .as_deref()
-                .context("symlink entry is missing a target")?
-                .to_string();
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).await?;
-            }
-            create_symlink(target, path).await?;
-        }
-        EntryKind::CharDevice | EntryKind::BlockDevice => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).await?;
-            }
-            create_device(&path, entry).await?;
-        }
-        EntryKind::File => {}
-    }
-    Ok(())
-}
-
-async fn send_file_bytes(
-    stream: &mut TcpStream,
-    source_path: &Path,
-    expected_size: u64,
-    progress: &ProgressTracker,
-) -> Result<String> {
-    let mut file = fs::File::open(source_path)
-        .await
-        .with_context(|| format!("failed to open source file {}", source_path.display()))?;
-    let mut remaining = expected_size;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
-    while remaining > 0 {
-        let chunk = remaining.min(buffer.len() as u64) as usize;
-        let n = file
-            .read(&mut buffer[..chunk])
-            .await
-            .with_context(|| format!("failed to read source file {}", source_path.display()))?;
-        if n == 0 {
-            bail!(
-                "source file {} ended early: expected {} more bytes",
-                source_path.display(),
-                remaining
-            );
-        }
-        stream.write_all(&buffer[..n]).await?;
-        hasher.update(&buffer[..n]);
-        remaining -= n as u64;
-        progress.add_bytes(n as u64);
-    }
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
-async fn receive_file_bytes(
-    stream: &mut TcpStream,
-    target_path: &Path,
-    expected_size: u64,
-    mode: Option<u32>,
-    progress: &ProgressTracker,
-) -> Result<String> {
-    if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    let mut file = fs::File::create(target_path)
-        .await
-        .with_context(|| format!("failed to create destination file {}", target_path.display()))?;
-    let mut remaining = expected_size;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
-    while remaining > 0 {
-        let chunk = remaining.min(buffer.len() as u64) as usize;
-        stream
-            .read_exact(&mut buffer[..chunk])
-            .await
-            .with_context(|| format!("failed to receive payload for {}", target_path.display()))?;
-        file.write_all(&buffer[..chunk]).await?;
-        hasher.update(&buffer[..chunk]);
-        remaining -= chunk as u64;
-        progress.add_bytes(chunk as u64);
-    }
-    file.flush().await?;
-    file.sync_all().await?;
-    drop(file);
-    apply_mode(target_path, mode).await?;
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
-async fn send_stdin_bytes(stream: &mut TcpStream, progress: &ProgressTracker) -> Result<(u64, String)> {
-    let mut stdin = io::stdin();
-    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
-    let mut total = 0u64;
-    let mut hasher = blake3::Hasher::new();
-    loop {
-        let read = stdin.read(&mut buffer).await.context("failed to read stdin")?;
-        if read == 0 {
-            break;
-        }
-        send_frame(stream, &Frame::StreamChunk { len: read as u32 }).await?;
-        stream.write_all(&buffer[..read]).await?;
-        hasher.update(&buffer[..read]);
-        total += read as u64;
-        progress.add_bytes(read as u64);
-    }
-    Ok((total, hasher.finalize().to_hex().to_string()))
-}
-
-async fn receive_stream_bytes(
-    stream: &mut TcpStream,
-    target_path: &Path,
-    mode: Option<u32>,
-    progress: &ProgressTracker,
-) -> Result<(u64, String)> {
-    if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    let mut file = fs::File::create(target_path)
-        .await
-        .with_context(|| format!("failed to create destination file {}", target_path.display()))?;
-    let mut total = 0u64;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
-
-    loop {
-        match recv_frame(stream).await? {
-            Some(Frame::StreamChunk { len }) => {
-                let len = len as usize;
-                if len > buffer.len() {
-                    buffer.resize(len, 0);
-                }
-                stream
-                    .read_exact(&mut buffer[..len])
-                    .await
-                    .with_context(|| format!("failed to receive streamed payload for {}", target_path.display()))?;
-                file.write_all(&buffer[..len]).await?;
-                hasher.update(&buffer[..len]);
-                total += len as u64;
-                progress.add_bytes(len as u64);
-            }
-            Some(Frame::StreamEnd {
-                rel_path: _,
-                size,
-                blake3,
-            }) => {
-                file.flush().await?;
-                file.sync_all().await?;
-                drop(file);
-                apply_mode(target_path, mode).await?;
-                let digest = hasher.finalize().to_hex().to_string();
-                if size != total {
-                    bail!(
-                        "stream size mismatch for {}: sender={}, receiver={total}",
-                        target_path.display(),
-                        size
-                    );
-                }
-                if blake3 != digest {
-                    bail!(
-                        "stream digest mismatch for {}: sender={}, receiver={digest}",
-                        target_path.display(),
-                        blake3
-                    );
-                }
-                return Ok((total, digest));
-            }
-            Some(Frame::Error { message }) => bail!("sender aborted during stdin stream: {message}"),
-            Some(other) => bail!("unexpected frame inside streamed payload: {:?}", other),
-            None => bail!("sender closed before the streamed payload ended"),
-        }
-    }
-}
-
-fn update_transfer_hash(
-    hasher: &mut blake3::Hasher,
-    entry: &ManifestEntry,
-    digest: Option<&str>,
-    size: Option<u64>,
-) -> Result<()> {
-    let record = TransferRecord {
-        rel_path: &entry.rel_path,
-        kind: entry.kind,
-        size,
-        blake3: digest,
-        symlink_target: entry.symlink_target.as_deref(),
-        device: entry.device.as_ref(),
-    };
-    let encoded = serde_json::to_vec(&record)?;
-    hasher.update(&(encoded.len() as u32).to_le_bytes());
-    hasher.update(&encoded);
-    Ok(())
-}
-
-fn bump_static_stats(stats: &mut TransferStats, kind: EntryKind) {
-    match kind {
-        EntryKind::Directory => stats.dirs += 1,
-        EntryKind::Symlink => stats.symlinks += 1,
-        EntryKind::CharDevice | EntryKind::BlockDevice => stats.devices += 1,
-        EntryKind::File => {}
-    }
-}
-
-async fn send_frame(stream: &mut TcpStream, frame: &Frame) -> Result<()> {
-    let payload = serde_json::to_vec(frame)?;
-    if payload.len() > FRAME_LIMIT {
-        bail!("transfer frame exceeds size limit ({})", payload.len());
-    }
-    stream.write_u32_le(payload.len() as u32).await?;
-    stream.write_all(&payload).await?;
-    Ok(())
-}
-
-async fn recv_frame(stream: &mut TcpStream) -> Result<Option<Frame>> {
-    let len = match stream.read_u32_le().await {
-        Ok(len) => len as usize,
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err).context("failed to read transfer frame length"),
-    };
-    if len > FRAME_LIMIT {
-        bail!("transfer frame length {} exceeds limit {}", len, FRAME_LIMIT);
-    }
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).await?;
-    Ok(Some(serde_json::from_slice(&payload)?))
-}
-
-async fn send_protocol_error(stream: &mut TcpStream, message: String) {
-    let _ = send_frame(stream, &Frame::Error { message }).await;
-}
-
-async fn cleanup_stage(path: &Path) -> Result<()> {
-    if path_exists(path).await? {
-        cleanup_path(path).await?;
-    }
-    Ok(())
-}
-
-async fn cleanup_path(path: &Path) -> Result<()> {
-    let meta = fs::symlink_metadata(path).await?;
-    if meta.is_dir() {
-        fs::remove_dir_all(path).await?;
-    } else {
-        fs::remove_file(path).await?;
-    }
-    Ok(())
-}
-
-async fn path_exists(path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(path).await {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
-    }
-}
-
-fn stage_entry_path(stage_root: &Path, entry: &ManifestEntry) -> Result<PathBuf> {
-    if entry.rel_path.is_empty() {
-        return Ok(stage_root.to_path_buf());
-    }
-    validate_rel_path(&entry.rel_path)?;
-    Ok(stage_root.join(&entry.rel_path))
-}
-
-fn validate_rel_path(rel_path: &str) -> Result<()> {
-    let path = Path::new(rel_path);
-    if path.is_absolute() {
-        bail!("manifest path '{}' must be relative", rel_path);
-    }
-    for component in path.components() {
-        match component {
-            Component::Normal(_) => {}
-            Component::CurDir => {}
-            Component::ParentDir => bail!("manifest path '{}' escapes the transfer root", rel_path),
-            Component::RootDir | Component::Prefix(_) => {
-                bail!("manifest path '{}' must be relative", rel_path)
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_output_name(output: &str) -> Result<()> {
-    let path = Path::new(output);
-    if output.is_empty() {
-        bail!("--output must not be empty");
-    }
-    if path.components().count() != 1 || !matches!(path.components().next(), Some(Component::Normal(_))) {
-        bail!("--output must be a single file name, not a path");
-    }
-    Ok(())
-}
-
-fn rel_path_to_string(path: &Path) -> Result<String> {
-    if path.as_os_str().is_empty() {
-        return Ok(String::new());
-    }
-    path.to_str()
-        .map(str::to_string)
-        .with_context(|| format!("path '{}' is not valid UTF-8", path.display()))
-}
-
-fn display_rel_path(rel_path: &str) -> &str {
-    if rel_path.is_empty() {
-        "."
-    } else {
-        rel_path
-    }
-}
-
-fn display_path(path: &Path) -> String {
-    let rendered = path.to_string_lossy();
-    if rendered.is_empty() {
-        ".".to_string()
-    } else {
-        rendered.into_owned()
-    }
-}
-
-fn generate_transfer_id() -> String {
-    Uuid::new_v4().to_string()
-}
-
-fn transfer_security(path: &TransferPathInfo) -> &'static str {
-    if path.direct {
-        "quic-encrypted"
-    } else if path.relay_tls {
-        "tls"
-    } else {
-        "plain"
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0usize;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{} {}", bytes, UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-fn truncate_item(item: &str) -> String {
+fn truncate_item(value: &str) -> String {
     const LIMIT: usize = 48;
-    if item.chars().count() <= LIMIT {
-        item.to_string()
+    if value.chars().count() <= LIMIT {
+        value.to_string()
     } else {
-        let prefix: String = item.chars().take(LIMIT - 3).collect();
+        let prefix: String = value.chars().take(LIMIT - 3).collect();
         format!("{prefix}...")
     }
 }
 
-fn unix_mode(metadata: &std::fs::Metadata) -> Option<u32> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        return Some(metadata.permissions().mode());
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        None
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-async fn apply_mode(path: &Path, mode: Option<u32>) -> Result<()> {
+    #[test]
+    fn path_codec_round_trips_utf8_component() {
+        let original =
+            OsString::from("report-za\u{017c}\u{00f3}\u{0142}\u{0107}-\u{4f8b}\u{5b50}.txt");
+        let encoded = encode_component_os(original.as_os_str());
+
+        assert_eq!(decode_component(&encoded), original);
+    }
+
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Some(mode) = mode {
-            fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await?;
+    #[test]
+    fn path_codec_round_trips_unix_raw_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let original =
+            OsString::from_vec(vec![b'r', b'a', b'w', b'-', 0xff, b'.', b'b', b'i', b'n']);
+        let encoded = encode_component_os(OsStr::from_bytes(original.as_bytes()));
+
+        assert!(encoded.starts_with("b:"));
+        assert_eq!(decode_component(&encoded), original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_codec_sanitizes_windows_reserved_names() {
+        for reserved in ["CON", "con.txt", "PRN", "nul.log", "Com1", "lpt9.txt"] {
+            assert!(!is_safe_windows_component(reserved));
+
+            let encoded = format!("u:{}", hex::encode(reserved.as_bytes()));
+            let expected =
+                OsString::from(format!("_bore_utf8_{}", hex::encode(reserved.as_bytes())));
+            assert_eq!(decode_component(&encoded), expected);
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-    }
-    Ok(())
-}
 
-#[cfg(unix)]
-fn describe_device(metadata: &std::fs::Metadata) -> Result<DeviceDescriptor> {
-    use nix::sys::stat::{major, minor};
-    use std::os::unix::fs::MetadataExt;
-    let dev = metadata.rdev();
-    Ok(DeviceDescriptor {
-        major: major(dev),
-        minor: minor(dev),
-    })
-}
+    #[cfg(windows)]
+    #[test]
+    fn path_codec_round_trips_windows_wide_units() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-#[cfg(not(unix))]
-fn describe_device(_metadata: &std::fs::Metadata) -> Result<DeviceDescriptor> {
-    bail!("device node transfer is only supported on Unix")
-}
+        let original = OsString::from_wide(&[0x0077, 0xD800, 0x0069, 0x0064, 0x0065]);
+        let encoded = encode_component_os(original.as_os_str());
+        let decoded = decode_component(&encoded);
 
-#[cfg(unix)]
-async fn create_symlink(target: String, path: PathBuf) -> Result<()> {
-    tokio::task::spawn_blocking(move || {
-        std::os::unix::fs::symlink(&target, &path)
-            .with_context(|| format!("failed to create symlink {} -> {}", path.display(), target))
-    })
-    .await
-    .context("symlink creation task failed")?
-}
-
-#[cfg(windows)]
-async fn create_symlink(target: String, path: PathBuf) -> Result<()> {
-    tokio::task::spawn_blocking(move || {
-        std::os::windows::fs::symlink_file(&target, &path)
-            .with_context(|| format!("failed to create symlink {} -> {}", path.display(), target))
-    })
-    .await
-    .context("symlink creation task failed")?
-}
-
-#[cfg(not(any(unix, windows)))]
-async fn create_symlink(_target: String, _path: PathBuf) -> Result<()> {
-    bail!("symlink transfer is not supported on this platform")
-}
-
-#[cfg(unix)]
-async fn create_device(path: &Path, entry: &ManifestEntry) -> Result<()> {
-    use nix::sys::stat::{makedev, mknod, Mode, SFlag};
-
-    let descriptor = entry
-        .device
-        .as_ref()
-        .context("device entry is missing major/minor information")?
-        .clone();
-    let mode = entry.mode.unwrap_or(0o600);
-    let flag = match entry.kind {
-        EntryKind::CharDevice => SFlag::S_IFCHR,
-        EntryKind::BlockDevice => SFlag::S_IFBLK,
-        _ => bail!("device creation requested for non-device entry"),
-    };
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        mknod(
-            &path,
-            flag,
-            Mode::from_bits_truncate(mode),
-            makedev(descriptor.major, descriptor.minor),
-        )
-        .with_context(|| format!("failed to create device node {}", path.display()))
-    })
-    .await
-    .context("device creation task failed")?
-}
-
-#[cfg(not(unix))]
-async fn create_device(_path: &Path, _entry: &ManifestEntry) -> Result<()> {
-    bail!("device node transfer is only supported on Unix")
-}
-
-impl PartialEq for SummaryFrame {
-    fn eq(&self, other: &Self) -> bool {
-        self.files == other.files
-            && self.dirs == other.dirs
-            && self.symlinks == other.symlinks
-            && self.devices == other.devices
-            && self.bytes == other.bytes
-            && self.blake3 == other.blake3
+        assert!(encoded.starts_with("w:"));
+        assert_eq!(
+            decoded.encode_wide().collect::<Vec<_>>(),
+            original.encode_wide().collect::<Vec<_>>()
+        );
     }
 }
-
-impl Eq for SummaryFrame {}
-*/

@@ -8,7 +8,7 @@ BORE_ARM64="https://github.com/manprint/bore/releases/latest/download/bore-aarch
 BORE_MACOS="https://github.com/manprint/bore/releases/latest/download/bore-x86_64-apple-darwin"
 BORE_ANDROID="https://github.com/manprint/bore/releases/latest/download/bore-aarch64-linux-android"
 
-USER_INSTALL_PATH="$HOME/.local/bin"
+USER_INSTALL_PATH="$HOME/.bin"
 INSTALL_PATH="${INSTALL_PATH:-$USER_INSTALL_PATH}"
 # Create a safe temporary directory; fall back to /tmp when mktemp variants differ
 TMPDIR="$(mktemp -d 2>/dev/null || mktemp -d -t bore 2>/dev/null || printf '/tmp/bore-install-%s' "$$")"

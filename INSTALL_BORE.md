@@ -2,16 +2,16 @@
 
 ## Quick install
 
-Default path `/usr/local/bin`:
+Default path `/home/$USER/.bin`:
 
 ```bash
-curl -fsSL https://short.sish.adiprint.it//install-bore.sh | sudo bash
+curl -fsSL https://short.sish.adiprint.it/install-bore | sudo bash
 ```
 
 Custom path via env var:
 
 ```bash
-curl -fsSL https://short.sish.adiprint.it//install-bore.sh | sudo INSTALL_PATH=/opt/bin bash
+curl -fsSL https://short.sish.adiprint.it/install-bore | INSTALL_PATH=/home/$USER/.bin bash
 ```
 
 ## Source — direct (no file saved)
@@ -21,28 +21,28 @@ Run script in current shell via process substitution. No file written to disk.
 Default path:
 
 ```bash
-source <(curl -fsSL https://short.sish.adiprint.it//install-bore.sh)
+source <(curl -fsSL https://short.sish.adiprint.it/install-bore)
 ```
 
 Custom path with sudo:
 
 ```bash
-INSTALL_PATH=/opt/bin sudo -E bash -c 'source <(curl -fsSL https://short.sish.adiprint.it//install-bore.sh)'
+INSTALL_PATH=/home/$USER/.bin -E bash -c 'source <(curl -fsSL https://short.sish.adiprint.it/install-bore)'
 ```
 
 Or step-by-step (download → inspect → run):
 
 ```bash
-curl -fsSL -o install-bore.sh https://short.sish.adiprint.it//install-bore.sh
+curl -fsSL -o install-bore.sh https://short.sish.adiprint.it/install-bore
 chmod +x install-bore.sh
 # inspect/edit vars if needed
-sudo ./install-bore.sh
+./install-bore.sh
 ```
 
 With custom path:
 
 ```bash
-INSTALL_PATH=/home/user/.local/bin ./install-bore.sh
+INSTALL_PATH=/home/$USER/.bin ./install-bore.sh
 ```
 
 ## Env vars

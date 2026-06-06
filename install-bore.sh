@@ -7,7 +7,8 @@ BORE_ARM64="https://github.com/manprint/bore/releases/latest/download/bore-aarch
 BORE_MACOS="https://github.com/manprint/bore/releases/latest/download/bore-x86_64-apple-darwin"
 BORE_ANDROID="https://github.com/manprint/bore/releases/latest/download/bore-aarch64-linux-android"
 
-INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin}"
+USER_INSTALL_PATH="$HOME/.local/bin"
+INSTALL_PATH="${INSTALL_PATH:-$USER_INSTALL_PATH}"
 TMPDIR="$(mktemp -d)"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -88,9 +89,12 @@ main() {
     echo "  Arch: $arch"
     echo "  URL:  $url"
     echo "  Dest: $INSTALL_PATH/bore"
+
     echo
 
     echo "Downloading..."
+    echo
+
     echo "Create install directory if needed..."
     mkdir -p "$INSTALL_PATH"
     

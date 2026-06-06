@@ -138,7 +138,24 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 
 ---
 
-## 11. Helpers / utilities
+## 12. Receiver `--ask-confirm` (Feature 002)
+
+| Scenario | Test | Status |
+|---|---|---|
+| Sender ALWAYS shows file list (no flag needed) | all integration tests print "Sources to be transferred:" | ✅ |
+| Receiver shows incoming manifest (no flag needed) | all integration tests print "Incoming transfer …:" | ✅ |
+| Receiver no `--ask-confirm` → auto-accept | all existing integration tests (`ask_confirm: false`) | ✅ |
+| Receiver `--ask-confirm=true`, accepts (`y`) | `transfer_receiver_ask_confirm_accepts` (integration) + unit test | ✅ |
+| Receiver `--ask-confirm=true`, rejects (`n`) → sender gets clear error | `transfer_receiver_ask_confirm_rejects` (integration) + unit test | ✅ |
+| Receiver `--ask-confirm=true`, stdin source → flag silently ignored | `receiver_ask_confirm_ignored_for_stdin` (unit) | ✅ |
+| `display_and_confirm_manifest_sync`, no ask_confirm → always accepts | `receiver_no_ask_confirm_always_accepts` (unit) | ✅ |
+| `display_and_confirm_manifest_sync`, response `y` → accepts | `receiver_ask_confirm_accepts_on_y` (unit) | ✅ |
+| `display_and_confirm_manifest_sync`, response `n` → rejects | `receiver_ask_confirm_rejects_on_n` (unit) | ✅ |
+| Listener starts cleanly with `--ask-confirm` before any sender | `transfer_receiver_ask_confirm_listener_starts_cleanly` (integration) | ✅ |
+
+---
+
+## 13. Helpers / utilities
 
 | Scenario | Test | Status |
 |---|---|---|
@@ -153,7 +170,8 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 |---|---|
 | Windows symlinks | Platform-specific; not in CI |
 | Device transfer (char/block) in multi-source | Requires root; covered only for single-source |
-| `--ask-confirm` with real terminal + `y`/`n` input | Cannot automate tty input in tests |
+| Receiver `--ask-confirm` with real terminal + `y`/`n` input | Cannot automate tty input in tests |
+| Receiver `--ask-confirm` + stdin source full end-to-end | stdin transfer in integration tests requires subprocess I/O wiring |
 | Very large files (> 10 GiB) | Disk / time constraints in CI |
 | Network errors mid-transfer | Requires low-level TCP injection |
 | `rename_component` with > 9999 existing copies | Extreme edge case |
@@ -161,5 +179,5 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 
 ---
 
-*Updated: 2026-06-06 — after fixing bugs 001, 002, 003.*
-*Test counts: 32 integration + 30 unit = 62 transfer-specific tests.*
+*Updated: 2026-06-07 — after implementing receiver `--ask-confirm` (Feature 002).*
+*Test counts: 35 integration + 34 unit = 69 transfer-specific tests.*

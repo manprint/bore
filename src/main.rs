@@ -545,6 +545,11 @@ enum TransferCommand {
         /// the listener stays up.
         #[clap(long)]
         persistent: bool,
+
+        /// Show the incoming file list and ask for y/N before accepting the transfer.
+        /// Ignored when the sender is streaming stdin.
+        #[clap(long)]
+        ask_confirm: bool,
     },
 
     /// Send a file, directory, or stdin stream.
@@ -875,6 +880,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 overwrite,
                 rename,
                 persistent,
+                ask_confirm,
             } => {
                 let collision = match (overwrite, rename) {
                     (true, false) => CollisionPolicy::Overwrite,
@@ -908,6 +914,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     carriers,
                     collision,
                     persistent,
+                    ask_confirm,
                 })
                 .await?;
             }

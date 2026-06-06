@@ -27,6 +27,14 @@ lazy_static! {
     static ref SERIAL_GUARD: Mutex<()> = Mutex::new(());
 }
 
+/// RAII guard that removes an env var on drop (panic-safe cleanup).
+struct EnvVarGuard(&'static str);
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(self.0);
+    }
+}
+
 const TEST_CHUNK_SIZE: usize = 1024 * 1024;
 const TEST_MANIFEST_CHUNK: usize = 128;
 const TRANSFER_TLS_CONTROL_PORT: u16 = 17910;
@@ -125,6 +133,7 @@ fn listener_options_with_collision(
         carriers,
         collision,
         persistent: false,
+        ask_confirm: false,
     }
 }
 
@@ -216,6 +225,7 @@ async fn transfer_single_file_over_relay() -> Result<()> {
             carriers: 1,
             collision: CollisionPolicy::Fail,
             persistent: false,
+            ask_confirm: false,
         })
         .await
     });
@@ -653,6 +663,7 @@ async fn transfer_directory_preserves_structure() -> Result<()> {
             carriers: 1,
             collision: CollisionPolicy::Fail,
             persistent: false,
+            ask_confirm: false,
         })
         .await
     });
@@ -1318,6 +1329,7 @@ async fn transfer_single_file_over_direct_udp() -> Result<()> {
             carriers: 1,
             collision: CollisionPolicy::Fail,
             persistent: false,
+            ask_confirm: false,
         })
         .await
     });
@@ -1886,6 +1898,7 @@ async fn transfer_persistent_listener_two_sequential_transfers() -> Result<()> {
                 carriers: 1,
                 collision: CollisionPolicy::Fail,
                 persistent: true,
+                ask_confirm: false,
             })
             .await
         }
@@ -2067,6 +2080,7 @@ async fn transfer_persistent_listener_collision_continues() -> Result<()> {
                 carriers: 1,
                 collision: CollisionPolicy::Fail,
                 persistent: true,
+                ask_confirm: false,
             })
             .await
         }
@@ -2338,5 +2352,152 @@ async fn transfer_ask_confirm_returns_err_when_no_tty_available() -> Result<()> 
     );
 
     let _ = fs::remove_dir_all(&source_root).await;
+    Ok(())
+}
+
+/// Feature 002: receiver --ask-confirm=true, user types "y" → transfer succeeds.
+/// Uses BORE_TEST_CONFIRM_RESPONSE env var to inject the answer without a real tty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_receiver_ask_confirm_accepts() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    // Inject "y" so the receiver confirmation returns true.
+    std::env::set_var("BORE_TEST_CONFIRM_RESPONSE", "y");
+    let _cleanup_env = EnvVarGuard("BORE_TEST_CONFIRM_RESPONSE");
+
+    let source_root = temp_path("rx-confirm-accept-src");
+    let dest_root = temp_path("rx-confirm-accept-dst");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+
+    let source_file = source_root.join("hello.txt");
+    write_file(&source_file, b"receiver accepted").await?;
+
+    let transfer_id = format!("rx-confirm-accept-{}", Uuid::new_v4());
+
+    let mut listener_opts = listener_options(transfer_id.clone(), dest_root.clone(), true, 1, None);
+    listener_opts.ask_confirm = true;
+
+    let listener_task = tokio::spawn(bore_cli::transfer::run_listener(listener_opts));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        source_file,
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await?;
+
+    let outcome = listener_task.await??;
+    // final_path for a single file is the file itself, not the dest directory
+    let received = read_file(&outcome.final_path).await?;
+    assert_eq!(received, b"receiver accepted");
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+/// Feature 002: receiver --ask-confirm=true, user types "n" → transfer rejected.
+/// Sender should receive "peer reported an error: transfer rejected by receiver".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_receiver_ask_confirm_rejects() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    // Inject "n" so the receiver confirmation returns false.
+    std::env::set_var("BORE_TEST_CONFIRM_RESPONSE", "n");
+    let _cleanup_env = EnvVarGuard("BORE_TEST_CONFIRM_RESPONSE");
+
+    let source_root = temp_path("rx-confirm-reject-src");
+    let dest_root = temp_path("rx-confirm-reject-dst");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+
+    let source_file = source_root.join("data.txt");
+    write_file(&source_file, b"should not arrive").await?;
+
+    let transfer_id = format!("rx-confirm-reject-{}", Uuid::new_v4());
+
+    let mut listener_opts = listener_options(transfer_id.clone(), dest_root.clone(), true, 1, None);
+    listener_opts.ask_confirm = true;
+
+    let listener_task = tokio::spawn(bore_cli::transfer::run_listener(listener_opts));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let sender_err = bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        source_file,
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await
+    .expect_err("sender must fail when receiver rejects");
+
+    let err_str = format!("{sender_err}");
+    assert!(
+        err_str.contains("rejected by receiver") || err_str.contains("peer reported an error"),
+        "error must mention receiver rejection, got: {err_str}"
+    );
+    assert!(
+        !err_str.contains("unexpected EOF"),
+        "must not expose raw EOF, got: {err_str}"
+    );
+
+    // Listener exits with an error (rejection); we just discard it.
+    let _ = listener_task.await;
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+/// Feature 002: when sender uses stdin, receiver --ask-confirm is silently ignored.
+/// The unit-level assertion is in transfer::tests::receiver_ask_confirm_ignored_for_stdin.
+/// This integration test verifies the listener starts up cleanly with ask_confirm=true
+/// and doesn't crash before any sender connects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_receiver_ask_confirm_listener_starts_cleanly() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let dest_root = temp_path("rx-confirm-clean-dst");
+    fs::create_dir_all(&dest_root).await?;
+
+    let transfer_id = format!("rx-confirm-clean-{}", Uuid::new_v4());
+
+    let mut listener_opts = listener_options(transfer_id.clone(), dest_root.clone(), true, 1, None);
+    listener_opts.ask_confirm = true;
+
+    let listener_task = tokio::spawn(bore_cli::transfer::run_listener(listener_opts));
+    // Give the listener time to start; then abort it — we just verify it started.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    listener_task.abort();
+    // JoinError::is_cancelled() means task was aborted, not panicked — that's fine.
+    match listener_task.await {
+        Err(e) if e.is_cancelled() => {}
+        other => {
+            // An actual error (not cancellation) would be unexpected.
+            if let Ok(Err(e)) = other {
+                let err_str = format!("{e}");
+                // The only acceptable listener errors at this stage are transport-level
+                // (e.g., "transport ended before a sender connected").
+                assert!(
+                    !err_str.contains("rejected by receiver"),
+                    "listener must not self-reject before any sender connects: {err_str}"
+                );
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&dest_root).await;
     Ok(())
 }

@@ -79,6 +79,9 @@ pub struct ListenerOptions {
     pub carriers: u16,
     pub collision: CollisionPolicy,
     pub persistent: bool,
+    /// Show the incoming file list and ask for y/N before accepting. Ignored when
+    /// the sender is streaming stdin (see `display_and_confirm_manifest_sync`).
+    pub ask_confirm: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -569,6 +572,7 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
             &mut conn_rx,
             options.dest_path.clone(),
             options.collision,
+            options.ask_confirm,
         )
         .await;
 
@@ -640,14 +644,14 @@ pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
     if all_sources.is_empty() {
         bail!("no sources specified; use --sources or --source-files");
     }
-    if options.ask_confirm {
-        let sources_for_confirm = all_sources.clone();
-        let confirmed = spawn_blocking(move || confirm_sources_sync(&sources_for_confirm))
-            .await
-            .context("confirmation task failed")??;
-        if !confirmed {
-            bail!("transfer cancelled by user");
-        }
+    // Always display the source list; --ask-confirm additionally gates on y/N.
+    let ask = options.ask_confirm;
+    let sources_for_confirm = all_sources.clone();
+    let confirmed = spawn_blocking(move || confirm_sources_sync(&sources_for_confirm, ask))
+        .await
+        .context("confirmation task failed")??;
+    if !confirmed {
+        bail!("transfer cancelled by user");
     }
 
     let plan = plan_transfer(transfer_id.clone(), &options, &all_sources).await?;
@@ -986,6 +990,7 @@ async fn receive_transfer(
     incoming: &mut mpsc::UnboundedReceiver<TcpStream>,
     dest_root: PathBuf,
     collision: CollisionPolicy,
+    ask_confirm: bool,
 ) -> Result<TransferOutcome> {
     let outcome = async {
         let begin = match expect_frame(&mut control).await? {
@@ -1006,6 +1011,38 @@ async fn receive_transfer(
         );
 
         let plan = receive_manifest(&mut control, begin, &dest_root, collision).await?;
+
+        // Always display the incoming file list; when ask_confirm is set and the
+        // source is not stdin, wait for the user to confirm before proceeding.
+        {
+            let begin_clone = plan.begin.clone();
+            let entries_clone = plan.entries.clone();
+            let dest_root_clone = dest_root.clone();
+            let accepted = spawn_blocking(move || {
+                display_and_confirm_manifest_sync(
+                    &begin_clone,
+                    &entries_clone,
+                    &dest_root_clone,
+                    ask_confirm,
+                )
+            })
+            .await
+            .context("manifest confirmation task failed")??;
+            if !accepted {
+                // Inform the sender before bailing so it gets a clear error message.
+                let _ = send_frame(
+                    &mut control,
+                    &Frame::Error {
+                        message: "transfer rejected by receiver".to_string(),
+                    },
+                )
+                .await;
+                // Clean up any staging state created by receive_manifest.
+                let _ = tokio::fs::remove_dir_all(&plan.stage_dir).await;
+                bail!("transfer rejected by receiver");
+            }
+        }
+
         send_frame(
             &mut control,
             &Frame::ManifestAccepted {
@@ -1820,6 +1857,14 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn read_confirmation_line() -> Result<String> {
+    // Allow injecting a canned response via env var so integration tests (which
+    // compile the library without cfg(test)) can exercise y/N paths without a
+    // real terminal.  The name is intentionally prefixed with BORE_TEST_ so it
+    // is never accidentally set in production.
+    if let Ok(val) = std::env::var("BORE_TEST_CONFIRM_RESPONSE") {
+        return Ok(format!("{}\n", val));
+    }
+
     let mut input = String::new();
     // Try /dev/tty first so that confirmation works even when bore is invoked
     // via `curl | bash` (where stdin is the pipe, not the terminal).
@@ -1849,7 +1894,9 @@ fn read_confirmation_line() -> Result<String> {
     Ok(input)
 }
 
-fn confirm_sources_sync(sources: &[PathBuf]) -> Result<bool> {
+/// Display the source list and, when `ask_confirm` is true, prompt for y/N.
+/// Called via `spawn_blocking` so blocking I/O is safe here.
+fn confirm_sources_sync(sources: &[PathBuf], ask_confirm: bool) -> Result<bool> {
     use std::io::Write as _;
     println!("Sources to be transferred:");
     for source in sources {
@@ -1864,7 +1911,105 @@ fn confirm_sources_sync(sources: &[PathBuf]) -> Result<bool> {
             println!("  OTHER {}", source.display());
         }
     }
+    if !ask_confirm {
+        return Ok(true);
+    }
     print!("Proceed? [y/N] ");
+    std::io::stdout()
+        .flush()
+        .context("failed to flush stdout")?;
+    let input = read_confirmation_line()?;
+    Ok(input.trim().eq_ignore_ascii_case("y"))
+}
+
+/// Display the incoming manifest on the receiver terminal and, when `ask_confirm`
+/// is true, wait for y/N before accepting.
+///
+/// Called via `spawn_blocking` so blocking I/O is safe here.
+///
+/// # Stdin transfers
+///
+/// When `begin.root_source == RootSourceKind::Stdin` this function always returns
+/// `Ok(true)` regardless of `ask_confirm`. The sender is already streaming live
+/// bytes; there is no safe point to pause and wait for receiver confirmation without
+/// a two-round-trip protocol extension (manifest-only phase before data begins).
+/// This is a known limitation — future work could add a pre-stream negotiation phase.
+fn display_and_confirm_manifest_sync(
+    begin: &BeginFrame,
+    entries: &[ManifestEntry],
+    dest_root: &Path,
+    ask_confirm: bool,
+) -> Result<bool> {
+    use std::io::Write as _;
+
+    println!("Incoming transfer {}:", begin.transfer_id);
+
+    if begin.root_source == RootSourceKind::Stdin {
+        let name = display_component(&begin.root_name);
+        println!("  STDIN  {name}  (size unknown until transfer completes)");
+        if ask_confirm {
+            // Documented limitation: --ask-confirm is ignored for stdin transfers.
+            println!(
+                "[listener] --ask-confirm is ignored for stdin transfers; \
+                 proceeding automatically."
+            );
+        }
+        return Ok(true);
+    }
+
+    if begin.multi_source {
+        // List only the top-level items (entries whose rel_path has no '/' separator).
+        for entry in entries {
+            if entry.rel_path.is_empty() {
+                continue;
+            }
+            if entry.rel_path.contains('/') {
+                continue;
+            }
+            let name = display_component(&entry.rel_path);
+            match entry.kind {
+                EntryKind::Directory => {
+                    // Sum sizes of all regular files rooted under this directory.
+                    let prefix = format!("{}/", entry.rel_path);
+                    let size: u64 = entries
+                        .iter()
+                        .filter(|e| e.kind.is_regular_file() && e.rel_path.starts_with(&prefix))
+                        .filter_map(|e| e.size)
+                        .sum();
+                    println!("  DIR  {name} ({})", format_bytes(size));
+                }
+                EntryKind::RegularFile => {
+                    let size = entry.size.unwrap_or(0);
+                    println!("  FILE {name} ({})", format_bytes(size));
+                }
+                _ => println!("  OTHER {name}"),
+            }
+        }
+    } else {
+        // Single source: display the root item.
+        let name = display_component(&begin.root_name);
+        let total = begin.total_bytes.unwrap_or(0);
+        match entries.first().map(|e| e.kind) {
+            Some(EntryKind::Directory) => println!("  DIR  {name} ({})", format_bytes(total)),
+            Some(EntryKind::RegularFile) => println!("  FILE {name} ({})", format_bytes(total)),
+            _ => println!("  {name} ({})", format_bytes(total)),
+        }
+    }
+
+    let regular_count = entries.iter().filter(|e| e.kind.is_regular_file()).count();
+    let total = begin.total_bytes.unwrap_or(0);
+    println!(
+        "  {} file(s), {}  →  {}",
+        regular_count,
+        format_bytes(total),
+        dest_root.display()
+    );
+
+    if !ask_confirm {
+        return Ok(true);
+    }
+
+    print!("Accept transfer? [y/N] ");
     std::io::stdout()
         .flush()
         .context("failed to flush stdout")?;
@@ -3494,6 +3639,162 @@ mod tests {
     #[test]
     fn format_duration_minutes() {
         assert_eq!(format_duration(90.0), "1m30s");
+    }
+
+    // ── receiver confirmation helpers ─────────────────────────────────────────
+
+    fn make_stdin_begin() -> BeginFrame {
+        BeginFrame {
+            protocol_version: PROTOCOL_VERSION,
+            transfer_id: "test-stdin".to_string(),
+            root_name: "u:payload.bin".to_string(),
+            root_source: RootSourceKind::Stdin,
+            total_entries: 1,
+            total_bytes: None,
+            transport: TransportMode {
+                direct_udp: false,
+                relay_tls: false,
+            },
+            requested_parallel: 1,
+            multi_source: false,
+        }
+    }
+
+    fn make_stdin_entry() -> ManifestEntry {
+        ManifestEntry {
+            id: 0,
+            rel_path: String::new(),
+            kind: EntryKind::RegularFile,
+            size: None,
+            full_hash: None,
+            chunk_count: 0,
+            symlink_target: None,
+            device: None,
+            mode: None,
+        }
+    }
+
+    /// display_and_confirm_manifest_sync must return Ok(true) for stdin transfers
+    /// even when ask_confirm=true and the canned response is "n".  The stdin
+    /// branch exits before calling read_confirmation_line.
+    #[test]
+    fn receiver_ask_confirm_ignored_for_stdin() {
+        // Inject "n" — the stdin branch must bypass this entirely.
+        std::env::set_var("BORE_TEST_CONFIRM_RESPONSE", "n");
+        let result = display_and_confirm_manifest_sync(
+            &make_stdin_begin(),
+            &[make_stdin_entry()],
+            Path::new("/tmp"),
+            true, // ask_confirm = true
+        );
+        std::env::remove_var("BORE_TEST_CONFIRM_RESPONSE");
+        assert!(
+            result.unwrap(),
+            "stdin transfer with ask_confirm=true must auto-accept"
+        );
+    }
+
+    /// display_and_confirm_manifest_sync with ask_confirm=false always returns true.
+    #[test]
+    fn receiver_no_ask_confirm_always_accepts() {
+        // Even with "n" injected, ask_confirm=false bypasses the prompt entirely.
+        std::env::set_var("BORE_TEST_CONFIRM_RESPONSE", "n");
+        let begin = BeginFrame {
+            protocol_version: PROTOCOL_VERSION,
+            transfer_id: "test-noask".to_string(),
+            root_name: "u:file.txt".to_string(),
+            root_source: RootSourceKind::Filesystem,
+            total_entries: 1,
+            total_bytes: Some(10),
+            transport: TransportMode {
+                direct_udp: false,
+                relay_tls: false,
+            },
+            requested_parallel: 1,
+            multi_source: false,
+        };
+        let entry = ManifestEntry {
+            id: 0,
+            rel_path: String::new(),
+            kind: EntryKind::RegularFile,
+            size: Some(10),
+            full_hash: None,
+            chunk_count: 1,
+            symlink_target: None,
+            device: None,
+            mode: None,
+        };
+        let result = display_and_confirm_manifest_sync(&begin, &[entry], Path::new("/tmp"), false);
+        std::env::remove_var("BORE_TEST_CONFIRM_RESPONSE");
+        assert!(result.unwrap(), "no ask_confirm must always auto-accept");
+    }
+
+    /// display_and_confirm_manifest_sync with ask_confirm=true and response "y" accepts.
+    #[test]
+    fn receiver_ask_confirm_accepts_on_y() {
+        std::env::set_var("BORE_TEST_CONFIRM_RESPONSE", "y");
+        let begin = BeginFrame {
+            protocol_version: PROTOCOL_VERSION,
+            transfer_id: "test-y".to_string(),
+            root_name: "u:file.txt".to_string(),
+            root_source: RootSourceKind::Filesystem,
+            total_entries: 1,
+            total_bytes: Some(5),
+            transport: TransportMode {
+                direct_udp: false,
+                relay_tls: false,
+            },
+            requested_parallel: 1,
+            multi_source: false,
+        };
+        let entry = ManifestEntry {
+            id: 0,
+            rel_path: String::new(),
+            kind: EntryKind::RegularFile,
+            size: Some(5),
+            full_hash: None,
+            chunk_count: 1,
+            symlink_target: None,
+            device: None,
+            mode: None,
+        };
+        let result = display_and_confirm_manifest_sync(&begin, &[entry], Path::new("/tmp"), true);
+        std::env::remove_var("BORE_TEST_CONFIRM_RESPONSE");
+        assert!(result.unwrap(), "response 'y' must accept");
+    }
+
+    /// display_and_confirm_manifest_sync with ask_confirm=true and response "n" rejects.
+    #[test]
+    fn receiver_ask_confirm_rejects_on_n() {
+        std::env::set_var("BORE_TEST_CONFIRM_RESPONSE", "n");
+        let begin = BeginFrame {
+            protocol_version: PROTOCOL_VERSION,
+            transfer_id: "test-n".to_string(),
+            root_name: "u:file.txt".to_string(),
+            root_source: RootSourceKind::Filesystem,
+            total_entries: 1,
+            total_bytes: Some(5),
+            transport: TransportMode {
+                direct_udp: false,
+                relay_tls: false,
+            },
+            requested_parallel: 1,
+            multi_source: false,
+        };
+        let entry = ManifestEntry {
+            id: 0,
+            rel_path: String::new(),
+            kind: EntryKind::RegularFile,
+            size: Some(5),
+            full_hash: None,
+            chunk_count: 1,
+            symlink_target: None,
+            device: None,
+            mode: None,
+        };
+        let result = display_and_confirm_manifest_sync(&begin, &[entry], Path::new("/tmp"), true);
+        std::env::remove_var("BORE_TEST_CONFIRM_RESPONSE");
+        assert!(!result.unwrap(), "response 'n' must reject");
     }
 
     #[cfg(windows)]

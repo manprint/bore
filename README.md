@@ -539,11 +539,20 @@ bore transfer sender \
 ```
 
 ```shell
-# Confirm before sending (shows sizes, asks y/N)
+# Sender always shows source list; --ask-confirm additionally waits for y/N
 bore transfer sender \
   --secret mysecret \
   --transfer-id nightly-backup \
   --sources /home/alice/data/ \
+  --ask-confirm
+```
+
+```shell
+# Receiver with --ask-confirm: shows incoming file list and waits for y/N
+bore transfer listener \
+  --secret mysecret \
+  --transfer-id nightly-backup \
+  --dest-path ~/received/ \
   --ask-confirm
 ```
 
@@ -726,8 +735,15 @@ Notes:
 - `--sources` accepts one or more paths (files or directories) separated by
   spaces. `--source-files FILE…` reads additional paths from text files (lines
   containing `#` are ignored as comments). Both flags may be combined.
-- `--ask-confirm` prints each source with its size (directory total) and asks
-  for `y/N` confirmation before any data is transferred.
+- The sender **always** prints the source list (name and size) before connecting.
+  `--ask-confirm` on the sender additionally waits for a `y/N` prompt before
+  the transfer starts. Works with `/dev/tty` so it is safe to invoke via
+  `curl | bash`.
+- `--ask-confirm` on the **listener** shows the incoming file list and waits for
+  `y/N` after the manifest is received but before any data is written.  If the
+  receiver types `n`, a clean rejection message is sent to the sender.
+  `--ask-confirm` on the listener is ignored for stdin transfers (the data stream
+  starts immediately after the manifest; there is no safe pause point).
 - `--persistent` on the listener keeps the listener alive after each transfer;
   errors from individual transfers are logged but do not kill the listener.
 - Cross-platform path handling is explicit, not lossy: Unix raw-byte path

@@ -5,13 +5,19 @@
 Default path `/home/$USER/.bin`:
 
 ```bash
-curl -fsSL https://short.sish.adiprint.it/install-bore | sudo bash
+curl -fsSL https://short.sish.adiprint.it/install-bore | bash
 ```
 
 Custom path via env var:
 
 ```bash
 curl -fsSL https://short.sish.adiprint.it/install-bore | INSTALL_PATH=/home/$USER/.bin bash
+```
+
+or
+
+```bash
+curl -fsSL https://short.sish.adiprint.it/install-bore | INSTALL_PATH=/usr/local/bin sudo bash
 ```
 
 ## Source — direct (no file saved)
@@ -27,7 +33,13 @@ source <(curl -fsSL https://short.sish.adiprint.it/install-bore)
 Custom path with sudo:
 
 ```bash
-INSTALL_PATH=/home/$USER/.bin -E bash -c 'source <(curl -fsSL https://short.sish.adiprint.it/install-bore)'
+INSTALL_PATH=/home/$USER/.bin bash -c 'source <(curl -fsSL https://short.sish.adiprint.it/install-bore)'
+```
+
+or 
+
+```bash
+INSTALL_PATH=/usr/local/bin sudo -E bash -c 'source <(curl -fsSL https://short.sish.adiprint.it/install-bore)'
 ```
 
 Or step-by-step (download → inspect → run):

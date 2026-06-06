@@ -15,7 +15,10 @@ env:
 # target binaries attached as release assets: compressed archives (.tar.gz/.zip)
 # AND raw unstripped binaries (.exe on Windows). Every release is marked "latest"
 # so https://github.com/manprint/bore/releases/latest/download/ always resolves
-# to the most recent build. Branch builds are marked as pre-releases.
+# to the most recent build. Raw binaries have a fixed name per target and can be
+# downloaded at a URL that never changes: e.g.
+#   https://github.com/manprint/bore/releases/latest/download/bore-x86_64-unknown-linux-musl
+#   https://github.com/manprint/bore/releases/latest/download/bore-x86_64-pc-windows-msvc.exe
 
 permissions:
   contents: write # create the release + tag and upload assets
@@ -38,7 +41,6 @@ jobs:
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ${{ steps.ver.outputs.name }}
-          prerelease: ${{ steps.ver.outputs.is_tag != 'true' }}
           make_latest: "true"
           draft: false
 
@@ -103,7 +105,7 @@ jobs:
         run: tar -czvf "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz" --directory=target/${{ matrix.target }}/release ${{ env.BIN }}
 
       - name: Package | Raw binary
-        run: cp "target/${{ matrix.target }}/release/${{ env.BIN }}" "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}"
+        run: cp "target/${{ matrix.target }}/release/${{ env.BIN }}" "${{ env.BIN }}-${{ matrix.target }}"
 
       - name: Upload | Release assets
         uses: softprops/action-gh-release@v2
@@ -111,7 +113,7 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           files: |
             ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz
-            ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}
+            ${{ env.BIN }}-${{ matrix.target }}
 
   linux:
     runs-on: ubuntu-latest
@@ -145,7 +147,7 @@ jobs:
         run: tar -czvf "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz" --directory=target/${{ matrix.target }}/release ${{ env.BIN }}
 
       - name: Package | Raw binary
-        run: cp "target/${{ matrix.target }}/release/${{ env.BIN }}" "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}"
+        run: cp "target/${{ matrix.target }}/release/${{ env.BIN }}" "${{ env.BIN }}-${{ matrix.target }}"
 
       - name: Upload | Release assets
         uses: softprops/action-gh-release@v2
@@ -153,7 +155,7 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           files: |
             ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz
-            ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}
+            ${{ env.BIN }}-${{ matrix.target }}
 
   windows:
     runs-on: windows-latest
@@ -182,7 +184,7 @@ jobs:
 
       - name: Package | Raw binary
         shell: bash
-        run: cp "target/${{ matrix.target }}/release/${{ env.BIN }}.exe" "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.exe"
+        run: cp "target/${{ matrix.target }}/release/${{ env.BIN }}.exe" "${{ env.BIN }}-${{ matrix.target }}.exe"
 
       - name: Upload | Release assets
         uses: softprops/action-gh-release@v2
@@ -190,7 +192,7 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           files: |
             ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.zip
-            ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.exe
+            ${{ env.BIN }}-${{ matrix.target }}.exe
 
   # Android is built with the NDK (zig/cross cannot build `ring` for Android).
   android:
@@ -214,7 +216,7 @@ jobs:
         run: tar -czvf "${{ env.BIN }}-${{ steps.ver.outputs.name }}-aarch64-linux-android.tar.gz" --directory=bin ${{ env.BIN }}
 
       - name: Package | Raw binary
-        run: cp "bin/${{ env.BIN }}" "${{ env.BIN }}-${{ steps.ver.outputs.name }}-aarch64-linux-android"
+        run: cp "bin/${{ env.BIN }}" "${{ env.BIN }}-aarch64-linux-android"
 
       - name: Upload | Release assets
         uses: softprops/action-gh-release@v2
@@ -222,4 +224,4 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           files: |
             ${{ env.BIN }}-${{ steps.ver.outputs.name }}-aarch64-linux-android.tar.gz
-            ${{ env.BIN }}-${{ steps.ver.outputs.name }}-aarch64-linux-android
+            ${{ env.BIN }}-aarch64-linux-android

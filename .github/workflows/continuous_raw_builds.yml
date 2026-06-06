@@ -36,6 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: version
     steps:
+      - uses: actions/checkout@v4
       - name: Delete previous continuous release
         continue-on-error: true
         run: gh release delete continuous --yes --cleanup-tag 2>/dev/null || true

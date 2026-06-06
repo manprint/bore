@@ -770,10 +770,52 @@ bore transfer listener \
 bore transfer sender \
   --secret hunter2 \
   --transfer-id nightly-backup \
-  --source /home/alice/archive.tar.gz \
+  --sources /home/alice/archive.tar.gz \
   --parallel 4 \
   --carriers 4
 ```
+
+#### Più file e cartelle in un solo trasferimento
+
+```shell
+bore transfer sender \
+  --secret hunter2 \
+  --transfer-id nightly-backup \
+  --sources /home/alice/report.pdf /home/alice/data/ /home/alice/notes.txt \
+  --output bundle \
+  --parallel 4
+```
+
+#### Lista sorgenti da file (righe con `#` = commenti)
+
+```shell
+# /home/alice/backup.list:
+#   /home/alice/report.pdf
+#   /home/alice/data/
+#   # questa riga è un commento
+#   /home/alice/notes.txt
+
+bore transfer sender \
+  --secret hunter2 \
+  --transfer-id nightly-backup \
+  --source-files /home/alice/backup.list \
+  --output bundle
+```
+
+`--sources` e `--source-files` possono coesistere: le sorgenti vengono unite.
+
+#### Conferma prima dell'invio
+
+```shell
+bore transfer sender \
+  --secret hunter2 \
+  --transfer-id nightly-backup \
+  --sources /home/alice/data/ \
+  --ask-confirm
+```
+
+Stampa i file singoli con dimensione e le cartelle con nome + dimensione totale,
+poi chiede `Proceed? [y/N]` prima di avviare il trasferimento.
 
 #### Directory ricorsiva
 
@@ -782,7 +824,7 @@ bore transfer sender \
   --to https://bore.tld \
   --secret hunter2 \
   --transfer-id project-tree \
-  --source /home/alice/project \
+  --sources /home/alice/project \
   --parallel 4 \
   --symlinks include
 ```
@@ -794,8 +836,23 @@ tar -cvpzf - project | bore transfer sender \
   --to https://bore.tld \
   --secret hunter2 \
   --transfer-id project-stdin \
-  --source stdin \
+  --sources stdin \
   --output project.tar.gz
+```
+
+#### Listener persistente
+
+In modalità `--persistent` il listener non esce dopo il completamento: attende
+il prossimo sender con lo stesso `--transfer-id`. Gli errori del singolo
+trasferimento (es. collisione) vengono inviati al sender ma non abbattono il
+listener.
+
+```shell
+bore transfer listener \
+  --secret hunter2 \
+  --transfer-id nightly-backup \
+  --dest-path /srv/inbox \
+  --persistent
 ```
 
 #### Resume dopo interruzione
@@ -815,7 +872,7 @@ bore transfer sender \
   --to https://bore.tld \
   --secret hunter2 \
   --transfer-id nightly-backup \
-  --source /home/alice/archive.tar.gz \
+  --sources /home/alice/archive.tar.gz \
   --parallel 4
 ```
 
@@ -836,7 +893,7 @@ bore transfer sender \
   --to https://bore.tld \
   --secret hunter2 \
   --transfer-id relay-only-copy \
-  --source /home/alice/archive.tar.gz \
+  --sources /home/alice/archive.tar.gz \
   --relay-only \
   --carriers 4
 ```
@@ -862,7 +919,7 @@ bore transfer sender \
   --to https://bore.tld \
   --secret hunter2 \
   --transfer-id udp-copy \
-  --source /home/alice/archive.tar.gz \
+  --sources /home/alice/archive.tar.gz \
   --stun-server stun.cloudflare.com:3478 \
   --upnp \
   --try-port-prediction \
@@ -887,7 +944,7 @@ bore transfer sender \
   --to https://bore.tld \
   --secret hunter2 \
   --transfer-id tls-copy \
-  --source /home/alice/archive.tar.gz \
+  --sources /home/alice/archive.tar.gz \
   --insecure
 ```
 
@@ -919,7 +976,7 @@ bore transfer sender \
   --to https://bore.tld \
   --secret hunter2 \
   --transfer-id symlink-tree \
-  --source /home/alice/project \
+  --sources /home/alice/project \
   --symlinks include
 
 # Include i device Unix nel manifest. Il receiver potrebbe richiedere privilegi
@@ -928,7 +985,7 @@ bore transfer sender \
   --to https://bore.tld \
   --secret hunter2 \
   --transfer-id device-copy \
-  --source /dev/null \
+  --sources /dev/null \
   --devices include
 ```
 
@@ -944,7 +1001,7 @@ bore transfer sender \
   --to https://bore.tld \
   --secret hunter2 \
   --transfer-id big-tree \
-  --source /data/big-tree \
+  --sources /data/big-tree \
   --parallel 8 \
   --carriers 4
 ```

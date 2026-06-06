@@ -539,15 +539,31 @@ enum TransferCommand {
         /// Rename the destination root if it already exists.
         #[clap(long, conflicts_with = "overwrite")]
         rename: bool,
+
+        /// Do not exit after the transfer completes; keep waiting for more senders
+        /// with the same transfer-id. Errors from a single transfer are logged but
+        /// the listener stays up.
+        #[clap(long)]
+        persistent: bool,
     },
 
     /// Send a file, directory, or stdin stream.
     Sender {
-        /// Source path or the literal string "stdin".
-        #[clap(long, value_name = "PATH|stdin")]
-        source: PathBuf,
+        /// Source paths (files or directories) to transfer. May be specified multiple times
+        /// or as a space-separated list. Use the literal "stdin" to read from standard input.
+        #[clap(long = "sources", alias = "source", value_name = "PATH|stdin", num_args = 1..)]
+        sources: Vec<PathBuf>,
 
-        /// Output file name when --source stdin is used.
+        /// Text files containing source paths to transfer, one per line. Lines containing
+        /// '#' are treated as comments and ignored.
+        #[clap(long, value_name = "FILE", num_args = 1..)]
+        source_files: Vec<PathBuf>,
+
+        /// Print each source with its size and ask for confirmation before sending.
+        #[clap(long)]
+        ask_confirm: bool,
+
+        /// Output file name when --sources stdin is used.
         #[clap(long, value_name = "NAME")]
         output: Option<PathBuf>,
 
@@ -858,6 +874,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 carriers,
                 overwrite,
                 rename,
+                persistent,
             } => {
                 let collision = match (overwrite, rename) {
                     (true, false) => CollisionPolicy::Overwrite,
@@ -890,11 +907,14 @@ async fn dispatch(command: Command) -> Result<()> {
                     nat_udp_release_timeout,
                     carriers,
                     collision,
+                    persistent,
                 })
                 .await?;
             }
             TransferCommand::Sender {
-                source,
+                sources,
+                source_files,
+                ask_confirm,
                 output,
                 to,
                 secret,
@@ -928,7 +948,9 @@ async fn dispatch(command: Command) -> Result<()> {
                     secret,
                     insecure,
                     transfer_id,
-                    source,
+                    sources,
+                    source_files,
+                    ask_confirm,
                     output,
                     relay_only,
                     stun_server,
@@ -1524,13 +1546,16 @@ mod tests {
             panic!("expected transfer command");
         };
         let TransferCommand::Sender {
-            to, source, output, ..
+            to,
+            sources,
+            output,
+            ..
         } = command
         else {
             panic!("expected transfer sender command");
         };
         assert_eq!(to, DEFAULT_SERVER);
-        assert_eq!(source, PathBuf::from("stdin"));
+        assert_eq!(sources, vec![PathBuf::from("stdin")]);
         assert_eq!(
             output.as_deref(),
             Some(PathBuf::from("archive.tar.gz").as_path())

@@ -513,9 +513,38 @@ Try these transfer modes:
 bore transfer sender \
   --secret mysecret \
   --transfer-id nightly-backup \
-  --source /home/alice/archive.tar.gz \
+  --sources /home/alice/archive.tar.gz \
   --parallel 4 \
   --carriers 4
+```
+
+```shell
+# Multiple files and directories in one transfer
+bore transfer sender \
+  --secret mysecret \
+  --transfer-id nightly-backup \
+  --sources /home/alice/report.pdf /home/alice/data/ /home/alice/notes.txt \
+  --output bundle \
+  --parallel 4
+```
+
+```shell
+# Source list from file (lines with '#' are comments)
+bore transfer sender \
+  --secret mysecret \
+  --transfer-id nightly-backup \
+  --sources /home/alice/extra.tar.gz \
+  --source-files /home/alice/backup.list \
+  --output bundle
+```
+
+```shell
+# Confirm before sending (shows sizes, asks y/N)
+bore transfer sender \
+  --secret mysecret \
+  --transfer-id nightly-backup \
+  --sources /home/alice/data/ \
+  --ask-confirm
 ```
 
 ```shell
@@ -524,7 +553,7 @@ bore transfer sender \
   --to https://bore.example.com \
   --secret mysecret \
   --transfer-id nightly-backup \
-  --source /home/alice/project \
+  --sources /home/alice/project \
   --parallel 4 \
   --symlinks include
 ```
@@ -535,8 +564,17 @@ tar -cvpzf - project | bore transfer sender \
   --to https://bore.example.com \
   --secret mysecret \
   --transfer-id nightly-backup \
-  --source stdin \
+  --sources stdin \
   --output project.tar.gz
+```
+
+```shell
+# Persistent listener: stays up after each transfer, ready for the next sender
+bore transfer listener \
+  --secret mysecret \
+  --transfer-id nightly-backup \
+  --dest-path /srv/inbox \
+  --persistent
 ```
 
 ```shell
@@ -552,7 +590,7 @@ bore transfer sender \
   --to https://bore.example.com \
   --secret mysecret \
   --transfer-id nightly-backup \
-  --source /home/alice/archive.tar.gz \
+  --sources /home/alice/archive.tar.gz \
   --parallel 4
 ```
 
@@ -569,7 +607,7 @@ bore transfer sender \
   --to https://bore.example.com \
   --secret mysecret \
   --transfer-id relay-only-copy \
-  --source /home/alice/archive.tar.gz \
+  --sources /home/alice/archive.tar.gz \
   --relay-only \
   --carriers 4
 ```
@@ -592,7 +630,7 @@ bore transfer sender \
   --to https://bore.example.com \
   --secret mysecret \
   --transfer-id udp-copy \
-  --source /home/alice/archive.tar.gz \
+  --sources /home/alice/archive.tar.gz \
   --stun-server stun.cloudflare.com:3478 \
   --upnp \
   --try-port-prediction \
@@ -613,7 +651,7 @@ bore transfer sender \
   --to https://bore.example.com \
   --secret mysecret \
   --transfer-id tls-copy \
-  --source /home/alice/archive.tar.gz \
+  --sources /home/alice/archive.tar.gz \
   --insecure
 ```
 
@@ -635,14 +673,14 @@ bore transfer sender \
   --to https://bore.example.com \
   --secret mysecret \
   --transfer-id symlink-tree \
-  --source /home/alice/project \
+  --sources /home/alice/project \
   --symlinks include
 
 bore transfer sender \
   --to https://bore.example.com \
   --secret mysecret \
   --transfer-id device-copy \
-  --source /dev/null \
+  --sources /dev/null \
   --devices include
 ```
 
@@ -680,11 +718,18 @@ Notes:
 - The listener batches staged-file syncs and resume-state persistence instead of
   forcing one file sync plus one `state.json` rewrite per 256 KiB chunk, so
   resume safety does not throttle large filesystem transfers on fast links.
-- `--source stdin` verifies the exact byte stream that `bore` reads and the
+- `--sources stdin` verifies the exact byte stream that `bore` reads and the
   receiver writes. It cannot know whether the producer command earlier in the
   shell pipeline succeeded semantically; use shell `pipefail` if you need that.
-- `--source stdin` requires `--output`, always uses a single stream, and does
+- `--sources stdin` requires `--output`, always uses a single stream, and does
   not participate in chunk resume or `--parallel`.
+- `--sources` accepts one or more paths (files or directories) separated by
+  spaces. `--source-files FILE…` reads additional paths from text files (lines
+  containing `#` are ignored as comments). Both flags may be combined.
+- `--ask-confirm` prints each source with its size (directory total) and asks
+  for `y/N` confirmation before any data is transferred.
+- `--persistent` on the listener keeps the listener alive after each transfer;
+  errors from individual transfers are logged but do not kill the listener.
 - Cross-platform path handling is explicit, not lossy: Unix raw-byte path
   components and Windows UTF-16 path components are encoded on the wire; on
   Windows, reserved or otherwise invalid names are sanitized to

@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::{ErrorKind, IsTerminal, Read, Write};
+use std::io::{BufRead, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -77,6 +77,7 @@ pub struct ListenerOptions {
     pub nat_udp_release_timeout: u64,
     pub carriers: u16,
     pub collision: CollisionPolicy,
+    pub persistent: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -85,7 +86,9 @@ pub struct SenderOptions {
     pub secret: Option<String>,
     pub insecure: bool,
     pub transfer_id: Option<String>,
-    pub source: PathBuf,
+    pub sources: Vec<PathBuf>,
+    pub source_files: Vec<PathBuf>,
+    pub ask_confirm: bool,
     pub output: Option<PathBuf>,
     pub relay_only: bool,
     pub stun_server: Option<String>,
@@ -536,32 +539,77 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
         options.dest_path.display()
     );
 
-    let control = tokio::select! {
-        maybe = conn_rx.recv() => maybe.context("failed to accept control transfer stream")?,
-        result = &mut provider_task => match result {
-            Ok(Ok(())) => bail!("transfer listener transport ended before a sender connected"),
-            Ok(Err(err)) => return Err(err).context("transfer listener transport failed"),
-            Err(err) => bail!("transfer listener task failed: {err}"),
-        },
-        result = &mut accept_task => match result {
-            Ok(Ok(())) => bail!("transfer listener stopped accepting before a sender connected"),
-            Ok(Err(err)) => return Err(err).context("transfer listener accept loop failed"),
-            Err(err) => bail!("transfer listener accept task failed: {err}"),
-        },
-    };
+    loop {
+        let control = tokio::select! {
+            maybe = conn_rx.recv() => match maybe {
+                Some(s) => s,
+                None => bail!("accept channel closed unexpectedly"),
+            },
+            result = &mut provider_task => match result {
+                Ok(Ok(())) => bail!("transfer listener transport ended before a sender connected"),
+                Ok(Err(err)) => return Err(err).context("transfer listener transport failed"),
+                Err(err) => bail!("transfer listener task failed: {err}"),
+            },
+            result = &mut accept_task => match result {
+                Ok(Ok(())) => bail!("transfer listener stopped accepting before a sender connected"),
+                Ok(Err(err)) => return Err(err).context("transfer listener accept loop failed"),
+                Err(err) => bail!("transfer listener accept task failed: {err}"),
+            },
+        };
 
-    let outcome =
-        receive_transfer(control, &mut conn_rx, options.dest_path, options.collision).await;
-    // Allow tunnel relay to drain before aborting — prevents spurious "channel closed" warnings
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    provider_task.abort();
-    accept_task.abort();
-    let _ = provider_task.await;
-    let _ = accept_task.await;
-    outcome.map(|mut transfer| {
-        transfer.transfer_id = transfer_id;
-        transfer
-    })
+        let outcome = receive_transfer(
+            control,
+            &mut conn_rx,
+            options.dest_path.clone(),
+            options.collision,
+        )
+        .await;
+
+        match outcome {
+            Ok(mut o) => {
+                o.transfer_id = transfer_id.clone();
+                if !options.persistent {
+                    // Allow tunnel relay to drain before aborting — prevents spurious "channel closed" warnings
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    provider_task.abort();
+                    accept_task.abort();
+                    let _ = provider_task.await;
+                    let _ = accept_task.await;
+                    return Ok(o);
+                }
+                println!(
+                    "transfer complete, waiting for next transfer {transfer_id} into {}",
+                    options.dest_path.display()
+                );
+                // Drain leftover connections from completed transfer
+                let drain_end = tokio::time::Instant::now() + Duration::from_millis(200);
+                while let Ok(maybe) = tokio::time::timeout_at(drain_end, conn_rx.recv()).await {
+                    if maybe.is_none() {
+                        break;
+                    }
+                }
+            }
+            Err(err) => {
+                if !options.persistent {
+                    // Allow tunnel relay to drain before aborting — prevents spurious "channel closed" warnings
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    provider_task.abort();
+                    accept_task.abort();
+                    let _ = provider_task.await;
+                    let _ = accept_task.await;
+                    return Err(err);
+                }
+                warn!(%err, "transfer error in persistent mode, waiting for next sender");
+                // Drain leftover connections
+                let drain_end = tokio::time::Instant::now() + Duration::from_millis(500);
+                while let Ok(maybe) = tokio::time::timeout_at(drain_end, conn_rx.recv()).await {
+                    if maybe.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
@@ -572,7 +620,30 @@ pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
     if options.transfer_id.is_none() {
         println!("transfer id: {transfer_id}");
     }
-    let plan = plan_transfer(transfer_id.clone(), &options).await?;
+
+    // Gather all sources
+    let mut all_sources = options.sources.clone();
+    if !options.source_files.is_empty() {
+        let source_files = options.source_files.clone();
+        let extra = spawn_blocking(move || read_source_files(&source_files))
+            .await
+            .context("source-files read task failed")??;
+        all_sources.extend(extra);
+    }
+    if all_sources.is_empty() {
+        bail!("no sources specified; use --sources or --source-files");
+    }
+    if options.ask_confirm {
+        let sources_for_confirm = all_sources.clone();
+        let confirmed = spawn_blocking(move || confirm_sources_sync(&sources_for_confirm))
+            .await
+            .context("confirmation task failed")??;
+        if !confirmed {
+            bail!("transfer cancelled by user");
+        }
+    }
+
+    let plan = plan_transfer(transfer_id.clone(), &options, &all_sources).await?;
     let endpoint = Endpoint::parse(&options.to);
     let proxy = Proxy::new(
         &options.to,
@@ -1616,7 +1687,154 @@ async fn commit_stage(plan: &ReceiverPlan, collision: CollisionPolicy) -> Result
     Ok(())
 }
 
-async fn plan_transfer(transfer_id: String, options: &SenderOptions) -> Result<PlannedTransfer> {
+fn read_source_files(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for file in files {
+        let content = std::fs::read_to_string(file)
+            .with_context(|| format!("failed to read source list file {}", file.display()))?;
+        for line in content.lines() {
+            if line.contains('#') {
+                continue;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            paths.push(PathBuf::from(trimmed));
+        }
+    }
+    Ok(paths)
+}
+
+fn compute_dir_size_sync(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut queue = vec![path.to_path_buf()];
+    while let Some(dir) = queue.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Ok(m) = std::fs::symlink_metadata(&p) {
+                if m.is_dir() {
+                    queue.push(p);
+                } else if m.is_file() {
+                    total += m.len();
+                }
+            }
+        }
+    }
+    total
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn confirm_sources_sync(sources: &[PathBuf]) -> Result<bool> {
+    use std::io::Write as _;
+    println!("Sources to be transferred:");
+    for source in sources {
+        let meta = std::fs::symlink_metadata(source)
+            .with_context(|| format!("failed to stat {}", source.display()))?;
+        if meta.is_dir() {
+            let size = compute_dir_size_sync(source);
+            println!("  DIR  {} ({})", source.display(), format_bytes(size));
+        } else if meta.is_file() {
+            println!("  FILE {} ({})", source.display(), format_bytes(meta.len()));
+        } else {
+            println!("  OTHER {}", source.display());
+        }
+    }
+    print!("Proceed? [y/N] ");
+    std::io::stdout()
+        .flush()
+        .context("failed to flush stdout")?;
+    let mut input = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut input)
+        .context("failed to read confirmation")?;
+    Ok(input.trim().eq_ignore_ascii_case("y"))
+}
+
+fn scan_multi_filesystem_transfer(
+    transfer_id: String,
+    sources: Vec<PathBuf>,
+    output: Option<PathBuf>,
+    symlinks: SymlinkMode,
+    devices: DeviceMode,
+    parallel: u16,
+) -> Result<PlannedTransfer> {
+    let root_name = if let Some(out) = output {
+        encode_root_name(&out)?
+    } else {
+        source_file_name_string(&sources[0])?
+    };
+
+    let mut entries = Vec::new();
+    let mut total_bytes = 0u64;
+
+    // Virtual root directory (rel_path="")
+    entries.push(PlannedEntry {
+        manifest: ManifestEntry {
+            id: 0,
+            rel_path: String::new(),
+            kind: EntryKind::Directory,
+            size: None,
+            full_hash: None,
+            chunk_count: 0,
+            symlink_target: None,
+            device: None,
+            mode: None,
+        },
+        source_path: None,
+    });
+    let mut next_id = 1u32;
+
+    for source in &sources {
+        let name = source
+            .file_name()
+            .with_context(|| format!("{} has no file name", source.display()))?;
+        let rel = PathBuf::from(name);
+        scan_entry(
+            source,
+            &rel,
+            symlinks,
+            devices,
+            &mut entries,
+            &mut total_bytes,
+            &mut next_id,
+        )?;
+    }
+
+    if entries.len() <= 1 {
+        bail!("nothing to transfer from the specified sources");
+    }
+
+    Ok(PlannedTransfer {
+        transfer_id,
+        root_name,
+        root_source: RootSourceKind::Filesystem,
+        entries,
+        total_bytes: Some(total_bytes),
+        parallel,
+    })
+}
+
+async fn plan_transfer(
+    transfer_id: String,
+    options: &SenderOptions,
+    all_sources: &[PathBuf],
+) -> Result<PlannedTransfer> {
     let parallel = if options.parallel == 0 {
         let cpu_count = std::thread::available_parallelism()
             .map(|n| n.get() as u16)
@@ -1627,40 +1845,58 @@ async fn plan_transfer(transfer_id: String, options: &SenderOptions) -> Result<P
     };
     let symlinks = options.symlinks;
     let devices = options.devices;
-    match parse_sender_source(&options.source) {
-        SenderSource::Stdin => {
-            let output = options
-                .output
-                .as_ref()
-                .context("--output is required when --source stdin")?;
-            let root_name = encode_root_name(output)?;
-            Ok(PlannedTransfer {
-                transfer_id,
-                root_name,
-                root_source: RootSourceKind::Stdin,
-                entries: vec![PlannedEntry {
-                    manifest: ManifestEntry {
-                        id: 0,
-                        rel_path: String::new(),
-                        kind: EntryKind::RegularFile,
-                        size: None,
-                        full_hash: None,
-                        chunk_count: 0,
-                        symlink_target: None,
-                        device: None,
-                        mode: None,
-                    },
-                    source_path: None,
-                }],
-                total_bytes: None,
-                parallel: 1,
+
+    if all_sources.len() == 1 {
+        match parse_sender_source(&all_sources[0]) {
+            SenderSource::Stdin => {
+                let output = options
+                    .output
+                    .as_ref()
+                    .context("--output is required when --source stdin")?;
+                let root_name = encode_root_name(output)?;
+                Ok(PlannedTransfer {
+                    transfer_id,
+                    root_name,
+                    root_source: RootSourceKind::Stdin,
+                    entries: vec![PlannedEntry {
+                        manifest: ManifestEntry {
+                            id: 0,
+                            rel_path: String::new(),
+                            kind: EntryKind::RegularFile,
+                            size: None,
+                            full_hash: None,
+                            chunk_count: 0,
+                            symlink_target: None,
+                            device: None,
+                            mode: None,
+                        },
+                        source_path: None,
+                    }],
+                    total_bytes: None,
+                    parallel: 1,
+                })
+            }
+            SenderSource::Filesystem(path) => spawn_blocking(move || {
+                scan_filesystem_transfer(transfer_id, path, symlinks, devices, parallel)
             })
+            .await
+            .context("filesystem scan task failed")?,
         }
-        SenderSource::Filesystem(path) => spawn_blocking(move || {
-            scan_filesystem_transfer(transfer_id, path, symlinks, devices, parallel)
+    } else {
+        let sources = all_sources.to_vec();
+        let output = options.output.clone();
+        spawn_blocking(move || {
+            scan_multi_filesystem_transfer(
+                transfer_id,
+                sources,
+                output,
+                symlinks,
+                devices,
+                parallel,
+            )
         })
         .await
-        .context("filesystem scan task failed")?,
+        .context("multi-source filesystem scan task failed")?
     }
 }
 

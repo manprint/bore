@@ -109,7 +109,7 @@ fn sender_stdin_child(
     let mut cmd = Command::new(bore_binary()?);
     cmd.arg("transfer")
         .arg("sender")
-        .arg("--source")
+        .arg("--sources")
         .arg("stdin")
         .arg("--to")
         .arg("localhost")
@@ -143,7 +143,7 @@ fn sender_filesystem_child(
     let mut cmd = Command::new(bore_binary()?);
     cmd.arg("transfer")
         .arg("sender")
-        .arg("--source")
+        .arg("--sources")
         .arg(source)
         .arg("--to")
         .arg("localhost")
@@ -817,6 +817,142 @@ async fn transfer_stdin_invalid_windows_char_output_name_over_relay_cli() -> Res
         payload
     );
 
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+fn sender_multi_source_child(
+    transfer_id: &str,
+    sources: &[&Path],
+    output: Option<&Path>,
+    relay_only: bool,
+) -> Result<Child> {
+    let mut cmd = Command::new(bore_binary()?);
+    cmd.arg("transfer").arg("sender");
+    cmd.arg("--sources");
+    for s in sources {
+        cmd.arg(s);
+    }
+    cmd.arg("--to")
+        .arg("localhost")
+        .arg("--secret")
+        .arg("transfer-secret")
+        .arg("--transfer-id")
+        .arg(transfer_id);
+    if let Some(out) = output {
+        cmd.arg("--output").arg(out);
+    }
+    if relay_only {
+        cmd.arg("--relay-only");
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.spawn().context("failed to spawn sender subprocess")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_source_cli() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("multi-source-cli-src");
+    let dest_root = temp_path("multi-source-cli-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let file1 = source_root.join("alpha.txt");
+    let file2 = source_root.join("beta.txt");
+    fs::write(&file1, b"alpha content").await?;
+    fs::write(&file2, b"beta content").await?;
+
+    let transfer_id = format!("multi-source-cli-{}", Uuid::new_v4());
+
+    let listener = listener_child(&dest_root, &transfer_id, true, false, false, None)?;
+    time::sleep(Duration::from_millis(200)).await;
+
+    let sender = sender_multi_source_child(
+        &transfer_id,
+        &[file1.as_path(), file2.as_path()],
+        Some(Path::new("bundle")),
+        true,
+    )?;
+
+    expect_success(wait_child_output(sender).await?, "multi-source sender")?;
+    expect_success(wait_child_output(listener).await?, "multi-source listener")?;
+
+    assert_eq!(
+        read_file(&dest_root.join("bundle/alpha.txt")).await?,
+        b"alpha content"
+    );
+    assert_eq!(
+        read_file(&dest_root.join("bundle/beta.txt")).await?,
+        b"beta content"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_files_cli() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("source-files-cli-src");
+    let dest_root = temp_path("source-files-cli-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let file1 = source_root.join("hello.txt");
+    let file2 = source_root.join("world.txt");
+    fs::write(&file1, b"hello").await?;
+    fs::write(&file2, b"world").await?;
+
+    let list_content = format!(
+        "# comment\n{}\n# another comment\n{}\n   \n",
+        file1.display(),
+        file2.display()
+    );
+    let list_file = source_root.join("list.txt");
+    fs::write(&list_file, list_content.as_bytes()).await?;
+
+    let transfer_id = format!("source-files-cli-{}", Uuid::new_v4());
+
+    let listener = listener_child(&dest_root, &transfer_id, true, false, false, None)?;
+    time::sleep(Duration::from_millis(200)).await;
+
+    let mut cmd = Command::new(bore_binary()?);
+    cmd.arg("transfer")
+        .arg("sender")
+        .arg("--source-files")
+        .arg(&list_file)
+        .arg("--output")
+        .arg("bundle")
+        .arg("--to")
+        .arg("localhost")
+        .arg("--secret")
+        .arg("transfer-secret")
+        .arg("--transfer-id")
+        .arg(&transfer_id)
+        .arg("--relay-only");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let sender = cmd.spawn().context("failed to spawn source-files sender")?;
+
+    expect_success(wait_child_output(sender).await?, "source-files sender")?;
+    expect_success(wait_child_output(listener).await?, "source-files listener")?;
+
+    assert_eq!(
+        read_file(&dest_root.join("bundle/hello.txt")).await?,
+        b"hello"
+    );
+    assert_eq!(
+        read_file(&dest_root.join("bundle/world.txt")).await?,
+        b"world"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
     let _ = fs::remove_dir_all(&dest_root).await;
     Ok(())
 }

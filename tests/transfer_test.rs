@@ -123,6 +123,7 @@ fn listener_options_with_collision(
         nat_udp_release_timeout: 0,
         carriers,
         collision,
+        persistent: false,
     }
 }
 
@@ -140,7 +141,9 @@ fn sender_options(
         secret: Some("transfer-secret".to_string()),
         insecure: false,
         transfer_id: Some(transfer_id),
-        source,
+        sources: vec![source],
+        source_files: vec![],
+        ask_confirm: false,
         output,
         relay_only,
         stun_server,
@@ -211,6 +214,7 @@ async fn transfer_single_file_over_relay() -> Result<()> {
             nat_udp_release_timeout: 0,
             carriers: 1,
             collision: CollisionPolicy::Fail,
+            persistent: false,
         })
         .await
     });
@@ -221,7 +225,9 @@ async fn transfer_single_file_over_relay() -> Result<()> {
         secret: Some("transfer-secret".to_string()),
         insecure: false,
         transfer_id: Some(transfer_id.clone()),
-        source: source_file.clone(),
+        sources: vec![source_file.clone()],
+        source_files: vec![],
+        ask_confirm: false,
         output: None,
         relay_only: true,
         stun_server: None,
@@ -645,6 +651,7 @@ async fn transfer_directory_preserves_structure() -> Result<()> {
             nat_udp_release_timeout: 0,
             carriers: 1,
             collision: CollisionPolicy::Fail,
+            persistent: false,
         })
         .await
     });
@@ -655,7 +662,9 @@ async fn transfer_directory_preserves_structure() -> Result<()> {
         secret: Some("transfer-secret".to_string()),
         insecure: false,
         transfer_id: Some(transfer_id),
-        source: source_root.clone(),
+        sources: vec![source_root.clone()],
+        source_files: vec![],
+        ask_confirm: false,
         output: None,
         relay_only: true,
         stun_server: None,
@@ -1307,6 +1316,7 @@ async fn transfer_single_file_over_direct_udp() -> Result<()> {
             nat_udp_release_timeout: 0,
             carriers: 1,
             collision: CollisionPolicy::Fail,
+            persistent: false,
         })
         .await
     });
@@ -1317,7 +1327,9 @@ async fn transfer_single_file_over_direct_udp() -> Result<()> {
         secret: Some("transfer-secret".to_string()),
         insecure: false,
         transfer_id: Some(transfer_id),
-        source: source_file.clone(),
+        sources: vec![source_file.clone()],
+        source_files: vec![],
+        ask_confirm: false,
         output: None,
         relay_only: false,
         stun_server: Some(stun),
@@ -1765,6 +1777,384 @@ async fn transfer_resume_large_file_over_udp_request_fallback_relay() -> Result<
         "listener should report relay fallback during resumed transfer"
     );
     assert_eq!(read_file(&dest_root.join("resume.bin")).await?, payload);
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_multi_source_files_over_relay() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("multi-source");
+    let dest_root = temp_path("multi-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let file1 = source_root.join("alpha.txt");
+    let file2 = source_root.join("beta.txt");
+    write_file(&file1, b"alpha content").await?;
+    write_file(&file2, b"beta content").await?;
+
+    let transfer_id = format!("multi-relay-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                1,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    bore_cli::transfer::run_sender(SenderOptions {
+        to: "localhost".to_string(),
+        secret: Some("transfer-secret".to_string()),
+        insecure: false,
+        transfer_id: Some(transfer_id),
+        sources: vec![file1, file2],
+        source_files: vec![],
+        ask_confirm: false,
+        output: Some(PathBuf::from("bundle")),
+        relay_only: true,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        nat_udp_preferred_port: 0,
+        nat_udp_release_timeout: 0,
+        carriers: 1,
+        parallel: 0,
+        symlinks: SymlinkMode::Exclude,
+        devices: DeviceMode::Exclude,
+    })
+    .await?;
+    listener.await.context("listener task join failed")??;
+
+    assert_eq!(
+        read_file(&dest_root.join("bundle/alpha.txt")).await?,
+        b"alpha content"
+    );
+    assert_eq!(
+        read_file(&dest_root.join("bundle/beta.txt")).await?,
+        b"beta content"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_persistent_listener_two_sequential_transfers() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("persist-source");
+    let dest_root = temp_path("persist-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let file1 = source_root.join("first.txt");
+    let file2 = source_root.join("second.txt");
+    write_file(&file1, b"first transfer").await?;
+    write_file(&file2, b"second transfer").await?;
+
+    let transfer_id = format!("persist-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(ListenerOptions {
+                to: "localhost".to_string(),
+                secret: Some("transfer-secret".to_string()),
+                insecure: false,
+                transfer_id: Some(transfer_id),
+                dest_path: dest_root,
+                relay_only: true,
+                stun_server: None,
+                upnp: false,
+                try_port_prediction: false,
+                nat_udp_preferred_port: 0,
+                nat_udp_release_timeout: 0,
+                carriers: 1,
+                collision: CollisionPolicy::Fail,
+                persistent: true,
+            })
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+
+    // First transfer
+    bore_cli::transfer::run_sender(SenderOptions {
+        to: "localhost".to_string(),
+        secret: Some("transfer-secret".to_string()),
+        insecure: false,
+        transfer_id: Some(transfer_id.clone()),
+        sources: vec![file1],
+        source_files: vec![],
+        ask_confirm: false,
+        output: None,
+        relay_only: true,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        nat_udp_preferred_port: 0,
+        nat_udp_release_timeout: 0,
+        carriers: 1,
+        parallel: 0,
+        symlinks: SymlinkMode::Exclude,
+        devices: DeviceMode::Exclude,
+    })
+    .await?;
+    assert_eq!(
+        read_file(&dest_root.join("first.txt")).await?,
+        b"first transfer"
+    );
+
+    // Give listener time to reset
+    time::sleep(Duration::from_millis(300)).await;
+
+    // Second transfer
+    bore_cli::transfer::run_sender(SenderOptions {
+        to: "localhost".to_string(),
+        secret: Some("transfer-secret".to_string()),
+        insecure: false,
+        transfer_id: Some(transfer_id.clone()),
+        sources: vec![file2],
+        source_files: vec![],
+        ask_confirm: false,
+        output: None,
+        relay_only: true,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        nat_udp_preferred_port: 0,
+        nat_udp_release_timeout: 0,
+        carriers: 1,
+        parallel: 0,
+        symlinks: SymlinkMode::Exclude,
+        devices: DeviceMode::Exclude,
+    })
+    .await?;
+    assert_eq!(
+        read_file(&dest_root.join("second.txt")).await?,
+        b"second transfer"
+    );
+
+    // Kill listener (it's persistent, never exits on its own)
+    listener.abort();
+    let _ = listener.await;
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_source_files_flag() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("srcfiles-source");
+    let dest_root = temp_path("srcfiles-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let file1 = source_root.join("hello.txt");
+    let file2 = source_root.join("world.txt");
+    write_file(&file1, b"hello").await?;
+    write_file(&file2, b"world").await?;
+
+    let list_file = source_root.join("list.txt");
+    let list_content = format!(
+        "# this is a comment\n{}\n# another comment\n{}\n   \n",
+        file1.display(),
+        file2.display()
+    );
+    fs::write(&list_file, list_content.as_bytes()).await?;
+
+    let transfer_id = format!("srcfiles-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                1,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    bore_cli::transfer::run_sender(SenderOptions {
+        to: "localhost".to_string(),
+        secret: Some("transfer-secret".to_string()),
+        insecure: false,
+        transfer_id: Some(transfer_id),
+        sources: vec![],
+        source_files: vec![list_file],
+        ask_confirm: false,
+        output: Some(PathBuf::from("bundle")),
+        relay_only: true,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        nat_udp_preferred_port: 0,
+        nat_udp_release_timeout: 0,
+        carriers: 1,
+        parallel: 0,
+        symlinks: SymlinkMode::Exclude,
+        devices: DeviceMode::Exclude,
+    })
+    .await?;
+    listener.await.context("listener task join failed")??;
+
+    assert_eq!(
+        read_file(&dest_root.join("bundle/hello.txt")).await?,
+        b"hello"
+    );
+    assert_eq!(
+        read_file(&dest_root.join("bundle/world.txt")).await?,
+        b"world"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_persistent_listener_collision_continues() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("persist-coll-source");
+    let dest_root = temp_path("persist-coll-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let file = source_root.join("data.txt");
+    write_file(&file, b"content").await?;
+
+    let transfer_id = format!("persist-coll-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(ListenerOptions {
+                to: "localhost".to_string(),
+                secret: Some("transfer-secret".to_string()),
+                insecure: false,
+                transfer_id: Some(transfer_id),
+                dest_path: dest_root,
+                relay_only: true,
+                stun_server: None,
+                upnp: false,
+                try_port_prediction: false,
+                nat_udp_preferred_port: 0,
+                nat_udp_release_timeout: 0,
+                carriers: 1,
+                collision: CollisionPolicy::Fail,
+                persistent: true,
+            })
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+
+    // First transfer succeeds
+    bore_cli::transfer::run_sender(SenderOptions {
+        to: "localhost".to_string(),
+        secret: Some("transfer-secret".to_string()),
+        insecure: false,
+        transfer_id: Some(transfer_id.clone()),
+        sources: vec![file.clone()],
+        source_files: vec![],
+        ask_confirm: false,
+        output: None,
+        relay_only: true,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        nat_udp_preferred_port: 0,
+        nat_udp_release_timeout: 0,
+        carriers: 1,
+        parallel: 0,
+        symlinks: SymlinkMode::Exclude,
+        devices: DeviceMode::Exclude,
+    })
+    .await?;
+
+    time::sleep(Duration::from_millis(300)).await;
+
+    // Second transfer fails (collision) — sender gets error, listener stays up
+    let second_result = bore_cli::transfer::run_sender(SenderOptions {
+        to: "localhost".to_string(),
+        secret: Some("transfer-secret".to_string()),
+        insecure: false,
+        transfer_id: Some(transfer_id.clone()),
+        sources: vec![file.clone()],
+        source_files: vec![],
+        ask_confirm: false,
+        output: None,
+        relay_only: true,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        nat_udp_preferred_port: 0,
+        nat_udp_release_timeout: 0,
+        carriers: 1,
+        parallel: 0,
+        symlinks: SymlinkMode::Exclude,
+        devices: DeviceMode::Exclude,
+    })
+    .await;
+    assert!(
+        second_result.is_err(),
+        "second transfer should fail due to collision"
+    );
+
+    // Wait longer than the persistent listener's error-drain window (500ms)
+    time::sleep(Duration::from_millis(700)).await;
+
+    // Listener should still be alive — verify by sending a different file
+    let file3 = source_root.join("new_data.txt");
+    write_file(&file3, b"new content").await?;
+    bore_cli::transfer::run_sender(SenderOptions {
+        to: "localhost".to_string(),
+        secret: Some("transfer-secret".to_string()),
+        insecure: false,
+        transfer_id: Some(transfer_id.clone()),
+        sources: vec![file3],
+        source_files: vec![],
+        ask_confirm: false,
+        output: None,
+        relay_only: true,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        nat_udp_preferred_port: 0,
+        nat_udp_release_timeout: 0,
+        carriers: 1,
+        parallel: 0,
+        symlinks: SymlinkMode::Exclude,
+        devices: DeviceMode::Exclude,
+    })
+    .await?;
+
+    listener.abort();
+    let _ = listener.await;
 
     let _ = fs::remove_dir_all(&source_root).await;
     let _ = fs::remove_dir_all(&dest_root).await;

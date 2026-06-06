@@ -12,8 +12,10 @@ env:
 
 # Every push (any branch) and every vX.Y.Z tag produces a GitHub Release named
 # after the ref ("<branch>-<sha7>" for branches, the tag for tags), with all
-# target binaries attached as release assets. Branch builds are marked as
-# pre-releases; only tag builds become the "latest" release.
+# target binaries attached as release assets: compressed archives (.tar.gz/.zip)
+# AND raw unstripped binaries (.exe on Windows). Every release is marked "latest"
+# so https://github.com/manprint/bore/releases/latest/download/ always resolves
+# to the most recent build. Branch builds are marked as pre-releases.
 
 permissions:
   contents: write # create the release + tag and upload assets
@@ -37,7 +39,7 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ${{ steps.ver.outputs.name }}
           prerelease: ${{ steps.ver.outputs.is_tag != 'true' }}
-          make_latest: ${{ steps.ver.outputs.is_tag == 'true' }}
+          make_latest: "true"
           draft: false
 
   # Downloads and stores `cross` as an artifact for reuse across the build jobs.
@@ -97,14 +99,19 @@ jobs:
       - name: Build | Build
         run: cargo build --all-features --release --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package | Compressed archive
         run: tar -czvf "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz" --directory=target/${{ matrix.target }}/release ${{ env.BIN }}
 
-      - name: Upload | Release asset
+      - name: Package | Raw binary
+        run: cp "target/${{ matrix.target }}/release/${{ env.BIN }}" "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}"
+
+      - name: Upload | Release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          files: ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz
+          files: |
+            ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz
+            ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}
 
   linux:
     runs-on: ubuntu-latest
@@ -134,14 +141,19 @@ jobs:
 
       - run: ci/set_rust_version.bash stable ${{ matrix.target }}
       - run: ci/build.bash /tmp/cross ${{ matrix.target }} RELEASE
-      - name: Package
+      - name: Package | Compressed archive
         run: tar -czvf "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz" --directory=target/${{ matrix.target }}/release ${{ env.BIN }}
 
-      - name: Upload | Release asset
+      - name: Package | Raw binary
+        run: cp "target/${{ matrix.target }}/release/${{ env.BIN }}" "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}"
+
+      - name: Upload | Release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          files: ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz
+          files: |
+            ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz
+            ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}
 
   windows:
     runs-on: windows-latest
@@ -161,18 +173,24 @@ jobs:
 
       - run: bash ci/set_rust_version.bash stable ${{ matrix.target }}
       - run: bash ci/build.bash cargo ${{ matrix.target }} RELEASE
-      - name: Package
+      - name: Package | Compressed archive
         shell: bash
         run: |
           cd ./target/${{ matrix.target }}/release/
           7z a "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.zip" "${{ env.BIN }}.exe"
           mv "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.zip" "$GITHUB_WORKSPACE"
 
-      - name: Upload | Release asset
+      - name: Package | Raw binary
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/${{ env.BIN }}.exe" "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.exe"
+
+      - name: Upload | Release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          files: ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.zip
+          files: |
+            ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.zip
+            ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.exe
 
   # Android is built with the NDK (zig/cross cannot build `ring` for Android).
   android:
@@ -190,12 +208,18 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build via the Android NDK
-        run: |
-          docker buildx build -f docker/Dockerfile.android --output type=local,dest=bin .
-          tar -czvf "${{ env.BIN }}-${{ steps.ver.outputs.name }}-aarch64-linux-android.tar.gz" --directory=bin ${{ env.BIN }}
+        run: docker buildx build -f docker/Dockerfile.android --output type=local,dest=bin .
 
-      - name: Upload | Release asset
+      - name: Package | Compressed archive
+        run: tar -czvf "${{ env.BIN }}-${{ steps.ver.outputs.name }}-aarch64-linux-android.tar.gz" --directory=bin ${{ env.BIN }}
+
+      - name: Package | Raw binary
+        run: cp "bin/${{ env.BIN }}" "${{ env.BIN }}-${{ steps.ver.outputs.name }}-aarch64-linux-android"
+
+      - name: Upload | Release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          files: ${{ env.BIN }}-${{ steps.ver.outputs.name }}-aarch64-linux-android.tar.gz
+          files: |
+            ${{ env.BIN }}-${{ steps.ver.outputs.name }}-aarch64-linux-android.tar.gz
+            ${{ env.BIN }}-${{ steps.ver.outputs.name }}-aarch64-linux-android

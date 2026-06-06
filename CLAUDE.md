@@ -1,170 +1,84 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## Instructions for CLAUDE and optimizations.
+
+### Model selection per task
+
+Three tiers, each with a clear role. Using the wrong one wastes money or quality.
+
+**Haiku 4.5** (`claude-haiku`) — fast, cheap ($1/$5 per MTok)
+- Linting, grep-style code search, syntax checks
+- Routing/classification decisions in multi-agent flows
+- Extracting structured data from text (parse logs, format JSON)
+- Generating short repetitive outputs (commit messages, variable names)
+- Sub-agent tasks where the work is mechanical, not reasoning-heavy
+
+**Sonnet 4.6** (`claude-sonnet`) — default for 90%+ of tasks ($3/$15 per MTok)
+- Implementing features, refactoring, writing tests
+- Debugging non-trivial bugs
+- Writing/reviewing documentation
+- Code review with explanation
+- Agentic loops that need sustained focus but not peak reasoning
+
+**Opus 4.8** — complex tasks where quality delta is worth 5–10× cost
+- Architecture decisions across many files
+- Multi-step reasoning that Sonnet visibly gets wrong
+- Deep research synthesis
+- `opusplan` alias: Opus for plan mode only, auto-switches to Sonnet for codegen
+
+**Rule of thumb**: start with Sonnet. Drop to Haiku for bulk/mechanical sub-tasks.
+Escalate to Opus only when Sonnet output is concretely insufficient.
+
+## Agent workflow
+
+### Analysis phase
+Every repository analysis must produce structured output files organized by phase and
+sub-phase. Each entry must contain clear, self-contained implementation details usable
+by downstream agents without additional context. Preserve all considerations and
+decisions made by the orchestrating agent — nothing implicit, nothing assumed.
+
+### Implementation phase
+Work phase by phase, sub-phase by sub-phase. For each unit:
+1. Write tests first or alongside implementation.
+2. Verify all CI gates pass (`cargo fmt`, `cargo clippy -- -D warnings`, `cargo test`).
+3. Run the full regression suite before marking the sub-phase done.
+4. **Zero regressions tolerated.** A sub-phase that breaks an existing test is not done.
+
+### Documentation
+Every phase that changes behavior, APIs, or invariants must produce or update the
+corresponding markdown documentation. Docs are part of the deliverable, not optional.
+
+### Quality bar
+- Code must be correct before it is clever.
+- If a detail is uncertain, surface it explicitly — do not paper over it.
+- High quality is the baseline, not a stretch goal.
 
 ## What this is
 
-`bore` is a minimal TCP tunnel: a client exposes a local port to the public internet through a remote server, bypassing NAT/firewalls. The whole thing is ~400 lines of safe async Rust (`#![forbid(unsafe_code)]`). The crate ships both the library (`bore_cli`) and a single `bore` binary that runs as either client or server.
+`bore` — async Rust TCP/UDP tunnel/proxy/transfer app. (`#![forbid(unsafe_code)]`). Exposes a local port to the internet through a remote server, bypassing NAT/firewalls. Ships `bore_cli` lib + `bore` binary.
 
-`bore --version` prints `bore <semver> - <branch> - <sha8>` (e.g. `bore 1.0.0 - main - a1b2c3d4`). The branch and commit SHA are embedded at compile time via `build.rs`, which prefers `BORE_GIT_BRANCH`/`BORE_GIT_SHA` env vars (set by Docker `--build-arg`), then `GITHUB_REF_NAME`/`GITHUB_SHA` (CI), then `git` CLI (local dev). Run `cargo build` to regenerate when HEAD changes.
+**Five subcommands:**
+- `bore local <port>` — public tunnel: server assigns a public port, forwards traffic to local `<port>`
+- `bore proxy` — secret consumer: connects to a named provider, relays traffic to local port
+- `bore server` — runs the relay server
+- `bore transfer listener|sender` — file transfer over tunnel (resume, BLAKE3 verify, parallel streams)
+- `bore test-udp` — NAT/UDP diagnostic; with `--tcp-secret-id` runs a two-peer latency/bandwidth test
 
-## Commands
+**Core transport stack:**
+- One long-lived yamux-multiplexed TCP connection per tunnel (control port 7835)
+- Plain TCP or TLS (`https://` URL to server)
+- Public tunnels: server opens data substreams → client splices to local service
+- Secret tunnels: consumer opens data substreams → server relays to provider → provider splices to local
+- `--carriers N`: N parallel TCP connections, round-robin per proxied connection (HOL + cwnd isolation)
+- `--udp`: UDP hole-punching + QUIC direct path for secret tunnels (each proxied conn = own QUIC bidi stream); falls back to relay automatically
 
-```shell
-cargo build --all-features        # build (CI builds with --all-features)
-cargo test                        # run all tests
-cargo test basic_proxy            # run a single test by name
-cargo fmt -- --check              # rustfmt check (CI gate)
-cargo clippy -- -D warnings       # lint, warnings are errors (CI gate)
+**Key invariants to never break:**
+- Client sends `Hello` before auth (yamux is lazy; without it, deadlock)
+- Server writes `mux::STREAM_READY` before splice (banner-first protocols need it)
+- `copy_bidirectional_with_sizes` propagates half-close; do not replace with a non-half-close variant
+- `shared::tune_tcp` (`TCP_NODELAY` + `SO_KEEPALIVE 15s`) must be applied to every new socket
+- `--max-conns` semaphore is the real bound; yamux stream limit is set generous intentionally
+- `carriers<=1` (default) keeps the single-connection path byte-for-byte unchanged
 
-cargo run -- local 8000                    # run client (defaults to https://bore.0912345.xyz)
-cargo run -- server                        # run server
-```
-
-CI (`.github/workflows/ci.yml`) runs three separate jobs: build+test, `cargo fmt --check`, and `cargo clippy --all-features --all-targets -- -D warnings`. All three must pass.
-
-### Testing caveats
-
-- **Integration tests bind real ports and must run serially.** `tests/e2e_test.rs` spins up an actual `Server` on `CONTROL_PORT` (7835) plus tunnel ports. Tests share a `SERIAL_GUARD` mutex (`lazy_static`) to avoid port races — any new test that starts a server must take this lock. This means tests fail if port 7835 is already in use.
-- Tests use `rstest` for parameterized cases (e.g. `basic_proxy` runs across `None`/`Some("")`/`Some("abc")` secrets).
-- Doctests exist (see `auth.rs`) and run under `cargo test`.
-- **Multi-consumer is a supported invariant and is tested**: many `bore proxy` consumers may attach to one provider id, on the relay *and* the UDP direct path. Coverage — relay: `secret_multiple_consumers_concurrent` (3 concurrent consumers, distinct payloads, no cross-talk), `secret_single_consumer_many_connections` (16 conns over one consumer); direct: `udp_multiple_consumers_concurrent_direct` (3 direct on one provider endpoint via the stable per-provider nonce), `udp_mixed_direct_and_relay_consumers` (direct + relay against the same provider), `udp_consumer_reconnects_while_others_active`, `udp_multiple_consumers_detect_provider_drop`. The direct path scales because the provider runs one persistent `DirectListener` (one QUIC endpoint) that accepts every consumer's connection; the stable nonce means all derive the same token.
-- **Carrier pool is opt-in and tested** (`tests/carrier_test.rs`): a public tunnel with `--carriers N` opens N parallel TCP connections and the server spreads proxied connections across them. Coverage — `carrier_pool_round_trips_concurrent_connections` (4 carriers × 40 concurrent conns, distinct payloads, no cross-talk), `carrier_pool_half_close`, `carrier_pool_large_payload` (1 MiB), `carrier_pool_request_above_cap_still_works` (request 16, cap 2), `carrier_pool_disabled_server_side_degrades_to_single` (cap 1 → `extra = 0`, single connection). `--carriers 1` (and the default) leave the path unchanged, so the whole existing suite is the no-regression guard.
-- **Secret-tunnel pools + native direct are tested** (`tests/secret_pool_test.rs`, `tests/udp_test.rs`): `provider_pool_relays_concurrent_connections` (provider `--carriers 4`, server round-robins the relay), `consumer_pool_relays_concurrent_connections` (consumer `--carriers 4`), `both_pools_relay_concurrent_connections` (both legs pooled), and `udp_direct_many_concurrent_streams` (one direct consumer, 30 concurrent connections each on its own native QUIC stream). All 13 `udp_test` cases pass over the native-stream direct path (multi-consumer, reconnect, provider drop, relay upgrade, fallback, max-conns, plus `paired_test_udp_diagnostic_exercises_direct_and_relay` for `bore test-udp --tcp-secret-id`).
-- **Transfer V2 has dedicated end-to-end coverage** (`tests/transfer_test.rs`, `tests/transfer_stdin_cli_test.rs`): filesystem relay/direct/fallback, resume, TLS control, collision policies, non-UTF8 names, size boundaries, multi-frame manifests, symlink/device policies, NAT flags, real subprocess stdin, and listener-kill resume/cleanup. These suites also bind the fixed control port and should remain serialized like the other integration tests.
-
-## Architecture
-
-The client and server share **one** long-lived connection (on the control port, `7835` by default, `--control-port` to change) and multiplex everything over it with yamux. The connection is plain TCP, or TLS when the client's `--to` is an `https://` URL. There is no longer a separate connection (or auth handshake) per proxied connection.
-
-Modules under `src/`:
-
-- **`shared.rs`** — control-channel protocol. `ClientMessage`/`ServerMessage` enums (serde JSON) and the `Delimited<U>` transport (null-byte-delimited JSON frames via `AnyDelimiterCodec`). Constants `CONTROL_PORT`, `MAX_FRAME_LENGTH = 1024`, `MAX_NOTES_LEN = 256`, `NETWORK_TIMEOUT = 3s`, `PROXY_BUFFER_SIZE = 64 KiB`. `TunnelOptions` (rides in `Hello`) carries `https`/`force_https` plus `basic_auth: Option<String>` (server-enforced creds for public tunnels), `notes`, and `carriers: u16` (`#[serde(default)]`; `0`/`1` = single connection, `>1` requests a carrier pool). `HelloSecret { id, notes, basic_auth: bool }` / `ConnectSecret { id, notes }` are **struct** variants (the `basic_auth` bool is display-only — the provider enforces locally, creds never leave it). **Carrier pool** messages: `ServerMessage::CarrierToken { token, extra }` (sent after `Hello` when `carriers > 1`) and `ClientMessage::JoinCarrier { token }` (first message on each extra connection). **Paired diagnostics** add `ClientMessage::TestUdpJoin { id, candidates, summary, options }`, `ServerMessage::TestUdpWaiting`, and `ServerMessage::TestUdpStart { role, nonce, peer_candidates, peer_summary, options }`; the exchanged summary is intentionally compact so `MAX_FRAME_LENGTH` stays at 1024.
-- **`pool.rs`** — shared **carrier pool** primitives, used by public tunnels *and* secret providers/consumers. `Carrier { opener, alive: AtomicBool }`; `CarrierPool` (thread-safe round-robin `pick()` that prunes dead carriers, `push(carrier, max)` capped); `PendingCarriers = Arc<DashMap<token, Sender<Carrier>>>` (the first connection issues a token in `CarrierToken`, extras present it in `JoinCarrier` and the server delivers their openers here); `TokenGuard` (RAII frees the token); `recv_carrier` (select-friendly receiver). The lock is never held across `.await`.
-- **`mux.rs`** — yamux wrapper, generic over any `Transport` (the `AsyncRead+AsyncWrite+Unpin+Send+'static` blanket trait — TCP or TLS). `mux::client`/`mux::server` spawn a single driver task that owns the `yamux::Connection` (its poll API needs `&mut`, so one owner only). `Opener::open()` requests outbound substreams over a channel; `Acceptor::accept()` yields inbound ones. `Stream` is `Compat<yamux::Stream>` (yamux is `futures`-IO; `tokio_util::compat` adapts it to Tokio traits).
-- **`server.rs`** — `Server`: accepts the single connection, dispatches on the first control message into one of five roles (public-port tunnel, secret provider, secret consumer, carrier-pool join, paired UDP diagnostic). Holds the `providers` registry, the diagnostic `udp_tests` registry, and the `--max-conns` `Semaphore`. Each tunnel role registers a live entry in the `admin` `AdminRegistry` (held for the connection's lifetime; public tunnels + relayed consumers also bump an `ActiveGuard` per proxied connection). `route_connection` is the admin gate: with `--admin-token` set it peeks the **first byte** (after TLS) — an HTTP method → `admin_http::serve`, `0x00`/anything else → the bore protocol via a `Prefixed` replay; **with no token it is a pass-through, so the protocol path is byte-for-byte unchanged**. **Carrier pool** (`serve_tunnel`): when a public tunnel requests `carriers > 1`, the server issues a per-tunnel token (random `Uuid`) in `CarrierToken`, clamps the count to `--max-carriers` (`DEFAULT_MAX_CARRIERS = 16`), and round-robins each external connection across the pool's `Opener`s (`pick_carrier`, pruning dead ones via an `AtomicBool`). Extra connections present the token via `JoinCarrier` → `serve_carrier` matches it against the `pending_carriers` `DashMap<token, Sender<Carrier>>`, delivers that connection's opener to the tunnel loop, and holds the connection open to detect teardown. A `TokenGuard` removes the token when the tunnel ends. **The data path (edge → `STREAM_READY` → splice) is unchanged — only *which* carrier opens each substream.** `carriers <= 1` (incl. the `serde` default) keeps the single-connection path byte-for-byte.
-- **`client.rs`** — `Client`: dials the server, opens the control substream, accepts data substreams and splices each to a fresh local connection. `Client::new` = public-port mode; `Client::new_secret_provider` = secret-provider mode (shares `listen`/`handle_connection`). Provider direct-path hardening: a per-provider `Semaphore` (`--max-conns` on `local`, default `DEFAULT_MAX_CONNS`) bounds concurrently served **direct** substreams in `provider_direct` — the direct analog of the relay's server-wide cap (it protects the provider host; over the cap, drop). `listen` also re-offers UDP candidates on a 15s timer (`udp_cfg`) if the initial offer failed, so a transient bootstrap problem doesn't leave the provider relay-only. A secret-tunnel provider's `--basic-auth` is stored as `basic_auth: Option<BasicAuth>` and enforced in `handle_connection` (so it covers **both** relay and direct paths): the gate reads the HTTP head off the substream, replays it to the local service on success, returns `401` on failure (`basicauth::gate`). Public tunnels do **not** set this (the server enforces them at the edge). **Carrier pool** (public tunnels, `--carriers N`): after `Hello`, if `carriers > 1` the client reads `CarrierToken { token, extra }` and opens `extra` more connections via `open_carrier` (dial + `JoinCarrier` + auth, mirroring `new`'s order); each held-open control substream + data acceptor is stored, then in `listen` a per-carrier pump task (`spawn_carrier_pump`) forwards that acceptor's data substreams into a shared channel the loop drains exactly like the main acceptor (`spawn_handle` is shared by both). A 15s `maybe_redial_carriers` timer tops the pool back up off the loop (non-blocking, `inflight` guard) if a carrier drops. `carriers <= 1` keeps the single-connection `listen` path; secret providers never use the pool.
-- **`edge.rs`** — per-connection handling on the public tunnel port when a tunnel sets `--https`/`--force-https`. Peeks the first bytes (bounded by a timeout; a no-options tunnel skips peeking entirely and forwards as before): a TLS `ClientHello` (`0x16`) is terminated with the server cert (`TunnelStream::Tls`), a plain HTTP request is answered with a `308` redirect to `https://` when `force_https`, otherwise the connection is forwarded plain. `TunnelOptions` rides in the `Hello` message. When `opts.basic_auth` is set, the edge (after any TLS termination) runs `basicauth::gate` on the decrypted/plain stream: an unauthenticated HTTP request gets `401`, an authenticated one is forwarded as `TunnelStream::Buffered(Prefixed)` (the head already read is replayed), and non-HTTP traffic passes through unprotected. `--basic-auth` also forces the peek path (no fast-path forward).
-- **`secret.rs`** — named "secret" tunnels (no public port). Server-side `serve_provider` (register under id) / `serve_consumer` + `relay` (splice each consumer substream to a provider substream); and the consumer-side `Proxy` (`bore proxy`) which binds a local listener and opens one stream per local connection. `serve_provider`/`serve_consumer` also take `admin`/`peer`/`notes` and register an `AdminRegistry` entry (provider/consumer), calling `mark_udp()` when candidates are offered/brokered; consumers wrap each relay with an `ActiveGuard`. `Proxy::new` and `Client::new_secret_provider` carry the `notes`/`ProviderMeta` for the admin page.
-  - **Carrier pools on both relay legs** (`--carriers`): `Registry = Arc<DashMap<id, Arc<pool::CarrierPool>>>` — `serve_provider` seeds the pool with the provider's opener and, if it requested `carriers > 1`, issues a `CarrierToken` (reusing the same `pending_carriers`/`serve_carrier` path as public tunnels) and adds each joined provider connection's opener to the pool; `relay` round-robins across it (`pool.pick()`). The **consumer** opens its own `carriers` connections (`open_consumer_carrier` — extra `ConnectSecret`s, each drained of heartbeats + pruned on drop) into a client-side `CarrierPool`; `Proxy`'s `DataPath::Relay(Arc<CarrierPool>)` round-robins `forward` across them. Default `carriers = 1` (single member) is the original single-connection path.
-  - **Direct UDP path uses native QUIC streams** (no yamux): `Proxy`'s `DataPath` is `Relay(pool)` or `Direct(holepunch::DirectConn)`; `forward` opens a stream from a `StreamOpener` (`mux::Opener` or a QUIC `open_bi`) and writes/flushes `STREAM_READY`. `DataStream` is the `AsyncRead`/`AsyncWrite` enum over the two. Direct-path death is detected via `DirectConn::closed()` (a `spawn_closed_monitor` oneshot), replacing the old yamux-acceptor probe. The relay→direct upgrade now swaps the `DataPath` in place (`DirectUpgrade` carries the `DirectConn`; an `Infallible` alias keeps the upgrade channels nameable without the `udp` feature, since `tokio::select!` forbids `#[cfg]` on arms).
-- **`transfer_v2.rs`** — `bore transfer listener|sender`. Filesystem mode builds a manifest, preserves cross-platform path encodings (Unix raw bytes / Windows UTF-16), splits regular files into deterministic chunks, fans them across `--parallel` worker streams, persists receiver-side resume state, stages into a temp tree, verifies BLAKE3 per chunk/file/final summary, and commits only after verification. The receiver batches staged-file syncs and resume-state writes, serializing flushes so resume safety does not force one fsync + state rewrite per chunk. `stdin` mode requires `--output`, uses a single stream, and does not resume. Sender-side `--symlinks` / `--devices` govern special-file scanning; Windows invalid/reserved names sanitize to `_bore_utf8_<hex>`; Unix device creation uses portable `nix::libc::{major, minor, makedev}` helpers so Linux, macOS, and Android builds share the same path.
-- **`admin.rs`** — in-memory `AdminRegistry` (`Arc<DashMap<u64, Arc<Entry>>>`) of live tunnels for the status page; **no persistence**. `register(NewEntry) -> Registration` (RAII: drops the entry on disconnect), `Registration::active()`/`mark_udp()`, `ActiveGuard` (inc/dec a connection counter on scope), `snapshot() -> Vec<EntryView>` (serializable, id-sorted; `uptime_secs` from a stored `Instant`). `Role` = Public / SecretProvider / SecretConsumer. A direct-UDP consumer's `active` stays 0 server-side (its data bypasses the server).
-- **`admin_http.rs`** — minimal hand-rolled HTTP/1.1 for the status page (no framework). `serve(stream, registry, token, ServerStatus)` handles one request: `GET /admin/status` → embedded HTML (`include_str!("admin_status.html")`), `GET /admin/status/data` → token-gated JSON (`{server, tunnels}`), else 404/405; `Connection: close` + clean `shutdown` (TLS `close_notify`). Token via `Authorization: Bearer`/`X-Admin-Token`, constant-time compared. `is_http_first_byte` is the discriminator used by `server::route_connection`.
-- **`admin_status.html`** — the embedded frontend: a single self-contained page (inline CSS+vanilla JS, no external assets). Token login (stored in `sessionStorage`), then polls `status/data` every ~2s and renders two tables (public + secret, grouped by role/id) with truncated/ellipsised cells. Served verbatim by `admin_http`.
-- **`basicauth.rs`** — HTTP Basic auth. `BasicAuth::parse("user:pass")` precomputes the expected base64 (hand-rolled `base64_encode`, no dep); `authorized(head)` finds `Authorization: Basic` and compares constant-time. `gate(stream, auth) -> Gate` reads the request head (time-bounded) and returns `Forward(prefix)` (HTTP authorized, or non-HTTP/empty → unprotected per design) or `Reject` (wrote `401`). Shared `pub(crate) constant_time_eq` (also used for the admin token).
-- **`prefixed.rs`** — `Prefixed<S>`: a stream that replays an already-read byte prefix before delegating to `S` (reads), with writes straight through. Used to forward the basic-auth-gated head and to put back the routing byte peeked in `server::route_connection`. It is a `mux::Transport` when `S` is.
-- **`transport.rs`** — control-connection endpoint. `Endpoint::parse` turns `--to` into host/port/tls (`https://`→TLS:443, `http://`→plain:80, bare→plain:control-port; explicit `:port` overrides). `connect` dials and, for TLS, wraps with rustls (**ring** provider, for musl/scratch builds; `--insecure` skips verification, else webpki-roots). `ControlStream` is the plain-or-TLS enum (implements `mux::Transport`); `load_server_tls`/`server_tls_from_pem` build the server `TlsAcceptor`.
-- **`udp_diagnostic.rs`** — coordinated two-peer `bore test-udp --tcp-secret-id` mode. The first peer waits in `udp_tests`; the second pairs it, server sends `TestUdpStart` with role (`Listener`/`Dialer`), nonce, peer candidates and compact NAT summary. The server relays diagnostic TCP substreams by accepting an inbound yamux stream from one peer, opening a stream to the other, writing `STREAM_READY`, then splicing. The clients run the same binary protocol over direct QUIC streams and over the TCP relay: latency ping/echo, optional bandwidth quota (`--test-bandwidth`, alias `--test-bandwith`, `--test-transfer-quota`), and metrics exchange. Stream `shutdown` after payload/ack is best-effort to avoid treating close races as failed transfers.
-- **`holepunch.rs`** — optional `udp` feature: UDP hole-punching + STUN with a QUIC carrier for a **direct** consumer↔provider path in secret tunnels (bypassing the relay). Split so the *server* parts (STUN reflexive discovery `discover_reflexive`/`resolve_stun`, STUN responder `run_stun_responder`, token `derive_token`, and `check_reflexive_port`) carry no `quinn` dependency and compile unconditionally; the *client* QUIC parts (`connect_direct`, `DirectListener`, `DirectConn`, `QuicTransport`, configs) are `#[cfg(feature = "udp")]` and pull `quinn`. **Native QUIC streams:** `connect_direct`/`DirectListener::accept` authenticate the connection once (token on a dedicated bidi stream) and return a `DirectConn`; each proxied connection then rides its **own** native QUIC bidi (`DirectConn::open_stream`/`accept_stream` → a per-stream `QuicTransport`), so a lost packet on one connection's stream does not stall the others — no head-of-line blocking (the old design ran yamux over a single QUIC stream and did). `transport_config` raises `max_concurrent_bidi_streams` to `MAX_DIRECT_STREAMS` so the provider's `--max-conns` is the real bound. Both peers authenticate with a shared token = HMAC(secret, server-issued nonce) (the nonce is from the system CSPRNG via `ring::rand`, not a fast PRNG — it is the token's only entropy when no `--secret` is set; the client also warns when `--udp` is used without `--secret`). `udp` is a **default** feature (on for `cargo build`/`test`); build `--no-default-features` to drop `quinn`/`quinn-udp` (e.g. a target where `quinn` won't compile). The server-side brokering + STUN still compile without the feature. **Hard-NAT extras** in `gather_candidates` (opt-in, both peers): `--upnp`/`BORE_UPNP` adds a UPnP-IGD router-mapped candidate (`igd-next`, gated on `udp`; helps strict *home* routers, useless behind CGNAT); `--try-port-prediction`/`BORE_TRY_PORT_PREDICTION` advertises `PREDICT_RANGE` ports past the reflexive one for sequential symmetric NATs (best-effort, logs a `port prediction ENABLED` warning as it can look like a scan). Both flags are on `local` + `proxy` only (the server doesn't punch); CGNAT-both-ends stays on the relay. **Diagnostic** `diagnose` (behind `bore test-udp`, compiles without the feature): probes `PUBLIC_STUN` (Google×2 + Cloudflare) on one socket plus, with `--to`, the bore server's own STUN; `classify_nat` (pure, unit-tested) reads the mapping variation across servers → `Blocked`/`Open`/`Inconclusive`/`Cone`/`Symmetric{sequential}`; also reports port-preservation, `is_cgnat` (`100.64/10`)/double-NAT, a co-location/hairpin note (public STUN OK but own server's UDP dead), and a UPnP-IGD presence probe (`upnp_external_ip`, gated). Prints a human report via `println!` (not `tracing`). **Fixed UDP port**: `bind_socket(port)` (0 = ephemeral) — a non-zero `port` binds that exact UDP source port (via `socket2` with `SO_REUSEADDR` so an auto-reconnect rebinds cleanly), threaded from `--nat-udp-preferred-port`/`BORE_NAT_UDP_PORT` through `new_secret_provider`/`Proxy::new`/`negotiate_direct_consumer`/`diagnose`; lets a strict egress firewall be opened for that one port and fixes the public mapping on a port-preserving NAT (no help for symmetric NATs). On `local`+`proxy`+`test-udp`. **Port-release detection:** when the NAT remaps the preferred port, the consumer (`proxy`) and provider (`local --tcp-secret-id`) switch to ephemeral probes so the NAT entry expires naturally, then re-check every `--nat-udp-release-timeout` (default 600s) via `check_reflexive_port` — a lightweight single-STUN-probe function that returns `Some(true)` (preserved), `Some(false)` (remapped) or `None` (STUN unreachable).
-- **Live STUN selection/logging** — `local --udp`, `proxy --udp`, and paired `test-udp` candidate gathering use Cloudflare first (`stun.cloudflare.com:3478`), then Google (`stun.l.google.com:19302`, `stun1.l.google.com:19302`), then the bore server's own UDP control-port STUN as final fallback. For secret tunnels, the provider sends `UdpCandidateOffer { selected_stun }`; the server stores it in `UdpReg`, consumers ask with `UdpStunHintRequest`, and `proxy --udp` tries that provider-selected STUN first before continuing through the normal chain. A failed hint is non-blocking; `--stun-server` remains an absolute single-server override. Logs include the STUN chain, provider hint, selected STUN, `stun_aligned`, local UDP socket, reflexive address, offered candidates, peer candidates, and direct QUIC candidate attempts.
-- **`reconnect.rs`** — `--auto-reconnect` support. `Backoff` yields a configurable exponential sequence (default: 1,2,4,8,16,32 then 32s); `new_with(initial, max)` customises the sequence (used by the UDP direct-path upgrade with 2→256s). `peek()` returns the current delay without advancing; `next_delay()` advances; `reset()` restarts from the initial. Generic `run(auto, connect, serve)` runs the connect/serve cycle once (errors propagate) or loops forever reconnecting. Used by `local` (normal + provider), `proxy` in `main.rs`, and the UDP upgrade path in `secret.rs`.
-- **`auth.rs`** — `Authenticator`: optional HMAC-SHA256 challenge/response, run **once** on the control substream.
-- **`main.rs`** — clap CLI (`local` / `proxy` / `server` / `transfer` / `test-udp`). All client-side `--to` flags now default to `https://bore.0912345.xyz`; explicit `--to` and `BORE_SERVER` still override. `transfer listener|sender` exposes `--transfer-id` (alias `--tcp-secret-id`), `--relay-only`, the NAT knobs (`--stun-server`, `--upnp`, `--try-port-prediction`, `--nat-udp-preferred-port`, `--nat-udp-release-timeout`), relay `--carriers`, listener collision policy (`--overwrite` / `--rename`), sender filesystem controls (`--parallel`, `--symlinks`, `--devices`) and `--output` for `stdin`. `test-udp` without `--tcp-secret-id` is the standalone NAT/UDP diagnostic (`--to`/`--stun-server`) → `holepunch::diagnose`; with `--tcp-secret-id` it runs `udp_diagnostic::run_peer_test`. Paired test flags: `--secret`, `--insecure`, `--upnp`, `--try-port-prediction`, `--nat-udp-preferred-port`, `--test-bandwidth` (alias `--test-bandwith`), and `--test-transfer-quota <SIZE>` parsed as bytes/KB/MB/GB/KiB/MiB/GiB (default 64MB). Flags also read env vars (`BORE_SERVER`, `BORE_SECRET`, `BORE_LOCAL_PORT`, `BORE_MIN_PORT`, `BORE_MAX_PORT`, `BORE_MAX_CONNS`, `BORE_CONTROL_PORT`, `BORE_BIND_DOMAIN`, `BORE_CERT_FILE`, `BORE_KEY_FILE`, `BORE_INSECURE`, `BORE_HTTPS`, `BORE_FORCE_HTTPS`, `BORE_AUTO_RECONNECT`, `BORE_TCP_SECRET_ID`, `BORE_LOCAL_PROXY_PORT`, `BORE_PREFER_UDP`, `BORE_STUN_SERVER`, `BORE_UDP`, `BORE_UPNP`, `BORE_TRY_PORT_PREDICTION`, `BORE_NAT_UDP_PORT`, `BORE_NAT_UDP_RELEASE_TIMEOUT`, `BORE_MAX_CONNS` also on `local`, `BORE_BASIC_AUTH` + `BORE_NOTES` + `BORE_CARRIERS` on `local`, `BORE_NOTES` on `proxy`, `BORE_ADMIN_TOKEN` + `BORE_MAX_CARRIERS` on `server`). New flags: `--basic-auth user:pass` (validated to contain `:`) and `--notes` on `local`; `--notes` on `proxy`; `--admin-token` on `server` (rejected if < 32 chars); notes are clamped to `MAX_NOTES_LEN` chars (`clamp_notes`). **Carrier pool**: `--carriers N` on `local` (env `BORE_CARRIERS`, default 1) — applies to **public tunnels** (server→client leg), **secret providers** (server→provider relay leg), and **`bore proxy`** consumers (consumer→server relay leg, also `--carriers`/`BORE_CARRIERS`). `--max-carriers N` on `server` (env `BORE_MAX_CARRIERS`, default `DEFAULT_MAX_CARRIERS`) caps the provider/public pools (the consumer opens its own connections, uncapped by this). The UDP **direct** path is unaffected by `--carriers` (it already uses independent native QUIC streams). Host-level congestion control (e.g. `sysctl net.ipv4.tcp_congestion_control=bbr`) is the recommended single-flow tuning — a per-socket `TCP_CONGESTION` flag would need `unsafe` (`setsockopt`), which the crate forbids. **Logging** (`init_logging`): `tracing_subscriber` with an `EnvFilter` — default `info`, `-v`/`-vv` raise to `debug`/`trace`, `RUST_LOG` overrides; logs to **stderr**, ANSI **only on a TTY** (clean under Docker/journald/redirection). **Graceful shutdown**: `run` races the command against `shutdown_signal` (Ctrl-C + SIGTERM) → clean exit with a log line. All flags use short `value_name`s so `--help` renders the same compact layout across subcommands.
-
-### Connection protocol (key flow to understand)
-
-1. Client dials `CONTROL_PORT` and opens the **control** substream. It sends `Hello(port)` **first** (this matters — see below), then, if a secret is set, completes the auth challenge/response. Server replies `Hello(actual_port)` (port 0 ⇒ probe up to 150 random ports, see `create_listener`).
-2. Server sends `Heartbeat` every 500ms on the control substream; if the send fails the client is gone and the tunnel (and its port) is torn down.
-3. For each external connection to the tunnel port, the server acquires a permit and opens a new **data** substream, writes a one-byte readiness marker (`mux::STREAM_READY`), and splices the external socket to the substream with `copy_bidirectional_with_sizes`.
-4. The client accepts the data substream, consumes the marker byte, dials the local service, and splices.
-
-**Secret tunnels** (role chosen by the first control message — `HelloSecret(id)` / `ConnectSecret(id)` instead of `Hello(port)`; ack is `ServerMessage::Ok`): the provider connection is registered in `providers[id]` and bound by no port. A consumer (`bore proxy`) opens one substream per local connection; the server reads its readiness marker, looks up the provider, opens a substream to it, and `copy_bidirectional`s the two substreams. Direction is inverted vs. the public-port path: here the **consumer opens** data substreams and the **server accepts** them.
-
-### UDP direct path (optional `udp` feature)
-
-Only for **secret tunnels** (provider+consumer both dial the server = rendezvous; the public-port path is not hole-punchable). When both ends pass `--udp` and the server runs `--udp`: each peer opens a UDP socket, learns its reflexive address via STUN (public default chain, provider-selected hint for consumers, or `--stun-server` override), and offers candidates over the control channel (`ClientMessage::UdpCandidateOffer`, with legacy `UdpCandidates` still accepted). The provider's selected STUN is stored server-side; consumers request it before gathering candidates and try it first, then continue through public/bore fallbacks if it fails. The server brokers (`secret::broker_udp`): it mints/reuses a stable provider nonce, tells the provider to punch (`ServerMessage::UdpPunch` via a per-provider `mpsc` channel held in `UdpRegistry`) and replies to the consumer with the provider's candidates plus selected-STUN metadata. Both punch; provider = QUIC server (`DirectListener`), consumer = QUIC client (`connect_direct`). On success the consumer routes each connection over its **own native QUIC bidi** on the authenticated `DirectConn` (provider serves each via the same generic `handle_connection` as relay, looping `accept_stream`); **any failure falls back to the relay** — the relay path is always available, so `--udp` never breaks a tunnel. The server-side brokering compiles without the feature (no `quinn`), so a lean server can rendezvous for `quinn`-enabled clients. The provider keeps a **persistent** `DirectListener` and re-punches its NAT toward each new/reconnecting consumer (`punch_via_endpoint`, since the raw socket is owned by quinn after setup); a **stable per-provider nonce** (in `UdpReg`) means every consumer derives the same token, so reconnecting and multiple consumers all work. **Reliability:** the consumer monitors `DirectConn::closed()` (a `spawn_closed_monitor` oneshot) in `Proxy::listen` — it resolves when the QUIC path dies (provider restart), so `listen` returns and `--auto-reconnect` re-negotiates (direct again, or relay). Detection is immediate on a graceful close (provider teardown calls `DirectListener::close`) and within the QUIC idle timeout (~10s, keep-alive 3s) on a hard kill. Server death is handled by the existing control-channel reconnect on both ends. **Relay→direct upgrade (non-blocking):** a consumer on the relay retries the direct negotiation with an exponential backoff (2s initial, 256s cap, reset on success). The upgrade uses `reconnect::Backoff::new_with(2, 256)` stored in `Proxy::upgrade_backoff`. The loop checks `backoff.peek()` every iteration; when the delay has elapsed it sends `UdpStunHintRequest`, advances the backoff via `next_delay()`, and spawns an `upgrade_task`. On success the backoff is reset to 2s; on failure the next retry uses the doubled delay (capped at 256s, ~4.3 min). The slow work (STUN gather, punch, QUIC dial) runs in the spawned task so `Proxy::listen`'s accept/forward loop **never stalls**; the loop owns `control` and only does quick control I/O, handing candidates to the task (`cand` channel) and routing the brokered `UdpPunch` back (a `oneshot`), then swapping the `DataPath` to `Direct(conn)` in place on success (`done` channel carries the `DirectConn`) — no dropped session. (`negotiate_direct_consumer` is the synchronous variant used only at startup in `Proxy::new`, where blocking is fine.) The consumer's QUIC dial (`holepunch::connect_direct`) tries all provider candidates **concurrently under one total `NETWORK_TIMEOUT` budget** (`futures_util::select_ok`), not a full timeout per candidate. Per-candidate errors are collected via `Arc<Mutex<Vec<(SocketAddr, String)>>>` and logged in the final `warn!` as structured `errors` field (e.g. `errors = ["addr1 → TimedOut", "addr2 → ConnectionRefused"]`). So the system converges to direct within the backoff window after the provider becomes reachable, and the operator sees exactly why each candidate failed.
-
-### Connection stability (long transfers)
-
-No timeout in the code closes an **established** data stream — `recv_timeout`/
-`connect_with_timeout`/the edge peek are all setup-only, and `copy_bidirectional`
-has no idle timeout. The mux carrier TCP is kept busy by the 500ms control
-heartbeat. `shared::tune_tcp` sets `TCP_NODELAY` + `SO_KEEPALIVE` (15s) on every
-proxied/control socket so middleboxes don't drop a long but quiet transfer
-(e.g. `tar | rclone rcat`). Apply `tune_tcp` to any new accepted/dialed socket.
-
-### Carrier pool (`--carriers N`) and native QUIC direct streams
-
-By default a tunnel multiplexes **all** data substreams (yamux) over **one** TCP
-connection. Under loss that means cross-connection head-of-line blocking (one flow's
-lost segment stalls every flow sharing the TCP) and a single congestion window.
-`--carriers N` opens **N parallel TCP carrier connections** and round-robins proxied
-connections across them, so a lost segment only stalls the ~1/N flows on that carrier
-and each carrier gets its own congestion window. It is the **concurrency**
-optimization (rclone parallel transfers, many web requests, streaming, S3/WebDAV) — a
-**single** bulk flow is one stream on one carrier and sees no change; for single-flow
-loss/high-BDP, tune the host (`sysctl net.ipv4.tcp_congestion_control=bbr`), not bore
-(per-socket `TCP_CONGESTION` would need `unsafe`).
-
-**Scope — all three relay legs** (the server stays in the relay data path, so this
-removes the single-TCP HOL/cwnd bottleneck on each leg; it does **not** reduce
-server bandwidth or bypass it):
-- **Public tunnel** (`bore local --carriers`): server→client leg. Server round-robins.
-- **Secret provider** (`bore local --tcp-secret-id --carriers`): server→provider
-  relay leg. Server round-robins (`Registry` holds an `Arc<CarrierPool>` per id).
-- **Secret consumer** (`bore proxy --carriers`): consumer→server relay leg. The
-  consumer opens N `ConnectSecret` connections and round-robins its `forward`s.
-
-Liveness: the control connection (carrier 0) carries the heartbeat; an extra carrier
-that drops is pruned and (public/provider) re-dialed on a 15s timer — losing one
-degrades to N-1, never breaks the tunnel.
-
-**The UDP direct path** (secret tunnels, `--udp`) does **not** use a carrier pool —
-it bypasses the server, so there is no relay leg to widen. Instead it multiplexes
-each proxied connection over its **own native QUIC stream** (`DirectConn::open_stream`),
-which QUIC keeps independently flow-controlled and loss-isolated — eliminating HOL on
-the direct path without any extra connections. `holepunch::transport_config` also
-sets the direct QUIC flow-control windows via named constants:
-`DIRECT_QUIC_STREAM_RECEIVE_WINDOW` (16 MiB),
-`DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` (64 MiB), and `DIRECT_QUIC_SEND_WINDOW`
-(64 MiB), requests `DIRECT_UDP_SOCKET_RECV_BUFFER`/`DIRECT_UDP_SOCKET_SEND_BUFFER`
-(16 MiB each) on every direct UDP socket, keeps `MAX_DIRECT_STREAMS` at 4096,
-uses `QUIC_KEEPALIVE`/`QUIC_MAX_IDLE` = 3s/10s, and uses
-`quinn::congestion::BbrConfig` for the direct path. If `test-udp --test-bandwidth`
-shows bulk-transfer stalls on high-BDP links, tune those constants first and
-balance throughput against memory. So `--udp` and `--carriers` are complementary:
-the former fixes the direct path, the latter the relay fallback.
-
-### Things to preserve when editing
-
-- **Client sends `Hello` before authenticating.** yamux opens substreams *lazily* — the peer sees nothing until the opener writes. The server speaks first during auth, so if the client opened the control substream and waited to read, neither side would ever see it (deadlock). Sending `Hello` first is the eager write that announces the substream. The server still authenticates before binding any port.
-- **The data substream's readiness marker is mandatory** for the same lazy-open reason: without it a connection whose local service speaks first (SSH/SMTP banners), or that sends no data, would never be established. Server writes `mux::STREAM_READY`; client reads exactly one byte before splicing.
-- **Half-closed streams must keep working** — `copy_bidirectional_with_sizes` propagates EOF/shutdown across the substream (regression tests: `half_closed_tcp_stream`, and `mux_*` in `tests/mux_test.rs`).
-- **`--max-conns`** bounds concurrently proxied connections via a semaphore; over the cap, new external connections are dropped. yamux's own stream limit is set generous so the semaphore is the real bound.
-- The control channel still caps JSON frames at `MAX_FRAME_LENGTH` (`very_long_frame` test).
-
-## Deployment & builds
-
-- `Dockerfile` produces a static (musl) binary in a `scratch` image. `build-base`
-  is installed so `ring` (TLS) compiles on Alpine.
-- **`justfile`** (`just --list`): `build-amd64`/`build-arm64` (Linux, via
-  `docker buildx --platform`), `macos-m5`/`windows-amd64` (via `cargo-zigbuild`,
-  `docker/Dockerfile.cross`), `android-arm64` (via the Android NDK,
-  `docker/Dockerfile.android` — zig can't build `ring` for Android). All write to
-  `./bin/` (gitignored). `push` builds + pushes a multi-arch (amd64+arm64) image;
-  set `repo`. `_builder` creates a docker-container buildx builder; `setup-qemu`
-  registers binfmt for arm64 emulation.
-- **`docker/docker-compose.{server,client,secret-proxy}.yml`**: ready-to-run
-  compose files. Server uses a bridge network with explicit port forwards
-  (control port + tunnel range; the scheme depends on the cert, not the port —
-  `80`=plain, `443`=TLS); client and secret-proxy use `network_mode: host`. All
-  env vars present (optional ones commented). UDP direct paths are enabled
-  (`BORE_UDP=true` on the server with a `7835/udp` forward, `BORE_PREFER_UDP=true`
-  on client/proxy); see the server file's NAT caveat about bridge vs host.
-- **CI/release split.** `ci.yml` and `mean_bean_ci.yml` gate quality on the
-  main/dev branches (plus pull requests); `mean_bean_deploy.yml` and `docker.yml`
-  run on **any branch** push (plus `v*` tags). `ci.yml` (host: fmt/clippy/build/test
-  `--all-features` + audit) and `mean_bean_ci.yml` (cross build with `udp` + test
-  relay-only) gate quality.
-  `mean_bean_deploy.yml` produces a **GitHub Release** per push — a `create-release`
-  job makes it (named `<branch>-<sha7>`, or the tag; branch builds are pre-releases,
-  only tags become "latest") via `softprops/action-gh-release`, then the matrix
-  jobs (macOS×2, Linux×7, Windows×2, Android) upload each binary as a release asset
-  (`bore-<name>-<target>.{tar.gz,zip}`). `docker.yml` builds+pushes an **amd64-only**
-  image to GHCR Packages, tagged by branch and sha (arm64 was dropped — QEMU
-  emulation cost ~20 min; `just push` still does multi-arch locally). `ci/version.bash`
-  computes the release name/tag. Releases need a git tag, so branch builds create a
-  lightweight tag `<branch>-<sha7>` — this accumulates tags/releases per push (prune
-  if noisy); the created tag doesn't match `v*` and the `GITHUB_TOKEN` can't
-  re-trigger workflows, so there is no trigger loop.
+**Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
+(`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

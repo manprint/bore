@@ -10,6 +10,8 @@ BORE_ANDROID="https://github.com/manprint/bore/releases/latest/download/bore-aar
 
 USER_INSTALL_PATH="$HOME/.bin"
 INSTALL_PATH="${INSTALL_PATH:-$USER_INSTALL_PATH}"
+die() { echo "ERROR: $*" >&2; exit 1; }
+
 # Create a safe temporary directory; fall back to /tmp when mktemp variants differ
 TMPDIR="$(mktemp -d 2>/dev/null || mktemp -d -t bore 2>/dev/null || printf '/tmp/bore-install-%s' "$$")"
 if [[ -z "${TMPDIR:-}" || ! -d "$TMPDIR" ]]; then
@@ -24,8 +26,6 @@ cleanup() {
 }
 
 trap cleanup EXIT
-
-die() { echo "ERROR: $*" >&2; exit 1; }
 
 detect_arch() {
     local arch
@@ -116,6 +116,78 @@ download() {
     fi
 }
 
+detect_shell_rc() {
+    local shell_base bash_rc zsh_rc
+
+    bash_rc="$HOME/.bashrc"
+    zsh_rc="$HOME/.zshrc"
+    shell_base="${SHELL##*/}"
+
+    case "$shell_base" in
+        bash)
+            [[ -f "$bash_rc" ]] && { printf '%s\n' "$bash_rc"; return 0; }
+            [[ -f "$zsh_rc" ]] && { printf '%s\n' "$zsh_rc"; return 0; }
+            ;;
+        zsh)
+            [[ -f "$zsh_rc" ]] && { printf '%s\n' "$zsh_rc"; return 0; }
+            [[ -f "$bash_rc" ]] && { printf '%s\n' "$bash_rc"; return 0; }
+            ;;
+        *)
+            [[ -f "$bash_rc" ]] && { printf '%s\n' "$bash_rc"; return 0; }
+            [[ -f "$zsh_rc" ]] && { printf '%s\n' "$zsh_rc"; return 0; }
+            ;;
+    esac
+
+    return 1
+}
+
+rc_has_install_path() {
+    local rc_file="$1" install_path="$2" home_prefix home_relative
+
+    if grep -Fq "$install_path" "$rc_file"; then
+        return 0
+    fi
+
+    home_prefix="${HOME%/}"
+    case "$install_path" in
+        "$home_prefix"/*)
+            home_relative="${install_path#"$home_prefix"/}"
+            if grep -Fq "\$HOME/$home_relative" "$rc_file" || grep -Fq "~/$home_relative" "$rc_file"; then
+                return 0
+            fi
+            ;;
+    esac
+
+    return 1
+}
+
+append_path_to_shell_rc() {
+    local rc_file="$1" install_path="$2"
+
+    {
+        printf '\n# Added by bore installer\n'
+        printf 'export PATH="$PATH:%s"\n' "$install_path"
+    } >> "$rc_file" || die "Failed to update $rc_file"
+}
+
+update_shell_path() {
+    local install_path="$1" rc_file
+
+    if ! rc_file="$(detect_shell_rc)"; then
+        echo "  PATH: nessun file ~/.bashrc o ~/.zshrc trovato, salto l'aggiornamento automatico"
+        return 1
+    fi
+
+    if rc_has_install_path "$rc_file" "$install_path"; then
+        echo "  PATH: già presente in $rc_file, nessuna modifica"
+        return 0
+    fi
+
+    append_path_to_shell_rc "$rc_file" "$install_path"
+    echo "  PATH: aggiunto automaticamente a $rc_file"
+    return 0
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 main() {
     local os arch url dest
@@ -165,11 +237,7 @@ main() {
     echo
     echo "✓ bore installed at $INSTALL_PATH/bore"
     "$INSTALL_PATH/bore" --version
-    echo "Add $INSTALL_PATH to your PATH if it's not already there."
-    echo "Command to add:"
-    echo "(bash)  export PATH=\"\$PATH:$INSTALL_PATH\" >> ~/.bashrc"
-    echo "(zsh)   export PATH=\"\$PATH:$INSTALL_PATH\" >> ~/.zshrc"
-    echo "(fish)  set -U fish_user_paths \$fish_user_paths $INSTALL_PATH"
+    update_shell_path "$INSTALL_PATH" || true
     echo "Done!"
 }
 

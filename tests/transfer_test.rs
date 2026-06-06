@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -2158,5 +2159,184 @@ async fn transfer_persistent_listener_collision_continues() -> Result<()> {
 
     let _ = fs::remove_dir_all(&source_root).await;
     let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+// ── Bug regressions ──────────────────────────────────────────────────────────
+
+/// Bug 002: multi-source without --output must place each source directly in
+/// dest_root, not inside a wrapper directory named after the first source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_multi_source_flat_no_output_over_relay() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("multi-flat-source");
+    let dest_root = temp_path("multi-flat-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+
+    let file1 = source_root.join("alpha.txt");
+    write_file(&file1, b"alpha content").await?;
+
+    let dir1 = source_root.join("sub_dir");
+    fs::create_dir_all(&dir1).await?;
+    write_file(&dir1.join("nested.txt"), b"nested content").await?;
+
+    let file2 = source_root.join("beta.txt");
+    write_file(&file2, b"beta content").await?;
+
+    let transfer_id = format!("multi-flat-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                1,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    bore_cli::transfer::run_sender(SenderOptions {
+        to: "localhost".to_string(),
+        secret: Some("transfer-secret".to_string()),
+        insecure: false,
+        transfer_id: Some(transfer_id),
+        sources: vec![file1, dir1, file2],
+        source_files: vec![],
+        ask_confirm: false,
+        output: None,
+        relay_only: true,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        nat_udp_preferred_port: 0,
+        nat_udp_release_timeout: 0,
+        carriers: 1,
+        parallel: 0,
+        symlinks: SymlinkMode::Exclude,
+        devices: DeviceMode::Exclude,
+    })
+    .await?;
+    listener.await.context("listener task join failed")??;
+
+    // Each source must land directly in dest_root, not inside a wrapper dir.
+    assert_eq!(
+        read_file(&dest_root.join("alpha.txt")).await?,
+        b"alpha content",
+        "alpha.txt must be at dest_root level"
+    );
+    assert_eq!(
+        read_file(&dest_root.join("beta.txt")).await?,
+        b"beta content",
+        "beta.txt must be at dest_root level"
+    );
+    assert_eq!(
+        read_file(&dest_root.join("sub_dir/nested.txt")).await?,
+        b"nested content",
+        "sub_dir/nested.txt must be at dest_root/sub_dir level"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+/// Bug 003: when no listener is running, the sender must exit with a helpful
+/// error message rather than the generic "unexpected EOF on transfer stream".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_sender_fails_with_helpful_message_when_no_listener() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("no-listener-source");
+    fs::create_dir_all(&source_root).await?;
+    let source_file = source_root.join("data.txt");
+    write_file(&source_file, b"payload").await?;
+
+    let transfer_id = format!("no-listener-{}", Uuid::new_v4());
+    // Intentionally do NOT start a listener.
+    let err = bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        source_file,
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await
+    .expect_err("sender must fail when no listener is running");
+
+    let err_str = format!("{err}");
+    assert!(
+        err_str.contains("listener did not respond") || err_str.contains("transfer listener"),
+        "error should mention the listener, got: {err_str}"
+    );
+    assert!(
+        !err_str.contains("unexpected EOF on transfer stream"),
+        "must not expose the raw EOF error to the user, got: {err_str}"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    Ok(())
+}
+
+/// Bug 001: --ask-confirm must not silently cancel when stdin is not a tty.
+/// In non-interactive test environments it must return a clear error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_ask_confirm_returns_err_when_no_tty_available() -> Result<()> {
+    // Skip when stdin IS a real terminal: we cannot test the non-tty path then.
+    if std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+
+    let source_root = temp_path("ask-confirm-src");
+    fs::create_dir_all(&source_root).await?;
+    let source_file = source_root.join("file.txt");
+    write_file(&source_file, b"data").await?;
+
+    let result = bore_cli::transfer::run_sender(SenderOptions {
+        to: "localhost".to_string(),
+        secret: None,
+        insecure: true,
+        transfer_id: Some("ask-confirm-test".to_string()),
+        sources: vec![source_file],
+        source_files: vec![],
+        ask_confirm: true,
+        output: None,
+        relay_only: true,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        nat_udp_preferred_port: 0,
+        nat_udp_release_timeout: 0,
+        carriers: 1,
+        parallel: 0,
+        symlinks: SymlinkMode::Exclude,
+        devices: DeviceMode::Exclude,
+    })
+    .await;
+
+    let err = result.expect_err("must fail when no tty is available");
+    let err_str = format!("{err:#}");
+    // After the fix: error explains the tty requirement.
+    // Before the fix: Ok(false) → "transfer cancelled by user" (misleading).
+    assert!(
+        err_str.contains("terminal") || err_str.contains("tty"),
+        "error must explain the tty requirement, got: {err_str}"
+    );
+    assert!(
+        !err_str.contains("transfer cancelled by user"),
+        "must not silently cancel, got: {err_str}"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
     Ok(())
 }

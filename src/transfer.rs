@@ -39,6 +39,7 @@ const LOCAL_CONNECT_RETRIES: usize = 50;
 const LOCAL_CONNECT_DELAY: Duration = Duration::from_millis(20);
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
 const RESUME_STATE_FILE: &str = "state.json";
+const MULTI_SOURCE_STAGE_ROOT: &str = ".bore-multi-root";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
 pub enum CollisionPolicy {
@@ -178,6 +179,10 @@ struct BeginFrame {
     total_bytes: Option<u64>,
     transport: TransportMode,
     requested_parallel: u16,
+    /// True when multiple sources are sent without an explicit --output name.
+    /// The receiver commits each top-level entry directly into dest_root.
+    #[serde(default)]
+    multi_source: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -315,6 +320,7 @@ struct PlannedTransfer {
     entries: Vec<PlannedEntry>,
     total_bytes: Option<u64>,
     parallel: u16,
+    multi_source: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -339,6 +345,7 @@ struct ReceiverPlan {
     resume: Option<Arc<ResumeShared>>,
     resumed_bytes: u64,
     resume_plan: Vec<ResumeFilePlan>,
+    multi_source: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -728,6 +735,7 @@ async fn send_transfer(
             total_bytes: plan.total_bytes,
             transport,
             requested_parallel: plan.parallel,
+            multi_source: plan.multi_source,
         }),
     )
     .await?;
@@ -742,16 +750,20 @@ async fn send_transfer(
     }
     send_frame(&mut control, &Frame::ManifestDone).await?;
 
-    let (final_name, parallel, resumed_bytes, resume_plan) =
-        match expect_frame(&mut control).await? {
-            Frame::ManifestAccepted {
-                final_name,
-                parallel,
-                resumed_bytes,
-                resume,
-            } => (final_name, parallel, resumed_bytes, resume),
-            other => bail!("unexpected manifest response: {other:?}"),
-        };
+    // Bug 003: on EOF after sending the manifest the listener is not running.
+    // Peer-sent error frames still propagate as "peer reported an error: ..." so
+    // tests that assert specific error messages (e.g. "destination already exists")
+    // are unaffected.
+    let accepted = recv_manifest_accepted(&mut control, &plan.transfer_id).await?;
+    let (final_name, parallel, resumed_bytes, resume_plan) = match accepted {
+        Frame::ManifestAccepted {
+            final_name,
+            parallel,
+            resumed_bytes,
+            resume,
+        } => (final_name, parallel, resumed_bytes, resume),
+        other => bail!("unexpected manifest response: {other:?}"),
+    };
     info!(
         transfer_id = %plan.transfer_id,
         final_name = %display_component(&final_name),
@@ -1333,8 +1345,13 @@ async fn receive_manifest(
             resume: None,
             resumed_bytes: 0,
             resume_plan: Vec::new(),
+            multi_source: false,
         });
     }
+
+    // For multi_source (no --output), stage inside a hidden sub-directory so that
+    // commit_stage can rename each top-level child individually into dest_root.
+    let multi_source = begin.multi_source;
 
     let stage_dir = resume_state_dir(dest_root, &begin.transfer_id);
     let state_file = stage_dir.join(RESUME_STATE_FILE);
@@ -1371,9 +1388,17 @@ async fn receive_manifest(
         fs::create_dir_all(&stage_dir)
             .await
             .with_context(|| format!("failed to create state directory {}", stage_dir.display()))?;
-        let requested = decode_component(&begin.root_name);
-        let final_name_local = resolve_final_name_local(dest_root, &requested, collision).await?;
-        let final_name = encode_component_os(&final_name_local);
+        let (final_name, final_name_local) = if multi_source {
+            // Use a fixed staging sub-dir; final_path will be dest_root itself.
+            let name = OsString::from(MULTI_SOURCE_STAGE_ROOT);
+            let encoded = encode_component_os(OsStr::new(MULTI_SOURCE_STAGE_ROOT));
+            (encoded, name)
+        } else {
+            let requested = decode_component(&begin.root_name);
+            let local = resolve_final_name_local(dest_root, &requested, collision).await?;
+            let encoded = encode_component_os(&local);
+            (encoded, local)
+        };
         let state = ResumeState {
             protocol_version: PROTOCOL_VERSION,
             transfer_id: begin.transfer_id.clone(),
@@ -1413,17 +1438,26 @@ async fn receive_manifest(
         persist_lock: Arc::new(AsyncMutex::new(())),
     });
 
+    // For multi_source, final_path is dest_root (already exists); commit_stage
+    // will move individual children rather than renaming the whole stage_root.
+    let final_path = if multi_source {
+        dest_root.to_path_buf()
+    } else {
+        dest_root.join(&final_name_local)
+    };
+
     Ok(ReceiverPlan {
         begin,
         entries,
         final_name,
-        final_path: dest_root.join(final_name_local),
+        final_path,
         stage_dir,
         stage_root,
         _manifest_hash: manifest_hash,
         resume: Some(resume),
         resumed_bytes,
         resume_plan,
+        multi_source,
     })
 }
 
@@ -1644,6 +1678,52 @@ async fn verify_summary(plan: &ReceiverPlan) -> Result<TransferSummary> {
 }
 
 async fn commit_stage(plan: &ReceiverPlan, collision: CollisionPolicy) -> Result<()> {
+    if plan.multi_source {
+        // Flat multi-source: move each top-level child of stage_root into dest_root.
+        let dest_root = &plan.final_path; // set to dest_root in receive_manifest
+        let mut read_dir = fs::read_dir(&plan.stage_root).await.with_context(|| {
+            format!(
+                "failed to list multi-source stage {}",
+                plan.stage_root.display()
+            )
+        })?;
+        while let Some(entry) = read_dir.next_entry().await? {
+            let name = entry.file_name();
+            let src = plan.stage_root.join(&name);
+            let dst = dest_root.join(&name);
+            if fs::try_exists(&dst).await? {
+                match collision {
+                    CollisionPolicy::Fail | CollisionPolicy::Rename => {
+                        bail!("destination already exists: {}", dst.display());
+                    }
+                    CollisionPolicy::Overwrite => {
+                        let backup = plan
+                            .stage_dir
+                            .join(format!("overwrite-backup-{}", name.to_string_lossy()));
+                        fs::rename(&dst, &backup).await.with_context(|| {
+                            format!("failed to stage existing destination {}", dst.display())
+                        })?;
+                        if let Err(err) = fs::rename(&src, &dst).await {
+                            let _ = fs::rename(&backup, &dst).await;
+                            return Err(err).with_context(|| {
+                                format!("failed to commit staged item to {}", dst.display())
+                            });
+                        }
+                        remove_any(&backup).await?;
+                    }
+                }
+            } else {
+                fs::rename(&src, &dst).await.with_context(|| {
+                    format!("failed to commit staged item to {}", dst.display())
+                })?;
+            }
+        }
+        if fs::try_exists(&plan.stage_dir).await? {
+            let _ = fs::remove_dir_all(&plan.stage_dir).await;
+        }
+        return Ok(());
+    }
+
     if fs::try_exists(&plan.final_path).await? {
         match collision {
             CollisionPolicy::Fail | CollisionPolicy::Rename => {
@@ -1739,6 +1819,36 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn read_confirmation_line() -> Result<String> {
+    let mut input = String::new();
+    // Try /dev/tty first so that confirmation works even when bore is invoked
+    // via `curl | bash` (where stdin is the pipe, not the terminal).
+    #[cfg(unix)]
+    {
+        if let Ok(tty) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+        {
+            std::io::BufReader::new(tty)
+                .read_line(&mut input)
+                .context("failed to read confirmation from /dev/tty")?;
+            return Ok(input);
+        }
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "--ask-confirm requires an interactive terminal; \
+             stdin is not a tty and /dev/tty is unavailable"
+        );
+    }
+    std::io::stdin()
+        .lock()
+        .read_line(&mut input)
+        .context("failed to read confirmation")?;
+    Ok(input)
+}
+
 fn confirm_sources_sync(sources: &[PathBuf]) -> Result<bool> {
     use std::io::Write as _;
     println!("Sources to be transferred:");
@@ -1758,11 +1868,7 @@ fn confirm_sources_sync(sources: &[PathBuf]) -> Result<bool> {
     std::io::stdout()
         .flush()
         .context("failed to flush stdout")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut input)
-        .context("failed to read confirmation")?;
+    let input = read_confirmation_line()?;
     Ok(input.trim().eq_ignore_ascii_case("y"))
 }
 
@@ -1774,10 +1880,13 @@ fn scan_multi_filesystem_transfer(
     devices: DeviceMode,
     parallel: u16,
 ) -> Result<PlannedTransfer> {
-    let root_name = if let Some(out) = output {
-        encode_root_name(&out)?
+    // When --output is provided, wrap everything in a named directory.
+    // Without --output, use flat mode: each source lands directly in dest_root.
+    let (root_name, multi_source) = if let Some(out) = output {
+        (encode_root_name(&out)?, false)
     } else {
-        source_file_name_string(&sources[0])?
+        // root_name is used only for display/hash; flat mode ignores it for paths.
+        (source_file_name_string(&sources[0])?, true)
     };
 
     let mut entries = Vec::new();
@@ -1827,6 +1936,7 @@ fn scan_multi_filesystem_transfer(
         entries,
         total_bytes: Some(total_bytes),
         parallel,
+        multi_source,
     })
 }
 
@@ -1874,6 +1984,7 @@ async fn plan_transfer(
                     }],
                     total_bytes: None,
                     parallel: 1,
+                    multi_source: false,
                 })
             }
             SenderSource::Filesystem(path) => spawn_blocking(move || {
@@ -1930,6 +2041,7 @@ fn scan_filesystem_transfer(
         entries,
         total_bytes: Some(total_bytes),
         parallel,
+        multi_source: false,
     })
 }
 
@@ -2349,6 +2461,20 @@ async fn expect_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Frame> {
         Some(Frame::Error { message }) => bail!("peer reported an error: {message}"),
         Some(frame) => Ok(frame),
         None => bail!("unexpected EOF on transfer stream"),
+    }
+}
+
+/// Like `expect_frame` but replaces the generic EOF error with a targeted message
+/// that tells the user the listener is not running — without swallowing peer-sent
+/// error frames, which still propagate as "peer reported an error: …".
+async fn recv_manifest_accepted(stream: &mut TcpStream, transfer_id: &str) -> Result<Frame> {
+    match recv_frame(stream).await? {
+        Some(Frame::Error { message }) => bail!("peer reported an error: {message}"),
+        Some(frame) => Ok(frame),
+        None => bail!(
+            "listener did not respond to transfer manifest — \
+             is 'bore transfer listener' running with --transfer-id {transfer_id}?"
+        ),
     }
 }
 
@@ -3028,6 +3154,346 @@ mod tests {
                 OsString::from(format!("_bore_utf8_{}", hex::encode(reserved.as_bytes())));
             assert_eq!(decode_component(&encoded), expected);
         }
+    }
+
+    // ── chunk math ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn chunk_count_zero_byte_file() {
+        assert_eq!(chunk_count_for(0), 0);
+    }
+
+    #[test]
+    fn chunk_count_exactly_one_chunk() {
+        assert_eq!(chunk_count_for(CHUNK_SIZE as u64), 1);
+    }
+
+    #[test]
+    fn chunk_count_one_byte_over_chunk() {
+        assert_eq!(chunk_count_for(CHUNK_SIZE as u64 + 1), 2);
+    }
+
+    #[test]
+    fn chunk_count_large_file() {
+        let size = CHUNK_SIZE as u64 * 5 + 1;
+        assert_eq!(chunk_count_for(size), 6);
+    }
+
+    #[test]
+    fn chunk_len_first_chunk_full_size() {
+        let size = CHUNK_SIZE as u64 * 3;
+        assert_eq!(chunk_len(size, 0), CHUNK_SIZE as u64);
+    }
+
+    #[test]
+    fn chunk_len_last_chunk_partial() {
+        let partial: u64 = 42;
+        let size = CHUNK_SIZE as u64 + partial;
+        assert_eq!(chunk_len(size, 1), partial);
+    }
+
+    #[test]
+    fn chunk_len_zero_byte_file_is_zero() {
+        assert_eq!(chunk_len(0, 0), 0);
+    }
+
+    // ── manifest validation ───────────────────────────────────────────────────
+
+    fn make_begin(root_source: RootSourceKind) -> BeginFrame {
+        BeginFrame {
+            protocol_version: PROTOCOL_VERSION,
+            transfer_id: "test-id".to_string(),
+            root_name: encode_component_os(OsStr::new("root")),
+            root_source,
+            total_entries: 0,
+            total_bytes: None,
+            transport: TransportMode {
+                direct_udp: false,
+                relay_tls: false,
+            },
+            requested_parallel: 1,
+            multi_source: false,
+        }
+    }
+
+    fn make_file_entry(id: u32, rel_path: &str, size: u64) -> ManifestEntry {
+        ManifestEntry {
+            id,
+            rel_path: rel_path.to_string(),
+            kind: EntryKind::RegularFile,
+            size: Some(size),
+            full_hash: Some("aa".repeat(32)),
+            chunk_count: chunk_count_for(size),
+            symlink_target: None,
+            device: None,
+            mode: None,
+        }
+    }
+
+    fn make_dir_entry(id: u32, rel_path: &str) -> ManifestEntry {
+        ManifestEntry {
+            id,
+            rel_path: rel_path.to_string(),
+            kind: EntryKind::Directory,
+            size: None,
+            full_hash: None,
+            chunk_count: 0,
+            symlink_target: None,
+            device: None,
+            mode: None,
+        }
+    }
+
+    #[test]
+    fn validate_manifest_single_file_ok() {
+        let begin = make_begin(RootSourceKind::Filesystem);
+        let entries = vec![make_file_entry(0, "", 100)];
+        assert!(validate_manifest(&begin, &entries).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_dir_with_child_ok() {
+        let begin = make_begin(RootSourceKind::Filesystem);
+        let entries = vec![make_dir_entry(0, ""), make_file_entry(1, "child.txt", 10)];
+        assert!(validate_manifest(&begin, &entries).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_empty() {
+        let begin = make_begin(RootSourceKind::Filesystem);
+        assert!(validate_manifest(&begin, &[]).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_non_empty_root_rel_path() {
+        let begin = make_begin(RootSourceKind::Filesystem);
+        let entries = vec![make_file_entry(0, "bad", 10)];
+        assert!(validate_manifest(&begin, &entries).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_duplicate_ids() {
+        let begin = make_begin(RootSourceKind::Filesystem);
+        let entries = vec![
+            make_dir_entry(0, ""),
+            make_file_entry(0, "child.txt", 10), // same id
+        ];
+        assert!(validate_manifest(&begin, &entries).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_duplicate_paths() {
+        let begin = make_begin(RootSourceKind::Filesystem);
+        let entries = vec![
+            make_dir_entry(0, ""),
+            make_file_entry(1, "child.txt", 10),
+            make_file_entry(2, "child.txt", 20), // duplicate path
+        ];
+        assert!(validate_manifest(&begin, &entries).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_file_missing_size() {
+        let begin = make_begin(RootSourceKind::Filesystem);
+        let mut entry = make_file_entry(0, "", 100);
+        entry.size = None;
+        let entries = vec![entry];
+        assert!(validate_manifest(&begin, &entries).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_wrong_chunk_count() {
+        let begin = make_begin(RootSourceKind::Filesystem);
+        let mut entry = make_file_entry(0, "", 100);
+        entry.chunk_count = 99; // wrong
+        let entries = vec![entry];
+        assert!(validate_manifest(&begin, &entries).is_err());
+    }
+
+    // ── manifest hash ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn manifest_hash_is_deterministic() {
+        let entries = vec![make_dir_entry(0, ""), make_file_entry(1, "f.txt", 10)];
+        let h1 = manifest_hash("root", RootSourceKind::Filesystem, &entries).unwrap();
+        let h2 = manifest_hash("root", RootSourceKind::Filesystem, &entries).unwrap();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn manifest_hash_differs_for_different_entries() {
+        let a = vec![make_dir_entry(0, ""), make_file_entry(1, "a.txt", 10)];
+        let b = vec![make_dir_entry(0, ""), make_file_entry(1, "b.txt", 10)];
+        let ha = manifest_hash("root", RootSourceKind::Filesystem, &a).unwrap();
+        let hb = manifest_hash("root", RootSourceKind::Filesystem, &b).unwrap();
+        assert_ne!(ha, hb);
+    }
+
+    // ── summary ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn summary_counts_entries_correctly() {
+        let entries = vec![
+            make_dir_entry(0, ""),
+            make_file_entry(1, "a.txt", 100),
+            make_file_entry(2, "b.txt", 200),
+        ];
+        let summary = summary_from_materialized_entries(&entries).unwrap();
+        assert_eq!(summary.regular_files, 2);
+        assert_eq!(summary.directories, 1);
+        assert_eq!(summary.total_bytes, 300);
+    }
+
+    #[test]
+    fn summary_is_deterministic() {
+        let entries = vec![make_dir_entry(0, ""), make_file_entry(1, "f.txt", 10)];
+        let s1 = summary_from_materialized_entries(&entries).unwrap();
+        let s2 = summary_from_materialized_entries(&entries).unwrap();
+        assert_eq!(s1.transfer_hash, s2.transfer_hash);
+    }
+
+    // ── build_chunk_tasks ─────────────────────────────────────────────────────
+
+    #[test]
+    fn build_chunk_tasks_generates_tasks_for_regular_files() {
+        let src = PathBuf::from("/tmp/dummy");
+        let plan = PlannedTransfer {
+            transfer_id: "t".to_string(),
+            root_name: encode_component_os(OsStr::new("root")),
+            root_source: RootSourceKind::Filesystem,
+            entries: vec![
+                PlannedEntry {
+                    manifest: make_dir_entry(0, ""),
+                    source_path: None,
+                },
+                PlannedEntry {
+                    manifest: make_file_entry(1, "f.txt", CHUNK_SIZE as u64 + 1),
+                    source_path: Some(src.clone()),
+                },
+            ],
+            total_bytes: None,
+            parallel: 1,
+            multi_source: false,
+        };
+        let tasks = build_chunk_tasks(&plan, &[]).unwrap();
+        assert_eq!(tasks.len(), 2, "two chunks: full + partial");
+        assert_eq!(tasks[0].chunk_index, 0);
+        assert_eq!(tasks[1].chunk_index, 1);
+    }
+
+    #[test]
+    fn build_chunk_tasks_skips_resumed_chunks() {
+        let src = PathBuf::from("/tmp/dummy");
+        let plan = PlannedTransfer {
+            transfer_id: "t".to_string(),
+            root_name: encode_component_os(OsStr::new("root")),
+            root_source: RootSourceKind::Filesystem,
+            entries: vec![PlannedEntry {
+                manifest: make_file_entry(0, "", CHUNK_SIZE as u64 * 3),
+                source_path: Some(src.clone()),
+            }],
+            total_bytes: None,
+            parallel: 1,
+            multi_source: false,
+        };
+        let resume = vec![ResumeFilePlan {
+            entry_id: 0,
+            completed_chunks: vec![0, 2], // chunks 0 and 2 already done
+        }];
+        let tasks = build_chunk_tasks(&plan, &resume).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].chunk_index, 1);
+    }
+
+    // ── multi_source flag ─────────────────────────────────────────────────────
+
+    #[test]
+    fn scan_multi_filesystem_sets_multi_source_without_output() {
+        // Create two temp files to scan
+        let dir =
+            std::env::temp_dir().join(format!("bore-test-scan-multi-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        std::fs::write(&f1, b"aa").unwrap();
+        std::fs::write(&f2, b"bb").unwrap();
+
+        let plan = scan_multi_filesystem_transfer(
+            "tid".to_string(),
+            vec![f1, f2],
+            None, // no --output → flat mode
+            SymlinkMode::Exclude,
+            DeviceMode::Exclude,
+            1,
+        )
+        .unwrap();
+
+        assert!(
+            plan.multi_source,
+            "multi_source must be true without --output"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_multi_filesystem_clears_multi_source_with_output() {
+        let dir =
+            std::env::temp_dir().join(format!("bore-test-scan-output-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        std::fs::write(&f1, b"aa").unwrap();
+        std::fs::write(&f2, b"bb").unwrap();
+
+        let plan = scan_multi_filesystem_transfer(
+            "tid".to_string(),
+            vec![f1, f2],
+            Some(PathBuf::from("bundle")),
+            SymlinkMode::Exclude,
+            DeviceMode::Exclude,
+            1,
+        )
+        .unwrap();
+
+        assert!(
+            !plan.multi_source,
+            "multi_source must be false with --output"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── path helpers ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn encode_decode_relative_path_round_trip() {
+        let path = Path::new("dir/sub/file.txt");
+        let encoded = encode_relative_path(path).unwrap();
+        let decoded = decode_relative_path(&encoded).unwrap();
+        assert_eq!(decoded, path);
+    }
+
+    #[test]
+    fn encode_relative_path_empty_is_empty_string() {
+        let encoded = encode_relative_path(Path::new("")).unwrap();
+        assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn human_bytes_formats_correctly() {
+        assert_eq!(human_bytes(0), "0B");
+        assert_eq!(human_bytes(512), "512B");
+        assert_eq!(human_bytes(1024), "1.0KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0MiB");
+    }
+
+    #[test]
+    fn format_duration_short() {
+        assert_eq!(format_duration(5.5), "5.5s");
+    }
+
+    #[test]
+    fn format_duration_minutes() {
+        assert_eq!(format_duration(90.0), "1m30s");
     }
 
     #[cfg(windows)]

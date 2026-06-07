@@ -677,6 +677,23 @@ bore transfer listener --to https://bore.example.com --secret mysecret \
 ```
 
 ```shell
+# Liveness timeouts: reject if the sender doesn't confirm in 30 s; abort stalled
+# data within 20 s on both sides.
+bore transfer listener \
+  --secret mysecret \
+  --transfer-id nightly-backup \
+  --dest-path /srv/inbox \
+  --confirm-timeout 30 \
+  --stall-timeout 20
+
+bore transfer sender \
+  --secret mysecret \
+  --transfer-id nightly-backup \
+  --sources /home/alice/archive.tar.gz \
+  --stall-timeout 20
+```
+
+```shell
 # Special files on Unix.
 bore transfer sender \
   --to https://bore.example.com \
@@ -706,6 +723,11 @@ What the transfer command guarantees in V2:
   under the destination root and published only after the hashes match.
 - **Collision policy** is fail-safe by default. Use `--overwrite` or `--rename`
   on `bore transfer listener` to opt into replacement/renaming.
+- **Idempotent re-completion**: if the link drops after the receiver has committed
+  the data but before it can send the `Completed` acknowledgement, re-running the
+  same sender with the same `--transfer-id` and unchanged files is safe — the
+  receiver detects the committed marker and re-sends the acknowledgement without
+  re-writing any data.
 - **Parallel filesystem workers** via `--parallel N`. `--parallel 0` is
   automatic and currently resolves from `--carriers`, capped at 4 workers; with
   the default `--carriers 1`, automatic mode starts one worker. Explicit
@@ -744,6 +766,14 @@ Notes:
   receiver types `n`, a clean rejection message is sent to the sender.
   `--ask-confirm` on the listener is ignored for stdin transfers (the data stream
   starts immediately after the manifest; there is no safe pause point).
+- `--confirm-timeout <secs>` on the **listener** (default `120`, `0` = wait
+  forever) sets how long to wait for the operator to type `y`/`n` when
+  `--ask-confirm` is active. On timeout the transfer is rejected and the sender
+  receives a clear error.
+- `--stall-timeout <secs>` on both **listener** and **sender** (default `60`, `0`
+  = disabled) aborts the transfer if no progress is made on any data read or write
+  within the given window. Use `0` on very slow links or when your operating
+  system keepalives are sufficient.
 - `--persistent` on the listener keeps the listener alive after each transfer;
   errors from individual transfers are logged but do not kill the listener.
 - Cross-platform path handling is explicit, not lossy: Unix raw-byte path

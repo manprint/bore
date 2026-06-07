@@ -81,6 +81,8 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 | Resume rejected when manifest changed | `transfer_resume_rejects_changed_manifest_over_relay` | ✅ |
 | `build_chunk_tasks` skips already-completed chunks | unit test | ✅ |
 | `build_chunk_tasks` generates tasks for all chunks | unit test | ✅ |
+| Idempotent re-completion: link drop after commit → retry re-acks (F3) | `transfer_idempotent_recompletion_after_commit` | ✅ |
+| Stale committed marker (different content) starts fresh collision check | `transfer_committed_marker_mismatch_starts_fresh` | ✅ |
 
 ---
 
@@ -93,7 +95,34 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 
 ---
 
-## 8. Manifest & protocol
+## 8. Input hardening & invariants
+
+| Scenario | Test | Status |
+|---|---|---|
+| `tune_tcp` (TCP_NODELAY) applied to transfer sockets (F1) | `connect_local_sets_nodelay` (unit) | ✅ |
+| `validate_chunk_geometry` — valid first chunk accepted (F2) | unit test | ✅ |
+| `validate_chunk_geometry` — valid last partial chunk accepted (F2) | unit test | ✅ |
+| `validate_chunk_geometry` — chunk_index out of range rejected (F2) | unit test | ✅ |
+| `validate_chunk_geometry` — oversized len rejected (F2) | unit test | ✅ |
+| `validate_chunk_geometry` — offset mismatch rejected (F2) | unit test | ✅ |
+| `STREAM_CHUNK_MAX` equals `CHUNK_SIZE` (allocation bound consistency) | unit test | ✅ |
+
+---
+
+## 9. Liveness / stall detection
+
+| Scenario | Test | Status |
+|---|---|---|
+| `with_stall` fires error after timeout (F10) | `with_stall_fires_after_timeout` (unit) | ✅ |
+| `with_stall` disabled when secs=0 (F10) | `with_stall_zero_disables_timeout` (unit) | ✅ |
+| `with_stall` passes through Ok result | `with_stall_passes_through_ok` (unit) | ✅ |
+| `with_stall` propagates inner error | `with_stall_propagates_inner_error` (unit) | ✅ |
+| `--confirm-timeout` rejects on expiry + sender gets clear error (F6) | manual (requires `--ask-confirm` + TTY) | ⚠️ |
+| `--stall-timeout` aborts a stalled data path (F10) | manual (requires injected TCP pause) | ⚠️ |
+
+---
+
+## 10. Manifest & protocol
 
 | Scenario | Test | Status |
 |---|---|---|
@@ -112,7 +141,7 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 
 ---
 
-## 9. Path encoding
+## 11. Path encoding
 
 | Scenario | Test | Status |
 |---|---|---|
@@ -125,7 +154,7 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 
 ---
 
-## 10. User-experience / error paths (Bug regressions)
+## 12. User-experience / error paths (Bug regressions)
 
 | Scenario | Bug | Test | Status |
 |---|---|---|---|
@@ -138,7 +167,7 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 
 ---
 
-## 12. Receiver `--ask-confirm` (Feature 002)
+## 13. Receiver `--ask-confirm` (Feature 002)
 
 | Scenario | Test | Status |
 |---|---|---|
@@ -155,7 +184,7 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 
 ---
 
-## 13. Helpers / utilities
+## 14. Helpers / utilities
 
 | Scenario | Test | Status |
 |---|---|---|
@@ -170,8 +199,10 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 |---|---|
 | Windows symlinks | Platform-specific; not in CI |
 | Device transfer (char/block) in multi-source | Requires root; covered only for single-source |
-| Receiver `--ask-confirm` with real terminal + `y`/`n` input | Cannot automate tty input in tests |
+| Receiver `--ask-confirm` with real terminal + `y`/`n` input | Cannot automate tty input in automated tests |
 | Receiver `--ask-confirm` + stdin source full end-to-end | stdin transfer in integration tests requires subprocess I/O wiring |
+| `--confirm-timeout` end-to-end (F6) | Requires `--ask-confirm` + TTY; covered by `with_stall` unit tests + manual test |
+| `--stall-timeout` end-to-end data stall (F10) | Requires injected TCP pause; covered by `with_stall` unit tests + manual test |
 | Very large files (> 10 GiB) | Disk / time constraints in CI |
 | Network errors mid-transfer | Requires low-level TCP injection |
 | `rename_component` with > 9999 existing copies | Extreme edge case |
@@ -179,5 +210,5 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 
 ---
 
-*Updated: 2026-06-07 — after implementing receiver `--ask-confirm` (Feature 002).*
-*Test counts: 35 integration + 34 unit = 69 transfer-specific tests.*
+*Updated: 2026-06-07 — after production-hardening audit (F1-F10): tune_tcp invariant, input bounds, idempotent re-completion, stdin cleanup, liveness timeouts, persistent-mode drain, test seam centralization, progress seeding.*
+*Test counts: 37 integration + 74 unit = 111 transfer-specific tests. Two unit tests require a real TTY and are manual-only.*

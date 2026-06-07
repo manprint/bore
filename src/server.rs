@@ -1,6 +1,7 @@
 //! Server implementation for the `bore` service.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::{io, ops::RangeInclusive, sync::Arc, time::Duration};
 
@@ -28,6 +29,7 @@ use crate::shared::{
     CONTROL_PORT, NETWORK_TIMEOUT, PROXY_BUFFER_SIZE,
 };
 use crate::udp_diagnostic;
+use crate::vhost::{self, VhostRegistry};
 
 /// Default cap on the number of concurrently proxied connections per tunnel
 /// connection. Bounds memory and file-descriptor use under a connection flood.
@@ -100,6 +102,18 @@ pub struct Server {
     /// (and the HTTP detection on the control port), preserving the plain
     /// bore-protocol behaviour.
     admin_token: Option<String>,
+
+    /// Registry of live vhost providers, keyed by subdomain label.
+    vhost_registry: VhostRegistry,
+
+    /// Hot-swappable vhost config; `None` when vhost is not configured.
+    vhost_config: Option<vhost::SharedVhostConfig>,
+
+    /// Hot-swappable TLS acceptor for the vhost HTTPS frontend.
+    vhost_tls: Arc<std::sync::RwLock<Option<Arc<TlsAcceptor>>>>,
+
+    /// Path to the vhost config file, retained for the hot-reload task.
+    vhost_config_path: Option<PathBuf>,
 }
 
 impl Server {
@@ -124,6 +138,10 @@ impl Server {
             bind_tunnels: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             admin: AdminRegistry::default(),
             admin_token: None,
+            vhost_registry: VhostRegistry::default(),
+            vhost_config: None,
+            vhost_tls: Arc::new(std::sync::RwLock::new(None)),
+            vhost_config_path: None,
         }
     }
 
@@ -187,6 +205,44 @@ impl Server {
         self.admin.clone()
     }
 
+    /// Enable the vhost frontend with the given config.
+    ///
+    /// Loads the config once at startup; the hot-reload task updates it later.
+    /// Returns an error if the mode requires a cert that is not present.
+    pub fn set_vhost(&mut self, cfg: vhost::VhostConfig) -> Result<()> {
+        use crate::transport;
+        use crate::vhost::resolve_mode;
+        use std::sync::RwLock;
+
+        let cert_present = cfg.cert_file.is_some() && cfg.key_file.is_some();
+        let _ = resolve_mode(&cfg, cert_present)?; // fail fast on bad mode+cert combo
+
+        // Load TLS if cert+key are present.
+        let tls_acceptor: Option<Arc<TlsAcceptor>> = if cert_present {
+            let cert = cfg.cert_file.as_ref().unwrap();
+            let key = cfg.key_file.as_ref().unwrap();
+            let acceptor = transport::load_server_tls(
+                cert.to_str().unwrap_or_default(),
+                key.to_str().unwrap_or_default(),
+            )
+            .map(Arc::new)?;
+            Some(acceptor)
+        } else {
+            None
+        };
+
+        let shared_cfg = Arc::new(RwLock::new(Arc::new(cfg)));
+        let shared_tls = Arc::new(RwLock::new(tls_acceptor));
+        self.vhost_config = Some(shared_cfg);
+        self.vhost_tls = shared_tls;
+        Ok(())
+    }
+
+    /// Store the path to the vhost config file so the hot-reload task can poll it.
+    pub fn set_vhost_config_path(&mut self, path: PathBuf) {
+        self.vhost_config_path = Some(path);
+    }
+
     /// Start the server, listening for new connections.
     pub async fn listen(self) -> Result<()> {
         let this = Arc::new(self);
@@ -199,6 +255,90 @@ impl Server {
             udp = this.udp,
             "server listening"
         );
+
+        // When vhost is configured, spawn the HTTP and/or HTTPS frontend listeners.
+        if let Some(cfg_arc) = &this.vhost_config {
+            let cfg = cfg_arc.read().unwrap().clone();
+            let cert_present = cfg.cert_file.is_some() && cfg.key_file.is_some();
+            let mode = vhost::resolve_mode(&cfg, cert_present).unwrap_or(vhost::VhostMode::Http);
+            if mode.serves_http() {
+                let http_listener = TcpListener::bind((this.bind_tunnels, cfg.http_port)).await?;
+                let port = http_listener.local_addr()?.port();
+                info!(port, "vhost HTTP frontend listening");
+                let this2 = Arc::clone(&this);
+                tokio::spawn(async move {
+                    loop {
+                        match http_listener.accept().await {
+                            Ok((stream, _addr)) => {
+                                tune_tcp(&stream);
+                                let permit =
+                                    match Arc::clone(&this2.conn_permits).try_acquire_owned() {
+                                        Ok(p) => p,
+                                        Err(_) => continue,
+                                    };
+                                let this3 = Arc::clone(&this2);
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    if let Err(e) = vhost::handle_http(
+                                        stream,
+                                        &this3.vhost_registry,
+                                        &this3.vhost_config,
+                                        mode,
+                                    )
+                                    .await
+                                    {
+                                        trace!(%e, "vhost http connection closed");
+                                    }
+                                });
+                            }
+                            Err(err) => warn!(%err, "vhost HTTP accept error"),
+                        }
+                    }
+                });
+            }
+            if mode.serves_https() {
+                let https_listener = TcpListener::bind((this.bind_tunnels, cfg.https_port)).await?;
+                let port = https_listener.local_addr()?.port();
+                info!(port, "vhost HTTPS frontend listening");
+                let this2 = Arc::clone(&this);
+                tokio::spawn(async move {
+                    loop {
+                        match https_listener.accept().await {
+                            Ok((stream, _addr)) => {
+                                tune_tcp(&stream);
+                                let permit =
+                                    match Arc::clone(&this2.conn_permits).try_acquire_owned() {
+                                        Ok(p) => p,
+                                        Err(_) => continue,
+                                    };
+                                let this3 = Arc::clone(&this2);
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    if let Err(e) = vhost::handle_https(
+                                        stream,
+                                        &this3.vhost_registry,
+                                        &this3.vhost_tls,
+                                    )
+                                    .await
+                                    {
+                                        trace!(%e, "vhost https connection closed");
+                                    }
+                                });
+                            }
+                            Err(err) => warn!(%err, "vhost HTTPS accept error"),
+                        }
+                    }
+                });
+            }
+
+            // Hot-reload task: poll config + cert mtimes every 2s.
+            let this2 = Arc::clone(&this);
+            tokio::spawn(vhost::run_reload_task(
+                this2.vhost_config.clone(),
+                this2.vhost_tls.clone(),
+                this2.vhost_config_path.clone(),
+            ));
+        }
 
         // When UDP direct paths are enabled, run a STUN responder on the control
         // port over UDP so clients can discover their reflexive address without
@@ -391,6 +531,37 @@ impl Server {
                     peer,
                     notes,
                     self.udp_tuning,
+                )
+                .await
+            }
+            Some(ClientMessage::HelloVhost {
+                subdomain,
+                client_id,
+                notes,
+                basic_auth,
+                carriers,
+            }) => {
+                let Some(cfg) = self.vhost_config.clone() else {
+                    warn!("vhost not configured on this server");
+                    let _ = control
+                        .send(ServerMessage::Error("vhost not configured".into()))
+                        .await;
+                    return Ok(());
+                };
+                vhost::serve_vhost_provider(
+                    control,
+                    opener,
+                    self.vhost_registry.clone(),
+                    cfg,
+                    subdomain,
+                    client_id,
+                    self.admin.clone(),
+                    peer,
+                    notes,
+                    basic_auth,
+                    self.pending_carriers.clone(),
+                    self.max_carriers,
+                    carriers,
                 )
                 .await
             }

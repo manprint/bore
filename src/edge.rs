@@ -192,12 +192,12 @@ async fn gate_stream<S: EdgeIo + 'static>(
     }
 }
 
-fn looks_like_http(head: &[u8]) -> bool {
+pub(crate) fn looks_like_http(head: &[u8]) -> bool {
     HTTP_METHODS.iter().any(|method| head.starts_with(method))
 }
 
 /// Consume the HTTP request head and reply with a `308` redirect to `https://`.
-async fn redirect_to_https(
+pub(crate) async fn redirect_to_https(
     mut stream: TcpStream,
     port: u16,
     fallback_host: Option<&str>,
@@ -223,7 +223,7 @@ async fn redirect_to_https(
 }
 
 /// Read up to the end of the request headers (`\r\n\r\n`), capped.
-async fn read_request_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
+pub(crate) async fn read_request_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 512];
     loop {
@@ -240,7 +240,7 @@ async fn read_request_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
 }
 
 /// Extract the request-target (path) from the request line, defaulting to `/`.
-fn request_path(request: &[u8]) -> String {
+pub(crate) fn request_path(request: &[u8]) -> String {
     let line = request
         .split(|&b| b == b'\r' || b == b'\n')
         .next()
@@ -255,7 +255,7 @@ fn request_path(request: &[u8]) -> String {
 
 /// Determine the authority (`host[:port]`) for the redirect, preferring the
 /// request's `Host` header.
-fn host_authority(request: &[u8], port: u16, fallback_host: Option<&str>) -> String {
+pub(crate) fn host_authority(request: &[u8], port: u16, fallback_host: Option<&str>) -> String {
     let text = String::from_utf8_lossy(request);
     let host = text
         .lines()

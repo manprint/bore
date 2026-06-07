@@ -845,6 +845,102 @@ Paired mode also accepts `--upnp`, `--try-port-prediction`,
 `--nat-udp-preferred-port`, `--stun-server`, and `--insecure`, mirroring the
 direct-path options used by `local`/`proxy`.
 
+## Vhost — Subdomain Reverse Proxy
+
+`bore vhost` exposes a local HTTP(S) service at a public subdomain without allocating a dedicated TCP port:
+
+```shell
+bore vhost 127.0.0.1:8080 \
+  --subdomain myapp \
+  --id client-id \
+  --to bore.mydomain.com
+# → http://myapp.bore.mydomain.com   (or https:// when a wildcard cert is configured)
+```
+
+All subdomains share ports 80 and 443 on the server. The server reads the `Host` header (after optional TLS termination) and routes each connection to the registered provider for that subdomain.
+
+### DNS prerequisite
+
+Point a wildcard `A`/`AAAA` record at the server:
+```
+*.bore.mydomain.com  →  <server IP>
+  bore.mydomain.com  →  <server IP>
+```
+
+### Server configuration (`vhost.yml`)
+
+Enable the vhost frontend by passing `--vhost-config <path>` to `bore server`:
+
+```yaml
+base_domain: bore.mydomain.com
+
+# Frontend mode: http | https | both | redirect-https | auto (default)
+# 'auto' selects 'http' when no cert is provided, 'both' when one is.
+mode: auto
+
+http_port: 80     # default
+https_port: 443   # default
+
+# Optional TLS for HTTPS. Use a wildcard certificate (*.bore.mydomain.com).
+cert_file: /etc/bore/wildcard.crt
+key_file:  /etc/bore/wildcard.key
+
+# Optional default headers injected on every routed request.
+default_headers:
+  X-Forwarded-Proto: https
+
+# Optional reservations: lock a subdomain to a specific client id.
+reservations:
+  - subdomain: myapp
+    client_id:  my-client-id
+    headers:
+      X-App-Name: myapp   # merged over default_headers (this key wins)
+```
+
+Start the server:
+```shell
+bore server --vhost-config /etc/bore/vhost.yml
+```
+
+### Frontend modes
+
+| Mode | HTTP (port 80) | HTTPS (port 443) | Cert required |
+|---|---|---|---|
+| `http` | serves | — | no |
+| `https` | — | serves | yes |
+| `both` | serves | serves | yes |
+| `redirect-https` | 308 → https | serves | yes |
+| `auto` | serves | serves if cert present | no |
+
+### Hot reload
+
+The server polls `vhost.yml`, `cert_file`, and `key_file` every 2 seconds. On a detected mtime change it reloads atomically — in-flight connections are unaffected.
+
+### `bore vhost` flags
+
+| Flag | Description |
+|---|---|
+| `<TARGET>` | Local `host:port` to forward to (e.g. `127.0.0.1:8080`) |
+| `--subdomain` | Subdomain label to register |
+| `--id` | Client identifier for reservation matching |
+| `--to` | bore server address |
+| `--secret` | Optional server secret |
+| `--insecure` | Skip TLS cert verification on `https://` servers |
+| `--carriers N` | Parallel relay connections (default 1) |
+| `--basic-auth user:pass` | Tell the admin page this provider enforces Basic auth |
+| `--notes TEXT` | Free-form note on the admin status page |
+| `--auto-reconnect` | Reconnect automatically with backoff on disconnect |
+
+### Server-side overrides
+
+`bore server` accepts these flags in addition to `--vhost-config`:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--vhost-http-port N` | 80 | Override `http_port` from the config |
+| `--vhost-https-port N` | 443 | Override `https_port` from the config |
+| `--vhost-mode <mode>` | (from config) | Override `mode` from the config |
+
 ## Protocol
 
 There is a _control port_, `7835` by default (configurable with `--control-port`). The client opens a single connection to it — plain TCP, or TLS when reached via `https://` — and [multiplexes](https://github.com/hashicorp/yamux/blob/master/spec.md) everything over that one connection. At initialization, the client opens a control stream and sends a "Hello" message asking to proxy a selected remote port. The server responds with an acknowledgement and begins listening for external TCP connections.

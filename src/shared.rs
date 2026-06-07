@@ -496,6 +496,21 @@ pub enum ClientMessage {
         /// Requested diagnostic options.
         options: UdpTestOptions,
     },
+
+    /// Register as the provider for a vhost subdomain reverse-proxy tunnel.
+    HelloVhost {
+        /// Subdomain label to register (e.g. `myapp` in `myapp.bore.example.com`).
+        subdomain: String,
+        /// Client identifier used for reservation matching in `vhost.yml`.
+        client_id: String,
+        /// Optional operator note shown on the admin status page.
+        notes: Option<String>,
+        /// Whether the provider enforces HTTP Basic auth itself (display only).
+        basic_auth: bool,
+        /// Number of parallel TCP carrier connections to request.
+        #[serde(default)]
+        carriers: u16,
+    },
 }
 
 /// A message from the server on the control substream.
@@ -559,6 +574,17 @@ pub enum ServerMessage {
     /// The direct UDP path is unavailable (the other peer did not opt in, or no
     /// peer is registered yet); proceed over the server relay instead.
     UdpUnavailable,
+
+    /// Acknowledges a vhost registration ([`ClientMessage::HelloVhost`]) and
+    /// returns the public URL(s) the client should print to the user.
+    VhostReady {
+        /// Public HTTP URL (e.g. `http://myapp.bore.example.com`), when the
+        /// server's frontend serves plain HTTP for this mode.
+        http_url: Option<String>,
+        /// Public HTTPS URL (e.g. `https://myapp.bore.example.com`), when the
+        /// server's frontend serves HTTPS.
+        https_url: Option<String>,
+    },
 
     /// A `bore test-udp` peer is registered and waiting for another peer with the
     /// same diagnostic id.
@@ -645,6 +671,22 @@ impl ControlFrameSummary for ClientMessage {
                     options.control_frame_summary(),
                 )
             }
+            ClientMessage::HelloVhost {
+                subdomain,
+                client_id,
+                notes,
+                basic_auth,
+                carriers,
+            } => {
+                format!(
+                    "HelloVhost {{ subdomain={}, client_id={}, notes={}, basic_auth={}, carriers={} }}",
+                    subdomain,
+                    client_id,
+                    if notes.is_some() { "present" } else { "none" },
+                    if *basic_auth { "on" } else { "off" },
+                    carriers,
+                )
+            }
         }
     }
 }
@@ -683,6 +725,14 @@ impl ControlFrameSummary for ServerMessage {
                 )
             }
             ServerMessage::UdpUnavailable => "UdpUnavailable".to_string(),
+            ServerMessage::VhostReady {
+                http_url,
+                https_url,
+            } => format!(
+                "VhostReady {{ http_url={}, https_url={} }}",
+                http_url.as_deref().unwrap_or("<none>"),
+                https_url.as_deref().unwrap_or("<none>"),
+            ),
             ServerMessage::TestUdpWaiting => "TestUdpWaiting".to_string(),
             ServerMessage::TestUdpStart {
                 role,
@@ -918,4 +968,57 @@ fn control_frame_summary_includes_test_udp_plan() {
     assert!(summary.contains("TestUdpStart"));
     assert!(summary.contains("adaptive_plan=direct-first"));
     assert!(summary.contains("nonce=01010101010101010101010101010101"));
+}
+
+#[test]
+fn hello_vhost_round_trips_and_fits_frame() {
+    let msg = ClientMessage::HelloVhost {
+        subdomain: "myapp".to_string(),
+        client_id: "client-a".to_string(),
+        notes: Some("test note".to_string()),
+        basic_auth: false,
+        carriers: 1,
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(
+        json.len() < MAX_FRAME_LENGTH,
+        "HelloVhost must fit in MAX_FRAME_LENGTH"
+    );
+    let round: ClientMessage = serde_json::from_str(&json).unwrap();
+    match round {
+        ClientMessage::HelloVhost {
+            subdomain,
+            client_id,
+            notes,
+            basic_auth,
+            carriers,
+        } => {
+            assert_eq!(subdomain, "myapp");
+            assert_eq!(client_id, "client-a");
+            assert_eq!(notes.as_deref(), Some("test note"));
+            assert!(!basic_auth);
+            assert_eq!(carriers, 1);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn vhost_ready_round_trips() {
+    let msg = ServerMessage::VhostReady {
+        http_url: Some("http://myapp.bore.example.com".to_string()),
+        https_url: Some("https://myapp.bore.example.com".to_string()),
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let round: ServerMessage = serde_json::from_str(&json).unwrap();
+    match round {
+        ServerMessage::VhostReady {
+            http_url,
+            https_url,
+        } => {
+            assert_eq!(http_url.as_deref(), Some("http://myapp.bore.example.com"));
+            assert_eq!(https_url.as_deref(), Some("https://myapp.bore.example.com"));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
 }

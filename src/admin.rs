@@ -26,6 +26,8 @@ pub enum Role {
     SecretProvider,
     /// A secret-tunnel consumer (`bore proxy`).
     SecretConsumer,
+    /// A vhost subdomain reverse-proxy provider (`bore vhost`).
+    Vhost,
 }
 
 /// A live tunnel registration. One per accepted control connection.

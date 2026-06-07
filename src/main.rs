@@ -254,6 +254,61 @@ enum Command {
         auto_reconnect: bool,
     },
 
+    /// Expose a local service via HTTP(S) subdomain routing on the remote server.
+    ///
+    /// The server's public HTTP/HTTPS frontend routes requests by Host header to
+    /// the registered subdomain and forwards them to the local target.
+    ///
+    /// Example: bore vhost 127.0.0.1:8080 --subdomain myapp --id my-client-id
+    ///   → https://myapp.bore.mydomain.com
+    Vhost {
+        /// Local host:port to forward requests to.
+        #[clap(value_name = "TARGET")]
+        target: String,
+
+        /// Subdomain label to register (e.g. `myapp` → `myapp.bore.mydomain.com`).
+        #[clap(long, value_name = "LABEL", env = "BORE_VHOST_SUBDOMAIN")]
+        subdomain: String,
+
+        /// Client identifier for reservation matching in the server's vhost.yml.
+        #[clap(long, value_name = "ID", env = "BORE_VHOST_ID")]
+        id: String,
+
+        /// Address of the remote bore server.
+        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER", default_value = DEFAULT_SERVER)]
+        to: String,
+
+        /// Optional secret for authentication.
+        #[clap(
+            short,
+            long,
+            value_name = "SECRET",
+            env = "BORE_SECRET",
+            hide_env_values = true
+        )]
+        secret: Option<String>,
+
+        /// Skip TLS certificate verification (for self-signed https:// servers).
+        #[clap(long, env = "BORE_INSECURE")]
+        insecure: bool,
+
+        /// Free-form note shown on the server's admin status page (no behaviour).
+        #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
+        notes: Option<String>,
+
+        /// Whether the provider enforces HTTP Basic auth itself (display-only flag).
+        #[clap(long, value_name = "USER:PASS")]
+        basic_auth: Option<String>,
+
+        /// Number of parallel TCP carrier connections for the relay data path.
+        #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
+        carriers: u16,
+
+        /// Reconnect automatically with backoff if the connection fails or drops.
+        #[clap(long, env = "BORE_AUTO_RECONNECT")]
+        auto_reconnect: bool,
+    },
+
     /// Secure file and directory transfer over secret tunnels.
     Transfer {
         #[clap(subcommand)]
@@ -393,6 +448,34 @@ enum Command {
             hide_env_values = true
         )]
         admin_token: Option<String>,
+
+        /// Path to a vhost.yml config file. Presence enables the HTTP(S) vhost
+        /// frontend (subdomain-routed reverse proxy) on the server.
+        #[clap(long, value_name = "PATH", env = "BORE_VHOST_CONFIG")]
+        vhost_config: Option<PathBuf>,
+
+        /// Override the HTTP frontend port from vhost.yml (default 80).
+        #[clap(
+            long,
+            value_name = "PORT",
+            default_value_t = 80,
+            env = "BORE_VHOST_HTTP_PORT"
+        )]
+        vhost_http_port: u16,
+
+        /// Override the HTTPS frontend port from vhost.yml (default 443).
+        #[clap(
+            long,
+            value_name = "PORT",
+            default_value_t = 443,
+            env = "BORE_VHOST_HTTPS_PORT"
+        )]
+        vhost_https_port: u16,
+
+        /// Override the frontend mode from vhost.yml.
+        /// Values: http | https | both | redirect-https
+        #[clap(long, value_name = "MODE", env = "BORE_VHOST_MODE")]
+        vhost_mode: Option<String>,
     },
 
     /// Diagnose this host's UDP / NAT / firewall for hole-punching (opens no
@@ -1019,6 +1102,10 @@ async fn dispatch(command: Command) -> Result<()> {
             udp_socket_send_buffer,
             udp_max_streams,
             admin_token,
+            vhost_config,
+            vhost_http_port,
+            vhost_https_port,
+            vhost_mode,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -1071,7 +1158,78 @@ async fn dispatch(command: Command) -> Result<()> {
             server.set_bind_addr(bind_addr);
             server.set_bind_tunnels(bind_tunnels.unwrap_or(bind_addr));
             server.set_udp(udp);
+            if let Some(config_path) = vhost_config {
+                let yaml = std::fs::read_to_string(&config_path).with_context(|| {
+                    format!("failed to read vhost config: {}", config_path.display())
+                })?;
+                let mut cfg = bore_cli::vhost::parse_config(&yaml)?;
+                cfg.http_port = vhost_http_port;
+                cfg.https_port = vhost_https_port;
+                if let Some(mode_str) = vhost_mode {
+                    cfg.mode = match mode_str.as_str() {
+                        "http" => bore_cli::vhost::VhostModeCfg::Http,
+                        "https" => bore_cli::vhost::VhostModeCfg::Https,
+                        "both" => bore_cli::vhost::VhostModeCfg::Both,
+                        "redirect-https" => bore_cli::vhost::VhostModeCfg::RedirectHttps,
+                        "auto" => bore_cli::vhost::VhostModeCfg::Auto,
+                        other => {
+                            Args::command()
+                                .error(
+                                    ErrorKind::InvalidValue,
+                                    format!("unknown --vhost-mode '{other}'; expected: http, https, both, redirect-https, auto"),
+                                )
+                                .exit();
+                        }
+                    };
+                }
+                server.set_vhost(cfg)?;
+                server.set_vhost_config_path(config_path);
+            }
             server.listen().await?;
+        }
+        Command::Vhost {
+            target,
+            subdomain,
+            id,
+            to,
+            secret,
+            insecure,
+            notes,
+            basic_auth,
+            carriers,
+            auto_reconnect,
+        } => {
+            let (local_host, local_port) = parse_vhost_target(&target)?;
+            let notes = clamp_notes(notes);
+            let meta = bore_cli::client::ProviderMeta {
+                notes,
+                basic_auth: basic_auth.clone(),
+            };
+            let connect = move || {
+                let (local_host, to, subdomain, id, secret, meta) = (
+                    local_host.clone(),
+                    to.clone(),
+                    subdomain.clone(),
+                    id.clone(),
+                    secret.clone(),
+                    meta.clone(),
+                );
+                async move {
+                    bore_cli::client::Client::new_vhost_provider(
+                        &local_host,
+                        local_port,
+                        &to,
+                        &subdomain,
+                        &id,
+                        secret.as_deref(),
+                        insecure,
+                        carriers,
+                        meta,
+                    )
+                    .await
+                }
+            };
+            reconnect::run(auto_reconnect, connect, serve_client).await?;
         }
         Command::TestUdp {
             to,
@@ -1180,6 +1338,17 @@ async fn serve_proxy(proxy: Proxy) -> Result<()> {
 }
 
 /// Parse a proxy bind address. A leading ":" (e.g. ":5555") binds all interfaces.
+fn parse_vhost_target(target: &str) -> Result<(String, u16)> {
+    let normalized = match target.strip_prefix(':') {
+        Some(port) => format!("localhost:{port}"),
+        None => target.to_string(),
+    };
+    let addr: SocketAddr = normalized
+        .parse()
+        .with_context(|| format!("invalid vhost target '{target}'; expected host:port"))?;
+    Ok((addr.ip().to_string(), addr.port()))
+}
+
 fn parse_proxy_addr(value: &str) -> Result<SocketAddr> {
     let normalized = match value.strip_prefix(':') {
         Some(port) => format!("0.0.0.0:{port}"),

@@ -385,6 +385,121 @@ impl Client {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    /// Connect to a bore server as a vhost subdomain provider.
+    ///
+    /// Sends `HelloVhost`, authenticates if a secret is provided, receives
+    /// `VhostReady` with the public URL(s), then returns a ready `Client` whose
+    /// `listen` loop accepts forwarded yamux substreams and splices them to
+    /// `local_host:local_port`.
+    pub async fn new_vhost_provider(
+        local_host: &str,
+        local_port: u16,
+        to: &str,
+        subdomain: &str,
+        client_id: &str,
+        secret: Option<&str>,
+        insecure: bool,
+        carriers: u16,
+        meta: ProviderMeta,
+    ) -> Result<Self> {
+        let endpoint = Endpoint::parse(to);
+        let socket = transport::connect(&endpoint, insecure).await?;
+        let (opener, acceptor) = mux::client(socket);
+        let mut control = Delimited::with_label(
+            opener
+                .open()
+                .await
+                .context("failed to open control stream")?,
+            "client/vhost",
+        );
+
+        control
+            .send(ClientMessage::HelloVhost {
+                subdomain: subdomain.to_string(),
+                client_id: client_id.to_string(),
+                notes: meta.notes.clone(),
+                basic_auth: meta.basic_auth.is_some(),
+                carriers,
+            })
+            .await?;
+
+        if let Some(secret) = secret {
+            Authenticator::new(secret)
+                .client_handshake(&mut control)
+                .await?;
+        }
+
+        match control.recv_timeout().await? {
+            Some(ServerMessage::VhostReady {
+                http_url,
+                https_url,
+            }) => {
+                if let Some(url) = &http_url {
+                    info!(url, "vhost HTTP endpoint");
+                }
+                if let Some(url) = &https_url {
+                    info!(url, "vhost HTTPS endpoint");
+                }
+            }
+            Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+            Some(ServerMessage::Challenge(_)) => {
+                bail!("server requires authentication, but no client secret was provided");
+            }
+            Some(_) => bail!("unexpected response to vhost registration"),
+            None => bail!("unexpected EOF"),
+        }
+        info!(%subdomain, "vhost provider ready");
+
+        let mut carrier_acceptors = Vec::new();
+        let mut carrier_dialer = None;
+        if carriers > 1 {
+            match control.recv_timeout().await? {
+                Some(ServerMessage::CarrierToken { token, extra }) => {
+                    for _ in 0..extra {
+                        match open_carrier(&endpoint, insecure, secret, &token).await {
+                            Ok(pair) => carrier_acceptors.push(pair),
+                            Err(err) => warn!(%err, "failed to open vhost carrier connection"),
+                        }
+                    }
+                    info!(
+                        opened = carrier_acceptors.len(),
+                        requested = extra,
+                        "vhost carrier pool established"
+                    );
+                    if extra > 0 {
+                        carrier_dialer = Some(CarrierDialer {
+                            endpoint: endpoint.clone(),
+                            insecure,
+                            secret: secret.map(str::to_string),
+                            token,
+                            target_extra: extra as usize,
+                        });
+                    }
+                }
+                Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+                other => bail!("expected carrier token, got {other:?}"),
+            }
+        }
+
+        Ok(Client {
+            control: Some(control),
+            acceptor: Some(acceptor),
+            local_host: local_host.to_string(),
+            local_port,
+            remote_port: 0,
+            #[cfg(feature = "udp")]
+            udp_socket: None,
+            #[cfg(feature = "udp")]
+            secret: secret.map(str::to_string),
+            #[cfg(feature = "udp")]
+            udp_cfg: None,
+            basic_auth: meta.basic_auth.as_deref().and_then(BasicAuth::parse),
+            carrier_acceptors,
+            carrier_dialer,
+        })
+    }
+
     /// Returns the port publicly available on the remote.
     pub fn remote_port(&self) -> u16 {
         self.remote_port
@@ -509,6 +624,7 @@ impl Client {
                         Some(ServerMessage::UdpUnavailable) => warn!("unexpected udp unavailable"),
                         Some(ServerMessage::TestUdpWaiting) => warn!("unexpected udp diagnostic wait"),
                         Some(ServerMessage::TestUdpStart { .. }) => warn!("unexpected udp diagnostic start"),
+                        Some(ServerMessage::VhostReady { .. }) => warn!("unexpected vhost ready"),
                         None => return Ok(()),
                     }
                 }

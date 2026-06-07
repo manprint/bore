@@ -550,6 +550,15 @@ enum TransferCommand {
         /// Ignored when the sender is streaming stdin.
         #[clap(long)]
         ask_confirm: bool,
+
+        /// Seconds to wait for --ask-confirm input before rejecting automatically
+        /// (0 = wait forever; default 120).
+        #[clap(long, default_value_t = 120)]
+        confirm_timeout: u64,
+
+        /// Abort if no transfer data is received for this many seconds (0 = disabled; default 60).
+        #[clap(long, default_value_t = 60)]
+        stall_timeout: u64,
     },
 
     /// Send a file, directory, or stdin stream.
@@ -646,6 +655,10 @@ enum TransferCommand {
         /// Include or exclude Unix device nodes while scanning the source.
         #[clap(long, value_enum, default_value_t = DeviceMode::Exclude)]
         devices: DeviceMode,
+
+        /// Abort if no transfer data is sent for this many seconds (0 = disabled; default 60).
+        #[clap(long, default_value_t = 60)]
+        stall_timeout: u64,
     },
 }
 
@@ -881,6 +894,8 @@ async fn dispatch(command: Command) -> Result<()> {
                 rename,
                 persistent,
                 ask_confirm,
+                confirm_timeout,
+                stall_timeout,
             } => {
                 let collision = match (overwrite, rename) {
                     (true, false) => CollisionPolicy::Overwrite,
@@ -915,6 +930,8 @@ async fn dispatch(command: Command) -> Result<()> {
                     collision,
                     persistent,
                     ask_confirm,
+                    confirm_timeout,
+                    stall_timeout,
                 })
                 .await?;
             }
@@ -937,6 +954,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 parallel,
                 symlinks,
                 devices,
+                stall_timeout,
             } => {
                 if !relay_only {
                     info!(
@@ -969,6 +987,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     parallel,
                     symlinks,
                     devices,
+                    stall_timeout,
                 })
                 .await?;
             }

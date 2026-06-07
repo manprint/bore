@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::client::{Client, ProviderMeta};
 use crate::secret::Proxy;
 use crate::server::DEFAULT_MAX_CONNS;
+use crate::shared::tune_tcp;
 use crate::transport::Endpoint;
 
 const PROTOCOL_VERSION: u32 = 3;
@@ -39,7 +40,11 @@ const LOCAL_CONNECT_RETRIES: usize = 50;
 const LOCAL_CONNECT_DELAY: Duration = Duration::from_millis(20);
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
 const RESUME_STATE_FILE: &str = "state.json";
+const COMMITTED_MARKER_FILE: &str = "committed.json";
 const MULTI_SOURCE_STAGE_ROOT: &str = ".bore-multi-root";
+/// Upper bound on a single stdin StreamChunk payload the receiver will allocate.
+/// The sender uses COPY_BUFFER (64 KiB); allow up to CHUNK_SIZE for headroom.
+const STREAM_CHUNK_MAX: usize = CHUNK_SIZE as usize;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
 pub enum CollisionPolicy {
@@ -82,6 +87,10 @@ pub struct ListenerOptions {
     /// Show the incoming file list and ask for y/N before accepting. Ignored when
     /// the sender is streaming stdin (see `display_and_confirm_manifest_sync`).
     pub ask_confirm: bool,
+    /// Seconds to wait for --ask-confirm input before rejecting (0 = wait forever).
+    pub confirm_timeout: u64,
+    /// Abort if no transfer data is received for this many seconds (0 = disabled).
+    pub stall_timeout: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +113,8 @@ pub struct SenderOptions {
     pub parallel: u16,
     pub symlinks: SymlinkMode,
     pub devices: DeviceMode,
+    /// Abort if no transfer data is sent for this many seconds (0 = disabled).
+    pub stall_timeout: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -241,6 +252,20 @@ struct ResumeFilePlan {
     completed_chunks: Vec<u32>,
 }
 
+/// Written atomically to `<stage_dir>/committed.json` after a successful commit so that
+/// a retry after a commit→Completed link-drop can re-complete idempotently.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CommittedMarker {
+    protocol_version: u32,
+    transfer_id: String,
+    manifest_hash: String,
+    final_name: String,
+    final_path: String,
+    total_bytes: u64,
+    regular_files: u64,
+    transfer_hash: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ResumeState {
     protocol_version: u32,
@@ -280,10 +305,6 @@ enum Frame {
         offset: u64,
         len: u32,
         blake3: String,
-    },
-    ChunkAck {
-        entry_id: u32,
-        chunk_index: u32,
     },
     StreamChunk {
         len: u32,
@@ -344,11 +365,13 @@ struct ReceiverPlan {
     final_path: PathBuf,
     stage_dir: PathBuf,
     stage_root: PathBuf,
-    _manifest_hash: String,
+    manifest_hash: String,
     resume: Option<Arc<ResumeShared>>,
     resumed_bytes: u64,
     resume_plan: Vec<ResumeFilePlan>,
     multi_source: bool,
+    /// Set when this transfer was already committed in a prior run (F3 idempotent marker).
+    already_committed: Option<CommittedMarker>,
 }
 
 #[derive(Clone, Debug)]
@@ -483,6 +506,7 @@ impl ProgressHandle {
 }
 
 pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
+    test_seam::warn_if_active();
     let transfer_id = options
         .transfer_id
         .clone()
@@ -537,6 +561,7 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
     let mut accept_task = tokio::spawn(async move {
         loop {
             let (stream, _) = internal.accept().await?;
+            tune_tcp(&stream);
             if conn_tx.send(stream).is_err() {
                 break;
             }
@@ -573,6 +598,8 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
             options.dest_path.clone(),
             options.collision,
             options.ask_confirm,
+            options.confirm_timeout,
+            options.stall_timeout,
         )
         .await;
 
@@ -592,13 +619,8 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
                     "transfer complete, waiting for next transfer {transfer_id} into {}",
                     options.dest_path.display()
                 );
-                // Drain leftover connections from completed transfer
-                let drain_end = tokio::time::Instant::now() + Duration::from_millis(200);
-                while let Ok(maybe) = tokio::time::timeout_at(drain_end, conn_rx.recv()).await {
-                    if maybe.is_none() {
-                        break;
-                    }
-                }
+                // Drain any leftover worker connections from the completed transfer.
+                while conn_rx.try_recv().is_ok() {}
             }
             Err(err) => {
                 if !options.persistent {
@@ -611,19 +633,15 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
                     return Err(err);
                 }
                 warn!(%err, "transfer error in persistent mode, waiting for next sender");
-                // Drain leftover connections
-                let drain_end = tokio::time::Instant::now() + Duration::from_millis(500);
-                while let Ok(maybe) = tokio::time::timeout_at(drain_end, conn_rx.recv()).await {
-                    if maybe.is_none() {
-                        break;
-                    }
-                }
+                // Drain any leftover connections from the failed transfer.
+                while conn_rx.try_recv().is_ok() {}
             }
         }
     }
 }
 
 pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
+    test_seam::warn_if_active();
     let transfer_id = options
         .transfer_id
         .clone()
@@ -702,7 +720,7 @@ pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
     let proxy_task = tokio::spawn(proxy.listen());
     let outcome = async {
         let control = connect_local(local_addr).await?;
-        send_transfer(control, local_addr, plan, transport).await
+        send_transfer(control, local_addr, plan, transport, options.stall_timeout).await
     }
     .await;
     // Allow tunnel relay to drain before aborting — prevents spurious "channel closed" warnings
@@ -717,6 +735,7 @@ async fn send_transfer(
     local_addr: std::net::SocketAddr,
     plan: PlannedTransfer,
     transport: TransportMode,
+    stall_timeout: u64,
 ) -> Result<TransferOutcome> {
     let regular_files_total = plan
         .entries
@@ -778,9 +797,28 @@ async fn send_transfer(
     handle.add_resumed_bytes(resumed_bytes);
 
     let summary = if plan.root_source == RootSourceKind::Stdin {
-        send_stdin_stream(&mut control, &plan, &handle).await?
+        send_stdin_stream(&mut control, &plan, &handle, stall_timeout).await?
     } else {
         let tasks = build_chunk_tasks(&plan, &resume_plan)?;
+        // Seed progress with fully-resumed files (no tasks emitted → add_file never called).
+        {
+            let completed_counts: BTreeMap<u32, usize> = resume_plan
+                .iter()
+                .map(|e| (e.entry_id, e.completed_chunks.len()))
+                .collect();
+            for entry in &plan.entries {
+                if !entry.manifest.kind.is_regular_file() {
+                    continue;
+                }
+                let done = completed_counts
+                    .get(&entry.manifest.id)
+                    .copied()
+                    .unwrap_or(0);
+                if done as u32 == entry.manifest.chunk_count {
+                    handle.add_file();
+                }
+            }
+        }
         if !tasks.is_empty() {
             send_chunked_files(
                 local_addr,
@@ -788,6 +826,7 @@ async fn send_transfer(
                 tasks,
                 parallel,
                 handle.clone(),
+                stall_timeout,
             )
             .await?;
         }
@@ -795,9 +834,15 @@ async fn send_transfer(
     };
 
     send_frame(&mut control, &Frame::TransferSummary(summary.clone())).await?;
-    let completed = match expect_frame(&mut control).await? {
-        Frame::Completed(done) => done,
-        other => bail!("unexpected final frame from receiver: {other:?}"),
+    let completed = match recv_frame(&mut control).await? {
+        Some(Frame::Completed(done)) => done,
+        Some(Frame::Error { message }) => bail!("peer reported an error: {message}"),
+        Some(other) => bail!("unexpected final frame from receiver: {other:?}"),
+        None => bail!(
+            "transfer data fully sent, but the listener closed before confirming completion. \
+             The destination may already be complete — re-run the same command to confirm \
+             (it will re-verify idempotently)."
+        ),
     };
     if completed.transfer_hash != summary.transfer_hash {
         bail!("receiver acknowledged a different transfer hash");
@@ -827,6 +872,7 @@ async fn send_chunked_files(
     tasks: Vec<ChunkTask>,
     parallel: u16,
     progress: ProgressHandle,
+    stall_timeout: u64,
 ) -> Result<()> {
     let injected_limit = injected_fail_after_chunks();
     let sent = Arc::new(AtomicU64::new(0));
@@ -892,7 +938,11 @@ async fn send_chunked_files(
                         },
                     )
                     .await?;
-                    stream.write_all(&chunk).await?;
+                    with_stall(stall_timeout, async {
+                        stream.write_all(&chunk).await?;
+                        Ok(())
+                    })
+                    .await?;
                     progress.add_bytes(task.len as u64);
                     let count = sent.fetch_add(1, Ordering::Relaxed) + 1;
                     if let Some(limit) = injected_limit {
@@ -906,7 +956,7 @@ async fn send_chunked_files(
             // Read terminal frame from receiver (WorkerComplete or Error)
             if worker_result.is_ok() {
                 let terminal = async {
-                    match expect_frame(&mut stream).await? {
+                    match with_stall(stall_timeout, expect_frame(&mut stream)).await? {
                         Frame::WorkerComplete => Ok(()),
                         Frame::Error { message } => {
                             bail!("receiver worker reported error: {message}")
@@ -936,6 +986,7 @@ async fn send_stdin_stream(
     control: &mut TcpStream,
     plan: &PlannedTransfer,
     progress: &ProgressHandle,
+    stall_timeout: u64,
 ) -> Result<TransferSummary> {
     let entry = plan
         .entries
@@ -955,7 +1006,14 @@ async fn send_stdin_stream(
             break;
         }
         send_frame(control, &Frame::StreamChunk { len: read as u32 }).await?;
-        control.write_all(&buffer[..read]).await?;
+        {
+            let data = &buffer[..read];
+            with_stall(stall_timeout, async {
+                control.write_all(data).await?;
+                Ok(())
+            })
+            .await?;
+        }
         hasher.update(&buffer[..read]);
         total += read as u64;
         progress.add_bytes(read as u64);
@@ -991,11 +1049,16 @@ async fn receive_transfer(
     dest_root: PathBuf,
     collision: CollisionPolicy,
     ask_confirm: bool,
+    confirm_timeout: u64,
+    stall_timeout: u64,
 ) -> Result<TransferOutcome> {
+    // Tracks the stdin temp stage dir so we can clean it up on failure (F5).
+    let mut cleanup_stdin_dir: Option<PathBuf> = None;
+
     let outcome = async {
         let begin = match expect_frame(&mut control).await? {
             Frame::Begin(begin) => begin,
-            other => bail!("unexpected first control frame: {other:?}"),
+            other => bail!("unexpected first control frame (a stray worker connection from a previous transfer?): {other:?}"),
         };
         if begin.protocol_version != PROTOCOL_VERSION {
             bail!(
@@ -1012,22 +1075,102 @@ async fn receive_transfer(
 
         let plan = receive_manifest(&mut control, begin, &dest_root, collision).await?;
 
+        // Idempotent re-completion: a prior run committed the data but dropped the link
+        // before the sender received Completed. Reply on the normal protocol so the sender
+        // finishes cleanly (F3).
+        if let Some(ref marker) = plan.already_committed {
+            send_frame(
+                &mut control,
+                &Frame::ManifestAccepted {
+                    final_name: marker.final_name.clone(),
+                    parallel: 1,
+                    resumed_bytes: marker.total_bytes,
+                    resume: all_chunks_complete_plan(&plan.entries),
+                },
+            )
+            .await?;
+            // Sender sees all-complete plan → 0 tasks → no workers → sends TransferSummary.
+            match expect_frame(&mut control).await? {
+                Frame::TransferSummary(summary) => {
+                    if summary.transfer_hash != marker.transfer_hash {
+                        bail!("re-sent transfer hash does not match the committed copy");
+                    }
+                }
+                other => bail!("unexpected frame during idempotent re-completion: {other:?}"),
+            }
+            let final_path = plan.final_path.clone();
+            send_frame(
+                &mut control,
+                &Frame::Completed(CompletedFrame {
+                    final_path: marker.final_path.clone(),
+                    total_bytes: marker.total_bytes,
+                    regular_files: marker.regular_files,
+                    transfer_hash: marker.transfer_hash.clone(),
+                }),
+            )
+            .await?;
+            let _ = control.shutdown().await;
+            return Ok(TransferOutcome {
+                transfer_id: plan.begin.transfer_id,
+                final_path,
+                total_bytes: marker.total_bytes,
+                regular_files: marker.regular_files,
+                transport: plan.begin.transport,
+            });
+        }
+
+        // Track stdin temp dir for cleanup on failure.
+        if plan.begin.root_source == RootSourceKind::Stdin {
+            cleanup_stdin_dir = Some(plan.stage_dir.clone());
+        }
+
         // Always display the incoming file list; when ask_confirm is set and the
         // source is not stdin, wait for the user to confirm before proceeding.
         {
             let begin_clone = plan.begin.clone();
             let entries_clone = plan.entries.clone();
             let dest_root_clone = dest_root.clone();
-            let accepted = spawn_blocking(move || {
+            let confirm_fut = spawn_blocking(move || {
                 display_and_confirm_manifest_sync(
                     &begin_clone,
                     &entries_clone,
                     &dest_root_clone,
                     ask_confirm,
                 )
-            })
-            .await
-            .context("manifest confirmation task failed")??;
+            });
+            // When confirm_timeout > 0 and ask_confirm is active, wrap the blocking read in
+            // a timeout. Note: tokio::time::timeout cancels the async join-handle, but the
+            // underlying blocking OS read on /dev/tty keeps running on the blocking-thread pool
+            // until it gets input. The async task is unblocked regardless, so the sender
+            // receives a timely rejection frame.
+            let accepted = if confirm_timeout > 0 && ask_confirm {
+                match tokio::time::timeout(
+                    Duration::from_secs(confirm_timeout),
+                    confirm_fut,
+                )
+                .await
+                {
+                    Ok(joined) => joined.context("manifest confirmation task failed")??,
+                    Err(_) => {
+                        let _ = send_frame(
+                            &mut control,
+                            &Frame::Error {
+                                message: format!(
+                                    "transfer rejected by receiver (confirmation timed out after {confirm_timeout}s)"
+                                ),
+                            },
+                        )
+                        .await;
+                        let _ = tokio::fs::remove_dir_all(&plan.stage_dir).await;
+                        cleanup_stdin_dir = None;
+                        bail!("transfer confirmation timed out after {confirm_timeout}s");
+                    }
+                }
+            } else {
+                confirm_fut
+                    .await
+                    .context("manifest confirmation task failed")??
+            };
             if !accepted {
                 // Inform the sender before bailing so it gets a clear error message.
                 let _ = send_frame(
@@ -1039,6 +1182,7 @@ async fn receive_transfer(
                 .await;
                 // Clean up any staging state created by receive_manifest.
                 let _ = tokio::fs::remove_dir_all(&plan.stage_dir).await;
+                cleanup_stdin_dir = None; // already cleaned above
                 bail!("transfer rejected by receiver");
             }
         }
@@ -1065,16 +1209,17 @@ async fn receive_transfer(
         handle.set_current(display_component(&plan.final_name));
 
         let sender_summary = if plan.begin.root_source == RootSourceKind::Stdin {
-            receive_stdin_stream(&mut control, &plan, &handle).await?
+            receive_stdin_stream(&mut control, &plan, &handle, stall_timeout).await?
         } else {
-            receive_filesystem_streams(&mut control, incoming, &plan, &handle).await?
+            receive_filesystem_streams(&mut control, incoming, &plan, &handle, stall_timeout)
+                .await?
         };
 
         let local_summary = verify_summary(&plan).await?;
         if sender_summary != local_summary {
             bail!("sender summary does not match receiver state");
         }
-        commit_stage(&plan, collision).await?;
+        commit_stage(&plan, collision, &local_summary).await?;
         send_frame(
             &mut control,
             &Frame::Completed(CompletedFrame {
@@ -1118,6 +1263,10 @@ async fn receive_transfer(
             },
         )
         .await;
+        // Clean up the stdin temp stage dir on failure (F5).
+        if let Some(dir) = &cleanup_stdin_dir {
+            let _ = tokio::fs::remove_dir_all(dir).await;
+        }
     }
     outcome
 }
@@ -1127,6 +1276,7 @@ async fn receive_filesystem_streams(
     incoming: &mut mpsc::UnboundedReceiver<TcpStream>,
     plan: &ReceiverPlan,
     progress: &ProgressHandle,
+    stall_timeout: u64,
 ) -> Result<TransferSummary> {
     let resume = plan
         .resume
@@ -1146,16 +1296,23 @@ async fn receive_filesystem_streams(
             .context("worker channel closed before all worker streams connected")?;
         let resume = resume.clone();
         let progress = progress.clone();
-        workers.spawn(async move { handle_worker_connection(stream, resume, progress).await });
+        workers.spawn(async move {
+            handle_worker_connection(stream, resume, progress, stall_timeout).await
+        });
     }
     while let Some(joined) = workers.join_next().await {
         let joined = joined.context("worker join failed")?;
         joined?;
     }
-    match expect_frame(control).await? {
-        Frame::TransferSummary(summary) => Ok(summary),
-        other => bail!("unexpected control frame while waiting for transfer summary: {other:?}"),
-    }
+    with_stall(stall_timeout, async {
+        match expect_frame(control).await? {
+            Frame::TransferSummary(summary) => Ok(summary),
+            other => {
+                bail!("unexpected control frame while waiting for transfer summary: {other:?}")
+            }
+        }
+    })
+    .await
 }
 
 fn expected_worker_connections(plan: &ReceiverPlan) -> usize {
@@ -1180,12 +1337,44 @@ fn expected_worker_connections(plan: &ReceiverPlan) -> usize {
     }
 }
 
+/// Validate that a ChunkStart's geometry matches the manifest for the given entry.
+/// Rejects peer-controlled `offset`/`len` before any allocation, bounding allocation to
+/// at most CHUNK_SIZE bytes.
+fn validate_chunk_geometry(
+    entry: &ManifestEntry,
+    chunk_index: u32,
+    offset: u64,
+    len: u32,
+) -> Result<()> {
+    let size = entry
+        .size
+        .context("regular file manifest entry missing size")?;
+    if chunk_index >= entry.chunk_count {
+        bail!(
+            "chunk index {chunk_index} out of range ({}) for {}",
+            entry.chunk_count,
+            display_rel_path(&entry.rel_path)
+        );
+    }
+    let expected_off = chunk_index as u64 * CHUNK_SIZE as u64;
+    let expected_len = chunk_len(size, chunk_index);
+    if offset != expected_off || len as u64 != expected_len {
+        bail!(
+            "chunk geometry mismatch for {} chunk {chunk_index}: \
+             got off={offset} len={len}, expected off={expected_off} len={expected_len}",
+            display_rel_path(&entry.rel_path)
+        );
+    }
+    Ok(())
+}
+
 async fn handle_worker_connection(
     mut stream: TcpStream,
     resume: Arc<ResumeShared>,
     progress: ProgressHandle,
+    stall_timeout: u64,
 ) -> Result<()> {
-    match expect_frame(&mut stream).await? {
+    match with_stall(stall_timeout, expect_frame(&mut stream)).await? {
         Frame::WorkerHello { transfer_id } => {
             if transfer_id != resume.transfer_id {
                 bail!("worker connected for unexpected transfer id {transfer_id}");
@@ -1197,7 +1386,7 @@ async fn handle_worker_connection(
     let mut file_cache: HashMap<u32, tokio::fs::File> = HashMap::new();
     let worker_result = async {
         loop {
-            match recv_frame(&mut stream).await? {
+            match with_stall(stall_timeout, recv_frame(&mut stream)).await? {
                 Some(Frame::ChunkStart {
                     entry_id,
                     chunk_index,
@@ -1213,8 +1402,13 @@ async fn handle_worker_connection(
                     if !entry.kind.is_regular_file() {
                         bail!("chunk data is only valid for regular files");
                     }
+                    validate_chunk_geometry(&entry, chunk_index, offset, len)?;
                     let mut payload = vec![0u8; len as usize];
-                    stream.read_exact(&mut payload).await?;
+                    with_stall(stall_timeout, async {
+                        stream.read_exact(&mut payload).await?;
+                        Ok(())
+                    })
+                    .await?;
                     let local_hash = blake3::hash(&payload).to_hex().to_string();
                     if local_hash != blake3 {
                         bail!(
@@ -1285,6 +1479,7 @@ async fn receive_stdin_stream(
     control: &mut TcpStream,
     plan: &ReceiverPlan,
     progress: &ProgressHandle,
+    stall_timeout: u64,
 ) -> Result<TransferSummary> {
     let entry = plan
         .entries
@@ -1302,10 +1497,17 @@ async fn receive_stdin_stream(
     let mut total = 0u64;
     let mut hasher = blake3::Hasher::new();
     loop {
-        match expect_frame(control).await? {
+        match with_stall(stall_timeout, expect_frame(control)).await? {
             Frame::StreamChunk { len } => {
+                if len == 0 || len as usize > STREAM_CHUNK_MAX {
+                    bail!("stdin stream chunk length {len} out of bounds (max {STREAM_CHUNK_MAX})");
+                }
                 let mut buf = vec![0u8; len as usize];
-                control.read_exact(&mut buf).await?;
+                with_stall(stall_timeout, async {
+                    control.read_exact(&mut buf).await?;
+                    Ok(())
+                })
+                .await?;
                 file.write_all(&buf).await?;
                 hasher.update(&buf);
                 total += len as u64;
@@ -1378,11 +1580,12 @@ async fn receive_manifest(
             final_path: dest_root.join(final_name_local),
             stage_dir,
             stage_root,
-            _manifest_hash: manifest_hash,
+            manifest_hash,
             resume: None,
             resumed_bytes: 0,
             resume_plan: Vec::new(),
             multi_source: false,
+            already_committed: None,
         });
     }
 
@@ -1391,6 +1594,40 @@ async fn receive_manifest(
     let multi_source = begin.multi_source;
 
     let stage_dir = resume_state_dir(dest_root, &begin.transfer_id);
+
+    // Check for a committed marker from a prior run (F3 idempotent re-completion).
+    let marker_file = stage_dir.join(COMMITTED_MARKER_FILE);
+    if fs::try_exists(&marker_file).await? {
+        match read_json::<CommittedMarker>(&marker_file).await {
+            Ok(marker)
+                if marker.protocol_version == PROTOCOL_VERSION
+                    && marker.transfer_id == begin.transfer_id
+                    && marker.manifest_hash == manifest_hash =>
+            {
+                let final_name_local = decode_component(&marker.final_name);
+                let final_path = decode_native_path(&marker.final_path);
+                return Ok(ReceiverPlan {
+                    begin,
+                    entries,
+                    final_name: marker.final_name.clone(),
+                    final_path,
+                    stage_dir,
+                    stage_root: final_name_local.into(),
+                    manifest_hash,
+                    resume: None,
+                    resumed_bytes: marker.total_bytes,
+                    resume_plan: Vec::new(),
+                    multi_source: false,
+                    already_committed: Some(marker),
+                });
+            }
+            _ => {
+                // Stale or unreadable marker (different content under same id): fall through.
+                let _ = fs::remove_file(&marker_file).await;
+            }
+        }
+    }
+
     let state_file = stage_dir.join(RESUME_STATE_FILE);
     let (final_name, final_name_local, state, resumed_bytes, resume_plan) = if fs::try_exists(
         &state_file,
@@ -1490,11 +1727,12 @@ async fn receive_manifest(
         final_path,
         stage_dir,
         stage_root,
-        _manifest_hash: manifest_hash,
+        manifest_hash,
         resume: Some(resume),
         resumed_bytes,
         resume_plan,
         multi_source,
+        already_committed: None,
     })
 }
 
@@ -1628,6 +1866,19 @@ fn manifest_hash(
     Ok(blake3::hash(&payload).to_hex().to_string())
 }
 
+/// Builds a resume plan that marks every chunk of every regular file as complete.
+/// Used for idempotent re-completion when a `CommittedMarker` is found.
+fn all_chunks_complete_plan(entries: &[ManifestEntry]) -> Vec<ResumeFilePlan> {
+    entries
+        .iter()
+        .filter(|e| e.kind.is_regular_file())
+        .map(|e| ResumeFilePlan {
+            entry_id: e.id,
+            completed_chunks: (0..e.chunk_count).collect(),
+        })
+        .collect()
+}
+
 fn build_resume_plan(
     entries: &[ManifestEntry],
     state: &ResumeState,
@@ -1714,7 +1965,11 @@ async fn verify_summary(plan: &ReceiverPlan) -> Result<TransferSummary> {
     summary_from_materialized_entries(&plan.entries)
 }
 
-async fn commit_stage(plan: &ReceiverPlan, collision: CollisionPolicy) -> Result<()> {
+async fn commit_stage(
+    plan: &ReceiverPlan,
+    collision: CollisionPolicy,
+    summary: &TransferSummary,
+) -> Result<()> {
     if plan.multi_source {
         // Flat multi-source: move each top-level child of stage_root into dest_root.
         let dest_root = &plan.final_path; // set to dest_root in receive_manifest
@@ -1755,9 +2010,11 @@ async fn commit_stage(plan: &ReceiverPlan, collision: CollisionPolicy) -> Result
                 })?;
             }
         }
-        if fs::try_exists(&plan.stage_dir).await? {
-            let _ = fs::remove_dir_all(&plan.stage_dir).await;
-        }
+        // Remove the now-empty staging subdir and state.json, then write the
+        // committed marker so a retry can re-complete idempotently (F3).
+        let _ = fs::remove_dir_all(&plan.stage_root).await;
+        let _ = fs::remove_file(plan.stage_dir.join(RESUME_STATE_FILE)).await;
+        write_committed_marker(plan, summary).await?;
         return Ok(());
     }
 
@@ -1798,10 +2055,40 @@ async fn commit_stage(plan: &ReceiverPlan, collision: CollisionPolicy) -> Result
                 )
             })?;
     }
-    if fs::try_exists(&plan.stage_dir).await? {
-        let _ = fs::remove_dir_all(&plan.stage_dir).await;
+
+    if plan.begin.root_source == RootSourceKind::Stdin {
+        // Stdin uses a temp stage dir; no persistent marker needed — remove entirely.
+        if fs::try_exists(&plan.stage_dir).await? {
+            let _ = fs::remove_dir_all(&plan.stage_dir).await;
+        }
+    } else {
+        // Filesystem: clean up staged content and state, then write committed marker
+        // so a retry after a commit→Completed link-drop can re-complete idempotently (F3).
+        let _ = fs::remove_file(plan.stage_dir.join(RESUME_STATE_FILE)).await;
+        write_committed_marker(plan, summary).await?;
     }
     Ok(())
+}
+
+async fn write_committed_marker(plan: &ReceiverPlan, summary: &TransferSummary) -> Result<()> {
+    let marker = CommittedMarker {
+        protocol_version: PROTOCOL_VERSION,
+        transfer_id: plan.begin.transfer_id.clone(),
+        manifest_hash: plan.manifest_hash.clone(),
+        final_name: plan.final_name.clone(),
+        final_path: encode_native_path(&plan.final_path),
+        total_bytes: summary.total_bytes,
+        regular_files: summary.regular_files,
+        transfer_hash: summary.transfer_hash.clone(),
+    };
+    // Ensure the stage_dir still exists (may have been just created or survived from resume).
+    fs::create_dir_all(&plan.stage_dir).await.with_context(|| {
+        format!(
+            "failed to create stage dir for committed marker {}",
+            plan.stage_dir.display()
+        )
+    })?;
+    write_json_atomic(&plan.stage_dir.join(COMMITTED_MARKER_FILE), &marker).await
 }
 
 fn read_source_files(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -1857,12 +2144,8 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn read_confirmation_line() -> Result<String> {
-    // Allow injecting a canned response via env var so integration tests (which
-    // compile the library without cfg(test)) can exercise y/N paths without a
-    // real terminal.  The name is intentionally prefixed with BORE_TEST_ so it
-    // is never accidentally set in production.
-    if let Ok(val) = std::env::var("BORE_TEST_CONFIRM_RESPONSE") {
-        return Ok(format!("{}\n", val));
+    if let Some(val) = test_seam::confirm_response() {
+        return Ok(val);
     }
 
     let mut input = String::new();
@@ -2547,9 +2830,9 @@ impl ResumeShared {
     }
 }
 
-async fn persist_resume_state(path: &Path, state: &ResumeState) -> Result<()> {
+async fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec(state)?).await?;
+    fs::write(&tmp, serde_json::to_vec(value)?).await?;
     if fs::try_exists(path).await? {
         let _ = fs::remove_file(path).await;
     }
@@ -2557,15 +2840,39 @@ async fn persist_resume_state(path: &Path, state: &ResumeState) -> Result<()> {
     Ok(())
 }
 
-async fn load_resume_state(path: &Path) -> Result<ResumeState> {
+async fn read_json<T: for<'de> serde::Deserialize<'de>>(path: &Path) -> Result<T> {
     Ok(serde_json::from_slice(&fs::read(path).await?)?)
+}
+
+async fn persist_resume_state(path: &Path, state: &ResumeState) -> Result<()> {
+    write_json_atomic(path, state).await
+}
+
+async fn load_resume_state(path: &Path) -> Result<ResumeState> {
+    read_json(path).await
+}
+
+/// Wraps a future in a stall timeout. If `secs == 0`, the future runs without a timeout.
+/// When the timeout fires, the future is dropped (cancellation-safe because we always bail
+/// immediately and discard the associated stream).
+async fn with_stall<T>(secs: u64, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    if secs == 0 {
+        return fut.await;
+    }
+    match tokio::time::timeout(Duration::from_secs(secs), fut).await {
+        Ok(r) => r,
+        Err(_) => bail!("transfer stalled: no progress for {secs}s"),
+    }
 }
 
 async fn connect_local(addr: std::net::SocketAddr) -> Result<TcpStream> {
     let mut last_err = None;
     for _ in 0..LOCAL_CONNECT_RETRIES {
         match TcpStream::connect(addr).await {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                tune_tcp(&stream);
+                return Ok(stream);
+            }
             Err(err) => {
                 last_err = Some(err);
                 tokio::time::sleep(LOCAL_CONNECT_DELAY).await;
@@ -3136,10 +3443,51 @@ async fn create_device(entry: &ManifestEntry, path: &Path) -> Result<()> {
     }
 }
 
+/// TEST SEAM: env-var injection points used by integration tests.
+/// All names are prefixed with BORE_TEST_ / BORE_TRANSFER_TEST_ so they are
+/// never set accidentally in production. In non-test builds a one-time warning
+/// is emitted if any seam variable is active at startup.
+mod test_seam {
+    /// Call once at listener/sender startup to surface accidental seam use in production.
+    pub fn warn_if_active() {
+        #[cfg(not(test))]
+        {
+            use std::sync::OnceLock;
+            use tracing::warn;
+            static WARNED: OnceLock<()> = OnceLock::new();
+            let active = [
+                "BORE_TRANSFER_TEST_MAX_CHUNKS",
+                "BORE_TEST_CONFIRM_RESPONSE",
+            ]
+            .iter()
+            .any(|v| std::env::var(v).is_ok());
+            if active {
+                WARNED.get_or_init(|| {
+                    warn!(
+                        "BORE_TEST_* env vars are set — test seams are active in a non-test build"
+                    );
+                });
+            }
+        }
+    }
+
+    /// Returns `Some(n)` when `BORE_TRANSFER_TEST_MAX_CHUNKS=n`, else `None`.
+    pub fn fail_after_chunks() -> Option<u64> {
+        std::env::var("BORE_TRANSFER_TEST_MAX_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    }
+
+    /// Returns `Some(line)` when `BORE_TEST_CONFIRM_RESPONSE` is set, else `None`.
+    pub fn confirm_response() -> Option<String> {
+        std::env::var("BORE_TEST_CONFIRM_RESPONSE")
+            .ok()
+            .map(|v| format!("{v}\n"))
+    }
+}
+
 fn injected_fail_after_chunks() -> Option<u64> {
-    std::env::var("BORE_TRANSFER_TEST_MAX_CHUNKS")
-        .ok()
-        .and_then(|value| value.parse().ok())
+    test_seam::fail_after_chunks()
 }
 
 #[cfg(unix)]
@@ -3811,5 +4159,133 @@ mod tests {
             decoded.encode_wide().collect::<Vec<_>>(),
             original.encode_wide().collect::<Vec<_>>()
         );
+    }
+
+    // ── P1.1: tune_tcp applied to transfer sockets ────────────────────────────
+
+    #[tokio::test]
+    async fn connect_local_sets_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (connected, _) = tokio::join!(connect_local(addr), async {
+            listener.accept().await.unwrap()
+        });
+        let stream = connected.unwrap();
+        assert!(
+            stream.nodelay().unwrap(),
+            "connect_local must set TCP_NODELAY"
+        );
+    }
+
+    // ── P1.2: chunk geometry validation ──────────────────────────────────────
+
+    fn make_single_chunk_entry(size: u64) -> ManifestEntry {
+        ManifestEntry {
+            id: 1,
+            rel_path: "test.bin".to_string(),
+            kind: EntryKind::RegularFile,
+            size: Some(size),
+            full_hash: None,
+            chunk_count: chunk_count_for(size),
+            symlink_target: None,
+            device: None,
+            mode: None,
+        }
+    }
+
+    #[test]
+    fn chunk_geometry_valid_first_chunk_accepted() {
+        let size = CHUNK_SIZE as u64 * 2 + 42;
+        let entry = make_single_chunk_entry(size);
+        assert!(validate_chunk_geometry(&entry, 0, 0, CHUNK_SIZE).is_ok());
+    }
+
+    #[test]
+    fn chunk_geometry_valid_last_partial_chunk_accepted() {
+        let size = CHUNK_SIZE as u64 + 42;
+        let entry = make_single_chunk_entry(size);
+        assert!(validate_chunk_geometry(&entry, 1, CHUNK_SIZE as u64, 42).is_ok());
+    }
+
+    #[test]
+    fn chunk_start_index_out_of_range_rejected() {
+        let size = CHUNK_SIZE as u64;
+        let entry = make_single_chunk_entry(size); // chunk_count == 1
+        let err = validate_chunk_geometry(&entry, 1, CHUNK_SIZE as u64, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "error should say out of range: {err}"
+        );
+    }
+
+    #[test]
+    fn chunk_start_oversized_len_rejected() {
+        let size = CHUNK_SIZE as u64 * 2;
+        let entry = make_single_chunk_entry(size);
+        // correct index/offset, but 4× the expected length
+        let err = validate_chunk_geometry(&entry, 0, 0, CHUNK_SIZE * 4).unwrap_err();
+        assert!(
+            err.to_string().contains("geometry mismatch"),
+            "error should say geometry mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn chunk_start_offset_mismatch_rejected() {
+        let size = CHUNK_SIZE as u64 * 2;
+        let entry = make_single_chunk_entry(size);
+        let err = validate_chunk_geometry(&entry, 0, 1, CHUNK_SIZE).unwrap_err();
+        assert!(
+            err.to_string().contains("geometry mismatch"),
+            "error should say geometry mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn stream_chunk_max_equals_chunk_size() {
+        // STREAM_CHUNK_MAX is the allocation bound for stdin StreamChunk payloads.
+        // It must equal CHUNK_SIZE so the geometry guard and the stdin guard are consistent.
+        assert_eq!(STREAM_CHUNK_MAX, CHUNK_SIZE as usize);
+    }
+
+    // --- with_stall unit tests (P3) ---
+
+    #[tokio::test]
+    async fn with_stall_fires_after_timeout() {
+        let result = with_stall(1u64, async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        assert!(result.is_err(), "with_stall should return Err on timeout");
+        assert!(
+            result.unwrap_err().to_string().contains("stalled"),
+            "error message should contain 'stalled'"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_stall_zero_disables_timeout() {
+        // secs=0 means disabled; a quick future should return Ok.
+        let result = with_stall(0u64, async { Ok::<u32, anyhow::Error>(42) }).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn with_stall_passes_through_ok() {
+        let result = with_stall(30u64, async { Ok::<&str, anyhow::Error>("done") }).await;
+        assert_eq!(result.unwrap(), "done");
+    }
+
+    #[tokio::test]
+    async fn with_stall_propagates_inner_error() {
+        let result = with_stall(30u64, async {
+            anyhow::bail!("inner error");
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("inner error"));
     }
 }

@@ -134,6 +134,8 @@ fn listener_options_with_collision(
         collision,
         persistent: false,
         ask_confirm: false,
+        confirm_timeout: 120,
+        stall_timeout: 0, // disabled in tests to avoid false timeouts
     }
 }
 
@@ -165,6 +167,7 @@ fn sender_options(
         parallel,
         symlinks: SymlinkMode::Exclude,
         devices: DeviceMode::Exclude,
+        stall_timeout: 0, // disabled in tests to avoid false timeouts
     }
 }
 
@@ -226,6 +229,8 @@ async fn transfer_single_file_over_relay() -> Result<()> {
             collision: CollisionPolicy::Fail,
             persistent: false,
             ask_confirm: false,
+            confirm_timeout: 120,
+            stall_timeout: 0,
         })
         .await
     });
@@ -250,6 +255,7 @@ async fn transfer_single_file_over_relay() -> Result<()> {
         parallel: 0,
         symlinks: SymlinkMode::Exclude,
         devices: DeviceMode::Exclude,
+        stall_timeout: 0,
     })
     .await?;
     let listener = listener.await.context("listener task join failed")??;
@@ -664,6 +670,8 @@ async fn transfer_directory_preserves_structure() -> Result<()> {
             collision: CollisionPolicy::Fail,
             persistent: false,
             ask_confirm: false,
+            confirm_timeout: 120,
+            stall_timeout: 0,
         })
         .await
     });
@@ -688,6 +696,7 @@ async fn transfer_directory_preserves_structure() -> Result<()> {
         parallel: 0,
         symlinks: SymlinkMode::Include,
         devices: DeviceMode::Exclude,
+        stall_timeout: 0,
     })
     .await?;
     listener.await.context("listener task join failed")??;
@@ -1330,6 +1339,8 @@ async fn transfer_single_file_over_direct_udp() -> Result<()> {
             collision: CollisionPolicy::Fail,
             persistent: false,
             ask_confirm: false,
+            confirm_timeout: 120,
+            stall_timeout: 0,
         })
         .await
     });
@@ -1354,6 +1365,7 @@ async fn transfer_single_file_over_direct_udp() -> Result<()> {
         parallel: 0,
         symlinks: SymlinkMode::Exclude,
         devices: DeviceMode::Exclude,
+        stall_timeout: 0,
     })
     .await?;
     let listener = listener.await.context("listener task join failed")??;
@@ -1846,6 +1858,7 @@ async fn transfer_multi_source_files_over_relay() -> Result<()> {
         parallel: 0,
         symlinks: SymlinkMode::Exclude,
         devices: DeviceMode::Exclude,
+        stall_timeout: 0,
     })
     .await?;
     listener.await.context("listener task join failed")??;
@@ -1899,6 +1912,8 @@ async fn transfer_persistent_listener_two_sequential_transfers() -> Result<()> {
                 collision: CollisionPolicy::Fail,
                 persistent: true,
                 ask_confirm: false,
+                confirm_timeout: 120,
+                stall_timeout: 0,
             })
             .await
         }
@@ -1926,6 +1941,7 @@ async fn transfer_persistent_listener_two_sequential_transfers() -> Result<()> {
         parallel: 0,
         symlinks: SymlinkMode::Exclude,
         devices: DeviceMode::Exclude,
+        stall_timeout: 0,
     })
     .await?;
     assert_eq!(
@@ -1956,6 +1972,7 @@ async fn transfer_persistent_listener_two_sequential_transfers() -> Result<()> {
         parallel: 0,
         symlinks: SymlinkMode::Exclude,
         devices: DeviceMode::Exclude,
+        stall_timeout: 0,
     })
     .await?;
     assert_eq!(
@@ -2030,6 +2047,7 @@ async fn transfer_source_files_flag() -> Result<()> {
         parallel: 0,
         symlinks: SymlinkMode::Exclude,
         devices: DeviceMode::Exclude,
+        stall_timeout: 0,
     })
     .await?;
     listener.await.context("listener task join failed")??;
@@ -2043,6 +2061,156 @@ async fn transfer_source_files_flag() -> Result<()> {
         b"world"
     );
 
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+/// A re-run of the same sender (same transfer_id + same content) must succeed idempotently
+/// rather than failing with "destination already exists" (F3 committed-marker fix).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_idempotent_recompletion_after_commit() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("idemp-source");
+    let dest_root = temp_path("idemp-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let file = source_root.join("data.txt");
+    write_file(&file, b"hello idempotent").await?;
+
+    let transfer_id = format!("idemp-{}", Uuid::new_v4());
+
+    // Persistent listener so the second sender can connect after the first completes.
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            let mut opts = listener_options(transfer_id, dest_root, true, 1, None);
+            opts.persistent = true;
+            bore_cli::transfer::run_listener(opts).await
+        }
+    });
+    time::sleep(Duration::from_millis(200)).await;
+
+    // First send succeeds normally.
+    bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        file.clone(),
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await?;
+
+    time::sleep(Duration::from_millis(300)).await;
+
+    // Second send with identical content + same transfer_id must succeed (idempotent
+    // re-completion via the committed marker — not a false collision).
+    bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        file.clone(),
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await
+    .expect("idempotent re-run must succeed, not fail with collision");
+
+    // File in dest must still contain the original content.
+    let content = read_file(&dest_root.join("data.txt")).await?;
+    assert_eq!(
+        content, b"hello idempotent",
+        "file content must be unchanged"
+    );
+
+    listener.abort();
+    let _ = listener.await;
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+/// A committed marker with a different manifest_hash (stale marker) must be ignored
+/// and the transfer must proceed normally — here triggering a real collision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_committed_marker_mismatch_starts_fresh() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("idemp-stale-source");
+    let dest_root = temp_path("idemp-stale-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let file = source_root.join("data.txt");
+    write_file(&file, b"original content").await?;
+
+    let transfer_id = format!("idemp-stale-{}", Uuid::new_v4());
+
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            let mut opts = listener_options(transfer_id, dest_root, true, 1, None);
+            opts.persistent = true;
+            bore_cli::transfer::run_listener(opts).await
+        }
+    });
+    time::sleep(Duration::from_millis(200)).await;
+
+    // First send succeeds — committed marker is written with hash H1.
+    bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        file.clone(),
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await?;
+
+    time::sleep(Duration::from_millis(300)).await;
+
+    // Change the file so the manifest hash differs from the committed marker (stale).
+    write_file(&file, b"different content").await?;
+
+    // Second send has a different manifest → stale marker removed → normal collision check
+    // → data.txt already exists in dest_root → CollisionPolicy::Fail → error.
+    let result = bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        file.clone(),
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await;
+    assert!(
+        result.is_err(),
+        "stale committed marker must not suppress a real collision"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("destination already exists") || err.contains("collision"),
+        "error must mention destination conflict, got: {err}"
+    );
+
+    // Original file content is preserved.
+    let content = read_file(&dest_root.join("data.txt")).await?;
+    assert_eq!(
+        content, b"original content",
+        "original committed content must be preserved"
+    );
+
+    listener.abort();
+    let _ = listener.await;
     let _ = fs::remove_dir_all(&source_root).await;
     let _ = fs::remove_dir_all(&dest_root).await;
     Ok(())
@@ -2081,6 +2249,8 @@ async fn transfer_persistent_listener_collision_continues() -> Result<()> {
                 collision: CollisionPolicy::Fail,
                 persistent: true,
                 ask_confirm: false,
+                confirm_timeout: 120,
+                stall_timeout: 0,
             })
             .await
         }
@@ -2108,10 +2278,16 @@ async fn transfer_persistent_listener_collision_continues() -> Result<()> {
         parallel: 0,
         symlinks: SymlinkMode::Exclude,
         devices: DeviceMode::Exclude,
+        stall_timeout: 0,
     })
     .await?;
 
     time::sleep(Duration::from_millis(300)).await;
+
+    // Mutate the file so its manifest hash differs from the committed marker written by
+    // the first transfer. This triggers the stale-marker removal path, and the normal
+    // CollisionPolicy::Fail check fires because data.txt already exists in dest_root.
+    write_file(&file, b"different content").await?;
 
     // Second transfer fails (collision) — sender gets error, listener stays up
     let second_result = bore_cli::transfer::run_sender(SenderOptions {
@@ -2133,6 +2309,7 @@ async fn transfer_persistent_listener_collision_continues() -> Result<()> {
         parallel: 0,
         symlinks: SymlinkMode::Exclude,
         devices: DeviceMode::Exclude,
+        stall_timeout: 0,
     })
     .await;
     assert!(
@@ -2165,6 +2342,7 @@ async fn transfer_persistent_listener_collision_continues() -> Result<()> {
         parallel: 0,
         symlinks: SymlinkMode::Exclude,
         devices: DeviceMode::Exclude,
+        stall_timeout: 0,
     })
     .await?;
 
@@ -2236,6 +2414,7 @@ async fn transfer_multi_source_flat_no_output_over_relay() -> Result<()> {
         parallel: 0,
         symlinks: SymlinkMode::Exclude,
         devices: DeviceMode::Exclude,
+        stall_timeout: 0,
     })
     .await?;
     listener.await.context("listener task join failed")??;
@@ -2335,6 +2514,7 @@ async fn transfer_ask_confirm_returns_err_when_no_tty_available() -> Result<()> 
         parallel: 0,
         symlinks: SymlinkMode::Exclude,
         devices: DeviceMode::Exclude,
+        stall_timeout: 0,
     })
     .await;
 

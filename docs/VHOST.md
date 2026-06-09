@@ -102,6 +102,43 @@ raw (headers not re-injected). Full per-request rewriting is future work.
 
 ---
 
+## WebSocket support
+
+`bore vhost` supports standard WebSocket upgrades over **HTTP/1.1**:
+
+- `ws://` over the plain HTTP frontend
+- `wss://` over the HTTPS frontend
+- both the normal TCP relay path and `bore vhost --udp`
+
+The reason is simple: once the server has read the first HTTP request head to route by
+`Host` (and optionally inject headers on that first head), the connection is spliced
+full-duplex to the provider. After the upstream returns `101 Switching Protocols`,
+WebSocket frames flow as an opaque byte stream.
+
+What is covered:
+
+- browser/client -> server over HTTP or HTTPS
+- server -> provider over relay TCP
+- server -> provider over vhost QUIC (`--udp`)
+- text, binary, ping/pong, and close frames
+
+Important caveats:
+
+- The browser-facing side stays **HTTP/TLS to the server** even when `--udp` is enabled.
+  Only the server->provider hop switches to QUIC.
+- Header injection still applies only to the **first request head** on the connection.
+  That is fine for a normal WebSocket upgrade, which happens on the first request.
+- bore does **not** claim support for WebSocket over HTTP/2 extended CONNECT
+  (`RFC 8441`). The supported path is the classic HTTP/1.1 `Upgrade: websocket` flow.
+- If the vhost UDP direct path drops while a WebSocket is already open, that in-flight
+  connection drops like any other live stream. New connections fall back automatically
+  to the TCP relay.
+
+The WebSocket paths are covered by end-to-end tests for HTTP relay, HTTPS relay, and
+vhost UDP.
+
+---
+
 ## DNS prerequisite
 
 Point both a wildcard and an apex record at your server:
@@ -322,6 +359,8 @@ guard removes the registry entry synchronously).
   Future: allow configurable nesting depth.
 - **Header injection is first-request-only** on a keep-alive connection (see above).
   Future: full per-request HTTP/1.1 framing parser.
+- **WebSocket support is HTTP/1.1 Upgrade based.** HTTP/2 extended CONNECT is not
+  implemented.
 - **SNI-based multi-certificate:** not implemented. All subdomains share one wildcard cert.
   Future: SNI dispatch with per-subdomain certificates.
 - **Multi-map per command:** one `--subdomain` per `bore vhost` invocation.

@@ -14,6 +14,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time;
 
+#[path = "support/websocket.rs"]
+mod websocket;
+
 lazy_static! {
     /// Serializes tests that bind the fixed control port.
     static ref SERIAL_GUARD: Mutex<()> = Mutex::new(());
@@ -261,6 +264,115 @@ async fn secret_tunnel_round_trip() -> Result<()> {
     conn.read_exact(&mut buf).await?;
     assert_eq!(&buf, b"hello secret");
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn secret_tunnel_websocket_relay_round_trip() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(Some("ws-secret")).await;
+
+    let ws_port = websocket::spawn_websocket_echo_service(None).await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        ws_port,
+        "localhost",
+        "ws-relay",
+        Some("ws-secret"),
+        false,
+        false,
+        None,
+        false,
+        false,
+        0,
+        0,
+        1024,
+        1,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(provider.listen());
+
+    let proxy = Proxy::new(
+        "localhost",
+        "127.0.0.1:0".parse()?,
+        "ws-relay",
+        Some("ws-secret"),
+        false,
+        false,
+        None,
+        false,
+        false,
+        0,
+        0,
+        1,
+        None,
+    )
+    .await?;
+    let addr = proxy.local_addr()?;
+    tokio::spawn(proxy.listen());
+    time::sleep(Duration::from_millis(100)).await;
+
+    let mut conn = TcpStream::connect(addr).await?;
+    websocket::assert_websocket_round_trip(&mut conn, "secret-relay.local", "/chat").await?;
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secret_tunnel_websocket_direct_udp_round_trip() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    wait_for_control_port(false).await;
+    let mut server = Server::new(1024..=65535, Some("ws-udp-secret"));
+    server.set_udp(true);
+    tokio::spawn(server.listen());
+    wait_for_control_port(true).await;
+
+    let ws_port = websocket::spawn_websocket_echo_service(None).await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        ws_port,
+        "localhost",
+        "ws-direct",
+        Some("ws-udp-secret"),
+        false,
+        true,
+        None,
+        false,
+        false,
+        0,
+        0,
+        1024,
+        1,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(provider.listen());
+    time::sleep(Duration::from_millis(200)).await;
+
+    let proxy = Proxy::new(
+        "localhost",
+        "127.0.0.1:0".parse()?,
+        "ws-direct",
+        Some("ws-udp-secret"),
+        false,
+        true,
+        None,
+        false,
+        false,
+        0,
+        0,
+        1,
+        None,
+    )
+    .await?;
+    assert!(proxy.is_direct(), "expected the secret websocket test to negotiate direct UDP");
+    let addr = proxy.local_addr()?;
+    tokio::spawn(proxy.listen());
+    time::sleep(Duration::from_millis(100)).await;
+
+    let mut conn = TcpStream::connect(addr).await?;
+    websocket::assert_websocket_round_trip(&mut conn, "secret-direct.local", "/chat").await?;
     Ok(())
 }
 

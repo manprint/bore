@@ -9,6 +9,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time;
 
+#[path = "support/websocket.rs"]
+mod websocket;
+
 async fn wait_port(port: u16, listening: bool) {
     for _ in 0..500 {
         if TcpStream::connect(("localhost", port)).await.is_ok() == listening {
@@ -213,6 +216,41 @@ async fn tunnel_port_terminates_tls_and_keeps_plain() -> Result<()> {
     let mut buf = [0u8; 9];
     plain.read_exact(&mut buf).await?;
     assert_eq!(&buf, b"via-raw!!");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_tunnel_tls_terminated_websocket_round_trip() -> Result<()> {
+    const PORT: u16 = 17906;
+    wait_port(PORT, false).await;
+
+    let (cert_pem, key_pem) = self_signed()?;
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+    let mut server = Server::new(1024..=65535, Some("sec"));
+    server.set_control_port(PORT);
+    server.set_tls(acceptor);
+    tokio::spawn(server.listen());
+    wait_port(PORT, true).await;
+
+    let ws_port = websocket::spawn_websocket_echo_service(None).await?;
+    let to = format!("https://localhost:{PORT}");
+    let options = TunnelOptions {
+        https: true,
+        force_https: false,
+        ..Default::default()
+    };
+    let client = Client::new("localhost", ws_port, &to, 0, Some("sec"), true, options).await?;
+    let tunnel = client.remote_port();
+    tokio::spawn(client.listen());
+
+    let endpoint = Endpoint {
+        host: "127.0.0.1".to_string(),
+        port: tunnel,
+        tls: true,
+    };
+    let mut tls = transport::connect(&endpoint, true).await?;
+    websocket::assert_websocket_round_trip(&mut tls, "public-wss.local", "/chat").await?;
 
     Ok(())
 }

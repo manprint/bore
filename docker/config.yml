@@ -1,0 +1,22 @@
+# Mount this file into the server container and point BORE_VHOST_CONFIG to it.
+# Example:
+#   - ./config.yml:/vhost/config.yml:ro
+#   - BORE_VHOST_CONFIG=/vhost/config.yml
+
+base_domain: bore.0912345.xyz
+mode: auto
+
+# Optional when you want HTTPS on the vhost frontend.
+# cert_file: /certs/wildcard.crt
+# key_file: /certs/wildcard.key
+
+default_headers:
+  X-Frame-Options: "SAMEORIGIN"
+  X-XSS-Protection: "1; mode=block"
+  Referrer-Policy: "no-referrer-when-downgrade"
+  Strict-Transport-Security: "max-age=31536000; includeSubDomains"
+  Permissions-Policy: "geolocation=(self), microphone=(self), camera=(self), fullscreen=(self)"
+  Content-Security-Policy: "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;"
+  X-Content-Type-Options: "nosniff"
+
+reservations: []

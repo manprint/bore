@@ -57,6 +57,28 @@ attraverso un server pubblico. Tre ruoli:
     `id` viene rifiutata), ma può avere **più proxy contemporaneamente**: più utenti
     possono agganciarsi allo stesso `id` (sia in relay che in UDP diretto).
 
+### Supporto WebSocket
+
+`bore` supporta il forwarding trasparente delle WebSocket standard:
+
+- **Tunnel pubblico**: `ws://` e, con `--https`, anche `wss://`.
+- **Tunnel segreto**: sia sul relay TCP sia sul path diretto UDP.
+- **Vhost**: WebSocket via **HTTP/1.1 Upgrade** sia sul relay TCP sia con
+  `bore vhost --udp`.
+
+Il motivo è che, dopo l'eventuale lettura iniziale necessaria per routing, TLS,
+redirect o header HTTP, bore passa a uno splice full-duplex byte-stream. Dopo la
+risposta `101 Switching Protocols`, i frame WebSocket viaggiano opachi.
+
+Limiti da conoscere:
+
+- per `bore vhost` il percorso supportato è quello classico HTTP/1.1 `Upgrade: websocket`
+  e **non** WebSocket su HTTP/2 extended CONNECT;
+- con `bore vhost --udp` solo la tratta **server->provider** usa QUIC: il browser parla
+  comunque HTTP/TLS col server;
+- se un path diretto UDP/QUIC cade mentre una WebSocket è già aperta, quella connessione
+  in corso cade; il fallback vale per le nuove connessioni, non per migrare una sessione live.
+
 ### La control port e lo schema di `--to`
 
 Il server ascolta su una **control port** (default `7835`). Tutto il traffico

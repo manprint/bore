@@ -155,11 +155,12 @@ enum Command {
         #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
         notes: Option<String>,
 
-        /// Number of parallel TCP carrier connections for the data path (public
-        /// tunnels only). 1 = current single-connection behaviour. >1 spreads
-        /// proxied connections across several TCP streams to avoid head-of-line
-        /// blocking under concurrency (e.g. many parallel transfers); the server
-        /// caps it at its --max-carriers. Ignored for secret tunnels.
+        /// Number of parallel TCP carrier connections for the relay data path.
+        /// Public tunnels spread inbound proxied connections across them; secret
+        /// providers (`--tcp-secret-id`) spread relayed consumer substreams
+        /// across them. 1 keeps the current single-connection behaviour. >1
+        /// avoids head-of-line blocking under concurrency; server-managed pools
+        /// are capped by `bore server --max-carriers`. Direct UDP ignores it.
         #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
         carriers: u16,
 
@@ -363,9 +364,11 @@ enum Command {
         #[clap(long, value_name = "N", default_value_t = bore_cli::server::DEFAULT_MAX_CONNS, env = "BORE_MAX_CONNS")]
         max_conns: usize,
 
-        /// Maximum number of parallel TCP carrier connections a single tunnel may
-        /// use for its data path (the cap on a client's --carriers request). 1
-        /// disables the carrier pool server-wide.
+        /// Maximum number of parallel TCP carrier connections the server grants
+        /// to one server-managed carrier pool (public tunnels, secret providers,
+        /// vhost providers). Does not cap `bore proxy`, whose relay carriers are
+        /// client-side `ConnectSecret` connections. 1 disables server-managed
+        /// carrier pools.
         #[clap(long, value_name = "N", default_value_t = bore_cli::server::DEFAULT_MAX_CARRIERS, env = "BORE_MAX_CARRIERS")]
         max_carriers: u16,
 
@@ -639,9 +642,10 @@ enum TransferCommand {
         nat_udp_release_timeout: u64,
 
         /// Number of relay carrier connections, used only on the TCP fallback path.
-        /// 0 = auto: match the worker parallelism (capped at the server's max carriers) so
-        /// each relay stream rides its own TCP connection — independent congestion window,
-        /// no head-of-line blocking. 1 forces a single connection. Ignored on direct UDP.
+        /// 0 = auto: match the local worker hint, capped at 16 so each relay
+        /// stream can ride its own TCP connection — independent congestion
+        /// window, no head-of-line blocking. The server may still clamp lower.
+        /// 1 forces a single connection. Ignored on direct UDP.
         #[clap(long, value_name = "N", default_value_t = 0, env = "BORE_CARRIERS")]
         carriers: u16,
 
@@ -751,9 +755,10 @@ enum TransferCommand {
         nat_udp_release_timeout: u64,
 
         /// Number of relay carrier connections, used only on the TCP fallback path.
-        /// 0 = auto: match the worker parallelism (capped at the server's max carriers) so
-        /// each relay stream rides its own TCP connection — independent congestion window,
-        /// no head-of-line blocking. 1 forces a single connection. Ignored on direct UDP.
+        /// 0 = auto: match the resolved worker parallelism, capped at 16 so each
+        /// relay stream can ride its own TCP connection — independent congestion
+        /// window, no head-of-line blocking. The server may still clamp lower on
+        /// provider-side pools. 1 forces a single connection. Ignored on direct UDP.
         #[clap(long, value_name = "N", default_value_t = 0, env = "BORE_CARRIERS")]
         carriers: u16,
 

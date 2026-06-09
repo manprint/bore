@@ -22,6 +22,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time;
 
+#[path = "support/websocket.rs"]
+mod websocket;
+
 lazy_static! {
     /// Serializes registration tests that share a single server on ports 17920/17930.
     static ref SERIAL_GUARD: Mutex<()> = Mutex::new(());
@@ -831,6 +834,170 @@ async fn vhost_concurrency_smoke() -> Result<()> {
     for t in tasks {
         t.await??;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn vhost_http_websocket_relay_round_trip() -> Result<()> {
+    const CTRL: u16 = 17993;
+    const HTTP: u16 = 17994;
+
+    let ws_port = websocket::spawn_websocket_echo_service(Some("x-websocket-test: yes")).await?;
+
+    let mut default_headers = BTreeMap::new();
+    default_headers.insert("X-Websocket-Test".to_string(), "yes".to_string());
+    let cfg = VhostConfig {
+        base_domain: "bore.local".to_string(),
+        mode: VhostModeCfg::Http,
+        http_port: HTTP,
+        https_port: 443,
+        cert_file: None,
+        key_file: None,
+        default_headers,
+        reservations: vec![],
+    };
+
+    spawn_server_vhost(CTRL, cfg).await?;
+    wait_port(HTTP, true).await;
+
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        ws_port,
+        &format!("localhost:{CTRL}"),
+        "wsapp",
+        "client1",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    time::sleep(Duration::from_millis(100)).await;
+
+    let mut conn = TcpStream::connect(("127.0.0.1", HTTP)).await?;
+    websocket::assert_websocket_round_trip(&mut conn, "wsapp.bore.local", "/socket").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn vhost_https_websocket_relay_round_trip() -> Result<()> {
+    const CTRL: u16 = 17995;
+    const HTTPS: u16 = 17996;
+
+    let ws_port = websocket::spawn_websocket_echo_service(None).await?;
+
+    let (cert_pem, key_pem) =
+        self_signed_for(vec!["*.bore.local".to_string(), "bore.local".to_string()])?;
+    let (cert_path, key_path) = write_pem_files(&cert_pem, &key_pem)?;
+    let cfg = VhostConfig {
+        base_domain: "bore.local".to_string(),
+        mode: VhostModeCfg::Https,
+        http_port: 80,
+        https_port: HTTPS,
+        cert_file: Some(cert_path),
+        key_file: Some(key_path),
+        default_headers: BTreeMap::new(),
+        reservations: vec![],
+    };
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_vhost(cfg)?;
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTPS, true).await;
+
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        ws_port,
+        &format!("localhost:{CTRL}"),
+        "wssapp",
+        "client1",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    time::sleep(Duration::from_millis(100)).await;
+
+    let endpoint = Endpoint {
+        host: "127.0.0.1".to_string(),
+        port: HTTPS,
+        tls: true,
+    };
+    let mut tls = transport::connect(&endpoint, true).await?;
+    websocket::assert_websocket_round_trip(&mut tls, "wssapp.bore.local", "/socket").await?;
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_https_websocket_direct_udp_round_trip() -> Result<()> {
+    const CTRL: u16 = 17997;
+    const HTTPS: u16 = 17998;
+    const QUIC: u16 = 17999;
+
+    let ws_port = websocket::spawn_websocket_echo_service(None).await?;
+
+    let (cert_pem, key_pem) =
+        self_signed_for(vec!["*.bore.local".to_string(), "bore.local".to_string()])?;
+    let (cert_path, key_path) = write_pem_files(&cert_pem, &key_pem)?;
+    let cfg = VhostConfig {
+        base_domain: "bore.local".to_string(),
+        mode: VhostModeCfg::Https,
+        http_port: 80,
+        https_port: HTTPS,
+        cert_file: Some(cert_path),
+        key_file: Some(key_path),
+        default_headers: BTreeMap::new(),
+        reservations: vec![],
+    };
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, Some("vhost-ws-udp-secret"));
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(true);
+    server.set_vhost(cfg)?;
+    server.set_vhost_quic_port(QUIC);
+    let registry = server.vhost_registry();
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTPS, true).await;
+
+    let client = Client::new_vhost_provider_with_udp(
+        "127.0.0.1",
+        ws_port,
+        &format!("localhost:{CTRL}"),
+        "udpwss",
+        "client1",
+        Some("vhost-ws-udp-secret"),
+        false,
+        1,
+        true,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+
+    wait_for_vhost_direct(&registry, "udpwss", true).await;
+
+    let endpoint = Endpoint {
+        host: "127.0.0.1".to_string(),
+        port: HTTPS,
+        tls: true,
+    };
+    let mut tls = transport::connect(&endpoint, true).await?;
+    websocket::assert_websocket_round_trip(&mut tls, "udpwss.bore.local", "/socket").await?;
+    assert!(
+        direct_stream_opens(&registry, "udpwss") >= 1,
+        "expected websocket connection to open a direct QUIC stream"
+    );
     Ok(())
 }
 

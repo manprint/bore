@@ -252,6 +252,31 @@ bore local 8080 --to https://bore.tld -p 9000 -s mysecret --https --force-https
 # -> bore.tld:9000           (raw TCP)
 ```
 
+#### WebSocket support
+
+`bore` forwards standard WebSocket connections transparently:
+
+- **Public tunnels** (`bore local`) support `ws://` and, with `--https`, `wss://`.
+- **Secret tunnels** (`bore local --tcp-secret-id` + `bore proxy`) support WebSocket
+  traffic on both the relay path and the direct UDP path.
+- **Vhost** (`bore vhost`) supports standard HTTP/1.1 WebSocket upgrade on both the
+  TCP relay and `bore vhost --udp`.
+
+This works because bore only inspects the first bytes needed for routing / TLS /
+optional HTTP handling, then switches to a full-duplex byte-stream splice. After the
+HTTP `101 Switching Protocols` response, WebSocket frames are forwarded unchanged.
+
+Important caveats:
+
+- The supported vhost/browser path is the classic **HTTP/1.1 `Upgrade: websocket`** flow.
+  WebSocket over HTTP/2 extended CONNECT is not implemented.
+- For `bore vhost --udp`, only the **server->provider** hop uses QUIC; the browser still
+  talks HTTP/TLS to the server.
+- If a live direct UDP/QUIC path drops, an already-open WebSocket on that path drops too;
+  fallback applies to new connections, not migration of an in-flight stream.
+
+End-to-end tests now cover public tunnels, secret tunnels, and vhost WebSocket flows.
+
 ### Self-Hosting
 
 As mentioned in the startup instructions, the CLI now defaults to the public server `https://bore.0912345.xyz`. However, if you want to self-host `bore` on your own network, you can do so with the following command:

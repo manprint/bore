@@ -10,6 +10,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time;
 
+#[path = "support/websocket.rs"]
+mod websocket;
+
 lazy_static! {
     /// Guard to make sure that tests are run serially, not concurrently.
     static ref SERIAL_GUARD: Mutex<()> = Mutex::new(());
@@ -237,6 +240,20 @@ async fn large_payload_transfer() -> Result<()> {
     };
     tokio::try_join!(writer, reader)?;
     assert_eq!(received, payload);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_tunnel_websocket_round_trip() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+
+    spawn_server(Some("ws-secret")).await;
+    let (listener, addr) = spawn_client(Some("ws-secret")).await?;
+    websocket::spawn_websocket_echo_listener(listener, None);
+
+    let mut stream = TcpStream::connect(addr).await?;
+    websocket::assert_websocket_round_trip(&mut stream, "public-ws.local", "/socket").await?;
 
     Ok(())
 }

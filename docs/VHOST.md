@@ -386,6 +386,28 @@ A larger buffer trades memory (≈ `size × 2 directions × concurrent connectio
 for fewer wakeups on high-throughput, high-latency paths. It does **not** raise
 single-stream throughput on a low-latency link — see the one-transfer note above.
 
+### Measured: TCP vs `--udp` (single `curl`, 1 GiB)
+
+| Direction | Transport | Throughput |
+|---|---|---:|
+| Upload, fast link | **TCP relay** | ~110 MB/s (saturates) |
+| Upload, fast link | **`--udp` QUIC** | ~53 MB/s (~half) |
+| Download, ~600 Mbps link | TCP / `--udp` | ~75 MB/s (both link-capped) |
+
+- A single **TCP** (yamux) stream **saturates the link** — it uses kernel
+  segmentation offload (TSO/GSO).
+- A single **QUIC** connection is **send-capped at ~50–75 MB/s**: userspace AEAD +
+  BBR pacing on one core, no kernel offload. This is a property of userspace QUIC
+  (quinn), not a bore bug; `BORE_PROXY_BUFFER_SIZE` does not change it.
+- When the link is slower than the QUIC ceiling, TCP and UDP look identical (network
+  is the bottleneck). When it is faster, the QUIC per-connection ceiling shows.
+
+**Therefore: for maximum throughput, prefer TCP — omit `--udp`.** The QUIC direct
+path is for NAT/firewall traversal and latency, not for higher single-stream
+bandwidth. To exceed the per-connection QUIC ceiling, drive **many concurrent
+connections** (a parallel client) so the multi-carrier QUIC pool (`--carriers N
+--udp`) spreads them across connections/cores; a single `curl` will not benefit.
+
 ---
 
 ## Reservation semantics

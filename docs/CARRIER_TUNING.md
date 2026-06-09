@@ -22,6 +22,54 @@ That distinction matters:
 > per-direction copy buffer at each relay/splice hop — a memory/latency trade for
 > high-BDP links, not a concurrency knob. See `docs/VHOST.md`.
 
+## `--carriers` vs `--parallel` — two different axes
+
+These are often confused. They parallelize at different layers and are **not**
+interchangeable.
+
+| | `--carriers` | `--parallel` |
+|---|---|---|
+| What it parallelizes | **transport connections** (TCP carriers / QUIC connections) | **data streams that split one file** into chunks |
+| Granularity | spreads independent proxied *connections* across N transports | splits a single *payload* (file) into N byte-range chunks, reassembled by offset |
+| Available on | `bore local`, `bore proxy`, `bore vhost`, `bore transfer`, (`bore server` caps it) | **`bore transfer` only** (`listener` / `sender`) |
+| Who owns the payload | nobody — bore is a transparent byte pipe | bore itself (it is the file-transfer application) |
+
+`--parallel` (see `transfer.rs`, `workers = parallel.clamp(1, MAX_PARALLEL)`) divides
+**one file** into chunks keyed by `chunk_index`/offset and reassembles them. It is
+parallelism *inside a single payload*.
+
+### Why only `bore transfer` has `--parallel`
+
+`bore local`, `bore proxy`, and `bore vhost` are **transparent pipes** for a
+*foreign* application stream (a browser's HTTP, an arbitrary TCP protocol). On those
+paths bore cannot offer `--parallel`, because:
+
+1. **It does not understand the payload.** Splitting a stream and reassembling it in
+   order would require parsing the application's framing.
+2. **It does not decide the connection count.** The external client (curl, browser,
+   an app) opens however many connections it wants; bore only forwards them.
+3. **A single foreign TCP/HTTP connection is not splittable** by a transparent proxy.
+
+`bore transfer` is different: it *is* the transfer application — it reads the file,
+knows its size, and addresses chunks by byte offset — so it can chunk and reassemble.
+That is why `--parallel` is coherent there and absent everywhere else. It is by
+design, not an omission.
+
+### The vhost equivalent of `--parallel`
+
+For vhost, payload-level parallelism must come from the **client on the far side**,
+not from bore:
+
+- A multi-connection / ranged client: `aria2c -x16 -s16`, `axel -n16`, or parallel
+  HTTP `Range:` requests. Then set `--carriers N` on `bore vhost` to widen the
+  transport for that concurrency.
+- Or, if the goal is plain file transfer, use `bore transfer --parallel N` (which
+  does both: chunk the file *and* auto-size carriers).
+
+Rule of thumb: **`--carriers` = transport width (generic); `--parallel` = file split
+(only where bore owns the payload).** A single flow over a single connection is never
+sped up by either — see the one-flow note throughout this document.
+
 ## Core rules
 
 1. `0` is special only on `bore transfer listener` and `bore transfer sender`.
@@ -81,6 +129,41 @@ The practical ceiling is usually:
 
 Once carrier count is above the number of busy relay flows, more carriers mostly
 add overhead.
+
+## Measured: TCP saturates, QUIC send is capped per connection
+
+Single-connection `curl` of a 1 GiB file through a `bore vhost` frontend (one HTTP
+connection = one carrier / one QUIC stream):
+
+| Direction | Transport | Throughput |
+|---|---|---:|
+| Upload (fast link) | **TCP relay** | ~110 MB/s (saturates the link) |
+| Upload (fast link) | **`--udp` QUIC** | ~53 MB/s (~half) |
+| Download (≈600 Mbps link) | TCP relay | ~76 MB/s (link-capped) |
+| Download (≈600 Mbps link) | `--udp` QUIC | ~75 MB/s (link-capped) |
+
+Takeaways:
+
+- **A single TCP (yamux) stream saturates the link.** TCP rides kernel
+  segmentation offload (TSO/GSO), so one carrier is enough for one flow — raising
+  `--carriers` does nothing for a lone transfer (as stated above), but the ceiling
+  is the network, not bore.
+- **A single QUIC connection is send-capped at roughly 50–75 MB/s.** QUIC does AEAD
+  encryption and BBR pacing in userspace on one core, without kernel offload, so per
+  *connection* throughput plateaus there. This is a property of userspace QUIC
+  (quinn), not a bore bug, and bigger `BORE_PROXY_BUFFER_SIZE` does not change it.
+- When the link is **slower** than the QUIC ceiling (the download row), TCP and UDP
+  look identical — the network is the bottleneck. When the link is **faster** (the
+  upload row), the QUIC per-connection ceiling shows and UDP falls behind.
+
+Consequences:
+
+- **For maximum vhost throughput, prefer TCP** (omit `--udp`). `--udp` exists for
+  NAT/firewall traversal and lower latency, not for higher single-stream bandwidth.
+- A single large transfer over `--udp` cannot exceed the ~50–75 MB/s per-connection
+  ceiling. To go faster on UDP you need **many concurrent connections** (a parallel
+  client) so the multi-carrier QUIC pool spreads them across connections/cores — see
+  the vhost section below. One `curl` will not benefit.
 
 ## Command-by-command tuning
 

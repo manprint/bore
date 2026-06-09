@@ -1,0 +1,15 @@
+# bore VPN development — passwordless sudo, restricted to the network-test commands
+# the VPN plan needs (docs/VPN_FULL_PLAN_V1.md §11.9-B, §13 netns harness).
+#
+# Install (one-time):
+#   sudo install -o root -g root -m 0440 scripts/dev/bore-vpn-sudoers /etc/sudoers.d/bore-vpn-dev
+# Remove when VPN development is done:
+#   sudo rm /etc/sudoers.d/bore-vpn-dev
+#
+# HONEST SECURITY NOTE (dev machine tradeoff, accepted): unrestricted `ip` includes
+# `ip netns exec <ns> <cmd>`, which can run any command as root inside a netns —
+# this grant is therefore effectively root-equivalent for anyone running as 'fabio'.
+# That is exactly what the netns test harness requires (it runs bore/ping/iperf3
+# inside namespaces). Do NOT install this on a production machine.
+
+fabio ALL=(root) NOPASSWD: /usr/sbin/ip, /usr/sbin/nft, /usr/sbin/iptables, /usr/bin/tee /proc/sys/net/ipv4/ip_forward, /mnt/fabio/dati/Git/Github-manprint/bore-forked/scripts/vpn_netns_test.sh

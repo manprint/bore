@@ -668,10 +668,14 @@ answer to each step before moving on:**
    MTU/datagram (see C), not routing.
 **Stop rule:** if the same symptom survives **3 diagnostic iterations**, stop, write
 down the checklist findings, and surface to the user — do not keep mutating code.
-*(Sudo note: this is a development machine — root/netns commands are allowed. When a
-step needs root, **ask the user to run it / approve it**; never skip a root-gated test
-or mark it passed without executing it. "Couldn't run because root" is not an
-acceptable gate result — asking is.)*
+*(Sudo note: this is a development machine. Passwordless sudo is configured
+(`/etc/sudoers.d/bore-vpn-dev`, source: `scripts/dev/bore-vpn-sudoers`) for exactly:
+`ip`, `nft`, `iptables`, `tee /proc/sys/net/ipv4/ip_forward`, and
+`scripts/vpn_netns_test.sh` (invoke the script **directly** — `sudo
+scripts/vpn_netns_test.sh` — not via `sudo bash ...`, or the sudoers rule won't match).
+Run those without asking. Anything root-gated **outside** that set: ask the user.
+Never skip a root-gated test or mark it passed without executing it — "couldn't run
+because root" is not an acceptable gate result.)*
 
 **C. MTU / datagram-size transient — judgment already removed, follow §6.1 literally.**
 The first seconds of a direct link can drop full-size packets (`TooLarge`) while QUIC

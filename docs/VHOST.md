@@ -130,7 +130,16 @@ mtime change is detected:
   In-flight connections keep their captured `Arc`; new registrations see the new rules.
   On parse failure, the old config is kept and an error is logged (no crash, no downtime).
 - **Cert/key changed:** a new `TlsAcceptor` is built and atomically swapped. New
-  connections see the new certificate; in-flight TLS streams are unaffected.
+  connections see the new certificate; in-flight TLS streams are unaffected. This fires
+  both when the file *contents* change (mtime) **and** when the config repoints
+  `cert_file`/`key_file` to a different path.
+
+**Restart required for `mode` and ports.** The frontend listener set (which of
+HTTP/HTTPS is bound, and on which ports) is fixed when the server starts. Changing
+`mode`, `http_port`, or `https_port` in `vhost.yml` updates the in-memory config and is
+logged with a warning, but the running listeners are **not** rebound — restart `bore
+server` to apply. (Example: starting with `mode: auto` and no cert binds HTTP only; adding
+a cert later reloads the TLS material but does not start an HTTPS listener until restart.)
 
 ---
 
@@ -138,13 +147,13 @@ mtime change is detected:
 
 | Flag | Env var | Default | Description |
 |---|---|---|---|
-| `<TARGET>` | — | — | Local `host:port` (e.g. `127.0.0.1:8080`) |
+| `<TARGET>` | — | — | Local `host:port` (`127.0.0.1:8080`, `localhost:8080`, `:8080`, `[::1]:8080`) |
 | `--subdomain` | `BORE_VHOST_SUBDOMAIN` | — | Subdomain label to register |
 | `--id` | `BORE_VHOST_ID` | — | Client id for reservation matching |
 | `--to` | `BORE_SERVER` | `https://bore.0912345.xyz` | bore server address |
 | `--secret` | `BORE_SECRET` | — | Server authentication secret |
 | `--insecure` | `BORE_INSECURE` | false | Skip TLS cert verification |
-| `--carriers N` | `BORE_CARRIERS` | 1 | Parallel relay TCP connections |
+| `--carriers N` | `BORE_CARRIERS` | 1 | Parallel relay TCP connections (see note below) |
 | `--basic-auth user:pass` | — | — | Reports Basic auth to admin page (display only) |
 | `--notes TEXT` | `BORE_NOTES` | — | Free-form note on the admin page |
 | `--auto-reconnect` | `BORE_AUTO_RECONNECT` | false | Reconnect with backoff on disconnect |
@@ -158,9 +167,24 @@ These flags extend `bore server`:
 | Flag | Env var | Default | Description |
 |---|---|---|---|
 | `--vhost-config <path>` | `BORE_VHOST_CONFIG` | — | Enables vhost frontend |
-| `--vhost-http-port N` | `BORE_VHOST_HTTP_PORT` | 80 | Override `http_port` |
-| `--vhost-https-port N` | `BORE_VHOST_HTTPS_PORT` | 443 | Override `https_port` |
+| `--vhost-http-port N` | `BORE_VHOST_HTTP_PORT` | (from config) | Override `http_port` |
+| `--vhost-https-port N` | `BORE_VHOST_HTTPS_PORT` | (from config) | Override `https_port` |
 | `--vhost-mode <mode>` | `BORE_VHOST_MODE` | (from config) | Override `mode` |
+
+The port/mode flags **override** `vhost.yml` only when passed. When omitted, the values
+from `vhost.yml` are used (yaml defaults: `http_port` 80, `https_port` 443, `mode` auto).
+
+---
+
+## Throughput: `--carriers`
+
+The relay data path multiplexes every proxied connection over the provider's bore tunnel.
+With the default `--carriers 1`, all concurrent requests share a single TCP connection's
+congestion window and are subject to yamux head-of-line blocking. For high-throughput or
+highly-concurrent workloads, raise `--carriers N` on `bore vhost`: proxied connections are
+spread round-robin across `N` parallel TCP carriers (capped by the server's
+`--max-carriers`), isolating congestion windows and removing HOL blocking. `1` preserves
+the single-connection path byte-for-byte.
 
 ---
 

@@ -3785,6 +3785,11 @@ fn truncate_item(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that mutate the process-global
+    /// `BORE_TEST_CONFIRM_RESPONSE` env var so they don't race under the parallel
+    /// test runner (one test's value/removal must not leak into another).
+    static CONFIRM_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn path_codec_round_trips_utf8_component() {
         let original =
@@ -4198,6 +4203,7 @@ mod tests {
     /// branch exits before calling read_confirmation_line.
     #[test]
     fn receiver_ask_confirm_ignored_for_stdin() {
+        let _env = CONFIRM_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         // Inject "n" — the stdin branch must bypass this entirely.
         std::env::set_var("BORE_TEST_CONFIRM_RESPONSE", "n");
         let result = display_and_confirm_manifest_sync(
@@ -4216,6 +4222,7 @@ mod tests {
     /// display_and_confirm_manifest_sync with ask_confirm=false always returns true.
     #[test]
     fn receiver_no_ask_confirm_always_accepts() {
+        let _env = CONFIRM_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         // Even with "n" injected, ask_confirm=false bypasses the prompt entirely.
         std::env::set_var("BORE_TEST_CONFIRM_RESPONSE", "n");
         let begin = BeginFrame {
@@ -4251,6 +4258,7 @@ mod tests {
     /// display_and_confirm_manifest_sync with ask_confirm=true and response "y" accepts.
     #[test]
     fn receiver_ask_confirm_accepts_on_y() {
+        let _env = CONFIRM_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("BORE_TEST_CONFIRM_RESPONSE", "y");
         let begin = BeginFrame {
             protocol_version: PROTOCOL_VERSION,
@@ -4285,6 +4293,7 @@ mod tests {
     /// display_and_confirm_manifest_sync with ask_confirm=true and response "n" rejects.
     #[test]
     fn receiver_ask_confirm_rejects_on_n() {
+        let _env = CONFIRM_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("BORE_TEST_CONFIRM_RESPONSE", "n");
         let begin = BeginFrame {
             protocol_version: PROTOCOL_VERSION,

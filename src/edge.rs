@@ -33,7 +33,7 @@ const HTTP_METHODS: [&[u8]; 9] = [
 ];
 
 /// Maximum number of request bytes read while building a redirect.
-const MAX_REQUEST_HEAD: usize = 8 * 1024;
+const MAX_REQUEST_HEAD: usize = 16 * 1024;
 
 /// A stream the edge can forward: anything readable, writable, and `Send`. Used
 /// to type-erase a [`Prefixed`] wrapper over either a plain or a TLS stream.
@@ -231,8 +231,11 @@ pub(crate) async fn read_request_head(stream: &mut TcpStream) -> Result<Vec<u8>>
         if n == 0 {
             break;
         }
+        // Scan only the newly-read region (plus 3 bytes of overlap) instead of
+        // re-scanning the whole buffer each iteration.
+        let scan_from = buf.len().saturating_sub(3);
         buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= MAX_REQUEST_HEAD {
+        if buf[scan_from..].windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= MAX_REQUEST_HEAD {
             break;
         }
     }

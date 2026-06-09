@@ -454,23 +454,13 @@ enum Command {
         #[clap(long, value_name = "PATH", env = "BORE_VHOST_CONFIG")]
         vhost_config: Option<PathBuf>,
 
-        /// Override the HTTP frontend port from vhost.yml (default 80).
-        #[clap(
-            long,
-            value_name = "PORT",
-            default_value_t = 80,
-            env = "BORE_VHOST_HTTP_PORT"
-        )]
-        vhost_http_port: u16,
+        /// Override the HTTP frontend port from vhost.yml (yaml default 80).
+        #[clap(long, value_name = "PORT", env = "BORE_VHOST_HTTP_PORT")]
+        vhost_http_port: Option<u16>,
 
-        /// Override the HTTPS frontend port from vhost.yml (default 443).
-        #[clap(
-            long,
-            value_name = "PORT",
-            default_value_t = 443,
-            env = "BORE_VHOST_HTTPS_PORT"
-        )]
-        vhost_https_port: u16,
+        /// Override the HTTPS frontend port from vhost.yml (yaml default 443).
+        #[clap(long, value_name = "PORT", env = "BORE_VHOST_HTTPS_PORT")]
+        vhost_https_port: Option<u16>,
 
         /// Override the frontend mode from vhost.yml.
         /// Values: http | https | both | redirect-https
@@ -1163,8 +1153,12 @@ async fn dispatch(command: Command) -> Result<()> {
                     format!("failed to read vhost config: {}", config_path.display())
                 })?;
                 let mut cfg = bore_cli::vhost::parse_config(&yaml)?;
-                cfg.http_port = vhost_http_port;
-                cfg.https_port = vhost_https_port;
+                if let Some(port) = vhost_http_port {
+                    cfg.http_port = port;
+                }
+                if let Some(port) = vhost_https_port {
+                    cfg.https_port = port;
+                }
                 if let Some(mode_str) = vhost_mode {
                     cfg.mode = match mode_str.as_str() {
                         "http" => bore_cli::vhost::VhostModeCfg::Http,
@@ -1337,16 +1331,29 @@ async fn serve_proxy(proxy: Proxy) -> Result<()> {
     proxy.listen().await
 }
 
-/// Parse a proxy bind address. A leading ":" (e.g. ":5555") binds all interfaces.
+/// Parse a vhost forward target `host:port`. A leading ":" (e.g. ":8080") means
+/// `localhost`. The host may be an IP literal or a hostname (resolved at connect
+/// time), matching the local/proxy/transfer subcommands.
 fn parse_vhost_target(target: &str) -> Result<(String, u16)> {
     let normalized = match target.strip_prefix(':') {
         Some(port) => format!("localhost:{port}"),
         None => target.to_string(),
     };
-    let addr: SocketAddr = normalized
-        .parse()
+    // Prefer a full socket address (handles IPv4 and bracketed IPv6 literals).
+    if let Ok(addr) = normalized.parse::<SocketAddr>() {
+        return Ok((addr.ip().to_string(), addr.port()));
+    }
+    // Otherwise accept host:port where host is a name resolved at connect time.
+    let (host, port) = normalized
+        .rsplit_once(':')
         .with_context(|| format!("invalid vhost target '{target}'; expected host:port"))?;
-    Ok((addr.ip().to_string(), addr.port()))
+    if host.is_empty() {
+        anyhow::bail!("invalid vhost target '{target}'; expected host:port");
+    }
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("invalid port in vhost target '{target}'; expected host:port"))?;
+    Ok((host.to_string(), port))
 }
 
 fn parse_proxy_addr(value: &str) -> Result<SocketAddr> {
@@ -1766,6 +1773,93 @@ mod tests {
         match saved {
             Some(value) => std::env::set_var("BORE_SERVER", value),
             None => std::env::remove_var("BORE_SERVER"),
+        }
+    }
+
+    #[test]
+    fn parse_vhost_target_accepts_ip_hostname_and_shorthand() {
+        // IPv4 literal.
+        assert_eq!(
+            parse_vhost_target("127.0.0.1:8080").unwrap(),
+            ("127.0.0.1".to_string(), 8080)
+        );
+        // Hostname (resolved at connect time) — must NOT require an IP literal.
+        assert_eq!(
+            parse_vhost_target("localhost:8080").unwrap(),
+            ("localhost".to_string(), 8080)
+        );
+        // `:port` shorthand → localhost.
+        assert_eq!(
+            parse_vhost_target(":8080").unwrap(),
+            ("localhost".to_string(), 8080)
+        );
+        // IPv6 literal.
+        assert_eq!(
+            parse_vhost_target("[::1]:8080").unwrap(),
+            ("::1".to_string(), 8080)
+        );
+    }
+
+    #[test]
+    fn parse_vhost_target_rejects_malformed() {
+        assert!(parse_vhost_target("no-port").is_err());
+        assert!(parse_vhost_target("localhost:not-a-port").is_err());
+        assert!(parse_vhost_target(":99999").is_err()); // port out of u16 range
+    }
+
+    #[test]
+    fn server_vhost_port_flags_default_to_none() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        // With no --vhost-http-port/--vhost-https-port flags, the options are None
+        // so the dispatch leaves the vhost.yml ports untouched (regression: the old
+        // u16 defaults of 80/443 silently clobbered the config).
+        let args = Args::parse_from(["bore", "server"]);
+        let Command::Server {
+            vhost_http_port,
+            vhost_https_port,
+            ..
+        } = args.command
+        else {
+            panic!("expected server command");
+        };
+        assert_eq!(vhost_http_port, None);
+        assert_eq!(vhost_https_port, None);
+    }
+
+    #[test]
+    fn server_vhost_port_flags_parse_when_present() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved_http = std::env::var_os("BORE_VHOST_HTTP_PORT");
+        let saved_https = std::env::var_os("BORE_VHOST_HTTPS_PORT");
+        std::env::remove_var("BORE_VHOST_HTTP_PORT");
+        std::env::remove_var("BORE_VHOST_HTTPS_PORT");
+
+        let args = Args::parse_from([
+            "bore",
+            "server",
+            "--vhost-http-port",
+            "8080",
+            "--vhost-https-port",
+            "8443",
+        ]);
+        let Command::Server {
+            vhost_http_port,
+            vhost_https_port,
+            ..
+        } = args.command
+        else {
+            panic!("expected server command");
+        };
+        assert_eq!(vhost_http_port, Some(8080));
+        assert_eq!(vhost_https_port, Some(8443));
+
+        match saved_http {
+            Some(v) => std::env::set_var("BORE_VHOST_HTTP_PORT", v),
+            None => std::env::remove_var("BORE_VHOST_HTTP_PORT"),
+        }
+        match saved_https {
+            Some(v) => std::env::set_var("BORE_VHOST_HTTPS_PORT", v),
+            None => std::env::remove_var("BORE_VHOST_HTTPS_PORT"),
         }
     }
 }

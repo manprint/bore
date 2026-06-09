@@ -1081,11 +1081,243 @@ fn vhost_https_mode_without_cert_errors() {
     );
 }
 
+// ─── POST body + header injection (control=17972, http=17973) ────────────────
+
+/// Stub that reads a full request (headers + `Content-Length` body) and captures
+/// the raw bytes, then replies 200.
+async fn spawn_body_capturing_stub(captured: Arc<Mutex<Option<Vec<u8>>>>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let captured = Arc::clone(&captured);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16384];
+                let mut total = 0;
+                // Read until headers complete, then until headers+body length reached.
+                let mut need: Option<usize> = None;
+                loop {
+                    let n = stream.read(&mut buf[total..]).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                    if need.is_none() {
+                        if let Some(p) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&buf[..p]);
+                            let cl = headers
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        v.trim().parse::<usize>().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            need = Some(p + 4 + cl);
+                        }
+                    }
+                    if let Some(target) = need {
+                        if total >= target || total >= buf.len() {
+                            break;
+                        }
+                    }
+                }
+                *captured.lock().await = Some(buf[..total].to_vec());
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+    port
+}
+
+/// Send a POST with `body` and the given Host header; headers+body in one write so
+/// the server's head reader over-reads the body (the F1 regression condition).
+async fn send_http_post(port: u16, host: &str, body: &str) -> Result<String> {
+    let mut conn = time::timeout(
+        Duration::from_secs(3),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await??;
+    let req = format!(
+        "POST / HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    conn.write_all(req.as_bytes()).await?;
+    conn.shutdown().await?;
+    let mut resp = Vec::new();
+    time::timeout(Duration::from_secs(5), conn.read_to_end(&mut resp)).await??;
+    Ok(String::from_utf8_lossy(&resp).into_owned())
+}
+
+#[tokio::test]
+async fn vhost_post_body_preserved_with_inject() -> Result<()> {
+    const CTRL: u16 = 17972;
+    const HTTP: u16 = 17973;
+
+    let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let stub_port = spawn_body_capturing_stub(Arc::clone(&captured)).await;
+
+    // default_headers makes the rewrite (inject) path active — the path that used
+    // to drop the request body.
+    let mut default_headers = BTreeMap::new();
+    default_headers.insert("X-Injected".to_string(), "yes".to_string());
+
+    let cfg = VhostConfig {
+        base_domain: "bore.local".to_string(),
+        mode: VhostModeCfg::Http,
+        http_port: HTTP,
+        https_port: 443,
+        cert_file: None,
+        key_file: None,
+        default_headers,
+        reservations: vec![],
+    };
+
+    spawn_server_vhost(CTRL, cfg).await?;
+    wait_port(HTTP, true).await;
+
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "post",
+        "client1",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    time::sleep(Duration::from_millis(50)).await;
+
+    let body = "the-quick-brown-fox-jumps-over-the-lazy-dog";
+    let _ = send_http_post(HTTP, "post.bore.local", body).await?;
+    time::sleep(Duration::from_millis(100)).await;
+
+    let raw = captured
+        .lock()
+        .await
+        .clone()
+        .expect("stub did not capture request");
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        text.contains("X-Injected: yes"),
+        "inject header must be present: {text}"
+    );
+    assert!(
+        text.ends_with(body),
+        "request body must reach the upstream intact, got tail: {:?}",
+        &text[text.len().saturating_sub(80)..]
+    );
+    Ok(())
+}
+
+// ─── HTTPS routing rejects foreign base domain (control=17974, https=17975) ──
+
+#[tokio::test]
+async fn vhost_https_rejects_foreign_base_domain() -> Result<()> {
+    const CTRL: u16 = 17974;
+    const HTTPS: u16 = 17975;
+
+    let stub_port = spawn_http_stub("hello-tls").await;
+
+    let (cert_pem, key_pem) =
+        self_signed_for(vec!["*.bore.local".to_string(), "bore.local".to_string()])?;
+    let (cert_path, key_path) = write_pem_files(&cert_pem, &key_pem)?;
+
+    let cfg = VhostConfig {
+        base_domain: "bore.local".to_string(),
+        mode: VhostModeCfg::Https,
+        http_port: 80,
+        https_port: HTTPS,
+        cert_file: Some(cert_path),
+        key_file: Some(key_path),
+        default_headers: BTreeMap::new(),
+        reservations: vec![],
+    };
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_vhost(cfg)?;
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTPS, true).await;
+
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "tlsapp",
+        "client1",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    time::sleep(Duration::from_millis(50)).await;
+
+    let endpoint = Endpoint {
+        host: "127.0.0.1".to_string(),
+        port: HTTPS,
+        tls: true,
+    };
+
+    // Helper: send a request with an arbitrary Host header over TLS, return response.
+    async fn https_request(endpoint: &Endpoint, host: &str) -> Result<String> {
+        let mut tls = transport::connect(endpoint, true).await?;
+        let req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        tls.write_all(req.as_bytes()).await?;
+        tls.shutdown().await?;
+        let mut resp = Vec::new();
+        time::timeout(Duration::from_secs(5), tls.read_to_end(&mut resp)).await??;
+        Ok(String::from_utf8_lossy(&resp).into_owned())
+    }
+
+    // Correct base domain → routed → 200.
+    let ok = https_request(&endpoint, "tlsapp.bore.local").await?;
+    assert!(ok.contains("hello-tls"), "valid host must route: {ok}");
+
+    // Foreign base domain with a registered first label → must be rejected (502),
+    // not routed (regression: HTTPS used to ignore the base domain).
+    let foreign = https_request(&endpoint, "tlsapp.evil.com").await?;
+    assert!(
+        foreign.starts_with("HTTP/1.1 502"),
+        "foreign base domain must 502, got: {foreign}"
+    );
+
+    // Nested label under the base domain → rejected (HTTP path already rejects it).
+    let nested = https_request(&endpoint, "a.tlsapp.bore.local").await?;
+    assert!(
+        nested.starts_with("HTTP/1.1 502"),
+        "nested label must 502, got: {nested}"
+    );
+    Ok(())
+}
+
 // ─── TODO: cert hot-reload test ───────────────────────────────────────────────
 // Cert hot-reload (swapping cert/key files while the server is live) is complex
 // to test reliably in a short integration test because:
 //   - The hot-reload task polls every 2s using mtime comparison.
 //   - Generating two different self-signed certs, writing them, waiting for mtime
 //     change detection, and then verifying the new cert is used requires careful
-//     timing and a way to inspect which cert the TLS handshake negotiated.
-// This is left as future work.
+//     timing and a way to inspect which cert the TLS handshake negotiated
+//     (tokio-rustls is not a dev-dependency, so peer-cert inspection in-test is
+//     not currently wired up).
+// The reload *path* (including the cert/key path-change → forced TLS reload fixed
+// in this audit) is exercised by `vhost_config_hot_reload`; cert-DER verification
+// is left as future work.

@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::admin::{AdminRegistry, NewEntry, Role};
@@ -267,6 +267,12 @@ pub fn resolve_mode(cfg: &VhostConfig, cert_present: bool) -> Result<VhostMode> 
     Ok(mode)
 }
 
+/// Whether a usable TLS certificate is configured: both the chain and the key
+/// must be present. Single source of truth for the cert-present predicate.
+pub fn cert_present(cfg: &VhostConfig) -> bool {
+    cfg.cert_file.is_some() && cfg.key_file.is_some()
+}
+
 /// Compute the public URL(s) for a registered vhost subdomain.
 ///
 /// Port is omitted from the URL when it matches the scheme default (80/443).
@@ -399,7 +405,7 @@ pub async fn serve_vhost_provider(
     });
 
     // Compute and send the public URLs based on current config.
-    let mode = resolve_mode(&cfg, cfg.cert_file.is_some()).unwrap_or(VhostMode::Http);
+    let mode = resolve_mode(&cfg, cert_present(&cfg)).unwrap_or(VhostMode::Http);
     let (http_url, https_url) = public_urls(
         &subdomain,
         &cfg.base_domain,
@@ -467,38 +473,28 @@ pub async fn serve_vhost_provider(
     }
 }
 
-/// Splice one inbound public HTTP(S) connection to the registered vhost provider.
+/// Splice one inbound public HTTP(S) connection to a registered vhost provider.
 ///
-/// `head` is the already-read request head bytes that must be forwarded before
-/// splicing. `inject` is the set of headers to rewrite into the head, or `None`
-/// for the zero-overhead pure-splice path.
+/// `entry` is the already-resolved registry entry (carrier pool + inject headers),
+/// cloned out by the caller so no DashMap guard is held across an await. `head` is
+/// the already-read request head, forwarded (with header injection if the entry has
+/// any configured) before the bidirectional splice begins.
 pub async fn relay_vhost(
     public: impl AsyncRead + AsyncWrite + Unpin,
-    reg: &VhostRegistry,
-    sub: &str,
-    inject: Option<&[(String, String)]>,
+    entry: &VhostEntry,
     head: Vec<u8>,
 ) -> Result<()> {
-    // Clone the pool out before any await — never hold the DashMap guard across an await.
-    let entry = reg
-        .get(sub)
-        .map(|e| Arc::clone(e.value()))
-        .with_context(|| format!("no vhost provider registered for '{sub}'"))?;
-
     let opener = entry.pool.pick().context("no live vhost carrier")?;
     let mut provider = opener.open().await.context("vhost provider unavailable")?;
     provider.write_all(&[mux::STREAM_READY]).await?;
 
     let mut public = public;
-    match inject {
-        Some(headers) if !headers.is_empty() => {
-            let rewritten = rewrite_head(&head, headers);
-            provider.write_all(&rewritten).await?;
-        }
-        _ => {
-            // No headers to inject: forward the already-read head as-is.
-            provider.write_all(&head).await?;
-        }
+    if entry.headers.is_empty() {
+        // Zero-overhead pure-splice path: forward the already-read head as-is.
+        provider.write_all(&head).await?;
+    } else {
+        let rewritten = rewrite_head(&head, &entry.headers);
+        provider.write_all(&rewritten).await?;
     }
 
     tokio::io::copy_bidirectional_with_sizes(
@@ -514,54 +510,95 @@ pub async fn relay_vhost(
 /// Rewrite a request head: insert/override configured headers, keep the rest.
 ///
 /// Only modifies headers whose names appear in `inject`; preserves all other
-/// headers and the request line unchanged.
+/// headers and the request line unchanged. Operates on raw bytes (no lossy UTF-8
+/// conversion) so header values with non-ASCII bytes survive intact.
+///
+/// The head buffer may contain bytes *past* the header terminator — request-body
+/// bytes (or a pipelined follow-up) that arrived in the same read. Those are
+/// preserved verbatim after the rewritten headers. If the buffer has no complete
+/// `\r\n\r\n` terminator (e.g. it was truncated at the read cap), no rewrite is
+/// attempted and the bytes are returned unchanged so the stream never desyncs.
 ///
 /// **MVP limitation:** only the first request head of the connection is rewritten.
 /// Subsequent keep-alive requests are spliced raw.
 pub fn rewrite_head(head: &[u8], inject: &[(String, String)]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(head);
-    let mut lines = text.split("\r\n");
-
-    // Keep the request line intact.
-    let request_line = lines.next().unwrap_or("");
-    let inject_names: Vec<&str> = inject.iter().map(|(k, _)| k.as_str()).collect();
+    // Locate the end of the header block. Everything after it is body bytes that
+    // must be forwarded as-is; without a complete terminator, do not rewrite.
+    let Some(sep) = head.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return head.to_vec();
+    };
+    let headers_region = &head[..sep];
+    let rest = &head[sep + 4..];
 
     let mut out = Vec::with_capacity(head.len() + 256);
-    out.extend_from_slice(request_line.as_bytes());
-    out.extend_from_slice(b"\r\n");
+    // Split on LF and strip a trailing CR, so each piece is one header (or the
+    // request line) with its line ending removed.
+    let mut lines = headers_region.split(|&b| b == b'\n').map(trim_cr);
 
-    // Keep existing headers that are NOT overridden.
-    let mut found_end = false;
+    // Keep the request line intact.
+    if let Some(request_line) = lines.next() {
+        out.extend_from_slice(request_line);
+        out.extend_from_slice(b"\r\n");
+    }
+
+    // Keep existing headers that are NOT overridden (case-insensitive name match).
     for line in lines {
         if line.is_empty() {
-            found_end = true;
-            break;
+            continue;
         }
-        // Check if this header name is being overridden.
-        let should_drop = if let Some(colon) = line.find(':') {
-            let name = line[..colon].trim();
-            inject_names.iter().any(|n| n.eq_ignore_ascii_case(name))
-        } else {
-            false
+        let should_drop = match line.iter().position(|&b| b == b':') {
+            Some(colon) => {
+                let name = trim_ascii(&line[..colon]);
+                inject
+                    .iter()
+                    .any(|(k, _)| k.as_bytes().eq_ignore_ascii_case(name))
+            }
+            None => false,
         };
         if !should_drop {
-            out.extend_from_slice(line.as_bytes());
+            out.extend_from_slice(line);
             out.extend_from_slice(b"\r\n");
         }
     }
 
-    // Append the injected headers.
+    // Append the injected headers, then close the header block and replay any
+    // already-read body bytes verbatim.
     for (name, value) in inject {
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(b": ");
         out.extend_from_slice(value.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-
-    if found_end {
-        out.extend_from_slice(b"\r\n");
-    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(rest);
     out
+}
+
+/// Strip a single trailing `\r` from a line (the LF was already split off).
+fn trim_cr(line: &[u8]) -> &[u8] {
+    match line.split_last() {
+        Some((b'\r', rest)) => rest,
+        _ => line,
+    }
+}
+
+/// Trim leading/trailing ASCII whitespace from a byte slice.
+fn trim_ascii(mut s: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = s {
+        if first.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    while let [rest @ .., last] = s {
+        if last.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    s
 }
 
 // ─── Frontend handlers ────────────────────────────────────────────────────────
@@ -598,30 +635,33 @@ pub async fn handle_http(
     let sub = match host.and_then(|h| extract_subdomain(h, base_domain)) {
         Some(s) => s,
         None => {
+            debug!(
+                host = host.unwrap_or(""),
+                "vhost http 502: no routable subdomain"
+            );
             return send_bad_gateway(stream).await;
         }
     };
 
-    // Look up inject headers from the registry entry.
-    let inject_headers: Option<Vec<(String, String)>> = registry
-        .get(&sub)
-        .map(|e| e.headers.clone())
-        .filter(|h| !h.is_empty());
-
-    if !registry.contains_key(&sub) {
+    // Single registry lookup: clone the entry out (pool + inject headers) so no
+    // DashMap guard is held across the await in `relay_vhost`.
+    let Some(entry) = registry.get(&sub).map(|e| Arc::clone(e.value())) else {
+        debug!(%sub, "vhost http 502: no provider registered");
         return send_bad_gateway(stream).await;
-    }
+    };
 
-    relay_vhost(stream, registry, &sub, inject_headers.as_deref(), head).await
+    relay_vhost(stream, &entry, head).await
 }
 
 /// Handle one inbound HTTPS connection on the vhost frontend port.
 ///
 /// Terminates TLS with the wildcard acceptor, then routes identically to
-/// [`handle_http`] on the decrypted stream.
+/// [`handle_http`] on the decrypted stream — same `Host`-header → subdomain
+/// extraction against the configured base domain, same single registry lookup.
 pub async fn handle_https(
     stream: TcpStream,
     registry: &VhostRegistry,
+    vhost_config: &Option<SharedVhostConfig>,
     vhost_tls: &Arc<RwLock<Option<Arc<TlsAcceptor>>>>,
 ) -> Result<()> {
     use tokio::time::timeout;
@@ -644,52 +684,33 @@ pub async fn handle_https(
         .await
         .context("timed out reading HTTPS request head")??;
 
+    let cfg = vhost_config.as_ref().map(|c| c.read().unwrap().clone());
+    let base_domain = cfg.as_deref().map(|c| c.base_domain.as_str()).unwrap_or("");
+
     let host = extract_host_from_head(&head);
-    // For HTTPS, we assume the base domain is derivable from the registry itself.
-    // We route by trying to match any registered subdomain in the Host header.
-    let sub = match host.and_then(|h| extract_subdomain_from_registry(h, registry)) {
+    let sub = match host.and_then(|h| extract_subdomain(h, base_domain)) {
         Some(s) => s,
         None => {
-            let _ = tls_stream
-                .write_all(
-                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await;
-            return Ok(());
+            debug!(
+                host = host.unwrap_or(""),
+                "vhost https 502: no routable subdomain"
+            );
+            return send_bad_gateway(tls_stream).await;
         }
     };
 
-    let inject_headers: Option<Vec<(String, String)>> = registry
-        .get(&sub)
-        .map(|e| e.headers.clone())
-        .filter(|h| !h.is_empty());
-
-    relay_vhost(tls_stream, registry, &sub, inject_headers.as_deref(), head).await
-}
-
-/// Try to find a matching subdomain from the Host header by checking all live
-/// registry entries (the base domain is not known here; we match by suffix).
-fn extract_subdomain_from_registry(host: &str, registry: &VhostRegistry) -> Option<String> {
-    // Strip port from host.
-    let host = match host.rfind(':') {
-        Some(i) if host[i + 1..].chars().all(|c| c.is_ascii_digit()) => &host[..i],
-        _ => host,
+    let Some(entry) = registry.get(&sub).map(|e| Arc::clone(e.value())) else {
+        debug!(%sub, "vhost https 502: no provider registered");
+        return send_bad_gateway(tls_stream).await;
     };
-    let host_lc = host.to_lowercase();
-    // Check each registered subdomain: if host starts with "<sub>." it matches.
-    for entry in registry.iter() {
-        let sub = entry.key().to_lowercase();
-        if host_lc == sub || host_lc.starts_with(&format!("{sub}.")) {
-            return Some(entry.key().clone());
-        }
-    }
-    None
+
+    relay_vhost(tls_stream, &entry, head).await
 }
 
-/// Read up to `\r\n\r\n` from any `AsyncRead + Unpin` stream, capped at 8 KiB.
+/// Read up to `\r\n\r\n` from any `AsyncRead + Unpin` stream, capped at 16 KiB.
 async fn read_head_async<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
-    const MAX: usize = 8 * 1024;
+    const MAX: usize = 16 * 1024;
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 512];
     loop {
@@ -697,19 +718,24 @@ async fn read_head_async<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>
         if n == 0 {
             break;
         }
+        // Scan only the newly-read region (plus 3 bytes of overlap) for the
+        // terminator instead of re-scanning the whole buffer each iteration.
+        let scan_from = buf.len().saturating_sub(3);
         buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= MAX {
+        if buf[scan_from..].windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= MAX {
             break;
         }
     }
     Ok(buf)
 }
 
-/// Send a minimal 502 Bad Gateway response and close.
-async fn send_bad_gateway(mut stream: TcpStream) -> Result<()> {
+/// Send a minimal 502 Bad Gateway response and close. Generic over the stream so
+/// both the plain HTTP and TLS-terminated HTTPS paths share one implementation.
+async fn send_bad_gateway<S: AsyncWrite + Unpin>(mut stream: S) -> Result<()> {
     let _ = stream
         .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         .await;
+    let _ = stream.shutdown().await;
     Ok(())
 }
 
@@ -728,8 +754,16 @@ fn extract_host_from_head(head: &[u8]) -> Option<&str> {
 
 // ─── Hot-reload task ──────────────────────────────────────────────────────────
 
-/// Poll cert/key files every 2 s. On mtime change, atomically swap the TLS
-/// acceptor so in-flight connections are unaffected. Config reload (vhost.yml
+/// Poll the vhost config + cert/key files every 2 s.
+///
+/// On a `vhost.yml` change the config is re-parsed and hot-swapped. On a cert/key
+/// change — whether the file *contents* changed (mtime) or the config repointed to
+/// a different file (path) — the TLS acceptor is atomically swapped so in-flight
+/// connections are unaffected.
+///
+/// The frontend listener set (mode + ports) is bound once at startup and cannot be
+/// changed without a restart; a reload that implies a different set is applied to
+/// the config but logged as a warning so the operator knows a restart is needed.
 pub async fn run_reload_task(
     vhost_config: Option<SharedVhostConfig>,
     vhost_tls: Arc<RwLock<Option<Arc<TlsAcceptor>>>>,
@@ -739,9 +773,17 @@ pub async fn run_reload_task(
         return;
     };
 
-    let (mut cert_path, mut key_path) = {
+    // Snapshot the startup config. The bound listener set (mode + ports) is fixed
+    // for the life of the process, so a reload that changes it needs a restart.
+    let (mut cert_path, mut key_path, bound_mode, bound_http_port, bound_https_port) = {
         let cfg = cfg_lock.read().unwrap().clone();
-        (cfg.cert_file.clone(), cfg.key_file.clone())
+        (
+            cfg.cert_file.clone(),
+            cfg.key_file.clone(),
+            resolve_mode(&cfg, cert_present(&cfg)).unwrap_or(VhostMode::Http),
+            cfg.http_port,
+            cfg.https_port,
+        )
     };
     let mut cert_mtime = mtime_of(cert_path.as_deref());
     let mut key_mtime = mtime_of(key_path.as_deref());
@@ -758,26 +800,53 @@ pub async fn run_reload_task(
         if let Some(ref path) = config_path {
             let new_cfg_mtime = mtime_of(Some(path.as_path()));
             if new_cfg_mtime != cfg_mtime {
+                cfg_mtime = new_cfg_mtime;
                 match std::fs::read_to_string(path) {
                     Ok(yaml) => match parse_config(&yaml) {
                         Ok(new_cfg) => {
-                            cert_path = new_cfg.cert_file.clone();
-                            key_path = new_cfg.key_file.clone();
+                            let new_cert = new_cfg.cert_file.clone();
+                            let new_key = new_cfg.key_file.clone();
+                            let paths_changed = new_cert != cert_path || new_key != key_path;
+
+                            // Warn (don't fail) when the reload implies a listener set
+                            // the running process can't honor without a restart.
+                            let new_mode = resolve_mode(&new_cfg, cert_present(&new_cfg))
+                                .unwrap_or(VhostMode::Http);
+                            if new_mode != bound_mode {
+                                warn!(
+                                    ?bound_mode, ?new_mode,
+                                    "vhost mode changed in config; restart required to (un)bind frontend listeners"
+                                );
+                            }
+                            if new_cfg.http_port != bound_http_port
+                                || new_cfg.https_port != bound_https_port
+                            {
+                                warn!(
+                                    "vhost frontend port changed in config; restart required to rebind listeners"
+                                );
+                            }
+
+                            cert_path = new_cert;
+                            key_path = new_key;
                             *cfg_lock.write().unwrap() = Arc::new(new_cfg);
-                            cfg_mtime = new_cfg_mtime;
-                            cert_mtime = mtime_of(cert_path.as_deref());
-                            key_mtime = mtime_of(key_path.as_deref());
                             info!("vhost config reloaded");
+
+                            // When the cert/key *paths* changed, force a TLS reload:
+                            // resetting the tracked mtimes makes the block below fire
+                            // even if the new file's own mtime happens to match.
+                            if paths_changed {
+                                cert_mtime = None;
+                                key_mtime = None;
+                            }
                         }
                         Err(err) => warn!(%err, "vhost config reload failed; keeping old config"),
                     },
                     Err(err) => warn!(%err, "vhost config read failed; keeping old config"),
                 }
-                continue; // cert paths may have changed; re-check on next tick
             }
         }
 
-        // Reload TLS cert/key if either changed.
+        // Reload TLS cert/key if either changed (content mtime, or forced above).
         let new_cert_mtime = mtime_of(cert_path.as_deref());
         let new_key_mtime = mtime_of(key_path.as_deref());
         if new_cert_mtime != cert_mtime || new_key_mtime != key_mtime {
@@ -795,14 +864,12 @@ pub async fn run_reload_task(
                     }
                     Err(err) => warn!(%err, "vhost TLS reload failed; keeping old cert"),
                 }
+            } else {
+                // No cert/key in the current config: record the mtimes so we don't
+                // retry the (impossible) reload on every tick.
+                cert_mtime = new_cert_mtime;
+                key_mtime = new_key_mtime;
             }
-        }
-
-        // Re-read paths from current config in case they changed.
-        {
-            let cfg = cfg_lock.read().unwrap().clone();
-            cert_path = cfg.cert_file.clone();
-            key_path = cfg.key_file.clone();
         }
     }
 }
@@ -1085,5 +1152,73 @@ reservations:
         );
         assert_eq!(http, None);
         assert_eq!(https, Some("https://myapp.bore.example.com".to_string()));
+    }
+
+    // ── rewrite_head ──────────────────────────────────────────────────────
+
+    fn inject(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn rewrite_head_preserves_request_body() {
+        // The head reader can over-read body bytes that arrived in the same TCP
+        // segment as the headers; they must survive the rewrite (regression: they
+        // used to be dropped, corrupting every POST/PUT on the inject path).
+        let head = b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello";
+        let out = rewrite_head(head, &inject(&[("X-Inj", "1")]));
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.ends_with("\r\n\r\nhello"),
+            "body must be preserved: {text}"
+        );
+        assert!(
+            text.contains("X-Inj: 1\r\n"),
+            "injected header must be present"
+        );
+        assert!(
+            text.contains("Content-Length: 5\r\n"),
+            "original headers kept"
+        );
+    }
+
+    #[test]
+    fn rewrite_head_overrides_named_header_case_insensitively() {
+        let head = b"GET / HTTP/1.1\r\nHost: a\r\nX-A: old\r\n\r\n";
+        let out = rewrite_head(head, &inject(&[("x-a", "new")]));
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("x-a: new\r\n"),
+            "override must be injected: {text}"
+        );
+        assert!(
+            !text.contains("X-A: old"),
+            "old value must be dropped: {text}"
+        );
+        assert!(text.contains("Host: a\r\n"), "unrelated header kept");
+    }
+
+    #[test]
+    fn rewrite_head_without_terminator_is_returned_unchanged() {
+        // A head with no complete `\r\n\r\n` (e.g. truncated at the read cap) must
+        // not be rewritten — that would desync the stream. Returned as-is.
+        let head = b"POST /x HTTP/1.1\r\nHost: a\r\nX-Partial: incomplet";
+        let out = rewrite_head(head, &inject(&[("X-Inj", "1")]));
+        assert_eq!(out, head, "no terminator → returned verbatim");
+    }
+
+    #[test]
+    fn rewrite_head_preserves_non_ascii_header_bytes() {
+        // Raw-byte processing must not mangle non-ASCII header values.
+        let head = b"GET / HTTP/1.1\r\nX-Name: caf\xC3\xA9\r\n\r\n";
+        let out = rewrite_head(head, &inject(&[("X-Inj", "1")]));
+        // The café bytes (0xC3 0xA9) must appear untouched.
+        assert!(
+            out.windows(2).any(|w| w == [0xC3, 0xA9]),
+            "non-ascii bytes survive"
+        );
     }
 }

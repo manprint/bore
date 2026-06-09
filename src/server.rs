@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, info_span, trace, warn, Instrument};
+use tracing::{debug, info, info_span, trace, warn, Instrument};
 use uuid::Uuid;
 
 use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Role};
@@ -211,10 +211,10 @@ impl Server {
     /// Returns an error if the mode requires a cert that is not present.
     pub fn set_vhost(&mut self, cfg: vhost::VhostConfig) -> Result<()> {
         use crate::transport;
-        use crate::vhost::resolve_mode;
+        use crate::vhost::{cert_present, resolve_mode};
         use std::sync::RwLock;
 
-        let cert_present = cfg.cert_file.is_some() && cfg.key_file.is_some();
+        let cert_present = cert_present(&cfg);
         let _ = resolve_mode(&cfg, cert_present)?; // fail fast on bad mode+cert combo
 
         // Load TLS if cert+key are present.
@@ -259,8 +259,8 @@ impl Server {
         // When vhost is configured, spawn the HTTP and/or HTTPS frontend listeners.
         if let Some(cfg_arc) = &this.vhost_config {
             let cfg = cfg_arc.read().unwrap().clone();
-            let cert_present = cfg.cert_file.is_some() && cfg.key_file.is_some();
-            let mode = vhost::resolve_mode(&cfg, cert_present).unwrap_or(vhost::VhostMode::Http);
+            let mode = vhost::resolve_mode(&cfg, vhost::cert_present(&cfg))
+                .unwrap_or(vhost::VhostMode::Http);
             if mode.serves_http() {
                 let http_listener = TcpListener::bind((this.bind_tunnels, cfg.http_port)).await?;
                 let port = http_listener.local_addr()?.port();
@@ -271,11 +271,15 @@ impl Server {
                         match http_listener.accept().await {
                             Ok((stream, _addr)) => {
                                 tune_tcp(&stream);
-                                let permit =
-                                    match Arc::clone(&this2.conn_permits).try_acquire_owned() {
-                                        Ok(p) => p,
-                                        Err(_) => continue,
-                                    };
+                                let permit = match Arc::clone(&this2.conn_permits)
+                                    .try_acquire_owned()
+                                {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        debug!("vhost HTTP connection dropped: max-conns reached");
+                                        continue;
+                                    }
+                                };
                                 let this3 = Arc::clone(&this2);
                                 tokio::spawn(async move {
                                     let _permit = permit;
@@ -306,17 +310,22 @@ impl Server {
                         match https_listener.accept().await {
                             Ok((stream, _addr)) => {
                                 tune_tcp(&stream);
-                                let permit =
-                                    match Arc::clone(&this2.conn_permits).try_acquire_owned() {
-                                        Ok(p) => p,
-                                        Err(_) => continue,
-                                    };
+                                let permit = match Arc::clone(&this2.conn_permits)
+                                    .try_acquire_owned()
+                                {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        debug!("vhost HTTPS connection dropped: max-conns reached");
+                                        continue;
+                                    }
+                                };
                                 let this3 = Arc::clone(&this2);
                                 tokio::spawn(async move {
                                     let _permit = permit;
                                     if let Err(e) = vhost::handle_https(
                                         stream,
                                         &this3.vhost_registry,
+                                        &this3.vhost_config,
                                         &this3.vhost_tls,
                                     )
                                     .await

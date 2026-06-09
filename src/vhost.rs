@@ -708,7 +708,7 @@ pub async fn handle_https(
 }
 
 /// Read up to `\r\n\r\n` from any `AsyncRead + Unpin` stream, capped at 16 KiB.
-async fn read_head_async<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
+pub(crate) async fn read_head_async<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     const MAX: usize = 16 * 1024;
     let mut buf = Vec::with_capacity(512);
@@ -740,7 +740,7 @@ async fn send_bad_gateway<S: AsyncWrite + Unpin>(mut stream: S) -> Result<()> {
 }
 
 /// Extract the Host header value from a raw HTTP request head.
-fn extract_host_from_head(head: &[u8]) -> Option<&str> {
+pub(crate) fn extract_host_from_head(head: &[u8]) -> Option<&str> {
     let text = std::str::from_utf8(head).ok()?;
     for line in text.lines().skip(1) {
         if let Some((name, value)) = line.split_once(':') {

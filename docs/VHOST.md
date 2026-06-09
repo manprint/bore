@@ -121,6 +121,44 @@ multi-certificate selection is needed (or supported; that is future work).
 
 ---
 
+## Deployment topology (which port serves vhost)
+
+The vhost reverse proxy can be reached two ways. Pick one.
+
+### A) Unified single port (recommended for one public IP)
+
+When vhost is enabled, the **control port itself also serves vhost**: after TLS
+termination it inspects each connection — the bore protocol (tunnels) and the admin
+page work as before, and an HTTP request whose `Host` is `<sub>.<base-domain>` is
+routed to that provider. So a single public `443` serves tunnels + admin + every
+subdomain, and clients keep using the default `https://<base-domain>`.
+
+Requirements:
+- Expose the control port on 443 (`-p 443:7835`, or run the server with
+  `--control-port 443`).
+- `BORE_CERT_FILE` / `--secret`'s TLS cert must be a **wildcard** covering
+  `*.<base-domain>` **and** the apex `<base-domain>`, since browsers TLS-handshake
+  against the control-port certificate for `app.<base-domain>`.
+- Set `BORE_VHOST_BASE_DOMAIN` (no separate frontend ports needed).
+
+This is the topology a single-IP Docker host wants; it is exactly what the unified
+control port was built for.
+
+### B) Dedicated frontend ports
+
+Keep the control port on its own port (e.g. 7835) and let vhost bind standalone
+HTTP/HTTPS frontend listeners on `BORE_VHOST_HTTP_PORT` / `BORE_VHOST_HTTPS_PORT`
+(default 80 / 443). Publish those ports. Clients then connect to the control port
+explicitly (`--to <host>:7835`). Use this when 443 must stay reserved for the raw
+bore protocol, or to serve plain HTTP on 80. The frontend HTTPS listener uses
+`BORE_VHOST_CERT_FILE` (also a wildcard cert).
+
+> Do **not** map host `443` to the control port *and* also publish a `443:443`
+> vhost frontend — only one service can own a host port. In topology A the control
+> port does both jobs; in topology B the frontend port does the HTTP job.
+
+---
+
 ## Hot reload (zero downtime)
 
 The server polls `vhost.yml`, `cert_file`, and `key_file` every 2 seconds. When an

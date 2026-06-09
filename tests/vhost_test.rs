@@ -1309,6 +1309,113 @@ async fn vhost_https_rejects_foreign_base_domain() -> Result<()> {
     Ok(())
 }
 
+// ─── Unified control port: HTTP routed by Host (control=17976) ───────────────
+
+#[tokio::test]
+async fn vhost_routes_on_control_port() -> Result<()> {
+    const CTRL: u16 = 17976;
+    const HTTP: u16 = 17977; // standalone frontend; this test hits the control port
+
+    let stub_port = spawn_http_stub("hello-control").await;
+    let cfg = http_config("bore.local", HTTP);
+    spawn_server_vhost(CTRL, cfg).await?;
+
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "app",
+        "client1",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    time::sleep(Duration::from_millis(50)).await;
+
+    // An HTTP request to the CONTROL port (not the vhost frontend) must route by
+    // Host to the vhost provider — this is the single-port (e.g. 443) deployment
+    // where control + vhost share one listener. (Regression: previously the control
+    // port only served the bore protocol / admin, so this 404'd.)
+    let resp = send_http(CTRL, "app.bore.local", "/").await?;
+    assert!(
+        resp.contains("hello-control"),
+        "HTTP on the control port must route to vhost, got: {resp}"
+    );
+
+    // An unknown subdomain on the control port → 404 (no admin token configured).
+    let miss = send_http(CTRL, "ghost.bore.local", "/").await?;
+    assert!(
+        miss.starts_with("HTTP/1.1 404"),
+        "unknown subdomain on control port → 404, got: {miss}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn vhost_routes_on_tls_control_port() -> Result<()> {
+    const CTRL: u16 = 17978;
+    const HTTP: u16 = 17979; // standalone frontend; this test hits the TLS control port
+
+    let stub_port = spawn_http_stub("hello-tls-control").await;
+    // Wildcard cert so the browser's TLS to app.bore.local validates against the
+    // control-port certificate (the single-443 deployment requirement).
+    let (cert_pem, key_pem) = self_signed_for(vec![
+        "*.bore.local".to_string(),
+        "bore.local".to_string(),
+        "localhost".to_string(),
+    ])?;
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_tls(acceptor);
+    server.set_vhost(http_config("bore.local", HTTP))?;
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+
+    // Provider registers over the TLS control port (insecure: self-signed cert).
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("https://localhost:{CTRL}"),
+        "app",
+        "client1",
+        None,
+        true,
+        1,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    time::sleep(Duration::from_millis(50)).await;
+
+    // Browser-style: TLS to the control port, then an HTTP GET routed by Host to
+    // the vhost provider — the exact single-port (443) topology that failed in the
+    // field before unification.
+    let endpoint = Endpoint {
+        host: "127.0.0.1".to_string(),
+        port: CTRL,
+        tls: true,
+    };
+    let mut tls = transport::connect(&endpoint, true).await?;
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: app.bore.local\r\nConnection: close\r\n\r\n")
+        .await?;
+    tls.shutdown().await?;
+    let mut resp = Vec::new();
+    time::timeout(Duration::from_secs(5), tls.read_to_end(&mut resp)).await??;
+    let resp = String::from_utf8_lossy(&resp);
+    assert!(
+        resp.contains("hello-tls-control"),
+        "HTTP over TLS on the control port must route to vhost, got: {resp}"
+    );
+    Ok(())
+}
+
 // ─── TODO: cert hot-reload test ───────────────────────────────────────────────
 // Cert hot-reload (swapping cert/key files while the server is live) is complex
 // to test reliably in a short integration test because:

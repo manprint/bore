@@ -62,10 +62,19 @@ services:
       # - "443:7835"           # HTTPS (set BORE_CERT_FILE/BORE_KEY_FILE) -> clients use https://bore.tld
       #
       # --- vhost frontend (subdomain reverse proxy) ---
-      # When BORE_VHOST_BASE_DOMAIN (or BORE_VHOST_CONFIG) is set below, the server
-      # binds HTTP/HTTPS frontend listeners that route by Host header to the matching
-      # registered subdomain of *.<base-domain>. These are the vhost frontend ports,
-      # NOT the control port — do not combine with the "80:7835"/"443:7835" lines:
+      # Two deployment topologies (pick ONE):
+      #
+      # A) Unified single port (recommended, one public IP). Expose the control port
+      #    on 443 (the "443:7835" line above). When vhost is enabled, that one port
+      #    serves everything: bore-protocol tunnels, the admin page, AND vhost — an
+      #    HTTPS request whose Host is <sub>.<base-domain> is routed to that provider.
+      #    Requirement: BORE_CERT_FILE must be a WILDCARD cert covering
+      #    *.<base-domain> (and the apex). No extra ports needed; do NOT also publish
+      #    80:80 / 443:443 below. Clients keep using the default https://<base-domain>.
+      #
+      # B) Dedicated frontend ports. Keep the control port on 7835 only (clients use
+      #    --to <host>:7835) and publish the standalone vhost listeners here. Use this
+      #    when 443 must stay reserved for the bore protocol, or for plain HTTP on 80:
       # - "80:80"              # vhost HTTP frontend  (BORE_VHOST_HTTP_PORT)
       # - "443:443"            # vhost HTTPS frontend (BORE_VHOST_HTTPS_PORT, needs cert)
     environment:

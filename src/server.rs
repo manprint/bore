@@ -261,7 +261,19 @@ impl Server {
             let cfg = cfg_arc.read().unwrap().clone();
             let mode = vhost::resolve_mode(&cfg, vhost::cert_present(&cfg))
                 .unwrap_or(vhost::VhostMode::Http);
-            if mode.serves_http() {
+            // In the unified topology the control port doubles as the vhost frontend
+            // (it routes HTTP by Host). When a configured frontend port equals the
+            // control port, skip the standalone listener so the two don't fight over
+            // the same bind ("address in use"); the control port serves it instead.
+            let http_unified = cfg.http_port == this.control_port;
+            let https_unified = cfg.https_port == this.control_port;
+            if http_unified || https_unified {
+                info!(
+                    control_port = this.control_port,
+                    "vhost served on the control port (unified); skipping the duplicate frontend listener"
+                );
+            }
+            if mode.serves_http() && !http_unified {
                 let http_listener = TcpListener::bind((this.bind_tunnels, cfg.http_port)).await?;
                 let port = http_listener.local_addr()?.port();
                 info!(port, "vhost HTTP frontend listening");
@@ -300,7 +312,7 @@ impl Server {
                     }
                 });
             }
-            if mode.serves_https() {
+            if mode.serves_https() && !https_unified {
                 let https_listener = TcpListener::bind((this.bind_tunnels, cfg.https_port)).await?;
                 let port = https_listener.local_addr()?.port();
                 info!(port, "vhost HTTPS frontend listening");
@@ -429,39 +441,33 @@ impl Server {
 
     /// Route an accepted (and TLS-terminated, if applicable) control connection.
     ///
-    /// When the admin status page is enabled, the first byte is inspected: an HTTP
-    /// request is served by the admin handler, anything else falls through to the
-    /// bore protocol. When the admin page is disabled this is a thin pass-through
-    /// to [`Server::handle_connection`], so the plain protocol path is unchanged.
+    /// When the admin status page or the vhost frontend is enabled, the first byte
+    /// is inspected: an HTTP request is handled by [`Server::serve_control_http`]
+    /// (vhost routing by Host, then admin / 404), anything else falls through to the
+    /// bore protocol. When neither is enabled this is a thin pass-through to
+    /// [`Server::handle_connection`], so the plain protocol path is unchanged.
     async fn route_connection<S: mux::Transport>(
         &self,
         mut socket: S,
         peer: SocketAddr,
     ) -> Result<()> {
-        // No admin token → never inspect; behave exactly as before.
-        let Some(token) = self.admin_token.clone() else {
+        // Neither admin page nor vhost frontend → never inspect; behave exactly as
+        // before (the plain bore-protocol path stays byte-for-byte unchanged).
+        if self.admin_token.is_none() && self.vhost_config.is_none() {
             return self.handle_connection(socket, peer).await;
-        };
+        }
 
-        // Peek the first byte to tell an HTTP request (admin page) from the bore
-        // protocol (yamux, first byte 0x00). A bore client writes its Hello
-        // eagerly and an HTTP client sends its request line, so this arrives
-        // promptly; on timeout we hand the untouched socket to the protocol path.
+        // Peek the first byte to tell an HTTP request from the bore protocol (yamux,
+        // first byte 0x00). A bore client writes its Hello eagerly and an HTTP client
+        // sends its request line, so this arrives promptly; on timeout we hand the
+        // untouched socket to the protocol path.
         let mut first = [0u8; 1];
         match timeout(NETWORK_TIMEOUT, socket.read(&mut first)).await {
             Ok(Ok(0)) | Ok(Err(_)) => Ok(()), // EOF or read error: drop
             Ok(Ok(_)) => {
                 let stream = Prefixed::new(first.to_vec(), socket);
                 if admin_http::is_http_first_byte(first[0]) {
-                    let server = ServerStatus {
-                        control_port: self.control_port,
-                        tls: self.tls.is_some(),
-                        udp: self.udp,
-                    };
-                    if let Err(err) = admin_http::serve(stream, &self.admin, &token, server).await {
-                        trace!(%err, "admin request failed");
-                    }
-                    Ok(())
+                    self.serve_control_http(stream).await
                 } else {
                     self.handle_connection(stream, peer).await
                 }
@@ -469,6 +475,60 @@ impl Server {
             // Timed out waiting for the first byte: the byte (if any) is still
             // pending, so forward the untouched socket to the protocol path.
             Err(_) => self.handle_connection(socket, peer).await,
+        }
+    }
+
+    /// Handle an HTTP request that arrived on the control port. When a vhost
+    /// frontend is configured, route by Host header to the matching live subdomain,
+    /// so a single public port (e.g. 443) serves both the bore control protocol and
+    /// the vhost reverse proxy. A request that matches no subdomain falls through to
+    /// the admin status page (if enabled) or a 404.
+    async fn serve_control_http<S: mux::Transport>(&self, mut stream: Prefixed<S>) -> Result<()> {
+        if let Some(cfg_lock) = &self.vhost_config {
+            // Read the request head so we can route by Host; on timeout/error, drop.
+            let head = match timeout(NETWORK_TIMEOUT, vhost::read_head_async(&mut stream)).await {
+                Ok(Ok(head)) => head,
+                _ => return Ok(()),
+            };
+            let cfg = cfg_lock.read().unwrap().clone();
+            let sub = vhost::extract_host_from_head(&head)
+                .and_then(|h| vhost::extract_subdomain(h, &cfg.base_domain));
+            if let Some(sub) = sub {
+                if let Some(entry) = self.vhost_registry.get(&sub).map(|e| Arc::clone(e.value())) {
+                    return vhost::relay_vhost(stream, &entry, head).await;
+                }
+            }
+            // Not a vhost route: replay the already-read head for the admin / 404 path.
+            let replayed = Prefixed::new(head, stream);
+            return self.serve_admin_http(replayed).await;
+        }
+        self.serve_admin_http(stream).await
+    }
+
+    /// Serve the admin status page when an admin token is configured, otherwise a
+    /// minimal 404 (the request reached the control port but matched no vhost route).
+    async fn serve_admin_http<S: mux::Transport>(&self, mut stream: S) -> Result<()> {
+        match self.admin_token.clone() {
+            Some(token) => {
+                let server = ServerStatus {
+                    control_port: self.control_port,
+                    tls: self.tls.is_some(),
+                    udp: self.udp,
+                };
+                if let Err(err) = admin_http::serve(stream, &self.admin, &token, server).await {
+                    trace!(%err, "admin request failed");
+                }
+                Ok(())
+            }
+            None => {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+                Ok(())
+            }
         }
     }
 

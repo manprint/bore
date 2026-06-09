@@ -723,11 +723,12 @@ What the transfer command guarantees in V2:
   under the destination root and published only after the hashes match.
 - **Collision policy** is fail-safe by default. Use `--overwrite` or `--rename`
   on `bore transfer listener` to opt into replacement/renaming.
-- **Idempotent re-completion**: if the link drops after the receiver has committed
-  the data but before it can send the `Completed` acknowledgement, re-running the
-  same sender with the same `--transfer-id` and unchanged files is safe — the
-  receiver detects the committed marker and re-sends the acknowledgement without
-  re-writing any data.
+- **Idempotent re-completion** (content-based): if the link drops after the receiver
+  has committed the data but before it can send the `Completed` acknowledgement,
+  re-running the same sender with unchanged files is safe — the receiver compares the
+  existing destination's content against the manifest and, on a full match, re-sends the
+  acknowledgement without re-writing any data. No hidden marker is left behind: a
+  successful transfer removes all of its working state from the destination.
 - **Parallel filesystem workers** via `--parallel N`. `--parallel 0` (the
   default) is automatic: one worker per CPU core, floored at 4 and capped at 32.
   On the relay path each worker rides its own TCP carrier, so by default

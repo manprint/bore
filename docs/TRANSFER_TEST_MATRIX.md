@@ -83,8 +83,10 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 | Resume rejected when manifest changed | `transfer_resume_rejects_changed_manifest_over_relay` | ✅ |
 | `build_chunk_tasks` skips already-completed chunks | unit test | ✅ |
 | `build_chunk_tasks` generates tasks for all chunks | unit test | ✅ |
-| Idempotent re-completion: link drop after commit → retry re-acks (F3) | `transfer_idempotent_recompletion_after_commit` | ✅ |
-| Stale committed marker (different content) starts fresh collision check | `transfer_committed_marker_mismatch_starts_fresh` | ✅ |
+| Idempotent re-completion (content-based): identical re-run re-acks, no collision | `transfer_idempotent_recompletion_after_commit` | ✅ |
+| Different content under same id → real collision (no false idempotency) | `transfer_committed_marker_mismatch_starts_fresh` | ✅ |
+| Success leaves no working state dir; identical re-run stays clean + idempotent | `transfer_cleans_state_dir_and_reruns_idempotently_over_relay` | ✅ |
+| Resumed transfer completes then fully cleans its state dir (CLI) | `transfer_filesystem_listener_kill_resumes_and_cleans_up_cli` | ✅ |
 
 ---
 
@@ -125,6 +127,22 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 | Idle helpers pass through when `secs=0` | `idle_helpers_passthrough_when_disabled` (unit) | ✅ |
 | `--confirm-timeout` rejects on expiry + sender gets clear error (F6) | manual (requires `--ask-confirm` + TTY) | ⚠️ |
 | `--stall-timeout` aborts a stalled data path (F10) | manual end-to-end; unit-proven via `*_idle_aborts_*` | ✅ |
+| Receiver aborts (not hangs) when the sender dies before all data streams connect | `accept_worker_stream_aborts_when_control_closes` (unit) | ✅ |
+| Worker-accept returns a connected data stream | `accept_worker_stream_returns_a_connected_worker` (unit) | ✅ |
+| Worker-accept honors the idle stall timeout | `accept_worker_stream_times_out_when_idle` (unit) | ✅ |
+
+---
+
+## 9b. Interruption / disconnection robustness (audit)
+
+| Scenario | Test | Status |
+|---|---|---|
+| Sender interrupted mid-transfer → receiver fails fast, no hang | `accept_worker_stream_aborts_when_control_closes` (unit) | ✅ |
+| Data stream closed before `WorkerDone` → explicit error (not silent success) | covered by code path; surfaced via resume tests | ✅ |
+| Stray data-stream from a prior transfer skipped, next sender served (persistent) | `StrayWorkerConnection` path; persistent-listener tests | ✅ |
+| Listener killed mid-transfer → sender fails, resume + full cleanup on retry | `transfer_filesystem_listener_kill_resumes_and_cleans_up_cli` | ✅ |
+| `bore transfer sender --sources stdin` works (no false `failed to stat stdin`) | `transfer_stdin_*_cli` suite | ✅ |
+| `stdin` combined with file sources rejected with a clear message | covered by `run_sender` guard | ✅ |
 
 ---
 
@@ -216,5 +234,5 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 
 ---
 
-*Updated: 2026-06-07 — after production-hardening audit (F1-F10): tune_tcp invariant, input bounds, idempotent re-completion, stdin cleanup, liveness timeouts, persistent-mode drain, test seam centralization, progress seeding.*
+*Updated: 2026-06-09 — after the deep sender/receiver audit (see `TRANSFER_AUDIT.md`): worker-accept deadlock-on-interruption fix, truncated-stream detection, stray-worker handling, single error frame, stdin `--sources` stat fix, content-based idempotency + full state cleanup, log clarity. Prior: production-hardening (F1-F10).*
 *Test counts: 37 integration + 74 unit = 111 transfer-specific tests. Two unit tests require a real TTY and are manual-only.*

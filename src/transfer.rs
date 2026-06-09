@@ -18,7 +18,7 @@ use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWr
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::task::{spawn_blocking, JoinHandle, JoinSet};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::client::{Client, ProviderMeta};
@@ -44,7 +44,6 @@ const LOCAL_CONNECT_RETRIES: usize = 50;
 const LOCAL_CONNECT_DELAY: Duration = Duration::from_millis(20);
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
 const RESUME_STATE_FILE: &str = "state.json";
-const COMMITTED_MARKER_FILE: &str = "committed.json";
 const MULTI_SOURCE_STAGE_ROOT: &str = ".bore-multi-root";
 /// Upper bound on a single stdin StreamChunk payload the receiver will allocate.
 /// The sender uses COPY_BUFFER (64 KiB); allow up to CHUNK_SIZE for headroom.
@@ -256,20 +255,6 @@ struct ResumeFilePlan {
     completed_chunks: Vec<u32>,
 }
 
-/// Written atomically to `<stage_dir>/committed.json` after a successful commit so that
-/// a retry after a commit→Completed link-drop can re-complete idempotently.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CommittedMarker {
-    protocol_version: u32,
-    transfer_id: String,
-    manifest_hash: String,
-    final_name: String,
-    final_path: String,
-    total_bytes: u64,
-    regular_files: u64,
-    transfer_hash: String,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ResumeState {
     protocol_version: u32,
@@ -369,13 +354,14 @@ struct ReceiverPlan {
     final_path: PathBuf,
     stage_dir: PathBuf,
     stage_root: PathBuf,
-    manifest_hash: String,
     resume: Option<Arc<ResumeShared>>,
     resumed_bytes: u64,
     resume_plan: Vec<ResumeFilePlan>,
     multi_source: bool,
-    /// Set when this transfer was already committed in a prior run (F3 idempotent marker).
-    already_committed: Option<CommittedMarker>,
+    /// Set when the destination already holds content matching this manifest, so the transfer
+    /// can be re-acknowledged idempotently without re-sending any data (handles a lost
+    /// `Completed` frame or an identical re-run). Detected by content comparison — no marker.
+    already_complete: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -590,12 +576,12 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
                 None => bail!("accept channel closed unexpectedly"),
             },
             result = &mut provider_task => match result {
-                Ok(Ok(())) => bail!("transfer listener transport ended before a sender connected"),
+                Ok(Ok(())) => bail!("the listener's connection to the relay server ended while waiting for a sender"),
                 Ok(Err(err)) => return Err(err).context("transfer listener transport failed"),
                 Err(err) => bail!("transfer listener task failed: {err}"),
             },
             result = &mut accept_task => match result {
-                Ok(Ok(())) => bail!("transfer listener stopped accepting before a sender connected"),
+                Ok(Ok(())) => bail!("the listener stopped accepting local connections while waiting for a sender"),
                 Ok(Err(err)) => return Err(err).context("transfer listener accept loop failed"),
                 Err(err) => bail!("transfer listener accept task failed: {err}"),
             },
@@ -611,6 +597,17 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
             options.stall_timeout,
         )
         .await;
+
+        // A late data-stream connection from a previous transfer (only possible behind a
+        // persistent listener) is not a real failure: drop it and keep serving.
+        if let Some(stray) = outcome
+            .as_ref()
+            .err()
+            .and_then(|err| err.downcast_ref::<StrayWorkerConnection>())
+        {
+            debug!(%stray, "ignored stray data-stream connection; waiting for the next sender");
+            continue;
+        }
 
         match outcome {
             Ok(mut o) => {
@@ -641,7 +638,7 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
                     let _ = accept_task.await;
                     return Err(err);
                 }
-                warn!(%err, "transfer error in persistent mode, waiting for next sender");
+                warn!(%err, transfer_id = %transfer_id, "transfer failed in persistent mode; staging/resume state is kept for a retry — waiting for the next sender");
                 // Drain any leftover connections from the failed transfer.
                 while conn_rx.try_recv().is_ok() {}
             }
@@ -670,6 +667,16 @@ pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
     }
     if all_sources.is_empty() {
         bail!("no sources specified; use --sources or --source-files");
+    }
+    // The stdin stream is mutually exclusive with filesystem sources: a single byte stream
+    // has no manifest to merge with files. Reject the combination with a clear message
+    // instead of failing later with a confusing "failed to stat stdin".
+    if all_sources.len() > 1
+        && all_sources
+            .iter()
+            .any(|s| matches!(parse_sender_source(s), SenderSource::Stdin))
+    {
+        bail!("'stdin' cannot be combined with other sources; send stdin on its own");
     }
     // Always display the source list; --ask-confirm additionally gates on y/N.
     let ask = options.ask_confirm;
@@ -1061,7 +1068,15 @@ async fn receive_transfer(
     let outcome = async {
         let begin = match expect_frame(&mut control).await? {
             Frame::Begin(begin) => begin,
-            other => bail!("unexpected first control frame (a stray worker connection from a previous transfer?): {other:?}"),
+            // A late data-stream connection from a previous (persistent) transfer. Surface it
+            // as a typed, non-fatal error so the listener can skip it and keep serving.
+            Frame::WorkerHello { transfer_id } => {
+                return Err(StrayWorkerConnection { transfer_id }.into());
+            }
+            other => bail!(
+                "expected a Begin frame to start a transfer, got {other:?} \
+                 (protocol desync or a connection from an incompatible client)"
+            ),
         };
         if begin.protocol_version != PROTOCOL_VERSION {
             bail!(
@@ -1078,25 +1093,29 @@ async fn receive_transfer(
 
         let plan = receive_manifest(&mut control, begin, &dest_root, collision).await?;
 
-        // Idempotent re-completion: a prior run committed the data but dropped the link
-        // before the sender received Completed. Reply on the normal protocol so the sender
-        // finishes cleanly (F3).
-        if let Some(ref marker) = plan.already_committed {
+        // Idempotent re-completion: the destination already holds content identical to this
+        // manifest (a prior run committed but the Completed frame was lost, or the user simply
+        // re-ran the same transfer). Re-acknowledge over the normal protocol so the sender
+        // finishes cleanly, without re-sending any data and without a false collision.
+        if plan.already_complete {
+            // The summary is recomputed from the manifest the sender just sent; its
+            // transfer_hash must match what the sender will report.
+            let summary = summary_from_materialized_entries(&plan.entries)?;
             send_frame(
                 &mut control,
                 &Frame::ManifestAccepted {
-                    final_name: marker.final_name.clone(),
+                    final_name: plan.final_name.clone(),
                     parallel: 1,
-                    resumed_bytes: marker.total_bytes,
+                    resumed_bytes: summary.total_bytes,
                     resume: all_chunks_complete_plan(&plan.entries),
                 },
             )
             .await?;
             // Sender sees all-complete plan → 0 tasks → no workers → sends TransferSummary.
             match expect_frame(&mut control).await? {
-                Frame::TransferSummary(summary) => {
-                    if summary.transfer_hash != marker.transfer_hash {
-                        bail!("re-sent transfer hash does not match the committed copy");
+                Frame::TransferSummary(sender_summary) => {
+                    if sender_summary.transfer_hash != summary.transfer_hash {
+                        bail!("re-sent transfer does not match the existing destination content");
                     }
                 }
                 other => bail!("unexpected frame during idempotent re-completion: {other:?}"),
@@ -1105,19 +1124,23 @@ async fn receive_transfer(
             send_frame(
                 &mut control,
                 &Frame::Completed(CompletedFrame {
-                    final_path: marker.final_path.clone(),
-                    total_bytes: marker.total_bytes,
-                    regular_files: marker.regular_files,
-                    transfer_hash: marker.transfer_hash.clone(),
+                    final_path: encode_native_path(&final_path),
+                    total_bytes: summary.total_bytes,
+                    regular_files: summary.regular_files,
+                    transfer_hash: summary.transfer_hash.clone(),
                 }),
             )
             .await?;
             let _ = control.shutdown().await;
+            info!(
+                transfer_id = %plan.begin.transfer_id,
+                "destination already matches the manifest; re-acknowledged idempotently"
+            );
             return Ok(TransferOutcome {
                 transfer_id: plan.begin.transfer_id,
                 final_path,
-                total_bytes: marker.total_bytes,
-                regular_files: marker.regular_files,
+                total_bytes: summary.total_bytes,
+                regular_files: summary.regular_files,
                 transport: plan.begin.transport,
             });
         }
@@ -1155,18 +1178,13 @@ async fn receive_transfer(
                 {
                     Ok(joined) => joined.context("manifest confirmation task failed")??,
                     Err(_) => {
-                        let _ = send_frame(
-                            &mut control,
-                            &Frame::Error {
-                                message: format!(
-                                    "transfer rejected by receiver (confirmation timed out after {confirm_timeout}s)"
-                                ),
-                            },
-                        )
-                        .await;
+                        // The single error frame is sent by the outer error handler below
+                        // (avoids sending two Error frames for one failure).
                         let _ = tokio::fs::remove_dir_all(&plan.stage_dir).await;
                         cleanup_stdin_dir = None;
-                        bail!("transfer confirmation timed out after {confirm_timeout}s");
+                        bail!(
+                            "transfer rejected by receiver (confirmation timed out after {confirm_timeout}s)"
+                        );
                     }
                 }
             } else {
@@ -1175,15 +1193,8 @@ async fn receive_transfer(
                     .context("manifest confirmation task failed")??
             };
             if !accepted {
-                // Inform the sender before bailing so it gets a clear error message.
-                let _ = send_frame(
-                    &mut control,
-                    &Frame::Error {
-                        message: "transfer rejected by receiver".to_string(),
-                    },
-                )
-                .await;
-                // Clean up any staging state created by receive_manifest.
+                // Clean up any staging state created by receive_manifest. The error frame that
+                // informs the sender is sent once by the outer error handler below.
                 let _ = tokio::fs::remove_dir_all(&plan.stage_dir).await;
                 cleanup_stdin_dir = None; // already cleaned above
                 bail!("transfer rejected by receiver");
@@ -1222,7 +1233,7 @@ async fn receive_transfer(
         if sender_summary != local_summary {
             bail!("sender summary does not match receiver state");
         }
-        commit_stage(&plan, collision, &local_summary).await?;
+        commit_stage(&plan, collision).await?;
         send_frame(
             &mut control,
             &Frame::Completed(CompletedFrame {
@@ -1274,6 +1285,65 @@ async fn receive_transfer(
     outcome
 }
 
+/// Marker error: the first frame on a freshly accepted control connection was a `WorkerHello`,
+/// i.e. a late data-stream connection left over from a previous transfer (only possible with a
+/// persistent listener). The listener treats this as non-fatal and waits for the next sender
+/// instead of failing a real transfer. See `run_listener`.
+#[derive(Debug)]
+struct StrayWorkerConnection {
+    transfer_id: String,
+}
+
+impl fmt::Display for StrayWorkerConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "stray data-stream connection from a previous transfer (id {})",
+            self.transfer_id
+        )
+    }
+}
+
+impl std::error::Error for StrayWorkerConnection {}
+
+/// Block until the control connection reports EOF or an error. Returns the resulting error.
+///
+/// Used as a `select!` arm while the receiver waits for data-stream connections: until every
+/// worker has connected, the sender sends nothing on the control channel, so a readable or
+/// closed control stream means the sender went away (interrupted/killed/network drop). `peek`
+/// is used so this never consumes protocol bytes and stays cancellation-safe.
+async fn control_disconnected(control: &TcpStream) -> anyhow::Error {
+    let mut probe = [0u8; 1];
+    match control.peek(&mut probe).await {
+        Ok(0) => anyhow!("sender disconnected before all data streams connected"),
+        // Nothing legitimate arrives on the control channel during the accept phase.
+        Ok(_) => anyhow!("unexpected control data before all data streams connected"),
+        Err(err) => anyhow::Error::from(err)
+            .context("control connection failed while waiting for data streams"),
+    }
+}
+
+/// Accept the next worker data stream, aborting promptly (instead of hanging forever) if the
+/// sender disappears or stalls before all streams arrive. Watches three things: a new worker
+/// connection, the control connection closing (peer death), and — when enabled — an idle
+/// `stall_timeout`.
+async fn accept_worker_stream(
+    incoming: &mut mpsc::UnboundedReceiver<TcpStream>,
+    control: &mut TcpStream,
+    stall_timeout: u64,
+) -> Result<TcpStream> {
+    let idle = Duration::from_secs(stall_timeout.max(1));
+    tokio::select! {
+        maybe = incoming.recv() => {
+            maybe.context("worker channel closed before all data streams connected")
+        }
+        err = control_disconnected(control) => Err(err),
+        _ = tokio::time::sleep(idle), if stall_timeout > 0 => {
+            bail!("timed out after {stall_timeout}s waiting for the sender's data streams")
+        }
+    }
+}
+
 async fn receive_filesystem_streams(
     control: &mut TcpStream,
     incoming: &mut mpsc::UnboundedReceiver<TcpStream>,
@@ -1292,11 +1362,16 @@ async fn receive_filesystem_streams(
     // `expect_frame(control)` is not cancellation-safe: if a `select!` branch drops it
     // after the 4-byte length prefix was read, the next read starts at the JSON body.
     // Accept worker streams first, then read the summary once all workers drained.
-    for _ in 0..expected_workers {
-        let stream = incoming
-            .recv()
+    //
+    // `accept_worker_stream` watches the control connection so that if the sender dies
+    // (interrupt/kill/network drop) after `ManifestAccepted` but before opening every data
+    // stream, the receiver aborts with a clear error instead of blocking forever.
+    for connected in 0..expected_workers {
+        let stream = accept_worker_stream(incoming, control, stall_timeout)
             .await
-            .context("worker channel closed before all worker streams connected")?;
+            .with_context(|| {
+                format!("only {connected} of {expected_workers} data streams connected")
+            })?;
         let resume = resume.clone();
         let progress = progress.clone();
         workers.spawn(async move {
@@ -1453,7 +1528,11 @@ async fn handle_worker_connection(
                 }
                 Some(Frame::Error { message }) => bail!("sender worker aborted: {message}"),
                 Some(other) => bail!("unexpected worker frame: {other:?}"),
-                None => break Ok(()),
+                // A clean WorkerDone always precedes a normal close; EOF here means the sender
+                // was interrupted mid-stream. Fail fast with a clear message rather than
+                // silently treating a truncated stream as complete (verification would later
+                // reject it with a more confusing hash mismatch).
+                None => bail!("data stream closed before WorkerDone (sender interrupted?)"),
             }
         }
     }
@@ -1575,12 +1654,11 @@ async fn receive_manifest(
             final_path: dest_root.join(final_name_local),
             stage_dir,
             stage_root,
-            manifest_hash,
             resume: None,
             resumed_bytes: 0,
             resume_plan: Vec::new(),
             multi_source: false,
-            already_committed: None,
+            already_complete: false,
         });
     }
 
@@ -1590,37 +1668,33 @@ async fn receive_manifest(
 
     let stage_dir = resume_state_dir(dest_root, &begin.transfer_id);
 
-    // Check for a committed marker from a prior run (F3 idempotent re-completion).
-    let marker_file = stage_dir.join(COMMITTED_MARKER_FILE);
-    if fs::try_exists(&marker_file).await? {
-        match read_json::<CommittedMarker>(&marker_file).await {
-            Ok(marker)
-                if marker.protocol_version == PROTOCOL_VERSION
-                    && marker.transfer_id == begin.transfer_id
-                    && marker.manifest_hash == manifest_hash =>
-            {
-                let final_name_local = decode_component(&marker.final_name);
-                let final_path = decode_native_path(&marker.final_path);
-                return Ok(ReceiverPlan {
-                    begin,
-                    entries,
-                    final_name: marker.final_name.clone(),
-                    final_path,
-                    stage_dir,
-                    stage_root: final_name_local.into(),
-                    manifest_hash,
-                    resume: None,
-                    resumed_bytes: marker.total_bytes,
-                    resume_plan: Vec::new(),
-                    multi_source: false,
-                    already_committed: Some(marker),
-                });
-            }
-            _ => {
-                // Stale or unreadable marker (different content under same id): fall through.
-                let _ = fs::remove_file(&marker_file).await;
-            }
-        }
+    // Idempotent re-completion (content-based): if the destination already holds content
+    // identical to this manifest, re-acknowledge without re-transferring. This must run
+    // before `resolve_final_name_local`, which would otherwise reject a `Fail` collision.
+    // No on-disk marker is kept — the destination's own content is the source of truth.
+    // Skipped when an in-progress resume state exists (that takes priority).
+    let candidate_local = decode_component(&begin.root_name);
+    let candidate_final = if multi_source {
+        dest_root.to_path_buf()
+    } else {
+        dest_root.join(&candidate_local)
+    };
+    if !fs::try_exists(stage_dir.join(RESUME_STATE_FILE)).await?
+        && destination_satisfies_manifest(&candidate_final, &entries, multi_source).await?
+    {
+        return Ok(ReceiverPlan {
+            begin,
+            entries,
+            final_name: encode_component_os(&candidate_local),
+            final_path: candidate_final,
+            stage_dir,
+            stage_root: candidate_local.into(),
+            resume: None,
+            resumed_bytes: 0,
+            resume_plan: Vec::new(),
+            multi_source,
+            already_complete: true,
+        });
     }
 
     let state_file = stage_dir.join(RESUME_STATE_FILE);
@@ -1722,12 +1796,11 @@ async fn receive_manifest(
         final_path,
         stage_dir,
         stage_root,
-        manifest_hash,
         resume: Some(resume),
         resumed_bytes,
         resume_plan,
         multi_source,
-        already_committed: None,
+        already_complete: false,
     })
 }
 
@@ -1862,7 +1935,7 @@ fn manifest_hash(
 }
 
 /// Builds a resume plan that marks every chunk of every regular file as complete.
-/// Used for idempotent re-completion when a `CommittedMarker` is found.
+/// Used for content-based idempotent re-completion (the destination already matches).
 fn all_chunks_complete_plan(entries: &[ManifestEntry]) -> Vec<ResumeFilePlan> {
     entries
         .iter()
@@ -1960,11 +2033,53 @@ async fn verify_summary(plan: &ReceiverPlan) -> Result<TransferSummary> {
     summary_from_materialized_entries(&plan.entries)
 }
 
-async fn commit_stage(
-    plan: &ReceiverPlan,
-    collision: CollisionPolicy,
-    summary: &TransferSummary,
-) -> Result<()> {
+/// True when `root` already holds content equivalent to `entries` — the basis for
+/// content-based idempotent re-completion (see `receive_transfer`). Conservative: a missing
+/// or mismatched entry, or any kind that cannot be cheaply/safely verified (symlink/device),
+/// yields `false`, so the normal transfer/collision path runs instead. Never reports a match
+/// it cannot prove by content, so it can't mask a genuine collision.
+async fn destination_satisfies_manifest(
+    root: &Path,
+    entries: &[ManifestEntry],
+    multi_source: bool,
+) -> Result<bool> {
+    // Single-root transfers (file or dir): the root must exist. Multi-source targets
+    // dest_root (always present), so each entry is checked individually.
+    if !multi_source && !fs::try_exists(root).await? {
+        return Ok(false);
+    }
+    for entry in entries {
+        let path = stage_path(root, &entry.rel_path)?;
+        match entry.kind {
+            EntryKind::RegularFile => {
+                let Some(expected) = entry.full_hash.as_deref() else {
+                    return Ok(false);
+                };
+                let meta = match fs::symlink_metadata(&path).await {
+                    Ok(meta) => meta,
+                    Err(_) => return Ok(false),
+                };
+                if !meta.is_file() || Some(meta.len()) != entry.size {
+                    return Ok(false);
+                }
+                if hash_file_async(&path).await? != expected {
+                    return Ok(false);
+                }
+            }
+            EntryKind::Directory => match fs::symlink_metadata(&path).await {
+                Ok(meta) if meta.is_dir() => {}
+                _ => return Ok(false),
+            },
+            // Not verified here; transfers containing these take the normal path.
+            EntryKind::Symlink | EntryKind::CharDevice | EntryKind::BlockDevice => {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+async fn commit_stage(plan: &ReceiverPlan, collision: CollisionPolicy) -> Result<()> {
     if plan.multi_source {
         // Flat multi-source: move each top-level child of stage_root into dest_root.
         let dest_root = &plan.final_path; // set to dest_root in receive_manifest
@@ -2005,11 +2120,10 @@ async fn commit_stage(
                 })?;
             }
         }
-        // Remove the now-empty staging subdir and state.json, then write the
-        // committed marker so a retry can re-complete idempotently (F3).
-        let _ = fs::remove_dir_all(&plan.stage_root).await;
-        let _ = fs::remove_file(plan.stage_dir.join(RESUME_STATE_FILE)).await;
-        write_committed_marker(plan, summary).await?;
+        // The data is committed into dest_root; remove the whole working state directory
+        // (staging subdir + resume state). Idempotent re-runs are detected by comparing the
+        // destination's content to the manifest, so no on-disk marker is kept.
+        let _ = fs::remove_dir_all(&plan.stage_dir).await;
         return Ok(());
     }
 
@@ -2057,33 +2171,12 @@ async fn commit_stage(
             let _ = fs::remove_dir_all(&plan.stage_dir).await;
         }
     } else {
-        // Filesystem: clean up staged content and state, then write committed marker
-        // so a retry after a commit→Completed link-drop can re-complete idempotently (F3).
-        let _ = fs::remove_file(plan.stage_dir.join(RESUME_STATE_FILE)).await;
-        write_committed_marker(plan, summary).await?;
+        // Filesystem: the data is committed; remove the whole working state directory
+        // (staged content + resume state). Idempotent re-runs are detected by comparing the
+        // destination's content to the manifest — no on-disk marker is kept.
+        let _ = fs::remove_dir_all(&plan.stage_dir).await;
     }
     Ok(())
-}
-
-async fn write_committed_marker(plan: &ReceiverPlan, summary: &TransferSummary) -> Result<()> {
-    let marker = CommittedMarker {
-        protocol_version: PROTOCOL_VERSION,
-        transfer_id: plan.begin.transfer_id.clone(),
-        manifest_hash: plan.manifest_hash.clone(),
-        final_name: plan.final_name.clone(),
-        final_path: encode_native_path(&plan.final_path),
-        total_bytes: summary.total_bytes,
-        regular_files: summary.regular_files,
-        transfer_hash: summary.transfer_hash.clone(),
-    };
-    // Ensure the stage_dir still exists (may have been just created or survived from resume).
-    fs::create_dir_all(&plan.stage_dir).await.with_context(|| {
-        format!(
-            "failed to create stage dir for committed marker {}",
-            plan.stage_dir.display()
-        )
-    })?;
-    write_json_atomic(&plan.stage_dir.join(COMMITTED_MARKER_FILE), &marker).await
 }
 
 fn read_source_files(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -2178,6 +2271,11 @@ fn confirm_sources_sync(sources: &[PathBuf], ask_confirm: bool) -> Result<bool> 
     use std::io::Write as _;
     println!("Sources to be transferred:");
     for source in sources {
+        // The literal "stdin" is a stream sentinel, not a filesystem path: never stat it.
+        if matches!(parse_sender_source(source), SenderSource::Stdin) {
+            println!("  STDIN (stream)");
+            continue;
+        }
         let meta = std::fs::symlink_metadata(source)
             .with_context(|| format!("failed to stat {}", source.display()))?;
         if meta.is_dir() {
@@ -4446,5 +4544,72 @@ mod tests {
             err.to_string().contains("no progress") || err.to_string().contains("not accepting"),
             "expected idle-stall error, got: {err}"
         );
+    }
+
+    // ----- Worker-accept liveness: receiver must not hang if the sender vanishes -----
+
+    /// Build a connected TCP pair on loopback; returns (client_side, server_side).
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn accept_worker_stream_aborts_when_control_closes() {
+        // Receiver's control stream; the sender side is dropped to simulate the sender dying
+        // after ManifestAccepted but before opening any data stream.
+        let (client, mut control) = tcp_pair().await;
+        let (_tx, mut rx) = mpsc::unbounded_channel::<TcpStream>();
+        drop(client); // sender vanishes
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            accept_worker_stream(&mut rx, &mut control, 0),
+        )
+        .await
+        .expect("accept_worker_stream hung after the control connection closed");
+        let err = res.expect_err("expected an error when the control connection closed");
+        assert!(
+            err.to_string().contains("sender disconnected"),
+            "expected a sender-disconnected error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_worker_stream_returns_a_connected_worker() {
+        let (_client, mut control) = tcp_pair().await; // control stays open
+        let (tx, mut rx) = mpsc::unbounded_channel::<TcpStream>();
+        let (worker, _peer) = tcp_pair().await;
+        tx.send(worker).unwrap();
+        let got = tokio::time::timeout(
+            Duration::from_secs(5),
+            accept_worker_stream(&mut rx, &mut control, 0),
+        )
+        .await
+        .expect("accept_worker_stream hung")
+        .expect("expected the queued worker stream");
+        drop(got);
+        drop(_client);
+    }
+
+    #[tokio::test]
+    async fn accept_worker_stream_times_out_when_idle() {
+        // Control open, no worker ever arrives: the idle stall timeout must fire.
+        let (_client, mut control) = tcp_pair().await;
+        let (_tx, mut rx) = mpsc::unbounded_channel::<TcpStream>();
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            accept_worker_stream(&mut rx, &mut control, 1),
+        )
+        .await
+        .expect("accept_worker_stream hung instead of honoring stall_timeout")
+        .expect_err("expected a stall timeout");
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
+        drop(_client);
     }
 }

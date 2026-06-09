@@ -175,6 +175,13 @@ fn patterned_bytes(size: usize) -> Vec<u8> {
     (0..size).map(|index| (index % 251) as u8).collect()
 }
 
+/// Mirror of the private `transfer::resume_state_dir` so tests can assert on the working
+/// state directory's lifecycle.
+fn resume_state_dir(dest_root: &Path, transfer_id: &str) -> PathBuf {
+    let digest = blake3::hash(transfer_id.as_bytes()).to_hex().to_string();
+    dest_root.join(format!(".bore-transfer-state-{digest}"))
+}
+
 fn reserve_udp_port(exclude: Option<u16>) -> Result<u16> {
     for _ in 0..32 {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
@@ -2183,6 +2190,80 @@ async fn transfer_idempotent_recompletion_after_commit() -> Result<()> {
     assert_eq!(
         content, b"hello idempotent",
         "file content must be unchanged"
+    );
+
+    listener.abort();
+    let _ = listener.await;
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+/// Content-based idempotency redesign: a successful transfer must leave no working state
+/// directory in the destination (no marker litter), and an identical re-run must still be
+/// idempotent (re-acknowledged, not a false collision) and still leave nothing behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_cleans_state_dir_and_reruns_idempotently_over_relay() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("idemp-clean-source");
+    let dest_root = temp_path("idemp-clean-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let file = source_root.join("data.bin");
+    let payload = patterned_bytes(900_000);
+    write_file(&file, &payload).await?;
+
+    let transfer_id = format!("idemp-clean-{}", Uuid::new_v4());
+    let state_dir = resume_state_dir(&dest_root, &transfer_id);
+
+    // Persistent listener so the second sender can connect after the first completes.
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            let mut opts = listener_options(transfer_id, dest_root, true, 1, None);
+            opts.persistent = true;
+            bore_cli::transfer::run_listener(opts).await
+        }
+    });
+    time::sleep(Duration::from_millis(200)).await;
+
+    // First transfer completes; the working state dir must be gone afterwards.
+    bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        file.clone(),
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await?;
+    assert!(
+        !fs::try_exists(&state_dir).await?,
+        "working state dir must be removed after a successful transfer"
+    );
+
+    time::sleep(Duration::from_millis(300)).await;
+
+    // Identical re-run is idempotent (content match → re-ack, not collision) and still clean.
+    bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        file.clone(),
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await
+    .expect("identical re-run must be idempotent, not fail with a collision");
+    assert_eq!(read_file(&dest_root.join("data.bin")).await?, payload);
+    assert!(
+        !fs::try_exists(&state_dir).await?,
+        "no working state dir may be left after an idempotent re-run"
     );
 
     listener.abort();

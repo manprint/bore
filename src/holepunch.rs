@@ -1667,6 +1667,8 @@ pub async fn run_stun_responder(socket: UdpSocket) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "udp")]
+    use crate::shared::UDP_NONCE_LEN;
 
     #[test]
     fn token_is_deterministic_and_keyed() {
@@ -1995,6 +1997,51 @@ mod tests {
         // Port 0 is ephemeral (non-zero, and almost surely different).
         let eph = bind_socket(0).await.unwrap();
         assert_ne!(eph.local_addr().unwrap().port(), 0);
+    }
+
+    #[cfg(feature = "udp")]
+    #[tokio::test]
+    async fn vhost_server_handshake_rejects_wrong_token() {
+        let tuning = UdpDirectTuning::default();
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+        let endpoint = vhost_server_endpoint(server_socket, &tuning).unwrap();
+        let expected = derive_token(Some("shared-secret"), &[9u8; UDP_NONCE_LEN]);
+
+        let server_task = {
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move {
+                let incoming = endpoint.accept().await.expect("incoming connection");
+                let conn = incoming.await.expect("QUIC handshake should complete");
+                vhost_server_handshake(conn, endpoint, |subdomain| {
+                    (subdomain == "myapp").then_some(expected)
+                })
+                .await
+            })
+        };
+
+        let wrong = derive_token(Some("different-secret"), &[9u8; UDP_NONCE_LEN]);
+        let client = vhost_connect(
+            bind_socket(0).await.unwrap(),
+            server_addr,
+            "myapp",
+            wrong,
+            tuning,
+        )
+        .await;
+        assert!(
+            client.is_err(),
+            "client must fail when the server rejects the vhost direct token"
+        );
+
+        let server = tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server handshake task timed out")
+            .unwrap();
+        assert!(
+            server.is_err(),
+            "server must reject the wrong vhost direct token"
+        );
     }
 
     #[test]

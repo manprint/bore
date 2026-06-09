@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::client::{Client, ProviderMeta};
 use crate::secret::Proxy;
-use crate::server::DEFAULT_MAX_CONNS;
+use crate::server::{DEFAULT_MAX_CARRIERS, DEFAULT_MAX_CONNS};
 use crate::shared::tune_tcp;
 use crate::transport::Endpoint;
 
@@ -33,6 +33,10 @@ const MANIFEST_CHUNK: usize = 128;
 const COPY_BUFFER: usize = 64 * 1024;
 const CHUNK_SIZE: u32 = 1024 * 1024;
 const MAX_PARALLEL: u16 = 32;
+/// Upper bound for *auto* (`--carriers 0`) carrier scaling. Matches the server's default
+/// carrier cap so the auto request is not silently truncated by the server. An explicit
+/// `--carriers N` is not clamped here (the server still enforces its own `--max-carriers`).
+const AUTO_CARRIER_CAP: u16 = DEFAULT_MAX_CARRIERS;
 const RESUME_FLUSH_EVERY_CHUNKS: u64 = 8;
 const LOCAL_BIND: &str = "127.0.0.1:0";
 const LOCAL_HOST: &str = "127.0.0.1";
@@ -524,11 +528,16 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
         })?;
 
     let endpoint = Endpoint::parse(&options.to);
+    // The listener cannot yet see the sender's `--parallel`, so the auto carrier count uses
+    // the same cpu-based hint the sender's auto `--parallel` uses; they match in the common
+    // (same-class hardware) case. Carriers only matter on the relay fallback path.
+    let carriers = resolve_carriers(options.carriers, default_parallel_hint());
     info!(
         transfer_id = %transfer_id,
         dest_path = %options.dest_path.display(),
         udp = !options.relay_only,
-        carriers = options.carriers,
+        carriers,
+        carriers_requested = options.carriers,
         relay_security = if endpoint.tls { "tls" } else { "plain" },
         "transfer listener starting"
     );
@@ -551,7 +560,7 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
         options.nat_udp_preferred_port,
         options.nat_udp_release_timeout,
         DEFAULT_MAX_CONNS,
-        options.carriers.max(1),
+        carriers,
         ProviderMeta::default(),
     )
     .await?;
@@ -673,6 +682,9 @@ pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
     }
 
     let plan = plan_transfer(transfer_id.clone(), &options, &all_sources).await?;
+    // Auto (`--carriers 0`) matches the resolved worker count so each relay substream gets
+    // its own TCP carrier (no single-connection HOL). Ignored on the direct UDP path.
+    let carriers = resolve_carriers(options.carriers, plan.parallel);
     let endpoint = Endpoint::parse(&options.to);
     let proxy = Proxy::new(
         &options.to,
@@ -686,7 +698,7 @@ pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
         options.try_port_prediction,
         options.nat_udp_preferred_port,
         options.nat_udp_release_timeout,
-        options.carriers.max(1),
+        carriers,
         None,
     )
     .await?;
@@ -704,15 +716,17 @@ pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
     info!(
         transfer_id = %plan.transfer_id,
         transport = %transport,
-        carriers = options.carriers,
+        carriers,
+        carriers_requested = options.carriers,
         requested_parallel = plan.parallel,
         "transfer sender transport ready"
     );
-    if !transport.direct_udp && plan.parallel > options.carriers.max(1) {
+    if !transport.direct_udp && plan.parallel > carriers {
         warn!(
             parallel = plan.parallel,
-            carriers = options.carriers,
-            "parallel workers exceed carrier connections; relay path may have HOL blocking — consider matching --carriers to --parallel"
+            carriers,
+            "parallel workers exceed carrier connections; relay path may have HOL blocking — \
+             raise --carriers (or leave it at 0/auto)"
         );
     }
 
@@ -938,11 +952,7 @@ async fn send_chunked_files(
                         },
                     )
                     .await?;
-                    with_stall(stall_timeout, async {
-                        stream.write_all(&chunk).await?;
-                        Ok(())
-                    })
-                    .await?;
+                    write_all_idle(&mut stream, &chunk, stall_timeout).await?;
                     progress.add_bytes(task.len as u64);
                     let count = sent.fetch_add(1, Ordering::Relaxed) + 1;
                     if let Some(limit) = injected_limit {
@@ -1006,14 +1016,7 @@ async fn send_stdin_stream(
             break;
         }
         send_frame(control, &Frame::StreamChunk { len: read as u32 }).await?;
-        {
-            let data = &buffer[..read];
-            with_stall(stall_timeout, async {
-                control.write_all(data).await?;
-                Ok(())
-            })
-            .await?;
-        }
+        write_all_idle(control, &buffer[..read], stall_timeout).await?;
         hasher.update(&buffer[..read]);
         total += read as u64;
         progress.add_bytes(read as u64);
@@ -1404,11 +1407,7 @@ async fn handle_worker_connection(
                     }
                     validate_chunk_geometry(&entry, chunk_index, offset, len)?;
                     let mut payload = vec![0u8; len as usize];
-                    with_stall(stall_timeout, async {
-                        stream.read_exact(&mut payload).await?;
-                        Ok(())
-                    })
-                    .await?;
+                    read_exact_idle(&mut stream, &mut payload, stall_timeout).await?;
                     let local_hash = blake3::hash(&payload).to_hex().to_string();
                     if local_hash != blake3 {
                         bail!(
@@ -1503,11 +1502,7 @@ async fn receive_stdin_stream(
                     bail!("stdin stream chunk length {len} out of bounds (max {STREAM_CHUNK_MAX})");
                 }
                 let mut buf = vec![0u8; len as usize];
-                with_stall(stall_timeout, async {
-                    control.read_exact(&mut buf).await?;
-                    Ok(())
-                })
-                .await?;
+                read_exact_idle(control, &mut buf, stall_timeout).await?;
                 file.write_all(&buf).await?;
                 hasher.update(&buf);
                 total += len as u64;
@@ -2373,14 +2368,7 @@ async fn plan_transfer(
     options: &SenderOptions,
     all_sources: &[PathBuf],
 ) -> Result<PlannedTransfer> {
-    let parallel = if options.parallel == 0 {
-        let cpu_count = std::thread::available_parallelism()
-            .map(|n| n.get() as u16)
-            .unwrap_or(4);
-        cpu_count.clamp(4, MAX_PARALLEL)
-    } else {
-        options.parallel.clamp(1, MAX_PARALLEL)
-    };
+    let parallel = resolve_parallel(options.parallel);
     let symlinks = options.symlinks;
     let devices = options.devices;
 
@@ -2862,6 +2850,91 @@ async fn with_stall<T>(secs: u64, fut: impl std::future::Future<Output = Result<
     match tokio::time::timeout(Duration::from_secs(secs), fut).await {
         Ok(r) => r,
         Err(_) => bail!("transfer stalled: no progress for {secs}s"),
+    }
+}
+
+/// Write the whole buffer, enforcing `secs` as a true **idle** timeout: the deadline is
+/// re-armed on every `write` that makes forward progress, so a slow-but-alive peer keeps
+/// the transfer going and only a genuine stall (no bytes accepted for `secs`) aborts.
+/// `secs == 0` disables the timeout. Unlike wrapping the whole `write_all` in one timeout,
+/// this does not impose a per-chunk deadline (the old bug aborted any link below
+/// `chunk_size / secs`, e.g. ~17 KiB/s for a 1 MiB chunk at 60 s).
+async fn write_all_idle<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    buf: &[u8],
+    secs: u64,
+) -> Result<()> {
+    if secs == 0 {
+        stream.write_all(buf).await?;
+        return Ok(());
+    }
+    let dur = Duration::from_secs(secs);
+    let mut off = 0;
+    while off < buf.len() {
+        match tokio::time::timeout(dur, stream.write(&buf[off..])).await {
+            Ok(Ok(0)) => bail!("transfer stalled: peer is not accepting data"),
+            Ok(Ok(n)) => off += n,
+            Ok(Err(err)) => return Err(err).context("failed to write transfer data"),
+            Err(_) => bail!("transfer stalled: no progress for {secs}s"),
+        }
+    }
+    Ok(())
+}
+
+/// Read exactly `buf.len()` bytes, enforcing `secs` as a true **idle** timeout: the deadline
+/// is re-armed on every `read` that delivers bytes. Mirrors [`write_all_idle`].
+async fn read_exact_idle<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut [u8],
+    secs: u64,
+) -> Result<()> {
+    if secs == 0 {
+        stream.read_exact(buf).await?;
+        return Ok(());
+    }
+    let dur = Duration::from_secs(secs);
+    let total = buf.len();
+    let mut off = 0;
+    while off < total {
+        match tokio::time::timeout(dur, stream.read(&mut buf[off..])).await {
+            Ok(Ok(0)) => bail!("unexpected EOF mid-chunk after {off}/{total} bytes"),
+            Ok(Ok(n)) => off += n,
+            Ok(Err(err)) => return Err(err).context("failed to read transfer data"),
+            Err(_) => bail!("transfer stalled: no progress for {secs}s"),
+        }
+    }
+    Ok(())
+}
+
+/// cpu-based default for `--parallel 0` / the listener's carrier hint: one worker per core,
+/// floored at 4 and capped at [`MAX_PARALLEL`].
+fn default_parallel_hint() -> u16 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u16)
+        .unwrap_or(4)
+        .clamp(4, MAX_PARALLEL)
+}
+
+/// Resolve `--parallel`: `0` ⇒ [`default_parallel_hint`], otherwise the request clamped to
+/// `[1, MAX_PARALLEL]`.
+fn resolve_parallel(requested: u16) -> u16 {
+    if requested == 0 {
+        default_parallel_hint()
+    } else {
+        requested.clamp(1, MAX_PARALLEL)
+    }
+}
+
+/// Resolve `--carriers` for a transfer. `0` ⇒ **auto**: match `parallel_hint` so each relay
+/// worker substream rides its own TCP carrier (independent congestion window, no cross-stream
+/// head-of-line blocking), capped at [`AUTO_CARRIER_CAP`]. An explicit value passes through
+/// unchanged — `1` forces the byte-for-byte single-connection path. Carriers only affect the
+/// relay path; the direct UDP path uses independent QUIC streams regardless.
+fn resolve_carriers(requested: u16, parallel_hint: u16) -> u16 {
+    if requested == 0 {
+        parallel_hint.clamp(1, AUTO_CARRIER_CAP)
+    } else {
+        requested
     }
 }
 
@@ -4287,5 +4360,91 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("inner error"));
+    }
+
+    // ----- Fix A: carrier / parallel resolution -----
+
+    #[test]
+    fn resolve_parallel_auto_and_clamp() {
+        assert_eq!(resolve_parallel(0), default_parallel_hint());
+        assert!((4..=MAX_PARALLEL).contains(&default_parallel_hint()));
+        assert_eq!(resolve_parallel(1), 1);
+        assert_eq!(resolve_parallel(7), 7);
+        assert_eq!(resolve_parallel(1000), MAX_PARALLEL);
+    }
+
+    #[test]
+    fn resolve_carriers_auto_tracks_parallel_capped() {
+        // auto (0): match the parallelism hint, capped at the server's default max.
+        assert_eq!(resolve_carriers(0, 8), 8);
+        assert_eq!(
+            resolve_carriers(0, AUTO_CARRIER_CAP + 100),
+            AUTO_CARRIER_CAP
+        );
+        assert_eq!(resolve_carriers(0, 0), 1); // never below one
+    }
+
+    #[test]
+    fn resolve_carriers_explicit_passes_through() {
+        // Explicit values are untouched here (the server still enforces --max-carriers).
+        assert_eq!(resolve_carriers(1, 32), 1); // single-connection path preserved
+        assert_eq!(resolve_carriers(4, 32), 4); // even below the hint
+        assert_eq!(resolve_carriers(64, 8), 64); // even above the auto cap
+    }
+
+    // ----- Fix B: idle (no-progress) stall timeout -----
+
+    #[tokio::test]
+    async fn idle_helpers_passthrough_when_disabled() {
+        let (mut a, mut b) = tokio::io::duplex(1 << 20);
+        write_all_idle(&mut a, &[9u8; 4096], 0).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        read_exact_idle(&mut b, &mut buf, 0).await.unwrap();
+        assert!(buf.iter().all(|&x| x == 9));
+    }
+
+    #[tokio::test]
+    async fn read_exact_idle_tolerates_slow_but_alive_writer() {
+        // Six 16 KiB slices, 250 ms apart: every gap is below the 1 s timeout but the total
+        // (~1.5 s) exceeds it. A whole-operation deadline (the old bug) would abort; a true
+        // idle timeout must not.
+        let (mut a, mut b) = tokio::io::duplex(1 << 20);
+        let writer = tokio::spawn(async move {
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                a.write_all(&[1u8; 16 * 1024]).await.unwrap();
+            }
+        });
+        let mut buf = vec![0u8; 6 * 16 * 1024];
+        read_exact_idle(&mut b, &mut buf, 1).await.unwrap();
+        writer.await.unwrap();
+        assert!(buf.iter().all(|&x| x == 1));
+    }
+
+    #[tokio::test]
+    async fn read_exact_idle_aborts_on_true_stall() {
+        // 16 KiB arrives, then the writer goes silent (stream stays open → no EOF).
+        let (mut a, mut b) = tokio::io::duplex(1 << 20);
+        a.write_all(&[7u8; 16 * 1024]).await.unwrap();
+        let mut buf = vec![0u8; 32 * 1024];
+        let err = read_exact_idle(&mut b, &mut buf, 1).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no progress"),
+            "expected idle-stall error, got: {err}"
+        );
+        drop(a); // keep the write half alive until after the assertion
+    }
+
+    #[tokio::test]
+    async fn write_all_idle_aborts_when_peer_never_drains() {
+        // 16 KiB pipe, peer never reads: once the buffer fills, writes make no progress.
+        let (_peer, mut b) = tokio::io::duplex(16 * 1024);
+        let err = write_all_idle(&mut b, &vec![5u8; 256 * 1024], 1)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no progress") || err.to_string().contains("not accepting"),
+            "expected idle-stall error, got: {err}"
+        );
     }
 }

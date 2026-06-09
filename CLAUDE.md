@@ -78,7 +78,10 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
 - `copy_bidirectional_with_sizes` propagates half-close; do not replace with a non-half-close variant
 - `shared::tune_tcp` (`TCP_NODELAY` + `SO_KEEPALIVE 15s`) must be applied to every new socket
 - `--max-conns` semaphore is the real bound; yamux stream limit is set generous intentionally
-- `carriers<=1` (default) keeps the single-connection path byte-for-byte unchanged
+- `carriers<=1` keeps the single-connection path byte-for-byte unchanged. Default is `1`
+  for `local`/`proxy`, but `0` (auto) for `bore transfer` — auto scales the relay carrier
+  pool to the worker `--parallel` count (capped at server `--max-carriers`); `transfer.rs`
+  resolves it via `resolve_carriers`. Explicit `--carriers 1` still forces the single path.
 
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

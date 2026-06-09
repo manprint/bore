@@ -528,8 +528,11 @@ enum TransferCommand {
         )]
         nat_udp_release_timeout: u64,
 
-        /// Number of relay carrier connections for fallback mode.
-        #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
+        /// Number of relay carrier connections, used only on the TCP fallback path.
+        /// 0 = auto: match the worker parallelism (capped at the server's max carriers) so
+        /// each relay stream rides its own TCP connection — independent congestion window,
+        /// no head-of-line blocking. 1 forces a single connection. Ignored on direct UDP.
+        #[clap(long, value_name = "N", default_value_t = 0, env = "BORE_CARRIERS")]
         carriers: u16,
 
         /// Overwrite an existing destination root.
@@ -637,14 +640,18 @@ enum TransferCommand {
         )]
         nat_udp_release_timeout: u64,
 
-        /// Number of relay carrier connections for fallback mode.
-        #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
+        /// Number of relay carrier connections, used only on the TCP fallback path.
+        /// 0 = auto: match the worker parallelism (capped at the server's max carriers) so
+        /// each relay stream rides its own TCP connection — independent congestion window,
+        /// no head-of-line blocking. 1 forces a single connection. Ignored on direct UDP.
+        #[clap(long, value_name = "N", default_value_t = 0, env = "BORE_CARRIERS")]
         carriers: u16,
 
         /// Number of parallel data streams for chunked filesystem transfers.
         /// Each stream maps to one QUIC bidi (direct path) or one yamux substream
-        /// (relay). 0 = automatic (cpu-count, min 4). On the relay path, matching
-        /// --carriers to --parallel avoids HOL blocking. Stdin always uses one stream.
+        /// (relay). 0 = automatic (cpu-count, min 4). With --carriers 0 (auto) the relay
+        /// carrier count tracks this value, so the relay path avoids HOL blocking out of
+        /// the box. Stdin always uses one stream.
         #[clap(long, value_name = "N", default_value_t = 0)]
         parallel: u16,
 

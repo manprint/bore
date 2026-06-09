@@ -944,6 +944,62 @@ async fn transfer_large_file_parallel_over_relay() -> Result<()> {
     Ok(())
 }
 
+/// Fix A: `--carriers 0` (auto) must transparently scale the relay carrier pool to the
+/// worker parallelism and still deliver the file intact over the multi-carrier relay path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_auto_carriers_over_relay() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("auto-carriers-source");
+    let dest_root = temp_path("auto-carriers-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let source_file = source_root.join("auto.bin");
+    // Several chunks so multiple workers (and thus multiple auto-allocated carriers) are used.
+    let payload = patterned_bytes(5_000_000);
+    write_file(&source_file, &payload).await?;
+
+    let transfer_id = format!("auto-carriers-{}", Uuid::new_v4());
+    let listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            // carriers = 0 → auto on the listener.
+            bore_cli::transfer::run_listener(listener_options(
+                transfer_id,
+                dest_root,
+                true,
+                0,
+                None,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    // carriers = 0 → auto on the sender; parallel = 6 workers.
+    let sender = bore_cli::transfer::run_sender(sender_options(
+        transfer_id,
+        source_file,
+        None,
+        true,
+        0,
+        6,
+        None,
+    ))
+    .await?;
+    let listener = listener.await.context("listener task join failed")??;
+
+    assert!(!sender.transport.direct_udp);
+    assert!(!listener.transport.direct_udp);
+    assert_eq!(read_file(&dest_root.join("auto.bin")).await?, payload);
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfer_small_file_parallel_over_relay_when_workers_exceed_chunks() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;

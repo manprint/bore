@@ -728,12 +728,15 @@ What the transfer command guarantees in V2:
   same sender with the same `--transfer-id` and unchanged files is safe — the
   receiver detects the committed marker and re-sends the acknowledgement without
   re-writing any data.
-- **Parallel filesystem workers** via `--parallel N`. `--parallel 0` is
-  automatic and currently resolves from `--carriers`, capped at 4 workers; with
-  the default `--carriers 1`, automatic mode starts one worker. Explicit
-  `--parallel` values are clamped to 32. On the relay, `--carriers N` widens
-  the data path; on direct UDP, each transferred connection already uses an
-  independent native QUIC stream.
+- **Parallel filesystem workers** via `--parallel N`. `--parallel 0` (the
+  default) is automatic: one worker per CPU core, floored at 4 and capped at 32.
+  On the relay path each worker rides its own TCP carrier, so by default
+  `--carriers 0` (auto) scales the carrier pool to match the worker count
+  (capped at the server's `--max-carriers`, default 16) — every worker gets an
+  independent congestion window and there is no single-connection head-of-line
+  blocking. Set `--carriers 1` to force the old single-connection path, or a
+  fixed `N` to pin it. On direct UDP, carriers are irrelevant: each transferred
+  connection already uses an independent native QUIC stream.
 - **Cross-platform path fidelity**: the wire format preserves Unix raw-byte path
   components and Windows UTF-16 path components losslessly, so Linux/macOS raw
   names and Windows names survive relay/direct transfer without forcing UTF-8.

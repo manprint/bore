@@ -26,6 +26,8 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 | File sizes around chunk boundaries (1, CHUNK-1, CHUNK, CHUNK+1, 2×CHUNK) | `transfer_file_size_boundaries_over_relay` | ✅ |
 | Manifest spanning multiple frames | `transfer_manifest_spans_multiple_frames_over_relay` | ✅ |
 | Large file, parallel workers (relay) | `transfer_large_file_parallel_over_relay` | ✅ |
+| Auto carriers (`--carriers 0`) scale the relay pool to parallelism | `transfer_auto_carriers_over_relay` | ✅ |
+| `resolve_carriers` / `resolve_parallel` (auto, clamp, explicit pass-through) | unit tests (×3) | ✅ |
 | Small file, parallel workers > chunk count | `transfer_small_file_parallel_over_relay_when_workers_exceed_chunks` | ✅ |
 | `chunk_count_for` — 0, exact, over, large | unit tests (×4) | ✅ |
 | `chunk_len` — first, last partial, zero-byte | unit tests (×3) | ✅ |
@@ -117,8 +119,12 @@ Unit tests live in `src/transfer.rs #[cfg(test)]`; integration tests in `tests/t
 | `with_stall` disabled when secs=0 (F10) | `with_stall_zero_disables_timeout` (unit) | ✅ |
 | `with_stall` passes through Ok result | `with_stall_passes_through_ok` (unit) | ✅ |
 | `with_stall` propagates inner error | `with_stall_propagates_inner_error` (unit) | ✅ |
+| Idle timeout tolerates slow-but-alive transfer (no per-chunk deadline) | `read_exact_idle_tolerates_slow_but_alive_writer` (unit) | ✅ |
+| Idle timeout aborts on a genuine read stall | `read_exact_idle_aborts_on_true_stall` (unit) | ✅ |
+| Idle timeout aborts when the peer never drains writes | `write_all_idle_aborts_when_peer_never_drains` (unit) | ✅ |
+| Idle helpers pass through when `secs=0` | `idle_helpers_passthrough_when_disabled` (unit) | ✅ |
 | `--confirm-timeout` rejects on expiry + sender gets clear error (F6) | manual (requires `--ask-confirm` + TTY) | ⚠️ |
-| `--stall-timeout` aborts a stalled data path (F10) | manual (requires injected TCP pause) | ⚠️ |
+| `--stall-timeout` aborts a stalled data path (F10) | manual end-to-end; unit-proven via `*_idle_aborts_*` | ✅ |
 
 ---
 

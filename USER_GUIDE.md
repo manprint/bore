@@ -992,9 +992,14 @@ bore transfer sender \
 #### Molti file o relay ad alta concorrenza
 
 `--parallel N` governa i worker filesystem; `--carriers N` allarga solo la
-tratta relay. Sul direct UDP ogni connessione trasferita usa già il proprio
-stream QUIC nativo. In automatico, `--parallel 0` deriva oggi da `--carriers`
-ed è capato a 4; con il default `--carriers 1`, parte un solo worker.
+tratta relay. In automatico `--parallel 0` (default) usa un worker per core,
+minimo 4 e massimo 32. Sul relay ogni worker viaggia sul proprio carrier TCP:
+di default `--carriers 0` (auto) dimensiona il pool di carrier sul numero di
+worker (capato al `--max-carriers` del server, default 16), così ogni worker ha
+la propria finestra di congestione e sparisce l'head-of-line blocking della
+singola connessione. Usa `--carriers 1` per forzare il vecchio percorso a
+connessione singola, oppure un valore fisso `N`. Sul direct UDP i carrier sono
+irrilevanti: ogni connessione usa già il proprio stream QUIC nativo.
 
 ```shell
 bore transfer sender \

@@ -1,0 +1,83 @@
+# Full example vhost.yml for bore server.
+#
+# Use it by mounting the file into the container and setting:
+#   BORE_VHOST_CONFIG=/vhost/config-full.example.yml
+#
+# Notes:
+# - `default_headers` are injected into the first request head sent upstream.
+# - `default_response_headers` are injected into the first response head sent back to the client.
+# - `reservations[].headers` override request headers for that subdomain.
+# - `reservations[].response_headers` override response headers for that subdomain.
+# - Most top-level fields can also be overridden by `BORE_VHOST_*` env vars.
+# - Header rewriting currently touches only the first request head and the first
+#   response head on a connection; subsequent keep-alive exchanges are pure-spliced.
+
+# Required: base domain used by the vhost frontend.
+base_domain: bore.example.com
+
+# Optional: http | https | both | redirect-https | auto
+# Default: auto
+mode: auto
+
+# Optional: frontend ports.
+# Defaults: 80 / 443
+http_port: 80
+https_port: 443
+
+# Optional TLS files for vhost HTTPS modes.
+# Required for: https, both, redirect-https
+# Use a wildcard certificate for *.bore.example.com and bore.example.com.
+cert_file: /certs/fullchain.pem
+key_file: /certs/privkey.pem
+
+# Default request headers injected into the first routed request head.
+default_headers:
+  X-Forwarded-Proto: "https"
+  X-Forwarded-Ssl: "on"
+
+# Default response headers injected into the first routed response head.
+# Use this block for browser-visible security headers.
+default_response_headers:
+  X-Frame-Options: "SAMEORIGIN"
+  X-XSS-Protection: "1; mode=block"
+  Referrer-Policy: "no-referrer-when-downgrade"
+  Strict-Transport-Security: "max-age=31536000; includeSubDomains"
+  Permissions-Policy: "geolocation=(self), microphone=(self), camera=(self), fullscreen=(self)"
+  Content-Security-Policy: "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;"
+  X-Content-Type-Options: "nosniff"
+
+# Optional static reservations.
+# If a subdomain is listed here, only the matching `client_id` may register it.
+# If a subdomain is not listed, it can still be claimed dynamically when free.
+reservations:
+  - subdomain: app
+    client_id: my-app-client
+    headers:
+      X-Forwarded-Host: "app.bore.example.com"
+      X-App-Name: "main-app"
+    response_headers:
+      X-Frame-Options: "SAMEORIGIN"
+      Cache-Control: "private, no-store"
+
+  - subdomain: admin
+    client_id: admin-client
+    headers:
+      X-Forwarded-Host: "admin.bore.example.com"
+    response_headers:
+      Content-Security-Policy: "default-src 'self'; img-src 'self' data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss:; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"
+      X-Robots-Tag: "noindex, nofollow"
+
+  - subdomain: api
+    client_id: api-client
+    headers:
+      X-Forwarded-Host: "api.bore.example.com"
+    response_headers:
+      Permissions-Policy: "geolocation=(), microphone=(), camera=(), fullscreen=(self)"
+      Cache-Control: "no-store"
+
+  - subdomain: ws
+    client_id: websocket-client
+    headers:
+      X-Upstream-Protocol: "websocket"
+    response_headers:
+      Content-Security-Policy: "default-src 'self'; connect-src 'self' ws: wss:; frame-ancestors 'self'; base-uri 'self'"

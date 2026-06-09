@@ -40,6 +40,9 @@ pub const DEFAULT_MAX_CONNS: usize = 1024;
 /// may use for its data path. Overridable with [`Server::set_max_carriers`].
 pub const DEFAULT_MAX_CARRIERS: u16 = 16;
 
+/// Default HSTS value served on HTTPS control-port HTTP responses.
+pub const DEFAULT_CONTROL_HSTS: &str = "max-age=31536000; includeSubDomains";
+
 /// Interval at which the server sends heartbeats to detect a dead client.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -106,6 +109,9 @@ pub struct Server {
     /// bore-protocol behaviour.
     admin_token: Option<String>,
 
+    /// Optional HSTS value added to HTTPS control-port HTTP responses.
+    control_hsts: Option<String>,
+
     /// Registry of live vhost providers, keyed by subdomain label.
     vhost_registry: VhostRegistry,
 
@@ -153,6 +159,7 @@ impl Server {
             bind_tunnels: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             admin: AdminRegistry::default(),
             admin_token: None,
+            control_hsts: Some(DEFAULT_CONTROL_HSTS.to_string()),
             vhost_registry: VhostRegistry::default(),
             vhost_config: None,
             vhost_tls: Arc::new(std::sync::RwLock::new(None)),
@@ -216,6 +223,21 @@ impl Server {
     /// `None` (the default) leaves it disabled.
     pub fn set_admin_token(&mut self, token: Option<String>) {
         self.admin_token = token;
+    }
+
+    /// Set the HSTS value served on HTTPS control-port HTTP responses.
+    /// Pass `off`, `false`, `none`, or an empty string to disable it.
+    pub fn set_control_hsts(&mut self, hsts: &str) {
+        let value = hsts.trim();
+        self.control_hsts = if value.is_empty()
+            || value.eq_ignore_ascii_case("off")
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("none")
+        {
+            None
+        } else {
+            Some(value.to_string())
+        };
     }
 
     /// Set the UDP port used by the vhost QUIC direct path.
@@ -639,6 +661,11 @@ impl Server {
     /// Serve the admin status page when an admin token is configured, otherwise a
     /// minimal 404 (the request reached the control port but matched no vhost route).
     async fn serve_admin_http<S: mux::Transport>(&self, mut stream: S) -> Result<()> {
+        let control_hsts = if self.tls.is_some() {
+            self.control_hsts.as_deref()
+        } else {
+            None
+        };
         match self.admin_token.clone() {
             Some(token) => {
                 let server = ServerStatus {
@@ -646,18 +673,15 @@ impl Server {
                     tls: self.tls.is_some(),
                     udp: self.udp,
                 };
-                if let Err(err) = admin_http::serve(stream, &self.admin, &token, server).await {
+                if let Err(err) =
+                    admin_http::serve(stream, &self.admin, &token, server, control_hsts).await
+                {
                     trace!(%err, "admin request failed");
                 }
                 Ok(())
             }
             None => {
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .await;
-                let _ = stream.shutdown().await;
+                let _ = admin_http::respond_not_found(&mut stream, control_hsts).await;
                 Ok(())
             }
         }

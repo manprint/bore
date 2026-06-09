@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use serde::Deserialize;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
@@ -66,6 +66,9 @@ pub struct VhostConfig {
     /// Headers injected on every route (per-subdomain overrides these).
     #[serde(default)]
     pub default_headers: BTreeMap<String, String>,
+    /// Response headers injected on every routed response.
+    #[serde(default)]
+    pub default_response_headers: BTreeMap<String, String>,
     /// Static subdomain → client-id reservations.
     #[serde(default)]
     pub reservations: Vec<Reservation>,
@@ -81,6 +84,9 @@ pub struct Reservation {
     /// Extra headers injected for this subdomain (merged over `default_headers`).
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Extra response headers injected for this subdomain.
+    #[serde(default)]
+    pub response_headers: BTreeMap<String, String>,
 }
 
 /// Frontend mode as expressed in `vhost.yml` (or via CLI override).
@@ -191,7 +197,9 @@ pub enum RouteDecision {
     /// Accept; `headers` is the merged header list to inject (may be empty).
     Accept {
         /// Resolved headers to inject on the first request head.
-        headers: Vec<(String, String)>,
+        request_headers: Vec<(String, String)>,
+        /// Resolved headers to inject on the first response head.
+        response_headers: Vec<(String, String)>,
     },
     /// Reject with the given human-readable reason.
     Reject {
@@ -212,13 +220,23 @@ pub fn resolve_route(cfg: &VhostConfig, subdomain: &str, client_id: &str) -> Rou
             reason: format!("subdomain '{subdomain}' is reserved for a different client"),
         },
         Some(res) => {
-            let headers = merge_headers(&cfg.default_headers, &res.headers);
-            RouteDecision::Accept { headers }
+            let request_headers = merge_headers(&cfg.default_headers, &res.headers);
+            let response_headers =
+                merge_headers(&cfg.default_response_headers, &res.response_headers);
+            RouteDecision::Accept {
+                request_headers,
+                response_headers,
+            }
         }
         None => {
             // Unreserved: accept with default headers only.
-            let headers = merge_headers(&cfg.default_headers, &BTreeMap::new());
-            RouteDecision::Accept { headers }
+            let request_headers = merge_headers(&cfg.default_headers, &BTreeMap::new());
+            let response_headers =
+                merge_headers(&cfg.default_response_headers, &BTreeMap::new());
+            RouteDecision::Accept {
+                request_headers,
+                response_headers,
+            }
         }
     }
 }
@@ -321,7 +339,9 @@ pub struct VhostEntry {
     /// Carrier pool for this provider (may have >1 connection with `--carriers`).
     pub pool: Arc<CarrierPool>,
     /// Resolved header list to inject on the first request head (may be empty).
-    pub headers: Vec<(String, String)>,
+    pub request_headers: Vec<(String, String)>,
+    /// Resolved header list to inject on the first response head (may be empty).
+    pub response_headers: Vec<(String, String)>,
     /// Live QUIC direct connection to the provider, when one is established.
     #[cfg(feature = "udp")]
     pub direct: std::sync::RwLock<Option<crate::holepunch::DirectConn>>,
@@ -423,8 +443,11 @@ pub async fn serve_vhost_provider(
 ) -> Result<()> {
     // Validate against live config (resolve_route checks reservations).
     let cfg = vhost_config.read().unwrap().clone();
-    let headers = match resolve_route(&cfg, &subdomain, &client_id) {
-        RouteDecision::Accept { headers } => headers,
+    let (request_headers, response_headers) = match resolve_route(&cfg, &subdomain, &client_id) {
+        RouteDecision::Accept {
+            request_headers,
+            response_headers,
+        } => (request_headers, response_headers),
         RouteDecision::Reject { reason } => {
             warn!(%subdomain, %reason, "vhost registration rejected");
             control.send(ServerMessage::Error(reason)).await?;
@@ -447,7 +470,8 @@ pub async fn serve_vhost_provider(
             let pool = Arc::new(CarrierPool::new(opener));
             let entry = Arc::new(VhostEntry {
                 pool: Arc::clone(&pool),
-                headers,
+                request_headers,
+                response_headers,
                 #[cfg(feature = "udp")]
                 direct: std::sync::RwLock::new(None),
                 #[cfg(feature = "udp")]
@@ -637,25 +661,71 @@ pub async fn relay_vhost(
     provider.write_all(&[mux::STREAM_READY]).await?;
 
     let mut public = public;
-    if entry.headers.is_empty() {
+    let request_head = if entry.request_headers.is_empty() {
         // Zero-overhead pure-splice path: forward the already-read head as-is.
-        provider.write_all(&head).await?;
+        head
     } else {
-        let rewritten = rewrite_head(&head, &entry.headers);
-        provider.write_all(&rewritten).await?;
+        rewrite_head(&head, &entry.request_headers)
+    };
+    provider.write_all(&request_head).await?;
+
+    if entry.response_headers.is_empty() {
+        tokio::io::copy_bidirectional_with_sizes(
+            &mut public,
+            &mut provider,
+            PROXY_BUFFER_SIZE,
+            PROXY_BUFFER_SIZE,
+        )
+        .await?;
+        return Ok(());
     }
 
-    tokio::io::copy_bidirectional_with_sizes(
-        &mut public,
-        &mut provider,
-        PROXY_BUFFER_SIZE,
-        PROXY_BUFFER_SIZE,
-    )
-    .await?;
+    relay_response_injected(public, provider, &entry.response_headers).await?;
     Ok(())
 }
 
-/// Rewrite a request head: insert/override configured headers, keep the rest.
+async fn relay_response_injected(
+    public: impl AsyncRead + AsyncWrite + Unpin,
+    provider: impl AsyncRead + AsyncWrite + Unpin,
+    inject: &[(String, String)],
+) -> Result<()> {
+    let (mut public_read, mut public_write) = tokio::io::split(public);
+    let (mut provider_read, mut provider_write) = tokio::io::split(provider);
+
+    let forward_request = async {
+        copy_one_direction_with_shutdown(&mut public_read, &mut provider_write).await
+    };
+
+    let forward_response = async {
+        let response_head = read_head_async(&mut provider_read).await?;
+        if !response_head.is_empty() {
+            let rewritten = rewrite_head(&response_head, inject);
+            public_write.write_all(&rewritten).await?;
+        }
+        copy_one_direction_with_shutdown(&mut provider_read, &mut public_write).await
+    };
+
+    let (_, _) = tokio::try_join!(forward_request, forward_response)?;
+    Ok(())
+}
+
+async fn copy_one_direction_with_shutdown<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; PROXY_BUFFER_SIZE];
+    loop {
+        let read = reader.read(&mut buf).await?;
+        if read == 0 {
+            writer.shutdown().await?;
+            return Ok(());
+        }
+        writer.write_all(&buf[..read]).await?;
+    }
+}
+
+/// Rewrite an HTTP head: insert/override configured headers, keep the rest.
 ///
 /// Only modifies headers whose names appear in `inject`; preserves all other
 /// headers and the request line unchanged. Operates on raw bytes (no lossy UTF-8
@@ -667,8 +737,8 @@ pub async fn relay_vhost(
 /// `\r\n\r\n` terminator (e.g. it was truncated at the read cap), no rewrite is
 /// attempted and the bytes are returned unchanged so the stream never desyncs.
 ///
-/// **MVP limitation:** only the first request head of the connection is rewritten.
-/// Subsequent keep-alive requests are spliced raw.
+/// **MVP limitation:** only the first parsed HTTP head on that direction is rewritten.
+/// Subsequent keep-alive heads are spliced raw.
 pub fn rewrite_head(head: &[u8], inject: &[(String, String)]) -> Vec<u8> {
     // Locate the end of the header block. Everything after it is body bytes that
     // must be forwarded as-is; without a complete terminator, do not rewrite.
@@ -1223,6 +1293,7 @@ reservations:
             cert_file: None,
             key_file: None,
             default_headers: BTreeMap::new(),
+            default_response_headers: BTreeMap::new(),
             reservations: vec![],
         }
     }

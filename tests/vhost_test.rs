@@ -160,6 +160,7 @@ fn http_config(base_domain: &str, http_port: u16) -> VhostConfig {
         cert_file: None,
         key_file: None,
         default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
         reservations: vec![],
     }
 }
@@ -321,6 +322,7 @@ async fn vhost_reservation_enforced_accepted() -> Result<()> {
         client_id: "clientA".to_string(),
         subdomain: "reserved".to_string(),
         headers: BTreeMap::new(),
+        response_headers: BTreeMap::new(),
     }];
     spawn_reg_server(cfg).await?;
 
@@ -353,6 +355,7 @@ async fn vhost_reservation_enforced_rejected() -> Result<()> {
         client_id: "clientA".to_string(),
         subdomain: "reserved2".to_string(),
         headers: BTreeMap::new(),
+        response_headers: BTreeMap::new(),
     }];
     spawn_reg_server(cfg).await?;
 
@@ -479,6 +482,7 @@ async fn vhost_https_routing() -> Result<()> {
         cert_file: Some(cert_path),
         key_file: Some(key_path),
         default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
         reservations: vec![],
     };
 
@@ -546,6 +550,7 @@ async fn vhost_redirect_mode() -> Result<()> {
         cert_file: Some(cert_path),
         key_file: Some(key_path),
         default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
         reservations: vec![],
     };
 
@@ -623,6 +628,16 @@ async fn vhost_header_injection() -> Result<()> {
     sub_headers.insert("X-Override".to_string(), "v1".to_string());
     sub_headers.insert("X-Default".to_string(), "override".to_string());
 
+    let mut default_response_headers = BTreeMap::new();
+    default_response_headers.insert("X-Frame-Options".to_string(), "DENY".to_string());
+
+    let mut sub_response_headers = BTreeMap::new();
+    sub_response_headers.insert("X-Frame-Options".to_string(), "SAMEORIGIN".to_string());
+    sub_response_headers.insert(
+        "Strict-Transport-Security".to_string(),
+        "max-age=31536000; includeSubDomains".to_string(),
+    );
+
     let cfg = VhostConfig {
         base_domain: "bore.local".to_string(),
         mode: VhostModeCfg::Http,
@@ -631,10 +646,12 @@ async fn vhost_header_injection() -> Result<()> {
         cert_file: None,
         key_file: None,
         default_headers,
+        default_response_headers,
         reservations: vec![Reservation {
             client_id: "inject-client".to_string(),
             subdomain: "inject".to_string(),
             headers: sub_headers,
+            response_headers: sub_response_headers,
         }],
     };
 
@@ -656,7 +673,7 @@ async fn vhost_header_injection() -> Result<()> {
     tokio::spawn(client.listen());
     time::sleep(Duration::from_millis(50)).await;
 
-    let _ = send_http(HTTP, "inject.bore.local", "/").await?;
+    let response = send_http(HTTP, "inject.bore.local", "/").await?;
 
     // Give the stub a moment to capture the request.
     time::sleep(Duration::from_millis(50)).await;
@@ -679,6 +696,20 @@ async fn vhost_header_injection() -> Result<()> {
     assert!(
         !request_text.to_lowercase().contains("x-default: d1"),
         "X-Default: d1 (the default value) must not appear: {request_text}"
+    );
+    assert!(
+        response.to_lowercase().contains("x-frame-options: sameorigin"),
+        "response header override must be present: {response}"
+    );
+    assert!(
+        !response.to_lowercase().contains("x-frame-options: deny"),
+        "default response header value must be overridden: {response}"
+    );
+    assert!(
+        response
+            .to_lowercase()
+            .contains("strict-transport-security: max-age=31536000; includesubdomains"),
+        "response header injection must add HSTS: {response}"
     );
     Ok(())
 }
@@ -854,6 +885,7 @@ async fn vhost_http_websocket_relay_round_trip() -> Result<()> {
         cert_file: None,
         key_file: None,
         default_headers,
+        default_response_headers: BTreeMap::new(),
         reservations: vec![],
     };
 
@@ -898,6 +930,7 @@ async fn vhost_https_websocket_relay_round_trip() -> Result<()> {
         cert_file: Some(cert_path),
         key_file: Some(key_path),
         default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
         reservations: vec![],
     };
 
@@ -955,6 +988,7 @@ async fn vhost_https_websocket_direct_udp_round_trip() -> Result<()> {
         cert_file: Some(cert_path),
         key_file: Some(key_path),
         default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
         reservations: vec![],
     };
 
@@ -1282,6 +1316,7 @@ fn vhost_https_mode_without_cert_errors() {
         cert_file: None,
         key_file: None,
         default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
         reservations: vec![],
     };
     let mut server = Server::new(1024..=65535, None);
@@ -1391,6 +1426,7 @@ async fn vhost_post_body_preserved_with_inject() -> Result<()> {
         cert_file: None,
         key_file: None,
         default_headers,
+        default_response_headers: BTreeMap::new(),
         reservations: vec![],
     };
 
@@ -1455,6 +1491,7 @@ async fn vhost_https_rejects_foreign_base_domain() -> Result<()> {
         cert_file: Some(cert_path),
         key_file: Some(key_path),
         default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
         reservations: vec![],
     };
 

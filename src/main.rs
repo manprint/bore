@@ -466,10 +466,21 @@ enum Command {
         )]
         admin_token: Option<String>,
 
+        /// HSTS value served on HTTPS control-port HTTP responses (admin page,
+        /// vhost-miss 404 on the control port). Use `off` to disable.
+        #[clap(
+            long,
+            value_name = "VALUE|off",
+            default_value = bore_cli::server::DEFAULT_CONTROL_HSTS,
+            env = "BORE_CONTROL_HSTS"
+        )]
+        control_hsts: String,
+
         /// Path to a vhost.yml config file. Optional: the vhost frontend
         /// (subdomain-routed reverse proxy) is enabled by either this file or
         /// --vhost-base-domain. A file is only needed for reservations and
-        /// default_headers; everything else can be set via the flags below.
+        /// default_headers/default_response_headers; everything else can be set
+        /// via the flags below.
         #[clap(long, value_name = "PATH", env = "BORE_VHOST_CONFIG")]
         vhost_config: Option<PathBuf>,
 
@@ -1134,6 +1145,7 @@ async fn dispatch(command: Command) -> Result<()> {
             udp_socket_send_buffer,
             udp_max_streams,
             admin_token,
+            control_hsts,
             vhost_config,
             vhost_base_domain,
             vhost_http_port,
@@ -1162,6 +1174,7 @@ async fn dispatch(command: Command) -> Result<()> {
             }
             let mut server = Server::new(port_range, secret.as_deref());
             server.set_admin_token(admin_token);
+            server.set_control_hsts(&control_hsts);
             server.set_max_conns(max_conns);
             server.set_max_carriers(max_carriers);
             server.set_udp_tuning(parse_udp_tuning(
@@ -1213,6 +1226,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     cert_file: None,
                     key_file: None,
                     default_headers: Default::default(),
+                    default_response_headers: Default::default(),
                     reservations: Vec::new(),
                 })
             } else {

@@ -9,6 +9,7 @@ use bore_cli::{
     server::Server,
     shared::CONTROL_PORT,
     transport::{self, Endpoint},
+    vhost::{VhostConfig, VhostModeCfg},
 };
 use lazy_static::lazy_static;
 use rcgen::generate_simple_self_signed;
@@ -259,12 +260,94 @@ async fn admin_served_over_tls() -> Result<()> {
     let page = http_get(stream, "/admin/status", None).await?;
     assert!(page.starts_with("HTTP/1.1 200"), "tls page: {page:.40}");
     assert!(page.contains("bore"), "tls page should contain the shell");
+    assert!(
+        page.contains("Strict-Transport-Security: max-age=31536000; includeSubDomains"),
+        "tls page must include HSTS"
+    );
 
     // And the guarded data endpoint over TLS too.
     let stream = transport::connect(&ep, true).await?;
     let data = http_get(stream, "/admin/status/data", Some(TOKEN)).await?;
     assert!(data.starts_with("HTTP/1.1 200"), "tls data: {data:.40}");
     assert!(data.contains("\"server\""));
+    assert!(
+        data.contains("Strict-Transport-Security: max-age=31536000; includeSubDomains"),
+        "tls data must include HSTS"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_disabled_over_tls_returns_404_with_hsts() -> Result<()> {
+    const PORT: u16 = 17961;
+    const VHOST_HTTP: u16 = 17962;
+    let _g = SERIAL_GUARD.lock().await;
+    wait_port(PORT, false).await;
+
+    let (cert, key) = self_signed()?;
+    let acceptor = transport::server_tls_from_pem(cert.as_bytes(), key.as_bytes())?;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(PORT);
+    server.set_tls(acceptor);
+    server.set_vhost(VhostConfig {
+        base_domain: "bore.local".to_string(),
+        mode: VhostModeCfg::Http,
+        http_port: VHOST_HTTP,
+        https_port: 443,
+        cert_file: None,
+        key_file: None,
+        default_headers: Default::default(),
+        default_response_headers: Default::default(),
+        reservations: vec![],
+    })?;
+    tokio::spawn(server.listen());
+    wait_port(PORT, true).await;
+
+    let ep = Endpoint {
+        host: "localhost".to_string(),
+        port: PORT,
+        tls: true,
+    };
+    let stream = transport::connect(&ep, true).await?;
+    let resp = http_get(stream, "/", None).await?;
+    assert!(resp.starts_with("HTTP/1.1 404"), "tls 404: {resp:.60}");
+    assert!(
+        resp.contains("Strict-Transport-Security: max-age=31536000; includeSubDomains"),
+        "tls 404 must include HSTS"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_tls_hsts_can_be_disabled() -> Result<()> {
+    const PORT: u16 = 17963;
+    let _g = SERIAL_GUARD.lock().await;
+    wait_port(PORT, false).await;
+
+    let (cert, key) = self_signed()?;
+    let acceptor = transport::server_tls_from_pem(cert.as_bytes(), key.as_bytes())?;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(PORT);
+    server.set_tls(acceptor);
+    server.set_admin_token(Some(TOKEN.into()));
+    server.set_control_hsts("off");
+    tokio::spawn(server.listen());
+    wait_port(PORT, true).await;
+
+    let ep = Endpoint {
+        host: "localhost".to_string(),
+        port: PORT,
+        tls: true,
+    };
+    let stream = transport::connect(&ep, true).await?;
+    let page = http_get(stream, "/admin/status", None).await?;
+    assert!(page.starts_with("HTTP/1.1 200"), "tls page: {page:.40}");
+    assert!(
+        !page.contains("Strict-Transport-Security:"),
+        "HSTS must be absent when disabled"
+    );
 
     Ok(())
 }

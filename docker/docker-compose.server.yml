@@ -118,6 +118,10 @@ services:
       # port (min 32 chars). It is served over the same scheme as the control
       # connection (http or https). Leave unset to disable the page entirely.
       # - BORE_ADMIN_TOKEN=change-me-to-a-long-random-token-32+chars
+      # HSTS for HTTPS control-port HTTP responses (admin page and control-port
+      # 404/vhost-miss responses). Default is already
+      # `max-age=31536000; includeSubDomains`; set `off` to disable.
+      # - BORE_CONTROL_HSTS=max-age=31536000; includeSubDomains
       # Serve the control connection over TLS (also used for --https tunnels);
       # mount the files via the `volumes:` block below.
       # - BORE_CERT_FILE=/certs/cert.pem
@@ -145,8 +149,8 @@ services:
       # modes). Mount them via the `volumes:` block below.
       # - BORE_VHOST_CERT_FILE=/certs/vhost-fullchain.pem
       # - BORE_VHOST_KEY_FILE=/certs/vhost-privkey.pem
-      # Advanced only: static subdomain reservations and default injected headers
-      # need a yaml file (everything above is env-configurable without one). Mount
+      # Advanced only: static subdomain reservations plus default request/response
+      # header injection need a yaml file (everything above is env-configurable without one). Mount
       # it and set the path here; base-domain/ports/mode/cert env vars still override
       # the file. The file is hot-reloaded on change.
       # - BORE_VHOST_CONFIG=/vhost/vhost.yml

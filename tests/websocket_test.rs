@@ -237,6 +237,7 @@ fn http_config(base_domain: &str, http_port: u16) -> VhostConfig {
         cert_file: None,
         key_file: None,
         default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
         reservations: vec![],
     }
 }
@@ -512,6 +513,7 @@ async fn vhost_websocket_https_relay_round_trip() -> Result<()> {
         cert_file: Some(cert_path),
         key_file: Some(key_path),
         default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
         reservations: vec![],
     };
 
@@ -569,6 +571,7 @@ async fn vhost_websocket_https_udp_round_trip() -> Result<()> {
         cert_file: Some(cert_path),
         key_file: Some(key_path),
         default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
         reservations: vec![],
     };
 

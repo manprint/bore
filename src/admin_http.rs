@@ -52,6 +52,7 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     registry: &AdminRegistry,
     token: &str,
     server: ServerStatus,
+    control_hsts: Option<&str>,
 ) -> Result<()> {
     let head = match read_head(&mut stream).await? {
         Some(h) => h,
@@ -59,7 +60,14 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     };
     let (method, path) = request_line(&head);
     if method != "GET" {
-        return respond(&mut stream, 405, "text/plain", b"method not allowed").await;
+        return respond(
+            &mut stream,
+            405,
+            "text/plain",
+            b"method not allowed",
+            control_hsts,
+        )
+        .await;
     }
 
     // Route on the path without its query string.
@@ -70,22 +78,38 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 200,
                 "text/html; charset=utf-8",
                 STATUS_HTML.as_bytes(),
+                control_hsts,
             )
             .await
         }
         "/admin/status/data" => {
             if !authorized(&head, token) {
-                return respond(&mut stream, 401, "text/plain", b"unauthorized").await;
+                return respond(
+                    &mut stream,
+                    401,
+                    "text/plain",
+                    b"unauthorized",
+                    control_hsts,
+                )
+                    .await;
             }
             let view = StatusView {
                 server,
                 tunnels: registry.snapshot(),
             };
             let body = serde_json::to_vec(&view).context("serialize admin status")?;
-            respond(&mut stream, 200, "application/json", &body).await
+            respond(&mut stream, 200, "application/json", &body, control_hsts).await
         }
-        _ => respond(&mut stream, 404, "text/plain", b"not found").await,
+        _ => respond(&mut stream, 404, "text/plain", b"not found", control_hsts).await,
     }
+}
+
+/// Write the minimal control-port 404 response, with optional HSTS.
+pub(crate) async fn respond_not_found<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    control_hsts: Option<&str>,
+) -> Result<()> {
+    respond(stream, 404, "text/plain", b"", control_hsts).await
 }
 
 /// Read the HTTP request head (up to `\r\n\r\n`, capped, time-bounded).
@@ -164,6 +188,7 @@ async fn respond<S: AsyncWrite + Unpin>(
     code: u16,
     content_type: &str,
     body: &[u8],
+    control_hsts: Option<&str>,
 ) -> Result<()> {
     let reason = match code {
         200 => "OK",
@@ -172,11 +197,15 @@ async fn respond<S: AsyncWrite + Unpin>(
         405 => "Method Not Allowed",
         _ => "OK",
     };
+    let hsts = control_hsts
+        .map(|value| format!("Strict-Transport-Security: {value}\r\n"))
+        .unwrap_or_default();
     let header = format!(
         "HTTP/1.1 {code} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
+         {hsts}\
          Connection: close\r\n\r\n",
         body.len()
     );

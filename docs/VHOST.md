@@ -55,19 +55,27 @@ https_port: 443
 # cert_file: /path/to/fullchain.pem
 # key_file:  /path/to/privkey.pem
 
-# Default headers injected on every routed request (first request head only —
-# see "MVP limitations" below).
+# Default request headers injected on every routed request (first request head
+# only — see "MVP limitations" below).
 # default_headers:
 #   X-Forwarded-Proto: https
 #   X-Real-IP: ""
+
+# Default response headers injected on every routed response (first response
+# head only). Use this for browser-visible security headers.
+# default_response_headers:
+#   Strict-Transport-Security: max-age=31536000; includeSubDomains
+#   X-Frame-Options: SAMEORIGIN
 
 # Static subdomain reservations. An unlisted subdomain is accepted if free.
 # If a subdomain is listed, only the matching client_id may register it.
 reservations:
   - subdomain: myapp          # DNS label, e.g. myapp.bore.mydomain.com
     client_id: my-client-id  # must match --id on the bore vhost command
-    headers:                  # per-subdomain headers override default_headers
+    headers:                  # per-subdomain request headers override default_headers
       X-App-Name: myapp
+    response_headers:         # per-subdomain response headers override default_response_headers
+      X-Frame-Options: SAMEORIGIN
 ```
 
 ---
@@ -91,14 +99,17 @@ is configured. It never silently downgrades the mode.
 
 Headers are merged at registration time:
 
-1. `default_headers` from the config root apply to every subdomain.
+1. `default_headers` from the config root apply to the first routed request head.
 2. Per-reservation `headers` override `default_headers` (same key → reservation wins).
-3. If no headers are configured for a route, the connection is **pure-spliced**
+3. `default_response_headers` from the config root apply to the first routed response head.
+4. Per-reservation `response_headers` override `default_response_headers`.
+5. If no request or response headers are configured for a route, the connection is **pure-spliced**
    (`copy_bidirectional`) with zero overhead — multi-GB file transfers work at full speed.
 
-**MVP limitation:** headers are injected on the **first request head** of each TCP
-connection. Subsequent requests on the same HTTP keep-alive connection are spliced
-raw (headers not re-injected). Full per-request rewriting is future work.
+**MVP limitation:** headers are injected on the **first request head** and the
+**first response head** of each TCP connection. Subsequent keep-alive exchanges are
+spliced raw (headers not re-injected). Full per-request / per-response rewriting
+is future work.
 
 ---
 
@@ -111,9 +122,9 @@ raw (headers not re-injected). Full per-request rewriting is future work.
 - both the normal TCP relay path and `bore vhost --udp`
 
 The reason is simple: once the server has read the first HTTP request head to route by
-`Host` (and optionally inject headers on that first head), the connection is spliced
-full-duplex to the provider. After the upstream returns `101 Switching Protocols`,
-WebSocket frames flow as an opaque byte stream.
+`Host` (and optionally inject request/response headers on those first heads), the
+connection is spliced full-duplex to the provider. After the upstream returns
+`101 Switching Protocols`, WebSocket frames flow as an opaque byte stream.
 
 What is covered:
 

@@ -1,0 +1,115 @@
+# Full docker-compose example for `bore server`.
+# File name intentionally kept as requested: docker-compose-full-yml.ym
+#
+# Start:
+#   docker compose -f docker-compose-full-yml.ym up -d
+#
+# Image override:
+#   BORE_IMAGE=ghcr.io/youruser/bore:latest docker compose -f docker-compose-full-yml.ym up -d
+
+networks:
+  bore:
+    driver: bridge
+
+services:
+  bore-server:
+    image: ${BORE_IMAGE:-ghcr.io/manprint/bore:vhost_gpt}
+    # To build locally instead of pulling, comment `image:` and uncomment:
+    # build:
+    #   context: ..
+    #   dockerfile: Dockerfile
+    pull_policy: always
+    container_name: bore-server
+
+    # `command` can also carry options that do not have env vars, such as
+    # --bind-addr and --bind-tunnels.
+    command:
+      - server
+      # Only-CLI options without env vars:
+      # - --bind-addr
+      # - 0.0.0.0
+      # - --bind-tunnels
+      # - 0.0.0.0
+
+    restart: unless-stopped
+    networks:
+      - bore
+
+    # Increase this when raising BORE_MAX_CONNS / BORE_MAX_CARRIERS.
+    # ulimits:
+    #   nofile:
+    #     soft: 1048576
+    #     hard: 1048576
+
+    # Publish only the ports that match your chosen topology.
+    ports:
+      - "7835:7835"            # BORE_CONTROL_PORT TCP
+      - "7835:7835/udp"        # STUN fallback / control UDP
+      - "9000-9100:9000-9100"  # BORE_MIN_PORT..BORE_MAX_PORT tunnel range
+
+      # Optional: expose control over a standard web port.
+      - "443:7835"             # control over HTTPS when BORE_CERT_FILE/BORE_KEY_FILE are set
+      # - "80:7835"            # control over plain HTTP when no control cert is set
+
+      # Optional dedicated vhost frontend ports.
+      - "80:80"                # BORE_VHOST_HTTP_PORT
+      - "80:80/udp"            # vhost QUIC when HTTP-only and quic port = 80
+      - "443:443/udp"          # BORE_VHOST_QUIC_PORT for vhost --udp
+      # - "443:443"            # BORE_VHOST_HTTPS_PORT when using a dedicated HTTPS frontend
+
+    environment:
+      # --- Core server settings ---
+      - BORE_SECRET=change-me
+      - BORE_CONTROL_PORT=7835
+      - BORE_MIN_PORT=9000
+      - BORE_MAX_PORT=9100
+      - BORE_MAX_CONNS=1024
+      - BORE_MAX_CARRIERS=128
+
+      # Optional public domain advertised to clients for http(s):// endpoints.
+      - BORE_BIND_DOMAIN=bore.example.com
+
+      # Optional admin status page token, minimum 32 characters.
+      - BORE_ADMIN_TOKEN=replace-with-a-random-token-at-least-32-chars
+      # HSTS for HTTPS control-port HTTP responses. Use `off` to disable.
+      - BORE_CONTROL_HSTS=max-age=31536000; includeSubDomains
+
+      # Optional TLS for the main control listener / https public tunnels.
+      - BORE_CERT_FILE=/certs/cert.pem
+      - BORE_KEY_FILE=/certs/key.pem
+
+      # --- UDP direct path for secret tunnels ---
+      - BORE_UDP=true
+      - BORE_UDP_STREAM_RECEIVE_WINDOW=16MiB
+      - BORE_UDP_CONNECTION_RECEIVE_WINDOW=64MiB
+      - BORE_UDP_SEND_WINDOW=64MiB
+      - BORE_UDP_SOCKET_RECV_BUFFER=16MiB
+      - BORE_UDP_SOCKET_SEND_BUFFER=16MiB
+      - BORE_UDP_MAX_STREAMS=4096
+
+      # --- Vhost frontend ---
+      # You can enable vhost either with BORE_VHOST_BASE_DOMAIN alone or with a
+      # config file. The file is required for request/response header injection
+      # (`default_headers`, `default_response_headers`) and `reservations`.
+      - BORE_VHOST_CONFIG=/vhost/config-full.example.yml
+      - BORE_VHOST_BASE_DOMAIN=bore.example.com
+      - BORE_VHOST_MODE=auto
+      - BORE_VHOST_HTTP_PORT=80
+      - BORE_VHOST_HTTPS_PORT=443
+      - BORE_VHOST_QUIC_PORT=443
+      - BORE_VHOST_CERT_FILE=/certs/cert.pem
+      - BORE_VHOST_KEY_FILE=/certs/key.pem
+
+      # Examples of valid alternatives:
+      # - BORE_VHOST_MODE=http
+      # - BORE_VHOST_MODE=https
+      # - BORE_VHOST_MODE=both
+      # - BORE_VHOST_MODE=redirect-https
+
+    volumes:
+      - ./certs:/certs:ro
+      - ./config-full.example.yml:/vhost/config-full.example.yml:ro
+
+    # Linux production alternative when Docker bridge NAT breaks STUN/reflexive UDP:
+    # network_mode: host
+    # In that case comment out `networks:` and the whole `ports:` block.

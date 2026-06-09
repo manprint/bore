@@ -10,7 +10,9 @@ mode: auto
 # cert_file: /certs/wildcard.crt
 # key_file: /certs/wildcard.key
 
-default_headers:
+# Response headers injected into the first response head for every routed
+# subdomain. This is the section to use for browser-visible security headers.
+default_response_headers:
   X-Frame-Options: "SAMEORIGIN"
   X-XSS-Protection: "1; mode=block"
   Referrer-Policy: "no-referrer-when-downgrade"
@@ -18,5 +20,9 @@ default_headers:
   Permissions-Policy: "geolocation=(self), microphone=(self), camera=(self), fullscreen=(self)"
   Content-Security-Policy: "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;"
   X-Content-Type-Options: "nosniff"
+
+# Optional request headers injected into the first request head sent upstream.
+# default_headers:
+#   X-Forwarded-Proto: "https"
 
 reservations: []

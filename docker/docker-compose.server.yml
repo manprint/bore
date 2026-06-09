@@ -60,6 +60,14 @@ services:
       # decided by the certificate, not the port:
       # - "80:7835"            # plain HTTP (no cert/key set) -> clients use http://bore.tld
       # - "443:7835"           # HTTPS (set BORE_CERT_FILE/BORE_KEY_FILE) -> clients use https://bore.tld
+      #
+      # --- vhost frontend (subdomain reverse proxy) ---
+      # When BORE_VHOST_BASE_DOMAIN (or BORE_VHOST_CONFIG) is set below, the server
+      # binds HTTP/HTTPS frontend listeners that route by Host header to the matching
+      # registered subdomain of *.<base-domain>. These are the vhost frontend ports,
+      # NOT the control port — do not combine with the "80:7835"/"443:7835" lines:
+      # - "80:80"              # vhost HTTP frontend  (BORE_VHOST_HTTP_PORT)
+      # - "443:443"            # vhost HTTPS frontend (BORE_VHOST_HTTPS_PORT, needs cert)
     environment:
       - BORE_SECRET=change-me
       - BORE_CONTROL_PORT=7835
@@ -103,5 +111,29 @@ services:
       # mount the files via the `volumes:` block below.
       # - BORE_CERT_FILE=/certs/cert.pem
       # - BORE_KEY_FILE=/certs/key.pem
+      #
+      # --- vhost frontend (subdomain-routed reverse proxy) ---
+      # Enable by setting a base domain (no config file required). Clients then run:
+      #   bore vhost 127.0.0.1:8080 --subdomain app --id myid --to <this-server>
+      #   -> http(s)://app.<base-domain>
+      # DNS: point a wildcard *.<base-domain> at this host. Also publish the vhost
+      # frontend ports in the `ports:` block above. See ../docs/VHOST.md.
+      # - BORE_VHOST_BASE_DOMAIN=bore.mydomain.com
+      # Frontend mode: http | https | both | redirect-https | auto. Default auto =
+      # http when no cert, both when a cert is present.
+      # - BORE_VHOST_MODE=auto
+      # Frontend ports (must match the published vhost `ports:` above).
+      # - BORE_VHOST_HTTP_PORT=80
+      # - BORE_VHOST_HTTPS_PORT=443
+      # Wildcard TLS cert/key for *.<base-domain> (required for https/both/redirect-https
+      # modes). Mount them via the `volumes:` block below.
+      # - BORE_VHOST_CERT_FILE=/certs/vhost-fullchain.pem
+      # - BORE_VHOST_KEY_FILE=/certs/vhost-privkey.pem
+      # Advanced only: static subdomain reservations and default injected headers
+      # need a yaml file (everything above is env-configurable without one). Mount
+      # it and set the path here; base-domain/ports/mode/cert env vars still override
+      # the file. The file is hot-reloaded on change.
+      # - BORE_VHOST_CONFIG=/vhost/vhost.yml
     # volumes:
     #   - ./certs:/certs:ro
+    #   - ./vhost:/vhost:ro

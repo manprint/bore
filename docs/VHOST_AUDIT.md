@@ -41,6 +41,22 @@ Also fixed (pre-existing, surfaced by the new tests): `transfer.rs` `receiver_as
 tests raced on the global `BORE_TEST_CONFIRM_RESPONSE` env var → serialized with a
 `CONFIRM_ENV_GUARD` mutex (poison-tolerant). Suite is now deterministic under parallelism.
 
+### Follow-up — env/Docker configurability (F13)
+
+Reported gap: vhost was the only feature not configurable via env vars (the rest of bore
+is fully env-driven), and the server compose had no vhost wiring.
+
+- `bore server` now enables vhost from **either** `--vhost-config` **or**
+  `--vhost-base-domain` (`BORE_VHOST_BASE_DOMAIN`). A yaml file is needed only for
+  `reservations` / `default_headers`; base domain, mode, ports, and cert/key are all
+  env/flag-configurable. New flags: `--vhost-base-domain`, `--vhost-cert-file`
+  (`BORE_VHOST_CERT_FILE`), `--vhost-key-file` (`BORE_VHOST_KEY_FILE`). Flags/env override
+  the file when both are set (`main.rs` dispatch).
+- `bore vhost --basic-auth` gained `BORE_BASIC_AUTH` (parity with `bore local`).
+- `docker/docker-compose.server.yml`: vhost env block + frontend ports (80/443) + cert
+  volume mount, all documented. `docker-compose.client.yml`: `bore vhost` example.
+- Tests: `server_vhost_config_via_cli_flags`, `server_vhost_base_domain_via_env`.
+
 What is **clean** (verified, not assumptions):
 - Auth: `HelloVhost` runs through the same central `auth.server_handshake` in
   `handle_connection` (server.rs:484) **before** dispatch. No auth bypass.

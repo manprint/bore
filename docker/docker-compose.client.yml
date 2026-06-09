@@ -15,6 +15,12 @@ services:
     command: ["local"]
     # --port and --local-host have no env vars; set them in the command instead:
     # command: ["local", "--port", "9000", "--local-host", "127.0.0.1"]
+    #
+    # Expose the local service as a Host-routed subdomain instead (the server must
+    # run with a vhost frontend; see docker-compose.server.yml + ../docs/VHOST.md).
+    # The target is a positional arg; --subdomain/--id also read BORE_VHOST_SUBDOMAIN
+    # / BORE_VHOST_ID. Reachable at http(s)://<subdomain>.<server-base-domain>:
+    # command: ["vhost", "127.0.0.1:8080", "--subdomain", "app", "--id", "my-client"]
     restart: unless-stopped
     network_mode: host
     environment:

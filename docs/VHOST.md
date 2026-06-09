@@ -166,13 +166,31 @@ These flags extend `bore server`:
 
 | Flag | Env var | Default | Description |
 |---|---|---|---|
-| `--vhost-config <path>` | `BORE_VHOST_CONFIG` | — | Enables vhost frontend |
-| `--vhost-http-port N` | `BORE_VHOST_HTTP_PORT` | (from config) | Override `http_port` |
-| `--vhost-https-port N` | `BORE_VHOST_HTTPS_PORT` | (from config) | Override `https_port` |
-| `--vhost-mode <mode>` | `BORE_VHOST_MODE` | (from config) | Override `mode` |
+| `--vhost-config <path>` | `BORE_VHOST_CONFIG` | — | Path to `vhost.yml` (optional) |
+| `--vhost-base-domain <d>` | `BORE_VHOST_BASE_DOMAIN` | — | Base domain; enables vhost without a file |
+| `--vhost-http-port N` | `BORE_VHOST_HTTP_PORT` | (from config / 80) | Override `http_port` |
+| `--vhost-https-port N` | `BORE_VHOST_HTTPS_PORT` | (from config / 443) | Override `https_port` |
+| `--vhost-mode <mode>` | `BORE_VHOST_MODE` | (from config / auto) | Override `mode` |
+| `--vhost-cert-file <path>` | `BORE_VHOST_CERT_FILE` | (from config) | Override `cert_file` |
+| `--vhost-key-file <path>` | `BORE_VHOST_KEY_FILE` | (from config) | Override `key_file` |
 
-The port/mode flags **override** `vhost.yml` only when passed. When omitted, the values
-from `vhost.yml` are used (yaml defaults: `http_port` 80, `https_port` 443, `mode` auto).
+**The vhost frontend is enabled by either `--vhost-config` *or* `--vhost-base-domain`.**
+A config file is only needed for `reservations` and `default_headers`; everything else
+(base domain, mode, ports, cert/key) is fully env-configurable, so a Docker/compose
+deployment needs no mounted file for the common case:
+
+```bash
+bore server \
+  --vhost-base-domain bore.mydomain.com \
+  --vhost-cert-file /certs/fullchain.pem \
+  --vhost-key-file  /certs/privkey.pem
+# or purely via env: BORE_VHOST_BASE_DOMAIN, BORE_VHOST_CERT_FILE, BORE_VHOST_KEY_FILE, ...
+```
+
+When both a file and flags/env are set, the flags/env **override** the file's
+`base_domain`, ports, `mode`, and cert/key (yaml defaults: `http_port` 80, `https_port`
+443, `mode` auto). The `vhost.yml` is still hot-reloaded; env/flag overrides are applied
+once at startup.
 
 ---
 

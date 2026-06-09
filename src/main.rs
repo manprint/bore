@@ -37,6 +37,10 @@ struct Args {
     command: Command,
 }
 
+// The `Server` variant carries many CLI options and is larger than the others.
+// This enum is parsed exactly once at startup and immediately destructured, so the
+// per-variant size never matters (boxing would only obscure the dispatch).
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Starts a local proxy to the remote server.
@@ -297,7 +301,12 @@ enum Command {
         notes: Option<String>,
 
         /// Whether the provider enforces HTTP Basic auth itself (display-only flag).
-        #[clap(long, value_name = "USER:PASS")]
+        #[clap(
+            long,
+            value_name = "USER:PASS",
+            env = "BORE_BASIC_AUTH",
+            hide_env_values = true
+        )]
         basic_auth: Option<String>,
 
         /// Number of parallel TCP carrier connections for the relay data path.
@@ -449,10 +458,18 @@ enum Command {
         )]
         admin_token: Option<String>,
 
-        /// Path to a vhost.yml config file. Presence enables the HTTP(S) vhost
-        /// frontend (subdomain-routed reverse proxy) on the server.
+        /// Path to a vhost.yml config file. Optional: the vhost frontend
+        /// (subdomain-routed reverse proxy) is enabled by either this file or
+        /// --vhost-base-domain. A file is only needed for reservations and
+        /// default_headers; everything else can be set via the flags below.
         #[clap(long, value_name = "PATH", env = "BORE_VHOST_CONFIG")]
         vhost_config: Option<PathBuf>,
+
+        /// Base domain for the vhost frontend, e.g. `bore.mydomain.com`. Enables
+        /// vhost without a config file, and overrides `base_domain` from the file
+        /// when both are set.
+        #[clap(long, value_name = "DOMAIN", env = "BORE_VHOST_BASE_DOMAIN")]
+        vhost_base_domain: Option<String>,
 
         /// Override the HTTP frontend port from vhost.yml (yaml default 80).
         #[clap(long, value_name = "PORT", env = "BORE_VHOST_HTTP_PORT")]
@@ -463,9 +480,19 @@ enum Command {
         vhost_https_port: Option<u16>,
 
         /// Override the frontend mode from vhost.yml.
-        /// Values: http | https | both | redirect-https
+        /// Values: http | https | both | redirect-https | auto
         #[clap(long, value_name = "MODE", env = "BORE_VHOST_MODE")]
         vhost_mode: Option<String>,
+
+        /// TLS certificate chain (PEM) for the vhost HTTPS frontend. Overrides
+        /// `cert_file` from vhost.yml. Use a wildcard cert for `*.<base-domain>`.
+        #[clap(long, value_name = "PATH", env = "BORE_VHOST_CERT_FILE")]
+        vhost_cert_file: Option<PathBuf>,
+
+        /// TLS private key (PEM) for the vhost HTTPS frontend. Overrides
+        /// `key_file` from vhost.yml.
+        #[clap(long, value_name = "PATH", env = "BORE_VHOST_KEY_FILE")]
+        vhost_key_file: Option<PathBuf>,
     },
 
     /// Diagnose this host's UDP / NAT / firewall for hole-punching (opens no
@@ -1093,9 +1120,12 @@ async fn dispatch(command: Command) -> Result<()> {
             udp_max_streams,
             admin_token,
             vhost_config,
+            vhost_base_domain,
             vhost_http_port,
             vhost_https_port,
             vhost_mode,
+            vhost_cert_file,
+            vhost_key_file,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -1148,16 +1178,46 @@ async fn dispatch(command: Command) -> Result<()> {
             server.set_bind_addr(bind_addr);
             server.set_bind_tunnels(bind_tunnels.unwrap_or(bind_addr));
             server.set_udp(udp);
-            if let Some(config_path) = vhost_config {
-                let yaml = std::fs::read_to_string(&config_path).with_context(|| {
+            // Build the vhost config from a yaml file and/or env/CLI flags. vhost
+            // is enabled when either a config file or a base domain is provided, so
+            // a simple deployment needs no file (env-only), matching the rest of
+            // bore's env-driven configuration. A file is only required for
+            // reservations and default_headers.
+            let vhost_cfg = if let Some(ref config_path) = vhost_config {
+                let yaml = std::fs::read_to_string(config_path).with_context(|| {
                     format!("failed to read vhost config: {}", config_path.display())
                 })?;
-                let mut cfg = bore_cli::vhost::parse_config(&yaml)?;
+                Some(bore_cli::vhost::parse_config(&yaml)?)
+            } else if vhost_base_domain.is_some() {
+                Some(bore_cli::vhost::VhostConfig {
+                    base_domain: String::new(), // filled from the flag below
+                    mode: bore_cli::vhost::VhostModeCfg::Auto,
+                    http_port: 80,
+                    https_port: 443,
+                    cert_file: None,
+                    key_file: None,
+                    default_headers: Default::default(),
+                    reservations: Vec::new(),
+                })
+            } else {
+                None
+            };
+
+            if let Some(mut cfg) = vhost_cfg {
+                if let Some(domain) = vhost_base_domain {
+                    cfg.base_domain = domain;
+                }
                 if let Some(port) = vhost_http_port {
                     cfg.http_port = port;
                 }
                 if let Some(port) = vhost_https_port {
                     cfg.https_port = port;
+                }
+                if let Some(cert) = vhost_cert_file {
+                    cfg.cert_file = Some(cert);
+                }
+                if let Some(key) = vhost_key_file {
+                    cfg.key_file = Some(key);
                 }
                 if let Some(mode_str) = vhost_mode {
                     cfg.mode = match mode_str.as_str() {
@@ -1176,8 +1236,18 @@ async fn dispatch(command: Command) -> Result<()> {
                         }
                     };
                 }
+                if cfg.base_domain.trim().is_empty() {
+                    Args::command()
+                        .error(
+                            ErrorKind::InvalidValue,
+                            "vhost requires a base domain (set `base_domain` in --vhost-config or pass --vhost-base-domain / BORE_VHOST_BASE_DOMAIN)",
+                        )
+                        .exit();
+                }
                 server.set_vhost(cfg)?;
-                server.set_vhost_config_path(config_path);
+                if let Some(config_path) = vhost_config {
+                    server.set_vhost_config_path(config_path);
+                }
             }
             server.listen().await?;
         }
@@ -1860,6 +1930,63 @@ mod tests {
         match saved_https {
             Some(v) => std::env::set_var("BORE_VHOST_HTTPS_PORT", v),
             None => std::env::remove_var("BORE_VHOST_HTTPS_PORT"),
+        }
+    }
+
+    #[test]
+    fn server_vhost_config_via_cli_flags() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        // The vhost frontend is fully configurable without a yaml file: base domain,
+        // cert and key all come from flags (env-backed), so a Docker/compose
+        // deployment needs no mounted config file for the common case.
+        let args = Args::parse_from([
+            "bore",
+            "server",
+            "--vhost-base-domain",
+            "bore.example.com",
+            "--vhost-cert-file",
+            "/certs/fullchain.pem",
+            "--vhost-key-file",
+            "/certs/privkey.pem",
+            "--vhost-mode",
+            "both",
+        ]);
+        let Command::Server {
+            vhost_config,
+            vhost_base_domain,
+            vhost_cert_file,
+            vhost_key_file,
+            vhost_mode,
+            ..
+        } = args.command
+        else {
+            panic!("expected server command");
+        };
+        assert_eq!(vhost_config, None);
+        assert_eq!(vhost_base_domain.as_deref(), Some("bore.example.com"));
+        assert_eq!(vhost_cert_file, Some(PathBuf::from("/certs/fullchain.pem")));
+        assert_eq!(vhost_key_file, Some(PathBuf::from("/certs/privkey.pem")));
+        assert_eq!(vhost_mode.as_deref(), Some("both"));
+    }
+
+    #[test]
+    fn server_vhost_base_domain_via_env() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = std::env::var_os("BORE_VHOST_BASE_DOMAIN");
+        std::env::set_var("BORE_VHOST_BASE_DOMAIN", "env.example.com");
+
+        let args = Args::parse_from(["bore", "server"]);
+        let Command::Server {
+            vhost_base_domain, ..
+        } = args.command
+        else {
+            panic!("expected server command");
+        };
+        assert_eq!(vhost_base_domain.as_deref(), Some("env.example.com"));
+
+        match saved {
+            Some(v) => std::env::set_var("BORE_VHOST_BASE_DOMAIN", v),
+            None => std::env::remove_var("BORE_VHOST_BASE_DOMAIN"),
         }
     }
 }

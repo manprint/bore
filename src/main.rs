@@ -313,6 +313,11 @@ enum Command {
         #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
         carriers: u16,
 
+        /// Prefer a direct QUIC data path for the server→provider vhost hop;
+        /// falls back to the TCP carrier relay if UDP is unavailable.
+        #[clap(long, env = "BORE_VHOST_UDP")]
+        udp: bool,
+
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
         auto_reconnect: bool,
@@ -478,6 +483,11 @@ enum Command {
         /// Override the HTTPS frontend port from vhost.yml (yaml default 443).
         #[clap(long, value_name = "PORT", env = "BORE_VHOST_HTTPS_PORT")]
         vhost_https_port: Option<u16>,
+
+        /// UDP port for the vhost QUIC direct path. Unset = use the resolved
+        /// vhost HTTPS port on UDP.
+        #[clap(long, value_name = "PORT", env = "BORE_VHOST_QUIC_PORT")]
+        vhost_quic_port: Option<u16>,
 
         /// Override the frontend mode from vhost.yml.
         /// Values: http | https | both | redirect-https | auto
@@ -1123,6 +1133,7 @@ async fn dispatch(command: Command) -> Result<()> {
             vhost_base_domain,
             vhost_http_port,
             vhost_https_port,
+            vhost_quic_port,
             vhost_mode,
             vhost_cert_file,
             vhost_key_file,
@@ -1244,6 +1255,9 @@ async fn dispatch(command: Command) -> Result<()> {
                         )
                         .exit();
                 }
+                if let Some(port) = vhost_quic_port {
+                    server.set_vhost_quic_port(port);
+                }
                 server.set_vhost(cfg)?;
                 if let Some(config_path) = vhost_config {
                     server.set_vhost_config_path(config_path);
@@ -1261,6 +1275,7 @@ async fn dispatch(command: Command) -> Result<()> {
             notes,
             basic_auth,
             carriers,
+            udp,
             auto_reconnect,
         } => {
             let (local_host, local_port) = parse_vhost_target(&target)?;
@@ -1279,7 +1294,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     meta.clone(),
                 );
                 async move {
-                    bore_cli::client::Client::new_vhost_provider(
+                    bore_cli::client::Client::new_vhost_provider_with_udp(
                         &local_host,
                         local_port,
                         &to,
@@ -1288,6 +1303,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         secret.as_deref(),
                         insecure,
                         carriers,
+                        udp,
                         meta,
                     )
                     .await
@@ -1901,8 +1917,10 @@ mod tests {
         let _guard = ENV_GUARD.lock().unwrap();
         let saved_http = std::env::var_os("BORE_VHOST_HTTP_PORT");
         let saved_https = std::env::var_os("BORE_VHOST_HTTPS_PORT");
+        let saved_quic = std::env::var_os("BORE_VHOST_QUIC_PORT");
         std::env::remove_var("BORE_VHOST_HTTP_PORT");
         std::env::remove_var("BORE_VHOST_HTTPS_PORT");
+        std::env::remove_var("BORE_VHOST_QUIC_PORT");
 
         let args = Args::parse_from([
             "bore",
@@ -1911,10 +1929,13 @@ mod tests {
             "8080",
             "--vhost-https-port",
             "8443",
+            "--vhost-quic-port",
+            "9443",
         ]);
         let Command::Server {
             vhost_http_port,
             vhost_https_port,
+            vhost_quic_port,
             ..
         } = args.command
         else {
@@ -1922,6 +1943,12 @@ mod tests {
         };
         assert_eq!(vhost_http_port, Some(8080));
         assert_eq!(vhost_https_port, Some(8443));
+        assert_eq!(vhost_quic_port, Some(9443));
+
+        match saved_quic {
+            Some(value) => std::env::set_var("BORE_VHOST_QUIC_PORT", value),
+            None => std::env::remove_var("BORE_VHOST_QUIC_PORT"),
+        }
 
         match saved_http {
             Some(v) => std::env::set_var("BORE_VHOST_HTTP_PORT", v),
@@ -1930,6 +1957,33 @@ mod tests {
         match saved_https {
             Some(v) => std::env::set_var("BORE_VHOST_HTTPS_PORT", v),
             None => std::env::remove_var("BORE_VHOST_HTTPS_PORT"),
+        }
+    }
+
+    #[test]
+    fn vhost_udp_flag_parses() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = std::env::var_os("BORE_VHOST_UDP");
+        std::env::remove_var("BORE_VHOST_UDP");
+
+        let args = Args::parse_from([
+            "bore",
+            "vhost",
+            "127.0.0.1:8080",
+            "--subdomain",
+            "myapp",
+            "--id",
+            "client1",
+            "--udp",
+        ]);
+        let Command::Vhost { udp, .. } = args.command else {
+            panic!("expected vhost command");
+        };
+        assert!(udp);
+
+        match saved {
+            Some(value) => std::env::set_var("BORE_VHOST_UDP", value),
+            None => std::env::remove_var("BORE_VHOST_UDP"),
         }
     }
 

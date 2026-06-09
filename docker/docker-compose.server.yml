@@ -76,7 +76,9 @@ services:
       #    --to <host>:7835) and publish the standalone vhost listeners here. Use this
       #    when 443 must stay reserved for the bore protocol, or for plain HTTP on 80:
       # - "80:80"              # vhost HTTP frontend  (BORE_VHOST_HTTP_PORT)
+      # - "80:80/udp"          # vhost QUIC default when running HTTP-only / no cert
       # - "443:443"            # vhost HTTPS frontend (BORE_VHOST_HTTPS_PORT, needs cert)
+      # - "443:443/udp"        # vhost QUIC direct path (BORE_VHOST_QUIC_PORT; extra firewall rule)
     environment:
       - BORE_SECRET=change-me
       - BORE_CONTROL_PORT=7835
@@ -134,6 +136,11 @@ services:
       # Frontend ports (must match the published vhost `ports:` above).
       # - BORE_VHOST_HTTP_PORT=80
       # - BORE_VHOST_HTTPS_PORT=443
+      # UDP port for the vhost QUIC direct path (`bore vhost --udp`). Default =
+      # the active vhost frontend port on UDP: HTTP when running without TLS,
+      # HTTPS when the resolved mode serves HTTPS. Distinct from BORE_CONTROL_PORT/udp.
+      # Open it in the host/cloud firewall separately from 7835/udp.
+      # - BORE_VHOST_QUIC_PORT=443
       # Wildcard TLS cert/key for *.<base-domain> (required for https/both/redirect-https
       # modes). Mount them via the `volumes:` block below.
       # - BORE_VHOST_CERT_FILE=/certs/vhost-fullchain.pem

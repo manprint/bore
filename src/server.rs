@@ -51,6 +51,9 @@ pub struct Server {
     /// Optional secret used to authenticate clients.
     auth: Option<Authenticator>,
 
+    /// Raw shared secret retained for vhost QUIC token derivation.
+    secret: Option<String>,
+
     /// Limits the number of concurrently proxied connections per client.
     conn_permits: Arc<Semaphore>,
 
@@ -112,6 +115,17 @@ pub struct Server {
     /// Hot-swappable TLS acceptor for the vhost HTTPS frontend.
     vhost_tls: Arc<std::sync::RwLock<Option<Arc<TlsAcceptor>>>>,
 
+    /// UDP port used by the vhost QUIC direct path.
+    vhost_quic_port: u16,
+
+    /// Whether the vhost QUIC port was explicitly overridden. When false, the
+    /// default tracks the active vhost frontend port at startup: HTTPS when the
+    /// resolved mode serves HTTPS, otherwise HTTP.
+    vhost_quic_port_explicit: bool,
+
+    /// Server-issued nonces for live vhost direct-path negotiations.
+    pending_vhost_udp: vhost::PendingVhostUdp,
+
     /// Path to the vhost config file, retained for the hot-reload task.
     vhost_config_path: Option<PathBuf>,
 }
@@ -133,6 +147,7 @@ impl Server {
             control_port: CONTROL_PORT,
             tls: None,
             bind_domain: None,
+            secret: secret.map(str::to_string),
             auth: secret.map(Authenticator::new),
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             bind_tunnels: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -141,6 +156,9 @@ impl Server {
             vhost_registry: VhostRegistry::default(),
             vhost_config: None,
             vhost_tls: Arc::new(std::sync::RwLock::new(None)),
+            vhost_quic_port: 443,
+            vhost_quic_port_explicit: false,
+            pending_vhost_udp: vhost::PendingVhostUdp::default(),
             vhost_config_path: None,
         }
     }
@@ -200,9 +218,30 @@ impl Server {
         self.admin_token = token;
     }
 
+    /// Set the UDP port used by the vhost QUIC direct path.
+    pub fn set_vhost_quic_port(&mut self, port: u16) {
+        self.vhost_quic_port = port;
+        self.vhost_quic_port_explicit = true;
+    }
+
+    fn default_vhost_quic_port(cfg: &vhost::VhostConfig) -> u16 {
+        let mode =
+            vhost::resolve_mode(cfg, vhost::cert_present(cfg)).unwrap_or(vhost::VhostMode::Http);
+        if mode.serves_https() {
+            cfg.https_port
+        } else {
+            cfg.http_port
+        }
+    }
+
     /// Shared handle to the live tunnel registry (for the admin status page).
     pub fn admin_registry(&self) -> AdminRegistry {
         self.admin.clone()
+    }
+
+    /// Shared handle to the live vhost registry.
+    pub fn vhost_registry(&self) -> VhostRegistry {
+        self.vhost_registry.clone()
     }
 
     /// Enable the vhost frontend with the given config.
@@ -233,6 +272,10 @@ impl Server {
 
         let shared_cfg = Arc::new(RwLock::new(Arc::new(cfg)));
         let shared_tls = Arc::new(RwLock::new(tls_acceptor));
+        if !self.vhost_quic_port_explicit {
+            self.vhost_quic_port =
+                Self::default_vhost_quic_port(shared_cfg.read().unwrap().as_ref());
+        }
         self.vhost_config = Some(shared_cfg);
         self.vhost_tls = shared_tls;
         Ok(())
@@ -371,6 +414,94 @@ impl Server {
                     tokio::spawn(holepunch::run_stun_responder(udp));
                 }
                 Err(err) => warn!(%err, "failed to bind STUN responder; udp disabled"),
+            }
+        }
+
+        #[cfg(feature = "udp")]
+        if this.udp && this.vhost_config.is_some() {
+            match tokio::net::UdpSocket::bind((this.bind_addr, this.vhost_quic_port)).await {
+                Ok(udp) => match holepunch::vhost_server_endpoint(udp, &this.udp_tuning) {
+                    Ok(endpoint) => {
+                        info!(
+                            port = this.vhost_quic_port,
+                            "vhost QUIC direct endpoint listening"
+                        );
+                        let registry = this.vhost_registry.clone();
+                        let pending = this.pending_vhost_udp.clone();
+                        let secret = this.secret.clone();
+                        let ep = endpoint.clone();
+                        tokio::spawn(async move {
+                            while let Some(incoming) = ep.accept().await {
+                                let registry = registry.clone();
+                                let pending = pending.clone();
+                                let secret = secret.clone();
+                                let endpoint = ep.clone();
+                                tokio::spawn(async move {
+                                    let conn = match incoming.await {
+                                        Ok(conn) => conn,
+                                        Err(err) => {
+                                            debug!(%err, "vhost QUIC handshake failed");
+                                            return;
+                                        }
+                                    };
+
+                                    let lookup = |subdomain: &str| {
+                                        pending.get(subdomain).map(|nonce| {
+                                            holepunch::derive_token(
+                                                secret.as_deref(),
+                                                nonce.value(),
+                                            )
+                                        })
+                                    };
+
+                                    match holepunch::vhost_server_handshake(conn, endpoint, lookup)
+                                        .await
+                                    {
+                                        Ok((subdomain, direct)) => {
+                                            let entry = registry
+                                                .get(&subdomain)
+                                                .map(|entry| Arc::clone(entry.value()));
+                                            if let Some(entry) = entry {
+                                                let generation = entry
+                                                    .direct_generation
+                                                    .fetch_add(1, Ordering::AcqRel)
+                                                    + 1;
+                                                *entry.direct.write().unwrap() =
+                                                    Some(direct.clone());
+                                                info!(subdomain = %subdomain, generation, "vhost QUIC direct path established");
+
+                                                let registry = registry.clone();
+                                                tokio::spawn(async move {
+                                                    direct.closed().await;
+                                                    if let Some(entry) = registry
+                                                        .get(&subdomain)
+                                                        .map(|entry| Arc::clone(entry.value()))
+                                                    {
+                                                        if entry
+                                                            .direct_generation
+                                                            .load(Ordering::Acquire)
+                                                            == generation
+                                                        {
+                                                            *entry.direct.write().unwrap() = None;
+                                                            debug!(subdomain = %subdomain, generation, "vhost QUIC direct path closed; reverting to TCP");
+                                                        }
+                                                    }
+                                                });
+                                            } else {
+                                                debug!(subdomain = %subdomain, "vhost QUIC connection arrived after provider deregistered");
+                                            }
+                                        }
+                                        Err(err) => debug!(%err, "vhost QUIC handshake rejected"),
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        warn!(%err, "failed to configure vhost QUIC endpoint; vhost --udp disabled")
+                    }
+                },
+                Err(err) => warn!(%err, "failed to bind vhost QUIC endpoint; vhost --udp disabled"),
             }
         }
 
@@ -609,6 +740,7 @@ impl Server {
                 notes,
                 basic_auth,
                 carriers,
+                udp,
             }) => {
                 let Some(cfg) = self.vhost_config.clone() else {
                     warn!("vhost not configured on this server");
@@ -628,9 +760,15 @@ impl Server {
                     peer,
                     notes,
                     basic_auth,
+                    udp,
                     self.pending_carriers.clone(),
                     self.max_carriers,
                     carriers,
+                    self.udp,
+                    self.vhost_quic_port,
+                    self.pending_vhost_udp.clone(),
+                    self.secret.clone(),
+                    self.udp_tuning,
                 )
                 .await
             }
@@ -640,7 +778,8 @@ impl Server {
             }
             Some(ClientMessage::UdpCandidates(_))
             | Some(ClientMessage::UdpCandidateOffer(_))
-            | Some(ClientMessage::UdpStunHintRequest) => {
+            | Some(ClientMessage::UdpStunHintRequest)
+            | Some(ClientMessage::VhostUdpRenew { .. }) => {
                 warn!("unexpected udp candidates as first message");
                 Ok(())
             }

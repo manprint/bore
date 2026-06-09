@@ -1022,6 +1022,11 @@ impl DirectConn {
         self.conn.closed().await;
     }
 
+    /// Gracefully close the QUIC connection so the peer immediately reverts or renews.
+    pub fn close(&self) {
+        self.conn.close(0u32.into(), b"vhost direct path closed");
+    }
+
     /// Snapshot the current QUIC connection statistics for diagnostics.
     pub fn stats(&self) -> quinn::ConnectionStats {
         self.conn.stats()
@@ -1177,6 +1182,55 @@ pub async fn connect_direct(
     }
 }
 
+/// Provider side (QUIC client): dial a public bore server's vhost QUIC endpoint
+/// and authenticate for `subdomain`. No hole-punching is needed because the
+/// server is public; the provider later accepts native QUIC streams on the
+/// returned connection, while the server opens them.
+#[cfg(feature = "udp")]
+pub async fn vhost_connect(
+    socket: UdpSocket,
+    server_addr: SocketAddr,
+    subdomain: &str,
+    token: [u8; TOKEN_LEN],
+    tuning: UdpDirectTuning,
+) -> Result<DirectConn> {
+    let subdomain_len: u16 = subdomain
+        .len()
+        .try_into()
+        .context("vhost subdomain too long for QUIC auth frame")?;
+    configure_udp_socket_buffers(&socket, &tuning);
+    let endpoint = client_endpoint(socket, &tuning)?;
+    let conn = timeout(
+        NETWORK_TIMEOUT,
+        endpoint
+            .connect(server_addr, "bore")
+            .context("failed to start vhost QUIC connect")?,
+    )
+    .await
+    .context("vhost QUIC connect timed out")?
+    .context("vhost QUIC handshake failed")?;
+
+    timeout(NETWORK_TIMEOUT, async {
+        let (mut send, mut recv) = conn.open_bi().await.context("auth open_bi failed")?;
+        send.write_all(&subdomain_len.to_be_bytes()).await?;
+        send.write_all(subdomain.as_bytes()).await?;
+        send.write_all(&token).await?;
+        send.flush().await?;
+
+        let mut peer_token = [0u8; TOKEN_LEN];
+        recv.read_exact(&mut peer_token).await?;
+        if !tokens_match(&token, &peer_token) {
+            bail!("vhost direct path token mismatch");
+        }
+
+        let _ = send.finish();
+        info!(server = %server_addr, subdomain, "vhost direct udp connection established");
+        Ok(DirectConn { conn, endpoint })
+    })
+    .await
+    .context("vhost QUIC auth timed out")?
+}
+
 /// Provider side: a long-lived QUIC server endpoint that accepts direct
 /// connections from punched consumers.
 #[cfg(feature = "udp")]
@@ -1259,6 +1313,54 @@ impl DirectListener {
             endpoint: self.endpoint.clone(),
         })
     }
+}
+
+/// Server side: build a QUIC endpoint for the vhost direct path.
+#[cfg(feature = "udp")]
+pub(crate) fn vhost_server_endpoint(
+    socket: UdpSocket,
+    tuning: &UdpDirectTuning,
+) -> Result<Endpoint> {
+    server_endpoint(socket, tuning)
+}
+
+/// Server side (QUIC server): authenticate one accepted vhost direct-path
+/// connection and return the verified subdomain plus the trusted connection.
+#[cfg(feature = "udp")]
+pub async fn vhost_server_handshake(
+    conn: quinn::Connection,
+    endpoint: Endpoint,
+    lookup: impl Fn(&str) -> Option<[u8; TOKEN_LEN]>,
+) -> Result<(String, DirectConn)> {
+    let peer = conn.remote_address();
+    timeout(NETWORK_TIMEOUT, async {
+        let (mut send, mut recv) = conn.accept_bi().await.context("auth accept_bi failed")?;
+
+        let mut sub_len = [0u8; 2];
+        recv.read_exact(&mut sub_len).await?;
+        let sub_len = u16::from_be_bytes(sub_len) as usize;
+
+        let mut subdomain = vec![0u8; sub_len];
+        recv.read_exact(&mut subdomain).await?;
+        let subdomain = String::from_utf8(subdomain).context("vhost auth subdomain is not UTF-8")?;
+
+        let mut received = [0u8; TOKEN_LEN];
+        recv.read_exact(&mut received).await?;
+
+        let expected = lookup(&subdomain).context("unknown vhost direct-path subdomain")?;
+        if !tokens_match(&expected, &received) {
+            warn!(%peer, subdomain = %subdomain, "rejected vhost direct udp connection: token mismatch");
+            bail!("vhost direct path token mismatch");
+        }
+
+        send.write_all(&expected).await?;
+        send.flush().await?;
+        let _ = send.finish();
+        info!(%peer, subdomain = %subdomain, "accepted vhost direct udp connection");
+        Ok((subdomain, DirectConn { conn, endpoint }))
+    })
+    .await
+    .context("vhost QUIC auth timed out")?
 }
 
 /// Build a QUIC client endpoint over an already-bound UDP socket.

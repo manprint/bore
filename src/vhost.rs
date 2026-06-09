@@ -3,6 +3,9 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
+#[cfg(feature = "udp")]
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -22,7 +25,10 @@ use crate::admin::{AdminRegistry, NewEntry, Role};
 use crate::edge;
 use crate::mux;
 use crate::pool::{CarrierPool, PendingCarriers, TokenGuard};
-use crate::shared::{ClientMessage, Delimited, ServerMessage, NETWORK_TIMEOUT, PROXY_BUFFER_SIZE};
+use crate::shared::{
+    ClientMessage, Delimited, ServerMessage, UdpDirectTuning, NETWORK_TIMEOUT, PROXY_BUFFER_SIZE,
+    UDP_NONCE_LEN,
+};
 use crate::transport;
 
 // ─── Config data types ────────────────────────────────────────────────────────
@@ -316,10 +322,23 @@ pub struct VhostEntry {
     pub pool: Arc<CarrierPool>,
     /// Resolved header list to inject on the first request head (may be empty).
     pub headers: Vec<(String, String)>,
+    /// Live QUIC direct connection to the provider, when one is established.
+    #[cfg(feature = "udp")]
+    pub direct: std::sync::RwLock<Option<crate::holepunch::DirectConn>>,
+    /// Monotonic generation used to clear `direct` only for the connection that
+    /// originally installed it, so an old closed-monitor never stomps a newer one.
+    #[cfg(feature = "udp")]
+    pub direct_generation: AtomicU64,
+    /// Number of proxied requests that successfully opened a direct QUIC stream.
+    #[cfg(feature = "udp")]
+    pub direct_stream_opens: AtomicU64,
 }
 
 /// Registry of live vhost providers, keyed by subdomain label.
 pub type VhostRegistry = Arc<DashMap<String, Arc<VhostEntry>>>;
+
+/// Pending vhost direct-path nonces keyed by subdomain.
+pub type PendingVhostUdp = Arc<DashMap<String, [u8; UDP_NONCE_LEN]>>;
 
 /// Shared hot-swappable vhost config behind a read-write lock.
 pub type SharedVhostConfig = Arc<RwLock<Arc<VhostConfig>>>;
@@ -327,19 +346,60 @@ pub type SharedVhostConfig = Arc<RwLock<Arc<VhostConfig>>>;
 /// Removes a vhost provider registration when the provider connection ends.
 struct Deregister {
     registry: VhostRegistry,
+    pending_udp: Option<PendingVhostUdp>,
     subdomain: String,
 }
 
 impl Drop for Deregister {
     fn drop(&mut self) {
         self.registry.remove(&self.subdomain);
+        if let Some(pending) = &self.pending_udp {
+            pending.remove(&self.subdomain);
+        }
     }
 }
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
+#[cfg(feature = "udp")]
+fn new_nonce() -> [u8; UDP_NONCE_LEN] {
+    use ring::rand::{SecureRandom, SystemRandom};
+
+    let mut nonce = [0u8; UDP_NONCE_LEN];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .expect("system CSPRNG must not fail");
+    nonce
+}
+
+#[cfg(feature = "udp")]
+async fn send_vhost_udp_offer(
+    control: &mut Delimited<mux::Stream>,
+    subdomain: &str,
+    port: u16,
+    pending_vhost_udp: &PendingVhostUdp,
+    tuning: UdpDirectTuning,
+) -> Result<()> {
+    let nonce = new_nonce();
+    pending_vhost_udp.insert(subdomain.to_string(), nonce);
+    control
+        .send(ServerMessage::VhostUdp {
+            port,
+            nonce,
+            tuning,
+        })
+        .await?;
+    info!(subdomain, port, "offered vhost direct udp path");
+    Ok(())
+}
+
 /// Server side: register this connection as the vhost provider for `subdomain`.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "udp"), allow(unused_variables))]
 pub async fn serve_vhost_provider(
     mut control: Delimited<mux::Stream>,
     opener: mux::Opener,
@@ -351,9 +411,15 @@ pub async fn serve_vhost_provider(
     peer: SocketAddr,
     notes: Option<String>,
     basic_auth: bool,
+    udp: bool,
     pending_carriers: PendingCarriers,
     max_carriers: u16,
     carriers: u16,
+    server_udp_enabled: bool,
+    vhost_quic_port: u16,
+    pending_vhost_udp: PendingVhostUdp,
+    _secret: Option<String>,
+    udp_tuning: UdpDirectTuning,
 ) -> Result<()> {
     // Validate against live config (resolve_route checks reservations).
     let cfg = vhost_config.read().unwrap().clone();
@@ -382,6 +448,12 @@ pub async fn serve_vhost_provider(
             let entry = Arc::new(VhostEntry {
                 pool: Arc::clone(&pool),
                 headers,
+                #[cfg(feature = "udp")]
+                direct: std::sync::RwLock::new(None),
+                #[cfg(feature = "udp")]
+                direct_generation: AtomicU64::new(0),
+                #[cfg(feature = "udp")]
+                direct_stream_opens: AtomicU64::new(0),
             });
             slot.insert(entry);
             pool
@@ -389,6 +461,11 @@ pub async fn serve_vhost_provider(
     };
     let _guard = Deregister {
         registry: registry.clone(),
+        pending_udp: if udp {
+            Some(pending_vhost_udp.clone())
+        } else {
+            None
+        },
         subdomain: subdomain.clone(),
     };
 
@@ -440,6 +517,26 @@ pub async fn serve_vhost_provider(
         None
     };
 
+    #[cfg(feature = "udp")]
+    if udp && server_udp_enabled {
+        send_vhost_udp_offer(
+            &mut control,
+            &subdomain,
+            vhost_quic_port,
+            &pending_vhost_udp,
+            udp_tuning,
+        )
+        .await?;
+    }
+    #[cfg(feature = "udp")]
+    if udp && !server_udp_enabled {
+        debug!(%subdomain, "vhost udp requested but server udp is disabled; using TCP relay");
+    }
+    #[cfg(not(feature = "udp"))]
+    if udp {
+        debug!(%subdomain, "vhost udp requested but binary was built without udp support; using TCP relay");
+    }
+
     // Heartbeat loop until the provider disconnects.
     let mut hb = interval(HEARTBEAT_INTERVAL);
     hb.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -457,6 +554,26 @@ pub async fn serve_vhost_provider(
                     | Some(ClientMessage::ConnectSecret { .. })
                     | Some(ClientMessage::Authenticate(_)) => {
                         warn!(%subdomain, "unexpected message from vhost provider");
+                    }
+                    Some(ClientMessage::VhostUdpRenew { subdomain: renew_subdomain }) => {
+                        if renew_subdomain != subdomain {
+                            warn!(%subdomain, requested = %renew_subdomain, "unexpected vhost udp renew request");
+                        }
+                        #[cfg(feature = "udp")]
+                        if renew_subdomain == subdomain && udp && server_udp_enabled {
+                            send_vhost_udp_offer(
+                                &mut control,
+                                &subdomain,
+                                vhost_quic_port,
+                                &pending_vhost_udp,
+                                udp_tuning,
+                            )
+                            .await?;
+                        }
+                        #[cfg(any(not(feature = "udp"), feature = "udp"))]
+                        if renew_subdomain == subdomain && (!udp || !server_udp_enabled) {
+                            debug!(%subdomain, "ignoring vhost udp renew request while udp is disabled");
+                        }
                     }
                     Some(_) => warn!(%subdomain, "unexpected message from vhost provider"),
                     None => return Ok(()),
@@ -484,8 +601,39 @@ pub async fn relay_vhost(
     entry: &VhostEntry,
     head: Vec<u8>,
 ) -> Result<()> {
-    let opener = entry.pool.pick().context("no live vhost carrier")?;
-    let mut provider = opener.open().await.context("vhost provider unavailable")?;
+    let mut provider: Pin<Box<dyn AsyncReadWrite>> = {
+        #[cfg(feature = "udp")]
+        {
+            // In vhost UDP the server opens the QUIC streams and the provider
+            // accepts them. If the direct connection is down or opening a stream
+            // fails, fall back per-request to the existing TCP carrier pool.
+            let direct = entry.direct.read().unwrap().clone();
+            match direct {
+                Some(direct) => match direct.open_stream().await {
+                    Ok(stream) => {
+                        entry
+                            .direct_stream_opens
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Box::pin(stream)
+                    }
+                    Err(err) => {
+                        debug!(%err, "vhost QUIC open_stream failed; using TCP carrier");
+                        let opener = entry.pool.pick().context("no live vhost carrier")?;
+                        Box::pin(opener.open().await.context("vhost provider unavailable")?)
+                    }
+                },
+                None => {
+                    let opener = entry.pool.pick().context("no live vhost carrier")?;
+                    Box::pin(opener.open().await.context("vhost provider unavailable")?)
+                }
+            }
+        }
+        #[cfg(not(feature = "udp"))]
+        {
+            let opener = entry.pool.pick().context("no live vhost carrier")?;
+            Box::pin(opener.open().await.context("vhost provider unavailable")?)
+        }
+    };
     provider.write_all(&[mux::STREAM_READY]).await?;
 
     let mut public = public;

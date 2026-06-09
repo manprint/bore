@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+#[cfg(feature = "udp")]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+#[cfg(feature = "udp")]
+use bore_cli::vhost::VhostRegistry;
 use bore_cli::{
     client::{Client, ProviderMeta},
     reconnect,
@@ -200,6 +204,46 @@ fn reg_cfg_no_reservations() -> VhostConfig {
 
 fn to_reg() -> String {
     format!("localhost:{REG_CONTROL}")
+}
+
+#[cfg(feature = "udp")]
+async fn wait_for_vhost_direct(registry: &VhostRegistry, subdomain: &str, expected: bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let is_direct = registry
+            .get(subdomain)
+            .map(|entry| entry.direct.read().unwrap().is_some())
+            .unwrap_or(false);
+        if is_direct == expected {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for direct={expected} on subdomain {subdomain}");
+        }
+        time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(feature = "udp")]
+fn direct_stream_opens(registry: &VhostRegistry, subdomain: &str) -> u64 {
+    registry
+        .get(subdomain)
+        .map(|entry| entry.direct_stream_opens.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "udp")]
+fn close_vhost_direct(registry: &VhostRegistry, subdomain: &str) {
+    let entry = registry
+        .get(subdomain)
+        .unwrap_or_else(|| panic!("missing vhost entry for {subdomain}"));
+    let direct = entry
+        .direct
+        .read()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| panic!("missing direct connection for {subdomain}"));
+    direct.close();
 }
 
 #[tokio::test]
@@ -1428,3 +1472,362 @@ async fn vhost_routes_on_tls_control_port() -> Result<()> {
 // The reload *path* (including the cert/key path-change → forced TLS reload fixed
 // in this audit) is exercised by `vhost_config_hot_reload`; cert-DER verification
 // is left as future work.
+
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_udp_direct_get_and_post() -> Result<()> {
+    const CTRL: u16 = 17980;
+    const HTTP: u16 = 17981;
+    const QUIC: u16 = 17982;
+
+    let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let stub_port = spawn_body_capturing_stub(Arc::clone(&captured)).await;
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, Some("vhost-udp-secret"));
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(true);
+    server.set_vhost(http_config("bore.local", HTTP))?;
+    server.set_vhost_quic_port(QUIC);
+    let registry = server.vhost_registry();
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTP, true).await;
+
+    let client = Client::new_vhost_provider_with_udp(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "udpapp",
+        "client1",
+        Some("vhost-udp-secret"),
+        false,
+        1,
+        true,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+
+    wait_for_vhost_direct(&registry, "udpapp", true).await;
+
+    let response = send_http(HTTP, "udpapp.bore.local", "/").await?;
+    assert!(
+        response.contains("ok"),
+        "expected GET response over direct path: {response}"
+    );
+
+    let body = "vhost-udp-post-body";
+    let response = send_http_post(HTTP, "udpapp.bore.local", body).await?;
+    assert!(
+        response.contains("ok"),
+        "expected POST response over direct path: {response}"
+    );
+    time::sleep(Duration::from_millis(100)).await;
+
+    let raw = captured
+        .lock()
+        .await
+        .clone()
+        .expect("captured request missing");
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        text.ends_with(body),
+        "upstream must receive the POST body intact: {text}"
+    );
+    assert!(
+        direct_stream_opens(&registry, "udpapp") >= 2,
+        "expected GET and POST to open direct streams"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_udp_falls_back_when_server_udp_disabled() -> Result<()> {
+    const CTRL: u16 = 17983;
+    const HTTP: u16 = 17984;
+
+    let stub_port = spawn_http_stub("relay-only").await;
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, Some("vhost-udp-secret"));
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(false);
+    server.set_vhost(http_config("bore.local", HTTP))?;
+    let registry = server.vhost_registry();
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTP, true).await;
+
+    let client = Client::new_vhost_provider_with_udp(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "relayapp",
+        "client1",
+        Some("vhost-udp-secret"),
+        false,
+        1,
+        true,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    time::sleep(Duration::from_millis(200)).await;
+
+    let response = send_http(HTTP, "relayapp.bore.local", "/").await?;
+    assert!(
+        response.contains("relay-only"),
+        "fallback relay response missing: {response}"
+    );
+    assert!(
+        !registry
+            .get("relayapp")
+            .unwrap()
+            .direct
+            .read()
+            .unwrap()
+            .is_some(),
+        "server with udp disabled must not establish a direct path"
+    );
+    assert_eq!(
+        direct_stream_opens(&registry, "relayapp"),
+        0,
+        "fallback request must not open direct streams"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_udp_drop_recovers_and_reestablishes() -> Result<()> {
+    const CTRL: u16 = 17985;
+    const HTTP: u16 = 17986;
+    const QUIC: u16 = 17987;
+
+    let stub_port = spawn_http_stub("recover").await;
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, Some("vhost-udp-secret"));
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(true);
+    server.set_vhost(http_config("bore.local", HTTP))?;
+    server.set_vhost_quic_port(QUIC);
+    let registry = server.vhost_registry();
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTP, true).await;
+
+    let client = Client::new_vhost_provider_with_udp(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "recoverapp",
+        "client1",
+        Some("vhost-udp-secret"),
+        false,
+        1,
+        true,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+
+    wait_for_vhost_direct(&registry, "recoverapp", true).await;
+
+    let response = send_http(HTTP, "recoverapp.bore.local", "/").await?;
+    assert!(
+        response.contains("recover"),
+        "initial direct response missing: {response}"
+    );
+    let direct_before_drop = direct_stream_opens(&registry, "recoverapp");
+    assert!(
+        direct_before_drop >= 1,
+        "initial request must use the direct path"
+    );
+
+    close_vhost_direct(&registry, "recoverapp");
+    wait_for_vhost_direct(&registry, "recoverapp", false).await;
+
+    let response = send_http(HTTP, "recoverapp.bore.local", "/").await?;
+    assert!(
+        response.contains("recover"),
+        "fallback request after drop must still succeed: {response}"
+    );
+    assert_eq!(
+        direct_stream_opens(&registry, "recoverapp"),
+        direct_before_drop,
+        "fallback request must not open a new direct stream while the path is down"
+    );
+
+    wait_for_vhost_direct(&registry, "recoverapp", true).await;
+
+    let response = send_http(HTTP, "recoverapp.bore.local", "/").await?;
+    assert!(
+        response.contains("recover"),
+        "request after renewal must succeed: {response}"
+    );
+    assert!(
+        direct_stream_opens(&registry, "recoverapp") > direct_before_drop,
+        "renewed direct path must open a new QUIC stream"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_udp_defaults_to_http_port_without_tls() -> Result<()> {
+    const CTRL: u16 = 17988;
+    const HTTP: u16 = 17989;
+
+    let stub_port = spawn_http_stub("http-udp-default").await;
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, Some("vhost-udp-secret"));
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(true);
+    server.set_vhost(http_config("bore.local", HTTP))?;
+    let registry = server.vhost_registry();
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTP, true).await;
+
+    let client = Client::new_vhost_provider_with_udp(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "httpudp",
+        "client1",
+        Some("vhost-udp-secret"),
+        false,
+        1,
+        true,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+
+    wait_for_vhost_direct(&registry, "httpudp", true).await;
+
+    let response = send_http(HTTP, "httpudp.bore.local", "/").await?;
+    assert!(
+        response.contains("http-udp-default"),
+        "http-mode vhost udp should work on the http port by default: {response}"
+    );
+    assert!(
+        direct_stream_opens(&registry, "httpudp") >= 1,
+        "http-mode vhost udp should open a direct QUIC stream"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_udp_large_body_integrity() -> Result<()> {
+    const CTRL: u16 = 17990;
+    const HTTP: u16 = 17991;
+    const QUIC: u16 = 17992;
+    const LEN: usize = 1 << 20;
+
+    let pattern: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+    let pattern_clone = pattern.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let stub_port = listener.local_addr()?.port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let pattern = pattern_clone.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let mut total = 0;
+                loop {
+                    let n = stream.read(&mut buf[total..]).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                    if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if total >= buf.len() {
+                        break;
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {LEN}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(&pattern).await;
+            });
+        }
+    });
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, Some("vhost-udp-secret"));
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(true);
+    server.set_vhost(http_config("bore.local", HTTP))?;
+    server.set_vhost_quic_port(QUIC);
+    let registry = server.vhost_registry();
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTP, true).await;
+
+    let client = Client::new_vhost_provider_with_udp(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "bigudp",
+        "client1",
+        Some("vhost-udp-secret"),
+        false,
+        1,
+        true,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+
+    wait_for_vhost_direct(&registry, "bigudp", true).await;
+
+    let mut conn = time::timeout(
+        Duration::from_secs(3),
+        TcpStream::connect(("127.0.0.1", HTTP)),
+    )
+    .await??;
+    let req = "GET / HTTP/1.1\r\nHost: bigudp.bore.local\r\nConnection: close\r\n\r\n";
+    conn.write_all(req.as_bytes()).await?;
+    conn.shutdown().await?;
+    let mut response = Vec::new();
+    time::timeout(Duration::from_secs(5), conn.read_to_end(&mut response)).await??;
+
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("response must contain a header terminator");
+    let body = &response[split + 4..];
+    assert_eq!(
+        body.len(),
+        LEN,
+        "large response body length must be preserved"
+    );
+    assert_eq!(
+        body,
+        pattern.as_slice(),
+        "large response body must survive the QUIC direct path intact"
+    );
+    assert!(
+        direct_stream_opens(&registry, "bigudp") >= 1,
+        "large-body request should use the direct QUIC path"
+    );
+    Ok(())
+}

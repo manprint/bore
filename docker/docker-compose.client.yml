@@ -21,6 +21,10 @@ services:
     # The target is a positional arg; --subdomain/--id also read BORE_VHOST_SUBDOMAIN
     # / BORE_VHOST_ID. Reachable at http(s)://<subdomain>.<server-base-domain>:
     # command: ["vhost", "127.0.0.1:8080", "--subdomain", "app", "--id", "my-client"]
+    # To also try the QUIC direct path for the server->provider hop, add --udp and
+    # publish/open BORE_VHOST_QUIC_PORT/udp on the server. Without TLS this often
+    # means publishing 80/udp alongside the HTTP frontend:
+    # command: ["vhost", "127.0.0.1:8080", "--subdomain", "app", "--id", "my-client", "--udp"]
     restart: unless-stopped
     network_mode: host
     environment:
@@ -49,6 +53,10 @@ services:
       # the server enforces it; for a secret tunnel this provider enforces it. Use
       # over TLS so credentials are not sent in the clear.
       # - BORE_BASIC_AUTH=admin:s3cr3t
+      # Vhost direct-QUIC path (server->provider hop only). Ignored unless the
+      # command is `bore vhost ...` and the server has BORE_UDP=true plus an open
+      # BORE_VHOST_QUIC_PORT/udp.
+      # - BORE_VHOST_UDP=true
       # Label this tunnel on the server's admin status page:
       # - BORE_NOTES=dev box A
       # Open N parallel TCP carrier connections for the relay data path and spread

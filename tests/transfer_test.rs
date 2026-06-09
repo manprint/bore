@@ -7,7 +7,9 @@ use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 
-use anyhow::{bail, Context, Result};
+#[cfg(feature = "udp")]
+use anyhow::bail;
+use anyhow::{Context, Result};
 use bore_cli::{
     server::Server,
     shared::CONTROL_PORT,
@@ -182,6 +184,7 @@ fn resume_state_dir(dest_root: &Path, transfer_id: &str) -> PathBuf {
     dest_root.join(format!(".bore-transfer-state-{digest}"))
 }
 
+#[cfg(feature = "udp")]
 fn reserve_udp_port(exclude: Option<u16>) -> Result<u16> {
     for _ in 0..32 {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;

@@ -33,10 +33,12 @@ use crate::adaptive_nat;
 use crate::auth::Authenticator;
 use crate::holepunch::{self, NatClass, StunObservation};
 use crate::mux;
+#[cfg(feature = "udp")]
+use crate::shared::UdpAdaptiveMode;
 use crate::shared::{
-    ClientMessage, Delimited, ServerMessage, UdpAdaptiveCandidateKind, UdpAdaptiveMode,
-    UdpAdaptivePlan, UdpCandidateKind, UdpDirectTuning, UdpTestOptions, UdpTestPeerSummary,
-    UdpTestRole, PROXY_BUFFER_SIZE, UDP_NONCE_LEN,
+    ClientMessage, Delimited, ServerMessage, UdpAdaptiveCandidateKind, UdpAdaptivePlan,
+    UdpCandidateKind, UdpDirectTuning, UdpTestOptions, UdpTestPeerSummary, UdpTestRole,
+    PROXY_BUFFER_SIZE, UDP_NONCE_LEN,
 };
 use crate::transport::{self, Endpoint};
 const LATENCY_SAMPLES: u16 = 8;
@@ -2262,6 +2264,7 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::UdpAdaptiveMode;
 
     #[test]
     fn merge_options_enables_bandwidth_and_uses_lower_quota() {

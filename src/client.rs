@@ -7,7 +7,6 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::{net::TcpStream, time::timeout};
-#[cfg(feature = "udp")]
 use tracing::trace;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
@@ -74,6 +73,20 @@ pub struct Client {
     /// candidates if the initial offer failed, and bound direct substreams.
     #[cfg(feature = "udp")]
     udp_cfg: Option<UdpProviderCfg>,
+
+    /// Whether this vhost provider requested the QUIC direct data path.
+    #[cfg(feature = "udp")]
+    vhost_udp: bool,
+
+    /// Control endpoint used to resolve the server's public UDP address for the
+    /// vhost direct path.
+    #[cfg(feature = "udp")]
+    vhost_endpoint: Option<Endpoint>,
+
+    /// Registered vhost subdomain, retained so renew requests can name the
+    /// direct path that should be re-issued after a drop.
+    #[cfg(feature = "udp")]
+    vhost_subdomain: Option<String>,
 
     /// HTTP Basic auth enforced on each proxied connection. `Some` only for a
     /// secret-tunnel provider with `--basic-auth` (public tunnels are enforced on
@@ -214,6 +227,12 @@ impl Client {
             secret: secret.map(str::to_string),
             #[cfg(feature = "udp")]
             udp_cfg: None,
+            #[cfg(feature = "udp")]
+            vhost_udp: false,
+            #[cfg(feature = "udp")]
+            vhost_endpoint: None,
+            #[cfg(feature = "udp")]
+            vhost_subdomain: None,
             // Public tunnels are basic-auth-gated on the server, not the client.
             basic_auth: None,
             carrier_acceptors,
@@ -379,6 +398,12 @@ impl Client {
             secret: secret.map(str::to_string),
             #[cfg(feature = "udp")]
             udp_cfg,
+            #[cfg(feature = "udp")]
+            vhost_udp: false,
+            #[cfg(feature = "udp")]
+            vhost_endpoint: None,
+            #[cfg(feature = "udp")]
+            vhost_subdomain: None,
             basic_auth: meta.basic_auth.as_deref().and_then(BasicAuth::parse),
             carrier_acceptors,
             carrier_dialer,
@@ -403,6 +428,33 @@ impl Client {
         carriers: u16,
         meta: ProviderMeta,
     ) -> Result<Self> {
+        Self::new_vhost_provider_with_udp(
+            local_host, local_port, to, subdomain, client_id, secret, insecure, carriers, false,
+            meta,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Connect to a bore server as a vhost subdomain provider, optionally
+    /// requesting the vhost QUIC direct data path.
+    pub async fn new_vhost_provider_with_udp(
+        local_host: &str,
+        local_port: u16,
+        to: &str,
+        subdomain: &str,
+        client_id: &str,
+        secret: Option<&str>,
+        insecure: bool,
+        carriers: u16,
+        udp: bool,
+        meta: ProviderMeta,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "udp"))]
+        if udp {
+            warn!("built without udp support; ignoring --udp");
+        }
+
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
         let (opener, acceptor) = mux::client(socket);
@@ -421,6 +473,7 @@ impl Client {
                 notes: meta.notes.clone(),
                 basic_auth: meta.basic_auth.is_some(),
                 carriers,
+                udp,
             })
             .await?;
 
@@ -494,6 +547,12 @@ impl Client {
             secret: secret.map(str::to_string),
             #[cfg(feature = "udp")]
             udp_cfg: None,
+            #[cfg(feature = "udp")]
+            vhost_udp: udp,
+            #[cfg(feature = "udp")]
+            vhost_endpoint: Some(endpoint),
+            #[cfg(feature = "udp")]
+            vhost_subdomain: Some(subdomain.to_string()),
             basic_auth: meta.basic_auth.as_deref().and_then(BasicAuth::parse),
             carrier_acceptors,
             carrier_dialer,
@@ -515,6 +574,24 @@ impl Client {
         let mut udp_socket = self.udp_socket.take();
         #[cfg(feature = "udp")]
         let secret = self.secret.clone();
+        #[cfg(feature = "udp")]
+        let vhost_udp = self.vhost_udp;
+        #[cfg(feature = "udp")]
+        let vhost_endpoint = self.vhost_endpoint.clone();
+        #[cfg(feature = "udp")]
+        let vhost_subdomain = self.vhost_subdomain.clone();
+        #[cfg(not(feature = "udp"))]
+        let vhost_subdomain: Option<String> = None;
+        #[cfg(feature = "udp")]
+        let (vhost_renew_tx, mut vhost_renew_rx) = mpsc::unbounded_channel::<()>();
+        #[cfg(not(feature = "udp"))]
+        let (_vhost_renew_tx, mut vhost_renew_rx) = mpsc::unbounded_channel::<()>();
+        #[cfg(feature = "udp")]
+        let mut vhost_renew_backoff = crate::reconnect::Backoff::new_with(2, 32);
+        #[cfg(feature = "udp")]
+        let mut vhost_renew_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        #[cfg(not(feature = "udp"))]
+        let mut vhost_renew_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         // Once the direct path is up, later `UdpPunch` messages (a new or
         // reconnecting consumer) are forwarded here to re-punch the NAT.
         #[cfg(feature = "udp")]
@@ -625,7 +702,92 @@ impl Client {
                         Some(ServerMessage::TestUdpWaiting) => warn!("unexpected udp diagnostic wait"),
                         Some(ServerMessage::TestUdpStart { .. }) => warn!("unexpected udp diagnostic start"),
                         Some(ServerMessage::VhostReady { .. }) => warn!("unexpected vhost ready"),
+                        Some(ServerMessage::VhostUdp { port, nonce, tuning }) => {
+                            #[cfg(feature = "udp")]
+                            if vhost_udp {
+                                let Some(endpoint) = vhost_endpoint.as_ref() else {
+                                    warn!("vhost udp offer received without an endpoint context");
+                                    continue;
+                                };
+                                let Some(subdomain) = vhost_subdomain.as_deref() else {
+                                    warn!("vhost udp offer received without a subdomain context");
+                                    continue;
+                                };
+
+                                let server_addr = match resolve_vhost_server_addr(endpoint, port).await {
+                                    Ok(addr) => addr,
+                                    Err(err) => {
+                                        warn!(%err, subdomain, "failed to resolve vhost udp endpoint; using TCP relay");
+                                        let _ = vhost_renew_tx.send(());
+                                        continue;
+                                    }
+                                };
+                                let socket = match crate::holepunch::bind_socket(0).await {
+                                    Ok(socket) => socket,
+                                    Err(err) => {
+                                        warn!(%err, subdomain, "failed to bind vhost udp socket; using TCP relay");
+                                        let _ = vhost_renew_tx.send(());
+                                        continue;
+                                    }
+                                };
+                                let token = crate::holepunch::derive_token(secret.as_deref(), &nonce);
+
+                                match crate::holepunch::vhost_connect(socket, server_addr, subdomain, token, tuning).await {
+                                    Ok(direct) => {
+                                        vhost_renew_backoff.reset();
+                                        vhost_renew_sleep = None;
+                                        while vhost_renew_rx.try_recv().is_ok() {}
+                                        info!(subdomain, "vhost direct udp path ready, accepting streams");
+                                        spawn_vhost_direct(Arc::clone(&this), direct, vhost_renew_tx.clone());
+                                    }
+                                    Err(err) => {
+                                        warn!(%err, subdomain, "vhost direct udp unavailable; using TCP relay");
+                                        let _ = vhost_renew_tx.send(());
+                                    }
+                                }
+                            } else {
+                                warn!("unexpected vhost udp offer");
+                            }
+                            #[cfg(not(feature = "udp"))]
+                            {
+                                let _ = (port, nonce, tuning);
+                                warn!("unexpected vhost udp offer");
+                            }
+                        }
                         None => return Ok(()),
+                    }
+                }
+                _ = async {
+                    if let Some(sleep) = &mut vhost_renew_sleep {
+                        sleep.as_mut().await;
+                    }
+                }, if vhost_renew_sleep.is_some() => {
+                    vhost_renew_sleep = None;
+                    if let Some(subdomain) = vhost_subdomain.as_deref() {
+                        info!(subdomain, "requesting vhost udp renewal");
+                        if control
+                            .send(ClientMessage::VhostUdpRenew {
+                                subdomain: subdomain.to_string(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+                renew = vhost_renew_rx.recv() => {
+                    #[cfg(not(feature = "udp"))]
+                    let _ = renew;
+                    #[cfg(feature = "udp")]
+                    if renew.is_some() && vhost_udp && vhost_subdomain.is_some() && vhost_renew_sleep.is_none() {
+                        let delay = vhost_renew_backoff.next_delay();
+                        info!(
+                            subdomain = vhost_subdomain.as_deref().unwrap_or_default(),
+                            next_retry_s = delay.as_secs(),
+                            "scheduling vhost udp renewal"
+                        );
+                        vhost_renew_sleep = Some(Box::pin(tokio::time::sleep(delay)));
                     }
                 }
                 // Periodically re-offer UDP candidates if the provider requested
@@ -780,6 +942,54 @@ fn spawn_handle(this: &Arc<Client>, stream: mux::Stream) {
         }
         .instrument(info_span!("proxy")),
     );
+}
+
+/// Resolve the public UDP address a vhost provider should dial for the server's
+/// direct QUIC endpoint. The direct path currently uses the IPv4 UDP stack, so
+/// prefer IPv4 answers and fail fast if none are available.
+#[cfg(feature = "udp")]
+async fn resolve_vhost_server_addr(endpoint: &Endpoint, port: u16) -> Result<SocketAddr> {
+    tokio::net::lookup_host((endpoint.host.as_str(), port))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to resolve vhost udp endpoint {}:{port}",
+                endpoint.host
+            )
+        })?
+        .find(SocketAddr::is_ipv4)
+        .context("resolved no IPv4 address for the vhost udp endpoint")
+}
+
+/// Serve accepted vhost direct QUIC streams to the local service. The inversion
+/// from secret UDP is intentional: here the server opens the QUIC streams and the
+/// provider accepts them.
+#[cfg(feature = "udp")]
+fn spawn_vhost_direct(
+    client: Arc<Client>,
+    direct: crate::holepunch::DirectConn,
+    renew_tx: mpsc::UnboundedSender<()>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let stream = match direct.accept_stream().await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    debug!(%err, "vhost direct udp connection closed");
+                    let _ = renew_tx.send(());
+                    break;
+                }
+            };
+
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                debug!("serving local connection over vhost direct udp path");
+                if let Err(err) = client.handle_connection(stream).await {
+                    warn!(%err, "vhost direct connection closed with error");
+                }
+            });
+        }
+    });
 }
 
 /// Open one extra carrier connection for a public tunnel's pool: dial the server,

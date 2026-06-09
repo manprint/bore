@@ -192,6 +192,7 @@ a cert later reloads the TLS material but does not start an HTTPS listener until
 | `--secret` | `BORE_SECRET` | — | Server authentication secret |
 | `--insecure` | `BORE_INSECURE` | false | Skip TLS cert verification |
 | `--carriers N` | `BORE_CARRIERS` | 1 | Parallel relay TCP connections (see note below) |
+| `--udp` | `BORE_VHOST_UDP` | false | Try a QUIC direct path for the server→provider hop; fall back silently to TCP relay |
 | `--basic-auth user:pass` | — | — | Reports Basic auth to admin page (display only) |
 | `--notes TEXT` | `BORE_NOTES` | — | Free-form note on the admin page |
 | `--auto-reconnect` | `BORE_AUTO_RECONNECT` | false | Reconnect with backoff on disconnect |
@@ -208,6 +209,7 @@ These flags extend `bore server`:
 | `--vhost-base-domain <d>` | `BORE_VHOST_BASE_DOMAIN` | — | Base domain; enables vhost without a file |
 | `--vhost-http-port N` | `BORE_VHOST_HTTP_PORT` | (from config / 80) | Override `http_port` |
 | `--vhost-https-port N` | `BORE_VHOST_HTTPS_PORT` | (from config / 443) | Override `https_port` |
+| `--vhost-quic-port N` | `BORE_VHOST_QUIC_PORT` | (active vhost frontend port, UDP) | UDP port for the vhost QUIC direct path |
 | `--vhost-mode <mode>` | `BORE_VHOST_MODE` | (from config / auto) | Override `mode` |
 | `--vhost-cert-file <path>` | `BORE_VHOST_CERT_FILE` | (from config) | Override `cert_file` |
 | `--vhost-key-file <path>` | `BORE_VHOST_KEY_FILE` | (from config) | Override `key_file` |
@@ -229,6 +231,62 @@ When both a file and flags/env are set, the flags/env **override** the file's
 `base_domain`, ports, `mode`, and cert/key (yaml defaults: `http_port` 80, `https_port`
 443, `mode` auto). The `vhost.yml` is still hot-reloaded; env/flag overrides are applied
 once at startup.
+
+---
+
+## UDP / QUIC data path
+
+`bore vhost --udp` opportunistically upgrades only the **server→provider** data hop
+from yamux-over-TCP to **native QUIC streams**. The browser-facing side is unchanged:
+
+```text
+browser -- TCP/TLS --> bore server -- QUIC (optional) --> bore vhost provider -- TCP --> local app
+```
+
+What it does:
+
+| Scenario | Effect |
+|---|---|
+| Many concurrent requests through one provider | Better throughput and tail latency: each proxied request gets its own QUIC bidi stream |
+| Lossy / high-RTT provider uplink | Usually better than one yamux-over-TCP carrier because QUIC avoids the single TCP congestion window / HOL issue |
+| Server FD pressure | Lower: one QUIC connection can carry many proxied requests |
+| Single clean bulk flow | Usually little to no gain over tuned TCP |
+| Browser RTT baseline | No change; the browser still talks plain HTTP/TLS to the server |
+| Server bandwidth offload | No change; the server still relays every byte |
+
+Important constraints:
+
+- The **server stays in the data path**. This is not the peer-to-peer secret-tunnel `--udp` mode.
+- There is **no STUN or hole-punching** for vhost UDP. The provider dials the server's public UDP port directly.
+- If UDP is blocked or the QUIC path drops, bore **falls back automatically and silently** to the existing TCP carrier relay.
+- `--carriers` still matters for the TCP fallback path; QUIC is only used when the direct server→provider hop is up.
+
+### Firewall / port requirements
+
+If you enable `bore vhost --udp`, open one extra UDP port on the server:
+
+- `BORE_VHOST_QUIC_PORT` / `--vhost-quic-port`
+- default: the active vhost frontend port on **UDP**: `https_port` when the resolved mode serves HTTPS, otherwise `http_port`
+- distinct from the secret-tunnel STUN responder on `BORE_CONTROL_PORT/udp`
+
+Examples:
+
+- no cert / `mode: auto|http`: `80/tcp` for HTTP frontend + `80/udp` for vhost QUIC
+- dedicated frontend: `443/tcp` for HTTPS frontend + `443/udp` for vhost QUIC
+- custom QUIC port: `8443/tcp` for HTTPS frontend + `9443/udp` for vhost QUIC
+
+### Authentication model
+
+The direct QUIC path uses the same self-signed-cert + shared-secret model as the
+existing direct UDP stack:
+
+- the server sends a per-session nonce on the authenticated control channel
+- server and provider derive the same HMAC token from `nonce + --secret`
+- the provider authenticates the QUIC connection with that token before any data streams are trusted
+
+Weak-auth caveat: if the control channel itself is plain TCP and the server has **no**
+`--secret`, the vhost QUIC auth is correspondingly weak, exactly like the existing
+direct-UDP modes. Use `https://...` control and a shared `--secret` in production.
 
 ---
 
@@ -268,7 +326,7 @@ guard removes the registry entry synchronously).
   Future: SNI dispatch with per-subdomain certificates.
 - **Multi-map per command:** one `--subdomain` per `bore vhost` invocation.
   Future: `--map sub1=host:port --map sub2=host:port`.
-- **QUIC server↔client transport:** the relay uses yamux-over-TCP (same as other tunnels).
-  Future: QUIC on the relay path for improved throughput.
+- **Vhost QUIC is only the server→provider hop.** The browser-facing side is still
+  HTTP/TLS to the server, and the server still relays every byte.
 - **Per-client distinct secrets:** reservation identity is by `client_id` string only.
   Future: per-reservation secrets or mTLS.

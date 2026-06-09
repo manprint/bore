@@ -510,6 +510,17 @@ pub enum ClientMessage {
         /// Number of parallel TCP carrier connections to request.
         #[serde(default)]
         carriers: u16,
+        /// Whether the provider wants the QUIC direct data path (`bore vhost --udp`).
+        /// `#[serde(default)]` keeps the wire format backward-compatible.
+        #[serde(default)]
+        udp: bool,
+    },
+
+    /// Ask the server to issue a fresh vhost-UDP nonce so the provider can
+    /// re-dial the direct QUIC path after it dropped.
+    VhostUdpRenew {
+        /// Subdomain whose direct path should be renewed.
+        subdomain: String,
     },
 }
 
@@ -584,6 +595,17 @@ pub enum ServerMessage {
         /// Public HTTPS URL (e.g. `https://myapp.bore.example.com`), when the
         /// server's frontend serves HTTPS.
         https_url: Option<String>,
+    },
+
+    /// Offer the vhost QUIC direct path to a provider that requested `--udp`.
+    VhostUdp {
+        /// Server UDP port to dial for the QUIC direct path.
+        port: u16,
+        /// Session nonce; server and provider derive the same token from it + secret.
+        nonce: [u8; UDP_NONCE_LEN],
+        /// Direct-UDP transport tuning requested by the server.
+        #[serde(default)]
+        tuning: UdpDirectTuning,
     },
 
     /// A `bore test-udp` peer is registered and waiting for another peer with the
@@ -677,15 +699,20 @@ impl ControlFrameSummary for ClientMessage {
                 notes,
                 basic_auth,
                 carriers,
+                udp,
             } => {
                 format!(
-                    "HelloVhost {{ subdomain={}, client_id={}, notes={}, basic_auth={}, carriers={} }}",
+                    "HelloVhost {{ subdomain={}, client_id={}, notes={}, basic_auth={}, carriers={}, udp={} }}",
                     subdomain,
                     client_id,
                     if notes.is_some() { "present" } else { "none" },
                     if *basic_auth { "on" } else { "off" },
                     carriers,
+                    if *udp { "on" } else { "off" },
                 )
+            }
+            ClientMessage::VhostUdpRenew { subdomain } => {
+                format!("VhostUdpRenew {{ subdomain={} }}", subdomain)
             }
         }
     }
@@ -733,6 +760,18 @@ impl ControlFrameSummary for ServerMessage {
                 http_url.as_deref().unwrap_or("<none>"),
                 https_url.as_deref().unwrap_or("<none>"),
             ),
+            ServerMessage::VhostUdp {
+                port,
+                nonce,
+                tuning,
+            } => {
+                format!(
+                    "VhostUdp {{ port={}, nonce={}, tuning={{ {} }} }}",
+                    port,
+                    hex::encode(nonce),
+                    tuning.control_frame_summary(),
+                )
+            }
             ServerMessage::TestUdpWaiting => "TestUdpWaiting".to_string(),
             ServerMessage::TestUdpStart {
                 role,
@@ -909,6 +948,57 @@ mod tests {
             other => panic!("unexpected message: {other:?}"),
         }
     }
+
+    #[test]
+    fn hello_vhost_defaults_udp_false_for_old_wire_format() {
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"HelloVhost":{"subdomain":"myapp","client_id":"client-1","notes":null,"basic_auth":false,"carriers":2}}"#,
+        )
+        .unwrap();
+
+        match msg {
+            ClientMessage::HelloVhost {
+                subdomain,
+                client_id,
+                notes,
+                basic_auth,
+                carriers,
+                udp,
+            } => {
+                assert_eq!(subdomain, "myapp");
+                assert_eq!(client_id, "client-1");
+                assert_eq!(notes, None);
+                assert!(!basic_auth);
+                assert_eq!(carriers, 2);
+                assert!(!udp);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vhost_udp_round_trips() {
+        let msg = ServerMessage::VhostUdp {
+            port: 443,
+            nonce: [7; UDP_NONCE_LEN],
+            tuning: UdpDirectTuning::default(),
+        };
+
+        let encoded = serde_json::to_string(&msg).unwrap();
+        let decoded: ServerMessage = serde_json::from_str(&encoded).unwrap();
+        match decoded {
+            ServerMessage::VhostUdp {
+                port,
+                nonce,
+                tuning,
+            } => {
+                assert_eq!(port, 443);
+                assert_eq!(nonce, [7; UDP_NONCE_LEN]);
+                assert_eq!(tuning, UdpDirectTuning::default());
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -978,6 +1068,7 @@ fn hello_vhost_round_trips_and_fits_frame() {
         notes: Some("test note".to_string()),
         basic_auth: false,
         carriers: 1,
+        udp: false,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(
@@ -992,12 +1083,14 @@ fn hello_vhost_round_trips_and_fits_frame() {
             notes,
             basic_auth,
             carriers,
+            udp,
         } => {
             assert_eq!(subdomain, "myapp");
             assert_eq!(client_id, "client-a");
             assert_eq!(notes.as_deref(), Some("test note"));
             assert!(!basic_auth);
             assert_eq!(carriers, 1);
+            assert!(!udp);
         }
         other => panic!("unexpected: {other:?}"),
     }

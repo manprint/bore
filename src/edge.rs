@@ -149,9 +149,14 @@ pub async fn accept(
 
     if n > 0 && opts.https && head[0] == TLS_HANDSHAKE {
         let acceptor = tls.context("TLS requested but no certificate is configured")?;
-        let tls_stream = acceptor
-            .accept(stream)
+        // Bound the handshake. The caller holds a `--max-conns` permit for the whole
+        // edge step, so a peer that sends the first handshake byte (passing the peek)
+        // and then stalls would otherwise pin a connection slot indefinitely
+        // (slowloris). This mirrors the timeout already guarding the peek, the
+        // redirect, and the basic-auth read — only this branch was unbounded.
+        let tls_stream = timeout(NETWORK_TIMEOUT, acceptor.accept(stream))
             .await
+            .context("TLS handshake timed out")?
             .context("TLS handshake failed")?;
         // Basic auth is checked on the decrypted HTTP stream.
         if let Some(auth) = &auth {

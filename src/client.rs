@@ -655,7 +655,10 @@ fn spawn_handle(this: &Arc<Client>, stream: mux::Stream) {
         async move {
             info!("new connection");
             match this.handle_connection(stream).await {
-                Ok(_) => info!("connection exited"),
+                // Per-connection success is high-frequency, low-value: log it at
+                // trace, matching the server and secret-relay paths (which trace
+                // their per-connection closes). The arrival above stays at info.
+                Ok(_) => trace!("connection exited"),
                 Err(err) => warn!(%err, "connection exited with error"),
             }
         }

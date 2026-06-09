@@ -217,6 +217,66 @@ async fn tunnel_port_terminates_tls_and_keeps_plain() -> Result<()> {
     Ok(())
 }
 
+/// A peer that opens a TLS tunnel connection, sends the first handshake byte, then
+/// stalls must be dropped by the server's handshake timeout — it must not pin a
+/// connection slot — and the tunnel must keep serving healthy connections.
+#[tokio::test]
+async fn stalled_tls_handshake_is_dropped_and_tunnel_keeps_serving() -> Result<()> {
+    const PORT: u16 = 17905;
+    wait_port(PORT, false).await;
+
+    let (cert_pem, key_pem) = self_signed()?;
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+    let mut server = Server::new(1024..=65535, Some("sec"));
+    server.set_control_port(PORT);
+    server.set_tls(acceptor);
+    tokio::spawn(server.listen());
+    wait_port(PORT, true).await;
+
+    let echo = echo_service_loop().await?;
+    let to = format!("https://localhost:{PORT}");
+    let options = TunnelOptions {
+        https: true,
+        force_https: false,
+        ..Default::default()
+    };
+    let client = Client::new("localhost", echo, &to, 0, Some("sec"), true, options).await?;
+    let tunnel = client.remote_port();
+    tokio::spawn(client.listen());
+
+    // Open a connection, send only the TLS handshake content-type byte (so the edge
+    // enters the TLS branch), then stall — never completing the handshake.
+    let mut stall = TcpStream::connect(("127.0.0.1", tunnel)).await?;
+    stall.write_all(&[0x16]).await?;
+    stall.flush().await?;
+
+    // The server must close the stalled connection (EOF or reset) within a bound a
+    // bit larger than NETWORK_TIMEOUT. Without the handshake timeout this hangs.
+    let mut sink = [0u8; 1];
+    match time::timeout(Duration::from_secs(8), stall.read(&mut sink)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {} // closed by the server — expected
+        Ok(Ok(n)) => panic!("stalled TLS handshake unexpectedly produced {n} bytes"),
+        Err(_) => {
+            panic!("server did not drop the stalled TLS handshake (handshake timeout missing)")
+        }
+    }
+
+    // The tunnel is still healthy: a real TLS connection completes the round-trip,
+    // proving the connection slot was released and the accept loop kept serving.
+    let endpoint = Endpoint {
+        host: "127.0.0.1".to_string(),
+        port: tunnel,
+        tls: true,
+    };
+    let mut tls = transport::connect(&endpoint, true).await?;
+    tls.write_all(b"after-sl").await?;
+    let mut buf = [0u8; 8];
+    tls.read_exact(&mut buf).await?;
+    assert_eq!(&buf, b"after-sl");
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn force_https_redirects_plain_http() -> Result<()> {
     const PORT: u16 = 17904;

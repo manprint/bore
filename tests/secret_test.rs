@@ -366,7 +366,10 @@ async fn secret_tunnel_websocket_direct_udp_round_trip() -> Result<()> {
         None,
     )
     .await?;
-    assert!(proxy.is_direct(), "expected the secret websocket test to negotiate direct UDP");
+    assert!(
+        proxy.is_direct(),
+        "expected the secret websocket test to negotiate direct UDP"
+    );
     let addr = proxy.local_addr()?;
     tokio::spawn(proxy.listen());
     time::sleep(Duration::from_millis(100)).await;

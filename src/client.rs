@@ -16,8 +16,8 @@ use crate::mux;
 #[cfg(feature = "udp")]
 use crate::shared::UdpCandidateOffer;
 use crate::shared::{
-    tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions, NETWORK_TIMEOUT,
-    PROXY_BUFFER_SIZE,
+    proxy_buffer_size, tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions,
+    NETWORK_TIMEOUT,
 };
 use crate::transport::{self, Endpoint};
 
@@ -87,6 +87,13 @@ pub struct Client {
     /// direct path that should be re-issued after a drop.
     #[cfg(feature = "udp")]
     vhost_subdomain: Option<String>,
+
+    /// Target number of parallel QUIC direct connections (carriers) for the vhost
+    /// UDP data path. `0` outside the vhost-provider-with-udp case; otherwise the
+    /// resolved `--carriers` count (min 1). The listen loop keeps this many direct
+    /// connections established, topping up after a drop.
+    #[cfg(feature = "udp")]
+    vhost_udp_carriers: u16,
 
     /// HTTP Basic auth enforced on each proxied connection. `Some` only for a
     /// secret-tunnel provider with `--basic-auth` (public tunnels are enforced on
@@ -233,6 +240,8 @@ impl Client {
             vhost_endpoint: None,
             #[cfg(feature = "udp")]
             vhost_subdomain: None,
+            #[cfg(feature = "udp")]
+            vhost_udp_carriers: 0,
             // Public tunnels are basic-auth-gated on the server, not the client.
             basic_auth: None,
             carrier_acceptors,
@@ -404,6 +413,8 @@ impl Client {
             vhost_endpoint: None,
             #[cfg(feature = "udp")]
             vhost_subdomain: None,
+            #[cfg(feature = "udp")]
+            vhost_udp_carriers: 0,
             basic_auth: meta.basic_auth.as_deref().and_then(BasicAuth::parse),
             carrier_acceptors,
             carrier_dialer,
@@ -553,6 +564,8 @@ impl Client {
             vhost_endpoint: Some(endpoint),
             #[cfg(feature = "udp")]
             vhost_subdomain: Some(subdomain.to_string()),
+            #[cfg(feature = "udp")]
+            vhost_udp_carriers: if udp { carriers.max(1) } else { 0 },
             basic_auth: meta.basic_auth.as_deref().and_then(BasicAuth::parse),
             carrier_acceptors,
             carrier_dialer,
@@ -582,6 +595,19 @@ impl Client {
         let vhost_subdomain = self.vhost_subdomain.clone();
         #[cfg(not(feature = "udp"))]
         let vhost_subdomain: Option<String> = None;
+        // Target width of the QUIC direct carrier pool, and a counter of
+        // established-or-establishing carriers so each offer only opens the
+        // shortfall (no double-provisioning, no exceeding the target).
+        #[cfg(feature = "udp")]
+        let vhost_udp_target = self.vhost_udp_carriers.max(1) as usize;
+        #[cfg(feature = "udp")]
+        let vhost_direct_live = Arc::new(AtomicUsize::new(0));
+        // A direct carrier signals here once it is established, so the loop can
+        // reset the renewal backoff (success path moved off the listen task).
+        #[cfg(feature = "udp")]
+        let (vhost_up_tx, mut vhost_up_rx) = mpsc::unbounded_channel::<()>();
+        #[cfg(not(feature = "udp"))]
+        let (_vhost_up_tx, mut vhost_up_rx) = mpsc::unbounded_channel::<()>();
         #[cfg(feature = "udp")]
         let (vhost_renew_tx, mut vhost_renew_rx) = mpsc::unbounded_channel::<()>();
         #[cfg(not(feature = "udp"))]
@@ -722,28 +748,31 @@ impl Client {
                                         continue;
                                     }
                                 };
-                                let socket = match crate::holepunch::bind_socket(0).await {
-                                    Ok(socket) => socket,
-                                    Err(err) => {
-                                        warn!(%err, subdomain, "failed to bind vhost udp socket; using TCP relay");
-                                        let _ = vhost_renew_tx.send(());
-                                        continue;
-                                    }
-                                };
                                 let token = crate::holepunch::derive_token(secret.as_deref(), &nonce);
 
-                                match crate::holepunch::vhost_connect(socket, server_addr, subdomain, token, tuning).await {
-                                    Ok(direct) => {
-                                        vhost_renew_backoff.reset();
-                                        vhost_renew_sleep = None;
-                                        while vhost_renew_rx.try_recv().is_ok() {}
-                                        info!(subdomain, "vhost direct udp path ready, accepting streams");
-                                        spawn_vhost_direct(Arc::clone(&this), direct, vhost_renew_tx.clone());
-                                    }
-                                    Err(err) => {
-                                        warn!(%err, subdomain, "vhost direct udp unavailable; using TCP relay");
-                                        let _ = vhost_renew_tx.send(());
-                                    }
+                                // Open only the shortfall toward the target carrier
+                                // count: each offer (initial or renewal) tops the
+                                // QUIC direct pool back up to `vhost_udp_target`.
+                                // Reserve the slot before spawning so a concurrent
+                                // renewal does not over-provision.
+                                let current = vhost_direct_live.load(Ordering::Relaxed);
+                                let need = vhost_udp_target.saturating_sub(current);
+                                if need == 0 {
+                                    continue;
+                                }
+                                info!(subdomain, need, target = vhost_udp_target, "establishing vhost direct udp carriers");
+                                for _ in 0..need {
+                                    vhost_direct_live.fetch_add(1, Ordering::Relaxed);
+                                    spawn_vhost_direct(
+                                        Arc::clone(&this),
+                                        server_addr,
+                                        subdomain.to_string(),
+                                        token,
+                                        tuning,
+                                        Arc::clone(&vhost_direct_live),
+                                        vhost_renew_tx.clone(),
+                                        vhost_up_tx.clone(),
+                                    );
                                 }
                             } else {
                                 warn!("unexpected vhost udp offer");
@@ -788,6 +817,18 @@ impl Client {
                             "scheduling vhost udp renewal"
                         );
                         vhost_renew_sleep = Some(Box::pin(tokio::time::sleep(delay)));
+                    }
+                }
+                // A direct carrier came up: clear the renewal backoff so a later
+                // drop retries promptly, and cancel any pending renewal sleep.
+                up = vhost_up_rx.recv() => {
+                    #[cfg(not(feature = "udp"))]
+                    let _ = up;
+                    #[cfg(feature = "udp")]
+                    if up.is_some() {
+                        vhost_renew_backoff.reset();
+                        vhost_renew_sleep = None;
+                        while vhost_renew_rx.try_recv().is_ok() {}
                     }
                 }
                 // Periodically re-offer UDP candidates if the provider requested
@@ -913,13 +954,8 @@ impl Client {
         if !prefix.is_empty() {
             local_conn.write_all(&prefix).await?;
         }
-        tokio::io::copy_bidirectional_with_sizes(
-            &mut local_conn,
-            &mut stream,
-            PROXY_BUFFER_SIZE,
-            PROXY_BUFFER_SIZE,
-        )
-        .await?;
+        let buf = proxy_buffer_size();
+        tokio::io::copy_bidirectional_with_sizes(&mut local_conn, &mut stream, buf, buf).await?;
         Ok(())
     }
 }
@@ -961,22 +997,65 @@ async fn resolve_vhost_server_addr(endpoint: &Endpoint, port: u16) -> Result<Soc
         .context("resolved no IPv4 address for the vhost udp endpoint")
 }
 
-/// Serve accepted vhost direct QUIC streams to the local service. The inversion
-/// from secret UDP is intentional: here the server opens the QUIC streams and the
-/// provider accepts them.
+/// Establish one QUIC direct carrier toward the vhost server and serve its
+/// accepted streams to the local service. The inversion from secret UDP is
+/// intentional: the server opens the QUIC streams and the provider accepts them.
+///
+/// One of these runs per pooled carrier. The caller has already reserved the slot
+/// in `live` (incremented before spawning); this task releases it (`live -= 1`)
+/// and signals `renew_tx` whenever the carrier fails to establish or later closes,
+/// so the listen loop re-requests an offer and tops the pool back up. On a
+/// successful connect it signals `up_tx` so the loop resets its renewal backoff.
 #[cfg(feature = "udp")]
+#[allow(clippy::too_many_arguments)]
 fn spawn_vhost_direct(
     client: Arc<Client>,
-    direct: crate::holepunch::DirectConn,
+    server_addr: SocketAddr,
+    subdomain: String,
+    token: [u8; crate::holepunch::TOKEN_LEN],
+    tuning: crate::shared::UdpDirectTuning,
+    live: Arc<AtomicUsize>,
     renew_tx: mpsc::UnboundedSender<()>,
+    up_tx: mpsc::UnboundedSender<()>,
 ) {
     tokio::spawn(async move {
+        // Release the reserved slot and ask for a renewal. Used on every exit
+        // path (bind/connect failure or a later carrier close).
+        let release = |live: &AtomicUsize, renew_tx: &mpsc::UnboundedSender<()>| {
+            live.fetch_sub(1, Ordering::Relaxed);
+            let _ = renew_tx.send(());
+        };
+
+        let socket = match crate::holepunch::bind_socket(0).await {
+            Ok(socket) => socket,
+            Err(err) => {
+                warn!(%err, subdomain, "failed to bind vhost udp socket; using TCP relay");
+                release(&live, &renew_tx);
+                return;
+            }
+        };
+        let direct =
+            match crate::holepunch::vhost_connect(socket, server_addr, &subdomain, token, tuning)
+                .await
+            {
+                Ok(direct) => direct,
+                Err(err) => {
+                    warn!(%err, subdomain, "vhost direct udp carrier unavailable; using TCP relay");
+                    release(&live, &renew_tx);
+                    return;
+                }
+            };
+
+        let _ = up_tx.send(());
+        info!(
+            subdomain,
+            "vhost direct udp carrier ready, accepting streams"
+        );
         loop {
             let stream = match direct.accept_stream().await {
                 Ok(stream) => stream,
                 Err(err) => {
-                    debug!(%err, "vhost direct udp connection closed");
-                    let _ = renew_tx.send(());
+                    debug!(%err, subdomain, "vhost direct udp carrier closed");
                     break;
                 }
             };
@@ -989,6 +1068,7 @@ fn spawn_vhost_direct(
                 }
             });
         }
+        release(&live, &renew_tx);
     });
 }
 

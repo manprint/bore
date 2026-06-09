@@ -6,6 +6,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{bail, ensure, Result};
+#[cfg(feature = "udp")]
+use bore_cli::vhost::VhostRegistry;
 use bore_cli::{
     client::{Client, ProviderMeta},
     secret::Proxy,
@@ -14,8 +16,6 @@ use bore_cli::{
     transport::{self, Endpoint},
     vhost::{VhostConfig, VhostModeCfg},
 };
-#[cfg(feature = "udp")]
-use bore_cli::vhost::VhostRegistry;
 use rcgen::generate_simple_self_signed;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -88,7 +88,10 @@ async fn read_ws_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Vec<
     let mut header = [0u8; 2];
     stream.read_exact(&mut header).await?;
 
-    ensure!(header[0] & 0x70 == 0, "RSV bits are unsupported in test helper");
+    ensure!(
+        header[0] & 0x70 == 0,
+        "RSV bits are unsupported in test helper"
+    );
     let opcode = header[0] & 0x0f;
     let masked = header[1] & 0x80 != 0;
     let len = match header[1] & 0x7f {
@@ -102,7 +105,10 @@ async fn read_ws_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Vec<
             let mut ext = [0u8; 8];
             stream.read_exact(&mut ext).await?;
             let len = u64::from_be_bytes(ext);
-            ensure!(len <= usize::MAX as u64, "frame too large for this platform");
+            ensure!(
+                len <= usize::MAX as u64,
+                "frame too large for this platform"
+            );
             len as usize
         }
         _ => unreachable!("payload length is masked to 7 bits"),
@@ -129,10 +135,22 @@ async fn read_ws_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Vec<
 async fn websocket_echo_peer(mut stream: TcpStream) -> Result<()> {
     let head = read_http_head(&mut stream).await?;
     let request = String::from_utf8_lossy(&head).to_lowercase();
-    ensure!(request.starts_with("get "), "expected HTTP GET upgrade request");
-    ensure!(request.contains("upgrade: websocket"), "missing websocket upgrade header");
-    ensure!(request.contains("connection: upgrade"), "missing connection upgrade header");
-    ensure!(request.contains("sec-websocket-key:"), "missing websocket key header");
+    ensure!(
+        request.starts_with("get "),
+        "expected HTTP GET upgrade request"
+    );
+    ensure!(
+        request.contains("upgrade: websocket"),
+        "missing websocket upgrade header"
+    );
+    ensure!(
+        request.contains("connection: upgrade"),
+        "missing connection upgrade header"
+    );
+    ensure!(
+        request.contains("sec-websocket-key:"),
+        "missing websocket key header"
+    );
 
     stream
         .write_all(
@@ -191,8 +209,14 @@ async fn websocket_round_trip<S: AsyncRead + AsyncWrite + Unpin>(
         "expected websocket 101 response, got: {}",
         String::from_utf8_lossy(&response)
     );
-    ensure!(response_text.contains("upgrade: websocket"), "missing upgrade response header");
-    ensure!(response_text.contains("connection: upgrade"), "missing connection upgrade response header");
+    ensure!(
+        response_text.contains("upgrade: websocket"),
+        "missing upgrade response header"
+    );
+    ensure!(
+        response_text.contains("connection: upgrade"),
+        "missing connection upgrade response header"
+    );
 
     let text_payload = b"hello websocket through bore";
     write_ws_frame(stream, 0x1, text_payload, true).await?;
@@ -204,7 +228,10 @@ async fn websocket_round_trip<S: AsyncRead + AsyncWrite + Unpin>(
     write_ws_frame(stream, 0x2, &binary_payload, true).await?;
     let (opcode, payload) = read_ws_frame(stream).await?;
     ensure!(opcode == 0x2, "expected echoed binary frame");
-    ensure!(payload == binary_payload, "binary websocket payload mismatch");
+    ensure!(
+        payload == binary_payload,
+        "binary websocket payload mismatch"
+    );
 
     write_ws_frame(stream, 0x8, &[], true).await?;
     let (opcode, _) = read_ws_frame(stream).await?;
@@ -248,7 +275,7 @@ async fn wait_for_vhost_direct(registry: &VhostRegistry, subdomain: &str, expect
     loop {
         let direct = registry
             .get(subdomain)
-            .map(|entry| entry.direct.read().unwrap().is_some())
+            .map(|entry| !entry.direct.is_empty())
             .unwrap_or(false);
         if direct == expected {
             return;
@@ -451,7 +478,10 @@ async fn secret_proxy_websocket_direct_udp_round_trip() -> Result<()> {
         None,
     )
     .await?;
-    ensure!(proxy.is_direct(), "expected secret websocket test to use direct UDP");
+    ensure!(
+        proxy.is_direct(),
+        "expected secret websocket test to use direct UDP"
+    );
     let addr = proxy.local_addr()?;
     tokio::spawn(proxy.listen());
     time::sleep(Duration::from_millis(50)).await;

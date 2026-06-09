@@ -1130,10 +1130,22 @@ una richiesta più grande viene troncata, e `--max-carriers 1` disabilita il poo
 carrier che cade viene ri-aperto automaticamente: il tunnel non si interrompe mai.
 Default `1` = comportamento invariato.
 
-> **Il path diretto UDP non usa `--carriers`.** Quando un tunnel segreto gira su path
-> diretto (`--udp`), ogni connessione proxata viaggia già su una **stream QUIC
-> nativa** indipendente (niente HOL). `--carriers` ottimizza il **relay**; `--udp`
-> ottimizza il **diretto**. Si combinano: il pool relay serve da fallback.
+> **Il path diretto UDP non usa `--carriers`** per tunnel segreti e transfer. Quando
+> un tunnel segreto gira su path diretto (`--udp`), ogni connessione proxata viaggia
+> già su una **stream QUIC nativa** indipendente (niente HOL). `--carriers` ottimizza
+> il **relay**; `--udp` ottimizza il **diretto**. Si combinano: il pool relay serve
+> da fallback.
+>
+> **Eccezione — `bore vhost --udp`:** lì `--carriers N` dimensiona *anche* il path
+> diretto QUIC: il provider apre `N` **connessioni** QUIC parallele e il server le
+> mette in pool e le bilancia round-robin (cap 32 per subdomain, non limitato da
+> `--max-carriers`). Un singolo flusso su una connessione non viene comunque
+> spezzato. Vedi `CARRIER_TUNING.md`.
+>
+> **Buffer di copia:** `BORE_PROXY_BUFFER_SIZE` (default 256 KiB; suffissi
+> `KB`/`MB`/`GiB`/..., clamp `[4 KiB, 16 MiB]`) imposta il buffer per-direzione di
+> relay/splice. Settalo sul server (buffer relay) e/o sul provider (splice locale):
+> aiuta link ad alta latenza/BDP, non il throughput single-stream su LAN veloce.
 
 Il path diretto QUIC usa finestre interne più ampie dei default Quinn:
 `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` = 16 MiB,

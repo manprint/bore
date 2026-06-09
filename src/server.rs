@@ -25,8 +25,8 @@ use crate::pool::{self, Carrier, CarrierPool, PendingCarriers, TokenGuard};
 use crate::prefixed::Prefixed;
 use crate::secret::{self, Registry, UdpRegistry};
 use crate::shared::{
-    tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions, UdpDirectTuning,
-    CONTROL_PORT, NETWORK_TIMEOUT, PROXY_BUFFER_SIZE,
+    proxy_buffer_size, tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions,
+    UdpDirectTuning, CONTROL_PORT, NETWORK_TIMEOUT,
 };
 use crate::udp_diagnostic;
 use crate::vhost::{self, VhostRegistry};
@@ -484,31 +484,28 @@ impl Server {
                                                 .get(&subdomain)
                                                 .map(|entry| Arc::clone(entry.value()));
                                             if let Some(entry) = entry {
-                                                let generation = entry
-                                                    .direct_generation
-                                                    .fetch_add(1, Ordering::AcqRel)
-                                                    + 1;
-                                                *entry.direct.write().unwrap() =
-                                                    Some(direct.clone());
-                                                info!(subdomain = %subdomain, generation, "vhost QUIC direct path established");
-
-                                                let registry = registry.clone();
-                                                tokio::spawn(async move {
-                                                    direct.closed().await;
-                                                    if let Some(entry) = registry
-                                                        .get(&subdomain)
-                                                        .map(|entry| Arc::clone(entry.value()))
-                                                    {
-                                                        if entry
-                                                            .direct_generation
-                                                            .load(Ordering::Acquire)
-                                                            == generation
-                                                        {
-                                                            *entry.direct.write().unwrap() = None;
-                                                            debug!(subdomain = %subdomain, generation, "vhost QUIC direct path closed; reverting to TCP");
-                                                        }
+                                                match entry.direct.install(direct.clone()) {
+                                                    Some(id) => {
+                                                        info!(subdomain = %subdomain, id, carriers = entry.direct.len(), "vhost QUIC direct carrier established");
+                                                        let registry = registry.clone();
+                                                        tokio::spawn(async move {
+                                                            direct.closed().await;
+                                                            if let Some(entry) = registry
+                                                                .get(&subdomain)
+                                                                .map(|entry| {
+                                                                    Arc::clone(entry.value())
+                                                                })
+                                                            {
+                                                                entry.direct.remove(id);
+                                                                debug!(subdomain = %subdomain, id, carriers = entry.direct.len(), "vhost QUIC direct carrier closed");
+                                                            }
+                                                        });
                                                     }
-                                                });
+                                                    None => {
+                                                        debug!(subdomain = %subdomain, "vhost QUIC direct pool full; dropping extra carrier");
+                                                        direct.close();
+                                                    }
+                                                }
                                             } else {
                                                 debug!(subdomain = %subdomain, "vhost QUIC connection arrived after provider deregistered");
                                             }
@@ -989,11 +986,12 @@ impl Server {
                                     trace!(%err, "failed to establish multiplexed stream");
                                     return;
                                 }
+                                let buf = proxy_buffer_size();
                                 let result = tokio::io::copy_bidirectional_with_sizes(
                                     &mut edge,
                                     &mut stream,
-                                    PROXY_BUFFER_SIZE,
-                                    PROXY_BUFFER_SIZE,
+                                    buf,
+                                    buf,
                                 )
                                 .await;
                                 if let Err(err) = result {

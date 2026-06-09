@@ -197,12 +197,24 @@ providers; a larger request is clamped, and `--max-carriers 1` disables the pool
 tunnel never breaks (it just runs with fewer carriers until the re-dial succeeds).
 Default `1` = unchanged behaviour.
 
-**The UDP direct path needs no `--carriers`.** When a secret tunnel runs over a
-direct hole-punched path (`--udp`), each proxied connection already rides its **own
-native QUIC stream**, which QUIC keeps independently loss-isolated — so there is no
-single-stream head-of-line blocking to fix. `--carriers` widens the relay; `--udp`
-fixes the direct path. They compose (the relay pool is used whenever a tunnel is on
-the relay fallback).
+**The UDP direct path needs no `--carriers` for secret tunnels and transfer.** When
+a secret tunnel runs over a direct hole-punched path (`--udp`), each proxied
+connection already rides its **own native QUIC stream**, which QUIC keeps
+independently loss-isolated — so there is no single-stream head-of-line blocking to
+fix. `--carriers` widens the relay; `--udp` fixes the direct path. They compose (the
+relay pool is used whenever a tunnel is on the relay fallback).
+
+**Exception — `bore vhost --udp`:** there `--carriers N` *also* sizes the QUIC
+direct path. The provider opens `N` parallel QUIC **connections** and the server
+pools them and round-robins requests, parallelizing per-connection crypto/congestion
+across cores (capped at 32 per subdomain, not by `--max-carriers`). As always, a
+single flow over one connection is not split — see `CARRIER_TUNING.md`.
+
+**Proxy copy buffer:** `BORE_PROXY_BUFFER_SIZE` (default 256 KiB; accepts a
+`KB`/`MB`/`GiB`/... suffix, clamped `[4 KiB, 16 MiB]`) sets the per-direction relay/
+splice buffer. Set it on the server (relay buffers) and/or a provider (local splice);
+a larger buffer helps high-latency, high-BDP links, not single-stream throughput on a
+fast LAN.
 
 For bulk transfers, the direct QUIC path is tuned in code with larger flow-control
 windows than Quinn's defaults: `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` (16 MiB),

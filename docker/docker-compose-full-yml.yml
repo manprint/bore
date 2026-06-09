@@ -64,7 +64,14 @@ services:
       - BORE_MIN_PORT=9000
       - BORE_MAX_PORT=9100
       - BORE_MAX_CONNS=1024
+      # Caps the TCP relay carrier pools (public / secret / vhost). Does NOT cap
+      # the vhost `--udp` QUIC direct pool (provider-driven, 32/subdomain limit).
       - BORE_MAX_CARRIERS=128
+      # Per-direction relay copy buffer (public/secret/vhost). Default 256KiB;
+      # KB/MB/GB/KiB/MiB/GiB suffix, clamped [4KiB,16MiB]. Memory ~= size x 2 x
+      # concurrent connections. Set the same value on provider processes for an
+      # end-to-end large buffer on high-latency links.
+      # - BORE_PROXY_BUFFER_SIZE=1MiB
 
       # Optional public domain advertised to clients for http(s):// endpoints.
       - BORE_BIND_DOMAIN=bore.example.com

@@ -12,6 +12,18 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
 ## [Unreleased]
 
 ### Added
+- **Tunable proxy copy buffer (`BORE_PROXY_BUFFER_SIZE`)**: the per-direction
+  relay/splice buffer is now configurable via env var (raw bytes or
+  `KB`/`MB`/`GB`/`KiB`/`MiB`/`GiB` suffix, clamped to `[4 KiB, 16 MiB]`) and the
+  default is raised from 64 KiB to **256 KiB**, tuned for large-file throughput on
+  high-BDP links. Honored by the server (relay-side buffers for public, secret,
+  and vhost paths) and by client/provider processes (local-service splice).
+- **Vhost multi-carrier QUIC direct path**: `bore vhost --udp --carriers N` now
+  opens `N` parallel QUIC connections; the server pools them and round-robins
+  proxied requests across them, parallelizing per-connection crypto/congestion
+  work across cores (previously the UDP direct path used a single QUIC connection
+  and ignored `--carriers`). The pool tops back up after a connection drops, and
+  is capped at 32 connections per subdomain.
 - **Git metadata in `--version`**: `bore --version` now prints
   `bore <version> - <branch> - <sha8>` (e.g. `bore 1.0.0 - main - a1b2c3d4`).
   Branch and commit SHA are embedded at compile time via `build.rs`. In CI

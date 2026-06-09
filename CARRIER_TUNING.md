@@ -10,8 +10,17 @@ That distinction matters:
 - Many simultaneous relay flows often improve, because each carrier gets its own
   TCP congestion window and loss domain instead of sharing one yamux-over-TCP
   connection.
-- Direct UDP / QUIC paths already use independent streams, so `--carriers`
-  affects only the relay path or relay fallback.
+- Direct UDP / QUIC paths already use independent streams per proxied connection,
+  so for **secret tunnels and transfer** `--carriers` affects only the relay path
+  or relay fallback.
+- **Exception — `bore vhost --udp`:** `--carriers N` also sizes the QUIC direct
+  path itself. The provider opens `N` parallel QUIC *connections* and the server
+  round-robins requests across them, so per-connection crypto/congestion work
+  parallelizes across cores. (Capped at 32 connections per subdomain.)
+
+> Orthogonal knob: `BORE_PROXY_BUFFER_SIZE` (default 256 KiB) sets the
+> per-direction copy buffer at each relay/splice hop — a memory/latency trade for
+> high-BDP links, not a concurrency knob. See `docs/VHOST.md`.
 
 ## Core rules
 
@@ -32,7 +41,7 @@ That distinction matters:
 | `bore local <port>` | `--carriers`, `BORE_CARRIERS` | `1` | `1` | same as `1` | server <-> local provider | Yes | Public tunnel mode |
 | `bore local <port> --tcp-secret-id <id>` | `--carriers`, `BORE_CARRIERS` | `1` | `1` | same as `1` | server <-> secret provider | Yes | Secret provider mode |
 | `bore proxy` | `--carriers`, `BORE_CARRIERS` | `1` | `1` | same as `1` | consumer <-> server | No | Client-side pool only |
-| `bore vhost` | `--carriers`, `BORE_CARRIERS` | `1` | `1` | same as `1` | server <-> vhost provider relay / fallback | Yes | If `--udp` is healthy, relay carriers are mostly idle |
+| `bore vhost` | `--carriers`, `BORE_CARRIERS` | `1` | `1` | same as `1` | server <-> vhost provider (TCP relay) | Yes (TCP only) | With `--udp`, **also** sizes the QUIC direct pool: `N` parallel QUIC connections (capped at 32/subdomain, not by `--max-carriers`) |
 | `bore transfer listener` | `--carriers`, `BORE_CARRIERS` | `0` | `min(max(cpu_cores, 4), 16)` | auto | server <-> listener/provider on relay fallback | Yes | Uses the listener CPU hint because it cannot see sender `--parallel` yet |
 | `bore transfer sender` | `--carriers`, `BORE_CARRIERS` | `0` | `min(resolve_parallel(--parallel), 16)` | auto | sender/consumer <-> server on relay fallback | No | Direct UDP ignores it |
 | `bore server` | `--max-carriers`, `BORE_MAX_CARRIERS` | `16` | `16` | `0` behaves like `1` after clamp | caps public / secret-provider / vhost-provider pools | n/a | Does not cap `bore proxy` |
@@ -59,8 +68,12 @@ When `N` grows from `1` to `N > 1`:
 What does not change:
 
 - one proxied connection still rides one carrier for its lifetime
-- a single bulk flow is not split across carriers
-- direct UDP / QUIC paths do not become faster because of `--carriers`
+- a single bulk flow is not split across carriers (a single large file over one
+  HTTP connection rides one carrier/QUIC stream regardless of `--carriers`)
+- for secret tunnels and transfer, direct UDP / QUIC paths do not become faster
+  because of `--carriers` (one QUIC stream per proxied connection already)
+- **vhost `--udp` differs:** more carriers add more QUIC *connections*, which does
+  raise aggregate throughput under concurrency — but still not for a lone flow
 
 The practical ceiling is usually:
 
@@ -144,25 +157,37 @@ For maximum performance:
 
 ### `bore vhost`
 
-`bore vhost` uses carriers on the TCP relay between the server and the provider.
-If `--udp` is not enabled, or if vhost UDP is unavailable, that relay path is the
-steady-state data path. If vhost UDP is healthy, the server opens native QUIC
-streams instead and the carrier pool becomes a fallback path.
+`bore vhost` carriers size the server↔provider data path. The transport depends on
+`--udp`:
+
+- **TCP relay (no `--udp`, or UDP unavailable):** `N` parallel TCP carrier
+  connections, server-capped by `--max-carriers`. Proxied browser connections are
+  round-robined across them.
+- **QUIC direct (`--udp` healthy):** the provider opens `N` parallel QUIC
+  *connections*; the server pools them and round-robins requests across them, so
+  per-connection AEAD/congestion work spreads across cores. The QUIC pool is **not**
+  capped by `--max-carriers` (it is provider-driven), only by a 32/subdomain limit.
+  The pool tops back up automatically after a connection drops. With `--udp`, `N`
+  TCP carriers are *also* opened as fallback insurance.
 
 Behavior by value:
 
-- `1`: single relay carrier.
-- `N > 1`: more server-to-provider relay carriers.
-- `> --max-carriers`: truncated by the server.
+- `1`: single connection (TCP relay, or one QUIC connection with `--udp`).
+- `N > 1`: `N` parallel connections on the active transport.
+- TCP relay only: `> --max-carriers` is truncated by the server. (The QUIC pool is
+  not affected by that cap.)
 
 For maximum performance:
 
-- Relay-only vhost: size carriers to the number of simultaneously busy browser
-  connections you expect the provider hop to carry.
-- Vhost `--udp`: prioritize the UDP path first; keep carriers above `1` only if
-  you want better fallback behavior during UDP loss, restart, or disabled-UDP periods.
-- Do not expect `--carriers` to improve the browser-to-server leg; it only widens
-  the server-to-provider relay leg.
+- Size `N` to the number of simultaneously busy browser connections the provider
+  hop carries; more than that adds overhead without gain.
+- A single large download/upload over one HTTP connection will not speed up — split
+  it across connections (`aria2c -x16`, ranged requests) or use `bore transfer
+  --parallel N` for native multi-stream file transfer.
+- `--carriers` never improves the browser↔server leg; it only widens the
+  server↔provider hop.
+- On a low-latency link, also consider `BORE_PROXY_BUFFER_SIZE`; on a high-latency
+  link it can smooth throughput.
 
 ### `bore transfer listener`
 
@@ -273,9 +298,13 @@ For maximum performance:
 
 ### Vhost
 
-- Stable vhost UDP: `--carriers` is mostly fallback insurance.
 - Relay-only vhost: size carriers for concurrent browser connections on the
-  server -> provider hop.
+  server → provider hop (server-capped by `--max-carriers`).
+- Vhost `--udp`: `--carriers N` opens `N` parallel QUIC connections (pooled,
+  round-robined, capped at 32/subdomain). Raise it for many concurrent browser
+  connections; it does not help a single flow.
+- Single large file either way: parallelize on the client, or use
+  `bore transfer --parallel N`.
 
 ## Operational caveats
 
@@ -287,13 +316,19 @@ For maximum performance:
   carriers if they drop; it is not governed by the server token/cap path.
 - Transfer auto is intentionally aligned with `DEFAULT_MAX_CARRIERS = 16`, so the
   auto request is not silently truncated by the server default.
+- The vhost QUIC direct pool is separate from the TCP carrier-token mechanism: the
+  provider dials its own QUIC connections (token-authenticated), the server pools
+  them (`vhost::DirectPool`), and `--max-carriers` does not apply — only the
+  32/subdomain `MAX_DIRECT_CARRIERS` cap.
 
 ## Tests and code paths worth reading
 
 - `tests/carrier_test.rs`: public tunnel carrier pool behavior and server cap
 - `tests/secret_pool_test.rs`: secret provider pool, secret consumer pool, relay vs direct behavior
 - `tests/transfer_test.rs`: `transfer_auto_carriers_over_relay`
-- `src/pool.rs`: round-robin carrier pool implementation
+- `tests/vhost_test.rs`: `vhost_udp_multi_carrier_pool` (QUIC direct pool fills to `--carriers`)
+- `src/pool.rs`: round-robin TCP carrier pool implementation
+- `src/vhost.rs`: `DirectPool` round-robin QUIC direct pool (vhost `--udp`)
 - `src/transfer.rs`: auto carrier resolution for transfer
 - `src/secret.rs`: consumer-side relay carrier pool behavior
-- `src/server.rs`: server-side clamp and token issuance
+- `src/server.rs`: server-side clamp, token issuance, and QUIC pool install/remove

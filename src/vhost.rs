@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 #[cfg(feature = "udp")]
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ use crate::edge;
 use crate::mux;
 use crate::pool::{CarrierPool, PendingCarriers, TokenGuard};
 use crate::shared::{
-    ClientMessage, Delimited, ServerMessage, UdpDirectTuning, NETWORK_TIMEOUT, PROXY_BUFFER_SIZE,
+    proxy_buffer_size, ClientMessage, Delimited, ServerMessage, UdpDirectTuning, NETWORK_TIMEOUT,
     UDP_NONCE_LEN,
 };
 use crate::transport;
@@ -231,8 +231,7 @@ pub fn resolve_route(cfg: &VhostConfig, subdomain: &str, client_id: &str) -> Rou
         None => {
             // Unreserved: accept with default headers only.
             let request_headers = merge_headers(&cfg.default_headers, &BTreeMap::new());
-            let response_headers =
-                merge_headers(&cfg.default_response_headers, &BTreeMap::new());
+            let response_headers = merge_headers(&cfg.default_response_headers, &BTreeMap::new());
             RouteDecision::Accept {
                 request_headers,
                 response_headers,
@@ -342,16 +341,84 @@ pub struct VhostEntry {
     pub request_headers: Vec<(String, String)>,
     /// Resolved header list to inject on the first response head (may be empty).
     pub response_headers: Vec<(String, String)>,
-    /// Live QUIC direct connection to the provider, when one is established.
+    /// Pool of live QUIC direct connections to the provider. Empty until at least
+    /// one is established; a provider with `--carriers N --udp` fills it with up to
+    /// `N` connections so proxied requests spread across them (per-connection
+    /// crypto/congestion parallelism), exactly as the TCP carrier pool does.
     #[cfg(feature = "udp")]
-    pub direct: std::sync::RwLock<Option<crate::holepunch::DirectConn>>,
-    /// Monotonic generation used to clear `direct` only for the connection that
-    /// originally installed it, so an old closed-monitor never stomps a newer one.
-    #[cfg(feature = "udp")]
-    pub direct_generation: AtomicU64,
+    pub direct: DirectPool,
     /// Number of proxied requests that successfully opened a direct QUIC stream.
     #[cfg(feature = "udp")]
     pub direct_stream_opens: AtomicU64,
+}
+
+/// Upper bound on QUIC direct connections pooled per vhost subdomain. The provider
+/// is authenticated (token derived from the tunnel secret), so this only guards
+/// against an accidental connection storm, not an untrusted peer.
+#[cfg(feature = "udp")]
+const MAX_DIRECT_CARRIERS: usize = 32;
+
+/// Round-robin pool of live QUIC direct connections to one vhost provider.
+///
+/// The UDP analog of [`CarrierPool`]: each member is an independent QUIC
+/// connection, and proxied requests are spread across them so per-connection AEAD
+/// and congestion-control work parallelizes across cores instead of funneling
+/// through a single connection. Members are added on connect and removed when
+/// their QUIC connection closes (keyed by a monotonic id so a stale close-monitor
+/// never evicts a newer member).
+#[cfg(feature = "udp")]
+#[derive(Default)]
+pub struct DirectPool {
+    conns: RwLock<Vec<DirectMember>>,
+    next: AtomicU64,
+    ids: AtomicU64,
+}
+
+#[cfg(feature = "udp")]
+struct DirectMember {
+    id: u64,
+    conn: crate::holepunch::DirectConn,
+}
+
+#[cfg(feature = "udp")]
+impl DirectPool {
+    /// Install a connection, returning its id (used by [`DirectPool::remove`] when
+    /// the connection closes). Returns `None` when the pool is already full, so the
+    /// caller can drop the excess connection.
+    pub fn install(&self, conn: crate::holepunch::DirectConn) -> Option<u64> {
+        let mut conns = self.conns.write().unwrap();
+        if conns.len() >= MAX_DIRECT_CARRIERS {
+            return None;
+        }
+        let id = self.ids.fetch_add(1, Ordering::Relaxed);
+        conns.push(DirectMember { id, conn });
+        Some(id)
+    }
+
+    /// Remove the connection with `id`, if still present.
+    pub fn remove(&self, id: u64) {
+        self.conns.write().unwrap().retain(|m| m.id != id);
+    }
+
+    /// Pick the next connection round-robin, or `None` when the pool is empty.
+    pub fn pick(&self) -> Option<crate::holepunch::DirectConn> {
+        let conns = self.conns.read().unwrap();
+        if conns.is_empty() {
+            return None;
+        }
+        let idx = (self.next.fetch_add(1, Ordering::Relaxed) % conns.len() as u64) as usize;
+        Some(conns[idx].conn.clone())
+    }
+
+    /// Number of live pooled connections.
+    pub fn len(&self) -> usize {
+        self.conns.read().unwrap().len()
+    }
+
+    /// Whether the pool currently has no live connections.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Registry of live vhost providers, keyed by subdomain label.
@@ -473,9 +540,7 @@ pub async fn serve_vhost_provider(
                 request_headers,
                 response_headers,
                 #[cfg(feature = "udp")]
-                direct: std::sync::RwLock::new(None),
-                #[cfg(feature = "udp")]
-                direct_generation: AtomicU64::new(0),
+                direct: DirectPool::default(),
                 #[cfg(feature = "udp")]
                 direct_stream_opens: AtomicU64::new(0),
             });
@@ -629,9 +694,10 @@ pub async fn relay_vhost(
         #[cfg(feature = "udp")]
         {
             // In vhost UDP the server opens the QUIC streams and the provider
-            // accepts them. If the direct connection is down or opening a stream
-            // fails, fall back per-request to the existing TCP carrier pool.
-            let direct = entry.direct.read().unwrap().clone();
+            // accepts them. Pick a direct connection round-robin from the pool; if
+            // none is live or opening a stream fails, fall back per-request to the
+            // existing TCP carrier pool.
+            let direct = entry.direct.pick();
             match direct {
                 Some(direct) => match direct.open_stream().await {
                     Ok(stream) => {
@@ -670,13 +736,8 @@ pub async fn relay_vhost(
     provider.write_all(&request_head).await?;
 
     if entry.response_headers.is_empty() {
-        tokio::io::copy_bidirectional_with_sizes(
-            &mut public,
-            &mut provider,
-            PROXY_BUFFER_SIZE,
-            PROXY_BUFFER_SIZE,
-        )
-        .await?;
+        let buf = proxy_buffer_size();
+        tokio::io::copy_bidirectional_with_sizes(&mut public, &mut provider, buf, buf).await?;
         return Ok(());
     }
 
@@ -692,9 +753,8 @@ async fn relay_response_injected(
     let (mut public_read, mut public_write) = tokio::io::split(public);
     let (mut provider_read, mut provider_write) = tokio::io::split(provider);
 
-    let forward_request = async {
-        copy_one_direction_with_shutdown(&mut public_read, &mut provider_write).await
-    };
+    let forward_request =
+        async { copy_one_direction_with_shutdown(&mut public_read, &mut provider_write).await };
 
     let forward_response = async {
         let response_head = read_head_async(&mut provider_read).await?;
@@ -714,7 +774,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; PROXY_BUFFER_SIZE];
+    let mut buf = vec![0u8; proxy_buffer_size()];
     loop {
         let read = reader.read(&mut buf).await?;
         if read == 0 {

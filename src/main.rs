@@ -310,12 +310,20 @@ enum Command {
         )]
         basic_auth: Option<String>,
 
-        /// Number of parallel TCP carrier connections for the relay data path.
+        /// Number of parallel carrier connections for the data path. Spreads
+        /// proxied connections across N transports so per-connection congestion
+        /// (and yamux head-of-line) is isolated. Sizes the TCP relay carrier pool
+        /// (capped by `bore server --max-carriers`); with `--udp` it ALSO sets how
+        /// many parallel QUIC direct connections the provider opens. Only helps
+        /// when many connections run concurrently — a single transfer rides one
+        /// connection regardless.
         #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
         carriers: u16,
 
         /// Prefer a direct QUIC data path for the server→provider vhost hop;
-        /// falls back to the TCP carrier relay if UDP is unavailable.
+        /// falls back to the TCP carrier relay if UDP is unavailable. With
+        /// `--carriers N` the provider opens N parallel QUIC connections and the
+        /// server round-robins proxied requests across them.
         #[clap(long, env = "BORE_VHOST_UDP")]
         udp: bool,
 

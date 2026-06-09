@@ -89,11 +89,21 @@ services:
       # file descriptors (`ulimits.nofile`). It does NOT increase direct UDP
       # bandwidth: successful UDP direct data bypasses the server.
       - BORE_MAX_CONNS=1024
-      # Cap on parallel TCP "carrier" connections for public tunnels and secret
-      # providers using --carriers. Helps concurrent relay workloads, not single
-      # bulk flows, and has no effect on the UDP direct data path. Higher values
-      # mean more sockets and scheduler work; 1 disables server-side pools.
+      # Cap on parallel TCP "carrier" connections for public tunnels and secret/
+      # vhost providers using --carriers. Helps concurrent relay workloads, not
+      # single bulk flows. Higher values mean more sockets and scheduler work; 1
+      # disables server-side pools. NOTE: this caps only the TCP relay pools — the
+      # vhost `--udp` QUIC direct pool is provider-driven and bounded separately
+      # (32 connections per subdomain), not by this value.
       - BORE_MAX_CARRIERS=16
+      # Per-direction proxy copy buffer for the relay/splice data path (public,
+      # secret, and vhost). Default 256KiB, tuned for large files on high-latency
+      # links; accepts a KB/MB/GB/KiB/MiB/GiB suffix, clamped to [4KiB, 16MiB].
+      # Memory cost ~= size x 2 directions x concurrent connections. It does NOT
+      # raise single-stream throughput on a low-latency link. The same var is read
+      # by client/provider processes for their local splice (see the client
+      # compose). Uncomment to override the 256KiB default.
+      # - BORE_PROXY_BUFFER_SIZE=1MiB
       # Direct-UDP tuning defaults (match src/shared.rs; override here if you
       # want to change the brokered QUIC and socket profile on the server).
       - BORE_UDP_STREAM_RECEIVE_WINDOW=16MiB

@@ -59,13 +59,21 @@ services:
       # - BORE_VHOST_UDP=true
       # Label this tunnel on the server's admin status page:
       # - BORE_NOTES=dev box A
-      # Open N parallel TCP carrier connections for the relay data path and spread
-      # proxied connections across them (round-robin), avoiding yamux's single-
-      # connection head-of-line blocking under concurrency (e.g. parallel rclone/S3
-      # transfers, many web requests). Works for a public tunnel (server->client leg)
-      # and a secret provider (server->provider leg). 1 = single connection. The
-      # server clamps this to its BORE_MAX_CARRIERS. (The UDP direct path already
-      # uses independent native QUIC streams, so it needs no carriers.)
+      # Open N parallel carrier connections for the data path and spread proxied
+      # connections across them (round-robin), avoiding yamux's single-connection
+      # head-of-line blocking under concurrency (e.g. parallel rclone/S3 transfers,
+      # many web requests). Works for a public tunnel (server->client leg) and a
+      # secret provider (server->provider leg); the server clamps it to
+      # BORE_MAX_CARRIERS. 1 = single connection.
+      # For `bore vhost --udp` it ALSO sizes the QUIC direct path: N parallel QUIC
+      # connections, pooled and round-robined by the server (capped at 32/subdomain,
+      # NOT by BORE_MAX_CARRIERS). For secret/transfer the UDP direct path already
+      # uses independent native QUIC streams, so carriers apply only to the relay.
+      # A single bulk flow rides one connection regardless of N.
       # - BORE_CARRIERS=4
+      # Per-direction copy buffer for this provider's local-service splice. Default
+      # 256KiB; KB/MB/GB/KiB/MiB/GiB suffix, clamped [4KiB,16MiB]. Match the server's
+      # BORE_PROXY_BUFFER_SIZE for an end-to-end large buffer on high-latency links.
+      # - BORE_PROXY_BUFFER_SIZE=1MiB
       # Accept a self-signed server certificate for an https:// control address:
       # - BORE_INSECURE=true

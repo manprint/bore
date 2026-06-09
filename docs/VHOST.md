@@ -338,15 +338,53 @@ direct-UDP modes. Use `https://...` control and a shared `--secret` in productio
 
 ---
 
-## Throughput: `--carriers`
+## Throughput: `--carriers`, `--udp`, and buffers
 
-The relay data path multiplexes every proxied connection over the provider's bore tunnel.
-With the default `--carriers 1`, all concurrent requests share a single TCP connection's
-congestion window and are subject to yamux head-of-line blocking. For high-throughput or
-highly-concurrent workloads, raise `--carriers N` on `bore vhost`: proxied connections are
-spread round-robin across `N` parallel TCP carriers (capped by the server's
-`--max-carriers`), isolating congestion windows and removing HOL blocking. `1` preserves
-the single-connection path byte-for-byte.
+The data path multiplexes every proxied connection over the provider's tunnel.
+With the default `--carriers 1`, all concurrent requests share a single TCP
+connection's congestion window and are subject to yamux head-of-line blocking.
+Raise `--carriers N` on `bore vhost` to spread proxied connections round-robin
+across `N` parallel carriers, isolating congestion windows and removing HOL
+blocking. `1` preserves the single-connection path byte-for-byte.
+
+`--carriers` sizes **both** transports:
+
+- **TCP relay:** `N` parallel TCP carrier connections, capped by the server's
+  `--max-carriers`.
+- **`--udp` direct path:** the provider opens `N` parallel **QUIC connections**;
+  the server pools them and round-robins proxied requests across them, so
+  per-connection AEAD/congestion work parallelizes across cores instead of
+  funneling through a single QUIC connection (capped at 32 per subdomain).
+
+> **One transfer = one connection.** Carriers parallelize *across* concurrent
+> proxied connections, never *within* one. A single large file fetched over a
+> single HTTP connection rides exactly one carrier/QUIC stream and is bounded by
+> single-stream throughput no matter how high `--carriers` is. To saturate a link
+> with one file, split it across many connections (e.g. `aria2c -x16`, ranged
+> requests) — or use `bore transfer --parallel N` for native multi-stream file
+> transfer.
+
+### Proxy copy buffer: `BORE_PROXY_BUFFER_SIZE`
+
+Each relay hop copies bytes through a per-direction buffer (default **256 KiB**,
+tuned for large files on high-latency links). Override it with the
+`BORE_PROXY_BUFFER_SIZE` environment variable (raw bytes or a
+`KB`/`MB`/`GB`/`KiB`/`MiB`/`GiB` suffix), clamped to `[4 KiB, 16 MiB]`:
+
+- Set it on the **server** to size the relay-side buffers (server↔provider and
+  server↔visitor copies, shared with public and secret tunnels).
+- Set it on the **`bore vhost` provider** to size that side's local-service splice.
+
+```bash
+# server: 1 MiB relay buffers
+BORE_PROXY_BUFFER_SIZE=1MiB bore server --vhost-base-domain bore.example.com ...
+# provider: match it for the local splice
+BORE_PROXY_BUFFER_SIZE=1MiB bore vhost 127.0.0.1:8383 --subdomain upload --id up-1 ...
+```
+
+A larger buffer trades memory (≈ `size × 2 directions × concurrent connections`)
+for fewer wakeups on high-throughput, high-latency paths. It does **not** raise
+single-stream throughput on a low-latency link — see the one-transfer note above.
 
 ---
 

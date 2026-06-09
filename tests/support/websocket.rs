@@ -44,17 +44,26 @@ where
     let binary: Vec<u8> = (0..200u16).map(|n| (n % 251) as u8).collect();
     write_frame(stream, 0x2, &binary, true).await?;
     let (opcode, payload) = read_frame(stream).await?;
-    ensure!(opcode == 0x2, "expected binary echo, got opcode {opcode:#x}");
+    ensure!(
+        opcode == 0x2,
+        "expected binary echo, got opcode {opcode:#x}"
+    );
     ensure!(payload == binary, "binary frame payload mismatch");
 
     write_frame(stream, PING_OPCODE, b"ping", true).await?;
     let (opcode, payload) = read_frame(stream).await?;
-    ensure!(opcode == PONG_OPCODE, "expected pong, got opcode {opcode:#x}");
+    ensure!(
+        opcode == PONG_OPCODE,
+        "expected pong, got opcode {opcode:#x}"
+    );
     ensure!(payload == b"ping", "pong payload mismatch");
 
     write_frame(stream, CLOSE_OPCODE, &[], true).await?;
     let (opcode, _) = read_frame(stream).await?;
-    ensure!(opcode == CLOSE_OPCODE, "expected close echo, got opcode {opcode:#x}");
+    ensure!(
+        opcode == CLOSE_OPCODE,
+        "expected close echo, got opcode {opcode:#x}"
+    );
     Ok(())
 }
 
@@ -138,7 +147,10 @@ where
         if buf[scan_from..].windows(4).any(|w| w == b"\r\n\r\n") {
             return Ok(buf);
         }
-        ensure!(buf.len() < MAX_HTTP_HEAD, "websocket HTTP head exceeded {MAX_HTTP_HEAD} bytes");
+        ensure!(
+            buf.len() < MAX_HTTP_HEAD,
+            "websocket HTTP head exceeded {MAX_HTTP_HEAD} bytes"
+        );
     }
     bail!("unexpected EOF while reading websocket HTTP head")
 }
@@ -182,7 +194,10 @@ where
             let mut buf = [0u8; 8];
             stream.read_exact(&mut buf).await?;
             let len = u64::from_be_bytes(buf);
-            ensure!(len <= usize::MAX as u64, "frame too large for this platform");
+            ensure!(
+                len <= usize::MAX as u64,
+                "frame too large for this platform"
+            );
             Ok(len as usize)
         }
         _ => unreachable!("payload length is masked to 7 bits"),

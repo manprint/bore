@@ -1,6 +1,7 @@
 //! Shared data structures, utilities, and protocol definitions.
 
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -28,12 +29,82 @@ pub const MAX_FRAME_LENGTH: usize = 1024;
 /// authentication token is derived from this nonce and the tunnel secret.
 pub const UDP_NONCE_LEN: usize = 16;
 
-/// Per-direction buffer size used when proxying data between two TCP streams.
+/// Default per-direction buffer used when proxying data between two streams.
 ///
-/// Larger than Tokio's 8 KiB default to improve throughput on connections with a
-/// high bandwidth-delay product, at a modest, bounded memory cost per proxied
-/// connection.
-pub const PROXY_BUFFER_SIZE: usize = 64 * 1024;
+/// 256 KiB is tuned for large-file throughput on high bandwidth-delay-product
+/// links (far above Tokio's 8 KiB default), while keeping per-connection memory
+/// bounded. Override at runtime with [`proxy_buffer_size`].
+pub const DEFAULT_PROXY_BUFFER_SIZE: usize = 256 * 1024;
+
+/// Lower clamp for the resolved proxy buffer size (a tiny buffer would throttle
+/// throughput and is almost never intended).
+const MIN_PROXY_BUFFER_SIZE: usize = 4 * 1024;
+
+/// Upper clamp for the resolved proxy buffer size. Bounds the worst-case memory
+/// an operator can request per proxied direction.
+const MAX_PROXY_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+
+/// Per-direction buffer size used when proxying data between two streams.
+///
+/// Honors the `BORE_PROXY_BUFFER_SIZE` environment variable (raw bytes or a
+/// `KB`/`MB`/`GB`/`KiB`/`MiB`/`GiB` suffix), clamped to
+/// `[4 KiB, 16 MiB]`; defaults to [`DEFAULT_PROXY_BUFFER_SIZE`] when unset or
+/// unparseable. Resolved once and cached for the process lifetime.
+///
+/// Set it on the **server** to size the relay-side copy buffers (public tunnel,
+/// secret relay, and vhost), and on a **client/provider** process (`bore local`,
+/// `bore proxy`, `bore vhost`) to size that side's local splice. A larger buffer
+/// trades memory for fewer wakeups on high-throughput, high-latency links.
+pub fn proxy_buffer_size() -> usize {
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| match std::env::var("BORE_PROXY_BUFFER_SIZE") {
+        Ok(raw) => match parse_size_bytes(&raw) {
+            Some(bytes) => {
+                let resolved = (bytes as usize).clamp(MIN_PROXY_BUFFER_SIZE, MAX_PROXY_BUFFER_SIZE);
+                trace!(
+                    requested = bytes,
+                    resolved,
+                    "proxy buffer size set via BORE_PROXY_BUFFER_SIZE"
+                );
+                resolved
+            }
+            None => {
+                trace!(
+                    value = %raw,
+                    "ignoring unparseable BORE_PROXY_BUFFER_SIZE; using default"
+                );
+                DEFAULT_PROXY_BUFFER_SIZE
+            }
+        },
+        Err(_) => DEFAULT_PROXY_BUFFER_SIZE,
+    })
+}
+
+/// Parse a byte size with an optional unit suffix (`B`/`KB`/`MB`/`GB` decimal,
+/// `KiB`/`MiB`/`GiB` binary). Returns `None` for empty, non-numeric, or
+/// overflowing input. Shared shape with the server's `--udp-*` size parsing.
+fn parse_size_bytes(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let split_at = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (number, suffix) = trimmed.split_at(split_at);
+    let bytes: u64 = number.parse().ok()?;
+    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1_000,
+        "m" | "mb" => 1_000_000,
+        "g" | "gb" => 1_000_000_000,
+        "ki" | "kib" => 1024,
+        "mi" | "mib" => 1024 * 1024,
+        "gi" | "gib" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    bytes.checked_mul(multiplier)
+}
 
 /// Timeout for network connections and initial protocol messages.
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);

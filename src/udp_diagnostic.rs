@@ -36,9 +36,9 @@ use crate::mux;
 #[cfg(feature = "udp")]
 use crate::shared::UdpAdaptiveMode;
 use crate::shared::{
-    ClientMessage, Delimited, ServerMessage, UdpAdaptiveCandidateKind, UdpAdaptivePlan,
-    UdpCandidateKind, UdpDirectTuning, UdpTestOptions, UdpTestPeerSummary, UdpTestRole,
-    PROXY_BUFFER_SIZE, UDP_NONCE_LEN,
+    proxy_buffer_size, ClientMessage, Delimited, ServerMessage, UdpAdaptiveCandidateKind,
+    UdpAdaptivePlan, UdpCandidateKind, UdpDirectTuning, UdpTestOptions, UdpTestPeerSummary,
+    UdpTestRole, UDP_NONCE_LEN,
 };
 use crate::transport::{self, Endpoint};
 const LATENCY_SAMPLES: u16 = 8;
@@ -232,13 +232,10 @@ async fn relay_loop(
                     if target.write_all(&[mux::STREAM_READY]).await.is_err() {
                         return;
                     }
-                    let _ = tokio::io::copy_bidirectional_with_sizes(
-                        &mut source,
-                        &mut target,
-                        PROXY_BUFFER_SIZE,
-                        PROXY_BUFFER_SIZE,
-                    )
-                    .await;
+                    let buf = proxy_buffer_size();
+                    let _ =
+                        tokio::io::copy_bidirectional_with_sizes(&mut source, &mut target, buf, buf)
+                            .await;
                 });
             }
         }

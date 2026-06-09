@@ -35,8 +35,8 @@ use crate::mux;
 use crate::pool::{self, Carrier, CarrierPool, PendingCarriers, TokenGuard};
 use crate::reconnect;
 use crate::shared::{
-    tune_tcp, ClientMessage, Delimited, ServerMessage, UdpCandidateOffer, UdpDirectTuning,
-    PROXY_BUFFER_SIZE, UDP_NONCE_LEN,
+    proxy_buffer_size, tune_tcp, ClientMessage, Delimited, ServerMessage, UdpCandidateOffer,
+    UdpDirectTuning, UDP_NONCE_LEN,
 };
 use crate::transport::{self, Endpoint};
 use uuid::Uuid;
@@ -517,13 +517,8 @@ async fn relay(mut consumer: mux::Stream, registry: Registry, id: &str) -> Resul
     let mut provider = opener.open().await.context("provider unavailable")?;
     provider.write_all(&[mux::STREAM_READY]).await?;
 
-    tokio::io::copy_bidirectional_with_sizes(
-        &mut consumer,
-        &mut provider,
-        PROXY_BUFFER_SIZE,
-        PROXY_BUFFER_SIZE,
-    )
-    .await?;
+    let buf = proxy_buffer_size();
+    tokio::io::copy_bidirectional_with_sizes(&mut consumer, &mut provider, buf, buf).await?;
     Ok(())
 }
 
@@ -1641,13 +1636,8 @@ async fn forward(mut local: TcpStream, opener: StreamOpener) -> Result<()> {
     // peer sees the stream promptly (a fresh QUIC stream is silent until flushed).
     stream.write_all(&[mux::STREAM_READY]).await?;
     stream.flush().await?;
-    tokio::io::copy_bidirectional_with_sizes(
-        &mut local,
-        &mut stream,
-        PROXY_BUFFER_SIZE,
-        PROXY_BUFFER_SIZE,
-    )
-    .await?;
+    let buf = proxy_buffer_size();
+    tokio::io::copy_bidirectional_with_sizes(&mut local, &mut stream, buf, buf).await?;
     Ok(())
 }
 

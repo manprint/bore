@@ -91,7 +91,7 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     b"unauthorized",
                     control_hsts,
                 )
-                    .await;
+                .await;
             }
             let view = StatusView {
                 server,

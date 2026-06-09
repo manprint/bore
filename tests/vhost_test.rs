@@ -216,7 +216,7 @@ async fn wait_for_vhost_direct(registry: &VhostRegistry, subdomain: &str, expect
     loop {
         let is_direct = registry
             .get(subdomain)
-            .map(|entry| entry.direct.read().unwrap().is_some())
+            .map(|entry| !entry.direct.is_empty())
             .unwrap_or(false);
         if is_direct == expected {
             return;
@@ -236,6 +236,26 @@ fn direct_stream_opens(registry: &VhostRegistry, subdomain: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Wait until the QUIC direct pool for `subdomain` has at least `expected` live
+/// carriers (used by the multi-carrier test).
+#[cfg(feature = "udp")]
+async fn wait_for_vhost_direct_count(registry: &VhostRegistry, subdomain: &str, expected: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let count = registry
+            .get(subdomain)
+            .map(|entry| entry.direct.len())
+            .unwrap_or(0);
+        if count >= expected {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for {expected} direct carriers on {subdomain}, have {count}");
+        }
+        time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[cfg(feature = "udp")]
 fn close_vhost_direct(registry: &VhostRegistry, subdomain: &str) {
     let entry = registry
@@ -243,9 +263,7 @@ fn close_vhost_direct(registry: &VhostRegistry, subdomain: &str) {
         .unwrap_or_else(|| panic!("missing vhost entry for {subdomain}"));
     let direct = entry
         .direct
-        .read()
-        .unwrap()
-        .clone()
+        .pick()
         .unwrap_or_else(|| panic!("missing direct connection for {subdomain}"));
     direct.close();
 }
@@ -698,7 +716,9 @@ async fn vhost_header_injection() -> Result<()> {
         "X-Default: d1 (the default value) must not appear: {request_text}"
     );
     assert!(
-        response.to_lowercase().contains("x-frame-options: sameorigin"),
+        response
+            .to_lowercase()
+            .contains("x-frame-options: sameorigin"),
         "response header override must be present: {response}"
     );
     assert!(
@@ -1749,6 +1769,62 @@ async fn vhost_udp_direct_get_and_post() -> Result<()> {
 
 #[cfg(feature = "udp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_udp_multi_carrier_pool() -> Result<()> {
+    const CTRL: u16 = 18010;
+    const HTTP: u16 = 18011;
+    const QUIC: u16 = 18012;
+
+    let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let stub_port = spawn_body_capturing_stub(Arc::clone(&captured)).await;
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, Some("vhost-udp-secret"));
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(true);
+    server.set_vhost(http_config("bore.local", HTTP))?;
+    server.set_vhost_quic_port(QUIC);
+    let registry = server.vhost_registry();
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTP, true).await;
+
+    // Request 3 QUIC direct carriers: the provider opens that many independent
+    // QUIC connections and the server pools them for round-robin relaying.
+    let carriers = 3u16;
+    let client = Client::new_vhost_provider_with_udp(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "multiudp",
+        "client1",
+        Some("vhost-udp-secret"),
+        false,
+        carriers,
+        true,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+
+    // The direct pool fills to the requested carrier count.
+    wait_for_vhost_direct_count(&registry, "multiudp", carriers as usize).await;
+
+    // Traffic still routes correctly over the pooled direct path.
+    let response = send_http(HTTP, "multiudp.bore.local", "/").await?;
+    assert!(
+        response.contains("ok"),
+        "expected GET response over the multi-carrier direct path: {response}"
+    );
+    assert!(
+        direct_stream_opens(&registry, "multiudp") >= 1,
+        "expected the GET to open a direct stream"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vhost_udp_falls_back_when_server_udp_disabled() -> Result<()> {
     const CTRL: u16 = 17983;
     const HTTP: u16 = 17984;
@@ -1788,13 +1864,7 @@ async fn vhost_udp_falls_back_when_server_udp_disabled() -> Result<()> {
         "fallback relay response missing: {response}"
     );
     assert!(
-        !registry
-            .get("relayapp")
-            .unwrap()
-            .direct
-            .read()
-            .unwrap()
-            .is_some(),
+        registry.get("relayapp").unwrap().direct.is_empty(),
         "server with udp disabled must not establish a direct path"
     );
     assert_eq!(

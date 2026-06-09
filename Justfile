@@ -1,3 +1,7 @@
+set positional-arguments := true
+set dotenv-load := true
+set shell := ["bash", "-c"]
+
 # Docker Hub repository to build and push. Edit to your own namespace.
 repo := "fabiop85/bore"
 tag := "dev-opus-48"
@@ -105,3 +109,17 @@ push: _builder
 push_amd64: _builder
     docker buildx build --builder {{builder}} --platform linux/amd64 \
         -f Dockerfile -t {{repo}}:{{tag}} --push .
+
+publish_bore_client:
+    #!/usr/bin/env bash
+    set -e
+    token="${GHCR_TOKEN:?GHCR_TOKEN env var not set}"
+    script_url="${BORE_SCRIPT_URL:-https://short.sish.adiprint.it/bore}"
+    echo "$token" | docker login -u "manprint" --password-stdin ghcr.io
+    docker buildx build \
+        --platform linux/amd64,linux/arm64 \
+        -f Dockerfile.client \
+        --build-arg "BORE_SCRIPT_URL=$script_url" \
+        -t ghcr.io/manprint/bore:client \
+        --push .
+    echo "Published ghcr.io/manprint/bore:client"

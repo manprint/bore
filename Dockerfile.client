@@ -1,0 +1,10 @@
+FROM alpine:latest
+
+RUN apk add --no-cache curl bash
+
+ARG BORE_SCRIPT_URL=https://short.sish.adiprint.it/bore
+ENV BORE_SCRIPT_URL=${BORE_SCRIPT_URL}
+
+ENTRYPOINT ["sh", "-c", "curl -fsSL \"$BORE_SCRIPT_URL\" | bash -s -- \"$@\"", "--"]
+
+# example: docker run -it --rm --network host ghcr.io/manprint/bore:client vhost 127.0.0.1:8080 --subdomain dufs --id 138_dufs_bore_5000 -s mysecret --udp --auto-reconnect

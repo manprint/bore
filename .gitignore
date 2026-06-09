@@ -6,3 +6,4 @@ CONTEXT.md
 features/
 refactorys/
 bugs/
+.env

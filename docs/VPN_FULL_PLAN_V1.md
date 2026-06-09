@@ -561,6 +561,8 @@ connect_closure, vpn::run_listen|run_connect)`.
 - **Acceptance:** gates green; no change to secret-tunnel tests.
 
 ### Phase 5 — TUN + `NetConfig` (root-gated) (`vpn::hostcfg`)
+> **Read §11.9 (B) before starting.** Root/netns tests: ask the user (dev machine,
+> sudo available) — never skip or fake a root-gated test.
 - **5.1** TUN bring-up (name/addr/mtu/up), preflight cap/binary checks, stale reclaim.
 - **5.2** `NetConfig` apply/revert running argv from `hostcfg_cmd`; signal handler;
   `--no-route-manage` printing.
@@ -575,6 +577,8 @@ connect_closure, vpn::run_listen|run_connect)`.
   (asserted in §13).
 
 ### Phase 6 — Data-plane bridge (`vpn::bridge`, `vpn::link`)
+> **Read §11.9 (A, B, C) before starting.** Record the 6.1 `iperf3` baseline before
+> touching 6.2; the §11.9-A unworkable criteria are binding.
 - **6.1** `VpnLink` (Direct datagrams + Relay AEAD frames) backed by single-packet tun
   I/O; uplink/downlink tasks; `closed()` handling; relay fallback + reconnect (reuse
   secret-tunnel renegotiation). Get `ping` working in netns.
@@ -620,6 +624,65 @@ connect_closure, vpn::run_listen|run_connect)`.
 - **8.4** Update `CLAUDE.md` ("what this is" + new invariants: HelloVpn-before-auth,
   relay-is-AEAD-opaque, NetConfig-reverts-on-exit, tun MTU clamp).
 - **Acceptance:** docs build/read cleanly; every test bullet above exists and passes.
+
+### §11.9 Implementer alerts — known risk zones (MANDATORY reading before Phases 5–6)
+
+These are the three places where implementations of this plan are most likely to go
+wrong. Read them before starting the corresponding phase; they override your instincts.
+
+**A. Phase 6.2 (GSO/GRO offload) — the hardest part of the whole plan.**
+The `tun-rs` offload API (`IFF_VNET_HDR`, `virtio_net_hdr`, multi-packet read/write)
+is sparsely documented and may not match this plan's assumptions.
+- **The failure mode to avoid:** producing code that *compiles and seems to run* but
+  mis-segments or mis-coalesces. Compiling is not working. Do not "adapt creatively"
+  around an API that doesn't fit — that is exactly the "unworkable" case.
+- **Concrete unworkable criteria** (any one of these → stop, fall back to 6.1, record
+  the decision in the code and in `docs/VPN.md`, move offload to §V2):
+  1. The crate cannot enable `IFF_VNET_HDR` + expose the `virtio_net_hdr` per buffer.
+  2. After **2 focused attempts**, the segmentation/coalescing unit tests still fail.
+  3. The netns `iperf3` run shows **no measurable improvement** over the 6.1 baseline.
+- **Insist on in tests:** measure and record the 6.1 `iperf3` baseline **before**
+  starting 6.2 (you cannot prove improvement without it). Segmentation output must be
+  byte-exact: reassembling the segments must reproduce the original super-buffer, and
+  every segment must be ≤ `max_datagram_size()`. Coalescing must be verified against
+  the single-packet path (same input packets → same bytes delivered to the tun).
+- **Verify explicitly:** `virtio_net_hdr` checksum semantics (`NEEDS_CSUM` flag) —
+  packets read from the tun with offloaded (incomplete) checksums must not be sent to
+  the peer as-is unless the receiving side's write path handles it; if unclear, disable
+  checksum offload and keep only GSO/GRO.
+
+**B. netns test debugging (Phases 5–6) — do not iterate blindly.**
+When a ping doesn't pass in the netns harness, the cause space is layered (interface?
+route? nft? forwarding? MTU? punch? crypto?). Random code changes to "see if it fixes"
+burn iterations and mask the real cause. **Follow this checklist in order, record the
+answer to each step before moving on:**
+1. `ip addr` both ends — tun exists, UP, correct overlay addr/prefix?
+2. `ip route get <dst>` on the sender — does the route point at the tun?
+3. Logs — which path is active (`path=direct|relay`)? Any `TooLarge`/AEAD errors?
+4. Are data-plane counters moving on each side? (tx but no rx ⇒ transport; neither ⇒
+   routing into the tun.)
+5. `tcpdump -ni bore0` (and on the veths) — where exactly does the packet disappear?
+6. Gateway only: `cat /proc/sys/net/ipv4/ip_forward` = 1? `nft list table inet
+   bore_vpn_<id>` shows masquerade + clamp?
+7. Size-dependent? `ping` (56 B) vs `ping -s 1300` — if only big packets fail, it is
+   MTU/datagram (see C), not routing.
+**Stop rule:** if the same symptom survives **3 diagnostic iterations**, stop, write
+down the checklist findings, and surface to the user — do not keep mutating code.
+*(Sudo note: this is a development machine — root/netns commands are allowed. When a
+step needs root, **ask the user to run it / approve it**; never skip a root-gated test
+or mark it passed without executing it. "Couldn't run because root" is not an
+acceptable gate result — asking is.)*
+
+**C. MTU / datagram-size transient — judgment already removed, follow §6.1 literally.**
+The first seconds of a direct link can drop full-size packets (`TooLarge`) while QUIC
+MTU discovery raises the path MTU from 1200. This is **specified behavior**, not a bug
+to fix — and conversely, *persistent* drops are a real bug, not "the transient".
+- **Insist on in tests:** every e2e scenario must ping with **both** small (default
+  56 B) and large (`-s 1300`) payloads; the large one must reach steady-state success.
+  Assert the distinction: transient drops within the first ~10 s = acceptable; any
+  `TooLarge` drop after that = test failure (path MTU too small or clamp wrong).
+- **Verify explicitly:** `max_datagram_size()` logged at connect; the >10 s `warn!`
+  fires when (and only when) drops persist; relay path has no such limit (stream).
 
 ---
 

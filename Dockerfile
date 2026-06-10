@@ -9,7 +9,7 @@ ARG BORE_GIT_SHA=unknown
 ENV BORE_GIT_BRANCH=${BORE_GIT_BRANCH}
 ENV BORE_GIT_SHA=${BORE_GIT_SHA}
 COPY . .
-RUN cargo install --path . --locked
+RUN cargo install --path . --locked --features vpn
 
 FROM scratch
 COPY --from=builder /usr/local/cargo/bin/bore .

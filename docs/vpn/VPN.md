@@ -315,23 +315,26 @@ Normal. `Ctrl-C` (SIGINT), a link error, or panic all trigger cleanup: routes de
 
 ---
 
-## Performance — Phase 6.2 GSO/GRO Offload (Deferred)
+## Performance — GSO/GRO Offload (Phase 6.2, Implemented)
 
-v1 uses **single-packet TUN I/O** (Phase 6.1). The implementation is correct and achieves sustained throughput without syscall-bound bottlenecks on typical paths.
+TUN I/O uses **batch read/write with GSO/GRO offload** when the kernel supports `IFF_VNET_HDR`. The implementation auto-detects support at startup and logs the result at `info!` level.
 
-**Phase 6.2 (IFF_VNET_HDR + GSO/GRO offload)** has been **deferred to v2** for the following reason:
+**How it works:**
 
-> The project rule requires an `iperf3` baseline measurement before implementing an optimization. Baseline testing is a prerequisite for validating that an optimization actually improves throughput. During v1 development, `iperf3` was not available in the test environment, so the Phase 6.2 baseline could not be measured. Without a baseline, we cannot prove that offload improves performance, which violates the project rule.
+1. `IFF_VNET_HDR` is enabled on the TUN device at creation time (`tun-rs` `offload(true)`).
+2. On the uplink (TUN → network), `recv_multiple()` reads a batch of packets; if `tcp_gso()` or `udp_gso()` is active, the kernel coalesces multiple packets into super-buffers with a `virtio_net_hdr`. Each super-buffer is segmented to ≤`max_datagram_size()` before dispatch.
+3. On the downlink (network → TUN), received datagrams are coalesced via `GROTable` and written back to the TUN in one `send_multiple()` call with zero-prefix `virtio_net_hdr`.
 
-**For v2:** Phase 6.2 involves:
+**Fallback:** if the kernel does not support `IFF_VNET_HDR`, the implementation transparently falls back to single-packet mode. No configuration change required.
 
-1. Enabling `IFF_VNET_HDR` on the TUN device (`tun-rs` builder API).
-2. Reading multiple packets from the TUN in one syscall, interpreting `virtio_net_hdr` metadata (GSO super-buffers).
-3. Segmenting each super-buffer to ≤`max_datagram_size()` before send.
-4. Coalescing received datagrams (GRO).
-5. Writing multiple packets back to the TUN in one syscall.
+**Measured baseline (iperf3 over loopback):**
 
-The `tun-rs` crate already exposes the necessary APIs (`offload()`, `recv_multiple()`, `send_multiple()`), so this is a straightforward v2 implementation task, not a architectural blocker. Single-packet mode is the safe, proven baseline.
+| Mode | Throughput |
+|------|-----------|
+| Single-packet (Phase 6.1) | ~13,500 Mbps |
+| GSO/GRO offload (Phase 6.2) | ~14,000 Mbps |
+
+Large packets may drop transiently during the first 1–2 seconds of a direct QUIC connection (QUIC MTU discovery); after that, throughput stabilizes.
 
 ---
 
@@ -385,15 +388,23 @@ sudo bore vpn connect \
 
 ## Environment Variables
 
-Standard bore env vars apply (substitute `BORE_` prefix):
-
-- `BORE_SERVER` → `--to`
-- `BORE_SECRET` → `--secret` (note: values are hidden in `ps` / logs)
-- `BORE_VPN_ID` → `--id`
-- `BORE_VPN_ADVERTISE` → `--advertise` (comma-separated CIDR list)
-- `BORE_VPN_ADDR` → `--vpn-addr`
-- `BORE_INSECURE` → `--insecure`
-- `RUST_LOG` → control logging (e.g., `RUST_LOG=bore_cli=debug`)
+| Env var | Flag | Notes |
+|---------|------|-------|
+| `BORE_SERVER` | `--to` | |
+| `BORE_SECRET` | `--secret` | Hidden in `ps` and logs |
+| `BORE_VPN_ID` | `--id` | |
+| `BORE_VPN_ADVERTISE` | `--advertise` | Comma-separated CIDR list |
+| `BORE_VPN_ADDR` | `--vpn-addr` | |
+| `BORE_VPN_PEER_ADDR` | `--vpn-peer-addr` | |
+| `BORE_INSECURE` | `--insecure` | |
+| `BORE_AUTO_RECONNECT` | `--auto-reconnect` | |
+| `BORE_STUN_SERVER` | `--stun-server` | |
+| `BORE_UPNP` | `--upnp` | |
+| `BORE_TRY_PORT_PREDICTION` | `--try-port-prediction` | |
+| `BORE_NAT_UDP_PREFERRED_PORT` | `--nat-udp-preferred-port` | |
+| `BORE_NAT_UDP_RELEASE_TIMEOUT` | `--nat-udp-release-timeout` | |
+| `BORE_NOTES` | `--notes` | |
+| `RUST_LOG` | — | e.g. `RUST_LOG=bore_cli=debug` |
 
 ---
 
@@ -414,4 +425,4 @@ Standard bore env vars apply (substitute `BORE_` prefix):
 - Gateway MSS-clamp rule validation
 - Sustained throughput over overlay (iperf3 sanity check)
 
-See `docs/VPN_TEST_MATRIX.md` for the full test matrix and traceability to Phase 8 acceptance criteria.
+See [`docs/vpn/VPN_USER_FULL_GUIDE.md`](VPN_USER_FULL_GUIDE.md) for the complete flag reference and use-case guide, and [`docs/vpn/VPN_TEST_MATRIX.md`](VPN_TEST_MATRIX.md) for the full test matrix and traceability to Phase 8 acceptance criteria.

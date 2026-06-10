@@ -429,6 +429,9 @@ pub async fn serve_vpn_connector(
     let listener_opener = listener_entry.opener.clone();
     drop(listener_entry);
 
+    // RAII guard for pool lease: freed on all error returns; lives for link duration.
+    let mut _pool_lease: Option<VpnLeaseGuard> = None;
+
     // Determine overlay addressing based on listener and connector requests.
     let (listener_overlay, connector_overlay, nonce) = match (&listener_addr_req, &addr) {
         // Both use pool: allocate a /30
@@ -456,6 +459,11 @@ pub async fn serve_vpn_connector(
                     return Ok(());
                 }
             };
+            // Arm the lease guard immediately so the block is freed on all
+            // subsequent early returns (overlap rejection, send failure, etc.).
+            // The guard lives until serve_vpn_connector returns.
+            let net_addr = u32::from(listener_ip) - 1;
+            _pool_lease = Some(VpnLeaseGuard::new(pool_arc, net_addr));
             let n = new_nonce();
             (listener_ip, connector_ip, n)
         }

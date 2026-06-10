@@ -178,11 +178,16 @@ pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
     )
     .await?;
 
-    // Wait for relay substream from server
-    let mut relay_stream = acceptor
-        .accept()
-        .await
-        .context("server did not open relay substream")?;
+    // Wait for relay substream from server (connector must connect within 60 s).
+    // Without a timeout the listener hangs indefinitely if the connector crashes
+    // after VpnReady is sent but before it opens the relay substream.
+    let mut relay_stream = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        acceptor.accept(),
+    )
+    .await
+    .context("timed out waiting for relay substream (connector did not connect within 60 s)")?
+    .context("server did not open relay substream")?;
 
     // Read STREAM_READY marker
     let mut marker = [0u8; 1];
@@ -1378,13 +1383,19 @@ pub mod hostcfg {
                 .zip(self.revert_labels.iter().rev())
             {
                 tracing::info!(%label, "reverting vpn netconfig");
-                let result = std::process::Command::new(&argv[0])
+                match std::process::Command::new(&argv[0])
                     .args(&argv[1..])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
-                    .status();
-                if let Err(e) = result {
-                    tracing::warn!(%e, %label, "vpn netconfig revert step failed (best-effort)");
+                    .status()
+                {
+                    Err(e) => {
+                        tracing::warn!(%e, %label, "vpn netconfig revert step failed (spawn error)");
+                    }
+                    Ok(s) if !s.success() => {
+                        tracing::warn!(code=%s, %label, "vpn netconfig revert step exited non-zero");
+                    }
+                    Ok(_) => {}
                 }
             }
 
@@ -1581,20 +1592,29 @@ pub mod link {
     use bytes::Bytes;
     use futures_util::FutureExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
 
     use super::crypto::DirectionKeys;
     use crate::holepunch::DirectConn;
 
     const BATCH_CAP: usize = 64;
 
+    // Relay write queue depth. When full, packets are dropped (congestion relief).
+    // TCP sessions above the VPN will retransmit; UDP is inherently lossy.
+    // ~512 × 1350 bytes ≈ 700 KB of in-flight relay buffer before dropping starts.
+    const RELAY_QUEUE: usize = 512;
+
     /// Send half of a VPN link (owned by the uplink task).
     pub enum LinkSender {
         /// Direct QUIC datagram path.
         Direct(DirectConn),
         /// Relay path: AEAD-framed stream.
+        /// The actual write is done by a background writer task; this side
+        /// uses non-blocking try_send so relay TCP congestion never deadlocks
+        /// the uplink loop.
         Relay {
-            /// Write half of the yamux stream.
-            write: tokio::io::WriteHalf<crate::mux::Stream>,
+            /// Channel to the background relay writer task.
+            tx: mpsc::Sender<Bytes>,
             /// AEAD egress key.
             key: [u8; 32],
             /// Per-packet counter for nonce derivation.
@@ -1621,11 +1641,17 @@ pub mod link {
     }
 
     /// Split a Relay link into send+recv halves for the bridge tasks.
+    ///
+    /// Spawns a background writer task that owns the write half. The uplink
+    /// loop communicates via a bounded channel, so relay TCP congestion cannot
+    /// block the bridge (excess frames are dropped instead of stalling the loop).
     pub fn make_relay(stream: crate::mux::Stream, keys: DirectionKeys) -> (LinkSender, LinkRecver) {
         let (read, write) = tokio::io::split(stream);
+        let (tx, rx) = mpsc::channel::<Bytes>(RELAY_QUEUE);
+        tokio::spawn(relay_writer(write, rx));
         (
             LinkSender::Relay {
-                write,
+                tx,
                 key: keys.egress,
                 counter: 0,
             },
@@ -1634,6 +1660,20 @@ pub mod link {
                 key: keys.ingress,
             },
         )
+    }
+
+    /// Background task: drain the relay write queue and write frames to the yamux stream.
+    /// Exits on write error (broken relay TCP); subsequent try_send calls in the uplink
+    /// task will see Disconnected and propagate the error, tearing down the bridge.
+    async fn relay_writer(
+        mut write: tokio::io::WriteHalf<crate::mux::Stream>,
+        mut rx: mpsc::Receiver<Bytes>,
+    ) {
+        while let Some(frame) = rx.recv().await {
+            if write.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
     }
 
     impl LinkSender {
@@ -1651,21 +1691,25 @@ pub mod link {
                     }
                     Ok(())
                 }
-                LinkSender::Relay {
-                    write,
-                    key,
-                    counter,
-                } => {
+                LinkSender::Relay { tx, key, counter } => {
                     for pkt in pkts {
                         if *counter == u64::MAX {
                             anyhow::bail!("AEAD counter exhausted — tear down link");
                         }
                         let frame = super::crypto::seal_with_counter(key, *counter, pkt)?;
                         *counter += 1;
-                        write
-                            .write_all(&frame)
-                            .await
-                            .context("relay write failed")?;
+                        match tx.try_send(Bytes::from(frame)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // Relay write queue full: drop this packet.
+                                // The relay TCP is congested; TCP sessions above will
+                                // retransmit. Dropping here prevents the uplink loop
+                                // from stalling and deadlocking the bridge.
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                anyhow::bail!("relay writer exited (write error on relay TCP)");
+                            }
+                        }
                     }
                     Ok(())
                 }
@@ -1724,7 +1768,51 @@ pub mod link {
     }
 
     #[cfg(test)]
-    mod tests {}
+    mod tests {
+        use super::*;
+        use bytes::Bytes;
+        use tokio::sync::mpsc;
+
+        /// relay_writer must NOT block the caller when the channel is full.
+        /// Excess packets are dropped (TrySendError::Full) instead of stalling.
+        #[tokio::test]
+        async fn relay_sender_drops_on_full_channel() {
+            // Capacity 1 so the second packet overflows immediately.
+            let (tx, _rx) = mpsc::channel::<Bytes>(1);
+            let key = [0u8; 32];
+            let mut sender = LinkSender::Relay { tx, key, counter: 0 };
+
+            let pkt = Bytes::from(vec![0xAB; 64]);
+            // First send fills the channel.
+            sender.send_batch(&[pkt.clone()]).await.unwrap();
+            // Second send would block with write_all; with try_send it must return Ok
+            // (packet is silently dropped, not an error).
+            sender.send_batch(&[pkt.clone()]).await.unwrap();
+            // Counter advanced for both sealed packets (drop happens after sealing).
+            match &sender {
+                LinkSender::Relay { counter, .. } => assert_eq!(*counter, 2),
+                _ => panic!("expected Relay"),
+            }
+        }
+
+        /// When the writer task exits (e.g. relay TCP broken), the next send_batch
+        /// must return Err rather than silently dropping or hanging.
+        #[tokio::test]
+        async fn relay_sender_errors_when_writer_gone() {
+            let (tx, rx) = mpsc::channel::<Bytes>(8);
+            // Drop the receiver — simulates the writer task having exited.
+            drop(rx);
+            let key = [0u8; 32];
+            let mut sender = LinkSender::Relay { tx, key, counter: 0 };
+
+            let pkt = Bytes::from(vec![0xCD; 32]);
+            let result = sender.send_batch(&[pkt]).await;
+            assert!(
+                result.is_err(),
+                "send_batch must error when writer task is gone"
+            );
+        }
+    }
 }
 
 pub mod bridge {

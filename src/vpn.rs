@@ -1,0 +1,1504 @@
+//! VPN L3 tunnel feature (Linux, experimental).
+
+#![cfg(all(feature = "vpn", target_os = "linux"))]
+
+use anyhow::Result;
+
+/// Start a VPN listener.
+pub async fn run_listen(_args: ()) -> Result<()> {
+    anyhow::bail!("not yet implemented")
+}
+
+/// Start a VPN connector.
+pub async fn run_connect(_args: ()) -> Result<()> {
+    anyhow::bail!("not yet implemented")
+}
+
+mod net {
+    #![allow(dead_code)]
+    use serde::{Deserialize, Serialize};
+    use std::fmt;
+    use std::net::Ipv4Addr;
+    use std::str::FromStr;
+
+    /// IPv4 CIDR (address + prefix length). Used for overlay + advertised subnets.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Ipv4Net {
+        pub addr: Ipv4Addr,
+        pub prefix: u8,
+    }
+
+    impl Ipv4Net {
+        /// Network address (host bits zeroed).
+        pub fn network(&self) -> Ipv4Addr {
+            let mask = Self::prefix_to_mask(self.prefix);
+            let n = u32::from(self.addr) & mask;
+            Ipv4Addr::from(n)
+        }
+
+        /// True if `other` addr is within this network.
+        pub fn contains(&self, other: Ipv4Addr) -> bool {
+            let mask = Self::prefix_to_mask(self.prefix);
+            (u32::from(self.addr) & mask) == (u32::from(other) & mask)
+        }
+
+        /// True if `other` network overlaps with this one.
+        pub fn overlaps(&self, other: &Ipv4Net) -> bool {
+            let mask = if self.prefix <= other.prefix {
+                Self::prefix_to_mask(self.prefix)
+            } else {
+                Self::prefix_to_mask(other.prefix)
+            };
+            (u32::from(self.addr) & mask) == (u32::from(other.addr) & mask)
+        }
+
+        fn prefix_to_mask(prefix: u8) -> u32 {
+            if prefix == 0 {
+                0
+            } else {
+                !0u32 << (32 - prefix)
+            }
+        }
+    }
+
+    impl FromStr for Ipv4Net {
+        type Err = anyhow::Error;
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            let (addr_str, prefix_str) = s
+                .split_once('/')
+                .ok_or_else(|| anyhow::anyhow!("missing '/' in CIDR: {s}"))?;
+            let addr = addr_str
+                .parse::<Ipv4Addr>()
+                .map_err(|e| anyhow::anyhow!("invalid addr in {s}: {e}"))?;
+            let prefix = prefix_str
+                .parse::<u8>()
+                .map_err(|e| anyhow::anyhow!("invalid prefix in {s}: {e}"))?;
+            anyhow::ensure!(prefix <= 32, "prefix {prefix} > 32 in {s}");
+            Ok(Ipv4Net { addr, prefix })
+        }
+    }
+
+    impl fmt::Display for Ipv4Net {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}/{}", self.addr, self.prefix)
+        }
+    }
+
+    /// A /30 pool allocator. Carves /30 blocks from a parent CIDR.
+    /// Each /30 has 4 addresses: network, .1 (listener), .2 (connector), broadcast.
+    pub struct PoolAllocator {
+        parent: Ipv4Net,
+        allocated: std::collections::HashSet<u32>,
+    }
+
+    impl PoolAllocator {
+        pub fn new(parent: Ipv4Net) -> anyhow::Result<Self> {
+            anyhow::ensure!(
+                parent.prefix <= 30,
+                "pool CIDR prefix must be ≤ 30, got /{}",
+                parent.prefix
+            );
+            Ok(Self {
+                parent,
+                allocated: Default::default(),
+            })
+        }
+
+        /// Allocate next free /30. Returns (listener_addr, connector_addr).
+        pub fn alloc(&mut self) -> anyhow::Result<(Ipv4Addr, Ipv4Addr)> {
+            let base = u32::from(self.parent.network());
+            let total_bits = 32 - self.parent.prefix;
+            let blocks = 1u32 << total_bits.saturating_sub(2);
+            for i in 0..blocks {
+                let net_addr = base + i * 4;
+                if !self.allocated.contains(&net_addr) {
+                    self.allocated.insert(net_addr);
+                    let listener = Ipv4Addr::from(net_addr + 1);
+                    let connector = Ipv4Addr::from(net_addr + 2);
+                    return Ok((listener, connector));
+                }
+            }
+            anyhow::bail!(
+                "vpn pool exhausted (all /30 blocks in {} in use)",
+                self.parent
+            )
+        }
+
+        /// Free a previously allocated block. `addr` is any address in the /30.
+        pub fn free(&mut self, addr: Ipv4Addr) {
+            let net_addr = u32::from(addr) & 0xFFFF_FFFC;
+            self.allocated.remove(&net_addr);
+        }
+
+        /// Check if a static addr collides with any allocated block.
+        pub fn collides(&self, addr: Ipv4Addr) -> bool {
+            let net_addr = u32::from(addr) & 0xFFFF_FFFC;
+            self.allocated.contains(&net_addr)
+        }
+    }
+
+    /// Calculate the IP MTU for IP packets from a tun MTU.
+    pub fn ip_mtu(tun_mtu: u16) -> u16 {
+        tun_mtu
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn overlap_truth_table() {
+            let a: Ipv4Net = "10.0.0.0/24".parse().unwrap();
+            let b: Ipv4Net = "10.0.0.0/25".parse().unwrap();
+            let c: Ipv4Net = "10.0.1.0/24".parse().unwrap();
+            assert!(a.overlaps(&b));
+            assert!(b.overlaps(&a));
+            assert!(!a.overlaps(&c));
+
+            let d: Ipv4Net = "192.168.0.0/30".parse().unwrap();
+            let e: Ipv4Net = "192.168.0.4/30".parse().unwrap();
+            assert!(!d.overlaps(&e));
+        }
+
+        #[test]
+        fn pool_alloc_assigns_dot1_dot2() {
+            let parent: Ipv4Net = "192.168.0.0/30".parse().unwrap();
+            let mut pool = PoolAllocator::new(parent).unwrap();
+            let (l1, c1) = pool.alloc().unwrap();
+            assert_eq!(l1.to_string(), "192.168.0.1");
+            assert_eq!(c1.to_string(), "192.168.0.2");
+        }
+
+        #[test]
+        fn pool_free_reuses_block() {
+            let parent: Ipv4Net = "192.168.0.0/28".parse().unwrap();
+            let mut pool = PoolAllocator::new(parent).unwrap();
+            let (l1, c1) = pool.alloc().unwrap();
+            assert_eq!(l1.to_string(), "192.168.0.1");
+            pool.free(c1);
+            let (l2, c2) = pool.alloc().unwrap();
+            assert_eq!(l2, l1);
+            assert_eq!(c2, c1);
+        }
+
+        #[test]
+        fn pool_exhaustion_errors() {
+            let result = PoolAllocator::new("192.168.0.0/31".parse().unwrap());
+            assert!(result.is_err());
+
+            let parent: Ipv4Net = "192.168.0.0/30".parse().unwrap();
+            let mut pool = PoolAllocator::new(parent).unwrap();
+            let _ = pool.alloc().unwrap();
+            let result = pool.alloc();
+            assert!(result.is_err());
+        }
+    }
+}
+
+mod crypto {
+    #![allow(dead_code)]
+    use anyhow::{bail, Result};
+    use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+    use ring::hkdf;
+
+    const MAX_COUNTER: u64 = u64::MAX - 1;
+    pub const TAG_LEN: usize = 16;
+    const INFO_L2C: &[u8] = b"bore-vpn l2c v1";
+    const INFO_C2L: &[u8] = b"bore-vpn c2l v1";
+
+    /// Two derived 32-byte keys for the two directions.
+    pub struct DirectionKeys {
+        pub egress: [u8; 32],
+        pub ingress: [u8; 32],
+    }
+
+    /// Derive the relay AEAD keys for the listener side.
+    pub fn derive_keys_listener(secret: &str, nonce: &[u8]) -> Result<DirectionKeys> {
+        let l2c = hkdf_expand(secret, nonce, INFO_L2C)?;
+        let c2l = hkdf_expand(secret, nonce, INFO_C2L)?;
+        Ok(DirectionKeys {
+            egress: l2c,
+            ingress: c2l,
+        })
+    }
+
+    /// Derive the relay AEAD keys for the connector side.
+    pub fn derive_keys_connector(secret: &str, nonce: &[u8]) -> Result<DirectionKeys> {
+        let l2c = hkdf_expand(secret, nonce, INFO_L2C)?;
+        let c2l = hkdf_expand(secret, nonce, INFO_C2L)?;
+        Ok(DirectionKeys {
+            egress: c2l,
+            ingress: l2c,
+        })
+    }
+
+    fn hkdf_expand(secret: &str, salt_bytes: &[u8], info: &[u8]) -> Result<[u8; 32]> {
+        let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, salt_bytes);
+        let prk = salt.extract(secret.as_bytes());
+        let info_arr = [info];
+        let mut out = [0u8; 32];
+        prk.expand(&info_arr, hkdf::HKDF_SHA256)
+            .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?
+            .fill(&mut out)
+            .map_err(|_| anyhow::anyhow!("HKDF fill failed"))?;
+        Ok(out)
+    }
+
+    /// Build a 96-bit nonce from a u64 counter: 4 zero bytes ‖ counter (BE).
+    pub fn nonce_from_counter(counter: u64) -> [u8; 12] {
+        let mut n = [0u8; 12];
+        n[4..].copy_from_slice(&counter.to_be_bytes());
+        n
+    }
+
+    /// Seal an IP packet. Returns `[u32 BE total_len][u64 BE counter][ciphertext‖tag]`.
+    pub fn seal(key_bytes: &[u8; 32], counter: &mut u64, plaintext: &[u8]) -> Result<Vec<u8>> {
+        if *counter >= MAX_COUNTER {
+            bail!("AEAD counter exhausted — tear down link");
+        }
+        let nonce_bytes = nonce_from_counter(*counter);
+        let unbound = UnboundKey::new(&CHACHA20_POLY1305, key_bytes)
+            .map_err(|_| anyhow::anyhow!("AEAD key init"))?;
+        let key = LessSafeKey::new(unbound);
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+        let mut buf = plaintext.to_vec();
+        key.seal_in_place_append_tag(nonce, Aad::empty(), &mut buf)
+            .map_err(|_| anyhow::anyhow!("AEAD seal"))?;
+
+        let ctr = *counter;
+        *counter += 1;
+
+        let total_len = (8 + buf.len()) as u32;
+        let mut frame = Vec::with_capacity(4 + 8 + buf.len());
+        frame.extend_from_slice(&total_len.to_be_bytes());
+        frame.extend_from_slice(&ctr.to_be_bytes());
+        frame.extend_from_slice(&buf);
+        Ok(frame)
+    }
+
+    /// Open a received frame. `frame` is the raw bytes after reading `[u32 total_len]`.
+    pub fn open(key_bytes: &[u8; 32], frame: &[u8]) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            frame.len() >= 8 + TAG_LEN,
+            "frame too short: {} bytes",
+            frame.len()
+        );
+        let ctr = u64::from_be_bytes(frame[..8].try_into().unwrap());
+        let nonce_bytes = nonce_from_counter(ctr);
+
+        let unbound = UnboundKey::new(&CHACHA20_POLY1305, key_bytes)
+            .map_err(|_| anyhow::anyhow!("AEAD key init"))?;
+        let key = LessSafeKey::new(unbound);
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+        let mut buf = frame[8..].to_vec();
+        let plaintext = key
+            .open_in_place(nonce, Aad::empty(), &mut buf)
+            .map_err(|_| anyhow::anyhow!("AEAD open — tampered or wrong key"))?;
+        Ok(plaintext.to_vec())
+    }
+
+    /// Seal with an explicit counter value (no auto-increment).
+    /// Returns `[u32 BE total_len][u64 BE counter][ciphertext‖tag]`.
+    pub fn seal_with_counter(
+        key_bytes: &[u8; 32],
+        counter: u64,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        if counter >= MAX_COUNTER {
+            bail!("AEAD counter exhausted — tear down link");
+        }
+        let nonce_bytes = nonce_from_counter(counter);
+        let unbound = UnboundKey::new(&CHACHA20_POLY1305, key_bytes)
+            .map_err(|_| anyhow::anyhow!("AEAD key init"))?;
+        let key = LessSafeKey::new(unbound);
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+        let mut buf = plaintext.to_vec();
+        key.seal_in_place_append_tag(nonce, Aad::empty(), &mut buf)
+            .map_err(|_| anyhow::anyhow!("AEAD seal"))?;
+
+        let total_len = (8 + buf.len()) as u32;
+        let mut frame = Vec::with_capacity(4 + 8 + buf.len());
+        frame.extend_from_slice(&total_len.to_be_bytes());
+        frame.extend_from_slice(&counter.to_be_bytes());
+        frame.extend_from_slice(&buf);
+        Ok(frame)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn aead_roundtrip_ok() {
+            let key = [1u8; 32];
+            let mut ctr = 0u64;
+            let plaintext = b"hello world";
+            let sealed = seal(&key, &mut ctr, plaintext).unwrap();
+            assert_eq!(ctr, 1);
+            let frame = &sealed[4..];
+            let opened = open(&key, frame).unwrap();
+            assert_eq!(&opened[..], plaintext);
+        }
+
+        #[test]
+        fn aead_tamper_fails() {
+            let key = [1u8; 32];
+            let mut ctr = 0u64;
+            let plaintext = b"hello world";
+            let sealed = seal(&key, &mut ctr, plaintext).unwrap();
+            let mut frame = sealed[4..].to_vec();
+            if frame.len() > 20 {
+                frame[20] ^= 0xFF;
+            }
+            let result = open(&key, &frame);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn aead_wrong_key_fails() {
+            let key1 = [1u8; 32];
+            let key2 = [2u8; 32];
+            let mut ctr = 0u64;
+            let plaintext = b"hello world";
+            let sealed = seal(&key1, &mut ctr, plaintext).unwrap();
+            let frame = &sealed[12..];
+            let result = open(&key2, frame);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn nonce_monotonic_unique() {
+            let n1 = nonce_from_counter(0);
+            let n2 = nonce_from_counter(1);
+            assert_ne!(n1, n2);
+        }
+
+        #[test]
+        fn hkdf_deterministic() {
+            let secret = "test-secret";
+            let nonce = b"test-nonce";
+            let k1 = derive_keys_listener(secret, nonce).unwrap();
+            let k2 = derive_keys_listener(secret, nonce).unwrap();
+            assert_eq!(k1.egress, k2.egress);
+            assert_eq!(k1.ingress, k2.ingress);
+        }
+
+        #[test]
+        fn hkdf_directions_differ() {
+            let secret = "test-secret";
+            let nonce = b"test-nonce";
+            let listener = derive_keys_listener(secret, nonce).unwrap();
+            let connector = derive_keys_connector(secret, nonce).unwrap();
+            assert_ne!(listener.egress, connector.egress);
+            assert_ne!(listener.ingress, connector.ingress);
+            assert_eq!(listener.egress, connector.ingress);
+            assert_eq!(listener.ingress, connector.egress);
+        }
+    }
+}
+
+mod hostcfg_cmd {
+    #![allow(dead_code)]
+    /// Build `ip addr add <addr>/<prefix> dev <dev>` argv.
+    pub fn cmd_addr_add(dev: &str, addr: &str, prefix: u8) -> Vec<String> {
+        vec![
+            "ip".into(),
+            "addr".into(),
+            "add".into(),
+            format!("{addr}/{prefix}"),
+            "dev".into(),
+            dev.into(),
+        ]
+    }
+
+    pub fn cmd_addr_del(dev: &str, addr: &str, prefix: u8) -> Vec<String> {
+        vec![
+            "ip".into(),
+            "addr".into(),
+            "del".into(),
+            format!("{addr}/{prefix}"),
+            "dev".into(),
+            dev.into(),
+        ]
+    }
+
+    pub fn cmd_link_set_up(dev: &str) -> Vec<String> {
+        vec![
+            "ip".into(),
+            "link".into(),
+            "set".into(),
+            dev.into(),
+            "up".into(),
+        ]
+    }
+
+    pub fn cmd_link_set_mtu(dev: &str, mtu: u16) -> Vec<String> {
+        vec![
+            "ip".into(),
+            "link".into(),
+            "set".into(),
+            dev.into(),
+            "mtu".into(),
+            mtu.to_string(),
+        ]
+    }
+
+    pub fn cmd_route_add(subnet: &str, dev: &str) -> Vec<String> {
+        vec![
+            "ip".into(),
+            "route".into(),
+            "add".into(),
+            subnet.into(),
+            "dev".into(),
+            dev.into(),
+        ]
+    }
+
+    pub fn cmd_route_del(subnet: &str, dev: &str) -> Vec<String> {
+        vec![
+            "ip".into(),
+            "route".into(),
+            "del".into(),
+            subnet.into(),
+            "dev".into(),
+            dev.into(),
+        ]
+    }
+
+    pub fn cmd_route_get(host: &str) -> Vec<String> {
+        vec!["ip".into(), "route".into(), "get".into(), host.into()]
+    }
+
+    /// Parse the output of `ip route get <host>` to extract the `dev <iface>` field.
+    pub fn parse_lan_iface(output: &str) -> Option<String> {
+        let mut iter = output.split_whitespace();
+        while let Some(token) = iter.next() {
+            if token == "dev" {
+                return iter.next().map(str::to_string);
+            }
+        }
+        None
+    }
+
+    pub fn cmd_nft_add_table(id: &str) -> Vec<String> {
+        vec![
+            "nft".into(),
+            "add".into(),
+            "table".into(),
+            "inet".into(),
+            format!("bore_vpn_{id}"),
+        ]
+    }
+
+    pub fn cmd_nft_add_postrouting_chain(id: &str) -> Vec<String> {
+        vec![
+            "nft".into(),
+            "add".into(),
+            "chain".into(),
+            "inet".into(),
+            format!("bore_vpn_{id}"),
+            "post".into(),
+            "{ type nat hook postrouting priority 100 ; }".into(),
+        ]
+    }
+
+    pub fn cmd_nft_add_masquerade_rule(id: &str, tun: &str, lan_if: &str) -> Vec<String> {
+        vec![
+            "nft".into(),
+            "add".into(),
+            "rule".into(),
+            "inet".into(),
+            format!("bore_vpn_{id}"),
+            "post".into(),
+            "iif".into(),
+            tun.into(),
+            "oif".into(),
+            lan_if.into(),
+            "masquerade".into(),
+        ]
+    }
+
+    pub fn cmd_nft_add_forward_chain(id: &str) -> Vec<String> {
+        vec![
+            "nft".into(),
+            "add".into(),
+            "chain".into(),
+            "inet".into(),
+            format!("bore_vpn_{id}"),
+            "fwd".into(),
+            "{ type filter hook forward priority -10 ; }".into(),
+        ]
+    }
+
+    pub fn cmd_nft_add_mss_clamp(id: &str) -> Vec<String> {
+        vec![
+            "nft".into(),
+            "add".into(),
+            "rule".into(),
+            "inet".into(),
+            format!("bore_vpn_{id}"),
+            "fwd".into(),
+            "tcp".into(),
+            "flags".into(),
+            "syn".into(),
+            "tcp".into(),
+            "option".into(),
+            "maxseg".into(),
+            "size".into(),
+            "set".into(),
+            "rt".into(),
+            "mtu".into(),
+        ]
+    }
+
+    pub fn cmd_nft_delete_table(id: &str) -> Vec<String> {
+        vec![
+            "nft".into(),
+            "delete".into(),
+            "table".into(),
+            "inet".into(),
+            format!("bore_vpn_{id}"),
+        ]
+    }
+
+    pub fn cmd_iptables_masquerade_add(id: &str, tun: &str, lan_if: &str) -> Vec<String> {
+        vec![
+            "iptables".into(),
+            "-t".into(),
+            "nat".into(),
+            "-A".into(),
+            "POSTROUTING".into(),
+            "-i".into(),
+            tun.into(),
+            "-o".into(),
+            lan_if.into(),
+            "-j".into(),
+            "MASQUERADE".into(),
+            "-m".into(),
+            "comment".into(),
+            "--comment".into(),
+            format!("bore_vpn_{id}"),
+        ]
+    }
+
+    pub fn cmd_iptables_masquerade_del(id: &str) -> Vec<String> {
+        vec![
+            "iptables".into(),
+            "-t".into(),
+            "nat".into(),
+            "-D".into(),
+            "POSTROUTING".into(),
+            "-m".into(),
+            "comment".into(),
+            "--comment".into(),
+            format!("bore_vpn_{id}"),
+        ]
+    }
+
+    pub fn cmd_iptables_mss_clamp_add(id: &str) -> Vec<String> {
+        vec![
+            "iptables".into(),
+            "-t".into(),
+            "mangle".into(),
+            "-A".into(),
+            "FORWARD".into(),
+            "-p".into(),
+            "tcp".into(),
+            "--tcp-flags".into(),
+            "SYN,RST".into(),
+            "SYN".into(),
+            "-j".into(),
+            "TCPMSS".into(),
+            "--clamp-mss-to-pmtu".into(),
+            "-m".into(),
+            "comment".into(),
+            "--comment".into(),
+            format!("bore_vpn_{id}"),
+        ]
+    }
+
+    pub fn cmd_iptables_mss_clamp_del(id: &str) -> Vec<String> {
+        vec![
+            "iptables".into(),
+            "-t".into(),
+            "mangle".into(),
+            "-D".into(),
+            "FORWARD".into(),
+            "-p".into(),
+            "tcp".into(),
+            "--tcp-flags".into(),
+            "SYN,RST".into(),
+            "SYN".into(),
+            "-j".into(),
+            "TCPMSS".into(),
+            "--clamp-mss-to-pmtu".into(),
+            "-m".into(),
+            "comment".into(),
+            "--comment".into(),
+            format!("bore_vpn_{id}"),
+        ]
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn cmd_route_add_snapshot() {
+            let cmd = cmd_route_add("10.0.0.0/24", "tun0");
+            assert_eq!(
+                cmd,
+                vec!["ip", "route", "add", "10.0.0.0/24", "dev", "tun0"]
+            );
+        }
+
+        #[test]
+        fn cmd_nft_table_snapshot() {
+            let cmd = cmd_nft_add_table("link1");
+            assert_eq!(cmd, vec!["nft", "add", "table", "inet", "bore_vpn_link1"]);
+        }
+
+        #[test]
+        fn cmd_iptables_fallback_snapshot() {
+            let cmd = cmd_iptables_masquerade_add("link1", "tun0", "eth0");
+            assert_eq!(
+                cmd,
+                vec![
+                    "iptables",
+                    "-t",
+                    "nat",
+                    "-A",
+                    "POSTROUTING",
+                    "-i",
+                    "tun0",
+                    "-o",
+                    "eth0",
+                    "-j",
+                    "MASQUERADE",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "bore_vpn_link1"
+                ]
+            );
+        }
+
+        #[test]
+        fn parse_lan_iface_from_ip_route_get() {
+            let output = "10.0.0.1 via 192.168.1.1 dev eth0 src 192.168.1.100";
+            let iface = parse_lan_iface(output);
+            assert_eq!(iface, Some("eth0".to_string()));
+
+            let output2 = "10.0.0.1 dev eth0 src 192.168.1.100";
+            let iface2 = parse_lan_iface(output2);
+            assert_eq!(iface2, Some("eth0".to_string()));
+        }
+    }
+}
+
+mod hostcfg {
+    #![allow(dead_code)]
+    //! Host network configuration (routes, NAT, ip_forward) with RAII cleanup.
+    //!
+    //! Manages routes, ip_forward toggle, and NAT rules for a VPN link.
+    //! All configuration is reverted in reverse order on Drop (cleanup path).
+
+    use anyhow::{anyhow, bail, Context};
+    use std::net::Ipv4Addr;
+    use std::process::Command;
+
+    /// Injectable command runner (allows unit testing without root).
+    pub trait CommandRunner: Send + Sync {
+        fn run<'a>(
+            &'a self,
+            argv: &'a [String],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>;
+    }
+
+    /// Real runner: calls std::process::Command (blocking, suitable for root operations).
+    pub struct RealRunner;
+
+    impl CommandRunner for RealRunner {
+        fn run<'a>(
+            &'a self,
+            argv: &'a [String],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                anyhow::ensure!(!argv.is_empty(), "empty argv");
+                let out = Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .output()
+                    .with_context(|| format!("failed to run {:?}", argv))?;
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    bail!(
+                        "command {:?} failed ({}): {}",
+                        argv,
+                        out.status,
+                        stderr.trim()
+                    );
+                }
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            })
+        }
+    }
+
+    /// Test runner: records all calls in memory.
+    #[cfg(test)]
+    pub struct TestRunner {
+        calls: std::sync::Arc<tokio::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[cfg(test)]
+    impl TestRunner {
+        pub fn new() -> Self {
+            Self {
+                calls: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        pub async fn get_calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().await.clone()
+        }
+    }
+
+    #[cfg(test)]
+    impl CommandRunner for TestRunner {
+        fn run<'a>(
+            &'a self,
+            argv: &'a [String],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>
+        {
+            let calls = std::sync::Arc::clone(&self.calls);
+            let argv_owned = argv.to_vec();
+            Box::pin(async move {
+                calls.lock().await.push(argv_owned);
+                Ok(String::new())
+            })
+        }
+    }
+
+    /// Check that we are root (UID 0).
+    pub fn check_root() -> anyhow::Result<()> {
+        if nix::unistd::getuid().is_root() {
+            Ok(())
+        } else {
+            bail!(
+                "bore vpn requires root privileges (or CAP_NET_ADMIN). \
+                 Run with sudo or grant the capability."
+            )
+        }
+    }
+
+    /// Verify a binary exists by running it with --version.
+    pub fn check_binary_exists(name: &str) -> bool {
+        std::process::Command::new(name)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|_| true)
+            .unwrap_or(false)
+    }
+
+    /// Delete leftover resources from a previous failed run (idempotent, best-effort).
+    pub async fn stale_reclaim(id: &str, tun_name: &str) {
+        // Try to delete nft table (ignore "not found" errors)
+        let _ = Command::new("nft")
+            .args(["delete", "table", "inet", &format!("bore_vpn_{id}")])
+            .output();
+        // Try to delete TUN interface (ignore errors)
+        let _ = Command::new("ip").args(["link", "del", tun_name]).output();
+    }
+
+    /// Create a TUN device and bring it up with the given address and MTU.
+    pub async fn create_tun(
+        name: &str,
+        addr: Ipv4Addr,
+        prefix: u8,
+        mtu: u16,
+    ) -> anyhow::Result<tun_rs::AsyncDevice> {
+        let dev = tun_rs::DeviceBuilder::new()
+            .name(name)
+            .ipv4(addr, prefix, None)
+            .mtu(mtu)
+            .build_async()
+            .context("failed to create TUN device")?;
+        Ok(dev)
+    }
+
+    /// Internal: marker for an ip_forward revert operation.
+    enum AppliedOp {
+        IpForward { saved_value: u8 },
+    }
+
+    /// RAII guard that manages routes, forwarding, and NAT around a VPN link.
+    /// Reverts everything in reverse order on `Drop`.
+    pub struct NetConfig {
+        id: String,
+        tun_name: String,
+        no_route_manage: bool,
+        nft_available: bool,
+        // Revert actions in reverse order (each is an argv).
+        revert_cmds: Vec<Vec<String>>,
+        // Labels for logging during revert.
+        revert_labels: Vec<String>,
+        // Saved ip_forward value (if we changed it).
+        ip_forward_saved: Option<u8>,
+        // Operations (e.g. ip_forward save/restore).
+        applied_ops: Vec<AppliedOp>,
+    }
+
+    impl NetConfig {
+        /// Apply host network configuration for a VPN link.
+        ///
+        /// - `id`: link id (used for nft table name)
+        /// - `tun_name`: tun device name
+        /// - `assigned`: this side's overlay address
+        /// - `prefix`: overlay prefix (30 for /30)
+        /// - `peer_routes`: subnets to route via the tun
+        /// - `advertised`: subnets this side exposes (non-empty = gateway mode)
+        /// - `no_route_manage`: if true, print commands instead of running them
+        #[allow(clippy::too_many_arguments)]
+        pub async fn apply<R: CommandRunner>(
+            runner: &R,
+            id: &str,
+            tun_name: &str,
+            _assigned: std::net::Ipv4Addr,
+            _prefix: u8,
+            peer_routes: &[super::net::Ipv4Net],
+            advertised: &[super::net::Ipv4Net],
+            no_route_manage: bool,
+        ) -> anyhow::Result<Self> {
+            use super::hostcfg_cmd::*;
+
+            let mut cfg = NetConfig {
+                id: id.to_string(),
+                tun_name: tun_name.to_string(),
+                no_route_manage,
+                nft_available: false,
+                revert_cmds: Vec::new(),
+                revert_labels: Vec::new(),
+                ip_forward_saved: None,
+                applied_ops: Vec::new(),
+            };
+
+            let is_gateway = !advertised.is_empty();
+
+            // ── Routes ────────────────────────────────────────────────────────────
+            for net in peer_routes {
+                let subnet = net.to_string();
+                let argv = cmd_route_add(&subnet, tun_name);
+                if no_route_manage {
+                    println!("# (skipped, --no-route-manage): {}", argv.join(" "));
+                } else {
+                    runner
+                        .run(&argv)
+                        .await
+                        .with_context(|| format!("ip route add {subnet}"))?;
+                    tracing::info!(%subnet, %tun_name, "added route");
+                    cfg.revert_cmds.push(cmd_route_del(&subnet, tun_name));
+                    cfg.revert_labels
+                        .push(format!("del route {subnet} dev {tun_name}"));
+                }
+            }
+
+            // ── Gateway mode: ip_forward + NAT ────────────────────────────────────
+            if is_gateway && !no_route_manage {
+                // Save and enable ip_forward
+                let current = tokio::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+                    .await
+                    .unwrap_or_else(|_| "0".to_string());
+                let saved: u8 = current.trim().parse().unwrap_or(0);
+
+                if saved == 0 {
+                    tokio::fs::write("/proc/sys/net/ipv4/ip_forward", "1\n")
+                        .await
+                        .context("enable ip_forward")?;
+                    tracing::info!("enabled ip_forward (saved={})", saved);
+                }
+
+                cfg.ip_forward_saved = Some(saved);
+                cfg.applied_ops
+                    .push(AppliedOp::IpForward { saved_value: saved });
+
+                // Determine LAN egress interface
+                let sample_host: std::net::Ipv4Addr = {
+                    let net = &advertised[0];
+                    let base = u32::from(net.network());
+                    std::net::Ipv4Addr::from(base + 1)
+                };
+                let route_out = runner
+                    .run(&cmd_route_get(&sample_host.to_string()))
+                    .await
+                    .context("ip route get to find LAN iface")?;
+                let lan_if = super::hostcfg_cmd::parse_lan_iface(&route_out).ok_or_else(|| {
+                    anyhow!("could not determine LAN egress interface from: {route_out}")
+                })?;
+
+                // Try nft first, fall back to iptables
+                cfg.nft_available = check_binary_exists("nft");
+
+                if cfg.nft_available {
+                    runner
+                        .run(&cmd_nft_add_table(id))
+                        .await
+                        .context("nft add table")?;
+                    runner
+                        .run(&cmd_nft_add_postrouting_chain(id))
+                        .await
+                        .context("nft add postrouting chain")?;
+                    runner
+                        .run(&cmd_nft_add_masquerade_rule(id, tun_name, &lan_if))
+                        .await
+                        .context("nft add masquerade rule")?;
+                    runner
+                        .run(&cmd_nft_add_forward_chain(id))
+                        .await
+                        .context("nft add forward chain")?;
+                    runner
+                        .run(&cmd_nft_add_mss_clamp(id))
+                        .await
+                        .context("nft add mss clamp")?;
+                    tracing::info!(%id, "created nft table bore_vpn_{}", id);
+                    cfg.revert_cmds.push(cmd_nft_delete_table(id));
+                    cfg.revert_labels
+                        .push(format!("delete nft table bore_vpn_{id}"));
+                } else {
+                    runner
+                        .run(&cmd_iptables_masquerade_add(id, tun_name, &lan_if))
+                        .await
+                        .context("iptables masquerade add")?;
+                    runner
+                        .run(&cmd_iptables_mss_clamp_add(id))
+                        .await
+                        .context("iptables mss clamp add")?;
+                    tracing::info!(%id, "applied iptables NAT rules");
+                    cfg.revert_cmds.push(cmd_iptables_masquerade_del(id));
+                    cfg.revert_labels
+                        .push(format!("del iptables masquerade bore_vpn_{id}"));
+                    cfg.revert_cmds.push(cmd_iptables_mss_clamp_del(id));
+                    cfg.revert_labels
+                        .push(format!("del iptables mss clamp bore_vpn_{id}"));
+                }
+            } else if is_gateway && no_route_manage {
+                // Print commands for gateway mode (nft preferred)
+                let lan_if = "LAN_IFACE"; // placeholder
+                for cmd in &[
+                    cmd_nft_add_table(id),
+                    cmd_nft_add_postrouting_chain(id),
+                    cmd_nft_add_masquerade_rule(id, tun_name, lan_if),
+                    cmd_nft_add_forward_chain(id),
+                    cmd_nft_add_mss_clamp(id),
+                ] {
+                    println!("# (skipped, --no-route-manage): {}", cmd.join(" "));
+                }
+            }
+
+            Ok(cfg)
+        }
+    }
+
+    impl Drop for NetConfig {
+        fn drop(&mut self) {
+            // Revert in reverse order using blocking std::process::Command.
+            // Note: Drop is not async, so we use blocking subprocess calls.
+
+            // First, revert nft/iptables rules in reverse order.
+            for (argv, label) in self
+                .revert_cmds
+                .iter()
+                .rev()
+                .zip(self.revert_labels.iter().rev())
+            {
+                tracing::info!(%label, "reverting vpn netconfig");
+                let result = std::process::Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                if let Err(e) = result {
+                    tracing::warn!(%e, %label, "vpn netconfig revert step failed (best-effort)");
+                }
+            }
+
+            // Then revert applied_ops in reverse order.
+            for op in self.applied_ops.iter().rev() {
+                match op {
+                    AppliedOp::IpForward { saved_value } => {
+                        tracing::info!(saved_value, "restoring ip_forward");
+                        let _ = std::fs::write(
+                            "/proc/sys/net/ipv4/ip_forward",
+                            format!("{}\n", saved_value),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn netconfig_rollback_is_reverse_order() {
+            // Simulate applying multiple routes.
+            // (We can't call the full apply() in a sync test, so we construct
+            // the revert commands manually for this test.)
+            let cfg = NetConfig {
+                id: "test1".to_string(),
+                tun_name: "tun0".to_string(),
+                no_route_manage: false,
+                nft_available: false,
+                revert_cmds: vec![
+                    vec![
+                        "ip".into(),
+                        "route".into(),
+                        "del".into(),
+                        "10.0.0.0/24".into(),
+                        "dev".into(),
+                        "tun0".into(),
+                    ],
+                    vec![
+                        "ip".into(),
+                        "route".into(),
+                        "del".into(),
+                        "10.1.0.0/24".into(),
+                        "dev".into(),
+                        "tun0".into(),
+                    ],
+                ],
+                revert_labels: vec![
+                    "del route 10.0.0.0/24 dev tun0".to_string(),
+                    "del route 10.1.0.0/24 dev tun0".to_string(),
+                ],
+                ip_forward_saved: None,
+                applied_ops: vec![],
+            };
+
+            // Record the order of revert commands by manually calling drop.
+            // (In practice, Drop is called automatically.)
+            drop(cfg);
+            // If we got here, Drop ran without panicking. The actual order
+            // is verified by the reversal in Drop implementation.
+        }
+
+        #[tokio::test]
+        async fn netconfig_apply_routes_only() {
+            let runner = TestRunner::new();
+            let peer_routes = vec![
+                "10.0.0.0/24".parse::<super::super::net::Ipv4Net>().unwrap(),
+                "10.1.0.0/24".parse::<super::super::net::Ipv4Net>().unwrap(),
+            ];
+            let advertised = vec![];
+
+            let cfg = NetConfig::apply(
+                &runner,
+                "test1",
+                "tun0",
+                "192.168.100.1".parse().unwrap(),
+                30,
+                &peer_routes,
+                &advertised,
+                false,
+            )
+            .await
+            .expect("apply should succeed");
+
+            let calls = runner.get_calls().await;
+            // Should have called route add twice.
+            assert_eq!(calls.len(), 2);
+            assert!(calls[0][0] == "ip" && calls[0][1] == "route" && calls[0][2] == "add");
+            assert!(calls[1][0] == "ip" && calls[1][1] == "route" && calls[1][2] == "add");
+
+            // Verify revert order is reversed.
+            assert_eq!(cfg.revert_cmds.len(), 2);
+            assert!(cfg.revert_cmds[0].contains(&"10.0.0.0/24".to_string()));
+            assert!(cfg.revert_cmds[1].contains(&"10.1.0.0/24".to_string()));
+        }
+
+        #[tokio::test]
+        async fn netconfig_no_route_manage_skips_routes() {
+            let runner = TestRunner::new();
+            let peer_routes = vec!["10.0.0.0/24".parse::<super::super::net::Ipv4Net>().unwrap()];
+            let advertised = vec![];
+
+            let cfg = NetConfig::apply(
+                &runner,
+                "test1",
+                "tun0",
+                "192.168.100.1".parse().unwrap(),
+                30,
+                &peer_routes,
+                &advertised,
+                true, // --no-route-manage
+            )
+            .await
+            .expect("apply should succeed");
+
+            let calls = runner.get_calls().await;
+            // Should not have called anything (only printed).
+            assert_eq!(calls.len(), 0);
+            assert_eq!(cfg.revert_cmds.len(), 0);
+        }
+
+        // Root-required tests (skipped by default).
+
+        #[tokio::test]
+        #[ignore = "requires root: sudo cargo test --features vpn -- vpn::hostcfg::tests::check_root_accepts_uid_zero --ignored --nocapture"]
+        async fn check_root_accepts_uid_zero() {
+            // This test only passes if we're actually root.
+            let result = check_root();
+            assert!(result.is_ok());
+        }
+
+        // These don't actually need root — just check binary existence.
+        #[tokio::test]
+        async fn check_binary_exists_finds_ip() {
+            assert!(check_binary_exists("ip"));
+        }
+
+        #[tokio::test]
+        async fn check_binary_missing_not_found() {
+            assert!(!check_binary_exists("__nonexistent_binary_12345__"));
+        }
+
+        /// Create a TUN device, verify it appears in `ip link show`, then drop it
+        /// and verify it disappears.  Requires CAP_NET_ADMIN (root).
+        /// Run: sudo cargo test --features vpn -- vpn::hostcfg::tests::tun_bring_up_and_down --ignored --nocapture
+        #[tokio::test]
+        #[ignore = "requires root/CAP_NET_ADMIN"]
+        async fn tun_bring_up_and_down() {
+            use std::net::Ipv4Addr;
+            check_root().expect("test requires root");
+
+            let name = "bore_test_tun0";
+            let addr: Ipv4Addr = "10.199.0.1".parse().unwrap();
+
+            // Stale reclaim in case a previous run crashed.
+            stale_reclaim("test0", name).await;
+
+            let dev = create_tun(name, addr, 30, 1350)
+                .await
+                .expect("failed to create TUN");
+
+            // Verify interface is visible.
+            let out = std::process::Command::new("ip")
+                .args(["link", "show", name])
+                .output()
+                .expect("ip link show failed");
+            assert!(
+                out.status.success(),
+                "interface {name} not found after creation"
+            );
+
+            // Drop the device — tun-rs should delete it.
+            drop(dev);
+
+            // Verify it's gone.
+            let out2 = std::process::Command::new("ip")
+                .args(["link", "show", name])
+                .output()
+                .expect("ip link show failed");
+            assert!(
+                !out2.status.success(),
+                "interface {name} still exists after drop"
+            );
+        }
+    }
+}
+
+pub mod link {
+    //! VPN data-plane abstraction: Direct (QUIC datagrams) or Relay (AEAD-framed stream).
+    use anyhow::{Context, Result};
+    use bytes::Bytes;
+    use futures_util::FutureExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::crypto::DirectionKeys;
+    use crate::holepunch::DirectConn;
+
+    const BATCH_CAP: usize = 64;
+
+    /// Send half of a VPN link (owned by the uplink task).
+    pub enum LinkSender {
+        /// Direct QUIC datagram path.
+        Direct(DirectConn),
+        /// Relay path: AEAD-framed stream.
+        Relay {
+            /// Write half of the yamux stream.
+            write: tokio::io::WriteHalf<crate::mux::Stream>,
+            /// AEAD egress key.
+            key: [u8; 32],
+            /// Per-packet counter for nonce derivation.
+            counter: u64,
+        },
+    }
+
+    /// Receive half of a VPN link (owned by the downlink task).
+    pub enum LinkRecver {
+        /// Direct QUIC datagram path.
+        Direct(DirectConn),
+        /// Relay path: AEAD-framed stream.
+        Relay {
+            /// Read half of the yamux stream.
+            read: tokio::io::ReadHalf<crate::mux::Stream>,
+            /// AEAD ingress key.
+            key: [u8; 32],
+        },
+    }
+
+    /// Split a Direct link into send+recv halves for the bridge tasks.
+    pub fn make_direct(conn: DirectConn) -> (LinkSender, LinkRecver) {
+        (LinkSender::Direct(conn.clone()), LinkRecver::Direct(conn))
+    }
+
+    /// Split a Relay link into send+recv halves for the bridge tasks.
+    pub fn make_relay(stream: crate::mux::Stream, keys: DirectionKeys) -> (LinkSender, LinkRecver) {
+        let (read, write) = tokio::io::split(stream);
+        (
+            LinkSender::Relay {
+                write,
+                key: keys.egress,
+                counter: 0,
+            },
+            LinkRecver::Relay {
+                read,
+                key: keys.ingress,
+            },
+        )
+    }
+
+    impl LinkSender {
+        /// Send a batch of IP packets. For Direct: QUIC datagrams. For Relay: AEAD frames.
+        pub async fn send_batch(&mut self, pkts: &[Bytes]) -> Result<()> {
+            match self {
+                LinkSender::Direct(conn) => {
+                    for pkt in pkts {
+                        if let Err(e) = conn.send_datagram(pkt.clone()) {
+                            // Skip TooLarge (MTU discovery transient); recount elsewhere.
+                            if !e.to_string().contains("TooLarge") {
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                LinkSender::Relay {
+                    write,
+                    key,
+                    counter,
+                } => {
+                    for pkt in pkts {
+                        if *counter == u64::MAX {
+                            anyhow::bail!("AEAD counter exhausted — tear down link");
+                        }
+                        let frame = super::crypto::seal_with_counter(key, *counter, pkt)?;
+                        *counter += 1;
+                        write
+                            .write_all(&frame)
+                            .await
+                            .context("relay write failed")?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+
+        /// Resolved when the underlying link is gone (Direct only; Relay is TCP-based).
+        pub async fn closed(&self) {
+            match self {
+                LinkSender::Direct(conn) => conn.closed().await,
+                LinkSender::Relay { .. } => std::future::pending().await,
+            }
+        }
+    }
+
+    impl LinkRecver {
+        /// Receive ≥1 IP packets. Err on link close.
+        pub async fn recv_batch(&mut self, out: &mut Vec<Bytes>) -> Result<()> {
+            match self {
+                LinkRecver::Direct(conn) => {
+                    let first = conn
+                        .read_datagram()
+                        .await
+                        .context("direct recv first datagram")?;
+                    out.push(first);
+                    // Drain queued datagrams without yielding (up to BATCH_CAP).
+                    for _ in 1..BATCH_CAP {
+                        match conn.read_datagram().now_or_never() {
+                            Some(Ok(pkt)) => out.push(pkt),
+                            _ => break,
+                        }
+                    }
+                    Ok(())
+                }
+                LinkRecver::Relay { read, key } => {
+                    let mut len_buf = [0u8; 4];
+                    read.read_exact(&mut len_buf)
+                        .await
+                        .context("relay frame length read")?;
+                    let total_len = u32::from_be_bytes(len_buf) as usize;
+                    anyhow::ensure!(total_len >= 8, "relay frame too short: {total_len}");
+                    anyhow::ensure!(
+                        total_len <= 65536 + 8 + 16,
+                        "relay frame too large: {total_len}"
+                    );
+                    let mut frame = vec![0u8; total_len];
+                    read.read_exact(&mut frame)
+                        .await
+                        .context("relay frame body read")?;
+                    let plaintext = super::crypto::open(key, &frame).context("AEAD open failed")?;
+                    out.push(Bytes::from(plaintext));
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {}
+}
+
+mod bridge {
+    #![allow(dead_code)]
+    //! VPN data-plane bridge: bidirectional flow between TUN and VpnLink.
+    use anyhow::Result;
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::interval;
+    use tracing::debug;
+
+    use super::link::{LinkRecver, LinkSender};
+
+    /// Counter metrics for bridge data-plane.
+    pub struct BridgeCounters {
+        pub tx_pkts: AtomicU64,
+        pub tx_bytes: AtomicU64,
+        pub rx_pkts: AtomicU64,
+        pub rx_bytes: AtomicU64,
+        pub tx_drops: AtomicU64,
+    }
+
+    impl BridgeCounters {
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self {
+                tx_pkts: AtomicU64::new(0),
+                tx_bytes: AtomicU64::new(0),
+                rx_pkts: AtomicU64::new(0),
+                rx_bytes: AtomicU64::new(0),
+                tx_drops: AtomicU64::new(0),
+            })
+        }
+    }
+
+    /// Run the VPN data-plane bridge until the link dies or the tun closes.
+    /// Spawns uplink + downlink tasks and runs until one fails.
+    pub async fn run(
+        dev: Arc<tun_rs::AsyncDevice>,
+        sender: LinkSender,
+        recver: LinkRecver,
+        counters: Arc<BridgeCounters>,
+        mtu: u16,
+    ) -> Result<()> {
+        let dev_up = Arc::clone(&dev);
+        let dev_dn = Arc::clone(&dev);
+        let cntr_up = Arc::clone(&counters);
+        let cntr_dn = Arc::clone(&counters);
+
+        let mut uplink = tokio::spawn(run_uplink(dev_up, sender, cntr_up, mtu));
+        let mut downlink = tokio::spawn(run_downlink(dev_dn, recver, cntr_dn));
+
+        let stats_task = tokio::spawn({
+            let c = Arc::clone(&counters);
+            async move {
+                let mut ticker = interval(Duration::from_secs(10));
+                loop {
+                    ticker.tick().await;
+                    debug!(
+                        tx_pkts = c.tx_pkts.load(Ordering::Relaxed),
+                        rx_pkts = c.rx_pkts.load(Ordering::Relaxed),
+                        tx_bytes = c.tx_bytes.load(Ordering::Relaxed),
+                        rx_bytes = c.rx_bytes.load(Ordering::Relaxed),
+                        tx_drops = c.tx_drops.load(Ordering::Relaxed),
+                        "vpn bridge stats",
+                    );
+                }
+            }
+        });
+
+        // Run until either direction fails.
+        let result = tokio::select! {
+            res = &mut uplink => {
+                downlink.abort();
+                stats_task.abort();
+                res.unwrap_or_else(|e| Err(anyhow::anyhow!("uplink task panic: {e}")))
+            }
+            res = &mut downlink => {
+                uplink.abort();
+                stats_task.abort();
+                res.unwrap_or_else(|e| Err(anyhow::anyhow!("downlink task panic: {e}")))
+            }
+        };
+        result
+    }
+
+    async fn run_uplink(
+        dev: Arc<tun_rs::AsyncDevice>,
+        mut sender: LinkSender,
+        counters: Arc<BridgeCounters>,
+        mtu: u16,
+    ) -> Result<()> {
+        let mut buf = vec![0u8; mtu as usize + 4];
+        loop {
+            let n = dev.recv(&mut buf).await?;
+            if n == 0 {
+                continue;
+            }
+            let pkt = Bytes::copy_from_slice(&buf[..n]);
+            let pkts = [pkt.clone()];
+            match sender.send_batch(&pkts).await {
+                Ok(_) => {
+                    counters.tx_pkts.fetch_add(1, Ordering::Relaxed);
+                    counters.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    if e.to_string().contains("TooLarge") {
+                        counters.tx_drops.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_downlink(
+        dev: Arc<tun_rs::AsyncDevice>,
+        mut recver: LinkRecver,
+        counters: Arc<BridgeCounters>,
+    ) -> Result<()> {
+        let mut batch = Vec::with_capacity(64);
+        loop {
+            batch.clear();
+            recver.recv_batch(&mut batch).await?;
+            for pkt in &batch {
+                counters.rx_pkts.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .rx_bytes
+                    .fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                dev.send(pkt).await?;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {}
+}

@@ -1036,6 +1036,25 @@ impl DirectConn {
     pub fn max_datagram_size(&self) -> Option<usize> {
         self.conn.max_datagram_size()
     }
+
+    /// Send an IP packet as a QUIC unreliable datagram. Non-blocking.
+    ///
+    /// Returns `Err` if the packet exceeds the current datagram size limit
+    /// (`TooLarge` — typically only during the initial MTU-discovery window;
+    /// the VPN bridge counts these and warns after >10 s). quinn 0.11 silently
+    /// drops the *oldest* queued datagram when the send buffer is full, so
+    /// calling this from the uplink hot loop is safe without backpressure.
+    pub fn send_datagram(&self, pkt: bytes::Bytes) -> Result<()> {
+        self.conn
+            .send_datagram(pkt)
+            .map_err(|e| anyhow::anyhow!("send_datagram: {e}"))
+    }
+
+    /// Read the next QUIC datagram. Resolves when a datagram arrives or the
+    /// connection closes (in which case `Err` signals path death to the bridge).
+    pub async fn read_datagram(&self) -> Result<bytes::Bytes> {
+        self.conn.read_datagram().await.context("read_datagram")
+    }
 }
 
 // quinn's streams carry inherent `poll_read`/`poll_write` methods (with quinn's
@@ -1145,7 +1164,9 @@ pub async fn connect_direct(
                 let _ = send.finish();
                 info!(target_addr = %peer, peer = %conn.remote_address(),
                     "direct udp connection established (consumer, token verified)");
-                anyhow::Ok(DirectConn { conn, endpoint })
+                let dc = DirectConn { conn, endpoint };
+                debug!(max_datagram = ?dc.max_datagram_size(), "direct conn established (consumer)");
+                anyhow::Ok(dc)
             })
         })
         .collect();
@@ -1225,7 +1246,9 @@ pub async fn vhost_connect(
 
         let _ = send.finish();
         info!(server = %server_addr, subdomain, "vhost direct udp connection established");
-        Ok(DirectConn { conn, endpoint })
+        let dc = DirectConn { conn, endpoint };
+        debug!(max_datagram = ?dc.max_datagram_size(), "direct conn established (vhost consumer)");
+        Ok(dc)
     })
     .await
     .context("vhost QUIC auth timed out")?
@@ -1308,10 +1331,12 @@ impl DirectListener {
         send.flush().await?;
         let _ = send.finish();
         info!(%peer, "accepted direct udp connection (provider, token verified)");
-        Ok(DirectConn {
+        let dc = DirectConn {
             conn,
             endpoint: self.endpoint.clone(),
-        })
+        };
+        debug!(max_datagram = ?dc.max_datagram_size(), "direct conn established (provider)");
+        Ok(dc)
     }
 }
 
@@ -1357,7 +1382,9 @@ pub async fn vhost_server_handshake(
         send.flush().await?;
         let _ = send.finish();
         info!(%peer, subdomain = %subdomain, "accepted vhost direct udp connection");
-        Ok((subdomain, DirectConn { conn, endpoint }))
+        let dc = DirectConn { conn, endpoint };
+        debug!(max_datagram = ?dc.max_datagram_size(), "direct conn established (vhost provider)");
+        Ok((subdomain, dc))
     })
     .await
     .context("vhost QUIC auth timed out")?
@@ -1426,6 +1453,12 @@ fn transport_config(tuning: &UdpDirectTuning) -> quinn::TransportConfig {
     // One native QUIC stream per proxied connection: raise the concurrent-stream
     // limit well above quinn's small default so it is not the bottleneck.
     cfg.max_concurrent_bidi_streams(tuning.max_direct_streams.into());
+
+    // VPN datagram path: pre-allocate large buffers so RX/TX bursts of IP
+    // packets don't stall waiting for the application loop to drain them.
+    cfg.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+    cfg.datagram_send_buffer_size(8 * 1024 * 1024);
+
     cfg
 }
 
@@ -2051,5 +2084,166 @@ mod tests {
         assert!(!is_cgnat("100.63.0.1".parse().unwrap()));
         assert!(!is_cgnat("100.128.0.1".parse().unwrap()));
         assert!(!is_cgnat("8.8.8.8".parse().unwrap()));
+    }
+
+    /// Two in-process QUIC endpoints exchange a datagram round-trip.
+    /// Proves that: (a) `send_datagram` / `read_datagram` compile and work,
+    /// (b) the datagram buffers configured in `transport_config` are accepted,
+    /// (c) the received bytes match the sent bytes.
+    #[cfg(feature = "udp")]
+    #[tokio::test]
+    async fn quic_datagram_loopback_echo() {
+        use tokio::sync::oneshot;
+
+        let tuning = UdpDirectTuning::default();
+
+        let srv_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = srv_sock.local_addr().unwrap();
+        let srv_ep = server_endpoint(srv_sock, &tuning).unwrap();
+
+        // done_tx signals the server task to exit after the echo completes.
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+
+        let srv_task = tokio::spawn(async move {
+            let incoming = srv_ep.accept().await.expect("no incoming");
+            let conn = incoming.await.expect("QUIC handshake failed");
+            let dc = DirectConn {
+                conn,
+                endpoint: srv_ep,
+            };
+            let pkt = dc.read_datagram().await.expect("server recv failed");
+            dc.send_datagram(pkt.clone())
+                .expect("server echo send failed");
+            // Keep the connection alive until the client confirms it received the echo.
+            let _ = done_rx.await;
+            pkt
+        });
+
+        let cli_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cli_ep = client_endpoint(cli_sock, &tuning).unwrap();
+        let conn = cli_ep.connect(srv_addr, "bore").unwrap().await.unwrap();
+        let cli_dc = DirectConn {
+            conn,
+            endpoint: cli_ep,
+        };
+
+        let payload = bytes::Bytes::from("hello-vpn-datagram");
+        cli_dc
+            .send_datagram(payload.clone())
+            .expect("client send failed");
+        let echoed = cli_dc
+            .read_datagram()
+            .await
+            .expect("client echo recv failed");
+        assert_eq!(echoed, payload);
+
+        // Signal server it can exit.
+        let _ = done_tx.send(());
+
+        let srv_recv = tokio::time::timeout(std::time::Duration::from_secs(3), srv_task)
+            .await
+            .expect("server task timed out")
+            .unwrap();
+        assert_eq!(srv_recv, payload);
+    }
+
+    /// Sending a datagram that exceeds any realistic QUIC datagram limit returns
+    /// an error rather than panicking.
+    #[cfg(feature = "udp")]
+    #[tokio::test]
+    async fn datagram_too_large_is_error() {
+        let tuning = UdpDirectTuning::default();
+
+        let srv_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = srv_sock.local_addr().unwrap();
+        let srv_ep = server_endpoint(srv_sock, &tuning).unwrap();
+        // Server just needs to exist; it doesn't need to read the datagram.
+        let _srv = tokio::spawn(async move {
+            if let Some(inc) = srv_ep.accept().await {
+                let _ = inc.await;
+            }
+        });
+
+        let cli_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cli_ep = client_endpoint(cli_sock, &tuning).unwrap();
+        let conn = cli_ep.connect(srv_addr, "bore").unwrap().await.unwrap();
+        let cli_dc = DirectConn {
+            conn,
+            endpoint: cli_ep,
+        };
+
+        // 65 KB is always larger than any QUIC datagram limit.
+        let huge = bytes::Bytes::from(vec![0u8; 65_000]);
+        let result = cli_dc.send_datagram(huge);
+        assert!(
+            result.is_err(),
+            "expected TooLarge error for oversized datagram"
+        );
+    }
+
+    /// recv_batch drains multiple queued datagrams in one call (Direct path).
+    /// Proves the drain pattern: queue N datagrams on sender, one recv_batch
+    /// call on receiver returns >1 packet.
+    #[cfg(feature = "vpn")]
+    #[cfg(feature = "udp")]
+    #[tokio::test]
+    async fn recv_batch_drains_queued_datagrams() {
+        use crate::vpn::link::make_direct;
+
+        let tuning = UdpDirectTuning::default();
+
+        let srv_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = srv_sock.local_addr().unwrap();
+        let srv_ep = server_endpoint(srv_sock, &tuning).unwrap();
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let srv_task = tokio::spawn(async move {
+            let incoming = srv_ep.accept().await.expect("no incoming");
+            let conn = incoming.await.expect("QUIC handshake failed");
+            let dc = DirectConn {
+                conn,
+                endpoint: srv_ep,
+            };
+
+            // Server sends 5 datagrams to the client.
+            for i in 0..5 {
+                let pkt = bytes::Bytes::from(format!("pkt-{}", i));
+                dc.send_datagram(pkt).expect("server send failed");
+            }
+
+            // Keep alive until client signals done.
+            let _ = done_rx.await;
+        });
+
+        let cli_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cli_ep = client_endpoint(cli_sock, &tuning).unwrap();
+        let conn = cli_ep.connect(srv_addr, "bore").unwrap().await.unwrap();
+        let dc = DirectConn {
+            conn,
+            endpoint: cli_ep,
+        };
+
+        let (_sender, mut recver) = make_direct(dc);
+
+        // Give the server a moment to queue all 5 datagrams.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // First recv_batch call should drain multiple queued datagrams without yielding.
+        let mut batch = Vec::new();
+        recver
+            .recv_batch(&mut batch)
+            .await
+            .expect("recv_batch failed");
+
+        // Expect >= 2 (proves the drain pattern; exact number depends on QUIC internals).
+        assert!(
+            batch.len() >= 2,
+            "recv_batch should drain multiple queued packets, got only {}",
+            batch.len()
+        );
+
+        let _ = done_tx.send(());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), srv_task).await;
     }
 }

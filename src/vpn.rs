@@ -4,7 +4,6 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info};
 
 /// Public arg struct for `bore vpn listen` (converted from CLI args).
@@ -178,33 +177,72 @@ pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
     )
     .await?;
 
-    // Wait for relay substream from server (connector must connect within 60 s).
-    // Without a timeout the listener hangs indefinitely if the connector crashes
-    // after VpnReady is sent but before it opens the relay substream.
-    let mut relay_stream = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        acceptor.accept(),
-    )
-    .await
-    .context("timed out waiting for relay substream (connector did not connect within 60 s)")?
-    .context("server did not open relay substream")?;
-
-    // Read STREAM_READY marker
-    let mut marker = [0u8; 1];
-    relay_stream.read_exact(&mut marker).await?;
+    // Accept the two relay substreams (one per direction) from the server.
+    let (egress, ingress) = link::accept_relay(&mut acceptor).await?;
 
     // Build relay link
     let keys = crypto::derive_keys_listener(&args.secret, &session_nonce)?;
-    let (sender, recver) = link::make_relay(relay_stream, keys);
+    let (sender, recver) = link::make_relay(egress, ingress, keys);
     let counters = bridge::BridgeCounters::new();
 
     info!(link_id = %args.id, "vpn link bridge starting");
 
-    // Run the bridge until it closes
-    bridge::run(dev, sender, recver, counters, args.mtu, offload).await?;
+    // Run the bridge until it closes or the control connection dies.
+    let result = run_bridge_with_ctrl(
+        &args.id, ctrl, dev, sender, recver, counters, args.mtu, offload,
+    )
+    .await;
 
     info!(link_id = %args.id, "vpn link bridge closed");
-    Ok(())
+    result
+}
+
+/// Run the data-plane bridge alongside a control-stream drainer.
+///
+/// The server sends `Heartbeat` on the control stream every 500 ms. Without a
+/// reader those frames would slowly exhaust the stream's receive window, and —
+/// worse — server death would go completely unnoticed: the bridge would keep
+/// "running" with zero traffic and no log line. Draining the stream gives us
+/// prompt, loud detection of a lost server.
+#[allow(clippy::too_many_arguments)]
+async fn run_bridge_with_ctrl(
+    link_id: &str,
+    mut ctrl: crate::shared::Delimited<crate::mux::Stream>,
+    dev: Arc<tun_rs::AsyncDevice>,
+    sender: link::LinkSender,
+    recver: link::LinkRecver,
+    counters: Arc<bridge::BridgeCounters>,
+    mtu: u16,
+    offload: bool,
+) -> Result<()> {
+    let mut ctrl_task = tokio::spawn(async move {
+        loop {
+            match ctrl.recv::<crate::shared::ServerMessage>().await {
+                Ok(Some(crate::shared::ServerMessage::Heartbeat)) => continue,
+                Ok(Some(msg)) => {
+                    tracing::debug!(?msg, "ignoring control message on vpn link");
+                }
+                Ok(None) => return anyhow!("server closed the vpn control stream"),
+                Err(e) => return anyhow!("vpn control stream error: {e}"),
+            }
+        }
+    });
+
+    // The bridge owns spawned uplink/downlink tasks; on either exit path the
+    // process tears down right after (NetConfig RAII reverts host state), so
+    // aborting the loser of the select is enough.
+    let result = tokio::select! {
+        res = bridge::run(dev, sender, recver, counters, mtu, offload) => {
+            ctrl_task.abort();
+            res
+        }
+        res = &mut ctrl_task => {
+            let err = res.unwrap_or_else(|e| anyhow!("vpn control task panicked: {e}"));
+            error!(link_id = %link_id, error = %err, "vpn control connection lost; closing link");
+            Err(err)
+        }
+    };
+    result
 }
 
 /// Start a VPN connector.
@@ -307,22 +345,24 @@ pub async fn run_connect(args: VpnConnectArgs) -> Result<()> {
     )
     .await?;
 
-    // Open relay substream and write STREAM_READY
-    let mut relay_stream = opener.open().await.context("open relay substream")?;
-    relay_stream.write_all(&[crate::mux::STREAM_READY]).await?;
+    // Open the two relay substreams (one per direction) and tag them.
+    let (egress, ingress) = link::connect_relay(&opener).await?;
 
     // Build relay link
     let keys = crypto::derive_keys_connector(&args.secret, &session_nonce)?;
-    let (sender, recver) = link::make_relay(relay_stream, keys);
+    let (sender, recver) = link::make_relay(egress, ingress, keys);
     let counters = bridge::BridgeCounters::new();
 
     info!(link_id = %args.id, "vpn link bridge starting");
 
-    // Run the bridge until it closes
-    bridge::run(dev, sender, recver, counters, args.mtu, offload).await?;
+    // Run the bridge until it closes or the control connection dies.
+    let result = run_bridge_with_ctrl(
+        &args.id, ctrl, dev, sender, recver, counters, args.mtu, offload,
+    )
+    .await;
 
     info!(link_id = %args.id, "vpn link bridge closed");
-    Ok(())
+    result
 }
 
 /// Reexport submodules as public for use by tests and from main.rs.
@@ -516,20 +556,25 @@ pub mod net {
     }
 }
 
-mod crypto {
+/// Relay AEAD framing: HKDF key derivation + ChaCha20-Poly1305 seal/open.
+/// Public so integration tests can drive the relay link without a TUN device.
+pub mod crypto {
     #![allow(dead_code)]
     use anyhow::{bail, Result};
     use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
     use ring::hkdf;
 
     const MAX_COUNTER: u64 = u64::MAX - 1;
+    /// ChaCha20-Poly1305 authentication tag length in bytes.
     pub const TAG_LEN: usize = 16;
     const INFO_L2C: &[u8] = b"bore-vpn l2c v1";
     const INFO_C2L: &[u8] = b"bore-vpn c2l v1";
 
     /// Two derived 32-byte keys for the two directions.
     pub struct DirectionKeys {
+        /// Key for frames this side seals and sends.
         pub egress: [u8; 32],
+        /// Key for frames received from the peer.
         pub ingress: [u8; 32],
     }
 
@@ -1587,9 +1632,17 @@ pub mod hostcfg {
 }
 
 pub mod link {
-    //! VPN data-plane abstraction: Direct (QUIC datagrams) or Relay (AEAD-framed stream).
+    //! VPN data-plane abstraction: Direct (QUIC datagrams) or Relay (AEAD-framed streams).
+    //!
+    //! The relay path uses **two** yamux substreams, one per direction, so that
+    //! each `yamux::Stream` object is polled by exactly one task. A `yamux::Stream`
+    //! must never be shared between two tasks (e.g. via `tokio::io::split`):
+    //! `poll_read` and `poll_write` both call `poll_ready` on the stream's single
+    //! `futures::channel::mpsc::Sender`, which holds **one** parked-task waker.
+    //! Two tasks polling the same stream overwrite each other's waker, and the
+    //! losing task is never woken again — the link wedges silently under load.
     use anyhow::{Context, Result};
-    use bytes::Bytes;
+    use bytes::{Buf, Bytes, BytesMut};
     use futures_util::FutureExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
@@ -1599,19 +1652,34 @@ pub mod link {
 
     const BATCH_CAP: usize = 64;
 
-    // Relay write queue depth. When full, packets are dropped (congestion relief).
-    // TCP sessions above the VPN will retransmit; UDP is inherently lossy.
-    // ~512 × 1350 bytes ≈ 700 KB of in-flight relay buffer before dropping starts.
+    // Relay write queue depth (frames). The uplink awaits when full, propagating
+    // backpressure to the TUN read loop instead of dropping packets: the relay is
+    // an ordered, reliable byte stream, so loss here only multiplies inner-TCP
+    // retransmissions (and those retransmissions would be dropped too, collapsing
+    // every flow on the link).
     const RELAY_QUEUE: usize = 512;
+
+    // Target size for a single ingress read; large enough to pick up a full GRO
+    // batch worth of frames per syscall.
+    const RECV_BUF: usize = 128 * 1024;
+
+    /// Largest accepted relay frame body (8-byte counter + 65535-byte IP packet + AEAD tag).
+    const MAX_FRAME: usize = 8 + 65535 + super::crypto::TAG_LEN;
+
+    /// Direction tag for the connector→listener payload substream.
+    /// Written by the connector right after [`crate::mux::STREAM_READY`]; the
+    /// server consumes the marker and relays the tag to the listener.
+    pub const RELAY_TAG_UP: u8 = 1;
+    /// Direction tag for the listener→connector payload substream.
+    pub const RELAY_TAG_DOWN: u8 = 2;
 
     /// Send half of a VPN link (owned by the uplink task).
     pub enum LinkSender {
         /// Direct QUIC datagram path.
         Direct(DirectConn),
         /// Relay path: AEAD-framed stream.
-        /// The actual write is done by a background writer task; this side
-        /// uses non-blocking try_send so relay TCP congestion never deadlocks
-        /// the uplink loop.
+        /// The actual write is done by a background writer task that owns the
+        /// egress substream; the uplink communicates over a bounded channel.
         Relay {
             /// Channel to the background relay writer task.
             tx: mpsc::Sender<Bytes>,
@@ -1626,12 +1694,14 @@ pub mod link {
     pub enum LinkRecver {
         /// Direct QUIC datagram path.
         Direct(DirectConn),
-        /// Relay path: AEAD-framed stream.
+        /// Relay path: AEAD-framed stream. Owns the ingress substream outright.
         Relay {
-            /// Read half of the yamux stream.
-            read: tokio::io::ReadHalf<crate::mux::Stream>,
+            /// Ingress substream (this side only ever reads it).
+            read: crate::mux::Stream,
             /// AEAD ingress key.
             key: [u8; 32],
+            /// Accumulator for frame reassembly across reads.
+            acc: BytesMut,
         },
     }
 
@@ -1640,15 +1710,18 @@ pub mod link {
         (LinkSender::Direct(conn.clone()), LinkRecver::Direct(conn))
     }
 
-    /// Split a Relay link into send+recv halves for the bridge tasks.
+    /// Build a Relay link from the two direction substreams.
     ///
-    /// Spawns a background writer task that owns the write half. The uplink
-    /// loop communicates via a bounded channel, so relay TCP congestion cannot
-    /// block the bridge (excess frames are dropped instead of stalling the loop).
-    pub fn make_relay(stream: crate::mux::Stream, keys: DirectionKeys) -> (LinkSender, LinkRecver) {
-        let (read, write) = tokio::io::split(stream);
+    /// `egress` is the substream this side writes its sealed frames to; `ingress`
+    /// is the substream the peer writes to. A background writer task takes sole
+    /// ownership of `egress`; the returned `LinkRecver` owns `ingress` outright.
+    pub fn make_relay(
+        egress: crate::mux::Stream,
+        ingress: crate::mux::Stream,
+        keys: DirectionKeys,
+    ) -> (LinkSender, LinkRecver) {
         let (tx, rx) = mpsc::channel::<Bytes>(RELAY_QUEUE);
-        tokio::spawn(relay_writer(write, rx));
+        tokio::spawn(relay_writer(egress, rx));
         (
             LinkSender::Relay {
                 tx,
@@ -1656,24 +1729,106 @@ pub mod link {
                 counter: 0,
             },
             LinkRecver::Relay {
-                read,
+                read: ingress,
                 key: keys.ingress,
+                acc: BytesMut::with_capacity(RECV_BUF),
             },
         )
     }
 
-    /// Background task: drain the relay write queue and write frames to the yamux stream.
-    /// Exits on write error (broken relay TCP); subsequent try_send calls in the uplink
-    /// task will see Disconnected and propagate the error, tearing down the bridge.
-    async fn relay_writer(
-        mut write: tokio::io::WriteHalf<crate::mux::Stream>,
-        mut rx: mpsc::Receiver<Bytes>,
-    ) {
-        while let Some(frame) = rx.recv().await {
-            if write.write_all(&frame).await.is_err() {
-                break;
+    /// Connector side: open the two relay substreams and tag their directions.
+    /// Returns `(egress, ingress)` from the connector's perspective.
+    pub async fn connect_relay(
+        opener: &crate::mux::Opener,
+    ) -> Result<(crate::mux::Stream, crate::mux::Stream)> {
+        let mut up = opener.open().await.context("open relay egress substream")?;
+        up.write_all(&[crate::mux::STREAM_READY, RELAY_TAG_UP])
+            .await
+            .context("write relay egress header")?;
+        let mut down = opener
+            .open()
+            .await
+            .context("open relay ingress substream")?;
+        down.write_all(&[crate::mux::STREAM_READY, RELAY_TAG_DOWN])
+            .await
+            .context("write relay ingress header")?;
+        Ok((up, down))
+    }
+
+    /// Listener side: accept the two relay substreams and sort them by tag.
+    /// Returns `(egress, ingress)` from the listener's perspective
+    /// (egress = `RELAY_TAG_DOWN` stream, ingress = `RELAY_TAG_UP` stream).
+    pub async fn accept_relay(
+        acceptor: &mut crate::mux::Acceptor,
+    ) -> Result<(crate::mux::Stream, crate::mux::Stream)> {
+        let mut up = None;
+        let mut down = None;
+        for _ in 0..2 {
+            // Without a timeout the listener hangs indefinitely if the connector
+            // crashes after VpnReady but before opening the relay substreams.
+            let mut stream = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                acceptor.accept(),
+            )
+            .await
+            .context(
+                "timed out waiting for relay substream (connector did not connect within 60 s)",
+            )?
+            .context("server closed before opening relay substreams")?;
+            let mut header = [0u8; 2];
+            stream
+                .read_exact(&mut header)
+                .await
+                .context("read relay substream header")?;
+            anyhow::ensure!(
+                header[0] == crate::mux::STREAM_READY,
+                "bad relay stream-ready marker: {}",
+                header[0]
+            );
+            match header[1] {
+                RELAY_TAG_UP => up = Some(stream),
+                RELAY_TAG_DOWN => down = Some(stream),
+                tag => anyhow::bail!(
+                    "unknown relay direction tag {tag} (peer built from an older version?)"
+                ),
             }
         }
+        match (down, up) {
+            (Some(down), Some(up)) => Ok((down, up)),
+            _ => anyhow::bail!("duplicate relay direction tag (peer built from an older version?)"),
+        }
+    }
+
+    /// Background task: drain the relay write queue and write frames to the
+    /// egress substream. This task is the stream's only owner. Exits on write
+    /// error after logging it; the channel then closes and the uplink's next
+    /// `send_batch` fails, tearing down the bridge loudly.
+    async fn relay_writer(mut egress: crate::mux::Stream, mut rx: mpsc::Receiver<Bytes>) {
+        while let Some(frame) = rx.recv().await {
+            if let Err(e) = egress.write_all(&frame).await {
+                tracing::warn!(error = %e, "vpn relay egress write failed; tearing down link");
+                return;
+            }
+        }
+    }
+
+    /// Pop one complete `[u32 len][len bytes]` frame off `acc`, if present.
+    /// Returns the frame body (counter + ciphertext) without the length prefix.
+    fn take_frame(acc: &mut BytesMut) -> Result<Option<Bytes>> {
+        if acc.len() < 4 {
+            return Ok(None);
+        }
+        let total_len = u32::from_be_bytes(acc[..4].try_into().unwrap()) as usize;
+        anyhow::ensure!(
+            total_len >= 8 + super::crypto::TAG_LEN,
+            "relay frame too short: {total_len}"
+        );
+        anyhow::ensure!(total_len <= MAX_FRAME, "relay frame too large: {total_len}");
+        if acc.len() < 4 + total_len {
+            return Ok(None);
+        }
+        acc.advance(4);
+        Ok(Some(acc.split_to(total_len).freeze()))
     }
 
     impl LinkSender {
@@ -1693,40 +1848,29 @@ pub mod link {
                 }
                 LinkSender::Relay { tx, key, counter } => {
                     for pkt in pkts {
-                        if *counter == u64::MAX {
-                            anyhow::bail!("AEAD counter exhausted — tear down link");
-                        }
                         let frame = super::crypto::seal_with_counter(key, *counter, pkt)?;
                         *counter += 1;
-                        match tx.try_send(Bytes::from(frame)) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                // Relay write queue full: drop this packet.
-                                // The relay TCP is congested; TCP sessions above will
-                                // retransmit. Dropping here prevents the uplink loop
-                                // from stalling and deadlocking the bridge.
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                anyhow::bail!("relay writer exited (write error on relay TCP)");
-                            }
-                        }
+                        // Await when the queue is full: backpressure, not loss.
+                        tx.send(Bytes::from(frame)).await.map_err(|_| {
+                            anyhow::anyhow!("relay writer exited (write error on relay stream)")
+                        })?;
                     }
                     Ok(())
                 }
             }
         }
 
-        /// Resolved when the underlying link is gone (Direct only; Relay is TCP-based).
+        /// Resolved when the underlying link is gone.
         pub async fn closed(&self) {
             match self {
                 LinkSender::Direct(conn) => conn.closed().await,
-                LinkSender::Relay { .. } => std::future::pending().await,
+                LinkSender::Relay { tx, .. } => tx.closed().await,
             }
         }
     }
 
     impl LinkRecver {
-        /// Receive ≥1 IP packets. Err on link close.
+        /// Receive ≥1 IP packets (up to `BATCH_CAP`). Err on link close.
         pub async fn recv_batch(&mut self, out: &mut Vec<Bytes>) -> Result<()> {
             match self {
                 LinkRecver::Direct(conn) => {
@@ -1744,24 +1888,27 @@ pub mod link {
                     }
                     Ok(())
                 }
-                LinkRecver::Relay { read, key } => {
-                    let mut len_buf = [0u8; 4];
-                    read.read_exact(&mut len_buf)
-                        .await
-                        .context("relay frame length read")?;
-                    let total_len = u32::from_be_bytes(len_buf) as usize;
-                    anyhow::ensure!(total_len >= 8, "relay frame too short: {total_len}");
-                    anyhow::ensure!(
-                        total_len <= 65536 + 8 + 16,
-                        "relay frame too large: {total_len}"
-                    );
-                    let mut frame = vec![0u8; total_len];
-                    read.read_exact(&mut frame)
-                        .await
-                        .context("relay frame body read")?;
-                    let plaintext = super::crypto::open(key, &frame).context("AEAD open failed")?;
-                    out.push(Bytes::from(plaintext));
-                    Ok(())
+                LinkRecver::Relay { read, key, acc } => {
+                    loop {
+                        // Drain every complete frame already buffered so one read
+                        // syscall can yield a whole GRO batch downstream.
+                        while out.len() < BATCH_CAP {
+                            match take_frame(acc)? {
+                                Some(frame) => {
+                                    let plaintext = super::crypto::open(key, &frame)
+                                        .context("AEAD open failed")?;
+                                    out.push(Bytes::from(plaintext));
+                                }
+                                None => break,
+                            }
+                        }
+                        if !out.is_empty() {
+                            return Ok(());
+                        }
+                        acc.reserve(RECV_BUF);
+                        let n = read.read_buf(acc).await.context("relay ingress read")?;
+                        anyhow::ensure!(n != 0, "relay ingress stream closed by peer");
+                    }
                 }
             }
         }
@@ -1773,37 +1920,54 @@ pub mod link {
         use bytes::Bytes;
         use tokio::sync::mpsc;
 
-        /// relay_writer must NOT block the caller when the channel is full.
-        /// Excess packets are dropped (TrySendError::Full) instead of stalling.
+        /// A full relay queue must apply backpressure: send_batch completes as
+        /// soon as the consumer drains a slot, and no packet is lost.
         #[tokio::test]
-        async fn relay_sender_drops_on_full_channel() {
-            // Capacity 1 so the second packet overflows immediately.
-            let (tx, _rx) = mpsc::channel::<Bytes>(1);
+        async fn relay_sender_backpressure_no_loss() {
+            // Capacity 1 so the second packet must wait for the consumer.
+            let (tx, mut rx) = mpsc::channel::<Bytes>(1);
             let key = [0u8; 32];
-            let mut sender = LinkSender::Relay { tx, key, counter: 0 };
+            let mut sender = LinkSender::Relay {
+                tx,
+                key,
+                counter: 0,
+            };
 
             let pkt = Bytes::from(vec![0xAB; 64]);
             // First send fills the channel.
-            sender.send_batch(&[pkt.clone()]).await.unwrap();
-            // Second send would block with write_all; with try_send it must return Ok
-            // (packet is silently dropped, not an error).
-            sender.send_batch(&[pkt.clone()]).await.unwrap();
-            // Counter advanced for both sealed packets (drop happens after sealing).
+            sender.send_batch(std::slice::from_ref(&pkt)).await.unwrap();
+            // Consumer drains with a delay; the second send must wait, then succeed.
+            let consumer = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let mut frames = Vec::new();
+                while let Some(f) = rx.recv().await {
+                    frames.push(f);
+                }
+                frames
+            });
+            sender.send_batch(std::slice::from_ref(&pkt)).await.unwrap();
             match &sender {
                 LinkSender::Relay { counter, .. } => assert_eq!(*counter, 2),
                 _ => panic!("expected Relay"),
             }
+            drop(sender);
+            let frames = consumer.await.unwrap();
+            assert_eq!(frames.len(), 2, "both sealed frames must reach the writer");
         }
 
-        /// When the writer task exits (e.g. relay TCP broken), the next send_batch
-        /// must return Err rather than silently dropping or hanging.
+        /// When the writer task exits (e.g. relay stream broken), the next
+        /// send_batch must return Err rather than silently dropping or hanging.
         #[tokio::test]
         async fn relay_sender_errors_when_writer_gone() {
             let (tx, rx) = mpsc::channel::<Bytes>(8);
             // Drop the receiver — simulates the writer task having exited.
             drop(rx);
             let key = [0u8; 32];
-            let mut sender = LinkSender::Relay { tx, key, counter: 0 };
+            let mut sender = LinkSender::Relay {
+                tx,
+                key,
+                counter: 0,
+            };
 
             let pkt = Bytes::from(vec![0xCD; 32]);
             let result = sender.send_batch(&[pkt]).await;
@@ -1811,6 +1975,47 @@ pub mod link {
                 result.is_err(),
                 "send_batch must error when writer task is gone"
             );
+        }
+
+        /// Frame reassembly: partial prefixes, multiple frames per buffer, and
+        /// split frames across reads must all parse exactly.
+        #[test]
+        fn take_frame_reassembly() {
+            let mut acc = BytesMut::new();
+
+            // Partial length prefix → None.
+            acc.extend_from_slice(&[0, 0]);
+            assert!(take_frame(&mut acc).unwrap().is_none());
+
+            // Complete header but incomplete body → None.
+            let body = vec![7u8; 8 + super::super::crypto::TAG_LEN + 5];
+            acc.clear();
+            acc.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            acc.extend_from_slice(&body[..3]);
+            assert!(take_frame(&mut acc).unwrap().is_none());
+
+            // Rest of the body arrives, plus a second complete frame.
+            acc.extend_from_slice(&body[3..]);
+            acc.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            acc.extend_from_slice(&body);
+            let f1 = take_frame(&mut acc).unwrap().expect("first frame");
+            assert_eq!(&f1[..], &body[..]);
+            let f2 = take_frame(&mut acc).unwrap().expect("second frame");
+            assert_eq!(&f2[..], &body[..]);
+            assert!(take_frame(&mut acc).unwrap().is_none());
+            assert!(acc.is_empty());
+        }
+
+        /// Oversized and undersized frame lengths must be rejected, not allocated.
+        #[test]
+        fn take_frame_rejects_bad_lengths() {
+            let mut acc = BytesMut::new();
+            acc.extend_from_slice(&(u32::MAX).to_be_bytes());
+            assert!(take_frame(&mut acc).is_err(), "oversized frame must error");
+
+            let mut acc = BytesMut::new();
+            acc.extend_from_slice(&3u32.to_be_bytes());
+            assert!(take_frame(&mut acc).is_err(), "undersized frame must error");
         }
     }
 }
@@ -1959,10 +2164,14 @@ pub mod bridge {
         dev: Arc<tun_rs::AsyncDevice>,
         mut sender: LinkSender,
         counters: Arc<BridgeCounters>,
-        mtu: u16,
+        _mtu: u16,
     ) -> Result<()> {
         let mut original_buffer = vec![0u8; tun_rs::VIRTIO_NET_HDR_LEN + 65535];
-        let mut bufs = vec![vec![0u8; mtu as usize]; tun_rs::IDEAL_BATCH_SIZE];
+        // Per-segment buffers sized for the largest possible IP packet, NOT the
+        // TUN MTU: in gateway mode the kernel forwards GRO super-frames whose
+        // gso_size reflects the LAN-side MSS (1500+, jumbo frames up to 9000),
+        // and tun_rs's gso_split panics on a segment larger than its buffer.
+        let mut bufs = vec![vec![0u8; u16::MAX as usize]; tun_rs::IDEAL_BATCH_SIZE];
         let mut sizes = vec![0usize; tun_rs::IDEAL_BATCH_SIZE];
         loop {
             let num = dev

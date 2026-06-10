@@ -18,7 +18,11 @@
 
 **Direct path (preferred):** unreliable QUIC datagrams, encrypted end-to-end via QUIC-TLS 1.3. The server is not involved in the data path; it only orchestrates the handshake.
 
-**Relay path (fallback):** framed AEAD-encrypted IP packets over a yamux substream. Each packet is sealed with ChaCha20-Poly1305 under a key derived from the shared secret and a server-issued nonce. The server splices ciphertext bytes opaque — **it never sees plaintext IP packets**, preserving E2E encryption even when a direct path is unavailable.
+> **Status:** the direct QUIC path is **not wired up yet** (see `VPN_FULL_PLAN_TODO.md` §A1). Every link currently runs on the relay path (`path="relay"` in the logs). Sections below that describe `path="direct"` behaviour document the planned design, not the current binary.
+
+**Relay path (fallback):** framed AEAD-encrypted IP packets over **two yamux substreams, one per direction**. The connector opens both and tags each with a direction byte (`0x01` connector→listener, `0x02` listener→connector) right after the readiness marker; each substream is then written by exactly one side and read only by the other. Each packet is sealed with ChaCha20-Poly1305 under a key derived from the shared secret and a server-issued nonce. The server splices ciphertext bytes opaque — **it never sees plaintext IP packets**, preserving E2E encryption even when a direct path is unavailable.
+
+> Why two substreams: a `yamux::Stream` holds a single parked-task waker on its internal command channel, so its read and write halves must never be polled from two different tasks (e.g. via `tokio::io::split`) — the reader and writer overwrite each other's waker and the link freezes permanently after ~256 KB under load, with no error reported. One unidirectional substream per task removes the contention entirely. Both peers must run a build that speaks the dual-substream protocol; an old single-substream peer fails link setup with an explicit "peer built from an older version?" error instead of wedging. The relay queue applies backpressure (the TUN read loop waits) rather than dropping packets: the relay is an ordered, reliable stream, so dropping there only multiplies inner-TCP retransmissions.
 
 **No network traversal is possible without the shared `--secret`.** Server cannot derive relay encryption keys; keys are bound to the secret supplied by the client.
 

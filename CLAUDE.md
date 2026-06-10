@@ -85,6 +85,14 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   pool to the worker `--parallel` count (capped at server `--max-carriers`); `transfer.rs`
   resolves it via `resolve_carriers`. Explicit `--carriers 1` still forces the single path.
 - Relay path is AEAD-opaque: server splices ciphertext, never plaintext IP packets
+- **Never `tokio::io::split` a `mux::Stream` across two tasks.** `yamux::Stream` keeps a
+  single parked-task waker on its internal channel (`poll_read` and `poll_write` both call
+  `sender.poll_ready`); two tasks overwrite each other's waker and the loser is never woken
+  — the stream wedges silently under load. One stream = one task. The VPN relay uses two
+  unidirectional substreams (tags `0x01`/`0x02`) for exactly this reason. Single-task
+  bidirectional use (`copy_bidirectional`, `try_join!` in one task) is safe.
+- VPN relay queue applies backpressure (await on full), never silent drops; VPN clients
+  must keep draining the control stream after `VpnReady` (heartbeats + server-death detection)
 - `NetConfig` RAII: all routes/nft/ip_forward changes revert on exit (SIGINT, SIGTERM, panic handled; SIGKILL requires next-run stale reclaim)
 - TUN MTU default 1350: clamps QUIC datagram size; gateway MSS-clamp keeps forwarded TCP healthy
 

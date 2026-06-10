@@ -3,16 +3,15 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 #[cfg(all(feature = "vpn", target_os = "linux"))]
+use bore_cli::shared::{Ipv4Net, VpnAddrRequest};
+#[cfg(all(feature = "vpn", target_os = "linux"))]
 use bore_cli::vpn;
 use bore_cli::{
     client::{Client, ProviderMeta},
     reconnect,
     secret::Proxy,
     server::Server,
-    shared::{
-        Ipv4Net, TunnelOptions, UdpDirectTuning, UdpTestOptions, VpnAddrRequest,
-        MAX_DIRECT_STREAMS, MAX_NOTES_LEN,
-    },
+    shared::{TunnelOptions, UdpDirectTuning, UdpTestOptions, MAX_DIRECT_STREAMS, MAX_NOTES_LEN},
     transfer::{
         CollisionPolicy, DeviceMode, ListenerOptions as TransferListenerOptions,
         SenderOptions as TransferSenderOptions, SymlinkMode,

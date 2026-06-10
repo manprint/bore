@@ -5,6 +5,31 @@
 
 ---
 
+## A0 — RISOLTO (2026-06-10): stallo permanente del relay sotto carico
+
+**Sintomo:** il link funzionava per i primi ~256 KB di traffico, poi si bloccava
+per sempre (anche un nuovo SYN non passava più). Nessun log, nessun errore.
+
+**Causa radice (NON il meltdown §R.1):** il relay usava **un solo** substream yamux
+condiviso fra task lettore e task scrittore via `tokio::io::split`. `yamux::Stream`
+ha **un solo slot waker** sul proprio canale interno (`futures::mpsc::Sender::poll_ready`
+in `poll_read` *e* `poll_write`): due task che pollano lo stesso stream si sovrascrivono
+il waker a vicenda e il perdente non viene mai più svegliato → scrittore parcheggiato
+per sempre → coda piena → drop silenzioso di ogni pacchetto.
+
+**Fix:** due substream relay, uno per direzione (tag `0x01`/`0x02` dopo lo
+`STREAM_READY`), ognuno posseduto da un solo task; la coda di uscita ora fa
+**backpressure** (await) invece di droppare; il client ora **drena il control
+stream** e rileva la morte del server (prima: nessun log possibile); buffer GSO
+dimensionati a 65535 (i super-frame GRO inoltrati in gateway mode superano l'MTU
+della TUN → panic in `gso_split`). Regression test: `tests/vpn_relay_link_test.rs`.
+Invariante: **mai** `tokio::io::split` su un `mux::Stream` condiviso fra due task.
+
+Risultato misurato (docker, 3 nodi): prima = stallo a ~256 KB; dopo = 100 MB in
+0,5 s (~200 MB/s), 6 download paralleli da 100 MB ok, ping 0% loss sotto carico.
+
+---
+
 ## A. DIRETTO CRITICO — funzionalità mancante che limita l'usabilità
 
 ### A1 — Direct QUIC path non cablato `P1`
@@ -14,8 +39,10 @@ esistono in `vpn::link` ma non vengono mai usati. `run_listen` e `run_connect` v
 **sempre** su relay AEAD. Il server ha `broker_vpn_udp()` implementato ma i client non
 inviano mai `UdpCandidateOffer` dopo `VpnReady`.
 
-**Conseguenza:** traffico TCP sull'overlay → meltdown reliable-over-reliable (§R.1).
-`iperf3 -c overlay_addr` in modalità TCP si blocca; UDP funziona. Nessun beneficio QUIC.
+**Conseguenza:** nessun percorso peer-to-peer: tutto il traffico passa dal server
+(banda e latenza del relay). Nota: lo "stallo TCP" attribuito qui al meltdown
+reliable-over-reliable era in realtà il bug A0 (waker perso) — risolto. Il relay
+ora regge traffico TCP bulk; il direct path resta utile per latenza/banda.
 
 **Da fare:**
 

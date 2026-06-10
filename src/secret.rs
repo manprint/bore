@@ -1046,6 +1046,8 @@ impl Proxy {
                         Some(ServerMessage::TestUdpWaiting) => warn!("unexpected udp diagnostic wait"),
                         Some(ServerMessage::TestUdpStart { .. }) => warn!("unexpected udp diagnostic start"),
                         Some(ServerMessage::VhostReady { .. }) => warn!("unexpected vhost ready"),
+                        Some(ServerMessage::VpnReady { .. }) => warn!("unexpected vpn ready"),
+                        Some(ServerMessage::VpnError(err)) => error!(%err, "vpn error"),
                         None => return Ok(()),
                     }
                 }

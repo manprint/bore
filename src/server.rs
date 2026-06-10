@@ -9,6 +9,8 @@ use anyhow::Result;
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+#[cfg(feature = "vpn")]
+use tokio::sync::Mutex;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tokio_rustls::TlsAcceptor;
@@ -30,6 +32,8 @@ use crate::shared::{
 };
 use crate::udp_diagnostic;
 use crate::vhost::{self, VhostRegistry};
+#[cfg(feature = "vpn")]
+use crate::vpn_server;
 
 /// Default cap on the number of concurrently proxied connections per tunnel
 /// connection. Bounds memory and file-descriptor use under a connection flood.
@@ -134,6 +138,22 @@ pub struct Server {
 
     /// Path to the vhost config file, retained for the hot-reload task.
     vhost_config_path: Option<PathBuf>,
+
+    /// Whether VPN brokering is enabled.
+    #[cfg(feature = "vpn")]
+    vpn_enabled: bool,
+
+    /// The overlay address pool for VPN (from --vpn-pool).
+    #[cfg(feature = "vpn")]
+    vpn_pool: Option<Arc<Mutex<crate::vpn_server::VpnPool>>>,
+
+    /// Registry of live VPN providers, keyed by VPN link ID.
+    #[cfg(feature = "vpn")]
+    vpn_providers: crate::vpn_server::VpnRegistry,
+
+    /// Semaphore bounding concurrent VPN links.
+    #[cfg(feature = "vpn")]
+    vpn_link_permits: Arc<Semaphore>,
 }
 
 impl Server {
@@ -167,6 +187,14 @@ impl Server {
             vhost_quic_port_explicit: false,
             pending_vhost_udp: vhost::PendingVhostUdp::default(),
             vhost_config_path: None,
+            #[cfg(feature = "vpn")]
+            vpn_enabled: false,
+            #[cfg(feature = "vpn")]
+            vpn_pool: None,
+            #[cfg(feature = "vpn")]
+            vpn_providers: Arc::new(DashMap::new()),
+            #[cfg(feature = "vpn")]
+            vpn_link_permits: Arc::new(Semaphore::new(100)),
         }
     }
 
@@ -306,6 +334,26 @@ impl Server {
     /// Store the path to the vhost config file so the hot-reload task can poll it.
     pub fn set_vhost_config_path(&mut self, path: PathBuf) {
         self.vhost_config_path = Some(path);
+    }
+
+    /// Enable VPN brokering.
+    #[cfg(feature = "vpn")]
+    pub fn set_vpn(&mut self, enabled: bool) {
+        self.vpn_enabled = enabled;
+    }
+
+    /// Set the overlay address pool for VPN (from --vpn-pool).
+    #[cfg(feature = "vpn")]
+    pub fn set_vpn_pool(&mut self, pool: crate::shared::Ipv4Net) -> Result<()> {
+        let p = vpn_server::VpnPool::new(pool)?;
+        self.vpn_pool = Some(Arc::new(Mutex::new(p)));
+        Ok(())
+    }
+
+    /// Set the maximum number of concurrent VPN links.
+    #[cfg(feature = "vpn")]
+    pub fn set_vpn_max_links(&mut self, max: usize) {
+        self.vpn_link_permits = Arc::new(Semaphore::new(max));
     }
 
     /// Start the server, listening for new connections.
@@ -823,6 +871,76 @@ impl Server {
                     self.udp_tuning,
                 )
                 .await
+            }
+            Some(ClientMessage::HelloVpn {
+                id,
+                advertised,
+                addr,
+                notes,
+                ..
+            }) => {
+                #[cfg(feature = "vpn")]
+                if self.vpn_enabled {
+                    return vpn_server::serve_vpn_listener(
+                        control,
+                        opener,
+                        self.vpn_providers.clone(),
+                        id,
+                        advertised,
+                        addr,
+                        notes,
+                        self.admin.clone(),
+                        peer,
+                        self.udp_providers.clone(),
+                        self.udp_tuning,
+                        self.vpn_link_permits.clone(),
+                    )
+                    .await;
+                }
+                #[cfg(not(feature = "vpn"))]
+                let _ = (&advertised, &addr, &notes); // Suppress unused warnings when vpn feature is off
+                warn!(%id, "vpn not enabled on this server");
+                let _ = control
+                    .send(ServerMessage::VpnError(
+                        "vpn not supported/enabled on this server".into(),
+                    ))
+                    .await;
+                Ok(())
+            }
+            Some(ClientMessage::ConnectVpn {
+                id,
+                advertised,
+                addr,
+                notes,
+            }) => {
+                #[cfg(feature = "vpn")]
+                if self.vpn_enabled {
+                    return vpn_server::serve_vpn_connector(
+                        control,
+                        acceptor,
+                        self.vpn_providers.clone(),
+                        self.vpn_pool.clone(),
+                        self.conn_permits.clone(),
+                        id,
+                        advertised,
+                        addr,
+                        notes,
+                        self.admin.clone(),
+                        peer,
+                        self.udp_providers.clone(),
+                        self.udp_tuning,
+                    )
+                    .await;
+                }
+                #[cfg(not(feature = "vpn"))]
+                let _ = (&advertised, &addr, &notes); // Suppress unused warnings when vpn feature is off
+                warn!(%id, "vpn not enabled on this server");
+                let _ = control
+                    .send(ServerMessage::VpnError(
+                        "vpn not supported/enabled on this server".into(),
+                    ))
+                    .await;
+                Ok(())
             }
             None => Ok(()),
         }

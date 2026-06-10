@@ -2,19 +2,326 @@
 
 #![cfg(all(feature = "vpn", target_os = "linux"))]
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Context, Result};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{error, info};
+
+/// Public arg struct for `bore vpn listen` (converted from CLI args).
+#[derive(Clone, Debug)]
+pub struct VpnListenArgs {
+    /// Server address.
+    pub to: String,
+    /// Shared secret.
+    pub secret: String,
+    /// VPN link identifier.
+    pub id: String,
+    /// Skip TLS verification.
+    pub insecure: bool,
+    /// Advertised subnets.
+    pub advertised: Vec<crate::shared::Ipv4Net>,
+    /// Address request (pool or static).
+    pub addr_request: crate::shared::VpnAddrRequest,
+    /// TUN interface name.
+    pub tun_name: String,
+    /// Interface MTU.
+    pub mtu: u16,
+    /// Skip route/NAT management.
+    pub no_route_manage: bool,
+    /// STUN server.
+    pub stun_server: Option<String>,
+    /// Try UPnP.
+    pub upnp: bool,
+    /// Try port prediction.
+    pub try_port_prediction: bool,
+    /// Preferred UDP port.
+    pub nat_udp_preferred_port: u16,
+    /// UDP port release timeout.
+    pub nat_udp_release_timeout: u64,
+    /// Optional notes.
+    pub notes: Option<String>,
+}
+
+/// Public arg struct for `bore vpn connect` (converted from CLI args).
+#[derive(Clone, Debug)]
+pub struct VpnConnectArgs {
+    /// Server address.
+    pub to: String,
+    /// Shared secret.
+    pub secret: String,
+    /// VPN link identifier.
+    pub id: String,
+    /// Skip TLS verification.
+    pub insecure: bool,
+    /// Advertised subnets.
+    pub advertised: Vec<crate::shared::Ipv4Net>,
+    /// Address request (pool or static).
+    pub addr_request: crate::shared::VpnAddrRequest,
+    /// TUN interface name.
+    pub tun_name: String,
+    /// Interface MTU.
+    pub mtu: u16,
+    /// Skip route/NAT management.
+    pub no_route_manage: bool,
+    /// STUN server.
+    pub stun_server: Option<String>,
+    /// Try UPnP.
+    pub upnp: bool,
+    /// Try port prediction.
+    pub try_port_prediction: bool,
+    /// Preferred UDP port.
+    pub nat_udp_preferred_port: u16,
+    /// UDP port release timeout.
+    pub nat_udp_release_timeout: u64,
+    /// Optional notes.
+    pub notes: Option<String>,
+}
 
 /// Start a VPN listener.
-pub async fn run_listen(_args: ()) -> Result<()> {
-    anyhow::bail!("not yet implemented")
+pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
+    // Preflight checks
+    hostcfg::check_root()?;
+    hostcfg::check_binary_exists("ip")
+        .then_some(())
+        .ok_or_else(|| anyhow!("'ip' command not found"))?;
+
+    info!(link_id = %args.id, "vpn listener starting");
+
+    // Connect to server
+    let endpoint = crate::transport::Endpoint::parse(&args.to);
+    let control_stream = crate::transport::connect(&endpoint, args.insecure).await?;
+
+    let (opener, mut acceptor) = crate::mux::client(control_stream);
+    let ctrl_stream = opener.open().await.context("open control stream")?;
+    let mut ctrl = crate::shared::Delimited::new(ctrl_stream);
+
+    // Send HelloVpn first (yamux lazy-init invariant)
+    let hello = crate::shared::ClientMessage::HelloVpn {
+        id: args.id.clone(),
+        advertised: args.advertised.clone(),
+        addr: args.addr_request.clone(),
+        notes: args.notes.clone(),
+        carriers: 1,
+    };
+    ctrl.send(hello).await?;
+
+    // Auth if we have a secret (server will send Challenge if it requires it)
+    crate::auth::Authenticator::new(&args.secret)
+        .client_handshake(&mut ctrl)
+        .await?;
+
+    // Wait for VpnReady
+    let msg = ctrl.recv::<crate::shared::ServerMessage>().await?;
+    let (assigned, prefix, peer_advertised, session_nonce) = match msg {
+        Some(crate::shared::ServerMessage::VpnReady {
+            assigned,
+            prefix,
+            peer_advertised,
+            session_nonce,
+            ..
+        }) => {
+            info!(
+                link_id = %args.id,
+                path = "relay",
+                overlay = %format!("{assigned}/{prefix}"),
+                iface = %args.tun_name,
+                "vpn link paired"
+            );
+            (assigned, prefix, peer_advertised, session_nonce)
+        }
+        Some(crate::shared::ServerMessage::VpnError(e)) => {
+            error!(link_id = %args.id, error = %e, "vpn server error");
+            bail!("{e}");
+        }
+        Some(crate::shared::ServerMessage::Error(e)) => {
+            error!(link_id = %args.id, error = %e, "vpn server error");
+            bail!("{e}");
+        }
+        None => {
+            error!(link_id = %args.id, "server closed before sending VpnReady; may be too old or not VPN-capable");
+            bail!("server may be too old or not VPN-capable (needs 'bore server --vpn', built with --features vpn)");
+        }
+        other => {
+            error!(link_id = %args.id, msg = ?other, "unexpected server message");
+            bail!("unexpected server message: {other:?}");
+        }
+    };
+
+    // Stale reclaim
+    hostcfg::stale_reclaim(&args.id, &args.tun_name).await;
+
+    // Create TUN device
+    let dev = Arc::new(hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu).await?);
+    info!(
+        link_id = %args.id,
+        iface = %args.tun_name,
+        addr = %assigned,
+        prefix = prefix,
+        "created tun device"
+    );
+
+    // Apply network config (routes, NAT, etc.)
+    let advertised_nets = args.advertised.to_vec();
+    let peer_routes = peer_advertised.to_vec();
+    let runner = hostcfg::RealRunner;
+    let _netcfg = hostcfg::NetConfig::apply(
+        &runner,
+        &args.id,
+        &args.tun_name,
+        assigned,
+        prefix,
+        &peer_routes,
+        &advertised_nets,
+        args.no_route_manage,
+    )
+    .await?;
+
+    // Wait for relay substream from server
+    let mut relay_stream = acceptor
+        .accept()
+        .await
+        .context("server did not open relay substream")?;
+
+    // Read STREAM_READY marker
+    let mut marker = [0u8; 1];
+    relay_stream.read_exact(&mut marker).await?;
+
+    // Build relay link
+    let keys = crypto::derive_keys_listener(&args.secret, &session_nonce)?;
+    let (sender, recver) = link::make_relay(relay_stream, keys);
+    let counters = bridge::BridgeCounters::new();
+
+    info!(link_id = %args.id, "vpn link bridge starting");
+
+    // Run the bridge until it closes
+    bridge::run(dev, sender, recver, counters, args.mtu).await?;
+
+    info!(link_id = %args.id, "vpn link bridge closed");
+    Ok(())
 }
 
 /// Start a VPN connector.
-pub async fn run_connect(_args: ()) -> Result<()> {
-    anyhow::bail!("not yet implemented")
+pub async fn run_connect(args: VpnConnectArgs) -> Result<()> {
+    // Preflight checks
+    hostcfg::check_root()?;
+    hostcfg::check_binary_exists("ip")
+        .then_some(())
+        .ok_or_else(|| anyhow!("'ip' command not found"))?;
+
+    info!(link_id = %args.id, "vpn connector starting");
+
+    // Connect to server
+    let endpoint = crate::transport::Endpoint::parse(&args.to);
+    let control_stream = crate::transport::connect(&endpoint, args.insecure).await?;
+
+    let (opener, _acceptor) = crate::mux::client(control_stream);
+    let ctrl_stream = opener.open().await.context("open control stream")?;
+    let mut ctrl = crate::shared::Delimited::new(ctrl_stream);
+
+    // Send ConnectVpn first (yamux lazy-init invariant)
+    let connect_msg = crate::shared::ClientMessage::ConnectVpn {
+        id: args.id.clone(),
+        advertised: args.advertised.clone(),
+        addr: args.addr_request.clone(),
+        notes: args.notes.clone(),
+    };
+    ctrl.send(connect_msg).await?;
+
+    // Auth if we have a secret (server will send Challenge if it requires it)
+    crate::auth::Authenticator::new(&args.secret)
+        .client_handshake(&mut ctrl)
+        .await?;
+
+    // Wait for VpnReady
+    let msg = ctrl.recv::<crate::shared::ServerMessage>().await?;
+    let (assigned, prefix, peer_advertised, session_nonce) = match msg {
+        Some(crate::shared::ServerMessage::VpnReady {
+            assigned,
+            prefix,
+            peer_advertised,
+            session_nonce,
+            ..
+        }) => {
+            info!(
+                link_id = %args.id,
+                path = "relay",
+                overlay = %format!("{assigned}/{prefix}"),
+                iface = %args.tun_name,
+                "vpn link paired"
+            );
+            (assigned, prefix, peer_advertised, session_nonce)
+        }
+        Some(crate::shared::ServerMessage::VpnError(e)) => {
+            error!(link_id = %args.id, error = %e, "vpn server error");
+            bail!("{e}");
+        }
+        Some(crate::shared::ServerMessage::Error(e)) => {
+            error!(link_id = %args.id, error = %e, "vpn server error");
+            bail!("{e}");
+        }
+        None => {
+            error!(link_id = %args.id, "server closed before sending VpnReady; may be too old or not VPN-capable");
+            bail!("server may be too old or not VPN-capable (needs 'bore server --vpn', built with --features vpn)");
+        }
+        other => {
+            error!(link_id = %args.id, msg = ?other, "unexpected server message");
+            bail!("unexpected server message: {other:?}");
+        }
+    };
+
+    // Stale reclaim
+    hostcfg::stale_reclaim(&args.id, &args.tun_name).await;
+
+    // Create TUN device
+    let dev = Arc::new(hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu).await?);
+    info!(
+        link_id = %args.id,
+        iface = %args.tun_name,
+        addr = %assigned,
+        prefix = prefix,
+        "created tun device"
+    );
+
+    // Apply network config (routes, NAT, etc.)
+    let advertised_nets = args.advertised.to_vec();
+    let peer_routes = peer_advertised.to_vec();
+    let runner = hostcfg::RealRunner;
+    let _netcfg = hostcfg::NetConfig::apply(
+        &runner,
+        &args.id,
+        &args.tun_name,
+        assigned,
+        prefix,
+        &peer_routes,
+        &advertised_nets,
+        args.no_route_manage,
+    )
+    .await?;
+
+    // Open relay substream and write STREAM_READY
+    let mut relay_stream = opener.open().await.context("open relay substream")?;
+    relay_stream.write_all(&[crate::mux::STREAM_READY]).await?;
+
+    // Build relay link
+    let keys = crypto::derive_keys_connector(&args.secret, &session_nonce)?;
+    let (sender, recver) = link::make_relay(relay_stream, keys);
+    let counters = bridge::BridgeCounters::new();
+
+    info!(link_id = %args.id, "vpn link bridge starting");
+
+    // Run the bridge until it closes
+    bridge::run(dev, sender, recver, counters, args.mtu).await?;
+
+    info!(link_id = %args.id, "vpn link bridge closed");
+    Ok(())
 }
 
-mod net {
+/// Reexport submodules as public for use by tests and from main.rs.
+pub use hostcfg::RealRunner;
+pub use link::{LinkRecver, LinkSender};
+
+/// Internal network types and utilities.
+pub mod net {
     #![allow(dead_code)]
     use serde::{Deserialize, Serialize};
     use std::fmt;
@@ -24,7 +331,9 @@ mod net {
     /// IPv4 CIDR (address + prefix length). Used for overlay + advertised subnets.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Ipv4Net {
+        /// IPv4 address.
         pub addr: Ipv4Addr,
+        /// Prefix length.
         pub prefix: u8,
     }
 
@@ -87,11 +396,14 @@ mod net {
     /// A /30 pool allocator. Carves /30 blocks from a parent CIDR.
     /// Each /30 has 4 addresses: network, .1 (listener), .2 (connector), broadcast.
     pub struct PoolAllocator {
+        /// Parent CIDR.
         parent: Ipv4Net,
+        /// Allocated block network addresses (as u32).
         allocated: std::collections::HashSet<u32>,
     }
 
     impl PoolAllocator {
+        /// Create a new /30 pool allocator from a parent CIDR.
         pub fn new(parent: Ipv4Net) -> anyhow::Result<Self> {
             anyhow::ensure!(
                 parent.prefix <= 30,
@@ -400,7 +712,8 @@ mod crypto {
     }
 }
 
-mod hostcfg_cmd {
+/// Command builders for host network configuration (ip, nft, iptables).
+pub mod hostcfg_cmd {
     #![allow(dead_code)]
     /// Build `ip addr add <addr>/<prefix> dev <dev>` argv.
     pub fn cmd_addr_add(dev: &str, addr: &str, prefix: u8) -> Vec<String> {
@@ -414,6 +727,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build `ip addr del <addr>/<prefix> dev <dev>` argv.
     pub fn cmd_addr_del(dev: &str, addr: &str, prefix: u8) -> Vec<String> {
         vec![
             "ip".into(),
@@ -425,6 +739,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build `ip link set <dev> up` argv.
     pub fn cmd_link_set_up(dev: &str) -> Vec<String> {
         vec![
             "ip".into(),
@@ -435,6 +750,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build `ip link set <dev> mtu <mtu>` argv.
     pub fn cmd_link_set_mtu(dev: &str, mtu: u16) -> Vec<String> {
         vec![
             "ip".into(),
@@ -446,6 +762,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build `ip route add <subnet> dev <dev>` argv.
     pub fn cmd_route_add(subnet: &str, dev: &str) -> Vec<String> {
         vec![
             "ip".into(),
@@ -457,6 +774,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build `ip route del <subnet> dev <dev>` argv.
     pub fn cmd_route_del(subnet: &str, dev: &str) -> Vec<String> {
         vec![
             "ip".into(),
@@ -468,6 +786,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build `ip route get <host>` argv.
     pub fn cmd_route_get(host: &str) -> Vec<String> {
         vec!["ip".into(), "route".into(), "get".into(), host.into()]
     }
@@ -483,6 +802,7 @@ mod hostcfg_cmd {
         None
     }
 
+    /// Build `nft add table inet bore_vpn_<id>` argv.
     pub fn cmd_nft_add_table(id: &str) -> Vec<String> {
         vec![
             "nft".into(),
@@ -493,6 +813,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build `nft add chain inet bore_vpn_<id> post` argv.
     pub fn cmd_nft_add_postrouting_chain(id: &str) -> Vec<String> {
         vec![
             "nft".into(),
@@ -505,6 +826,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build nft masquerade rule argv.
     pub fn cmd_nft_add_masquerade_rule(id: &str, tun: &str, lan_if: &str) -> Vec<String> {
         vec![
             "nft".into(),
@@ -521,6 +843,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build nft forward chain argv.
     pub fn cmd_nft_add_forward_chain(id: &str) -> Vec<String> {
         vec![
             "nft".into(),
@@ -528,11 +851,12 @@ mod hostcfg_cmd {
             "chain".into(),
             "inet".into(),
             format!("bore_vpn_{id}"),
-            "fwd".into(),
+            "bore_fw".into(),
             "{ type filter hook forward priority -10 ; }".into(),
         ]
     }
 
+    /// Build nft MSS clamp argv.
     pub fn cmd_nft_add_mss_clamp(id: &str) -> Vec<String> {
         vec![
             "nft".into(),
@@ -540,7 +864,7 @@ mod hostcfg_cmd {
             "rule".into(),
             "inet".into(),
             format!("bore_vpn_{id}"),
-            "fwd".into(),
+            "bore_fw".into(),
             "tcp".into(),
             "flags".into(),
             "syn".into(),
@@ -554,6 +878,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build `nft delete table inet bore_vpn_<id>` argv.
     pub fn cmd_nft_delete_table(id: &str) -> Vec<String> {
         vec![
             "nft".into(),
@@ -564,6 +889,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build iptables masquerade rule argv.
     pub fn cmd_iptables_masquerade_add(id: &str, tun: &str, lan_if: &str) -> Vec<String> {
         vec![
             "iptables".into(),
@@ -584,6 +910,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build iptables masquerade del argv.
     pub fn cmd_iptables_masquerade_del(id: &str) -> Vec<String> {
         vec![
             "iptables".into(),
@@ -598,6 +925,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build iptables MSS clamp argv.
     pub fn cmd_iptables_mss_clamp_add(id: &str) -> Vec<String> {
         vec![
             "iptables".into(),
@@ -620,6 +948,7 @@ mod hostcfg_cmd {
         ]
     }
 
+    /// Build iptables MSS clamp del argv.
     pub fn cmd_iptables_mss_clamp_del(id: &str) -> Vec<String> {
         vec![
             "iptables".into(),
@@ -699,7 +1028,7 @@ mod hostcfg_cmd {
     }
 }
 
-mod hostcfg {
+pub mod hostcfg {
     #![allow(dead_code)]
     //! Host network configuration (routes, NAT, ip_forward) with RAII cleanup.
     //!
@@ -712,6 +1041,7 @@ mod hostcfg {
 
     /// Injectable command runner (allows unit testing without root).
     pub trait CommandRunner: Send + Sync {
+        /// Run a command with the given argv.
         fn run<'a>(
             &'a self,
             argv: &'a [String],
@@ -755,12 +1085,15 @@ mod hostcfg {
 
     #[cfg(test)]
     impl TestRunner {
+        /// Create a new test runner.
+        #[allow(clippy::new_without_default)]
         pub fn new() -> Self {
             Self {
                 calls: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
             }
         }
 
+        /// Get the list of commands that were run.
         pub async fn get_calls(&self) -> Vec<Vec<String>> {
             self.calls.lock().await.clone()
         }
@@ -870,8 +1203,8 @@ mod hostcfg {
             tun_name: &str,
             _assigned: std::net::Ipv4Addr,
             _prefix: u8,
-            peer_routes: &[super::net::Ipv4Net],
-            advertised: &[super::net::Ipv4Net],
+            peer_routes: &[crate::shared::Ipv4Net],
+            advertised: &[crate::shared::Ipv4Net],
             no_route_manage: bool,
         ) -> anyhow::Result<Self> {
             use super::hostcfg_cmd::*;
@@ -1092,8 +1425,8 @@ mod hostcfg {
         async fn netconfig_apply_routes_only() {
             let runner = TestRunner::new();
             let peer_routes = vec![
-                "10.0.0.0/24".parse::<super::super::net::Ipv4Net>().unwrap(),
-                "10.1.0.0/24".parse::<super::super::net::Ipv4Net>().unwrap(),
+                "10.0.0.0/24".parse::<crate::shared::Ipv4Net>().unwrap(),
+                "10.1.0.0/24".parse::<crate::shared::Ipv4Net>().unwrap(),
             ];
             let advertised = vec![];
 
@@ -1125,7 +1458,7 @@ mod hostcfg {
         #[tokio::test]
         async fn netconfig_no_route_manage_skips_routes() {
             let runner = TestRunner::new();
-            let peer_routes = vec!["10.0.0.0/24".parse::<super::super::net::Ipv4Net>().unwrap()];
+            let peer_routes = vec!["10.0.0.0/24".parse::<crate::shared::Ipv4Net>().unwrap()];
             let advertised = vec![];
 
             let cfg = NetConfig::apply(
@@ -1365,7 +1698,7 @@ pub mod link {
     mod tests {}
 }
 
-mod bridge {
+pub mod bridge {
     #![allow(dead_code)]
     //! VPN data-plane bridge: bidirectional flow between TUN and VpnLink.
     use anyhow::Result;
@@ -1380,14 +1713,20 @@ mod bridge {
 
     /// Counter metrics for bridge data-plane.
     pub struct BridgeCounters {
+        /// Transmitted packets.
         pub tx_pkts: AtomicU64,
+        /// Transmitted bytes.
         pub tx_bytes: AtomicU64,
+        /// Received packets.
         pub rx_pkts: AtomicU64,
+        /// Received bytes.
         pub rx_bytes: AtomicU64,
+        /// Dropped (TooLarge) packets.
         pub tx_drops: AtomicU64,
     }
 
     impl BridgeCounters {
+        /// Create new bridge counters.
         pub fn new() -> Arc<Self> {
             Arc::new(Self {
                 tx_pkts: AtomicU64::new(0),

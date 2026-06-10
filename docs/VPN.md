@@ -1,0 +1,417 @@
+# bore VPN — Linux Point-to-Point L3 Tunnel
+
+## Concept
+
+`bore vpn` establishes a **point-to-point Layer 3 virtual network interface** between two Linux machines, carrying real IP packets over bore's brokered, NAT-traversing transport. Two peers rendezvous through the server, establish a direct QUIC path when possible, and fall back to a server-relayed encryption layer for maximum availability. The tunnel works equally well for exposing a single host's services to a peer, or for routing entire subnets between two gateways.
+
+**The load-bearing mental model:** a VPN link is structurally a secret tunnel that carries IP packets instead of a TCP byte-stream.
+
+### Requirements
+
+- **Operating system:** Linux only (kernel TUN/TAP support required)
+- **Privilege:** root or `CAP_NET_ADMIN` (to manage network interfaces and routes)
+- **Build:** `cargo build --release --features vpn`
+- **Server:** must be started with `--vpn` flag and have a pool configured (`--vpn-pool <CIDR>`)
+- **Authentication:** `--secret` is mandatory on both client sides (required for E2E encryption on the relay fallback path)
+
+### Security Model
+
+**Direct path (preferred):** unreliable QUIC datagrams, encrypted end-to-end via QUIC-TLS 1.3. The server is not involved in the data path; it only orchestrates the handshake.
+
+**Relay path (fallback):** framed AEAD-encrypted IP packets over a yamux substream. Each packet is sealed with ChaCha20-Poly1305 under a key derived from the shared secret and a server-issued nonce. The server splices ciphertext bytes opaque — **it never sees plaintext IP packets**, preserving E2E encryption even when a direct path is unavailable.
+
+**No network traversal is possible without the shared `--secret`.** Server cannot derive relay encryption keys; keys are bound to the secret supplied by the client.
+
+---
+
+## Three Topologies
+
+### Topology A: Host ↔ Host
+
+Neither peer advertises a subnet; each side forwards only its own traffic.
+
+**Setup:**
+
+```bash
+# Machine A (listener) — root required
+sudo bore vpn listen \
+  --to bore.example.com \
+  --secret S3cret \
+  --id mylink
+
+# Machine B (connector) — root required
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id mylink
+```
+
+**Expected behavior:**
+
+- Both sides obtain a `/30` overlay address pair from the server's pool (e.g., A gets `10.99.0.1`, B gets `10.99.0.2`).
+- A TUN interface (`bore0` by default) is created on each side, UP, with the assigned address.
+- Logs show `path="direct"` if hole-punching succeeded, or `path="relay"` if it fell back to the server.
+- `ping` between the overlay addresses works; small packets (56 bytes) usually succeed immediately.
+- Large packets (e.g., `ping -s 1300`) may drop briefly during QUIC MTU discovery, then succeed. This is normal (§6.1 transient).
+- No IP forwarding is enabled; no NAT rules are installed (each side routes only its own traffic).
+
+**Throughput:** `iperf3 -s` on A, `iperf3 -c 10.99.0.1` on B shows sustained throughput. Direct path achieves roughly the same bandwidth as `bore test-udp` between the same hosts. Relay path uses the server's TCP relay, potentially more latency.
+
+---
+
+### Topology B: Site ↔ Host (Gateway + Roaming Client)
+
+The listener advertises one or more subnets behind it (its LAN); the connector reaches hosts in those subnets.
+
+**Setup:**
+
+```bash
+# Machine A: gateway of LAN 192.168.50.0/24
+sudo bore vpn listen \
+  --to bore.example.com \
+  --secret S3cret \
+  --id site \
+  --advertise 192.168.50.0/24
+
+# Machine B: roaming client, connects to the site
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id site
+```
+
+**Expected behavior:**
+
+- A becomes the gateway; B becomes the client.
+- A's system detects that it advertises routes; it enables IP forwarding (`/proc/sys/net/ipv4/ip_forward = 1`), saves the previous value for restoration.
+- A installs an `nft` table `bore_vpn_site` with masquerade (NAT) and MSS-clamp rules. One rule marks packets inbound on the TUN as going out toward the LAN with source NAT (masquerade). Another rule clamps TCP MSS to the path MTU to avoid PMTU blackholes. Logs show each rule at `info!` on apply.
+- B receives a route: `192.168.50.0/24 dev bore0` (the peer's advertised subnet via the TUN).
+- From B, you can now `ping 192.168.50.10` (a real host on A's LAN) and see replies from that host's real IP.
+- From B, `curl http://192.168.50.10` reaches the LAN host's service. The LAN host sees the source IP as A's LAN address (masquerade), not B's.
+- TCP connections from B into A's LAN never get stuck with "PMTU blackhole" errors because the MSS is clamped at setup time.
+
+**On exit (Ctrl-C or error):**
+
+- The `nft` table is deleted (atomic, single operation).
+- IP forwarding is restored to its previous value.
+- B's route is deleted.
+- Both TUN interfaces are removed.
+- Logs show each undo at `info!`.
+
+**Cleanup guarantee:** after a graceful exit, `ip route show`, `nft list tables`, and `cat /proc/sys/net/ipv4/ip_forward` are identical to before the link started. (A `SIGKILL` cannot clean up; the next `bore vpn` run with the same `--id` reclaims stale state.)
+
+---
+
+### Topology C: Site ↔ Site (Gateway ↔ Gateway)
+
+Both peers advertise subnets; each side is both a gateway and a client.
+
+**Setup:**
+
+```bash
+# Site A gateway (LAN 192.168.50.0/24)
+sudo bore vpn listen \
+  --to bore.example.com \
+  --secret S3cret \
+  --id s2s \
+  --advertise 192.168.50.0/24
+
+# Site B gateway (LAN 192.168.60.0/24)
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id s2s \
+  --advertise 192.168.60.0/24
+```
+
+**Expected behavior:**
+
+- A installs: routes to B's LAN (192.168.60.0/24), IP forwarding, NAT/MSS rules.
+- B installs: routes to A's LAN (192.168.50.0/24), IP forwarding, NAT/MSS rules.
+- A host on LAN A can reach a host on LAN B **if** LAN A's router knows to forward `192.168.60.0/24` via gateway A, or if you run the test from the gateway itself.
+- Similarly for B.
+
+**LAN router configuration:** Bore manages the gateway hosts; it does not manage the LAN's internal routing. For a full site-to-site mesh, ensure each LAN's router or default gateway is aware of the route via the bore gateway. Example:
+
+```bash
+# On LAN A's router: add a route to B's LAN via A's gateway
+ip route add 192.168.60.0/24 via 192.168.50.10  # A's gateway IP
+
+# On LAN B's router: add a route to A's LAN via B's gateway
+ip route add 192.168.50.0/24 via 192.168.60.10  # B's gateway IP
+```
+
+---
+
+## Addressing
+
+### Pool Mode (Default)
+
+If neither `--vpn-addr` nor `--vpn-peer-addr` is specified, the server allocates addresses from its `--vpn-pool` (e.g., `10.99.0.0/16`). Each /30 subnet is allocated once per link; on teardown, it is freed and becomes available for reuse.
+
+- **Listener** gets the `.1` address of the allocated /30 (e.g., `10.99.0.1/30`).
+- **Connector** gets the `.2` address (e.g., `10.99.0.2/30`).
+
+Both sides must use pool mode (or both static); mixed mode is rejected with `VpnError("addressing mode mismatch")`.
+
+### Static Mode
+
+Provide explicit overlay addresses on both sides:
+
+```bash
+# Listener
+sudo bore vpn listen \
+  --to bore.example.com \
+  --secret S3cret \
+  --id st \
+  --vpn-addr 172.31.0.1/30 \
+  --vpn-peer-addr 172.31.0.2
+
+# Connector
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id st \
+  --vpn-addr 172.31.0.2/30 \
+  --vpn-peer-addr 172.31.0.1
+```
+
+**Validation (server-side):**
+
+1. Both sides must use the same mode (both pool or both static).
+2. For static pairs, the mirror must be consistent: `listener.addr == connector.peer` and vice versa; same prefix; both addresses in the same network; addresses distinct.
+3. Static addresses cannot collide with any live pool lease or another live static link.
+4. Pool mode requires the server to have `--vpn-pool`; if absent, both sides get `VpnError("server has no vpn pool")`.
+
+On validation failure, the connector receives a `VpnError` and exits non-zero; the listener remains registered, waiting for a valid connector.
+
+---
+
+## Network Configuration
+
+### MTU and QUIC Datagrams
+
+The TUN interface default MTU is **1350 bytes**, overridable with `--mtu`. This is a conservative value chosen to:
+
+1. **Fit inside a QUIC datagram.** QUIC datagram payloads have a maximum size advertised by the peer (`max_datagram_size()`). By clamping the TUN MTU, we guarantee that a segmented packet always fits in one datagram on the direct path, avoiding retransmission meltdown.
+2. **Survive path MTU discovery transients.** At the start of a direct QUIC connection, the peer's `max_datagram_size()` may report 1200 bytes (the QUIC conservative initial guess) before MTU discovery raises it. Small packets pass immediately; full-size packets (`ping -s 1300`) drop transiently, and TCP retransmits. After the first round-trips (usually within 1–2 seconds), MTU discovery settles and throughput normalizes.
+
+**If you see persistent large-packet loss >10 seconds after link-up:**
+
+The path MTU is likely below 1350. Try `--mtu 1280` or lower, or enable `--no-route-manage` and manually inspect the path with `tracepath` / `mtu-test`.
+
+### On the Relay Fallback Path
+
+When the direct QUIC path is unavailable, IP packets are framed with a 4-byte length + 8-byte counter + 16-byte AEAD tag, so the minimum relay frame is roughly 28 bytes overhead per packet. The server multiplexes this over a TCP connection with standard TCP framing, so the effective path MTU is slightly lower than the TUN MTU. If you find the relay path is losing large packets, reduce `--mtu` by 50 bytes and retry.
+
+### Gateway MSS Clamping
+
+When you advertise subnets (gateway mode), the setup installs an `nft` rule:
+
+```
+tcp flags syn tcp option maxseg size set rt mtu
+```
+
+This clamps TCP's **Maximum Segment Size** to the route MTU on outbound packets, preventing TCP implementations that ignore path MTU discovery from sending oversized segments that silently drop.
+
+---
+
+## Limitations (v1)
+
+### Overlapping Subnets
+
+If both sides (or either side and the overlay /30) advertise overlapping subnets, the server rejects the pair with `VpnError("overlapping subnets: ...")`. The listener remains registered; the connector exits non-zero.
+
+This is a **v1 limitation**. Future versions may support overlapping subnets via per-subnet 1:1 NAT (DNAT/SNAT remapping).
+
+### IPv4 Only
+
+v1 supports IPv4 only (`Ipv4Addr`, `/30` overlay, advertised `Ipv4Net` subnets). IPv6 and dual-stack support is deferred to v2 (§V2).
+
+---
+
+## The `--no-route-manage` Flag
+
+By default, `bore vpn` auto-manages all network configuration: interface creation, address assignment, routing, IP forwarding, and NAT rules. This requires root or `CAP_NET_ADMIN`.
+
+With `--no-route-manage`, the TUN device itself is still created and configured (non-negotiable), but all **routing and NAT mutations are skipped**. Instead, every command is **printed verbatim** so you can review and run them manually:
+
+```bash
+sudo bore vpn connect --to srv --id site --no-route-manage 2>&1 | tee /tmp/vpn_cmds.txt
+
+# Review, then apply manually:
+cat /tmp/vpn_cmds.txt | bash
+```
+
+On exit, only the TUN interface is removed; the manually-applied routes and rules are left in place. This is useful for:
+
+- Environments where you prefer to control NAT rules (Docker, network namespaces).
+- Testing the exact rules before applying them system-wide.
+- Constrained privilege models where you want to separate interface setup from routing.
+
+---
+
+## Automatic Reconnection
+
+With `--auto-reconnect`, the client reconnects on link failure with exponential backoff (1, 2, 4, 8, 16, 32 seconds, then every 32 seconds). The TUN interface and routes are re-validated (not duplicated); the same overlay address is reused if the pool is still available. On reconnection failure, logs show `warn!` and the retry schedule; on success, the backoff resets.
+
+---
+
+## Path Selection & Fallback
+
+**On link-up:** the client attempts a direct QUIC hole-punch first. Logs show `info!(path="direct")` on success or `warn!` (fallback) + `info!(path="relay")` if the direct path fails.
+
+**After link-up:** if the direct path becomes unavailable (UDP blocked, firewall changes), the bridge detects the closure and transparently falls back to the relay. A brief stall may occur (the client re-opens a relay substream and re-derives keys), then traffic resumes.
+
+**Relay is always available** (assuming the server is up) because it is the fallback transport; there is no scenario where the relay "succeeds or fails" — it is the baseline.
+
+---
+
+## Diagnosing Issues
+
+### Link pairs but no ping
+
+Check which path is active in the logs:
+
+```bash
+# From the logs:
+2026-06-10T10:30:42.123Z info vpn_link_paired link_id=mylink path=relay overlay=10.99.0.1/30
+```
+
+If `path="relay"`, run `bore test-udp` between the two hosts to diagnose NAT:
+
+```bash
+# Machine A
+bore test-udp --to bore.example.com
+
+# Machine B (same command)
+bore test-udp --to bore.example.com
+```
+
+This prints NAT class (cone, symmetric, etc.), port preservation, CGNAT detection, and UPnP status. If both are "open" or "cone", direct should work; if one is "symmetric" and the other is not, only one direction will punch. If both are "symmetric", direct fails (relay only).
+
+### Ping ok, TCP slow or stalls
+
+Likely an MTU issue:
+
+1. Try `--mtu 1280`.
+2. On a gateway, verify the MSS-clamp rule exists: `nft list table inet bore_vpn_<id>`.
+3. Check if the path MTU is actually lower than your `--mtu`: run `tracepath` between the peers from outside the tunnel and look for the "no route to host" point, which reveals the bottleneck.
+
+### Works from gateway, not from LAN hosts
+
+**For site↔host (Topology B):** the LAN behind the gateway is behind NAT (masquerade). This is correct. If a LAN host can't reach the other site's tunnel gateway, the LAN's router is missing the route. Example:
+
+```bash
+# On LAN A's router:
+ip route add 192.168.60.0/24 via 192.168.50.10  # A's gateway
+```
+
+**For site↔site (Topology C):** same issue, but both LANs need routes. Each LAN must know to forward packets destined for the peer LAN via the local bore gateway.
+
+### Interface disappears after exit
+
+Normal. `Ctrl-C` (SIGINT), a link error, or panic all trigger cleanup: routes deleted, IP forwarding restored, nft table dropped, TUN interface removed. Stale state from a crash (e.g., `SIGKILL`) is reclaimed on the next `bore vpn` run with the same `--id`.
+
+---
+
+## Performance — Phase 6.2 GSO/GRO Offload (Deferred)
+
+v1 uses **single-packet TUN I/O** (Phase 6.1). The implementation is correct and achieves sustained throughput without syscall-bound bottlenecks on typical paths.
+
+**Phase 6.2 (IFF_VNET_HDR + GSO/GRO offload)** has been **deferred to v2** for the following reason:
+
+> The project rule requires an `iperf3` baseline measurement before implementing an optimization. Baseline testing is a prerequisite for validating that an optimization actually improves throughput. During v1 development, `iperf3` was not available in the test environment, so the Phase 6.2 baseline could not be measured. Without a baseline, we cannot prove that offload improves performance, which violates the project rule.
+
+**For v2:** Phase 6.2 involves:
+
+1. Enabling `IFF_VNET_HDR` on the TUN device (`tun-rs` builder API).
+2. Reading multiple packets from the TUN in one syscall, interpreting `virtio_net_hdr` metadata (GSO super-buffers).
+3. Segmenting each super-buffer to ≤`max_datagram_size()` before send.
+4. Coalescing received datagrams (GRO).
+5. Writing multiple packets back to the TUN in one syscall.
+
+The `tun-rs` crate already exposes the necessary APIs (`offload()`, `recv_multiple()`, `send_multiple()`), so this is a straightforward v2 implementation task, not a architectural blocker. Single-packet mode is the safe, proven baseline.
+
+---
+
+## Building and Running
+
+### Build
+
+```bash
+# With VPN feature
+cargo build --release --features vpn
+
+# Verification
+./target/release/bore vpn --help  # subcommand exists
+```
+
+### Server
+
+```bash
+bore server \
+  --secret S3cret \
+  --vpn \
+  --vpn-pool 10.99.0.0/16 \
+  --vpn-max-links 32 \
+  --bind-addr 0.0.0.0
+```
+
+- `--vpn`: enable VPN brokering (server must be built with `--features vpn`; if not, clients get `VpnError("vpn not supported/enabled")`).
+- `--vpn-pool <CIDR>`: allocate /30 blocks from this pool (required for pool-mode clients).
+- `--vpn-max-links <N>`: limit concurrent VPN links (default unlimited; reuse pattern from `--max-conns`).
+
+### Client (Listen)
+
+```bash
+sudo bore vpn listen \
+  --to bore.example.com \
+  --secret S3cret \
+  --id mylink \
+  --advertise 192.168.50.0/24  # (optional; omit for host-only)
+```
+
+### Client (Connect)
+
+```bash
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id mylink
+```
+
+---
+
+## Environment Variables
+
+Standard bore env vars apply (substitute `BORE_` prefix):
+
+- `BORE_SERVER` → `--to`
+- `BORE_SECRET` → `--secret` (note: values are hidden in `ps` / logs)
+- `BORE_VPN_ID` → `--id`
+- `BORE_VPN_ADVERTISE` → `--advertise` (comma-separated CIDR list)
+- `BORE_VPN_ADDR` → `--vpn-addr`
+- `BORE_INSECURE` → `--insecure`
+- `RUST_LOG` → control logging (e.g., `RUST_LOG=bore_cli=debug`)
+
+---
+
+## Tested Scenarios
+
+- Host ↔ host (pool and static addressing)
+- Site ↔ host (one gateway, one client)
+- Site ↔ site (both gateways)
+- Direct path hole-punch success and failure
+- Relay fallback from direct path drop
+- `--no-route-manage` (prints commands without applying)
+- `--auto-reconnect` with server drop and recovery
+- `Ctrl-C` exit cleanup (routes, IP forward, nft table, interface)
+- Duplicate link id rejection
+- Overlapping subnet rejection
+- Pool exhaustion detection
+- Address collision detection
+- Gateway MSS-clamp rule validation
+- Sustained throughput over overlay (iperf3 sanity check)
+
+See `docs/VPN_TEST_MATRIX.md` for the full test matrix and traceability to Phase 8 acceptance criteria.

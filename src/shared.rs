@@ -488,6 +488,86 @@ impl UdpDirectTuning {
     }
 }
 
+/// An IPv4 CIDR (address + prefix length). Used for overlay + advertised subnets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ipv4Net {
+    /// The IPv4 address.
+    pub addr: std::net::Ipv4Addr,
+    /// The prefix length (0-32).
+    pub prefix: u8,
+}
+
+impl std::str::FromStr for Ipv4Net {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (addr_str, prefix_str) = s
+            .split_once('/')
+            .ok_or_else(|| anyhow::anyhow!("missing '/' in CIDR: {s}"))?;
+        let addr = addr_str
+            .parse::<std::net::Ipv4Addr>()
+            .map_err(|e| anyhow::anyhow!("invalid addr in {s}: {e}"))?;
+        let prefix = prefix_str
+            .parse::<u8>()
+            .map_err(|e| anyhow::anyhow!("invalid prefix in {s}: {e}"))?;
+        anyhow::ensure!(prefix <= 32, "prefix {prefix} > 32 in {s}");
+        Ok(Ipv4Net { addr, prefix })
+    }
+}
+
+impl std::fmt::Display for Ipv4Net {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix)
+    }
+}
+
+impl Ipv4Net {
+    /// Network address (host bits zeroed).
+    pub fn network(&self) -> std::net::Ipv4Addr {
+        let mask = Self::prefix_to_mask(self.prefix);
+        std::net::Ipv4Addr::from(u32::from(self.addr) & mask)
+    }
+
+    /// True if `addr` is within this network.
+    pub fn contains(&self, addr: std::net::Ipv4Addr) -> bool {
+        let mask = Self::prefix_to_mask(self.prefix);
+        (u32::from(self.addr) & mask) == (u32::from(addr) & mask)
+    }
+
+    /// True if `other` network overlaps with this one.
+    pub fn overlaps(&self, other: &Ipv4Net) -> bool {
+        let mask = if self.prefix <= other.prefix {
+            Self::prefix_to_mask(self.prefix)
+        } else {
+            Self::prefix_to_mask(other.prefix)
+        };
+        (u32::from(self.addr) & mask) == (u32::from(other.addr) & mask)
+    }
+
+    fn prefix_to_mask(prefix: u8) -> u32 {
+        if prefix == 0 {
+            0
+        } else {
+            !0u32 << (32 - prefix)
+        }
+    }
+}
+
+/// How a side wants its overlay address assigned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VpnAddrRequest {
+    /// Server allocates a /30 from its pool.
+    Pool,
+    /// Client specifies its own address, prefix, and peer address.
+    Static {
+        /// The overlay address requested.
+        addr: std::net::Ipv4Addr,
+        /// The prefix length.
+        prefix: u8,
+        /// The peer's overlay address.
+        peer: std::net::Ipv4Addr,
+    },
+}
+
 /// A message from the client on the control substream.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -592,6 +672,33 @@ pub enum ClientMessage {
     VhostUdpRenew {
         /// Subdomain whose direct path should be renewed.
         subdomain: String,
+    },
+
+    /// Register as the listener for a VPN link id.
+    HelloVpn {
+        /// VPN link identifier to register under.
+        id: String,
+        /// CIDRs this side exposes (empty = host-only).
+        advertised: Vec<Ipv4Net>,
+        /// How this side wants its overlay address assigned.
+        addr: VpnAddrRequest,
+        /// Optional operator note for the admin status page.
+        notes: Option<String>,
+        /// Number of relay carrier connections (always 1 in v1; field reserved for v2).
+        #[serde(default)]
+        carriers: u16,
+    },
+
+    /// Connect as the connector for a VPN link id.
+    ConnectVpn {
+        /// VPN link identifier to connect to.
+        id: String,
+        /// CIDRs this side exposes (empty = host-only).
+        advertised: Vec<Ipv4Net>,
+        /// How this side wants its overlay address assigned.
+        addr: VpnAddrRequest,
+        /// Optional operator note.
+        notes: Option<String>,
     },
 }
 
@@ -703,6 +810,26 @@ pub enum ServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         adaptive_plan: Option<UdpAdaptivePlan>,
     },
+
+    /// VPN link paired; contains overlay addressing and the direct-path nonce.
+    VpnReady {
+        /// This side's overlay address.
+        assigned: std::net::Ipv4Addr,
+        /// Overlay link prefix length (always 30 for /30).
+        prefix: u8,
+        /// The other end's overlay address.
+        peer_overlay: std::net::Ipv4Addr,
+        /// Install routes toward these CIDRs via the tun interface.
+        peer_advertised: Vec<Ipv4Net>,
+        /// Seeds both the AEAD key derivation and the direct-path token derivation.
+        session_nonce: [u8; UDP_NONCE_LEN],
+        /// Direct-UDP transport tuning.
+        #[serde(default)]
+        tuning: UdpDirectTuning,
+    },
+
+    /// VPN pairing failed (duplicate id, pool exhausted, overlap, etc.).
+    VpnError(String),
 }
 
 #[doc(hidden)]
@@ -785,6 +912,36 @@ impl ControlFrameSummary for ClientMessage {
             ClientMessage::VhostUdpRenew { subdomain } => {
                 format!("VhostUdpRenew {{ subdomain={} }}", subdomain)
             }
+            ClientMessage::HelloVpn {
+                id,
+                advertised,
+                addr,
+                notes,
+                carriers,
+            } => {
+                format!(
+                    "HelloVpn {{ id={}, advertised={:?}, addr={:?}, notes={}, carriers={} }}",
+                    id,
+                    advertised,
+                    addr,
+                    if notes.is_some() { "present" } else { "none" },
+                    carriers,
+                )
+            }
+            ClientMessage::ConnectVpn {
+                id,
+                advertised,
+                addr,
+                notes,
+            } => {
+                format!(
+                    "ConnectVpn {{ id={}, advertised={:?}, addr={:?}, notes={} }}",
+                    id,
+                    advertised,
+                    addr,
+                    if notes.is_some() { "present" } else { "none" },
+                )
+            }
         }
     }
 }
@@ -863,6 +1020,27 @@ impl ControlFrameSummary for ServerMessage {
                     tuning.control_frame_summary(),
                     adaptive_plan.as_ref().map(|plan| plan.summary()).unwrap_or_else(|| "<none>".to_string()),
                 )
+            }
+            ServerMessage::VpnReady {
+                assigned,
+                prefix,
+                peer_overlay,
+                peer_advertised,
+                session_nonce,
+                tuning,
+            } => {
+                format!(
+                    "VpnReady {{ assigned={}, prefix={}, peer_overlay={}, peer_advertised={:?}, session_nonce={}, tuning={{ {} }} }}",
+                    assigned,
+                    prefix,
+                    peer_overlay,
+                    peer_advertised,
+                    hex::encode(session_nonce),
+                    tuning.control_frame_summary(),
+                )
+            }
+            ServerMessage::VpnError(msg) => {
+                format!("VpnError {{ message={} }}", msg)
             }
         }
     }
@@ -1185,4 +1363,62 @@ fn vhost_ready_round_trips() {
         }
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+#[test]
+fn serde_roundtrip_vpn_messages() {
+    let msg = ClientMessage::HelloVpn {
+        id: "test".into(),
+        advertised: vec![Ipv4Net {
+            addr: "10.0.0.0".parse().unwrap(),
+            prefix: 24,
+        }],
+        addr: VpnAddrRequest::Pool,
+        notes: None,
+        carriers: 1,
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let back: ClientMessage = serde_json::from_str(&json).unwrap();
+    assert!(matches!(back, ClientMessage::HelloVpn { .. }));
+
+    let msg = ServerMessage::VpnReady {
+        assigned: "10.99.0.1".parse().unwrap(),
+        prefix: 30,
+        peer_overlay: "10.99.0.2".parse().unwrap(),
+        peer_advertised: vec![],
+        session_nonce: [0u8; 16],
+        tuning: UdpDirectTuning::default(),
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let back: ServerMessage = serde_json::from_str(&json).unwrap();
+    assert!(matches!(back, ServerMessage::VpnReady { .. }));
+
+    let msg = ServerMessage::VpnError("test error".into());
+    let json = serde_json::to_string(&msg).unwrap();
+    let back: ServerMessage = serde_json::from_str(&json).unwrap();
+    assert!(matches!(back, ServerMessage::VpnError(_)));
+}
+
+#[test]
+fn forward_compat_unknown_fields_default() {
+    let json = r#"{"HelloVpn":{"id":"x","advertised":[],"addr":"Pool","notes":null}}"#;
+    let msg: ClientMessage = serde_json::from_str(json).unwrap();
+    if let ClientMessage::HelloVpn { carriers, .. } = msg {
+        assert_eq!(carriers, 0);
+    } else {
+        panic!("unexpected variant");
+    }
+}
+
+#[test]
+fn ipv4net_overlaps() {
+    let a: Ipv4Net = "10.0.0.0/24".parse().unwrap();
+    let b: Ipv4Net = "10.0.0.0/25".parse().unwrap();
+    let c: Ipv4Net = "10.0.1.0/24".parse().unwrap();
+    assert!(a.overlaps(&b));
+    assert!(b.overlaps(&a));
+    assert!(!a.overlaps(&c));
+    let d: Ipv4Net = "192.168.0.0/30".parse().unwrap();
+    let e: Ipv4Net = "192.168.0.4/30".parse().unwrap();
+    assert!(!d.overlaps(&e));
 }

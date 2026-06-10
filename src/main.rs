@@ -2,12 +2,17 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+#[cfg(all(feature = "vpn", target_os = "linux"))]
+use bore_cli::vpn;
 use bore_cli::{
     client::{Client, ProviderMeta},
     reconnect,
     secret::Proxy,
     server::Server,
-    shared::{TunnelOptions, UdpDirectTuning, UdpTestOptions, MAX_DIRECT_STREAMS, MAX_NOTES_LEN},
+    shared::{
+        Ipv4Net, TunnelOptions, UdpDirectTuning, UdpTestOptions, VpnAddrRequest,
+        MAX_DIRECT_STREAMS, MAX_NOTES_LEN,
+    },
     transfer::{
         CollisionPolicy, DeviceMode, ListenerOptions as TransferListenerOptions,
         SenderOptions as TransferSenderOptions, SymlinkMode,
@@ -338,6 +343,13 @@ enum Command {
         command: TransferCommand,
     },
 
+    /// Linux point-to-point VPN overlay (requires --features vpn; needs root / CAP_NET_ADMIN).
+    #[cfg(all(feature = "vpn", target_os = "linux"))]
+    Vpn {
+        #[clap(subcommand)]
+        command: VpnCommand,
+    },
+
     /// Runs the remote proxy server.
     Server {
         /// Minimum accepted TCP port number.
@@ -525,6 +537,27 @@ enum Command {
         /// `key_file` from vhost.yml.
         #[clap(long, value_name = "PATH", env = "BORE_VHOST_KEY_FILE")]
         vhost_key_file: Option<PathBuf>,
+
+        /// Enable VPN link brokering (requires --features vpn on the client).
+        #[cfg(feature = "vpn")]
+        #[clap(long, env = "BORE_VPN")]
+        vpn: bool,
+
+        /// Overlay address pool for VPN links (CIDR, e.g. 10.99.0.0/16).
+        /// Required when clients use pool-mode addressing.
+        #[cfg(feature = "vpn")]
+        #[clap(long, value_name = "CIDR", env = "BORE_VPN_POOL")]
+        vpn_pool: Option<String>,
+
+        /// Maximum number of concurrent VPN links.
+        #[cfg(feature = "vpn")]
+        #[clap(
+            long,
+            value_name = "N",
+            default_value_t = 32usize,
+            env = "BORE_VPN_MAX_LINKS"
+        )]
+        vpn_max_links: usize,
     },
 
     /// Diagnose this host's UDP / NAT / firewall for hole-punching (opens no
@@ -801,6 +834,215 @@ enum TransferCommand {
         #[clap(long, default_value_t = 60)]
         stall_timeout: u64,
     },
+}
+
+#[cfg(all(feature = "vpn", target_os = "linux"))]
+#[derive(Subcommand, Debug)]
+enum VpnCommand {
+    /// Register a VPN link id and wait for a connector.
+    Listen(VpnListenArgs),
+    /// Dial a VPN link id registered by a listener.
+    Connect(VpnConnectArgs),
+}
+
+#[cfg(all(feature = "vpn", target_os = "linux"))]
+#[derive(clap::Args, Debug)]
+struct VpnListenArgs {
+    /// Server address (host or https://host).
+    #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER", default_value = DEFAULT_SERVER)]
+    to: String,
+
+    /// Shared secret for authentication (required).
+    #[clap(
+        short,
+        long,
+        value_name = "SECRET",
+        env = "BORE_SECRET",
+        hide_env_values = true,
+        required = true
+    )]
+    secret: String,
+
+    /// VPN link identifier.
+    #[clap(long, value_name = "ID", env = "BORE_VPN_ID", required = true)]
+    id: String,
+
+    /// Skip TLS certificate verification for self-signed servers.
+    #[clap(long, env = "BORE_INSECURE")]
+    insecure: bool,
+
+    /// Reconnect on disconnect (with exponential backoff).
+    #[clap(long, env = "BORE_AUTO_RECONNECT")]
+    auto_reconnect: bool,
+
+    /// Subnets this side exposes (comma-separated CIDRs, e.g. 192.168.50.0/24).
+    /// Omit for host-only mode; presence enables gateway mode.
+    #[clap(
+        long,
+        value_name = "CIDR[,CIDR...]",
+        env = "BORE_VPN_ADVERTISE",
+        value_delimiter = ','
+    )]
+    advertise: Vec<String>,
+
+    /// Static overlay IPv4 address with prefix (e.g. 172.31.0.1/30). Omit to use server pool.
+    #[clap(long, value_name = "IP/PREFIX", env = "BORE_VPN_ADDR")]
+    vpn_addr: Option<String>,
+
+    /// Peer's overlay address for static mode (required with --vpn-addr).
+    #[clap(
+        long,
+        value_name = "IP",
+        env = "BORE_VPN_PEER_ADDR",
+        requires = "vpn_addr"
+    )]
+    vpn_peer_addr: Option<String>,
+
+    /// TUN interface name.
+    #[clap(long, value_name = "NAME", default_value = "bore0")]
+    tun_name: String,
+
+    /// Interface MTU.
+    #[clap(long, value_name = "N", default_value_t = 1350u16)]
+    mtu: u16,
+
+    /// Print route/NAT commands instead of running them (interface is still created).
+    #[clap(long)]
+    no_route_manage: bool,
+
+    /// STUN server (host:port).
+    #[clap(long, value_name = "HOST:PORT", env = "BORE_STUN_SERVER")]
+    stun_server: Option<String>,
+
+    /// Try UPnP-IGD to add a router-mapped UDP candidate.
+    #[clap(long, env = "BORE_UPNP")]
+    upnp: bool,
+
+    /// Also advertise predicted symmetric-NAT ports.
+    #[clap(long, env = "BORE_TRY_PORT_PREDICTION")]
+    try_port_prediction: bool,
+
+    /// Bind the UDP hole-punch socket to this fixed port.
+    #[clap(
+        long,
+        value_name = "PORT",
+        default_value_t = 0u16,
+        env = "BORE_NAT_UDP_PREFERRED_PORT"
+    )]
+    nat_udp_preferred_port: u16,
+
+    /// How long (seconds) to wait before re-checking the preferred UDP port.
+    #[clap(
+        long,
+        value_name = "SECS",
+        default_value_t = 0u64,
+        env = "BORE_NAT_UDP_RELEASE_TIMEOUT"
+    )]
+    nat_udp_release_timeout: u64,
+
+    /// Optional operator note.
+    #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
+    notes: Option<String>,
+}
+
+#[cfg(all(feature = "vpn", target_os = "linux"))]
+#[derive(clap::Args, Debug)]
+struct VpnConnectArgs {
+    /// Server address (host or https://host).
+    #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER", default_value = DEFAULT_SERVER)]
+    to: String,
+
+    /// Shared secret for authentication (required).
+    #[clap(
+        short,
+        long,
+        value_name = "SECRET",
+        env = "BORE_SECRET",
+        hide_env_values = true,
+        required = true
+    )]
+    secret: String,
+
+    /// VPN link identifier.
+    #[clap(long, value_name = "ID", env = "BORE_VPN_ID", required = true)]
+    id: String,
+
+    /// Skip TLS certificate verification for self-signed servers.
+    #[clap(long, env = "BORE_INSECURE")]
+    insecure: bool,
+
+    /// Reconnect on disconnect (with exponential backoff).
+    #[clap(long, env = "BORE_AUTO_RECONNECT")]
+    auto_reconnect: bool,
+
+    /// Subnets this side exposes (comma-separated CIDRs, e.g. 192.168.50.0/24).
+    /// Omit for host-only mode; presence enables gateway mode.
+    #[clap(
+        long,
+        value_name = "CIDR[,CIDR...]",
+        env = "BORE_VPN_ADVERTISE",
+        value_delimiter = ','
+    )]
+    advertise: Vec<String>,
+
+    /// Static overlay IPv4 address with prefix (e.g. 172.31.0.2/30). Omit to use server pool.
+    #[clap(long, value_name = "IP/PREFIX", env = "BORE_VPN_ADDR")]
+    vpn_addr: Option<String>,
+
+    /// Peer's overlay address for static mode (required with --vpn-addr).
+    #[clap(
+        long,
+        value_name = "IP",
+        env = "BORE_VPN_PEER_ADDR",
+        requires = "vpn_addr"
+    )]
+    vpn_peer_addr: Option<String>,
+
+    /// TUN interface name.
+    #[clap(long, value_name = "NAME", default_value = "bore0")]
+    tun_name: String,
+
+    /// Interface MTU.
+    #[clap(long, value_name = "N", default_value_t = 1350u16)]
+    mtu: u16,
+
+    /// Print route/NAT commands instead of running them (interface is still created).
+    #[clap(long)]
+    no_route_manage: bool,
+
+    /// STUN server (host:port).
+    #[clap(long, value_name = "HOST:PORT", env = "BORE_STUN_SERVER")]
+    stun_server: Option<String>,
+
+    /// Try UPnP-IGD to add a router-mapped UDP candidate.
+    #[clap(long, env = "BORE_UPNP")]
+    upnp: bool,
+
+    /// Also advertise predicted symmetric-NAT ports.
+    #[clap(long, env = "BORE_TRY_PORT_PREDICTION")]
+    try_port_prediction: bool,
+
+    /// Bind the UDP hole-punch socket to this fixed port.
+    #[clap(
+        long,
+        value_name = "PORT",
+        default_value_t = 0u16,
+        env = "BORE_NAT_UDP_PREFERRED_PORT"
+    )]
+    nat_udp_preferred_port: u16,
+
+    /// How long (seconds) to wait before re-checking the preferred UDP port.
+    #[clap(
+        long,
+        value_name = "SECS",
+        default_value_t = 0u64,
+        env = "BORE_NAT_UDP_RELEASE_TIMEOUT"
+    )]
+    nat_udp_release_timeout: u64,
+
+    /// Optional operator note.
+    #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
+    notes: Option<String>,
 }
 
 #[tokio::main]
@@ -1133,6 +1375,95 @@ async fn dispatch(command: Command) -> Result<()> {
                 .await?;
             }
         },
+        #[cfg(all(feature = "vpn", target_os = "linux"))]
+        Command::Vpn { command } => match command {
+            VpnCommand::Listen(args) => {
+                let advertised: Result<Vec<_>> = args
+                    .advertise
+                    .iter()
+                    .map(|s| s.parse::<Ipv4Net>())
+                    .collect();
+                let advertised = advertised.context("failed to parse --advertise CIDRs")?;
+
+                let addr_request = match (&args.vpn_addr, &args.vpn_peer_addr) {
+                    (None, None) => VpnAddrRequest::Pool,
+                    (Some(addr_str), Some(peer_str)) => {
+                        let (addr_s, prefix_s) = addr_str
+                            .split_once('/')
+                            .context("missing '/' in --vpn-addr (format: 172.31.0.1/30)")?;
+                        let addr = addr_s.parse().context("invalid IP in --vpn-addr")?;
+                        let prefix = prefix_s.parse().context("invalid prefix in --vpn-addr")?;
+                        let peer = peer_str.parse().context("invalid IP in --vpn-peer-addr")?;
+                        VpnAddrRequest::Static { addr, prefix, peer }
+                    }
+                    (Some(_), None) => anyhow::bail!("--vpn-addr requires --vpn-peer-addr"),
+                    (None, Some(_)) => anyhow::bail!("--vpn-peer-addr requires --vpn-addr"),
+                };
+
+                let vpn_args = vpn::VpnListenArgs {
+                    to: args.to,
+                    secret: args.secret,
+                    id: args.id,
+                    insecure: args.insecure,
+                    advertised,
+                    addr_request,
+                    tun_name: args.tun_name,
+                    mtu: args.mtu,
+                    no_route_manage: args.no_route_manage,
+                    stun_server: args.stun_server,
+                    upnp: args.upnp,
+                    try_port_prediction: args.try_port_prediction,
+                    nat_udp_preferred_port: args.nat_udp_preferred_port,
+                    nat_udp_release_timeout: args.nat_udp_release_timeout,
+                    notes: args.notes,
+                };
+
+                vpn::run_listen(vpn_args).await?;
+            }
+            VpnCommand::Connect(args) => {
+                let advertised: Result<Vec<_>> = args
+                    .advertise
+                    .iter()
+                    .map(|s| s.parse::<Ipv4Net>())
+                    .collect();
+                let advertised = advertised.context("failed to parse --advertise CIDRs")?;
+
+                let addr_request = match (&args.vpn_addr, &args.vpn_peer_addr) {
+                    (None, None) => VpnAddrRequest::Pool,
+                    (Some(addr_str), Some(peer_str)) => {
+                        let (addr_s, prefix_s) = addr_str
+                            .split_once('/')
+                            .context("missing '/' in --vpn-addr (format: 172.31.0.2/30)")?;
+                        let addr = addr_s.parse().context("invalid IP in --vpn-addr")?;
+                        let prefix = prefix_s.parse().context("invalid prefix in --vpn-addr")?;
+                        let peer = peer_str.parse().context("invalid IP in --vpn-peer-addr")?;
+                        VpnAddrRequest::Static { addr, prefix, peer }
+                    }
+                    (Some(_), None) => anyhow::bail!("--vpn-addr requires --vpn-peer-addr"),
+                    (None, Some(_)) => anyhow::bail!("--vpn-peer-addr requires --vpn-addr"),
+                };
+
+                let vpn_args = vpn::VpnConnectArgs {
+                    to: args.to,
+                    secret: args.secret,
+                    id: args.id,
+                    insecure: args.insecure,
+                    advertised,
+                    addr_request,
+                    tun_name: args.tun_name,
+                    mtu: args.mtu,
+                    no_route_manage: args.no_route_manage,
+                    stun_server: args.stun_server,
+                    upnp: args.upnp,
+                    try_port_prediction: args.try_port_prediction,
+                    nat_udp_preferred_port: args.nat_udp_preferred_port,
+                    nat_udp_release_timeout: args.nat_udp_release_timeout,
+                    notes: args.notes,
+                };
+
+                vpn::run_connect(vpn_args).await?;
+            }
+        },
         Command::Server {
             min_port,
             max_port,
@@ -1162,6 +1493,12 @@ async fn dispatch(command: Command) -> Result<()> {
             vhost_mode,
             vhost_cert_file,
             vhost_key_file,
+            #[cfg(feature = "vpn")]
+            vpn,
+            #[cfg(feature = "vpn")]
+            vpn_pool,
+            #[cfg(feature = "vpn")]
+            vpn_max_links,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -1215,6 +1552,20 @@ async fn dispatch(command: Command) -> Result<()> {
             server.set_bind_addr(bind_addr);
             server.set_bind_tunnels(bind_tunnels.unwrap_or(bind_addr));
             server.set_udp(udp);
+            // VPN brokering (only available when compiled with --features vpn).
+            #[cfg(feature = "vpn")]
+            {
+                if vpn {
+                    server.set_vpn(true);
+                    server.set_vpn_max_links(vpn_max_links);
+                    if let Some(pool_cidr) = vpn_pool {
+                        let net: bore_cli::shared::Ipv4Net = pool_cidr
+                            .parse()
+                            .with_context(|| format!("invalid --vpn-pool CIDR: {pool_cidr}"))?;
+                        server.set_vpn_pool(net).context("invalid --vpn-pool")?;
+                    }
+                }
+            }
             // Build the vhost config from a yaml file and/or env/CLI flags. vhost
             // is enabled when either a config file or a base domain is provided, so
             // a simple deployment needs no file (env-only), matching the rest of
@@ -2069,5 +2420,80 @@ mod tests {
             Some(v) => std::env::set_var("BORE_VHOST_BASE_DOMAIN", v),
             None => std::env::remove_var("BORE_VHOST_BASE_DOMAIN"),
         }
+    }
+
+    // ─── VPN CLI tests ────────────────────────────────────────────────────────
+
+    #[cfg(all(feature = "vpn", target_os = "linux"))]
+    #[test]
+    fn cli_vpn_help_renders() {
+        // --help exits with a non-zero code; clap returns Err(DisplayHelp).
+        let result = Args::try_parse_from(["bore", "vpn", "--help"]);
+        assert!(result.is_err(), "vpn --help should exit (clap Err)");
+    }
+
+    #[cfg(all(feature = "vpn", target_os = "linux"))]
+    #[test]
+    fn cli_vpn_requires_secret() {
+        let result = Args::try_parse_from([
+            "bore",
+            "vpn",
+            "listen",
+            "--id",
+            "x",
+            "--to",
+            "server.example.com",
+        ]);
+        assert!(result.is_err(), "listen without --secret must fail");
+    }
+
+    #[cfg(all(feature = "vpn", target_os = "linux"))]
+    #[test]
+    fn cli_vpn_static_requires_peer_addr() {
+        // --vpn-peer-addr requires --vpn-addr (clap `requires` constraint).
+        let result = Args::try_parse_from([
+            "bore",
+            "vpn",
+            "connect",
+            "--to",
+            "server.example.com",
+            "--secret",
+            "s",
+            "--id",
+            "x",
+            "--vpn-peer-addr",
+            "10.0.0.2",
+        ]);
+        assert!(
+            result.is_err(),
+            "--vpn-peer-addr without --vpn-addr must fail"
+        );
+    }
+
+    #[cfg(all(feature = "vpn", target_os = "linux"))]
+    #[test]
+    fn cli_vpn_parses_advertise_list() {
+        let args = Args::parse_from([
+            "bore",
+            "vpn",
+            "listen",
+            "--to",
+            "s",
+            "--secret",
+            "sec",
+            "--id",
+            "mylink",
+            "--advertise",
+            "192.168.1.0/24,192.168.2.0/24",
+        ]);
+        let Command::Vpn {
+            command: VpnCommand::Listen(la),
+        } = args.command
+        else {
+            panic!("expected vpn listen");
+        };
+        assert_eq!(la.advertise.len(), 2);
+        assert_eq!(la.advertise[0], "192.168.1.0/24");
+        assert_eq!(la.advertise[1], "192.168.2.0/24");
     }
 }

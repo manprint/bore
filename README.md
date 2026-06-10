@@ -465,6 +465,7 @@ Notes:
 
 - **Requires the `udp` feature**, which is **on by default**. Build
   `--no-default-features` to drop it (and the `quinn` dependency).
+- **VPN (experimental, Linux)** — point-to-point L3 tunnel; build with `--features vpn`.
 - **Reflexive discovery (STUN).** Each peer learns its public address from a STUN
   chain: Cloudflare on the standard `3478/udp` first, then Google, then the
   server's built-in STUN responder on the control port over **UDP** as the final
@@ -840,6 +841,121 @@ bore test-udp                                 # public STUN + default bore serve
 bore test-udp --to https://bore.example.com   # public STUN + another bore server
 bore test-udp --stun-server stun.l.google.com:19302  # add an explicit STUN server
 ```
+
+## VPN — Point-to-Point L3 Tunnel (Linux)
+
+`bore vpn` (experimental) establishes a **point-to-point Layer 3 virtual network interface** between two Linux machines, carrying real IP traffic over bore's NAT-traversing transport. Requires **root** or `CAP_NET_ADMIN`, and must be built with `--features vpn`.
+
+### Requirements
+
+- **Linux only** (TUN/TAP support)
+- **Root or `CAP_NET_ADMIN`**
+- Build: `cargo build --release --features vpn`
+- **Server:** started with `--vpn --vpn-pool <CIDR>`
+- **Shared secret:** `--secret` is mandatory (required for end-to-end encryption on the relay fallback path)
+
+### Three Topologies
+
+#### Host ↔ Host (direct tunnel between two machines)
+
+```bash
+# Machine A (listener)
+sudo bore vpn listen \
+  --to bore.example.com \
+  --secret S3cret \
+  --id mylink
+
+# Machine B (connector)
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id mylink
+```
+
+Both get a `/30` overlay address from the server's pool. Ping works immediately; throughput matches the direct QUIC path or relay fallback, depending on NAT type. No routes or IP forwarding involved (host-only).
+
+#### Site ↔ Host (gateway broadcasts its LAN)
+
+```bash
+# Machine A: gateway of LAN 192.168.50.0/24
+sudo bore vpn listen \
+  --to bore.example.com \
+  --secret S3cret \
+  --id site \
+  --advertise 192.168.50.0/24
+
+# Machine B: roaming client
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id site
+```
+
+Machine B can now reach hosts in A's LAN (192.168.50.0/24) via the tunnel. A installs masquerade (NAT) so LAN hosts see the traffic as coming from A, and MSS-clamping to avoid PMTU blackholes.
+
+#### Site ↔ Site (both gateways broadcast their LANs)
+
+```bash
+# Site A gateway (LAN 192.168.50.0/24)
+sudo bore vpn listen \
+  --to bore.example.com \
+  --secret S3cret \
+  --id s2s \
+  --advertise 192.168.50.0/24
+
+# Site B gateway (LAN 192.168.60.0/24)
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id s2s \
+  --advertise 192.168.60.0/24
+```
+
+Both LANs are reachable via the tunnel (subject to each LAN's router knowing the remote route via the bore gateway). Each gateway enables IP forwarding and installs NAT/MSS rules.
+
+### Security Model
+
+- **Direct path:** QUIC datagrams, encrypted end-to-end via QUIC-TLS 1.3. Server does not see plaintext.
+- **Relay fallback:** IP packets are framed, sealed with ChaCha20-Poly1305 (key derived from `--secret`), and relayed through the server as opaque ciphertext. Server never sees plaintext IP headers.
+
+### Server Configuration
+
+```bash
+bore server \
+  --secret S3cret \
+  --vpn \
+  --vpn-pool 10.99.0.0/16 \
+  --vpn-max-links 32
+```
+
+- `--vpn`: enable VPN brokering (server must be built with `--features vpn`).
+- `--vpn-pool <CIDR>`: allocate `/30` overlay blocks from this pool.
+- `--vpn-max-links <N>`: limit concurrent VPN links.
+
+### Advanced Options
+
+- `--advertise <CIDR[,CIDR...]>`: mark this side as a gateway for the given subnets (empty = host-only).
+- `--vpn-addr <ip/prefix> --vpn-peer-addr <ip>`: use static overlay addresses instead of server pool.
+- `--tun-name <name>`: TUN interface name (default `bore0`).
+- `--mtu <n>`: interface MTU (default 1350; conservative to fit QUIC datagrams and survive MTU discovery).
+- `--no-route-manage`: skip automatic route/NAT setup; print commands for manual application.
+- `--auto-reconnect`: reconnect automatically with backoff if the connection drops.
+
+### Performance
+
+v1 uses single-packet TUN I/O (Phase 6.1) and achieves sustained throughput without being syscall-bound on typical paths. Large packets may drop transiently during the first 1–2 seconds (QUIC MTU discovery); after that, throughput stabilizes.
+
+### Troubleshooting
+
+- **Link pairs but no ping:** Check `path=` in logs. If `relay`, run `bore test-udp` between the hosts to diagnose NAT type.
+- **Ping ok, TCP slow:** Try `--mtu 1280`; verify the MSS-clamp rule on the gateway (`nft list table inet bore_vpn_<id>`).
+- **Works from gateway, not from LAN hosts:** The LAN's router must have a route to the peer's LAN via the bore gateway (site↔site only).
+
+### Cleanup
+
+`Ctrl-C` triggers graceful cleanup: routes deleted, IP forwarding restored, nft table dropped, TUN interface removed. After exit, the host state is identical to before the link started. A `SIGKILL` leaves stale state; the next `bore vpn --id <same>` reclaims it automatically.
+
+See **[`docs/VPN.md`](docs/VPN.md)** for full documentation and **[`docs/VPN_TEST_MATRIX.md`](docs/VPN_TEST_MATRIX.md)** for test coverage.
 
 What it tells you:
 

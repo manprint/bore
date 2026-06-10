@@ -24,9 +24,11 @@ default = ["udp"]
 # (and `quinn-udp`). Build with `--no-default-features` to drop it (e.g. for a
 # target where `quinn` does not compile).
 udp = ["dep:quinn", "dep:rcgen", "dep:igd-next"]
+vpn = ["udp", "dep:tun-rs"]
 
 [dependencies]
 anyhow = { version = "1.0.56", features = ["backtrace"] }
+bytes = "1"
 clap = { version = "4.5.0", features = ["derive", "env"] }
 dashmap = "5.2.0"
 fastrand = "2"
@@ -58,10 +60,11 @@ rcgen = { version = "0.14.8", optional = true }
 igd-next = { version = "0.16", default-features = false, features = ["aio_tokio"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29.0", features = ["fs"] }
+nix = { version = "0.29.0", features = ["fs", "user"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.18"
+tun-rs = { version = "2.8.5", optional = true, features = ["async"] }
 
 [dev-dependencies]
 lazy_static = "1.4.0"

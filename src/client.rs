@@ -783,6 +783,8 @@ impl Client {
                                 warn!("unexpected vhost udp offer");
                             }
                         }
+                        Some(ServerMessage::VpnReady { .. }) => warn!("unexpected vpn ready"),
+                        Some(ServerMessage::VpnError(err)) => error!(%err, "vpn error"),
                         None => return Ok(()),
                     }
                 }

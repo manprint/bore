@@ -57,12 +57,13 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
 
 `bore` — async Rust TCP/UDP tunnel/proxy/transfer app. (`#![forbid(unsafe_code)]`). Exposes a local port to the internet through a remote server, bypassing NAT/firewalls. Ships `bore_cli` lib + `bore` binary.
 
-**Five subcommands:**
+**Six subcommands:**
 - `bore local <port>` — public tunnel: server assigns a public port, forwards traffic to local `<port>`
 - `bore proxy` — secret consumer: connects to a named provider, relays traffic to local port
 - `bore server` — runs the relay server
 - `bore transfer listener|sender` — file transfer over tunnel (resume, BLAKE3 verify, parallel streams)
 - `bore test-udp` — NAT/UDP diagnostic; with `--tcp-secret-id` runs a two-peer latency/bandwidth test
+- `bore vpn listen|connect` — Linux L3 VPN (requires `--features vpn`; root/CAP_NET_ADMIN)
 
 **Core transport stack:**
 - One long-lived yamux-multiplexed TCP connection per tunnel (control port 7835)
@@ -74,6 +75,7 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
 
 **Key invariants to never break:**
 - Client sends `Hello` before auth (yamux is lazy; without it, deadlock)
+- `HelloVpn`/`ConnectVpn` sent **before** auth (same lazy-yamux rule as `Hello`)
 - Server writes `mux::STREAM_READY` before splice (banner-first protocols need it)
 - `copy_bidirectional_with_sizes` propagates half-close; do not replace with a non-half-close variant
 - `shared::tune_tcp` (`TCP_NODELAY` + `SO_KEEPALIVE 15s`) must be applied to every new socket
@@ -82,6 +84,9 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   for `local`/`proxy`, but `0` (auto) for `bore transfer` — auto scales the relay carrier
   pool to the worker `--parallel` count (capped at server `--max-carriers`); `transfer.rs`
   resolves it via `resolve_carriers`. Explicit `--carriers 1` still forces the single path.
+- Relay path is AEAD-opaque: server splices ciphertext, never plaintext IP packets
+- `NetConfig` RAII: all routes/nft/ip_forward changes revert on exit (SIGINT, SIGTERM, panic handled; SIGKILL requires next-run stale reclaim)
+- TUN MTU default 1350: clamps QUIC datagram size; gateway MSS-clamp keeps forwarded TCP healthy
 
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

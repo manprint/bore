@@ -153,16 +153,18 @@ if wait_for_log "$BORE_LOG.listen1" "vpn link paired\|VpnReady\|vpn.*up" 10; the
         else
             fail "large payload ping (-s 1300) failed (check MTU/datagram limits)"
         fi
-        # iperf3 sanity
+        # iperf3 sanity — UDP mode to avoid TCP-over-relay reliable-over-reliable
+        # deadlock (§R.1). -b 0 = max UDP rate. timeout 15s safety net.
         if [ "$SKIP_IPERF" = "0" ] && command -v iperf3 >/dev/null 2>&1; then
             ip netns exec ns1 iperf3 -s -D --logfile /dev/null
-            IPERF_BW=$(ip netns exec ns2 iperf3 -c "$NS1_OVERLAY" -t 3 -J 2>/dev/null | \
-                python3 -c "import sys,json; d=json.load(sys.stdin); print(int(d['end']['sum_received']['bits_per_second']/1e6))" 2>/dev/null || echo 0)
+            sleep 0.2
+            IPERF_BW=$(timeout 15 ip netns exec ns2 iperf3 -c "$NS1_OVERLAY" -t 3 -u -b 0 -J 2>/dev/null | \
+                python3 -c "import sys,json; d=json.load(sys.stdin); print(int(d['end']['sum']['bits_per_second']/1e6))" 2>/dev/null || echo 0)
             ip netns exec ns1 pkill iperf3 2>/dev/null || true
             if [ "$IPERF_BW" -gt 1 ]; then
-                pass "iperf3 throughput: ${IPERF_BW} Mbps (>1 Mbps, not syscall-bound)"
+                pass "iperf3 UDP throughput: ${IPERF_BW} Mbps (>1 Mbps, not syscall-bound)"
             else
-                fail "iperf3 throughput too low or failed: ${IPERF_BW} Mbps"
+                fail "iperf3 UDP throughput too low or failed: ${IPERF_BW} Mbps"
             fi
         fi
     else

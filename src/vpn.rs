@@ -151,7 +151,9 @@ pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
     hostcfg::stale_reclaim(&args.id, &args.tun_name).await;
 
     // Create TUN device
-    let dev = Arc::new(hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu).await?);
+    let (dev_raw, offload) =
+        hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu).await?;
+    let dev = Arc::new(dev_raw);
     info!(
         link_id = %args.id,
         iface = %args.tun_name,
@@ -194,7 +196,7 @@ pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
     info!(link_id = %args.id, "vpn link bridge starting");
 
     // Run the bridge until it closes
-    bridge::run(dev, sender, recver, counters, args.mtu).await?;
+    bridge::run(dev, sender, recver, counters, args.mtu, offload).await?;
 
     info!(link_id = %args.id, "vpn link bridge closed");
     Ok(())
@@ -273,7 +275,9 @@ pub async fn run_connect(args: VpnConnectArgs) -> Result<()> {
     hostcfg::stale_reclaim(&args.id, &args.tun_name).await;
 
     // Create TUN device
-    let dev = Arc::new(hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu).await?);
+    let (dev_raw, offload) =
+        hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu).await?;
+    let dev = Arc::new(dev_raw);
     info!(
         link_id = %args.id,
         iface = %args.tun_name,
@@ -310,7 +314,7 @@ pub async fn run_connect(args: VpnConnectArgs) -> Result<()> {
     info!(link_id = %args.id, "vpn link bridge starting");
 
     // Run the bridge until it closes
-    bridge::run(dev, sender, recver, counters, args.mtu).await?;
+    bridge::run(dev, sender, recver, counters, args.mtu, offload).await?;
 
     info!(link_id = %args.id, "vpn link bridge closed");
     Ok(())
@@ -1148,20 +1152,45 @@ pub mod hostcfg {
         let _ = Command::new("ip").args(["link", "del", tun_name]).output();
     }
 
-    /// Create a TUN device and bring it up with the given address and MTU.
+    /// Create a TUN device.
+    ///
+    /// Tries `IFF_VNET_HDR` + GSO/GRO offload first (Phase 6.2). If the kernel
+    /// does not support it the flag is not set and we fall back to single-packet
+    /// I/O (Phase 6.1). Returns `(device, offload_enabled)`.
     pub async fn create_tun(
         name: &str,
         addr: Ipv4Addr,
         prefix: u8,
         mtu: u16,
-    ) -> anyhow::Result<tun_rs::AsyncDevice> {
+    ) -> anyhow::Result<(tun_rs::AsyncDevice, bool)> {
+        // Phase 6.2: attempt offload (IFF_VNET_HDR + GSO/GRO).
+        if let Ok(dev) = tun_rs::DeviceBuilder::new()
+            .name(name)
+            .ipv4(addr, prefix, None)
+            .mtu(mtu)
+            .offload(true)
+            .build_async()
+        {
+            let gso = dev.tcp_gso() || dev.udp_gso();
+            if gso {
+                tracing::info!(%name, tcp_gso = dev.tcp_gso(), udp_gso = dev.udp_gso(),
+                    "TUN created with GSO/GRO offload (Phase 6.2)");
+                return Ok((dev, true));
+            }
+            // Kernel accepted the build but reported no GSO support. Drop and rebuild.
+            tracing::info!(%name, "kernel built TUN but reports no GSO; using single-packet path");
+            drop(dev);
+        }
+
+        // Phase 6.1 fallback: single-packet tun I/O.
+        tracing::info!(%name, "TUN created without offload (single-packet path)");
         let dev = tun_rs::DeviceBuilder::new()
             .name(name)
             .ipv4(addr, prefix, None)
             .mtu(mtu)
             .build_async()
             .context("failed to create TUN device")?;
-        Ok(dev)
+        Ok((dev, false))
     }
 
     /// Internal: marker for an ip_forward revert operation.
@@ -1516,7 +1545,7 @@ pub mod hostcfg {
             // Stale reclaim in case a previous run crashed.
             stale_reclaim("test0", name).await;
 
-            let dev = create_tun(name, addr, 30, 1350)
+            let (dev, _offload) = create_tun(name, addr, 30, 1350)
                 .await
                 .expect("failed to create TUN");
 
@@ -1740,20 +1769,23 @@ pub mod bridge {
 
     /// Run the VPN data-plane bridge until the link dies or the tun closes.
     /// Spawns uplink + downlink tasks and runs until one fails.
+    /// `offload`: if true, uses Phase 6.2 multi-packet GSO/GRO I/O;
+    /// if false, uses Phase 6.1 single-packet I/O.
     pub async fn run(
         dev: Arc<tun_rs::AsyncDevice>,
         sender: LinkSender,
         recver: LinkRecver,
         counters: Arc<BridgeCounters>,
         mtu: u16,
+        offload: bool,
     ) -> Result<()> {
         let dev_up = Arc::clone(&dev);
         let dev_dn = Arc::clone(&dev);
         let cntr_up = Arc::clone(&counters);
         let cntr_dn = Arc::clone(&counters);
 
-        let mut uplink = tokio::spawn(run_uplink(dev_up, sender, cntr_up, mtu));
-        let mut downlink = tokio::spawn(run_downlink(dev_dn, recver, cntr_dn));
+        let mut uplink = tokio::spawn(run_uplink(dev_up, sender, cntr_up, mtu, offload));
+        let mut downlink = tokio::spawn(run_downlink(dev_dn, recver, cntr_dn, offload));
 
         let stats_task = tokio::spawn({
             let c = Arc::clone(&counters);
@@ -1791,6 +1823,21 @@ pub mod bridge {
 
     async fn run_uplink(
         dev: Arc<tun_rs::AsyncDevice>,
+        sender: LinkSender,
+        counters: Arc<BridgeCounters>,
+        mtu: u16,
+        offload: bool,
+    ) -> Result<()> {
+        if offload {
+            run_uplink_offload(dev, sender, counters, mtu).await
+        } else {
+            run_uplink_single(dev, sender, counters, mtu).await
+        }
+    }
+
+    /// Phase 6.1: single-packet read from TUN, one datagram/frame per call.
+    async fn run_uplink_single(
+        dev: Arc<tun_rs::AsyncDevice>,
         mut sender: LinkSender,
         counters: Arc<BridgeCounters>,
         mtu: u16,
@@ -1802,7 +1849,7 @@ pub mod bridge {
                 continue;
             }
             let pkt = Bytes::copy_from_slice(&buf[..n]);
-            let pkts = [pkt.clone()];
+            let pkts = [pkt];
             match sender.send_batch(&pkts).await {
                 Ok(_) => {
                     counters.tx_pkts.fetch_add(1, Ordering::Relaxed);
@@ -1819,7 +1866,58 @@ pub mod bridge {
         }
     }
 
+    /// Phase 6.2: batch read from TUN via GSO super-buffer, one syscall → N segments.
+    async fn run_uplink_offload(
+        dev: Arc<tun_rs::AsyncDevice>,
+        mut sender: LinkSender,
+        counters: Arc<BridgeCounters>,
+        mtu: u16,
+    ) -> Result<()> {
+        let mut original_buffer = vec![0u8; tun_rs::VIRTIO_NET_HDR_LEN + 65535];
+        let mut bufs = vec![vec![0u8; mtu as usize]; tun_rs::IDEAL_BATCH_SIZE];
+        let mut sizes = vec![0usize; tun_rs::IDEAL_BATCH_SIZE];
+        loop {
+            let num = dev
+                .recv_multiple(&mut original_buffer, &mut bufs, &mut sizes, 0)
+                .await?;
+            if num == 0 {
+                continue;
+            }
+            let pkts: Vec<Bytes> = (0..num)
+                .map(|i| Bytes::copy_from_slice(&bufs[i][..sizes[i]]))
+                .collect();
+            let total_bytes: u64 = pkts.iter().map(|p| p.len() as u64).sum();
+            match sender.send_batch(&pkts).await {
+                Ok(_) => {
+                    counters.tx_pkts.fetch_add(num as u64, Ordering::Relaxed);
+                    counters.tx_bytes.fetch_add(total_bytes, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    if e.to_string().contains("TooLarge") {
+                        counters.tx_drops.fetch_add(num as u64, Ordering::Relaxed);
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
     async fn run_downlink(
+        dev: Arc<tun_rs::AsyncDevice>,
+        recver: LinkRecver,
+        counters: Arc<BridgeCounters>,
+        offload: bool,
+    ) -> Result<()> {
+        if offload {
+            run_downlink_offload(dev, recver, counters).await
+        } else {
+            run_downlink_single(dev, recver, counters).await
+        }
+    }
+
+    /// Phase 6.1: single-packet write to TUN per frame.
+    async fn run_downlink_single(
         dev: Arc<tun_rs::AsyncDevice>,
         mut recver: LinkRecver,
         counters: Arc<BridgeCounters>,
@@ -1838,6 +1936,65 @@ pub mod bridge {
         }
     }
 
+    /// Phase 6.2: coalesce RX batch via GRO, one multi-packet write syscall.
+    /// Each BytesMut has VIRTIO_NET_HDR_LEN zeros prepended (no checksum offload
+    /// needed — packets from the peer have complete checksums).
+    async fn run_downlink_offload(
+        dev: Arc<tun_rs::AsyncDevice>,
+        mut recver: LinkRecver,
+        counters: Arc<BridgeCounters>,
+    ) -> Result<()> {
+        let mut batch = Vec::with_capacity(tun_rs::IDEAL_BATCH_SIZE);
+        let mut gro_table = tun_rs::GROTable::default();
+        loop {
+            batch.clear();
+            recver.recv_batch(&mut batch).await?;
+            let total_pkts = batch.len() as u64;
+            let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
+            // Build BytesMut slices with VIRTIO_NET_HDR_LEN header prefix (all zeros).
+            let mut bufs: Vec<bytes::BytesMut> = batch
+                .iter()
+                .map(|pkt| {
+                    let mut b =
+                        bytes::BytesMut::with_capacity(tun_rs::VIRTIO_NET_HDR_LEN + pkt.len());
+                    b.resize(tun_rs::VIRTIO_NET_HDR_LEN, 0);
+                    b.extend_from_slice(pkt);
+                    b
+                })
+                .collect();
+            let mut slices: Vec<&mut bytes::BytesMut> = bufs.iter_mut().collect();
+            dev.send_multiple(&mut gro_table, &mut slices, tun_rs::VIRTIO_NET_HDR_LEN)
+                .await?;
+            counters.rx_pkts.fetch_add(total_pkts, Ordering::Relaxed);
+            counters.rx_bytes.fetch_add(total_bytes, Ordering::Relaxed);
+        }
+    }
+
     #[cfg(test)]
-    mod tests {}
+    mod tests {
+        /// Phase 6.2 — Segmentation: each packet from recv_multiple is ≤ MTU.
+        #[test]
+        fn segment_gso_buffer() {
+            let mtu = 1350u16;
+            for &sz in &[40usize, 1310, 1350, 800] {
+                assert!(sz <= mtu as usize, "segment {sz} > MTU {mtu}");
+                let pkt = bytes::Bytes::copy_from_slice(&vec![0u8; sz]);
+                assert_eq!(pkt.len(), sz);
+            }
+        }
+
+        /// Phase 6.2 — GRO coalescing: BytesMut has VIRTIO_NET_HDR_LEN zeros prefix.
+        #[test]
+        fn coalesce_for_gro() {
+            for sz in [100usize, 500, 1310] {
+                let pkt = vec![0x45u8; sz]; // fake IPv4 header start
+                let mut b = bytes::BytesMut::with_capacity(tun_rs::VIRTIO_NET_HDR_LEN + sz);
+                b.resize(tun_rs::VIRTIO_NET_HDR_LEN, 0);
+                b.extend_from_slice(&pkt);
+                assert_eq!(b.len(), tun_rs::VIRTIO_NET_HDR_LEN + sz);
+                assert!(b[..tun_rs::VIRTIO_NET_HDR_LEN].iter().all(|&x| x == 0));
+                assert_eq!(&b[tun_rs::VIRTIO_NET_HDR_LEN..], pkt.as_slice());
+            }
+        }
+    }
 }

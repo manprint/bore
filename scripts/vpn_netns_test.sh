@@ -890,6 +890,228 @@ kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
 ip netns exec ns0 nft delete table inet bore_test_block 2>/dev/null || true
 sleep 0.5
 
+# ── Test 16: gateway clean-teardown route check (T-new-1, G1) ──────────────────
+echo "=== Test 16: gateway clean-teardown route absence (G1 coverage) ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-new-1-gw-route \
+    --advertise "$FAKE_LAN" \
+    >"$BORE_LOG.listen16" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-new-1-gw-route \
+    >"$BORE_LOG.connect16" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.listen16" "vpn link paired\|VpnReady" 10; then
+    sleep 1
+    # Verify route was installed
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$FAKE_LAN"; then
+        pass "T-new-1: advertised route present in ns2 during link up"
+    else
+        fail "T-new-1: advertised route missing in ns2"
+    fi
+    # Clean exit
+    kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+    kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+    sleep 1
+    # Assert cleanup
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$FAKE_LAN"; then
+        fail "T-new-1: advertised route NOT removed after clean teardown"
+    else
+        pass "T-new-1: advertised route removed after clean teardown (G1 pass)"
+    fi
+    if ip netns exec ns1 nft list tables 2>/dev/null | grep -q "bore_vpn_t-new-1-gw-route"; then
+        fail "T-new-1: nft table NOT removed after clean teardown"
+    else
+        pass "T-new-1: nft table removed after clean teardown"
+    fi
+else
+    fail "T-new-1: gateway listener did not pair"
+    kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+    kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+fi
+sleep 0.5
+
+# ── Test 17: connector dies and returns (T-new-2, G4) ─────────────────────────────
+echo "=== Test 17: connector dies and returns (G4 coverage) ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-new-2-conn-die \
+    --relay-only --auto-reconnect \
+    >"$BORE_LOG.listen17" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-new-2-conn-die \
+    --relay-only --auto-reconnect \
+    >"$BORE_LOG.connect17" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.listen17" "vpn link paired" 10; then
+    sleep 0.5
+    NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    if [ -n "$NS1_OVL" ] && ip netns exec ns2 ping -c 1 -W 3 "$NS1_OVL" >/dev/null 2>&1; then
+        pass "T-new-2: initial ping ok"
+    else
+        fail "T-new-2: initial ping failed"
+    fi
+    # Kill connector
+    kill -9 "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+    if wait_for_log "$BORE_LOG.listen17" "vpn link lost; reconnecting" 15; then
+        pass "T-new-2: listener detects connector death"
+    else
+        fail "T-new-2: listener did not detect connector death"
+    fi
+    # Restart connector
+    ip netns exec ns2 "$BORE" vpn connect \
+        --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-new-2-conn-die \
+        --relay-only --auto-reconnect \
+        >"$BORE_LOG.connect17b" 2>&1 &
+    BORE_CONNECT_PID=$!
+    PAIRED_COUNT=0
+    for _ in $(seq 1 150); do
+        PAIRED_COUNT=$(grep -c 'vpn link paired' "$BORE_LOG.listen17" 2>/dev/null || echo 0)
+        [ "$PAIRED_COUNT" -ge 2 ] && break
+        sleep 0.1
+    done
+    if [ "$PAIRED_COUNT" -ge 2 ]; then
+        pass "T-new-2: re-pair after connector restart"
+        sleep 1
+        NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+        if [ -n "$NS1_OVL" ] && ip netns exec ns2 ping -c 1 -W 3 "$NS1_OVL" >/dev/null 2>&1; then
+            pass "T-new-2: post-recovery ping ok"
+        else
+            fail "T-new-2: post-recovery ping failed"
+        fi
+    else
+        fail "T-new-2: re-pair failed"
+    fi
+else
+    fail "T-new-2: initial pair failed"
+fi
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
+# ── Test 18: listener dies and returns (T-new-3, G4) ─────────────────────────────
+echo "=== Test 18: listener dies and returns (G4 symmetric coverage) ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-new-3-list-die \
+    --relay-only --auto-reconnect \
+    >"$BORE_LOG.listen18" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-new-3-list-die \
+    --relay-only --auto-reconnect \
+    >"$BORE_LOG.connect18" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.connect18" "vpn link paired" 10; then
+    sleep 0.5
+    NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    if [ -n "$NS1_OVL" ] && ip netns exec ns2 ping -c 1 -W 3 "$NS1_OVL" >/dev/null 2>&1; then
+        pass "T-new-3: initial ping ok"
+    else
+        fail "T-new-3: initial ping failed"
+    fi
+    # Kill listener
+    kill -9 "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+    if wait_for_log "$BORE_LOG.connect18" "vpn link lost; reconnecting" 15; then
+        pass "T-new-3: connector detects listener death"
+    else
+        fail "T-new-3: connector did not detect listener death"
+    fi
+    # Restart listener
+    ip netns exec ns1 "$BORE" vpn listen \
+        --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-new-3-list-die \
+        --relay-only --auto-reconnect \
+        >"$BORE_LOG.listen18b" 2>&1 &
+    BORE_LISTEN_PID=$!
+    PAIRED_COUNT=0
+    for _ in $(seq 1 150); do
+        PAIRED_COUNT=$(grep -c 'vpn link paired' "$BORE_LOG.connect18" 2>/dev/null || echo 0)
+        [ "$PAIRED_COUNT" -ge 2 ] && break
+        sleep 0.1
+    done
+    if [ "$PAIRED_COUNT" -ge 2 ]; then
+        pass "T-new-3: re-pair after listener restart"
+        sleep 1
+        NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+        if [ -n "$NS1_OVL" ] && ip netns exec ns2 ping -c 1 -W 3 "$NS1_OVL" >/dev/null 2>&1; then
+            pass "T-new-3: post-recovery ping ok"
+        else
+            fail "T-new-3: post-recovery ping failed"
+        fi
+    else
+        fail "T-new-3: re-pair failed"
+    fi
+else
+    fail "T-new-3: initial pair failed"
+fi
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
+# ── Test 19: host↔site with connector advertises (T-new-4, G3) ───────────────────
+echo "=== Test 19: host↔site connector advertises (G3 coverage) ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-new-4-host-site \
+    >"$BORE_LOG.listen19" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-new-4-host-site \
+    --advertise "$FAKE_LAN" \
+    >"$BORE_LOG.connect19" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.listen19" "vpn link paired\|VpnReady" 10; then
+    sleep 2
+    # Verify listener received the advertised route
+    if ip netns exec ns1 ip route show 2>/dev/null | grep -q "$FAKE_LAN"; then
+        pass "T-new-4: ns1 received advertised route from connector"
+    else
+        fail "T-new-4: ns1 missing advertised route"
+    fi
+    # Verify ns1 can reach the LAN host
+    if ip netns exec ns1 ping -c 1 -W 3 "$FAKE_LAN_HOST" >/dev/null 2>&1; then
+        pass "T-new-4: ns1 can ping connector's advertised LAN host"
+    else
+        fail "T-new-4: ns1 cannot reach connector's LAN host"
+    fi
+    # Verify host↔host overlay ping still works
+    NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    NS2_OVL=$(ip netns exec ns2 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    if [ -n "$NS1_OVL" ] && [ -n "$NS2_OVL" ]; then
+        if ip netns exec ns1 ping -c 1 -W 3 "$NS2_OVL" >/dev/null 2>&1; then
+            pass "T-new-4: overlay bidi ping ok"
+        else
+            fail "T-new-4: overlay ping failed"
+        fi
+    else
+        fail "T-new-4: overlay addresses missing"
+    fi
+    # Clean teardown
+    kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+    kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+    sleep 1
+    if ip netns exec ns1 ip route show 2>/dev/null | grep -q "$FAKE_LAN"; then
+        fail "T-new-4: advertised route NOT removed after clean exit"
+    else
+        pass "T-new-4: advertised route cleaned up after exit"
+    fi
+else
+    fail "T-new-4: host↔site listener did not pair"
+    kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+    kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+fi
+sleep 0.5
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Results: PASS=$PASS FAIL=$FAIL ==="

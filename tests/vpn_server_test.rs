@@ -958,6 +958,299 @@ async fn vpn_broker_rebrokers_on_repeated_offer() {
     assert_eq!(l_peer2, vec!["203.0.113.2:2001".parse().unwrap()]);
 }
 
+/// Connector offers an empty candidate vec; listener offers real candidates.
+/// An empty connector offer is still a valid offer in DEC-3: the broker checks
+/// only that the listener has provided candidates (non-empty), then punches.
+/// The connector receives the listener's candidates and an empty peer_candidates
+/// set back. This is correct behavior (connector can choose not to punch locally).
+#[tokio::test]
+async fn vpn_broker_empty_candidate_offer_times_out() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_pool("10.96.0.0/16").await;
+
+    let mut l_ctrl = vpn_ctrl_connect().await;
+    l_ctrl.send(pool_hello_vpn("empty_cand")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl.send(pool_connect_vpn("empty_cand")).await.unwrap();
+    let c_ready = c_ctrl.recv::<ServerMessage>().await.unwrap();
+    let nonce = session_nonce_of(&c_ready);
+    let _ = l_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+
+    // Listener offers real candidates first.
+    l_ctrl.send(offer("203.0.113.1:1000")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    // Connector offers EMPTY candidates. The broker still punches because the
+    // connector has made an offer (even if empty) and the listener has provided
+    // real candidates. The punch carries the listener's addresses to the
+    // connector (which can choose not to punch locally). The connector receives
+    // an empty peer_candidates set in return (listener gets empty set back).
+    c_ctrl
+        .send(ClientMessage::UdpCandidateOffer(
+            bore_cli::shared::UdpCandidateOffer {
+                candidates: vec![], // empty
+                selected_stun: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    // Expect UdpPunch with listener's candidates, even though connector offered empty.
+    let (c_nonce, c_peer) = recv_until_punch(&mut c_ctrl, "connector empty offer").await;
+    assert_eq!(c_nonce, nonce);
+    assert_eq!(
+        c_peer,
+        vec!["203.0.113.1:1000".parse().unwrap()],
+        "connector receives listener's candidates even with empty offer"
+    );
+
+    // Listener should also get a punch with the empty set from the connector.
+    let (l_nonce, l_peer) = recv_until_punch(&mut l_ctrl, "listener empty offer").await;
+    assert_eq!(l_nonce, nonce);
+    assert!(
+        l_peer.is_empty(),
+        "listener receives empty peer set from connector's empty offer"
+    );
+}
+
+/// Both listener and connector offer IPv6 SocketAddrs. The broker relays them
+/// unchanged to the peer in UdpPunch, with no panic or IPv4 assumption.
+#[tokio::test]
+async fn vpn_broker_ipv6_candidates_relayed() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_pool("10.97.0.0/16").await;
+
+    let mut l_ctrl = vpn_ctrl_connect().await;
+    l_ctrl.send(pool_hello_vpn("ipv6_cand")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl.send(pool_connect_vpn("ipv6_cand")).await.unwrap();
+    let _ = c_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+    let _ = l_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+
+    // Listener offers IPv6 address.
+    l_ctrl
+        .send(ClientMessage::UdpCandidateOffer(
+            bore_cli::shared::UdpCandidateOffer {
+                candidates: vec!["[2001:db8::1]:1000".parse().unwrap()],
+                selected_stun: None,
+            },
+        ))
+        .await
+        .unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    // Connector offers IPv6 address.
+    c_ctrl
+        .send(ClientMessage::UdpCandidateOffer(
+            bore_cli::shared::UdpCandidateOffer {
+                candidates: vec!["[2001:db8::2]:2000".parse().unwrap()],
+                selected_stun: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    // Both should receive the peer's IPv6 candidates unchanged.
+    let (c_nonce, c_peer) = recv_until_punch(&mut c_ctrl, "connector ipv6").await;
+    assert_eq!(
+        c_peer,
+        vec!["[2001:db8::1]:1000".parse().unwrap()],
+        "connector must receive listener's IPv6 candidate unchanged"
+    );
+
+    let (l_nonce, l_peer) = recv_until_punch(&mut l_ctrl, "listener ipv6").await;
+    assert_eq!(l_nonce, c_nonce, "ipv6 nonces must match");
+    assert_eq!(
+        l_peer,
+        vec!["[2001:db8::2]:2000".parse().unwrap()],
+        "listener must receive connector's IPv6 candidate unchanged"
+    );
+}
+
+/// Both listener and connector advertise the SAME SocketAddr. The broker should
+/// still punch both sides with each other's candidate set (even if identical).
+/// No dedup, no crash.
+#[tokio::test]
+async fn vpn_broker_both_offer_same_address() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_pool("10.98.0.0/16").await;
+
+    let mut l_ctrl = vpn_ctrl_connect().await;
+    l_ctrl.send(pool_hello_vpn("same_addr")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl.send(pool_connect_vpn("same_addr")).await.unwrap();
+    let c_ready = c_ctrl.recv::<ServerMessage>().await.unwrap();
+    let nonce = session_nonce_of(&c_ready);
+    let _ = l_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+
+    let shared_addr = "203.0.113.100:5555";
+
+    // Both sides offer the SAME address.
+    l_ctrl.send(offer(shared_addr)).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+    c_ctrl.send(offer(shared_addr)).await.unwrap();
+
+    // Both should receive the punch with the shared address.
+    let (c_nonce, c_peer) = recv_until_punch(&mut c_ctrl, "connector same_addr").await;
+    assert_eq!(c_nonce, nonce);
+    assert_eq!(
+        c_peer,
+        vec![shared_addr.parse().unwrap()],
+        "connector must receive the same address the listener offered"
+    );
+
+    let (l_nonce, l_peer) = recv_until_punch(&mut l_ctrl, "listener same_addr").await;
+    assert_eq!(l_nonce, nonce);
+    assert_eq!(
+        l_peer,
+        vec![shared_addr.parse().unwrap()],
+        "listener must receive the same address the connector offered"
+    );
+}
+
+/// Set punch_timeout to 200 ms. Connector offers, listener never offers.
+/// Assert UdpUnavailable fires once, after the deadline expires, not before.
+#[tokio::test]
+async fn vpn_broker_timeout_boundary() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_punch_timeout("10.99.0.0/16", Duration::from_millis(200)).await;
+
+    let mut l_ctrl = vpn_ctrl_connect().await;
+    l_ctrl.send(pool_hello_vpn("timeout_bound")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl
+        .send(pool_connect_vpn("timeout_bound"))
+        .await
+        .unwrap();
+    let _ = c_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+    let _ = l_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+
+    // Connector offers; listener never does.
+    c_ctrl.send(offer("203.0.113.2:2000")).await.unwrap();
+
+    // The broker should wait ~200 ms, then send UdpUnavailable.
+    // Helper has 5 s timeout; it will catch the unavailable message.
+    let start = time::Instant::now();
+    recv_until_unavailable(&mut c_ctrl, "connector timeout_bound").await;
+    let elapsed = start.elapsed();
+
+    // Verify that we waited at least close to the timeout (200 ms).
+    // Add some buffer for system jitter (50–250 ms range).
+    assert!(
+        elapsed.as_millis() >= 150,
+        "UdpUnavailable arrived too quickly ({}ms); should wait ~200ms",
+        elapsed.as_millis()
+    );
+}
+
+/// Connector offers 3 times in succession with different candidates.
+/// Listener also re-offers each time. The broker must punch with the FRESHEST
+/// set each round and re-arm the deadline (not latch after round 1).
+#[tokio::test]
+async fn vpn_broker_triple_reoffer() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_pool("10.100.0.0/16").await;
+
+    let mut l_ctrl = vpn_ctrl_connect().await;
+    l_ctrl.send(pool_hello_vpn("triple_reoffer")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl
+        .send(pool_connect_vpn("triple_reoffer"))
+        .await
+        .unwrap();
+    let c_ready = c_ctrl.recv::<ServerMessage>().await.unwrap();
+    let nonce = session_nonce_of(&c_ready);
+    let _ = l_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+
+    // Round 1: both offer; both get punched.
+    l_ctrl.send(offer("203.0.113.1:1000")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+    c_ctrl.send(offer("203.0.113.2:2000")).await.unwrap();
+    let (_, c_peer1) = recv_until_punch(&mut c_ctrl, "connector r1").await;
+    assert_eq!(c_peer1, vec!["203.0.113.1:1000".parse().unwrap()]);
+    let (_, l_peer1) = recv_until_punch(&mut l_ctrl, "listener r1").await;
+    assert_eq!(l_peer1, vec!["203.0.113.2:2000".parse().unwrap()]);
+
+    // Round 2: both re-offer with different candidates.
+    c_ctrl.send(offer("203.0.113.2:2001")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+    l_ctrl.send(offer("203.0.113.1:1001")).await.unwrap();
+    let (_, c_peer2) = recv_until_punch(&mut c_ctrl, "connector r2").await;
+    assert_eq!(
+        c_peer2,
+        vec!["203.0.113.1:1001".parse().unwrap()],
+        "r2: connector must get fresh listener candidate"
+    );
+    let (_, l_peer2) = recv_until_punch(&mut l_ctrl, "listener r2").await;
+    assert_eq!(
+        l_peer2,
+        vec!["203.0.113.2:2001".parse().unwrap()],
+        "r2: listener must get fresh connector candidate"
+    );
+
+    // Round 3: both re-offer AGAIN with different candidates.
+    l_ctrl.send(offer("203.0.113.1:1002")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+    c_ctrl.send(offer("203.0.113.2:2002")).await.unwrap();
+    let (c_nonce3, c_peer3) = recv_until_punch(&mut c_ctrl, "connector r3").await;
+    assert_eq!(c_nonce3, nonce);
+    assert_eq!(
+        c_peer3,
+        vec!["203.0.113.1:1002".parse().unwrap()],
+        "r3: connector must get freshest listener candidate"
+    );
+    let (l_nonce3, l_peer3) = recv_until_punch(&mut l_ctrl, "listener r3").await;
+    assert_eq!(l_nonce3, nonce);
+    assert_eq!(
+        l_peer3,
+        vec!["203.0.113.2:2002".parse().unwrap()],
+        "r3: listener must get freshest connector candidate"
+    );
+}
+
+/// Connector offers candidates repeatedly; listener is registered but never
+/// offers candidates. The broker should eventually send UdpUnavailable to the
+/// connector, not wait indefinitely and not punch with an empty peer set.
+#[tokio::test]
+async fn vpn_broker_connector_only_no_listener_offer() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_punch_timeout("10.101.0.0/16", Duration::from_millis(500)).await;
+
+    let mut l_ctrl = vpn_ctrl_connect().await;
+    l_ctrl.send(pool_hello_vpn("connector_only")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl
+        .send(pool_connect_vpn("connector_only"))
+        .await
+        .unwrap();
+    let _ = c_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+    let _ = l_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+
+    // Connector offers once; listener never offers.
+    c_ctrl.send(offer("203.0.113.2:2000")).await.unwrap();
+
+    // First timeout: the broker should send UdpUnavailable.
+    recv_until_unavailable(&mut c_ctrl, "connector first offer").await;
+
+    // Connector tries again (simulating the direct-upgrade retry loop).
+    c_ctrl.send(offer("203.0.113.2:2001")).await.unwrap();
+
+    // Should get another UdpUnavailable (re-arm on each offer, no punch).
+    recv_until_unavailable(&mut c_ctrl, "connector second offer").await;
+}
+
 // ─── §3.1 Admin page VPN entries (F5) ────────────────────────────────────────
 
 const ADMIN_TOKEN: &str = "0123456789abcdef0123456789abcdef01234567";

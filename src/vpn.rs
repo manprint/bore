@@ -114,13 +114,22 @@ fn is_fatal(err: &anyhow::Error) -> bool {
 
 /// Classify a server-sent `VpnError` message.
 ///
-/// "vpn id already in use" is deliberately retryable: during a reconnect the
-/// server-side handler of the previous session can take a few seconds to die
-/// and release the id — retrying with backoff resolves it. Every other
-/// `VpnError` (pool exhausted, overlap, mode mismatch, static mismatch, no vpn
-/// pool, max-links) reflects configuration and would fail identically forever.
+/// Two `VpnError`s are deliberately retryable; the rest are fatal config errors.
+///
+/// - "vpn id already in use": during a reconnect the server-side handler of the
+///   previous session can take a few seconds to die and release the id.
+/// - "vpn listener '<id>' not found": on a reconnect after the server restarts,
+///   the connector and listener race to re-register. If the connector wins it
+///   gets this error before the listener has re-registered; retrying with
+///   backoff lets the listener catch up. (Without `--auto-reconnect` the
+///   connector still exits on first error, so a genuinely-missing listener is
+///   not retried.)
+///
+/// Every other `VpnError` (pool exhausted, overlap, mode mismatch, static
+/// mismatch, no vpn pool, max-links) reflects configuration and would fail
+/// identically forever.
 fn vpn_error_is_retryable(msg: &str) -> bool {
-    msg.contains("already in use")
+    msg.contains("already in use") || msg.contains("not found")
 }
 
 /// Build the error for a server-sent `VpnError`, fatal or retryable per
@@ -3099,7 +3108,14 @@ pub mod bridge {
                         p.abort();
                     }
                     for p in &mut pumps {
-                        let _ = p.await;
+                        // `select_all` above may have already polled one handle
+                        // to completion; awaiting it again would re-poll a
+                        // finished `JoinHandle` and panic. A finished pump has
+                        // already stopped, which is all we need before reusing
+                        // the TUN.
+                        if !p.is_finished() {
+                            let _ = p.await;
+                        }
                     }
                 }};
             }
@@ -3481,11 +3497,16 @@ mod tests {
         // Fatal survives an added context chain (downcast_ref traverses it).
         let wrapped = anyhow::Error::new(FatalVpnError("overlap".into())).context("while pairing");
         assert!(is_fatal(&wrapped));
-        // "already in use" is the deliberate retryable VpnError.
+        // "already in use" and "not found" are the deliberate retryable VpnErrors
+        // (both are reconnect-race transients, not config errors).
         assert!(vpn_error_is_retryable("vpn id 'x' already in use"));
+        assert!(vpn_error_is_retryable("vpn listener 'x' not found"));
         assert!(!vpn_error_is_retryable("overlapping subnets: a and b"));
         assert!(!is_fatal(&classify_vpn_error(
             "vpn id 'x' already in use".into()
+        )));
+        assert!(!is_fatal(&classify_vpn_error(
+            "vpn listener 'x' not found".into()
         )));
         assert!(is_fatal(&classify_vpn_error("vpn pool exhausted".into())));
     }

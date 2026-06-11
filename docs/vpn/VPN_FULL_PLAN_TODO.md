@@ -1,6 +1,8 @@
 # VPN_FULL_PLAN_TODO — Tutto ciò che resta da implementare
 
-> Stato al commit `142fe78` (branch `vpn`).  
+> Stato aggiornato 2026-06-11 (branch `vpn`). Suite netns Test 1–14 eseguita e
+> verde (`PASS=42 FAIL=0`); per il riepilogo "fatto vs manca" vedi la
+> **[sezione finale «STATO 2026-06-11»](#stato-2026-06-11--cosa-resta-davvero)**.  
 > Priorità: **P1** = blocca funzionalità core, **P2** = importante ma aggirabile, **P3** = nice-to-have / V2.
 
 ---
@@ -32,7 +34,12 @@ Risultato misurato (docker, 3 nodi): prima = stallo a ~256 KB; dopo = 100 MB in
 
 ## A. DIRETTO CRITICO — funzionalità mancante che limita l'usabilità
 
-### A1 — Direct QUIC path non cablato `P1` — ✅ RISOLTO (2026-06-11, commit 49783aa)
+### A1 — Direct QUIC path non cablato `P1` — ✅ RISOLTO (2026-06-11, commit 49783aa; fix panic switch da netns Test 8)
+
+> **Nota fix 2026-06-11 (netns Test 8, direct gateway):** lo switch a direct
+> faceva panic (`JoinHandle polled after completion`) perché `stop_pumps!` in
+> `bridge::run` ri-attendeva il pump `JoinHandle` già pollato a `Ready` da
+> `select_all`. Fix: salta gli handle `is_finished()` (`src/vpn.rs`).
 
 **Stato attuale:** `VpnLink::Direct`, `make_direct()`, `LinkSender::Direct`, `LinkRecver::Direct`
 esistono in `vpn::link` ma non vengono mai usati. `run_listen` e `run_connect` vanno
@@ -69,7 +76,14 @@ già pronto lato server).
 
 ---
 
-### A2 — `--auto-reconnect` non funziona `P1` — ✅ RISOLTO (2026-06-11, commit 07598e0)
+### A2 — `--auto-reconnect` non funziona `P1` — ✅ RISOLTO (2026-06-11, commit 07598e0; fix reconnect-race da netns Test 10)
+
+> **Nota fix 2026-06-11 (netns Test 10):** la prima esecuzione netns ha mostrato
+> che al restart del server connector e listener fanno race per ri-registrarsi;
+> se il connector vince riceve `vpn listener '<id>' not found`, che era
+> classificato **fatale** → il connector usciva e non si riconnetteva.
+> `"not found"` è ora ritentabile come `"already in use"` in
+> `vpn_error_is_retryable` (`src/vpn.rs`).
 
 **Stato attuale:** CLI ha `--auto-reconnect` ma `run_listen`/`run_connect` non usano
 `reconnect::run()`. Quando il bridge si chiude (server giù, link perso) il processo esce
@@ -248,21 +262,24 @@ Tuttavia se il link viene ripareggiato (reconnect) e l'UDP entry della sessione 
 
 ## F. TEST mancanti o deboli
 
-### F1 — Reconnect smoke test `P1` — ✅ SCRITTO (netns Test 10; esecuzione richiede sudo)
+### F1 — Reconnect smoke test `P1` — ✅ FATTO (netns Test 10 PASS 2026-06-11)
 
-Richiesto dal piano Phase 7.2. Non scritto. Scenario: server crasha mentre il bridge
-gira → client riprova con backoff → link si riconnette.
+Richiesto dal piano Phase 7.2. Scenario: server crasha mentre il bridge gira →
+client riprova con backoff → link si riconnette. **L'esecuzione ha scoperto un
+bug** (race connector/listener al re-register: `vpn listener not found`
+classificato fatale) ora corretto — vedi §A2.
 
-### F2 — Test direct path end-to-end `P1` — ✅ SCRITTO (netns Test 6-9; esecuzione richiede sudo)
+### F2 — Test direct path end-to-end `P1` — ✅ FATTO (netns Test 6-9 PASS 2026-06-11)
 
 Una volta implementato §A1, aggiungere al netns test:
 - `ping` su path direct (verificare `info!(path="direct")` nei log)
 - UDP `iperf3` su direct path (nessun TCP meltdown)
 - Bloccare UDP → fallback a relay → sbloccare → tornare a direct
 
-### F3 — Test `--auto-reconnect` nel netns harness `P2` — ✅ SCRITTO (netns Test 10-11; esecuzione richiede sudo)
+### F3 — Test `--auto-reconnect` nel netns harness `P2` — ✅ FATTO (netns Test 10-11 PASS 2026-06-11)
 
-Dipende da §A2 + §F1.
+Dipende da §A2 + §F1. Test 11 verifica anche che un errore fatale esca subito
+nonostante `--auto-reconnect`.
 
 ### F4 — Test replay protection `P2`
 
@@ -272,24 +289,27 @@ Dipende da §B1. Test unitario: ritrasmettere frame relay già visto → `open()
 
 Dipende da §D2. Verificare che link VPN siano visibili e con informazioni corrette.
 
-### F6 — Procedure manuali VPN_TEST_MATRIX.md non eseguite `P2`
+### F6 — Procedure manuali VPN_TEST_MATRIX.md
 
-- `16.5.4` — `--no-route-manage`: applicare comandi stampati manualmente e verificare
-  che la connettività funzioni
-- `16.6.8` — SIGKILL + stale reclaim: confermato nel netns (Test 5), ma manca il
-  check che `bore0` sia effettivamente rimasto dopo il SIGKILL e che il secondo avvio
-  riclami correttamente **con** le route/nft (non solo il TUN)
+- `16.6.8` — SIGKILL + stale reclaim **con route/nft (non solo TUN)**:
+  ✅ FATTO — automatizzato come netns Test 14, PASS 2026-06-11 (verifica che
+  nft table + route sopravvivano al `kill -9` e siano riclamate al riavvio,
+  niente EEXIST).
+- `16.5.4` — `--no-route-manage`: ⚠️ ancora manuale (applicare i comandi
+  stampati a mano e verificare la connettività). Unica procedura manuale residua.
 
 ---
 
-## G. DOCUMENTAZIONE da aggiornare post-implementazione
+## G. DOCUMENTAZIONE da aggiornare post-implementazione — ✅ FATTO (2026-06-11)
 
-| Documento | Aggiornamento necessario |
-|---|---|
-| `docs/VPN.md` | Aggiungere sezione direct path (§A1 completato); aggiornare troubleshooting con "path=direct" |
-| `docs/VPN.md` | Rimuovere nota "Phase 6.2 GSO/GRO deferred" (ora implementato) |
-| `docs/VPN_TEST_MATRIX.md` | Aggiungere copertura §F1–F6; aggiornare stato |
-| `CLAUDE.md` | Aggiungere invariante: VPN bridge NOT to carry TCP at high rate over relay (meltdown) |
+| Documento | Aggiornamento | Stato |
+|---|---|---|
+| `docs/vpn/VPN.md` | Sezione direct path (§A1) + troubleshooting "path=direct"; nota GSO/GRO ora "Implemented" | ✅ |
+| `docs/vpn/VPN_TEST_MATRIX.md` | Copertura §F1–F6; netns Test 1–14 PASS; nota bug-fix | ✅ |
+| `docs/vpn/VPN_PHASE_2_STATUS.md` | Esecuzione netns + §2.bis bug-fix | ✅ |
+| `docs/vpn/VPN_USER_FULL_GUIDE.md` | Stato test, PMTU dinamico, "not found" ritentabile | ✅ |
+| `README.md` / `USER_GUIDE.md` | Sezione VPN allineata; USER_GUIDE §4.10 nuova | ✅ |
+| `CLAUDE.md` | Invarianti yamux-split, counter atomico, DEC-*, RAII NetConfig | ✅ (commit precedenti) |
 
 ---
 
@@ -344,3 +364,54 @@ tokio::select! {
 
 **File da toccare:** `src/vpn.rs` (run\_listen, run\_connect), niente di nuovo
 nell'infrastruttura — `holepunch.rs` e `vpn_server.rs` sono già pronti.
+
+---
+
+## STATO 2026-06-11 — cosa resta davvero
+
+Sezione di sintesi: tutto il resto del documento è storia. Qui solo lo stato netto.
+
+### ✅ FATTO e verificato end-to-end (netns Test 1–14 PASS, `PASS=42 FAIL=0`)
+
+- **A1** direct QUIC path · **A2** `--auto-reconnect` · **A3** route replace ·
+  **A4** ip_forward revert · **C1** multi-queue · **C2** dynamic PMTU ·
+  **C3** carriers relay · **D1** TooLarge warn · **D2** admin page ·
+  **D3** NAT/UPnP wiring · **D4** lease guard · **D5** deregister race ·
+  **F1/F2/F3** netns reconnect+direct · **F5** admin entries ·
+  **F6/16.6.8** SIGKILL full reclaim (Test 14).
+- **+2 bug** scoperti dalla prima run netns e corretti: panic allo switch direct
+  (Test 8) e race di reconnect `not found` fatale (Test 10) — vedi §A1, §A2.
+- Gate CI verdi: `fmt`, `clippy --all-features --all-targets -D warnings`,
+  `cargo test --all-features`.
+
+### ⏳ APERTO ma a basso rischio (esecuzione/misura, non codice)
+
+| # | Cosa manca | Tipo | Bloccante? |
+|---|---|---|---|
+| §4.4 | **Benchmark `vpn_bench.sh`** + tuning pass (criterio: cambi solo con ≥5% riproducibile; verificare relay-4c ≥ relay-1c e direct > relay) | Esecuzione (sudo) | No — perf, non correttezza |
+| C2/M-3 | `tun MTU adjusted` su **WAN reale** (in netns la PMTU è statica) | Manuale | No |
+| 16.5.4 | `--no-route-manage`: applicare a mano i comandi stampati e verificare | Manuale | No |
+| V2-5.5 | Job CI `vpn-cross-build` (prima esecuzione: possibili aggiustamenti cargo-ndk/NDK) | CI | No |
+
+### ❌ NON FATTO — Fase 5 cross-platform runtime (E6) `parziale`
+
+Fatto solo il groundwork: builder argv `hostcfg_cmd::{macos,windows}` + CI
+cross-build + tabella piattaforme. **Manca il runtime per-OS:**
+
+- **§5.1** refactor dei `cfg` (`lib.rs`/`vpn.rs`), gating fine di
+  offload/multiqueue/procfs, `check_root` per-OS, selezione per-OS dei builder.
+- **§5.2** runtime utun (macOS) + **§5.3** runtime wintun (Windows) + gestione
+  `wintun.dll` + **§5.4** Android `--tun-fd` / target nel justfile.
+- **M-4/M-5/M-6** smoke macOS/Windows/Termux (dipendono dal runtime).
+- *Motivazione del rinvio:* su questa macchina non esiste toolchain C per
+  macOS/Windows (perfino `cargo check --target aarch64-apple-darwin` fallisce
+  sulla build C di `ring`). Iterare via CI `vpn-cross-build`.
+
+### ❌ NON FATTO — fuori scope dichiarato del piano V2 (sicurezza / V2)
+
+- **B1** replay protection sul relay (`P2`) — il frame ha già il counter;
+  dimensionare la sliding window ≥ 2 × (carriers × RELAY_QUEUE) per DEC-10. + **F4** (test replay) dipende da qui.
+- **B2** AAD binding (`P3`, wire-breaking → versioning) · **B3** key rotation (`P3`).
+- **E1** mesh · **E2** IPv6/dual-stack · **E3** overlapping subnets via 1:1 NAT ·
+  **E4** relay su UDP · **E5** privilege drop post-setup · **E7** PSK per-link ·
+  **E8** rekey.

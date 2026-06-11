@@ -465,7 +465,8 @@ Notes:
 
 - **Requires the `udp` feature**, which is **on by default**. Build
   `--no-default-features` to drop it (and the `quinn` dependency).
-- **VPN (experimental, Linux)** — point-to-point L3 tunnel; build with `--features vpn`.
+- **VPN (Linux)** — point-to-point L3 tunnel; build with `--features vpn`.
+  Feature-complete and netns-validated on Linux; macOS/Windows are groundwork only.
 - **Reflexive discovery (STUN).** Each peer learns its public address from a STUN
   chain: Cloudflare on the standard `3478/udp` first, then Google, then the
   server's built-in STUN responder on the control port over **UDP** as the final
@@ -991,6 +992,9 @@ bore server \
 | `--mtu <N>` | — | `1350` | TUN interface MTU |
 | `--no-route-manage` | — | — | Print route/NAT commands instead of running them |
 | `--auto-reconnect` | `BORE_AUTO_RECONNECT` | — | Reconnect with exponential backoff |
+| `--relay-only` | `BORE_VPN_RELAY_ONLY` | — | Never attempt the direct UDP path; stay on the relay |
+| `--carriers <N>` | — | `1` | Parallel relay substream pairs (1–16); effective = min(both sides, server `--max-carriers`) |
+| `--tun-queues <N>` | — | `1` | Linux TUN queues (`IFF_MULTI_QUEUE`, 1–8); one uplink pump per queue |
 | `--insecure` | `BORE_INSECURE` | — | Skip TLS cert verification |
 | `--notes <TEXT>` | `BORE_NOTES` | — | Operator note (logged on link-up) |
 
@@ -1006,7 +1010,7 @@ bore server \
 
 ### Performance
 
-TUN I/O uses batch read/write with GSO/GRO offload when the kernel supports `IFF_VNET_HDR`. Auto-detects on startup; falls back to single-packet if unavailable. Measured iperf3 baseline over loopback: **~13,500 Mbps** (single-packet) → **~14,000 Mbps** (GSO/GRO).
+TUN I/O uses batch read/write with GSO/GRO offload when the kernel supports `IFF_VNET_HDR`. Auto-detects on startup; falls back to single-packet if unavailable. Measured iperf3 baseline over loopback: **~13,500 Mbps** (single-packet) → **~14,000 Mbps** (GSO/GRO). Use `--carriers N` (parallel relay substreams) and `--tun-queues N` (Linux multi-queue TUN) on high-bandwidth links; the direct path raises the TUN MTU automatically (dynamic PMTU) once QUIC MTU discovery settles.
 
 Large packets drop transiently during the first 1–2 seconds (QUIC MTU discovery), then stabilize.
 

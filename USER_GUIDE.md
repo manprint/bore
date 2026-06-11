@@ -29,6 +29,8 @@ il collegamento al variare della configurazione del server.
    - [4.6 Server con pagina di amministrazione (`--admin-token`)](#46-server-con-pagina-di-amministrazione---admin-token)
    - [4.7 Configurazione di rete avanzata](#47-configurazione-di-rete-avanzata)
    - [4.8 Deploy "production" completo (TLS + secret + UDP + admin)](#48-deploy-production-completo-tls--secret--udp--admin)
+   - [4.9 Transfer sicuri (`bore transfer`)](#49-transfer-sicuri-bore-transfer)
+   - [4.10 VPN Layer 3 (`bore vpn`)](#410-vpn-layer-3-bore-vpn)
 5. [Funzionalità trasversali](#5-funzionalità-trasversali)
 6. [Scenari end-to-end completi](#6-scenari-end-to-end-completi)
 7. [Risoluzione dei problemi](#7-risoluzione-dei-problemi)
@@ -1056,6 +1058,87 @@ manifest multi-frame (>128 entry), policy `fail`/`overwrite`/`rename`, TLS sul
 control channel, symlink inclusi/esclusi, device inclusi/esclusi, flag NAT/UPnP,
 stdin reale via subprocess e kill del listener a metà transfer con resume e
 cleanup del state dir.
+
+---
+
+### 4.10 VPN Layer 3 (`bore vpn`)
+
+`bore vpn` non espone una porta: stabilisce una **interfaccia di rete L3
+punto-a-punto** (`bore0`) fra due macchine **Linux**, trasportando pacchetti IP
+reali sopra il transport di bore (path diretto QUIC con hole-punch quando
+possibile, relay AEAD cifrato come fallback). Serve per collegare due host, o per
+**instradare intere sottoreti** fra due gateway. Richiede `--features vpn` e
+**root o `CAP_NET_ADMIN`**.
+
+> Guida completa (tutte le topologie, flag, NAT, troubleshooting):
+> [`docs/vpn/VPN_USER_FULL_GUIDE.md`](docs/vpn/VPN_USER_FULL_GUIDE.md).
+> Riferimento operatore e modello di sicurezza: [`docs/vpn/VPN.md`](docs/vpn/VPN.md).
+
+#### Avvio del server
+
+Il server fa solo da broker (non vede mai il plaintext IP); va avviato con `--vpn`
+e un pool da cui assegnare i blocchi `/30` di overlay:
+
+```bash
+bore server \
+  --secret S3cret \
+  --vpn --vpn-pool 10.99.0.0/16 \
+  --vpn-max-links 32 \
+  --udp --bind-addr 0.0.0.0
+```
+
+- `--vpn`: abilita il brokering VPN (il server dev'essere compilato `--features vpn`).
+- `--vpn-pool <CIDR>`: pool da cui allocare gli overlay `/30` (richiesto in pool mode).
+- `--vpn-max-links <N>`: limite di link VPN concorrenti (default 32).
+- `--udp` consigliato: abilita lo STUN integrato e il path diretto QUIC.
+
+#### Avvio dei client — host ↔ host
+
+I due lati condividono lo stesso `--id` e lo stesso `--secret`. Un lato fa
+`listen` (aspetta), l'altro `connect`:
+
+```bash
+# Macchina A
+sudo bore vpn listen  --to bore.example.com --secret S3cret --id mylink
+
+# Macchina B
+sudo bore vpn connect --to bore.example.com --secret S3cret --id mylink
+```
+
+Entrambe ottengono un indirizzo overlay (`10.99.0.1` / `10.99.0.2`): `ping
+10.99.0.1` funziona subito. Nessuna route né IP forwarding coinvolti.
+
+#### Avvio dei client — site ↔ host (gateway)
+
+Il lato gateway annuncia una LAN con `--advertise`; abilita automaticamente IP
+forwarding, masquerade e MSS-clamp:
+
+```bash
+# Gateway (LAN 192.168.50.0/24)
+sudo bore vpn listen  --to bore.example.com --secret S3cret --id site \
+  --advertise 192.168.50.0/24
+
+# Client roaming
+sudo bore vpn connect --to bore.example.com --secret S3cret --id site
+```
+
+Il client raggiunge la LAN dietro il gateway. Per **site ↔ site** basta passare
+`--advertise` anche sul lato `connect`.
+
+#### Opzioni utili
+
+- `--auto-reconnect`: riconnessione con backoff esponenziale (teardown+rebuild
+  completo a ogni tentativo; gli errori di configurazione fatali escono subito).
+- `--relay-only`: resta sempre sul relay, non tenta mai il path diretto.
+- `--carriers <N>` (1–16) e `--tun-queues <N>` (1–8, Linux): throughput su link
+  ad alta banda/latenza; default 1 = path identico alla configurazione singola.
+- `--no-route-manage`: stampa i comandi route/NAT invece di eseguirli.
+- `Ctrl-C` ripristina tutto (route, ip_forward, nft, interfaccia); un `SIGKILL`
+  lascia stato stantio che il riavvio con lo stesso `--id` riclama da solo.
+
+> **Stato:** VPN su Linux è feature-complete e verificata end-to-end dalla suite
+> netns (`scripts/vpn_netns_test.sh`, Test 1–14 — PASS 2026-06-11). macOS/Windows/
+> Android sono solo groundwork (build-checked in CI, nessun runtime).
 
 ---
 

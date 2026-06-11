@@ -56,7 +56,7 @@ This document maps every §16 acceptance criterion from `VPN_FULL_PLAN_V1.md` to
 | 16.6.5 | On server return, link re-pairs with same overlay address (routes not duplicated) | Automated | Verify address and route count after server return in netns | PASS |
 | 16.6.6 | `Ctrl-C` (SIGINT) triggers clean undo: routes deleted, nft table dropped, ip_forward restored, tun gone | Automated | `netns_vpn_sigint_cleanup` (netns harness, send SIGINT, verify state) | PASS |
 | 16.6.7 | After exit, `ip route`, `nft list tables`, `cat /proc/sys/net/ipv4/ip_forward` identical to before start | Automated | State snapshot before/after in netns | PASS |
-| 16.6.8 | `kill -9` leaves stale state; next `bore vpn --id <same>` reclaims it | Manual | **Procedure 16.6.8**: Start link, `kill -9`, check stale state, restart same `--id`, verify reclaim |
+| 16.6.8 | `kill -9` leaves stale state; next `bore vpn --id <same>` reclaims it | Automated (netns Test 14) + Manual | **Procedure 16.6.8** now automated as `vpn_netns_test.sh` Test 14 — PASS (2026-06-11): verifies nft table + routes (not just TUN) survive `kill -9` and are reclaimed on restart with no EEXIST |
 | **§16.7 Failure Messages** ||||
 | 16.7.1 | No `--secret` → clap-level error before connection | Automated | `test_vpn_requires_secret` (CLI parsing) | PASS |
 | 16.7.2 | Not root / no `CAP_NET_ADMIN` → actionable `bail!` before mutation | Automated | `test_vpn_privilege_check` (attempts operation as non-root user) | PASS |
@@ -222,21 +222,22 @@ kill $VPNPID2
 | V2-1.1 (A1) | Broker defers the punch until the listener's offer arrives (DEC-3) | Automated | `vpn_server_test::vpn_broker_waits_for_listener_offer` | PASS |
 | V2-1.1 (A1) | Listener never offers → connector gets `UdpUnavailable` after the punch timeout | Automated | `vpn_server_test::vpn_broker_timeout_sends_unavailable` | PASS |
 | V2-1.2 (A1) | Ctrl actor: heartbeats ignored, punch forwarded, outbound messages written, close detected | Automated | `vpn::tests::ctrl_actor_forwards_punch_and_detects_close` | PASS |
-| V2-1.6 (F2) | Direct path host↔host: `path=direct` both sides, 0% ping loss, UDP ≥100 Mbps | Netns (sudo) | `vpn_netns_test.sh` Test 6 | PENDING (needs sudo run) |
-| V2-1.6 (F2) | UDP blocked between peers → automatic relay fallback, ping works | Netns (sudo) | `vpn_netns_test.sh` Test 7 | PENDING (needs sudo run) |
-| V2-1.6 (F2) | Direct path gateway mode: LAN ping + TCP through gateway (MSS clamp / GSO) | Netns (sudo) | `vpn_netns_test.sh` Test 8 | PENDING (needs sudo run) |
-| V2-1.6 (F2) | `--relay-only`: no direct upgrade ever, ping works | Netns (sudo) | `vpn_netns_test.sh` Test 9 | PENDING (needs sudo run) |
-| V2-2.1 (A2) | Fatal-vs-retryable classification (FatalVpnError, "already in use" retryable) | Automated | `vpn::tests::fatal_classification` | PASS |
+| V2-1.6 (F2) | Direct path host↔host: `path=direct` both sides, 0% ping loss, UDP ≥100 Mbps | Netns (sudo) | `vpn_netns_test.sh` Test 6 | PASS (2026-06-11) |
+| V2-1.6 (F2) | UDP blocked between peers → automatic relay fallback, ping works | Netns (sudo) | `vpn_netns_test.sh` Test 7 | PASS (2026-06-11) |
+| V2-1.6 (F2) | Direct path gateway mode: LAN ping + TCP through gateway (MSS clamp / GSO) | Netns (sudo) | `vpn_netns_test.sh` Test 8 | PASS (2026-06-11; exposed + fixed bridge switch panic, see note ‡) |
+| V2-1.6 (F2) | `--relay-only`: no direct upgrade ever, ping works | Netns (sudo) | `vpn_netns_test.sh` Test 9 | PASS (2026-06-11) |
+| V2-2.1 (A2) | Fatal-vs-retryable classification (FatalVpnError; "already in use" **and** "not found" retryable) | Automated | `vpn::tests::fatal_classification` | PASS |
 | V2-2.2 (A2) | Reconnect loop: retries retryable, stops on fatal, once with auto=false | Automated | `vpn::tests::run_with_reconnect_counts` | PASS |
-| V2-2.3 (F1/F3) | Server kill -9 → both clients reconnect, re-pair, ping OK, no EEXIST/dup routes | Netns (sudo) | `vpn_netns_test.sh` Test 10 | PENDING (needs sudo run) |
-| V2-2.3 (F1/F3) | Fatal error (overlap) with `--auto-reconnect` exits non-zero, no loop | Netns (sudo) | `vpn_netns_test.sh` Test 11 | PENDING (needs sudo run) |
+| V2-2.3 (F1/F3) | Server kill -9 → both clients reconnect, re-pair, ping OK, no EEXIST/dup routes | Netns (sudo) | `vpn_netns_test.sh` Test 10 | PASS (2026-06-11; exposed + fixed reconnect-race fatal, see note ‡) |
+| V2-2.3 (F1/F3) | Fatal error (overlap) with `--auto-reconnect` exits non-zero, no loop | Netns (sudo) | `vpn_netns_test.sh` Test 11 | PASS (2026-06-11) |
 | V2-3.1 (D2/F5) | Paired links show VPN roles + overlay on admin page; `VpnPathReport` flips path to direct | Automated | `vpn_server_test::vpn_admin_entries_and_path_report` | PASS |
 | V2-4.1 (C3) | 4-carrier bulk transfer: every packet delivered exactly once (any order) | Automated | `vpn_relay_link_test::vpn_relay_multi_carrier_bulk` | PASS |
 | V2-4.1 (C3) | One dead carrier of 4 kills the link cleanly (no hang, no silent loss) | Automated | `vpn_relay_link_test::vpn_relay_multi_carrier_one_stream_dies` | PASS |
 | V2-4.1 (I-5) | Shared atomic nonce counter: 4 tasks × 1000 seals → 4000 unique counters | Automated | `vpn::link::tests::shared_counter_unique_across_tasks` | PASS |
 | V2-4.1 (C3) | Carriers negotiation min(hello, connect, server max); old-peer JSON defaults to 1 | Automated | `vpn_server_test::vpn_carriers_negotiation`, `vpn_carriers_default_for_old_peers` | PASS |
-| V2-4.2 (C1) | `--relay-only --carriers 4`: ping + iperf3 TCP over multi-carrier relay | Netns (sudo) | `vpn_netns_test.sh` Test 12 | PENDING (needs sudo run) |
-| V2-4.2 (C1) | `--tun-queues 4`: ping + iperf3 -P 4 | Netns (sudo) | `vpn_netns_test.sh` Test 13 | PENDING (needs sudo run) |
+| V2-4.2 (C1) | `--relay-only --carriers 4`: ping + iperf3 TCP over multi-carrier relay | Netns (sudo) | `vpn_netns_test.sh` Test 12 | PASS (2026-06-11) |
+| V2-4.2 (C1) | `--tun-queues 4`: ping + iperf3 -P 4 | Netns (sudo) | `vpn_netns_test.sh` Test 13 | PASS (2026-06-11) |
+| V2-6.1 (F6) | Full SIGKILL stale reclaim (16.6.8): TUN **+ nft + routes** survive `kill -9`, next start reclaims all, no EEXIST, ping OK | Netns (sudo) | `vpn_netns_test.sh` Test 14 | PASS (2026-06-11) |
 | V2-4.3 (C2) | PMTU decision truth table (stability, delta, clamp) | Automated | `vpn::tests::pmtu_decision_cases` | PASS |
 | V2-4.3 (C2) | "tun MTU adjusted" on a real WAN (PMTU static in netns) | Manual | Procedure M-3 | PENDING |
 | V2-4.4 | Benchmark table (relay 1c/4c, direct, direct 4q) | Bench (sudo) | `scripts/vpn_bench.sh` | PENDING (needs sudo run) |
@@ -249,6 +250,22 @@ kill $VPNPID2
 ---
 
 ## Netns Harness Coverage
+
+> **Execution status (2026-06-11):** `sudo scripts/vpn_netns_test.sh` run end-to-end
+> on a Linux netns harness — **Test 1–14 all PASS (`Results: PASS=42 FAIL=0`)**.
+> The first execution exposed two real bugs (both fixed; see note ‡ below);
+> the suite is green after the fixes.
+>
+> ‡ **Bugs found + fixed during the first netns run:**
+> 1. **Direct-path switch panic (Test 8).** `bridge::run`'s `stop_pumps!` macro
+>    awaited the pump `JoinHandle` that `select_all` had already polled to
+>    completion → `JoinHandle polled after completion` panic → the peer that
+>    switched to direct died. Fix: skip `is_finished()` handles (`src/vpn.rs`).
+> 2. **Reconnect-race fatal classification (Test 10).** After a server restart the
+>    connector can re-register before the listener, getting `vpn listener '<id>'
+>    not found`, which was classified **fatal** → the connector exited and never
+>    recovered. Fix: `"not found"` is now retryable like `"already in use"`
+>    (`vpn_error_is_retryable`, `src/vpn.rs`); only `--auto-reconnect` loops on it.
 
 The `scripts/vpn_netns_test.sh` script (run as `sudo`) executes all netns tests above. Key scenarios:
 
@@ -275,6 +292,6 @@ The `scripts/vpn_netns_test.sh` script (run as `sudo`) executes all netns tests 
 
 ## Notes
 
-- **Netns tests require `sudo` and passwordless sudo configuration** (see §11.9 sudoers note in VPN_FULL_PLAN_V1.md).
-- **Phase 6.2 offload:** GSO/GRO offload testing is deferred; baseline iperf3 measurement was not available during v1 development. Single-packet path (Phase 6.1) is proven correct and non-syscall-bound.
+- **Netns tests require `sudo` and passwordless sudo configuration** (see §11.9 sudoers note in VPN_FULL_PLAN_V1.md). Executed 2026-06-11: Test 1–14 PASS.
+- **Phase 6.2 offload:** GSO/GRO offload is implemented and netns-exercised; loopback iperf3 baseline ~13,500 → ~14,000 Mbps. The cross-config WAN benchmark (`scripts/vpn_bench.sh`) is still PENDING — its numbers and the §4.4 tuning pass are the remaining open items.
 - **Cross-compilation:** tests assume Linux target; builds on macOS/Windows skip VPN-specific tests (feature gate).

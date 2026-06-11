@@ -4,6 +4,12 @@
 
 **Platform:** Linux only. Requires root or `CAP_NET_ADMIN`. Build: `cargo build --release --features vpn`.
 
+> **Status:** Linux VPN is feature-complete and validated end-to-end by the netns
+> acceptance suite (`scripts/vpn_netns_test.sh`, Test 1–14 — PASS on 2026-06-11)
+> plus the automated unit/integration tests. macOS/Windows/Android are
+> groundwork only (CI build-checked; no runtime yet). A cross-config throughput
+> benchmark is the one remaining open item.
+
 ---
 
 ## Table of Contents
@@ -559,8 +565,12 @@ sudo bore vpn connect \
 - An attempt that stayed up >60 s resets the backoff to 1 second.
 - **Fatal configuration errors exit instead of looping**: overlap, addressing
   mode mismatch, static mismatch, pool exhausted, no server pool, max-links,
-  missing root or `ip` binary. Exception: `vpn id already in use` is retried
-  (the previous server-side session may take a few seconds to die).
+  missing root or `ip` binary. Two exceptions are retried because they are
+  reconnect-race transients, not config errors:
+  - `vpn id already in use` — the previous server-side session may take a few
+    seconds to die and release the id.
+  - `vpn listener '<id>' not found` — after a server restart the connector can
+    re-register before the listener; retrying lets the listener catch up.
 
 **Log output during reconnect loop:**
 
@@ -655,6 +665,14 @@ sudo bore vpn connect --id mylink --secret S --mtu 1280
 ping -M do -s 1280 10.99.0.1  # check 1280-byte packets
 ping -M do -s 1300 10.99.0.1  # likely fails if path MTU is 1350
 ```
+
+**Dynamic PMTU (direct path):** once a link upgrades to the direct QUIC path, a
+monitor raises the TUN MTU automatically to follow the QUIC path MTU. It samples
+`max_datagram_size()` every 5 s and, once stable (3 equal samples, ≥16 bytes of
+change, clamped to `[576, 9000]`), runs `ip link set <tun> mtu <new>` and logs
+`tun MTU adjusted to QUIC path MTU`. No revert is needed — the TUN is destroyed
+at teardown and the gateway MSS clamp uses `rt mtu`, adapting on its own. The
+`--mtu` value remains the starting point and the relay-path ceiling.
 
 ### Routes installed
 

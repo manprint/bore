@@ -15,19 +15,20 @@ sul piano del codice, con tutti i gate di qualità verdi (`cargo fmt --check`,
 per-OS rimandato — motivazione in §4.1). La **fase 6 è completata** per la parte
 documentale/consolidamento eseguibile in questa sessione.
 
-**Limite operativo della sessione:** la suite netns (`scripts/vpn_netns_test.sh`)
-e il benchmark (`scripts/vpn_bench.sh`) richiedono `sudo` interattivo, non
-disponibile. Tutti i test netns nuovi (Test 6–14) sono **scritti e
-sintatticamente validati** ma **mai eseguiti**. È il primo passo da fare a mano
-(vedi §6).
+**AGGIORNAMENTO 2026-06-11 — suite netns ESEGUITA.** Con sudo passwordless
+configurato, `scripts/vpn_netns_test.sh` è stato eseguito end-to-end: **Test 1–14
+tutti PASS** (`Results: PASS=42 FAIL=0`). La prima esecuzione ha scoperto **due
+bug reali**, entrambi corretti (vedi §2.bis); la suite è verde dopo i fix.
+Resta da eseguire **solo il benchmark** (`scripts/vpn_bench.sh`, ancora `PENDING`)
+e il relativo tuning pass §4.4.
 
 | Fase | Contenuto | Stato | Commit |
 |---|---|---|---|
 | 0 | Robustezza (A3, A4, D1, D4, D5) | ✅ Completa | `351eda7` |
-| 1 | Direct QUIC path (A1 + D3 + F2) | ✅ Completa (netns da eseguire) | `49783aa` |
-| 2 | `--auto-reconnect` (A2 + F1/F3) | ✅ Completa (netns da eseguire) | `07598e0` |
+| 1 | Direct QUIC path (A1 + D3 + F2) | ✅ Completa (netns 6–9 PASS 2026-06-11) | `49783aa` |
+| 2 | `--auto-reconnect` (A2 + F1/F3) | ✅ Completa (netns 10–11 PASS; reconnect-race fix) | `07598e0` |
 | 3 | Admin page VPN (D2 + F5) | ✅ Completa | `3910299` |
-| 4 | Performance (C3, C1, C2) + bench | ✅ Codice completo (bench da eseguire) | `20f7d07` |
+| 4 | Performance (C3, C1, C2) + bench | ✅ Codice completo (netns 12–13 PASS; bench da eseguire) | `20f7d07` |
 | 5 | Cross-platform (E6) | ⚠️ Parziale (groundwork + CI) | `85ad3a4` |
 | 6 | Consolidamento + docs | ✅ Completa (procedure manuali pendenti) | questo commit |
 
@@ -191,12 +192,52 @@ sintatticamente validati** ma **mai eseguiti**. È il primo passo da fare a mano
 
 ---
 
+## 2.bis — Bug scoperti dalla prima esecuzione netns (2026-06-11) e corretti
+
+La prima esecuzione end-to-end della suite netns ha scoperto due bug reali che i
+test unit/integration a livello di protocollo **non** potevano cogliere (servono
+TUN reale + timing reale del path switch e del reconnect). Entrambi corretti,
+suite rieseguita verde (`PASS=42 FAIL=0`), gate CI verdi (`fmt`, `clippy
+--all-features --all-targets -D warnings`, `cargo test --all-features`).
+
+1. **Panic allo switch su path direct (Test 8 — direct gateway).**
+   *Sintomo:* il peer che passava a direct moriva con
+   `thread 'main' panicked: JoinHandle polled after completion`, ~15 ms dopo
+   `vpn path upgraded to direct`. Ping LAN e iperf3 fallivano perché il processo
+   era morto (non un bug di forwarding).
+   *Causa:* in `bridge::run` la macro `stop_pumps!` faceva
+   `for p in &mut pumps { let _ = p.await }` su **tutti** i pump, incluso quello
+   che `select_all(pumps.iter_mut())` aveva già pollato a `Ready` → ri-poll di un
+   `JoinHandle` completato → panic di tokio. Scenario tipico: il peer switcha a
+   direct per primo, il nostro pump relay finisce via `select_all`, la
+   finestra di grazia consegna l'upgrade e `stop_pumps!` ri-attende l'handle
+   consumato.
+   *Fix:* salta gli handle `is_finished()` in `stop_pumps!` (un pump finito ha
+   già smesso, è tutto ciò che serve prima di riusare la TUN). `src/vpn.rs`.
+
+2. **Classificazione fatale della race di reconnect (Test 10 — auto-reconnect).**
+   *Sintomo:* dopo il restart del server, il connector usciva con
+   `Error: vpn listener 'reconnect-test' not found` e non si riconnetteva più;
+   il listener restava in attesa di un peer che non sarebbe mai arrivato → link
+   mai ripareggiato entro 90 s.
+   *Causa:* al reconnect dopo un restart del server, connector e listener fanno
+   race per ri-registrarsi. Se il connector vince, riceve dal server
+   `vpn listener '<id>' not found` — che `classify_vpn_error` marcava **fatale**
+   → `run_with_reconnect` esce subito.
+   *Fix:* `"not found"` è ora **ritentabile** come `"already in use"` in
+   `vpn_error_is_retryable` (è l'unico messaggio server con "not found", quindi
+   il match è preciso); senza `--auto-reconnect` il connector esce comunque al
+   primo errore, quindi un listener davvero assente non viene ritentato.
+   `src/vpn.rs`; truth-table `fatal_classification` estesa.
+
+---
+
 ## 3. Cosa è rimasto fuori
 
-1. **Esecuzione della suite netns (Test 1–14) e del benchmark** — richiedono
-   `sudo` interattivo, non disponibile nella sessione. I Test 6–14 sono nuovi e
-   **mai stati eseguiti**: vanno considerati non verificati end-to-end finché
-   non girano. Le righe della test matrix sono marcate `PENDING (needs sudo run)`.
+1. **Benchmark `vpn_bench.sh`** — unico item di esecuzione ancora aperto
+   (richiede `sudo`). La suite netns (Test 1–14) è invece stata **eseguita il
+   2026-06-11: tutti PASS** (`PASS=42 FAIL=0`); le righe della test matrix sono
+   ora `PASS (2026-06-11)`. Restano aperti il benchmark e il tuning pass §4.4.
 2. **Fase 5 runtime cross-platform (§5.1–§5.4)**: il refactor di portabilità
    (allargamento dei `cfg` di `lib.rs`/`vpn.rs`, gating fine di offload/
    multiqueue/procfs, `check_root` per-OS, selezione per-OS dei builder
@@ -223,10 +264,13 @@ sintatticamente validati** ma **mai eseguiti**. È il primo passo da fare a mano
 
 ### 4.1 Criticità di processo
 
-- **Test netns mai eseguiti** (vedi §3.1): è la criticità principale. Il data
-  plane direct, lo switch del bridge, il reconnect e il multiqueue sono coperti
-  da unit/integration test a livello di protocollo e di link, ma il
-  comportamento con TUN reale, NAT e iperf3 è verificato solo "by design".
+- **Test netns ora eseguiti (2026-06-11)**: era la criticità principale, ora
+  risolta. La prima esecuzione ha scoperto e fatto correggere due bug reali che
+  i test di protocollo non potevano cogliere (panic allo switch direct, race di
+  reconnect — §2.bis). Dopo i fix, Test 1–14 PASS. Il data plane direct, lo
+  switch del bridge, il reconnect e il multiqueue sono ora verificati con TUN
+  reale, NAT e iperf3, non più solo "by design". Resta non verificato end-to-end
+  solo il benchmark comparativo (`vpn_bench.sh`).
 - **Fase 5 non verificabile localmente**: qualunque futura iterazione
   cross-platform deve passare dalla CI (o da una macchina con i toolchain).
 
@@ -307,16 +351,16 @@ Stato item per item del TODO (aggiornato anche inline nel TODO stesso):
 
 | Item TODO | Stato | Cosa manca |
 |---|---|---|
-| A1 direct QUIC path `P1` | ✅ Risolto (`49783aa`) | Solo esecuzione netns Test 6–9 |
-| A2 `--auto-reconnect` `P1` | ✅ Risolto (`07598e0`) | Solo esecuzione netns Test 10–11 |
+| A1 direct QUIC path `P1` | ✅ Risolto (`49783aa`) | — (netns Test 6–9 PASS 2026-06-11) |
+| A2 `--auto-reconnect` `P1` | ✅ Risolto (`07598e0` + fix reconnect-race) | — (netns Test 10–11 PASS 2026-06-11) |
 | A3 route replace `P1` | ✅ Risolto (`351eda7`) | — |
 | A4 ip_forward revert `P2` | ✅ Risolto (`351eda7`) | — |
 | B1 replay protection `P2` | ❌ Fuori scope del piano V2 (annotato DEC-10) | Implementazione completa |
 | B2 AAD binding `P3` | ❌ Fuori scope (wire-breaking) | Versioning protocollo + implementazione |
 | B3 key rotation `P3` | ❌ Fuori scope | Implementazione |
-| C1 multi-queue `P3` | ✅ Risolto (`20f7d07`) | Esecuzione netns Test 13 + benchmark |
+| C1 multi-queue `P3` | ✅ Risolto (`20f7d07`) | netns Test 13 PASS; resta benchmark |
 | C2 dynamic PMTU `P3` | ✅ Risolto (`20f7d07`) | Procedura manuale M-3 su WAN reale |
-| C3 carriers relay `P3` | ✅ Risolto (`20f7d07`) | Esecuzione netns Test 12 + benchmark WAN |
+| C3 carriers relay `P3` | ✅ Risolto (`20f7d07`) | netns Test 12 PASS; resta benchmark WAN |
 | D1 TooLarge warn `P2` | ✅ Risolto (`351eda7`) | — |
 | D2 admin page `P2` | ✅ Risolto (`3910299`) | — |
 | D3 NAT/UPnP args `P2` | ✅ Risolto (`49783aa`) | — |
@@ -324,19 +368,21 @@ Stato item per item del TODO (aggiornato anche inline nel TODO stesso):
 | D5 deregister race `P2` | ✅ Risolto (`351eda7`) | — |
 | E6 cross-platform | ⚠️ Parziale (`85ad3a4`) | §5.1 refactor cfg, §5.2 utun runtime, §5.3 wintun runtime, §5.4 Android/`--tun-fd`; iterare via CI |
 | E1–E5, E7, E8 | ❌ Fuori scope V2 (per piano) | — |
-| F1 reconnect smoke `P1` | ✅ Scritto (Test 10) | **Esecuzione con sudo** |
-| F2 direct e2e `P1` | ✅ Scritto (Test 6–9) | **Esecuzione con sudo** |
-| F3 reconnect netns `P2` | ✅ Scritto (Test 10–11) | **Esecuzione con sudo** |
+| F1 reconnect smoke `P1` | ✅ Risolto (Test 10 PASS 2026-06-11) | — |
+| F2 direct e2e `P1` | ✅ Risolto (Test 6–9 PASS 2026-06-11) | — |
+| F3 reconnect netns `P2` | ✅ Risolto (Test 10–11 PASS 2026-06-11) | — |
 | F4 replay test `P2` | ❌ Dipende da B1 | Con B1 |
 | F5 admin entries `P2` | ✅ Risolto (test automatico) | — |
-| F6 procedure manuali `P2` | ⚠️ 16.6.8 automatizzato (Test 14, da eseguire); 16.5.4 manuale | Esecuzione manuale |
+| F6 procedure manuali `P2` | ✅ 16.6.8 automatizzato (Test 14 PASS 2026-06-11); ⚠️ 16.5.4 ancora manuale | Solo 16.5.4 (`--no-route-manage` a mano) |
 | G documentazione | ✅ Aggiornata (VPN.md, TEST_MATRIX, USER_GUIDE, CLAUDE.md, TODO) | — |
 
 ### Checklist di chiusura (in ordine)
 
-1. **`cargo build --release --features vpn` + `sudo scripts/vpn_netns_test.sh`**
-   → Test 1–14 PASS. È l'unico gate mancante per dichiarare chiuse le fasi 1, 2
-   e 4 anche sul piano della verifica end-to-end.
+1. ✅ **FATTO (2026-06-11)** — `cargo build --release --features vpn` +
+   `sudo scripts/vpn_netns_test.sh` → **Test 1–14 PASS** (`PASS=42 FAIL=0`).
+   Due bug scoperti e corretti (§2.bis), suite rieseguita verde, gate CI verdi.
+   Fasi 1, 2 e 4 ora chiuse anche sul piano della verifica end-to-end (manca
+   solo il benchmark, punto 2).
 2. **`sudo scripts/vpn_bench.sh`** → incollare la tabella in `VPN.md` §Performance
    e fare il tuning pass §4.4 (criterio: cambi solo con ≥5% riproducibile;
    verificare relay-4c ≥ relay-1c e direct > relay).

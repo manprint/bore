@@ -310,10 +310,16 @@ identically forever: missing root/`CAP_NET_ADMIN`, missing `ip` binary,
 mismatch, exhausted pool, missing server pool, or `vpn-max-links`. The process
 exits non-zero with the error.
 
-**Deliberate exception:** `vpn id already in use` IS retried (with a `warn!`).
-During a reconnect the server-side handler of the previous session can take a
-few seconds to notice the dead connection and release the id; one or two
-backoff rounds resolve it.
+**Deliberate exceptions (both reconnect-race transients, not config errors):**
+
+- `vpn id already in use` IS retried (with a `warn!`). During a reconnect the
+  server-side handler of the previous session can take a few seconds to notice
+  the dead connection and release the id; one or two backoff rounds resolve it.
+- `vpn listener '<id>' not found` IS retried. After a server restart the
+  connector and listener race to re-register; if the connector wins it gets this
+  error before the listener is back. Retrying lets the listener catch up. (Found
+  by netns Test 10; without `--auto-reconnect` the connector still exits on the
+  first error, so a genuinely-missing listener is not retried forever.)
 
 ---
 
@@ -468,10 +474,16 @@ uses `rt mtu`, adapting on its own.
 
 **Benchmarks:** `sudo scripts/vpn_bench.sh` produces the comparison table
 (relay 1c / relay 4c / direct / direct 4q × TCP / UDP / latency). Record the
-numbers here after each tuning change.
+numbers here after each tuning change. **Status: still PENDING** — this is the
+last open execution item (the §4.4 tuning pass is gated on it; criterion: apply
+a change only on a reproducible ≥5% gain, and verify relay-4c ≥ relay-1c and
+direct > relay).
 
 > Baseline (pre-Phase-4, docker 3-node): relay ≈ 200 MB/s bulk, ping 0% loss
-> under load. Netns numbers to be recorded on the first `vpn_bench.sh` run.
+> under load. The functional netns suite (Test 1–14) passed on 2026-06-11
+> (`PASS=42 FAIL=0`) and reports sanity throughput (e.g. direct gateway iperf3
+> TCP ≈ 4.8 Gbps, 4-carrier relay ≈ 1.4 Gbps, multi-queue ≈ 4.7 Gbps), but the
+> structured comparison numbers are recorded on the first `vpn_bench.sh` run.
 
 ---
 
@@ -570,6 +582,11 @@ sudo bore vpn connect \
 
 ## Tested Scenarios
 
+> Verified by the netns harness (`sudo scripts/vpn_netns_test.sh`, Test 1–14) —
+> **all PASS on 2026-06-11** (`PASS=42 FAIL=0`), plus the automated unit/integration
+> suite. The first netns run also exposed and fixed two bugs (direct-switch panic,
+> reconnect-race fatal — see VPN_TEST_MATRIX.md note ‡).
+
 - Host ↔ host (pool and static addressing)
 - Site ↔ host (one gateway, one client)
 - Site ↔ site (both gateways)
@@ -584,5 +601,8 @@ sudo bore vpn connect \
 - Address collision detection
 - Gateway MSS-clamp rule validation
 - Sustained throughput over overlay (iperf3 sanity check)
+- `SIGKILL` full stale reclaim: TUN **+ nft table + routes** survive `kill -9`
+  and are reclaimed on the next start with no `EEXIST` (netns Test 14)
+- Multi-carrier relay (`--carriers 4`) and TUN multi-queue (`--tun-queues 4`)
 
 See [`docs/vpn/VPN_USER_FULL_GUIDE.md`](VPN_USER_FULL_GUIDE.md) for the complete flag reference and use-case guide, and [`docs/vpn/VPN_TEST_MATRIX.md`](VPN_TEST_MATRIX.md) for the full test matrix and traceability to Phase 8 acceptance criteria.

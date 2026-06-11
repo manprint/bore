@@ -9,7 +9,9 @@ use anyhow::Result;
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-#[cfg(feature = "vpn")]
+// `Semaphore` (conn_permits) and `mpsc` (carrier token channel) are used on the
+// default build; only `vpn_link_permits` is vpn-gated. Keep the import
+// unconditional so `--no-default-features`/non-vpn builds compile.
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tokio_rustls::TlsAcceptor;

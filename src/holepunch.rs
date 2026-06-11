@@ -992,6 +992,20 @@ pub struct DirectConn {
     endpoint: Endpoint,
 }
 
+/// Outcome of a best-effort datagram send on the direct QUIC path.
+///
+/// `TooLarge` is a transient PER-PACKET condition (the packet is bigger than the
+/// current QUIC path-MTU allows), NOT a link failure — the caller drops the
+/// packet and keeps the link alive. Genuine link death is an `Err` instead.
+#[cfg(feature = "udp")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatagramSend {
+    /// Queued for transmission.
+    Sent,
+    /// Dropped: larger than the current path-MTU datagram limit.
+    TooLarge,
+}
+
 #[cfg(feature = "udp")]
 impl DirectConn {
     /// Open a new native QUIC bidi stream for one proxied connection (consumer).
@@ -1039,15 +1053,27 @@ impl DirectConn {
 
     /// Send an IP packet as a QUIC unreliable datagram. Non-blocking.
     ///
-    /// Returns `Err` if the packet exceeds the current datagram size limit
-    /// (`TooLarge` — typically only during the initial MTU-discovery window;
-    /// the VPN bridge counts these and warns after >10 s). quinn 0.11 silently
-    /// drops the *oldest* queued datagram when the send buffer is full, so
-    /// calling this from the uplink hot loop is safe without backpressure.
-    pub fn send_datagram(&self, pkt: bytes::Bytes) -> Result<()> {
-        self.conn
-            .send_datagram(pkt)
-            .map_err(|e| anyhow::anyhow!("send_datagram: {e}"))
+    /// Returns `Ok(DatagramSend::TooLarge)` — NOT `Err` — when the packet
+    /// exceeds the current QUIC path-MTU datagram limit. That happens whenever
+    /// the TUN MTU runs ahead of the path MTU: throughout the initial MTU
+    /// discovery window, and briefly after every switch to the direct path (the
+    /// TUN starts at its configured MTU; the PMTU monitor narrows it once QUIC
+    /// settles). The caller MUST drop such a packet and keep going — it is a
+    /// transient per-packet condition, not a link failure. The VPN bridge
+    /// counts these and warns after >10 s.
+    ///
+    /// `Err` is reserved for genuine link death (`ConnectionLost`, datagrams
+    /// `Disabled`/`UnsupportedByPeer`) so the bridge tears down and reconnects.
+    ///
+    /// quinn 0.11 silently drops the *oldest* queued datagram when the send
+    /// buffer is full, so calling this from the uplink hot loop is safe without
+    /// backpressure.
+    pub fn send_datagram(&self, pkt: bytes::Bytes) -> Result<DatagramSend> {
+        match self.conn.send_datagram(pkt) {
+            Ok(()) => Ok(DatagramSend::Sent),
+            Err(quinn::SendDatagramError::TooLarge) => Ok(DatagramSend::TooLarge),
+            Err(e) => Err(anyhow::anyhow!("send_datagram: {e}")),
+        }
     }
 
     /// Read the next QUIC datagram. Resolves when a datagram arrives or the
@@ -2147,11 +2173,13 @@ mod tests {
         assert_eq!(srv_recv, payload);
     }
 
-    /// Sending a datagram that exceeds any realistic QUIC datagram limit returns
-    /// an error rather than panicking.
+    /// Sending a datagram that exceeds any realistic QUIC datagram limit is
+    /// reported as `DatagramSend::TooLarge` (a droppable per-packet condition),
+    /// NOT as `Err` (which would kill the VPN link). Regression guard for the
+    /// "send_datagram: datagram too large" link-death bug.
     #[cfg(feature = "udp")]
     #[tokio::test]
-    async fn datagram_too_large_is_error() {
+    async fn datagram_too_large_is_droppable_not_fatal() {
         let tuning = UdpDirectTuning::default();
 
         let srv_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2175,9 +2203,75 @@ mod tests {
         // 65 KB is always larger than any QUIC datagram limit.
         let huge = bytes::Bytes::from(vec![0u8; 65_000]);
         let result = cli_dc.send_datagram(huge);
-        assert!(
-            result.is_err(),
-            "expected TooLarge error for oversized datagram"
+        assert_eq!(
+            result.unwrap(),
+            DatagramSend::TooLarge,
+            "oversized datagram must be droppable (TooLarge), never a fatal Err"
+        );
+
+        // A datagram that fits the path limit is reported as Sent.
+        let small = bytes::Bytes::from(vec![0u8; 64]);
+        assert_eq!(cli_dc.send_datagram(small).unwrap(), DatagramSend::Sent);
+    }
+
+    /// Regression for the "send_datagram: datagram too large" link-death bug:
+    /// a Direct `send_batch` must report oversized packets as a DROP COUNT
+    /// (`Ok(dropped)`), never as `Err`. The VPN uplink pump treats `Err` as
+    /// link death and tears the whole tunnel down, so an oversized packet
+    /// leaking out as `Err` here is exactly the bug. Also proves a mixed batch
+    /// still delivers its in-limit packets (drop only the oversized ones).
+    #[cfg(feature = "vpn")]
+    #[cfg(feature = "udp")]
+    #[tokio::test]
+    async fn direct_send_batch_drops_oversized_without_error() {
+        use crate::vpn::link::make_direct;
+
+        let tuning = UdpDirectTuning::default();
+
+        let srv_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = srv_sock.local_addr().unwrap();
+        let srv_ep = server_endpoint(srv_sock, &tuning).unwrap();
+        let _srv = tokio::spawn(async move {
+            if let Some(inc) = srv_ep.accept().await {
+                let _ = inc.await;
+            }
+        });
+
+        let cli_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cli_ep = client_endpoint(cli_sock, &tuning).unwrap();
+        let conn = cli_ep.connect(srv_addr, "bore").unwrap().await.unwrap();
+        let dc = DirectConn {
+            conn,
+            endpoint: cli_ep,
+        };
+        let (mut sender, _recver) = make_direct(dc);
+
+        // 65 KB is always larger than any QUIC datagram limit.
+        let huge = bytes::Bytes::from(vec![0u8; 65_000]);
+        let small = bytes::Bytes::from(vec![0u8; 64]);
+
+        // Oversized packet → counted as 1 drop, NOT an Err.
+        assert_eq!(
+            sender
+                .send_batch(std::slice::from_ref(&huge))
+                .await
+                .expect("oversized packet must never be a fatal Err"),
+            1,
+        );
+        // In-limit packet → zero drops.
+        assert_eq!(
+            sender
+                .send_batch(std::slice::from_ref(&small))
+                .await
+                .unwrap(),
+            0,
+        );
+        // Mixed batch → only the oversized packet is dropped; the rest go out.
+        let mixed = [small.clone(), huge.clone(), small.clone()];
+        assert_eq!(
+            sender.send_batch(&mixed).await.unwrap(),
+            1,
+            "mixed batch must drop only the oversized packet",
         );
     }
 

@@ -466,11 +466,33 @@ bottleneck; revisit if benchmarks say otherwise). Default 1 = identical to the
 single-queue path.
 
 **Dynamic PMTU (direct path):** after the switch to direct, a monitor samples
-`max_datagram_size()` every 5 s; once the QUIC MTU discovery settles (3 equal
-samples, ≥16 bytes away from the current MTU, within [576, 9000]) it runs
-`ip link set <tun> mtu <new>` and logs `tun MTU adjusted to QUIC path MTU`.
-No revert needed — the TUN is destroyed at teardown, and the nft MSS clamp
-uses `rt mtu`, adapting on its own.
+`max_datagram_size()` every 5 s and runs `ip link set <tun> mtu <new>`, logging
+`tun MTU adjusted to QUIC path MTU`. Two rules:
+
+- **Shrink immediately** (`pmtu_shrink_now`): the first sample seen *below* the
+  current TUN MTU (≥16 bytes, within [576, 9000]) narrows the interface on a
+  single sample. Right after the switch the TUN is still at its configured MTU
+  (default 1350) while the QUIC path MTU is smaller (e.g. 1162), so every
+  full-size packet read from TUN is over the datagram limit. Narrowing at once
+  restores throughput in <1 s instead of waiting ~10 s for the stable decision.
+- **Grow only when settled** (`pmtu_decision`): raising the MTU requires 3 equal
+  samples, ≥16 bytes from the current MTU, within [576, 9000] (anti-flap).
+
+No revert needed — the TUN is destroyed at teardown, and the nft MSS clamp uses
+`rt mtu`, adapting on its own. A failed adjust *during* teardown (the TUN was
+already removed) is benign and logged at debug, not warn.
+
+**Oversized packets are dropped, never fatal:** while the TUN MTU runs ahead of
+the QUIC path MTU (the window above, before the shrink lands), packets that
+exceed `max_datagram_size()` come back as `DatagramSend::TooLarge` from
+`DirectConn::send_datagram`. The bridge counts them in `tx_drops` and keeps the
+link alive — `TooLarge` is a transient per-packet condition, **not** a link
+failure. Only genuine link death (`ConnectionLost`, datagrams disabled) returns
+`Err` and tears the bridge down for reconnect. (Regression: an earlier build
+matched the error by the substring `"TooLarge"`, but quinn's `Display` is
+`"datagram too large"`, so the check never fired and a single oversized packet
+killed the link the instant it switched to direct — surfacing as
+`Error: send_datagram: datagram too large`.)
 
 **Benchmarks:** `sudo scripts/vpn_bench.sh` produces the comparison table
 (relay 1c / relay 4c / direct / direct 4q × TCP / UDP / latency). Re-run and

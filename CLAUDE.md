@@ -109,6 +109,14 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   carrier kills the whole link cleanly (reconnect re-establishes), never silent degradation
 - `NetConfig` RAII: all routes/nft/ip_forward changes revert on exit (SIGINT, SIGTERM, panic handled; SIGKILL requires next-run stale reclaim)
 - TUN MTU default 1350: clamps QUIC datagram size; gateway MSS-clamp keeps forwarded TCP healthy
+- VPN direct path: a `TooLarge` datagram send is a per-packet DROP, never link death. The TUN MTU
+  runs ahead of the QUIC path MTU right after every direct switch, so full-size packets exceed
+  `max_datagram_size()` until the PMTU monitor narrows the TUN. `DirectConn::send_datagram` returns
+  the typed `DatagramSend::{Sent,TooLarge}` (NOT a stringly error — quinn's `Display` for
+  `SendDatagramError::TooLarge` is `"datagram too large"`, so substring-matching `"TooLarge"`
+  silently never fired and killed the link). `send_batch` returns the drop count; only genuine link
+  death returns `Err`. PMTU monitor shrinks immediately on one below-current sample
+  (`pmtu_shrink_now`, fast recovery), grows only on 3 stable samples (`pmtu_decision`, anti-flap)
 
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

@@ -239,7 +239,10 @@ kill $VPNPID2
 | V2-4.2 (C1) | `--tun-queues 4`: ping + iperf3 -P 4 | Netns (sudo) | `vpn_netns_test.sh` Test 13 | PASS (2026-06-11) |
 | V2-6.1 (F6) | Full SIGKILL stale reclaim (16.6.8): TUN **+ nft + routes** survive `kill -9`, next start reclaims all, no EEXIST, ping OK | Netns (sudo) | `vpn_netns_test.sh` Test 14 | PASS (2026-06-11) |
 | V2-4.3 (C2) | PMTU decision truth table (stability, delta, clamp) | Automated | `vpn::tests::pmtu_decision_cases` | PASS |
+| V2-4.3 (C2) | Urgent one-sample shrink (fast recovery after direct switch; churn/floor/clamp guards) | Automated | `vpn::tests::pmtu_shrink_now_cases` | PASS (2026-06-11) |
 | V2-4.3 (C2) | "tun MTU adjusted" on a real WAN (PMTU static in netns) | Manual | Procedure M-3 | PENDING |
+| V2-BUGFIX | Oversized direct datagram is droppable (`DatagramSend::TooLarge`), never a fatal `Err` (link-death regression) | Automated | `holepunch::tests::datagram_too_large_is_droppable_not_fatal` | PASS (2026-06-11) |
+| V2-BUGFIX | Direct `send_batch` reports oversized packets as a drop count, sends the rest of a mixed batch | Automated | `holepunch::tests::direct_send_batch_drops_oversized_without_error` | PASS (2026-06-11) |
 | V2-4.4 | Benchmark table (relay 1c/4c, direct, direct 4q) | Bench (sudo) | `scripts/vpn_bench.sh` | PASS (2026-06-11; table in VPN.md). direct≫relay ✅; relay-4c<relay-1c on ~0.4 ms netns (expected, carriers target high-RTT WAN) — no tuning change |
 | V2-5.2/5.3 | macOS/Windows argv builders snapshots (portable) | Automated | `vpn::hostcfg_cmd::tests::cmd_macos_builders_snapshot`, `cmd_windows_builders_snapshot` | PASS |
 | V2-5.5 | CI cross check: windows-msvc, apple-darwin, android (cargo-ndk) | CI | `.github/workflows/ci.yml` job `vpn-cross-build` | PENDING (next CI run) |

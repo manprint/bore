@@ -639,12 +639,36 @@ fn pmtu_decision(current_mtu: u16, samples: &[usize]) -> Option<u16> {
     Some(candidate)
 }
 
+/// Urgent one-sample shrink (C2 fast path).
+///
+/// The instant the QUIC path-MTU is observed BELOW the current TUN MTU we are
+/// dropping full-size packets *right now* — every read from TUN at the old MTU
+/// is a `TooLarge` datagram. Waiting for the stable 3-sample [`pmtu_decision`]
+/// would mean up to ~10 s of lost throughput after every switch to the direct
+/// path. Narrowing is always safe (it never over-shoots the path), so we do it
+/// on a single sample. Growing still goes through the anti-flap 3-sample path.
+///
+/// Returns `Some(new_mtu)` only when the sample is at least 16 bytes below the
+/// current MTU (churn guard) and within the valid floor `[576, 9000]`.
+fn pmtu_shrink_now(current_mtu: u16, sample: usize) -> Option<u16> {
+    if sample < 576 {
+        return None;
+    }
+    let candidate = sample.min(9000) as u16;
+    if current_mtu.saturating_sub(candidate) >= 16 {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 /// Background task: track the direct path's QUIC datagram limit and follow it
 /// with `ip link set <tun> mtu` (C2). Started only after the switch to direct;
 /// exits when the QUIC connection closes (link teardown or path death). No MTU
 /// revert is needed: the TUN is destroyed at teardown (DEC-5), and the nft MSS
 /// clamp uses `rt mtu`, adapting on its own.
 async fn pmtu_monitor(conn: crate::holepunch::DirectConn, tun_name: String, initial_mtu: u16) {
+    use futures_util::FutureExt;
     let runner = hostcfg::RealRunner;
     let mut current = initial_mtu;
     let mut samples: Vec<usize> = Vec::new();
@@ -663,7 +687,11 @@ async fn pmtu_monitor(conn: crate::holepunch::DirectConn, tun_name: String, init
         if samples.len() > 3 {
             samples.remove(0);
         }
-        if let Some(new_mtu) = pmtu_decision(current, &samples) {
+        // Shrink immediately on one below-current sample (fast recovery after a
+        // direct switch); otherwise use the stable 3-sample growth/shrink path.
+        let decision =
+            pmtu_shrink_now(current, max_datagram).or_else(|| pmtu_decision(current, &samples));
+        if let Some(new_mtu) = decision {
             let argv = hostcfg_cmd::cmd_link_set_mtu(&tun_name, new_mtu);
             match crate::vpn::hostcfg::CommandRunner::run(&runner, &argv).await {
                 Ok(_) => {
@@ -675,7 +703,15 @@ async fn pmtu_monitor(conn: crate::holepunch::DirectConn, tun_name: String, init
                     current = new_mtu;
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, new_mtu, "failed to adjust tun MTU; keeping current");
+                    // A failed adjust during teardown (the TUN was destroyed
+                    // between the decision and the `ip link` call) is benign:
+                    // the device is gone anyway. Demote to debug so it does not
+                    // spam warnings; keep WARN for genuine failures.
+                    if conn.closed().now_or_never().is_some() {
+                        tracing::debug!(error = %e, new_mtu, "tun MTU adjust skipped; link closing");
+                    } else {
+                        tracing::warn!(error = %e, new_mtu, "failed to adjust tun MTU; keeping current");
+                    }
                 }
             }
         }
@@ -2737,18 +2773,25 @@ pub mod link {
 
     impl LinkSender {
         /// Send a batch of IP packets. For Direct: QUIC datagrams. For Relay: AEAD frames.
-        pub async fn send_batch(&mut self, pkts: &[Bytes]) -> Result<()> {
+        ///
+        /// Returns the number of packets DROPPED because they exceeded the
+        /// current QUIC path-MTU (`DatagramSend::TooLarge`). Such drops are a
+        /// transient per-packet condition — never a link failure — so they must
+        /// not abort the rest of the batch nor tear the link down; the caller
+        /// counts them and continues. `Err` is reserved for genuine link death.
+        pub async fn send_batch(&mut self, pkts: &[Bytes]) -> Result<usize> {
             match self {
                 LinkSender::Direct(conn) => {
+                    let mut dropped = 0usize;
                     for pkt in pkts {
-                        if let Err(e) = conn.send_datagram(pkt.clone()) {
-                            // Skip TooLarge (MTU discovery transient); recount elsewhere.
-                            if !e.to_string().contains("TooLarge") {
-                                return Err(e);
-                            }
+                        // Skip oversized packets (path MTU < TUN MTU window);
+                        // a real send error propagates and tears down the link.
+                        match conn.send_datagram(pkt.clone())? {
+                            crate::holepunch::DatagramSend::Sent => {}
+                            crate::holepunch::DatagramSend::TooLarge => dropped += 1,
                         }
                     }
-                    Ok(())
+                    Ok(dropped)
                 }
                 LinkSender::Relay {
                     txs,
@@ -2769,7 +2812,9 @@ pub mod link {
                             anyhow::anyhow!("relay writer exited (write error on relay stream)")
                         })?;
                     }
-                    Ok(())
+                    // Relay frames are length-prefixed and never size-limited
+                    // like QUIC datagrams: nothing is ever dropped here.
+                    Ok(0)
                 }
             }
         }
@@ -3206,18 +3251,14 @@ pub mod bridge {
             }
             let pkt = Bytes::copy_from_slice(&buf[..n]);
             let pkts = [pkt];
-            match sender.send_batch(&pkts).await {
-                Ok(_) => {
-                    counters.tx_pkts.fetch_add(1, Ordering::Relaxed);
-                    counters.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    if e.to_string().contains("TooLarge") {
-                        counters.tx_drops.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        return Err(e);
-                    }
-                }
+            // `dropped` counts oversized (TooLarge) packets — transient, not
+            // fatal. Only a genuine link error returns Err and stops the pump.
+            let dropped = sender.send_batch(&pkts).await?;
+            if dropped == 0 {
+                counters.tx_pkts.fetch_add(1, Ordering::Relaxed);
+                counters.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+            } else {
+                counters.tx_drops.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -3247,19 +3288,17 @@ pub mod bridge {
                 .map(|i| Bytes::copy_from_slice(&bufs[i][..sizes[i]]))
                 .collect();
             let total_bytes: u64 = pkts.iter().map(|p| p.len() as u64).sum();
-            match sender.send_batch(&pkts).await {
-                Ok(_) => {
-                    counters.tx_pkts.fetch_add(num as u64, Ordering::Relaxed);
-                    counters.tx_bytes.fetch_add(total_bytes, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    if e.to_string().contains("TooLarge") {
-                        counters.tx_drops.fetch_add(num as u64, Ordering::Relaxed);
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
+            // `dropped` counts oversized (TooLarge) packets — transient, not
+            // fatal. Only a genuine link error returns Err and stops the pump.
+            let dropped = sender.send_batch(&pkts).await?;
+            let sent = num - dropped;
+            counters.tx_pkts.fetch_add(sent as u64, Ordering::Relaxed);
+            // tx_bytes counts the whole batch; during the brief MTU-discovery
+            // drop window this slightly over-counts, which is immaterial.
+            counters.tx_bytes.fetch_add(total_bytes, Ordering::Relaxed);
+            counters
+                .tx_drops
+                .fetch_add(dropped as u64, Ordering::Relaxed);
         }
     }
 
@@ -3483,6 +3522,25 @@ mod tests {
         assert_eq!(pmtu_decision(1350, &[65000, 65000, 65000]), Some(9000));
         // Only the LAST 3 samples matter.
         assert_eq!(pmtu_decision(1350, &[100, 1450, 1450, 1450]), Some(1450));
+    }
+
+    /// §4.3 — urgent one-sample shrink (fast recovery after a direct switch).
+    #[test]
+    fn pmtu_shrink_now_cases() {
+        // Sample well below current → shrink immediately on a single sample.
+        // This is the post-switch case: TUN at 1350, path MTU 1162.
+        assert_eq!(pmtu_shrink_now(1350, 1162), Some(1162));
+        // Sample at/above current → never shrink (growth needs pmtu_decision).
+        assert_eq!(pmtu_shrink_now(1162, 1350), None);
+        assert_eq!(pmtu_shrink_now(1350, 1350), None);
+        // Within the 16-byte churn guard → no shrink.
+        assert_eq!(pmtu_shrink_now(1350, 1340), None);
+        // Exactly 16 below → shrink (boundary).
+        assert_eq!(pmtu_shrink_now(1350, 1334), Some(1334));
+        // Below the 576 floor → rejected (bogus reading, keep current).
+        assert_eq!(pmtu_shrink_now(1350, 500), None);
+        // A huge sample is clamped to 9000; with a larger current it shrinks.
+        assert_eq!(pmtu_shrink_now(9100, 65000), Some(9000));
     }
 
     /// §2.1 — fatal-vs-retryable classification truth table.

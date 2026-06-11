@@ -700,6 +700,15 @@ pub enum ClientMessage {
         /// Optional operator note.
         notes: Option<String>,
     },
+
+    /// Report the active VPN data-plane path (`"relay"` or `"direct"`) for the
+    /// admin page. Sent only when the server advertised support via
+    /// [`ServerMessage::VpnReady`]'s `admin_v2` flag (an old server would fail
+    /// to deserialize an unknown enum variant).
+    VpnPathReport {
+        /// `"relay"` or `"direct"`.
+        path: String,
+    },
 }
 
 /// A message from the server on the control substream.
@@ -826,6 +835,11 @@ pub enum ServerMessage {
         /// Direct-UDP transport tuning.
         #[serde(default)]
         tuning: UdpDirectTuning,
+        /// Whether this server accepts [`ClientMessage::VpnPathReport`]
+        /// (admin page v2). `#[serde(default)]` keeps old peers compatible:
+        /// old server → field absent → false → client never sends the report.
+        #[serde(default)]
+        admin_v2: bool,
     },
 
     /// VPN pairing failed (duplicate id, pool exhausted, overlap, etc.).
@@ -942,6 +956,9 @@ impl ControlFrameSummary for ClientMessage {
                     if notes.is_some() { "present" } else { "none" },
                 )
             }
+            ClientMessage::VpnPathReport { path } => {
+                format!("VpnPathReport {{ path={} }}", path)
+            }
         }
     }
 }
@@ -1028,15 +1045,17 @@ impl ControlFrameSummary for ServerMessage {
                 peer_advertised,
                 session_nonce,
                 tuning,
+                admin_v2,
             } => {
                 format!(
-                    "VpnReady {{ assigned={}, prefix={}, peer_overlay={}, peer_advertised={:?}, session_nonce={}, tuning={{ {} }} }}",
+                    "VpnReady {{ assigned={}, prefix={}, peer_overlay={}, peer_advertised={:?}, session_nonce={}, tuning={{ {} }}, admin_v2={} }}",
                     assigned,
                     prefix,
                     peer_overlay,
                     peer_advertised,
                     hex::encode(session_nonce),
                     tuning.control_frame_summary(),
+                    admin_v2,
                 )
             }
             ServerMessage::VpnError(msg) => {
@@ -1388,6 +1407,7 @@ fn serde_roundtrip_vpn_messages() {
         peer_advertised: vec![],
         session_nonce: [0u8; 16],
         tuning: UdpDirectTuning::default(),
+        admin_v2: true,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let back: ServerMessage = serde_json::from_str(&json).unwrap();

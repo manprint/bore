@@ -202,12 +202,13 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
 
     // Wait for VpnReady
     let msg = ctrl.recv::<crate::shared::ServerMessage>().await?;
-    let (assigned, prefix, peer_advertised, session_nonce) = match msg {
+    let (assigned, prefix, peer_advertised, session_nonce, admin_v2) = match msg {
         Some(crate::shared::ServerMessage::VpnReady {
             assigned,
             prefix,
             peer_advertised,
             session_nonce,
+            admin_v2,
             ..
         }) => {
             info!(
@@ -217,7 +218,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
                 iface = %args.tun_name,
                 "vpn link paired"
             );
-            (assigned, prefix, peer_advertised, session_nonce)
+            (assigned, prefix, peer_advertised, session_nonce, admin_v2)
         }
         Some(crate::shared::ServerMessage::VpnError(e)) => {
             error!(link_id = %args.id, error = %e, "vpn server error");
@@ -281,6 +282,15 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
     // Control-stream actor (single owner of `ctrl` from here on).
     let (out_tx, event_rx, ctrl_task) = spawn_ctrl_actor(ctrl);
 
+    // Admin v2 servers track the active path; report the initial relay state.
+    if admin_v2 {
+        let _ = out_tx
+            .send(crate::shared::ClientMessage::VpnPathReport {
+                path: "relay".into(),
+            })
+            .await;
+    }
+
     // Direct-path upgrade attempt (skipped entirely with --relay-only).
     let (upgrade_tx, upgrade_rx) = tokio::sync::mpsc::channel(1);
     let direct_task = if args.relay_only {
@@ -299,6 +309,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
                 try_port_prediction: args.try_port_prediction,
                 nat_udp_preferred_port: args.nat_udp_preferred_port,
             },
+            admin_v2,
         );
         Some(tokio::spawn(direct_upgrade_task(
             ctx,
@@ -419,10 +430,17 @@ struct DirectUpgradeCtx {
     upnp: bool,
     try_port_prediction: bool,
     nat_udp_preferred_port: u16,
+    /// Server accepts `VpnPathReport` (admin page v2).
+    admin_v2: bool,
 }
 
 impl DirectUpgradeCtx {
-    fn from_link_args(side: DirectSide, to: &str, args: &CommonDirectArgs<'_>) -> Self {
+    fn from_link_args(
+        side: DirectSide,
+        to: &str,
+        args: &CommonDirectArgs<'_>,
+        admin_v2: bool,
+    ) -> Self {
         let endpoint = crate::transport::Endpoint::parse(to);
         DirectUpgradeCtx {
             side,
@@ -434,6 +452,7 @@ impl DirectUpgradeCtx {
             upnp: args.upnp,
             try_port_prediction: args.try_port_prediction,
             nat_udp_preferred_port: args.nat_udp_preferred_port,
+            admin_v2,
         }
     }
 }
@@ -546,6 +565,13 @@ async fn try_direct_upgrade(
         .await
         .map_err(|_| anyhow!("bridge closed before the direct upgrade"))?;
     info!(link_id = %ctx.link_id, path = "direct", "vpn path upgraded to direct QUIC");
+    if ctx.admin_v2 {
+        let _ = out_tx
+            .send(crate::shared::ClientMessage::VpnPathReport {
+                path: "direct".into(),
+            })
+            .await;
+    }
     Ok(())
 }
 
@@ -621,12 +647,13 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
 
     // Wait for VpnReady
     let msg = ctrl.recv::<crate::shared::ServerMessage>().await?;
-    let (assigned, prefix, peer_advertised, session_nonce) = match msg {
+    let (assigned, prefix, peer_advertised, session_nonce, admin_v2) = match msg {
         Some(crate::shared::ServerMessage::VpnReady {
             assigned,
             prefix,
             peer_advertised,
             session_nonce,
+            admin_v2,
             ..
         }) => {
             info!(
@@ -636,7 +663,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
                 iface = %args.tun_name,
                 "vpn link paired"
             );
-            (assigned, prefix, peer_advertised, session_nonce)
+            (assigned, prefix, peer_advertised, session_nonce, admin_v2)
         }
         Some(crate::shared::ServerMessage::VpnError(e)) => {
             error!(link_id = %args.id, error = %e, "vpn server error");
@@ -700,6 +727,15 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
     // Control-stream actor (single owner of `ctrl` from here on).
     let (out_tx, event_rx, ctrl_task) = spawn_ctrl_actor(ctrl);
 
+    // Admin v2 servers track the active path; report the initial relay state.
+    if admin_v2 {
+        let _ = out_tx
+            .send(crate::shared::ClientMessage::VpnPathReport {
+                path: "relay".into(),
+            })
+            .await;
+    }
+
     // Direct-path upgrade attempt (skipped entirely with --relay-only).
     let (upgrade_tx, upgrade_rx) = tokio::sync::mpsc::channel(1);
     let direct_task = if args.relay_only {
@@ -718,6 +754,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
                 try_port_prediction: args.try_port_prediction,
                 nat_udp_preferred_port: args.nat_udp_preferred_port,
             },
+            admin_v2,
         );
         Some(tokio::spawn(direct_upgrade_task(
             ctx,

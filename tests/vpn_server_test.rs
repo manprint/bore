@@ -901,3 +901,95 @@ async fn vpn_broker_timeout_sends_unavailable() {
     c_ctrl.send(offer("203.0.113.2:2000")).await.unwrap();
     recv_until_unavailable(&mut c_ctrl, "connector").await;
 }
+
+// ─── §3.1 Admin page VPN entries (F5) ────────────────────────────────────────
+
+const ADMIN_TOKEN: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// Issue one admin HTTP GET on the control port and return the response body.
+async fn admin_get_data() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = TcpStream::connect(("127.0.0.1", CONTROL_PORT))
+        .await
+        .unwrap();
+    let req = format!(
+        "GET /admin/status/data HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    s.flush().await.unwrap();
+    let mut buf = Vec::new();
+    time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// F5 — paired VPN links appear on the admin page with dedicated roles, the
+/// assigned overlay, path=relay initially, and flip to direct on VpnPathReport.
+#[tokio::test]
+async fn vpn_admin_entries_and_path_report() {
+    let _guard = SERIAL_GUARD.lock().await;
+    wait_for_control_port(false).await;
+    let pool: Ipv4Net = "10.94.0.0/16".parse().unwrap();
+    let mut server = bore_cli::server::Server::new(1024..=65535, None);
+    server.set_vpn(true);
+    server.set_vpn_pool(pool).unwrap();
+    server.set_vpn_max_links(10);
+    server.set_admin_token(Some(ADMIN_TOKEN.into()));
+    tokio::spawn(server.listen());
+    wait_for_control_port(true).await;
+
+    let mut l_ctrl = vpn_ctrl_connect().await;
+    l_ctrl.send(pool_hello_vpn("admin1")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl.send(pool_connect_vpn("admin1")).await.unwrap();
+    let c_ready = c_ctrl.recv::<ServerMessage>().await.unwrap();
+    // The server must advertise admin v2 support.
+    match &c_ready {
+        Some(ServerMessage::VpnReady { admin_v2, .. }) => {
+            assert!(*admin_v2, "server must set admin_v2 in VpnReady")
+        }
+        other => panic!("expected VpnReady, got {other:?}"),
+    }
+    let _ = l_ctrl.recv::<ServerMessage>().await.unwrap(); // listener VpnReady
+    time::sleep(Duration::from_millis(100)).await;
+
+    let data = admin_get_data().await;
+    assert!(
+        data.contains("vpn-listener"),
+        "missing vpn-listener role: {data}"
+    );
+    assert!(
+        data.contains("vpn-connector"),
+        "missing vpn-connector role: {data}"
+    );
+    assert!(
+        data.contains("10.94.0.1/30") && data.contains("10.94.0.2/30"),
+        "missing overlay addresses: {data}"
+    );
+    assert!(
+        data.contains("\"vpn_direct\":false"),
+        "links must start as relay: {data}"
+    );
+    assert!(
+        !data.contains("\"vpn_direct\":true"),
+        "no link reported direct yet: {data}"
+    );
+
+    // The connector reports the direct path; the snapshot must reflect it.
+    c_ctrl
+        .send(ClientMessage::VpnPathReport {
+            path: "direct".into(),
+        })
+        .await
+        .unwrap();
+    time::sleep(Duration::from_millis(300)).await;
+    let data = admin_get_data().await;
+    assert!(
+        data.contains("\"vpn_direct\":true"),
+        "connector entry must show direct after VpnPathReport: {data}"
+    );
+}

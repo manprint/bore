@@ -858,6 +858,10 @@ impl Server {
                 warn!("unexpected authenticate");
                 Ok(())
             }
+            Some(ClientMessage::VpnPathReport { .. }) => {
+                warn!("unexpected vpn path report as first message");
+                Ok(())
+            }
             Some(ClientMessage::UdpCandidates(_))
             | Some(ClientMessage::UdpCandidateOffer(_))
             | Some(ClientMessage::UdpStunHintRequest)

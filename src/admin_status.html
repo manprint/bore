@@ -145,6 +145,24 @@
         </table>
       </div>
     </div>
+
+    <div class="section">
+      <h2>VPN links <span class="count" id="vpnCount">0</span></h2>
+      <div class="card">
+        <table>
+          <colgroup>
+            <col style="width:11%"><col style="width:14%"><col style="width:17%">
+            <col style="width:13%"><col style="width:9%"><col style="width:11%">
+            <col style="width:11%"><col style="width:7%"><col style="width:11%">
+          </colgroup>
+          <thead><tr>
+            <th>Role</th><th>ID</th><th>Client</th><th>Overlay</th><th>Path</th>
+            <th>Relay TX</th><th>Relay RX</th><th>Conns</th><th>Uptime</th>
+          </tr></thead>
+          <tbody id="vpnRows"></tbody>
+        </table>
+      </div>
+    </div>
   </main>
 </div>
 
@@ -203,12 +221,17 @@ function render(data) {
 
   const tunnels = data.tunnels || [];
   const pub = tunnels.filter((t) => t.role === "public");
-  const sec = tunnels.filter((t) => t.role !== "public");
+  const vpn = tunnels.filter((t) => t.role === "vpn-listener" || t.role === "vpn-connector");
+  const sec = tunnels.filter((t) => t.role !== "public"
+    && t.role !== "vpn-listener" && t.role !== "vpn-connector");
   sec.sort((a, b) => (a.secret_id || "").localeCompare(b.secret_id || "")
+    || a.role.localeCompare(b.role));
+  vpn.sort((a, b) => (a.secret_id || "").localeCompare(b.secret_id || "")
     || a.role.localeCompare(b.role));
 
   $("pubCount").textContent = pub.length;
   $("secCount").textContent = sec.length;
+  $("vpnCount").textContent = vpn.length;
 
   $("pubRows").innerHTML = pub.length ? pub.map((t) =>
     "<tr>" +
@@ -242,8 +265,40 @@ function render(data) {
   }).join("")
     : '<tr><td class="empty" colspan="8">No secret tunnels.</td></tr>';
 
+  $("vpnRows").innerHTML = vpn.length ? vpn.map((t) => {
+    const role = t.role === "vpn-listener"
+      ? '<span class="badge b-role">listener</span>'
+      : '<span class="badge b-off">connector</span>';
+    const path = t.vpn_direct
+      ? '<span class="badge b-on">direct</span>'
+      : '<span class="badge b-off">relay</span>';
+    // On the direct path the server never sees traffic: bytes are n/a (p2p).
+    const tx = t.vpn_direct ? "n/a (p2p)" : fmtBytes(t.relay_tx_bytes);
+    const rx = t.vpn_direct ? "n/a (p2p)" : fmtBytes(t.relay_rx_bytes);
+    return "<tr>" +
+      "<td>" + role + "</td>" +
+      '<td class="mono" title="' + esc(t.secret_id) + '">' + esc(t.secret_id) + "</td>" +
+      cell(t.peer) +
+      '<td class="mono">' + esc(t.overlay || "—") + "</td>" +
+      "<td>" + path + "</td>" +
+      '<td class="mono">' + esc(tx) + "</td>" +
+      '<td class="mono">' + esc(rx) + "</td>" +
+      '<td class="mono">' + esc(t.active) + "</td>" +
+      "<td>" + esc(fmtUptime(t.uptime_secs)) + "</td>" +
+      "</tr>";
+  }).join("")
+    : '<tr><td class="empty" colspan="9">No VPN links.</td></tr>';
+
   $("updated").innerHTML = '<span class="dot"></span>updated ' +
     new Date().toLocaleTimeString();
+}
+
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + " GB";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + " MB";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + " kB";
+  return n + " B";
 }
 
 async function refresh() {

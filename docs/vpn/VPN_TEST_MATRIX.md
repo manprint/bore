@@ -230,6 +230,7 @@ kill $VPNPID2
 | V2-2.2 (A2) | Reconnect loop: retries retryable, stops on fatal, once with auto=false | Automated | `vpn::tests::run_with_reconnect_counts` | PASS |
 | V2-2.3 (F1/F3) | Server kill -9 → both clients reconnect, re-pair, ping OK, no EEXIST/dup routes | Netns (sudo) | `vpn_netns_test.sh` Test 10 | PENDING (needs sudo run) |
 | V2-2.3 (F1/F3) | Fatal error (overlap) with `--auto-reconnect` exits non-zero, no loop | Netns (sudo) | `vpn_netns_test.sh` Test 11 | PENDING (needs sudo run) |
+| V2-3.1 (D2/F5) | Paired links show VPN roles + overlay on admin page; `VpnPathReport` flips path to direct | Automated | `vpn_server_test::vpn_admin_entries_and_path_report` | PASS |
 
 ---
 

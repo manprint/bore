@@ -28,6 +28,10 @@ pub enum Role {
     SecretConsumer,
     /// A vhost subdomain reverse-proxy provider (`bore vhost`).
     Vhost,
+    /// A VPN link listener (`bore vpn listen`).
+    VpnListener,
+    /// A VPN link connector (`bore vpn connect`).
+    VpnConnector,
 }
 
 /// A live tunnel registration. One per accepted control connection.
@@ -61,6 +65,14 @@ pub struct Entry {
     /// server can observe them (public tunnels and relayed consumers; a direct
     /// UDP consumer's data bypasses the server, so its count stays 0).
     pub active: Arc<AtomicUsize>,
+    /// VPN roles: overlay address (`addr/prefix`), set at/after pairing.
+    pub overlay: std::sync::Mutex<Option<String>>,
+    /// VPN roles: whether the link reported the direct QUIC path as active.
+    pub vpn_direct: AtomicBool,
+    /// VPN roles: relay ciphertext bytes sent toward this client.
+    pub relay_tx_bytes: Arc<AtomicU64>,
+    /// VPN roles: relay ciphertext bytes received from this client.
+    pub relay_rx_bytes: Arc<AtomicU64>,
 }
 
 /// Descriptive fields used to create an [`Entry`]; the atomics are initialized by
@@ -113,6 +125,14 @@ pub struct EntryView {
     pub uptime_secs: u64,
     /// See [`Entry::active`].
     pub active: usize,
+    /// See [`Entry::overlay`].
+    pub overlay: Option<String>,
+    /// See [`Entry::vpn_direct`].
+    pub vpn_direct: bool,
+    /// See [`Entry::relay_tx_bytes`].
+    pub relay_tx_bytes: u64,
+    /// See [`Entry::relay_rx_bytes`].
+    pub relay_rx_bytes: u64,
 }
 
 /// Shared, cloneable handle to the live tunnel registry.
@@ -154,6 +174,10 @@ impl AdminRegistry {
             since: Instant::now(),
             udp: AtomicBool::new(new.udp),
             active: Arc::new(AtomicUsize::new(0)),
+            overlay: std::sync::Mutex::new(None),
+            vpn_direct: AtomicBool::new(false),
+            relay_tx_bytes: Arc::new(AtomicU64::new(0)),
+            relay_rx_bytes: Arc::new(AtomicU64::new(0)),
         });
         self.inner.entries.insert(id, Arc::clone(&entry));
         Registration {
@@ -185,6 +209,14 @@ impl AdminRegistry {
                     udp: entry.udp.load(Ordering::Relaxed),
                     uptime_secs: entry.since.elapsed().as_secs(),
                     active: entry.active.load(Ordering::Relaxed),
+                    overlay: entry
+                        .overlay
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone(),
+                    vpn_direct: entry.vpn_direct.load(Ordering::Relaxed),
+                    relay_tx_bytes: entry.relay_tx_bytes.load(Ordering::Relaxed),
+                    relay_rx_bytes: entry.relay_rx_bytes.load(Ordering::Relaxed),
                 }
             })
             .collect();
@@ -223,6 +255,24 @@ impl Registration {
     /// when a consumer later offers UDP candidates).
     pub fn mark_udp(&self) {
         self.entry.udp.store(true, Ordering::Relaxed);
+    }
+
+    /// Set the VPN overlay address (`addr/prefix`) once pairing assigns it.
+    pub fn set_overlay(&self, overlay: String) {
+        *self.entry.overlay.lock().unwrap_or_else(|p| p.into_inner()) = Some(overlay);
+    }
+
+    /// Record the VPN data-plane path reported by the client.
+    pub fn set_vpn_direct(&self, direct: bool) {
+        self.entry.vpn_direct.store(direct, Ordering::Relaxed);
+    }
+
+    /// Shared handles to the relay byte counters `(tx_toward_client, rx_from_client)`.
+    pub fn relay_bytes(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (
+            Arc::clone(&self.entry.relay_tx_bytes),
+            Arc::clone(&self.entry.relay_rx_bytes),
+        )
     }
 }
 

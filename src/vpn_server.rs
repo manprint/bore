@@ -323,9 +323,10 @@ pub async fn serve_vpn_listener(
         nonce: None,
     };
 
-    // Admin entry.
-    let _admin_reg = admin.register(NewEntry {
-        role: Role::SecretProvider, // reuse role for now; "vpn listener"
+    // Admin entry. Registered before pairing so a waiting listener shows up on
+    // the panel; the overlay is filled in via `set_overlay` once assigned.
+    let admin_reg = admin.register(NewEntry {
+        role: Role::VpnListener,
         peer,
         secret_id: Some(format!("vpn:{id}")),
         public_port: None,
@@ -356,7 +357,13 @@ pub async fn serve_vpn_listener(
         }
     };
 
-    // Send VpnReady to the listener.
+    // Record the assigned overlay on the admin entry, then deliver VpnReady.
+    if let ServerMessage::VpnReady {
+        assigned, prefix, ..
+    } = &pair_msg.listener_ready
+    {
+        admin_reg.set_overlay(format!("{assigned}/{prefix}"));
+    }
     control.send(pair_msg.listener_ready).await?;
 
     // Register for UDP direct path (so connector can get our candidates).
@@ -417,6 +424,9 @@ pub async fn serve_vpn_listener(
                         if let Some(mut entry) = udp_providers.get_mut(&udp_id) {
                             entry.candidates = addrs;
                         }
+                    }
+                    Ok(Some(ClientMessage::VpnPathReport { path })) => {
+                        admin_reg.set_vpn_direct(path == "direct");
                     }
                     Ok(None) | Err(_) => {
                         info!(%id, "vpn listener disconnected");
@@ -583,6 +593,7 @@ pub async fn serve_vpn_connector(
         peer_advertised: advertised.clone(),
         session_nonce: nonce,
         tuning: udp_tuning,
+        admin_v2: true,
     };
 
     let connector_ready = ServerMessage::VpnReady {
@@ -592,6 +603,7 @@ pub async fn serve_vpn_connector(
         peer_advertised: listener_advertised.clone(),
         session_nonce: nonce,
         tuning: udp_tuning,
+        admin_v2: true,
     };
 
     // Send VpnReady to connector
@@ -609,8 +621,8 @@ pub async fn serve_vpn_connector(
     }
 
     // Admin entry
-    let _admin_reg = admin.register(NewEntry {
-        role: Role::SecretConsumer,
+    let admin_reg = admin.register(NewEntry {
+        role: Role::VpnConnector,
         peer,
         secret_id: Some(format!("vpn:{id}")),
         public_port: None,
@@ -620,9 +632,14 @@ pub async fn serve_vpn_connector(
         force_https: false,
         udp: false,
     });
+    admin_reg.set_overlay(format!("{connector_overlay}/30"));
 
-    // Set up relay: accept substreams from connector, forward to listener
+    // Set up relay: accept substreams from connector, forward to listener.
+    // Each substream counts toward the entry's live connections and its
+    // ciphertext byte totals (the server only ever sees AEAD ciphertext).
     let id_clone = id.clone();
+    let active_counter = admin_reg.active();
+    let (relay_tx, relay_rx) = admin_reg.relay_bytes();
     let acceptor_handle = tokio::spawn(async move {
         while let Some(connector_stream) = acceptor.accept().await {
             let permit = match Arc::clone(&conn_permits).try_acquire_owned() {
@@ -631,9 +648,16 @@ pub async fn serve_vpn_connector(
             };
             let listener_opener = listener_opener.clone();
             let id = id_clone.clone();
+            let guard = crate::admin::ActiveGuard::new(Arc::clone(&active_counter));
+            let counted = CountingStream {
+                inner: connector_stream,
+                rx: Arc::clone(&relay_rx),
+                tx: Arc::clone(&relay_tx),
+            };
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(e) = vpn_relay(connector_stream, listener_opener, &id).await {
+                let _guard = guard;
+                if let Err(e) = vpn_relay(counted, listener_opener, &id).await {
                     tracing::trace!(%e, %id, "vpn relay closed");
                 }
             });
@@ -725,6 +749,9 @@ pub async fn serve_vpn_connector(
                         });
                         offer_deadline.get_or_insert_with(|| tokio::time::Instant::now() + punch_timeout);
                     }
+                    Ok(Some(ClientMessage::VpnPathReport { path })) => {
+                        admin_reg.set_vpn_direct(path == "direct");
+                    }
                     Ok(None) | Err(_) => break,
                     _ => {}
                 }
@@ -737,12 +764,65 @@ pub async fn serve_vpn_connector(
     Ok(())
 }
 
+/// Byte-counting wrapper around a relay substream: reads from the inner stream
+/// bump `rx`, writes bump `tx`. The counters power the admin page's relay
+/// traffic columns (ciphertext totals — the server never sees plaintext).
+struct CountingStream<S> {
+    inner: S,
+    rx: Arc<std::sync::atomic::AtomicU64>,
+    tx: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountingStream<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let res = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &res {
+            let n = (buf.filled().len() - before) as u64;
+            self.rx.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountingStream<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let res = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &res {
+            self.tx
+                .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Relay a connector substream to the listener.
-async fn vpn_relay(
-    mut connector: mux::Stream,
-    listener_opener: mux::Opener,
-    _id: &str,
-) -> Result<()> {
+async fn vpn_relay<S>(mut connector: S, listener_opener: mux::Opener, _id: &str) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // Consume the connector's readiness marker
     let mut marker = [0u8; 1];
     connector.read_exact(&mut marker).await?;

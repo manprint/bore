@@ -345,6 +345,25 @@ environments where outbound UDP is undesirable.
 
 ---
 
+## Admin Page
+
+With `bore server --admin-token <T>`, the status page at `/admin/status` shows a
+dedicated **VPN links** section: role (`listener`/`connector`), link id
+(`vpn:<id>`), client address, assigned overlay (`addr/30`), active path
+(`relay`/`direct`), relay traffic counters, live relay substream count, and
+uptime.
+
+- The **path** column is fed by `VpnPathReport` messages: clients report
+  `relay` right after pairing and `direct` after a successful upgrade. The
+  server advertises support via the `admin_v2` flag in `VpnReady`; clients
+  never send the report to an older server (whose JSON decoder would reject the
+  unknown variant).
+- The **relay TX/RX** counters measure AEAD **ciphertext** spliced by the
+  server (it never sees plaintext, I-3). On the direct path the server carries
+  no traffic, so the page shows `n/a (p2p)` — correct and honest.
+
+---
+
 ## Diagnosing Issues
 
 ### Link pairs but no ping

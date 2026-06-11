@@ -10,7 +10,6 @@ use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(feature = "vpn")]
-use tokio::sync::Mutex;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tokio_rustls::TlsAcceptor;
@@ -145,7 +144,7 @@ pub struct Server {
 
     /// The overlay address pool for VPN (from --vpn-pool).
     #[cfg(feature = "vpn")]
-    vpn_pool: Option<Arc<Mutex<crate::vpn_server::VpnPool>>>,
+    vpn_pool: Option<crate::vpn_server::VpnPoolHandle>,
 
     /// Registry of live VPN providers, keyed by VPN link ID.
     #[cfg(feature = "vpn")]
@@ -346,7 +345,7 @@ impl Server {
     #[cfg(feature = "vpn")]
     pub fn set_vpn_pool(&mut self, pool: crate::shared::Ipv4Net) -> Result<()> {
         let p = vpn_server::VpnPool::new(pool)?;
-        self.vpn_pool = Some(Arc::new(Mutex::new(p)));
+        self.vpn_pool = Some(Arc::new(std::sync::Mutex::new(p)));
         Ok(())
     }
 

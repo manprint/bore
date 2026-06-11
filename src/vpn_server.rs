@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use dashmap::{mapref::entry::Entry, DashMap};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{oneshot, Mutex, Semaphore};
+use tokio::sync::{oneshot, Semaphore};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, warn};
 
@@ -26,6 +26,14 @@ use crate::shared::{
 /// VPN provider registry, keyed by VPN link ID.
 pub type VpnRegistry = Arc<DashMap<String, VpnProviderEntry>>;
 
+/// Shared handle to the server's /30 overlay pool.
+///
+/// A **std** mutex, not a tokio one: every critical section is a few map
+/// operations with no await inside, and `VpnLeaseGuard::drop` (a sync context)
+/// must be able to take the lock unconditionally — the old `try_lock` silently
+/// leaked the /30 block whenever the lock happened to be contended.
+pub type VpnPoolHandle = Arc<std::sync::Mutex<VpnPool>>;
+
 /// What the VPN listener registers while waiting for a connector.
 pub struct VpnProviderEntry {
     /// Networks this side advertises.
@@ -36,6 +44,19 @@ pub struct VpnProviderEntry {
     pub opener: mux::Opener,
     /// Connector sends pairing info here; listener awaits this.
     pub pair_tx: oneshot::Sender<VpnPairMsg>,
+    /// Monotonic registration generation. Protects against a stale handler's
+    /// deregistration removing a newer registration with the same id (a
+    /// reconnect race: the old handler's Drop can run after the new listener
+    /// already re-registered).
+    pub session: u64,
+}
+
+/// Global generation counter for [`VpnProviderEntry::session`].
+static VPN_SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Allocate the next VPN registration generation token.
+pub fn next_vpn_session() -> u64 {
+    VPN_SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Message the connector sends to the listener to complete pairing.
@@ -101,13 +122,13 @@ impl VpnPool {
 
 /// RAII guard that frees a /30 pool lease on drop.
 pub struct VpnLeaseGuard {
-    pool: Option<Arc<Mutex<VpnPool>>>,
+    pool: Option<VpnPoolHandle>,
     net_addr: u32, // network address of the /30 block
 }
 
 impl VpnLeaseGuard {
     /// Create a new lease guard for a VPN pool block.
-    pub fn new(pool: Arc<Mutex<VpnPool>>, net_addr: u32) -> Self {
+    pub fn new(pool: VpnPoolHandle, net_addr: u32) -> Self {
         Self {
             pool: Some(pool),
             net_addr,
@@ -123,11 +144,11 @@ impl VpnLeaseGuard {
 impl Drop for VpnLeaseGuard {
     fn drop(&mut self) {
         if let Some(pool) = self.pool.take() {
-            // Non-blocking: if the lock is contended, try_lock. Pool is short-lived.
-            if let Ok(mut p) = pool.try_lock() {
-                p.free(self.net_addr);
-            }
-            // If try_lock fails (very unlikely), the block leaks until server restart.
+            // Blocking lock: critical sections never hold the lock across an
+            // await, so this waits microseconds at most and the block is always
+            // freed (the old try_lock leaked it under contention).
+            let mut p = pool.lock().unwrap_or_else(|poison| poison.into_inner());
+            p.free(self.net_addr);
         }
     }
 }
@@ -213,17 +234,28 @@ pub fn validate_static(
 }
 
 /// Removes a VPN provider/UDP registration when the provider connection ends.
+///
+/// Both removals are generation-guarded (D5): if the same id was re-registered
+/// by a newer session (listener reconnect) before this handler's Drop ran, the
+/// newer entries must survive. The provider registry is matched on `session`;
+/// the UDP registry is matched on the pairing `nonce` (unique per pairing).
 struct VpnDeregister {
     registry: VpnRegistry,
     udp_registry: secret::UdpRegistry,
     id: String,
+    /// Generation of the provider entry this handler registered.
+    session: u64,
+    /// Pairing nonce of the UDP entry this handler registered (post-pairing).
+    nonce: Option<[u8; UDP_NONCE_LEN]>,
 }
 
 impl Drop for VpnDeregister {
     fn drop(&mut self) {
-        self.registry.remove(&self.id);
+        self.registry
+            .remove_if(&self.id, |_, entry| entry.session == self.session);
         let udp_id = format!("vpn:{}", self.id);
-        self.udp_registry.remove(&udp_id);
+        self.udp_registry
+            .remove_if(&udp_id, |_, reg| Some(reg.nonce) == self.nonce);
     }
 }
 
@@ -260,6 +292,7 @@ pub async fn serve_vpn_listener(
     };
 
     // Register atomically; reject duplicate id.
+    let session = next_vpn_session();
     let (pair_tx, pair_rx) = oneshot::channel::<VpnPairMsg>();
     match vpn_providers.entry(id.clone()) {
         Entry::Occupied(_) => {
@@ -277,14 +310,17 @@ pub async fn serve_vpn_listener(
                 addr: addr.clone(),
                 opener,
                 pair_tx,
+                session,
             });
         }
     }
-    // RAII deregister when this fn returns.
-    let _deregister = VpnDeregister {
+    // RAII deregister when this fn returns (generation-guarded, D5).
+    let mut deregister = VpnDeregister {
         registry: vpn_providers.clone(),
         udp_registry: udp_providers.clone(),
         id: id.clone(),
+        session,
+        nonce: None,
     };
 
     // Admin entry.
@@ -337,6 +373,8 @@ pub async fn serve_vpn_listener(
             },
         },
     );
+    // Arm the generation-guarded UDP removal for this pairing only.
+    deregister.nonce = Some(pair_msg.nonce);
 
     // Heartbeat loop (same shape as serve_provider).
     let heartbeat = Duration::from_millis(500);
@@ -384,7 +422,7 @@ pub async fn serve_vpn_connector(
     mut control: Delimited<mux::Stream>,
     mut acceptor: mux::Acceptor,
     vpn_providers: VpnRegistry,
-    vpn_pool: Option<Arc<Mutex<VpnPool>>>,
+    vpn_pool: Option<VpnPoolHandle>,
     conn_permits: Arc<Semaphore>,
     id: String,
     advertised: Vec<Ipv4Net>,
@@ -447,8 +485,9 @@ pub async fn serve_vpn_connector(
                     return Ok(());
                 }
             };
+            // Sync lock, no await inside the critical section (see VpnPoolHandle).
             let alloc_result = {
-                let mut pool_locked = pool_arc.lock().await;
+                let mut pool_locked = pool_arc.lock().unwrap_or_else(|p| p.into_inner());
                 pool_locked.alloc()
             };
             let (listener_ip, connector_ip) = match alloc_result {
@@ -694,4 +733,97 @@ async fn broker_vpn_udp(
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry_with_session(opener: mux::Opener, session: u64) -> VpnProviderEntry {
+        let (pair_tx, _pair_rx) = oneshot::channel();
+        VpnProviderEntry {
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            opener,
+            pair_tx,
+            session,
+        }
+    }
+
+    fn udp_reg(nonce: [u8; UDP_NONCE_LEN]) -> secret::UdpReg {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        secret::UdpReg {
+            candidates: vec![],
+            selected_stun: None,
+            nonce,
+            to_provider: tx,
+        }
+    }
+
+    /// D5 — a stale handler's deregistration must not remove the entries of a
+    /// newer session that re-registered the same id (listener reconnect race).
+    #[tokio::test]
+    async fn vpn_deregister_does_not_remove_newer_session() {
+        let registry: VpnRegistry = Arc::new(DashMap::new());
+        let udp_registry: secret::UdpRegistry = Default::default();
+        let (a, _b) = tokio::io::duplex(1024);
+        let (opener, _acceptor) = mux::client(a);
+
+        // Session 1 registers and pairs (UDP nonce [1; 16]).
+        let s1 = next_vpn_session();
+        registry.insert("x".into(), entry_with_session(opener.clone(), s1));
+        udp_registry.insert("vpn:x".into(), udp_reg([1u8; UDP_NONCE_LEN]));
+        let dereg1 = VpnDeregister {
+            registry: registry.clone(),
+            udp_registry: udp_registry.clone(),
+            id: "x".into(),
+            session: s1,
+            nonce: Some([1u8; UDP_NONCE_LEN]),
+        };
+
+        // Reconnect: session 2 re-registers the same id with a new nonce.
+        let s2 = next_vpn_session();
+        registry.insert("x".into(), entry_with_session(opener, s2));
+        udp_registry.insert("vpn:x".into(), udp_reg([2u8; UDP_NONCE_LEN]));
+
+        // The stale handler's Drop runs AFTER the new registration.
+        drop(dereg1);
+
+        let entry = registry
+            .get("x")
+            .expect("newer provider entry must survive");
+        assert_eq!(entry.session, s2);
+        drop(entry);
+        let udp = udp_registry
+            .get("vpn:x")
+            .expect("newer udp entry must survive");
+        assert_eq!(udp.nonce, [2u8; UDP_NONCE_LEN]);
+    }
+
+    /// D5 — the guard still removes its OWN session's entries.
+    #[tokio::test]
+    async fn vpn_deregister_removes_own_session() {
+        let registry: VpnRegistry = Arc::new(DashMap::new());
+        let udp_registry: secret::UdpRegistry = Default::default();
+        let (a, _b) = tokio::io::duplex(1024);
+        let (opener, _acceptor) = mux::client(a);
+
+        let s1 = next_vpn_session();
+        registry.insert("y".into(), entry_with_session(opener, s1));
+        udp_registry.insert("vpn:y".into(), udp_reg([7u8; UDP_NONCE_LEN]));
+        let dereg = VpnDeregister {
+            registry: registry.clone(),
+            udp_registry: udp_registry.clone(),
+            id: "y".into(),
+            session: s1,
+            nonce: Some([7u8; UDP_NONCE_LEN]),
+        };
+        drop(dereg);
+
+        assert!(registry.get("y").is_none(), "own entry must be removed");
+        assert!(
+            udp_registry.get("vpn:y").is_none(),
+            "own udp entry must be removed"
+        );
+    }
 }

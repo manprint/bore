@@ -185,7 +185,7 @@ async fn vpn_disabled_server_rejects_hello_vpn() {
 async fn vpn_lease_guard_drops_cleanly() {
     let parent = Ipv4Net::from_str("10.0.0.0/30").unwrap();
     let pool = bore_cli::vpn_server::VpnPool::new(parent).unwrap();
-    let pool_arc = std::sync::Arc::new(tokio::sync::Mutex::new(pool));
+    let pool_arc = std::sync::Arc::new(std::sync::Mutex::new(pool));
 
     // Create a lease for address 10.0.0.4 (net_addr = 4)
     let _guard = bore_cli::vpn_server::VpnLeaseGuard::new(pool_arc.clone(), 0);
@@ -194,14 +194,14 @@ async fn vpn_lease_guard_drops_cleanly() {
     drop(_guard);
 
     // Pool should still be valid
-    let _pool_locked = pool_arc.lock().await;
+    let _pool_locked = pool_arc.lock().unwrap();
 }
 
 #[tokio::test]
 async fn vpn_lease_guard_disarm_prevents_drop() {
     let parent = Ipv4Net::from_str("10.0.0.0/30").unwrap();
     let pool = bore_cli::vpn_server::VpnPool::new(parent).unwrap();
-    let pool_arc = std::sync::Arc::new(tokio::sync::Mutex::new(pool));
+    let pool_arc = std::sync::Arc::new(std::sync::Mutex::new(pool));
 
     let mut guard = bore_cli::vpn_server::VpnLeaseGuard::new(pool_arc.clone(), 0);
     guard.disarm();
@@ -209,8 +209,48 @@ async fn vpn_lease_guard_disarm_prevents_drop() {
     // When dropped, should not free the block
     drop(guard);
 
-    let _pool_locked = pool_arc.lock().await;
+    let _pool_locked = pool_arc.lock().unwrap();
     // Disarmed guard: block was not freed; pool lock acquired successfully.
+}
+
+/// D4 — the guard must free its block even when the pool lock is contended at
+/// drop time. With the old `try_lock` implementation the block silently leaked.
+#[tokio::test]
+async fn vpn_lease_guard_frees_under_contention() {
+    let parent = Ipv4Net::from_str("10.0.0.0/30").unwrap();
+    let mut pool = bore_cli::vpn_server::VpnPool::new(parent).unwrap();
+    let (l1, _c1) = pool.alloc().unwrap(); // the only /30 block
+    let net_addr = u32::from(l1) - 1;
+    let pool_arc = std::sync::Arc::new(std::sync::Mutex::new(pool));
+
+    // Thread A holds the lock for 50 ms while thread B drops the guard.
+    let holder = {
+        let pool_arc = pool_arc.clone();
+        std::thread::spawn(move || {
+            let guard = pool_arc.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(guard);
+        })
+    };
+    // Give the holder time to actually take the lock.
+    std::thread::sleep(Duration::from_millis(10));
+
+    let dropper = {
+        let pool_arc = pool_arc.clone();
+        std::thread::spawn(move || {
+            let guard = bore_cli::vpn_server::VpnLeaseGuard::new(pool_arc, net_addr);
+            drop(guard); // must BLOCK until the holder releases, then free
+        })
+    };
+
+    holder.join().unwrap();
+    dropper.join().unwrap();
+
+    // The block must be free again: a fresh alloc must succeed.
+    let mut pool_locked = pool_arc.lock().unwrap();
+    pool_locked
+        .alloc()
+        .expect("lease guard must free the block even under lock contention");
 }
 
 #[tokio::test]

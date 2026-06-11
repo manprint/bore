@@ -209,6 +209,16 @@ kill $VPNPID2
 | **Total Automated** | | **57** | **PASS** |
 | Manual Procedures (§16.5.4, §16.6.8) | | 2 | — |
 
+### Phase 2 plan (VPN_FULL_PLAN_V2) additions
+
+| Plan § | Criterion | Test Type | Test Name | Status |
+|---|---|---|---|---|
+| V2-0.1 (A3) | `ip route replace` used for route install (idempotent on reconnect) | Automated | `vpn::hostcfg_cmd::tests::cmd_route_replace_snapshot`, `netconfig_apply_routes_only` | PASS |
+| V2-0.2 (A4) | `ip_forward` enable/restore falls back to `sudo -n tee` without UID 0 | Automated | `vpn::hostcfg_cmd::tests::cmd_sysctl_ip_forward_snapshot` (builder snapshot) | PASS |
+| V2-0.3 (D1) | One-shot warn when TooLarge drops persist >10 s after link-up | Automated | `vpn::bridge::tests::toolarge_warn_logic` (truth table) | PASS |
+| V2-0.4 (D4) | `VpnLeaseGuard::drop` frees the /30 block even under lock contention | Automated | `vpn_server_test::vpn_lease_guard_frees_under_contention` | PASS |
+| V2-0.5 (D5) | Stale deregistration cannot remove a newer session's registry entries | Automated | `vpn_server::tests::vpn_deregister_does_not_remove_newer_session`, `vpn_deregister_removes_own_session` | PASS |
+
 ---
 
 ## Netns Harness Coverage

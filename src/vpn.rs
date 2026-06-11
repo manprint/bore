@@ -816,15 +816,33 @@ pub mod hostcfg_cmd {
         ]
     }
 
-    /// Build `ip route add <subnet> dev <dev>` argv.
+    /// Build `ip route replace <subnet> dev <dev>` argv.
+    ///
+    /// `replace` (not `add`) keeps the operation idempotent: a stale route left
+    /// behind by a crashed previous run (or an in-flight reconnect) would make
+    /// `ip route add` fail with EEXIST and abort the whole link setup.
     pub fn cmd_route_add(subnet: &str, dev: &str) -> Vec<String> {
         vec![
             "ip".into(),
             "route".into(),
-            "add".into(),
+            "replace".into(),
             subnet.into(),
             "dev".into(),
             dev.into(),
+        ]
+    }
+
+    /// Build the `sh -c "echo <v> | sudo -n tee /proc/sys/net/ipv4/ip_forward"` argv.
+    ///
+    /// Fallback used when the process holds CAP_NET_ADMIN but not UID 0: writing
+    /// `/proc/sys/net/ipv4/ip_forward` directly fails with EACCES, while a
+    /// non-interactive `sudo -n tee` succeeds if the operator installed the
+    /// recommended sudoers line (see docs/vpn/VPN.md, "Requirements").
+    pub fn cmd_sysctl_ip_forward(value: u8) -> Vec<String> {
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!("echo {value} | sudo -n tee /proc/sys/net/ipv4/ip_forward"),
         ]
     }
 
@@ -1030,11 +1048,31 @@ pub mod hostcfg_cmd {
         use super::*;
 
         #[test]
-        fn cmd_route_add_snapshot() {
+        fn cmd_route_replace_snapshot() {
             let cmd = cmd_route_add("10.0.0.0/24", "tun0");
             assert_eq!(
                 cmd,
-                vec!["ip", "route", "add", "10.0.0.0/24", "dev", "tun0"]
+                vec!["ip", "route", "replace", "10.0.0.0/24", "dev", "tun0"]
+            );
+        }
+
+        #[test]
+        fn cmd_sysctl_ip_forward_snapshot() {
+            assert_eq!(
+                cmd_sysctl_ip_forward(1),
+                vec![
+                    "sh",
+                    "-c",
+                    "echo 1 | sudo -n tee /proc/sys/net/ipv4/ip_forward"
+                ]
+            );
+            assert_eq!(
+                cmd_sysctl_ip_forward(0),
+                vec![
+                    "sh",
+                    "-c",
+                    "echo 0 | sudo -n tee /proc/sys/net/ipv4/ip_forward"
+                ]
             );
         }
 
@@ -1328,9 +1366,18 @@ pub mod hostcfg {
                 let saved: u8 = current.trim().parse().unwrap_or(0);
 
                 if saved == 0 {
-                    tokio::fs::write("/proc/sys/net/ipv4/ip_forward", "1\n")
-                        .await
-                        .context("enable ip_forward")?;
+                    match tokio::fs::write("/proc/sys/net/ipv4/ip_forward", "1\n").await {
+                        Ok(()) => {}
+                        Err(e) => {
+                            // CAP_NET_ADMIN without UID 0 cannot write procfs
+                            // directly; fall back to non-interactive sudo tee.
+                            tracing::debug!(error = %e, "direct ip_forward write failed; trying sudo -n fallback");
+                            runner
+                                .run(&cmd_sysctl_ip_forward(1))
+                                .await
+                                .context("enable ip_forward (direct write failed and 'sudo -n tee' fallback failed; run as root or add a sudoers rule for tee /proc/sys/net/ipv4/ip_forward)")?;
+                        }
+                    }
                     tracing::info!("enabled ip_forward (saved={})", saved);
                 }
 
@@ -1449,10 +1496,31 @@ pub mod hostcfg {
                 match op {
                     AppliedOp::IpForward { saved_value } => {
                         tracing::info!(saved_value, "restoring ip_forward");
-                        let _ = std::fs::write(
+                        if std::fs::write(
                             "/proc/sys/net/ipv4/ip_forward",
                             format!("{}\n", saved_value),
-                        );
+                        )
+                        .is_err()
+                        {
+                            // CAP_NET_ADMIN without UID 0: try sudo -n tee
+                            // (best-effort, non-interactive).
+                            let argv = super::hostcfg_cmd::cmd_sysctl_ip_forward(*saved_value);
+                            let ok = std::process::Command::new(&argv[0])
+                                .args(&argv[1..])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status()
+                                .map(|s| s.success())
+                                .unwrap_or(false);
+                            if !ok {
+                                tracing::warn!(
+                                    saved_value,
+                                    "could not restore ip_forward (no root and sudo -n failed); \
+                                     restore manually: echo {} | sudo tee /proc/sys/net/ipv4/ip_forward",
+                                    saved_value
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1529,10 +1597,10 @@ pub mod hostcfg {
             .expect("apply should succeed");
 
             let calls = runner.get_calls().await;
-            // Should have called route add twice.
+            // Should have called route replace (idempotent) twice.
             assert_eq!(calls.len(), 2);
-            assert!(calls[0][0] == "ip" && calls[0][1] == "route" && calls[0][2] == "add");
-            assert!(calls[1][0] == "ip" && calls[1][1] == "route" && calls[1][2] == "add");
+            assert!(calls[0][0] == "ip" && calls[0][1] == "route" && calls[0][2] == "replace");
+            assert!(calls[1][0] == "ip" && calls[1][1] == "route" && calls[1][2] == "replace");
 
             // Verify revert order is reversed.
             assert_eq!(cfg.revert_cmds.len(), 2);
@@ -2083,15 +2151,26 @@ pub mod bridge {
         let stats_task = tokio::spawn({
             let c = Arc::clone(&counters);
             async move {
+                let start = tokio::time::Instant::now();
+                let mut warned = false;
                 let mut ticker = interval(Duration::from_secs(10));
                 loop {
                     ticker.tick().await;
+                    let tx_drops = c.tx_drops.load(Ordering::Relaxed);
+                    if should_warn_drops(tx_drops, start.elapsed(), warned) {
+                        warned = true;
+                        tracing::warn!(
+                            tx_drops,
+                            "VPN link is dropping oversized packets; consider lowering --mtu \
+                             (current path MTU is smaller than the TUN MTU)"
+                        );
+                    }
                     debug!(
                         tx_pkts = c.tx_pkts.load(Ordering::Relaxed),
                         rx_pkts = c.rx_pkts.load(Ordering::Relaxed),
                         tx_bytes = c.tx_bytes.load(Ordering::Relaxed),
                         rx_bytes = c.rx_bytes.load(Ordering::Relaxed),
-                        tx_drops = c.tx_drops.load(Ordering::Relaxed),
+                        tx_drops,
                         "vpn bridge stats",
                     );
                 }
@@ -2112,6 +2191,13 @@ pub mod bridge {
             }
         };
         result
+    }
+
+    /// Decide whether to emit the one-shot "persistent TooLarge drops" warning:
+    /// only when drops exist, the link has been up for more than 10 s (transient
+    /// MTU-discovery drops at startup are normal), and we have not warned yet.
+    fn should_warn_drops(drops: u64, elapsed: Duration, warned: bool) -> bool {
+        drops > 0 && elapsed > Duration::from_secs(10) && !warned
     }
 
     async fn run_uplink(
@@ -2269,6 +2355,24 @@ pub mod bridge {
 
     #[cfg(test)]
     mod tests {
+        use std::time::Duration;
+
+        /// D1 — truth table for the one-shot persistent-drops warning.
+        #[test]
+        fn toolarge_warn_logic() {
+            use super::should_warn_drops;
+            let early = Duration::from_secs(5);
+            let late = Duration::from_secs(11);
+            // No drops → never warn.
+            assert!(!should_warn_drops(0, late, false));
+            // Drops but link younger than 10 s → no warn (startup transients).
+            assert!(!should_warn_drops(3, early, false));
+            // Already warned → never again.
+            assert!(!should_warn_drops(3, late, true));
+            // Drops persisting past 10 s, not yet warned → warn.
+            assert!(should_warn_drops(3, late, false));
+        }
+
         /// Phase 6.2 — Segmentation: each packet from recv_multiple is ≤ MTU.
         #[test]
         fn segment_gso_buffer() {

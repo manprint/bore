@@ -14,6 +14,30 @@
 - **Server:** must be started with `--vpn` flag and have a pool configured (`--vpn-pool <CIDR>`)
 - **Authentication:** `--secret` is mandatory on both client sides (required for E2E encryption on the relay fallback path)
 
+#### Running with CAP_NET_ADMIN but without root (gateway mode)
+
+Gateway mode toggles `/proc/sys/net/ipv4/ip_forward`. `CAP_NET_ADMIN` alone is
+**not** enough to write that procfs file: the write fails with `EACCES` even
+though interface/route management works. In that case bore falls back to a
+non-interactive `sudo -n tee /proc/sys/net/ipv4/ip_forward` for both the enable
+(at link setup) and the restore (at teardown). For the fallback to work, install
+a sudoers rule for the user running bore:
+
+```
+# /etc/sudoers.d/bore-vpn
+youruser ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/net/ipv4/ip_forward
+```
+
+If both the direct write and the `sudo -n` fallback fail at **setup**, the link
+aborts with an actionable error. If they fail at **teardown**, bore logs a
+`warn!` with the exact manual command to restore the saved value
+(`echo <saved> | sudo tee /proc/sys/net/ipv4/ip_forward`). Host-only links
+(no `--advertise`) never touch `ip_forward`.
+
+Route management uses `ip route replace` (idempotent): a stale route left over
+from a crashed run or an in-flight reconnect never aborts link setup with
+`EEXIST`.
+
 ### Security Model
 
 **Direct path (preferred):** unreliable QUIC datagrams, encrypted end-to-end via QUIC-TLS 1.3. The server is not involved in the data path; it only orchestrates the handshake.

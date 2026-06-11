@@ -56,6 +56,48 @@ jobs:
           cargo test --all-features --test transfer_stdin_cli_test transfer_stdin_reserved_windows_output_name_over_relay_cli
           cargo test --all-features --test transfer_stdin_cli_test transfer_stdin_invalid_windows_char_output_name_over_relay_cli
 
+  vpn-cross-build:
+    name: VPN cross check (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk (Android)
+        if: matrix.target == 'aarch64-linux-android'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Check (Android via NDK)
+        if: matrix.target == 'aarch64-linux-android'
+        run: cargo ndk -t arm64-v8a check --features vpn
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+
+      - name: Check (host toolchain)
+        if: matrix.target != 'aarch64-linux-android'
+        run: cargo check --features vpn --target ${{ matrix.target }}
+
+      - name: Portable VPN unit tests (host)
+        if: matrix.target != 'aarch64-linux-android'
+        run: cargo test --features vpn --lib
+
   audit:
     name: Security audit
     runs-on: ubuntu-latest

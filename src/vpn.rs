@@ -1566,9 +1566,162 @@ pub mod hostcfg_cmd {
         ]
     }
 
+    /// macOS argv builders (E6 groundwork, host-only mode — no NAT/forwarding).
+    ///
+    /// Pure functions so the snapshots run on every platform. The runtime
+    /// host-config refactor that selects these per-OS is still pending (the
+    /// `vpn` module is currently compiled on Linux only).
+    pub mod macos {
+        /// Build `route -n add -net <subnet> -interface <dev>` argv.
+        pub fn cmd_route_add(subnet: &str, dev: &str) -> Vec<String> {
+            vec![
+                "route".into(),
+                "-n".into(),
+                "add".into(),
+                "-net".into(),
+                subnet.into(),
+                "-interface".into(),
+                dev.into(),
+            ]
+        }
+
+        /// Build `route -n delete -net <subnet> -interface <dev>` argv.
+        pub fn cmd_route_del(subnet: &str, dev: &str) -> Vec<String> {
+            vec![
+                "route".into(),
+                "-n".into(),
+                "delete".into(),
+                "-net".into(),
+                subnet.into(),
+                "-interface".into(),
+                dev.into(),
+            ]
+        }
+
+        /// Build `ifconfig <dev> mtu <mtu>` argv (dynamic PMTU).
+        pub fn cmd_link_set_mtu(dev: &str, mtu: u16) -> Vec<String> {
+            vec!["ifconfig".into(), dev.into(), "mtu".into(), mtu.to_string()]
+        }
+    }
+
+    /// Windows argv builders (E6 groundwork, host-only mode). `netsh` is used
+    /// over `route ADD` for native CIDR syntax (no interface-index lookups).
+    pub mod windows {
+        /// Build `netsh interface ipv4 add route <cidr> <iface>` argv.
+        pub fn cmd_route_add(cidr: &str, iface: &str) -> Vec<String> {
+            vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv4".into(),
+                "add".into(),
+                "route".into(),
+                cidr.into(),
+                iface.into(),
+            ]
+        }
+
+        /// Build `netsh interface ipv4 delete route <cidr> <iface>` argv.
+        pub fn cmd_route_del(cidr: &str, iface: &str) -> Vec<String> {
+            vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv4".into(),
+                "delete".into(),
+                "route".into(),
+                cidr.into(),
+                iface.into(),
+            ]
+        }
+
+        /// Build `netsh interface ipv4 set subinterface <iface> mtu=<mtu>` argv.
+        pub fn cmd_link_set_mtu(iface: &str, mtu: u16) -> Vec<String> {
+            vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv4".into(),
+                "set".into(),
+                "subinterface".into(),
+                iface.into(),
+                format!("mtu={mtu}"),
+            ]
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn cmd_macos_builders_snapshot() {
+            assert_eq!(
+                macos::cmd_route_add("10.0.0.0/24", "utun4"),
+                vec![
+                    "route",
+                    "-n",
+                    "add",
+                    "-net",
+                    "10.0.0.0/24",
+                    "-interface",
+                    "utun4"
+                ]
+            );
+            assert_eq!(
+                macos::cmd_route_del("10.0.0.0/24", "utun4"),
+                vec![
+                    "route",
+                    "-n",
+                    "delete",
+                    "-net",
+                    "10.0.0.0/24",
+                    "-interface",
+                    "utun4"
+                ]
+            );
+            assert_eq!(
+                macos::cmd_link_set_mtu("utun4", 1400),
+                vec!["ifconfig", "utun4", "mtu", "1400"]
+            );
+        }
+
+        #[test]
+        fn cmd_windows_builders_snapshot() {
+            assert_eq!(
+                windows::cmd_route_add("10.0.0.0/24", "bore0"),
+                vec![
+                    "netsh",
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "10.0.0.0/24",
+                    "bore0"
+                ]
+            );
+            assert_eq!(
+                windows::cmd_route_del("10.0.0.0/24", "bore0"),
+                vec![
+                    "netsh",
+                    "interface",
+                    "ipv4",
+                    "delete",
+                    "route",
+                    "10.0.0.0/24",
+                    "bore0"
+                ]
+            );
+            assert_eq!(
+                windows::cmd_link_set_mtu("bore0", 1400),
+                vec![
+                    "netsh",
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "subinterface",
+                    "bore0",
+                    "mtu=1400"
+                ]
+            );
+        }
 
         #[test]
         fn cmd_route_replace_snapshot() {

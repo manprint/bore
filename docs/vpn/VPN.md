@@ -6,6 +6,19 @@
 
 **The load-bearing mental model:** a VPN link is structurally a secret tunnel that carries IP packets instead of a TCP byte-stream.
 
+### Platform support
+
+| Platform | Status | Notes |
+|---|---|---|
+| Linux | ✅ Full (host + gateway mode) | Reference platform; all features |
+| Android (Termux, rooted) | 🔬 Build-checked in CI | Kernel is Linux but `target_os = "android"`; runtime support pending the portability refactor (plan §5.1/§5.4). Requires `tsu` + Termux `iproute2` |
+| macOS (utun) | 📐 Groundwork | `hostcfg_cmd::macos` argv builders + CI cross-check in place; runtime TUN/host-config wiring pending (§5.2) |
+| Windows (wintun) | 📐 Groundwork | `hostcfg_cmd::windows` argv builders + CI cross-check in place; runtime wiring + `wintun.dll` handling pending (§5.3) |
+
+Non-Linux targets are planned as **host-only mode** (no `--advertise`, no
+NAT/forwarding/MSS-clamp): gateway mode needs a per-OS NAT engine and stays
+Linux-only (DEC-8).
+
 ### Requirements
 
 - **Operating system:** Linux only (kernel TUN/TAP support required)

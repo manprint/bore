@@ -240,6 +240,11 @@ kill $VPNPID2
 | V2-4.3 (C2) | PMTU decision truth table (stability, delta, clamp) | Automated | `vpn::tests::pmtu_decision_cases` | PASS |
 | V2-4.3 (C2) | "tun MTU adjusted" on a real WAN (PMTU static in netns) | Manual | Procedure M-3 | PENDING |
 | V2-4.4 | Benchmark table (relay 1c/4c, direct, direct 4q) | Bench (sudo) | `scripts/vpn_bench.sh` | PENDING (needs sudo run) |
+| V2-5.2/5.3 | macOS/Windows argv builders snapshots (portable) | Automated | `vpn::hostcfg_cmd::tests::cmd_macos_builders_snapshot`, `cmd_windows_builders_snapshot` | PASS |
+| V2-5.5 | CI cross check: windows-msvc, apple-darwin, android (cargo-ndk) | CI | `.github/workflows/ci.yml` job `vpn-cross-build` | PENDING (next CI run) |
+| V2-5.2 (M-4) | macOS↔Linux host-only smoke (ping + iperf3, relay e direct) | Manual | Procedure M-4 | DEFERRED (runtime wiring pending) |
+| V2-5.3 (M-5) | Windows↔Linux host-only smoke | Manual | Procedure M-5 | DEFERRED (runtime wiring pending) |
+| V2-5.4 (M-6) | Termux(rooted)↔Linux smoke | Manual | Procedure M-6 | DEFERRED (runtime wiring pending) |
 
 ---
 

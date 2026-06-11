@@ -740,6 +740,75 @@ kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
 kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
 sleep 0.5
 
+# ── Test 14: SIGKILL leaves stale state; full reclaim (TUN + nft + routes) ────
+echo "=== Test 14: full stale reclaim after SIGKILL (16.6.8) ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id reclaim-full \
+    --advertise "$FAKE_LAN" --relay-only \
+    >"$BORE_LOG.listen14" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id reclaim-full --relay-only \
+    >"$BORE_LOG.connect14" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.listen14" "vpn link paired" 10; then
+    sleep 1.5
+    # SIGKILL: no cleanup possible.
+    kill -9 "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+    kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+    sleep 0.5
+    # Stale state must actually be there (otherwise the reclaim test is vacuous).
+    if ip netns exec ns1 nft list tables 2>/dev/null | grep -q "bore_vpn_reclaim-full"; then
+        pass "16.6.8: nft table survived SIGKILL (stale state present)"
+    else
+        fail "16.6.8: nft table missing after SIGKILL (nothing to reclaim?)"
+    fi
+    # NOTE: the TUN fd dies with the process (kernel removes the interface),
+    # so only nft/route state is expected to leak.
+    # Second run with the SAME id must reclaim and come up healthy.
+    ip netns exec ns1 "$BORE" vpn listen \
+        --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id reclaim-full \
+        --advertise "$FAKE_LAN" --relay-only \
+        >"$BORE_LOG.listen14b" 2>&1 &
+    BORE_LISTEN_PID=$!
+    sleep 0.5
+    ip netns exec ns2 "$BORE" vpn connect \
+        --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id reclaim-full --relay-only \
+        >"$BORE_LOG.connect14b" 2>&1 &
+    BORE_CONNECT_PID=$!
+    if wait_for_log "$BORE_LOG.listen14b" "vpn link paired" 15; then
+        sleep 1.5
+        # nft table re-created exactly once, routes present, ping works.
+        NFT_COUNT=$(ip netns exec ns1 nft list tables 2>/dev/null | grep -c "bore_vpn_reclaim-full" || true)
+        [ "$NFT_COUNT" = "1" ] && pass "16.6.8: nft table reclaimed (count=1)" \
+            || fail "16.6.8: nft table count=$NFT_COUNT after reclaim"
+        if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$FAKE_LAN"; then
+            pass "16.6.8: route re-applied after reclaim"
+        else
+            fail "16.6.8: route missing after reclaim"
+        fi
+        if grep -qi "file exists" "$BORE_LOG.listen14b" "$BORE_LOG.connect14b" 2>/dev/null; then
+            fail "16.6.8: EEXIST during reclaim (route replace regression)"
+        else
+            pass "16.6.8: no EEXIST during reclaim"
+        fi
+        ip netns exec ns2 ping -c 2 -W 3 "$FAKE_LAN_HOST" >/dev/null 2>&1 \
+            && pass "16.6.8: ping ok after full reclaim" \
+            || fail "16.6.8: ping failed after full reclaim"
+    else
+        fail "16.6.8: second run did not pair (reclaim failed)"
+        echo "  [listener log]: $(tail -5 "$BORE_LOG.listen14b" 2>/dev/null | tr '\n' '|')"
+    fi
+else
+    fail "16.6.8: initial pairing failed"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Results: PASS=$PASS FAIL=$FAIL ==="

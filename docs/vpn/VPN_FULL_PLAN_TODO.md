@@ -32,7 +32,7 @@ Risultato misurato (docker, 3 nodi): prima = stallo a ~256 KB; dopo = 100 MB in
 
 ## A. DIRETTO CRITICO — funzionalità mancante che limita l'usabilità
 
-### A1 — Direct QUIC path non cablato `P1`
+### A1 — Direct QUIC path non cablato `P1` — ✅ RISOLTO (2026-06-11, commit 49783aa)
 
 **Stato attuale:** `VpnLink::Direct`, `make_direct()`, `LinkSender::Direct`, `LinkRecver::Direct`
 esistono in `vpn::link` ma non vengono mai usati. `run_listen` e `run_connect` vanno
@@ -69,7 +69,7 @@ già pronto lato server).
 
 ---
 
-### A2 — `--auto-reconnect` non funziona `P1`
+### A2 — `--auto-reconnect` non funziona `P1` — ✅ RISOLTO (2026-06-11, commit 07598e0)
 
 **Stato attuale:** CLI ha `--auto-reconnect` ma `run_listen`/`run_connect` non usano
 `reconnect::run()`. Quando il bridge si chiude (server giù, link perso) il processo esce
@@ -89,7 +89,7 @@ senza riprovare.
 
 ---
 
-### A3 — Route duplicate su reconnect `P1`
+### A3 — Route duplicate su reconnect `P1` — ✅ RISOLTO (2026-06-11, commit 351eda7: `ip route replace`)
 
 **Stato attuale:** `ip route add` senza controllo. Se il link si riconnette senza un
 teardown pulito, `ip route add 192.168.50.0/24 dev bore0` fallisce con "file exists".
@@ -101,7 +101,7 @@ Usare `ip route replace ...` invece di `ip route add ...`, oppure ignorare l'err
 
 ---
 
-### A4 — `ip_forward` revert non affidabile `P2`
+### A4 — `ip_forward` revert non affidabile `P2` — ✅ RISOLTO (2026-06-11, commit 351eda7: fallback `sudo -n tee` + doc sudoers)
 
 **Stato attuale:** `NetConfig::Drop` usa `std::fs::write("/proc/sys/net/ipv4/ip_forward", ...)`
 direttamente. Se il processo gira senza root (CAP\_NET\_ADMIN senza UID 0), la scrittura
@@ -149,7 +149,7 @@ le buone pratiche consigliano rekey periodico (es. ogni 2^32 pacchetti o ogni or
 
 ## C. PERFORMANCE — bottleneck noti
 
-### C1 — Single uplink/downlink — CPU-bound su >1 Gbps `P3`
+### C1 — Single uplink/downlink — CPU-bound su >1 Gbps `P3` — ✅ RISOLTO (2026-06-11, commit 20f7d07: `--tun-queues`, uplink per coda)
 
 **Stato attuale:** un solo task uplink + un solo task downlink. Su link da 10+ Gbps
 (server bare-metal con NIC veloci) diventa CPU-bound.
@@ -158,7 +158,7 @@ le buone pratiche consigliano rekey periodico (es. ogni 2^32 pacchetti o ogni or
 `IFF_MULTI_QUEUE` sul TUN (`tun_rs::DeviceBuilder::multi_queue(true)`) + N coppie
 uplink/downlink, una per coda. Richiede partizionamento del link o N istanze VpnLink.
 
-### C2 — Dynamic PMTU non implementato `P3`
+### C2 — Dynamic PMTU non implementato `P3` — ✅ RISOLTO (2026-06-11, commit 20f7d07: `pmtu_monitor` + `pmtu_decision`)
 
 **Stato attuale:** MTU fisso 1350. `max_datagram_size()` cresce con il QUIC MTU discovery
 ma non aggiorna il TUN. Dopo il warm-up il TUN potrebbe usare un MTU più grande.
@@ -167,7 +167,7 @@ ma non aggiorna il TUN. Dopo il warm-up il TUN potrebbe usare un MTU più grande
 Spawn task che monitora `DirectConn::max_datagram_size()` ogni 5s e chiama
 `ip link set bore0 mtu <new_mtu>` quando stabile.
 
-### C3 — `--carriers` relay non implementato `P3`
+### C3 — `--carriers` relay non implementato `P3` — ✅ RISOLTO (2026-06-11, commit 20f7d07: round-robin per-datagram, counter atomico condiviso)
 
 **Stato attuale:** protocollo riserva il campo `carriers` (inviato come 1), ma il relay
 usa sempre un singolo yamux stream. Con un solo stream il throughput relay è limitato
@@ -181,7 +181,7 @@ dei secret tunnel). Gestire riordinamento o accettare out-of-order (IP è già b
 
 ## D. ROBUSTEZZA — comportamenti non gestiti
 
-### D1 — `>10s TooLarge warn` non implementato `P2`
+### D1 — `>10s TooLarge warn` non implementato `P2` — ✅ RISOLTO (2026-06-11, commit 351eda7)
 
 **Stato attuale:** `BridgeCounters.tx_drops` conta i `TooLarge`, ma il piano (§6.1)
 richiede: "if drops still occurring >10s after link-up, `warn!` once suggesting lower
@@ -191,7 +191,7 @@ richiede: "if drops still occurring >10s after link-up, `warn!` once suggesting 
 In `run_uplink_single`/`run_uplink_offload` registrare `Instant::now()` all'avvio.
 Se `tx_drops > 0` dopo 10s, emettere `warn!` una sola volta.
 
-### D2 — Admin page VPN non differenziata `P2`
+### D2 — Admin page VPN non differenziata `P2` — ✅ RISOLTO (2026-06-11, commit 3910299: ruoli dedicati, overlay, path report, byte relay)
 
 **Stato attuale:** `serve_vpn_listener` usa `Role::SecretProvider` e
 `serve_vpn_connector` usa `Role::SecretConsumer`. Sul pannello admin i link VPN appaiono
@@ -203,7 +203,7 @@ come provider/consumer segreti, senza info overlay, path, iface, o contatori.
 3. Admin HTTP page: mostrare per i VPN link: ID, overlay, path (direct/relay), Mbps TX/RX
    (dal `BridgeCounters`), drops.
 
-### D3 — NAT/UPnP args non usati `P2`
+### D3 — NAT/UPnP args non usati `P2` — ✅ RISOLTO (2026-06-11, commit 49783aa: wiring nel direct upgrade)
 
 **Stato attuale:** `VpnListenArgs`/`VpnConnectArgs` hanno `stun_server`, `upnp`,
 `try_port_prediction`, `nat_udp_preferred_port`, `nat_udp_release_timeout` ma non vengono
@@ -211,7 +211,7 @@ passati a nessuna funzione (dipendono dal direct path, §A1).
 
 **Da fare:** wiring automatico una volta implementato §A1.
 
-### D4 — `VpnLeaseGuard::drop` usa `try_lock` (silenzioso) `P2`
+### D4 — `VpnLeaseGuard::drop` usa `try_lock` (silenzioso) `P2` — ✅ RISOLTO (2026-06-11, commit 351eda7: std Mutex bloccante)
 
 **Stato attuale:** se il lock è conteso al momento del Drop, il blocco /30 non viene
 liberato e il pool "perde" quella entry fino al restart del server. Probabilità bassa
@@ -221,7 +221,7 @@ liberato e il pool "perde" quella entry fino al restart del server. Probabilità
 Usare `block_in_place` + `blocking_lock()` nel Drop, oppure passare a un canale oneshot
 per il cleanup asincrono (pattern Tokio).
 
-### D5 — `VpnDeregister` rimuove dall'`udp_providers` con chiave `"vpn:{id}"` `P2`
+### D5 — `VpnDeregister` rimuove dall'`udp_providers` con chiave `"vpn:{id}"` `P2` — ✅ RISOLTO (2026-06-11, commit 351eda7: generation token)
 
 **Stato attuale:** in `VpnDeregister::drop` viene rimosso anche `udp_providers.remove(&udp_id)`.
 Ma se `serve_vpn_listener` esce prima che il connector arrivi (e quindi prima che venga
@@ -248,19 +248,19 @@ Tuttavia se il link viene ripareggiato (reconnect) e l'UDP entry della sessione 
 
 ## F. TEST mancanti o deboli
 
-### F1 — Reconnect smoke test `P1`
+### F1 — Reconnect smoke test `P1` — ✅ SCRITTO (netns Test 10; esecuzione richiede sudo)
 
 Richiesto dal piano Phase 7.2. Non scritto. Scenario: server crasha mentre il bridge
 gira → client riprova con backoff → link si riconnette.
 
-### F2 — Test direct path end-to-end `P1`
+### F2 — Test direct path end-to-end `P1` — ✅ SCRITTO (netns Test 6-9; esecuzione richiede sudo)
 
 Una volta implementato §A1, aggiungere al netns test:
 - `ping` su path direct (verificare `info!(path="direct")` nei log)
 - UDP `iperf3` su direct path (nessun TCP meltdown)
 - Bloccare UDP → fallback a relay → sbloccare → tornare a direct
 
-### F3 — Test `--auto-reconnect` nel netns harness `P2`
+### F3 — Test `--auto-reconnect` nel netns harness `P2` — ✅ SCRITTO (netns Test 10-11; esecuzione richiede sudo)
 
 Dipende da §A2 + §F1.
 
@@ -268,7 +268,7 @@ Dipende da §A2 + §F1.
 
 Dipende da §B1. Test unitario: ritrasmettere frame relay già visto → `open()` rifiuta.
 
-### F5 — Admin page VPN entries `P2`
+### F5 — Admin page VPN entries `P2` — ✅ RISOLTO (2026-06-11: `vpn_admin_entries_and_path_report`)
 
 Dipende da §D2. Verificare che link VPN siano visibili e con informazioni corrette.
 

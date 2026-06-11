@@ -99,6 +99,14 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   respawn on Direct). Direct death at runtime kills the bridge → handled by reconnect (DEC-2).
   Server brokers `UdpPunch` to BOTH sides only when it holds BOTH offers (DEC-3, 10 s timeout →
   `UdpUnavailable`)
+- VPN AEAD nonce counter is ONE shared `Arc<AtomicU64>` per egress key (I-5/DEC-6): carriers
+  and multi-queue clones all `fetch_add` on it — never per-producer counters, never two seals
+  with the same `(key, counter)`. Relay carriers round-robin per-datagram (DEC-7, reorder OK);
+  any future replay window (B1) must size for that reorder: ≥ 2 × (carriers × RELAY_QUEUE)
+  (DEC-10)
+- VPN `--carriers`/`--tun-queues` default 1 = byte/path-identical to the single configuration
+  (I-9). Carrier count negotiated min(listener, connector, server `--max-carriers`); a dead
+  carrier kills the whole link cleanly (reconnect re-establishes), never silent degradation
 - `NetConfig` RAII: all routes/nft/ip_forward changes revert on exit (SIGINT, SIGTERM, panic handled; SIGKILL requires next-run stale reclaim)
 - TUN MTU default 1350: clamps QUIC datagram size; gateway MSS-clamp keeps forwarded TCP healthy
 

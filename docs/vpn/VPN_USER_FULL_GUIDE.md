@@ -303,7 +303,10 @@ ping 192.168.60.1
 | `--tun-name` | | — | `NAME` | `bore0` | TUN interface name |
 | `--mtu` | | — | `N` | `1350` | TUN interface MTU; reduce if large packets drop persistently |
 | `--no-route-manage` | | — | flag | — | Print all route/NAT commands verbatim instead of running them; TUN is still created |
-| `--auto-reconnect` | | `BORE_AUTO_RECONNECT` | flag | — | Reconnect on link failure with exponential backoff |
+| `--auto-reconnect` | | `BORE_AUTO_RECONNECT` | flag | — | Reconnect on link failure with exponential backoff (full teardown+rebuild per attempt; fatal config errors exit) |
+| `--relay-only` | | `BORE_VPN_RELAY_ONLY` | flag | — | Never attempt the direct UDP path; stay on the server relay |
+| `--carriers` | | `BORE_VPN_CARRIERS` | N | 1 | Parallel relay carrier substream pairs (1-16); effective = min(both sides, server --max-carriers) |
+| `--tun-queues` | | `BORE_VPN_TUN_QUEUES` | N | 1 | Linux TUN queues (IFF_MULTI_QUEUE, 1-8); one uplink pump per queue |
 | `--insecure` | | `BORE_INSECURE` | flag | — | Skip TLS certificate verification (useful with self-signed certs) |
 | `--stun-server` | | `BORE_STUN_SERVER` | `HOST:PORT` | — | Additional STUN server for UDP candidate discovery |
 | `--upnp` | | `BORE_UPNP` | flag | — | Attempt UPnP-IGD to add a router-mapped UDP candidate |

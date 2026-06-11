@@ -117,6 +117,25 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   silently never fired and killed the link). `send_batch` returns the drop count; only genuine link
   death returns `Err`. PMTU monitor shrinks immediately on one below-current sample
   (`pmtu_shrink_now`, fast recovery), grows only on 3 stable samples (`pmtu_decision`, anti-flap)
+- VPN direct-path candidates must NEVER include an address routed into the TUN. A peer candidate
+  inside a locally-tunneled subnet (`peer_routes`, e.g. connector routes `10.10.0.0/19 → bore0`
+  and the peer offers `10.10.16.138`) makes the QUIC handshake loop through the relay: it
+  succeeds, the bridge switches to direct + drops the relay halves, then the looped path dies at
+  the QUIC idle timeout (`read_datagram: timed out` ~10 s; provider sees the peer as the *overlay*
+  IP `10.99.x.x`). `filter_tunneled_candidates` drops these before punching → fall back to relay,
+  never a fake-direct path that silently dies. Conservative by design (drops even if a
+  more-specific connected route would reach it off-tunnel)
+- VPN direct upgrade is NOT one-shot: `direct_upgrade_task` retries on a fixed 30 s grid
+  (`DIRECT_RETRY_INTERVAL`, `should_retry_direct`) while on relay, so a link that came up on a
+  UDP-hostile network upgrades to direct in-place (no reconnect) once the path opens. Relay stays
+  stable through every failed attempt. Stops on success or upgrade-channel close. Both peers stay
+  aligned because the grid is anchored at pairing and the interval > worst-case attempt
+  (`DIRECT_PUNCH_WAIT` 15 s). Server broker MUST re-arm per round (reset deadline + clear `punched`
+  on each repeated `UdpCandidateOffer`) or retries never re-punch, AND clear the listener's stored
+  candidates right after each punch (else round N+1 re-punches round N's dead socket → connector
+  times out against a closed port). `--relay-only` skips it entirely. Also: the netns harness
+  (`vpn_netns_test.sh`) refuses to run against a release binary older than `src/` — rebuild with
+  `cargo build --release --features vpn` (as your user, not root) before `sudo`-running it
 
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

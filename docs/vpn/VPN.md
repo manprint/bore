@@ -347,10 +347,35 @@ background task attempts the direct upgrade in parallel:
    during the switch — IP is best-effort; TCP inside the tunnel retransmits.
 
 **If the direct attempt fails** (no punch within 15 s, `UdpUnavailable`, QUIC
-handshake timeout), the client logs
-`info!(path="relay", "direct path unavailable; staying on relay")` and the
-relay bridge keeps running untouched — there is no retry within the same
-session (a reconnect re-attempts the upgrade with a fresh nonce).
+handshake timeout, or all candidates filtered as tunneled loops), the client
+logs `info!(path="relay", …, "direct path unavailable; staying on relay, will
+retry")` and the relay bridge keeps running **untouched** — relay stability is
+never affected by a failed direct attempt.
+
+**Background retry (relay → direct).** Rather than giving up after one shot, the
+upgrade task keeps retrying on a fixed 30 s grid (`DIRECT_RETRY_INTERVAL`) while
+the link stays on relay, re-binding a fresh socket and re-offering candidates
+each round. It stops the moment direct succeeds (then the bridge switches, DEC-1)
+or the link tears down (the upgrade channel closes; the task is also `abort()`ed
+on teardown). The first attempt is immediate (try-direct-ASAP, unchanged). This
+means a link that came up on a UDP-hostile network upgrades to direct **without a
+reconnect** the moment the path opens (e.g. a firewall change, a roaming event).
+
+- **Both peers stay in sync** because each runs the same state machine anchored
+  at pairing, and the fixed-grid `interval` keeps their retry rounds aligned —
+  the server brokers a punch only when it holds **both** fresh offers within
+  `punch_timeout`. The interval (30 s) exceeds the worst-case single attempt
+  (`DIRECT_PUNCH_WAIT` 15 s), so rounds never overlap and the grids do not drift.
+- **The server broker re-arms** on every repeated `UdpCandidateOffer`: a fresh
+  offer resets the punch deadline and clears the one-round latch, so the broker
+  punches again with the latest candidates instead of staying stuck after the
+  first round. **It also clears the listener's stored candidates immediately
+  after each punch**, so the next round must wait for a *fresh* listener offer
+  rather than re-punching the previous round's now-dead socket (which would make
+  the connector time out against a closed port — exactly mirroring the first
+  round's empty-registry behaviour). `--relay-only` still disables direct
+  entirely (the task never spawns), and a successful direct switch stops the
+  retries.
 
 **If the direct path dies at runtime** (DEC-2), the bridge ends with an error
 and the process exits — or reconnects when `--auto-reconnect` is set, landing
@@ -493,6 +518,21 @@ matched the error by the substring `"TooLarge"`, but quinn's `Display` is
 `"datagram too large"`, so the check never fired and a single oversized packet
 killed the link the instant it switched to direct — surfacing as
 `Error: send_datagram: datagram too large`.)
+
+**Routing-loop guard (direct candidates):** before punching, each side drops
+any peer candidate whose IP falls inside a subnet it routes into the TUN
+(`filter_tunneled_candidates` over `peer_routes`). Reaching such an address
+would loop the QUIC handshake back through the VPN itself: e.g. a connector that
+routes `10.10.0.0/19 → bore0` and receives the peer candidate `10.10.16.138`
+(inside that range) sends the "direct" handshake *into the tunnel*. It rides the
+relay, the handshake succeeds, the bridge switches to direct and drops the relay
+halves — and the looped path immediately dies (`read_datagram: timed out`, ~10 s
+= the QUIC idle timeout, on both ends). The provider even sees the QUIC peer as
+the *overlay* address (`10.99.0.2`), the tell-tale of a looped path. Dropping
+these candidates makes the link fall back to relay (correct, if not optimal)
+instead of standing up a fake-direct path that silently dies. The guard is
+conservative: a tunneled-subnet candidate is dropped even if a more-specific
+connected route would have reached it off-tunnel.
 
 **Benchmarks:** `sudo scripts/vpn_bench.sh` produces the comparison table
 (relay 1c / relay 4c / direct / direct 4q × TCP / UDP / latency). Re-run and

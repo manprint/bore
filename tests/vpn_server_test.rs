@@ -906,6 +906,58 @@ async fn vpn_broker_timeout_sends_unavailable() {
     recv_until_unavailable(&mut c_ctrl, "connector").await;
 }
 
+/// The broker must re-broker on a REPEATED offer: a client that stays on relay
+/// keeps retrying the direct upgrade, re-offering fresh candidates each round.
+/// The broker must punch again (with the new candidates), not latch after the
+/// first round. Regression guard for the background direct-retry feature.
+#[tokio::test]
+async fn vpn_broker_rebrokers_on_repeated_offer() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_pool("10.95.0.0/16").await;
+
+    let mut l_ctrl = vpn_ctrl_connect().await;
+    l_ctrl.send(pool_hello_vpn("rebroker")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl.send(pool_connect_vpn("rebroker")).await.unwrap();
+    let c_ready = c_ctrl.recv::<ServerMessage>().await.unwrap();
+    let nonce = session_nonce_of(&c_ready);
+    let _ = l_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+
+    // Round 1: both offer; both get punched.
+    l_ctrl.send(offer("203.0.113.1:1000")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+    c_ctrl.send(offer("203.0.113.2:2000")).await.unwrap();
+    let (c_nonce, c_peer) = recv_until_punch(&mut c_ctrl, "connector r1").await;
+    assert_eq!(c_nonce, nonce);
+    assert_eq!(c_peer, vec!["203.0.113.1:1000".parse().unwrap()]);
+    let (_, l_peer) = recv_until_punch(&mut l_ctrl, "listener r1").await;
+    assert_eq!(l_peer, vec!["203.0.113.2:2000".parse().unwrap()]);
+
+    // Round 2 (retry): the connector re-offers a NEW port FIRST, while the
+    // listener has not re-offered yet. The broker must NOT re-punch the STALE
+    // round-1 listener candidate (.1:1000) — that socket is gone on the next
+    // round and the connector would time out against a dead port. It must wait
+    // for the listener's FRESH offer, then punch with that. (Without the
+    // clear-after-punch fix the broker would punch .1:1000 here immediately.)
+    c_ctrl.send(offer("203.0.113.2:2001")).await.unwrap();
+    time::sleep(Duration::from_millis(200)).await;
+    l_ctrl.send(offer("203.0.113.1:1001")).await.unwrap();
+    let (c_nonce2, c_peer2) = recv_until_punch(&mut c_ctrl, "connector r2").await;
+    assert_eq!(
+        c_nonce2, nonce,
+        "retry punch must carry the same pairing nonce"
+    );
+    assert_eq!(
+        c_peer2,
+        vec!["203.0.113.1:1001".parse().unwrap()],
+        "retry must broker the listener's FRESH candidates, not the stale round-1 ones"
+    );
+    let (_, l_peer2) = recv_until_punch(&mut l_ctrl, "listener r2").await;
+    assert_eq!(l_peer2, vec!["203.0.113.2:2001".parse().unwrap()]);
+}
+
 // ─── §3.1 Admin page VPN entries (F5) ────────────────────────────────────────
 
 const ADMIN_TOKEN: &str = "0123456789abcdef0123456789abcdef01234567";

@@ -243,6 +243,10 @@ kill $VPNPID2
 | V2-4.3 (C2) | "tun MTU adjusted" on a real WAN (PMTU static in netns) | Manual | Procedure M-3 | PENDING |
 | V2-BUGFIX | Oversized direct datagram is droppable (`DatagramSend::TooLarge`), never a fatal `Err` (link-death regression) | Automated | `holepunch::tests::datagram_too_large_is_droppable_not_fatal` | PASS (2026-06-11) |
 | V2-BUGFIX | Direct `send_batch` reports oversized packets as a drop count, sends the rest of a mixed batch | Automated | `holepunch::tests::direct_send_batch_drops_oversized_without_error` | PASS (2026-06-11) |
+| V2-BUGFIX | Routing-loop guard: drop direct candidates inside tunneled subnets (looped "direct" path dies at switch with `read_datagram: timed out`) | Automated | `vpn::tests::filter_tunneled_candidates_drops_looping_addrs` | PASS (2026-06-11) |
+| V2-RETRY | Server broker re-arms on a repeated offer (re-punches with fresh candidates, not latched after round 1) | Automated | `vpn_server_test::vpn_broker_rebrokers_on_repeated_offer` | PASS (2026-06-11) |
+| V2-RETRY | Direct-upgrade retry-loop control: keep retrying on relay, stop on success / channel close | Automated | `vpn::tests::should_retry_direct_cases` | PASS (2026-06-11) |
+| V2-RETRY | E2E: link comes up on relay (UDP blocked, retrying), then upgrades relay→direct on a later retry round after UDP unblocked, no reconnect | Netns (sudo) | `vpn_netns_test.sh` Test 15 | PENDING (needs sudo netns run) |
 | V2-4.4 | Benchmark table (relay 1c/4c, direct, direct 4q) | Bench (sudo) | `scripts/vpn_bench.sh` | PASS (2026-06-11; table in VPN.md). direct≫relay ✅; relay-4c<relay-1c on ~0.4 ms netns (expected, carriers target high-RTT WAN) — no tuning change |
 | V2-5.2/5.3 | macOS/Windows argv builders snapshots (portable) | Automated | `vpn::hostcfg_cmd::tests::cmd_macos_builders_snapshot`, `cmd_windows_builders_snapshot` | PASS |
 | V2-5.5 | CI cross check: windows-msvc, apple-darwin, android (cargo-ndk) | CI | `.github/workflows/ci.yml` job `vpn-cross-build` | PENDING (next CI run) |

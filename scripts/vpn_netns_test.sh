@@ -14,6 +14,23 @@
 set -euo pipefail
 
 BORE="${BORE:-$(dirname "$0")/../target/release/bore}"
+
+# Guard against a STALE release binary. A netns run against an old build silently
+# exercises the wrong code — a missing retry loop or bug fix then looks like a
+# test failure when it is really just an un-rebuilt binary. Build as your user
+# (NOT under sudo: a root-owned target/ poisons later `cargo` runs).
+if [ ! -x "$BORE" ]; then
+    echo "ERROR: $BORE not found. Build first (as your user, NOT root):" >&2
+    echo "  cargo build --release --features vpn" >&2
+    exit 1
+fi
+if find "$(dirname "$0")/../src" "$(dirname "$0")/../Cargo.toml" \
+        -newer "$BORE" -print -quit 2>/dev/null | grep -q .; then
+    echo "ERROR: $BORE is OLDER than the sources — stale build." >&2
+    echo "  Rebuild (as your user, NOT root):  cargo build --release --features vpn" >&2
+    exit 1
+fi
+
 SECRET="vpntest$(shuf -i 1000-9999 -n1 2>/dev/null || echo 1234)"
 POOL="10.99.0.0/16"
 SERVER_IP_NS1="10.201.0.1"   # ns1-side of veth to server
@@ -807,6 +824,70 @@ fi
 
 kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
 kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
+# ── Test 15: background direct-retry (relay → direct after UDP unblocked) ─────
+# Start with peer-to-peer UDP blocked (link comes up on relay, keeps retrying),
+# then UNBLOCK UDP mid-session and prove the link upgrades to direct on a later
+# retry round WITHOUT a reconnect — the relay stayed stable the whole time.
+echo "=== Test 15: background direct-retry upgrades relay -> direct ==="
+ip netns exec ns0 nft add table inet bore_test_block
+ip netns exec ns0 nft 'add chain inet bore_test_block bore_blk { type filter hook forward priority 0; }'
+ip netns exec ns0 nft 'add rule  inet bore_test_block bore_blk meta l4proto udp drop'
+
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id retry-test \
+    --stun-server "$STUN" \
+    >"$BORE_LOG.listen15" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id retry-test \
+    --stun-server "$STUN" \
+    >"$BORE_LOG.connect15" 2>&1 &
+BORE_CONNECT_PID=$!
+
+# Phase 1: blocked → relay, and the connector announces it will retry.
+if wait_for_log "$BORE_LOG.connect15" "staying on relay, will retry" 40; then
+    pass "retry: connector on relay and scheduling retries"
+else
+    fail "retry: connector did not log a scheduled retry within 40s"
+    echo "  [connector log]: $(tail -5 "$BORE_LOG.connect15" 2>/dev/null | tr '\n' '|')"
+fi
+NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+if [ -n "$NS1_OVL" ] && ip netns exec ns2 ping -c 2 -W 5 "$NS1_OVL" >/dev/null 2>&1; then
+    pass "retry: ping over relay while direct is blocked"
+else
+    fail "retry: ping failed over relay while direct is blocked"
+fi
+
+# Phase 2: unblock UDP; the next retry round must upgrade to direct (≤ one
+# DIRECT_RETRY_INTERVAL of 30 s + slack), no reconnect.
+ip netns exec ns0 nft delete table inet bore_test_block 2>/dev/null || true
+echo "  (UDP unblocked; waiting for a retry round to upgrade to direct)"
+if wait_for_log "$BORE_LOG.connect15" "upgraded to direct" 45 && \
+   wait_for_log "$BORE_LOG.listen15" "upgraded to direct" 45; then
+    pass "retry: link upgraded relay -> direct on a later retry round"
+    # The relay must have stayed stable — no link-lost/reconnect in between.
+    if grep -qi "vpn link lost\|reconnecting" "$BORE_LOG.connect15" 2>/dev/null; then
+        fail "retry: link reconnected instead of in-place upgrade"
+    else
+        pass "retry: relay stayed stable (no reconnect) until the upgrade"
+    fi
+    sleep 0.5
+    NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    LOSS=$(ip netns exec ns2 ping -c 10 -i 0.2 -W 3 "$NS1_OVL" 2>/dev/null | grep -oP '\d+(?=% packet loss)' || echo 100)
+    [ "$LOSS" = "0" ] && pass "retry: direct path ping 0% loss after upgrade" \
+        || fail "retry: direct path ping ${LOSS}% loss after upgrade"
+else
+    fail "retry: did not upgrade to direct within 45s after unblock"
+    echo "  [connector log]: $(tail -8 "$BORE_LOG.connect15" 2>/dev/null | tr '\n' '|')"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+ip netns exec ns0 nft delete table inet bore_test_block 2>/dev/null || true
 sleep 0.5
 
 # ── Summary ────────────────────────────────────────────────────────────────────

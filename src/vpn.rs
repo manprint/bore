@@ -337,6 +337,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
                 mtu: args.mtu,
             },
             admin_v2,
+            peer_routes.clone(),
         );
         Some(tokio::spawn(direct_upgrade_task(
             ctx,
@@ -463,6 +464,13 @@ struct DirectUpgradeCtx {
     tun_name: String,
     /// Initial TUN MTU (the PMTU monitor's starting point).
     mtu: u16,
+    /// Subnets this node routes INTO the TUN (`peer_routes`). A direct-path
+    /// candidate whose IP falls inside one of these is only "reachable" by
+    /// looping back through the VPN itself: the QUIC handshake rides the relay
+    /// tunnel, succeeds, then dies the moment the relay halves are dropped at
+    /// the switch to direct (`read_datagram: timed out`). Such candidates are
+    /// filtered out before punching (see [`filter_tunneled_candidates`]).
+    tunneled_subnets: Vec<crate::shared::Ipv4Net>,
 }
 
 impl DirectUpgradeCtx {
@@ -471,6 +479,7 @@ impl DirectUpgradeCtx {
         to: &str,
         args: &CommonDirectArgs<'_>,
         admin_v2: bool,
+        tunneled_subnets: Vec<crate::shared::Ipv4Net>,
     ) -> Self {
         let endpoint = crate::transport::Endpoint::parse(to);
         DirectUpgradeCtx {
@@ -486,6 +495,7 @@ impl DirectUpgradeCtx {
             admin_v2,
             tun_name: args.tun_name.to_string(),
             mtu: args.mtu,
+            tunneled_subnets,
         }
     }
 }
@@ -506,26 +516,108 @@ struct CommonDirectArgs<'a> {
 const DIRECT_PUNCH_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 /// How long the listener waits for the peer's QUIC connection after the punch.
 const DIRECT_ACCEPT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Cadence of the background direct-upgrade retry while the link is on relay.
+///
+/// Both peers run the same state machine anchored at pairing, so a fixed-grid
+/// `interval` keeps their retry rounds aligned (the server brokers a punch only
+/// when it holds BOTH offers within `punch_timeout`). Must exceed the worst-case
+/// single attempt (`DIRECT_PUNCH_WAIT` 15 s ≥ a stalled round) so rounds never
+/// overlap and the two sides stay on the same 30 s grid.
+const DIRECT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Background task that attempts the relay → direct upgrade (one shot).
+/// Decide whether the direct-upgrade loop should run another round. It stops
+/// once direct is achieved (`succeeded`) or the bridge's upgrade channel is gone
+/// (`upgrade_closed` — the link is tearing down); otherwise it keeps retrying
+/// while on relay when `retry_enabled`.
+fn should_retry_direct(succeeded: bool, retry_enabled: bool, upgrade_closed: bool) -> bool {
+    retry_enabled && !succeeded && !upgrade_closed
+}
+
+/// Background task that attempts the relay → direct upgrade and, while the link
+/// stays on relay, keeps retrying on a fixed grid ([`DIRECT_RETRY_INTERVAL`]).
 ///
 /// On success it pushes the new `Direct` link halves into the bridge's upgrade
-/// channel (DEC-1) and logs `path = "direct"`. On any failure it logs once and
-/// returns — the relay bridge keeps running untouched.
+/// channel (DEC-1), logs `path = "direct"`, and stops. On failure it logs and
+/// retries on the next tick — the relay bridge keeps running untouched the whole
+/// time (relay stability is never affected by a failed direct attempt). It gives
+/// up only when the upgrade channel closes (the link is being torn down; the
+/// task is also `abort()`ed by the caller on teardown). The first attempt is
+/// immediate (`interval`'s first tick fires at once), preserving the original
+/// try-direct-ASAP behaviour.
 async fn direct_upgrade_task(
     ctx: DirectUpgradeCtx,
     out_tx: tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
     mut event_rx: tokio::sync::mpsc::Receiver<CtrlEvent>,
     upgrade_tx: tokio::sync::mpsc::Sender<(link::LinkSender, link::LinkRecver)>,
 ) {
-    if let Err(e) = try_direct_upgrade(&ctx, &out_tx, &mut event_rx, &upgrade_tx).await {
-        info!(
-            link_id = %ctx.link_id,
-            error = %e,
-            path = "relay",
-            "direct path unavailable; staying on relay"
-        );
+    let mut ticker = tokio::time::interval(DIRECT_RETRY_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut attempt: u32 = 0;
+    loop {
+        ticker.tick().await; // immediate on the first iteration
+        attempt += 1;
+        match try_direct_upgrade(&ctx, &out_tx, &mut event_rx, &upgrade_tx).await {
+            Ok(()) => return, // direct achieved — stop retrying
+            Err(e) => {
+                let will_retry = should_retry_direct(false, true, upgrade_tx.is_closed());
+                if will_retry {
+                    info!(
+                        link_id = %ctx.link_id,
+                        error = %e,
+                        attempt,
+                        retry_in = ?DIRECT_RETRY_INTERVAL,
+                        path = "relay",
+                        "direct path unavailable; staying on relay, will retry"
+                    );
+                } else {
+                    info!(
+                        link_id = %ctx.link_id,
+                        error = %e,
+                        attempt,
+                        path = "relay",
+                        "direct path unavailable; staying on relay"
+                    );
+                    return;
+                }
+            }
+        }
     }
+}
+
+/// Drop direct-path candidates whose IP falls inside a subnet this node routes
+/// into the TUN. Reaching such a candidate would loop back through the VPN
+/// itself (the QUIC handshake rides the relay tunnel, succeeds, then dies when
+/// the relay halves are dropped at the switch to direct — observed as
+/// `read_datagram: timed out` ~10 s after `path="direct"`). Returns
+/// `(kept, dropped)`. With no tunneled subnets nothing is filtered.
+///
+/// Note: this is intentionally conservative — if a candidate inside a tunneled
+/// subnet is *also* reachable off-tunnel via a more-specific connected route,
+/// it is still dropped and the link stays on relay. Relay is correct (just not
+/// optimal); a looped "direct" path that silently dies is not.
+fn filter_tunneled_candidates(
+    peers: &[std::net::SocketAddr],
+    tunneled: &[crate::shared::Ipv4Net],
+) -> (Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>) {
+    if tunneled.is_empty() {
+        return (peers.to_vec(), Vec::new());
+    }
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for &p in peers {
+        let routed_into_tun = match p.ip() {
+            std::net::IpAddr::V4(v4) => tunneled.iter().any(|n| n.contains(v4)),
+            // The overlay is IPv4-only; an IPv6 candidate never matches a
+            // tunneled subnet, so it can never loop.
+            std::net::IpAddr::V6(_) => false,
+        };
+        if routed_into_tun {
+            dropped.push(p);
+        } else {
+            kept.push(p);
+        }
+    }
+    (kept, dropped)
 }
 
 async fn try_direct_upgrade(
@@ -579,6 +671,22 @@ async fn try_direct_upgrade(
         } => (nonce, peer, tuning),
         CtrlEvent::Unavailable => bail!("server reported the direct path unavailable"),
     };
+
+    // 5b. Routing-loop guard: drop candidates inside subnets we route into the
+    //     TUN — connecting to them would loop the QUIC handshake back through
+    //     the relay and the "direct" path would die at the switch (DEC-2).
+    let (peer, dropped) = filter_tunneled_candidates(&peer, &ctx.tunneled_subnets);
+    if !dropped.is_empty() {
+        info!(
+            link_id = %ctx.link_id,
+            ?dropped,
+            "skipping direct candidates inside tunneled subnets (would loop through the VPN)"
+        );
+    }
+    anyhow::ensure!(
+        !peer.is_empty(),
+        "all direct candidates are inside tunneled subnets; staying on relay"
+    );
 
     // 6. Hole-punch + QUIC with the token both peers derive from (secret, nonce).
     let token = crate::holepunch::derive_token(Some(&ctx.secret), &nonce);
@@ -909,6 +1017,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
                 mtu: args.mtu,
             },
             admin_v2,
+            peer_routes.clone(),
         );
         Some(tokio::spawn(direct_upgrade_task(
             ctx,
@@ -3522,6 +3631,54 @@ mod tests {
         assert_eq!(pmtu_decision(1350, &[65000, 65000, 65000]), Some(9000));
         // Only the LAST 3 samples matter.
         assert_eq!(pmtu_decision(1350, &[100, 1450, 1450, 1450]), Some(1450));
+    }
+
+    /// Routing-loop guard: direct candidates inside a tunneled subnet are
+    /// dropped (they would loop the QUIC handshake back through the relay and
+    /// the "direct" link would die at the switch — `read_datagram: timed out`).
+    #[test]
+    fn filter_tunneled_candidates_drops_looping_addrs() {
+        let parse = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        let net = |s: &str| s.parse::<crate::shared::Ipv4Net>().unwrap();
+
+        // Reproduces the field bug: peer offers a public + a LAN candidate; the
+        // LAN one (10.10.16.138) is inside the tunneled 10.10.0.0/19.
+        let peers = vec![parse("91.81.116.61:35444"), parse("10.10.16.138:35444")];
+        let tunneled = vec![net("10.10.0.0/19"), net("172.31.0.0/16")];
+        let (kept, dropped) = filter_tunneled_candidates(&peers, &tunneled);
+        assert_eq!(kept, vec![parse("91.81.116.61:35444")]);
+        assert_eq!(dropped, vec![parse("10.10.16.138:35444")]);
+
+        // No tunneled subnets (e.g. the connector advertised nothing) → keep all.
+        let (kept, dropped) = filter_tunneled_candidates(&peers, &[]);
+        assert_eq!(kept, peers);
+        assert!(dropped.is_empty());
+
+        // All candidates inside tunneled subnets → nothing kept (caller bails to relay).
+        let only_lan = vec![parse("10.10.1.1:1"), parse("172.31.9.9:2")];
+        let (kept, dropped) = filter_tunneled_candidates(&only_lan, &tunneled);
+        assert!(kept.is_empty());
+        assert_eq!(dropped.len(), 2);
+
+        // IPv6 candidate never matches an IPv4 tunneled subnet.
+        let v6 = vec![parse("[2001:db8::1]:9")];
+        let (kept, dropped) = filter_tunneled_candidates(&v6, &tunneled);
+        assert_eq!(kept, v6);
+        assert!(dropped.is_empty());
+    }
+
+    /// Direct-upgrade retry loop control: keep retrying on relay, stop on
+    /// success or when the upgrade channel closes (link teardown).
+    #[test]
+    fn should_retry_direct_cases() {
+        // Failed attempt, retry enabled, channel open → retry.
+        assert!(should_retry_direct(false, true, false));
+        // Succeeded → stop (direct achieved).
+        assert!(!should_retry_direct(true, true, false));
+        // Upgrade channel closed (link tearing down) → stop.
+        assert!(!should_retry_direct(false, true, true));
+        // Retry disabled → stop after one shot.
+        assert!(!should_retry_direct(false, false, false));
     }
 
     /// §4.3 — urgent one-sample shrink (fast recovery after a direct switch).

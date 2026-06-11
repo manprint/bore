@@ -725,6 +725,17 @@ pub async fn serve_vpn_connector(
                         let _ = to_provider.send(fwd).await;
                         info!(%id, "brokered vpn udp punch to both peers");
                         punched = true;
+                        // Consume the listener's candidates: on the next retry
+                        // round (the client keeps retrying while on relay) its
+                        // socket will have changed, so a stale candidate here
+                        // would make the connector punch a DEAD port and time
+                        // out. Clearing forces the next round to wait for a
+                        // FRESH listener offer — mirroring the first round's
+                        // empty-registry behaviour.
+                        if let Some(mut e) = udp_providers.get_mut(&udp_id) {
+                            e.candidates.clear();
+                            e.selected_stun = None;
+                        }
                     }
                     Some(_) => {
                         // Listener registered but has not offered candidates yet:
@@ -755,15 +766,21 @@ pub async fn serve_vpn_connector(
             msg = control.recv::<ClientMessage>() => {
                 match msg {
                     Ok(Some(ClientMessage::UdpCandidateOffer(consumer_offer))) => {
+                        // A fresh offer begins a new direct-upgrade round (the
+                        // client retries while staying on relay): re-arm the
+                        // broker so it punches again with the latest candidates,
+                        // even after a prior round already punched or timed out.
                         connector_offer = Some(consumer_offer);
-                        offer_deadline.get_or_insert_with(|| tokio::time::Instant::now() + punch_timeout);
+                        offer_deadline = Some(tokio::time::Instant::now() + punch_timeout);
+                        punched = false;
                     }
                     Ok(Some(ClientMessage::UdpCandidates(consumer_cands))) => {
                         connector_offer = Some(crate::shared::UdpCandidateOffer {
                             candidates: consumer_cands,
                             selected_stun: None,
                         });
-                        offer_deadline.get_or_insert_with(|| tokio::time::Instant::now() + punch_timeout);
+                        offer_deadline = Some(tokio::time::Instant::now() + punch_timeout);
+                        punched = false;
                     }
                     Ok(Some(ClientMessage::VpnPathReport { path })) => {
                         admin_reg.set_vpn_direct(path == "direct");

@@ -1,6 +1,6 @@
 FROM alpine:latest
 
-RUN apk add --no-cache curl bash
+RUN apk add --no-cache curl bash iproute2 nftables iptables
 
 ARG BORE_SCRIPT_URL=https://short.sish.adiprint.it/bore
 ENV BORE_SCRIPT_URL=${BORE_SCRIPT_URL}

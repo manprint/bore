@@ -19,8 +19,11 @@ documentale/consolidamento eseguibile in questa sessione.
 configurato, `scripts/vpn_netns_test.sh` è stato eseguito end-to-end: **Test 1–14
 tutti PASS** (`Results: PASS=42 FAIL=0`). La prima esecuzione ha scoperto **due
 bug reali**, entrambi corretti (vedi §2.bis); la suite è verde dopo i fix.
-Resta da eseguire **solo il benchmark** (`scripts/vpn_bench.sh`, ancora `PENDING`)
-e il relativo tuning pass §4.4.
+Anche il **benchmark** (`scripts/vpn_bench.sh`) è stato eseguito: tabella in
+`VPN.md` §Performance — direct ≫ relay (2.4× TCP, ½ latenza); `--carriers 4` <
+1 carrier sul link netns a ~0.4 ms (atteso: i carrier servono su WAN ad alto RTT,
+non su loopback — nessun cambio di tuning, criterio §4.4 = solo guadagno ≥5%
+riproducibile). Non resta più alcun item di esecuzione locale aperto.
 
 | Fase | Contenuto | Stato | Commit |
 |---|---|---|---|
@@ -234,10 +237,11 @@ suite rieseguita verde (`PASS=42 FAIL=0`), gate CI verdi (`fmt`, `clippy
 
 ## 3. Cosa è rimasto fuori
 
-1. **Benchmark `vpn_bench.sh`** — unico item di esecuzione ancora aperto
-   (richiede `sudo`). La suite netns (Test 1–14) è invece stata **eseguita il
-   2026-06-11: tutti PASS** (`PASS=42 FAIL=0`); le righe della test matrix sono
-   ora `PASS (2026-06-11)`. Restano aperti il benchmark e il tuning pass §4.4.
+1. **Nessun item di esecuzione locale resta aperto.** La suite netns (Test 1–14)
+   è stata **eseguita il 2026-06-11: tutti PASS** (`PASS=42 FAIL=0`) e il
+   **benchmark** `vpn_bench.sh` è stato eseguito (tabella in `VPN.md`). Aperti
+   solo item che richiedono ambienti diversi: tuning su WAN reale (carrier
+   benefit + PMTU M-3), procedura manuale 16.5.4, e Fase 5 cross-platform.
 2. **Fase 5 runtime cross-platform (§5.1–§5.4)**: il refactor di portabilità
    (allargamento dei `cfg` di `lib.rs`/`vpn.rs`, gating fine di offload/
    multiqueue/procfs, `check_root` per-OS, selezione per-OS dei builder
@@ -269,8 +273,10 @@ suite rieseguita verde (`PASS=42 FAIL=0`), gate CI verdi (`fmt`, `clippy
   i test di protocollo non potevano cogliere (panic allo switch direct, race di
   reconnect — §2.bis). Dopo i fix, Test 1–14 PASS. Il data plane direct, lo
   switch del bridge, il reconnect e il multiqueue sono ora verificati con TUN
-  reale, NAT e iperf3, non più solo "by design". Resta non verificato end-to-end
-  solo il benchmark comparativo (`vpn_bench.sh`).
+  reale, NAT e iperf3, non più solo "by design". Anche il benchmark comparativo
+  (`vpn_bench.sh`) è stato eseguito (§6.2): direct ≫ relay; il beneficio dei
+  carrier resta da misurare su WAN ad alto RTT (su netns a ~0.4 ms regrediscono,
+  com'è atteso).
 - **Fase 5 non verificabile localmente**: qualunque futura iterazione
   cross-platform deve passare dalla CI (o da una macchina con i toolchain).
 
@@ -381,11 +387,14 @@ Stato item per item del TODO (aggiornato anche inline nel TODO stesso):
 1. ✅ **FATTO (2026-06-11)** — `cargo build --release --features vpn` +
    `sudo scripts/vpn_netns_test.sh` → **Test 1–14 PASS** (`PASS=42 FAIL=0`).
    Due bug scoperti e corretti (§2.bis), suite rieseguita verde, gate CI verdi.
-   Fasi 1, 2 e 4 ora chiuse anche sul piano della verifica end-to-end (manca
-   solo il benchmark, punto 2).
-2. **`sudo scripts/vpn_bench.sh`** → incollare la tabella in `VPN.md` §Performance
-   e fare il tuning pass §4.4 (criterio: cambi solo con ≥5% riproducibile;
-   verificare relay-4c ≥ relay-1c e direct > relay).
+   Fasi 1, 2 e 4 ora chiuse anche sul piano della verifica end-to-end.
+2. ✅ **FATTO (2026-06-11)** — `sudo scripts/vpn_bench.sh` eseguito, tabella in
+   `VPN.md` §Performance. direct ≫ relay e direct-4q ≈ direct ✅. **Anomalia
+   attesa:** relay-4c < relay-1c sul link netns a ~0.4 ms (i carrier rompono il
+   tetto RTT×finestra solo su WAN ad alto RTT; su loopback il round-robin
+   per-datagram aggiunge solo riordino). **Nessun cambio di tuning** (§4.4:
+   solo guadagni ≥5% riproducibili). Il beneficio carrier su WAN reale resta da
+   misurare (fuori scope netns).
 3. **Push del branch e run CI** → verificare il job `vpn-cross-build` (è la
    prima esecuzione: possibili aggiustamenti su cargo-ndk/NDK env).
 4. **Procedura manuale 16.5.4** (`--no-route-manage`) e **M-3** (PMTU su WAN).

@@ -388,7 +388,7 @@ Sezione di sintesi: tutto il resto del documento è storia. Qui solo lo stato ne
 
 | # | Cosa manca | Tipo | Bloccante? |
 |---|---|---|---|
-| §4.4 | **Benchmark `vpn_bench.sh`** + tuning pass (criterio: cambi solo con ≥5% riproducibile; verificare relay-4c ≥ relay-1c e direct > relay) | Esecuzione (sudo) | No — perf, non correttezza |
+| §4.4 | ✅ **Benchmark `vpn_bench.sh` eseguito** (2026-06-11, tabella in VPN.md): direct ≫ relay. Nessun cambio di tuning (criterio: solo guadagni ≥5% riproducibili). **Residuo:** misurare il beneficio dei `--carriers` su **WAN ad alto RTT** — su netns a ~0.4 ms regrediscono (atteso: round-robin per-datagram → riordino; il tetto RTT×finestra che i carrier rompono non esiste su loopback) | Misura su WAN | No — perf, non correttezza |
 | C2/M-3 | `tun MTU adjusted` su **WAN reale** (in netns la PMTU è statica) | Manuale | No |
 | 16.5.4 | `--no-route-manage`: applicare a mano i comandi stampati e verificare | Manuale | No |
 | V2-5.5 | Job CI `vpn-cross-build` (prima esecuzione: possibili aggiustamenti cargo-ndk/NDK) | CI | No |

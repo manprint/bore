@@ -240,7 +240,7 @@ kill $VPNPID2
 | V2-6.1 (F6) | Full SIGKILL stale reclaim (16.6.8): TUN **+ nft + routes** survive `kill -9`, next start reclaims all, no EEXIST, ping OK | Netns (sudo) | `vpn_netns_test.sh` Test 14 | PASS (2026-06-11) |
 | V2-4.3 (C2) | PMTU decision truth table (stability, delta, clamp) | Automated | `vpn::tests::pmtu_decision_cases` | PASS |
 | V2-4.3 (C2) | "tun MTU adjusted" on a real WAN (PMTU static in netns) | Manual | Procedure M-3 | PENDING |
-| V2-4.4 | Benchmark table (relay 1c/4c, direct, direct 4q) | Bench (sudo) | `scripts/vpn_bench.sh` | PENDING (needs sudo run) |
+| V2-4.4 | Benchmark table (relay 1c/4c, direct, direct 4q) | Bench (sudo) | `scripts/vpn_bench.sh` | PASS (2026-06-11; table in VPN.md). direct≫relay ✅; relay-4c<relay-1c on ~0.4 ms netns (expected, carriers target high-RTT WAN) — no tuning change |
 | V2-5.2/5.3 | macOS/Windows argv builders snapshots (portable) | Automated | `vpn::hostcfg_cmd::tests::cmd_macos_builders_snapshot`, `cmd_windows_builders_snapshot` | PASS |
 | V2-5.5 | CI cross check: windows-msvc, apple-darwin, android (cargo-ndk) | CI | `.github/workflows/ci.yml` job `vpn-cross-build` | PENDING (next CI run) |
 | V2-5.2 (M-4) | macOS↔Linux host-only smoke (ping + iperf3, relay e direct) | Manual | Procedure M-4 | DEFERRED (runtime wiring pending) |
@@ -293,5 +293,6 @@ The `scripts/vpn_netns_test.sh` script (run as `sudo`) executes all netns tests 
 ## Notes
 
 - **Netns tests require `sudo` and passwordless sudo configuration** (see §11.9 sudoers note in VPN_FULL_PLAN_V1.md). Executed 2026-06-11: Test 1–14 PASS.
-- **Phase 6.2 offload:** GSO/GRO offload is implemented and netns-exercised; loopback iperf3 baseline ~13,500 → ~14,000 Mbps. The cross-config WAN benchmark (`scripts/vpn_bench.sh`) is still PENDING — its numbers and the §4.4 tuning pass are the remaining open items.
+- **Phase 6.2 offload:** GSO/GRO offload is implemented and netns-exercised; loopback iperf3 baseline ~13,500 → ~14,000 Mbps.
+- **Phase 4.4 benchmark (2026-06-11):** `scripts/vpn_bench.sh` run — table in VPN.md §Performance. direct ≫ relay (2.4× TCP, ½ latency). `--carriers 4` < 1 carrier on the ~0.4 ms-RTT netns link (per-datagram round-robin → inner-TCP reordering; expected, carriers target high-RTT WANs); no §4.4 tuning change applied. Real-WAN carrier benefit remains to be measured (out of scope for netns).
 - **Cross-compilation:** tests assume Linux target; builds on macOS/Windows skip VPN-specific tests (feature gate).

@@ -2,7 +2,7 @@
 
 > Stato di partenza: branch `vpn`, commit `1a5df0b` (post-fix A0 waker yamux).
 > Documento progettato per essere eseguito **linearmente** da un agente di coding IA
-> (target: Sonnet 4.6), fase per fase, sottofase per sottofase, senza salti nel buio.
+> (targets: Sonnet 4.6, Opus 4.8, Fable), fase per fase, sottofase per sottofase, senza salti nel buio.
 >
 > **Obiettivo finale:** massima stabilità dell'applicazione, massima banda sfruttata
 > sui path dati (direct e relay), minima latenza possibile.

@@ -1423,6 +1423,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     nat_udp_preferred_port: args.nat_udp_preferred_port,
                     nat_udp_release_timeout: args.nat_udp_release_timeout,
                     relay_only: args.relay_only,
+                    auto_reconnect: args.auto_reconnect,
                     notes: args.notes,
                 };
 
@@ -1467,6 +1468,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     nat_udp_preferred_port: args.nat_udp_preferred_port,
                     nat_udp_release_timeout: args.nat_udp_release_timeout,
                     relay_only: args.relay_only,
+                    auto_reconnect: args.auto_reconnect,
                     notes: args.notes,
                 };
 

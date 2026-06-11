@@ -279,7 +279,28 @@ On exit, only the TUN interface is removed; the manually-applied routes and rule
 
 ## Automatic Reconnection
 
-With `--auto-reconnect`, the client reconnects on link failure with exponential backoff (1, 2, 4, 8, 16, 32 seconds, then every 32 seconds). The TUN interface and routes are re-validated (not duplicated); the same overlay address is reused if the pool is still available. On reconnection failure, logs show `warn!` and the retry schedule; on success, the backoff resets.
+With `--auto-reconnect`, the client retries on link failure with exponential
+backoff (1, 2, 4, 8, 16, 32 seconds, then every 32 seconds). Each attempt is a
+**full teardown + rebuild** (DEC-5): the TUN is destroyed and re-created, and
+`NetConfig` is reverted and re-applied — `ip route replace` keeps the re-apply
+idempotent even if a previous teardown was incomplete. With pool addressing the
+overlay /30 may change across reconnects (the server re-allocates); static
+addressing keeps the same addresses. The direct-path upgrade is re-attempted on
+every reconnect with a fresh nonce.
+
+An attempt that stayed up for more than 60 seconds resets the backoff to 1 s,
+so a long-lived link that drops reconnects promptly.
+
+**Fatal errors stop the loop** — retrying a configuration mistake would fail
+identically forever: missing root/`CAP_NET_ADMIN`, missing `ip` binary,
+`VpnError` for overlapping subnets, addressing mode mismatch, static mirror
+mismatch, exhausted pool, missing server pool, or `vpn-max-links`. The process
+exits non-zero with the error.
+
+**Deliberate exception:** `vpn id already in use` IS retried (with a `warn!`).
+During a reconnect the server-side handler of the previous session can take a
+few seconds to notice the dead connection and release the id; one or two
+backoff rounds resolve it.
 
 ---
 

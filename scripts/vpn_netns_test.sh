@@ -550,6 +550,108 @@ kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
 kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
 sleep 0.5
 
+# ── Test 10: server drop → auto-reconnect ─────────────────────────────────────
+echo "=== Test 10: --auto-reconnect after server kill ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id reconnect-test \
+    --advertise "$FAKE_LAN" --auto-reconnect --relay-only \
+    >"$BORE_LOG.listen10" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id reconnect-test \
+    --auto-reconnect --relay-only \
+    >"$BORE_LOG.connect10" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.listen10" "vpn link paired" 10; then
+    sleep 1
+    NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    ip netns exec ns2 ping -c 2 -W 3 "$NS1_OVL" >/dev/null 2>&1 \
+        && pass "reconnect: initial ping ok" || fail "reconnect: initial ping failed"
+
+    # Kill the SERVER hard; both clients must enter the reconnect loop.
+    kill -9 "$BORE_SERVER_PID" 2>/dev/null; BORE_SERVER_PID=""
+    if wait_for_log "$BORE_LOG.listen10" "vpn link lost; reconnecting" 15 && \
+       wait_for_log "$BORE_LOG.connect10" "vpn link lost; reconnecting" 15; then
+        pass "reconnect: both sides report 'vpn link lost; reconnecting'"
+    else
+        fail "reconnect: clients did not enter the reconnect loop"
+    fi
+
+    # Restart the server (same command).
+    ip netns exec ns0 "$BORE" server \
+        --secret "$SECRET" \
+        --vpn --vpn-pool "$POOL" --vpn-max-links 16 \
+        --udp --bind-addr 0.0.0.0 \
+        >"$BORE_LOG.server" 2>&1 &
+    BORE_SERVER_PID=$!
+
+    # Re-pairing = a SECOND "vpn link paired" in the listener log.
+    REPAIRED=0
+    for _ in $(seq 1 900); do
+        [ "$(grep -c 'vpn link paired' "$BORE_LOG.listen10" 2>/dev/null)" -ge 2 ] && { REPAIRED=1; break; }
+        sleep 0.1
+    done
+    if [ "$REPAIRED" = "1" ]; then
+        pass "reconnect: link re-paired after server restart"
+        sleep 2
+        NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+        ip netns exec ns2 ping -c 3 -W 5 "$NS1_OVL" >/dev/null 2>&1 \
+            && pass "reconnect: ping ok after re-pair" || fail "reconnect: ping failed after re-pair"
+    else
+        fail "reconnect: link did not re-pair within 90s"
+        echo "  [listener log]: $(tail -5 "$BORE_LOG.listen10" 2>/dev/null | tr '\n' '|')"
+    fi
+
+    # Regression §0.1: no EEXIST and no duplicated routes after the re-apply.
+    if grep -qi "file exists" "$BORE_LOG.listen10" "$BORE_LOG.connect10" 2>/dev/null; then
+        fail "reconnect: 'File exists' route error found in logs (route replace regression)"
+    else
+        pass "reconnect: no 'File exists' route errors"
+    fi
+    ROUTE_COUNT=$(ip netns exec ns2 ip route show 2>/dev/null | grep -c "$FAKE_LAN" || true)
+    if [ "$ROUTE_COUNT" -le 1 ]; then
+        pass "reconnect: no duplicate routes in ns2 (count=$ROUTE_COUNT)"
+    else
+        fail "reconnect: duplicate routes in ns2 (count=$ROUTE_COUNT)"
+    fi
+else
+    fail "reconnect: initial pairing failed"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 1
+
+# ── Test 11: fatal error must NOT loop with --auto-reconnect ──────────────────
+echo "=== Test 11: fatal error exits despite --auto-reconnect ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id fatal-test \
+    --advertise "192.168.7.0/24" \
+    >"$BORE_LOG.listen11" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+# Connector advertises an overlapping subnet → fatal VpnError; with
+# --auto-reconnect it must still exit non-zero quickly (no infinite loop).
+FATAL_EXIT=0
+timeout 15 ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id fatal-test \
+    --advertise "192.168.7.0/24" --auto-reconnect \
+    >"$BORE_LOG.connect11" 2>&1 || FATAL_EXIT=$?
+if [ "$FATAL_EXIT" -ne 0 ] && [ "$FATAL_EXIT" -ne 124 ]; then
+    pass "fatal error: connector exited non-zero ($FATAL_EXIT) without looping"
+elif [ "$FATAL_EXIT" -eq 124 ]; then
+    fail "fatal error: connector still running after 15s (reconnect loop on a fatal error)"
+else
+    fail "fatal error: connector exited zero (expected failure)"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+sleep 0.3
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Results: PASS=$PASS FAIL=$FAIL ==="

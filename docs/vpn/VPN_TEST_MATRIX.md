@@ -226,6 +226,10 @@ kill $VPNPID2
 | V2-1.6 (F2) | UDP blocked between peers → automatic relay fallback, ping works | Netns (sudo) | `vpn_netns_test.sh` Test 7 | PENDING (needs sudo run) |
 | V2-1.6 (F2) | Direct path gateway mode: LAN ping + TCP through gateway (MSS clamp / GSO) | Netns (sudo) | `vpn_netns_test.sh` Test 8 | PENDING (needs sudo run) |
 | V2-1.6 (F2) | `--relay-only`: no direct upgrade ever, ping works | Netns (sudo) | `vpn_netns_test.sh` Test 9 | PENDING (needs sudo run) |
+| V2-2.1 (A2) | Fatal-vs-retryable classification (FatalVpnError, "already in use" retryable) | Automated | `vpn::tests::fatal_classification` | PASS |
+| V2-2.2 (A2) | Reconnect loop: retries retryable, stops on fatal, once with auto=false | Automated | `vpn::tests::run_with_reconnect_counts` | PASS |
+| V2-2.3 (F1/F3) | Server kill -9 → both clients reconnect, re-pair, ping OK, no EEXIST/dup routes | Netns (sudo) | `vpn_netns_test.sh` Test 10 | PENDING (needs sudo run) |
+| V2-2.3 (F1/F3) | Fatal error (overlap) with `--auto-reconnect` exits non-zero, no loop | Netns (sudo) | `vpn_netns_test.sh` Test 11 | PENDING (needs sudo run) |
 
 ---
 

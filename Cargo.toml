@@ -70,7 +70,7 @@ tun-rs = { version = "2.8.5", optional = true, features = ["async"] }
 lazy_static = "1.4.0"
 rcgen = "0.14.8"
 rstest = "0.15.0"
-tokio = { version = "1.41.0", features = ["sync"] }
+tokio = { version = "1.41.0", features = ["sync", "test-util"] }
 
 [profile.release]
 lto = true

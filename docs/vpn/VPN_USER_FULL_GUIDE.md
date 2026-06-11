@@ -547,19 +547,24 @@ sudo bore vpn connect \
 
 **Behavior on reconnect:**
 
-- TUN device is reused; it is not removed and re-created between reconnects.
-- Routes and NAT rules are re-validated and reinstalled if missing.
-- The same overlay address is requested (if pool is available) or used (static mode).
-- On successful reconnect, backoff resets to 1 second.
+- Each attempt is a full teardown + rebuild: the TUN is destroyed and
+  re-created, routes/NAT are reverted and re-applied (`ip route replace` makes
+  the re-apply idempotent).
+- With pool addressing the overlay /30 **may change** across reconnects (the
+  server re-allocates); use static addressing if you need stable addresses.
+- The direct-path upgrade is re-attempted on every reconnect (fresh nonce).
+- An attempt that stayed up >60 s resets the backoff to 1 second.
+- **Fatal configuration errors exit instead of looping**: overlap, addressing
+  mode mismatch, static mismatch, pool exhausted, no server pool, max-links,
+  missing root or `ip` binary. Exception: `vpn id already in use` is retried
+  (the previous server-side session may take a few seconds to die).
 
 **Log output during reconnect loop:**
 
 ```
-warn vpn_link_dropped link_id=mylink reason="connection reset"
-info vpn_reconnecting attempt=1 delay=1s
-warn vpn_reconnect_failed attempt=1 delay=2s
-info vpn_reconnecting attempt=2 delay=2s
-info vpn_link_paired link_id=mylink path=relay overlay=10.99.0.2/30
+warn vpn link lost; reconnecting error="server closed the vpn control stream" delay=1s
+info vpn listener starting link_id=mylink
+info vpn link paired link_id=mylink path=relay overlay=10.99.0.2/30
 ```
 
 **Ctrl-C during reconnect:** cancels the reconnect loop cleanly; all installed state is removed.

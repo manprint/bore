@@ -39,6 +39,8 @@ pub struct VpnListenArgs {
     pub nat_udp_release_timeout: u64,
     /// Never attempt the direct UDP path (stay on the server relay).
     pub relay_only: bool,
+    /// Reconnect with backoff when the link drops (full teardown + rebuild).
+    pub auto_reconnect: bool,
     /// Optional notes.
     pub notes: Option<String>,
 }
@@ -76,17 +78,102 @@ pub struct VpnConnectArgs {
     pub nat_udp_release_timeout: u64,
     /// Never attempt the direct UDP path (stay on the server relay).
     pub relay_only: bool,
+    /// Reconnect with backoff when the link drops (full teardown + rebuild).
+    pub auto_reconnect: bool,
     /// Optional notes.
     pub notes: Option<String>,
 }
 
-/// Start a VPN listener.
+/// Non-retryable configuration error: retrying would yield the same outcome
+/// (duplicate id at first attempt is the deliberate exception — see
+/// [`vpn_error_is_retryable`]). `run_with_reconnect` stops on these instead of
+/// looping forever against a config mistake.
+#[derive(Debug)]
+pub struct FatalVpnError(pub String);
+
+impl std::fmt::Display for FatalVpnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FatalVpnError {}
+
+/// True when the error must stop the reconnect loop.
+fn is_fatal(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<FatalVpnError>().is_some()
+}
+
+/// Classify a server-sent `VpnError` message.
+///
+/// "vpn id already in use" is deliberately retryable: during a reconnect the
+/// server-side handler of the previous session can take a few seconds to die
+/// and release the id — retrying with backoff resolves it. Every other
+/// `VpnError` (pool exhausted, overlap, mode mismatch, static mismatch, no vpn
+/// pool, max-links) reflects configuration and would fail identically forever.
+fn vpn_error_is_retryable(msg: &str) -> bool {
+    msg.contains("already in use")
+}
+
+/// Build the error for a server-sent `VpnError`, fatal or retryable per
+/// [`vpn_error_is_retryable`].
+fn classify_vpn_error(msg: String) -> anyhow::Error {
+    if vpn_error_is_retryable(&msg) {
+        tracing::warn!(error = %msg, "retryable vpn error (stale server-side session?)");
+        anyhow!("{msg}")
+    } else {
+        anyhow::Error::new(FatalVpnError(msg))
+    }
+}
+
+/// Reconnect wrapper (DEC-4): a local loop reusing [`crate::reconnect::Backoff`],
+/// NOT `reconnect::run` — the VPN must distinguish fatal configuration errors
+/// from lost links, which the shared helper deliberately does not.
+///
+/// Every attempt is a full teardown + rebuild (DEC-5): `run_*_once` owns the
+/// TUN and `NetConfig` as locals, so their RAII drops run before the next
+/// attempt; `ip route replace` keeps a re-apply idempotent.
+async fn run_with_reconnect<F, Fut>(auto: bool, mut attempt: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if !auto {
+        return attempt().await;
+    }
+    let mut backoff = crate::reconnect::Backoff::new(); // 1 s .. 32 s
+    loop {
+        let started = tokio::time::Instant::now();
+        match attempt().await {
+            Ok(()) => return Ok(()), // clean exit (future: shutdown signal)
+            Err(e) if is_fatal(&e) => return Err(e),
+            Err(e) => {
+                // An attempt that lived >60 s was a healthy link: restart the
+                // backoff from the minimum instead of escalating.
+                if started.elapsed() > std::time::Duration::from_secs(60) {
+                    backoff.reset();
+                }
+                let delay = backoff.next_delay();
+                tracing::warn!(error = %e, ?delay, "vpn link lost; reconnecting");
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// Start a VPN listener (reconnect loop around [`run_listen_once`]).
 pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
-    // Preflight checks
-    hostcfg::check_root()?;
+    let auto = args.auto_reconnect;
+    run_with_reconnect(auto, move || run_listen_once(args.clone())).await
+}
+
+/// One full listener attempt: connect, pair, bring the link up, run the bridge.
+async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
+    // Preflight checks (fatal: retrying cannot fix privileges or PATH)
+    hostcfg::check_root().map_err(|e| FatalVpnError(e.to_string()))?;
     hostcfg::check_binary_exists("ip")
         .then_some(())
-        .ok_or_else(|| anyhow!("'ip' command not found"))?;
+        .ok_or_else(|| FatalVpnError("'ip' command not found".into()))?;
 
     info!(link_id = %args.id, "vpn listener starting");
 
@@ -134,7 +221,7 @@ pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
         }
         Some(crate::shared::ServerMessage::VpnError(e)) => {
             error!(link_id = %args.id, error = %e, "vpn server error");
-            bail!("{e}");
+            return Err(classify_vpn_error(e));
         }
         Some(crate::shared::ServerMessage::Error(e)) => {
             error!(link_id = %args.id, error = %e, "vpn server error");
@@ -494,13 +581,19 @@ async fn run_bridge_with_ctrl(
     result
 }
 
-/// Start a VPN connector.
+/// Start a VPN connector (reconnect loop around [`run_connect_once`]).
 pub async fn run_connect(args: VpnConnectArgs) -> Result<()> {
-    // Preflight checks
-    hostcfg::check_root()?;
+    let auto = args.auto_reconnect;
+    run_with_reconnect(auto, move || run_connect_once(args.clone())).await
+}
+
+/// One full connector attempt: connect, pair, bring the link up, run the bridge.
+async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
+    // Preflight checks (fatal: retrying cannot fix privileges or PATH)
+    hostcfg::check_root().map_err(|e| FatalVpnError(e.to_string()))?;
     hostcfg::check_binary_exists("ip")
         .then_some(())
-        .ok_or_else(|| anyhow!("'ip' command not found"))?;
+        .ok_or_else(|| FatalVpnError("'ip' command not found".into()))?;
 
     info!(link_id = %args.id, "vpn connector starting");
 
@@ -547,7 +640,7 @@ pub async fn run_connect(args: VpnConnectArgs) -> Result<()> {
         }
         Some(crate::shared::ServerMessage::VpnError(e)) => {
             error!(link_id = %args.id, error = %e, "vpn server error");
-            bail!("{e}");
+            return Err(classify_vpn_error(e));
         }
         Some(crate::shared::ServerMessage::Error(e)) => {
             error!(link_id = %args.id, error = %e, "vpn server error");
@@ -2847,5 +2940,75 @@ mod tests {
             err.to_string().contains("control stream"),
             "unexpected error: {err}"
         );
+    }
+
+    /// §2.1 — fatal-vs-retryable classification truth table.
+    #[test]
+    fn fatal_classification() {
+        // FatalVpnError downcasts as fatal.
+        let fatal: anyhow::Error = anyhow::Error::new(FatalVpnError("overlap".into()));
+        assert!(is_fatal(&fatal));
+        // Plain anyhow errors are retryable.
+        let plain = anyhow!("connection reset by peer");
+        assert!(!is_fatal(&plain));
+        // Fatal survives an added context chain (downcast_ref traverses it).
+        let wrapped = anyhow::Error::new(FatalVpnError("overlap".into())).context("while pairing");
+        assert!(is_fatal(&wrapped));
+        // "already in use" is the deliberate retryable VpnError.
+        assert!(vpn_error_is_retryable("vpn id 'x' already in use"));
+        assert!(!vpn_error_is_retryable("overlapping subnets: a and b"));
+        assert!(!is_fatal(&classify_vpn_error(
+            "vpn id 'x' already in use".into()
+        )));
+        assert!(is_fatal(&classify_vpn_error("vpn pool exhausted".into())));
+    }
+
+    /// §2.2 — the reconnect loop retries retryable errors, stops on fatal ones,
+    /// and runs exactly once with auto = false.
+    #[tokio::test(start_paused = true)]
+    async fn run_with_reconnect_counts() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        // 3 retryable failures, then a fatal one: exactly 4 attempts, Err out.
+        let n = Arc::new(AtomicU32::new(0));
+        let n2 = Arc::clone(&n);
+        let result = run_with_reconnect(true, move || {
+            let n = Arc::clone(&n2);
+            async move {
+                let i = n.fetch_add(1, Ordering::SeqCst);
+                if i < 3 {
+                    Err(anyhow!("transient"))
+                } else {
+                    Err(anyhow::Error::new(FatalVpnError("config".into())))
+                }
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(is_fatal(&result.unwrap_err()));
+        assert_eq!(n.load(Ordering::SeqCst), 4, "3 retries + 1 fatal stop");
+
+        // auto = false: a retryable error is NOT retried.
+        let n = Arc::new(AtomicU32::new(0));
+        let n2 = Arc::clone(&n);
+        let result = run_with_reconnect(false, move || {
+            let n = Arc::clone(&n2);
+            async move {
+                n.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(anyhow!("transient"))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            1,
+            "no retry without --auto-reconnect"
+        );
+
+        // Ok() exits the loop immediately.
+        let result = run_with_reconnect(true, || async { Ok(()) }).await;
+        assert!(result.is_ok());
     }
 }

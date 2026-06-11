@@ -894,7 +894,7 @@ impl Server {
                 advertised,
                 addr,
                 notes,
-                ..
+                carriers,
             }) => {
                 #[cfg(feature = "vpn")]
                 if self.vpn_enabled {
@@ -911,9 +911,12 @@ impl Server {
                         self.udp_providers.clone(),
                         self.udp_tuning,
                         self.vpn_link_permits.clone(),
+                        carriers,
                     )
                     .await;
                 }
+                #[cfg(not(feature = "vpn"))]
+                let _ = carriers;
                 #[cfg(not(feature = "vpn"))]
                 let _ = (&advertised, &addr, &notes); // Suppress unused warnings when vpn feature is off
                 warn!(%id, "vpn not enabled on this server");
@@ -929,6 +932,7 @@ impl Server {
                 advertised,
                 addr,
                 notes,
+                carriers,
             }) => {
                 #[cfg(feature = "vpn")]
                 if self.vpn_enabled {
@@ -947,9 +951,13 @@ impl Server {
                         self.udp_providers.clone(),
                         self.udp_tuning,
                         self.vpn_punch_timeout,
+                        carriers,
+                        self.max_carriers,
                     )
                     .await;
                 }
+                #[cfg(not(feature = "vpn"))]
+                let _ = carriers;
                 #[cfg(not(feature = "vpn"))]
                 let _ = (&advertised, &addr, &notes); // Suppress unused warnings when vpn feature is off
                 warn!(%id, "vpn not enabled on this server");

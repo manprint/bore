@@ -29,6 +29,12 @@ pub const MAX_FRAME_LENGTH: usize = 1024;
 /// authentication token is derived from this nonce and the tunnel secret.
 pub const UDP_NONCE_LEN: usize = 16;
 
+/// Serde default for VPN relay carrier counts: old peers without the field
+/// behave exactly like a single-carrier build.
+fn default_vpn_carriers() -> u16 {
+    1
+}
+
 /// Default per-direction buffer used when proxying data between two streams.
 ///
 /// 256 KiB is tuned for large-file throughput on high bandwidth-delay-product
@@ -699,6 +705,10 @@ pub enum ClientMessage {
         addr: VpnAddrRequest,
         /// Optional operator note.
         notes: Option<String>,
+        /// Requested number of relay carrier substream pairs. Old peers omit
+        /// the field → 1 → single-pair path, byte-identical to before (I-9).
+        #[serde(default = "default_vpn_carriers")]
+        carriers: u16,
     },
 
     /// Report the active VPN data-plane path (`"relay"` or `"direct"`) for the
@@ -840,6 +850,10 @@ pub enum ServerMessage {
         /// old server → field absent → false → client never sends the report.
         #[serde(default)]
         admin_v2: bool,
+        /// Effective number of relay carrier substream pairs, negotiated as
+        /// `min(listener, connector, server max)`. Old server → absent → 1.
+        #[serde(default = "default_vpn_carriers")]
+        carriers: u16,
     },
 
     /// VPN pairing failed (duplicate id, pool exhausted, overlap, etc.).
@@ -947,13 +961,15 @@ impl ControlFrameSummary for ClientMessage {
                 advertised,
                 addr,
                 notes,
+                carriers,
             } => {
                 format!(
-                    "ConnectVpn {{ id={}, advertised={:?}, addr={:?}, notes={} }}",
+                    "ConnectVpn {{ id={}, advertised={:?}, addr={:?}, notes={}, carriers={} }}",
                     id,
                     advertised,
                     addr,
                     if notes.is_some() { "present" } else { "none" },
+                    carriers,
                 )
             }
             ClientMessage::VpnPathReport { path } => {
@@ -1046,9 +1062,10 @@ impl ControlFrameSummary for ServerMessage {
                 session_nonce,
                 tuning,
                 admin_v2,
+                carriers,
             } => {
                 format!(
-                    "VpnReady {{ assigned={}, prefix={}, peer_overlay={}, peer_advertised={:?}, session_nonce={}, tuning={{ {} }}, admin_v2={} }}",
+                    "VpnReady {{ assigned={}, prefix={}, peer_overlay={}, peer_advertised={:?}, session_nonce={}, tuning={{ {} }}, admin_v2={}, carriers={} }}",
                     assigned,
                     prefix,
                     peer_overlay,
@@ -1056,6 +1073,7 @@ impl ControlFrameSummary for ServerMessage {
                     hex::encode(session_nonce),
                     tuning.control_frame_summary(),
                     admin_v2,
+                    carriers,
                 )
             }
             ServerMessage::VpnError(msg) => {
@@ -1408,6 +1426,7 @@ fn serde_roundtrip_vpn_messages() {
         session_nonce: [0u8; 16],
         tuning: UdpDirectTuning::default(),
         admin_v2: true,
+        carriers: 1,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let back: ServerMessage = serde_json::from_str(&json).unwrap();

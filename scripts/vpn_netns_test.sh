@@ -652,6 +652,94 @@ fi
 kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
 sleep 0.3
 
+# ── Test 12: relay carriers (--relay-only --carriers 4) ───────────────────────
+echo "=== Test 12: relay with 4 carriers ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id carriers-test \
+    --relay-only --carriers 4 \
+    >"$BORE_LOG.listen12" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id carriers-test \
+    --relay-only --carriers 4 \
+    >"$BORE_LOG.connect12" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.listen12" "vpn link paired" 10; then
+    sleep 1
+    NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    if ip netns exec ns2 ping -c 3 -W 3 "$NS1_OVL" >/dev/null 2>&1; then
+        pass "carriers=4: ping ok over multi-carrier relay"
+    else
+        fail "carriers=4: ping failed"
+    fi
+    if [ "$SKIP_IPERF" = "0" ] && command -v iperf3 >/dev/null 2>&1; then
+        ip netns exec ns1 iperf3 -s -D --logfile /dev/null
+        sleep 0.2
+        IPERF_TCP=$(timeout 20 ip netns exec ns2 iperf3 -c "$NS1_OVL" -t 3 -J 2>/dev/null | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(int(d['end']['sum_received']['bits_per_second']/1e6))" 2>/dev/null || echo 0)
+        ip netns exec ns1 pkill iperf3 2>/dev/null || true
+        if [ "$IPERF_TCP" -gt 1 ]; then
+            pass "carriers=4: iperf3 TCP over relay: ${IPERF_TCP} Mbps"
+        else
+            fail "carriers=4: iperf3 TCP failed/stalled: ${IPERF_TCP} Mbps"
+        fi
+    fi
+else
+    fail "carriers=4: pairing failed"
+    echo "  [listener log]: $(tail -5 "$BORE_LOG.listen12" 2>/dev/null | tr '\n' '|')"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
+# ── Test 13: TUN multi-queue (--tun-queues 4) ─────────────────────────────────
+echo "=== Test 13: TUN multi-queue ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id mq-test \
+    --tun-queues 4 --stun-server "$STUN" \
+    >"$BORE_LOG.listen13" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id mq-test \
+    --tun-queues 4 --stun-server "$STUN" \
+    >"$BORE_LOG.connect13" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.listen13" "vpn link paired" 10; then
+    sleep 1
+    NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    if ip netns exec ns2 ping -c 3 -W 3 "$NS1_OVL" >/dev/null 2>&1; then
+        pass "tun-queues=4: ping ok"
+    else
+        fail "tun-queues=4: ping failed"
+    fi
+    if [ "$SKIP_IPERF" = "0" ] && command -v iperf3 >/dev/null 2>&1; then
+        ip netns exec ns1 iperf3 -s -D --logfile /dev/null
+        sleep 0.2
+        IPERF_P4=$(timeout 20 ip netns exec ns2 iperf3 -c "$NS1_OVL" -t 3 -P 4 -J 2>/dev/null | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(int(d['end']['sum_received']['bits_per_second']/1e6))" 2>/dev/null || echo 0)
+        ip netns exec ns1 pkill iperf3 2>/dev/null || true
+        if [ "$IPERF_P4" -gt 1 ]; then
+            pass "tun-queues=4: iperf3 -P 4 over the link: ${IPERF_P4} Mbps"
+        else
+            fail "tun-queues=4: iperf3 -P 4 failed/stalled: ${IPERF_P4} Mbps"
+        fi
+    fi
+else
+    fail "tun-queues=4: pairing failed"
+    echo "  [listener log]: $(tail -5 "$BORE_LOG.listen13" 2>/dev/null | tr '\n' '|')"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Results: PASS=$PASS FAIL=$FAIL ==="

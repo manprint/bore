@@ -41,6 +41,10 @@ pub struct VpnListenArgs {
     pub relay_only: bool,
     /// Reconnect with backoff when the link drops (full teardown + rebuild).
     pub auto_reconnect: bool,
+    /// Requested relay carrier substream pairs (1 = single, as before).
+    pub carriers: u16,
+    /// Number of TUN queues (Linux IFF_MULTI_QUEUE); 1 = single queue.
+    pub tun_queues: usize,
     /// Optional notes.
     pub notes: Option<String>,
 }
@@ -80,6 +84,10 @@ pub struct VpnConnectArgs {
     pub relay_only: bool,
     /// Reconnect with backoff when the link drops (full teardown + rebuild).
     pub auto_reconnect: bool,
+    /// Requested relay carrier substream pairs (1 = single, as before).
+    pub carriers: u16,
+    /// Number of TUN queues (Linux IFF_MULTI_QUEUE); 1 = single queue.
+    pub tun_queues: usize,
     /// Optional notes.
     pub notes: Option<String>,
 }
@@ -191,7 +199,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
         advertised: args.advertised.clone(),
         addr: args.addr_request.clone(),
         notes: args.notes.clone(),
-        carriers: 1,
+        carriers: args.carriers.clamp(1, 16),
     };
     ctrl.send(hello).await?;
 
@@ -202,13 +210,14 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
 
     // Wait for VpnReady
     let msg = ctrl.recv::<crate::shared::ServerMessage>().await?;
-    let (assigned, prefix, peer_advertised, session_nonce, admin_v2) = match msg {
+    let (assigned, prefix, peer_advertised, session_nonce, admin_v2, carriers) = match msg {
         Some(crate::shared::ServerMessage::VpnReady {
             assigned,
             prefix,
             peer_advertised,
             session_nonce,
             admin_v2,
+            carriers,
             ..
         }) => {
             info!(
@@ -218,7 +227,14 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
                 iface = %args.tun_name,
                 "vpn link paired"
             );
-            (assigned, prefix, peer_advertised, session_nonce, admin_v2)
+            (
+                assigned,
+                prefix,
+                peer_advertised,
+                session_nonce,
+                admin_v2,
+                carriers.max(1),
+            )
         }
         Some(crate::shared::ServerMessage::VpnError(e)) => {
             error!(link_id = %args.id, error = %e, "vpn server error");
@@ -241,10 +257,10 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
     // Stale reclaim
     hostcfg::stale_reclaim(&args.id, &args.tun_name).await;
 
-    // Create TUN device
-    let (dev_raw, offload) =
-        hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu).await?;
-    let dev = Arc::new(dev_raw);
+    // Create TUN device(s) (one per queue).
+    let (devs_raw, offload) =
+        hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu, args.tun_queues).await?;
+    let devs: Vec<Arc<tun_rs::AsyncDevice>> = devs_raw.into_iter().map(Arc::new).collect();
     info!(
         link_id = %args.id,
         iface = %args.tun_name,
@@ -269,12 +285,12 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
     )
     .await?;
 
-    // Accept the two relay substreams (one per direction) from the server.
-    let (egress, ingress) = link::accept_relay(&mut acceptor).await?;
+    // Accept the negotiated relay substream pairs from the server.
+    let (egress, ingress) = link::accept_relay_multi(&mut acceptor, carriers).await?;
 
     // Build relay link
     let keys = crypto::derive_keys_listener(&args.secret, &session_nonce)?;
-    let (sender, recver) = link::make_relay(egress, ingress, keys);
+    let (sender, recver) = link::make_relay_multi(egress, ingress, keys);
     let counters = bridge::BridgeCounters::new();
 
     info!(link_id = %args.id, "vpn link bridge starting");
@@ -308,6 +324,8 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
                 upnp: args.upnp,
                 try_port_prediction: args.try_port_prediction,
                 nat_udp_preferred_port: args.nat_udp_preferred_port,
+                tun_name: &args.tun_name,
+                mtu: args.mtu,
             },
             admin_v2,
         );
@@ -322,7 +340,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
 
     // Run the bridge until it closes or the control connection dies.
     let result = run_bridge_with_ctrl(
-        &args.id, ctrl_task, dev, sender, recver, counters, args.mtu, offload, upgrade_rx,
+        &args.id, ctrl_task, devs, sender, recver, counters, args.mtu, offload, upgrade_rx,
     )
     .await;
 
@@ -432,6 +450,10 @@ struct DirectUpgradeCtx {
     nat_udp_preferred_port: u16,
     /// Server accepts `VpnPathReport` (admin page v2).
     admin_v2: bool,
+    /// TUN interface name (for the dynamic-PMTU monitor).
+    tun_name: String,
+    /// Initial TUN MTU (the PMTU monitor's starting point).
+    mtu: u16,
 }
 
 impl DirectUpgradeCtx {
@@ -453,6 +475,8 @@ impl DirectUpgradeCtx {
             try_port_prediction: args.try_port_prediction,
             nat_udp_preferred_port: args.nat_udp_preferred_port,
             admin_v2,
+            tun_name: args.tun_name.to_string(),
+            mtu: args.mtu,
         }
     }
 }
@@ -465,6 +489,8 @@ struct CommonDirectArgs<'a> {
     upnp: bool,
     try_port_prediction: bool,
     nat_udp_preferred_port: u16,
+    tun_name: &'a str,
+    mtu: u16,
 }
 
 /// Total budget for the offer → punch round-trip before giving up on direct.
@@ -559,11 +585,14 @@ async fn try_direct_upgrade(
         }
     };
 
-    // 7. Hand the Direct link halves to the bridge (DEC-1: controlled restart).
+    // 7. Hand the Direct link halves to the bridge (DEC-1: controlled restart)
+    //    and start the dynamic-PMTU monitor (C2) on the live connection.
+    let monitor_conn = conn.clone();
     upgrade_tx
         .send(link::make_direct(conn))
         .await
         .map_err(|_| anyhow!("bridge closed before the direct upgrade"))?;
+    tokio::spawn(pmtu_monitor(monitor_conn, ctx.tun_name.clone(), ctx.mtu));
     info!(link_id = %ctx.link_id, path = "direct", "vpn path upgraded to direct QUIC");
     if ctx.admin_v2 {
         let _ = out_tx
@@ -573,6 +602,75 @@ async fn try_direct_upgrade(
             .await;
     }
     Ok(())
+}
+
+/// Decide the new TUN MTU from the QUIC path-MTU sample history (C2).
+///
+/// Returns `Some(new_mtu)` only when the last 3 samples are present and
+/// identical (the QUIC MTU discovery has settled), the stable value differs
+/// from the current MTU by at least 16 bytes (avoid churn), and the result is
+/// within [576, 9000] (candidates above 9000 are clamped to 9000; below 576
+/// rejected).
+fn pmtu_decision(current_mtu: u16, samples: &[usize]) -> Option<u16> {
+    if samples.len() < 3 {
+        return None;
+    }
+    let last3 = &samples[samples.len() - 3..];
+    let stable = last3[0];
+    if last3.iter().any(|&s| s != stable) {
+        return None;
+    }
+    if stable < 576 {
+        return None;
+    }
+    let candidate = stable.min(9000) as u16;
+    if candidate.abs_diff(current_mtu) < 16 {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// Background task: track the direct path's QUIC datagram limit and follow it
+/// with `ip link set <tun> mtu` (C2). Started only after the switch to direct;
+/// exits when the QUIC connection closes (link teardown or path death). No MTU
+/// revert is needed: the TUN is destroyed at teardown (DEC-5), and the nft MSS
+/// clamp uses `rt mtu`, adapting on its own.
+async fn pmtu_monitor(conn: crate::holepunch::DirectConn, tun_name: String, initial_mtu: u16) {
+    let runner = hostcfg::RealRunner;
+    let mut current = initial_mtu;
+    let mut samples: Vec<usize> = Vec::new();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = conn.closed() => return,
+        }
+        // The QUIC datagram limit minus AEAD-free overhead IS the usable IP
+        // packet size on the direct path.
+        let Some(max_datagram) = conn.max_datagram_size() else {
+            continue;
+        };
+        samples.push(max_datagram);
+        if samples.len() > 3 {
+            samples.remove(0);
+        }
+        if let Some(new_mtu) = pmtu_decision(current, &samples) {
+            let argv = hostcfg_cmd::cmd_link_set_mtu(&tun_name, new_mtu);
+            match crate::vpn::hostcfg::CommandRunner::run(&runner, &argv).await {
+                Ok(_) => {
+                    info!(
+                        old = current,
+                        new = new_mtu,
+                        "tun MTU adjusted to QUIC path MTU"
+                    );
+                    current = new_mtu;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, new_mtu, "failed to adjust tun MTU; keeping current");
+                }
+            }
+        }
+    }
 }
 
 /// Run the data-plane bridge alongside the control-stream actor.
@@ -585,7 +683,7 @@ async fn try_direct_upgrade(
 async fn run_bridge_with_ctrl(
     link_id: &str,
     mut ctrl_task: tokio::task::JoinHandle<anyhow::Error>,
-    dev: Arc<tun_rs::AsyncDevice>,
+    devs: Vec<Arc<tun_rs::AsyncDevice>>,
     sender: link::LinkSender,
     recver: link::LinkRecver,
     counters: Arc<bridge::BridgeCounters>,
@@ -594,7 +692,7 @@ async fn run_bridge_with_ctrl(
     upgrade_rx: tokio::sync::mpsc::Receiver<(link::LinkSender, link::LinkRecver)>,
 ) -> Result<()> {
     let result = tokio::select! {
-        res = bridge::run(dev, sender, recver, counters, mtu, offload, upgrade_rx) => {
+        res = bridge::run(devs, sender, recver, counters, mtu, offload, upgrade_rx) => {
             ctrl_task.abort();
             res
         }
@@ -637,6 +735,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
         advertised: args.advertised.clone(),
         addr: args.addr_request.clone(),
         notes: args.notes.clone(),
+        carriers: args.carriers.clamp(1, 16),
     };
     ctrl.send(connect_msg).await?;
 
@@ -647,13 +746,14 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
 
     // Wait for VpnReady
     let msg = ctrl.recv::<crate::shared::ServerMessage>().await?;
-    let (assigned, prefix, peer_advertised, session_nonce, admin_v2) = match msg {
+    let (assigned, prefix, peer_advertised, session_nonce, admin_v2, carriers) = match msg {
         Some(crate::shared::ServerMessage::VpnReady {
             assigned,
             prefix,
             peer_advertised,
             session_nonce,
             admin_v2,
+            carriers,
             ..
         }) => {
             info!(
@@ -663,7 +763,14 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
                 iface = %args.tun_name,
                 "vpn link paired"
             );
-            (assigned, prefix, peer_advertised, session_nonce, admin_v2)
+            (
+                assigned,
+                prefix,
+                peer_advertised,
+                session_nonce,
+                admin_v2,
+                carriers.max(1),
+            )
         }
         Some(crate::shared::ServerMessage::VpnError(e)) => {
             error!(link_id = %args.id, error = %e, "vpn server error");
@@ -686,10 +793,10 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
     // Stale reclaim
     hostcfg::stale_reclaim(&args.id, &args.tun_name).await;
 
-    // Create TUN device
-    let (dev_raw, offload) =
-        hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu).await?;
-    let dev = Arc::new(dev_raw);
+    // Create TUN device(s) (one per queue).
+    let (devs_raw, offload) =
+        hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu, args.tun_queues).await?;
+    let devs: Vec<Arc<tun_rs::AsyncDevice>> = devs_raw.into_iter().map(Arc::new).collect();
     info!(
         link_id = %args.id,
         iface = %args.tun_name,
@@ -714,12 +821,12 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
     )
     .await?;
 
-    // Open the two relay substreams (one per direction) and tag them.
-    let (egress, ingress) = link::connect_relay(&opener).await?;
+    // Open the negotiated relay substream pairs and tag them.
+    let (egress, ingress) = link::connect_relay_multi(&opener, carriers).await?;
 
     // Build relay link
     let keys = crypto::derive_keys_connector(&args.secret, &session_nonce)?;
-    let (sender, recver) = link::make_relay(egress, ingress, keys);
+    let (sender, recver) = link::make_relay_multi(egress, ingress, keys);
     let counters = bridge::BridgeCounters::new();
 
     info!(link_id = %args.id, "vpn link bridge starting");
@@ -753,6 +860,8 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
                 upnp: args.upnp,
                 try_port_prediction: args.try_port_prediction,
                 nat_udp_preferred_port: args.nat_udp_preferred_port,
+                tun_name: &args.tun_name,
+                mtu: args.mtu,
             },
             admin_v2,
         );
@@ -767,7 +876,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
 
     // Run the bridge until it closes or the control connection dies.
     let result = run_bridge_with_ctrl(
-        &args.id, ctrl_task, dev, sender, recver, counters, args.mtu, offload, upgrade_rx,
+        &args.id, ctrl_task, devs, sender, recver, counters, args.mtu, offload, upgrade_rx,
     )
     .await;
 
@@ -1654,45 +1763,66 @@ pub mod hostcfg {
         let _ = Command::new("ip").args(["link", "del", tun_name]).output();
     }
 
-    /// Create a TUN device.
+    /// Create a TUN device with `queues` kernel queues (C1).
     ///
     /// Tries `IFF_VNET_HDR` + GSO/GRO offload first (Phase 6.2). If the kernel
     /// does not support it the flag is not set and we fall back to single-packet
-    /// I/O (Phase 6.1). Returns `(device, offload_enabled)`.
+    /// I/O (Phase 6.1). With `queues > 1` the device is created with
+    /// `IFF_MULTI_QUEUE` and the extra queue fds come from `try_clone` (each
+    /// clone = one more queue). Returns `(devices, offload_enabled)` — with
+    /// `queues == 1` a vector of one, path identical to before (I-9).
     pub async fn create_tun(
         name: &str,
         addr: Ipv4Addr,
         prefix: u8,
         mtu: u16,
-    ) -> anyhow::Result<(tun_rs::AsyncDevice, bool)> {
-        // Phase 6.2: attempt offload (IFF_VNET_HDR + GSO/GRO).
-        if let Ok(dev) = tun_rs::DeviceBuilder::new()
-            .name(name)
-            .ipv4(addr, prefix, None)
-            .mtu(mtu)
-            .offload(true)
-            .build_async()
-        {
-            let gso = dev.tcp_gso() || dev.udp_gso();
-            if gso {
-                tracing::info!(%name, tcp_gso = dev.tcp_gso(), udp_gso = dev.udp_gso(),
-                    "TUN created with GSO/GRO offload (Phase 6.2)");
-                return Ok((dev, true));
+        queues: usize,
+    ) -> anyhow::Result<(Vec<tun_rs::AsyncDevice>, bool)> {
+        let queues = queues.clamp(1, 8);
+        let build = |offload: bool| {
+            let mut b = tun_rs::DeviceBuilder::new()
+                .name(name)
+                .ipv4(addr, prefix, None)
+                .mtu(mtu);
+            if offload {
+                b = b.offload(true);
             }
-            // Kernel accepted the build but reported no GSO support. Drop and rebuild.
-            tracing::info!(%name, "kernel built TUN but reports no GSO; using single-packet path");
-            drop(dev);
-        }
+            if queues > 1 {
+                b = b.multi_queue(true);
+            }
+            b.build_async()
+        };
 
-        // Phase 6.1 fallback: single-packet tun I/O.
-        tracing::info!(%name, "TUN created without offload (single-packet path)");
-        let dev = tun_rs::DeviceBuilder::new()
-            .name(name)
-            .ipv4(addr, prefix, None)
-            .mtu(mtu)
-            .build_async()
-            .context("failed to create TUN device")?;
-        Ok((dev, false))
+        // Phase 6.2: attempt offload (IFF_VNET_HDR + GSO/GRO).
+        let (first, offload) = match build(true) {
+            Ok(dev) if dev.tcp_gso() || dev.udp_gso() => {
+                tracing::info!(%name, tcp_gso = dev.tcp_gso(), udp_gso = dev.udp_gso(), queues,
+                    "TUN created with GSO/GRO offload (Phase 6.2)");
+                (dev, true)
+            }
+            Ok(dev) => {
+                // Kernel accepted the build but reported no GSO support.
+                tracing::info!(%name, "kernel built TUN but reports no GSO; using single-packet path");
+                drop(dev);
+                let dev = build(false).context("failed to create TUN device")?;
+                (dev, false)
+            }
+            Err(_) => {
+                // Phase 6.1 fallback: single-packet tun I/O.
+                tracing::info!(%name, "TUN created without offload (single-packet path)");
+                let dev = build(false).context("failed to create TUN device")?;
+                (dev, false)
+            }
+        };
+
+        let mut devs = vec![first];
+        for i in 1..queues {
+            let extra = devs[0]
+                .try_clone()
+                .with_context(|| format!("failed to clone TUN queue {i}"))?;
+            devs.push(extra);
+        }
+        Ok((devs, offload))
     }
 
     /// Internal: marker for an ip_forward revert operation.
@@ -2083,9 +2213,10 @@ pub mod hostcfg {
             // Stale reclaim in case a previous run crashed.
             stale_reclaim("test0", name).await;
 
-            let (dev, _offload) = create_tun(name, addr, 30, 1350)
+            let (mut devs, _offload) = create_tun(name, addr, 30, 1350, 1)
                 .await
                 .expect("failed to create TUN");
+            let dev = devs.remove(0);
 
             // Verify interface is visible.
             let out = std::process::Command::new("ip")
@@ -2155,35 +2286,56 @@ pub mod link {
     /// Direction tag for the listener→connector payload substream.
     pub const RELAY_TAG_DOWN: u8 = 2;
 
-    /// Send half of a VPN link (owned by the uplink task).
+    /// Send half of a VPN link (owned by an uplink task).
+    ///
+    /// Cloneable so multiple uplink pumps (TUN multi-queue) can share one link:
+    /// the AEAD nonce counter is a single shared atomic (I-5/DEC-6 — two seals
+    /// with the same `(key, counter)` would be catastrophic), while the
+    /// round-robin cursor is per-clone (per-task distribution stays balanced).
     pub enum LinkSender {
         /// Direct QUIC datagram path.
         Direct(DirectConn),
-        /// Relay path: AEAD-framed stream.
-        /// The actual write is done by a background writer task that owns the
-        /// egress substream; the uplink communicates over a bounded channel.
+        /// Relay path: AEAD-framed substreams (one writer task each).
+        /// Frames are distributed round-robin **per datagram** (DEC-7):
+        /// out-of-order arrival is fine, IP is best-effort.
         Relay {
-            /// Channel to the background relay writer task.
-            tx: mpsc::Sender<Bytes>,
-            /// AEAD egress key.
+            /// Channels to the background relay writer tasks (one per carrier).
+            txs: Vec<mpsc::Sender<Bytes>>,
+            /// AEAD egress key (single key per direction, DEC-6).
             key: [u8; 32],
-            /// Per-packet counter for nonce derivation.
-            counter: u64,
+            /// Shared per-packet counter for nonce derivation (I-5).
+            counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+            /// Round-robin cursor (local to this clone).
+            rr: usize,
         },
+    }
+
+    impl Clone for LinkSender {
+        fn clone(&self) -> Self {
+            match self {
+                LinkSender::Direct(conn) => LinkSender::Direct(conn.clone()),
+                LinkSender::Relay {
+                    txs, key, counter, ..
+                } => LinkSender::Relay {
+                    txs: txs.clone(),
+                    key: *key,
+                    counter: std::sync::Arc::clone(counter),
+                    rr: 0,
+                },
+            }
+        }
     }
 
     /// Receive half of a VPN link (owned by the downlink task).
     pub enum LinkRecver {
         /// Direct QUIC datagram path.
         Direct(DirectConn),
-        /// Relay path: AEAD-framed stream. Owns the ingress substream outright.
+        /// Relay path: fan-in of the per-carrier reader tasks. Each reader owns
+        /// one ingress substream (I-1), decrypts frames, and pushes plaintext
+        /// packets — or its terminal error — into this channel.
         Relay {
-            /// Ingress substream (this side only ever reads it).
-            read: crate::mux::Stream,
-            /// AEAD ingress key.
-            key: [u8; 32],
-            /// Accumulator for frame reassembly across reads.
-            acc: BytesMut,
+            /// Fan-in of decrypted packets (or a reader's terminal error).
+            rx: mpsc::Receiver<Result<Bytes>>,
         },
     }
 
@@ -2192,29 +2344,53 @@ pub mod link {
         (LinkSender::Direct(conn.clone()), LinkRecver::Direct(conn))
     }
 
-    /// Build a Relay link from the two direction substreams.
-    ///
-    /// `egress` is the substream this side writes its sealed frames to; `ingress`
-    /// is the substream the peer writes to. A background writer task takes sole
-    /// ownership of `egress`; the returned `LinkRecver` owns `ingress` outright.
+    /// Build a Relay link from one pair of direction substreams (carriers = 1).
     pub fn make_relay(
         egress: crate::mux::Stream,
         ingress: crate::mux::Stream,
         keys: DirectionKeys,
     ) -> (LinkSender, LinkRecver) {
-        let (tx, rx) = mpsc::channel::<Bytes>(RELAY_QUEUE);
-        tokio::spawn(relay_writer(egress, rx));
+        make_relay_multi(vec![egress], vec![ingress], keys)
+    }
+
+    /// Build a Relay link from N carrier substream pairs (C3).
+    ///
+    /// Per carrier: one background writer task owns its `egress` substream and
+    /// one reader task owns its `ingress` substream (I-1). Egress frames are
+    /// sealed with a **shared** atomic counter (I-5) and distributed
+    /// round-robin per datagram (DEC-7); ingress readers decrypt and fan into
+    /// one channel. A reader hitting EOF/error pushes the error into the
+    /// fan-in, killing the link cleanly (no silent half-degraded state).
+    pub fn make_relay_multi(
+        egress: Vec<crate::mux::Stream>,
+        ingress: Vec<crate::mux::Stream>,
+        keys: DirectionKeys,
+    ) -> (LinkSender, LinkRecver) {
+        assert!(!egress.is_empty() && egress.len() == ingress.len());
+        let n = egress.len();
+        let per_writer_queue = (RELAY_QUEUE / n).max(64);
+        let txs: Vec<mpsc::Sender<Bytes>> = egress
+            .into_iter()
+            .map(|stream| {
+                let (tx, rx) = mpsc::channel::<Bytes>(per_writer_queue);
+                tokio::spawn(relay_writer(stream, rx));
+                tx
+            })
+            .collect();
+
+        let (fan_tx, fan_rx) = mpsc::channel::<Result<Bytes>>(RELAY_QUEUE);
+        for stream in ingress {
+            tokio::spawn(relay_reader(stream, keys.ingress, fan_tx.clone()));
+        }
+
         (
             LinkSender::Relay {
-                tx,
+                txs,
                 key: keys.egress,
-                counter: 0,
+                counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                rr: 0,
             },
-            LinkRecver::Relay {
-                read: ingress,
-                key: keys.ingress,
-                acc: BytesMut::with_capacity(RECV_BUF),
-            },
+            LinkRecver::Relay { rx: fan_rx },
         )
     }
 
@@ -2223,18 +2399,47 @@ pub mod link {
     pub async fn connect_relay(
         opener: &crate::mux::Opener,
     ) -> Result<(crate::mux::Stream, crate::mux::Stream)> {
-        let mut up = opener.open().await.context("open relay egress substream")?;
-        up.write_all(&[crate::mux::STREAM_READY, RELAY_TAG_UP])
-            .await
-            .context("write relay egress header")?;
-        let mut down = opener
-            .open()
-            .await
-            .context("open relay ingress substream")?;
-        down.write_all(&[crate::mux::STREAM_READY, RELAY_TAG_DOWN])
-            .await
-            .context("write relay ingress header")?;
-        Ok((up, down))
+        let (mut egress, mut ingress) = connect_relay_multi(opener, 1).await?;
+        Ok((egress.remove(0), ingress.remove(0)))
+    }
+
+    /// Connector side: open `n` relay substream pairs and tag them.
+    ///
+    /// Header compatibility (I-9): with `n == 1` the header is the original
+    /// 2-byte `[STREAM_READY, tag]`; with `n > 1` a third byte carries the
+    /// carrier index. Both sides know `n` from `VpnReady.carriers`.
+    pub async fn connect_relay_multi(
+        opener: &crate::mux::Opener,
+        n: u16,
+    ) -> Result<(Vec<crate::mux::Stream>, Vec<crate::mux::Stream>)> {
+        let n = n.max(1);
+        let mut egress = Vec::with_capacity(n as usize);
+        let mut ingress = Vec::with_capacity(n as usize);
+        for idx in 0..n {
+            let mut up = opener.open().await.context("open relay egress substream")?;
+            let mut down = opener
+                .open()
+                .await
+                .context("open relay ingress substream")?;
+            if n == 1 {
+                up.write_all(&[crate::mux::STREAM_READY, RELAY_TAG_UP])
+                    .await
+                    .context("write relay egress header")?;
+                down.write_all(&[crate::mux::STREAM_READY, RELAY_TAG_DOWN])
+                    .await
+                    .context("write relay ingress header")?;
+            } else {
+                up.write_all(&[crate::mux::STREAM_READY, RELAY_TAG_UP, idx as u8])
+                    .await
+                    .context("write relay egress header")?;
+                down.write_all(&[crate::mux::STREAM_READY, RELAY_TAG_DOWN, idx as u8])
+                    .await
+                    .context("write relay ingress header")?;
+            }
+            egress.push(up);
+            ingress.push(down);
+        }
+        Ok((egress, ingress))
     }
 
     /// Listener side: accept the two relay substreams and sort them by tag.
@@ -2243,9 +2448,21 @@ pub mod link {
     pub async fn accept_relay(
         acceptor: &mut crate::mux::Acceptor,
     ) -> Result<(crate::mux::Stream, crate::mux::Stream)> {
-        let mut up = None;
-        let mut down = None;
-        for _ in 0..2 {
+        let (mut egress, mut ingress) = accept_relay_multi(acceptor, 1).await?;
+        Ok((egress.remove(0), ingress.remove(0)))
+    }
+
+    /// Listener side: accept `n` relay substream pairs and sort them by tag.
+    /// Returns `(egress, ingress)` vectors from the listener's perspective
+    /// (egress = `RELAY_TAG_DOWN` streams, ingress = `RELAY_TAG_UP` streams).
+    pub async fn accept_relay_multi(
+        acceptor: &mut crate::mux::Acceptor,
+        n: u16,
+    ) -> Result<(Vec<crate::mux::Stream>, Vec<crate::mux::Stream>)> {
+        let n = n.max(1) as usize;
+        let mut up = Vec::new();
+        let mut down = Vec::new();
+        for _ in 0..(2 * n) {
             // Without a timeout the listener hangs indefinitely if the connector
             // crashes after VpnReady but before opening the relay substreams.
             let mut stream = tokio::time::timeout(
@@ -2257,28 +2474,38 @@ pub mod link {
                 "timed out waiting for relay substream (connector did not connect within 60 s)",
             )?
             .context("server closed before opening relay substreams")?;
+            // 2-byte header for the single-carrier path (bit-exact with v1),
+            // 3-byte header (with carrier index) when n > 1.
             let mut header = [0u8; 2];
             stream
                 .read_exact(&mut header)
                 .await
                 .context("read relay substream header")?;
+            if n > 1 {
+                let mut idx = [0u8; 1];
+                stream
+                    .read_exact(&mut idx)
+                    .await
+                    .context("read relay carrier index")?;
+            }
             anyhow::ensure!(
                 header[0] == crate::mux::STREAM_READY,
                 "bad relay stream-ready marker: {}",
                 header[0]
             );
             match header[1] {
-                RELAY_TAG_UP => up = Some(stream),
-                RELAY_TAG_DOWN => down = Some(stream),
+                RELAY_TAG_UP => up.push(stream),
+                RELAY_TAG_DOWN => down.push(stream),
                 tag => anyhow::bail!(
                     "unknown relay direction tag {tag} (peer built from an older version?)"
                 ),
             }
         }
-        match (down, up) {
-            (Some(down), Some(up)) => Ok((down, up)),
-            _ => anyhow::bail!("duplicate relay direction tag (peer built from an older version?)"),
-        }
+        anyhow::ensure!(
+            up.len() == n && down.len() == n,
+            "unbalanced relay direction tags (peer built from an older version?)"
+        );
+        Ok((down, up))
     }
 
     /// Background task: drain the relay write queue and write frames to the
@@ -2291,6 +2518,39 @@ pub mod link {
                 tracing::warn!(error = %e, "vpn relay egress write failed; tearing down link");
                 return;
             }
+        }
+    }
+
+    /// Background task: read AEAD frames off one ingress substream, decrypt,
+    /// and push plaintext packets into the fan-in channel. On EOF or any error
+    /// the terminal error itself is pushed (best-effort) so the downlink dies
+    /// loudly instead of limping on the surviving carriers.
+    async fn relay_reader(
+        mut read: crate::mux::Stream,
+        key: [u8; 32],
+        fan_tx: mpsc::Sender<Result<Bytes>>,
+    ) {
+        let mut acc = BytesMut::with_capacity(RECV_BUF);
+        let result: Result<()> = async {
+            loop {
+                while let Some(frame) = take_frame(&mut acc)? {
+                    let plaintext =
+                        super::crypto::open(&key, &frame).context("AEAD open failed")?;
+                    if fan_tx.send(Ok(Bytes::from(plaintext))).await.is_err() {
+                        return Ok(()); // recver gone: normal teardown
+                    }
+                }
+                acc.reserve(RECV_BUF);
+                let n = read
+                    .read_buf(&mut acc)
+                    .await
+                    .context("relay ingress read")?;
+                anyhow::ensure!(n != 0, "relay ingress stream closed by peer");
+            }
+        }
+        .await;
+        if let Err(e) = result {
+            let _ = fan_tx.send(Err(e)).await;
         }
     }
 
@@ -2328,12 +2588,22 @@ pub mod link {
                     }
                     Ok(())
                 }
-                LinkSender::Relay { tx, key, counter } => {
+                LinkSender::Relay {
+                    txs,
+                    key,
+                    counter,
+                    rr,
+                } => {
                     for pkt in pkts {
-                        let frame = super::crypto::seal_with_counter(key, *counter, pkt)?;
-                        *counter += 1;
-                        // Await when the queue is full: backpressure, not loss.
-                        tx.send(Bytes::from(frame)).await.map_err(|_| {
+                        // Shared atomic counter: unique nonce even with multiple
+                        // producers on the same egress key (I-5, DEC-6).
+                        let ctr = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let frame = super::crypto::seal_with_counter(key, ctr, pkt)?;
+                        // Round-robin per datagram (DEC-7). A full queue blocks
+                        // (backpressure, I-4) — no skip-to-next: simple and
+                        // predictable.
+                        *rr = (*rr + 1) % txs.len();
+                        txs[*rr].send(Bytes::from(frame)).await.map_err(|_| {
                             anyhow::anyhow!("relay writer exited (write error on relay stream)")
                         })?;
                     }
@@ -2342,11 +2612,14 @@ pub mod link {
             }
         }
 
-        /// Resolved when the underlying link is gone.
+        /// Resolved when the underlying link is gone (any carrier writer exited).
         pub async fn closed(&self) {
             match self {
                 LinkSender::Direct(conn) => conn.closed().await,
-                LinkSender::Relay { tx, .. } => tx.closed().await,
+                LinkSender::Relay { txs, .. } => {
+                    let waits = txs.iter().map(|tx| Box::pin(tx.closed()));
+                    futures_util::future::select_all(waits).await;
+                }
             }
         }
     }
@@ -2370,27 +2643,22 @@ pub mod link {
                     }
                     Ok(())
                 }
-                LinkRecver::Relay { read, key, acc } => {
-                    loop {
-                        // Drain every complete frame already buffered so one read
-                        // syscall can yield a whole GRO batch downstream.
-                        while out.len() < BATCH_CAP {
-                            match take_frame(acc)? {
-                                Some(frame) => {
-                                    let plaintext = super::crypto::open(key, &frame)
-                                        .context("AEAD open failed")?;
-                                    out.push(Bytes::from(plaintext));
-                                }
-                                None => break,
-                            }
+                LinkRecver::Relay { rx } => {
+                    let first = rx
+                        .recv()
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("relay ingress closed"))??;
+                    out.push(first);
+                    // Drain whatever is already queued (up to BATCH_CAP) so one
+                    // wake-up can flush a whole batch downstream.
+                    while out.len() < BATCH_CAP {
+                        match rx.try_recv() {
+                            Ok(Ok(pkt)) => out.push(pkt),
+                            Ok(Err(e)) => return Err(e),
+                            Err(_) => break,
                         }
-                        if !out.is_empty() {
-                            return Ok(());
-                        }
-                        acc.reserve(RECV_BUF);
-                        let n = read.read_buf(acc).await.context("relay ingress read")?;
-                        anyhow::ensure!(n != 0, "relay ingress stream closed by peer");
                     }
+                    Ok(())
                 }
             }
         }
@@ -2410,9 +2678,10 @@ pub mod link {
             let (tx, mut rx) = mpsc::channel::<Bytes>(1);
             let key = [0u8; 32];
             let mut sender = LinkSender::Relay {
-                tx,
+                txs: vec![tx],
                 key,
-                counter: 0,
+                counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                rr: 0,
             };
 
             let pkt = Bytes::from(vec![0xAB; 64]);
@@ -2429,7 +2698,9 @@ pub mod link {
             });
             sender.send_batch(std::slice::from_ref(&pkt)).await.unwrap();
             match &sender {
-                LinkSender::Relay { counter, .. } => assert_eq!(*counter, 2),
+                LinkSender::Relay { counter, .. } => {
+                    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2)
+                }
                 _ => panic!("expected Relay"),
             }
             drop(sender);
@@ -2446,9 +2717,10 @@ pub mod link {
             drop(rx);
             let key = [0u8; 32];
             let mut sender = LinkSender::Relay {
-                tx,
+                txs: vec![tx],
                 key,
-                counter: 0,
+                counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                rr: 0,
             };
 
             let pkt = Bytes::from(vec![0xCD; 32]);
@@ -2486,6 +2758,35 @@ pub mod link {
             assert_eq!(&f2[..], &body[..]);
             assert!(take_frame(&mut acc).unwrap().is_none());
             assert!(acc.is_empty());
+        }
+
+        /// I-5 — concurrent seals on a shared key must never reuse a counter:
+        /// 4 tasks × 1000 increments on the shared atomic yield 4000 unique
+        /// nonce counters.
+        #[tokio::test]
+        async fn shared_counter_unique_across_tasks() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::sync::Arc;
+            let counter = Arc::new(AtomicU64::new(0));
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let counter = Arc::clone(&counter);
+                handles.push(tokio::spawn(async move {
+                    let mut seen = Vec::with_capacity(1000);
+                    for _ in 0..1000 {
+                        seen.push(counter.fetch_add(1, Ordering::Relaxed));
+                        tokio::task::yield_now().await;
+                    }
+                    seen
+                }));
+            }
+            let mut all = std::collections::HashSet::new();
+            for h in handles {
+                for v in h.await.unwrap() {
+                    assert!(all.insert(v), "counter value {v} reused across tasks");
+                }
+            }
+            assert_eq!(all.len(), 4000);
         }
 
         /// Oversized and undersized frame lengths must be rejected, not allocated.
@@ -2550,19 +2851,24 @@ pub mod bridge {
     const UPGRADE_GRACE: Duration = Duration::from_secs(5);
 
     /// Run the VPN data-plane bridge until the link dies or the tun closes.
-    /// Spawns uplink + downlink tasks and runs until one fails.
+    ///
+    /// Spawns one uplink pump per TUN queue (the kernel hashes flows across
+    /// queues on read) plus a single downlink pump writing to the first queue
+    /// (TUN writes accept any queue fd; kernel RPS spreads receive processing),
+    /// and runs until any pump fails.
     ///
     /// `offload`: if true, uses Phase 6.2 multi-packet GSO/GRO I/O;
     /// if false, uses Phase 6.1 single-packet I/O.
     ///
     /// `upgrade_rx` (DEC-1): when the direct-path task delivers new link halves,
-    /// the bridge aborts both pumps, waits for them to actually terminate (the
-    /// TUN must never have two concurrent readers), and respawns them on the new
-    /// halves. The old halves are dropped, which closes the relay substreams.
-    /// Relay-only callers pass a channel whose sender is already dropped: the
-    /// first `recv()` yields `None` and the upgrade arm is disabled for good.
+    /// the bridge aborts every pump, waits for them to actually terminate (the
+    /// TUN must never have two concurrent readers per queue), and respawns them
+    /// on the new halves. The old halves are dropped, which closes the relay
+    /// substreams. Relay-only callers pass a channel whose sender is already
+    /// dropped: the first `recv()` yields `None` and the upgrade arm is
+    /// disabled for good.
     pub async fn run(
-        dev: Arc<tun_rs::AsyncDevice>,
+        devs: Vec<Arc<tun_rs::AsyncDevice>>,
         sender: LinkSender,
         recver: LinkRecver,
         counters: Arc<BridgeCounters>,
@@ -2570,6 +2876,7 @@ pub mod bridge {
         offload: bool,
         mut upgrade_rx: tokio::sync::mpsc::Receiver<(LinkSender, LinkRecver)>,
     ) -> Result<()> {
+        assert!(!devs.is_empty(), "bridge needs at least one TUN queue");
         let stats_task = tokio::spawn({
             let c = Arc::clone(&counters);
             async move {
@@ -2599,41 +2906,59 @@ pub mod bridge {
             }
         });
 
+        /// Spawn one uplink per queue + one downlink; first to die wins.
+        fn spawn_pumps(
+            devs: &[Arc<tun_rs::AsyncDevice>],
+            sender: LinkSender,
+            recver: LinkRecver,
+            counters: &Arc<BridgeCounters>,
+            mtu: u16,
+            offload: bool,
+        ) -> Vec<tokio::task::JoinHandle<Result<()>>> {
+            let mut pumps = Vec::with_capacity(devs.len() + 1);
+            for dev in devs {
+                pumps.push(tokio::spawn(run_uplink(
+                    Arc::clone(dev),
+                    sender.clone(),
+                    Arc::clone(counters),
+                    mtu,
+                    offload,
+                )));
+            }
+            pumps.push(tokio::spawn(run_downlink(
+                Arc::clone(&devs[0]),
+                recver,
+                Arc::clone(counters),
+                offload,
+            )));
+            pumps
+        }
+
         let mut cur = Some((sender, recver));
         let result = 'outer: loop {
             let (sender, recver) = cur.take().expect("link halves present at spawn");
-            let mut uplink = tokio::spawn(run_uplink(
-                Arc::clone(&dev),
-                sender,
-                Arc::clone(&counters),
-                mtu,
-                offload,
-            ));
-            let mut downlink = tokio::spawn(run_downlink(
-                Arc::clone(&dev),
-                recver,
-                Arc::clone(&counters),
-                offload,
-            ));
+            let mut pumps = spawn_pumps(&devs, sender, recver, &counters, mtu, offload);
 
-            // Stop both pumps and WAIT for both to finish before reusing the
-            // TUN: aborting alone leaves a window with two readers.
+            // Stop every pump and WAIT for all of them before reusing the TUN.
             macro_rules! stop_pumps {
                 () => {{
-                    uplink.abort();
-                    downlink.abort();
-                    let _ = (&mut uplink).await;
-                    let _ = (&mut downlink).await;
+                    for p in &pumps {
+                        p.abort();
+                    }
+                    for p in &mut pumps {
+                        let _ = p.await;
+                    }
                 }};
             }
 
-            // On pump death, give a queued/imminent upgrade one last chance
-            // (the peer may have switched to direct first, killing our relay).
-            // With the upgrade channel already closed (relay-only, or direct
-            // attempt over) `recv()` yields `None` immediately — no delay.
-            macro_rules! die_or_switch {
-                ($res:expr, $what:literal) => {{
-                    let outcome: Result<()> = $res;
+            tokio::select! {
+                (res, _idx, _rest) = futures_util::future::select_all(pumps.iter_mut()) => {
+                    let outcome: Result<()> =
+                        res.unwrap_or_else(|e| Err(anyhow::anyhow!("bridge pump panic: {e}")));
+                    // On pump death, give a queued/imminent upgrade one last
+                    // chance (the peer may have switched to direct first,
+                    // killing our relay). With the channel already closed,
+                    // recv() yields None immediately — no delay.
                     if let Ok(Some(pair)) =
                         tokio::time::timeout(UPGRADE_GRACE, upgrade_rx.recv()).await
                     {
@@ -2641,28 +2966,12 @@ pub mod bridge {
                         cur = Some(pair);
                         tracing::info!(
                             path = "direct",
-                            concat!(
-                                "relay ",
-                                $what,
-                                " ended during direct upgrade; switching paths"
-                            ),
+                            "relay pump ended during direct upgrade; switching paths",
                         );
                         continue 'outer;
                     }
+                    stop_pumps!();
                     break 'outer outcome;
-                }};
-            }
-
-            tokio::select! {
-                res = &mut uplink => {
-                    downlink.abort();
-                    let outcome = res.unwrap_or_else(|e| Err(anyhow::anyhow!("uplink task panic: {e}")));
-                    die_or_switch!(outcome, "uplink")
-                }
-                res = &mut downlink => {
-                    uplink.abort();
-                    let outcome = res.unwrap_or_else(|e| Err(anyhow::anyhow!("downlink task panic: {e}")));
-                    die_or_switch!(outcome, "downlink")
                 }
                 maybe = upgrade_rx.recv() => match maybe {
                     Some(pair) => {
@@ -2673,13 +2982,13 @@ pub mod bridge {
                     }
                     None => {
                         // Upgrade can never happen (relay-only, direct attempt
-                        // over, or already switched); keep the pumps running
-                        // and wait for one of them to finish.
-                        let res = tokio::select! {
-                            res = &mut uplink => { downlink.abort(); res }
-                            res = &mut downlink => { uplink.abort(); res }
-                        };
-                        break 'outer res.unwrap_or_else(|e| Err(anyhow::anyhow!("bridge task panic: {e}")));
+                        // over, or already switched); wait for any pump to end.
+                        let (res, _idx, _rest) =
+                            futures_util::future::select_all(pumps.iter_mut()).await;
+                        let outcome: Result<()> =
+                            res.unwrap_or_else(|e| Err(anyhow::anyhow!("bridge pump panic: {e}")));
+                        stop_pumps!();
+                        break 'outer outcome;
                     }
                 }
             }
@@ -2716,7 +3025,11 @@ pub mod bridge {
         counters: Arc<BridgeCounters>,
         mtu: u16,
     ) -> Result<()> {
-        let mut buf = vec![0u8; mtu as usize + 4];
+        // Fixed worst-case buffer (not MTU-sized): the dynamic-PMTU monitor can
+        // raise the TUN MTU at runtime, and a smaller buffer would truncate
+        // reads. 64 KiB per uplink task is negligible.
+        let _ = mtu;
+        let mut buf = vec![0u8; u16::MAX as usize + 4];
         loop {
             let n = dev.recv(&mut buf).await?;
             if n == 0 {
@@ -2977,6 +3290,30 @@ mod tests {
             err.to_string().contains("control stream"),
             "unexpected error: {err}"
         );
+    }
+
+    /// §4.3 — PMTU decision truth table.
+    #[test]
+    fn pmtu_decision_cases() {
+        // Fewer than 3 samples → None.
+        assert_eq!(pmtu_decision(1350, &[]), None);
+        assert_eq!(pmtu_decision(1350, &[1450, 1450]), None);
+        // Unstable samples → None.
+        assert_eq!(pmtu_decision(1350, &[1400, 1450, 1450]), None);
+        // Stable but equal to current → None.
+        assert_eq!(pmtu_decision(1450, &[1450, 1450, 1450]), None);
+        // Stable, delta < 16 → None (churn guard).
+        assert_eq!(pmtu_decision(1450, &[1460, 1460, 1460]), None);
+        // Stable, larger → Some.
+        assert_eq!(pmtu_decision(1350, &[1450, 1450, 1450]), Some(1450));
+        // Stable, smaller → Some (path got narrower).
+        assert_eq!(pmtu_decision(1450, &[1350, 1350, 1350]), Some(1350));
+        // Below 576 → None.
+        assert_eq!(pmtu_decision(1350, &[500, 500, 500]), None);
+        // Above 9000 → clamped.
+        assert_eq!(pmtu_decision(1350, &[65000, 65000, 65000]), Some(9000));
+        // Only the LAST 3 samples matter.
+        assert_eq!(pmtu_decision(1350, &[100, 1450, 1450, 1450]), Some(1450));
     }
 
     /// §2.1 — fatal-vs-retryable classification truth table.

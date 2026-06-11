@@ -44,6 +44,8 @@ pub struct VpnProviderEntry {
     pub opener: mux::Opener,
     /// Connector sends pairing info here; listener awaits this.
     pub pair_tx: oneshot::Sender<VpnPairMsg>,
+    /// Relay carrier pairs requested by the listener (`HelloVpn.carriers`).
+    pub carriers: u16,
     /// Monotonic registration generation. Protects against a stale handler's
     /// deregistration removing a newer registration with the same id (a
     /// reconnect race: the old handler's Drop can run after the new listener
@@ -276,6 +278,7 @@ pub async fn serve_vpn_listener(
     udp_providers: secret::UdpRegistry,
     udp_tuning: UdpDirectTuning,
     link_permits: Arc<Semaphore>,
+    carriers: u16,
 ) -> Result<()> {
     // Acquire link permit (bounds live VPN links).
     let _permit = match link_permits.try_acquire() {
@@ -310,6 +313,7 @@ pub async fn serve_vpn_listener(
                 addr: addr.clone(),
                 opener,
                 pair_tx,
+                carriers,
                 session,
             });
         }
@@ -458,6 +462,8 @@ pub async fn serve_vpn_connector(
     udp_providers: secret::UdpRegistry,
     udp_tuning: UdpDirectTuning,
     punch_timeout: Duration,
+    carriers: u16,
+    max_carriers: u16,
 ) -> Result<()> {
     info!(%id, "vpn connector connecting");
 
@@ -491,7 +497,15 @@ pub async fn serve_vpn_connector(
     let listener_advertised = listener_entry.advertised.clone();
     let listener_addr_req = listener_entry.addr.clone();
     let listener_opener = listener_entry.opener.clone();
+    let listener_carriers = listener_entry.carriers;
     drop(listener_entry);
+
+    // Negotiate the relay carrier count (DEC-7): both sides and the server
+    // must agree; an old peer's missing field defaults to 1 (I-9).
+    let effective_carriers = listener_carriers
+        .max(1)
+        .min(carriers.max(1))
+        .min(max_carriers.max(1));
 
     // RAII guard for pool lease: freed on all error returns; lives for link duration.
     let mut _pool_lease: Option<VpnLeaseGuard> = None;
@@ -594,6 +608,7 @@ pub async fn serve_vpn_connector(
         session_nonce: nonce,
         tuning: udp_tuning,
         admin_v2: true,
+        carriers: effective_carriers,
     };
 
     let connector_ready = ServerMessage::VpnReady {
@@ -604,6 +619,7 @@ pub async fn serve_vpn_connector(
         session_nonce: nonce,
         tuning: udp_tuning,
         admin_v2: true,
+        carriers: effective_carriers,
     };
 
     // Send VpnReady to connector
@@ -856,6 +872,7 @@ mod tests {
             addr: VpnAddrRequest::Pool,
             opener,
             pair_tx,
+            carriers: 1,
             session,
         }
     }

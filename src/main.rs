@@ -943,6 +943,27 @@ struct VpnListenArgs {
     #[clap(long, env = "BORE_VPN_RELAY_ONLY")]
     relay_only: bool,
 
+    /// Number of parallel relay carrier substream pairs (1-16). Both sides and
+    /// the server's --max-carriers must agree; the minimum wins.
+    #[clap(
+        long,
+        value_name = "N",
+        default_value_t = 1u16,
+        env = "BORE_VPN_CARRIERS"
+    )]
+    carriers: u16,
+
+    /// Number of TUN queues (Linux IFF_MULTI_QUEUE, 1-8). One uplink pump per
+    /// queue; useful on multi-Gbit links where a single pump is CPU-bound.
+    #[clap(
+        long,
+        value_name = "N",
+        default_value_t = 1u8,
+        value_parser = clap::value_parser!(u8).range(1..=8),
+        env = "BORE_VPN_TUN_QUEUES"
+    )]
+    tun_queues: u8,
+
     /// Optional operator note.
     #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
     notes: Option<String>,
@@ -1046,6 +1067,27 @@ struct VpnConnectArgs {
     /// Never attempt the direct UDP path; stay on the server relay.
     #[clap(long, env = "BORE_VPN_RELAY_ONLY")]
     relay_only: bool,
+
+    /// Number of parallel relay carrier substream pairs (1-16). Both sides and
+    /// the server's --max-carriers must agree; the minimum wins.
+    #[clap(
+        long,
+        value_name = "N",
+        default_value_t = 1u16,
+        env = "BORE_VPN_CARRIERS"
+    )]
+    carriers: u16,
+
+    /// Number of TUN queues (Linux IFF_MULTI_QUEUE, 1-8). One uplink pump per
+    /// queue; useful on multi-Gbit links where a single pump is CPU-bound.
+    #[clap(
+        long,
+        value_name = "N",
+        default_value_t = 1u8,
+        value_parser = clap::value_parser!(u8).range(1..=8),
+        env = "BORE_VPN_TUN_QUEUES"
+    )]
+    tun_queues: u8,
 
     /// Optional operator note.
     #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
@@ -1424,6 +1466,8 @@ async fn dispatch(command: Command) -> Result<()> {
                     nat_udp_release_timeout: args.nat_udp_release_timeout,
                     relay_only: args.relay_only,
                     auto_reconnect: args.auto_reconnect,
+                    carriers: args.carriers,
+                    tun_queues: args.tun_queues as usize,
                     notes: args.notes,
                 };
 
@@ -1469,6 +1513,8 @@ async fn dispatch(command: Command) -> Result<()> {
                     nat_udp_release_timeout: args.nat_udp_release_timeout,
                     relay_only: args.relay_only,
                     auto_reconnect: args.auto_reconnect,
+                    carriers: args.carriers,
+                    tun_queues: args.tun_queues as usize,
                     notes: args.notes,
                 };
 

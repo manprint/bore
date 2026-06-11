@@ -231,6 +231,15 @@ kill $VPNPID2
 | V2-2.3 (F1/F3) | Server kill -9 → both clients reconnect, re-pair, ping OK, no EEXIST/dup routes | Netns (sudo) | `vpn_netns_test.sh` Test 10 | PENDING (needs sudo run) |
 | V2-2.3 (F1/F3) | Fatal error (overlap) with `--auto-reconnect` exits non-zero, no loop | Netns (sudo) | `vpn_netns_test.sh` Test 11 | PENDING (needs sudo run) |
 | V2-3.1 (D2/F5) | Paired links show VPN roles + overlay on admin page; `VpnPathReport` flips path to direct | Automated | `vpn_server_test::vpn_admin_entries_and_path_report` | PASS |
+| V2-4.1 (C3) | 4-carrier bulk transfer: every packet delivered exactly once (any order) | Automated | `vpn_relay_link_test::vpn_relay_multi_carrier_bulk` | PASS |
+| V2-4.1 (C3) | One dead carrier of 4 kills the link cleanly (no hang, no silent loss) | Automated | `vpn_relay_link_test::vpn_relay_multi_carrier_one_stream_dies` | PASS |
+| V2-4.1 (I-5) | Shared atomic nonce counter: 4 tasks × 1000 seals → 4000 unique counters | Automated | `vpn::link::tests::shared_counter_unique_across_tasks` | PASS |
+| V2-4.1 (C3) | Carriers negotiation min(hello, connect, server max); old-peer JSON defaults to 1 | Automated | `vpn_server_test::vpn_carriers_negotiation`, `vpn_carriers_default_for_old_peers` | PASS |
+| V2-4.2 (C1) | `--relay-only --carriers 4`: ping + iperf3 TCP over multi-carrier relay | Netns (sudo) | `vpn_netns_test.sh` Test 12 | PENDING (needs sudo run) |
+| V2-4.2 (C1) | `--tun-queues 4`: ping + iperf3 -P 4 | Netns (sudo) | `vpn_netns_test.sh` Test 13 | PENDING (needs sudo run) |
+| V2-4.3 (C2) | PMTU decision truth table (stability, delta, clamp) | Automated | `vpn::tests::pmtu_decision_cases` | PASS |
+| V2-4.3 (C2) | "tun MTU adjusted" on a real WAN (PMTU static in netns) | Manual | Procedure M-3 | PENDING |
+| V2-4.4 | Benchmark table (relay 1c/4c, direct, direct 4q) | Bench (sudo) | `scripts/vpn_bench.sh` | PENDING (needs sudo run) |
 
 ---
 

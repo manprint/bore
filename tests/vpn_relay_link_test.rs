@@ -138,6 +138,7 @@ async fn vpn_relay_link_bulk_bidirectional_no_wedge() {
             advertised: vec![],
             addr: VpnAddrRequest::Pool,
             notes: None,
+            carriers: 1,
         })
         .await
         .unwrap();
@@ -183,4 +184,212 @@ async fn vpn_relay_link_bulk_bidirectional_no_wedge() {
 
     c_out.abort();
     l_out.abort();
+}
+
+// ─── §4.1 multi-carrier relay (C3) ───────────────────────────────────────────
+
+/// Receive PKT_COUNT packets accepting ANY order (DEC-7: round-robin across
+/// carriers reorders datagrams); assert the seq set is complete and payloads
+/// intact.
+async fn pump_in_unordered(mut recver: link::LinkRecver) {
+    let mut seen = std::collections::HashSet::new();
+    let mut batch = Vec::with_capacity(64);
+    while (seen.len() as u64) < PKT_COUNT {
+        batch.clear();
+        recver
+            .recv_batch(&mut batch)
+            .await
+            .expect("recv_batch failed");
+        for pkt in &batch {
+            assert_eq!(pkt.len(), PKT_LEN, "packet length mismatch");
+            let seq = u64::from_be_bytes(pkt[..8].try_into().unwrap());
+            for (i, b) in pkt[8..].iter().enumerate() {
+                assert_eq!(*b, (seq as usize + i) as u8, "packet payload corrupted");
+            }
+            assert!(seen.insert(seq), "duplicate packet seq {seq}");
+            assert!(seq < PKT_COUNT, "seq {seq} out of range");
+        }
+    }
+}
+
+/// Pair through the real server with `carriers` substream pairs and return the
+/// two link halves per side.
+async fn pair_multi(
+    id: &str,
+    carriers: u16,
+) -> (
+    (link::LinkSender, link::LinkRecver),
+    (link::LinkSender, link::LinkRecver),
+) {
+    // Listener handshake.
+    let (l_opener, mut l_acceptor) = mux_connect().await;
+    let mut l_ctrl = Delimited::new(l_opener.open().await.unwrap());
+    l_ctrl
+        .send(ClientMessage::HelloVpn {
+            id: id.to_string(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers,
+        })
+        .await
+        .unwrap();
+
+    time::sleep(Duration::from_millis(80)).await;
+    let (c_opener, _c_acceptor) = mux_connect().await;
+    let mut c_ctrl = Delimited::new(c_opener.open().await.unwrap());
+    c_ctrl
+        .send(ClientMessage::ConnectVpn {
+            id: id.to_string(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers,
+        })
+        .await
+        .unwrap();
+
+    let (c_nonce, c_carriers) = match c_ctrl.recv::<ServerMessage>().await.unwrap() {
+        Some(ServerMessage::VpnReady {
+            session_nonce,
+            carriers,
+            ..
+        }) => (session_nonce, carriers),
+        other => panic!("connector expected VpnReady, got {other:?}"),
+    };
+    assert_eq!(c_carriers, carriers, "negotiated carrier count");
+    let l_nonce = match l_ctrl.recv::<ServerMessage>().await.unwrap() {
+        Some(ServerMessage::VpnReady { session_nonce, .. }) => session_nonce,
+        other => panic!("listener expected VpnReady, got {other:?}"),
+    };
+    assert_eq!(c_nonce, l_nonce);
+
+    let (c_egress, c_ingress) = link::connect_relay_multi(&c_opener, carriers)
+        .await
+        .unwrap();
+    let c_halves = link::make_relay_multi(
+        c_egress,
+        c_ingress,
+        bore_cli::vpn::crypto::derive_keys_connector(SECRET, &c_nonce).unwrap(),
+    );
+    let (l_egress, l_ingress) = link::accept_relay_multi(&mut l_acceptor, carriers)
+        .await
+        .unwrap();
+    let l_halves = link::make_relay_multi(
+        l_egress,
+        l_ingress,
+        bore_cli::vpn::crypto::derive_keys_listener(SECRET, &l_nonce).unwrap(),
+    );
+    // Keep the control plumbing alive for the duration of the test.
+    std::mem::forget((l_ctrl, c_ctrl, l_opener, c_opener, l_acceptor));
+    (c_halves, l_halves)
+}
+
+/// Bulk bidirectional transfer over 4 carriers: every packet must arrive
+/// exactly once (any order), no wedge, no loss.
+#[tokio::test]
+async fn vpn_relay_multi_carrier_bulk() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server("10.97.0.0/16").await;
+
+    let ((c_sender, c_recver), (l_sender, l_recver)) = pair_multi("multi4", 4).await;
+
+    let c_out = tokio::spawn(pump_out(c_sender));
+    let l_out = tokio::spawn(pump_out(l_sender));
+    let c_in = tokio::spawn(pump_in_unordered(c_recver));
+    let l_in = tokio::spawn(pump_in_unordered(l_recver));
+
+    let both = async {
+        c_in.await.unwrap();
+        l_in.await.unwrap();
+    };
+    time::timeout(Duration::from_secs(60), both)
+        .await
+        .expect("multi-carrier relay wedged: bulk transfer did not complete");
+
+    c_out.abort();
+    l_out.abort();
+}
+
+/// Killing one of 4 carriers mid-transfer must kill the link with a clean
+/// error on the receiving side — no hang, no silent half-degraded state.
+#[tokio::test]
+async fn vpn_relay_multi_carrier_one_stream_dies() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server("10.98.0.0/16").await;
+
+    // Build the connector side normally but keep raw listener streams so one
+    // can be dropped (closing it) mid-test.
+    let (l_opener, mut l_acceptor) = mux_connect().await;
+    let mut l_ctrl = Delimited::new(l_opener.open().await.unwrap());
+    l_ctrl
+        .send(ClientMessage::HelloVpn {
+            id: "die1".into(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 4,
+        })
+        .await
+        .unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+    let (c_opener, _c_acceptor) = mux_connect().await;
+    let mut c_ctrl = Delimited::new(c_opener.open().await.unwrap());
+    c_ctrl
+        .send(ClientMessage::ConnectVpn {
+            id: "die1".into(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 4,
+        })
+        .await
+        .unwrap();
+    let c_nonce = match c_ctrl.recv::<ServerMessage>().await.unwrap() {
+        Some(ServerMessage::VpnReady { session_nonce, .. }) => session_nonce,
+        other => panic!("connector expected VpnReady, got {other:?}"),
+    };
+    let _ = l_ctrl.recv::<ServerMessage>().await.unwrap();
+
+    let (c_egress, c_ingress) = link::connect_relay_multi(&c_opener, 4).await.unwrap();
+    let (c_sender, c_recver) = link::make_relay_multi(
+        c_egress,
+        c_ingress,
+        bore_cli::vpn::crypto::derive_keys_connector(SECRET, &c_nonce).unwrap(),
+    );
+    let (mut l_egress, mut l_ingress) = link::accept_relay_multi(&mut l_acceptor, 4).await.unwrap();
+
+    // Listener: drop one carrier pair (closing both substreams) to simulate a
+    // dead carrier. The connector's matching ingress reader must error out.
+    drop(l_egress.remove(3));
+    drop(l_ingress.remove(3));
+
+    // The surviving listener halves still build a (3-carrier) sender so the
+    // remaining streams stay open — the connector recver must STILL die.
+    let (l_sender, _l_recver) = link::make_relay_multi(
+        l_egress,
+        l_ingress,
+        bore_cli::vpn::crypto::derive_keys_listener(SECRET, &c_nonce).unwrap(),
+    );
+
+    // Drive some connector traffic so the link is live.
+    let pump = tokio::spawn(pump_out(c_sender));
+
+    // The connector's recv_batch must return Err (its 4th reader hit EOF).
+    let mut recver = c_recver;
+    let mut batch = Vec::new();
+    let died = async {
+        loop {
+            batch.clear();
+            if recver.recv_batch(&mut batch).await.is_err() {
+                return;
+            }
+        }
+    };
+    time::timeout(Duration::from_secs(15), died)
+        .await
+        .expect("link did not die after a carrier was killed");
+
+    pump.abort();
+    drop(l_sender);
 }

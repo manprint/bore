@@ -427,6 +427,41 @@ Normal. `Ctrl-C` (SIGINT), a link error, or panic all trigger cleanup: routes de
 
 ---
 
+## Performance — Carriers, Multi-Queue, Dynamic PMTU (Phase 2 plan, §4)
+
+**`--carriers <N>` (relay):** opens N relay substream pairs instead of one,
+breaking the single-TCP-stream RTT×window throughput ceiling on high-latency
+WANs. Frames are distributed round-robin **per datagram** (out-of-order
+delivery is fine: IP is best-effort; TCP inside the tunnel reorders). The
+effective count is `min(listener, connector, server --max-carriers)`; old
+peers default to 1. The AEAD nonce counter is a single shared atomic across
+all carriers — never two seals with the same `(key, counter)`. If any carrier
+substream dies, the whole link dies cleanly (auto-reconnect picks it up); no
+silent half-degraded state.
+
+**`--tun-queues <N>` (Linux):** creates the TUN with `IFF_MULTI_QUEUE` and
+runs one uplink pump per queue (the kernel hashes flows across queues), for
+multi-Gbit links where a single pump is CPU-bound. The downlink remains a
+single pump writing to the first queue (TUN writes are not the typical
+bottleneck; revisit if benchmarks say otherwise). Default 1 = identical to the
+single-queue path.
+
+**Dynamic PMTU (direct path):** after the switch to direct, a monitor samples
+`max_datagram_size()` every 5 s; once the QUIC MTU discovery settles (3 equal
+samples, ≥16 bytes away from the current MTU, within [576, 9000]) it runs
+`ip link set <tun> mtu <new>` and logs `tun MTU adjusted to QUIC path MTU`.
+No revert needed — the TUN is destroyed at teardown, and the nft MSS clamp
+uses `rt mtu`, adapting on its own.
+
+**Benchmarks:** `sudo scripts/vpn_bench.sh` produces the comparison table
+(relay 1c / relay 4c / direct / direct 4q × TCP / UDP / latency). Record the
+numbers here after each tuning change.
+
+> Baseline (pre-Phase-4, docker 3-node): relay ≈ 200 MB/s bulk, ping 0% loss
+> under load. Netns numbers to be recorded on the first `vpn_bench.sh` run.
+
+---
+
 ## Performance — GSO/GRO Offload (Phase 6.2, Implemented)
 
 TUN I/O uses **batch read/write with GSO/GRO offload** when the kernel supports `IFF_VNET_HDR`. The implementation auto-detects support at startup and logs the result at `info!` level.

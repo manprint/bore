@@ -88,6 +88,7 @@ fn pool_connect_vpn(id: &str) -> ClientMessage {
         advertised: vec![],
         addr: VpnAddrRequest::Pool,
         notes: None,
+        carriers: 1,
     }
 }
 
@@ -516,6 +517,7 @@ async fn vpn_server_overlap_rejected() {
         advertised: vec![cidr],
         addr: VpnAddrRequest::Pool,
         notes: None,
+        carriers: 1,
     })
     .await
     .unwrap();
@@ -555,6 +557,7 @@ async fn vpn_server_addr_mode_mismatch_rejected() {
             peer: "10.91.0.1".parse().unwrap(),
         },
         notes: None,
+        carriers: 1,
     })
     .await
     .unwrap();
@@ -603,6 +606,7 @@ async fn vpn_server_static_inconsistent_pair_rejected() {
             peer: "172.31.0.3".parse().unwrap(), // WRONG: should be .1
         },
         notes: None,
+        carriers: 1,
     })
     .await
     .unwrap();
@@ -992,4 +996,74 @@ async fn vpn_admin_entries_and_path_report() {
         data.contains("\"vpn_direct\":true"),
         "connector entry must show direct after VpnPathReport: {data}"
     );
+}
+
+// ─── §4.1 carriers negotiation (C3) ──────────────────────────────────────────
+
+/// hello(4) + connect(2) → VpnReady.carriers == 2 on both sides.
+#[tokio::test]
+async fn vpn_carriers_negotiation() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_pool("10.95.0.0/16").await;
+
+    let mut l_ctrl = vpn_ctrl_connect().await;
+    l_ctrl
+        .send(ClientMessage::HelloVpn {
+            id: "neg1".into(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 4,
+        })
+        .await
+        .unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl
+        .send(ClientMessage::ConnectVpn {
+            id: "neg1".into(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 2,
+        })
+        .await
+        .unwrap();
+
+    let c_carriers = match c_ctrl.recv::<ServerMessage>().await.unwrap() {
+        Some(ServerMessage::VpnReady { carriers, .. }) => carriers,
+        other => panic!("connector expected VpnReady, got {other:?}"),
+    };
+    let l_carriers = match l_ctrl.recv::<ServerMessage>().await.unwrap() {
+        Some(ServerMessage::VpnReady { carriers, .. }) => carriers,
+        other => panic!("listener expected VpnReady, got {other:?}"),
+    };
+    assert_eq!(c_carriers, 2, "min(hello=4, connect=2, server max) == 2");
+    assert_eq!(l_carriers, 2);
+}
+
+/// Wire compatibility (I-8/I-9): messages from an OLD peer without the
+/// `carriers` field deserialize with carriers == 1, and an old `VpnReady`
+/// (without `carriers`/`admin_v2`) defaults to 1/false.
+#[tokio::test]
+async fn vpn_carriers_default_for_old_peers() {
+    let json = r#"{"ConnectVpn":{"id":"x","advertised":[],"addr":"Pool","notes":null}}"#;
+    let msg: ClientMessage = serde_json::from_str(json).unwrap();
+    match msg {
+        ClientMessage::ConnectVpn { carriers, .. } => assert_eq!(carriers, 1),
+        other => panic!("expected ConnectVpn, got {other:?}"),
+    }
+
+    let json = r#"{"VpnReady":{"assigned":"10.0.0.2","prefix":30,"peer_overlay":"10.0.0.1","peer_advertised":[],"session_nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}"#;
+    let msg: ServerMessage = serde_json::from_str(json).unwrap();
+    match msg {
+        ServerMessage::VpnReady {
+            carriers, admin_v2, ..
+        } => {
+            assert_eq!(carriers, 1);
+            assert!(!admin_v2);
+        }
+        other => panic!("expected VpnReady, got {other:?}"),
+    }
 }

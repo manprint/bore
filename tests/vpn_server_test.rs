@@ -47,6 +47,19 @@ async fn spawn_vpn_server_disabled() {
     wait_for_control_port(true).await;
 }
 
+/// Like `spawn_vpn_server_with_pool` but with a custom DEC-3 punch timeout.
+async fn spawn_vpn_server_with_punch_timeout(pool_cidr: &str, punch_timeout: Duration) {
+    wait_for_control_port(false).await;
+    let pool: Ipv4Net = pool_cidr.parse().unwrap();
+    let mut server = bore_cli::server::Server::new(1024..=65535, None);
+    server.set_vpn(true);
+    server.set_vpn_pool(pool).unwrap();
+    server.set_vpn_max_links(10);
+    server.set_vpn_punch_timeout(punch_timeout);
+    tokio::spawn(server.listen());
+    wait_for_control_port(true).await;
+}
+
 /// Open a VPN control connection to the running server.
 /// Returns a Delimited<mux::Stream> ready to send/receive control messages.
 async fn vpn_ctrl_connect() -> Delimited<bore_cli::mux::Stream> {
@@ -749,4 +762,142 @@ async fn vpn_relay_substream_is_opaque() {
         received[0], 0x45,
         "server must not have decrypted the AEAD frame"
     );
+}
+
+// ─── §1.1 UDP broker (DEC-3: punch only with BOTH offers) ────────────────────
+
+/// Drain heartbeats until a `UdpPunch` arrives; panic on anything else.
+async fn recv_until_punch(
+    ctrl: &mut Delimited<bore_cli::mux::Stream>,
+    what: &str,
+) -> ([u8; 16], Vec<std::net::SocketAddr>) {
+    let deadline = time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let msg = time::timeout_at(deadline, ctrl.recv::<ServerMessage>())
+            .await
+            .unwrap_or_else(|_| panic!("{what}: timed out waiting for UdpPunch"))
+            .unwrap();
+        match msg {
+            Some(ServerMessage::UdpPunch { nonce, peer, .. }) => return (nonce, peer),
+            Some(ServerMessage::Heartbeat) => continue,
+            other => panic!("{what}: expected UdpPunch, got {other:?}"),
+        }
+    }
+}
+
+/// Drain heartbeats until a `UdpUnavailable` arrives; panic on anything else.
+async fn recv_until_unavailable(ctrl: &mut Delimited<bore_cli::mux::Stream>, what: &str) {
+    let deadline = time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let msg = time::timeout_at(deadline, ctrl.recv::<ServerMessage>())
+            .await
+            .unwrap_or_else(|_| panic!("{what}: timed out waiting for UdpUnavailable"))
+            .unwrap();
+        match msg {
+            Some(ServerMessage::UdpUnavailable) => return,
+            Some(ServerMessage::Heartbeat) => continue,
+            other => panic!("{what}: expected UdpUnavailable, got {other:?}"),
+        }
+    }
+}
+
+fn offer(addr: &str) -> ClientMessage {
+    ClientMessage::UdpCandidateOffer(bore_cli::shared::UdpCandidateOffer {
+        candidates: vec![addr.parse().unwrap()],
+        selected_stun: None,
+    })
+}
+
+fn session_nonce_of(msg: &Option<ServerMessage>) -> [u8; 16] {
+    match msg {
+        Some(ServerMessage::VpnReady { session_nonce, .. }) => *session_nonce,
+        other => panic!("expected VpnReady, got {other:?}"),
+    }
+}
+
+/// With both offers present the broker punches BOTH sides: each peer receives
+/// the OTHER peer's candidates, under the pairing nonce.
+#[tokio::test]
+async fn vpn_broker_punches_both_sides_when_both_offers_present() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_pool("10.91.0.0/16").await;
+
+    let mut l_ctrl = vpn_ctrl_connect().await;
+    l_ctrl.send(pool_hello_vpn("broker1")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl.send(pool_connect_vpn("broker1")).await.unwrap();
+    let c_ready = c_ctrl.recv::<ServerMessage>().await.unwrap();
+    let nonce = session_nonce_of(&c_ready);
+    let l_ready = l_ctrl.recv::<ServerMessage>().await.unwrap();
+    assert_eq!(session_nonce_of(&l_ready), nonce, "nonce must match");
+
+    // Listener offers first, then the connector.
+    l_ctrl.send(offer("203.0.113.1:1000")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+    c_ctrl.send(offer("203.0.113.2:2000")).await.unwrap();
+
+    let (c_nonce, c_peer) = recv_until_punch(&mut c_ctrl, "connector").await;
+    assert_eq!(
+        c_nonce, nonce,
+        "connector punch must carry the pairing nonce"
+    );
+    assert_eq!(c_peer, vec!["203.0.113.1:1000".parse().unwrap()]);
+
+    let (l_nonce, l_peer) = recv_until_punch(&mut l_ctrl, "listener").await;
+    assert_eq!(
+        l_nonce, nonce,
+        "listener punch must carry the pairing nonce"
+    );
+    assert_eq!(l_peer, vec!["203.0.113.2:2000".parse().unwrap()]);
+}
+
+/// The broker must defer the punch until the listener's offer arrives (DEC-3),
+/// even when the connector offers first.
+#[tokio::test]
+async fn vpn_broker_waits_for_listener_offer() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_pool("10.92.0.0/16").await;
+
+    let mut l_ctrl = vpn_ctrl_connect().await;
+    l_ctrl.send(pool_hello_vpn("broker2")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl.send(pool_connect_vpn("broker2")).await.unwrap();
+    let _ = c_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+    let _ = l_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+
+    // Connector offers FIRST; the listener takes 1 s to offer.
+    c_ctrl.send(offer("203.0.113.2:2000")).await.unwrap();
+    time::sleep(Duration::from_secs(1)).await;
+    l_ctrl.send(offer("203.0.113.1:1000")).await.unwrap();
+
+    // The punch must still arrive (within the helper's 5 s budget).
+    let (_, c_peer) = recv_until_punch(&mut c_ctrl, "connector").await;
+    assert_eq!(c_peer, vec!["203.0.113.1:1000".parse().unwrap()]);
+    let (_, l_peer) = recv_until_punch(&mut l_ctrl, "listener").await;
+    assert_eq!(l_peer, vec!["203.0.113.2:2000".parse().unwrap()]);
+}
+
+/// If the listener never offers, the connector gets `UdpUnavailable` after the
+/// punch timeout and stays on relay.
+#[tokio::test]
+async fn vpn_broker_timeout_sends_unavailable() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_punch_timeout("10.93.0.0/16", Duration::from_millis(500)).await;
+
+    let mut l_ctrl = vpn_ctrl_connect().await;
+    l_ctrl.send(pool_hello_vpn("broker3")).await.unwrap();
+    time::sleep(Duration::from_millis(80)).await;
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl.send(pool_connect_vpn("broker3")).await.unwrap();
+    let _ = c_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+    let _ = l_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+
+    // Only the connector offers; the listener never does.
+    c_ctrl.send(offer("203.0.113.2:2000")).await.unwrap();
+    recv_until_unavailable(&mut c_ctrl, "connector").await;
 }

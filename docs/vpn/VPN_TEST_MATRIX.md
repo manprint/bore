@@ -218,6 +218,14 @@ kill $VPNPID2
 | V2-0.3 (D1) | One-shot warn when TooLarge drops persist >10 s after link-up | Automated | `vpn::bridge::tests::toolarge_warn_logic` (truth table) | PASS |
 | V2-0.4 (D4) | `VpnLeaseGuard::drop` frees the /30 block even under lock contention | Automated | `vpn_server_test::vpn_lease_guard_frees_under_contention` | PASS |
 | V2-0.5 (D5) | Stale deregistration cannot remove a newer session's registry entries | Automated | `vpn_server::tests::vpn_deregister_does_not_remove_newer_session`, `vpn_deregister_removes_own_session` | PASS |
+| V2-1.1 (A1) | Broker punches BOTH sides only when both offers are present, with the pairing nonce | Automated | `vpn_server_test::vpn_broker_punches_both_sides_when_both_offers_present` | PASS |
+| V2-1.1 (A1) | Broker defers the punch until the listener's offer arrives (DEC-3) | Automated | `vpn_server_test::vpn_broker_waits_for_listener_offer` | PASS |
+| V2-1.1 (A1) | Listener never offers → connector gets `UdpUnavailable` after the punch timeout | Automated | `vpn_server_test::vpn_broker_timeout_sends_unavailable` | PASS |
+| V2-1.2 (A1) | Ctrl actor: heartbeats ignored, punch forwarded, outbound messages written, close detected | Automated | `vpn::tests::ctrl_actor_forwards_punch_and_detects_close` | PASS |
+| V2-1.6 (F2) | Direct path host↔host: `path=direct` both sides, 0% ping loss, UDP ≥100 Mbps | Netns (sudo) | `vpn_netns_test.sh` Test 6 | PENDING (needs sudo run) |
+| V2-1.6 (F2) | UDP blocked between peers → automatic relay fallback, ping works | Netns (sudo) | `vpn_netns_test.sh` Test 7 | PENDING (needs sudo run) |
+| V2-1.6 (F2) | Direct path gateway mode: LAN ping + TCP through gateway (MSS clamp / GSO) | Netns (sudo) | `vpn_netns_test.sh` Test 8 | PENDING (needs sudo run) |
+| V2-1.6 (F2) | `--relay-only`: no direct upgrade ever, ping works | Netns (sudo) | `vpn_netns_test.sh` Test 9 | PENDING (needs sudo run) |
 
 ---
 

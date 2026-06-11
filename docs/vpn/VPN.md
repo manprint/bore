@@ -40,9 +40,7 @@ from a crashed run or an in-flight reconnect never aborts link setup with
 
 ### Security Model
 
-**Direct path (preferred):** unreliable QUIC datagrams, encrypted end-to-end via QUIC-TLS 1.3. The server is not involved in the data path; it only orchestrates the handshake.
-
-> **Status:** the direct QUIC path is **not wired up yet** (see `VPN_FULL_PLAN_TODO.md` §A1). Every link currently runs on the relay path (`path="relay"` in the logs). Sections below that describe `path="direct"` behaviour document the planned design, not the current binary.
+**Direct path (preferred):** unreliable QUIC datagrams, encrypted end-to-end via QUIC-TLS 1.3. The server is not involved in the data path; it only orchestrates the handshake. Both peers authenticate the QUIC connection with a token derived from `(secret, session_nonce)` — the same mechanism as secret tunnels.
 
 **Relay path (fallback):** framed AEAD-encrypted IP packets over **two yamux substreams, one per direction**. The connector opens both and tags each with a direction byte (`0x01` connector→listener, `0x02` listener→connector) right after the readiness marker; each substream is then written by exactly one side and read only by the other. Each packet is sealed with ChaCha20-Poly1305 under a key derived from the shared secret and a server-issued nonce. The server splices ciphertext bytes opaque — **it never sees plaintext IP packets**, preserving E2E encryption even when a direct path is unavailable.
 
@@ -287,9 +285,40 @@ With `--auto-reconnect`, the client reconnects on link failure with exponential 
 
 ## Path Selection & Fallback
 
-**On link-up:** the client attempts a direct QUIC hole-punch first. Logs show `info!(path="direct")` on success or `warn!` (fallback) + `info!(path="relay")` if the direct path fails.
+**On link-up the link ALWAYS starts on the relay** (instant availability), and a
+background task attempts the direct upgrade in parallel:
 
-**After link-up:** if the direct path becomes unavailable (UDP blocked, firewall changes), the bridge detects the closure and transparently falls back to the relay. A brief stall may occur (the client re-opens a relay substream and re-derives keys), then traffic resumes.
+1. Both clients bind a UDP socket, gather hole-punch candidates (STUN reflexive
+   + local address; optionally UPnP and port prediction), and send a
+   `UdpCandidateOffer` to the server on the control stream.
+2. The server's broker waits until it holds **both** offers, then sends
+   `UdpPunch` to **both** sides, each carrying the other peer's candidates. If
+   the listener produces no candidates within 10 s of the connector's offer,
+   the connector receives `UdpUnavailable` and stays on relay.
+3. The listener starts a QUIC endpoint (`DirectListener`) and the connector
+   dials it (`connect_direct`); both punch UDP toward the peer's candidates.
+   The connection is authenticated with the token derived from
+   `(secret, session_nonce)`.
+4. On success the bridge performs a **controlled restart** (DEC-1): both pumps
+   are stopped, the relay link halves are dropped (closing the relay
+   substreams), and the pumps respawn on the direct QUIC link. Logs show
+   `info!(path="direct", "vpn path upgraded to direct QUIC")` and
+   `"bridge switched to direct path"`. A few in-flight packets may be lost
+   during the switch — IP is best-effort; TCP inside the tunnel retransmits.
+
+**If the direct attempt fails** (no punch within 15 s, `UdpUnavailable`, QUIC
+handshake timeout), the client logs
+`info!(path="relay", "direct path unavailable; staying on relay")` and the
+relay bridge keeps running untouched — there is no retry within the same
+session (a reconnect re-attempts the upgrade with a fresh nonce).
+
+**If the direct path dies at runtime** (DEC-2), the bridge ends with an error
+and the process exits — or reconnects when `--auto-reconnect` is set, landing
+back on relay first and re-attempting the upgrade.
+
+**`--relay-only`** (both subcommands) disables the upgrade attempt entirely:
+no UDP socket, no STUN, no offer. Useful for deterministic tests and for
+environments where outbound UDP is undesirable.
 
 **Relay is always available** (assuming the server is up) because it is the fallback transport; there is no scenario where the relay "succeeds or fails" — it is the baseline.
 
@@ -317,6 +346,21 @@ bore test-udp --to bore.example.com
 ```
 
 This prints NAT class (cone, symmetric, etc.), port preservation, CGNAT detection, and UPnP status. If both are "open" or "cone", direct should work; if one is "symmetric" and the other is not, only one direction will punch. If both are "symmetric", direct fails (relay only).
+
+### `path=relay` persists (no direct upgrade)
+
+The order of checks:
+
+1. `--relay-only` set on either side? Then this is by design.
+2. Grep both client logs for `direct path unavailable; staying on relay` —
+   the attached error says why: `no usable UDP candidates` (STUN unreachable,
+   UDP egress blocked), `no punch from server` (the **other** peer never
+   offered — check its log), `server reported the direct path unavailable`
+   (`UdpUnavailable`: the listener produced no candidates within the broker's
+   10 s window), or a QUIC timeout (punch packets dropped between the peers).
+3. Diagnose NAT with `bore test-udp` as above.
+
+The link stays fully functional on relay in all these cases.
 
 ### Ping ok, TCP slow or stalls
 

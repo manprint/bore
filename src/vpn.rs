@@ -37,6 +37,8 @@ pub struct VpnListenArgs {
     pub nat_udp_preferred_port: u16,
     /// UDP port release timeout.
     pub nat_udp_release_timeout: u64,
+    /// Never attempt the direct UDP path (stay on the server relay).
+    pub relay_only: bool,
     /// Optional notes.
     pub notes: Option<String>,
 }
@@ -72,6 +74,8 @@ pub struct VpnConnectArgs {
     pub nat_udp_preferred_port: u16,
     /// UDP port release timeout.
     pub nat_udp_release_timeout: u64,
+    /// Never attempt the direct UDP path (stay on the server relay).
+    pub relay_only: bool,
     /// Optional notes.
     pub notes: Option<String>,
 }
@@ -187,52 +191,297 @@ pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
 
     info!(link_id = %args.id, "vpn link bridge starting");
 
+    // Control-stream actor (single owner of `ctrl` from here on).
+    let (out_tx, event_rx, ctrl_task) = spawn_ctrl_actor(ctrl);
+
+    // Direct-path upgrade attempt (skipped entirely with --relay-only).
+    let (upgrade_tx, upgrade_rx) = tokio::sync::mpsc::channel(1);
+    let direct_task = if args.relay_only {
+        drop(event_rx);
+        drop(upgrade_tx);
+        None
+    } else {
+        let ctx = DirectUpgradeCtx::from_link_args(
+            DirectSide::Listener,
+            &args.to,
+            &CommonDirectArgs {
+                id: &args.id,
+                secret: &args.secret,
+                stun_server: args.stun_server.as_ref(),
+                upnp: args.upnp,
+                try_port_prediction: args.try_port_prediction,
+                nat_udp_preferred_port: args.nat_udp_preferred_port,
+            },
+        );
+        Some(tokio::spawn(direct_upgrade_task(
+            ctx,
+            out_tx.clone(),
+            event_rx,
+            upgrade_tx,
+        )))
+    };
+    drop(out_tx);
+
     // Run the bridge until it closes or the control connection dies.
     let result = run_bridge_with_ctrl(
-        &args.id, ctrl, dev, sender, recver, counters, args.mtu, offload,
+        &args.id, ctrl_task, dev, sender, recver, counters, args.mtu, offload, upgrade_rx,
     )
     .await;
+
+    if let Some(task) = direct_task {
+        task.abort();
+    }
 
     info!(link_id = %args.id, "vpn link bridge closed");
     result
 }
 
-/// Run the data-plane bridge alongside a control-stream drainer.
+/// Events the control-stream actor forwards to the direct-path logic.
+enum CtrlEvent {
+    /// The server brokered a punch: peer candidates + transport tuning.
+    Punch {
+        /// Session nonce; both peers derive the same QUIC token from it.
+        nonce: [u8; crate::shared::UDP_NONCE_LEN],
+        /// Peer candidate addresses to punch toward.
+        peer: Vec<std::net::SocketAddr>,
+        /// Direct-UDP transport tuning requested by the server.
+        tuning: crate::shared::UdpDirectTuning,
+    },
+    /// The direct path is unavailable; stay on relay.
+    Unavailable,
+}
+
+/// Spawn the control-stream actor: the **single** owner of the control stream
+/// after `VpnReady` (one stream = one task).
 ///
-/// The server sends `Heartbeat` on the control stream every 500 ms. Without a
-/// reader those frames would slowly exhaust the stream's receive window, and —
-/// worse — server death would go completely unnoticed: the bridge would keep
-/// "running" with zero traffic and no log line. Draining the stream gives us
-/// prompt, loud detection of a lost server.
+/// The server sends `Heartbeat` every 500 ms. Without a reader those frames
+/// would slowly exhaust the stream's receive window, and — worse — server death
+/// would go completely unnoticed: the bridge would keep "running" with zero
+/// traffic and no log line. The actor drains the stream for prompt, loud
+/// detection of a lost server (the returned `JoinHandle` resolves with the
+/// error), forwards `UdpPunch`/`UdpUnavailable` to `CtrlEvent` consumers, and
+/// writes any `ClientMessage` submitted on the returned sender (candidate
+/// offers, path reports).
+fn spawn_ctrl_actor(
+    mut ctrl: crate::shared::Delimited<crate::mux::Stream>,
+) -> (
+    tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
+    tokio::sync::mpsc::Receiver<CtrlEvent>,
+    tokio::task::JoinHandle<anyhow::Error>,
+) {
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<crate::shared::ClientMessage>(8);
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel::<CtrlEvent>(8);
+    let task = tokio::spawn(async move {
+        let mut out_open = true;
+        loop {
+            tokio::select! {
+                out = out_rx.recv(), if out_open => match out {
+                    Some(msg) => {
+                        if let Err(e) = ctrl.send(msg).await {
+                            return anyhow!("vpn control stream error: {e}");
+                        }
+                    }
+                    // All senders dropped: keep draining the stream (I-7).
+                    None => out_open = false,
+                },
+                msg = ctrl.recv::<crate::shared::ServerMessage>() => match msg {
+                    Ok(Some(crate::shared::ServerMessage::Heartbeat)) => continue,
+                    Ok(Some(crate::shared::ServerMessage::UdpPunch {
+                        nonce,
+                        peer,
+                        peer_selected_stun,
+                        tuning,
+                    })) => {
+                        tracing::debug!(?peer, ?peer_selected_stun, "received vpn udp punch");
+                        let _ = event_tx
+                            .send(CtrlEvent::Punch { nonce, peer, tuning })
+                            .await;
+                    }
+                    Ok(Some(crate::shared::ServerMessage::UdpUnavailable)) => {
+                        let _ = event_tx.send(CtrlEvent::Unavailable).await;
+                    }
+                    Ok(Some(msg)) => {
+                        tracing::debug!(?msg, "ignoring control message on vpn link");
+                    }
+                    Ok(None) => return anyhow!("server closed the vpn control stream"),
+                    Err(e) => return anyhow!("vpn control stream error: {e}"),
+                }
+            }
+        }
+    });
+    (out_tx, event_rx, task)
+}
+
+/// Which QUIC role this peer plays during the direct-path upgrade.
+#[derive(Clone, Copy, Debug)]
+enum DirectSide {
+    /// QUIC server (`DirectListener::accept`).
+    Listener,
+    /// QUIC client (`connect_direct`).
+    Connector,
+}
+
+/// Inputs for [`direct_upgrade_task`], captured from the link args + pairing.
+struct DirectUpgradeCtx {
+    side: DirectSide,
+    link_id: String,
+    secret: String,
+    server_host: String,
+    server_port: u16,
+    stun_server: Option<String>,
+    upnp: bool,
+    try_port_prediction: bool,
+    nat_udp_preferred_port: u16,
+}
+
+impl DirectUpgradeCtx {
+    fn from_link_args(side: DirectSide, to: &str, args: &CommonDirectArgs<'_>) -> Self {
+        let endpoint = crate::transport::Endpoint::parse(to);
+        DirectUpgradeCtx {
+            side,
+            link_id: args.id.to_string(),
+            secret: args.secret.to_string(),
+            server_host: endpoint.host,
+            server_port: endpoint.port,
+            stun_server: args.stun_server.cloned(),
+            upnp: args.upnp,
+            try_port_prediction: args.try_port_prediction,
+            nat_udp_preferred_port: args.nat_udp_preferred_port,
+        }
+    }
+}
+
+/// Borrowed view of the NAT-related fields shared by listen/connect args.
+struct CommonDirectArgs<'a> {
+    id: &'a str,
+    secret: &'a str,
+    stun_server: Option<&'a String>,
+    upnp: bool,
+    try_port_prediction: bool,
+    nat_udp_preferred_port: u16,
+}
+
+/// Total budget for the offer → punch round-trip before giving up on direct.
+const DIRECT_PUNCH_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long the listener waits for the peer's QUIC connection after the punch.
+const DIRECT_ACCEPT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Background task that attempts the relay → direct upgrade (one shot).
+///
+/// On success it pushes the new `Direct` link halves into the bridge's upgrade
+/// channel (DEC-1) and logs `path = "direct"`. On any failure it logs once and
+/// returns — the relay bridge keeps running untouched.
+async fn direct_upgrade_task(
+    ctx: DirectUpgradeCtx,
+    out_tx: tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
+    mut event_rx: tokio::sync::mpsc::Receiver<CtrlEvent>,
+    upgrade_tx: tokio::sync::mpsc::Sender<(link::LinkSender, link::LinkRecver)>,
+) {
+    if let Err(e) = try_direct_upgrade(&ctx, &out_tx, &mut event_rx, &upgrade_tx).await {
+        info!(
+            link_id = %ctx.link_id,
+            error = %e,
+            path = "relay",
+            "direct path unavailable; staying on relay"
+        );
+    }
+}
+
+async fn try_direct_upgrade(
+    ctx: &DirectUpgradeCtx,
+    out_tx: &tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
+    event_rx: &mut tokio::sync::mpsc::Receiver<CtrlEvent>,
+    upgrade_tx: &tokio::sync::mpsc::Sender<(link::LinkSender, link::LinkRecver)>,
+) -> Result<()> {
+    // 1. UDP socket (0 = ephemeral port).
+    let socket = crate::holepunch::bind_socket(ctx.nat_udp_preferred_port).await?;
+
+    // 2. STUN chain (explicit override > public chain > bore server fallback).
+    let targets = crate::holepunch::resolve_live_stun_targets(
+        &ctx.server_host,
+        ctx.server_port,
+        ctx.stun_server.as_deref(),
+    )
+    .await?;
+
+    // 3. Candidate gathering (reflexive + local; optional UPnP / port prediction).
+    let disc = crate::holepunch::gather_candidates_from_stun_targets(
+        &socket,
+        &targets,
+        ctx.upnp,
+        ctx.try_port_prediction,
+    )
+    .await;
+    anyhow::ensure!(!disc.candidates.is_empty(), "no usable UDP candidates");
+
+    // 4. Offer our candidates to the server's broker.
+    out_tx
+        .send(crate::shared::ClientMessage::UdpCandidateOffer(
+            crate::shared::UdpCandidateOffer {
+                candidates: disc.candidates,
+                selected_stun: disc.selected_stun.map(|s| s.requested),
+            },
+        ))
+        .await
+        .map_err(|_| anyhow!("control actor closed"))?;
+
+    // 5. Wait for the punch (the server replies only when BOTH offers are in).
+    let event = tokio::time::timeout(DIRECT_PUNCH_WAIT, event_rx.recv())
+        .await
+        .map_err(|_| anyhow!("no punch from server within {DIRECT_PUNCH_WAIT:?}"))?
+        .ok_or_else(|| anyhow!("control stream closed"))?;
+    let (nonce, peer, tuning) = match event {
+        CtrlEvent::Punch {
+            nonce,
+            peer,
+            tuning,
+        } => (nonce, peer, tuning),
+        CtrlEvent::Unavailable => bail!("server reported the direct path unavailable"),
+    };
+
+    // 6. Hole-punch + QUIC with the token both peers derive from (secret, nonce).
+    let token = crate::holepunch::derive_token(Some(&ctx.secret), &nonce);
+    let conn = match ctx.side {
+        DirectSide::Listener => {
+            let dl = crate::holepunch::DirectListener::new(socket, peer, tuning).await?;
+            tokio::time::timeout(DIRECT_ACCEPT_WAIT, dl.accept(token))
+                .await
+                .map_err(|_| anyhow!("timed out waiting for the peer's direct QUIC connection"))??
+        }
+        DirectSide::Connector => {
+            crate::holepunch::connect_direct(socket, peer, token, tuning).await?
+        }
+    };
+
+    // 7. Hand the Direct link halves to the bridge (DEC-1: controlled restart).
+    upgrade_tx
+        .send(link::make_direct(conn))
+        .await
+        .map_err(|_| anyhow!("bridge closed before the direct upgrade"))?;
+    info!(link_id = %ctx.link_id, path = "direct", "vpn path upgraded to direct QUIC");
+    Ok(())
+}
+
+/// Run the data-plane bridge alongside the control-stream actor.
+///
+/// The actor's `JoinHandle` resolving means the control connection died (server
+/// gone): the link is torn down loudly. The bridge finishing (error or upgrade
+/// channel logic) aborts the actor; the caller's RAII guards then revert host
+/// state.
 #[allow(clippy::too_many_arguments)]
 async fn run_bridge_with_ctrl(
     link_id: &str,
-    mut ctrl: crate::shared::Delimited<crate::mux::Stream>,
+    mut ctrl_task: tokio::task::JoinHandle<anyhow::Error>,
     dev: Arc<tun_rs::AsyncDevice>,
     sender: link::LinkSender,
     recver: link::LinkRecver,
     counters: Arc<bridge::BridgeCounters>,
     mtu: u16,
     offload: bool,
+    upgrade_rx: tokio::sync::mpsc::Receiver<(link::LinkSender, link::LinkRecver)>,
 ) -> Result<()> {
-    let mut ctrl_task = tokio::spawn(async move {
-        loop {
-            match ctrl.recv::<crate::shared::ServerMessage>().await {
-                Ok(Some(crate::shared::ServerMessage::Heartbeat)) => continue,
-                Ok(Some(msg)) => {
-                    tracing::debug!(?msg, "ignoring control message on vpn link");
-                }
-                Ok(None) => return anyhow!("server closed the vpn control stream"),
-                Err(e) => return anyhow!("vpn control stream error: {e}"),
-            }
-        }
-    });
-
-    // The bridge owns spawned uplink/downlink tasks; on either exit path the
-    // process tears down right after (NetConfig RAII reverts host state), so
-    // aborting the loser of the select is enough.
     let result = tokio::select! {
-        res = bridge::run(dev, sender, recver, counters, mtu, offload) => {
+        res = bridge::run(dev, sender, recver, counters, mtu, offload, upgrade_rx) => {
             ctrl_task.abort();
             res
         }
@@ -355,11 +604,46 @@ pub async fn run_connect(args: VpnConnectArgs) -> Result<()> {
 
     info!(link_id = %args.id, "vpn link bridge starting");
 
+    // Control-stream actor (single owner of `ctrl` from here on).
+    let (out_tx, event_rx, ctrl_task) = spawn_ctrl_actor(ctrl);
+
+    // Direct-path upgrade attempt (skipped entirely with --relay-only).
+    let (upgrade_tx, upgrade_rx) = tokio::sync::mpsc::channel(1);
+    let direct_task = if args.relay_only {
+        drop(event_rx);
+        drop(upgrade_tx);
+        None
+    } else {
+        let ctx = DirectUpgradeCtx::from_link_args(
+            DirectSide::Connector,
+            &args.to,
+            &CommonDirectArgs {
+                id: &args.id,
+                secret: &args.secret,
+                stun_server: args.stun_server.as_ref(),
+                upnp: args.upnp,
+                try_port_prediction: args.try_port_prediction,
+                nat_udp_preferred_port: args.nat_udp_preferred_port,
+            },
+        );
+        Some(tokio::spawn(direct_upgrade_task(
+            ctx,
+            out_tx.clone(),
+            event_rx,
+            upgrade_tx,
+        )))
+    };
+    drop(out_tx);
+
     // Run the bridge until it closes or the control connection dies.
     let result = run_bridge_with_ctrl(
-        &args.id, ctrl, dev, sender, recver, counters, args.mtu, offload,
+        &args.id, ctrl_task, dev, sender, recver, counters, args.mtu, offload, upgrade_rx,
     )
     .await;
+
+    if let Some(task) = direct_task {
+        task.abort();
+    }
 
     info!(link_id = %args.id, "vpn link bridge closed");
     result
@@ -2128,10 +2412,25 @@ pub mod bridge {
         }
     }
 
+    /// Grace window after a relay pump dies while an upgrade may be in flight:
+    /// when the PEER switches to direct first, it drops its relay substreams and
+    /// our relay pumps fail — but our own direct upgrade completes within
+    /// moments. Waiting briefly for the upgrade channel turns that race into a
+    /// clean path switch instead of a dead link.
+    const UPGRADE_GRACE: Duration = Duration::from_secs(5);
+
     /// Run the VPN data-plane bridge until the link dies or the tun closes.
     /// Spawns uplink + downlink tasks and runs until one fails.
+    ///
     /// `offload`: if true, uses Phase 6.2 multi-packet GSO/GRO I/O;
     /// if false, uses Phase 6.1 single-packet I/O.
+    ///
+    /// `upgrade_rx` (DEC-1): when the direct-path task delivers new link halves,
+    /// the bridge aborts both pumps, waits for them to actually terminate (the
+    /// TUN must never have two concurrent readers), and respawns them on the new
+    /// halves. The old halves are dropped, which closes the relay substreams.
+    /// Relay-only callers pass a channel whose sender is already dropped: the
+    /// first `recv()` yields `None` and the upgrade arm is disabled for good.
     pub async fn run(
         dev: Arc<tun_rs::AsyncDevice>,
         sender: LinkSender,
@@ -2139,15 +2438,8 @@ pub mod bridge {
         counters: Arc<BridgeCounters>,
         mtu: u16,
         offload: bool,
+        mut upgrade_rx: tokio::sync::mpsc::Receiver<(LinkSender, LinkRecver)>,
     ) -> Result<()> {
-        let dev_up = Arc::clone(&dev);
-        let dev_dn = Arc::clone(&dev);
-        let cntr_up = Arc::clone(&counters);
-        let cntr_dn = Arc::clone(&counters);
-
-        let mut uplink = tokio::spawn(run_uplink(dev_up, sender, cntr_up, mtu, offload));
-        let mut downlink = tokio::spawn(run_downlink(dev_dn, recver, cntr_dn, offload));
-
         let stats_task = tokio::spawn({
             let c = Arc::clone(&counters);
             async move {
@@ -2177,19 +2469,92 @@ pub mod bridge {
             }
         });
 
-        // Run until either direction fails.
-        let result = tokio::select! {
-            res = &mut uplink => {
-                downlink.abort();
-                stats_task.abort();
-                res.unwrap_or_else(|e| Err(anyhow::anyhow!("uplink task panic: {e}")))
+        let mut cur = Some((sender, recver));
+        let result = 'outer: loop {
+            let (sender, recver) = cur.take().expect("link halves present at spawn");
+            let mut uplink = tokio::spawn(run_uplink(
+                Arc::clone(&dev),
+                sender,
+                Arc::clone(&counters),
+                mtu,
+                offload,
+            ));
+            let mut downlink = tokio::spawn(run_downlink(
+                Arc::clone(&dev),
+                recver,
+                Arc::clone(&counters),
+                offload,
+            ));
+
+            // Stop both pumps and WAIT for both to finish before reusing the
+            // TUN: aborting alone leaves a window with two readers.
+            macro_rules! stop_pumps {
+                () => {{
+                    uplink.abort();
+                    downlink.abort();
+                    let _ = (&mut uplink).await;
+                    let _ = (&mut downlink).await;
+                }};
             }
-            res = &mut downlink => {
-                uplink.abort();
-                stats_task.abort();
-                res.unwrap_or_else(|e| Err(anyhow::anyhow!("downlink task panic: {e}")))
+
+            // On pump death, give a queued/imminent upgrade one last chance
+            // (the peer may have switched to direct first, killing our relay).
+            // With the upgrade channel already closed (relay-only, or direct
+            // attempt over) `recv()` yields `None` immediately — no delay.
+            macro_rules! die_or_switch {
+                ($res:expr, $what:literal) => {{
+                    let outcome: Result<()> = $res;
+                    if let Ok(Some(pair)) =
+                        tokio::time::timeout(UPGRADE_GRACE, upgrade_rx.recv()).await
+                    {
+                        stop_pumps!();
+                        cur = Some(pair);
+                        tracing::info!(
+                            path = "direct",
+                            concat!(
+                                "relay ",
+                                $what,
+                                " ended during direct upgrade; switching paths"
+                            ),
+                        );
+                        continue 'outer;
+                    }
+                    break 'outer outcome;
+                }};
+            }
+
+            tokio::select! {
+                res = &mut uplink => {
+                    downlink.abort();
+                    let outcome = res.unwrap_or_else(|e| Err(anyhow::anyhow!("uplink task panic: {e}")));
+                    die_or_switch!(outcome, "uplink")
+                }
+                res = &mut downlink => {
+                    uplink.abort();
+                    let outcome = res.unwrap_or_else(|e| Err(anyhow::anyhow!("downlink task panic: {e}")));
+                    die_or_switch!(outcome, "downlink")
+                }
+                maybe = upgrade_rx.recv() => match maybe {
+                    Some(pair) => {
+                        stop_pumps!();
+                        cur = Some(pair);
+                        tracing::info!(path = "direct", "bridge switched to direct path");
+                        continue 'outer;
+                    }
+                    None => {
+                        // Upgrade can never happen (relay-only, direct attempt
+                        // over, or already switched); keep the pumps running
+                        // and wait for one of them to finish.
+                        let res = tokio::select! {
+                            res = &mut uplink => { downlink.abort(); res }
+                            res = &mut downlink => { uplink.abort(); res }
+                        };
+                        break 'outer res.unwrap_or_else(|e| Err(anyhow::anyhow!("bridge task panic: {e}")));
+                    }
+                }
             }
         };
+        stats_task.abort();
         result
     }
 
@@ -2397,5 +2762,90 @@ pub mod bridge {
                 assert_eq!(&b[tun_rs::VIRTIO_NET_HDR_LEN..], pkt.as_slice());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::{ClientMessage, Delimited, ServerMessage, UdpDirectTuning};
+
+    /// §1.2 — the ctrl actor ignores heartbeats, forwards punches as events,
+    /// writes outbound client messages, and resolves its JoinHandle with an
+    /// error when the server closes the control stream.
+    #[tokio::test]
+    async fn ctrl_actor_forwards_punch_and_detects_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (client_opener, _client_acceptor) = crate::mux::client(a);
+        let (_server_opener, mut server_acceptor) = crate::mux::server(b);
+        // yamux opens substreams lazily: the acceptor learns about the stream
+        // only after the opener's first write, so announce it with the marker.
+        let mut client_stream = client_opener.open().await.unwrap();
+        client_stream
+            .write_all(&[crate::mux::STREAM_READY])
+            .await
+            .unwrap();
+        let mut server_stream = server_acceptor.accept().await.unwrap();
+        let mut marker = [0u8; 1];
+        server_stream.read_exact(&mut marker).await.unwrap();
+        let ctrl = Delimited::new(client_stream);
+        let mut server = Delimited::new(server_stream);
+
+        let (out_tx, mut event_rx, handle) = spawn_ctrl_actor(ctrl);
+
+        // Heartbeat produces no event.
+        server.send(ServerMessage::Heartbeat).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            event_rx.try_recv().is_err(),
+            "heartbeat must not produce an event"
+        );
+
+        // Outbound message reaches the server side.
+        out_tx
+            .send(ClientMessage::UdpStunHintRequest)
+            .await
+            .unwrap();
+        let got = server.recv::<ClientMessage>().await.unwrap();
+        assert!(matches!(got, Some(ClientMessage::UdpStunHintRequest)));
+
+        // UdpPunch becomes CtrlEvent::Punch with the same fields.
+        let peer: std::net::SocketAddr = "203.0.113.9:4444".parse().unwrap();
+        server
+            .send(ServerMessage::UdpPunch {
+                nonce: [9u8; crate::shared::UDP_NONCE_LEN],
+                peer: vec![peer],
+                peer_selected_stun: None,
+                tuning: UdpDirectTuning::default(),
+            })
+            .await
+            .unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timed out waiting for punch event")
+        {
+            Some(CtrlEvent::Punch {
+                nonce,
+                peer: got_peer,
+                ..
+            }) => {
+                assert_eq!(nonce, [9u8; crate::shared::UDP_NONCE_LEN]);
+                assert_eq!(got_peer, vec![peer]);
+            }
+            Some(CtrlEvent::Unavailable) => panic!("expected Punch, got Unavailable"),
+            None => panic!("event channel closed unexpectedly"),
+        }
+
+        // Closing the server side resolves the JoinHandle with an error.
+        drop(server);
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("ctrl actor did not detect stream close")
+            .expect("ctrl actor panicked");
+        assert!(
+            err.to_string().contains("control stream"),
+            "unexpected error: {err}"
+        );
     }
 }

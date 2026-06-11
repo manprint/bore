@@ -92,7 +92,13 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   unidirectional substreams (tags `0x01`/`0x02`) for exactly this reason. Single-task
   bidirectional use (`copy_bidirectional`, `try_join!` in one task) is safe.
 - VPN relay queue applies backpressure (await on full), never silent drops; VPN clients
-  must keep draining the control stream after `VpnReady` (heartbeats + server-death detection)
+  must keep draining the control stream after `VpnReady` (heartbeats + server-death detection;
+  the ctrl actor in `vpn.rs` is the stream's single owner — route new control messages through it)
+- VPN: links start on relay; a background task attempts the direct QUIC upgrade (skipped with
+  `--relay-only`). Path switch = controlled bridge restart (DEC-1: stop pumps, drop relay halves,
+  respawn on Direct). Direct death at runtime kills the bridge → handled by reconnect (DEC-2).
+  Server brokers `UdpPunch` to BOTH sides only when it holds BOTH offers (DEC-3, 10 s timeout →
+  `UdpUnavailable`)
 - `NetConfig` RAII: all routes/nft/ip_forward changes revert on exit (SIGINT, SIGTERM, panic handled; SIGKILL requires next-run stale reclaim)
 - TUN MTU default 1350: clamps QUIC datagram size; gateway MSS-clamp keeps forwarded TCP healthy
 

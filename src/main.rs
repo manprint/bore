@@ -939,6 +939,10 @@ struct VpnListenArgs {
     )]
     nat_udp_release_timeout: u64,
 
+    /// Never attempt the direct UDP path; stay on the server relay.
+    #[clap(long, env = "BORE_VPN_RELAY_ONLY")]
+    relay_only: bool,
+
     /// Optional operator note.
     #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
     notes: Option<String>,
@@ -1038,6 +1042,10 @@ struct VpnConnectArgs {
         env = "BORE_NAT_UDP_RELEASE_TIMEOUT"
     )]
     nat_udp_release_timeout: u64,
+
+    /// Never attempt the direct UDP path; stay on the server relay.
+    #[clap(long, env = "BORE_VPN_RELAY_ONLY")]
+    relay_only: bool,
 
     /// Optional operator note.
     #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
@@ -1414,6 +1422,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     try_port_prediction: args.try_port_prediction,
                     nat_udp_preferred_port: args.nat_udp_preferred_port,
                     nat_udp_release_timeout: args.nat_udp_release_timeout,
+                    relay_only: args.relay_only,
                     notes: args.notes,
                 };
 
@@ -1457,6 +1466,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     try_port_prediction: args.try_port_prediction,
                     nat_udp_preferred_port: args.nat_udp_preferred_port,
                     nat_udp_release_timeout: args.nat_udp_release_timeout,
+                    relay_only: args.relay_only,
                     notes: args.notes,
                 };
 

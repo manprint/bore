@@ -153,6 +153,11 @@ pub struct Server {
     /// Semaphore bounding concurrent VPN links.
     #[cfg(feature = "vpn")]
     vpn_link_permits: Arc<Semaphore>,
+
+    /// How long the VPN broker waits for the listener's UDP candidates after
+    /// the connector's offer before sending `UdpUnavailable` (DEC-3).
+    #[cfg(feature = "vpn")]
+    vpn_punch_timeout: std::time::Duration,
 }
 
 impl Server {
@@ -194,6 +199,8 @@ impl Server {
             vpn_providers: Arc::new(DashMap::new()),
             #[cfg(feature = "vpn")]
             vpn_link_permits: Arc::new(Semaphore::new(100)),
+            #[cfg(feature = "vpn")]
+            vpn_punch_timeout: vpn_server::DEFAULT_VPN_PUNCH_TIMEOUT,
         }
     }
 
@@ -353,6 +360,13 @@ impl Server {
     #[cfg(feature = "vpn")]
     pub fn set_vpn_max_links(&mut self, max: usize) {
         self.vpn_link_permits = Arc::new(Semaphore::new(max));
+    }
+
+    /// Override the broker's wait for the listener's UDP candidates (DEC-3).
+    /// Intended for tests; production uses [`vpn_server::DEFAULT_VPN_PUNCH_TIMEOUT`].
+    #[cfg(feature = "vpn")]
+    pub fn set_vpn_punch_timeout(&mut self, timeout: std::time::Duration) {
+        self.vpn_punch_timeout = timeout;
     }
 
     /// Start the server, listening for new connections.
@@ -928,6 +942,7 @@ impl Server {
                         peer,
                         self.udp_providers.clone(),
                         self.udp_tuning,
+                        self.vpn_punch_timeout,
                     )
                     .await;
                 }

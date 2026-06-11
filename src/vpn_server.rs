@@ -274,7 +274,7 @@ pub async fn serve_vpn_listener(
     admin: AdminRegistry,
     peer: std::net::SocketAddr,
     udp_providers: secret::UdpRegistry,
-    _udp_tuning: UdpDirectTuning,
+    udp_tuning: UdpDirectTuning,
     link_permits: Arc<Semaphore>,
 ) -> Result<()> {
     // Acquire link permit (bounds live VPN links).
@@ -360,17 +360,18 @@ pub async fn serve_vpn_listener(
     control.send(pair_msg.listener_ready).await?;
 
     // Register for UDP direct path (so connector can get our candidates).
+    // The channel is REAL (unlike the Phase-4 stub): the connector handler
+    // forwards its offer through `to_provider`, and the select arm below relays
+    // the punch to the listener client.
     let udp_id = format!("vpn:{id}");
+    let (to_provider_tx, mut to_provider_rx) = tokio::sync::mpsc::channel::<secret::UdpOffer>(4);
     udp_providers.insert(
         udp_id.clone(),
         secret::UdpReg {
             candidates: vec![],
             selected_stun: None,
             nonce: pair_msg.nonce,
-            to_provider: {
-                let (tx, _rx) = tokio::sync::mpsc::channel(4);
-                tx
-            },
+            to_provider: to_provider_tx,
         },
     );
     // Arm the generation-guarded UDP removal for this pairing only.
@@ -388,10 +389,24 @@ pub async fn serve_vpn_listener(
                     break;
                 }
             }
+            Some(offer) = to_provider_rx.recv() => {
+                // The connector offered candidates: forward the punch so the
+                // listener can start its QUIC endpoint and punch back.
+                info!(%id, "forwarding vpn udp punch to listener");
+                if control.send(ServerMessage::UdpPunch {
+                    nonce: offer.nonce,
+                    peer: offer.peer_candidates,
+                    peer_selected_stun: offer.peer_selected_stun,
+                    tuning: udp_tuning,
+                }).await.is_err() {
+                    info!(%id, "vpn listener disconnected");
+                    break;
+                }
+            }
             msg = control.recv::<ClientMessage>() => {
                 match msg {
                     Ok(Some(ClientMessage::UdpCandidateOffer(offer))) => {
-                        // Store candidates for the connector to read.
+                        // Store candidates for the connector's broker to read.
                         if let Some(mut entry) = udp_providers.get_mut(&udp_id) {
                             entry.candidates = offer.candidates;
                             entry.selected_stun = offer.selected_stun;
@@ -432,6 +447,7 @@ pub async fn serve_vpn_connector(
     peer: std::net::SocketAddr,
     udp_providers: secret::UdpRegistry,
     udp_tuning: UdpDirectTuning,
+    punch_timeout: Duration,
 ) -> Result<()> {
     info!(%id, "vpn connector connecting");
 
@@ -624,11 +640,71 @@ pub async fn serve_vpn_connector(
         }
     });
 
-    // Broker UDP candidates
-    let _udp_id = format!("vpn:{id}");
+    // Broker UDP candidates (DEC-3): the punch is sent to BOTH sides only once
+    // the server holds BOTH offers. The connector's offer is buffered here; the
+    // listener's candidates are read from the UDP registry on every wake-up
+    // (500 ms tick or message arrival). If the listener has produced nothing
+    // within `punch_timeout` of the connector's offer, the connector gets
+    // `UdpUnavailable` and stays on relay.
+    let udp_id = format!("vpn:{id}");
+    let mut connector_offer: Option<crate::shared::UdpCandidateOffer> = None;
+    let mut offer_deadline: Option<tokio::time::Instant> = None;
+    let mut punched = false;
     let mut heartbeat = interval(Duration::from_millis(500));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
+        if !punched {
+            if let Some(offer) = connector_offer.as_ref() {
+                // Clone out so no DashMap guard is held across an await point.
+                let provider = udp_providers.get(&udp_id).map(|e| {
+                    (
+                        e.candidates.clone(),
+                        e.selected_stun.clone(),
+                        e.nonce,
+                        e.to_provider.clone(),
+                    )
+                });
+                match provider {
+                    Some((cands, stun, nonce, to_provider)) if !cands.is_empty() => {
+                        // Both offers known: punch the connector with the
+                        // listener's candidates...
+                        control
+                            .send(ServerMessage::UdpPunch {
+                                nonce,
+                                peer: cands,
+                                peer_selected_stun: stun,
+                                tuning: udp_tuning,
+                            })
+                            .await?;
+                        // ...and forward the connector's offer to the listener.
+                        let fwd = secret::UdpOffer {
+                            nonce,
+                            peer_candidates: offer.candidates.clone(),
+                            peer_selected_stun: offer.selected_stun.clone(),
+                        };
+                        let _ = to_provider.send(fwd).await;
+                        info!(%id, "brokered vpn udp punch to both peers");
+                        punched = true;
+                    }
+                    Some(_) => {
+                        // Listener registered but has not offered candidates yet:
+                        // wait until the deadline.
+                        if offer_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+                            info!(%id, "vpn listener offered no udp candidates in time; connector stays on relay");
+                            control.send(ServerMessage::UdpUnavailable).await?;
+                            punched = true;
+                        }
+                    }
+                    None => {
+                        // Listener UDP entry gone (listener disconnected):
+                        // direct path is impossible for this pairing.
+                        info!(%id, "no vpn listener udp available; connector will use relay");
+                        control.send(ServerMessage::UdpUnavailable).await?;
+                        punched = true;
+                    }
+                }
+            }
+        }
         tokio::select! {
             _ = heartbeat.tick() => {
                 // Heartbeat; if connector is gone, exit
@@ -639,22 +715,15 @@ pub async fn serve_vpn_connector(
             msg = control.recv::<ClientMessage>() => {
                 match msg {
                     Ok(Some(ClientMessage::UdpCandidateOffer(consumer_offer))) => {
-                        // Broker UDP from connector to listener
-                        broker_vpn_udp(
-                            &mut control,
-                            &udp_providers,
-                            &id,
-                            consumer_offer,
-                            udp_tuning,
-                        )
-                        .await?;
+                        connector_offer = Some(consumer_offer);
+                        offer_deadline.get_or_insert_with(|| tokio::time::Instant::now() + punch_timeout);
                     }
                     Ok(Some(ClientMessage::UdpCandidates(consumer_cands))) => {
-                        let offer = crate::shared::UdpCandidateOffer {
+                        connector_offer = Some(crate::shared::UdpCandidateOffer {
                             candidates: consumer_cands,
                             selected_stun: None,
-                        };
-                        broker_vpn_udp(&mut control, &udp_providers, &id, offer, udp_tuning).await?;
+                        });
+                        offer_deadline.get_or_insert_with(|| tokio::time::Instant::now() + punch_timeout);
                     }
                     Ok(None) | Err(_) => break,
                     _ => {}
@@ -690,50 +759,11 @@ async fn vpn_relay(
     Ok(())
 }
 
-/// Broker UDP direct path between VPN connector and listener.
-async fn broker_vpn_udp(
-    control: &mut Delimited<mux::Stream>,
-    udp_registry: &secret::UdpRegistry,
-    id: &str,
-    consumer_offer: crate::shared::UdpCandidateOffer,
-    tuning: UdpDirectTuning,
-) -> Result<()> {
-    let udp_id = format!("vpn:{id}");
-
-    // Clone out so no DashMap guard is held across an await point.
-    let provider = udp_registry.get(&udp_id).map(|e| {
-        (
-            e.candidates.clone(),
-            e.selected_stun.clone(),
-            e.nonce,
-            e.to_provider.clone(),
-        )
-    });
-
-    let Some((_provider_cands, _provider_selected_stun, nonce, _to_provider)) = provider else {
-        info!(%id, "no vpn listener udp available; connector will use relay");
-        control.send(ServerMessage::UdpUnavailable).await?;
-        return Ok(());
-    };
-
-    // Tell the listener about the connector's offer (if the channel exists)
-    // For now, since the listener doesn't actively punch, we just broker the nonce
-    info!(
-        %id,
-        consumer_candidates = ?consumer_offer.candidates,
-        "brokered vpn udp punch"
-    );
-
-    control
-        .send(ServerMessage::UdpPunch {
-            nonce,
-            peer: vec![], // Listener candidates unknown in Phase 4
-            peer_selected_stun: None,
-            tuning,
-        })
-        .await?;
-    Ok(())
-}
+/// Default time the connector broker waits for the listener's UDP candidates
+/// after the connector's own offer arrived, before giving up with
+/// `UdpUnavailable` (DEC-3). Overridable via `Server::set_vpn_punch_timeout`
+/// (used by tests).
+pub const DEFAULT_VPN_PUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(test)]
 mod tests {

@@ -708,6 +708,19 @@ impl Server {
                 .and_then(|h| vhost::extract_subdomain(h, &cfg.base_domain));
             if let Some(sub) = sub {
                 if let Some(entry) = self.vhost_registry.get(&sub).map(|e| Arc::clone(e.value())) {
+                    // Meter unified-port vhost relays against `--max-conns`, exactly
+                    // like the dedicated frontend listeners do (VH-1: this path used
+                    // to bypass the semaphore entirely, so the default single-port
+                    // topology had no effective connection bound). The permit is held
+                    // for the lifetime of the relay and released when it finishes.
+                    let permit = match Arc::clone(&self.conn_permits).try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            debug!(%sub, "vhost connection on control port dropped: max-conns reached");
+                            return vhost::send_service_unavailable(stream).await;
+                        }
+                    };
+                    let _permit = permit;
                     return vhost::relay_vhost(stream, &entry, head).await;
                 }
             }

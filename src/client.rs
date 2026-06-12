@@ -466,6 +466,15 @@ impl Client {
             warn!("built without udp support; ignoring --udp");
         }
 
+        #[cfg(feature = "udp")]
+        if udp && carriers as usize > crate::vhost::MAX_DIRECT_CARRIERS {
+            warn!(
+                requested = carriers,
+                cap = crate::vhost::MAX_DIRECT_CARRIERS,
+                "vhost --carriers exceeds the QUIC direct-pool cap; clamping (extra carriers would churn against the server cap)"
+            );
+        }
+
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
         let (opener, acceptor) = mux::client(socket);
@@ -564,8 +573,15 @@ impl Client {
             vhost_endpoint: Some(endpoint),
             #[cfg(feature = "udp")]
             vhost_subdomain: Some(subdomain.to_string()),
+            // Clamp the QUIC direct-carrier target to the server's per-subdomain
+            // cap (VH-2): opening more than the server keeps would make every
+            // surplus connection churn (server closes it → renew → reopen → …).
             #[cfg(feature = "udp")]
-            vhost_udp_carriers: if udp { carriers.max(1) } else { 0 },
+            vhost_udp_carriers: if udp {
+                crate::vhost::clamp_direct_carriers(carriers)
+            } else {
+                0
+            },
             basic_auth: meta.basic_auth.as_deref().and_then(BasicAuth::parse),
             carrier_acceptors,
             carrier_dialer,

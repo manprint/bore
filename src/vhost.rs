@@ -356,7 +356,21 @@ pub struct VhostEntry {
 /// is authenticated (token derived from the tunnel secret), so this only guards
 /// against an accidental connection storm, not an untrusted peer.
 #[cfg(feature = "udp")]
-const MAX_DIRECT_CARRIERS: usize = 32;
+pub const MAX_DIRECT_CARRIERS: usize = 32;
+
+/// Resolve the number of QUIC direct carriers a provider should open, clamped to
+/// `[1, MAX_DIRECT_CARRIERS]`.
+///
+/// The server installs at most [`MAX_DIRECT_CARRIERS`] connections per subdomain
+/// and closes any surplus (VH-2). If the provider opened more than that, each
+/// surplus connection would be closed by the server, trigger a renewal, and be
+/// reopened — an endless open/close churn that never converges. Clamping the
+/// provider's target to the same cap means every connection it opens is kept, so
+/// the pool reaches a stable steady state.
+#[cfg(feature = "udp")]
+pub fn clamp_direct_carriers(requested: u16) -> u16 {
+    requested.clamp(1, MAX_DIRECT_CARRIERS as u16)
+}
 
 /// Round-robin pool of live QUIC direct connections to one vhost provider.
 ///
@@ -1017,6 +1031,19 @@ async fn send_bad_gateway<S: AsyncWrite + Unpin>(mut stream: S) -> Result<()> {
     Ok(())
 }
 
+/// Send a minimal 503 Service Unavailable response and close. Used when the
+/// `--max-conns` bound is hit on the unified control-port vhost path, so the
+/// client gets a clean signal instead of a silent reset.
+pub(crate) async fn send_service_unavailable<S: AsyncWrite + Unpin>(mut stream: S) -> Result<()> {
+    let _ = stream
+        .write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
 /// Extract the Host header value from a raw HTTP request head.
 pub(crate) fn extract_host_from_head(head: &[u8]) -> Option<&str> {
     let text = std::str::from_utf8(head).ok()?;
@@ -1499,5 +1526,21 @@ reservations:
             out.windows(2).any(|w| w == [0xC3, 0xA9]),
             "non-ascii bytes survive"
         );
+    }
+
+    // ── clamp_direct_carriers (VH-2) ──────────────────────────────────────
+
+    #[cfg(feature = "udp")]
+    #[test]
+    fn clamp_direct_carriers_caps_at_max() {
+        let max = MAX_DIRECT_CARRIERS as u16;
+        assert_eq!(clamp_direct_carriers(0), 1, "zero floors to one");
+        assert_eq!(clamp_direct_carriers(1), 1);
+        assert_eq!(clamp_direct_carriers(16), 16, "under cap is unchanged");
+        assert_eq!(clamp_direct_carriers(max), max);
+        // Above the server's per-subdomain cap: must clamp so surplus carriers
+        // don't churn (open → server-close → renew → reopen → …).
+        assert_eq!(clamp_direct_carriers(max + 8), max, "above cap is clamped");
+        assert_eq!(clamp_direct_carriers(u16::MAX), max);
     }
 }

@@ -1,0 +1,15 @@
+# bore vhost development — passwordless sudo, restricted to the network-test commands
+# the vhost e2e testing harness needs.
+#
+# Install (one-time):
+#   sudo install -o root -g root -m 0440 scripts/dev/bore-vhost-sudoers /etc/sudoers.d/bore-vhost-dev
+# Remove when vhost development is done:
+#   sudo rm /etc/sudoers.d/bore-vhost-dev
+#
+# HONEST SECURITY NOTE (dev machine tradeoff, accepted): unrestricted `ip` includes
+# `ip netns exec <ns> <cmd>`, which can run any command as root inside a netns —
+# this grant is therefore effectively root-equivalent for anyone running as 'fabio'.
+# That is exactly what the vhost e2e test harness requires (it runs bore/curl/python3
+# inside namespaces). Do NOT install this on a production machine.
+
+fabio ALL=(root) NOPASSWD: /usr/sbin/ip, /usr/sbin/nft, /mnt/fabio/dati/Git/Github-manprint/bore-forked/scripts/vhost_netns_test.sh, 

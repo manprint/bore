@@ -2105,3 +2105,183 @@ async fn vhost_udp_large_body_integrity() -> Result<()> {
     );
     Ok(())
 }
+
+// ─── VH-1 regression: --max-conns enforced on the unified control port ────────
+//
+// The default single-port topology serves vhost on the control port itself
+// (`serve_control_http` → `relay_vhost`). That path used to bypass the
+// `conn_permits` semaphore entirely, so `--max-conns` had no effect there
+// (VH-1). With a small cap and many simultaneous *slow* requests, the surplus
+// must be rejected with 503 instead of all being relayed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_max_conns_enforced_on_unified_control_port() -> Result<()> {
+    const CTRL: u16 = 18020; // vhost http_port == control port => unified path
+    const MAX_CONNS: usize = 2;
+    const N: usize = 8;
+
+    // Slow origin: read the request head, hold ~1.5 s, then reply 200. Concurrent
+    // requests therefore pile up and exceed the cap at the same instant.
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let stub_port = listener.local_addr()?.port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                time::sleep(Duration::from_millis(1500)).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    // http_port == CTRL => the dedicated frontend is skipped and the control port
+    // serves vhost (the unified topology). Small --max-conns to make the cap bite.
+    let cfg = http_config("bore.local", CTRL);
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_max_conns(MAX_CONNS);
+    server.set_vhost(cfg)?;
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "capapp",
+        "client1",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    time::sleep(Duration::from_millis(100)).await;
+
+    // Fire N concurrent slow requests at the unified control port.
+    let mut tasks = Vec::new();
+    for _ in 0..N {
+        tasks.push(tokio::spawn(async move {
+            match time::timeout(
+                Duration::from_secs(5),
+                send_http(CTRL, "capapp.bore.local", "/"),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => resp.lines().next().unwrap_or("").to_string(),
+                _ => "ERR".to_string(),
+            }
+        }));
+    }
+
+    let (mut ok, mut unavailable, mut other) = (0usize, 0usize, 0usize);
+    for t in tasks {
+        let line = t.await?;
+        if line.contains("200") {
+            ok += 1;
+        } else if line.contains("503") {
+            unavailable += 1;
+        } else {
+            other += 1;
+        }
+    }
+
+    // Pre-fix (VH-1): every request was relayed -> 0x503. Post-fix: the surplus
+    // beyond --max-conns is rejected with 503, and at most ~MAX_CONNS are served
+    // concurrently.
+    assert!(
+        unavailable >= 1,
+        "--max-conns must be enforced on the unified control port: \
+         got {ok}x200 {unavailable}x503 {other}xother (N={N}, max={MAX_CONNS})"
+    );
+    assert!(
+        ok <= MAX_CONNS + 1,
+        "served more than ~max_conns concurrently: {ok}x200 (max={MAX_CONNS})"
+    );
+    Ok(())
+}
+
+// ─── VH-2 regression: --carriers above the QUIC cap clamps (no churn) ─────────
+//
+// A provider asking for more QUIC direct carriers than the server keeps
+// (`MAX_DIRECT_CARRIERS`) used to open the surplus, have the server close it,
+// renew, reopen — forever. The client now clamps its target to the cap, so the
+// direct pool reaches exactly the cap and routing still works. (The clamp logic
+// itself is unit-tested in `vhost::tests::clamp_direct_carriers_caps_at_max`;
+// this is the end-to-end sanity check.)
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_udp_carriers_clamped_to_cap() -> Result<()> {
+    const CTRL: u16 = 18030;
+    const HTTP: u16 = 18031;
+    const QUIC: u16 = 18032;
+    let cap = bore_cli::vhost::MAX_DIRECT_CARRIERS;
+
+    let stub_port = spawn_http_stub("clamped").await;
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, Some("vhost-udp-secret"));
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(true);
+    server.set_vhost(http_config("bore.local", HTTP))?;
+    server.set_vhost_quic_port(QUIC);
+    let registry = server.vhost_registry();
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTP, true).await;
+
+    // Ask for far more carriers than the cap; the client must clamp to `cap`.
+    let client = Client::new_vhost_provider_with_udp(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "clampudp",
+        "client1",
+        Some("vhost-udp-secret"),
+        false,
+        (cap as u16) + 8,
+        true,
+        ProviderMeta::default(),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+
+    // Pool fills to exactly the cap and stays there (no churn → no oscillation).
+    wait_for_vhost_direct_count(&registry, "clampudp", cap).await;
+    time::sleep(Duration::from_millis(500)).await;
+    let count = registry
+        .get("clampudp")
+        .map(|e| e.direct.len())
+        .unwrap_or(0);
+    assert_eq!(
+        count, cap,
+        "direct pool must stabilize at the cap ({cap}), got {count}"
+    );
+
+    // Traffic still routes over the (capped) direct pool.
+    let response = send_http(HTTP, "clampudp.bore.local", "/").await?;
+    assert!(
+        response.contains("clamped"),
+        "expected routed response over the capped direct pool: {response}"
+    );
+    Ok(())
+}

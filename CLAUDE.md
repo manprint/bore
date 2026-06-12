@@ -5,10 +5,14 @@
 ### Model selection per task
 
 Three tiers, each with a clear role. Using the wrong one wastes money or quality.
-Target: **minimize input/output tokens usage**.
+**Target**: **minimize input/output tokens usage**.
+
+- Use caveman in ultra mode (`/caveman ultra`)
+- Use caveman plugin for subtsk
+- Show to user the model used for every task/subtask
 
 **Haiku 4.5** (`claude-haiku`) — fast, cheap ($1/$5 per MTok)
-- Linting, grep-style code search, syntax checks
+- Linting, grep-style code search, syntax checks, *codebase exploration*
 - Routing/classification decisions in multi-agent flows
 - Extracting structured data from text (parse logs, format JSON)
 - Generating short repetitive outputs (commit messages, variable names)
@@ -17,23 +21,19 @@ Target: **minimize input/output tokens usage**.
 **Sonnet 4.6** (`claude-sonnet`) — default for 90%+ of tasks ($3/$15 per MTok)
 - Implementing features, refactoring, writing tests
 - Debugging non-trivial bugs
-- Writing/reviewing documentation
+- Writing/reviewing documentation ( if simple, *delegate to haiku* )
 - Code review with explanation
 - Agentic loops that need sustained focus but not peak reasoning
 
-**Opus 4.8** — complex tasks where quality delta is worth 5–10× cost
+**Opus 4.8** (`claude-opus`)— The supervisor. Complex tasks where quality delta is worth 5–10× cost
 - Architecture decisions across many files
 - Multi-step reasoning that Sonnet visibly gets wrong
 - Deep research synthesis
-- `opusplan` alias: Opus for plan mode only, auto-switches to Sonnet for codegen
+- Check if Sonnet and Haiku works respect the specifics.
+- Borker task to Haiku and Sonnet.
 
 **Rule of thumb**: start with Sonnet. Drop to Haiku for bulk/mechanical sub-tasks.
-Escalate to Opus only when Sonnet output is concretely insufficient.
-
-## Plugins/Skills to use
-
-- Use caveman in ultra mode (`/caveman ultra`)
-- Use caveman plugin for subtsk
+Escalate to Opus only when Sonnet output is concretely insufficient or the task is critical.
 
 ## Agent workflow
 
@@ -58,6 +58,8 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
 - Code must be correct before it is clever.
 - If a detail is uncertain, surface it explicitly — do not paper over it.
 - High quality is the baseline, not a stretch goal.
+- Gates and test (internal, unit and e2e) must present 0 fails.
+- You are autorized to launch so tests (permitted by sudoers)
 
 ## What this is
 

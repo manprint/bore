@@ -377,9 +377,14 @@ reconnect** the moment the path opens (e.g. a firewall change, a roaming event).
   entirely (the task never spawns), and a successful direct switch stops the
   retries.
 
-**If the direct path dies at runtime** (DEC-2), the bridge ends with an error
-and the process exits — or reconnects when `--auto-reconnect` is set, landing
-back on relay first and re-attempting the upgrade.
+**If the direct path dies at runtime** (DEC-2), the relay was kept warm throughout the
+link lifetime (relay substreams held open, server continuing to splice them). The bridge
+falls back to the warm relay **in place** — no reconnect, TUN preserved, traffic resumes on the
+relay. The link only reconnects if **both** paths are down. The AEAD nonce counter is
+preserved across the switch (relay LinkSender not rebuilt). Logs show
+`warn!(path="relay", "direct path lost; fell back to relay (link preserved)")` at fallback and
+`info!(path="direct", "bridge switched to direct path")` on re-upgrade. **Cost:** idle relay
+substreams are held for the entire link uptime while on direct (server-side connection state).
 
 **`--relay-only`** (both subcommands) disables the upgrade attempt entirely:
 no UDP socket, no STUN, no offer. Useful for deterministic tests and for

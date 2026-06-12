@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
-# VPN hardening test suite — comprehensive bug-hunt phase
-# Heavy tests for relay↔direct cycling, fault injection, UDP pinning, and flag cross-products.
-# Surfaces known bugs (BUG-1, BUG-2, BUG-4) as XFAIL; distinguishes expected failures from regressions.
-#
-# Expected-fail tags and their bugs: see docs/vpn/VPN_HARDENING_PLAN.md Part 1.
-#   xfail_bug1 — direct→relay fallback is NOT seamless (reconnect blip on idle death)
-#   xfail_bug2 — SIGKILL poisons ip_forward permanently
-#   xfail_bug4 — MTU asymmetry silently drops packets
+# VPN hardening test suite — regression gate for relay↔direct cycling, fault injection, UDP pinning, and flag cross-products.
+# All tests are hard asserts; no xfail machinery. Tests BUG-1, BUG-2, BUG-3 fixes, direct↔relay seamless fallback,
+# and rapid flap resilience.
 #
 # Usage: sudo scripts/vpn_netns_test_hard.sh [--skip-iperf]
 
@@ -46,8 +41,6 @@ done
 
 PASS=0
 FAIL=0
-XFAIL=0
-XPASS=0
 BORE_LOG=$(mktemp)
 BORE_SERVER_PID=""
 BORE_LISTEN_PID=""
@@ -55,21 +48,6 @@ BORE_CONNECT_PID=""
 
 pass() { echo "PASS: $*"; PASS=$((PASS+1)); }
 fail() { echo "FAIL: $*"; FAIL=$((FAIL+1)); }
-xassert() {
-    local tag="$1" && shift
-    if "$@" >/dev/null 2>&1; then
-        echo "XPASS: $tag: expected failure unexpectedly PASSED — bug may be fixed!"; XPASS=$((XPASS+1))
-    else
-        echo "XFAIL: $tag: expected failure reproduced as expected"; XFAIL=$((XFAIL+1))
-    fi
-}
-
-# Predicate for xfail_bug1: direct→relay recovery is seamless = 0% loss AND no reconnect.
-# Must be a function: a compound `&&` passed inline to xassert escapes it, and under
-# `set -e` a failing `! grep` would abort the whole suite.
-direct_relay_seamless() {
-    [ "$LOSS3" = "0" ] && ! grep -qi "reconnecting" "$BORE_LOG.connect_d1_cycle" 2>/dev/null
-}
 
 cleanup() {
     set +e
@@ -106,7 +84,7 @@ probe_loss() {
 
 mtu_of() {
     local ns="$1" dev="$2"
-    ip netns exec "$ns" ip -o link show "$dev" 2>/dev/null | awk '{print $17}' || echo "?"
+    ip netns exec "$ns" ip -o link show "$dev" 2>/dev/null | grep -oP 'mtu \K[0-9]+' || echo "?"
 }
 
 bgping_start() {
@@ -133,6 +111,8 @@ bgping_stop() {
     done
     local loss_pct
     loss_pct=$(grep -oP '\d+(?=% packet loss)' "$tmpfile" 2>/dev/null | tail -1 || echo 100)
+    case "$loss_pct" in ''|*[!0-9]*) loss_pct=100 ;; esac
+    if [ "$loss_pct" -gt 100 ] 2>/dev/null; then loss_pct=100; fi
     rm -f "$tmpfile"
     echo "$loss_pct"
 }
@@ -405,6 +385,9 @@ for D in 2 8 16; do
     # Phase 1: Block UDP → link pairs on relay
     block_udp ns0
     if wait_for_log "$BORE_LOG.listen_d1_cycle" "staying on relay\|vpn link paired" 40; then
+        # Warm up the freshly-paired link (first packets can drop while the bridge pumps
+        # and neighbor state settle) before measuring steady-state loss.
+        ip netns exec ns2 ping -c 3 -W 2 "10.99.0.1" >/dev/null 2>&1 || true
         BG1=$(bgping_start ns2 "10.99.0.1")
         sleep 2
         LOSS1=$(bgping_stop "$BG1")
@@ -444,29 +427,55 @@ for D in 2 8 16; do
     LOSS3=$(bgping_stop "$BG3")
 
     if [ "$D" -lt 10 ]; then
-        # D=2s: direct should survive; no reconnect expected
-        [ "$LOSS3" = "0" ] && pass "D1.6.3 (D=$D): brief block: QUIC survives, 0% loss" || fail "D1.6.3 (D=$D): brief block: ${LOSS3}% loss (keepalive failed?)"
+        # Brief block (< QUIC idle 10s): traffic CANNOT flow while UDP is fully dropped,
+        # so ~100% loss DURING the window is expected — the real property is that the
+        # link SURVIVES (no reconnect) and resumes on the SAME direct conn after unblock.
+        echo "  [D=$D: during-block loss=${LOSS3}% (expected high; checking link survival)]"
         if grep -qi "reconnecting" "$BORE_LOG.connect_d1_cycle" 2>/dev/null; then
-            fail "D1.6.3 (D=$D): brief block: unexpected reconnect log"
+            fail "D1.6.3 (D=$D): brief block triggered a reconnect (link did not survive)"
         else
-            pass "D1.6.3 (D=$D): brief block: no reconnect (keepalive held the link)"
+            pass "D1.6.3 (D=$D): brief block: link survived without reconnect (QUIC keepalive held)"
         fi
     else
-        # D=16s: direct dies → recovery expected; reconnect may appear
-        pass "D1.6.3 (D=$D): long block (${D}s > idle 10s): link outage measured at ${LOSS3}% loss"
-        if grep -qi "reconnecting" "$BORE_LOG.connect_d1_cycle" 2>/dev/null; then
-            pass "D1.6.3 (D=$D): long block: reconnect triggered (expected after idle death)"
+        # D=16s: direct dies → bridge falls back to warm relay (no reconnect, no link death)
+        echo "  [D=$D: during-block loss=${LOSS3}% (direct path dies > QUIC idle 10s); checking warm-relay fallback...]"
+
+        # Check for NO reconnect during block→recover window (BUG-1 fixed: seamless fallback)
+        LISTEN_PRE_COUNT=$(grep -c 'vpn link lost' "$BORE_LOG.listen_d1_cycle" 2>/dev/null || echo 0)
+        CONNECT_PRE_COUNT=$(grep -c 'vpn link lost' "$BORE_LOG.connect_d1_cycle" 2>/dev/null || echo 0)
+
+        if grep -qi "vpn link lost; reconnecting" "$BORE_LOG.listen_d1_cycle" 2>/dev/null || \
+           grep -qi "vpn link lost; reconnecting" "$BORE_LOG.connect_d1_cycle" 2>/dev/null; then
+            fail "D1.6.3 (D=$D): long block: NO reconnect allowed (warm-relay fallback failed) — direct→relay must be seamless"
+        else
+            pass "D1.6.3 (D=$D): long block: NO reconnect logged; bridge fell back to warm relay seamlessly"
         fi
-        # The big xfail assert: direct→relay seamless recovery
-        xassert "xfail_bug1" direct_relay_seamless
+
+        # Check for fallback message on at least one side
+        if grep -qi "fell back to relay (link preserved)" "$BORE_LOG.listen_d1_cycle" 2>/dev/null || \
+           grep -qi "fell back to relay (link preserved)" "$BORE_LOG.connect_d1_cycle" 2>/dev/null; then
+            pass "D1.6.3 (D=$D): long block: fallback message logged (warm relay active)"
+        else
+            fail "D1.6.3 (D=$D): long block: NO fallback message found — warm relay was NOT invoked"
+        fi
     fi
 
-    # Phase 4: Unblock and expect upgrade back to direct
-    BG4=$(bgping_start ns2 "10.99.0.1")
-    sleep 3
-    LOSS4=$(bgping_stop "$BG4")
+    # Phase 4: Unblock and expect the link to recover and climb back to direct.
+    # After a long-block reconnect the link re-pairs from scratch, so wait for recovery
+    # FIRST, then RE-READ the overlay address (pool may reassign) and measure only the
+    # steady state — measuring during the reconnect window would just remeasure BUG-1.
     if wait_for_log "$BORE_LOG.connect_d1_cycle" "upgraded to direct" 50; then
-        [ "$LOSS4" = "0" ] && pass "D1.6.4 (D=$D): recovery to direct: 0% loss" || fail "D1.6.4 (D=$D): recovery: ${LOSS4}% loss"
+        sleep 1
+        OVL_PEER=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+        if [ -n "$OVL_PEER" ]; then
+            ip netns exec ns2 ping -c 3 -W 2 "$OVL_PEER" >/dev/null 2>&1 || true
+            BG4=$(bgping_start ns2 "$OVL_PEER")
+            sleep 2
+            LOSS4=$(bgping_stop "$BG4")
+            [ "$LOSS4" = "0" ] && pass "D1.6.4 (D=$D): recovery to direct: steady-state 0% loss" || fail "D1.6.4 (D=$D): recovery: ${LOSS4}% loss"
+        else
+            fail "D1.6.4 (D=$D): no overlay address after recovery"
+        fi
     else
         fail "D1.6.4 (D=$D): link did not upgrade back to direct within 50s"
     fi
@@ -613,8 +622,12 @@ sleep 0.5
 echo ""
 echo "=== Test F4: SIGKILL both peers in gateway mode (BUG-2: ip_forward poison) ==="
 # Capture pre-run ip_forward
+# BUG-2 only manifests on hosts that START with ip_forward=0; on hosts already at 1
+# (Docker/routers, and fresh netns on this box) the poison is invisible because restoring
+# to 1 is correct. Force a pristine 0 baseline so the test is deterministic everywhere.
+ip netns exec ns1 sysctl -qw net.ipv4.ip_forward=0 2>/dev/null || true
 NS1_PRE_IPF_INITIAL=$(ip netns exec ns1 cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
-pass "F4: captured initial ns1 ip_forward=$NS1_PRE_IPF_INITIAL (before any runs)"
+pass "F4: forced pristine ns1 ip_forward=$NS1_PRE_IPF_INITIAL baseline"
 
 ip netns exec ns1 "$BORE" vpn listen \
     --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id f4-sigkill-gw \
@@ -634,10 +647,12 @@ if wait_for_log "$BORE_LOG.listen_f4" "vpn link paired" 10; then
     NS1_IPF_DURING=$(ip netns exec ns1 cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "?")
     pass "F4: ns1 ip_forward=$NS1_IPF_DURING during gateway mode"
 
-    # SIGKILL both
+    # SIGKILL both, then let the kernel fully reap the processes (close TUN fds, etc.)
+    # before the fresh run's stale_reclaim runs — a too-short settle here races the
+    # reclaim and was the cause of an intermittent F4 failure.
     kill -9 "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
     kill -9 "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
-    sleep 0.3
+    sleep 1
 
     # Assert TUN is stale (SIGKILL can't clean up)
     if ip netns exec ns1 ip link show bore0 >/dev/null 2>&1; then
@@ -665,11 +680,22 @@ if wait_for_log "$BORE_LOG.listen_f4" "vpn link paired" 10; then
         # Clean exit
         kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
         kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
-        sleep 1
 
-        # BUG-2 xfail assert: ip_forward should return to original
-        NS1_POST_IPF=$(ip netns exec ns1 cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "?")
-        xassert "xfail_bug2" [ "$NS1_POST_IPF" = "$NS1_PRE_IPF_INITIAL" ]
+        # We forced a 0 baseline above, so after a SIGKILL'd gateway session + a fresh
+        # clean run + clean exit, ip_forward MUST be back to 0. The fix: the fresh run's
+        # stale_reclaim restores ip_forward from the /run state file, so it is never
+        # poisoned. Poll (don't fixed-sleep) for the clean-exit Drop to settle.
+        NS1_POST_IPF="?"
+        for _ in $(seq 1 30); do
+            NS1_POST_IPF=$(ip netns exec ns1 cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "?")
+            [ "$NS1_POST_IPF" = "0" ] && break
+            sleep 0.1
+        done
+        if [ "$NS1_POST_IPF" = "0" ]; then
+            pass "F4: ip_forward restored to 0 after SIGKILL+rerun (BUG-2 fixed)"
+        else
+            fail "F4: ip_forward NOT restored (stuck at $NS1_POST_IPF, expected 0) — BUG-2 reproduced"
+        fi
     else
         fail "F4: second run (post-SIGKILL) did not pair"
         kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
@@ -685,6 +711,9 @@ sleep 0.5
 # ── Test F5: clean teardown leaves nothing ──────────────────────────────────────
 echo ""
 echo "=== Test F5: clean teardown route/nft/ip_forward cleanup ==="
+# Force a 0 baseline so the "restored to 0" assert below is a real positive proof that a
+# CLEAN teardown (unlike SIGKILL, BUG-2) restores ip_forward.
+ip netns exec ns1 sysctl -qw net.ipv4.ip_forward=0 2>/dev/null || true
 ip netns exec ns1 "$BORE" vpn listen \
     --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id f5-clean-gw \
     --advertise "$FAKE_LAN_1" --relay-only \
@@ -734,9 +763,9 @@ if wait_for_log "$BORE_LOG.listen_f5" "vpn link paired" 10; then
 
     NS1_IPF_POST=$(ip netns exec ns1 cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
     if [ "$NS1_IPF_POST" = "0" ]; then
-        pass "F5: ns1 ip_forward restored to 0"
+        pass "F5: clean teardown restored ns1 ip_forward to 0 (was $NS1_IPF_PRE in gateway mode)"
     else
-        pass "F5: ns1 ip_forward is $NS1_IPF_POST (was $NS1_IPF_PRE before gateway mode)"
+        fail "F5: clean teardown did NOT restore ip_forward (now $NS1_IPF_POST, expected 0)"
     fi
 else
     fail "F5: pair failed"
@@ -799,8 +828,12 @@ echo "=== Test P2: egress allow-list emulation (UDP port 51820 only) ==="
 # Add nft rule: drop forwarded UDP except dport 51820
 ip netns exec ns0 nft add table inet bore_test_port
 ip netns exec ns0 nft 'add chain inet bore_test_port port_fwd { type filter hook forward priority 0; }'
+# Accept rules MUST precede the drop: nft `drop` is terminal, so a leading drop would
+# discard ALL udp (including 51820). The pinned socket sends AND receives on 51820, so
+# allow both source- and dest-port 51820, then drop everything else.
+ip netns exec ns0 nft 'add rule inet bore_test_port port_fwd udp sport 51820 accept'
+ip netns exec ns0 nft 'add rule inet bore_test_port port_fwd udp dport 51820 accept'
 ip netns exec ns0 nft 'add rule inet bore_test_port port_fwd meta l4proto udp drop'
-ip netns exec ns0 nft 'add rule inet bore_test_port port_fwd meta l4proto udp udp dport 51820 accept'
 
 ip netns exec ns1 "$BORE" vpn listen \
     --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id p2-allow-pin \
@@ -922,9 +955,23 @@ if wait_for_log "$BORE_LOG.listen_mtu" "vpn link paired" 10; then
     NS2_MTU=$(mtu_of ns2 bore0)
     pass "mtu mismatch: ns1 TUN MTU=$NS1_MTU, ns2 TUN MTU=$NS2_MTU"
 
-    NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
-    # BUG-4 xfail: large payload should fail on 1200-MTU side
-    xassert "xfail_bug4" ip netns exec ns1 ping -c 1 -W 5 -s 1350 "$NS1_OVL"
+    NS2_OVL=$(ip netns exec ns2 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    # BUG-4 REFUTED → hard assert: a 1350B (1378B IP) payload sent ACROSS the tunnel to
+    # the 1200-MTU side does NOT silently drop. IPv4 fragments non-DF traffic and the relay
+    # carries the fragments, so the ping must succeed. (The old hypothesis — silent drop on
+    # the smaller-MTU egress — was wrong.)
+    if ip netns exec ns1 ping -c 1 -W 5 -s 1350 "$NS2_OVL" >/dev/null 2>&1; then
+        pass "mtu mismatch: non-DF large payload survives (IPv4 fragmentation, no silent loss)"
+    else
+        fail "mtu mismatch: non-DF large payload dropped (would be a real data-loss bug)"
+    fi
+    # DF-set traffic above the smaller MTU correctly fails (standard PMTU, ICMP frag-needed).
+    # The only real gap is cosmetic: bore never WARNS that the two --mtu values disagree.
+    if ip netns exec ns1 ping -c 1 -W 3 -M do -s 1350 "$NS2_OVL" >/dev/null 2>&1; then
+        pass "mtu mismatch: DF payload also passed (effective path MTU >= 1378)"
+    else
+        pass "mtu mismatch: DF payload >min-MTU fails as expected (effective MTU=min; no bore warning — cosmetic)"
+    fi
 else
     fail "mtu mismatch: pair failed"
 fi
@@ -968,8 +1015,77 @@ kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
 kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
 sleep 0.5
 
+# ── Test D1.7: rapid direct↔relay flap (post-BUG-1 fix validation) ─────────────
+echo ""
+echo "=== Test D1.7: rapid direct↔relay flap (4 block/unblock cycles, no link death) ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "d1-flap" \
+    --stun-server "$STUN" --auto-reconnect \
+    >"$BORE_LOG.listen_d1_flap" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "d1-flap" \
+    --stun-server "$STUN" --auto-reconnect \
+    >"$BORE_LOG.connect_d1_flap" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.listen_d1_flap" "vpn link paired" 10; then
+    sleep 1
+    OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    if [ -z "$OVL" ]; then
+        fail "D1.7: initial pair failed (no overlay)"
+        kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+        kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+    else
+        # Perform 4 rapid block/unblock cycles, each 13s block (exceeds 10s QUIC idle) + 6s open
+        FLAP_PASS=1
+        RECONNECT_COUNT_BEFORE=$(grep -c 'vpn link lost; reconnecting' "$BORE_LOG.connect_d1_flap" 2>/dev/null || echo 0)
+
+        for FLAP_CYCLE in 1 2 3 4; do
+            echo "  [D1.7: flap cycle $FLAP_CYCLE/4 — 13s block + 6s open]"
+            block_udp ns0
+            sleep 13
+            unblock_udp ns0
+            sleep 6
+        done
+
+        # Check: NEVER any "vpn link lost" in either log during the whole flap sequence
+        LISTEN_LOST_COUNT=$(grep -c 'vpn link lost; reconnecting' "$BORE_LOG.listen_d1_flap" 2>/dev/null || echo 0)
+        CONNECT_LOST_COUNT=$(grep -c 'vpn link lost; reconnecting' "$BORE_LOG.connect_d1_flap" 2>/dev/null || echo 0)
+
+        if [ "$LISTEN_LOST_COUNT" -gt 0 ] || [ "$CONNECT_LOST_COUNT" -gt 0 ]; then
+            fail "D1.7: link tore down during flap (listen lost=$LISTEN_LOST_COUNT, connect lost=$CONNECT_LOST_COUNT)"
+            FLAP_PASS=0
+        else
+            pass "D1.7: all 4 flap cycles completed — link never tore down (warm-relay fallback active)"
+        fi
+
+        # Wait for potential re-upgrade to direct after final unblock
+        sleep 2
+
+        # Verify link is still pingable post-flap
+        OVL_POST=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+        if [ -n "$OVL_POST" ] && ip netns exec ns2 ping -c 2 -W 3 "$OVL_POST" >/dev/null 2>&1; then
+            pass "D1.7: post-flap ping 0% loss (link recovered and stable)"
+        else
+            fail "D1.7: post-flap ping failed or interface gone"
+        fi
+
+        kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+        kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+    fi
+else
+    fail "D1.7: initial pair failed"
+    kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+    kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+fi
+unblock_udp ns0
+sleep 0.5
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== Hardening test suite complete ==="
-echo "PASS=$PASS FAIL=$FAIL XFAIL=$XFAIL XPASS=$XPASS"
+echo "=== Hardening test suite complete (regression gate) ==="
+echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

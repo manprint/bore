@@ -1,7 +1,7 @@
 # VPN Hardening & Bug-Hunt Plan
 
-Status: **bug-hunt phase — DO NOT modify `src/` in this phase.** Goal is to surface
-real-world failures with severe tests and document them. Fixes happen in a later phase.
+Status: **FIX phase.** Bug-hunt complete. BUG-2/BUG-3 fixed. BUG-4 refuted. BUG-1 fix
+designed in Part 6 below (Option A — warm relay). `src/` changes are now in scope.
 
 Design by Opus. Implementation delegated to Sonnet/Haiku. Each section below is a
 self-contained handoff: an implementing agent should not need extra context.
@@ -34,7 +34,7 @@ report. Mark such asserts clearly (see "expected-fail" tagging in Part 2).
 - The requested cycle (relay→direct→relay→direct, transparent) cannot be transparent on
   the down-legs **by construction** — the relay path is gone the moment we go direct.
 
-### BUG-2 — SIGKILL poisons `ip_forward` permanently (HIGH)
+### BUG-2 — SIGKILL leaves `ip_forward` enabled, never restored (HIGH on ip_forward=0 hosts)
 
 - `stale_reclaim` (`vpn.rs` ~2064-2071) deletes only the nft table and the TUN device.
   It never restores `/proc/sys/net/ipv4/ip_forward`.
@@ -42,6 +42,11 @@ report. Mark such asserts clearly (see "expected-fail" tagging in Part 2).
   Drop never runs → ip_forward stays 1. The **next** run reads the current value (now 1)
   and saves *1* as the "original" (`vpn.rs` ~2214-2237). On its clean exit it "restores"
   to 1 (`vpn.rs` ~2345-2377). ip_forward is now stuck at 1 forever, no manual fix done.
+- **CONFIRMED by the netns run, with a scope caveat:** the bug only bites hosts that
+  **start with ip_forward=0**. On a host already at 1 (Docker, libvirt, routers — and the
+  test box's fresh netns) the residue is invisible, since restoring to 1 *is* correct. The
+  F4 test therefore forces a 0 baseline before exercising it, to be deterministic. Clean
+  teardown (SIGTERM/SIGINT) *does* restore correctly (proven by F5) — only SIGKILL leaks.
 
 ### BUG-3 — SIGKILL + iptables fallback leaks NAT/MSS rules forever (HIGH)
 
@@ -53,12 +58,17 @@ report. Mark such asserts clearly (see "expected-fail" tagging in Part 2).
   next run's stale_reclaim cannot remove them. (The netns harness uses nft, so it has
   never exercised this path.)
 
-### BUG-4 — MTU asymmetry silently drops packets (MEDIUM)
+### BUG-4 — MTU asymmetry → REFUTED as a data-loss bug; only a cosmetic gap (LOW)
 
-- `--mtu` is purely local; it is not in `HelloVpn`/`ConnectVpn`/`VpnReady`
-  (`shared.rs`) and is never negotiated. Two peers with different `--mtu` run mismatched
-  with no warning. The smaller-MTU side silently drops oversized packets (TooLarge →
-  per-packet drop). Symptom: small pings pass, large payloads vanish — hard to diagnose.
+- `--mtu` is purely local; it is not in `HelloVpn`/`ConnectVpn`/`VpnReady` (`shared.rs`)
+  and is never negotiated. Two peers with different `--mtu` run mismatched with no warning.
+- **Hypothesis (silent oversized-packet drop) was REFUTED by the netns run.** With
+  ns1=1400/ns2=1200 and a 1378-byte IP ping sent across the tunnel to the 1200-MTU side,
+  the packet is **not** dropped: IPv4 fragments non-DF traffic and the relay carries the
+  fragments, so connectivity is intact. DF-set traffic above the smaller MTU fails per
+  standard PMTU (ICMP frag-needed), which is correct, not a bore defect.
+- The only real gap is **cosmetic**: bore emits no warning when the two `--mtu` values
+  disagree, so the effective path MTU silently becomes `min(a, b)`. Low priority.
 
 ### Coverage gaps (test debt, not bugs)
 
@@ -307,3 +317,187 @@ sudo.
 - Verification (Part 5): **Haiku/Sonnet** runs cargo + bash -n, reports output.
 - Opus reviews the produced files against this spec and confirms xfail tagging + that the
   four bugs are reproduced as XFAIL.
+
+---
+
+## Part 6 — Deliverable D4: BUG-1 fix (Option A — warm-relay seamless fallback)
+
+Goal: direct→relay must NOT tear the link down / reconnect. The relay path stays warm the
+whole link lifetime; on direct death the data plane falls back to relay in place. Literal
+0% loss during the direct-failure-detection window (~QUIC idle 10 s) is NOT a goal (not
+physically achievable); the guarantee is **no reconnect, no re-pair, TUN stays up, link
+preserved**, then steady 0% on relay.
+
+### Design (verified against the code)
+
+- The link ALWAYS starts on relay. Server already keeps idle relay substreams spliced
+  (continuous accept loop + dynamic per-substream pairing in `vpn_server.rs`) → **no server
+  change**. The listener's relay reader/writer tasks and the connector's stay alive →
+  **no listener-protocol change**.
+- **Always-on relay downlink**: spawn the relay downlink ONCE at bridge start; it runs the
+  whole link lifetime, draining `fan_rx` → TUN. While on direct it simply idles (the peer
+  sends nothing on relay → `recv_batch` blocks). When direct dies and the peer falls back,
+  relay traffic arrives and this downlink delivers it — **the RX side needs no switching**.
+- **Uplink-only switch**: exactly ONE uplink set reads the TUN at a time. On upgrade, abort
+  the relay uplinks and spawn direct uplinks (direct sender). On direct death, abort the
+  direct uplinks and respawn relay uplinks (`relay_sender.clone()`).
+- **Direct downlink**: spawned on upgrade (reads the QUIC conn → TUN), removed on direct
+  death. Its death (QUIC idle timeout) is the direct-death signal. Runs concurrently with
+  the idle relay downlink — but the relay downlink is blocked (no relay traffic on direct),
+  so there is effectively never a concurrent TUN write; `dev.send` is packet-atomic anyway.
+- **Counter / nonce safety**: the bridge holds `relay_sender` for the whole lifetime and
+  only ever `.clone()`s it — the relay `LinkSender::Relay` is NEVER rebuilt, so its shared
+  `Arc<AtomicU64>` counter is preserved across any number of direct interludes. **No nonce
+  reuse** (the trap that the old full-reconnect avoided only by re-keying). No counter
+  hoisting needed.
+- **yamux-split safety**: the bridge only ever touches channels (`fan_rx`, the writer
+  `txs`) and the direct conn — never a `mux::Stream` directly. The relay reader/writer tasks
+  (the stream owners) are untouched and persist. No split risk.
+- **Perf hot path unchanged**: on relay = 1 uplink set + 1 relay downlink (byte-identical to
+  today). On direct = 1 direct uplink set + 1 direct downlink + 1 *blocked* relay downlink
+  (zero CPU). `--relay-only` path is unchanged (no direct task, no upgrade, no direct
+  downlink — identical to today).
+
+### Bridge state machine (factor a PURE, UNIT-TESTABLE decision fn)
+
+Add an enum + pure function so the transition logic is testable without a real TUN:
+
+```rust
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BridgeMode { Relay, Direct }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BridgeEvent { RelayDownlinkDied, UplinkDied, UpgradeArrived, DirectDownlinkDied }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BridgeAction { LinkDead, GoDirect, FallBackToRelay, ReconnectRelayDead, Ignore }
+
+/// Pure transition table. `relay_alive` = is the always-on relay downlink still running?
+fn bridge_next_action(mode: BridgeMode, ev: BridgeEvent, relay_alive: bool) -> BridgeAction {
+    match (mode, ev) {
+        (BridgeMode::Relay,  BridgeEvent::RelayDownlinkDied) => BridgeAction::LinkDead,
+        (BridgeMode::Relay,  BridgeEvent::UplinkDied)        => BridgeAction::LinkDead,
+        (BridgeMode::Relay,  BridgeEvent::UpgradeArrived)    => BridgeAction::GoDirect,
+        (BridgeMode::Relay,  BridgeEvent::DirectDownlinkDied)=> BridgeAction::Ignore, // none on relay
+        // On direct, the warm relay dying is NOT fatal — we're healthy on direct.
+        (BridgeMode::Direct, BridgeEvent::RelayDownlinkDied) => BridgeAction::Ignore,
+        (BridgeMode::Direct, BridgeEvent::UpgradeArrived)    => BridgeAction::Ignore, // already direct
+        (BridgeMode::Direct, BridgeEvent::DirectDownlinkDied)
+        | (BridgeMode::Direct, BridgeEvent::UplinkDied) =>
+            if relay_alive { BridgeAction::FallBackToRelay } else { BridgeAction::ReconnectRelayDead },
+    }
+}
+```
+
+The async `bridge::run` drives this:
+- `Mode::Relay`: `select!` over {relay downlink handle, `select_all(uplinks)`, `upgrade_rx.recv()`}.
+  - relay downlink done → `LinkDead` → break with its result.
+  - uplink done → `LinkDead` → break with its result.
+  - upgrade `Some((ds,dr))` → `GoDirect`: abort+await relay uplinks; `uplinks =
+    spawn_uplinks(direct_sender)`; `direct_downlink = Some(spawn run_downlink(dr))`;
+    `mode = Direct`. upgrade `None` → keep running relay (watch downlink/uplinks for death).
+- `Mode::Direct`: `select!` over {direct downlink handle, `select_all(uplinks)`}. (Do NOT
+  watch the relay downlink here — its handle is checked with `is_finished()` on fallback.)
+  - direct downlink done OR uplink done → if `!relay_downlink.is_finished()` →
+    `FallBackToRelay`: `downgrade_tx.try_send(())` (re-arm the direct-retry task, best-effort,
+    bounded chan); abort+await direct uplinks; `direct_downlink.take().abort()`;
+    `uplinks = spawn_uplinks(relay_sender.clone())`; `mode = Relay`; `warn!(path="relay",
+    "direct path lost; fell back to relay (link preserved)")`. Else (`relay_downlink`
+    finished) → `ReconnectRelayDead`: break with the relay downlink's result (genuine link
+    death — both paths gone → the reconnect loop handles it).
+- On exit: abort relay downlink, all uplinks, direct downlink, stats task.
+
+Reuse the existing `abort_await` pattern (abort all; `await` only `!is_finished()` handles —
+avoids re-polling a `select_all`-completed handle, per the existing comment).
+
+### Refactor needed for the always-on relay downlink
+
+`run_downlink`/`run_downlink_single`/`run_downlink_offload` stay as-is (the relay downlink is
+just `run_downlink` spawned once; the direct downlink is `run_downlink` too). NO cancellable
+variant is needed — this design never cancels a downlink, it only aborts uplinks and the
+direct downlink. Keep the downlink code byte-identical.
+
+### Channel wiring (signatures)
+
+- New reverse channel per link: `let (downgrade_tx, downgrade_rx) = mpsc::channel::<()>(1);`
+- `bridge::run(... , upgrade_rx, downgrade_tx)` — add `downgrade_tx: mpsc::Sender<()>`.
+- `run_bridge_with_ctrl(... , upgrade_rx, downgrade_tx)` — thread it through to `bridge::run`.
+- `direct_upgrade_task(ctx, out_tx, event_rx, upgrade_tx, downgrade_rx)` — add
+  `downgrade_rx: mpsc::Receiver<()>`.
+- Both call sites (listener ~line 320-353, connector ~line 1000-1033): create the channel;
+  pass `downgrade_tx` to `run_bridge_with_ctrl`; pass `downgrade_rx` to `direct_upgrade_task`.
+  For `--relay-only`: drop both ends (no direct task, bridge never gets an upgrade → stays
+  on relay forever, identical to today; `downgrade_tx` sends are best-effort `try_send` so a
+  dropped rx is harmless).
+
+### direct_upgrade_task re-arm (so the cycle repeats)
+
+Today the task returns `Ok(())` after a successful upgrade. Change: after a successful
+upgrade (it already `upgrade_tx.send(make_direct(conn))`ed inside `try_direct_upgrade`),
+WAIT on `downgrade_rx.recv()` for the bridge's "direct died" signal, then RESUME the retry
+loop (re-attempt on the 30 s grid):
+
+```rust
+'retry: loop {
+    ticker.tick().await;            // immediate first tick; MissedTickBehavior::Skip
+    attempt += 1;
+    match try_direct_upgrade(&ctx, &out_tx, &mut event_rx, &upgrade_tx).await {
+        Ok(()) => {
+            // Direct is up. Block until the bridge tells us it fell back, then re-arm.
+            match downgrade_rx.recv().await {
+                Some(()) => { info!(link_id=%ctx.link_id, "direct path lost; re-arming relay→direct retry"); continue 'retry; }
+                None => return,     // bridge gone → link closing
+            }
+        }
+        Err(e) => { /* existing should_retry_direct logic: log + continue 'retry, or return */ }
+    }
+}
+```
+
+Both peers detect direct death at ~the same time (shared QUIC idle) and both re-arm; the
+server broker already re-arms per repeated offer and clears stale candidates (existing,
+tested). No new coordination.
+
+### Edge cases / invariants to preserve
+
+- Control-connection death is still caught by `run_bridge_with_ctrl`'s `ctrl_task` watch →
+  full teardown/reconnect (unchanged). The warm relay substreams live on that same control
+  connection, so they cannot independently die while the control conn is alive.
+- If direct dies AND the warm relay is already dead (`relay_downlink.is_finished()`), the
+  bridge breaks → the existing reconnect loop re-establishes (same as today; no worse).
+- `--carriers`, `--tun-queues`, static-addr, gateway mode: unaffected (the warm relay is
+  whatever was negotiated; uplink set size = TUN queue count, unchanged).
+
+### Tests (NEW — internal + e2e)
+
+Internal (`#[cfg(feature = "vpn")]`, in the bridge module's `mod tests`):
+- `bridge_next_action_table` — assert every (mode, event, relay_alive) row of
+  `bridge_next_action` (the full truth table above), incl. both fallback branches.
+- Keep/extend `should_retry_direct` tests.
+- (Mocking a real TUN is impractical → bridge integration is covered by the netns e2e.)
+
+E2e — `scripts/vpn_netns_test_hard.sh`, the D1.6 cycling test:
+- PROMOTE `xfail_bug1` to a HARD assert for the D=16 (direct-death) leg: after the long
+  block, assert the connector/listener logs contain NO `vpn link lost` / `reconnecting`
+  during the block→recover window, AND DO contain the new `fell back to relay` (or
+  equivalent path=relay fallback) log, AND the link recovers (post-unblock re-upgrades to
+  direct, steady-state ping 0%). Remove the `xfail_bug1`/`direct_relay_seamless` machinery.
+- ADD a new test `D1.7 — rapid flap`: with STUN enabled and link on direct, block/unblock
+  UDP 4–5 times in quick succession (e.g. 12 s blocks alternating with 8 s open). Assert
+  across the WHOLE sequence: NEVER any `vpn link lost`/`reconnecting` log on either side,
+  and the link is pingable at the end (on whichever path), 0% loss after a warmup. This is
+  the stress proof that warm-relay fallback + re-upgrade never tears the link down.
+- The base suite (`vpn_netns_test.sh`) and all its tests must still pass unchanged.
+
+CI gates (Part 5) all green, ZERO regressions across `--features vpn`, default, and
+`--no-default-features`. The implementing agent iterates until `cargo build/clippy/test`
+are clean on all three configs and `bash -n` is clean.
+
+### Docs to update as part of D4
+
+- `CLAUDE.md`: rewrite the DEC-2 invariant — direct death no longer reconnects; it falls
+  back to the warm relay in place (link preserved). Note the warm-relay idle cost and that
+  the egress counter is preserved across switches (no nonce reuse). Note that a reconnect
+  now happens only if BOTH paths are down.
+- `docs/vpn/VPN.md` + `docs/vpn/VPN_TEST_MATRIX.md`: document the seamless fallback + the new
+  D1.7 flap test + the re-arm behavior.

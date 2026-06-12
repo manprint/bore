@@ -264,7 +264,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
     };
 
     // Stale reclaim
-    hostcfg::stale_reclaim(&args.id, &args.tun_name).await;
+    hostcfg::stale_reclaim(&args.id, "listen", &args.tun_name).await;
 
     // Create TUN device(s) (one per queue).
     let (devs_raw, offload) =
@@ -285,6 +285,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
     let _netcfg = hostcfg::NetConfig::apply(
         &runner,
         &args.id,
+        "listen",
         &args.tun_name,
         assigned,
         prefix,
@@ -318,9 +319,11 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
 
     // Direct-path upgrade attempt (skipped entirely with --relay-only).
     let (upgrade_tx, upgrade_rx) = tokio::sync::mpsc::channel(1);
+    let (downgrade_tx, downgrade_rx) = tokio::sync::mpsc::channel::<()>(1);
     let direct_task = if args.relay_only {
         drop(event_rx);
         drop(upgrade_tx);
+        drop(downgrade_rx);
         None
     } else {
         let ctx = DirectUpgradeCtx::from_link_args(
@@ -344,13 +347,23 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
             out_tx.clone(),
             event_rx,
             upgrade_tx,
+            downgrade_rx,
         )))
     };
     drop(out_tx);
 
     // Run the bridge until it closes or the control connection dies.
     let result = run_bridge_with_ctrl(
-        &args.id, ctrl_task, devs, sender, recver, counters, args.mtu, offload, upgrade_rx,
+        &args.id,
+        ctrl_task,
+        devs,
+        sender,
+        recver,
+        counters,
+        args.mtu,
+        offload,
+        upgrade_rx,
+        downgrade_tx,
     )
     .await;
 
@@ -549,15 +562,25 @@ async fn direct_upgrade_task(
     out_tx: tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
     mut event_rx: tokio::sync::mpsc::Receiver<CtrlEvent>,
     upgrade_tx: tokio::sync::mpsc::Sender<(link::LinkSender, link::LinkRecver)>,
+    mut downgrade_rx: tokio::sync::mpsc::Receiver<()>,
 ) {
     let mut ticker = tokio::time::interval(DIRECT_RETRY_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut attempt: u32 = 0;
-    loop {
+    'retry: loop {
         ticker.tick().await; // immediate on the first iteration
         attempt += 1;
         match try_direct_upgrade(&ctx, &out_tx, &mut event_rx, &upgrade_tx).await {
-            Ok(()) => return, // direct achieved — stop retrying
+            Ok(()) => {
+                // Direct is up. Block until the bridge tells us it fell back, then re-arm.
+                match downgrade_rx.recv().await {
+                    Some(()) => {
+                        info!(link_id=%ctx.link_id, "direct path lost; re-arming relay→direct retry");
+                        continue 'retry;
+                    }
+                    None => return, // bridge gone → link closing
+                }
+            }
             Err(e) => {
                 let will_retry = should_retry_direct(false, true, upgrade_tx.is_closed());
                 if will_retry {
@@ -843,9 +866,10 @@ async fn run_bridge_with_ctrl(
     mtu: u16,
     offload: bool,
     upgrade_rx: tokio::sync::mpsc::Receiver<(link::LinkSender, link::LinkRecver)>,
+    downgrade_tx: tokio::sync::mpsc::Sender<()>,
 ) -> Result<()> {
     let result = tokio::select! {
-        res = bridge::run(devs, sender, recver, counters, mtu, offload, upgrade_rx) => {
+        res = bridge::run(devs, sender, recver, counters, mtu, offload, upgrade_rx, downgrade_tx) => {
             ctrl_task.abort();
             res
         }
@@ -944,7 +968,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
     };
 
     // Stale reclaim
-    hostcfg::stale_reclaim(&args.id, &args.tun_name).await;
+    hostcfg::stale_reclaim(&args.id, "connect", &args.tun_name).await;
 
     // Create TUN device(s) (one per queue).
     let (devs_raw, offload) =
@@ -965,6 +989,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
     let _netcfg = hostcfg::NetConfig::apply(
         &runner,
         &args.id,
+        "connect",
         &args.tun_name,
         assigned,
         prefix,
@@ -998,9 +1023,11 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
 
     // Direct-path upgrade attempt (skipped entirely with --relay-only).
     let (upgrade_tx, upgrade_rx) = tokio::sync::mpsc::channel(1);
+    let (downgrade_tx, downgrade_rx) = tokio::sync::mpsc::channel::<()>(1);
     let direct_task = if args.relay_only {
         drop(event_rx);
         drop(upgrade_tx);
+        drop(downgrade_rx);
         None
     } else {
         let ctx = DirectUpgradeCtx::from_link_args(
@@ -1024,13 +1051,23 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
             out_tx.clone(),
             event_rx,
             upgrade_tx,
+            downgrade_rx,
         )))
     };
     drop(out_tx);
 
     // Run the bridge until it closes or the control connection dies.
     let result = run_bridge_with_ctrl(
-        &args.id, ctrl_task, devs, sender, recver, counters, args.mtu, offload, upgrade_rx,
+        &args.id,
+        ctrl_task,
+        devs,
+        sender,
+        recver,
+        counters,
+        args.mtu,
+        offload,
+        upgrade_rx,
+        downgrade_tx,
     )
     .await;
 
@@ -2061,11 +2098,53 @@ pub mod hostcfg {
     }
 
     /// Delete leftover resources from a previous failed run (idempotent, best-effort).
-    pub async fn stale_reclaim(id: &str, tun_name: &str) {
+    pub async fn stale_reclaim(id: &str, role: &str, tun_name: &str) {
+        // Try to restore ip_forward from state file (SIGKILL recovery). The file is keyed
+        // by (id, role) so a co-located peer with the same id (e.g. the connector in the
+        // netns harness) cannot read+delete THIS side's file out from under it.
+        let state_path = ipforward_state_path(id, role);
+        if let Ok(content) = std::fs::read_to_string(&state_path) {
+            if let Ok(saved_value) = content.trim().parse::<u8>() {
+                tracing::info!(
+                    saved_value,
+                    "stale_reclaim: restoring ip_forward from state file"
+                );
+                let _ = std::fs::write(
+                    "/proc/sys/net/ipv4/ip_forward",
+                    format!("{}\n", saved_value),
+                );
+                // If direct write failed, try sudo -n fallback
+                if std::fs::write(
+                    "/proc/sys/net/ipv4/ip_forward",
+                    format!("{}\n", saved_value),
+                )
+                .is_err()
+                {
+                    let argv = super::hostcfg_cmd::cmd_sysctl_ip_forward(saved_value);
+                    let _ = std::process::Command::new(&argv[0])
+                        .args(&argv[1..])
+                        .output();
+                }
+            }
+            let _ = std::fs::remove_file(&state_path);
+        }
+
         // Try to delete nft table (ignore "not found" errors)
         let _ = Command::new("nft")
             .args(["delete", "table", "inet", &format!("bore_vpn_{id}")])
             .output();
+
+        // Try to delete iptables rules (BUG-3: for iptables fallback hosts)
+        let masquerade_del = super::hostcfg_cmd::cmd_iptables_masquerade_del(id);
+        let mut cmd = Command::new(&masquerade_del[0]);
+        cmd.args(&masquerade_del[1..]);
+        let _ = cmd.output();
+
+        let mss_clamp_del = super::hostcfg_cmd::cmd_iptables_mss_clamp_del(id);
+        let mut cmd = Command::new(&mss_clamp_del[0]);
+        cmd.args(&mss_clamp_del[1..]);
+        let _ = cmd.output();
+
         // Try to delete TUN interface (ignore errors)
         let _ = Command::new("ip").args(["link", "del", tun_name]).output();
     }
@@ -2137,10 +2216,38 @@ pub mod hostcfg {
         IpForward { saved_value: u8 },
     }
 
+    /// Sanitize id for use in a filename: keep [A-Za-z0-9_-], replace others with _.
+    /// Path of the ip_forward recovery state file. Keyed by BOTH the link id AND the
+    /// role ("listen"/"connect"): two peers of one link can share a host (and `/run`
+    /// is host-shared, not network-namespaced), so a key on `id` alone would make the
+    /// connector's `stale_reclaim` read+delete the listener's file (racing it away) and
+    /// would collide outright in site↔site mode where both sides are gateways.
+    fn ipforward_state_path(id: &str, role: &str) -> std::path::PathBuf {
+        let sanitize = |s: &str| {
+            s.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        };
+        std::path::PathBuf::from(format!(
+            "/run/bore-vpn-{}-{}.ipforward",
+            sanitize(id),
+            sanitize(role)
+        ))
+    }
+
     /// RAII guard that manages routes, forwarding, and NAT around a VPN link.
     /// Reverts everything in reverse order on `Drop`.
     pub struct NetConfig {
         id: String,
+        // "listen" / "connect" — disambiguates the ip_forward state file between two
+        // peers of one link that share a host (and `/run`).
+        role: String,
         tun_name: String,
         no_route_manage: bool,
         nft_available: bool,
@@ -2168,6 +2275,7 @@ pub mod hostcfg {
         pub async fn apply<R: CommandRunner>(
             runner: &R,
             id: &str,
+            role: &str,
             tun_name: &str,
             _assigned: std::net::Ipv4Addr,
             _prefix: u8,
@@ -2179,6 +2287,7 @@ pub mod hostcfg {
 
             let mut cfg = NetConfig {
                 id: id.to_string(),
+                role: role.to_string(),
                 tun_name: tun_name.to_string(),
                 no_route_manage,
                 nft_available: false,
@@ -2230,6 +2339,12 @@ pub mod hostcfg {
                         }
                     }
                     tracing::info!("enabled ip_forward (saved={})", saved);
+
+                    // Write state file so stale_reclaim can restore on SIGKILL
+                    let state_path = ipforward_state_path(id, role);
+                    if let Err(e) = tokio::fs::write(&state_path, format!("{}\n", saved)).await {
+                        tracing::debug!(error = %e, ?state_path, "could not write ip_forward state file (will not recover from SIGKILL); continuing");
+                    }
                 }
 
                 cfg.ip_forward_saved = Some(saved);
@@ -2372,6 +2487,10 @@ pub mod hostcfg {
                                 );
                             }
                         }
+
+                        // Delete state file (best-effort)
+                        let state_path = ipforward_state_path(&self.id, &self.role);
+                        let _ = std::fs::remove_file(&state_path);
                     }
                 }
             }
@@ -2389,6 +2508,7 @@ pub mod hostcfg {
             // the revert commands manually for this test.)
             let cfg = NetConfig {
                 id: "test1".to_string(),
+                role: "listen".to_string(),
                 tun_name: "tun0".to_string(),
                 no_route_manage: false,
                 nft_available: false,
@@ -2437,6 +2557,7 @@ pub mod hostcfg {
             let cfg = NetConfig::apply(
                 &runner,
                 "test1",
+                "listen",
                 "tun0",
                 "192.168.100.1".parse().unwrap(),
                 30,
@@ -2468,6 +2589,7 @@ pub mod hostcfg {
             let cfg = NetConfig::apply(
                 &runner,
                 "test1",
+                "listen",
                 "tun0",
                 "192.168.100.1".parse().unwrap(),
                 30,
@@ -2518,7 +2640,7 @@ pub mod hostcfg {
             let addr: Ipv4Addr = "10.199.0.1".parse().unwrap();
 
             // Stale reclaim in case a previous run crashed.
-            stale_reclaim("test0", name).await;
+            stale_reclaim("test0", "listen", name).await;
 
             let (mut devs, _offload) = create_tun(name, addr, 30, 1350, 1)
                 .await
@@ -2547,6 +2669,69 @@ pub mod hostcfg {
                 !out2.status.success(),
                 "interface {name} still exists after drop"
             );
+        }
+
+        #[test]
+        fn ipforward_state_path_sanitizes_id_and_role() {
+            assert_eq!(
+                ipforward_state_path("test123", "listen"),
+                std::path::PathBuf::from("/run/bore-vpn-test123-listen.ipforward")
+            );
+            assert_eq!(
+                ipforward_state_path("test/123", "listen"),
+                std::path::PathBuf::from("/run/bore-vpn-test_123-listen.ipforward")
+            );
+            assert_eq!(
+                ipforward_state_path("test 123", "connect"),
+                std::path::PathBuf::from("/run/bore-vpn-test_123-connect.ipforward")
+            );
+            assert_eq!(
+                ipforward_state_path("test.123", "listen"),
+                std::path::PathBuf::from("/run/bore-vpn-test_123-listen.ipforward")
+            );
+            assert_eq!(
+                ipforward_state_path("test-123", "listen"),
+                std::path::PathBuf::from("/run/bore-vpn-test-123-listen.ipforward")
+            );
+        }
+
+        #[test]
+        fn ipforward_state_path_distinguishes_id_and_role() {
+            // Different ids → different paths.
+            assert_ne!(
+                ipforward_state_path("id1", "listen"),
+                ipforward_state_path("id2", "listen")
+            );
+            // Same id, different role → different paths. This is the fix for two peers
+            // of one link sharing a host + /run (the netns harness; site↔site): without
+            // it the connector's stale_reclaim would delete the listener's state file.
+            assert_ne!(
+                ipforward_state_path("id1", "listen"),
+                ipforward_state_path("id1", "connect")
+            );
+        }
+
+        #[tokio::test]
+        async fn ipforward_state_file_roundtrip() {
+            let test_dir = std::env::temp_dir().join("bore_test_ipforward");
+            let _ = std::fs::create_dir_all(&test_dir);
+
+            let test_path = test_dir.join("test.ipforward");
+
+            // Write a state file with value 0
+            let _ = std::fs::write(&test_path, "0\n");
+            let content = std::fs::read_to_string(&test_path).expect("failed to read");
+            let value: u8 = content.trim().parse().expect("failed to parse");
+            assert_eq!(value, 0);
+
+            // Write a state file with value 1
+            let _ = std::fs::write(&test_path, "1\n");
+            let content = std::fs::read_to_string(&test_path).expect("failed to read");
+            let value: u8 = content.trim().parse().expect("failed to parse");
+            assert_eq!(value, 1);
+
+            // Clean up
+            let _ = std::fs::remove_file(&test_path);
         }
     }
 }
@@ -3166,6 +3351,50 @@ pub mod bridge {
     /// clean path switch instead of a dead link.
     const UPGRADE_GRACE: Duration = Duration::from_secs(5);
 
+    /// Bridge state machine (warm-relay seamless fallback).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum BridgeMode {
+        Relay,
+        Direct,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum BridgeEvent {
+        RelayDownlinkDied,
+        UplinkDied,
+        UpgradeArrived,
+        DirectDownlinkDied,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum BridgeAction {
+        LinkDead,
+        GoDirect,
+        FallBackToRelay,
+        ReconnectRelayDead,
+        Ignore,
+    }
+
+    /// Pure transition table. `relay_alive` = is the always-on relay downlink still running?
+    fn bridge_next_action(mode: BridgeMode, ev: BridgeEvent, relay_alive: bool) -> BridgeAction {
+        match (mode, ev) {
+            (BridgeMode::Relay, BridgeEvent::RelayDownlinkDied) => BridgeAction::LinkDead,
+            (BridgeMode::Relay, BridgeEvent::UplinkDied) => BridgeAction::LinkDead,
+            (BridgeMode::Relay, BridgeEvent::UpgradeArrived) => BridgeAction::GoDirect,
+            (BridgeMode::Relay, BridgeEvent::DirectDownlinkDied) => BridgeAction::Ignore,
+            (BridgeMode::Direct, BridgeEvent::RelayDownlinkDied) => BridgeAction::Ignore,
+            (BridgeMode::Direct, BridgeEvent::UpgradeArrived) => BridgeAction::Ignore,
+            (BridgeMode::Direct, BridgeEvent::DirectDownlinkDied)
+            | (BridgeMode::Direct, BridgeEvent::UplinkDied) => {
+                if relay_alive {
+                    BridgeAction::FallBackToRelay
+                } else {
+                    BridgeAction::ReconnectRelayDead
+                }
+            }
+        }
+    }
+
     /// Run the VPN data-plane bridge until the link dies or the tun closes.
     ///
     /// Spawns one uplink pump per TUN queue (the kernel hashes flows across
@@ -3183,6 +3412,7 @@ pub mod bridge {
     /// substreams. Relay-only callers pass a channel whose sender is already
     /// dropped: the first `recv()` yields `None` and the upgrade arm is
     /// disabled for good.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         devs: Vec<Arc<tun_rs::AsyncDevice>>,
         sender: LinkSender,
@@ -3191,6 +3421,7 @@ pub mod bridge {
         mtu: u16,
         offload: bool,
         mut upgrade_rx: tokio::sync::mpsc::Receiver<(LinkSender, LinkRecver)>,
+        downgrade_tx: tokio::sync::mpsc::Sender<()>,
     ) -> Result<()> {
         assert!(!devs.is_empty(), "bridge needs at least one TUN queue");
         let stats_task = tokio::spawn({
@@ -3222,18 +3453,17 @@ pub mod bridge {
             }
         });
 
-        /// Spawn one uplink per queue + one downlink; first to die wins.
-        fn spawn_pumps(
+        /// Spawn uplinks only (not downlinks); first to die wins.
+        fn spawn_uplinks(
             devs: &[Arc<tun_rs::AsyncDevice>],
             sender: LinkSender,
-            recver: LinkRecver,
             counters: &Arc<BridgeCounters>,
             mtu: u16,
             offload: bool,
         ) -> Vec<tokio::task::JoinHandle<Result<()>>> {
-            let mut pumps = Vec::with_capacity(devs.len() + 1);
+            let mut uplinks = Vec::with_capacity(devs.len());
             for dev in devs {
-                pumps.push(tokio::spawn(run_uplink(
+                uplinks.push(tokio::spawn(run_uplink(
                     Arc::clone(dev),
                     sender.clone(),
                     Arc::clone(counters),
@@ -3241,82 +3471,152 @@ pub mod bridge {
                     offload,
                 )));
             }
-            pumps.push(tokio::spawn(run_downlink(
-                Arc::clone(&devs[0]),
-                recver,
-                Arc::clone(counters),
-                offload,
-            )));
-            pumps
+            uplinks
         }
 
-        let mut cur = Some((sender, recver));
-        let result = 'outer: loop {
-            let (sender, recver) = cur.take().expect("link halves present at spawn");
-            let mut pumps = spawn_pumps(&devs, sender, recver, &counters, mtu, offload);
+        /// Spawn the relay downlink (always-on for the link lifetime).
+        fn spawn_relay_downlink(
+            devs: &[Arc<tun_rs::AsyncDevice>],
+            relay_recver: LinkRecver,
+            counters: &Arc<BridgeCounters>,
+            offload: bool,
+        ) -> tokio::task::JoinHandle<Result<()>> {
+            tokio::spawn(run_downlink(
+                Arc::clone(&devs[0]),
+                relay_recver,
+                Arc::clone(counters),
+                offload,
+            ))
+        }
 
-            // Stop every pump and WAIT for all of them before reusing the TUN.
-            macro_rules! stop_pumps {
-                () => {{
-                    for p in &pumps {
-                        p.abort();
-                    }
-                    for p in &mut pumps {
-                        // `select_all` above may have already polled one handle
-                        // to completion; awaiting it again would re-poll a
-                        // finished `JoinHandle` and panic. A finished pump has
-                        // already stopped, which is all we need before reusing
-                        // the TUN.
-                        if !p.is_finished() {
-                            let _ = p.await;
-                        }
-                    }
-                }};
-            }
+        /// Spawn the direct downlink (conditional on direct upgrade).
+        fn spawn_direct_downlink(
+            devs: &[Arc<tun_rs::AsyncDevice>],
+            direct_recver: LinkRecver,
+            counters: &Arc<BridgeCounters>,
+            offload: bool,
+        ) -> tokio::task::JoinHandle<Result<()>> {
+            tokio::spawn(run_downlink(
+                Arc::clone(&devs[0]),
+                direct_recver,
+                Arc::clone(counters),
+                offload,
+            ))
+        }
 
-            tokio::select! {
-                (res, _idx, _rest) = futures_util::future::select_all(pumps.iter_mut()) => {
-                    let outcome: Result<()> =
-                        res.unwrap_or_else(|e| Err(anyhow::anyhow!("bridge pump panic: {e}")));
-                    // On pump death, give a queued/imminent upgrade one last
-                    // chance (the peer may have switched to direct first,
-                    // killing our relay). With the channel already closed,
-                    // recv() yields None immediately — no delay.
-                    if let Ok(Some(pair)) =
-                        tokio::time::timeout(UPGRADE_GRACE, upgrade_rx.recv()).await
-                    {
-                        stop_pumps!();
-                        cur = Some(pair);
-                        tracing::info!(
-                            path = "direct",
-                            "relay pump ended during direct upgrade; switching paths",
-                        );
-                        continue 'outer;
-                    }
-                    stop_pumps!();
-                    break 'outer outcome;
+        // Abort and await all handles, skipping any already finished (avoid re-polling completed handles).
+        macro_rules! abort_await {
+            ($handles:expr) => {{
+                for h in &$handles {
+                    h.abort();
                 }
-                maybe = upgrade_rx.recv() => match maybe {
-                    Some(pair) => {
-                        stop_pumps!();
-                        cur = Some(pair);
-                        tracing::info!(path = "direct", "bridge switched to direct path");
-                        continue 'outer;
+                for h in &mut $handles {
+                    if !h.is_finished() {
+                        let _ = h.await;
                     }
-                    None => {
-                        // Upgrade can never happen (relay-only, direct attempt
-                        // over, or already switched); wait for any pump to end.
-                        let (res, _idx, _rest) =
-                            futures_util::future::select_all(pumps.iter_mut()).await;
-                        let outcome: Result<()> =
-                            res.unwrap_or_else(|e| Err(anyhow::anyhow!("bridge pump panic: {e}")));
-                        stop_pumps!();
-                        break 'outer outcome;
+                }
+            }};
+        }
+
+        // Bridge starts on relay. The relay downlink is always-on for the link lifetime:
+        // it idles while on direct (the peer sends nothing on relay) and resumes delivering
+        // the instant the peer falls back — so the RX side never needs switching. Only the
+        // single active uplink set is switched between relay and direct.
+        let relay_sender = sender.clone();
+        let mut relay_dl = spawn_relay_downlink(&devs, recver, &counters, offload);
+        // Once the relay downlink has died we must stop selecting on it: re-polling a
+        // finished `JoinHandle` panics. `relay_dead` both disables its branch and feeds the
+        // `relay_alive` argument of `bridge_next_action`.
+        let mut relay_dead = false;
+        let mut direct_dl: Option<tokio::task::JoinHandle<Result<()>>> = None;
+        let mut uplinks = spawn_uplinks(&devs, relay_sender.clone(), &counters, mtu, offload);
+        let mut mode = BridgeMode::Relay;
+
+        let result: Result<()> = 'outer: loop {
+            tokio::select! {
+                // Relay downlink — disabled once dead (no re-poll of a finished handle).
+                res = &mut relay_dl, if !relay_dead => {
+                    let outcome = res.unwrap_or_else(|e| Err(anyhow::anyhow!("relay downlink panic: {e}")));
+                    match bridge_next_action(mode, BridgeEvent::RelayDownlinkDied, false) {
+                        // On relay the relay recv path is the link → dead.
+                        BridgeAction::LinkDead => break 'outer outcome,
+                        // On direct the warm relay dying is non-fatal; stop watching it. If
+                        // direct also dies later, the fallback sees relay_dead → reconnect.
+                        BridgeAction::Ignore => {
+                            relay_dead = true;
+                            tracing::warn!(path = "direct", "warm relay path died while on direct; will reconnect if direct also fails");
+                        }
+                        _ => unreachable!("relay downlink death yields LinkDead/Ignore only"),
+                    }
+                }
+                // Direct downlink — present only while on direct.
+                res = async { direct_dl.as_mut().unwrap().await }, if direct_dl.is_some() => {
+                    let outcome = res.unwrap_or_else(|e| Err(anyhow::anyhow!("direct downlink panic: {e}")));
+                    direct_dl = None;
+                    match bridge_next_action(mode, BridgeEvent::DirectDownlinkDied, !relay_dead) {
+                        BridgeAction::FallBackToRelay => {
+                            let _ = downgrade_tx.try_send(());
+                            abort_await!(uplinks);
+                            uplinks = spawn_uplinks(&devs, relay_sender.clone(), &counters, mtu, offload);
+                            mode = BridgeMode::Relay;
+                            tracing::warn!(path = "relay", "direct path lost; fell back to relay (link preserved)");
+                        }
+                        // Both paths gone → genuine link death; the reconnect loop handles it.
+                        BridgeAction::ReconnectRelayDead => break 'outer outcome,
+                        _ => unreachable!("direct downlink death yields FallBack/Reconnect only"),
+                    }
+                }
+                // The single active uplink set.
+                (res, _idx, _rest) = futures_util::future::select_all(uplinks.iter_mut()) => {
+                    let outcome = res.unwrap_or_else(|e| Err(anyhow::anyhow!("bridge uplink panic: {e}")));
+                    match bridge_next_action(mode, BridgeEvent::UplinkDied, !relay_dead) {
+                        BridgeAction::LinkDead => {
+                            abort_await!(uplinks);
+                            break 'outer outcome;
+                        }
+                        BridgeAction::FallBackToRelay => {
+                            let _ = downgrade_tx.try_send(());
+                            abort_await!(uplinks);
+                            if let Some(d) = direct_dl.take() {
+                                d.abort();
+                            }
+                            uplinks = spawn_uplinks(&devs, relay_sender.clone(), &counters, mtu, offload);
+                            mode = BridgeMode::Relay;
+                            tracing::warn!(path = "relay", "direct path lost; fell back to relay (link preserved)");
+                        }
+                        BridgeAction::ReconnectRelayDead => {
+                            abort_await!(uplinks);
+                            break 'outer outcome;
+                        }
+                        _ => unreachable!("uplink death yields LinkDead/FallBack/Reconnect only"),
+                    }
+                }
+                // Upgrade channel (relay→direct). The `Some(_)` pattern disables this branch
+                // once the channel closes (relay-only / the direct task ended).
+                Some(pair) = upgrade_rx.recv() => {
+                    match bridge_next_action(mode, BridgeEvent::UpgradeArrived, !relay_dead) {
+                        BridgeAction::GoDirect => {
+                            abort_await!(uplinks);
+                            let (direct_sender, direct_recver) = pair;
+                            uplinks = spawn_uplinks(&devs, direct_sender, &counters, mtu, offload);
+                            direct_dl = Some(spawn_direct_downlink(&devs, direct_recver, &counters, offload));
+                            mode = BridgeMode::Direct;
+                            tracing::info!(path = "direct", "bridge switched to direct path");
+                        }
+                        // Already on direct: drop the spurious upgrade.
+                        BridgeAction::Ignore => {}
+                        _ => unreachable!("upgrade yields GoDirect/Ignore only"),
                     }
                 }
             }
         };
+
         stats_task.abort();
+        relay_dl.abort();
+        if let Some(d) = direct_dl.take() {
+            d.abort();
+        }
+        abort_await!(uplinks);
         result
     }
 
@@ -3521,6 +3821,82 @@ pub mod bridge {
                 assert!(b[..tun_rs::VIRTIO_NET_HDR_LEN].iter().all(|&x| x == 0));
                 assert_eq!(&b[tun_rs::VIRTIO_NET_HDR_LEN..], pkt.as_slice());
             }
+        }
+
+        /// Truth table for the bridge state machine's transition function.
+        #[test]
+        fn bridge_next_action_table() {
+            use super::{bridge_next_action, BridgeAction, BridgeEvent, BridgeMode};
+
+            // Relay mode
+            assert_eq!(
+                bridge_next_action(BridgeMode::Relay, BridgeEvent::RelayDownlinkDied, true),
+                BridgeAction::LinkDead
+            );
+            assert_eq!(
+                bridge_next_action(BridgeMode::Relay, BridgeEvent::RelayDownlinkDied, false),
+                BridgeAction::LinkDead
+            );
+            assert_eq!(
+                bridge_next_action(BridgeMode::Relay, BridgeEvent::UplinkDied, true),
+                BridgeAction::LinkDead
+            );
+            assert_eq!(
+                bridge_next_action(BridgeMode::Relay, BridgeEvent::UplinkDied, false),
+                BridgeAction::LinkDead
+            );
+            assert_eq!(
+                bridge_next_action(BridgeMode::Relay, BridgeEvent::UpgradeArrived, true),
+                BridgeAction::GoDirect
+            );
+            assert_eq!(
+                bridge_next_action(BridgeMode::Relay, BridgeEvent::UpgradeArrived, false),
+                BridgeAction::GoDirect
+            );
+            assert_eq!(
+                bridge_next_action(BridgeMode::Relay, BridgeEvent::DirectDownlinkDied, true),
+                BridgeAction::Ignore
+            );
+            assert_eq!(
+                bridge_next_action(BridgeMode::Relay, BridgeEvent::DirectDownlinkDied, false),
+                BridgeAction::Ignore
+            );
+
+            // Direct mode - relay alive
+            assert_eq!(
+                bridge_next_action(BridgeMode::Direct, BridgeEvent::RelayDownlinkDied, true),
+                BridgeAction::Ignore
+            );
+            assert_eq!(
+                bridge_next_action(BridgeMode::Direct, BridgeEvent::UplinkDied, true),
+                BridgeAction::FallBackToRelay
+            );
+            assert_eq!(
+                bridge_next_action(BridgeMode::Direct, BridgeEvent::UpgradeArrived, true),
+                BridgeAction::Ignore
+            );
+            assert_eq!(
+                bridge_next_action(BridgeMode::Direct, BridgeEvent::DirectDownlinkDied, true),
+                BridgeAction::FallBackToRelay
+            );
+
+            // Direct mode - relay dead
+            assert_eq!(
+                bridge_next_action(BridgeMode::Direct, BridgeEvent::RelayDownlinkDied, false),
+                BridgeAction::Ignore
+            );
+            assert_eq!(
+                bridge_next_action(BridgeMode::Direct, BridgeEvent::UplinkDied, false),
+                BridgeAction::ReconnectRelayDead
+            );
+            assert_eq!(
+                bridge_next_action(BridgeMode::Direct, BridgeEvent::UpgradeArrived, false),
+                BridgeAction::Ignore
+            );
+            assert_eq!(
+                bridge_next_action(BridgeMode::Direct, BridgeEvent::DirectDownlinkDied, false),
+                BridgeAction::ReconnectRelayDead
+            );
         }
     }
 }

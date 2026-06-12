@@ -5,6 +5,7 @@
 ### Model selection per task
 
 Three tiers, each with a clear role. Using the wrong one wastes money or quality.
+Target: **minimize input/output tokens usage**.
 
 **Haiku 4.5** (`claude-haiku`) — fast, cheap ($1/$5 per MTok)
 - Linting, grep-style code search, syntax checks
@@ -28,6 +29,11 @@ Three tiers, each with a clear role. Using the wrong one wastes money or quality
 
 **Rule of thumb**: start with Sonnet. Drop to Haiku for bulk/mechanical sub-tasks.
 Escalate to Opus only when Sonnet output is concretely insufficient.
+
+## Plugins/Skills to use
+
+- Use caveman in ultra mode (`/caveman ultra`)
+- Use caveman plugin for subtsk
 
 ## Agent workflow
 
@@ -95,10 +101,11 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   must keep draining the control stream after `VpnReady` (heartbeats + server-death detection;
   the ctrl actor in `vpn.rs` is the stream's single owner — route new control messages through it)
 - VPN: links start on relay; a background task attempts the direct QUIC upgrade (skipped with
-  `--relay-only`). Path switch = controlled bridge restart (DEC-1: stop pumps, drop relay halves,
-  respawn on Direct). Direct death at runtime kills the bridge → handled by reconnect (DEC-2).
-  Server brokers `UdpPunch` to BOTH sides only when it holds BOTH offers (DEC-3, 10 s timeout →
-  `UdpUnavailable`)
+  `--relay-only`). Path switch = controlled bridge restart (DEC-1: stop pumps, switch uplink set,
+  respawn on Direct). Relay stays WARM for link lifetime; on direct death the bridge falls back to
+  warm relay IN PLACE (no reconnect, TUN preserved, nonce counter preserved — DEC-2: seamless fallback).
+  Full reconnect only if BOTH paths down. Server brokers `UdpPunch` to BOTH sides only when it holds
+  BOTH offers (DEC-3, 10 s timeout → `UdpUnavailable`)
 - VPN AEAD nonce counter is ONE shared `Arc<AtomicU64>` per egress key (I-5/DEC-6): carriers
   and multi-queue clones all `fetch_add` on it — never per-producer counters, never two seals
   with the same `(key, counter)`. Relay carriers round-robin per-datagram (DEC-7, reorder OK);
@@ -107,7 +114,7 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
 - VPN `--carriers`/`--tun-queues` default 1 = byte/path-identical to the single configuration
   (I-9). Carrier count negotiated min(listener, connector, server `--max-carriers`); a dead
   carrier kills the whole link cleanly (reconnect re-establishes), never silent degradation
-- `NetConfig` RAII: all routes/nft/ip_forward changes revert on exit (SIGINT, SIGTERM, panic handled; SIGKILL requires next-run stale reclaim)
+- `NetConfig` RAII: all routes/nft/ip_forward changes revert on exit (SIGINT, SIGTERM, panic handled; SIGKILL requires next-run stale reclaim via /run state file to restore ip_forward and remove leaked iptables/nft rules — BUG-2/BUG-3 fixed)
 - TUN MTU default 1350: clamps QUIC datagram size; gateway MSS-clamp keeps forwarded TCP healthy
 - VPN direct path: a `TooLarge` datagram send is a per-packet DROP, never link death. The TUN MTU
   runs ahead of the QUIC path MTU right after every direct switch, so full-size packets exceed

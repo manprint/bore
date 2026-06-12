@@ -45,30 +45,6 @@ jobs:
           make_latest: "true"
           draft: false
 
-  # Downloads and stores `cross` as an artifact for reuse across the build jobs.
-  install-cross:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 50
-
-      - uses: XAMPPRocky/get-github-release@v1
-        id: cross
-        with:
-          owner: rust-embedded
-          repo: cross
-          matches: ${{ matrix.platform }}
-          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cross-${{ matrix.platform }}
-          path: ${{ steps.cross.outputs.install_path }}
-    strategy:
-      matrix:
-        platform: [linux-musl]
-
   macos:
     runs-on: macos-latest
     needs: create-release
@@ -119,7 +95,7 @@ jobs:
 
   linux:
     runs-on: ubuntu-latest
-    needs: [install-cross, create-release]
+    needs: create-release
     strategy:
       matrix:
         target:
@@ -137,14 +113,12 @@ jobs:
         id: ver
         run: bash ci/version.bash
 
-      - uses: actions/download-artifact@v4
+      - uses: taiki-e/install-action@v2
         with:
-          name: cross-linux-musl
-          path: /tmp/
-      - run: chmod +x /tmp/cross
+          tool: cross
 
       - run: ci/set_rust_version.bash stable ${{ matrix.target }}
-      - run: ci/build.bash /tmp/cross ${{ matrix.target }} RELEASE
+      - run: ci/build.bash cross ${{ matrix.target }} RELEASE
       - name: Package | Compressed archive
         run: tar -czvf "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz" --directory=target/${{ matrix.target }}/release ${{ env.BIN }}
 
@@ -162,7 +136,7 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    needs: [install-cross, create-release]
+    needs: create-release
     strategy:
       matrix:
         target:

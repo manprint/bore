@@ -146,5 +146,34 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   (`vpn_netns_test.sh`) refuses to run against a release binary older than `src/` — rebuild with
   `cargo build --release --features vpn` (as your user, not root) before `sudo`-running it
 
+**VPN multi-client (hub-and-spoke, `--max-clients N>1`) — `mod hub` in `vpn.rs` + `vpn_server.rs`:**
+- I-MC1: `--max-clients 1` (default) is byte-for-byte the legacy 1:1 path. Hub mode is a SEPARATE
+  early branch (`run_listen_hub`); never edit the 1:1 path to add hub behavior. Hub requires server
+  pool addressing (no static /30); connector `--advertise` is rejected by the server (D4).
+- Server keeps the listener registry entry ALIVE in hub mode (`VpnProviderEntry.hub: Option<HubShared>`,
+  `pair_tx` is None); each connector allocates a host addr + monotonic `peer_id` from `HubState`,
+  pushes `HubPeerEvent::Join/Leave/Punch` to the hub via an mpsc, and is relayed with a `peer_id`
+  injected: server→hub framing is `[STREAM_READY, peer_id u32 BE]` then the connector's verbatim
+  `[tag, idx?, payload]` (`vpn_relay_hub`). Connector→server bytes are UNCHANGED (I-MC2).
+- Hub data plane: ONE TUN; a shared **router uplink** routes by dst IPv4 → per-peer swappable
+  `Mutex<LinkSender>`; one downlink per peer writes the shared TUN (writes are packet-atomic).
+  The router NEVER restarts on a path switch — the per-peer direct upgrade swaps the sender IN PLACE
+  and keeps the relay downlink WARM for seamless fallback (I-MC5/DEC-2), exactly per-peer.
+- Each peer derives its OWN keys from its OWN `session_nonce` (passed RAW, UDP_NONCE_LEN bytes — never
+  padded/resized, or HKDF inputs diverge and the AEAD keys won't match) with its OWN shared nonce
+  counter (I-MC4 — never shared across peers).
+- Spoke isolation (D2): `iifname bore0 oifname bore0 drop`, added by `NetConfig::apply(.., hub=true)`
+  in gateway mode. A HOST-ONLY hub (no `--advertise`) currently relies on the host `ip_forward=0`
+  for isolation (no nft table is created) — a known v1 gap if the host forwards by default.
+- Connector route policy is DEFAULT-DENY (I-MC8): `routes::filter_accepted(advertised, accept_all,
+  refuse_all, accept, refuse)` with exact-or-subset matching (a flag CIDR must equal or be a SUPERNET
+  of an advertised CIDR — `flag.prefix <= adv.prefix && flag.contains(adv.network())`). This also
+  changed the 1:1 connector default: existing netns site-to-host tests pass `--accept-all-routes`.
+- TRAP: a hub helper that only `tokio::spawn`s must NOT be an `async fn` unless the call site awaits
+  it — an unawaited future never runs (this silently killed the whole relay accept path once).
+- Full 5-host scenario + per-peer direct/relay/fallback are covered by T-HUB*/T-HUBD*/T-SCEN-* in
+  `vpn_netns_test.sh` (run on BOTH relay and direct). NOPASSWD sudo is per-EXACT-path: invoke
+  `sudo -n /abs/path/scripts/vpn_netns_test.sh` (NOT `sudo bash scripts/...`, which prompts).
+
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

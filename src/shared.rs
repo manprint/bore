@@ -371,6 +371,9 @@ pub struct UdpCandidateOffer {
     /// STUN host:port selected by this peer, if a STUN probe succeeded.
     #[serde(default)]
     pub selected_stun: Option<String>,
+    /// Hub mode: which peer this offer is for; 0 in 1:1.
+    #[serde(default)]
+    pub peer_id: u32,
 }
 
 /// Bandwidth-oriented tuning for the direct UDP path.
@@ -472,10 +475,11 @@ impl UdpTestPeerSummary {
 impl UdpCandidateOffer {
     fn control_frame_summary(&self) -> String {
         format!(
-            "selected_stun={}, candidate_count={}, candidates={:?}",
+            "selected_stun={}, candidate_count={}, candidates={:?}, peer_id={}",
             self.selected_stun.as_deref().unwrap_or("<none>"),
             self.candidates.len(),
             self.candidates,
+            self.peer_id,
         )
     }
 }
@@ -693,6 +697,9 @@ pub enum ClientMessage {
         /// Number of relay carrier connections (always 1 in v1; field reserved for v2).
         #[serde(default)]
         carriers: u16,
+        /// Max concurrent connectors (hub mode). 0/absent → treated as 1 = legacy 1:1.
+        #[serde(default)]
+        max_clients: u16,
     },
 
     /// Connect as the connector for a VPN link id.
@@ -769,6 +776,9 @@ pub enum ServerMessage {
         /// Direct-UDP transport tuning requested by the server.
         #[serde(default)]
         tuning: UdpDirectTuning,
+        /// Hub mode: which peer this punch belongs to; 0 in 1:1.
+        #[serde(default)]
+        peer_id: u32,
     },
 
     /// Provider-selected STUN server hint returned to a consumer before it
@@ -858,6 +868,27 @@ pub enum ServerMessage {
 
     /// VPN pairing failed (duplicate id, pool exhausted, overlap, etc.).
     VpnError(String),
+
+    /// A new connector joined the hub (hub mode only, server → listener).
+    /// Sent after the connector is fully paired and ready to accept data substreams.
+    VpnPeerJoin {
+        /// Hub-assigned peer identifier (monotonic within a hub session).
+        peer_id: u32,
+        /// This peer's overlay address.
+        peer_overlay: std::net::Ipv4Addr,
+        /// CIDRs this peer exposes (empty = host-only; connectors don't advertise in v1).
+        peer_advertised: Vec<Ipv4Net>,
+        /// Seeds the AEAD key derivation for this peer's relay streams.
+        session_nonce: [u8; UDP_NONCE_LEN],
+        /// Number of relay carrier substream pairs for this peer (negotiated min).
+        carriers: u16,
+    },
+
+    /// A peer disconnected from the hub (hub mode only, server → listener).
+    VpnPeerLeave {
+        /// The peer's identifier (from the matching VpnPeerJoin).
+        peer_id: u32,
+    },
 }
 
 #[doc(hidden)]
@@ -946,14 +977,16 @@ impl ControlFrameSummary for ClientMessage {
                 addr,
                 notes,
                 carriers,
+                max_clients,
             } => {
                 format!(
-                    "HelloVpn {{ id={}, advertised={:?}, addr={:?}, notes={}, carriers={} }}",
+                    "HelloVpn {{ id={}, advertised={:?}, addr={:?}, notes={}, carriers={}, max_clients={} }}",
                     id,
                     advertised,
                     addr,
                     if notes.is_some() { "present" } else { "none" },
                     carriers,
+                    max_clients,
                 )
             }
             ClientMessage::ConnectVpn {
@@ -997,13 +1030,15 @@ impl ControlFrameSummary for ServerMessage {
                 peer,
                 peer_selected_stun,
                 tuning,
+                peer_id,
             } => {
                 format!(
-                    "UdpPunch {{ nonce={}, peer={:?}, peer_selected_stun={}, tuning={{ {} }} }}",
+                    "UdpPunch {{ nonce={}, peer={:?}, peer_selected_stun={}, tuning={{ {} }}, peer_id={} }}",
                     hex::encode(nonce),
                     peer,
                     peer_selected_stun.as_deref().unwrap_or("<none>"),
                     tuning.control_frame_summary(),
+                    peer_id,
                 )
             }
             ServerMessage::UdpStunHint { stun_server } => {
@@ -1078,6 +1113,25 @@ impl ControlFrameSummary for ServerMessage {
             }
             ServerMessage::VpnError(msg) => {
                 format!("VpnError {{ message={} }}", msg)
+            }
+            ServerMessage::VpnPeerJoin {
+                peer_id,
+                peer_overlay,
+                peer_advertised,
+                session_nonce,
+                carriers,
+            } => {
+                format!(
+                    "VpnPeerJoin {{ peer_id={}, peer_overlay={}, peer_advertised={:?}, session_nonce={}, carriers={} }}",
+                    peer_id,
+                    peer_overlay,
+                    peer_advertised,
+                    hex::encode(session_nonce),
+                    carriers,
+                )
+            }
+            ServerMessage::VpnPeerLeave { peer_id } => {
+                format!("VpnPeerLeave {{ peer_id={} }}", peer_id)
             }
         }
     }
@@ -1193,6 +1247,7 @@ mod tests {
                 peer,
                 peer_selected_stun,
                 tuning,
+                peer_id: _,
             } => {
                 assert_eq!(nonce, [0; UDP_NONCE_LEN]);
                 assert_eq!(peer, vec!["127.0.0.1:3478".parse().unwrap()]);
@@ -1413,6 +1468,7 @@ fn serde_roundtrip_vpn_messages() {
         addr: VpnAddrRequest::Pool,
         notes: None,
         carriers: 1,
+        max_clients: 0,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let back: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -1460,4 +1516,81 @@ fn ipv4net_overlaps() {
     let d: Ipv4Net = "192.168.0.0/30".parse().unwrap();
     let e: Ipv4Net = "192.168.0.4/30".parse().unwrap();
     assert!(!d.overlaps(&e));
+}
+
+#[test]
+fn hello_vpn_serde_roundtrip_with_and_without_max_clients() {
+    // Test legacy payload without max_clients deserializes to 0
+    let json =
+        r#"{"HelloVpn":{"id":"test","advertised":[],"addr":"Pool","notes":null,"carriers":1}}"#;
+    let msg: ClientMessage = serde_json::from_str(json).unwrap();
+    if let ClientMessage::HelloVpn { max_clients, .. } = msg {
+        assert_eq!(max_clients, 0);
+    } else {
+        panic!("unexpected variant");
+    }
+
+    // Test roundtrip with max_clients set
+    let msg = ClientMessage::HelloVpn {
+        id: "hub1".to_string(),
+        advertised: vec!["192.168.0.0/24".parse().unwrap()],
+        addr: VpnAddrRequest::Pool,
+        notes: Some("test hub".to_string()),
+        carriers: 2,
+        max_clients: 4,
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let back: ClientMessage = serde_json::from_str(&json).unwrap();
+    if let ClientMessage::HelloVpn { max_clients, .. } = back {
+        assert_eq!(max_clients, 4);
+    } else {
+        panic!("unexpected variant");
+    }
+}
+
+#[test]
+fn vpn_peer_join_leave_serde_roundtrip() {
+    let msg = ServerMessage::VpnPeerJoin {
+        peer_id: 1,
+        peer_overlay: "10.99.0.2".parse().unwrap(),
+        peer_advertised: vec!["192.168.0.0/24".parse().unwrap()],
+        session_nonce: [1u8; UDP_NONCE_LEN],
+        carriers: 2,
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let back: ServerMessage = serde_json::from_str(&json).unwrap();
+    if let ServerMessage::VpnPeerJoin { peer_id, .. } = back {
+        assert_eq!(peer_id, 1);
+    } else {
+        panic!("unexpected variant");
+    }
+
+    let msg = ServerMessage::VpnPeerLeave { peer_id: 2 };
+    let json = serde_json::to_string(&msg).unwrap();
+    let back: ServerMessage = serde_json::from_str(&json).unwrap();
+    if let ServerMessage::VpnPeerLeave { peer_id } = back {
+        assert_eq!(peer_id, 2);
+    } else {
+        panic!("unexpected variant");
+    }
+}
+
+#[test]
+fn udp_punch_peer_id_default_zero() {
+    // Test legacy UdpPunch JSON without peer_id deserializes to 0
+    let json = r#"{"UdpPunch":{"nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"peer":[],"peer_selected_stun":null,"tuning":{"stream_receive_window":0,"connection_receive_window":0,"send_window":0,"udp_socket_recv_buffer":0,"udp_socket_send_buffer":0,"max_direct_streams":0}}}"#;
+    let msg: ServerMessage = serde_json::from_str(json).unwrap();
+    if let ServerMessage::UdpPunch { peer_id, .. } = msg {
+        assert_eq!(peer_id, 0);
+    } else {
+        panic!("unexpected variant");
+    }
+}
+
+#[test]
+fn udp_candidate_offer_peer_id_default_zero() {
+    // Test legacy UdpCandidateOffer JSON without peer_id deserializes to 0
+    let json = r#"{"candidates":[],"selected_stun":null}"#;
+    let offer: UdpCandidateOffer = serde_json::from_str(json).unwrap();
+    assert_eq!(offer.peer_id, 0);
 }

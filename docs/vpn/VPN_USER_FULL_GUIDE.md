@@ -323,7 +323,18 @@ ping 192.168.60.1
 
 ### `bore vpn connect`
 
-Identical flag set to `bore vpn listen`. The only semantic difference: the connector role determines which address (`listener.1` vs `connector.2`) the server assigns in pool mode, and the connector triggers the pairing on the server.
+Identical flag set to `bore vpn listen`, with additional route filtering flags:
+
+| Flag | Env var | Type | Default | Description |
+|------|---------|------|---------|-------------|
+| `--accept-routes` | — | `CIDR[,CIDR...]` | — | Accept only these advertised routes (subset matching; default: none) |
+| `--accept-all-routes` | — | flag | — | Accept every route the listener advertises |
+| `--refuse-routes` | — | `CIDR[,CIDR...]` | — | Exclude these routes from the accepted set (used with `--accept-all-routes`) |
+| `--refuse-all-routes` | — | flag | — | Accept nothing; reach only the listener's overlay IP (explicit for clarity) |
+
+**Route filtering behavior:** When no flag is specified, the connector accepts **no advertised routes by default**—it reaches only the listener's overlay IP (host-only mode). Use `--accept-all-routes` to enable site-to-host gateway mode. Exact-or-subset matching: a refuse/accept rule removes/keeps any advertised CIDR that equals or contains the rule CIDR.
+
+**Role difference:** the connector role determines which address (`listener.1` vs `connector.2`) the server assigns in pool mode, and the connector triggers the pairing on the server.
 
 ### `bore server` (VPN-related flags)
 

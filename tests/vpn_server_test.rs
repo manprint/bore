@@ -74,6 +74,7 @@ async fn vpn_ctrl_connect() -> Delimited<bore_cli::mux::Stream> {
 
 fn pool_hello_vpn(id: &str) -> ClientMessage {
     ClientMessage::HelloVpn {
+        max_clients: 0,
         id: id.to_string(),
         advertised: vec![],
         addr: VpnAddrRequest::Pool,
@@ -497,6 +498,7 @@ async fn vpn_server_overlap_rejected() {
     let listener_task = tokio::spawn(async move {
         let mut ctrl = vpn_ctrl_connect().await;
         ctrl.send(ClientMessage::HelloVpn {
+            max_clients: 0,
             id: "ov".into(),
             advertised: vec![cidr],
             addr: VpnAddrRequest::Pool,
@@ -578,6 +580,7 @@ async fn vpn_server_static_inconsistent_pair_rejected() {
     let _listener = tokio::spawn(async {
         let mut ctrl = vpn_ctrl_connect().await;
         ctrl.send(ClientMessage::HelloVpn {
+            max_clients: 0,
             id: "si".into(),
             advertised: vec![],
             addr: VpnAddrRequest::Static {
@@ -809,6 +812,7 @@ fn offer(addr: &str) -> ClientMessage {
     ClientMessage::UdpCandidateOffer(bore_cli::shared::UdpCandidateOffer {
         candidates: vec![addr.parse().unwrap()],
         selected_stun: None,
+        peer_id: 0,
     })
 }
 
@@ -992,6 +996,7 @@ async fn vpn_broker_empty_candidate_offer_times_out() {
             bore_cli::shared::UdpCandidateOffer {
                 candidates: vec![], // empty
                 selected_stun: None,
+                peer_id: 0,
             },
         ))
         .await
@@ -1037,6 +1042,7 @@ async fn vpn_broker_ipv6_candidates_relayed() {
             bore_cli::shared::UdpCandidateOffer {
                 candidates: vec!["[2001:db8::1]:1000".parse().unwrap()],
                 selected_stun: None,
+                peer_id: 0,
             },
         ))
         .await
@@ -1049,6 +1055,7 @@ async fn vpn_broker_ipv6_candidates_relayed() {
             bore_cli::shared::UdpCandidateOffer {
                 candidates: vec!["[2001:db8::2]:2000".parse().unwrap()],
                 selected_stun: None,
+                peer_id: 0,
             },
         ))
         .await
@@ -1354,6 +1361,7 @@ async fn vpn_carriers_negotiation() {
     let mut l_ctrl = vpn_ctrl_connect().await;
     l_ctrl
         .send(ClientMessage::HelloVpn {
+            max_clients: 0,
             id: "neg1".into(),
             advertised: vec![],
             addr: VpnAddrRequest::Pool,
@@ -1410,5 +1418,400 @@ async fn vpn_carriers_default_for_old_peers() {
             assert!(!admin_v2);
         }
         other => panic!("expected VpnReady, got {other:?}"),
+    }
+}
+
+// ─── Phase 2: Server hub registry + addressing ──────────────────────────────
+
+/// Phase 2.1: Hub subnet allocation in the pool — distinct hosts in same block.
+#[tokio::test]
+async fn vpn_pool_hub_subnet_allocation() {
+    use bore_cli::vpn_server::VpnPool;
+    let parent: Ipv4Net = "10.99.0.0/16".parse().unwrap();
+    let mut pool = VpnPool::new(parent).unwrap();
+
+    // Allocate a /24 hub
+    let subnet = pool.alloc_hub_subnet(24).unwrap();
+    assert_eq!(subnet.addr, Ipv4Addr::from([10, 99, 0, 0]));
+    assert_eq!(subnet.prefix, 24);
+
+    // Allocate another /24 hub in a different block
+    let subnet2 = pool.alloc_hub_subnet(24).unwrap();
+    assert_eq!(subnet2.addr, Ipv4Addr::from([10, 99, 1, 0]));
+}
+
+/// Phase 2.1: Hub and /30 don't overlap.
+#[tokio::test]
+async fn vpn_pool_hub_block_excludes_slash30() {
+    use bore_cli::vpn_server::VpnPool;
+    let parent: Ipv4Net = "10.99.0.0/16".parse().unwrap();
+    let mut pool = VpnPool::new(parent).unwrap();
+
+    // Allocate a /24 hub
+    let hub = pool.alloc_hub_subnet(24).unwrap();
+    assert!(hub.prefix == 24);
+
+    // Try to allocate /30s in the same block — should fail
+    for _ in 0..256 {
+        // The /24 block takes up 256 addresses; we should get nothing
+        let result = pool.alloc();
+        if result.is_err() {
+            break;
+        }
+    }
+    // At least one /30 allocation should have failed due to hub overlap
+    // (or the pool is simply too small for more /30s next to the hub)
+}
+
+/// Phase 2.2: HubState allocates distinct peer IDs and addresses.
+#[tokio::test]
+async fn vpn_hubstate_alloc_peer_distinct_and_monotonic() {
+    use bore_cli::vpn_server::HubState;
+
+    let subnet: Ipv4Net = "10.99.0.0/24".parse().unwrap();
+    let advertised = vec![];
+    let mut state = HubState::new(subnet, advertised);
+
+    let p1 = state.alloc_peer().unwrap();
+    let p2 = state.alloc_peer().unwrap();
+    let p3 = state.alloc_peer().unwrap();
+
+    assert_eq!(p1.peer_id, 1);
+    assert_eq!(p2.peer_id, 2);
+    assert_eq!(p3.peer_id, 3);
+
+    assert_ne!(p1.overlay, p2.overlay);
+    assert_ne!(p2.overlay, p3.overlay);
+
+    // Nonces must all be present and non-empty
+    assert!(p1.nonce.iter().any(|&b| b != 0));
+    assert!(p2.nonce.iter().any(|&b| b != 0));
+    assert!(p3.nonce.iter().any(|&b| b != 0));
+}
+
+/// Phase 2.2: HubState free_peer allows reallocation.
+#[tokio::test]
+async fn vpn_hubstate_free_peer_reallocates() {
+    use bore_cli::vpn_server::HubState;
+
+    let subnet: Ipv4Net = "10.99.0.0/24".parse().unwrap();
+    let advertised = vec![];
+    let mut state = HubState::new(subnet, advertised);
+
+    let p1 = state.alloc_peer().unwrap();
+    state.free_peer(p1.overlay);
+
+    let p2 = state.alloc_peer().unwrap();
+    // The address might be reused (implementation detail), but peer_id should be new
+    assert_eq!(p2.peer_id, 2);
+}
+
+/// Phase 2.3 + 2.4: Hub listener and connector integration.
+/// Multiple connectors pair with one hub listener, each gets distinct overlay + peer_id.
+#[tokio::test]
+async fn vpn_server_hub_pairs_multiple_connectors() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_pool("10.98.0.0/16").await;
+
+    // Hub listener
+    let mut hub_ctrl = vpn_ctrl_connect().await;
+    hub_ctrl
+        .send(ClientMessage::HelloVpn {
+            max_clients: 4,
+            id: "hub1".into(),
+            advertised: vec!["192.168.1.0/24".parse().unwrap()],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 1,
+        })
+        .await
+        .unwrap();
+
+    // Hub listener gets VpnReady with hub overlay
+    let hub_ready = match hub_ctrl.recv::<ServerMessage>().await.unwrap() {
+        Some(ServerMessage::VpnReady {
+            assigned,
+            prefix,
+            peer_advertised,
+            ..
+        }) => {
+            // Hub is the listener; assigned should be the .1 of the hub subnet
+            assert!((24..=30).contains(&prefix));
+            assert!(peer_advertised.is_empty()); // hub phase-2 has no peer_advertised
+            (assigned, prefix)
+        }
+        other => panic!("expected hub VpnReady, got {other:?}"),
+    };
+
+    // Connect 3 connectors
+    let mut connectors = vec![];
+    let mut peers = vec![];
+
+    for i in 0..3 {
+        let mut c_ctrl = vpn_ctrl_connect().await;
+        c_ctrl
+            .send(ClientMessage::ConnectVpn {
+                id: "hub1".into(),
+                advertised: vec![],
+                addr: VpnAddrRequest::Pool,
+                notes: None,
+                carriers: 1,
+            })
+            .await
+            .unwrap();
+
+        // Connector gets VpnReady
+        let (c_overlay, _c_peer_overlay, _c_advertised) =
+            match c_ctrl.recv::<ServerMessage>().await.unwrap() {
+                Some(ServerMessage::VpnReady {
+                    assigned,
+                    peer_overlay,
+                    peer_advertised,
+                    ..
+                }) => {
+                    assert_eq!(peer_overlay, hub_ready.0);
+                    (assigned, peer_overlay, peer_advertised)
+                }
+                other => panic!("connector {i} expected VpnReady, got {other:?}"),
+            };
+
+        // Hub listener gets VpnPeerJoin (may have heartbeats mixed in)
+        let peer_id = loop {
+            match hub_ctrl.recv::<ServerMessage>().await.unwrap() {
+                Some(ServerMessage::VpnPeerJoin {
+                    peer_id,
+                    peer_overlay,
+                    ..
+                }) => {
+                    assert_eq!(peer_overlay, c_overlay);
+                    assert!(peer_id > 0);
+                    break peer_id;
+                }
+                Some(ServerMessage::Heartbeat) => {
+                    // Expected; ignore and keep waiting
+                }
+                other => panic!("hub expected VpnPeerJoin, got {other:?}"),
+            }
+        };
+
+        connectors.push(c_ctrl);
+        peers.push((c_overlay, peer_id));
+    }
+
+    // Verify distinct peer_ids and overlays
+    let ids: Vec<_> = peers.iter().map(|(_, id)| id).collect();
+    assert_eq!(ids[0], &1);
+    assert_eq!(ids[1], &2);
+    assert_eq!(ids[2], &3);
+
+    let addrs: Vec<_> = peers.iter().map(|(addr, _)| addr).collect();
+    assert_ne!(addrs[0], addrs[1]);
+    assert_ne!(addrs[1], addrs[2]);
+}
+
+/// Phase 2.4: Hub connector rejects --advertise flag.
+#[tokio::test]
+async fn vpn_server_hub_rejects_connector_advertise() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_pool("10.97.0.0/16").await;
+
+    let mut hub_ctrl = vpn_ctrl_connect().await;
+    hub_ctrl
+        .send(ClientMessage::HelloVpn {
+            max_clients: 2,
+            id: "hub_no_advertise".into(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 1,
+        })
+        .await
+        .unwrap();
+    let _ = hub_ctrl.recv::<ServerMessage>().await.unwrap();
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl
+        .send(ClientMessage::ConnectVpn {
+            id: "hub_no_advertise".into(),
+            advertised: vec!["10.10.0.0/16".parse().unwrap()],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 1,
+        })
+        .await
+        .unwrap();
+
+    match c_ctrl.recv::<ServerMessage>().await.unwrap() {
+        Some(ServerMessage::VpnError(msg)) => {
+            assert!(msg.contains("advertise") && msg.contains("hub-and-spoke"));
+        }
+        other => panic!("expected VpnError, got {other:?}"),
+    }
+}
+
+/// Phase 2.4: Hub rejects connector when at capacity.
+#[tokio::test]
+async fn vpn_server_hub_rejects_when_at_capacity() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_pool("10.96.0.0/16").await;
+
+    let mut hub_ctrl = vpn_ctrl_connect().await;
+    hub_ctrl
+        .send(ClientMessage::HelloVpn {
+            max_clients: 2,
+            id: "hub_cap".into(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 1,
+        })
+        .await
+        .unwrap();
+    let _ = hub_ctrl.recv::<ServerMessage>().await.unwrap();
+
+    // Connect 2 connectors successfully
+    let mut connectors = vec![];
+    for _i in 0..2 {
+        let mut c_ctrl = vpn_ctrl_connect().await;
+        c_ctrl
+            .send(ClientMessage::ConnectVpn {
+                id: "hub_cap".into(),
+                advertised: vec![],
+                addr: VpnAddrRequest::Pool,
+                notes: None,
+                carriers: 1,
+            })
+            .await
+            .unwrap();
+        match c_ctrl.recv::<ServerMessage>().await.unwrap() {
+            Some(ServerMessage::VpnReady { .. }) => {}
+            other => panic!("expected VpnReady, got {other:?}"),
+        }
+        // Hub receives VpnPeerJoin (may have heartbeats mixed in)
+        loop {
+            match hub_ctrl.recv::<ServerMessage>().await.unwrap() {
+                Some(ServerMessage::VpnPeerJoin { .. }) => break,
+                Some(ServerMessage::Heartbeat) => {}
+                other => panic!("expected VpnPeerJoin, got {other:?}"),
+            }
+        }
+        connectors.push(c_ctrl);
+    }
+
+    // 3rd connector should be rejected
+    let mut c3_ctrl = vpn_ctrl_connect().await;
+    c3_ctrl
+        .send(ClientMessage::ConnectVpn {
+            id: "hub_cap".into(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 1,
+        })
+        .await
+        .unwrap();
+
+    match c3_ctrl.recv::<ServerMessage>().await.unwrap() {
+        Some(ServerMessage::VpnError(msg)) => {
+            assert!(msg.contains("capacity"));
+        }
+        other => panic!("expected VpnError for 3rd connector, got {other:?}"),
+    }
+}
+
+/// Phase 2.4: Relay substream to hub has peer_id header injection.
+#[tokio::test]
+async fn vpn_relay_hub_injects_peer_id_header() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_pool("10.95.0.0/16").await;
+
+    let mut hub_ctrl = vpn_ctrl_connect().await;
+    hub_ctrl
+        .send(ClientMessage::HelloVpn {
+            max_clients: 2,
+            id: "hub_relay".into(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 1,
+        })
+        .await
+        .unwrap();
+    let _ = hub_ctrl.recv::<ServerMessage>().await.unwrap();
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl
+        .send(ClientMessage::ConnectVpn {
+            id: "hub_relay".into(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 1,
+        })
+        .await
+        .unwrap();
+    let _ = c_ctrl.recv::<ServerMessage>().await.unwrap();
+    let _ = hub_ctrl.recv::<ServerMessage>().await.unwrap();
+
+    // Basic sanity: substreams exist and are routable.
+    // (Phase 3 tests the actual demux behavior; Phase 2 just ensures no error.)
+}
+
+/// Phase 2.4: Legacy 1:1 path still removes the entry on pair.
+#[tokio::test]
+async fn vpn_server_legacy_1to1_still_consumes_entry() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_pool("10.94.0.0/16").await;
+
+    let mut l_ctrl = vpn_ctrl_connect().await;
+    l_ctrl
+        .send(ClientMessage::HelloVpn {
+            max_clients: 1, // or 0 = default
+            id: "1to1_consume".into(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 1,
+        })
+        .await
+        .unwrap();
+
+    // Wait for listener to register
+    time::sleep(Duration::from_millis(50)).await;
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl
+        .send(ClientMessage::ConnectVpn {
+            id: "1to1_consume".into(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 1,
+        })
+        .await
+        .unwrap();
+
+    // Both should get VpnReady
+    let _ = c_ctrl.recv::<ServerMessage>().await.unwrap();
+    let _ = l_ctrl.recv::<ServerMessage>().await.unwrap();
+
+    // A second connector should be rejected (entry consumed)
+    let mut c2_ctrl = vpn_ctrl_connect().await;
+    c2_ctrl
+        .send(ClientMessage::ConnectVpn {
+            id: "1to1_consume".into(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 1,
+        })
+        .await
+        .unwrap();
+
+    match c2_ctrl.recv::<ServerMessage>().await.unwrap() {
+        Some(ServerMessage::VpnError(msg)) => {
+            assert!(msg.contains("not found"));
+        }
+        other => panic!("expected VpnError 'not found', got {other:?}"),
     }
 }

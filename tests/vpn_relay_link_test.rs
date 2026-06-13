@@ -119,6 +119,7 @@ async fn vpn_relay_link_bulk_bidirectional_no_wedge() {
     let mut l_ctrl = Delimited::new(l_opener.open().await.unwrap());
     l_ctrl
         .send(ClientMessage::HelloVpn {
+            max_clients: 0,
             id: "relay-link".into(),
             advertised: vec![],
             addr: VpnAddrRequest::Pool,
@@ -226,6 +227,7 @@ async fn pair_multi(
     let mut l_ctrl = Delimited::new(l_opener.open().await.unwrap());
     l_ctrl
         .send(ClientMessage::HelloVpn {
+            max_clients: 0,
             id: id.to_string(),
             advertised: vec![],
             addr: VpnAddrRequest::Pool,
@@ -324,6 +326,7 @@ async fn vpn_relay_multi_carrier_one_stream_dies() {
     let mut l_ctrl = Delimited::new(l_opener.open().await.unwrap());
     l_ctrl
         .send(ClientMessage::HelloVpn {
+            max_clients: 0,
             id: "die1".into(),
             advertised: vec![],
             addr: VpnAddrRequest::Pool,

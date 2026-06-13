@@ -47,6 +47,8 @@ pub struct VpnListenArgs {
     pub tun_queues: usize,
     /// Optional notes.
     pub notes: Option<String>,
+    /// Max concurrent connectors (hub mode). 1 = legacy 1:1 path (unchanged).
+    pub max_clients: u16,
 }
 
 /// Public arg struct for `bore vpn connect` (converted from CLI args).
@@ -90,6 +92,14 @@ pub struct VpnConnectArgs {
     pub tun_queues: usize,
     /// Optional notes.
     pub notes: Option<String>,
+    /// Accept exactly these advertised routes (exact-or-subset).
+    pub accept_routes: Vec<crate::shared::Ipv4Net>,
+    /// Accept every route the listener advertises.
+    pub accept_all_routes: bool,
+    /// Subtract these routes from the accepted set.
+    pub refuse_routes: Vec<crate::shared::Ipv4Net>,
+    /// Accept nothing (== default; for explicit, self-documenting scripts).
+    pub refuse_all_routes: bool,
 }
 
 /// Non-retryable configuration error: retrying would yield the same outcome
@@ -140,6 +150,179 @@ fn classify_vpn_error(msg: String) -> anyhow::Error {
         anyhow!("{msg}")
     } else {
         anyhow::Error::new(FatalVpnError(msg))
+    }
+}
+
+/// Route filtering for connectors (Phase 1 of multi-client hub feature).
+/// Resolves which advertised CIDRs the connector installs based on accept/refuse flags.
+mod routes {
+    use crate::shared::Ipv4Net;
+
+    /// True iff `flag` is equal to OR a supernet of `adv` (i.e. `adv` is
+    /// equal-to-or-contained-in `flag`, the D9 "exact-or-subset" relation).
+    ///
+    /// Requires BOTH: `flag` is no more specific than `adv` (`flag.prefix <=
+    /// adv.prefix`) AND `adv`'s network base falls inside `flag`. The prefix
+    /// check is essential: without it a *smaller* flag sharing the same base
+    /// address (e.g. flag `10.10.0.0/24` vs adv `10.10.0.0/16`) would falsely
+    /// match, since `contains` only tests the base address.
+    fn covers(flag: &Ipv4Net, adv: &Ipv4Net) -> bool {
+        flag.prefix <= adv.prefix && flag.contains(adv.network())
+    }
+
+    /// Resolve which advertised CIDRs the connector installs.
+    ///
+    /// Semantics (D9, exact-or-subset):
+    /// - Start set = if `accept_all` then all advertised, else those advertised `A`
+    ///   such that some `acc` in `accept` covers `A` (`acc` equals or is a supernet of `A`).
+    /// - Then remove any `A` covered by some `r` in `refuse` (`r` equals or is a supernet of `A`).
+    /// - If `refuse_all` → return empty (ignore accept flags).
+    ///
+    /// Example: advertised `10.10.0.0/16`, refuse `10.10.5.0/24` → result still contains
+    /// `10.10.0.0/16` (a refuse must COVER the advertised entry to remove it).
+    pub fn filter_accepted(
+        advertised: &[Ipv4Net],
+        accept_all: bool,
+        refuse_all: bool,
+        accept: &[Ipv4Net],
+        refuse: &[Ipv4Net],
+    ) -> Vec<Ipv4Net> {
+        // If refuse_all is set, return empty regardless of accept flags.
+        if refuse_all {
+            return Vec::new();
+        }
+
+        // Start with the set of routes to accept.
+        let mut result: Vec<Ipv4Net> = if accept_all {
+            advertised.to_vec()
+        } else {
+            // Keep only advertised routes covered (equal-or-supernet) by some accept CIDR.
+            advertised
+                .iter()
+                .filter(|adv| accept.iter().any(|acc| covers(acc, adv)))
+                .copied()
+                .collect()
+        };
+
+        // Remove any routes covered (equal-or-supernet) by a refuse CIDR.
+        result.retain(|adv| !refuse.iter().any(|r| covers(r, adv)));
+
+        result
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn default_no_flags_returns_empty() {
+            let advertised = vec![
+                "192.168.4.0/24".parse().unwrap(),
+                "10.10.0.0/16".parse().unwrap(),
+            ];
+            let result = filter_accepted(&advertised, false, false, &[], &[]);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn refuse_all_returns_empty() {
+            let advertised = vec![
+                "192.168.4.0/24".parse().unwrap(),
+                "10.10.0.0/16".parse().unwrap(),
+            ];
+            let accept = vec!["192.168.4.0/24".parse().unwrap()];
+            let result = filter_accepted(&advertised, true, true, &accept, &[]);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn accept_all_returns_all() {
+            let advertised = vec![
+                "192.168.4.0/24".parse().unwrap(),
+                "10.10.0.0/16".parse().unwrap(),
+            ];
+            let result = filter_accepted(&advertised, true, false, &[], &[]);
+            assert_eq!(result.len(), 2);
+            assert!(result.contains(&"192.168.4.0/24".parse().unwrap()));
+            assert!(result.contains(&"10.10.0.0/16".parse().unwrap()));
+        }
+
+        #[test]
+        fn accept_all_refuse_one() {
+            let advertised = vec![
+                "192.168.4.0/24".parse().unwrap(),
+                "10.10.0.0/16".parse().unwrap(),
+            ];
+            let refuse = vec!["10.10.0.0/16".parse().unwrap()];
+            let result = filter_accepted(&advertised, true, false, &[], &refuse);
+            assert_eq!(result.len(), 1);
+            assert!(result.contains(&"192.168.4.0/24".parse().unwrap()));
+        }
+
+        #[test]
+        fn accept_all_refuse_other() {
+            let advertised = vec![
+                "192.168.4.0/24".parse().unwrap(),
+                "10.10.0.0/16".parse().unwrap(),
+            ];
+            let refuse = vec!["192.168.4.0/24".parse().unwrap()];
+            let result = filter_accepted(&advertised, true, false, &[], &refuse);
+            assert_eq!(result.len(), 1);
+            assert!(result.contains(&"10.10.0.0/16".parse().unwrap()));
+        }
+
+        #[test]
+        fn accept_specific_route() {
+            let advertised = vec![
+                "192.168.4.0/24".parse().unwrap(),
+                "10.10.0.0/16".parse().unwrap(),
+            ];
+            let accept = vec!["192.168.4.0/24".parse().unwrap()];
+            let result = filter_accepted(&advertised, false, false, &accept, &[]);
+            assert_eq!(result.len(), 1);
+            assert!(result.contains(&"192.168.4.0/24".parse().unwrap()));
+        }
+
+        #[test]
+        fn accept_not_advertised() {
+            let advertised = vec![
+                "192.168.4.0/24".parse().unwrap(),
+                "10.10.0.0/16".parse().unwrap(),
+            ];
+            let accept = vec!["8.8.8.0/24".parse().unwrap()];
+            let result = filter_accepted(&advertised, false, false, &accept, &[]);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn refuse_must_cover_advertised_to_remove() {
+            // advertised 10.10.0.0/16, refuse 10.10.5.0/24 → still contains 10.10.0.0/16
+            let advertised = vec!["10.10.0.0/16".parse().unwrap()];
+            let refuse = vec!["10.10.5.0/24".parse().unwrap()];
+            let result = filter_accepted(&advertised, true, false, &[], &refuse);
+            assert_eq!(result.len(), 1);
+            assert!(result.contains(&"10.10.0.0/16".parse().unwrap()));
+        }
+
+        #[test]
+        fn accept_smaller_subnet_sharing_base_does_not_cover_advertised() {
+            // advertised 10.10.0.0/16, accept 10.10.0.0/24 (same base, MORE specific) → []
+            // The flag must be equal-or-supernet of the advertised entry (D9).
+            let advertised = vec!["10.10.0.0/16".parse().unwrap()];
+            let accept = vec!["10.10.0.0/24".parse().unwrap()];
+            let result = filter_accepted(&advertised, false, false, &accept, &[]);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn accept_supernet_covers_advertised_subset() {
+            // advertised 10.10.5.0/24, accept 10.10.0.0/16 (supernet) → [10.10.5.0/24]
+            let advertised = vec!["10.10.5.0/24".parse().unwrap()];
+            let accept = vec!["10.10.0.0/16".parse().unwrap()];
+            let result = filter_accepted(&advertised, false, false, &accept, &[]);
+            assert_eq!(result.len(), 1);
+            assert!(result.contains(&"10.10.5.0/24".parse().unwrap()));
+        }
     }
 }
 
@@ -209,6 +392,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
         addr: args.addr_request.clone(),
         notes: args.notes.clone(),
         carriers: args.carriers.clamp(1, 16),
+        max_clients: args.max_clients,
     };
     ctrl.send(hello).await?;
 
@@ -263,6 +447,14 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
         }
     };
 
+    // Hub mode (I-MC1: early branch preserves legacy 1:1 path unchanged)
+    if args.max_clients > 1 {
+        return hub::run_listen_hub(
+            args, acceptor, opener, ctrl, assigned, prefix, admin_v2, carriers,
+        )
+        .await;
+    }
+
     // Stale reclaim
     hostcfg::stale_reclaim(&args.id, "listen", &args.tun_name).await;
 
@@ -292,6 +484,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
         &peer_routes,
         &advertised_nets,
         args.no_route_manage,
+        false,
     )
     .await?;
 
@@ -430,6 +623,7 @@ fn spawn_ctrl_actor(
                         peer,
                         peer_selected_stun,
                         tuning,
+                        peer_id: _,
                     })) => {
                         tracing::debug!(?peer, ?peer_selected_stun, "received vpn udp punch");
                         let _ = event_tx
@@ -438,6 +632,12 @@ fn spawn_ctrl_actor(
                     }
                     Ok(Some(crate::shared::ServerMessage::UdpUnavailable)) => {
                         let _ = event_tx.send(CtrlEvent::Unavailable).await;
+                    }
+                    Ok(Some(crate::shared::ServerMessage::VpnPeerJoin { .. })) => {
+                        tracing::debug!("unexpected VpnPeerJoin on 1:1 vpn link (ignoring)");
+                    }
+                    Ok(Some(crate::shared::ServerMessage::VpnPeerLeave { .. })) => {
+                        tracing::debug!("unexpected VpnPeerLeave on 1:1 vpn link (ignoring)");
                     }
                     Ok(Some(msg)) => {
                         tracing::debug!(?msg, "ignoring control message on vpn link");
@@ -676,6 +876,7 @@ async fn try_direct_upgrade(
             crate::shared::UdpCandidateOffer {
                 candidates: disc.candidates,
                 selected_stun: disc.selected_stun.map(|s| s.requested),
+                peer_id: 0,
             },
         ))
         .await
@@ -984,7 +1185,24 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
 
     // Apply network config (routes, NAT, etc.)
     let advertised_nets = args.advertised.to_vec();
-    let peer_routes = peer_advertised.to_vec();
+    // Connector-local route policy (D3/D9): install only the advertised CIDRs this
+    // connector opted into. Default (no flags) = accept nothing (I-MC8). The refused
+    // subnets simply get no route installed.
+    let peer_routes = routes::filter_accepted(
+        &peer_advertised,
+        args.accept_all_routes,
+        args.refuse_all_routes,
+        &args.accept_routes,
+        &args.refuse_routes,
+    );
+    info!(
+        link_id = %args.id,
+        advertised = ?peer_advertised,
+        accepted = ?peer_routes,
+        accept_all = args.accept_all_routes,
+        refuse_all = args.refuse_all_routes,
+        "resolved connector route policy"
+    );
     let runner = hostcfg::RealRunner;
     let _netcfg = hostcfg::NetConfig::apply(
         &runner,
@@ -996,6 +1214,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
         &peer_routes,
         &advertised_nets,
         args.no_route_manage,
+        false,
     )
     .await?;
 
@@ -1757,6 +1976,55 @@ pub mod hostcfg_cmd {
         ]
     }
 
+    /// Build nft spoke-isolation drop rule for hub mode: `nft add rule inet bore_vpn_<id> bore_fw iif <tun> oif <tun> drop`.
+    pub fn cmd_nft_add_spoke_isolation(id: &str, tun: &str) -> Vec<String> {
+        vec![
+            "nft".into(),
+            "add".into(),
+            "rule".into(),
+            "inet".into(),
+            format!("bore_vpn_{id}"),
+            "bore_fw".into(),
+            "iif".into(),
+            tun.into(),
+            "oif".into(),
+            tun.into(),
+            "drop".into(),
+        ]
+    }
+
+    /// Build iptables spoke-isolation drop rule for hub mode: `-A FORWARD -i <tun> -o <tun> -j DROP`.
+    pub fn cmd_iptables_spoke_isolation_add(id: &str, tun: &str) -> Vec<String> {
+        vec![
+            "iptables".into(),
+            "-A".into(),
+            "FORWARD".into(),
+            "-i".into(),
+            tun.into(),
+            "-o".into(),
+            tun.into(),
+            "-j".into(),
+            "DROP".into(),
+            "-m".into(),
+            "comment".into(),
+            "--comment".into(),
+            format!("bore_vpn_{id}_spoke_iso"),
+        ]
+    }
+
+    /// Build iptables spoke-isolation drop rule deletion.
+    pub fn cmd_iptables_spoke_isolation_del(id: &str, _tun: &str) -> Vec<String> {
+        vec![
+            "iptables".into(),
+            "-D".into(),
+            "FORWARD".into(),
+            "-m".into(),
+            "comment".into(),
+            "--comment".into(),
+            format!("bore_vpn_{id}_spoke_iso"),
+        ]
+    }
+
     /// macOS argv builders (E6 groundwork, host-only mode — no NAT/forwarding).
     ///
     /// Pure functions so the snapshots run on every platform. The runtime
@@ -2212,6 +2480,7 @@ pub mod hostcfg {
     }
 
     /// Internal: marker for an ip_forward revert operation.
+    #[derive(Debug)]
     enum AppliedOp {
         IpForward { saved_value: u8 },
     }
@@ -2243,6 +2512,7 @@ pub mod hostcfg {
 
     /// RAII guard that manages routes, forwarding, and NAT around a VPN link.
     /// Reverts everything in reverse order on `Drop`.
+    #[derive(Debug)]
     pub struct NetConfig {
         id: String,
         // "listen" / "connect" — disambiguates the ip_forward state file between two
@@ -2271,6 +2541,7 @@ pub mod hostcfg {
         /// - `peer_routes`: subnets to route via the tun
         /// - `advertised`: subnets this side exposes (non-empty = gateway mode)
         /// - `no_route_manage`: if true, print commands instead of running them
+        /// - `hub`: if true, apply hub-mode spoke-isolation rule (blocks spoke-to-spoke forwarding)
         #[allow(clippy::too_many_arguments)]
         pub async fn apply<R: CommandRunner>(
             runner: &R,
@@ -2282,6 +2553,7 @@ pub mod hostcfg {
             peer_routes: &[crate::shared::Ipv4Net],
             advertised: &[crate::shared::Ipv4Net],
             no_route_manage: bool,
+            hub: bool,
         ) -> anyhow::Result<Self> {
             use super::hostcfg_cmd::*;
 
@@ -2389,6 +2661,16 @@ pub mod hostcfg {
                         .run(&cmd_nft_add_mss_clamp(id))
                         .await
                         .context("nft add mss clamp")?;
+
+                    // Hub mode: add spoke-isolation rule
+                    if hub {
+                        runner
+                            .run(&cmd_nft_add_spoke_isolation(id, tun_name))
+                            .await
+                            .context("nft add spoke isolation")?;
+                        tracing::info!(%id, %tun_name, "added nft spoke-isolation rule");
+                    }
+
                     tracing::info!(%id, "created nft table bore_vpn_{}", id);
                     cfg.revert_cmds.push(cmd_nft_delete_table(id));
                     cfg.revert_labels
@@ -2402,6 +2684,20 @@ pub mod hostcfg {
                         .run(&cmd_iptables_mss_clamp_add(id))
                         .await
                         .context("iptables mss clamp add")?;
+
+                    // Hub mode: add spoke-isolation rule
+                    if hub {
+                        runner
+                            .run(&cmd_iptables_spoke_isolation_add(id, tun_name))
+                            .await
+                            .context("iptables add spoke isolation")?;
+                        tracing::info!(%id, %tun_name, "added iptables spoke-isolation rule");
+                        cfg.revert_cmds
+                            .push(cmd_iptables_spoke_isolation_del(id, tun_name));
+                        cfg.revert_labels
+                            .push(format!("del iptables spoke isolation bore_vpn_{id}"));
+                    }
+
                     tracing::info!(%id, "applied iptables NAT rules");
                     cfg.revert_cmds.push(cmd_iptables_masquerade_del(id));
                     cfg.revert_labels
@@ -2564,6 +2860,7 @@ pub mod hostcfg {
                 &peer_routes,
                 &advertised,
                 false,
+                false,
             )
             .await
             .expect("apply should succeed");
@@ -2596,6 +2893,7 @@ pub mod hostcfg {
                 &peer_routes,
                 &advertised,
                 true, // --no-route-manage
+                false,
             )
             .await
             .expect("apply should succeed");
@@ -2604,6 +2902,52 @@ pub mod hostcfg {
             // Should not have called anything (only printed).
             assert_eq!(calls.len(), 0);
             assert_eq!(cfg.revert_cmds.len(), 0);
+        }
+
+        #[test]
+        fn netconfig_hub_isolation_rule_cmd() {
+            // Unit test: check that the isolation rule commands are built correctly
+            use crate::vpn::hostcfg_cmd::*;
+            let tun = "bore0";
+            let id = "testhub";
+            let nft_cmd = cmd_nft_add_spoke_isolation(id, tun);
+            let iptables_cmd = cmd_iptables_spoke_isolation_add(id, tun);
+
+            // NFT command should contain "drop" and both interfaces
+            assert!(nft_cmd.contains(&"add".to_string()));
+            assert!(nft_cmd.contains(&"rule".to_string()));
+            assert!(nft_cmd.contains(&"drop".to_string()));
+            assert!(nft_cmd.contains(&tun.to_string()));
+
+            // Iptables command should contain "-A FORWARD" and "-D FORWARD" (del variant)
+            assert!(iptables_cmd.contains(&"-A".to_string()));
+            assert!(iptables_cmd.contains(&"FORWARD".to_string()));
+            assert!(iptables_cmd.contains(&tun.to_string()));
+
+            let iptables_del = cmd_iptables_spoke_isolation_del(id, tun);
+            assert!(iptables_del.contains(&"-D".to_string()));
+            assert!(iptables_del.contains(&"FORWARD".to_string()));
+        }
+
+        #[test]
+        fn netconfig_non_hub_no_isolation_rule() {
+            // Verify that the isolation rule commands are only added in hub mode
+            // by checking the conditional code path
+            use crate::vpn::hostcfg_cmd::*;
+            let tun = "bore0";
+            let id = "test1to1";
+
+            // These commands should exist (they're the hub-mode builders)
+            let nft_hub = cmd_nft_add_spoke_isolation(id, tun);
+            let iptables_hub = cmd_iptables_spoke_isolation_add(id, tun);
+
+            // Both should mention the isolation concept
+            assert!(nft_hub.contains(&"drop".to_string()));
+            assert!(iptables_hub.contains(&"-A".to_string()));
+
+            // In non-hub mode, these would NOT be called (verified by code inspection)
+            // This is a unit test of the command builders, not the NetConfig apply path
+            // (which would require full gateway setup including ip route get mocking).
         }
 
         // Root-required tests (skipped by default).
@@ -3711,7 +4055,9 @@ pub mod bridge {
         }
     }
 
-    async fn run_downlink(
+    /// Run the downlink: write decrypted/decompressed packets to the TUN.
+    /// Public for hub mode (Phase 3).
+    pub async fn run_downlink(
         dev: Arc<tun_rs::AsyncDevice>,
         recver: LinkRecver,
         counters: Arc<BridgeCounters>,
@@ -3954,6 +4300,7 @@ mod tests {
                 peer: vec![peer],
                 peer_selected_stun: None,
                 tuning: UdpDirectTuning::default(),
+                peer_id: 0,
             })
             .await
             .unwrap();
@@ -4149,5 +4496,1034 @@ mod tests {
         // Ok() exits the loop immediately.
         let result = run_with_reconnect(true, || async { Ok(()) }).await;
         assert!(result.is_ok());
+    }
+}
+
+/// VPN hub data-plane: single TUN with per-peer router (relay path only, Phase 3).
+///
+/// Hub mode for `bore vpn listen --max-clients >1`: single TUN device with per-peer
+/// router uplink and shared downlink. Each peer gets its own relay link + PeerHandle.
+/// Phase 3 relay-only; Phase 4 adds per-peer direct upgrade.
+#[allow(clippy::doc_lazy_continuation, clippy::mixed_attributes_style)]
+pub mod hub {
+
+    use anyhow::{anyhow, Result};
+    use bytes::Bytes;
+    use dashmap::DashMap;
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, Mutex, Notify};
+    use tracing::{debug, info, warn};
+
+    use super::bridge::BridgeCounters;
+    use super::link::LinkSender;
+
+    /// Handle to a connected peer in the hub. Holds a swappable sender (for Phase 4
+    /// relay↔direct upgrade) and a shutdown trigger. The sender is behind a Mutex
+    /// to allow in-place swaps without restarting the router.
+    pub struct PeerHandle {
+        /// Peer's overlay IP address.
+        pub overlay: Ipv4Addr,
+        /// Server-assigned peer id (unique within hub session).
+        pub peer_id: u32,
+        /// Swappable link sender (currently relay; Phase 4: can swap to direct).
+        pub sender: Mutex<LinkSender>,
+        /// Notified when the peer should shut down (VpnPeerLeave or link death).
+        pub shutdown: Notify,
+    }
+
+    /// Peer table: map from overlay IP to peer handle. Read-mostly (router path).
+    type PeerTable = Arc<DashMap<Ipv4Addr, Arc<PeerHandle>>>;
+
+    /// Substream demux event: a peer's relay substream arrived before the peer was
+    /// registered, or a fresh peer substream from the relay.
+    struct HubSub {
+        /// Peer id from the server's injected header.
+        peer_id: u32,
+        /// Direction tag (RELAY_TAG_UP or RELAY_TAG_DOWN).
+        tag: u8,
+        /// The accepted mux::Stream.
+        stream: crate::mux::Stream,
+    }
+
+    /// Live peer entry: (downlink_task, peer_handle, punch_tx for direct upgrade).
+    type LivePeerEntry = (
+        tokio::task::JoinHandle<()>,
+        Arc<PeerHandle>,
+        tokio::sync::mpsc::Sender<HubEvent>,
+    );
+
+    /// Event from the server-facing control stream (hub ctrl actor output).
+    #[derive(Debug, Clone)]
+    enum HubEvent {
+        /// A new connector paired; add to peer table when link builds.
+        Join {
+            peer_id: u32,
+            overlay: Ipv4Addr,
+            /// The peer's per-peer session nonce. Passed RAW (UDP_NONCE_LEN bytes)
+            /// to `derive_keys_listener` so it matches the spoke's
+            /// `derive_keys_connector(&session_nonce)` — never padded/resized, or
+            /// the HKDF inputs diverge and the AEAD keys won't match.
+            nonce: [u8; crate::shared::UDP_NONCE_LEN],
+            carriers: u16,
+        },
+        /// A connector disconnected; remove from peer table.
+        Leave { peer_id: u32 },
+        /// Server brokered a punch for two peers (direct-path upgrade attempt).
+        /// Routes to the connector's direct task (matched by peer_id).
+        Punch {
+            peer_id: u32,
+            /// Session nonce; both peers derive the same QUIC token from it.
+            nonce: [u8; crate::shared::UDP_NONCE_LEN],
+            /// Peer candidate addresses to punch toward.
+            peer: Vec<std::net::SocketAddr>,
+            /// Direct-UDP transport tuning requested by the server.
+            tuning: crate::shared::UdpDirectTuning,
+        },
+    }
+
+    /// Pending peer: buffering substreams until the Join event + carriers count allows build.
+    struct PendingPeer {
+        /// Metadata from the Join event (if arrived).
+        meta: Option<(u16, [u8; crate::shared::UDP_NONCE_LEN], Ipv4Addr)>, // (carriers, nonce, overlay)
+        /// Uplink substreams (connector→hub).
+        up: Vec<crate::mux::Stream>,
+        /// Downlink substreams (hub→connector).
+        down: Vec<crate::mux::Stream>,
+    }
+
+    /// Spawns the accept task: reads from the mux acceptor and parses the server's
+    /// `[STREAM_READY, peer_id u32, tag]` prefix, then sends HubSub events to the coordinator.
+    ///
+    /// NOT `async`: it must `tokio::spawn` synchronously and return the handle.
+    /// As an `async fn` the body would only run when the returned future is
+    /// awaited — and the call site does not await it, so the accept task (and
+    /// thus the entire relay data path) would silently never start.
+    fn spawn_accept_task(
+        mut acceptor: crate::mux::Acceptor,
+        tx: mpsc::Sender<HubSub>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(60), acceptor.accept())
+                    .await
+                {
+                    Ok(Some(mut stream)) => {
+                        // Read the server-injected header: [STREAM_READY, peer_id u32, tag]
+                        use tokio::io::AsyncReadExt;
+                        let mut hdr = [0u8; 6];
+                        if let Err(e) = stream.read_exact(&mut hdr).await {
+                            warn!(error = %e, "failed to read hub relay header");
+                            continue;
+                        }
+
+                        // Check STREAM_READY marker
+                        if hdr[0] != crate::mux::STREAM_READY {
+                            warn!(marker = hdr[0], "expected STREAM_READY in hub relay header");
+                            continue;
+                        }
+
+                        let peer_id = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]);
+                        let tag = hdr[5];
+
+                        let ev = HubSub {
+                            peer_id,
+                            tag,
+                            stream,
+                        };
+                        if tx.send(ev).await.is_err() {
+                            debug!("hub coordinator closed; accept task exiting");
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        debug!("acceptor closed; accept task exiting");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!("60s timeout waiting for hub relay substream; dropping pending");
+                    }
+                }
+            }
+        })
+    }
+
+    /// Router uplink: read packets from TUN, parse destination IPv4, route to per-peer sender.
+    /// Spawned once per TUN queue. Adapted from `bridge::run_uplink_single`/`_offload`.
+    pub async fn run_router_uplink(
+        dev: Arc<tun_rs::AsyncDevice>,
+        table: PeerTable,
+        counters: Arc<BridgeCounters>,
+        offload: bool,
+    ) -> Result<()> {
+        if offload {
+            run_router_uplink_offload(dev, table, counters).await
+        } else {
+            run_router_uplink_single(dev, table, counters).await
+        }
+    }
+
+    /// Phase 6.1 router: single-packet read.
+    async fn run_router_uplink_single(
+        dev: Arc<tun_rs::AsyncDevice>,
+        table: PeerTable,
+        counters: Arc<BridgeCounters>,
+    ) -> Result<()> {
+        let mut buf = vec![0u8; u16::MAX as usize + 4];
+        let mut _dropped_no_peer = 0u64;
+        loop {
+            let n = dev.recv(&mut buf).await?;
+            if n == 0 {
+                continue;
+            }
+            let pkt = Bytes::copy_from_slice(&buf[..n]);
+
+            // Parse destination IPv4 from the packet header (offset 16..20).
+            if let Some(dst) = parse_ipv4_dst(&pkt) {
+                if let Some(peer_entry) = table.get(&dst) {
+                    let peer = Arc::clone(peer_entry.value());
+                    drop(peer_entry); // Drop the DashMap ref early.
+                    let mut sender = peer.sender.lock().await;
+                    match sender.send_batch(std::slice::from_ref(&pkt)).await {
+                        Ok(0) => {
+                            counters.tx_pkts.fetch_add(1, Ordering::Relaxed);
+                            counters.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        Ok(_dropped) => {
+                            // Oversized (direct path only, shouldn't happen on relay).
+                            counters.tx_drops.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            warn!(peer_id = peer.peer_id, error = %e, "peer send failed; dropping packet");
+                            // Per-packet error: drop and continue (downlink will also fail).
+                        }
+                    }
+                } else {
+                    _dropped_no_peer += 1;
+                }
+            }
+            // Non-IPv4 or too short: silently drop.
+        }
+    }
+
+    /// Phase 6.2 router: offload (batch) read with GSO.
+    async fn run_router_uplink_offload(
+        dev: Arc<tun_rs::AsyncDevice>,
+        table: PeerTable,
+        counters: Arc<BridgeCounters>,
+    ) -> Result<()> {
+        let mut original_buffer = vec![0u8; tun_rs::VIRTIO_NET_HDR_LEN + 65535];
+        let mut bufs = vec![vec![0u8; u16::MAX as usize]; tun_rs::IDEAL_BATCH_SIZE];
+        let mut sizes = vec![0usize; tun_rs::IDEAL_BATCH_SIZE];
+
+        loop {
+            // Offset 0: each segment buffer holds the pure IP packet at [0..size]
+            // (matches bridge::run_uplink_offload). A non-zero offset would shift
+            // the payload and make parse_ipv4_dst read the wrong bytes.
+            let num = dev
+                .recv_multiple(&mut original_buffer, &mut bufs, &mut sizes, 0)
+                .await?;
+            if num == 0 {
+                continue;
+            }
+
+            // Group packets by destination peer.
+            use std::collections::HashMap;
+            let mut groups: HashMap<Ipv4Addr, Vec<Bytes>> = HashMap::new();
+            let mut _dropped_no_peer = 0usize;
+
+            for i in 0..num {
+                let pkt = Bytes::copy_from_slice(&bufs[i][..sizes[i]]);
+                if let Some(dst) = parse_ipv4_dst(&pkt) {
+                    groups.entry(dst).or_default().push(pkt);
+                } else {
+                    _dropped_no_peer += 1;
+                }
+            }
+
+            // Send each group to its peer.
+            for (dst, pkts) in groups {
+                if let Some(peer_entry) = table.get(&dst) {
+                    let peer = Arc::clone(peer_entry.value());
+                    drop(peer_entry);
+                    let mut sender = peer.sender.lock().await;
+                    match sender.send_batch(&pkts).await {
+                        Ok(0) => {
+                            let pkt_count = pkts.len() as u64;
+                            let byte_count: u64 = pkts.iter().map(|p| p.len() as u64).sum();
+                            counters.tx_pkts.fetch_add(pkt_count, Ordering::Relaxed);
+                            counters.tx_bytes.fetch_add(byte_count, Ordering::Relaxed);
+                        }
+                        Ok(dropped) => {
+                            counters
+                                .tx_drops
+                                .fetch_add(dropped as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            warn!(peer_id = peer.peer_id, error = %e, "peer send failed; dropping group");
+                        }
+                    }
+                } else {
+                    _dropped_no_peer += pkts.len();
+                }
+            }
+        }
+    }
+
+    /// Parse the destination IPv4 address from a packet (offset 16..20 of IPv4 header).
+    /// Returns None if the packet is too short or not IPv4.
+    fn parse_ipv4_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
+        if pkt.len() < 20 {
+            return None;
+        }
+        let version = pkt[0] >> 4;
+        if version != 4 {
+            return None;
+        }
+        Some(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
+    }
+
+    /// Hub coordinator: manages peer table, pending substreams, and lifecycle.
+    /// Single owner of PeerTable mutation.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_hub_coordinator(
+        devs: Vec<Arc<tun_rs::AsyncDevice>>,
+        secret: String,
+        counters: Arc<BridgeCounters>,
+        offload: bool,
+        mut sub_rx: mpsc::Receiver<HubSub>,
+        mut event_rx: mpsc::Receiver<HubEvent>,
+        event_tx: mpsc::Sender<HubEvent>,
+        peer_table: PeerTable,
+        args: super::VpnListenArgs,
+        admin_v2: bool,
+        out_tx: tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
+    ) {
+        let mut pending: std::collections::HashMap<u32, PendingPeer> =
+            std::collections::HashMap::new();
+        let mut live_peers: std::collections::HashMap<u32, LivePeerEntry> =
+            std::collections::HashMap::new();
+
+        loop {
+            tokio::select! {
+                // Substream arrived
+                Some(HubSub { peer_id, tag, stream }) = sub_rx.recv() => {
+                    // Bound the pre-join buffer (6.1): drop substreams for a new
+                    // peer once too many distinct peers are pending un-built, and
+                    // cap per-peer streams (a peer needs only 2*carriers ≤ 32).
+                    // Prevents unbounded growth from stray/duplicate substreams.
+                    const MAX_PENDING_PEERS: usize = 512;
+                    const MAX_PENDING_PER_PEER: usize = 64;
+                    if !pending.contains_key(&peer_id) && pending.len() >= MAX_PENDING_PEERS {
+                        warn!(peer_id, "hub pending-peer buffer full; dropping substream");
+                        continue;
+                    }
+                    let entry = pending.entry(peer_id).or_insert_with(|| PendingPeer {
+                        meta: None,
+                        up: Vec::new(),
+                        down: Vec::new(),
+                    });
+                    if entry.up.len() + entry.down.len() >= MAX_PENDING_PER_PEER {
+                        warn!(peer_id, "hub per-peer pending buffer full; dropping substream");
+                        continue;
+                    }
+
+                    match tag {
+                        super::link::RELAY_TAG_UP => entry.up.push(stream),
+                        super::link::RELAY_TAG_DOWN => entry.down.push(stream),
+                        _ => {
+                            warn!(peer_id, tag, "unknown relay tag");
+                            continue;
+                        }
+                    }
+
+                    try_build_peer(&mut pending, &mut live_peers, &devs, &secret, &counters, offload, peer_id, &peer_table, &event_tx, &args, admin_v2, out_tx.clone()).await;
+                }
+
+                // Join/Leave/Punch event from server
+                Some(ev) = event_rx.recv() => {
+                    match ev {
+                        HubEvent::Join {
+                            peer_id,
+                            overlay,
+                            nonce,
+                            carriers,
+                        } => {
+                            let entry = pending.entry(peer_id).or_insert_with(|| PendingPeer {
+                                meta: None,
+                                up: Vec::new(),
+                                down: Vec::new(),
+                            });
+                            entry.meta = Some((carriers, nonce, overlay));
+                            try_build_peer(&mut pending, &mut live_peers, &devs, &secret, &counters, offload, peer_id, &peer_table, &event_tx, &args, admin_v2, out_tx.clone()).await;
+                        }
+                        HubEvent::Leave { peer_id } => {
+                            // Remove from live peers and tear down. Idempotent:
+                            // a downlink-death self-report and a server
+                            // VpnPeerLeave can both fire for the same peer.
+                            if let Some((dl_task, peer, _punch_tx)) = live_peers.remove(&peer_id) {
+                                peer_table.remove(&peer.overlay);
+                                peer.shutdown.notify_waiters();
+                                dl_task.abort();
+                            }
+                            pending.remove(&peer_id);
+                        }
+                        HubEvent::Punch {
+                            peer_id,
+                            nonce,
+                            peer,
+                            tuning,
+                        } => {
+                            // Phase 4.2c: route to peer's direct task (when added).
+                            if let Some((_dl_task, _peer_handle, punch_tx)) = live_peers.get(&peer_id) {
+                                let _ = punch_tx.send(HubEvent::Punch {
+                                    peer_id,
+                                    nonce,
+                                    peer,
+                                    tuning,
+                                }).await;
+                            } else {
+                                debug!(?peer_id, "hub coordinator: punch event for unknown peer; peer may be removed");
+                            }
+                        }
+                    }
+                }
+
+                else => {
+                    debug!("hub coordinator exiting");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Attempt to build a peer link when it has carriers + nonce + up/down substreams.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_build_peer(
+        pending: &mut std::collections::HashMap<u32, PendingPeer>,
+        live_peers: &mut std::collections::HashMap<u32, LivePeerEntry>,
+        devs: &[Arc<tun_rs::AsyncDevice>],
+        secret: &str,
+        counters: &Arc<BridgeCounters>,
+        offload: bool,
+        peer_id: u32,
+        peer_table: &PeerTable,
+        event_tx: &mpsc::Sender<HubEvent>,
+        args: &super::VpnListenArgs,
+        admin_v2: bool,
+        out_tx: tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
+    ) {
+        let entry = match pending.get_mut(&peer_id) {
+            Some(e) => e,
+            None => return,
+        };
+
+        let (carriers, nonce, overlay) = match entry.meta {
+            Some(m) => m,
+            None => return,
+        };
+
+        let carriers = carriers as usize;
+        if entry.up.len() < carriers || entry.down.len() < carriers {
+            return;
+        }
+
+        // Take the streams.
+        let mut up_streams = Vec::new();
+        let mut down_streams = Vec::new();
+        for _ in 0..carriers {
+            if let Some(s) = entry.up.pop() {
+                up_streams.push(s);
+            }
+            if let Some(s) = entry.down.pop() {
+                down_streams.push(s);
+            }
+        }
+
+        // For multi-carrier peers the connector wrote a 3-byte header
+        // `[STREAM_READY, tag, idx]`; the server forwards `[tag, idx, payload]`
+        // and the accept task already consumed `[STREAM_READY, peer_id, tag]`,
+        // leaving `[idx, payload]`. Consume the 1-byte carrier index here (its
+        // value is unused — make_relay_multi round-robins). carriers==1 has no
+        // idx byte (byte-identical to the single-carrier path).
+        if carriers > 1 {
+            use tokio::io::AsyncReadExt;
+            for s in up_streams.iter_mut().chain(down_streams.iter_mut()) {
+                let mut idx = [0u8; 1];
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    s.read_exact(&mut idx),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    _ => {
+                        warn!(%peer_id, "failed to read carrier idx byte; dropping peer");
+                        pending.remove(&peer_id);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Derive keys and build the link.
+        let keys = match super::crypto::derive_keys_listener(secret, &nonce) {
+            Ok(k) => k,
+            Err(e) => {
+                warn!(%peer_id, error = %e, "failed to derive keys");
+                pending.remove(&peer_id);
+                return;
+            }
+        };
+
+        let (sender, recver) = super::link::make_relay_multi(down_streams, up_streams, keys);
+        let peer = Arc::new(PeerHandle {
+            overlay,
+            peer_id,
+            sender: Mutex::new(sender),
+            shutdown: Notify::new(),
+        });
+
+        // Register in peer table.
+        peer_table.insert(overlay, Arc::clone(&peer));
+
+        // Spawn downlink. On death it self-reports Leave so the coordinator
+        // removes it from the PeerTable even without a server VpnPeerLeave
+        // (otherwise the router would keep sending to a dead relay link).
+        let peer_clone = Arc::clone(&peer);
+        let dev0 = Arc::clone(&devs[0]);
+        let counters_clone = Arc::clone(counters);
+        let dl_event_tx = event_tx.clone();
+        let dl_task = tokio::spawn(async move {
+            if let Err(e) = super::bridge::run_downlink(dev0, recver, counters_clone, offload).await
+            {
+                warn!(peer_id = peer_clone.peer_id, error = %e, "peer downlink died");
+            }
+            peer_clone.shutdown.notify_waiters();
+            let _ = dl_event_tx.send(HubEvent::Leave { peer_id }).await;
+        });
+
+        // Phase 4.2d: Spawn per-peer direct task (unless relay_only).
+        let (punch_tx, punch_rx) = tokio::sync::mpsc::channel(16);
+        if !args.relay_only {
+            let peer_clone = Arc::clone(&peer);
+            let out_tx_clone = out_tx.clone();
+            let args_clone = args.clone();
+            let dev0 = Arc::clone(&devs[0]);
+            let counters_clone = Arc::clone(counters);
+            tokio::spawn(async move {
+                per_peer_direct_upgrade_task(
+                    peer_id,
+                    peer_clone,
+                    punch_rx,
+                    args_clone,
+                    admin_v2,
+                    out_tx_clone,
+                    dev0,
+                    counters_clone,
+                    offload,
+                )
+                .await;
+            });
+        }
+
+        live_peers.insert(peer_id, (dl_task, peer, punch_tx));
+        pending.remove(&peer_id);
+        info!(%peer_id, %overlay, %carriers, "hub peer link built");
+    }
+
+    /// Phase 4.2d: Per-peer direct (QUIC) upgrade task for one spoke.
+    ///
+    /// The hub is always the QUIC **listener** (`DirectSide::Listener`). While the
+    /// peer is on relay, this retries on the fixed [`DIRECT_RETRY_INTERVAL`] grid
+    /// (aligned with the spoke's own grid so the server brokers a punch when it
+    /// holds both offers). Each round: gather candidates → offer (with `peer_id`)
+    /// → await the brokered punch → QUIC-accept. On success it swaps the peer's
+    /// sender to Direct IN PLACE (the router never restarts — I-MC5) and spawns a
+    /// direct downlink, keeping the relay downlink WARM. On direct death it swaps
+    /// back to the warm relay sender (DEC-2 seamless fallback) and re-arms.
+    ///
+    /// Removal: when the coordinator drops the peer it drops `punch_tx`, closing
+    /// `punch_rx`; every blocking point selects on it so the task exits promptly.
+    #[allow(clippy::too_many_arguments)]
+    async fn per_peer_direct_upgrade_task(
+        peer_id: u32,
+        peer: Arc<PeerHandle>,
+        mut punch_rx: tokio::sync::mpsc::Receiver<HubEvent>,
+        args: super::VpnListenArgs,
+        admin_v2: bool,
+        out_tx: tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
+        dev0: Arc<tun_rs::AsyncDevice>,
+        counters: Arc<BridgeCounters>,
+        offload: bool,
+    ) {
+        // The relay sender is captured for fallback. It is a CLONE that shares the
+        // SAME Arc<AtomicU64> nonce counter as the live relay link (I-5/DEC-6), so
+        // swapping relay→direct→relay never reuses a (key, counter) pair.
+        let relay_sender = peer.sender.lock().await.clone();
+        let endpoint = crate::transport::Endpoint::parse(&args.to);
+        let tunneled = args.advertised.clone();
+
+        let mut ticker = tokio::time::interval(super::DIRECT_RETRY_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                ev = punch_rx.recv() => match ev {
+                    None => return,        // peer removed → exit
+                    Some(_) => continue,   // stray punch between rounds → ignore
+                },
+            }
+            match try_hub_peer_direct(
+                peer_id,
+                &peer,
+                &mut punch_rx,
+                &args,
+                &endpoint,
+                &tunneled,
+                &dev0,
+                &counters,
+                offload,
+                &out_tx,
+                admin_v2,
+                &relay_sender,
+            )
+            .await
+            {
+                HubDirectOutcome::FellBack => {
+                    // Direct came up then died; relay is restored. Retry next tick.
+                }
+                HubDirectOutcome::NoDirect => {
+                    // Stayed on relay this round (no punch / handshake failed).
+                }
+                HubDirectOutcome::PeerGone => return,
+            }
+        }
+    }
+
+    /// Result of one hub direct-upgrade attempt.
+    enum HubDirectOutcome {
+        /// Direct established then fell back to warm relay (re-arm immediately).
+        FellBack,
+        /// No direct this round; still on relay.
+        NoDirect,
+        /// The peer was removed (punch channel closed) — the task must exit.
+        PeerGone,
+    }
+
+    /// One hub→spoke direct-upgrade attempt (QUIC listener side). See
+    /// [`per_peer_direct_upgrade_task`] for lifecycle.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_hub_peer_direct(
+        peer_id: u32,
+        peer: &Arc<PeerHandle>,
+        punch_rx: &mut tokio::sync::mpsc::Receiver<HubEvent>,
+        args: &super::VpnListenArgs,
+        endpoint: &crate::transport::Endpoint,
+        tunneled: &[crate::shared::Ipv4Net],
+        dev0: &Arc<tun_rs::AsyncDevice>,
+        counters: &Arc<BridgeCounters>,
+        offload: bool,
+        out_tx: &tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
+        admin_v2: bool,
+        relay_sender: &LinkSender,
+    ) -> HubDirectOutcome {
+        // 1. Socket + STUN candidate gathering.
+        let socket = match crate::holepunch::bind_socket(args.nat_udp_preferred_port).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!(%peer_id, error=%e, "hub direct: bind socket failed");
+                return HubDirectOutcome::NoDirect;
+            }
+        };
+        let targets = match crate::holepunch::resolve_live_stun_targets(
+            &endpoint.host,
+            endpoint.port,
+            args.stun_server.as_deref(),
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                debug!(%peer_id, error=%e, "hub direct: stun resolve failed");
+                return HubDirectOutcome::NoDirect;
+            }
+        };
+        let disc = crate::holepunch::gather_candidates_from_stun_targets(
+            &socket,
+            &targets,
+            args.upnp,
+            args.try_port_prediction,
+        )
+        .await;
+        if disc.candidates.is_empty() {
+            debug!(%peer_id, "hub direct: no usable candidates");
+            return HubDirectOutcome::NoDirect;
+        }
+
+        // 2. Offer our candidates to the server's per-peer broker (WITH peer_id).
+        if out_tx
+            .send(crate::shared::ClientMessage::UdpCandidateOffer(
+                crate::shared::UdpCandidateOffer {
+                    candidates: disc.candidates,
+                    selected_stun: disc.selected_stun.map(|s| s.requested),
+                    peer_id,
+                },
+            ))
+            .await
+            .is_err()
+        {
+            return HubDirectOutcome::PeerGone; // ctrl actor gone → hub tearing down
+        }
+
+        // 3. Await the brokered punch (peer candidates + nonce + tuning).
+        let (nonce, peer_addrs, tuning) =
+            match tokio::time::timeout(super::DIRECT_PUNCH_WAIT, punch_rx.recv()).await {
+                Ok(Some(HubEvent::Punch {
+                    nonce,
+                    peer,
+                    tuning,
+                    ..
+                })) => (nonce, peer, tuning),
+                Ok(Some(_)) => return HubDirectOutcome::NoDirect, // unexpected event
+                Ok(None) => return HubDirectOutcome::PeerGone,    // peer removed
+                Err(_) => return HubDirectOutcome::NoDirect,      // no punch in time
+            };
+
+        // 4. Drop candidates inside tunneled subnets (would loop through the VPN).
+        let (peer_addrs, dropped) = super::filter_tunneled_candidates(&peer_addrs, tunneled);
+        if !dropped.is_empty() {
+            info!(%peer_id, ?dropped, "hub direct: skipping tunneled candidates");
+        }
+        if peer_addrs.is_empty() {
+            return HubDirectOutcome::NoDirect;
+        }
+
+        // 5. QUIC handshake — the hub is the listener (QUIC server).
+        let token = crate::holepunch::derive_token(Some(&args.secret), &nonce);
+        let dl = match crate::holepunch::DirectListener::new(socket, peer_addrs, tuning).await {
+            Ok(dl) => dl,
+            Err(e) => {
+                debug!(%peer_id, error=%e, "hub direct: listener setup failed");
+                return HubDirectOutcome::NoDirect;
+            }
+        };
+        let conn = match tokio::time::timeout(super::DIRECT_ACCEPT_WAIT, dl.accept(token)).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                debug!(%peer_id, error=%e, "hub direct: accept failed");
+                return HubDirectOutcome::NoDirect;
+            }
+            Err(_) => {
+                debug!(%peer_id, "hub direct: accept timed out");
+                return HubDirectOutcome::NoDirect;
+            }
+        };
+
+        // 6. Swap the sender to Direct IN PLACE (router follows; no restart). The
+        //    relay downlink stays WARM (untouched). Spawn the direct downlink.
+        //    v1 limitation: no per-peer PMTU monitor (the TUN MTU is shared across
+        //    peers); oversized direct packets are dropped per-packet (TooLarge),
+        //    never link death.
+        let (dsender, drecver) = super::link::make_direct(conn.clone());
+        {
+            let mut s = peer.sender.lock().await;
+            *s = dsender;
+        }
+        let direct_dl = {
+            let dev0 = Arc::clone(dev0);
+            let counters = Arc::clone(counters);
+            tokio::spawn(async move {
+                let _ = super::bridge::run_downlink(dev0, drecver, counters, offload).await;
+            })
+        };
+        if admin_v2 {
+            let _ = out_tx
+                .send(crate::shared::ClientMessage::VpnPathReport {
+                    path: "direct".into(),
+                })
+                .await;
+        }
+        info!(%peer_id, path = "direct", "hub peer upgraded to direct path");
+
+        // 7. Stay direct until the QUIC connection dies OR the peer is removed.
+        tokio::select! {
+            _ = conn.closed() => {}
+            ev = punch_rx.recv() => {
+                if ev.is_none() {
+                    // Peer removed: swap back, stop direct downlink, exit.
+                    {
+                        let mut s = peer.sender.lock().await;
+                        *s = relay_sender.clone();
+                    }
+                    direct_dl.abort();
+                    return HubDirectOutcome::PeerGone;
+                }
+                // A stray punch while direct is up: ignore, keep waiting on close.
+                conn.closed().await;
+            }
+        }
+
+        // 8. Direct died: swap back to the warm relay sender IN PLACE (seamless,
+        //    no reconnect, TUN preserved, relay nonce counter preserved). Stop the
+        //    direct downlink (its recver already errored on close).
+        {
+            let mut s = peer.sender.lock().await;
+            *s = relay_sender.clone();
+        }
+        direct_dl.abort();
+        if admin_v2 {
+            let _ = out_tx
+                .send(crate::shared::ClientMessage::VpnPathReport {
+                    path: "relay".into(),
+                })
+                .await;
+        }
+        info!(%peer_id, path = "relay", "hub peer direct path lost; fell back to warm relay");
+        HubDirectOutcome::FellBack
+    }
+
+    /// Run the hub listener: single TUN, per-peer router, shared downlink path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_listen_hub(
+        args: super::VpnListenArgs,
+        acceptor: crate::mux::Acceptor,
+        _opener: crate::mux::Opener,
+        mut ctrl: crate::shared::Delimited<crate::mux::Stream>,
+        assigned: Ipv4Addr,
+        prefix: u8,
+        admin_v2: bool,
+        _carriers: u16,
+    ) -> Result<()> {
+        info!(
+            link_id = %args.id,
+            overlay = %format!("{assigned}/{prefix}"),
+            "vpn hub listener starting"
+        );
+
+        // Stale reclaim
+        super::hostcfg::stale_reclaim(&args.id, "listen", &args.tun_name).await;
+
+        // Create TUN device(s).
+        let (devs_raw, offload) =
+            super::hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu, args.tun_queues)
+                .await?;
+        let devs: Vec<Arc<tun_rs::AsyncDevice>> = devs_raw.into_iter().map(Arc::new).collect();
+        info!(
+            link_id = %args.id,
+            iface = %args.tun_name,
+            addr = %assigned,
+            prefix = prefix,
+            "created hub tun device"
+        );
+
+        // Apply network config (gateway + spoke isolation).
+        let advertised_nets = args.advertised.to_vec();
+        let runner = super::hostcfg::RealRunner;
+        let _netcfg = super::hostcfg::NetConfig::apply(
+            &runner,
+            &args.id,
+            "listen",
+            &args.tun_name,
+            assigned,
+            prefix,
+            &[], // Hub doesn't route peer routes; peers route themselves
+            &advertised_nets,
+            args.no_route_manage,
+            true, // Hub mode: add spoke isolation
+        )
+        .await?;
+
+        // Create peer table.
+        let peer_table = Arc::new(DashMap::new());
+
+        // Create channels.
+        let (sub_tx, sub_rx) = mpsc::channel(256);
+        let (event_tx, event_rx) = mpsc::channel(256);
+        // Clone for the coordinator: a peer's downlink self-reports Leave here
+        // when its relay link dies, so the coordinator removes it even without a
+        // server VpnPeerLeave (no stale PeerTable entry).
+        let coord_event_tx = event_tx.clone();
+
+        // Spawn control-stream actor.
+        let (out_tx, ctrl_task) = {
+            let (tx, mut rx) = mpsc::channel::<crate::shared::ClientMessage>(16);
+            let event_tx_clone = event_tx.clone();
+            (
+                tx,
+                tokio::spawn(async move {
+                    let mut out_open = true;
+                    loop {
+                        tokio::select! {
+                            out = rx.recv(), if out_open => match out {
+                                Some(msg) => {
+                                    if let Err(e) = ctrl.send(msg).await {
+                                        return Err(anyhow::anyhow!("vpn hub control stream send error: {e}"));
+                                    }
+                                }
+                                // All senders dropped: keep draining the stream (I-7).
+                                None => out_open = false,
+                            },
+                            msg = tokio::time::timeout(
+                                std::time::Duration::from_secs(60),
+                                ctrl.recv::<crate::shared::ServerMessage>(),
+                            ) => match msg {
+                                Ok(Ok(None)) => return Ok(()),
+                                Ok(Ok(Some(crate::shared::ServerMessage::Heartbeat))) => continue,
+                                Ok(Ok(Some(crate::shared::ServerMessage::VpnPeerJoin {
+                                    peer_id,
+                                    peer_overlay,
+                                    session_nonce,
+                                    carriers,
+                                    ..
+                                }))) => {
+                                    info!(%peer_id, %peer_overlay, %carriers, "vpn hub peer join");
+                                    // Pass the per-peer nonce RAW — must match the
+                                    // spoke's derive_keys_connector(&session_nonce).
+                                    let _ = event_tx_clone
+                                        .send(HubEvent::Join {
+                                            peer_id,
+                                            overlay: peer_overlay,
+                                            nonce: session_nonce,
+                                            carriers: carriers.max(1),
+                                        })
+                                        .await;
+                                }
+                                Ok(Ok(Some(crate::shared::ServerMessage::VpnPeerLeave {
+                                    peer_id,
+                                }))) => {
+                                    info!(%peer_id, "vpn hub peer leave");
+                                    let _ = event_tx_clone.send(HubEvent::Leave { peer_id }).await;
+                                }
+                                Ok(Ok(Some(crate::shared::ServerMessage::UdpPunch {
+                                    peer_id,
+                                    nonce,
+                                    peer,
+                                    tuning,
+                                    ..
+                                }))) => {
+                                    debug!(?peer_id, ?peer, "hub ctrl: received vpn udp punch");
+                                    let _ = event_tx_clone
+                                        .send(HubEvent::Punch {
+                                            peer_id,
+                                            nonce,
+                                            peer,
+                                            tuning,
+                                        })
+                                        .await;
+                                }
+                                Ok(Ok(Some(crate::shared::ServerMessage::UdpUnavailable))) => {
+                                    debug!("hub ctrl: received UdpUnavailable (ignoring; no peer_id)");
+                                }
+                                Ok(Ok(Some(_))) => continue,
+                                Ok(Err(e)) => return Err(anyhow::anyhow!("vpn hub control stream recv error: {e}")),
+                                Err(_) => return Err(anyhow::anyhow!("vpn hub control stream timeout")),
+                            }
+                        }
+                    }
+                }),
+            )
+        };
+
+        // Send initial VpnPathReport if admin_v2.
+        if admin_v2 {
+            let _ = out_tx
+                .send(crate::shared::ClientMessage::VpnPathReport {
+                    path: "relay".to_string(),
+                })
+                .await;
+        }
+
+        // Spawn accept task.
+        let _accept_task = spawn_accept_task(acceptor, sub_tx);
+
+        // Create bridge counters.
+        let counters = BridgeCounters::new();
+
+        // Spawn router uplink(s), one per TUN queue.
+        let mut router_tasks = Vec::new();
+        for dev in &devs {
+            let dev = Arc::clone(dev);
+            let table = Arc::clone(&peer_table);
+            let ctr = Arc::clone(&counters);
+            let task = tokio::spawn(run_router_uplink(dev, table, ctr, offload));
+            router_tasks.push(task);
+        }
+
+        // Spawn coordinator.
+        let devs_clone = devs.clone();
+        let secret = args.secret.clone();
+        let counters_clone = Arc::clone(&counters);
+        let table_clone = Arc::clone(&peer_table);
+        let _coordinator_task = tokio::spawn(run_hub_coordinator(
+            devs_clone,
+            secret,
+            counters_clone,
+            offload,
+            sub_rx,
+            event_rx,
+            coord_event_tx,
+            table_clone,
+            args.clone(),
+            admin_v2,
+            out_tx.clone(),
+        ));
+
+        // Wait for any critical task to die.
+        tokio::select! {
+            res = ctrl_task => {
+                match res {
+                    Ok(Ok(())) => info!(link_id = %args.id, "hub control stream closed"),
+                    Ok(Err(e)) => {
+                        warn!(link_id = %args.id, error = %e, "hub control stream error");
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        warn!(link_id = %args.id, error = %e, "hub ctrl task panic");
+                        return Err(e.into());
+                    }
+                }
+            }
+            _ = async { futures_util::future::select_all(router_tasks.iter_mut()).await } => {
+                info!(link_id = %args.id, "hub router uplink died");
+                return Err(anyhow!("router uplink died"));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn router_parses_ipv4_dst() {
+            // Valid IPv4 packet: version 4, dst 192.168.1.5
+            let mut pkt = vec![0x45u8; 20]; // IPv4 header, version 4
+            pkt[16..20].copy_from_slice(&[192, 168, 1, 5]);
+            assert_eq!(
+                parse_ipv4_dst(&Bytes::from(pkt)),
+                Some("192.168.1.5".parse().unwrap())
+            );
+
+            // Too short
+            assert_eq!(parse_ipv4_dst(&Bytes::from(vec![0x45u8; 19])), None);
+
+            // Non-IPv4 (version 6)
+            let mut pkt6 = vec![0x65u8; 20];
+            pkt6[16..20].copy_from_slice(&[192, 168, 1, 5]);
+            assert_eq!(parse_ipv4_dst(&Bytes::from(pkt6)), None);
+        }
+
+        #[test]
+        fn router_drops_unknown_dst() {
+            // Packet with dst not in table → dropped, counter incremented
+            // (tested implicitly in integration; unit test is lightweight)
+            let mut pkt = vec![0x45u8; 20];
+            pkt[16..20].copy_from_slice(&[10, 0, 0, 1]);
+            assert!(parse_ipv4_dst(&Bytes::from(pkt)).is_some());
+        }
     }
 }

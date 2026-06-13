@@ -3,7 +3,7 @@
 
 #![cfg(feature = "vpn")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use dashmap::{mapref::entry::Entry, DashMap};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, warn};
 
@@ -34,6 +34,152 @@ pub type VpnRegistry = Arc<DashMap<String, VpnProviderEntry>>;
 /// leaked the /30 block whenever the lock happened to be contended.
 pub type VpnPoolHandle = Arc<std::sync::Mutex<VpnPool>>;
 
+/// Shared handle to a hub's [`HubState`] and its peer-event channel. Cloned into
+/// every connector handler so they can allocate peers and notify the hub
+/// listener. Present only when `max_clients > 1`.
+#[derive(Clone)]
+pub struct HubShared {
+    /// Hub address/peer table (std mutex; no awaits held across the lock).
+    pub state: Arc<std::sync::Mutex<HubState>>,
+    /// Channel to the hub listener handler: connector handlers push
+    /// join/leave/punch events here, which become `ServerMessage`s to the hub.
+    pub event_tx: mpsc::Sender<HubPeerEvent>,
+    /// Max concurrent spokes (`HelloVpn.max_clients`).
+    pub max_clients: u16,
+}
+
+/// Hub address/peer tracking (protected by std::sync::Mutex, no awaits inside).
+pub struct HubState {
+    /// The hub's overlay subnet (e.g. `10.99.0.0/24`).
+    pub subnet: Ipv4Net,
+    /// The hub's own overlay address (the subnet's `.1`).
+    pub hub_overlay: Ipv4Addr,
+    /// CIDRs the hub advertises to spokes (delivered in each connector's
+    /// `VpnReady.peer_advertised` and `VpnPeerJoin`).
+    pub advertised: Vec<Ipv4Net>,
+    /// Monotonic peer-id allocator (starts at 1, never reused within a session).
+    next_peer_id: u32,
+    /// Live peers keyed by `peer_id`.
+    peers: HashMap<u32, PeerSlot>,
+}
+
+/// One spoke's allocation within a hub: its overlay address, server-assigned
+/// `peer_id`, per-peer AEAD/direct-path nonce, and Phase-4 UDP rendezvous slot.
+#[derive(Clone)]
+pub struct PeerSlot {
+    /// Server-assigned id, monotonic within the hub session.
+    pub peer_id: u32,
+    /// This spoke's overlay address (a host in the hub subnet).
+    pub overlay: Ipv4Addr,
+    /// Per-peer session nonce seeding key derivation + direct-path token.
+    pub nonce: [u8; UDP_NONCE_LEN],
+    /// Hub's UDP candidates for this peer (filled by the hub on offer; read by
+    /// the connector's broker in Phase 4).
+    pub hub_candidates: Vec<std::net::SocketAddr>,
+    /// Hub's selected STUN server for this peer (advisory, Phase 4).
+    pub hub_selected_stun: Option<String>,
+}
+
+/// Event a connector handler sends to the hub listener handler.
+pub enum HubPeerEvent {
+    /// A new spoke paired: the hub emits `VpnPeerJoin` to its client.
+    Join {
+        /// Server-assigned peer id.
+        peer_id: u32,
+        /// The spoke's overlay address.
+        overlay: Ipv4Addr,
+        /// The hub's advertised CIDRs (echoed for symmetry; spokes don't advertise in v1).
+        advertised: Vec<Ipv4Net>,
+        /// Per-peer session nonce.
+        nonce: [u8; UDP_NONCE_LEN],
+        /// Negotiated relay carrier count for this peer.
+        carriers: u16,
+    },
+    /// A spoke disconnected: the hub emits `VpnPeerLeave` to its client.
+    Leave {
+        /// Peer id that left.
+        peer_id: u32,
+    },
+    /// Phase 4: the spoke offered UDP candidates; the hub forwards a per-peer
+    /// `UdpPunch`.
+    Punch {
+        /// Peer id the punch is for.
+        peer_id: u32,
+        /// The spoke's candidate offer.
+        offer: secret::UdpOffer,
+    },
+}
+
+impl HubState {
+    /// Create hub state for `subnet`; the hub takes the subnet's `.1`.
+    pub fn new(subnet: Ipv4Net, advertised: Vec<Ipv4Net>) -> Self {
+        let hub_overlay = Ipv4Addr::from(u32::from(subnet.network()) + 1);
+        Self {
+            subnet,
+            hub_overlay,
+            advertised,
+            next_peer_id: 1,
+            peers: HashMap::new(),
+        }
+    }
+
+    /// Allocate the lowest free host (skipping `.0`/`.1`/broadcast) and a fresh
+    /// monotonic `peer_id`. Errors if the subnet has no free host.
+    pub fn alloc_peer(&mut self) -> Result<PeerSlot> {
+        let base = u32::from(self.subnet.network());
+        let host_bits = 32 - self.subnet.prefix;
+        let subnet_size = 1u32 << host_bits;
+        let first_host = base + 2;
+        let last_host = base + subnet_size - 2;
+
+        for addr_u32 in first_host..=last_host {
+            if !self
+                .peers
+                .values()
+                .any(|p| u32::from(p.overlay) == addr_u32)
+            {
+                let overlay = Ipv4Addr::from(addr_u32);
+                let peer_id = self.next_peer_id;
+                self.next_peer_id += 1;
+                let nonce = new_nonce();
+                let slot = PeerSlot {
+                    peer_id,
+                    overlay,
+                    nonce,
+                    hub_candidates: vec![],
+                    hub_selected_stun: None,
+                };
+                self.peers.insert(peer_id, slot.clone());
+                return Ok(slot);
+            }
+        }
+        bail!("hub subnet full")
+    }
+
+    /// Release the peer holding `overlay` (idempotent).
+    pub fn free_peer(&mut self, overlay: Ipv4Addr) {
+        self.peers.retain(|_, slot| slot.overlay != overlay);
+    }
+
+    /// Number of live spokes.
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Store the hub's UDP candidates for `peer_id` (Phase 4 rendezvous).
+    pub fn set_hub_candidates(
+        &mut self,
+        peer_id: u32,
+        cands: Vec<std::net::SocketAddr>,
+        stun: Option<String>,
+    ) {
+        if let Some(slot) = self.peers.get_mut(&peer_id) {
+            slot.hub_candidates = cands;
+            slot.hub_selected_stun = stun;
+        }
+    }
+}
+
 /// What the VPN listener registers while waiting for a connector.
 pub struct VpnProviderEntry {
     /// Networks this side advertises.
@@ -42,8 +188,10 @@ pub struct VpnProviderEntry {
     pub addr: VpnAddrRequest,
     /// The listener's mux opener (for relay substream).
     pub opener: mux::Opener,
-    /// Connector sends pairing info here; listener awaits this.
-    pub pair_tx: oneshot::Sender<VpnPairMsg>,
+    /// 1:1 pairing oneshot (Some in 1:1 mode, None in hub mode).
+    pub pair_tx: Option<oneshot::Sender<VpnPairMsg>>,
+    /// Hub shared state (Some only when max_clients > 1).
+    pub hub: Option<HubShared>,
     /// Relay carrier pairs requested by the listener (`HelloVpn.carriers`).
     pub carriers: u16,
     /// Monotonic registration generation. Protects against a stale handler's
@@ -69,10 +217,11 @@ pub struct VpnPairMsg {
     pub nonce: [u8; UDP_NONCE_LEN],
 }
 
-/// Pure /30 allocator, no I/O.
+/// Pure /30 and hub subnet allocator, no I/O.
 pub struct VpnPool {
     parent: Ipv4Net,
     allocated: HashSet<u32>, // network address of each /30 block (as u32)
+    hub_blocks: HashMap<u32, u8>, // network addr -> prefix for each hub block
 }
 
 impl VpnPool {
@@ -86,6 +235,7 @@ impl VpnPool {
         Ok(Self {
             parent,
             allocated: HashSet::new(),
+            hub_blocks: HashMap::new(),
         })
     }
 
@@ -96,7 +246,7 @@ impl VpnPool {
         let total_blocks = 1u32 << host_bits.saturating_sub(2); // each /30 = 4 addrs
         for i in 0..total_blocks {
             let net_addr = base + i * 4;
-            if !self.allocated.contains(&net_addr) {
+            if !self.allocated.contains(&net_addr) && !self.in_any_hub_block(net_addr, 4) {
                 self.allocated.insert(net_addr);
                 return Ok((
                     Ipv4Addr::from(net_addr + 1), // .1 = listener
@@ -115,10 +265,126 @@ impl VpnPool {
         self.allocated.remove(&net_addr);
     }
 
-    /// Check whether an address collides with any live allocation.
+    /// Check whether an address collides with any live allocation (a /30 block
+    /// or a reserved hub subnet).
     pub fn is_allocated(&self, addr: Ipv4Addr) -> bool {
         let net_addr = u32::from(addr) & 0xFFFF_FFFC;
-        self.allocated.contains(&net_addr)
+        self.allocated.contains(&net_addr) || self.in_any_hub_block(u32::from(addr), 1)
+    }
+
+    /// Allocate a hub subnet of the given prefix. Returns the Ipv4Net.
+    pub fn alloc_hub_subnet(&mut self, prefix: u8) -> Result<Ipv4Net> {
+        anyhow::ensure!(
+            self.parent.prefix <= prefix && prefix <= 30,
+            "vpn hub prefix must be between {} and 30, got {}",
+            self.parent.prefix,
+            prefix
+        );
+        let base = u32::from(self.parent.network());
+        let host_bits = 32 - prefix;
+        let block_size = 1u32 << host_bits;
+        let parent_host_bits = 32 - self.parent.prefix;
+        let parent_size = 1u32 << parent_host_bits;
+
+        for offset in (0..parent_size).step_by(block_size as usize) {
+            let block_net = base + offset;
+            let block_end = block_net + block_size; // exclusive upper bound
+
+            // Skip blocks overlapping an existing hub block.
+            if self.in_any_hub_block(block_net, block_size) {
+                continue;
+            }
+            // Skip blocks overlapping any allocated /30 (each /30 spans 4 addrs).
+            // Iterate the live allocation set (small) — never the whole address
+            // space.
+            let collides_slash30 = self
+                .allocated
+                .iter()
+                .any(|&s| s < block_end && s + 4 > block_net);
+            if collides_slash30 {
+                continue;
+            }
+
+            self.hub_blocks.insert(block_net, prefix);
+            return Ok(Ipv4Net {
+                addr: Ipv4Addr::from(block_net),
+                prefix,
+            });
+        }
+        bail!("vpn hub pool exhausted")
+    }
+
+    /// Free a hub subnet. `net_addr` is the subnet's network address.
+    pub fn free_hub_subnet(&mut self, net_addr: u32) {
+        self.hub_blocks.remove(&net_addr);
+    }
+
+    fn in_any_hub_block(&self, net_addr: u32, span: u32) -> bool {
+        for (&hub_base, &hub_prefix) in &self.hub_blocks {
+            let hub_bits = 32 - hub_prefix;
+            let hub_size = 1u32 << hub_bits;
+            let hub_end = hub_base + hub_size;
+            let span_end = net_addr + span;
+            if !(span_end <= hub_base || net_addr >= hub_end) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// RAII guard that frees a hub subnet lease on drop.
+pub struct VpnHubLeaseGuard {
+    pool: Option<VpnPoolHandle>,
+    net_addr: u32,
+}
+
+impl VpnHubLeaseGuard {
+    /// Arm a guard that frees hub subnet `net_addr` from `pool` on drop.
+    pub fn new(pool: VpnPoolHandle, net_addr: u32) -> Self {
+        Self {
+            pool: Some(pool),
+            net_addr,
+        }
+    }
+
+    /// Disarm: the lease is handed off elsewhere and must not be freed on drop.
+    #[allow(dead_code)]
+    pub fn disarm(&mut self) {
+        self.pool = None;
+    }
+}
+
+impl Drop for VpnHubLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            let mut p = pool.lock().unwrap_or_else(|poison| poison.into_inner());
+            p.free_hub_subnet(self.net_addr);
+        }
+    }
+}
+
+/// RAII guard for a hub spoke: on drop it releases the peer's overlay address
+/// back to the [`HubState`] and best-effort notifies the hub listener with a
+/// `Leave` event. Armed right after `alloc_peer`, so the address is freed on
+/// EVERY return path of the connector handler (including early `?` failures
+/// before the relay/broker loop starts) — no address leak.
+struct HubPeerGuard {
+    hub: HubShared,
+    peer_id: u32,
+    overlay: Ipv4Addr,
+}
+
+impl Drop for HubPeerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.hub.state.lock() {
+            state.free_peer(self.overlay);
+        }
+        // Best-effort (sync Drop context): the hub listener also frees the whole
+        // subnet when it exits, and Phase 3 tears peers down on relay death.
+        let _ = self.hub.event_tx.try_send(HubPeerEvent::Leave {
+            peer_id: self.peer_id,
+        });
     }
 }
 
@@ -279,6 +545,9 @@ pub async fn serve_vpn_listener(
     udp_tuning: UdpDirectTuning,
     link_permits: Arc<Semaphore>,
     carriers: u16,
+    max_clients: u16,
+    vpn_hub_prefix: u8,
+    vpn_pool: Option<VpnPoolHandle>,
 ) -> Result<()> {
     // Acquire link permit (bounds live VPN links).
     let _permit = match link_permits.try_acquire() {
@@ -296,26 +565,108 @@ pub async fn serve_vpn_listener(
 
     // Register atomically; reject duplicate id.
     let session = next_vpn_session();
-    let (pair_tx, pair_rx) = oneshot::channel::<VpnPairMsg>();
-    match vpn_providers.entry(id.clone()) {
-        Entry::Occupied(_) => {
-            warn!(%id, "vpn id already in use");
+    let effective_max_clients = if max_clients == 0 { 1 } else { max_clients };
+
+    // Hub mode requires pool addressing.
+    let mut _hub_lease: Option<VpnHubLeaseGuard> = None;
+    let pair_rx: Option<oneshot::Receiver<VpnPairMsg>>;
+    let mut event_rx_opt: Option<mpsc::Receiver<HubPeerEvent>> = None;
+    let hub_opt: Option<HubShared>;
+
+    if effective_max_clients > 1 {
+        // Hub mode
+        if addr != VpnAddrRequest::Pool {
             control
-                .send(ServerMessage::VpnError(format!(
-                    "vpn id '{id}' already in use"
-                )))
+                .send(ServerMessage::VpnError(
+                    "hub mode (--max-clients > 1) requires server pool addressing (D6)".into(),
+                ))
                 .await?;
             return Ok(());
         }
-        Entry::Vacant(slot) => {
-            slot.insert(VpnProviderEntry {
-                advertised: advertised.clone(),
-                addr: addr.clone(),
-                opener,
-                pair_tx,
-                carriers,
-                session,
-            });
+        let pool_arc = match vpn_pool {
+            Some(p) => p,
+            None => {
+                control
+                    .send(ServerMessage::VpnError(
+                        "hub mode requires a server pool (--vpn-pool)".into(),
+                    ))
+                    .await?;
+                return Ok(());
+            }
+        };
+        let subnet = {
+            let mut p = pool_arc.lock().unwrap_or_else(|poison| poison.into_inner());
+            p.alloc_hub_subnet(vpn_hub_prefix)
+                .context("vpn hub subnet allocation failed")?
+        };
+        if let Some(msg) = check_overlap(&advertised, &[], subnet) {
+            control.send(ServerMessage::VpnError(msg)).await?;
+            return Ok(());
+        }
+        let hub_state = HubState::new(subnet, advertised.clone());
+        let (event_tx, event_rx) = mpsc::channel::<HubPeerEvent>(32);
+        let hub_shared = HubShared {
+            state: Arc::new(std::sync::Mutex::new(hub_state)),
+            event_tx,
+            max_clients: effective_max_clients,
+        };
+        _hub_lease = Some(VpnHubLeaseGuard::new(pool_arc, u32::from(subnet.network())));
+        hub_opt = Some(hub_shared);
+        event_rx_opt = Some(event_rx);
+        pair_rx = None;
+    } else {
+        // 1:1 mode
+        let (pair_tx, rx) = oneshot::channel::<VpnPairMsg>();
+        pair_rx = Some(rx);
+        hub_opt = None;
+        // event_rx_opt stays None (initialized above) in 1:1 mode.
+
+        match vpn_providers.entry(id.clone()) {
+            Entry::Occupied(_) => {
+                warn!(%id, "vpn id already in use");
+                control
+                    .send(ServerMessage::VpnError(format!(
+                        "vpn id '{id}' already in use"
+                    )))
+                    .await?;
+                return Ok(());
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(VpnProviderEntry {
+                    advertised: advertised.clone(),
+                    addr: addr.clone(),
+                    opener: opener.clone(),
+                    pair_tx: Some(pair_tx),
+                    hub: None,
+                    carriers,
+                    session,
+                });
+            }
+        }
+    };
+
+    if effective_max_clients > 1 {
+        match vpn_providers.entry(id.clone()) {
+            Entry::Occupied(_) => {
+                warn!(%id, "vpn id already in use");
+                control
+                    .send(ServerMessage::VpnError(format!(
+                        "vpn id '{id}' already in use"
+                    )))
+                    .await?;
+                return Ok(());
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(VpnProviderEntry {
+                    advertised: advertised.clone(),
+                    addr: addr.clone(),
+                    opener: opener.clone(),
+                    pair_tx: None,
+                    hub: hub_opt.clone(),
+                    carriers,
+                    session,
+                });
+            }
         }
     }
     // RAII deregister when this fn returns (generation-guarded, D5).
@@ -343,100 +694,225 @@ pub async fn serve_vpn_listener(
 
     info!(%id, "vpn listener registered, waiting for connector");
 
-    // Wait for a connector to pair us (or control channel to close).
-    let pair_msg = tokio::select! {
-        result = pair_rx => {
-            match result {
-                Ok(msg) => msg,
-                Err(_) => {
-                    warn!(%id, "vpn listener: pair channel dropped before connector arrived");
-                    return Ok(());
+    if effective_max_clients > 1 {
+        // Hub mode
+        let mut event_rx = event_rx_opt.take().unwrap();
+        let hub = hub_opt.clone().unwrap();
+
+        // The hub's own VpnReady carries no peer routes (peer_advertised: vec![]);
+        // its advertised CIDRs reach spokes via each connector's VpnReady instead.
+        let (hub_overlay, hub_prefix) = {
+            let hub_state = hub.state.lock().unwrap();
+            (hub_state.hub_overlay, hub_state.subnet.prefix)
+        };
+
+        control
+            .send(ServerMessage::VpnReady {
+                assigned: hub_overlay,
+                prefix: hub_prefix,
+                peer_overlay: hub_overlay,
+                peer_advertised: vec![],
+                session_nonce: new_nonce(),
+                tuning: udp_tuning,
+                admin_v2: true,
+                carriers,
+            })
+            .await?;
+
+        admin_reg.set_overlay(format!("{hub_overlay}/{hub_prefix}"));
+
+        let heartbeat = Duration::from_millis(500);
+        let mut hb = interval(heartbeat);
+        hb.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                _ = hb.tick() => {
+                    if control.send(ServerMessage::Heartbeat).await.is_err() {
+                        info!(%id, "vpn hub listener disconnected");
+                        break;
+                    }
+                }
+                Some(ev) = event_rx.recv() => {
+                    match ev {
+                        HubPeerEvent::Join {
+                            peer_id,
+                            overlay,
+                            advertised,
+                            nonce,
+                            carriers,
+                        } => {
+                            if control
+                                .send(ServerMessage::VpnPeerJoin {
+                                    peer_id,
+                                    peer_overlay: overlay,
+                                    peer_advertised: advertised,
+                                    session_nonce: nonce,
+                                    carriers,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                info!(%id, "vpn hub listener disconnected");
+                                break;
+                            }
+                        }
+                        HubPeerEvent::Leave { peer_id } => {
+                            if control
+                                .send(ServerMessage::VpnPeerLeave { peer_id })
+                                .await
+                                .is_err()
+                            {
+                                info!(%id, "vpn hub listener disconnected");
+                                break;
+                            }
+                        }
+                        HubPeerEvent::Punch {
+                            peer_id,
+                            offer,
+                        } => {
+                            if control
+                                .send(ServerMessage::UdpPunch {
+                                    nonce: offer.nonce,
+                                    peer: offer.peer_candidates,
+                                    peer_selected_stun: offer.peer_selected_stun,
+                                    tuning: udp_tuning,
+                                    peer_id,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                info!(%id, "vpn hub listener disconnected");
+                                break;
+                            }
+                        }
+                    }
+                }
+                msg = control.recv::<ClientMessage>() => {
+                    match msg {
+                        Ok(Some(ClientMessage::UdpCandidateOffer(offer))) => {
+                            {
+                                let mut hub_state = hub.state.lock().unwrap();
+                                hub_state.set_hub_candidates(
+                                    offer.peer_id,
+                                    offer.candidates,
+                                    offer.selected_stun,
+                                );
+                            }
+                        }
+                        Ok(Some(ClientMessage::VpnPathReport { path })) => {
+                            admin_reg.set_vpn_direct(path == "direct");
+                        }
+                        Ok(None) | Err(_) => {
+                            info!(%id, "vpn hub listener disconnected");
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
-        result = control.recv::<ClientMessage>() => {
-            // Client disconnected before pairing.
-            let _ = result;
-            return Ok(());
+    } else {
+        // 1:1 mode (unchanged)
+        let mut pair_rx = pair_rx.unwrap(); // safe: 1:1 mode always has pair_rx
+
+        // Wait for a connector to pair us (or control channel to close).
+        let pair_msg = tokio::select! {
+            result = &mut pair_rx => {
+                match result {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        warn!(%id, "vpn listener: pair channel dropped before connector arrived");
+                        return Ok(());
+                    }
+                }
+            }
+            result = control.recv::<ClientMessage>() => {
+                // Client disconnected before pairing.
+                let _ = result;
+                return Ok(());
+            }
+        };
+
+        // Record the assigned overlay on the admin entry, then deliver VpnReady.
+        if let ServerMessage::VpnReady {
+            assigned, prefix, ..
+        } = &pair_msg.listener_ready
+        {
+            admin_reg.set_overlay(format!("{assigned}/{prefix}"));
         }
-    };
+        control.send(pair_msg.listener_ready).await?;
 
-    // Record the assigned overlay on the admin entry, then deliver VpnReady.
-    if let ServerMessage::VpnReady {
-        assigned, prefix, ..
-    } = &pair_msg.listener_ready
-    {
-        admin_reg.set_overlay(format!("{assigned}/{prefix}"));
-    }
-    control.send(pair_msg.listener_ready).await?;
+        // Register for UDP direct path (so connector can get our candidates).
+        // The channel is REAL (unlike the Phase-4 stub): the connector handler
+        // forwards its offer through `to_provider`, and the select arm below relays
+        // the punch to the listener client.
+        let udp_id = format!("vpn:{id}");
+        let (to_provider_tx, mut to_provider_rx) =
+            tokio::sync::mpsc::channel::<secret::UdpOffer>(4);
+        udp_providers.insert(
+            udp_id.clone(),
+            secret::UdpReg {
+                candidates: vec![],
+                selected_stun: None,
+                nonce: pair_msg.nonce,
+                to_provider: to_provider_tx,
+            },
+        );
+        // Arm the generation-guarded UDP removal for this pairing only.
+        deregister.nonce = Some(pair_msg.nonce);
 
-    // Register for UDP direct path (so connector can get our candidates).
-    // The channel is REAL (unlike the Phase-4 stub): the connector handler
-    // forwards its offer through `to_provider`, and the select arm below relays
-    // the punch to the listener client.
-    let udp_id = format!("vpn:{id}");
-    let (to_provider_tx, mut to_provider_rx) = tokio::sync::mpsc::channel::<secret::UdpOffer>(4);
-    udp_providers.insert(
-        udp_id.clone(),
-        secret::UdpReg {
-            candidates: vec![],
-            selected_stun: None,
-            nonce: pair_msg.nonce,
-            to_provider: to_provider_tx,
-        },
-    );
-    // Arm the generation-guarded UDP removal for this pairing only.
-    deregister.nonce = Some(pair_msg.nonce);
-
-    // Heartbeat loop (same shape as serve_provider).
-    let heartbeat = Duration::from_millis(500);
-    let mut hb = interval(heartbeat);
-    hb.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            _ = hb.tick() => {
-                if let Err(_e) = control.send(ServerMessage::Heartbeat).await {
-                    info!(%id, "vpn listener disconnected");
-                    break;
-                }
-            }
-            Some(offer) = to_provider_rx.recv() => {
-                // The connector offered candidates: forward the punch so the
-                // listener can start its QUIC endpoint and punch back.
-                info!(%id, "forwarding vpn udp punch to listener");
-                if control.send(ServerMessage::UdpPunch {
-                    nonce: offer.nonce,
-                    peer: offer.peer_candidates,
-                    peer_selected_stun: offer.peer_selected_stun,
-                    tuning: udp_tuning,
-                }).await.is_err() {
-                    info!(%id, "vpn listener disconnected");
-                    break;
-                }
-            }
-            msg = control.recv::<ClientMessage>() => {
-                match msg {
-                    Ok(Some(ClientMessage::UdpCandidateOffer(offer))) => {
-                        // Store candidates for the connector's broker to read.
-                        if let Some(mut entry) = udp_providers.get_mut(&udp_id) {
-                            entry.candidates = offer.candidates;
-                            entry.selected_stun = offer.selected_stun;
-                        }
-                    }
-                    Ok(Some(ClientMessage::UdpCandidates(addrs))) => {
-                        // Legacy UDP candidates format.
-                        if let Some(mut entry) = udp_providers.get_mut(&udp_id) {
-                            entry.candidates = addrs;
-                        }
-                    }
-                    Ok(Some(ClientMessage::VpnPathReport { path })) => {
-                        admin_reg.set_vpn_direct(path == "direct");
-                    }
-                    Ok(None) | Err(_) => {
+        // Heartbeat loop (same shape as serve_provider).
+        let heartbeat = Duration::from_millis(500);
+        let mut hb = interval(heartbeat);
+        hb.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = hb.tick() => {
+                    if let Err(_e) = control.send(ServerMessage::Heartbeat).await {
                         info!(%id, "vpn listener disconnected");
                         break;
                     }
-                    _ => {}
+                }
+                Some(offer) = to_provider_rx.recv() => {
+                    // The connector offered candidates: forward the punch so the
+                    // listener can start its QUIC endpoint and punch back.
+                    info!(%id, "forwarding vpn udp punch to listener");
+                    if control.send(ServerMessage::UdpPunch {
+                        nonce: offer.nonce,
+                        peer: offer.peer_candidates,
+                        peer_selected_stun: offer.peer_selected_stun,
+                        tuning: udp_tuning,
+                        peer_id: 0,
+                    }).await.is_err() {
+                        info!(%id, "vpn listener disconnected");
+                        break;
+                    }
+                }
+                msg = control.recv::<ClientMessage>() => {
+                    match msg {
+                        Ok(Some(ClientMessage::UdpCandidateOffer(offer))) => {
+                            // Store candidates for the connector's broker to read.
+                            if let Some(mut entry) = udp_providers.get_mut(&udp_id) {
+                                entry.candidates = offer.candidates;
+                                entry.selected_stun = offer.selected_stun;
+                            }
+                        }
+                        Ok(Some(ClientMessage::UdpCandidates(addrs))) => {
+                            // Legacy UDP candidates format.
+                            if let Some(mut entry) = udp_providers.get_mut(&udp_id) {
+                                entry.candidates = addrs;
+                            }
+                        }
+                        Ok(Some(ClientMessage::VpnPathReport { path })) => {
+                            admin_reg.set_vpn_direct(path == "direct");
+                        }
+                        Ok(None) | Err(_) => {
+                            info!(%id, "vpn listener disconnected");
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -498,6 +974,7 @@ pub async fn serve_vpn_connector(
     let listener_addr_req = listener_entry.addr.clone();
     let listener_opener = listener_entry.opener.clone();
     let listener_carriers = listener_entry.carriers;
+    let hub = listener_entry.hub.clone();
     drop(listener_entry);
 
     // Negotiate the relay carrier count (DEC-7): both sides and the server
@@ -510,6 +987,264 @@ pub async fn serve_vpn_connector(
     // RAII guard for pool lease: freed on all error returns; lives for link duration.
     let mut _pool_lease: Option<VpnLeaseGuard> = None;
 
+    // Hub mode branch
+    if let Some(hub) = hub {
+        // Hub mode: allocate a peer address from the hub subnet
+        if !advertised.is_empty() {
+            control
+                .send(ServerMessage::VpnError(
+                    "connector --advertise is not allowed in hub mode (hub-and-spoke only, D4)"
+                        .into(),
+                ))
+                .await?;
+            return Ok(());
+        }
+        if addr != VpnAddrRequest::Pool {
+            control
+                .send(ServerMessage::VpnError(
+                    "hub mode requires pool addressing on the connector".into(),
+                ))
+                .await?;
+            return Ok(());
+        }
+
+        // Capacity check + address allocation under ONE lock (no TOCTOU between
+        // the check and the alloc: two concurrent connectors can't both pass a
+        // stale capacity check and over-allocate).
+        let alloc = {
+            let mut state = hub.state.lock().unwrap();
+            if state.peer_count() >= hub.max_clients as usize {
+                Err(format!("hub '{id}' is at capacity (--max-clients reached)"))
+            } else {
+                state.alloc_peer().map_err(|e| e.to_string())
+            }
+        };
+        let peer_slot = match alloc {
+            Ok(slot) => slot,
+            Err(msg) => {
+                control.send(ServerMessage::VpnError(msg)).await?;
+                return Ok(());
+            }
+        };
+
+        // Free the address + notify the hub on ANY subsequent return path.
+        let _peer_guard = HubPeerGuard {
+            hub: hub.clone(),
+            peer_id: peer_slot.peer_id,
+            overlay: peer_slot.overlay,
+        };
+
+        let hub_overlay = {
+            let state = hub.state.lock().unwrap();
+            state.hub_overlay
+        };
+        let hub_prefix = {
+            let state = hub.state.lock().unwrap();
+            state.subnet.prefix
+        };
+        let hub_advertised = {
+            let state = hub.state.lock().unwrap();
+            state.advertised.clone()
+        };
+
+        // Send VpnReady to connector
+        control
+            .send(ServerMessage::VpnReady {
+                assigned: peer_slot.overlay,
+                prefix: hub_prefix,
+                peer_overlay: hub_overlay,
+                peer_advertised: hub_advertised.clone(),
+                session_nonce: peer_slot.nonce,
+                tuning: udp_tuning,
+                admin_v2: true,
+                carriers: effective_carriers,
+            })
+            .await?;
+
+        // Notify hub of the new peer
+        let _ = hub
+            .event_tx
+            .send(HubPeerEvent::Join {
+                peer_id: peer_slot.peer_id,
+                overlay: peer_slot.overlay,
+                advertised: hub_advertised.clone(),
+                nonce: peer_slot.nonce,
+                carriers: effective_carriers,
+            })
+            .await;
+
+        // Admin entry
+        let admin_reg = admin.register(NewEntry {
+            role: Role::VpnConnector,
+            peer,
+            secret_id: Some(format!("vpn:{id}")),
+            public_port: None,
+            notes,
+            basic_auth: false,
+            https: false,
+            force_https: false,
+            udp: false,
+        });
+        admin_reg.set_overlay(format!("{}/32", peer_slot.overlay));
+
+        // Set up relay acceptor for this peer
+        let id_clone = id.clone();
+        let active_counter = admin_reg.active();
+        let (relay_tx, relay_rx) = admin_reg.relay_bytes();
+        let peer_id = peer_slot.peer_id;
+        let acceptor_handle = tokio::spawn(async move {
+            while let Some(connector_stream) = acceptor.accept().await {
+                let permit = match Arc::clone(&conn_permits).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let listener_opener = listener_opener.clone();
+                let id = id_clone.clone();
+                let guard = crate::admin::ActiveGuard::new(Arc::clone(&active_counter));
+                let counted = CountingStream {
+                    inner: connector_stream,
+                    rx: Arc::clone(&relay_rx),
+                    tx: Arc::clone(&relay_tx),
+                };
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _guard = guard;
+                    if let Err(e) = vpn_relay_hub(counted, listener_opener, peer_id).await {
+                        tracing::trace!(%e, %id, "vpn hub relay closed");
+                    }
+                });
+            }
+        });
+
+        // Broker loop (Phase 4.1: per-peer UDP broker, hub-side candidates polling)
+        // Track per-spoke offer state: deadline-based rounds (re-arm on each fresh offer).
+        // On each 500ms tick: check deadline timeout, poll hub.state for hub_candidates,
+        // send UdpPunch when both offers are ready.
+        let mut heartbeat = interval(Duration::from_millis(500));
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let hub_clone = hub.clone();
+        let punch_timeout = Duration::from_secs(10);
+
+        let mut spoke_offer: Option<crate::shared::UdpCandidateOffer> = None;
+        let mut offer_deadline: Option<tokio::time::Instant> = None;
+        let mut punched = false;
+
+        loop {
+            // Check if it's time to poll and punch (before select! to avoid deadlock on lock)
+            if !punched {
+                if let Some(offer) = spoke_offer.as_ref() {
+                    // Clone out so no Mutex guard is held across an await point (DEC-6 pattern).
+                    let hub_cands = {
+                        let hub_state = hub_clone.state.lock().unwrap();
+                        hub_state.peers.get(&peer_id).map(|slot| {
+                            (slot.hub_candidates.clone(), slot.hub_selected_stun.clone())
+                        })
+                    };
+
+                    match hub_cands {
+                        Some((cands, stun)) if !cands.is_empty() => {
+                            // Both offers ready: punch the spoke with hub's candidates.
+                            if control
+                                .send(ServerMessage::UdpPunch {
+                                    nonce: peer_slot.nonce,
+                                    peer: cands.clone(),
+                                    peer_selected_stun: stun,
+                                    tuning: udp_tuning,
+                                    peer_id,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            // Forward spoke's offer to the hub listener via event channel.
+                            let fwd = secret::UdpOffer {
+                                nonce: peer_slot.nonce,
+                                peer_candidates: offer.candidates.clone(),
+                                peer_selected_stun: offer.selected_stun.clone(),
+                            };
+                            let _ = hub_clone
+                                .event_tx
+                                .send(HubPeerEvent::Punch {
+                                    peer_id,
+                                    offer: fwd,
+                                })
+                                .await;
+                            info!(%peer_id, "brokered vpn udp punch to hub and spoke");
+                            punched = true;
+                            // Clear hub_candidates so the next round waits for a fresh offer from hub.
+                            {
+                                let mut hub_state = hub_clone.state.lock().unwrap();
+                                if let Some(slot) = hub_state.peers.get_mut(&peer_id) {
+                                    slot.hub_candidates.clear();
+                                    slot.hub_selected_stun = None;
+                                }
+                            }
+                        }
+                        Some(_) => {
+                            // Hub registered but has not offered candidates yet: wait until deadline.
+                            if offer_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+                                info!(%peer_id, "hub offered no udp candidates in time; spoke stays on relay");
+                                let _ = control.send(ServerMessage::UdpUnavailable).await;
+                                punched = true;
+                            }
+                        }
+                        None => {
+                            // Hub peer slot gone (hub disconnected or peer freed):
+                            // direct path is impossible for this spoke.
+                            info!(%peer_id, "no hub udp available; spoke will use relay");
+                            let _ = control.send(ServerMessage::UdpUnavailable).await;
+                            punched = true;
+                        }
+                    }
+                }
+            }
+
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    if control.send(ServerMessage::Heartbeat).await.is_err() {
+                        break;
+                    }
+                }
+                msg = control.recv::<ClientMessage>() => {
+                    match msg {
+                        Ok(Some(ClientMessage::UdpCandidateOffer(offer))) => {
+                            // Fresh offer: re-arm the broker round (client retries while on relay).
+                            // Store offer and reset deadline for polling hub candidates.
+                            spoke_offer = Some(offer);
+                            offer_deadline = Some(tokio::time::Instant::now() + punch_timeout);
+                            punched = false;
+                            // Push the spoke's offer to the hub listener so it can punch back.
+                            let _ = hub_clone
+                                .event_tx
+                                .send(HubPeerEvent::Punch {
+                                    peer_id,
+                                    offer: secret::UdpOffer {
+                                        nonce: peer_slot.nonce,
+                                        peer_candidates: spoke_offer.as_ref().unwrap().candidates.clone(),
+                                        peer_selected_stun: spoke_offer.as_ref().unwrap().selected_stun.clone(),
+                                    },
+                                })
+                                .await;
+                        }
+                        Ok(Some(ClientMessage::VpnPathReport { path })) => {
+                            admin_reg.set_vpn_direct(path == "direct");
+                        }
+                        Ok(None) | Err(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Cleanup: stop accepting relay substreams. `_peer_guard` frees the
+        // overlay address and notifies the hub (Leave) on drop — covering this
+        // normal exit and every early `?` return above.
+        acceptor_handle.abort();
+        return Ok(());
+    }
+
+    // 1:1 mode (unchanged)
     // Determine overlay addressing based on listener and connector requests.
     let (listener_overlay, connector_overlay, nonce) = match (&listener_addr_req, &addr) {
         // Both use pool: allocate a /30
@@ -629,10 +1364,12 @@ pub async fn serve_vpn_connector(
     // Extract the entry and send the pair_tx (consuming it)
     if let Some((_, entry)) = vpn_providers.remove(&id) {
         // This fails silently if the listener disconnected.
-        let _ = entry.pair_tx.send(VpnPairMsg {
-            listener_ready,
-            nonce,
-        });
+        if let Some(pair_tx) = entry.pair_tx {
+            let _ = pair_tx.send(VpnPairMsg {
+                listener_ready,
+                nonce,
+            });
+        }
         // Note: entry is not re-inserted; it's consumed after pairing
     }
 
@@ -714,6 +1451,7 @@ pub async fn serve_vpn_connector(
                                 peer: cands,
                                 peer_selected_stun: stun,
                                 tuning: udp_tuning,
+                                peer_id: 0,
                             })
                             .await?;
                         // ...and forward the connector's offer to the listener.
@@ -778,6 +1516,7 @@ pub async fn serve_vpn_connector(
                         connector_offer = Some(crate::shared::UdpCandidateOffer {
                             candidates: consumer_cands,
                             selected_stun: None,
+                            peer_id: 0,
                         });
                         offer_deadline = Some(tokio::time::Instant::now() + punch_timeout);
                         punched = false;
@@ -851,6 +1590,33 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountingStream<
     }
 }
 
+/// Relay a connector substream to the hub listener, injecting the peer_id header.
+async fn vpn_relay_hub<S>(
+    mut connector: S,
+    listener_opener: mux::Opener,
+    peer_id: u32,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // Consume the connector's readiness marker
+    let mut marker = [0u8; 1];
+    connector.read_exact(&mut marker).await?;
+
+    // Open a substream to the listener
+    let mut listener = listener_opener.open().await.context("hub unavailable")?;
+
+    // Write STREAM_READY + peer_id header
+    let mut head = [0u8; 5];
+    head[0] = mux::STREAM_READY;
+    head[1..5].copy_from_slice(&peer_id.to_be_bytes());
+    listener.write_all(&head).await?;
+
+    let buf = proxy_buffer_size();
+    tokio::io::copy_bidirectional_with_sizes(&mut connector, &mut listener, buf, buf).await?;
+    Ok(())
+}
+
 /// Relay a connector substream to the listener.
 async fn vpn_relay<S>(mut connector: S, listener_opener: mux::Opener, _id: &str) -> Result<()>
 where
@@ -888,7 +1654,8 @@ mod tests {
             advertised: vec![],
             addr: VpnAddrRequest::Pool,
             opener,
-            pair_tx,
+            pair_tx: Some(pair_tx),
+            hub: None,
             carriers: 1,
             session,
         }

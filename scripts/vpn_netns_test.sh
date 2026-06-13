@@ -68,16 +68,20 @@ cleanup() {
     ip netns del ns0 2>/dev/null
     ip netns del ns1 2>/dev/null
     ip netns del ns2 2>/dev/null
+    ip netns del ns3 2>/dev/null
+    ip netns del ns4 2>/dev/null
     rm -f "$BORE_LOG"
     set -e
 }
 trap cleanup EXIT INT TERM
 
 # ── Setup ──────────────────────────────────────────────────────────────────────
-echo "=== Setup: creating netns ns0/ns1/ns2 ==="
+echo "=== Setup: creating netns ns0/ns1/ns2/ns3/ns4 ==="
 ip netns add ns0
 ip netns add ns1
 ip netns add ns2
+ip netns add ns3
+ip netns add ns4
 
 # ns0 ↔ ns1: create veth pair in root, move ends to namespaces
 ip link add veth0s type veth peer name veth0p
@@ -97,17 +101,47 @@ ip netns exec ns2 ip addr add "$SERVER_IP_NS2/24"   dev veth1p
 ip netns exec ns0 ip link set veth1s up
 ip netns exec ns2 ip link set veth1p up
 
+# ns0 ↔ ns3
+SERVER_IP_NS3="10.203.0.1"
+SERVER_IP_NS0_C="10.203.0.2"
+ip link add veth2s type veth peer name veth2p
+ip link set veth2s netns ns0
+ip link set veth2p netns ns3
+ip netns exec ns0 ip addr add "$SERVER_IP_NS0_C/24" dev veth2s
+ip netns exec ns3 ip addr add "$SERVER_IP_NS3/24"   dev veth2p
+ip netns exec ns0 ip link set veth2s up
+ip netns exec ns3 ip link set veth2p up
+
+# ns0 ↔ ns4
+SERVER_IP_NS4="10.204.0.1"
+SERVER_IP_NS0_D="10.204.0.2"
+ip link add veth3s type veth peer name veth3p
+ip link set veth3s netns ns0
+ip link set veth3p netns ns4
+ip netns exec ns0 ip addr add "$SERVER_IP_NS0_D/24" dev veth3s
+ip netns exec ns4 ip addr add "$SERVER_IP_NS4/24"   dev veth3p
+ip netns exec ns0 ip link set veth3s up
+ip netns exec ns4 ip link set veth3p up
+
 # Enable loopback in all ns
 ip netns exec ns0 ip link set lo up
 ip netns exec ns1 ip link set lo up
 ip netns exec ns2 ip link set lo up
+ip netns exec ns3 ip link set lo up
+ip netns exec ns4 ip link set lo up
 
 # ns1 fake LAN on loopback
 ip netns exec ns1 ip addr add "$FAKE_LAN_HOST/24" dev lo
+# Two scenario LANs behind the hub for the T-SCEN acceptance tests (host-D
+# advertises both; spokes accept/refuse per policy).
+ip netns exec ns1 ip addr add "192.168.4.1/24"  dev lo
+ip netns exec ns1 ip addr add "10.10.0.1/16"    dev lo
 
-# Default routes: ns1 and ns2 route to each other via server (ns0)
+# Default routes: ns1, ns2, ns3, ns4 route to each other via server (ns0)
 ip netns exec ns1 ip route add default via "$SERVER_IP_NS0_A"
 ip netns exec ns2 ip route add default via "$SERVER_IP_NS0_B"
+ip netns exec ns3 ip route add default via "$SERVER_IP_NS0_C"
+ip netns exec ns4 ip route add default via "$SERVER_IP_NS0_D"
 # ns0 already has direct routes via connected interfaces; no extra routes needed
 # Allow ns0 to forward
 ip netns exec ns0 sysctl -qw net.ipv4.ip_forward=1
@@ -218,6 +252,7 @@ sleep 0.5
 
 ip netns exec ns2 "$BORE" vpn connect \
     --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id site-test \
+    --accept-all-routes \
     >"$BORE_LOG.connect2" 2>&1 &
 BORE_CONNECT_PID=$!
 
@@ -280,6 +315,126 @@ else
     # ip_forward may stay 1 if it was already 1 before; check the saved value
     pass "ip_forward is $NS1_POST_IPF after teardown (was $NS1_PRE_IPF before gateway mode)"
 fi
+
+# ── Test T-RF1: default deny (no route flag) ───────────────────────────────────
+echo "=== T-RF1: default deny (no route flag) ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-rf1-default-deny \
+    --advertise "$FAKE_LAN" \
+    >"$BORE_LOG.listen_rf1" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-rf1-default-deny \
+    >"$BORE_LOG.connect_rf1" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.listen_rf1" "vpn link paired\|VpnReady" 10; then
+    sleep 1
+    # Verify route was NOT installed
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$FAKE_LAN"; then
+        fail "T-RF1: advertised route WAS installed (should be default-deny)"
+    else
+        pass "T-RF1: route to $FAKE_LAN NOT installed (default-deny works)"
+    fi
+    # Ping fake LAN host should FAIL
+    if ip netns exec ns2 ping -c 1 -W 3 "$FAKE_LAN_HOST" >/dev/null 2>&1; then
+        fail "T-RF1: ping to $FAKE_LAN_HOST succeeded (should fail with default-deny)"
+    else
+        pass "T-RF1: ping to $FAKE_LAN_HOST failed as expected (default-deny)"
+    fi
+    # Overlay ping should work (host-only)
+    NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    NS2_OVL=$(ip netns exec ns2 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    if [ -n "$NS1_OVL" ] && [ -n "$NS2_OVL" ]; then
+        if ip netns exec ns2 ping -c 1 -W 3 "$NS1_OVL" >/dev/null 2>&1; then
+            pass "T-RF1: overlay ping works (host-only reachable)"
+        else
+            fail "T-RF1: overlay ping failed"
+        fi
+    fi
+else
+    fail "T-RF1: listener did not pair"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
+# ── Test T-RF2: accept-all-routes ─────────────────────────────────────────────
+echo "=== T-RF2: --accept-all-routes ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-rf2-accept-all \
+    --advertise "$FAKE_LAN" \
+    >"$BORE_LOG.listen_rf2" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-rf2-accept-all \
+    --accept-all-routes \
+    >"$BORE_LOG.connect_rf2" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.listen_rf2" "vpn link paired\|VpnReady" 10; then
+    sleep 1
+    # Verify route WAS installed
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$FAKE_LAN"; then
+        pass "T-RF2: route to $FAKE_LAN installed with --accept-all-routes"
+    else
+        fail "T-RF2: route to $FAKE_LAN NOT installed (--accept-all-routes failed)"
+    fi
+    # Ping fake LAN host should SUCCEED
+    if ip netns exec ns2 ping -c 1 -W 3 "$FAKE_LAN_HOST" >/dev/null 2>&1; then
+        pass "T-RF2: ping to $FAKE_LAN_HOST succeeded (--accept-all-routes works)"
+    else
+        fail "T-RF2: ping to $FAKE_LAN_HOST failed (--accept-all-routes should allow it)"
+    fi
+else
+    fail "T-RF2: listener did not pair"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
+# ── Test T-RF3: accept-all-routes + refuse-routes ────────────────────────────
+echo "=== T-RF3: --accept-all-routes --refuse-routes ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-rf3-refuse \
+    --advertise "$FAKE_LAN" \
+    >"$BORE_LOG.listen_rf3" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-rf3-refuse \
+    --accept-all-routes --refuse-routes "$FAKE_LAN" \
+    >"$BORE_LOG.connect_rf3" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.listen_rf3" "vpn link paired\|VpnReady" 10; then
+    sleep 1
+    # Verify route was NOT installed (refused)
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$FAKE_LAN"; then
+        fail "T-RF3: advertised route WAS installed (should be refused)"
+    else
+        pass "T-RF3: route to $FAKE_LAN NOT installed (refuse override works)"
+    fi
+    # Ping fake LAN host should FAIL
+    if ip netns exec ns2 ping -c 1 -W 3 "$FAKE_LAN_HOST" >/dev/null 2>&1; then
+        fail "T-RF3: ping to $FAKE_LAN_HOST succeeded (should fail with refuse)"
+    else
+        pass "T-RF3: ping to $FAKE_LAN_HOST failed as expected (refused)"
+    fi
+else
+    fail "T-RF3: listener did not pair"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
 
 # ── Test 3: relay fallback ─────────────────────────────────────────────────────
 echo "=== Test 3: relay fallback (block UDP between peers) ==="
@@ -494,7 +649,7 @@ sleep 0.5
 
 ip netns exec ns2 "$BORE" vpn connect \
     --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id direct-gw-test \
-    --stun-server "$STUN" \
+    --accept-all-routes --stun-server "$STUN" \
     >"$BORE_LOG.connect8" 2>&1 &
 BORE_CONNECT_PID=$!
 
@@ -547,7 +702,7 @@ ip netns exec ns2 "$BORE" vpn connect \
 BORE_CONNECT_PID=$!
 
 if wait_for_log "$BORE_LOG.listen9" "vpn link paired" 10; then
-    sleep 3  # generous window: an unwanted upgrade would land in here
+    sleep 2.5; sleep 0.5  # give TUN time to settle  # generous window: an unwanted upgrade would land in here
     NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
     if [ -n "$NS1_OVL" ] && ip netns exec ns2 ping -c 2 -W 3 "$NS1_OVL" >/dev/null 2>&1; then
         pass "relay-only: ping works"
@@ -767,6 +922,7 @@ BORE_LISTEN_PID=$!
 sleep 0.5
 ip netns exec ns2 "$BORE" vpn connect \
     --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id reclaim-full --relay-only \
+    --accept-all-routes \
     >"$BORE_LOG.connect14" 2>&1 &
 BORE_CONNECT_PID=$!
 
@@ -793,6 +949,7 @@ if wait_for_log "$BORE_LOG.listen14" "vpn link paired" 10; then
     sleep 0.5
     ip netns exec ns2 "$BORE" vpn connect \
         --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id reclaim-full --relay-only \
+        --accept-all-routes \
         >"$BORE_LOG.connect14b" 2>&1 &
     BORE_CONNECT_PID=$!
     if wait_for_log "$BORE_LOG.listen14b" "vpn link paired" 15; then
@@ -901,6 +1058,7 @@ sleep 0.5
 
 ip netns exec ns2 "$BORE" vpn connect \
     --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-new-1-gw-route \
+    --accept-all-routes \
     >"$BORE_LOG.connect16" 2>&1 &
 BORE_CONNECT_PID=$!
 
@@ -1111,6 +1269,428 @@ else
     kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
 fi
 sleep 0.5
+
+# ── Test T-HUB1: multi-connector address allocation ─────────────────────────
+echo "=== T-HUB1: hub multi-connector address allocation ==="
+# Host-only hub spoke isolation relies on the hub host NOT forwarding between
+# spokes. A prior SIGKILL test (Test 14) can leave ns1 ip_forward=1 (reclaim
+# only restores it on the next same-id run), so reset it for a clean baseline.
+ip netns exec ns1 sysctl -qw net.ipv4.ip_forward=0 2>/dev/null || true
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hub-relay \
+    --max-clients 4 --relay-only \
+    >"$BORE_LOG.hub_listen" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 1
+
+# Start 3 connectors on ns2, ns3, ns4
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_B" --secret "$SECRET" --id hub-relay \
+    --relay-only \
+    >"$BORE_LOG.hub_conn2" 2>&1 &
+BORE_HUB_CONN2=$!
+
+ip netns exec ns3 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_C" --secret "$SECRET" --id hub-relay \
+    --relay-only \
+    >"$BORE_LOG.hub_conn3" 2>&1 &
+BORE_HUB_CONN3=$!
+
+ip netns exec ns4 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_D" --secret "$SECRET" --id hub-relay \
+    --relay-only \
+    >"$BORE_LOG.hub_conn4" 2>&1 &
+BORE_HUB_CONN4=$!
+
+# Wait for all 3 connectors to join the hub (look for "vpn hub peer join" x3)
+HUB_PAIRED=0
+if wait_for_log "$BORE_LOG.hub_listen" "vpn hub peer join" 15; then
+    sleep 1; PEER_JOIN_COUNT=$(grep -c "vpn hub peer join" "$BORE_LOG.hub_listen" 2>/dev/null || echo 0)
+    if [ "$PEER_JOIN_COUNT" -ge 3 ]; then
+        HUB_PAIRED=1
+    fi
+fi
+
+if [ "$HUB_PAIRED" = "1" ]; then
+    sleep 2  # Let interfaces settle
+    HUB_OVERLAY=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    CONN2_OVERLAY=$(ip netns exec ns2 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    CONN3_OVERLAY=$(ip netns exec ns3 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    CONN4_OVERLAY=$(ip netns exec ns4 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+
+    if [ -n "$HUB_OVERLAY" ] && [ -n "$CONN2_OVERLAY" ] && [ -n "$CONN3_OVERLAY" ] && [ -n "$CONN4_OVERLAY" ]; then
+        # Verify distinct addresses
+        ADDRS="$HUB_OVERLAY $CONN2_OVERLAY $CONN3_OVERLAY $CONN4_OVERLAY"
+        UNIQUE_ADDRS=$(echo "$ADDRS" | tr ' ' '\n' | sort | uniq | wc -l)
+        if [ "$UNIQUE_ADDRS" = "4" ]; then
+            pass "T-HUB1: all 4 peers assigned distinct overlay addresses (hub=$HUB_OVERLAY, conn2=$CONN2_OVERLAY, conn3=$CONN3_OVERLAY, conn4=$CONN4_OVERLAY)"
+        else
+            fail "T-HUB1: overlay addresses NOT distinct"
+        fi
+    else
+        fail "T-HUB1: one or more overlay addresses missing"
+    fi
+else
+    fail "T-HUB1: hub did not establish 3 connector pairs within timeout"
+fi
+
+kill "$BORE_HUB_CONN2" "$BORE_HUB_CONN3" "$BORE_HUB_CONN4" 2>/dev/null
+BORE_HUB_CONN2=""
+BORE_HUB_CONN3=""
+BORE_HUB_CONN4=""
+sleep 0.5
+
+# ── Test T-HUB2: spoke isolation ───────────────────────────────────────────────
+echo "=== T-HUB2: spoke isolation (no spoke↔spoke) ==="
+# Restart 3 connectors
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_B" --secret "$SECRET" --id hub-relay \
+    --relay-only \
+    >"$BORE_LOG.hub_conn2_t2" 2>&1 &
+BORE_HUB_CONN2=$!
+
+ip netns exec ns3 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_C" --secret "$SECRET" --id hub-relay \
+    --relay-only \
+    >"$BORE_LOG.hub_conn3_t2" 2>&1 &
+BORE_HUB_CONN3=$!
+
+ip netns exec ns4 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_D" --secret "$SECRET" --id hub-relay \
+    --relay-only \
+    >"$BORE_LOG.hub_conn4_t2" 2>&1 &
+BORE_HUB_CONN4=$!
+
+sleep 2.5; sleep 0.5  # give TUN time to settle
+CONN2_OVL=$(ip netns exec ns2 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+CONN3_OVL=$(ip netns exec ns3 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+
+# Test: ns2 should FAIL to ping ns3 (spoke isolation)
+if [ -n "$CONN2_OVL" ] && [ -n "$CONN3_OVL" ]; then
+    if ip netns exec ns2 ping -c 1 -W 2 "$CONN3_OVL" >/dev/null 2>&1; then
+        fail "T-HUB2: ns2 can ping ns3 (spoke isolation violated)"
+    else
+        pass "T-HUB2: ns2 cannot ping ns3 (spoke isolation enforced)"
+    fi
+else
+    fail "T-HUB2: overlay addresses not found"
+fi
+
+kill "$BORE_HUB_CONN2" "$BORE_HUB_CONN3" "$BORE_HUB_CONN4" "$BORE_LISTEN_PID" 2>/dev/null
+BORE_LISTEN_PID=""
+BORE_HUB_CONN2=""
+BORE_HUB_CONN3=""
+BORE_HUB_CONN4=""
+sleep 0.5
+
+# ── Test T-HUB3: join/leave address reallocation ───────────────────────────────
+echo "=== T-HUB3: join/leave address reallocation ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hub-relay-t3 \
+    --max-clients 4 --relay-only \
+    >"$BORE_LOG.hub_listen_t3" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 1
+
+# Start 2 connectors initially
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_B" --secret "$SECRET" --id hub-relay-t3 \
+    --relay-only \
+    >"$BORE_LOG.hub_conn2_t3" 2>&1 &
+BORE_HUB_CONN2=$!
+
+ip netns exec ns3 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_C" --secret "$SECRET" --id hub-relay-t3 \
+    --relay-only \
+    >"$BORE_LOG.hub_conn3_t3" 2>&1 &
+BORE_HUB_CONN3=$!
+
+sleep 2
+
+# Verify initial 2 addresses
+INITIAL_COUNT=$(grep -c "vpn hub peer join" "$BORE_LOG.hub_listen_t3" 2>/dev/null || echo 0)
+if [ "$INITIAL_COUNT" -ge 2 ]; then
+    pass "T-HUB3: 2 connectors joined initially"
+
+    # Kill one
+    kill "$BORE_HUB_CONN3" 2>/dev/null
+    BORE_HUB_CONN3=""
+    sleep 1
+
+    # Start a new one (ns3 again)
+    ip netns exec ns3 "$BORE" vpn connect \
+        --to "$SERVER_IP_NS0_C" --secret "$SECRET" --id hub-relay-t3 \
+        --relay-only \
+        >"$BORE_LOG.hub_conn3_t3_new" 2>&1 &
+    BORE_HUB_CONN3=$!
+    sleep 2
+
+    # Verify new join (3rd peer join entry)
+    FINAL_COUNT=$(grep -c "vpn hub peer join" "$BORE_LOG.hub_listen_t3" 2>/dev/null || echo 0)
+    if [ "$FINAL_COUNT" -ge 3 ]; then
+        pass "T-HUB3: connector rejoined and got new overlay address"
+    else
+        fail "T-HUB3: connector did not rejoin"
+    fi
+else
+    fail "T-HUB3: initial peer joins failed"
+fi
+
+kill "$BORE_LISTEN_PID" "$BORE_HUB_CONN2" "$BORE_HUB_CONN3" 2>/dev/null
+BORE_LISTEN_PID=""
+BORE_HUB_CONN2=""
+BORE_HUB_CONN3=""
+sleep 0.5
+
+# ── Test T-HUB4: hub mode rejects --advertise on connectors ─────────────────────
+echo "=== T-HUB4: hub mode rejects connector --advertise ==="
+# NOTE: --max-clients 4 makes this a HUB; in 1:1 mode (--max-clients 1) a
+# connector --advertise is legitimately allowed, so the rejection only applies
+# to hub mode (server-side guard, D4).
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hub-relay-t4 \
+    --max-clients 4 --relay-only \
+    >"$BORE_LOG.hub_listen_t4" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 1
+
+# Try to start a connector with --advertise in hub mode (should fail quickly)
+ADVERTISE_EXIT=0
+timeout 5 ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_B" --secret "$SECRET" --id hub-relay-t4 \
+    --advertise "192.168.99.0/24" --relay-only \
+    >"$BORE_LOG.hub_conn2_t4" 2>&1 || ADVERTISE_EXIT=$?
+
+if [ "$ADVERTISE_EXIT" -ne 0 ] && [ "$ADVERTISE_EXIT" -ne 124 ]; then
+    pass "T-HUB4: hub mode rejected connector --advertise (exit=$ADVERTISE_EXIT)"
+elif [ "$ADVERTISE_EXIT" -eq 124 ]; then
+    fail "T-HUB4: connector did not exit (timeout; check if --advertise rejection is implemented)"
+else
+    fail "T-HUB4: hub mode did NOT reject connector --advertise (expected failure)"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null
+BORE_LISTEN_PID=""
+sleep 0.5
+
+# ── Test T-HUBD1: hub + 2 spokes BOTH upgrade to direct ───────────────────────
+echo "=== T-HUBD1: hub + 2 spokes upgrade to direct ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hubd1 \
+    --max-clients 4 --stun-server "$STUN" \
+    >"$BORE_LOG.hubd1_listen" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 1
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hubd1 --stun-server "$STUN" \
+    >"$BORE_LOG.hubd1_conn2" 2>&1 &
+BORE_HUB_CONN2=$!
+ip netns exec ns3 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hubd1 --stun-server "$STUN" \
+    >"$BORE_LOG.hubd1_conn3" 2>&1 &
+BORE_HUB_CONN3=$!
+
+# Wait until the hub logs TWO distinct per-peer direct upgrades.
+HUBD1_OK=0
+for _ in $(seq 1 50); do
+    N=$(grep -c "hub peer upgraded to direct path" "$BORE_LOG.hubd1_listen" 2>/dev/null || echo 0)
+    [ "${N:-0}" -ge 2 ] && { HUBD1_OK=1; break; }
+    sleep 1
+done
+if [ "$HUBD1_OK" = 1 ]; then
+    pass "T-HUBD1: both spokes upgraded to direct (per-peer)"
+else
+    fail "T-HUBD1: <2 direct upgrades ($(grep -c "hub peer upgraded to direct path" "$BORE_LOG.hubd1_listen" 2>/dev/null || echo 0))"
+    echo "  [hub]: $(tail -6 "$BORE_LOG.hubd1_listen" 2>/dev/null | tr '\n' '|')"
+fi
+LOSS=$(ip netns exec ns2 ping -c 6 -i 0.2 -W 3 10.99.0.1 2>/dev/null | grep -oP '\d+(?=% packet loss)' || echo 100)
+[ "$LOSS" = "0" ] && pass "T-HUBD1: spoke→hub ping 0% loss over direct" \
+    || fail "T-HUBD1: spoke→hub ping ${LOSS}% loss"
+kill "$BORE_HUB_CONN2" "$BORE_HUB_CONN3" "$BORE_LISTEN_PID" 2>/dev/null
+BORE_LISTEN_PID=""; BORE_HUB_CONN2=""; BORE_HUB_CONN3=""
+sleep 0.5
+
+# ── Test T-HUBD2: mixed paths — one spoke direct, one forced relay ─────────────
+echo "=== T-HUBD2: mixed paths (ns3 UDP blocked stays relay, ns2 direct) ==="
+# Block ONLY ns3's UDP (its egress source IP), so ns2 still upgrades.
+ip netns exec ns0 nft add table inet bore_test_block 2>/dev/null
+ip netns exec ns0 nft 'add chain inet bore_test_block bore_blk { type filter hook forward priority 0; }' 2>/dev/null
+ip netns exec ns0 nft "add rule inet bore_test_block bore_blk ip saddr $SERVER_IP_NS3 meta l4proto udp drop"
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hubd2 \
+    --max-clients 4 --stun-server "$STUN" \
+    >"$BORE_LOG.hubd2_listen" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 1
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hubd2 --stun-server "$STUN" \
+    >"$BORE_LOG.hubd2_conn2" 2>&1 &
+BORE_HUB_CONN2=$!
+ip netns exec ns3 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hubd2 --stun-server "$STUN" \
+    >"$BORE_LOG.hubd2_conn3" 2>&1 &
+BORE_HUB_CONN3=$!
+# ns2 must upgrade to direct (its connector log).
+if wait_for_log "$BORE_LOG.hubd2_conn2" "upgraded to direct" 45; then
+    pass "T-HUBD2: ns2 spoke upgraded to direct"
+else
+    fail "T-HUBD2: ns2 did not upgrade to direct"
+fi
+# ns3 must stay on relay (UDP blocked) — never logs a direct upgrade.
+sleep 3
+if grep -q "upgraded to direct" "$BORE_LOG.hubd2_conn3" 2>/dev/null; then
+    fail "T-HUBD2: ns3 reached direct despite UDP block"
+else
+    pass "T-HUBD2: ns3 stayed on relay (UDP blocked)"
+fi
+# Both still reach the hub.
+ip netns exec ns2 ping -c 3 -W 3 10.99.0.1 >/dev/null 2>&1 && ip netns exec ns3 ping -c 3 -W 3 10.99.0.1 >/dev/null 2>&1 \
+    && pass "T-HUBD2: both spokes ping hub (direct + relay)" \
+    || fail "T-HUBD2: a spoke could not ping the hub"
+ip netns exec ns0 nft delete table inet bore_test_block 2>/dev/null || true
+kill "$BORE_HUB_CONN2" "$BORE_HUB_CONN3" "$BORE_LISTEN_PID" 2>/dev/null
+BORE_LISTEN_PID=""; BORE_HUB_CONN2=""; BORE_HUB_CONN3=""
+sleep 0.5
+
+# ── Test T-HUBD3: direct → warm-relay fallback when UDP drops mid-session ──────
+echo "=== T-HUBD3: direct path fallback to warm relay ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hubd3 \
+    --max-clients 4 --stun-server "$STUN" \
+    >"$BORE_LOG.hubd3_listen" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 1
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hubd3 --stun-server "$STUN" \
+    >"$BORE_LOG.hubd3_conn2" 2>&1 &
+BORE_HUB_CONN2=$!
+if wait_for_log "$BORE_LOG.hubd3_listen" "hub peer upgraded to direct path" 45; then
+    pass "T-HUBD3: spoke upgraded to direct"
+    # Drop the spoke's UDP mid-session → the hub must fall back to warm relay.
+    ip netns exec ns0 nft add table inet bore_test_block 2>/dev/null
+    ip netns exec ns0 nft 'add chain inet bore_test_block bore_blk { type filter hook forward priority 0; }' 2>/dev/null
+    ip netns exec ns0 nft "add rule inet bore_test_block bore_blk ip saddr $SERVER_IP_NS2 meta l4proto udp drop"
+    if wait_for_log "$BORE_LOG.hubd3_listen" "fell back to warm relay" 30; then
+        pass "T-HUBD3: hub fell back to warm relay on direct death"
+    else
+        fail "T-HUBD3: hub did not fall back to relay after UDP drop"
+    fi
+    # Both ends fall back independently on their own QUIC idle timeout (~10s);
+    # poll until the warm relay carries traffic again (UDP stays blocked, so a
+    # success proves relay — not a re-established direct path).
+    RELAY_OK=0
+    for _ in $(seq 1 20); do
+        if ip netns exec ns2 ping -c 2 -W 2 10.99.0.1 >/dev/null 2>&1; then RELAY_OK=1; break; fi
+        sleep 1
+    done
+    [ "$RELAY_OK" = 1 ] && pass "T-HUBD3: ping continues over warm relay after fallback" \
+        || fail "T-HUBD3: ping did not recover over relay after fallback"
+    ip netns exec ns0 nft delete table inet bore_test_block 2>/dev/null || true
+else
+    fail "T-HUBD3: spoke never reached direct (cannot test fallback)"
+fi
+kill "$BORE_HUB_CONN2" "$BORE_LISTEN_PID" 2>/dev/null
+BORE_LISTEN_PID=""; BORE_HUB_CONN2=""
+sleep 0.5
+
+# ── Test T-HUBD4: background upgrade (blocked → relay → unblock → direct) ──────
+echo "=== T-HUBD4: background relay→direct upgrade after unblock ==="
+ip netns exec ns0 nft add table inet bore_test_block 2>/dev/null
+ip netns exec ns0 nft 'add chain inet bore_test_block bore_blk { type filter hook forward priority 0; }' 2>/dev/null
+ip netns exec ns0 nft 'add rule inet bore_test_block bore_blk meta l4proto udp drop'
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hubd4 \
+    --max-clients 4 --stun-server "$STUN" \
+    >"$BORE_LOG.hubd4_listen" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 1
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hubd4 --stun-server "$STUN" \
+    >"$BORE_LOG.hubd4_conn2" 2>&1 &
+BORE_HUB_CONN2=$!
+if wait_for_log "$BORE_LOG.hubd4_conn2" "staying on relay, will retry" 40; then
+    pass "T-HUBD4: spoke on relay while UDP blocked"
+else
+    fail "T-HUBD4: spoke did not schedule a retry while blocked"
+fi
+ip netns exec ns0 nft delete table inet bore_test_block 2>/dev/null || true
+if wait_for_log "$BORE_LOG.hubd4_listen" "hub peer upgraded to direct path" 45; then
+    pass "T-HUBD4: upgraded relay→direct on a later round after unblock"
+else
+    fail "T-HUBD4: did not upgrade to direct within 45s after unblock"
+fi
+kill "$BORE_HUB_CONN2" "$BORE_LISTEN_PID" 2>/dev/null
+BORE_LISTEN_PID=""; BORE_HUB_CONN2=""
+sleep 0.5
+
+
+# ══ Phase 5: full site-to-host scenario (host-A/B/C/E + hub-D) on relay+direct ══
+# host-D advertises 192.168.4.0/24 (LAN1 host .1) and 10.10.0.0/16 (LAN2 host 10.10.0.1).
+run_scen() {
+    local MODE="$1" HF SF
+    if [ "$MODE" = relay ]; then HF="--relay-only"; SF="--relay-only"; else HF="--stun-server $STUN"; SF="--stun-server $STUN"; fi
+    png() { ip netns exec "$1" ping -c 2 -W 3 "$2" >/dev/null 2>&1; }
+    echo "=== T-SCEN ($MODE): hub advertises 192.168.4.0/24 + 10.10.0.0/16 ==="
+    ip netns exec ns1 "$BORE" vpn listen --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "scen-$MODE" \
+        --advertise "192.168.4.0/24,10.10.0.0/16" --max-clients 8 $HF >"$BORE_LOG.scen_hub_$MODE" 2>&1 &
+    BORE_LISTEN_PID=$!; sleep 1
+    ip netns exec ns2 "$BORE" vpn connect --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "scen-$MODE" \
+        --accept-all-routes --refuse-routes "10.10.0.0/16" $SF >"$BORE_LOG.scen_a_$MODE" 2>&1 &
+    BORE_HUB_CONN2=$!
+    ip netns exec ns3 "$BORE" vpn connect --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "scen-$MODE" \
+        --accept-all-routes $SF >"$BORE_LOG.scen_b_$MODE" 2>&1 &
+    BORE_HUB_CONN3=$!
+    ip netns exec ns4 "$BORE" vpn connect --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "scen-$MODE" \
+        --accept-all-routes --refuse-routes "192.168.4.0/24" $SF >"$BORE_LOG.scen_c_$MODE" 2>&1 &
+    BORE_HUB_CONN4=$!
+    for _ in $(seq 1 20); do
+        [ "$(grep -c 'vpn hub peer join' "$BORE_LOG.scen_hub_$MODE" 2>/dev/null || echo 0)" -ge 3 ] && break; sleep 1
+    done
+    if [ "$MODE" = direct ]; then
+        for _ in $(seq 1 50); do
+            [ "$(grep -c 'upgraded to direct path' "$BORE_LOG.scen_hub_$MODE" 2>/dev/null || echo 0)" -ge 3 ] && break; sleep 1
+        done
+        N=$(grep -c 'upgraded to direct path' "$BORE_LOG.scen_hub_$MODE" 2>/dev/null || echo 0)
+        [ "$N" -ge 3 ] && pass "T-SCEN-$MODE: all 3 spokes upgraded to direct" \
+            || fail "T-SCEN-$MODE: only $N/3 spokes reached direct"
+    fi
+    sleep 2
+    # host-A: LAN1 yes, LAN2 (refused) no
+    png ns2 192.168.4.1 && pass "T-SCEN-$MODE A: reaches 192.168.4.0/24" || fail "T-SCEN-$MODE A: cannot reach 192.168.4.0/24"
+    png ns2 10.10.0.1   && fail "T-SCEN-$MODE A: reached refused 10.10.0.0/16" || pass "T-SCEN-$MODE A: refused 10.10.0.0/16 unreachable"
+    # host-B: both
+    png ns3 192.168.4.1 && pass "T-SCEN-$MODE B: reaches 192.168.4.0/24" || fail "T-SCEN-$MODE B: cannot reach 192.168.4.0/24"
+    png ns3 10.10.0.1   && pass "T-SCEN-$MODE B: reaches 10.10.0.0/16"   || fail "T-SCEN-$MODE B: cannot reach 10.10.0.0/16"
+    # host-C: LAN2 yes, LAN1 (refused) no
+    png ns4 10.10.0.1   && pass "T-SCEN-$MODE C: reaches 10.10.0.0/16"   || fail "T-SCEN-$MODE C: cannot reach 10.10.0.0/16"
+    png ns4 192.168.4.1 && fail "T-SCEN-$MODE C: reached refused 192.168.4.0/24" || pass "T-SCEN-$MODE C: refused 192.168.4.0/24 unreachable"
+    # ISO: A cannot reach C's overlay (spoke isolation)
+    local A_OVL C_OVL
+    A_OVL=$(ip netns exec ns2 ip -4 addr show bore0 2>/dev/null | grep -oP 'inet \K[0-9.]+')
+    C_OVL=$(ip netns exec ns4 ip -4 addr show bore0 2>/dev/null | grep -oP 'inet \K[0-9.]+')
+    if [ -n "$A_OVL" ] && [ -n "$C_OVL" ]; then
+        png ns2 "$C_OVL" && fail "T-SCEN-$MODE ISO: A reached C (isolation broken)" || pass "T-SCEN-$MODE ISO: A↔C blocked"
+    else fail "T-SCEN-$MODE ISO: overlays missing (A=$A_OVL C=$C_OVL)"; fi
+    png ns2 10.99.0.1 && png ns3 10.99.0.1 && png ns4 10.99.0.1 \
+        && pass "T-SCEN-$MODE: all spokes reach hub overlay" || fail "T-SCEN-$MODE: a spoke cannot reach hub overlay"
+    kill "$BORE_HUB_CONN2" "$BORE_HUB_CONN3" "$BORE_HUB_CONN4" "$BORE_LISTEN_PID" 2>/dev/null
+    BORE_LISTEN_PID=""; BORE_HUB_CONN2=""; BORE_HUB_CONN3=""; BORE_HUB_CONN4=""; sleep 1
+    # host-E: no route flags → hub overlay only, neither LAN (default deny)
+    ip netns exec ns1 "$BORE" vpn listen --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "scenE-$MODE" \
+        --advertise "192.168.4.0/24,10.10.0.0/16" --max-clients 8 $HF >"$BORE_LOG.scenE_hub_$MODE" 2>&1 &
+    BORE_LISTEN_PID=$!; sleep 1
+    ip netns exec ns2 "$BORE" vpn connect --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "scenE-$MODE" $SF >"$BORE_LOG.scenE_e_$MODE" 2>&1 &
+    BORE_HUB_CONN2=$!
+    for _ in $(seq 1 15); do [ "$(grep -c 'vpn hub peer join' "$BORE_LOG.scenE_hub_$MODE" 2>/dev/null || echo 0)" -ge 1 ] && break; sleep 1; done
+    sleep 1
+    png ns2 10.99.0.1   && pass "T-SCEN-$MODE E: reaches hub overlay"        || fail "T-SCEN-$MODE E: cannot reach hub overlay"
+    png ns2 192.168.4.1 && fail "T-SCEN-$MODE E: reached 192.168.4.0/24 (default-deny breach)" || pass "T-SCEN-$MODE E: 192.168.4.0/24 denied by default"
+    png ns2 10.10.0.1   && fail "T-SCEN-$MODE E: reached 10.10.0.0/16 (default-deny breach)"   || pass "T-SCEN-$MODE E: 10.10.0.0/16 denied by default"
+    kill "$BORE_HUB_CONN2" "$BORE_LISTEN_PID" 2>/dev/null
+    BORE_LISTEN_PID=""; BORE_HUB_CONN2=""; sleep 1
+}
+run_scen relay
+run_scen direct
 
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""

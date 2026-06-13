@@ -684,6 +684,7 @@ impl Client {
                             peer,
                             peer_selected_stun,
                             tuning,
+                            peer_id: _,
                         }) => {
                             #[cfg(feature = "udp")]
                             {
@@ -801,6 +802,8 @@ impl Client {
                         }
                         Some(ServerMessage::VpnReady { .. }) => warn!("unexpected vpn ready"),
                         Some(ServerMessage::VpnError(err)) => error!(%err, "vpn error"),
+                        Some(ServerMessage::VpnPeerJoin { .. }) => warn!("unexpected vpn peer join in 1:1 mode"),
+                        Some(ServerMessage::VpnPeerLeave { .. }) => warn!("unexpected vpn peer leave in 1:1 mode"),
                         None => return Ok(()),
                     }
                 }
@@ -1277,6 +1280,7 @@ async fn offer_provider_candidates(
         .send(ClientMessage::UdpCandidateOffer(UdpCandidateOffer {
             candidates,
             selected_stun: selected_stun_owned,
+            peer_id: 0,
         }))
         .await?;
     Ok(socket)

@@ -102,6 +102,7 @@ fn udp_offer_from_legacy(candidates: Vec<SocketAddr>) -> UdpCandidateOffer {
     UdpCandidateOffer {
         candidates,
         selected_stun: None,
+        peer_id: 0,
     }
 }
 
@@ -301,6 +302,7 @@ pub async fn serve_provider(
                     peer: offer.peer_candidates,
                     peer_selected_stun: offer.peer_selected_stun,
                     tuning: udp_tuning,
+                    peer_id: 0,
                 };
                 if control.send(msg).await.is_err() {
                     return Ok(());
@@ -496,6 +498,7 @@ async fn broker_udp(
             peer: provider_cands,
             peer_selected_stun: provider_selected_stun,
             tuning,
+            peer_id: 0,
         })
         .await?;
     Ok(())
@@ -1003,7 +1006,7 @@ impl Proxy {
                         Some(ServerMessage::VhostUdp { .. }) => warn!("unexpected vhost udp offer"),
                         // Deliver the brokered candidates to the in-flight upgrade
                         // task (which then punches + dials QUIC); else it is stray.
-                        Some(ServerMessage::UdpPunch { nonce, peer, peer_selected_stun, tuning }) => match nego_punch_tx.take() {
+                        Some(ServerMessage::UdpPunch { nonce, peer, peer_selected_stun, tuning, peer_id: _ }) => match nego_punch_tx.take() {
                             Some(tx) => {
                                 let _ = tx.send(Some((nonce, peer, peer_selected_stun, tuning)));
                             }
@@ -1048,6 +1051,8 @@ impl Proxy {
                         Some(ServerMessage::VhostReady { .. }) => warn!("unexpected vhost ready"),
                         Some(ServerMessage::VpnReady { .. }) => warn!("unexpected vpn ready"),
                         Some(ServerMessage::VpnError(err)) => error!(%err, "vpn error"),
+                        Some(ServerMessage::VpnPeerJoin { .. }) => warn!("unexpected vpn peer join in 1:1 mode"),
+                        Some(ServerMessage::VpnPeerLeave { .. }) => warn!("unexpected vpn peer leave in 1:1 mode"),
                         None => return Ok(()),
                     }
                 }
@@ -1382,6 +1387,7 @@ async fn gather_consumer_candidates(
         UdpCandidateOffer {
             candidates,
             selected_stun: selected_stun_owned,
+            peer_id: 0,
         },
     ))
 }
@@ -1467,6 +1473,7 @@ async fn negotiate_direct_consumer(
                     peer,
                     peer_selected_stun,
                     tuning,
+                    peer_id: _,
                 }) => {
                     return Ok::<_, anyhow::Error>(Some((nonce, peer, peer_selected_stun, tuning)));
                 }

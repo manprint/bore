@@ -124,7 +124,8 @@ sudo bore vpn connect \
 - A becomes the gateway; B becomes the client.
 - A's system detects that it advertises routes; it enables IP forwarding (`/proc/sys/net/ipv4/ip_forward = 1`), saves the previous value for restoration.
 - A installs an `nft` table `bore_vpn_site` with masquerade (NAT) and MSS-clamp rules. One rule marks packets inbound on the TUN as going out toward the LAN with source NAT (masquerade). Another rule clamps TCP MSS to the path MTU to avoid PMTU blackholes. Logs show each rule at `info!` on apply.
-- B receives a route: `192.168.50.0/24 dev bore0` (the peer's advertised subnet via the TUN).
+- **B must opt in to receive the routes** using `--accept-all-routes` or `--accept-routes <CIDR>`. By default (without the flag), B reaches only A's overlay IP — **it does not receive any advertised routes**. This is a security-first default: routes appear only via explicit opt-in.
+- If B uses `--accept-all-routes`, it receives a route: `192.168.50.0/24 dev bore0` (the peer's advertised subnet via the TUN).
 - From B, you can now `ping 192.168.50.10` (a real host on A's LAN) and see replies from that host's real IP.
 - From B, `curl http://192.168.50.10` reaches the LAN host's service. The LAN host sees the source IP as A's LAN address (masquerade), not B's.
 - TCP connections from B into A's LAN never get stuck with "PMTU blackhole" errors because the MSS is clamped at setup time.
@@ -179,6 +180,71 @@ ip route add 192.168.60.0/24 via 192.168.50.10  # A's gateway IP
 # On LAN B's router: add a route to A's LAN via B's gateway
 ip route add 192.168.50.0/24 via 192.168.60.10  # B's gateway IP
 ```
+
+---
+
+### Topology D: Hub-and-Spoke (Multi-Client)
+
+One listener (the **hub**) serves an **arbitrary number** of connectors (**spokes**),
+and each spoke independently chooses which of the hub's advertised routes to
+accept or refuse. Enabled by `--max-clients <N>` on the listener (default `1` =
+the classic 1:1 path, byte-for-byte unchanged).
+
+**Setup:**
+
+```bash
+# host-D: the hub, advertises two LANs, accepts up to 8 spokes
+sudo bore vpn listen \
+  --to bore.example.com --secret S3cret --id office \
+  --advertise 192.168.4.0/24,10.10.0.0/16 \
+  --max-clients 8
+
+# host-A: reaches 192.168.4.0/24 only (refuses 10.10.0.0/16)
+sudo bore vpn connect --to bore.example.com --secret S3cret --id office \
+  --accept-all-routes --refuse-routes 10.10.0.0/16
+
+# host-B: reaches both advertised LANs
+sudo bore vpn connect --to bore.example.com --secret S3cret --id office \
+  --accept-all-routes
+
+# host-C: reaches 10.10.0.0/16 only (refuses 192.168.4.0/24)
+sudo bore vpn connect --to bore.example.com --secret S3cret --id office \
+  --accept-all-routes --refuse-routes 192.168.4.0/24
+
+# host-E: reaches host-D's overlay IP only (no route flags = accept nothing)
+sudo bore vpn connect --to bore.example.com --secret S3cret --id office
+```
+
+**How it works:**
+
+- The hub runs a **single** TUN with one overlay subnet (a `/24` by default, set
+  per-hub by the server's `--vpn-hub-prefix`, carved from `--vpn-pool`). The hub
+  takes `.1`; each spoke gets a unique `.N`.
+- The hub routes overlay packets by destination IP to the matching spoke link
+  (relay or direct, per-spoke), and writes each spoke's traffic to the shared TUN.
+- **Each spoke upgrades to a direct QUIC path independently** (unless
+  `--relay-only`), with seamless warm-relay fallback — exactly like a 1:1 link.
+- **Spoke isolation:** spokes reach the hub and its advertised routes only;
+  spoke↔spoke traffic is dropped at the hub (`bore0 → bore0` DROP rule). LAN↔spoke
+  forwarding (the gateway path) is unaffected.
+
+**Route accept/refuse flags (`vpn connect`):**
+
+| Flag | Effect |
+|------|--------|
+| *(none)* | **Accept nothing** — the spoke reaches only the hub's overlay IP (default-deny). |
+| `--accept-all-routes` | Accept every CIDR the hub advertises. |
+| `--accept-routes <CIDR,…>` | Accept exactly these (each must be equal-to-or-inside an advertised CIDR). |
+| `--refuse-routes <CIDR,…>` | Subtract these from the accepted set (use with `--accept-all-routes` for "all except"). |
+| `--refuse-all-routes` | Accept nothing (explicit, == default). |
+
+Resolution: `final = (accept_all ? advertised : accept ∩ advertised) − refuse`,
+matched **exact-or-subset** (a refuse/accept CIDR must equal or be a supernet of an
+advertised CIDR to affect it).
+
+**Constraints (v1):** hub mode requires server pool addressing (no static `/30`),
+and a connector may **not** also `--advertise` (hub-and-spoke only; the server
+rejects it). A spoke with no route flags is host-only by design.
 
 ---
 

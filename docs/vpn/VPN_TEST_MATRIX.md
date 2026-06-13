@@ -286,6 +286,23 @@ The `scripts/vpn_netns_test.sh` script (run as `sudo`) executes all netns tests 
 5. **Cleanup proof:** SIGINT, check host state (routes, ip_forward, nft, interface).
 6. **Stale reclaim:** Panic-simulation, verify next start cleans up.
 
+### Multi-Client Hub (`--max-clients N>1`) coverage
+
+> **Execution status (2026-06-13):** full harness **`Results: PASS=107 FAIL=0`**
+> (relay + per-peer direct + full scenario, both data paths).
+
+| Test | Asserts |
+|------|---------|
+| **T-HUB1** | Hub + 3 spokes (relay): each gets a distinct overlay in the hub /24; each pings the hub. |
+| **T-HUB2** | Spoke isolation — spoke A cannot ping spoke B's overlay. |
+| **T-HUB3** | Join/leave churn — kill a spoke, a new spoke reuses a freed address; survivors keep working (no hub restart). |
+| **T-HUB4** | Hub rejects a connector that also `--advertise`s (server `VpnError`, connector exits non-zero). |
+| **T-HUBD1** | Hub + 2 spokes both upgrade to **direct** (per-peer); 0% loss ping over direct. |
+| **T-HUBD2** | Mixed paths — one spoke direct, one (UDP-blocked) stays relay; both reach the hub. |
+| **T-HUBD3** | Direct → **warm-relay fallback** when a spoke's UDP drops mid-session; ping continues. |
+| **T-HUBD4** | Background relay→direct upgrade after UDP is unblocked (30 s retry grid). |
+| **T-SCEN-{relay,direct}** | Full 5-host scenario: host-D advertises `192.168.4.0/24`+`10.10.0.0/16`; host-A reaches LAN1 only, host-B both, host-C LAN2 only, host-E neither (default-deny); A↔C isolated. Run on BOTH relay and direct. |
+
 ---
 
 ## Acceptance Gate

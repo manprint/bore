@@ -160,6 +160,10 @@ pub struct Server {
     /// the connector's offer before sending `UdpUnavailable` (DEC-3).
     #[cfg(feature = "vpn")]
     vpn_punch_timeout: std::time::Duration,
+
+    /// Overlay subnet prefix allocated per hub from --vpn-pool (default 24).
+    #[cfg(feature = "vpn")]
+    vpn_hub_prefix: u8,
 }
 
 impl Server {
@@ -203,6 +207,8 @@ impl Server {
             vpn_link_permits: Arc::new(Semaphore::new(100)),
             #[cfg(feature = "vpn")]
             vpn_punch_timeout: vpn_server::DEFAULT_VPN_PUNCH_TIMEOUT,
+            #[cfg(feature = "vpn")]
+            vpn_hub_prefix: 24,
         }
     }
 
@@ -369,6 +375,12 @@ impl Server {
     #[cfg(feature = "vpn")]
     pub fn set_vpn_punch_timeout(&mut self, timeout: std::time::Duration) {
         self.vpn_punch_timeout = timeout;
+    }
+
+    /// Set the overlay subnet prefix allocated per hub from --vpn-pool (default 24).
+    #[cfg(feature = "vpn")]
+    pub fn set_vpn_hub_prefix(&mut self, prefix: u8) {
+        self.vpn_hub_prefix = prefix;
     }
 
     /// Start the server, listening for new connections.
@@ -910,6 +922,7 @@ impl Server {
                 addr,
                 notes,
                 carriers,
+                max_clients,
             }) => {
                 #[cfg(feature = "vpn")]
                 if self.vpn_enabled {
@@ -927,6 +940,9 @@ impl Server {
                         self.udp_tuning,
                         self.vpn_link_permits.clone(),
                         carriers,
+                        max_clients,
+                        self.vpn_hub_prefix,
+                        self.vpn_pool.clone(),
                     )
                     .await;
                 }

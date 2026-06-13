@@ -331,7 +331,7 @@ sleep 0.5
 
 ip netns exec ns2 "$BORE" vpn connect \
     --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id d1-ss-12 \
-    --advertise "$FAKE_LAN_2" \
+    --advertise "$FAKE_LAN_2" --accept-all-routes \
     >"$BORE_LOG.connect_d1_ss12" 2>&1 &
 BORE_CONNECT_PID=$!
 

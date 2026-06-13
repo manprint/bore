@@ -557,6 +557,16 @@ enum Command {
             env = "BORE_VPN_MAX_LINKS"
         )]
         vpn_max_links: usize,
+
+        /// Overlay subnet prefix allocated per hub from --vpn-pool (default 24).
+        #[cfg(feature = "vpn")]
+        #[clap(
+            long,
+            value_name = "P",
+            default_value_t = 24u8,
+            env = "BORE_VPN_HUB_PREFIX"
+        )]
+        vpn_hub_prefix: u8,
     },
 
     /// Diagnose this host's UDP / NAT / firewall for hole-punching (opens no
@@ -967,6 +977,15 @@ struct VpnListenArgs {
     /// Optional operator note.
     #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
     notes: Option<String>,
+
+    /// Max concurrent connectors (hub mode). 1 = legacy 1:1 path (byte-for-byte unchanged).
+    #[clap(
+        long,
+        value_name = "N",
+        default_value_t = 1u16,
+        env = "BORE_VPN_MAX_CLIENTS"
+    )]
+    max_clients: u16,
 }
 
 #[cfg(all(feature = "vpn", target_os = "linux"))]
@@ -1092,6 +1111,32 @@ struct VpnConnectArgs {
     /// Optional operator note.
     #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
     notes: Option<String>,
+
+    /// Accept exactly these advertised routes (exact-or-subset). Comma-separated CIDRs.
+    #[clap(
+        long,
+        value_name = "CIDR[,CIDR...]",
+        env = "BORE_VPN_ACCEPT_ROUTES",
+        value_delimiter = ','
+    )]
+    accept_routes: Vec<String>,
+
+    /// Accept every route the listener advertises.
+    #[clap(long, env = "BORE_VPN_ACCEPT_ALL_ROUTES")]
+    accept_all_routes: bool,
+
+    /// Subtract these routes from the accepted set. Comma-separated CIDRs.
+    #[clap(
+        long,
+        value_name = "CIDR[,CIDR...]",
+        env = "BORE_VPN_REFUSE_ROUTES",
+        value_delimiter = ','
+    )]
+    refuse_routes: Vec<String>,
+
+    /// Accept nothing (== default; for explicit, self-documenting scripts).
+    #[clap(long, env = "BORE_VPN_REFUSE_ALL_ROUTES")]
+    refuse_all_routes: bool,
 }
 
 #[tokio::main]
@@ -1469,6 +1514,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     carriers: args.carriers,
                     tun_queues: args.tun_queues as usize,
                     notes: args.notes,
+                    max_clients: args.max_clients,
                 };
 
                 vpn::run_listen(vpn_args).await?;
@@ -1480,6 +1526,22 @@ async fn dispatch(command: Command) -> Result<()> {
                     .map(|s| s.parse::<Ipv4Net>())
                     .collect();
                 let advertised = advertised.context("failed to parse --advertise CIDRs")?;
+
+                let accept_routes: Result<Vec<_>> = args
+                    .accept_routes
+                    .iter()
+                    .map(|s| s.parse::<Ipv4Net>())
+                    .collect();
+                let accept_routes =
+                    accept_routes.context("failed to parse --accept-routes CIDRs")?;
+
+                let refuse_routes: Result<Vec<_>> = args
+                    .refuse_routes
+                    .iter()
+                    .map(|s| s.parse::<Ipv4Net>())
+                    .collect();
+                let refuse_routes =
+                    refuse_routes.context("failed to parse --refuse-routes CIDRs")?;
 
                 let addr_request = match (&args.vpn_addr, &args.vpn_peer_addr) {
                     (None, None) => VpnAddrRequest::Pool,
@@ -1516,6 +1578,10 @@ async fn dispatch(command: Command) -> Result<()> {
                     carriers: args.carriers,
                     tun_queues: args.tun_queues as usize,
                     notes: args.notes,
+                    accept_routes,
+                    accept_all_routes: args.accept_all_routes,
+                    refuse_routes,
+                    refuse_all_routes: args.refuse_all_routes,
                 };
 
                 vpn::run_connect(vpn_args).await?;
@@ -1556,6 +1622,8 @@ async fn dispatch(command: Command) -> Result<()> {
             vpn_pool,
             #[cfg(feature = "vpn")]
             vpn_max_links,
+            #[cfg(feature = "vpn")]
+            vpn_hub_prefix,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -1615,6 +1683,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 if vpn {
                     server.set_vpn(true);
                     server.set_vpn_max_links(vpn_max_links);
+                    server.set_vpn_hub_prefix(vpn_hub_prefix);
                     if let Some(pool_cidr) = vpn_pool {
                         let net: bore_cli::shared::Ipv4Net = pool_cidr
                             .parse()

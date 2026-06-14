@@ -456,15 +456,15 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
     }
 
     // Stale reclaim
-    hostcfg::stale_reclaim(&args.id, "listen", &args.tun_name).await;
+    hostcfg::stale_reclaim(&args.id, "listen").await;
 
     // Create TUN device(s) (one per queue).
-    let (devs_raw, offload) =
+    let (devs_raw, offload, tun_name) =
         hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu, args.tun_queues).await?;
     let devs: Vec<Arc<tun_rs::AsyncDevice>> = devs_raw.into_iter().map(Arc::new).collect();
     info!(
         link_id = %args.id,
-        iface = %args.tun_name,
+        iface = %tun_name,
         addr = %assigned,
         prefix = prefix,
         "created tun device"
@@ -478,7 +478,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
         &runner,
         &args.id,
         "listen",
-        &args.tun_name,
+        &tun_name,
         assigned,
         prefix,
         &peer_routes,
@@ -529,7 +529,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
                 upnp: args.upnp,
                 try_port_prediction: args.try_port_prediction,
                 nat_udp_preferred_port: args.nat_udp_preferred_port,
-                tun_name: &args.tun_name,
+                tun_name: &tun_name,
                 mtu: args.mtu,
             },
             admin_v2,
@@ -1169,15 +1169,15 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
     };
 
     // Stale reclaim
-    hostcfg::stale_reclaim(&args.id, "connect", &args.tun_name).await;
+    hostcfg::stale_reclaim(&args.id, "connect").await;
 
     // Create TUN device(s) (one per queue).
-    let (devs_raw, offload) =
+    let (devs_raw, offload, tun_name) =
         hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu, args.tun_queues).await?;
     let devs: Vec<Arc<tun_rs::AsyncDevice>> = devs_raw.into_iter().map(Arc::new).collect();
     info!(
         link_id = %args.id,
-        iface = %args.tun_name,
+        iface = %tun_name,
         addr = %assigned,
         prefix = prefix,
         "created tun device"
@@ -1208,7 +1208,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
         &runner,
         &args.id,
         "connect",
-        &args.tun_name,
+        &tun_name,
         assigned,
         prefix,
         &peer_routes,
@@ -1259,7 +1259,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
                 upnp: args.upnp,
                 try_port_prediction: args.try_port_prediction,
                 nat_udp_preferred_port: args.nat_udp_preferred_port,
-                tun_name: &args.tun_name,
+                tun_name: &tun_name,
                 mtu: args.mtu,
             },
             admin_v2,
@@ -2263,8 +2263,24 @@ pub mod hostcfg {
     //! All configuration is reverted in reverse order on Drop (cleanup path).
 
     use anyhow::{anyhow, bail, Context};
+    use std::collections::HashSet;
     use std::net::Ipv4Addr;
     use std::process::Command;
+
+    /// Resolve a requested TUN name. "auto" → first free `boreN` (N=0..=255) per `exists`.
+    /// Any explicit name is returned verbatim. None only if every auto slot is taken.
+    pub fn pick_tun_name(requested: &str, exists: impl Fn(&str) -> bool) -> Option<String> {
+        if requested != "auto" {
+            return Some(requested.to_string());
+        }
+        for n in 0..=255 {
+            let c = format!("bore{n}");
+            if !exists(&c) {
+                return Some(c);
+            }
+        }
+        None
+    }
 
     /// Injectable command runner (allows unit testing without root).
     pub trait CommandRunner: Send + Sync {
@@ -2366,7 +2382,9 @@ pub mod hostcfg {
     }
 
     /// Delete leftover resources from a previous failed run (idempotent, best-effort).
-    pub async fn stale_reclaim(id: &str, role: &str, tun_name: &str) {
+    /// TUN devices are non-persistent (kernel auto-removes on process death), so we do NOT
+    /// delete them here — that would only destroy a co-located live instance's interface.
+    pub async fn stale_reclaim(id: &str, role: &str) {
         // Try to restore ip_forward from state file (SIGKILL recovery). The file is keyed
         // by (id, role) so a co-located peer with the same id (e.g. the connector in the
         // netns harness) cannot read+delete THIS side's file out from under it.
@@ -2412,60 +2430,83 @@ pub mod hostcfg {
         let mut cmd = Command::new(&mss_clamp_del[0]);
         cmd.args(&mss_clamp_del[1..]);
         let _ = cmd.output();
-
-        // Try to delete TUN interface (ignore errors)
-        let _ = Command::new("ip").args(["link", "del", tun_name]).output();
     }
 
     /// Create a TUN device with `queues` kernel queues (C1).
     ///
-    /// Tries `IFF_VNET_HDR` + GSO/GRO offload first (Phase 6.2). If the kernel
-    /// does not support it the flag is not set and we fall back to single-packet
-    /// I/O (Phase 6.1). With `queues > 1` the device is created with
-    /// `IFF_MULTI_QUEUE` and the extra queue fds come from `try_clone` (each
-    /// clone = one more queue). Returns `(devices, offload_enabled)` — with
-    /// `queues == 1` a vector of one, path identical to before (I-9).
+    /// Resolves "auto" name to the first free `boreN` (N=0..=255); explicit names are used
+    /// verbatim. Tries `IFF_VNET_HDR` + GSO/GRO offload first (Phase 6.2). If the kernel
+    /// does not support it the flag is not set and we fall back to single-packet I/O (Phase 6.1).
+    /// With `queues > 1` the device is created with `IFF_MULTI_QUEUE` and the extra queue fds
+    /// come from `try_clone` (each clone = one more queue). Returns `(devices, offload_enabled,
+    /// resolved_name)` — with `queues == 1` a vector of one, path identical to before (I-9).
     pub async fn create_tun(
         name: &str,
         addr: Ipv4Addr,
         prefix: u8,
         mtu: u16,
         queues: usize,
-    ) -> anyhow::Result<(Vec<tun_rs::AsyncDevice>, bool)> {
+    ) -> anyhow::Result<(Vec<tun_rs::AsyncDevice>, bool, String)> {
         let queues = queues.clamp(1, 8);
-        let build = |offload: bool| {
-            let mut b = tun_rs::DeviceBuilder::new()
-                .name(name)
-                .ipv4(addr, prefix, None)
-                .mtu(mtu);
-            if offload {
-                b = b.offload(true);
-            }
-            if queues > 1 {
-                b = b.multi_queue(true);
-            }
-            b.build_async()
-        };
 
-        // Phase 6.2: attempt offload (IFF_VNET_HDR + GSO/GRO).
-        let (first, offload) = match build(true) {
-            Ok(dev) if dev.tcp_gso() || dev.udp_gso() => {
-                tracing::info!(%name, tcp_gso = dev.tcp_gso(), udp_gso = dev.udp_gso(), queues,
-                    "TUN created with GSO/GRO offload (Phase 6.2)");
-                (dev, true)
-            }
-            Ok(dev) => {
-                // Kernel accepted the build but reported no GSO support.
-                tracing::info!(%name, "kernel built TUN but reports no GSO; using single-packet path");
-                drop(dev);
-                let dev = build(false).context("failed to create TUN device")?;
-                (dev, false)
-            }
-            Err(_) => {
-                // Phase 6.1 fallback: single-packet tun I/O.
-                tracing::info!(%name, "TUN created without offload (single-packet path)");
-                let dev = build(false).context("failed to create TUN device")?;
-                (dev, false)
+        // Resolve and create with retry for auto-mode races.
+        let mut taken = HashSet::new();
+        let mut resolved_name;
+        let (first, offload) = 'create_loop: loop {
+            // Pick the name (auto or explicit).
+            resolved_name = match pick_tun_name(name, |c| {
+                taken.contains(c) || std::path::Path::new(&format!("/sys/class/net/{c}")).exists()
+            }) {
+                Some(n) => n,
+                None => {
+                    if name == "auto" {
+                        bail!("no free bore<N> TUN name available (0..=255 all in use)");
+                    } else {
+                        bail!("TUN name resolution failed for explicit name '{name}'");
+                    }
+                }
+            };
+
+            // Try to build the device with offload first.
+            let try_build = |offload: bool| {
+                let mut b = tun_rs::DeviceBuilder::new()
+                    .name(&resolved_name)
+                    .ipv4(addr, prefix, None)
+                    .mtu(mtu);
+                if offload {
+                    b = b.offload(true);
+                }
+                if queues > 1 {
+                    b = b.multi_queue(true);
+                }
+                b.build_async()
+            };
+
+            match try_build(true) {
+                Ok(dev) if dev.tcp_gso() || dev.udp_gso() => {
+                    tracing::info!(%resolved_name, tcp_gso = dev.tcp_gso(), udp_gso = dev.udp_gso(), queues,
+                        "TUN created with GSO/GRO offload (Phase 6.2)");
+                    break 'create_loop (dev, true);
+                }
+                Ok(dev) => {
+                    tracing::info!(%resolved_name, "kernel built TUN but reports no GSO; using single-packet path");
+                    drop(dev);
+                    let dev = try_build(false).context("failed to create TUN device")?;
+                    break 'create_loop (dev, false);
+                }
+                Err(e) => {
+                    if name == "auto" && taken.len() < 255 {
+                        tracing::debug!(
+                            name = %resolved_name,
+                            error = %e,
+                            "TUN creation failed (race); trying next free boreN"
+                        );
+                        taken.insert(resolved_name);
+                        continue;
+                    } else {
+                        return Err(e).context("failed to create TUN device");
+                    }
+                }
             }
         };
 
@@ -2476,7 +2517,7 @@ pub mod hostcfg {
                 .with_context(|| format!("failed to clone TUN queue {i}"))?;
             devs.push(extra);
         }
-        Ok((devs, offload))
+        Ok((devs, offload, resolved_name))
     }
 
     /// Internal: marker for an ip_forward revert operation.
@@ -2984,9 +3025,9 @@ pub mod hostcfg {
             let addr: Ipv4Addr = "10.199.0.1".parse().unwrap();
 
             // Stale reclaim in case a previous run crashed.
-            stale_reclaim("test0", "listen", name).await;
+            stale_reclaim("test0", "listen").await;
 
-            let (mut devs, _offload) = create_tun(name, addr, 30, 1350, 1)
+            let (mut devs, _offload, _resolved_name) = create_tun(name, addr, 30, 1350, 1)
                 .await
                 .expect("failed to create TUN");
             let dev = devs.remove(0);
@@ -4356,6 +4397,42 @@ mod tests {
         assert_eq!(pmtu_decision(1350, &[100, 1450, 1450, 1450]), Some(1450));
     }
 
+    /// TUN name auto-resolution.
+    #[test]
+    fn pick_tun_name_explicit_passthrough() {
+        assert_eq!(
+            hostcfg::pick_tun_name("bore7", |_| false),
+            Some("bore7".to_string())
+        );
+        assert_eq!(
+            hostcfg::pick_tun_name("mytun", |_| false),
+            Some("mytun".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_tun_name_auto_finds_first_free() {
+        assert_eq!(
+            hostcfg::pick_tun_name("auto", |_| false),
+            Some("bore0".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_tun_name_auto_skips_occupied() {
+        let taken = |c: &str| c == "bore0" || c == "bore1";
+        assert_eq!(
+            hostcfg::pick_tun_name("auto", taken),
+            Some("bore2".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_tun_name_auto_exhaustion() {
+        let all_taken = |c: &str| c.starts_with("bore");
+        assert_eq!(hostcfg::pick_tun_name("auto", all_taken), None);
+    }
+
     /// Routing-loop guard: direct candidates inside a tunneled subnet are
     /// dropped (they would loop the QUIC handshake back through the relay and
     /// the "direct" link would die at the switch — `read_datagram: timed out`).
@@ -5303,16 +5380,16 @@ pub mod hub {
         );
 
         // Stale reclaim
-        super::hostcfg::stale_reclaim(&args.id, "listen", &args.tun_name).await;
+        super::hostcfg::stale_reclaim(&args.id, "listen").await;
 
         // Create TUN device(s).
-        let (devs_raw, offload) =
+        let (devs_raw, offload, tun_name) =
             super::hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu, args.tun_queues)
                 .await?;
         let devs: Vec<Arc<tun_rs::AsyncDevice>> = devs_raw.into_iter().map(Arc::new).collect();
         info!(
             link_id = %args.id,
-            iface = %args.tun_name,
+            iface = %tun_name,
             addr = %assigned,
             prefix = prefix,
             "created hub tun device"
@@ -5325,7 +5402,7 @@ pub mod hub {
             &runner,
             &args.id,
             "listen",
-            &args.tun_name,
+            &tun_name,
             assigned,
             prefix,
             &[], // Hub doesn't route peer routes; peers route themselves

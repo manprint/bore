@@ -988,7 +988,7 @@ bore server \
 | `--advertise <CIDRs>` | `BORE_VPN_ADVERTISE` | — | Subnets to expose (comma-sep); enables gateway mode |
 | `--vpn-addr <IP/PREFIX>` | `BORE_VPN_ADDR` | — | Static overlay address (pool mode if omitted) |
 | `--vpn-peer-addr <IP>` | `BORE_VPN_PEER_ADDR` | — | Static peer address (requires `--vpn-addr`) |
-| `--tun-name <NAME>` | — | `bore0` | TUN interface name |
+| `--tun-name <NAME>` | — | `auto` | TUN interface name; `auto` picks the first free `boreN` (bore0, bore1, …) |
 | `--mtu <N>` | — | `1350` | TUN interface MTU |
 | `--no-route-manage` | — | — | Print route/NAT commands instead of running them |
 | `--auto-reconnect` | `BORE_AUTO_RECONNECT` | — | Reconnect with exponential backoff |
@@ -1019,6 +1019,26 @@ Large packets drop transiently during the first 1–2 seconds (QUIC MTU discover
 - **Link pairs but no ping:** Check `path=` in logs. If `relay`, run `bore test-udp` to diagnose NAT type.
 - **Ping ok, TCP slow:** Try `--mtu 1280`; verify MSS-clamp rule: `nft list table inet bore_vpn_<id>`.
 - **Works from gateway, not from LAN hosts:** LAN's router needs a route to the peer's LAN via the bore gateway.
+
+### Running Multiple VPN Instances on One Host
+
+By default, `--tun-name` auto-selects the first available interface name (`bore0`, then `bore1`, `bore2`, …). This allows multiple `bore vpn listen` and/or `bore vpn connect` instances to coexist on the same physical host with no manual configuration or collision:
+
+```bash
+# Terminal 1: first connector to listener A
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id linkA
+
+# Terminal 2: second connector to listener B (on the same host)
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id linkB
+```
+
+The first instance gets `bore0`, the second `bore1`. To force a specific name, pass `--tun-name myname`; otherwise, auto-naming handles arbitrary instance counts with zero configuration.
 
 ### Cleanup
 

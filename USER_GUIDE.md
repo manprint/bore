@@ -1136,6 +1136,26 @@ Il client raggiunge la LAN dietro il gateway. Per **site ↔ site** basta passar
 - `Ctrl-C` ripristina tutto (route, ip_forward, nft, interfaccia); un `SIGKILL`
   lascia stato stantio che il riavvio con lo stesso `--id` riclama da solo.
 
+#### Lanciare più istanze VPN sullo stesso host
+
+Per default, `--tun-name` sceglie automaticamente il primo nome di interfaccia disponibile (`bore0`, poi `bore1`, `bore2`, …). Questo consente a molteplici istanze di `bore vpn listen` e/o `bore vpn connect` di coesistere su uno stesso host senza configurazione manuale né collisioni:
+
+```bash
+# Terminale 1: primo connector verso il listener A
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id linkA
+
+# Terminale 2: secondo connector verso il listener B (stesso host)
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id linkB
+```
+
+La prima istanza ottiene `bore0`, la seconda `bore1`. Per forzare un nome specifico, passa `--tun-name myname`; altrimenti l'auto-naming gestisce un numero arbitrario di istanze senza configurazione.
+
 > **Stato:** VPN su Linux è feature-complete e verificata end-to-end dalla suite
 > netns (`scripts/vpn_netns_test.sh`, Test 1–14 — PASS 2026-06-11). macOS/Windows/
 > Android sono solo groundwork (build-checked in CI, nessun runtime).

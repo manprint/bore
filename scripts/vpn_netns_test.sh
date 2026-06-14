@@ -54,6 +54,8 @@ BORE_LOG=$(mktemp)
 BORE_SERVER_PID=""
 BORE_LISTEN_PID=""
 BORE_CONNECT_PID=""
+BORE_LISTEN_PID_B=""
+BORE_CONNECT_PID_B=""
 
 pass() { echo "PASS: $*"; PASS=$((PASS+1)); }
 fail() { echo "FAIL: $*"; FAIL=$((FAIL+1)); }
@@ -62,7 +64,9 @@ die()  { echo "ERROR: $*" >&2; cleanup; exit 1; }
 cleanup() {
     set +e
     [ -n "$BORE_CONNECT_PID" ] && kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+    [ -n "$BORE_CONNECT_PID_B" ] && kill "$BORE_CONNECT_PID_B" 2>/dev/null; BORE_CONNECT_PID_B=""
     [ -n "$BORE_LISTEN_PID"  ] && kill "$BORE_LISTEN_PID"  2>/dev/null; BORE_LISTEN_PID=""
+    [ -n "$BORE_LISTEN_PID_B" ] && kill "$BORE_LISTEN_PID_B" 2>/dev/null; BORE_LISTEN_PID_B=""
     [ -n "$BORE_SERVER_PID"  ] && kill "$BORE_SERVER_PID"  2>/dev/null; BORE_SERVER_PID=""
     sleep 0.5
     ip netns del ns0 2>/dev/null
@@ -1691,6 +1695,110 @@ run_scen() {
 }
 run_scen relay
 run_scen direct
+
+# ── Test T-MULTI-TUN: two co-located connectors auto-assign distinct TUN names ────
+# Regression guard: --tun-name auto defaults to the first free boreN interface,
+# so two same-host connectors dialing different listeners no longer collide.
+# Before the fix: both picked bore0, the second's startup tore down the first's interface.
+echo "=== T-MULTI-TUN: two connectors same-host distinct auto TUN names ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id multi-tun-alpha \
+    --relay-only \
+    >"$BORE_LOG.multi_tun_listen_alpha" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns3 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_C" --secret "$SECRET" --id multi-tun-beta \
+    --relay-only \
+    >"$BORE_LOG.multi_tun_listen_beta" 2>&1 &
+BORE_LISTEN_PID_B=$!
+sleep 0.5
+
+# Start TWO connectors in ns2, both WITHOUT --tun-name (auto-assignment):
+# First dials listen-alpha, second dials listen-beta.
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_B" --secret "$SECRET" --id multi-tun-alpha \
+    --relay-only \
+    >"$BORE_LOG.multi_tun_conn_alpha" 2>&1 &
+BORE_CONNECT_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_B" --secret "$SECRET" --id multi-tun-beta \
+    --relay-only \
+    >"$BORE_LOG.multi_tun_conn_beta" 2>&1 &
+BORE_CONNECT_PID_B=$!
+
+# Wait for both listeners to pair
+if wait_for_log "$BORE_LOG.multi_tun_listen_alpha" "vpn link paired\|VpnReady" 10 && \
+   wait_for_log "$BORE_LOG.multi_tun_listen_beta" "vpn link paired\|VpnReady" 10; then
+    sleep 1.5  # Let both TUN interfaces settle
+
+    # Assertion 1: Both TUN interfaces exist and are distinct (bore0 AND bore1)
+    BORE0_EXISTS=$(ip netns exec ns2 ip link show bore0 >/dev/null 2>&1 && echo 1 || echo 0)
+    BORE1_EXISTS=$(ip netns exec ns2 ip link show bore1 >/dev/null 2>&1 && echo 1 || echo 0)
+
+    if [ "$BORE0_EXISTS" = "1" ] && [ "$BORE1_EXISTS" = "1" ]; then
+        pass "T-MULTI-TUN: both bore0 and bore1 exist in ns2"
+    else
+        fail "T-MULTI-TUN: missing TUN interface (bore0=$BORE0_EXISTS bore1=$BORE1_EXISTS)"
+    fi
+
+    # Assertion 2: Get the overlay addresses from both interfaces
+    BORE0_ADDR=$(ip netns exec ns2 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    BORE1_ADDR=$(ip netns exec ns2 ip addr show bore1 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    NS1_ALPHA_ADDR=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    NS3_BETA_ADDR=$(ip netns exec ns3 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+
+    if [ -n "$BORE0_ADDR" ] && [ -n "$BORE1_ADDR" ] && [ -n "$NS1_ALPHA_ADDR" ] && [ -n "$NS3_BETA_ADDR" ]; then
+        # Assertion 2a: ping alpha link (ns2 bore0 → ns1 bore0)
+        if ip netns exec ns2 ping -c 2 -W 3 "$NS1_ALPHA_ADDR" >/dev/null 2>&1; then
+            pass "T-MULTI-TUN: traffic flows on alpha link (ns2 bore0 → ns1)"
+        else
+            fail "T-MULTI-TUN: ping failed on alpha link"
+        fi
+
+        # Assertion 2b: ping beta link (ns2 bore1 → ns3 bore0)
+        if ip netns exec ns2 ping -c 2 -W 3 "$NS3_BETA_ADDR" >/dev/null 2>&1; then
+            pass "T-MULTI-TUN: traffic flows on beta link (ns2 bore1 → ns3)"
+        else
+            fail "T-MULTI-TUN: ping failed on beta link"
+        fi
+    else
+        fail "T-MULTI-TUN: one or more overlay addresses missing (bore0=$BORE0_ADDR bore1=$BORE1_ADDR ns1=$NS1_ALPHA_ADDR ns3=$NS3_BETA_ADDR)"
+    fi
+
+    # Assertion 3: RC1 regression guard — kill alpha connector, verify beta still works
+    kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+    sleep 1
+
+    # bore0 should be gone, bore1 should still exist
+    BORE0_AFTER=$(ip netns exec ns2 ip link show bore0 >/dev/null 2>&1 && echo 1 || echo 0)
+    BORE1_AFTER=$(ip netns exec ns2 ip link show bore1 >/dev/null 2>&1 && echo 1 || echo 0)
+
+    if [ "$BORE0_AFTER" = "0" ] && [ "$BORE1_AFTER" = "1" ]; then
+        pass "T-MULTI-TUN: bore0 removed after alpha kill, bore1 still up"
+    else
+        fail "T-MULTI-TUN: unexpected TUN state after kill (bore0=$BORE0_AFTER bore1=$BORE1_AFTER, expected 0 and 1)"
+    fi
+
+    # Verify beta link still carries traffic after alpha is gone
+    if [ -n "$NS3_BETA_ADDR" ] && ip netns exec ns2 ping -c 2 -W 3 "$NS3_BETA_ADDR" >/dev/null 2>&1; then
+        pass "T-MULTI-TUN: beta link still carries traffic after alpha dies"
+    else
+        fail "T-MULTI-TUN: beta link broke after alpha kill"
+    fi
+else
+    fail "T-MULTI-TUN: one or both listeners did not pair within 10s"
+fi
+
+kill "$BORE_LISTEN_PID" "$BORE_LISTEN_PID_B" "$BORE_CONNECT_PID" "$BORE_CONNECT_PID_B" 2>/dev/null
+BORE_LISTEN_PID=""
+BORE_LISTEN_PID_B=""
+BORE_CONNECT_PID=""
+BORE_CONNECT_PID_B=""
+sleep 0.5
 
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""

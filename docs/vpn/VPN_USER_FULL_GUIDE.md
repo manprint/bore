@@ -58,7 +58,7 @@ sudo bore vpn connect \
   --id demo
 ```
 
-After pairing, both machines have a `bore0` interface with overlay addresses (e.g. `10.99.0.1` and `10.99.0.2`). Ping them:
+After pairing, both machines have a TUN interface (`bore0` by default, configurable with `--tun-name`) with overlay addresses (e.g. `10.99.0.1` and `10.99.0.2`). Ping them:
 
 ```bash
 # From Machine B
@@ -306,7 +306,7 @@ ping 192.168.60.1
 | `--advertise` | | `BORE_VPN_ADVERTISE` | `CIDR[,CIDR...]` | — | Subnets to expose; comma-separated; enables gateway mode when non-empty |
 | `--vpn-addr` | | `BORE_VPN_ADDR` | `IP/PREFIX` | — | Static overlay address with prefix (e.g. `172.31.0.1/30`); omit for pool mode |
 | `--vpn-peer-addr` | | `BORE_VPN_PEER_ADDR` | `IP` | — | Static peer overlay address (requires `--vpn-addr`) |
-| `--tun-name` | | — | `NAME` | `bore0` | TUN interface name |
+| `--tun-name` | | — | `NAME` | `auto` | TUN interface name; `auto` picks the first free `boreN` (bore0, bore1, …) |
 | `--mtu` | | — | `N` | `1350` | TUN interface MTU; reduce if large packets drop persistently |
 | `--no-route-manage` | | — | flag | — | Print all route/NAT commands verbatim instead of running them; TUN is still created |
 | `--auto-reconnect` | | `BORE_AUTO_RECONNECT` | flag | — | Reconnect on link failure with exponential backoff (full teardown+rebuild per attempt; fatal config errors exit) |
@@ -742,6 +742,44 @@ SIGKILL bypasses cleanup. On the next `bore vpn` run with the same `--id`, bore 
 - `bore0` interface exists → delete and recreate
 - `bore_vpn_<id>` nft table exists → delete before installing new rules
 - `/proc/sys/net/ipv4/ip_forward` is `1` but was `0` before → note: bore cannot distinguish its own previous change from an independent one; IP forwarding is left as-is in ambiguous cases
+
+---
+
+## 16.1 Running Multiple VPN Instances on One Host
+
+By default, `--tun-name` auto-selects the first available interface name (`bore0`, then `bore1`, `bore2`, …). This allows multiple `bore vpn listen` and/or `bore vpn connect` instances to coexist on the same physical host with no manual configuration or collision.
+
+**Example: two connectors on one host, connecting to two different listeners**
+
+```bash
+# Terminal 1: first connector to listener A (gets bore0)
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id linkA
+
+# Terminal 2: second connector to listener B (gets bore1)
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id linkB
+```
+
+After both start, `ip link show type tun` lists:
+```
+1: bore0: <POINTOPOINT,NOARP,UP,LOWER_UP> ...
+2: bore1: <POINTOPOINT,NOARP,UP,LOWER_UP> ...
+```
+
+Each instance has its own overlay addresses, routes, and cleanup. `Ctrl-C` on either instance tears down only that link; the other remains unaffected.
+
+**To force a specific name:**
+
+```bash
+sudo bore vpn connect --id linkC --secret S3cret --tun-name vpn0
+```
+
+When omitted, the auto default handles arbitrary instance counts with zero configuration.
 
 ---
 

@@ -907,8 +907,8 @@ struct VpnListenArgs {
     )]
     vpn_peer_addr: Option<String>,
 
-    /// TUN interface name.
-    #[clap(long, value_name = "NAME", default_value = "bore0")]
+    /// TUN interface name ("auto" = first free boreN, lets many instances share a host).
+    #[clap(long, value_name = "NAME", default_value = "auto")]
     tun_name: String,
 
     /// Interface MTU.
@@ -1041,8 +1041,8 @@ struct VpnConnectArgs {
     )]
     vpn_peer_addr: Option<String>,
 
-    /// TUN interface name.
-    #[clap(long, value_name = "NAME", default_value = "bore0")]
+    /// TUN interface name ("auto" = first free boreN, lets many instances share a host).
+    #[clap(long, value_name = "NAME", default_value = "auto")]
     tun_name: String,
 
     /// Interface MTU.

@@ -251,7 +251,7 @@ Tuttavia se il link viene ripareggiato (reconnect) e l'UDP entry della sessione 
 |---|---|---|---|
 | E1 | Multi-peer mesh / hub (N nodi, routing dinamico) | Alta | Trasforma bore in overlay network completo |
 | E2 | IPv6 overlay + dual-stack + NAT66/NPTv6 | Media | Necessario per deployment moderni |
-| E3 | Overlapping subnets via 1:1 NAT (DNAT/SNAT remap) | Media | Sblocca siti con LAN private identiche |
+| ✅ E3 | Overlapping subnets via 1:1 NAT (DNAT/SNAT remap) | Media | **DONE (2026-06-14)** Sblocca siti con LAN private identiche |
 | E4 | Relay su path UDP inaffidabile (no TCP meltdown su relay) | Alta | Elimina §C3, parità con direct path |
 | E5 | Privilege drop post-setup (setuid/capabilities) | Bassa | Riduzione superficie d'attacco |
 | E6 | Windows support (wintun) / macOS (utun) | Media | Cross-platform |

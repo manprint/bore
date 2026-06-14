@@ -294,6 +294,40 @@ ping 192.168.60.1
 
 ---
 
+## 6.1 Overlapping Subnets / 1:1 NAT
+
+If two sites have identical real LANs (e.g., both numbered `192.168.1.0/24`), use the NAT form of `--advertise` to expose each under a distinct virtual CIDR:
+
+```bash
+# Site A (real LAN 192.168.1.0/24)
+sudo bore vpn listen \
+  --to bore.example.com \
+  --secret S3cret \
+  --id office \
+  --advertise 192.168.1.0/24@10.50.1.0/24
+
+# Site B (real LAN 192.168.1.0/24, same as Site A!)
+sudo bore vpn connect \
+  --to bore.example.com \
+  --secret S3cret \
+  --id office \
+  --advertise 192.168.1.0/24@10.60.1.0/24 \
+  --accept-all-routes
+```
+
+**Result:**
+- Site A reaches Site B's real LAN via `10.60.1.x` (the virtual).
+- Site B reaches Site A's real LAN via `10.50.1.x` (the virtual).
+- Each site performs stateless 1:1 netmap: `10.50.1.5 ↔ 192.168.1.5` (host bits preserved), no collision, no masquerade confusion.
+
+**What the connector sees:**
+The connector only knows about the **virtual CIDRs** (`10.50.1.0/24`, `10.60.1.0/24`). The real subnets (`192.168.1.0/24`) are hidden by design — the gateway alone knows and maps them. When you use `--accept-routes` or `--accept-all-routes` on the connector, you are filtering the virtuals; the real subnets are never advertised.
+
+**Limitation — No ALG:**
+Stateless 1:1 netmap does not rewrite IPs embedded in application payloads. Protocols that embed their own address (FTP active mode, SIP, some RPC variants) will fail or misbehave. Use IP-agnostic protocols (HTTP, HTTPS, SSH, DNS, passive-mode FTP) or configure the app separately.
+
+---
+
 ## 7. Complete Flag Reference
 
 ### `bore vpn listen`
@@ -303,7 +337,7 @@ ping 192.168.60.1
 | `--to` | `-t` | `BORE_SERVER` | `ADDR` | `bore.0912345.xyz` | Server address (`host`, `host:port`, or `https://host`) |
 | `--secret` | `-s` | `BORE_SECRET` | `SECRET` | **required** | Shared secret for auth + relay encryption |
 | `--id` | | `BORE_VPN_ID` | `ID` | **required** | Link identifier; connector must use the same value |
-| `--advertise` | | `BORE_VPN_ADVERTISE` | `CIDR[,CIDR...]` | — | Subnets to expose; comma-separated; enables gateway mode when non-empty |
+| `--advertise` | | `BORE_VPN_ADVERTISE` | `ITEM[,ITEM...]` | — | Subnets to expose; comma-separated; `ITEM` = `<cidr>` (plain) or `<real>@<virtual>` (NAT); enables gateway mode when non-empty |
 | `--vpn-addr` | | `BORE_VPN_ADDR` | `IP/PREFIX` | — | Static overlay address with prefix (e.g. `172.31.0.1/30`); omit for pool mode |
 | `--vpn-peer-addr` | | `BORE_VPN_PEER_ADDR` | `IP` | — | Static peer overlay address (requires `--vpn-addr`) |
 | `--tun-name` | | — | `NAME` | `auto` | TUN interface name; `auto` picks the first free `boreN` (bore0, bore1, …) |

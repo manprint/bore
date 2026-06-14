@@ -562,6 +562,68 @@ impl Ipv4Net {
     }
 }
 
+/// One `--advertise` item, optionally NAT-mapped (overlapping-subnet NAT, "E3").
+///
+/// Parsed from `<real>` (plain, no NAT) or `<real>@<exposed>` (1:1 stateless
+/// netmap). The **real** subnet is the actual LAN behind this gateway; the
+/// **exposed** subnet is what peers route and address. They are equal for a
+/// plain entry. Only the exposed CIDR is ever serialized on the wire (N3/I-NAT2):
+/// real subnets are gateway-local. Equal prefix length is enforced (N4): the
+/// netmap preserves host bits 1:1, so a `/24@/25` is a hard parse error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdvertiseEntry {
+    /// Real local subnet (the actual LAN behind this gateway).
+    pub real: Ipv4Net,
+    /// Subnet exposed to peers over the wire. Equals `real` when no `@` mapping is given.
+    pub exposed: Ipv4Net,
+}
+
+impl AdvertiseEntry {
+    /// True when this entry maps a real subnet to a distinct exposed (virtual) one.
+    pub fn is_nat(&self) -> bool {
+        self.real != self.exposed
+    }
+}
+
+impl std::str::FromStr for AdvertiseEntry {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.split_once('@') {
+            None => {
+                let n: Ipv4Net = s.parse()?;
+                Ok(Self {
+                    real: n,
+                    exposed: n,
+                })
+            }
+            Some((r, v)) => {
+                anyhow::ensure!(!v.contains('@'), "advertise '{s}': at most one '@'");
+                let real: Ipv4Net = r.parse().with_context(|| format!("advertise real '{r}'"))?;
+                let exposed: Ipv4Net = v
+                    .parse()
+                    .with_context(|| format!("advertise virtual '{v}'"))?;
+                anyhow::ensure!(
+                    real.prefix == exposed.prefix,
+                    "advertise '{s}': real /{} and virtual /{} must have equal prefix length (1:1 netmap)",
+                    real.prefix,
+                    exposed.prefix
+                );
+                Ok(Self { real, exposed })
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for AdvertiseEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_nat() {
+            write!(f, "{}@{}", self.real, self.exposed)
+        } else {
+            write!(f, "{}", self.real)
+        }
+    }
+}
+
 /// How a side wants its overlay address assigned.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VpnAddrRequest {
@@ -1516,6 +1578,58 @@ fn ipv4net_overlaps() {
     let d: Ipv4Net = "192.168.0.0/30".parse().unwrap();
     let e: Ipv4Net = "192.168.0.4/30".parse().unwrap();
     assert!(!d.overlaps(&e));
+}
+
+#[test]
+fn advertise_parse_plain_no_at() {
+    let e: AdvertiseEntry = "192.168.50.0/24".parse().unwrap();
+    assert_eq!(e.real, e.exposed);
+    assert!(!e.is_nat());
+    assert_eq!(e.real, "192.168.50.0/24".parse::<Ipv4Net>().unwrap());
+    assert_eq!(e.to_string(), "192.168.50.0/24");
+}
+
+#[test]
+fn advertise_parse_nat_at() {
+    let e: AdvertiseEntry = "192.168.1.0/24@10.50.1.0/24".parse().unwrap();
+    assert_eq!(e.real, "192.168.1.0/24".parse::<Ipv4Net>().unwrap());
+    assert_eq!(e.exposed, "10.50.1.0/24".parse::<Ipv4Net>().unwrap());
+    assert!(e.is_nat());
+    assert_eq!(e.to_string(), "192.168.1.0/24@10.50.1.0/24");
+}
+
+#[test]
+fn advertise_parse_rejects_prefix_mismatch() {
+    let r = "192.168.1.0/24@10.50.1.0/25".parse::<AdvertiseEntry>();
+    assert!(r.is_err());
+    assert!(r.unwrap_err().to_string().contains("equal prefix length"));
+}
+
+#[test]
+fn advertise_parse_rejects_double_at() {
+    assert!("192.168.1.0/24@10.50.1.0/24@x"
+        .parse::<AdvertiseEntry>()
+        .is_err());
+}
+
+#[test]
+fn advertise_parse_rejects_bad_cidr() {
+    assert!("not-a-cidr".parse::<AdvertiseEntry>().is_err());
+    assert!("192.168.1.0/24@not-a-cidr"
+        .parse::<AdvertiseEntry>()
+        .is_err());
+}
+
+#[test]
+fn advertise_parse_mixed_list() {
+    let items = ["192.168.1.0/24@10.50.1.0/24", "172.16.0.0/24"];
+    let entries: Vec<AdvertiseEntry> = items.iter().map(|s| s.parse().unwrap()).collect();
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0].is_nat());
+    assert!(!entries[1].is_nat());
+    let exposed: Vec<Ipv4Net> = entries.iter().map(|e| e.exposed).collect();
+    assert_eq!(exposed[0], "10.50.1.0/24".parse::<Ipv4Net>().unwrap());
+    assert_eq!(exposed[1], "172.16.0.0/24".parse::<Ipv4Net>().unwrap());
 }
 
 #[test]

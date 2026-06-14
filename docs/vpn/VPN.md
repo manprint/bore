@@ -323,11 +323,37 @@ This clamps TCP's **Maximum Segment Size** to the route MTU on outbound packets,
 
 ## Limitations (v1)
 
-### Overlapping Subnets
+### Overlapping Subnets / 1:1 NAT
 
-If both sides (or either side and the overlay /30) advertise overlapping subnets, the server rejects the pair with `VpnError("overlapping subnets: ...")`. The listener remains registered; the connector exits non-zero.
+Two gateways with identical real LANs can now be joined via **stateless 1:1 netmap (NAT)**. Use the `--advertise <real>@<virtual>` syntax:
 
-This is a **v1 limitation**. Future versions may support overlapping subnets via per-subnet 1:1 NAT (DNAT/SNAT remapping).
+```bash
+# Site A (LAN 192.168.1.0/24)
+bore vpn listen --id demo --secret S --advertise 192.168.1.0/24@10.50.1.0/24
+
+# Site B (LAN 192.168.1.0/24, same real subnet!)
+bore vpn connect --id demo --secret S --advertise 192.168.1.0/24@10.60.1.0/24 --accept-all-routes
+```
+
+**How it works:**
+- Each gateway advertises a **virtual CIDR** (`10.50.1.0/24`, `10.60.1.0/24`) to peers and the server.
+- The server sees only virtuals — no overlap, no collision.
+- The gateway performs stateless 1:1 netmap locally: incoming traffic to the virtual is DNAT'd to the real; outgoing from the real is SNAT'd to the virtual. Host bits are preserved (`10.50.1.7` ↔ `192.168.1.7`).
+- The mapping works identically on relay and direct paths, and in site↔host, site↔site, and hub topologies.
+
+**Constraints:**
+- The real and virtual CIDR must have **equal prefix length** (validated at CLI parse; e.g., `/24@/24` OK, `/24@/25` rejected).
+- Plain `--advertise <cidr>` (no `@`) is unchanged — no NAT, unmodified behavior.
+- **Limitation:** no ALG (Application Layer Gateway) — IPs embedded in payloads (FTP active mode, SIP) are not translated. Use IP-agnostic or passive protocols, or configure the app layer separately.
+
+**Example cross-ping:**
+
+```bash
+# From Site A gateway:  ping 10.60.1.10  → reaches Site B's real 192.168.1.10
+# From Site B gateway:  ping 10.50.1.5   → reaches Site A's real 192.168.1.5
+```
+
+Site B's host 192.168.1.10 observes the caller as `10.50.1.5` (stable, no masquerade collision).
 
 ### IPv4 Only
 

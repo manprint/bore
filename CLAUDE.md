@@ -175,5 +175,17 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   `vpn_netns_test.sh` (run on BOTH relay and direct). NOPASSWD sudo is per-EXACT-path: invoke
   `sudo -n /abs/path/scripts/vpn_netns_test.sh` (NOT `sudo bash scripts/...`, which prompts).
 
+**VPN overlapping-subnet NAT (E3) — stateless 1:1 netmap for identical LANs:**
+- **I-NAT1:** No `@` in advertise ⇒ `NetConfig::apply` byte-for-byte today's blanket masquerade (zero regression, mirrors I-MC1).
+- **I-NAT2:** Only **exposed (virtual)** CIDR serialized (`HelloVpn`/`ConnectVpn`/`VpnReady`); real subnets gateway-local, never on wire. NAT client interops with unmodified server.
+- **I-NAT3:** Netmap stateless 1:1, host-bits preserved; real & exposed equal prefix length (validated parse). No conntrack.
+- **I-NAT4:** Each gateway maps only its own real↔exposed; no per-peer or global state. Identical relay/direct (kernel-side).
+- **I-NAT5:** NAT'd subnets never masqueraded (source already peer virtual). When NAT present, masquerade scoped to plain subnets by destination.
+- **I-NAT6:** Server overlap check on virtuals; real subnets may overlap freely (feature purpose).
+- **I-NAT7:** `NetConfig` RAII reverts netmap rules + prerouting chain on SIGINT/SIGTERM/panic; SIGKILL via `stale_reclaim` (nft: table delete; iptables: explicit rule deletes).
+- **I-NAT8:** Bore data plane unchanged — IP packets opaque, no Rust header rewrite; all NAT kernel nft/iptables.
+- **I-NAT9:** LAN-egress iface + `ip_forward` use real subnet (virtual has no local route).
+- **I-NAT10:** Every link logs at `info`: advertise entries (real→exposed), NAT rules, peer routes, canonical route-table summary. No ALG — embedded IPs not translated.
+
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

@@ -1696,6 +1696,468 @@ run_scen() {
 run_scen relay
 run_scen direct
 
+# ══ Phase 6: NAT (overlapping-subnet 1:1 netmap) tests ══════════════════════════════════
+# Add lo aliases for real LAN hosts behind the NAT gateways.
+# NAT test setup:
+# - NAT_LAN_A = 192.168.10.0/24 (real LAN behind ns1 gateway, exposed as 10.50.1.0/24)
+# - NAT_LAN_B = 192.168.10.0/24 (real LAN behind ns2 gateway, exposed as 10.60.1.0/24)
+# - NAT_LAN_C = 192.168.10.0/24 (real LAN behind ns3 gateway, exposed as 10.70.1.0/24)
+# Both sites have IDENTICAL real LAN 192.168.10.0/24; virtuals are distinct.
+NAT_REAL_LAN="192.168.10.0/24"
+NAT_REAL_HOST_A="192.168.10.5"
+NAT_REAL_HOST_B="192.168.10.10"
+NAT_REAL_HOST_C="192.168.10.15"
+NAT_VIRT_A="10.50.1.0/24"
+NAT_VIRT_B="10.60.1.0/24"
+NAT_VIRT_C="10.70.1.0/24"
+
+# Add the real LAN hosts to ns1, ns2, ns3 loopbacks
+ip netns exec ns1 ip addr add "$NAT_REAL_HOST_A/24" dev lo
+ip netns exec ns2 ip addr add "$NAT_REAL_HOST_B/24" dev lo
+ip netns exec ns3 ip addr add "$NAT_REAL_HOST_C/24" dev lo
+
+# ── Test T-NAT1: site↔host with NAT (topology B) ─────────────────────────────────────
+echo "=== T-NAT1: site↔host NAT (gateway advertises real@virtual) ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-nat1 \
+    --advertise "${NAT_REAL_LAN}@${NAT_VIRT_A}" \
+    >"$BORE_LOG.nat1_listen" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-nat1 \
+    --accept-all-routes \
+    >"$BORE_LOG.nat1_connect" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.nat1_listen" "vpn link paired\|VpnReady" 10; then
+    sleep 1
+    # ns2 should have route to the virtual LAN (10.50.1.0/24), NOT the real LAN (192.168.10.0/24)
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$NAT_VIRT_A"; then
+        pass "T-NAT1: virtual route $NAT_VIRT_A installed in ns2 (not real $NAT_REAL_LAN)"
+    else
+        fail "T-NAT1: virtual route to $NAT_VIRT_A NOT found in ns2"
+    fi
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$NAT_REAL_LAN"; then
+        fail "T-NAT1: real route $NAT_REAL_LAN should NOT be installed in ns2"
+    else
+        pass "T-NAT1: real route $NAT_REAL_LAN correctly absent from ns2"
+    fi
+    # Ping the virtual address should reach the real host
+    if ip netns exec ns2 ping -c 2 -W 3 "10.50.1.5" >/dev/null 2>&1; then
+        pass "T-NAT1: ping 10.50.1.5 (virtual) reaches ns1 real host 192.168.10.5"
+    else
+        fail "T-NAT1: ping to 10.50.1.5 failed"
+    fi
+    # Verify the log contains nat netmap messages
+    if grep -q "nat netmap: dnat" "$BORE_LOG.nat1_listen" 2>/dev/null; then
+        pass "T-NAT1: log contains 'nat netmap: dnat' (NAT rules installed)"
+    else
+        fail "T-NAT1: log missing 'nat netmap: dnat' line"
+    fi
+else
+    fail "T-NAT1: listener did not pair within 10s"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
+# ── Test T-NAT2: site↔site with identical overlapping LANs (topology C) ──────────────────
+echo "=== T-NAT2: site↔site NAT (both map identical real 192.168.10.0/24) ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-nat2 \
+    --advertise "${NAT_REAL_LAN}@${NAT_VIRT_A}" \
+    >"$BORE_LOG.nat2_listen_a" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-nat2 \
+    --advertise "${NAT_REAL_LAN}@${NAT_VIRT_B}" \
+    --accept-all-routes \
+    >"$BORE_LOG.nat2_connect_b" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.nat2_listen_a" "vpn link paired\|VpnReady" 10; then
+    sleep 1
+    # ns1 should have route to ns2's virtual (10.60.1.0/24)
+    if ip netns exec ns1 ip route show 2>/dev/null | grep -q "$NAT_VIRT_B"; then
+        pass "T-NAT2: ns1 has route to ns2's virtual $NAT_VIRT_B"
+    else
+        fail "T-NAT2: ns1 missing route to $NAT_VIRT_B"
+    fi
+    # ns2 should have route to ns1's virtual (10.50.1.0/24)
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$NAT_VIRT_A"; then
+        pass "T-NAT2: ns2 has route to ns1's virtual $NAT_VIRT_A"
+    else
+        fail "T-NAT2: ns2 missing route to $NAT_VIRT_A"
+    fi
+    # The §1 identical-LAN scenario: source from the LOCAL real LAN host so the
+    # egress SNAT (saddr real -> virtual) fires on BOTH sides. ns1's host
+    # 192.168.10.5 -> 10.60.1.10 must reach ns2's real .10 (which sees the caller
+    # as 10.50.1.5, no collision); and symmetrically the other way.
+    if ip netns exec ns1 ping -c 2 -W 3 -I "$NAT_REAL_HOST_A" "10.60.1.10" >/dev/null 2>&1; then
+        pass "T-NAT2: ns1 host 192.168.10.5 -> 10.60.1.10 reaches ns2 real .10 (egress SNAT fired)"
+    else
+        fail "T-NAT2: ns1 host-sourced ping to 10.60.1.10 failed"
+    fi
+    # From ns2's host, ping ns1's virtual address should reach ns1's real host.
+    if ip netns exec ns2 ping -c 2 -W 3 -I "$NAT_REAL_HOST_B" "10.50.1.5" >/dev/null 2>&1; then
+        pass "T-NAT2: ns2 host 192.168.10.10 -> 10.50.1.5 reaches ns1 real .5 (symmetric)"
+    else
+        fail "T-NAT2: ns2 host-sourced ping to 10.50.1.5 failed"
+    fi
+else
+    fail "T-NAT2: listener did not pair within 10s"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
+# ── Test T-NAT3: host-bit preservation (1:1 netmap, not single-address DNAT) ────────────
+echo "=== T-NAT3: host-bit preservation (1:1 netmap) ==="
+# Add extra lo aliases for additional hosts to test host-bit preservation
+ip netns exec ns1 ip addr add "192.168.10.23/24" dev lo
+ip netns exec ns2 ip addr add "192.168.10.23/24" dev lo
+
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-nat3 \
+    --advertise "${NAT_REAL_LAN}@${NAT_VIRT_A}" \
+    >"$BORE_LOG.nat3_listen" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-nat3 \
+    --advertise "${NAT_REAL_LAN}@${NAT_VIRT_B}" \
+    --accept-all-routes \
+    >"$BORE_LOG.nat3_connect" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.nat3_listen" "vpn link paired\|VpnReady" 10; then
+    sleep 1
+    # Test host-bit preservation: .5 → 10.50.1.5, .23 → 10.50.1.23
+    if ip netns exec ns2 ping -c 1 -W 3 "10.50.1.5" >/dev/null 2>&1; then
+        pass "T-NAT3: host-bit .5 preserved (10.50.1.5 → 192.168.10.5)"
+    else
+        fail "T-NAT3: ping 10.50.1.5 failed"
+    fi
+    if ip netns exec ns2 ping -c 1 -W 3 "10.50.1.23" >/dev/null 2>&1; then
+        pass "T-NAT3: host-bit .23 preserved (10.50.1.23 → 192.168.10.23)"
+    else
+        fail "T-NAT3: ping 10.50.1.23 failed (host-bit not preserved?)"
+    fi
+else
+    fail "T-NAT3: listener did not pair within 10s"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
+# Clean up the extra .23 alias for next tests
+ip netns exec ns1 ip addr del "192.168.10.23/24" dev lo 2>/dev/null || true
+ip netns exec ns2 ip addr del "192.168.10.23/24" dev lo 2>/dev/null || true
+
+# ── Test T-NAT4: mixed plain + NAT (scoped masquerade) ───────────────────────────────────
+echo "=== T-NAT4: mixed plain + NAT advertise ==="
+# Add a second plain LAN to ns1 (not NAT'd)
+PLAIN_LAN="172.16.9.0/24"
+PLAIN_HOST="172.16.9.99"
+ip netns exec ns1 ip addr add "$PLAIN_HOST/24" dev lo
+
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-nat4 \
+    --advertise "${NAT_REAL_LAN}@${NAT_VIRT_A},$PLAIN_LAN" \
+    >"$BORE_LOG.nat4_listen" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-nat4 \
+    --accept-all-routes \
+    >"$BORE_LOG.nat4_connect" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.nat4_listen" "vpn link paired\|VpnReady" 10; then
+    sleep 1
+    # Should have both virtual (NAT'd) and plain routes
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$NAT_VIRT_A"; then
+        pass "T-NAT4: virtual NAT route $NAT_VIRT_A installed"
+    else
+        fail "T-NAT4: virtual NAT route missing"
+    fi
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$PLAIN_LAN"; then
+        pass "T-NAT4: plain route $PLAIN_LAN installed"
+    else
+        fail "T-NAT4: plain route missing"
+    fi
+    # Both should be reachable
+    if ip netns exec ns2 ping -c 1 -W 3 "10.50.1.5" >/dev/null 2>&1; then
+        pass "T-NAT4: NAT'd LAN reachable via 10.50.1.5"
+    else
+        fail "T-NAT4: ping to NAT'd LAN failed"
+    fi
+    if ip netns exec ns2 ping -c 1 -W 3 "$PLAIN_HOST" >/dev/null 2>&1; then
+        pass "T-NAT4: plain LAN reachable via $PLAIN_HOST"
+    else
+        fail "T-NAT4: ping to plain LAN failed"
+    fi
+else
+    fail "T-NAT4: listener did not pair"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
+# Clean up the plain LAN host alias
+ip netns exec ns1 ip addr del "$PLAIN_HOST/24" dev lo 2>/dev/null || true
+
+# ── Test T-NAT5: cleanup after graceful exit (RAII revert) ──────────────────────────────
+echo "=== T-NAT5: NAT cleanup after graceful exit ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-nat5 \
+    --advertise "${NAT_REAL_LAN}@${NAT_VIRT_A}" \
+    >"$BORE_LOG.nat5_listen" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-nat5 \
+    --accept-all-routes \
+    >"$BORE_LOG.nat5_connect" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.nat5_listen" "vpn link paired\|VpnReady" 10; then
+    sleep 1
+    # Confirm the NAT table exists while the link is up.
+    if ip netns exec ns1 nft list tables 2>/dev/null | grep -q "bore_vpn_t-nat5"; then
+        pass "T-NAT5: nft table bore_vpn_t-nat5 present while link up"
+    else
+        fail "T-NAT5: nft table bore_vpn_t-nat5 missing while link up"
+    fi
+
+    # Clean exit
+    kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+    kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+    sleep 1
+
+    # After exit, nft table should be gone (RAII revert). Use grep -q like the
+    # existing teardown test (grep -c + '|| echo 0' double-counts on no match).
+    if ip netns exec ns1 nft list tables 2>/dev/null | grep -q "bore_vpn_t-nat5"; then
+        fail "T-NAT5: nft table NOT removed after graceful exit"
+    else
+        pass "T-NAT5: nft table removed after graceful exit (RAII revert)"
+    fi
+
+    # Routes should be removed from ns2
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$NAT_VIRT_A"; then
+        fail "T-NAT5: route to $NAT_VIRT_A NOT removed from ns2 after exit"
+    else
+        pass "T-NAT5: route to $NAT_VIRT_A removed from ns2 after exit"
+    fi
+else
+    fail "T-NAT5: initial pair failed"
+    kill "$BORE_LISTEN_PID" "$BORE_CONNECT_PID" 2>/dev/null; BORE_LISTEN_PID=""; BORE_CONNECT_PID=""
+fi
+sleep 0.5
+
+# ── Test T-HUBNAT1: hub NAT multi-client (topology D) ──────────────────────────────────
+echo "=== T-HUBNAT1: hub NAT with multiple spokes ==="
+ip netns exec ns1 sysctl -qw net.ipv4.ip_forward=0 2>/dev/null || true
+
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hubnat-relay \
+    --max-clients 4 --relay-only \
+    --advertise "${NAT_REAL_LAN}@${NAT_VIRT_A}" \
+    >"$BORE_LOG.hubnat1_listen" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 1
+
+# Two spokes
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_B" --secret "$SECRET" --id hubnat-relay \
+    --relay-only --accept-all-routes \
+    >"$BORE_LOG.hubnat1_conn2" 2>&1 &
+BORE_HUB_CONN2=$!
+
+ip netns exec ns3 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_C" --secret "$SECRET" --id hubnat-relay \
+    --relay-only --accept-all-routes \
+    >"$BORE_LOG.hubnat1_conn3" 2>&1 &
+BORE_HUB_CONN3=$!
+
+# Wait for pairing
+HUB_NAT_PAIRED=0
+if wait_for_log "$BORE_LOG.hubnat1_listen" "vpn hub peer join" 15; then
+    sleep 1
+    PEER_JOIN_COUNT=$(grep -c "vpn hub peer join" "$BORE_LOG.hubnat1_listen" 2>/dev/null || echo 0)
+    if [ "$PEER_JOIN_COUNT" -ge 2 ]; then
+        HUB_NAT_PAIRED=1
+    fi
+fi
+
+if [ "$HUB_NAT_PAIRED" = "1" ]; then
+    sleep 1
+    # Both spokes should have the virtual route
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$NAT_VIRT_A"; then
+        pass "T-HUBNAT1: spoke ns2 has route to hub virtual $NAT_VIRT_A"
+    else
+        fail "T-HUBNAT1: spoke ns2 missing virtual route"
+    fi
+    if ip netns exec ns3 ip route show 2>/dev/null | grep -q "$NAT_VIRT_A"; then
+        pass "T-HUBNAT1: spoke ns3 has route to hub virtual $NAT_VIRT_A"
+    else
+        fail "T-HUBNAT1: spoke ns3 missing virtual route"
+    fi
+    # Both should reach the hub's real host via virtual
+    if ip netns exec ns2 ping -c 1 -W 3 "10.50.1.5" >/dev/null 2>&1; then
+        pass "T-HUBNAT1: spoke ns2 reaches hub real host via 10.50.1.5"
+    else
+        fail "T-HUBNAT1: spoke ns2 ping to hub failed"
+    fi
+    if ip netns exec ns3 ping -c 1 -W 3 "10.50.1.5" >/dev/null 2>&1; then
+        pass "T-HUBNAT1: spoke ns3 reaches hub real host via 10.50.1.5"
+    else
+        fail "T-HUBNAT1: spoke ns3 ping to hub failed"
+    fi
+else
+    fail "T-HUBNAT1: hub did not establish 2 spoke pairs"
+fi
+
+kill "$BORE_HUB_CONN2" "$BORE_HUB_CONN3" "$BORE_LISTEN_PID" 2>/dev/null
+BORE_LISTEN_PID=""; BORE_HUB_CONN2=""; BORE_HUB_CONN3=""
+sleep 0.5
+
+# ── Test T-HUBNAT2: spoke isolation intact with NAT ──────────────────────────────────────
+echo "=== T-HUBNAT2: spoke isolation intact (NAT doesn't break it) ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id hubnat2 \
+    --max-clients 4 --relay-only \
+    --advertise "${NAT_REAL_LAN}@${NAT_VIRT_A}" \
+    >"$BORE_LOG.hubnat2_listen" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 1
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_B" --secret "$SECRET" --id hubnat2 \
+    --relay-only --accept-all-routes \
+    >"$BORE_LOG.hubnat2_conn2" 2>&1 &
+BORE_HUB_CONN2=$!
+
+ip netns exec ns3 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_C" --secret "$SECRET" --id hubnat2 \
+    --relay-only --accept-all-routes \
+    >"$BORE_LOG.hubnat2_conn3" 2>&1 &
+BORE_HUB_CONN3=$!
+
+sleep 2.5; sleep 0.5  # settle
+CONN2_OVL=$(ip netns exec ns2 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+CONN3_OVL=$(ip netns exec ns3 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+
+if [ -n "$CONN2_OVL" ] && [ -n "$CONN3_OVL" ]; then
+    # ns2 should NOT reach ns3 (spoke isolation)
+    if ip netns exec ns2 ping -c 1 -W 2 "$CONN3_OVL" >/dev/null 2>&1; then
+        fail "T-HUBNAT2: ns2 reached ns3 (isolation violated)"
+    else
+        pass "T-HUBNAT2: ns2 cannot reach ns3 (isolation intact)"
+    fi
+else
+    fail "T-HUBNAT2: overlay addresses missing"
+fi
+
+kill "$BORE_HUB_CONN2" "$BORE_HUB_CONN3" "$BORE_LISTEN_PID" 2>/dev/null
+BORE_LISTEN_PID=""; BORE_HUB_CONN2=""; BORE_HUB_CONN3=""
+sleep 0.5
+
+# ── Test T-NATKILL: SIGKILL stale reclaim for NAT (nft + ip_forward) ───────────────────
+echo "=== T-NATKILL: SIGKILL stale reclaim with NAT ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-natkill \
+    --advertise "${NAT_REAL_LAN}@${NAT_VIRT_A}" \
+    --relay-only \
+    >"$BORE_LOG.natkill_listen" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-natkill \
+    --relay-only --accept-all-routes \
+    >"$BORE_LOG.natkill_connect" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.natkill_listen" "vpn link paired" 10; then
+    sleep 1
+    # SIGKILL: no cleanup
+    kill -9 "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+    kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+    sleep 0.5
+
+    # Stale table must exist
+    if ip netns exec ns1 nft list tables 2>/dev/null | grep -q "bore_vpn_t-natkill"; then
+        pass "T-NATKILL: nft table survived SIGKILL (stale state present)"
+    else
+        fail "T-NATKILL: nft table missing after SIGKILL"
+    fi
+
+    # Re-run with same id; should reclaim
+    ip netns exec ns1 "$BORE" vpn listen \
+        --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-natkill \
+        --advertise "${NAT_REAL_LAN}@${NAT_VIRT_A}" \
+        --relay-only \
+        >"$BORE_LOG.natkill_listen2" 2>&1 &
+    BORE_LISTEN_PID=$!
+    sleep 0.5
+
+    ip netns exec ns2 "$BORE" vpn connect \
+        --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-natkill \
+        --relay-only --accept-all-routes \
+        >"$BORE_LOG.natkill_connect2" 2>&1 &
+    BORE_CONNECT_PID=$!
+
+    if wait_for_log "$BORE_LOG.natkill_listen2" "vpn link paired" 15; then
+        sleep 1
+        # nft table should exist exactly once (reclaimed and re-created)
+        NFT_COUNT=$(ip netns exec ns1 nft list tables 2>/dev/null | grep -c "bore_vpn_t-natkill" || echo 0)
+        if [ "$NFT_COUNT" = "1" ]; then
+            pass "T-NATKILL: nft table reclaimed and re-created (count=1)"
+        else
+            fail "T-NATKILL: nft table count=$NFT_COUNT after reclaim (expected 1)"
+        fi
+
+        # No EEXIST errors
+        if grep -qi "file exists" "$BORE_LOG.natkill_listen2" "$BORE_LOG.natkill_connect2" 2>/dev/null; then
+            fail "T-NATKILL: EEXIST errors found in logs (route replace regression)"
+        else
+            pass "T-NATKILL: no EEXIST errors during reclaim"
+        fi
+
+        # Ping should work
+        if ip netns exec ns2 ping -c 1 -W 3 "10.50.1.5" >/dev/null 2>&1; then
+            pass "T-NATKILL: ping works after reclaim"
+        else
+            fail "T-NATKILL: ping failed after reclaim"
+        fi
+    else
+        fail "T-NATKILL: second run did not pair after reclaim"
+    fi
+else
+    fail "T-NATKILL: initial pair failed"
+    kill -9 "$BORE_LISTEN_PID" "$BORE_CONNECT_PID" 2>/dev/null; BORE_LISTEN_PID=""; BORE_CONNECT_PID=""
+fi
+
+kill "$BORE_LISTEN_PID" "$BORE_CONNECT_PID" 2>/dev/null; BORE_LISTEN_PID=""; BORE_CONNECT_PID=""
+sleep 0.5
+
+# Clean up NAT test lo aliases
+ip netns exec ns1 ip addr del "$NAT_REAL_HOST_A/24" dev lo 2>/dev/null || true
+ip netns exec ns2 ip addr del "$NAT_REAL_HOST_B/24" dev lo 2>/dev/null || true
+ip netns exec ns3 ip addr del "$NAT_REAL_HOST_C/24" dev lo 2>/dev/null || true
+
 # ── Test T-MULTI-TUN: two co-located connectors auto-assign distinct TUN names ────
 # Regression guard: --tun-name auto defaults to the first free boreN interface,
 # so two same-host connectors dialing different listeners no longer collide.

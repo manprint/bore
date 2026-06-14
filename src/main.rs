@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 #[cfg(all(feature = "vpn", target_os = "linux"))]
-use bore_cli::shared::{Ipv4Net, VpnAddrRequest};
+use bore_cli::shared::{AdvertiseEntry, Ipv4Net, VpnAddrRequest};
 #[cfg(all(feature = "vpn", target_os = "linux"))]
 use bore_cli::vpn;
 use bore_cli::{
@@ -1472,12 +1472,13 @@ async fn dispatch(command: Command) -> Result<()> {
         #[cfg(all(feature = "vpn", target_os = "linux"))]
         Command::Vpn { command } => match command {
             VpnCommand::Listen(args) => {
-                let advertised: Result<Vec<_>> = args
+                let advertise_entries: Result<Vec<_>> = args
                     .advertise
                     .iter()
-                    .map(|s| s.parse::<Ipv4Net>())
+                    .map(|s| s.parse::<AdvertiseEntry>())
                     .collect();
-                let advertised = advertised.context("failed to parse --advertise CIDRs")?;
+                let advertise_entries =
+                    advertise_entries.context("failed to parse --advertise CIDRs")?;
 
                 let addr_request = match (&args.vpn_addr, &args.vpn_peer_addr) {
                     (None, None) => VpnAddrRequest::Pool,
@@ -1499,7 +1500,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     secret: args.secret,
                     id: args.id,
                     insecure: args.insecure,
-                    advertised,
+                    advertise_entries,
                     addr_request,
                     tun_name: args.tun_name,
                     mtu: args.mtu,
@@ -1520,12 +1521,13 @@ async fn dispatch(command: Command) -> Result<()> {
                 vpn::run_listen(vpn_args).await?;
             }
             VpnCommand::Connect(args) => {
-                let advertised: Result<Vec<_>> = args
+                let advertise_entries: Result<Vec<_>> = args
                     .advertise
                     .iter()
-                    .map(|s| s.parse::<Ipv4Net>())
+                    .map(|s| s.parse::<AdvertiseEntry>())
                     .collect();
-                let advertised = advertised.context("failed to parse --advertise CIDRs")?;
+                let advertise_entries =
+                    advertise_entries.context("failed to parse --advertise CIDRs")?;
 
                 let accept_routes: Result<Vec<_>> = args
                     .accept_routes
@@ -1563,7 +1565,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     secret: args.secret,
                     id: args.id,
                     insecure: args.insecure,
-                    advertised,
+                    advertise_entries,
                     addr_request,
                     tun_name: args.tun_name,
                     mtu: args.mtu,

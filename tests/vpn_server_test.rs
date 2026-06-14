@@ -143,6 +143,37 @@ async fn vpn_overlap_accepts_non_overlapping_nets() {
     assert!(result.is_none());
 }
 
+// ── Overlapping-subnet NAT (E3) server-side invariants ───────────────────────
+//
+// The server only ever sees the EXPOSED (virtual) CIDRs — real subnets are
+// gateway-local and never serialized (N3/I-NAT2/I-NAT6). So `check_overlap`
+// operates on virtuals: two sites with identical REAL LANs but distinct virtuals
+// pair fine; overlapping VIRTUALS are still rejected with the existing message.
+
+#[tokio::test]
+async fn server_accepts_overlapping_reals_via_distinct_virtuals() {
+    // Both sites have real LAN 192.168.1.0/24 but the wire carries distinct
+    // virtuals (10.50.1.0/24 / 10.60.1.0/24) → no overlap → pairs.
+    let overlay = Ipv4Net::from_str("10.0.0.0/30").unwrap();
+    let listener_virtuals = vec![Ipv4Net::from_str("10.50.1.0/24").unwrap()];
+    let connector_virtuals = vec![Ipv4Net::from_str("10.60.1.0/24").unwrap()];
+    let result =
+        bore_cli::vpn_server::check_overlap(&listener_virtuals, &connector_virtuals, overlay);
+    assert!(result.is_none(), "distinct virtuals must not overlap");
+}
+
+#[tokio::test]
+async fn server_rejects_overlapping_virtuals() {
+    // If the operator picks colliding virtuals the existing rejection fires.
+    let overlay = Ipv4Net::from_str("10.0.0.0/30").unwrap();
+    let listener_virtuals = vec![Ipv4Net::from_str("10.50.1.0/24").unwrap()];
+    let connector_virtuals = vec![Ipv4Net::from_str("10.50.1.0/24").unwrap()];
+    let result =
+        bore_cli::vpn_server::check_overlap(&listener_virtuals, &connector_virtuals, overlay);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("overlapping subnets"));
+}
+
 #[tokio::test]
 async fn vpn_static_validation_accepts_mirror_addresses() {
     let result = bore_cli::vpn_server::validate_static(

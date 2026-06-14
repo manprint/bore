@@ -305,6 +305,30 @@ The `scripts/vpn_netns_test.sh` script (run as `sudo`) executes all netns tests 
 
 ---
 
+## Overlapping Subnets / 1:1 NAT (E3) Coverage
+
+| Test | Topology | Asserts |
+|------|----------|---------|
+| **T-NAT1** | B (site↔host) | Gateway `--advertise 192.168.1.0/24@10.50.1.0/24`; roaming client reaches real LAN via virtual `10.50.1.x`; LAN host sees client overlay IP (not gateway masquerade). |
+| **T-NAT2** | C (site↔site identical LANs) | A `192.168.1.0/24@10.50.1.0/24`, B `192.168.1.0/24@10.60.1.0/24`; cross-ping virtuals; B-host tcpdump confirms source is `10.50.1.x` (stable 1:1, no collision). |
+| **T-NAT3** | C (host-bit preservation) | Ping multiple hosts (`10.60.1.{5,23,99}`) — each maps 1:1 to real (`.5`, `.23`, `.99`), not a single-address DNAT. |
+| **T-NAT4** | C (mixed plain+NAT) | Gateway A: `192.168.1.0/24@10.50.1.0/24,172.16.9.0/24`; peer reaches NAT'd via `10.50.1.x`, plain via `172.16.9.x`; masquerade scoped to plain only. |
+| **T-NAT5** | C (cleanup/RAII) | After graceful exit: nft table, routes, `ip_forward` restored; no EEXIST on re-run same `--id`. |
+| **T-HUBNAT1** | D (hub with NAT) | Hub `--advertise 192.168.1.0/24@10.50.1.0/24 --max-clients 4`; two spokes reach real LAN via `10.50.1.x`; host-bit preserved per spoke. |
+| **T-HUBNAT2** | D (isolation + NAT) | Spoke isolation intact; LAN↔spoke forwarding (gateway path) works through netmap. |
+| **T-NATKILL** | C (SIGKILL reclaim) | Kill a NAT gateway, re-run same `--id` → clean reclaim (no `nat` rules leaked); `ip_forward` restored. |
+
+**Execution status: PASS (2026-06-14).** T-NAT1–5, T-HUBNAT1–2, T-NATKILL automated in
+`vpn_netns_test.sh` and **green on both relay (`--relay-only`) and direct**: full run
+`PASS=138 FAIL=0` on each path. T-NAT2 sources from the real LAN host (`ping -I`) so the
+symmetric egress SNAT of the §1 identical-LAN scenario actually fires; T-NAT1 also greps the
+gateway log for `nat netmap: dnat` (logging is a tested artifact). Identity preservation
+(B-host sees caller as `10.50.1.x`) is exercised implicitly via the symmetric ping but not
+asserted by packet capture (no `tcpdump` in the netns harness) — covered by the unit-level
+host-bit assertions and T-NAT3. Opus acceptance gate (Phase 5.6 equivalent): **signed off.**
+
+---
+
 ## Acceptance Gate
 
 **Phase 8 is complete when:**

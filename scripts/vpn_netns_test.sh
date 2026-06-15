@@ -599,6 +599,63 @@ kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
 kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
 sleep 0.5
 
+# ── Test 6b: multi-carrier direct path (Fix #3a) ──────────────────────────────
+# N parallel QUIC connections over the one punched socket. Must still establish
+# direct, log the multi-carrier banner on both sides, and pass traffic. carriers=1
+# is the legacy single path (Test 6); here we force 4.
+echo "=== Test 6b: direct path with --carriers 4 ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id direct-mc-test \
+    --stun-server "$STUN" --carriers 4 \
+    >"$BORE_LOG.listen6b" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id direct-mc-test \
+    --stun-server "$STUN" --carriers 4 \
+    >"$BORE_LOG.connect6b" 2>&1 &
+BORE_CONNECT_PID=$!
+
+if wait_for_log "$BORE_LOG.listen6b" "upgraded to direct" 20 && \
+   wait_for_log "$BORE_LOG.connect6b" "upgraded to direct" 20; then
+    pass "multi-carrier direct path established on both sides"
+    if grep -q "established with parallel QUIC carriers" "$BORE_LOG.listen6b" && \
+       grep -q "established with parallel QUIC carriers" "$BORE_LOG.connect6b"; then
+        pass "carriers=4: both sides logged the parallel-carrier banner"
+    else
+        fail "carriers=4: parallel-carrier banner missing (did not open N connections?)"
+    fi
+    sleep 0.5
+    NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    LOSS=$(ip netns exec ns2 ping -c 10 -i 0.2 -W 3 "$NS1_OVL" 2>/dev/null | grep -oP '\d+(?=% packet loss)' || echo 100)
+    if [ "$LOSS" = "0" ]; then
+        pass "carriers=4 direct ping: 0% loss over 10 packets"
+    else
+        fail "carriers=4 direct ping: ${LOSS}% loss (expected 0%)"
+    fi
+    if [ "$SKIP_IPERF" = "0" ] && command -v iperf3 >/dev/null 2>&1; then
+        ip netns exec ns1 iperf3 -s -D --logfile /dev/null
+        sleep 0.2
+        IPERF_BW=$(timeout 15 ip netns exec ns2 iperf3 -c "$NS1_OVL" -t 3 -u -b 200M -J 2>/dev/null | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(int(d['end']['sum']['bits_per_second']/1e6))" 2>/dev/null || echo 0)
+        ip netns exec ns1 pkill iperf3 2>/dev/null || true
+        if [ "$IPERF_BW" -ge 100 ]; then
+            pass "carriers=4 direct iperf3 UDP: ${IPERF_BW} Mbps (>=100 Mbps)"
+        else
+            fail "carriers=4 direct iperf3 UDP too low: ${IPERF_BW} Mbps (<100 Mbps)"
+        fi
+    fi
+else
+    fail "multi-carrier direct path not established within 20s"
+    echo "  [listener log]: $(tail -5 "$BORE_LOG.listen6b" 2>/dev/null | tr '\n' '|')"
+    echo "  [connector log]: $(tail -5 "$BORE_LOG.connect6b" 2>/dev/null | tr '\n' '|')"
+fi
+
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
 # ── Test 7: direct blocked → automatic relay fallback ─────────────────────────
 echo "=== Test 7: direct blocked -> stays on relay ==="
 # Drop forwarded UDP in ns0: peer-to-peer punch fails, but STUN/control to ns0

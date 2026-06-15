@@ -119,6 +119,22 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
 - VPN `--carriers`/`--tun-queues` default 1 = byte/path-identical to the single configuration
   (I-9). Carrier count negotiated min(listener, connector, server `--max-carriers`); a dead
   carrier kills the whole link cleanly (reconnect re-establishes), never silent degradation
+- VPN `--carriers` applies to BOTH paths (Fix #3a). Relay: N AEAD substream pairs. Direct: N
+  parallel QUIC connections over the ONE punched socket (`DirectConn::open_sibling` reuses the open
+  5-tuple — no extra punch), each its OWN congestion controller → ~N× in-flight window (parallel-
+  stream effect a lone loss-bound flow can't reach). `LinkSender::Direct{conns,rr}` round-robins
+  datagrams per-packet; the single downlink task `select_all`s `read_datagram` across all carriers
+  (one task, many conns — safe: `read_datagram`/`send_datagram` are `&self` + cancel-safe, no stream
+  split). Establishment requires the FULL negotiated count on both sides (connector dials siblings
+  to `conn0.remote_address()`, listener accepts N) — any carrier failing aborts the upgrade → stay
+  on relay + retry (never a mismatched/silently-degraded count). `carriers==1` = legacy single conn,
+  rr pinned at 0, byte-identical. Hub per-peer direct path stays single-conn (v1)
+- VPN direct-path throughput is bounded by the UDP socket buffer / RTT. The kernel SILENTLY clamps
+  `SO_SNDBUF`/`SO_RCVBUF` to `net.core.{w,r}mem_max` (stock Ubuntu/AWS default 208 KiB → ~10 MB/s at
+  20 ms RTT regardless of Quinn's windows, CPU idle). `configure_udp_socket_buffers` (holepunch.rs,
+  Linux) forces past it with `SO_{SND,RCV}BUFFORCE` (nix `*BufForce`, needs CAP_NET_ADMIN which VPN
+  has) → falls back to the clamped setter on EPERM → getsockopt-verifies and `warn!`s with the
+  remediation when a clamp survives (was a silent `debug!`). Requested 16 MiB (Fix #1)
 - `NetConfig` RAII: all routes/nft/ip_forward changes revert on exit (SIGINT, SIGTERM, panic handled; SIGKILL requires next-run stale reclaim via /run state file to restore ip_forward and remove leaked iptables/nft rules — BUG-2/BUG-3 fixed). Concurrent gateway links in ONE netns refcount ip_forward via per-`(netns,id,role)` `/run/bore-vpn-ns<inode>-*.fwdref` markers + a first-wins `/run/bore-vpn-ns<inode>.ipfwd-orig` record: a link restores ip_forward only when NO other co-netns `.fwdref` remains, and the last one out restores the true original — never disables forwarding under a still-live co-netns peer (B3 fixed); `stale_reclaim` is refcount-aware too. CRITICAL: markers are scoped by the `/proc/self/ns/net` inode because `ip_forward` is per-netns while `/run` is shared across netns (the netns harness, containers) — an unscoped refcount would wrongly couple independent netns and break teardown
 - TUN MTU default 1350: clamps QUIC datagram size; gateway MSS-clamp keeps forwarded TCP healthy
 - VPN direct path: a `TooLarge` datagram send is a per-packet DROP, never link death. The TUN MTU
@@ -128,7 +144,12 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   `SendDatagramError::TooLarge` is `"datagram too large"`, so substring-matching `"TooLarge"`
   silently never fired and killed the link). `send_batch` returns the drop count; only genuine link
   death returns `Err`. PMTU monitor shrinks immediately on one below-current sample
-  (`pmtu_shrink_now`, fast recovery), grows only on 3 stable samples (`pmtu_decision`, anti-flap)
+  (`pmtu_shrink_now`, fast recovery), grows only on 3 stable samples (`pmtu_decision`, anti-flap).
+  Black-hole hysteresis (Fix #2): a grow followed by a shrink back within 30 s marks the grown size
+  as a ceiling (`pmtu_decision`'s `ceiling` arg blocks GROWING into it again — shrinks are never
+  blocked), so the TUN stops chasing quinn's doomed re-probe of an MTU the WAN path can't carry
+  (the ~70 s 1162↔1414 oscillation + periodic `TooLarge` drop bursts). Ceiling clears after 5 min of
+  a stable MTU so a genuinely improved path is rediscovered
 - VPN direct-path candidates must NEVER include an address routed into the TUN. A peer candidate
   inside a locally-tunneled subnet (`peer_routes`, e.g. connector routes `10.10.0.0/19 → bore0`
   and the peer offers `10.10.16.138`) makes the QUIC handshake loop through the relay: it

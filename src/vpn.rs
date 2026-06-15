@@ -621,6 +621,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
                 nat_udp_preferred_port: args.nat_udp_preferred_port,
                 tun_name: &tun_name,
                 mtu: args.mtu,
+                carriers,
             },
             admin_v2,
             peer_routes.clone(),
@@ -792,6 +793,9 @@ struct DirectUpgradeCtx {
     /// the switch to direct (`read_datagram: timed out`). Such candidates are
     /// filtered out before punching (see [`filter_tunneled_candidates`]).
     tunneled_subnets: Vec<crate::shared::Ipv4Net>,
+    /// Negotiated direct-path carrier count (Fix #3a): how many parallel QUIC
+    /// connections to establish over the punched socket. 1 = legacy single path.
+    carriers: u16,
 }
 
 impl DirectUpgradeCtx {
@@ -817,6 +821,7 @@ impl DirectUpgradeCtx {
             tun_name: args.tun_name.to_string(),
             mtu: args.mtu,
             tunneled_subnets,
+            carriers: args.carriers.max(1),
         }
     }
 }
@@ -831,12 +836,19 @@ struct CommonDirectArgs<'a> {
     nat_udp_preferred_port: u16,
     tun_name: &'a str,
     mtu: u16,
+    /// Negotiated direct-path carrier count (Fix #3a).
+    carriers: u16,
 }
 
 /// Total budget for the offer → punch round-trip before giving up on direct.
 const DIRECT_PUNCH_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 /// How long the listener waits for the peer's QUIC connection after the punch.
 const DIRECT_ACCEPT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Per-carrier budget for the extra direct connections beyond the first (Fix
+/// #3a). The path is already proven once the first carrier is up, so siblings
+/// only need one RTT plus handshake — a short budget keeps a flaky extra carrier
+/// from stalling the whole upgrade (it falls back to relay and retries instead).
+const DIRECT_CARRIER_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 /// Cadence of the background direct-upgrade retry while the link is on relay.
 ///
 /// Both peers run the same state machine anchored at pairing, so a fixed-grid
@@ -1021,24 +1033,60 @@ async fn try_direct_upgrade(
     );
 
     // 6. Hole-punch + QUIC with the token both peers derive from (secret, nonce).
+    //    With `carriers > 1` (Fix #3a) we establish N parallel QUIC connections
+    //    over the SAME punched socket: the first proves the path, the rest reuse
+    //    the open 5-tuple (no extra punch). Both sides target the SAME negotiated
+    //    count, so the carrier set matches end-to-end; any carrier failing aborts
+    //    the whole upgrade → stay on relay and retry on the next grid tick (never
+    //    a silently degraded count). `carriers == 1` is the legacy single path.
     let token = crate::holepunch::derive_token(Some(&ctx.secret), &nonce);
-    let conn = match ctx.side {
+    let n = ctx.carriers.max(1) as usize;
+    let conns: Vec<crate::holepunch::DirectConn> = match ctx.side {
         DirectSide::Listener => {
             let dl = crate::holepunch::DirectListener::new(socket, peer, tuning).await?;
-            tokio::time::timeout(DIRECT_ACCEPT_WAIT, dl.accept(token))
+            let mut conns = Vec::with_capacity(n);
+            let first = tokio::time::timeout(DIRECT_ACCEPT_WAIT, dl.accept(token))
                 .await
-                .map_err(|_| anyhow!("timed out waiting for the peer's direct QUIC connection"))??
+                .map_err(|_| {
+                    anyhow!("timed out waiting for the peer's direct QUIC connection")
+                })??;
+            conns.push(first);
+            for i in 1..n {
+                let c = tokio::time::timeout(DIRECT_CARRIER_WAIT, dl.accept(token))
+                    .await
+                    .map_err(|_| anyhow!("timed out accepting direct carrier {i}/{n}"))??;
+                conns.push(c);
+            }
+            conns
         }
         DirectSide::Connector => {
-            crate::holepunch::connect_direct(socket, peer, token, tuning).await?
+            let first = crate::holepunch::connect_direct(socket, peer, token, tuning).await?;
+            let mut conns = Vec::with_capacity(n);
+            for i in 1..n {
+                let c = tokio::time::timeout(DIRECT_CARRIER_WAIT, first.open_sibling(token))
+                    .await
+                    .map_err(|_| anyhow!("timed out opening direct carrier {i}/{n}"))??;
+                conns.push(c);
+            }
+            conns.insert(0, first);
+            conns
         }
     };
+    if n > 1 {
+        info!(
+            link_id = %ctx.link_id,
+            carriers = conns.len(),
+            "direct path established with parallel QUIC carriers"
+        );
+    }
 
     // 7. Hand the Direct link halves to the bridge (DEC-1: controlled restart)
-    //    and start the dynamic-PMTU monitor (C2) on the live connection.
-    let monitor_conn = conn.clone();
+    //    and start the dynamic-PMTU monitor (C2) on the live connection. All
+    //    carriers share one punched socket/path, so the first carrier's MTU is
+    //    representative for the monitor.
+    let monitor_conn = conns[0].clone();
     upgrade_tx
-        .send(link::make_direct(conn))
+        .send(link::make_direct_multi(conns))
         .await
         .map_err(|_| anyhow!("bridge closed before the direct upgrade"))?;
     tokio::spawn(pmtu_monitor(monitor_conn, ctx.tun_name.clone(), ctx.mtu));
@@ -1060,7 +1108,14 @@ async fn try_direct_upgrade(
 /// from the current MTU by at least 16 bytes (avoid churn), and the result is
 /// within [576, 9000] (candidates above 9000 are clamped to 9000; below 576
 /// rejected).
-fn pmtu_decision(current_mtu: u16, samples: &[usize]) -> Option<u16> {
+///
+/// `ceiling` is the anti-flap black-hole guard (Fix #2): a size that was grown
+/// to and then immediately shrank away from (quinn's DPLPMTUD re-probes a size
+/// the WAN path cannot actually carry, reports it briefly, then black-holes
+/// back). A *grow* to a candidate `>= ceiling` is rejected so the TUN stops
+/// chasing quinn's doomed re-probe and settles at the last-good MTU. A shrink is
+/// never blocked (narrowing is always safe) — that path is [`pmtu_shrink_now`].
+fn pmtu_decision(current_mtu: u16, samples: &[usize], ceiling: Option<u16>) -> Option<u16> {
     if samples.len() < 3 {
         return None;
     }
@@ -1075,6 +1130,15 @@ fn pmtu_decision(current_mtu: u16, samples: &[usize]) -> Option<u16> {
     let candidate = stable.min(9000) as u16;
     if candidate.abs_diff(current_mtu) < 16 {
         return None;
+    }
+    // Black-hole guard: never GROW into a known-bad size. Shrinks (candidate <
+    // current) are still allowed regardless of the ceiling.
+    if candidate > current_mtu {
+        if let Some(c) = ceiling {
+            if candidate >= c {
+                return None;
+            }
+        }
     }
     Some(candidate)
 }
@@ -1109,15 +1173,29 @@ fn pmtu_shrink_now(current_mtu: u16, sample: usize) -> Option<u16> {
 /// clamp uses `rt mtu`, adapting on its own.
 async fn pmtu_monitor(conn: crate::holepunch::DirectConn, tun_name: String, initial_mtu: u16) {
     use futures_util::FutureExt;
+    // Anti-flap (Fix #2): a grow followed by a shrink back within this many
+    // ticks marks the grown size as a black hole — quinn re-probed an MTU the
+    // path cannot carry. The ceiling then blocks growing into it again. After
+    // this many ticks of an unchanged MTU the ceiling is cleared so a genuinely
+    // improved path can be rediscovered (one flap per decay window at worst,
+    // versus the ~70 s perpetual oscillation without the guard). Tick = 5 s.
+    const RECENT_GROW_TICKS: u32 = 6; // 30 s
+    const CEILING_DECAY_TICKS: u32 = 60; // 5 min
+
     let runner = hostcfg::RealRunner;
     let mut current = initial_mtu;
     let mut samples: Vec<usize> = Vec::new();
+    let mut ceiling: Option<u16> = None;
+    let mut last_grown_to: u16 = 0;
+    let mut ticks_since_grow: u32 = u32::MAX;
+    let mut stable_ticks: u32 = 0;
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
             _ = conn.closed() => return,
         }
+        ticks_since_grow = ticks_since_grow.saturating_add(1);
         // The QUIC datagram limit minus AEAD-free overhead IS the usable IP
         // packet size on the direct path.
         let Some(max_datagram) = conn.max_datagram_size() else {
@@ -1128,10 +1206,33 @@ async fn pmtu_monitor(conn: crate::holepunch::DirectConn, tun_name: String, init
             samples.remove(0);
         }
         // Shrink immediately on one below-current sample (fast recovery after a
-        // direct switch); otherwise use the stable 3-sample growth/shrink path.
-        let decision =
-            pmtu_shrink_now(current, max_datagram).or_else(|| pmtu_decision(current, &samples));
-        if let Some(new_mtu) = decision {
+        // direct switch); otherwise use the stable 3-sample growth/shrink path
+        // (ceiling-guarded against re-growing into a known black hole).
+        let decision = pmtu_shrink_now(current, max_datagram)
+            .or_else(|| pmtu_decision(current, &samples, ceiling));
+        let Some(new_mtu) = decision else {
+            // MTU held this tick: count toward ceiling decay.
+            stable_ticks = stable_ticks.saturating_add(1);
+            if ceiling.is_some() && stable_ticks >= CEILING_DECAY_TICKS {
+                tracing::debug!(
+                    cleared = ?ceiling,
+                    "tun MTU stable; clearing PMTU black-hole ceiling to allow re-probe"
+                );
+                ceiling = None;
+            }
+            continue;
+        };
+        // A shrink immediately after a recent grow is a black hole: the grown
+        // size could not be sustained. Remember it so we stop chasing it.
+        if new_mtu < current && ticks_since_grow <= RECENT_GROW_TICKS && last_grown_to > new_mtu {
+            ceiling = Some(last_grown_to);
+            tracing::info!(
+                black_hole = last_grown_to,
+                settling_to = new_mtu,
+                "PMTU flap detected; capping TUN MTU below the black-hole size to stop oscillation"
+            );
+        }
+        {
             let argv = hostcfg_cmd::cmd_link_set_mtu(&tun_name, new_mtu);
             match crate::vpn::hostcfg::CommandRunner::run(&runner, &argv).await {
                 Ok(_) => {
@@ -1140,7 +1241,12 @@ async fn pmtu_monitor(conn: crate::holepunch::DirectConn, tun_name: String, init
                         new = new_mtu,
                         "tun MTU adjusted to QUIC path MTU"
                     );
+                    if new_mtu > current {
+                        last_grown_to = new_mtu;
+                        ticks_since_grow = 0;
+                    }
                     current = new_mtu;
+                    stable_ticks = 0;
                 }
                 Err(e) => {
                     // A failed adjust during teardown (the TUN was destroyed
@@ -1389,6 +1495,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
                 nat_udp_preferred_port: args.nat_udp_preferred_port,
                 tun_name: &tun_name,
                 mtu: args.mtu,
+                carriers,
             },
             admin_v2,
             peer_routes.clone(),
@@ -4428,8 +4535,17 @@ pub mod link {
     /// with the same `(key, counter)` would be catastrophic), while the
     /// round-robin cursor is per-clone (per-task distribution stays balanced).
     pub enum LinkSender {
-        /// Direct QUIC datagram path.
-        Direct(DirectConn),
+        /// Direct QUIC datagram path. One or more carrier connections (Fix #3a)
+        /// over the SAME punched socket; datagrams are distributed round-robin
+        /// per packet across carriers (each carrier = its own congestion
+        /// controller → ~N× in-flight window). `conns.len() == 1` is the legacy
+        /// single-connection path, byte-for-byte unchanged (rr stays 0).
+        Direct {
+            /// Parallel QUIC carrier connections over one punched socket.
+            conns: Vec<DirectConn>,
+            /// Round-robin cursor (local to this clone).
+            rr: usize,
+        },
         /// Relay path: AEAD-framed substreams (one writer task each).
         /// Frames are distributed round-robin **per datagram** (DEC-7):
         /// out-of-order arrival is fine, IP is best-effort.
@@ -4448,7 +4564,10 @@ pub mod link {
     impl Clone for LinkSender {
         fn clone(&self) -> Self {
             match self {
-                LinkSender::Direct(conn) => LinkSender::Direct(conn.clone()),
+                LinkSender::Direct { conns, .. } => LinkSender::Direct {
+                    conns: conns.clone(),
+                    rr: 0,
+                },
                 LinkSender::Relay {
                     txs, key, counter, ..
                 } => LinkSender::Relay {
@@ -4463,8 +4582,14 @@ pub mod link {
 
     /// Receive half of a VPN link (owned by the downlink task).
     pub enum LinkRecver {
-        /// Direct QUIC datagram path.
-        Direct(DirectConn),
+        /// Direct QUIC datagram path. One or more carrier connections (Fix #3a);
+        /// the single downlink task reads datagrams from ALL of them (one task,
+        /// many connections — safe: `read_datagram` is `&self` and cancel-safe,
+        /// no stream is split across tasks). `conns.len() == 1` is the legacy path.
+        Direct {
+            /// Parallel QUIC carrier connections; the downlink reads from all.
+            conns: Vec<DirectConn>,
+        },
         /// Relay path: fan-in of the per-carrier reader tasks. Each reader owns
         /// one ingress substream (I-1), decrypts frames, and pushes plaintext
         /// packets — or its terminal error — into this channel.
@@ -4474,9 +4599,25 @@ pub mod link {
         },
     }
 
-    /// Split a Direct link into send+recv halves for the bridge tasks.
+    /// Split a single-connection Direct link into send+recv halves.
     pub fn make_direct(conn: DirectConn) -> (LinkSender, LinkRecver) {
-        (LinkSender::Direct(conn.clone()), LinkRecver::Direct(conn))
+        make_direct_multi(vec![conn])
+    }
+
+    /// Split an N-carrier Direct link into send+recv halves (Fix #3a). Both
+    /// halves share the same `Vec<DirectConn>` (each `DirectConn` is a cheap
+    /// handle clone); the sender round-robins datagrams across carriers and the
+    /// downlink task reads from all of them. `conns.len() == 1` reduces to the
+    /// legacy single-connection path with the round-robin cursor pinned at 0.
+    pub fn make_direct_multi(conns: Vec<DirectConn>) -> (LinkSender, LinkRecver) {
+        assert!(!conns.is_empty(), "direct link needs at least one carrier");
+        (
+            LinkSender::Direct {
+                conns: conns.clone(),
+                rr: 0,
+            },
+            LinkRecver::Direct { conns },
+        )
     }
 
     /// Build a Relay link from one pair of direction substreams (carriers = 1).
@@ -4718,12 +4859,16 @@ pub mod link {
         /// counts them and continues. `Err` is reserved for genuine link death.
         pub async fn send_batch(&mut self, pkts: &[Bytes]) -> Result<usize> {
             match self {
-                LinkSender::Direct(conn) => {
+                LinkSender::Direct { conns, rr } => {
                     let mut dropped = 0usize;
                     for pkt in pkts {
+                        // Round-robin per datagram across carriers (DEC-7 style:
+                        // reorder OK, IP is best-effort). One carrier → always
+                        // index 0, byte-identical to the legacy path.
+                        *rr = (*rr + 1) % conns.len();
                         // Skip oversized packets (path MTU < TUN MTU window);
                         // a real send error propagates and tears down the link.
-                        match conn.send_datagram(pkt.clone())? {
+                        match conns[*rr].send_datagram(pkt.clone())? {
                             crate::holepunch::DatagramSend::Sent => {}
                             crate::holepunch::DatagramSend::TooLarge => dropped += 1,
                         }
@@ -4759,7 +4904,12 @@ pub mod link {
         /// Resolved when the underlying link is gone (any carrier writer exited).
         pub async fn closed(&self) {
             match self {
-                LinkSender::Direct(conn) => conn.closed().await,
+                LinkSender::Direct { conns, .. } => {
+                    // Any carrier dying = link dead (no silent degradation): the
+                    // bridge tears down and reconnect re-establishes all carriers.
+                    let waits = conns.iter().map(|c| Box::pin(c.closed()));
+                    futures_util::future::select_all(waits).await;
+                }
                 LinkSender::Relay { txs, .. } => {
                     let waits = txs.iter().map(|tx| Box::pin(tx.closed()));
                     futures_util::future::select_all(waits).await;
@@ -4772,17 +4922,39 @@ pub mod link {
         /// Receive ≥1 IP packets (up to `BATCH_CAP`). Err on link close.
         pub async fn recv_batch(&mut self, out: &mut Vec<Bytes>) -> Result<()> {
             match self {
-                LinkRecver::Direct(conn) => {
-                    let first = conn
-                        .read_datagram()
-                        .await
-                        .context("direct recv first datagram")?;
-                    out.push(first);
-                    // Drain queued datagrams without yielding (up to BATCH_CAP).
-                    for _ in 1..BATCH_CAP {
-                        match conn.read_datagram().now_or_never() {
-                            Some(Ok(pkt)) => out.push(pkt),
-                            _ => break,
+                LinkRecver::Direct { conns } => {
+                    if conns.len() == 1 {
+                        // Legacy single-connection fast path, byte-identical.
+                        let first = conns[0]
+                            .read_datagram()
+                            .await
+                            .context("direct recv first datagram")?;
+                        out.push(first);
+                        for _ in 1..BATCH_CAP {
+                            match conns[0].read_datagram().now_or_never() {
+                                Some(Ok(pkt)) => out.push(pkt),
+                                _ => break,
+                            }
+                        }
+                        return Ok(());
+                    }
+                    // Multi-carrier: wait on ALL carriers for the first datagram
+                    // (read_datagram is cancel-safe — the losers' queued datagrams
+                    // are not lost, just re-polled next call), then drain every
+                    // carrier's queued datagrams up to BATCH_CAP.
+                    let futs = conns
+                        .iter()
+                        .map(|c| Box::pin(c.read_datagram()))
+                        .collect::<Vec<_>>();
+                    let (res, _idx, _rest) = futures_util::future::select_all(futs).await;
+                    out.push(res.context("direct recv first datagram")?);
+                    for c in conns.iter() {
+                        while out.len() < BATCH_CAP {
+                            match c.read_datagram().now_or_never() {
+                                Some(Ok(pkt)) => out.push(pkt),
+                                Some(Err(e)) => return Err(e).context("direct recv drain"),
+                                None => break,
+                            }
                         }
                     }
                     Ok(())
@@ -5751,24 +5923,52 @@ mod tests {
     #[test]
     fn pmtu_decision_cases() {
         // Fewer than 3 samples → None.
-        assert_eq!(pmtu_decision(1350, &[]), None);
-        assert_eq!(pmtu_decision(1350, &[1450, 1450]), None);
+        assert_eq!(pmtu_decision(1350, &[], None), None);
+        assert_eq!(pmtu_decision(1350, &[1450, 1450], None), None);
         // Unstable samples → None.
-        assert_eq!(pmtu_decision(1350, &[1400, 1450, 1450]), None);
+        assert_eq!(pmtu_decision(1350, &[1400, 1450, 1450], None), None);
         // Stable but equal to current → None.
-        assert_eq!(pmtu_decision(1450, &[1450, 1450, 1450]), None);
+        assert_eq!(pmtu_decision(1450, &[1450, 1450, 1450], None), None);
         // Stable, delta < 16 → None (churn guard).
-        assert_eq!(pmtu_decision(1450, &[1460, 1460, 1460]), None);
+        assert_eq!(pmtu_decision(1450, &[1460, 1460, 1460], None), None);
         // Stable, larger → Some.
-        assert_eq!(pmtu_decision(1350, &[1450, 1450, 1450]), Some(1450));
+        assert_eq!(pmtu_decision(1350, &[1450, 1450, 1450], None), Some(1450));
         // Stable, smaller → Some (path got narrower).
-        assert_eq!(pmtu_decision(1450, &[1350, 1350, 1350]), Some(1350));
+        assert_eq!(pmtu_decision(1450, &[1350, 1350, 1350], None), Some(1350));
         // Below 576 → None.
-        assert_eq!(pmtu_decision(1350, &[500, 500, 500]), None);
+        assert_eq!(pmtu_decision(1350, &[500, 500, 500], None), None);
         // Above 9000 → clamped.
-        assert_eq!(pmtu_decision(1350, &[65000, 65000, 65000]), Some(9000));
+        assert_eq!(
+            pmtu_decision(1350, &[65000, 65000, 65000], None),
+            Some(9000)
+        );
         // Only the LAST 3 samples matter.
-        assert_eq!(pmtu_decision(1350, &[100, 1450, 1450, 1450]), Some(1450));
+        assert_eq!(
+            pmtu_decision(1350, &[100, 1450, 1450, 1450], None),
+            Some(1450)
+        );
+    }
+
+    /// Fix #2 — black-hole ceiling guard on the grow path.
+    #[test]
+    fn pmtu_decision_ceiling_blocks_growth_into_black_hole() {
+        // Ceiling 1414: a grow to exactly the black-hole size is rejected — the
+        // TUN must stop chasing quinn's doomed re-probe and hold 1162.
+        assert_eq!(pmtu_decision(1162, &[1414, 1414, 1414], Some(1414)), None);
+        // A grow ABOVE the ceiling is likewise rejected.
+        assert_eq!(pmtu_decision(1162, &[1500, 1500, 1500], Some(1414)), None);
+        // A grow BELOW the ceiling is allowed (genuine, sustainable improvement).
+        assert_eq!(
+            pmtu_decision(1162, &[1300, 1300, 1300], Some(1414)),
+            Some(1300)
+        );
+        // The ceiling NEVER blocks a shrink (narrowing is always safe).
+        assert_eq!(
+            pmtu_decision(1450, &[1162, 1162, 1162], Some(1414)),
+            Some(1162)
+        );
+        // No ceiling → growth into 1414 proceeds as before (no regression).
+        assert_eq!(pmtu_decision(1162, &[1414, 1414, 1414], None), Some(1414));
     }
 
     /// TUN name auto-resolution.

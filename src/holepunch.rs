@@ -154,7 +154,70 @@ fn configure_udp_socket_buffers<S: std::os::windows::io::AsSocket>(
     );
 }
 
-#[cfg(all(feature = "udp", not(windows)))]
+#[cfg(all(feature = "udp", target_os = "linux"))]
+fn configure_udp_socket_buffers<S: std::os::fd::AsFd>(socket: &S, tuning: &UdpDirectTuning) {
+    // CRITICAL for direct-path throughput: the kernel silently clamps
+    // SO_SNDBUF/SO_RCVBUF to net.core.{w,r}mem_max (Ubuntu/Debian default
+    // 212992 = 208 KiB). A single congestion-controlled QUIC datagram flow is
+    // then capped at ~buffer/RTT — e.g. 208 KiB / 20 ms ≈ 10 MB/s — no matter
+    // how large a window Quinn negotiates and with the CPU near idle. bore VPN
+    // runs with CAP_NET_ADMIN, so use SO_{SND,RCV}BUFFORCE (nix `*BufForce`)
+    // which bypass the *mem_max ceiling entirely. Fall back to the clamped
+    // setsockopt (socket2) when the cap is absent (EPERM), and verify the
+    // result so a clamp that survives is logged LOUDLY (not at debug) with the
+    // exact remediation.
+    use nix::sys::socket::{getsockopt, setsockopt, sockopt};
+
+    let fd = socket.as_fd();
+
+    // Try the forced setters first; on EPERM (no CAP_NET_ADMIN) fall back to the
+    // clamped path so an unprivileged build still gets the best the kernel allows.
+    let recv_forced = setsockopt(&fd, sockopt::RcvBufForce, &tuning.udp_socket_recv_buffer).is_ok();
+    if !recv_forced {
+        let _ = setsockopt(&fd, sockopt::RcvBuf, &tuning.udp_socket_recv_buffer);
+    }
+    let send_forced = setsockopt(&fd, sockopt::SndBufForce, &tuning.udp_socket_send_buffer).is_ok();
+    if !send_forced {
+        let _ = setsockopt(&fd, sockopt::SndBuf, &tuning.udp_socket_send_buffer);
+    }
+
+    // getsockopt(SO_{SND,RCV}BUF) returns the kernel's internal value, which is
+    // 2× the requested size on Linux (kernel doubles for bookkeeping). Compare
+    // against the requested size to detect a surviving clamp.
+    let actual_recv = getsockopt(&fd, sockopt::RcvBuf).unwrap_or(0);
+    let actual_send = getsockopt(&fd, sockopt::SndBuf).unwrap_or(0);
+    // A clamp leaves the effective buffer well under the request; the kernel
+    // doubling means "healthy" is actual >= requested, so flag actual < requested.
+    let recv_clamped = actual_recv < tuning.udp_socket_recv_buffer;
+    let send_clamped = actual_send < tuning.udp_socket_send_buffer;
+
+    if recv_clamped || send_clamped {
+        tracing::warn!(
+            requested_recv = tuning.udp_socket_recv_buffer,
+            effective_recv = actual_recv,
+            requested_send = tuning.udp_socket_send_buffer,
+            effective_send = actual_send,
+            recv_forced,
+            send_forced,
+            "UDP socket buffer clamped below request — direct-path throughput \
+             will be limited to roughly buffer/RTT. Run with CAP_NET_ADMIN \
+             (privileged) for SO_*BUFFORCE, or raise net.core.rmem_max and \
+             net.core.wmem_max (e.g. sysctl -w net.core.rmem_max=16777216 \
+             net.core.wmem_max=16777216)"
+        );
+    } else {
+        info!(
+            requested_recv = tuning.udp_socket_recv_buffer,
+            effective_recv = actual_recv,
+            requested_send = tuning.udp_socket_send_buffer,
+            effective_send = actual_send,
+            forced = recv_forced && send_forced,
+            "configured UDP socket buffers"
+        );
+    }
+}
+
+#[cfg(all(feature = "udp", unix, not(target_os = "linux")))]
 fn configure_udp_socket_buffers<S: std::os::fd::AsFd>(socket: &S, tuning: &UdpDirectTuning) {
     let socket = socket2::SockRef::from(socket);
     if let Err(err) = socket.set_recv_buffer_size(tuning.udp_socket_recv_buffer) {
@@ -1081,6 +1144,46 @@ impl DirectConn {
     pub async fn read_datagram(&self) -> Result<bytes::Bytes> {
         self.conn.read_datagram().await.context("read_datagram")
     }
+
+    /// The connection's resolved remote address (the winning peer candidate).
+    pub fn remote_address(&self) -> SocketAddr {
+        self.conn.remote_address()
+    }
+
+    /// Open an ADDITIONAL authenticated QUIC connection to the SAME peer over the
+    /// SAME endpoint/socket (VPN direct-path carrier, Fix #3a). The hole-punched
+    /// 5-tuple is already open, so no new punch is needed — quinn assigns the new
+    /// connection fresh connection IDs and the peer's server endpoint demuxes it.
+    /// Each carrier gets its OWN congestion controller, so N carriers give a
+    /// single high-BDP VPN flow ~N× the in-flight window (parallel-stream effect),
+    /// which a lone loss-bound flow cannot reach. Consumer-side handshake (writes
+    /// its token first, then reads the peer's), mirroring [`connect_direct`].
+    pub async fn open_sibling(&self, token: [u8; TOKEN_LEN]) -> Result<DirectConn> {
+        let peer = self.conn.remote_address();
+        let conn = self
+            .endpoint
+            .connect(peer, "bore")
+            .context("failed to start direct carrier connect")?
+            .await
+            .context("direct carrier QUIC handshake failed")?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .context("carrier auth open_bi failed")?;
+        send.write_all(&token).await?;
+        send.flush().await?;
+        let mut peer_token = [0u8; TOKEN_LEN];
+        recv.read_exact(&mut peer_token).await?;
+        if !tokens_match(&token, &peer_token) {
+            bail!("direct carrier token mismatch");
+        }
+        let _ = send.finish();
+        debug!(%peer, "direct carrier connection established (consumer, token verified)");
+        Ok(DirectConn {
+            conn,
+            endpoint: self.endpoint.clone(),
+        })
+    }
 }
 
 // quinn's streams carry inherent `poll_read`/`poll_write` methods (with quinn's
@@ -1728,6 +1831,68 @@ mod tests {
     use super::*;
     #[cfg(feature = "udp")]
     use crate::shared::UDP_NONCE_LEN;
+
+    /// `SO_*BUFFORCE` must lift the UDP buffer past `net.core.{w,r}mem_max` when
+    /// the process holds CAP_NET_ADMIN. This is the direct-path throughput fix:
+    /// without it the kernel silently clamps the 16 MiB request to the sysctl
+    /// ceiling, capping a single QUIC flow at ~buffer/RTT. The test only asserts
+    /// the strong (forced) outcome when it actually has the capability — under an
+    /// unprivileged CI runner it degrades to documenting the clamp, never fails.
+    #[cfg(all(feature = "udp", target_os = "linux"))]
+    #[test]
+    fn udp_buffers_forced_past_sysctl_clamp() {
+        use nix::sys::socket::{getsockopt, sockopt};
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let wmem_max: usize = std::fs::read_to_string("/proc/sys/net/core/wmem_max")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+
+        let socket =
+            Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create socket");
+        let tuning = UdpDirectTuning::default();
+        configure_udp_socket_buffers(&socket, &tuning);
+
+        let actual_send = getsockopt(&socket, sockopt::SndBuf).expect("getsockopt SndBuf");
+
+        // Can we force? Probe with a fresh socket so the assertion above is not
+        // self-referential.
+        let probe =
+            Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create probe");
+        let can_force = nix::sys::socket::setsockopt(
+            &probe,
+            sockopt::SndBufForce,
+            &tuning.udp_socket_send_buffer,
+        )
+        .is_ok();
+
+        if can_force {
+            // Forced: effective buffer must reach the request (kernel reports ~2×),
+            // and crucially exceed the sysctl ceiling that would otherwise clamp it.
+            assert!(
+                actual_send >= tuning.udp_socket_send_buffer,
+                "forced send buffer {actual_send} < requested {} — force ineffective",
+                tuning.udp_socket_send_buffer
+            );
+            if wmem_max > 0 && wmem_max < tuning.udp_socket_send_buffer {
+                assert!(
+                    actual_send > wmem_max,
+                    "forced send buffer {actual_send} did not exceed wmem_max {wmem_max} \
+                     — clamp not bypassed"
+                );
+            }
+        } else {
+            // No CAP_NET_ADMIN here: the clamped value must still be the best the
+            // kernel allows (>= ceiling), proving the fallback path ran.
+            if wmem_max > 0 {
+                assert!(
+                    actual_send >= wmem_max.min(tuning.udp_socket_send_buffer),
+                    "fallback send buffer {actual_send} below kernel ceiling {wmem_max}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn token_is_deterministic_and_keyed() {

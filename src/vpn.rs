@@ -50,6 +50,11 @@ pub struct VpnListenArgs {
     pub notes: Option<String>,
     /// Max concurrent connectors (hub mode). 1 = legacy 1:1 path (unchanged).
     pub max_clients: u16,
+    /// Masquerade NAT'd (`real@exposed`) subnets toward the LAN (F2). Default off
+    /// keeps per-peer source visibility (I-NAT5) but only the gateway host itself
+    /// is reachable unless it is the LAN's router; on rewrites the source to the
+    /// gateway LAN IP so every host behind the gateway is reachable on any topology.
+    pub nat_masquerade: bool,
 }
 
 /// Public arg struct for `bore vpn connect` (converted from CLI args).
@@ -102,6 +107,10 @@ pub struct VpnConnectArgs {
     pub refuse_routes: Vec<crate::shared::Ipv4Net>,
     /// Accept nothing (== default; for explicit, self-documenting scripts).
     pub refuse_all_routes: bool,
+    /// Masquerade NAT'd (`real@exposed`) subnets toward the LAN (F2). Applies on
+    /// the advertising side (a connector advertising its own `real@exposed`). See
+    /// [`VpnListenArgs::nat_masquerade`].
+    pub nat_masquerade: bool,
 }
 
 /// Non-retryable configuration error: retrying would yield the same outcome
@@ -544,8 +553,13 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
     let advertised_nets = routes::advertised_reals(&args.advertise_entries);
     let nat_maps = routes::nat_maps(&args.advertise_entries);
     let peer_routes = peer_advertised.to_vec();
-    if !nat_maps.is_empty() {
-        info!(link_id = %args.id, ?nat_maps, "vpn nat netmap maps (listener)");
+    for (real, exposed) in &nat_maps {
+        info!(
+            link_id = %args.id,
+            real = %real,
+            exposed = %exposed,
+            "NAT 1:1 netmap: advertising real {real} mapped to exposed {exposed} (peers reach this LAN as {exposed})"
+        );
     }
     let runner = hostcfg::RealRunner;
     let _netcfg = hostcfg::NetConfig::apply(
@@ -560,6 +574,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
         &nat_maps,
         args.no_route_manage,
         false,
+        args.nat_masquerade,
     )
     .await?;
 
@@ -1282,8 +1297,19 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
         refuse_all = args.refuse_all_routes,
         "resolved connector route policy"
     );
-    if !nat_maps.is_empty() {
-        info!(link_id = %args.id, ?nat_maps, "vpn nat netmap maps (connector)");
+    // Per-route clarity (peer subnets are the EXPOSED virtuals; the peer's real LAN
+    // behind any 1:1 NAT is hidden by design, N3/I-NAT2 — never sent on the wire).
+    for r in &peer_routes {
+        info!(link_id = %args.id, route = %r, "accepted peer route {r} (routed via tun; if the gateway NAT-maps it, the real LAN is gateway-side and not visible here)");
+    }
+    // This connector's OWN advertised NAT entries (site↔site), if any.
+    for (real, exposed) in &nat_maps {
+        info!(
+            link_id = %args.id,
+            real = %real,
+            exposed = %exposed,
+            "NAT 1:1 netmap: advertising real {real} mapped to exposed {exposed} (peers reach this LAN as {exposed})"
+        );
     }
     let runner = hostcfg::RealRunner;
     let _netcfg = hostcfg::NetConfig::apply(
@@ -1298,6 +1324,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
         &nat_maps,
         args.no_route_manage,
         false,
+        args.nat_masquerade,
     )
     .await?;
 
@@ -1977,39 +2004,96 @@ pub mod hostcfg_cmd {
         ]
     }
 
-    /// Build iptables masquerade rule argv.
-    pub fn cmd_iptables_masquerade_add(id: &str, tun: &str, lan_if: &str) -> Vec<String> {
+    // ── iptables custom chain management (F3/F4 fix) ────────────────────────────
+    //
+    // Per-link NAT chains avoid `-i` in POSTROUTING (which iptables rejects, F4)
+    // and enable chain teardown by `-X` instead of comment-matching (which fails
+    // with partial-spec rules, F3). Chain names kept short (< 28 chars) for iptables
+    // portability. Pre chain handles DNAT (prerouting hook); post chain handles
+    // SNAT, masquerade, and scoped masquerade (postrouting hook).
+
+    /// Build the prerouting custom chain name: `bore_<id>_pre`.
+    pub fn ipt_nat_pre_chain(id: &str) -> String {
+        format!("bore_{id}_pre")
+    }
+
+    /// Build the postrouting custom chain name: `bore_<id>_post`.
+    pub fn ipt_nat_post_chain(id: &str) -> String {
+        format!("bore_{id}_post")
+    }
+
+    /// Build `iptables -t nat -N <chain>` argv (create custom chain).
+    pub fn cmd_iptables_nat_new_chain(chain: &str) -> Vec<String> {
+        vec![
+            "iptables".into(),
+            "-t".into(),
+            "nat".into(),
+            "-N".into(),
+            chain.into(),
+        ]
+    }
+
+    /// Build `iptables -t nat -F <chain>` argv (flush custom chain).
+    pub fn cmd_iptables_nat_flush_chain(chain: &str) -> Vec<String> {
+        vec![
+            "iptables".into(),
+            "-t".into(),
+            "nat".into(),
+            "-F".into(),
+            chain.into(),
+        ]
+    }
+
+    /// Build `iptables -t nat -X <chain>` argv (delete empty custom chain).
+    pub fn cmd_iptables_nat_del_chain(chain: &str) -> Vec<String> {
+        vec![
+            "iptables".into(),
+            "-t".into(),
+            "nat".into(),
+            "-X".into(),
+            chain.into(),
+        ]
+    }
+
+    /// Build `iptables -t nat -A <hook> -j <chain>` argv (jump from hook to chain).
+    pub fn cmd_iptables_nat_jump(hook: &str, chain: &str) -> Vec<String> {
         vec![
             "iptables".into(),
             "-t".into(),
             "nat".into(),
             "-A".into(),
-            "POSTROUTING".into(),
-            "-i".into(),
-            tun.into(),
-            "-o".into(),
-            lan_if.into(),
+            hook.into(),
             "-j".into(),
-            "MASQUERADE".into(),
-            "-m".into(),
-            "comment".into(),
-            "--comment".into(),
-            format!("bore_vpn_{id}"),
+            chain.into(),
         ]
     }
 
-    /// Build iptables masquerade del argv.
-    pub fn cmd_iptables_masquerade_del(id: &str) -> Vec<String> {
+    /// Build `iptables -t nat -D <hook> -j <chain>` argv (delete jump from hook).
+    pub fn cmd_iptables_nat_jump_del(hook: &str, chain: &str) -> Vec<String> {
         vec![
             "iptables".into(),
             "-t".into(),
             "nat".into(),
             "-D".into(),
-            "POSTROUTING".into(),
-            "-m".into(),
-            "comment".into(),
-            "--comment".into(),
-            format!("bore_vpn_{id}"),
+            hook.into(),
+            "-j".into(),
+            chain.into(),
+        ]
+    }
+
+    /// Build iptables masquerade rule argv for the postrouting chain.
+    pub fn cmd_iptables_masquerade_add(id: &str, lan_if: &str) -> Vec<String> {
+        let chain = ipt_nat_post_chain(id);
+        vec![
+            "iptables".into(),
+            "-t".into(),
+            "nat".into(),
+            "-A".into(),
+            chain,
+            "-o".into(),
+            lan_if.into(),
+            "-j".into(),
+            "MASQUERADE".into(),
         ]
     }
 
@@ -2130,8 +2214,14 @@ pub mod hostcfg_cmd {
         ]
     }
 
-    /// Build nft ingress netmap DNAT: `... pre iif <tun> ip daddr <exposed> dnat ip to <real>`.
+    /// Build nft ingress netmap DNAT: `... pre iif <tun> ip daddr <exposed> dnat ip prefix to <real>`.
     /// Prefix-preserving (host bits kept): `10.50.1.7 → 192.168.1.7`.
+    ///
+    /// The `prefix` keyword is MANDATORY: without it, `dnat ip to <prefix>` treats the
+    /// target as a plain range and the kernel scrambles the host part (verified on
+    /// nft 1.0.9 / kernel 7.0: `100.100.16.138 → 10.10.16.8`, not `.138`). `dnat ip
+    /// prefix to <prefix>` sets NF_NAT_RANGE_NETMAP → true 1:1 host-bit-preserving map,
+    /// matching the iptables `NETMAP` fallback below.
     pub fn cmd_nft_add_netmap_dnat(id: &str, tun: &str, exposed: &str, real: &str) -> Vec<String> {
         vec![
             "nft".into(),
@@ -2147,13 +2237,15 @@ pub mod hostcfg_cmd {
             exposed.into(),
             "dnat".into(),
             "ip".into(),
+            "prefix".into(),
             "to".into(),
             real.into(),
         ]
     }
 
-    /// Build nft egress netmap SNAT: `... post oif <tun> ip saddr <real> snat ip to <exposed>`
-    /// (reuses the existing postrouting chain).
+    /// Build nft egress netmap SNAT: `... post oif <tun> ip saddr <real> snat ip prefix to <exposed>`
+    /// (reuses the existing postrouting chain). The `prefix` keyword is MANDATORY for
+    /// host-bit preservation — see [`cmd_nft_add_netmap_dnat`].
     pub fn cmd_nft_add_netmap_snat(id: &str, tun: &str, real: &str, exposed: &str) -> Vec<String> {
         vec![
             "nft".into(),
@@ -2169,6 +2261,7 @@ pub mod hostcfg_cmd {
             real.into(),
             "snat".into(),
             "ip".into(),
+            "prefix".into(),
             "to".into(),
             exposed.into(),
         ]
@@ -2202,20 +2295,22 @@ pub mod hostcfg_cmd {
         ]
     }
 
-    /// Build iptables ingress NETMAP DNAT add (`-A PREROUTING -i <tun> -d <exposed>
-    /// -j NETMAP --to <real>`), commented `bore_vpn_<id>`.
+    /// Build iptables ingress NETMAP DNAT add into the prerouting custom chain.
     pub fn cmd_iptables_netmap_dnat_add(
         id: &str,
         tun: &str,
         exposed: &str,
         real: &str,
     ) -> Vec<String> {
+        let chain = ipt_nat_pre_chain(id);
         vec![
             "iptables".into(),
             "-t".into(),
             "nat".into(),
             "-A".into(),
-            "PREROUTING".into(),
+            chain,
+            // Scope to tunnel ingress (parity with nft `iif <tun>`): the exposed
+            // virtual is only routed via the TUN.
             "-i".into(),
             tun.into(),
             "-d".into(),
@@ -2224,55 +2319,26 @@ pub mod hostcfg_cmd {
             "NETMAP".into(),
             "--to".into(),
             real.into(),
-            "-m".into(),
-            "comment".into(),
-            "--comment".into(),
-            format!("bore_vpn_{id}"),
         ]
     }
 
-    /// Build iptables ingress NETMAP DNAT delete (full-spec, mirrors add with `-D`).
-    pub fn cmd_iptables_netmap_dnat_del(
-        id: &str,
-        tun: &str,
-        exposed: &str,
-        real: &str,
-    ) -> Vec<String> {
-        vec![
-            "iptables".into(),
-            "-t".into(),
-            "nat".into(),
-            "-D".into(),
-            "PREROUTING".into(),
-            "-i".into(),
-            tun.into(),
-            "-d".into(),
-            exposed.into(),
-            "-j".into(),
-            "NETMAP".into(),
-            "--to".into(),
-            real.into(),
-            "-m".into(),
-            "comment".into(),
-            "--comment".into(),
-            format!("bore_vpn_{id}"),
-        ]
-    }
-
-    /// Build iptables egress NETMAP SNAT add (`-A POSTROUTING -o <tun> -s <real>
-    /// -j NETMAP --to <exposed>`), commented `bore_vpn_<id>`.
+    /// Build iptables egress NETMAP SNAT add into the postrouting custom chain.
     pub fn cmd_iptables_netmap_snat_add(
         id: &str,
         tun: &str,
         real: &str,
         exposed: &str,
     ) -> Vec<String> {
+        let chain = ipt_nat_post_chain(id);
         vec![
             "iptables".into(),
             "-t".into(),
             "nat".into(),
             "-A".into(),
-            "POSTROUTING".into(),
+            chain,
+            // MUST scope to tunnel egress (parity with nft `oif <tun>`): without
+            // `-o <tun>` this would rewrite the real LAN's normal (non-tunnel)
+            // traffic source and break the LAN.
             "-o".into(),
             tun.into(),
             "-s".into(),
@@ -2281,113 +2347,24 @@ pub mod hostcfg_cmd {
             "NETMAP".into(),
             "--to".into(),
             exposed.into(),
-            "-m".into(),
-            "comment".into(),
-            "--comment".into(),
-            format!("bore_vpn_{id}"),
         ]
     }
 
-    /// Build iptables egress NETMAP SNAT delete (full-spec, mirrors add with `-D`).
-    pub fn cmd_iptables_netmap_snat_del(
-        id: &str,
-        tun: &str,
-        real: &str,
-        exposed: &str,
-    ) -> Vec<String> {
-        vec![
-            "iptables".into(),
-            "-t".into(),
-            "nat".into(),
-            "-D".into(),
-            "POSTROUTING".into(),
-            "-o".into(),
-            tun.into(),
-            "-s".into(),
-            real.into(),
-            "-j".into(),
-            "NETMAP".into(),
-            "--to".into(),
-            exposed.into(),
-            "-m".into(),
-            "comment".into(),
-            "--comment".into(),
-            format!("bore_vpn_{id}"),
-        ]
-    }
-
-    /// Build iptables destination-scoped masquerade add for a PLAIN subnet (N6):
-    /// `-A POSTROUTING -i <tun> -o <lan_if> -d <plain> -j MASQUERADE`.
-    pub fn cmd_iptables_masquerade_scoped_add(
-        id: &str,
-        tun: &str,
-        lan_if: &str,
-        plain: &str,
-    ) -> Vec<String> {
+    /// Build iptables destination-scoped masquerade add into the postrouting chain.
+    pub fn cmd_iptables_masquerade_scoped_add(id: &str, lan_if: &str, subnet: &str) -> Vec<String> {
+        let chain = ipt_nat_post_chain(id);
         vec![
             "iptables".into(),
             "-t".into(),
             "nat".into(),
             "-A".into(),
-            "POSTROUTING".into(),
-            "-i".into(),
-            tun.into(),
+            chain,
             "-o".into(),
             lan_if.into(),
             "-d".into(),
-            plain.into(),
+            subnet.into(),
             "-j".into(),
             "MASQUERADE".into(),
-            "-m".into(),
-            "comment".into(),
-            "--comment".into(),
-            format!("bore_vpn_{id}"),
-        ]
-    }
-
-    /// Build iptables destination-scoped masquerade delete (full-spec, `-D`).
-    pub fn cmd_iptables_masquerade_scoped_del(
-        id: &str,
-        tun: &str,
-        lan_if: &str,
-        plain: &str,
-    ) -> Vec<String> {
-        vec![
-            "iptables".into(),
-            "-t".into(),
-            "nat".into(),
-            "-D".into(),
-            "POSTROUTING".into(),
-            "-i".into(),
-            tun.into(),
-            "-o".into(),
-            lan_if.into(),
-            "-d".into(),
-            plain.into(),
-            "-j".into(),
-            "MASQUERADE".into(),
-            "-m".into(),
-            "comment".into(),
-            "--comment".into(),
-            format!("bore_vpn_{id}"),
-        ]
-    }
-
-    /// Build iptables PREROUTING delete-by-comment (`-D PREROUTING -m comment
-    /// --comment bore_vpn_<id>`). Deletes one matching rule; the SIGKILL reclaim
-    /// loops it until non-zero to flush all leaked netmap DNAT rules (mirrors the
-    /// POSTROUTING [`cmd_iptables_masquerade_del`] used for the egress side).
-    pub fn cmd_iptables_prerouting_del_by_comment(id: &str) -> Vec<String> {
-        vec![
-            "iptables".into(),
-            "-t".into(),
-            "nat".into(),
-            "-D".into(),
-            "PREROUTING".into(),
-            "-m".into(),
-            "comment".into(),
-            "--comment".into(),
-            format!("bore_vpn_{id}"),
         ]
     }
 
@@ -2585,7 +2562,7 @@ pub mod hostcfg_cmd {
 
         #[test]
         fn cmd_iptables_fallback_snapshot() {
-            let cmd = cmd_iptables_masquerade_add("link1", "tun0", "eth0");
+            let cmd = cmd_iptables_masquerade_add("link1", "eth0");
             assert_eq!(
                 cmd,
                 vec![
@@ -2593,17 +2570,11 @@ pub mod hostcfg_cmd {
                     "-t",
                     "nat",
                     "-A",
-                    "POSTROUTING",
-                    "-i",
-                    "tun0",
+                    "bore_link1_post",
                     "-o",
                     "eth0",
                     "-j",
                     "MASQUERADE",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    "bore_vpn_link1"
                 ]
             );
         }
@@ -2638,6 +2609,7 @@ pub mod hostcfg_cmd {
                     "10.50.1.0/24",
                     "dnat",
                     "ip",
+                    "prefix",
                     "to",
                     "192.168.1.0/24"
                 ]
@@ -2658,6 +2630,7 @@ pub mod hostcfg_cmd {
                     "192.168.1.0/24",
                     "snat",
                     "ip",
+                    "prefix",
                     "to",
                     "10.50.1.0/24"
                 ]
@@ -2685,6 +2658,7 @@ pub mod hostcfg_cmd {
 
         #[test]
         fn cmd_iptables_netmap_snapshots() {
+            // Test chain-based DNAT rule targeting the prerouting custom chain.
             assert_eq!(
                 cmd_iptables_netmap_dnat_add("link1", "bore0", "10.50.1.0/24", "192.168.1.0/24"),
                 vec![
@@ -2692,7 +2666,7 @@ pub mod hostcfg_cmd {
                     "-t",
                     "nat",
                     "-A",
-                    "PREROUTING",
+                    "bore_link1_pre",
                     "-i",
                     "bore0",
                     "-d",
@@ -2701,19 +2675,9 @@ pub mod hostcfg_cmd {
                     "NETMAP",
                     "--to",
                     "192.168.1.0/24",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    "bore_vpn_link1"
                 ]
             );
-            // del mirrors add with -D.
-            let mut del = cmd_iptables_netmap_dnat_add("l", "b", "10.50.1.0/24", "192.168.1.0/24");
-            del[3] = "-D".into();
-            assert_eq!(
-                cmd_iptables_netmap_dnat_del("l", "b", "10.50.1.0/24", "192.168.1.0/24"),
-                del
-            );
+            // Test chain-based SNAT rule targeting the postrouting custom chain.
             assert_eq!(
                 cmd_iptables_netmap_snat_add("link1", "bore0", "192.168.1.0/24", "10.50.1.0/24"),
                 vec![
@@ -2721,7 +2685,7 @@ pub mod hostcfg_cmd {
                     "-t",
                     "nat",
                     "-A",
-                    "POSTROUTING",
+                    "bore_link1_post",
                     "-o",
                     "bore0",
                     "-s",
@@ -2730,46 +2694,64 @@ pub mod hostcfg_cmd {
                     "NETMAP",
                     "--to",
                     "10.50.1.0/24",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    "bore_vpn_link1"
                 ]
             );
+            // Test chain-based scoped masquerade.
             assert_eq!(
-                cmd_iptables_masquerade_scoped_add("link1", "bore0", "eth0", "172.16.9.0/24"),
+                cmd_iptables_masquerade_scoped_add("link1", "eth0", "172.16.9.0/24"),
                 vec![
                     "iptables",
                     "-t",
                     "nat",
                     "-A",
-                    "POSTROUTING",
-                    "-i",
-                    "bore0",
+                    "bore_link1_post",
                     "-o",
                     "eth0",
                     "-d",
                     "172.16.9.0/24",
                     "-j",
                     "MASQUERADE",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    "bore_vpn_link1"
+                ]
+            );
+        }
+
+        #[test]
+        fn cmd_iptables_nat_chain_management_snapshots() {
+            // Test chain management builders.
+            assert_eq!(
+                cmd_iptables_nat_new_chain("bore_link1_pre"),
+                vec!["iptables", "-t", "nat", "-N", "bore_link1_pre",]
+            );
+            assert_eq!(
+                cmd_iptables_nat_flush_chain("bore_link1_post"),
+                vec!["iptables", "-t", "nat", "-F", "bore_link1_post",]
+            );
+            assert_eq!(
+                cmd_iptables_nat_del_chain("bore_link1_post"),
+                vec!["iptables", "-t", "nat", "-X", "bore_link1_post",]
+            );
+            assert_eq!(
+                cmd_iptables_nat_jump("POSTROUTING", "bore_link1_post"),
+                vec![
+                    "iptables",
+                    "-t",
+                    "nat",
+                    "-A",
+                    "POSTROUTING",
+                    "-j",
+                    "bore_link1_post",
                 ]
             );
             assert_eq!(
-                cmd_iptables_prerouting_del_by_comment("link1"),
+                cmd_iptables_nat_jump_del("PREROUTING", "bore_link1_pre"),
                 vec![
                     "iptables",
                     "-t",
                     "nat",
                     "-D",
                     "PREROUTING",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    "bore_vpn_link1"
+                    "-j",
+                    "bore_link1_pre",
                 ]
             );
         }
@@ -2961,30 +2943,29 @@ pub mod hostcfg {
             .args(["delete", "table", "inet", &format!("bore_vpn_{id}")])
             .output();
 
-        // Try to delete iptables rules (BUG-3: for iptables fallback hosts). All our
-        // POSTROUTING rules (blanket/scoped masquerade + netmap SNAT) and PREROUTING
-        // rules (netmap DNAT) carry the `bore_vpn_<id>` comment, so a delete-by-comment
-        // loop flushes every leaked rule regardless of count (I-NAT7). iptables `-D`
-        // returns non-zero once no rule matches; the cap guards against a pathological
-        // always-succeeds backend.
-        let flush_by_comment = |argv: Vec<String>| {
-            for _ in 0..64 {
-                let ok = Command::new(&argv[0])
-                    .args(&argv[1..])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if !ok {
-                    break;
-                }
-            }
-        };
-        flush_by_comment(super::hostcfg_cmd::cmd_iptables_masquerade_del(id));
-        flush_by_comment(super::hostcfg_cmd::cmd_iptables_prerouting_del_by_comment(
-            id,
-        ));
+        // Try to delete iptables chains (F3/F4 fix: custom chain teardown by id only, no subnet info).
+        // Run deletion commands ignoring errors (they may not exist).
+        use super::hostcfg_cmd::*;
+        let post = ipt_nat_post_chain(id);
+        let pre = ipt_nat_pre_chain(id);
+
+        // Order: delete jumps, flush chains, delete chains (iptables requires this).
+        let teardown_cmds = vec![
+            cmd_iptables_nat_jump_del("POSTROUTING", &post),
+            cmd_iptables_nat_jump_del("PREROUTING", &pre),
+            cmd_iptables_nat_flush_chain(&post),
+            cmd_iptables_nat_del_chain(&post),
+            cmd_iptables_nat_flush_chain(&pre),
+            cmd_iptables_nat_del_chain(&pre),
+        ];
+
+        for argv in teardown_cmds {
+            let _ = Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output();
+        }
 
         let mss_clamp_del = super::hostcfg_cmd::cmd_iptables_mss_clamp_del(id);
         let mut cmd = Command::new(&mss_clamp_del[0]);
@@ -3162,6 +3143,7 @@ pub mod hostcfg {
             nat_maps: &[(crate::shared::Ipv4Net, crate::shared::Ipv4Net)],
             no_route_manage: bool,
             hub: bool,
+            nat_masquerade: bool,
         ) -> anyhow::Result<Self> {
             use super::hostcfg_cmd::*;
 
@@ -3245,8 +3227,10 @@ pub mod hostcfg {
                     anyhow!("could not determine LAN egress interface from: {route_out}")
                 })?;
 
-                // Try nft first, fall back to iptables
-                cfg.nft_available = check_binary_exists("nft");
+                // Try nft first, fall back to iptables. Test hook: BORE_VPN_FORCE_IPTABLES
+                // env var forces the iptables fallback on nft-available systems.
+                cfg.nft_available = check_binary_exists("nft")
+                    && std::env::var_os("BORE_VPN_FORCE_IPTABLES").is_none();
 
                 // Plain (non-NAT) advertised reals: everything not in nat_maps. When
                 // any NAT entry is present these get a destination-scoped masquerade
@@ -3303,6 +3287,21 @@ pub mod hostcfg {
                                 .with_context(|| format!("nft scoped masquerade {p}"))?;
                             tracing::info!(plain = %p, lan_if = %lan_if, tun = %tun_name, "masquerade (scoped to plain subnet)");
                         }
+                        // F2: opt-in masquerade of NAT'd subnets toward the LAN, scoped to
+                        // the REAL (post-DNAT) destination. Lets peers reach every host
+                        // behind the gateway (not just the gateway itself) even when the
+                        // gateway is not the LAN router; trades away per-peer source
+                        // visibility (the LAN host sees the gateway IP). Off = I-NAT5.
+                        if nat_masquerade {
+                            for (real, _exposed) in nat_maps {
+                                let r = real.to_string();
+                                runner
+                                    .run(&cmd_nft_add_masquerade_scoped(id, tun_name, &lan_if, &r))
+                                    .await
+                                    .with_context(|| format!("nft nat-masquerade {r}"))?;
+                                tracing::info!(real = %r, lan_if = %lan_if, tun = %tun_name, "nat-masquerade: NAT'd subnet -> LAN (--nat-masquerade)");
+                            }
+                        }
                     }
 
                     runner
@@ -3329,13 +3328,41 @@ pub mod hostcfg {
                     cfg.revert_labels
                         .push(format!("delete nft table bore_vpn_{id}"));
                 } else {
+                    // iptables fallback path (F3/F4 fix): custom chains instead of
+                    // direct POSTROUTING/PREROUTING rules. Chain teardown via -X
+                    // replaces comment-matching deletion (which fails on partial specs).
+                    let post = ipt_nat_post_chain(id);
+
+                    // Create and jump to postrouting chain
+                    runner
+                        .run(&cmd_iptables_nat_new_chain(&post))
+                        .await
+                        .context("iptables nat new postrouting chain")?;
+                    runner
+                        .run(&cmd_iptables_nat_jump("POSTROUTING", &post))
+                        .await
+                        .context("iptables nat jump postrouting")?;
+
                     if nat_maps.is_empty() {
+                        // N8/I-NAT1: byte-for-byte today's path — blanket masquerade,
+                        // no prerouting chain, no netmap.
                         runner
-                            .run(&cmd_iptables_masquerade_add(id, tun_name, &lan_if))
+                            .run(&cmd_iptables_masquerade_add(id, &lan_if))
                             .await
                             .context("iptables masquerade add")?;
-                        // Revert pushed below (after mss) to keep today's order.
                     } else {
+                        // Overlapping-subnet 1:1 netmap (E3). Create prerouting chain
+                        // and add DNAT rules; reuse postrouting for SNAT.
+                        let pre = ipt_nat_pre_chain(id);
+                        runner
+                            .run(&cmd_iptables_nat_new_chain(&pre))
+                            .await
+                            .context("iptables nat new prerouting chain")?;
+                        runner
+                            .run(&cmd_iptables_nat_jump("PREROUTING", &pre))
+                            .await
+                            .context("iptables nat jump prerouting")?;
+
                         for (real, exposed) in nat_maps {
                             let (r, v) = (real.to_string(), exposed.to_string());
                             runner
@@ -3348,29 +3375,32 @@ pub mod hostcfg {
                                 .with_context(|| format!("iptables netmap snat {r}->{v}"))?;
                             tracing::info!(exposed = %v, real = %r, tun = %tun_name, "nat netmap: dnat ingress  exposed -> real");
                             tracing::info!(real = %r, exposed = %v, tun = %tun_name, "nat netmap: snat egress   real -> exposed");
-                            cfg.revert_cmds
-                                .push(cmd_iptables_netmap_dnat_del(id, tun_name, &v, &r));
-                            cfg.revert_labels
-                                .push(format!("del iptables netmap dnat {v}"));
-                            cfg.revert_cmds
-                                .push(cmd_iptables_netmap_snat_del(id, tun_name, &r, &v));
-                            cfg.revert_labels
-                                .push(format!("del iptables netmap snat {r}"));
                         }
+
+                        // Plain subnets keep today's semantics, scoped by destination.
                         for plain in &plain_subnets {
                             let p = plain.to_string();
                             runner
-                                .run(&cmd_iptables_masquerade_scoped_add(
-                                    id, tun_name, &lan_if, &p,
-                                ))
+                                .run(&cmd_iptables_masquerade_scoped_add(id, &lan_if, &p))
                                 .await
                                 .with_context(|| format!("iptables scoped masquerade {p}"))?;
                             tracing::info!(plain = %p, lan_if = %lan_if, tun = %tun_name, "masquerade (scoped to plain subnet)");
-                            cfg.revert_cmds.push(cmd_iptables_masquerade_scoped_del(
-                                id, tun_name, &lan_if, &p,
-                            ));
-                            cfg.revert_labels
-                                .push(format!("del iptables scoped masquerade {p}"));
+                        }
+
+                        // F2: opt-in masquerade of NAT'd subnets toward the LAN, scoped to
+                        // the REAL (post-DNAT) destination. Lets peers reach every host
+                        // behind the gateway (not just the gateway itself) even when the
+                        // gateway is not the LAN router; trades away per-peer source
+                        // visibility (the LAN host sees the gateway IP). Off = I-NAT5.
+                        if nat_masquerade {
+                            for (real, _exposed) in nat_maps {
+                                let r = real.to_string();
+                                runner
+                                    .run(&cmd_iptables_masquerade_scoped_add(id, &lan_if, &r))
+                                    .await
+                                    .with_context(|| format!("iptables nat-masquerade {r}"))?;
+                                tracing::info!(real = %r, lan_if = %lan_if, tun = %tun_name, "nat-masquerade: NAT'd subnet -> LAN (--nat-masquerade)");
+                            }
                         }
                     }
 
@@ -3393,19 +3423,53 @@ pub mod hostcfg {
                     }
 
                     tracing::info!(%id, "applied iptables NAT rules");
-                    if nat_maps.is_empty() {
-                        cfg.revert_cmds.push(cmd_iptables_masquerade_del(id));
-                        cfg.revert_labels
-                            .push(format!("del iptables masquerade bore_vpn_{id}"));
-                    }
+
+                    // Build revert command stack in reverse order for correct cleanup:
+                    // (reversed sequence = del jumps, flush chains, delete chains).
+                    // MSS clamp del (unchanged behavior, pushed first so reversed = last).
                     cfg.revert_cmds.push(cmd_iptables_mss_clamp_del(id));
                     cfg.revert_labels
                         .push(format!("del iptables mss clamp bore_vpn_{id}"));
+
+                    if !nat_maps.is_empty() {
+                        // Pre chain: delete jump, flush, delete chain.
+                        let pre = ipt_nat_pre_chain(id);
+                        cfg.revert_cmds.push(cmd_iptables_nat_del_chain(&pre));
+                        cfg.revert_labels
+                            .push(format!("delete iptables nat chain {}", pre));
+                        cfg.revert_cmds.push(cmd_iptables_nat_flush_chain(&pre));
+                        cfg.revert_labels
+                            .push(format!("flush iptables nat chain {}", pre));
+                        cfg.revert_cmds
+                            .push(cmd_iptables_nat_jump_del("PREROUTING", &pre));
+                        cfg.revert_labels
+                            .push(format!("delete jump prerouting -> {}", pre));
+                    }
+
+                    // Post chain: delete jump, flush, delete chain.
+                    cfg.revert_cmds.push(cmd_iptables_nat_del_chain(&post));
+                    cfg.revert_labels
+                        .push(format!("delete iptables nat chain {}", post));
+                    cfg.revert_cmds.push(cmd_iptables_nat_flush_chain(&post));
+                    cfg.revert_labels
+                        .push(format!("flush iptables nat chain {}", post));
+                    cfg.revert_cmds
+                        .push(cmd_iptables_nat_jump_del("POSTROUTING", &post));
+                    cfg.revert_labels
+                        .push(format!("delete jump postrouting -> {}", post));
                 }
             } else if is_gateway && no_route_manage {
                 // Print commands for gateway mode (nft preferred). LAN iface is a
                 // placeholder operators replace with their real egress iface.
-                for cmd in gateway_nft_cmds(id, tun_name, "LAN_IFACE", advertised, nat_maps, hub) {
+                for cmd in gateway_nft_cmds(
+                    id,
+                    tun_name,
+                    "LAN_IFACE",
+                    advertised,
+                    nat_maps,
+                    hub,
+                    nat_masquerade,
+                ) {
                     println!("# (skipped, --no-route-manage): {}", cmd.join(" "));
                 }
             }
@@ -3425,6 +3489,7 @@ pub mod hostcfg {
         advertised: &[crate::shared::Ipv4Net],
         nat_maps: &[(crate::shared::Ipv4Net, crate::shared::Ipv4Net)],
         hub: bool,
+        nat_masquerade: bool,
     ) -> Vec<Vec<String>> {
         use super::hostcfg_cmd::*;
         let mut cmds = vec![cmd_nft_add_table(id), cmd_nft_add_postrouting_chain(id)];
@@ -3447,6 +3512,17 @@ pub mod hostcfg {
                     lan_if,
                     &plain.to_string(),
                 ));
+            }
+            // F2: opt-in masquerade of NAT'd subnets toward the LAN (scoped to real).
+            if nat_masquerade {
+                for (real, _exposed) in nat_maps {
+                    cmds.push(cmd_nft_add_masquerade_scoped(
+                        id,
+                        tun,
+                        lan_if,
+                        &real.to_string(),
+                    ));
+                }
             }
         }
         cmds.push(cmd_nft_add_forward_chain(id));
@@ -3595,6 +3671,7 @@ pub mod hostcfg {
                 &[],
                 false,
                 false,
+                false,
             )
             .await
             .expect("apply should succeed");
@@ -3628,6 +3705,7 @@ pub mod hostcfg {
                 &advertised,
                 &[],
                 true, // --no-route-manage
+                false,
                 false,
             )
             .await
@@ -3676,6 +3754,7 @@ pub mod hostcfg {
                 &[],
                 false,
                 false,
+                false,
             )
             .await
             .expect("apply ok");
@@ -3688,10 +3767,7 @@ pub mod hostcfg {
                 assert!(!has(&calls, &cmd_nft_add_prerouting_chain("t")));
                 assert!(!calls.iter().any(|c| c.contains(&"dnat".to_string())));
             } else {
-                assert!(has(
-                    &calls,
-                    &cmd_iptables_masquerade_add("t", "tun0", "eth0")
-                ));
+                assert!(has(&calls, &cmd_iptables_masquerade_add("t", "eth0")));
                 assert!(!calls.iter().any(|c| c.contains(&"NETMAP".to_string())));
             }
         }
@@ -3712,6 +3788,7 @@ pub mod hostcfg {
                 &[],
                 &advertised,
                 &maps,
+                false,
                 false,
                 false,
             )
@@ -3742,10 +3819,7 @@ pub mod hostcfg {
                     &calls,
                     &cmd_iptables_netmap_snat_add("t", "tun0", "192.168.1.0/24", "10.50.1.0/24")
                 ));
-                assert!(!has(
-                    &calls,
-                    &cmd_iptables_masquerade_add("t", "tun0", "eth0")
-                ));
+                assert!(!has(&calls, &cmd_iptables_masquerade_add("t", "eth0")));
             }
         }
 
@@ -3765,6 +3839,7 @@ pub mod hostcfg {
                 &[],
                 &advertised,
                 &maps,
+                false,
                 false,
                 false,
             )
@@ -3789,12 +3864,9 @@ pub mod hostcfg {
             } else {
                 assert!(has(
                     &calls,
-                    &cmd_iptables_masquerade_scoped_add("t", "tun0", "eth0", "172.16.9.0/24")
+                    &cmd_iptables_masquerade_scoped_add("t", "eth0", "172.16.9.0/24")
                 ));
-                assert!(!has(
-                    &calls,
-                    &cmd_iptables_masquerade_add("t", "tun0", "eth0")
-                ));
+                assert!(!has(&calls, &cmd_iptables_masquerade_add("t", "eth0")));
             }
         }
 
@@ -3815,6 +3887,7 @@ pub mod hostcfg {
                 &[],
                 &advertised,
                 &maps,
+                false,
                 false,
                 false,
             )
@@ -3851,6 +3924,7 @@ pub mod hostcfg {
                 &maps,
                 false,
                 false,
+                false,
             )
             .await
             .expect("apply ok");
@@ -3858,19 +3932,17 @@ pub mod hostcfg {
                 // nft: a single table delete reverts every rule (netmap included).
                 assert!(cfg.revert_cmds.contains(&cmd_nft_delete_table("t")));
             } else {
-                // iptables: each netmap rule has an explicit full-spec delete.
-                assert!(cfg.revert_cmds.contains(&cmd_iptables_netmap_dnat_del(
-                    "t",
-                    "tun0",
-                    "10.50.1.0/24",
-                    "192.168.1.0/24"
-                )));
-                assert!(cfg.revert_cmds.contains(&cmd_iptables_netmap_snat_del(
-                    "t",
-                    "tun0",
-                    "192.168.1.0/24",
-                    "10.50.1.0/24"
-                )));
+                // iptables: chain teardown deletes the entire chain containing all rules.
+                let pre = ipt_nat_pre_chain("t");
+                let post = ipt_nat_post_chain("t");
+                assert!(cfg.revert_cmds.contains(&cmd_iptables_nat_del_chain(&pre)));
+                assert!(cfg
+                    .revert_cmds
+                    .contains(&cmd_iptables_nat_flush_chain(&pre)));
+                assert!(cfg.revert_cmds.contains(&cmd_iptables_nat_del_chain(&post)));
+                assert!(cfg
+                    .revert_cmds
+                    .contains(&cmd_iptables_nat_flush_chain(&post)));
             }
         }
 
@@ -3884,6 +3956,7 @@ pub mod hostcfg {
                 "LAN_IFACE",
                 &[net("192.168.1.0/24"), net("172.16.9.0/24")],
                 &[(net("192.168.1.0/24"), net("10.50.1.0/24"))],
+                false,
                 false,
             );
             assert!(cmds.contains(&cmd_nft_add_prerouting_chain("t")));
@@ -3914,6 +3987,7 @@ pub mod hostcfg {
                 "LAN_IFACE",
                 &[net("192.168.50.0/24")],
                 &[],
+                false,
                 false,
             );
             assert!(plain.contains(&cmd_nft_add_masquerade_rule("t", "tun0", "LAN_IFACE")));
@@ -6393,6 +6467,7 @@ pub mod hub {
             &nat_maps,
             args.no_route_manage,
             true, // Hub mode: add spoke isolation
+            args.nat_masquerade,
         )
         .await?;
 

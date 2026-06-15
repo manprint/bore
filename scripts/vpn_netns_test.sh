@@ -74,6 +74,7 @@ cleanup() {
     ip netns del ns2 2>/dev/null
     ip netns del ns3 2>/dev/null
     ip netns del ns4 2>/dev/null
+    ip netns del ns_lanm 2>/dev/null
     rm -f "$BORE_LOG"
     set -e
 }
@@ -1839,16 +1840,41 @@ BORE_CONNECT_PID=$!
 
 if wait_for_log "$BORE_LOG.nat3_listen" "vpn link paired\|VpnReady" 10; then
     sleep 1
-    # Test host-bit preservation: .5 → 10.50.1.5, .23 → 10.50.1.23
+    # Liveness ping (necessary but NOT sufficient — a scrambled host bit that happens
+    # to land on ANOTHER assigned alias would still answer; see the identity check below).
     if ip netns exec ns2 ping -c 1 -W 3 "10.50.1.5" >/dev/null 2>&1; then
-        pass "T-NAT3: host-bit .5 preserved (10.50.1.5 → 192.168.10.5)"
+        pass "T-NAT3: 10.50.1.5 reachable (liveness)"
     else
         fail "T-NAT3: ping 10.50.1.5 failed"
     fi
-    if ip netns exec ns2 ping -c 1 -W 3 "10.50.1.23" >/dev/null 2>&1; then
-        pass "T-NAT3: host-bit .23 preserved (10.50.1.23 → 192.168.10.23)"
+
+    # ── Deterministic EXACT host-bit identity (regression guard for the nft `prefix`
+    #    bug, commit 8564ae0). A socat listener bound to each real host echoes the exact
+    #    address the connection actually landed on ($SOCAT_SOCKADDR). Connecting to
+    #    virtual .X MUST reach real .X — if the netmap scrambles host bits (e.g. the old
+    #    `dnat ip to <prefix>` mapped .138→.8), the echoed address differs and this FAILS.
+    #    Ping alone could NOT catch this; an exact-identity check can.
+    if command -v socat >/dev/null 2>&1; then
+        # Listeners on ns1 real hosts (local to the gateway; mirrors the gateway-self path).
+        ip netns exec ns1 socat TCP-LISTEN:7700,bind=192.168.10.5,reuseaddr,fork \
+            SYSTEM:'echo HIT-$SOCAT_SOCKADDR' >/dev/null 2>&1 &
+        NAT3_S1=$!
+        ip netns exec ns1 socat TCP-LISTEN:7700,bind=192.168.10.23,reuseaddr,fork \
+            SYSTEM:'echo HIT-$SOCAT_SOCKADDR' >/dev/null 2>&1 &
+        NAT3_S2=$!
+        sleep 0.5
+        for hb in 5 23; do
+            got=$(ip netns exec ns2 timeout 4 socat -T3 - "TCP:10.50.1.${hb}:7700" </dev/null 2>/dev/null | tr -d '\r\n')
+            if [ "$got" = "HIT-192.168.10.${hb}" ]; then
+                pass "T-NAT3: EXACT host-bit .${hb}: 10.50.1.${hb} → 192.168.10.${hb} (got '$got')"
+            else
+                fail "T-NAT3: host-bit .${hb} SCRAMBLED: 10.50.1.${hb} should reach 192.168.10.${hb}, got '$got' (nft netmap missing 'prefix'?)"
+            fi
+        done
+        kill "$NAT3_S1" "$NAT3_S2" 2>/dev/null || true
+        ip netns exec ns1 pkill -f "TCP-LISTEN:7700" 2>/dev/null || true
     else
-        fail "T-NAT3: ping 10.50.1.23 failed (host-bit not preserved?)"
+        echo "WARN: T-NAT3: socat not found — skipping deterministic host-bit identity check"
     fi
 else
     fail "T-NAT3: listener did not pair within 10s"
@@ -1861,6 +1887,153 @@ sleep 0.5
 # Clean up the extra .23 alias for next tests
 ip netns exec ns1 ip addr del "192.168.10.23/24" dev lo 2>/dev/null || true
 ip netns exec ns2 ip addr del "192.168.10.23/24" dev lo 2>/dev/null || true
+
+# ── Test T-NAT-IPT: iptables fallback path (forced) — host-bit identity + clean teardown ──
+# Exercises the iptables NETMAP custom-chain path (F3/F4 refactor) end-to-end through the
+# real binary, forced on this nft host via BORE_VPN_FORCE_IPTABLES. Guards: apply must NOT
+# crash (F4: no '-i' in POSTROUTING), host bits preserved (NETMAP target), and SIGTERM
+# teardown must leave ZERO bore_* chains (F3: chain teardown, not comment-matching).
+echo "=== T-NAT-IPT: iptables fallback (forced) host-bit identity + teardown ==="
+if command -v socat >/dev/null 2>&1 && ip netns exec ns1 sh -c 'command -v iptables' >/dev/null 2>&1; then
+    ip netns exec ns1 ip addr add "192.168.10.23/24" dev lo 2>/dev/null || true
+    ip netns exec ns1 env BORE_VPN_FORCE_IPTABLES=1 "$BORE" vpn listen \
+        --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id tnatipt \
+        --advertise "${NAT_REAL_LAN}@${NAT_VIRT_A}" \
+        >"$BORE_LOG.natipt_listen" 2>&1 &
+    BORE_LISTEN_PID=$!
+    sleep 0.5
+    ip netns exec ns2 "$BORE" vpn connect \
+        --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id tnatipt \
+        --accept-all-routes \
+        >"$BORE_LOG.natipt_connect" 2>&1 &
+    BORE_CONNECT_PID=$!
+
+    if wait_for_log "$BORE_LOG.natipt_listen" "vpn link paired\|VpnReady" 10; then
+        sleep 1
+        # F4: apply must have used iptables and NOT errored.
+        if grep -q "applied iptables NAT rules" "$BORE_LOG.natipt_listen" 2>/dev/null; then
+            pass "T-NAT-IPT: iptables NAT path applied (no '-i POSTROUTING' crash)"
+        else
+            fail "T-NAT-IPT: log missing 'applied iptables NAT rules' (forced-iptables apply failed?)"
+        fi
+        # Custom chains present while up.
+        if ip netns exec ns1 iptables -t nat -S 2>/dev/null | grep -q "bore_tnatipt_"; then
+            pass "T-NAT-IPT: iptables custom chains present while link up"
+        else
+            fail "T-NAT-IPT: iptables bore_tnatipt_* chains not found while up"
+        fi
+        # Host-bit identity over the iptables NETMAP path.
+        ip netns exec ns1 socat TCP-LISTEN:7701,bind=192.168.10.5,reuseaddr,fork \
+            SYSTEM:'echo HIT-$SOCAT_SOCKADDR' >/dev/null 2>&1 &
+        NATIPT_S1=$!
+        ip netns exec ns1 socat TCP-LISTEN:7701,bind=192.168.10.23,reuseaddr,fork \
+            SYSTEM:'echo HIT-$SOCAT_SOCKADDR' >/dev/null 2>&1 &
+        NATIPT_S2=$!
+        sleep 0.5
+        for hb in 5 23; do
+            got=$(ip netns exec ns2 timeout 4 socat -T3 - "TCP:10.50.1.${hb}:7701" </dev/null 2>/dev/null | tr -d '\r\n')
+            if [ "$got" = "HIT-192.168.10.${hb}" ]; then
+                pass "T-NAT-IPT: iptables NETMAP exact host-bit .${hb} (got '$got')"
+            else
+                fail "T-NAT-IPT: iptables NETMAP host-bit .${hb} wrong (got '$got')"
+            fi
+        done
+        kill "$NATIPT_S1" "$NATIPT_S2" 2>/dev/null || true
+        ip netns exec ns1 pkill -f "TCP-LISTEN:7701" 2>/dev/null || true
+
+        # F3: graceful teardown must remove ALL bore_* chains (no leak).
+        kill -TERM "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+        kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+        sleep 1.5
+        leftover=$(ip netns exec ns1 iptables -t nat -S 2>/dev/null | grep -c "bore_tnatipt_" || true)
+        if [ "${leftover:-0}" = "0" ]; then
+            pass "T-NAT-IPT: iptables chains fully reclaimed after exit (F3 fixed)"
+        else
+            fail "T-NAT-IPT: $leftover leaked iptables bore_tnatipt_* rules after exit"
+        fi
+    else
+        fail "T-NAT-IPT: listener did not pair within 10s (forced-iptables apply may have crashed)"
+    fi
+    ip netns exec ns1 ip addr del "192.168.10.23/24" dev lo 2>/dev/null || true
+    [ -n "$BORE_LISTEN_PID" ] && kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+    [ -n "$BORE_CONNECT_PID" ] && kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+    sleep 0.5
+else
+    echo "WARN: T-NAT-IPT: socat/iptables unavailable — skipping forced-iptables test"
+fi
+true  # guard: keep set -e from aborting on the prior short-circuit's exit code
+
+# ── Test T-NAT-MASQ: --nat-masquerade reaches a SEPARATE host behind the gateway (F2) ──
+# TRUE forwarding: the target is a distinct netns (ns_lanm), NOT the gateway itself, and the
+# gateway is NOT its router (ns_lanm has only the on-link /24, no route back to the peer
+# overlay). Reachable ONLY when --nat-masquerade rewrites the peer source to the gateway LAN
+# IP so the LAN host's reply returns on-link. The gateway LAN IP is .254 (NOT network+1=.1,
+# which bore probes via `ip route get` for lan_if detection — a .1 would resolve "local").
+echo "=== T-NAT-MASQ: --nat-masquerade forwarding to a SEPARATE LAN host (F2) ==="
+if command -v socat >/dev/null 2>&1; then
+    MQ_REAL="192.168.77.0/24"; MQ_VIRT="10.77.1.0/24"
+    MQ_HOST="192.168.77.77"; MQ_VHOST="10.77.1.77"
+    ip netns add ns_lanm 2>/dev/null || true
+    ip link add veth-gwlan netns ns1 type veth peer name veth-lanm netns ns_lanm
+    ip netns exec ns1 ip addr add 192.168.77.254/24 dev veth-gwlan
+    ip netns exec ns1 ip link set veth-gwlan up
+    ip netns exec ns_lanm ip link set lo up
+    ip netns exec ns_lanm ip link set veth-lanm up
+    ip netns exec ns_lanm ip addr add "$MQ_HOST/24" dev veth-lanm
+    # ns_lanm: ONLY the on-link /24 (no default) → reply to a peer-overlay src is undeliverable.
+    ip netns exec ns_lanm socat TCP-LISTEN:7702,bind="$MQ_HOST",reuseaddr,fork \
+        SYSTEM:'echo HIT-$SOCAT_SOCKADDR' >/dev/null 2>&1 &
+    MQ_S=$!
+    sleep 0.3
+
+    run_masq() {  # $1 = id ; $2 = extra listen flags ; echoes the connector's response
+        ip netns exec ns1 "$BORE" vpn listen --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "$1" \
+            --advertise "${MQ_REAL}@${MQ_VIRT}" $2 >"$BORE_LOG.$1_listen" 2>&1 &
+        BORE_LISTEN_PID=$!
+        sleep 0.5
+        ip netns exec ns2 "$BORE" vpn connect --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "$1" \
+            --accept-all-routes >"$BORE_LOG.$1_connect" 2>&1 &
+        BORE_CONNECT_PID=$!
+        local r=""
+        if wait_for_log "$BORE_LOG.$1_listen" "vpn link paired\|VpnReady" 10; then
+            sleep 1
+            r=$(ip netns exec ns2 timeout 4 socat -T3 - "TCP:${MQ_VHOST}:7702" </dev/null 2>/dev/null | tr -d '\r\n')
+        fi
+        [ -n "$BORE_LISTEN_PID" ] && kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+        [ -n "$BORE_CONNECT_PID" ] && kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+        sleep 1
+        printf '%s' "$r"
+    }
+
+    # (1) WITHOUT the flag: the separate host must be UNREACHABLE (the F2 gap).
+    got_off=$(run_masq tnmq1 "")
+    if [ -z "$got_off" ]; then
+        pass "T-NAT-MASQ: WITHOUT --nat-masquerade, separate LAN host unreachable (gap confirmed)"
+    else
+        fail "T-NAT-MASQ: WITHOUT flag, unexpectedly reached separate host (got '$got_off')"
+    fi
+
+    # (2) WITH the flag: REACHABLE, and the exact host bit is preserved end-to-end.
+    got_on=$(run_masq tnmq2 "--nat-masquerade")
+    if grep -q "nat-masquerade" "$BORE_LOG.tnmq2_listen" 2>/dev/null; then
+        pass "T-NAT-MASQ: listener logged the nat-masquerade rule"
+    else
+        fail "T-NAT-MASQ: listener log missing 'nat-masquerade' line"
+    fi
+    if [ "$got_on" = "HIT-$MQ_HOST" ]; then
+        pass "T-NAT-MASQ: WITH --nat-masquerade, separate LAN host reachable + host-bit correct (got '$got_on')"
+    else
+        fail "T-NAT-MASQ: WITH flag, separate host not reached / wrong host-bit (got '$got_on')"
+    fi
+
+    kill "$MQ_S" 2>/dev/null || true
+    ip netns exec ns_lanm pkill -f "TCP-LISTEN:7702" 2>/dev/null || true
+    ip netns del ns_lanm 2>/dev/null || true
+    sleep 0.5
+else
+    echo "WARN: T-NAT-MASQ: socat unavailable — skipping"
+fi
+true
 
 # ── Test T-NAT4: mixed plain + NAT (scoped masquerade) ───────────────────────────────────
 echo "=== T-NAT4: mixed plain + NAT advertise ==="

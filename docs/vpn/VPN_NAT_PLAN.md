@@ -136,21 +136,25 @@ For each NAT entry (real `R`, exposed `V`, equal prefix), on the advertising gat
 # nft (preferred — same bore_vpn_<id> table as masquerade/MSS):
 #   need a NEW prerouting nat chain (only postrouting pri 100 + forward pri -10 exist today)
 nft add chain inet bore_vpn_<id> pre { type nat hook prerouting priority -100 ; }
-nft add rule  inet bore_vpn_<id> pre  iif <tun> ip daddr <V> dnat ip to <R>     # ingress  V->R
-nft add rule  inet bore_vpn_<id> post oif <tun> ip saddr <R> snat ip to <V>     # egress   R->V
+nft add rule  inet bore_vpn_<id> pre  iif <tun> ip daddr <V> dnat ip prefix to <R>   # ingress  V->R
+nft add rule  inet bore_vpn_<id> post oif <tun> ip saddr <R> snat ip prefix to <V>   # egress   R->V
 
 # iptables fallback (rock-solid stateless NETMAP target):
 iptables -t nat -A PREROUTING  -i <tun> -d <V> -j NETMAP --to <R>
 iptables -t nat -A POSTROUTING -o <tun> -s <R> -j NETMAP --to <V>
 ```
 
-> **Uncertain detail, surfaced (do not paper over):** the **exact nft netmap syntax** for a
-> prefix-preserving 1:1 map varies across nft/kernel versions (`dnat ip to <prefix>` vs
-> `dnat ip prefix to <prefix>` vs a `dnat ip to ... map { ... }` form). **Phase 1.0 is a spike
-> that locks the exact nft form on the target kernel** before any builder is written. The
-> iptables `NETMAP` target is stable and is the reference fallback; if the nft form proves
-> fragile, the implementation may use iptables `NETMAP` for netmap rules even when nft is used
-> for masquerade (note the coexistence caveat in §8).
+> **RESOLVED (2026-06-15, was "uncertain detail"):** the prefix-preserving 1:1 nft netmap
+> **requires the `prefix` keyword**: `dnat ip prefix to <R>` / `snat ip prefix to <V>`. The
+> plain `dnat ip to <prefix>` form (and the `dnat ip to ... map {...}` form) do **NOT** preserve
+> host bits — the kernel treats the target as a range and scrambles the host part (empirically on
+> **nft 1.0.9 / kernel 7.0**: `100.100.16.138 → 10.10.16.8`, `.50 → .112`). This shipped broken in
+> commit `8564ae0` ("nat plan 1:1, to test") and silently timed out every NAT'd connection on
+> nft hosts. Fixed by inserting `prefix` in `cmd_nft_add_netmap_dnat`/`cmd_nft_add_netmap_snat`.
+> Verified in a netns harness that `dnat ip prefix to` maps `.138 → .138`, `.50 → .50`, `.23 → .23`
+> and `snat ip prefix to` mirrors it. The iptables `NETMAP` target was always correct (reference
+> fallback). **Lesson: the Phase 1.0 spike validated only that the rule *renders* (`dstnat`), not
+> that the translation *preserves host bits at runtime* — a render-check is not a behavior-check.**
 
 **Masquerade coexistence (N6).** Today `apply` installs one blanket rule
 `iif <tun> oif <lan_if> masquerade` (`src/vpn.rs:2653`). That rule would wrongly source-NAT

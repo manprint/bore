@@ -919,6 +919,13 @@ struct VpnListenArgs {
     #[clap(long)]
     no_route_manage: bool,
 
+    /// Masquerade NAT'd (`real@exposed`) subnets toward the LAN so peers reach every
+    /// host behind the gateway, not just the gateway itself (needed when the gateway
+    /// is not the LAN's router). Off by default: preserves the peer's source IP for
+    /// per-peer LAN ACLs / site↔site identical-LAN.
+    #[clap(long)]
+    nat_masquerade: bool,
+
     /// STUN server (host:port).
     #[clap(long, value_name = "HOST:PORT", env = "BORE_STUN_SERVER")]
     stun_server: Option<String>,
@@ -1052,6 +1059,13 @@ struct VpnConnectArgs {
     /// Print route/NAT commands instead of running them (interface is still created).
     #[clap(long)]
     no_route_manage: bool,
+
+    /// Masquerade NAT'd (`real@exposed`) subnets toward the LAN so peers reach every
+    /// host behind the gateway, not just the gateway itself (needed when the gateway
+    /// is not the LAN's router). Off by default: preserves the peer's source IP for
+    /// per-peer LAN ACLs / site↔site identical-LAN.
+    #[clap(long)]
+    nat_masquerade: bool,
 
     /// STUN server (host:port).
     #[clap(long, value_name = "HOST:PORT", env = "BORE_STUN_SERVER")]
@@ -1505,6 +1519,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     tun_name: args.tun_name,
                     mtu: args.mtu,
                     no_route_manage: args.no_route_manage,
+                    nat_masquerade: args.nat_masquerade,
                     stun_server: args.stun_server,
                     upnp: args.upnp,
                     try_port_prediction: args.try_port_prediction,
@@ -1570,6 +1585,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     tun_name: args.tun_name,
                     mtu: args.mtu,
                     no_route_manage: args.no_route_manage,
+                    nat_masquerade: args.nat_masquerade,
                     stun_server: args.stun_server,
                     upnp: args.upnp,
                     try_port_prediction: args.try_port_prediction,

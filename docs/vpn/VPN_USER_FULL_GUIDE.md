@@ -345,7 +345,7 @@ Stateless 1:1 netmap does not rewrite IPs embedded in application payloads. Prot
 | `--no-route-manage` | | — | flag | — | Print all route/NAT commands verbatim instead of running them; TUN is still created |
 | `--auto-reconnect` | | `BORE_AUTO_RECONNECT` | flag | — | Reconnect on link failure with exponential backoff (full teardown+rebuild per attempt; fatal config errors exit) |
 | `--relay-only` | | `BORE_VPN_RELAY_ONLY` | flag | — | Never attempt the direct UDP path; stay on the server relay |
-| `--carriers` | | `BORE_VPN_CARRIERS` | N | 1 | Parallel relay carrier substream pairs (1-16); effective = min(both sides, server --max-carriers) |
+| `--carriers` | | `BORE_VPN_CARRIERS` | N | 1 | Parallel carriers (1-16); effective = min(both sides, server --max-carriers). Relay: N substream pairs. Direct: N parallel QUIC connections over the one punched socket (each its own congestion controller → higher single-link throughput on lossy/high-BDP paths). 1:1 only; hub direct stays single-conn |
 | `--tun-queues` | | `BORE_VPN_TUN_QUEUES` | N | 1 | Linux TUN queues (IFF_MULTI_QUEUE, 1-8); one uplink pump per queue |
 | `--insecure` | | `BORE_INSECURE` | flag | — | Skip TLS certificate verification (useful with self-signed certs) |
 | `--stun-server` | | `BORE_STUN_SERVER` | `HOST:PORT` | — | Additional STUN server for UDP candidate discovery |
@@ -721,6 +721,40 @@ change, clamped to `[576, 9000]`), runs `ip link set <tun> mtu <new>` and logs
 `tun MTU adjusted to QUIC path MTU`. No revert is needed — the TUN is destroyed
 at teardown and the gateway MSS clamp uses `rt mtu`, adapting on its own. The
 `--mtu` value remains the starting point and the relay-path ceiling.
+
+The grower has **black-hole hysteresis**: if it grows the MTU and then has to
+shrink back within ~30 s, that size is capped as a black hole and not re-probed
+(quinn's path-MTU discovery sometimes briefly reports a size the WAN can't carry,
+which otherwise causes a perpetual ~70 s `1162↔1414` oscillation with periodic
+`dropping oversized packets` bursts). The cap clears after 5 min of a stable MTU
+so a genuinely improved path is rediscovered. If you still see the warning, pin a
+conservative `--mtu` (e.g. `1280`).
+
+### Throughput tuning (direct path)
+
+A single congestion-controlled QUIC flow is bounded by **socket buffer / RTT**.
+The kernel silently clamps `SO_SNDBUF`/`SO_RCVBUF` to `net.core.{w,r}mem_max`
+(stock Ubuntu/AWS default **208 KiB** → ~10 MB/s at 20 ms RTT, no matter the QUIC
+window, CPU near idle). bore requests **16 MiB** and, because the VPN runs with
+`CAP_NET_ADMIN`, **forces past the ceiling** with `SO_{SND,RCV}BUFFORCE`. On
+startup each side logs:
+
+```
+configured UDP socket buffers requested_recv=16777216 effective_recv=33554432 ... forced=true
+```
+
+`effective_*` is the kernel-doubled value (so 16 MiB requested → ~32 MiB). If you
+instead see `WARN ... UDP socket buffer clamped below request`, the process lacks
+`CAP_NET_ADMIN` — either run privileged, or raise the ceiling on **both** ends:
+
+```
+sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+```
+
+For a single high-BDP link that one BBR flow can't fill (lossy or high-RTT path),
+add `--carriers N` (both ends): N parallel QUIC connections over the one punched
+socket, each with its own congestion controller. On a clean low-RTT path one
+carrier already saturates a gigabit, so carriers help most on adverse paths.
 
 ### Routes installed
 

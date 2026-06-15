@@ -80,6 +80,16 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# ── Pre-cleanup ─────────────────────────────────────────────────────────────────
+# Idempotent: a prior run that crashed or was killed (SIGKILL bypasses the EXIT
+# trap) can leave stray bore processes and named netns. `ip netns add` would then
+# fail and cascade. Reclaim the names + kill strays BEFORE setup so a re-run is
+# always reliable from any starting state.
+echo "=== Pre-cleanup: reclaiming any stale bore procs / netns ==="
+pkill -9 -f "target/release/bore" 2>/dev/null || true
+for _ns in ns0 ns1 ns2 ns3 ns4 ns_lanm; do ip netns del "$_ns" 2>/dev/null || true; done
+sleep 0.5
+
 # ── Setup ──────────────────────────────────────────────────────────────────────
 echo "=== Setup: creating netns ns0/ns1/ns2/ns3/ns4 ==="
 ip netns add ns0

@@ -598,6 +598,23 @@ Bore inoltre richiede `DIRECT_UDP_SOCKET_RECV_BUFFER` e
 `MAX_DIRECT_STREAMS` a 4096 e usa keep-alive/idle QUIC di 3 s / 10 s, cosi il
 comportamento di base non dipende dai default piu piccoli del sistema.
 
+> **Buffer UDP (collo di bottiglia n.1 sul throughput diretto).** Un singolo
+> flusso QUIC è limitato da `buffer socket / RTT`. Il kernel tronca silenziosamente
+> `SO_SNDBUF`/`SO_RCVBUF` a `net.core.{w,r}mem_max` (default Ubuntu/AWS **208 KiB**
+> → ~10 MB/s a 20 ms di RTT, a prescindere dalle finestre QUIC, con CPU quasi
+> ferma). La VPN gira con `CAP_NET_ADMIN`, quindi bore **forza** i 16 MiB oltre il
+> limite con `SO_{SND,RCV}BUFFORCE`; all'avvio logga
+> `configured UDP socket buffers ... forced=true` (`effective_*` è raddoppiato dal
+> kernel). Se invece vedi `WARN ... UDP socket buffer clamped below request`, manca
+> la capability: gira da root/privilegiato, oppure alza il limite su **entrambi** i
+> lati: `sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216`.
+> Per un singolo link high-BDP che un flusso BBR non riempie (path lossy o
+> high-RTT) aggiungi `--carriers N` su entrambi i lati: ora vale anche sul path
+> **diretto** (N connessioni QUIC parallele sullo stesso socket bucato, ognuna con
+> il proprio congestion controller). Su path puliti a basso RTT un carrier satura
+> già la gigabit. Il monitor PMTU ha anche isteresi anti-flap (basta un `--mtu`
+> conservativo se vedi ancora `dropping oversized packets`).
+
 > Regola d'oro: il **provider** è il lato che deve essere *raggiungibile* (fa da
 > server QUIC); il **proxy** è il lato che *contatta*. Se il provider è dietro un NAT
 > simmetrico/CGNAT il path diretto può non riuscire e si resta sul relay.

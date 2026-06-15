@@ -467,6 +467,12 @@ Notes:
   `--no-default-features` to drop it (and the `quinn` dependency).
 - **VPN (Linux)** — point-to-point L3 tunnel; build with `--features vpn`.
   Feature-complete and netns-validated on Linux; macOS/Windows are groundwork only.
+  Direct-path throughput: a single QUIC flow is bounded by `socket buffer / RTT`.
+  bore requests 16 MiB UDP buffers and, running with `CAP_NET_ADMIN`, **forces past**
+  the `net.core.{w,r}mem_max` clamp (`SO_*BUFFORCE`) so a stock 208 KiB ceiling
+  (~10 MB/s at 20 ms RTT) does not cap it — startup logs `forced=true`. Unprivileged?
+  raise `net.core.{r,w}mem_max` on both ends. `--carriers N` now also fans the direct
+  path across N parallel QUIC connections (helps lossy/high-BDP links).
 - **Reflexive discovery (STUN).** Each peer learns its public address from a STUN
   chain: Cloudflare on the standard `3478/udp` first, then Google, then the
   server's built-in STUN responder on the control port over **UDP** as the final

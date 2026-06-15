@@ -960,7 +960,8 @@ Each gateway installs IP forwarding, NAT, and MSS rules. LAN-to-LAN routing requ
 ### Security Model
 
 - **Direct path:** QUIC datagrams, QUIC-TLS 1.3 end-to-end. Server not in the data path.
-- **Relay fallback:** packets sealed with ChaCha20-Poly1305 (key = `HKDF-SHA256(secret, nonce)`). Server splices opaque ciphertext — never sees plaintext IP headers.
+- **Relay fallback:** packets sealed with ChaCha20-Poly1305 (key = `HKDF-SHA256(secret, nonce)`). Server splices opaque ciphertext — never sees plaintext IP headers. Each link/peer derives keys from a fresh per-session CSPRNG nonce with its own monotonic counter, so a `(key, nonce)` pair is never reused — across carriers, multi-queue, an in-place direct↔relay fallback, or a reconnect.
+- **Relay replay (known limit):** the relay (your own server) carries opaque ciphertext and cannot read or forge it, but the receiver has no replay window, so a malicious relay could *replay* captured frames. The data plane is best-effort IP and TCP discards duplicates; cross-link replay is impossible (per-link keys). Use the direct path (default) for full end-to-end protection.
 
 ### Server Configuration
 
@@ -1043,6 +1044,8 @@ The first instance gets `bore0`, the second `bore1`. To force a specific name, p
 ### Cleanup
 
 `Ctrl-C` triggers graceful cleanup: routes deleted, IP forwarding restored, nft table dropped, TUN interface removed. State after exit is identical to before the link started. A `SIGKILL` leaves stale state; the next `bore vpn --id <same>` reclaims it automatically.
+
+When several gateway links run on the **same host**, `ip_forward` is reference-counted (`/run/bore-vpn-*.fwdref`): each link restores it only once the last gateway link exits, so tearing one link down never disables forwarding under another still-running one. Server liveness is detected within ~15 s on a broken socket (TCP keepalive) and within 60 s even for a wedged-but-connected server (control-stream heartbeat timeout), after which `--auto-reconnect` re-establishes the link with its forwarding/routes intact.
 
 See **[`docs/vpn/VPN_USER_FULL_GUIDE.md`](docs/vpn/VPN_USER_FULL_GUIDE.md)** for the complete flag reference and use-case guide.
 

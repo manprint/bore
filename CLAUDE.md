@@ -101,7 +101,10 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   bidirectional use (`copy_bidirectional`, `try_join!` in one task) is safe.
 - VPN relay queue applies backpressure (await on full), never silent drops; VPN clients
   must keep draining the control stream after `VpnReady` (heartbeats + server-death detection;
-  the ctrl actor in `vpn.rs` is the stream's single owner — route new control messages through it)
+  the ctrl actor in `vpn.rs` is the stream's single owner — route new control messages through it).
+  Server heartbeats every 500 ms; the 1:1 ctrl actor reads with a 60 s `CTRL_HEARTBEAT_TIMEOUT`
+  (parity with the hub's 60 s) on top of `SO_KEEPALIVE` 15 s, so a wedged-but-TCP-alive server is
+  detected — not just a broken socket (B5)
 - VPN: links start on relay; a background task attempts the direct QUIC upgrade (skipped with
   `--relay-only`). Path switch = controlled bridge restart (DEC-1: stop pumps, switch uplink set,
   respawn on Direct). Relay stays WARM for link lifetime; on direct death the bridge falls back to
@@ -116,7 +119,7 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
 - VPN `--carriers`/`--tun-queues` default 1 = byte/path-identical to the single configuration
   (I-9). Carrier count negotiated min(listener, connector, server `--max-carriers`); a dead
   carrier kills the whole link cleanly (reconnect re-establishes), never silent degradation
-- `NetConfig` RAII: all routes/nft/ip_forward changes revert on exit (SIGINT, SIGTERM, panic handled; SIGKILL requires next-run stale reclaim via /run state file to restore ip_forward and remove leaked iptables/nft rules — BUG-2/BUG-3 fixed)
+- `NetConfig` RAII: all routes/nft/ip_forward changes revert on exit (SIGINT, SIGTERM, panic handled; SIGKILL requires next-run stale reclaim via /run state file to restore ip_forward and remove leaked iptables/nft rules — BUG-2/BUG-3 fixed). Concurrent gateway links in ONE netns refcount ip_forward via per-`(netns,id,role)` `/run/bore-vpn-ns<inode>-*.fwdref` markers + a first-wins `/run/bore-vpn-ns<inode>.ipfwd-orig` record: a link restores ip_forward only when NO other co-netns `.fwdref` remains, and the last one out restores the true original — never disables forwarding under a still-live co-netns peer (B3 fixed); `stale_reclaim` is refcount-aware too. CRITICAL: markers are scoped by the `/proc/self/ns/net` inode because `ip_forward` is per-netns while `/run` is shared across netns (the netns harness, containers) — an unscoped refcount would wrongly couple independent netns and break teardown
 - TUN MTU default 1350: clamps QUIC datagram size; gateway MSS-clamp keeps forwarded TCP healthy
 - VPN direct path: a `TooLarge` datagram send is a per-packet DROP, never link death. The TUN MTU
   runs ahead of the QUIC path MTU right after every direct switch, so full-size packets exceed

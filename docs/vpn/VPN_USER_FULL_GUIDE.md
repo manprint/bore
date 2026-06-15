@@ -641,10 +641,13 @@ When the direct QUIC path is unavailable, IP packets travel over a yamux substre
 
 - **Algorithm:** ChaCha20-Poly1305
 - **Key derivation:** `HKDF-SHA256(secret, session_nonce, label)` with distinct labels for each direction (`bore-vpn l2c v1` / `bore-vpn c2l v1`)
-- **Session nonce:** server-issued, unique per link pairing
+- **Session nonce:** server-issued from the system CSPRNG, unique per link pairing and per hub peer
 - **Frame format:** `[u32 BE total_len][u64 BE counter][ciphertext ‖ 16-byte AEAD tag]`
+- **Nonce uniqueness:** the 96-bit AEAD nonce is `0000 ‖ counter`, where the counter is one shared monotonic `u64` per egress key. It is **never** reused for a given key — all carriers and TUN-queue producers increment the one counter atomically, an in-place direct↔relay fallback preserves it, and a reconnect derives a brand-new key from a fresh nonce (so restarting the counter at 0 is safe). Each hub spoke has its own key and counter.
 
 The server splices bytes between the two relay substreams without ever seeing plaintext. Even if the server is compromised, relay traffic is protected by the shared secret.
+
+> **Replay (known limitation).** The relay cannot read or forge frames, but the receiver keeps no replay window, so a malicious relay could *replay* frames it already carried. The relay data plane is best-effort IP and TCP discards duplicate segments; replay across links is impossible (each link/peer has a distinct key). For workloads where relay-path replay matters, prefer the direct path (the default; the relay is only a fallback) or a `--relay-only` deployment behind a trusted relay.
 
 ### Direct path encryption
 
@@ -807,6 +810,8 @@ After both start, `ip link show type tun` lists:
 
 Each instance has its own overlay addresses, routes, and cleanup. `Ctrl-C` on either instance tears down only that link; the other remains unaffected.
 
+> **Concurrent gateways share `ip_forward`.** All instances on a host write the single kernel `ip_forward` toggle. bore reference-counts gateway instances with per-link `/run/bore-vpn-*.fwdref` markers and a first-wins `/run/bore-vpn.ipfwd-orig` record: any instance enables forwarding, but only the **last** gateway instance to exit restores the host's original value. So tearing down one gateway link never disables forwarding under another that is still running, and after the last one exits the host returns to its original setting. (Each link still owns its own nft table, routes, and TUN, which are reverted independently.)
+
 **To force a specific name:**
 
 ```bash
@@ -945,9 +950,21 @@ If the listener's advertised subnets overlap with the connector's (or with the o
 
 The relay path wraps IP packets in a yamux substream over a TCP connection. For latency-sensitive protocols, use `bore test-udp` to investigate whether the direct path can be made to work (see §10). If both sides are behind symmetric NAT, direct is impossible; reduce relay latency by choosing a geographically close server.
 
-### No multi-peer mesh in v1
+### Hub-and-spoke, not full mesh
 
-Each `--id` accepts exactly one listener and one connector. For three or more peers, run multiple independent links with different `--id` values and manage routing manually.
+A 1:1 link (`--id` = one listener + one connector) is the default. For three or
+more peers, run the listener as a hub with `--max-clients N` (hub-and-spoke: each
+spoke reaches the hub and, with the hub forwarding, the resources behind it — see
+`VPN_MULTI_CLIENT.md`). There is no full peer-to-peer mesh: spokes do not get
+direct spoke↔spoke paths, and a host-only hub relies on the host's `ip_forward`
+for spoke isolation (a documented v1 gap). For an arbitrary mesh, run multiple
+independent links with different `--id` values and manage routing manually.
+
+### Relay path has no replay window
+
+See §13 — the relay carries opaque ciphertext but does not deduplicate replayed
+frames. Out of scope for the semi-trusted-relay, best-effort-IP threat model;
+prefer the direct path (default) where it matters.
 
 ### No privilege drop after setup
 

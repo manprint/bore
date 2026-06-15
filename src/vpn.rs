@@ -684,6 +684,14 @@ enum CtrlEvent {
 /// error), forwards `UdpPunch`/`UdpUnavailable` to `CtrlEvent` consumers, and
 /// writes any `ClientMessage` submitted on the returned sender (candidate
 /// offers, path reports).
+/// Max silence on the 1:1 control stream before we declare the server dead.
+/// The server heartbeats every 500 ms (`vpn_server.rs`), so 60 s is a 120-beat
+/// margin — no false positives on a healthy-but-idle link — while still catching
+/// a wedged-but-TCP-alive server that `SO_KEEPALIVE` alone cannot (it only
+/// detects a broken socket, not a hung peer process). Mirrors the hub ctrl
+/// actor's 60 s timeout for parity.
+const CTRL_HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn spawn_ctrl_actor(
     mut ctrl: crate::shared::Delimited<crate::mux::Stream>,
 ) -> (
@@ -706,34 +714,44 @@ fn spawn_ctrl_actor(
                     // All senders dropped: keep draining the stream (I-7).
                     None => out_open = false,
                 },
-                msg = ctrl.recv::<crate::shared::ServerMessage>() => match msg {
-                    Ok(Some(crate::shared::ServerMessage::Heartbeat)) => continue,
-                    Ok(Some(crate::shared::ServerMessage::UdpPunch {
+                msg = tokio::time::timeout(
+                    CTRL_HEARTBEAT_TIMEOUT,
+                    ctrl.recv::<crate::shared::ServerMessage>(),
+                ) => match msg {
+                    // No message (not even a heartbeat) within the window: the
+                    // server process is gone or wedged. Tear down → reconnect.
+                    Err(_) => {
+                        return anyhow!(
+                            "no server heartbeat within {CTRL_HEARTBEAT_TIMEOUT:?}; assuming server died"
+                        )
+                    }
+                    Ok(Ok(Some(crate::shared::ServerMessage::Heartbeat))) => continue,
+                    Ok(Ok(Some(crate::shared::ServerMessage::UdpPunch {
                         nonce,
                         peer,
                         peer_selected_stun,
                         tuning,
                         peer_id: _,
-                    })) => {
+                    }))) => {
                         tracing::debug!(?peer, ?peer_selected_stun, "received vpn udp punch");
                         let _ = event_tx
                             .send(CtrlEvent::Punch { nonce, peer, tuning })
                             .await;
                     }
-                    Ok(Some(crate::shared::ServerMessage::UdpUnavailable)) => {
+                    Ok(Ok(Some(crate::shared::ServerMessage::UdpUnavailable))) => {
                         let _ = event_tx.send(CtrlEvent::Unavailable).await;
                     }
-                    Ok(Some(crate::shared::ServerMessage::VpnPeerJoin { .. })) => {
+                    Ok(Ok(Some(crate::shared::ServerMessage::VpnPeerJoin { .. }))) => {
                         tracing::debug!("unexpected VpnPeerJoin on 1:1 vpn link (ignoring)");
                     }
-                    Ok(Some(crate::shared::ServerMessage::VpnPeerLeave { .. })) => {
+                    Ok(Ok(Some(crate::shared::ServerMessage::VpnPeerLeave { .. }))) => {
                         tracing::debug!("unexpected VpnPeerLeave on 1:1 vpn link (ignoring)");
                     }
-                    Ok(Some(msg)) => {
+                    Ok(Ok(Some(msg))) => {
                         tracing::debug!(?msg, "ignoring control message on vpn link");
                     }
-                    Ok(None) => return anyhow!("server closed the vpn control stream"),
-                    Err(e) => return anyhow!("vpn control stream error: {e}"),
+                    Ok(Ok(None)) => return anyhow!("server closed the vpn control stream"),
+                    Ok(Err(e)) => return anyhow!("vpn control stream error: {e}"),
                 }
             }
         }
@@ -1805,6 +1823,33 @@ pub mod crypto {
             assert_ne!(listener.ingress, connector.ingress);
             assert_eq!(listener.egress, connector.ingress);
             assert_eq!(listener.ingress, connector.egress);
+        }
+
+        /// A3 — per-peer key isolation in the hub. Two spokes get two distinct
+        /// CSPRNG session nonces; each derives keys from its OWN nonce passed RAW
+        /// (`UDP_NONCE_LEN` bytes) and starts its OWN counter at 0. Distinct
+        /// nonces MUST give distinct keys, or two peers whose counters both start
+        /// at 0 would seal under the same `(key, 0)` — a cross-peer nonce reuse.
+        #[test]
+        fn distinct_session_nonces_yield_distinct_keys() {
+            let secret = "shared-tunnel-secret";
+            let n1 = [0x11u8; crate::shared::UDP_NONCE_LEN];
+            let n2 = [0x22u8; crate::shared::UDP_NONCE_LEN];
+            let p1 = derive_keys_listener(secret, &n1).unwrap();
+            let p2 = derive_keys_listener(secret, &n2).unwrap();
+            assert_ne!(
+                p1.egress, p2.egress,
+                "distinct nonces must give distinct egress keys"
+            );
+            assert_ne!(p1.ingress, p2.ingress);
+            // A nonce differing in a single byte must still diverge (no truncation).
+            let mut n3 = n1;
+            n3[crate::shared::UDP_NONCE_LEN - 1] ^= 0x01;
+            let p3 = derive_keys_listener(secret, &n3).unwrap();
+            assert_ne!(
+                p1.egress, p3.egress,
+                "last-byte change must change the key (full nonce hashed)"
+            );
         }
     }
 }
@@ -2908,34 +2953,47 @@ pub mod hostcfg {
     /// TUN devices are non-persistent (kernel auto-removes on process death), so we do NOT
     /// delete them here — that would only destroy a co-located live instance's interface.
     pub async fn stale_reclaim(id: &str, role: &str) {
+        // Drop our own stale refcount marker from a SIGKILLed previous run with
+        // this exact (id, role) before deciding whether to restore (B3).
+        let fwdref = fwd_refcount_path(id, role);
+        let _ = std::fs::remove_file(&fwdref);
+        let others_active = other_fwdref_present(std::path::Path::new("/run"), &fwdref);
+
         // Try to restore ip_forward from state file (SIGKILL recovery). The file is keyed
         // by (id, role) so a co-located peer with the same id (e.g. the connector in the
-        // netns harness) cannot read+delete THIS side's file out from under it.
+        // netns harness) cannot read+delete THIS side's file out from under it. Skip the
+        // /proc write while ANOTHER gateway link is still active (it needs forwarding).
         let state_path = ipforward_state_path(id, role);
         if let Ok(content) = std::fs::read_to_string(&state_path) {
-            if let Ok(saved_value) = content.trim().parse::<u8>() {
-                tracing::info!(
-                    saved_value,
-                    "stale_reclaim: restoring ip_forward from state file"
-                );
-                let _ = std::fs::write(
-                    "/proc/sys/net/ipv4/ip_forward",
-                    format!("{}\n", saved_value),
-                );
-                // If direct write failed, try sudo -n fallback
-                if std::fs::write(
-                    "/proc/sys/net/ipv4/ip_forward",
-                    format!("{}\n", saved_value),
-                )
-                .is_err()
-                {
-                    let argv = super::hostcfg_cmd::cmd_sysctl_ip_forward(saved_value);
-                    let _ = std::process::Command::new(&argv[0])
-                        .args(&argv[1..])
-                        .output();
+            if !others_active {
+                if let Ok(saved_value) = content.trim().parse::<u8>() {
+                    tracing::info!(
+                        saved_value,
+                        "stale_reclaim: restoring ip_forward from state file"
+                    );
+                    let _ = std::fs::write(
+                        "/proc/sys/net/ipv4/ip_forward",
+                        format!("{}\n", saved_value),
+                    );
+                    // If direct write failed, try sudo -n fallback
+                    if std::fs::write(
+                        "/proc/sys/net/ipv4/ip_forward",
+                        format!("{}\n", saved_value),
+                    )
+                    .is_err()
+                    {
+                        let argv = super::hostcfg_cmd::cmd_sysctl_ip_forward(saved_value);
+                        let _ = std::process::Command::new(&argv[0])
+                            .args(&argv[1..])
+                            .output();
+                    }
                 }
             }
             let _ = std::fs::remove_file(&state_path);
+        }
+        // If we are the last gateway link gone, clear the host-wide original record.
+        if !others_active {
+            let _ = std::fs::remove_file(ipforward_orig_path());
         }
 
         // Try to delete nft table (ignore "not found" errors)
@@ -3067,29 +3125,104 @@ pub mod hostcfg {
         IpForward { saved_value: u8 },
     }
 
-    /// Sanitize id for use in a filename: keep [A-Za-z0-9_-], replace others with _.
+    /// Sanitize id/role for use in a filename: keep [A-Za-z0-9_-], replace others with _.
+    fn sanitize_run_key(s: &str) -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+
     /// Path of the ip_forward recovery state file. Keyed by BOTH the link id AND the
     /// role ("listen"/"connect"): two peers of one link can share a host (and `/run`
     /// is host-shared, not network-namespaced), so a key on `id` alone would make the
     /// connector's `stale_reclaim` read+delete the listener's file (racing it away) and
     /// would collide outright in site↔site mode where both sides are gateways.
     fn ipforward_state_path(id: &str, role: &str) -> std::path::PathBuf {
-        let sanitize = |s: &str| {
-            s.chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect::<String>()
-        };
         std::path::PathBuf::from(format!(
             "/run/bore-vpn-{}-{}.ipforward",
-            sanitize(id),
-            sanitize(role)
+            sanitize_run_key(id),
+            sanitize_run_key(role)
         ))
+    }
+
+    /// Identifier of the CURRENT network namespace (the inode of
+    /// `/proc/self/ns/net`). `ip_forward` is a PER-NETNS sysctl, but `/run` is
+    /// shared across netns that share a mount namespace (e.g. the netns test
+    /// harness, or containers bind-mounting `/run`). The B3 refcount markers are
+    /// therefore scoped by this id so links in DIFFERENT netns never couple their
+    /// independent `ip_forward` toggles — only co-netns links refcount together.
+    /// `0` on the unreadable/non-Linux path: degrades to a single host-wide scope.
+    fn current_netns_id() -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self/ns/net")
+            .map(|m| m.ino())
+            .unwrap_or(0)
+    }
+
+    /// Filename prefix shared by every `.fwdref` marker in the current netns.
+    fn fwdref_prefix() -> String {
+        format!("bore-vpn-ns{}-", current_netns_id())
+    }
+
+    /// Per-netns marker that this gateway link currently relies on `ip_forward`
+    /// being enabled (one per `(netns, id, role)`). The PRESENCE of any `.fwdref`
+    /// marker for THIS netns means at least one bore VPN gateway still needs
+    /// forwarding, so a link tearing down must NOT restore `ip_forward` while
+    /// another marker remains. Without this, two concurrent gateways in one netns
+    /// raced the shared `/proc/sys/net/ipv4/ip_forward` value (B3): the link that
+    /// observed the original `0` would, on exit, restore `0` and silently kill
+    /// forwarding under a still-running peer that needs `1`.
+    fn fwd_refcount_path(id: &str, role: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!(
+            "/run/{}{}-{}.fwdref",
+            fwdref_prefix(),
+            sanitize_run_key(id),
+            sanitize_run_key(role)
+        ))
+    }
+
+    /// First-writer-wins record of the netns's ORIGINAL `ip_forward` value. The
+    /// LAST gateway link out (in this netns) restores from this — not from its own
+    /// observed value, which is already `1` if another link enabled forwarding
+    /// first — so forwarding is never left enabled after every bore link has gone.
+    fn ipforward_orig_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("/run/bore-vpn-ns{}.ipfwd-orig", current_netns_id()))
+    }
+
+    /// True iff a `.fwdref` marker for THIS netns OTHER than `mine` exists in
+    /// `dir` — i.e. another co-netns gateway link still needs `ip_forward`. The
+    /// `prefix` argument is `fwdref_prefix()`; passed in so this stays pure for
+    /// unit testing.
+    fn other_fwdref_present_with_prefix(
+        dir: &std::path::Path,
+        mine: &std::path::Path,
+        prefix: &str,
+    ) -> bool {
+        let mine_name = mine.file_name();
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten().any(|e| {
+                    let p = e.path();
+                    let is_fwdref = p.extension().and_then(|x| x.to_str()) == Some("fwdref");
+                    let same_netns = p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(prefix));
+                    is_fwdref && same_netns && p.file_name() != mine_name
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Convenience wrapper using the live netns prefix.
+    fn other_fwdref_present(dir: &std::path::Path, mine: &std::path::Path) -> bool {
+        other_fwdref_present_with_prefix(dir, mine, &fwdref_prefix())
     }
 
     /// RAII guard that manages routes, forwarding, and NAT around a VPN link.
@@ -3207,6 +3340,28 @@ pub mod hostcfg {
                     if let Err(e) = tokio::fs::write(&state_path, format!("{}\n", saved)).await {
                         tracing::debug!(error = %e, ?state_path, "could not write ip_forward state file (will not recover from SIGKILL); continuing");
                     }
+                }
+
+                // B3 refcount: record the host's ORIGINAL value first-wins (so the
+                // LAST gateway link out restores it, not its own already-1 value),
+                // and drop a per-link marker so no link restores while another is
+                // still forwarding. `create_new` makes the orig write first-wins.
+                if let Err(e) = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(ipforward_orig_path())
+                    .await
+                {
+                    // Already exists (another link recorded it) or unwritable — both fine.
+                    tracing::trace!(error = %e, "ip_forward orig already recorded or unwritable");
+                } else if let Err(e) =
+                    tokio::fs::write(ipforward_orig_path(), format!("{}\n", saved)).await
+                {
+                    tracing::debug!(error = %e, "could not record original ip_forward; last-out restore falls back to per-link value");
+                }
+                let fwdref = fwd_refcount_path(id, role);
+                if let Err(e) = tokio::fs::write(&fwdref, b"1\n").await {
+                    tracing::debug!(error = %e, ?fwdref, "could not write ip_forward refcount marker; concurrent-gateway teardown may race");
                 }
 
                 cfg.ip_forward_saved = Some(saved);
@@ -3566,16 +3721,39 @@ pub mod hostcfg {
             for op in self.applied_ops.iter().rev() {
                 match op {
                     AppliedOp::IpForward { saved_value } => {
-                        tracing::info!(saved_value, "restoring ip_forward");
+                        // B3 refcount: drop our marker, then restore ONLY if no
+                        // other gateway link still needs forwarding. While another
+                        // marker remains, leave ip_forward as-is (that peer needs
+                        // it) — the last link out does the restore.
+                        let fwdref = fwd_refcount_path(&self.id, &self.role);
+                        let _ = std::fs::remove_file(&fwdref);
+                        let others_active =
+                            other_fwdref_present(std::path::Path::new("/run"), &fwdref);
+                        if others_active {
+                            tracing::info!(
+                                "ip_forward left enabled: another bore gateway link still active"
+                            );
+                            // Still clean our own per-link recovery file.
+                            let _ =
+                                std::fs::remove_file(ipforward_state_path(&self.id, &self.role));
+                            continue;
+                        }
+                        // Last gateway link out: restore the host's ORIGINAL value
+                        // (first-wins record), falling back to our observed value.
+                        let restore_to: u8 = std::fs::read_to_string(ipforward_orig_path())
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u8>().ok())
+                            .unwrap_or(*saved_value);
+                        tracing::info!(restore_to, "restoring ip_forward (last gateway link out)");
                         if std::fs::write(
                             "/proc/sys/net/ipv4/ip_forward",
-                            format!("{}\n", saved_value),
+                            format!("{}\n", restore_to),
                         )
                         .is_err()
                         {
                             // CAP_NET_ADMIN without UID 0: try sudo -n tee
                             // (best-effort, non-interactive).
-                            let argv = super::hostcfg_cmd::cmd_sysctl_ip_forward(*saved_value);
+                            let argv = super::hostcfg_cmd::cmd_sysctl_ip_forward(restore_to);
                             let ok = std::process::Command::new(&argv[0])
                                 .args(&argv[1..])
                                 .stdout(std::process::Stdio::null())
@@ -3585,17 +3763,17 @@ pub mod hostcfg {
                                 .unwrap_or(false);
                             if !ok {
                                 tracing::warn!(
-                                    saved_value,
+                                    restore_to,
                                     "could not restore ip_forward (no root and sudo -n failed); \
                                      restore manually: echo {} | sudo tee /proc/sys/net/ipv4/ip_forward",
-                                    saved_value
+                                    restore_to
                                 );
                             }
                         }
 
-                        // Delete state file (best-effort)
-                        let state_path = ipforward_state_path(&self.id, &self.role);
-                        let _ = std::fs::remove_file(&state_path);
+                        // Delete state + orig files (best-effort)
+                        let _ = std::fs::remove_file(ipforward_state_path(&self.id, &self.role));
+                        let _ = std::fs::remove_file(ipforward_orig_path());
                     }
                 }
             }
@@ -4167,6 +4345,37 @@ pub mod hostcfg {
             // Clean up
             let _ = std::fs::remove_file(&test_path);
         }
+
+        /// B3 — the refcount helper sees other CO-NETNS gateway links' `.fwdref`
+        /// markers (so a tearing-down link does not restore ip_forward under a
+        /// live peer) but ignores its OWN marker, unrelated files, and — crucially
+        /// — markers from a DIFFERENT netns (different prefix), since `ip_forward`
+        /// is per-netns while `/run` is shared.
+        #[test]
+        fn other_fwdref_present_detects_concurrent_links() {
+            let dir = std::env::temp_dir().join(format!("bore_test_fwdref_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let pfx = "bore-vpn-ns42-";
+            let mine = dir.join(format!("{pfx}A-listen.fwdref"));
+            let theirs = dir.join(format!("{pfx}B-connect.fwdref"));
+            let other_netns = dir.join("bore-vpn-ns99-C-listen.fwdref");
+            let unrelated = dir.join(format!("{pfx}A-listen.ipforward"));
+            std::fs::write(&mine, b"1\n").unwrap();
+            std::fs::write(&unrelated, b"0\n").unwrap();
+            std::fs::write(&other_netns, b"1\n").unwrap();
+
+            // Only my own marker + an unrelated extension + a DIFFERENT-netns
+            // marker → no OTHER co-netns link active.
+            assert!(!other_fwdref_present_with_prefix(&dir, &mine, pfx));
+            // A second co-netns link's marker → another link active.
+            std::fs::write(&theirs, b"1\n").unwrap();
+            assert!(other_fwdref_present_with_prefix(&dir, &mine, pfx));
+            // After it leaves, none remain (the other-netns marker still ignored).
+            std::fs::remove_file(&theirs).unwrap();
+            assert!(!other_fwdref_present_with_prefix(&dir, &mine, pfx));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
 
@@ -4734,6 +4943,122 @@ pub mod link {
             let mut acc = BytesMut::new();
             acc.extend_from_slice(&3u32.to_be_bytes());
             assert!(take_frame(&mut acc).is_err(), "undersized frame must error");
+        }
+
+        /// A (HIGHEST) — end-to-end `(key, nonce)` uniqueness guard. A
+        /// ChaCha20-Poly1305 nonce-reuse under one key is catastrophic, so the
+        /// single invariant this whole feature rests on is: no `(egress_key,
+        /// counter)` pair is ever sealed twice. This drives a real `LinkSender`
+        /// through every fan-out shape that could violate it:
+        ///   1. multi-carrier (N writer channels) — frames spread round-robin,
+        ///   2. multi-queue (M cloned senders) — every `--tun-queues` clone
+        ///      shares ONE `Arc<AtomicU64>` (I-5/DEC-6),
+        ///   3. in-place direct→relay fallback — the warm relay counter is
+        ///      PRESERVED, never reset (DEC-2),
+        ///   4. full reconnect — a fresh session-nonce gives a fresh key, so a
+        ///      counter reset to 0 is safe (the pair is new).
+        /// Captures every sealed frame's counter and asserts global uniqueness
+        /// of the `(key, counter)` set across all four.
+        #[tokio::test]
+        async fn nonce_uniqueness_carriers_queues_fallback_reconnect() {
+            use std::collections::HashSet;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::sync::Arc;
+
+            // Counter lives at frame bytes [4..12] (`[u32 len][u64 ctr][ct]`).
+            fn frame_ctr(frame: &Bytes) -> u64 {
+                u64::from_be_bytes(frame[4..12].try_into().unwrap())
+            }
+            // Relay sender wired to owned channels so the test drains every frame.
+            fn build(
+                key: [u8; 32],
+                counter: Arc<AtomicU64>,
+                n: usize,
+            ) -> (LinkSender, Vec<mpsc::Receiver<Bytes>>) {
+                let (mut txs, mut rxs) = (Vec::new(), Vec::new());
+                for _ in 0..n {
+                    let (tx, rx) = mpsc::channel::<Bytes>(8192);
+                    txs.push(tx);
+                    rxs.push(rx);
+                }
+                (
+                    LinkSender::Relay {
+                        txs,
+                        key,
+                        counter,
+                        rr: 0,
+                    },
+                    rxs,
+                )
+            }
+
+            let mut pairs: HashSet<([u8; 32], u64)> = HashSet::new();
+            let key_a = [0xA5u8; 32];
+            let counter = Arc::new(AtomicU64::new(0));
+
+            // 1+2. Link A: 3 carriers, 4 cloned producers, one shared counter.
+            let (sender, mut rxs) = build(key_a, Arc::clone(&counter), 3);
+            let mut producers = Vec::new();
+            for q in 0..4u8 {
+                let mut s = sender.clone(); // shares the Arc counter (rr reset is fine)
+                producers.push(tokio::spawn(async move {
+                    let pkt = Bytes::from(vec![q; 100]);
+                    for _ in 0..250 {
+                        s.send_batch(std::slice::from_ref(&pkt)).await.unwrap();
+                    }
+                }));
+            }
+            for p in producers {
+                p.await.unwrap();
+            }
+            drop(sender);
+            let mut count_a = 0;
+            for rx in &mut rxs {
+                while let Ok(frame) = rx.try_recv() {
+                    let ctr = frame_ctr(&frame);
+                    assert!(pairs.insert((key_a, ctr)), "(key,ctr) reuse at ctr={ctr}");
+                    count_a += 1;
+                }
+            }
+            assert_eq!(count_a, 1000, "4 producers x 250 packets all sealed");
+            assert_eq!(counter.load(Ordering::Relaxed), 1000);
+
+            // 3. Fallback: a NEW clone of the SAME Arc counter (as the bridge does
+            //    on FallBackToRelay). Counters must CONTINUE past 1000, never reset.
+            let (mut s2, mut rxs2) = build(key_a, Arc::clone(&counter), 1);
+            let pkt = Bytes::from(vec![7u8; 80]);
+            for _ in 0..500 {
+                s2.send_batch(std::slice::from_ref(&pkt)).await.unwrap();
+            }
+            drop(s2);
+            while let Ok(frame) = rxs2[0].try_recv() {
+                let ctr = frame_ctr(&frame);
+                assert!(
+                    ctr >= 1000,
+                    "fallback reset the counter to {ctr} (DEC-2 broken)"
+                );
+                assert!(
+                    pairs.insert((key_a, ctr)),
+                    "(key,ctr) reuse after fallback: {ctr}"
+                );
+            }
+
+            // 4. Reconnect: fresh key, counter restarts at 0. Pairs stay unique
+            //    BECAUSE the key differs — counter overlap with link A is safe.
+            let key_b = [0x3Cu8; 32];
+            assert_ne!(key_a, key_b);
+            let (mut s3, mut rxs3) = build(key_b, Arc::new(AtomicU64::new(0)), 1);
+            for _ in 0..1000 {
+                s3.send_batch(std::slice::from_ref(&pkt)).await.unwrap();
+            }
+            drop(s3);
+            while let Ok(frame) = rxs3[0].try_recv() {
+                let ctr = frame_ctr(&frame);
+                assert!(
+                    pairs.insert((key_b, ctr)),
+                    "(key,ctr) reuse across reconnect at ctr={ctr}"
+                );
+            }
         }
     }
 }
@@ -5573,6 +5898,58 @@ mod tests {
             "vpn listener 'x' not found".into()
         )));
         assert!(is_fatal(&classify_vpn_error("vpn pool exhausted".into())));
+    }
+
+    /// B1 (bug-hunt) — pin EVERY server-emitted `VpnError` string to its expected
+    /// class. `vpn_error_is_retryable` is a bare substring match (`"already in
+    /// use" || "not found"`); that is the exact bug class that hid the NAT
+    /// `prefix` bug, so this table is a regression tripwire. If a server message
+    /// is reworded into (or out of) one of those substrings, classification
+    /// flips silently — an infinite reconnect on a fatal config error, or a lost
+    /// auto-reconnect on a transient one. This test fails the instant that
+    /// happens. Keep it in sync with the `ServerMessage::VpnError(..)` sites in
+    /// `vpn_server.rs`.
+    #[test]
+    fn vpn_error_classification_pinned() {
+        // Transient reconnect-race conditions → RETRYABLE.
+        let retryable = [
+            "vpn id 'mylink' already in use",
+            "vpn listener 'mylink' not found",
+        ];
+        // Configuration / capacity errors → FATAL (retrying cannot fix them).
+        let fatal = [
+            "server vpn-max-links reached",
+            "server connection limit reached",
+            "server has no vpn pool; use --vpn-addr/--vpn-peer-addr",
+            "hub mode (--max-clients > 1) requires server pool addressing (D6)",
+            "hub mode requires a server pool (--vpn-pool)",
+            "hub mode requires pool addressing on the connector",
+            "connector --advertise is not allowed in hub mode (hub-and-spoke only, D4)",
+            "hub subnet full",
+            "vpn hub pool exhausted",
+            "vpn pool exhausted",
+            "overlapping subnets: 10.0.0.0/24 and 10.0.0.0/16",
+            "addressing mode mismatch: listener=pool connector=static",
+        ];
+        for m in retryable {
+            assert!(vpn_error_is_retryable(m), "{m:?} must be retryable");
+            assert!(
+                !is_fatal(&classify_vpn_error(m.to_string())),
+                "{m:?} classified fatal"
+            );
+        }
+        for m in fatal {
+            // The fragility guard: NO fatal message may contain a retryable
+            // substring, or it would be retried forever.
+            assert!(
+                !vpn_error_is_retryable(m),
+                "fatal {m:?} matched a retryable substring"
+            );
+            assert!(
+                is_fatal(&classify_vpn_error(m.to_string())),
+                "{m:?} not classified fatal"
+            );
+        }
     }
 
     /// §2.2 — the reconnect loop retries retryable errors, stops on fatal ones,

@@ -1156,9 +1156,20 @@ sudo bore vpn connect \
 
 La prima istanza ottiene `bore0`, la seconda `bore1`. Per forzare un nome specifico, passa `--tun-name myname`; altrimenti l'auto-naming gestisce un numero arbitrario di istanze senza configurazione.
 
+> **Gateway concorrenti e `ip_forward`.** Tutte le istanze su un host scrivono
+> l'unico toggle kernel `ip_forward`. bore conta i riferimenti delle istanze
+> gateway con marker per-link `/run/bore-vpn-*.fwdref` e un record first-wins
+> `/run/bore-vpn.ipfwd-orig`: qualsiasi istanza abilita il forwarding, ma solo
+> l'**ultima** istanza gateway che esce ripristina il valore originale dell'host.
+> Così smontare un link gateway non disabilita mai il forwarding sotto un altro
+> ancora attivo (B3 risolto, 2026-06-15). nft table, route e TUN restano per-link.
+
 > **Stato:** VPN su Linux è feature-complete e verificata end-to-end dalla suite
-> netns (`scripts/vpn_netns_test.sh`, Test 1–14 — PASS 2026-06-11). macOS/Windows/
-> Android sono solo groundwork (build-checked in CI, nessun runtime).
+> netns (`scripts/vpn_netns_test.sh`). 1:N hub-and-spoke (`--max-clients N`) e NAT
+> per subnet sovrapposte (`--advertise R@V`) supportati. Bug-hunt crypto/reconnect/
+> hub/path-switch completato 2026-06-15 (vedi `docs/vpn/VPN_BUGHUNT_ASSESSMENT.md`):
+> nessun riuso di nonce, fix B3 (`ip_forward` concorrente) e B5 (rilevamento server
+> morto). macOS/Windows/Android sono solo groundwork (build-checked in CI).
 
 ---
 

@@ -932,6 +932,14 @@ struct VpnListenArgs {
     #[clap(long)]
     nat_masquerade: bool,
 
+    /// Insert an ACCEPT for the tun↔LAN pair into the iptables FORWARD chain so
+    /// peers reach hosts BEHIND this gateway on a default-deny FORWARD host (the
+    /// Docker daemon sets `-P FORWARD DROP`; ufw/hardened hosts too). Without it,
+    /// bore only DETECTS a default-deny FORWARD and warns with the manual fix —
+    /// only the gateway host itself would be reachable. Reverted on exit (RAII).
+    #[clap(long)]
+    forward_accept: bool,
+
     /// STUN server (host:port).
     #[clap(long, value_name = "HOST:PORT", env = "BORE_STUN_SERVER")]
     stun_server: Option<String>,
@@ -1078,6 +1086,14 @@ struct VpnConnectArgs {
     /// per-peer LAN ACLs / site↔site identical-LAN.
     #[clap(long)]
     nat_masquerade: bool,
+
+    /// Insert an ACCEPT for the tun↔LAN pair into the iptables FORWARD chain so
+    /// peers reach hosts BEHIND this gateway on a default-deny FORWARD host (the
+    /// Docker daemon sets `-P FORWARD DROP`; ufw/hardened hosts too). Without it,
+    /// bore only DETECTS a default-deny FORWARD and warns with the manual fix —
+    /// only the gateway host itself would be reachable. Reverted on exit (RAII).
+    #[clap(long)]
+    forward_accept: bool,
 
     /// STUN server (host:port).
     #[clap(long, value_name = "HOST:PORT", env = "BORE_STUN_SERVER")]
@@ -1533,6 +1549,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     pin_mtu: args.pin_mtu,
                     no_route_manage: args.no_route_manage,
                     nat_masquerade: args.nat_masquerade,
+                    forward_accept: args.forward_accept,
                     stun_server: args.stun_server,
                     upnp: args.upnp,
                     try_port_prediction: args.try_port_prediction,
@@ -1600,6 +1617,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     pin_mtu: args.pin_mtu,
                     no_route_manage: args.no_route_manage,
                     nat_masquerade: args.nat_masquerade,
+                    forward_accept: args.forward_accept,
                     stun_server: args.stun_server,
                     upnp: args.upnp,
                     try_port_prediction: args.try_port_prediction,

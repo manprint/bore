@@ -229,5 +229,23 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
 - **I-NAT9:** LAN-egress iface + `ip_forward` use real subnet (virtual has no local route).
 - **I-NAT10:** Every link logs at `info`: advertise entries (real→exposed), NAT rules, peer routes, canonical route-table summary. No ALG — embedded IPs not translated.
 
+**VPN FORWARD default-deny gap (`--forward-accept`):**
+- On a **default-deny FORWARD** host (Docker daemon `-P FORWARD DROP`, ufw, hardened) a gateway
+  reaches ONLY itself; every host BEHIND it is stranded. bore's nft NAT rules live in a SEPARATE
+  table and **cannot override a terminal FORWARD `DROP`** from another chain (accept is not terminal
+  across base chains; drop is). The Docker DAEMON's rule persists on the host even when bore runs
+  natively (not in a container) — `docker0`/`br-*` in `ip route` is the tell.
+- `--forward-accept` (gateway/listen side) punches an `ACCEPT` for the tun↔LAN pair into the
+  iptables `filter` FORWARD chain via a per-link custom chain `bore_<id>_fwd` (F3/F4 pattern:
+  `-N` + `-I FORWARD -j` at TOP + two `-A ... ACCEPT`), torn down by id alone (SIGKILL `stale_reclaim`
+  safe). **iptables, NOT nft** — the real-world deny lives in `ip filter FORWARD` regardless of bore's
+  NAT backend; a hand-rolled `nft inet filter forward` policy-drop is NOT covered (out of scope, v1).
+  Off (default) ⇒ bore PROBES `iptables -S FORWARD` and `warn!`s the exact remediation when policy is
+  DROP/REJECT (`forward_policy_is_deny`). Detection-vs-install is mutually exclusive (no probe when
+  punching). RAII-reverted. Covered by T-FWD in `vpn_netns_test.sh` + `apply_*` unit tests.
+- NOTE: `--forward-accept` only fixes the FORWARD hop. NAT'd (`real@virtual`) subnets ALSO need
+  `--nat-masquerade` for the return path when the gateway is not the LAN router (I-NAT5) — the two
+  are orthogonal; the field repro needed BOTH.
+
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

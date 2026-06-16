@@ -947,7 +947,7 @@ impl Server {
                     .await;
                 }
                 #[cfg(not(feature = "vpn"))]
-                let _ = carriers;
+                let _ = (carriers, max_clients);
                 #[cfg(not(feature = "vpn"))]
                 let _ = (&advertised, &addr, &notes); // Suppress unused warnings when vpn feature is off
                 warn!(%id, "vpn not enabled on this server");

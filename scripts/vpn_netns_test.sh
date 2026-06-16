@@ -2102,6 +2102,96 @@ else
 fi
 true
 
+# ── Test T-FWD: --forward-accept punches a default-deny FORWARD (Docker/ufw) ──────────────
+# Faithful reproduction of the field bug: a NAT gateway with --nat-masquerade STILL cannot
+# reach a SEPARATE host behind it when the FORWARD chain is default-deny (the Docker daemon
+# sets `-P FORWARD DROP`; ufw/hardened hosts too). bore's nft rules cannot override a FORWARD
+# DROP that lives in another chain. --forward-accept punches an ACCEPT for the tun<->LAN pair
+# into the iptables FORWARD chain → reachable. Also asserts the detection WARNING (no flag) and
+# the RAII revert of the forward-accept chain on exit. Uses the same ns_lanm topology as
+# T-NAT-MASQ (a real veth-connected netns, NOT a gateway-local lo alias).
+echo "=== T-FWD: --forward-accept over a default-deny FORWARD chain ==="
+if command -v socat >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1; then
+    FW_REAL="192.168.78.0/24"; FW_VIRT="10.78.1.0/24"
+    FW_HOST="192.168.78.78"; FW_VHOST="10.78.1.78"
+    ip netns add ns_lanm 2>/dev/null || true
+    ip link add veth-gwlan netns ns1 type veth peer name veth-lanm netns ns_lanm
+    ip netns exec ns1 ip addr add 192.168.78.254/24 dev veth-gwlan
+    ip netns exec ns1 ip link set veth-gwlan up
+    ip netns exec ns_lanm ip link set lo up
+    ip netns exec ns_lanm ip link set veth-lanm up
+    ip netns exec ns_lanm ip addr add "$FW_HOST/24" dev veth-lanm
+    # ns_lanm: ONLY the on-link /24 (no default) — replies return on-link to .254 via masquerade.
+    ip netns exec ns_lanm socat TCP-LISTEN:7703,bind="$FW_HOST",reuseaddr,fork \
+        SYSTEM:'echo HIT-$SOCAT_SOCKADDR' >/dev/null 2>&1 &
+    FW_S=$!
+    sleep 0.3
+    # Simulate Docker/ufw: a default-deny FORWARD chain in the gateway netns.
+    ip netns exec ns1 iptables -P FORWARD DROP
+
+    run_fwd() {  # $1=id ; $2=extra listen flags ; echoes the connector's response
+        ip netns exec ns1 "$BORE" vpn listen --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "$1" \
+            --advertise "${FW_REAL}@${FW_VIRT}" --nat-masquerade $2 >"$BORE_LOG.$1_listen" 2>&1 &
+        BORE_LISTEN_PID=$!
+        sleep 0.5
+        ip netns exec ns2 "$BORE" vpn connect --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "$1" \
+            --accept-all-routes >"$BORE_LOG.$1_connect" 2>&1 &
+        BORE_CONNECT_PID=$!
+        local r=""
+        if wait_for_log "$BORE_LOG.$1_listen" "vpn link paired\|VpnReady" 10; then
+            sleep 1
+            r=$(ip netns exec ns2 timeout 4 socat -T3 - "TCP:${FW_VHOST}:7703" </dev/null 2>/dev/null | tr -d '\r\n')
+        fi
+        [ -n "$BORE_LISTEN_PID" ] && kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+        [ -n "$BORE_CONNECT_PID" ] && kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+        sleep 1
+        printf '%s' "$r"
+    }
+
+    # (1) WITHOUT --forward-accept: the FORWARD DROP strands the separate host even though
+    #     --nat-masquerade is set; bore must DETECT the default-deny chain and WARN.
+    got_off=$(run_fwd tfwd1 "")
+    if [ -z "$got_off" ]; then
+        pass "T-FWD: WITHOUT --forward-accept, default-deny FORWARD strands the LAN host (gap confirmed)"
+    else
+        fail "T-FWD: WITHOUT flag, unexpectedly reached host through a DROP'd FORWARD (got '$got_off')"
+    fi
+    if grep -q "FORWARD chain is default-deny" "$BORE_LOG.tfwd1_listen" 2>/dev/null; then
+        pass "T-FWD: bore WARNED about the default-deny FORWARD chain (with remediation)"
+    else
+        fail "T-FWD: missing default-deny FORWARD warning in listener log"
+    fi
+
+    # (2) WITH --forward-accept: bore punches the FORWARD chain → host reachable, host-bit kept.
+    got_on=$(run_fwd tfwd2 "--forward-accept")
+    if [ "$got_on" = "HIT-$FW_HOST" ]; then
+        pass "T-FWD: WITH --forward-accept, separate LAN host reachable through default-deny FORWARD (got '$got_on')"
+    else
+        fail "T-FWD: WITH --forward-accept, host still unreachable (got '$got_on')"
+    fi
+    if grep -q "forward-accept: inserted FORWARD ACCEPT" "$BORE_LOG.tfwd2_listen" 2>/dev/null; then
+        pass "T-FWD: listener logged the forward-accept rule insertion"
+    else
+        fail "T-FWD: listener log missing 'forward-accept: inserted FORWARD ACCEPT' line"
+    fi
+    # The per-link forward-accept chain must be REVERTED on graceful exit (RAII).
+    if ip netns exec ns1 iptables -S 2>/dev/null | grep -q "bore_tfwd2_fwd"; then
+        fail "T-FWD: forward-accept chain bore_tfwd2_fwd leaked after exit"
+    else
+        pass "T-FWD: forward-accept chain reverted on graceful exit (RAII)"
+    fi
+
+    # Restore FORWARD policy so later tests' forwarding is unaffected.
+    ip netns exec ns1 iptables -P FORWARD ACCEPT 2>/dev/null || true
+    kill "$FW_S" 2>/dev/null || true
+    ip netns exec ns_lanm pkill -f "TCP-LISTEN:7703" 2>/dev/null || true
+    ip netns del ns_lanm 2>/dev/null || true
+    sleep 0.5
+else
+    echo "WARN: T-FWD: socat/iptables unavailable — skipping"
+fi
+true  # guard: keep set -e from aborting on the prior short-circuit's exit code
+
 # ── Test T-NAT4: mixed plain + NAT (scoped masquerade) ───────────────────────────────────
 echo "=== T-NAT4: mixed plain + NAT advertise ==="
 # Add a second plain LAN to ns1 (not NAT'd)

@@ -19,6 +19,7 @@
 3. [Addressing Modes](#3-addressing-modes)
 4. [Topology A — Host to Host](#4-topology-a--host-to-host)
 5. [Topology B — Site to Host (Gateway + Roaming Client)](#5-topology-b--site-to-host)
+   - [5.1 Reaching Hosts Behind the Gateway (default-deny FORWARD: Docker / ufw)](#51-reaching-hosts-behind-the-gateway-default-deny-forward-docker--ufw)
 6. [Topology C — Site to Site (Gateway to Gateway)](#6-topology-c--site-to-site)
 7. [Complete Flag Reference](#7-complete-flag-reference)
 8. [Server Configuration](#8-server-configuration)
@@ -241,6 +242,90 @@ Both subnets are routed and masqueraded.
 
 ---
 
+## 5.1 Reaching Hosts *Behind* the Gateway (default-deny FORWARD: Docker / ufw)
+
+A gateway forwards tunnel traffic into its LAN. Two host-side conditions decide whether peers
+reach **other** LAN hosts (not just the gateway machine itself):
+
+1. **Return path** — the LAN host must be able to reply. Plain advertised subnets are always
+   masqueraded to the gateway's LAN IP, so this is automatic. NAT'd (`real@virtual`) subnets are
+   **not** masqueraded by default (the peer source IP is preserved); add `--nat-masquerade` when the
+   gateway is not the LAN's router. See §6.1.
+2. **Forwarding allowed** — the kernel `FORWARD` chain must permit `bore0 ↔ <lan_if>`. On a host
+   with a **default-deny FORWARD** chain this is where it breaks.
+
+### The symptom
+
+You advertise a LAN, the link comes up, and the peer can ping/reach **only the gateway host
+itself** (e.g. the gateway's own LAN IP, or — with NAT — the virtual address that maps to it).
+**Every other host on the LAN times out.**
+
+### Why
+
+The **Docker daemon** sets `iptables -P FORWARD DROP` (and only allows its own bridges); `ufw` and
+hardened hosts do the same. Forwarded `bore0 → <lan_if>` traffic matches none of those allow rules
+and hits the `DROP`. The gateway host *itself* still works because traffic to it is delivered
+locally and never traverses the `FORWARD` hook.
+
+bore's own NAT rules live in a **separate** nftables table, and **a `DROP` verdict in another chain
+is terminal** — bore cannot override it from its own table. So bore *detects* the situation and
+**warns** with the exact fix:
+
+```
+WARN ... FORWARD chain is default-deny (e.g. Docker daemon / ufw): peers will reach ONLY this
+gateway host, NOT other hosts behind it ... Fix: re-run with `--forward-accept`, or add manually:
+`iptables -I FORWARD -i bore0 -o wlp0s20f3 -j ACCEPT` and
+`iptables -I FORWARD -i wlp0s20f3 -o bore0 -j ACCEPT`.
+```
+
+### The fix — `--forward-accept`
+
+Pass `--forward-accept` on the **gateway (listen) side**. bore inserts a per-link `ACCEPT` for the
+tun↔LAN pair at the **top** of the `FORWARD` chain (a custom chain `bore_<id>_fwd`, jumped from
+`FORWARD`), so it short-circuits before the deny. It is fully reverted on exit (RAII), and reclaimed
+even after `SIGKILL`.
+
+```bash
+# Gateway behind Docker/ufw, NAT-mapping its LAN, reaching every host behind it:
+sudo bore vpn listen \
+  --id adv \
+  --secret S \
+  --advertise 192.168.1.0/24@10.30.0.0/24 \
+  --nat-masquerade \
+  --forward-accept
+```
+
+```bash
+# Plain (non-overlapping) LAN behind a default-deny FORWARD host:
+sudo bore vpn listen --id office --secret S \
+  --advertise 192.168.50.0/24 \
+  --forward-accept
+```
+
+### Manual alternative (no flag)
+
+If you prefer to manage the firewall yourself (replace `wlp0s20f3` with your LAN interface):
+
+```bash
+sudo iptables -I FORWARD -i bore0 -o wlp0s20f3 -j ACCEPT
+sudo iptables -I FORWARD -i wlp0s20f3 -o bore0 -j ACCEPT
+```
+
+### Notes & limits
+
+- **Running the gateway inside a `--network host` container does not help by itself** — the Docker
+  *daemon's* `FORWARD DROP` lives in the host and applies regardless of how bore is launched. Use
+  `--forward-accept`, the manual rules, or run the gateway outside containers.
+- `--forward-accept` targets the **iptables** `filter FORWARD` chain because that is where the
+  real-world deny lives (Docker/ufw), even on nftables-backed systems. A purely hand-rolled
+  `nft inet filter forward` policy-drop (rare) is **not** covered — add an `nft` accept yourself.
+- Verify the gateway can reach the LAN host directly first: `ping 192.168.1.3` **from the gateway**
+  (the real address). And note: pinging the *virtual* address (`10.30.0.x`) **from the gateway
+  itself** never works — the DNAT is `iif bore0` (tunnel-only) and the gateway has no route to the
+  virtual CIDR. Test reachability **from the connector**.
+
+---
+
 ## 6. Topology C — Site to Site
 
 Both sides advertise subnets; each is both a gateway and a client for the other's LAN.
@@ -338,6 +423,8 @@ Stateless 1:1 netmap does not rewrite IPs embedded in application payloads. Prot
 | `--secret` | `-s` | `BORE_SECRET` | `SECRET` | **required** | Shared secret for auth + relay encryption |
 | `--id` | | `BORE_VPN_ID` | `ID` | **required** | Link identifier; connector must use the same value |
 | `--advertise` | | `BORE_VPN_ADVERTISE` | `ITEM[,ITEM...]` | — | Subnets to expose; comma-separated; `ITEM` = `<cidr>` (plain) or `<real>@<virtual>` (NAT); enables gateway mode when non-empty |
+| `--nat-masquerade` | | — | flag | — | Masquerade NAT'd (`real@virtual`) subnets toward the LAN so peers reach **every** host behind the gateway, not just the gateway itself (needed when the gateway is not the LAN's router). Off = preserve the peer source IP (plain subnets are always masqueraded). See §5.1 |
+| `--forward-accept` | | — | flag | — | Punch an `ACCEPT` for the tun↔LAN pair into the iptables `FORWARD` chain so peers reach hosts **behind** the gateway on a **default-deny FORWARD** host (Docker daemon, `ufw`, hardened). Without it, bore only *detects* a default-deny FORWARD and warns. Reverted on exit (RAII). See §5.1 |
 | `--vpn-addr` | | `BORE_VPN_ADDR` | `IP/PREFIX` | — | Static overlay address with prefix (e.g. `172.31.0.1/30`); omit for pool mode |
 | `--vpn-peer-addr` | | `BORE_VPN_PEER_ADDR` | `IP` | — | Static peer overlay address (requires `--vpn-addr`) |
 | `--tun-name` | | — | `NAME` | `auto` | TUN interface name; `auto` picks the first free `boreN` (bore0, bore1, …) |
@@ -934,8 +1021,15 @@ From the connector side:
 
 1. Verify the route is installed: `ip route get 192.168.50.1` should show `dev bore0`.
 2. Confirm the gateway has IP forwarding enabled: `cat /proc/sys/net/ipv4/ip_forward` (should be `1`).
-3. Confirm the nft masquerade rule exists: `nft list table inet bore_vpn_<id>`.
+3. Confirm the nft masquerade rule exists: `nft list table inet bore_vpn_<id>` (note: **`inet`**, not `ip`).
 4. Try `ping -I bore0 192.168.50.1` to force the TUN as the outbound interface.
+5. **If only the gateway host itself is reachable and every other LAN host times out:** the host
+   has a **default-deny `FORWARD` chain** (Docker daemon / `ufw`). Check `sudo iptables -S FORWARD`
+   for `-P FORWARD DROP`. bore logs a `WARN ... FORWARD chain is default-deny ...` on link-up. Fix:
+   re-run the gateway with **`--forward-accept`**, or add the two `iptables -I FORWARD ... ACCEPT`
+   rules manually. Full detail + examples in **§5.1**.
+6. **For NAT'd (`real@virtual`) subnets:** if the gateway is not the LAN's router, the reply path
+   needs **`--nat-masquerade`** (plain subnets get this automatically). See §6.1.
 
 ### Works from gateway but not from other LAN hosts
 

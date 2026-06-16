@@ -58,6 +58,11 @@ pub struct VpnListenArgs {
     /// is reachable unless it is the LAN's router; on rewrites the source to the
     /// gateway LAN IP so every host behind the gateway is reachable on any topology.
     pub nat_masquerade: bool,
+    /// Punch an ACCEPT for the tun↔LAN pair into the iptables FORWARD chain so
+    /// peers reach hosts BEHIND the gateway on a default-deny FORWARD host (Docker
+    /// daemon `-P FORWARD DROP`, ufw, …). Off ⇒ bore only DETECTS a default-deny
+    /// FORWARD and warns with the manual remediation. See [`VpnListenArgs`] docs.
+    pub forward_accept: bool,
 }
 
 /// Public arg struct for `bore vpn connect` (converted from CLI args).
@@ -117,6 +122,10 @@ pub struct VpnConnectArgs {
     /// the advertising side (a connector advertising its own `real@exposed`). See
     /// [`VpnListenArgs::nat_masquerade`].
     pub nat_masquerade: bool,
+    /// Punch a FORWARD-chain ACCEPT for the tun↔LAN pair (default-deny FORWARD
+    /// hosts: Docker/ufw). Applies on the advertising side. See
+    /// [`VpnListenArgs::forward_accept`].
+    pub forward_accept: bool,
 }
 
 /// Non-retryable configuration error: retrying would yield the same outcome
@@ -581,6 +590,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
         args.no_route_manage,
         false,
         args.nat_masquerade,
+        args.forward_accept,
     )
     .await?;
 
@@ -1657,6 +1667,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
         args.no_route_manage,
         false,
         args.nat_masquerade,
+        args.forward_accept,
     )
     .await?;
 
@@ -2443,6 +2454,112 @@ pub mod hostcfg_cmd {
         ]
     }
 
+    // ── FORWARD default-deny gap: `--forward-accept` custom chain (filter) ──────
+    //
+    // On hosts with a default-deny FORWARD chain — the Docker daemon sets
+    // `-P FORWARD DROP`, ufw/hardened hosts do the same — forwarded tunnel↔LAN
+    // traffic is dropped by netfilter BEFORE bore's own nft rules can matter: a
+    // `drop` verdict (or a base-chain DROP policy) at the forward hook is
+    // TERMINAL, and bore's accept lives in a SEPARATE base chain/table so it can
+    // never override it. Only the gateway host ITSELF stays reachable (local
+    // delivery skips the FORWARD hook); every other host behind the gateway times
+    // out. `--forward-accept` punches an ACCEPT for the tun↔LAN pair into the TOP
+    // of the iptables `filter` FORWARD chain — the SAME chain that holds the deny —
+    // so it short-circuits before the drop fires.
+    //
+    // Mirrors the F3/F4 NAT custom-chain pattern: one per-link chain, jumped from
+    // FORWARD, torn down by id alone (no lan_if needed → SIGKILL `stale_reclaim`
+    // works). Uses iptables (NOT nft) because the real-world deny lives in the
+    // iptables(-nft) `ip filter FORWARD` chain regardless of which backend bore
+    // chose for its NAT rules.
+
+    /// Build the forward-accept custom chain name: `bore_<id>_fwd`.
+    pub fn ipt_fwd_chain(id: &str) -> String {
+        format!("bore_{id}_fwd")
+    }
+
+    /// Build `iptables -N <chain>` argv (create custom chain in the filter table).
+    pub fn cmd_iptables_filter_new_chain(chain: &str) -> Vec<String> {
+        vec!["iptables".into(), "-N".into(), chain.into()]
+    }
+
+    /// Build `iptables -F <chain>` argv (flush custom chain in the filter table).
+    pub fn cmd_iptables_filter_flush_chain(chain: &str) -> Vec<String> {
+        vec!["iptables".into(), "-F".into(), chain.into()]
+    }
+
+    /// Build `iptables -X <chain>` argv (delete empty custom chain, filter table).
+    pub fn cmd_iptables_filter_del_chain(chain: &str) -> Vec<String> {
+        vec!["iptables".into(), "-X".into(), chain.into()]
+    }
+
+    /// Build `iptables -I FORWARD -j <chain>` argv. INSERT at the TOP so the
+    /// jump precedes Docker's bridge rules and the chain's deny policy.
+    pub fn cmd_iptables_forward_jump(chain: &str) -> Vec<String> {
+        vec![
+            "iptables".into(),
+            "-I".into(),
+            "FORWARD".into(),
+            "-j".into(),
+            chain.into(),
+        ]
+    }
+
+    /// Build `iptables -D FORWARD -j <chain>` argv (delete the jump).
+    pub fn cmd_iptables_forward_jump_del(chain: &str) -> Vec<String> {
+        vec![
+            "iptables".into(),
+            "-D".into(),
+            "FORWARD".into(),
+            "-j".into(),
+            chain.into(),
+        ]
+    }
+
+    /// Build `iptables -A <chain> -i <in_if> -o <out_if> -j ACCEPT` argv.
+    pub fn cmd_iptables_fwd_accept(chain: &str, in_if: &str, out_if: &str) -> Vec<String> {
+        vec![
+            "iptables".into(),
+            "-A".into(),
+            chain.into(),
+            "-i".into(),
+            in_if.into(),
+            "-o".into(),
+            out_if.into(),
+            "-j".into(),
+            "ACCEPT".into(),
+        ]
+    }
+
+    /// Build `iptables -S FORWARD` argv (dump FORWARD spec; first line = policy).
+    pub fn cmd_iptables_list_forward() -> Vec<String> {
+        vec!["iptables".into(), "-S".into(), "FORWARD".into()]
+    }
+
+    /// Ordered command list to install the forward-accept chain: create the
+    /// chain, populate both directions, then jump into FORWARD (chain must exist
+    /// before it is referenced). Mirror of the live path for the print branch and
+    /// unit tests.
+    pub fn forward_accept_cmds(id: &str, tun: &str, lan_if: &str) -> Vec<Vec<String>> {
+        let fwd = ipt_fwd_chain(id);
+        vec![
+            cmd_iptables_filter_new_chain(&fwd),
+            cmd_iptables_fwd_accept(&fwd, tun, lan_if),
+            cmd_iptables_fwd_accept(&fwd, lan_if, tun),
+            cmd_iptables_forward_jump(&fwd),
+        ]
+    }
+
+    /// Parse `iptables -S FORWARD` output. True when the chain's default policy is
+    /// DROP or REJECT (a default-deny FORWARD → forwarded tunnel↔LAN traffic dies
+    /// without `--forward-accept`). Looks only at the `-P FORWARD <policy>` line.
+    pub fn forward_policy_is_deny(output: &str) -> bool {
+        output.lines().any(|line| {
+            let l = line.trim();
+            l == "-P FORWARD DROP" || l == "-P FORWARD REJECT"
+        })
+    }
+
     /// Build iptables masquerade rule argv for the postrouting chain.
     pub fn cmd_iptables_masquerade_add(id: &str, lan_if: &str) -> Vec<String> {
         let chain = ipt_nat_post_chain(id);
@@ -3128,6 +3245,87 @@ pub mod hostcfg_cmd {
             let iface2 = parse_lan_iface(output2);
             assert_eq!(iface2, Some("eth0".to_string()));
         }
+
+        #[test]
+        fn cmd_forward_accept_chain_snapshots() {
+            assert_eq!(ipt_fwd_chain("adv"), "bore_adv_fwd");
+            // Filter-table chain management: no `-t nat` (filter is the default).
+            assert_eq!(
+                cmd_iptables_filter_new_chain("bore_adv_fwd"),
+                vec!["iptables", "-N", "bore_adv_fwd"]
+            );
+            assert_eq!(
+                cmd_iptables_filter_flush_chain("bore_adv_fwd"),
+                vec!["iptables", "-F", "bore_adv_fwd"]
+            );
+            assert_eq!(
+                cmd_iptables_filter_del_chain("bore_adv_fwd"),
+                vec!["iptables", "-X", "bore_adv_fwd"]
+            );
+            // Jump INSERTED at the top of FORWARD (so it precedes Docker's policy).
+            assert_eq!(
+                cmd_iptables_forward_jump("bore_adv_fwd"),
+                vec!["iptables", "-I", "FORWARD", "-j", "bore_adv_fwd"]
+            );
+            assert_eq!(
+                cmd_iptables_forward_jump_del("bore_adv_fwd"),
+                vec!["iptables", "-D", "FORWARD", "-j", "bore_adv_fwd"]
+            );
+            assert_eq!(
+                cmd_iptables_fwd_accept("bore_adv_fwd", "bore0", "wlan0"),
+                vec![
+                    "iptables",
+                    "-A",
+                    "bore_adv_fwd",
+                    "-i",
+                    "bore0",
+                    "-o",
+                    "wlan0",
+                    "-j",
+                    "ACCEPT"
+                ]
+            );
+            assert_eq!(
+                cmd_iptables_list_forward(),
+                vec!["iptables", "-S", "FORWARD"]
+            );
+        }
+
+        #[test]
+        fn forward_accept_cmds_order_is_create_populate_jump() {
+            // The chain must exist + be populated BEFORE the FORWARD jump references
+            // it; both directions are present.
+            let cmds = forward_accept_cmds("adv", "bore0", "wlan0");
+            assert_eq!(cmds.len(), 4);
+            assert_eq!(cmds[0], cmd_iptables_filter_new_chain("bore_adv_fwd"));
+            assert_eq!(
+                cmds[1],
+                cmd_iptables_fwd_accept("bore_adv_fwd", "bore0", "wlan0")
+            );
+            assert_eq!(
+                cmds[2],
+                cmd_iptables_fwd_accept("bore_adv_fwd", "wlan0", "bore0")
+            );
+            assert_eq!(cmds[3], cmd_iptables_forward_jump("bore_adv_fwd"));
+        }
+
+        #[test]
+        fn forward_policy_is_deny_detects_drop_and_reject() {
+            // Docker / hardened host: policy DROP.
+            let docker = "-P FORWARD DROP\n-N DOCKER\n-A FORWARD -j DOCKER-USER\n";
+            assert!(forward_policy_is_deny(docker));
+            // Some hardened hosts use REJECT as the policy-equivalent catch.
+            assert!(forward_policy_is_deny("-P FORWARD REJECT\n"));
+            // Open host: policy ACCEPT → no warning.
+            assert!(!forward_policy_is_deny(
+                "-P FORWARD ACCEPT\n-A FORWARD -j DOCKER\n"
+            ));
+            // A `-A ... DROP` rule is NOT the chain policy; we only key on `-P`.
+            assert!(!forward_policy_is_deny(
+                "-P FORWARD ACCEPT\n-A FORWARD -i eth0 -j DROP\n"
+            ));
+            assert!(!forward_policy_is_deny(""));
+        }
     }
 }
 
@@ -3325,6 +3523,9 @@ pub mod hostcfg {
         let pre = ipt_nat_pre_chain(id);
 
         // Order: delete jumps, flush chains, delete chains (iptables requires this).
+        // Includes the --forward-accept filter chain (bore_<id>_fwd): torn down by
+        // id alone, no lan_if/tun needed (the whole point of the custom-chain form).
+        let fwd = ipt_fwd_chain(id);
         let teardown_cmds = vec![
             cmd_iptables_nat_jump_del("POSTROUTING", &post),
             cmd_iptables_nat_jump_del("PREROUTING", &pre),
@@ -3332,6 +3533,9 @@ pub mod hostcfg {
             cmd_iptables_nat_del_chain(&post),
             cmd_iptables_nat_flush_chain(&pre),
             cmd_iptables_nat_del_chain(&pre),
+            cmd_iptables_forward_jump_del(&fwd),
+            cmd_iptables_filter_flush_chain(&fwd),
+            cmd_iptables_filter_del_chain(&fwd),
         ];
 
         for argv in teardown_cmds {
@@ -3580,6 +3784,10 @@ pub mod hostcfg {
         ///   masquerade instead of the blanket rule (N6/I-NAT5).
         /// - `no_route_manage`: if true, print commands instead of running them
         /// - `hub`: if true, apply hub-mode spoke-isolation rule (blocks spoke-to-spoke forwarding)
+        /// - `forward_accept`: if true (gateway mode), punch an ACCEPT for the
+        ///   tun↔LAN pair into the iptables FORWARD chain so peers reach hosts
+        ///   BEHIND the gateway on a default-deny FORWARD host (Docker/ufw). Off ⇒
+        ///   only detect + warn when FORWARD is default-deny.
         #[allow(clippy::too_many_arguments)]
         pub async fn apply<R: CommandRunner>(
             runner: &R,
@@ -3594,6 +3802,7 @@ pub mod hostcfg {
             no_route_manage: bool,
             hub: bool,
             nat_masquerade: bool,
+            forward_accept: bool,
         ) -> anyhow::Result<Self> {
             use super::hostcfg_cmd::*;
 
@@ -3930,6 +4139,71 @@ pub mod hostcfg {
                     cfg.revert_labels
                         .push(format!("delete jump postrouting -> {}", post));
                 }
+
+                // ── FORWARD default-deny gap (Docker/ufw) ─────────────────────
+                // Independent of the nft/iptables NAT backend above: the deny that
+                // strands hosts BEHIND the gateway lives in the iptables `filter`
+                // FORWARD chain, which bore's NAT table cannot override.
+                if forward_accept {
+                    if check_binary_exists("iptables") {
+                        let fwd = ipt_fwd_chain(id);
+                        runner
+                            .run(&cmd_iptables_filter_new_chain(&fwd))
+                            .await
+                            .context("iptables new forward-accept chain")?;
+                        runner
+                            .run(&cmd_iptables_fwd_accept(&fwd, tun_name, &lan_if))
+                            .await
+                            .context("iptables forward-accept tun->lan")?;
+                        runner
+                            .run(&cmd_iptables_fwd_accept(&fwd, &lan_if, tun_name))
+                            .await
+                            .context("iptables forward-accept lan->tun")?;
+                        runner
+                            .run(&cmd_iptables_forward_jump(&fwd))
+                            .await
+                            .context("iptables forward-accept jump")?;
+                        tracing::info!(
+                            %id, tun = %tun_name, lan_if = %lan_if,
+                            "forward-accept: inserted FORWARD ACCEPT for tun<->LAN (--forward-accept)"
+                        );
+                        // Revert reverse-order: del jump, flush chain, del chain
+                        // (pushed so `.rev()` yields exactly that order).
+                        cfg.revert_cmds.push(cmd_iptables_filter_del_chain(&fwd));
+                        cfg.revert_labels
+                            .push(format!("delete iptables filter chain {fwd}"));
+                        cfg.revert_cmds.push(cmd_iptables_filter_flush_chain(&fwd));
+                        cfg.revert_labels
+                            .push(format!("flush iptables filter chain {fwd}"));
+                        cfg.revert_cmds.push(cmd_iptables_forward_jump_del(&fwd));
+                        cfg.revert_labels
+                            .push(format!("delete FORWARD jump -> {fwd}"));
+                    } else {
+                        tracing::warn!(
+                            %id, tun = %tun_name, lan_if = %lan_if,
+                            "--forward-accept requested but `iptables` not found; cannot punch the \
+                             FORWARD chain. Install iptables, or manually allow forwarding for \
+                             {tun_name}<->{lan_if}."
+                        );
+                    }
+                } else {
+                    // Detection: warn (don't change anything) when the FORWARD
+                    // chain is default-deny, so the operator knows why only the
+                    // gateway host itself is reachable and how to fix it.
+                    if let Ok(out) = runner.run(&cmd_iptables_list_forward()).await {
+                        if forward_policy_is_deny(&out) {
+                            tracing::warn!(
+                                %id, tun = %tun_name, lan_if = %lan_if,
+                                "FORWARD chain is default-deny (e.g. Docker daemon / ufw): peers \
+                                 will reach ONLY this gateway host, NOT other hosts behind it — \
+                                 bore's NAT rules cannot override a FORWARD DROP from another \
+                                 firewall. Fix: re-run with `--forward-accept`, or add manually: \
+                                 `iptables -I FORWARD -i {tun_name} -o {lan_if} -j ACCEPT` and \
+                                 `iptables -I FORWARD -i {lan_if} -o {tun_name} -j ACCEPT`."
+                            );
+                        }
+                    }
+                }
             } else if is_gateway && no_route_manage {
                 // Print commands for gateway mode (nft preferred). LAN iface is a
                 // placeholder operators replace with their real egress iface.
@@ -3943,6 +4217,12 @@ pub mod hostcfg {
                     nat_masquerade,
                 ) {
                     println!("# (skipped, --no-route-manage): {}", cmd.join(" "));
+                }
+                // FORWARD default-deny punch (iptables, backend-independent).
+                if forward_accept {
+                    for cmd in forward_accept_cmds(id, tun_name, "LAN_IFACE") {
+                        println!("# (skipped, --no-route-manage): {}", cmd.join(" "));
+                    }
                 }
             }
 
@@ -4167,6 +4447,7 @@ pub mod hostcfg {
                 false,
                 false,
                 false,
+                false,
             )
             .await
             .expect("apply should succeed");
@@ -4200,6 +4481,7 @@ pub mod hostcfg {
                 &advertised,
                 &[],
                 true, // --no-route-manage
+                false,
                 false,
                 false,
             )
@@ -4250,6 +4532,7 @@ pub mod hostcfg {
                 false,
                 false,
                 false,
+                false,
             )
             .await
             .expect("apply ok");
@@ -4283,6 +4566,7 @@ pub mod hostcfg {
                 &[],
                 &advertised,
                 &maps,
+                false,
                 false,
                 false,
                 false,
@@ -4337,6 +4621,7 @@ pub mod hostcfg {
                 false,
                 false,
                 false,
+                false,
             )
             .await
             .expect("apply ok");
@@ -4385,6 +4670,7 @@ pub mod hostcfg {
                 false,
                 false,
                 false,
+                false,
             )
             .await
             .expect("apply ok");
@@ -4420,6 +4706,7 @@ pub mod hostcfg {
                 false,
                 false,
                 false,
+                false,
             )
             .await
             .expect("apply ok");
@@ -4439,6 +4726,90 @@ pub mod hostcfg {
                     .revert_cmds
                     .contains(&cmd_iptables_nat_flush_chain(&post)));
             }
+        }
+
+        #[tokio::test]
+        async fn apply_without_forward_accept_probes_forward_policy() {
+            // Gateway mode, flag OFF: bore PROBES the FORWARD policy so it can warn
+            // on a default-deny host. No forward-accept chain is installed.
+            use crate::vpn::hostcfg_cmd::*;
+            let runner = TestRunner::new();
+            let advertised = vec![net("192.168.1.0/24")];
+            let _cfg = NetConfig::apply(
+                &runner,
+                "fa2",
+                "listen",
+                "bore0",
+                "10.0.0.1".parse().unwrap(),
+                30,
+                &[],
+                &advertised,
+                &[],
+                false,
+                false,
+                false,
+                false, // forward_accept OFF
+            )
+            .await
+            .expect("apply ok");
+            let calls = runner.get_calls().await;
+            assert!(
+                has(&calls, &cmd_iptables_list_forward()),
+                "must probe `iptables -S FORWARD` to detect default-deny"
+            );
+            assert!(!has(
+                &calls,
+                &cmd_iptables_filter_new_chain(&ipt_fwd_chain("fa2"))
+            ));
+        }
+
+        #[tokio::test]
+        async fn apply_forward_accept_installs_and_reverts_chain() {
+            // Gateway mode, flag ON: install the per-link FORWARD-accept chain
+            // (both directions) + jump, record the reverse-order teardown, and do
+            // NOT probe the policy (we are actively punching it open).
+            use crate::vpn::hostcfg_cmd::*;
+            if !check_binary_exists("iptables") {
+                eprintln!("skipping apply_forward_accept: iptables not installed");
+                return;
+            }
+            let runner = TestRunner::new();
+            let advertised = vec![net("192.168.1.0/24")];
+            let cfg = NetConfig::apply(
+                &runner,
+                "fa",
+                "listen",
+                "bore0",
+                "10.0.0.1".parse().unwrap(),
+                30,
+                &[],
+                &advertised,
+                &[],
+                false,
+                false,
+                false,
+                true, // forward_accept ON
+            )
+            .await
+            .expect("apply ok");
+            let calls = runner.get_calls().await;
+            let fwd = ipt_fwd_chain("fa"); // canned `ip route get` resolves lan_if=eth0
+            assert!(has(&calls, &cmd_iptables_filter_new_chain(&fwd)));
+            assert!(has(&calls, &cmd_iptables_fwd_accept(&fwd, "bore0", "eth0")));
+            assert!(has(&calls, &cmd_iptables_fwd_accept(&fwd, "eth0", "bore0")));
+            assert!(has(&calls, &cmd_iptables_forward_jump(&fwd)));
+            // Not probing when actively punching.
+            assert!(!has(&calls, &cmd_iptables_list_forward()));
+            // Teardown is registered for RAII revert.
+            assert!(cfg
+                .revert_cmds
+                .contains(&cmd_iptables_forward_jump_del(&fwd)));
+            assert!(cfg
+                .revert_cmds
+                .contains(&cmd_iptables_filter_flush_chain(&fwd)));
+            assert!(cfg
+                .revert_cmds
+                .contains(&cmd_iptables_filter_del_chain(&fwd)));
         }
 
         #[test]
@@ -5296,7 +5667,10 @@ pub mod link {
                     4,
                 ));
             }
-            assert!(seen.len() > 1, "flows must spread across carriers, got {seen:?}");
+            assert!(
+                seen.len() > 1,
+                "flows must spread across carriers, got {seen:?}"
+            );
             // All indices stay in range.
             assert!(seen.iter().all(|&i| i < 4));
         }
@@ -7368,6 +7742,7 @@ pub mod hub {
             args.no_route_manage,
             true, // Hub mode: add spoke isolation
             args.nat_masquerade,
+            args.forward_accept,
         )
         .await?;
 

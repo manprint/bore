@@ -152,3 +152,11 @@ assigned alias answers anyway) — and **were never executed** ("nat plan 1:1, t
   iptables) + T-NAT-MASQ (differential `--nat-masquerade` forwarding to a separate host).
   Full netns suite **142 PASS / 0 FAIL**; `cargo test --lib` **247 PASS**; clippy clean.
 - Docs: this assessment + `VPN_NAT_PLAN.md` note recording the resolved nft syntax.
+
+## Follow-up: default-deny FORWARD (orthogonal to F2)
+`--nat-masquerade` fixes the **return path**, but on a host with a **default-deny FORWARD** chain
+(Docker daemon `-P FORWARD DROP`, ufw) the forwarded request is dropped *before* masquerade matters
+— so even with `--nat-masquerade` the peer reaches only the gateway itself. bore's nft table cannot
+override a terminal `DROP` in another chain. Fixed by **`--forward-accept`** (detect+warn when off;
+punch the iptables FORWARD chain when on). The two flags are orthogonal; the field repro needed
+both. Full detail: [VPN_FORWARD_ACCEPT.md](VPN_FORWARD_ACCEPT.md). e2e: `T-FWD` (netns 150/0).

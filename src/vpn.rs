@@ -2847,12 +2847,32 @@ pub mod hostcfg_cmd {
         ]
     }
 
-    /// macOS argv builders (E6 groundwork, host-only mode — no NAT/forwarding).
+    /// macOS argv builders + PF ruleset composer (Phase 1/3 groundwork).
     ///
-    /// Pure functions so the snapshots run on every platform. The runtime
-    /// host-config refactor that selects these per-OS is still pending (the
-    /// `vpn` module is currently compiled on Linux only).
+    /// PURE functions — no I/O — so every snapshot below runs on the Linux CI box
+    /// without a Mac (Phase 5.1). The runtime that wires these into a macOS
+    /// `NetConfig` (utun creation, temp-file PF anchor load, sysctl save/restore,
+    /// RAII teardown) is gated `#[cfg(target_os="macos")]` and lands in Phase 2/3
+    /// AFTER the Phase 0 spike validates the exact utun + PF behavior on a real
+    /// Mac. See `docs/vpn/VPN_MACOS_PORT_PLAN.md`.
+    ///
+    /// **PF syntax is PROVISIONAL** — locked here as the spike's starting point and
+    /// verified structurally by snapshots; the Phase 0 spike confirms/refines the
+    /// exact `pfctl` grammar against macOS 13+ (Apple Silicon).
+    ///
+    /// macOS↔Linux mapping (see `gateway_nft_cmds` for the Linux twin):
+    /// - blanket / scoped masquerade → PF `nat on <lan> from any to <subnet> -> (<lan>)`
+    /// - 1:1 NAT netmap (`real@virtual`) → PF `binat` (bidirectional, host-bit preserving)
+    /// - `--nat-masquerade` → PF `nat ... to <real> -> (<lan>)`
+    /// - MSS clamp → PF `scrub on <tun> all max-mss <n>`
+    /// - hub spoke isolation → PF `block in on <tun> from (<tun>:network) to (<tun>:network)`
+    /// - `--forward-accept` → PF `pass` (macOS has no Docker FORWARD-DROP; semantics differ)
     pub mod macos {
+        /// PF anchor name for a link: `bore_vpn/<id>` (slash = nested anchor path).
+        pub fn pf_anchor(id: &str) -> String {
+            format!("bore_vpn/{id}")
+        }
+
         /// Build `route -n add -net <subnet> -interface <dev>` argv.
         pub fn cmd_route_add(subnet: &str, dev: &str) -> Vec<String> {
             vec![
@@ -2879,9 +2899,186 @@ pub mod hostcfg_cmd {
             ]
         }
 
+        /// Build `route -n get <host>` argv (LAN egress-iface probe; parsed by
+        /// [`parse_lan_iface`]). macOS analogue of Linux `ip route get`.
+        pub fn cmd_route_get(host: &str) -> Vec<String> {
+            vec!["route".into(), "-n".into(), "get".into(), host.into()]
+        }
+
+        /// Parse `route -n get <host>` output → the `interface: <iface>` field.
+        /// macOS prints `  interface: en0`; Linux's `dev <iface>` parser does not
+        /// apply here (different format), hence a dedicated parser.
+        pub fn parse_lan_iface(output: &str) -> Option<String> {
+            for line in output.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("interface:") {
+                    let iface = rest.trim();
+                    if !iface.is_empty() {
+                        return Some(iface.to_string());
+                    }
+                }
+            }
+            None
+        }
+
+        /// Build `ifconfig <dev> inet <local> <peer> up` argv — point-to-point
+        /// overlay address on a utun (utun is strictly p2p; peer = other /30 end).
+        pub fn cmd_addr_add(dev: &str, local: &str, peer: &str) -> Vec<String> {
+            vec![
+                "ifconfig".into(),
+                dev.into(),
+                "inet".into(),
+                local.into(),
+                peer.into(),
+                "up".into(),
+            ]
+        }
+
+        /// Build `ifconfig <dev> up` argv.
+        pub fn cmd_link_set_up(dev: &str) -> Vec<String> {
+            vec!["ifconfig".into(), dev.into(), "up".into()]
+        }
+
         /// Build `ifconfig <dev> mtu <mtu>` argv (dynamic PMTU).
         pub fn cmd_link_set_mtu(dev: &str, mtu: u16) -> Vec<String> {
             vec!["ifconfig".into(), dev.into(), "mtu".into(), mtu.to_string()]
+        }
+
+        /// Build `sysctl -w net.inet.ip.forwarding=<v>` argv (gateway mode).
+        /// macOS analogue of writing `/proc/sys/net/ipv4/ip_forward` on Linux.
+        pub fn cmd_sysctl_ip_forward(value: u8) -> Vec<String> {
+            vec![
+                "sysctl".into(),
+                "-w".into(),
+                format!("net.inet.ip.forwarding={value}"),
+            ]
+        }
+
+        /// Build `sysctl -n net.inet.ip.forwarding` argv (read current value to
+        /// save for RAII restore).
+        pub fn cmd_sysctl_get_ip_forward() -> Vec<String> {
+            vec![
+                "sysctl".into(),
+                "-n".into(),
+                "net.inet.ip.forwarding".into(),
+            ]
+        }
+
+        /// Build `pfctl -e` argv (enable PF; idempotent — already-enabled is a
+        /// benign non-zero the runtime tolerates).
+        pub fn cmd_pf_enable() -> Vec<String> {
+            vec!["pfctl".into(), "-e".into()]
+        }
+
+        /// Build `pfctl -d` argv (disable PF; only used on RAII teardown if THIS
+        /// link enabled it).
+        pub fn cmd_pf_disable() -> Vec<String> {
+            vec!["pfctl".into(), "-d".into()]
+        }
+
+        /// Build `pfctl -a bore_vpn/<id> -f <path>` argv (load the link's anchor
+        /// ruleset from a file — the runtime writes [`pf_ruleset`] to a temp file
+        /// because `CommandRunner` has no stdin).
+        pub fn cmd_pf_load_anchor(id: &str, path: &str) -> Vec<String> {
+            vec![
+                "pfctl".into(),
+                "-a".into(),
+                pf_anchor(id),
+                "-f".into(),
+                path.into(),
+            ]
+        }
+
+        /// Build `pfctl -a bore_vpn/<id> -F all` argv (flush the link's anchor —
+        /// RAII teardown + SIGKILL `stale_reclaim`, by id alone).
+        pub fn cmd_pf_flush_anchor(id: &str) -> Vec<String> {
+            vec![
+                "pfctl".into(),
+                "-a".into(),
+                pf_anchor(id),
+                "-F".into(),
+                "all".into(),
+            ]
+        }
+
+        /// Build `pfctl -a bore_vpn/<id> -sa` argv (show all rules in the anchor;
+        /// diagnostics).
+        pub fn cmd_pf_show_anchor(id: &str) -> Vec<String> {
+            vec!["pfctl".into(), "-a".into(), pf_anchor(id), "-sa".into()]
+        }
+
+        /// Compose the per-link PF anchor ruleset (the macOS twin of
+        /// [`super::gateway_nft_cmds`]). Returns the full ruleset text the runtime
+        /// writes to a temp file and loads via [`cmd_pf_load_anchor`].
+        ///
+        /// - `tun` / `lan_if`: TUN (utunN) and LAN egress interface
+        /// - `advertised`: REAL local subnets (gateway mode)
+        /// - `nat_maps`: `(real, virtual)` 1:1 netmap pairs (empty ⇒ plain masquerade)
+        /// - `hub`: add spoke-isolation block
+        /// - `nat_masquerade`: masquerade NAT'd subnets toward the LAN (F2 parity)
+        /// - `forward_accept`: emit PF `pass` for tun↔LAN (macOS semantics, see docs)
+        /// - `mss`: TCP MSS clamp value (caller passes `mtu - 40`)
+        ///
+        /// Rule ordering follows pfctl sections: scrub, then nat/binat (translation),
+        /// then filter (block/pass). PROVISIONAL syntax — validated by the Phase 0 spike.
+        #[allow(clippy::too_many_arguments)]
+        pub fn pf_ruleset(
+            tun: &str,
+            lan_if: &str,
+            advertised: &[crate::shared::Ipv4Net],
+            nat_maps: &[(crate::shared::Ipv4Net, crate::shared::Ipv4Net)],
+            hub: bool,
+            nat_masquerade: bool,
+            forward_accept: bool,
+            mss: u16,
+        ) -> String {
+            let mut out = String::new();
+            out.push_str(
+                "# bore vpn macOS PF anchor ruleset (PROVISIONAL — Phase 0 spike validates)\n",
+            );
+
+            // ── scrub / MSS clamp ───────────────────────────────────────────────
+            out.push_str(&format!("scrub on {tun} all max-mss {mss}\n"));
+
+            // ── translation: nat / binat ────────────────────────────────────────
+            // Plain (non-NAT) advertised subnets → destination-scoped masquerade.
+            for plain in advertised
+                .iter()
+                .filter(|p| !nat_maps.iter().any(|(r, _)| r == *p))
+            {
+                out.push_str(&format!(
+                    "nat on {lan_if} from any to {plain} -> ({lan_if})\n"
+                ));
+            }
+            // NAT'd subnets → bidirectional 1:1 binat (host bits preserved).
+            for (real, virt) in nat_maps {
+                out.push_str(&format!("binat on {lan_if} from {real} to any -> {virt}\n"));
+            }
+            // F2 parity: also masquerade NAT'd subnets toward the LAN (opt-in) so
+            // hosts behind a non-router gateway reply on-link.
+            if nat_masquerade {
+                for (real, _virt) in nat_maps {
+                    out.push_str(&format!(
+                        "nat on {lan_if} from any to {real} -> ({lan_if})\n"
+                    ));
+                }
+            }
+
+            // ── filter: block / pass ────────────────────────────────────────────
+            if hub {
+                // Spoke isolation: drop spoke↔spoke (both in the tun's network).
+                out.push_str(&format!(
+                    "block in on {tun} from ({tun}:network) to ({tun}:network)\n"
+                ));
+            }
+            if forward_accept {
+                // macOS has no Docker FORWARD-DROP; emit pass for tun↔LAN so a PF
+                // default-block policy still forwards. Semantics differ from Linux.
+                out.push_str(&format!("pass on {tun} all\n"));
+                out.push_str(&format!("pass on {lan_if} from ({tun}:network) to any\n"));
+            }
+
+            out
         }
     }
 
@@ -2962,6 +3159,116 @@ pub mod hostcfg_cmd {
                 macos::cmd_link_set_mtu("utun4", 1400),
                 vec!["ifconfig", "utun4", "mtu", "1400"]
             );
+            assert_eq!(
+                macos::cmd_route_get("192.168.1.1"),
+                vec!["route", "-n", "get", "192.168.1.1"]
+            );
+            assert_eq!(
+                macos::cmd_addr_add("utun4", "10.99.0.1", "10.99.0.2"),
+                vec!["ifconfig", "utun4", "inet", "10.99.0.1", "10.99.0.2", "up"]
+            );
+            assert_eq!(
+                macos::cmd_link_set_up("utun4"),
+                vec!["ifconfig", "utun4", "up"]
+            );
+            assert_eq!(
+                macos::cmd_sysctl_ip_forward(1),
+                vec!["sysctl", "-w", "net.inet.ip.forwarding=1"]
+            );
+            assert_eq!(
+                macos::cmd_sysctl_get_ip_forward(),
+                vec!["sysctl", "-n", "net.inet.ip.forwarding"]
+            );
+            assert_eq!(macos::pf_anchor("adv"), "bore_vpn/adv");
+            assert_eq!(macos::cmd_pf_enable(), vec!["pfctl", "-e"]);
+            assert_eq!(macos::cmd_pf_disable(), vec!["pfctl", "-d"]);
+            assert_eq!(
+                macos::cmd_pf_load_anchor("adv", "/tmp/bore_adv.pf"),
+                vec!["pfctl", "-a", "bore_vpn/adv", "-f", "/tmp/bore_adv.pf"]
+            );
+            assert_eq!(
+                macos::cmd_pf_flush_anchor("adv"),
+                vec!["pfctl", "-a", "bore_vpn/adv", "-F", "all"]
+            );
+            assert_eq!(
+                macos::cmd_pf_show_anchor("adv"),
+                vec!["pfctl", "-a", "bore_vpn/adv", "-sa"]
+            );
+        }
+
+        #[test]
+        fn macos_parse_lan_iface_from_route_get() {
+            // Real `route -n get` shape (macOS).
+            let out = "   route to: 192.168.1.1\ndestination: 192.168.1.1\n   \
+                       interface: en0\n      flags: <UP,HOST,DONE,LLINFO>\n";
+            assert_eq!(macos::parse_lan_iface(out), Some("en0".to_string()));
+            // Missing interface line → None.
+            assert_eq!(macos::parse_lan_iface("   route to: 1.2.3.4\n"), None);
+            assert_eq!(macos::parse_lan_iface(""), None);
+        }
+
+        fn n(s: &str) -> crate::shared::Ipv4Net {
+            s.parse().unwrap()
+        }
+
+        #[test]
+        fn macos_pf_ruleset_plain_only() {
+            // Plain advertised subnet, no NAT → dst-scoped masquerade + MSS clamp.
+            let rs = macos::pf_ruleset(
+                "utun4",
+                "en0",
+                &[n("192.168.50.0/24")],
+                &[],
+                false,
+                false,
+                false,
+                1310,
+            );
+            assert!(rs.contains("scrub on utun4 all max-mss 1310"));
+            assert!(rs.contains("nat on en0 from any to 192.168.50.0/24 -> (en0)"));
+            assert!(!rs.contains("binat"));
+            assert!(!rs.contains("block"));
+            assert!(!rs.contains("pass on"));
+        }
+
+        #[test]
+        fn macos_pf_ruleset_netmap_uses_binat_not_masquerade() {
+            // NAT'd subnet → binat (1:1, host-bit preserving); no plain nat for it.
+            let rs = macos::pf_ruleset(
+                "utun4",
+                "en0",
+                &[n("192.168.1.0/24")],
+                &[(n("192.168.1.0/24"), n("10.30.0.0/24"))],
+                false,
+                false,
+                false,
+                1310,
+            );
+            assert!(rs.contains("binat on en0 from 192.168.1.0/24 to any -> 10.30.0.0/24"));
+            // The NAT'd real must NOT get a plain `nat` rule (it is binat-only).
+            assert!(!rs.contains("nat on en0 from any to 192.168.1.0/24"));
+        }
+
+        #[test]
+        fn macos_pf_ruleset_nat_masquerade_and_hub_and_forward_accept() {
+            let rs = macos::pf_ruleset(
+                "utun4",
+                "en0",
+                &[n("192.168.1.0/24")],
+                &[(n("192.168.1.0/24"), n("10.30.0.0/24"))],
+                true, // hub
+                true, // nat_masquerade
+                true, // forward_accept
+                1310,
+            );
+            assert!(rs.contains("binat on en0 from 192.168.1.0/24 to any -> 10.30.0.0/24"));
+            // F2 parity: NAT'd real also masqueraded toward the LAN.
+            assert!(rs.contains("nat on en0 from any to 192.168.1.0/24 -> (en0)"));
+            // Hub spoke isolation.
+            assert!(rs.contains("block in on utun4 from (utun4:network) to (utun4:network)"));
+            // forward-accept PF pass (macOS semantics).
+            assert!(rs.contains("pass on utun4 all"));
+            assert!(rs.contains("pass on en0 from (utun4:network) to any"));
         }
 
         #[test]

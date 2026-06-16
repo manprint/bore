@@ -1066,6 +1066,23 @@ RUST_LOG=bore_cli::vpn=trace,bore_cli::vpn_server=trace sudo -E bore vpn connect
 
 ## 19. Known Limitations
 
+### Platform support — `bore vpn` is Linux-only (today)
+
+The VPN client (`bore vpn listen` / `connect`) requires Linux (TUN + nftables/iptables +
+`ip_forward` + network namespaces) and is built with `--features vpn`. On macOS/Windows the `vpn`
+subcommand is not compiled in.
+
+| Capability | Linux | macOS | Windows |
+|---|---|---|---|
+| `bore local` / `proxy` / `server` / `transfer` / `test-udp` | ✅ | ✅ | ✅ |
+| UDP direct path (QUIC hole-punch) | ✅ | ✅ (no `SO_*BUFFORCE` tuning) | ✅ |
+| `bore server --vpn` (relay/broker only) | ✅ | ✅ | ✅ |
+| **`bore vpn listen` / `connect`** | ✅ | 🚧 in progress | ⏳ planned |
+
+A macOS port is underway (utun + PF backend); groundwork (command/ruleset builders + tests) has
+landed, the runtime is pending. See `docs/vpn/VPN_MACOS.md` and `docs/vpn/VPN_MACOS_PORT_PLAN.md`.
+A macOS box can already act as the VPN **server** (`bore server --vpn`) for Linux peers.
+
 ### IPv4 only
 
 v1 supports IPv4. IPv6 and dual-stack are not implemented. The overlay addresses, `--vpn-pool`, `--vpn-addr`, and `--advertise` all accept IPv4 only.

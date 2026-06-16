@@ -247,5 +247,22 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   `--nat-masquerade` for the return path when the gateway is not the LAN router (I-NAT5) — the two
   are orthogonal; the field repro needed BOTH.
 
+**VPN macOS port (groundwork only, runtime PENDING a Mac):**
+- The `vpn` module + `Vpn` subcommand are gated `cfg(all(feature="vpn", target_os="linux"))` — VPN
+  is **Linux-only today**. macOS port plan: `docs/vpn/VPN_MACOS_PORT_PLAN.md`; backend ref:
+  `docs/vpn/VPN_MACOS.md`. Decisions LOCKED: Apple Silicon macOS 13+, `--forward-accept`=PF `pass`,
+  GitHub macos CI runner, Windows deferred.
+- DEC-M1 (zero-regression contract): the Linux `NetConfig::apply`/`Drop`/`stale_reclaim` + ALL
+  `cmd_nft_*`/`cmd_iptables_*`/`cmd_*` builders stay BYTE-FOR-BYTE under `#[cfg(target_os="linux")]`.
+  macOS is an additive `#[cfg(target_os="macos")]` twin (compile-time split, NOT a runtime trait).
+  Reuse the generic `CommandRunner` + `revert_cmds` argv stack + `NetConfig` fields + the
+  platform-agnostic data plane (bridge/AEAD/carriers/relay/QUIC/PMTU).
+- LANDED (2026-06-16): `Cargo.toml` makes `tun-rs` available on the macOS target (`procfs` stays
+  Linux-only); `hostcfg_cmd::macos` has the full PURE builder set + `pf_ruleset` composer (macOS twin
+  of `gateway_nft_cmds`) + `parse_lan_iface`, snapshot-tested on the Linux CI. PF mapping: `binat`=1:1
+  netmap (host-bit preserving), `nat`=masquerade, `scrub max-mss`=MSS clamp, `block`=spoke isolation.
+  PF syntax is PROVISIONAL until the Phase 0 Mac spike. The module `cfg` gate is NOT flipped — Linux
+  build/runtime byte-identical, macOS still has no `vpn` subcommand until the runtime lands.
+
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

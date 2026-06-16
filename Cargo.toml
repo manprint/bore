@@ -64,6 +64,12 @@ nix = { version = "0.29.0", features = ["fs", "user", "socket"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.18"
+
+# TUN device backend. Available on Linux AND macOS (utun); the `vpn` feature pulls
+# it. Linux uses GSO/GRO offload + multi-queue; macOS uses the basic utun path
+# (offload/multi_queue are Linux-only in tun-rs). The macOS host-config runtime is
+# gated separately — see docs/vpn/VPN_MACOS_PORT_PLAN.md.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 tun-rs = { version = "2.8.5", optional = true, features = ["async"] }
 
 [dev-dependencies]

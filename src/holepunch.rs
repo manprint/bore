@@ -1139,6 +1139,26 @@ impl DirectConn {
         }
     }
 
+    /// Send an IP packet as a QUIC datagram, AWAITING send-buffer room instead of
+    /// dropping the oldest queued datagram when the buffer is full.
+    ///
+    /// This is the backpressure path (VPN F3): the plain [`send_datagram`] is
+    /// non-blocking and quinn silently drops the OLDEST queued datagram on a full
+    /// buffer, which the tunnelled TCP reads as loss and reacts to by collapsing
+    /// its window — congestion masquerading as loss. Awaiting room instead pauses
+    /// the caller (the uplink task), the kernel TUN queue fills, and the inner
+    /// senders pace themselves to the real drain rate. Caller MUST be a dedicated
+    /// per-link task: a shared pump would head-of-line block every other flow.
+    ///
+    /// `TooLarge` stays a per-packet drop (not awaitable); `Err` is link death.
+    pub async fn send_datagram_wait(&self, pkt: bytes::Bytes) -> Result<DatagramSend> {
+        match self.conn.send_datagram_wait(pkt).await {
+            Ok(()) => Ok(DatagramSend::Sent),
+            Err(quinn::SendDatagramError::TooLarge) => Ok(DatagramSend::TooLarge),
+            Err(e) => Err(anyhow::anyhow!("send_datagram_wait: {e}")),
+        }
+    }
+
     /// Read the next QUIC datagram. Resolves when a datagram arrives or the
     /// connection closes (in which case `Err` signals path death to the bridge).
     pub async fn read_datagram(&self) -> Result<bytes::Bytes> {

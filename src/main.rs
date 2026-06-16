@@ -915,6 +915,12 @@ struct VpnListenArgs {
     #[clap(long, value_name = "N", default_value_t = 1350u16)]
     mtu: u16,
 
+    /// Pin --mtu: keep it fixed for the link lifetime (tests/benchmarks). The
+    /// direct-path PMTU monitor then only WARNS when the path MTU is smaller,
+    /// instead of resizing the TUN to follow it. Off by default (auto-tune).
+    #[clap(long)]
+    pin_mtu: bool,
+
     /// Print route/NAT commands instead of running them (interface is still created).
     #[clap(long)]
     no_route_manage: bool,
@@ -1055,6 +1061,12 @@ struct VpnConnectArgs {
     /// Interface MTU.
     #[clap(long, value_name = "N", default_value_t = 1350u16)]
     mtu: u16,
+
+    /// Pin --mtu: keep it fixed for the link lifetime (tests/benchmarks). The
+    /// direct-path PMTU monitor then only WARNS when the path MTU is smaller,
+    /// instead of resizing the TUN to follow it. Off by default (auto-tune).
+    #[clap(long)]
+    pin_mtu: bool,
 
     /// Print route/NAT commands instead of running them (interface is still created).
     #[clap(long)]
@@ -1518,6 +1530,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     addr_request,
                     tun_name: args.tun_name,
                     mtu: args.mtu,
+                    pin_mtu: args.pin_mtu,
                     no_route_manage: args.no_route_manage,
                     nat_masquerade: args.nat_masquerade,
                     stun_server: args.stun_server,
@@ -1584,6 +1597,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     addr_request,
                     tun_name: args.tun_name,
                     mtu: args.mtu,
+                    pin_mtu: args.pin_mtu,
                     no_route_manage: args.no_route_manage,
                     nat_masquerade: args.nat_masquerade,
                     stun_server: args.stun_server,

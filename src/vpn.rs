@@ -26,6 +26,9 @@ pub struct VpnListenArgs {
     pub tun_name: String,
     /// Interface MTU.
     pub mtu: u16,
+    /// Pin `--mtu`: the direct-path PMTU monitor only WARNS when the path MTU is
+    /// smaller, never resizes the TUN (for tests/benchmarks). Off = dynamic.
+    pub pin_mtu: bool,
     /// Skip route/NAT management.
     pub no_route_manage: bool,
     /// STUN server.
@@ -77,6 +80,9 @@ pub struct VpnConnectArgs {
     pub tun_name: String,
     /// Interface MTU.
     pub mtu: u16,
+    /// Pin `--mtu`: the direct-path PMTU monitor only WARNS when the path MTU is
+    /// smaller, never resizes the TUN (for tests/benchmarks). Off = dynamic.
+    pub pin_mtu: bool,
     /// Skip route/NAT management.
     pub no_route_manage: bool,
     /// STUN server.
@@ -621,6 +627,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
                 nat_udp_preferred_port: args.nat_udp_preferred_port,
                 tun_name: &tun_name,
                 mtu: args.mtu,
+                pin_mtu: args.pin_mtu,
                 carriers,
             },
             admin_v2,
@@ -632,6 +639,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
             event_rx,
             upgrade_tx,
             downgrade_rx,
+            Arc::clone(&counters),
         )))
     };
     drop(out_tx);
@@ -769,6 +777,16 @@ enum DirectSide {
     Connector,
 }
 
+impl DirectSide {
+    /// Short role label for diagnostic logs.
+    fn diag_role(self) -> &'static str {
+        match self {
+            DirectSide::Listener => "listener",
+            DirectSide::Connector => "connector",
+        }
+    }
+}
+
 /// Inputs for [`direct_upgrade_task`], captured from the link args + pairing.
 struct DirectUpgradeCtx {
     side: DirectSide,
@@ -786,6 +804,8 @@ struct DirectUpgradeCtx {
     tun_name: String,
     /// Initial TUN MTU (the PMTU monitor's starting point).
     mtu: u16,
+    /// Pin `--mtu`: PMTU monitor observes/warns but never resizes the TUN.
+    pin_mtu: bool,
     /// Subnets this node routes INTO the TUN (`peer_routes`). A direct-path
     /// candidate whose IP falls inside one of these is only "reachable" by
     /// looping back through the VPN itself: the QUIC handshake rides the relay
@@ -820,6 +840,7 @@ impl DirectUpgradeCtx {
             admin_v2,
             tun_name: args.tun_name.to_string(),
             mtu: args.mtu,
+            pin_mtu: args.pin_mtu,
             tunneled_subnets,
             carriers: args.carriers.max(1),
         }
@@ -836,6 +857,8 @@ struct CommonDirectArgs<'a> {
     nat_udp_preferred_port: u16,
     tun_name: &'a str,
     mtu: u16,
+    /// Pin `--mtu`: PMTU monitor observes/warns but never resizes the TUN.
+    pin_mtu: bool,
     /// Negotiated direct-path carrier count (Fix #3a).
     carriers: u16,
 }
@@ -883,6 +906,7 @@ async fn direct_upgrade_task(
     mut event_rx: tokio::sync::mpsc::Receiver<CtrlEvent>,
     upgrade_tx: tokio::sync::mpsc::Sender<(link::LinkSender, link::LinkRecver)>,
     mut downgrade_rx: tokio::sync::mpsc::Receiver<()>,
+    counters: Arc<bridge::BridgeCounters>,
 ) {
     let mut ticker = tokio::time::interval(DIRECT_RETRY_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -890,7 +914,7 @@ async fn direct_upgrade_task(
     'retry: loop {
         ticker.tick().await; // immediate on the first iteration
         attempt += 1;
-        match try_direct_upgrade(&ctx, &out_tx, &mut event_rx, &upgrade_tx).await {
+        match try_direct_upgrade(&ctx, &out_tx, &mut event_rx, &upgrade_tx, &counters).await {
             Ok(()) => {
                 // Direct is up. Block until the bridge tells us it fell back, then re-arm.
                 match downgrade_rx.recv().await {
@@ -968,6 +992,7 @@ async fn try_direct_upgrade(
     out_tx: &tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
     event_rx: &mut tokio::sync::mpsc::Receiver<CtrlEvent>,
     upgrade_tx: &tokio::sync::mpsc::Sender<(link::LinkSender, link::LinkRecver)>,
+    counters: &Arc<bridge::BridgeCounters>,
 ) -> Result<()> {
     // 1. UDP socket (0 = ephemeral port).
     let socket = crate::holepunch::bind_socket(ctx.nat_udp_preferred_port).await?;
@@ -1085,11 +1110,26 @@ async fn try_direct_upgrade(
     //    carriers share one punched socket/path, so the first carrier's MTU is
     //    representative for the monitor.
     let monitor_conn = conns[0].clone();
+    // Clone every carrier handle for the read-only diagnostics task BEFORE the
+    // conns vec is moved into the link. `DirectConn` is Arc-backed, so this is a
+    // refcount bump, not a connection copy.
+    let diag_conns: Vec<_> = conns.to_vec();
     upgrade_tx
         .send(link::make_direct_multi(conns))
         .await
         .map_err(|_| anyhow!("bridge closed before the direct upgrade"))?;
-    tokio::spawn(pmtu_monitor(monitor_conn, ctx.tun_name.clone(), ctx.mtu));
+    tokio::spawn(pmtu_monitor(
+        monitor_conn,
+        ctx.tun_name.clone(),
+        ctx.mtu,
+        ctx.pin_mtu,
+    ));
+    tokio::spawn(direct_diag(
+        diag_conns,
+        Arc::clone(counters),
+        ctx.link_id.clone(),
+        ctx.side.diag_role(),
+    ));
     info!(link_id = %ctx.link_id, path = "direct", "vpn path upgraded to direct QUIC");
     if ctx.admin_v2 {
         let _ = out_tx
@@ -1171,7 +1211,12 @@ fn pmtu_shrink_now(current_mtu: u16, sample: usize) -> Option<u16> {
 /// exits when the QUIC connection closes (link teardown or path death). No MTU
 /// revert is needed: the TUN is destroyed at teardown (DEC-5), and the nft MSS
 /// clamp uses `rt mtu`, adapting on its own.
-async fn pmtu_monitor(conn: crate::holepunch::DirectConn, tun_name: String, initial_mtu: u16) {
+async fn pmtu_monitor(
+    conn: crate::holepunch::DirectConn,
+    tun_name: String,
+    initial_mtu: u16,
+    pin: bool,
+) {
     use futures_util::FutureExt;
     // Anti-flap (Fix #2): a grow followed by a shrink back within this many
     // ticks marks the grown size as a black hole — quinn re-probed an MTU the
@@ -1182,6 +1227,13 @@ async fn pmtu_monitor(conn: crate::holepunch::DirectConn, tun_name: String, init
     const RECENT_GROW_TICKS: u32 = 6; // 30 s
     const CEILING_DECAY_TICKS: u32 = 60; // 5 min
 
+    if pin {
+        info!(
+            tun = %tun_name,
+            mtu = initial_mtu,
+            "PMTU monitor OBSERVE-ONLY (--pin-mtu): warns on a path-MTU shortfall but never resizes the TUN"
+        );
+    }
     let runner = hostcfg::RealRunner;
     let mut current = initial_mtu;
     let mut samples: Vec<usize> = Vec::new();
@@ -1189,6 +1241,7 @@ async fn pmtu_monitor(conn: crate::holepunch::DirectConn, tun_name: String, init
     let mut last_grown_to: u16 = 0;
     let mut ticks_since_grow: u32 = u32::MAX;
     let mut stable_ticks: u32 = 0;
+    let mut warned_small = false;
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
     loop {
         tokio::select! {
@@ -1201,6 +1254,31 @@ async fn pmtu_monitor(conn: crate::holepunch::DirectConn, tun_name: String, init
         let Some(max_datagram) = conn.max_datagram_size() else {
             continue;
         };
+        // Pinned (--pin-mtu): never resize the TUN. Only WARN when the path MTU
+        // falls below the pinned TUN MTU (full-size packets are being dropped as
+        // TooLarge) and INFO when it recovers, so a benchmark sees the diagnosis
+        // without the MTU moving under it. `warned_small` edge-triggers to avoid
+        // log spam.
+        if pin {
+            let path_too_small = max_datagram < current as usize;
+            if path_too_small && !warned_small {
+                warned_small = true;
+                tracing::warn!(
+                    pinned_mtu = current,
+                    path_max_datagram = max_datagram,
+                    "pinned --mtu exceeds the direct path MTU: full-size packets are being DROPPED (TooLarge). \
+                     Lower --mtu to <= {max_datagram} for this path, or drop --pin-mtu to let it auto-tune"
+                );
+            } else if !path_too_small && warned_small {
+                warned_small = false;
+                tracing::info!(
+                    pinned_mtu = current,
+                    path_max_datagram = max_datagram,
+                    "direct path MTU now accommodates the pinned --mtu again"
+                );
+            }
+            continue;
+        }
         samples.push(max_datagram);
         if samples.len() > 3 {
             samples.remove(0);
@@ -1261,6 +1339,136 @@ async fn pmtu_monitor(conn: crate::holepunch::DirectConn, tun_name: String, init
                 }
             }
         }
+    }
+}
+
+/// Background diagnostic dump (DEBUG): per-carrier QUIC stats on the direct
+/// path, logged as 5 s INTERVAL DELTAS so loss/throughput RATES are visible (not
+/// just cumulative totals). Purely observational — reads `conn.stats()`,
+/// `max_datagram_size()` and the shared bridge counters; never mutates link
+/// state, so it cannot itself change throughput. One task per direct upgrade;
+/// exits when the carrier set closes (link teardown or fallback to relay).
+///
+/// Targets the open bandwidth hypotheses:
+/// - send-buffer datagram drops (`buffer_drop_est` = app datagrams submitted
+///   minus datagrams framed on the wire): quinn silently drops the OLDEST queued
+///   datagram when its send buffer is full, which the tunnelled TCP sees as loss.
+/// - single-flow loss bound: `lost_pct`, `cwnd`, `cong_events_d` per carrier.
+/// - PMTU black-hole flap: `quic_mtu`, `max_datagram`, `black_holes`,
+///   `plpmtud_lost_d`.
+/// - BDP headroom: `rtt_ms` × link rate vs `cwnd`.
+async fn direct_diag(
+    conns: Vec<crate::holepunch::DirectConn>,
+    counters: Arc<bridge::BridgeCounters>,
+    link_id: String,
+    role: &'static str,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const TICK_SECS: f64 = 5.0;
+    let r1 = |x: f64| (x * 10.0).round() / 10.0;
+    let r2 = |x: f64| (x * 100.0).round() / 100.0;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    // Baseline snapshot (type inferred from `stats()` — avoids naming quinn here).
+    let mut prev: Vec<_> = conns.iter().map(|c| c.stats()).collect();
+    let (mut p_txp, mut p_txb, mut p_rxp, mut p_rxb) = (
+        counters.tx_pkts.load(Relaxed),
+        counters.tx_bytes.load(Relaxed),
+        counters.rx_pkts.load(Relaxed),
+        counters.rx_bytes.load(Relaxed),
+    );
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = conns[0].closed() => return,
+        }
+        // App-level deltas (bridge counters are shared across all carriers).
+        let txp = counters.tx_pkts.load(Relaxed);
+        let txb = counters.tx_bytes.load(Relaxed);
+        let rxp = counters.rx_pkts.load(Relaxed);
+        let rxb = counters.rx_bytes.load(Relaxed);
+        let txd = counters.tx_drops.load(Relaxed);
+        let (txp_d, txb_d, rxp_d, rxb_d) = (
+            txp.saturating_sub(p_txp),
+            txb.saturating_sub(p_txb),
+            rxp.saturating_sub(p_rxp),
+            rxb.saturating_sub(p_rxb),
+        );
+        (p_txp, p_txb, p_rxp, p_rxb) = (txp, txb, rxp, rxb);
+
+        let mut dgram_tx_d_sum = 0u64;
+        let mut dgram_rx_d_sum = 0u64;
+        for (i, c) in conns.iter().enumerate() {
+            let s = c.stats();
+            let pv = &prev[i];
+            let sent_d = s.path.sent_packets.saturating_sub(pv.path.sent_packets);
+            let lost_d = s.path.lost_packets.saturating_sub(pv.path.lost_packets);
+            let lostb_d = s.path.lost_bytes.saturating_sub(pv.path.lost_bytes);
+            let cong_d = s
+                .path
+                .congestion_events
+                .saturating_sub(pv.path.congestion_events);
+            let pp_sent_d = s
+                .path
+                .sent_plpmtud_probes
+                .saturating_sub(pv.path.sent_plpmtud_probes);
+            let pp_lost_d = s
+                .path
+                .lost_plpmtud_probes
+                .saturating_sub(pv.path.lost_plpmtud_probes);
+            let dtx_d = s.frame_tx.datagram.saturating_sub(pv.frame_tx.datagram);
+            let drx_d = s.frame_rx.datagram.saturating_sub(pv.frame_rx.datagram);
+            let utx_b_d = s.udp_tx.bytes.saturating_sub(pv.udp_tx.bytes);
+            let urx_b_d = s.udp_rx.bytes.saturating_sub(pv.udp_rx.bytes);
+            dgram_tx_d_sum += dtx_d;
+            dgram_rx_d_sum += drx_d;
+            let lost_pct = if sent_d > 0 {
+                r2(lost_d as f64 / sent_d as f64 * 100.0)
+            } else {
+                0.0
+            };
+            tracing::debug!(
+                %link_id,
+                role,
+                carrier = i,
+                rtt_ms = r1(s.path.rtt.as_secs_f64() * 1000.0),
+                cwnd = s.path.cwnd,
+                quic_mtu = s.path.current_mtu,
+                max_datagram = ?c.max_datagram_size(),
+                sent_pkts_d = sent_d,
+                lost_pkts_d = lost_d,
+                lost_bytes_d = lostb_d,
+                lost_pct,
+                cong_events_d = cong_d,
+                black_holes = s.path.black_holes_detected,
+                plpmtud_sent_d = pp_sent_d,
+                plpmtud_lost_d = pp_lost_d,
+                dgram_tx_d = dtx_d,
+                dgram_rx_d = drx_d,
+                tx_mbit_s = r1(utx_b_d as f64 * 8.0 / TICK_SECS / 1e6),
+                rx_mbit_s = r1(urx_b_d as f64 * 8.0 / TICK_SECS / 1e6),
+                "direct carrier quic stats (5s delta)"
+            );
+            prev[i] = s;
+        }
+        // App-submitted vs quic-framed datagrams: the gap is the send-buffer drop
+        // (hypothesis #1). Saturating: snapshot lag / keepalives can make it
+        // momentarily negative. `tx_drops_total` is the SEPARATE TooLarge/MTU
+        // counter (oversized packets rejected before queueing) — not buffer drops.
+        let buffer_drop_est = txp_d.saturating_sub(dgram_tx_d_sum);
+        tracing::debug!(
+            %link_id,
+            role,
+            carriers = conns.len(),
+            app_tx_pkts_d = txp_d,
+            app_rx_pkts_d = rxp_d,
+            app_tx_mbit_s = r1(txb_d as f64 * 8.0 / TICK_SECS / 1e6),
+            app_rx_mbit_s = r1(rxb_d as f64 * 8.0 / TICK_SECS / 1e6),
+            quic_dgram_tx_d = dgram_tx_d_sum,
+            quic_dgram_rx_d = dgram_rx_d_sum,
+            buffer_drop_est,
+            tx_drops_total = txd,
+            "direct app<->quic datagram accounting (5s delta)"
+        );
     }
 }
 
@@ -1495,6 +1703,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
                 nat_udp_preferred_port: args.nat_udp_preferred_port,
                 tun_name: &tun_name,
                 mtu: args.mtu,
+                pin_mtu: args.pin_mtu,
                 carriers,
             },
             admin_v2,
@@ -1506,6 +1715,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
             event_rx,
             upgrade_tx,
             downgrade_rx,
+            Arc::clone(&counters),
         )))
     };
     drop(out_tx);
@@ -4849,6 +5059,41 @@ pub mod link {
         Ok(Some(acc.split_to(total_len).freeze()))
     }
 
+    /// Pick a direct-path carrier for an IP packet by hashing its flow key, so
+    /// every packet of one inner connection rides the same carrier and stays in
+    /// order (VPN F2). `n <= 1` always returns 0 — the legacy single-carrier path,
+    /// byte-for-byte. IPv4 TCP/UDP hash the full 5-tuple (proto + src/dst addr +
+    /// port pair); other IPv4 hash proto + addresses; anything else degrades to a
+    /// stable bucket. Steering is per-sender/per-direction — symmetry is not
+    /// required, only per-flow consistency within one direction.
+    fn flow_carrier(pkt: &[u8], n: usize) -> usize {
+        if n <= 1 {
+            return 0;
+        }
+        #[inline]
+        fn mix(h: u64, b: u8) -> u64 {
+            (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+        if pkt.len() >= 20 && (pkt[0] >> 4) == 4 {
+            let proto = pkt[9];
+            h = mix(h, proto);
+            for &b in &pkt[12..20] {
+                h = mix(h, b); // src + dst IPv4
+            }
+            let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+            // TCP(6)/UDP(17): fold in the port pair (first 4 L4 bytes).
+            if (proto == 6 || proto == 17) && pkt.len() >= ihl + 4 {
+                for &b in &pkt[ihl..ihl + 4] {
+                    h = mix(h, b);
+                }
+            }
+        } else if let Some(&b0) = pkt.first() {
+            h = mix(h, b0);
+        }
+        (h % n as u64) as usize
+    }
+
     impl LinkSender {
         /// Send a batch of IP packets. For Direct: QUIC datagrams. For Relay: AEAD frames.
         ///
@@ -4858,17 +5103,44 @@ pub mod link {
         /// not abort the rest of the batch nor tear the link down; the caller
         /// counts them and continues. `Err` is reserved for genuine link death.
         pub async fn send_batch(&mut self, pkts: &[Bytes]) -> Result<usize> {
+            self.send_batch_inner(pkts, false).await
+        }
+
+        /// Like [`send_batch`] but applies BACKPRESSURE on the direct path (VPN
+        /// F3): when the QUIC datagram send buffer is full the call AWAITS room
+        /// instead of letting quinn silently drop the oldest queued datagram.
+        /// Dropping looks like loss to the tunnelled TCP and collapses its window;
+        /// awaiting pauses the TUN read so the kernel TUN queue backpressures the
+        /// inner senders to the real drain rate. Use ONLY from a dedicated per-link
+        /// uplink task (the 1:1 bridge): the shared hub router must NOT block here
+        /// or one congested peer head-of-line blocks every other peer.
+        pub async fn send_batch_wait(&mut self, pkts: &[Bytes]) -> Result<usize> {
+            self.send_batch_inner(pkts, true).await
+        }
+
+        async fn send_batch_inner(&mut self, pkts: &[Bytes], backpressure: bool) -> Result<usize> {
             match self {
-                LinkSender::Direct { conns, rr } => {
+                LinkSender::Direct { conns, .. } => {
                     let mut dropped = 0usize;
+                    let n = conns.len();
                     for pkt in pkts {
-                        // Round-robin per datagram across carriers (DEC-7 style:
-                        // reorder OK, IP is best-effort). One carrier → always
-                        // index 0, byte-identical to the legacy path.
-                        *rr = (*rr + 1) % conns.len();
-                        // Skip oversized packets (path MTU < TUN MTU window);
-                        // a real send error propagates and tears down the link.
-                        match conns[*rr].send_datagram(pkt.clone())? {
+                        // Flow-pinned steering (VPN F2): every packet of one inner
+                        // 5-tuple rides the SAME carrier, so a single flow is never
+                        // reordered across carriers — per-datagram round-robin
+                        // reordered it and the tunnelled TCP read that as loss,
+                        // cratering throughput (see docs/vpn/VPN_BANDWIDTH_*).
+                        // Distinct flows still hash to different carriers, so N
+                        // carriers give N-flow parallelism. `n == 1` → 0, the
+                        // legacy single-carrier path byte-for-byte.
+                        let idx = flow_carrier(pkt, n);
+                        // Oversized (path MTU < TUN MTU) is a per-packet drop, never
+                        // link death; a real send error propagates and tears down.
+                        let outcome = if backpressure {
+                            conns[idx].send_datagram_wait(pkt.clone()).await?
+                        } else {
+                            conns[idx].send_datagram(pkt.clone())?
+                        };
+                        match outcome {
                             crate::holepunch::DatagramSend::Sent => {}
                             crate::holepunch::DatagramSend::TooLarge => dropped += 1,
                         }
@@ -4881,14 +5153,16 @@ pub mod link {
                     counter,
                     rr,
                 } => {
+                    // Relay carriers are independent RELIABLE streams: per-datagram
+                    // round-robin is kept (DEC-7 — reorder is bounded and the replay
+                    // window is sized for it), and the bounded channel already
+                    // applies backpressure, so `backpressure` is a no-op here.
+                    let _ = backpressure;
                     for pkt in pkts {
                         // Shared atomic counter: unique nonce even with multiple
                         // producers on the same egress key (I-5, DEC-6).
                         let ctr = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let frame = super::crypto::seal_with_counter(key, ctr, pkt)?;
-                        // Round-robin per datagram (DEC-7). A full queue blocks
-                        // (backpressure, I-4) — no skip-to-next: simple and
-                        // predictable.
                         *rr = (*rr + 1) % txs.len();
                         txs[*rr].send(Bytes::from(frame)).await.map_err(|_| {
                             anyhow::anyhow!("relay writer exited (write error on relay stream)")
@@ -4985,6 +5259,47 @@ pub mod link {
         use super::*;
         use bytes::Bytes;
         use tokio::sync::mpsc;
+
+        /// Build a minimal IPv4 TCP packet for flow-steering tests.
+        fn ipv4_tcp(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16) -> Vec<u8> {
+            let mut p = vec![0u8; 24];
+            p[0] = 0x45; // version 4, IHL 5 (20 bytes)
+            p[9] = 6; // TCP
+            p[12..16].copy_from_slice(&src);
+            p[16..20].copy_from_slice(&dst);
+            p[20..22].copy_from_slice(&sport.to_be_bytes());
+            p[22..24].copy_from_slice(&dport.to_be_bytes());
+            p
+        }
+
+        /// F2: `flow_carrier` pins one flow to one carrier (in-order), `n == 1`
+        /// is always 0 (legacy byte-identical), and distinct flows spread.
+        #[test]
+        fn flow_carrier_pins_flow_and_spreads() {
+            let a = ipv4_tcp([10, 0, 0, 1], [10, 0, 0, 2], 1000, 80);
+            let a2 = ipv4_tcp([10, 0, 0, 1], [10, 0, 0, 2], 1000, 80);
+            // Same 5-tuple → same carrier every time (no reordering).
+            for n in [2usize, 3, 4, 8, 16] {
+                assert_eq!(flow_carrier(&a, n), flow_carrier(&a2, n), "n={n} stable");
+            }
+            // n == 1 → always 0 (legacy single-carrier path).
+            for p in [&a, &ipv4_tcp([1, 2, 3, 4], [5, 6, 7, 8], 1, 2)] {
+                assert_eq!(flow_carrier(p, 1), 0);
+                assert_eq!(flow_carrier(p, 0), 0);
+            }
+            // Many distinct flows must touch more than one carrier (n=4): a hash
+            // that pinned everything to 0 would silently kill the parallelism.
+            let mut seen = std::collections::HashSet::new();
+            for port in 1000u16..1100 {
+                seen.insert(flow_carrier(
+                    &ipv4_tcp([10, 0, 0, 1], [10, 0, 0, 2], port, 443),
+                    4,
+                ));
+            }
+            assert!(seen.len() > 1, "flows must spread across carriers, got {seen:?}");
+            // All indices stay in range.
+            assert!(seen.iter().all(|&i| i < 4));
+        }
 
         /// A full relay queue must apply backpressure: send_batch completes as
         /// soon as the consumer drains a slot, and no packet is lost.
@@ -5593,7 +5908,11 @@ pub mod bridge {
             let pkts = [pkt];
             // `dropped` counts oversized (TooLarge) packets — transient, not
             // fatal. Only a genuine link error returns Err and stops the pump.
-            let dropped = sender.send_batch(&pkts).await?;
+            // 1:1 bridge uplink → backpressure (F3): a dedicated per-link task, so
+            // blocking on a full send buffer paces the inner TCP instead of
+            // dropping (which it reads as loss). The hub router keeps the
+            // non-blocking send_batch to avoid cross-peer head-of-line blocking.
+            let dropped = sender.send_batch_wait(&pkts).await?;
             if dropped == 0 {
                 counters.tx_pkts.fetch_add(1, Ordering::Relaxed);
                 counters.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
@@ -5630,7 +5949,11 @@ pub mod bridge {
             let total_bytes: u64 = pkts.iter().map(|p| p.len() as u64).sum();
             // `dropped` counts oversized (TooLarge) packets — transient, not
             // fatal. Only a genuine link error returns Err and stops the pump.
-            let dropped = sender.send_batch(&pkts).await?;
+            // 1:1 bridge uplink → backpressure (F3): a dedicated per-link task, so
+            // blocking on a full send buffer paces the inner TCP instead of
+            // dropping (which it reads as loss). The hub router keeps the
+            // non-blocking send_batch to avoid cross-peer head-of-line blocking.
+            let dropped = sender.send_batch_wait(&pkts).await?;
             let sent = num - dropped;
             counters.tx_pkts.fetch_add(sent as u64, Ordering::Relaxed);
             // tx_bytes counts the whole batch; during the brief MTU-discovery

@@ -471,8 +471,10 @@ Notes:
   bore requests 16 MiB UDP buffers and, running with `CAP_NET_ADMIN`, **forces past**
   the `net.core.{w,r}mem_max` clamp (`SO_*BUFFORCE`) so a stock 208 KiB ceiling
   (~10 MB/s at 20 ms RTT) does not cap it — startup logs `forced=true`. Unprivileged?
-  raise `net.core.{r,w}mem_max` on both ends. `--carriers N` now also fans the direct
-  path across N parallel QUIC connections (helps lossy/high-BDP links).
+  raise `net.core.{r,w}mem_max` on both ends. The biggest real-world limiter is a
+  **single inner TCP flow over a lossy path** (Mathis-bound): parallelise the
+  workload, not bore. `--carriers` rarely helps a VPN and defaults to `1` — see
+  [Tuning VPN throughput](#tuning-vpn-throughput).
 - **Reflexive discovery (STUN).** Each peer learns its public address from a STUN
   chain: Cloudflare on the standard `3478/udp` first, then Google, then the
   server's built-in STUN responder on the control port over **UDP** as the final
@@ -997,10 +999,11 @@ bore server \
 | `--vpn-peer-addr <IP>` | `BORE_VPN_PEER_ADDR` | — | Static peer address (requires `--vpn-addr`) |
 | `--tun-name <NAME>` | — | `auto` | TUN interface name; `auto` picks the first free `boreN` (bore0, bore1, …) |
 | `--mtu <N>` | — | `1350` | TUN interface MTU |
+| `--pin-mtu` | — | — | Keep `--mtu` fixed; the direct PMTU monitor only warns on a shortfall, never resizes (tests/benchmarks) |
 | `--no-route-manage` | — | — | Print route/NAT commands instead of running them |
 | `--auto-reconnect` | `BORE_AUTO_RECONNECT` | — | Reconnect with exponential backoff |
 | `--relay-only` | `BORE_VPN_RELAY_ONLY` | — | Never attempt the direct UDP path; stay on the relay |
-| `--carriers <N>` | — | `1` | Parallel relay substream pairs (1–16); effective = min(both sides, server `--max-carriers`) |
+| `--carriers <N>` | — | `1` | Parallel carriers (1–16); effective = min(both sides, server `--max-carriers`). **Flow-pinned** (one inner connection → one carrier). Rarely helps a VPN — see [Tuning VPN throughput](#tuning-vpn-throughput) before raising it |
 | `--tun-queues <N>` | — | `1` | Linux TUN queues (`IFF_MULTI_QUEUE`, 1–8); one uplink pump per queue |
 | `--insecure` | `BORE_INSECURE` | — | Skip TLS cert verification |
 | `--notes <TEXT>` | `BORE_NOTES` | — | Operator note (logged on link-up) |
@@ -1017,9 +1020,47 @@ bore server \
 
 ### Performance
 
-TUN I/O uses batch read/write with GSO/GRO offload when the kernel supports `IFF_VNET_HDR`. Auto-detects on startup; falls back to single-packet if unavailable. Measured iperf3 baseline over loopback: **~13,500 Mbps** (single-packet) → **~14,000 Mbps** (GSO/GRO). Use `--carriers N` (parallel relay substreams) and `--tun-queues N` (Linux multi-queue TUN) on high-bandwidth links; the direct path raises the TUN MTU automatically (dynamic PMTU) once QUIC MTU discovery settles.
+TUN I/O uses batch read/write with GSO/GRO offload when the kernel supports `IFF_VNET_HDR`. Auto-detects on startup; falls back to single-packet if unavailable. Measured iperf3 baseline over loopback: **~13,500 Mbps** (single-packet) → **~14,000 Mbps** (GSO/GRO). `--tun-queues N` (Linux multi-queue TUN) adds an uplink pump per queue on high-pps links. The direct path raises the TUN MTU automatically (dynamic PMTU) once QUIC MTU discovery settles.
 
 Large packets drop transiently during the first 1–2 seconds (QUIC MTU discovery), then stabilize.
+
+### Tuning VPN throughput
+
+On a clean LAN/loopback the direct path runs at multi-Gbps and these knobs do
+nothing. On a **real Internet path** (RTT + a little loss + a sub-1500 MTU) the
+dominant limit is almost always **one inner TCP flow**, not bore. A single TCP
+connection over any lossy link is bounded by `≈ MSS / (RTT · √loss)` (Mathis):
+e.g. at 40 ms RTT and 0.2 % loss one flow tops out near ~25 Mbit regardless of the
+link rate, while **8 parallel flows over the same tunnel reach ~170 Mbit** (netns
+emulation, 250 Mbit cap). So:
+
+- **Parallelise the workload, not the tunnel.** Use a multi-stream tool
+  (`iperf3 -P 8`, `rclone --transfers`, parallel `rsync`, multi-connection HTTP).
+  A single `scp`/`iperf3` (one flow) is the worst case and will *look* like bore is
+  slow when it is TCP physics. Quick check: `iperf3 -c <overlay-ip> -P 8`.
+- **`--carriers` rarely helps a VPN — leave it at `1` (default).** Carriers open N
+  parallel QUIC connections on the direct path. bore now **flow-pins** each inner
+  connection to one carrier (so a single flow is never reordered), but a single
+  bulk flow still rides a single carrier, and many flows already share one carrier
+  fine (one QUIC connection delivers in order). Raise `--carriers` only with **many
+  concurrent heavy flows on a clean, high-BDP path**, and measure — on a lossy path
+  more carriers usually make it *worse*, not better.
+  > Earlier builds round-robined every datagram across carriers, which reordered a
+  > single flow and the tunnelled TCP read that as loss — `--carriers 4` could
+  > *halve* throughput. Fixed by flow-pinning; carriers are now safe but still
+  > seldom useful for a VPN.
+- **`--tun-queues N`** helps only when a single uplink task is CPU-bound at very
+  high packet rates; otherwise leave at `1`.
+- **Don't fight the MTU.** The direct path auto-tunes the TUN MTU to the QUIC path
+  MTU. For a stable benchmark, pin it: `--mtu 1280 --pin-mtu` (the monitor then only
+  *warns* if the path can't carry it, instead of resizing under your test).
+- **Diagnostics:** run both ends with
+  `RUST_LOG=info,bore_cli::vpn=debug,bore_cli::holepunch=debug`. The `direct_diag`
+  lines report per-carrier `cwnd`, `rtt_ms`, `lost_pct`, `buffer_drop_est` (QUIC
+  send-buffer drops), `black_holes` and MTU changes every 5 s — the fastest way to
+  tell a single-flow limit (`lost_pct` low, throughput still low → add flows) from a
+  bore-side issue. Reproduce locally with `scripts/vpn_bench.sh` (netns + `tc netem`
+  WAN emulation); see `docs/vpn/VPN_BANDWIDTH_ASSESSMENT.md`.
 
 ### Troubleshooting
 

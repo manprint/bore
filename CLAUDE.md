@@ -121,14 +121,28 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   carrier kills the whole link cleanly (reconnect re-establishes), never silent degradation
 - VPN `--carriers` applies to BOTH paths (Fix #3a). Relay: N AEAD substream pairs. Direct: N
   parallel QUIC connections over the ONE punched socket (`DirectConn::open_sibling` reuses the open
-  5-tuple — no extra punch), each its OWN congestion controller → ~N× in-flight window (parallel-
-  stream effect a lone loss-bound flow can't reach). `LinkSender::Direct{conns,rr}` round-robins
-  datagrams per-packet; the single downlink task `select_all`s `read_datagram` across all carriers
-  (one task, many conns — safe: `read_datagram`/`send_datagram` are `&self` + cancel-safe, no stream
-  split). Establishment requires the FULL negotiated count on both sides (connector dials siblings
-  to `conn0.remote_address()`, listener accepts N) — any carrier failing aborts the upgrade → stay
-  on relay + retry (never a mismatched/silently-degraded count). `carriers==1` = legacy single conn,
-  rr pinned at 0, byte-identical. Hub per-peer direct path stays single-conn (v1)
+  5-tuple — no extra punch), each its OWN congestion controller. The single downlink task
+  `select_all`s `read_datagram` across all carriers (one task, many conns — safe: `read_datagram`/
+  `send_datagram` are `&self` + cancel-safe, no stream split). Establishment requires the FULL
+  negotiated count on both sides (connector dials siblings to `conn0.remote_address()`, listener
+  accepts N) — any carrier failing aborts the upgrade → stay on relay + retry (never a mismatched/
+  silently-degraded count). `carriers==1` = legacy single conn, byte-identical. Hub per-peer direct
+  path stays single-conn (v1)
+- VPN DIRECT carrier steering is FLOW-PINNED, not per-datagram round-robin (BW-F2). `flow_carrier`
+  hashes the inner IPv4 5-tuple → one inner connection always rides ONE carrier (in order); distinct
+  flows spread. CRITICAL: per-datagram RR across carriers reordered a single flow and the tunnelled
+  TCP read the reorder as loss — `--carriers 4` could HALVE throughput / explode UDP loss to 25-44 %
+  (netns+netem). NEVER restore per-datagram RR on the direct path. `n==1` → idx 0, byte-identical.
+  RELAY keeps per-datagram RR (reliable streams; replay window sized for it, DEC-10) — do not flow-pin
+  it without resizing the window. A single bulk flow gains nothing from carriers (one carrier); the
+  real VPN bottleneck is the single inner TCP flow (Mathis) — parallelise the workload. `--carriers`
+  default stays 1; rarely helps a VPN (see docs/vpn/VPN_BANDWIDTH_ASSESSMENT.md)
+- VPN 1:1 uplink uses `send_batch_wait` (BACKPRESSURE, BW-F3): on a full QUIC datagram send buffer it
+  AWAITS room instead of quinn silently dropping the OLDEST queued datagram — drop = congestion the
+  tunnelled TCP reads as loss (cwnd collapse) + bufferbloat. Awaiting pauses the TUN read so the
+  kernel TUN queue backpressures the inner senders. ONLY the dedicated 1:1 uplink task may block here;
+  the SHARED hub router keeps non-blocking `send_batch` (a blocking peer would HOL every other peer).
+  Relay branch ignores backpressure (bounded channel already blocks)
 - VPN direct-path throughput is bounded by the UDP socket buffer / RTT. The kernel SILENTLY clamps
   `SO_SNDBUF`/`SO_RCVBUF` to `net.core.{w,r}mem_max` (stock Ubuntu/AWS default 208 KiB → ~10 MB/s at
   20 ms RTT regardless of Quinn's windows, CPU idle). `configure_udp_socket_buffers` (holepunch.rs,
@@ -137,6 +151,10 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   remediation when a clamp survives (was a silent `debug!`). Requested 16 MiB (Fix #1)
 - `NetConfig` RAII: all routes/nft/ip_forward changes revert on exit (SIGINT, SIGTERM, panic handled; SIGKILL requires next-run stale reclaim via /run state file to restore ip_forward and remove leaked iptables/nft rules — BUG-2/BUG-3 fixed). Concurrent gateway links in ONE netns refcount ip_forward via per-`(netns,id,role)` `/run/bore-vpn-ns<inode>-*.fwdref` markers + a first-wins `/run/bore-vpn-ns<inode>.ipfwd-orig` record: a link restores ip_forward only when NO other co-netns `.fwdref` remains, and the last one out restores the true original — never disables forwarding under a still-live co-netns peer (B3 fixed); `stale_reclaim` is refcount-aware too. CRITICAL: markers are scoped by the `/proc/self/ns/net` inode because `ip_forward` is per-netns while `/run` is shared across netns (the netns harness, containers) — an unscoped refcount would wrongly couple independent netns and break teardown
 - TUN MTU default 1350: clamps QUIC datagram size; gateway MSS-clamp keeps forwarded TCP healthy
+- `--pin-mtu` (BW-F4): the PMTU monitor runs OBSERVE-ONLY — it `warn!`s when the path max_datagram
+  drops below the pinned TUN MTU (full-size packets being TooLarge-dropped) and `info!`s on recovery,
+  but NEVER calls `ip link set`. For tests/benchmarks that need a fixed MTU. Default off = dynamic
+  auto-tune (the existing `pmtu_monitor` resize path). `pmtu_monitor(.., pin)` carries the flag
 - VPN direct path: a `TooLarge` datagram send is a per-packet DROP, never link death. The TUN MTU
   runs ahead of the QUIC path MTU right after every direct switch, so full-size packets exceed
   `max_datagram_size()` until the PMTU monitor narrows the TUN. `DirectConn::send_datagram` returns

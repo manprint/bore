@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bore Admin</title>
+    <link rel="stylesheet" href="/admin/ui/style.css">
+</head>
+<body>
+    <aside id="menu">
+        <!-- Sidebar populated by app.js from registry -->
+    </aside>
+    <main id="view">
+        <!-- Panel content rendered here -->
+    </main>
+    <div id="login-overlay" class="hidden">
+        <form id="login-form">
+            <h2>Admin Login</h2>
+            <input type="password" id="token-input" placeholder="Enter admin token" autocomplete="off" required>
+            <button type="submit">Login</button>
+        </form>
+    </div>
+    <script type="module" src="/admin/ui/app.js"></script>
+</body>
+</html>

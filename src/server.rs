@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{io, ops::RangeInclusive, sync::Arc, time::Duration};
 
 use anyhow::Result;
@@ -128,6 +128,9 @@ pub struct Server {
     /// TLS acceptor for the control connection; `None` means plain TCP.
     tls: Option<TlsAcceptor>,
 
+    /// Path to the control TLS certificate file (retained for cert inspection).
+    tls_cert_path: Option<PathBuf>,
+
     /// Public domain advertised for this server (informational).
     bind_domain: Option<String>,
 
@@ -203,12 +206,25 @@ pub struct Server {
     /// Overlay subnet prefix allocated per hub from --vpn-pool (default 24).
     #[cfg(feature = "vpn")]
     vpn_hub_prefix: u8,
+
+    /// Server startup instant (for uptime calculation).
+    started_at: std::time::Instant,
+
+    /// Cumulative bytes sent over all relay tunnels (all time).
+    total_tx_bytes: Arc<AtomicU64>,
+
+    /// Cumulative bytes received over all relay tunnels (all time).
+    total_rx_bytes: Arc<AtomicU64>,
+
+    /// Serializable snapshot of server startup configuration (sanitized, D11).
+    config_view: Arc<crate::admin_views::ConfigView>,
 }
 
 impl Server {
     /// Create a new server with a specified minimum port number.
     pub fn new(port_range: RangeInclusive<u16>, secret: Option<&str>) -> Self {
         assert!(!port_range.is_empty(), "must provide at least one port");
+        let port_range_str = format!("{}-{}", port_range.start(), port_range.end());
         Server {
             port_range,
             conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
@@ -221,6 +237,7 @@ impl Server {
             udp_tests: udp_diagnostic::Registry::default(),
             control_port: CONTROL_PORT,
             tls: None,
+            tls_cert_path: None,
             bind_domain: None,
             secret: secret.map(str::to_string),
             auth: secret.map(Authenticator::new),
@@ -252,7 +269,39 @@ impl Server {
             vpn_punch_timeout: vpn_server::DEFAULT_VPN_PUNCH_TIMEOUT,
             #[cfg(feature = "vpn")]
             vpn_hub_prefix: 24,
+            started_at: std::time::Instant::now(),
+            total_tx_bytes: Arc::new(AtomicU64::new(0)),
+            total_rx_bytes: Arc::new(AtomicU64::new(0)),
+            config_view: Arc::new(crate::admin_views::ConfigView {
+                port_range: port_range_str,
+                control_port: CONTROL_PORT,
+                max_conns: DEFAULT_MAX_CONNS as u32,
+                max_carriers: DEFAULT_MAX_CARRIERS,
+                bind_addr: "0.0.0.0".into(),
+                bind_tunnels: "0.0.0.0".into(),
+                udp: false,
+                udp_socket_send_buffer: None,
+                udp_socket_recv_buffer: None,
+                #[cfg(feature = "vpn")]
+                vpn_enabled: false,
+                #[cfg(feature = "vpn")]
+                vpn_pool: None,
+                #[cfg(feature = "vpn")]
+                vpn_max_links: 32,
+                #[cfg(feature = "vpn")]
+                vpn_hub_prefix: 24,
+                vhost_enabled: false,
+                vhost_base_domain: None,
+                vhost_http_port: None,
+                vhost_https_port: None,
+                tls: false,
+            }),
         }
+    }
+
+    /// Get the TCP port the control listener binds to.
+    pub fn control_port(&self) -> u16 {
+        self.control_port
     }
 
     /// Set the TCP port the control listener binds to (default [`CONTROL_PORT`]).
@@ -269,6 +318,11 @@ impl Server {
     /// Enable TLS on the control connection using the given acceptor.
     pub fn set_tls(&mut self, acceptor: TlsAcceptor) {
         self.tls = Some(acceptor);
+    }
+
+    /// Set the path to the control TLS certificate file.
+    pub fn set_tls_cert_path(&mut self, path: Option<PathBuf>) {
+        self.tls_cert_path = path;
     }
 
     /// Set the public domain advertised for this server (informational).
@@ -310,6 +364,41 @@ impl Server {
         self.admin_token = token;
     }
 
+    /// Update the server configuration view (called from main.rs after construction).
+    pub fn set_config_view(&mut self, view: crate::admin_views::ConfigView) {
+        self.config_view = Arc::new(view);
+    }
+
+    /// Retrieve the server configuration view.
+    pub fn config_view(&self) -> Arc<crate::admin_views::ConfigView> {
+        Arc::clone(&self.config_view)
+    }
+
+    /// Server uptime in seconds.
+    pub fn uptime_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+
+    /// Cumulative bytes sent over all relay tunnels.
+    pub fn total_tx_bytes(&self) -> u64 {
+        self.total_tx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative bytes received over all relay tunnels.
+    pub fn total_rx_bytes(&self) -> u64 {
+        self.total_rx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Shared atomic for accumulating sent bytes (used by relay code).
+    pub fn total_tx_bytes_atomic(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.total_tx_bytes)
+    }
+
+    /// Shared atomic for accumulating received bytes (used by relay code).
+    pub fn total_rx_bytes_atomic(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.total_rx_bytes)
+    }
+
     /// Set the HSTS value served on HTTPS control-port HTTP responses.
     /// Pass `off`, `false`, `none`, or an empty string to disable it.
     pub fn set_control_hsts(&mut self, hsts: &str) {
@@ -349,6 +438,49 @@ impl Server {
     /// Shared handle to the live vhost registry.
     pub fn vhost_registry(&self) -> VhostRegistry {
         self.vhost_registry.clone()
+    }
+
+    /// Get the vhost configuration (if set).
+    pub fn vhost_config(&self) -> Option<vhost::SharedVhostConfig> {
+        self.vhost_config.clone()
+    }
+
+    /// Whether TLS is enabled on the vhost HTTPS frontend.
+    pub fn vhost_has_tls(&self) -> bool {
+        self.vhost_tls.read().unwrap().is_some()
+    }
+
+    /// Shared handle to the live VPN provider registry (cfg vpn).
+    #[cfg(feature = "vpn")]
+    pub fn vpn_providers(&self) -> crate::vpn_server::VpnRegistry {
+        Arc::clone(&self.vpn_providers)
+    }
+
+    /// Get the path to the control TLS certificate file (if set).
+    pub fn tls_cert_path(&self) -> Option<&PathBuf> {
+        self.tls_cert_path.as_ref()
+    }
+
+    /// Whether TLS is enabled on the control port.
+    pub fn is_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
+    /// Whether UDP direct-path brokering is enabled.
+    pub fn is_udp(&self) -> bool {
+        self.udp
+    }
+
+    /// Whether VPN brokering is enabled (cfg vpn).
+    #[cfg(feature = "vpn")]
+    pub fn is_vpn_enabled(&self) -> bool {
+        self.vpn_enabled
+    }
+
+    /// Whether VPN brokering is enabled (non-vpn always returns false).
+    #[cfg(not(feature = "vpn"))]
+    pub fn is_vpn_enabled(&self) -> bool {
+        false
     }
 
     /// Clone the public-tunnel UDP direct registry handle. Call before
@@ -506,6 +638,8 @@ impl Server {
                                     }
                                 };
                                 let this3 = Arc::clone(&this2);
+                                let grx = Arc::clone(&this3.total_rx_bytes);
+                                let gtx = Arc::clone(&this3.total_tx_bytes);
                                 tokio::spawn(async move {
                                     let _permit = permit;
                                     if let Err(e) = vhost::handle_http(
@@ -513,6 +647,8 @@ impl Server {
                                         &this3.vhost_registry,
                                         &this3.vhost_config,
                                         mode,
+                                        grx,
+                                        gtx,
                                     )
                                     .await
                                     {
@@ -545,6 +681,8 @@ impl Server {
                                     }
                                 };
                                 let this3 = Arc::clone(&this2);
+                                let grx = Arc::clone(&this3.total_rx_bytes);
+                                let gtx = Arc::clone(&this3.total_tx_bytes);
                                 tokio::spawn(async move {
                                     let _permit = permit;
                                     if let Err(e) = vhost::handle_https(
@@ -552,6 +690,8 @@ impl Server {
                                         &this3.vhost_registry,
                                         &this3.vhost_config,
                                         &this3.vhost_tls,
+                                        grx,
+                                        gtx,
                                     )
                                     .await
                                     {
@@ -858,7 +998,15 @@ impl Server {
                         }
                     };
                     let _permit = permit;
-                    return vhost::relay_vhost(stream, &entry, head).await;
+                    return vhost::relay_vhost(
+                        stream,
+                        &entry,
+                        head,
+                        Arc::clone(&self.total_rx_bytes),
+                        Arc::clone(&self.total_tx_bytes),
+                        Arc::clone(&entry.active),
+                    )
+                    .await;
                 }
             }
             // Not a vhost route: replay the already-read head for the admin / 404 path.
@@ -883,8 +1031,15 @@ impl Server {
                     tls: self.tls.is_some(),
                     udp: self.udp,
                 };
-                if let Err(err) =
-                    admin_http::serve(stream, &self.admin, &token, server, control_hsts).await
+                if let Err(err) = admin_http::serve(
+                    stream,
+                    &self.admin,
+                    &token,
+                    server,
+                    control_hsts,
+                    Some(self),
+                )
+                .await
                 {
                     trace!(%err, "admin request failed");
                 }
@@ -965,6 +1120,8 @@ impl Server {
                     peer,
                     notes,
                     self.udp_tuning,
+                    Arc::clone(&self.total_rx_bytes),
+                    Arc::clone(&self.total_tx_bytes),
                 )
                 .await
             }
@@ -1110,6 +1267,8 @@ impl Server {
                         self.vpn_punch_timeout,
                         carriers,
                         self.max_carriers,
+                        Arc::clone(&self.total_rx_bytes),
+                        Arc::clone(&self.total_tx_bytes),
                     )
                     .await;
                 }
@@ -1309,6 +1468,8 @@ impl Server {
                     let domain = self.bind_domain.clone();
                     let opts = opts.clone();
                     let active = Arc::clone(&active);
+                    let grx = Arc::clone(&self.total_rx_bytes);
+                    let gtx = Arc::clone(&self.total_tx_bytes);
                     #[cfg(feature = "udp")]
                     let public_direct_entry = if opts.udp {
                         let key = format!("port:{}", port);
@@ -1348,7 +1509,10 @@ impl Server {
                                             buf,
                                             buf,
                                         ).await;
-                                        if let Err(err) = result {
+                                        if let Ok((rx_bytes, tx_bytes)) = result {
+                                            grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
+                                            gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
+                                        } else if let Err(err) = result {
                                             trace!(%err, "direct proxied connection closed");
                                         }
                                         true
@@ -1388,7 +1552,10 @@ impl Server {
                                     buf,
                                 )
                                 .await;
-                                if let Err(err) = result {
+                                if let Ok((rx_bytes, tx_bytes)) = result {
+                                    grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
+                                    gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
+                                } else if let Err(err) = result {
                                     trace!(%err, "proxied connection closed");
                                 }
                             }

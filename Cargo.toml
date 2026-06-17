@@ -52,6 +52,10 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = { version = "1.2.1", features = ["serde", "v4"] }
 webpki-roots = "1.0.7"
 yamux = "0.13.10"
+x509-parser = "0.16"
+# `time` is already pulled transitively by x509-parser/rustls; named directly here
+# to format certificate validity timestamps (RFC3339) without a separate dep.
+time = "0.3"
 
 # Optional, enabled by the `udp` feature (see [features]). These must stay in the
 # top-level dependency set so `--all-features` keeps working on Windows too.

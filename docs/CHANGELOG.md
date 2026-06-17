@@ -12,6 +12,19 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
 ## [Unreleased]
 
 ### Added
+- **Admin dashboard revamp (Phase 5 / all-features SPA)**: the legacy single-page
+  `/admin/status` HTML is replaced by a modular SPA shell + 8 REST API endpoints
+  under `/admin/api/v1/` (summary, tunnels, secret, vhost, vpn, certs, config,
+  metrics). Each endpoint is token-guarded and returns a JSON snapshot of live
+  subsystem state. The frontend is vanilla JS with a panel registry so new
+  sections require only 3 steps (panel module + registry line + API endpoint).
+  Panels poll with per-section refresh intervals and show real peer IPs,
+  expandable notes, TLS cert expiry countdowns, memory (Linux), and cumulative
+  bandwidth. New dependency: `x509-parser` for cert expiry. Asset embedding via
+  `build.rs`; legacy `/admin/status/data` endpoint unchanged (pinned by T-COMPAT
+  unit test). Built with `--features vpn` for full VPN section; non-VPN builds
+  return empty VPN array (zero regressions). Documentation in
+  `docs/frontend/ADMIN_DASHBOARD.md`; e2e harness in `scripts/admin_dashboard_test.sh`.
 - **Tunable proxy copy buffer (`BORE_PROXY_BUFFER_SIZE`)**: the per-direction
   relay/splice buffer is now configurable via env var (raw bytes or
   `KB`/`MB`/`GB`/`KiB`/`MiB`/`GiB` suffix, clamped to `[4 KiB, 16 MiB]`) and the

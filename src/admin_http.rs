@@ -2,9 +2,9 @@
 //! port (plain or TLS, matching how the server was started).
 //!
 //! It speaks just enough HTTP to serve one request per connection: the embedded
-//! status page at `/admin/status`, and a token-guarded JSON snapshot at
-//! `/admin/status/data` that the page polls. No framework, no persistence — the
-//! data is a live read of [`AdminRegistry`].
+//! SPA shell at `/admin/status`, static assets at `/admin/ui/*`, token-guarded
+//! JSON API at `/admin/api/v1/*`, and the legacy `/admin/status/data` snapshot.
+//! No framework, no persistence — the data is a live read of [`AdminRegistry`].
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -15,8 +15,9 @@ use crate::admin::{AdminRegistry, EntryView};
 use crate::basicauth::constant_time_eq;
 use crate::shared::NETWORK_TIMEOUT;
 
-/// The embedded status page (login form + auto-refreshing table).
-const STATUS_HTML: &str = include_str!("admin_status.html");
+// Include the auto-generated admin assets table from build.rs.
+// Generated code is pub static ADMIN_ASSETS.
+include!(concat!(env!("OUT_DIR"), "/admin_assets.rs"));
 
 /// Cap on the request-head bytes read.
 const MAX_HEAD: usize = 8 * 1024;
@@ -51,8 +52,9 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     registry: &AdminRegistry,
     token: &str,
-    server: ServerStatus,
+    server_status: ServerStatus,
     control_hsts: Option<&str>,
+    server: Option<&crate::server::Server>,
 ) -> Result<()> {
     let head = match read_head(&mut stream).await? {
         Some(h) => h,
@@ -71,37 +73,159 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     // Route on the path without its query string.
-    match path.split('?').next().unwrap_or(&path) {
-        "/admin/status" | "/admin/status/" => {
-            respond(
+    let path_only = path.split('?').next().unwrap_or(&path);
+
+    // CSP header for all responses
+    let csp = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'";
+
+    // New API endpoints (D1, D10).
+    if path_only.starts_with("/admin/api/v1/") {
+        if !authorized(&head, token) {
+            return respond_with_csp(
                 &mut stream,
-                200,
-                "text/html; charset=utf-8",
-                STATUS_HTML.as_bytes(),
+                401,
+                "text/plain",
+                b"unauthorized",
                 control_hsts,
+                csp,
             )
-            .await
+            .await;
         }
-        "/admin/status/data" => {
-            if !authorized(&head, token) {
-                return respond(
+
+        // Dispatch to the appropriate builder and return JSON.
+        let Some(srv) = server else {
+            return respond_with_csp(
+                &mut stream,
+                404,
+                "text/plain",
+                b"not found",
+                control_hsts,
+                csp,
+            )
+            .await;
+        };
+
+        let body = match path_only {
+            "/admin/api/v1/summary" => serde_json::to_vec(&crate::admin_api::summary(srv))?,
+            "/admin/api/v1/tunnels" => serde_json::to_vec(&crate::admin_api::tunnels(srv))?,
+            "/admin/api/v1/secret" => serde_json::to_vec(&crate::admin_api::secret(srv))?,
+            "/admin/api/v1/vhost" => serde_json::to_vec(&crate::admin_api::vhost(srv))?,
+            "/admin/api/v1/vpn" => {
+                #[cfg(feature = "vpn")]
+                {
+                    serde_json::to_vec(&crate::admin_api::vpn(srv))?
+                }
+                #[cfg(not(feature = "vpn"))]
+                {
+                    serde_json::to_vec(&serde_json::json!({ "links": [] }))?
+                }
+            }
+            "/admin/api/v1/certs" => serde_json::to_vec(&crate::admin_api::certs(srv))?,
+            "/admin/api/v1/config" => serde_json::to_vec(&crate::admin_api::config(srv))?,
+            "/admin/api/v1/metrics" => serde_json::to_vec(&crate::admin_api::metrics(srv))?,
+            _ => {
+                return respond_with_csp(
                     &mut stream,
-                    401,
+                    404,
                     "text/plain",
-                    b"unauthorized",
+                    b"not found",
                     control_hsts,
+                    csp,
                 )
                 .await;
             }
-            let view = StatusView {
-                server,
-                tunnels: registry.snapshot(),
-            };
-            let body = serde_json::to_vec(&view).context("serialize admin status")?;
-            respond(&mut stream, 200, "application/json", &body, control_hsts).await
-        }
-        _ => respond(&mut stream, 404, "text/plain", b"not found", control_hsts).await,
+        };
+        return respond_with_csp(
+            &mut stream,
+            200,
+            "application/json",
+            &body,
+            control_hsts,
+            csp,
+        )
+        .await;
     }
+
+    // Asset serving: /admin/ui/<path> → exact key lookup in ADMIN_ASSETS
+    if path_only.starts_with("/admin/ui/") {
+        if let Some((_, bytes, content_type)) =
+            ADMIN_ASSETS.iter().find(|(url, _, _)| *url == path_only)
+        {
+            return respond_with_csp(&mut stream, 200, content_type, bytes, control_hsts, csp)
+                .await;
+        }
+        return respond_with_csp(
+            &mut stream,
+            404,
+            "text/plain",
+            b"not found",
+            control_hsts,
+            csp,
+        )
+        .await;
+    }
+
+    // SPA shell: /admin/status, /admin/status/, /admin, /admin/ → index.html
+    if matches!(
+        path_only,
+        "/admin/status" | "/admin/status/" | "/admin" | "/admin/"
+    ) {
+        if let Some((_, bytes, content_type)) = ADMIN_ASSETS
+            .iter()
+            .find(|(url, _, _)| *url == "/admin/ui/index.html")
+        {
+            return respond_with_csp(&mut stream, 200, content_type, bytes, control_hsts, csp)
+                .await;
+        }
+        return respond_with_csp(
+            &mut stream,
+            404,
+            "text/plain",
+            b"not found",
+            control_hsts,
+            csp,
+        )
+        .await;
+    }
+
+    // Legacy /admin/status/data endpoint (D2: must stay byte-identical)
+    if path_only == "/admin/status/data" {
+        if !authorized(&head, token) {
+            return respond_with_csp(
+                &mut stream,
+                401,
+                "text/plain",
+                b"unauthorized",
+                control_hsts,
+                csp,
+            )
+            .await;
+        }
+        let view = StatusView {
+            server: server_status,
+            tunnels: registry.snapshot(),
+        };
+        let body = serde_json::to_vec(&view).context("serialize admin status")?;
+        return respond_with_csp(
+            &mut stream,
+            200,
+            "application/json",
+            &body,
+            control_hsts,
+            csp,
+        )
+        .await;
+    }
+
+    respond_with_csp(
+        &mut stream,
+        404,
+        "text/plain",
+        b"not found",
+        control_hsts,
+        csp,
+    )
+    .await
 }
 
 /// Write the minimal control-port 404 response, with optional HSTS.
@@ -180,6 +304,44 @@ fn authorized(head: &[u8], token: &str) -> bool {
         }
     }
     false
+}
+
+/// Write a complete HTTP/1.1 response with CSP header and close the connection.
+async fn respond_with_csp<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    code: u16,
+    content_type: &str,
+    body: &[u8],
+    control_hsts: Option<&str>,
+    csp: &str,
+) -> Result<()> {
+    let reason = match code {
+        200 => "OK",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        _ => "OK",
+    };
+    let hsts = control_hsts
+        .map(|value| format!("Strict-Transport-Security: {value}\r\n"))
+        .unwrap_or_default();
+    let header = format!(
+        "HTTP/1.1 {code} {reason}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-store\r\n\
+         Content-Security-Policy: {csp}\r\n\
+         {hsts}\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.flush().await?;
+    // Shut the stream down cleanly so a TLS peer gets a `close_notify` (and a
+    // plain peer a prompt FIN) instead of an "unexpected EOF".
+    let _ = stream.shutdown().await;
+    Ok(())
 }
 
 /// Write a complete HTTP/1.1 response and close the connection.

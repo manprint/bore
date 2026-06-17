@@ -1,0 +1,53 @@
+/**
+ * Secret panel: secret tunnels table.
+ */
+
+import { table, badge, notesCell, fmtBytes, fmtDuration, escapeHtml } from '../ui.js';
+
+export default {
+    id: 'secret',
+    title: 'Secret',
+    route: 'secret',
+    endpoint: '/admin/api/v1/secret',
+    refreshMs: 5000,
+
+    async render(el, data) {
+        if (!data || !Array.isArray(data)) {
+            el.innerHTML = '<p class="empty-state">No secret tunnels</p>';
+            return;
+        }
+
+        if (data.length === 0) {
+            el.innerHTML = '<p class="empty-state">No secret tunnels active</p>';
+            return;
+        }
+
+        const rows = data.map(secret => {
+            const badges = [];
+            if (secret.udp) badges.push(badge('UDP', 'success'));
+            if (secret.basic_auth) badges.push(badge('Basic Auth', 'warning'));
+
+            const badgeCell = document.createElement('span');
+            badges.forEach((b, i) => {
+                if (i > 0) badgeCell.appendChild(document.createTextNode(' '));
+                badgeCell.appendChild(b);
+            });
+
+            return {
+                'Role': escapeHtml(secret.role ?? 'N/A'),
+                'Secret ID': escapeHtml(secret.secret_id ?? 'N/A'),
+                'Peer': escapeHtml(secret.peer ?? 'N/A'),
+                'Flags': badgeCell,
+                'Active': escapeHtml(String(secret.active ?? 0)),
+                'Uptime': escapeHtml(fmtDuration(secret.uptime_secs)),
+                'TX': escapeHtml(fmtBytes(secret.relay_tx_bytes)),
+                'RX': escapeHtml(fmtBytes(secret.relay_rx_bytes))
+            };
+        });
+
+        el.appendChild(table(
+            ['Role', 'Secret ID', 'Peer', 'Flags', 'Active', 'Uptime', 'TX', 'RX'],
+            rows
+        ));
+    }
+};

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::AtomicUsize;
 #[cfg(feature = "udp")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -350,6 +351,8 @@ pub struct VhostEntry {
     /// Number of proxied requests that successfully opened a direct QUIC stream.
     #[cfg(feature = "udp")]
     pub direct_stream_opens: AtomicU64,
+    /// Live count of connections currently proxied through this vhost subdomain.
+    pub active: Arc<AtomicUsize>,
 }
 
 /// Upper bound on QUIC direct connections pooled per vhost subdomain. The provider
@@ -557,6 +560,7 @@ pub async fn serve_vhost_provider(
                 direct: DirectPool::default(),
                 #[cfg(feature = "udp")]
                 direct_stream_opens: AtomicU64::new(0),
+                active: Arc::new(AtomicUsize::new(0)),
             });
             slot.insert(entry);
             pool
@@ -703,6 +707,9 @@ pub async fn relay_vhost(
     public: impl AsyncRead + AsyncWrite + Unpin,
     entry: &VhostEntry,
     head: Vec<u8>,
+    grx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    gtx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<()> {
     let mut provider: Pin<Box<dyn AsyncReadWrite>> = {
         #[cfg(feature = "udp")]
@@ -749,9 +756,15 @@ pub async fn relay_vhost(
     };
     provider.write_all(&request_head).await?;
 
+    let _guard = crate::admin::ActiveGuard::new(active);
+
     if entry.response_headers.is_empty() {
         let buf = proxy_buffer_size();
-        tokio::io::copy_bidirectional_with_sizes(&mut public, &mut provider, buf, buf).await?;
+        let result =
+            tokio::io::copy_bidirectional_with_sizes(&mut public, &mut provider, buf, buf).await?;
+        let (rx_bytes, tx_bytes) = result;
+        grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
+        gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
         return Ok(());
     }
 
@@ -905,6 +918,8 @@ pub async fn handle_http(
     registry: &VhostRegistry,
     vhost_config: &Option<SharedVhostConfig>,
     mode: VhostMode,
+    grx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    gtx: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
     use tokio::time::timeout;
 
@@ -942,7 +957,7 @@ pub async fn handle_http(
         return send_bad_gateway(stream).await;
     };
 
-    relay_vhost(stream, &entry, head).await
+    relay_vhost(stream, &entry, head, grx, gtx, Arc::clone(&entry.active)).await
 }
 
 /// Handle one inbound HTTPS connection on the vhost frontend port.
@@ -955,6 +970,8 @@ pub async fn handle_https(
     registry: &VhostRegistry,
     vhost_config: &Option<SharedVhostConfig>,
     vhost_tls: &Arc<RwLock<Option<Arc<TlsAcceptor>>>>,
+    grx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    gtx: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
     use tokio::time::timeout;
 
@@ -996,7 +1013,15 @@ pub async fn handle_https(
         return send_bad_gateway(tls_stream).await;
     };
 
-    relay_vhost(tls_stream, &entry, head).await
+    relay_vhost(
+        tls_stream,
+        &entry,
+        head,
+        grx,
+        gtx,
+        Arc::clone(&entry.active),
+    )
+    .await
 }
 
 /// Read up to `\r\n\r\n` from any `AsyncRead + Unpin` stream, capped at 16 KiB.

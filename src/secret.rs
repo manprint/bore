@@ -345,6 +345,8 @@ pub async fn serve_consumer(
     peer: SocketAddr,
     notes: Option<String>,
     udp_tuning: UdpDirectTuning,
+    grx: Arc<std::sync::atomic::AtomicU64>,
+    gtx: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
     info!(%id, "secret consumer connected");
     control.send(ServerMessage::Ok).await?;
@@ -424,11 +426,13 @@ pub async fn serve_consumer(
                 let registry = registry.clone();
                 let id = id.clone();
                 let active = Arc::clone(&active);
+                let grx = Arc::clone(&grx);
+                let gtx = Arc::clone(&gtx);
                 tokio::spawn(
                     async move {
                         let _permit = permit;
                         let _active = ActiveGuard::new(active);
-                        if let Err(err) = relay(consumer_stream, registry, &id).await {
+                        if let Err(err) = relay(consumer_stream, registry, &id, grx, gtx).await {
                             trace!(%err, "secret relay closed");
                         }
                     }
@@ -505,7 +509,13 @@ async fn broker_udp(
 }
 
 /// Splice one consumer substream to a freshly opened provider substream.
-async fn relay(mut consumer: mux::Stream, registry: Registry, id: &str) -> Result<()> {
+async fn relay(
+    mut consumer: mux::Stream,
+    registry: Registry,
+    id: &str,
+    grx: Arc<std::sync::atomic::AtomicU64>,
+    gtx: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<()> {
     // Consume the consumer's readiness marker (it announced the substream).
     let mut marker = [0u8; 1];
     consumer.read_exact(&mut marker).await?;
@@ -521,7 +531,11 @@ async fn relay(mut consumer: mux::Stream, registry: Registry, id: &str) -> Resul
     provider.write_all(&[mux::STREAM_READY]).await?;
 
     let buf = proxy_buffer_size();
-    tokio::io::copy_bidirectional_with_sizes(&mut consumer, &mut provider, buf, buf).await?;
+    let result =
+        tokio::io::copy_bidirectional_with_sizes(&mut consumer, &mut provider, buf, buf).await?;
+    let (rx_bytes, tx_bytes) = result;
+    grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
+    gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 

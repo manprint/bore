@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,7 +61,7 @@ pub struct HubState {
     /// Monotonic peer-id allocator (starts at 1, never reused within a session).
     next_peer_id: u32,
     /// Live peers keyed by `peer_id`.
-    peers: HashMap<u32, PeerSlot>,
+    pub peers: HashMap<u32, PeerSlot>,
 }
 
 /// One spoke's allocation within a hub: its overlay address, server-assigned
@@ -940,6 +941,8 @@ pub async fn serve_vpn_connector(
     punch_timeout: Duration,
     carriers: u16,
     max_carriers: u16,
+    grx: Arc<AtomicU64>,
+    gtx: Arc<AtomicU64>,
 ) -> Result<()> {
     info!(%id, "vpn connector connecting");
 
@@ -1101,10 +1104,14 @@ pub async fn serve_vpn_connector(
                 let listener_opener = listener_opener.clone();
                 let id = id_clone.clone();
                 let guard = crate::admin::ActiveGuard::new(Arc::clone(&active_counter));
+                let grx_clone = Arc::clone(&grx);
+                let gtx_clone = Arc::clone(&gtx);
                 let counted = CountingStream {
                     inner: connector_stream,
                     rx: Arc::clone(&relay_rx),
                     tx: Arc::clone(&relay_tx),
+                    grx: grx_clone,
+                    gtx: gtx_clone,
                 };
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -1402,10 +1409,14 @@ pub async fn serve_vpn_connector(
             let listener_opener = listener_opener.clone();
             let id = id_clone.clone();
             let guard = crate::admin::ActiveGuard::new(Arc::clone(&active_counter));
+            let grx_clone = Arc::clone(&grx);
+            let gtx_clone = Arc::clone(&gtx);
             let counted = CountingStream {
                 inner: connector_stream,
                 rx: Arc::clone(&relay_rx),
                 tx: Arc::clone(&relay_tx),
+                grx: grx_clone,
+                gtx: gtx_clone,
             };
             tokio::spawn(async move {
                 let _permit = permit;
@@ -1543,6 +1554,8 @@ struct CountingStream<S> {
     inner: S,
     rx: Arc<std::sync::atomic::AtomicU64>,
     tx: Arc<std::sync::atomic::AtomicU64>,
+    grx: Arc<std::sync::atomic::AtomicU64>,
+    gtx: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountingStream<S> {
@@ -1556,6 +1569,7 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountingStream<S>
         if let std::task::Poll::Ready(Ok(())) = &res {
             let n = (buf.filled().len() - before) as u64;
             self.rx.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            self.grx.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         }
         res
     }
@@ -1570,6 +1584,8 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountingStream<
         let res = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
         if let std::task::Poll::Ready(Ok(n)) = &res {
             self.tx
+                .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
+            self.gtx
                 .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
         }
         res
@@ -1736,5 +1752,60 @@ mod tests {
             udp_registry.get("vpn:y").is_none(),
             "own udp entry must be removed"
         );
+    }
+
+    /// Verify that CountingStream bumps both per-entry and global byte counters
+    /// identically when reading and writing.
+    #[tokio::test]
+    async fn t_counting_stream_bumps_global() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Create an in-memory duplex stream
+        let (mut left, right) = tokio::io::duplex(1024);
+
+        // Create per-entry and global atomics
+        let entry_rx = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let entry_tx = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let global_rx = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let global_tx = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // Wrap the right side with CountingStream
+        let mut counted = CountingStream {
+            inner: right,
+            rx: Arc::clone(&entry_rx),
+            tx: Arc::clone(&entry_tx),
+            grx: Arc::clone(&global_rx),
+            gtx: Arc::clone(&global_tx),
+        };
+
+        // Spawn a task to write and read through the counting stream
+        let counted_task = tokio::spawn(async move {
+            let mut buf = [0u8; 100];
+            // Read 50 bytes from left
+            let n = counted.read(&mut buf).await.expect("read");
+            assert_eq!(n, 50);
+            // Write 75 bytes back
+            counted.write_all(&[42u8; 75]).await.expect("write");
+        });
+
+        // Main task: write 50 bytes, read 75 bytes
+        left.write_all(&[1u8; 50]).await.expect("main write");
+        let mut buf = [0u8; 100];
+        let n = left.read(&mut buf).await.expect("main read");
+        assert_eq!(n, 75);
+
+        counted_task.await.expect("task completed");
+
+        // Verify both per-entry and global counters advanced identically
+        let entry_rx_val = entry_rx.load(Ordering::Relaxed);
+        let entry_tx_val = entry_tx.load(Ordering::Relaxed);
+        let global_rx_val = global_rx.load(Ordering::Relaxed);
+        let global_tx_val = global_tx.load(Ordering::Relaxed);
+
+        assert_eq!(entry_rx_val, 50, "per-entry rx must be 50");
+        assert_eq!(entry_tx_val, 75, "per-entry tx must be 75");
+        assert_eq!(global_rx_val, 50, "global rx must be 50");
+        assert_eq!(global_tx_val, 75, "global tx must be 75");
     }
 }

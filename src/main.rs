@@ -1735,10 +1735,17 @@ async fn dispatch(command: Command) -> Result<()> {
             if let Some(domain) = bind_domain {
                 server.set_bind_domain(domain);
             }
+            // Store config values before they might be moved/consumed.
+            #[cfg(feature = "vpn")]
+            let config_vpn_pool = vpn_pool.clone();
+            let config_vhost_base_domain = vhost_base_domain.clone();
+            let config_tls = cert_file.is_some() && key_file.is_some();
+
             match (cert_file, key_file) {
                 (Some(cert), Some(key)) => {
                     let acceptor = bore_cli::transport::load_server_tls(&cert, &key)?;
                     server.set_tls(acceptor);
+                    server.set_tls_cert_path(Some(std::path::PathBuf::from(cert.clone())));
                 }
                 (None, None) => {}
                 _ => {
@@ -1754,6 +1761,7 @@ async fn dispatch(command: Command) -> Result<()> {
             server.set_bind_tunnels(bind_tunnels.unwrap_or(bind_addr));
             server.set_udp(udp);
             // VPN brokering (only available when compiled with --features vpn).
+
             #[cfg(feature = "vpn")]
             {
                 if vpn {
@@ -1843,6 +1851,33 @@ async fn dispatch(command: Command) -> Result<()> {
                     server.set_vhost_config_path(config_path);
                 }
             }
+            // Build and store the server configuration snapshot (D11: sanitized, no secrets).
+            let config_view = bore_cli::admin_views::ConfigView {
+                port_range: format!("{}-{}", min_port, max_port),
+                control_port,
+                max_conns: max_conns as u32,
+                max_carriers,
+                bind_addr: bind_addr.to_string(),
+                bind_tunnels: bind_tunnels.unwrap_or(bind_addr).to_string(),
+                udp,
+                udp_socket_send_buffer: None, // TODO: parse from string if needed
+                udp_socket_recv_buffer: None,
+                #[cfg(feature = "vpn")]
+                vpn_enabled: vpn,
+                #[cfg(feature = "vpn")]
+                vpn_pool: config_vpn_pool,
+                #[cfg(feature = "vpn")]
+                vpn_max_links: vpn_max_links as u32,
+                #[cfg(feature = "vpn")]
+                vpn_hub_prefix,
+                vhost_enabled: !server.vhost_registry().is_empty()
+                    || config_vhost_base_domain.is_some(),
+                vhost_base_domain: config_vhost_base_domain,
+                vhost_http_port,
+                vhost_https_port,
+                tls: config_tls,
+            };
+            server.set_config_view(config_view);
             server.listen().await?;
         }
         Command::Vhost {

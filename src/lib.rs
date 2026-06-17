@@ -17,9 +17,12 @@
 
 mod adaptive_nat;
 pub mod admin;
+pub mod admin_api;
 pub mod admin_http;
+pub mod admin_views;
 pub mod auth;
 pub mod basicauth;
+pub mod certinfo;
 pub mod client;
 pub mod edge;
 pub mod holepunch;

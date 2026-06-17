@@ -82,6 +82,8 @@ The bandwidth-relevant tuning is already in place and was confirmed sound:
 - **Auto-tuned yamux receive window** (`set_max_connection_receive_window(None)`) lets a
   stream's window grow to the bandwidth-delay product instead of capping at the default
   credit.
-- **`TCP_NODELAY`** on every socket (latency); **64 KiB** copy buffers per direction.
+- **`TCP_NODELAY`** on every socket (latency); **256 KiB** copy buffers per direction
+  (`DEFAULT_PROXY_BUFFER_SIZE`, `shared.rs:43`; env `BORE_PROXY_BUFFER_SIZE`, clamped
+  `[4 KiB, 16 MiB]`).
 - **Direct UDP/QUIC:** 16 MiB socket buffers, 16/64 MiB stream/connection windows, BBR
   congestion control, 4096 max bidi streams.

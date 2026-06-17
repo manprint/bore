@@ -191,6 +191,10 @@ pub struct TunnelOptions {
     /// keeps the wire format backward-compatible (a missing field reads as `0`).
     #[serde(default)]
     pub carriers: u16,
+    /// Whether the client wants the QUIC direct data path for this public tunnel.
+    /// `#[serde(default)]` keeps the wire format backward-compatible.
+    #[serde(default)]
+    pub udp: bool,
 }
 
 /// Options negotiated by two `bore test-udp` peers once the server pairs them.
@@ -409,7 +413,7 @@ impl Default for UdpDirectTuning {
 impl TunnelOptions {
     fn control_frame_summary(&self) -> String {
         format!(
-            "https={}, force_https={}, basic_auth={}, notes={}, carriers={}",
+            "https={}, force_https={}, basic_auth={}, notes={}, carriers={}, udp={}",
             if self.https { "on" } else { "off" },
             if self.force_https { "on" } else { "off" },
             if self.basic_auth.is_some() {
@@ -423,6 +427,7 @@ impl TunnelOptions {
                 "none"
             },
             self.carriers,
+            if self.udp { "on" } else { "off" },
         )
     }
 }
@@ -746,6 +751,13 @@ pub enum ClientMessage {
         subdomain: String,
     },
 
+    /// Ask the server to issue a fresh public-UDP nonce so the client can
+    /// re-dial the direct QUIC path after it dropped.
+    PublicUdpRenew {
+        /// Public tunnel port whose direct path should be renewed.
+        port: u16,
+    },
+
     /// Register as the listener for a VPN link id.
     HelloVpn {
         /// VPN link identifier to register under.
@@ -871,6 +883,17 @@ pub enum ServerMessage {
         /// Server UDP port to dial for the QUIC direct path.
         port: u16,
         /// Session nonce; server and provider derive the same token from it + secret.
+        nonce: [u8; UDP_NONCE_LEN],
+        /// Direct-UDP transport tuning requested by the server.
+        #[serde(default)]
+        tuning: UdpDirectTuning,
+    },
+
+    /// Offer the QUIC direct path to a public-tunnel client that requested `--udp`.
+    PublicUdp {
+        /// Server UDP port to dial for the QUIC direct path.
+        port: u16,
+        /// Session nonce; server and client derive the same token from it + secret.
         nonce: [u8; UDP_NONCE_LEN],
         /// Direct-UDP transport tuning requested by the server.
         #[serde(default)]
@@ -1033,6 +1056,9 @@ impl ControlFrameSummary for ClientMessage {
             ClientMessage::VhostUdpRenew { subdomain } => {
                 format!("VhostUdpRenew {{ subdomain={} }}", subdomain)
             }
+            ClientMessage::PublicUdpRenew { port } => {
+                format!("PublicUdpRenew {{ port={} }}", port)
+            }
             ClientMessage::HelloVpn {
                 id,
                 advertised,
@@ -1125,6 +1151,18 @@ impl ControlFrameSummary for ServerMessage {
             } => {
                 format!(
                     "VhostUdp {{ port={}, nonce={}, tuning={{ {} }} }}",
+                    port,
+                    hex::encode(nonce),
+                    tuning.control_frame_summary(),
+                )
+            }
+            ServerMessage::PublicUdp {
+                port,
+                nonce,
+                tuning,
+            } => {
+                format!(
+                    "PublicUdp {{ port={}, nonce={}, tuning={{ {} }} }}",
                     port,
                     hex::encode(nonce),
                     tuning.control_frame_summary(),

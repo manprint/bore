@@ -138,7 +138,7 @@ Options:
       --insecure               Skip TLS certificate verification [env: BORE_INSECURE=]
       --https                  Terminate TLS on the tunnel port [env: BORE_HTTPS=]
       --force-https            Redirect plain HTTP to https:// (requires --https) [env: BORE_FORCE_HTTPS=]
-      --udp                    Prefer a direct UDP hole-punched path (secret tunnels only) [env: BORE_PREFER_UDP=]
+      --udp                    Prefer a direct UDP/QUIC data path (public: server→client QUIC; secret: hole-punched). Falls back to relay. [env: BORE_PREFER_UDP=]
       --stun-server <HOST:PORT> STUN server for the direct path [env: BORE_STUN_SERVER=]
       --upnp                   Map a router port via UPnP-IGD for the direct path [env: BORE_UPNP=]
       --try-port-prediction    Advertise predicted symmetric-NAT ports (opt-in, best-effort) [env: BORE_TRY_PORT_PREDICTION=]
@@ -204,10 +204,12 @@ independently loss-isolated — so there is no single-stream head-of-line blocki
 fix. `--carriers` widens the relay; `--udp` fixes the direct path. They compose (the
 relay pool is used whenever a tunnel is on the relay fallback).
 
-**Exception — `bore vhost --udp`:** there `--carriers N` *also* sizes the QUIC
-direct path. The provider opens `N` parallel QUIC **connections** and the server
-pools them and round-robins requests, parallelizing per-connection crypto/congestion
-across cores (capped at 32 per subdomain, not by `--max-carriers`). As always, a
+**Exception — `bore vhost --udp` and `bore local --udp` (public tunnel):** there
+`--carriers N` *also* sizes the QUIC direct path. The client/provider opens `N`
+parallel QUIC **connections** and the server pools them and round-robins proxied
+connections across them, parallelizing per-connection crypto/congestion across cores
+(capped at 32, not by `--max-carriers`). Both need `bore server --udp`; both fall back
+to the TCP relay per-connection when the direct path is unavailable. As always, a
 single flow over one connection is not split — see `CARRIER_TUNING.md`.
 
 **Proxy copy buffer:** `BORE_PROXY_BUFFER_SIZE` (default 256 KiB; accepts a
@@ -232,6 +234,34 @@ throughput than TCP relay, that is not automatically a bug: QUIC is reliable and
 congestion-controlled over UDP, while the relay uses highly optimized kernel TCP
 and may sit close to one peer. Tune those constants only after measuring both
 directions with a realistic quota.
+
+**Direct-path throughput on unprivileged hosts.** The 16 MiB UDP socket buffers
+above are requested with `SO_{SND,RCV}BUFFORCE`, which bypasses the kernel's
+`net.core.{r,w}mem_max` ceiling — but that needs `CAP_NET_ADMIN`. `bore vpn` runs
+privileged and gets it; an ordinary `bore local --udp` / `bore proxy --udp` does
+**not**, so on a host with the stock `*mem_max` (208 KiB on Ubuntu/Debian/AWS) the
+buffers are clamped and a single direct flow is capped at roughly `buffer / RTT`
+(≈10 MB/s at 20 ms RTT) regardless of the QUIC windows. bore logs a `warn!` with the
+remediation when this happens; raise the ceiling with
+`sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216` (and the
+matching `net.core.*mem_default` for it to take effect on new sockets).
+
+**`--udp` selects a *transport*, it does not forward UDP application traffic.**
+`bore local`/`bore proxy` forward **TCP** services only; `--udp` chooses a direct
+**QUIC** data path for the tunnel itself, with automatic relay fallback. It works for:
+- **secret tunnels** (`bore proxy`, `bore local --tcp-secret-id`): peer-to-peer
+  hole-punched QUIC between consumer and provider;
+- **public tunnels** (`bore local`, no `--tcp-secret-id`): a server→client QUIC path
+  (the server is public, so no hole-punch is needed — same model as `bore vhost --udp`).
+  `--carriers N` opens N independent QUIC connections (each its own BBR congestion
+  controller), exactly like vhost. Requires `bore server --udp`; otherwise the tunnel
+  transparently stays on the TCP relay.
+
+The other direct-path flags (`--upnp`, `--stun-server`, `--try-port-prediction`,
+`--nat-udp-*`) are hole-punch helpers and apply to **secret tunnels only**; on a public
+tunnel they are inert and bore `warn!`s instead of silently ignoring them. To tunnel a
+**UDP application** (DNS, game servers, WireGuard, …) use `bore vpn` (L3 overlay), not
+`bore local`/`proxy`.
 
 #### Automatic reconnection
 

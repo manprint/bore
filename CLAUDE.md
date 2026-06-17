@@ -80,6 +80,12 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
 - Secret tunnels: consumer opens data substreams → server relays to provider → provider splices to local
 - `--carriers N`: N parallel TCP connections, round-robin per proxied connection (HOL + cwnd isolation)
 - `--udp`: UDP hole-punching + QUIC direct path for secret tunnels (each proxied conn = own QUIC bidi stream); falls back to relay automatically
+- `--udp` for PUBLIC `bore local` tunnels (no `--tcp-secret-id`): server→client QUIC direct
+  path, **no STUN/hole-punch** (server is public, client dials it — same model as
+  `bore vhost --udp`). Client opens N (`--carriers`) QUIC connections to the server's
+  `--vhost-quic-port`; server round-robins inbound public connections across them (its own
+  `PublicDirectEntry`/`DirectPool` per tunnel), writes `mux::STREAM_READY`, splices; falls
+  back per-connection to the warm TCP relay. Needs `bore server --udp`
 
 **Key invariants to never break:**
 - Client sends `Hello` before auth (yamux is lazy; without it, deadlock)
@@ -92,6 +98,21 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   for `local`/`proxy`, but `0` (auto) for `bore transfer` — auto scales the relay carrier
   pool to the worker `--parallel` count (capped at server `--max-carriers`); `transfer.rs`
   resolves it via `resolve_carriers`. Explicit `--carriers 1` still forces the single path.
+- **Public-tunnel `--udp` (server→client QUIC, mirrors vhost; `docs/LOCAL_UDP_PLAN.md`):**
+  `--udp` off ⇒ public path byte-for-byte the TCP relay (DEC-LU5); `TunnelOptions.udp`
+  is `#[serde(default)]` so old/new client↔server interop. ONE server QUIC endpoint binds
+  whenever `bore server --udp` (NOT gated on vhost config) and serves both vhost subdomains
+  and public tunnels; the auth handshake key is namespaced (`port:{public_port}` for public,
+  bare DNS label for vhost) so the accept loop installs into the right registry. `--carriers N`
+  on public `--udp` = N independent QUIC connections (own BBR each), per-connection
+  round-robin — NEVER per-datagram/intra-request striping (reorder trap). The TCP carrier
+  pool stays warm for the tunnel's life; direct is tried per inbound connection and falls
+  back in place — UDP never gates tunnel liveness (DEC-LU4). Server writes `STREAM_READY`
+  on the direct bidi stream too (DEC-LU6); the client funnels accepted streams into the same
+  `handle_connection` as the relay path. `spawn_direct`/`direct_*` client state + the
+  holepunch `vhost_connect`/`vhost_server_handshake`/`DirectPool` are SHARED with vhost — do
+  not fork them. Hole-punch helper flags (`--upnp`/`--stun-server`/`--try-port-prediction`/
+  `--nat-udp-*`) stay secret-tunnel-only and `warn!` (not silently ignored) on a public tunnel
 - Relay path is AEAD-opaque: server splices ciphertext, never plaintext IP packets
 - **Never `tokio::io::split` a `mux::Stream` across two tasks.** `yamux::Stream` keeps a
   single parked-task waker on its internal channel (`poll_read` and `poll_write` both call

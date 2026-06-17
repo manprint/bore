@@ -18,7 +18,7 @@ use bore_cli::{
     },
 };
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Full version string: "bore 1.0.0 - <branch> - <sha8>".
 const FULL_VERSION: &str = concat!(
@@ -94,8 +94,11 @@ enum Command {
         #[clap(long, requires = "https", env = "BORE_FORCE_HTTPS")]
         force_https: bool,
 
-        /// Prefer a direct UDP hole-punched path (secret tunnels only, requires
-        /// --tcp-secret-id); falls back to the server relay if unavailable.
+        /// Prefer a direct UDP/QUIC data path; falls back to the server relay if
+        /// unavailable. Public tunnels use a server→client QUIC path (server is
+        /// public, no hole-punch; needs `bore server --udp`). Secret tunnels
+        /// (`--tcp-secret-id`) use a peer-to-peer hole-punched path. `--carriers N`
+        /// opens N independent QUIC connections.
         #[clap(long, env = "BORE_PREFER_UDP")]
         udp: bool,
 
@@ -1253,23 +1256,28 @@ async fn dispatch(command: Command) -> Result<()> {
                         .exit();
                 }
             }
-            if udp {
-                info!(
-                    mode = "local",
-                    secret_tunnel = tcp_secret_id.is_some(),
-                    udp,
-                    stun_server = ?stun_server.as_deref(),
-                    upnp,
-                    try_port_prediction,
-                    nat_udp_preferred_port,
-                    nat_udp_release_timeout,
-                    max_conns,
-                    carriers,
-                    "resolved UDP optimization settings",
-                );
-            }
+            // The direct-UDP path (hole-punched QUIC) exists only for secret
+            // tunnels: a public tunnel always relays through the server, which owns
+            // the public port, so there is no peer to punch to. These flags are
+            // inert on the public path — warn loudly rather than dropping them
+            // silently, and only emit the "resolved UDP settings" line when it is
+            // actually a secret tunnel.
             match tcp_secret_id {
                 Some(id) => {
+                    if udp {
+                        info!(
+                            mode = "local",
+                            udp,
+                            stun_server = ?stun_server.as_deref(),
+                            upnp,
+                            try_port_prediction,
+                            nat_udp_preferred_port,
+                            nat_udp_release_timeout,
+                            max_conns,
+                            carriers,
+                            "resolved UDP optimization settings",
+                        );
+                    }
                     let meta = ProviderMeta { notes, basic_auth };
                     let connect = move || {
                         let (local_host, to, id, secret, stun_server, meta) = (
@@ -1304,12 +1312,30 @@ async fn dispatch(command: Command) -> Result<()> {
                     reconnect::run(auto_reconnect, connect, serve_client).await?;
                 }
                 None => {
+                    if upnp
+                        || try_port_prediction
+                        || stun_server.is_some()
+                        || nat_udp_preferred_port != 0
+                    {
+                        warn!(
+                            upnp,
+                            try_port_prediction,
+                            stun_server = ?stun_server.as_deref(),
+                            nat_udp_preferred_port,
+                            "ignoring secret-tunnel-only UDP options on a public tunnel: \
+                             --upnp / --stun-server / --try-port-prediction / \
+                             --nat-udp-preferred-port apply to secret tunnels only \
+                             (pass --tcp-secret-id). Use --udp on public tunnels for \
+                             QUIC direct path.",
+                        );
+                    }
                     let options = TunnelOptions {
                         https,
                         force_https,
                         basic_auth,
                         notes,
                         carriers,
+                        udp,
                     };
                     let connect = move || {
                         let (local_host, to, secret, options) = (
@@ -2319,6 +2345,43 @@ mod tests {
         match saved {
             Some(value) => std::env::set_var("BORE_SERVER", value),
             None => std::env::remove_var("BORE_SERVER"),
+        }
+    }
+
+    #[test]
+    fn local_udp_without_secret_id_is_a_public_tunnel() {
+        // `bore local --udp` with no --tcp-secret-id parses as a PUBLIC tunnel
+        // (tcp_secret_id == None). The dispatch warns that the direct-UDP options
+        // are inert on the public path and runs the relay; the behavioural
+        // assertion (no UDP attempt, warn emitted) lives in the netns e2e harness.
+        // This guards that the combo stays parseable and that --udp does not
+        // implicitly imply a secret tunnel (BUG-LP1 regression guard).
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved_udp = std::env::var_os("BORE_PREFER_UDP");
+        let saved_id = std::env::var_os("BORE_TCP_SECRET_ID");
+        std::env::remove_var("BORE_PREFER_UDP");
+        std::env::remove_var("BORE_TCP_SECRET_ID");
+
+        let args = Args::parse_from(["bore", "local", "8080", "--udp"]);
+        let Command::Local {
+            udp, tcp_secret_id, ..
+        } = args.command
+        else {
+            panic!("expected local command");
+        };
+        assert!(udp, "--udp must parse as true");
+        assert!(
+            tcp_secret_id.is_none(),
+            "--udp alone must NOT imply a secret tunnel; it stays a public tunnel"
+        );
+
+        match saved_udp {
+            Some(value) => std::env::set_var("BORE_PREFER_UDP", value),
+            None => std::env::remove_var("BORE_PREFER_UDP"),
+        }
+        match saved_id {
+            Some(value) => std::env::set_var("BORE_TCP_SECRET_ID", value),
+            None => std::env::remove_var("BORE_TCP_SECRET_ID"),
         }
     }
 

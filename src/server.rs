@@ -51,6 +51,37 @@ pub const DEFAULT_CONTROL_HSTS: &str = "max-age=31536000; includeSubDomains";
 /// Interval at which the server sends heartbeats to detect a dead client.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
+/// One registered public-tunnel UDP direct path: its QUIC connection pool.
+#[cfg(feature = "udp")]
+pub struct PublicDirectEntry {
+    /// Pool of live QUIC direct connections to the client.
+    pub direct: vhost::DirectPool,
+    /// Number of proxied requests that successfully opened a direct QUIC stream.
+    pub direct_stream_opens: std::sync::atomic::AtomicU64,
+}
+
+/// Handle to the live registry of public-tunnel UDP direct paths, keyed by
+/// `"port:{public_port}"`. Cloned out of the server before [`Server::listen`]
+/// (which consumes `self`) so tests/operators can observe direct-path usage.
+#[cfg(feature = "udp")]
+pub type PublicUdpRegistry = Arc<DashMap<String, Arc<PublicDirectEntry>>>;
+
+/// Removes a public-tunnel UDP direct registry entry when the tunnel ends.
+#[cfg(feature = "udp")]
+struct PublicDeregister {
+    registry: Arc<DashMap<String, Arc<PublicDirectEntry>>>,
+    pending_udp: Arc<DashMap<String, [u8; crate::shared::UDP_NONCE_LEN]>>,
+    key: String,
+}
+
+#[cfg(feature = "udp")]
+impl Drop for PublicDeregister {
+    fn drop(&mut self) {
+        self.registry.remove(&self.key);
+        self.pending_udp.remove(&self.key);
+    }
+}
+
 /// State structure for the server.
 pub struct Server {
     /// Range of TCP ports that can be forwarded.
@@ -140,6 +171,14 @@ pub struct Server {
     /// Path to the vhost config file, retained for the hot-reload task.
     vhost_config_path: Option<PathBuf>,
 
+    /// Registry of live public-tunnel UDP direct paths, keyed by `port:{N}`.
+    #[cfg(feature = "udp")]
+    public_udp_registry: Arc<DashMap<String, Arc<PublicDirectEntry>>>,
+
+    /// Server-issued nonces for live public UDP direct-path negotiations.
+    #[cfg(feature = "udp")]
+    pending_public_udp: Arc<DashMap<String, [u8; crate::shared::UDP_NONCE_LEN]>>,
+
     /// Whether VPN brokering is enabled.
     #[cfg(feature = "vpn")]
     vpn_enabled: bool,
@@ -197,6 +236,10 @@ impl Server {
             vhost_quic_port_explicit: false,
             pending_vhost_udp: vhost::PendingVhostUdp::default(),
             vhost_config_path: None,
+            #[cfg(feature = "udp")]
+            public_udp_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "udp")]
+            pending_public_udp: Arc::new(DashMap::new()),
             #[cfg(feature = "vpn")]
             vpn_enabled: false,
             #[cfg(feature = "vpn")]
@@ -306,6 +349,36 @@ impl Server {
     /// Shared handle to the live vhost registry.
     pub fn vhost_registry(&self) -> VhostRegistry {
         self.vhost_registry.clone()
+    }
+
+    /// Clone the public-tunnel UDP direct registry handle. Call before
+    /// [`Server::listen`] (which consumes `self`) to observe per-tunnel direct
+    /// QUIC usage afterwards (carrier count / `direct_stream_opens`).
+    #[cfg(feature = "udp")]
+    pub fn public_udp_registry(&self) -> PublicUdpRegistry {
+        Arc::clone(&self.public_udp_registry)
+    }
+
+    /// Number of direct QUIC streams opened for a public tunnel UDP path.
+    /// Returns 0 if the tunnel is not found or not using UDP.
+    #[cfg(feature = "udp")]
+    pub fn public_direct_stream_opens(&self, public_port: u16) -> u64 {
+        let key = format!("port:{public_port}");
+        self.public_udp_registry
+            .get(&key)
+            .map(|entry| entry.direct_stream_opens.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Number of live QUIC carriers for a public tunnel UDP direct path.
+    /// Returns 0 if the tunnel is not found or not using UDP.
+    #[cfg(feature = "udp")]
+    pub fn public_direct_carriers(&self, public_port: u16) -> usize {
+        let key = format!("port:{public_port}");
+        self.public_udp_registry
+            .get(&key)
+            .map(|entry| entry.direct.len())
+            .unwrap_or(0)
     }
 
     /// Enable the vhost frontend with the given config.
@@ -515,7 +588,7 @@ impl Server {
         }
 
         #[cfg(feature = "udp")]
-        if this.udp && this.vhost_config.is_some() {
+        if this.udp {
             match tokio::net::UdpSocket::bind((this.bind_addr, this.vhost_quic_port)).await {
                 Ok(udp) => match holepunch::vhost_server_endpoint(udp, &this.udp_tuning) {
                     Ok(endpoint) => {
@@ -523,69 +596,121 @@ impl Server {
                             port = this.vhost_quic_port,
                             "vhost QUIC direct endpoint listening"
                         );
-                        let registry = this.vhost_registry.clone();
-                        let pending = this.pending_vhost_udp.clone();
+                        let vhost_reg = this.vhost_registry.clone();
+                        let vhost_pending = this.pending_vhost_udp.clone();
+                        #[cfg(feature = "udp")]
+                        let public_reg = this.public_udp_registry.clone();
+                        #[cfg(feature = "udp")]
+                        let public_pending = this.pending_public_udp.clone();
                         let secret = this.secret.clone();
                         let ep = endpoint.clone();
                         tokio::spawn(async move {
                             while let Some(incoming) = ep.accept().await {
-                                let registry = registry.clone();
-                                let pending = pending.clone();
+                                let vhost_reg = vhost_reg.clone();
+                                let vhost_pending = vhost_pending.clone();
+                                #[cfg(feature = "udp")]
+                                let public_reg = public_reg.clone();
+                                #[cfg(feature = "udp")]
+                                let public_pending = public_pending.clone();
                                 let secret = secret.clone();
                                 let endpoint = ep.clone();
                                 tokio::spawn(async move {
                                     let conn = match incoming.await {
                                         Ok(conn) => conn,
                                         Err(err) => {
-                                            debug!(%err, "vhost QUIC handshake failed");
+                                            debug!(%err, "QUIC handshake failed");
                                             return;
                                         }
                                     };
 
-                                    let lookup = |subdomain: &str| {
-                                        pending.get(subdomain).map(|nonce| {
-                                            holepunch::derive_token(
+                                    let lookup = |key: &str| {
+                                        if let Some(nonce) = vhost_pending.get(key) {
+                                            Some(holepunch::derive_token(
                                                 secret.as_deref(),
                                                 nonce.value(),
-                                            )
-                                        })
+                                            ))
+                                        } else {
+                                            #[cfg(feature = "udp")]
+                                            if let Some(nonce) = public_pending.get(key) {
+                                                return Some(holepunch::derive_token(
+                                                    secret.as_deref(),
+                                                    nonce.value(),
+                                                ));
+                                            }
+                                            None
+                                        }
                                     };
 
                                     match holepunch::vhost_server_handshake(conn, endpoint, lookup)
                                         .await
                                     {
-                                        Ok((subdomain, direct)) => {
-                                            let entry = registry
-                                                .get(&subdomain)
-                                                .map(|entry| Arc::clone(entry.value()));
-                                            if let Some(entry) = entry {
-                                                match entry.direct.install(direct.clone()) {
-                                                    Some(id) => {
-                                                        info!(subdomain = %subdomain, id, carriers = entry.direct.len(), "vhost QUIC direct carrier established");
-                                                        let registry = registry.clone();
-                                                        tokio::spawn(async move {
-                                                            direct.closed().await;
-                                                            if let Some(entry) = registry
-                                                                .get(&subdomain)
-                                                                .map(|entry| {
-                                                                    Arc::clone(entry.value())
-                                                                })
-                                                            {
-                                                                entry.direct.remove(id);
-                                                                debug!(subdomain = %subdomain, id, carriers = entry.direct.len(), "vhost QUIC direct carrier closed");
+                                        Ok((key, direct)) => {
+                                            // Check if this is a public tunnel (port:N key) or vhost (subdomain key)
+                                            if key.starts_with("port:") {
+                                                #[cfg(feature = "udp")]
+                                                {
+                                                    if let Some(entry) = public_reg
+                                                        .get(&key)
+                                                        .map(|e| Arc::clone(e.value()))
+                                                    {
+                                                        match entry.direct.install(direct.clone()) {
+                                                            Some(id) => {
+                                                                info!(key = %key, id, carriers = entry.direct.len(), "public QUIC direct carrier established");
+                                                                let public_reg = public_reg.clone();
+                                                                tokio::spawn(async move {
+                                                                    direct.closed().await;
+                                                                    if let Some(entry) = public_reg
+                                                                        .get(&key)
+                                                                        .map(|e| {
+                                                                            Arc::clone(e.value())
+                                                                        })
+                                                                    {
+                                                                        entry.direct.remove(id);
+                                                                        debug!(key = %key, id, carriers = entry.direct.len(), "public QUIC direct carrier closed");
+                                                                    }
+                                                                });
                                                             }
-                                                        });
-                                                    }
-                                                    None => {
-                                                        debug!(subdomain = %subdomain, "vhost QUIC direct pool full; dropping extra carrier");
-                                                        direct.close();
+                                                            None => {
+                                                                debug!(key = %key, "public QUIC direct pool full; dropping extra carrier");
+                                                                direct.close();
+                                                            }
+                                                        }
+                                                    } else {
+                                                        debug!(key = %key, "public QUIC connection arrived after tunnel deregistered");
                                                     }
                                                 }
                                             } else {
-                                                debug!(subdomain = %subdomain, "vhost QUIC connection arrived after provider deregistered");
+                                                // Vhost subdomain
+                                                if let Some(entry) = vhost_reg
+                                                    .get(&key)
+                                                    .map(|e| Arc::clone(e.value()))
+                                                {
+                                                    match entry.direct.install(direct.clone()) {
+                                                        Some(id) => {
+                                                            info!(subdomain = %key, id, carriers = entry.direct.len(), "vhost QUIC direct carrier established");
+                                                            let vhost_reg = vhost_reg.clone();
+                                                            tokio::spawn(async move {
+                                                                direct.closed().await;
+                                                                if let Some(entry) = vhost_reg
+                                                                    .get(&key)
+                                                                    .map(|e| Arc::clone(e.value()))
+                                                                {
+                                                                    entry.direct.remove(id);
+                                                                    debug!(subdomain = %key, id, carriers = entry.direct.len(), "vhost QUIC direct carrier closed");
+                                                                }
+                                                            });
+                                                        }
+                                                        None => {
+                                                            debug!(subdomain = %key, "vhost QUIC direct pool full; dropping extra carrier");
+                                                            direct.close();
+                                                        }
+                                                    }
+                                                } else {
+                                                    debug!(subdomain = %key, "vhost QUIC connection arrived after provider deregistered");
+                                                }
                                             }
                                         }
-                                        Err(err) => debug!(%err, "vhost QUIC handshake rejected"),
+                                        Err(err) => debug!(%err, "QUIC handshake rejected"),
                                     }
                                 });
                             }
@@ -892,8 +1017,9 @@ impl Server {
             Some(ClientMessage::UdpCandidates(_))
             | Some(ClientMessage::UdpCandidateOffer(_))
             | Some(ClientMessage::UdpStunHintRequest)
-            | Some(ClientMessage::VhostUdpRenew { .. }) => {
-                warn!("unexpected udp candidates as first message");
+            | Some(ClientMessage::VhostUdpRenew { .. })
+            | Some(ClientMessage::PublicUdpRenew { .. }) => {
+                warn!("unexpected udp renewal as first message");
                 Ok(())
             }
             Some(ClientMessage::TestUdpJoin {
@@ -1074,9 +1200,54 @@ impl Server {
             basic_auth: opts.basic_auth.is_some(),
             https: opts.https,
             force_https: opts.force_https,
-            udp: false,
+            udp: opts.udp,
         });
         let active = registration.active();
+
+        // Register UDP direct path when the client requests it (DEC-LU3/LU4).
+        #[cfg(feature = "udp")]
+        let _public_deregister = if opts.udp && self.udp {
+            let key = format!("port:{}", port);
+            let entry = Arc::new(PublicDirectEntry {
+                direct: vhost::DirectPool::default(),
+                direct_stream_opens: std::sync::atomic::AtomicU64::new(0),
+            });
+            self.public_udp_registry.insert(key.clone(), entry);
+
+            // Generate a nonce for the direct-path handshake.
+            let nonce = {
+                use ring::rand::{SecureRandom, SystemRandom};
+                let mut n = [0u8; crate::shared::UDP_NONCE_LEN];
+                SystemRandom::new()
+                    .fill(&mut n)
+                    .expect("system CSPRNG must not fail");
+                n
+            };
+            self.pending_public_udp.insert(key.clone(), nonce);
+
+            // Offer the direct path to the client.
+            let tuning = self.udp_tuning;
+            if let Err(err) = control
+                .send(ServerMessage::PublicUdp {
+                    port: self.vhost_quic_port,
+                    nonce,
+                    tuning,
+                })
+                .await
+            {
+                warn!(%err, port, "failed to send PublicUdp offer");
+            } else {
+                info!(port, "offered public direct udp path");
+            }
+
+            Some(PublicDeregister {
+                registry: Arc::clone(&self.public_udp_registry),
+                pending_udp: Arc::clone(&self.pending_public_udp),
+                key,
+            })
+        } else {
+            None
+        };
 
         let mut heartbeat = interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1138,6 +1309,15 @@ impl Server {
                     let domain = self.bind_domain.clone();
                     let opts = opts.clone();
                     let active = Arc::clone(&active);
+                    #[cfg(feature = "udp")]
+                    let public_direct_entry = if opts.udp {
+                        let key = format!("port:{}", port);
+                        self.public_udp_registry.get(&key).map(|e| Arc::clone(e.value()))
+                    } else {
+                        None
+                    };
+                    #[cfg(not(feature = "udp"))]
+                    let _public_direct_entry: Option<Arc<()>> = None;
                     tokio::spawn(async move {
                         let _permit = permit;
                         let _active = ActiveGuard::new(active);
@@ -1153,6 +1333,45 @@ impl Server {
                                     return;
                                 }
                             };
+                        // Try direct QUIC path first (DEC-LU4), fall back to relay on error.
+                        #[cfg(feature = "udp")]
+                        let used_direct = if let Some(entry) = &public_direct_entry {
+                            if let Some(direct_conn) = entry.direct.pick() {
+                                if let Ok(mut stream) = direct_conn.open_stream().await {
+                                    // Write STREAM_READY marker (DEC-LU6) before data flows.
+                                    if stream.write_all(&[mux::STREAM_READY]).await.is_ok() {
+                                        entry.direct_stream_opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        let buf = proxy_buffer_size();
+                                        let result = tokio::io::copy_bidirectional_with_sizes(
+                                            &mut edge,
+                                            &mut stream,
+                                            buf,
+                                            buf,
+                                        ).await;
+                                        if let Err(err) = result {
+                                            trace!(%err, "direct proxied connection closed");
+                                        }
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        // If direct succeeded, we're done.
+                        #[cfg(feature = "udp")]
+                        if used_direct {
+                            return;
+                        }
+
+                        // Relay fallback.
                         match opener.open().await {
                             Ok(mut stream) => {
                                 // Announce the lazily-opened substream so the client

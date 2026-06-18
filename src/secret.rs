@@ -228,6 +228,8 @@ pub async fn serve_provider(
         basic_auth,
         https: false,
         force_https: false,
+        carriers,
+        auto_reconnect: false,
         udp: false,
     });
     info!(%id, "secret provider registered");
@@ -361,9 +363,14 @@ pub async fn serve_consumer(
         basic_auth: false,
         https: false,
         force_https: false,
+        carriers: 0,
+        auto_reconnect: false,
         udp: false,
     });
     let active = admin_reg.active();
+    // Per-tunnel relay byte counters for this consumer (shown on the admin page).
+    // Summed off the hot path, once per closed relayed substream.
+    let (relay_tx, relay_rx) = admin_reg.relay_bytes();
 
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -428,11 +435,13 @@ pub async fn serve_consumer(
                 let active = Arc::clone(&active);
                 let grx = Arc::clone(&grx);
                 let gtx = Arc::clone(&gtx);
+                let erx = Arc::clone(&relay_rx);
+                let etx = Arc::clone(&relay_tx);
                 tokio::spawn(
                     async move {
                         let _permit = permit;
                         let _active = ActiveGuard::new(active);
-                        if let Err(err) = relay(consumer_stream, registry, &id, grx, gtx).await {
+                        if let Err(err) = relay(consumer_stream, registry, &id, grx, gtx, erx, etx).await {
                             trace!(%err, "secret relay closed");
                         }
                     }
@@ -515,6 +524,8 @@ async fn relay(
     id: &str,
     grx: Arc<std::sync::atomic::AtomicU64>,
     gtx: Arc<std::sync::atomic::AtomicU64>,
+    erx: Arc<std::sync::atomic::AtomicU64>,
+    etx: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
     // Consume the consumer's readiness marker (it announced the substream).
     let mut marker = [0u8; 1];
@@ -536,6 +547,8 @@ async fn relay(
     let (rx_bytes, tx_bytes) = result;
     grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
     gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
+    erx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
+    etx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 

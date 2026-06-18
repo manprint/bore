@@ -57,6 +57,12 @@ pub struct Entry {
     pub https: bool,
     /// Whether the public tunnel redirects plain HTTP to https (`--force-https`).
     pub force_https: bool,
+    /// Number of parallel TCP carrier connections the client requested
+    /// (`--carriers`; `0`/`1` = single-connection default).
+    pub carriers: u16,
+    /// Whether the client runs with `--auto-reconnect` (client-side reconnect
+    /// loop; informational, sent over the wire via `TunnelOptions`).
+    pub auto_reconnect: bool,
     /// When the connection registered (for an uptime readout).
     pub since: Instant,
     /// Provider: registered as UDP-capable. Consumer: requested a direct path.
@@ -94,6 +100,10 @@ pub struct NewEntry {
     pub https: bool,
     /// See [`Entry::force_https`].
     pub force_https: bool,
+    /// See [`Entry::carriers`].
+    pub carriers: u16,
+    /// See [`Entry::auto_reconnect`].
+    pub auto_reconnect: bool,
     /// Initial value of [`Entry::udp`].
     pub udp: bool,
 }
@@ -119,6 +129,10 @@ pub struct EntryView {
     pub https: bool,
     /// See [`Entry::force_https`].
     pub force_https: bool,
+    /// See [`Entry::carriers`].
+    pub carriers: u16,
+    /// See [`Entry::auto_reconnect`].
+    pub auto_reconnect: bool,
     /// See [`Entry::udp`].
     pub udp: bool,
     /// Seconds since the connection registered.
@@ -171,6 +185,8 @@ impl AdminRegistry {
             basic_auth: new.basic_auth,
             https: new.https,
             force_https: new.force_https,
+            carriers: new.carriers,
+            auto_reconnect: new.auto_reconnect,
             since: Instant::now(),
             udp: AtomicBool::new(new.udp),
             active: Arc::new(AtomicUsize::new(0)),
@@ -206,6 +222,8 @@ impl AdminRegistry {
                     basic_auth: entry.basic_auth,
                     https: entry.https,
                     force_https: entry.force_https,
+                    carriers: entry.carriers,
+                    auto_reconnect: entry.auto_reconnect,
                     udp: entry.udp.load(Ordering::Relaxed),
                     uptime_secs: entry.since.elapsed().as_secs(),
                     active: entry.active.load(Ordering::Relaxed),
@@ -315,6 +333,8 @@ mod tests {
             basic_auth: false,
             https: false,
             force_https: false,
+            carriers: 0,
+            auto_reconnect: false,
             udp: false,
         }
     }
@@ -356,5 +376,34 @@ mod tests {
         assert!(!reg.snapshot()[0].udp);
         handle.mark_udp();
         assert!(reg.snapshot()[0].udp);
+    }
+
+    #[test]
+    fn relay_counters_snapshot() {
+        // BUG-1: the per-entry relay byte counters were never incremented. This
+        // proves the read path (snapshot) reflects writes through `relay_bytes()`.
+        let reg = AdminRegistry::default();
+        let handle = reg.register(sample(Role::Public));
+        assert_eq!(reg.snapshot()[0].relay_tx_bytes, 0);
+        assert_eq!(reg.snapshot()[0].relay_rx_bytes, 0);
+        let (tx, rx) = handle.relay_bytes();
+        tx.fetch_add(4096, Ordering::Relaxed);
+        rx.fetch_add(2048, Ordering::Relaxed);
+        let view = &reg.snapshot()[0];
+        assert_eq!(view.relay_tx_bytes, 4096);
+        assert_eq!(view.relay_rx_bytes, 2048);
+    }
+
+    #[test]
+    fn carriers_and_auto_reconnect_in_snapshot() {
+        // BUG-3: carriers + auto_reconnect must survive into the admin snapshot.
+        let reg = AdminRegistry::default();
+        let mut new = sample(Role::Public);
+        new.carriers = 4;
+        new.auto_reconnect = true;
+        let _handle = reg.register(new);
+        let view = &reg.snapshot()[0];
+        assert_eq!(view.carriers, 4);
+        assert!(view.auto_reconnect);
     }
 }

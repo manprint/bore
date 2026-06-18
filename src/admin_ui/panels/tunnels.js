@@ -4,6 +4,22 @@
 
 import { table, badge, notesCell, fmtBytes, fmtDuration, escapeHtml } from '../ui.js';
 
+/**
+ * Flag badges for a public tunnel (BUG-3). Pure (no DOM) so it is unit-testable;
+ * the render maps each spec through `badge()`. Covers every operator-visible
+ * flag: https, force_https, basic_auth, udp, carriers (>1), auto_reconnect.
+ */
+export function tunnelBadges(t) {
+    const b = [];
+    if (t.https) b.push({ label: 'HTTPS', kind: 'primary' });
+    if (t.force_https) b.push({ label: 'Force-HTTPS', kind: 'primary' });
+    if (t.basic_auth) b.push({ label: 'Basic Auth', kind: 'warning' });
+    if (t.udp) b.push({ label: 'UDP', kind: 'success' });
+    if (t.carriers > 1) b.push({ label: `x${t.carriers} carriers`, kind: 'default' });
+    if (t.auto_reconnect) b.push({ label: 'Auto-reconnect', kind: 'success' });
+    return b;
+}
+
 export default {
     id: 'tunnels',
     title: 'Tunnels',
@@ -23,15 +39,10 @@ export default {
         }
 
         const rows = data.map(tunnel => {
-            const badges = [];
-            if (tunnel.https) badges.push(badge('HTTPS', 'primary'));
-            if (tunnel.basic_auth) badges.push(badge('Basic Auth', 'warning'));
-            if (tunnel.udp) badges.push(badge('UDP', 'success'));
-
             const badgeCell = document.createElement('span');
-            badges.forEach((b, i) => {
+            tunnelBadges(tunnel).forEach((spec, i) => {
                 if (i > 0) badgeCell.appendChild(document.createTextNode(' '));
-                badgeCell.appendChild(b);
+                badgeCell.appendChild(badge(spec.label, spec.kind));
             });
 
             return {

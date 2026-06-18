@@ -112,18 +112,23 @@ export function table(headers, rows) {
  */
 export function notesCell(text, maxLen = 50) {
     const cell = document.createElement('span');
-    cell.className = 'notes-cell';
 
+    // BUG-2: only notes long enough to be truncated get the clickable
+    // (underlined, pointer) affordance + expand handler. Short/empty notes are
+    // plain text — previously they carried the clickable class with no handler,
+    // so they looked like a link but did nothing.
     if (!text || text.length <= maxLen) {
-        cell.textContent = escapeHtml(text || '');
+        cell.className = 'notes-plain';
+        cell.textContent = text || ''; // textContent is auto-escaped by the DOM
         return cell;
     }
 
+    cell.className = 'notes-cell';
+    cell.setAttribute('title', text);
     const truncated = escapeHtml(text.substring(0, maxLen)) + '...';
     cell.innerHTML = truncated;
 
-    cell.addEventListener('click', (e) => {
-        e.preventDefault();
+    cell.addEventListener('click', () => {
         if (cell.classList.contains('expanded')) {
             cell.classList.remove('expanded');
             cell.innerHTML = truncated;

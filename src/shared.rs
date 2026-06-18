@@ -195,6 +195,12 @@ pub struct TunnelOptions {
     /// `#[serde(default)]` keeps the wire format backward-compatible.
     #[serde(default)]
     pub udp: bool,
+    /// Whether the client runs with `--auto-reconnect` (a client-side reconnect
+    /// loop). Sent purely so the admin status page can show it; the server takes
+    /// no action on it. `#[serde(default)]` keeps the wire format
+    /// backward-compatible (an old client omits it ⇒ reads as `false`).
+    #[serde(default)]
+    pub auto_reconnect: bool,
 }
 
 /// Options negotiated by two `bore test-udp` peers once the server pairs them.
@@ -1333,6 +1339,38 @@ mod tests {
             SockRef::from(&stream).keepalive().unwrap(),
             "SO_KEEPALIVE must be set"
         );
+    }
+
+    #[test]
+    fn tunnelopts_compat_missing_new_fields_default() {
+        // I-COMPAT (D4): an old client omits `carriers`/`udp`/`auto_reconnect`;
+        // a new server must read them as their defaults rather than failing.
+        let opts: TunnelOptions = serde_json::from_str(
+            r#"{"https":true,"force_https":false,"basic_auth":null,"notes":null}"#,
+        )
+        .expect("legacy TunnelOptions must still deserialize");
+        assert!(opts.https);
+        assert_eq!(opts.carriers, 0);
+        assert!(!opts.udp);
+        assert!(
+            !opts.auto_reconnect,
+            "missing auto_reconnect defaults to false"
+        );
+
+        // Round-trip with the new field set survives.
+        let full = TunnelOptions {
+            https: true,
+            force_https: true,
+            basic_auth: None,
+            notes: None,
+            carriers: 4,
+            udp: true,
+            auto_reconnect: true,
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        let back: TunnelOptions = serde_json::from_str(&json).unwrap();
+        assert!(back.auto_reconnect);
+        assert_eq!(back.carriers, 4);
     }
 
     #[test]

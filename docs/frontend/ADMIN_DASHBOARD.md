@@ -289,15 +289,39 @@ Exit code 0 = all pass; nonzero = failure(s). Uses `jq` for JSON if available, f
 - `t_shell_served` — shell 200 text/html
 - `t_legacy_data_compat` — **T-COMPAT**: legacy shape pinned (§5.2)
 
+**Frontend unit tests** (zero npm deps — Node's built-in test runner + a tiny
+DOM stub; see `test/admin_ui/`):
+```bash
+npm test          # === node --test "test/admin_ui/**/*.test.js"
+```
+- `smoke.test.js` — harness/import sanity (`fmtBytes`, `badge`)
+- `poller.test.js` — **BUG-0**: the poll timer actually calls the refresh fn
+- `metrics-rate.test.js` — **BUG-5**: `rateFromSamples` delta math + NaN/Inf guards
+- `notes.test.js` — **BUG-2**: short notes plain, long notes click-to-expand
+- `badges.test.js` — **BUG-3**: all flags surface as badges; only CSS-defined kinds
+- `dom-stub.js` — minimal headless DOM (not a real DOM; only what the code touches)
+
+> The DOM stub + tests live in `test/` (NOT `src/admin_ui/`), so `build.rs` does
+> not embed them. The repo-root `package.json` only sets `"type":"module"` so
+> Node treats the existing ES-module `.js` as ESM; it is dev-only.
+
 **e2e test** (run with `sudo -n /path/scripts/admin_dashboard_test.sh`):
 - T-REF1 .. T-REF4 — reference scenario assertions
 - T-AUTH-E2E, T-COMPAT-E2E — contract-level acceptance
+- **T-BUG1** — per-tunnel TX/RX > 0 after a real transfer (was always 0)
+- **T-BUG3** — all-flags tunnel exposes `carriers`/`force_https`/`auto_reconnect`/`notes`
+- **T-BUG4** — certs are deduped (single entry, no duplicate card)
+
+> **Rebuild caveat:** the served JS is embedded at build time. After editing any
+> `src/admin_ui/*` file, rebuild (`cargo build --release --features vpn`) before
+> running the netns e2e — the harness refuses a binary older than `src/`.
 
 All gates:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-features --all-targets -- -D warnings
 cargo test --all-features
+npm test                     # frontend unit tests
 cargo audit  # for new x509-parser dep
 ```
 
@@ -306,6 +330,39 @@ cargo audit  # for new x509-parser dep
 ## Changelog entry
 
 See `docs/CHANGELOG.md` for the Phase 5 entry added to the unreleased section.
+
+---
+
+## Bug fixes (2026-06-18)
+
+A bug-hunt pass over `/admin/status` found and fixed seven defects (plan:
+`docs/frontend/ADMIN_DASHBOARD_BUGFIX_PLAN.md`).
+
+| Bug | Layer | Root cause | Fix |
+|-----|-------|-----------|-----|
+| **BUG-0** auto-refresh dead | frontend | `app.js` dispatched a `panel:refresh` event **no one listened to** | `poller.js` owns the timer and calls `router.refreshCurrent()` directly; the dead event is gone |
+| **BUG-1** TX/RX always `0` | backend | per-tunnel `relay_tx_bytes`/`relay_rx_bytes` were **never incremented** (only the global counters were) | `fetch_add(Relaxed)` at the existing post-splice sites (`server.rs`, `secret.rs`) — see I-PERF |
+| **BUG-2** notes fake link | frontend | `notesCell` set the clickable class unconditionally but only attached the handler when truncated | clickable affordance + handler **only** for truncated notes; short notes are plain text (`.notes-plain`) |
+| **BUG-3** flags missing | both | `force_https` wasn't rendered; `carriers` was dropped at registration; `auto_reconnect` was client-only | `carriers`+`auto_reconnect` threaded into the admin record (the latter added to `TunnelOptions`, `#[serde(default)]`); `tunnelBadges()` renders every flag |
+| **BUG-4** cert shown twice | backend | `certs()` pushed the control **and** vhost cert even when they are the same file | `dedup_merge_label()` merges into one card (label `control+vhost`) by canonical path |
+| **BUG-5** metrics wrong/stale | both | "stale" = BUG-0; "wrong" = cumulative totals mislabeled "Bandwidth" | relabeled **Total TX/RX** + a derived **Rate TX/RX** (`rateFromSamples`, Δbytes/Δt across polls) |
+| **BUG-6** other panels | both | flag-sweep gap | `SecretView` now carries + renders `carriers` |
+
+### TX/RX semantics & the performance guarantee (I-PERF)
+
+The per-tunnel and global byte counters are summed **off the per-byte hot path**:
+a single `AtomicU64::fetch_add(.., Relaxed)` runs **once per closed proxied
+connection**, from the `(rx, tx)` totals that `copy_bidirectional_with_sizes`
+already returns — never per byte, never under a lock. Measurement therefore does
+**not** reduce tunnel throughput (verified: the data path is unchanged; the add is
+post-splice). Direction (server's perspective): `relay_rx_bytes` = ingress from
+the visitor, `relay_tx_bytes` = egress to the visitor — matching the global
+`grx`/`gtx` mapping. The metrics **rate** is computed on the frontend from two
+cumulative samples, so the server keeps no rate state.
+
+`auto_reconnect` is sent over the wire purely so the admin page can show it; the
+server takes no action on it. `#[serde(default)]` keeps the `TunnelOptions` wire
+format backward-compatible (old client ↔ new server).
 
 ---
 

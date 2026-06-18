@@ -4,6 +4,24 @@
 
 import { fmtDuration, fmtBytes, escapeHtml } from '../ui.js';
 
+/**
+ * BUG-5: the `bandwidth_*` fields are CUMULATIVE totals, not a rate. Derive a
+ * rate from two successive samples: bytes/second per direction. Returns null on
+ * the first sample or a non-positive time delta (avoids NaN/Infinity).
+ * `prev`/`cur` = { tx, rx, t } where t is seconds.
+ */
+export function rateFromSamples(prev, cur) {
+    if (!prev || !cur || cur.t <= prev.t) return null;
+    const dt = cur.t - prev.t;
+    return {
+        txbps: Math.max(0, (cur.tx - prev.tx) / dt),
+        rxbps: Math.max(0, (cur.rx - prev.rx) / dt),
+    };
+}
+
+// Module-scoped last sample; persists across polls so the rate is delta-based.
+let _lastSample = null;
+
 export default {
     id: 'metrics',
     title: 'Metrics',
@@ -41,23 +59,54 @@ export default {
         `;
         container.appendChild(memCard);
 
-        // Bandwidth TX
+        // Total TX/RX are cumulative byte counters; the rate is derived from the
+        // delta between successive polls (BUG-5: these were mislabeled "Bandwidth"
+        // and never updated because polling was broken — see poller.js / BUG-0).
+        const now = Date.now() / 1000;
+        const cur = {
+            tx: data.bandwidth_tx_bytes ?? 0,
+            rx: data.bandwidth_rx_bytes ?? 0,
+            t: now,
+        };
+        const rate = rateFromSamples(_lastSample, cur);
+        _lastSample = cur;
+        const rateStr = (bps) => (rate ? `${fmtBytes(bps)}/s` : '—');
+
+        // Total TX (cumulative)
         const txCard = document.createElement('div');
         txCard.className = 'metric-card';
         txCard.innerHTML = `
-            <div class="metric-label">Bandwidth TX</div>
-            <div class="metric-value">${escapeHtml(fmtBytes(data.bandwidth_tx_bytes))}</div>
+            <div class="metric-label">Total TX</div>
+            <div class="metric-value">${escapeHtml(fmtBytes(cur.tx))}</div>
         `;
         container.appendChild(txCard);
 
-        // Bandwidth RX
+        // Total RX (cumulative)
         const rxCard = document.createElement('div');
         rxCard.className = 'metric-card';
         rxCard.innerHTML = `
-            <div class="metric-label">Bandwidth RX</div>
-            <div class="metric-value">${escapeHtml(fmtBytes(data.bandwidth_rx_bytes))}</div>
+            <div class="metric-label">Total RX</div>
+            <div class="metric-value">${escapeHtml(fmtBytes(cur.rx))}</div>
         `;
         container.appendChild(rxCard);
+
+        // Rate TX (derived)
+        const rateTxCard = document.createElement('div');
+        rateTxCard.className = 'metric-card';
+        rateTxCard.innerHTML = `
+            <div class="metric-label">Rate TX</div>
+            <div class="metric-value">${escapeHtml(rateStr(rate && rate.txbps))}</div>
+        `;
+        container.appendChild(rateTxCard);
+
+        // Rate RX (derived)
+        const rateRxCard = document.createElement('div');
+        rateRxCard.className = 'metric-card';
+        rateRxCard.innerHTML = `
+            <div class="metric-label">Rate RX</div>
+            <div class="metric-value">${escapeHtml(rateStr(rate && rate.rxbps))}</div>
+        `;
+        container.appendChild(rateRxCard);
 
         // Live counts section
         const countsSection = document.createElement('div');

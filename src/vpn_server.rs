@@ -690,6 +690,8 @@ pub async fn serve_vpn_listener(
         basic_auth: false,
         https: false,
         force_https: false,
+        carriers: 0,
+        auto_reconnect: false,
         udp: false,
     });
 
@@ -1086,6 +1088,8 @@ pub async fn serve_vpn_connector(
             basic_auth: false,
             https: false,
             force_https: false,
+            carriers: 0,
+            auto_reconnect: false,
             udp: false,
         });
         admin_reg.set_overlay(format!("{}/32", peer_slot.overlay));
@@ -1390,6 +1394,8 @@ pub async fn serve_vpn_connector(
         basic_auth: false,
         https: false,
         force_https: false,
+        carriers: 0,
+        auto_reconnect: false,
         udp: false,
     });
     admin_reg.set_overlay(format!("{connector_overlay}/30"));

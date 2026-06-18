@@ -50,6 +50,10 @@ pub struct TunnelView {
     pub https: bool,
     /// Force HTTP→HTTPS redirect.
     pub force_https: bool,
+    /// Number of parallel TCP carrier connections (1 = single-connection path).
+    pub carriers: u16,
+    /// Client runs with `--auto-reconnect`.
+    pub auto_reconnect: bool,
     /// UDP direct-path enabled.
     pub udp: bool,
     /// VPN overlay address (if applicable).
@@ -79,6 +83,8 @@ pub struct SecretView {
     pub secret_id: Option<String>,
     /// HTTP Basic auth enforced.
     pub basic_auth: bool,
+    /// Number of parallel TCP carrier connections (1 = single-connection path).
+    pub carriers: u16,
     /// UDP direct-path enabled.
     pub udp: bool,
     /// Active proxied connections.
@@ -276,7 +282,9 @@ mod tests {
             notes: Some("test".into()),
             basic_auth: false,
             https: true,
-            force_https: false,
+            force_https: true,
+            carriers: 4,
+            auto_reconnect: true,
             udp: false,
             overlay: None,
             vpn_direct: false,
@@ -288,6 +296,10 @@ mod tests {
         let json = serde_json::to_value(&tunnel).unwrap();
         assert!(json["public_port"].is_number());
         assert!(json["relay_tx_bytes"].is_number());
+        // BUG-3: carriers + auto_reconnect + force_https must reach the JSON.
+        assert_eq!(json["carriers"], 4);
+        assert_eq!(json["auto_reconnect"], true);
+        assert_eq!(json["force_https"], true);
 
         let config = ConfigView {
             port_range: "5000-6000".into(),

@@ -50,6 +50,8 @@ pub fn tunnels(server: &Server) -> Vec<TunnelView> {
             basic_auth: e.basic_auth,
             https: e.https,
             force_https: e.force_https,
+            carriers: e.carriers,
+            auto_reconnect: e.auto_reconnect,
             udp: e.udp,
             overlay: e.overlay,
             vpn_direct: e.vpn_direct,
@@ -74,6 +76,7 @@ pub fn secret(server: &Server) -> Vec<SecretView> {
             peer: e.peer,
             secret_id: e.secret_id,
             basic_auth: e.basic_auth,
+            carriers: e.carriers,
             udp: e.udp,
             active: e.active,
             uptime_secs: e.uptime_secs,
@@ -219,6 +222,35 @@ pub struct VpnSectionView {
     pub links: Vec<VpnLinkView>,
 }
 
+/// Canonicalize a path for certificate dedup comparison; fall back to the raw
+/// string when the file cannot be canonicalized (e.g. it does not exist).
+fn canon_for_dedup(p: &str) -> String {
+    std::fs::canonicalize(p)
+        .map(|q| q.to_string_lossy().to_string())
+        .unwrap_or_else(|_| p.to_string())
+}
+
+/// BUG-4 dedup: if `views` already holds a cert for the same file as
+/// `candidate_path` (compared by canonical path), merge `merge_label` into that
+/// entry's label and return `true` (caller must NOT push a duplicate card).
+/// Returns `false` when no existing entry matches.
+fn dedup_merge_label(views: &mut [CertView], candidate_path: &str, merge_label: &str) -> bool {
+    let canon = canon_for_dedup(candidate_path);
+    if let Some(existing) = views.iter_mut().find(|v| {
+        v.path
+            .as_deref()
+            .map(|p| canon_for_dedup(p) == canon)
+            .unwrap_or(false)
+    }) {
+        if !existing.label.split('+').any(|l| l == merge_label) {
+            existing.label = format!("{}+{}", existing.label, merge_label);
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Build the TLS certificates section view.
 pub fn certs(server: &Server) -> Vec<CertView> {
     use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer};
@@ -262,16 +294,33 @@ pub fn certs(server: &Server) -> Vec<CertView> {
         }
     }
 
-    // Inspect vhost certificate if configured.
+    // Inspect vhost certificate if configured. BUG-4: when the vhost cert is the
+    // same file as the control cert, merge the labels into the existing card
+    // instead of emitting a duplicate.
     if let Some(cfg_arc) = server.vhost_config() {
         let cfg = cfg_arc.read().unwrap();
         if let Some(cert_path) = &cfg.cert_file {
-            match std::fs::read(cert_path) {
-                Ok(pem) => match CertificateDer::pem_slice_iter(&pem).next() {
-                    Some(Ok(der)) => {
-                        views.push(crate::certinfo::inspect(&der, "vhost", Some(cert_path)));
-                    }
-                    _ => {
+            if !dedup_merge_label(&mut views, &cert_path.to_string_lossy(), "vhost") {
+                match std::fs::read(cert_path) {
+                    Ok(pem) => match CertificateDer::pem_slice_iter(&pem).next() {
+                        Some(Ok(der)) => {
+                            views.push(crate::certinfo::inspect(&der, "vhost", Some(cert_path)));
+                        }
+                        _ => {
+                            views.push(CertView {
+                                label: "vhost".to_string(),
+                                path: Some(cert_path.to_string_lossy().to_string()),
+                                subject: None,
+                                sans: vec![],
+                                not_before: None,
+                                not_after: None,
+                                days_remaining: -999,
+                                expiring: true,
+                                error: Some("failed to parse certificate PEM".to_string()),
+                            });
+                        }
+                    },
+                    Err(_) => {
                         views.push(CertView {
                             label: "vhost".to_string(),
                             path: Some(cert_path.to_string_lossy().to_string()),
@@ -281,22 +330,9 @@ pub fn certs(server: &Server) -> Vec<CertView> {
                             not_after: None,
                             days_remaining: -999,
                             expiring: true,
-                            error: Some("failed to parse certificate PEM".to_string()),
+                            error: Some("failed to read cert file".to_string()),
                         });
                     }
-                },
-                Err(_) => {
-                    views.push(CertView {
-                        label: "vhost".to_string(),
-                        path: Some(cert_path.to_string_lossy().to_string()),
-                        subject: None,
-                        sans: vec![],
-                        not_before: None,
-                        not_after: None,
-                        days_remaining: -999,
-                        expiring: true,
-                        error: Some("failed to read cert file".to_string()),
-                    });
                 }
             }
         }
@@ -365,6 +401,44 @@ mod tests {
 
         assert_eq!(tx.load(Ordering::Relaxed), 2000);
         assert_eq!(rx.load(Ordering::Relaxed), 1000);
+    }
+
+    fn cert_with(label: &str, path: &str) -> CertView {
+        CertView {
+            label: label.to_string(),
+            path: Some(path.to_string()),
+            subject: None,
+            sans: vec![],
+            not_before: None,
+            not_after: None,
+            days_remaining: 100,
+            expiring: false,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn t_certs_dedup_same_path() {
+        // BUG-4: control + vhost certs pointing at the same (non-canonicalizable
+        // here) path must merge into one card with a combined label.
+        let path = "/nonexistent/same/cert.pem";
+        let mut views = vec![cert_with("control", path)];
+        let merged = dedup_merge_label(&mut views, path, "vhost");
+        assert!(merged, "same path must merge, not push");
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].label, "control+vhost");
+        // Idempotent: merging vhost again does not double-append.
+        assert!(dedup_merge_label(&mut views, path, "vhost"));
+        assert_eq!(views[0].label, "control+vhost");
+    }
+
+    #[test]
+    fn t_certs_distinct_paths_not_merged() {
+        let mut views = vec![cert_with("control", "/nonexistent/a.pem")];
+        let merged = dedup_merge_label(&mut views, "/nonexistent/b.pem", "vhost");
+        assert!(!merged, "distinct paths must NOT merge");
+        assert_eq!(views.len(), 1, "caller pushes the second cert itself");
+        assert_eq!(views[0].label, "control");
     }
 
     #[test]

@@ -35,8 +35,10 @@ JQ_AVAIL=false; command -v jq >/dev/null 2>&1 && JQ_AVAIL=true
 ADMIN_TOKEN="0123456789abcdef0123456789abcdef01234567"  # 40 chars
 SRV_IP="10.221.0.2"      # ns0 (server) end of the veth
 CLI_IP="10.221.0.1"      # nscli (client) end of the veth — the expected peer IP
-PUB_PORT="20050"         # explicit public port requested by the client
+PUB_PORT="20050"         # explicit public port requested by the client (plain — TX/RX test)
+PUB_PORT2="20051"        # second tunnel: all-flags client (BUG-3 flag assertions)
 CTRL_PORT="7835"
+LOCAL_SVC_PORT="9999"    # local HTTP service the plain tunnel forwards to
 
 PASS=0; FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS+1)); }
@@ -44,9 +46,11 @@ fail() { echo "FAIL: $*"; FAIL=$((FAIL+1)); }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
 TMPDIR="/tmp/bore_admin_$$"
-SERVER_PID=""; CLIENT_PID=""
+SERVER_PID=""; CLIENT_PID=""; CLIENT2_PID=""; LOCAL_PID=""
 
 cleanup() {
+    [ -n "$LOCAL_PID" ] && kill "$LOCAL_PID" 2>/dev/null
+    [ -n "$CLIENT2_PID" ] && kill "$CLIENT2_PID" 2>/dev/null
     [ -n "$CLIENT_PID" ] && kill "$CLIENT_PID" 2>/dev/null
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     pkill -9 -f 'target/release/bore' 2>/dev/null
@@ -104,10 +108,23 @@ done
 $ready || { cat "$SERVER_LOG"; die "server control port not ready"; }
 echo "  Server up (pid $SERVER_PID)"
 
+# ── Local HTTP service the plain tunnel forwards to (for TX/RX accounting) ──────
+# Optional: only runs if python3 is present; the byte-counter assertions skip
+# otherwise. Serves a fixed 64 KiB payload so a download moves real bytes.
+PY_AVAIL=false; command -v python3 >/dev/null 2>&1 && PY_AVAIL=true
+PAYLOAD_BYTES=65536
+if $PY_AVAIL; then
+    mkdir -p "$TMPDIR/www"
+    head -c "$PAYLOAD_BYTES" /dev/zero | tr '\0' 'x' > "$TMPDIR/www/payload"
+    ( cd "$TMPDIR/www" && exec ip netns exec nscli python3 -m http.server "$LOCAL_SVC_PORT" ) \
+        >"$TMPDIR/httpd.log" 2>&1 &
+    LOCAL_PID=$!
+fi
+
 # ── Start a public tunnel from nscli (deterministic peer IP + port) ─────────────
 echo "=== Starting public tunnel (bore local from $CLI_IP) ==="
 CLIENT_LOG="$TMPDIR/client.log"
-ip netns exec nscli "$BORE" local 9999 \
+ip netns exec nscli "$BORE" local "$LOCAL_SVC_PORT" \
     --to "https://$SRV_IP:$CTRL_PORT" --insecure -p "$PUB_PORT" \
     >"$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
@@ -120,6 +137,21 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 $registered || { echo "client log:"; cat "$CLIENT_LOG"; echo "(tunnel did not register; continuing)"; }
+
+# ── Second tunnel: an all-flags client (BUG-3: carriers/force_https/auto_reconnect/notes) ──
+echo "=== Starting all-flags public tunnel (port $PUB_PORT2) ==="
+CLIENT2_LOG="$TMPDIR/client2.log"
+NOTE_TEXT="superdufs lenovo lavoro 5353"
+ip netns exec nscli "$BORE" local 9998 \
+    --to "https://$SRV_IP:$CTRL_PORT" --insecure -p "$PUB_PORT2" \
+    --carriers 4 --https --force-https --auto-reconnect --notes "$NOTE_TEXT" \
+    >"$CLIENT2_LOG" 2>&1 &
+CLIENT2_PID=$!
+for _ in $(seq 1 50); do
+    body=$(ip netns exec ns0 curl -sk -H "Authorization: Bearer $ADMIN_TOKEN" "$B/admin/api/v1/tunnels" 2>/dev/null)
+    echo "$body" | grep -q "\"public_port\":$PUB_PORT2" && break
+    sleep 0.1
+done
 
 # ── HTTP helper (admin calls over HTTPS from inside ns0) ─────────────────────────
 # Usage: aget <path> [token]   → echoes "<http_code>\n<body>"
@@ -212,6 +244,55 @@ R=$(aget /admin/status/data "$ADMIN_TOKEN"); C=$(code_of "$R"); BODY=$(body_of "
 if [ "$C" = "200" ] && echo "$BODY" | grep -q '"server"' && echo "$BODY" | grep -q '"tunnels"'; then
     pass "T-COMPAT /admin/status/data legacy shape (server+tunnels)"
 else fail "T-COMPAT got code=$C body=$BODY"; fi
+
+echo ""
+echo "=== Bug-fix contract assertions ==="
+
+# T-BUG3: all-flags tunnel exposes carriers + force_https + auto_reconnect + notes.
+R=$(aget /admin/api/v1/tunnels "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+if $JQ_AVAIL; then
+    ok=$(echo "$BODY" | jq -e --arg n "$NOTE_TEXT" \
+        'any(.[]; .public_port==20051 and .carriers==4 and .force_https==true and .auto_reconnect==true and .notes==$n)' \
+        >/dev/null 2>&1 && echo y)
+else
+    ok=$(echo "$BODY" | grep -q '"carriers":4' \
+        && echo "$BODY" | grep -q '"force_https":true' \
+        && echo "$BODY" | grep -q '"auto_reconnect":true' && echo y)
+fi
+[ "$ok" = "y" ] && pass "T-BUG3 carriers=4 + force_https + auto_reconnect + notes in JSON" \
+    || fail "T-BUG3 missing flags; body=$BODY"
+
+# T-BUG1: per-tunnel TX/RX increment after a real transfer (was always 0).
+if $PY_AVAIL; then
+    ip netns exec ns0 curl -s -m 10 -o /dev/null "http://127.0.0.1:$PUB_PORT/payload" 2>/dev/null
+    sleep 0.3
+    R=$(aget /admin/api/v1/tunnels "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+    if $JQ_AVAIL; then
+        ok=$(echo "$BODY" | jq -e \
+            'any(.[]; .public_port==20050 and .relay_tx_bytes>0 and .relay_rx_bytes>0)' \
+            >/dev/null 2>&1 && echo y)
+    else
+        ok=$(echo "$BODY" | grep -Eq '"relay_tx_bytes":[1-9]' && echo y)
+    fi
+    [ "$ok" = "y" ] && pass "T-BUG1 relay_tx_bytes/relay_rx_bytes > 0 after transfer" \
+        || fail "T-BUG1 counters still 0 after transfer; body=$BODY"
+else
+    echo "SKIP: python3 absent — T-BUG1 TX/RX transfer test skipped"
+fi
+
+# T-BUG4: certs are deduped. The harness configures only the control cert, so
+# exactly one entry must be reported (a regression that double-counts would show
+# 2). The same-file control+vhost merge is covered by the Rust unit tests.
+R=$(aget /admin/api/v1/certs "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+if $JQ_AVAIL; then
+    n=$(echo "$BODY" | jq 'length' 2>/dev/null)
+    [ "$n" = "1" ] && pass "T-BUG4 certs single entry (len=1, no duplicate)" \
+        || fail "T-BUG4 certs len=$n; body=$BODY"
+else
+    cnt=$(echo "$BODY" | grep -o '"label"' | wc -l)
+    [ "$cnt" = "1" ] && pass "T-BUG4 certs single entry (grep label count=1)" \
+        || fail "T-BUG4 label count=$cnt; body=$BODY"
+fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""

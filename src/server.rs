@@ -1359,9 +1359,15 @@ impl Server {
             basic_auth: opts.basic_auth.is_some(),
             https: opts.https,
             force_https: opts.force_https,
+            carriers: opts.carriers,
+            auto_reconnect: opts.auto_reconnect,
             udp: opts.udp,
         });
         let active = registration.active();
+        // Per-tunnel relay byte counters (shown on /admin/status#/tunnels). These
+        // are summed off the hot path — once per closed proxied connection, from
+        // the totals `copy_bidirectional_with_sizes` returns — never per byte.
+        let (relay_tx, relay_rx) = registration.relay_bytes();
 
         // Register UDP direct path when the client requests it (DEC-LU3/LU4).
         #[cfg(feature = "udp")]
@@ -1470,6 +1476,8 @@ impl Server {
                     let active = Arc::clone(&active);
                     let grx = Arc::clone(&self.total_rx_bytes);
                     let gtx = Arc::clone(&self.total_tx_bytes);
+                    let erx = Arc::clone(&relay_rx);
+                    let etx = Arc::clone(&relay_tx);
                     #[cfg(feature = "udp")]
                     let public_direct_entry = if opts.udp {
                         let key = format!("port:{}", port);
@@ -1512,6 +1520,8 @@ impl Server {
                                         if let Ok((rx_bytes, tx_bytes)) = result {
                                             grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
                                             gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
+                                            erx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
+                                            etx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
                                         } else if let Err(err) = result {
                                             trace!(%err, "direct proxied connection closed");
                                         }
@@ -1555,6 +1565,8 @@ impl Server {
                                 if let Ok((rx_bytes, tx_bytes)) = result {
                                     grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
                                     gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
+                                    erx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
+                                    etx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
                                 } else if let Err(err) = result {
                                     trace!(%err, "proxied connection closed");
                                 }

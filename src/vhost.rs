@@ -585,6 +585,8 @@ pub async fn serve_vhost_provider(
         basic_auth,
         https: false,
         force_https: false,
+        carriers: 0,
+        auto_reconnect: false,
         udp: false,
     });
 

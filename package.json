@@ -1,0 +1,9 @@
+{
+  "name": "bore-admin-ui-tests",
+  "private": true,
+  "type": "module",
+  "description": "Dev-only test harness for the /admin/status SPA (src/admin_ui). Not embedded in the binary; build.rs walks src/admin_ui only.",
+  "scripts": {
+    "test": "node --test \"test/admin_ui/**/*.test.js\""
+  }
+}

@@ -280,7 +280,9 @@ async fn max_conns_permit_recovers_after_rapid_churn() -> Result<()> {
         0,
         None,
         false,
-        TunnelOptions::default(),
+        TunnelOptions {
+            ..Default::default()
+        },
     )
     .await?;
     let addr: SocketAddr = ([127, 0, 0, 1], client.remote_port()).into();

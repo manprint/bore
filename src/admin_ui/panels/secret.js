@@ -26,6 +26,7 @@ export default {
             const badges = [];
             if (secret.udp) badges.push(badge('UDP', 'success'));
             if (secret.basic_auth) badges.push(badge('Basic Auth', 'warning'));
+            if (secret.carriers > 1) badges.push(badge(`x${secret.carriers} carriers`, 'default'));
 
             const badgeCell = document.createElement('span');
             badges.forEach((b, i) => {

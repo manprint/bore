@@ -1336,6 +1336,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         notes,
                         carriers,
                         udp,
+                        auto_reconnect,
                     };
                     let connect = move || {
                         let (local_host, to, secret, options) = (

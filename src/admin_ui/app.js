@@ -4,10 +4,12 @@
  */
 
 import registry from './registry.js';
-import { setupRouter } from './router.js';
+import { setupRouter, refreshCurrent } from './router.js';
+import { createPoller } from './poller.js';
 import { getToken, setToken, clearToken } from './store.js';
 
-let pollInterval = null;
+// One poller for the whole app; it re-fetches + repaints the active panel.
+const poller = createPoller(() => refreshCurrent());
 
 function buildSidebar() {
     const menu = document.getElementById('menu');
@@ -52,15 +54,8 @@ function setupLoginOverlay() {
 
 function setupPolling() {
     const activePanel = registry.find(p => p.route === (window.location.hash.slice(1).split('/')[1] || 'overview'));
-    if (activePanel && activePanel.refreshMs > 0) {
-        if (pollInterval) clearInterval(pollInterval);
-        pollInterval = setInterval(() => {
-            // Re-fetch and re-render
-            window.dispatchEvent(new CustomEvent('panel:refresh'));
-        }, activePanel.refreshMs);
-    } else {
-        if (pollInterval) clearInterval(pollInterval);
-    }
+    // (Re)arm the poller for the active panel; refreshMs<=0 (or no panel) stops it.
+    poller.start(activePanel && activePanel.refreshMs > 0 ? activePanel.refreshMs : 0);
 }
 
 window.addEventListener('hashchange', setupPolling);

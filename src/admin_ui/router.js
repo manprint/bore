@@ -2,6 +2,10 @@
  * Hash router: listen to #/<route> and dispatch to the appropriate panel.
  */
 
+// Set by setupRouter; re-renders the currently active route. Used by the poll
+// timer (BUG-0) so auto-refresh actually re-fetches + repaints the live panel.
+let _refresh = null;
+
 export function setupRouter(registry) {
     function getRoute() {
         const hash = window.location.hash.slice(1); // Remove #
@@ -44,6 +48,9 @@ export function setupRouter(registry) {
         }
     }
 
+    // Expose a refresh hook for the poll timer (re-fetch + repaint current route).
+    _refresh = () => renderPanel(getRoute());
+
     // Handle hash change
     window.addEventListener('hashchange', () => {
         renderPanel(getRoute());
@@ -51,4 +58,12 @@ export function setupRouter(registry) {
 
     // Initial render
     renderPanel(getRoute());
+}
+
+/**
+ * Re-fetch and re-render the currently active route. No-op until setupRouter has
+ * run. This is what the polling timer calls every `refreshMs`.
+ */
+export function refreshCurrent() {
+    if (_refresh) return _refresh();
 }

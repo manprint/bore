@@ -13,15 +13,22 @@ use tracing::warn;
 pub fn summary(server: &Server) -> SummaryView {
     let admin = server.admin_registry();
     let vhost_reg = server.vhost_registry();
-    #[cfg(feature = "vpn")]
-    let vpn_reg = server.vpn_providers();
 
     let snapshot = admin.snapshot();
     let (mut public_tunnels, mut secret_tunnels) = (0, 0);
-    for entry in snapshot {
+    // VPN link count must come from the long-lived admin registry: the provider
+    // registry (`vpn_providers`) is consumed when a 1:1 link pairs, so its
+    // `.len()` reads 0 for every established link. Count distinct shared ids.
+    #[cfg(feature = "vpn")]
+    let mut vpn_ids = std::collections::HashSet::new();
+    for entry in &snapshot {
         match entry.role {
             Role::Public => public_tunnels += 1,
             Role::SecretProvider | Role::SecretConsumer => secret_tunnels += 1,
+            #[cfg(feature = "vpn")]
+            Role::VpnListener | Role::VpnConnector => {
+                vpn_ids.insert(entry.secret_id.clone().unwrap_or_default());
+            }
             _ => {}
         }
     }
@@ -44,7 +51,7 @@ pub fn summary(server: &Server) -> SummaryView {
         secret_tunnels,
         vhost_domains: vhost_reg.len(),
         #[cfg(feature = "vpn")]
-        vpn_links: vpn_reg.len(),
+        vpn_links: vpn_ids.len(),
         vhost_http_port: config.vhost_http_port,
         vhost_https_port: config.vhost_https_port,
         vhost_quic_port: config.vhost_quic_port,
@@ -433,16 +440,22 @@ pub fn config(server: &Server) -> ConfigView {
 pub fn metrics(server: &Server) -> MetricsView {
     let admin = server.admin_registry();
     let vhost_reg = server.vhost_registry();
-    #[cfg(feature = "vpn")]
-    let vpn_reg = server.vpn_providers();
 
     let snapshot = admin.snapshot();
     let (mut public_tunnels, mut secret_tunnels, mut active_connections) = (0, 0, 0);
-    for entry in snapshot {
+    // See `summary`: count VPN links from the admin registry, not the ephemeral
+    // provider registry (which empties on pairing).
+    #[cfg(feature = "vpn")]
+    let mut vpn_ids = std::collections::HashSet::new();
+    for entry in &snapshot {
         active_connections += entry.active;
         match entry.role {
             Role::Public => public_tunnels += 1,
             Role::SecretProvider | Role::SecretConsumer => secret_tunnels += 1,
+            #[cfg(feature = "vpn")]
+            Role::VpnListener | Role::VpnConnector => {
+                vpn_ids.insert(entry.secret_id.clone().unwrap_or_default());
+            }
             _ => {}
         }
     }
@@ -471,7 +484,7 @@ pub fn metrics(server: &Server) -> MetricsView {
         secret_tunnels,
         vhost_domains: vhost_reg.len(),
         #[cfg(feature = "vpn")]
-        vpn_links: vpn_reg.len(),
+        vpn_links: vpn_ids.len(),
         active_connections,
         auth_failures: server.auth_failures(),
         conn_rejections: server.conn_rejections(),

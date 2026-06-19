@@ -12,7 +12,9 @@ export async function apiGet(endpoint) {
         headers['Authorization'] = `Bearer ${token}`;
     }
 
-    const response = await fetch(endpoint, { headers });
+    // `no-store`: each poll must hit the server, never a cached response
+    // (the server also sends Cache-Control: no-store; this covers intermediaries).
+    const response = await fetch(endpoint, { headers, cache: 'no-store' });
 
     if (response.status === 401) {
         clearToken();

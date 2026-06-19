@@ -4,6 +4,16 @@
 
 import { escapeHtml } from '../ui.js';
 
+// Byte counts that should read in MiB, to match the sibling udp_*_window values.
+const BYTE_KEYS = new Set(['udp_socket_send_buffer', 'udp_socket_recv_buffer']);
+
+/** Format a byte count as a MiB string (e.g. 12582912 → "12 MiB", 13107200 → "12.5 MiB"). */
+function fmtMiB(bytes) {
+    const mib = bytes / (1024 * 1024);
+    const s = Number.isInteger(mib) ? String(mib) : mib.toFixed(2).replace(/\.?0+$/, '');
+    return `${s} MiB`;
+}
+
 export default {
     id: 'config',
     title: 'Configuration',
@@ -33,11 +43,13 @@ export default {
 
             if (value === null) {
                 // Render null with context-specific friendly labels
-                if (key === 'udp_socket_send_buffer' || key === 'udp_socket_recv_buffer') {
+                if (BYTE_KEYS.has(key)) {
                     valEl.textContent = 'auto (OS default)';
                 } else {
                     valEl.textContent = '—';
                 }
+            } else if (BYTE_KEYS.has(key) && typeof value === 'number') {
+                valEl.textContent = escapeHtml(fmtMiB(value));
             } else if (typeof value === 'boolean') {
                 valEl.textContent = escapeHtml(value ? 'true' : 'false');
             } else if (typeof value === 'number') {

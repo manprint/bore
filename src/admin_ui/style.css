@@ -420,7 +420,12 @@ tr:hover {
 }
 
 /* Config panel styles */
+/* One grid for the whole table so every key cell shares ONE column sized to the
+   widest key (`max-content`); rows are `display: contents` so their two cells
+   flow straight into the shared grid. This fixes the per-row key-column width. */
 .config-container {
+    display: grid;
+    grid-template-columns: max-content 1fr;
     background-color: #fff;
     border-radius: 4px;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
@@ -428,33 +433,33 @@ tr:hover {
 }
 
 .config-row {
-    display: grid;
-    grid-template-columns: minmax(180px, auto) 1fr;
-    border-bottom: 1px solid #ecf0f1;
-    align-items: start;
+    display: contents;
 }
 
-.config-row:last-child {
+.config-key,
+.config-value {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid #ecf0f1;
+    font-family: monospace;
+    font-size: 0.9rem;
+    align-self: start;
+}
+
+.config-row:last-child .config-key,
+.config-row:last-child .config-value {
     border-bottom: none;
 }
 
 .config-key {
     background-color: #f9f9f9;
-    padding: 0.75rem 1rem;
     font-weight: 600;
     color: #2c3e50;
-    font-family: monospace;
-    font-size: 0.9rem;
-    word-break: break-word;
-    overflow-wrap: anywhere;
+    white-space: nowrap;
 }
 
 .config-value {
-    padding: 0.75rem 1rem;
     color: #555;
     word-break: break-all;
-    font-family: monospace;
-    font-size: 0.9rem;
 }
 
 /* Metrics panel styles */

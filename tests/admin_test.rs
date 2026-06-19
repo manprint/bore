@@ -716,6 +716,20 @@ fn t_vpn_panel_groups_and_fields() {
         .find(|l| l.role == "vpnconnector")
         .expect("connector side");
     assert_eq!(connector.notes.as_deref(), Some("branch office"));
+
+    // Overview/Metrics VPN-link count must come from the admin registry (the
+    // provider registry is empty here, as after a 1:1 pairing). One distinct
+    // link id ("site-a") → exactly 1 link, NOT 0.
+    assert_eq!(
+        bore_cli::admin_api::summary(&server).vpn_links,
+        1,
+        "summary vpn_links counts distinct links from admin registry"
+    );
+    assert_eq!(
+        bore_cli::admin_api::metrics(&server).vpn_links,
+        1,
+        "metrics vpn_links counts distinct links from admin registry"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

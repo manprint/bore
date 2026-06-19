@@ -564,11 +564,13 @@ fn t_views_serialize_stable() {
     {
         let vpn_link = VpnLinkView {
             id: 3,
-            role: "VpnListener".into(),
+            link_id: "site-a".into(),
+            role: "vpnlistener".into(),
             peer: "192.0.2.3:54323".into(),
+            notes: Some("edge gateway".into()),
             overlay: Some("10.99.0.1/32".into()),
             advertised: vec!["10.0.0.0/24".into()],
-            carriers: 1,
+            carriers: 4,
             direct: false,
             path: "relay".into(),
             relay_tx_bytes: 256,
@@ -576,6 +578,13 @@ fn t_views_serialize_stable() {
             uptime_secs: 75,
             mode: "1:1".into(),
             auto_reconnect: true,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: Some(1350),
+            forward_accept: true,
+            nat_masquerade: false,
+            route_policy: Some("accept-all".into()),
+            nat_udp_port: Some(443),
             hub_peers: None,
         };
         let json_vpn = serde_json::to_value(&vpn_link).expect("serialize VpnLinkView");
@@ -584,8 +593,10 @@ fn t_views_serialize_stable() {
         // VpnLinkView with hub_peers (nested VpnPeerView objects).
         let vpn_hub = VpnLinkView {
             id: 4,
-            role: "VpnListener".into(),
+            link_id: "hub1".into(),
+            role: "vpnlistener".into(),
             peer: "192.0.2.4:54324".into(),
+            notes: None,
             overlay: Some("10.99.0.1/25".into()),
             advertised: vec![],
             carriers: 2,
@@ -596,6 +607,13 @@ fn t_views_serialize_stable() {
             uptime_secs: 120,
             mode: "hub".into(),
             auto_reconnect: false,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
+            nat_udp_port: None,
             hub_peers: Some(vec![
                 VpnPeerView {
                     peer_id: 1,
@@ -614,6 +632,90 @@ fn t_views_serialize_stable() {
         let json_vpn_hub = serde_json::to_value(&vpn_hub).expect("serialize VpnLinkView with hub");
         assert_no_secret_keys(&json_vpn_hub, "");
     }
+}
+
+/// T-VPNPANEL: the VPN section builder must source carriers / notes / advertised /
+/// NAT-UDP-port / flags from the long-lived admin entry (NOT the ephemeral provider
+/// registry, which is gone after a 1:1 link pairs), and expose the shared `link_id`
+/// so the UI can group the listener and connector together. Regression guard for the
+/// "Carriers: 1, no notes, no nat port, everything disconnected" bug cluster.
+#[cfg(feature = "vpn")]
+#[test]
+fn t_vpn_panel_groups_and_fields() {
+    use bore_cli::admin::{NewEntry, Role};
+    use bore_cli::server::Server;
+
+    fn vpn_entry(role: Role, peer: &str, note: &str) -> NewEntry {
+        NewEntry {
+            role,
+            peer: peer.parse().unwrap(),
+            secret_id: Some("vpn:site-a".into()),
+            public_port: None,
+            notes: Some(note.into()),
+            basic_auth: false,
+            https: false,
+            force_https: false,
+            carriers: 4,
+            auto_reconnect: false,
+            udp: false,
+            vpn_relay_only: false,
+            vpn_pin_mtu: false,
+            vpn_mtu: Some(1350),
+            vpn_forward_accept: true,
+            vpn_nat_masquerade: false,
+            vpn_route_policy: None,
+            vpn_advertised: vec!["10.10.0.0/24".into()],
+            vpn_nat_udp_port: Some(443),
+        }
+    }
+
+    let server = Server::new(1024..=65535, None);
+    // No provider registry entry exists (mirrors a paired 1:1 link). The builder
+    // must still report the right data straight from the admin entries.
+    let _l = server.admin_registry().register(vpn_entry(
+        Role::VpnListener,
+        "192.0.2.3:5001",
+        "edge gateway",
+    ));
+    let _c = server.admin_registry().register(vpn_entry(
+        Role::VpnConnector,
+        "192.0.2.9:5002",
+        "branch office",
+    ));
+
+    let view = bore_cli::admin_api::vpn(&server);
+    assert_eq!(view.links.len(), 2, "both endpoints present");
+
+    // Both sides share the grouping key.
+    for link in &view.links {
+        assert_eq!(link.link_id, "site-a", "shared link_id for grouping");
+        assert_eq!(
+            link.carriers, 4,
+            "carriers from entry, not provider default 1"
+        );
+        assert_eq!(
+            link.nat_udp_port,
+            Some(443),
+            "nat-udp-preferred-port surfaced"
+        );
+        assert_eq!(link.advertised, vec!["10.10.0.0/24".to_string()]);
+        assert!(link.forward_accept, "flag badges fed from entry");
+        assert_eq!(link.mtu, Some(1350));
+        assert!(link.notes.is_some(), "operator notes surfaced");
+    }
+
+    let listener = view
+        .links
+        .iter()
+        .find(|l| l.role == "vpnlistener")
+        .expect("listener side");
+    assert_eq!(listener.notes.as_deref(), Some("edge gateway"));
+    let connector = view
+        .links
+        .iter()
+        .find(|l| l.role == "vpnconnector")
+        .expect("connector side");
+    assert_eq!(connector.notes.as_deref(), Some("branch office"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -806,6 +806,9 @@ pub enum ClientMessage {
         /// Display-only: route accept/refuse policy summary (e.g., "accept-all", "refuse-all", "accept:2 refuse:1").
         #[serde(default)]
         route_policy: Option<String>,
+        /// Display-only: client's `--nat-udp-preferred-port` (0 = unset/ephemeral).
+        #[serde(default)]
+        nat_udp_preferred_port: u16,
     },
 
     /// Connect as the connector for a VPN link id.
@@ -840,6 +843,9 @@ pub enum ClientMessage {
         /// Display-only: route accept/refuse policy summary (e.g., "accept-all", "refuse-all", "accept:2 refuse:1").
         #[serde(default)]
         route_policy: Option<String>,
+        /// Display-only: client's `--nat-udp-preferred-port` (0 = unset/ephemeral).
+        #[serde(default)]
+        nat_udp_preferred_port: u16,
     },
 
     /// Report the active VPN data-plane path (`"relay"` or `"direct"`) for the
@@ -1667,6 +1673,7 @@ fn serde_roundtrip_vpn_messages() {
         forward_accept: false,
         nat_masquerade: false,
         route_policy: None,
+        nat_udp_preferred_port: 0,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let back: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -1745,6 +1752,7 @@ fn t_vpnwire_hello_roundtrip_with_flags() {
         forward_accept: true,
         nat_masquerade: true,
         route_policy: Some("accept:2 refuse:1".to_string()),
+        nat_udp_preferred_port: 8443,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let back: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -1755,6 +1763,7 @@ fn t_vpnwire_hello_roundtrip_with_flags() {
         forward_accept,
         nat_masquerade,
         route_policy,
+        nat_udp_preferred_port,
         ..
     } = back
     {
@@ -1764,6 +1773,7 @@ fn t_vpnwire_hello_roundtrip_with_flags() {
         assert!(forward_accept);
         assert!(nat_masquerade);
         assert_eq!(route_policy, Some("accept:2 refuse:1".to_string()));
+        assert_eq!(nat_udp_preferred_port, 8443);
     } else {
         panic!("unexpected variant");
     }
@@ -1887,6 +1897,7 @@ fn hello_vpn_serde_roundtrip_with_and_without_max_clients() {
         forward_accept: false,
         nat_masquerade: false,
         route_policy: None,
+        nat_udp_preferred_port: 0,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let back: ClientMessage = serde_json::from_str(&json).unwrap();

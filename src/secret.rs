@@ -237,6 +237,8 @@ pub async fn serve_provider(
         vpn_forward_accept: false,
         vpn_nat_masquerade: false,
         vpn_route_policy: None,
+        vpn_advertised: vec![],
+        vpn_nat_udp_port: None,
     });
     info!(%id, "secret provider registered");
     control.send(ServerMessage::Ok).await?;
@@ -378,6 +380,8 @@ pub async fn serve_consumer(
         vpn_forward_accept: false,
         vpn_nat_masquerade: false,
         vpn_route_policy: None,
+        vpn_advertised: vec![],
+        vpn_nat_udp_port: None,
     });
     let active = admin_reg.active();
     // Per-tunnel relay byte counters for this consumer (shown on the admin page).

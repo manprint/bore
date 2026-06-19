@@ -600,6 +600,8 @@ pub async fn serve_vhost_provider(
         vpn_forward_accept: false,
         vpn_nat_masquerade: false,
         vpn_route_policy: None,
+        vpn_advertised: vec![],
+        vpn_nat_udp_port: None,
     });
 
     // Compute and send the public URLs based on current config.

@@ -1,10 +1,108 @@
 /**
- * VPN panel: VPN links with hub peer expansion.
+ * VPN panel: one card per VPN link id, grouping the listener and its
+ * connector(s) together. Each side shows its own peer, overlay, advertised
+ * routes, carriers, notes, NAT UDP port and flags. Hub listeners expand to
+ * their peer roster.
  */
 
 import { badge, fmtBytes, fmtDuration, escapeHtml } from '../ui.js';
 import { DEFAULT_REFRESH_MS } from '../poller.js';
 import { openModal, detailRows } from '../modal.js';
+
+/** Build the flag badges shared by both sides. */
+function flagBadgesHtml(link) {
+    const parts = [];
+    if (link.relay_only) parts.push(badge('Relay-Only', 'warning'));
+    if (link.pin_mtu) parts.push(badge('Pin-MTU', 'default'));
+    if (link.forward_accept) parts.push(badge('Forward-Accept', 'info'));
+    if (link.nat_masquerade) parts.push(badge('NAT-Masquerade', 'warning'));
+    if (parts.length === 0) return '';
+    const html = parts.map(b => b.outerHTML).join(' ');
+    return `<div><strong>Flags:</strong> ${html}</div>`;
+}
+
+/** Render one side (listener or connector) of a VPN link as a clickable block. */
+function renderSide(link) {
+    const side = document.createElement('div');
+    side.className = 'vpn-side';
+    side.style.cursor = 'pointer';
+
+    const pathBadge = link.path === 'direct'
+        ? badge('Direct', 'success')
+        : badge('Relay', 'warning');
+
+    const advertised = link.advertised && link.advertised.length > 0
+        ? escapeHtml(link.advertised.join(', '))
+        : 'None';
+
+    const notesHtml = link.notes
+        ? `<div><strong>Notes:</strong> ${escapeHtml(link.notes)}</div>`
+        : '';
+
+    const natHtml = (link.nat_udp_port !== null && link.nat_udp_port !== undefined)
+        ? `<div><strong>NAT UDP port:</strong> ${escapeHtml(String(link.nat_udp_port))}</div>`
+        : '';
+
+    side.innerHTML = `
+        <div class="vpn-side-head">
+            <strong>${escapeHtml(link.role)}</strong> ${pathBadge.outerHTML}
+            — Peer: ${escapeHtml(link.peer)}
+            | Overlay: ${escapeHtml(link.overlay || 'N/A')}
+        </div>
+        <div class="vpn-side-body">
+            <div><strong>Advertised:</strong> ${advertised}</div>
+            <div><strong>Carriers:</strong> ${escapeHtml(String(link.carriers ?? 1))}</div>
+            ${notesHtml}
+            ${natHtml}
+            ${flagBadgesHtml(link)}
+            <div><strong>Uptime:</strong> ${escapeHtml(fmtDuration(link.uptime_secs))}</div>
+            <div><strong>TX:</strong> ${escapeHtml(fmtBytes(link.relay_tx_bytes))} | <strong>RX:</strong> ${escapeHtml(fmtBytes(link.relay_rx_bytes))}</div>
+        </div>
+    `;
+
+    side.addEventListener('click', () => {
+        openModal(`VPN ${link.role} — ${link.overlay || link.peer}`, detailRows(link));
+    });
+    return side;
+}
+
+/** Render the expandable hub-peer roster (listener side only). */
+function renderHubPeers(peers) {
+    const section = document.createElement('div');
+    section.className = 'vpn-hub-section';
+
+    const toggle = document.createElement('button');
+    toggle.className = 'vpn-hub-toggle';
+    toggle.textContent = `Hub Peers (${peers.length})`;
+
+    const table = document.createElement('div');
+    table.className = 'vpn-hub-peers hidden';
+    const list = document.createElement('div');
+    list.className = 'vpn-peers-list';
+    peers.forEach(peer => {
+        const row = document.createElement('div');
+        row.className = 'vpn-peer-row';
+        row.innerHTML = `
+            <span class="vpn-peer-id">#${escapeHtml(String(peer.peer_id))}</span>
+            <span class="vpn-peer-overlay">${escapeHtml(peer.overlay)}</span>
+            <span class="vpn-peer-addr">${escapeHtml(peer.peer)}</span>
+            <span class="vpn-peer-adv">${escapeHtml((peer.advertised || []).join(', ') || 'None')}</span>
+        `;
+        list.appendChild(row);
+    });
+    table.appendChild(list);
+
+    let expanded = false;
+    toggle.addEventListener('click', () => {
+        expanded = !expanded;
+        table.classList.toggle('hidden', !expanded);
+        toggle.classList.toggle('expanded', expanded);
+    });
+
+    section.appendChild(toggle);
+    section.appendChild(table);
+    return section;
+}
 
 export default {
     id: 'vpn',
@@ -22,132 +120,54 @@ export default {
             return;
         }
 
+        // Group listener + connector(s) by the shared link id. Falls back to the
+        // per-connection id so a malformed entry still renders on its own.
+        const groups = new Map();
+        for (const link of links) {
+            const key = link.link_id || `#${link.id}`;
+            if (!groups.has(key)) {
+                groups.set(key, { key, listeners: [], connectors: [] });
+            }
+            const g = groups.get(key);
+            if (link.role === 'vpnlistener') g.listeners.push(link);
+            else g.connectors.push(link);
+        }
+
         const container = document.createElement('div');
 
-        links.forEach(link => {
+        for (const group of groups.values()) {
+            const sides = [...group.listeners, ...group.connectors];
+            const mode = sides.find(s => s.mode)?.mode ?? '1:1';
+
             const card = document.createElement('div');
             card.className = 'vpn-link-card';
 
-            // Path badge: direct or relay
-            const pathBadges = [];
-            const pathStr = link.path ?? (link.direct ? 'direct' : 'relay');
-            if (pathStr === 'direct') {
-                pathBadges.push(badge('Direct', 'success'));
-            } else {
-                pathBadges.push(badge('Relay', 'warning'));
-            }
-
-            const pathBadgeCell = document.createElement('span');
-            pathBadges.forEach((b, i) => {
-                if (i > 0) pathBadgeCell.appendChild(document.createTextNode(' '));
-                pathBadgeCell.appendChild(b);
-            });
-
-            // Mode badge (1:1 or hub)
-            const modeStr = link.mode ?? '1:1';
-            const modeBadge = badge(modeStr, 'info');
-
-            // Flag badges for card display (show only if truthy)
-            const flagBadges = [];
-            if (link.relay_only) flagBadges.push(badge('Relay-Only', 'warning'));
-            if (link.pin_mtu) flagBadges.push(badge('Pin-MTU', 'default'));
-            if (link.forward_accept) flagBadges.push(badge('Forward-Accept', 'info'));
-            if (link.nat_masquerade) flagBadges.push(badge('NAT-Masquerade', 'warning'));
-
-            const advertised = link.advertised && link.advertised.length > 0
-                ? escapeHtml(link.advertised.join(', '))
-                : 'None';
-
             const header = document.createElement('div');
             header.className = 'vpn-link-header';
-            header.style.cursor = 'pointer';
             header.innerHTML = `
-                <strong>${escapeHtml(link.role)}</strong>
-                — Peer: ${escapeHtml(link.peer)}
-                | Overlay: ${escapeHtml(link.overlay || 'N/A')}
+                <strong>VPN: ${escapeHtml(group.key)}</strong>
+                ${badge(mode, 'info').outerHTML}
+                <span class="vpn-link-count">${sides.length} endpoint${sides.length === 1 ? '' : 's'}</span>
             `;
-            header.addEventListener('click', (e) => {
-                // Don't open modal if click is on the toggle button
-                if (e.target.closest('.vpn-hub-toggle')) return;
-                openModal(`VPN Link ${link.overlay || link.peer}`, detailRows(link));
-            });
-
-            const details = document.createElement('div');
-            details.className = 'vpn-link-details';
-
-            // Build flag badges HTML
-            let flagsDisplay = '';
-            if (flagBadges.length > 0) {
-                const flagHtmlParts = flagBadges.map(b => {
-                    const kind = b.className?.split('badge-')[1] || 'default';
-                    return `<span class="badge badge-${escapeHtml(kind)}">${escapeHtml(b.textContent)}</span>`;
-                });
-                flagsDisplay = `<div><strong>Flags:</strong> ${flagHtmlParts.join(' ')}</div>`;
-            }
-
-            // Build mode badge HTML
-            const modeHtml = `<span class="badge badge-info">${escapeHtml(modeStr)}</span>`;
-
-            details.innerHTML = `
-                <div><strong>Path:</strong> ${pathBadgeCell.innerHTML}</div>
-                <div><strong>Mode:</strong> ${modeHtml}</div>
-                <div><strong>Uptime:</strong> ${escapeHtml(fmtDuration(link.uptime_secs))}</div>
-                <div><strong>Advertised:</strong> ${advertised}</div>
-                <div><strong>Carriers:</strong> ${escapeHtml(String(link.carriers ?? 1))}</div>
-                ${flagsDisplay}
-                <div><strong>TX:</strong> ${escapeHtml(fmtBytes(link.relay_tx_bytes))} | <strong>RX:</strong> ${escapeHtml(fmtBytes(link.relay_rx_bytes))}</div>
-            `;
-
             card.appendChild(header);
-            card.appendChild(details);
 
-            // If hub peers exist, render expandable sub-table
-            if (link.hub_peers && link.hub_peers.length > 0) {
-                const peersSection = document.createElement('div');
-                peersSection.className = 'vpn-hub-section';
+            const body = document.createElement('div');
+            body.className = 'vpn-link-sides';
+            if (sides.length === 0) {
+                body.innerHTML = '<p class="empty-state">Link registered, no endpoints</p>';
+            } else {
+                sides.forEach(link => body.appendChild(renderSide(link)));
+            }
+            card.appendChild(body);
 
-                const toggle = document.createElement('button');
-                toggle.className = 'vpn-hub-toggle';
-                toggle.textContent = `Hub Peers (${link.hub_peers.length})`;
-                let expanded = false;
-
-                const peersTable = document.createElement('div');
-                peersTable.className = 'vpn-hub-peers hidden';
-
-                // Render hub peers as a compact list/table
-                const peersList = document.createElement('div');
-                peersList.className = 'vpn-peers-list';
-                link.hub_peers.forEach(peer => {
-                    const peerRow = document.createElement('div');
-                    peerRow.className = 'vpn-peer-row';
-                    peerRow.innerHTML = `
-                        <span class="vpn-peer-id">#${escapeHtml(String(peer.peer_id))}</span>
-                        <span class="vpn-peer-overlay">${escapeHtml(peer.overlay)}</span>
-                        <span class="vpn-peer-addr">${escapeHtml(peer.peer)}</span>
-                        <span class="vpn-peer-adv">${escapeHtml((peer.advertised || []).join(', ') || 'None')}</span>
-                    `;
-                    peersList.appendChild(peerRow);
-                });
-                peersTable.appendChild(peersList);
-
-                toggle.addEventListener('click', () => {
-                    expanded = !expanded;
-                    if (expanded) {
-                        peersTable.classList.remove('hidden');
-                        toggle.classList.add('expanded');
-                    } else {
-                        peersTable.classList.add('hidden');
-                        toggle.classList.remove('expanded');
-                    }
-                });
-
-                peersSection.appendChild(toggle);
-                peersSection.appendChild(peersTable);
-                card.appendChild(peersSection);
+            // Hub peer roster (attached to the listener side by the backend).
+            const hubListener = group.listeners.find(l => l.hub_peers && l.hub_peers.length > 0);
+            if (hubListener) {
+                card.appendChild(renderHubPeers(hubListener.hub_peers));
             }
 
             container.appendChild(card);
-        });
+        }
 
         el.appendChild(container);
     }

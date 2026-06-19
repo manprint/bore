@@ -131,6 +131,7 @@ async fn vpn_relay_link_bulk_bidirectional_no_wedge() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -152,6 +153,7 @@ async fn vpn_relay_link_bulk_bidirectional_no_wedge() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -251,6 +253,7 @@ async fn pair_multi(
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -271,6 +274,7 @@ async fn pair_multi(
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -362,6 +366,7 @@ async fn vpn_relay_multi_carrier_one_stream_dies() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -381,6 +386,7 @@ async fn vpn_relay_multi_carrier_one_stream_dies() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();

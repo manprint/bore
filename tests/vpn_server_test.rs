@@ -86,6 +86,7 @@ fn pool_hello_vpn(id: &str) -> ClientMessage {
         forward_accept: false,
         nat_masquerade: false,
         route_policy: None,
+        nat_udp_preferred_port: 0,
     }
 }
 
@@ -102,6 +103,7 @@ fn pool_connect_vpn(id: &str) -> ClientMessage {
         forward_accept: false,
         nat_masquerade: false,
         route_policy: None,
+        nat_udp_preferred_port: 0,
     }
 }
 
@@ -553,6 +555,7 @@ async fn vpn_server_overlap_rejected() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -575,6 +578,7 @@ async fn vpn_server_overlap_rejected() {
         forward_accept: false,
         nat_masquerade: false,
         route_policy: None,
+        nat_udp_preferred_port: 0,
     })
     .await
     .unwrap();
@@ -621,6 +625,7 @@ async fn vpn_server_addr_mode_mismatch_rejected() {
         forward_accept: false,
         nat_masquerade: false,
         route_policy: None,
+        nat_udp_preferred_port: 0,
     })
     .await
     .unwrap();
@@ -657,6 +662,7 @@ async fn vpn_server_static_inconsistent_pair_rejected() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -683,6 +689,7 @@ async fn vpn_server_static_inconsistent_pair_rejected() {
         forward_accept: false,
         nat_masquerade: false,
         route_policy: None,
+        nat_udp_preferred_port: 0,
     })
     .await
     .unwrap();
@@ -1446,6 +1453,7 @@ async fn vpn_carriers_negotiation() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -1465,6 +1473,7 @@ async fn vpn_carriers_negotiation() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -1614,6 +1623,7 @@ async fn vpn_server_hub_pairs_multiple_connectors() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -1653,6 +1663,7 @@ async fn vpn_server_hub_pairs_multiple_connectors() {
                 forward_accept: false,
                 nat_masquerade: false,
                 route_policy: None,
+                nat_udp_preferred_port: 0,
             })
             .await
             .unwrap();
@@ -1727,6 +1738,7 @@ async fn vpn_server_hub_rejects_connector_advertise() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -1746,6 +1758,7 @@ async fn vpn_server_hub_rejects_connector_advertise() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -1779,6 +1792,7 @@ async fn vpn_server_hub_rejects_when_at_capacity() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -1801,6 +1815,7 @@ async fn vpn_server_hub_rejects_when_at_capacity() {
                 forward_accept: false,
                 nat_masquerade: false,
                 route_policy: None,
+                nat_udp_preferred_port: 0,
             })
             .await
             .unwrap();
@@ -1834,6 +1849,7 @@ async fn vpn_server_hub_rejects_when_at_capacity() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -1867,6 +1883,7 @@ async fn vpn_relay_hub_injects_peer_id_header() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -1886,6 +1903,7 @@ async fn vpn_relay_hub_injects_peer_id_header() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -1917,6 +1935,7 @@ async fn vpn_server_legacy_1to1_still_consumes_entry() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -1938,6 +1957,7 @@ async fn vpn_server_legacy_1to1_still_consumes_entry() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();
@@ -1961,6 +1981,7 @@ async fn vpn_server_legacy_1to1_still_consumes_entry() {
             forward_accept: false,
             nat_masquerade: false,
             route_policy: None,
+            nat_udp_preferred_port: 0,
         })
         .await
         .unwrap();

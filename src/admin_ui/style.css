@@ -264,16 +264,50 @@ tr:hover {
     margin-bottom: 1rem;
     font-size: 0.95rem;
     color: #2c3e50;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
 }
 
-.vpn-link-details {
+.vpn-link-count {
+    margin-left: auto;
+    font-size: 0.8rem;
+    color: #7f8c8d;
+}
+
+/* The two (or more) endpoints of one link, side by side. */
+.vpn-link-sides {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1rem;
+}
+
+.vpn-side {
+    background-color: #f9f9f9;
+    border: 1px solid #ecf0f1;
+    border-radius: 4px;
+    padding: 1rem;
+    transition: border-color 0.2s;
+}
+
+.vpn-side:hover {
+    border-color: #3498db;
+}
+
+.vpn-side-head {
+    margin-bottom: 0.75rem;
+    font-size: 0.95rem;
+    color: #2c3e50;
+}
+
+.vpn-side-body {
     font-size: 0.9rem;
     color: #555;
     line-height: 1.6;
 }
 
-.vpn-link-details div {
-    margin-bottom: 0.5rem;
+.vpn-side-body div {
+    margin-bottom: 0.4rem;
 }
 
 .vpn-hub-section {

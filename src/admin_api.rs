@@ -202,54 +202,56 @@ pub fn vpn(server: &Server) -> VpnSectionView {
         .collect();
 
     for entry in &vpn_entries {
-        // Extract the provider key from the admin entry's secret_id.
-        // Admin VPN entries have secret_id: Some(format!("vpn:{id}")).
-        // The VPN provider registry is keyed by the bare id (without "vpn:" prefix).
-        let (advertised, carriers, hub_peers) = {
-            let provider_key = entry
-                .secret_id
-                .as_ref()
-                .and_then(|sid| sid.strip_prefix("vpn:").map(|s| s.to_string()));
+        // Shared link id: admin VPN entries carry secret_id = "vpn:{id}", and the
+        // VPN provider registry is keyed by the bare id. Listener + connector(s)
+        // of the same tunnel share it, so the UI groups the two sides by `link_id`.
+        let link_id = entry
+            .secret_id
+            .as_deref()
+            .and_then(|sid| sid.strip_prefix("vpn:"))
+            .unwrap_or("")
+            .to_string();
 
-            if let Some(key) = provider_key {
-                if let Some(provider) = vpn_reg.get(&key) {
-                    let adv = provider.advertised.clone();
-                    let carr = provider.carriers;
+        // The provider registry is the ONLY place hub membership lives, and it
+        // stays populated only in hub mode (a 1:1 provider entry is consumed at
+        // pairing). So `mode`/`hub_peers` come from here, but every other display
+        // field is sourced from the long-lived admin entry — otherwise carriers,
+        // advertised, etc. would reset to defaults the moment a 1:1 link pairs.
+        let provider = (!link_id.is_empty())
+            .then(|| vpn_reg.get(&link_id))
+            .flatten();
+        let is_hub = provider.as_ref().is_some_and(|p| p.hub.is_some());
 
-                    // If this provider has a hub, extract its peers.
-                    let hub_opt = provider.hub.as_ref().map(|hub_sh| {
-                        let hub_st = hub_sh.state.lock().unwrap();
-                        let mut peer_list = Vec::new();
-                        for (peer_id, slot) in &hub_st.peers {
-                            // Find the peer's real address from the admin registry if available.
-                            let peer_addr = vpn_entries
-                                .iter()
-                                .find(|e| {
-                                    e.role == Role::VpnConnector
-                                        && e.overlay.as_ref() == Some(&slot.overlay.to_string())
-                                })
-                                .map(|e| e.peer.clone())
-                                .unwrap_or_default();
+        // Attach the peer roster to the hub listener only (a spoke connector must
+        // not duplicate the whole roster inside the grouped card).
+        let hub_peers = if entry.role == Role::VpnListener {
+            provider.as_ref().and_then(|provider| {
+                provider.hub.as_ref().map(|hub_sh| {
+                    let hub_st = hub_sh.state.lock().unwrap();
+                    let mut peer_list = Vec::new();
+                    for (peer_id, slot) in &hub_st.peers {
+                        // Find the peer's real address from the admin registry if available.
+                        let peer_addr = vpn_entries
+                            .iter()
+                            .find(|e| {
+                                e.role == Role::VpnConnector
+                                    && e.overlay.as_ref() == Some(&slot.overlay.to_string())
+                            })
+                            .map(|e| e.peer.clone())
+                            .unwrap_or_default();
 
-                            peer_list.push(VpnPeerView {
-                                peer_id: *peer_id,
-                                overlay: slot.overlay.to_string(),
-                                peer: peer_addr,
-                                advertised: adv.iter().map(|n| n.to_string()).collect(),
-                            });
-                        }
-                        peer_list
-                    });
-
-                    (adv.iter().map(|n| n.to_string()).collect(), carr, hub_opt)
-                } else {
-                    // Provider not found in registry; use defaults.
-                    (vec![], 1u16, None)
-                }
-            } else {
-                // No valid secret_id; use defaults.
-                (vec![], 1u16, None)
-            }
+                        peer_list.push(VpnPeerView {
+                            peer_id: *peer_id,
+                            overlay: slot.overlay.to_string(),
+                            peer: peer_addr,
+                            advertised: provider.advertised.iter().map(|n| n.to_string()).collect(),
+                        });
+                    }
+                    peer_list
+                })
+            })
+        } else {
+            None
         };
 
         let path = if entry.vpn_direct {
@@ -257,18 +259,20 @@ pub fn vpn(server: &Server) -> VpnSectionView {
         } else {
             "relay".to_string()
         };
-        let mode = if hub_peers.is_some() {
+        let mode = if is_hub {
             "hub".to_string()
         } else {
             "1:1".to_string()
         };
         links.push(VpnLinkView {
             id: entry.id,
+            link_id,
             role: format!("{:?}", entry.role).to_lowercase(),
             peer: entry.peer.clone(),
+            notes: entry.notes.clone(),
             overlay: entry.overlay.clone(),
-            advertised,
-            carriers,
+            advertised: entry.vpn_advertised.clone(),
+            carriers: entry.carriers,
             direct: entry.vpn_direct,
             path,
             relay_tx_bytes: entry.relay_tx_bytes,
@@ -276,6 +280,13 @@ pub fn vpn(server: &Server) -> VpnSectionView {
             uptime_secs: entry.uptime_secs,
             mode,
             auto_reconnect: entry.auto_reconnect,
+            relay_only: entry.vpn_relay_only,
+            pin_mtu: entry.vpn_pin_mtu,
+            mtu: entry.vpn_mtu,
+            forward_accept: entry.vpn_forward_accept,
+            nat_masquerade: entry.vpn_nat_masquerade,
+            route_policy: entry.vpn_route_policy.clone(),
+            nat_udp_port: entry.vpn_nat_udp_port,
             hub_peers,
         });
     }
@@ -620,6 +631,8 @@ mod tests {
             vpn_forward_accept: false,
             vpn_nat_masquerade: false,
             vpn_route_policy: None,
+            vpn_advertised: vec![],
+            vpn_nat_udp_port: None,
         };
         let provider_entry = crate::admin::NewEntry {
             role: Role::SecretProvider,
@@ -639,6 +652,8 @@ mod tests {
             vpn_forward_accept: false,
             vpn_nat_masquerade: false,
             vpn_route_policy: None,
+            vpn_advertised: vec![],
+            vpn_nat_udp_port: None,
         };
         let consumer_entry = crate::admin::NewEntry {
             role: Role::SecretConsumer,
@@ -658,6 +673,8 @@ mod tests {
             vpn_forward_accept: false,
             vpn_nat_masquerade: false,
             vpn_route_policy: None,
+            vpn_advertised: vec![],
+            vpn_nat_udp_port: None,
         };
 
         let _h1 = admin.register(public_entry);

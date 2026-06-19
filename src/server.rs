@@ -1331,6 +1331,7 @@ impl Server {
                 forward_accept,
                 nat_masquerade,
                 route_policy,
+                nat_udp_preferred_port,
             }) => {
                 #[cfg(feature = "vpn")]
                 if self.vpn_enabled {
@@ -1357,6 +1358,7 @@ impl Server {
                         forward_accept,
                         nat_masquerade,
                         route_policy,
+                        nat_udp_preferred_port,
                     )
                     .await;
                 }
@@ -1370,6 +1372,7 @@ impl Server {
                     forward_accept,
                     nat_masquerade,
                     route_policy,
+                    nat_udp_preferred_port,
                 );
                 #[cfg(not(feature = "vpn"))]
                 let _ = (&advertised, &addr, &notes); // Suppress unused warnings when vpn feature is off
@@ -1393,6 +1396,7 @@ impl Server {
                 forward_accept,
                 nat_masquerade,
                 route_policy,
+                nat_udp_preferred_port,
             }) => {
                 #[cfg(feature = "vpn")]
                 if self.vpn_enabled {
@@ -1421,6 +1425,7 @@ impl Server {
                         forward_accept,
                         nat_masquerade,
                         route_policy,
+                        nat_udp_preferred_port,
                     )
                     .await;
                 }
@@ -1433,6 +1438,7 @@ impl Server {
                     forward_accept,
                     nat_masquerade,
                     route_policy,
+                    nat_udp_preferred_port,
                 );
                 #[cfg(not(feature = "vpn"))]
                 let _ = (&advertised, &addr, &notes); // Suppress unused warnings when vpn feature is off
@@ -1528,6 +1534,8 @@ impl Server {
             vpn_forward_accept: false,
             vpn_nat_masquerade: false,
             vpn_route_policy: None,
+            vpn_advertised: vec![],
+            vpn_nat_udp_port: None,
         });
         let active = registration.active();
         // Per-tunnel relay byte counters (shown on /admin/status#/tunnels). These

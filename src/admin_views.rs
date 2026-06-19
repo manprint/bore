@@ -140,12 +140,17 @@ pub struct VhostView {
 #[cfg(feature = "vpn")]
 #[derive(Serialize, Clone)]
 pub struct VpnLinkView {
-    /// Stable link id.
+    /// Stable per-connection id.
     pub id: u64,
+    /// Shared VPN link identifier (the `--id`); listener and connector(s) of the
+    /// same tunnel share it. Used by the UI to group the two sides together.
+    pub link_id: String,
     /// VpnListener or VpnConnector.
     pub role: String,
     /// Real peer address.
     pub peer: String,
+    /// Operator note supplied with `--notes` on this side.
+    pub notes: Option<String>,
     /// Overlay CIDR (e.g., "10.99.0.1/32").
     pub overlay: Option<String>,
     /// Advertised routes (as strings).
@@ -166,6 +171,20 @@ pub struct VpnLinkView {
     pub mode: String,
     /// Auto-reconnect enabled.
     pub auto_reconnect: bool,
+    /// Display-only: relay-only mode (no direct QUIC).
+    pub relay_only: bool,
+    /// Display-only: MTU pinning enabled.
+    pub pin_mtu: bool,
+    /// Display-only: TUN interface MTU.
+    pub mtu: Option<u16>,
+    /// Display-only: forward-accept iptables rule inserted.
+    pub forward_accept: bool,
+    /// Display-only: NAT masquerade enabled.
+    pub nat_masquerade: bool,
+    /// Display-only: route accept/refuse policy summary.
+    pub route_policy: Option<String>,
+    /// Display-only: client's `--nat-udp-preferred-port` (None when unset).
+    pub nat_udp_port: Option<u16>,
     /// Hub peers (if this is a hub listener).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hub_peers: Option<Vec<VpnPeerView>>,
@@ -348,11 +367,13 @@ mod tests {
         {
             let vpn = VpnLinkView {
                 id: 1,
+                link_id: "site-a".into(),
                 role: "vpnlistener".into(),
                 peer: "10.0.0.1:1234".into(),
+                notes: Some("edge".into()),
                 overlay: Some("10.99.0.1/32".into()),
                 advertised: vec!["10.0.0.0/24".into()],
-                carriers: 1,
+                carriers: 4,
                 direct: false,
                 path: "relay".into(),
                 relay_tx_bytes: 1024,
@@ -360,6 +381,13 @@ mod tests {
                 uptime_secs: 600,
                 mode: "1:1".into(),
                 auto_reconnect: true,
+                relay_only: false,
+                pin_mtu: false,
+                mtu: Some(1350),
+                forward_accept: true,
+                nat_masquerade: false,
+                route_policy: None,
+                nat_udp_port: Some(443),
                 hub_peers: None,
             };
             let json = serde_json::to_value(&vpn).unwrap();
@@ -367,6 +395,11 @@ mod tests {
             assert_eq!(json["uptime_secs"], 600);
             assert_eq!(json["mode"], "1:1");
             assert_eq!(json["auto_reconnect"], true);
+            assert_eq!(json["link_id"], "site-a");
+            assert_eq!(json["carriers"], 4);
+            assert_eq!(json["nat_udp_port"], 443);
+            assert_eq!(json["notes"], "edge");
+            assert_eq!(json["forward_accept"], true);
             assert!(json["relay"].is_null(), "relay field must not exist");
         }
     }

@@ -555,8 +555,12 @@ pub async fn serve_vpn_listener(
     forward_accept: bool,
     nat_masquerade: bool,
     route_policy: Option<String>,
+    nat_udp_preferred_port: u16,
 ) -> Result<()> {
     // Acquire link permit (bounds live VPN links).
+    // Display-only derivations for the admin panel.
+    let nat_udp_display = (nat_udp_preferred_port != 0).then_some(nat_udp_preferred_port);
+    let advertised_display: Vec<String> = advertised.iter().map(|n| n.to_string()).collect();
     let _permit = match link_permits.try_acquire() {
         Ok(p) => p,
         Err(_) => {
@@ -696,7 +700,9 @@ pub async fn serve_vpn_listener(
         basic_auth: false,
         https: false,
         force_https: false,
-        carriers: 0,
+        // The listener's requested count; refreshed to the effective negotiated
+        // value once a connector pairs (1:1) — see the pair-receive block below.
+        carriers,
         auto_reconnect: false,
         udp: false,
         vpn_relay_only: relay_only,
@@ -705,6 +711,8 @@ pub async fn serve_vpn_listener(
         vpn_forward_accept: forward_accept,
         vpn_nat_masquerade: nat_masquerade,
         vpn_route_policy: route_policy,
+        vpn_advertised: advertised_display,
+        vpn_nat_udp_port: nat_udp_display,
     });
 
     info!(%id, "vpn listener registered, waiting for connector");
@@ -851,10 +859,16 @@ pub async fn serve_vpn_listener(
 
         // Record the assigned overlay on the admin entry, then deliver VpnReady.
         if let ServerMessage::VpnReady {
-            assigned, prefix, ..
+            assigned,
+            prefix,
+            carriers,
+            ..
         } = &pair_msg.listener_ready
         {
             admin_reg.set_overlay(format!("{assigned}/{prefix}"));
+            // Refresh to the effective negotiated carrier count (the connector
+            // handler computed min(listener, connector, server-max)).
+            admin_reg.set_carriers(*carriers);
         }
         control.send(pair_msg.listener_ready).await?;
 
@@ -963,8 +977,11 @@ pub async fn serve_vpn_connector(
     forward_accept: bool,
     nat_masquerade: bool,
     route_policy: Option<String>,
+    nat_udp_preferred_port: u16,
 ) -> Result<()> {
     info!(%id, "vpn connector connecting");
+    // Display-only: client's preferred holepunch port (0 = ephemeral/unset).
+    let nat_udp_display = (nat_udp_preferred_port != 0).then_some(nat_udp_preferred_port);
 
     // Acquire link permit.
     let _permit = match Arc::clone(&conn_permits).try_acquire_owned() {
@@ -1106,7 +1123,7 @@ pub async fn serve_vpn_connector(
             basic_auth: false,
             https: false,
             force_https: false,
-            carriers: 0,
+            carriers: effective_carriers,
             auto_reconnect: false,
             udp: false,
             vpn_relay_only: relay_only,
@@ -1115,6 +1132,8 @@ pub async fn serve_vpn_connector(
             vpn_forward_accept: forward_accept,
             vpn_nat_masquerade: nat_masquerade,
             vpn_route_policy: route_policy,
+            vpn_advertised: advertised.iter().map(|n| n.to_string()).collect(),
+            vpn_nat_udp_port: nat_udp_display,
         });
         admin_reg.set_overlay(format!("{}/32", peer_slot.overlay));
 
@@ -1418,7 +1437,7 @@ pub async fn serve_vpn_connector(
         basic_auth: false,
         https: false,
         force_https: false,
-        carriers: 0,
+        carriers: effective_carriers,
         auto_reconnect: false,
         udp: false,
         vpn_relay_only: relay_only,
@@ -1427,6 +1446,8 @@ pub async fn serve_vpn_connector(
         vpn_forward_accept: forward_accept,
         vpn_nat_masquerade: nat_masquerade,
         vpn_route_policy: route_policy,
+        vpn_advertised: advertised.iter().map(|n| n.to_string()).collect(),
+        vpn_nat_udp_port: nat_udp_display,
     });
     admin_reg.set_overlay(format!("{connector_overlay}/30"));
 

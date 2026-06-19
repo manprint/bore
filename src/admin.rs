@@ -9,7 +9,7 @@
 //! The HTTP server that renders this state lives in [`crate::admin_http`].
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -57,9 +57,10 @@ pub struct Entry {
     pub https: bool,
     /// Whether the public tunnel redirects plain HTTP to https (`--force-https`).
     pub force_https: bool,
-    /// Number of parallel TCP carrier connections the client requested
-    /// (`--carriers`; `0`/`1` = single-connection default).
-    pub carriers: u16,
+    /// Number of parallel carrier connections. For VPN roles this is updated to
+    /// the *effective* negotiated count once pairing completes (atomic so the
+    /// listener task can refresh it after a connector arrives).
+    pub carriers: AtomicU16,
     /// Whether the client runs with `--auto-reconnect` (client-side reconnect
     /// loop; informational, sent over the wire via `TunnelOptions`).
     pub auto_reconnect: bool,
@@ -91,6 +92,10 @@ pub struct Entry {
     pub vpn_nat_masquerade: bool,
     /// VPN display-only: route accept/refuse policy summary.
     pub vpn_route_policy: Option<String>,
+    /// VPN display-only: CIDRs this side advertises (exposed/virtual), as strings.
+    pub vpn_advertised: Vec<String>,
+    /// VPN display-only: client's `--nat-udp-preferred-port` (None when 0/unset).
+    pub vpn_nat_udp_port: Option<u16>,
 }
 
 /// Descriptive fields used to create an [`Entry`]; the atomics are initialized by
@@ -130,6 +135,10 @@ pub struct NewEntry {
     pub vpn_nat_masquerade: bool,
     /// See [`Entry::vpn_route_policy`].
     pub vpn_route_policy: Option<String>,
+    /// See [`Entry::vpn_advertised`].
+    pub vpn_advertised: Vec<String>,
+    /// See [`Entry::vpn_nat_udp_port`].
+    pub vpn_nat_udp_port: Option<u16>,
 }
 
 /// A serializable snapshot of one [`Entry`], produced by [`AdminRegistry::snapshot`].
@@ -183,6 +192,10 @@ pub struct EntryView {
     pub vpn_nat_masquerade: bool,
     /// See [`Entry::vpn_route_policy`].
     pub vpn_route_policy: Option<String>,
+    /// See [`Entry::vpn_advertised`].
+    pub vpn_advertised: Vec<String>,
+    /// See [`Entry::vpn_nat_udp_port`].
+    pub vpn_nat_udp_port: Option<u16>,
 }
 
 /// Shared, cloneable handle to the live tunnel registry.
@@ -221,7 +234,7 @@ impl AdminRegistry {
             basic_auth: new.basic_auth,
             https: new.https,
             force_https: new.force_https,
-            carriers: new.carriers,
+            carriers: AtomicU16::new(new.carriers),
             auto_reconnect: new.auto_reconnect,
             since: Instant::now(),
             udp: AtomicBool::new(new.udp),
@@ -236,6 +249,8 @@ impl AdminRegistry {
             vpn_forward_accept: new.vpn_forward_accept,
             vpn_nat_masquerade: new.vpn_nat_masquerade,
             vpn_route_policy: new.vpn_route_policy,
+            vpn_advertised: new.vpn_advertised,
+            vpn_nat_udp_port: new.vpn_nat_udp_port,
         });
         self.inner.entries.insert(id, Arc::clone(&entry));
         Registration {
@@ -264,7 +279,7 @@ impl AdminRegistry {
                     basic_auth: entry.basic_auth,
                     https: entry.https,
                     force_https: entry.force_https,
-                    carriers: entry.carriers,
+                    carriers: entry.carriers.load(Ordering::Relaxed),
                     auto_reconnect: entry.auto_reconnect,
                     udp: entry.udp.load(Ordering::Relaxed),
                     uptime_secs: entry.since.elapsed().as_secs(),
@@ -283,6 +298,8 @@ impl AdminRegistry {
                     vpn_forward_accept: entry.vpn_forward_accept,
                     vpn_nat_masquerade: entry.vpn_nat_masquerade,
                     vpn_route_policy: entry.vpn_route_policy.clone(),
+                    vpn_advertised: entry.vpn_advertised.clone(),
+                    vpn_nat_udp_port: entry.vpn_nat_udp_port,
                 }
             })
             .collect();
@@ -331,6 +348,13 @@ impl Registration {
     /// Record the VPN data-plane path reported by the client.
     pub fn set_vpn_direct(&self, direct: bool) {
         self.entry.vpn_direct.store(direct, Ordering::Relaxed);
+    }
+
+    /// Update the carrier count once the effective (negotiated) value is known.
+    /// VPN listeners register before a connector arrives, so the count is
+    /// refreshed here after pairing.
+    pub fn set_carriers(&self, carriers: u16) {
+        self.entry.carriers.store(carriers, Ordering::Relaxed);
     }
 
     /// Shared handles to the relay byte counters `(tx_toward_client, rx_from_client)`.
@@ -390,6 +414,8 @@ mod tests {
             vpn_forward_accept: false,
             vpn_nat_masquerade: false,
             vpn_route_policy: None,
+            vpn_advertised: vec![],
+            vpn_nat_udp_port: None,
         }
     }
 
@@ -459,5 +485,34 @@ mod tests {
         let view = &reg.snapshot()[0];
         assert_eq!(view.carriers, 4);
         assert!(view.auto_reconnect);
+    }
+
+    #[test]
+    fn set_carriers_updates_snapshot() {
+        // VPN listeners register before the connector arrives, then refresh the
+        // count to the effective negotiated value via `set_carriers`.
+        let reg = AdminRegistry::default();
+        let mut new = sample(Role::VpnListener);
+        new.carriers = 1;
+        let handle = reg.register(new);
+        assert_eq!(reg.snapshot()[0].carriers, 1);
+        handle.set_carriers(4);
+        assert_eq!(reg.snapshot()[0].carriers, 4);
+    }
+
+    #[test]
+    fn vpn_display_fields_in_snapshot() {
+        // notes / advertised / nat-udp-port must survive into the admin snapshot
+        // (the VPN panel reads them from here, not the ephemeral provider registry).
+        let reg = AdminRegistry::default();
+        let mut new = sample(Role::VpnConnector);
+        new.notes = Some("site-a".into());
+        new.vpn_advertised = vec!["10.10.0.0/24".into()];
+        new.vpn_nat_udp_port = Some(443);
+        let _handle = reg.register(new);
+        let view = &reg.snapshot()[0];
+        assert_eq!(view.notes.as_deref(), Some("site-a"));
+        assert_eq!(view.vpn_advertised, vec!["10.10.0.0/24".to_string()]);
+        assert_eq!(view.vpn_nat_udp_port, Some(443));
     }
 }

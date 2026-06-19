@@ -41,3 +41,4 @@ pub mod vhost;
 pub mod vpn;
 #[cfg(feature = "vpn")]
 pub mod vpn_server;
+pub mod weblog;

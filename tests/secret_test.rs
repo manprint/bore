@@ -71,6 +71,7 @@ async fn secret_provider_registers() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await;
     if let Err(err) = provider {
@@ -102,6 +103,7 @@ async fn secret_duplicate_id_rejected() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(first.listen()); // keep the registration alive
@@ -123,6 +125,7 @@ async fn secret_duplicate_id_rejected() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await;
     assert!(second.is_err(), "duplicate tcp-secret-id must be rejected");
@@ -152,6 +155,7 @@ async fn secret_registration_requires_correct_secret() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await;
     assert!(wrong.is_err(), "wrong secret must be rejected");
@@ -172,6 +176,7 @@ async fn secret_registration_requires_correct_secret() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await;
     assert!(missing.is_err(), "missing secret must be rejected");
@@ -225,6 +230,7 @@ async fn spawn_secret_tunnel(id: &str, secret: Option<&str>) -> Result<std::net:
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -289,6 +295,7 @@ async fn secret_tunnel_websocket_relay_round_trip() -> Result<()> {
         1024,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -345,6 +352,7 @@ async fn secret_tunnel_websocket_direct_udp_round_trip() -> Result<()> {
         1024,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -434,6 +442,7 @@ async fn secret_multiple_consumers_concurrent() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -614,6 +623,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
             notes: Some("pub note".into()),
             ..Default::default()
         },
+        None,
     )
     .await?;
     let pub_port = pub_client.remote_port();
@@ -639,6 +649,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
             notes: Some("prov note".into()),
             basic_auth: Some("u:p".into()),
         },
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());

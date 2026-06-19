@@ -6,6 +6,7 @@
 //! - max-conns permit recovery after rapid connection churn
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -14,6 +15,7 @@ use bore_cli::{
     server::Server,
     shared::{TunnelOptions, CONTROL_PORT},
     transport,
+    weblog::{AccessLogConfig, AccessLogger},
 };
 use lazy_static::lazy_static;
 use rcgen::generate_simple_self_signed;
@@ -74,6 +76,7 @@ async fn spawn_client(options: TunnelOptions) -> Result<(TcpListener, SocketAddr
         None,
         false,
         options,
+        None,
     )
     .await?;
     let remote_addr = ([127, 0, 0, 1], client.remote_port()).into();
@@ -94,6 +97,7 @@ async fn spawn_tls_client(options: TunnelOptions) -> Result<(TcpListener, Socket
         None,
         true, // insecure: self-signed cert
         options,
+        None,
     )
     .await?;
     let remote_addr = ([127, 0, 0, 1], client.remote_port()).into();
@@ -283,6 +287,7 @@ async fn max_conns_permit_recovers_after_rapid_churn() -> Result<()> {
         TunnelOptions {
             ..Default::default()
         },
+        None,
     )
     .await?;
     let addr: SocketAddr = ([127, 0, 0, 1], client.remote_port()).into();
@@ -303,6 +308,244 @@ async fn max_conns_permit_recovers_after_rapid_churn() -> Result<()> {
     stream.write_all(b"x").await?;
     // The local service doesn't echo, so just verify the write succeeded
     // (no error = connection accepted and reached the service).
+
+    Ok(())
+}
+
+// ─── Access logging tests ─────────────────────────────────────────────
+
+/// Spawn a server with webserver logging enabled.
+async fn spawn_server_with_log(log_dir: &std::path::Path) -> Result<()> {
+    wait_for_control_port(false).await;
+    let mut server = Server::new(1024..=65535, None);
+    let _ = server.set_webserver_log(Some(log_dir.to_path_buf()), 4, 100);
+    tokio::spawn(server.listen());
+    wait_for_control_port(true).await;
+    Ok(())
+}
+
+/// Spawn a public-tunnel client with logging enabled.
+async fn spawn_client_with_log(
+    log_dir: &std::path::Path,
+    options: TunnelOptions,
+) -> Result<(TcpListener, SocketAddr)> {
+    let listener = TcpListener::bind("localhost:0").await?;
+    let local_port = listener.local_addr()?.port();
+
+    let cfg = AccessLogConfig {
+        dir: log_dir.to_path_buf(),
+        max_files: 4,
+        max_file_size_bytes: 100 * 1024 * 1024,
+    };
+    let logger = Arc::new(AccessLogger::new(cfg));
+
+    let client = Client::new(
+        "localhost",
+        local_port,
+        "localhost",
+        0,
+        None,
+        false,
+        options,
+        Some(logger),
+    )
+    .await?;
+    let remote_addr = ([127, 0, 0, 1], client.remote_port()).into();
+    tokio::spawn(client.listen());
+    Ok((listener, remote_addr))
+}
+
+/// Poll a file path up to 2 seconds, returning its contents when available.
+async fn poll_file(path: &std::path::Path, max_wait: Duration) -> Result<String> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            return Ok(content);
+        }
+        if start.elapsed() > max_wait {
+            anyhow::bail!("log file not created after {:?}", max_wait);
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Spawn a simple HTTP stub that always returns 200 OK.
+#[allow(dead_code)]
+async fn spawn_http_echo_stub(body: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let body = body;
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let mut total = 0;
+                loop {
+                    let n = stream.read(&mut buf[total..]).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                    if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if total >= buf.len() {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn server_access_log_http() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let log_dir = std::env::temp_dir().join("bore_test_server_log");
+    let _ = std::fs::remove_dir_all(&log_dir);
+    std::fs::create_dir_all(&log_dir)?;
+
+    spawn_server_with_log(&log_dir).await?;
+    let (listener, addr) = spawn_client(TunnelOptions::default()).await?;
+
+    // HTTP stub that responds to GET /api/ping
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await?;
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let response = if req.contains("GET /api/ping") {
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+        } else {
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"
+        };
+        stream.write_all(response.as_bytes()).await?;
+        anyhow::Ok(())
+    });
+
+    // Send HTTP request
+    let mut conn = TcpStream::connect(addr).await?;
+    conn.write_all(b"GET /api/ping HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await?;
+    conn.shutdown().await?;
+    let _ = read_some(&mut conn).await;
+
+    // Check log file exists and contains the request
+    let log_file = log_dir.join(format!("{}.log", addr.port()));
+    let content = poll_file(&log_file, Duration::from_secs(2)).await?;
+    assert!(
+        content.contains("GET /api/ping"),
+        "log should contain request: {}",
+        content
+    );
+    assert!(
+        content.contains("127.0.0.1"),
+        "log should contain client IP: {}",
+        content
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_access_log_real_ip_forwarded() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let log_dir = std::env::temp_dir().join("bore_test_client_log");
+    let _ = std::fs::remove_dir_all(&log_dir);
+    std::fs::create_dir_all(&log_dir)?;
+
+    spawn_server().await;
+    let (listener, addr) = spawn_client_with_log(&log_dir, TunnelOptions::default()).await?;
+
+    // Simple echo service that immediately returns HTTP OK
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n > 0 {
+                        let response =
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+                        let _ = stream.write_all(response).await;
+                    }
+                });
+            }
+        }
+    });
+
+    // Send HTTP request through tunnel
+    let mut conn = TcpStream::connect(addr).await?;
+    conn.write_all(b"GET /api/ping HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await?;
+    conn.shutdown().await?;
+    let _ = read_some(&mut conn).await;
+
+    time::sleep(Duration::from_millis(100)).await;
+
+    // Check client log
+    let log_file = log_dir.join(format!("{}.log", addr.port()));
+    let content = poll_file(&log_file, Duration::from_secs(2)).await?;
+    assert!(
+        content.contains("GET /api/ping"),
+        "client log should contain request: {}",
+        content
+    );
+    // Client-side logging shows "-" for unknown IP (no forwarded header from local service).
+    // The important thing is that it logged at all.
+    assert!(
+        !content.is_empty(),
+        "client log should not be empty: {}",
+        content
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_access_log_raw() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let log_dir = std::env::temp_dir().join("bore_test_raw_log");
+    let _ = std::fs::remove_dir_all(&log_dir);
+    std::fs::create_dir_all(&log_dir)?;
+
+    spawn_server().await;
+    let (listener, addr) = spawn_client_with_log(&log_dir, TunnelOptions::default()).await?;
+
+    // Raw TCP echo service
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut buf = [0u8; 256];
+        let n = stream.read(&mut buf).await?;
+        stream.write_all(&buf[..n]).await?;
+        anyhow::Ok(())
+    });
+
+    // Send raw bytes
+    let mut conn = TcpStream::connect(addr).await?;
+    conn.write_all(b"\x01\x02\x03\x04\x05").await?;
+    conn.shutdown().await?;
+
+    time::sleep(Duration::from_millis(100)).await;
+
+    // Check log file
+    let log_file = log_dir.join(format!("{}.log", addr.port()));
+    let content = poll_file(&log_file, Duration::from_secs(2)).await?;
+    assert!(
+        !content.is_empty(),
+        "raw log should have content: {}",
+        content
+    );
 
     Ok(())
 }

@@ -200,6 +200,104 @@ bench() {
     sleep 1
 }
 
+# bench_wlog_delta <config-name> <bore-vhost-args...>
+# Measures throughput WITH and WITHOUT --webserver-log, prints delta.
+bench_wlog_delta() {
+    local name="$1"; shift
+    local pargs=("$@")
+    local wlog_dir="/tmp/bore_wlog_vhost_bench"
+
+    # Measure WITHOUT --webserver-log
+    ip netns exec nsp "$BORE" vhost 127.0.0.1:"$ORIGIN_PORT" \
+        --subdomain "$name" --id "bench-$name-nowlog" \
+        --to "$SERVER_IP_NS0_PROV:7835" --secret "$SECRET" \
+        "${pargs[@]}" \
+        >"$LOG/$name.provider.nowlog.log" 2>&1 &
+    local PROV_PID=$!
+    sleep 3
+
+    local THROUGHPUT_NO_WLOG="—"
+    if command -v hey >/dev/null 2>&1; then
+        local hey_out
+        hey_out=$(ip netns exec nsc hey -z "${DUR}s" -c 50 -q 5 \
+            -H "Host: $name.bore.local" \
+            "http://$SERVER_IP_NS0_CLI/testfile.bin" 2>/dev/null || echo "")
+        if [ -n "$hey_out" ]; then
+            THROUGHPUT_NO_WLOG=$(echo "$hey_out" | grep -oP 'Requests/sec:\s*\K[0-9.]+' | head -1 || echo "—")
+        fi
+    else
+        # Fallback to curl
+        local speedfile
+        speedfile=$(mktemp)
+        for _ in $(seq 1 10); do
+            ( timeout 30 ip netns exec nsc curl -s -o /dev/null -w '%{speed_download}\n' \
+                -H "Host: $name.bore.local" \
+                "http://$SERVER_IP_NS0_CLI/testfile.bin" 2>/dev/null >>"$speedfile" || true ) &
+        done
+        wait
+        THROUGHPUT_NO_WLOG=$(awk '{s+=$1} END {printf "%.0f", s/1e6}' "$speedfile" 2>/dev/null || echo "?")
+        rm -f "$speedfile"
+    fi
+    kill "$PROV_PID" 2>/dev/null || true
+    sleep 1
+
+    # Measure WITH --webserver-log
+    rm -rf "$wlog_dir" 2>/dev/null || true
+    mkdir -p "$wlog_dir"
+
+    ip netns exec nsp "$BORE" vhost 127.0.0.1:"$ORIGIN_PORT" \
+        --subdomain "$name" --id "bench-$name-wlog" \
+        --to "$SERVER_IP_NS0_PROV:7835" --secret "$SECRET" \
+        --webserver-log "$wlog_dir" \
+        "${pargs[@]}" \
+        >"$LOG/$name.provider.wlog.log" 2>&1 &
+    local PROV_PID=$!
+    sleep 3
+
+    local THROUGHPUT_WITH_WLOG="—"
+    if command -v hey >/dev/null 2>&1; then
+        local hey_out
+        hey_out=$(ip netns exec nsc hey -z "${DUR}s" -c 50 -q 5 \
+            -H "Host: $name.bore.local" \
+            "http://$SERVER_IP_NS0_CLI/testfile.bin" 2>/dev/null || echo "")
+        if [ -n "$hey_out" ]; then
+            THROUGHPUT_WITH_WLOG=$(echo "$hey_out" | grep -oP 'Requests/sec:\s*\K[0-9.]+' | head -1 || echo "—")
+        fi
+    else
+        # Fallback to curl
+        local speedfile
+        speedfile=$(mktemp)
+        for _ in $(seq 1 10); do
+            ( timeout 30 ip netns exec nsc curl -s -o /dev/null -w '%{speed_download}\n' \
+                -H "Host: $name.bore.local" \
+                "http://$SERVER_IP_NS0_CLI/testfile.bin" 2>/dev/null >>"$speedfile" || true ) &
+        done
+        wait
+        THROUGHPUT_WITH_WLOG=$(awk '{s+=$1} END {printf "%.0f", s/1e6}' "$speedfile" 2>/dev/null || echo "?")
+        rm -f "$speedfile"
+    fi
+    kill "$PROV_PID" 2>/dev/null || true
+    sleep 1
+
+    # Calculate delta %
+    local delta="—"
+    if [ "$THROUGHPUT_NO_WLOG" != "—" ] && [ "$THROUGHPUT_WITH_WLOG" != "—" ] && \
+       [ "$THROUGHPUT_NO_WLOG" != "?" ] && [ "$THROUGHPUT_WITH_WLOG" != "?" ]; then
+        delta=$(echo "scale=1; ($THROUGHPUT_NO_WLOG - $THROUGHPUT_WITH_WLOG) / $THROUGHPUT_NO_WLOG * 100" | bc 2>/dev/null || echo "—")
+    fi
+
+    # Check status
+    local status="PASS"
+    if [ "$delta" != "—" ]; then
+        if (( $(echo "$delta > 5" | bc -l 2>/dev/null) )); then
+            status="FAIL (delta > 5%)"
+        fi
+    fi
+
+    echo "| $name | $THROUGHPUT_NO_WLOG | $THROUGHPUT_WITH_WLOG | $delta% | $status |"
+    rm -rf "$wlog_dir" 2>/dev/null || true
+}
+
 # ── BENCHMARK MATRIX: CLEAN LINK ───────────────────────────────────────────────
 echo "## vhost throughput/latency benchmark ($(date -u +%F), netns, ${DUR}s per test)"
 echo ""
@@ -234,3 +332,18 @@ ip netns exec ns0 tc qdisc del dev vethsp root 2>/dev/null || true
 
 echo ""
 echo "Acceptance: QUIC gains over TCP under loss; multi-carrier > single-carrier."
+
+# ── T-WLBENCH: webserver-log bandwidth impact ────────────────────────────────────
+echo ""
+echo "### T-WLBENCH: --webserver-log throughput impact"
+echo ""
+echo "| Configuration | No logging (req/s) | With logging (req/s) | Delta % | Status |"
+echo "|---|---|---|---|---|"
+bench_wlog_delta "wlog-tcp-1c"
+bench_wlog_delta "wlog-tcp-4c" --carriers 4
+bench_wlog_delta "wlog-udp-1c" --udp
+bench_wlog_delta "wlog-udp-4c" --udp --carriers 4
+
+echo ""
+echo "Acceptance: throughput with --webserver-log must be within 5% of without."
+echo "The logging must never cause the data path to block or throttle."

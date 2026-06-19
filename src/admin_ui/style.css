@@ -395,7 +395,7 @@ tr:hover {
 
 .config-row {
     display: grid;
-    grid-template-columns: 200px 1fr;
+    grid-template-columns: minmax(180px, auto) 1fr;
     border-bottom: 1px solid #ecf0f1;
     align-items: start;
 }
@@ -411,6 +411,8 @@ tr:hover {
     color: #2c3e50;
     font-family: monospace;
     font-size: 0.9rem;
+    word-break: break-word;
+    overflow-wrap: anywhere;
 }
 
 .config-value {

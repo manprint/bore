@@ -16,8 +16,10 @@ use bore_cli::{
         CollisionPolicy, DeviceMode, ListenerOptions as TransferListenerOptions,
         SenderOptions as TransferSenderOptions, SymlinkMode,
     },
+    weblog::{AccessLogConfig, AccessLogger},
 };
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Full version string: "bore 1.0.0 - <branch> - <sha8>".
@@ -174,6 +176,31 @@ enum Command {
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
         auto_reconnect: bool,
+
+        /// Directory to write access logs for HTTP requests (vhost + public tunnels).
+        /// When set, enables logging to files under this directory.
+        #[clap(long, value_name = "DIR", env = "BORE_WEBSERVER_LOG")]
+        webserver_log: Option<PathBuf>,
+
+        /// Maximum number of rotated log files to retain per tunnel.
+        /// Only meaningful with --webserver-log; default 4.
+        #[clap(
+            long,
+            value_name = "N",
+            default_value_t = 4,
+            env = "BORE_WEBSERVER_LOG_MAX_FILES"
+        )]
+        webserver_log_max_files: usize,
+
+        /// Maximum size (in MiB) of a log file before rotation.
+        /// Only meaningful with --webserver-log; default 100.
+        #[clap(
+            long,
+            value_name = "MB",
+            default_value_t = 100,
+            env = "BORE_WEBSERVER_LOG_MAX_FILE_SIZE"
+        )]
+        webserver_log_max_file_size: u64,
     },
 
     /// Connects to a named secret tunnel and exposes it on a local port.
@@ -337,6 +364,31 @@ enum Command {
         /// Reconnect automatically with backoff if the connection fails or drops.
         #[clap(long, env = "BORE_AUTO_RECONNECT")]
         auto_reconnect: bool,
+
+        /// Directory to write access logs for HTTP requests (vhost + public tunnels).
+        /// When set, enables logging to files under this directory.
+        #[clap(long, value_name = "DIR", env = "BORE_WEBSERVER_LOG")]
+        webserver_log: Option<PathBuf>,
+
+        /// Maximum number of rotated log files to retain per tunnel.
+        /// Only meaningful with --webserver-log; default 4.
+        #[clap(
+            long,
+            value_name = "N",
+            default_value_t = 4,
+            env = "BORE_WEBSERVER_LOG_MAX_FILES"
+        )]
+        webserver_log_max_files: usize,
+
+        /// Maximum size (in MiB) of a log file before rotation.
+        /// Only meaningful with --webserver-log; default 100.
+        #[clap(
+            long,
+            value_name = "MB",
+            default_value_t = 100,
+            env = "BORE_WEBSERVER_LOG_MAX_FILE_SIZE"
+        )]
+        webserver_log_max_file_size: u64,
     },
 
     /// Secure file and directory transfer over secret tunnels.
@@ -570,6 +622,31 @@ enum Command {
             env = "BORE_VPN_HUB_PREFIX"
         )]
         vpn_hub_prefix: u8,
+
+        /// Directory to write access logs for HTTP requests (vhost + public tunnels).
+        /// When set, enables logging to files under this directory.
+        #[clap(long, value_name = "DIR", env = "BORE_WEBSERVER_LOG")]
+        webserver_log: Option<PathBuf>,
+
+        /// Maximum number of rotated log files to retain per tunnel.
+        /// Only meaningful with --webserver-log; default 4.
+        #[clap(
+            long,
+            value_name = "N",
+            default_value_t = 4,
+            env = "BORE_WEBSERVER_LOG_MAX_FILES"
+        )]
+        webserver_log_max_files: usize,
+
+        /// Maximum size (in MiB) of a log file before rotation.
+        /// Only meaningful with --webserver-log; default 100.
+        #[clap(
+            long,
+            value_name = "MB",
+            default_value_t = 100,
+            env = "BORE_WEBSERVER_LOG_MAX_FILE_SIZE"
+        )]
+        webserver_log_max_file_size: u64,
     },
 
     /// Diagnose this host's UDP / NAT / firewall for hole-punching (opens no
@@ -1244,6 +1321,9 @@ async fn dispatch(command: Command) -> Result<()> {
             notes,
             carriers,
             auto_reconnect,
+            webserver_log,
+            webserver_log_max_files,
+            webserver_log_max_file_size,
         } => {
             let notes = clamp_notes(notes);
             if let Some(creds) = &basic_auth {
@@ -1256,6 +1336,15 @@ async fn dispatch(command: Command) -> Result<()> {
                         .exit();
                 }
             }
+
+            // Build access logger for public tunnels.
+            let access_logger = AccessLogConfig::from_flags(
+                webserver_log.clone(),
+                webserver_log_max_files,
+                webserver_log_max_file_size,
+            )?
+            .map(|cfg| Arc::new(AccessLogger::new(cfg)));
+
             // The direct-UDP path (hole-punched QUIC) exists only for secret
             // tunnels: a public tunnel always relays through the server, which owns
             // the public port, so there is no peer to punch to. These flags are
@@ -1280,13 +1369,14 @@ async fn dispatch(command: Command) -> Result<()> {
                     }
                     let meta = ProviderMeta { notes, basic_auth };
                     let connect = move || {
-                        let (local_host, to, id, secret, stun_server, meta) = (
+                        let (local_host, to, id, secret, stun_server, meta, access_logger) = (
                             local_host.clone(),
                             to.clone(),
                             id.clone(),
                             secret.clone(),
                             stun_server.clone(),
                             meta.clone(),
+                            access_logger.clone(),
                         );
                         async move {
                             Client::new_secret_provider(
@@ -1305,6 +1395,7 @@ async fn dispatch(command: Command) -> Result<()> {
                                 max_conns,
                                 carriers,
                                 meta,
+                                access_logger,
                             )
                             .await
                         }
@@ -1337,13 +1428,15 @@ async fn dispatch(command: Command) -> Result<()> {
                         carriers,
                         udp,
                         auto_reconnect,
+                        webserver_log: webserver_log.is_some(),
                     };
                     let connect = move || {
-                        let (local_host, to, secret, options) = (
+                        let (local_host, to, secret, options, access_logger) = (
                             local_host.clone(),
                             to.clone(),
                             secret.clone(),
                             options.clone(),
+                            access_logger.clone(),
                         );
                         async move {
                             Client::new(
@@ -1354,6 +1447,7 @@ async fn dispatch(command: Command) -> Result<()> {
                                 secret.as_deref(),
                                 insecure,
                                 options,
+                                access_logger,
                             )
                             .await
                         }
@@ -1701,6 +1795,9 @@ async fn dispatch(command: Command) -> Result<()> {
             vpn_max_links,
             #[cfg(feature = "vpn")]
             vpn_hub_prefix,
+            webserver_log,
+            webserver_log_max_files,
+            webserver_log_max_file_size,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -1720,6 +1817,11 @@ async fn dispatch(command: Command) -> Result<()> {
                 }
             }
             let mut server = Server::new(port_range, secret.as_deref());
+            server.set_webserver_log(
+                webserver_log,
+                webserver_log_max_files,
+                webserver_log_max_file_size,
+            )?;
             server.set_admin_token(admin_token);
             server.set_control_hsts(&control_hsts);
             server.set_max_conns(max_conns);
@@ -1914,6 +2016,9 @@ async fn dispatch(command: Command) -> Result<()> {
             carriers,
             udp,
             auto_reconnect,
+            webserver_log,
+            webserver_log_max_files,
+            webserver_log_max_file_size,
         } => {
             let (local_host, local_port) = parse_vhost_target(&target)?;
             let notes = clamp_notes(notes);
@@ -1921,14 +2026,24 @@ async fn dispatch(command: Command) -> Result<()> {
                 notes,
                 basic_auth: basic_auth.clone(),
             };
+
+            // Build access logger for vhost provider.
+            let access_logger = AccessLogConfig::from_flags(
+                webserver_log.clone(),
+                webserver_log_max_files,
+                webserver_log_max_file_size,
+            )?
+            .map(|cfg| Arc::new(AccessLogger::new(cfg)));
+
             let connect = move || {
-                let (local_host, to, subdomain, id, secret, meta) = (
+                let (local_host, to, subdomain, id, secret, meta, access_logger) = (
                     local_host.clone(),
                     to.clone(),
                     subdomain.clone(),
                     id.clone(),
                     secret.clone(),
                     meta.clone(),
+                    access_logger.clone(),
                 );
                 async move {
                     bore_cli::client::Client::new_vhost_provider_with_udp(
@@ -1942,6 +2057,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         carriers,
                         udp,
                         meta,
+                        access_logger,
                     )
                     .await
                 }

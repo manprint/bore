@@ -586,6 +586,201 @@ fi
 kill "$PROXY_PID" "$LOCAL_PID" "$HTTP_PID" 2>/dev/null || true
 sleep 0.5
 
+# ── Test 9: T-WLOG-PUB-HTTP (public tunnel HTTP logging) ────────────────────────
+echo "=== Test 9: T-WLOG-PUB-HTTP (public tunnel with --webserver-log) ==="
+# Start HTTP responder (returns valid HTTP/1.1 response with proper CRLF)
+HTTP_RESP_9="/tmp/http_response_9.bin"
+printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok" > "$HTTP_RESP_9"
+ip netns exec nssvc socat TCP-LISTEN:9000,reuseaddr,fork SYSTEM:"cat $HTTP_RESP_9" >/dev/null 2>&1 &
+SVC_PID=$!
+sleep 0.3
+
+# Create log directory
+WLOG_DIR="/tmp/bore_wlog_http"
+rm -rf "$WLOG_DIR" 2>/dev/null || true
+mkdir -p "$WLOG_DIR"
+
+# Start bore local with --webserver-log
+LOCAL_LOG="/tmp/bore_local_wlog_http.log"
+ip netns exec nssvc "$BORE" local 9000 \
+    --to "$SERVER_IP_NS0_SVC:7835" \
+    --secret "$SECRET" \
+    --port 9999 \
+    --webserver-log "$WLOG_DIR" \
+    >"$LOCAL_LOG" 2>&1 &
+LOCAL_PID=$!
+sleep 1
+
+# Send HTTP request from nscli (caller IP = 10.211.0.1)
+HTTP_REQUEST="GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+(echo -en "$HTTP_REQUEST"; sleep 0.5) | timeout 10 ip netns exec nscli nc "$SERVER_IP_NS0_CLI" 9999 > /dev/null 2>&1 || true
+sleep 1
+
+# Check that log file exists and contains the request + caller IP
+WLOG_FILE="$WLOG_DIR/9999.log"
+if [ -f "$WLOG_FILE" ]; then
+    if grep -q "GET /ping" "$WLOG_FILE" 2>/dev/null && grep -q "$CLI_IP" "$WLOG_FILE" 2>/dev/null; then
+        pass "webserver-log public HTTP: log file contains GET /ping and caller IP $CLI_IP"
+    else
+        fail "webserver-log public HTTP: log file missing request line or caller IP"
+    fi
+else
+    fail "webserver-log public HTTP: log file not created"
+fi
+
+kill "$LOCAL_PID" "$SVC_PID" 2>/dev/null || true
+sleep 0.5
+rm -rf "$WLOG_DIR" 2>/dev/null || true
+
+# ── Test 10: T-WLOG-PUB-RAW (public tunnel raw bytes logging) ────────────────────
+echo "=== Test 10: T-WLOG-PUB-RAW (public tunnel with raw bytes) ==="
+# Start echo service (echoes request back, triggering raw mode)
+ip netns exec nssvc socat TCP-LISTEN:9000,reuseaddr,fork EXEC:/bin/cat >/dev/null 2>&1 &
+SVC_PID=$!
+sleep 0.3
+
+# Create log directory
+WLOG_DIR="/tmp/bore_wlog_raw"
+rm -rf "$WLOG_DIR" 2>/dev/null || true
+mkdir -p "$WLOG_DIR"
+
+# Start bore local with --webserver-log
+LOCAL_LOG="/tmp/bore_local_wlog_raw.log"
+ip netns exec nssvc "$BORE" local 9000 \
+    --to "$SERVER_IP_NS0_SVC:7835" \
+    --secret "$SECRET" \
+    --port 9999 \
+    --webserver-log "$WLOG_DIR" \
+    >"$LOCAL_LOG" 2>&1 &
+LOCAL_PID=$!
+sleep 1
+
+# Send raw (non-HTTP) bytes through the tunnel
+echo -n "raw_binary_data" | timeout 10 ip netns exec nscli nc "$SERVER_IP_NS0_CLI" 9999 > /dev/null 2>&1 || true
+sleep 1
+
+# Check that log file contains exactly one raw line (marked with "raw" at end)
+WLOG_FILE="$WLOG_DIR/9999.log"
+if [ -f "$WLOG_FILE" ]; then
+    RAW_COUNT=$(grep '"raw"' "$WLOG_FILE" 2>/dev/null | wc -l)
+    if [ "$RAW_COUNT" -eq 1 ]; then
+        pass "webserver-log public raw: exactly one raw line recorded"
+    else
+        fail "webserver-log public raw: expected 1 raw line, got $RAW_COUNT"
+    fi
+else
+    fail "webserver-log public raw: log file not created"
+fi
+
+kill "$LOCAL_PID" "$SVC_PID" 2>/dev/null || true
+sleep 0.5
+rm -rf "$WLOG_DIR" 2>/dev/null || true
+
+# ── Test 11: T-WLOG-PUB-IP (server-side public logging) ───────────────────────────
+echo "=== Test 11: T-WLOG-PUB-IP (server-side public tunnel logging) ==="
+# Kill existing server and restart with --webserver-log
+kill "$SERVER_PID" 2>/dev/null || true
+wait_port_free ns0 127.0.0.1 7835 || true
+
+# Create server-side log directory
+WLOG_DIR="/tmp/bore_wlog_server"
+rm -rf "$WLOG_DIR" 2>/dev/null || true
+mkdir -p "$WLOG_DIR"
+
+SERVER_LOG="/tmp/bore_local_server_wlog.log"
+ip netns exec ns0 "$BORE" server \
+    --bind-addr 0.0.0.0 --bind-tunnels 0.0.0.0 \
+    --secret "$SECRET" \
+    --udp \
+    --control-port 7835 \
+    --webserver-log "$WLOG_DIR" \
+    >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+wait_server_ready ns0 127.0.0.1 7835 || die "server with --webserver-log failed to start"
+sleep 1
+
+# Start HTTP responder and public tunnel
+HTTP_RESP_11="/tmp/http_response_11.bin"
+printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok" > "$HTTP_RESP_11"
+ip netns exec nssvc socat TCP-LISTEN:9000,reuseaddr,fork SYSTEM:"cat $HTTP_RESP_11" >/dev/null 2>&1 &
+SVC_PID=$!
+sleep 0.3
+
+LOCAL_LOG="/tmp/bore_local_wlog_server_test.log"
+ip netns exec nssvc "$BORE" local 9000 \
+    --to "$SERVER_IP_NS0_SVC:7835" \
+    --secret "$SECRET" \
+    --port 9999 \
+    >"$LOCAL_LOG" 2>&1 &
+LOCAL_PID=$!
+sleep 1
+
+# Send HTTP from nscli (caller will appear in server log with real IP from accept)
+HTTP_REQUEST="GET /test HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+(echo -en "$HTTP_REQUEST"; sleep 0.5) | timeout 10 ip netns exec nscli nc "$SERVER_IP_NS0_CLI" 9999 > /dev/null 2>&1 || true
+sleep 1
+
+# Check server-side log — it should contain the caller IP from accept
+WLOG_FILE="$WLOG_DIR/9999.log"
+if [ -f "$WLOG_FILE" ]; then
+    if grep -q "$CLI_IP" "$WLOG_FILE" 2>/dev/null; then
+        pass "webserver-log server public: log contains caller IP from accept"
+    else
+        fail "webserver-log server public: log missing caller IP"
+    fi
+else
+    fail "webserver-log server public: server log file not created"
+fi
+
+kill "$LOCAL_PID" "$SVC_PID" 2>/dev/null || true
+sleep 0.5
+rm -rf "$WLOG_DIR" 2>/dev/null || true
+
+# ── Test 12: T-WLOG-CLIENT-IP-FWD (client receives forwarded IP) ─────────────────
+echo "=== Test 12: T-WLOG-CLIENT-IP-FWD (client logs forwarded external IP) ==="
+# Start HTTP responder
+HTTP_RESP_12="/tmp/http_response_12.bin"
+printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok" > "$HTTP_RESP_12"
+ip netns exec nssvc socat TCP-LISTEN:9000,reuseaddr,fork SYSTEM:"cat $HTTP_RESP_12" >/dev/null 2>&1 &
+SVC_PID=$!
+sleep 0.3
+
+# Create client-side log directory
+WLOG_DIR="/tmp/bore_wlog_client_fwd"
+rm -rf "$WLOG_DIR" 2>/dev/null || true
+mkdir -p "$WLOG_DIR"
+
+LOCAL_LOG="/tmp/bore_local_wlog_client_fwd.log"
+ip netns exec nssvc "$BORE" local 9000 \
+    --to "$SERVER_IP_NS0_SVC:7835" \
+    --secret "$SECRET" \
+    --port 9999 \
+    --webserver-log "$WLOG_DIR" \
+    >"$LOCAL_LOG" 2>&1 &
+LOCAL_PID=$!
+sleep 1
+
+# Send HTTP from nscli (caller IP = 10.211.0.1)
+HTTP_REQUEST="GET /fwd-test HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+(echo -en "$HTTP_REQUEST"; sleep 0.5) | timeout 10 ip netns exec nscli nc "$SERVER_IP_NS0_CLI" 9999 > /dev/null 2>&1 || true
+sleep 1
+
+# Check that client-side log contains the REAL external caller IP (forwarded from server)
+WLOG_FILE="$WLOG_DIR/9999.log"
+if [ -f "$WLOG_FILE" ]; then
+    if grep -q "$CLI_IP" "$WLOG_FILE" 2>/dev/null; then
+        pass "webserver-log client forward: client log shows external caller IP"
+    else
+        fail "webserver-log client forward: client log missing external caller IP"
+    fi
+else
+    fail "webserver-log client forward: client log file not created"
+fi
+
+kill "$LOCAL_PID" "$SVC_PID" 2>/dev/null || true
+sleep 0.5
+rm -rf "$WLOG_DIR" 2>/dev/null || true
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
 echo "========================================"

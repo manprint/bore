@@ -149,6 +149,9 @@ Options:
       --notes <TEXT>           Note shown on the server's admin status page [env: BORE_NOTES=]
       --carriers <N>           Parallel TCP carrier connections for the data path (public tunnels; default 1) [env: BORE_CARRIERS=]
       --auto-reconnect         Reconnect automatically with backoff if the connection drops [env: BORE_AUTO_RECONNECT=]
+      --webserver-log <DIR>    Write access logs in nginx-combined format to <DIR> [env: BORE_WEBSERVER_LOG=]
+      --webserver-log-max-files <N> Max rotated log files per target (default 4) [env: BORE_WEBSERVER_LOG_MAX_FILES=]
+      --webserver-log-max-file-size <MB> Max MiB per log file before rotation (default 100) [env: BORE_WEBSERVER_LOG_MAX_FILE_SIZE=]
   -h, --help                   Print help
 ```
 
@@ -1008,12 +1011,16 @@ bore server \
   --secret S3cret \
   --vpn \
   --vpn-pool 10.99.0.0/16 \
-  --vpn-max-links 32
+  --vpn-max-links 32 \
+  --webserver-log /var/log/bore
 ```
 
 - `--vpn`: enable VPN brokering (server must be built with `--features vpn`).
 - `--vpn-pool <CIDR>`: allocate `/30` overlay blocks from this pool (required for pool-mode clients).
 - `--vpn-max-links <N>`: limit concurrent VPN links (default `32`).
+- `--webserver-log <DIR>`: write access logs in nginx-combined format to <DIR> (off by default).
+- `--webserver-log-max-files <N>`: max rotated log files per target (default 4).
+- `--webserver-log-max-file-size <MB>`: max MiB per log file before rotation (default 100).
 
 ### Client Options
 
@@ -1211,6 +1218,96 @@ The server polls `vhost.yml`, `cert_file`, and `key_file` every 2 seconds. On a 
 | `--basic-auth user:pass` | Tell the admin page this provider enforces Basic auth |
 | `--notes TEXT` | Free-form note on the admin status page |
 | `--auto-reconnect` | Reconnect automatically with backoff on disconnect |
+| `--webserver-log <DIR>` | Write access logs in nginx-combined format to <DIR> |
+| `--webserver-log-max-files <N>` | Max rotated log files per target (default 4) |
+| `--webserver-log-max-file-size <MB>` | Max MiB per log file before rotation (default 100) |
+
+## Access Logging
+
+Access logs record HTTP requests and raw TCP connections in nginx "combined" format, with real caller IPs, optional size-based rotation, and **zero bandwidth overhead** (logging taps in-flight bytes without copying, drops records under disk pressure, never blocks the data path).
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--webserver-log <DIR>` | off | Write logs to this directory |
+| `--webserver-log-max-files <N>` | 4 | Rotated log files retained per target |
+| `--webserver-log-max-file-size <MB>` | 100 | File size (MiB) before rotation |
+
+Rotation flags without `--webserver-log` are ignored with a warning.
+
+### File naming and layout
+
+**Client-side:**
+- Vhost: `<DIR>/<subdomain>.log` (flat; one file per subdomain)
+- Public `local` tunnel: `<DIR>/<port>.log` (one file per public port)
+
+**Server-side:**
+- Vhost: `<DIR>/<subdomain>/<subdomain>.<domain>.<tld>.log` (per-subdomain folder)
+- Public tunnel: `<DIR>/<port>.log` (one file per public port)
+
+### HTTP vs raw/TLS
+
+**HTTP traffic** (including HTTP/1.1 keep-alive with Content-Length and chunked bodies) is logged per-request in nginx combined format:
+```
+IP - - [timestamp] "METHOD PATH HTTP/x.y" status_code bytes "referer" "user-agent"
+```
+
+**Non-HTTP or TLS-encrypted** connections (detected by sniffing the first bytes) are logged at connection level:
+```
+IP - - [timestamp] "raw" - bytes_sent+bytes_recv - "-" "-"
+```
+
+For **vhost HTTPS**, the server terminates TLS, so per-request logging works. For a public `local` tunnel carrying TLS end-to-end, the server sees only ciphertext and can only log at the connection level — a known limitation.
+
+### Real caller IP
+
+The real caller IP is logged:
+- **Server-side:** comes directly from the inbound `accept()` address.
+- **Client-side:** forwarded from the server via a negotiated readiness header (backward-compatible; old/new peers interop; without the flag, the wire is byte-identical).
+
+### Size-based rotation and retention
+
+When a log file reaches `--webserver-log-max-file-size`, it is renamed to `<name>.log.1`, `<name>.log.1` → `<name>.log.2`, etc., and a fresh `<name>.log` is created. Files beyond `--webserver-log-max-files` are deleted. Rotation happens in-place when a new write would exceed the size.
+
+### Performance and reliability
+
+- **Zero bandwidth impact:** logging observes bytes in-flight without an extra copy and writes via a bounded async queue.
+- **Drop on disk pressure:** when the queue is full, incoming log records are dropped (a counter is bumped) and execution continues. The data path is **never blocked or slowed**.
+- **Backward compatible:** the real-IP forwarding header is negotiated; old clients and servers work unchanged with or without logging.
+
+### Examples
+
+**Public tunnel with logging (client and server):**
+```bash
+# Terminal 1: server
+bore server --webserver-log /var/log/bore
+
+# Terminal 2: client
+bore local 8080 --to bore.example.com --port 9000 --webserver-log /tmp/bore-logs
+
+# Access logs:
+# - Server: /var/log/bore/9000.log (public port 9000)
+# - Client: /tmp/bore-logs/9000.log (incoming requests from remote public port)
+```
+
+**Vhost with logging (client and server):**
+```bash
+# Terminal 1: server
+bore server --vhost-config /etc/bore/vhost.yml --webserver-log /var/log/bore
+
+# Terminal 2: client
+bore vhost 127.0.0.1:3000 --subdomain api --to bore.example.com --webserver-log /tmp/bore-logs
+
+# Access logs:
+# - Server: /var/log/bore/api/api.example.com.log
+# - Client: /tmp/bore-logs/api.log
+```
+
+**Sample log line (HTTP request to public tunnel):**
+```
+203.0.113.45 - - [19/Jun/2026:14:23:01 +0000] "GET /path HTTP/1.1" 200 1024 "-" "Mozilla/5.0"
+```
 
 ### Server-side overrides
 

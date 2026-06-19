@@ -53,6 +53,7 @@ async fn spawn_client(secret: Option<&str>) -> Result<(TcpListener, SocketAddr)>
         secret,
         false,
         Default::default(),
+        None,
     )
     .await?;
     let remote_addr = ([127, 0, 0, 1], client.remote_port()).into();
@@ -121,6 +122,7 @@ async fn invalid_address() -> Result<()> {
             use_secret.then_some("a secret"),
             false,
             Default::default(),
+            None,
         )
         .await
         {
@@ -384,6 +386,7 @@ async fn concurrent_connections_are_bounded() -> Result<()> {
         None,
         false,
         Default::default(),
+        None,
     )
     .await?;
     let addr: SocketAddr = ([127, 0, 0, 1], client.remote_port()).into();

@@ -7,7 +7,7 @@ use std::{io, ops::RangeInclusive, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use dashmap::DashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 // `Semaphore` (conn_permits) and `mpsc` (carrier token channel) are used on the
 // default build; only `vpn_link_permits` is vpn-gated. Keep the import
@@ -227,6 +227,12 @@ pub struct Server {
 
     /// Serializable snapshot of server startup configuration (sanitized, D11).
     config_view: Arc<crate::admin_views::ConfigView>,
+
+    /// Optional access logger for webserver logs (Phase 2.3).
+    access_logger: Option<Arc<crate::weblog::AccessLogger>>,
+
+    /// Shared dropped-record counter for all loggers (Phase 2.3).
+    access_logger_dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Server {
@@ -320,6 +326,8 @@ impl Server {
                 vhost_cert_file: None,
                 tls: false,
             }),
+            access_logger: None,
+            access_logger_dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -609,6 +617,24 @@ impl Server {
         self.vhost_config_path = Some(path);
     }
 
+    /// Set the access logger (Phase 2.3 — server-side integration).
+    pub fn set_webserver_log(
+        &mut self,
+        dir: Option<PathBuf>,
+        max_files: usize,
+        max_file_size_mb: u64,
+    ) -> Result<()> {
+        match crate::weblog::AccessLogConfig::from_flags(dir, max_files, max_file_size_mb)? {
+            Some(cfg) => {
+                self.access_logger = Some(Arc::new(crate::weblog::AccessLogger::new(cfg)));
+            }
+            None => {
+                self.access_logger = None;
+            }
+        }
+        Ok(())
+    }
+
     /// Enable VPN brokering.
     #[cfg(feature = "vpn")]
     pub fn set_vpn(&mut self, enabled: bool) {
@@ -680,7 +706,7 @@ impl Server {
                 tokio::spawn(async move {
                     loop {
                         match http_listener.accept().await {
-                            Ok((stream, _addr)) => {
+                            Ok((stream, addr)) => {
                                 tune_tcp(&stream);
                                 let permit = match Arc::clone(&this2.conn_permits)
                                     .try_acquire_owned()
@@ -697,15 +723,23 @@ impl Server {
                                 let this3 = Arc::clone(&this2);
                                 let grx = Arc::clone(&this3.total_rx_bytes);
                                 let gtx = Arc::clone(&this3.total_tx_bytes);
+                                let access_logger = this3.access_logger.clone();
+                                let access_logger_dropped =
+                                    Arc::clone(&this3.access_logger_dropped);
                                 tokio::spawn(async move {
                                     let _permit = permit;
                                     if let Err(e) = vhost::handle_http(
                                         stream,
+                                        addr,
                                         &this3.vhost_registry,
                                         &this3.vhost_config,
                                         mode,
                                         grx,
                                         gtx,
+                                        vhost::LogContext {
+                                            logger: access_logger,
+                                            dropped: access_logger_dropped,
+                                        },
                                     )
                                     .await
                                     {
@@ -726,7 +760,7 @@ impl Server {
                 tokio::spawn(async move {
                     loop {
                         match https_listener.accept().await {
-                            Ok((stream, _addr)) => {
+                            Ok((stream, addr)) => {
                                 tune_tcp(&stream);
                                 let permit = match Arc::clone(&this2.conn_permits)
                                     .try_acquire_owned()
@@ -743,15 +777,23 @@ impl Server {
                                 let this3 = Arc::clone(&this2);
                                 let grx = Arc::clone(&this3.total_rx_bytes);
                                 let gtx = Arc::clone(&this3.total_tx_bytes);
+                                let access_logger = this3.access_logger.clone();
+                                let access_logger_dropped =
+                                    Arc::clone(&this3.access_logger_dropped);
                                 tokio::spawn(async move {
                                     let _permit = permit;
                                     if let Err(e) = vhost::handle_https(
                                         stream,
+                                        addr,
                                         &this3.vhost_registry,
                                         &this3.vhost_config,
                                         &this3.vhost_tls,
                                         grx,
                                         gtx,
+                                        vhost::LogContext {
+                                            logger: access_logger,
+                                            dropped: access_logger_dropped,
+                                        },
                                     )
                                     .await
                                     {
@@ -1060,13 +1102,24 @@ impl Server {
                         }
                     };
                     let _permit = permit;
+                    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0)); // Dummy addr for unified path.
+                    let host = vhost::extract_host_from_head(&head)
+                        .unwrap_or("")
+                        .to_string();
                     return vhost::relay_vhost(
                         stream,
+                        addr,
                         &entry,
                         head,
                         Arc::clone(&self.total_rx_bytes),
                         Arc::clone(&self.total_tx_bytes),
                         Arc::clone(&entry.active),
+                        &sub,
+                        &host,
+                        vhost::LogContext {
+                            logger: self.access_logger.clone(),
+                            dropped: Arc::clone(&self.access_logger_dropped),
+                        },
                     )
                     .await;
                 }
@@ -1196,6 +1249,7 @@ impl Server {
                 basic_auth,
                 carriers,
                 udp,
+                webserver_log,
             }) => {
                 let Some(cfg) = self.vhost_config.clone() else {
                     warn!("vhost not configured on this server");
@@ -1216,6 +1270,7 @@ impl Server {
                     notes,
                     basic_auth,
                     udp,
+                    webserver_log,
                     self.pending_carriers.clone(),
                     self.max_carriers,
                     carriers,
@@ -1591,6 +1646,8 @@ impl Server {
                     let gtx = Arc::clone(&self.total_tx_bytes);
                     let erx = Arc::clone(&relay_rx);
                     let etx = Arc::clone(&relay_tx);
+                    let access_logger = self.access_logger.clone();
+                    let access_logger_dropped = Arc::clone(&self.access_logger_dropped);
                     #[cfg(feature = "udp")]
                     let public_direct_entry = if opts.udp {
                         let key = format!("port:{}", port);
@@ -1605,6 +1662,8 @@ impl Server {
                     tokio::spawn(async move {
                         let _permit = permit;
                         let _active = ActiveGuard::new(active);
+                        // Extract webserver_log before opts is moved (Phase 3).
+                        let client_wants_logging = opts.webserver_log;
                         // Terminate TLS / handle redirects at the edge as needed.
                         let mut edge =
                             match edge::accept(stream2, opts, tls.as_ref(), port, domain.as_deref())
@@ -1622,16 +1681,33 @@ impl Server {
                         let used_direct = if let Some(entry) = &public_direct_entry {
                             if let Some(direct_conn) = entry.direct.pick() {
                                 if let Ok(mut stream) = direct_conn.open_stream().await {
-                                    // Write STREAM_READY marker (DEC-LU6) before data flows.
-                                    if stream.write_all(&[mux::STREAM_READY]).await.is_ok() {
+                                    // Write STREAM_READY marker (DEC-LU6) with optional caller IP (Phase 3).
+                                    let forward_ip = if client_wants_logging {
+                                        Some(addr.ip().to_string())
+                                    } else {
+                                        None
+                                    };
+                                    if mux::write_stream_ready(&mut stream, forward_ip.as_deref()).await.is_ok() {
                                         entry.direct_stream_opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         let buf = proxy_buffer_size();
-                                        let result = tokio::io::copy_bidirectional_with_sizes(
-                                            &mut edge,
-                                            &mut stream,
-                                            buf,
-                                            buf,
-                                        ).await;
+                                        // Wrap edge in tap if logger is present (Phase 2.1 — I-WL1 guard).
+                                        let result = if let Some(logger) = &access_logger {
+                                            let tx = logger.sender_for(&port.to_string(), crate::weblog::PathLayout::Flat);
+                                            let mut tap = crate::weblog::HttpAccessTap::new(edge, Some(addr.ip().to_string()), tx, access_logger_dropped.clone());
+                                            tokio::io::copy_bidirectional_with_sizes(
+                                                &mut tap,
+                                                &mut stream,
+                                                buf,
+                                                buf,
+                                            ).await
+                                        } else {
+                                            tokio::io::copy_bidirectional_with_sizes(
+                                                &mut edge,
+                                                &mut stream,
+                                                buf,
+                                                buf,
+                                            ).await
+                                        };
                                         if let Ok((rx_bytes, tx_bytes)) = result {
                                             grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
                                             gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
@@ -1640,52 +1716,58 @@ impl Server {
                                         } else if let Err(err) = result {
                                             trace!(%err, "direct proxied connection closed");
                                         }
-                                        true
-                                    } else {
-                                        false
+                                        return;
                                     }
-                                } else {
-                                    false
                                 }
-                            } else {
-                                false
                             }
+                            false
                         } else {
                             false
                         };
+                        let _ = used_direct;  // Silence unused variable warning for non-udp feature
 
-                        // If direct succeeded, we're done.
+                        // Direct path was attempted but failed; count the fallback.
                         #[cfg(feature = "udp")]
-                        if used_direct {
-                            return;
-                        }
-
-                        // Direct was attempted (UDP requested) but did not carry the
-                        // connection — count the per-connection relay fallback (off the
-                        // hot path: once per proxied connection, never in a copy loop).
-                        #[cfg(feature = "udp")]
-                        if public_direct_entry.is_some() {
-                            direct_fallbacks
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        {
+                            if public_direct_entry.is_some() {
+                                direct_fallbacks
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
 
                         // Relay fallback.
                         match opener.open().await {
                             Ok(mut stream) => {
                                 // Announce the lazily-opened substream so the client
-                                // dials the local service before any payload flows.
-                                if let Err(err) = stream.write_all(&[mux::STREAM_READY]).await {
+                                // dials the local service before any payload flows (Phase 3).
+                                let forward_ip = if client_wants_logging {
+                                    Some(addr.ip().to_string())
+                                } else {
+                                    None
+                                };
+                                if let Err(err) = mux::write_stream_ready(&mut stream, forward_ip.as_deref()).await {
                                     trace!(%err, "failed to establish multiplexed stream");
                                     return;
                                 }
                                 let buf = proxy_buffer_size();
-                                let result = tokio::io::copy_bidirectional_with_sizes(
-                                    &mut edge,
-                                    &mut stream,
-                                    buf,
-                                    buf,
-                                )
-                                .await;
+                                // Wrap edge in tap if logger is present (Phase 2.1 — I-WL1 guard).
+                                let result = if let Some(logger) = &access_logger {
+                                    let tx = logger.sender_for(&port.to_string(), crate::weblog::PathLayout::Flat);
+                                    let mut tap = crate::weblog::HttpAccessTap::new(edge, Some(addr.ip().to_string()), tx, access_logger_dropped.clone());
+                                    tokio::io::copy_bidirectional_with_sizes(
+                                        &mut tap,
+                                        &mut stream,
+                                        buf,
+                                        buf,
+                                    ).await
+                                } else {
+                                    tokio::io::copy_bidirectional_with_sizes(
+                                        &mut edge,
+                                        &mut stream,
+                                        buf,
+                                        buf,
+                                    ).await
+                                };
                                 if let Ok((rx_bytes, tx_bytes)) = result {
                                     grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
                                     gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);

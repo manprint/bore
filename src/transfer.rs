@@ -548,6 +548,7 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
         DEFAULT_MAX_CONNS,
         carriers,
         ProviderMeta::default(),
+        None, // No access logging for transfer
     )
     .await?;
     let mut provider_task = tokio::spawn(provider.listen());

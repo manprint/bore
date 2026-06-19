@@ -157,6 +157,7 @@ async fn udp_direct_round_trip() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -217,6 +218,7 @@ async fn udp_direct_many_concurrent_streams() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -284,6 +286,7 @@ async fn udp_direct_survives_consumer_reconnect() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -361,6 +364,7 @@ async fn udp_consumer_detects_provider_drop() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     let h_provider = tokio::spawn(provider.listen());
@@ -450,6 +454,7 @@ async fn udp_relay_upgrades_to_direct_when_provider_appears() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     let h_provider = tokio::spawn(provider.listen());
@@ -492,6 +497,7 @@ async fn udp_falls_back_to_relay_without_udp_provider() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -553,6 +559,7 @@ async fn udp_multiple_consumers_concurrent_direct() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -630,6 +637,7 @@ async fn udp_mixed_direct_and_relay_consumers() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -712,6 +720,7 @@ async fn udp_consumer_reconnects_while_others_active() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -807,6 +816,7 @@ async fn udp_multiple_consumers_detect_provider_drop() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     let h_provider = tokio::spawn(provider.listen());
@@ -910,6 +920,7 @@ async fn udp_direct_respects_max_conns() -> Result<()> {
         2, // max_conns = 2
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());

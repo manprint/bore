@@ -100,6 +100,7 @@ async fn public_basic_auth_rejects_and_allows() -> Result<()> {
             notes: None,
             ..Default::default()
         },
+        None,
     )
     .await?;
     let port = client.remote_port();
@@ -155,6 +156,7 @@ async fn public_basic_auth_passes_non_http() -> Result<()> {
             notes: None,
             ..Default::default()
         },
+        None,
     )
     .await?;
     let port = client.remote_port();
@@ -195,6 +197,7 @@ async fn secret_provider_basic_auth_rejects_and_allows() -> Result<()> {
             notes: None,
             basic_auth: Some(CREDS.into()),
         },
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());

@@ -14,6 +14,7 @@ use bore_cli::{
     server::Server,
     transport::{self, Endpoint},
     vhost::{Reservation, VhostConfig, VhostModeCfg},
+    weblog::{AccessLogConfig, AccessLogger},
 };
 use lazy_static::lazy_static;
 use rcgen::generate_simple_self_signed;
@@ -284,6 +285,7 @@ async fn vhost_provider_registers() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await;
     assert!(
@@ -311,6 +313,7 @@ async fn vhost_duplicate_subdomain_rejected() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(first.listen());
@@ -326,6 +329,7 @@ async fn vhost_duplicate_subdomain_rejected() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await;
     assert!(second.is_err(), "duplicate subdomain must be rejected");
@@ -355,6 +359,7 @@ async fn vhost_reservation_enforced_accepted() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await;
     assert!(
@@ -388,6 +393,7 @@ async fn vhost_reservation_enforced_rejected() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await;
     assert!(result.is_err(), "wrong client_id must be rejected");
@@ -411,6 +417,7 @@ async fn vhost_subdomain_freed_after_disconnect() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     let task = tokio::spawn(first.listen());
@@ -430,6 +437,7 @@ async fn vhost_subdomain_freed_after_disconnect() -> Result<()> {
             false,
             1,
             ProviderMeta::default(),
+            None,
         )
         .await;
         if r.is_ok() {
@@ -466,6 +474,7 @@ async fn vhost_http_routing() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -523,6 +532,7 @@ async fn vhost_https_routing() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -686,6 +696,7 @@ async fn vhost_header_injection() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -795,6 +806,7 @@ async fn vhost_large_body_integrity() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -861,6 +873,7 @@ async fn vhost_concurrency_smoke() -> Result<()> {
             false,
             1,
             ProviderMeta::default(),
+            None,
         )
         .await?;
         tokio::spawn(client.listen());
@@ -922,6 +935,7 @@ async fn vhost_http_websocket_relay_round_trip() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -973,6 +987,7 @@ async fn vhost_https_websocket_relay_round_trip() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -1035,6 +1050,7 @@ async fn vhost_https_websocket_direct_udp_round_trip() -> Result<()> {
         1,
         true,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -1099,6 +1115,7 @@ async fn vhost_config_hot_reload() -> Result<()> {
             false,
             1,
             ProviderMeta::default(),
+            None,
         )
         .await;
         assert!(
@@ -1123,6 +1140,7 @@ async fn vhost_config_hot_reload() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await;
     assert!(
@@ -1149,6 +1167,7 @@ async fn vhost_config_hot_reload() -> Result<()> {
             false,
             1,
             ProviderMeta::default(),
+            None,
         )
         .await;
         if r.is_ok() {
@@ -1171,6 +1190,7 @@ async fn vhost_config_hot_reload() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await;
     assert!(
@@ -1221,6 +1241,7 @@ async fn vhost_bad_config_ignored() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await;
     assert!(
@@ -1252,6 +1273,7 @@ async fn vhost_bad_config_ignored() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await;
     assert!(
@@ -1293,6 +1315,7 @@ async fn vhost_auto_reconnect() -> Result<()> {
                         false,
                         1,
                         ProviderMeta::default(),
+                        None,
                     )
                     .await
                 }
@@ -1463,6 +1486,7 @@ async fn vhost_post_body_preserved_with_inject() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -1534,6 +1558,7 @@ async fn vhost_https_rejects_foreign_base_domain() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -1598,6 +1623,7 @@ async fn vhost_routes_on_control_port() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -1657,6 +1683,7 @@ async fn vhost_routes_on_tls_control_port() -> Result<()> {
         true,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -1730,6 +1757,7 @@ async fn vhost_udp_direct_get_and_post() -> Result<()> {
         1,
         true,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -1803,6 +1831,7 @@ async fn vhost_udp_multi_carrier_pool() -> Result<()> {
         carriers,
         true,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -1853,6 +1882,7 @@ async fn vhost_udp_falls_back_when_server_udp_disabled() -> Result<()> {
         1,
         true,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -1907,6 +1937,7 @@ async fn vhost_udp_drop_recovers_and_reestablishes() -> Result<()> {
         1,
         true,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -1982,6 +2013,7 @@ async fn vhost_udp_defaults_to_http_port_without_tls() -> Result<()> {
         1,
         true,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -2067,6 +2099,7 @@ async fn vhost_udp_large_body_integrity() -> Result<()> {
         1,
         true,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -2171,6 +2204,7 @@ async fn vhost_max_conns_enforced_on_unified_control_port() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -2261,6 +2295,7 @@ async fn vhost_udp_carriers_clamped_to_cap() -> Result<()> {
         (cap as u16) + 8,
         true,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -2283,5 +2318,178 @@ async fn vhost_udp_carriers_clamped_to_cap() -> Result<()> {
         response.contains("clamped"),
         "expected routed response over the capped direct pool: {response}"
     );
+    Ok(())
+}
+
+// ─── Access logging tests (vhost) ────────────────────────────────────
+
+#[tokio::test]
+async fn vhost_server_access_log_layout() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let log_dir = std::env::temp_dir().join("bore_test_vhost_server_log");
+    let _ = std::fs::remove_dir_all(&log_dir);
+    std::fs::create_dir_all(&log_dir)?;
+
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(REG_CONTROL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    let _ = server.set_webserver_log(Some(log_dir.clone()), 4, 100);
+    let cfg = http_config("bore.local", REG_HTTP);
+    server.set_vhost(cfg)?;
+    tokio::spawn(server.listen());
+    wait_port(REG_CONTROL, true).await;
+
+    let backend_port = spawn_http_stub("OK").await;
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        backend_port,
+        &format!("http://127.0.0.1:{REG_CONTROL}"),
+        "shop",
+        "test-client",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(client.listen());
+
+    time::sleep(Duration::from_millis(200)).await;
+
+    let response = send_http(REG_HTTP, "shop.bore.local", "/test").await?;
+    assert!(response.contains("200"), "expected 200 OK: {response}");
+
+    // Check server log
+    let log_file = log_dir.join("shop").join("shop.bore.local.log");
+    let start = std::time::Instant::now();
+    let content = loop {
+        if let Ok(c) = std::fs::read_to_string(&log_file) {
+            break c;
+        }
+        if start.elapsed() > Duration::from_secs(2) {
+            anyhow::bail!(
+                "server vhost log file not created after 2s at {:?}",
+                log_file
+            );
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert!(
+        content.contains("GET /test"),
+        "server vhost log should contain request: {}",
+        content
+    );
+    assert!(
+        content.contains("127.0.0.1"),
+        "server vhost log should contain client IP: {}",
+        content
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn vhost_client_access_log() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let log_dir = std::env::temp_dir().join("bore_test_vhost_client_log");
+    let _ = std::fs::remove_dir_all(&log_dir);
+    std::fs::create_dir_all(&log_dir)?;
+
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(REG_CONTROL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    let cfg = http_config("bore.local", REG_HTTP);
+    server.set_vhost(cfg)?;
+    tokio::spawn(server.listen());
+    wait_port(REG_CONTROL, true).await;
+
+    // Capturing stub: records what request it receives
+    let captured = Arc::new(Mutex::new(None));
+    let backend_port = spawn_capturing_stub(Arc::clone(&captured), "OK").await;
+
+    // Create client logger
+    let cfg = AccessLogConfig {
+        dir: log_dir.clone(),
+        max_files: 4,
+        max_file_size_bytes: 100 * 1024 * 1024,
+    };
+    let logger = Arc::new(AccessLogger::new(cfg));
+
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        backend_port,
+        &format!("http://127.0.0.1:{REG_CONTROL}"),
+        "shop",
+        "test-client",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+        Some(logger),
+    )
+    .await?;
+    tokio::spawn(client.listen());
+
+    time::sleep(Duration::from_millis(200)).await;
+
+    // Send HTTP request through vhost tunnel
+    let response = send_http(REG_HTTP, "shop.bore.local", "/api/insert").await?;
+    assert!(response.contains("200"), "expected 200 OK: {response}");
+
+    // Wait for the captured request
+    let mut attempts = 0;
+    let req_bytes = loop {
+        if let Some(captured_data) = &*captured.lock().await {
+            break captured_data.clone();
+        }
+        if attempts > 40 {
+            anyhow::bail!("backend never received request after 2s");
+        }
+        time::sleep(Duration::from_millis(50)).await;
+        attempts += 1;
+    };
+
+    let req_str = String::from_utf8_lossy(&req_bytes);
+    // Check that the backend received a CLEAN request with NO leaked [ip_len][ip] prefix
+    assert!(
+        req_str.contains("GET /api/insert"),
+        "backend should receive clean request, got: {}",
+        req_str
+    );
+    assert!(
+        !req_str.starts_with("\x01\x02\x03"),
+        "backend received corrupted request with leaked prefix: {:?}",
+        &req_bytes[..std::cmp::min(10, req_bytes.len())]
+    );
+
+    // Check client log file: should be named shop.log (subdomain, not port)
+    let log_file = log_dir.join("shop.log");
+    let start = std::time::Instant::now();
+    let content = loop {
+        if let Ok(c) = std::fs::read_to_string(&log_file) {
+            break c;
+        }
+        if start.elapsed() > Duration::from_secs(2) {
+            anyhow::bail!(
+                "client vhost log file not created after 2s at {:?}",
+                log_file
+            );
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert!(
+        content.contains("GET /api/insert"),
+        "client vhost log should contain request: {}",
+        content
+    );
+    assert!(
+        content.contains("127.0.0.1"),
+        "client vhost log should contain caller IP: {}",
+        content
+    );
+
     Ok(())
 }

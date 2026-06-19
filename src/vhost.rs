@@ -14,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use serde::Deserialize;
+use time;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -353,6 +354,9 @@ pub struct VhostEntry {
     pub direct_stream_opens: AtomicU64,
     /// Live count of connections currently proxied through this vhost subdomain.
     pub active: Arc<AtomicUsize>,
+    /// Whether this provider requested access logging with real caller IP forwarding.
+    /// (Phase 3/4: wired from HelloVhost.webserver_log field; defaults false for now.)
+    pub webserver_log: bool,
 }
 
 /// Upper bound on QUIC direct connections pooled per vhost subdomain. The provider
@@ -516,6 +520,7 @@ pub async fn serve_vhost_provider(
     notes: Option<String>,
     basic_auth: bool,
     udp: bool,
+    webserver_log: bool,
     pending_carriers: PendingCarriers,
     max_carriers: u16,
     carriers: u16,
@@ -561,6 +566,7 @@ pub async fn serve_vhost_provider(
                 #[cfg(feature = "udp")]
                 direct_stream_opens: AtomicU64::new(0),
                 active: Arc::new(AtomicUsize::new(0)),
+                webserver_log,
             });
             slot.insert(entry);
             pool
@@ -710,14 +716,20 @@ pub async fn serve_vhost_provider(
 /// `entry` is the already-resolved registry entry (carrier pool + inject headers),
 /// cloned out by the caller so no DashMap guard is held across an await. `head` is
 /// the already-read request head, forwarded (with header injection if the entry has
-/// any configured) before the bidirectional splice begins.
+/// any configured) before the bidirectional splice begins. `addr` is the remote
+/// caller's address (for logging); `subdomain` and `fqdn` are for access logging.
+#[allow(clippy::too_many_arguments)]
 pub async fn relay_vhost(
     public: impl AsyncRead + AsyncWrite + Unpin,
+    addr: SocketAddr,
     entry: &VhostEntry,
     head: Vec<u8>,
     grx: std::sync::Arc<std::sync::atomic::AtomicU64>,
     gtx: std::sync::Arc<std::sync::atomic::AtomicU64>,
     active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    subdomain: &str,
+    fqdn: &str,
+    log_ctx: LogContext,
 ) -> Result<()> {
     let mut provider: Pin<Box<dyn AsyncReadWrite>> = {
         #[cfg(feature = "udp")]
@@ -753,9 +765,17 @@ pub async fn relay_vhost(
             Box::pin(opener.open().await.context("vhost provider unavailable")?)
         }
     };
-    provider.write_all(&[mux::STREAM_READY]).await?;
+    // Write STREAM_READY with optional caller IP forwarding (Phase 3).
+    let forward_ip = if entry.webserver_log {
+        Some(addr.ip().to_string())
+    } else {
+        None
+    };
+    mux::write_stream_ready(&mut provider, forward_ip.as_deref()).await?;
 
     let mut public = public;
+    // Keep a copy of the head for logging (before it's moved/rewritten).
+    let head_for_logging = head.clone();
     let request_head = if entry.request_headers.is_empty() {
         // Zero-overhead pure-splice path: forward the already-read head as-is.
         head
@@ -768,15 +788,77 @@ pub async fn relay_vhost(
 
     if entry.response_headers.is_empty() {
         let buf = proxy_buffer_size();
-        let result =
-            tokio::io::copy_bidirectional_with_sizes(&mut public, &mut provider, buf, buf).await?;
+        // Wrap public in tap if logger is present (Phase 2.2 — I-WL1 guard).
+        let result = if let Some(ref logger) = log_ctx.logger {
+            let tx = logger.sender_for(
+                fqdn,
+                crate::weblog::PathLayout::SubdomainFolder {
+                    subdomain: subdomain.to_string(),
+                },
+            );
+            let mut tap = crate::weblog::HttpAccessTap::new(
+                public,
+                Some(addr.ip().to_string()),
+                tx,
+                log_ctx.dropped.clone(),
+            );
+
+            // The request head was already consumed by handle_http/handle_https before
+            // the tap was attached. Parse it here and inject into the tap so it can be
+            // paired with the response (I-WL2).
+            // BUG-1 fix: also compute body_len and pass it to prime the parser's body-skip state.
+            if let Ok(req_head) = std::str::from_utf8(&head_for_logging) {
+                let mut headers = [httparse::EMPTY_HEADER; 64];
+                let mut req = httparse::Request::new(&mut headers);
+                if let Ok(httparse::Status::Complete(_)) = req.parse(req_head.as_bytes()) {
+                    let method = req.method.unwrap_or("").to_string();
+                    let path = req.path.unwrap_or("").to_string();
+                    let version = match req.version {
+                        Some(0) => "HTTP/1.0".to_string(),
+                        Some(1) => "HTTP/1.1".to_string(),
+                        _ => "HTTP/?".to_string(),
+                    };
+                    let mut referer = None;
+                    let mut user_agent = None;
+                    for h in req.headers.iter().filter(|h| !h.name.is_empty()) {
+                        match h.name.to_lowercase().as_str() {
+                            "referer" => {
+                                referer = String::from_utf8(h.value.to_vec()).ok();
+                            }
+                            "user-agent" => {
+                                user_agent = String::from_utf8(h.value.to_vec()).ok();
+                            }
+                            _ => {}
+                        }
+                    }
+                    let body_len = crate::weblog::body_length(req.headers);
+                    tap.inject_pending_request(
+                        method, path, version, referer, user_agent, body_len,
+                    );
+                }
+            }
+
+            tokio::io::copy_bidirectional_with_sizes(&mut tap, &mut provider, buf, buf).await?
+        } else {
+            tokio::io::copy_bidirectional_with_sizes(&mut public, &mut provider, buf, buf).await?
+        };
         let (rx_bytes, tx_bytes) = result;
         grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
         gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
         return Ok(());
     }
 
-    relay_response_injected(public, provider, &entry.response_headers).await?;
+    // BUG-2 fix: thread logging context and request head to relay_response_injected.
+    let log_context = log_ctx.logger.as_ref().map(|logger| ResponseLogContext {
+        head: head_for_logging,
+        logger: logger.clone(),
+        dropped: log_ctx.dropped.clone(),
+        addr,
+        subdomain: subdomain.to_string(),
+        fqdn: fqdn.to_string(),
+    });
+
+    relay_response_injected(public, provider, &entry.response_headers, log_context).await?;
     Ok(())
 }
 
@@ -784,6 +866,7 @@ async fn relay_response_injected(
     public: impl AsyncRead + AsyncWrite + Unpin,
     provider: impl AsyncRead + AsyncWrite + Unpin,
     inject: &[(String, String)],
+    log_context: Option<ResponseLogContext>,
 ) -> Result<()> {
     let (mut public_read, mut public_write) = tokio::io::split(public);
     let (mut provider_read, mut provider_write) = tokio::io::split(provider);
@@ -797,6 +880,64 @@ async fn relay_response_injected(
             let rewritten = rewrite_head(&response_head, inject);
             public_write.write_all(&rewritten).await?;
         }
+
+        // BUG-2 fix: emit one access log entry if logger is present.
+        // MVP: only the first request on a response-rewrite keep-alive connection is logged.
+        if let Some(log_ctx) = log_context {
+            // Parse request line and headers from the already-read head.
+            if let Ok(req_head_str) = std::str::from_utf8(&log_ctx.head) {
+                let mut headers = [httparse::EMPTY_HEADER; 64];
+                let mut req = httparse::Request::new(&mut headers);
+                if let Ok(httparse::Status::Complete(_)) = req.parse(req_head_str.as_bytes()) {
+                    let method = req.method.unwrap_or("").to_string();
+                    let path = req.path.unwrap_or("").to_string();
+                    let version = match req.version {
+                        Some(0) => "HTTP/1.0".to_string(),
+                        Some(1) => "HTTP/1.1".to_string(),
+                        _ => "HTTP/?".to_string(),
+                    };
+                    let mut referer = None;
+                    let mut user_agent = None;
+                    for h in req.headers.iter().filter(|h| !h.name.is_empty()) {
+                        match h.name.to_lowercase().as_str() {
+                            "referer" => {
+                                referer = String::from_utf8(h.value.to_vec()).ok();
+                            }
+                            "user-agent" => {
+                                user_agent = String::from_utf8(h.value.to_vec()).ok();
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Parse response status code from response_head.
+                    let mut resp_headers = [httparse::EMPTY_HEADER; 64];
+                    let mut resp = httparse::Response::new(&mut resp_headers);
+                    if let Ok(httparse::Status::Complete(_)) = resp.parse(&response_head) {
+                        let status = resp.code.unwrap_or(0);
+                        let rec = crate::weblog::AccessRecord::http(
+                            time::OffsetDateTime::now_utc(),
+                            Some(log_ctx.addr.ip().to_string()),
+                            method,
+                            path,
+                            version,
+                            status,
+                            0, // bytes_sent: best-effort 0 (counting would require copying body path)
+                            referer,
+                            user_agent,
+                        );
+                        let tx = log_ctx.logger.sender_for(
+                            &log_ctx.fqdn,
+                            crate::weblog::PathLayout::SubdomainFolder {
+                                subdomain: log_ctx.subdomain.clone(),
+                            },
+                        );
+                        crate::weblog::try_log(&tx, rec, &log_ctx.dropped);
+                    }
+                }
+            }
+        }
+
         copy_one_direction_with_shutdown(&mut provider_read, &mut public_write).await
     };
 
@@ -914,6 +1055,32 @@ fn trim_ascii(mut s: &[u8]) -> &[u8] {
     s
 }
 
+// ─── Logging context ──────────────────────────────────────────────────────────
+
+/// Context for access logging (Phase 2).
+pub struct LogContext {
+    /// Optional access logger for HTTP request/response logging.
+    pub logger: Option<Arc<crate::weblog::AccessLogger>>,
+    /// Shared dropped-record counter for all loggers.
+    pub dropped: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Logging context for response-header-injected relay path.
+struct ResponseLogContext {
+    /// Request head (already parsed in handle_http/handle_https).
+    head: Vec<u8>,
+    /// Logger reference.
+    logger: Arc<crate::weblog::AccessLogger>,
+    /// Dropped-record counter.
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// Caller's socket address.
+    addr: SocketAddr,
+    /// Subdomain label.
+    subdomain: String,
+    /// FQDN for log file.
+    fqdn: String,
+}
+
 // ─── Frontend handlers ────────────────────────────────────────────────────────
 
 /// Handle one inbound HTTP connection on the vhost frontend port.
@@ -921,13 +1088,16 @@ fn trim_ascii(mut s: &[u8]) -> &[u8] {
 /// Reads the request head, extracts the subdomain from the Host header, and
 /// relays the connection to the registered provider (with header injection if
 /// configured). Returns a clean 502 when no provider is registered.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_http(
     mut stream: TcpStream,
+    addr: SocketAddr,
     registry: &VhostRegistry,
     vhost_config: &Option<SharedVhostConfig>,
     mode: VhostMode,
     grx: std::sync::Arc<std::sync::atomic::AtomicU64>,
     gtx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    log_ctx: LogContext,
 ) -> Result<()> {
     use tokio::time::timeout;
 
@@ -965,7 +1135,20 @@ pub async fn handle_http(
         return send_bad_gateway(stream).await;
     };
 
-    relay_vhost(stream, &entry, head, grx, gtx, Arc::clone(&entry.active)).await
+    let fqdn = host.unwrap_or("").to_string();
+    relay_vhost(
+        stream,
+        addr,
+        &entry,
+        head,
+        grx,
+        gtx,
+        Arc::clone(&entry.active),
+        &sub,
+        &fqdn,
+        log_ctx,
+    )
+    .await
 }
 
 /// Handle one inbound HTTPS connection on the vhost frontend port.
@@ -973,13 +1156,16 @@ pub async fn handle_http(
 /// Terminates TLS with the wildcard acceptor, then routes identically to
 /// [`handle_http`] on the decrypted stream — same `Host`-header → subdomain
 /// extraction against the configured base domain, same single registry lookup.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_https(
     stream: TcpStream,
+    addr: SocketAddr,
     registry: &VhostRegistry,
     vhost_config: &Option<SharedVhostConfig>,
     vhost_tls: &Arc<RwLock<Option<Arc<TlsAcceptor>>>>,
     grx: std::sync::Arc<std::sync::atomic::AtomicU64>,
     gtx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    log_ctx: LogContext,
 ) -> Result<()> {
     use tokio::time::timeout;
 
@@ -1021,13 +1207,18 @@ pub async fn handle_https(
         return send_bad_gateway(tls_stream).await;
     };
 
+    let fqdn = host.unwrap_or("").to_string();
     relay_vhost(
         tls_stream,
+        addr,
         &entry,
         head,
         grx,
         gtx,
         Arc::clone(&entry.active),
+        &sub,
+        &fqdn,
+        log_ctx,
     )
     .await
 }

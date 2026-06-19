@@ -91,6 +91,7 @@ async fn client_reconnects_when_server_appears() -> Result<()> {
                 None,
                 false,
                 Default::default(),
+                None,
             )
             .await
         };
@@ -158,6 +159,7 @@ async fn proxy_reconnects_when_server_appears() -> Result<()> {
         1024,
         1, // carriers
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());

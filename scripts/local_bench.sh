@@ -172,6 +172,101 @@ bench() {
     sleep 1
 }
 
+# bench_wlog_delta <config-name> <bore-local-args...>
+# Measures throughput WITH and WITHOUT --webserver-log, prints delta.
+# Pass if delta is within 5%.
+bench_wlog_delta() {
+    local name="$1"; shift
+    local pargs=("$@")
+    local wlog_dir="/tmp/bore_wlog_bench"
+
+    # Measure WITHOUT --webserver-log
+    ip netns exec nssvc "$BORE" local "$ORIGIN_PORT" \
+        --to "$SERVER_IP_NS0_SVC:7835" --secret "$SECRET" \
+        --port "$PUB_PORT" \
+        "${pargs[@]}" \
+        >"$LOG/$name.no_wlog.log" 2>&1 &
+    local CLI_PID=$!
+    sleep 3
+
+    local tp_no_wlog="—"
+    local url="http://$SERVER_IP_NS0_CLI:$PUB_PORT/testfile.bin"
+    if command -v hey >/dev/null 2>&1; then
+        local hey_out
+        hey_out=$(ip netns exec nscli hey -z "${DUR}s" -c 50 -q 5 "$url" 2>/dev/null || echo "")
+        if [ -n "$hey_out" ]; then
+            tp_no_wlog=$(echo "$hey_out" | grep -oP 'Requests/sec:\s*\K[0-9.]+' | head -1 || echo "—")
+        fi
+    else
+        # Fallback to curl
+        local speedfile
+        speedfile=$(mktemp)
+        for _ in $(seq 1 10); do
+            ( timeout 30 ip netns exec nscli curl -s -o /dev/null -w '%{speed_download}\n' \
+                "$url" 2>/dev/null >>"$speedfile" || true ) &
+        done
+        wait
+        tp_no_wlog=$(awk '{s+=$1} END {printf "%.0f", s/1e6}' "$speedfile" 2>/dev/null || echo "?")
+        rm -f "$speedfile"
+    fi
+    kill "$CLI_PID" 2>/dev/null || true
+    sleep 1
+
+    # Measure WITH --webserver-log
+    rm -rf "$wlog_dir" 2>/dev/null || true
+    mkdir -p "$wlog_dir"
+
+    ip netns exec nssvc "$BORE" local "$ORIGIN_PORT" \
+        --to "$SERVER_IP_NS0_SVC:7835" --secret "$SECRET" \
+        --port "$PUB_PORT" \
+        --webserver-log "$wlog_dir" \
+        "${pargs[@]}" \
+        >"$LOG/$name.with_wlog.log" 2>&1 &
+    local CLI_PID=$!
+    sleep 3
+
+    local tp_with_wlog="—"
+    if command -v hey >/dev/null 2>&1; then
+        local hey_out
+        hey_out=$(ip netns exec nscli hey -z "${DUR}s" -c 50 -q 5 "$url" 2>/dev/null || echo "")
+        if [ -n "$hey_out" ]; then
+            tp_with_wlog=$(echo "$hey_out" | grep -oP 'Requests/sec:\s*\K[0-9.]+' | head -1 || echo "—")
+        fi
+    else
+        # Fallback to curl
+        local speedfile
+        speedfile=$(mktemp)
+        for _ in $(seq 1 10); do
+            ( timeout 30 ip netns exec nscli curl -s -o /dev/null -w '%{speed_download}\n' \
+                "$url" 2>/dev/null >>"$speedfile" || true ) &
+        done
+        wait
+        tp_with_wlog=$(awk '{s+=$1} END {printf "%.0f", s/1e6}' "$speedfile" 2>/dev/null || echo "?")
+        rm -f "$speedfile"
+    fi
+    kill "$CLI_PID" 2>/dev/null || true
+    sleep 1
+
+    # Calculate delta %
+    local delta="—"
+    if [ "$tp_no_wlog" != "—" ] && [ "$tp_with_wlog" != "—" ] && [ "$tp_no_wlog" != "?" ] && [ "$tp_with_wlog" != "?" ]; then
+        # delta = (no_wlog - with_wlog) / no_wlog * 100
+        delta=$(echo "scale=1; ($tp_no_wlog - $tp_with_wlog) / $tp_no_wlog * 100" | bc 2>/dev/null || echo "—")
+    fi
+
+    # Check if within threshold (5%)
+    local status="PASS"
+    if [ "$delta" != "—" ]; then
+        # Compare as floats: if delta > 5, fail
+        if (( $(echo "$delta > 5" | bc -l 2>/dev/null) )); then
+            status="FAIL (delta > 5%)"
+        fi
+    fi
+
+    echo "| $name | $tp_no_wlog | $tp_with_wlog | $delta% | $status |"
+    rm -rf "$wlog_dir" 2>/dev/null || true
+}
+
 echo "## bore local throughput/latency benchmark ($(date -u +%F), netns, ${DUR}s per test)"
 echo ""
 echo "### Clean link"
@@ -204,3 +299,18 @@ ip netns exec ns0 tc qdisc del dev vethsv root 2>/dev/null || true
 echo ""
 echo "Acceptance: QUIC (BBR) should gain over the TCP relay under loss; the Direct?"
 echo "column must read 'yes' for udp-* rows (else it silently fell back to relay)."
+
+# ── T-WLBENCH: webserver-log bandwidth impact ────────────────────────────────────
+echo ""
+echo "### T-WLBENCH: --webserver-log throughput impact"
+echo ""
+echo "| Configuration | No logging (req/s) | With logging (req/s) | Delta % | Status |"
+echo "|---|---|---|---|---|"
+bench_wlog_delta "wlog-tcp-1c"
+bench_wlog_delta "wlog-tcp-4c" --carriers 4
+bench_wlog_delta "wlog-udp-1c" --udp
+bench_wlog_delta "wlog-udp-4c" --udp --carriers 4
+
+echo ""
+echo "Acceptance: throughput with --webserver-log must be within 5% of without."
+echo "The logging must never cause the data path to block or throttle."

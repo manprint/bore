@@ -90,6 +90,7 @@ async fn tls_round_trip_with_insecure() -> Result<()> {
         Some("sec"),
         true,
         Default::default(),
+        None,
     )
     .await?;
     let tunnel_port = client.remote_port();
@@ -128,6 +129,7 @@ async fn tls_rejects_untrusted_cert_without_insecure() -> Result<()> {
         Some("sec"),
         false,
         Default::default(),
+        None,
     )
     .await;
     assert!(
@@ -159,6 +161,7 @@ async fn http_scheme_plain_round_trip() -> Result<()> {
         Some("sec"),
         false,
         Default::default(),
+        None,
     )
     .await?;
     let tunnel_port = client.remote_port();
@@ -194,7 +197,7 @@ async fn tunnel_port_terminates_tls_and_keeps_plain() -> Result<()> {
         force_https: false,
         ..Default::default()
     };
-    let client = Client::new("localhost", echo, &to, 0, Some("sec"), true, options).await?;
+    let client = Client::new("localhost", echo, &to, 0, Some("sec"), true, options, None).await?;
     let tunnel = client.remote_port();
     tokio::spawn(client.listen());
 
@@ -240,7 +243,17 @@ async fn public_tunnel_tls_terminated_websocket_round_trip() -> Result<()> {
         force_https: false,
         ..Default::default()
     };
-    let client = Client::new("localhost", ws_port, &to, 0, Some("sec"), true, options).await?;
+    let client = Client::new(
+        "localhost",
+        ws_port,
+        &to,
+        0,
+        Some("sec"),
+        true,
+        options,
+        None,
+    )
+    .await?;
     let tunnel = client.remote_port();
     tokio::spawn(client.listen());
 
@@ -278,7 +291,7 @@ async fn stalled_tls_handshake_is_dropped_and_tunnel_keeps_serving() -> Result<(
         force_https: false,
         ..Default::default()
     };
-    let client = Client::new("localhost", echo, &to, 0, Some("sec"), true, options).await?;
+    let client = Client::new("localhost", echo, &to, 0, Some("sec"), true, options, None).await?;
     let tunnel = client.remote_port();
     tokio::spawn(client.listen());
 
@@ -336,7 +349,7 @@ async fn force_https_redirects_plain_http() -> Result<()> {
         force_https: true,
         ..Default::default()
     };
-    let client = Client::new("localhost", echo, &to, 0, Some("sec"), true, options).await?;
+    let client = Client::new("localhost", echo, &to, 0, Some("sec"), true, options, None).await?;
     let tunnel = client.remote_port();
     tokio::spawn(client.listen());
 

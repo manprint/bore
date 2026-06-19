@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::{net::TcpStream, time::timeout};
 use tracing::trace;
@@ -20,6 +20,7 @@ use crate::shared::{
     NETWORK_TIMEOUT,
 };
 use crate::transport::{self, Endpoint};
+use crate::weblog::{AccessLogger, PathLayout};
 
 #[cfg(feature = "udp")]
 use std::net::SocketAddr;
@@ -109,6 +110,20 @@ pub struct Client {
     /// Parameters to re-dial a dropped carrier and keep the pool at full width.
     /// `Some` only for a public tunnel that established a pool.
     carrier_dialer: Option<CarrierDialer>,
+
+    /// Whether this tunnel requests access logging with real caller IP forwarding.
+    /// Used to correctly read the extended STREAM_READY header (Phase 3).
+    webserver_log: bool,
+
+    /// Access logger registry (Phase 4). `Some` when `--webserver-log` is set.
+    access_logger: Option<Arc<AccessLogger>>,
+
+    /// Counter for dropped access log records (when the channel is full).
+    access_logger_dropped: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Subdomain label for vhost providers; `None` for public/secret tunnels.
+    /// Used to determine the correct log filename (vhost: subdomain.log, public: port.log).
+    vhost_subdomain: Option<String>,
 }
 
 /// Parameters retained to (re)open a carrier connection for a public tunnel's
@@ -141,6 +156,7 @@ struct UdpProviderCfg {
 
 impl Client {
     /// Create a new client.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         local_host: &str,
         local_port: u16,
@@ -149,6 +165,7 @@ impl Client {
         secret: Option<&str>,
         insecure: bool,
         options: TunnelOptions,
+        access_logger: Option<Arc<AccessLogger>>,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
@@ -172,6 +189,7 @@ impl Client {
         let carriers = options.carriers;
         #[cfg(feature = "udp")]
         let options_udp = options.udp;
+        let webserver_log_opt = options.webserver_log;
         control.send(ClientMessage::Hello(port, options)).await?;
         if let Some(secret) = secret {
             Authenticator::new(secret)
@@ -264,6 +282,10 @@ impl Client {
             basic_auth: None,
             carrier_acceptors,
             carrier_dialer,
+            webserver_log: webserver_log_opt,
+            access_logger,
+            access_logger_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            vhost_subdomain: None,
         })
     }
 
@@ -290,6 +312,7 @@ impl Client {
         max_conns: usize,
         carriers: u16,
         meta: ProviderMeta,
+        access_logger: Option<Arc<AccessLogger>>,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
@@ -436,6 +459,10 @@ impl Client {
             basic_auth: meta.basic_auth.as_deref().and_then(BasicAuth::parse),
             carrier_acceptors,
             carrier_dialer,
+            webserver_log: access_logger.is_some(),
+            access_logger,
+            access_logger_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            vhost_subdomain: None,
         })
     }
 
@@ -456,10 +483,20 @@ impl Client {
         insecure: bool,
         carriers: u16,
         meta: ProviderMeta,
+        access_logger: Option<Arc<AccessLogger>>,
     ) -> Result<Self> {
         Self::new_vhost_provider_with_udp(
-            local_host, local_port, to, subdomain, client_id, secret, insecure, carriers, false,
+            local_host,
+            local_port,
+            to,
+            subdomain,
+            client_id,
+            secret,
+            insecure,
+            carriers,
+            false,
             meta,
+            access_logger,
         )
         .await
     }
@@ -478,6 +515,7 @@ impl Client {
         carriers: u16,
         udp: bool,
         meta: ProviderMeta,
+        access_logger: Option<Arc<AccessLogger>>,
     ) -> Result<Self> {
         #[cfg(not(feature = "udp"))]
         if udp {
@@ -512,6 +550,7 @@ impl Client {
                 basic_auth: meta.basic_auth.is_some(),
                 carriers,
                 udp,
+                webserver_log: access_logger.is_some(),
             })
             .await?;
 
@@ -607,6 +646,10 @@ impl Client {
             basic_auth: meta.basic_auth.as_deref().and_then(BasicAuth::parse),
             carrier_acceptors,
             carrier_dialer,
+            webserver_log: access_logger.is_some(),
+            access_logger,
+            access_logger_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            vhost_subdomain: Some(subdomain.to_string()),
         })
     }
 
@@ -1038,9 +1081,8 @@ impl Client {
         &self,
         mut stream: S,
     ) -> Result<()> {
-        // Consume the server's readiness marker before splicing (see mux module).
-        let mut marker = [0u8; 1];
-        stream.read_exact(&mut marker).await?;
+        // Read the server's readiness marker with optional caller IP forwarding (Phase 3).
+        let real_ip = mux::read_stream_ready(&mut stream, self.webserver_log).await?;
 
         // Enforce HTTP Basic auth (secret-tunnel providers only). The gate reads
         // the request head off the substream; on success that head is replayed to
@@ -1059,7 +1101,29 @@ impl Client {
             local_conn.write_all(&prefix).await?;
         }
         let buf = proxy_buffer_size();
-        tokio::io::copy_bidirectional_with_sizes(&mut local_conn, &mut stream, buf, buf).await?;
+
+        // Wrap with access tap if logging is enabled.
+        if let Some(logger) = &self.access_logger {
+            // Determine the log key and layout based on tunnel type.
+            let (key, layout) = match &self.vhost_subdomain {
+                Some(sub) => (sub.clone(), PathLayout::Flat),
+                None => (self.remote_port.to_string(), PathLayout::Flat),
+            };
+
+            let tx = logger.sender_for(&key, layout);
+            let mut tap = crate::weblog::HttpAccessTap::new(
+                stream,
+                real_ip.filter(|s| !s.is_empty()),
+                tx,
+                Arc::clone(&self.access_logger_dropped),
+            );
+            tokio::io::copy_bidirectional_with_sizes(&mut local_conn, &mut tap, buf, buf).await?;
+        } else {
+            // No logging: use stream directly.
+            tokio::io::copy_bidirectional_with_sizes(&mut local_conn, &mut stream, buf, buf)
+                .await?;
+        }
+
         Ok(())
     }
 }

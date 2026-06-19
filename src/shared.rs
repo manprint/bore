@@ -201,6 +201,10 @@ pub struct TunnelOptions {
     /// backward-compatible (an old client omits it ⇒ reads as `false`).
     #[serde(default)]
     pub auto_reconnect: bool,
+    /// Whether the client wants access logging with real caller IP forwarding.
+    /// `#[serde(default)]` keeps the wire format backward-compatible.
+    #[serde(default)]
+    pub webserver_log: bool,
 }
 
 /// Options negotiated by two `bore test-udp` peers once the server pairs them.
@@ -748,6 +752,10 @@ pub enum ClientMessage {
         /// `#[serde(default)]` keeps the wire format backward-compatible.
         #[serde(default)]
         udp: bool,
+        /// Whether the provider wants access logging with real caller IP forwarding.
+        /// `#[serde(default)]` keeps the wire format backward-compatible.
+        #[serde(default)]
+        webserver_log: bool,
     },
 
     /// Ask the server to issue a fresh vhost-UDP nonce so the provider can
@@ -1084,15 +1092,17 @@ impl ControlFrameSummary for ClientMessage {
                 basic_auth,
                 carriers,
                 udp,
+                webserver_log,
             } => {
                 format!(
-                    "HelloVhost {{ subdomain={}, client_id={}, notes={}, basic_auth={}, carriers={}, udp={} }}",
+                    "HelloVhost {{ subdomain={}, client_id={}, notes={}, basic_auth={}, carriers={}, udp={}, webserver_log={} }}",
                     subdomain,
                     client_id,
                     if notes.is_some() { "present" } else { "none" },
                     if *basic_auth { "on" } else { "off" },
                     carriers,
                     if *udp { "on" } else { "off" },
+                    if *webserver_log { "on" } else { "off" },
                 )
             }
             ClientMessage::VhostUdpRenew { subdomain } => {
@@ -1404,6 +1414,7 @@ mod tests {
             carriers: 4,
             udp: true,
             auto_reconnect: true,
+            webserver_log: false,
         };
         let json = serde_json::to_string(&full).unwrap();
         let back: TunnelOptions = serde_json::from_str(&json).unwrap();
@@ -1481,6 +1492,7 @@ mod tests {
                 basic_auth,
                 carriers,
                 udp,
+                webserver_log,
             } => {
                 assert_eq!(subdomain, "myapp");
                 assert_eq!(client_id, "client-1");
@@ -1488,6 +1500,7 @@ mod tests {
                 assert!(!basic_auth);
                 assert_eq!(carriers, 2);
                 assert!(!udp);
+                assert!(!webserver_log);
             }
             other => panic!("unexpected message: {other:?}"),
         }
@@ -1586,6 +1599,7 @@ fn hello_vhost_round_trips_and_fits_frame() {
         basic_auth: false,
         carriers: 1,
         udp: false,
+        webserver_log: false,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(
@@ -1601,6 +1615,7 @@ fn hello_vhost_round_trips_and_fits_frame() {
             basic_auth,
             carriers,
             udp,
+            webserver_log,
         } => {
             assert_eq!(subdomain, "myapp");
             assert_eq!(client_id, "client-a");
@@ -1608,6 +1623,7 @@ fn hello_vhost_round_trips_and_fits_frame() {
             assert!(!basic_auth);
             assert_eq!(carriers, 1);
             assert!(!udp);
+            assert!(!webserver_log);
         }
         other => panic!("unexpected: {other:?}"),
     }
@@ -1926,4 +1942,12 @@ fn udp_candidate_offer_peer_id_default_zero() {
     let json = r#"{"candidates":[],"selected_stun":null}"#;
     let offer: UdpCandidateOffer = serde_json::from_str(json).unwrap();
     assert_eq!(offer.peer_id, 0);
+}
+
+#[test]
+fn tunnel_options_serde_default_webserver_log() {
+    // Deserialize TunnelOptions without webserver_log field → defaults to false
+    let json = r#"{"https":false,"force_https":false,"basic_auth":null,"notes":null,"carriers":0,"udp":false,"auto_reconnect":false}"#;
+    let opts: TunnelOptions = serde_json::from_str(json).unwrap();
+    assert!(!opts.webserver_log);
 }

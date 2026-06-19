@@ -184,6 +184,7 @@ async fn admin_data_reflects_live_tunnels() -> Result<()> {
             notes: Some("hello-note".into()),
             basic_auth: None,
         },
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());

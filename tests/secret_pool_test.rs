@@ -91,6 +91,7 @@ async fn spawn_provider(id: &str, echo_port: u16, provider_carriers: u16) -> Res
         1024,
         provider_carriers,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());

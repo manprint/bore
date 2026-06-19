@@ -14,7 +14,7 @@ use std::future::poll_fn;
 use std::io;
 use std::task::Poll;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use yamux::{Config, Connection, Mode};
@@ -183,4 +183,153 @@ async fn drive<S: Transport>(
     }
 
     let _ = poll_fn(|cx| conn.poll_close(cx)).await;
+}
+
+/// Write the STREAM_READY marker with optional caller IP forwarding.
+///
+/// **Legacy (webserver_log=false):** writes `[0x00]` (BYTE-IDENTICAL to today).
+///
+/// **Extended (webserver_log=true):** writes `[0x00, ip_len:u8, ip_utf8]` where
+/// `ip` is a string like "203.0.113.7:54321" (caller IP:port). If `forward_ip` is
+/// `Some("")`, writes `ip_len=0` (server couldn't determine IP). If the IP is >255
+/// bytes, truncates to 255.
+pub async fn write_stream_ready<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    forward_ip: Option<&str>,
+) -> io::Result<()> {
+    match forward_ip {
+        None => {
+            // Legacy path: write only the STREAM_READY marker.
+            w.write_all(&[STREAM_READY]).await?;
+        }
+        Some(ip) => {
+            // Extended path: write marker, length, then IP bytes (capped at 255).
+            let ip_bytes = ip.as_bytes();
+            let ip_len = (ip_bytes.len().min(255)) as u8;
+            w.write_all(&[STREAM_READY]).await?;
+            w.write_all(&[ip_len]).await?;
+            w.write_all(&ip_bytes[..ip_len as usize]).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Read the STREAM_READY marker with optional caller IP.
+///
+/// **Legacy (expect_ip=false):** reads exactly 1 byte (the marker), validates it
+/// is `STREAM_READY`, returns `Ok(None)`. Byte-identical to today's behavior.
+///
+/// **Extended (expect_ip=true):** reads the marker byte, then reads `ip_len:u8`
+/// followed by `ip_len` bytes, returning `Ok(Some(ip_string))`. If `ip_len=0`,
+/// returns `Ok(Some(String::new()))` (empty string signals "IP unknown").
+///
+/// On any I/O error or marker validation failure, returns `Err`.
+pub async fn read_stream_ready<R: AsyncRead + Unpin>(
+    r: &mut R,
+    expect_ip: bool,
+) -> io::Result<Option<String>> {
+    // Read and validate the marker.
+    let mut marker = [0u8; 1];
+    r.read_exact(&mut marker).await?;
+    if marker[0] != STREAM_READY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid STREAM_READY marker",
+        ));
+    }
+
+    if !expect_ip {
+        // Legacy path: no IP extension, return None (marker consumed).
+        return Ok(None);
+    }
+
+    // Extended path: read IP length and IP bytes.
+    let mut ip_len = [0u8; 1];
+    r.read_exact(&mut ip_len).await?;
+    let len = ip_len[0] as usize;
+
+    if len == 0 {
+        // IP unknown (server couldn't determine it).
+        return Ok(Some(String::new()));
+    }
+
+    let mut ip_bytes = vec![0u8; len];
+    r.read_exact(&mut ip_bytes).await?;
+    let ip_string = String::from_utf8(ip_bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid UTF-8 in IP: {e}"),
+        )
+    })?;
+    Ok(Some(ip_string))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn readiness_legacy_plain() {
+        // Legacy path: write [0x00], read it back with expect_ip=false.
+        let (mut client, mut server) = tokio::io::duplex(64);
+
+        write_stream_ready(&mut client, None).await.unwrap();
+
+        let result = read_stream_ready(&mut server, false).await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn readiness_header_roundtrip() {
+        // Extended path: write IP, read it back.
+        let (mut client, mut server) = tokio::io::duplex(64);
+
+        write_stream_ready(&mut client, Some("203.0.113.7:54321"))
+            .await
+            .unwrap();
+
+        let result = read_stream_ready(&mut server, true).await.unwrap();
+        assert_eq!(result, Some("203.0.113.7:54321".to_string()));
+    }
+
+    #[tokio::test]
+    async fn readiness_empty_ip() {
+        // Empty IP (server couldn't determine it).
+        let (mut client, mut server) = tokio::io::duplex(64);
+
+        write_stream_ready(&mut client, Some("")).await.unwrap();
+
+        let result = read_stream_ready(&mut server, true).await.unwrap();
+        assert_eq!(result, Some(String::new()));
+    }
+
+    #[tokio::test]
+    async fn readiness_long_ip_truncated() {
+        // IP > 255 bytes is truncated to 255.
+        let (mut client, mut server) = tokio::io::duplex(512);
+
+        let long_ip = "x".repeat(300);
+        write_stream_ready(&mut client, Some(&long_ip))
+            .await
+            .unwrap();
+
+        let result = read_stream_ready(&mut server, true).await.unwrap();
+        assert_eq!(result.as_ref().unwrap().len(), 255);
+        assert_eq!(result.as_ref().unwrap(), &"x".repeat(255));
+    }
+
+    #[tokio::test]
+    async fn readiness_interop_old_client() {
+        // Old client (no webserver_log field) deserializes to false; server writes bare byte.
+        // This is implicitly tested by readiness_legacy_plain, but make it explicit:
+        // if opts.webserver_log is false, we write None, which produces [0x00].
+        let (mut client, mut server) = tokio::io::duplex(64);
+
+        // Simulate server behavior: opts.webserver_log is false, so we write None.
+        write_stream_ready(&mut client, None).await.unwrap();
+
+        // Old client reads exactly one byte and should get STREAM_READY.
+        let result = read_stream_ready(&mut server, false).await.unwrap();
+        assert_eq!(result, None);
+    }
 }

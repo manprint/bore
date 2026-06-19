@@ -167,7 +167,9 @@ async fn public_udp_direct_round_trip() -> Result<()> {
             carriers: 1,
             udp: true,
             auto_reconnect: false,
+            webserver_log: false,
         },
+        None,
     )
     .await?;
     let remote_port = client.remote_port();
@@ -214,7 +216,9 @@ async fn public_udp_many_concurrent_streams() -> Result<()> {
             carriers: 1,
             udp: true,
             auto_reconnect: false,
+            webserver_log: false,
         },
+        None,
     )
     .await?;
     let remote_port = client.remote_port();
@@ -272,7 +276,9 @@ async fn public_udp_carriers() -> Result<()> {
             carriers: 4,
             udp: true,
             auto_reconnect: false,
+            webserver_log: false,
         },
+        None,
     )
     .await?;
     let remote_port = client.remote_port();
@@ -335,7 +341,9 @@ async fn public_udp_large_payload() -> Result<()> {
             carriers: 1,
             udp: true,
             auto_reconnect: false,
+            webserver_log: false,
         },
+        None,
     )
     .await?;
     let remote_port = client.remote_port();
@@ -399,7 +407,9 @@ async fn public_udp_falls_back_to_relay_when_server_lacks_udp() -> Result<()> {
             carriers: 1,
             udp: true,
             auto_reconnect: false,
+            webserver_log: false,
         },
+        None,
     )
     .await?;
     let remote_port = client.remote_port();
@@ -451,7 +461,9 @@ async fn public_tcp_still_works_without_udp() -> Result<()> {
             carriers: 1,
             udp: false,
             auto_reconnect: false,
+            webserver_log: false,
         },
+        None,
     )
     .await?;
     let remote_addr: std::net::SocketAddr = ([127, 0, 0, 1], client.remote_port()).into();

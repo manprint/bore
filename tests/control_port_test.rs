@@ -47,6 +47,7 @@ async fn custom_control_port_round_trip() -> Result<()> {
         Some("sec"),
         false,
         Default::default(),
+        None,
     )
     .await?;
     let tunnel_port = client.remote_port();

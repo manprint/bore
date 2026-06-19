@@ -64,6 +64,7 @@ async fn spawn_pool_client(carriers: u16) -> Result<(TcpListener, SocketAddr)> {
         None,
         false,
         options,
+        None,
     )
     .await?;
     let remote_addr = ([127, 0, 0, 1], client.remote_port()).into();

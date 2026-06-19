@@ -318,6 +318,7 @@ async fn public_tunnel_websocket_round_trip() -> Result<()> {
         Some(SECRET),
         false,
         Default::default(),
+        None,
     )
     .await?;
     let addr: SocketAddr = ([127, 0, 0, 1], client.remote_port()).into();
@@ -356,6 +357,7 @@ async fn public_tunnel_tls_terminated_websocket_round_trip() -> Result<()> {
         Some(SECRET),
         true,
         options,
+        None,
     )
     .await?;
     let endpoint = Endpoint {
@@ -398,6 +400,7 @@ async fn secret_proxy_websocket_relay_round_trip() -> Result<()> {
         1024,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -457,6 +460,7 @@ async fn secret_proxy_websocket_direct_udp_round_trip() -> Result<()> {
         1024,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(provider.listen());
@@ -516,6 +520,7 @@ async fn vhost_websocket_http_relay_round_trip() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -566,6 +571,7 @@ async fn vhost_websocket_https_relay_round_trip() -> Result<()> {
         false,
         1,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());
@@ -628,6 +634,7 @@ async fn vhost_websocket_https_udp_round_trip() -> Result<()> {
         1,
         true,
         ProviderMeta::default(),
+        None,
     )
     .await?;
     tokio::spawn(client.listen());

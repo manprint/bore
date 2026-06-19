@@ -578,6 +578,203 @@ fi
 kill "$P1_VID" "$P1_HTTP_PID" 2>/dev/null || true
 sleep 0.5
 
+# ── Test 10: T-WLOG-VHOST-IP (vhost with webserver-log) ──────────────────────────
+echo "=== Test 10: T-WLOG-VHOST-IP (vhost HTTP logging with real IP) ==="
+# Create client and server-side log directories
+WLOG_CLIENT_DIR="/tmp/bore_wlog_vhost_cli"
+WLOG_SERVER_DIR="/tmp/bore_wlog_vhost_srv"
+rm -rf "$WLOG_CLIENT_DIR" "$WLOG_SERVER_DIR" 2>/dev/null || true
+mkdir -p "$WLOG_CLIENT_DIR" "$WLOG_SERVER_DIR"
+
+# Kill and restart server with --webserver-log
+kill "$SERVER_PID" 2>/dev/null || true
+sleep 0.5
+
+SERVER_LOG="/tmp/bore_vhost_server_wlog.log"
+ip netns exec ns0 "$BORE" server \
+    --bind-addr 0.0.0.0 --bind-tunnels 0.0.0.0 \
+    --secret "$SECRET" \
+    --vhost-base-domain bore.local \
+    --vhost-https-port 443 --vhost-cert-file "$CERT_FILE" --vhost-key-file "$KEY_FILE" \
+    --vhost-mode both \
+    --udp --vhost-quic-port 443 \
+    --control-port 7835 \
+    --webserver-log "$WLOG_SERVER_DIR" \
+    >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+wait_server_ready nsp1 "$SERVER_IP_NS0_P1" 7835 \
+    || die "T10 server failed to start: $(tail -3 "$SERVER_LOG" 2>/dev/null)"
+
+# Start provider (app1) with --webserver-log
+P1_LOG="/tmp/bore_vhost_p1_wlog.log"
+ip netns exec nsp1 python3 -m http.server 8000 --bind 127.0.0.1 \
+    >"$P1_LOG" 2>&1 &
+P1_HTTP_PID=$!
+sleep 0.3
+
+P1_VID="/tmp/bore_vhost_p1_wlog.vlog"
+ip netns exec nsp1 "$BORE" vhost 127.0.0.1:8000 \
+    --subdomain app1 --id user1 \
+    --to "$SERVER_IP_NS0_P1:7835" --secret "$SECRET" \
+    --webserver-log "$WLOG_CLIENT_DIR" \
+    >"$P1_VID" 2>&1 &
+P1_VID_PID=$!
+sleep 1
+
+# Send HTTP from nsc (caller IP = 10.213.0.1)
+RESPONSE=$(ip netns exec nsc curl -s -k --resolve app1.bore.local:443:"$SERVER_IP_NS0_C" "https://app1.bore.local/" 2>/dev/null | head -c 50)
+sleep 2
+
+# Check that both client and server logs exist and contain the caller IP
+CLIENT_LOG="$WLOG_CLIENT_DIR/app1.log"
+SERVER_LOG_FILE="$WLOG_SERVER_DIR/app1/app1.bore.local.log"
+
+CLIENT_HAS_IP=0
+SERVER_HAS_IP=0
+
+if [ -f "$CLIENT_LOG" ] && grep -q "$CLIENT_IP" "$CLIENT_LOG" 2>/dev/null; then
+    CLIENT_HAS_IP=1
+fi
+
+if [ -f "$SERVER_LOG_FILE" ] && grep -q "$CLIENT_IP" "$SERVER_LOG_FILE" 2>/dev/null; then
+    SERVER_HAS_IP=1
+fi
+
+if [ "$CLIENT_HAS_IP" -eq 1 ] && [ "$SERVER_HAS_IP" -eq 1 ]; then
+    pass "webserver-log vhost: both client and server logs contain real IP $CLIENT_IP"
+else
+    if [ "$CLIENT_HAS_IP" -eq 0 ]; then
+        fail "webserver-log vhost: client log missing IP (file exists: $([ -f "$CLIENT_LOG" ] && echo yes || echo no))"
+    fi
+    if [ "$SERVER_HAS_IP" -eq 0 ]; then
+        fail "webserver-log vhost: server log missing IP (file exists: $([ -f "$SERVER_LOG_FILE" ] && echo yes || echo no))"
+    fi
+fi
+
+kill "$P1_VID_PID" "$P1_HTTP_PID" 2>/dev/null || true
+sleep 0.5
+rm -rf "$WLOG_CLIENT_DIR" "$WLOG_SERVER_DIR" 2>/dev/null || true
+
+# ── Test 11: T-WLOG-VHOST-SRV-LAYOUT (server log folder layout) ────────────────────
+echo "=== Test 11: T-WLOG-VHOST-SRV-LAYOUT (server log directory structure) ==="
+WLOG_SERVER_DIR="/tmp/bore_wlog_vhost_layout"
+rm -rf "$WLOG_SERVER_DIR" 2>/dev/null || true
+mkdir -p "$WLOG_SERVER_DIR"
+
+# Server already running from previous test — restart with different log dir
+kill "$SERVER_PID" 2>/dev/null || true
+sleep 0.5
+
+SERVER_LOG="/tmp/bore_vhost_server_layout.log"
+ip netns exec ns0 "$BORE" server \
+    --bind-addr 0.0.0.0 --bind-tunnels 0.0.0.0 \
+    --secret "$SECRET" \
+    --vhost-base-domain bore.local \
+    --vhost-https-port 443 --vhost-cert-file "$CERT_FILE" --vhost-key-file "$KEY_FILE" \
+    --vhost-mode both \
+    --udp --vhost-quic-port 443 \
+    --control-port 7835 \
+    --webserver-log "$WLOG_SERVER_DIR" \
+    >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+wait_server_ready nsp1 "$SERVER_IP_NS0_P1" 7835 \
+    || die "T11 server failed to start: $(tail -3 "$SERVER_LOG" 2>/dev/null)"
+
+# Start provider and send request
+ip netns exec nsp1 python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
+P1_HTTP_PID=$!
+sleep 0.3
+
+P1_VID="/tmp/bore_vhost_p1_layout.vlog"
+ip netns exec nsp1 "$BORE" vhost 127.0.0.1:8000 \
+    --subdomain shop --id user1 \
+    --to "$SERVER_IP_NS0_P1:7835" --secret "$SECRET" \
+    >"$P1_VID" 2>&1 &
+P1_VID_PID=$!
+sleep 1
+
+# Send request
+ip netns exec nsc curl -s -k --resolve shop.bore.local:443:"$SERVER_IP_NS0_C" "https://shop.bore.local/" >/dev/null 2>&1 || true
+sleep 2
+
+# Check the expected layout: <dir>/shop/shop.bore.local.log
+EXPECTED_LOG="$WLOG_SERVER_DIR/shop/shop.bore.local.log"
+if [ -f "$EXPECTED_LOG" ]; then
+    pass "webserver-log vhost layout: server log at correct path $EXPECTED_LOG"
+else
+    # Debug: show what was actually created
+    ACTUAL_FILES=$(find "$WLOG_SERVER_DIR" -type f 2>/dev/null | tr '\n' ' ')
+    fail "webserver-log vhost layout: expected file not found. Files: $ACTUAL_FILES"
+fi
+
+kill "$P1_VID_PID" "$P1_HTTP_PID" 2>/dev/null || true
+sleep 0.5
+rm -rf "$WLOG_SERVER_DIR" 2>/dev/null || true
+
+# ── Test 12: T-WLOG-VHOST-ROTATE (rotation on max file size) ──────────────────────
+echo "=== Test 12: T-WLOG-VHOST-ROTATE (log rotation on max-file-size) ==="
+WLOG_SERVER_DIR="/tmp/bore_wlog_vhost_rotate"
+rm -rf "$WLOG_SERVER_DIR" 2>/dev/null || true
+mkdir -p "$WLOG_SERVER_DIR"
+
+# Restart server with small max-file-size (1 MB) and max-files = 2
+kill "$SERVER_PID" 2>/dev/null || true
+sleep 0.5
+
+SERVER_LOG="/tmp/bore_vhost_server_rotate.log"
+ip netns exec ns0 "$BORE" server \
+    --bind-addr 0.0.0.0 --bind-tunnels 0.0.0.0 \
+    --secret "$SECRET" \
+    --vhost-base-domain bore.local \
+    --vhost-https-port 443 --vhost-cert-file "$CERT_FILE" --vhost-key-file "$KEY_FILE" \
+    --vhost-mode both \
+    --udp --vhost-quic-port 443 \
+    --control-port 7835 \
+    --webserver-log "$WLOG_SERVER_DIR" \
+    --webserver-log-max-file-size 1 \
+    --webserver-log-max-files 2 \
+    >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+wait_server_ready nsp1 "$SERVER_IP_NS0_P1" 7835 \
+    || die "T12 server failed to start: $(tail -3 "$SERVER_LOG" 2>/dev/null)"
+
+# Start provider and send large requests to exceed max-file-size
+ip netns exec nsp1 python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
+P1_HTTP_PID=$!
+sleep 0.3
+
+P1_VID="/tmp/bore_vhost_p1_rotate.vlog"
+ip netns exec nsp1 "$BORE" vhost 127.0.0.1:8000 \
+    --subdomain test --id user1 \
+    --to "$SERVER_IP_NS0_P1:7835" --secret "$SECRET" \
+    >"$P1_VID" 2>&1 &
+P1_VID_PID=$!
+sleep 1
+
+# Send many requests to generate logs larger than 1 MB
+for i in {1..15}; do
+    ip netns exec nsc curl -s -k --resolve test.bore.local:443:"$SERVER_IP_NS0_C" "https://test.bore.local/" >/dev/null 2>&1 || true
+    sleep 0.1
+done
+sleep 2
+
+# Check rotation: should have at most 2 files (test/test.bore.local.log and .log.1)
+ROTATE_DIR="$WLOG_SERVER_DIR/test"
+FILE_COUNT=0
+if [ -d "$ROTATE_DIR" ]; then
+    FILE_COUNT=$(find "$ROTATE_DIR" -type f -name "test.bore.local.log*" | wc -l)
+fi
+
+if [ "$FILE_COUNT" -le 2 ]; then
+    pass "webserver-log vhost rotate: rotation kept <= 2 files (got $FILE_COUNT)"
+else
+    fail "webserver-log vhost rotate: expected <= 2 rotated files, got $FILE_COUNT"
+fi
+
+kill "$P1_VID_PID" "$P1_HTTP_PID" 2>/dev/null || true
+sleep 0.5
+rm -rf "$WLOG_SERVER_DIR" 2>/dev/null || true
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "========================================"

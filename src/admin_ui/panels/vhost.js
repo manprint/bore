@@ -34,20 +34,17 @@ export default {
                 badgeCell.appendChild(b);
             });
 
-            const reqHeaders = vhost.request_headers
-                ? escapeHtml(vhost.request_headers.join(', '))
-                : 'None';
-            const respHeaders = vhost.response_headers
-                ? escapeHtml(vhost.response_headers.join(', '))
-                : 'None';
+            // Header count badge (show total request + response headers)
+            const reqCount = vhost.request_headers ? vhost.request_headers.length : 0;
+            const respCount = vhost.response_headers ? vhost.response_headers.length : 0;
+            const headerCountBadge = badge(`${reqCount} req / ${respCount} resp`, 'info');
 
             const row = {
                 'Subdomain': escapeHtml(vhost.subdomain ?? 'N/A'),
-                'Active': escapeHtml(String(vhost.active ?? 0)),
+                'Connections': escapeHtml(String(vhost.active ?? 0)),
                 'Carriers': escapeHtml(String(vhost.carriers ?? 0)),
                 'Direct Opens': escapeHtml(String(vhost.direct_stream_opens ?? 0)),
-                'Request Headers': reqHeaders,
-                'Response Headers': respHeaders,
+                'Headers': headerCountBadge,
                 'TLS': badgeCell,
                 _entry: vhost
             };
@@ -55,7 +52,7 @@ export default {
         });
 
         const tbl = table(
-            ['Subdomain', 'Active', 'Carriers', 'Direct Opens', 'Request Headers', 'Response Headers', 'TLS'],
+            ['Subdomain', 'Connections', 'Carriers', 'Direct Opens', 'Headers', 'TLS'],
             rows
         );
 

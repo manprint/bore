@@ -780,6 +780,24 @@ pub enum ClientMessage {
         /// Max concurrent connectors (hub mode). 0/absent → treated as 1 = legacy 1:1.
         #[serde(default)]
         max_clients: u16,
+        /// Display-only: relay-only mode enabled (no direct QUIC).
+        #[serde(default)]
+        relay_only: bool,
+        /// Display-only: MTU pinning enabled.
+        #[serde(default)]
+        pin_mtu: bool,
+        /// Display-only: TUN interface MTU.
+        #[serde(default)]
+        mtu: Option<u16>,
+        /// Display-only: forward-accept iptables rule inserted.
+        #[serde(default)]
+        forward_accept: bool,
+        /// Display-only: NAT masquerade enabled.
+        #[serde(default)]
+        nat_masquerade: bool,
+        /// Display-only: route accept/refuse policy summary (e.g., "accept-all", "refuse-all", "accept:2 refuse:1").
+        #[serde(default)]
+        route_policy: Option<String>,
     },
 
     /// Connect as the connector for a VPN link id.
@@ -796,6 +814,24 @@ pub enum ClientMessage {
         /// the field → 1 → single-pair path, byte-identical to before (I-9).
         #[serde(default = "default_vpn_carriers")]
         carriers: u16,
+        /// Display-only: relay-only mode enabled (no direct QUIC).
+        #[serde(default)]
+        relay_only: bool,
+        /// Display-only: MTU pinning enabled.
+        #[serde(default)]
+        pin_mtu: bool,
+        /// Display-only: TUN interface MTU.
+        #[serde(default)]
+        mtu: Option<u16>,
+        /// Display-only: forward-accept iptables rule inserted.
+        #[serde(default)]
+        forward_accept: bool,
+        /// Display-only: NAT masquerade enabled.
+        #[serde(default)]
+        nat_masquerade: bool,
+        /// Display-only: route accept/refuse policy summary (e.g., "accept-all", "refuse-all", "accept:2 refuse:1").
+        #[serde(default)]
+        route_policy: Option<String>,
     },
 
     /// Report the active VPN data-plane path (`"relay"` or `"direct"`) for the
@@ -1072,6 +1108,7 @@ impl ControlFrameSummary for ClientMessage {
                 notes,
                 carriers,
                 max_clients,
+                ..
             } => {
                 format!(
                     "HelloVpn {{ id={}, advertised={:?}, addr={:?}, notes={}, carriers={}, max_clients={} }}",
@@ -1089,6 +1126,7 @@ impl ControlFrameSummary for ClientMessage {
                 addr,
                 notes,
                 carriers,
+                ..
             } => {
                 format!(
                     "ConnectVpn {{ id={}, advertised={:?}, addr={:?}, notes={}, carriers={} }}",
@@ -1607,6 +1645,12 @@ fn serde_roundtrip_vpn_messages() {
         notes: None,
         carriers: 1,
         max_clients: 0,
+        relay_only: false,
+        pin_mtu: false,
+        mtu: None,
+        forward_accept: false,
+        nat_masquerade: false,
+        route_policy: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let back: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -1638,6 +1682,99 @@ fn forward_compat_unknown_fields_default() {
     let msg: ClientMessage = serde_json::from_str(json).unwrap();
     if let ClientMessage::HelloVpn { carriers, .. } = msg {
         assert_eq!(carriers, 0);
+    } else {
+        panic!("unexpected variant");
+    }
+}
+
+#[test]
+fn t_vpnwire_old_hello_deserializes_with_defaults() {
+    // Old client sends HelloVpn without the new display fields; server deserializes with defaults.
+    let json = r#"{"HelloVpn":{"id":"test","advertised":[],"addr":"Pool","notes":null,"carriers":1,"max_clients":0}}"#;
+    let msg: ClientMessage = serde_json::from_str(json).unwrap();
+    if let ClientMessage::HelloVpn {
+        relay_only,
+        pin_mtu,
+        mtu,
+        forward_accept,
+        nat_masquerade,
+        route_policy,
+        ..
+    } = msg
+    {
+        assert!(!relay_only);
+        assert!(!pin_mtu);
+        assert_eq!(mtu, None);
+        assert!(!forward_accept);
+        assert!(!nat_masquerade);
+        assert_eq!(route_policy, None);
+    } else {
+        panic!("unexpected variant");
+    }
+}
+
+#[test]
+fn t_vpnwire_hello_roundtrip_with_flags() {
+    // New client sends HelloVpn with all display flags set; roundtrip preserves them.
+    let msg = ClientMessage::HelloVpn {
+        id: "test".to_string(),
+        advertised: vec![],
+        addr: VpnAddrRequest::Pool,
+        notes: None,
+        carriers: 1,
+        max_clients: 0,
+        relay_only: true,
+        pin_mtu: true,
+        mtu: Some(1500),
+        forward_accept: true,
+        nat_masquerade: true,
+        route_policy: Some("accept:2 refuse:1".to_string()),
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let back: ClientMessage = serde_json::from_str(&json).unwrap();
+    if let ClientMessage::HelloVpn {
+        relay_only,
+        pin_mtu,
+        mtu,
+        forward_accept,
+        nat_masquerade,
+        route_policy,
+        ..
+    } = back
+    {
+        assert!(relay_only);
+        assert!(pin_mtu);
+        assert_eq!(mtu, Some(1500));
+        assert!(forward_accept);
+        assert!(nat_masquerade);
+        assert_eq!(route_policy, Some("accept:2 refuse:1".to_string()));
+    } else {
+        panic!("unexpected variant");
+    }
+}
+
+#[test]
+fn t_vpnwire_old_connect_deserializes_with_defaults() {
+    // Old client sends ConnectVpn without the new display fields.
+    let json =
+        r#"{"ConnectVpn":{"id":"test","advertised":[],"addr":"Pool","notes":null,"carriers":1}}"#;
+    let msg: ClientMessage = serde_json::from_str(json).unwrap();
+    if let ClientMessage::ConnectVpn {
+        relay_only,
+        pin_mtu,
+        mtu,
+        forward_accept,
+        nat_masquerade,
+        route_policy,
+        ..
+    } = msg
+    {
+        assert!(!relay_only);
+        assert!(!pin_mtu);
+        assert_eq!(mtu, None);
+        assert!(!forward_accept);
+        assert!(!nat_masquerade);
+        assert_eq!(route_policy, None);
     } else {
         panic!("unexpected variant");
     }
@@ -1728,6 +1865,12 @@ fn hello_vpn_serde_roundtrip_with_and_without_max_clients() {
         notes: Some("test hub".to_string()),
         carriers: 2,
         max_clients: 4,
+        relay_only: false,
+        pin_mtu: false,
+        mtu: None,
+        forward_accept: false,
+        nat_masquerade: false,
+        route_policy: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let back: ClientMessage = serde_json::from_str(&json).unwrap();

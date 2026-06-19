@@ -549,6 +549,12 @@ pub async fn serve_vpn_listener(
     max_clients: u16,
     vpn_hub_prefix: u8,
     vpn_pool: Option<VpnPoolHandle>,
+    relay_only: bool,
+    pin_mtu: bool,
+    mtu: Option<u16>,
+    forward_accept: bool,
+    nat_masquerade: bool,
+    route_policy: Option<String>,
 ) -> Result<()> {
     // Acquire link permit (bounds live VPN links).
     let _permit = match link_permits.try_acquire() {
@@ -693,6 +699,12 @@ pub async fn serve_vpn_listener(
         carriers: 0,
         auto_reconnect: false,
         udp: false,
+        vpn_relay_only: relay_only,
+        vpn_pin_mtu: pin_mtu,
+        vpn_mtu: mtu,
+        vpn_forward_accept: forward_accept,
+        vpn_nat_masquerade: nat_masquerade,
+        vpn_route_policy: route_policy,
     });
 
     info!(%id, "vpn listener registered, waiting for connector");
@@ -945,6 +957,12 @@ pub async fn serve_vpn_connector(
     max_carriers: u16,
     grx: Arc<AtomicU64>,
     gtx: Arc<AtomicU64>,
+    relay_only: bool,
+    pin_mtu: bool,
+    mtu: Option<u16>,
+    forward_accept: bool,
+    nat_masquerade: bool,
+    route_policy: Option<String>,
 ) -> Result<()> {
     info!(%id, "vpn connector connecting");
 
@@ -1091,6 +1109,12 @@ pub async fn serve_vpn_connector(
             carriers: 0,
             auto_reconnect: false,
             udp: false,
+            vpn_relay_only: relay_only,
+            vpn_pin_mtu: pin_mtu,
+            vpn_mtu: mtu,
+            vpn_forward_accept: forward_accept,
+            vpn_nat_masquerade: nat_masquerade,
+            vpn_route_policy: route_policy,
         });
         admin_reg.set_overlay(format!("{}/32", peer_slot.overlay));
 
@@ -1397,6 +1421,12 @@ pub async fn serve_vpn_connector(
         carriers: 0,
         auto_reconnect: false,
         udp: false,
+        vpn_relay_only: relay_only,
+        vpn_pin_mtu: pin_mtu,
+        vpn_mtu: mtu,
+        vpn_forward_accept: forward_accept,
+        vpn_nat_masquerade: nat_masquerade,
+        vpn_route_policy: route_policy,
     });
     admin_reg.set_overlay(format!("{connector_overlay}/30"));
 

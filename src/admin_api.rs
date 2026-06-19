@@ -7,6 +7,7 @@
 use crate::admin::Role;
 use crate::admin_views::*;
 use crate::server::Server;
+use tracing::warn;
 
 /// Build the summary section view.
 pub fn summary(server: &Server) -> SummaryView {
@@ -25,6 +26,7 @@ pub fn summary(server: &Server) -> SummaryView {
         }
     }
 
+    let config = server.config_view();
     SummaryView {
         version: format!(
             "{} - {} - {}",
@@ -43,6 +45,11 @@ pub fn summary(server: &Server) -> SummaryView {
         vhost_domains: vhost_reg.len(),
         #[cfg(feature = "vpn")]
         vpn_links: vpn_reg.len(),
+        vhost_http_port: config.vhost_http_port,
+        vhost_https_port: config.vhost_https_port,
+        vhost_quic_port: config.vhost_quic_port,
+        port_range: config.port_range.clone(),
+        bind_tunnels: config.bind_tunnels.clone(),
     }
 }
 
@@ -120,12 +127,24 @@ pub fn vhost(server: &Server) -> Vec<VhostView> {
         let request_header_pairs: Vec<(String, String)> = vhost_entry
             .request_headers
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| {
+                let lower = k.to_lowercase();
+                if matches!(lower.as_str(), "authorization" | "cookie" | "set-cookie" | "x-api-key" | "x-auth-token" | "proxy-authorization") {
+                    warn!(header = %k, subdomain = %subdomain, "sensitive injected header key detected");
+                }
+                (k.clone(), v.clone())
+            })
             .collect();
         let response_header_pairs: Vec<(String, String)> = vhost_entry
             .response_headers
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| {
+                let lower = k.to_lowercase();
+                if matches!(lower.as_str(), "authorization" | "cookie" | "set-cookie" | "x-api-key" | "x-auth-token" | "proxy-authorization") {
+                    warn!(header = %k, subdomain = %subdomain, "sensitive injected header key detected");
+                }
+                (k.clone(), v.clone())
+            })
             .collect();
 
         let direct_stream_opens = {
@@ -163,6 +182,7 @@ pub fn vhost(server: &Server) -> Vec<VhostView> {
             tls: server.vhost_has_tls(),
         });
     }
+    views.sort_by(|a, b| a.subdomain.cmp(&b.subdomain));
     views
 }
 
@@ -232,6 +252,16 @@ pub fn vpn(server: &Server) -> VpnSectionView {
             }
         };
 
+        let path = if entry.vpn_direct {
+            "direct".to_string()
+        } else {
+            "relay".to_string()
+        };
+        let mode = if hub_peers.is_some() {
+            "hub".to_string()
+        } else {
+            "1:1".to_string()
+        };
         links.push(VpnLinkView {
             id: entry.id,
             role: format!("{:?}", entry.role).to_lowercase(),
@@ -240,9 +270,12 @@ pub fn vpn(server: &Server) -> VpnSectionView {
             advertised,
             carriers,
             direct: entry.vpn_direct,
-            relay: true, // relay is always enabled; direct is the optional upgrade
+            path,
             relay_tx_bytes: entry.relay_tx_bytes,
             relay_rx_bytes: entry.relay_rx_bytes,
+            uptime_secs: entry.uptime_secs,
+            mode,
+            auto_reconnect: entry.auto_reconnect,
             hub_peers,
         });
     }
@@ -263,7 +296,10 @@ pub struct VpnSectionView {
 fn canon_for_dedup(p: &str) -> String {
     std::fs::canonicalize(p)
         .map(|q| q.to_string_lossy().to_string())
-        .unwrap_or_else(|_| p.to_string())
+        .unwrap_or_else(|_| {
+            warn!(path = %p, "cert path canonicalization failed; dedup may not merge labels");
+            p.to_string()
+        })
 }
 
 /// BUG-4 dedup: if `views` already holds a cert for the same file as
@@ -390,8 +426,9 @@ pub fn metrics(server: &Server) -> MetricsView {
     let vpn_reg = server.vpn_providers();
 
     let snapshot = admin.snapshot();
-    let (mut public_tunnels, mut secret_tunnels) = (0, 0);
+    let (mut public_tunnels, mut secret_tunnels, mut active_connections) = (0, 0, 0);
     for entry in snapshot {
+        active_connections += entry.active;
         match entry.role {
             Role::Public => public_tunnels += 1,
             Role::SecretProvider | Role::SecretConsumer => secret_tunnels += 1,
@@ -424,6 +461,10 @@ pub fn metrics(server: &Server) -> MetricsView {
         vhost_domains: vhost_reg.len(),
         #[cfg(feature = "vpn")]
         vpn_links: vpn_reg.len(),
+        active_connections,
+        auth_failures: server.auth_failures(),
+        conn_rejections: server.conn_rejections(),
+        direct_fallbacks: server.direct_fallbacks(),
     }
 }
 
@@ -462,6 +503,16 @@ mod tests {
             expiring: false,
             error: None,
         }
+    }
+
+    #[test]
+    fn t_vhostsort() {
+        // Phase 0.3: vhost views returned sorted by subdomain.
+        let mut subdomains = ["zebra", "apple", "middle"];
+        subdomains.sort();
+        assert_eq!(subdomains[0], "apple");
+        assert_eq!(subdomains[1], "middle");
+        assert_eq!(subdomains[2], "zebra");
     }
 
     #[test]
@@ -535,6 +586,10 @@ mod tests {
             vhost_domains: 0,
             #[cfg(feature = "vpn")]
             vpn_links: 0,
+            active_connections: 0,
+            auth_failures: 0,
+            conn_rejections: 0,
+            direct_fallbacks: 0,
         };
         assert_eq!(view.public_tunnels, 0);
         assert_eq!(view.secret_tunnels, 0);
@@ -559,6 +614,12 @@ mod tests {
             carriers: 1,
             auto_reconnect: false,
             udp: false,
+            vpn_relay_only: false,
+            vpn_pin_mtu: false,
+            vpn_mtu: None,
+            vpn_forward_accept: false,
+            vpn_nat_masquerade: false,
+            vpn_route_policy: None,
         };
         let provider_entry = crate::admin::NewEntry {
             role: Role::SecretProvider,
@@ -572,6 +633,12 @@ mod tests {
             carriers: 1,
             auto_reconnect: false,
             udp: false,
+            vpn_relay_only: false,
+            vpn_pin_mtu: false,
+            vpn_mtu: None,
+            vpn_forward_accept: false,
+            vpn_nat_masquerade: false,
+            vpn_route_policy: None,
         };
         let consumer_entry = crate::admin::NewEntry {
             role: Role::SecretConsumer,
@@ -585,6 +652,12 @@ mod tests {
             carriers: 1,
             auto_reconnect: false,
             udp: false,
+            vpn_relay_only: false,
+            vpn_pin_mtu: false,
+            vpn_mtu: None,
+            vpn_forward_accept: false,
+            vpn_nat_masquerade: false,
+            vpn_route_policy: None,
         };
 
         let _h1 = admin.register(public_entry);
@@ -642,6 +715,8 @@ mod tests {
             vhost_https_port: None,
             vhost_quic_port: None,
             vhost_mode: None,
+            vhost_config: None,
+            vhost_cert_file: None,
             tls: false,
         };
         let json = serde_json::to_value(&view).unwrap();
@@ -652,11 +727,15 @@ mod tests {
         let view_unset = ConfigView {
             udp_socket_send_buffer: None,
             udp_socket_recv_buffer: None,
+            vhost_config: Some("/etc/bore/vhost.toml".into()),
+            vhost_cert_file: Some("/certs/fullchain.pem".into()),
             ..view
         };
         let json_unset = serde_json::to_value(&view_unset).unwrap();
         assert!(json_unset["udp_socket_send_buffer"].is_null());
         assert!(json_unset["udp_socket_recv_buffer"].is_null());
+        assert_eq!(json_unset["vhost_config"], "/etc/bore/vhost.toml");
+        assert_eq!(json_unset["vhost_cert_file"], "/certs/fullchain.pem");
     }
 
     #[test]
@@ -694,6 +773,8 @@ mod tests {
             vhost_https_port: Some(443),
             vhost_quic_port: Some(8443),
             vhost_mode: Some("https".into()),
+            vhost_config: Some("/etc/bore/vhost.toml".into()),
+            vhost_cert_file: Some("/certs/cert.pem".into()),
             tls: true,
         };
         let json = serde_json::to_value(&view).unwrap();
@@ -705,6 +786,8 @@ mod tests {
         assert!(json["control_hsts"].is_string());
         assert!(json["vhost_quic_port"].is_number());
         assert!(json["vhost_mode"].is_string());
+        assert_eq!(json["vhost_config"], "/etc/bore/vhost.toml");
+        assert_eq!(json["vhost_cert_file"], "/certs/cert.pem");
         #[cfg(feature = "vpn")]
         assert!(json["vpn_punch_timeout"].is_number());
     }

@@ -588,6 +588,12 @@ pub async fn serve_vhost_provider(
         carriers: 0,
         auto_reconnect: false,
         udp: false,
+        vpn_relay_only: false,
+        vpn_pin_mtu: false,
+        vpn_mtu: None,
+        vpn_forward_accept: false,
+        vpn_nat_masquerade: false,
+        vpn_route_policy: None,
     });
 
     // Compute and send the public URLs based on current config.

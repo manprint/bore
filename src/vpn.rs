@@ -179,6 +179,32 @@ fn classify_vpn_error(msg: String) -> anyhow::Error {
     }
 }
 
+/// Compose a short route-policy summary for display (e.g. "accept-all", "refuse-all", "accept:2 refuse:1").
+/// Real CIDRs are NEVER included on the wire (I-NAT2 preserved).
+fn compose_route_policy(
+    accept_all: bool,
+    refuse_all: bool,
+    accept_count: usize,
+    refuse_count: usize,
+) -> Option<String> {
+    if refuse_all {
+        Some("refuse-all".to_string())
+    } else if accept_all {
+        Some("accept-all".to_string())
+    } else if accept_count > 0 || refuse_count > 0 {
+        let mut parts = Vec::new();
+        if accept_count > 0 {
+            parts.push(format!("accept:{}", accept_count));
+        }
+        if refuse_count > 0 {
+            parts.push(format!("refuse:{}", refuse_count));
+        }
+        Some(parts.join(" "))
+    } else {
+        None
+    }
+}
+
 /// Route filtering for connectors (Phase 1 of multi-client hub feature).
 /// Resolves which advertised CIDRs the connector installs based on accept/refuse flags.
 mod routes {
@@ -486,6 +512,12 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
         notes: args.notes.clone(),
         carriers: args.carriers.clamp(1, 16),
         max_clients: args.max_clients,
+        relay_only: args.relay_only,
+        pin_mtu: args.pin_mtu,
+        mtu: Some(args.mtu),
+        forward_accept: args.forward_accept,
+        nat_masquerade: args.nat_masquerade,
+        route_policy: None,
     };
     ctrl.send(hello).await?;
 
@@ -1541,12 +1573,24 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
 
     // Send ConnectVpn first (yamux lazy-init invariant). Only the exposed
     // (virtual) CIDRs go on the wire (N3/I-NAT2); real subnets stay local.
+    let route_policy = compose_route_policy(
+        args.accept_all_routes,
+        args.refuse_all_routes,
+        args.accept_routes.len(),
+        args.refuse_routes.len(),
+    );
     let connect_msg = crate::shared::ClientMessage::ConnectVpn {
         id: args.id.clone(),
         advertised: routes::advertised_exposed(&args.advertise_entries),
         addr: args.addr_request.clone(),
         notes: args.notes.clone(),
         carriers: args.carriers.clamp(1, 16),
+        relay_only: args.relay_only,
+        pin_mtu: args.pin_mtu,
+        mtu: Some(args.mtu),
+        forward_accept: args.forward_accept,
+        nat_masquerade: args.nat_masquerade,
+        route_policy,
     };
     ctrl.send(connect_msg).await?;
 

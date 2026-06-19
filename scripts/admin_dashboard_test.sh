@@ -86,9 +86,12 @@ openssl req -x509 -newkey rsa:2048 -keyout "$KEY_FILE" -out "$CERT_FILE" \
     -days 365 -nodes -subj "/CN=bore.test" -addext "subjectAltName=DNS:bore.test" 2>/dev/null \
     || die "failed to generate cert"
 
-# ── Start server in ns0 (control TLS) ──────────────────────────────────────────
-echo "=== Starting bore server (admin + control TLS) ==="
+# ── Start server in ns0 (control TLS + vhost) ──────────────────────────────────────────
+echo "=== Starting bore server (admin + control TLS + vhost + secret) ==="
 SERVER_LOG="$TMPDIR/server.log"
+VHOST_HTTP_PORT="8080"
+VHOST_HTTPS_PORT="8443"
+SERVER_SECRET="test-server-secret-for-auth-failure"
 ip netns exec ns0 "$BORE" server \
     --admin-token "$ADMIN_TOKEN" \
     --bind-addr 0.0.0.0 \
@@ -99,6 +102,10 @@ ip netns exec ns0 "$BORE" server \
     --udp-socket-send-buffer 16MiB \
     --bind-domain bore.example.com \
     --control-hsts "max-age=31536000" \
+    --vhost-base-domain bore.test \
+    --vhost-http-port "$VHOST_HTTP_PORT" \
+    --vhost-https-port "$VHOST_HTTPS_PORT" \
+    --secret "$SERVER_SECRET" \
     >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -131,6 +138,7 @@ echo "=== Starting public tunnel (bore local from $CLI_IP) ==="
 CLIENT_LOG="$TMPDIR/client.log"
 ip netns exec nscli "$BORE" local "$LOCAL_SVC_PORT" \
     --to "https://$SRV_IP:$CTRL_PORT" --insecure -p "$PUB_PORT" \
+    --secret "$SERVER_SECRET" \
     >"$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
 
@@ -149,6 +157,7 @@ CLIENT2_LOG="$TMPDIR/client2.log"
 NOTE_TEXT="superdufs lenovo lavoro 5353"
 ip netns exec nscli "$BORE" local 9998 \
     --to "https://$SRV_IP:$CTRL_PORT" --insecure -p "$PUB_PORT2" \
+    --secret "$SERVER_SECRET" \
     --carriers 4 --https --force-https --auto-reconnect --notes "$NOTE_TEXT" \
     >"$CLIENT2_LOG" 2>&1 &
 CLIENT2_PID=$!
@@ -166,6 +175,7 @@ SECRET_ID="test-secret-id-123456789012345"
 PROVIDER_LOG="$TMPDIR/provider.log"
 ip netns exec nscli "$BORE" local 9988 \
     --to "https://$SRV_IP:$CTRL_PORT" --insecure \
+    --secret "$SERVER_SECRET" \
     --tcp-secret-id "$SECRET_ID" \
     --notes "Provider notes test" \
     >"$PROVIDER_LOG" 2>&1 &
@@ -177,6 +187,7 @@ echo "=== Starting secret consumer (bore proxy consumer) ==="
 CONSUMER_LOG="$TMPDIR/consumer.log"
 ip netns exec ns0 "$BORE" proxy \
     --to "https://$SRV_IP:$CTRL_PORT" --insecure \
+    --secret "$SERVER_SECRET" \
     --tcp-secret-id "$SECRET_ID" \
     --local-proxy-port "127.0.0.1:19999" \
     --notes "Consumer notes test" \
@@ -397,6 +408,86 @@ else
         fail "T-SECNOTES notes missing; body=$BODY"
     fi
 fi
+
+# ── Phase 5.1 / 5.3 new e2e assertions ─────────────────────────────────────────
+echo ""
+echo "=== Phase 5.1 / 5.3 e2e assertions (vhost, metrics, auth failures) ==="
+
+# T-OVRPORTS-E2E: server started with vhost flags → GET /admin/api/v1/summary has keys
+# vhost_http_port, port_range, bind_tunnels and they are non-null.
+R=$(aget /admin/api/v1/summary "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+keys_ok=true
+if echo "$BODY" | grep -q '"vhost_http_port"' \
+   && echo "$BODY" | grep -q '"port_range"' \
+   && echo "$BODY" | grep -q '"bind_tunnels"'; then
+    # Check that port_range and bind_tunnels are non-null strings (not null)
+    if echo "$BODY" | grep -q '"port_range":"' && echo "$BODY" | grep -q '"bind_tunnels":"'; then
+        keys_ok=true
+    else
+        keys_ok=false
+    fi
+else
+    keys_ok=false
+fi
+[ "$keys_ok" = "true" ] && pass "T-OVRPORTS-E2E summary vhost_http_port + port_range + bind_tunnels (non-null)" \
+    || fail "T-OVRPORTS-E2E missing/null keys; body=$BODY"
+
+# T-METACTIVE-E2E: GET /admin/api/v1/metrics has integer active_connections (>=0)
+# and the three new counters auth_failures, conn_rejections, direct_fallbacks (>=0).
+R=$(aget /admin/api/v1/metrics "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+metrics_ok=false
+if $JQ_AVAIL; then
+    if echo "$BODY" | jq -e '.active_connections >= 0
+                             and .auth_failures >= 0
+                             and .conn_rejections >= 0
+                             and .direct_fallbacks >= 0' >/dev/null 2>&1; then
+        metrics_ok=true
+    fi
+else
+    # Grep fallback: check presence and look for >= 0 values
+    if echo "$BODY" | grep -q '"active_connections":[0-9]' \
+       && echo "$BODY" | grep -q '"auth_failures":[0-9]' \
+       && echo "$BODY" | grep -q '"conn_rejections":[0-9]' \
+       && echo "$BODY" | grep -q '"direct_fallbacks":[0-9]'; then
+        metrics_ok=true
+    fi
+fi
+[ "$metrics_ok" = "true" ] && pass "T-METACTIVE-E2E metrics active_connections + counters (>=0)" \
+    || fail "T-METACTIVE-E2E missing/invalid counters; body=$BODY"
+
+# T-AUTHFAIL-E2E: make N=3 connection attempts with WRONG secret, which must fail
+# the handshake. Then GET /admin/api/v1/metrics and assert auth_failures >= 3.
+echo "  (making 3 failed auth attempts with wrong secret...)"
+for i in 1 2 3; do
+    # Each attempt connects with the wrong secret and should fail immediately
+    timeout 2 ip netns exec nscli "$BORE" local 9977 \
+        --to "https://$SRV_IP:$CTRL_PORT" --insecure \
+        --secret "wrongsecret-attempt-$i" \
+        >/dev/null 2>&1 &
+done
+sleep 0.5  # Wait for attempts to fail
+
+R=$(aget /admin/api/v1/metrics "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+authfail_ok=false
+if $JQ_AVAIL; then
+    failures=$(echo "$BODY" | jq '.auth_failures // 0' 2>/dev/null)
+    if [ "$failures" -ge 3 ] 2>/dev/null; then
+        authfail_ok=true
+    fi
+else
+    # Grep: extract the auth_failures value
+    failures=$(echo "$BODY" | grep -oE '"auth_failures":[0-9]+' | grep -oE '[0-9]+')
+    [ "$failures" -ge 3 ] 2>/dev/null && authfail_ok=true
+fi
+[ "$authfail_ok" = "true" ] && pass "T-AUTHFAIL-E2E auth_failures >= 3 after wrong-secret attempts" \
+    || fail "T-AUTHFAIL-E2E auth_failures too low ($failures); body=$BODY"
+
+# T-VPNFLAGS-E2E: VPN requires --features vpn + netns harness.
+# ASSESSMENT: VPN flag display is covered by Rust unit tests (T-VPNFLAGS in admin_views.rs)
+# and manual integration testing in docs/vpn/VPN_FULL_PLAN_V1.md. The e2e netns harness
+# (vpn_netns_test.sh) would require invasive changes to inject --admin-token into its
+# server launch and curl /admin/api/v1/vpn from inside the test netns. Deferred to v2.
+echo "SKIP: T-VPNFLAGS-E2E (VPN flag display covered by Rust T-VPNFLAGS unit test + manual)"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""

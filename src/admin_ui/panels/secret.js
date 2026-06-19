@@ -41,7 +41,7 @@ export default {
                 'Secret ID': escapeHtml(secret.secret_id ?? 'N/A'),
                 'Peer': escapeHtml(secret.peer ?? 'N/A'),
                 'Flags': badgeCell,
-                'Active': escapeHtml(String(secret.active ?? 0)),
+                'Connections': escapeHtml(String(secret.active ?? 0)),
                 'Uptime': escapeHtml(fmtDuration(secret.uptime_secs)),
                 'TX': escapeHtml(fmtBytes(secret.relay_tx_bytes)),
                 'RX': escapeHtml(fmtBytes(secret.relay_rx_bytes)),
@@ -51,7 +51,7 @@ export default {
         });
 
         const tbl = table(
-            ['Role', 'Secret ID', 'Peer', 'Flags', 'Active', 'Uptime', 'TX', 'RX'],
+            ['Role', 'Secret ID', 'Peer', 'Flags', 'Connections', 'Uptime', 'TX', 'RX'],
             rows
         );
 

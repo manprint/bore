@@ -33,6 +33,16 @@ pub struct SummaryView {
     /// Number of live VPN links (cfg vpn).
     #[cfg(feature = "vpn")]
     pub vpn_links: usize,
+    /// Vhost HTTP listener port (when vhost enabled).
+    pub vhost_http_port: Option<u16>,
+    /// Vhost HTTPS listener port (when vhost enabled).
+    pub vhost_https_port: Option<u16>,
+    /// Vhost QUIC direct-path port (when vhost enabled).
+    pub vhost_quic_port: Option<u16>,
+    /// Port range forwarded.
+    pub port_range: String,
+    /// Bind address for tunnel listeners.
+    pub bind_tunnels: String,
 }
 
 /// Public tunnel entry (role=Public).
@@ -144,12 +154,18 @@ pub struct VpnLinkView {
     pub carriers: u16,
     /// Direct QUIC path active.
     pub direct: bool,
-    /// Relay path active.
-    pub relay: bool,
+    /// Active path ("direct" if direct, else "relay").
+    pub path: String,
     /// Relay tx bytes.
     pub relay_tx_bytes: u64,
     /// Relay rx bytes.
     pub relay_rx_bytes: u64,
+    /// Seconds since connection registered.
+    pub uptime_secs: u64,
+    /// Link mode (1:1 for single peer, hub for multi-peer).
+    pub mode: String,
+    /// Auto-reconnect enabled.
+    pub auto_reconnect: bool,
     /// Hub peers (if this is a hub listener).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hub_peers: Option<Vec<VpnPeerView>>,
@@ -253,6 +269,10 @@ pub struct ConfigView {
     pub vhost_quic_port: Option<u16>,
     /// Vhost frontend mode (http, https, both, redirect-https, auto).
     pub vhost_mode: Option<String>,
+    /// Vhost configuration file path.
+    pub vhost_config: Option<String>,
+    /// Vhost certificate file path.
+    pub vhost_cert_file: Option<String>,
     /// TLS enabled on control port.
     pub tls: bool,
 }
@@ -277,11 +297,172 @@ pub struct MetricsView {
     /// Number of live VPN links (cfg vpn).
     #[cfg(feature = "vpn")]
     pub vpn_links: usize,
+    /// Total active connections across all tunnels.
+    pub active_connections: usize,
+    /// Authentication / handshake failures.
+    pub auth_failures: u64,
+    /// Connection rejections (semaphore exhaustion).
+    pub conn_rejections: u64,
+    /// Direct-to-relay fallback count.
+    pub direct_fallbacks: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn t_ovrports() {
+        // Phase 0.1: SummaryView serializes the 5 new port fields.
+        let summary = SummaryView {
+            version: "1.0.0 - main - abc1234".into(),
+            control_port: 7835,
+            tls: true,
+            udp: false,
+            vpn_enabled: false,
+            vhost_enabled: true,
+            uptime_secs: 42,
+            public_tunnels: 1,
+            secret_tunnels: 2,
+            vhost_domains: 2,
+            #[cfg(feature = "vpn")]
+            vpn_links: 0,
+            vhost_http_port: Some(80),
+            vhost_https_port: Some(443),
+            vhost_quic_port: Some(443),
+            port_range: "5000-6000".into(),
+            bind_tunnels: "0.0.0.0".into(),
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["vhost_http_port"], 80);
+        assert_eq!(json["vhost_https_port"], 443);
+        assert_eq!(json["vhost_quic_port"], 443);
+        assert_eq!(json["port_range"], "5000-6000");
+        assert_eq!(json["bind_tunnels"], "0.0.0.0");
+    }
+
+    #[test]
+    fn t_vpnview() {
+        // Phase 0.2: VpnLinkView has uptime_secs, path, mode, auto_reconnect; no relay field.
+        #[cfg(feature = "vpn")]
+        {
+            let vpn = VpnLinkView {
+                id: 1,
+                role: "vpnlistener".into(),
+                peer: "10.0.0.1:1234".into(),
+                overlay: Some("10.99.0.1/32".into()),
+                advertised: vec!["10.0.0.0/24".into()],
+                carriers: 1,
+                direct: false,
+                path: "relay".into(),
+                relay_tx_bytes: 1024,
+                relay_rx_bytes: 2048,
+                uptime_secs: 600,
+                mode: "1:1".into(),
+                auto_reconnect: true,
+                hub_peers: None,
+            };
+            let json = serde_json::to_value(&vpn).unwrap();
+            assert_eq!(json["path"], "relay");
+            assert_eq!(json["uptime_secs"], 600);
+            assert_eq!(json["mode"], "1:1");
+            assert_eq!(json["auto_reconnect"], true);
+            assert!(json["relay"].is_null(), "relay field must not exist");
+        }
+    }
+
+    #[test]
+    fn t_cfgpaths() {
+        // Phase 0.3: ConfigView has vhost_config and vhost_cert_file paths.
+        let config = ConfigView {
+            port_range: "5000-6000".into(),
+            control_port: 7835,
+            max_conns: 100,
+            max_carriers: 4,
+            bind_addr: "0.0.0.0".into(),
+            bind_tunnels: "0.0.0.0".into(),
+            udp: false,
+            udp_socket_send_buffer: None,
+            udp_socket_recv_buffer: None,
+            udp_stream_receive_window: "16MiB".into(),
+            udp_connection_receive_window: "16MiB".into(),
+            udp_send_window: "64MiB".into(),
+            udp_max_streams: 4096,
+            bind_domain: None,
+            control_hsts: "max-age=31536000".into(),
+            #[cfg(feature = "vpn")]
+            vpn_enabled: false,
+            #[cfg(feature = "vpn")]
+            vpn_pool: None,
+            #[cfg(feature = "vpn")]
+            vpn_max_links: 100,
+            #[cfg(feature = "vpn")]
+            vpn_hub_prefix: 24,
+            #[cfg(feature = "vpn")]
+            vpn_punch_timeout: Some(10),
+            vhost_enabled: true,
+            vhost_base_domain: Some("example.com".into()),
+            vhost_http_port: Some(80),
+            vhost_https_port: Some(443),
+            vhost_quic_port: Some(443),
+            vhost_mode: Some("https".into()),
+            vhost_config: Some("/etc/bore/vhost.toml".into()),
+            vhost_cert_file: Some("/certs/fullchain.pem".into()),
+            tls: true,
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["vhost_config"], "/etc/bore/vhost.toml");
+        assert_eq!(json["vhost_cert_file"], "/certs/fullchain.pem");
+        // Verify no secrets leaked
+        assert!(json.get("key").is_none());
+        assert!(json.get("password").is_none());
+    }
+
+    #[test]
+    fn t_metactive() {
+        // Phase 0.4: MetricsView has active_connections field.
+        let metrics = MetricsView {
+            uptime_secs: 100,
+            mem_rss_bytes: Some(100000),
+            bandwidth_tx_bytes: 1000,
+            bandwidth_rx_bytes: 2000,
+            public_tunnels: 2,
+            secret_tunnels: 1,
+            vhost_domains: 1,
+            #[cfg(feature = "vpn")]
+            vpn_links: 0,
+            active_connections: 42,
+            auth_failures: 0,
+            conn_rejections: 0,
+            direct_fallbacks: 0,
+        };
+        let json = serde_json::to_value(&metrics).unwrap();
+        assert_eq!(json["active_connections"], 42);
+    }
+
+    #[test]
+    fn t_metcount() {
+        // Phase 1.1: MetricsView has auth_failures, conn_rejections, direct_fallbacks.
+        let metrics = MetricsView {
+            uptime_secs: 100,
+            mem_rss_bytes: Some(100000),
+            bandwidth_tx_bytes: 1000,
+            bandwidth_rx_bytes: 2000,
+            public_tunnels: 2,
+            secret_tunnels: 1,
+            vhost_domains: 1,
+            #[cfg(feature = "vpn")]
+            vpn_links: 0,
+            active_connections: 10,
+            auth_failures: 5,
+            conn_rejections: 3,
+            direct_fallbacks: 2,
+        };
+        let json = serde_json::to_value(&metrics).unwrap();
+        assert_eq!(json["auth_failures"], 5);
+        assert_eq!(json["conn_rejections"], 3);
+        assert_eq!(json["direct_fallbacks"], 2);
+    }
 
     #[test]
     fn t_views_serialize_stable() {
@@ -299,6 +480,11 @@ mod tests {
             vhost_domains: 2,
             #[cfg(feature = "vpn")]
             vpn_links: 0,
+            vhost_http_port: None,
+            vhost_https_port: None,
+            vhost_quic_port: None,
+            port_range: "5000-6000".into(),
+            bind_tunnels: "0.0.0.0".into(),
         };
         let json = serde_json::to_value(&summary).unwrap();
         assert!(json["version"].is_string());
@@ -372,6 +558,8 @@ mod tests {
             vhost_https_port: None,
             vhost_quic_port: None,
             vhost_mode: None,
+            vhost_config: None,
+            vhost_cert_file: None,
             tls: false,
         };
         let json = serde_json::to_value(&config).unwrap();

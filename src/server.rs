@@ -216,6 +216,15 @@ pub struct Server {
     /// Cumulative bytes received over all relay tunnels (all time).
     total_rx_bytes: Arc<AtomicU64>,
 
+    /// Authentication / handshake failures.
+    auth_failures: Arc<AtomicU64>,
+
+    /// Connection rejections (semaphore exhaustion).
+    conn_rejections: Arc<AtomicU64>,
+
+    /// Direct-to-relay fallback count.
+    direct_fallbacks: Arc<AtomicU64>,
+
     /// Serializable snapshot of server startup configuration (sanitized, D11).
     config_view: Arc<crate::admin_views::ConfigView>,
 }
@@ -272,6 +281,9 @@ impl Server {
             started_at: std::time::Instant::now(),
             total_tx_bytes: Arc::new(AtomicU64::new(0)),
             total_rx_bytes: Arc::new(AtomicU64::new(0)),
+            auth_failures: Arc::new(AtomicU64::new(0)),
+            conn_rejections: Arc::new(AtomicU64::new(0)),
+            direct_fallbacks: Arc::new(AtomicU64::new(0)),
             config_view: Arc::new(crate::admin_views::ConfigView {
                 port_range: port_range_str,
                 control_port: CONTROL_PORT,
@@ -304,6 +316,8 @@ impl Server {
                 vhost_https_port: None,
                 vhost_quic_port: None,
                 vhost_mode: None,
+                vhost_config: None,
+                vhost_cert_file: None,
                 tls: false,
             }),
         }
@@ -407,6 +421,36 @@ impl Server {
     /// Shared atomic for accumulating received bytes (used by relay code).
     pub fn total_rx_bytes_atomic(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.total_rx_bytes)
+    }
+
+    /// Authentication / handshake failures.
+    pub fn auth_failures(&self) -> u64 {
+        self.auth_failures.load(Ordering::Relaxed)
+    }
+
+    /// Connection rejections (semaphore exhaustion).
+    pub fn conn_rejections(&self) -> u64 {
+        self.conn_rejections.load(Ordering::Relaxed)
+    }
+
+    /// Direct-to-relay fallback count.
+    pub fn direct_fallbacks(&self) -> u64 {
+        self.direct_fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// Shared atomic for auth failures (used by auth code).
+    pub fn auth_failures_atomic(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.auth_failures)
+    }
+
+    /// Shared atomic for connection rejections (used by semaphore code).
+    pub fn conn_rejections_atomic(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.conn_rejections)
+    }
+
+    /// Shared atomic for direct fallbacks (used by direct path code).
+    pub fn direct_fallbacks_atomic(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.direct_fallbacks)
     }
 
     /// Set the HSTS value served on HTTPS control-port HTTP responses.
@@ -643,6 +687,9 @@ impl Server {
                                 {
                                     Ok(p) => p,
                                     Err(_) => {
+                                        this2
+                                            .conn_rejections
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         debug!("vhost HTTP connection dropped: max-conns reached");
                                         continue;
                                     }
@@ -686,6 +733,9 @@ impl Server {
                                 {
                                     Ok(p) => p,
                                     Err(_) => {
+                                        this2
+                                            .conn_rejections
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         debug!("vhost HTTPS connection dropped: max-conns reached");
                                         continue;
                                     }
@@ -1003,6 +1053,8 @@ impl Server {
                     let permit = match Arc::clone(&self.conn_permits).try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
+                            self.conn_rejections
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             debug!(%sub, "vhost connection on control port dropped: max-conns reached");
                             return vhost::send_service_unavailable(stream).await;
                         }
@@ -1083,6 +1135,8 @@ impl Server {
         if let Some(auth) = &self.auth {
             if let Err(err) = auth.server_handshake(&mut control).await {
                 warn!(%err, "server handshake failed");
+                self.auth_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 control.send(ServerMessage::Error(err.to_string())).await?;
                 return Ok(());
             }
@@ -1216,6 +1270,12 @@ impl Server {
                 notes,
                 carriers,
                 max_clients,
+                relay_only,
+                pin_mtu,
+                mtu,
+                forward_accept,
+                nat_masquerade,
+                route_policy,
             }) => {
                 #[cfg(feature = "vpn")]
                 if self.vpn_enabled {
@@ -1236,11 +1296,26 @@ impl Server {
                         max_clients,
                         self.vpn_hub_prefix,
                         self.vpn_pool.clone(),
+                        relay_only,
+                        pin_mtu,
+                        mtu,
+                        forward_accept,
+                        nat_masquerade,
+                        route_policy,
                     )
                     .await;
                 }
                 #[cfg(not(feature = "vpn"))]
-                let _ = (carriers, max_clients);
+                let _ = (
+                    carriers,
+                    max_clients,
+                    relay_only,
+                    pin_mtu,
+                    mtu,
+                    forward_accept,
+                    nat_masquerade,
+                    route_policy,
+                );
                 #[cfg(not(feature = "vpn"))]
                 let _ = (&advertised, &addr, &notes); // Suppress unused warnings when vpn feature is off
                 warn!(%id, "vpn not enabled on this server");
@@ -1257,6 +1332,12 @@ impl Server {
                 addr,
                 notes,
                 carriers,
+                relay_only,
+                pin_mtu,
+                mtu,
+                forward_accept,
+                nat_masquerade,
+                route_policy,
             }) => {
                 #[cfg(feature = "vpn")]
                 if self.vpn_enabled {
@@ -1279,11 +1360,25 @@ impl Server {
                         self.max_carriers,
                         Arc::clone(&self.total_rx_bytes),
                         Arc::clone(&self.total_tx_bytes),
+                        relay_only,
+                        pin_mtu,
+                        mtu,
+                        forward_accept,
+                        nat_masquerade,
+                        route_policy,
                     )
                     .await;
                 }
                 #[cfg(not(feature = "vpn"))]
-                let _ = carriers;
+                let _ = (
+                    carriers,
+                    relay_only,
+                    pin_mtu,
+                    mtu,
+                    forward_accept,
+                    nat_masquerade,
+                    route_policy,
+                );
                 #[cfg(not(feature = "vpn"))]
                 let _ = (&advertised, &addr, &notes); // Suppress unused warnings when vpn feature is off
                 warn!(%id, "vpn not enabled on this server");
@@ -1372,6 +1467,12 @@ impl Server {
             carriers: opts.carriers,
             auto_reconnect: opts.auto_reconnect,
             udp: opts.udp,
+            vpn_relay_only: false,
+            vpn_pin_mtu: false,
+            vpn_mtu: None,
+            vpn_forward_accept: false,
+            vpn_nat_masquerade: false,
+            vpn_route_policy: None,
         });
         let active = registration.active();
         // Per-tunnel relay byte counters (shown on /admin/status#/tunnels). These
@@ -1465,6 +1566,8 @@ impl Server {
                     let permit = match Arc::clone(&self.conn_permits).try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
+                            self.conn_rejections
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             warn!(?addr, ?port, "too many active connections, dropping");
                             continue;
                         }
@@ -1495,6 +1598,8 @@ impl Server {
                     } else {
                         None
                     };
+                    #[cfg(feature = "udp")]
+                    let direct_fallbacks = Arc::clone(&self.direct_fallbacks);
                     #[cfg(not(feature = "udp"))]
                     let _public_direct_entry: Option<Arc<()>> = None;
                     tokio::spawn(async move {
@@ -1553,6 +1658,15 @@ impl Server {
                         #[cfg(feature = "udp")]
                         if used_direct {
                             return;
+                        }
+
+                        // Direct was attempted (UDP requested) but did not carry the
+                        // connection — count the per-connection relay fallback (off the
+                        // hot path: once per proxied connection, never in a copy loop).
+                        #[cfg(feature = "udp")]
+                        if public_direct_entry.is_some() {
+                            direct_fallbacks
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
 
                         // Relay fallback.

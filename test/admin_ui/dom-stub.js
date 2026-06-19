@@ -43,6 +43,7 @@ class HTMLElement {
         this._text = '';
         this._html = '';
         this.attributes = {};
+        this.style = {};
     }
     set className(v) {
         this.classList = new ClassList();
@@ -65,7 +66,15 @@ class HTMLElement {
         this._html = v == null ? '' : String(v);
     }
     get innerHTML() {
-        return this._html;
+        // If _html was set explicitly, return it
+        if (this._html) return this._html;
+        // Otherwise, compute from children (for appendChild'd elements)
+        if (this.children.length === 0) return '';
+        return this.children.map(child => {
+            if (child.innerHTML) return child.innerHTML;
+            if (child.textContent) return child.textContent;
+            return '';
+        }).join('');
     }
     appendChild(node) {
         this.children.push(node);

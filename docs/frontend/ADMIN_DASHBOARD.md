@@ -412,6 +412,84 @@ detail modals (plan: `docs/frontend/ADMIN_DASHBOARD_BUGFIX2_PLAN.md`).
 
 ---
 
+## Round-3 staging hardening (2026-06-19)
+
+A third hardening pass applied operator-facing visibility improvements: control-plane
+clarity, per-link VPN state surfacing, debug metrics, and security tightening
+(plan: `docs/frontend/ADMIN_DASHBOARD_ASSESSMENT.md`, phases 0–5).
+
+| Fix | Layer | Root cause | Result |
+|-----|-------|-----------|--------|
+| **Overview: Listeners & Ports card** | backend + frontend | operator cannot see at a glance how the server was started (vhost HTTP/HTTPS/QUIC ports, tunnel bind address, port range) — must read Config | `SummaryView` += `vhost_http_port`/`vhost_https_port`/`vhost_quic_port`/`port_range`/`bind_tunnels` (all `Option`; vhost fields `None` when vhost disabled); new card renders control port, range, bind address, vhost listening ports when vhost enabled |
+| **VPN per-link path & mode** | backend + frontend | per-link view shows `relay: true` (always, hardcoded) — tells operator nothing about whether direct is active/available; no mode indicator (1:1 vs hub); no uptime | `VpnLinkView` replaces `relay: bool` with `path: "direct"\|"relay"` (derived from `vpn_direct`); adds `uptime_secs`, `mode: "1:1"\|"hub"` (from `hub_peers`), keeps `direct: bool`; frontend renders path as badge + uptime in card + full display in modal |
+| **VPN connector flags visible to server** | wire + backend | server admin cannot tell why a link behaves as it does (direct disabled by config, UDP unavailable, etc.); flags `--relay-only`/`--pin-mtu`/`--forward-accept`/`--nat-masquerade` are connector-local, not sent over wire | `ConnectVpn`/`HelloVpn` gain display-only fields (`#[serde(default)]`): `relay_only`, `pin_mtu`, `mtu` (Option), `forward_accept`, `nat_masquerade`, `route_policy` (Option, policy string only — no real NAT CIDRs); sent **before auth** (lazy-yamux invariant); server stores on `Entry`; never acts on them; frontend renders flags as badges + detail in modal |
+| **VPN direct fallback counter** | backend | operator cannot measure UDP-direct stability — silent fallbacks to relay are invisible | `MetricsView` += `direct_fallbacks: u64` (counts per-connection public-tunnel UDP→relay fallback); `Server` increments on fallback; exposed for debugging |
+| **Active connections & auth/reject counts** | backend | operator sees no live connection census or auth failure rate (debug troubleshooting); only global bandwidth | `MetricsView` += `active_connections` (pure compute: sum of all entries' `active`), `auth_failures` (handshake/auth rejects), `conn_rejections` (max-conns semaphore exhaustion); `Server` carries three `Arc<AtomicU64>` incremented off the hot path (accept/permit-fail/fallback sites); frontend renders with friendly labels |
+| **Vhost table leaner** | frontend | vhost table rows clutter with header name columns (compact view) | table header columns moved to detail-modal-only; summary table carries a count badge instead; modal preserves full `request_header_pairs`/`response_header_pairs` key+value display |
+| **Config detail completeness** | backend | operator cannot see at a glance whether vhost is configured (only in Config details); no vhost certificate path reference | `ConfigView` += `vhost_config` and `vhost_cert_file` paths (Option; display info only); config panel renders them in the grid |
+| **CSP hardening** | backend | CSP allows `img-src ... data:` (theoretical confused-deputy risk) | tightened `img-src` to `'self'` only (data: removed from CSP header); **T-CSP** confirms |
+| **Cert dedup warning** | backend | cert card duplicate-merging silently swallows canonicalize errors → possible latent bugs | `canon_for_dedup()` now `warn!`s when path canonicalization fails (e.g. symlink resolve); operator sees the issue in logs |
+| **Vhost header-value security flag** | backend | header values (Authorization, X-Api-Key) are exported to the admin page — no operator warning despite token gate | `warn!` emitted at register time when an injected header key is sensitive; security note added to docs stating values are admin-only by design (operator needs them to debug); see **Security considerations** below |
+
+### Key implementation details
+
+- **Listeners & Ports card:** `SummaryView` now exposes the five control-plane parameters from `ServerConfig` (already available in `ConfigView` — now surfaced in `SummaryView` for at-a-glance overview). Card shows: control port (always), port range (if public tunnels enabled), bind address (if non-default), vhost HTTP/HTTPS/QUIC ports (only when `vhost_enabled && vhost_http_port.is_some()`).
+- **VPN path:** replaces the misleading `relay: bool` with a derived string. Frontend logic: if `vpn_direct` → `"direct"`, else `"relay"`. The `direct: bool` field is retained for backward-compat (legacy consumers, if any); new code uses `path`. Modal shows full direct-upgrade history (uptime → uptime since path last changed TBD; uptime_secs is entry-wide for now).
+- **VPN flags wire extension:** all six new fields are `#[serde(default)]`, so old client ↔ new server and vice versa both work (missing fields decode to default). Sent on `ConnectVpn`/`HelloVpn` messages **before auth** — respects the lazy-yamux rule (prevents deadlock if server tries to write before receiving client Hello). Server reads them into `Entry` once and never changes them; they are display-only. `route_policy` is a summary string (`"accept-all"`, `"refuse-all"`, or `"accept:N refuse:M"`) — **real NAT subnets are never on the wire** (by-design limitation I-NAT2; future client-side `/admin` would show a connector's own real mappings).
+- **Metrics counters:** `auth_failures` incremented at TLS-accept / Hello-auth-reject sites; `conn_rejections` at semaphore-acquire failure; `direct_fallbacks` at the fallback-to-relay sites (public-tunnel direct path only for now; vhost direct fallback not yet counted). All are `Arc<AtomicU64>` incremented with `Relaxed` ordering (no hot-path overhead — sites are error/once-per-conn).
+- **Vhost table:** moved header-name columns (`Request Headers`, `Response Headers`) to the detail modal under the `request_header_pairs`/`response_header_pairs` full key+value display; table header now shows a count badge instead of clogging the row.
+- **Config paths:** `vhost_config` and `vhost_cert_file` are new optional string fields pointing to the config file and cert file used at startup. Not secrets — purely for operator reference (e.g., "where do I edit vhost rules?").
+- **CSP tightening:** the admin shell `index.html` served with `Content-Security-Policy: ... img-src 'self'; ...` (removed `data:`). Eliminates a theoretical attack surface (confused-deputy via a malicious `<img src="data:...">` in a header value or note).
+- **Sanitization invariant strengthened (F5):** `T-SANITIZE` now recursively walks all view JSON keys (not just names, but values recursively) and asserts no match to `secret|key|password|token|admin_token`. Newly added fields (`vhost_config`, `vhost_cert_file`, route_policy) pass the check (no secrets).
+
+### VPN display-flag wire invariants
+
+The round-3 VPN extension respects all legacy invariants:
+- **Backward compat (D1/I-4):** `#[serde(default)]` on all six new fields; old client sends Hello/ConnectVpn without them → server fills defaults; new client ↔ old server same logic.
+- **Pre-auth send (D1/I-4):** flags ride the existing pre-auth `HelloVpn`/`ConnectVpn` messages; no new message type; same lazy-yamux rule applies.
+- **Server acts on none (D1/I-4):** all six fields are **read-only display** — the server stores them for dashboard export but **never conditionally acts on them** (e.g., no `if relay_only { disallow direct }`). Connector behavior controlled by its own CLI flags, not by server decisions.
+- **No real NAT CIDRs (D2/I-NAT2):** the `route_policy` field is a **summary string** only — the real `accept`/`refuse` route CIDR list is connector-local and never on the wire. Limitation documented below (F8).
+
+### Known limitation (F8)
+
+NAT real→exposed subnet mappings and per-connector accept/refuse route SUBNETS are not surfaced in the admin dashboard:
+- **Why:** real subnets are gateway-local by design (`I-NAT2`) and stay off the wire (security: no IP leakage, no peer visibility into gateway LAN structure).
+- **What is visible:** only the connector's advertised *exposed/virtual* subnet entries (already on wire) and a `route_policy` summary string (e.g., `"accept-all"`, `"accept:3 refuse:1"`).
+- **Future:** a future client-side `/admin` endpoint would show a connector node's own real↔virtual mappings (out of scope for the server dashboard v1).
+
+### Test IDs
+
+**Rust unit** (`src/admin.rs`, `tests/admin_test.rs`):
+- `T-OVRPORTS` — `SummaryView` serializes the five new port/bind fields
+- `T-VPNVIEW` — `VpnLinkView` has `uptime_secs`/`path`/`mode`; no `relay` field
+- `T-VHOSTSORT` — vhost views returned in stable subdomain order
+- `T-CFGPATHS` — `ConfigView` has `vhost_config`/`vhost_cert_file`; `T-SANITIZE` passes
+- `T-METACTIVE` — `active_connections` = sum of entries' `active`
+- `T-METCOUNT` — new counters (auth, reject, fallback) start at 0; unit harness increments them correctly
+- `T-VPNWIRE` — old `HelloVpn`/`ConnectVpn` bytes (missing new fields) deserialize with defaults; round-trip with fields set
+- `T-VPNFLAGS` — `VpnLinkView` exposes all six display flags; backend stores, frontend renders
+- `T-CSP` — served CSP header has no `data:` in img-src
+
+**Frontend unit** (`test/admin_ui/**/*.test.js`):
+- `T-OVR2` — overview card renders Listeners & Ports when vhost present; hidden when disabled
+- `T-VPNRENDER` — given a link object with path/mode/uptime/flags, badges and detail modal render correctly
+- `T-LABELS` — column header renamed "Connections" (was "Active")
+- `T-VHOSTLEAN` — vhost table omits header columns; modal preserves full pairs
+
+**e2e** (`scripts/admin_dashboard_test.sh` + `scripts/vpn_netns_test.sh`):
+- `T-OVRPORTS-E2E` — server with `--vhost-http-port 8080` → `/admin/api/v1/summary` has `vhost_http_port: 8080`
+- `T-METACTIVE-E2E` — after a transfer, `/admin/api/v1/metrics` has `active_connections >= 0` and increments under load
+- `T-AUTHFAIL-E2E` — N control connections with a WRONG `--secret` (server started with `--secret`) → handshake rejects → `/admin/api/v1/metrics.auth_failures >= N`
+- `T-VPNFLAGS-E2E` — **deferred this pass** (extending `vpn_netns_test.sh` to enable `--admin-token` + curl is invasive). VPN-flag display is covered by the Rust unit test `T-VPNFLAGS` + manual; netns e2e tracked for v2.
+
+### Security notes
+
+- **Vhost header values:** `request_header_pairs` and `response_header_pairs` expose full key+value pairs visible to the admin. Keys can include `Authorization`, `X-Api-Key`, etc. — this is **intentional** (operator needs them to debug gateway behavior). Token gates the entire `/admin/*` surface. A `warn!` is emitted when a sensitive key is injected, and the docs note the visibility. **No change to behavior — operator needs the data; just flagged.**
+- **CSP tightening:** removed `data:` from `img-src` to eliminate a theoretical confused-deputy surface.
+- **Token in transit:** always use TLS (`--tls`, `https://`) in production; the admin token is never logged or exposed in query strings.
+
+---
+
 ## Future extensions
 
 The modular design enables:

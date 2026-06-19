@@ -51,7 +51,7 @@ export default {
                 'Port': escapeHtml(String(tunnel.public_port ?? 'N/A')),
                 'Peer': escapeHtml(tunnel.peer ?? 'N/A'),
                 'Flags': badgeCell,
-                'Active': escapeHtml(String(tunnel.active ?? 0)),
+                'Connections': escapeHtml(String(tunnel.active ?? 0)),
                 'Uptime': escapeHtml(fmtDuration(tunnel.uptime_secs)),
                 'TX': escapeHtml(fmtBytes(tunnel.relay_tx_bytes)),
                 'RX': escapeHtml(fmtBytes(tunnel.relay_rx_bytes)),
@@ -62,7 +62,7 @@ export default {
         });
 
         const tbl = table(
-            ['Port', 'Peer', 'Flags', 'Active', 'Uptime', 'TX', 'RX', 'Notes'],
+            ['Port', 'Peer', 'Flags', 'Connections', 'Uptime', 'TX', 'RX', 'Notes'],
             rows
         );
 

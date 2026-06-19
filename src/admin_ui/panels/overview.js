@@ -58,5 +58,32 @@ export default {
 
         el.appendChild(grid);
         el.appendChild(flags);
+
+        // Listeners & Ports card
+        if (data.port_range || data.bind_tunnels || (data.vhost_enabled && (data.vhost_http_port || data.vhost_https_port || data.vhost_quic_port))) {
+            const ports = document.createElement('div');
+            ports.className = 'card';
+            let portContent = '<strong>Listeners & Ports:</strong><br>';
+            portContent += `Control: ${escapeHtml(String(data.control_port || 'N/A'))}<br>`;
+            if (data.port_range) {
+                portContent += `Port Range: ${escapeHtml(data.port_range)}<br>`;
+            }
+            if (data.bind_tunnels) {
+                portContent += `Tunnel Bind: ${escapeHtml(data.bind_tunnels)}<br>`;
+            }
+            if (data.vhost_enabled) {
+                if (data.vhost_http_port) {
+                    portContent += `Vhost HTTP: ${escapeHtml(String(data.vhost_http_port))}<br>`;
+                }
+                if (data.vhost_https_port) {
+                    portContent += `Vhost HTTPS: ${escapeHtml(String(data.vhost_https_port))}<br>`;
+                }
+                if (data.vhost_quic_port) {
+                    portContent += `Vhost QUIC: ${escapeHtml(String(data.vhost_quic_port))}<br>`;
+                }
+            }
+            ports.innerHTML = portContent;
+            el.appendChild(ports);
+        }
     }
 };

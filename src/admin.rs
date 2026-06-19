@@ -79,6 +79,18 @@ pub struct Entry {
     pub relay_tx_bytes: Arc<AtomicU64>,
     /// VPN roles: relay ciphertext bytes received from this client.
     pub relay_rx_bytes: Arc<AtomicU64>,
+    /// VPN display-only: relay-only mode enabled (no direct QUIC).
+    pub vpn_relay_only: bool,
+    /// VPN display-only: MTU pinning enabled.
+    pub vpn_pin_mtu: bool,
+    /// VPN display-only: TUN interface MTU.
+    pub vpn_mtu: Option<u16>,
+    /// VPN display-only: forward-accept iptables rule inserted.
+    pub vpn_forward_accept: bool,
+    /// VPN display-only: NAT masquerade enabled.
+    pub vpn_nat_masquerade: bool,
+    /// VPN display-only: route accept/refuse policy summary.
+    pub vpn_route_policy: Option<String>,
 }
 
 /// Descriptive fields used to create an [`Entry`]; the atomics are initialized by
@@ -106,6 +118,18 @@ pub struct NewEntry {
     pub auto_reconnect: bool,
     /// Initial value of [`Entry::udp`].
     pub udp: bool,
+    /// See [`Entry::vpn_relay_only`].
+    pub vpn_relay_only: bool,
+    /// See [`Entry::vpn_pin_mtu`].
+    pub vpn_pin_mtu: bool,
+    /// See [`Entry::vpn_mtu`].
+    pub vpn_mtu: Option<u16>,
+    /// See [`Entry::vpn_forward_accept`].
+    pub vpn_forward_accept: bool,
+    /// See [`Entry::vpn_nat_masquerade`].
+    pub vpn_nat_masquerade: bool,
+    /// See [`Entry::vpn_route_policy`].
+    pub vpn_route_policy: Option<String>,
 }
 
 /// A serializable snapshot of one [`Entry`], produced by [`AdminRegistry::snapshot`].
@@ -147,6 +171,18 @@ pub struct EntryView {
     pub relay_tx_bytes: u64,
     /// See [`Entry::relay_rx_bytes`].
     pub relay_rx_bytes: u64,
+    /// See [`Entry::vpn_relay_only`].
+    pub vpn_relay_only: bool,
+    /// See [`Entry::vpn_pin_mtu`].
+    pub vpn_pin_mtu: bool,
+    /// See [`Entry::vpn_mtu`].
+    pub vpn_mtu: Option<u16>,
+    /// See [`Entry::vpn_forward_accept`].
+    pub vpn_forward_accept: bool,
+    /// See [`Entry::vpn_nat_masquerade`].
+    pub vpn_nat_masquerade: bool,
+    /// See [`Entry::vpn_route_policy`].
+    pub vpn_route_policy: Option<String>,
 }
 
 /// Shared, cloneable handle to the live tunnel registry.
@@ -194,6 +230,12 @@ impl AdminRegistry {
             vpn_direct: AtomicBool::new(false),
             relay_tx_bytes: Arc::new(AtomicU64::new(0)),
             relay_rx_bytes: Arc::new(AtomicU64::new(0)),
+            vpn_relay_only: new.vpn_relay_only,
+            vpn_pin_mtu: new.vpn_pin_mtu,
+            vpn_mtu: new.vpn_mtu,
+            vpn_forward_accept: new.vpn_forward_accept,
+            vpn_nat_masquerade: new.vpn_nat_masquerade,
+            vpn_route_policy: new.vpn_route_policy,
         });
         self.inner.entries.insert(id, Arc::clone(&entry));
         Registration {
@@ -235,6 +277,12 @@ impl AdminRegistry {
                     vpn_direct: entry.vpn_direct.load(Ordering::Relaxed),
                     relay_tx_bytes: entry.relay_tx_bytes.load(Ordering::Relaxed),
                     relay_rx_bytes: entry.relay_rx_bytes.load(Ordering::Relaxed),
+                    vpn_relay_only: entry.vpn_relay_only,
+                    vpn_pin_mtu: entry.vpn_pin_mtu,
+                    vpn_mtu: entry.vpn_mtu,
+                    vpn_forward_accept: entry.vpn_forward_accept,
+                    vpn_nat_masquerade: entry.vpn_nat_masquerade,
+                    vpn_route_policy: entry.vpn_route_policy.clone(),
                 }
             })
             .collect();
@@ -336,6 +384,12 @@ mod tests {
             carriers: 0,
             auto_reconnect: false,
             udp: false,
+            vpn_relay_only: false,
+            vpn_pin_mtu: false,
+            vpn_mtu: None,
+            vpn_forward_accept: false,
+            vpn_nat_masquerade: false,
+            vpn_route_policy: None,
         }
     }
 

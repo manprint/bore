@@ -1813,8 +1813,8 @@ async fn dispatch(command: Command) -> Result<()> {
                 if let Some(port) = vhost_https_port {
                     cfg.https_port = port;
                 }
-                if let Some(cert) = vhost_cert_file {
-                    cfg.cert_file = Some(cert);
+                if let Some(ref cert) = vhost_cert_file {
+                    cfg.cert_file = Some(cert.clone());
                 }
                 if let Some(key) = vhost_key_file {
                     cfg.key_file = Some(key);
@@ -1848,8 +1848,8 @@ async fn dispatch(command: Command) -> Result<()> {
                     server.set_vhost_quic_port(port);
                 }
                 server.set_vhost(cfg)?;
-                if let Some(config_path) = vhost_config {
-                    server.set_vhost_config_path(config_path);
+                if let Some(ref config_path) = vhost_config {
+                    server.set_vhost_config_path(config_path.clone());
                 }
             }
             // Build and store the server configuration snapshot (D11: sanitized, no secrets).
@@ -1891,6 +1891,12 @@ async fn dispatch(command: Command) -> Result<()> {
                 vhost_https_port,
                 vhost_quic_port,
                 vhost_mode: vhost_mode.clone(),
+                vhost_config: vhost_config
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
+                vhost_cert_file: vhost_cert_file
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
                 tls: config_tls,
             };
             server.set_config_view(config_view);

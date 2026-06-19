@@ -80,6 +80,12 @@ fn pool_hello_vpn(id: &str) -> ClientMessage {
         addr: VpnAddrRequest::Pool,
         notes: None,
         carriers: 1,
+        relay_only: false,
+        pin_mtu: false,
+        mtu: None,
+        forward_accept: false,
+        nat_masquerade: false,
+        route_policy: None,
     }
 }
 
@@ -90,6 +96,12 @@ fn pool_connect_vpn(id: &str) -> ClientMessage {
         addr: VpnAddrRequest::Pool,
         notes: None,
         carriers: 1,
+        relay_only: false,
+        pin_mtu: false,
+        mtu: None,
+        forward_accept: false,
+        nat_masquerade: false,
+        route_policy: None,
     }
 }
 
@@ -535,6 +547,12 @@ async fn vpn_server_overlap_rejected() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -551,6 +569,12 @@ async fn vpn_server_overlap_rejected() {
         addr: VpnAddrRequest::Pool,
         notes: None,
         carriers: 1,
+        relay_only: false,
+        pin_mtu: false,
+        mtu: None,
+        forward_accept: false,
+        nat_masquerade: false,
+        route_policy: None,
     })
     .await
     .unwrap();
@@ -591,6 +615,12 @@ async fn vpn_server_addr_mode_mismatch_rejected() {
         },
         notes: None,
         carriers: 1,
+        relay_only: false,
+        pin_mtu: false,
+        mtu: None,
+        forward_accept: false,
+        nat_masquerade: false,
+        route_policy: None,
     })
     .await
     .unwrap();
@@ -621,6 +651,12 @@ async fn vpn_server_static_inconsistent_pair_rejected() {
             },
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -641,6 +677,12 @@ async fn vpn_server_static_inconsistent_pair_rejected() {
         },
         notes: None,
         carriers: 1,
+        relay_only: false,
+        pin_mtu: false,
+        mtu: None,
+        forward_accept: false,
+        nat_masquerade: false,
+        route_policy: None,
     })
     .await
     .unwrap();
@@ -1398,6 +1440,12 @@ async fn vpn_carriers_negotiation() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 4,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -1411,6 +1459,12 @@ async fn vpn_carriers_negotiation() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 2,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -1554,6 +1608,12 @@ async fn vpn_server_hub_pairs_multiple_connectors() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -1587,6 +1647,12 @@ async fn vpn_server_hub_pairs_multiple_connectors() {
                 addr: VpnAddrRequest::Pool,
                 notes: None,
                 carriers: 1,
+                relay_only: false,
+                pin_mtu: false,
+                mtu: None,
+                forward_accept: false,
+                nat_masquerade: false,
+                route_policy: None,
             })
             .await
             .unwrap();
@@ -1655,6 +1721,12 @@ async fn vpn_server_hub_rejects_connector_advertise() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -1668,6 +1740,12 @@ async fn vpn_server_hub_rejects_connector_advertise() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -1695,6 +1773,12 @@ async fn vpn_server_hub_rejects_when_at_capacity() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -1711,6 +1795,12 @@ async fn vpn_server_hub_rejects_when_at_capacity() {
                 addr: VpnAddrRequest::Pool,
                 notes: None,
                 carriers: 1,
+                relay_only: false,
+                pin_mtu: false,
+                mtu: None,
+                forward_accept: false,
+                nat_masquerade: false,
+                route_policy: None,
             })
             .await
             .unwrap();
@@ -1738,6 +1828,12 @@ async fn vpn_server_hub_rejects_when_at_capacity() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -1765,6 +1861,12 @@ async fn vpn_relay_hub_injects_peer_id_header() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -1778,6 +1880,12 @@ async fn vpn_relay_hub_injects_peer_id_header() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -1803,6 +1911,12 @@ async fn vpn_server_legacy_1to1_still_consumes_entry() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -1818,6 +1932,12 @@ async fn vpn_server_legacy_1to1_still_consumes_entry() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -1835,6 +1955,12 @@ async fn vpn_server_legacy_1to1_still_consumes_entry() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();

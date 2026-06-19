@@ -231,6 +231,12 @@ pub async fn serve_provider(
         carriers,
         auto_reconnect: false,
         udp: false,
+        vpn_relay_only: false,
+        vpn_pin_mtu: false,
+        vpn_mtu: None,
+        vpn_forward_accept: false,
+        vpn_nat_masquerade: false,
+        vpn_route_policy: None,
     });
     info!(%id, "secret provider registered");
     control.send(ServerMessage::Ok).await?;
@@ -366,6 +372,12 @@ pub async fn serve_consumer(
         carriers: 0,
         auto_reconnect: false,
         udp: false,
+        vpn_relay_only: false,
+        vpn_pin_mtu: false,
+        vpn_mtu: None,
+        vpn_forward_accept: false,
+        vpn_nat_masquerade: false,
+        vpn_route_policy: None,
     });
     let active = admin_reg.active();
     // Per-tunnel relay byte counters for this consumer (shown on the admin page).

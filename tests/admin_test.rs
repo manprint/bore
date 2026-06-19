@@ -361,11 +361,64 @@ async fn admin_tls_hsts_can_be_disabled() -> Result<()> {
 
 // ─── Phase 0 tests (§0.1 – §0.4) ───────────────────────────────────
 
+/// Recursively walk all keys in a JSON object and assert no (case-insensitive) match
+/// to secret, key, password, or token. Exempts public metadata field names like
+/// `secret_id`, `secret_tunnels` (counters, not secret values).
+fn assert_no_secret_keys(value: &serde_json::Value, path: &str) {
+    if let Some(obj) = value.as_object() {
+        for (key, val) in obj.iter() {
+            // Check key name (case-insensitive).
+            let key_lower = key.to_lowercase();
+            // Exempt specific non-secret metadata fields:
+            // - `secret_id`: public tunnel identifier (not a secret value)
+            // - `secret_tunnels`: a counter of tunnels with secret IDs (not a secret value)
+            let is_exempt = key_lower == "secret_id" || key_lower == "secret_tunnels";
+            if !is_exempt {
+                assert!(
+                    !key_lower.contains("secret")
+                        && !key_lower.contains("key")
+                        && !key_lower.contains("password")
+                        && !key_lower.contains("token"),
+                    "forbidden key '{}' at path {}{}",
+                    key,
+                    path,
+                    if path.is_empty() { "" } else { "." }
+                );
+            }
+            // Recurse into nested objects and arrays.
+            if val.is_object() {
+                let new_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", path, key)
+                };
+                assert_no_secret_keys(val, &new_path);
+            } else if let Some(arr) = val.as_array() {
+                let new_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", path, key)
+                };
+                for (idx, item) in arr.iter().enumerate() {
+                    if item.is_object() {
+                        assert_no_secret_keys(item, &format!("{}[{}]", new_path, idx));
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn t_views_serialize_stable() {
     use bore_cli::admin_views::*;
 
-    // Test that ConfigView serializes with expected snake_case keys (T-SANITIZE gate).
+    // Test that all admin views serialize safely without leaking secrets (T-SANITIZE gate).
+    // Build representative instances of each view and verify no forbidden keys appear
+    // (recursively, including nested objects/arrays). Key names checked case-insensitively.
+    // Exempts `secret_id` (public tunnel identifier, not a secret value).
+
+    // ConfigView.
     let config = ConfigView {
         port_range: "5000-6000".into(),
         control_port: 7835,
@@ -398,27 +451,168 @@ fn t_views_serialize_stable() {
         vhost_https_port: None,
         vhost_quic_port: None,
         vhost_mode: None,
+        vhost_config: None,
+        vhost_cert_file: None,
         tls: false,
     };
+    let json_config = serde_json::to_value(&config).expect("serialize ConfigView");
+    assert_no_secret_keys(&json_config, "");
 
-    let json = serde_json::to_value(&config).expect("serialize ConfigView");
-    assert!(json["port_range"].is_string(), "port_range must be string");
-    assert!(
-        json["control_port"].is_number(),
-        "control_port must be number"
-    );
-    assert!(json["max_conns"].is_number());
+    // SummaryView.
+    let summary = SummaryView {
+        version: "1.0.0 - main - abc1234".into(),
+        control_port: 7835,
+        tls: true,
+        udp: false,
+        vpn_enabled: false,
+        vhost_enabled: true,
+        uptime_secs: 42,
+        public_tunnels: 1,
+        secret_tunnels: 2,
+        vhost_domains: 2,
+        #[cfg(feature = "vpn")]
+        vpn_links: 0,
+        vhost_http_port: Some(80),
+        vhost_https_port: Some(443),
+        vhost_quic_port: Some(443),
+        port_range: "5000-6000".into(),
+        bind_tunnels: "0.0.0.0".into(),
+    };
+    let json_summary = serde_json::to_value(&summary).expect("serialize SummaryView");
+    assert_no_secret_keys(&json_summary, "");
 
-    // (T-SANITIZE) Forbidden keys must NOT appear.
-    assert!(
-        json.get("admin_token").is_none(),
-        "admin_token must be sanitized"
-    );
-    assert!(json.get("secret").is_none(), "secret must be sanitized");
-    assert!(json.get("key").is_none(), "key must be sanitized");
-    assert!(json.get("password").is_none(), "password must be sanitized");
-    // tls must be a bool, not a path.
-    assert!(json["tls"].is_boolean(), "tls must be boolean");
+    // TunnelView (public tunnel).
+    let tunnel = TunnelView {
+        id: 1,
+        peer: "192.0.2.1:54321".into(),
+        public_port: Some(5000),
+        notes: Some("test".into()),
+        basic_auth: false,
+        https: false,
+        force_https: false,
+        carriers: 1,
+        auto_reconnect: false,
+        udp: false,
+        overlay: None,
+        vpn_direct: false,
+        active: 3,
+        uptime_secs: 100,
+        relay_tx_bytes: 1024,
+        relay_rx_bytes: 2048,
+    };
+    let json_tunnel = serde_json::to_value(&tunnel).expect("serialize TunnelView");
+    assert_no_secret_keys(&json_tunnel, "");
+
+    // SecretView (secret tunnel with secret_id field, which must be exempted).
+    let secret = SecretView {
+        id: 2,
+        role: "SecretProvider".into(),
+        peer: "192.0.2.2:54322".into(),
+        secret_id: Some("abc123def456".into()), // Allowed field; exempted in check.
+        notes: None,
+        basic_auth: false,
+        carriers: 1,
+        udp: false,
+        active: 0,
+        uptime_secs: 50,
+        relay_tx_bytes: 512,
+        relay_rx_bytes: 1024,
+    };
+    let json_secret = serde_json::to_value(&secret).expect("serialize SecretView");
+    assert_no_secret_keys(&json_secret, "");
+    // Verify secret_id is actually present (not stripped).
+    assert_eq!(json_secret["secret_id"], "abc123def456");
+
+    // VhostView.
+    let vhost = VhostView {
+        subdomain: "example".into(),
+        active: 2,
+        carriers: 1,
+        direct_stream_opens: 10,
+        request_headers: vec!["x-forwarded-for".into()],
+        response_headers: vec!["x-custom".into()],
+        request_header_pairs: vec![("x-app".into(), "value".into())],
+        response_header_pairs: vec![("x-app-version".into(), "1.0".into())],
+        direct_pool: 5,
+        tls: true,
+    };
+    let json_vhost = serde_json::to_value(&vhost).expect("serialize VhostView");
+    assert_no_secret_keys(&json_vhost, "");
+
+    // MetricsView (includes new counters).
+    let metrics = MetricsView {
+        uptime_secs: 300,
+        mem_rss_bytes: Some(50_000_000),
+        bandwidth_tx_bytes: 1_000_000,
+        bandwidth_rx_bytes: 2_000_000,
+        public_tunnels: 1,
+        secret_tunnels: 2,
+        vhost_domains: 1,
+        #[cfg(feature = "vpn")]
+        vpn_links: 0,
+        active_connections: 5,
+        auth_failures: 0,
+        conn_rejections: 0,
+        direct_fallbacks: 0,
+    };
+    let json_metrics = serde_json::to_value(&metrics).expect("serialize MetricsView");
+    assert_no_secret_keys(&json_metrics, "");
+
+    // VpnLinkView (cfg vpn).
+    #[cfg(feature = "vpn")]
+    {
+        let vpn_link = VpnLinkView {
+            id: 3,
+            role: "VpnListener".into(),
+            peer: "192.0.2.3:54323".into(),
+            overlay: Some("10.99.0.1/32".into()),
+            advertised: vec!["10.0.0.0/24".into()],
+            carriers: 1,
+            direct: false,
+            path: "relay".into(),
+            relay_tx_bytes: 256,
+            relay_rx_bytes: 512,
+            uptime_secs: 75,
+            mode: "1:1".into(),
+            auto_reconnect: true,
+            hub_peers: None,
+        };
+        let json_vpn = serde_json::to_value(&vpn_link).expect("serialize VpnLinkView");
+        assert_no_secret_keys(&json_vpn, "");
+
+        // VpnLinkView with hub_peers (nested VpnPeerView objects).
+        let vpn_hub = VpnLinkView {
+            id: 4,
+            role: "VpnListener".into(),
+            peer: "192.0.2.4:54324".into(),
+            overlay: Some("10.99.0.1/25".into()),
+            advertised: vec![],
+            carriers: 2,
+            direct: true,
+            path: "direct".into(),
+            relay_tx_bytes: 512,
+            relay_rx_bytes: 1024,
+            uptime_secs: 120,
+            mode: "hub".into(),
+            auto_reconnect: false,
+            hub_peers: Some(vec![
+                VpnPeerView {
+                    peer_id: 1,
+                    overlay: "10.99.0.2/32".into(),
+                    peer: "192.0.2.100:12345".into(),
+                    advertised: vec!["192.168.1.0/24".into()],
+                },
+                VpnPeerView {
+                    peer_id: 2,
+                    overlay: "10.99.0.3/32".into(),
+                    peer: "192.0.2.101:12346".into(),
+                    advertised: vec!["192.168.2.0/24".into()],
+                },
+            ]),
+        };
+        let json_vpn_hub = serde_json::to_value(&vpn_hub).expect("serialize VpnLinkView with hub");
+        assert_no_secret_keys(&json_vpn_hub, "");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -638,6 +832,45 @@ async fn t_shell_served() -> Result<()> {
     assert!(
         resp.starts_with("HTTP/1.1 200"),
         "/admin/ must also serve the shell"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_csp() -> Result<()> {
+    // (Phase 4 / F10) CSP header must have img-src 'self' only (no data:).
+    const PORT: u16 = 17975;
+    let _g = SERIAL_GUARD.lock().await;
+    wait_port(PORT, false).await;
+
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(PORT);
+    server.set_admin_token(Some(TOKEN.into()));
+    tokio::spawn(server.listen());
+    wait_port(PORT, true).await;
+
+    let s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let resp = http_get(s, "/admin/status", None).await?;
+    assert!(resp.starts_with("HTTP/1.1 200"), "shell must be 200");
+
+    // Extract and verify CSP header
+    let csp_line = resp
+        .lines()
+        .find(|l| l.starts_with("Content-Security-Policy:"))
+        .expect("CSP header must be present");
+
+    assert!(
+        csp_line.contains("img-src 'self'"),
+        "CSP must contain img-src 'self'"
+    );
+    assert!(
+        !csp_line.contains("img-src 'self' data:"),
+        "CSP must not contain data: in img-src"
+    );
+    assert!(
+        !csp_line.contains("img-src 'self' data:") && !csp_line.contains("img-src 'self', data:"),
+        "CSP img-src must not allow data: URIs"
     );
 
     Ok(())

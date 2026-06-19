@@ -76,7 +76,7 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let path_only = path.split('?').next().unwrap_or(&path);
 
     // CSP header for all responses
-    let csp = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'";
+    let csp = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'";
 
     // New API endpoints (D1, D10).
     if path_only.starts_with("/admin/api/v1/") {

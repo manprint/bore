@@ -125,6 +125,12 @@ async fn vpn_relay_link_bulk_bidirectional_no_wedge() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -140,6 +146,12 @@ async fn vpn_relay_link_bulk_bidirectional_no_wedge() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -233,6 +245,12 @@ async fn pair_multi(
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -247,6 +265,12 @@ async fn pair_multi(
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -332,6 +356,12 @@ async fn vpn_relay_multi_carrier_one_stream_dies() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 4,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();
@@ -345,6 +375,12 @@ async fn vpn_relay_multi_carrier_one_stream_dies() {
             addr: VpnAddrRequest::Pool,
             notes: None,
             carriers: 4,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
         })
         .await
         .unwrap();

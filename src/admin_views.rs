@@ -66,6 +66,8 @@ pub struct TunnelView {
     pub carriers: u16,
     /// Client runs with `--auto-reconnect`.
     pub auto_reconnect: bool,
+    /// Client requested HTTP access logging (`--webserver-log`).
+    pub webserver_log: bool,
     /// UDP direct-path enabled.
     pub udp: bool,
     /// VPN overlay address (if applicable).
@@ -112,10 +114,33 @@ pub struct SecretView {
 }
 
 /// Vhost subdomain provider.
+///
+/// Mirrors [`TunnelView`]'s execution-info fields (peer/notes/flags/uptime/bytes)
+/// so the dashboard's Vhost section can present the same columns as Tunnels, plus
+/// the vhost-only fields (headers, direct pool). Built from a self-sufficient
+/// [`crate::vhost::VhostEntry`] (no admin-registry join).
 #[derive(Serialize, Clone)]
 pub struct VhostView {
     /// Subdomain label.
     pub subdomain: String,
+    /// Remote peer address of the provider's control connection (string).
+    pub peer: String,
+    /// Operator notes (`--notes`).
+    pub notes: Option<String>,
+    /// HTTP Basic auth enforced by the provider (display only).
+    pub basic_auth: bool,
+    /// Provider requested the QUIC direct data path (`--udp`).
+    pub udp: bool,
+    /// Provider runs with `--auto-reconnect`.
+    pub auto_reconnect: bool,
+    /// Provider requested HTTP access logging (`--webserver-log`).
+    pub webserver_log: bool,
+    /// Seconds since the provider registered.
+    pub uptime_secs: u64,
+    /// Relay tx bytes (server→provider) for this subdomain.
+    pub relay_tx_bytes: u64,
+    /// Relay rx bytes (provider→server) for this subdomain.
+    pub relay_rx_bytes: u64,
     /// Active proxied connections.
     pub active: usize,
     /// Number of parallel carrier TCP streams.
@@ -543,6 +568,7 @@ mod tests {
             force_https: true,
             carriers: 4,
             auto_reconnect: true,
+            webserver_log: true,
             udp: false,
             overlay: None,
             vpn_direct: false,
@@ -558,6 +584,8 @@ mod tests {
         assert_eq!(json["carriers"], 4);
         assert_eq!(json["auto_reconnect"], true);
         assert_eq!(json["force_https"], true);
+        // webserver_log must reach the JSON (flag-visibility parity).
+        assert_eq!(json["webserver_log"], true);
 
         let config = ConfigView {
             port_range: "5000-6000".into(),

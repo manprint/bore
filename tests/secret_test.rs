@@ -648,6 +648,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
         ProviderMeta {
             notes: Some("prov note".into()),
             basic_auth: Some("u:p".into()),
+            auto_reconnect: false,
         },
         None,
     )

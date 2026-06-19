@@ -183,6 +183,7 @@ async fn admin_data_reflects_live_tunnels() -> Result<()> {
         ProviderMeta {
             notes: Some("hello-note".into()),
             basic_auth: None,
+            auto_reconnect: false,
         },
         None,
     )
@@ -493,6 +494,7 @@ fn t_views_serialize_stable() {
         force_https: false,
         carriers: 1,
         auto_reconnect: false,
+        webserver_log: false,
         udp: false,
         overlay: None,
         vpn_direct: false,
@@ -527,6 +529,15 @@ fn t_views_serialize_stable() {
     // VhostView.
     let vhost = VhostView {
         subdomain: "example".into(),
+        peer: "192.0.2.3:54323".into(),
+        notes: Some("vhost note".into()),
+        basic_auth: false,
+        udp: false,
+        auto_reconnect: false,
+        webserver_log: false,
+        uptime_secs: 75,
+        relay_tx_bytes: 256,
+        relay_rx_bytes: 512,
         active: 2,
         carriers: 1,
         direct_stream_opens: 10,
@@ -657,6 +668,7 @@ fn t_vpn_panel_groups_and_fields() {
             force_https: false,
             carriers: 4,
             auto_reconnect: false,
+            webserver_log: false,
             udp: false,
             vpn_relay_only: false,
             vpn_pin_mtu: false,
@@ -830,6 +842,45 @@ async fn t_api_tunnels_shape() -> Result<()> {
         "summary must have control_port"
     );
     assert!(resp.contains("\"version\""), "summary must have version");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_api_vhost_shape() -> Result<()> {
+    // (T-VHOST-PARITY) The vhost endpoint serves a JSON array (empty when no
+    // providers) — the parity fields are asserted in the admin_views/admin_api
+    // unit tests; this confirms the endpoint is wired and token-guarded.
+    const PORT: u16 = 17979;
+    let _g = SERIAL_GUARD.lock().await;
+    wait_port(PORT, false).await;
+
+    let mut server = Server::new(10000..=65535, None);
+    server.set_control_port(PORT);
+    server.set_admin_token(Some(TOKEN.into()));
+    tokio::spawn(server.listen());
+    wait_port(PORT, true).await;
+
+    // Unauthorized request is rejected.
+    let s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let resp = http_get(s, "/admin/api/v1/vhost", None).await?;
+    assert!(
+        !resp.starts_with("HTTP/1.1 200"),
+        "vhost endpoint must require the admin token"
+    );
+
+    // Authorized request returns a JSON array.
+    let s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let resp = http_get(s, "/admin/api/v1/vhost", Some(TOKEN)).await?;
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "response: {}",
+        &resp[..100.min(resp.len())]
+    );
+    assert!(
+        resp.contains("["),
+        "vhost JSON must be an array (even if empty)"
+    );
 
     Ok(())
 }

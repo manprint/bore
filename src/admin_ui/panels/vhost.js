@@ -1,8 +1,15 @@
 /**
  * Vhost panel: vhost providers table.
+ *
+ * Structurally identical to the Tunnels panel (same columns/logic): `Subdomain`
+ * takes the place of `Port`, flags render through the SHARED `flagBadges` helper,
+ * and the row-click detail modal shows every field. Two vhost-only trailing
+ * columns are retained — `Direct Opens` and a `Headers` count badge — while the
+ * full header pairs / direct pool live in the modal (see
+ * docs/frontend/ADMIN_VHOST_PARITY_PLAN.md).
  */
 
-import { table, badge, escapeHtml } from '../ui.js';
+import { table, badge, notesCell, fmtBytes, fmtDuration, escapeHtml, flagBadges, badgeCell } from '../ui.js';
 import { DEFAULT_REFRESH_MS } from '../poller.js';
 import { openModal, detailRows } from '../modal.js';
 
@@ -25,34 +32,29 @@ export default {
         }
 
         const rows = data.map(vhost => {
-            const badges = [];
-            if (vhost.tls) badges.push(badge('TLS', 'primary'));
-
-            const badgeCell = document.createElement('span');
-            badges.forEach((b, i) => {
-                if (i > 0) badgeCell.appendChild(document.createTextNode(' '));
-                badgeCell.appendChild(b);
-            });
-
-            // Header count badge (show total request + response headers)
+            // Header count badge (vhost-only): total request + response headers.
             const reqCount = vhost.request_headers ? vhost.request_headers.length : 0;
             const respCount = vhost.response_headers ? vhost.response_headers.length : 0;
             const headerCountBadge = badge(`${reqCount} req / ${respCount} resp`, 'info');
 
             const row = {
                 'Subdomain': escapeHtml(vhost.subdomain ?? 'N/A'),
+                'Peer': escapeHtml(vhost.peer ?? 'N/A'),
+                'Flags': badgeCell(flagBadges(vhost)),
                 'Connections': escapeHtml(String(vhost.active ?? 0)),
-                'Carriers': escapeHtml(String(vhost.carriers ?? 0)),
+                'Uptime': escapeHtml(fmtDuration(vhost.uptime_secs)),
+                'TX': escapeHtml(fmtBytes(vhost.relay_tx_bytes)),
+                'RX': escapeHtml(fmtBytes(vhost.relay_rx_bytes)),
+                'Notes': notesCell(vhost.notes, 40),
                 'Direct Opens': escapeHtml(String(vhost.direct_stream_opens ?? 0)),
                 'Headers': headerCountBadge,
-                'TLS': badgeCell,
                 _entry: vhost
             };
             return row;
         });
 
         const tbl = table(
-            ['Subdomain', 'Connections', 'Carriers', 'Direct Opens', 'Headers', 'TLS'],
+            ['Subdomain', 'Peer', 'Flags', 'Connections', 'Uptime', 'TX', 'RX', 'Notes', 'Direct Opens', 'Headers'],
             rows
         );
 
@@ -63,6 +65,7 @@ export default {
             trList.forEach((tr, idx) => {
                 tr.style.cursor = 'pointer';
                 tr.addEventListener('click', (e) => {
+                    // Don't open modal if click was on a nested expander (notes cell)
                     if (e.target.closest('.notes-cell')) return;
                     const vhost = rows[idx]._entry;
                     openModal(`Vhost ${vhost.subdomain}`, detailRows(vhost));

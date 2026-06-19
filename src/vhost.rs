@@ -4,11 +4,9 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
-#[cfg(feature = "udp")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use dashmap::mapref::entry::Entry;
@@ -355,8 +353,29 @@ pub struct VhostEntry {
     /// Live count of connections currently proxied through this vhost subdomain.
     pub active: Arc<AtomicUsize>,
     /// Whether this provider requested access logging with real caller IP forwarding.
-    /// (Phase 3/4: wired from HelloVhost.webserver_log field; defaults false for now.)
+    /// Wired from `HelloVhost.webserver_log`.
     pub webserver_log: bool,
+    // ── Execution-info fields (parity with the public `TunnelView`) ───────────
+    // These let the admin Vhost section present the same columns as Tunnels.
+    // `VhostEntry` is self-sufficient here (no admin-registry join, see
+    // docs/frontend/ADMIN_VHOST_PARITY_PLAN.md).
+    /// Remote address of the provider's control connection.
+    pub peer: SocketAddr,
+    /// When this provider registered (for an uptime readout).
+    pub since: Instant,
+    /// Free-form operator note (`--notes`).
+    pub notes: Option<String>,
+    /// Whether the provider enforces HTTP Basic auth itself (display only).
+    pub basic_auth: bool,
+    /// Whether the provider requested the QUIC direct data path (`--udp`).
+    pub udp: bool,
+    /// Whether the provider runs with `--auto-reconnect` (display only).
+    pub auto_reconnect: bool,
+    /// Relay bytes sent toward the provider (server→provider), summed off the hot
+    /// path from the totals `copy_bidirectional_with_sizes` returns.
+    pub relay_tx_bytes: Arc<AtomicU64>,
+    /// Relay bytes received from the provider (provider→server).
+    pub relay_rx_bytes: Arc<AtomicU64>,
 }
 
 /// Upper bound on QUIC direct connections pooled per vhost subdomain. The provider
@@ -521,6 +540,7 @@ pub async fn serve_vhost_provider(
     basic_auth: bool,
     udp: bool,
     webserver_log: bool,
+    auto_reconnect: bool,
     pending_carriers: PendingCarriers,
     max_carriers: u16,
     carriers: u16,
@@ -567,6 +587,14 @@ pub async fn serve_vhost_provider(
                 direct_stream_opens: AtomicU64::new(0),
                 active: Arc::new(AtomicUsize::new(0)),
                 webserver_log,
+                peer,
+                since: Instant::now(),
+                notes: notes.clone(),
+                basic_auth,
+                udp,
+                auto_reconnect,
+                relay_tx_bytes: Arc::new(AtomicU64::new(0)),
+                relay_rx_bytes: Arc::new(AtomicU64::new(0)),
             });
             slot.insert(entry);
             pool
@@ -592,8 +620,9 @@ pub async fn serve_vhost_provider(
         https: false,
         force_https: false,
         carriers: 0,
-        auto_reconnect: false,
-        udp: false,
+        auto_reconnect,
+        webserver_log,
+        udp,
         vpn_relay_only: false,
         vpn_pin_mtu: false,
         vpn_mtu: None,
@@ -847,6 +876,10 @@ pub async fn relay_vhost(
         let (rx_bytes, tx_bytes) = result;
         grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
         gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
+        // Per-subdomain relay counters (shown on /admin/status#/vhost), mirroring
+        // the global/server totals above. Off the hot path (once per closed conn).
+        entry.relay_rx_bytes.fetch_add(rx_bytes, Ordering::Relaxed);
+        entry.relay_tx_bytes.fetch_add(tx_bytes, Ordering::Relaxed);
         return Ok(());
     }
 

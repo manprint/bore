@@ -41,6 +41,10 @@ pub struct ProviderMeta {
     /// HTTP Basic auth credentials (`"user:pass"`) the provider enforces itself on
     /// each proxied HTTP connection (both relay and direct). `None` = no auth.
     pub basic_auth: Option<String>,
+    /// Whether the provider runs with `--auto-reconnect`. Display-only; forwarded
+    /// to the server's admin page (via `HelloVhost`) so the Vhost section can show
+    /// it, matching the public-tunnel `TunnelOptions.auto_reconnect` field.
+    pub auto_reconnect: bool,
 }
 
 /// State structure for the client.
@@ -551,6 +555,7 @@ impl Client {
                 carriers,
                 udp,
                 webserver_log: access_logger.is_some(),
+                auto_reconnect: meta.auto_reconnect,
             })
             .await?;
 

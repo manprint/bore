@@ -704,6 +704,7 @@ pub async fn serve_vpn_listener(
         // value once a connector pairs (1:1) — see the pair-receive block below.
         carriers,
         auto_reconnect: false,
+        webserver_log: false,
         udp: false,
         vpn_relay_only: relay_only,
         vpn_pin_mtu: pin_mtu,
@@ -1125,6 +1126,7 @@ pub async fn serve_vpn_connector(
             force_https: false,
             carriers: effective_carriers,
             auto_reconnect: false,
+            webserver_log: false,
             udp: false,
             vpn_relay_only: relay_only,
             vpn_pin_mtu: pin_mtu,
@@ -1439,6 +1441,7 @@ pub async fn serve_vpn_connector(
         force_https: false,
         carriers: effective_carriers,
         auto_reconnect: false,
+        webserver_log: false,
         udp: false,
         vpn_relay_only: relay_only,
         vpn_pin_mtu: pin_mtu,

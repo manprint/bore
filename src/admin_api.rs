@@ -77,6 +77,7 @@ pub fn tunnels(server: &Server) -> Vec<TunnelView> {
             force_https: e.force_https,
             carriers: e.carriers,
             auto_reconnect: e.auto_reconnect,
+            webserver_log: e.webserver_log,
             udp: e.udp,
             overlay: e.overlay,
             vpn_direct: e.vpn_direct,
@@ -178,6 +179,15 @@ pub fn vhost(server: &Server) -> Vec<VhostView> {
 
         views.push(VhostView {
             subdomain,
+            peer: vhost_entry.peer.to_string(),
+            notes: vhost_entry.notes.clone(),
+            basic_auth: vhost_entry.basic_auth,
+            udp: vhost_entry.udp,
+            auto_reconnect: vhost_entry.auto_reconnect,
+            webserver_log: vhost_entry.webserver_log,
+            uptime_secs: vhost_entry.since.elapsed().as_secs(),
+            relay_tx_bytes: vhost_entry.relay_tx_bytes.load(Ordering::Relaxed),
+            relay_rx_bytes: vhost_entry.relay_rx_bytes.load(Ordering::Relaxed),
             active: vhost_entry.active.load(Ordering::Relaxed),
             carriers: vhost_entry.pool.len() as u16,
             direct_stream_opens,
@@ -637,6 +647,7 @@ mod tests {
             force_https: false,
             carriers: 1,
             auto_reconnect: false,
+            webserver_log: false,
             udp: false,
             vpn_relay_only: false,
             vpn_pin_mtu: false,
@@ -658,6 +669,7 @@ mod tests {
             force_https: false,
             carriers: 1,
             auto_reconnect: false,
+            webserver_log: false,
             udp: false,
             vpn_relay_only: false,
             vpn_pin_mtu: false,
@@ -679,6 +691,7 @@ mod tests {
             force_https: false,
             carriers: 1,
             auto_reconnect: false,
+            webserver_log: false,
             udp: false,
             vpn_relay_only: false,
             vpn_pin_mtu: false,
@@ -855,6 +868,15 @@ mod tests {
         // T-VHH: test VhostView includes request/response header pairs.
         let view = VhostView {
             subdomain: "test".into(),
+            peer: "10.0.0.1:5555".into(),
+            notes: Some("edge".into()),
+            basic_auth: true,
+            udp: true,
+            auto_reconnect: true,
+            webserver_log: true,
+            uptime_secs: 120,
+            relay_tx_bytes: 4096,
+            relay_rx_bytes: 8192,
             active: 5,
             carriers: 2,
             direct_stream_opens: 10,
@@ -870,5 +892,55 @@ mod tests {
         assert!(json["response_header_pairs"].is_array());
         assert!(json["direct_pool"].is_number());
         assert_eq!(json["direct_pool"].as_u64(), Some(3));
+    }
+
+    #[test]
+    fn t_vhost_parity_fields() {
+        // VhostView must carry the same execution-info fields as TunnelView so the
+        // dashboard Vhost section can mirror the Tunnels columns.
+        let view = VhostView {
+            subdomain: "demo".into(),
+            peer: "203.0.113.7:443".into(),
+            notes: Some("prod edge".into()),
+            basic_auth: true,
+            udp: true,
+            auto_reconnect: true,
+            webserver_log: true,
+            uptime_secs: 600,
+            relay_tx_bytes: 1024,
+            relay_rx_bytes: 2048,
+            active: 3,
+            carriers: 4,
+            direct_stream_opens: 7,
+            request_headers: vec![],
+            response_headers: vec![],
+            request_header_pairs: vec![],
+            response_header_pairs: vec![],
+            direct_pool: 2,
+            tls: false,
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        for key in [
+            "peer",
+            "notes",
+            "basic_auth",
+            "udp",
+            "auto_reconnect",
+            "webserver_log",
+            "uptime_secs",
+            "relay_tx_bytes",
+            "relay_rx_bytes",
+            "active",
+            "carriers",
+        ] {
+            assert!(
+                json.get(key).is_some(),
+                "VhostView JSON missing parity field `{key}`"
+            );
+        }
+        assert_eq!(json["peer"], "203.0.113.7:443");
+        assert_eq!(json["webserver_log"], true);
+        assert_eq!(json["relay_tx_bytes"], 1024);
+        assert_eq!(json["uptime_secs"], 600);
     }
 }

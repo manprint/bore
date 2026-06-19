@@ -756,6 +756,12 @@ pub enum ClientMessage {
         /// `#[serde(default)]` keeps the wire format backward-compatible.
         #[serde(default)]
         webserver_log: bool,
+        /// Whether the provider runs with `--auto-reconnect` (client-side reconnect
+        /// loop). Sent purely so the admin status page can show it; the server takes
+        /// no action on it. `#[serde(default)]` keeps the wire format
+        /// backward-compatible (an old client omits it ⇒ reads as `false`).
+        #[serde(default)]
+        auto_reconnect: bool,
     },
 
     /// Ask the server to issue a fresh vhost-UDP nonce so the provider can
@@ -1099,9 +1105,10 @@ impl ControlFrameSummary for ClientMessage {
                 carriers,
                 udp,
                 webserver_log,
+                auto_reconnect,
             } => {
                 format!(
-                    "HelloVhost {{ subdomain={}, client_id={}, notes={}, basic_auth={}, carriers={}, udp={}, webserver_log={} }}",
+                    "HelloVhost {{ subdomain={}, client_id={}, notes={}, basic_auth={}, carriers={}, udp={}, webserver_log={}, auto_reconnect={} }}",
                     subdomain,
                     client_id,
                     if notes.is_some() { "present" } else { "none" },
@@ -1109,6 +1116,7 @@ impl ControlFrameSummary for ClientMessage {
                     carriers,
                     if *udp { "on" } else { "off" },
                     if *webserver_log { "on" } else { "off" },
+                    if *auto_reconnect { "on" } else { "off" },
                 )
             }
             ClientMessage::VhostUdpRenew { subdomain } => {
@@ -1499,6 +1507,7 @@ mod tests {
                 carriers,
                 udp,
                 webserver_log,
+                auto_reconnect,
             } => {
                 assert_eq!(subdomain, "myapp");
                 assert_eq!(client_id, "client-1");
@@ -1507,6 +1516,8 @@ mod tests {
                 assert_eq!(carriers, 2);
                 assert!(!udp);
                 assert!(!webserver_log);
+                // D6: old wire format without auto_reconnect ⇒ serde default false.
+                assert!(!auto_reconnect);
             }
             other => panic!("unexpected message: {other:?}"),
         }
@@ -1606,6 +1617,7 @@ fn hello_vhost_round_trips_and_fits_frame() {
         carriers: 1,
         udp: false,
         webserver_log: false,
+        auto_reconnect: true,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(
@@ -1622,6 +1634,7 @@ fn hello_vhost_round_trips_and_fits_frame() {
             carriers,
             udp,
             webserver_log,
+            auto_reconnect,
         } => {
             assert_eq!(subdomain, "myapp");
             assert_eq!(client_id, "client-a");
@@ -1630,6 +1643,8 @@ fn hello_vhost_round_trips_and_fits_frame() {
             assert_eq!(carriers, 1);
             assert!(!udp);
             assert!(!webserver_log);
+            // D6: auto_reconnect round-trips on the wire.
+            assert!(auto_reconnect);
         }
         other => panic!("unexpected: {other:?}"),
     }

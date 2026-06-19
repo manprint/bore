@@ -1367,7 +1367,11 @@ async fn dispatch(command: Command) -> Result<()> {
                             "resolved UDP optimization settings",
                         );
                     }
-                    let meta = ProviderMeta { notes, basic_auth };
+                    let meta = ProviderMeta {
+                        notes,
+                        basic_auth,
+                        auto_reconnect,
+                    };
                     let connect = move || {
                         let (local_host, to, id, secret, stun_server, meta, access_logger) = (
                             local_host.clone(),
@@ -2025,6 +2029,7 @@ async fn dispatch(command: Command) -> Result<()> {
             let meta = bore_cli::client::ProviderMeta {
                 notes,
                 basic_auth: basic_auth.clone(),
+                auto_reconnect,
             };
 
             // Build access logger for vhost provider.

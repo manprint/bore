@@ -2,7 +2,7 @@
  * Secret panel: secret tunnels table.
  */
 
-import { table, badge, notesCell, fmtBytes, fmtDuration, escapeHtml } from '../ui.js';
+import { table, notesCell, fmtBytes, fmtDuration, escapeHtml, flagBadges, badgeCell } from '../ui.js';
 import { DEFAULT_REFRESH_MS } from '../poller.js';
 import { openModal, detailRows } from '../modal.js';
 
@@ -25,33 +25,23 @@ export default {
         }
 
         const rows = data.map(secret => {
-            const badges = [];
-            if (secret.udp) badges.push(badge('UDP', 'success'));
-            if (secret.basic_auth) badges.push(badge('Basic Auth', 'warning'));
-            if (secret.carriers > 1) badges.push(badge(`x${secret.carriers} carriers`, 'default'));
-
-            const badgeCell = document.createElement('span');
-            badges.forEach((b, i) => {
-                if (i > 0) badgeCell.appendChild(document.createTextNode(' '));
-                badgeCell.appendChild(b);
-            });
-
             const row = {
                 'Role': escapeHtml(secret.role ?? 'N/A'),
                 'Secret ID': escapeHtml(secret.secret_id ?? 'N/A'),
                 'Peer': escapeHtml(secret.peer ?? 'N/A'),
-                'Flags': badgeCell,
+                'Flags': badgeCell(flagBadges(secret)),
                 'Connections': escapeHtml(String(secret.active ?? 0)),
                 'Uptime': escapeHtml(fmtDuration(secret.uptime_secs)),
                 'TX': escapeHtml(fmtBytes(secret.relay_tx_bytes)),
                 'RX': escapeHtml(fmtBytes(secret.relay_rx_bytes)),
+                'Notes': notesCell(secret.notes, 40),
                 _entry: secret
             };
             return row;
         });
 
         const tbl = table(
-            ['Role', 'Secret ID', 'Peer', 'Flags', 'Connections', 'Uptime', 'TX', 'RX'],
+            ['Role', 'Secret ID', 'Peer', 'Flags', 'Connections', 'Uptime', 'TX', 'RX', 'Notes'],
             rows
         );
 

@@ -76,6 +76,19 @@ class HTMLElement {
             return '';
         }).join('');
     }
+    // Real-DOM serialization, modeled just enough for panels that build markup
+    // via `badge(...).outerHTML` (e.g. vpn.js). Includes class + attributes and
+    // the element's inner content (innerHTML, falling back to textContent).
+    get outerHTML() {
+        const tag = this.tagName.toLowerCase();
+        const cls = this.classList.toString();
+        const clsAttr = cls ? ` class="${cls}"` : '';
+        const attrs = Object.entries(this.attributes)
+            .map(([k, v]) => ` ${k}="${v}"`)
+            .join('');
+        const inner = this.innerHTML || this._text || '';
+        return `<${tag}${clsAttr}${attrs}>${inner}</${tag}>`;
+    }
     appendChild(node) {
         this.children.push(node);
         return node;

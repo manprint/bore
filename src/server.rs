@@ -1250,6 +1250,7 @@ impl Server {
                 carriers,
                 udp,
                 webserver_log,
+                auto_reconnect,
             }) => {
                 let Some(cfg) = self.vhost_config.clone() else {
                     warn!("vhost not configured on this server");
@@ -1271,6 +1272,7 @@ impl Server {
                     basic_auth,
                     udp,
                     webserver_log,
+                    auto_reconnect,
                     self.pending_carriers.clone(),
                     self.max_carriers,
                     carriers,
@@ -1527,6 +1529,7 @@ impl Server {
             force_https: opts.force_https,
             carriers: opts.carriers,
             auto_reconnect: opts.auto_reconnect,
+            webserver_log: opts.webserver_log,
             udp: opts.udp,
             vpn_relay_only: false,
             vpn_pin_mtu: false,
@@ -1732,7 +1735,8 @@ impl Server {
                         } else {
                             false
                         };
-                        let _ = used_direct;  // Silence unused variable warning for non-udp feature
+                        #[cfg(feature = "udp")]
+                        let _ = used_direct; // Silence unused variable warning (udp-only binding).
 
                         // Direct path was attempted but failed; count the fallback.
                         #[cfg(feature = "udp")]

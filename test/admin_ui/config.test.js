@@ -51,7 +51,7 @@ test('T-CFGNULL: null udp_socket_recv_buffer renders as "auto (OS default)"', as
     assert.ok(foundAutoLabel, 'udp_socket_recv_buffer row found and checked');
 });
 
-test('T-CFGNULL: numeric buffer values render as strings', async () => {
+test('T-CFGNULL: numeric buffer values render humanized in MiB', async () => {
     const data = {
         udp_socket_send_buffer: 16777216,
         control_port: 7835,
@@ -65,7 +65,9 @@ test('T-CFGNULL: numeric buffer values render as strings', async () => {
     container.children.forEach(row => {
         if (row.children[0].textContent === 'udp_socket_send_buffer') {
             const valueText = row.children[1].textContent;
-            assert.equal(valueText, '16777216', 'numeric buffer rendered as string');
+            // config.js humanizes socket buffers to MiB (to match the sibling
+            // udp_*_window values), so 16777216 → "16 MiB".
+            assert.equal(valueText, '16 MiB', 'numeric buffer humanized to MiB');
             foundNumeric = true;
         }
     });

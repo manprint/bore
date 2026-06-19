@@ -1,17 +1,32 @@
 /**
- * T-VPNRENDER: VPN panel render test — verifies path badge, mode, uptime, and flags.
+ * T-VPNRENDER: VPN panel render test — verifies the grouped card structure
+ * (header with mode badge + per-side details), path/flags/uptime, and hub roster.
+ *
+ * The panel groups listener + connector(s) by link id; each side is a
+ * `.vpn-side` block inside `.vpn-link-sides`, and the mode badge lives in the
+ * `.vpn-link-header`. Role grouping keys on the backend's lowercase role
+ * strings ("vpnlistener"/"vpnconnector").
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import './dom-stub.js';
 import vpnPanel from '../../src/admin_ui/panels/vpn.js';
 
+function cardOf(el) {
+    const container = el.children[0];
+    assert.ok(container, 'container rendered');
+    const card = container.children[0];
+    assert.ok(card.classList.contains('vpn-link-card'), 'card has vpn-link-card class');
+    return card;
+}
+
 test('T-VPNRENDER: vpn panel renders path badge and mode with uptime', async () => {
     const data = {
         links: [
             {
                 id: 1,
-                role: 'Listener',
+                link_id: 'site-a',
+                role: 'vpnlistener',
                 peer: '192.168.1.100:50000',
                 overlay: '10.99.0.1/32',
                 advertised: ['10.0.0.0/8'],
@@ -35,28 +50,22 @@ test('T-VPNRENDER: vpn panel renders path badge and mode with uptime', async () 
     const el = document.createElement('div');
     await vpnPanel.render(el, data);
 
-    // Check that the container has the card
-    const container = el.children[0];
-    assert.ok(container, 'container rendered');
+    const card = cardOf(el);
 
-    const card = container.children[0];
-    assert.ok(card.classList.contains('vpn-link-card'), 'card has vpn-link-card class');
-
-    // Check header
+    // Header carries the link id + the mode badge.
     const header = card.children[0];
     assert.ok(header.classList.contains('vpn-link-header'), 'header has correct class');
+    assert.ok(header.innerHTML.includes('site-a'), 'link id in header');
+    assert.ok(header.innerHTML.includes('1:1'), 'mode badge in header');
 
-    // Check details section has path and mode
-    const details = card.children[1];
-    assert.ok(details.classList.contains('vpn-link-details'), 'details section present');
-
-    // Verify innerHTML contains the expected labels
-    assert.ok(details._html.includes('Path:'), 'Path label present');
-    assert.ok(details._html.includes('Mode:'), 'Mode label present');
-    assert.ok(details._html.includes('Uptime:'), 'Uptime label present');
-    assert.ok(details._html.includes('Direct'), 'Direct badge present');
-    assert.ok(details._html.includes('1:1'), 'mode keyword present');
-    assert.ok(details._html.includes('1h'), 'uptime formatting present');
+    // The side block carries path/uptime.
+    const body = card.children[1];
+    assert.ok(body.classList.contains('vpn-link-sides'), 'sides container present');
+    const side = body.children[0];
+    assert.ok(side.classList.contains('vpn-side'), 'side block present');
+    assert.ok(side.innerHTML.includes('Direct'), 'Direct path badge present');
+    assert.ok(side.innerHTML.includes('Uptime:'), 'Uptime label present');
+    assert.ok(side.innerHTML.includes('1h'), 'uptime formatting present');
 });
 
 test('T-VPNRENDER: vpn panel renders connector flags when set', async () => {
@@ -64,7 +73,8 @@ test('T-VPNRENDER: vpn panel renders connector flags when set', async () => {
         links: [
             {
                 id: 1,
-                role: 'Connector',
+                link_id: 'site-a',
+                role: 'vpnconnector',
                 peer: '10.0.0.1:50001',
                 overlay: '10.99.0.2/32',
                 advertised: ['192.168.0.0/24'],
@@ -89,15 +99,12 @@ test('T-VPNRENDER: vpn panel renders connector flags when set', async () => {
     const el = document.createElement('div');
     await vpnPanel.render(el, data);
 
-    const card = el.children[0].children[0];
-    const details = card.children[1];
-
-    // Check flags are present
-    assert.ok(details._html.includes('Flags:'), 'Flags section present when flags are set');
-    assert.ok(details._html.includes('Relay-Only'), 'relay_only flag rendered');
-    assert.ok(details._html.includes('Pin-MTU'), 'pin_mtu flag rendered');
-    assert.ok(details._html.includes('Forward-Accept'), 'forward_accept flag rendered');
-    assert.ok(details._html.includes('NAT-Masquerade'), 'nat_masquerade flag rendered');
+    const side = cardOf(el).children[1].children[0];
+    assert.ok(side.innerHTML.includes('Flags:'), 'Flags section present when flags are set');
+    assert.ok(side.innerHTML.includes('Relay-Only'), 'relay_only flag rendered');
+    assert.ok(side.innerHTML.includes('Pin-MTU'), 'pin_mtu flag rendered');
+    assert.ok(side.innerHTML.includes('Forward-Accept'), 'forward_accept flag rendered');
+    assert.ok(side.innerHTML.includes('NAT-Masquerade'), 'nat_masquerade flag rendered');
 });
 
 test('T-VPNRENDER: vpn panel omits flags section when all false', async () => {
@@ -105,7 +112,8 @@ test('T-VPNRENDER: vpn panel omits flags section when all false', async () => {
         links: [
             {
                 id: 1,
-                role: 'Connector',
+                link_id: 'site-a',
+                role: 'vpnconnector',
                 peer: '10.0.0.1:50001',
                 overlay: '10.99.0.2/32',
                 advertised: [],
@@ -130,11 +138,8 @@ test('T-VPNRENDER: vpn panel omits flags section when all false', async () => {
     const el = document.createElement('div');
     await vpnPanel.render(el, data);
 
-    const card = el.children[0].children[0];
-    const details = card.children[1];
-
-    // Flags section should NOT be present when no flags are set
-    assert.ok(!details._html.includes('Flags:'), 'Flags section omitted when all false');
+    const side = cardOf(el).children[1].children[0];
+    assert.ok(!side.innerHTML.includes('Flags:'), 'Flags section omitted when all false');
 });
 
 test('T-VPNRENDER: vpn panel handles hub mode', async () => {
@@ -142,7 +147,8 @@ test('T-VPNRENDER: vpn panel handles hub mode', async () => {
         links: [
             {
                 id: 1,
-                role: 'Listener',
+                link_id: 'hub-a',
+                role: 'vpnlistener',
                 peer: '192.168.1.100:50000',
                 overlay: '10.99.0.1/32',
                 advertised: [],
@@ -174,11 +180,12 @@ test('T-VPNRENDER: vpn panel handles hub mode', async () => {
     const el = document.createElement('div');
     await vpnPanel.render(el, data);
 
-    const card = el.children[0].children[0];
-    const details = card.children[1];
-
-    // Check mode shows "hub"
-    assert.ok(details._html.includes('hub'), 'hub mode rendered');
+    const card = cardOf(el);
+    // Mode badge shows "hub" in the header.
+    assert.ok(card.children[0].innerHTML.includes('hub'), 'hub mode rendered in header');
+    // Hub peer roster section is attached to the card.
+    const hubSection = card.children.find(c => c.classList && c.classList.contains('vpn-hub-section'));
+    assert.ok(hubSection, 'hub peer roster section present');
 });
 
 test('T-VPNRENDER: vpn panel handles missing path field (fallback to direct bool)', async () => {
@@ -186,7 +193,8 @@ test('T-VPNRENDER: vpn panel handles missing path field (fallback to direct bool
         links: [
             {
                 id: 1,
-                role: 'Connector',
+                link_id: 'site-a',
+                role: 'vpnconnector',
                 peer: '10.0.0.1:50001',
                 overlay: null,
                 advertised: [],
@@ -210,11 +218,9 @@ test('T-VPNRENDER: vpn panel handles missing path field (fallback to direct bool
     const el = document.createElement('div');
     await vpnPanel.render(el, data);
 
-    const card = el.children[0].children[0];
-    const details = card.children[1];
-
-    // Should render "Direct" even though path is missing
-    assert.ok(details._html.includes('Direct'), 'fallback to direct bool works');
+    const side = cardOf(el).children[1].children[0];
+    // Should render "Direct" even though path is missing (falls back to direct bool).
+    assert.ok(side.innerHTML.includes('Direct'), 'fallback to direct bool works');
 });
 
 test('T-VPNRENDER: vpn panel with empty links shows empty state', async () => {
@@ -223,5 +229,5 @@ test('T-VPNRENDER: vpn panel with empty links shows empty state', async () => {
     const el = document.createElement('div');
     await vpnPanel.render(el, data);
 
-    assert.ok(el._html.includes('No VPN links active'), 'empty state message shown');
+    assert.ok(el.innerHTML.includes('No VPN links active'), 'empty state message shown');
 });

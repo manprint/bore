@@ -64,6 +64,10 @@ pub struct Entry {
     /// Whether the client runs with `--auto-reconnect` (client-side reconnect
     /// loop; informational, sent over the wire via `TunnelOptions`).
     pub auto_reconnect: bool,
+    /// Whether the client requested HTTP access logging (`--webserver-log`),
+    /// sent over the wire via `TunnelOptions` (public) / `HelloVhost` (vhost).
+    /// Informational; the server takes no action on it.
+    pub webserver_log: bool,
     /// When the connection registered (for an uptime readout).
     pub since: Instant,
     /// Provider: registered as UDP-capable. Consumer: requested a direct path.
@@ -121,6 +125,8 @@ pub struct NewEntry {
     pub carriers: u16,
     /// See [`Entry::auto_reconnect`].
     pub auto_reconnect: bool,
+    /// See [`Entry::webserver_log`].
+    pub webserver_log: bool,
     /// Initial value of [`Entry::udp`].
     pub udp: bool,
     /// See [`Entry::vpn_relay_only`].
@@ -166,6 +172,8 @@ pub struct EntryView {
     pub carriers: u16,
     /// See [`Entry::auto_reconnect`].
     pub auto_reconnect: bool,
+    /// See [`Entry::webserver_log`].
+    pub webserver_log: bool,
     /// See [`Entry::udp`].
     pub udp: bool,
     /// Seconds since the connection registered.
@@ -236,6 +244,7 @@ impl AdminRegistry {
             force_https: new.force_https,
             carriers: AtomicU16::new(new.carriers),
             auto_reconnect: new.auto_reconnect,
+            webserver_log: new.webserver_log,
             since: Instant::now(),
             udp: AtomicBool::new(new.udp),
             active: Arc::new(AtomicUsize::new(0)),
@@ -281,6 +290,7 @@ impl AdminRegistry {
                     force_https: entry.force_https,
                     carriers: entry.carriers.load(Ordering::Relaxed),
                     auto_reconnect: entry.auto_reconnect,
+                    webserver_log: entry.webserver_log,
                     udp: entry.udp.load(Ordering::Relaxed),
                     uptime_secs: entry.since.elapsed().as_secs(),
                     active: entry.active.load(Ordering::Relaxed),
@@ -407,6 +417,7 @@ mod tests {
             force_https: false,
             carriers: 0,
             auto_reconnect: false,
+            webserver_log: false,
             udp: false,
             vpn_relay_only: false,
             vpn_pin_mtu: false,
@@ -485,6 +496,21 @@ mod tests {
         let view = &reg.snapshot()[0];
         assert_eq!(view.carriers, 4);
         assert!(view.auto_reconnect);
+    }
+
+    #[test]
+    fn webserver_log_in_snapshot() {
+        // webserver_log (from TunnelOptions / HelloVhost) must survive into the
+        // admin snapshot so the dashboard can show the access-logging flag.
+        let reg = AdminRegistry::default();
+        let mut new = sample(Role::Public);
+        new.webserver_log = true;
+        let _handle = reg.register(new);
+        assert!(reg.snapshot()[0].webserver_log);
+        // default stays false
+        let reg2 = AdminRegistry::default();
+        let _h2 = reg2.register(sample(Role::SecretProvider));
+        assert!(!reg2.snapshot()[0].webserver_log);
     }
 
     #[test]

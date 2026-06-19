@@ -27,7 +27,10 @@ function renderSide(link) {
     side.className = 'vpn-side';
     side.style.cursor = 'pointer';
 
-    const pathBadge = link.path === 'direct'
+    // Prefer the explicit `path` string; fall back to the `direct` bool when the
+    // backend omits it (defensive — the server always sends `path` today).
+    const isDirect = link.path ? link.path === 'direct' : !!link.direct;
+    const pathBadge = isDirect
         ? badge('Direct', 'success')
         : badge('Relay', 'warning');
 

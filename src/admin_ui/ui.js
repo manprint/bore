@@ -72,6 +72,44 @@ export function badge(text, kind = 'default') {
 }
 
 /**
+ * Build the flag-badge specs for ANY live-tunnel entry (public, secret, vhost).
+ * Pure (no DOM) so it is unit-testable; callers map specs through `badgeCell`.
+ *
+ * This is the SINGLE source of flag badges across the Tunnels/Secret/Vhost
+ * sections (consistency by construction): each section passes its entry and gets
+ * the same labels/kinds for the same flags. A flag absent from an entry simply
+ * yields no badge. Both `https` (public) and `tls` (vhost) map to a TLS-class
+ * badge so the concept reads identically across sections.
+ *
+ * Returns: [{ label: string, kind: string }, ...] using only CSS-defined kinds.
+ */
+export function flagBadges(e) {
+    const b = [];
+    if (e.https) b.push({ label: 'HTTPS', kind: 'primary' });
+    if (e.force_https) b.push({ label: 'Force-HTTPS', kind: 'primary' });
+    if (e.tls) b.push({ label: 'TLS', kind: 'primary' });
+    if (e.basic_auth) b.push({ label: 'Basic Auth', kind: 'warning' });
+    if (e.udp) b.push({ label: 'UDP', kind: 'success' });
+    if (e.carriers > 1) b.push({ label: `x${e.carriers} carriers`, kind: 'default' });
+    if (e.auto_reconnect) b.push({ label: 'Auto-reconnect', kind: 'success' });
+    if (e.webserver_log) b.push({ label: 'Weblog', kind: 'default' });
+    return b;
+}
+
+/**
+ * Render an array of badge specs ({label, kind}) into a single span of
+ * space-separated badges (used for the "Flags" column in every section).
+ */
+export function badgeCell(specs) {
+    const cell = document.createElement('span');
+    specs.forEach((spec, i) => {
+        if (i > 0) cell.appendChild(document.createTextNode(' '));
+        cell.appendChild(badge(spec.label, spec.kind));
+    });
+    return cell;
+}
+
+/**
  * Render a table from headers and rows.
  * rows: array of objects with keys matching headers.
  */

@@ -3,13 +3,14 @@
  */
 
 import { fmtDuration, escapeHtml } from '../ui.js';
+import { DEFAULT_REFRESH_MS } from '../poller.js';
 
 export default {
     id: 'overview',
     title: 'Overview',
     route: 'overview',
     endpoint: '/admin/api/v1/summary',
-    refreshMs: 5000,
+    refreshMs: DEFAULT_REFRESH_MS,
 
     async render(el, data) {
         if (!data) {

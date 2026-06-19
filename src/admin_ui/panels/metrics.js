@@ -3,6 +3,7 @@
  */
 
 import { fmtDuration, fmtBytes, escapeHtml } from '../ui.js';
+import { DEFAULT_REFRESH_MS } from '../poller.js';
 
 /**
  * BUG-5: the `bandwidth_*` fields are CUMULATIVE totals, not a rate. Derive a
@@ -27,7 +28,7 @@ export default {
     title: 'Metrics',
     route: 'metrics',
     endpoint: '/admin/api/v1/metrics',
-    refreshMs: 3000,
+    refreshMs: DEFAULT_REFRESH_MS,
 
     async render(el, data) {
         if (!data || typeof data !== 'object') {
@@ -118,28 +119,36 @@ export default {
         const countsList = document.createElement('div');
         countsList.className = 'counts-list';
 
-        const tunnelsCount = document.createElement('div');
-        tunnelsCount.className = 'count-row';
-        tunnelsCount.innerHTML = `
-            <span><strong>Live Tunnels:</strong></span>
-            <span>${escapeHtml(String(data.live_tunnels ?? 0))}</span>
+        const publicCount = document.createElement('div');
+        publicCount.className = 'count-row';
+        publicCount.innerHTML = `
+            <span><strong>Public Tunnels:</strong></span>
+            <span>${escapeHtml(String(data.public_tunnels ?? 0))}</span>
         `;
-        countsList.appendChild(tunnelsCount);
+        countsList.appendChild(publicCount);
+
+        const secretCount = document.createElement('div');
+        secretCount.className = 'count-row';
+        secretCount.innerHTML = `
+            <span><strong>Secret Tunnels:</strong></span>
+            <span>${escapeHtml(String(data.secret_tunnels ?? 0))}</span>
+        `;
+        countsList.appendChild(secretCount);
 
         const vhostCount = document.createElement('div');
         vhostCount.className = 'count-row';
         vhostCount.innerHTML = `
-            <span><strong>Live Vhost:</strong></span>
-            <span>${escapeHtml(String(data.live_vhost ?? 0))}</span>
+            <span><strong>Vhost Domains:</strong></span>
+            <span>${escapeHtml(String(data.vhost_domains ?? 0))}</span>
         `;
         countsList.appendChild(vhostCount);
 
-        if (data.live_vpn_links !== undefined) {
+        if (data.vpn_links !== undefined) {
             const vpnCount = document.createElement('div');
             vpnCount.className = 'count-row';
             vpnCount.innerHTML = `
-                <span><strong>Live VPN Links:</strong></span>
-                <span>${escapeHtml(String(data.live_vpn_links))}</span>
+                <span><strong>VPN Links:</strong></span>
+                <span>${escapeHtml(String(data.vpn_links))}</span>
             `;
             countsList.appendChild(vpnCount);
         }

@@ -24,13 +24,15 @@ pub struct SummaryView {
     pub vhost_enabled: bool,
     /// Seconds since server started.
     pub uptime_secs: u64,
-    /// Number of live public tunnels.
-    pub live_tunnels: usize,
-    /// Number of live vhost providers.
-    pub live_vhost: usize,
+    /// Number of live public tunnels (Role::Public).
+    pub public_tunnels: usize,
+    /// Number of live secret tunnels (Role::SecretProvider + Role::SecretConsumer).
+    pub secret_tunnels: usize,
+    /// Number of live vhost domains.
+    pub vhost_domains: usize,
     /// Number of live VPN links (cfg vpn).
     #[cfg(feature = "vpn")]
-    pub live_vpn_links: usize,
+    pub vpn_links: usize,
 }
 
 /// Public tunnel entry (role=Public).
@@ -81,6 +83,8 @@ pub struct SecretView {
     pub peer: String,
     /// Secret tunnel id.
     pub secret_id: Option<String>,
+    /// Operator notes.
+    pub notes: Option<String>,
     /// HTTP Basic auth enforced.
     pub basic_auth: bool,
     /// Number of parallel TCP carrier connections (1 = single-connection path).
@@ -112,6 +116,12 @@ pub struct VhostView {
     pub request_headers: Vec<String>,
     /// Injected response-header names (sanitized, no sensitive values).
     pub response_headers: Vec<String>,
+    /// Request header key-value pairs.
+    pub request_header_pairs: Vec<(String, String)>,
+    /// Response header key-value pairs.
+    pub response_header_pairs: Vec<(String, String)>,
+    /// Size of the direct QUIC connection pool.
+    pub direct_pool: usize,
     /// TLS termination.
     pub tls: bool,
 }
@@ -204,6 +214,18 @@ pub struct ConfigView {
     pub udp_socket_send_buffer: Option<usize>,
     /// UDP socket receive buffer size.
     pub udp_socket_recv_buffer: Option<usize>,
+    /// UDP stream receive window (human string, e.g., "16MiB").
+    pub udp_stream_receive_window: String,
+    /// UDP connection receive window (human string, e.g., "16MiB").
+    pub udp_connection_receive_window: String,
+    /// UDP send window (human string, e.g., "64MiB").
+    pub udp_send_window: String,
+    /// Max native QUIC bidi streams the server allows.
+    pub udp_max_streams: u32,
+    /// Bind domain for control/tunnel endpoints.
+    pub bind_domain: Option<String>,
+    /// HSTS header value for HTTPS control port.
+    pub control_hsts: String,
     /// VPN enabled.
     #[cfg(feature = "vpn")]
     pub vpn_enabled: bool,
@@ -216,6 +238,9 @@ pub struct ConfigView {
     /// Overlay subnet prefix per hub.
     #[cfg(feature = "vpn")]
     pub vpn_hub_prefix: u8,
+    /// VPN UDP hole-punch timeout in seconds.
+    #[cfg(feature = "vpn")]
+    pub vpn_punch_timeout: Option<u64>,
     /// Vhost reverse-proxy enabled.
     pub vhost_enabled: bool,
     /// Vhost base domain.
@@ -224,6 +249,10 @@ pub struct ConfigView {
     pub vhost_http_port: Option<u16>,
     /// Vhost HTTPS port.
     pub vhost_https_port: Option<u16>,
+    /// Vhost QUIC port (UDP direct path).
+    pub vhost_quic_port: Option<u16>,
+    /// Vhost frontend mode (http, https, both, redirect-https, auto).
+    pub vhost_mode: Option<String>,
     /// TLS enabled on control port.
     pub tls: bool,
 }
@@ -239,13 +268,15 @@ pub struct MetricsView {
     pub bandwidth_tx_bytes: u64,
     /// Cumulative bytes received (over all tunnels, all time).
     pub bandwidth_rx_bytes: u64,
-    /// Number of live public tunnels.
-    pub live_tunnels: usize,
-    /// Number of live vhost providers.
-    pub live_vhost: usize,
+    /// Number of live public tunnels (Role::Public).
+    pub public_tunnels: usize,
+    /// Number of live secret tunnels (Role::SecretProvider + Role::SecretConsumer).
+    pub secret_tunnels: usize,
+    /// Number of live vhost domains.
+    pub vhost_domains: usize,
     /// Number of live VPN links (cfg vpn).
     #[cfg(feature = "vpn")]
-    pub live_vpn_links: usize,
+    pub vpn_links: usize,
 }
 
 #[cfg(test)]
@@ -263,17 +294,25 @@ mod tests {
             vpn_enabled: false,
             vhost_enabled: true,
             uptime_secs: 42,
-            live_tunnels: 1,
-            live_vhost: 2,
+            public_tunnels: 1,
+            secret_tunnels: 2,
+            vhost_domains: 2,
             #[cfg(feature = "vpn")]
-            live_vpn_links: 0,
+            vpn_links: 0,
         };
         let json = serde_json::to_value(&summary).unwrap();
         assert!(json["version"].is_string());
         assert!(json["control_port"].is_number());
         assert!(json["tls"].is_boolean());
         assert!(json["uptime_secs"].is_number());
-        assert!(json["live_tunnels"].is_number());
+        assert!(json["public_tunnels"].is_number());
+        assert!(json["secret_tunnels"].is_number());
+        assert!(json["vhost_domains"].is_number());
+        // Verify no legacy live_* fields
+        assert!(json["live_tunnels"].is_null());
+        assert!(json["live_vhost"].is_null());
+        #[cfg(feature = "vpn")]
+        assert!(json["live_vpn_links"].is_null());
 
         let tunnel = TunnelView {
             id: 1,
@@ -311,6 +350,12 @@ mod tests {
             udp: false,
             udp_socket_send_buffer: None,
             udp_socket_recv_buffer: None,
+            udp_stream_receive_window: "16MiB".into(),
+            udp_connection_receive_window: "16MiB".into(),
+            udp_send_window: "64MiB".into(),
+            udp_max_streams: 4096,
+            bind_domain: None,
+            control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]
             vpn_enabled: false,
             #[cfg(feature = "vpn")]
@@ -319,10 +364,14 @@ mod tests {
             vpn_max_links: 100,
             #[cfg(feature = "vpn")]
             vpn_hub_prefix: 24,
+            #[cfg(feature = "vpn")]
+            vpn_punch_timeout: Some(10),
             vhost_enabled: false,
             vhost_base_domain: None,
             vhost_http_port: None,
             vhost_https_port: None,
+            vhost_quic_port: None,
+            vhost_mode: None,
             tls: false,
         };
         let json = serde_json::to_value(&config).unwrap();

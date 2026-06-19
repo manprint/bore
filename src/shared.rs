@@ -89,7 +89,7 @@ pub fn proxy_buffer_size() -> usize {
 /// Parse a byte size with an optional unit suffix (`B`/`KB`/`MB`/`GB` decimal,
 /// `KiB`/`MiB`/`GiB` binary). Returns `None` for empty, non-numeric, or
 /// overflowing input. Shared shape with the server's `--udp-*` size parsing.
-fn parse_size_bytes(value: &str) -> Option<u64> {
+pub fn parse_size_bytes(value: &str) -> Option<u64> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;

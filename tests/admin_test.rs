@@ -376,6 +376,12 @@ fn t_views_serialize_stable() {
         udp: false,
         udp_socket_send_buffer: None,
         udp_socket_recv_buffer: None,
+        udp_stream_receive_window: "16MiB".into(),
+        udp_connection_receive_window: "16MiB".into(),
+        udp_send_window: "64MiB".into(),
+        udp_max_streams: 4096,
+        bind_domain: None,
+        control_hsts: "max-age=31536000".into(),
         #[cfg(feature = "vpn")]
         vpn_enabled: false,
         #[cfg(feature = "vpn")]
@@ -384,10 +390,14 @@ fn t_views_serialize_stable() {
         vpn_max_links: 32,
         #[cfg(feature = "vpn")]
         vpn_hub_prefix: 24,
+        #[cfg(feature = "vpn")]
+        vpn_punch_timeout: Some(10),
         vhost_enabled: false,
         vhost_base_domain: None,
         vhost_http_port: None,
         vhost_https_port: None,
+        vhost_quic_port: None,
+        vhost_mode: None,
         tls: false,
     };
 

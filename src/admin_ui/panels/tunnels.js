@@ -3,6 +3,8 @@
  */
 
 import { table, badge, notesCell, fmtBytes, fmtDuration, escapeHtml } from '../ui.js';
+import { DEFAULT_REFRESH_MS } from '../poller.js';
+import { openModal, detailRows } from '../modal.js';
 
 /**
  * Flag badges for a public tunnel (BUG-3). Pure (no DOM) so it is unit-testable;
@@ -25,7 +27,7 @@ export default {
     title: 'Tunnels',
     route: 'tunnels',
     endpoint: '/admin/api/v1/tunnels',
-    refreshMs: 5000,
+    refreshMs: DEFAULT_REFRESH_MS,
 
     async render(el, data) {
         if (!data || !Array.isArray(data)) {
@@ -45,7 +47,7 @@ export default {
                 badgeCell.appendChild(badge(spec.label, spec.kind));
             });
 
-            return {
+            const row = {
                 'Port': escapeHtml(String(tunnel.public_port ?? 'N/A')),
                 'Peer': escapeHtml(tunnel.peer ?? 'N/A'),
                 'Flags': badgeCell,
@@ -53,13 +55,32 @@ export default {
                 'Uptime': escapeHtml(fmtDuration(tunnel.uptime_secs)),
                 'TX': escapeHtml(fmtBytes(tunnel.relay_tx_bytes)),
                 'RX': escapeHtml(fmtBytes(tunnel.relay_rx_bytes)),
-                'Notes': notesCell(tunnel.notes, 40)
+                'Notes': notesCell(tunnel.notes, 40),
+                _entry: tunnel
             };
+            return row;
         });
 
-        el.appendChild(table(
+        const tbl = table(
             ['Port', 'Peer', 'Flags', 'Active', 'Uptime', 'TX', 'RX', 'Notes'],
             rows
-        ));
+        );
+
+        // Make rows clickable to open detail modal
+        const tbody = tbl.querySelector('tbody');
+        if (tbody) {
+            const trList = tbody.querySelectorAll('tr');
+            trList.forEach((tr, idx) => {
+                tr.style.cursor = 'pointer';
+                tr.addEventListener('click', (e) => {
+                    // Don't open modal if click was on a nested expander (notes cell)
+                    if (e.target.closest('.notes-cell')) return;
+                    const tunnel = rows[idx]._entry;
+                    openModal(`Tunnel ${tunnel.public_port}`, detailRows(tunnel));
+                });
+            });
+        }
+
+        el.appendChild(tbl);
     }
 };

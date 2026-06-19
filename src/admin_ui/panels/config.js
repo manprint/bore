@@ -32,7 +32,12 @@ export default {
             valEl.className = 'config-value';
 
             if (value === null) {
-                valEl.textContent = 'null';
+                // Render null with context-specific friendly labels
+                if (key === 'udp_socket_send_buffer' || key === 'udp_socket_recv_buffer') {
+                    valEl.textContent = 'auto (OS default)';
+                } else {
+                    valEl.textContent = '—';
+                }
             } else if (typeof value === 'boolean') {
                 valEl.textContent = escapeHtml(value ? 'true' : 'false');
             } else if (typeof value === 'number') {

@@ -3,13 +3,15 @@
  */
 
 import { badge, fmtBytes, escapeHtml } from '../ui.js';
+import { DEFAULT_REFRESH_MS } from '../poller.js';
+import { openModal, detailRows } from '../modal.js';
 
 export default {
     id: 'vpn',
     title: 'VPN',
     route: 'vpn',
     endpoint: '/admin/api/v1/vpn',
-    refreshMs: 5000,
+    refreshMs: DEFAULT_REFRESH_MS,
 
     async render(el, data) {
         // VPN endpoint returns { links: [...] }
@@ -45,11 +47,17 @@ export default {
 
             const header = document.createElement('div');
             header.className = 'vpn-link-header';
+            header.style.cursor = 'pointer';
             header.innerHTML = `
                 <strong>${escapeHtml(link.role)}</strong>
                 — Peer: ${escapeHtml(link.peer)}
                 | Overlay: ${escapeHtml(link.overlay || 'N/A')}
             `;
+            header.addEventListener('click', (e) => {
+                // Don't open modal if click is on the toggle button
+                if (e.target.closest('.vpn-hub-toggle')) return;
+                openModal(`VPN Link ${link.overlay || link.peer}`, detailRows(link));
+            });
 
             const details = document.createElement('div');
             details.className = 'vpn-link-details';

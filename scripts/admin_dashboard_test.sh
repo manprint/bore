@@ -46,10 +46,12 @@ fail() { echo "FAIL: $*"; FAIL=$((FAIL+1)); }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
 TMPDIR="/tmp/bore_admin_$$"
-SERVER_PID=""; CLIENT_PID=""; CLIENT2_PID=""; LOCAL_PID=""
+SERVER_PID=""; CLIENT_PID=""; CLIENT2_PID=""; LOCAL_PID=""; PROVIDER_PID=""; CONSUMER_PID=""
 
 cleanup() {
     [ -n "$LOCAL_PID" ] && kill "$LOCAL_PID" 2>/dev/null
+    [ -n "$CONSUMER_PID" ] && kill "$CONSUMER_PID" 2>/dev/null
+    [ -n "$PROVIDER_PID" ] && kill "$PROVIDER_PID" 2>/dev/null
     [ -n "$CLIENT2_PID" ] && kill "$CLIENT2_PID" 2>/dev/null
     [ -n "$CLIENT_PID" ] && kill "$CLIENT_PID" 2>/dev/null
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
@@ -94,6 +96,9 @@ ip netns exec ns0 "$BORE" server \
     --min-port 20000 --max-port 20100 \
     --cert-file "$CERT_FILE" --key-file "$KEY_FILE" \
     --udp \
+    --udp-socket-send-buffer 16MiB \
+    --bind-domain bore.example.com \
+    --control-hsts "max-age=31536000" \
     >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -152,6 +157,44 @@ for _ in $(seq 1 50); do
     echo "$body" | grep -q "\"public_port\":$PUB_PORT2" && break
     sleep 0.1
 done
+
+# ── Secret tunnel pair (provider + consumer) for T-SUMCOUNT / T-SECNOTES ──────────
+# Secret provider: listens for a secret consumer and relays its traffic.
+# Runs on nscli and serves a local port (9988) via the secret tunnel.
+echo "=== Starting secret provider (bore local with --tcp-secret-id) ==="
+SECRET_ID="test-secret-id-123456789012345"
+PROVIDER_LOG="$TMPDIR/provider.log"
+ip netns exec nscli "$BORE" local 9988 \
+    --to "https://$SRV_IP:$CTRL_PORT" --insecure \
+    --tcp-secret-id "$SECRET_ID" \
+    --notes "Provider notes test" \
+    >"$PROVIDER_LOG" 2>&1 &
+PROVIDER_PID=$!
+
+# Secret consumer: connects to the provider's secret tunnel.
+# Runs on ns0 and listens on localhost:19999 to expose the provider's 9988.
+echo "=== Starting secret consumer (bore proxy consumer) ==="
+CONSUMER_LOG="$TMPDIR/consumer.log"
+ip netns exec ns0 "$BORE" proxy \
+    --to "https://$SRV_IP:$CTRL_PORT" --insecure \
+    --tcp-secret-id "$SECRET_ID" \
+    --local-proxy-port "127.0.0.1:19999" \
+    --notes "Consumer notes test" \
+    >"$CONSUMER_LOG" 2>&1 &
+CONSUMER_PID=$!
+
+# Wait for secret tunnels to register
+secret_registered=false
+for _ in $(seq 1 50); do
+    body=$(ip netns exec ns0 curl -sk -H "Authorization: Bearer $ADMIN_TOKEN" "$B/admin/api/v1/secret" 2>/dev/null)
+    # Check for at least 2 entries (provider and consumer)
+    if echo "$body" | grep -q '"role"' && [ "$(echo "$body" | grep -o '"role"' | wc -l)" -ge 2 ]; then
+        secret_registered=true
+        break
+    fi
+    sleep 0.1
+done
+$secret_registered || { echo "secret tunnels log:"; cat "$PROVIDER_LOG"; cat "$CONSUMER_LOG"; echo "(secrets may not have registered; continuing)"; }
 
 # ── HTTP helper (admin calls over HTTPS from inside ns0) ─────────────────────────
 # Usage: aget <path> [token]   → echoes "<http_code>\n<body>"
@@ -292,6 +335,67 @@ else
     cnt=$(echo "$BODY" | grep -o '"label"' | wc -l)
     [ "$cnt" = "1" ] && pass "T-BUG4 certs single entry (grep label count=1)" \
         || fail "T-BUG4 label count=$cnt; body=$BODY"
+fi
+
+echo ""
+echo "=== Phase 2.3 e2e assertions (backend shape verification) ==="
+
+# T-SUMCOUNT: with live public tunnel + secret pair, GET /summary → .public_tunnels >= 1 AND .secret_tunnels >= 2
+R=$(aget /admin/api/v1/summary "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+if $JQ_AVAIL; then
+    ok=$(echo "$BODY" | jq -e '.public_tunnels >= 1 and .secret_tunnels >= 2' >/dev/null 2>&1 && echo y)
+else
+    pub=$(echo "$BODY" | grep -oE '"public_tunnels":[0-9]+' | head -1 | grep -oE '[0-9]+')
+    sec=$(echo "$BODY" | grep -oE '"secret_tunnels":[0-9]+' | head -1 | grep -oE '[0-9]+')
+    [ "$pub" -ge 1 ] 2>/dev/null && [ "$sec" -ge 2 ] 2>/dev/null && ok=y
+fi
+[ "$ok" = "y" ] && pass "T-SUMCOUNT summary public_tunnels>=1 && secret_tunnels>=2" \
+    || fail "T-SUMCOUNT counts wrong; body=$BODY"
+
+# T-CFGBUF: server launched with --udp-socket-send-buffer 16MiB → GET /config .udp_socket_send_buffer == 16777216
+R=$(aget /admin/api/v1/config "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+if $JQ_AVAIL; then
+    buf=$(echo "$BODY" | jq '.udp_socket_send_buffer' 2>/dev/null)
+    [ "$buf" = "16777216" ] && pass "T-CFGBUF udp_socket_send_buffer==16777216 (16MiB)" \
+        || fail "T-CFGBUF buffer=$buf (expected 16777216); body=$BODY"
+else
+    if echo "$BODY" | grep -q '"udp_socket_send_buffer":16777216'; then
+        pass "T-CFGBUF udp_socket_send_buffer==16777216 (grep)"
+    else
+        fail "T-CFGBUF missing/wrong buffer; body=$BODY"
+    fi
+fi
+
+# T-CFGFIELDS: GET /config has keys udp_stream_receive_window, udp_max_streams, bind_domain, control_hsts, vhost_mode
+R=$(aget /admin/api/v1/config "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+fields_ok=true
+for field in "udp_stream_receive_window" "udp_max_streams" "bind_domain" "control_hsts" "vhost_mode"; do
+    if ! echo "$BODY" | grep -q "\"$field\""; then
+        fields_ok=false
+        break
+    fi
+done
+[ "$fields_ok" = "true" ] && pass "T-CFGFIELDS config has all required fields" \
+    || fail "T-CFGFIELDS missing fields; body=$BODY"
+
+# T-SECNOTES: GET /admin/api/v1/secret → first element has key "notes"
+R=$(aget /admin/api/v1/secret "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+if [ -z "$BODY" ]; then
+    fail "T-SECNOTES secret endpoint returned empty; body=$BODY"
+elif $JQ_AVAIL; then
+    if echo "$BODY" | jq -e '.[0] | has("notes")' >/dev/null 2>&1; then
+        pass "T-SECNOTES secret first element has notes key"
+    else
+        fail "T-SECNOTES notes missing; body=$BODY"
+    fi
+else
+    # Grep fallback: look for the notes field in the first entry (before the next closing brace at array level)
+    first_entry=$(echo "$BODY" | sed -n '/\[\s*{/,/^\s*}/p' | head -20)
+    if echo "$first_entry" | grep -q '"notes"'; then
+        pass "T-SECNOTES secret first element has notes key (grep)"
+    else
+        fail "T-SECNOTES notes missing; body=$BODY"
+    fi
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────

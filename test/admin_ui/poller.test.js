@@ -4,7 +4,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPoller } from '../../src/admin_ui/poller.js';
+import { createPoller, DEFAULT_REFRESH_MS } from '../../src/admin_ui/poller.js';
 
 test('poller invokes refreshFn on each interval tick and is restartable', () => {
     let calls = 0;
@@ -49,4 +49,8 @@ test('poller does not arm when refreshMs <= 0', () => {
     p.start(0);
     assert.ok(!started, 'refreshMs<=0 must not schedule');
     assert.ok(!p.isRunning());
+});
+
+test('DEFAULT_REFRESH_MS is 30000', () => {
+    assert.equal(DEFAULT_REFRESH_MS, 30000, 'must be 30 seconds for consistent polling');
 });

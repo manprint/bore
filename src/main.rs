@@ -1733,8 +1733,8 @@ async fn dispatch(command: Command) -> Result<()> {
                 udp_max_streams,
             )?);
             server.set_control_port(control_port);
-            if let Some(domain) = bind_domain {
-                server.set_bind_domain(domain);
+            if let Some(ref domain) = bind_domain {
+                server.set_bind_domain(domain.clone());
             }
             // Store config values before they might be moved/consumed.
             #[cfg(feature = "vpn")]
@@ -1819,7 +1819,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 if let Some(key) = vhost_key_file {
                     cfg.key_file = Some(key);
                 }
-                if let Some(mode_str) = vhost_mode {
+                if let Some(ref mode_str) = vhost_mode {
                     cfg.mode = match mode_str.as_str() {
                         "http" => bore_cli::vhost::VhostModeCfg::Http,
                         "https" => bore_cli::vhost::VhostModeCfg::Https,
@@ -1853,6 +1853,11 @@ async fn dispatch(command: Command) -> Result<()> {
                 }
             }
             // Build and store the server configuration snapshot (D11: sanitized, no secrets).
+            let udp_socket_send_buffer =
+                bore_cli::shared::parse_size_bytes(&udp_socket_send_buffer).map(|b| b as usize);
+            let udp_socket_recv_buffer =
+                bore_cli::shared::parse_size_bytes(&udp_socket_recv_buffer).map(|b| b as usize);
+
             let config_view = bore_cli::admin_views::ConfigView {
                 port_range: format!("{}-{}", min_port, max_port),
                 control_port,
@@ -1861,8 +1866,14 @@ async fn dispatch(command: Command) -> Result<()> {
                 bind_addr: bind_addr.to_string(),
                 bind_tunnels: bind_tunnels.unwrap_or(bind_addr).to_string(),
                 udp,
-                udp_socket_send_buffer: None, // TODO: parse from string if needed
-                udp_socket_recv_buffer: None,
+                udp_socket_send_buffer,
+                udp_socket_recv_buffer,
+                udp_stream_receive_window,
+                udp_connection_receive_window,
+                udp_send_window,
+                udp_max_streams,
+                bind_domain: bind_domain.clone(),
+                control_hsts,
                 #[cfg(feature = "vpn")]
                 vpn_enabled: vpn,
                 #[cfg(feature = "vpn")]
@@ -1871,11 +1882,15 @@ async fn dispatch(command: Command) -> Result<()> {
                 vpn_max_links: vpn_max_links as u32,
                 #[cfg(feature = "vpn")]
                 vpn_hub_prefix,
+                #[cfg(feature = "vpn")]
+                vpn_punch_timeout: Some(bore_cli::vpn_server::DEFAULT_VPN_PUNCH_TIMEOUT.as_secs()),
                 vhost_enabled: !server.vhost_registry().is_empty()
                     || config_vhost_base_domain.is_some(),
                 vhost_base_domain: config_vhost_base_domain,
                 vhost_http_port,
                 vhost_https_port,
+                vhost_quic_port,
+                vhost_mode: vhost_mode.clone(),
                 tls: config_tls,
             };
             server.set_config_view(config_view);

@@ -87,26 +87,75 @@ class HTMLElement {
     dispatch(type, ev = {}) {
         (this._listeners[type] || []).forEach((fn) => fn({ preventDefault() {}, ...ev }));
     }
+    querySelector(selector) {
+        // Simple selector support: 'tag' or 'tag.class'
+        if (!selector) return null;
+        if (selector === 'tbody') return this.tagName === 'TBODY' ? this : this.children.find(c => c.tagName === 'TBODY');
+        if (selector === 'thead') return this.tagName === 'THEAD' ? this : this.children.find(c => c.tagName === 'THEAD');
+        if (selector === '.modal-overlay') return this.classList.contains('modal-overlay') ? this : null;
+        return null;
+    }
+    querySelectorAll(selector) {
+        // Simple selector support: 'tag' or 'tag.class'
+        if (!selector) return [];
+        if (selector === 'tr') {
+            const result = [];
+            if (this.tagName === 'TR') result.push(this);
+            this.children.forEach(c => {
+                if (c.tagName === 'TR') result.push(c);
+            });
+            return result;
+        }
+        return [];
+    }
+    removeChild(node) {
+        const idx = this.children.indexOf(node);
+        if (idx >= 0) {
+            this.children.splice(idx, 1);
+        }
+        return node;
+    }
 }
 
-const document = {
+class DocumentStub {
+    constructor() {
+        this.body = new HTMLElement('body');
+    }
     createElement(tag) {
         return new HTMLElement(tag);
-    },
+    }
     createTextNode(text) {
         const n = new HTMLElement('#text');
         n.textContent = text;
         return n;
-    },
+    }
     getElementById() {
         return null;
-    },
+    }
     querySelectorAll() {
         return [];
-    },
-};
+    }
+    addEventListener(type, fn) {
+        // Listen on the global document for keydown events (modal.js)
+        (this._listeners ||= {})[type] ||= [];
+        this._listeners[type].push(fn);
+    }
+    removeEventListener(type, fn) {
+        if (!this._listeners || !this._listeners[type]) return;
+        const idx = this._listeners[type].indexOf(fn);
+        if (idx >= 0) {
+            this._listeners[type].splice(idx, 1);
+        }
+    }
+    dispatch(type, ev = {}) {
+        if (!this._listeners || !this._listeners[type]) return;
+        this._listeners[type].forEach((fn) => fn({ key: 'Escape', ...ev }));
+    }
+}
+
+const document = new DocumentStub();
 
 globalThis.HTMLElement = HTMLElement;
 globalThis.document = document;
 
-export { HTMLElement, ClassList, document };
+export { HTMLElement, ClassList, document, DocumentStub };

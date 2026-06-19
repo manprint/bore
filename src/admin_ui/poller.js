@@ -6,6 +6,10 @@
  * timer and calls `refreshFn` directly. It is decoupled from the global
  * `setInterval`/`clearInterval` (injectable) so it can be unit-tested headless.
  */
+
+/** Default polling interval: 30 seconds. Data panels inherit this; config stays 0 (static). */
+export const DEFAULT_REFRESH_MS = 30000;
+
 export function createPoller(refreshFn, timers = { setInterval, clearInterval }) {
     let handle = null;
     return {

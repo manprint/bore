@@ -366,6 +366,52 @@ format backward-compatible (old client ↔ new server).
 
 ---
 
+## Round-2 bug-fix (2026-06-19)
+
+A second bug-hunt pass applied fixes for overview counts, config completeness, and
+detail modals (plan: `docs/frontend/ADMIN_DASHBOARD_BUGFIX2_PLAN.md`).
+
+| Fix | Layer | Root cause | Result |
+|-----|-------|-----------|--------|
+| **Summary counts renamed** | backend | `SummaryView` exposed `live_tunnels`/`live_vhost`/`live_vpn_links` — overview panel had no matching field names | replaced with `public_tunnels`, `secret_tunnels`, `vhost_domains`, `vpn_links` (exact role-based counts); overview displays non-zero counts |
+| **Config buffers hardcoded null** | backend | `/admin/api/v1/config` hardcoded `udp_socket_send_buffer` / `udp_socket_recv_buffer` to `None` despite CLI flags being parsed | wired parsed values to `ConfigView` as `Option<usize>`; `None` → frontend label "auto (OS default)" |
+| **Config missing tuning fields** | backend | operator-visible startup parameters (`--udp-stream-receive-window`, `--bind-domain`, `--control-hsts`, etc.) never reached the API | added `udp_stream_receive_window`, `udp_connection_receive_window`, `udp_send_window` (human-size strings), `udp_max_streams`, `bind_domain`, `control_hsts`, `vhost_mode`, `vhost_quic_port`, `vpn_punch_timeout` (vpn feature) to `ConfigView`; config panel renders them auto-magically |
+| **Detail modals missing** | frontend | tunnels/secret/vhost/vpn table rows were compact; clicking a row showed nothing | added reusable `modal.js` component (`openModal`/`closeModal`); row-click opens modal showing all per-entry fields via `detailRows(obj)` formatter (byte/duration/bool/array/null handling) |
+| **Backend gaps for modal** | backend | detail views lacked some per-entry fields needed by the modal | added `notes` to `SecretView`; added `request_header_pairs`/`response_header_pairs` (full key+value) and `direct_pool` size to `VhostView` |
+| **Polling interval fragmented** | frontend | overview/tunnels/secret/vhost/vpn had per-panel hardcoded `refreshMs` (5000, 3000, etc.); data stale unless manually reloaded | unified to single `DEFAULT_REFRESH_MS = 30000` (30 s) across all data panels; config stays 0 (static); **rebuild required after editing `src/admin_ui/*`** — assets are compile-time embedded |
+
+### Key implementation details
+
+- **Summary:** `public_tunnels` = count of `Role::Public`; `secret_tunnels` = count of `Role::SecretProvider` + `Role::SecretConsumer`; `vhost_domains` = vhost registry len; `vpn_links` = vpn registry len (vpn feature).
+- **Config:** socket buffers parse via existing human-size parser ("16MiB" → bytes); stored as `Option<usize>` (null when flag unset). Window strings stored verbatim. **Sanitization invariant:** no field name contains `secret|key|password|admin_token` (test **T-SANITIZE** enforces on all new fields).
+- **Modal:** `detailRows(obj)` uses key suffixes (`*_bytes` → `fmtBytes`, `*_secs` → `fmtDuration`), type checks (bool → badge, array → join, null → "—"), and HTML escaping. Modal attaches to `document.body` so poll re-renders of `#view` don't destroy it.
+- **Vhost headers:** `request_header_pairs` / `response_header_pairs` expose full header VALUES (not just keys); admin-token-guarded, no unauth path — documented security note.
+- **Polling & rebuild:** `/admin/ui/*.js` are embedded at compile time via `build.rs`. A freshly rebuilt binary auto-refreshes every 30 s. **Operator note:** after editing any `src/admin_ui/*` file, rebuild the binary (`cargo build`) before serving — the JavaScript in the running process is from the last build, not from disk.
+
+### Test IDs
+
+**JS unit** (`test/admin_ui/**/*.test.js`):
+- `T-MODAL` — `openModal`/`closeModal` create/destroy modal overlay
+- `T-DETAIL` — `detailRows` formats each field type correctly
+- `T-POLL30` — poller fires repeatedly at 30 s intervals
+- `T-CFGNULL` — config null values render as friendly label
+- `T-OVR` — overview panel reads correct field names from summary
+
+**Rust unit** (`src/admin.rs` mod, `tests/admin_test.rs`):
+- `T-SUM` — per-role count mapping; old field names gone
+- `T-BUF` — socket buffers serialize to bytes, not null when set
+- `T-CFG` — new ConfigView fields present + no secrets in names
+- `T-SECN` — SecretView carries `notes`
+- `T-VHH` — VhostView has `request_header_pairs`/`response_header_pairs`
+
+**e2e** (`scripts/admin_dashboard_test.sh`):
+- `T-SUMCOUNT` — server with public + secret tunnels → `/api/v1/summary` has non-zero counts
+- `T-CFGBUF` — server with `--udp-socket-send-buffer 16MiB` → config reports `16777216`
+- `T-CFGFIELDS` — `/api/v1/config` includes `udp_stream_receive_window`, `bind_domain`, `control_hsts`, `vhost_mode`, `vhost_quic_port`
+- `T-SECNOTES` — `/api/v1/secret` first entry has key `notes`
+
+---
+
 ## Future extensions
 
 The modular design enables:

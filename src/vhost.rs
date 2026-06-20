@@ -804,7 +804,6 @@ pub async fn relay_vhost(
     };
     mux::write_stream_ready(&mut provider, forward_ip.as_deref()).await?;
 
-    let mut public = public;
     // Keep a copy of the head for logging (before it's moved/rewritten).
     let head_for_logging = head.clone();
     let request_head = if entry.request_headers.is_empty() {
@@ -819,7 +818,16 @@ pub async fn relay_vhost(
 
     if entry.response_headers.is_empty() {
         let buf = proxy_buffer_size();
-        // Wrap public in tap if logger is present (Phase 2.2 — I-WL1 guard).
+        // Count bytes LIVE as they flow (per-subdomain + global), not only on
+        // close, so the admin Vhost TX/RX columns update for open connections.
+        let counted = crate::shared::CountingStream::new(
+            public,
+            entry.relay_rx_bytes.clone(),
+            entry.relay_tx_bytes.clone(),
+            grx.clone(),
+            gtx.clone(),
+        );
+        // Wrap in tap if logger is present (Phase 2.2 — I-WL1 guard).
         let result = if let Some(ref logger) = log_ctx.logger {
             let tx = logger.sender_for(
                 fqdn,
@@ -828,7 +836,7 @@ pub async fn relay_vhost(
                 },
             );
             let mut tap = crate::weblog::HttpAccessTap::new(
-                public,
+                counted,
                 Some(addr.ip().to_string()),
                 tx,
                 log_ctx.dropped.clone(),
@@ -871,15 +879,12 @@ pub async fn relay_vhost(
 
             tokio::io::copy_bidirectional_with_sizes(&mut tap, &mut provider, buf, buf).await?
         } else {
-            tokio::io::copy_bidirectional_with_sizes(&mut public, &mut provider, buf, buf).await?
+            let mut counted = counted;
+            tokio::io::copy_bidirectional_with_sizes(&mut counted, &mut provider, buf, buf).await?
         };
-        let (rx_bytes, tx_bytes) = result;
-        grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
-        gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
-        // Per-subdomain relay counters (shown on /admin/status#/vhost), mirroring
-        // the global/server totals above. Off the hot path (once per closed conn).
-        entry.relay_rx_bytes.fetch_add(rx_bytes, Ordering::Relaxed);
-        entry.relay_tx_bytes.fetch_add(tx_bytes, Ordering::Relaxed);
+        // Byte counts are accumulated LIVE by `CountingStream` (per-subdomain +
+        // global) as bytes flow; nothing to add on close.
+        let _ = result;
         return Ok(());
     }
 
@@ -893,7 +898,24 @@ pub async fn relay_vhost(
         fqdn: fqdn.to_string(),
     });
 
-    relay_response_injected(public, provider, &entry.response_headers, log_context).await?;
+    // Count bytes LIVE on the response-header-injection path too (this path
+    // previously never updated the per-subdomain/global counters at all).
+    // Wrapping the public side captures both directions: request bytes are read
+    // from it, response bytes are written to it.
+    let counted_public = crate::shared::CountingStream::new(
+        public,
+        entry.relay_rx_bytes.clone(),
+        entry.relay_tx_bytes.clone(),
+        grx.clone(),
+        gtx.clone(),
+    );
+    relay_response_injected(
+        counted_public,
+        provider,
+        &entry.response_headers,
+        log_context,
+    )
+    .await?;
     Ok(())
 }
 

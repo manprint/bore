@@ -20,8 +20,8 @@ use crate::admin::{AdminRegistry, NewEntry, Role};
 use crate::mux;
 use crate::secret;
 use crate::shared::{
-    proxy_buffer_size, ClientMessage, Delimited, Ipv4Net, ServerMessage, UdpDirectTuning,
-    VpnAddrRequest, UDP_NONCE_LEN,
+    proxy_buffer_size, ClientMessage, CountingStream, Delimited, Ipv4Net, ServerMessage,
+    UdpDirectTuning, VpnAddrRequest, UDP_NONCE_LEN,
 };
 
 /// VPN provider registry, keyed by VPN link ID.
@@ -1605,65 +1605,6 @@ pub async fn serve_vpn_connector(
     // Connector disconnected; clean up
     acceptor_handle.abort();
     Ok(())
-}
-
-/// Byte-counting wrapper around a relay substream: reads from the inner stream
-/// bump `rx`, writes bump `tx`. The counters power the admin page's relay
-/// traffic columns (ciphertext totals — the server never sees plaintext).
-struct CountingStream<S> {
-    inner: S,
-    rx: Arc<std::sync::atomic::AtomicU64>,
-    tx: Arc<std::sync::atomic::AtomicU64>,
-    grx: Arc<std::sync::atomic::AtomicU64>,
-    gtx: Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountingStream<S> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        let res = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let std::task::Poll::Ready(Ok(())) = &res {
-            let n = (buf.filled().len() - before) as u64;
-            self.rx.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-            self.grx.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-        }
-        res
-    }
-}
-
-impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountingStream<S> {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        let res = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let std::task::Poll::Ready(Ok(n)) = &res {
-            self.tx
-                .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
-            self.gtx
-                .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
-        }
-        res
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
 }
 
 /// Relay a connector substream to the hub listener, injecting the peer_id header.

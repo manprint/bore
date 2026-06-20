@@ -1676,7 +1676,7 @@ impl Server {
                         // Extract webserver_log before opts is moved (Phase 3).
                         let client_wants_logging = opts.webserver_log;
                         // Terminate TLS / handle redirects at the edge as needed.
-                        let mut edge =
+                        let edge =
                             match edge::accept(stream2, opts, tls.as_ref(), port, domain.as_deref())
                                 .await
                             {
@@ -1701,10 +1701,19 @@ impl Server {
                                     if mux::write_stream_ready(&mut stream, forward_ip.as_deref()).await.is_ok() {
                                         entry.direct_stream_opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         let buf = proxy_buffer_size();
-                                        // Wrap edge in tap if logger is present (Phase 2.1 — I-WL1 guard).
+                                        // Count bytes LIVE as they flow (not only on close) so the
+                                        // admin TX/RX columns update for long-lived connections.
+                                        let counted = crate::shared::CountingStream::new(
+                                            edge,
+                                            Arc::clone(&erx),
+                                            Arc::clone(&etx),
+                                            Arc::clone(&grx),
+                                            Arc::clone(&gtx),
+                                        );
+                                        // Wrap in tap if logger is present (Phase 2.1 — I-WL1 guard).
                                         let result = if let Some(logger) = &access_logger {
                                             let tx = logger.sender_for(&port.to_string(), crate::weblog::PathLayout::Flat);
-                                            let mut tap = crate::weblog::HttpAccessTap::new(edge, Some(addr.ip().to_string()), tx, access_logger_dropped.clone());
+                                            let mut tap = crate::weblog::HttpAccessTap::new(counted, Some(addr.ip().to_string()), tx, access_logger_dropped.clone());
                                             tokio::io::copy_bidirectional_with_sizes(
                                                 &mut tap,
                                                 &mut stream,
@@ -1712,19 +1721,15 @@ impl Server {
                                                 buf,
                                             ).await
                                         } else {
+                                            let mut counted = counted;
                                             tokio::io::copy_bidirectional_with_sizes(
-                                                &mut edge,
+                                                &mut counted,
                                                 &mut stream,
                                                 buf,
                                                 buf,
                                             ).await
                                         };
-                                        if let Ok((rx_bytes, tx_bytes)) = result {
-                                            grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
-                                            gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
-                                            erx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
-                                            etx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
-                                        } else if let Err(err) = result {
+                                        if let Err(err) = result {
                                             trace!(%err, "direct proxied connection closed");
                                         }
                                         return;
@@ -1762,10 +1767,19 @@ impl Server {
                                     return;
                                 }
                                 let buf = proxy_buffer_size();
-                                // Wrap edge in tap if logger is present (Phase 2.1 — I-WL1 guard).
+                                // Count bytes LIVE as they flow (not only on close) so the
+                                // admin TX/RX columns update for long-lived connections.
+                                let counted = crate::shared::CountingStream::new(
+                                    edge,
+                                    Arc::clone(&erx),
+                                    Arc::clone(&etx),
+                                    Arc::clone(&grx),
+                                    Arc::clone(&gtx),
+                                );
+                                // Wrap in tap if logger is present (Phase 2.1 — I-WL1 guard).
                                 let result = if let Some(logger) = &access_logger {
                                     let tx = logger.sender_for(&port.to_string(), crate::weblog::PathLayout::Flat);
-                                    let mut tap = crate::weblog::HttpAccessTap::new(edge, Some(addr.ip().to_string()), tx, access_logger_dropped.clone());
+                                    let mut tap = crate::weblog::HttpAccessTap::new(counted, Some(addr.ip().to_string()), tx, access_logger_dropped.clone());
                                     tokio::io::copy_bidirectional_with_sizes(
                                         &mut tap,
                                         &mut stream,
@@ -1773,19 +1787,15 @@ impl Server {
                                         buf,
                                     ).await
                                 } else {
+                                    let mut counted = counted;
                                     tokio::io::copy_bidirectional_with_sizes(
-                                        &mut edge,
+                                        &mut counted,
                                         &mut stream,
                                         buf,
                                         buf,
                                     ).await
                                 };
-                                if let Ok((rx_bytes, tx_bytes)) = result {
-                                    grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
-                                    gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
-                                    erx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
-                                    etx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
-                                } else if let Err(err) = result {
+                                if let Err(err) = result {
                                     trace!(%err, "proxied connection closed");
                                 }
                             }

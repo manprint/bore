@@ -560,13 +560,12 @@ async fn relay(
     provider.write_all(&[mux::STREAM_READY]).await?;
 
     let buf = proxy_buffer_size();
-    let result =
-        tokio::io::copy_bidirectional_with_sizes(&mut consumer, &mut provider, buf, buf).await?;
-    let (rx_bytes, tx_bytes) = result;
-    grx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
-    gtx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
-    erx.fetch_add(rx_bytes, std::sync::atomic::Ordering::Relaxed);
-    etx.fetch_add(tx_bytes, std::sync::atomic::Ordering::Relaxed);
+    // Count bytes LIVE as they flow (not only on close) so the admin secret-tunnel
+    // TX/RX columns update while the connection is open. `rx`/`tx` map to the
+    // (consumer→provider, provider→consumer) directions `copy_bidirectional`
+    // would have returned.
+    let mut counted = crate::shared::CountingStream::new(consumer, erx, etx, grx, gtx);
+    tokio::io::copy_bidirectional_with_sizes(&mut counted, &mut provider, buf, buf).await?;
     Ok(())
 }
 

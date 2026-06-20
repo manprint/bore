@@ -334,6 +334,40 @@ else
     echo "SKIP: python3 absent — T-BUG1 TX/RX transfer test skipped"
 fi
 
+# T-BUG1-LIVE: counters must update WHILE a connection is still OPEN — the actual
+# regression. A dashboard polls live tunnels, whose connections are mostly open
+# and long-lived (keep-alive, downloads, websockets); on-close-only accounting
+# read 0.00B forever. Start a slow, large download in the background and poll the
+# API MID-transfer (connection not yet closed), requiring non-zero TX.
+if $PY_AVAIL; then
+    # 8 MiB payload so the transfer can't complete (or fit a socket buffer) before
+    # we sample; --limit-rate keeps the public connection open for many seconds.
+    head -c 8388608 /dev/zero | tr '\0' 'y' > "$TMPDIR/www/biglive"
+    ip netns exec ns0 curl -s -m 30 --limit-rate 128k -o /dev/null \
+        "http://127.0.0.1:$PUB_PORT/biglive" &
+    LIVE_CURL=$!
+    sleep 1.5
+    if kill -0 "$LIVE_CURL" 2>/dev/null; then
+        # Connection is still OPEN (curl still downloading) at sample time.
+        R=$(aget /admin/api/v1/tunnels "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+        if $JQ_AVAIL; then
+            ok=$(echo "$BODY" | jq -e \
+                'any(.[]; .public_port==20050 and .relay_tx_bytes>0)' \
+                >/dev/null 2>&1 && echo y)
+        else
+            ok=$(echo "$BODY" | grep -Eq '"relay_tx_bytes":[1-9]' && echo y)
+        fi
+        [ "$ok" = "y" ] && pass "T-BUG1-LIVE relay_tx_bytes > 0 while connection still OPEN (live counting)" \
+            || fail "T-BUG1-LIVE counters 0 mid-transfer (on-close-only regression); body=$BODY"
+    else
+        echo "SKIP: T-BUG1-LIVE download finished too fast to sample mid-flight"
+    fi
+    kill "$LIVE_CURL" 2>/dev/null
+    wait "$LIVE_CURL" 2>/dev/null || true
+else
+    echo "SKIP: python3 absent — T-BUG1-LIVE skipped"
+fi
+
 # T-BUG4: certs are deduped. The harness configures only the control cert, so
 # exactly one entry must be reported (a regression that double-counts would show
 # 2). The same-file control+vhost merge is covered by the Rust unit tests.

@@ -29,6 +29,94 @@ pub const MAX_FRAME_LENGTH: usize = 1024;
 /// authentication token is derived from this nonce and the tunnel secret.
 pub const UDP_NONCE_LEN: usize = 16;
 
+/// Transparent byte-counting wrapper around a relay stream: bytes READ from the
+/// inner stream bump `rx`/`grx`, bytes WRITTEN to it bump `tx`/`gtx`. The adds
+/// happen on every poll, so the per-entry and global counters reflect traffic
+/// LIVE — while the connection is still open — not only when it closes. Used by
+/// every data-plane splice (public/secret/vhost/vpn relay) so the admin page's
+/// TX/RX columns update for long-lived connections instead of reading 0 forever.
+///
+/// It is byte-for-byte transparent (only atomic adds; never alters or buffers
+/// payload) and forwards `poll_shutdown`, so half-close propagation is preserved.
+pub(crate) struct CountingStream<S> {
+    pub(crate) inner: S,
+    /// Counter for bytes read from `inner` (per-entry rx).
+    pub(crate) rx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Counter for bytes written to `inner` (per-entry tx).
+    pub(crate) tx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Global rx counter (server total).
+    pub(crate) grx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Global tx counter (server total).
+    pub(crate) gtx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<S> CountingStream<S> {
+    /// Wrap `inner`, counting reads into `rx`/`grx` and writes into `tx`/`gtx`.
+    pub(crate) fn new(
+        inner: S,
+        rx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        tx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        grx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        gtx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self {
+            inner,
+            rx,
+            tx,
+            grx,
+            gtx,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let res = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &res {
+            let n = (buf.filled().len() - before) as u64;
+            self.rx.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            self.grx.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let res = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &res {
+            self.tx
+                .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
+            self.gtx
+                .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Serde default for VPN relay carrier counts: old peers without the field
 /// behave exactly like a single-carrier build.
 fn default_vpn_carriers() -> u16 {

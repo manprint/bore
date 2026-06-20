@@ -846,6 +846,135 @@ async fn t_api_tunnels_shape() -> Result<()> {
     Ok(())
 }
 
+/// Extract the first `"key":<digits>` unsigned integer value from a JSON body.
+fn json_u64(body: &str, key: &str) -> Option<u64> {
+    let pat = format!("\"{key}\":");
+    let i = body.find(&pat)? + pat.len();
+    let rest = &body[i..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// T-BYTES1 (regression): a public tunnel that has carried real traffic must
+/// report NON-ZERO `relay_tx_bytes`/`relay_rx_bytes` in the admin API. This is
+/// the data-plane→admin-snapshot→JSON path the dashboard's TX/RX columns read;
+/// it previously had no e2e coverage, which let a "counters always 0" regression
+/// ship. Drives bytes through the assigned public port, closes the connection so
+/// the server's `copy_bidirectional_with_sizes` returns and the counters are
+/// flushed, then asserts the API reflects them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_public_tunnel_relay_bytes_nonzero() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    wait_port(CONTROL_PORT, false).await;
+
+    let mut server = Server::new(10000..=65535, None);
+    server.set_admin_token(Some(TOKEN.into()));
+    tokio::spawn(server.listen());
+    wait_port(CONTROL_PORT, true).await;
+
+    // Public tunnel whose local service is an echo server. `port = 0` asks the
+    // server to auto-assign a public port; the client dials the default control
+    // port (`CONTROL_PORT`).
+    let echo = spawn_echo_service().await?;
+    let client = Client::new(
+        "localhost",
+        echo,
+        "localhost",
+        0,
+        None,
+        false,
+        Default::default(),
+        None,
+    )
+    .await?;
+    let public_port = client.remote_port();
+    tokio::spawn(client.listen());
+    time::sleep(Duration::from_millis(200)).await;
+
+    // Drive bytes end-to-end through the public port, then close so the
+    // server-side proxy task returns and flushes the byte counters.
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", public_port)).await?;
+        s.write_all(b"hello world").await?;
+        let mut buf = [0u8; 11];
+        s.read_exact(&mut buf).await?;
+        assert_eq!(&buf, b"hello world");
+    }
+    time::sleep(Duration::from_millis(500)).await;
+
+    let s = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
+    let resp = http_get(s, "/admin/api/v1/tunnels", Some(TOKEN)).await?;
+    let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+    let tx = json_u64(body, "relay_tx_bytes");
+    let rx = json_u64(body, "relay_rx_bytes");
+    assert!(
+        tx == Some(11) || tx > Some(0),
+        "relay_tx_bytes must be non-zero after traffic, got {tx:?}; body: {body}"
+    );
+    assert!(
+        rx == Some(11) || rx > Some(0),
+        "relay_rx_bytes must be non-zero after traffic, got {rx:?}; body: {body}"
+    );
+
+    Ok(())
+}
+
+/// DIAGNOSTIC (kept as a regression test): while a proxied connection is still
+/// OPEN and has carried bytes, the admin API must already report non-zero
+/// TX/RX. The dashboard polls live tunnels — most of which have open, long-lived
+/// connections (keep-alive, downloads, websockets) — so on-close-only accounting
+/// shows 0.00B forever. Counters must update incrementally as bytes flow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_public_tunnel_relay_bytes_live_while_open() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    wait_port(CONTROL_PORT, false).await;
+
+    let mut server = Server::new(10000..=65535, None);
+    server.set_admin_token(Some(TOKEN.into()));
+    tokio::spawn(server.listen());
+    wait_port(CONTROL_PORT, true).await;
+
+    let echo = spawn_echo_service().await?;
+    let client = Client::new(
+        "localhost",
+        echo,
+        "localhost",
+        0,
+        None,
+        false,
+        Default::default(),
+        None,
+    )
+    .await?;
+    let public_port = client.remote_port();
+    tokio::spawn(client.listen());
+    time::sleep(Duration::from_millis(200)).await;
+
+    // Open a connection, push + read bytes, but DO NOT close it.
+    let mut s = TcpStream::connect(("127.0.0.1", public_port)).await?;
+    s.write_all(b"hello world").await?;
+    let mut buf = [0u8; 11];
+    s.read_exact(&mut buf).await?;
+    assert_eq!(&buf, b"hello world");
+    time::sleep(Duration::from_millis(300)).await;
+
+    // Poll the API while `s` is still open.
+    let admin = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
+    let resp = http_get(admin, "/admin/api/v1/tunnels", Some(TOKEN)).await?;
+    let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+    let tx = json_u64(body, "relay_tx_bytes");
+    let rx = json_u64(body, "relay_rx_bytes");
+    drop(s);
+    assert!(
+        tx > Some(0) && rx > Some(0),
+        "live (open-connection) TX/RX must be non-zero, got tx={tx:?} rx={rx:?}; body: {body}"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_api_vhost_shape() -> Result<()> {
     // (T-VHOST-PARITY) The vhost endpoint serves a JSON array (empty when no

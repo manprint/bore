@@ -233,6 +233,11 @@ pub struct Server {
 
     /// Shared dropped-record counter for all loggers (Phase 2.3).
     access_logger_dropped: Arc<std::sync::atomic::AtomicU64>,
+
+    /// How long a secret provider/consumer control loop waits for any frame
+    /// before reaping the connection (and its admin entry). Defaults to
+    /// [`secret::SECRET_CTRL_TIMEOUT`]; lowered by tests to reap fast.
+    secret_ctrl_timeout: std::time::Duration,
 }
 
 impl Server {
@@ -328,7 +333,16 @@ impl Server {
             }),
             access_logger: None,
             access_logger_dropped: Arc::new(AtomicU64::new(0)),
+            secret_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
         }
+    }
+
+    /// Override the secret-tunnel control-loop reap timeout (test hook). The
+    /// default ([`secret::SECRET_CTRL_TIMEOUT`], 60 s) is correct in production;
+    /// tests lower it to assert the reaper removes a wedged entry quickly.
+    pub fn secret_ctrl_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.secret_ctrl_timeout = timeout;
+        self
     }
 
     /// Get the TCP port the control listener binds to.
@@ -1248,6 +1262,7 @@ impl Server {
                         local_proxy_port: 0,
                         carriers,
                     },
+                    self.secret_ctrl_timeout,
                 )
                 .await
             }
@@ -1292,6 +1307,7 @@ impl Server {
                         local_proxy_port,
                         carriers,
                     },
+                    self.secret_ctrl_timeout,
                 )
                 .await
             }
@@ -1507,6 +1523,13 @@ impl Server {
                         "vpn not supported/enabled on this server".into(),
                     ))
                     .await;
+                Ok(())
+            }
+            // A Heartbeat is a liveness ping for an *established* secret control
+            // loop, never a valid first message. A client that opens a control
+            // substream and only pings without registering is dropped.
+            Some(ClientMessage::Heartbeat) => {
+                warn!(%peer, "unexpected heartbeat before registration");
                 Ok(())
             }
             None => Ok(()),

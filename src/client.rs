@@ -64,6 +64,13 @@ pub struct Client {
     /// Port that is publicly available on the remote.
     remote_port: u16,
 
+    /// Whether this client is a secret-tunnel **provider** (registered via
+    /// [`ClientMessage::HelloSecret`]). Only secret providers send periodic
+    /// [`ClientMessage::Heartbeat`] frames so the server's recv-deadline reaper
+    /// (`secret::SECRET_CTRL_TIMEOUT`) can detect a wedged/abandoned control
+    /// substream; public and vhost tunnels keep the legacy heartbeat-free path.
+    is_secret_provider: bool,
+
     /// UDP socket reserved for a direct hole-punched path; `Some` only for a
     /// secret provider that opted into the `udp` direct-path mode.
     #[cfg(feature = "udp")]
@@ -268,6 +275,7 @@ impl Client {
             local_host: local_host.to_string(),
             local_port,
             remote_port,
+            is_secret_provider: false,
             #[cfg(feature = "udp")]
             udp_socket: None,
             #[cfg(feature = "udp")]
@@ -457,6 +465,7 @@ impl Client {
             local_host: local_host.to_string(),
             local_port,
             remote_port: 0,
+            is_secret_provider: true,
             #[cfg(feature = "udp")]
             udp_socket,
             #[cfg(feature = "udp")]
@@ -647,6 +656,7 @@ impl Client {
             local_host: local_host.to_string(),
             local_port,
             remote_port: 0,
+            is_secret_provider: false,
             #[cfg(feature = "udp")]
             udp_socket: None,
             #[cfg(feature = "udp")]
@@ -732,6 +742,7 @@ impl Client {
         let mut preferred_port_remapped = false;
         #[cfg(feature = "udp")]
         let mut next_preferred_port_check = tokio::time::Instant::now();
+        let is_secret_provider = self.is_secret_provider;
         let this = Arc::new(self);
 
         // Carrier pool: pump each extra carrier's accepted data substreams into a
@@ -754,8 +765,22 @@ impl Client {
         // the whole session (the consumer already retries; the provider did not).
         // The first tick fires immediately, re-offering at once if needed.
         let mut udp_retry = tokio::time::interval(Duration::from_secs(15));
+        // Secret providers ping the server periodically so its recv-deadline
+        // reaper never trips on a healthy idle provider (a yamux substream hides
+        // a half-open peer). Public/vhost tunnels keep the legacy heartbeat-free
+        // path (branch disabled below).
+        let mut ctrl_heartbeat = {
+            let mut t = tokio::time::interval(crate::secret::CTRL_CLIENT_HEARTBEAT);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            t
+        };
         loop {
             tokio::select! {
+                _ = ctrl_heartbeat.tick(), if is_secret_provider => {
+                    if control.send(ClientMessage::Heartbeat).await.is_err() {
+                        return Ok(());
+                    }
+                }
                 // Drain the control substream so the server's heartbeats are read;
                 // this also surfaces server errors and connection teardown.
                 message = control.recv() => {

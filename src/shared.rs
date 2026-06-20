@@ -1035,6 +1035,15 @@ pub enum ClientMessage {
         /// `"relay"` or `"direct"`.
         path: String,
     },
+
+    /// Periodic liveness ping from a secret provider/consumer control loop. The
+    /// control channel is a yamux substream, so a half-open/abandoned peer is
+    /// invisible to the server's `send`/`recv` (send buffers, recv blocks). This
+    /// frame gives the server a positive liveness signal to time out on; the
+    /// server treats it as a no-op. Appended last so the wire stays
+    /// backward-compatible (an old server fails to deserialize this variant, so
+    /// clients must be deployed before / together with the server).
+    Heartbeat,
 }
 
 /// A message from the server on the control substream.
@@ -1339,6 +1348,7 @@ impl ControlFrameSummary for ClientMessage {
             ClientMessage::VpnPathReport { path } => {
                 format!("VpnPathReport {{ path={} }}", path)
             }
+            ClientMessage::Heartbeat => "Heartbeat".to_string(),
         }
     }
 }
@@ -2192,6 +2202,19 @@ fn hello_vpn_serde_roundtrip_with_and_without_max_clients() {
     } else {
         panic!("unexpected variant");
     }
+}
+
+#[test]
+fn t_wire_heartbeat_roundtrip() {
+    // T-WIRE1: the appended `ClientMessage::Heartbeat` variant round-trips and
+    // does not disturb the existing variants (it is the secret-tunnel liveness
+    // ping the server's reaper relies on).
+    let json = serde_json::to_string(&ClientMessage::Heartbeat).unwrap();
+    let back: ClientMessage = serde_json::from_str(&json).unwrap();
+    assert!(matches!(back, ClientMessage::Heartbeat));
+    // A pre-existing variant still decodes unchanged alongside the new one.
+    let auth: ClientMessage = serde_json::from_str(r#"{"Authenticate":"tok"}"#).unwrap();
+    assert!(matches!(auth, ClientMessage::Authenticate(_)));
 }
 
 #[test]

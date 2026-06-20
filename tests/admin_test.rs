@@ -1279,3 +1279,74 @@ async fn t_legacy_data_compat() -> Result<()> {
 
     Ok(())
 }
+
+/// T-COUNT1/T-COUNT2: the Overview/Metrics secret-tunnel counts must track the
+/// admin registry exactly — when a (reaped) entry is dropped, the count drops
+/// with it. Regression guard for the field bug where zombie secret entries
+/// inflated "Secret Tunnels: 9" after a server restart + reconnect storm.
+#[test]
+fn t_secret_counts_track_registry() {
+    use bore_cli::admin::{NewEntry, Role};
+    use bore_cli::server::Server;
+
+    fn secret_entry(role: Role, peer: &str) -> NewEntry {
+        NewEntry {
+            role,
+            peer: peer.parse().unwrap(),
+            secret_id: Some("svc-a".into()),
+            public_port: None,
+            notes: None,
+            basic_auth: false,
+            https: false,
+            force_https: false,
+            carriers: 1,
+            auto_reconnect: false,
+            webserver_log: false,
+            udp: false,
+            vpn_relay_only: false,
+            vpn_pin_mtu: false,
+            vpn_mtu: None,
+            vpn_forward_accept: false,
+            vpn_nat_masquerade: false,
+            vpn_route_policy: None,
+            vpn_advertised: vec![],
+            vpn_nat_udp_port: None,
+            local_proxy_port: None,
+            local_host: None,
+            local_port: None,
+            nat_udp_preferred_port: None,
+            nat_udp_release_timeout: None,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
+            max_conns: None,
+        }
+    }
+
+    let server = Server::new(1024..=65535, None);
+    let reg = server.admin_registry();
+
+    let _p = reg.register(secret_entry(Role::SecretProvider, "203.0.113.1:30000"));
+    let _c1 = reg.register(secret_entry(Role::SecretConsumer, "203.0.113.2:40001"));
+    let c2 = reg.register(secret_entry(Role::SecretConsumer, "203.0.113.2:40002"));
+    let zombie = reg.register(secret_entry(Role::SecretConsumer, "203.0.113.2:40003"));
+
+    // 1 provider + 3 consumers = 4.
+    assert_eq!(bore_cli::admin_api::summary(&server).secret_tunnels, 4);
+    assert_eq!(bore_cli::admin_api::metrics(&server).secret_tunnels, 4);
+
+    // T-COUNT2: dropping a Registration (what the recv-deadline reaper triggers
+    // when it returns from the loop) removes the entry from the snapshot...
+    drop(zombie);
+    assert_eq!(
+        server.admin_registry().snapshot().len(),
+        3,
+        "dropped registration must vanish from the snapshot"
+    );
+    // ...and the counts drop with it (no zombie inflation).
+    assert_eq!(bore_cli::admin_api::summary(&server).secret_tunnels, 3);
+    assert_eq!(bore_cli::admin_api::metrics(&server).secret_tunnels, 3);
+
+    drop(c2);
+    assert_eq!(bore_cli::admin_api::summary(&server).secret_tunnels, 2);
+}

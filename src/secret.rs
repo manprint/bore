@@ -24,7 +24,7 @@ use dashmap::DashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{interval, Instant as TokioInstant, MissedTickBehavior};
 #[cfg(feature = "udp")]
 use tracing::debug;
 use tracing::{error, info, info_span, trace, warn, Instrument};
@@ -43,6 +43,22 @@ use uuid::Uuid;
 
 /// Heartbeat interval on secret-tunnel control substreams.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long the server waits for *any* control frame from a secret
+/// provider/consumer before reaping the connection (and its admin entry). The
+/// control channel is a yamux substream, so a half-open/abandoned peer is
+/// invisible to `send`/`recv`; without this deadline the loop blocks forever on
+/// `recv` and the RAII admin `Registration` never drops — a zombie entry. The
+/// client sends [`ClientMessage::Heartbeat`] every [`CTRL_CLIENT_HEARTBEAT`] so a
+/// healthy idle tunnel always beats this. Parity with the VPN
+/// `CTRL_HEARTBEAT_TIMEOUT` (60 s). Overridable per-server (see
+/// [`crate::server::Server::secret_ctrl_timeout`]) so tests can reap fast.
+pub(crate) const SECRET_CTRL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often a secret provider/consumer *client* sends [`ClientMessage::Heartbeat`]
+/// up the control substream. Must stay well under [`SECRET_CTRL_TIMEOUT`] so a
+/// few lost frames never trip the server's reaper.
+pub(crate) const CTRL_CLIENT_HEARTBEAT: Duration = Duration::from_secs(20);
 
 /// How long a consumer waits for the server to broker a UDP direct path before
 /// falling back to the relay.
@@ -252,6 +268,7 @@ pub async fn serve_provider(
     carriers: u16,
     udp_tuning: UdpDirectTuning,
     display: SecretDisplay,
+    ctrl_timeout: Duration,
 ) -> Result<()> {
     // Register atomically, rejecting a duplicate id rather than hijacking it. The
     // registration is a carrier pool seeded with this connection's opener; extra
@@ -338,15 +355,28 @@ pub async fn serve_provider(
     let mut offers: Option<mpsc::Receiver<UdpOffer>> = None;
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Liveness deadline: reaped if no client frame arrives within `ctrl_timeout`.
+    // Checked on every heartbeat tick (≤ HEARTBEAT_INTERVAL granularity) rather
+    // than via `timeout(recv)` — the latter would reset every time the heartbeat
+    // branch wins the `select!`, so it could never reach `ctrl_timeout`.
+    let mut last_recv = TokioInstant::now();
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 if control.send(ServerMessage::Heartbeat).await.is_err() {
                     return Ok(());
                 }
+                if last_recv.elapsed() >= ctrl_timeout {
+                    warn!(%id, timeout = ?ctrl_timeout,
+                        "secret provider control idle; reaping (peer wedged/abandoned)");
+                    return Ok(());
+                }
             }
             message = control.recv() => {
+                last_recv = TokioInstant::now();
                 match message? {
+                    // Liveness ping; the deadline reset above is its only effect.
+                    Some(ClientMessage::Heartbeat) => {}
                     Some(ClientMessage::UdpCandidates(candidates)) => {
                         register_provider_udp_offer(
                             &udp_registry,
@@ -424,6 +454,7 @@ pub async fn serve_consumer(
     grx: Arc<std::sync::atomic::AtomicU64>,
     gtx: Arc<std::sync::atomic::AtomicU64>,
     display: SecretDisplay,
+    ctrl_timeout: Duration,
 ) -> Result<()> {
     info!(%id, "secret consumer connected");
     control.send(ServerMessage::Ok).await?;
@@ -467,10 +498,19 @@ pub async fn serve_consumer(
 
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Liveness deadline: reaped if no client frame arrives within `ctrl_timeout`.
+    // Checked on the heartbeat tick, not via `timeout(recv)` (which the heartbeat
+    // branch would reset every iteration so it never reaches `ctrl_timeout`).
+    let mut last_recv = TokioInstant::now();
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 if control.send(ServerMessage::Heartbeat).await.is_err() {
+                    return Ok(());
+                }
+                if last_recv.elapsed() >= ctrl_timeout {
+                    warn!(%id, timeout = ?ctrl_timeout,
+                        "secret consumer control idle; reaping (peer wedged/abandoned)");
                     return Ok(());
                 }
             }
@@ -478,7 +518,10 @@ pub async fn serve_consumer(
             // the registered provider (if it is UDP-capable) and reply with the
             // provider's candidates + a shared nonce, else say it is unavailable.
             message = control.recv() => {
+                last_recv = TokioInstant::now();
                 match message? {
+                    // Liveness ping; the deadline reset above is its only effect.
+                    Some(ClientMessage::Heartbeat) => {}
                     Some(ClientMessage::UdpCandidates(consumer_cands)) => {
                         // Flag for the admin page that this consumer attempted a
                         // direct path (success is established peer-to-peer, off the
@@ -1080,6 +1123,13 @@ impl Proxy {
         let mut upgrade_backoff = reconnect::Backoff::new_with(1, 1);
         #[cfg(not(feature = "udp"))]
         let mut upgrade_attempt = 0;
+        // Periodic liveness ping so the server's recv-deadline reaper never trips
+        // on a healthy idle consumer (a yamux substream hides a half-open peer).
+        let mut ctrl_heartbeat = {
+            let mut t = tokio::time::interval(CTRL_CLIENT_HEARTBEAT);
+            t.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            t
+        };
         loop {
             // Kick off an upgrade attempt on the timer. Non-blocking: the attempt
             // runs in `upgrade_task`; this loop keeps accepting and forwarding.
@@ -1309,6 +1359,11 @@ impl Proxy {
                                 }
                             }
                         }
+                    }
+                }
+                _ = ctrl_heartbeat.tick() => {
+                    if control.send(ClientMessage::Heartbeat).await.is_err() {
+                        return Ok(());
                     }
                 }
                 accepted = listener.accept() => {

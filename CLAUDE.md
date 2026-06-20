@@ -88,6 +88,21 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   back per-connection to the warm TCP relay. Needs `bore server --udp`
 
 **Key invariants to never break:**
+- **Secret control liveness (zombie-entry reaper):** the secret provider/consumer
+  control loop is a yamux substream, so a half-open/abandoned peer is invisible to
+  `send`/`recv` (send buffers into yamux, recv blocks forever) → the RAII admin
+  `Registration` never drops → a zombie admin entry persists (inflates the "Secret
+  Tunnels" count). FIX: `serve_provider`/`serve_consumer` track `last_recv` and
+  reap (return → drop entry) when `last_recv.elapsed() >= ctrl_timeout`, **checked
+  on the 500 ms heartbeat tick** — NOT via `timeout(recv)` (the heartbeat branch
+  wins the `select!` every 500 ms and would reset a `timeout(recv)` future before
+  it ever reaches the deadline). The secret-provider client (shared `client::listen`,
+  gated by `is_secret_provider`) and consumer client (`secret::Proxy` loop) send
+  `ClientMessage::Heartbeat` every `CTRL_CLIENT_HEARTBEAT` (20 s ≪ 60 s) so a
+  healthy idle tunnel never trips it. `ClientMessage::Heartbeat` is appended LAST
+  (wire-compat: old server can't decode it → upgrade server before/with clients).
+  `Server::secret_ctrl_timeout()` lowers the 60 s default for tests. Public/vhost
+  tunnels keep the legacy heartbeat-free path (their server loops are unchanged).
 - Client sends `Hello` before auth (yamux is lazy; without it, deadlock)
 - `HelloVpn`/`ConnectVpn` sent **before** auth (same lazy-yamux rule as `Hello`)
 - Server writes `mux::STREAM_READY` before splice (banner-first protocols need it)

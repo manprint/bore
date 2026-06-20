@@ -2,11 +2,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use bore_cli::{
-    admin::Role,
+    admin::{AdminRegistry, Role},
     client::{Client, ProviderMeta},
+    mux,
     secret::Proxy,
     server::Server,
-    shared::{TunnelOptions, CONTROL_PORT},
+    shared::{ClientMessage, Delimited, ServerMessage, TunnelOptions, CONTROL_PORT},
 };
 use lazy_static::lazy_static;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -718,5 +719,177 @@ async fn admin_registry_reflects_connections() -> Result<()> {
         "consumer entry must be removed after disconnect"
     );
 
+    Ok(())
+}
+
+// ---- Liveness reaper (zombie secret entries) regression tests ----
+
+/// A bare `ConnectSecret` with all display fields defaulted — mirrors an old /
+/// minimal consumer (exactly the bare zombie rows seen in the field).
+fn connect_secret(id: &str) -> ClientMessage {
+    ClientMessage::ConnectSecret {
+        id: id.into(),
+        notes: None,
+        carriers: 0,
+        auto_reconnect: false,
+        udp: false,
+        local_proxy_port: 0,
+        nat_udp_preferred_port: 0,
+        nat_udp_release_timeout: 0,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+    }
+}
+
+/// Count live admin entries of a given role; poll up to `max_ms` for `want`.
+async fn wait_role(admin: &AdminRegistry, role: Role, want: usize, max_ms: u64) -> usize {
+    let count = |a: &AdminRegistry| a.snapshot().iter().filter(|e| e.role == role).count();
+    for _ in 0..(max_ms / 20).max(1) {
+        if count(admin) == want {
+            return want;
+        }
+        time::sleep(Duration::from_millis(20)).await;
+    }
+    count(admin)
+}
+
+/// Open a raw control substream to the server (no auth server), bypassing the
+/// real client so the test fully controls whether heartbeats are sent.
+async fn raw_control() -> Result<(mux::Opener, Delimited<mux::Stream>)> {
+    let tcp = TcpStream::connect(("localhost", CONTROL_PORT)).await?;
+    let (opener, _acc) = mux::client(tcp);
+    let stream = opener.open().await?;
+    Ok((opener, Delimited::new(stream)))
+}
+
+/// T-REAP-C1: a secret consumer whose control substream wedges (registers, then
+/// goes silent — never sends `ClientMessage::Heartbeat`) must be reaped, so its
+/// admin entry cannot survive as a zombie. This is the core data-integrity fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_consumer_reaped_when_control_wedges() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    wait_for_control_port(false).await;
+    let server = Server::new(1024..=65535, None).secret_ctrl_timeout(Duration::from_millis(700));
+    let admin = server.admin_registry();
+    tokio::spawn(server.listen());
+    wait_for_control_port(true).await;
+
+    // Hold opener + control so the TCP stays UP (wedged, not closed).
+    let (_opener, mut control) = raw_control().await?;
+    control.send(connect_secret("svc-reap")).await?;
+    assert!(
+        matches!(
+            control.recv::<ServerMessage>().await?,
+            Some(ServerMessage::Ok)
+        ),
+        "server acks the consumer registration"
+    );
+    assert_eq!(
+        wait_role(&admin, Role::SecretConsumer, 1, 1500).await,
+        1,
+        "consumer entry must register"
+    );
+
+    // Go silent. The reaper must remove the entry past ctrl_timeout (700ms).
+    assert_eq!(
+        wait_role(&admin, Role::SecretConsumer, 0, 4000).await,
+        0,
+        "a wedged/silent consumer must be reaped — no zombie entry"
+    );
+    Ok(())
+}
+
+/// T-REAP-C2: a consumer that keeps sending heartbeats is NEVER reaped (no
+/// false-positive reaping of a healthy idle tunnel).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_consumer_survives_with_heartbeats() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    wait_for_control_port(false).await;
+    let server = Server::new(1024..=65535, None).secret_ctrl_timeout(Duration::from_millis(600));
+    let admin = server.admin_registry();
+    tokio::spawn(server.listen());
+    wait_for_control_port(true).await;
+
+    let (_opener, mut control) = raw_control().await?;
+    control.send(connect_secret("svc-live")).await?;
+    assert!(matches!(
+        control.recv::<ServerMessage>().await?,
+        Some(ServerMessage::Ok)
+    ));
+    assert_eq!(wait_role(&admin, Role::SecretConsumer, 1, 1500).await, 1);
+
+    // Beat every 100ms (≪ 600ms timeout) for ~2s; the entry must stay alive the
+    // whole time — well past several reaper windows.
+    let beater = tokio::spawn(async move {
+        for _ in 0..20 {
+            if control.send(ClientMessage::Heartbeat).await.is_err() {
+                break;
+            }
+            time::sleep(Duration::from_millis(100)).await;
+        }
+        // Keep the connection open after beating stops only briefly.
+        control
+    });
+    time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        admin
+            .snapshot()
+            .iter()
+            .filter(|e| e.role == Role::SecretConsumer)
+            .count(),
+        1,
+        "a heartbeating consumer must NOT be reaped"
+    );
+    let _ = beater.await;
+    Ok(())
+}
+
+/// T-REAP-P1: the same reaper guards secret PROVIDERS — a silent provider
+/// (registers via HelloSecret, then wedges) must be reaped too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_provider_reaped_when_control_wedges() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    wait_for_control_port(false).await;
+    let server = Server::new(1024..=65535, None).secret_ctrl_timeout(Duration::from_millis(700));
+    let admin = server.admin_registry();
+    tokio::spawn(server.listen());
+    wait_for_control_port(true).await;
+
+    let (_opener, mut control) = raw_control().await?;
+    control
+        .send(ClientMessage::HelloSecret {
+            id: "svc-prov-reap".into(),
+            notes: None,
+            basic_auth: false,
+            carriers: 1,
+            udp: false,
+            auto_reconnect: false,
+            webserver_log: false,
+            nat_udp_preferred_port: 0,
+            nat_udp_release_timeout: 0,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
+            max_conns: 0,
+            local_host: None,
+            local_port: 0,
+        })
+        .await?;
+    assert!(matches!(
+        control.recv::<ServerMessage>().await?,
+        Some(ServerMessage::Ok)
+    ));
+    assert_eq!(
+        wait_role(&admin, Role::SecretProvider, 1, 1500).await,
+        1,
+        "provider entry must register"
+    );
+
+    assert_eq!(
+        wait_role(&admin, Role::SecretProvider, 0, 4000).await,
+        0,
+        "a wedged/silent provider must be reaped — no zombie entry"
+    );
     Ok(())
 }

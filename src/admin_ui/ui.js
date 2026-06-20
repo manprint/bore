@@ -93,6 +93,9 @@ export function flagBadges(e) {
     if (e.carriers > 1) b.push({ label: `x${e.carriers} carriers`, kind: 'default' });
     if (e.auto_reconnect) b.push({ label: 'Auto-reconnect', kind: 'success' });
     if (e.webserver_log) b.push({ label: 'Weblog', kind: 'default' });
+    if (e.upnp === true) b.push({ label: 'UPnP', kind: 'default' });
+    if (e.try_port_prediction === true) b.push({ label: 'Port-Pred', kind: 'default' });
+    if (e.nat_udp_preferred_port > 0) b.push({ label: `NAT:${e.nat_udp_preferred_port}`, kind: 'default' });
     return b;
 }
 

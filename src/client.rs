@@ -339,6 +339,17 @@ impl Client {
                 notes: meta.notes.clone(),
                 basic_auth: meta.basic_auth.is_some(),
                 carriers,
+                udp,
+                auto_reconnect: meta.auto_reconnect,
+                webserver_log: access_logger.is_some(),
+                nat_udp_preferred_port: udp_port,
+                nat_udp_release_timeout,
+                stun_server: stun_server.map(|s| s.to_string()),
+                upnp: port_map,
+                try_port_prediction: port_prediction,
+                max_conns,
+                local_host: Some(local_host.to_string()),
+                local_port,
             })
             .await?;
         if let Some(secret) = secret {
@@ -556,6 +567,8 @@ impl Client {
                 udp,
                 webserver_log: access_logger.is_some(),
                 auto_reconnect: meta.auto_reconnect,
+                local_host: Some(local_host.to_string()),
+                local_port,
             })
             .await?;
 

@@ -217,6 +217,7 @@ async fn secret_provider_basic_auth_rejects_and_allows() -> Result<()> {
         0, // release timeout
         1, // carriers
         None,
+        false,
     )
     .await?;
     let addr = proxy.local_addr()?;

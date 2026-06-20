@@ -204,6 +204,7 @@ async fn admin_data_reflects_live_tunnels() -> Result<()> {
         0, // release timeout
         1, // carriers
         Some("consumer-note".into()),
+        false,
     )
     .await?;
     let consumer = tokio::spawn(proxy.listen());
@@ -496,6 +497,9 @@ fn t_views_serialize_stable() {
         auto_reconnect: false,
         webserver_log: false,
         udp: false,
+        local_host: Some("127.0.0.1".into()),
+        local_port: Some(8080),
+        max_conns: Some(50),
         overlay: None,
         vpn_direct: false,
         active: 3,
@@ -504,6 +508,8 @@ fn t_views_serialize_stable() {
         relay_rx_bytes: 2048,
     };
     let json_tunnel = serde_json::to_value(&tunnel).expect("serialize TunnelView");
+    assert_eq!(json_tunnel["local_port"], 8080);
+    assert_eq!(json_tunnel["max_conns"], 50);
     assert_no_secret_keys(&json_tunnel, "");
 
     // SecretView (secret tunnel with secret_id field, which must be exempted).
@@ -514,8 +520,19 @@ fn t_views_serialize_stable() {
         secret_id: Some("abc123def456".into()), // Allowed field; exempted in check.
         notes: None,
         basic_auth: false,
-        carriers: 1,
+        carriers: 4,
         udp: false,
+        auto_reconnect: true,
+        webserver_log: false,
+        local_proxy_port: Some(5432),
+        local_host: None,
+        local_port: None,
+        nat_udp_preferred_port: Some(443),
+        nat_udp_release_timeout: None,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        max_conns: None,
         active: 0,
         uptime_secs: 50,
         relay_tx_bytes: 512,
@@ -525,6 +542,11 @@ fn t_views_serialize_stable() {
     assert_no_secret_keys(&json_secret, "");
     // Verify secret_id is actually present (not stripped).
     assert_eq!(json_secret["secret_id"], "abc123def456");
+    // Flag-parity: consumer display fields must reach the JSON (the reported bugs).
+    assert_eq!(json_secret["carriers"], 4);
+    assert_eq!(json_secret["auto_reconnect"], true);
+    assert_eq!(json_secret["local_proxy_port"], 5432);
+    assert_eq!(json_secret["nat_udp_preferred_port"], 443);
 
     // VhostView.
     let vhost = VhostView {
@@ -535,6 +557,8 @@ fn t_views_serialize_stable() {
         udp: false,
         auto_reconnect: false,
         webserver_log: false,
+        local_host: Some("127.0.0.1".into()),
+        local_port: Some(3000),
         uptime_secs: 75,
         relay_tx_bytes: 256,
         relay_rx_bytes: 512,
@@ -678,6 +702,15 @@ fn t_vpn_panel_groups_and_fields() {
             vpn_route_policy: None,
             vpn_advertised: vec!["10.10.0.0/24".into()],
             vpn_nat_udp_port: Some(443),
+            local_proxy_port: None,
+            local_host: None,
+            local_port: None,
+            nat_udp_preferred_port: None,
+            nat_udp_release_timeout: None,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
+            max_conns: None,
         }
     }
 

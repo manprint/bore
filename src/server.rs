@@ -1207,6 +1207,17 @@ impl Server {
                 notes,
                 basic_auth,
                 carriers,
+                udp,
+                auto_reconnect,
+                webserver_log,
+                nat_udp_preferred_port,
+                nat_udp_release_timeout,
+                stun_server,
+                upnp,
+                try_port_prediction,
+                max_conns,
+                local_host,
+                local_port,
             }) => {
                 secret::serve_provider(
                     control,
@@ -1222,10 +1233,37 @@ impl Server {
                     self.max_carriers,
                     carriers,
                     self.udp_tuning,
+                    secret::SecretDisplay {
+                        udp,
+                        auto_reconnect,
+                        webserver_log,
+                        nat_udp_preferred_port,
+                        nat_udp_release_timeout,
+                        stun_server,
+                        upnp,
+                        try_port_prediction,
+                        max_conns,
+                        local_host,
+                        local_port,
+                        local_proxy_port: 0,
+                        carriers,
+                    },
                 )
                 .await
             }
-            Some(ClientMessage::ConnectSecret { id, notes }) => {
+            Some(ClientMessage::ConnectSecret {
+                id,
+                notes,
+                carriers,
+                auto_reconnect,
+                udp,
+                local_proxy_port,
+                nat_udp_preferred_port,
+                nat_udp_release_timeout,
+                stun_server,
+                upnp,
+                try_port_prediction,
+            }) => {
                 secret::serve_consumer(
                     control,
                     acceptor,
@@ -1239,6 +1277,21 @@ impl Server {
                     self.udp_tuning,
                     Arc::clone(&self.total_rx_bytes),
                     Arc::clone(&self.total_tx_bytes),
+                    secret::SecretDisplay {
+                        udp,
+                        auto_reconnect,
+                        webserver_log: false,
+                        nat_udp_preferred_port,
+                        nat_udp_release_timeout,
+                        stun_server,
+                        upnp,
+                        try_port_prediction,
+                        max_conns: 0,
+                        local_host: None,
+                        local_port: 0,
+                        local_proxy_port,
+                        carriers,
+                    },
                 )
                 .await
             }
@@ -1251,6 +1304,8 @@ impl Server {
                 udp,
                 webserver_log,
                 auto_reconnect,
+                local_host,
+                local_port,
             }) => {
                 let Some(cfg) = self.vhost_config.clone() else {
                     warn!("vhost not configured on this server");
@@ -1281,6 +1336,8 @@ impl Server {
                     self.pending_vhost_udp.clone(),
                     self.secret.clone(),
                     self.udp_tuning,
+                    local_host,
+                    local_port,
                 )
                 .await
             }
@@ -1539,6 +1596,17 @@ impl Server {
             vpn_route_policy: None,
             vpn_advertised: vec![],
             vpn_nat_udp_port: None,
+            local_proxy_port: None,
+            local_host: opts.local_host.clone(),
+            local_port: (opts.local_port != 0).then_some(opts.local_port),
+            // Public tunnels do not use the secret-tunnel holepunch helper flags
+            // (D4 / CLAUDE.md): they are warned-and-ignored client-side.
+            nat_udp_preferred_port: None,
+            nat_udp_release_timeout: None,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
+            max_conns: (opts.max_conns != 0).then_some(opts.max_conns),
         });
         let active = registration.active();
         // Per-tunnel relay byte counters (shown on /admin/status#/tunnels). These

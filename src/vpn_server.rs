@@ -714,6 +714,15 @@ pub async fn serve_vpn_listener(
         vpn_route_policy: route_policy,
         vpn_advertised: advertised_display,
         vpn_nat_udp_port: nat_udp_display,
+        local_proxy_port: None,
+        local_host: None,
+        local_port: None,
+        nat_udp_preferred_port: None,
+        nat_udp_release_timeout: None,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        max_conns: None,
     });
 
     info!(%id, "vpn listener registered, waiting for connector");
@@ -1136,6 +1145,15 @@ pub async fn serve_vpn_connector(
             vpn_route_policy: route_policy,
             vpn_advertised: advertised.iter().map(|n| n.to_string()).collect(),
             vpn_nat_udp_port: nat_udp_display,
+            local_proxy_port: None,
+            local_host: None,
+            local_port: None,
+            nat_udp_preferred_port: None,
+            nat_udp_release_timeout: None,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
+            max_conns: None,
         });
         admin_reg.set_overlay(format!("{}/32", peer_slot.overlay));
 
@@ -1451,6 +1469,15 @@ pub async fn serve_vpn_connector(
         vpn_route_policy: route_policy,
         vpn_advertised: advertised.iter().map(|n| n.to_string()).collect(),
         vpn_nat_udp_port: nat_udp_display,
+        local_proxy_port: None,
+        local_host: None,
+        local_port: None,
+        nat_udp_preferred_port: None,
+        nat_udp_release_timeout: None,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        max_conns: None,
     });
     admin_reg.set_overlay(format!("{connector_overlay}/30"));
 

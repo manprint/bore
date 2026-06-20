@@ -19,7 +19,10 @@ test('flagBadges covers every flag for a fully-flagged entry', () => {
         udp: true,
         carriers: 8,
         auto_reconnect: true,
-        webserver_log: true
+        webserver_log: true,
+        upnp: true,
+        try_port_prediction: true,
+        nat_udp_preferred_port: 443
     }).map((b) => b.label);
 
     assert.ok(labels.includes('HTTPS'));
@@ -30,6 +33,9 @@ test('flagBadges covers every flag for a fully-flagged entry', () => {
     assert.ok(labels.some((l) => l.includes('8')), 'carriers count');
     assert.ok(labels.includes('Auto-reconnect'));
     assert.ok(labels.includes('Weblog'));
+    assert.ok(labels.includes('UPnP'));
+    assert.ok(labels.includes('Port-Pred'));
+    assert.ok(labels.some((l) => l === 'NAT:443'));
 });
 
 test('flagBadges shows nothing for a bare entry', () => {

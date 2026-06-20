@@ -420,6 +420,7 @@ async fn secret_proxy_websocket_relay_round_trip() -> Result<()> {
         0,
         1,
         None,
+        false,
     )
     .await?;
     let addr = proxy.local_addr()?;
@@ -480,6 +481,7 @@ async fn secret_proxy_websocket_direct_udp_round_trip() -> Result<()> {
         0,
         1,
         None,
+        false,
     )
     .await?;
     ensure!(

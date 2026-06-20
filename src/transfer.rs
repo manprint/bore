@@ -708,6 +708,7 @@ pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
         options.nat_udp_release_timeout,
         carriers,
         None,
+        false,
     )
     .await?;
     let transport = TransportMode {

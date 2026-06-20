@@ -143,6 +143,7 @@ async fn provider_pool_relays_concurrent_connections() -> Result<()> {
         0, // release timeout
         1, // carriers
         None,
+        false,
     )
     .await?;
     let addr = proxy.local_addr()?;
@@ -169,6 +170,7 @@ async fn spawn_consumer(id: &str, consumer_carriers: u16) -> Result<SocketAddr> 
         0, // release timeout
         consumer_carriers,
         None,
+        false,
     )
     .await?;
     let addr = proxy.local_addr()?;

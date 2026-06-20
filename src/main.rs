@@ -1433,6 +1433,9 @@ async fn dispatch(command: Command) -> Result<()> {
                         udp,
                         auto_reconnect,
                         webserver_log: webserver_log.is_some(),
+                        max_conns,
+                        local_host: Some(local_host.clone()),
+                        local_port,
                     };
                     let connect = move || {
                         let (local_host, to, secret, options, access_logger) = (
@@ -1514,6 +1517,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         nat_udp_release_timeout,
                         carriers,
                         notes,
+                        auto_reconnect,
                     )
                     .await
                 }

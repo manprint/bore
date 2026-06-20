@@ -50,23 +50,33 @@ test('T-LABELS: secret table uses "Connections" header not "Active"', async () =
     const data = [
         {
             id: 1,
-            role: 'Provider',
+            role: 'secretprovider',
             secret_id: 'secret123',
             peer: '10.0.0.1:50001',
+            local_host: 'localhost',
+            local_port: 8080,
             active: 1,
             uptime_secs: 7200,
             relay_tx_bytes: 5000,
             relay_rx_bytes: 10000,
             udp: false,
             basic_auth: false,
-            carriers: 1
+            carriers: 1,
+            auto_reconnect: false,
+            webserver_log: false,
+            notes: null
         }
     ];
 
     const el = document.createElement('div');
     await secretPanel.render(el, data);
 
-    const table = el.children[0];
+    // Secret panel now renders cards with nested tables
+    const container = el.children[0];
+    const card = container.children[0];
+    const body = card.children[1];
+    const roleSection = body.children[0];
+    const table = roleSection.children[1];
     const thead = table.children[0];
     const headerRow = thead.children[0];
 

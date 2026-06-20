@@ -371,6 +371,10 @@ pub struct VhostEntry {
     pub udp: bool,
     /// Whether the provider runs with `--auto-reconnect` (display only).
     pub auto_reconnect: bool,
+    /// Provider's local target host (`-l/--local-host` of the forwarded service).
+    pub local_host: Option<String>,
+    /// Provider's local target port (0 = unknown).
+    pub local_port: u16,
     /// Relay bytes sent toward the provider (server→provider), summed off the hot
     /// path from the totals `copy_bidirectional_with_sizes` returns.
     pub relay_tx_bytes: Arc<AtomicU64>,
@@ -549,6 +553,8 @@ pub async fn serve_vhost_provider(
     pending_vhost_udp: PendingVhostUdp,
     _secret: Option<String>,
     udp_tuning: UdpDirectTuning,
+    local_host: Option<String>,
+    local_port: u16,
 ) -> Result<()> {
     // Validate against live config (resolve_route checks reservations).
     let cfg = vhost_config.read().unwrap().clone();
@@ -593,6 +599,8 @@ pub async fn serve_vhost_provider(
                 basic_auth,
                 udp,
                 auto_reconnect,
+                local_host: local_host.clone(),
+                local_port,
                 relay_tx_bytes: Arc::new(AtomicU64::new(0)),
                 relay_rx_bytes: Arc::new(AtomicU64::new(0)),
             });
@@ -631,6 +639,15 @@ pub async fn serve_vhost_provider(
         vpn_route_policy: None,
         vpn_advertised: vec![],
         vpn_nat_udp_port: None,
+        local_proxy_port: None,
+        local_host,
+        local_port: (local_port != 0).then_some(local_port),
+        nat_udp_preferred_port: None,
+        nat_udp_release_timeout: None,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        max_conns: None,
     });
 
     // Compute and send the public URLs based on current config.

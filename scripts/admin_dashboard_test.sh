@@ -178,6 +178,7 @@ ip netns exec nscli "$BORE" local 9988 \
     --secret "$SERVER_SECRET" \
     --tcp-secret-id "$SECRET_ID" \
     --notes "Provider notes test" \
+    --carriers 4 --auto-reconnect \
     >"$PROVIDER_LOG" 2>&1 &
 PROVIDER_PID=$!
 
@@ -191,6 +192,7 @@ ip netns exec ns0 "$BORE" proxy \
     --tcp-secret-id "$SECRET_ID" \
     --local-proxy-port "127.0.0.1:19999" \
     --notes "Consumer notes test" \
+    --carriers 4 --auto-reconnect --nat-udp-preferred-port 443 \
     >"$CONSUMER_LOG" 2>&1 &
 CONSUMER_PID=$!
 
@@ -442,6 +444,39 @@ else
         fail "T-SECNOTES notes missing; body=$BODY"
     fi
 fi
+
+# T-SEC-PARITY: the secret CONSUMER must surface every flag it was launched with
+# (the reported bugs: carriers / local-proxy-port / auto-reconnect /
+# nat-udp-preferred-port). These ride the ConnectSecret wire message now.
+R=$(aget /admin/api/v1/secret "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+if $JQ_AVAIL; then
+    consumer_ok=$(echo "$BODY" | jq -e \
+        'any(.[]; .role=="secretconsumer" and .carriers==4 and .auto_reconnect==true
+                  and .local_proxy_port==19999 and .nat_udp_preferred_port==443)' \
+        >/dev/null 2>&1 && echo y)
+    # Provider surfaces carriers + auto_reconnect + its local target port.
+    provider_ok=$(echo "$BODY" | jq -e \
+        'any(.[]; .role=="secretprovider" and .carriers==4 and .auto_reconnect==true
+                  and .local_port==9988)' \
+        >/dev/null 2>&1 && echo y)
+    # Grouping: provider and consumer share the same secret_id.
+    group_ok=$(echo "$BODY" | jq -e --arg id "$SECRET_ID" \
+        '(any(.[]; .role=="secretprovider" and .secret_id==$id))
+         and (any(.[]; .role=="secretconsumer" and .secret_id==$id))' \
+        >/dev/null 2>&1 && echo y)
+else
+    consumer_ok=$(echo "$BODY" | grep -q '"local_proxy_port":19999' \
+        && echo "$BODY" | grep -q '"nat_udp_preferred_port":443' \
+        && echo "$BODY" | grep -q '"auto_reconnect":true' && echo y)
+    provider_ok=$(echo "$BODY" | grep -q '"local_port":9988' && echo y)
+    group_ok=$(echo "$BODY" | grep -q "\"secret_id\":\"$SECRET_ID\"" && echo y)
+fi
+[ "$consumer_ok" = "y" ] && pass "T-SEC-PARITY consumer carriers=4 + auto_reconnect + local_proxy_port=19999 + nat_udp_preferred_port=443" \
+    || fail "T-SEC-PARITY consumer flags missing; body=$BODY"
+[ "$provider_ok" = "y" ] && pass "T-SEC-PARITY provider carriers=4 + auto_reconnect + local_port=9988" \
+    || fail "T-SEC-PARITY provider flags missing; body=$BODY"
+[ "$group_ok" = "y" ] && pass "T-SEC-PARITY provider+consumer share secret_id ($SECRET_ID)" \
+    || fail "T-SEC-PARITY grouping secret_id mismatch; body=$BODY"
 
 # ── Phase 5.1 / 5.3 new e2e assertions ─────────────────────────────────────────
 echo ""

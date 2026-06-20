@@ -70,6 +70,12 @@ pub struct TunnelView {
     pub webserver_log: bool,
     /// UDP direct-path enabled.
     pub udp: bool,
+    /// Local target host the client forwards to (`-l/--local-host`).
+    pub local_host: Option<String>,
+    /// Local target port the client forwards to.
+    pub local_port: Option<u16>,
+    /// Client's `--max-conns` cap (None when unset).
+    pub max_conns: Option<usize>,
     /// VPN overlay address (if applicable).
     pub overlay: Option<String>,
     /// Direct QUIC path active.
@@ -103,6 +109,28 @@ pub struct SecretView {
     pub carriers: u16,
     /// UDP direct-path enabled.
     pub udp: bool,
+    /// Client runs with `--auto-reconnect`.
+    pub auto_reconnect: bool,
+    /// Provider requested HTTP access logging (`--webserver-log`).
+    pub webserver_log: bool,
+    /// Consumer's local proxy listen port (`--local-proxy-port`).
+    pub local_proxy_port: Option<u16>,
+    /// Provider's local target host (`-l/--local-host`).
+    pub local_host: Option<String>,
+    /// Provider's local target port.
+    pub local_port: Option<u16>,
+    /// `--nat-udp-preferred-port` (None when unset).
+    pub nat_udp_preferred_port: Option<u16>,
+    /// `--nat-udp-release-timeout` seconds (None when unset).
+    pub nat_udp_release_timeout: Option<u64>,
+    /// `--stun-server`, if any.
+    pub stun_server: Option<String>,
+    /// `--upnp` enabled.
+    pub upnp: bool,
+    /// `--try-port-prediction` enabled.
+    pub try_port_prediction: bool,
+    /// Provider's `--max-conns` cap (None when unset).
+    pub max_conns: Option<usize>,
     /// Active proxied connections.
     pub active: usize,
     /// Seconds since connection registered.
@@ -135,6 +163,10 @@ pub struct VhostView {
     pub auto_reconnect: bool,
     /// Provider requested HTTP access logging (`--webserver-log`).
     pub webserver_log: bool,
+    /// Provider's local target host (`-l/--local-host`).
+    pub local_host: Option<String>,
+    /// Provider's local target port.
+    pub local_port: Option<u16>,
     /// Seconds since the provider registered.
     pub uptime_secs: u64,
     /// Relay tx bytes (server→provider) for this subdomain.
@@ -570,6 +602,9 @@ mod tests {
             auto_reconnect: true,
             webserver_log: true,
             udp: false,
+            local_host: Some("127.0.0.1".into()),
+            local_port: Some(8080),
+            max_conns: Some(50),
             overlay: None,
             vpn_direct: false,
             active: 0,

@@ -293,6 +293,16 @@ pub struct TunnelOptions {
     /// `#[serde(default)]` keeps the wire format backward-compatible.
     #[serde(default)]
     pub webserver_log: bool,
+    /// The client's `--max-conns` cap on concurrent proxied connections.
+    /// Display-only. `#[serde(default)]` keeps the wire format backward-compatible.
+    #[serde(default)]
+    pub max_conns: usize,
+    /// The client's local service host (`-l/--local-host`). Display-only.
+    #[serde(default)]
+    pub local_host: Option<String>,
+    /// The client's local service port. `0` = unknown. Display-only.
+    #[serde(default)]
+    pub local_port: u16,
 }
 
 /// Options negotiated by two `bore test-udp` peers once the server pairs them.
@@ -770,6 +780,42 @@ pub enum ClientMessage {
         /// `#[serde(default)]` keeps the wire format backward-compatible.
         #[serde(default)]
         carriers: u16,
+        /// Whether the provider requested the UDP/QUIC direct path (`--udp`).
+        /// Display-only.
+        #[serde(default)]
+        udp: bool,
+        /// Whether the provider runs with `--auto-reconnect`. Display-only.
+        #[serde(default)]
+        auto_reconnect: bool,
+        /// Whether the provider requested HTTP access logging (`--webserver-log`).
+        /// Display-only.
+        #[serde(default)]
+        webserver_log: bool,
+        /// The provider's `--nat-udp-preferred-port` (0 = unset/ephemeral).
+        /// Display-only.
+        #[serde(default)]
+        nat_udp_preferred_port: u16,
+        /// The provider's `--nat-udp-release-timeout` seconds. Display-only.
+        #[serde(default)]
+        nat_udp_release_timeout: u64,
+        /// The provider's selected `--stun-server`, if any. Display-only.
+        #[serde(default)]
+        stun_server: Option<String>,
+        /// Whether the provider enabled `--upnp`. Display-only.
+        #[serde(default)]
+        upnp: bool,
+        /// Whether the provider enabled `--try-port-prediction`. Display-only.
+        #[serde(default)]
+        try_port_prediction: bool,
+        /// The provider's `--max-conns` cap. Display-only.
+        #[serde(default)]
+        max_conns: usize,
+        /// The provider's local service host (`-l/--local-host`). Display-only.
+        #[serde(default)]
+        local_host: Option<String>,
+        /// The provider's local service port. `0` = unknown. Display-only.
+        #[serde(default)]
+        local_port: u16,
     },
 
     /// Connect as a consumer of a named secret tunnel; data substreams opened on
@@ -780,6 +826,39 @@ pub enum ClientMessage {
         id: String,
         /// Optional operator note for the admin status page.
         notes: Option<String>,
+        /// Number of parallel relay carrier connections the consumer requested
+        /// (`--carriers`). Display-only. `#[serde(default)]` keeps the wire format
+        /// backward-compatible (an old client omits it ⇒ reads as `0`).
+        #[serde(default)]
+        carriers: u16,
+        /// Whether the consumer runs with `--auto-reconnect` (client-side reconnect
+        /// loop). Display-only; the server takes no action on it.
+        #[serde(default)]
+        auto_reconnect: bool,
+        /// Whether the consumer requested the UDP/QUIC direct path (`--udp`).
+        /// Display-only.
+        #[serde(default)]
+        udp: bool,
+        /// The consumer's local proxy listen port (`--local-proxy-port`). `0` =
+        /// unset/unknown. Display-only.
+        #[serde(default)]
+        local_proxy_port: u16,
+        /// The consumer's `--nat-udp-preferred-port` (0 = unset/ephemeral).
+        /// Display-only.
+        #[serde(default)]
+        nat_udp_preferred_port: u16,
+        /// The consumer's `--nat-udp-release-timeout` seconds. Display-only.
+        #[serde(default)]
+        nat_udp_release_timeout: u64,
+        /// The consumer's selected `--stun-server`, if any. Display-only.
+        #[serde(default)]
+        stun_server: Option<String>,
+        /// Whether the consumer enabled `--upnp`. Display-only.
+        #[serde(default)]
+        upnp: bool,
+        /// Whether the consumer enabled `--try-port-prediction`. Display-only.
+        #[serde(default)]
+        try_port_prediction: bool,
     },
 
     /// Offer this peer's UDP hole-punch candidate addresses to the server, which
@@ -850,6 +929,12 @@ pub enum ClientMessage {
         /// backward-compatible (an old client omits it ⇒ reads as `false`).
         #[serde(default)]
         auto_reconnect: bool,
+        /// The provider's local target host. Display-only.
+        #[serde(default)]
+        local_host: Option<String>,
+        /// The provider's local target port. `0` = unknown. Display-only.
+        #[serde(default)]
+        local_port: u16,
     },
 
     /// Ask the server to issue a fresh vhost-UDP nonce so the provider can
@@ -1147,6 +1232,7 @@ impl ControlFrameSummary for ClientMessage {
                 notes,
                 basic_auth,
                 carriers,
+                ..
             } => {
                 format!(
                     "HelloSecret {{ id={}, notes={}, basic_auth={}, carriers={} }}",
@@ -1156,7 +1242,7 @@ impl ControlFrameSummary for ClientMessage {
                     carriers,
                 )
             }
-            ClientMessage::ConnectSecret { id, notes } => {
+            ClientMessage::ConnectSecret { id, notes, .. } => {
                 format!(
                     "ConnectSecret {{ id={}, notes={} }}",
                     id,
@@ -1194,6 +1280,7 @@ impl ControlFrameSummary for ClientMessage {
                 udp,
                 webserver_log,
                 auto_reconnect,
+                ..
             } => {
                 format!(
                     "HelloVhost {{ subdomain={}, client_id={}, notes={}, basic_auth={}, carriers={}, udp={}, webserver_log={}, auto_reconnect={} }}",
@@ -1492,6 +1579,95 @@ mod tests {
     }
 
     #[test]
+    fn t_wire_secret_default_compat() {
+        // D3/I-1: a legacy ConnectSecret carrying only `id`+`notes` must still
+        // deserialize on a new server, with every added display field defaulting.
+        let msg: ClientMessage =
+            serde_json::from_str(r#"{"ConnectSecret":{"id":"db","notes":null}}"#)
+                .expect("legacy ConnectSecret must still deserialize");
+        match msg {
+            ClientMessage::ConnectSecret {
+                id,
+                carriers,
+                auto_reconnect,
+                udp,
+                local_proxy_port,
+                nat_udp_preferred_port,
+                upnp,
+                try_port_prediction,
+                ..
+            } => {
+                assert_eq!(id, "db");
+                assert_eq!(carriers, 0);
+                assert!(!auto_reconnect);
+                assert!(!udp);
+                assert_eq!(local_proxy_port, 0);
+                assert_eq!(nat_udp_preferred_port, 0);
+                assert!(!upnp);
+                assert!(!try_port_prediction);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        // A legacy HelloSecret (id/notes/basic_auth/carriers only) likewise.
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"HelloSecret":{"id":"db","notes":null,"basic_auth":false,"carriers":2}}"#,
+        )
+        .expect("legacy HelloSecret must still deserialize");
+        match msg {
+            ClientMessage::HelloSecret {
+                id,
+                carriers,
+                udp,
+                auto_reconnect,
+                webserver_log,
+                max_conns,
+                local_host,
+                ..
+            } => {
+                assert_eq!(id, "db");
+                assert_eq!(carriers, 2);
+                assert!(!udp);
+                assert!(!auto_reconnect);
+                assert!(!webserver_log);
+                assert_eq!(max_conns, 0);
+                assert_eq!(local_host, None);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        // Round-trip a fully-populated ConnectSecret survives.
+        let full = ClientMessage::ConnectSecret {
+            id: "db".into(),
+            notes: Some("n".into()),
+            carriers: 4,
+            auto_reconnect: true,
+            udp: true,
+            local_proxy_port: 5432,
+            nat_udp_preferred_port: 443,
+            nat_udp_release_timeout: 30,
+            stun_server: Some("stun.example:3478".into()),
+            upnp: true,
+            try_port_prediction: true,
+        };
+        let back: ClientMessage =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        match back {
+            ClientMessage::ConnectSecret {
+                carriers,
+                local_proxy_port,
+                nat_udp_preferred_port,
+                ..
+            } => {
+                assert_eq!(carriers, 4);
+                assert_eq!(local_proxy_port, 5432);
+                assert_eq!(nat_udp_preferred_port, 443);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn tunnelopts_compat_missing_new_fields_default() {
         // I-COMPAT (D4): an old client omits `carriers`/`udp`/`auto_reconnect`;
         // a new server must read them as their defaults rather than failing.
@@ -1517,6 +1693,9 @@ mod tests {
             udp: true,
             auto_reconnect: true,
             webserver_log: false,
+            max_conns: 0,
+            local_host: None,
+            local_port: 0,
         };
         let json = serde_json::to_string(&full).unwrap();
         let back: TunnelOptions = serde_json::from_str(&json).unwrap();
@@ -1596,6 +1775,7 @@ mod tests {
                 udp,
                 webserver_log,
                 auto_reconnect,
+                ..
             } => {
                 assert_eq!(subdomain, "myapp");
                 assert_eq!(client_id, "client-1");
@@ -1706,6 +1886,8 @@ fn hello_vhost_round_trips_and_fits_frame() {
         udp: false,
         webserver_log: false,
         auto_reconnect: true,
+        local_host: None,
+        local_port: 0,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(
@@ -1723,6 +1905,7 @@ fn hello_vhost_round_trips_and_fits_frame() {
             udp,
             webserver_log,
             auto_reconnect,
+            ..
         } => {
             assert_eq!(subdomain, "myapp");
             assert_eq!(client_id, "client-a");

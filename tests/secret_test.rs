@@ -249,6 +249,7 @@ async fn spawn_secret_tunnel(id: &str, secret: Option<&str>) -> Result<std::net:
         0, // release timeout
         1, // carriers
         None,
+        false,
     )
     .await?;
     let addr = proxy.local_addr()?;
@@ -314,6 +315,7 @@ async fn secret_tunnel_websocket_relay_round_trip() -> Result<()> {
         0,
         1,
         None,
+        false,
     )
     .await?;
     let addr = proxy.local_addr()?;
@@ -372,6 +374,7 @@ async fn secret_tunnel_websocket_direct_udp_round_trip() -> Result<()> {
         0,
         1,
         None,
+        false,
     )
     .await?;
     assert!(
@@ -464,6 +467,7 @@ async fn secret_multiple_consumers_concurrent() -> Result<()> {
             0, // release timeout
             1, // carriers
             None,
+            false,
         )
         .await?;
         addrs.push(proxy.local_addr()?);
@@ -550,6 +554,7 @@ async fn secret_proxy_without_provider_closes() -> Result<()> {
         0, // release timeout
         1, // carriers
         None,
+        false,
     )
     .await?;
     let addr = proxy.local_addr()?;
@@ -586,6 +591,7 @@ async fn secret_proxy_requires_correct_secret() -> Result<()> {
         0, // release timeout
         1, // carriers
         None,
+        false,
     )
     .await;
     assert!(bad.is_err(), "proxy with wrong secret must be rejected");
@@ -670,6 +676,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
         0, // release timeout
         1, // carriers
         Some("cons note".into()),
+        false,
     )
     .await?;
     let consumer = tokio::spawn(proxy.listen());

@@ -100,6 +100,25 @@ pub struct Entry {
     pub vpn_advertised: Vec<String>,
     /// VPN display-only: client's `--nat-udp-preferred-port` (None when 0/unset).
     pub vpn_nat_udp_port: Option<u16>,
+    /// Consumer (secret) display-only: local proxy listen port (`--local-proxy-port`).
+    pub local_proxy_port: Option<u16>,
+    /// Display-only: local service host the client forwards to (`-l/--local-host`).
+    pub local_host: Option<String>,
+    /// Display-only: local service port the client forwards to.
+    pub local_port: Option<u16>,
+    /// Display-only: client's `--nat-udp-preferred-port` for secret/public roles
+    /// (None when 0/unset). VPN roles use [`Entry::vpn_nat_udp_port`].
+    pub nat_udp_preferred_port: Option<u16>,
+    /// Display-only: client's `--nat-udp-release-timeout` seconds (None when unset).
+    pub nat_udp_release_timeout: Option<u64>,
+    /// Display-only: client's selected `--stun-server`, if any.
+    pub stun_server: Option<String>,
+    /// Display-only: whether the client enabled `--upnp`.
+    pub upnp: bool,
+    /// Display-only: whether the client enabled `--try-port-prediction`.
+    pub try_port_prediction: bool,
+    /// Display-only: client's `--max-conns` cap (None when unset).
+    pub max_conns: Option<usize>,
 }
 
 /// Descriptive fields used to create an [`Entry`]; the atomics are initialized by
@@ -145,6 +164,24 @@ pub struct NewEntry {
     pub vpn_advertised: Vec<String>,
     /// See [`Entry::vpn_nat_udp_port`].
     pub vpn_nat_udp_port: Option<u16>,
+    /// See [`Entry::local_proxy_port`].
+    pub local_proxy_port: Option<u16>,
+    /// See [`Entry::local_host`].
+    pub local_host: Option<String>,
+    /// See [`Entry::local_port`].
+    pub local_port: Option<u16>,
+    /// See [`Entry::nat_udp_preferred_port`].
+    pub nat_udp_preferred_port: Option<u16>,
+    /// See [`Entry::nat_udp_release_timeout`].
+    pub nat_udp_release_timeout: Option<u64>,
+    /// See [`Entry::stun_server`].
+    pub stun_server: Option<String>,
+    /// See [`Entry::upnp`].
+    pub upnp: bool,
+    /// See [`Entry::try_port_prediction`].
+    pub try_port_prediction: bool,
+    /// See [`Entry::max_conns`].
+    pub max_conns: Option<usize>,
 }
 
 /// A serializable snapshot of one [`Entry`], produced by [`AdminRegistry::snapshot`].
@@ -204,6 +241,24 @@ pub struct EntryView {
     pub vpn_advertised: Vec<String>,
     /// See [`Entry::vpn_nat_udp_port`].
     pub vpn_nat_udp_port: Option<u16>,
+    /// See [`Entry::local_proxy_port`].
+    pub local_proxy_port: Option<u16>,
+    /// See [`Entry::local_host`].
+    pub local_host: Option<String>,
+    /// See [`Entry::local_port`].
+    pub local_port: Option<u16>,
+    /// See [`Entry::nat_udp_preferred_port`].
+    pub nat_udp_preferred_port: Option<u16>,
+    /// See [`Entry::nat_udp_release_timeout`].
+    pub nat_udp_release_timeout: Option<u64>,
+    /// See [`Entry::stun_server`].
+    pub stun_server: Option<String>,
+    /// See [`Entry::upnp`].
+    pub upnp: bool,
+    /// See [`Entry::try_port_prediction`].
+    pub try_port_prediction: bool,
+    /// See [`Entry::max_conns`].
+    pub max_conns: Option<usize>,
 }
 
 /// Shared, cloneable handle to the live tunnel registry.
@@ -260,6 +315,15 @@ impl AdminRegistry {
             vpn_route_policy: new.vpn_route_policy,
             vpn_advertised: new.vpn_advertised,
             vpn_nat_udp_port: new.vpn_nat_udp_port,
+            local_proxy_port: new.local_proxy_port,
+            local_host: new.local_host,
+            local_port: new.local_port,
+            nat_udp_preferred_port: new.nat_udp_preferred_port,
+            nat_udp_release_timeout: new.nat_udp_release_timeout,
+            stun_server: new.stun_server,
+            upnp: new.upnp,
+            try_port_prediction: new.try_port_prediction,
+            max_conns: new.max_conns,
         });
         self.inner.entries.insert(id, Arc::clone(&entry));
         Registration {
@@ -310,6 +374,15 @@ impl AdminRegistry {
                     vpn_route_policy: entry.vpn_route_policy.clone(),
                     vpn_advertised: entry.vpn_advertised.clone(),
                     vpn_nat_udp_port: entry.vpn_nat_udp_port,
+                    local_proxy_port: entry.local_proxy_port,
+                    local_host: entry.local_host.clone(),
+                    local_port: entry.local_port,
+                    nat_udp_preferred_port: entry.nat_udp_preferred_port,
+                    nat_udp_release_timeout: entry.nat_udp_release_timeout,
+                    stun_server: entry.stun_server.clone(),
+                    upnp: entry.upnp,
+                    try_port_prediction: entry.try_port_prediction,
+                    max_conns: entry.max_conns,
                 }
             })
             .collect();
@@ -427,6 +500,15 @@ mod tests {
             vpn_route_policy: None,
             vpn_advertised: vec![],
             vpn_nat_udp_port: None,
+            local_proxy_port: None,
+            local_host: None,
+            local_port: None,
+            nat_udp_preferred_port: None,
+            nat_udp_release_timeout: None,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
+            max_conns: None,
         }
     }
 

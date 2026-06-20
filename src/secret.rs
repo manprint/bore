@@ -179,6 +179,61 @@ impl Drop for Deregister {
     }
 }
 
+/// Display-only flag/parameter bundle carried by `HelloSecret`/`ConnectSecret`
+/// for the admin status page. None of these affect the data path; they are
+/// captured into the admin [`crate::admin::Entry`] so the dashboard can show
+/// every flag a secret provider/consumer was launched with (flag-parity).
+pub struct SecretDisplay {
+    /// `--udp` (direct path requested).
+    pub udp: bool,
+    /// `--auto-reconnect`.
+    pub auto_reconnect: bool,
+    /// `--webserver-log` enabled (provider only).
+    pub webserver_log: bool,
+    /// `--nat-udp-preferred-port` (0 = unset).
+    pub nat_udp_preferred_port: u16,
+    /// `--nat-udp-release-timeout` seconds.
+    pub nat_udp_release_timeout: u64,
+    /// `--stun-server`, if any.
+    pub stun_server: Option<String>,
+    /// `--upnp`.
+    pub upnp: bool,
+    /// `--try-port-prediction`.
+    pub try_port_prediction: bool,
+    /// `--max-conns` (provider only; 0 = unset/default).
+    pub max_conns: usize,
+    /// `-l/--local-host` (provider local target).
+    pub local_host: Option<String>,
+    /// Provider local target port (0 = unknown).
+    pub local_port: u16,
+    /// Consumer `--local-proxy-port` (0 = unset).
+    pub local_proxy_port: u16,
+    /// `--carriers` requested.
+    pub carriers: u16,
+}
+
+impl SecretDisplay {
+    /// Apply the display-only fields onto a [`NewEntry`] under construction.
+    fn fill(self, mut new: NewEntry) -> NewEntry {
+        new.udp = self.udp;
+        new.auto_reconnect = self.auto_reconnect;
+        new.webserver_log = self.webserver_log;
+        new.carriers = self.carriers;
+        new.nat_udp_preferred_port =
+            (self.nat_udp_preferred_port != 0).then_some(self.nat_udp_preferred_port);
+        new.nat_udp_release_timeout =
+            (self.nat_udp_release_timeout != 0).then_some(self.nat_udp_release_timeout);
+        new.stun_server = self.stun_server;
+        new.upnp = self.upnp;
+        new.try_port_prediction = self.try_port_prediction;
+        new.max_conns = (self.max_conns != 0).then_some(self.max_conns);
+        new.local_host = self.local_host;
+        new.local_port = (self.local_port != 0).then_some(self.local_port);
+        new.local_proxy_port = (self.local_proxy_port != 0).then_some(self.local_proxy_port);
+        new
+    }
+}
+
 /// Server side: register this connection as the provider for `id`, then keep it
 /// alive with heartbeats until it disconnects (which deregisters it).
 #[allow(clippy::too_many_arguments)]
@@ -196,6 +251,7 @@ pub async fn serve_provider(
     max_carriers: u16,
     carriers: u16,
     udp_tuning: UdpDirectTuning,
+    display: SecretDisplay,
 ) -> Result<()> {
     // Register atomically, rejecting a duplicate id rather than hijacking it. The
     // registration is a carrier pool seeded with this connection's opener; extra
@@ -219,7 +275,7 @@ pub async fn serve_provider(
         id: id.clone(),
     };
     // Live admin entry for this provider; dropped (removed) when it disconnects.
-    let admin_reg = admin.register(NewEntry {
+    let admin_reg = admin.register(display.fill(NewEntry {
         role: Role::SecretProvider,
         peer,
         secret_id: Some(id.clone()),
@@ -240,7 +296,16 @@ pub async fn serve_provider(
         vpn_route_policy: None,
         vpn_advertised: vec![],
         vpn_nat_udp_port: None,
-    });
+        local_proxy_port: None,
+        local_host: None,
+        local_port: None,
+        nat_udp_preferred_port: None,
+        nat_udp_release_timeout: None,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        max_conns: None,
+    }));
     info!(%id, "secret provider registered");
     control.send(ServerMessage::Ok).await?;
 
@@ -358,12 +423,13 @@ pub async fn serve_consumer(
     udp_tuning: UdpDirectTuning,
     grx: Arc<std::sync::atomic::AtomicU64>,
     gtx: Arc<std::sync::atomic::AtomicU64>,
+    display: SecretDisplay,
 ) -> Result<()> {
     info!(%id, "secret consumer connected");
     control.send(ServerMessage::Ok).await?;
 
     // Live admin entry for this consumer; dropped (removed) when it disconnects.
-    let admin_reg = admin.register(NewEntry {
+    let admin_reg = admin.register(display.fill(NewEntry {
         role: Role::SecretConsumer,
         peer,
         secret_id: Some(id.clone()),
@@ -384,7 +450,16 @@ pub async fn serve_consumer(
         vpn_route_policy: None,
         vpn_advertised: vec![],
         vpn_nat_udp_port: None,
-    });
+        local_proxy_port: None,
+        local_host: None,
+        local_port: None,
+        nat_udp_preferred_port: None,
+        nat_udp_release_timeout: None,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        max_conns: None,
+    }));
     let active = admin_reg.active();
     // Per-tunnel relay byte counters for this consumer (shown on the admin page).
     // Summed off the hot path, once per closed relayed substream.
@@ -750,6 +825,7 @@ impl Proxy {
         nat_udp_release_timeout: u64,
         carriers: u16,
         notes: Option<String>,
+        auto_reconnect: bool,
     ) -> Result<Self> {
         #[cfg(not(feature = "udp"))]
         let _ = nat_udp_release_timeout;
@@ -771,6 +847,15 @@ impl Proxy {
             .send(ClientMessage::ConnectSecret {
                 id: tcp_secret_id.to_string(),
                 notes,
+                carriers,
+                auto_reconnect,
+                udp,
+                local_proxy_port: bind_addr.port(),
+                nat_udp_preferred_port: udp_port,
+                nat_udp_release_timeout,
+                stun_server: stun_server.map(|s| s.to_string()),
+                upnp: port_map,
+                try_port_prediction: port_prediction,
             })
             .await?;
         if let Some(secret) = secret {
@@ -1295,6 +1380,15 @@ async fn open_consumer_carrier(
         .send(ClientMessage::ConnectSecret {
             id: id.to_string(),
             notes: None,
+            carriers: 0,
+            auto_reconnect: false,
+            udp: false,
+            local_proxy_port: 0,
+            nat_udp_preferred_port: 0,
+            nat_udp_release_timeout: 0,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
         })
         .await?;
     if let Some(secret) = secret {

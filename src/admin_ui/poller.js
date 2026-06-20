@@ -10,7 +10,14 @@
 /** Default polling interval: 30 seconds. Data panels inherit this; config stays 0 (static). */
 export const DEFAULT_REFRESH_MS = 30000;
 
-export function createPoller(refreshFn, timers = { setInterval, clearInterval }) {
+function createDefaultTimers() {
+    return {
+        setInterval: (...args) => globalThis.setInterval(...args),
+        clearInterval: (...args) => globalThis.clearInterval(...args),
+    };
+}
+
+export function createPoller(refreshFn, timers = createDefaultTimers()) {
     let handle = null;
     return {
         /** (Re)arm a repeating call to `refreshFn` every `refreshMs` ms.

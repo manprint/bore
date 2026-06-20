@@ -55,6 +55,27 @@ class El {
 }
 
 function installHarness() {
+    const previous = {
+        document: globalThis.document,
+        window: globalThis.window,
+        sessionStorage: globalThis.sessionStorage,
+        setInterval: globalThis.setInterval,
+        clearInterval: globalThis.clearInterval,
+        fetch: globalThis.fetch,
+        CustomEvent: globalThis.CustomEvent,
+        HTMLElement: globalThis.HTMLElement,
+    };
+    const had = {
+        document: Object.prototype.hasOwnProperty.call(globalThis, 'document'),
+        window: Object.prototype.hasOwnProperty.call(globalThis, 'window'),
+        sessionStorage: Object.prototype.hasOwnProperty.call(globalThis, 'sessionStorage'),
+        setInterval: Object.prototype.hasOwnProperty.call(globalThis, 'setInterval'),
+        clearInterval: Object.prototype.hasOwnProperty.call(globalThis, 'clearInterval'),
+        fetch: Object.prototype.hasOwnProperty.call(globalThis, 'fetch'),
+        CustomEvent: Object.prototype.hasOwnProperty.call(globalThis, 'CustomEvent'),
+        HTMLElement: Object.prototype.hasOwnProperty.call(globalThis, 'HTMLElement'),
+    };
+
     const els = {
         menu: new El('div'),
         view: new El('div'),
@@ -89,8 +110,22 @@ function installHarness() {
 
     // Capture the single armed interval; expose a manual "tick".
     const timer = { fn: null, ms: null, cleared: 0, id: 0 };
-    const setIntervalStub = (fn, ms) => { timer.fn = fn; timer.ms = ms; return ++timer.id; };
-    const clearIntervalStub = () => { timer.cleared++; timer.fn = null; };
+    const setIntervalStub = function(fn, ms) {
+        if (this !== globalThis) {
+            throw new TypeError('Illegal invocation');
+        }
+        timer.fn = fn;
+        timer.ms = ms;
+        return ++timer.id;
+    };
+    const clearIntervalStub = function(handle) {
+        if (this !== globalThis) {
+            throw new TypeError('Illegal invocation');
+        }
+        timer.cleared += 1;
+        timer.fn = null;
+        timer.lastHandle = handle;
+    };
 
     const fetchCalls = [];
     const fetchStub = async (url) => {
@@ -107,54 +142,67 @@ function installHarness() {
     globalThis.CustomEvent = class { constructor(type) { this.type = type; } };
     globalThis.HTMLElement = El;
 
-    return { win, timer, fetchCalls };
+    const restore = () => {
+        for (const key of Object.keys(previous)) {
+            if (had[key]) {
+                globalThis[key] = previous[key];
+            } else {
+                delete globalThis[key];
+            }
+        }
+    };
+
+    return { win, timer, fetchCalls, restore };
 }
 
 // Let the microtask queue drain (renderPanel is async: dynamic import + fetch + render).
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
 test('T-FE-POLL1: app.js arms the poller on load and auto-refresh re-fetches', async () => {
-    const { win, timer, fetchCalls } = installHarness();
+    const { win, timer, fetchCalls, restore } = installHarness();
 
-    // Importing app.js runs its bootstrap side effects (buildSidebar, router,
-    // setupPolling) exactly as the browser would.
-    await import('../../src/admin_ui/app.js');
-    await flush();
+    try {
+        // Importing app.js runs its bootstrap side effects (buildSidebar, router,
+        // setupPolling) exactly as the browser would.
+        await import('../../src/admin_ui/app.js');
+        await flush();
 
-    // 1. Poller armed with the secret panel's 30s interval.
-    assert.equal(timer.ms, 30000, 'poller must arm with the active panel refreshMs (30s)');
-    assert.equal(typeof timer.fn, 'function', 'an interval callback must be scheduled');
+        // 1. Poller armed with the secret panel's 30s interval.
+        assert.equal(timer.ms, 30000, 'poller must arm with the active panel refreshMs (30s)');
+        assert.equal(typeof timer.fn, 'function', 'an interval callback must be scheduled');
 
-    // Initial render fetched the secret endpoint once.
-    const initial = fetchCalls.length;
-    assert.ok(
-        fetchCalls.some((u) => u.includes('/admin/api/v1/secret')),
-        'initial render must fetch the active endpoint',
-    );
+        // Initial render fetched the secret endpoint once.
+        const initial = fetchCalls.length;
+        assert.ok(
+            fetchCalls.some((u) => u.includes('/admin/api/v1/secret')),
+            'initial render must fetch the active endpoint',
+        );
 
-    // 2. Firing the interval must RE-FETCH (this is auto-refresh; the BUG was no re-fetch).
-    timer.fn();
-    await flush();
-    assert.ok(fetchCalls.length > initial, 'a poll tick must re-fetch the active endpoint');
-    assert.ok(
-        fetchCalls.slice(initial).some((u) => u.includes('/admin/api/v1/secret')),
-        'the poll tick re-fetches the SAME active endpoint',
-    );
+        // 2. Firing the interval must RE-FETCH (this is auto-refresh; the BUG was no re-fetch).
+        timer.fn();
+        await flush();
+        assert.ok(fetchCalls.length > initial, 'a poll tick must re-fetch the active endpoint');
+        assert.ok(
+            fetchCalls.slice(initial).some((u) => u.includes('/admin/api/v1/secret')),
+            'the poll tick re-fetches the SAME active endpoint',
+        );
 
-    // 3. A hashchange re-arms the poller and fetches the new endpoint.
-    const beforeNav = fetchCalls.length;
-    win.location.hash = '#/overview';
-    win.fireHashChange();
-    await flush();
-    assert.equal(timer.ms, 30000, 'poller re-arms for the new panel');
-    assert.ok(
-        fetchCalls.slice(beforeNav).some((u) => u.includes('/admin/api/v1/summary')),
-        'navigating re-fetches the new endpoint (overview → summary)',
-    );
+        // 3. A hashchange re-arms the poller and fetches the new endpoint.
+        const beforeNav = fetchCalls.length;
+        win.location.hash = '#/overview';
+        win.fireHashChange();
+        await flush();
+        assert.equal(timer.ms, 30000, 'poller re-arms for the new panel');
+        assert.ok(
+            fetchCalls.slice(beforeNav).some((u) => u.includes('/admin/api/v1/summary')),
+            'navigating re-fetches the new endpoint (overview → summary)',
+        );
+    } finally {
+        restore();
+    }
 });
 
 test('T-FE-POLL2: every data panel exposes a positive refreshMs (config exempt)', async () => {
-    installHarness();
     const registry = (await import('../../src/admin_ui/registry.js')).default;
     for (const panel of registry) {
         if (panel.route === 'config') {

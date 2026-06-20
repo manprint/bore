@@ -182,6 +182,7 @@ tooling. See `UPSTREAM_CHANGES.md` for the detailed, module-level diff.
   BDP/memory trade-off in one place.
 
 ### Fixed
+- **Admin UI polling**: the default timer adapter in `src/admin_ui/poller.js` now wraps `globalThis.setInterval` / `globalThis.clearInterval`, so real browsers no longer throw `TypeError: Illegal invocation` during `/admin/status` bootstrap. Covered by `T-FE-POLL0` and `T-FE-POLL1`; no public API or protocol change.
 - Transfer filesystem throughput/resume hot path: the listener no longer forces
   `sync_data()` plus a full `state.json` rewrite on every acknowledged chunk.
   Staged-file syncs and resume-state persistence are now batched and serialized,

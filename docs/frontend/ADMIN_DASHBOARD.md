@@ -295,7 +295,8 @@ DOM stub; see `test/admin_ui/`):
 npm test          # === node --test "test/admin_ui/**/*.test.js"
 ```
 - `smoke.test.js` — harness/import sanity (`fmtBytes`, `badge`)
-- `poller.test.js` — **BUG-0**: the poll timer actually calls the refresh fn
+- `poller.test.js` — `T-FE-POLL0`: browser-safe timer binding + restart/stop semantics
+- `app-polling.test.js` — `T-FE-POLL1`: real `app.js` bootstrap/hashchange smoke under browser-like timer receivers
 - `metrics-rate.test.js` — **BUG-5**: `rateFromSamples` delta math + NaN/Inf guards
 - `notes.test.js` — **BUG-2**: short notes plain, long notes click-to-expand
 - `badges.test.js` — **BUG-3**: all flags surface as badges; only CSS-defined kinds

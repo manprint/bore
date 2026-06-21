@@ -1,0 +1,110 @@
+name: E2E (netns)
+
+# End-to-end network-namespace test + benchmark scripts under scripts/.
+# These need root (netns / nftables / iptables / TUN), which GitHub-hosted
+# ubuntu runners provide via passwordless sudo on a full VM (NOT a container —
+# container jobs can't create netns/TUN without --privileged, which Actions
+# does not expose). No Docker required.
+#
+# NON-BLOCKING BY DESIGN: every script step is `continue-on-error: true`, so a
+# failure is surfaced (orange step + uploaded log) without failing the job or
+# blocking a PR. Review the run / e2e-logs artifact and fix from the logs.
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-netns:
+    name: e2e netns + bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--features vpn` is additive (keeps default `udp`); the resulting binary
+      # drives every script (vpn, vhost, secret, local, admin). Build fresh so
+      # the netns harness staleness guard (binary must be newer than src/) passes.
+      - name: Build bore (release, vpn)
+        run: cargo build --release --features vpn
+
+      - name: Ensure TUN + tooling
+        run: |
+          test -c /dev/net/tun || sudo modprobe tun
+          sudo modprobe nf_tables || true
+          chmod +x scripts/*.sh
+          ip -V; nft --version || true
+
+      # --- e2e tests ---------------------------------------------------------
+      - name: admin_dashboard_test
+        continue-on-error: true
+        run: sudo -n "$GITHUB_WORKSPACE/scripts/admin_dashboard_test.sh" 2>&1 | tee "e2e-admin_dashboard.log"
+
+      - name: local_proxy_netns_test
+        continue-on-error: true
+        run: sudo -n "$GITHUB_WORKSPACE/scripts/local_proxy_netns_test.sh" 2>&1 | tee "e2e-local_proxy.log"
+
+      - name: secret_netns_test
+        continue-on-error: true
+        run: sudo -n "$GITHUB_WORKSPACE/scripts/secret_netns_test.sh" 2>&1 | tee "e2e-secret.log"
+
+      - name: vhost_netns_test
+        continue-on-error: true
+        run: sudo -n "$GITHUB_WORKSPACE/scripts/vhost_netns_test.sh" 2>&1 | tee "e2e-vhost.log"
+
+      - name: vhost_netns_test_hard
+        continue-on-error: true
+        run: sudo -n "$GITHUB_WORKSPACE/scripts/vhost_netns_test_hard.sh" 2>&1 | tee "e2e-vhost_hard.log"
+
+      - name: vpn_netns_test
+        continue-on-error: true
+        run: sudo -n "$GITHUB_WORKSPACE/scripts/vpn_netns_test.sh" 2>&1 | tee "e2e-vpn.log"
+
+      - name: vpn_netns_test_hard
+        continue-on-error: true
+        run: sudo -n "$GITHUB_WORKSPACE/scripts/vpn_netns_test_hard.sh" 2>&1 | tee "e2e-vpn_hard.log"
+
+      # --- benchmarks (noisy on shared CI VMs; smoke signal only) ------------
+      - name: local_bench
+        continue-on-error: true
+        run: sudo -n "$GITHUB_WORKSPACE/scripts/local_bench.sh" 2>&1 | tee "e2e-local_bench.log"
+
+      - name: vhost_bench
+        continue-on-error: true
+        run: sudo -n "$GITHUB_WORKSPACE/scripts/vhost_bench.sh" 2>&1 | tee "e2e-vhost_bench.log"
+
+      - name: vpn_bench
+        continue-on-error: true
+        run: sudo -n "$GITHUB_WORKSPACE/scripts/vpn_bench.sh" 2>&1 | tee "e2e-vpn_bench.log"
+
+      # --- debug scenarios (run a fixed scenario, exit; manual-inspection aid)
+      - name: vhost_debug
+        continue-on-error: true
+        run: sudo -n "$GITHUB_WORKSPACE/scripts/vhost_debug.sh" 2>&1 | tee "e2e-vhost_debug.log"
+
+      - name: vpn_debug
+        continue-on-error: true
+        run: sudo -n "$GITHUB_WORKSPACE/scripts/vpn_debug.sh" 2>&1 | tee "e2e-vpn_debug.log"
+
+      # --- teardown helper ---------------------------------------------------
+      - name: vhost_cleanup
+        continue-on-error: true
+        run: sudo -n "$GITHUB_WORKSPACE/scripts/vhost_cleanup.sh" 2>&1 | tee "e2e-vhost_cleanup.log"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: e2e-*.log
+          if-no-files-found: ignore
+          retention-days: 14

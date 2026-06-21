@@ -1278,6 +1278,7 @@ impl Server {
                 stun_server,
                 upnp,
                 try_port_prediction,
+                carrier,
             }) => {
                 secret::serve_consumer(
                     control,
@@ -1308,6 +1309,7 @@ impl Server {
                         carriers,
                     },
                     self.secret_ctrl_timeout,
+                    carrier,
                 )
                 .await
             }

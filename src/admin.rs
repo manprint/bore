@@ -326,6 +326,13 @@ impl AdminRegistry {
             max_conns: new.max_conns,
         });
         self.inner.entries.insert(id, Arc::clone(&entry));
+        tracing::info!(
+            id,
+            role = ?entry.role,
+            peer = %entry.peer,
+            secret_id = ?entry.secret_id,
+            "admin entry registered"
+        );
         Registration {
             inner: Arc::clone(&self.inner),
             id,
@@ -452,6 +459,7 @@ impl Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         self.inner.entries.remove(&self.id);
+        tracing::info!(id = self.id, role = ?self.entry.role, "admin entry dropped");
     }
 }
 

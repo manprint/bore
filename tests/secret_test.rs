@@ -739,6 +739,7 @@ fn connect_secret(id: &str) -> ClientMessage {
         stun_server: None,
         upnp: false,
         try_port_prediction: false,
+        carrier: false,
     }
 }
 
@@ -890,6 +891,184 @@ async fn secret_provider_reaped_when_control_wedges() -> Result<()> {
         wait_role(&admin, Role::SecretProvider, 0, 4000).await,
         0,
         "a wedged/silent provider must be reaped — no zombie entry"
+    );
+    Ok(())
+}
+
+/// Open `n` concurrent connections through `addr`, echo 32 bytes on each, and
+/// verify the round-trip — exercises the consumer's carrier pool.
+async fn drive_echo(addr: std::net::SocketAddr, n: u8) -> Result<()> {
+    let mut tasks = Vec::new();
+    for i in 0..n {
+        tasks.push(tokio::spawn(async move {
+            let mut conn = TcpStream::connect(addr).await?;
+            let msg = [i; 32];
+            conn.write_all(&msg).await?;
+            let mut buf = [0u8; 32];
+            time::timeout(Duration::from_secs(5), conn.read_exact(&mut buf)).await??;
+            anyhow::ensure!(buf == msg, "connection {i} echoed mismatched bytes");
+            anyhow::Ok(())
+        }));
+    }
+    for t in tasks {
+        t.await??;
+    }
+    Ok(())
+}
+
+/// T-CARRIER1 (BUG-S1): a single secret consumer with `--carriers 4` on the RELAY
+/// path must register EXACTLY ONE admin entry — the 3 extra relay carriers must NOT
+/// each create a spurious row — and the count must stay 1 over time (no transient
+/// spurious rows). Carrier liveness/no-reap is covered separately by T-CARRIER2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secret_consumer_carriers_make_one_admin_entry() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    wait_for_control_port(false).await;
+    let server = Server::new(1024..=65535, None);
+    let admin = server.admin_registry();
+    tokio::spawn(server.listen());
+    wait_for_control_port(true).await;
+
+    let echo_port = spawn_echo_service().await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo_port,
+        "localhost",
+        "carr",
+        None,
+        false,
+        false,
+        None,
+        false,
+        false,
+        0,
+        0,
+        1024,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(provider.listen());
+    assert_eq!(wait_role(&admin, Role::SecretProvider, 1, 1500).await, 1);
+
+    // Consumer with 4 relay carriers (udp = false ⇒ the relay path opens 3 extra).
+    let proxy = Proxy::new(
+        "localhost",
+        "127.0.0.1:0".parse()?,
+        "carr",
+        None,
+        false,
+        false,
+        None,
+        false,
+        false,
+        0,
+        0,
+        4, // carriers
+        Some("carrier-test".into()),
+        false,
+    )
+    .await?;
+    let addr = proxy.local_addr()?;
+    tokio::spawn(proxy.listen());
+
+    // Exactly ONE consumer entry despite 4 carriers (BUG-S1).
+    assert_eq!(
+        wait_role(&admin, Role::SecretConsumer, 1, 1500).await,
+        1,
+        "4 relay carriers must collapse to ONE admin entry (no spurious carrier rows)"
+    );
+    assert_eq!(
+        admin
+            .snapshot()
+            .iter()
+            .filter(|e| e.role == Role::SecretConsumer)
+            .count(),
+        1,
+        "no spurious carrier rows may appear at all"
+    );
+
+    // Relay works across the carrier pool.
+    drive_echo(addr, 8).await?;
+
+    // The count must stay at exactly 1 over time — no carrier ever produces a
+    // transient spurious row — and relay keeps working.
+    time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        admin
+            .snapshot()
+            .iter()
+            .filter(|e| e.role == Role::SecretConsumer)
+            .count(),
+        1,
+        "consumer entry count must stay 1 (no spurious carrier rows over time)"
+    );
+    drive_echo(addr, 8).await?;
+    Ok(())
+}
+
+/// A carrier `ConnectSecret` (`carrier: true`): an extra relay carrier of a
+/// consumer, which must create no admin entry and never be reaped.
+fn connect_secret_carrier(id: &str) -> ClientMessage {
+    ClientMessage::ConnectSecret {
+        id: id.into(),
+        notes: None,
+        carriers: 0,
+        auto_reconnect: false,
+        udp: false,
+        local_proxy_port: 0,
+        nat_udp_preferred_port: 0,
+        nat_udp_release_timeout: 0,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        carrier: true,
+    }
+}
+
+/// T-CARRIER2 (BUG-S2): a consumer CARRIER sends no heartbeats by design, so it
+/// must NOT be reaped by the consumer control reaper (its liveness is owned by the
+/// consumer's main control connection). A buggy build that routed carriers through
+/// the reaper would close the carrier connection after `ctrl_timeout`; here the
+/// server must instead keep heartbeating it and never close it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_consumer_carrier_not_reaped() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    wait_for_control_port(false).await;
+    // Short reaper window so a buggy build would reap quickly; the carrier must
+    // survive it (a primary consumer with this timeout WOULD be reaped — that is
+    // the inverse case in `secret_consumer_reaped_when_control_wedges`).
+    let server = Server::new(1024..=65535, None).secret_ctrl_timeout(Duration::from_millis(400));
+    tokio::spawn(server.listen());
+    wait_for_control_port(true).await;
+
+    let (_opener, mut control) = raw_control().await?;
+    control.send(connect_secret_carrier("svc-carrier")).await?;
+    assert!(matches!(
+        control.recv::<ServerMessage>().await?,
+        Some(ServerMessage::Ok)
+    ));
+
+    // Stay silent well past ctrl_timeout (400ms). The server must keep the carrier
+    // connection alive (heartbeating it) and never reap it: we keep receiving
+    // ServerMessage::Heartbeat and never observe a clean close (None).
+    let mut beats = 0;
+    let deadline = time::Instant::now() + Duration::from_millis(1600);
+    while time::Instant::now() < deadline {
+        match time::timeout(Duration::from_millis(700), control.recv::<ServerMessage>()).await {
+            Ok(Ok(Some(ServerMessage::Heartbeat))) => beats += 1,
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) => {
+                panic!("carrier connection was reaped/closed — carriers must not be reaped")
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {} // no frame this window; keep waiting
+        }
+    }
+    assert!(
+        beats >= 1,
+        "server must keep heartbeating the carrier connection (got {beats} beats)"
     );
     Ok(())
 }

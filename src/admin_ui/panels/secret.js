@@ -67,16 +67,21 @@ export default {
                 body.appendChild(provSection);
             }
 
-            // Render consumers
-            if (group.consumers.length > 0) {
+            // Render consumers. Dedup carrier rows defensively (D4): the backend
+            // already prevents an extra relay carrier from registering its own
+            // entry, but an OLDER server may still emit one row per carrier — fold
+            // those (port-less rows sharing a real consumer's peer IP) away so the
+            // UI shows one row per logical consumer regardless of server version.
+            const consumers = dedupeConsumers(group.consumers);
+            if (consumers.length > 0) {
                 const consSection = document.createElement('div');
                 consSection.className = 'secret-role-section';
                 const consLabel = document.createElement('div');
                 consLabel.className = 'secret-role-label';
-                consLabel.innerHTML = `<strong>Consumer${group.consumers.length > 1 ? 's' : ''}</strong>`;
+                consLabel.innerHTML = `<strong>Consumer${consumers.length > 1 ? 's' : ''}</strong>`;
                 consSection.appendChild(consLabel);
 
-                const consTable = renderEntryTable(group.consumers);
+                const consTable = renderEntryTable(consumers);
                 consSection.appendChild(consTable);
                 body.appendChild(consSection);
             }
@@ -88,6 +93,32 @@ export default {
         el.appendChild(container);
     }
 };
+
+/**
+ * The IP part of a "host:port" peer string (strips the trailing :port, IPv6-safe).
+ */
+function peerIp(peer) {
+    if (!peer) return '';
+    const i = peer.lastIndexOf(':');
+    return i === -1 ? peer : peer.slice(0, i);
+}
+
+/**
+ * Collapse extra relay carriers into their logical consumer (D4, defense-in-depth).
+ * A primary consumer always advertises a real `local_proxy_port`; an extra relay
+ * carrier (from an older server) has none. Drop port-less rows whose peer IP
+ * matches a primary consumer in the same group — they are that consumer's carriers.
+ * Two distinct consumers from the same host (both with real ports) are both kept.
+ */
+function dedupeConsumers(consumers) {
+    const primaryIps = new Set(
+        consumers.filter(c => c.local_proxy_port).map(c => peerIp(c.peer))
+    );
+    return consumers.filter(c => {
+        if (c.local_proxy_port) return true; // a primary consumer
+        return !primaryIps.has(peerIp(c.peer)); // keep only if not a known carrier
+    });
+}
 
 /**
  * Render a table of entries with role-specific columns.

@@ -1533,10 +1533,13 @@ async fn provider_direct(
                             }
                         });
                     }
-                    // A single bad handshake (e.g. token mismatch from a stray
-                    // peer) must not tear down the listener; log and keep serving.
+                    // `accept()` now swallows benign hole-punch strays internally
+                    // (BUG-S3), so reaching here means an endpoint-level problem
+                    // (the QUIC endpoint closed). Back off briefly before retrying;
+                    // intentional teardown is handled by the `punch_rx` `None` arm.
+                    // Logged at debug — a closed endpoint during teardown is normal.
                     Err(err) => {
-                        warn!(%err, "direct udp accept failed (will retry in 100ms)");
+                        debug!(%err, "direct udp endpoint accept error; retrying in 100ms");
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }

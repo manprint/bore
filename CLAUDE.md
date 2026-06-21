@@ -103,6 +103,33 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   (wire-compat: old server can't decode it → upgrade server before/with clients).
   `Server::secret_ctrl_timeout()` lowers the 60 s default for tests. Public/vhost
   tunnels keep the legacy heartbeat-free path (their server loops are unchanged).
+- **Secret consumer CARRIERS (`--carriers N` on `bore proxy`) must NOT register an
+  admin entry and must NOT be reaped.** An extra relay carrier dials the server and
+  sends `ClientMessage::ConnectSecret { carrier: true, .. }` (additive
+  `#[serde(default)]` field, serde_json wire — old client omits it ⇒ `false` ⇒ legacy
+  path). `serve_consumer(carrier=true)` skips `admin.register` (else `--carriers N`
+  showed N-1 spurious `local_proxy_port=None` "N/A" rows — BUG-S1) AND skips the
+  `ctrl_timeout` reap check (carriers send no `Heartbeat` by design — only the
+  consumer's MAIN control connection does, every 20 s — so reaping them degraded the
+  pool N→1 after 60 s — BUG-S2). A carrier still accepts+relays its data substreams.
+  One logical tunnel = exactly ONE admin row regardless of `--carriers`/transport
+  (I-3). The `carrier == false` path is byte-identical. FE (`secret.js`) also dedups
+  port-less carrier rows defensively (folds rows sharing a real consumer's peer IP)
+  so even an OLD server can't show spurious rows. Provider carriers already used the
+  leak-free `JoinCarrier`/`serve_carrier` path — do not fork them.
+- **Secret direct-path benign hole-punch strays are `debug`, never `WARN`.**
+  `DirectListener::accept` (holepunch.rs) loops internally: incipient QUIC incomings
+  from punch crossfire that never finish TLS / carry no/again-wrong token are logged
+  at `debug` and skipped; only an endpoint-level close propagates as `Err`. The real
+  token-verified connection succeeds alongside them. Do NOT restore a per-stray WARN
+  (BUG-S3) and do NOT filter the accepted source against the offered candidates /
+  disable QUIC migration — token auth is the gate and CGNAT consumers legitimately
+  connect from an un-offered source (e.g. a `100.64/10` egress; D7).
+- `relay()` (secret.rs) fails over across live provider carriers (retry `pick`→`open`
+  up to pool size) — a carrier dying between pick and open must not drop the forwarded
+  connection (BUG-S4). `--carriers N>1` on a secret `--udp` consumer that goes DIRECT
+  is a single QUIC connection; it `warn!`s once (N applies only to the relay fallback,
+  BUG-S5) — never silently ignored. See docs/SECRET_HARDENING_ASSESSMENT.md.
 - Client sends `Hello` before auth (yamux is lazy; without it, deadlock)
 - `HelloVpn`/`ConnectVpn` sent **before** auth (same lazy-yamux rule as `Hello`)
 - Server writes `mux::STREAM_READY` before splice (banner-first protocols need it)

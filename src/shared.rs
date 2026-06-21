@@ -859,6 +859,15 @@ pub enum ClientMessage {
         /// Whether the consumer enabled `--try-port-prediction`. Display-only.
         #[serde(default)]
         try_port_prediction: bool,
+        /// Whether this connection is an extra relay *carrier* of an existing
+        /// consumer rather than a primary consumer (`--carriers N` opens N-1 of
+        /// these). A carrier creates NO admin entry and is NOT reaped by the
+        /// consumer control-liveness check — its liveness is owned by the
+        /// consumer's main control connection (I-2/I-3). `#[serde(default)]` keeps
+        /// the wire backward-compatible (an old client omits it ⇒ `false` ⇒ the
+        /// legacy behaviour of registering a per-connection entry).
+        #[serde(default)]
+        carrier: bool,
     },
 
     /// Offer this peer's UDP hole-punch candidate addresses to the server, which
@@ -1605,6 +1614,7 @@ mod tests {
                 nat_udp_preferred_port,
                 upnp,
                 try_port_prediction,
+                carrier,
                 ..
             } => {
                 assert_eq!(id, "db");
@@ -1615,6 +1625,7 @@ mod tests {
                 assert_eq!(nat_udp_preferred_port, 0);
                 assert!(!upnp);
                 assert!(!try_port_prediction);
+                assert!(!carrier, "legacy ConnectSecret must default carrier=false");
             }
             other => panic!("unexpected message: {other:?}"),
         }
@@ -1659,6 +1670,7 @@ mod tests {
             stun_server: Some("stun.example:3478".into()),
             upnp: true,
             try_port_prediction: true,
+            carrier: true,
         };
         let back: ClientMessage =
             serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
@@ -1667,11 +1679,13 @@ mod tests {
                 carriers,
                 local_proxy_port,
                 nat_udp_preferred_port,
+                carrier,
                 ..
             } => {
                 assert_eq!(carriers, 4);
                 assert_eq!(local_proxy_port, 5432);
                 assert_eq!(nat_udp_preferred_port, 443);
+                assert!(carrier, "carrier flag must round-trip on the wire");
             }
             other => panic!("unexpected: {other:?}"),
         }

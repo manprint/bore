@@ -1490,35 +1490,61 @@ impl DirectListener {
     /// own. Returns the authenticated [`DirectConn`]; the provider then accepts
     /// native QUIC streams on it (one per proxied connection).
     pub async fn accept(&self, token: [u8; TOKEN_LEN]) -> Result<DirectConn> {
-        let incoming = self
-            .endpoint
-            .accept()
-            .await
-            .context("QUIC endpoint closed")?;
-        let conn = incoming.await.context("QUIC handshake failed")?;
-        let peer = conn.remote_address();
-        trace!(%peer, "QUIC accepted");
-        let (mut send, mut recv) = conn.accept_bi().await.context("auth accept_bi failed")?;
-        let mut peer_token = [0u8; TOKEN_LEN];
-        recv.read_exact(&mut peer_token).await?;
-        if !tokens_match(&token, &peer_token) {
-            warn!(
-                %peer,
-                "rejected direct QUIC connection: token mismatch \
-                 (stray connection or mismatched secrets)"
-            );
-            bail!("direct path token mismatch");
+        // UDP hole-punch crossfire makes both peers fire QUIC Initials at each
+        // other, so the endpoint sees incipient connections that never finish the
+        // TLS handshake — or finish but present no / a mismatched token. These are
+        // BENIGN (the real, token-verified connection arrives alongside them): log
+        // each at `debug` and keep accepting, rather than surfacing an alarming
+        // "accept failed" to the caller (BUG-S3). Only an endpoint-level failure
+        // (the QUIC endpoint itself closed) propagates as `Err`. Callers that wrap
+        // this in a timeout (VPN/diagnostic) get a real connection within the
+        // window instead of aborting on the first stray.
+        loop {
+            let incoming = self
+                .endpoint
+                .accept()
+                .await
+                .context("QUIC endpoint closed")?;
+            let remote = incoming.remote_address();
+            let conn = match incoming.await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    debug!(%remote, %err, "stray direct incoming: handshake never completed (hole-punch crossfire); ignoring");
+                    continue;
+                }
+            };
+            let peer = conn.remote_address();
+            trace!(%peer, "QUIC accepted");
+            let (mut send, mut recv) = match conn.accept_bi().await {
+                Ok(streams) => streams,
+                Err(err) => {
+                    debug!(%peer, %err, "stray direct incoming: no auth stream opened; ignoring");
+                    continue;
+                }
+            };
+            let mut peer_token = [0u8; TOKEN_LEN];
+            if let Err(err) = recv.read_exact(&mut peer_token).await {
+                debug!(%peer, %err, "stray direct incoming: auth token read failed; ignoring");
+                continue;
+            }
+            if !tokens_match(&token, &peer_token) {
+                debug!(
+                    %peer,
+                    "stray direct incoming: token mismatch (unrelated peer or mismatched secret); ignoring"
+                );
+                continue;
+            }
+            send.write_all(&token).await?;
+            send.flush().await?;
+            let _ = send.finish();
+            info!(%peer, "accepted direct udp connection (provider, token verified)");
+            let dc = DirectConn {
+                conn,
+                endpoint: self.endpoint.clone(),
+            };
+            debug!(max_datagram = ?dc.max_datagram_size(), "direct conn established (provider)");
+            return Ok(dc);
         }
-        send.write_all(&token).await?;
-        send.flush().await?;
-        let _ = send.finish();
-        info!(%peer, "accepted direct udp connection (provider, token verified)");
-        let dc = DirectConn {
-            conn,
-            endpoint: self.endpoint.clone(),
-        };
-        debug!(max_datagram = ?dc.max_datagram_size(), "direct conn established (provider)");
-        Ok(dc)
     }
 }
 

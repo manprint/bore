@@ -455,46 +455,73 @@ pub async fn serve_consumer(
     gtx: Arc<std::sync::atomic::AtomicU64>,
     display: SecretDisplay,
     ctrl_timeout: Duration,
+    carrier: bool,
 ) -> Result<()> {
-    info!(%id, "secret consumer connected");
+    if carrier {
+        debug!(%id, %peer, "secret consumer relay carrier connected (no admin entry, not reaped — liveness is owned by the consumer's main control connection)");
+    } else {
+        info!(%id, %peer, "secret consumer connected");
+    }
     control.send(ServerMessage::Ok).await?;
 
-    // Live admin entry for this consumer; dropped (removed) when it disconnects.
-    let admin_reg = admin.register(display.fill(NewEntry {
-        role: Role::SecretConsumer,
-        peer,
-        secret_id: Some(id.clone()),
-        public_port: None,
-        notes,
-        basic_auth: false,
-        https: false,
-        force_https: false,
-        carriers: 0,
-        auto_reconnect: false,
-        webserver_log: false,
-        udp: false,
-        vpn_relay_only: false,
-        vpn_pin_mtu: false,
-        vpn_mtu: None,
-        vpn_forward_accept: false,
-        vpn_nat_masquerade: false,
-        vpn_route_policy: None,
-        vpn_advertised: vec![],
-        vpn_nat_udp_port: None,
-        local_proxy_port: None,
-        local_host: None,
-        local_port: None,
-        nat_udp_preferred_port: None,
-        nat_udp_release_timeout: None,
-        stun_server: None,
-        upnp: false,
-        try_port_prediction: false,
-        max_conns: None,
-    }));
-    let active = admin_reg.active();
-    // Per-tunnel relay byte counters for this consumer (shown on the admin page).
-    // Summed off the hot path, once per closed relayed substream.
-    let (relay_tx, relay_rx) = admin_reg.relay_bytes();
+    // A primary consumer registers a live admin entry (removed when it disconnects).
+    // An extra relay *carrier* (`--carriers N` opens N-1 of these) registers NOTHING
+    // and is never reaped (I-2/I-3): its data substreams are still accepted and
+    // relayed below, but it owns no admin row and its liveness is the main control
+    // connection's responsibility. The `carrier == false` path stays byte-identical
+    // to the previous behaviour (I-1).
+    let admin_reg = if carrier {
+        None
+    } else {
+        Some(admin.register(display.fill(NewEntry {
+            role: Role::SecretConsumer,
+            peer,
+            secret_id: Some(id.clone()),
+            public_port: None,
+            notes,
+            basic_auth: false,
+            https: false,
+            force_https: false,
+            carriers: 0,
+            auto_reconnect: false,
+            webserver_log: false,
+            udp: false,
+            vpn_relay_only: false,
+            vpn_pin_mtu: false,
+            vpn_mtu: None,
+            vpn_forward_accept: false,
+            vpn_nat_masquerade: false,
+            vpn_route_policy: None,
+            vpn_advertised: vec![],
+            vpn_nat_udp_port: None,
+            local_proxy_port: None,
+            local_host: None,
+            local_port: None,
+            nat_udp_preferred_port: None,
+            nat_udp_release_timeout: None,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
+            max_conns: None,
+        })))
+    };
+    let active = admin_reg
+        .as_ref()
+        .map(|r| r.active())
+        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+    // Per-tunnel relay byte counters for this consumer (shown on the admin page),
+    // summed off the hot path once per closed relayed substream. A carrier owns no
+    // entry, so it gets throwaway counters here; its bytes still count toward the
+    // global server totals inside `relay()`.
+    let (relay_tx, relay_rx) = admin_reg
+        .as_ref()
+        .map(|r| r.relay_bytes())
+        .unwrap_or_else(|| {
+            (
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )
+        });
 
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -508,8 +535,10 @@ pub async fn serve_consumer(
                 if control.send(ServerMessage::Heartbeat).await.is_err() {
                     return Ok(());
                 }
-                if last_recv.elapsed() >= ctrl_timeout {
-                    warn!(%id, timeout = ?ctrl_timeout,
+                // Carriers are never reaped (they send no heartbeats by design —
+                // their liveness is the main control connection's job, I-2).
+                if !carrier && last_recv.elapsed() >= ctrl_timeout {
+                    warn!(%id, %peer, timeout = ?ctrl_timeout,
                         "secret consumer control idle; reaping (peer wedged/abandoned)");
                     return Ok(());
                 }
@@ -526,7 +555,9 @@ pub async fn serve_consumer(
                         // Flag for the admin page that this consumer attempted a
                         // direct path (success is established peer-to-peer, off the
                         // server, so the relay can only record the attempt).
-                        admin_reg.mark_udp();
+                        if let Some(reg) = &admin_reg {
+                            reg.mark_udp();
+                        }
                         broker_udp(
                             &mut control,
                             &udp_registry,
@@ -537,7 +568,9 @@ pub async fn serve_consumer(
                         .await?;
                     }
                     Some(ClientMessage::UdpCandidateOffer(consumer_offer)) => {
-                        admin_reg.mark_udp();
+                        if let Some(reg) = &admin_reg {
+                            reg.mark_udp();
+                        }
                         broker_udp(&mut control, &udp_registry, &id, consumer_offer, udp_tuning)
                             .await?;
                     }
@@ -673,8 +706,34 @@ async fn relay(
         Some(pool) => pool,
         None => bail!("no provider registered for '{id}'"),
     };
-    let opener = pool.pick().context("no live provider carrier")?;
-    let mut provider = opener.open().await.context("provider unavailable")?;
+    // Fail over across live provider carriers (D5): a carrier can die between
+    // `pick` (which prunes dead ones under the lock) and `open` (the connection
+    // breaking is observed asynchronously), so try up to the pool size before
+    // dropping this forwarded connection. `pick` round-robins, so successive
+    // attempts hit different carriers.
+    let attempts = pool.len().max(1);
+    let mut provider = None;
+    let mut last_err = None;
+    for _ in 0..attempts {
+        let Some(opener) = pool.pick() else { break };
+        match opener.open().await {
+            Ok(stream) => {
+                provider = Some(stream);
+                break;
+            }
+            Err(err) => {
+                trace!(%id, %err, "provider carrier open failed; trying next live carrier");
+                last_err = Some(err);
+            }
+        }
+    }
+    let mut provider = match provider {
+        Some(stream) => stream,
+        None => match last_err {
+            Some(err) => return Err(err).context("all provider carriers unavailable"),
+            None => bail!("no live provider carrier"),
+        },
+    };
     provider.write_all(&[mux::STREAM_READY]).await?;
 
     let buf = proxy_buffer_size();
@@ -899,6 +958,7 @@ impl Proxy {
                 stun_server: stun_server.map(|s| s.to_string()),
                 upnp: port_map,
                 try_port_prediction: port_prediction,
+                carrier: false,
             })
             .await?;
         if let Some(secret) = secret {
@@ -947,6 +1007,17 @@ impl Proxy {
                 #[cfg(feature = "udp")]
                 Ok(Some(conn)) => {
                     info!(%tcp_secret_id, "using direct udp path");
+                    // The direct path uses a single QUIC connection (one stream per
+                    // proxied connection); `--carriers` only governs the relay
+                    // fallback. Warn rather than silently ignore the flag (D8).
+                    if carriers > 1 {
+                        warn!(
+                            %tcp_secret_id, carriers,
+                            "secret --udp direct path uses a single QUIC connection; \
+                             --carriers applies only to the relay fallback \
+                             (multi-connection direct is not supported)"
+                        );
+                    }
                     direct_closed_rx = Some(spawn_closed_monitor(conn.clone()));
                     data_path = DataPath::Direct(conn);
                     direct = true;
@@ -978,7 +1049,18 @@ impl Proxy {
                     warn!(%err, "failed to open extra relay carrier");
                 }
             }
-            info!(%tcp_secret_id, size = pool.len(), "consumer carrier pool established");
+            let opened = pool.len();
+            if (opened as u16) < carriers {
+                warn!(
+                    %tcp_secret_id, requested = carriers, opened,
+                    "consumer relay carrier pool degraded: fewer carriers connected than requested"
+                );
+            } else {
+                info!(
+                    %tcp_secret_id, requested = carriers, opened,
+                    "consumer relay carrier pool established"
+                );
+            }
         }
 
         let listener = TcpListener::bind(bind_addr)
@@ -1444,6 +1526,9 @@ async fn open_consumer_carrier(
             stun_server: None,
             upnp: false,
             try_port_prediction: false,
+            // This is an extra relay carrier of an existing consumer: the server
+            // must NOT register an admin entry for it and must NOT reap it (I-2).
+            carrier: true,
         })
         .await?;
     if let Some(secret) = secret {

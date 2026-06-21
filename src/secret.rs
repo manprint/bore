@@ -25,9 +25,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{interval, Instant as TokioInstant, MissedTickBehavior};
-#[cfg(feature = "udp")]
-use tracing::debug;
-use tracing::{error, info, info_span, trace, warn, Instrument};
+use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 
 use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Registration, Role};
 use crate::auth::Authenticator;

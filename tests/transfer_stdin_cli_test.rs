@@ -727,7 +727,11 @@ async fn transfer_filesystem_listener_kill_resumes_and_cleans_up_cli() -> Result
     Ok(())
 }
 
-#[cfg(unix)]
+// Linux-only: macOS (APFS/HFS+) rejects non-UTF-8 byte sequences in file
+// names at the syscall layer (EILSEQ, os error 92) — "failed to create
+// destination file stdin-<bytes>.bin". Byte-preserving names are a Linux
+// filesystem capability.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfer_stdin_non_utf8_output_name_over_relay_cli() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;

@@ -1257,7 +1257,11 @@ async fn transfer_resume_rejects_changed_manifest_over_relay() -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+// Linux-only: ext4/xfs accept arbitrary non-UTF-8 bytes in file names, but
+// macOS (APFS/HFS+) rejects them at the syscall layer (EILSEQ, "Illegal byte
+// sequence", os error 92). The test validates byte-preserving transfer, which
+// is a Linux filesystem capability.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfer_non_utf8_file_name_over_relay() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
@@ -1312,7 +1316,9 @@ async fn transfer_non_utf8_file_name_over_relay() -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+// Linux-only: see `transfer_non_utf8_file_name_over_relay` — macOS rejects
+// non-UTF-8 byte sequences in path components (EILSEQ, os error 92).
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfer_non_utf8_nested_directory_over_relay() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;

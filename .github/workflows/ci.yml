@@ -87,8 +87,6 @@ jobs:
       - name: Check (Android via NDK)
         if: matrix.target == 'aarch64-linux-android'
         run: cargo ndk -t arm64-v8a check --features vpn
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
 
       - name: Check (host toolchain)
         if: matrix.target != 'aarch64-linux-android'

@@ -6,9 +6,13 @@ name: E2E (netns)
 # container jobs can't create netns/TUN without --privileged, which Actions
 # does not expose). No Docker required.
 #
-# NON-BLOCKING BY DESIGN: every script step is `continue-on-error: true`, so a
-# failure is surfaced (orange step + uploaded log) without failing the job or
-# blocking a PR. Review the run / e2e-logs artifact and fix from the logs.
+# NON-BLOCKING BY DESIGN: the matrix job is `continue-on-error: true` and
+# `fail-fast: false`, so any script failing/timing out is surfaced (failed
+# matrix leg + uploaded log) without failing the workflow or blocking a PR.
+#
+# Each script runs in its OWN matrix job (own runner, own netns, own timeout):
+# one hung script can never consume another's budget or cancel the whole run —
+# the bug that cancelled the earlier single-job version at the 60 m ceiling.
 
 on:
   push:
@@ -20,91 +24,90 @@ permissions:
   contents: read
 
 jobs:
-  e2e-netns:
-    name: e2e netns + bench
+  build:
+    name: build bore (release, vpn)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `--features vpn` is additive (keeps default `udp`); the one binary drives
+      # every script (vpn/vhost/secret/local/admin).
+      - run: cargo build --release --features vpn
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bore-bin
+          path: target/release/bore
+          retention-days: 1
+
+  e2e:
+    name: ${{ matrix.script }}
+    needs: build
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # e2e netns tests
+          - { script: admin_dashboard_test,      secs: 600 }
+          - { script: local_proxy_netns_test,    secs: 900 }
+          - { script: secret_netns_test,         secs: 1200 }
+          - { script: vhost_netns_test,          secs: 1200 }
+          - { script: vhost_netns_test_hard,     secs: 1200 }
+          - { script: vpn_netns_test,            secs: 1500 }
+          - { script: vpn_netns_test_hard,       secs: 1500 }
+          # benchmarks (noisy on shared CI VMs; smoke signal only)
+          - { script: local_bench,               secs: 900 }
+          - { script: vhost_bench,                secs: 900 }
+          - { script: vpn_bench,                  secs: 900 }
+          # debug scenarios (fixed scenario, then exit)
+          - { script: vhost_debug,                secs: 300 }
+          - { script: vpn_debug,                  secs: 300 }
+          # teardown helper
+          - { script: vhost_cleanup,              secs: 120 }
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Download bore binary
+        uses: actions/download-artifact@v4
+        with:
+          name: bore-bin
+          path: target/release
 
-      - uses: Swatinem/rust-cache@v2
-
-      # `--features vpn` is additive (keeps default `udp`); the resulting binary
-      # drives every script (vpn, vhost, secret, local, admin). Build fresh so
-      # the netns harness staleness guard (binary must be newer than src/) passes.
-      - name: Build bore (release, vpn)
-        run: cargo build --release --features vpn
-
-      - name: Ensure TUN + tooling
+      - name: Prepare binary + tooling
         run: |
+          # Artifacts lose the exec bit; restore it. `touch` keeps the binary
+          # newer than src/ so the netns harness staleness guard passes.
+          chmod +x target/release/bore
+          touch target/release/bore
+          chmod +x scripts/*.sh
+          # socat / iperf3 are required by the netns tests (else they SKIP);
+          # wrk is an optional load generator for the bench scripts (they fall
+          # back to timeout-guarded curl loops when absent).
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq socat iperf3
+          sudo apt-get install -y -qq wrk || true
           test -c /dev/net/tun || sudo modprobe tun
           sudo modprobe nf_tables || true
-          chmod +x scripts/*.sh
-          ip -V; nft --version || true
 
-      # --- e2e tests ---------------------------------------------------------
-      - name: admin_dashboard_test
-        continue-on-error: true
-        run: sudo -n "$GITHUB_WORKSPACE/scripts/admin_dashboard_test.sh" 2>&1 | tee "e2e-admin_dashboard.log"
+      - name: Run ${{ matrix.script }}
+        # Hard wall-clock cap per script: SIGTERM at `secs` (lets the script's
+        # EXIT trap clean up its netns/nft state), then SIGKILL 60 s later.
+        # `timeout` runs under sudo (as root) so it can signal root-spawned
+        # children. The step's own 30 m timeout-minutes is a backstop.
+        run: |
+          sudo -n timeout --kill-after=60 ${{ matrix.secs }} \
+            "$GITHUB_WORKSPACE/scripts/${{ matrix.script }}.sh" \
+            2>&1 | tee "e2e-${{ matrix.script }}.log"
 
-      - name: local_proxy_netns_test
-        continue-on-error: true
-        run: sudo -n "$GITHUB_WORKSPACE/scripts/local_proxy_netns_test.sh" 2>&1 | tee "e2e-local_proxy.log"
-
-      - name: secret_netns_test
-        continue-on-error: true
-        run: sudo -n "$GITHUB_WORKSPACE/scripts/secret_netns_test.sh" 2>&1 | tee "e2e-secret.log"
-
-      - name: vhost_netns_test
-        continue-on-error: true
-        run: sudo -n "$GITHUB_WORKSPACE/scripts/vhost_netns_test.sh" 2>&1 | tee "e2e-vhost.log"
-
-      - name: vhost_netns_test_hard
-        continue-on-error: true
-        run: sudo -n "$GITHUB_WORKSPACE/scripts/vhost_netns_test_hard.sh" 2>&1 | tee "e2e-vhost_hard.log"
-
-      - name: vpn_netns_test
-        continue-on-error: true
-        run: sudo -n "$GITHUB_WORKSPACE/scripts/vpn_netns_test.sh" 2>&1 | tee "e2e-vpn.log"
-
-      - name: vpn_netns_test_hard
-        continue-on-error: true
-        run: sudo -n "$GITHUB_WORKSPACE/scripts/vpn_netns_test_hard.sh" 2>&1 | tee "e2e-vpn_hard.log"
-
-      # --- benchmarks (noisy on shared CI VMs; smoke signal only) ------------
-      - name: local_bench
-        continue-on-error: true
-        run: sudo -n "$GITHUB_WORKSPACE/scripts/local_bench.sh" 2>&1 | tee "e2e-local_bench.log"
-
-      - name: vhost_bench
-        continue-on-error: true
-        run: sudo -n "$GITHUB_WORKSPACE/scripts/vhost_bench.sh" 2>&1 | tee "e2e-vhost_bench.log"
-
-      - name: vpn_bench
-        continue-on-error: true
-        run: sudo -n "$GITHUB_WORKSPACE/scripts/vpn_bench.sh" 2>&1 | tee "e2e-vpn_bench.log"
-
-      # --- debug scenarios (run a fixed scenario, exit; manual-inspection aid)
-      - name: vhost_debug
-        continue-on-error: true
-        run: sudo -n "$GITHUB_WORKSPACE/scripts/vhost_debug.sh" 2>&1 | tee "e2e-vhost_debug.log"
-
-      - name: vpn_debug
-        continue-on-error: true
-        run: sudo -n "$GITHUB_WORKSPACE/scripts/vpn_debug.sh" 2>&1 | tee "e2e-vpn_debug.log"
-
-      # --- teardown helper ---------------------------------------------------
-      - name: vhost_cleanup
-        continue-on-error: true
-        run: sudo -n "$GITHUB_WORKSPACE/scripts/vhost_cleanup.sh" 2>&1 | tee "e2e-vhost_cleanup.log"
-
-      - name: Upload logs
+      - name: Upload log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-logs
-          path: e2e-*.log
+          name: e2e-log-${{ matrix.script }}
+          path: e2e-${{ matrix.script }}.log
           if-no-files-found: ignore
           retention-days: 14

@@ -2508,7 +2508,7 @@ mod tests {
     /// link death and tears the whole tunnel down, so an oversized packet
     /// leaking out as `Err` here is exactly the bug. Also proves a mixed batch
     /// still delivers its in-limit packets (drop only the oversized ones).
-    #[cfg(feature = "vpn")]
+    #[cfg(all(feature = "vpn", target_os = "linux"))]
     #[cfg(feature = "udp")]
     #[tokio::test]
     async fn direct_send_batch_drops_oversized_without_error() {
@@ -2566,7 +2566,7 @@ mod tests {
     /// recv_batch drains multiple queued datagrams in one call (Direct path).
     /// Proves the drain pattern: queue N datagrams on sender, one recv_batch
     /// call on receiver returns >1 packet.
-    #[cfg(feature = "vpn")]
+    #[cfg(all(feature = "vpn", target_os = "linux"))]
     #[cfg(feature = "udp")]
     #[tokio::test]
     async fn recv_batch_drains_queued_datagrams() {

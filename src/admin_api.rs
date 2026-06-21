@@ -593,7 +593,7 @@ mod tests {
     fn t_metrics_mem_optional() {
         // Verify that mem_rss_bytes is an Option and is correctly set/unset
         // based on platform.
-        let mem_val = {
+        let mem_val: Option<u64> = {
             #[cfg(target_os = "linux")]
             {
                 procfs::process::Process::myself()

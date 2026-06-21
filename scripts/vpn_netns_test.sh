@@ -56,6 +56,11 @@ BORE_LISTEN_PID=""
 BORE_CONNECT_PID=""
 BORE_LISTEN_PID_B=""
 BORE_CONNECT_PID_B=""
+PORTCLASH_VPN_CONN_PID=""
+PORTCLASH_SECRET_PROV_PID=""
+PORTCLASH_SECRET_CONS_PID=""
+PORTCLASH_HTTP_PID=""
+MIX_PIDS=()
 
 pass() { echo "PASS: $*"; PASS=$((PASS+1)); }
 fail() { echo "FAIL: $*"; FAIL=$((FAIL+1)); }
@@ -67,6 +72,11 @@ cleanup() {
     [ -n "$BORE_CONNECT_PID_B" ] && kill "$BORE_CONNECT_PID_B" 2>/dev/null; BORE_CONNECT_PID_B=""
     [ -n "$BORE_LISTEN_PID"  ] && kill "$BORE_LISTEN_PID"  2>/dev/null; BORE_LISTEN_PID=""
     [ -n "$BORE_LISTEN_PID_B" ] && kill "$BORE_LISTEN_PID_B" 2>/dev/null; BORE_LISTEN_PID_B=""
+    [ -n "$PORTCLASH_VPN_CONN_PID" ] && kill "$PORTCLASH_VPN_CONN_PID" 2>/dev/null; PORTCLASH_VPN_CONN_PID=""
+    [ -n "$PORTCLASH_SECRET_PROV_PID" ] && kill "$PORTCLASH_SECRET_PROV_PID" 2>/dev/null; PORTCLASH_SECRET_PROV_PID=""
+    [ -n "$PORTCLASH_SECRET_CONS_PID" ] && kill "$PORTCLASH_SECRET_CONS_PID" 2>/dev/null; PORTCLASH_SECRET_CONS_PID=""
+    [ -n "$PORTCLASH_HTTP_PID" ] && kill "$PORTCLASH_HTTP_PID" 2>/dev/null; PORTCLASH_HTTP_PID=""
+    for pid in "${MIX_PIDS[@]}"; do kill "$pid" 2>/dev/null; done; MIX_PIDS=()
     [ -n "$BORE_SERVER_PID"  ] && kill "$BORE_SERVER_PID"  2>/dev/null; BORE_SERVER_PID=""
     sleep 0.5
     ip netns del ns0 2>/dev/null
@@ -2591,6 +2601,285 @@ BORE_LISTEN_PID_B=""
 BORE_CONNECT_PID=""
 BORE_CONNECT_PID_B=""
 sleep 0.5
+
+# ── Test T-STRESS-PORTCLASH: VPN + secret consumer on same UDP port (reproduces flap bug) ─
+# Two direct-path --udp tunnels (VPN connector + secret consumer) on the same host,
+# both pinned to --nat-udp-preferred-port 51820 (the bug). They steal each other's
+# inbound QUIC packets via SO_REUSEADDR rebinding, causing the VPN direct path to
+# flap: "bridge switched to direct" → 30s idle → "direct path lost" → relay → retry
+# → repeat. This test REPRODUCES the flap on the buggy code (should see >= 1 "lost"
+# or >= 2 "switched"). On fixed code it PASSES (switched==1, lost==0).
+echo "=== T-STRESS-PORTCLASH: port clash direct-path flap repro ==="
+
+# Start a VPN listener in ns1 (gateway, listener side)
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id clash-vpn \
+    --stun-server "$STUN" \
+    >"$BORE_LOG.portclash_listen" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+
+# Start VPN connector in ns2, pinned to port 51820
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id clash-vpn \
+    --stun-server "$STUN" \
+    --nat-udp-preferred-port 51820 \
+    >"$BORE_LOG.portclash_vpn_conn" 2>&1 &
+PORTCLASH_VPN_CONN_PID=$!
+sleep 1
+
+# Start a secret provider (bore local) in ns1 backed by a simple HTTP server
+ip netns exec ns1 python3 -m http.server 19000 --bind 127.0.0.1 >/dev/null 2>&1 &
+PORTCLASH_HTTP_PID=$!
+sleep 0.3
+
+ip netns exec ns1 "$BORE" local 19000 \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" \
+    --tcp-secret-id clash-sec --udp \
+    --nat-udp-preferred-port 51820 \
+    >"$BORE_LOG.portclash_secret_prov" 2>&1 &
+PORTCLASH_SECRET_PROV_PID=$!
+sleep 0.5
+
+# Start secret consumer (bore proxy) in ns2, also pinned to 51820 (THE CLASH)
+ip netns exec ns2 "$BORE" proxy \
+    --local-proxy-port ":19001" \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" \
+    --tcp-secret-id clash-sec --udp \
+    --nat-udp-preferred-port 51820 \
+    >"$BORE_LOG.portclash_secret_cons" 2>&1 &
+PORTCLASH_SECRET_CONS_PID=$!
+sleep 2
+
+# Let it run for 75 seconds to capture flap behavior
+echo "  (running for 75 seconds to observe VPN direct path behavior...)"
+sleep 75
+
+# Count the flap indicators in the VPN connector log
+SWITCHED=$(grep -c "bridge switched to direct path" "$BORE_LOG.portclash_vpn_conn" 2>/dev/null | tr -d '[:space:]' || echo 0)
+LOST=$(grep -c "direct path lost" "$BORE_LOG.portclash_vpn_conn" 2>/dev/null | tr -d '[:space:]' || echo 0)
+
+echo "  T-STRESS-PORTCLASH: VPN connector log flap counts:"
+echo "    bridge switched to direct path: $SWITCHED"
+echo "    direct path lost: $LOST"
+
+# On BUGGY code: expect flap (multiple switches or at least one loss)
+# On FIXED code: expect PASS (switched==1, lost==0)
+EXPECTED_PASS=0
+if [ "$SWITCHED" -eq 1 ] && [ "$LOST" -eq 0 ]; then
+    pass "T-STRESS-PORTCLASH: direct path stable (switched=$SWITCHED, lost=$LOST) — port clash FIXED"
+    EXPECTED_PASS=1
+elif [ "$LOST" -ge 1 ] || [ "$SWITCHED" -ge 2 ]; then
+    fail "T-STRESS-PORTCLASH: direct path FLAPPED (switched=$SWITCHED, lost=$LOST) — port clash BUG REPRODUCED"
+    echo "  [VPN connector log tail]:"
+    tail -8 "$BORE_LOG.portclash_vpn_conn" 2>/dev/null | sed 's/^/    /'
+else
+    fail "T-STRESS-PORTCLASH: unexpected flap counts (switched=$SWITCHED, lost=$LOST, expected either 0 or >=2 switched)"
+fi
+
+# Cleanup portclash processes
+kill "$PORTCLASH_VPN_CONN_PID" "$PORTCLASH_SECRET_PROV_PID" "$PORTCLASH_SECRET_CONS_PID" "$PORTCLASH_HTTP_PID" "$BORE_LISTEN_PID" 2>/dev/null
+PORTCLASH_VPN_CONN_PID=""
+PORTCLASH_SECRET_PROV_PID=""
+PORTCLASH_SECRET_CONS_PID=""
+PORTCLASH_HTTP_PID=""
+BORE_LISTEN_PID=""
+sleep 1
+
+# ── Test T-STRESS-MIX: mixed-load stress test (all tunnel types concurrent) ───────
+echo "=== T-STRESS-MIX: concurrent mixed-load stability test (90s window) ==="
+MIX_WINDOW="${MIX_WINDOW:-90}"
+echo "  Running all tunnel types concurrently for $MIX_WINDOW seconds..."
+
+# Helper to track and report tunnel flaps
+declare -A MIX_FLAP_COUNTS
+declare -A MIX_FLAP_TARGETS
+
+track_flap() {
+    local log_file="$1"
+    local tunnel_id="$2"
+    local lost_key="${tunnel_id}_lost"
+    local switched_key="${tunnel_id}_switched"
+    local lost switched
+    # A flap = a fall-back (lost) followed by a re-upgrade, so "direct path lost"
+    # is the unambiguous flap signal. `switched` is informational only: count ONE
+    # canonical marker per upgrade ("vpn path upgraded to direct QUIC") — a hub
+    # LISTENER legitimately logs N (one per spoke), so it must NOT be a fail gate.
+    lost=$(grep -c "direct path lost\|fell back to warm relay" "$log_file" 2>/dev/null || true)
+    switched=$(grep -c "vpn path upgraded to direct QUIC" "$log_file" 2>/dev/null || true)
+    MIX_FLAP_COUNTS["$lost_key"]=$(printf '%s' "${lost:-0}" | tr -dc '0-9')
+    MIX_FLAP_COUNTS["$switched_key"]=$(printf '%s' "${switched:-0}" | tr -dc '0-9')
+    MIX_FLAP_TARGETS["$lost_key"]=0
+    MIX_FLAP_TARGETS["$switched_key"]=1
+}
+
+# Start public tunnel 1 (bore local on port 18080)
+ip netns exec ns1 python3 -m http.server 18080 --bind 127.0.0.1 >/dev/null 2>&1 &
+MIX_PIDS+=($!)
+sleep 0.2
+ip netns exec ns1 "$BORE" local 18080 \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --port 18080 --udp \
+    >"$BORE_LOG.mix_pub1" 2>&1 &
+MIX_PIDS+=($!); sleep 0.3
+
+# Start public tunnel 2 (bore local on port 18081)
+ip netns exec ns1 python3 -m http.server 18081 --bind 127.0.0.1 >/dev/null 2>&1 &
+MIX_PIDS+=($!)
+sleep 0.2
+ip netns exec ns1 "$BORE" local 18081 \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --port 18081 --udp \
+    >"$BORE_LOG.mix_pub2" 2>&1 &
+MIX_PIDS+=($!); sleep 0.3
+
+# Start secret provider 1 (service on 19100)
+ip netns exec ns2 python3 -m http.server 19100 --bind 127.0.0.1 >/dev/null 2>&1 &
+MIX_PIDS+=($!)
+sleep 0.2
+ip netns exec ns2 "$BORE" local 19100 \
+    --to "$SERVER_IP_NS0_B" --secret "$SECRET" --tcp-secret-id mix-sec-A --udp \
+    --nat-udp-preferred-port 51821 \
+    >"$BORE_LOG.mix_sec_prov_A" 2>&1 &
+MIX_PIDS+=($!); sleep 0.3
+
+# Start secret consumer 1 (bore proxy)
+ip netns exec ns2 "$BORE" proxy \
+    --local-proxy-port ":19101" \
+    --to "$SERVER_IP_NS0_B" --secret "$SECRET" --tcp-secret-id mix-sec-A --udp \
+    --nat-udp-preferred-port 51821 \
+    >"$BORE_LOG.mix_sec_cons_A" 2>&1 &
+MIX_PIDS+=($!); sleep 0.3
+
+# Start secret provider 2 (service on 19110)
+ip netns exec ns3 python3 -m http.server 19110 --bind 127.0.0.1 >/dev/null 2>&1 &
+MIX_PIDS+=($!)
+sleep 0.2
+ip netns exec ns3 "$BORE" local 19110 \
+    --to "$SERVER_IP_NS0_C" --secret "$SECRET" --tcp-secret-id mix-sec-B --udp \
+    --nat-udp-preferred-port 51822 \
+    >"$BORE_LOG.mix_sec_prov_B" 2>&1 &
+MIX_PIDS+=($!); sleep 0.3
+
+# Start secret consumer 2 (bore proxy)
+ip netns exec ns3 "$BORE" proxy \
+    --local-proxy-port ":19111" \
+    --to "$SERVER_IP_NS0_C" --secret "$SECRET" --tcp-secret-id mix-sec-B --udp \
+    --nat-udp-preferred-port 51822 \
+    >"$BORE_LOG.mix_sec_cons_B" 2>&1 &
+MIX_PIDS+=($!); sleep 0.3
+
+# Start VPN 1:1 listener
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id mix-1to1 \
+    --advertise "$FAKE_LAN" --stun-server "$STUN" \
+    >"$BORE_LOG.mix_vpn_1to1_listen" 2>&1 &
+MIX_PIDS+=($!); sleep 0.3
+
+# Start VPN 1:1 connector
+ip netns exec ns4 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_D" --secret "$SECRET" --id mix-1to1 \
+    --accept-all-routes --stun-server "$STUN" \
+    >"$BORE_LOG.mix_vpn_1to1_conn" 2>&1 &
+MIX_PIDS+=($!); sleep 0.3
+
+# Start VPN hub listener (max 4 clients)
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id mix-hub \
+    --max-clients 4 --stun-server "$STUN" \
+    >"$BORE_LOG.mix_vpn_hub_listen" 2>&1 &
+MIX_PIDS+=($!); sleep 0.3
+
+# Start hub connectors (ns2 and ns3)
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_B" --secret "$SECRET" --id mix-hub \
+    --accept-all-routes --stun-server "$STUN" \
+    >"$BORE_LOG.mix_vpn_hub_conn_1" 2>&1 &
+MIX_PIDS+=($!); sleep 0.3
+
+ip netns exec ns3 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_C" --secret "$SECRET" --id mix-hub \
+    --accept-all-routes --stun-server "$STUN" \
+    >"$BORE_LOG.mix_vpn_hub_conn_2" 2>&1 &
+MIX_PIDS+=($!); sleep 0.5
+
+# Let the mix run for the specified window
+sleep "$MIX_WINDOW"
+
+# Collect flap metrics from all tunnels
+echo "  Collecting flap metrics..."
+track_flap "$BORE_LOG.mix_vpn_1to1_listen" "mix_1to1_listen"
+track_flap "$BORE_LOG.mix_vpn_1to1_conn" "mix_1to1_conn"
+track_flap "$BORE_LOG.mix_vpn_hub_listen" "mix_hub_listen"
+track_flap "$BORE_LOG.mix_vpn_hub_conn_1" "mix_hub_conn_1"
+track_flap "$BORE_LOG.mix_vpn_hub_conn_2" "mix_hub_conn_2"
+
+# Connectivity checks
+echo "  Verifying connectivity..."
+MIX_CONN_OK=0
+# Check VPN 1:1 overlay ping
+NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -1)
+NS4_OVL=$(ip netns exec ns4 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 | tail -1)
+if [ -n "$NS1_OVL" ] && [ -n "$NS4_OVL" ] && ip netns exec ns4 ping -c 1 -W 2 "$NS1_OVL" >/dev/null 2>&1; then
+    pass "T-STRESS-MIX: 1:1 VPN tunnel overlay reachable"
+    MIX_CONN_OK=$((MIX_CONN_OK + 1))
+else
+    fail "T-STRESS-MIX: 1:1 VPN tunnel overlay unreachable"
+fi
+
+# Hub data plane established: both spokes brought up their overlay TUN. (Spoke→spoke
+# is blocked by isolation by design — see T-HUBNAT2 — and the hub gateway overlay
+# addressing is config-specific, so assert the TUNs are up rather than a fixed IP.)
+HUB_S2=$(ip netns exec ns2 ip addr show bore0 2>/dev/null | grep -c "inet ")
+HUB_S3=$(ip netns exec ns3 ip addr show bore0 2>/dev/null | grep -c "inet ")
+if [ "${HUB_S2:-0}" -ge 1 ] && [ "${HUB_S3:-0}" -ge 1 ]; then
+    pass "T-STRESS-MIX: hub spokes ns2+ns3 overlay TUN up (hub data plane established)"
+    MIX_CONN_OK=$((MIX_CONN_OK + 1))
+else
+    fail "T-STRESS-MIX: hub spoke TUN not established (ns2=${HUB_S2:-0} ns3=${HUB_S3:-0})"
+fi
+
+# Check secret tunnel (consume via proxy)
+if timeout 3 ip netns exec ns2 curl -s http://127.0.0.1:19101 >/dev/null 2>&1; then
+    pass "T-STRESS-MIX: secret consumer A tunnel connected"
+    MIX_CONN_OK=$((MIX_CONN_OK + 1))
+else
+    fail "T-STRESS-MIX: secret consumer A tunnel failed"
+fi
+
+# Report flap metrics
+echo ""
+echo "  T-STRESS-MIX: stability metric — every tunnel must have lost==0 (no fall-back = no flap):"
+for key in "${!MIX_FLAP_COUNTS[@]}"; do
+    if [[ "$key" == *"_lost"* ]]; then
+        actual="${MIX_FLAP_COUNTS[$key]}"
+        [ "$actual" -eq 0 ] && echo "    $key: $actual (OK)" || echo "    $key: $actual (FLAP)"
+    fi
+done
+echo "  (informational) direct upgrades per tunnel — a hub listener legitimately shows one per spoke:"
+for key in "${!MIX_FLAP_COUNTS[@]}"; do
+    if [[ "$key" == *"_switched"* ]]; then
+        echo "    $key: ${MIX_FLAP_COUNTS[$key]}"
+    fi
+done
+
+# Overall verdict: a flap is a fall-back (lost) → re-upgrade, so lost==0 across all
+# tunnels is the complete "no flap" condition. `switched` is informational only.
+MIX_STABLE=1
+for key in "${!MIX_FLAP_COUNTS[@]}"; do
+    if [[ "$key" == *"_lost"* ]]; then
+        [ "${MIX_FLAP_COUNTS[$key]}" -gt 0 ] && MIX_STABLE=0
+    fi
+done
+
+if [ "$MIX_STABLE" -eq 1 ] && [ "$MIX_CONN_OK" -ge 2 ]; then
+    pass "T-STRESS-MIX: all tunnels stable under concurrent mixed load (${MIX_WINDOW}s)"
+else
+    fail "T-STRESS-MIX: tunnel instability detected during mixed load test"
+fi
+
+# Cleanup all MIX PIDs
+for pid in "${MIX_PIDS[@]}"; do kill "$pid" 2>/dev/null; done
+MIX_PIDS=()
+sleep 1
 
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""

@@ -185,6 +185,22 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   Linux) forces past it with `SO_{SND,RCV}BUFFORCE` (nix `*BufForce`, needs CAP_NET_ADMIN which VPN
   has) → falls back to the clamped setter on EPERM → getsockopt-verifies and `warn!`s with the
   remediation when a clamp survives (was a silent `debug!`). Requested 16 MiB (Fix #1)
+- **Direct-path UDP punch sockets must NEVER set `SO_REUSEADDR`** (`holepunch::bind_socket`,
+  holepunch.rs). Two wildcard UDP sockets that BOTH set `SO_REUSEADDR` co-bind the same
+  `0.0.0.0:port` and the kernel delivers inbound to the **last binder**. So when two direct-path
+  tunnels (VPN + secret, vhost, public `--udp`) share a `--nat-udp-preferred-port` on one host —
+  even in **separate processes** — each ~30 s re-punch rebinds the port and **steals** the other's
+  inbound QUIC, idle-closing the live connection → the establish→die→re-punch ~30 s LOCKSTEP FLAP
+  (both tunnels flap; only-with-concurrent-secret repro). FIX: bind the preferred port WITHOUT
+  `SO_REUSEADDR`; the kernel then refuses the 2nd binder (`EADDRINUSE`) and `bind_socket` falls back
+  to an **ephemeral port + `warn!`** (so the 1st tunnel keeps the firewall-friendly port; the 2nd
+  gets its own port and still punches, or stays on relay behind a strict egress firewall). UDP has
+  no TIME_WAIT, so a same-tunnel `--auto-reconnect` still rebinds the fixed port — but callers MUST
+  drop the old socket BEFORE binding the new one (no overlap), else the rebind hits `EADDRINUSE` and
+  downgrades to ephemeral. Regression: `bind_socket_*` unit tests + `T-STRESS-PORTCLASH` /
+  `T-STRESS-MIX` in `vpn_netns_test.sh`. Mechanism proof: `docs/plans/udp_flap/`. The direct QUIC
+  layer (keepalive 3 s / idle 10 s, transport_config) is byte-identical since `3a5c87b` — the flap
+  was NEVER the QUIC layer; do not re-bisect it
 - `NetConfig` RAII: all routes/nft/ip_forward changes revert on exit (SIGINT, SIGTERM, panic handled; SIGKILL requires next-run stale reclaim via /run state file to restore ip_forward and remove leaked iptables/nft rules — BUG-2/BUG-3 fixed). Concurrent gateway links in ONE netns refcount ip_forward via per-`(netns,id,role)` `/run/bore-vpn-ns<inode>-*.fwdref` markers + a first-wins `/run/bore-vpn-ns<inode>.ipfwd-orig` record: a link restores ip_forward only when NO other co-netns `.fwdref` remains, and the last one out restores the true original — never disables forwarding under a still-live co-netns peer (B3 fixed); `stale_reclaim` is refcount-aware too. CRITICAL: markers are scoped by the `/proc/self/ns/net` inode because `ip_forward` is per-netns while `/run` is shared across netns (the netns harness, containers) — an unscoped refcount would wrongly couple independent netns and break teardown
 - TUN MTU default 1350: clamps QUIC datagram size; gateway MSS-clamp keeps forwarded TCP healthy
 - `--pin-mtu` (BW-F4): the PMTU monitor runs OBSERVE-ONLY — it `warn!`s when the path max_datagram

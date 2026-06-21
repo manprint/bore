@@ -103,32 +103,65 @@ fn tokens_match(a: &[u8; TOKEN_LEN], b: &[u8; TOKEN_LEN]) -> bool {
 /// Bind a UDP socket for a hole-punch session. `port` 0 picks a random ephemeral
 /// port (the default); a fixed port lets a strict *egress* firewall be opened for
 /// exactly that port (use the same value on both peers) and makes the public
-/// mapping predictable on a port-preserving NAT. A fixed port is bound with
-/// `SO_REUSEADDR` so an `--auto-reconnect` cycle can re-bind it immediately after
-/// the previous socket closes. (A fixed port does not help symmetric NATs, which
-/// remap per destination regardless of the local port.)
+/// mapping predictable on a port-preserving NAT. (A fixed port does not help
+/// symmetric NATs, which remap per destination regardless of the local port.)
+///
+/// CRITICAL — NOT `SO_REUSEADDR` (see `docs/plans/udp_flap/EVIDENCE.md`): two
+/// wildcard UDP sockets that BOTH set `SO_REUSEADDR` co-bind the same port and the
+/// kernel delivers inbound datagrams to the *last* binder. With a shared
+/// `--nat-udp-preferred-port`, a second direct-path tunnel's punch (VPN + secret,
+/// vhost, public `--udp`) would silently STEAL the inbound QUIC of a live tunnel,
+/// idle-closing it — the concurrent-tunnel ~30 s flap. Without `SO_REUSEADDR` the
+/// second bind is cleanly refused (`EADDRINUSE`) and we fall back to an ephemeral
+/// port. UDP has no TIME_WAIT, so a same-tunnel `--auto-reconnect` still rebinds
+/// the fixed port fine once its previous socket has dropped (callers must
+/// drop-then-bind, not overlap).
 pub async fn bind_socket(port: u16) -> Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-        .context("failed to create UDP socket")?;
-    configure_udp_socket_buffers(&socket, &UdpDirectTuning::default());
 
-    // Reuse the address so a reconnect can rebind the fixed port without waiting
-    // for the previous socket to be fully released.
-    if port != 0 {
-        let _ = socket.set_reuse_address(true);
+    // Build + configure a fresh, unbound UDP socket (buffers + non-blocking).
+    // Returned unbound so the fixed-port attempt can be retried on an ephemeral
+    // port without reusing a socket whose bind already failed.
+    fn make_socket() -> Result<Socket> {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+            .context("failed to create UDP socket")?;
+        configure_udp_socket_buffers(&socket, &UdpDirectTuning::default());
+        socket
+            .set_nonblocking(true)
+            .context("failed to set UDP socket non-blocking")?;
+        Ok(socket)
     }
-    socket
-        .set_nonblocking(true)
-        .context("failed to set UDP socket non-blocking")?;
+
+    let socket = make_socket()?;
     let addr: SocketAddr = (Ipv4Addr::UNSPECIFIED, port).into();
-    socket.bind(&addr.into()).with_context(|| {
-        if port == 0 {
-            "failed to bind UDP socket".to_string()
-        } else {
-            format!("failed to bind fixed UDP port {port} (free? allowed?)")
+    match socket.bind(&addr.into()) {
+        Ok(()) => {
+            return UdpSocket::from_std(socket.into())
+                .context("failed to register UDP socket with tokio");
         }
-    })?;
+        // A fixed port already held (by another tunnel/process): degrade to an
+        // ephemeral port instead of stealing the holder's inbound traffic.
+        Err(e) if port != 0 && e.kind() == std::io::ErrorKind::AddrInUse => {
+            warn!(
+                preferred_port = port,
+                "fixed UDP port {port} is already in use (another tunnel or process holds it); \
+                 falling back to an ephemeral port. Behind a strict egress firewall that only \
+                 permits {port}, this tunnel may stay on the relay path."
+            );
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "failed to bind fixed UDP port {port} (free? allowed?)"
+            )));
+        }
+    }
+
+    // Ephemeral fallback after a fixed-port collision.
+    let socket = make_socket()?;
+    let addr: SocketAddr = (Ipv4Addr::UNSPECIFIED, 0).into();
+    socket
+        .bind(&addr.into())
+        .context("failed to bind ephemeral UDP socket after fixed-port fallback")?;
     UdpSocket::from_std(socket.into()).context("failed to register UDP socket with tokio")
 }
 
@@ -1851,6 +1884,50 @@ mod tests {
     use super::*;
     #[cfg(feature = "udp")]
     use crate::shared::UDP_NONCE_LEN;
+
+    /// An ephemeral request (`port == 0`) must always yield a bound socket on a
+    /// real (non-zero) port.
+    #[cfg(feature = "udp")]
+    #[tokio::test]
+    async fn bind_socket_ephemeral_gets_a_port() {
+        let s = bind_socket(0).await.expect("ephemeral bind");
+        assert_ne!(s.local_addr().unwrap().port(), 0);
+    }
+
+    /// REGRESSION (concurrent-tunnel flap, docs/plans/udp_flap/EVIDENCE.md): a
+    /// second `bind_socket` on a port a live socket already holds must NOT co-bind
+    /// it (that let the kernel deliver inbound to the last binder, stealing a live
+    /// tunnel's QUIC). Without `SO_REUSEADDR` the second bind is refused and falls
+    /// back to a DIFFERENT ephemeral port — never the contended one.
+    #[cfg(feature = "udp")]
+    #[tokio::test]
+    async fn bind_socket_fixed_port_collision_falls_back_to_ephemeral() {
+        let a = bind_socket(0).await.expect("first bind");
+        let p = a.local_addr().unwrap().port();
+        let b = bind_socket(p)
+            .await
+            .expect("second bind must fall back, not error");
+        let pb = b.local_addr().unwrap().port();
+        assert_ne!(
+            pb, p,
+            "a second bind must never co-bind the held port (would steal inbound)"
+        );
+        assert_ne!(pb, 0);
+        drop(a);
+    }
+
+    /// A free fixed port must be honored exactly (the firewall-friendly /
+    /// NAT-predictable use case still works for the first/only claimant).
+    #[cfg(feature = "udp")]
+    #[tokio::test]
+    async fn bind_socket_free_fixed_port_is_honored() {
+        // Discover a free port, release it (UDP frees immediately), re-bind it fixed.
+        let probe = bind_socket(0).await.expect("probe bind");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        let s = bind_socket(p).await.expect("fixed bind on a free port");
+        assert_eq!(s.local_addr().unwrap().port(), p);
+    }
 
     /// `SO_*BUFFORCE` must lift the UDP buffer past `net.core.{w,r}mem_max` when
     /// the process holds CAP_NET_ADMIN. This is the direct-path throughput fix:

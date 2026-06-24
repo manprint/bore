@@ -160,7 +160,7 @@ prepare_binary() {
 }
 
 main() {
-    local os arch path_mode asset url binary_status
+    local os arch path_mode asset url binary_status version
 
     [[ -n "${BASH_VERSION:-}" ]] || die "This script requires bash"
 
@@ -173,14 +173,22 @@ main() {
     asset="$(release_asset_for "$os" "$arch")"
     url="${BORE_RELEASE_BASE%/}/$asset"
 
+    prepare_binary "$url" "$TMPDIR/$asset"
+
+    # Get version from binary (-V preferred, fallback to --version). Keep first line.
+    version="$("$TMPDIR/$asset" -V 2>/dev/null || "$TMPDIR/$asset" --version 2>/dev/null || true)"
+    version="${version%%$'\n'*}"
+    if [[ -z "${version:-}" ]]; then
+        version="unknown"
+    fi
+
     info "-> bore live runner"
     info "  OS:         $os"
     info "  Arch:       $arch"
     info "  Path mode:   $path_mode"
     info "  Release:     $asset"
+    info "  Version:     $version"
     info "  Cleanup:     automatic on exit"
-
-    prepare_binary "$url" "$TMPDIR/$asset"
 
     if [[ $# -eq 0 ]]; then
         info

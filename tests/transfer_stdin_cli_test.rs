@@ -343,10 +343,11 @@ async fn wait_for_completed_chunks(
     minimum: usize,
 ) -> Result<()> {
     for _ in 0..1000 {
-        if fs::try_exists(state_file).await?
-            && completed_chunks_in_state(state_file).await? >= minimum
-            && !fs::try_exists(final_path).await?
-        {
+        // The listener rewrites the state file under us; a read that races a
+        // rewrite (a transient on Windows, where the atomic write has a
+        // non-existence window) must not fail the test — just poll again.
+        let chunks = completed_chunks_in_state(state_file).await.unwrap_or(0);
+        if chunks >= minimum && !fs::try_exists(final_path).await? {
             return Ok(());
         }
         time::sleep(Duration::from_millis(10)).await;

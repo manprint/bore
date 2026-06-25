@@ -2921,6 +2921,12 @@ impl ResumeShared {
 async fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, serde_json::to_vec(value)?).await?;
+    // On Unix `fs::rename` atomically replaces an existing target, so a
+    // concurrent reader (resume on restart, the kill/resume test poller) never
+    // observes a missing file. Windows `rename` fails if the target exists, so
+    // there the old file must be removed first — that leaves a brief
+    // non-existence window, but Unix is the hot path and stays gap-free.
+    #[cfg(windows)]
     if fs::try_exists(path).await? {
         let _ = fs::remove_file(path).await;
     }

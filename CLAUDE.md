@@ -140,6 +140,23 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   for `local`/`proxy`, but `0` (auto) for `bore transfer` — auto scales the relay carrier
   pool to the worker `--parallel` count (capped at server `--max-carriers`); `transfer.rs`
   resolves it via `resolve_carriers`. Explicit `--carriers 1` still forces the single path.
+- **Direct `--udp` connection_receive_window MUST stay >> stream_receive_window** (256 MiB
+  vs 16 MiB, `shared.rs` `DIRECT_QUIC_*` + the `--udp-*-window` flag defaults in `main.rs`).
+  At `--carriers 1` every proxied connection is a bidi stream on ONE QUIC connection; the
+  RECEIVER (server, for vhost/secret response bytes) only returns connection-level credit as
+  it DRAINS a stream into its public socket. A slow/paused public reader (browser pausing
+  assets) lets quinn buffer a full per-stream window (16 MiB) of unread data per stalled
+  stream against the SHARED connection window. `conn/stream` = how many stalled streams it
+  takes to starve EVERY other stream on that connection (requests hang `pending`). At 64 MiB
+  that was ~4 → the carriers=1 vhost stall; 256 MiB tolerates ~16 (the headroom four 64 MiB
+  carriers gave, in the default). It is a CEILING not a reservation (healthy tunnel buffers
+  ~0). Do NOT drop conn window back toward stream window, and do NOT raise stream window to
+  meet it (regresses single-stream throughput). Repro/gate: `scripts/vhost_udp_concurrency_repro.sh`
+  (R3 carriers=1 must serve a fast request <3 s while 8 slow readers pin the window).
+  Note (b): unprivileged `bore vhost`/`local` can't beat the kernel `net.core.*mem_max`
+  clamp on the per-socket UDP buffer (CAP_NET_ADMIN-only `SO_*BUFFORCE`); it `warn!`s the
+  sysctl/setcap remediation — orthogonal throughput cap, `--carriers N` also mitigates.
+  See docs/VHOST_UDP_CONCURRENCY_FIX.md.
 - **Public-tunnel `--udp` (server→client QUIC, mirrors vhost; `docs/LOCAL_UDP_PLAN.md`):**
   `--udp` off ⇒ public path byte-for-byte the TCP relay (DEC-LU5); `TunnelOptions.udp`
   is `#[serde(default)]` so old/new client↔server interop. ONE server QUIC endpoint binds

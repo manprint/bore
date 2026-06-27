@@ -212,11 +212,30 @@ pub const NAT_UDP_RELEASE_TIMEOUT: u64 = 600;
 pub const DIRECT_QUIC_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
 
 /// Default total QUIC receive window for one direct UDP connection.
-pub const DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
+///
+/// CRITICAL for the multiplexed `local`/`vhost --udp` paths: a single direct
+/// connection (the `--carriers 1` default) carries EVERY proxied connection as
+/// its own QUIC bidi stream. The receiver only returns connection-level
+/// flow-control credit as it DRAINS each stream into its public socket, so a
+/// slow/paused public reader (a browser pausing some assets while it parses
+/// blocking CSS/JS) lets quinn buffer up to one full `STREAM_RECEIVE_WINDOW`
+/// (16 MiB) of unread data per stalled stream AGAINST this shared window. Once
+/// `CONNECTION_RECEIVE_WINDOW / STREAM_RECEIVE_WINDOW` streams stall, the whole
+/// connection runs out of credit and EVERY other stream on it starves —
+/// requests hang "pending" until a stalled reader drains. At 64 MiB only ~4
+/// stalled streams triggered this (the carriers=1 stall reproduced by
+/// `scripts/vhost_udp_concurrency_repro.sh`). 256 MiB tolerates ~16 — the same
+/// headroom four 64 MiB carriers gave, now in the single-connection default.
+/// It is a CEILING (quinn only buffers what actually arrives unread), not a
+/// reservation, so a healthy tunnel that keeps draining costs ~0. Tunable via
+/// the direct-path tuning flags for hosts that need a tighter memory bound.
+pub const DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 256 * 1024 * 1024;
 
 /// Default upper bound on bytes sent but not yet acknowledged on the direct
-/// UDP path.
-pub const DIRECT_QUIC_SEND_WINDOW: u64 = 64 * 1024 * 1024;
+/// UDP path. Kept at parity with the connection receive window so the sender's
+/// own connection-level send budget never becomes the bottleneck before the
+/// peer's advertised receive window does.
+pub const DIRECT_QUIC_SEND_WINDOW: u64 = 256 * 1024 * 1024;
 
 /// Default UDP socket receive buffer requested for each direct-path socket.
 pub const DIRECT_UDP_SOCKET_RECV_BUFFER: usize = 16 * 1024 * 1024;

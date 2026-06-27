@@ -490,7 +490,7 @@ enum Command {
         #[clap(
             long,
             value_name = "SIZE",
-            default_value = "64MiB",
+            default_value = "256MiB",
             env = "BORE_UDP_CONNECTION_RECEIVE_WINDOW"
         )]
         udp_connection_receive_window: String,
@@ -500,7 +500,7 @@ enum Command {
         #[clap(
             long,
             value_name = "SIZE",
-            default_value = "64MiB",
+            default_value = "256MiB",
             env = "BORE_UDP_SEND_WINDOW"
         )]
         udp_send_window: String,

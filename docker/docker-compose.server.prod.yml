@@ -1,0 +1,74 @@
+# bore server — bridge network with explicit port forwarding.
+#
+#   docker compose -f docker-compose.server.yml up -d
+#
+# The image defaults to $BORE_IMAGE (see the justfile `repo`); override with
+#   BORE_IMAGE=youruser/bore:latest docker compose ... up -d
+
+networks:
+  bore:
+    driver: bridge
+
+services:
+  bore-server:
+    image: ${BORE_IMAGE:-ghcr.io/manprint/bore:dev}
+    # To build locally instead of pulling, comment `image:` and uncomment:
+    # build:
+    #   context: ..
+    #   dockerfile: Dockerfile
+    pull_policy: always
+    container_name: bore-server
+    command: ["server"]
+    restart: always
+    networks:
+      - bore
+    # The control port and the tunnel port range must be forwarded explicitly,
+    # and MUST match BORE_CONTROL_PORT and BORE_MIN_PORT/BORE_MAX_PORT below.
+    ports:
+      - "7835:7835"            # control port
+      - "7835:7835/udp"        # udp
+      - "9000-9100:9000-9100"  # tunnel port range
+      - "443:7835"             # expose the control port over standard HTTPS
+      - "80:80/udp"            # quic udp
+      - "443:443/udp"          # quic udp https 
+    environment:
+      - BORE_SECRET=zzzzzzzzzzzzzzzzzzzzzz
+      - BORE_CONTROL_PORT=7835
+      - BORE_MIN_PORT=9000
+      - BORE_MAX_PORT=9100
+      - BORE_MAX_CONNS=1024
+      # Public domain advertised to clients (enables http(s):// addressing):
+      - BORE_BIND_DOMAIN=bore.0912345.xyz
+      - BORE_ADMIN_TOKEN=zzzzzzzzzzzzzzzzzzzzz
+      - BORE_CERT_FILE=/certs/cert.pem
+      - BORE_KEY_FILE=/certs/key.pem
+      - BORE_UDP=true
+      - BORE_MAX_CARRIERS=1024
+      - BORE_UDP_MAX_STREAMS=8192
+      - BORE_PROXY_BUFFER_SIZE=128KiB
+#      - BORE_UDP_STREAM_RECEIVE_WINDOW=16MiB
+#      - BORE_UDP_CONNECTION_RECEIVE_WINDOW=32MiB
+#      - BORE_UDP_SEND_WINDOW=32MiB
+#      - BORE_UDP_SOCKET_RECV_BUFFER=16MiB
+#      - BORE_UDP_SOCKET_SEND_BUFFER=16MiB
+#      - BORE_UDP_MAX_STREAMS=4096
+      - BORE_VHOST_CONFIG=/config.yml
+      - BORE_VHOST_BASE_DOMAIN=bore.0912345.xyz
+      - BORE_VHOST_MODE=auto
+      - BORE_VHOST_HTTP_PORT=80
+      - BORE_VHOST_HTTPS_PORT=443
+      - BORE_VHOST_CERT_FILE=/certs/cert.pem
+      - BORE_VHOST_KEY_FILE=/certs/key.pem
+      - BORE_VHOST_QUIC_PORT=443
+      - BORE_CONTROL_HSTS=max-age=31536000; includeSubDomains
+      - BORE_VPN=true
+      - BORE_VPN_POOL=10.99.0.0/16
+      - BORE_VPN_MAX_LINKS=32
+      - BORE_WEBSERVER_LOG=/logs
+      - BORE_WEBSERVER_LOG_MAX_FILES=5
+      - BORE_WEBSERVER_LOG_MAX_FILE_SIZE=50
+
+    volumes:
+      - ./certs:/certs:ro
+      - ./config.yml:/config.yml:ro
+      - ./logs:/logs:rw

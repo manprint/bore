@@ -57,6 +57,10 @@ jobs:
           - { script: secret_netns_test,         secs: 1200 }
           - { script: vhost_netns_test,          secs: 1200 }
           - { script: vhost_netns_test_hard,     secs: 1200 }
+          # regression gate for the carriers=1 vhost/local --udp connection-window
+          # stall (R3: a fast request must complete <3 s while slow readers pin
+          # the shared QUIC connection window). Guards commit 04aac76.
+          - { script: vhost_udp_concurrency_repro, secs: 600 }
           - { script: vpn_netns_test,            secs: 1500 }
           - { script: vpn_netns_test_hard,       secs: 1500 }
           # benchmarks (noisy on shared CI VMs; smoke signal only)

@@ -2,9 +2,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-#[cfg(all(feature = "vpn", target_os = "linux"))]
+#[cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
 use bore_cli::shared::{AdvertiseEntry, Ipv4Net, VpnAddrRequest};
-#[cfg(all(feature = "vpn", target_os = "linux"))]
+#[cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
 use bore_cli::vpn;
 use bore_cli::{
     client::{Client, ProviderMeta},
@@ -398,7 +398,7 @@ enum Command {
     },
 
     /// Linux point-to-point VPN overlay (requires --features vpn; needs root / CAP_NET_ADMIN).
-    #[cfg(all(feature = "vpn", target_os = "linux"))]
+    #[cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
     Vpn {
         #[clap(subcommand)]
         command: VpnCommand,
@@ -925,7 +925,7 @@ enum TransferCommand {
     },
 }
 
-#[cfg(all(feature = "vpn", target_os = "linux"))]
+#[cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
 #[derive(Subcommand, Debug)]
 enum VpnCommand {
     /// Register a VPN link id and wait for a connector.
@@ -934,7 +934,7 @@ enum VpnCommand {
     Connect(VpnConnectArgs),
 }
 
-#[cfg(all(feature = "vpn", target_os = "linux"))]
+#[cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
 #[derive(clap::Args, Debug)]
 struct VpnListenArgs {
     /// Server address (host or https://host).
@@ -1089,7 +1089,7 @@ struct VpnListenArgs {
     max_clients: u16,
 }
 
-#[cfg(all(feature = "vpn", target_os = "linux"))]
+#[cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
 #[derive(clap::Args, Debug)]
 struct VpnConnectArgs {
     /// Server address (host or https://host).
@@ -1640,7 +1640,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 .await?;
             }
         },
-        #[cfg(all(feature = "vpn", target_os = "linux"))]
+        #[cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
         Command::Vpn { command } => match command {
             VpnCommand::Listen(args) => {
                 let advertise_entries: Result<Vec<_>> = args
@@ -2845,7 +2845,7 @@ mod tests {
 
     // ─── VPN CLI tests ────────────────────────────────────────────────────────
 
-    #[cfg(all(feature = "vpn", target_os = "linux"))]
+    #[cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn cli_vpn_help_renders() {
         // --help exits with a non-zero code; clap returns Err(DisplayHelp).
@@ -2853,7 +2853,7 @@ mod tests {
         assert!(result.is_err(), "vpn --help should exit (clap Err)");
     }
 
-    #[cfg(all(feature = "vpn", target_os = "linux"))]
+    #[cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn cli_vpn_requires_secret() {
         let result = Args::try_parse_from([
@@ -2868,7 +2868,7 @@ mod tests {
         assert!(result.is_err(), "listen without --secret must fail");
     }
 
-    #[cfg(all(feature = "vpn", target_os = "linux"))]
+    #[cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn cli_vpn_static_requires_peer_addr() {
         // --vpn-peer-addr requires --vpn-addr (clap `requires` constraint).
@@ -2891,7 +2891,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "vpn", target_os = "linux"))]
+    #[cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn cli_vpn_parses_advertise_list() {
         let args = Args::parse_from([

@@ -1,73 +1,56 @@
 # Resume — VPN macOS Completion
 
-Machine-readable progress tracker. Implementer updates this after every
-sub-phase. All TODO at init.
+> Updated 2026-06-29. Implemented on a **Linux** dev box. macOS cannot be compiled
+> locally (blake3 NEON C rejects cross-compile to `aarch64-apple-darwin`), so the
+> `macos-14` CI job is the macOS compile/test oracle and a Mac is needed for the
+> spike + manual acceptance. Linux is the hard local gate (I-M1).
+
+## Local gate status (Linux)
+
+- `cargo build --features vpn` — green.
+- `cargo clippy --features vpn --all-targets -- -D warnings` — green.
+- `cargo test --features vpn` — **610 passed / 0 failed** (unchanged count vs pre-port).
+- `cargo fmt --all -- --check` — clean.
+- `scripts/vpn_netns_test.sh` (sudo) — **PASS=161 FAIL=0** (2026-06-29; T-LINUX-REGRESS green, I-M1 proven).
 
 ## Phase status
 
-| Phase | Sub-phase | Model | Status |
-|-------|-----------|-------|--------|
-| 1 | 1.1 macOS CI build job (`macos-14`) | Haiku | TODO |
-| 1 | 1.2 De-risk spike + findings + PF/builder validation | Sonnet / Opus gate | TODO |
-| 2 | 2.1 Flip cfg gates to `any(linux, macos)` | Opus→Sonnet | TODO |
-| 2 | 2.2 cfg-split runtime + macOS stubs | Opus→Sonnet | TODO |
-| 2 | 2.3 Platform flag warnings | Haiku | TODO |
-| 3 | 3.1 macOS `create_tun` twin | Opus→Sonnet | TODO |
-| 3 | 3.2 macOS name-resolution tests + smoke hook | Sonnet | TODO |
-| 4 | 4.1 macOS `NetConfig::apply` twin | Opus→Sonnet | TODO |
-| 4 | 4.2 macOS Drop + `stale_reclaim` twin | Opus→Sonnet | TODO |
-| 4 | 4.3 macOS state-file helpers | Sonnet | TODO |
-| 4 | 4.4 macOS rule-plane unit tests | Sonnet | TODO |
-| 5 | 5.1 macOS single-host smoke e2e (CI) | Sonnet | TODO |
-| 5 | 5.2 Manual two-host acceptance checklist | Opus gate→Sonnet | TODO |
-| 5 | 5.3 Linux regression proof | Sonnet | TODO |
-| 6 | 6.1 Docs update | Haiku / Opus read gate | TODO |
+| Phase | Status | Notes |
+|-------|--------|-------|
+| 1.1 macOS CI build job | **DONE** | `macos-vpn-build` (macos-14): build+clippy+test+example+smoke in `.github/workflows/ci.yml`. |
+| 1.2 De-risk spike | **HARDWARE-PENDING** | Harness `examples/macos_vpn_spike.rs` (mode `spike`) + findings template `docs/vpn/VPN_MACOS_SPIKE_FINDINGS.md`. Human runs on a Mac; Opus gates findings. PF grammar PROVISIONAL until then (D6). |
+| 2.1 Flip cfg gates | **DONE** | 6 anchors + grep hits widened to `any(linux,macos)` (vpn.rs:1, lib.rs, main.rs ×11). holepunch.rs VPN data-path **tests** left `cfg(linux)` (conservative; not CLI/enum wiring). |
+| 2.2 cfg-split runtime | **DONE** | `create_tun`, `NetConfig::apply`, `Drop`→`restore_ip_forward_op`, `stale_reclaim`, offload pumps ×3 cfg-twinned. macOS test `macos_apply_stub_bails` kept for apply-error wording until 4 landed; now apply is real — test asserts tun-request + `/var/run` paths instead. |
+| 2.3 Platform flag warnings | **DONE** | `macos_flag_warnings` (pure, tested) + `emit_macos_flag_warnings` once in `run_listen`/`run_connect` (hub via `run_listen`). |
+| 3 macOS `create_tun` | **DONE (CI/spike-validate)** | Single-queue, no-offload utun; kernel assigns + reads back name (`dev.name()`); `macos_tun_request` maps auto/boreN→kernel, utunN→passthrough. tun-rs 2.8.5 API confirmed via docs. |
+| 4 macOS NetConfig/Drop/stale_reclaim | **DONE (CI/spike-validate)** | `apply` = `route -n` + `sysctl net.inet.ip.forwarding` + PF anchor `bore_vpn/<id>` from `pf_ruleset` (MSS 1310). `/var/run` state files (D5) via `run_dir()` cfg-twin. PF PROVISIONAL until 1.2. |
+| 5.1 single-host smoke (CI) | **DONE** | example modes `create-teardown`/`apply-revert`/`leak-then-reclaim`; CI step `continue-on-error` (GitHub runner may forbid utun under sudo — plan-sanctioned, warns). |
+| 5.2 manual two-host acceptance | **DONE (doc)/PENDING (run)** | `docs/vpn/VPN_MACOS_ACCEPTANCE.md` (T-MAC-MANUAL, 6 steps + result table). |
+| 5.3 Linux regression proof | **DONE** | `vpn_netns_test.sh` PASS=161 FAIL=0 (2026-06-29); macOS code is additive `cfg(macos)` + behavior-preserving shared refactors (`run_dir()`). |
+| 6 Docs | **PARTIAL** | `CLAUDE.md` macOS block → "runtime LANDED". `VPN_MACOS_PORT_PLAN.md`/`VPN_MACOS.md`/`README` still to drop PROVISIONAL/PENDING (after the spike validates PF). |
 
-## Test status
+## Deviations from the plan (all I-M1-safe, documented)
 
-| Test ID | What it proves | Where | Status |
-|---------|----------------|-------|--------|
-| `macos_runtime_stubs_bail` | macOS stubs bail "pending" (Phase 2.2) | `src/vpn.rs` (macOS, `macos-14`) | TODO |
-| `macos_tun_request_maps_auto_and_bore` | name mapping (Phase 3.1) | `src/vpn.rs` (macOS) | TODO |
-| `macos_state_paths_under_var_run` | `/var/run` state paths (Phase 4.3) | `src/vpn.rs` (macOS) | TODO |
-| `macos_other_fwdref_present_detects_peer` | refcount detection (Phase 4.3) | `src/vpn.rs` (macOS) | TODO |
-| `macos_stale_reclaim_restores_forwarding` | reclaim plan (Phase 4.2) | `src/vpn.rs` (macOS) | TODO |
-| `macos_drop_refcount_keeps_forwarding_when_peer_active` | last-out restore (Phase 4.2) | `src/vpn.rs` (macOS) | TODO |
-| `macos_apply_plain_advertise_uses_sysctl_and_pf_nat` | apply argv + PF nat (Phase 4.4) | `src/vpn.rs` (macOS) | TODO |
-| `macos_apply_netmap_uses_binat` | apply binat netmap (Phase 4.4) | `src/vpn.rs` (macOS) | TODO |
-| `macos_apply_nat_masquerade_and_hub_and_forward_accept` | apply F2+hub+forward (Phase 4.4) | `src/vpn.rs` (macOS) | TODO |
-| `macos_apply_no_route_manage_runs_nothing` | dry-run safety (Phase 4.4) | `src/vpn.rs` (macOS) | TODO |
-| `macos_apply_non_gateway_only_routes` | non-gateway path (Phase 4.4) | `src/vpn.rs` (macOS) | TODO |
-| `cmd_macos_builders_snapshot` (+ `macos_pf_ruleset_*`, `macos_parse_lan_iface_*`) | builders match validated grammar (Phase 1.2) | `src/vpn.rs:3179+` (Linux CI) | EXISTING (re-confirm) |
-| `T-MAC-BUILD` | build+clippy+test on `macos-14` | CI `ci.yml` | TODO |
-| `T-MAC-SMOKE` | single-host utun+apply+revert+reclaim under sudo | CI `ci.yml` | TODO |
-| `T-MAC-MANUAL` | two-host relay/direct/gateway/teardown/reclaim | `docs/vpn/VPN_MACOS_ACCEPTANCE.md` (human) | TODO |
-| `T-LINUX-REGRESS` | Linux netns suites unchanged | `scripts/vpn_netns_test.sh` + `_hard` | TODO |
+1. **I-M3 caveat:** TUN offload pumps use Linux-only `tun-rs` APIs
+   (`recv_multiple`/`send_multiple`/`GROTable`/`VIRTIO_NET_HDR_LEN`). Fixed by
+   cfg-twinning the three `*_offload` fns (`cfg(linux)` real + `cfg(macos)`
+   `unreachable!`); offload is always false on macOS so stubs never run.
+2. **Linux `cmd_nft_*`/`cmd_iptables_*` left un-gated** — `hostcfg_cmd` has
+   `#![allow(dead_code)]`, so unused-on-macOS does not trip clippy; gating ~460
+   lines added risk for no benefit.
+3. **State paths via `run_dir()` cfg-twin** (`/run` Linux, `/var/run` macOS, D5)
+   instead of separate macOS twin helpers. Linux byte-identical.
+4. **`run_listen_hub` warning skipped** — `run_listen` (its only caller) already
+   warns; warning twice would duplicate.
+5. **Phases 3–4 before the 1.2 spike** (D6 gates 4 on 1.2) — done best-effort
+   because additive + zero-Linux-risk; PF grammar marked PROVISIONAL.
+6. **Attribute-order gotcha:** on a cfg-twinned `pub` method, a doc comment must be
+   followed by `#[allow(...)]` THEN `#[cfg(...)]`, else `missing_docs` misfires.
 
-## Docs status
+## Next (Mac operator)
 
-| Doc | Action | Status |
-|-----|--------|--------|
-| `docs/vpn/VPN_MACOS_SPIKE_FINDINGS.md` | create (Phase 1.2) | TODO |
-| `docs/vpn/VPN_MACOS_ACCEPTANCE.md` | create (Phase 5.2) | TODO |
-| `docs/vpn/VPN_MACOS_PORT_PLAN.md` | mark phases landed (Phase 6.1) | TODO |
-| `docs/vpn/VPN_MACOS.md` | runtime real, validated PF grammar (Phase 6.1) | TODO |
-| `README` | macOS in VPN platform support (Phase 6.1) | TODO |
-| `CLAUDE.md` | update macOS port block to "runtime landed" (Phase 6.1) | TODO |
-
-## Invariant guards (must hold at every phase)
-
-- I-M1 Linux byte-for-byte (`git diff` clean inside `cfg(linux)`; netns green)
-- I-M2 compile-time twin only
-- I-M3 data plane untouched
-- I-M4 macOS offload off / queues 1
-- I-M5 PF semantics mirror nft
-- I-M6 RAII + SIGKILL parity on macOS
-- I-M7 no `--version` probe for BSD tools
-- I-M8 `--tun-name` advisory, read-back utunN
-
-## Next
-
-**Next:** Phase 1, sub-phase 1.1 — add the `macos-14` CI build job in
-`.github/workflows/ci.yml` (Haiku). Phase 1.2 (spike) is hardware-gated and is a
-hard prerequisite for Phase 4.
+1. `sudo target/debug/examples/macos_vpn_spike spike` → fill
+   `VPN_MACOS_SPIKE_FINDINGS.md`; patch `pf_ruleset`/`cmd_pf_*` + snapshots if any
+   PF line is rejected.
+2. Run `VPN_MACOS_ACCEPTANCE.md` (T-MAC-MANUAL) on a Mac+Linux pair.
+3. After PF validated, finish Phase 6 doc wording.

@@ -343,22 +343,44 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   `--nat-masquerade` for the return path when the gateway is not the LAN router (I-NAT5) — the two
   are orthogonal; the field repro needed BOTH.
 
-**VPN macOS port (groundwork only, runtime PENDING a Mac):**
-- The `vpn` module + `Vpn` subcommand are gated `cfg(all(feature="vpn", target_os="linux"))` — VPN
-  is **Linux-only today**. macOS port plan: `docs/vpn/VPN_MACOS_PORT_PLAN.md`; backend ref:
-  `docs/vpn/VPN_MACOS.md`. Decisions LOCKED: Apple Silicon macOS 13+, `--forward-accept`=PF `pass`,
-  GitHub macos CI runner, Windows deferred.
-- DEC-M1 (zero-regression contract): the Linux `NetConfig::apply`/`Drop`/`stale_reclaim` + ALL
-  `cmd_nft_*`/`cmd_iptables_*`/`cmd_*` builders stay BYTE-FOR-BYTE under `#[cfg(target_os="linux")]`.
-  macOS is an additive `#[cfg(target_os="macos")]` twin (compile-time split, NOT a runtime trait).
-  Reuse the generic `CommandRunner` + `revert_cmds` argv stack + `NetConfig` fields + the
-  platform-agnostic data plane (bridge/AEAD/carriers/relay/QUIC/PMTU).
-- LANDED (2026-06-16): `Cargo.toml` makes `tun-rs` available on the macOS target (`procfs` stays
-  Linux-only); `hostcfg_cmd::macos` has the full PURE builder set + `pf_ruleset` composer (macOS twin
-  of `gateway_nft_cmds`) + `parse_lan_iface`, snapshot-tested on the Linux CI. PF mapping: `binat`=1:1
-  netmap (host-bit preserving), `nat`=masquerade, `scrub max-mss`=MSS clamp, `block`=spoke isolation.
-  PF syntax is PROVISIONAL until the Phase 0 Mac spike. The module `cfg` gate is NOT flipped — Linux
-  build/runtime byte-identical, macOS still has no `vpn` subcommand until the runtime lands.
+**VPN macOS port (runtime LANDED 2026-06-29; macOS-compile + Mac spike validate on CI/hardware):**
+- The `vpn` module + `Vpn` subcommand are now gated `cfg(all(feature="vpn",
+  any(target_os="linux", target_os="macos")))` — VPN runs on **Linux AND macOS** (Apple Silicon,
+  macOS 13+; root/`sudo`). Plan: `docs/plans/plan_VpnMacosCompletion/`; backend ref:
+  `docs/vpn/VPN_MACOS.md`; spike findings: `docs/vpn/VPN_MACOS_SPIKE_FINDINGS.md`; manual acceptance:
+  `docs/vpn/VPN_MACOS_ACCEPTANCE.md`. Decisions LOCKED: `--forward-accept`=PF `pass`, `macos-14` CI
+  runner, Windows deferred.
+- DEC-M1 (zero-regression contract, HELD): every Linux runtime fn (`create_tun`, `NetConfig::apply`,
+  the `Drop` ip_forward branch via `restore_ip_forward_op`, `stale_reclaim`) and the bridge offload
+  pumps (`run_uplink_offload`/`run_downlink_offload`/`run_router_uplink_offload`) keep their bodies
+  BYTE-FOR-BYTE under `#[cfg(target_os="linux")]`; macOS is an additive `#[cfg(target_os="macos")]`
+  twin (compile-time split, NOT a runtime trait). `cmd_nft_*`/`cmd_iptables_*` stay un-gated but
+  unused on macOS (`#![allow(dead_code)]` on `hostcfg_cmd`). Shared, un-gated: `pick_tun_name`,
+  `check_root`, `check_binary_exists`, `CommandRunner`/`RealRunner`, `NetConfig` fields, the
+  `revert_cmds` argv stack, the `/run`-vs-`/var/run` state-path helpers (via `run_dir()`), and the
+  whole data plane (bridge/AEAD/carriers/relay/QUIC/PMTU). Proof: `vpn_netns_test.sh` stays green +
+  `git diff` shows no semantic edit inside any `cfg(linux)` body. Attribute order: a doc comment must
+  be followed by `#[allow(...)]` THEN `#[cfg(...)]` on a cfg-twinned `pub` method, else `missing_docs`
+  misfires.
+- macOS runtime: `create_tun` makes a single-queue, no-offload utun, kernel-assigns the `utunN` name
+  and reads it back via `dev.name()` (D7/I-M8); `--tun-name` is advisory (`macos_tun_request` maps
+  `auto`/`boreN` → kernel-assign, explicit `utunN` → passthrough); `--tun-queues>1` + the UDP
+  hole-punch helper flags warn (`macos_flag_warnings`, I-M4/I-M7) — never silently ignored. TUN
+  offload is always OFF on macOS ⇒ the bridge single-packet path (I-M3; the `*_offload` pumps use
+  Linux-only `tun-rs` `recv_multiple`/`GROTable`/`VIRTIO_NET_HDR_LEN`, so macOS gets `unreachable!`
+  twins). `NetConfig::apply` (macOS) = `route -n` routes + `sysctl net.inet.ip.forwarding` + ONE
+  per-link PF anchor `bore_vpn/<id>` composed by `pf_ruleset` and loaded with `pfctl -a … -f`; RAII
+  flushes the anchor + restores forwarding; `stale_reclaim` flushes a leaked anchor by id + restores
+  forwarding from the `/var/run` state file (D5, no netns inode → single ns0 scope; I-M6). BSD tools
+  are never `--version`-probed (D8; the `ip` preflight is `cfg(linux)`). PF mapping: `binat`=1:1
+  netmap (host-bit preserving), `nat`=masquerade, `scrub max-mss`=MSS clamp (1310 = default MTU
+  1350−40), `block`=spoke isolation, `pass`=`--forward-accept`.
+- REMAINING GATES (the dev box is Linux — macOS cannot be compiled locally; blake3 NEON C blocks
+  cross-check): the `macos-14` CI job (`cargo build/clippy/test --features vpn` + the
+  `macos_vpn_spike` smoke) is the macOS compile/test oracle; the Phase 1 Mac **spike** validates the
+  PROVISIONAL PF grammar (`examples/macos_vpn_spike.rs spike`, fill `VPN_MACOS_SPIKE_FINDINGS.md`) and
+  the two-host **manual acceptance** (`VPN_MACOS_ACCEPTANCE.md`, T-MAC-MANUAL). Any PF correction lands
+  in `pf_ruleset`/the `cmd_pf_*` builders + their snapshots, not in `apply`.
 
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

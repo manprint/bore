@@ -98,6 +98,37 @@ jobs:
         if: matrix.target != 'aarch64-linux-android'
         run: cargo test --features vpn --lib
 
+  macos-vpn-build:
+    name: macOS VPN build (macos-14)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --features vpn
+
+      - run: cargo clippy --features vpn --all-targets -- -D warnings
+
+      - run: cargo test --features vpn
+
+      - run: cargo build --features vpn --example macos_vpn_spike
+
+      # T-MAC-SMOKE: single-host utun + PF apply/revert + SIGKILL stale-reclaim.
+      # continue-on-error: GitHub macOS runners may forbid utun creation even
+      # under sudo (plan 5.1 allows this downgrade) — failures surface as warnings;
+      # the real device smoke is the manual checklist (docs/vpn/VPN_MACOS_ACCEPTANCE.md).
+      - name: macOS smoke (utun + PF apply/revert; best-effort under sudo)
+        run: |
+          sudo target/debug/examples/macos_vpn_spike apply-revert || echo "::warning::macos apply-revert smoke skipped/failed (runner may forbid utun under sudo) — see docs/vpn/VPN_MACOS_ACCEPTANCE.md"
+          sudo target/debug/examples/macos_vpn_spike leak-then-reclaim leak || true
+          sudo target/debug/examples/macos_vpn_spike leak-then-reclaim reclaim || echo "::warning::macos leak-then-reclaim smoke skipped"
+        continue-on-error: true
+
   audit:
     name: Security audit
     runs-on: ubuntu-latest

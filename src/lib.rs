@@ -37,7 +37,7 @@ pub mod transfer;
 pub mod transport;
 pub mod udp_diagnostic;
 pub mod vhost;
-#[cfg(all(feature = "vpn", target_os = "linux"))]
+#[cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
 pub mod vpn;
 #[cfg(feature = "vpn")]
 pub mod vpn_server;

@@ -1,6 +1,6 @@
-//! VPN L3 tunnel feature (Linux, experimental).
+//! VPN L3 tunnel feature (Linux + macOS, experimental).
 
-#![cfg(all(feature = "vpn", target_os = "linux"))]
+#![cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::sync::Arc;
@@ -479,8 +479,121 @@ where
     }
 }
 
+/// Classify which advisory warnings a macOS link should emit for flags that do
+/// not apply on macOS (Phase 2.3). Pure (testable): returns stable keys, not
+/// rendered messages. `tun-queues` = utun has no multi-queue (I-M4);
+/// `holepunch-helpers` = the UDP NAT-traversal helper flags are advisory on
+/// macOS. Both `nat_udp_*` defaults are `0`, so non-zero ⇒ user-set.
+#[cfg(target_os = "macos")]
+fn macos_flag_warnings(
+    tun_queues: usize,
+    upnp: bool,
+    stun_server_set: bool,
+    try_port_prediction: bool,
+    nat_udp_preferred_port: u16,
+    nat_udp_release_timeout: u64,
+) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+    if tun_queues > 1 {
+        warnings.push("tun-queues");
+    }
+    if upnp
+        || stun_server_set
+        || try_port_prediction
+        || nat_udp_preferred_port != 0
+        || nat_udp_release_timeout != 0
+    {
+        warnings.push("holepunch-helpers");
+    }
+    warnings
+}
+
+/// Emit the macOS advisory flag warnings once at link start (no control-flow
+/// change — I-M7 spirit: warn, never silently ignore).
+#[cfg(target_os = "macos")]
+fn emit_macos_flag_warnings(
+    tun_queues: usize,
+    upnp: bool,
+    stun_server_set: bool,
+    try_port_prediction: bool,
+    nat_udp_preferred_port: u16,
+    nat_udp_release_timeout: u64,
+) {
+    for key in macos_flag_warnings(
+        tun_queues,
+        upnp,
+        stun_server_set,
+        try_port_prediction,
+        nat_udp_preferred_port,
+        nat_udp_release_timeout,
+    ) {
+        match key {
+            "tun-queues" => {
+                tracing::warn!("macOS utun has no multi-queue; --tun-queues ignored (using 1)")
+            }
+            "holepunch-helpers" => tracing::warn!(
+                "macOS: UDP hole-punch helper flags (--upnp/--stun-server/\
+                 --try-port-prediction/--nat-udp-preferred-port/\
+                 --nat-udp-release-timeout) are advisory/unsupported on macOS"
+            ),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_flag_warning_tests {
+    use super::*;
+
+    #[test]
+    fn warns_on_multiqueue_and_holepunch_helpers() {
+        // No inapplicable flags → no warnings.
+        assert!(macos_flag_warnings(1, false, false, false, 0, 0).is_empty());
+        // Multi-queue requested.
+        assert_eq!(
+            macos_flag_warnings(4, false, false, false, 0, 0),
+            vec!["tun-queues"]
+        );
+        // Each hole-punch helper independently triggers the advisory.
+        assert_eq!(
+            macos_flag_warnings(1, true, false, false, 0, 0),
+            vec!["holepunch-helpers"]
+        );
+        assert_eq!(
+            macos_flag_warnings(1, false, true, false, 0, 0),
+            vec!["holepunch-helpers"]
+        );
+        assert_eq!(
+            macos_flag_warnings(1, false, false, true, 0, 0),
+            vec!["holepunch-helpers"]
+        );
+        assert_eq!(
+            macos_flag_warnings(1, false, false, false, 9000, 0),
+            vec!["holepunch-helpers"]
+        );
+        assert_eq!(
+            macos_flag_warnings(1, false, false, false, 0, 30),
+            vec!["holepunch-helpers"]
+        );
+        // Both categories at once, in order.
+        assert_eq!(
+            macos_flag_warnings(2, false, false, false, 0, 5),
+            vec!["tun-queues", "holepunch-helpers"]
+        );
+    }
+}
+
 /// Start a VPN listener (reconnect loop around [`run_listen_once`]).
 pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    emit_macos_flag_warnings(
+        args.tun_queues,
+        args.upnp,
+        args.stun_server.is_some(),
+        args.try_port_prediction,
+        args.nat_udp_preferred_port,
+        args.nat_udp_release_timeout,
+    );
     let auto = args.auto_reconnect;
     run_with_reconnect(auto, move || run_listen_once(args.clone())).await
 }
@@ -489,6 +602,10 @@ pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
 async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
     // Preflight checks (fatal: retrying cannot fix privileges or PATH)
     hostcfg::check_root().map_err(|e| FatalVpnError(e.to_string()))?;
+    // Linux uses iproute2 (`ip`); macOS uses BSD `route`/`ifconfig`, which do not
+    // accept `--version` (D8/I-M7), so the macOS path never probes them — it
+    // proceeds to the runtime, which currently bails at the create_tun stub.
+    #[cfg(target_os = "linux")]
     hostcfg::check_binary_exists("ip")
         .then_some(())
         .ok_or_else(|| FatalVpnError("'ip' command not found".into()))?;
@@ -1550,6 +1667,17 @@ async fn run_bridge_with_ctrl(
 
 /// Start a VPN connector (reconnect loop around [`run_connect_once`]).
 pub async fn run_connect(args: VpnConnectArgs) -> Result<()> {
+    // macOS advisory warnings once at start (the hub listener path is covered by
+    // `run_listen`, which is the only caller of `run_listen_hub`).
+    #[cfg(target_os = "macos")]
+    emit_macos_flag_warnings(
+        args.tun_queues,
+        args.upnp,
+        args.stun_server.is_some(),
+        args.try_port_prediction,
+        args.nat_udp_preferred_port,
+        args.nat_udp_release_timeout,
+    );
     let auto = args.auto_reconnect;
     run_with_reconnect(auto, move || run_connect_once(args.clone())).await
 }
@@ -1558,6 +1686,8 @@ pub async fn run_connect(args: VpnConnectArgs) -> Result<()> {
 async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
     // Preflight checks (fatal: retrying cannot fix privileges or PATH)
     hostcfg::check_root().map_err(|e| FatalVpnError(e.to_string()))?;
+    // Linux-only `ip` probe (D8/I-M7): macOS uses BSD tools that lack `--version`.
+    #[cfg(target_os = "linux")]
     hostcfg::check_binary_exists("ip")
         .then_some(())
         .ok_or_else(|| FatalVpnError("'ip' command not found".into()))?;
@@ -3820,6 +3950,7 @@ pub mod hostcfg {
     /// Delete leftover resources from a previous failed run (idempotent, best-effort).
     /// TUN devices are non-persistent (kernel auto-removes on process death), so we do NOT
     /// delete them here — that would only destroy a co-located live instance's interface.
+    #[cfg(target_os = "linux")]
     pub async fn stale_reclaim(id: &str, role: &str) {
         // Drop our own stale refcount marker from a SIGKILLed previous run with
         // this exact (id, role) before deciding whether to restore (B3).
@@ -3905,6 +4036,55 @@ pub mod hostcfg {
         let _ = cmd.output();
     }
 
+    /// macOS stale-reclaim (Phase 4 / D5 / I-M6): recover from a SIGKILLed run.
+    /// Restores `net.inet.ip.forwarding` from the `/var/run` state file (unless a
+    /// co-host gateway link still needs it) and flushes the leaked PF anchor
+    /// `bore_vpn/<id>` by id — the macOS twin of the Linux nft/iptables teardown.
+    #[cfg(target_os = "macos")]
+    pub async fn stale_reclaim(id: &str, role: &str) {
+        // Drop our own stale refcount marker first (parity with Linux B3).
+        let fwdref = fwd_refcount_path(id, role);
+        let _ = std::fs::remove_file(&fwdref);
+        let others_active = other_fwdref_present(std::path::Path::new(run_dir()), &fwdref);
+
+        // Restore forwarding from the per-(id,role) state file, but only if no
+        // other co-host gateway link still needs it.
+        let state_path = ipforward_state_path(id, role);
+        if let Ok(content) = std::fs::read_to_string(&state_path) {
+            if !others_active {
+                if let Ok(saved_value) = content.trim().parse::<u8>() {
+                    tracing::info!(
+                        saved_value,
+                        "stale_reclaim: restoring net.inet.ip.forwarding"
+                    );
+                    let argv = super::hostcfg_cmd::macos::cmd_sysctl_ip_forward(saved_value);
+                    let _ = std::process::Command::new(&argv[0])
+                        .args(&argv[1..])
+                        .output();
+                }
+            }
+            let _ = std::fs::remove_file(&state_path);
+        }
+        if !others_active {
+            let _ = std::fs::remove_file(ipforward_orig_path());
+        }
+
+        // Flush the leaked PF anchor by id (ignore "no such anchor" errors).
+        let argv = super::hostcfg_cmd::macos::cmd_pf_flush_anchor(id);
+        let _ = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+
+        // Best-effort: remove a leaked temp ruleset file.
+        let _ = std::fs::remove_file(format!(
+            "{}/bore-vpn-{}.pf",
+            run_dir(),
+            sanitize_run_key(id)
+        ));
+    }
+
     /// Create a TUN device with `queues` kernel queues (C1).
     ///
     /// Resolves "auto" name to the first free `boreN` (N=0..=255); explicit names are used
@@ -3913,6 +4093,7 @@ pub mod hostcfg {
     /// With `queues > 1` the device is created with `IFF_MULTI_QUEUE` and the extra queue fds
     /// come from `try_clone` (each clone = one more queue). Returns `(devices, offload_enabled,
     /// resolved_name)` — with `queues == 1` a vector of one, path identical to before (I-9).
+    #[cfg(target_os = "linux")]
     pub async fn create_tun(
         name: &str,
         addr: Ipv4Addr,
@@ -3993,6 +4174,83 @@ pub mod hostcfg {
         Ok((devs, offload, resolved_name))
     }
 
+    /// Map a requested TUN name to what the macOS `tun-rs` builder should request
+    /// (D7/I-M8). macOS has no `/sys/class/net` and the kernel assigns `utunN`
+    /// names itself, so:
+    ///   - `"auto"` or a Linux-style `boreN` (the cross-platform default) ⇒ `None`
+    ///     (let the kernel pick the next free `utunN`);
+    ///   - an explicit `utunN` ⇒ `Some(name)` (pass it through verbatim).
+    /// Pure + unit-tested.
+    #[cfg(target_os = "macos")]
+    fn macos_tun_request(name: &str) -> Option<&str> {
+        if name == "auto" {
+            return None;
+        }
+        // `boreN` (bore + digits) is the Linux default name; on macOS it is
+        // meaningless, so fall back to kernel auto-assignment.
+        if let Some(rest) = name.strip_prefix("bore") {
+            if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+        }
+        Some(name)
+    }
+
+    /// macOS TUN runtime (Phase 3): create a single-queue, no-offload utun.
+    ///
+    /// utun has neither GSO/GRO offload nor multi-queue (both Linux-only in
+    /// `tun-rs`), so `queues > 1` warns and is clamped to 1 (I-M4) and the returned
+    /// `offload` flag is always `false` — the bridge takes the single-packet path
+    /// (I-M3). The kernel assigns the `utunN` name (D7/I-M8); we read it back with
+    /// `dev.name()` and return it so every downstream consumer (routes, PF anchor,
+    /// admin) uses the real interface name.
+    ///
+    /// Address: `DeviceBuilder::ipv4(addr, prefix, None)` configures the overlay
+    /// address (validated by the tun-rs macOS examples); the Phase 1 spike
+    /// (`docs/vpn/VPN_MACOS_SPIKE_FINDINGS.md`) confirms whether an explicit
+    /// point-to-point peer address is additionally required — if so, that is a
+    /// Phase-1.2 builder patch, not a change here.
+    #[cfg(target_os = "macos")]
+    pub async fn create_tun(
+        name: &str,
+        addr: Ipv4Addr,
+        prefix: u8,
+        mtu: u16,
+        queues: usize,
+    ) -> anyhow::Result<(Vec<tun_rs::AsyncDevice>, bool, String)> {
+        if queues > 1 {
+            tracing::warn!(
+                queues,
+                "macOS utun: multi-queue unsupported, using 1 queue (I-M4)"
+            );
+        }
+
+        // No `.offload(true)` and no `.multi_queue(true)` (Linux-only, I-M4).
+        let mut builder = tun_rs::DeviceBuilder::new()
+            .ipv4(addr, prefix, None)
+            .mtu(mtu);
+        // Name is advisory on macOS: kernel assigns `utunN` unless an explicit
+        // `utunN` was passed (D7/I-M8).
+        if let Some(requested) = macos_tun_request(name) {
+            builder = builder.name(requested);
+        }
+
+        let dev = builder
+            .build_async()
+            .context("failed to create macOS utun device")?;
+
+        // Read the kernel-resolved interface name back (D7): the source of truth
+        // for routes, the PF anchor, and admin reporting.
+        let resolved_name = dev
+            .name()
+            .context("failed to read back macOS utun interface name")?;
+
+        tracing::info!(%resolved_name, "macOS utun created (single queue, no offload)");
+
+        // offload is always false on macOS ⇒ bridge single-packet path (I-M3).
+        Ok((vec![dev], false, resolved_name))
+    }
+
     /// Internal: marker for an ip_forward revert operation.
     #[derive(Debug)]
     enum AppliedOp {
@@ -4017,9 +4275,24 @@ pub mod hostcfg {
     /// is host-shared, not network-namespaced), so a key on `id` alone would make the
     /// connector's `stale_reclaim` read+delete the listener's file (racing it away) and
     /// would collide outright in site↔site mode where both sides are gateways.
+    /// Base directory for the VPN `/run`-state files (ip_forward recovery +
+    /// refcount markers). Linux uses `/run` (tmpfs, cleared per boot); macOS has
+    /// no `/run`, so the D5 path is `/var/run`. On macOS `current_netns_id()`
+    /// returns `0` (no `/proc/self/ns/net`) so the refcount scope is a single
+    /// host-wide scope — acceptable per D5 (macOS has no network namespaces).
+    #[cfg(target_os = "linux")]
+    fn run_dir() -> &'static str {
+        "/run"
+    }
+    #[cfg(target_os = "macos")]
+    fn run_dir() -> &'static str {
+        "/var/run"
+    }
+
     fn ipforward_state_path(id: &str, role: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(format!(
-            "/run/bore-vpn-{}-{}.ipforward",
+            "{}/bore-vpn-{}-{}.ipforward",
+            run_dir(),
             sanitize_run_key(id),
             sanitize_run_key(role)
         ))
@@ -4054,7 +4327,8 @@ pub mod hostcfg {
     /// forwarding under a still-running peer that needs `1`.
     fn fwd_refcount_path(id: &str, role: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(format!(
-            "/run/{}{}-{}.fwdref",
+            "{}/{}{}-{}.fwdref",
+            run_dir(),
             fwdref_prefix(),
             sanitize_run_key(id),
             sanitize_run_key(role)
@@ -4066,7 +4340,11 @@ pub mod hostcfg {
     /// observed value, which is already `1` if another link enabled forwarding
     /// first — so forwarding is never left enabled after every bore link has gone.
     fn ipforward_orig_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(format!("/run/bore-vpn-ns{}.ipfwd-orig", current_netns_id()))
+        std::path::PathBuf::from(format!(
+            "{}/bore-vpn-ns{}.ipfwd-orig",
+            run_dir(),
+            current_netns_id()
+        ))
     }
 
     /// True iff a `.fwdref` marker for THIS netns OTHER than `mine` exists in
@@ -4121,6 +4399,163 @@ pub mod hostcfg {
     }
 
     impl NetConfig {
+        /// macOS host-config runtime (Phase 4): the twin of the Linux `apply`.
+        ///
+        /// Same structure (routes → gateway forwarding+NAT → RAII revert) but the
+        /// host edge is macOS: `route -n` for routes, `sysctl net.inet.ip.forwarding`
+        /// for forwarding, and ONE per-link PF anchor `bore_vpn/<id>` composed by
+        /// `pf_ruleset` instead of nft/iptables (D4/I-M5). `binat`=netmap,
+        /// `nat`=masquerade, `scrub max-mss`=MSS clamp, `block`=spoke isolation,
+        /// `pass`=`--forward-accept`. State files (`/var/run`, D5) drive SIGKILL
+        /// recovery via `stale_reclaim`. BSD tools are never `--version`-probed (D8).
+        ///
+        /// PF grammar is validated by the Phase 1 spike
+        /// (`docs/vpn/VPN_MACOS_SPIKE_FINDINGS.md`); any correction lands in
+        /// `pf_ruleset`/the `cmd_pf_*` builders, not here.
+        #[cfg(target_os = "macos")]
+        #[allow(clippy::too_many_arguments)]
+        pub async fn apply<R: CommandRunner>(
+            runner: &R,
+            id: &str,
+            role: &str,
+            tun_name: &str,
+            assigned: std::net::Ipv4Addr,
+            prefix: u8,
+            peer_routes: &[crate::shared::Ipv4Net],
+            advertised: &[crate::shared::Ipv4Net],
+            nat_maps: &[(crate::shared::Ipv4Net, crate::shared::Ipv4Net)],
+            no_route_manage: bool,
+            hub: bool,
+            nat_masquerade: bool,
+            forward_accept: bool,
+        ) -> anyhow::Result<Self> {
+            use super::hostcfg_cmd::macos;
+
+            // The overlay address/prefix are configured on the utun by
+            // `create_tun` via `DeviceBuilder::ipv4` (Phase 3); apply only manages
+            // routes + forwarding + NAT, so these are not used here.
+            let _ = (assigned, prefix);
+
+            let mut cfg = NetConfig {
+                id: id.to_string(),
+                role: role.to_string(),
+                tun_name: tun_name.to_string(),
+                no_route_manage,
+                nft_available: false, // macOS uses PF, never nft.
+                revert_cmds: Vec::new(),
+                revert_labels: Vec::new(),
+                ip_forward_saved: None,
+                applied_ops: Vec::new(),
+            };
+
+            // ── Routes: peer subnets via the utun ─────────────────────────────
+            if !no_route_manage {
+                for net in peer_routes {
+                    let subnet = net.to_string();
+                    let argv = macos::cmd_route_add(&subnet, tun_name);
+                    match runner.run(&argv).await {
+                        Ok(_) => {
+                            cfg.revert_cmds
+                                .push(macos::cmd_route_del(&subnet, tun_name));
+                            cfg.revert_labels.push(format!("route del {subnet}"));
+                        }
+                        Err(e) => tracing::warn!(error = %e, %subnet, "macOS route add failed"),
+                    }
+                }
+            }
+
+            // ── Gateway mode: forwarding + PF NAT/filter anchor ───────────────
+            if !advertised.is_empty() {
+                // Save current `net.inet.ip.forwarding`, then enable it. `sysctl -n`
+                // returns the bare value; be defensive about a `key: value` form.
+                let saved: u8 = runner
+                    .run(&macos::cmd_sysctl_get_ip_forward())
+                    .await
+                    .ok()
+                    .and_then(|out| {
+                        out.split(|c: char| c == ':' || c.is_whitespace())
+                            .filter(|s| !s.is_empty())
+                            .last()
+                            .and_then(|s| s.parse::<u8>().ok())
+                    })
+                    .unwrap_or(0);
+                runner
+                    .run(&macos::cmd_sysctl_ip_forward(1))
+                    .await
+                    .context("enable net.inet.ip.forwarding (run as root)")?;
+                tracing::info!(saved, "macOS enabled net.inet.ip.forwarding");
+
+                // SIGKILL-recovery state file + first-wins orig + refcount marker (D5).
+                let state_path = ipforward_state_path(id, role);
+                if let Err(e) = std::fs::write(&state_path, format!("{saved}\n")) {
+                    tracing::debug!(error = %e, ?state_path, "could not write ip_forward state file");
+                }
+                let orig_path = ipforward_orig_path();
+                if !orig_path.exists() {
+                    let _ = std::fs::write(&orig_path, format!("{saved}\n"));
+                }
+                let _ = std::fs::write(fwd_refcount_path(id, role), b"1");
+                cfg.ip_forward_saved = Some(saved);
+                cfg.applied_ops
+                    .push(AppliedOp::IpForward { saved_value: saved });
+
+                // Detect the LAN egress interface (real subnet network +1), same
+                // representative-host trick as Linux.
+                let sample_host: std::net::Ipv4Addr = {
+                    let real = if !nat_maps.is_empty() {
+                        &nat_maps[0].0
+                    } else {
+                        &advertised[0]
+                    };
+                    std::net::Ipv4Addr::from(u32::from(real.network()).wrapping_add(1))
+                };
+                let route_out = runner
+                    .run(&macos::cmd_route_get(&sample_host.to_string()))
+                    .await
+                    .context("macOS `route -n get` for LAN interface detection")?;
+                let lan_if = macos::parse_lan_iface(&route_out).ok_or_else(|| {
+                    anyhow!("could not parse LAN interface from `route -n get {sample_host}`")
+                })?;
+                tracing::info!(%lan_if, "macOS LAN egress interface");
+
+                // Compose + load the per-link PF anchor (D4/I-M5). MSS clamp =
+                // default TUN MTU (1350) − 40 (IPv4+TCP headers) = 1310.
+                const MACOS_PF_MSS: u16 = 1310;
+                let ruleset = macos::pf_ruleset(
+                    tun_name,
+                    &lan_if,
+                    advertised,
+                    nat_maps,
+                    hub,
+                    nat_masquerade,
+                    forward_accept,
+                    MACOS_PF_MSS,
+                );
+                let pf_path = std::path::PathBuf::from(format!(
+                    "{}/bore-vpn-{}.pf",
+                    run_dir(),
+                    sanitize_run_key(id)
+                ));
+                std::fs::write(&pf_path, &ruleset)
+                    .with_context(|| format!("write PF ruleset to {pf_path:?}"))?;
+                // `pfctl -e` returns an error if PF is already enabled — benign.
+                if let Err(e) = runner.run(&macos::cmd_pf_enable()).await {
+                    tracing::debug!(error = %e, "pfctl -e (PF may already be enabled)");
+                }
+                runner
+                    .run(&macos::cmd_pf_load_anchor(id, &pf_path.to_string_lossy()))
+                    .await
+                    .with_context(|| format!("pfctl load anchor bore_vpn/{id}"))?;
+                // Rules now live in-kernel; the temp ruleset file is no longer needed.
+                let _ = std::fs::remove_file(&pf_path);
+                cfg.revert_cmds.push(macos::cmd_pf_flush_anchor(id));
+                cfg.revert_labels
+                    .push(format!("pfctl flush anchor bore_vpn/{id}"));
+            }
+
+            Ok(cfg)
+        }
+
         /// Apply host network configuration for a VPN link.
         ///
         /// - `id`: link id (used for nft table name)
@@ -4142,6 +4577,7 @@ pub mod hostcfg {
         ///   BEHIND the gateway on a default-deny FORWARD host (Docker/ufw). Off ⇒
         ///   only detect + warn when FORWARD is default-deny.
         #[allow(clippy::too_many_arguments)]
+        #[cfg(target_os = "linux")]
         pub async fn apply<R: CommandRunner>(
             runner: &R,
             id: &str,
@@ -4671,66 +5107,185 @@ pub mod hostcfg {
             for op in self.applied_ops.iter().rev() {
                 match op {
                     AppliedOp::IpForward { saved_value } => {
-                        // B3 refcount: drop our marker, then restore ONLY if no
-                        // other gateway link still needs forwarding. While another
-                        // marker remains, leave ip_forward as-is (that peer needs
-                        // it) — the last link out does the restore.
-                        let fwdref = fwd_refcount_path(&self.id, &self.role);
-                        let _ = std::fs::remove_file(&fwdref);
-                        let others_active =
-                            other_fwdref_present(std::path::Path::new("/run"), &fwdref);
-                        if others_active {
-                            tracing::info!(
-                                "ip_forward left enabled: another bore gateway link still active"
-                            );
-                            // Still clean our own per-link recovery file.
-                            let _ =
-                                std::fs::remove_file(ipforward_state_path(&self.id, &self.role));
-                            continue;
-                        }
-                        // Last gateway link out: restore the host's ORIGINAL value
-                        // (first-wins record), falling back to our observed value.
-                        let restore_to: u8 = std::fs::read_to_string(ipforward_orig_path())
-                            .ok()
-                            .and_then(|s| s.trim().parse::<u8>().ok())
-                            .unwrap_or(*saved_value);
-                        tracing::info!(restore_to, "restoring ip_forward (last gateway link out)");
-                        if std::fs::write(
-                            "/proc/sys/net/ipv4/ip_forward",
-                            format!("{}\n", restore_to),
-                        )
-                        .is_err()
-                        {
-                            // CAP_NET_ADMIN without UID 0: try sudo -n tee
-                            // (best-effort, non-interactive).
-                            let argv = super::hostcfg_cmd::cmd_sysctl_ip_forward(restore_to);
-                            let ok = std::process::Command::new(&argv[0])
-                                .args(&argv[1..])
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .status()
-                                .map(|s| s.success())
-                                .unwrap_or(false);
-                            if !ok {
-                                tracing::warn!(
-                                    restore_to,
-                                    "could not restore ip_forward (no root and sudo -n failed); \
-                                     restore manually: echo {} | sudo tee /proc/sys/net/ipv4/ip_forward",
-                                    restore_to
-                                );
-                            }
-                        }
-
-                        // Delete state + orig files (best-effort)
-                        let _ = std::fs::remove_file(ipforward_state_path(&self.id, &self.role));
-                        let _ = std::fs::remove_file(ipforward_orig_path());
+                        self.restore_ip_forward_op(*saved_value);
                     }
                 }
             }
         }
     }
 
+    impl NetConfig {
+        /// Restore the host IP-forwarding sysctl on Drop (last-gateway-link-out).
+        /// Linux twin: the procfs + B3 per-netns refcount + sudo-tee fallback
+        /// logic, byte-for-byte the original `Drop` body (I-M1).
+        #[cfg(target_os = "linux")]
+        fn restore_ip_forward_op(&self, saved_value: u8) {
+            // B3 refcount: drop our marker, then restore ONLY if no
+            // other gateway link still needs forwarding. While another
+            // marker remains, leave ip_forward as-is (that peer needs
+            // it) — the last link out does the restore.
+            let fwdref = fwd_refcount_path(&self.id, &self.role);
+            let _ = std::fs::remove_file(&fwdref);
+            let others_active = other_fwdref_present(std::path::Path::new("/run"), &fwdref);
+            if others_active {
+                tracing::info!("ip_forward left enabled: another bore gateway link still active");
+                // Still clean our own per-link recovery file.
+                let _ = std::fs::remove_file(ipforward_state_path(&self.id, &self.role));
+                return;
+            }
+            // Last gateway link out: restore the host's ORIGINAL value
+            // (first-wins record), falling back to our observed value.
+            let restore_to: u8 = std::fs::read_to_string(ipforward_orig_path())
+                .ok()
+                .and_then(|s| s.trim().parse::<u8>().ok())
+                .unwrap_or(saved_value);
+            tracing::info!(restore_to, "restoring ip_forward (last gateway link out)");
+            if std::fs::write("/proc/sys/net/ipv4/ip_forward", format!("{}\n", restore_to)).is_err()
+            {
+                // CAP_NET_ADMIN without UID 0: try sudo -n tee
+                // (best-effort, non-interactive).
+                let argv = super::hostcfg_cmd::cmd_sysctl_ip_forward(restore_to);
+                let ok = std::process::Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ok {
+                    tracing::warn!(
+                        restore_to,
+                        "could not restore ip_forward (no root and sudo -n failed); \
+                         restore manually: echo {} | sudo tee /proc/sys/net/ipv4/ip_forward",
+                        restore_to
+                    );
+                }
+            }
+
+            // Delete state + orig files (best-effort)
+            let _ = std::fs::remove_file(ipforward_state_path(&self.id, &self.role));
+            let _ = std::fs::remove_file(ipforward_orig_path());
+        }
+
+        /// macOS twin (Phase 4 / D5 / I-M6): restore `net.inet.ip.forwarding` on
+        /// Drop via `sysctl`, gated by the `/var/run` refcount so a co-host gateway
+        /// link keeps forwarding enabled. Last-link-out restores the first-wins
+        /// original.
+        #[cfg(target_os = "macos")]
+        fn restore_ip_forward_op(&self, saved_value: u8) {
+            let fwdref = fwd_refcount_path(&self.id, &self.role);
+            let _ = std::fs::remove_file(&fwdref);
+            let others_active = other_fwdref_present(std::path::Path::new(run_dir()), &fwdref);
+            if others_active {
+                tracing::info!(
+                    "net.inet.ip.forwarding left enabled: another bore gateway link still active"
+                );
+                let _ = std::fs::remove_file(ipforward_state_path(&self.id, &self.role));
+                return;
+            }
+            let restore_to: u8 = std::fs::read_to_string(ipforward_orig_path())
+                .ok()
+                .and_then(|s| s.trim().parse::<u8>().ok())
+                .unwrap_or(saved_value);
+            tracing::info!(
+                restore_to,
+                "restoring net.inet.ip.forwarding (last gateway link out)"
+            );
+            let argv = super::hostcfg_cmd::macos::cmd_sysctl_ip_forward(restore_to);
+            let ok = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                tracing::warn!(
+                    restore_to,
+                    "could not restore net.inet.ip.forwarding; restore manually: \
+                     sudo sysctl -w net.inet.ip.forwarding={}",
+                    restore_to
+                );
+            }
+            let _ = std::fs::remove_file(ipforward_state_path(&self.id, &self.role));
+            let _ = std::fs::remove_file(ipforward_orig_path());
+        }
+    }
+
+    // macOS runtime-stub tests (Phase 2.2 / D2): until Phases 3–4 land, the macOS
+    // `create_tun` and `NetConfig::apply` twins must bail cleanly with a
+    // "pending Phase" message rather than panic or misbehave.
     #[cfg(test)]
+    #[cfg(target_os = "macos")]
+    mod macos_runtime_tests {
+        use super::*;
+        use std::net::Ipv4Addr;
+
+        // `create_tun` (Phase 3) and `NetConfig::apply` (Phase 4) are implemented;
+        // their real device/PF behavior is exercised by the smoke example under
+        // sudo (Phase 5.1). Here we only assert the no-op path needs no root: with
+        // no peer routes, no advertised subnets and `no_route_manage`, apply makes
+        // zero host changes and returns an empty-revert NetConfig (RealRunner is
+        // never invoked).
+        #[tokio::test]
+        async fn macos_apply_noop_when_no_routes_or_gateway() {
+            let cfg = NetConfig::apply(
+                &RealRunner,
+                "noop0",
+                "listen",
+                "utun9",
+                Ipv4Addr::new(10, 255, 255, 1),
+                30,
+                &[],
+                &[],
+                &[],
+                true,
+                false,
+                false,
+                false,
+            )
+            .await
+            .expect("no-op macOS apply should succeed without root");
+            assert!(
+                cfg.revert_cmds.is_empty(),
+                "no-op apply must register no revert commands"
+            );
+        }
+
+        #[test]
+        fn macos_tun_request_maps_auto_and_bore() {
+            // auto + Linux-style boreN ⇒ kernel auto-assign (None).
+            assert_eq!(macos_tun_request("auto"), None);
+            assert_eq!(macos_tun_request("bore0"), None);
+            assert_eq!(macos_tun_request("bore15"), None);
+            // explicit utunN and anything non-boreN ⇒ pass through.
+            assert_eq!(macos_tun_request("utun9"), Some("utun9"));
+            assert_eq!(macos_tun_request("bore"), Some("bore")); // no digits
+            assert_eq!(macos_tun_request("borexyz"), Some("borexyz"));
+        }
+
+        #[test]
+        fn macos_state_paths_use_var_run() {
+            // D5: macOS state files live under /var/run (no /proc netns inode ⇒
+            // single host-wide ns0 scope).
+            assert_eq!(run_dir(), "/var/run");
+            assert!(ipforward_state_path("m0", "listen")
+                .to_string_lossy()
+                .starts_with("/var/run/bore-vpn-m0-listen"));
+            assert!(fwd_refcount_path("m0", "listen")
+                .to_string_lossy()
+                .starts_with("/var/run/bore-vpn-ns0-m0-listen"));
+            assert!(ipforward_orig_path()
+                .to_string_lossy()
+                .starts_with("/var/run/bore-vpn-ns0"));
+        }
+    }
+
+    // Linux host-config runtime tests: exercise `NetConfig::apply`, `create_tun`,
+    // `stale_reclaim`, and the `/run` state-file helpers — all Linux-only behavior.
+    // The macOS twins are stubs (Phase 2.2) → Phase 4 adds macOS-gated tests.
+    #[cfg(test)]
+    #[cfg(target_os = "linux")]
     mod tests {
         use super::*;
 
@@ -6649,7 +7204,22 @@ pub mod bridge {
         }
     }
 
+    /// macOS twin — never reached: TUN GSO/GRO offload uses Linux-only `tun-rs`
+    /// APIs (`recv_multiple`/`VIRTIO_NET_HDR_LEN`), and macOS `create_tun` forces
+    /// `offload=false` (I-M4), so the dispatcher always takes the single-packet
+    /// path. Present only so the offload branch compiles on macOS (I-M3 caveat).
+    #[cfg(target_os = "macos")]
+    async fn run_uplink_offload(
+        _dev: Arc<tun_rs::AsyncDevice>,
+        _sender: LinkSender,
+        _counters: Arc<BridgeCounters>,
+        _mtu: u16,
+    ) -> Result<()> {
+        unreachable!("TUN GSO/GRO offload is Linux-only (I-M3/I-M4)")
+    }
+
     /// Phase 6.2: batch read from TUN via GSO super-buffer, one syscall → N segments.
+    #[cfg(target_os = "linux")]
     async fn run_uplink_offload(
         dev: Arc<tun_rs::AsyncDevice>,
         mut sender: LinkSender,
@@ -6727,9 +7297,21 @@ pub mod bridge {
         }
     }
 
+    /// macOS twin — never reached (offload is Linux-only; macOS forces
+    /// offload=false, I-M4). Present so the offload branch compiles on macOS.
+    #[cfg(target_os = "macos")]
+    async fn run_downlink_offload(
+        _dev: Arc<tun_rs::AsyncDevice>,
+        _recver: LinkRecver,
+        _counters: Arc<BridgeCounters>,
+    ) -> Result<()> {
+        unreachable!("TUN GSO/GRO offload is Linux-only (I-M3/I-M4)")
+    }
+
     /// Phase 6.2: coalesce RX batch via GRO, one multi-packet write syscall.
     /// Each BytesMut has VIRTIO_NET_HDR_LEN zeros prepended (no checksum offload
     /// needed — packets from the peer have complete checksums).
+    #[cfg(target_os = "linux")]
     async fn run_downlink_offload(
         dev: Arc<tun_rs::AsyncDevice>,
         mut recver: LinkRecver,
@@ -6793,7 +7375,9 @@ pub mod bridge {
         }
 
         /// Phase 6.2 — GRO coalescing: BytesMut has VIRTIO_NET_HDR_LEN zeros prefix.
+        /// Linux-only: `tun_rs::VIRTIO_NET_HDR_LEN` is gated to the offload backend.
         #[test]
+        #[cfg(target_os = "linux")]
         fn coalesce_for_gro() {
             for sz in [100usize, 500, 1310] {
                 let pkt = vec![0x45u8; sz]; // fake IPv4 header start
@@ -7460,7 +8044,19 @@ pub mod hub {
         }
     }
 
+    /// macOS twin — never reached (offload is Linux-only; macOS forces
+    /// offload=false, I-M4). Present so the hub offload branch compiles on macOS.
+    #[cfg(target_os = "macos")]
+    async fn run_router_uplink_offload(
+        _dev: Arc<tun_rs::AsyncDevice>,
+        _table: PeerTable,
+        _counters: Arc<BridgeCounters>,
+    ) -> Result<()> {
+        unreachable!("TUN GSO/GRO offload is Linux-only (I-M3/I-M4)")
+    }
+
     /// Phase 6.2 router: offload (batch) read with GSO.
+    #[cfg(target_os = "linux")]
     async fn run_router_uplink_offload(
         dev: Arc<tun_rs::AsyncDevice>,
         table: PeerTable,

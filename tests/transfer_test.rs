@@ -2,9 +2,11 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[cfg(unix)]
+// Used only by the `#[cfg(target_os = "linux")]` non-UTF8 filename test; gate the
+// import to match (unused on other unix e.g. macOS otherwise).
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
 
 #[cfg(feature = "udp")]

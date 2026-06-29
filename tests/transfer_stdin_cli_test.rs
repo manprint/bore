@@ -2,9 +2,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
-#[cfg(unix)]
+// Used only by the `#[cfg(target_os = "linux")]` non-UTF8 filename test below;
+// gate the import to match (on other unix e.g. macOS it would be unused).
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
 
 use anyhow::{bail, Context, Result};

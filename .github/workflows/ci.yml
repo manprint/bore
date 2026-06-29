@@ -129,7 +129,8 @@ jobs:
   macos-vpn-e2e:
     name: macOS VPN device e2e (macos-14)
     runs-on: macos-14
-    needs: macos-vpn-build
+    # Independent of macos-vpn-build: the real device tests (utun/PF) are the
+    # point and should run even while unrelated test-corpus clippy is cleaned up.
     steps:
       - uses: actions/checkout@v4
 

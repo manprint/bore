@@ -4477,9 +4477,9 @@ pub mod hostcfg {
                     .await
                     .ok()
                     .and_then(|out| {
-                        out.split(|c: char| c == ':' || c.is_whitespace())
-                            .filter(|s| !s.is_empty())
-                            .next_back()
+                        // Last non-empty token (rsplit + find ⇒ scan from the end).
+                        out.rsplit(|c: char| c == ':' || c.is_whitespace())
+                            .find(|s| !s.is_empty())
                             .and_then(|s| s.parse::<u8>().ok())
                     })
                     .unwrap_or(0);

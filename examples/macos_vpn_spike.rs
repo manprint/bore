@@ -11,7 +11,19 @@
 //!
 //! Run: `sudo target/debug/examples/macos_vpn_spike [mode]` on macOS.
 
-#![cfg_attr(target_os = "macos", allow(unused))]
+// Diagnostic/smoke harness: relax pedantic style lints that are pure noise here
+// (the body is macOS-only and unlintable on the Linux dev box). Scoped to macOS
+// so the Linux build is unaffected.
+#![cfg_attr(
+    target_os = "macos",
+    allow(
+        unused,
+        clippy::uninlined_format_args,
+        clippy::needless_return,
+        clippy::needless_borrow,
+        clippy::useless_format
+    )
+)]
 
 #[cfg(target_os = "macos")]
 #[tokio::main]

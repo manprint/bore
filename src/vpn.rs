@@ -3820,6 +3820,9 @@ pub mod hostcfg {
     //! All configuration is reverted in reverse order on Drop (cleanup path).
 
     use anyhow::{anyhow, bail, Context};
+    // Only the Linux `create_tun` uses HashSet (auto-name race tracking); macOS
+    // lets the kernel assign `utunN`, so the import is Linux-only.
+    #[cfg(target_os = "linux")]
     use std::collections::HashSet;
     use std::net::Ipv4Addr;
     use std::process::Command;
@@ -4176,10 +4179,11 @@ pub mod hostcfg {
 
     /// Map a requested TUN name to what the macOS `tun-rs` builder should request
     /// (D7/I-M8). macOS has no `/sys/class/net` and the kernel assigns `utunN`
-    /// names itself, so:
-    ///   - `"auto"` or a Linux-style `boreN` (the cross-platform default) ⇒ `None`
-    ///     (let the kernel pick the next free `utunN`);
-    ///   - an explicit `utunN` ⇒ `Some(name)` (pass it through verbatim).
+    /// names itself.
+    ///
+    /// - `"auto"` or a Linux-style `boreN` (the default) ⇒ `None` (kernel picks `utunN`).
+    /// - An explicit `utunN` ⇒ `Some(name)` (passed through verbatim).
+    ///
     /// Pure + unit-tested.
     #[cfg(target_os = "macos")]
     fn macos_tun_request(name: &str) -> Option<&str> {
@@ -4475,7 +4479,7 @@ pub mod hostcfg {
                     .and_then(|out| {
                         out.split(|c: char| c == ':' || c.is_whitespace())
                             .filter(|s| !s.is_empty())
-                            .last()
+                            .next_back()
                             .and_then(|s| s.parse::<u8>().ok())
                     })
                     .unwrap_or(0);

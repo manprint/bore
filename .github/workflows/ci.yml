@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - dev
+      - macos
   pull_request:
 
 jobs:
@@ -118,16 +119,49 @@ jobs:
 
       - run: cargo build --features vpn --example macos_vpn_spike
 
-      # T-MAC-SMOKE: single-host utun + PF apply/revert + SIGKILL stale-reclaim.
-      # continue-on-error: GitHub macOS runners may forbid utun creation even
-      # under sudo (plan 5.1 allows this downgrade) — failures surface as warnings;
-      # the real device smoke is the manual checklist (docs/vpn/VPN_MACOS_ACCEPTANCE.md).
-      - name: macOS smoke (utun + PF apply/revert; best-effort under sudo)
+  # T-MAC-SMOKE: REAL single-host device tests on macos-14 under sudo (utun create,
+  # gateway PF apply/revert, SIGKILL stale-reclaim). Gating (no continue-on-error)
+  # so the macOS runtime is actually exercised, not skipped. The diagnostic step
+  # records runner capabilities first; if a hosted runner forbids utun/PF even
+  # under sudo, this job fails loudly — switch this job to a self-hosted macOS
+  # runner (labels: [self-hosted, macOS, ARM64]) and the manual checklist
+  # docs/vpn/VPN_MACOS_ACCEPTANCE.md remains the two-host acceptance.
+  macos-vpn-e2e:
+    name: macOS VPN device e2e (macos-14)
+    runs-on: macos-14
+    needs: macos-vpn-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --features vpn --example macos_vpn_spike
+
+      - name: Runner capability diagnostic
         run: |
-          sudo target/debug/examples/macos_vpn_spike apply-revert || echo "::warning::macos apply-revert smoke skipped/failed (runner may forbid utun under sudo) — see docs/vpn/VPN_MACOS_ACCEPTANCE.md"
-          sudo target/debug/examples/macos_vpn_spike leak-then-reclaim leak || true
-          sudo target/debug/examples/macos_vpn_spike leak-then-reclaim reclaim || echo "::warning::macos leak-then-reclaim smoke skipped"
-        continue-on-error: true
+          echo "## macOS runner capabilities"
+          sw_vers || true
+          uname -a || true
+          id || true
+          echo "passwordless sudo:"; sudo -n true && echo "  OK" || echo "  NOT available"
+          echo "ip.forwarding:"; sudo sysctl net.inet.ip.forwarding || true
+          echo "pfctl status:"; sudo pfctl -s info 2>&1 | head -3 || true
+
+      - name: De-risk spike (PF grammar + utun + sysctl)
+        run: sudo target/debug/examples/macos_vpn_spike spike
+
+      - name: utun create / teardown (real device)
+        run: sudo target/debug/examples/macos_vpn_spike create-teardown
+
+      - name: Gateway apply / RAII revert (real device + PF)
+        run: sudo target/debug/examples/macos_vpn_spike apply-revert
+
+      - name: SIGKILL stale-reclaim (leak then reclaim)
+        run: |
+          sudo target/debug/examples/macos_vpn_spike leak-then-reclaim leak
+          sudo target/debug/examples/macos_vpn_spike leak-then-reclaim reclaim
 
   audit:
     name: Security audit

@@ -375,12 +375,19 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   are never `--version`-probed (D8; the `ip` preflight is `cfg(linux)`). PF mapping: `binat`=1:1
   netmap (host-bit preserving), `nat`=masquerade, `scrub max-mss`=MSS clamp (1310 = default MTU
   1350−40), `block`=spoke isolation, `pass`=`--forward-accept`.
-- REMAINING GATES (the dev box is Linux — macOS cannot be compiled locally; blake3 NEON C blocks
-  cross-check): the `macos-14` CI job (`cargo build/clippy/test --features vpn` + the
-  `macos_vpn_spike` smoke) is the macOS compile/test oracle; the Phase 1 Mac **spike** validates the
-  PROVISIONAL PF grammar (`examples/macos_vpn_spike.rs spike`, fill `VPN_MACOS_SPIKE_FINDINGS.md`) and
-  the two-host **manual acceptance** (`VPN_MACOS_ACCEPTANCE.md`, T-MAC-MANUAL). Any PF correction lands
-  in `pf_ruleset`/the `cmd_pf_*` builders + their snapshots, not in `apply`.
+- VALIDATED ON macos-14 CI (2026-06-29, branch `macos`, full run 100% green): the `macos-vpn-build`
+  job (`cargo build` + `clippy --all-targets -D warnings` + `cargo test --features vpn`) AND a gating
+  `macos-vpn-e2e` job that runs `examples/macos_vpn_spike.rs` (spike/create-teardown/apply-revert/
+  leak-then-reclaim) under sudo on the hosted runner. Real `pfctl` ACCEPTS the `pf_ruleset` grammar
+  (no longer PROVISIONAL); `create_tun("auto")`→kernel `utun4` read back via `dev.name()`; apply/RAII-
+  revert + SIGKILL `stale_reclaim` pass. Hosted macos-14 permits utun+PF+sysctl under sudo. The dev box
+  is Linux (blake3+ring C/asm block cross-compile clippy to aarch64-apple-darwin) → macos-14 CI is the
+  ONLY macOS oracle; iterate via CI. macOS-only clippy bites that Linux can't see: gate Linux-only
+  imports `cfg(linux)`, avoid `Iterator::last`/`filter().next()`, doc-list `doc_lazy_continuation`,
+  and on a cfg-twinned `pub` method put `#[allow]` before `#[cfg]`.
+- REMAINING: only the two-host LAN gateway **manual acceptance** (`VPN_MACOS_ACCEPTANCE.md`, T-MAC-MANUAL)
+  — CI is single-host (the single-host PF rules are already CI-validated). Windows deferred. Any PF
+  correction lands in `pf_ruleset`/the `cmd_pf_*` builders + their snapshots, not in `apply`.
 
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

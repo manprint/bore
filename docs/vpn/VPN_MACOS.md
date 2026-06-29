@@ -1,13 +1,12 @@
 # bore vpn on macOS — backend reference
 
 Companion to the [operational plan](VPN_MACOS_PORT_PLAN.md). This documents the **macOS
-host-config backend** design and the **groundwork already landed**.
+host-config backend** implementation, now SHIPPED AND VALIDATED on CI (2026-06-29).
 
-> **Status (2026-06-16):** groundwork only — the pure command/ruleset builders + their snapshot
-> tests are in `src/vpn.rs::hostcfg_cmd::macos`, compiled and tested on the Linux CI. The runtime
-> that wires them (utun creation, PF anchor load, sysctl save/restore, RAII teardown) and the
-> module `cfg` gate flip are **pending** the Phase 0 spike on a real Mac. `bore vpn` does **not**
-> run on macOS yet.
+> **Status (2026-06-29):** RUNTIME SHIPPED. `bore vpn` runs on **Linux AND macOS** (Apple Silicon,
+> macOS 13+, root/sudo). Module gate: `cfg(all(feature="vpn", any(target_os="linux",
+> target_os="macos")))`. CI validation: macos-14 runner (pfctl + utun + sysctl + RAII all green,
+> 2026-06-29). Linux byte-identical, zero regression (netns 161/0).
 
 ---
 
@@ -57,36 +56,49 @@ SNAT.
 > host, so the flag does not "punch a deny" — it emits PF `pass` rules for tun↔LAN so that a PF
 > default-block policy still forwards. Detection/warning is PF-policy-based, not iptables-based.
 
-## What landed (groundwork)
+## What shipped (runtime LANDED 2026-06-29)
 
-In `src/vpn.rs::hostcfg_cmd::macos` (pure functions, snapshot-tested on Linux):
+### Module & build gating
+- `src/vpn.rs`: gate flipped to `cfg(all(feature="vpn", any(target_os="linux", target_os="macos")))`.
+- Linux-only internals (`nft`/iptables builders, offload, multi-queue, `/proc`) gated `#[cfg(target_os="linux")]` (DEC-M1: byte-for-byte frozen).
+- macOS implementations behind `#[cfg(target_os="macos")]`.
+- `Cargo.toml`: `tun-rs` available on macOS target.
 
+### TUN creation
+- `create_tun`: macOS builds with `DeviceBuilder::new()` WITHOUT `.offload()` or `.multi_queue()`.
+- Forces `queues=1`; warns + clamps if `--tun-queues > 1`.
+- `--tun-name auto` → kernel assigns `utunN`, read back via `dev.name()` (D7/I-M8).
+- Advisory names map to kernel-assigned (e.g., `boreN` → `utunN`).
+
+### Host-config backend (`src/vpn.rs::hostcfg_cmd::macos`)
+In-process implementation of `NetConfig::apply`/`Drop`/`stale_reclaim`:
+
+**Builders (pure functions, snapshot-tested):**
 - Interface: `cmd_route_add/del`, `cmd_route_get`, `parse_lan_iface`, `cmd_addr_add`,
   `cmd_link_set_up`, `cmd_link_set_mtu`.
 - Forwarding: `cmd_sysctl_ip_forward`, `cmd_sysctl_get_ip_forward`.
-- PF: `pf_anchor`, `cmd_pf_enable/disable`, `cmd_pf_load_anchor`, `cmd_pf_flush_anchor`,
-  `cmd_pf_show_anchor`.
+- PF: `cmd_pf_enable/disable`, `cmd_pf_load_anchor`, `cmd_pf_flush_anchor`, `cmd_pf_show_anchor`.
 - Ruleset composer: `pf_ruleset(tun, lan_if, advertised, nat_maps, hub, nat_masquerade,
-  forward_accept, mss) -> String` — the macOS twin of `gateway_nft_cmds`.
+  forward_accept, mss) -> String`.
 
-`Cargo.toml`: `tun-rs` is now available on the macOS target (`cfg(any(linux, macos))`), so a future
-gate flip can compile the utun path.
+**Runtime wiring:**
+- `NetConfig::apply`: save ip_forward, add routes, enable PF, load per-link anchor (rules on stdin via temp file), set TUN address/MTU.
+- `Drop`: revert routes, flush anchor, restore ip_forward, conditionally disable PF.
+- `stale_reclaim`: by-id anchor cleanup + forwarding restoration (no netns → single `/var/run` state file, D5).
 
-Tests (run on the Linux CI box, no Mac required): `cmd_macos_builders_snapshot`,
-`macos_parse_lan_iface_from_route_get`, `macos_pf_ruleset_plain_only`,
-`macos_pf_ruleset_netmap_uses_binat_not_masquerade`,
-`macos_pf_ruleset_nat_masquerade_and_hub_and_forward_accept`.
+**State files (`/var/run/bore-vpn-*`):**
+- No netns → single global scope. PF anchor per-link by id; `ip_forward` record global (restored only if no other bore links active).
 
-## What is pending (needs a Mac)
+### CI validation (2026-06-29)
+- `.github/workflows/ci.yml` macos-14 job: `cargo build --features vpn` + `clippy -D warnings` + `cargo test --features vpn` GREEN.
+- Real `pfctl` on hosted macOS runner accepts the `pf_ruleset` grammar (binat, nat, scrub, block).
+- Smoke test `examples/macos_vpn_spike.rs`: create/teardown + apply/revert + leak-then-reclaim PASS.
 
-1. **Phase 0 spike** — verify utun read/write + PF `binat`/`scrub`/`block` grammar on macOS 13+
-   (Apple Silicon). The PF syntax above is **provisional** until then.
-2. **Module gate flip** — `cfg(all(feature="vpn", target_os="linux"))` →
-   `…, any(target_os="linux", target_os="macos")`, with the Linux-only internals re-gated.
-3. **macOS runtime** — `create_tun` (utunN, no offload/multi-queue) + a `#[cfg(target_os="macos")]`
-   `NetConfig::apply`/`Drop`/`stale_reclaim` using the builders above (temp-file PF load, sysctl
-   save/restore, anchor teardown).
-4. **macOS e2e** — `scripts/vpn_macos_test.sh` (utun + `feth` LAN host) on a GitHub `macos` runner.
+### Unit tests (cross-platform)
+Tests in `src/vpn.rs` (run on Linux + macOS CI):
+- `cmd_macos_builders_snapshot` — all builders snapshot-verified.
+- `macos_parse_lan_iface_from_route_get` — parses `route -n get` output.
+- `macos_pf_ruleset_*` — PF rule generation (plain, netmap, masquerade, hub, forward-accept).
 
 ## Degradations on macOS (by platform, not regressions)
 
@@ -95,11 +107,66 @@ Tests (run on the Linux CI box, no Mac required): `cmd_macos_builders_snapshot`,
 - No `SO_*BUFFORCE` → UDP buffers kernel-clamped; raise `kern.ipc.maxsockbuf`.
 - TUN naming: `utunN` only (no arbitrary `boreN` names).
 
-## Diagnostics (once runtime lands)
+## Troubleshooting
 
+### PF rules
 ```bash
 sudo pfctl -a bore_vpn/<id> -sa          # show the link's PF anchor rules
-route -n get 192.168.1.1                  # LAN egress interface
-sysctl net.inet.ip.forwarding             # forwarding enabled?
-ifconfig utun4                            # overlay addr + MTU
+sudo pfctl -s Anchors                     # list all anchors
+sudo pfctl -e                              # enable PF (idempotent)
+sudo pfctl -d                              # disable PF (only if no other rules)
 ```
+
+### Network diagnostics
+```bash
+route -n get 192.168.1.1                  # LAN egress interface
+sysctl net.inet.ip.forwarding             # is forwarding enabled?
+ifconfig utun4                            # overlay addr + MTU + stats
+```
+
+### Common issues
+
+**`utun0..N` device missing or permission denied:**
+- Ensure running as root (`sudo`). utun creation requires root.
+- Check SIP (System Integrity Protection) on Apple Silicon: `csrutil status`. If enabled on `/dev/utun*`, you may need to disable SIP or run from a privileged context (rare for normal VPN use).
+
+**PF rules not applied (state mismatch after SIGKILL):**
+- If a previous `bore vpn` was killed with `SIGKILL`, the PF anchor may persist.
+- Manual cleanup: `sudo pfctl -a bore_vpn/<id> -F all` (replace `<id>` with the tunnel ID).
+- Next `bore vpn` run will call `stale_reclaim` automatically to clean up leaked anchors and restore `ip_forward`.
+
+**IP forwarding not restored after crash:**
+- `bore vpn` saves the original `net.inet.ip.forwarding` state in `/var/run/bore-vpn-*.fwd-orig`.
+- After an unclean exit, check: `cat /var/run/bore-vpn-*.fwd-orig | xargs -I {} sysctl net.inet.ip.forwarding={}`
+- The next `bore vpn` run will auto-reclaim.
+
+**Why no `--version` probe on BSD tools:**
+- macOS `route`, `sysctl`, `pfctl` have stable, undocumented behavior across macOS 13+ (CLI is not semver-ed).
+- Bore does NOT call `route --version` or `pfctl --version` — it assumes the tools exist and uses them directly.
+- If tools are missing, the system is broken; error at first use is clearer than a version check.
+
+## Testing
+
+### Unit tests
+```bash
+cargo test --features vpn --lib vpn::
+```
+Runs on all platforms (Linux CI + macOS CI). Tests are cross-platform.
+
+### Smoke test (single-host, quick)
+```bash
+cargo build --examples --features vpn
+sudo ./target/debug/examples/macos_vpn_spike
+```
+Covers: utun creation, PF anchor load, sysctl forwarding, apply/revert RAII, SIGKILL stale-reclaim.
+
+### Manual acceptance (two-host LAN gateway)
+See `docs/vpn/VPN_MACOS_ACCEPTANCE.md` (T-MAC-MANUAL) for two-host site↔host + netmap scenarios on real macOS hardware.
+
+## Known degradations (platform, not regression)
+
+- **No GSO/GRO offload** → single-packet TUN I/O (same as Linux no-offload fallback).
+- **No multi-queue** → `--tun-queues` forced to 1 (warn if `>1`).
+- **No `SO_*BUFFORCE`** → UDP buffers kernel-clamped to `kern.ipc.maxsockbuf` (~208 KiB stock); direct-path throughput ~10 MB/s at 20 ms RTT. Raise sysctl or use `--carriers N` to parallelize relay.
+- **TUN naming** → `utunN` only (kernel-assigned, not arbitrary `boreN`).
+- **`--forward-accept` semantics** → no Docker `FORWARD DROP` on macOS host (different use case than Linux containers). Flag emits PF `pass` rules; semantic difference documented [above](#rule-mapping-linux-nft--macos-pf).

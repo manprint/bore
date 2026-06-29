@@ -498,8 +498,10 @@ Notes:
 
 - **Requires the `udp` feature**, which is **on by default**. Build
   `--no-default-features` to drop it (and the `quinn` dependency).
-- **VPN (Linux)** — point-to-point L3 tunnel; build with `--features vpn`.
-  Feature-complete and netns-validated on Linux; macOS/Windows are groundwork only.
+- **VPN (Linux + macOS)** — point-to-point L3 tunnel; build with `--features vpn`.
+  Feature-complete and netns-validated on Linux; runs on macOS (Apple Silicon,
+  macOS 13+, requires `sudo`/root) with the same data plane — build + device e2e
+  validated on the `macos-14` CI runner. Windows is deferred.
   Direct-path throughput: a single QUIC flow is bounded by `socket buffer / RTT`.
   bore requests 16 MiB UDP buffers and, running with `CAP_NET_ADMIN`, **forces past**
   the `net.core.{w,r}mem_max` clamp (`SO_*BUFFORCE`) so a stock 208 KiB ceiling
@@ -925,14 +927,16 @@ Paired mode also accepts `--upnp`, `--try-port-prediction`,
 `--nat-udp-preferred-port`, `--stun-server`, and `--insecure`, mirroring the
 direct-path options used by `local`/`proxy`.
 
-## VPN — Point-to-Point L3 Tunnel (Linux)
+## VPN — Point-to-Point L3 Tunnel (Linux + macOS)
 
-`bore vpn` establishes a **point-to-point Layer 3 virtual network interface** between two Linux machines, carrying real IP traffic over bore's NAT-traversing transport. Requires **root** or `CAP_NET_ADMIN`, built with `--features vpn`.
+`bore vpn` establishes a **point-to-point Layer 3 virtual network interface** between two machines, carrying real IP traffic over bore's NAT-traversing transport. Runs on **Linux** and **macOS** (Apple Silicon, macOS 13+); the data plane is identical, only the host edge (TUN device + routes/NAT) differs. Requires **root** (`CAP_NET_ADMIN` on Linux; `sudo` on macOS), built with `--features vpn`.
+
+On macOS the kernel assigns the interface name (`utunN`) so `--tun-name` is advisory; `--tun-queues > 1` and the UDP hole-punch helper flags (`--upnp`/`--stun-server`/`--try-port-prediction`/`--nat-udp-*`) warn and are ignored/advisory (utun has no multi-queue/offload). Host config uses a per-link PF anchor `bore_vpn/<id>` + `sysctl net.inet.ip.forwarding` instead of nft/iptables. See [docs/vpn/VPN_MACOS.md](docs/vpn/VPN_MACOS.md).
 
 ### Requirements
 
-- **Linux only** (kernel TUN/TAP support)
-- **Root or `CAP_NET_ADMIN`**
+- **Linux** (kernel TUN/TAP) or **macOS** (Apple Silicon, macOS 13+; utun + PF)
+- **Root** (`CAP_NET_ADMIN` on Linux; `sudo` on macOS)
 - Build: `cargo build --release --features vpn`
 - **Server:** started with `--vpn --vpn-pool <CIDR>`
 - **Shared secret:** `--secret` mandatory (required for E2E encryption on the relay fallback path)

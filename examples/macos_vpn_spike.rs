@@ -11,19 +11,12 @@
 //!
 //! Run: `sudo target/debug/examples/macos_vpn_spike [mode]` on macOS.
 
-// Diagnostic/smoke harness: relax pedantic style lints that are pure noise here
-// (the body is macOS-only and unlintable on the Linux dev box). Scoped to macOS
-// so the Linux build is unaffected.
-#![cfg_attr(
-    target_os = "macos",
-    allow(
-        unused,
-        clippy::uninlined_format_args,
-        clippy::needless_return,
-        clippy::needless_borrow,
-        clippy::useless_format
-    )
-)]
+// Diagnostic/smoke harness: the body is macOS-only and cannot be linted on the
+// Linux dev box, and clippy-cleanliness of a throwaway harness has ~no value.
+// Relax the clippy `all` group + unused here, scoped to macOS so the Linux build
+// and the production library lints are unaffected. (Real compile errors still
+// fail the build — only style/lint noise is silenced.)
+#![cfg_attr(target_os = "macos", allow(unused, clippy::all))]
 
 #[cfg(target_os = "macos")]
 #[tokio::main]
@@ -110,7 +103,9 @@ async fn cmd_spike() -> anyhow::Result<()> {
     println!("\n[b] Configuring address, MTU, and link state...");
 
     // Address add is typically auto-set by create_tun on macOS, but let's show the argv for clarity.
-    let addr_argv = bore_cli::vpn::hostcfg_cmd::macos::cmd_addr_add(&utun_name, "10.255.255.1", 30);
+    // cmd_addr_add(dev, local, peer) — /30 point-to-point peer is .2.
+    let addr_argv =
+        bore_cli::vpn::hostcfg_cmd::macos::cmd_addr_add(&utun_name, "10.255.255.1", "10.255.255.2");
     println!("  cmd_addr_add argv: {:?}", addr_argv);
 
     let mtu_argv = bore_cli::vpn::hostcfg_cmd::macos::cmd_link_set_mtu(&utun_name, 1350);

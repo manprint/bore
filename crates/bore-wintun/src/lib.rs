@@ -7,8 +7,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
+#[cfg(not(windows))]
+use anyhow::bail;
 #[cfg(windows)]
 use anyhow::Context;
 #[cfg(windows)]

@@ -29,7 +29,7 @@ impl TunDevice {
             inner.recv_blocking(&mut owned).map(|n| (n, owned))
         })
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+        .map_err(std::io::Error::other)??;
         let (n, owned) = n;
         buf[..n].copy_from_slice(&owned[..n]);
         Ok(n)
@@ -40,7 +40,7 @@ impl TunDevice {
         let owned = pkt.to_vec();
         tokio::task::spawn_blocking(move || inner.send(&owned))
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .map_err(std::io::Error::other)?
     }
 }
 

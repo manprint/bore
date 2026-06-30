@@ -2561,6 +2561,11 @@ fn scan_filesystem_transfer(
     })
 }
 
+// `devices` is read only inside the `#[cfg(unix)]` block below (device files are
+// a Unix-only concept); on a Windows build it is genuinely unused except to pass
+// through the recursive call, which clippy's `only_used_in_recursion` flags —
+// a real lint on Windows, a false positive given the Unix body, not a bug.
+#[allow(clippy::only_used_in_recursion)]
 fn scan_entry(
     source: &Path,
     rel_path: &Path,
@@ -3286,7 +3291,7 @@ fn decode_windows_component(payload: &str) -> OsString {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStringExt;
-        return OsString::from_wide(&wide);
+        OsString::from_wide(&wide)
     }
     #[cfg(not(windows))]
     {
@@ -3303,7 +3308,7 @@ fn safe_component(text: String) -> OsString {
         if is_safe_windows_component(&text) {
             return OsString::from(text);
         }
-        return OsString::from(format!("_bore_utf8_{}", hex::encode(text.as_bytes())));
+        OsString::from(format!("_bore_utf8_{}", hex::encode(text.as_bytes())))
     }
     #[cfg(not(windows))]
     {

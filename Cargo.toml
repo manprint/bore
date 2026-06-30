@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/bore-wintun"]
+
 [package]
 name = "bore-cli"
 version = "1.0.0"

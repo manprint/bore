@@ -6,6 +6,7 @@ on:
       - main
       - dev
       - macos
+      - windows
   pull_request:
 
 jobs:
@@ -98,6 +99,34 @@ jobs:
       - name: Portable VPN unit tests (host)
         if: matrix.target != 'aarch64-linux-android'
         run: cargo test --features vpn --lib
+
+  # Real cargo test execution on a hosted windows-latest runner (not just the
+  # cross-compile check above). Per docs/plans/plan_WindowsSupport overview.md
+  # D10, hosted Windows CI is non-admin, so this cannot exercise WinTun/host
+  # networking (those need elevated/self-hosted CI, not available yet) — but
+  # every non-VPN integration test (tests/e2e_test.rs, secret_test.rs,
+  # vhost_test.rs, transfer_test.rs, udp_test.rs, etc.) plus the VPN protocol/
+  # logic-level tests (relay, hub allocation, broker, routes) need no
+  # elevation: no Command::new of an external binary, no /tmp, no Unix
+  # sockets, no root. This is the Phase 4 (non-VPN parity) hosted e2e tier
+  # named in the plan, mirroring the existing `macos-vpn-build` job shape.
+  windows-vpn-build:
+    name: Windows VPN build + non-VPN parity e2e (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --features vpn
+
+      - run: cargo clippy --features vpn --all-targets -- -D warnings
+
+      - run: cargo test --features vpn
 
   macos-vpn-build:
     name: macOS VPN build (macos-14)

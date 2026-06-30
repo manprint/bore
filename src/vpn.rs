@@ -1404,9 +1404,35 @@ fn pmtu_shrink_now(current_mtu: u16, sample: usize) -> Option<u16> {
     }
 }
 
+/// Per-OS argv for the dynamic PMTU monitor's "set the TUN MTU" step. Found and
+/// fixed as part of Windows support: this call site previously called the bare
+/// (Linux-only) `hostcfg_cmd::cmd_link_set_mtu` — `ip link set` — unconditionally
+/// on every platform, including macOS, which has no `ip` binary. The dynamic
+/// PMTU resize on macOS/Windows direct links was therefore silently a no-op
+/// (every attempt logged a WARN and kept the old MTU); never caught because
+/// hosted macOS CI is single-host and never exercises a real direct-path MTU
+/// shrink/grow. Each per-OS builder itself is unchanged/already-tested
+/// (`hostcfg_cmd::cmd_link_set_mtu`, `hostcfg_cmd::macos::cmd_link_set_mtu`,
+/// `hostcfg_cmd::windows::cmd_link_set_mtu`) — only the dispatch was wrong.
+#[cfg(target_os = "linux")]
+fn pmtu_link_set_mtu_argv(tun_name: &str, mtu: u16) -> Vec<String> {
+    hostcfg_cmd::cmd_link_set_mtu(tun_name, mtu)
+}
+
+#[cfg(target_os = "macos")]
+fn pmtu_link_set_mtu_argv(tun_name: &str, mtu: u16) -> Vec<String> {
+    hostcfg_cmd::macos::cmd_link_set_mtu(tun_name, mtu)
+}
+
+#[cfg(target_os = "windows")]
+fn pmtu_link_set_mtu_argv(tun_name: &str, mtu: u16) -> Vec<String> {
+    hostcfg_cmd::windows::cmd_link_set_mtu(tun_name, mtu)
+}
+
 /// Background task: track the direct path's QUIC datagram limit and follow it
-/// with `ip link set <tun> mtu` (C2). Started only after the switch to direct;
-/// exits when the QUIC connection closes (link teardown or path death). No MTU
+/// with the per-OS "set TUN MTU" command (C2; see `pmtu_link_set_mtu_argv`).
+/// Started only after the switch to direct; exits when the QUIC connection
+/// closes (link teardown or path death). No MTU
 /// revert is needed: the TUN is destroyed at teardown (DEC-5), and the nft MSS
 /// clamp uses `rt mtu`, adapting on its own.
 async fn pmtu_monitor(
@@ -1509,7 +1535,7 @@ async fn pmtu_monitor(
             );
         }
         {
-            let argv = hostcfg_cmd::cmd_link_set_mtu(&tun_name, new_mtu);
+            let argv = pmtu_link_set_mtu_argv(&tun_name, new_mtu);
             match crate::vpn::hostcfg::CommandRunner::run(&runner, &argv).await {
                 Ok(_) => {
                     info!(
@@ -3339,6 +3365,27 @@ pub mod hostcfg_cmd {
             ]
         }
 
+        /// Build PowerShell argv that prints `"True"`/`"False"` for whether the
+        /// current process token is an elevated (Administrator) token (§2.1).
+        /// `bore vpn listen|connect` must fail on this before any WinTun adapter
+        /// or host-config mutation — mirrors Linux `getuid().is_root()` and macOS's
+        /// same check, but Windows privilege is a token property, not a uid, so it
+        /// is queried instead of read from the process directly (keeps the
+        /// `#![forbid(unsafe_code)]` boundary in the main crate, D6).
+        pub fn cmd_is_elevated() -> Vec<String> {
+            powershell(
+                "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
+            )
+        }
+
+        /// Parse `cmd_is_elevated` output. PowerShell prints the boolean as
+        /// `True`/`False` (optionally with surrounding whitespace/newline);
+        /// anything else (empty output, error text) is treated as NOT elevated —
+        /// fail closed, never fail open on an unparseable probe.
+        pub fn parse_is_elevated_output(stdout: &str) -> bool {
+            stdout.trim().eq_ignore_ascii_case("true")
+        }
+
         /// Build PowerShell argv for querying global IPv4 forwarding state as JSON.
         pub fn cmd_ip_forward_get() -> Vec<String> {
             powershell("Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' -Name IPEnableRouter | Select-Object -ExpandProperty IPEnableRouter")
@@ -3350,22 +3397,132 @@ pub mod hostcfg_cmd {
             powershell(&format!("Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' -Name IPEnableRouter -Type DWord -Value {value}"))
         }
 
-        /// Build PowerShell argv for adding a scoped firewall allow rule.
-        pub fn cmd_firewall_allow(rule_name: &str, iface: &str, remote_cidr: &str) -> Vec<String> {
+        /// Parse `cmd_ip_forward_get` stdout into the saved `0`/`1` forwarding
+        /// value. Missing key, empty output, or anything unparseable defaults to
+        /// `0` (forwarding off) — the safe default to *restore* to if we cannot
+        /// determine what was there before bore touched it.
+        pub fn parse_ip_forward_output(stdout: &str) -> u8 {
+            stdout
+                .lines()
+                .map(str::trim)
+                .find(|s| !s.is_empty())
+                .and_then(|s| s.parse::<u8>().ok())
+                .map(|v| u8::from(v != 0))
+                .unwrap_or(0)
+        }
+
+        /// Per-(id,role) rule/NAT-instance naming prefix shared by every resource
+        /// `kind` ("fwd", "nat", ...) bore creates for one VPN link. Every per-net
+        /// resource name is `link_prefix(kind, id, role) + sanitize_name(net)`, so
+        /// `stale_reclaim` — which only has `(id, role)`, never the original net
+        /// list, because a SIGKILLed process cannot hand it one — can delete every
+        /// leaked resource for a link with a single wildcard match instead of
+        /// needing to reconstruct exact per-subnet names (the bug class already
+        /// fixed for Linux/macOS as BUG-2/BUG-3).
+        pub fn link_prefix(kind: &str, id: &str, role: &str) -> String {
+            format!(
+                "bore-{}-{}-{}-",
+                sanitize_name(id),
+                sanitize_name(role),
+                kind
+            )
+        }
+
+        /// Build PowerShell argv for a firewall rule that allows traffic entering
+        /// on the TUN interface (TUN→LAN direction of `--forward-accept`).
+        /// Windows `New-NetFirewallRule` has no combined ingress+egress interface
+        /// match (unlike nft `iifname X oifname Y` / iptables `-i X -o Y`), so this
+        /// is approximated as two separate rules instead of one — this one keyed on
+        /// `-InterfaceAlias` alone, the LAN-side counterpart
+        /// (`cmd_firewall_allow_lan_to_tun`) keyed on `-LocalAddress` instead.
+        /// Whether Windows Defender Firewall's standard rule set filters routed
+        /// (non-host-bound) transit traffic at all is unverified pending elevated
+        /// hardware (T-WIN-FWD1/2) — see `docs/vpn/VPN_WINDOWS.md`.
+        pub fn cmd_firewall_allow_tun_to_lan(rule_name: &str, tun_iface: &str) -> Vec<String> {
             powershell(&format!(
-                "New-NetFirewallRule -DisplayName '{}' -Group 'bore-vpn' -Direction Inbound -Action Allow -InterfaceAlias '{}' -RemoteAddress '{}'",
+                "New-NetFirewallRule -DisplayName '{}' -Group 'bore-vpn' -Direction Inbound -Action Allow -InterfaceAlias '{}'",
                 ps_quote(rule_name),
-                ps_quote(iface),
-                ps_quote(remote_cidr)
+                ps_quote(tun_iface)
             ))
         }
 
-        /// Build PowerShell argv for deleting all firewall rules in the bore group for one link.
+        /// Build PowerShell argv for a firewall rule that allows traffic leaving on
+        /// the LAN interface whose source is within the TUN overlay subnet
+        /// (LAN→TUN return direction of `--forward-accept`); the counterpart of
+        /// `cmd_firewall_allow_tun_to_lan`.
+        pub fn cmd_firewall_allow_lan_to_tun(
+            rule_name: &str,
+            lan_iface: &str,
+            tun_cidr: &str,
+        ) -> Vec<String> {
+            powershell(&format!(
+                "New-NetFirewallRule -DisplayName '{}' -Group 'bore-vpn' -Direction Outbound -Action Allow -InterfaceAlias '{}' -LocalAddress '{}'",
+                ps_quote(rule_name),
+                ps_quote(lan_iface),
+                ps_quote(tun_cidr)
+            ))
+        }
+
+        /// Build PowerShell argv for deleting one exact firewall rule by display
+        /// name (the precise success-path revert, paired 1:1 with whichever
+        /// `cmd_firewall_allow_*` call created it).
         pub fn cmd_firewall_delete(rule_name: &str) -> Vec<String> {
             powershell(&format!(
                 "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName '{}' | Remove-NetFirewallRule",
                 ps_quote(rule_name)
             ))
+        }
+
+        /// Build PowerShell argv that deletes every firewall rule for one VPN link
+        /// (any kind, any net suffix) by wildcard prefix match — the stale-reclaim
+        /// path, which only has `(id, role)` and never the original net list.
+        pub fn cmd_firewall_delete_for_link(id: &str, role: &str) -> Vec<String> {
+            let prefix = format!("bore-{}-{}-*", sanitize_name(id), sanitize_name(role));
+            powershell(&format!(
+                "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName '{}' | Remove-NetFirewallRule",
+                ps_quote(&prefix)
+            ))
+        }
+
+        /// Build PowerShell argv for a hub-mode spoke-isolation BLOCK rule on the
+        /// TUN interface. NOT wired into `NetConfig::apply` yet: Windows
+        /// `New-NetFirewallRule` cannot express nft's `iifname tun oifname tun`
+        /// (block only traffic that both enters AND leaves via the same
+        /// interface) — a naive `-InterfaceAlias tun -Direction Inbound` block
+        /// would also block legitimate spoke→LAN traffic, which transits the same
+        /// interface on ingress. Kept here (and intentionally unused) as the
+        /// starting point for a real WFP-based fix; until then hub mode on
+        /// Windows logs a warning instead of silently claiming spoke isolation it
+        /// cannot guarantee (fail-visible, not fail-open).
+        #[allow(dead_code)]
+        pub fn cmd_firewall_block_spoke_isolation(rule_name: &str, tun_iface: &str) -> Vec<String> {
+            powershell(&format!(
+                "New-NetFirewallRule -DisplayName '{}' -Group 'bore-vpn' -Direction Inbound -Action Block -InterfaceAlias '{}'",
+                ps_quote(rule_name),
+                ps_quote(tun_iface)
+            ))
+        }
+
+        /// Build PowerShell argv that resolves the egress interface alias for a
+        /// remote IPv4 address — the Windows analogue of `ip route get`/macOS
+        /// `route -n get`, used to detect the LAN interface for `--forward-accept`.
+        pub fn cmd_route_get(remote_ip: &str) -> Vec<String> {
+            powershell(&format!(
+                "(Find-NetRoute -RemoteIPAddress '{}' | Select-Object -First 1 -ExpandProperty InterfaceAlias)",
+                ps_quote(remote_ip)
+            ))
+        }
+
+        /// Parse `cmd_route_get` output: `Find-NetRoute ... -ExpandProperty
+        /// InterfaceAlias` prints the bare alias as its only output line, so this
+        /// is just "first non-empty trimmed line" rather than the prose-parsing
+        /// macOS's `parse_lan_iface` needs for `route -n get`'s multi-line output.
+        pub fn parse_lan_iface(output: &str) -> Option<String> {
+            output
+                .lines()
+                .map(str::trim)
+                .find(|s| !s.is_empty())
+                .map(str::to_string)
         }
 
         /// Build PowerShell argv for adding a per-link WinNAT instance.
@@ -3385,6 +3542,18 @@ pub mod hostcfg_cmd {
             ))
         }
 
+        /// Build PowerShell argv that deletes every WinNAT instance for one VPN
+        /// link by wildcard prefix match (the stale-reclaim path; `Get-NetNat`
+        /// has no built-in wildcard `-Name`, so the filter happens in
+        /// `Where-Object`).
+        pub fn cmd_nat_delete_for_link(id: &str, role: &str) -> Vec<String> {
+            let prefix = format!("bore-{}-{}-nat-", sanitize_name(id), sanitize_name(role));
+            powershell(&format!(
+                "Get-NetNat | Where-Object {{ $_.Name -like '{}*' }} | Remove-NetNat -Confirm:$false",
+                ps_quote(&prefix)
+            ))
+        }
+
         /// Sanitize user/link identifiers for Windows rule and NAT names.
         pub fn sanitize_name(value: &str) -> String {
             value
@@ -3396,6 +3565,21 @@ pub mod hostcfg_cmd {
                         '_'
                     }
                 })
+                .collect()
+        }
+
+        /// Plain (non-netmap) advertised subnets — `advertised` minus every `real`
+        /// side of a `nat_maps` entry. NAT masquerade must only ever apply to these:
+        /// a netmap'd real subnet is reached via stateless 1:1 DNAT/SNAT, never via
+        /// masquerade (mirrors the already-validated `gateway_nft_cmds`/macOS
+        /// `pf_ruleset` filter — same invariant, same filter, third platform).
+        pub fn plain_subnets<'a>(
+            advertised: &'a [crate::shared::Ipv4Net],
+            nat_maps: &[(crate::shared::Ipv4Net, crate::shared::Ipv4Net)],
+        ) -> Vec<&'a crate::shared::Ipv4Net> {
+            advertised
+                .iter()
+                .filter(|p| !nat_maps.iter().any(|(real, _)| real == *p))
                 .collect()
         }
 
@@ -3623,16 +3807,6 @@ pub mod hostcfg_cmd {
                 ]
             );
             assert_eq!(
-                windows::cmd_firewall_allow("bore-win-listen", "bore0", "10.0.0.0/24"),
-                vec![
-                    "powershell",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "New-NetFirewallRule -DisplayName 'bore-win-listen' -Group 'bore-vpn' -Direction Inbound -Action Allow -InterfaceAlias 'bore0' -RemoteAddress '10.0.0.0/24'"
-                ]
-            );
-            assert_eq!(
                 windows::cmd_nat_add("bore-win-listen", "10.0.0.0/24"),
                 vec![
                     "powershell",
@@ -3657,6 +3831,149 @@ pub mod hostcfg_cmd {
                     "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName 'bad''name' | Remove-NetFirewallRule"
                 ]
             );
+        }
+
+        #[test]
+        fn cmd_windows_is_elevated_snapshot_and_parse() {
+            assert_eq!(
+                windows::cmd_is_elevated(),
+                vec![
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"
+                ]
+            );
+            assert!(windows::parse_is_elevated_output("True"));
+            assert!(windows::parse_is_elevated_output("True\r\n"));
+            assert!(windows::parse_is_elevated_output("  true  "));
+            assert!(!windows::parse_is_elevated_output("False"));
+            // Fail closed on anything unparseable — never fail open.
+            assert!(!windows::parse_is_elevated_output(""));
+            assert!(!windows::parse_is_elevated_output("ERROR: not recognized"));
+        }
+
+        #[test]
+        fn cmd_windows_ip_forward_parse() {
+            assert_eq!(windows::parse_ip_forward_output("1\r\n"), 1);
+            assert_eq!(windows::parse_ip_forward_output("0\n"), 0);
+            // Non-zero/non-one DWORD values clamp to "on".
+            assert_eq!(windows::parse_ip_forward_output("2\n"), 1);
+            // Missing key / empty / unparseable output defaults to "off" — the
+            // safe value to *restore* to when we cannot determine the original.
+            assert_eq!(windows::parse_ip_forward_output(""), 0);
+            assert_eq!(windows::parse_ip_forward_output("\n"), 0);
+            assert_eq!(windows::parse_ip_forward_output("not a number"), 0);
+        }
+
+        #[test]
+        fn cmd_windows_link_prefix_sanitizes_id_and_role() {
+            assert_eq!(
+                windows::link_prefix("fwd", "link/one", "listen:main"),
+                "bore-link_one-listen_main-fwd-"
+            );
+        }
+
+        #[test]
+        fn cmd_windows_firewall_forward_accept_direction_snapshots() {
+            assert_eq!(
+                windows::cmd_firewall_allow_tun_to_lan("bore-x-listen-fwd-a", "bore0"),
+                vec![
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "New-NetFirewallRule -DisplayName 'bore-x-listen-fwd-a' -Group 'bore-vpn' -Direction Inbound -Action Allow -InterfaceAlias 'bore0'"
+                ]
+            );
+            assert_eq!(
+                windows::cmd_firewall_allow_lan_to_tun(
+                    "bore-x-listen-fwd-a",
+                    "Ethernet",
+                    "10.99.0.0/24"
+                ),
+                vec![
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "New-NetFirewallRule -DisplayName 'bore-x-listen-fwd-a' -Group 'bore-vpn' -Direction Outbound -Action Allow -InterfaceAlias 'Ethernet' -LocalAddress '10.99.0.0/24'"
+                ]
+            );
+        }
+
+        #[test]
+        fn cmd_windows_firewall_delete_for_link_uses_wildcard_prefix() {
+            assert_eq!(
+                windows::cmd_firewall_delete_for_link("link/one", "listen"),
+                vec![
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName 'bore-link_one-listen-*' | Remove-NetFirewallRule"
+                ]
+            );
+        }
+
+        #[test]
+        fn cmd_windows_nat_delete_for_link_uses_wildcard_prefix() {
+            assert_eq!(
+                windows::cmd_nat_delete_for_link("link/one", "listen"),
+                vec![
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-NetNat | Where-Object { $_.Name -like 'bore-link_one-listen-nat-*' } | Remove-NetNat -Confirm:$false"
+                ]
+            );
+        }
+
+        #[test]
+        fn cmd_windows_spoke_isolation_block_snapshot() {
+            assert_eq!(
+                windows::cmd_firewall_block_spoke_isolation("bore-x-listen-isolate", "bore0"),
+                vec![
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "New-NetFirewallRule -DisplayName 'bore-x-listen-isolate' -Group 'bore-vpn' -Direction Inbound -Action Block -InterfaceAlias 'bore0'"
+                ]
+            );
+        }
+
+        #[test]
+        fn cmd_windows_route_get_snapshot_and_parse() {
+            assert_eq!(
+                windows::cmd_route_get("192.168.1.1"),
+                vec![
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "(Find-NetRoute -RemoteIPAddress '192.168.1.1' | Select-Object -First 1 -ExpandProperty InterfaceAlias)"
+                ]
+            );
+            assert_eq!(
+                windows::parse_lan_iface("Ethernet\r\n"),
+                Some("Ethernet".to_string())
+            );
+            assert_eq!(windows::parse_lan_iface("  \n\n"), None);
+            assert_eq!(windows::parse_lan_iface(""), None);
+        }
+
+        #[test]
+        fn windows_plain_subnets_excludes_netmap_reals() {
+            let real: crate::shared::Ipv4Net = "192.168.1.0/24".parse().unwrap();
+            let exposed: crate::shared::Ipv4Net = "10.30.0.0/24".parse().unwrap();
+            let plain: crate::shared::Ipv4Net = "192.168.50.0/24".parse().unwrap();
+            let advertised = vec![real, plain];
+            let nat_maps = vec![(real, exposed)];
+            let result = windows::plain_subnets(&advertised, &nat_maps);
+            assert_eq!(result, vec![&plain]);
         }
 
         #[test]
@@ -4113,11 +4430,28 @@ pub mod hostcfg {
         }
     }
 
-    /// Windows privilege preflight. Full token inspection lands with the Windows
-    /// host-config backend; until then the Windows backend fails before host mutations.
+    /// Windows privilege preflight (§2.1): query whether the current process
+    /// token is elevated (Administrator) via PowerShell — keeps the unsafe
+    /// Windows-token-inspection boundary out of the main crate (D6,
+    /// `#![forbid(unsafe_code)]`), mirroring the pattern already used for
+    /// `restore_ip_forward_op`. Fails BEFORE any WinTun adapter or host-config
+    /// mutation, matching the Linux/macOS root check (T-WIN-HOST0).
     #[cfg(target_os = "windows")]
     pub fn check_root() -> anyhow::Result<()> {
-        Ok(())
+        let argv = super::hostcfg_cmd::windows::cmd_is_elevated();
+        let output = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .context("failed to query Windows elevation state (is PowerShell on PATH?)")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if super::hostcfg_cmd::windows::parse_is_elevated_output(&stdout) {
+            Ok(())
+        } else {
+            bail!(
+                "bore vpn requires an elevated process on Windows. \
+                 Right-click and choose 'Run as administrator', or launch from an elevated PowerShell/CMD."
+            )
+        }
     }
 
     /// Verify a binary exists by running it with --version.
@@ -4269,20 +4603,58 @@ pub mod hostcfg {
         ));
     }
 
-    /// Windows stale-reclaim scaffold: remove per-link state markers. Host route,
-    /// firewall, and NAT cleanup builders are added before the Windows runtime is
-    /// marked complete.
+    /// Windows stale-reclaim (§2.8): recover from a SIGKILLed previous run.
+    /// Routes are NOT explicitly removed here — like Linux/macOS, they are bound
+    /// to the WinTun adapter, which the OS reclaims when the owning process dies
+    /// (the adapter, unlike nft tables/firewall rules/NAT instances, is not
+    /// independently persistent host state). Firewall rules and WinNAT instances
+    /// ARE independently persistent, so — unlike the route-only assumption above —
+    /// they leak across a kill and must be deleted by wildcard `(id, role)` prefix
+    /// match (`link_prefix`): a SIGKILLed process cannot hand `stale_reclaim` the
+    /// original net list, so per-net exact names are not reconstructible here.
     #[cfg(target_os = "windows")]
     pub async fn stale_reclaim(id: &str, role: &str) {
         let _ = std::fs::create_dir_all(run_dir());
         let fwdref = fwd_refcount_path(id, role);
         let _ = std::fs::remove_file(&fwdref);
         let others_active = other_fwdref_present(std::path::Path::new(run_dir()), &fwdref);
+
         let state_path = ipforward_state_path(id, role);
-        let _ = std::fs::remove_file(&state_path);
+        if let Ok(content) = std::fs::read_to_string(&state_path) {
+            if !others_active {
+                if let Ok(saved_value) = content.trim().parse::<u8>() {
+                    tracing::info!(
+                        saved_value,
+                        "stale_reclaim: restoring Windows IPEnableRouter"
+                    );
+                    let argv = super::hostcfg_cmd::windows::cmd_ip_forward_set(saved_value != 0);
+                    let _ = std::process::Command::new(&argv[0])
+                        .args(&argv[1..])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .output();
+                }
+            }
+            let _ = std::fs::remove_file(&state_path);
+        }
         if !others_active {
             let _ = std::fs::remove_file(ipforward_orig_path());
         }
+
+        // Best-effort: delete every leaked firewall rule / WinNAT instance for
+        // this (id, role), regardless of which subnets they were keyed on.
+        let argv = super::hostcfg_cmd::windows::cmd_firewall_delete_for_link(id, role);
+        let _ = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let argv = super::hostcfg_cmd::windows::cmd_nat_delete_for_link(id, role);
+        let _ = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
     }
 
     /// Create a TUN device with `queues` kernel queues (C1).
@@ -4487,7 +4859,13 @@ pub mod hostcfg {
         Ok((vec![TunDevice { inner }], false, resolved_name))
     }
 
-    #[cfg(target_os = "windows")]
+    /// Reject Windows interface/adapter names that are unsafe to embed in adapter
+    /// creation calls or PowerShell rule names, before any WinTun/host-config call
+    /// is made (§1.2). Pure string validation — no Windows API dependency — so it
+    /// is intentionally NOT `cfg(target_os = "windows")`-gated: that would block
+    /// unit-test coverage on every non-Windows CI runner until a Windows runner
+    /// merges it, for a function with zero platform-specific behavior.
+    #[allow(dead_code)]
     fn validate_windows_adapter_name(name: &str) -> anyhow::Result<()> {
         anyhow::ensure!(!name.is_empty(), "Windows TUN adapter name cannot be empty");
         anyhow::ensure!(
@@ -4502,7 +4880,10 @@ pub mod hostcfg {
         Ok(())
     }
 
-    #[cfg(target_os = "windows")]
+    /// Convert an IPv4 prefix length to a dotted netmask, for the WinTun adapter
+    /// configuration call. Pure arithmetic — not `cfg(target_os = "windows")`-gated
+    /// for the same testability reason as `validate_windows_adapter_name`.
+    #[allow(dead_code)]
     fn prefix_to_netmask(prefix: u8) -> anyhow::Result<Ipv4Addr> {
         anyhow::ensure!(prefix <= 32, "invalid IPv4 prefix {prefix}");
         let mask = if prefix == 0 {
@@ -4511,6 +4892,57 @@ pub mod hostcfg {
             u32::MAX << (32 - prefix)
         };
         Ok(Ipv4Addr::from(mask))
+    }
+
+    // Windows TUN-naming pure-logic tests (§1.2). Unlike the Linux/macOS runtime
+    // tests above, these are NOT `target_os`-gated: `validate_windows_adapter_name`
+    // and `prefix_to_netmask` have no Windows API dependency, so they run on every
+    // CI runner today instead of waiting for a Windows runner to merge.
+    #[cfg(test)]
+    mod windows_tun_naming_tests {
+        use super::*;
+
+        #[test]
+        fn test_windows_tun_name_default_mapping() {
+            // "auto" resolves to the first free `boreN`, same as Linux/macOS.
+            assert_eq!(pick_tun_name("auto", |_| false), Some("bore0".to_string()));
+        }
+
+        #[test]
+        fn test_windows_tun_explicit_name_preserved() {
+            assert_eq!(
+                pick_tun_name("MyAdapter", |_| false),
+                Some("MyAdapter".to_string())
+            );
+            assert!(validate_windows_adapter_name("MyAdapter").is_ok());
+        }
+
+        #[test]
+        fn test_windows_tun_rejects_invalid_name_chars() {
+            assert!(validate_windows_adapter_name("").is_err());
+            assert!(validate_windows_adapter_name(&"a".repeat(129)).is_err());
+            for bad in ["bad\\name", "bad/name", "bad:name", "bad*name", "bad?name"] {
+                assert!(
+                    validate_windows_adapter_name(bad).is_err(),
+                    "expected {bad} to be rejected"
+                );
+            }
+            assert!(validate_windows_adapter_name("bore-vpn0").is_ok());
+        }
+
+        #[test]
+        fn test_prefix_to_netmask() {
+            assert_eq!(
+                prefix_to_netmask(24).unwrap(),
+                Ipv4Addr::new(255, 255, 255, 0)
+            );
+            assert_eq!(prefix_to_netmask(0).unwrap(), Ipv4Addr::new(0, 0, 0, 0));
+            assert_eq!(
+                prefix_to_netmask(32).unwrap(),
+                Ipv4Addr::new(255, 255, 255, 255)
+            );
+            assert!(prefix_to_netmask(33).is_err());
+        }
     }
 
     /// Internal: marker for an ip_forward revert operation.
@@ -5290,9 +5722,17 @@ pub mod hostcfg {
             Ok(cfg)
         }
 
-        /// Windows host-config runtime scaffold: routes, MTU, forwarding markers,
-        /// firewall and NAT command builders. Full elevated e2e validation lands in
-        /// the Windows acceptance phase.
+        /// Windows host-config runtime (§2.8): routes, IP forwarding refcount,
+        /// `--forward-accept` firewall rules, and plain NAT masquerade. Mirrors the
+        /// Linux/macOS apply shape (routes → gateway forwarding+NAT → RAII revert
+        /// via the shared `Drop` impl, since every Windows command here is already
+        /// an argv runnable by the same `std::process::Command::new(argv[0])`
+        /// pattern Drop uses). Overlapping-subnet `real@virtual` netmap (D7 §2.6)
+        /// and hub spoke isolation are explicitly NOT implemented here — Windows
+        /// has no built-in 1:1 prefix-NAT equivalent, and no firewall-rule shape
+        /// that safely expresses "block tun→tun without also blocking tun→LAN" —
+        /// both are documented gaps in `docs/vpn/VPN_WINDOWS.md` rather than
+        /// unverified guesses.
         #[cfg(target_os = "windows")]
         #[allow(clippy::too_many_arguments)]
         pub async fn apply<R: CommandRunner>(
@@ -5311,7 +5751,6 @@ pub mod hostcfg {
             forward_accept: bool,
         ) -> anyhow::Result<Self> {
             use super::hostcfg_cmd::windows;
-            let _ = (assigned, prefix, nat_maps, hub);
             let mut cfg = NetConfig {
                 id: id.to_string(),
                 role: role.to_string(),
@@ -5342,40 +5781,129 @@ pub mod hostcfg {
                 }
             }
 
-            if !advertised.is_empty() {
-                let _ = std::fs::write(ipforward_state_path(id, role), "0\n");
-                let _ = std::fs::write(fwd_refcount_path(id, role), "1\n");
-                let _ = std::fs::write(ipforward_orig_path(), "0\n");
-                cfg.applied_ops
-                    .push(AppliedOp::IpForward { saved_value: 0 });
+            if hub {
+                // D2 spoke isolation has no verified Windows equivalent yet (see
+                // doc comment above and `cmd_firewall_block_spoke_isolation`) —
+                // fail-visible rather than silently claim a security property
+                // this backend cannot currently guarantee.
+                tracing::warn!(
+                    %id,
+                    "Windows VPN hub mode does not yet enforce spoke isolation (D2); \
+                     spokes may be able to reach each other through this gateway. \
+                     See docs/vpn/VPN_WINDOWS.md."
+                );
+            }
 
-                let argv = windows::cmd_ip_forward_set(true);
+            if !advertised.is_empty() {
+                // Read the CURRENT value before changing it (first-wins, B3 parity
+                // with Linux/macOS): a second concurrent gateway link on this host
+                // must never overwrite the first link's record of the ORIGINAL
+                // value with its own (possibly wrong) guess.
+                let saved = match runner.run(&windows::cmd_ip_forward_get()).await {
+                    Ok(out) => windows::parse_ip_forward_output(&out),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not read current Windows IPEnableRouter; assuming 0");
+                        0
+                    }
+                };
+                let orig_path = ipforward_orig_path();
+                if !orig_path.exists() {
+                    let _ = std::fs::write(&orig_path, format!("{saved}\n"));
+                }
+                let _ = std::fs::write(ipforward_state_path(id, role), format!("{saved}\n"));
+                let _ = std::fs::write(fwd_refcount_path(id, role), "1\n");
+                cfg.ip_forward_saved = Some(saved);
+                cfg.applied_ops
+                    .push(AppliedOp::IpForward { saved_value: saved });
+
                 runner
-                    .run(&argv)
+                    .run(&windows::cmd_ip_forward_set(true))
                     .await
                     .context("enable Windows IP forwarding (run elevated)")?;
+                tracing::info!(saved, "Windows enabled IPEnableRouter");
 
                 if forward_accept {
-                    for net in advertised {
-                        let rule = windows::sanitize_name(&format!("bore-{id}-{role}-fwd-{}", net));
-                        let argv = windows::cmd_firewall_allow(&rule, tun_name, &net.to_string());
-                        match runner.run(&argv).await {
-                            Ok(_) => {
-                                cfg.revert_cmds.push(windows::cmd_firewall_delete(&rule));
-                                cfg.revert_labels
-                                    .push(format!("windows firewall del {rule}"));
+                    // Detect the LAN egress interface the same way Linux/macOS do:
+                    // probe the route to a representative host inside the first
+                    // real subnet (NAT'd real takes priority, mirrors macOS).
+                    let sample_host: std::net::Ipv4Addr = {
+                        let real = if !nat_maps.is_empty() {
+                            &nat_maps[0].0
+                        } else {
+                            &advertised[0]
+                        };
+                        std::net::Ipv4Addr::from(u32::from(real.network()).wrapping_add(1))
+                    };
+                    let route_out = runner
+                        .run(&windows::cmd_route_get(&sample_host.to_string()))
+                        .await
+                        .context("Windows route lookup for LAN interface detection")?;
+                    match windows::parse_lan_iface(&route_out) {
+                        Some(lan_if) => {
+                            let mask = prefix_to_netmask(prefix)?;
+                            let network = u32::from(assigned) & u32::from(mask);
+                            let tun_cidr =
+                                format!("{}/{prefix}", std::net::Ipv4Addr::from(network));
+
+                            let rule_in = format!("{}in", windows::link_prefix("fwd", id, role));
+                            let argv = windows::cmd_firewall_allow_tun_to_lan(&rule_in, tun_name);
+                            match runner.run(&argv).await {
+                                Ok(_) => {
+                                    cfg.revert_cmds.push(windows::cmd_firewall_delete(&rule_in));
+                                    cfg.revert_labels
+                                        .push(format!("windows firewall del {rule_in}"));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, rule = %rule_in, "Windows forward-accept tun->lan rule failed")
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!(error = %e, rule, "Windows firewall rule add failed")
+
+                            let rule_out = format!("{}out", windows::link_prefix("fwd", id, role));
+                            let argv = windows::cmd_firewall_allow_lan_to_tun(
+                                &rule_out, &lan_if, &tun_cidr,
+                            );
+                            match runner.run(&argv).await {
+                                Ok(_) => {
+                                    cfg.revert_cmds
+                                        .push(windows::cmd_firewall_delete(&rule_out));
+                                    cfg.revert_labels
+                                        .push(format!("windows firewall del {rule_out}"));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, rule = %rule_out, "Windows forward-accept lan->tun rule failed")
+                                }
                             }
+
+                            tracing::info!(%id, tun = %tun_name, %lan_if, "forward-accept: added Windows firewall allow rules for tun<->LAN (--forward-accept)");
                         }
+                        None => tracing::warn!(
+                            %id,
+                            "could not detect Windows LAN interface for --forward-accept; firewall rules not added"
+                        ),
                     }
+                } else {
+                    tracing::warn!(
+                        %id,
+                        "Windows gateway mode without --forward-accept: if Windows Defender \
+                         Firewall blocks routed traffic on this host, peers may not reach \
+                         hosts behind this gateway. Pass --forward-accept to add explicit \
+                         allow rules."
+                    );
                 }
 
                 if nat_masquerade {
-                    for net in advertised {
-                        let name = windows::sanitize_name(&format!("bore-{id}-{role}-nat-{}", net));
-                        let argv = windows::cmd_nat_add(&name, &net.to_string());
+                    // Only PLAIN subnets — a netmap'd real is reached via 1:1
+                    // DNAT/SNAT (D7, not implemented on Windows yet), never via
+                    // masquerade (same invariant as `gateway_nft_cmds`/macOS
+                    // `pf_ruleset`).
+                    for net in windows::plain_subnets(advertised, nat_maps) {
+                        let subnet = net.to_string();
+                        let name = format!(
+                            "{}{}",
+                            windows::link_prefix("nat", id, role),
+                            windows::sanitize_name(&subnet)
+                        );
+                        let argv = windows::cmd_nat_add(&name, &subnet);
                         match runner.run(&argv).await {
                             Ok(_) => {
                                 cfg.revert_cmds.push(windows::cmd_nat_del(&name));

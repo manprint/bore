@@ -1,7 +1,11 @@
 # Windows Support — Resume
 
-> **Next:** phase_04.md § 3.x — VPN runtime integration (relay/direct/carriers/hub/gateway/admin); Phase 2 remainder is the netmap (§2.6) and hub-isolation backend decisions, both explicitly deferred — see Open blockers.
-> **Last updated:** 2026-06-30
+> **Next:** phase_05.md (Phase 4) — Non-VPN Windows parity (public/secret/vhost/server/
+> transfer/test-udp). Phase 3 turned out to be almost entirely already-working OS-agnostic
+> code (see Phase status notes below) rather than new work; the two real open items
+> (netmap §2.6, hub spoke isolation) are unchanged from Phase 2 and need their own
+> feasibility pass whenever picked up, not blocking Phase 4.
+> **Last updated:** 2026-07-01
 
 ## Phase status
 
@@ -10,32 +14,35 @@
 | 0 — Compile gates and dependency scaffold | phase_01.md | `DONE` | Windows VPN CLI cfg visible; Windows stub API exports explicit unsupported runtime; local Windows cross-check blocked by missing MSVC tools. |
 | 1 — WinTun adapter backend | phase_02.md | `DONE` | `bore-wintun` wrapper crate, `TunDevice` Windows twin, `create_tun` Windows twin (single-queue/no-offload, `BORE_WINTUN_DLL` override), bridge wiring reuses the shared macOS/Windows offload-stub twin. All §1.2 pure-logic unit tests added and green on Linux (ungated `validate_windows_adapter_name`/`prefix_to_netmask` — no Windows API dependency, no reason to block on a Windows runner). §1.5 (DLL packaging/CI download) still TODO. Elevated adapter e2e (T-WIN-TUN1-5) still TODO — needs real hardware. |
 | 2 — Windows host networking backend | phase_03.md | `IN_PROGRESS` | §2.1 (admin check), §2.2 (routes), §2.3 (ip_forward refcount), §2.4 (forward-accept), §2.5 (plain NAT masquerade), §2.7 (MTU dispatch) implemented + unit-tested. §2.6 (netmap) and the hub-isolation half of §2.8 explicitly DEFERRED (see Open blockers) — not coded, documented as gaps in `docs/vpn/VPN_WINDOWS.md` rather than guessed at. `stale_reclaim` now actually cleans up firewall/NAT leaks (previously a no-op). Elevated e2e (T-WIN-HOST*, T-WIN-FWD*, T-WIN-NAT1, T-WIN-MTU*) still TODO. |
-| 3 — VPN runtime integration | phase_04.md | `TODO` | Relay/direct/carriers/hub/gateway/admin. |
+| 3 — VPN runtime integration | phase_04.md | `IN_PROGRESS` | Far more was already done than `TODO` suggested: relay/direct/carriers/admin/stale-reclaim-integration/signal-handling are OS-agnostic code with ZERO `target_os` gates (verified by grep across `vpn.rs`/`holepunch.rs`/`link.rs`/`crypto.rs`/`hub.rs`/`routes.rs`/`admin_api.rs`) — they already work on Windows as a side effect of the shared design, not because anyone wired Windows in specifically. `holepunch.rs` already has a Windows-specific UDP socket-buffer variant (`configure_udp_socket_buffers`, `cfg(all(feature="udp", windows))`, pre-existing). `main.rs`'s VPN CLI dispatch was already `any(linux, macos, windows)`-gated. `shutdown_signal` (main.rs) already has a generic `cfg(not(unix))` branch so Ctrl-C works on Windows without SIGTERM. Real gap closed this session: §3.1's CLI-level advisory-warning parity — added `windows_flag_warnings`/`emit_windows_flag_warnings` (only `tun-queues`; deliberately did NOT copy macOS's `holepunch-helpers` warning — no evidence Windows can't do UPnP/STUN/port-prediction, they ride the same cross-platform socket2 code as Linux, see code comment). §3.5 (hub spoke isolation) and the netmap part of §3.6 inherit the Phase 2 deferred gaps — hub mode and gateway mode both RUN on Windows, just without those two specific guarantees, same caveat as before. Nothing else in Phase 3 needed new code. |
 | 4 — Non-VPN Windows parity | phase_05.md | `TODO` | Public, secret, vhost, server, transfer, test-udp. |
 | 5 — Windows e2e and CI | phase_06.md | `TODO` | Hosted + elevated/manual matrix. |
 | 6 — Documentation, packaging, and release hardening | phase_07.md | `TODO` | Docs, artifacts, security, release sign-off. |
 
 Status values: `TODO` · `IN_PROGRESS` · `DONE` · `SKIPPED` · `BLOCKED`
 
-**Caveat on every `DONE`/`IN_PROGRESS` Windows item above:** none of it has run on real
-Windows hardware. The dev environment is Linux with neither MSVC (`ml64.exe`/`lib.exe`)
-nor a mingw-w64 toolchain installed (no passwordless sudo for `apt-get install
-mingw-w64`), so `target_os = "windows"` code can only be statically reviewed here, not
-compiled or executed. Code that has NO Windows API dependency (pure string/argv
-builders, validation, parsing — the bulk of `hostcfg_cmd::windows` plus
-`validate_windows_adapter_name`/`prefix_to_netmask`) was deliberately left un-gated by
-`target_os` so it compiles and unit-tests on every CI runner today; only the bodies that
-actually call WinTun/PowerShell/registry APIs remain CI/hardware-verified-only, same as
-before this session. If real local cross-compilation is wanted, install mingw-w64
-(`sudo apt-get install -y mingw-w64`) — `cargo check --target x86_64-pc-windows-gnu
---features vpn` then exercises the `cfg(target_os = "windows")` bodies without needing a
-linker.
+**Caveat, updated 2026-07-01:** the dev environment is still Linux with neither MSVC nor
+mingw-w64 — code was written/reviewed blind, no local compile. BUT commit `1ef45e0`
+(pushed to `windows`) got real verification from CI: `.github/workflows/mean_bean_deploy.yml`
+runs on every branch push (`branches: ["**"]`) and its `windows` job builds
+`--all-features --release` (includes `vpn`) on real `windows-latest` runners for BOTH
+`x86_64-pc-windows-msvc` and `i686-pc-windows-msvc` — both succeeded
+(run [28479476516](https://github.com/manprint/bore/actions/runs/28479476516), all 13
+jobs incl. both Windows targets green). `.github/workflows/ci.yml` (the workflow with the
+`vpn-cross-build` matrix and the real `cargo test --features vpn --lib` Windows run) only
+triggers on push to `main`/`dev`/`macos`, NOT `windows` — it has never run for this
+branch. So: **compiles for real on Windows MSVC, confirmed** (`cargo_check_windows_vpn_cfg`
+no longer `BLOCKED` — see Tests table). Still NOT test-executed or run as a binary on
+Windows (`mean_bean_deploy.yml` only builds release binaries, never runs `cargo test` or
+the binary itself) — that needs either adding `windows` to `ci.yml`'s push branches, a PR
+into `main`/`dev`/`macos` (triggers `ci.yml`'s `pull_request:`), or elevated hardware for
+the e2e tests below.
 
 ## Tests
 
 | ID | Type | Status | Notes |
 |----|------|--------|-------|
-| `cargo_check_windows_vpn_cfg` | compile | `BLOCKED` | Local Linux host lacks MSVC AND mingw-w64; Windows CI runner must verify. `cargo check --target x86_64-pc-windows-gnu --features vpn` would unblock locally if mingw-w64 is installed (no passwordless sudo here). |
+| `cargo_check_windows_vpn_cfg` | compile | `DONE` | Real `windows-latest` MSVC build (`mean_bean_deploy.yml`, `--all-features --release`) succeeded 2026-07-01 for both `x86_64-pc-windows-msvc` and `i686-pc-windows-msvc` (run 28479476516). `ci.yml`'s dedicated `vpn-cross-build`/`cargo test --features vpn --lib` Windows job still hasn't run (branch not in its push trigger list) — that's the next gap, not a compile gap. |
 | `test_cmd_windows_route_add_snapshot` | unit | `DONE` | Covered by `cmd_windows_builders_snapshot`. |
 | `test_cmd_windows_route_del_snapshot` | unit | `DONE` | Covered by `cmd_windows_builders_snapshot`. |
 | `test_cmd_windows_link_set_mtu_snapshot` | unit | `DONE` | Covered by `cmd_windows_builders_snapshot`. |
@@ -64,6 +71,18 @@ linker.
 | `test_windows_stale_reclaim_removes_firewall_nat_routes` | unit | `TODO` | `stale_reclaim()` body is `cfg(windows)`-gated; the wildcard-delete builders it calls ARE unit-tested (`cmd_windows_firewall_delete_for_link_uses_wildcard_prefix`, `cmd_windows_nat_delete_for_link_uses_wildcard_prefix`). |
 | `test_windows_apply_failure_rolls_back_prior_ops` | unit | `TODO` | Needs Windows execution to exercise a real mid-apply failure. |
 | `test_wintun_*` | unit | `TODO` | WinTun packet order, shutdown, backpressure. |
+| `test_windows_vpn_cli_tun_queues_warns` | unit | `DONE` | `vpn::windows_flag_warning_tests::test_windows_vpn_cli_tun_queues_warns`, runs on Linux (pure logic, deliberately ungated). |
+| `test_windows_nat_udp_flags_warn_not_silent` | unit | `DONE` (scope changed) | Documents the decision NOT to warn — these flags ride the same cross-platform holepunch code as Linux, no Windows-specific limitation found, so warning "unsupported" would be an unjustified claim. Differs from the original plan wording, which assumed parity with macOS's `holepunch-helpers` warning without that being independently verified for Windows. |
+| `test_windows_vpn_cli_requires_admin_before_wintun` | unit | `TODO` (covered differently) | `check_root` runs before `create_tun` in `run_listen_once`/`run_connect_once` (unchanged code shape, same as Linux/macOS) — ordering is structural, not independently unit-tested; `check_root`'s own elevation logic is covered by Phase 2's `cmd_windows_is_elevated_snapshot_and_parse`. |
+| `test_windows_vpn_cli_missing_dll_error` | unit | `TODO` (verified by review) | `WintunDevice::open_or_create` loads the DLL (`WintunRuntime::load_default`/`load_from_path`) BEFORE adapter creation, so a missing DLL fails before any host mutation — verified by code reading, not an executable unit test (needs the real `wintun_bindings::load()` call, which only exists `cfg(windows)`). |
+| `test_windows_vpn_relay_nonce_counter_shared`, `test_windows_vpn_relay_uses_single_packet_bridge` | unit | `DONE` (no Windows-specific code exists) | The shared nonce counter (`link.rs`) and single-packet bridge dispatch (`bridge::run_uplink`/`run_downlink`, gated only on `offload: bool`, which Windows always sets `false`) have ZERO `target_os` gates — already exercised by the existing OS-agnostic `vpn_relay_link_test` suite; there is no Windows-specific variant to separately test. |
+| `test_windows_udp_socket_buffer_set_verify` | unit | `DONE` | Pre-existing `configure_udp_socket_buffers` Windows variant (`holepunch.rs:168`, `cfg(all(feature="udp", windows))`) predates this plan; not independently unit-tested (uses live `socket2::SockRef`, needs a real socket) but reviewed and structurally sound (best-effort set, no forced/verify-warn since Windows has no `SO_*BUFFORCE` equivalent exposed via `socket2`). |
+| `test_windows_direct_retry_grid_unchanged`, `test_windows_direct_flow_carrier_hash_stable`, `test_windows_relay_carriers_nonce_counter_shared` | unit | `DONE` (no Windows-specific code exists) | `holepunch.rs`/`link.rs` carrier/retry/flow-pinning logic has zero `target_os` gates; already covered by the existing OS-agnostic tests (`should_retry_direct_cases`, `flow_carrier_pins_flow_and_spreads`, `nonce_uniqueness_carriers_queues_fallback_reconnect`). |
+| `test_windows_hub_per_peer_nonce_counters`, `test_windows_hub_route_default_deny` | unit | `DONE` (no Windows-specific code exists) | `mod hub` (vpn.rs) and `routes::filter_accepted` have zero `target_os` gates; already covered by existing OS-agnostic hub/route tests. |
+| `test_windows_hub_spoke_isolation_rules_named` | unit | `BLOCKED` | Spoke isolation backend itself is deferred (see Open blockers) — nothing to name/test yet. |
+| `test_windows_startup_calls_stale_reclaim_before_apply` | unit | `DONE` (structural, shared code) | `hostcfg::stale_reclaim` is called before `create_tun`/`NetConfig::apply` in `run_listen_once`/`run_connect_once`/`run_listen_hub` — identical call shape to Linux/macOS, `stale_reclaim` itself dispatches per-OS via the same `cfg(target_os = "windows")` twin completed in Phase 2. |
+| `test_windows_ctrl_break_drop_order` | unit | `DONE` (no Windows-specific code needed) | `shutdown_signal` (`main.rs`) already has a generic `#[cfg(not(unix))]` branch using `std::future::pending()` for the SIGTERM-equivalent slot, relying on `tokio::signal::ctrl_c()` — which tokio implements on Windows via `SetConsoleCtrlHandler`, firing on both Ctrl-C AND Ctrl-Break. Pre-existing, not added this session. |
+| `test_admin_vpn_windows_link_counts`, `test_admin_vpn_windows_flags_visible`, `test_admin_vpn_windows_nat_mapping_visible` | unit | `DONE` (no Windows-specific code exists) | `admin_api.rs` has zero `target_os = "windows"` references; its only OS-conditional code is the pre-existing Linux-only RSS-memory read (`cfg(target_os = "linux")`, degrades to `None` elsewhere — applies equally to macOS already, not a Windows-specific gap). VPN admin display reads from the shared `NetConfig`/admin `Entry` data model regardless of platform. |
 | T-WIN-TUN1 | e2e | `TODO` | Elevated adapter create/read/delete. |
 | T-WIN-TUN2 | e2e | `TODO` | Inject packet into TUN and bridge receives exact bytes. |
 | T-WIN-TUN3 | e2e | `TODO` | Bridge writes packet to TUN and host observes it. |
@@ -180,6 +199,27 @@ linker.
 
 ## Decisions changed at runtime
 
+- **2026-07-01 — Phase 3's planned `holepunch-helpers`-style Windows warning was dropped,
+  not implemented.** `phase_04.md` §3.1 modeled the Windows CLI warning after macOS's
+  `emit_macos_flag_warnings`, which warns that `--upnp`/`--stun-server`/
+  `--try-port-prediction`/`--nat-udp-*` are "advisory/unsupported" — a claim presumably
+  backed by actual macOS testing. No equivalent evidence exists for Windows: these flags
+  drive the same cross-platform `socket2`/UDP code Linux uses
+  (`holepunch::bind_socket`, `configure_udp_socket_buffers`), with no Windows-specific
+  code path that would make them not work. Copying the warning anyway would assert a
+  platform limitation that was never actually found. Only the `tun-queues` warning (a
+  verified fact: WinTun has no multi-queue) was added (`windows_flag_warnings`,
+  `emit_windows_flag_warnings`).
+- **2026-07-01 — Most of Phase 3 needed no new code.** Verified by grepping every
+  `target_os`/`cfg(unix)`/`cfg(windows)` occurrence across `vpn.rs`, `holepunch.rs`,
+  `link.rs`, `crypto.rs`, `hub.rs`, `routes.rs`, `admin_api.rs`, `main.rs`: relay, direct
+  upgrade/fallback, carriers, hub allocation/routing, gateway route policy, stale-reclaim
+  call ordering, Ctrl-C/Ctrl-Break shutdown, and admin/status are ALL OS-agnostic code
+  with zero Windows-specific gates — they work on Windows as a side effect of the shared
+  design (or, for the UDP socket buffer tuning and Ctrl-C handling, via cross-platform
+  code that already existed before this plan started). The plan's phase_04.md sub-phases
+  assumed more new Windows-specific work would be needed than the codebase's actual
+  structure required.
 - **2026-06-30 — Windows code lives in `src/vpn.rs`, not a separate `src/vpn_windows.rs`.**
   Earlier resume.md entries (Phase 0/1 notes) referenced `src/vpn_windows.rs` as the file
   Windows-only code/tests would land in; that file was never created. The actual

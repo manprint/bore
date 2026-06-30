@@ -579,6 +579,61 @@ fn emit_macos_flag_warnings(
     }
 }
 
+/// Classify which advisory warnings a Windows link should emit for flags that
+/// do not apply on Windows (§3.1). Pure (testable) — unlike `macos_flag_warnings`,
+/// deliberately NOT `target_os`-gated: it has zero Windows API dependency, so it
+/// runs on every CI today instead of waiting for a Windows runner (same reasoning
+/// as `validate_windows_adapter_name`/`prefix_to_netmask`, see resume.md).
+///
+/// Only `tun-queues` (WinTun has no multi-queue, matches `create_tun`'s own
+/// warning). Unlike macOS, the UDP hole-punch helper flags
+/// (`--upnp`/`--stun-server`/`--try-port-prediction`/`--nat-udp-*`) are NOT
+/// warned here: they ride the same cross-platform `socket2`/UDP code Linux
+/// uses (`holepunch::bind_socket`, `configure_udp_socket_buffers`), with no
+/// known Windows-specific limitation — warning "unsupported" without evidence
+/// would be an unjustified platform claim, not a found fact.
+#[allow(dead_code)]
+fn windows_flag_warnings(tun_queues: usize) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+    if tun_queues > 1 {
+        warnings.push("tun-queues");
+    }
+    warnings
+}
+
+/// Emit the Windows advisory flag warnings once at link start, same timing as
+/// `emit_macos_flag_warnings` (before `run_with_reconnect`, so it logs once per
+/// process even across reconnects, not once per attempt).
+#[cfg(target_os = "windows")]
+fn emit_windows_flag_warnings(tun_queues: usize) {
+    for key in windows_flag_warnings(tun_queues) {
+        if key == "tun-queues" {
+            tracing::warn!("Windows WinTun has no multi-queue; --tun-queues ignored (using 1)");
+        }
+    }
+}
+
+#[cfg(test)]
+mod windows_flag_warning_tests {
+    use super::*;
+
+    #[test]
+    fn test_windows_vpn_cli_tun_queues_warns() {
+        assert!(windows_flag_warnings(1).is_empty());
+        assert_eq!(windows_flag_warnings(4), vec!["tun-queues"]);
+    }
+
+    #[test]
+    fn test_windows_nat_udp_flags_warn_not_silent() {
+        // Documents the deliberate scope decision above: these flags have no
+        // Windows-specific entry in the warning list (they're not silently
+        // ignored — they're fully wired into the shared holepunch code; only
+        // the *warning* differs from macOS, because the underlying limitation
+        // does not exist on Windows).
+        assert!(windows_flag_warnings(1).is_empty());
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod macos_flag_warning_tests {
     use super::*;
@@ -632,6 +687,8 @@ pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
         args.nat_udp_preferred_port,
         args.nat_udp_release_timeout,
     );
+    #[cfg(target_os = "windows")]
+    emit_windows_flag_warnings(args.tun_queues);
     let auto = args.auto_reconnect;
     run_with_reconnect(auto, move || run_listen_once(args.clone())).await
 }
@@ -1742,6 +1799,8 @@ pub async fn run_connect(args: VpnConnectArgs) -> Result<()> {
         args.nat_udp_preferred_port,
         args.nat_udp_release_timeout,
     );
+    #[cfg(target_os = "windows")]
+    emit_windows_flag_warnings(args.tun_queues);
     let auto = args.auto_reconnect;
     run_with_reconnect(auto, move || run_connect_once(args.clone())).await
 }

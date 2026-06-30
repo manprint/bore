@@ -24,7 +24,7 @@ default = ["udp"]
 # (and `quinn-udp`). Build with `--no-default-features` to drop it (e.g. for a
 # target where `quinn` does not compile).
 udp = ["dep:quinn", "dep:rcgen", "dep:igd-next"]
-vpn = ["udp", "dep:tun-rs"]
+vpn = ["udp", "dep:tun-rs", "dep:bore-wintun"]
 
 [dependencies]
 anyhow = { version = "1.0.56", features = ["backtrace"] }
@@ -70,12 +70,14 @@ nix = { version = "0.29.0", features = ["fs", "user", "socket"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.18"
 
-# TUN device backend. Available on Linux AND macOS (utun); the `vpn` feature pulls
-# it. Linux uses GSO/GRO offload + multi-queue; macOS uses the basic utun path
-# (offload/multi_queue are Linux-only in tun-rs). The macOS host-config runtime is
-# gated separately — see docs/vpn/VPN_MACOS_PORT_PLAN.md.
+# TUN device backend. Linux uses GSO/GRO offload + multi-queue through tun-rs;
+# macOS uses the basic utun path through tun-rs. Windows uses WinTun bindings and
+# loads wintun.dll at runtime.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 tun-rs = { version = "2.8.5", optional = true, features = ["async"] }
+
+[target.'cfg(windows)'.dependencies]
+bore-wintun = { path = "crates/bore-wintun", optional = true }
 
 [dev-dependencies]
 lazy_static = "1.4.0"

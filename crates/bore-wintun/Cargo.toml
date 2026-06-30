@@ -1,0 +1,12 @@
+[package]
+name = "bore-wintun"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+
+[target.'cfg(windows)'.dependencies]
+wintun-bindings = "0.7.39"

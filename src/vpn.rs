@@ -1,10 +1,48 @@
-//! VPN L3 tunnel feature (Linux + macOS, experimental).
+//! VPN L3 tunnel feature (Linux + macOS + Windows, experimental).
 
-#![cfg(all(feature = "vpn", any(target_os = "linux", target_os = "macos")))]
+#![cfg(all(
+    feature = "vpn",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::sync::Arc;
 use tracing::{error, info};
+
+/// Platform TUN device handle used by the VPN bridge.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub type TunDevice = tun_rs::AsyncDevice;
+
+/// Platform TUN device handle used by the VPN bridge.
+#[cfg(target_os = "windows")]
+#[derive(Clone)]
+pub struct TunDevice {
+    inner: bore_wintun::WintunDevice,
+}
+
+#[cfg(target_os = "windows")]
+impl TunDevice {
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let inner = self.inner.clone();
+        let mut owned = vec![0u8; buf.len()];
+        let n = tokio::task::spawn_blocking(move || {
+            inner.recv_blocking(&mut owned).map(|n| (n, owned))
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+        let (n, owned) = n;
+        buf[..n].copy_from_slice(&owned[..n]);
+        Ok(n)
+    }
+
+    async fn send(&self, pkt: &[u8]) -> std::io::Result<usize> {
+        let inner = self.inner.clone();
+        let owned = pkt.to_vec();
+        tokio::task::spawn_blocking(move || inner.send(&owned))
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+    }
+}
 
 /// Public arg struct for `bore vpn listen` (converted from CLI args).
 #[derive(Clone, Debug)]
@@ -704,7 +742,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
     // Create TUN device(s) (one per queue).
     let (devs_raw, offload, tun_name) =
         hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu, args.tun_queues).await?;
-    let devs: Vec<Arc<tun_rs::AsyncDevice>> = devs_raw.into_iter().map(Arc::new).collect();
+    let devs: Vec<Arc<TunDevice>> = devs_raw.into_iter().map(Arc::new).collect();
     info!(
         link_id = %args.id,
         iface = %tun_name,
@@ -1642,7 +1680,7 @@ async fn direct_diag(
 async fn run_bridge_with_ctrl(
     link_id: &str,
     mut ctrl_task: tokio::task::JoinHandle<anyhow::Error>,
-    devs: Vec<Arc<tun_rs::AsyncDevice>>,
+    devs: Vec<Arc<TunDevice>>,
     sender: link::LinkSender,
     recver: link::LinkRecver,
     counters: Arc<bridge::BridgeCounters>,
@@ -1783,7 +1821,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
     // Create TUN device(s) (one per queue).
     let (devs_raw, offload, tun_name) =
         hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu, args.tun_queues).await?;
-    let devs: Vec<Arc<tun_rs::AsyncDevice>> = devs_raw.into_iter().map(Arc::new).collect();
+    let devs: Vec<Arc<TunDevice>> = devs_raw.into_iter().map(Arc::new).collect();
     info!(
         link_id = %args.id,
         iface = %tun_name,
@@ -3258,8 +3296,9 @@ pub mod hostcfg_cmd {
         }
     }
 
-    /// Windows argv builders (E6 groundwork, host-only mode). `netsh` is used
-    /// over `route ADD` for native CIDR syntax (no interface-index lookups).
+    /// Windows argv builders (E6 groundwork, host-only mode). `netsh`/PowerShell
+    /// are represented as argv vectors so user-controlled fields never get shell-
+    /// concatenated by bore.
     pub mod windows {
         /// Build `netsh interface ipv4 add route <cidr> <iface>` argv.
         pub fn cmd_route_add(cidr: &str, iface: &str) -> Vec<String> {
@@ -3298,6 +3337,80 @@ pub mod hostcfg_cmd {
                 iface.into(),
                 format!("mtu={mtu}"),
             ]
+        }
+
+        /// Build PowerShell argv for querying global IPv4 forwarding state as JSON.
+        pub fn cmd_ip_forward_get() -> Vec<String> {
+            powershell("Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' -Name IPEnableRouter | Select-Object -ExpandProperty IPEnableRouter")
+        }
+
+        /// Build PowerShell argv for setting global IPv4 forwarding state.
+        pub fn cmd_ip_forward_set(enabled: bool) -> Vec<String> {
+            let value = if enabled { 1 } else { 0 };
+            powershell(&format!("Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' -Name IPEnableRouter -Type DWord -Value {value}"))
+        }
+
+        /// Build PowerShell argv for adding a scoped firewall allow rule.
+        pub fn cmd_firewall_allow(rule_name: &str, iface: &str, remote_cidr: &str) -> Vec<String> {
+            powershell(&format!(
+                "New-NetFirewallRule -DisplayName '{}' -Group 'bore-vpn' -Direction Inbound -Action Allow -InterfaceAlias '{}' -RemoteAddress '{}'",
+                ps_quote(rule_name),
+                ps_quote(iface),
+                ps_quote(remote_cidr)
+            ))
+        }
+
+        /// Build PowerShell argv for deleting all firewall rules in the bore group for one link.
+        pub fn cmd_firewall_delete(rule_name: &str) -> Vec<String> {
+            powershell(&format!(
+                "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName '{}' | Remove-NetFirewallRule",
+                ps_quote(rule_name)
+            ))
+        }
+
+        /// Build PowerShell argv for adding a per-link WinNAT instance.
+        pub fn cmd_nat_add(name: &str, internal_prefix: &str) -> Vec<String> {
+            powershell(&format!(
+                "New-NetNat -Name '{}' -InternalIPInterfaceAddressPrefix '{}'",
+                ps_quote(name),
+                ps_quote(internal_prefix)
+            ))
+        }
+
+        /// Build PowerShell argv for deleting a per-link WinNAT instance.
+        pub fn cmd_nat_del(name: &str) -> Vec<String> {
+            powershell(&format!(
+                "Get-NetNat -Name '{}' | Remove-NetNat -Confirm:$false",
+                ps_quote(name)
+            ))
+        }
+
+        /// Sanitize user/link identifiers for Windows rule and NAT names.
+        pub fn sanitize_name(value: &str) -> String {
+            value
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        }
+
+        fn powershell(script: &str) -> Vec<String> {
+            vec![
+                "powershell".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                script.into(),
+            ]
+        }
+
+        fn ps_quote(value: &str) -> String {
+            value.replace('\'', "''")
         }
     }
 
@@ -3483,6 +3596,65 @@ pub mod hostcfg_cmd {
                     "subinterface",
                     "bore0",
                     "mtu=1400"
+                ]
+            );
+        }
+
+        #[test]
+        fn cmd_windows_hostcfg_phase2_builders_snapshot() {
+            assert_eq!(
+                windows::cmd_ip_forward_get(),
+                vec![
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' -Name IPEnableRouter | Select-Object -ExpandProperty IPEnableRouter"
+                ]
+            );
+            assert_eq!(
+                windows::cmd_ip_forward_set(true),
+                vec![
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' -Name IPEnableRouter -Type DWord -Value 1"
+                ]
+            );
+            assert_eq!(
+                windows::cmd_firewall_allow("bore-win-listen", "bore0", "10.0.0.0/24"),
+                vec![
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "New-NetFirewallRule -DisplayName 'bore-win-listen' -Group 'bore-vpn' -Direction Inbound -Action Allow -InterfaceAlias 'bore0' -RemoteAddress '10.0.0.0/24'"
+                ]
+            );
+            assert_eq!(
+                windows::cmd_nat_add("bore-win-listen", "10.0.0.0/24"),
+                vec![
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "New-NetNat -Name 'bore-win-listen' -InternalIPInterfaceAddressPrefix '10.0.0.0/24'"
+                ]
+            );
+        }
+
+        #[test]
+        fn cmd_windows_sanitizes_names_and_quotes_powershell_literals() {
+            assert_eq!(windows::sanitize_name("link/one:listen"), "link_one_listen");
+            assert_eq!(
+                windows::cmd_firewall_delete("bad'name"),
+                vec![
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName 'bad''name' | Remove-NetFirewallRule"
                 ]
             );
         }
@@ -3819,6 +3991,7 @@ pub mod hostcfg {
     //! Manages routes, ip_forward toggle, and NAT rules for a VPN link.
     //! All configuration is reverted in reverse order on Drop (cleanup path).
 
+    use super::TunDevice;
     use anyhow::{anyhow, bail, Context};
     // Only the Linux `create_tun` uses HashSet (auto-name race tracking); macOS
     // lets the kernel assign `utunN`, so the import is Linux-only.
@@ -3927,7 +4100,8 @@ pub mod hostcfg {
         }
     }
 
-    /// Check that we are root (UID 0).
+    /// Check that we have privileges to manage the VPN device and host routes.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn check_root() -> anyhow::Result<()> {
         if nix::unistd::getuid().is_root() {
             Ok(())
@@ -3937,6 +4111,13 @@ pub mod hostcfg {
                  Run with sudo or grant the capability."
             )
         }
+    }
+
+    /// Windows privilege preflight. Full token inspection lands with the Windows
+    /// host-config backend; until then the Windows backend fails before host mutations.
+    #[cfg(target_os = "windows")]
+    pub fn check_root() -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Verify a binary exists by running it with --version.
@@ -4088,6 +4269,22 @@ pub mod hostcfg {
         ));
     }
 
+    /// Windows stale-reclaim scaffold: remove per-link state markers. Host route,
+    /// firewall, and NAT cleanup builders are added before the Windows runtime is
+    /// marked complete.
+    #[cfg(target_os = "windows")]
+    pub async fn stale_reclaim(id: &str, role: &str) {
+        let _ = std::fs::create_dir_all(run_dir());
+        let fwdref = fwd_refcount_path(id, role);
+        let _ = std::fs::remove_file(&fwdref);
+        let others_active = other_fwdref_present(std::path::Path::new(run_dir()), &fwdref);
+        let state_path = ipforward_state_path(id, role);
+        let _ = std::fs::remove_file(&state_path);
+        if !others_active {
+            let _ = std::fs::remove_file(ipforward_orig_path());
+        }
+    }
+
     /// Create a TUN device with `queues` kernel queues (C1).
     ///
     /// Resolves "auto" name to the first free `boreN` (N=0..=255); explicit names are used
@@ -4103,7 +4300,7 @@ pub mod hostcfg {
         prefix: u8,
         mtu: u16,
         queues: usize,
-    ) -> anyhow::Result<(Vec<tun_rs::AsyncDevice>, bool, String)> {
+    ) -> anyhow::Result<(Vec<TunDevice>, bool, String)> {
         let queues = queues.clamp(1, 8);
 
         // Resolve and create with retry for auto-mode races.
@@ -4221,7 +4418,7 @@ pub mod hostcfg {
         prefix: u8,
         mtu: u16,
         queues: usize,
-    ) -> anyhow::Result<(Vec<tun_rs::AsyncDevice>, bool, String)> {
+    ) -> anyhow::Result<(Vec<TunDevice>, bool, String)> {
         if queues > 1 {
             tracing::warn!(
                 queues,
@@ -4253,6 +4450,67 @@ pub mod hostcfg {
 
         // offload is always false on macOS ⇒ bridge single-packet path (I-M3).
         Ok((vec![dev], false, resolved_name))
+    }
+
+    /// Windows WinTun runtime: create a single-queue, no-offload L3 adapter.
+    #[cfg(target_os = "windows")]
+    pub async fn create_tun(
+        name: &str,
+        addr: Ipv4Addr,
+        prefix: u8,
+        mtu: u16,
+        queues: usize,
+    ) -> anyhow::Result<(Vec<TunDevice>, bool, String)> {
+        if queues > 1 {
+            tracing::warn!(
+                queues,
+                "Windows WinTun: multi-queue unsupported, using 1 queue"
+            );
+        }
+        let resolved_name = pick_tun_name(name, |_| false)
+            .ok_or_else(|| anyhow!("no free Windows WinTun adapter name available"))?;
+        validate_windows_adapter_name(&resolved_name)?;
+        let dll_path = bore_wintun::dll_path_from_env_var(std::env::var_os("BORE_WINTUN_DLL"));
+        let netmask = prefix_to_netmask(prefix)?;
+        let inner = bore_wintun::WintunDevice::open_or_create(
+            dll_path.as_deref(),
+            &resolved_name,
+            "bore",
+            addr,
+            netmask,
+            mtu as usize,
+            bore_wintun::DEFAULT_RING_CAPACITY,
+        )
+        .context("failed to create Windows WinTun adapter")?;
+        let resolved_name = inner.name().to_string();
+        tracing::info!(%resolved_name, "Windows WinTun adapter created (single queue, no offload)");
+        Ok((vec![TunDevice { inner }], false, resolved_name))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn validate_windows_adapter_name(name: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(!name.is_empty(), "Windows TUN adapter name cannot be empty");
+        anyhow::ensure!(
+            name.len() <= 128,
+            "Windows TUN adapter name exceeds 128 characters"
+        );
+        anyhow::ensure!(
+            !name.chars().any(|c| c.is_control())
+                && !name.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|']),
+            "Windows TUN adapter name contains characters that are unsafe for adapter/rule names"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn prefix_to_netmask(prefix: u8) -> anyhow::Result<Ipv4Addr> {
+        anyhow::ensure!(prefix <= 32, "invalid IPv4 prefix {prefix}");
+        let mask = if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix)
+        };
+        Ok(Ipv4Addr::from(mask))
     }
 
     /// Internal: marker for an ip_forward revert operation.
@@ -4292,6 +4550,10 @@ pub mod hostcfg {
     fn run_dir() -> &'static str {
         "/var/run"
     }
+    #[cfg(target_os = "windows")]
+    fn run_dir() -> &'static str {
+        "C:/ProgramData/bore/vpn/state"
+    }
 
     fn ipforward_state_path(id: &str, role: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(format!(
@@ -4309,11 +4571,17 @@ pub mod hostcfg {
     /// therefore scoped by this id so links in DIFFERENT netns never couple their
     /// independent `ip_forward` toggles — only co-netns links refcount together.
     /// `0` on the unreadable/non-Linux path: degrades to a single host-wide scope.
+    #[cfg(target_os = "linux")]
     fn current_netns_id() -> u64 {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata("/proc/self/ns/net")
             .map(|m| m.ino())
             .unwrap_or(0)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn current_netns_id() -> u64 {
+        0
     }
 
     /// Filename prefix shared by every `.fwdref` marker in the current netns.
@@ -5021,6 +5289,106 @@ pub mod hostcfg {
 
             Ok(cfg)
         }
+
+        /// Windows host-config runtime scaffold: routes, MTU, forwarding markers,
+        /// firewall and NAT command builders. Full elevated e2e validation lands in
+        /// the Windows acceptance phase.
+        #[cfg(target_os = "windows")]
+        #[allow(clippy::too_many_arguments)]
+        pub async fn apply<R: CommandRunner>(
+            runner: &R,
+            id: &str,
+            role: &str,
+            tun_name: &str,
+            assigned: std::net::Ipv4Addr,
+            prefix: u8,
+            peer_routes: &[crate::shared::Ipv4Net],
+            advertised: &[crate::shared::Ipv4Net],
+            nat_maps: &[(crate::shared::Ipv4Net, crate::shared::Ipv4Net)],
+            no_route_manage: bool,
+            hub: bool,
+            nat_masquerade: bool,
+            forward_accept: bool,
+        ) -> anyhow::Result<Self> {
+            use super::hostcfg_cmd::windows;
+            let _ = (assigned, prefix, nat_maps, hub);
+            let mut cfg = NetConfig {
+                id: id.to_string(),
+                role: role.to_string(),
+                tun_name: tun_name.to_string(),
+                no_route_manage,
+                nft_available: false,
+                revert_cmds: Vec::new(),
+                revert_labels: Vec::new(),
+                ip_forward_saved: None,
+                applied_ops: Vec::new(),
+            };
+
+            std::fs::create_dir_all(run_dir()).ok();
+
+            if !no_route_manage {
+                for net in peer_routes {
+                    let subnet = net.to_string();
+                    let argv = windows::cmd_route_add(&subnet, tun_name);
+                    match runner.run(&argv).await {
+                        Ok(_) => {
+                            cfg.revert_cmds
+                                .push(windows::cmd_route_del(&subnet, tun_name));
+                            cfg.revert_labels
+                                .push(format!("windows route del {subnet}"));
+                        }
+                        Err(e) => tracing::warn!(error = %e, %subnet, "Windows route add failed"),
+                    }
+                }
+            }
+
+            if !advertised.is_empty() {
+                let _ = std::fs::write(ipforward_state_path(id, role), "0\n");
+                let _ = std::fs::write(fwd_refcount_path(id, role), "1\n");
+                let _ = std::fs::write(ipforward_orig_path(), "0\n");
+                cfg.applied_ops
+                    .push(AppliedOp::IpForward { saved_value: 0 });
+
+                let argv = windows::cmd_ip_forward_set(true);
+                runner
+                    .run(&argv)
+                    .await
+                    .context("enable Windows IP forwarding (run elevated)")?;
+
+                if forward_accept {
+                    for net in advertised {
+                        let rule = windows::sanitize_name(&format!("bore-{id}-{role}-fwd-{}", net));
+                        let argv = windows::cmd_firewall_allow(&rule, tun_name, &net.to_string());
+                        match runner.run(&argv).await {
+                            Ok(_) => {
+                                cfg.revert_cmds.push(windows::cmd_firewall_delete(&rule));
+                                cfg.revert_labels
+                                    .push(format!("windows firewall del {rule}"));
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, rule, "Windows firewall rule add failed")
+                            }
+                        }
+                    }
+                }
+
+                if nat_masquerade {
+                    for net in advertised {
+                        let name = windows::sanitize_name(&format!("bore-{id}-{role}-nat-{}", net));
+                        let argv = windows::cmd_nat_add(&name, &net.to_string());
+                        match runner.run(&argv).await {
+                            Ok(_) => {
+                                cfg.revert_cmds.push(windows::cmd_nat_del(&name));
+                                cfg.revert_labels.push(format!("windows nat del {name}"));
+                            }
+                            Err(e) => tracing::warn!(error = %e, name, "Windows NAT add failed"),
+                        }
+                    }
+                }
+            }
+
+            Ok(cfg)
+        }
     }
 
     /// Build the ordered nft command list for the gateway data plane (the
@@ -5210,6 +5578,38 @@ pub mod hostcfg {
                      sudo sysctl -w net.inet.ip.forwarding={}",
                     restore_to
                 );
+            }
+            let _ = std::fs::remove_file(ipforward_state_path(&self.id, &self.role));
+            let _ = std::fs::remove_file(ipforward_orig_path());
+        }
+
+        /// Windows twin: restore IP forwarding with refcount-aware state markers.
+        #[cfg(target_os = "windows")]
+        fn restore_ip_forward_op(&self, saved_value: u8) {
+            let fwdref = fwd_refcount_path(&self.id, &self.role);
+            let _ = std::fs::remove_file(&fwdref);
+            let others_active = other_fwdref_present(std::path::Path::new(run_dir()), &fwdref);
+            if others_active {
+                tracing::info!(
+                    "Windows IP forwarding left enabled: another bore gateway link still active"
+                );
+                let _ = std::fs::remove_file(ipforward_state_path(&self.id, &self.role));
+                return;
+            }
+            let restore_to: u8 = std::fs::read_to_string(ipforward_orig_path())
+                .ok()
+                .and_then(|s| s.trim().parse::<u8>().ok())
+                .unwrap_or(saved_value);
+            let argv = super::hostcfg_cmd::windows::cmd_ip_forward_set(restore_to != 0);
+            let ok = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                tracing::warn!(restore_to, "could not restore Windows IP forwarding; run elevated PowerShell and set IPEnableRouter manually");
             }
             let _ = std::fs::remove_file(ipforward_state_path(&self.id, &self.role));
             let _ = std::fs::remove_file(ipforward_orig_path());
@@ -6848,6 +7248,7 @@ pub mod bridge {
     use tracing::debug;
 
     use super::link::{LinkRecver, LinkSender};
+    use super::TunDevice;
 
     /// Counter metrics for bridge data-plane.
     pub struct BridgeCounters {
@@ -6946,7 +7347,7 @@ pub mod bridge {
     /// disabled for good.
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
-        devs: Vec<Arc<tun_rs::AsyncDevice>>,
+        devs: Vec<Arc<TunDevice>>,
         sender: LinkSender,
         recver: LinkRecver,
         counters: Arc<BridgeCounters>,
@@ -6987,7 +7388,7 @@ pub mod bridge {
 
         /// Spawn uplinks only (not downlinks); first to die wins.
         fn spawn_uplinks(
-            devs: &[Arc<tun_rs::AsyncDevice>],
+            devs: &[Arc<TunDevice>],
             sender: LinkSender,
             counters: &Arc<BridgeCounters>,
             mtu: u16,
@@ -7008,7 +7409,7 @@ pub mod bridge {
 
         /// Spawn the relay downlink (always-on for the link lifetime).
         fn spawn_relay_downlink(
-            devs: &[Arc<tun_rs::AsyncDevice>],
+            devs: &[Arc<TunDevice>],
             relay_recver: LinkRecver,
             counters: &Arc<BridgeCounters>,
             offload: bool,
@@ -7023,7 +7424,7 @@ pub mod bridge {
 
         /// Spawn the direct downlink (conditional on direct upgrade).
         fn spawn_direct_downlink(
-            devs: &[Arc<tun_rs::AsyncDevice>],
+            devs: &[Arc<TunDevice>],
             direct_recver: LinkRecver,
             counters: &Arc<BridgeCounters>,
             offload: bool,
@@ -7160,7 +7561,7 @@ pub mod bridge {
     }
 
     async fn run_uplink(
-        dev: Arc<tun_rs::AsyncDevice>,
+        dev: Arc<TunDevice>,
         sender: LinkSender,
         counters: Arc<BridgeCounters>,
         mtu: u16,
@@ -7175,7 +7576,7 @@ pub mod bridge {
 
     /// Phase 6.1: single-packet read from TUN, one datagram/frame per call.
     async fn run_uplink_single(
-        dev: Arc<tun_rs::AsyncDevice>,
+        dev: Arc<TunDevice>,
         mut sender: LinkSender,
         counters: Arc<BridgeCounters>,
         mtu: u16,
@@ -7208,13 +7609,13 @@ pub mod bridge {
         }
     }
 
-    /// macOS twin — never reached: TUN GSO/GRO offload uses Linux-only `tun-rs`
-    /// APIs (`recv_multiple`/`VIRTIO_NET_HDR_LEN`), and macOS `create_tun` forces
+    /// Non-Linux twin — never reached: TUN GSO/GRO offload uses Linux-only `tun-rs`
+    /// APIs (`recv_multiple`/`VIRTIO_NET_HDR_LEN`), and non-Linux `create_tun` forces
     /// `offload=false` (I-M4), so the dispatcher always takes the single-packet
-    /// path. Present only so the offload branch compiles on macOS (I-M3 caveat).
-    #[cfg(target_os = "macos")]
+    /// path. Present only so the offload branch compiles on non-Linux (I-M3 caveat).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     async fn run_uplink_offload(
-        _dev: Arc<tun_rs::AsyncDevice>,
+        _dev: Arc<TunDevice>,
         _sender: LinkSender,
         _counters: Arc<BridgeCounters>,
         _mtu: u16,
@@ -7225,7 +7626,7 @@ pub mod bridge {
     /// Phase 6.2: batch read from TUN via GSO super-buffer, one syscall → N segments.
     #[cfg(target_os = "linux")]
     async fn run_uplink_offload(
-        dev: Arc<tun_rs::AsyncDevice>,
+        dev: Arc<TunDevice>,
         mut sender: LinkSender,
         counters: Arc<BridgeCounters>,
         _mtu: u16,
@@ -7269,7 +7670,7 @@ pub mod bridge {
     /// Run the downlink: write decrypted/decompressed packets to the TUN.
     /// Public for hub mode (Phase 3).
     pub async fn run_downlink(
-        dev: Arc<tun_rs::AsyncDevice>,
+        dev: Arc<TunDevice>,
         recver: LinkRecver,
         counters: Arc<BridgeCounters>,
         offload: bool,
@@ -7283,7 +7684,7 @@ pub mod bridge {
 
     /// Phase 6.1: single-packet write to TUN per frame.
     async fn run_downlink_single(
-        dev: Arc<tun_rs::AsyncDevice>,
+        dev: Arc<TunDevice>,
         mut recver: LinkRecver,
         counters: Arc<BridgeCounters>,
     ) -> Result<()> {
@@ -7301,11 +7702,11 @@ pub mod bridge {
         }
     }
 
-    /// macOS twin — never reached (offload is Linux-only; macOS forces
-    /// offload=false, I-M4). Present so the offload branch compiles on macOS.
-    #[cfg(target_os = "macos")]
+    /// Non-Linux twin — never reached (offload is Linux-only; non-Linux forces
+    /// offload=false, I-M4). Present so the offload branch compiles on non-Linux.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     async fn run_downlink_offload(
-        _dev: Arc<tun_rs::AsyncDevice>,
+        _dev: Arc<TunDevice>,
         _recver: LinkRecver,
         _counters: Arc<BridgeCounters>,
     ) -> Result<()> {
@@ -7317,7 +7718,7 @@ pub mod bridge {
     /// needed — packets from the peer have complete checksums).
     #[cfg(target_os = "linux")]
     async fn run_downlink_offload(
-        dev: Arc<tun_rs::AsyncDevice>,
+        dev: Arc<TunDevice>,
         mut recver: LinkRecver,
         counters: Arc<BridgeCounters>,
     ) -> Result<()> {
@@ -7859,6 +8260,7 @@ pub mod hub {
 
     use super::bridge::BridgeCounters;
     use super::link::LinkSender;
+    use super::TunDevice;
 
     /// Handle to a connected peer in the hub. Holds a swappable sender (for Phase 4
     /// relay↔direct upgrade) and a shutdown trigger. The sender is behind a Mutex
@@ -7993,7 +8395,7 @@ pub mod hub {
     /// Router uplink: read packets from TUN, parse destination IPv4, route to per-peer sender.
     /// Spawned once per TUN queue. Adapted from `bridge::run_uplink_single`/`_offload`.
     pub async fn run_router_uplink(
-        dev: Arc<tun_rs::AsyncDevice>,
+        dev: Arc<TunDevice>,
         table: PeerTable,
         counters: Arc<BridgeCounters>,
         offload: bool,
@@ -8007,7 +8409,7 @@ pub mod hub {
 
     /// Phase 6.1 router: single-packet read.
     async fn run_router_uplink_single(
-        dev: Arc<tun_rs::AsyncDevice>,
+        dev: Arc<TunDevice>,
         table: PeerTable,
         counters: Arc<BridgeCounters>,
     ) -> Result<()> {
@@ -8048,11 +8450,11 @@ pub mod hub {
         }
     }
 
-    /// macOS twin — never reached (offload is Linux-only; macOS forces
-    /// offload=false, I-M4). Present so the hub offload branch compiles on macOS.
-    #[cfg(target_os = "macos")]
+    /// Non-Linux twin — never reached (offload is Linux-only; non-Linux forces
+    /// offload=false, I-M4). Present so the hub offload branch compiles on non-Linux.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     async fn run_router_uplink_offload(
-        _dev: Arc<tun_rs::AsyncDevice>,
+        _dev: Arc<TunDevice>,
         _table: PeerTable,
         _counters: Arc<BridgeCounters>,
     ) -> Result<()> {
@@ -8062,7 +8464,7 @@ pub mod hub {
     /// Phase 6.2 router: offload (batch) read with GSO.
     #[cfg(target_os = "linux")]
     async fn run_router_uplink_offload(
-        dev: Arc<tun_rs::AsyncDevice>,
+        dev: Arc<TunDevice>,
         table: PeerTable,
         counters: Arc<BridgeCounters>,
     ) -> Result<()> {
@@ -8141,7 +8543,7 @@ pub mod hub {
     /// Single owner of PeerTable mutation.
     #[allow(clippy::too_many_arguments)]
     async fn run_hub_coordinator(
-        devs: Vec<Arc<tun_rs::AsyncDevice>>,
+        devs: Vec<Arc<TunDevice>>,
         secret: String,
         counters: Arc<BridgeCounters>,
         offload: bool,
@@ -8256,7 +8658,7 @@ pub mod hub {
     async fn try_build_peer(
         pending: &mut std::collections::HashMap<u32, PendingPeer>,
         live_peers: &mut std::collections::HashMap<u32, LivePeerEntry>,
-        devs: &[Arc<tun_rs::AsyncDevice>],
+        devs: &[Arc<TunDevice>],
         secret: &str,
         counters: &Arc<BridgeCounters>,
         offload: bool,
@@ -8407,7 +8809,7 @@ pub mod hub {
         args: super::VpnListenArgs,
         admin_v2: bool,
         out_tx: tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
-        dev0: Arc<tun_rs::AsyncDevice>,
+        dev0: Arc<TunDevice>,
         counters: Arc<BridgeCounters>,
         offload: bool,
     ) {
@@ -8477,7 +8879,7 @@ pub mod hub {
         args: &super::VpnListenArgs,
         endpoint: &crate::transport::Endpoint,
         tunneled: &[crate::shared::Ipv4Net],
-        dev0: &Arc<tun_rs::AsyncDevice>,
+        dev0: &Arc<TunDevice>,
         counters: &Arc<BridgeCounters>,
         offload: bool,
         out_tx: &tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
@@ -8664,7 +9066,7 @@ pub mod hub {
         let (devs_raw, offload, tun_name) =
             super::hostcfg::create_tun(&args.tun_name, assigned, prefix, args.mtu, args.tun_queues)
                 .await?;
-        let devs: Vec<Arc<tun_rs::AsyncDevice>> = devs_raw.into_iter().map(Arc::new).collect();
+        let devs: Vec<Arc<TunDevice>> = devs_raw.into_iter().map(Arc::new).collect();
         info!(
             link_id = %args.id,
             iface = %tun_name,

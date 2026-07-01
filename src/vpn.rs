@@ -3551,10 +3551,19 @@ pub mod hostcfg_cmd {
         /// Build PowerShell argv that deletes every firewall rule for one VPN link
         /// (any kind, any net suffix) by wildcard prefix match — the stale-reclaim
         /// path, which only has `(id, role)` and never the original net list.
+        /// Filters with `Where-Object -like` on the piped objects rather than the
+        /// `-DisplayName` parameter's own wildcarding: confirmed via the
+        /// `windows_vpn_spike diag-firewall` investigation that `-DisplayName`
+        /// does exact literal matching only (a `*` in the value is not a
+        /// wildcard there) — the earlier version of this builder never matched
+        /// anything, so `stale_reclaim` silently left every rule behind on
+        /// every run (found real: `T-WIN-STALE1/2`, `leak-then-reclaim`
+        /// consistently reported 2 leaked rules instead of 0). `cmd_nat_delete_for_link`
+        /// already used the correct `Where-Object -like` pattern for `Get-NetNat`.
         pub fn cmd_firewall_delete_for_link(id: &str, role: &str) -> Vec<String> {
             let prefix = format!("bore-{}-{}-*", sanitize_name(id), sanitize_name(role));
             powershell(&format!(
-                "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName '{}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -Confirm:$false",
+                "Get-NetFirewallRule -Group 'bore-vpn' -ErrorAction SilentlyContinue | Where-Object {{ $_.DisplayName -like '{}' }} | Remove-NetFirewallRule -Confirm:$false",
                 ps_quote(&prefix)
             ))
         }
@@ -4003,7 +4012,7 @@ pub mod hostcfg_cmd {
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName 'bore-link_one-listen-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -Confirm:$false"
+                    "Get-NetFirewallRule -Group 'bore-vpn' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'bore-link_one-listen-*' } | Remove-NetFirewallRule -Confirm:$false"
                 ]
             );
         }
@@ -6105,23 +6114,30 @@ pub mod hostcfg {
             // Revert in reverse order using blocking std::process::Command.
             // Note: Drop is not async, so we use blocking subprocess calls.
 
-            // First, revert nft/iptables rules in reverse order. Each command
-            // gets a few quick retries before warning: the windows-vpn-e2e CI
-            // job surfaced a real, narrow Windows quirk here — a firewall rule
-            // created moments earlier (immediately followed by a WinNAT
-            // instance create + IPEnableRouter toggle) can be transiently
-            // unqueryable via Get-NetFirewallRule for the duration of a fast
-            // create-then-immediately-teardown cycle, even though
-            // New-NetFirewallRule/Get-NetFirewallRule work correctly in
-            // isolation (verified directly — see the `windows_vpn_spike
-            // diag-firewall` investigation). The exact network-stack
-            // mechanism wasn't pinned down further (not reproducible in
-            // isolation, only after NAT+ip_forward churn moments before), but
-            // retrying is the right fix either way: a real permanent failure
-            // (e.g. stale nft table already gone) just fails the same way a
-            // few hundred ms later, at negligible teardown-latency cost, while
-            // a transient one now actually succeeds instead of leaking.
-            const REVERT_ATTEMPTS: u32 = 3;
+            // First, revert nft/iptables rules in reverse order. On Windows
+            // ONLY, each command gets a few retries before warning: the
+            // windows-vpn-e2e CI job surfaced a real, narrow Windows quirk
+            // here — a firewall rule created moments earlier (immediately
+            // followed by a WinNAT instance create + IPEnableRouter toggle)
+            // can be unqueryable via Get-NetFirewallRule (by exact name AND
+            // by broad group scan) for a fast create-then-immediately-
+            // teardown cycle, even though New-NetFirewallRule/
+            // Get-NetFirewallRule work correctly in isolation with no NAT/
+            // ip_forward churn nearby (verified directly — see the
+            // `windows_vpn_spike diag-firewall` investigation). The exact
+            // network-stack mechanism wasn't pinned down (not reproducible in
+            // isolation); see docs/vpn/VPN_WINDOWS.md for the current
+            // documented status. Linux/macOS revert failures are either a
+            // genuine permanent error (permission, missing binary) that a
+            // retry cannot fix, or an already-fast/reliable kernel-level op
+            // with no known transient-visibility class of issue — retrying
+            // there would only add real wall-clock delay (teardown latency,
+            // and multiplied test time) for zero benefit, so they keep the
+            // original single-attempt behavior.
+            #[cfg(target_os = "windows")]
+            const REVERT_ATTEMPTS: u32 = 6;
+            #[cfg(not(target_os = "windows"))]
+            const REVERT_ATTEMPTS: u32 = 1;
             for (argv, label) in self
                 .revert_cmds
                 .iter()
@@ -6133,18 +6149,20 @@ pub mod hostcfg {
                     match std::process::Command::new(&argv[0])
                         .args(&argv[1..])
                         .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
+                        .stderr(std::process::Stdio::piped())
+                        .output()
                     {
                         Err(e) => {
                             tracing::warn!(%e, %label, "vpn netconfig revert step failed (spawn error)");
                             break;
                         }
-                        Ok(s) if !s.success() => {
+                        Ok(out) if !out.status.success() => {
                             if attempt == REVERT_ATTEMPTS {
-                                tracing::warn!(code=%s, %label, "vpn netconfig revert step exited non-zero");
+                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                tracing::warn!(code=%out.status, %label, stderr=%stderr.trim(), attempts=REVERT_ATTEMPTS, "vpn netconfig revert step exited non-zero after retries");
                             } else {
-                                std::thread::sleep(std::time::Duration::from_millis(300));
+                                tracing::debug!(attempt, %label, "vpn netconfig revert step failed, retrying");
+                                std::thread::sleep(std::time::Duration::from_millis(500));
                             }
                         }
                         Ok(_) => break,

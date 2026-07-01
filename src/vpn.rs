@@ -3524,26 +3524,25 @@ pub mod hostcfg_cmd {
 
         /// Build PowerShell argv for deleting one exact firewall rule by display
         /// name (the precise success-path revert, paired 1:1 with whichever
-        /// `cmd_firewall_allow_*` call created it). Two fixes found via the
-        /// `windows-vpn-e2e` CI job (T-WIN-FWD2 — real hardware surfaced both):
-        /// `-Confirm:$false`, without which `Remove-NetFirewallRule` silently
-        /// left the rule in place and exited non-zero on a non-interactive host
-        /// with no console to answer its confirmation prompt; and
-        /// `-ErrorAction SilentlyContinue` on the `Get-NetFirewallRule` lookup,
-        /// because it THROWS a terminating error on an exact `-DisplayName` with
-        /// zero matches (unlike most PowerShell cmdlets, which return an empty
-        /// collection) — observed even moments after the matching
-        /// `New-NetFirewallRule` call reported success, so a just-created rule
-        /// is not always immediately visible to a query from a freshly-spawned
-        /// process. Reverting a rule that isn't (yet) visible — or is already
-        /// gone — is a no-op, not an error; this revert path is best-effort by
-        /// design (every other step here already only warns, never blocks
-        /// teardown), so the right behavior is to degrade silently, not throw.
-        /// Matches the defensive style `cmd_nat_del`/`cmd_nat_delete_for_link`
-        /// already used for `Remove-NetNat`.
+        /// `cmd_firewall_allow_*` call created it).
+        ///
+        /// Root cause finally confirmed via captured stderr on the
+        /// `windows-vpn-e2e` CI job (T-WIN-FWD2 — after two earlier partial
+        /// fixes, `-Confirm:$false` and `-ErrorAction SilentlyContinue`,
+        /// didn't fully resolve it and a bounded retry loop was added as a
+        /// stopgap): `Get-NetFirewallRule -Group 'bore-vpn' -DisplayName
+        /// '<name>'` — combining `-Group` with `-DisplayName` — throws
+        /// `AmbiguousParameterSet` every single time (100% reproducible, NOT
+        /// a timing/visibility issue as earlier suspected). `-DisplayName`
+        /// alone is already exact/unique (every name is per-link-prefixed by
+        /// `link_prefix`), so `-Group` was redundant filtering, not a
+        /// correctness requirement — dropping it fixes the lookup outright.
+        /// `-Confirm:$false` (`Remove-NetFirewallRule` needs it on a
+        /// non-interactive host) and `-ErrorAction SilentlyContinue` (belt
+        /// and suspenders for an already-gone rule) both stay.
         pub fn cmd_firewall_delete(rule_name: &str) -> Vec<String> {
             powershell(&format!(
-                "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName '{}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -Confirm:$false",
+                "Get-NetFirewallRule -DisplayName '{}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -Confirm:$false",
                 ps_quote(rule_name)
             ))
         }
@@ -3928,7 +3927,7 @@ pub mod hostcfg_cmd {
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName 'bad''name' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -Confirm:$false"
+                    "Get-NetFirewallRule -DisplayName 'bad''name' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -Confirm:$false"
                 ]
             );
         }

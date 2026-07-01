@@ -3524,10 +3524,16 @@ pub mod hostcfg_cmd {
 
         /// Build PowerShell argv for deleting one exact firewall rule by display
         /// name (the precise success-path revert, paired 1:1 with whichever
-        /// `cmd_firewall_allow_*` call created it).
+        /// `cmd_firewall_allow_*` call created it). `-Confirm:$false` (found via
+        /// the `windows-vpn-e2e` CI job, T-WIN-FWD2 — real hardware surfaced
+        /// this): without it, `Remove-NetFirewallRule` silently left the rule in
+        /// place and exited non-zero on a non-interactive host with no console
+        /// to answer its confirmation prompt — every revert leaked both rules.
+        /// Matches the defensive style `cmd_nat_del`/`cmd_nat_delete_for_link`
+        /// already used for `Remove-NetNat`.
         pub fn cmd_firewall_delete(rule_name: &str) -> Vec<String> {
             powershell(&format!(
-                "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName '{}' | Remove-NetFirewallRule",
+                "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName '{}' | Remove-NetFirewallRule -Confirm:$false",
                 ps_quote(rule_name)
             ))
         }
@@ -3538,7 +3544,7 @@ pub mod hostcfg_cmd {
         pub fn cmd_firewall_delete_for_link(id: &str, role: &str) -> Vec<String> {
             let prefix = format!("bore-{}-{}-*", sanitize_name(id), sanitize_name(role));
             powershell(&format!(
-                "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName '{}' | Remove-NetFirewallRule",
+                "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName '{}' | Remove-NetFirewallRule -Confirm:$false",
                 ps_quote(&prefix)
             ))
         }
@@ -3903,7 +3909,7 @@ pub mod hostcfg_cmd {
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName 'bad''name' | Remove-NetFirewallRule"
+                    "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName 'bad''name' | Remove-NetFirewallRule -Confirm:$false"
                 ]
             );
         }
@@ -3987,7 +3993,7 @@ pub mod hostcfg_cmd {
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName 'bore-link_one-listen-*' | Remove-NetFirewallRule"
+                    "Get-NetFirewallRule -Group 'bore-vpn' -DisplayName 'bore-link_one-listen-*' | Remove-NetFirewallRule -Confirm:$false"
                 ]
             );
         }

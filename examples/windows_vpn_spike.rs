@@ -124,10 +124,14 @@ fn adapter_exists(name: &str) -> bool {
     ok && stdout.trim().eq_ignore_ascii_case("true")
 }
 
+// Scoped to one link's own rule-name prefix rather than the whole `bore-vpn`
+// group — the CI job runs every mode's spike as a separate process on the
+// SAME host, so firewall rules from an earlier step (or a prior failed run's
+// leak) are otherwise indistinguishable from this step's own rules.
 #[cfg(target_os = "windows")]
-fn firewall_rule_count(group: &str) -> usize {
+fn firewall_rule_count_for_link(id: &str, role: &str) -> usize {
     let (ok, stdout, _) = run(&ps(&format!(
-        "(Get-NetFirewallRule -Group '{group}' -ErrorAction SilentlyContinue | Measure-Object).Count"
+        "(Get-NetFirewallRule -Group 'bore-vpn' -DisplayName 'bore-{id}-{role}-*' -ErrorAction SilentlyContinue | Measure-Object).Count"
     )));
     if ok {
         stdout.trim().parse().unwrap_or(0)
@@ -215,7 +219,7 @@ async fn cmd_spike() -> anyhow::Result<()> {
         eprintln!("  WARN: expected IPEnableRouter=1, got {fwd}");
     }
 
-    let rules = firewall_rule_count("bore-vpn");
+    let rules = firewall_rule_count_for_link("spike0", "listen");
     println!("  bore-vpn firewall rules present: {rules}");
     if rules == 0 {
         eprintln!("  WARN: expected >=1 forward-accept firewall rule, found 0");
@@ -224,7 +228,7 @@ async fn cmd_spike() -> anyhow::Result<()> {
     println!("\n[d] Dropping NetConfig (RAII revert)...");
     drop(netcfg);
     let fwd_after = read_ip_forward();
-    let rules_after = firewall_rule_count("bore-vpn");
+    let rules_after = firewall_rule_count_for_link("spike0", "listen");
     println!(
         "  IPEnableRouter after revert: {fwd_after} (expected 0 unless another link is active)"
     );
@@ -396,7 +400,7 @@ async fn cmd_apply_revert() -> anyhow::Result<()> {
         eprintln!("  WARN: expected 1, got {fwd}");
     }
 
-    let rules = firewall_rule_count("bore-vpn");
+    let rules = firewall_rule_count_for_link("fwdnat0", "listen");
     println!("  bore-vpn firewall rules: {rules} (expected 2: tun->lan, lan->tun)");
     if rules < 2 {
         eprintln!("  WARN: expected >=2 forward-accept rules, found {rules}");
@@ -415,7 +419,7 @@ async fn cmd_apply_revert() -> anyhow::Result<()> {
     drop(netcfg);
 
     let fwd_after = read_ip_forward();
-    let rules_after = firewall_rule_count("bore-vpn");
+    let rules_after = firewall_rule_count_for_link("fwdnat0", "listen");
     println!("  IPEnableRouter after revert: {fwd_after} (expected {original_fwd})");
     println!("  bore-vpn firewall rules after revert: {rules_after} (expected 0)");
     if fwd_after != original_fwd {
@@ -463,7 +467,7 @@ async fn cmd_forward_accept_off_warn() -> anyhow::Result<()> {
         "[2] NetConfig applied WITHOUT --forward-accept (should have warned in the log above)"
     );
 
-    let rules = firewall_rule_count("bore-vpn");
+    let rules = firewall_rule_count_for_link("nofwd0", "listen");
     println!(
         "  bore-vpn firewall rules: {rules} (expected 0 — no rules added on the warn-only path)"
     );
@@ -620,7 +624,7 @@ async fn cmd_leak() -> anyhow::Result<()> {
     .await?;
     println!("[2] Applied NetConfig (forward-accept + nat-masquerade)");
 
-    let rules = firewall_rule_count("bore-vpn");
+    let rules = firewall_rule_count_for_link("leak0", "listen");
     println!("  bore-vpn firewall rules present: {rules}");
 
     println!("\n[3] Leaking (std::mem::forget) — simulating SIGKILL...");
@@ -638,7 +642,7 @@ async fn cmd_reclaim() -> anyhow::Result<()> {
     bore_cli::vpn::hostcfg::stale_reclaim("leak0", "listen").await;
     println!("OK: stale_reclaim completed");
 
-    let rules = firewall_rule_count("bore-vpn");
+    let rules = firewall_rule_count_for_link("leak0", "listen");
     println!("\n[2] bore-vpn firewall rules after reclaim: {rules} (expected 0)");
     let fwd = read_ip_forward();
     println!("[3] IPEnableRouter after reclaim: {fwd} (expected 0, no other link active)");

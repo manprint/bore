@@ -152,11 +152,23 @@ jobs:
 
       - run: bash ci/set_rust_version.bash stable ${{ matrix.target }}
       - run: bash ci/build.bash cargo ${{ matrix.target }} RELEASE
+
+      # Bundle the official signed wintun.dll (pinned version+hash, see
+      # scripts/fetch_wintun.ps1 and docs/vpn/VPN_WINDOWS.md) so `bore vpn`
+      # works out of the box from the release zip — no separate download step
+      # for users. amd64 for x86_64-pc-windows-msvc, x86 for i686-pc-windows-msvc.
+      - name: Setup | wintun.dll
+        shell: pwsh
+        run: |
+          $arch = if ("${{ matrix.target }}" -like "*x86_64*") { "amd64" } else { "x86" }
+          ./scripts/fetch_wintun.ps1 -Arch $arch -OutFile "target/${{ matrix.target }}/release/wintun.dll"
+          Copy-Item "target/${{ matrix.target }}/release/wintun.dll" "wintun-${{ matrix.target }}.dll"
+
       - name: Package | Compressed archive
         shell: bash
         run: |
           cd ./target/${{ matrix.target }}/release/
-          7z a "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.zip" "${{ env.BIN }}.exe"
+          7z a "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.zip" "${{ env.BIN }}.exe" "wintun.dll"
           mv "${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.zip" "$GITHUB_WORKSPACE"
 
       - name: Package | Raw binary
@@ -171,6 +183,7 @@ jobs:
           files: |
             ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.zip
             ${{ env.BIN }}-${{ matrix.target }}.exe
+            wintun-${{ matrix.target }}.dll
 
   # Android is built with the NDK (zig/cross cannot build `ring` for Android).
   android:

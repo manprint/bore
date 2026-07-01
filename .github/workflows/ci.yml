@@ -101,15 +101,16 @@ jobs:
         run: cargo test --features vpn --lib
 
   # Real cargo test execution on a hosted windows-latest runner (not just the
-  # cross-compile check above). Per docs/plans/plan_WindowsSupport overview.md
-  # D10, hosted Windows CI is non-admin, so this cannot exercise WinTun/host
-  # networking (those need elevated/self-hosted CI, not available yet) — but
-  # every non-VPN integration test (tests/e2e_test.rs, secret_test.rs,
-  # vhost_test.rs, transfer_test.rs, udp_test.rs, etc.) plus the VPN protocol/
-  # logic-level tests (relay, hub allocation, broker, routes) need no
-  # elevation: no Command::new of an external binary, no /tmp, no Unix
-  # sockets, no root. This is the Phase 4 (non-VPN parity) hosted e2e tier
-  # named in the plan, mirroring the existing `macos-vpn-build` job shape.
+  # cross-compile check above). Every non-VPN integration test (tests/e2e_test.rs,
+  # secret_test.rs, vhost_test.rs, transfer_test.rs, udp_test.rs, etc.) plus the
+  # VPN protocol/logic-level tests (relay, hub allocation, broker, routes) need
+  # no elevation: no Command::new of an external binary, no /tmp, no Unix
+  # sockets, no root. This is the Phase 4 (non-VPN parity) hosted e2e tier named
+  # in the plan, mirroring the existing `macos-vpn-build` job shape. Whether the
+  # hosted runner's default process token is ALSO already elevated enough for
+  # real WinTun/host-networking mutation (routes, firewall, NAT, IPEnableRouter)
+  # is a separate, previously-unverified question — answered empirically by the
+  # `windows-vpn-e2e` job below, not assumed here.
   windows-vpn-build:
     name: Windows VPN build + non-VPN parity e2e (windows-latest)
     runs-on: windows-latest
@@ -127,6 +128,71 @@ jobs:
       - run: cargo clippy --features vpn --all-targets -- -D warnings
 
       - run: cargo test --features vpn
+
+      - run: cargo build --features vpn --example windows_vpn_spike
+
+  # T-WIN-SMOKE (Phase 5.4): REAL single-host device tests on windows-latest —
+  # WinTun adapter create/teardown, NetConfig apply/revert (routes, firewall,
+  # WinNAT, IPEnableRouter), SIGKILL stale-reclaim, two-link ip_forward
+  # refcount. Gating (no continue-on-error) so the Windows runtime is actually
+  # exercised, not skipped — if the hosted runner's default process token turns
+  # out to be insufficiently privileged for adapter/host-config mutation, this
+  # job fails loudly and Phase 5.4 falls back to the original plan (self-hosted
+  # admin runner, or the manual acceptance doc docs/vpn/VPN_WINDOWS_ACCEPTANCE.md).
+  # Unlike macOS/Linux there is no `sudo` prefix here: whether that's needed at
+  # all, or the hosted runner is already sufficiently privileged, is exactly
+  # what this job's first real run determines (see diagnostic step).
+  windows-vpn-e2e:
+    name: Windows VPN device e2e (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --features vpn --example windows_vpn_spike
+
+      - name: Fetch wintun.dll (pinned version+hash, see scripts/fetch_wintun.ps1)
+        shell: pwsh
+        run: ./scripts/fetch_wintun.ps1 -Arch amd64 -OutFile target/debug/examples/wintun.dll
+
+      - name: Runner capability diagnostic
+        shell: pwsh
+        run: |
+          Write-Host "## Windows runner capabilities"
+          [System.Environment]::OSVersion | Out-String | Write-Host
+          whoami /groups | Out-String | Write-Host
+          $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Host "Elevated (Administrator role): $isAdmin"
+          Get-Service WinNat -ErrorAction SilentlyContinue | Out-String | Write-Host
+
+      - name: De-risk spike (WinTun + host-config workflow)
+        run: target/debug/examples/windows_vpn_spike.exe spike
+
+      - name: WinTun adapter create / teardown (real device)
+        run: target/debug/examples/windows_vpn_spike.exe create-teardown
+
+      - name: Missing DLL fails cleanly
+        run: target/debug/examples/windows_vpn_spike.exe missing-dll
+
+      - name: Route add / delete (real adapter)
+        run: target/debug/examples/windows_vpn_spike.exe route-add-del
+
+      - name: Gateway apply / RAII revert (firewall + WinNAT + IPEnableRouter)
+        run: target/debug/examples/windows_vpn_spike.exe apply-revert
+
+      - name: Gateway without --forward-accept adds no firewall rules
+        run: target/debug/examples/windows_vpn_spike.exe forward-accept-off-warn
+
+      - name: Two-link ip_forward refcount
+        run: target/debug/examples/windows_vpn_spike.exe two-link-refcount
+
+      - name: SIGKILL stale-reclaim (leak then reclaim)
+        run: |
+          target/debug/examples/windows_vpn_spike.exe leak-then-reclaim leak
+          target/debug/examples/windows_vpn_spike.exe leak-then-reclaim reclaim
 
   macos-vpn-build:
     name: macOS VPN build (macos-14)

@@ -3562,6 +3562,15 @@ pub mod hostcfg_cmd {
             ))
         }
 
+        /// Build PowerShell argv that lists every current network adapter name,
+        /// one per line — used to steer `"auto"` WinTun name resolution away
+        /// from a collision with an already-existing adapter (§1.2 fix).
+        pub fn cmd_get_adapter_names() -> Vec<String> {
+            powershell(
+                "Get-NetAdapter -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name",
+            )
+        }
+
         /// Build PowerShell argv that resolves the egress interface alias for a
         /// remote IPv4 address — the Windows analogue of `ip route get`/macOS
         /// `route -n get`, used to detect the LAN interface for `--forward-accept`.
@@ -3841,6 +3850,13 @@ pub mod hostcfg_cmd {
                     "mtu=1400"
                 ]
             );
+        }
+
+        #[test]
+        fn cmd_windows_get_adapter_names_snapshot() {
+            let argv = windows::cmd_get_adapter_names();
+            assert_eq!(argv[0], "powershell");
+            assert!(argv.iter().any(|a| a.contains("Get-NetAdapter")));
         }
 
         #[test]
@@ -4883,6 +4899,32 @@ pub mod hostcfg {
         Ok((vec![dev], false, resolved_name))
     }
 
+    /// Best-effort snapshot of currently-visible Windows network adapter names,
+    /// used to steer `"auto"` TUN name resolution away from a collision. Unlike
+    /// Linux's `/sys/class/net/<name>` check, this cannot be probed per-candidate
+    /// without an expensive PowerShell round-trip per name, so it queries once and
+    /// checks membership locally. Best-effort/not race-proof (two processes
+    /// launched at the exact same instant can still both resolve to the same
+    /// name — a real risk only with concurrent `bore vpn` invocations racing
+    /// on ONE host, not the common case); a missing/empty result degrades to
+    /// "nothing is taken", matching the pre-fix behavior for a broken PowerShell
+    /// environment rather than failing every launch outright.
+    #[cfg(target_os = "windows")]
+    fn windows_existing_adapter_names() -> HashSet<String> {
+        let argv = hostcfg_cmd::windows::cmd_get_adapter_names();
+        let output = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output();
+        match output {
+            Ok(out) => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
     /// Windows WinTun runtime: create a single-queue, no-offload L3 adapter.
     #[cfg(target_os = "windows")]
     pub async fn create_tun(
@@ -4898,7 +4940,16 @@ pub mod hostcfg {
                 "Windows WinTun: multi-queue unsupported, using 1 queue"
             );
         }
-        let resolved_name = pick_tun_name(name, |_| false)
+        // BUG FIX (found while building the Phase 5.4 e2e spike): this used to
+        // pass `|_| false` — "auto" always resolved to "bore0" regardless of
+        // what adapters already existed, so two `bore vpn` links on one Windows
+        // host silently shared/reconfigured the SAME WinTun adapter instead of
+        // getting independent ones (`open_or_create`'s "open" half masked it —
+        // no error, just a wrong shared adapter). Mirrors Linux's real
+        // `/sys/class/net` existence check, one PowerShell query instead of one
+        // syscall per candidate.
+        let existing = windows_existing_adapter_names();
+        let resolved_name = pick_tun_name(name, |c| existing.contains(c))
             .ok_or_else(|| anyhow!("no free Windows WinTun adapter name available"))?;
         validate_windows_adapter_name(&resolved_name)?;
         let dll_path = bore_wintun::dll_path_from_env_var(std::env::var_os("BORE_WINTUN_DLL"));

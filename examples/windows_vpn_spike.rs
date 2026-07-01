@@ -140,9 +140,12 @@ fn adapter_exists(name: &str) -> bool {
 // visible yet" from "genuinely never created."
 #[cfg(target_os = "windows")]
 fn firewall_rule_count_for_link(id: &str, role: &str) -> usize {
+    // Filters with `Where-Object -like` on the piped objects rather than the
+    // `-DisplayName` param's own (unconfirmed) wildcard support — this is the
+    // exact pattern the diag-firewall investigation proved works.
     for attempt in 0..5 {
         let (ok, stdout, _) = run(&ps(&format!(
-            "(Get-NetFirewallRule -Group 'bore-vpn' -DisplayName 'bore-{id}-{role}-*' -ErrorAction SilentlyContinue | Measure-Object).Count"
+            "(Get-NetFirewallRule -Group 'bore-vpn' -ErrorAction SilentlyContinue | Where-Object {{ $_.DisplayName -like 'bore-{id}-{role}-*' }} | Measure-Object).Count"
         )));
         let count: usize = if ok {
             stdout.trim().parse().unwrap_or(0)

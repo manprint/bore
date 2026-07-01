@@ -6105,7 +6105,23 @@ pub mod hostcfg {
             // Revert in reverse order using blocking std::process::Command.
             // Note: Drop is not async, so we use blocking subprocess calls.
 
-            // First, revert nft/iptables rules in reverse order.
+            // First, revert nft/iptables rules in reverse order. Each command
+            // gets a few quick retries before warning: the windows-vpn-e2e CI
+            // job surfaced a real, narrow Windows quirk here — a firewall rule
+            // created moments earlier (immediately followed by a WinNAT
+            // instance create + IPEnableRouter toggle) can be transiently
+            // unqueryable via Get-NetFirewallRule for the duration of a fast
+            // create-then-immediately-teardown cycle, even though
+            // New-NetFirewallRule/Get-NetFirewallRule work correctly in
+            // isolation (verified directly — see the `windows_vpn_spike
+            // diag-firewall` investigation). The exact network-stack
+            // mechanism wasn't pinned down further (not reproducible in
+            // isolation, only after NAT+ip_forward churn moments before), but
+            // retrying is the right fix either way: a real permanent failure
+            // (e.g. stale nft table already gone) just fails the same way a
+            // few hundred ms later, at negligible teardown-latency cost, while
+            // a transient one now actually succeeds instead of leaking.
+            const REVERT_ATTEMPTS: u32 = 3;
             for (argv, label) in self
                 .revert_cmds
                 .iter()
@@ -6113,19 +6129,26 @@ pub mod hostcfg {
                 .zip(self.revert_labels.iter().rev())
             {
                 tracing::info!(%label, "reverting vpn netconfig");
-                match std::process::Command::new(&argv[0])
-                    .args(&argv[1..])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                {
-                    Err(e) => {
-                        tracing::warn!(%e, %label, "vpn netconfig revert step failed (spawn error)");
+                for attempt in 1..=REVERT_ATTEMPTS {
+                    match std::process::Command::new(&argv[0])
+                        .args(&argv[1..])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                    {
+                        Err(e) => {
+                            tracing::warn!(%e, %label, "vpn netconfig revert step failed (spawn error)");
+                            break;
+                        }
+                        Ok(s) if !s.success() => {
+                            if attempt == REVERT_ATTEMPTS {
+                                tracing::warn!(code=%s, %label, "vpn netconfig revert step exited non-zero");
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_millis(300));
+                            }
+                        }
+                        Ok(_) => break,
                     }
-                    Ok(s) if !s.success() => {
-                        tracing::warn!(code=%s, %label, "vpn netconfig revert step exited non-zero");
-                    }
-                    Ok(_) => {}
                 }
             }
 

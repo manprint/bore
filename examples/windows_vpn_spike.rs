@@ -66,10 +66,12 @@ async fn main() -> anyhow::Result<()> {
         "forward-accept-off-warn" => cmd_forward_accept_off_warn().await,
         "two-link-refcount" => cmd_two_link_refcount().await,
         "leak-then-reclaim" => cmd_leak_then_reclaim().await,
+        "diag-firewall" => cmd_diag_firewall().await,
         _ => {
             eprintln!(
                 "Unknown mode: {}. Use: spike, create-teardown, missing-dll, route-add-del, \
-                 apply-revert, forward-accept-off-warn, two-link-refcount, leak-then-reclaim <leak|reclaim>",
+                 apply-revert, forward-accept-off-warn, two-link-refcount, leak-then-reclaim <leak|reclaim>, \
+                 diag-firewall",
                 mode
             );
             std::process::exit(1);
@@ -669,5 +671,84 @@ async fn cmd_reclaim() -> anyhow::Result<()> {
     }
 
     println!("\n=== RECLAIM OK ===\n");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// diag-firewall: raw investigation (not a pass/fail test) — isolates why
+// New-NetFirewallRule with -InterfaceAlias pointing at a fresh WinTun adapter
+// is unqueryable afterward, even with -ErrorAction SilentlyContinue and
+// -Confirm:$false already applied to the delete side (both already tried and
+// both insufficient per the windows-vpn-e2e log). Prints raw stdout/stderr
+// for each probe instead of asserting anything, so the CI log itself is the
+// diagnostic.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(target_os = "windows")]
+async fn cmd_diag_firewall() -> anyhow::Result<()> {
+    println!("\n=== DIAG: raw firewall rule investigation ===\n");
+
+    let (devs, _, tun_name) =
+        bore_cli::vpn::hostcfg::create_tun("auto", "10.255.255.1".parse()?, 30, 1350, 1).await?;
+    println!("[0] Created adapter: {tun_name}\n");
+
+    println!("[1] Get-NetAdapter full details for {tun_name}:");
+    let (ok, stdout, stderr) = run(&ps(&format!(
+        "Get-NetAdapter -Name '{tun_name}' | Format-List *"
+    )));
+    println!("  ok={ok}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n");
+
+    println!("[2] Get-NetConnectionProfile for {tun_name} (network classification):");
+    let (ok, stdout, stderr) = run(&ps(&format!(
+        "Get-NetConnectionProfile -InterfaceAlias '{tun_name}' | Format-List *"
+    )));
+    println!("  ok={ok}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n");
+
+    println!("[3] New-NetFirewallRule WITH -InterfaceAlias (raw, not via bore's runner):");
+    let (ok, stdout, stderr) = run(&ps(&format!(
+        "New-NetFirewallRule -DisplayName 'diag-with-iface' -Group 'bore-vpn' -Direction Inbound -Action Allow -InterfaceAlias '{tun_name}'"
+    )));
+    println!("  ok={ok}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n");
+
+    println!("[4] Immediately query it back by exact DisplayName:");
+    let (ok, stdout, stderr) = run(&ps(
+        "Get-NetFirewallRule -DisplayName 'diag-with-iface' | Format-List DisplayName,Group,Enabled,Profile,Direction,Action",
+    ));
+    println!("  ok={ok}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n");
+
+    println!("[5] New-NetFirewallRule WITHOUT -InterfaceAlias (isolates the variable):");
+    let (ok, stdout, stderr) = run(&ps(
+        "New-NetFirewallRule -DisplayName 'diag-no-iface' -Group 'bore-vpn' -Direction Inbound -Action Allow",
+    ));
+    println!("  ok={ok}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n");
+
+    println!("[6] Immediately query it back:");
+    let (ok, stdout, stderr) = run(&ps(
+        "Get-NetFirewallRule -DisplayName 'diag-no-iface' | Format-List DisplayName,Group,Enabled,Profile,Direction,Action",
+    ));
+    println!("  ok={ok}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n");
+
+    println!("[7] Broad query: every rule in the bore-vpn group, by ANY means:");
+    let (ok, stdout, stderr) = run(&ps(
+        "Get-NetFirewallRule -Group 'bore-vpn' | Format-List DisplayName,Group,Enabled,Profile,Direction,Action",
+    ));
+    println!("  ok={ok}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n");
+
+    println!("[8] Broadest query: every rule whose DisplayName starts with 'diag':");
+    let (ok, stdout, stderr) = run(&ps(
+        "Get-NetFirewallRule | Where-Object { $_.DisplayName -like 'diag*' } | Format-List DisplayName,Group,Enabled,Profile,Direction,Action",
+    ));
+    println!("  ok={ok}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n");
+
+    println!("[9] Cleanup: delete both diag rules (best-effort, raw):");
+    for name in ["diag-with-iface", "diag-no-iface"] {
+        let (ok, stdout, stderr) = run(&ps(&format!(
+            "Get-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -Confirm:$false"
+        )));
+        println!("  delete {name}: ok={ok} stdout={stdout:?} stderr={stderr:?}");
+    }
+
+    drop(devs);
+    println!("\n=== DIAG DONE (see above — not a pass/fail check) ===\n");
     Ok(())
 }

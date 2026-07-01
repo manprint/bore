@@ -168,6 +168,10 @@ jobs:
           Write-Host "Elevated (Administrator role): $isAdmin"
           Get-Service WinNat -ErrorAction SilentlyContinue | Out-String | Write-Host
 
+      - name: DIAGNOSTIC ONLY - raw firewall rule investigation
+        run: target/debug/examples/windows_vpn_spike.exe diag-firewall
+        continue-on-error: true
+
       - name: De-risk spike (WinTun + host-config workflow)
         run: target/debug/examples/windows_vpn_spike.exe spike
 

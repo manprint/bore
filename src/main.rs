@@ -2313,9 +2313,24 @@ fn init_logging(verbose: u8) {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
-    init_logging(args.verbose);
-    run(args.command)
+    // Windows' default main-thread stack is 1 MiB, versus ~8 MiB on Linux/macOS.
+    // `run` drives the entire application (via #[tokio::main]'s block_on) on
+    // whichever thread calls it; some paths (found via the windows-vpn-build CI
+    // job: `bore transfer sender --stdin`) hold enough state across a deep async
+    // call chain to overflow 1 MiB but not 8 MiB, crashing with
+    // STATUS_STACK_OVERFLOW on Windows only. Running on an explicitly-sized
+    // thread is a no-op on Linux/macOS (already ~8 MiB) and fixes Windows
+    // without needing to hunt down and shrink the exact stack-heavy call chain.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| -> Result<()> {
+            let args = Args::parse();
+            init_logging(args.verbose);
+            run(args.command)
+        })
+        .context("failed to spawn main worker thread")?
+        .join()
+        .map_err(|panic| anyhow::anyhow!("main worker thread panicked: {panic:?}"))?
 }
 
 #[cfg(test)]

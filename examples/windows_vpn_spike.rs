@@ -128,16 +128,31 @@ fn adapter_exists(name: &str) -> bool {
 // group — the CI job runs every mode's spike as a separate process on the
 // SAME host, so firewall rules from an earlier step (or a prior failed run's
 // leak) are otherwise indistinguishable from this step's own rules.
+//
+// Retries briefly: the first windows-vpn-e2e run showed `New-NetFirewallRule`
+// report success while a `Get-NetFirewallRule` query from a freshly-spawned
+// process found nothing for a few seconds afterward — a real propagation
+// lag in the underlying firewall policy store, not a bore bug (nothing in
+// the production apply() path reads back immediately after create; only
+// this diagnostic script's eager check does). Retrying disambiguates "not
+// visible yet" from "genuinely never created."
 #[cfg(target_os = "windows")]
 fn firewall_rule_count_for_link(id: &str, role: &str) -> usize {
-    let (ok, stdout, _) = run(&ps(&format!(
-        "(Get-NetFirewallRule -Group 'bore-vpn' -DisplayName 'bore-{id}-{role}-*' -ErrorAction SilentlyContinue | Measure-Object).Count"
-    )));
-    if ok {
-        stdout.trim().parse().unwrap_or(0)
-    } else {
-        0
+    for attempt in 0..5 {
+        let (ok, stdout, _) = run(&ps(&format!(
+            "(Get-NetFirewallRule -Group 'bore-vpn' -DisplayName 'bore-{id}-{role}-*' -ErrorAction SilentlyContinue | Measure-Object).Count"
+        )));
+        let count: usize = if ok {
+            stdout.trim().parse().unwrap_or(0)
+        } else {
+            0
+        };
+        if count > 0 || attempt == 4 {
+            return count;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
+    0
 }
 
 #[cfg(target_os = "windows")]

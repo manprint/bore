@@ -26,10 +26,35 @@ API facts used by the implementation:
 - `Session::recv(...)`, `Session::send(...)`, and `Session::shutdown(...)` cover packet I/O and shutdown.
 
 Operational policy:
-- `wintun.dll` should be placed next to `bore.exe` or provided through `BORE_WINTUN_DLL`.
+- `wintun.dll` is **bundled in the official release artifacts** (zip and a
+  separate `wintun-<target>.dll` asset), placed next to `bore.exe` so the
+  default DLL search path finds it — no separate download step for users.
+  Building from source still needs it placed next to the binary or provided
+  through `BORE_WINTUN_DLL`. See "WinTun DLL distribution" below.
 - `BORE_WINTUN_DLL` must point to a trusted DLL path.
-- Missing DLL must fail before host networking side effects.
+- Missing DLL must fail before host networking side effects (verified:
+  `windows_vpn_spike missing-dll`, T-WIN-TUN5).
 - Windows VPN requires an elevated shell for adapter creation and host networking changes.
+
+## WinTun DLL distribution (2026-07-01 decision)
+
+Redistributing the official signed `wintun.dll` was chosen over requiring a
+separate user download — WinTun's own site states "the below signed DLLs are
+the only supported way of distributing Wintun", i.e. redistribution of the
+unmodified signed binary is the *expected* path, not merely tolerated.
+
+- Pinned version + zip SHA256 live in `scripts/fetch_wintun.ps1` (currently
+  WinTun `0.14.1`). Bumping the WinTun version means updating both the
+  version string and the hash in that one script.
+- The same script is reused by two callers: the `windows-vpn-e2e` CI job
+  (places `wintun.dll` next to the compiled example so the elevated spike can
+  actually create adapters) and `mean_bean_deploy.yml`'s Windows release job
+  (bundles the correct arch — `amd64` for `x86_64-pc-windows-msvc`, `x86` for
+  `i686-pc-windows-msvc` — into the release zip, and uploads it again as a
+  standalone `wintun-<target>.dll` asset for users who fetch the raw `.exe`).
+- Integrity is checked by comparing the downloaded zip's SHA256 against the
+  pinned value before extracting anything — a mismatch aborts the build/CI
+  step rather than silently shipping an unverified DLL.
 
 ## Implementation status (2026-06-30)
 
@@ -92,11 +117,33 @@ Explicitly NOT implemented (documented gaps, not unverified guesses):
   interface" pattern) is the best structural analogy available without a
   combined in/out-interface match, not a confirmed-working design.
 
+## Implementation status update (2026-07-01)
+
+Added `examples/windows_vpn_spike.rs` (mirrors `macos_vpn_spike.rs`) and a
+`windows-vpn-e2e` CI job on hosted `windows-latest` — the same de-risking
+approach already validated for macOS, applied to determine empirically
+whether GitHub's hosted Windows runner is privileged enough to exercise real
+WinTun/host-config mutation without a self-hosted runner. See
+`docs/plans/plan_WindowsSupport/resume.md` for the current pass/fail result
+of that job (CI-verified only, updated per run).
+
+Building the spike surfaced a real, previously-unknown bug (now fixed):
+`create_tun`'s `"auto"` adapter-name resolution passed a hardcoded
+`|_| false` existence predicate, so it always resolved to `bore0` regardless
+of what adapters already existed on the host. Two concurrent `bore vpn`
+links on one Windows machine would silently share/reconfigure the SAME
+WinTun adapter instead of getting independent ones (`open_or_create`'s "open"
+half masked the collision — no error, just a wrong shared adapter). Fixed by
+querying existing adapter names once via PowerShell before resolving,
+mirroring Linux's real `/sys/class/net` check.
+
 Still required before Windows VPN can be declared complete:
-- Elevated Windows e2e tests (T-WIN-TUN*, T-WIN-HOST*, T-WIN-FWD*, T-WIN-NAT1,
-  T-WIN-VPN-*, T-WIN-HUB*, ...).
 - A real netmap backend decision + implementation (D7 §2.6), or an explicit
   permanent decision to ship Windows VPN without overlapping-subnet support.
 - A real hub spoke-isolation backend (D2), or an explicit decision to ship
   Windows hub mode as "isolation not enforced, use at your own risk."
-- Cross-OS VPN relay/direct/hub/NAT acceptance on real hardware.
+- Cross-OS VPN relay/direct/hub/NAT acceptance on real hardware — **decided
+  2026-07-01: manual acceptance only** (no self-hosted runner, no
+  cross-runner tunnel infra exists). See
+  `docs/vpn/VPN_WINDOWS_ACCEPTANCE.md` for the exact repro commands and
+  result log for every cross-OS row.

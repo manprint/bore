@@ -1,8 +1,8 @@
-# bore VPN — Linux Point-to-Point L3 Tunnel
+# bore VPN — Cross-Platform Point-to-Point L3 Tunnel
 
 ## Concept
 
-`bore vpn` establishes a **point-to-point Layer 3 virtual network interface** between two Linux machines, carrying real IP packets over bore's brokered, NAT-traversing transport. Two peers rendezvous through the server, establish a direct QUIC path when possible, and fall back to a server-relayed encryption layer for maximum availability. The tunnel works equally well for exposing a single host's services to a peer, or for routing entire subnets between two gateways.
+`bore vpn` establishes a **point-to-point Layer 3 virtual network interface** between two machines (Linux, macOS, or Windows, in any combination), carrying real IP packets over bore's brokered, NAT-traversing transport. Two peers rendezvous through the server, establish a direct QUIC path when possible, and fall back to a server-relayed encryption layer for maximum availability. The tunnel works equally well for exposing a single host's services to a peer, or for routing entire subnets between two gateways.
 
 **The load-bearing mental model:** a VPN link is structurally a secret tunnel that carries IP packets instead of a TCP byte-stream.
 
@@ -10,18 +10,24 @@
 
 | Platform | Status | Notes |
 |---|---|---|
-| Linux | ✅ Full (host + gateway mode) | Reference platform; all features |
+| Linux | ✅ Full (host + gateway mode) | Reference platform; all features, netns-validated |
+| macOS (utun) | ✅ Full (host + gateway mode) | PF-based host config (`bore_vpn/<id>` anchor); build + device e2e validated on `macos-14` CI. See [VPN_MACOS.md](VPN_MACOS.md) |
+| Windows (WinTun) | ✅ Host + gateway mode, two gaps | `netsh`/PowerShell-based host config; build + device e2e validated on `windows-latest` CI. Overlapping-subnet netmap (D7) and hub spoke isolation (D2) are NOT implemented (documented gaps, not silent guesses). See [VPN_WINDOWS.md](VPN_WINDOWS.md) |
 | Android (Termux, rooted) | 🔬 Build-checked in CI | Kernel is Linux but `target_os = "android"`; runtime support pending the portability refactor (plan §5.1/§5.4). Requires `tsu` + Termux `iproute2` |
-| macOS (utun) | 📐 Groundwork | `hostcfg_cmd::macos` argv builders + CI cross-check in place; runtime TUN/host-config wiring pending (§5.2) |
-| Windows (wintun) | 📐 Groundwork | `hostcfg_cmd::windows` argv builders + CI cross-check in place; runtime wiring + `wintun.dll` handling pending (§5.3) |
 
-Non-Linux targets are planned as **host-only mode** (no `--advertise`, no
-NAT/forwarding/MSS-clamp): gateway mode needs a per-OS NAT engine and stays
-Linux-only (DEC-8).
+Cross-OS two-machine scenarios (any Linux/macOS/Windows pairing) are
+**manual-acceptance only** — see
+[VPN_WINDOWS_ACCEPTANCE.md](VPN_WINDOWS_ACCEPTANCE.md) and
+[VPN_MACOS_ACCEPTANCE.md](VPN_MACOS_ACCEPTANCE.md) for exact repro commands;
+no CI rig exists for real two-machine networking (no self-hosted runner, no
+cross-runner tunnel infra).
 
 ### Requirements
 
-- **Operating system:** Linux only (kernel TUN/TAP support required)
+- **Operating system:** Linux (kernel TUN/TAP), macOS (13+, Apple Silicon),
+  or Windows (10/11, WinTun) — the commands below use Linux syntax
+  (`ip`/`nft`) unless noted; see the platform-specific docs above for the
+  macOS/Windows equivalents
 - **Privilege:** root or `CAP_NET_ADMIN` (to manage network interfaces and routes)
 - **Build:** `cargo build --release --features vpn`
 - **Server:** must be started with `--vpn` flag and have a pool configured (`--vpn-pool <CIDR>`)

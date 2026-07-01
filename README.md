@@ -498,10 +498,16 @@ Notes:
 
 - **Requires the `udp` feature**, which is **on by default**. Build
   `--no-default-features` to drop it (and the `quinn` dependency).
-- **VPN (Linux + macOS)** — point-to-point L3 tunnel; build with `--features vpn`.
-  Feature-complete and netns-validated on Linux; runs on macOS (Apple Silicon,
-  macOS 13+, requires `sudo`/root) with the same data plane — build + device e2e
-  validated on the `macos-14` CI runner. Windows is deferred.
+- **VPN (Linux + macOS + Windows)** — point-to-point L3 tunnel; build with
+  `--features vpn`. Feature-complete and netns-validated on Linux; runs on
+  macOS (Apple Silicon, macOS 13+, requires `sudo`/root) with the same data
+  plane — build + device e2e validated on the `macos-14` CI runner. Runs on
+  Windows (10/11, requires an elevated shell) via WinTun — build + device e2e
+  validated on the `windows-latest` CI runner; overlapping-subnet netmap and
+  hub spoke isolation are not yet implemented on Windows (see
+  [docs/vpn/VPN_WINDOWS.md](docs/vpn/VPN_WINDOWS.md)); cross-OS two-machine
+  scenarios are manual-acceptance only (no self-hosted runner), see
+  [docs/vpn/VPN_WINDOWS_ACCEPTANCE.md](docs/vpn/VPN_WINDOWS_ACCEPTANCE.md).
   Direct-path throughput: a single QUIC flow is bounded by `socket buffer / RTT`.
   bore requests 16 MiB UDP buffers and, running with `CAP_NET_ADMIN`, **forces past**
   the `net.core.{w,r}mem_max` clamp (`SO_*BUFFORCE`) so a stock 208 KiB ceiling
@@ -927,16 +933,18 @@ Paired mode also accepts `--upnp`, `--try-port-prediction`,
 `--nat-udp-preferred-port`, `--stun-server`, and `--insecure`, mirroring the
 direct-path options used by `local`/`proxy`.
 
-## VPN — Point-to-Point L3 Tunnel (Linux + macOS)
+## VPN — Point-to-Point L3 Tunnel (Linux + macOS + Windows)
 
-`bore vpn` establishes a **point-to-point Layer 3 virtual network interface** between two machines, carrying real IP traffic over bore's NAT-traversing transport. Runs on **Linux** and **macOS** (Apple Silicon, macOS 13+); the data plane is identical, only the host edge (TUN device + routes/NAT) differs. Requires **root** (`CAP_NET_ADMIN` on Linux; `sudo` on macOS), built with `--features vpn`.
+`bore vpn` establishes a **point-to-point Layer 3 virtual network interface** between two machines, carrying real IP traffic over bore's NAT-traversing transport. Runs on **Linux**, **macOS** (Apple Silicon, macOS 13+), and **Windows** (10/11, x86_64/i686); the data plane is identical, only the host edge (TUN/WinTun device + routes/NAT) differs. Requires **root** (`CAP_NET_ADMIN` on Linux; `sudo` on macOS; an elevated/Administrator shell on Windows), built with `--features vpn`.
 
 On macOS the kernel assigns the interface name (`utunN`) so `--tun-name` is advisory; `--tun-queues > 1` and the UDP hole-punch helper flags (`--upnp`/`--stun-server`/`--try-port-prediction`/`--nat-udp-*`) warn and are ignored/advisory (utun has no multi-queue/offload). Host config uses a per-link PF anchor `bore_vpn/<id>` + `sysctl net.inet.ip.forwarding` instead of nft/iptables. See [docs/vpn/VPN_MACOS.md](docs/vpn/VPN_MACOS.md).
 
+On Windows the TUN device is [WinTun](https://www.wintun.net/) (`wintun.dll`, bundled in the release download); `--tun-queues > 1` warns and is ignored (WinTun has no multi-queue). Host config uses `netsh`/PowerShell (`New-NetFirewallRule`, `New-NetNat`, the `IPEnableRouter` registry value) instead of nft/iptables/PF. Overlapping-subnet `real@virtual` netmap and hub-mode spoke isolation are not yet implemented on Windows (documented gaps, not silent guesses). See [docs/vpn/VPN_WINDOWS.md](docs/vpn/VPN_WINDOWS.md) and the manual two-host acceptance checklist [docs/vpn/VPN_WINDOWS_ACCEPTANCE.md](docs/vpn/VPN_WINDOWS_ACCEPTANCE.md).
+
 ### Requirements
 
-- **Linux** (kernel TUN/TAP) or **macOS** (Apple Silicon, macOS 13+; utun + PF)
-- **Root** (`CAP_NET_ADMIN` on Linux; `sudo` on macOS)
+- **Linux** (kernel TUN/TAP), **macOS** (Apple Silicon, macOS 13+; utun + PF), or **Windows** (10/11; WinTun)
+- **Root** (`CAP_NET_ADMIN` on Linux; `sudo` on macOS; elevated shell on Windows)
 - Build: `cargo build --release --features vpn`
 - **Server:** started with `--vpn --vpn-pool <CIDR>`
 - **Shared secret:** `--secret` mandatory (required for E2E encryption on the relay fallback path)

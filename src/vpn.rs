@@ -4910,8 +4910,8 @@ pub mod hostcfg {
     /// "nothing is taken", matching the pre-fix behavior for a broken PowerShell
     /// environment rather than failing every launch outright.
     #[cfg(target_os = "windows")]
-    fn windows_existing_adapter_names() -> HashSet<String> {
-        let argv = hostcfg_cmd::windows::cmd_get_adapter_names();
+    fn windows_existing_adapter_names() -> std::collections::HashSet<String> {
+        let argv = super::hostcfg_cmd::windows::cmd_get_adapter_names();
         let output = std::process::Command::new(&argv[0])
             .args(&argv[1..])
             .output();
@@ -4921,7 +4921,7 @@ pub mod hostcfg {
                 .map(|l| l.trim().to_string())
                 .filter(|l| !l.is_empty())
                 .collect(),
-            Err(_) => HashSet::new(),
+            Err(_) => std::collections::HashSet::new(),
         }
     }
 

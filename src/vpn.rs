@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 /// Platform TUN device handle used by the VPN bridge.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
 pub type TunDevice = tun_rs::AsyncDevice;
 
 /// Platform TUN device handle used by the VPN bridge.
@@ -1485,6 +1485,14 @@ fn pmtu_link_set_mtu_argv(tun_name: &str, mtu: u16) -> Vec<String> {
 #[cfg(target_os = "macos")]
 fn pmtu_link_set_mtu_argv(tun_name: &str, mtu: u16) -> Vec<String> {
     hostcfg_cmd::macos::cmd_link_set_mtu(tun_name, mtu)
+}
+
+// Android's toybox `ip` applet accepts the identical `ip link set <dev> mtu
+// <mtu>` grammar as Linux iproute2, so this reuses the Linux (top-level,
+// un-gated) builder verbatim rather than duplicating it in `hostcfg_cmd::android`.
+#[cfg(target_os = "android")]
+fn pmtu_link_set_mtu_argv(tun_name: &str, mtu: u16) -> Vec<String> {
+    hostcfg_cmd::cmd_link_set_mtu(tun_name, mtu)
 }
 
 #[cfg(target_os = "windows")]
@@ -3387,6 +3395,79 @@ pub mod hostcfg_cmd {
         }
     }
 
+    /// Android argv builders (phase 3, host-only mode). Toybox's `ip` applet
+    /// supports the same basic `route add`/`route del`/`link set` grammar as
+    /// Linux iproute2 but NOT `route replace` — unlike the Linux twin's
+    /// idempotent `replace`, android must use `add`.
+    pub mod android {
+        /// Build `ip route add <subnet> dev <dev>` argv.
+        pub fn cmd_route_add(subnet: &str, dev: &str) -> Vec<String> {
+            vec![
+                "ip".into(),
+                "route".into(),
+                "add".into(),
+                subnet.into(),
+                "dev".into(),
+                dev.into(),
+            ]
+        }
+
+        /// Build `ip route del <subnet> dev <dev>` argv.
+        pub fn cmd_route_del(subnet: &str, dev: &str) -> Vec<String> {
+            vec![
+                "ip".into(),
+                "route".into(),
+                "del".into(),
+                subnet.into(),
+                "dev".into(),
+                dev.into(),
+            ]
+        }
+
+        /// Pure argv builder for the android `NetConfig::apply` body
+        /// (host-only: no ip_forward/nft/iptables/PF — one `ip route add` per
+        /// accepted peer route, mirroring the route-only half of the
+        /// Linux/macOS twins). Un-gated so the Linux CI host can unit-test it
+        /// without an android target.
+        pub fn android_apply_cmds(tun_name: &str, peer_routes: &[String]) -> Vec<Vec<String>> {
+            peer_routes
+                .iter()
+                .map(|subnet| cmd_route_add(subnet, tun_name))
+                .collect()
+        }
+
+        /// Inverse of `android_apply_cmds`, in LIFO revert order.
+        pub fn android_revert_cmds(tun_name: &str, peer_routes: &[String]) -> Vec<Vec<String>> {
+            peer_routes
+                .iter()
+                .rev()
+                .map(|subnet| cmd_route_del(subnet, tun_name))
+                .collect()
+        }
+
+        /// Defense-in-depth guard for the android `NetConfig::apply` body
+        /// (D-A4/D-A6/D-A9): android VPN is host-only, so any gateway option
+        /// is rejected here too — the primary gate is the 3.3 CLI guard
+        /// matrix. Pure/un-gated so the Linux host can unit-test the guard
+        /// logic itself (`apply` is `#[cfg(target_os = "android")]`-only and
+        /// cannot be called on a Linux test binary).
+        pub fn check_host_only(
+            advertised_empty: bool,
+            nat_maps_empty: bool,
+            hub: bool,
+            nat_masquerade: bool,
+            forward_accept: bool,
+        ) -> anyhow::Result<()> {
+            if !advertised_empty || !nat_maps_empty || hub || nat_masquerade || forward_accept {
+                anyhow::bail!(
+                    "android VPN is host-only: --advertise/--nat-masquerade/\
+                     --forward-accept/hub mode are not supported (D-A4/D-A6/D-A9)"
+                );
+            }
+            Ok(())
+        }
+    }
+
     /// Windows argv builders (E6 groundwork, host-only mode). `netsh`/PowerShell
     /// are represented as argv vectors so user-controlled fields never get shell-
     /// concatenated by bore.
@@ -4715,6 +4796,51 @@ pub mod hostcfg {
         ));
     }
 
+    /// Pure core of Android stale-reclaim, parameterized by `dir` so the Linux
+    /// CI host can exercise it without an android target. Android VPN scope is
+    /// host-only (D-A4/D-A6/D-A9: no `--advertise`, no `--forward-accept`, no
+    /// gateway mode), so unlike Linux/macOS/Windows a host-only link never
+    /// creates an ip_forward value, a fwdref refcount marker, or nft/iptables
+    /// state — there is nothing to restore or tear down beyond the (id,
+    /// role)-keyed marker files themselves. Reuses `sanitize_run_key`/
+    /// `fwdref_prefix` (shared, un-gated) purely for filename computation, NOT
+    /// for any of the Linux/macOS restore/refcount logic. Returns the paths
+    /// actually removed, for unit-test assertions.
+    fn android_stale_reclaim_in(dir: &str, id: &str, role: &str) -> Vec<std::path::PathBuf> {
+        let ipforward = std::path::PathBuf::from(format!(
+            "{}/bore-vpn-{}-{}.ipforward",
+            dir,
+            sanitize_run_key(id),
+            sanitize_run_key(role)
+        ));
+        let fwdref = std::path::PathBuf::from(format!(
+            "{}/{}{}-{}.fwdref",
+            dir,
+            fwdref_prefix(),
+            sanitize_run_key(id),
+            sanitize_run_key(role)
+        ));
+        let mut removed = Vec::new();
+        for path in [ipforward, fwdref] {
+            if std::fs::remove_file(&path).is_ok() {
+                tracing::info!(
+                    path = %path.display(),
+                    "stale_reclaim: removed leaked android state file"
+                );
+                removed.push(path);
+            }
+        }
+        removed
+    }
+
+    /// Android stale-reclaim (phase 3, D-A4/D-A6/D-A9): host-only scope means
+    /// there is no ip_forward/fwdref/firewall state to restore — just point the
+    /// pure, testable `android_stale_reclaim_in` at the real `run_dir()`.
+    #[cfg(target_os = "android")]
+    pub async fn stale_reclaim(id: &str, role: &str) {
+        let _ = android_stale_reclaim_in(run_dir(), id, role);
+    }
+
     /// Windows stale-reclaim (§2.8): recover from a SIGKILLed previous run.
     /// Routes are NOT explicitly removed here — like Linux/macOS, they are bound
     /// to the WinTun adapter, which the OS reclaims when the owning process dies
@@ -4936,6 +5062,53 @@ pub mod hostcfg {
         Ok((vec![dev], false, resolved_name))
     }
 
+    /// Android TUN runtime (phase 3 compile port): create a single-queue,
+    /// no-offload TUN device. Android's kernel is Linux, so `/sys/class/net`
+    /// is a valid existence check for `pick_tun_name` — reused verbatim from
+    /// the Linux twin. Unlike macOS (where the name is only advisory and the
+    /// kernel assigns `utunN`), Android accepts an explicit interface name, so
+    /// the resolved name is requested from the builder directly. No GSO/GRO
+    /// offload and no retry-on-race loop (I-M4-style single-packet path):
+    /// `queues > 1` is refused earlier by the 3.3 CLI guard and can never
+    /// reach here — `debug_assert!` catches a future call-site regression.
+    /// Whether tun-rs's documented android `DeviceBuilder` API matches this
+    /// exactly is UNVERIFIED until the phase 4 spike.
+    // verified by android_vpn_spike (phase 4)
+    #[cfg(target_os = "android")]
+    pub async fn create_tun(
+        name: &str,
+        addr: Ipv4Addr,
+        prefix: u8,
+        mtu: u16,
+        queues: usize,
+    ) -> anyhow::Result<(Vec<TunDevice>, bool, String)> {
+        debug_assert!(
+            queues <= 1,
+            "android TUN is single-queue (enforced by the 3.3 CLI guard)"
+        );
+
+        let resolved_name = pick_tun_name(name, |c| {
+            std::path::Path::new(&format!("/sys/class/net/{c}")).exists()
+        })
+        .ok_or_else(|| anyhow!("TUN name resolution failed for '{name}'"))?;
+
+        let dev = tun_rs::DeviceBuilder::new()
+            .name(&resolved_name)
+            .ipv4(addr, prefix, None)
+            .mtu(mtu)
+            .build_async()
+            .context("failed to create Android TUN device")?;
+
+        let actual_name = dev
+            .name()
+            .context("failed to read back Android TUN interface name")?;
+
+        tracing::info!(%actual_name, "Android TUN created (single queue, no offload)");
+
+        // offload is always false on Android ⇒ bridge single-packet path (I-M3).
+        Ok((vec![dev], false, actual_name))
+    }
+
     /// Best-effort snapshot of currently-visible Windows network adapter names,
     /// used to steer `"auto"` TUN name resolution away from a collision. Unlike
     /// Linux's `/sys/class/net/<name>` check, this cannot be probed per-candidate
@@ -5128,6 +5301,13 @@ pub mod hostcfg {
     #[cfg(target_os = "macos")]
     fn run_dir() -> &'static str {
         "/var/run"
+    }
+    /// Android has no writable `/run`/`/var/run` (SELinux + app-sandboxed
+    /// filesystem); `/data/local/tmp` is the standard root-shell-writable
+    /// scratch area (D-A8).
+    #[cfg(target_os = "android")]
+    fn run_dir() -> &'static str {
+        "/data/local/tmp"
     }
     #[cfg(target_os = "windows")]
     fn run_dir() -> &'static str {
@@ -5403,6 +5583,82 @@ pub mod hostcfg {
                 cfg.revert_labels
                     .push(format!("pfctl flush anchor bore_vpn/{id}"));
             }
+
+            Ok(cfg)
+        }
+
+        /// Android `NetConfig::apply` (phase 3, D-A4/D-A6/D-A9): host-only
+        /// body. Gateway options non-empty → `bail!` (defense in depth; the
+        /// primary gate is the 3.3 CLI guard matrix). No ip_forward, no
+        /// nft/iptables, no PF — only routes to accepted peer subnets via the
+        /// tun, using the toybox-compatible `ip` argv from
+        /// `hostcfg_cmd::android` (un-gated, unit-tested on the Linux host).
+        #[allow(clippy::too_many_arguments)]
+        #[cfg(target_os = "android")]
+        pub async fn apply<R: CommandRunner>(
+            runner: &R,
+            id: &str,
+            role: &str,
+            tun_name: &str,
+            assigned: std::net::Ipv4Addr,
+            prefix: u8,
+            peer_routes: &[crate::shared::Ipv4Net],
+            advertised: &[crate::shared::Ipv4Net],
+            nat_maps: &[(crate::shared::Ipv4Net, crate::shared::Ipv4Net)],
+            no_route_manage: bool,
+            hub: bool,
+            nat_masquerade: bool,
+            forward_accept: bool,
+        ) -> anyhow::Result<Self> {
+            use super::hostcfg_cmd::android;
+
+            android::check_host_only(
+                advertised.is_empty(),
+                nat_maps.is_empty(),
+                hub,
+                nat_masquerade,
+                forward_accept,
+            )?;
+
+            // The overlay address/prefix are configured on the TUN by
+            // `create_tun` via `DeviceBuilder::ipv4` (same as Linux/macOS);
+            // apply only manages routes here.
+            let _ = (assigned, prefix);
+
+            let mut cfg = NetConfig {
+                id: id.to_string(),
+                role: role.to_string(),
+                tun_name: tun_name.to_string(),
+                no_route_manage,
+                nft_available: false,
+                revert_cmds: Vec::new(),
+                revert_labels: Vec::new(),
+                ip_forward_saved: None,
+                applied_ops: Vec::new(),
+            };
+
+            if !no_route_manage {
+                for net in peer_routes {
+                    let subnet = net.to_string();
+                    let argv = android::cmd_route_add(&subnet, tun_name);
+                    match runner.run(&argv).await {
+                        Ok(_) => {
+                            cfg.revert_cmds
+                                .push(android::cmd_route_del(&subnet, tun_name));
+                            cfg.revert_labels.push(format!("route del {subnet}"));
+                        }
+                        Err(e) => tracing::warn!(error = %e, %subnet, "android route add failed"),
+                    }
+                }
+            }
+
+            tracing::info!(
+                id,
+                role,
+                tun_name,
+                peer_route_count = peer_routes.len(),
+                "android VPN host-only route table applied"
+            );
 
             Ok(cfg)
         }
@@ -6290,6 +6546,17 @@ pub mod hostcfg {
             let _ = std::fs::remove_file(ipforward_orig_path());
         }
 
+        /// Android twin: android VPN is host-only (D-A4/D-A6/D-A9) and its
+        /// `apply` never enables ip_forward, so `AppliedOp::IpForward` is
+        /// never pushed onto `applied_ops` and this is never reached at
+        /// runtime — `unreachable!` catches a future regression at the call
+        /// site instead of silently no-op-ing (mirrors the offload-pump
+        /// `unreachable!` twins in phase 3.1).
+        #[cfg(target_os = "android")]
+        fn restore_ip_forward_op(&self, _saved_value: u8) {
+            unreachable!("android VPN never enables ip_forward (host-only, D-A4)")
+        }
+
         /// Windows twin: restore IP forwarding with refcount-aware state markers.
         #[cfg(target_os = "windows")]
         fn restore_ip_forward_op(&self, saved_value: u8) {
@@ -7082,6 +7349,102 @@ pub mod hostcfg {
             assert!(!other_fwdref_present_with_prefix(&dir, &mine, pfx));
 
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // Android hostcfg unit tests (phase 3.2): the real `create_tun`/`apply`/
+    // `stale_reclaim` twins are `#[cfg(target_os = "android")]`-only and cannot
+    // run on a Linux test binary, so this exercises the pure, un-gated argv
+    // builders and guard logic those twins are thin executors around — the
+    // pattern the phase 3 plan calls out explicitly so the logic is still
+    // verified on the Linux CI host.
+    #[cfg(test)]
+    mod android_hostcfg_tests {
+        use super::super::hostcfg_cmd::android;
+        use super::*;
+
+        fn sv(items: &[&str]) -> Vec<String> {
+            items.iter().map(|s| s.to_string()).collect()
+        }
+
+        #[test]
+        fn android_apply_builds_expected_argv() {
+            let routes = vec!["10.10.0.0/24".to_string(), "10.20.0.0/24".to_string()];
+
+            let apply_cmds = android::android_apply_cmds("bore0", &routes);
+            assert_eq!(
+                apply_cmds,
+                vec![
+                    sv(&["ip", "route", "add", "10.10.0.0/24", "dev", "bore0"]),
+                    sv(&["ip", "route", "add", "10.20.0.0/24", "dev", "bore0"]),
+                ]
+            );
+
+            // Revert stack is the exact inverse, LIFO order.
+            let revert_cmds = android::android_revert_cmds("bore0", &routes);
+            assert_eq!(
+                revert_cmds,
+                vec![
+                    sv(&["ip", "route", "del", "10.20.0.0/24", "dev", "bore0"]),
+                    sv(&["ip", "route", "del", "10.10.0.0/24", "dev", "bore0"]),
+                ]
+            );
+        }
+
+        #[test]
+        fn android_apply_rejects_gateway_inputs() {
+            // No gateway options requested → Ok.
+            assert!(android::check_host_only(true, true, false, false, false).is_ok());
+
+            // Each gateway-only option independently trips the guard, with a
+            // "host-only" error message (defense in depth; 3.3 is the primary gate).
+            let cases = [
+                (false, true, false, false, false), // non-empty advertise
+                (true, false, false, false, false), // non-empty nat_maps
+                (true, true, true, false, false),   // hub mode
+                (true, true, false, true, false),   // nat-masquerade
+                (true, true, false, false, true),   // forward-accept
+            ];
+            for (advertised_empty, nat_maps_empty, hub, nat_masquerade, forward_accept) in cases {
+                let err = android::check_host_only(
+                    advertised_empty,
+                    nat_maps_empty,
+                    hub,
+                    nat_masquerade,
+                    forward_accept,
+                )
+                .unwrap_err();
+                assert!(
+                    err.to_string().contains("host-only"),
+                    "unexpected error message: {err}"
+                );
+            }
+        }
+
+        #[test]
+        fn android_stale_reclaim_removes_leaked_state() {
+            let dir = tempfile::tempdir().unwrap();
+            let dir_path = dir.path().to_str().unwrap();
+
+            let ipforward_marker = dir.path().join("bore-vpn-test0-listen.ipforward");
+            // Prefixed via the live `fwdref_prefix()` (netns-scoped on Linux,
+            // always `ns0` on the real android runtime target) so this test
+            // is correct regardless of which host it runs on.
+            let fwdref_marker = dir
+                .path()
+                .join(format!("{}test0-listen.fwdref", fwdref_prefix()));
+            std::fs::write(&ipforward_marker, "1").unwrap();
+            std::fs::write(&fwdref_marker, "").unwrap();
+            // A file for a different (id, role) must survive untouched.
+            let unrelated = dir.path().join("bore-vpn-other-connect.ipforward");
+            std::fs::write(&unrelated, "1").unwrap();
+
+            let removed = android_stale_reclaim_in(dir_path, "test0", "listen");
+
+            assert_eq!(removed.len(), 2);
+            assert!(!ipforward_marker.exists());
+            assert!(!fwdref_marker.exists());
+            assert!(unrelated.exists());
         }
     }
 }

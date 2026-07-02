@@ -31,7 +31,13 @@ BORE_ANDROID_BIN="${BORE_ANDROID_BIN:?set BORE_ANDROID_BIN to the x86_64-linux-a
 
 DEV_BORE="/data/local/tmp/bore"
 DEV_INBOX="/data/local/tmp/inbox"
+# 10.0.2.2 is the emulator's NAT alias for "the host machine" — only valid
+# when dialed FROM the guest. Any bore process launched on the HOST side
+# (transfer sender, proxy) must reach the host's own server via loopback
+# instead, since 10.0.2.2 is not a meaningful address from the host's own
+# network namespace (T-AND-E2/E3 timed out against it before this fix).
 HOST_TO="10.0.2.2"
+HOST_LOOPBACK="127.0.0.1"
 
 # ── Guards ──────────────────────────────────────────────────────────────────
 if [ ! -x "$BORE_HOST_BIN" ]; then
@@ -157,7 +163,7 @@ head -c 8388608 /dev/urandom >"$SRC_FILE"
 SRC_SIZE=$(stat -c %s "$SRC_FILE" 2>/dev/null || wc -c <"$SRC_FILE")
 
 if "$BORE_HOST_BIN" transfer sender --sources "$SRC_FILE" \
-    --to "$HOST_TO" --transfer-id T_AND_E2 \
+    --to "$HOST_LOOPBACK" --transfer-id T_AND_E2 \
     >"$TMPDIR/e2_sender.log" 2>&1; then
     DEST_SIZE="$(adb shell "stat -c %s $DEV_INBOX/e2_src.bin" 2>/dev/null | tr -d '\r\n')"
     if [ "$DEST_SIZE" = "$SRC_SIZE" ]; then
@@ -176,7 +182,7 @@ guest_bore_bg "e3.log" local 8080 --to "$HOST_TO" --tcp-secret-id T_AND_E3
 sleep 1
 guest_http_responder 8080
 sleep 1
-BODY="$("$BORE_HOST_BIN" proxy --to "$HOST_TO" --tcp-secret-id T_AND_E3 \
+BODY="$("$BORE_HOST_BIN" proxy --to "$HOST_LOOPBACK" --tcp-secret-id T_AND_E3 \
     --local-proxy-port ":40031" >"$TMPDIR/e3_proxy.log" 2>&1 &
     E3_PID=$!
     sleep 1.5

@@ -2,7 +2,7 @@
 
 > Machine-readable. Implementer: update after EVERY sub-phase. Keep terse.
 
-**Next:** phase_02.md sub-phase 2.3 round 3 (pushed b1854aa, CI run in flight); phase 2 done once android-emu-e2e green 2x consecutive
+**Next:** Phase 2 DONE (android-emu-e2e green 2x consecutive: runs 28617339653 initial + rerun). Starting phase_03.md sub-phase 3.1
 
 > **Model note:** per explicit user instruction, every "Opus" role in the
 > original plan (architect / review-gate / final-read) is executed by
@@ -17,7 +17,7 @@
 | 1 | 1.3 Justfile android-x86_64 + API pin | Haiku | DONE | commit 040f920; API 24 already consistent |
 | 2 | 2.1 scripts/android_emu_test.sh | Sonnet | DONE | commit 762f383; shellcheck-clean via docker koalaman/shellcheck; deviated from literal spec on T-AND-E2 (transfer uses built-in --to/--transfer-id rendezvous, not wrapped in bore local — matches actual Sender/Listener CLI) |
 | 2 | 2.2 CI job android-emu-e2e | Sonnet | DONE | commit de782e9 |
-| 2 | 2.3 portability fixes (contingency) | Sonnet | DONE (code) | round 1 commit cc05bda: cargo-ndk `-p`→`-P` flag fix (run 28615734964 failed, "unknown package: 24"). round 2 commit 2f2c949: build succeeded this time (E1/E4/E5 passed) but T-AND-E2 (transfer sender) and T-AND-E3 (proxy) failed — both run on the HOST but dialed `--to 10.0.2.2`, the emulator's guest-only NAT alias for the host; meaningless from the host's own netns → connect timeout (E2) / empty body (E3). Fixed: host-launched processes now dial 127.0.0.1. round 3 commit b1854aa: E1-E5 all passed; script then died with generic exit-1 before ever printing an E6 result — `E6_OUT="$(...)"; E6_STATUS=$?` is the classic `set -e` gotcha (bore server's expected nonzero exit aborted the script on the assignment line, before `$?` was ever read). Fixed via `|| E6_STATUS=$?` form. Awaiting CI run for green confirmation (still need 2 consecutive) |
+| 2 | 2.3 portability fixes (contingency) | Sonnet | DONE | round 1 commit cc05bda: cargo-ndk `-p`→`-P` flag fix (run 28615734964 failed, "unknown package: 24"). round 2 commit 2f2c949: build succeeded this time (E1/E4/E5 passed) but T-AND-E2 (transfer sender) and T-AND-E3 (proxy) failed — both run on the HOST but dialed `--to 10.0.2.2`, the emulator's guest-only NAT alias for the host; meaningless from the host's own netns → connect timeout (E2) / empty body (E3). Fixed: host-launched processes now dial 127.0.0.1. round 3 commit b1854aa: E1-E5 all passed; script then died with generic exit-1 before ever printing an E6 result — `E6_OUT="$(...)"; E6_STATUS=$?` is the classic `set -e` gotcha (bore server's expected nonzero exit aborted the script on the assignment line, before `$?` was ever read). Fixed via `|| E6_STATUS=$?` form. CONFIRMED GREEN 2x consecutive: run 28617339653 initial pass + `gh run rerun` pass — flake-check satisfied. Phase 2 DONE |
 | 3 | 3.1 gate flips + shared joins | Sonnet + Sonnet 5 review gate | TODO | |
 | 3 | 3.2 android twins (tun/run_dir/apply/reclaim) | Sonnet | TODO | |
 | 3 | 3.3 host-only CLI guard matrix | Sonnet + Sonnet 5 review gate | TODO | |
@@ -35,8 +35,8 @@
 |----|------|-------|--------|
 | T-AND-B1, B2 | build matrix (targets, clippy) | 1 | PENDING CI (pushed, awaiting run) |
 | T-AND-B3 | `just android-x86_64` local build | 1 | BLOCKED — dev box has no NDK/cargo-ndk installed; covered indirectly by CI's cargo-ndk legs (B1/B2) instead |
-| T-AND-E1..E6 | non-VPN emulator e2e | 2 | TODO |
-| T-AND-E-CI | android-emu-e2e job green | 2 | TODO |
+| T-AND-E1..E6 | non-VPN emulator e2e | 2 | PASS (run 28617339653 x2) |
+| T-AND-E-CI | android-emu-e2e job green | 2 | PASS 2x consecutive (28617339653 initial + rerun) |
 | unit: android_apply_builds_expected_argv | apply argv + revert LIFO | 3 | TODO |
 | unit: android_apply_rejects_gateway_inputs | defense in depth | 3 | TODO |
 | unit: android_stale_reclaim_removes_leaked_state | reclaim | 3 | TODO |

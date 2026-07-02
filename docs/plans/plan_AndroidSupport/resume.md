@@ -2,7 +2,7 @@
 
 > Machine-readable. Implementer: update after EVERY sub-phase. Keep terse.
 
-**Next:** phase_02.md sub-phase 2.2 (pushed de782e9, CI run 28615734964 in flight)
+**Next:** phase_02.md sub-phase 2.3 verify (pushed cc05bda, CI run 28616082339 in flight); phase 2 done once green
 
 > **Model note:** per explicit user instruction, every "Opus" role in the
 > original plan (architect / review-gate / final-read) is executed by
@@ -16,8 +16,8 @@
 | 1 | 1.2 check → clippy -D warnings | Haiku | DONE | commit b954935 |
 | 1 | 1.3 Justfile android-x86_64 + API pin | Haiku | DONE | commit 040f920; API 24 already consistent |
 | 2 | 2.1 scripts/android_emu_test.sh | Sonnet | DONE | commit 762f383; shellcheck-clean via docker koalaman/shellcheck; deviated from literal spec on T-AND-E2 (transfer uses built-in --to/--transfer-id rendezvous, not wrapped in bore local — matches actual Sender/Listener CLI) |
-| 2 | 2.2 CI job android-emu-e2e | Sonnet | DONE (code) | commit de782e9; awaiting CI run 28615734964 for T-AND-E-CI green confirmation |
-| 2 | 2.3 portability fixes (contingency) | Sonnet | TODO | |
+| 2 | 2.2 CI job android-emu-e2e | Sonnet | DONE | commit de782e9 |
+| 2 | 2.3 portability fixes (contingency) | Sonnet | DONE (code) | commit cc05bda; run 28615734964's android-emu-e2e job failed: cargo-ndk panicked "unknown package: 24" — `-p` is cargo's own --package flag, forwarded through; the real platform/API-level flag is `-P`/`--platform`. Fixed in Justfile's android-x86_64 recipe (phase 1.3, never actually executed before — only dry-run verified) and the new android-emu-e2e job; also pinned ANDROID_API=24 on vpn-cross-build's clippy step (previously ran unpinned at cargo-ndk's default 21). Awaiting CI run 28616082339 for green confirmation |
 | 3 | 3.1 gate flips + shared joins | Sonnet + Sonnet 5 review gate | TODO | |
 | 3 | 3.2 android twins (tun/run_dir/apply/reclaim) | Sonnet | TODO | |
 | 3 | 3.3 host-only CLI guard matrix | Sonnet + Sonnet 5 review gate | TODO | |

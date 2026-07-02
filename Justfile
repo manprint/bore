@@ -95,7 +95,7 @@ android-arm64: _builder
 # requires a local NDK + `cargo install cargo-ndk`). Used for local dev-box
 # builds and by CI to produce the binary pushed to the Android emulator.
 android-x86_64:
-    cargo ndk -t x86_64 -p {{android_api}} build --release
+    cargo ndk -t x86_64 -P {{android_api}} build --release
 
 # Build all architecture binaries (Linux amd64/arm64, macOS, Windows, Android).
 build: build-amd64 build-arm64 macos-m5 windows-amd64 android-arm64

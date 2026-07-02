@@ -2,7 +2,7 @@
 
 > Machine-readable. Implementer: update after EVERY sub-phase. Keep terse.
 
-**Next:** phase_03.md sub-phase 3.4 (regression sweep + CLAUDE.md note)
+**Next:** phase_04.md sub-phase 4.1 (examples/android_vpn_spike.rs)
 
 > **Model note:** per explicit user instruction, every "Opus" role in the
 > original plan (architect / review-gate / final-read) is executed by
@@ -21,7 +21,7 @@
 | 3 | 3.1 gate flips + shared joins | Sonnet + Sonnet 5 review gate | DONE | commit 0997c09; extended all vpn any(linux,macos,windows) gates to +android (Cargo.toml tun-rs, lib.rs/main.rs module+subcommand, both vpn test files, check_root, 2x `ip --version` probe cfg, 3x offload unreachable twins); check_root gained android hint message (body unchanged); reviewed — diff is cfg-list-only + 1 message branch, zero semantic change to existing platforms (I-A1); Linux fmt/clippy/test (default+vpn) green. Expected: does NOT compile for android yet (no twins) — that's phase 3.2 |
 | 3 | 3.2 android twins (tun/run_dir/apply/reclaim) | Sonnet | DONE | commit 6c32726; NetConfig::apply (host-only route table, toybox `ip route add`, no ip_forward/nft/iptables/PF, check_host_only guard D-A4/D-A6/D-A9), stale_reclaim (no fwdref/ip_forward state to restore), restore_ip_forward_op (unreachable!, never pushed). Plus 3 self-found compile-blocking gaps not in plan text: TunDevice cfg(any) missing android, pmtu_link_set_mtu_argv missing android arm (reuses Linux builder — toybox ip supports same `link set mtu` grammar), restore_ip_forward_op missing android arm. Guard/argv logic pulled into un-gated hostcfg_cmd::android so Linux CI can unit-test without cross-compile. fmt/clippy(-D warnings, default+vpn)/test(default 490, vpn 326, both 0 failed) all green |
 | 3 | 3.3 host-only CLI guard matrix | Sonnet + Sonnet 5 review gate | DONE | commit 607355f; validate_android_host_only (pure, target_is_android bool param) called at top of run_listen/run_connect before run_with_reconnect; rejects --advertise non-empty, --nat-masquerade, --forward-accept, --max-clients>1, --tun-queues>1 with exact D-A4 message text; UDP hole-punch flags NOT special-cased (unchanged). Sonnet-5 review gate: rejected set == D-A4/D-A6/D-A9 exactly, confirmed. fmt/clippy(-D warnings, default+vpn)/test(default+vpn) all green |
-| 3 | 3.4 regression sweep + CLAUDE.md | Haiku | TODO | |
+| 3 | 3.4 regression sweep + CLAUDE.md | Haiku | DONE | commit 1f9a52d; full `vpn_netns_test.sh` 161/0 (SIGKILL reclaim, hub, NAT, forward-accept, stress/flap suites all pass — zero regression from Phase 3 twins/guards); fmt/clippy(-D warnings, default+vpn)/test(default+vpn) all green; CLAUDE.md VPN Android port block added. Phase 3 DONE |
 | 4 | 4.1 examples/android_vpn_spike.rs | Sonnet | TODO | |
 | 4 | 4.2 android-vpn-e2e job + script | Sonnet + Sonnet 5 review gate | TODO | |
 | 4 | 4.3 findings write-back | Sonnet (+ Sonnet 5 review if twins change) | TODO | |
@@ -41,7 +41,7 @@
 | unit: android_apply_rejects_gateway_inputs | defense in depth | 3 | PASS |
 | unit: android_stale_reclaim_removes_leaked_state | reclaim | 3 | PASS |
 | unit: android_guard_matrix | CLI guard table | 3 | PASS |
-| regression: vpn_netns_test.sh full | Linux zero-regression proof | 3,4,5 | TODO |
+| regression: vpn_netns_test.sh full | Linux zero-regression proof | 3,4,5 | PASS 161/0 |
 | T-AND-S1..S3 | spike (tun, apply/revert, reclaim) | 4 | TODO |
 | T-AND-L1 | relay link bidirectional ping | 4 | TODO |
 | T-AND-L2 | direct best-effort (informational) | 4 | TODO |
@@ -52,7 +52,7 @@
 
 | Doc | Phase | Status |
 |-----|-------|--------|
-| CLAUDE.md Android block | 3.4, 5.3 | TODO |
+| CLAUDE.md Android block | 3.4, 5.3 | DONE (3.4, will refresh at 5.3) |
 | SPIKE_FINDINGS.md (plan folder) | 4.3 | TODO |
 | docs/ANDROID.md | 5.1 | TODO |
 | limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md rewrite | 5.1 | TODO |

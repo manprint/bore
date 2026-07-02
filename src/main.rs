@@ -2288,6 +2288,38 @@ fn parse_udp_tuning(
     })
 }
 
+/// Best-effort: turn on ANSI/VT escape-sequence processing for stderr on
+/// Windows. The legacy Windows console (conhost, incl. the default
+/// PowerShell/cmd host) does NOT interpret `\x1b[...m` sequences unless
+/// `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is explicitly set on the console
+/// mode — unlike Linux/macOS terminals, which always understand ANSI. Without
+/// this, `stderr().is_terminal()` is still true, so tracing_subscriber's
+/// `with_ansi` emits raw escape codes that print as literal `←[2m...` noise
+/// instead of colors. Returns false (forcing ansi off) if the mode can't be
+/// queried/set, e.g. output is redirected to a file/pipe or an old console.
+#[cfg(windows)]
+fn enable_windows_ansi() -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_ERROR_HANDLE,
+    };
+    unsafe {
+        let handle = GetStdHandle(STD_ERROR_HANDLE);
+        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut mode: u32 = 0;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return false;
+        }
+        if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
+            return true;
+        }
+        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+    }
+}
+
 /// Initialize logging: `RUST_LOG` wins if set; otherwise default to `info`, or
 /// `debug`/`trace` with `-v`/`-vv`. Logs go to stderr (keeping stdout clean), and
 /// ANSI colors are enabled only on a terminal so redirected/Docker/journald logs
@@ -2305,10 +2337,15 @@ fn init_logging(verbose: u8) {
         };
         EnvFilter::new(format!("bore_cli={level},bore={level}"))
     };
+    let is_terminal = std::io::stderr().is_terminal();
+    #[cfg(windows)]
+    let ansi = is_terminal && enable_windows_ansi();
+    #[cfg(not(windows))]
+    let ansi = is_terminal;
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
+        .with_ansi(ansi)
         .init();
 }
 

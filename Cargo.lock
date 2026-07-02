@@ -309,6 +309,7 @@ dependencies = [
  "tun-rs",
  "uuid",
  "webpki-roots",
+ "windows-sys 0.52.0",
  "x509-parser 0.16.0",
  "yamux",
 ]

@@ -618,6 +618,81 @@ fn emit_windows_flag_warnings(tun_queues: usize) {
     }
 }
 
+/// Phase 3.3 fail-fast matrix (D-A4/D-A6/D-A9): Android VPN is host-only, so
+/// every gateway-flavored flag is a hard `bail!`, not a warn-and-clamp like
+/// macOS's `--tun-queues`. Pure and un-gated (`target_is_android` is a plain
+/// bool, not a `cfg`) so the Linux host can exercise both branches; the real
+/// call sites in `run_listen`/`run_connect` pass `cfg!(target_os =
+/// "android")`. `max_clients` is meaningless for `run_connect` (hub mode is
+/// listen-side only) — that call site passes `0`, which never trips `> 1`.
+fn validate_android_host_only(
+    target_is_android: bool,
+    advertise_empty: bool,
+    nat_masquerade: bool,
+    forward_accept: bool,
+    max_clients: u16,
+    tun_queues: usize,
+) -> Result<()> {
+    if !target_is_android {
+        return Ok(());
+    }
+    if !advertise_empty {
+        bail!("Android VPN is host-only: --advertise is not supported");
+    }
+    if nat_masquerade {
+        bail!("--nat-masquerade is not supported on Android (host-only)");
+    }
+    if forward_accept {
+        bail!("--forward-accept is not supported on Android (host-only)");
+    }
+    if max_clients > 1 {
+        bail!("hub mode is not supported on Android");
+    }
+    if tun_queues > 1 {
+        bail!("multi-queue TUN is not supported on Android");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod android_guard_matrix_tests {
+    use super::*;
+
+    #[test]
+    fn android_guard_matrix() {
+        // Non-android target: never rejects, regardless of flags.
+        assert!(validate_android_host_only(false, false, true, true, 5, 8).is_ok());
+
+        // Accepted baseline: host-only connect-style args on android.
+        assert!(validate_android_host_only(true, true, false, false, 0, 1).is_ok());
+
+        let err = validate_android_host_only(true, false, false, false, 0, 1).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Android VPN is host-only: --advertise is not supported"));
+
+        let err = validate_android_host_only(true, true, true, false, 0, 1).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("not supported on Android (host-only)"));
+
+        let err = validate_android_host_only(true, true, false, true, 0, 1).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("not supported on Android (host-only)"));
+
+        let err = validate_android_host_only(true, true, false, false, 2, 1).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("hub mode is not supported on Android"));
+
+        let err = validate_android_host_only(true, true, false, false, 0, 2).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("multi-queue TUN is not supported on Android"));
+    }
+}
+
 #[cfg(test)]
 mod windows_flag_warning_tests {
     use super::*;
@@ -683,6 +758,14 @@ mod macos_flag_warning_tests {
 
 /// Start a VPN listener (reconnect loop around [`run_listen_once`]).
 pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
+    validate_android_host_only(
+        cfg!(target_os = "android"),
+        args.advertise_entries.is_empty(),
+        args.nat_masquerade,
+        args.forward_accept,
+        args.max_clients,
+        args.tun_queues,
+    )?;
     #[cfg(target_os = "macos")]
     emit_macos_flag_warnings(
         args.tun_queues,
@@ -1802,6 +1885,16 @@ async fn run_bridge_with_ctrl(
 
 /// Start a VPN connector (reconnect loop around [`run_connect_once`]).
 pub async fn run_connect(args: VpnConnectArgs) -> Result<()> {
+    // `max_clients` is N/A on the connector (hub mode is listen-side only, see
+    // `validate_android_host_only`'s doc comment) — pass 0 so it never trips.
+    validate_android_host_only(
+        cfg!(target_os = "android"),
+        args.advertise_entries.is_empty(),
+        args.nat_masquerade,
+        args.forward_accept,
+        0,
+        args.tun_queues,
+    )?;
     // macOS advisory warnings once at start (the hub listener path is covered by
     // `run_listen`, which is the only caller of `run_listen_hub`).
     #[cfg(target_os = "macos")]

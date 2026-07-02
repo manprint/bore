@@ -2,7 +2,7 @@
 
 > Machine-readable. Implementer: update after EVERY sub-phase. Keep terse.
 
-**Next:** phase_02.md sub-phase 2.2
+**Next:** phase_02.md sub-phase 2.2 (pushed de782e9, CI run 28615734964 in flight)
 
 > **Model note:** per explicit user instruction, every "Opus" role in the
 > original plan (architect / review-gate / final-read) is executed by
@@ -16,7 +16,7 @@
 | 1 | 1.2 check → clippy -D warnings | Haiku | DONE | commit b954935 |
 | 1 | 1.3 Justfile android-x86_64 + API pin | Haiku | DONE | commit 040f920; API 24 already consistent |
 | 2 | 2.1 scripts/android_emu_test.sh | Sonnet | DONE | commit 762f383; shellcheck-clean via docker koalaman/shellcheck; deviated from literal spec on T-AND-E2 (transfer uses built-in --to/--transfer-id rendezvous, not wrapped in bore local — matches actual Sender/Listener CLI) |
-| 2 | 2.2 CI job android-emu-e2e | Sonnet | TODO | |
+| 2 | 2.2 CI job android-emu-e2e | Sonnet | DONE (code) | commit de782e9; awaiting CI run 28615734964 for T-AND-E-CI green confirmation |
 | 2 | 2.3 portability fixes (contingency) | Sonnet | TODO | |
 | 3 | 3.1 gate flips + shared joins | Sonnet + Sonnet 5 review gate | TODO | |
 | 3 | 3.2 android twins (tun/run_dir/apply/reclaim) | Sonnet | TODO | |

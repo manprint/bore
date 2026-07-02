@@ -2,7 +2,7 @@
 
 > Machine-readable. Implementer: update after EVERY sub-phase. Keep terse.
 
-**Next:** phase_02.md sub-phase 2.3 verify (pushed cc05bda, CI run 28616082339 in flight); phase 2 done once green
+**Next:** phase_02.md sub-phase 2.3 round 2 (pushed 2f2c949, CI run in flight); phase 2 done once android-emu-e2e green 2x consecutive
 
 > **Model note:** per explicit user instruction, every "Opus" role in the
 > original plan (architect / review-gate / final-read) is executed by
@@ -17,7 +17,7 @@
 | 1 | 1.3 Justfile android-x86_64 + API pin | Haiku | DONE | commit 040f920; API 24 already consistent |
 | 2 | 2.1 scripts/android_emu_test.sh | Sonnet | DONE | commit 762f383; shellcheck-clean via docker koalaman/shellcheck; deviated from literal spec on T-AND-E2 (transfer uses built-in --to/--transfer-id rendezvous, not wrapped in bore local — matches actual Sender/Listener CLI) |
 | 2 | 2.2 CI job android-emu-e2e | Sonnet | DONE | commit de782e9 |
-| 2 | 2.3 portability fixes (contingency) | Sonnet | DONE (code) | commit cc05bda; run 28615734964's android-emu-e2e job failed: cargo-ndk panicked "unknown package: 24" — `-p` is cargo's own --package flag, forwarded through; the real platform/API-level flag is `-P`/`--platform`. Fixed in Justfile's android-x86_64 recipe (phase 1.3, never actually executed before — only dry-run verified) and the new android-emu-e2e job; also pinned ANDROID_API=24 on vpn-cross-build's clippy step (previously ran unpinned at cargo-ndk's default 21). Awaiting CI run 28616082339 for green confirmation |
+| 2 | 2.3 portability fixes (contingency) | Sonnet | DONE (code) | round 1 commit cc05bda: cargo-ndk `-p`→`-P` flag fix (run 28615734964 failed, "unknown package: 24"). round 2 commit 2f2c949: build succeeded this time (E1/E4/E5 passed) but T-AND-E2 (transfer sender) and T-AND-E3 (proxy) failed — both run on the HOST but dialed `--to 10.0.2.2`, the emulator's guest-only NAT alias for the host; meaningless from the host's own netns → connect timeout (E2) / empty body (E3). Fixed: host-launched processes now dial 127.0.0.1; guest-launched ones (local, transfer listener) unchanged. Awaiting CI run for green confirmation (still need 2 consecutive) |
 | 3 | 3.1 gate flips + shared joins | Sonnet + Sonnet 5 review gate | TODO | |
 | 3 | 3.2 android twins (tun/run_dir/apply/reclaim) | Sonnet | TODO | |
 | 3 | 3.3 host-only CLI guard matrix | Sonnet + Sonnet 5 review gate | TODO | |

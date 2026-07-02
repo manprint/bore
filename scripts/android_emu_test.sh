@@ -236,8 +236,8 @@ fi
 
 # ── T-AND-E6: non-root negative (bind privileged port must fail) ────────────
 kill_guest_bore
-E6_OUT="$(adb shell "$DEV_BORE server --bind-addr 0.0.0.0 --control-port 80" 2>&1)"
-E6_STATUS=$?
+E6_STATUS=0
+E6_OUT="$(adb shell "$DEV_BORE server --bind-addr 0.0.0.0 --control-port 80" 2>&1)" || E6_STATUS=$?
 if [ "$E6_STATUS" -ne 0 ] && echo "$E6_OUT" | grep -qiE "permission|denied|eacces"; then
     pass "T-AND-E6 non-root bind of control-port 80 failed as expected"
 else

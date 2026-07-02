@@ -267,6 +267,53 @@ jobs:
           sudo target/debug/examples/macos_vpn_spike leak-then-reclaim leak
           sudo target/debug/examples/macos_vpn_spike leak-then-reclaim reclaim
 
+  # T-AND-E-CI: non-VPN runtime validation on a real Android emulator (x86_64,
+  # api 30) via scripts/android_emu_test.sh — public tunnel, transfer, secret
+  # tunnel, test-udp diagnostic, public --udp direct path, non-root negative
+  # bind, all run as the guest's unprivileged shell user against a host bore
+  # server. Independent job (no needs/if gating), mirrors macos-vpn-e2e's
+  # placement/style. Phase 2 of docs/plans/plan_AndroidSupport.
+  android-emu-e2e:
+    name: Android emulator e2e (api 30, x86_64)
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_API: "24" # must match Justfile's android_api
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Enable KVM for the hosted emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Build host binary
+        run: cargo build --release
+
+      - name: Build Android binary (x86_64, via cargo-ndk)
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+          cargo ndk -t x86_64 -p "$ANDROID_API" build --release
+
+      - name: Run emulator + e2e (T-AND-E1..E6)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: default
+          script: BORE_HOST_BIN=$PWD/target/release/bore BORE_ANDROID_BIN=$PWD/target/x86_64-linux-android/release/bore ./scripts/android_emu_test.sh
+
   audit:
     name: Security audit
     runs-on: ubuntu-latest

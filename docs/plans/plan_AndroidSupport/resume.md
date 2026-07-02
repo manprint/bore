@@ -2,7 +2,7 @@
 
 > Machine-readable. Implementer: update after EVERY sub-phase. Keep terse.
 
-**Next:** Phase 2 DONE (android-emu-e2e green 2x consecutive: runs 28617339653 initial + rerun). Starting phase_03.md sub-phase 3.1
+**Next:** phase_03.md sub-phase 3.2 (android twins: create_tun/run_dir/stale_reclaim/NetConfig::apply/Drop)
 
 > **Model note:** per explicit user instruction, every "Opus" role in the
 > original plan (architect / review-gate / final-read) is executed by
@@ -18,7 +18,7 @@
 | 2 | 2.1 scripts/android_emu_test.sh | Sonnet | DONE | commit 762f383; shellcheck-clean via docker koalaman/shellcheck; deviated from literal spec on T-AND-E2 (transfer uses built-in --to/--transfer-id rendezvous, not wrapped in bore local — matches actual Sender/Listener CLI) |
 | 2 | 2.2 CI job android-emu-e2e | Sonnet | DONE | commit de782e9 |
 | 2 | 2.3 portability fixes (contingency) | Sonnet | DONE | round 1 commit cc05bda: cargo-ndk `-p`→`-P` flag fix (run 28615734964 failed, "unknown package: 24"). round 2 commit 2f2c949: build succeeded this time (E1/E4/E5 passed) but T-AND-E2 (transfer sender) and T-AND-E3 (proxy) failed — both run on the HOST but dialed `--to 10.0.2.2`, the emulator's guest-only NAT alias for the host; meaningless from the host's own netns → connect timeout (E2) / empty body (E3). Fixed: host-launched processes now dial 127.0.0.1. round 3 commit b1854aa: E1-E5 all passed; script then died with generic exit-1 before ever printing an E6 result — `E6_OUT="$(...)"; E6_STATUS=$?` is the classic `set -e` gotcha (bore server's expected nonzero exit aborted the script on the assignment line, before `$?` was ever read). Fixed via `|| E6_STATUS=$?` form. CONFIRMED GREEN 2x consecutive: run 28617339653 initial pass + `gh run rerun` pass — flake-check satisfied. Phase 2 DONE |
-| 3 | 3.1 gate flips + shared joins | Sonnet + Sonnet 5 review gate | TODO | |
+| 3 | 3.1 gate flips + shared joins | Sonnet + Sonnet 5 review gate | DONE | commit 0997c09; extended all vpn any(linux,macos,windows) gates to +android (Cargo.toml tun-rs, lib.rs/main.rs module+subcommand, both vpn test files, check_root, 2x `ip --version` probe cfg, 3x offload unreachable twins); check_root gained android hint message (body unchanged); reviewed — diff is cfg-list-only + 1 message branch, zero semantic change to existing platforms (I-A1); Linux fmt/clippy/test (default+vpn) green. Expected: does NOT compile for android yet (no twins) — that's phase 3.2 |
 | 3 | 3.2 android twins (tun/run_dir/apply/reclaim) | Sonnet | TODO | |
 | 3 | 3.3 host-only CLI guard matrix | Sonnet + Sonnet 5 review gate | TODO | |
 | 3 | 3.4 regression sweep + CLAUDE.md | Haiku | TODO | |

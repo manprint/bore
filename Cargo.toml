@@ -76,7 +76,7 @@ procfs = "0.18"
 # TUN device backend. Linux uses GSO/GRO offload + multi-queue through tun-rs;
 # macOS uses the basic utun path through tun-rs. Windows uses WinTun bindings and
 # loads wintun.dll at runtime.
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))'.dependencies]
 tun-rs = { version = "2.8.5", optional = true, features = ["async"] }
 
 [target.'cfg(windows)'.dependencies]

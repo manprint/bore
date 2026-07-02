@@ -11,7 +11,12 @@
 
 #![cfg(all(
     feature = "vpn",
-    any(target_os = "linux", target_os = "macos", target_os = "windows")
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    )
 ))]
 
 use bore_cli::shared::{ClientMessage, Delimited, Ipv4Net, ServerMessage, VpnAddrRequest};

@@ -1,8 +1,13 @@
-//! VPN L3 tunnel feature (Linux + macOS + Windows, experimental).
+//! VPN L3 tunnel feature (Linux + macOS + Windows + Android, experimental).
 
 #![cfg(all(
     feature = "vpn",
-    any(target_os = "linux", target_os = "macos", target_os = "windows")
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    )
 ))]
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -697,10 +702,11 @@ pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
 async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
     // Preflight checks (fatal: retrying cannot fix privileges or PATH)
     hostcfg::check_root().map_err(|e| FatalVpnError(e.to_string()))?;
-    // Linux uses iproute2 (`ip`); macOS uses BSD `route`/`ifconfig`, which do not
+    // Linux and Android both use iproute2-compatible `ip` (toybox on Android
+    // accepts `--version`); macOS uses BSD `route`/`ifconfig`, which do not
     // accept `--version` (D8/I-M7), so the macOS path never probes them — it
     // proceeds to the runtime, which currently bails at the create_tun stub.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     hostcfg::check_binary_exists("ip")
         .then_some(())
         .ok_or_else(|| FatalVpnError("'ip' command not found".into()))?;
@@ -1809,8 +1815,8 @@ pub async fn run_connect(args: VpnConnectArgs) -> Result<()> {
 async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
     // Preflight checks (fatal: retrying cannot fix privileges or PATH)
     hostcfg::check_root().map_err(|e| FatalVpnError(e.to_string()))?;
-    // Linux-only `ip` probe (D8/I-M7): macOS uses BSD tools that lack `--version`.
-    #[cfg(target_os = "linux")]
+    // Linux/Android `ip` probe (D8/I-M7): macOS uses BSD tools that lack `--version`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     hostcfg::check_binary_exists("ip")
         .then_some(())
         .ok_or_else(|| FatalVpnError("'ip' command not found".into()))?;
@@ -4517,10 +4523,17 @@ pub mod hostcfg {
     }
 
     /// Check that we have privileges to manage the VPN device and host routes.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
     pub fn check_root() -> anyhow::Result<()> {
         if nix::unistd::getuid().is_root() {
             Ok(())
+        } else if cfg!(target_os = "android") {
+            bail!(
+                "bore vpn requires root privileges (or CAP_NET_ADMIN). \
+                 Run with sudo or grant the capability. \
+                 On Android run under root (tsu / Magisk su); non-root VPN is \
+                 impossible — see docs/vpn/limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md"
+            )
         } else {
             bail!(
                 "bore vpn requires root privileges (or CAP_NET_ADMIN). \
@@ -8307,7 +8320,7 @@ pub mod bridge {
     /// APIs (`recv_multiple`/`VIRTIO_NET_HDR_LEN`), and non-Linux `create_tun` forces
     /// `offload=false` (I-M4), so the dispatcher always takes the single-packet
     /// path. Present only so the offload branch compiles on non-Linux (I-M3 caveat).
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "android"))]
     async fn run_uplink_offload(
         _dev: Arc<TunDevice>,
         _sender: LinkSender,
@@ -8398,7 +8411,7 @@ pub mod bridge {
 
     /// Non-Linux twin — never reached (offload is Linux-only; non-Linux forces
     /// offload=false, I-M4). Present so the offload branch compiles on non-Linux.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "android"))]
     async fn run_downlink_offload(
         _dev: Arc<TunDevice>,
         _recver: LinkRecver,
@@ -9146,7 +9159,7 @@ pub mod hub {
 
     /// Non-Linux twin — never reached (offload is Linux-only; non-Linux forces
     /// offload=false, I-M4). Present so the hub offload branch compiles on non-Linux.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "android"))]
     async fn run_router_uplink_offload(
         _dev: Arc<TunDevice>,
         _table: PeerTable,

@@ -4,12 +4,22 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 #[cfg(all(
     feature = "vpn",
-    any(target_os = "linux", target_os = "macos", target_os = "windows")
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    )
 ))]
 use bore_cli::shared::{AdvertiseEntry, Ipv4Net, VpnAddrRequest};
 #[cfg(all(
     feature = "vpn",
-    any(target_os = "linux", target_os = "macos", target_os = "windows")
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    )
 ))]
 use bore_cli::vpn;
 use bore_cli::{
@@ -409,7 +419,12 @@ enum Command {
     /// Linux point-to-point VPN overlay (requires --features vpn; needs root / CAP_NET_ADMIN).
     #[cfg(all(
         feature = "vpn",
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "android"
+        )
     ))]
     Vpn {
         #[clap(subcommand)]
@@ -939,7 +954,12 @@ enum TransferCommand {
 
 #[cfg(all(
     feature = "vpn",
-    any(target_os = "linux", target_os = "macos", target_os = "windows")
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    )
 ))]
 #[derive(Subcommand, Debug)]
 enum VpnCommand {
@@ -951,7 +971,12 @@ enum VpnCommand {
 
 #[cfg(all(
     feature = "vpn",
-    any(target_os = "linux", target_os = "macos", target_os = "windows")
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    )
 ))]
 #[derive(clap::Args, Debug)]
 struct VpnListenArgs {
@@ -1109,7 +1134,12 @@ struct VpnListenArgs {
 
 #[cfg(all(
     feature = "vpn",
-    any(target_os = "linux", target_os = "macos", target_os = "windows")
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    )
 ))]
 #[derive(clap::Args, Debug)]
 struct VpnConnectArgs {
@@ -1665,7 +1695,12 @@ async fn dispatch(command: Command) -> Result<()> {
         },
         #[cfg(all(
             feature = "vpn",
-            any(target_os = "linux", target_os = "macos", target_os = "windows")
+            any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "windows",
+                target_os = "android"
+            )
         ))]
         Command::Vpn { command } => match command {
             VpnCommand::Listen(args) => {
@@ -3047,7 +3082,12 @@ mod tests {
 
     #[cfg(all(
         feature = "vpn",
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "android"
+        )
     ))]
     #[test]
     fn cli_vpn_help_renders() {
@@ -3058,7 +3098,12 @@ mod tests {
 
     #[cfg(all(
         feature = "vpn",
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "android"
+        )
     ))]
     #[test]
     fn cli_vpn_requires_secret() {
@@ -3076,7 +3121,12 @@ mod tests {
 
     #[cfg(all(
         feature = "vpn",
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "android"
+        )
     ))]
     #[test]
     fn cli_vpn_static_requires_peer_addr() {
@@ -3102,7 +3152,12 @@ mod tests {
 
     #[cfg(all(
         feature = "vpn",
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "android"
+        )
     ))]
     #[test]
     fn cli_vpn_parses_advertise_list() {

@@ -9,7 +9,10 @@
 //! under load, with no error anywhere. With the old code this test deadlocks;
 //! it must complete well within the timeout with the dual-substream link.
 
-#![cfg(feature = "vpn")]
+#![cfg(all(
+    feature = "vpn",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 
 use bore_cli::shared::{ClientMessage, Delimited, Ipv4Net, ServerMessage, VpnAddrRequest};
 use bore_cli::vpn::link;

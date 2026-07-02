@@ -1,4 +1,7 @@
-#![cfg(feature = "vpn")]
+#![cfg(all(
+    feature = "vpn",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 
 use bore_cli::shared::{
     ClientMessage, Delimited, Ipv4Net, ServerMessage, VpnAddrRequest, CONTROL_PORT,

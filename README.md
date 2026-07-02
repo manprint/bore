@@ -110,7 +110,13 @@ You can forward a port on your local machine by using the `bore local` command. 
 bore local 5000
 ```
 
-You can optionally pass in a `--port` option to pick a specific port on the remote to expose, although the command will fail if this port is not available. Also, passing `--local-host` allows you to expose a different host on your local area network besides the loopback address `localhost`.
+You can optionally pass in a `--port` option to pick a specific port on the remote to expose, although the command will fail if this port is not available. To expose a different host on your local area network besides the loopback address `localhost`, either pass `--local-host`, or embed the host directly in the positional argument as `HOST:PORT` (same syntax as `bore vhost`'s target):
+
+```shell
+bore local 10.10.16.138:5000
+```
+
+The two ways of specifying the host must agree: passing both `--local-host` and an embedded `HOST:PORT` is fine as long as the hosts match, but a mismatch (e.g. `bore local 10.10.16.138:5000 --local-host 192.168.1.1`) is rejected with a "conflicting host" error instead of silently picking one.
 
 The `--to` value selects the transport for the control connection. When omitted, `bore` uses `https://bore.0912345.xyz` (TLS on port `443`):
 
@@ -126,10 +132,13 @@ Starts a local proxy to the remote server
 Usage: bore local [OPTIONS] <PORT>
 
 Arguments:
-  <PORT>  The local port to expose [env: BORE_LOCAL_PORT=]
+  <PORT>  The local port to expose, or HOST:PORT to target a non-localhost
+          service [env: BORE_LOCAL_PORT=]
 
 Options:
-  -l, --local-host <HOST>      The local host to expose [default: localhost]
+  -l, --local-host <HOST>      The local host to expose (default: localhost;
+                                must match PORT's embedded host if it has
+                                one, else rejected as conflicting)
   -v, --verbose...             Increase log verbosity (-v debug, -vv trace; RUST_LOG overrides)
   -t, --to <ADDR>              Address of the remote server [env: BORE_SERVER=] [default: https://bore.0912345.xyz]
   -p, --port <PORT>            Optional port on the remote server to select [default: 0]

@@ -88,7 +88,7 @@ lazy_static = "1.4.0"
 rcgen = "0.14.8"
 rstest = "0.15.0"
 tempfile = "3"
-tokio = { version = "1.41.0", features = ["sync", "test-util"] }
+tokio = { version = "1.41.0", features = ["sync", "test-util", "process"] }
 
 [profile.release]
 lto = true

@@ -57,13 +57,16 @@ struct Args {
 enum Command {
     /// Starts a local proxy to the remote server.
     Local {
-        /// The local port to expose.
+        /// The local port to expose. Also accepts `HOST:PORT` (or `[ipv6]:PORT`)
+        /// to target a non-localhost service, same syntax as `bore vhost`'s
+        /// TARGET — e.g. `10.10.16.138:5000`. A bare port uses --local-host.
         #[clap(value_name = "PORT", env = "BORE_LOCAL_PORT")]
-        local_port: u16,
+        local_port: String,
 
-        /// The local host to expose.
-        #[clap(short, long, value_name = "HOST", default_value = "localhost")]
-        local_host: String,
+        /// The local host to expose. Ignored if PORT embeds its own host
+        /// (`HOST:PORT`).
+        #[clap(short, long, value_name = "HOST")]
+        local_host: Option<String>,
 
         /// Address of the remote server to expose local ports to.
         #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER", default_value = DEFAULT_SERVER)]
@@ -1319,8 +1322,8 @@ async fn shutdown_signal() {
 async fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::Local {
-            local_host,
-            local_port,
+            local_host: local_host_flag,
+            local_port: local_target,
             to,
             port,
             secret,
@@ -1343,6 +1346,8 @@ async fn dispatch(command: Command) -> Result<()> {
             webserver_log_max_files,
             webserver_log_max_file_size,
         } => {
+            let (local_host, local_port) =
+                resolve_local_target(&local_target, local_host_flag.as_deref())?;
             let notes = clamp_notes(notes);
             if let Some(creds) = &basic_auth {
                 if !creds.contains(':') {
@@ -2225,6 +2230,26 @@ fn parse_vhost_target(target: &str) -> Result<(String, u16)> {
     Ok((host.to_string(), port))
 }
 
+/// Resolve `bore local`'s positional PORT argument. Accepts either a bare port
+/// (host comes from `--local-host`, default `localhost` — the historical
+/// syntax) or a `HOST:PORT`/`:PORT`/`[ipv6]:PORT` target using the same
+/// `parse_vhost_target` grammar as `bore vhost`, to reach a non-localhost
+/// service without `--local-host` (e.g. `bore local 10.10.16.138:5000`).
+fn resolve_local_target(target: &str, local_host_flag: Option<&str>) -> Result<(String, u16)> {
+    if let Ok(port) = target.parse::<u16>() {
+        return Ok((local_host_flag.unwrap_or("localhost").to_string(), port));
+    }
+    let (host, port) = parse_vhost_target(target)
+        .with_context(|| format!("invalid PORT '{target}'; expected a port number or host:port"))?;
+    match local_host_flag {
+        Some(explicit) if explicit != host => anyhow::bail!(
+            "conflicting host: PORT '{target}' specifies host '{host}' but \
+             --local-host is '{explicit}'; specify the host in only one place"
+        ),
+        _ => Ok((host, port)),
+    }
+}
+
 fn parse_proxy_addr(value: &str) -> Result<SocketAddr> {
     let normalized = match value.strip_prefix(':') {
         Some(port) => format!("0.0.0.0:{port}"),
@@ -2763,6 +2788,108 @@ mod tests {
         assert!(parse_vhost_target("no-port").is_err());
         assert!(parse_vhost_target("localhost:not-a-port").is_err());
         assert!(parse_vhost_target(":99999").is_err()); // port out of u16 range
+    }
+
+    // Regression: `bore local`'s PORT positional used to be a bare `u16`, so the
+    // HOST:PORT syntax `bore vhost`/`bore proxy` both accept failed with a
+    // confusing clap error ("invalid digit found in string") instead of
+    // targeting the remote host.
+    #[test]
+    fn resolve_local_target_bare_port_defaults_to_localhost() {
+        assert_eq!(
+            resolve_local_target("8080", None).unwrap(),
+            ("localhost".to_string(), 8080)
+        );
+    }
+
+    #[test]
+    fn resolve_local_target_bare_port_honors_local_host_flag() {
+        assert_eq!(
+            resolve_local_target("8080", Some("10.10.16.138")).unwrap(),
+            ("10.10.16.138".to_string(), 8080)
+        );
+    }
+
+    #[test]
+    fn resolve_local_target_accepts_host_colon_port() {
+        assert_eq!(
+            resolve_local_target("10.10.16.138:5000", None).unwrap(),
+            ("10.10.16.138".to_string(), 5000)
+        );
+    }
+
+    #[test]
+    fn resolve_local_target_accepts_hostname_colon_port() {
+        assert_eq!(
+            resolve_local_target("my-nas.local:5000", None).unwrap(),
+            ("my-nas.local".to_string(), 5000)
+        );
+    }
+
+    #[test]
+    fn resolve_local_target_accepts_ipv6_colon_port() {
+        assert_eq!(
+            resolve_local_target("[::1]:5000", None).unwrap(),
+            ("::1".to_string(), 5000)
+        );
+    }
+
+    #[test]
+    fn resolve_local_target_embedded_host_matching_local_host_flag_ok() {
+        assert_eq!(
+            resolve_local_target("10.10.16.138:5000", Some("10.10.16.138")).unwrap(),
+            ("10.10.16.138".to_string(), 5000)
+        );
+    }
+
+    #[test]
+    fn resolve_local_target_rejects_conflicting_hosts() {
+        let err = resolve_local_target("10.10.16.138:5000", Some("192.168.1.1")).unwrap_err();
+        assert!(err.to_string().contains("conflicting host"));
+    }
+
+    #[test]
+    fn resolve_local_target_rejects_malformed() {
+        assert!(resolve_local_target("not-a-port-or-target", None).is_err());
+        assert!(resolve_local_target("host:not-a-port", None).is_err());
+    }
+
+    #[test]
+    fn local_cli_accepts_host_colon_port_positional() {
+        // The exact reported repro: `bore local -p 9005 --https 10.10.16.138:5000
+        // --udp --auto-reconnect -s mysecret` must parse (clap-level), not fail
+        // with "invalid digit found in string" on the PORT positional.
+        let args = Args::parse_from([
+            "bore",
+            "local",
+            "-p",
+            "9005",
+            "--https",
+            "10.10.16.138:5000",
+            "--udp",
+            "--auto-reconnect",
+            "-s",
+            "mysecret",
+        ]);
+        match args.command {
+            Command::Local {
+                local_port,
+                local_host,
+                port,
+                https,
+                ..
+            } => {
+                assert_eq!(local_port, "10.10.16.138:5000");
+                assert_eq!(local_host, None);
+                assert_eq!(port, 9005);
+                assert!(https);
+                let (host, port) =
+                    resolve_local_target(&local_port, local_host.as_deref()).unwrap();
+                assert_eq!(host, "10.10.16.138");
+                assert_eq!(port, 5000);
+            }
+            _ => panic!("expected Local command"),
+        }
     }
 
     #[test]

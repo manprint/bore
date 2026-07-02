@@ -389,5 +389,49 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   — CI is single-host (the single-host PF rules are already CI-validated). Windows deferred. Any PF
   correction lands in `pf_ruleset`/the `cmd_pf_*` builders + their snapshots, not in `apply`.
 
+**VPN Android port (compile-port + host-only twins LANDED 2026-07-03, branch
+`android`; runtime device/emulator validation still pending — Phase 4/5):**
+- Plan: `docs/plans/plan_AndroidSupport/` (overview + phase_0{1..5}.md + resume.md).
+  Same twin pattern as the macOS port (DEC-M1/I-A1): every OS-specific fn/type gets
+  a `#[cfg(target_os = "android")]` sibling; Linux/macOS/Windows bodies stay
+  byte-identical. `cfg(any(...))` gates extended to include android everywhere
+  needed to compile: `Cargo.toml` tun-rs dep, `lib.rs`/`main.rs` module+subcommand
+  gate, both vpn test files, `check_root` (android hint message, body otherwise
+  identical), the `ip --version` probe cfg (toybox supports it, same as Linux
+  iproute2), and the 3 offload-pump `unreachable!` twins (android has no
+  Linux-only `tun-rs` GSO/GRO offload path, same as macOS).
+- **D-A4/D-A6/D-A9 (host-only scope, HARD invariant):** android VPN is NEVER a
+  gateway — no `--advertise`, no `--nat-masquerade`, no `--forward-accept`, no hub
+  mode (`--max-clients>1`), no multi-queue TUN (`--tun-queues>1`). Enforced TWICE:
+  a fail-fast CLI guard (`validate_android_host_only`, called at the top of
+  `run_listen`/`run_connect` before `run_with_reconnect` — config errors are not
+  retryable) is the PRIMARY gate; `NetConfig::apply`'s `hostcfg_cmd::android::
+  check_host_only` is defense-in-depth at the apply layer. Both are pure/un-gated
+  (`target_is_android`/inputs are plain bools, not `cfg`) so the full matrix is
+  unit-tested on the Linux host without an android cross-compile target.
+- Android `NetConfig::apply` twin: no ip_forward, no nft/iptables, no PF — only
+  `ip route add` per accepted peer route via toybox's `ip` applet, which supports
+  the same basic `route add/del`/`link set mtu` grammar as Linux iproute2 but
+  **NOT `ip route replace`** (unlike the Linux twin's idempotent `replace`) — the
+  android argv builders (`hostcfg_cmd::android`) use `add`, not `replace`.
+  `stale_reclaim` (android) has nothing to restore beyond its own marker files
+  (host-only ⇒ never creates an ip_forward value or fwdref refcount marker in the
+  first place). `restore_ip_forward_op` (android) is `unreachable!()` — apply never
+  pushes an `AppliedOp::IpForward`, mirroring the offload-pump `unreachable!` twins.
+- `run_dir()` (android) → `/data/local/tmp` (D-A8: no writable `/run`/`/var/run`
+  under SELinux + the app sandbox, unlike Linux/macOS/Windows).
+- No local android cross-compile tooling on the Linux dev box (no `cargo-ndk`, no
+  `rustup` android target) — same situation as the macOS port; verify via CI
+  (`cargo ndk clippy` for x86_64/arm64-v8a) after push, not locally.
+- Status: Phase 1 (CI build+clippy matrix) and Phase 2 (non-VPN android-emu-e2e,
+  `scripts/android_emu_test.sh`) both green. Phase 3 (this VPN compile-port +
+  host-only guards) done Linux-side: `cargo fmt`/`clippy -D warnings`(default+vpn)/
+  `cargo test`(default+vpn) all green, PLUS the full `vpn_netns_test.sh` Linux
+  zero-regression suite at 161/0 (proves the twin additions changed nothing on
+  Linux). Phase 4 (`examples/android_vpn_spike.rs` + `android-vpn-e2e` CI job) and
+  Phase 5 (docs + manual device acceptance) are the REMAINING work before the VPN
+  path is validated on a real android runtime — until then, the android VPN code
+  paths are compiled and unit-tested but **not yet proven to run** on-device.
+
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

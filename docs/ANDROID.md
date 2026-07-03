@@ -1,78 +1,160 @@
-# bore vpn on Android — backend reference
+# bore on Android
 
-Companion to the [operational plan](plans/plan_AndroidSupport/). This documents the **Android
-host-only VPN client** implementation, now SHIPPED AND VALIDATED on CI (2026-07-03).
+Companion to the [operational plan](plans/plan_AndroidSupport/). Covers running any `bore`
+subcommand on Android (Termux or a raw shell), and documents the **host-only VPN client**
+implementation in depth, now SHIPPED AND VALIDATED on CI (2026-07-03).
 
 > **Status (2026-07-03):** RUNTIME SHIPPED. `bore vpn` runs on **Android** (API 24+, rooted device
 > or emulator, root or equivalent privilege). Module gate: `cfg(all(feature="vpn",
 > any(target_os="linux", target_os="macos", target_os="android")))`. CI validation: rooted
 > x86_64 emulator (API 30, `android-vpn-e2e` job, 2026-07-03, 8/8 tests passing). Linux byte-identical,
-> zero regression (netns 161/0).
+> zero regression (netns 161/0). Non-VPN subcommands need no root and are covered by the
+> separate `android-emu-e2e` CI job.
 
 ---
 
-## Design scope: host-only, never a gateway
+## Install (Termux)
 
-Android VPN is **permanently host-only by hard invariant** (D-A4/D-A6/D-A9 in CLAUDE.md):
-
-- ✅ **Supported:** VPN client (listen + connect), relay uplink, optional direct QUIC upgrade,
-  same AEAD encryption as Linux/macOS/Windows
-- ❌ **NOT supported (and never will be):** gateway mode (`--advertise`), NAT/masquerade
-  (`--nat-masquerade`), firewall accept rules (`--forward-accept`), hub mode (`--max-clients > 1`),
-  multi-queue TUN (`--tun-queues > 1`)
-
-Any attempt to pass an unsupported flag fails at CLI validation, with examples:
-
-- `--advertise <any>` → `Android VPN is host-only: --advertise is not supported`
-- `--nat-masquerade` → `--nat-masquerade is not supported on Android (host-only)`
-- `--forward-accept` → `--forward-accept is not supported on Android (host-only)`
-- `--max-clients N` (N > 1) → `hub mode is not supported on Android`
-- `--tun-queues N` (N > 1) → `multi-queue TUN is not supported on Android`
-
-This is enforced twice: once at the top of `run_listen`/`run_connect` (before any network
-setup), and again defensively in `NetConfig::apply` at the host-config layer.
-
----
-
-## Rooting and privilege
-
-`bore vpn` requires **root access** to create and manage the TUN device. On a rooted device,
-this means:
+**Prebuilt binary** (ARM64, matches most phones/tablets):
 
 ```bash
-adb shell "su -c 'bore vpn listen …'"
+pkg install curl   # if not already present
+curl -fL https://github.com/manprint/bore/releases/latest/download/bore-aarch64-linux-android \
+  -o bore
+chmod +x bore
+./bore --version
 ```
 
-On an unrooted device, `bore vpn` exits immediately with:
+No `pkg install` dependencies are required to *run* `bore` for any non-VPN subcommand — the
+binary is statically-ish linked against the Android NDK's libc and needs nothing else installed.
+VPN mode additionally needs root: install `tsu` (`pkg install tsu`) to bridge Termux to a
+Magisk/KernelSU root grant — see "Root VPN quickstart" below.
 
+The generic install script (`docs/INSTALL_BORE.md`) also auto-detects Android/arm64 and works
+unmodified under Termux, since it's bash-only:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/manprint/bore/main/install.sh | bash
 ```
-error: not running as root (uid=<uid>). bore vpn requires root or CAP_NET_ADMIN
-```
-
-### Rooting options
-
-**Rooted Android device (physical or emulator):**
-- Physical: use your device's standard rooting method (Magisk, custom ROM, etc.)
-- Emulator: start with `-selinux off -writable-system` and the `default` (non-`google_apis`) image.
-  The `android-vpn-e2e` CI job uses `system-images;android-30;default;x86_64`.
-
-**Termux + su fallback:**
-Some users run bore under Termux (Linux userspace on Android) with Magisk `su` bridging to
-the system. This is out of scope for this doc — Termux's model requires its own network
-namespace + magic (not directly supported by bore), and the Termux-to-root bridge is
-device-specific. If you need this path, consult Termux documentation + your root solution.
 
 ---
 
-## TUN device creation
+## Feature matrix
 
-### Device node: `/dev/tun` (not desktop Linux'''s `/dev/net/tun`)
+| Subcommand | Non-root | Root |
+|---|---|---|
+| `local` | works (unless the local target port is `<1024`) | works (no benefit over non-root) |
+| `proxy` | works (same `<1024` caveat on the local forward port) | works (no benefit) |
+| `vhost` | works (same `<1024` caveat) | works (no benefit) |
+| `transfer listener\|sender` | works (file transfer, no privileged ports) | works (no benefit) |
+| `test-udp` | works, but bandwidth numbers are limited by the UDP buffer clamp | works — can raise `net.core.*mem_max` first for accurate throughput |
+| `server` | works (default control port 7835 is unprivileged) | works — only needed to bind a port `<1024` |
+| `vpn` | **no — impossible** (Android's non-root VPN path is the `VpnService` Java API, which only a signed, permission-granted app can use; `bore` is a native CLI binary and can't hook into it) | works (host-only, see below) |
 
-Android'''s minimal `/dev` has no `net` subdirectory on stock ROMs, so the TUN clone device
-lives at `/dev/tun` — unlike desktop Linux, where it'''s `/dev/net/tun`. `bore-android-tun`
+None of the non-VPN subcommands touch a TUN device, `ip_forward`, or any routing table — they're
+plain userspace TCP/UDP sockets, so they behave like any other Linux CLI network tool under
+Termux. See [Limits and unsupported features](vpn/limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md) for
+the full non-root-VPN rationale.
+
+---
+
+## Non-root notes
+
+- **Ports `<1024` need root** (`CAP_NET_BIND_SERVICE` or uid 0) — same as any Linux kernel.
+  Only matters if you point `local`/`proxy`/`vhost`/`server` at a privileged port; the bore
+  server's own control port (7835) and all data substreams are unprivileged.
+- **UDP socket buffers are clamped** by `net.core.{r,w}mem_max` (same mechanism as desktop
+  Linux, see `CLAUDE.md`'s VPN throughput notes) — non-root can't raise this, so `test-udp`
+  bandwidth numbers and VPN relay throughput are capped at the stock clamp. Rooted remediation:
+  `sysctl -w net.core.rmem_max=16777216` (and the matching `wmem_max`).
+- **Android 12+ phantom process killer** terminates long-running Termux child processes that
+  aren't tied to a foreground activity — a `bore local`/`proxy`/`vpn connect` left running in the
+  background can be killed without warning. Two remediations:
+  - `termux-wake-lock` (keeps Termux's own process alive; install the Termux:API add-on if not
+    already present)
+  - `adb shell device_config put activity_manager max_phantom_processes 2147483647` (effectively
+    disables the killer), or the blunter `adb shell settings put global
+    settings_enable_monitor_phantom_procs false`
+- **No `/tmp`** — Termux has no writable `/tmp`; it sets `$TMPDIR` to `$PREFIX/tmp` instead. Not
+  relevant to `bore` directly (it doesn't use `/tmp`), but relevant if you're scripting around it.
+
+---
+
+## Root VPN quickstart
+
+```bash
+pkg install tsu
+tsu   # or: su -c '...'  if you're not using tsu
+```
+
+**Host side** (any platform reachable from the phone, e.g. a Linux box running the bore server):
+
+```bash
+bore server &
+bore vpn listen --to <bore-server-host:port> --secret <shared-secret> --id <link-id>
+```
+
+**Android side** (connector, as root):
+
+```bash
+tsu -c '/data/data/com.termux/files/home/bore vpn connect --to <bore-server-host:port> \
+  --secret <shared-secret> --id <link-id> --accept-all-routes'
+```
+
+`--accept-all-routes` is only needed if the far side advertises routes — it never does when the
+far side is also Android (host-only means no side ever advertises anything).
+
+Android VPN is **host-only by hard invariant** (D-A4/D-A6/D-A9 in `CLAUDE.md`) — gateway mode is
+out of scope for this release (a scoping decision, not a technical impossibility, unlike non-root
+VPN above; see D-A4). Five flags are rejected at the CLI before any TUN is created:
+
+| Flag | Why | Error message |
+|------|-----|---|
+| `--advertise <cidr>` (any non-empty) | Gateway mode forbidden | `Android VPN is host-only: --advertise is not supported` |
+| `--nat-masquerade` | Gateway feature | `--nat-masquerade is not supported on Android (host-only)` |
+| `--forward-accept` | Firewall feature | `--forward-accept is not supported on Android (host-only)` |
+| `--max-clients N` where `N > 1` | Hub mode forbidden | `hub mode is not supported on Android` |
+| `--tun-queues N` where `N > 1` | Multi-queue not supported | `multi-queue TUN is not supported on Android` |
+
+All five are enforced twice — `validate_android_host_only` at the top of `run_listen`/
+`run_connect` (before any network setup), and again defensively in `NetConfig::apply` at the
+host-config layer — none of these is a warning-only/best-effort check.
+
+Everything else (`--relay-only`, `--auto-reconnect`, `--carriers N`, `--pin-mtu`, the UDP
+hole-punch discovery flags) works identically to Linux.
+
+---
+
+## Emulator / dev notes
+
+Two CI jobs exercise Android without a physical device:
+
+- **`android-emu-e2e`** (Phase 2.2, `scripts/android_emu_test.sh`) — non-VPN subcommands
+  (`local`/`proxy`/`transfer`/`test-udp`/`server`) on a plain (non-rooted) emulator.
+- **`android-vpn-e2e`** (Phase 4.2, `scripts/android_vpn_test.sh`) — the VPN path, needs a
+  **rooted** emulator: `system-images;android-30;default;x86_64` started with
+  `-selinux off -writable-system` (the `default`, non-`google_apis`, image is the one that
+  allows root).
+
+Building for the emulator (x86_64) instead of a real device (ARM64) is covered under
+"Build and install" below.
+
+---
+
+## VPN backend reference
+
+The sections below are implementation detail for anyone modifying or debugging the Android VPN
+backend itself — not needed to just run `bore vpn` on a device.
+
+### TUN device creation
+
+#### Device node: `/dev/tun` (not desktop Linux's `/dev/net/tun`)
+
+Android's minimal `/dev` has no `net` subdirectory on stock ROMs, so the TUN clone device
+lives at `/dev/tun` — unlike desktop Linux, where it's `/dev/net/tun`. `bore-android-tun`
 tries `/dev/tun` first and falls back to `/dev/net/tun` for kernels/ROMs that still provide it.
 
-### bore-android-tun crate
+#### bore-android-tun crate
 
 The workspace declares `#![forbid(unsafe_code)]` at the root, so unsafe syscalls live
 in a separate crate, `crates/bore-android-tun`, which safely wraps:
@@ -86,18 +168,16 @@ in a separate crate, `crates/bore-android-tun`, which safely wraps:
 This mirrors the `crates/bore-wintun` model on Windows — isolate the FFI boundary, return
 safe types to the main crate.
 
-### Device naming
+#### Device naming
 
 Unlike macOS (kernel-assigned `utunN`, read back after creation), Android's TUN device is
 created with an explicit name, same as Linux: `pick_tun_name` resolves `--tun-name` (default
 `auto`) against `/sys/class/net/<name>` and picks the first free `bore0`, `bore1`, etc. if the
 requested name is taken. An explicit `--tun-name boreX` is honored as long as it's free.
 
----
+### Host-config backend (NetConfig::apply)
 
-## Host-config backend (NetConfig::apply)
-
-### Route setup (no ip_forward, no firewall)
+#### Route setup (no ip_forward, no firewall)
 
 Android's `NetConfig::apply` twin for Android:
 
@@ -121,7 +201,7 @@ No changes to:
 - `iptables` (available but not used for VPN routing on Android)
 - PF, `netsh`, WinTun (platform-specific, not Android)
 
-### The netd routing-policy database quirk
+#### The netd routing-policy database quirk
 
 **Symptom:** Host-initiated ping to a peer-tunneled subnet hangs; guest replies work.
 
@@ -141,7 +221,7 @@ This rule is scoped to the peer subnet and beats every netd rule (netd uses prio
 so the TUN's return-path packets reach "main" while normal app traffic routing is untouched.
 Rp_filter was also relaxed as defense-in-depth, though the rule is the actual fix.
 
-### Duplicate rule handling
+#### Duplicate rule handling
 
 Unlike `ip addr add` (which silently no-ops on an exact duplicate), `ip rule add` errors
 with `RTNETLINK answers: File exists` if the rule already exists. The rule lives in the
@@ -152,7 +232,7 @@ hits the existing rule.
 **Fix:** Issue the `ip rule add` via `std::process::Command` directly and tolerate stderr
 containing "File exists" as success — the rule is idempotent by construction.
 
-### No RAII state files on Android
+#### No RAII state files on Android
 
 Linux uses `/run/bore-vpn-*` state files to track refcounted `ip_forward` and leaked rules
 during SIGKILL recovery. Android has no writable `/run` under SELinux + app sandbox (Magisk/
@@ -164,58 +244,16 @@ Termux environments may differ, but unrooted Android has no `/run`). Instead:
 - **Restored on SIGKILL:** `stale_reclaim` flushes leaked state files but has no `ip_forward`
   to restore (it was never touched).
 
----
+### Build and install
 
-## Supported and unsupported flags
+#### From prebuilt binary
 
-### Supported (work identically to Linux)
-
-- `--relay-only` — skip direct QUIC upgrade, stay on relay (optional, default allows both)
-- `--auto-reconnect` — automatically reconnect on link death (optional, default off)
-- `--carriers N` — parallel relay carriers (default 1; rarely helps a VPN with a single inner flow)
-- `--pin-mtu` — lock TUN MTU (avoid dynamic PMTU monitor; for tests)
-- UDP hole-punch discovery flags (`--upnp`, `--stun-server`, `--try-port-prediction`,
-  `--nat-udp-preferred-port`, `--nat-udp-release-timeout`) — accepted, best-effort;
-  behavior on Android's NAT/firewall untested (CI is single-host; manual testing deferred)
-
-### NOT supported (rejected at CLI)
-
-| Flag | Why | Error message |
-|------|-----|---|
-| `--advertise <cidr>` (any non-empty) | Gateway mode forbidden | `Android VPN is host-only: --advertise is not supported` |
-| `--nat-masquerade` | Gateway feature | `--nat-masquerade is not supported on Android (host-only)` |
-| `--forward-accept` | Firewall feature | `--forward-accept is not supported on Android (host-only)` |
-| `--max-clients N` where `N > 1` | Hub mode forbidden | `hub mode is not supported on Android` |
-| `--tun-queues N` where `N > 1` | Multi-queue not supported | `multi-queue TUN is not supported on Android` |
-
-All five are rejected at the CLI (`validate_android_host_only`, `src/vpn.rs`), before any TUN
-is created — none of these is a warning-only/best-effort check.
-
-Attempting any of these fails before the TUN is created.
-
----
-
-## Build and install
-
-### From prebuilt binary
-
-The release page includes `bore-aarch64-linux-android` for most Android devices (ARM64).
-Download and place on the device:
-
-```bash
-# On your dev machine
-curl -fL https://github.com/manprint/bore/releases/latest/download/bore-aarch64-linux-android \
-  -o bore
-adb push bore /data/local/tmp/
-adb shell chmod +x /data/local/tmp/bore
-
-# On the device (or via adb shell)
-su -c '/data/local/tmp/bore vpn listen …'
-```
+The release page includes `bore-aarch64-linux-android` for most Android devices (ARM64) — see
+"Install (Termux)" above for the download command.
 
 For emulator (x86_64), the prebuilt binary is not yet in releases; build from source (see below).
 
-### From source
+#### From source
 
 **Prerequisites:**
 
@@ -254,42 +292,7 @@ adb push target/aarch64-linux-android/release/bore /data/local/tmp/
 adb shell chmod +x /data/local/tmp/bore
 ```
 
----
-
-## Runtime usage
-
-The CI e2e (`scripts/android_vpn_test.sh`) validates Android as the **connector** side, dialing
-into a `bore vpn listen` running on another host — this is the primary supported pattern. Android
-can also run `bore vpn listen`, as long as `--advertise` (and the other gateway-only flags) are
-never passed — host-only applies to both subcommands identically.
-
-**Host side** (any platform, e.g. the Linux machine the phone/emulator reaches):
-
-```bash
-bore server &
-bore vpn listen --to <bore-server-host:port> --secret <shared-secret> --id <link-id>
-```
-
-**Android side** (connector, as root):
-
-```bash
-adb shell "su -c '/data/local/tmp/bore vpn connect --to <bore-server-host:port> --secret <shared-secret> --id <link-id> --accept-all-routes'"
-```
-
-or inside Termux with Magisk `su`:
-
-```bash
-su -c '/data/local/tmp/bore vpn connect --to <bore-server-host:port> --secret <shared-secret> --id <link-id>'
-```
-
-`--accept-all-routes` is only needed if the far side advertises routes (it never does when the
-far side is also Android — host-only means no side advertises anything). Never pass `--advertise`,
-`--nat-masquerade`, `--forward-accept`, `--max-clients > 1`, or `--tun-queues > 1` on Android —
-see the rejected-flags table above.
-
----
-
-## Validation status
+### Validation status
 
 **CI (rooted x86_64 emulator, API 30):**
 - ✅ TUN creation + interface config + relay uplink (`T-AND-S1`, `T-AND-L1`)
@@ -309,19 +312,17 @@ see the rejected-flags table above.
 - Magisk/Termux bridge behavior
 - SELinux policy interactions with `/data/local/tmp` state files
 
----
+### Troubleshooting
 
-## Troubleshooting
-
-### Not running as root
+#### Not running as root
 
 ```
 error: not running as root (uid=<uid>). bore vpn requires root or CAP_NET_ADMIN
 ```
 
-**Fix:** Run with `su -c` or ensure the shell is root.
+**Fix:** Run with `su -c`/`tsu` or ensure the shell is root.
 
-### TUN device not found
+#### TUN device not found
 
 ```
 error: bore-android-tun: failed to open /dev/tun: permission denied
@@ -330,7 +331,7 @@ error: bore-android-tun: failed to open /dev/tun: permission denied
 **Fix:** Confirm you are running as root, and the device has `/dev/tun` (should be present on any stock
 Android with Linux kernel TUN support).
 
-### Stale `ip rule` entries accumulate across links
+#### Stale `ip rule` entries accumulate across links
 
 You will never see `RTNETLINK answers: File exists` as a bore-level error — bore itself
 tolerates an exact-duplicate `ip rule add to <subnet> lookup main priority 100` internally
@@ -348,20 +349,18 @@ adb shell "su -c 'ip rule show'"
 adb shell "su -c 'ip rule del to <stale-subnet> lookup main priority 100'"
 ```
 
-### Direct path not upgrading
+#### Direct path not upgrading
 
 If the link stays on relay and never tries to upgrade to direct:
 
 - Check `--relay-only` (forces relay only).
 - On a UDP-hostile network, direct upgrade may never succeed but the link stays stable on relay
-  (this is correct behavior, not a failure — see `direct_upgrade_task`'''s 30s retry grid in
+  (this is correct behavior, not a failure — see `direct_upgrade_task`'s 30s retry grid in
   CLAUDE.md, which applies unchanged on Android).
 
----
+### Testing
 
-## Testing
-
-### Unit tests (cross-platform, on Linux CI)
+#### Unit tests (cross-platform, on Linux CI)
 
 ```bash
 cargo test --features vpn --lib vpn::
@@ -370,12 +369,12 @@ cargo test --features vpn --lib vpn::
 All Android host-config logic is pure functions or gated by a `target_is_android()` parameter,
 so unit tests run on Linux CI without an actual Android device.
 
-### Emulator e2e (`android-vpn-e2e` CI job)
+#### Emulator e2e (`android-vpn-e2e` CI job)
 
 Runs on every push to CI: rooted x86_64 emulator, API 30, covers TUN creation, relay/direct
 paths, CLI guards, and SIGKILL reclaim.
 
-### Manual device acceptance (Phase 5.2)
+#### Manual device acceptance (Phase 5.2)
 
 See `VPN_ANDROID_ACCEPTANCE.md` (not yet written; will cover real 2+ device scenarios,
 carrier failover, and network switching).

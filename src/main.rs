@@ -676,6 +676,47 @@ enum Command {
             env = "BORE_WEBSERVER_LOG_MAX_FILE_SIZE"
         )]
         webserver_log_max_file_size: u64,
+
+        /// Enable the embedded SSH ingress gateway (stock `ssh -R`/`-L`
+        /// clients, no `bore` binary needed). Requires --ssh-authorized-keys-dir
+        /// and/or --ssh-passwords-file.
+        #[cfg(feature = "ssh-gateway")]
+        #[clap(long, env = "BORE_SSH_GATEWAY")]
+        ssh_gateway: bool,
+
+        /// Bind a dedicated TCP listener for the SSH gateway on this port
+        /// (requires --ssh-gateway). Control-port demux lands in a later phase.
+        #[cfg(feature = "ssh-gateway")]
+        #[clap(long, value_name = "PORT", env = "BORE_SSH_PORT")]
+        ssh_port: Option<u16>,
+
+        /// Path to the gateway's ed25519 host key (OpenSSH PEM). Generated on
+        /// first use if it does not exist yet.
+        #[cfg(feature = "ssh-gateway")]
+        #[clap(
+            long,
+            value_name = "PATH",
+            default_value = "bore_ssh_host_key.pem",
+            env = "BORE_SSH_HOST_KEY_FILE"
+        )]
+        ssh_host_key_file: PathBuf,
+
+        /// Directory of `authorized_keys`-format files granting SSH gateway
+        /// public-key auth.
+        #[cfg(feature = "ssh-gateway")]
+        #[clap(long, value_name = "DIR", env = "BORE_SSH_AUTHORIZED_KEYS_DIR")]
+        ssh_authorized_keys_dir: Option<PathBuf>,
+
+        /// Argon2id password file granting SSH gateway password auth
+        /// (generate with `bore hash-password`).
+        #[cfg(feature = "ssh-gateway")]
+        #[clap(long, value_name = "PATH", env = "BORE_SSH_PASSWORDS_FILE")]
+        ssh_passwords_file: Option<PathBuf>,
+
+        /// Banner text sent to SSH gateway clients before authentication.
+        #[cfg(feature = "ssh-gateway")]
+        #[clap(long, value_name = "TEXT", env = "BORE_SSH_BANNER")]
+        ssh_banner: Option<String>,
     },
 
     /// Diagnose this host's UDP / NAT / firewall for hole-punching (opens no
@@ -1873,6 +1914,18 @@ async fn dispatch(command: Command) -> Result<()> {
             webserver_log,
             webserver_log_max_files,
             webserver_log_max_file_size,
+            #[cfg(feature = "ssh-gateway")]
+            ssh_gateway,
+            #[cfg(feature = "ssh-gateway")]
+            ssh_port,
+            #[cfg(feature = "ssh-gateway")]
+            ssh_host_key_file,
+            #[cfg(feature = "ssh-gateway")]
+            ssh_authorized_keys_dir,
+            #[cfg(feature = "ssh-gateway")]
+            ssh_passwords_file,
+            #[cfg(feature = "ssh-gateway")]
+            ssh_banner,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -2077,6 +2130,29 @@ async fn dispatch(command: Command) -> Result<()> {
                 tls: config_tls,
             };
             server.set_config_view(config_view);
+
+            #[cfg(feature = "ssh-gateway")]
+            {
+                if ssh_port.is_some() && !ssh_gateway {
+                    Args::command()
+                        .error(
+                            ErrorKind::ArgumentConflict,
+                            "--ssh-port requires --ssh-gateway",
+                        )
+                        .exit();
+                }
+                if ssh_gateway {
+                    let ssh_cfg = bore_cli::sshgw::SshGatewayConfig {
+                        port: ssh_port,
+                        host_key_file: ssh_host_key_file,
+                        authorized_keys_dir: ssh_authorized_keys_dir,
+                        passwords_file: ssh_passwords_file,
+                        banner: ssh_banner,
+                    };
+                    server.set_ssh_gateway(ssh_cfg)?;
+                }
+            }
+
             server.listen().await?;
         }
         Command::Vhost {

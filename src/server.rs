@@ -238,6 +238,10 @@ pub struct Server {
     /// before reaping the connection (and its admin entry). Defaults to
     /// [`secret::SECRET_CTRL_TIMEOUT`]; lowered by tests to reap fast.
     secret_ctrl_timeout: std::time::Duration,
+
+    /// Embedded SSH ingress gateway (Phase 4), when enabled via `--ssh-gateway`.
+    #[cfg(feature = "ssh-gateway")]
+    ssh_gateway: Option<Arc<crate::sshgw::SshGateway>>,
 }
 
 impl Server {
@@ -334,6 +338,8 @@ impl Server {
             access_logger: None,
             access_logger_dropped: Arc::new(AtomicU64::new(0)),
             secret_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
+            #[cfg(feature = "ssh-gateway")]
+            ssh_gateway: None,
         }
     }
 
@@ -682,6 +688,24 @@ impl Server {
         self.vpn_hub_prefix = prefix;
     }
 
+    /// Enable the embedded SSH ingress gateway. Builds it from clones of this
+    /// server's own registries and helpers (never re-derived) so it shares
+    /// the exact same tunnel-serving state as the native accept paths.
+    #[cfg(feature = "ssh-gateway")]
+    pub fn set_ssh_gateway(&mut self, config: crate::sshgw::SshGatewayConfig) -> Result<()> {
+        let gateway = crate::sshgw::SshGateway::new(
+            config,
+            self.providers.clone(),
+            self.vhost_registry.clone(),
+            self.admin.clone(),
+            Arc::clone(&self.conn_permits),
+            self.port_range.clone(),
+            self.bind_tunnels,
+        )?;
+        self.ssh_gateway = Some(Arc::new(gateway));
+        Ok(())
+    }
+
     /// Start the server, listening for new connections.
     pub async fn listen(self) -> Result<()> {
         let this = Arc::new(self);
@@ -977,6 +1001,55 @@ impl Server {
                     }
                 },
                 Err(err) => warn!(%err, "failed to bind vhost QUIC endpoint; vhost --udp disabled"),
+            }
+        }
+
+        // SSH ingress gateway (Phase 4): dedicated TCP listener handing accepted
+        // connections to russh. Control-port demux lands in a later phase (D8).
+        #[cfg(feature = "ssh-gateway")]
+        if let Some(gateway) = this.ssh_gateway.clone() {
+            if let Some(port) = gateway.port() {
+                let ssh_listener = TcpListener::bind((this.bind_addr, port)).await?;
+                info!(port, "ssh gateway listening");
+                let this2 = Arc::clone(&this);
+                tokio::spawn(async move {
+                    loop {
+                        match ssh_listener.accept().await {
+                            Ok((stream, addr)) => {
+                                tune_tcp(&stream);
+                                let permit = match Arc::clone(&this2.conn_permits)
+                                    .try_acquire_owned()
+                                {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        this2
+                                            .conn_rejections
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        debug!("ssh gateway connection dropped: max-conns reached");
+                                        continue;
+                                    }
+                                };
+                                let gateway = Arc::clone(&gateway);
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    let config = gateway.russh_config();
+                                    let handler = gateway.handler();
+                                    match russh::server::run_stream(config, stream, handler).await {
+                                        Ok(session) => {
+                                            if let Err(err) = session.await {
+                                                debug!(%err, %addr, "ssh gateway session ended");
+                                            }
+                                        }
+                                        Err(err) => {
+                                            debug!(%err, %addr, "ssh gateway handshake failed");
+                                        }
+                                    }
+                                });
+                            }
+                            Err(err) => warn!(%err, "ssh gateway accept error"),
+                        }
+                    }
+                });
             }
         }
 

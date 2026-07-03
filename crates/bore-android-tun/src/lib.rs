@@ -44,7 +44,8 @@ pub fn create(name: &str) -> Result<(tun_rs::AsyncDevice, String)> {
 
     let mut ifr: nix::libc::ifreq = unsafe { std::mem::zeroed() };
     for (dst, src) in ifr.ifr_name.iter_mut().zip(name.as_bytes()) {
-        *dst = *src as std::os::raw::c_char;
+        // Same cross-arch c_char signedness note as `actual_name` below.
+        *dst = *src as i32 as std::os::raw::c_char;
     }
     ifr.ifr_ifru.ifru_flags = (nix::libc::IFF_TUN | nix::libc::IFF_NO_PI) as std::os::raw::c_short;
 
@@ -60,9 +61,12 @@ pub fn create(name: &str) -> Result<(tun_rs::AsyncDevice, String)> {
     let actual_name = {
         let raw = &ifr.ifr_name;
         let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+        // `c_char` is `i8` on x86_64 but `u8` on aarch64 — route through `i32` so
+        // neither cast below is ever a same-type no-op on either arch (clippy
+        // ::unnecessary_cast fires per-target otherwise; interface names are ASCII).
         raw[..end]
             .iter()
-            .map(|&c| c as u8 as char)
+            .map(|&c| c as i32 as u8 as char)
             .collect::<String>()
     };
 

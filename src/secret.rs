@@ -279,7 +279,7 @@ pub async fn serve_provider(
             return Ok(());
         }
         Entry::Vacant(slot) => {
-            let pool = Arc::new(CarrierPool::new(opener));
+            let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Mux(opener)));
             slot.insert(Arc::clone(&pool));
             pool
         }
@@ -714,7 +714,7 @@ async fn relay(
     let mut last_err = None;
     for _ in 0..attempts {
         let Some(opener) = pool.pick() else { break };
-        match opener.open().await {
+        match opener.open_ready(None).await {
             Ok(stream) => {
                 provider = Some(stream);
                 break;
@@ -732,7 +732,6 @@ async fn relay(
             None => bail!("no live provider carrier"),
         },
     };
-    provider.write_all(&[mux::STREAM_READY]).await?;
 
     let buf = proxy_buffer_size();
     // Count bytes LIVE as they flow (not only on close) so the admin secret-tunnel
@@ -774,7 +773,7 @@ impl DataPath {
 /// QUIC stream).
 #[derive(Clone)]
 enum StreamOpener {
-    Mux(mux::Opener),
+    Mux(mux::LinkOpener),
     #[cfg(feature = "udp")]
     Direct(crate::holepunch::DirectConn),
 }
@@ -975,7 +974,7 @@ impl Proxy {
         }
 
         // The relay carrier pool seeded with this (main) connection's opener.
-        let pool = Arc::new(CarrierPool::new(opener));
+        let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Mux(opener)));
         let mut data_path = DataPath::Relay(Arc::clone(&pool));
         let mut direct = false;
         let mut direct_closed_rx = None;
@@ -1539,7 +1538,7 @@ async fn open_consumer_carrier(
         Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
         _ => bail!("unexpected response to carrier connect"),
     }
-    let carrier = Carrier::new(opener);
+    let carrier = Carrier::new(mux::LinkOpener::Mux(opener));
     let alive = Arc::clone(&carrier.alive);
     if !pool.push(carrier, max as usize) {
         return Ok(()); // pool already at capacity
@@ -1920,7 +1919,7 @@ async fn forward(mut local: TcpStream, opener: StreamOpener) -> Result<()> {
     // Announce the stream so the peer routes it even if the local service waits
     // to speak first; the marker is consumed on the other end. Flush it so the
     // peer sees the stream promptly (a fresh QUIC stream is silent until flushed).
-    stream.write_all(&[mux::STREAM_READY]).await?;
+    mux::write_stream_ready(&mut stream, None).await?;
     stream.flush().await?;
     let buf = proxy_buffer_size();
     tokio::io::copy_bidirectional_with_sizes(&mut local, &mut stream, buf, buf).await?;

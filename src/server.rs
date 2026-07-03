@@ -1576,7 +1576,7 @@ impl Server {
         // handshakes and deliver their substream openers through `carrier_rx`. The
         // data path is unchanged — only *which* connection opens each substream.
         let effective = opts.carriers.clamp(1, self.max_carriers.max(1));
-        let pool = CarrierPool::new(opener);
+        let pool = CarrierPool::new(mux::LinkOpener::Mux(opener));
         let mut carrier_rx = if opts.carriers > 1 {
             let extra = effective - 1;
             let token = Uuid::new_v4().to_string();
@@ -1845,20 +1845,15 @@ impl Server {
                             }
                         }
 
-                        // Relay fallback.
-                        match opener.open().await {
+                        // Relay fallback. Announce the lazily-opened substream so the
+                        // client dials the local service before any payload flows (Phase 3).
+                        let forward_ip = if client_wants_logging {
+                            Some(addr.ip().to_string())
+                        } else {
+                            None
+                        };
+                        match opener.open_ready(forward_ip.as_deref()).await {
                             Ok(mut stream) => {
-                                // Announce the lazily-opened substream so the client
-                                // dials the local service before any payload flows (Phase 3).
-                                let forward_ip = if client_wants_logging {
-                                    Some(addr.ip().to_string())
-                                } else {
-                                    None
-                                };
-                                if let Err(err) = mux::write_stream_ready(&mut stream, forward_ip.as_deref()).await {
-                                    trace!(%err, "failed to establish multiplexed stream");
-                                    return;
-                                }
                                 let buf = proxy_buffer_size();
                                 // Count bytes LIVE as they flow (not only on close) so the
                                 // admin TX/RX columns update for long-lived connections.
@@ -1918,7 +1913,7 @@ impl Server {
             warn!("carrier join with unknown token");
             return Ok(());
         };
-        let carrier = Carrier::new(opener);
+        let carrier = Carrier::new(mux::LinkOpener::Mux(opener));
         let alive = Arc::clone(&carrier.alive);
         if tx.send(carrier).is_err() {
             // The tunnel ended between the lookup and the send.

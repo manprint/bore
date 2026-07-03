@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::pin::Pin;
 #[cfg(feature = "udp")]
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
@@ -494,10 +493,6 @@ impl Drop for Deregister {
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
-trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
-
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
-
 #[cfg(feature = "udp")]
 fn new_nonce() -> [u8; UDP_NONCE_LEN] {
     use ring::rand::{SecureRandom, SystemRandom};
@@ -584,7 +579,7 @@ pub async fn serve_vhost_provider(
             return Ok(());
         }
         Entry::Vacant(slot) => {
-            let pool = Arc::new(CarrierPool::new(opener));
+            let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Mux(opener)));
             let entry = Arc::new(VhostEntry {
                 pool: Arc::clone(&pool),
                 request_headers,
@@ -781,7 +776,14 @@ pub async fn relay_vhost(
     fqdn: &str,
     log_ctx: LogContext,
 ) -> Result<()> {
-    let mut provider: Pin<Box<dyn AsyncReadWrite>> = {
+    // Caller IP forwarding (Phase 3), computed up front so every branch below
+    // can announce readiness with it.
+    let forward_ip = if entry.webserver_log {
+        Some(addr.ip().to_string())
+    } else {
+        None
+    };
+    let mut provider: mux::LinkStream = {
         #[cfg(feature = "udp")]
         {
             // In vhost UDP the server opens the QUIC streams and the provider
@@ -791,37 +793,40 @@ pub async fn relay_vhost(
             let direct = entry.direct.pick();
             match direct {
                 Some(direct) => match direct.open_stream().await {
-                    Ok(stream) => {
+                    Ok(mut stream) => {
                         entry
                             .direct_stream_opens
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Box::pin(stream)
+                        mux::write_stream_ready(&mut stream, forward_ip.as_deref()).await?;
+                        Box::new(stream)
                     }
                     Err(err) => {
                         debug!(%err, "vhost QUIC open_stream failed; using TCP carrier");
                         let opener = entry.pool.pick().context("no live vhost carrier")?;
-                        Box::pin(opener.open().await.context("vhost provider unavailable")?)
+                        opener
+                            .open_ready(forward_ip.as_deref())
+                            .await
+                            .context("vhost provider unavailable")?
                     }
                 },
                 None => {
                     let opener = entry.pool.pick().context("no live vhost carrier")?;
-                    Box::pin(opener.open().await.context("vhost provider unavailable")?)
+                    opener
+                        .open_ready(forward_ip.as_deref())
+                        .await
+                        .context("vhost provider unavailable")?
                 }
             }
         }
         #[cfg(not(feature = "udp"))]
         {
             let opener = entry.pool.pick().context("no live vhost carrier")?;
-            Box::pin(opener.open().await.context("vhost provider unavailable")?)
+            opener
+                .open_ready(forward_ip.as_deref())
+                .await
+                .context("vhost provider unavailable")?
         }
     };
-    // Write STREAM_READY with optional caller IP forwarding (Phase 3).
-    let forward_ip = if entry.webserver_log {
-        Some(addr.ip().to_string())
-    } else {
-        None
-    };
-    mux::write_stream_ready(&mut provider, forward_ip.as_deref()).await?;
 
     // Keep a copy of the head for logging (before it's moved/rewritten).
     let head_for_logging = head.clone();

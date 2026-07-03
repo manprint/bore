@@ -84,6 +84,50 @@ impl Opener {
     }
 }
 
+/// Any stream usable as a forwarded connection's data path once opened and
+/// readiness-marked. Boxed to erase the underlying transport (a yamux
+/// substream today; an SSH channel in a later phase).
+pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+
+/// A boxed, transport-erased forwarded-connection stream.
+pub type LinkStream = Box<dyn Duplex>;
+
+/// How to open a fresh substream toward a tunnel's registered peer. Wraps the
+/// transport so the public/vhost/secret relay paths don't need to know
+/// whether the peer connected over the classic yamux mux or (a later phase)
+/// an SSH gateway channel. [`CarrierPool`](crate::pool::CarrierPool) stores
+/// this instead of a bare [`Opener`].
+#[derive(Clone)]
+pub enum LinkOpener {
+    /// The classic yamux-multiplexed substream opener.
+    Mux(Opener),
+}
+
+impl LinkOpener {
+    /// Open a substream without announcing it. Only meaningful for callers
+    /// that need to interleave more setup before the peer sees any data
+    /// (e.g. picking between a direct and a relayed path and announcing
+    /// readiness once on whichever succeeded). Most callers want
+    /// [`LinkOpener::open_ready`] instead.
+    pub async fn open(&self) -> io::Result<Stream> {
+        match self {
+            LinkOpener::Mux(opener) => opener.open().await,
+        }
+    }
+
+    /// Open a substream, write the STREAM_READY marker (with optional caller
+    /// IP), flush it, and return the boxed stream ready to splice. A failure
+    /// at any step (open or marker write) is reported as one error so
+    /// carrier-failover callers can treat it identically to an open failure.
+    pub async fn open_ready(&self, forward_ip: Option<&str>) -> io::Result<LinkStream> {
+        let mut stream = self.open().await?;
+        write_stream_ready(&mut stream, forward_ip).await?;
+        stream.flush().await?;
+        Ok(Box::new(stream))
+    }
+}
+
 /// Handle for accepting inbound substreams opened by the peer.
 pub struct Acceptor {
     inbound: mpsc::Receiver<Stream>,
@@ -331,5 +375,30 @@ mod tests {
         // Old client reads exactly one byte and should get STREAM_READY.
         let result = read_stream_ready(&mut server, false).await.unwrap();
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn link_open_ready_writes_single_zero_byte() {
+        // Real yamux pair: open a substream through LinkOpener and confirm the
+        // peer sees exactly one byte, STREAM_READY, before any payload.
+        let (a, b) = tokio::io::duplex(4096);
+        let (opener, _client_acceptor) = client(a);
+        let (_server_opener, mut server_acceptor) = server(b);
+
+        let link = LinkOpener::Mux(opener);
+        let _stream = link.open_ready(None).await.unwrap();
+
+        let mut accepted = server_acceptor.accept().await.expect("substream accepted");
+        let mut marker = [0u8; 1];
+        accepted.read_exact(&mut marker).await.unwrap();
+        assert_eq!(marker[0], STREAM_READY);
+
+        // Nothing else was written yet (no IP header, since forward_ip was None).
+        let mut probe = [0u8; 1];
+        let n = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            accepted.read(&mut probe).await
+        })
+        .await;
+        assert!(n.is_err(), "no further bytes expected without forward_ip");
     }
 }

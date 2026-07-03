@@ -316,6 +316,57 @@ jobs:
           target: default
           script: BORE_HOST_BIN=$PWD/target/release/bore BORE_ANDROID_BIN=$PWD/target/x86_64-linux-android/release/bore ./scripts/android_emu_test.sh
 
+  # Android VPN e2e — spike (TUN/apply-revert/reclaim) + a live host-only
+  # relay link between the host (listener) and a rooted emulator guest
+  # (connector), plus the D-A4/D-A6/D-A9 CLI guard negatives. Independent
+  # job (no needs/if gating), mirrors android-emu-e2e's placement/style.
+  # Phase 4 of docs/plans/plan_AndroidSupport.
+  android-vpn-e2e:
+    name: Android VPN e2e (api 30, x86_64)
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_API: "24" # must match Justfile's android_api
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Enable KVM for the hosted emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Build host binary (--features vpn)
+        run: cargo build --release --features vpn
+
+      - name: Build Android binary + spike example (x86_64, via cargo-ndk)
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+          cargo ndk -t x86_64 -P "$ANDROID_API" build --release --features vpn
+          cargo ndk -t x86_64 -P "$ANDROID_API" build --release --features vpn --example android_vpn_spike
+
+      - name: Run emulator + VPN e2e (T-AND-S1..S3, T-AND-L1..L5)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: default
+          script: >-
+            BORE_HOST_BIN=$PWD/target/release/bore
+            BORE_ANDROID_BIN=$PWD/target/x86_64-linux-android/release/bore
+            BORE_SPIKE_BIN=$PWD/target/x86_64-linux-android/release/examples/android_vpn_spike
+            ./scripts/android_vpn_test.sh
+
   audit:
     name: Security audit
     runs-on: ubuntu-latest

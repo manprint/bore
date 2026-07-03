@@ -292,6 +292,233 @@ impl Handler for GatewayHandler {
     }
 }
 
+/// Where a granted `tcpip-forward` request routes to (D1's address grammar):
+/// a native `bore local` public tunnel, a vhost subdomain, or a secret-tunnel
+/// provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardSpec {
+    /// Public tunnel. `port` is the requested port; `0` means "assign one
+    /// from the server's port range".
+    Public {
+        /// Requested port, or 0 to auto-assign.
+        port: u16,
+    },
+    /// Vhost subdomain forward.
+    Vhost {
+        /// Subdomain label: lowercase `[a-z0-9-]+`, single label, same
+        /// charset as [`crate::vhost::extract_subdomain`].
+        label: String,
+    },
+    /// Secret-tunnel provider forward.
+    SecretProvider {
+        /// Secret tunnel id, same charset as a vhost label.
+        id: String,
+    },
+}
+
+/// Error parsing a `tcpip-forward`/`direct-tcpip` address into a
+/// [`ForwardSpec`] or secret-consumer target id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecError(pub String);
+
+impl std::fmt::Display for SpecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SpecError {}
+
+/// Validates a vhost/secret label: lowercase `[a-z0-9-]+`, single label (no
+/// dots), not starting or ending with `-` — the exact charset
+/// `vhost::extract_subdomain` (`src/vhost.rs`) accepts.
+fn validate_label(label: &str) -> Result<String, SpecError> {
+    let valid = !label.is_empty()
+        && !label.contains('.')
+        && label
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !label.starts_with('-')
+        && !label.ends_with('-');
+    if valid {
+        Ok(label.to_string())
+    } else {
+        Err(SpecError(format!(
+            "invalid label {label:?}: must be lowercase [a-z0-9-]+, a single label, no leading/trailing hyphen"
+        )))
+    }
+}
+
+/// Parses a `tcpip-forward` bind address/port into a [`ForwardSpec`] (D1):
+/// - empty / `localhost` / `127.0.0.1` / `0.0.0.0` / `*` → [`ForwardSpec::Public`];
+/// - `vhost/<label>` → [`ForwardSpec::Vhost`], any port;
+/// - `secret/<id>` → [`ForwardSpec::SecretProvider`], any port;
+/// - a bare label on port 80/443 → [`ForwardSpec::Vhost`];
+/// - a bare label on port 0 → [`ForwardSpec::SecretProvider`];
+/// - a bare label on any other port is ambiguous and rejected — use a
+///   `vhost/` or `secret/` prefix to disambiguate.
+pub fn parse_forward_spec(addr: &str, port: u32) -> Result<ForwardSpec, SpecError> {
+    let port16 = u16::try_from(port).map_err(|_| SpecError(format!("port {port} out of range")))?;
+
+    if addr.is_empty() || matches!(addr, "localhost" | "127.0.0.1" | "0.0.0.0" | "*") {
+        return Ok(ForwardSpec::Public { port: port16 });
+    }
+    if let Some(label) = addr.strip_prefix("vhost/") {
+        return validate_label(label).map(|label| ForwardSpec::Vhost { label });
+    }
+    if let Some(id) = addr.strip_prefix("secret/") {
+        return validate_label(id).map(|id| ForwardSpec::SecretProvider { id });
+    }
+    match port16 {
+        80 | 443 => validate_label(addr).map(|label| ForwardSpec::Vhost { label }),
+        0 => validate_label(addr).map(|id| ForwardSpec::SecretProvider { id }),
+        _ => Err(SpecError(format!(
+            "ambiguous forward address {addr:?} on port {port16}; use a vhost/ or secret/ prefix"
+        ))),
+    }
+}
+
+/// Parses a `direct-tcpip` destination host/port into a secret-consumer
+/// target id (Phase 5.3 routes `ssh -L` through this). Only `<id>` or
+/// `secret/<id>` on port 0 are accepted; anything else is rejected with a
+/// message suitable for the channel-open failure reason.
+pub fn parse_direct_tcpip_dest(host: &str, port: u32) -> Result<String, SpecError> {
+    if port != 0 {
+        return Err(SpecError(format!(
+            "direct-tcpip to {host}:{port} not supported; use port 0 with a secret tunnel id"
+        )));
+    }
+    let id = host.strip_prefix("secret/").unwrap_or(host);
+    validate_label(id).map_err(|_| SpecError(format!("invalid secret tunnel id {host:?}")))
+}
+
+/// Client-transport-only keys: features the native `bore` client implements
+/// that have no equivalent over SSH ingress. Recognized so they produce a
+/// clear warning instead of a silent no-op or an "unknown parameter" one.
+const TRANSPORT_ONLY_KEYS: &[&str] = &[
+    "udp",
+    "carriers",
+    "stun-server",
+    "upnp",
+    "try-port-prediction",
+    "nat-udp-preferred-port",
+    "auto-reconnect",
+];
+
+/// Per-forward parameters parsed from an `exec` request string and/or
+/// `env` requests, merged with a [`crate::sshgw_auth::KeyGrant`]'s own
+/// options (precedence: grant > exec > env, per I-2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Params {
+    /// Free-text notes for the admin dashboard.
+    pub notes: Option<String>,
+    /// Per-tunnel connection cap.
+    pub max_conns: Option<usize>,
+    /// HTTP basic-auth credentials (`user:pass`) for a vhost forward.
+    pub basic_auth: Option<String>,
+    /// Enable per-tunnel access logging.
+    pub webserver_log: bool,
+    /// Explicit tunnel id override.
+    pub id: Option<String>,
+    /// One warning per unsupported or unrecognized key, in encounter order —
+    /// nothing is silently dropped (I-2).
+    pub warnings: Vec<String>,
+}
+
+/// Splits a `key=value ...` string into tokens, honoring double-quoted
+/// values that may contain spaces (e.g. `notes="two words"`). Quote
+/// characters themselves are stripped, not part of the token.
+fn tokenize(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for c in s.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Splits each whitespace-delimited (quote-aware) token on its first `=`
+/// into a `(key, value)` pair. Tokens without an `=` are dropped.
+fn parse_kv_tokens(s: &str) -> Vec<(String, String)> {
+    tokenize(s)
+        .into_iter()
+        .filter_map(|tok| {
+            tok.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Maps `BORE_<KEY>` environment entries to the same `key=value` grammar as
+/// `exec` params (e.g. `BORE_MAX_CONNS` → `max-conns`). Entries without the
+/// `BORE_` prefix are ignored — they are not bore parameters.
+fn env_params(env: &[(String, String)]) -> Vec<(String, String)> {
+    env.iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("BORE_")
+                .map(|rest| (rest.to_ascii_lowercase().replace('_', "-"), v.clone()))
+        })
+        .collect()
+}
+
+/// Parses `exec`/`env` request data into [`Params`], applying the SSH
+/// gateway's key=value grammar (I-2). Precedence is grant > exec > env: a
+/// [`crate::sshgw_auth::KeyGrant`]'s own `max-conns`/`notes` always win, an
+/// `exec` value wins over the same key set via `env`, and any key naming a
+/// client-transport-only feature or that isn't recognized at all produces a
+/// warning rather than being silently accepted or dropped.
+pub fn parse_params(
+    exec: Option<&str>,
+    env: &[(String, String)],
+    grant: &crate::sshgw_auth::KeyGrant,
+) -> Params {
+    let mut merged: Vec<(String, String)> = env_params(env);
+    if let Some(exec) = exec {
+        merged.extend(parse_kv_tokens(exec));
+    }
+
+    let mut params = Params::default();
+    for (key, value) in &merged {
+        match key.as_str() {
+            "notes" => params.notes = Some(value.clone()),
+            "max-conns" => match value.parse() {
+                Ok(n) => params.max_conns = Some(n),
+                Err(_) => params
+                    .warnings
+                    .push(format!("max-conns: invalid value {value:?}")),
+            },
+            "basic-auth" => params.basic_auth = Some(value.clone()),
+            "webserver-log" => params.webserver_log = value == "on",
+            "id" => params.id = Some(value.clone()),
+            k if TRANSPORT_ONLY_KEYS.contains(&k) => params.warnings.push(format!(
+                "{k}: not available via SSH ingress; use the native bore client"
+            )),
+            k => params.warnings.push(format!("{k}: unknown parameter")),
+        }
+    }
+
+    if let Some(max_conns) = grant.max_conns {
+        params.max_conns = Some(max_conns);
+    }
+    if let Some(notes) = &grant.notes {
+        params.notes = Some(notes.clone());
+    }
+
+    params
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +584,149 @@ mod tests {
             first, second,
             "reloaded host key must have the same fingerprint"
         );
+    }
+
+    fn grant(identity: &str) -> crate::sshgw_auth::KeyGrant {
+        crate::sshgw_auth::KeyGrant {
+            identity: identity.to_string(),
+            permit: None,
+            max_conns: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn spec_matrix() {
+        let ok_cases = [
+            ("", 9005, ForwardSpec::Public { port: 9005 }),
+            ("localhost", 9005, ForwardSpec::Public { port: 9005 }),
+            ("127.0.0.1", 9005, ForwardSpec::Public { port: 9005 }),
+            ("0.0.0.0", 9005, ForwardSpec::Public { port: 9005 }),
+            ("*", 9005, ForwardSpec::Public { port: 9005 }),
+            (
+                "vhost/foo",
+                9005,
+                ForwardSpec::Vhost {
+                    label: "foo".to_string(),
+                },
+            ),
+            (
+                "vhost/foo",
+                0,
+                ForwardSpec::Vhost {
+                    label: "foo".to_string(),
+                },
+            ),
+            (
+                "secret/bar",
+                9005,
+                ForwardSpec::SecretProvider {
+                    id: "bar".to_string(),
+                },
+            ),
+            (
+                "secret/bar",
+                0,
+                ForwardSpec::SecretProvider {
+                    id: "bar".to_string(),
+                },
+            ),
+            (
+                "mysub",
+                80,
+                ForwardSpec::Vhost {
+                    label: "mysub".to_string(),
+                },
+            ),
+            (
+                "mysub",
+                443,
+                ForwardSpec::Vhost {
+                    label: "mysub".to_string(),
+                },
+            ),
+            (
+                "tcp-id",
+                0,
+                ForwardSpec::SecretProvider {
+                    id: "tcp-id".to_string(),
+                },
+            ),
+        ];
+        for (addr, port, expected) in ok_cases {
+            assert_eq!(
+                parse_forward_spec(addr, port).unwrap(),
+                expected,
+                "addr={addr:?} port={port}"
+            );
+        }
+
+        let err_cases = [
+            ("mysub", 8080),  // ambiguous: bare label, non-80/443/0 port
+            ("My_Sub", 80),   // uppercase/underscore not allowed
+            ("a.b", 80),      // dot not allowed in a single label
+            ("-bad", 80),     // leading hyphen not allowed
+            ("bad-", 443),    // trailing hyphen not allowed
+            ("vhost/", 9005), // empty label after prefix
+        ];
+        for (addr, port) in err_cases {
+            assert!(
+                parse_forward_spec(addr, port).is_err(),
+                "addr={addr:?} port={port} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn params_precedence() {
+        let mut g = grant("id1");
+        g.max_conns = Some(3);
+        let params = parse_params(Some("max-conns=9"), &[], &g);
+        assert_eq!(params.max_conns, Some(3), "grant value must win over exec");
+
+        let env = [("BORE_MAX_CONNS".to_string(), "7".to_string())];
+        let params = parse_params(None, &env, &grant("id2"));
+        assert_eq!(
+            params.max_conns,
+            Some(7),
+            "env value must be used when exec is absent"
+        );
+    }
+
+    #[test]
+    fn params_quoting() {
+        let params = parse_params(
+            Some(r#"notes="two words" basic-auth=u:p"#),
+            &[],
+            &grant("id"),
+        );
+        assert_eq!(params.notes.as_deref(), Some("two words"));
+        assert_eq!(params.basic_auth.as_deref(), Some("u:p"));
+        assert!(params.warnings.is_empty());
+    }
+
+    #[test]
+    fn params_warnings_for_transport_keys() {
+        let params = parse_params(Some("udp=on carriers=4"), &[], &grant("id"));
+        assert_eq!(params.warnings.len(), 2);
+        assert!(params.warnings[0].contains("udp"));
+        assert!(params.warnings[1].contains("carriers"));
+        assert!(params
+            .warnings
+            .iter()
+            .all(|w| w.contains("not available via SSH ingress")));
+    }
+
+    #[test]
+    fn direct_tcpip_dest() {
+        assert_eq!(
+            parse_direct_tcpip_dest("tcp-id", 0).unwrap(),
+            "tcp-id".to_string()
+        );
+        assert_eq!(
+            parse_direct_tcpip_dest("secret/tcp-id", 0).unwrap(),
+            "tcp-id".to_string()
+        );
+        assert!(parse_direct_tcpip_dest("example.com", 80).is_err());
     }
 }

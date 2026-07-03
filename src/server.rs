@@ -1632,6 +1632,8 @@ impl Server {
             upnp: false,
             try_port_prediction: false,
             max_conns: (opts.max_conns != 0).then_some(opts.max_conns),
+            transport: crate::admin::Transport::Bore,
+            identity: None,
         });
         let active = registration.active();
         // Per-tunnel relay byte counters (shown on /admin/status#/tunnels). These

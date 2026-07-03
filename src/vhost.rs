@@ -645,6 +645,8 @@ pub async fn serve_vhost_provider(
         upnp: false,
         try_port_prediction: false,
         max_conns: None,
+        transport: crate::admin::Transport::Bore,
+        identity: None,
     });
 
     // Compute and send the public URLs based on current config.

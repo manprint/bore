@@ -88,6 +88,10 @@ pub struct TunnelView {
     pub relay_tx_bytes: u64,
     /// Relay rx bytes.
     pub relay_rx_bytes: u64,
+    /// Which client implementation established this tunnel.
+    pub transport: crate::admin::Transport,
+    /// Identity presented at authentication (SSH) or `None` (native `bore`).
+    pub identity: Option<String>,
 }
 
 /// Secret tunnel entry (role=SecretProvider or SecretConsumer).
@@ -611,6 +615,8 @@ mod tests {
             uptime_secs: 10,
             relay_tx_bytes: 1024,
             relay_rx_bytes: 2048,
+            transport: crate::admin::Transport::Bore,
+            identity: None,
         };
         let json = serde_json::to_value(&tunnel).unwrap();
         assert!(json["public_port"].is_number());

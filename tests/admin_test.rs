@@ -506,6 +506,8 @@ fn t_views_serialize_stable() {
         uptime_secs: 100,
         relay_tx_bytes: 1024,
         relay_rx_bytes: 2048,
+        transport: bore_cli::admin::Transport::Bore,
+        identity: None,
     };
     let json_tunnel = serde_json::to_value(&tunnel).expect("serialize TunnelView");
     assert_eq!(json_tunnel["local_port"], 8080);
@@ -711,6 +713,8 @@ fn t_vpn_panel_groups_and_fields() {
             upnp: false,
             try_port_prediction: false,
             max_conns: None,
+            transport: bore_cli::admin::Transport::Bore,
+            identity: None,
         }
     }
 
@@ -1320,6 +1324,8 @@ fn t_secret_counts_track_registry() {
             upnp: false,
             try_port_prediction: false,
             max_conns: None,
+            transport: bore_cli::admin::Transport::Bore,
+            identity: None,
         }
     }
 
@@ -1349,4 +1355,54 @@ fn t_secret_counts_track_registry() {
 
     drop(c2);
     assert_eq!(bore_cli::admin_api::summary(&server).secret_tunnels, 2);
+}
+
+/// Phase 4.5 (SSH gateway): `Entry`/`NewEntry` gained additive `transport` +
+/// `identity` fields (default `Transport::Bore`, `None`). A registered entry's
+/// JSON snapshot must expose `"transport":"bore"` by default so the FE (Phase
+/// 7.1) and e2e assertions (T-SSH-PUB1: `transport == "ssh"`) have something
+/// stable to read.
+#[test]
+fn admin_entry_transport_serialized() {
+    use bore_cli::admin::{AdminRegistry, Role};
+
+    let reg = AdminRegistry::default();
+    let _handle = reg.register(bore_cli::admin::NewEntry {
+        role: Role::Public,
+        peer: "127.0.0.1:1234".parse().unwrap(),
+        secret_id: None,
+        public_port: Some(4000),
+        notes: None,
+        basic_auth: false,
+        https: false,
+        force_https: false,
+        carriers: 1,
+        auto_reconnect: false,
+        webserver_log: false,
+        udp: false,
+        vpn_relay_only: false,
+        vpn_pin_mtu: false,
+        vpn_mtu: None,
+        vpn_forward_accept: false,
+        vpn_nat_masquerade: false,
+        vpn_route_policy: None,
+        vpn_advertised: vec![],
+        vpn_nat_udp_port: None,
+        local_proxy_port: None,
+        local_host: None,
+        local_port: None,
+        nat_udp_preferred_port: None,
+        nat_udp_release_timeout: None,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        max_conns: None,
+        transport: bore_cli::admin::Transport::Bore,
+        identity: None,
+    });
+
+    let view = &reg.snapshot()[0];
+    let json = serde_json::to_value(view).expect("serialize EntryView");
+    assert_eq!(json["transport"], "bore");
+    assert!(json["identity"].is_null());
 }

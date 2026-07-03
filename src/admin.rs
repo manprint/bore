@@ -34,6 +34,17 @@ pub enum Role {
     VpnConnector,
 }
 
+/// Which client implementation established this tunnel.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Transport {
+    /// The native `bore` client/protocol.
+    #[default]
+    Bore,
+    /// A stock OpenSSH client via the embedded SSH gateway (`--ssh-gateway`).
+    Ssh,
+}
+
 /// A live tunnel registration. One per accepted control connection.
 ///
 /// The immutable descriptive fields are set once at registration; the two
@@ -119,6 +130,11 @@ pub struct Entry {
     pub try_port_prediction: bool,
     /// Display-only: client's `--max-conns` cap (None when unset).
     pub max_conns: Option<usize>,
+    /// Which client implementation established this tunnel.
+    pub transport: Transport,
+    /// Identity presented at authentication (SSH pubkey comment / fingerprint or
+    /// password label). `None` for the native `bore` transport.
+    pub identity: Option<String>,
 }
 
 /// Descriptive fields used to create an [`Entry`]; the atomics are initialized by
@@ -182,6 +198,10 @@ pub struct NewEntry {
     pub try_port_prediction: bool,
     /// See [`Entry::max_conns`].
     pub max_conns: Option<usize>,
+    /// See [`Entry::transport`].
+    pub transport: Transport,
+    /// See [`Entry::identity`].
+    pub identity: Option<String>,
 }
 
 /// A serializable snapshot of one [`Entry`], produced by [`AdminRegistry::snapshot`].
@@ -259,6 +279,10 @@ pub struct EntryView {
     pub try_port_prediction: bool,
     /// See [`Entry::max_conns`].
     pub max_conns: Option<usize>,
+    /// See [`Entry::transport`].
+    pub transport: Transport,
+    /// See [`Entry::identity`].
+    pub identity: Option<String>,
 }
 
 /// Shared, cloneable handle to the live tunnel registry.
@@ -324,6 +348,8 @@ impl AdminRegistry {
             upnp: new.upnp,
             try_port_prediction: new.try_port_prediction,
             max_conns: new.max_conns,
+            transport: new.transport,
+            identity: new.identity,
         });
         self.inner.entries.insert(id, Arc::clone(&entry));
         tracing::info!(
@@ -390,6 +416,8 @@ impl AdminRegistry {
                     upnp: entry.upnp,
                     try_port_prediction: entry.try_port_prediction,
                     max_conns: entry.max_conns,
+                    transport: entry.transport,
+                    identity: entry.identity.clone(),
                 }
             })
             .collect();
@@ -517,6 +545,8 @@ mod tests {
             upnp: false,
             try_port_prediction: false,
             max_conns: None,
+            transport: Transport::Bore,
+            identity: None,
         }
     }
 

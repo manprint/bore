@@ -320,6 +320,8 @@ pub async fn serve_provider(
         upnp: false,
         try_port_prediction: false,
         max_conns: None,
+        transport: crate::admin::Transport::Bore,
+        identity: None,
     }));
     info!(%id, "secret provider registered");
     control.send(ServerMessage::Ok).await?;
@@ -501,6 +503,8 @@ pub async fn serve_consumer(
             upnp: false,
             try_port_prediction: false,
             max_conns: None,
+            transport: crate::admin::Transport::Bore,
+            identity: None,
         })))
     };
     let active = admin_reg

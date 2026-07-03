@@ -723,6 +723,8 @@ pub async fn serve_vpn_listener(
         upnp: false,
         try_port_prediction: false,
         max_conns: None,
+        transport: crate::admin::Transport::Bore,
+        identity: None,
     });
 
     info!(%id, "vpn listener registered, waiting for connector");
@@ -1154,6 +1156,8 @@ pub async fn serve_vpn_connector(
             upnp: false,
             try_port_prediction: false,
             max_conns: None,
+            transport: crate::admin::Transport::Bore,
+            identity: None,
         });
         admin_reg.set_overlay(format!("{}/32", peer_slot.overlay));
 
@@ -1478,6 +1482,8 @@ pub async fn serve_vpn_connector(
         upnp: false,
         try_port_prediction: false,
         max_conns: None,
+        transport: crate::admin::Transport::Bore,
+        identity: None,
     });
     admin_reg.set_overlay(format!("{connector_overlay}/30"));
 

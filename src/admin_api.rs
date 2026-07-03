@@ -88,6 +88,8 @@ pub fn tunnels(server: &Server) -> Vec<TunnelView> {
             uptime_secs: e.uptime_secs,
             relay_tx_bytes: e.relay_tx_bytes,
             relay_rx_bytes: e.relay_rx_bytes,
+            transport: e.transport,
+            identity: e.identity,
         })
         .collect()
 }
@@ -682,6 +684,8 @@ mod tests {
             upnp: false,
             try_port_prediction: false,
             max_conns: None,
+            transport: crate::admin::Transport::Bore,
+            identity: None,
         };
         let provider_entry = crate::admin::NewEntry {
             role: Role::SecretProvider,
@@ -713,6 +717,8 @@ mod tests {
             upnp: false,
             try_port_prediction: false,
             max_conns: None,
+            transport: crate::admin::Transport::Bore,
+            identity: None,
         };
         let consumer_entry = crate::admin::NewEntry {
             role: Role::SecretConsumer,
@@ -744,6 +750,8 @@ mod tests {
             upnp: false,
             try_port_prediction: false,
             max_conns: None,
+            transport: crate::admin::Transport::Bore,
+            identity: None,
         };
 
         let _h1 = admin.register(public_entry);

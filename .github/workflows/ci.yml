@@ -376,4 +376,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
-      - run: cargo audit
+      # RUSTSEC-2023-0071 (Marvin Attack, rsa crate, no fixed upgrade available):
+      # pulled in transitively by russh's `rsa` feature (ssh-gateway), used only
+      # for SSH pubkey/hostkey signing and verification — the advisory's timing
+      # side-channel is in PKCS#1v1.5 *decryption*, an operation SSH never
+      # performs with RSA (SSH only signs/verifies with it). Not exploitable here.
+      - run: cargo audit --ignore RUSTSEC-2023-0071

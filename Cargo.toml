@@ -20,6 +20,18 @@ edition = "2021"
 name = "bore"
 path = "src/main.rs"
 
+[[example]]
+name = "macos_vpn_spike"
+required-features = ["vpn"]
+
+[[example]]
+name = "android_vpn_spike"
+required-features = ["vpn"]
+
+[[example]]
+name = "windows_vpn_spike"
+required-features = ["vpn"]
+
 [features]
 default = ["udp"]
 # Direct peer-to-peer secret tunnels via UDP hole-punching + STUN, carried over

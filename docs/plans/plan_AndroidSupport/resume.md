@@ -2,7 +2,7 @@
 
 > Machine-readable. Implementer: update after EVERY sub-phase. Keep terse.
 
-**Next:** phase_04.md sub-phase 4.2 (android-vpn-e2e job + script)
+**Next:** phase_04.md sub-phase 4.3 (findings write-back, after CI run of 4.2)
 
 > **Model note:** per explicit user instruction, every "Opus" role in the
 > original plan (architect / review-gate / final-read) is executed by
@@ -23,7 +23,7 @@
 | 3 | 3.3 host-only CLI guard matrix | Sonnet + Sonnet 5 review gate | DONE | commit 607355f; validate_android_host_only (pure, target_is_android bool param) called at top of run_listen/run_connect before run_with_reconnect; rejects --advertise non-empty, --nat-masquerade, --forward-accept, --max-clients>1, --tun-queues>1 with exact D-A4 message text; UDP hole-punch flags NOT special-cased (unchanged). Sonnet-5 review gate: rejected set == D-A4/D-A6/D-A9 exactly, confirmed. fmt/clippy(-D warnings, default+vpn)/test(default+vpn) all green |
 | 3 | 3.4 regression sweep + CLAUDE.md | Haiku | DONE | commit 1f9a52d; full `vpn_netns_test.sh` 161/0 (SIGKILL reclaim, hub, NAT, forward-accept, stress/flap suites all pass — zero regression from Phase 3 twins/guards); fmt/clippy(-D warnings, default+vpn)/test(default+vpn) all green; CLAUDE.md VPN Android port block added. Phase 3 DONE |
 | 4 | 4.1 examples/android_vpn_spike.rs | Sonnet | DONE | commit 9ce7718; 4 modes (spike/create-teardown/apply-revert/leak-then-reclaim) mirroring macos/windows spike structure; every fn individually cfg(android)-gated, stub main for Linux; hardcodes deterministic "bore-vpn-ns0-" fwdref prefix (private helpers unreachable from example crate); fmt/clippy(-D warnings, default+vpn incl. this example)/test(default+vpn) all green on Linux. Actual android compile/run is CI/device-only, verified in 4.2 |
-| 4 | 4.2 android-vpn-e2e job + script | Sonnet + Sonnet 5 review gate | TODO | |
+| 4 | 4.2 android-vpn-e2e job + script | Sonnet + Sonnet 5 review gate | DONE | commit cdac0c8; scripts/android_vpn_test.sh (T-AND-S1..S3 spike modes, T-AND-L1 relay bidirectional ping via dynamic --vpn-pool, T-AND-L2 direct-informational never-fail-on-fallback, T-AND-L3..L5 negatives) + CI job android-vpn-e2e cloned from android-emu-e2e (cargo-ndk builds host+android+spike-example with --features vpn). Sonnet-5 review gate on the assertion set caught+fixed 2 real bugs pre-commit: (1) wait_for_log's "VpnReady" alt also matched the FAILURE log line, narrowed to unique "vpn link paired"; (2) unguarded `ip addr show bore0` under set-e/pipefail would abort the whole script on a failed pairing instead of failing just that test, added `\|\| true`. Shellcheck-clean (1 justified SC2024 suppression, documented). No Rust touched; actual green-run verification is CI-push-only (no local NDK/emulator) |
 | 4 | 4.3 findings write-back | Sonnet (+ Sonnet 5 review if twins change) | TODO | |
 | 5 | 5.1 docs/ANDROID.md + limits refresh | Haiku | TODO | |
 | 5 | 5.2 VPN_ANDROID_ACCEPTANCE.md | Haiku | TODO | |
@@ -42,10 +42,10 @@
 | unit: android_stale_reclaim_removes_leaked_state | reclaim | 3 | PASS |
 | unit: android_guard_matrix | CLI guard table | 3 | PASS |
 | regression: vpn_netns_test.sh full | Linux zero-regression proof | 3,4,5 | PASS 161/0 |
-| T-AND-S1..S3 | spike (tun, apply/revert, reclaim) | 4 | spike code written (4.1); hardware run PENDING (4.2 CI) |
-| T-AND-L1 | relay link bidirectional ping | 4 | TODO |
-| T-AND-L2 | direct best-effort (informational) | 4 | TODO |
-| T-AND-L3..L5 | negatives (non-root, advertise, queues) | 4 | TODO |
+| T-AND-S1..S3 | spike (tun, apply/revert, reclaim) | 4 | script+CI job written (4.2); PENDING CI run |
+| T-AND-L1 | relay link bidirectional ping | 4 | script+CI job written (4.2); PENDING CI run |
+| T-AND-L2 | direct best-effort (informational) | 4 | script+CI job written (4.2); PENDING CI run |
+| T-AND-L3..L5 | negatives (non-root, advertise, queues) | 4 | script+CI job written (4.2); PENDING CI run |
 | T-AND-M1..M5 | manual acceptance, real device | 5 | TODO (hardware) |
 
 ## Docs status

@@ -5261,9 +5261,22 @@ pub mod hostcfg {
         // netd rule (100 < 10000) sends anything bound for this link's own
         // subnet through "main" unconditionally, regardless of mark/uid/iif.
         // Scoped to just this /link's small subnet, so normal app traffic
-        // routing is untouched. `ip rule add` does not error on a duplicate
-        // (unlike `ip addr add`), so a harmless dupe on reconnect is fine.
-        run_ip(&[
+        // routing is untouched.
+        //
+        // CORRECTION (T-AND-L2 "could not discover overlay addrs"): unlike
+        // `ip addr add`, `ip rule add` DOES error on an exact duplicate
+        // (`RTNETLINK answers: File exists`) -- confirmed by CI diagnostics.
+        // This rule lives in the kernel's routing-policy DB, not attached to
+        // the TUN device, so tearing down a link's TUN does NOT remove it.
+        // The e2e harness's address pool restarts from the same first
+        // address (e.g. `10.199.0.2/30`) on every fresh `listen`, so the
+        // SECOND link in a run hit the identical `to <addr>/<prefix>` rule
+        // still present from the first and `run_ip`'s `?` propagated that as
+        // a fatal error, killing `connect` before the interface finished
+        // coming up. The rule is idempotent by construction (adding the same
+        // rule twice has the same effect as adding it once), so treat an
+        // already-exists duplicate as success instead of a hard failure.
+        let rule_args = [
             "rule",
             "add",
             "to",
@@ -5272,7 +5285,17 @@ pub mod hostcfg {
             "main",
             "priority",
             "100",
-        ])?;
+        ];
+        let rule_out = std::process::Command::new("ip")
+            .args(rule_args)
+            .output()
+            .with_context(|| format!("spawning `ip {}`", rule_args.join(" ")))?;
+        if !rule_out.status.success() {
+            let stderr = String::from_utf8_lossy(&rule_out.stderr);
+            if !stderr.contains("File exists") {
+                bail!("`ip {}` failed: {}", rule_args.join(" "), stderr);
+            }
+        }
 
         tracing::info!(%actual_name, "Android TUN created (single queue, no offload)");
 

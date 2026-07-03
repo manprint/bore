@@ -272,11 +272,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bore-android-tun"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nix 0.29.0",
+ "tun-rs",
+]
+
+[[package]]
 name = "bore-cli"
 version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "bore-android-tun",
  "bore-wintun",
  "bytes",
  "clap",

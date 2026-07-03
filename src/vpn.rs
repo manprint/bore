@@ -5155,17 +5155,27 @@ pub mod hostcfg {
         Ok((vec![dev], false, resolved_name))
     }
 
-    /// Android TUN runtime (phase 3 compile port): create a single-queue,
-    /// no-offload TUN device. Android's kernel is Linux, so `/sys/class/net`
-    /// is a valid existence check for `pick_tun_name` — reused verbatim from
-    /// the Linux twin. Unlike macOS (where the name is only advisory and the
-    /// kernel assigns `utunN`), Android accepts an explicit interface name, so
-    /// the resolved name is requested from the builder directly. No GSO/GRO
-    /// offload and no retry-on-race loop (I-M4-style single-packet path):
-    /// `queues > 1` is refused earlier by the 3.3 CLI guard and can never
-    /// reach here — `debug_assert!` catches a future call-site regression.
-    /// Whether tun-rs's documented android `DeviceBuilder` API matches this
-    /// exactly is UNVERIFIED until the phase 4 spike.
+    /// Android TUN runtime (phase 3 compile port, phase 4 twin-corrected): create a
+    /// single-queue, no-offload TUN device. Android's kernel is Linux, so
+    /// `/sys/class/net` is a valid existence check for `pick_tun_name` — reused
+    /// verbatim from the Linux twin. No GSO/GRO offload and no retry-on-race loop
+    /// (I-M4-style single-packet path): `queues > 1` is refused earlier by the 3.3
+    /// CLI guard and can never reach here — `debug_assert!` catches a future
+    /// call-site regression.
+    ///
+    /// tun-rs's high-level `DeviceBuilder` (ioctl-based create-from-scratch) is
+    /// compiled only for windows/linux(non-ohos)/macos/*bsd — NOT android (upstream's
+    /// android story is `AsyncDevice::from_fd` wrapping a fd handed over from
+    /// Android's Java-side `VpnService.Builder().establish()`; see tun-rs README's
+    /// Android section). That JNI/VpnService path doesn't exist for bore's
+    /// rooted-CLI host-only model (D-A4/D-A6/D-A9). `from_fd` and the `TUNSETIFF`
+    /// ioctl it needs are both `unsafe`, which this crate cannot use
+    /// (`#![forbid(unsafe_code)]`) — so, mirroring how `bore-wintun` isolates the
+    /// WinTun DLL FFI, `bore-android-tun` (a separate, non-forbid crate) owns that
+    /// unsafe boundary and hands back a plain, safe `tun_rs::AsyncDevice`. Found via
+    /// the Phase 4.1/4.2 spike + e2e CI (`tun_rs::DeviceBuilder` doesn't exist for
+    /// this target — E0433 — and a first `unsafe`-in-vpn.rs attempt tripped
+    /// `forbid(unsafe_code)` in the Mean Bean Deploy release build).
     // verified by android_vpn_spike (phase 4)
     #[cfg(target_os = "android")]
     pub async fn create_tun(
@@ -5185,65 +5195,8 @@ pub mod hostcfg {
         })
         .ok_or_else(|| anyhow!("TUN name resolution failed for '{name}'"))?;
 
-        // tun-rs's high-level `DeviceBuilder` (ioctl-based create-from-scratch)
-        // is compiled only for windows/linux(non-ohos)/macos/*bsd — NOT android
-        // (upstream's android story is `SyncDevice::from_fd`/`AsyncDevice::from_fd`
-        // wrapping a fd handed over from Android's Java-side
-        // `VpnService.Builder().establish()`; see tun-rs README's Android
-        // section). That JNI/VpnService path doesn't exist for bore's rooted-CLI
-        // host-only model (D-A4/D-A6/D-A9), so we open the kernel tun clone
-        // device and do the `TUNSETIFF` ioctl ourselves — safe here because a
-        // rooted device is still plain Linux underneath, identical kernel ABI
-        // to desktop Linux. Discovered via the Phase 4.1/4.2 spike + e2e CI
-        // (`tun_rs::DeviceBuilder` doesn't exist for this target — E0433).
-        let dev_path = if std::path::Path::new("/dev/tun").exists() {
-            "/dev/tun"
-        } else {
-            // Android's minimal /dev has no "net" subdirectory on stock ROMs;
-            // some kernels/ROMs still provide the desktop-Linux path.
-            "/dev/net/tun"
-        };
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(dev_path)
-            .with_context(|| format!("opening {dev_path} (TUN clone device)"))?;
-
-        let mut ifr: nix::libc::ifreq = unsafe { std::mem::zeroed() };
-        for (dst, src) in ifr.ifr_name.iter_mut().zip(resolved_name.as_bytes()) {
-            *dst = *src as std::os::raw::c_char;
-        }
-        ifr.ifr_ifru.ifru_flags =
-            (nix::libc::IFF_TUN | nix::libc::IFF_NO_PI) as std::os::raw::c_short;
-
-        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
-        // SAFETY: `fd` is a valid, open fd for `dev_path` (just opened above);
-        // `ifr` is a valid, live `ifreq` for the duration of this call. Raw
-        // pointer (not `&mut ifr`) to match nix's own `ioctl_write_ptr_bad!`
-        // calling convention for non-standard-encoded ioctls like TUNSETIFF.
-        let ret =
-            unsafe { nix::libc::ioctl(fd, nix::libc::TUNSETIFF as _, std::ptr::addr_of_mut!(ifr)) };
-        if ret < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("TUNSETIFF ioctl failed on Android TUN clone device");
-        }
-
-        let actual_name = {
-            let raw = &ifr.ifr_name;
-            let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
-            raw[..end]
-                .iter()
-                .map(|&c| *c as u8 as char)
-                .collect::<String>()
-        };
-
-        // Hand the fd to tun-rs. `from_fd` takes ownership (closes on drop), so
-        // release it from `file` first to avoid a double-close.
-        let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(file);
-        // SAFETY: `raw_fd` was just configured as a TUN device above and is not
-        // used anywhere else after this call.
-        let dev = unsafe { TunDevice::from_fd(raw_fd) }
-            .with_context(|| format!("wrapping fd for {actual_name} via tun_rs::AsyncDevice"))?;
+        let (dev, actual_name) = bore_android_tun::create(&resolved_name)
+            .context("failed to create Android TUN device")?;
 
         // No `DeviceBuilder` on this target (see above) ⇒ address/mtu/up must be
         // configured out-of-band, same style as `NetConfig::apply`'s route

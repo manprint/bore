@@ -82,6 +82,52 @@ impl Drop for PublicDeregister {
     }
 }
 
+/// Binds a public tunnel listener, either on a caller-requested port (validated
+/// against `port_range`) or on a randomly chosen free port within `port_range`
+/// when `port == 0`. Shared by the native public accept loop
+/// (`Server::create_listener`) and the SSH gateway's `tcpip-forward` handling,
+/// so port allocation semantics never drift between the two ingress paths.
+pub(crate) async fn bind_public_listener(
+    bind_tunnels: IpAddr,
+    port_range: &RangeInclusive<u16>,
+    port: u16,
+) -> Result<TcpListener, &'static str> {
+    let try_bind = |port: u16| async move {
+        TcpListener::bind((bind_tunnels, port))
+            .await
+            .map_err(|err| match err.kind() {
+                io::ErrorKind::AddrInUse => "port already in use",
+                io::ErrorKind::PermissionDenied => "permission denied",
+                _ => "failed to bind to port",
+            })
+    };
+    if port > 0 {
+        // Client requests a specific port number.
+        if !port_range.contains(&port) {
+            return Err("client port number not in allowed range");
+        }
+        try_bind(port).await
+    } else {
+        // Client requests any available port in range.
+        //
+        // In this case, we bind to 150 random port numbers. We choose this value because in
+        // order to find a free port with probability at least 1-δ, when ε proportion of the
+        // ports are currently available, it suffices to check approximately -2 ln(δ) / ε
+        // independently and uniformly chosen ports (up to a second-order term in ε).
+        //
+        // Checking 150 times gives us 99.999% success at utilizing 85% of ports under these
+        // conditions, when ε=0.15 and δ=0.00001.
+        for _ in 0..150 {
+            let port = fastrand::u16(port_range.clone());
+            match try_bind(port).await {
+                Ok(listener) => return Ok(listener),
+                Err(_) => continue,
+            }
+        }
+        Err("failed to find an available port")
+    }
+}
+
 /// State structure for the server.
 pub struct Server {
     /// Range of TCP ports that can be forwarded.
@@ -701,6 +747,8 @@ impl Server {
             Arc::clone(&self.conn_permits),
             self.port_range.clone(),
             self.bind_tunnels,
+            Arc::clone(&self.total_rx_bytes),
+            Arc::clone(&self.total_tx_bytes),
         )?;
         self.ssh_gateway = Some(Arc::new(gateway));
         Ok(())
@@ -1033,7 +1081,7 @@ impl Server {
                                 tokio::spawn(async move {
                                     let _permit = permit;
                                     let config = gateway.russh_config();
-                                    let handler = gateway.handler();
+                                    let handler = gateway.handler(addr);
                                     match russh::server::run_stream(config, stream, handler).await {
                                         Ok(session) => {
                                             if let Err(err) = session.await {
@@ -1082,40 +1130,7 @@ impl Server {
     }
 
     async fn create_listener(&self, port: u16) -> Result<TcpListener, &'static str> {
-        let try_bind = |port: u16| async move {
-            TcpListener::bind((self.bind_tunnels, port))
-                .await
-                .map_err(|err| match err.kind() {
-                    io::ErrorKind::AddrInUse => "port already in use",
-                    io::ErrorKind::PermissionDenied => "permission denied",
-                    _ => "failed to bind to port",
-                })
-        };
-        if port > 0 {
-            // Client requests a specific port number.
-            if !self.port_range.contains(&port) {
-                return Err("client port number not in allowed range");
-            }
-            try_bind(port).await
-        } else {
-            // Client requests any available port in range.
-            //
-            // In this case, we bind to 150 random port numbers. We choose this value because in
-            // order to find a free port with probability at least 1-δ, when ε proportion of the
-            // ports are currently available, it suffices to check approximately -2 ln(δ) / ε
-            // independently and uniformly chosen ports (up to a second-order term in ε).
-            //
-            // Checking 150 times gives us 99.999% success at utilizing 85% of ports under these
-            // conditions, when ε=0.15 and δ=0.00001.
-            for _ in 0..150 {
-                let port = fastrand::u16(self.port_range.clone());
-                match try_bind(port).await {
-                    Ok(listener) => return Ok(listener),
-                    Err(_) => continue,
-                }
-            }
-            Err("failed to find an available port")
-        }
+        bind_public_listener(self.bind_tunnels, &self.port_range, port).await
     }
 
     /// Route an accepted (and TLS-terminated, if applicable) control connection.

@@ -308,8 +308,8 @@ adb shell chmod +x /data/local/tmp/bore
 - ✅ Zero regressions on Linux (netns 161/0 pass)
 
 **Manual device acceptance (physical hardware, Phase 5.2):**
-- TODO — `VPN_ANDROID_ACCEPTANCE.md` to be filled in with real physical-device testing
-  (multi-carrier relay, direct path on real networks, carrier switching, failover)
+- Procedure written: [`VPN_ANDROID_ACCEPTANCE.md`](VPN_ANDROID_ACCEPTANCE.md) (T-AND-M1..M5) —
+  not yet RUN on physical hardware; tracked as the project's only remaining open item.
 
 **Known open questions (Phase 5.2+):**
 - Real carrier UDP buffer clamps on Android (similar to Linux 10 MB/s @ 20 ms clamp)
@@ -381,8 +381,10 @@ paths, CLI guards, and SIGKILL reclaim.
 
 #### Manual device acceptance (Phase 5.2)
 
-See `VPN_ANDROID_ACCEPTANCE.md` (not yet written; will cover real 2+ device scenarios,
-carrier failover, and network switching).
+See [`VPN_ANDROID_ACCEPTANCE.md`](VPN_ANDROID_ACCEPTANCE.md) — T-AND-M1..M5, covering both
+non-root subcommands and the root VPN host-only path (connect/teardown, SIGKILL reclaim,
+30-minute longevity vs the phantom-process killer). Android is host-only, so there is no
+multi-device gateway/NAT scenario to cover, unlike the macOS/Windows acceptance docs.
 
 ---
 
@@ -392,3 +394,4 @@ carrier failover, and network switching).
 - [plan_AndroidSupport](plans/plan_AndroidSupport/) — full project plan + status + resume
 - [SPIKE_FINDINGS.md](plans/plan_AndroidSupport/SPIKE_FINDINGS.md) — CI findings (netd quirk, ip rule duplicate handling)
 - [Limits and unsupported features](vpn/limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md)
+- [VPN_ANDROID_ACCEPTANCE.md](vpn/VPN_ANDROID_ACCEPTANCE.md) — manual physical-device test procedure (T-AND-M1..M5)

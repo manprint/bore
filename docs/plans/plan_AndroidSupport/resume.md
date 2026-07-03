@@ -2,7 +2,7 @@
 
 > Machine-readable. Implementer: update after EVERY sub-phase. Keep terse.
 
-**Next:** phase_05.md sub-phase 5.2 (VPN_ANDROID_ACCEPTANCE.md)
+**Next:** phase_05.md sub-phase 5.3 (release verification + final read)
 
 > **Model note:** per explicit user instruction, every "Opus" role in the
 > original plan (architect / review-gate / final-read) is executed by
@@ -26,7 +26,7 @@
 | 4 | 4.2 android-vpn-e2e job + script | Sonnet + Sonnet 5 review gate | DONE | commit cdac0c8 (script+job) then a bug chain to reach green, all CI-diagnosed not guessed: bdb7494 (rp_filter relax, insufficient alone) → fbe5edd (android netd policy routing eats implicit `lookup main` fallback rule, fixed with `ip rule add to <subnet> lookup main priority 100`; T-AND-L1 PASS after this) → 6301c3c (hypothesized T-AND-L2 teardown race, added `wait_for_guest_iface_gone` poll — kept as valid hardening but CI disproved the hypothesis, same failure recurred) → ee09770 (diagnostics-only: the "could not discover overlay addrs" branch had zero diagnostics, added a dump) → **aa0dfb3** (real root cause from the ee09770 CI log: `ip rule add` errors `RTNETLINK answers: File exists` on an exact duplicate — unlike `ip addr add` — and the rule persists across TUN teardown since it's routing-policy-DB state, not device state; T-AND-L1 and T-AND-L2 reuse the same pool address so L2 hit L1's leftover rule and `run_ip`'s `bail!` killed `connect` before the TUN came up; fixed by adding this one rule via `std::process::Command` directly, tolerating `File exists` as success). **CI CONFIRMED GREEN on aa0dfb3**: `Android VPN e2e (api 30, x86_64)` → `PASS: 8 FAIL: 0` (T-AND-L2 path=DIRECT), `VPN cross check` both aarch64/x86_64-linux-android green, Mean Bean Deploy + Docker(GHCR) green — zero regressions |
 | 4 | 4.3 findings write-back | Sonnet (Sonnet 5 review, no twin body change beyond 4.2's) | DONE | `SPIKE_FINDINGS.md` written (mirrors VPN_MACOS_SPIKE_FINDINGS.md structure, filled from CI evidence not TODO placeholders); CLAUDE.md Android block refreshed (bore-android-tun crate rationale, netd/`ip rule` finding, duplicate-tolerance correction, status flipped to Phase 4 DONE+CI-GREEN). No further `src/` twin changes needed beyond aa0dfb3 (4.2) — the twins were already final. Phase 4 DONE |
 | 5 | 5.1 docs/ANDROID.md + limits refresh | Haiku | DONE | Two-pass: (1) Haiku draft was VPN-only backend reference w/ 8 factual errors (TUN naming, rp_filter mechanism, self-contradicting `--advertise` example w/ hallucinated `--server` flag, placeholder error table, backwards `/dev/tun` vs `/dev/net/tun` claim, mislabeled unsafe boundary, fabricated Phase 5.2 claim, stale troubleshooting wording), all found+fixed against src/vpn.rs/main.rs/bore-android-tun source directly (commit 2b8527c). (2) Cross-check vs phase_05.md spec found the draft didn't match the required section order/content at all (missing Install/Termux, feature matrix across ALL subcommands, non-root notes, root quickstart, emulator pointers) — rewrote docs/ANDROID.md to spec order, kept prior detail as a "VPN backend reference" section; corrected VPN_ANDROID_ACTUAL_LIMIT.md to add the missing "non-root VPN impossible (VpnService app-only)" limit and separate it from the `--advertise`/gateway limits, which are v1-scoped-deferred (D-A4) not technically impossible (commit fa796cd). INSTALL_BORE.md/DOWNLOAD_URLS.md verified already correct, no edit needed. Gates green (fmt/clippy default+vpn/test); done-criteria link check passes (`grep -o '](\S*\.md' docs/ANDROID.md` all targets exist). |
-| 5 | 5.2 VPN_ANDROID_ACCEPTANCE.md | Haiku | TODO | |
+| 5 | 5.2 VPN_ANDROID_ACCEPTANCE.md | Sonnet 5 | DONE | commit c3513fa (bundled with a small stale_reclaim wording follow-up, see below) then a dedicated commit for the new doc: `docs/vpn/VPN_ANDROID_ACCEPTANCE.md` written mirroring VPN_MACOS_ACCEPTANCE.md's structure — T-AND-M1 (non-root public tunnel), T-AND-M2 (non-root transfer both directions + resume), T-AND-M3 (root VPN connect + bidirectional ping + clean SIGINT teardown), T-AND-M4 (SIGKILL + relaunch), T-AND-M5 (30 min screen-off longevity vs phantom-process killer). No multi-host gateway scenario (Android is host-only, D-A4) unlike the macOS doc. T-AND-M4 worded per the stale_reclaim no-op finding below (asserts clean relaunch + empty state dir, NOT a log line — phase_05.md's literal "assert stale_reclaim log line" phrasing does not match verified behavior: Android's apply() never writes a marker, so stale_reclaim always finds zero files and logs nothing). Flag names verified against `--help` output of a `cargo build --features vpn` binary. Both ANDROID.md "not yet written" placeholders updated to point at the new doc. Also folded in: fixed a residual inaccuracy caught during this sub-phase's fact-gathering — docs/ANDROID.md and VPN_ANDROID_ACTUAL_LIMIT.md both implied Android's apply() writes `.ipforward`/`.fwdref` markers for later stale_reclaim; verified false via src/vpn.rs (android_stale_reclaim_in/stale_reclaim never has a writer counterpart on Android, unlike Linux/Windows) — wording corrected in both docs. Gates green (fmt/clippy default+vpn); link-check passes. |
 | 5 | 5.3 release verify + final read | Sonnet 5 | TODO | |
 
 ## Test status
@@ -46,7 +46,7 @@
 | T-AND-L1 | relay link bidirectional ping | 4 | PASS (run 28637749882, commit aa0dfb3) |
 | T-AND-L2 | direct best-effort (informational) | 4 | PASS, path=DIRECT (run 28637749882, commit aa0dfb3) |
 | T-AND-L3..L5 | negatives (non-root, advertise, queues) | 4 | PASS (run 28637749882, commit aa0dfb3) |
-| T-AND-M1..M5 | manual acceptance, real device | 5 | TODO (hardware) |
+| T-AND-M1..M5 | manual acceptance, real device | 5 | Procedure WRITTEN (VPN_ANDROID_ACCEPTANCE.md); execution PENDING (hardware) |
 
 ## Docs status
 
@@ -56,5 +56,5 @@
 | SPIKE_FINDINGS.md (plan folder) | 4.3 | DONE |
 | docs/ANDROID.md | 5.1 | DONE |
 | limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md rewrite | 5.1 | DONE |
-| docs/vpn/VPN_ANDROID_ACCEPTANCE.md | 5.2 | TODO |
+| docs/vpn/VPN_ANDROID_ACCEPTANCE.md | 5.2 | DONE |
 | INSTALL_BORE.md / DOWNLOAD_URLS.md android rows | 5.1 | DONE (already correct pre-existing, verified, no edit needed) |

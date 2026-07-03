@@ -109,6 +109,29 @@ wait_for_log() {
     return 1
 }
 
+# Waits up to `timeout` seconds (0.5s poll) for the guest's `bore0` to
+# disappear after teardown. `pkill` returns as soon as the signal is sent,
+# not once NetConfig's RAII revert (ip rule del/ip addr del/TUN close) has
+# actually run — a fixed `sleep 1` after pkill raced that revert on a loaded
+# CI runner, so the NEXT run_link_test's `pick_tun_name` could observe the
+# still-present old `bore0` and fall back to a different name (e.g. `bore1`),
+# which the hardcoded `bore0` overlay lookup then finds empty
+# (T-AND-L2 "could not discover overlay addrs (guest=[])"). Poll instead of
+# guessing a bigger fixed sleep.
+wait_for_guest_iface_gone() {
+    local timeout="${1:-10}"
+    local polls=$((timeout * 2))
+    local i=0
+    while [ "$i" -lt "$polls" ]; do
+        if ! adb shell "ip link show bore0" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    return 1
+}
+
 # ── Setup ───────────────────────────────────────────────────────────────────
 echo "adb root..."
 adb root >/dev/null 2>&1 || true
@@ -189,6 +212,7 @@ run_link_test() {
         cat "$listen_log" >&2 || true
         sudo pkill -f "id $id" >/dev/null 2>&1 || true
         adb shell "pkill -f $DEV_BORE" >/dev/null 2>&1 || true
+        wait_for_guest_iface_gone 10 || true
         return
     fi
     # Give the TUN + route table a moment to settle after pairing.
@@ -247,7 +271,10 @@ run_link_test() {
 
     sudo pkill -f "id $id" >/dev/null 2>&1 || true
     adb shell "pkill -f $DEV_BORE" >/dev/null 2>&1 || true
-    sleep 1
+    # Best-effort: proceed even on timeout (matches the rest of this script's
+    # never-abort-the-whole-run philosophy) — a lingering interface just means
+    # the next test's discovery has less margin, not that this one failed.
+    wait_for_guest_iface_gone 10 || true
 }
 
 # ── T-AND-L1: relay link, bidirectional ping ─────────────────────────────────

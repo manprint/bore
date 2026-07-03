@@ -389,17 +389,27 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   — CI is single-host (the single-host PF rules are already CI-validated). Windows deferred. Any PF
   correction lands in `pf_ruleset`/the `cmd_pf_*` builders + their snapshots, not in `apply`.
 
-**VPN Android port (compile-port + host-only twins LANDED 2026-07-03, branch
-`android`; runtime device/emulator validation still pending — Phase 4/5):**
-- Plan: `docs/plans/plan_AndroidSupport/` (overview + phase_0{1..5}.md + resume.md).
-  Same twin pattern as the macOS port (DEC-M1/I-A1): every OS-specific fn/type gets
-  a `#[cfg(target_os = "android")]` sibling; Linux/macOS/Windows bodies stay
-  byte-identical. `cfg(any(...))` gates extended to include android everywhere
-  needed to compile: `Cargo.toml` tun-rs dep, `lib.rs`/`main.rs` module+subcommand
+**VPN Android port (runtime LANDED + VALIDATED on rooted emulator 2026-07-03,
+branch `android`; Phase 4 done — Phase 5 docs/manual-acceptance remaining):**
+- Plan: `docs/plans/plan_AndroidSupport/` (overview + phase_0{1..5}.md +
+  resume.md + `SPIKE_FINDINGS.md`). Same twin pattern as the macOS port
+  (DEC-M1/I-A1): every OS-specific fn/type gets a `#[cfg(target_os =
+  "android")]` sibling; Linux/macOS/Windows bodies stay byte-identical.
+  `cfg(any(...))` gates extended to include android everywhere needed to
+  compile: `Cargo.toml` tun-rs dep, `lib.rs`/`main.rs` module+subcommand
   gate, both vpn test files, `check_root` (android hint message, body otherwise
   identical), the `ip --version` probe cfg (toybox supports it, same as Linux
   iproute2), and the 3 offload-pump `unreachable!` twins (android has no
   Linux-only `tun-rs` GSO/GRO offload path, same as macOS).
+- `crates/bore-android-tun` (new, mirrors `crates/bore-wintun`'s isolation
+  pattern): `tun-rs::DeviceBuilder` doesn't cover android and its `from_fd`
+  constructor is `unsafe`, which the workspace's `#![forbid(unsafe_code)]`
+  can't take directly — the unsafe fd-open + `TUNSETIFF` ioctl is isolated in
+  this tiny standalone crate (own `Cargo.toml`, no `forbid(unsafe_code)`) so
+  `src/vpn.rs` calls it as a safe API. `nix` dep needed `features = ["fs"]`;
+  it was initially (wrongly) placed under `[target.'cfg(windows)'.dependencies]`
+  by copy-paste from `bore-wintun`'s Cargo.toml — moved to plain
+  `[dependencies]`.
 - **D-A4/D-A6/D-A9 (host-only scope, HARD invariant):** android VPN is NEVER a
   gateway — no `--advertise`, no `--nat-masquerade`, no `--forward-accept`, no hub
   mode (`--max-clients>1`), no multi-queue TUN (`--tun-queues>1`). Enforced TWICE:
@@ -420,18 +430,43 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   pushes an `AppliedOp::IpForward`, mirroring the offload-pump `unreachable!` twins.
 - `run_dir()` (android) → `/data/local/tmp` (D-A8: no writable `/run`/`/var/run`
   under SELinux + the app sandbox, unlike Linux/macOS/Windows).
+- **Android `netd` policy routing eats the implicit `lookup main` fallback rule**
+  (found via emulator e2e, not predictable from docs): stock Linux always has a
+  kernel-default `32766: from all lookup main` rule; android's `netd` deletes it
+  and replaces it with per-UID/fwmark policy rules (e.g. `15000: from all fwmark
+  0x0/0x10000 lookup legacy_system`), so a locally-generated reply packet
+  (mark=0) for the TUN's own connected route never reaches `main` and gets
+  dropped. Fix (android `create_tun` twin, `src/vpn.rs`): explicit
+  `ip rule add to <subnet> lookup main priority 100` — low enough priority (100
+  < netd's ~10000+ range) to win regardless of mark/uid/iif, scoped to just this
+  link's subnet so normal app traffic routing is untouched. `rp_filter` is also
+  relaxed to 0 (on `all` + the TUN iface) as defense-in-depth, though it was NOT
+  the actual root cause of the original ping failure.
+- **`ip rule add` DOES error on an exact duplicate** (`RTNETLINK answers: File
+  exists`) — unlike `ip addr add`. Because the rule above lives in the kernel's
+  routing-policy DB, not attached to the TUN device, it survives that link's
+  teardown; a second `listen`/`connect` reusing the same overlay subnet (e.g. a
+  test harness restarting its address pool from the same first address) hits
+  the identical rule and, if added via the shared `run_ip` helper (which
+  `bail!`s on any non-zero exit), kills the whole `connect`/`listen` process
+  before the TUN finishes coming up. Fixed by adding this one rule via
+  `std::process::Command` directly and tolerating a `stderr` containing
+  "File exists" as success (the rule is idempotent by construction) while still
+  failing hard on any other error.
 - No local android cross-compile tooling on the Linux dev box (no `cargo-ndk`, no
   `rustup` android target) — same situation as the macOS port; verify via CI
   (`cargo ndk clippy` for x86_64/arm64-v8a) after push, not locally.
 - Status: Phase 1 (CI build+clippy matrix) and Phase 2 (non-VPN android-emu-e2e,
-  `scripts/android_emu_test.sh`) both green. Phase 3 (this VPN compile-port +
-  host-only guards) done Linux-side: `cargo fmt`/`clippy -D warnings`(default+vpn)/
-  `cargo test`(default+vpn) all green, PLUS the full `vpn_netns_test.sh` Linux
-  zero-regression suite at 161/0 (proves the twin additions changed nothing on
-  Linux). Phase 4 (`examples/android_vpn_spike.rs` + `android-vpn-e2e` CI job) and
-  Phase 5 (docs + manual device acceptance) are the REMAINING work before the VPN
-  path is validated on a real android runtime — until then, the android VPN code
-  paths are compiled and unit-tested but **not yet proven to run** on-device.
+  `scripts/android_emu_test.sh`) both green. Phase 3 (VPN compile-port + host-only
+  guards) done Linux-side, `vpn_netns_test.sh` 161/0 zero-regression. **Phase 4
+  (runtime validation) DONE and CI-GREEN 2026-07-03**: `examples/android_vpn_spike.rs`
+  (spike/create-teardown/apply-revert/leak-then-reclaim) + the `android-vpn-e2e` CI
+  job (`scripts/android_vpn_test.sh`, T-AND-S1..S3 + T-AND-L1..L5) both pass on a
+  rooted x86_64 emulator — `PASS: 8 FAIL: 0`, including a genuine bidirectional
+  DIRECT-path link (T-AND-L2) alongside the forced-relay link (T-AND-L1). Findings
+  in `docs/plans/plan_AndroidSupport/SPIKE_FINDINGS.md`. The android VPN path is now
+  **proven to run** on-device, not just compiled/unit-tested. Phase 5 (docs +
+  manual physical-device acceptance) is the remaining work.
 
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - dev
+      - ssh
   pull_request:
 
 jobs:

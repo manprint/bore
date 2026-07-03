@@ -8,6 +8,7 @@ on:
       - macos
       - windows
       - android
+      - ssh
   pull_request:
 
 jobs:

@@ -94,8 +94,10 @@ green (`android-vpn-e2e`, 8/8, rooted x86_64 emulator API 30). Both `bore vpn li
 - `--pin-mtu` / PMTU monitor
 - `--relay-only` (force relay-only mode)
 - `--auto-reconnect` (auto-reconnect on link death)
-- SIGKILL recovery (`stale_reclaim`): state file cleanup (no ip_forward to restore; does NOT
-  cover the `ip rule` leak in gap #12 above — that state was never registered for revert)
+- SIGKILL recovery (`stale_reclaim`): always a clean no-op on Android — `apply()` never writes
+  an `.ipforward`/`.fwdref` marker (host-only, no `ip_forward` ever touched), so there's nothing
+  for it to find. Does NOT cover the `ip rule` leak in gap #12 above (that's separate kernel
+  routing-policy state, never registered for revert by any code path)
 - UDP hole-punch helper flags (`--upnp`, `--stun-server`, etc.) — accepted, best-effort
   (cross-platform socket code, behavior untested on real Android networks)
 

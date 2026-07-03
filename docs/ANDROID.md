@@ -235,14 +235,19 @@ containing "File exists" as success — the rule is idempotent by construction.
 #### No RAII state files on Android
 
 Linux uses `/run/bore-vpn-*` state files to track refcounted `ip_forward` and leaked rules
-during SIGKILL recovery. Android has no writable `/run` under SELinux + app sandbox (Magisk/
-Termux environments may differ, but unrooted Android has no `/run`). Instead:
+during SIGKILL recovery. Android's `apply()` twin never touches `ip_forward` at all (host-only,
+no gateway), so it never writes an `.ipforward`/`.fwdref` marker in the first place — there is
+nothing to persist.
 
-- **State path:** `/data/local/tmp` (readable/writable even in typical SELinux policies).
-- **Stored on apply:** only marker files for SIGKILL reclaim (routes and rules are expected to
-  persist across crashes until manual cleanup or the next successful `connect`).
-- **Restored on SIGKILL:** `stale_reclaim` flushes leaked state files but has no `ip_forward`
-  to restore (it was never touched).
+- **State path:** `/data/local/tmp` (`run_dir()`, readable/writable even in typical SELinux
+  policies) — reserved for parity with the other platforms' state-path helper, but never
+  actually written to by the Android VPN code path.
+- **`stale_reclaim` on a SIGKILL:** looks for `bore-vpn-<id>-<role>.ipforward`/`.fwdref` under
+  `/data/local/tmp` and removes them if present, exactly like the Linux/Windows twins — but
+  since Android never creates them, this is always a no-op: zero files found, zero log lines,
+  clean return. The `ip rule` left behind by a SIGKILLed link (see the troubleshooting section
+  below) is a *separate*, genuinely leaked piece of kernel state that `stale_reclaim` was never
+  wired to touch (it lives in the routing-policy database, not a `/data/local/tmp` file).
 
 ### Build and install
 

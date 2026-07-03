@@ -2,7 +2,7 @@
 
 > Machine-readable. Implementer: update after EVERY sub-phase. Keep terse.
 
-**Next:** phase_05.md sub-phase 5.1 (docs/ANDROID.md + limits refresh)
+**Next:** phase_05.md sub-phase 5.2 (VPN_ANDROID_ACCEPTANCE.md)
 
 > **Model note:** per explicit user instruction, every "Opus" role in the
 > original plan (architect / review-gate / final-read) is executed by
@@ -25,7 +25,7 @@
 | 4 | 4.1 examples/android_vpn_spike.rs | Sonnet | DONE | commit 9ce7718; 4 modes (spike/create-teardown/apply-revert/leak-then-reclaim) mirroring macos/windows spike structure; every fn individually cfg(android)-gated, stub main for Linux; hardcodes deterministic "bore-vpn-ns0-" fwdref prefix (private helpers unreachable from example crate); fmt/clippy(-D warnings, default+vpn incl. this example)/test(default+vpn) all green on Linux. Actual android compile/run is CI/device-only, verified in 4.2 |
 | 4 | 4.2 android-vpn-e2e job + script | Sonnet + Sonnet 5 review gate | DONE | commit cdac0c8 (script+job) then a bug chain to reach green, all CI-diagnosed not guessed: bdb7494 (rp_filter relax, insufficient alone) → fbe5edd (android netd policy routing eats implicit `lookup main` fallback rule, fixed with `ip rule add to <subnet> lookup main priority 100`; T-AND-L1 PASS after this) → 6301c3c (hypothesized T-AND-L2 teardown race, added `wait_for_guest_iface_gone` poll — kept as valid hardening but CI disproved the hypothesis, same failure recurred) → ee09770 (diagnostics-only: the "could not discover overlay addrs" branch had zero diagnostics, added a dump) → **aa0dfb3** (real root cause from the ee09770 CI log: `ip rule add` errors `RTNETLINK answers: File exists` on an exact duplicate — unlike `ip addr add` — and the rule persists across TUN teardown since it's routing-policy-DB state, not device state; T-AND-L1 and T-AND-L2 reuse the same pool address so L2 hit L1's leftover rule and `run_ip`'s `bail!` killed `connect` before the TUN came up; fixed by adding this one rule via `std::process::Command` directly, tolerating `File exists` as success). **CI CONFIRMED GREEN on aa0dfb3**: `Android VPN e2e (api 30, x86_64)` → `PASS: 8 FAIL: 0` (T-AND-L2 path=DIRECT), `VPN cross check` both aarch64/x86_64-linux-android green, Mean Bean Deploy + Docker(GHCR) green — zero regressions |
 | 4 | 4.3 findings write-back | Sonnet (Sonnet 5 review, no twin body change beyond 4.2's) | DONE | `SPIKE_FINDINGS.md` written (mirrors VPN_MACOS_SPIKE_FINDINGS.md structure, filled from CI evidence not TODO placeholders); CLAUDE.md Android block refreshed (bore-android-tun crate rationale, netd/`ip rule` finding, duplicate-tolerance correction, status flipped to Phase 4 DONE+CI-GREEN). No further `src/` twin changes needed beyond aa0dfb3 (4.2) — the twins were already final. Phase 4 DONE |
-| 5 | 5.1 docs/ANDROID.md + limits refresh | Haiku | TODO | |
+| 5 | 5.1 docs/ANDROID.md + limits refresh | Haiku | DONE | docs/ANDROID.md new (391 lines) + VPN_ANDROID_ACTUAL_LIMIT.md refreshed; Haiku draft had 8 factual errors (TUN naming, rp_filter mechanism, self-contradicting `--advertise` example w/ hallucinated `--server` flag, placeholder error table, backwards `/dev/tun` vs `/dev/net/tun` claim, mislabeled unsafe boundary, fabricated Phase 5.2 claim, stale troubleshooting wording), all found+fixed against src/vpn.rs/main.rs/bore-android-tun source directly; new gap #11 documented (`ip rule` never removed — no RAII/stale_reclaim coverage, permanent leak vs Linux/macOS/Windows); gates green (fmt/clippy default+vpn/test) |
 | 5 | 5.2 VPN_ANDROID_ACCEPTANCE.md | Haiku | TODO | |
 | 5 | 5.3 release verify + final read | Sonnet 5 | TODO | |
 
@@ -54,7 +54,7 @@
 |-----|-------|--------|
 | CLAUDE.md Android block | 3.4, 5.3 | DONE (3.4, will refresh at 5.3) |
 | SPIKE_FINDINGS.md (plan folder) | 4.3 | DONE |
-| docs/ANDROID.md | 5.1 | TODO |
-| limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md rewrite | 5.1 | TODO |
+| docs/ANDROID.md | 5.1 | DONE |
+| limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md rewrite | 5.1 | DONE |
 | docs/vpn/VPN_ANDROID_ACCEPTANCE.md | 5.2 | TODO |
 | INSTALL_BORE.md / DOWNLOAD_URLS.md android rows | 5.1 | TODO |

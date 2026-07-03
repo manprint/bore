@@ -2,7 +2,7 @@
 
 > Machine-readable. Implementer: update after EVERY sub-phase. Keep terse.
 
-**Next:** phase_04.md sub-phase 4.3 (findings write-back, after CI run of 4.2)
+**Next:** phase_05.md sub-phase 5.1 (docs/ANDROID.md + limits refresh)
 
 > **Model note:** per explicit user instruction, every "Opus" role in the
 > original plan (architect / review-gate / final-read) is executed by
@@ -23,8 +23,8 @@
 | 3 | 3.3 host-only CLI guard matrix | Sonnet + Sonnet 5 review gate | DONE | commit 607355f; validate_android_host_only (pure, target_is_android bool param) called at top of run_listen/run_connect before run_with_reconnect; rejects --advertise non-empty, --nat-masquerade, --forward-accept, --max-clients>1, --tun-queues>1 with exact D-A4 message text; UDP hole-punch flags NOT special-cased (unchanged). Sonnet-5 review gate: rejected set == D-A4/D-A6/D-A9 exactly, confirmed. fmt/clippy(-D warnings, default+vpn)/test(default+vpn) all green |
 | 3 | 3.4 regression sweep + CLAUDE.md | Haiku | DONE | commit 1f9a52d; full `vpn_netns_test.sh` 161/0 (SIGKILL reclaim, hub, NAT, forward-accept, stress/flap suites all pass — zero regression from Phase 3 twins/guards); fmt/clippy(-D warnings, default+vpn)/test(default+vpn) all green; CLAUDE.md VPN Android port block added. Phase 3 DONE |
 | 4 | 4.1 examples/android_vpn_spike.rs | Sonnet | DONE | commit 9ce7718; 4 modes (spike/create-teardown/apply-revert/leak-then-reclaim) mirroring macos/windows spike structure; every fn individually cfg(android)-gated, stub main for Linux; hardcodes deterministic "bore-vpn-ns0-" fwdref prefix (private helpers unreachable from example crate); fmt/clippy(-D warnings, default+vpn incl. this example)/test(default+vpn) all green on Linux. Actual android compile/run is CI/device-only, verified in 4.2 |
-| 4 | 4.2 android-vpn-e2e job + script | Sonnet + Sonnet 5 review gate | DONE | commit cdac0c8; scripts/android_vpn_test.sh (T-AND-S1..S3 spike modes, T-AND-L1 relay bidirectional ping via dynamic --vpn-pool, T-AND-L2 direct-informational never-fail-on-fallback, T-AND-L3..L5 negatives) + CI job android-vpn-e2e cloned from android-emu-e2e (cargo-ndk builds host+android+spike-example with --features vpn). Sonnet-5 review gate on the assertion set caught+fixed 2 real bugs pre-commit: (1) wait_for_log's "VpnReady" alt also matched the FAILURE log line, narrowed to unique "vpn link paired"; (2) unguarded `ip addr show bore0` under set-e/pipefail would abort the whole script on a failed pairing instead of failing just that test, added `\|\| true`. Shellcheck-clean (1 justified SC2024 suppression, documented). No Rust touched; actual green-run verification is CI-push-only (no local NDK/emulator) |
-| 4 | 4.3 findings write-back | Sonnet (+ Sonnet 5 review if twins change) | TODO | |
+| 4 | 4.2 android-vpn-e2e job + script | Sonnet + Sonnet 5 review gate | DONE | commit cdac0c8 (script+job) then a bug chain to reach green, all CI-diagnosed not guessed: bdb7494 (rp_filter relax, insufficient alone) → fbe5edd (android netd policy routing eats implicit `lookup main` fallback rule, fixed with `ip rule add to <subnet> lookup main priority 100`; T-AND-L1 PASS after this) → 6301c3c (hypothesized T-AND-L2 teardown race, added `wait_for_guest_iface_gone` poll — kept as valid hardening but CI disproved the hypothesis, same failure recurred) → ee09770 (diagnostics-only: the "could not discover overlay addrs" branch had zero diagnostics, added a dump) → **aa0dfb3** (real root cause from the ee09770 CI log: `ip rule add` errors `RTNETLINK answers: File exists` on an exact duplicate — unlike `ip addr add` — and the rule persists across TUN teardown since it's routing-policy-DB state, not device state; T-AND-L1 and T-AND-L2 reuse the same pool address so L2 hit L1's leftover rule and `run_ip`'s `bail!` killed `connect` before the TUN came up; fixed by adding this one rule via `std::process::Command` directly, tolerating `File exists` as success). **CI CONFIRMED GREEN on aa0dfb3**: `Android VPN e2e (api 30, x86_64)` → `PASS: 8 FAIL: 0` (T-AND-L2 path=DIRECT), `VPN cross check` both aarch64/x86_64-linux-android green, Mean Bean Deploy + Docker(GHCR) green — zero regressions |
+| 4 | 4.3 findings write-back | Sonnet (Sonnet 5 review, no twin body change beyond 4.2's) | DONE | `SPIKE_FINDINGS.md` written (mirrors VPN_MACOS_SPIKE_FINDINGS.md structure, filled from CI evidence not TODO placeholders); CLAUDE.md Android block refreshed (bore-android-tun crate rationale, netd/`ip rule` finding, duplicate-tolerance correction, status flipped to Phase 4 DONE+CI-GREEN). No further `src/` twin changes needed beyond aa0dfb3 (4.2) — the twins were already final. Phase 4 DONE |
 | 5 | 5.1 docs/ANDROID.md + limits refresh | Haiku | TODO | |
 | 5 | 5.2 VPN_ANDROID_ACCEPTANCE.md | Haiku | TODO | |
 | 5 | 5.3 release verify + final read | Sonnet 5 | TODO | |
@@ -42,10 +42,10 @@
 | unit: android_stale_reclaim_removes_leaked_state | reclaim | 3 | PASS |
 | unit: android_guard_matrix | CLI guard table | 3 | PASS |
 | regression: vpn_netns_test.sh full | Linux zero-regression proof | 3,4,5 | PASS 161/0 |
-| T-AND-S1..S3 | spike (tun, apply/revert, reclaim) | 4 | script+CI job written (4.2); PENDING CI run |
-| T-AND-L1 | relay link bidirectional ping | 4 | script+CI job written (4.2); PENDING CI run |
-| T-AND-L2 | direct best-effort (informational) | 4 | script+CI job written (4.2); PENDING CI run |
-| T-AND-L3..L5 | negatives (non-root, advertise, queues) | 4 | script+CI job written (4.2); PENDING CI run |
+| T-AND-S1..S3 | spike (tun, apply/revert, reclaim) | 4 | PASS (run 28637749882, commit aa0dfb3) |
+| T-AND-L1 | relay link bidirectional ping | 4 | PASS (run 28637749882, commit aa0dfb3) |
+| T-AND-L2 | direct best-effort (informational) | 4 | PASS, path=DIRECT (run 28637749882, commit aa0dfb3) |
+| T-AND-L3..L5 | negatives (non-root, advertise, queues) | 4 | PASS (run 28637749882, commit aa0dfb3) |
 | T-AND-M1..M5 | manual acceptance, real device | 5 | TODO (hardware) |
 
 ## Docs status
@@ -53,7 +53,7 @@
 | Doc | Phase | Status |
 |-----|-------|--------|
 | CLAUDE.md Android block | 3.4, 5.3 | DONE (3.4, will refresh at 5.3) |
-| SPIKE_FINDINGS.md (plan folder) | 4.3 | TODO |
+| SPIKE_FINDINGS.md (plan folder) | 4.3 | DONE |
 | docs/ANDROID.md | 5.1 | TODO |
 | limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md rewrite | 5.1 | TODO |
 | docs/vpn/VPN_ANDROID_ACCEPTANCE.md | 5.2 | TODO |

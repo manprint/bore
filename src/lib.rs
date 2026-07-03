@@ -33,6 +33,10 @@ pub mod reconnect;
 pub mod secret;
 pub mod server;
 pub mod shared;
+#[cfg(feature = "ssh-gateway")]
+pub mod sshgw;
+#[cfg(feature = "ssh-gateway")]
+pub mod sshgw_auth;
 pub mod transfer;
 pub mod transport;
 pub mod udp_diagnostic;

@@ -218,6 +218,22 @@ run_link_test() {
             fail "$test_id: guest_ping_ok=$guest_ping_ok host_ping_ok=$host_ping_ok"
             cat "$TMPDIR/${id}_guest_ping.log" >&2 || true
             cat "$TMPDIR/${id}_host_ping.log" >&2 || true
+            # Diagnostics for the direction that failed — rp_filter is the prime
+            # suspect (AOSP defaults strict, Ubuntu defaults loose) but dump both
+            # sides' routing/rp_filter/firewall state so a repeat failure has
+            # concrete evidence instead of another blind guess.
+            echo "--- diagnostics: $test_id ---" >&2
+            echo "[host] rp_filter all/bore0:" >&2
+            cat /proc/sys/net/ipv4/conf/all/rp_filter /proc/sys/net/ipv4/conf/bore0/rp_filter 1>&2 2>&1 || true
+            echo "[host] ip route show table all:" >&2
+            ip route show table all 1>&2 2>&1 || true
+            echo "[guest] rp_filter all/bore0:" >&2
+            adb shell "cat /proc/sys/net/ipv4/conf/all/rp_filter /proc/sys/net/ipv4/conf/bore0/rp_filter" 1>&2 2>&1 || true
+            echo "[guest] ip rule / route show table all:" >&2
+            adb shell "ip rule; ip route show table all" 1>&2 2>&1 || true
+            echo "[guest] iptables -L -n -v:" >&2
+            adb shell "iptables -L -n -v" 1>&2 2>&1 || true
+            echo "--- end diagnostics ---" >&2
         fi
     fi
 

@@ -5225,6 +5225,28 @@ pub mod hostcfg {
         run_ip(&["link", "set", "dev", &actual_name, "mtu", &mtu.to_string()])?;
         run_ip(&["link", "set", "dev", &actual_name, "up"])?;
 
+        // AOSP kernels default `rp_filter` to strict (1) on both `all` and newly
+        // created interfaces; the effective mode is `max(all, <if>)`, so lowering
+        // only the per-interface value is not enough (Documentation/networking/
+        // ip-sysctl.rst). Left at strict, a packet arriving on this TUN with a
+        // source address outside what strict mode considers routable back out the
+        // SAME interface is dropped in-kernel before reaching any socket or the
+        // ICMP auto-reply path — this is a well-known Android/OpenVPN-class gotcha
+        // (desktop Linux/Ubuntu ships `rp_filter=2`, loose, so this never surfaced
+        // on the other platform twins). Host-only (D-A4/D-A6): this device is
+        // already root for TUN creation, and a single-purpose VPN client widening
+        // `all` is the accepted, standard mobile-VPN trade-off. Best-effort: a
+        // write failure (SELinux, read-only /proc on some ROMs) only means the
+        // pre-existing strict behavior persists, not a fatal setup error.
+        for path in [
+            "/proc/sys/net/ipv4/conf/all/rp_filter".to_string(),
+            format!("/proc/sys/net/ipv4/conf/{actual_name}/rp_filter"),
+        ] {
+            if let Err(e) = tokio::fs::write(&path, "0\n").await {
+                tracing::warn!(%path, error = %e, "failed to relax rp_filter (reverse-path packets to this TUN may be dropped)");
+            }
+        }
+
         tracing::info!(%actual_name, "Android TUN created (single queue, no offload)");
 
         // offload is always false on Android ⇒ bridge single-packet path (I-M3).

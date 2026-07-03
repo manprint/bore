@@ -12,6 +12,8 @@ use anyhow::{Context, Result};
     )
 ))]
 use bore_cli::shared::{AdvertiseEntry, Ipv4Net, VpnAddrRequest};
+#[cfg(feature = "ssh-gateway")]
+use bore_cli::sshgw_auth;
 #[cfg(all(
     feature = "vpn",
     any(
@@ -742,6 +744,10 @@ enum Command {
         #[clap(long)]
         udp_only: bool,
     },
+
+    /// Generate an argon2id hash line for --ssh-passwords-file; reads the password from stdin.
+    #[cfg(feature = "ssh-gateway")]
+    HashPassword,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2213,6 +2219,16 @@ async fn dispatch(command: Command) -> Result<()> {
                 )
                 .await?;
             }
+        }
+
+        #[cfg(feature = "ssh-gateway")]
+        Command::HashPassword => {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            let password = line.trim_end_matches(['\n', '\r']);
+            let hash = sshgw_auth::hash_password(password)?;
+            println!("{hash}");
+            eprintln!("add to the passwords file as: <label>:{hash}");
         }
     }
 

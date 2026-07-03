@@ -390,7 +390,7 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   correction lands in `pf_ruleset`/the `cmd_pf_*` builders + their snapshots, not in `apply`.
 
 **VPN Android port (runtime LANDED + VALIDATED on rooted emulator 2026-07-03,
-branch `android`; Phase 4 done — Phase 5 docs/manual-acceptance remaining):**
+branch `android`; Phases 1-5 done — only manual physical-device acceptance remains):**
 - Plan: `docs/plans/plan_AndroidSupport/` (overview + phase_0{1..5}.md +
   resume.md + `SPIKE_FINDINGS.md`). Same twin pattern as the macOS port
   (DEC-M1/I-A1): every OS-specific fn/type gets a `#[cfg(target_os =
@@ -465,8 +465,16 @@ branch `android`; Phase 4 done — Phase 5 docs/manual-acceptance remaining):**
   rooted x86_64 emulator — `PASS: 8 FAIL: 0`, including a genuine bidirectional
   DIRECT-path link (T-AND-L2) alongside the forced-relay link (T-AND-L1). Findings
   in `docs/plans/plan_AndroidSupport/SPIKE_FINDINGS.md`. The android VPN path is now
-  **proven to run** on-device, not just compiled/unit-tested. Phase 5 (docs +
-  manual physical-device acceptance) is the remaining work.
+  **proven to run** on-device, not just compiled/unit-tested. **Phase 5 (docs) DONE
+  2026-07-03**: `docs/ANDROID.md` (install/feature-matrix/CLI-guard-table/VPN backend
+  reference), `docs/vpn/limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md` (hard-wall vs
+  v1-scoped-deferred vs unverified, 12 gaps), and `docs/vpn/VPN_ANDROID_ACCEPTANCE.md`
+  (T-AND-M1..M5 manual procedure, no gateway scenario since Android is host-only)
+  are all written and cross-checked against `src/vpn.rs`. Release pipeline verified:
+  `docker/Dockerfile.android` already builds with `--all-features`, so the shipped
+  `bore-aarch64-linux-android` release binary already ships the `vpn` feature —
+  no pipeline change needed. The only remaining work on this plan is running
+  T-AND-M1..M5 by hand on physical hardware (tracked in `resume.md`).
 
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

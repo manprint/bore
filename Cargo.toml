@@ -81,8 +81,10 @@ tun-rs = { version = "2.8.5", optional = true, features = ["async"] }
 
 [target.'cfg(windows)'.dependencies]
 bore-wintun = { path = "crates/bore-wintun", optional = true }
-bore-android-tun = { path = "crates/bore-android-tun", optional = true }
 windows-sys = { version = "0.52", features = ["Win32_System_Console", "Win32_Foundation"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+bore-android-tun = { path = "crates/bore-android-tun", optional = true }
 
 [dev-dependencies]
 lazy_static = "1.4.0"

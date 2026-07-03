@@ -5185,16 +5185,92 @@ pub mod hostcfg {
         })
         .ok_or_else(|| anyhow!("TUN name resolution failed for '{name}'"))?;
 
-        let dev = tun_rs::DeviceBuilder::new()
-            .name(&resolved_name)
-            .ipv4(addr, prefix, None)
-            .mtu(mtu)
-            .build_async()
-            .context("failed to create Android TUN device")?;
+        // tun-rs's high-level `DeviceBuilder` (ioctl-based create-from-scratch)
+        // is compiled only for windows/linux(non-ohos)/macos/*bsd — NOT android
+        // (upstream's android story is `SyncDevice::from_fd`/`AsyncDevice::from_fd`
+        // wrapping a fd handed over from Android's Java-side
+        // `VpnService.Builder().establish()`; see tun-rs README's Android
+        // section). That JNI/VpnService path doesn't exist for bore's rooted-CLI
+        // host-only model (D-A4/D-A6/D-A9), so we open the kernel tun clone
+        // device and do the `TUNSETIFF` ioctl ourselves — safe here because a
+        // rooted device is still plain Linux underneath, identical kernel ABI
+        // to desktop Linux. Discovered via the Phase 4.1/4.2 spike + e2e CI
+        // (`tun_rs::DeviceBuilder` doesn't exist for this target — E0433).
+        let dev_path = if std::path::Path::new("/dev/tun").exists() {
+            "/dev/tun"
+        } else {
+            // Android's minimal /dev has no "net" subdirectory on stock ROMs;
+            // some kernels/ROMs still provide the desktop-Linux path.
+            "/dev/net/tun"
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dev_path)
+            .with_context(|| format!("opening {dev_path} (TUN clone device)"))?;
 
-        let actual_name = dev
-            .name()
-            .context("failed to read back Android TUN interface name")?;
+        let mut ifr: nix::libc::ifreq = unsafe { std::mem::zeroed() };
+        for (dst, src) in ifr.ifr_name.iter_mut().zip(resolved_name.as_bytes()) {
+            *dst = *src as std::os::raw::c_char;
+        }
+        ifr.ifr_ifru.ifru_flags =
+            (nix::libc::IFF_TUN | nix::libc::IFF_NO_PI) as std::os::raw::c_short;
+
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        // SAFETY: `fd` is a valid, open fd for `dev_path` (just opened above);
+        // `ifr` is a valid, live `ifreq` for the duration of this call. Raw
+        // pointer (not `&mut ifr`) to match nix's own `ioctl_write_ptr_bad!`
+        // calling convention for non-standard-encoded ioctls like TUNSETIFF.
+        let ret =
+            unsafe { nix::libc::ioctl(fd, nix::libc::TUNSETIFF as _, std::ptr::addr_of_mut!(ifr)) };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("TUNSETIFF ioctl failed on Android TUN clone device");
+        }
+
+        let actual_name = {
+            let raw = &ifr.ifr_name;
+            let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+            raw[..end]
+                .iter()
+                .map(|&c| *c as u8 as char)
+                .collect::<String>()
+        };
+
+        // Hand the fd to tun-rs. `from_fd` takes ownership (closes on drop), so
+        // release it from `file` first to avoid a double-close.
+        let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(file);
+        // SAFETY: `raw_fd` was just configured as a TUN device above and is not
+        // used anywhere else after this call.
+        let dev = unsafe { TunDevice::from_fd(raw_fd) }
+            .with_context(|| format!("wrapping fd for {actual_name} via tun_rs::AsyncDevice"))?;
+
+        // No `DeviceBuilder` on this target (see above) ⇒ address/mtu/up must be
+        // configured out-of-band, same style as `NetConfig::apply`'s route
+        // management: toybox's `ip` applet.
+        let run_ip = |args: &[&str]| -> anyhow::Result<()> {
+            let out = std::process::Command::new("ip")
+                .args(args)
+                .output()
+                .with_context(|| format!("spawning `ip {}`", args.join(" ")))?;
+            if !out.status.success() {
+                bail!(
+                    "`ip {}` failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            Ok(())
+        };
+        run_ip(&[
+            "addr",
+            "add",
+            &format!("{addr}/{prefix}"),
+            "dev",
+            &actual_name,
+        ])?;
+        run_ip(&["link", "set", "dev", &actual_name, "mtu", &mtu.to_string()])?;
+        run_ip(&["link", "set", "dev", &actual_name, "up"])?;
 
         tracing::info!(%actual_name, "Android TUN created (single queue, no offload)");
 

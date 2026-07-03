@@ -24,9 +24,12 @@
 // the Linux dev box, and clippy-cleanliness of a throwaway harness has ~no
 // value. Relax the clippy `all` group + unused here, scoped to android so the
 // Linux build and the production library lints are unaffected.
-#![cfg_attr(target_os = "android", allow(unused, clippy::all))]
+#![cfg_attr(
+    all(target_os = "android", feature = "vpn"),
+    allow(unused, clippy::all)
+)]
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "vpn"))]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let subscriber = tracing_subscriber::fmt()
@@ -52,16 +55,16 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(all(target_os = "android", feature = "vpn")))]
 fn main() {
-    eprintln!("android_vpn_spike: android-only (Linux CI will skip with this stub main)");
+    eprintln!("android_vpn_spike: android+vpn-feature-only (this build skips with this stub main)");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Helper functions
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "vpn"))]
 fn run(argv: &[String]) -> (bool, String, String) {
     use std::process::{Command, Stdio};
     let output = Command::new(&argv[0])
@@ -80,7 +83,7 @@ fn run(argv: &[String]) -> (bool, String, String) {
     )
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "vpn"))]
 fn ip_link_has(name: &str) -> bool {
     let (ok, stdout, _) = run(&[
         "ip".to_string(),
@@ -91,18 +94,18 @@ fn ip_link_has(name: &str) -> bool {
     ok && stdout.contains(name)
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "vpn"))]
 fn ip_route_has(subnet: &str) -> bool {
     let (ok, stdout, _) = run(&["ip".to_string(), "route".to_string(), "show".to_string()]);
     ok && stdout.contains(subnet)
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "vpn"))]
 fn pass(step: &str) {
     println!("PASS {step}");
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "vpn"))]
 fn fail_exit(step: &str, detail: &str) -> ! {
     eprintln!("FAIL {step}: {detail}");
     std::process::exit(1);
@@ -112,7 +115,7 @@ fn fail_exit(step: &str, detail: &str) -> ! {
 // spike: TUN creation + self-ping
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "vpn"))]
 async fn cmd_spike() -> anyhow::Result<()> {
     println!("\n=== Phase 4.1 Spike: android TUN + self-ping ===\n");
 
@@ -183,7 +186,7 @@ async fn cmd_spike() -> anyhow::Result<()> {
 // create-teardown: TUN lifecycle
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "vpn"))]
 async fn cmd_create_teardown() -> anyhow::Result<()> {
     println!("\n=== create-teardown ===\n");
 
@@ -215,7 +218,7 @@ async fn cmd_create_teardown() -> anyhow::Result<()> {
 // apply-revert: NetConfig RAII (host-only route table)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "vpn"))]
 async fn cmd_apply_revert() -> anyhow::Result<()> {
     println!("\n=== apply-revert ===\n");
 
@@ -272,7 +275,7 @@ async fn cmd_apply_revert() -> anyhow::Result<()> {
 // leak-then-reclaim: stale_reclaim
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "vpn"))]
 async fn cmd_leak_then_reclaim() -> anyhow::Result<()> {
     println!("\n=== leak-then-reclaim ===\n");
 

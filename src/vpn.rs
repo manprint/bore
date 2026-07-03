@@ -5228,16 +5228,12 @@ pub mod hostcfg {
         // AOSP kernels default `rp_filter` to strict (1) on both `all` and newly
         // created interfaces; the effective mode is `max(all, <if>)`, so lowering
         // only the per-interface value is not enough (Documentation/networking/
-        // ip-sysctl.rst). Left at strict, a packet arriving on this TUN with a
-        // source address outside what strict mode considers routable back out the
-        // SAME interface is dropped in-kernel before reaching any socket or the
-        // ICMP auto-reply path — this is a well-known Android/OpenVPN-class gotcha
-        // (desktop Linux/Ubuntu ships `rp_filter=2`, loose, so this never surfaced
-        // on the other platform twins). Host-only (D-A4/D-A6): this device is
-        // already root for TUN creation, and a single-purpose VPN client widening
-        // `all` is the accepted, standard mobile-VPN trade-off. Best-effort: a
-        // write failure (SELinux, read-only /proc on some ROMs) only means the
-        // pre-existing strict behavior persists, not a fatal setup error.
+        // ip-sysctl.rst). Desktop Linux/Ubuntu ships `rp_filter=2` (loose), so
+        // this never surfaced on the other platform twins. Host-only (D-A4/D-A6):
+        // this device is already root for TUN creation, and a single-purpose VPN
+        // client widening `all` is the accepted, standard mobile-VPN trade-off.
+        // Best-effort: a write failure (SELinux, read-only /proc on some ROMs)
+        // only means the pre-existing strict behavior persists, not fatal.
         for path in [
             "/proc/sys/net/ipv4/conf/all/rp_filter".to_string(),
             format!("/proc/sys/net/ipv4/conf/{actual_name}/rp_filter"),
@@ -5246,6 +5242,37 @@ pub mod hostcfg {
                 tracing::warn!(%path, error = %e, "failed to relax rp_filter (reverse-path packets to this TUN may be dropped)");
             }
         }
+
+        // The actual T-AND-L1/L2 root cause (rp_filter alone did not fix it):
+        // netd manages Android's routing entirely through explicit `ip rule`
+        // policy routing per network (fwmark/uid/iif-scoped rules) and does NOT
+        // leave the kernel's implicit `32766: from all lookup main` fallback rule
+        // in place. `ip addr add`/`ip route add` above put our connected route in
+        // "main", but a kernel-generated packet (e.g. the automatic ICMP echo
+        // reply to an inbound ping — mark=0, no owning socket) hits netd's
+        // `15000: from all fwmark 0x0/0x10000 lookup legacy_system` first (it
+        // matches any default/unmarked packet) and never reaches "main" at all,
+        // so the reply's own outbound route lookup fails against a table that
+        // has no idea our TUN subnet exists — a silent drop, not a firewall
+        // rule (this is why inbound delivery + guest-initiated round trips
+        // worked: those only need the always-present "local" table to recognize
+        // the destination address, not a "main" table lookup for a NEW packet).
+        // Fix: an explicit destination-scoped rule at a priority below every
+        // netd rule (100 < 10000) sends anything bound for this link's own
+        // subnet through "main" unconditionally, regardless of mark/uid/iif.
+        // Scoped to just this /link's small subnet, so normal app traffic
+        // routing is untouched. `ip rule add` does not error on a duplicate
+        // (unlike `ip addr add`), so a harmless dupe on reconnect is fine.
+        run_ip(&[
+            "rule",
+            "add",
+            "to",
+            &format!("{addr}/{prefix}"),
+            "lookup",
+            "main",
+            "priority",
+            "100",
+        ])?;
 
         tracing::info!(%actual_name, "Android TUN created (single queue, no offload)");
 

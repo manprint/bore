@@ -227,6 +227,22 @@ run_link_test() {
 
     if [ -z "$host_overlay" ] || [ -z "$guest_overlay" ]; then
         fail "$test_id: could not discover overlay addrs (host=[$host_overlay] guest=[$guest_overlay])"
+        # No diagnostics existed for this failure path (unlike the ping-failure
+        # branch below) — dump enough to tell apart "iface never came up",
+        # "came up under a different name", and "process died/reconnected"
+        # instead of guessing a root cause blind again.
+        echo "--- diagnostics: $test_id (overlay discovery) ---" >&2
+        echo "[host] listen log:" >&2
+        cat "$listen_log" >&2 || true
+        echo "[host] ip -4 -o addr show (all ifaces):" >&2
+        ip -4 -o addr show 1>&2 2>&1 || true
+        echo "[guest] connect log ($guest_log):" >&2
+        adb shell "cat $guest_log" 1>&2 2>&1 || true
+        echo "[guest] ip -4 -o addr show (all ifaces):" >&2
+        adb shell "ip -4 -o addr show" 1>&2 2>&1 || true
+        echo "[guest] ps -A | grep bore:" >&2
+        adb shell "ps -A | grep bore" 1>&2 2>&1 || true
+        echo "--- end diagnostics ---" >&2
     else
         echo "host_overlay=$host_overlay guest_overlay=$guest_overlay"
         local guest_ping_ok=0 host_ping_ok=0

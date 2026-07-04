@@ -23,7 +23,7 @@ use dashmap::mapref::entry::Entry;
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, ChannelOpenHandle, Handle, Handler, Msg, Session};
-use russh::{Channel, ChannelId};
+use russh::{Channel, ChannelId, ChannelOpenFailure};
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
@@ -509,6 +509,169 @@ impl GatewayHandler {
             .queue_message(format!("vhost tunnel requested: {label_for_message}"));
         Ok(true)
     }
+
+    /// Registers `-R secret/<id>` (or a bare label on port 0) as a secret-tunnel
+    /// provider. Mirrors [`secret::serve_provider`]'s registry-insert + admin-
+    /// register sequence (`src/secret.rs:254`) so the untouched native consumer
+    /// relay (`serve_consumer`) reaches this provider transparently — its
+    /// `pool.pick().open_ready()` opens an SSH `forwarded-tcpip` channel behind
+    /// the same [`mux::LinkOpener`] abstraction it already uses for a native
+    /// yamux carrier.
+    async fn tcpip_forward_secret(
+        &self,
+        address: &str,
+        port: u16,
+        id: String,
+        grant: KeyGrant,
+        session: &mut Session,
+    ) -> Result<bool, russh::Error> {
+        if !permit_allows(&grant, "secret/", &id) {
+            self.state.queue_message(format!(
+                "bore ssh-gateway: this key's permit= list does not allow secret/{id}"
+            ));
+            return Ok(false);
+        }
+
+        let ssh_handle = session.handle();
+        let gateway = Arc::clone(&self.gateway);
+        let state = Arc::clone(&self.state);
+        let peer = self.peer;
+        let connected_address = address.to_string();
+        let key = (connected_address.clone(), port);
+        let id_for_message = id.clone();
+
+        let task = tokio::spawn(async move {
+            let (exec, env) = await_params(&state).await;
+            let params = parse_params(exec.as_deref(), &env, &grant);
+
+            let pool = match gateway.providers.entry(id.clone()) {
+                Entry::Occupied(_) => {
+                    state.queue_message(format!("tcp-secret-id '{id}' already in use"));
+                    return;
+                }
+                Entry::Vacant(slot) => {
+                    let opener = SshOpener::new(ssh_handle, connected_address, port);
+                    let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Ssh(Arc::new(opener))));
+                    slot.insert(Arc::clone(&pool));
+                    pool
+                }
+            };
+            let _guard = SecretSshGuard {
+                registry: gateway.providers.clone(),
+                id: id.clone(),
+            };
+
+            state.queue_message(format!("secret tunnel provider ready: {id}"));
+
+            let registration = gateway.admin.register(NewEntry {
+                role: Role::SecretProvider,
+                peer,
+                secret_id: Some(id.clone()),
+                public_port: None,
+                notes: params.notes.clone(),
+                basic_auth: false,
+                https: false,
+                force_https: false,
+                carriers: 1,
+                auto_reconnect: false,
+                webserver_log: false,
+                udp: false,
+                vpn_relay_only: false,
+                vpn_pin_mtu: false,
+                vpn_mtu: None,
+                vpn_forward_accept: false,
+                vpn_nat_masquerade: false,
+                vpn_route_policy: None,
+                vpn_advertised: vec![],
+                vpn_nat_udp_port: None,
+                local_proxy_port: None,
+                local_host: None,
+                local_port: None,
+                nat_udp_preferred_port: None,
+                nat_udp_release_timeout: None,
+                stun_server: None,
+                upnp: false,
+                try_port_prediction: false,
+                max_conns: None,
+                transport: Transport::Ssh,
+                identity: Some(grant.identity.clone()),
+            });
+
+            // Nothing left to do but stay alive: native/SSH consumers reach
+            // `pool` through the registry lookup in `secret::relay`/
+            // `channel_open_direct_tcpip`. This task's only remaining purpose
+            // is to hold `_guard`/`pool`/`registration` until aborted (I-3).
+            let _pool = pool;
+            let _registration = registration;
+            std::future::pending::<()>().await;
+        });
+        self.state
+            .forwards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, task);
+
+        self.state
+            .queue_message(format!("secret tunnel requested: {id_for_message}"));
+        Ok(true)
+    }
+
+    /// The (session, id)-scoped admin entry for a secret id this session
+    /// consumes via `direct-tcpip`, creating it on first use (D11).
+    fn consumer_entry(&self, id: &str) -> Arc<ConsumerEntry> {
+        let mut consumers = self
+            .state
+            .secret_consumers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = consumers.get(id) {
+            return Arc::clone(entry);
+        }
+        let grant = self.grant();
+        let registration = self.gateway.admin.register(NewEntry {
+            role: Role::SecretConsumer,
+            peer: self.peer,
+            secret_id: Some(id.to_string()),
+            public_port: None,
+            notes: grant.notes.clone(),
+            basic_auth: false,
+            https: false,
+            force_https: false,
+            carriers: 0,
+            auto_reconnect: false,
+            webserver_log: false,
+            udp: false,
+            vpn_relay_only: false,
+            vpn_pin_mtu: false,
+            vpn_mtu: None,
+            vpn_forward_accept: false,
+            vpn_nat_masquerade: false,
+            vpn_route_policy: None,
+            vpn_advertised: vec![],
+            vpn_nat_udp_port: None,
+            local_proxy_port: None,
+            local_host: None,
+            local_port: None,
+            nat_udp_preferred_port: None,
+            nat_udp_release_timeout: None,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
+            max_conns: None,
+            transport: Transport::Ssh,
+            identity: Some(grant.identity.clone()),
+        });
+        let active = registration.active();
+        let (relay_tx, relay_rx) = registration.relay_bytes();
+        let entry = Arc::new(ConsumerEntry {
+            _registration: registration,
+            active,
+            relay_tx,
+            relay_rx,
+        });
+        consumers.insert(id.to_string(), Arc::clone(&entry));
+        entry
+    }
 }
 
 /// State shared between a [`GatewayHandler`]'s callbacks — which all run,
@@ -541,6 +704,25 @@ struct ConnState {
     /// `cancel_tcpip_forward` can abort exactly the right one without
     /// disturbing sibling forwards on the same connection (I-3).
     forwards: Mutex<HashMap<(String, u16), JoinHandle<()>>>,
+    /// Secret-consumer admin bookkeeping (D11), keyed by secret id: created
+    /// lazily on the first `direct-tcpip` channel for that id, reused by
+    /// every later channel on the same id from this SSH session so there is
+    /// ONE admin row per (session, id) regardless of how many concurrent
+    /// proxied connections are open — never one row per channel (BUG-S1
+    /// parity, see `secret::serve_consumer`'s `carrier` handling). Dropped
+    /// (removing the admin rows) along with the rest of `ConnState`.
+    secret_consumers: Mutex<HashMap<String, Arc<ConsumerEntry>>>,
+}
+
+/// One SSH session's live admin entry for a secret id it consumes, shared by
+/// every concurrent `direct-tcpip` channel open for that id.
+struct ConsumerEntry {
+    /// Holds the admin row alive; dropped (removing the row) with this entry.
+    _registration: Registration,
+    /// Incremented/decremented per live channel via [`ActiveGuard`].
+    active: Arc<AtomicUsize>,
+    relay_tx: Arc<AtomicU64>,
+    relay_rx: Arc<AtomicU64>,
 }
 
 impl ConnState {
@@ -636,6 +818,80 @@ impl Handler for GatewayHandler {
         for line in self.state.drain_messages() {
             session.data(channel_id, format!("{line}\r\n").into_bytes())?;
         }
+        Ok(())
+    }
+
+    /// `-L <local>:<id|secret/id>:0` (an OpenSSH client's local forwarding):
+    /// looks up the secret provider's pool and splices this channel to a
+    /// freshly opened provider substream with the same carrier-failover
+    /// semantics as the native consumer relay (`secret::open_with_failover`,
+    /// BUG-S4). Admin bookkeeping follows D11: one `Role::SecretConsumer` row
+    /// per (session, id), created lazily, `active` incremented per live
+    /// channel — never one row per channel.
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let id = match parse_direct_tcpip_dest(host_to_connect, port_to_connect) {
+            Ok(id) => id,
+            Err(err) => {
+                self.state.queue_message(format!("bore ssh-gateway: {err}"));
+                reply.reject(ChannelOpenFailure::ConnectFailed).await;
+                return Ok(());
+            }
+        };
+
+        let Some(pool) = self
+            .gateway
+            .providers
+            .get(&id)
+            .map(|entry| Arc::clone(entry.value()))
+        else {
+            self.state
+                .queue_message(format!("bore ssh-gateway: unknown secret id '{id}'"));
+            reply.reject(ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        };
+
+        let provider = match secret::open_with_failover(&pool, &id).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                warn!(%id, %err, "ssh-gateway: secret consumer could not reach provider");
+                reply.reject(ChannelOpenFailure::ConnectFailed).await;
+                return Ok(());
+            }
+        };
+
+        let consumer_entry = self.consumer_entry(&id);
+        let total_rx_bytes = Arc::clone(&self.gateway.total_rx_bytes);
+        let total_tx_bytes = Arc::clone(&self.gateway.total_tx_bytes);
+
+        reply.accept().await;
+        tokio::spawn(async move {
+            let _active_guard = ActiveGuard::new(Arc::clone(&consumer_entry.active));
+            let ssh_stream = channel.into_stream();
+            let mut provider = provider;
+            let mut counted = CountingStream::new(
+                ssh_stream,
+                Arc::clone(&consumer_entry.relay_rx),
+                Arc::clone(&consumer_entry.relay_tx),
+                total_rx_bytes,
+                total_tx_bytes,
+            );
+            let buf = proxy_buffer_size();
+            if let Err(err) =
+                tokio::io::copy_bidirectional_with_sizes(&mut counted, &mut provider, buf, buf)
+                    .await
+            {
+                trace!(%id, %err, "ssh-gateway: secret consumer channel closed");
+            }
+        });
         Ok(())
     }
 
@@ -753,13 +1009,17 @@ impl Handler for GatewayHandler {
                     .tcpip_forward_vhost(address, port16, label, grant, session)
                     .await;
             }
-            ForwardSpec::SecretProvider { .. } => {
-                self.state.queue_message(
-                    "bore ssh-gateway: secret forwards are not implemented yet; \
-                     use a plain -R (public tunnel) or vhost/<label> forward"
-                        .to_string(),
-                );
-                return Ok(false);
+            ForwardSpec::SecretProvider { id } => {
+                // Same RFC 4254 7.1 echo-back rule as the vhost branch above:
+                // a secret provider forward has no real listening port either.
+                let port16 = match u16::try_from(*port) {
+                    Ok(0) | Err(_) => 1,
+                    Ok(p) => p,
+                };
+                *port = u32::from(port16);
+                return self
+                    .tcpip_forward_secret(address, port16, id, grant, session)
+                    .await;
             }
         };
 
@@ -968,6 +1228,19 @@ struct VhostSshGuard {
 impl Drop for VhostSshGuard {
     fn drop(&mut self) {
         self.registry.remove(&self.label);
+    }
+}
+
+/// Removes an SSH-backed secret provider's pool from the registry when its
+/// forward task ends, mirroring [`VhostSshGuard`] (I-3).
+struct SecretSshGuard {
+    registry: secret::Registry,
+    id: String,
+}
+
+impl Drop for SecretSshGuard {
+    fn drop(&mut self) {
+        self.registry.remove(&self.id);
     }
 }
 
@@ -1263,15 +1536,15 @@ pub fn parse_forward_spec(addr: &str, port: u32) -> Result<ForwardSpec, SpecErro
 }
 
 /// Parses a `direct-tcpip` destination host/port into a secret-consumer
-/// target id (Phase 5.3 routes `ssh -L` through this). Only `<id>` or
-/// `secret/<id>` on port 0 are accepted; anything else is rejected with a
-/// message suitable for the channel-open failure reason.
+/// target id (Phase 5.3 routes `ssh -L` through this). The port is ignored:
+/// unlike `-R` (which supports a literal `0` for dynamic remote-port
+/// allocation), OpenSSH's `-L` CLI parser rejects a literal `0` destination
+/// port outright (`Bad local forwarding specification`), so a real client
+/// can never send one here — callers must use some nonzero placeholder (e.g.
+/// `-L <local>:<id>:1`), and only the host label (`<id>` or `secret/<id>`)
+/// determines routing.
 pub fn parse_direct_tcpip_dest(host: &str, port: u32) -> Result<String, SpecError> {
-    if port != 0 {
-        return Err(SpecError(format!(
-            "direct-tcpip to {host}:{port} not supported; use port 0 with a secret tunnel id"
-        )));
-    }
+    let _ = port;
     let id = host.strip_prefix("secret/").unwrap_or(host);
     validate_label(id).map_err(|_| SpecError(format!("invalid secret tunnel id {host:?}")))
 }
@@ -1619,6 +1892,17 @@ mod tests {
         );
         assert_eq!(
             parse_direct_tcpip_dest("secret/tcp-id", 0).unwrap(),
+            "tcp-id".to_string()
+        );
+        // The port is ignored — a real OpenSSH `-L` client can never send a
+        // literal 0 (its CLI parser rejects that syntax), so any nonzero
+        // placeholder a client sends must still route correctly.
+        assert_eq!(
+            parse_direct_tcpip_dest("tcp-id", 1).unwrap(),
+            "tcp-id".to_string()
+        );
+        assert_eq!(
+            parse_direct_tcpip_dest("secret/tcp-id", 80).unwrap(),
             "tcp-id".to_string()
         );
         assert!(parse_direct_tcpip_dest("example.com", 80).is_err());

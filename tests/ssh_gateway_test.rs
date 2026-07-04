@@ -15,7 +15,13 @@ use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
 use bore_cli::vhost::{Reservation, VhostConfig, VhostModeCfg};
-use bore_cli::{server::Server, shared::CONTROL_PORT, sshgw::SshGatewayConfig};
+use bore_cli::{
+    client::{Client, ProviderMeta},
+    secret::Proxy,
+    server::Server,
+    shared::CONTROL_PORT,
+    sshgw::SshGatewayConfig,
+};
 use lazy_static::lazy_static;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -380,6 +386,26 @@ fn ssh_args_raw(
     if let Some(cmd) = command {
         args.push(cmd.into());
     }
+    args
+}
+
+/// Builds `ssh -N -L <bind_port>:<dest>` args for a secret-consumer forward
+/// (e.g. `dest = "tcp-id:1"` or `"secret/tcp-id:1"` — the destination port is
+/// an ignored placeholder; it must be nonzero because OpenSSH's `-L` parser
+/// rejects a literal `0` outright, unlike `-R`), which the gateway dispatches
+/// as a `direct-tcpip` channel open (`channel_open_direct_tcpip`, Phase 5.3)
+/// rather than a `tcpip-forward` request.
+fn ssh_local_forward_args(
+    gw_port: u16,
+    identity: &Path,
+    bind_port: u16,
+    dest: &str,
+) -> Vec<String> {
+    let mut args = ssh_base_args(gw_port, identity);
+    args.push("-N".into());
+    args.push("-L".into());
+    args.push(format!("{bind_port}:{dest}"));
+    args.push("gwtest@127.0.0.1".into());
     args
 }
 
@@ -977,33 +1003,284 @@ async fn t_ssh_pfx1_prefix_overrides_port_heuristic() -> Result<()> {
     time::sleep(Duration::from_millis(200)).await;
 
     // `secret/sid` on port 80: the prefix wins over the "port 80 -> vhost"
-    // heuristic, so this dispatches as a secret-provider forward. Secret
-    // providers over SSH are not implemented yet (Phase 5.3), so the
-    // gateway declines the forward request; with `ExitOnForwardFailure=yes`
-    // and no other forwards the `ssh -N` session exits non-zero. If this
-    // had instead been misclassified as `vhost/sid` on port 80, it would
-    // have succeeded exactly like the case above, so a non-zero exit here
-    // is specifically proof the `secret/` prefix was honored over the port
-    // heuristic.
+    // heuristic, so this dispatches as a secret-provider forward (Phase 5.3).
+    // If this had instead been misclassified as `vhost/sid` on port 80, the
+    // admin dashboard would show a vhost entry for "sid", not a
+    // `secret-provider`-role entry with `secret_id":"sid"` — so asserting
+    // that row is specifically proof the `secret/` prefix was honored over
+    // the port heuristic.
     let secret_svc_port = spawn_http_stub("unreachable").await?;
     let secret_forward = format!("secret/sid:80:127.0.0.1:{secret_svc_port}");
-    let status = time::timeout(
-        Duration::from_secs(10),
-        Command::new("ssh")
-            .args(ssh_args_raw(gw_port, &client_priv, &[secret_forward], None))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .status(),
-    )
-    .await
-    .context("secret/sid ssh did not exit (T-SSH-PFX1)")??;
+    let mut secret_child = Command::new("ssh")
+        .args(ssh_args_raw(gw_port, &client_priv, &[secret_forward], None))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh secret/sid (T-SSH-PFX1)")?;
+
+    let admin = wait_admin_data_contains("\"secret_id\":\"sid\"").await?;
     assert!(
-        !status.success(),
+        admin.contains("\"role\":\"secret-provider\""),
         "secret/sid on port 80 must dispatch as a secret-provider forward, \
-         not silently succeed as a vhost forward"
+         not silently succeed as a vhost forward: {admin}"
+    );
+    secret_child.kill().await.ok();
+
+    Ok(())
+}
+
+/// Locates the single-level JSON object containing `needle` within an
+/// `/admin/status/data` response — `EntryView` (`src/admin.rs`) has no nested
+/// `{}` (arrays like `vpn_advertised` use `[]`), so the nearest enclosing
+/// `{`/`}` pair around a field match is exactly one tunnel row.
+fn entry_json_containing<'a>(data: &'a str, needle: &str) -> Option<&'a str> {
+    let at = data.find(needle)?;
+    let start = data[..at].rfind('{')?;
+    let end = at + data[at..].find('}')?;
+    Some(&data[start..=end])
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-SEC1 — `secret/` provider over SSH (`-R secret/<id>:0:...`) served by
+// a NATIVE consumer (`secret::Proxy`, the same library API `secret_test.rs`
+// uses): proves `channel_open_direct_tcpip`'s provider side (Phase 5.3) works
+// transparently against an unmodified native consumer.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_sec1_ssh_provider_native_consumer() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    let gw_port = start_gateway_server(host_key, dir.path().to_path_buf()).await?;
+    let svc_port = spawn_echo_service().await?;
+
+    let id = "sec1";
+    let forward = format!("secret/{id}:0:127.0.0.1:{svc_port}");
+    let mut ssh_child = Command::new("ssh")
+        .args(ssh_args_raw(gw_port, &client_priv, &[forward], None))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh secret provider (T-SSH-SEC1)")?;
+
+    wait_admin_data_contains(&format!("\"secret_id\":\"{id}\"")).await?;
+
+    let proxy = Proxy::new(
+        "localhost",
+        "127.0.0.1:0".parse()?,
+        id,
+        None,
+        false,
+        false,
+        None,
+        false,
+        false,
+        0,
+        0,
+        1,
+        None,
+        false,
+    )
+    .await?;
+    let addr = proxy.local_addr()?;
+    tokio::spawn(proxy.listen());
+    time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        roundtrip(addr.port(), b"hello from native consumer").await?,
+        "native consumer must round-trip through the ssh-backed secret provider"
     );
 
+    ssh_child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-SEC2 — NATIVE provider (`Client::new_secret_provider`) served by a
+// secret consumer over SSH (`-L <local>:<id>:0`, dispatched by
+// `channel_open_direct_tcpip`): proves the SSH-gateway consumer side (Phase
+// 5.3) works transparently against an unmodified native provider.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_sec2_native_provider_ssh_consumer() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    let gw_port = start_gateway_server(host_key, dir.path().to_path_buf()).await?;
+    let echo_port = spawn_echo_service().await?;
+
+    let id = "sec2";
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo_port,
+        "localhost",
+        id,
+        None,
+        false,
+        false,
+        None,
+        false,
+        false,
+        0,
+        0,
+        1024,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(provider.listen());
+    time::sleep(Duration::from_millis(50)).await;
+
+    let lp = free_port().await?;
+    let mut ssh_child = Command::new("ssh")
+        .args(ssh_local_forward_args(
+            gw_port,
+            &client_priv,
+            lp,
+            &format!("{id}:1"),
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh secret consumer (T-SSH-SEC2)")?;
+    wait_port(lp, true).await;
+
+    assert!(
+        roundtrip(lp, b"hello from ssh consumer").await?,
+        "ssh consumer -L forward must round-trip through the native secret provider"
+    );
+
+    ssh_child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-SEC3 — ssh on both sides: roundtrip + admin shows exactly one
+// secret-provider row and one secret-consumer row (transport ssh); opening 3
+// concurrent proxied connections through the `-L` consumer must NOT create
+// extra admin rows — `active` increments to 3 on the SAME row (D11/BUG-S1
+// parity: one row per (session, id), never one row per channel).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_sec3_ssh_both_sides_admin_rows() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    let gw_port = start_gateway_server(host_key, dir.path().to_path_buf()).await?;
+    let svc_port = spawn_echo_service().await?;
+
+    let id = "sec3";
+    let provider_forward = format!("secret/{id}:0:127.0.0.1:{svc_port}");
+    let mut provider_child = Command::new("ssh")
+        .args(ssh_args_raw(
+            gw_port,
+            &client_priv,
+            &[provider_forward],
+            None,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh secret provider (T-SSH-SEC3)")?;
+
+    wait_admin_data_contains(&format!("\"secret_id\":\"{id}\"")).await?;
+
+    let lp = free_port().await?;
+    let mut consumer_child = Command::new("ssh")
+        .args(ssh_local_forward_args(
+            gw_port,
+            &client_priv,
+            lp,
+            &format!("{id}:1"),
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh secret consumer (T-SSH-SEC3)")?;
+    wait_port(lp, true).await;
+
+    assert!(
+        roundtrip(lp, b"hello ssh-to-ssh").await?,
+        "ssh consumer -L forward must round-trip through the ssh secret provider"
+    );
+
+    let admin = wait_admin_data_contains("\"role\":\"secret-consumer\"").await?;
+    assert_eq!(
+        admin.matches("\"transport\":\"ssh\"").count(),
+        2,
+        "expected exactly one secret-provider row and one secret-consumer row: {admin}"
+    );
+    let consumer_row = entry_json_containing(&admin, "\"role\":\"secret-consumer\"")
+        .context("no secret-consumer admin row found")?;
+    assert!(
+        consumer_row.contains(&format!("\"secret_id\":\"{id}\"")),
+        "consumer row must be scoped to '{id}': {consumer_row}"
+    );
+
+    // 3 concurrent proxied connections must bump `active` on the SAME
+    // consumer row, never spawn a second row (BUG-S1 parity).
+    let mut conns = Vec::new();
+    for _ in 0..3 {
+        conns.push(TcpStream::connect(("127.0.0.1", lp)).await?);
+    }
+
+    let mut admin = String::new();
+    for _ in 0..200 {
+        let s = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
+        admin = http_get(s, "/admin/status/data", Some(TOKEN)).await?;
+        if entry_json_containing(&admin, "\"role\":\"secret-consumer\"")
+            .is_some_and(|row| row.contains("\"active\":3"))
+        {
+            break;
+        }
+        time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        admin.matches("\"transport\":\"ssh\"").count(),
+        2,
+        "3 concurrent channels on one id must not create extra admin rows: {admin}"
+    );
+    let consumer_row = entry_json_containing(&admin, "\"role\":\"secret-consumer\"")
+        .context("no secret-consumer admin row found")?;
+    assert!(
+        consumer_row.contains("\"active\":3"),
+        "consumer active must be 3 with 3 open channels: {consumer_row}"
+    );
+
+    drop(conns);
+    provider_child.kill().await.ok();
+    consumer_child.kill().await.ok();
     Ok(())
 }

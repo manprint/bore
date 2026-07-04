@@ -688,6 +688,33 @@ async fn broker_udp(
     Ok(())
 }
 
+/// Open a fresh substream toward a provider's pool, failing over across live
+/// carriers (D5): a carrier can die between `pick` (which prunes dead ones
+/// under the lock) and `open` (the connection breaking is observed
+/// asynchronously), so this tries up to the pool size before giving up.
+/// `pick` round-robins, so successive attempts hit different carriers.
+/// Shared by the native consumer relay ([`relay`]) and the SSH-gateway
+/// secret-consumer `direct-tcpip` path (`src/sshgw.rs`), so a dying provider
+/// carrier degrades identically on both transports (BUG-S4 guarantee).
+pub(crate) async fn open_with_failover(
+    pool: &CarrierPool,
+    id: &str,
+) -> io::Result<mux::LinkStream> {
+    let attempts = pool.len().max(1);
+    let mut last_err = None;
+    for _ in 0..attempts {
+        let Some(opener) = pool.pick() else { break };
+        match opener.open_ready(None).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                trace!(%id, %err, "provider carrier open failed; trying next live carrier");
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other("no live provider carrier")))
+}
+
 /// Splice one consumer substream to a freshly opened provider substream.
 async fn relay(
     mut consumer: mux::Stream,
@@ -708,34 +735,9 @@ async fn relay(
         Some(pool) => pool,
         None => bail!("no provider registered for '{id}'"),
     };
-    // Fail over across live provider carriers (D5): a carrier can die between
-    // `pick` (which prunes dead ones under the lock) and `open` (the connection
-    // breaking is observed asynchronously), so try up to the pool size before
-    // dropping this forwarded connection. `pick` round-robins, so successive
-    // attempts hit different carriers.
-    let attempts = pool.len().max(1);
-    let mut provider = None;
-    let mut last_err = None;
-    for _ in 0..attempts {
-        let Some(opener) = pool.pick() else { break };
-        match opener.open_ready(None).await {
-            Ok(stream) => {
-                provider = Some(stream);
-                break;
-            }
-            Err(err) => {
-                trace!(%id, %err, "provider carrier open failed; trying next live carrier");
-                last_err = Some(err);
-            }
-        }
-    }
-    let mut provider = match provider {
-        Some(stream) => stream,
-        None => match last_err {
-            Some(err) => return Err(err).context("all provider carriers unavailable"),
-            None => bail!("no live provider carrier"),
-        },
-    };
+    let mut provider = open_with_failover(&pool, id)
+        .await
+        .context("all provider carriers unavailable")?;
 
     let buf = proxy_buffer_size();
     // Count bytes LIVE as they flow (not only on close) so the admin secret-tunnel

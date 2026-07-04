@@ -19,7 +19,7 @@ every existing suite.
 ssh -p <ctl> -N -R mysub:80:localhost:8080 <srv>          -> curl -H "Host: mysub.d" http://<srv>:<http> == backend body
 ssh -p <ctl> -N -R 9005:localhost:8080 <srv>              -> curl http://<srv>:9005 == backend body
 ssh -p <ctl> -N -R tcp-id:0:localhost:8080 <srv>          -> bore proxy --tcp-secret-id tcp-id reaches backend
-ssh -p <ctl> -N -L 8899:tcp-id:0 <srv>                    -> curl http://localhost:8899 == provider backend
+ssh -p <ctl> -N -L 8899:tcp-id:1 <srv>                    -> curl http://localhost:8899 == provider backend  # dest port is an ignored placeholder (must be nonzero; OpenSSH -L rejects literal 0)
 concurrently: native `bore local --udp` tunnel on the same port keeps its QUIC direct path
 kill -9 of an ssh client frees its subdomain/id within 75 s; same-key reconnect takes over instantly
 ```

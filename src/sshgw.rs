@@ -25,15 +25,18 @@ use russh::keys::ssh_key::LineEnding;
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, ChannelOpenHandle, Handle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch, Semaphore};
 use tokio::task::{AbortHandle, JoinHandle};
+use tokio::time::timeout;
 use tracing::{info, trace, warn};
 
 use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Registration, Role, Transport};
 use crate::basicauth::BasicAuth;
 use crate::mux;
 use crate::pool::CarrierPool;
+use crate::prefixed::Prefixed;
 use crate::secret;
 use crate::server::{bind_public_listener, DEFAULT_MAX_CONNS};
 use crate::shared::{proxy_buffer_size, tune_tcp, CountingStream};
@@ -300,9 +303,9 @@ impl SshGateway {
     /// Accept-to-completion for one SSH gateway connection: builds the
     /// `Handler` and drives the russh session (whose own keepalive/reaper
     /// timers are configured by `russh_config`, see its doc for I-3).
-    pub async fn serve_connection(
+    pub async fn serve_connection<S: mux::Transport>(
         self: &Arc<Self>,
-        stream: tokio::net::TcpStream,
+        stream: S,
         addr: SocketAddr,
     ) -> Result<(), russh::Error> {
         let config = self.russh_config();
@@ -310,6 +313,164 @@ impl SshGateway {
         russh::server::run_stream(config, stream, handler)
             .await?
             .await
+    }
+}
+
+/// How long the pre-TLS ([`demux_pre_tls`]) and post-TLS ([`demux_post_tls`])
+/// demux peeks wait for a client to speak first before assuming it is an SSH
+/// client waiting on the server's own banner (sslh-style, D8): a stock
+/// OpenSSH client — raw or tunneled through TLS via a `ProxyCommand` — obeys
+/// the SSH protocol's banner-first convention and sends nothing until it
+/// sees `SSH-2.0-...` from us. Every other supported protocol on this port
+/// talks first: a TLS `ClientHello`, an HTTP request line, or bore's own
+/// `Hello` (written eagerly — yamux is lazy, so nothing happens until the
+/// client writes). All of those arrive within milliseconds, so this can be
+/// generous without meaningfully delaying anyone.
+pub const SSH_PEEK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Pure classification of a control connection's very first byte (D8, 6.1).
+/// `Http`/`Bore` are kept distinct from `Tls` (rather than collapsed into
+/// one "not SSH" bucket) because the demux actually branches on that
+/// distinction too, not just on SSH-or-not: once the gateway demux is
+/// active, a `Tls` byte (0x16) goes through the TLS acceptor (when
+/// configured), while `Http`/`Bore` route DIRECTLY to `route_connection`,
+/// BYPASSING the TLS acceptor entirely — this is what lets a plain HTTP or
+/// plain bore client keep working on a port that also has TLS configured
+/// (T-SSH-DMX1: SSH + TLS + HTTP + native bore all live on the one port
+/// simultaneously). `Http` vs `Bore` themselves are not branched on further
+/// here — `route_connection`'s own existing peek re-derives that from the
+/// same first byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// No byte yet (an SSH client waiting on our banner), or a literal
+    /// `b'S'` (the start of `SSH-2.0-...`).
+    Ssh,
+    /// TLS `ClientHello` (0x16).
+    Tls,
+    /// An HTTP request-line verb byte (`admin_http::is_http_first_byte`).
+    Http,
+    /// Anything else — the bore protocol's yamux framing (first byte 0x00),
+    /// or any other unrecognized byte (existing behavior: falls through to
+    /// the bore protocol path, which will itself reject a genuinely bad
+    /// client).
+    Bore,
+}
+
+/// Classifies the pre-TLS first byte (`None` means "no byte within
+/// [`SSH_PEEK_TIMEOUT`]").
+pub fn demux_classify_first_byte(byte: Option<u8>) -> Route {
+    match byte {
+        None => Route::Ssh,
+        Some(b'S') => Route::Ssh,
+        Some(0x16) => Route::Tls,
+        Some(b) if crate::admin_http::is_http_first_byte(b) => Route::Http,
+        Some(_) => Route::Bore,
+    }
+}
+
+/// Binary outcome of the post-TLS SSH-over-TLS check ([`demux_post_tls`],
+/// 6.2, D4) — inside TLS there is nothing left to disambiguate beyond
+/// "is this SSH", since HTTP-vs-bore is already the existing
+/// `route_connection` peek's job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixRoute {
+    /// The literal `SSH-` version-string prefix.
+    Ssh,
+    /// Anything else.
+    NotSsh,
+}
+
+/// Classifies a (post-TLS) byte prefix: the literal `SSH-` version-string
+/// prefix (RFC 4253 §4.2) routes to SSH; anything else — including a prefix
+/// shorter than 4 bytes (EOF before the check completed) — is not.
+pub fn demux_classify_prefix(bytes: &[u8]) -> PrefixRoute {
+    if bytes.starts_with(b"SSH-") {
+        PrefixRoute::Ssh
+    } else {
+        PrefixRoute::NotSsh
+    }
+}
+
+/// Outcome of [`demux_pre_tls`] — the peeked byte (if any) is preserved via
+/// [`Prefixed`] in every arm, so no data is ever lost regardless of which is
+/// taken.
+pub enum PreTlsRoute<S> {
+    /// Hand this stream to [`SshGateway::serve_connection`].
+    Ssh(Prefixed<S>),
+    /// A TLS `ClientHello`: accept it (if TLS is configured on this port),
+    /// then apply [`demux_post_tls`] (6.2, SSH-over-TLS).
+    Tls(Prefixed<S>),
+    /// Neither SSH nor TLS: route DIRECTLY to `route_connection`, BYPASSING
+    /// any configured TLS acceptor entirely — once the gateway demux is
+    /// active, a plain HTTP or plain bore client on this port is no longer
+    /// forced through a TLS handshake it never initiated.
+    Direct(Prefixed<S>),
+}
+
+/// Pre-TLS demux (6.1, D8): peeks one byte with [`SSH_PEEK_TIMEOUT`] and
+/// classifies it via [`demux_classify_first_byte`]. Only called when the SSH
+/// gateway is enabled (I-1: the disabled path never calls this, so it adds
+/// no read/timeout/wrapper there). An EOF or read error is reported as
+/// [`PreTlsRoute::Direct`] with nothing buffered — the existing downstream
+/// peek (`route_connection`'s own, or nothing at all when neither admin nor
+/// vhost is configured) sees the SAME already-dead socket and handles it
+/// exactly as it does today.
+pub async fn demux_pre_tls<S: mux::Transport>(mut socket: S) -> PreTlsRoute<S> {
+    let mut first = [0u8; 1];
+    match timeout(SSH_PEEK_TIMEOUT, socket.read(&mut first)).await {
+        Ok(Ok(1)) => {
+            let prefixed = Prefixed::new(first.to_vec(), socket);
+            match demux_classify_first_byte(Some(first[0])) {
+                Route::Ssh => PreTlsRoute::Ssh(prefixed),
+                Route::Tls => PreTlsRoute::Tls(prefixed),
+                Route::Http | Route::Bore => PreTlsRoute::Direct(prefixed),
+            }
+        }
+        Ok(Ok(_)) | Ok(Err(_)) => PreTlsRoute::Direct(Prefixed::new(Vec::new(), socket)),
+        Err(_) => PreTlsRoute::Ssh(Prefixed::new(Vec::new(), socket)),
+    }
+}
+
+/// Outcome of [`demux_post_tls`], mirroring [`PreTlsRoute`] one layer deeper
+/// (after a successful TLS handshake).
+pub enum PostTlsRoute<S> {
+    /// Hand this (TLS-wrapped) stream to [`SshGateway::serve_connection`].
+    Ssh(Prefixed<S>),
+    /// Continue the existing `route_connection` logic on this stream.
+    NotSsh(Prefixed<S>),
+}
+
+/// Post-TLS demux (6.2, D4 — SSH-over-TLS): peeks up to 4 bytes with the
+/// SAME [`SSH_PEEK_TIMEOUT`] semantics as [`demux_pre_tls`], since a real
+/// SSH client tunneled through TLS (e.g. via an `openssl s_client`
+/// `ProxyCommand`) still obeys the SSH banner-first convention once the TLS
+/// session is up — the same "silence means SSH" reasoning applies one layer
+/// deeper. A short read followed by EOF/error is [`PostTlsRoute::NotSsh`]
+/// (matches [`demux_pre_tls`]'s EOF handling: the existing downstream peek
+/// sees the same dead socket). Only called when the SSH gateway is enabled.
+pub async fn demux_post_tls<S: mux::Transport>(mut socket: S) -> PostTlsRoute<S> {
+    let mut buf = [0u8; 4];
+    let mut filled = 0usize;
+    let read_all = async {
+        while filled < buf.len() {
+            match socket.read(&mut buf[filled..]).await {
+                Ok(0) => return Err(()),
+                Ok(n) => filled += n,
+                Err(_) => return Err(()),
+            }
+        }
+        Ok(())
+    };
+    match timeout(SSH_PEEK_TIMEOUT, read_all).await {
+        Ok(Ok(())) => {
+            let prefixed = Prefixed::new(buf.to_vec(), socket);
+            match demux_classify_prefix(&buf) {
+                PrefixRoute::Ssh => PostTlsRoute::Ssh(prefixed),
+                PrefixRoute::NotSsh => PostTlsRoute::NotSsh(prefixed),
+            }
+        }
+        Ok(Err(())) => PostTlsRoute::NotSsh(Prefixed::new(buf[..filled].to_vec(), socket)),
+        Err(_) => PostTlsRoute::Ssh(Prefixed::new(buf[..filled].to_vec(), socket)),
     }
 }
 
@@ -2409,5 +2570,32 @@ mod tests {
             TakeoverOutcome::Proceed => panic!("native incumbent must never be evicted"),
         }
         assert!(registry.contains_key("label"), "native entry left intact");
+    }
+
+    #[test]
+    fn demux_classify_first_byte_table() {
+        assert_eq!(demux_classify_first_byte(None), Route::Ssh);
+        assert_eq!(demux_classify_first_byte(Some(b'S')), Route::Ssh);
+        assert_eq!(demux_classify_first_byte(Some(0x16)), Route::Tls);
+        assert_eq!(demux_classify_first_byte(Some(b'G')), Route::Http);
+        assert_eq!(demux_classify_first_byte(Some(0x00)), Route::Bore);
+        assert_eq!(demux_classify_first_byte(Some(0xFF)), Route::Bore);
+    }
+
+    #[test]
+    fn demux_classify_prefix_table() {
+        assert_eq!(demux_classify_prefix(b"SSH-2.0-OpenSSH"), PrefixRoute::Ssh);
+        assert_eq!(demux_classify_prefix(b"SUBS"), PrefixRoute::NotSsh);
+        assert_eq!(demux_classify_prefix(b"GET "), PrefixRoute::NotSsh);
+        assert_eq!(
+            demux_classify_prefix(b"SSH"),
+            PrefixRoute::NotSsh,
+            "short of the full prefix"
+        );
+        assert_eq!(
+            demux_classify_prefix(b""),
+            PrefixRoute::NotSsh,
+            "empty (EOF before any byte)"
+        );
     }
 }

@@ -21,8 +21,10 @@ use bore_cli::{
     server::Server,
     shared::CONTROL_PORT,
     sshgw::SshGatewayConfig,
+    transport,
 };
 use lazy_static::lazy_static;
+use rcgen::generate_simple_self_signed;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
@@ -57,6 +59,27 @@ macro_rules! skip_without_ssh_cli {
         if !has_ssh_cli().await {
             eprintln!(
                 "WARNING: `ssh`/`ssh-keygen` not found on PATH — skipping {}",
+                module_path!()
+            );
+            return Ok(());
+        }
+    };
+}
+
+/// For T-SSH-TLS1 (SSH-over-TLS via an `openssl s_client` `ProxyCommand`).
+async fn has_openssl() -> bool {
+    Command::new("openssl")
+        .arg("version")
+        .output()
+        .await
+        .is_ok()
+}
+
+macro_rules! skip_without_openssl {
+    () => {
+        if !has_openssl().await {
+            eprintln!(
+                "WARNING: `openssl` not found on PATH — skipping {}",
                 module_path!()
             );
             return Ok(());
@@ -274,6 +297,84 @@ async fn start_gateway_server_vhost(
     wait_port(gw_port, true).await;
     wait_port(http_port, true).await;
     Ok(gw_port)
+}
+
+/// Generates a throwaway self-signed cert/key pair for "localhost" (PEM),
+/// same pattern as `tests/tls_test.rs`.
+fn self_signed_cert() -> Result<(String, String)> {
+    let key = generate_simple_self_signed(["localhost".to_string()])?;
+    Ok((key.cert.pem(), key.signing_key.serialize_pem()))
+}
+
+/// Starts a full `Server` on [`CONTROL_PORT`] with the ssh-gateway enabled
+/// WITHOUT a dedicated `--ssh-port` (demux only, Phase 6, D8) AND TLS
+/// configured on that same control port — the scenario T-SSH-DMX1/DMX2/TLS1
+/// exercise: one port serving SSH, TLS, HTTP (admin) and native bore
+/// concurrently.
+async fn start_demux_server(host_key_file: PathBuf, authorized_keys_dir: PathBuf) -> Result<()> {
+    let (cert_pem, key_pem) = self_signed_cert()?;
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+    let config = SshGatewayConfig {
+        port: None,
+        host_key_file,
+        authorized_keys_dir: Some(authorized_keys_dir),
+        passwords_file: None,
+        banner: None,
+    };
+    let mut server = Server::new(1024..=65535, None);
+    server.set_tls(acceptor);
+    server.set_admin_token(Some(TOKEN.to_string()));
+    server.set_ssh_gateway(config)?;
+    tokio::spawn(server.listen());
+    wait_port(CONTROL_PORT, true).await;
+    Ok(())
+}
+
+/// Builds `ssh` CLI args that reach the gateway through an `openssl
+/// s_client` TLS tunnel (`ProxyCommand`) instead of a direct TCP connect —
+/// SSH-over-TLS (T-SSH-TLS1, D4). `-verify_quiet` accepts the self-signed
+/// cert without a trust store, matching how a real deployment would use a
+/// CA-issued one instead.
+fn ssh_proxycommand_args(
+    identity: &Path,
+    forwards: &[String],
+    command: Option<&str>,
+) -> Vec<String> {
+    let proxy = format!("openssl s_client -quiet -verify_quiet -connect 127.0.0.1:{CONTROL_PORT}");
+    let mut args = vec![
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "GlobalKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+        "-o".into(),
+        "PreferredAuthentications=publickey".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ExitOnForwardFailure=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+        "-o".into(),
+        format!("ProxyCommand={proxy}"),
+        "-i".into(),
+        identity.display().to_string(),
+    ];
+    if command.is_none() {
+        args.push("-N".into());
+    }
+    for f in forwards {
+        args.push("-R".into());
+        args.push(f.clone());
+    }
+    args.push("gwtest@127.0.0.1".into());
+    if let Some(cmd) = command {
+        args.push(cmd.into());
+    }
+    args
 }
 
 /// A local HTTP service standing in for the "service on localhost" that a
@@ -1470,5 +1571,210 @@ async fn t_ssh_take2_different_identity_rejected() -> Result<()> {
     );
 
     child_b.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-DMX1 (`docs/plans/plan_SshGateway/phase_06.md`, D8) — control-port
+// demux: ONE port serves SSH, TLS, plain HTTP and native bore concurrently.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_ssh_dmx1_one_port_serves_ssh_tls_http_bore_concurrently() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    start_demux_server(host_key, dir.path().to_path_buf()).await?;
+
+    // (a) native public tunnel over a TLS control connection.
+    let echo_a = spawn_echo_service().await?;
+    let client_a = Client::new(
+        "localhost",
+        echo_a,
+        &format!("https://127.0.0.1:{CONTROL_PORT}"),
+        0,
+        None,
+        true,
+        Default::default(),
+        None,
+    )
+    .await
+    .context("native TLS client (T-SSH-DMX1)")?;
+    let port_a = client_a.remote_port();
+    tokio::spawn(client_a.listen());
+
+    // (b) ssh -N -R public tunnel on the SAME control port (no dedicated
+    // --ssh-port is configured — this only works if the demux is live).
+    let echo_b = spawn_echo_service().await?;
+    let bind_port_b = free_port().await?;
+    let mut ssh_child = Command::new("ssh")
+        .args(ssh_args(
+            CONTROL_PORT,
+            &client_priv,
+            &[(bind_port_b, echo_b)],
+            None,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh (T-SSH-DMX1)")?;
+    wait_port(bind_port_b, true).await;
+
+    // (d) plain bore client (no TLS scheme) on the same port.
+    let echo_d = spawn_echo_service().await?;
+    let client_d = Client::new(
+        "localhost",
+        echo_d,
+        &format!("127.0.0.1:{CONTROL_PORT}"),
+        0,
+        None,
+        false,
+        Default::default(),
+        None,
+    )
+    .await
+    .context("native plain client (T-SSH-DMX1)")?;
+    let port_d = client_d.remote_port();
+    tokio::spawn(client_d.listen());
+
+    // (c) plain-HTTP admin request on the same port, concurrently with (a),
+    // (b) and (d) all still live.
+    let admin = wait_admin_data_contains("\"role\"").await?;
+    assert!(!admin.is_empty());
+
+    // All four succeed simultaneously.
+    assert!(
+        roundtrip(port_a, b"via-tls-1").await?,
+        "TLS-scheme native tunnel must round-trip"
+    );
+    assert!(
+        roundtrip(bind_port_b, b"via-ssh-12").await?,
+        "ssh -R tunnel must round-trip on the demuxed control port"
+    );
+    assert!(
+        roundtrip(port_d, b"via-plain-1").await?,
+        "plain (no-TLS-scheme) native tunnel must round-trip on a TLS-configured port"
+    );
+
+    ssh_child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-DMX2 — a silent client (sends nothing) gets the SSH banner spoken
+// first, within the timeout fallback (sslh-style).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_dmx2_silent_client_gets_ssh_banner() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    start_demux_server(host_key, dir.path().to_path_buf()).await?;
+
+    let mut conn = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
+    let mut buf = [0u8; 8];
+    time::timeout(Duration::from_millis(2500), conn.read_exact(&mut buf))
+        .await
+        .context("server never spoke first within the timeout fallback")??;
+    assert_eq!(&buf, b"SSH-2.0-", "expected an SSH banner, got: {buf:?}");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-TLS1 (D4) — SSH-over-TLS: an `openssl s_client` `ProxyCommand`
+// tunnels a real ssh session through the control port's TLS listener.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_tls1_ssh_over_tls_via_proxycommand() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    skip_without_openssl!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    start_demux_server(host_key, dir.path().to_path_buf()).await?;
+
+    let svc_port = spawn_echo_service().await?;
+    let bind_port = free_port().await?;
+    let mut ssh_child = Command::new("ssh")
+        .args(ssh_proxycommand_args(
+            &client_priv,
+            &[format!("{bind_port}:127.0.0.1:{svc_port}")],
+            None,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh over TLS ProxyCommand (T-SSH-TLS1)")?;
+    wait_port(bind_port, true).await;
+
+    assert!(
+        roundtrip(bind_port, b"hello over ssh-over-tls").await?,
+        "SSH-over-TLS tunnel must round-trip"
+    );
+
+    ssh_child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-DMX-OFF — gateway DISABLED, TLS configured: a client sending
+// `SSH-2.0-...` gets no SSH banner back and the connection is not served as
+// SSH (proves the demux branch is truly off; the existing TLS/plain/admin
+// paths staying green is covered by `tests/tls_test.rs` + `tests/admin_test.rs`,
+// run unmodified as part of the same `cargo test --all-features` gate).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t_dmx_off_gateway_disabled_ignores_ssh_looking_bytes() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    wait_port(CONTROL_PORT, false).await;
+
+    let (cert_pem, key_pem) = self_signed_cert()?;
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_tls(acceptor);
+    // No `set_ssh_gateway` call: the gateway is disabled.
+    tokio::spawn(server.listen());
+    wait_port(CONTROL_PORT, true).await;
+
+    let mut conn = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
+    conn.write_all(b"SSH-2.0-OpenSSH_9.0\r\n").await?;
+
+    // Without the gateway, this port always TLS-accepts every connection
+    // (I-1, the untouched legacy path) — plain bytes are not a valid TLS
+    // ClientHello, so the handshake fails and the connection is dropped
+    // (EOF), never an SSH banner.
+    let mut buf = [0u8; 8];
+    let result = time::timeout(Duration::from_secs(3), conn.read_exact(&mut buf)).await;
+    match result {
+        Ok(Ok(_)) => panic!("gateway disabled but still served an SSH-looking response: {buf:?}"),
+        Ok(Err(_)) => {} // connection closed/reset: expected
+        Err(_) => panic!("connection neither closed nor produced a banner within the timeout"),
+    }
+
     Ok(())
 }

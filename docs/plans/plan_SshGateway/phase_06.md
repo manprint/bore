@@ -31,15 +31,35 @@ yamux frame 0x00; HTTP the verb letters. `S` collides with no existing branch.
   - When TLS is NOT configured but gateway is on: same peek, minus the 0x16 branch (0x16 falls to bore/HTTP as today — do not invent TLS handling).
 - **Unit tests:** `demux_classify_first_byte` — pure function `(Option<u8>) -> Route` table: None⇒Ssh, b'S'⇒Ssh, 0x16⇒Tls, b'G'⇒Http, 0x00⇒Bore, 0xFF⇒Bore.
 - **e2e tests:** see 6.3.
-- **Done:** gates green; diff of the disabled path is empty (reviewer checks `git diff` hunk shape); Opus sign-off recorded.
+- **Implementation note:** `demux_pre_tls` returns a 3-way `PreTlsRoute::{Ssh,Tls,Direct}`, not a
+  binary SSH/not-SSH split — `Direct` (an HTTP/bore first byte) routes STRAIGHT to
+  `route_connection`, BYPASSING the configured TLS acceptor entirely, even when TLS is
+  configured on this port. This is what lets a plain (unencrypted) HTTP or bore client keep
+  working on a port that also serves TLS (T-SSH-DMX1 clauses (c)/(d)) — only a genuine `0x16`
+  ClientHello (`Route::Tls`) goes through `acceptor.accept()`. An earlier draft collapsed
+  `Tls`/`Http`/`Bore` into one "NotSsh" bucket that still unconditionally forced everything
+  through the TLS acceptor when configured — that would have broken a plain client on a
+  TLS-configured port; caught before commit by re-reading this file's own 6.1 wording.
+- **Done:** gates green; diff of the disabled path is empty (`git diff` on `src/server.rs` shows
+  zero removed lines inside the main accept loop — only additive `if` insertion, verified
+  directly); Opus-reviewed 2026-07-04 for the hot accept path + I-1 — no correctness bugs or
+  I-1 violations found: the disabled path is confirmed byte-identical, the 3-way split correctly
+  bypasses TLS for `Direct`, every branch replays peeked bytes via `Prefixed` (no data loss), and
+  `serve_connection`'s generalization to `S: mux::Transport` doesn't change the dedicated
+  `--ssh-port` listener's behavior.
 
 ### 6.2 Post-TLS second peek (SSH-over-TLS, D4)
 - **Model:** Sonnet
 - **Files:** `src/server.rs` (the TLS-accepted branch), `src/sshgw.rs`
 - **Change:** gateway on: after `acceptor.accept(stream)` succeeds, peek again (same 2 s timeout semantics): bytes `SSH-`? — a single byte suffices (`b'S'`) since no TLS-wrapped bore/HTTP payload starts with `S`... it does: an HTTP request `SUBSCRIBE`? Not in `is_http_first_byte`'s verb set, but admin serves standard verbs only; still, to be exact peek FOUR bytes and match the literal prefix `b"SSH-"` (four-byte peek via `Prefixed`), else fall through to the existing post-TLS routing (`route_connection` body: HTTP vs bore). `serve_ssh_connection` must be generic over `mux::Transport` (`src/mux.rs:26`) so it runs on `TlsStream` and plain `TcpStream` alike (russh run-over-stream API is generic — SPIKE_FINDINGS.md).
   Gateway off: post-TLS path untouched (I-1).
-- **Unit tests:** extend `demux_classify_first_byte` with a 4-byte variant: `b"SSH-"`⇒Ssh, `b"SUBS"`⇒NotSsh, `b"GET "`⇒NotSsh.
+- **Unit tests:** extend `demux_classify_first_byte` with a 4-byte variant: `b"SSH-"`⇒Ssh, `b"SUBS"`⇒NotSsh, `b"GET "`⇒NotSsh. Implemented as a separate `demux_classify_prefix`/`PrefixRoute` pair (kept distinct from the richer 4-variant `Route` since post-TLS only ever needs the binary split) — `demux_classify_prefix_table`.
 - **e2e tests:** T-SSH-TLS1 (6.3).
+- **Implementation note:** `demux_post_tls` mirrors `demux_pre_tls`'s "silence means SSH" timeout
+  default (a real SSH-over-TLS client still obeys the banner-first convention one layer deeper),
+  but treats EOF/read-error distinctly as NOT SSH (matches the existing downstream peek's own EOF
+  handling) — on timeout it replays only the bytes actually read so far (never fabricates bytes
+  that never arrived).
 - **Done:** gates green.
 
 ### 6.3 Demux e2e + off-path regression
@@ -51,7 +71,13 @@ yamux frame 0x00; HTTP the verb letters. `S` collides with no existing branch.
   **T-SSH-TLS1** — `ssh -o ProxyCommand='openssl s_client -quiet -verify_quiet -connect 127.0.0.1:<port>' -N -R 19007:...` ⇒ tunnel works over TLS (D4). Skip-guard if `openssl` missing.
   **T-DMX-OFF** — gateway DISABLED, TLS configured: (a) native TLS tunnel + plain bore + HTTP admin all work (this is the existing behavior — reuse/extend an existing test only by RUNNING it, not editing); (b) a client sending `SSH-2.0-...` gets no SSH banner and the connection errors/closes (proves the branch is truly off).
 - **Unit tests:** none.
-- **e2e tests:** T-SSH-DMX1, T-SSH-DMX2, T-SSH-TLS1, T-DMX-OFF.
+- **e2e tests:** T-SSH-DMX1, T-SSH-DMX2, T-SSH-TLS1, T-DMX-OFF. Implemented as
+  `t_ssh_dmx1_one_port_serves_ssh_tls_http_bore_concurrently`,
+  `t_ssh_dmx2_silent_client_gets_ssh_banner`, `t_ssh_tls1_ssh_over_tls_via_proxycommand`,
+  `t_dmx_off_gateway_disabled_ignores_ssh_looking_bytes`. T-SSH-DMX1's (c) is a plain-HTTP
+  admin request (not vhost — vhost wiring was out of scope for this harness); T-DMX-OFF's (a)
+  is covered by the existing unmodified `tests/tls_test.rs`/`tests/admin_test.rs` suites, run
+  as part of the same `cargo test --all-features` gate.
 - **Done:** all four green; full `cargo test --all-features` green.
 
 ---
@@ -61,7 +87,7 @@ yamux frame 0x00; HTTP the verb letters. `S` collides with no existing branch.
 - **Fmt:** `cargo fmt`
 - **Lint:** `cargo clippy --all-targets --all-features -- -D warnings`
 - **Test subset:** `cargo test --features ssh-gateway --test ssh_gateway_test` + full `cargo test --all-features` AND full default-features `cargo test`
-- **Regression guard (mandatory, sudo):** all four netns suites (`secret`, `vhost`, `local_proxy`, `vpn`) FAIL: 0 — the accept path is shared by everything; invoke by exact absolute path with `sudo -n` (see phase_02.md).
+- **Regression guard (mandatory, sudo):** all four netns suites (`secret`, `vhost`, `local_proxy`, `vpn`) FAIL: 0 — the accept path is shared by everything; invoke by exact absolute path with `sudo -n` (see phase_02.md). Run 2026-07-04 against a `cargo build --release --all-features` binary: secret 29/0, vhost 13/0, local_proxy 16/0, vpn 161/0.
 
 ## Phase done criterion
 

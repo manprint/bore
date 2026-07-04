@@ -31,6 +31,8 @@ use crate::shared::{
     proxy_buffer_size, tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions,
     UdpDirectTuning, CONTROL_PORT, NETWORK_TIMEOUT,
 };
+#[cfg(feature = "ssh-gateway")]
+use crate::sshgw;
 use crate::udp_diagnostic;
 use crate::vhost::{self, VhostRegistry};
 #[cfg(feature = "vpn")]
@@ -125,6 +127,24 @@ pub(crate) async fn bind_public_listener(
             }
         }
         Err("failed to find an available port")
+    }
+}
+
+/// Logs an SSH gateway connection's outcome: the zombie-entry reaper's own
+/// keepalive-timeout disconnect (I-3) is escalated to `warn!` — it means a
+/// half-open/unresponsive client was reaped, unlike an ordinary
+/// client-initiated close (`debug!`). Shared by the dedicated `--ssh-port`
+/// listener and the control-port demux (Phase 6).
+#[cfg(feature = "ssh-gateway")]
+fn log_ssh_gateway_outcome(result: Result<(), russh::Error>, addr: SocketAddr) {
+    match result {
+        Ok(()) => {}
+        Err(err @ (russh::Error::KeepaliveTimeout | russh::Error::InactivityTimeout)) => {
+            warn!(%err, %addr, "ssh gateway: reaped unresponsive connection");
+        }
+        Err(err) => {
+            debug!(%err, %addr, "ssh gateway session ended");
+        }
     }
 }
 
@@ -1054,7 +1074,9 @@ impl Server {
         }
 
         // SSH ingress gateway (Phase 4): dedicated TCP listener handing accepted
-        // connections to russh. Control-port demux lands in a later phase (D8).
+        // connections to russh. The control port ALSO demuxes SSH in (Phase 6,
+        // D8, below) — the two listeners are independent and both work when
+        // both are configured (a client can reach either).
         #[cfg(feature = "ssh-gateway")]
         if let Some(gateway) = this.ssh_gateway.clone() {
             if let Some(port) = gateway.port() {
@@ -1081,22 +1103,8 @@ impl Server {
                                 let gateway = Arc::clone(&gateway);
                                 tokio::spawn(async move {
                                     let _permit = permit;
-                                    match gateway.serve_connection(stream, addr).await {
-                                        Ok(()) => {}
-                                        // Zombie-entry reaper (I-3): russh's own
-                                        // keepalive_max tripped, tuned to fire at
-                                        // sshgw::SSH_CTRL_TIMEOUT — worth a warn!,
-                                        // unlike an ordinary client-initiated close.
-                                        Err(
-                                            err @ (russh::Error::KeepaliveTimeout
-                                            | russh::Error::InactivityTimeout),
-                                        ) => {
-                                            warn!(%err, %addr, "ssh gateway: reaped unresponsive connection");
-                                        }
-                                        Err(err) => {
-                                            debug!(%err, %addr, "ssh gateway session ended");
-                                        }
-                                    }
+                                    let result = gateway.serve_connection(stream, addr).await;
+                                    log_ssh_gateway_outcome(result, addr);
                                 });
                             }
                             Err(err) => warn!(%err, "ssh gateway accept error"),
@@ -1113,6 +1121,74 @@ impl Server {
             tokio::spawn(
                 async move {
                     info!("incoming connection");
+
+                    // Control-port demux (Phase 6, D8): when the SSH gateway is
+                    // enabled, classify the connection before anything else so
+                    // ONE port serves SSH alongside TLS/HTTP/native bore. I-1:
+                    // with the gateway disabled (or the feature compiled out)
+                    // this whole `if` is skipped — no added read, no timeout, no
+                    // wrapper — and the unchanged legacy code below runs exactly
+                    // as it always has, on the untouched `stream`.
+                    #[cfg(feature = "ssh-gateway")]
+                    if let Some(gateway) = this.ssh_gateway.clone() {
+                        match sshgw::demux_pre_tls(stream).await {
+                            sshgw::PreTlsRoute::Ssh(ssh_stream) => {
+                                let result = gateway.serve_connection(ssh_stream, addr).await;
+                                log_ssh_gateway_outcome(result, addr);
+                                return;
+                            }
+                            sshgw::PreTlsRoute::Tls(prefixed) => {
+                                let result = match &this.tls {
+                                    Some(acceptor) => match acceptor.accept(prefixed).await {
+                                        Ok(tls) => match sshgw::demux_post_tls(tls).await {
+                                            // SSH-over-TLS (D4): a `ProxyCommand`
+                                            // tunneling ssh through this TLS
+                                            // connection.
+                                            sshgw::PostTlsRoute::Ssh(ssh_tls) => {
+                                                let result =
+                                                    gateway.serve_connection(ssh_tls, addr).await;
+                                                log_ssh_gateway_outcome(result, addr);
+                                                return;
+                                            }
+                                            sshgw::PostTlsRoute::NotSsh(tls2) => {
+                                                this.route_connection(tls2, addr).await
+                                            }
+                                        },
+                                        Err(err) => {
+                                            warn!(%err, "TLS handshake failed");
+                                            return;
+                                        }
+                                    },
+                                    // No TLS configured on this port, yet the
+                                    // first byte still looked like a
+                                    // ClientHello: per the plan, do not invent
+                                    // TLS handling here — hand it to the
+                                    // existing routing exactly like any other
+                                    // non-SSH byte, which will reject it
+                                    // exactly as it does today.
+                                    None => this.route_connection(prefixed, addr).await,
+                                };
+                                match result {
+                                    Ok(_) => info!("connection exited"),
+                                    Err(err) => warn!(%err, "connection exited with error"),
+                                }
+                                return;
+                            }
+                            sshgw::PreTlsRoute::Direct(prefixed) => {
+                                // Plain HTTP or plain bore: bypass any
+                                // configured TLS acceptor entirely (T-SSH-DMX1
+                                // — a plain client keeps working on a port
+                                // that also serves TLS).
+                                let result = this.route_connection(prefixed, addr).await;
+                                match result {
+                                    Ok(_) => info!("connection exited"),
+                                    Err(err) => warn!(%err, "connection exited with error"),
+                                }
+                                return;
+                            }
+                        }
+                    }
+
                     // The TLS handshake (if any) runs here, off the accept path.
                     let result = match &this.tls {
                         Some(acceptor) => match acceptor.accept(stream).await {

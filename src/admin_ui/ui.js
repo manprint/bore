@@ -85,6 +85,7 @@ export function badge(text, kind = 'default') {
  */
 export function flagBadges(e) {
     const b = [];
+    if (e.transport === 'ssh') b.push({ label: 'SSH', kind: 'primary' });
     if (e.https) b.push({ label: 'HTTPS', kind: 'primary' });
     if (e.force_https) b.push({ label: 'Force-HTTPS', kind: 'primary' });
     if (e.tls) b.push({ label: 'TLS', kind: 'primary' });

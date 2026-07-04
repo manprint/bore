@@ -71,6 +71,16 @@ test('flagBadges hides new badges when flags are false or zero', () => {
     assert.ok(!labels.some((l) => l.includes('NAT:')));
 });
 
+test('flagBadges renders ssh badge', () => {
+    const labels = flagBadges({ transport: 'ssh' }).map((b) => b.label);
+    assert.ok(labels.includes('SSH'));
+});
+
+test('no ssh badge for bore transport', () => {
+    const labels = flagBadges({ transport: 'bore' }).map((b) => b.label);
+    assert.ok(!labels.includes('SSH'));
+});
+
 test('flagBadges regression: existing flags still work', () => {
     const labels = flagBadges({
         https: true,

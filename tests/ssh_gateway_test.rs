@@ -330,6 +330,67 @@ async fn start_demux_server(host_key_file: PathBuf, authorized_keys_dir: PathBuf
     Ok(())
 }
 
+/// Like [`start_gateway_server`], but the server also has a TLS certificate
+/// configured (`set_tls`, called before `set_ssh_gateway` per `main.rs`'s
+/// real ordering — `SshGateway` snapshots `Server::tls` at that call). Used
+/// by T-SSH-PUB4/PUB5 to exercise `https=on`/`force-https=on` termination on
+/// a PUBLIC tunnel's own port (`edge::accept`, §5.6 of `README-SSH-GATEWAY.md`).
+async fn start_gateway_server_tls(
+    host_key_file: PathBuf,
+    authorized_keys_dir: PathBuf,
+) -> Result<u16> {
+    let (cert_pem, key_pem) = self_signed_cert()?;
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+    let gw_port = free_port().await?;
+    let config = SshGatewayConfig {
+        port: Some(gw_port),
+        host_key_file,
+        authorized_keys_dir: Some(authorized_keys_dir),
+        passwords_file: None,
+        banner: None,
+    };
+    let mut server = Server::new(1024..=65535, None);
+    server.set_tls(acceptor);
+    server.set_admin_token(Some(TOKEN.to_string()));
+    server.set_ssh_gateway(config)?;
+    tokio::spawn(server.listen());
+    wait_port(CONTROL_PORT, true).await;
+    wait_port(gw_port, true).await;
+    Ok(gw_port)
+}
+
+/// Round-trips `payload` through `openssl s_client` (TLS client, self-signed
+/// cert accepted via `-verify_quiet`) against `port` and returns whether the
+/// decrypted echo matches. Proves the server actually terminates TLS on that
+/// port (a plain-TCP client would just see ciphertext, never a valid echo).
+async fn tls_roundtrip(port: u16, payload: &[u8]) -> Result<bool> {
+    let mut child = Command::new("openssl")
+        .args([
+            "s_client",
+            "-quiet",
+            "-verify_quiet",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn openssl s_client")?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    stdin.write_all(payload).await?;
+    stdin.flush().await?;
+    let mut buf = vec![0u8; payload.len()];
+    let matched = time::timeout(Duration::from_secs(5), stdout.read_exact(&mut buf))
+        .await
+        .is_ok()
+        && buf == payload;
+    drop(stdin);
+    child.kill().await.ok();
+    Ok(matched)
+}
+
 /// Builds `ssh` CLI args that reach the gateway through an `openssl
 /// s_client` TLS tunnel (`ProxyCommand`) instead of a direct TCP connect —
 /// SSH-over-TLS (T-SSH-TLS1, D4). `-verify_quiet` accepts the self-signed
@@ -714,6 +775,121 @@ async fn t_ssh_pub3_notes_and_max_conns_enforced() -> Result<()> {
     assert!(
         freed,
         "third connection should succeed once the permit is freed"
+    );
+
+    child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-PUB4 — exec `https=on`: the SSH gateway terminates TLS on a PUBLIC
+// tunnel's own port using the server's configured certificate, exactly like
+// the native `bore local --https` client flag (`edge::accept`, shared
+// code). A non-TLS raw client is still forwarded as plain (additive, not
+// exclusive — see T-SSH-PUB5 for the `force-https=on` redirect case).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_pub4_https_terminates_tls() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    skip_without_openssl!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(&auth_dir, &client_priv, None)?;
+
+    let gw_port = start_gateway_server_tls(dir.path().join("host_key"), auth_dir).await?;
+    let svc_port = spawn_echo_service().await?;
+
+    let fwd_port = 19007u16;
+    let args = ssh_args(
+        gw_port,
+        &client_priv,
+        &[(fwd_port, svc_port)],
+        Some("https=on"),
+    );
+    let mut child = Command::new("ssh")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh -R with https=on (T-SSH-PUB4)")?;
+
+    wait_admin_data_contains(&format!("\"public_port\":{fwd_port}")).await?;
+
+    // A real TLS client terminates against the server's cert and gets the
+    // decrypted echo from the local service behind the tunnel — `https=on`
+    // works exactly like the native `bore local --https` flag.
+    assert!(
+        tls_roundtrip(fwd_port, b"ping-https").await?,
+        "https=on tunnel must terminate TLS and forward the decrypted payload"
+    );
+
+    // A raw (non-TLS, non-HTTP) TCP client still gets forwarded as plain —
+    // `edge::accept` is additive, not TLS-exclusive (`src/edge.rs`'s own doc:
+    // "so raw clients keep working"), same as the native client's `--https`.
+    assert!(
+        roundtrip(fwd_port, b"ping-plain").await?,
+        "https=on tunnel must still forward a non-TLS raw TCP client as plain"
+    );
+
+    child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-PUB5 — exec `https=on force-https=on`: a plain HTTP request on the
+// tunnel port gets redirected to `https://` instead of forwarded raw.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_pub5_force_https_redirects_plain_http() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(&auth_dir, &client_priv, None)?;
+
+    let gw_port = start_gateway_server_tls(dir.path().join("host_key"), auth_dir).await?;
+    let svc_port = spawn_http_stub("should never be reached").await?;
+
+    let fwd_port = 19008u16;
+    let args = ssh_args(
+        gw_port,
+        &client_priv,
+        &[(fwd_port, svc_port)],
+        Some("https=on force-https=on"),
+    );
+    let mut child = Command::new("ssh")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh -R with https=on force-https=on (T-SSH-PUB5)")?;
+
+    wait_admin_data_contains(&format!("\"public_port\":{fwd_port}")).await?;
+
+    let stream = TcpStream::connect(("127.0.0.1", fwd_port)).await?;
+    let resp = http_get(stream, "/", None).await?;
+    assert!(
+        resp.starts_with("HTTP/1.1 308"),
+        "plain HTTP on a force-https=on tunnel must get a 308 redirect, got: {resp}"
+    );
+    assert!(
+        resp.contains("Location: https://"),
+        "308 redirect must point at https://, got: {resp}"
     );
 
     child.kill().await.ok();

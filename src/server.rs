@@ -770,6 +770,8 @@ impl Server {
             self.bind_tunnels,
             Arc::clone(&self.total_rx_bytes),
             Arc::clone(&self.total_tx_bytes),
+            self.tls.clone(),
+            self.bind_domain.clone(),
         )?;
         self.ssh_gateway = Some(Arc::new(gateway));
         Ok(())

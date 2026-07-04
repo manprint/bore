@@ -240,6 +240,8 @@ permit="vhost/mysub",max-conns=256,notes="ci runner" ssh-ed25519 AAAA... ci@runn
 | `basic-auth=<user:pass>` | exec, env (`BORE_BASIC_AUTH`) | vhost, public HTTP | Basic-auth **enforced dal gateway** (401 server-side) — via SSH la fa il gateway, non il provider come nel client nativo |
 | `webserver-log=on` | exec, env (`BORE_WEBSERVER_LOG`) | vhost, public | Abilita access log per-tunnel (weblog server-side esistente) |
 | `id=<label>` | exec, env (`BORE_ID`) | tutti | Override esplicito dell'id/identità mostrata (default: fingerprint/label della chiave) |
+| `https=on` | exec, env (`BORE_HTTPS`) | **public** | Termina TLS sulla porta del tunnel pubblico, usando il certificato del server (richiede `--cert-file`/`--key-file` sul server; senza, la richiesta è servita come TCP semplice con un warning). Riusa `edge::accept`, lo stesso codice del client nativo `bore local --https` |
+| `force-https=on` | exec, env (`BORE_FORCE_HTTPS`) | **public** | Redirige le richieste HTTP semplici sulla porta del tunnel a `https://`. Richiede `https=on` sulla stessa richiesta — se assente, viene disabilitato con un warning invece di essere applicato o ignorato in silenzio |
 
 ### 5.5 Parametri client-transport-only: **rifiutati con warning esplicito**, mai silenzio
 
@@ -258,14 +260,14 @@ Elenco completo: `udp`, `carriers`, `stun-server`, `upnp`, `try-port-prediction`
 client — è l'equivalente corretto). Qualunque altra chiave non riconosciuta produce
 `<key>: unknown parameter`, mai un no-op silenzioso.
 
-### 5.6 `--https`/`--force-https`: non un parametro per-tunnel via SSH
+### 5.6 `https=on`/`force-https=on`: disponibili per i tunnel **public**; automatici per **vhost**
 
-A differenza del client nativo, `https`/`force-https` **non sono parametri SSH** — la
-terminazione TLS lato client non ha senso per un client SSH stock. HTTPS per i tunnel vhost
-è governato **lato server** dal `vhost.yml`/`--vhost-mode` (flag `--vhost-mode
-http|https|both|redirect-https|auto`, `--vhost-cert-file`/`--vhost-key-file`): un tunnel
-SSH-originato eredita automaticamente lo stesso comportamento HTTPS di un tunnel nativo sullo
-stesso host vhost, nessuna azione richiesta dal client.
+Due casi distinti, non confonderli:
+
+**VHOST**: HTTPS è governato **lato server** dal `vhost.yml`/`--vhost-mode` (flag
+`--vhost-mode http|https|both|redirect-https|auto`, `--vhost-cert-file`/`--vhost-key-file`).
+Un tunnel vhost SSH-originato eredita automaticamente lo stesso comportamento HTTPS di un
+tunnel nativo sullo stesso host — nessun parametro per-tunnel da passare:
 
 ```bash
 bore server --ssh-gateway ... \
@@ -273,6 +275,25 @@ bore server --ssh-gateway ... \
     --vhost-cert-file /etc/bore/vhost/fullchain.pem \
     --vhost-key-file /etc/bore/vhost/privkey.pem
 ```
+
+**PUBLIC**: `https=on`/`force-https=on` **sono** parametri per-tunnel via SSH (esattamente
+come sul client nativo `bore local --https`/`--force-https`), applicati sulla porta pubblica
+assegnata a quel forward. Richiede che il server abbia un certificato configurato
+(`--cert-file`/`--key-file` sul control port — lo stesso usato per demux/SSH-over-TLS):
+
+```bash
+ssh $OPTS -p 443 -N -R 9443:localhost:8080 bore.example.com -- 'https=on'
+# curl https://bore.example.com:9443/   → risposta del servizio locale, TLS terminato dal server
+
+ssh $OPTS -p 443 -N -R 9444:localhost:8080 bore.example.com -- 'https=on force-https=on'
+# curl http://bore.example.com:9444/    → 308 redirect verso https://bore.example.com:9444/
+```
+
+Senza certificato server configurato, `https=on` viene servito come TCP semplice con un
+warning esplicito sul canale (`https: server has no TLS certificate configured; serving this
+tunnel as plain TCP`) — mai un fallimento silenzioso né un rifiuto dell'intero tunnel.
+`force-https=on` senza `https=on` viene disabilitato con un warning invece di essere applicato
+o ignorato in silenzio.
 
 ---
 

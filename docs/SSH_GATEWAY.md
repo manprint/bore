@@ -169,7 +169,7 @@ porta d'ingresso universale. Sono complementari, non alternativi.
 | `--carriers > 1` | ❌ | Una sola connessione SSH. I canali danno già multiplexing, ma senza isolamento cwnd/HOL |
 | Hole-punch (`--stun-server`, `--upnp`, `--try-port-prediction`, `--nat-udp-*`) | ❌ | Ha senso solo col path UDP |
 | `bore transfer` (resume, BLAKE3, `--parallel`) | ❌ | Protocollo applicativo del client bore. Via SSH si usa il normale `scp`/`rsync`… che però non passa dal tunnel bore |
-| `--https`/`--force-https` (terminazione TLS lato client) | ❌ v1 | Il client SSH non può terminare TLS. Per HTTP il vhost copre già HTTPS lato server (wildcard cert) |
+| `--https`/`--force-https` | ✅ (public) / n/a (vhost) | Per i tunnel **public**: parametri `https=`/`force-https=` — il gateway termina TLS server-side sulla porta pubblica (`edge::accept`, stesso codice del client nativo). Per **vhost**: nessun parametro, HTTPS è già governato server-side da `vhost.yml`/`--vhost-mode` |
 | `--basic-auth` | ⚠️ diverso | In bore la enforce il *provider*; via SSH deve farla il **gateway** (401 server-side). Fattibile per vhost/public HTTP perché l'head HTTP è già parsato server-side; per secret/TCP generico non applicabile |
 | `--auto-reconnect` | ✅ equivalente | Lo fa `autossh`/systemd invece del client |
 | Consumer secret con path diretto p2p | ❌ | Il direct QUIC p2p richiede il client bore su *entrambi* i lati. Provider nativo + consumer SSH = sempre relay |
@@ -276,7 +276,7 @@ Priorità proposta: **opzioni per-chiave** (authorized_keys) > **stringa comando
 | `--secret` (HMAC) | n/a | Sostituito dall'auth SSH (chiavi/password) |
 | `--insecure` | n/a | Sostituito da known_hosts/host-key pinning SSH |
 | `--udp`, `--stun-server`, `--upnp`, `--try-port-prediction`, `--nat-udp-*`, `--carriers` | ❌ | Impossibili sul tratto SSH → `warn` esplicito sul canale, mai silenzio |
-| `--https` / `--force-https` | ❌ v1 | Terminazione TLS client-side impossibile; vhost copre HTTPS server-side. `force-https=on` fattibile come param v2 (redirect lato gateway) |
+| `--https` / `--force-https` | ✅ (public) | param `https=`/`force-https=` — vedi §6.10 (implementato, non solo pianificato) |
 
 Requisito "devono essere tutti disponibili": **tutti i parametri con significato server-side
 sono disponibili**; quelli che descrivono il *trasporto client* (UDP/carriers/hole-punch) non
@@ -770,3 +770,32 @@ riconnessione verifica contro quella riga fissa, non contro un nuovo TOFU.
 | Il tunnel si blocca dopo ~60s di silenzio di rete e il forward sparisce dall'admin | comportamento CORRETTO — reaper keepalive (I-SSH3, `SSH_CTRL_TIMEOUT`=60s); non un bug | usare `autossh`/`ServerAliveInterval` lato client per mantenerlo vivo attraverso interruzioni di rete transitorie |
 | `ssh: connect to host ... port 443: Connection refused` con `ProxyCommand openssl s_client` | il server non ha TLS configurato su quella porta, o `--ssh-gateway` non è abilitato | verificare `--cert-file`/`--key-file` sul server e che la porta sia quella del control port |
 | Nessun banner SSH entro qualche secondo su una connessione raw (diagnostica) | il gateway non è abilitato su quella porta, o si sta parlando con la porta sbagliata | connettersi al control port corretto; senza `--ssh-gateway` il comportamento è quello bore nativo (nessun demux) |
+
+### 6.10 `https=on`/`force-https=on` su tunnel public (verificato)
+
+A differenza della vhost (HTTPS già gestito lato server via `vhost.yml`), un tunnel
+**public** SSH-originato termina TLS solo se richiesto esplicitamente col param `https=on`,
+riusando lo stesso `edge::accept` del client nativo `bore local --https`. Richiede un
+certificato server configurato (`--cert-file`/`--key-file`):
+
+```bash
+ssh -i id_ed25519_bore -p 7835 -N -f -R 9443:localhost:8080 localhost -- 'https=on'
+curl -k https://localhost:9443/
+hello
+```
+
+Senza `https=on` (o senza certificato server), la porta resta TCP semplice — nessuna
+differenza dal comportamento pre-esistente. `force-https=on` (richiede `https=on` sulla
+stessa richiesta) redirige le richieste HTTP semplici:
+
+```bash
+ssh -i id_ed25519_bore -p 7835 -N -f -R 9444:localhost:8080 localhost -- 'https=on force-https=on'
+curl -i http://localhost:9444/
+HTTP/1.1 308 Permanent Redirect
+Location: https://localhost:9444/
+```
+
+`force-https=on` senza `https=on` è disabilitato con un warning esplicito sul canale
+(`force-https: requires https=on; ignoring force-https for this tunnel`), mai applicato in
+silenzio né rifiutato. Copertura test: `t_ssh_pub4_https_terminates_tls` /
+`t_ssh_pub5_force_https_redirects_plain_http` in `tests/ssh_gateway_test.rs`.

@@ -34,6 +34,7 @@ use tracing::{info, trace, warn};
 
 use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Registration, Role, Transport};
 use crate::basicauth::BasicAuth;
+use crate::edge;
 use crate::mux;
 use crate::pool::CarrierPool;
 use crate::prefixed::Prefixed;
@@ -191,6 +192,18 @@ pub struct SshGateway {
     /// traffic too.
     total_rx_bytes: Arc<AtomicU64>,
     total_tx_bytes: Arc<AtomicU64>,
+    /// Server's TLS acceptor, if `--cert-file`/`--key-file` are configured —
+    /// a clone of the `Server`'s own, snapshotted at `set_ssh_gateway` time
+    /// (which always runs after `set_tls` in `main.rs`). Used to terminate
+    /// TLS on a PUBLIC tunnel's own port when the client requests `https=on`
+    /// (`edge::accept`, same helper the native `bore local --https` path
+    /// uses) — `None` here means an `https=on` request is rejected with a
+    /// warning, exactly like the native client's equivalent check.
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    /// Server's `--domain`/bind domain, used as the redirect target host for
+    /// `force-https=on` when the client's `Host` header is absent (same
+    /// fallback the native `edge::accept` path uses).
+    bind_domain: Option<String>,
 }
 
 impl SshGateway {
@@ -211,6 +224,8 @@ impl SshGateway {
         bind_tunnels: IpAddr,
         total_rx_bytes: Arc<AtomicU64>,
         total_tx_bytes: Arc<AtomicU64>,
+        tls: Option<tokio_rustls::TlsAcceptor>,
+        bind_domain: Option<String>,
     ) -> Result<Self> {
         config.validate()?;
         let host_key = load_or_generate_host_key(&config.host_key_file)?;
@@ -232,6 +247,8 @@ impl SshGateway {
             bind_tunnels,
             total_rx_bytes,
             total_tx_bytes,
+            tls,
+            bind_domain,
         })
     }
 
@@ -1360,17 +1377,37 @@ impl Handler for GatewayHandler {
 
         let task = tokio::spawn(async move {
             let (exec, env) = await_params(&state).await;
-            let params = parse_params(exec.as_deref(), &env, &grant);
+            let mut params = parse_params(exec.as_deref(), &env, &grant);
+            // Mirror the native client's check (`server.rs::serve_tunnel`):
+            // `https=on` without a server certificate can never work — warn
+            // and drop it (I-2) rather than silently serving plain TCP or
+            // rejecting the whole tunnel the client already got a SUCCESS
+            // reply for.
+            if params.https && gateway.tls.is_none() {
+                state.queue_message(
+                    "bore ssh-gateway: https: server has no TLS certificate configured; \
+                     serving this tunnel as plain TCP"
+                        .to_string(),
+                );
+                params.https = false;
+                params.force_https = false;
+            }
             let effective_max_conns = params.max_conns.unwrap_or(DEFAULT_MAX_CONNS);
+            let tunnel_opts = crate::shared::TunnelOptions {
+                https: params.https,
+                force_https: params.force_https,
+                basic_auth: params.basic_auth.clone(),
+                ..Default::default()
+            };
             let registration = gateway.admin.register(NewEntry {
                 role: Role::Public,
                 peer,
                 secret_id: None,
                 public_port: Some(bound_port),
                 notes: params.notes.clone(),
-                basic_auth: false,
-                https: false,
-                force_https: false,
+                basic_auth: params.basic_auth.is_some(),
+                https: params.https,
+                force_https: params.force_https,
                 carriers: 1,
                 auto_reconnect: false,
                 webserver_log: params.webserver_log,
@@ -1410,6 +1447,9 @@ impl Handler for GatewayHandler {
                 Arc::clone(&gateway.total_rx_bytes),
                 Arc::clone(&gateway.total_tx_bytes),
                 registration,
+                tunnel_opts,
+                gateway.tls.clone(),
+                gateway.bind_domain.clone(),
             )
             .await;
         });
@@ -1809,10 +1849,29 @@ async fn await_params(state: &ConnState) -> (Option<String>, Vec<(String, String
 /// aborted (`cancel_tcpip_forward`, or the whole connection tearing down via
 /// `Drop for ConnState`) or the SSH control channel is gone (opening a
 /// `forwarded-tcpip` channel fails). Mirrors the native `Role::Public` accept
-/// loop (`src/server.rs`) minus edge/TLS/weblog/direct-UDP, which the SSH
-/// gateway does not support yet — there is no `STREAM_READY` anywhere on
-/// this path (I-4). `registration` is held for the loop's entire lifetime so
-/// the admin entry disappears (RAII) exactly when this task ends.
+/// loop (`src/server.rs`), including edge/TLS termination and `force-https`
+/// redirects (`https=on`/`force-https=on` params, §5.6) and basic-auth
+/// gating (`basic-auth=` param) — minus weblog/direct-UDP, which the SSH
+/// gateway does not support yet. There is no `STREAM_READY` anywhere on this
+/// path (I-4). `registration` is held for the loop's entire lifetime so the
+/// admin entry disappears (RAII) exactly when this task ends.
+///
+/// Edge handling AND the `forwarded-tcpip` channel-open are both awaited
+/// **inline in the accept loop**, not inside the per-connection spawned
+/// task — deliberately, unlike the native `Role::Public` loop (which spawns
+/// eagerly because its substream-open is a synchronous `pool.pick()`, never
+/// blocking). Here `channel_open_forwarded_tcpip` is a real round trip over
+/// the single SSH control connection: once that connection has died, the
+/// call can sit for a while rather than fail instantly. Spawning it per
+/// connection let the loop keep accepting — and once the peer app (or, as in
+/// `t_ssh_cancel1_session_close_frees_forwards`, a test polling the port
+/// after the session died) opened connections faster than those channel-opens
+/// resolved, the pile-up of concurrent requests over the one dead control
+/// connection starved the gateway's own liveness detection, delaying
+/// `Drop for ConnState`/the reaper far past their expected bound. Awaiting
+/// both inline naturally throttles new accepts to the pace the SSH control
+/// connection can actually service, which is what keeps that detection
+/// prompt (regression caught by `t_ssh_cancel1_session_close_frees_forwards`).
 #[allow(clippy::too_many_arguments)]
 async fn run_public_forward(
     listener: TcpListener,
@@ -1827,6 +1886,9 @@ async fn run_public_forward(
     total_rx_bytes: Arc<AtomicU64>,
     total_tx_bytes: Arc<AtomicU64>,
     registration: Registration,
+    tunnel_opts: crate::shared::TunnelOptions,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    bind_domain: Option<String>,
 ) {
     let _registration = registration;
     loop {
@@ -1862,6 +1924,27 @@ async fn run_public_forward(
             }
         };
 
+        // Terminate TLS / gate basic-auth / redirect at the edge exactly
+        // like the native public-tunnel path (`edge::accept`). With no
+        // https/force-https/basic-auth requested this is a zero-cost
+        // pass-through (no peek, no wait for the peer to speak first).
+        let edge = match edge::accept(
+            stream,
+            tunnel_opts.clone(),
+            tls.as_ref(),
+            connected_port,
+            bind_domain.as_deref(),
+        )
+        .await
+        {
+            Ok(Some(edge)) => edge,
+            Ok(None) => continue, // redirected to https:// or rejected (401)
+            Err(err) => {
+                trace!(%err, "ssh-gateway: edge handling failed");
+                continue;
+            }
+        };
+
         let ssh_channel = match ssh_handle
             .channel_open_forwarded_tcpip(
                 connected_address.clone(),
@@ -1889,7 +1972,7 @@ async fn run_public_forward(
             let _active = ActiveGuard::new(active);
             let mut ssh_stream = ssh_channel.into_stream();
             let mut counted =
-                CountingStream::new(stream, relay_rx, relay_tx, total_rx_bytes, total_tx_bytes);
+                CountingStream::new(edge, relay_rx, relay_tx, total_rx_bytes, total_tx_bytes);
             let buf = proxy_buffer_size();
             if let Err(err) =
                 tokio::io::copy_bidirectional_with_sizes(&mut counted, &mut ssh_stream, buf, buf)
@@ -2076,6 +2159,15 @@ pub struct Params {
     pub webserver_log: bool,
     /// Explicit tunnel id override.
     pub id: Option<String>,
+    /// Terminate TLS on a PUBLIC tunnel's own port (server must have a
+    /// certificate configured — `--cert-file`/`--key-file`). No effect on
+    /// vhost/secret forwards: vhost already serves HTTPS server-side via
+    /// `vhost.yml`/`--vhost-mode`, and secret tunnels are opaque TCP.
+    pub https: bool,
+    /// Redirect plain HTTP on a PUBLIC tunnel's own port to `https://`.
+    /// Meaningless without `https=on` — set alongside it without one, this
+    /// is disabled with a warning rather than silently ignored (I-2).
+    pub force_https: bool,
     /// One warning per unsupported or unrecognized key, in encounter order —
     /// nothing is silently dropped (I-2).
     pub warnings: Vec<String>,
@@ -2158,6 +2250,8 @@ pub fn parse_params(
             "basic-auth" => params.basic_auth = Some(value.clone()),
             "webserver-log" => params.webserver_log = value == "on",
             "id" => params.id = Some(value.clone()),
+            "https" => params.https = value == "on",
+            "force-https" => params.force_https = value == "on",
             k if TRANSPORT_ONLY_KEYS.contains(&k) => params.warnings.push(format!(
                 "{k}: not available via SSH ingress; use the native bore client"
             )),
@@ -2170,6 +2264,17 @@ pub fn parse_params(
     }
     if let Some(notes) = &grant.notes {
         params.notes = Some(notes.clone());
+    }
+
+    // Mirror the native client's `--force-https requires --https` rule
+    // (`main.rs`'s `#[clap(requires = "https")]`): rather than silently
+    // ignoring it or rejecting the whole tunnel, disable it with an explicit
+    // warning (I-2) and keep the tunnel plain.
+    if params.force_https && !params.https {
+        params.warnings.push(
+            "force-https: requires https=on; ignoring force-https for this tunnel".to_string(),
+        );
+        params.force_https = false;
     }
 
     params
@@ -2209,6 +2314,8 @@ mod tests {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            None,
+            None,
         )
     }
 
@@ -2369,6 +2476,28 @@ mod tests {
         assert_eq!(params.notes.as_deref(), Some("two words"));
         assert_eq!(params.basic_auth.as_deref(), Some("u:p"));
         assert!(params.warnings.is_empty());
+    }
+
+    #[test]
+    fn params_https_force_https() {
+        let params = parse_params(Some("https=on force-https=on"), &[], &grant("id"));
+        assert!(params.https);
+        assert!(params.force_https);
+        assert!(params.warnings.is_empty());
+
+        // force-https without https: disabled with a warning, not silently
+        // kept or a hard reject (I-2).
+        let params = parse_params(Some("force-https=on"), &[], &grant("id"));
+        assert!(!params.https);
+        assert!(!params.force_https);
+        assert_eq!(params.warnings.len(), 1);
+        assert!(params.warnings[0].contains("force-https"));
+        assert!(params.warnings[0].contains("requires https=on"));
+
+        // Anything other than exactly "on" leaves both off, same convention
+        // as webserver-log=.
+        let params = parse_params(Some("https=yes"), &[], &grant("id"));
+        assert!(!params.https);
     }
 
     #[test]

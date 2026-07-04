@@ -27,7 +27,13 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-features --all-targets -- -D warnings
       - run: cargo build --all-features
-      - run: cargo test --all-features
+      # ssh_gateway_test/ssh_gateway_spike_test spawn real ssh processes + bind
+      # real ports; under the hosted runner's default (CPU-count) parallel
+      # test threads they intermittently hit "connection reset"/"early eof"
+      # from resource contention. Run the rest of the suite normally, then
+      # run just those two binaries single-threaded.
+      - run: cargo test --all-features -- --skip t_ssh_ --skip t_dmx_
+      - run: cargo test --all-features --test ssh_gateway_test --test ssh_gateway_spike_test -- --test-threads=1
 
   transfer-paths:
     name: Transfer path edges (${{ matrix.os }})

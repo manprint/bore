@@ -74,8 +74,10 @@ async fn gen_keypair(dir: &Path, name: &str) -> Result<PathBuf> {
 }
 
 /// Shared `ssh` CLI options: no host-key persistence/prompts, pubkey-only, no
-/// interactive fallback, short connect timeout so a protocol mistake fails fast
-/// instead of hanging the test.
+/// interactive fallback. `ConnectTimeout` covers TCP connect AND the full SSH
+/// handshake/KEX (ssh_config(5)), not just the socket connect — 30s gives a
+/// loaded CI runner headroom for that whole phase (see `ssh_gateway_test.rs`'s
+/// `ssh_base_args` for the CI failures this was tuned against).
 fn ssh_base_args(port: u16, identity: &Path) -> Vec<String> {
     vec![
         "-o".into(),
@@ -91,7 +93,7 @@ fn ssh_base_args(port: u16, identity: &Path) -> Vec<String> {
         "-o".into(),
         "BatchMode=yes".into(),
         "-o".into(),
-        "ConnectTimeout=5".into(),
+        "ConnectTimeout=30".into(),
         "-i".into(),
         identity.display().to_string(),
         "-p".into(),

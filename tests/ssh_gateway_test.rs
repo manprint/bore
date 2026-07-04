@@ -422,7 +422,7 @@ fn ssh_proxycommand_args(
         "-o".into(),
         "ExitOnForwardFailure=yes".into(),
         "-o".into(),
-        "ConnectTimeout=10".into(),
+        "ConnectTimeout=30".into(),
         "-o".into(),
         format!("ProxyCommand={proxy}"),
         "-i".into(),
@@ -515,8 +515,17 @@ fn ssh_base_args(gw_port: u16, identity: &Path) -> Vec<String> {
         "BatchMode=yes".into(),
         "-o".into(),
         "ExitOnForwardFailure=yes".into(),
+        // Covers TCP connect AND the full SSH handshake/KEX (ssh_config(5)),
+        // not just the TCP connect syscall. 5s was tuned on a fast dev
+        // machine and the real `ssh` CLI's handshake reliably takes longer
+        // than that on a loaded CI runner — the client then self-aborts,
+        // which the server sees as "Connection reset by peer" (closing a
+        // socket with unread protocol bytes still buffered sends an RST).
+        // This is the actual root cause behind CI's long-standing
+        // "Connection reset by peer" failures (`t_ssh_cancel1`/`pub1`/`pub2`/
+        // etc.) that raising `PARAMS_GRACE` alone did not fix.
         "-o".into(),
-        "ConnectTimeout=5".into(),
+        "ConnectTimeout=30".into(),
         "-i".into(),
         identity.display().to_string(),
         "-p".into(),

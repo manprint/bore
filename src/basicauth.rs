@@ -22,7 +22,7 @@ const HTTP_METHODS: [&[u8]; 9] = [
 const MAX_HEAD: usize = 8 * 1024;
 
 /// The fixed `401` response sent to an unauthenticated HTTP client.
-const UNAUTHORIZED: &str = "HTTP/1.1 401 Unauthorized\r\n\
+pub(crate) const UNAUTHORIZED: &str = "HTTP/1.1 401 Unauthorized\r\n\
      WWW-Authenticate: Basic realm=\"bore\"\r\n\
      Content-Length: 0\r\n\
      Connection: close\r\n\r\n";

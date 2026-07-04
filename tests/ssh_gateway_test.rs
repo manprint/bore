@@ -8,11 +8,13 @@
 //! Skips (prints a warning, passes) when `ssh`/`ssh-keygen` are not on `PATH` —
 //! CI installs them in phase 7.3, mirroring `ssh_gateway_spike_test.rs`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
+use bore_cli::vhost::{Reservation, VhostConfig, VhostModeCfg};
 use bore_cli::{server::Server, shared::CONTROL_PORT, sshgw::SshGatewayConfig};
 use lazy_static::lazy_static;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -60,11 +62,18 @@ macro_rules! skip_without_ssh_cli {
 /// returns the private key path (the matching `<path>.pub` is created
 /// alongside it).
 async fn gen_keypair(dir: &Path, name: &str) -> Result<PathBuf> {
+    gen_keypair_with_comment(dir, name, "gwtest").await
+}
+
+/// Like [`gen_keypair`], but with a caller-chosen pubkey comment — the
+/// comment becomes the key's [`KeyGrant::identity`] (`crate::sshgw_auth`),
+/// which `resolve_route`'s reservation `client_id` check compares against.
+async fn gen_keypair_with_comment(dir: &Path, name: &str, comment: &str) -> Result<PathBuf> {
     let priv_path = dir.join(name);
     let status = Command::new("ssh-keygen")
         .args(["-t", "ed25519", "-N", "", "-f"])
         .arg(&priv_path)
-        .args(["-C", "gwtest"])
+        .args(["-C", comment])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -200,17 +209,112 @@ async fn start_gateway_server(host_key_file: PathBuf, authorized_keys_dir: PathB
     Ok(gw_port)
 }
 
+/// Minimal HTTP-only [`VhostConfig`] for `base_domain` on `http_port`, with
+/// the given `reservations` (empty = unrestricted).
+fn vhost_config(base_domain: &str, http_port: u16, reservations: Vec<Reservation>) -> VhostConfig {
+    VhostConfig {
+        base_domain: base_domain.to_string(),
+        mode: VhostModeCfg::Http,
+        http_port,
+        https_port: 443,
+        cert_file: None,
+        key_file: None,
+        default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
+        reservations,
+    }
+}
+
+/// Like [`start_gateway_server`], but also wires vhost (`vhost/<label>`
+/// forwards route through the vhost HTTP frontend on `cfg.http_port`).
+/// `set_vhost` must run before `set_ssh_gateway` — the gateway snapshots
+/// `Server::vhost_config` at that call (see `src/sshgw.rs`
+/// `tcpip_forward_vhost`).
+async fn start_gateway_server_vhost(
+    host_key_file: PathBuf,
+    authorized_keys_dir: PathBuf,
+    cfg: VhostConfig,
+) -> Result<u16> {
+    let http_port = cfg.http_port;
+    let gw_port = free_port().await?;
+    let config = SshGatewayConfig {
+        port: Some(gw_port),
+        host_key_file,
+        authorized_keys_dir: Some(authorized_keys_dir),
+        passwords_file: None,
+        banner: None,
+    };
+    let mut server = Server::new(1024..=65535, None);
+    server.set_admin_token(Some(TOKEN.to_string()));
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_vhost(cfg)?;
+    server.set_ssh_gateway(config)?;
+    tokio::spawn(server.listen());
+    wait_port(CONTROL_PORT, true).await;
+    wait_port(gw_port, true).await;
+    wait_port(http_port, true).await;
+    Ok(gw_port)
+}
+
+/// A local HTTP service standing in for the "service on localhost" that a
+/// vhost forward proxies to: replies to every request with a fixed 200 body.
+async fn spawn_http_stub(body: &'static str) -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    tokio::spawn(async move {
+        loop {
+            let (mut conn, _) = listener.accept().await?;
+            let mut buf = [0u8; 4096];
+            let mut total = 0;
+            loop {
+                let n = conn.read(&mut buf[total..]).await?;
+                total += n;
+                if n == 0 || buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            conn.write_all(resp.as_bytes()).await?;
+            conn.shutdown().await?;
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+    Ok(port)
+}
+
+/// Issues one HTTP/1.1 GET against `port` with the given `Host` header and
+/// returns the full raw response text.
+async fn send_http(port: u16, host: &str, path: &str) -> Result<String> {
+    send_http_auth(port, host, path, None).await
+}
+
+/// Like [`send_http`] but with an optional extra header line (e.g.
+/// `"Authorization: Basic ..."`) appended before the terminating blank line.
+async fn send_http_auth(
+    port: u16,
+    host: &str,
+    path: &str,
+    extra_header: Option<&str>,
+) -> Result<String> {
+    let mut conn = TcpStream::connect(("127.0.0.1", port)).await?;
+    let extra = extra_header.map(|h| format!("{h}\r\n")).unwrap_or_default();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n{extra}\r\n");
+    conn.write_all(req.as_bytes()).await?;
+    let mut buf = Vec::new();
+    time::timeout(Duration::from_secs(5), conn.read_to_end(&mut buf)).await??;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Builds `ssh` CLI args connecting to the gateway on `gw_port` as `identity`,
 /// with one `-R <bind_port>:127.0.0.1:<local_port>` per entry in `forwards`,
 /// and an optional trailing remote command (mutually exclusive with `-N`,
 /// which is added automatically when `command` is `None`).
-fn ssh_args(
-    gw_port: u16,
-    identity: &Path,
-    forwards: &[(u16, u16)],
-    command: Option<&str>,
-) -> Vec<String> {
-    let mut args = vec![
+fn ssh_base_args(gw_port: u16, identity: &Path) -> Vec<String> {
+    vec![
         "-o".into(),
         "StrictHostKeyChecking=no".into(),
         "-o".into(),
@@ -231,13 +335,46 @@ fn ssh_args(
         identity.display().to_string(),
         "-p".into(),
         gw_port.to_string(),
-    ];
+    ]
+}
+
+fn ssh_args(
+    gw_port: u16,
+    identity: &Path,
+    forwards: &[(u16, u16)],
+    command: Option<&str>,
+) -> Vec<String> {
+    let mut args = ssh_base_args(gw_port, identity);
     if command.is_none() {
         args.push("-N".into());
     }
     for (bind_port, local_port) in forwards {
         args.push("-R".into());
         args.push(format!("{bind_port}:127.0.0.1:{local_port}"));
+    }
+    args.push("gwtest@127.0.0.1".into());
+    if let Some(cmd) = command {
+        args.push(cmd.into());
+    }
+    args
+}
+
+/// Like [`ssh_args`], but each forward is a raw `-R` tail string (e.g.
+/// `"vhost/pfx:0:127.0.0.1:9000"`), for the `vhost/`/`secret/` prefixed
+/// bind-address forms that don't fit the `(bind_port, local_port)` shape.
+fn ssh_args_raw(
+    gw_port: u16,
+    identity: &Path,
+    raw_forwards: &[String],
+    command: Option<&str>,
+) -> Vec<String> {
+    let mut args = ssh_base_args(gw_port, identity);
+    if command.is_none() {
+        args.push("-N".into());
+    }
+    for f in raw_forwards {
+        args.push("-R".into());
+        args.push(f.clone());
     }
     args.push("gwtest@127.0.0.1".into());
     if let Some(cmd) = command {
@@ -677,5 +814,196 @@ async fn t_ssh_keep1_idle_session_survives_ctrl_timeout() -> Result<()> {
     );
 
     child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-VH1 — `-R vhost/<label>`: real HTTP traffic routes through the vhost
+// frontend to the forwarded local service, and the admin API shows an
+// ssh-transport Vhost entry (`docs/plans/plan_SshGateway/phase_05.md`).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_vh1_vhost_forward_routes_http_and_admin_entry() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    let http_port = free_port().await?;
+    let cfg = vhost_config("bore.sshtest", http_port, vec![]);
+    let gw_port = start_gateway_server_vhost(host_key, dir.path().to_path_buf(), cfg).await?;
+
+    let svc_port = spawn_http_stub("hello from vh1").await?;
+    let raw_forward = format!("vhost/vh1sub:0:127.0.0.1:{svc_port}");
+
+    let mut child = Command::new("ssh")
+        .args(ssh_args_raw(gw_port, &client_priv, &[raw_forward], None))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh (T-SSH-VH1)")?;
+
+    let admin = wait_admin_data_contains("vh1sub").await?;
+    assert!(
+        admin.contains("\"ssh\""),
+        "admin entry for an SSH vhost forward should show transport ssh: {admin}"
+    );
+
+    let resp = send_http(http_port, "vh1sub.bore.sshtest", "/").await?;
+    assert!(
+        resp.contains("hello from vh1"),
+        "expected the forwarded stub's body in the vhost response, got: {resp}"
+    );
+
+    child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-VH2 (`docs/plans/plan_SshGateway/phase_05.md`) — exec `basic-auth=u:p`
+// on an SSH vhost forward: a request without the header gets 401, one with
+// the correct `Authorization` header reaches the backend.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_vh2_basic_auth_enforced() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    let http_port = free_port().await?;
+    let cfg = vhost_config("bore.sshtest", http_port, vec![]);
+    let gw_port = start_gateway_server_vhost(host_key, dir.path().to_path_buf(), cfg).await?;
+
+    let svc_port = spawn_http_stub("hello from vh2").await?;
+    let raw_forward = format!("vhost/vh2sub:0:127.0.0.1:{svc_port}");
+
+    let mut child = Command::new("ssh")
+        .args(ssh_args_raw(
+            gw_port,
+            &client_priv,
+            &[raw_forward],
+            Some("basic-auth=user:pass"),
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh (T-SSH-VH2)")?;
+
+    wait_admin_data_contains("vh2sub").await?;
+
+    // No credentials -> 401.
+    let unauthed = send_http(http_port, "vh2sub.bore.sshtest", "/").await?;
+    assert!(
+        unauthed.starts_with("HTTP/1.1 401"),
+        "expected 401 without credentials, got: {unauthed}"
+    );
+
+    // base64("user:pass") == "dXNlcjpwYXNz".
+    let authed = send_http_auth(
+        http_port,
+        "vh2sub.bore.sshtest",
+        "/",
+        Some("Authorization: Basic dXNlcjpwYXNz"),
+    )
+    .await?;
+    assert!(
+        authed.contains("hello from vh2"),
+        "expected the backend body with correct credentials, got: {authed}"
+    );
+
+    child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-PFX1 — `vhost/`/`secret/` prefixes override the bare-label port
+// heuristic (`parse_forward_spec`, `src/sshgw.rs`): `vhost/pfx:0:...`
+// registers a vhost subdomain despite port 0 (which alone means "secret
+// provider"), and `secret/sid:80:...` is dispatched as a secret provider
+// forward despite port 80 (which alone means "vhost").
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_pfx1_prefix_overrides_port_heuristic() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    let http_port = free_port().await?;
+    let cfg = vhost_config("bore.sshtest", http_port, vec![]);
+    let gw_port = start_gateway_server_vhost(host_key, dir.path().to_path_buf(), cfg).await?;
+
+    // `vhost/pfx` on port 0: the prefix wins over the "port 0 -> secret"
+    // heuristic, so this must register as a vhost subdomain and proxy real
+    // traffic exactly like T-SSH-VH1.
+    let svc_port = spawn_http_stub("hello from pfx").await?;
+    let vhost_forward = format!("vhost/pfx:0:127.0.0.1:{svc_port}");
+    let mut vhost_child = Command::new("ssh")
+        .args(ssh_args_raw(gw_port, &client_priv, &[vhost_forward], None))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh vhost/pfx (T-SSH-PFX1)")?;
+
+    wait_admin_data_contains("pfx").await?;
+    let resp = send_http(http_port, "pfx.bore.sshtest", "/").await?;
+    assert!(
+        resp.contains("hello from pfx"),
+        "vhost/pfx on port 0 should register as a vhost subdomain, got: {resp}"
+    );
+    vhost_child.kill().await.ok();
+    time::sleep(Duration::from_millis(200)).await;
+
+    // `secret/sid` on port 80: the prefix wins over the "port 80 -> vhost"
+    // heuristic, so this dispatches as a secret-provider forward. Secret
+    // providers over SSH are not implemented yet (Phase 5.3), so the
+    // gateway declines the forward request; with `ExitOnForwardFailure=yes`
+    // and no other forwards the `ssh -N` session exits non-zero. If this
+    // had instead been misclassified as `vhost/sid` on port 80, it would
+    // have succeeded exactly like the case above, so a non-zero exit here
+    // is specifically proof the `secret/` prefix was honored over the port
+    // heuristic.
+    let secret_svc_port = spawn_http_stub("unreachable").await?;
+    let secret_forward = format!("secret/sid:80:127.0.0.1:{secret_svc_port}");
+    let status = time::timeout(
+        Duration::from_secs(10),
+        Command::new("ssh")
+            .args(ssh_args_raw(gw_port, &client_priv, &[secret_forward], None))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .context("secret/sid ssh did not exit (T-SSH-PFX1)")??;
+    assert!(
+        !status.success(),
+        "secret/sid on port 80 must dispatch as a secret-provider forward, \
+         not silently succeed as a vhost forward"
+    );
+
     Ok(())
 }

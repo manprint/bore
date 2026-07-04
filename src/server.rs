@@ -743,6 +743,7 @@ impl Server {
             config,
             self.providers.clone(),
             self.vhost_registry.clone(),
+            self.vhost_config.clone(),
             self.admin.clone(),
             Arc::clone(&self.conn_permits),
             self.port_range.clone(),

@@ -8,14 +8,18 @@
 //! `docs/plans/plan_SshGateway/` for the implementation plan.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use dashmap::mapref::entry::Entry;
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, ChannelOpenHandle, Handle, Handler, Msg, Session};
@@ -26,11 +30,17 @@ use tokio::task::JoinHandle;
 use tracing::{info, trace, warn};
 
 use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Registration, Role, Transport};
+use crate::basicauth::BasicAuth;
+use crate::mux;
+use crate::pool::CarrierPool;
 use crate::secret;
 use crate::server::{bind_public_listener, DEFAULT_MAX_CONNS};
 use crate::shared::{proxy_buffer_size, tune_tcp, CountingStream};
 use crate::sshgw_auth::{KeyGrant, KeyStore, PasswordStore};
-use crate::vhost::VhostRegistry;
+use crate::vhost::{
+    self, cert_present, public_urls, resolve_mode, resolve_route, RouteDecision, SharedVhostConfig,
+    VhostEntry, VhostMode, VhostRegistry,
+};
 
 /// Interval between server-initiated SSH keepalive probes on an authenticated
 /// gateway connection. Parity with `CTRL_CLIENT_HEARTBEAT` (`src/secret.rs`),
@@ -143,12 +153,15 @@ pub struct SshGateway {
     host_key: PrivateKey,
     keys: Option<KeyStore>,
     passwords: Option<PasswordStore>,
-    /// Wired for Phase 4.3 (`tcpip_forward` public-tunnel handling).
+    /// Wired for Phase 5.3 (`tcpip_forward` secret-provider handling).
     #[allow(dead_code)]
     providers: secret::Registry,
-    /// Wired for Phase 5 (vhost mapping).
-    #[allow(dead_code)]
+    /// Wired for Phase 5.2 (`tcpip_forward` vhost-subdomain handling).
     vhost_registry: VhostRegistry,
+    /// Live vhost config (reservations, base domain, TLS mode). `None` when
+    /// the server has no `vhost.yml` configured, in which case any
+    /// `vhost/<label>` forward request is rejected outright.
+    vhost_config: Option<SharedVhostConfig>,
     /// Admin registration, `transport: Ssh` (I-3: RAII teardown per forward).
     admin: AdminRegistry,
     /// Per-connection inbound cap, shared with the rest of the server's
@@ -171,15 +184,16 @@ pub struct SshGateway {
 
 impl SshGateway {
     /// Build the gateway: validates `config`, loads/generates the host key,
-    /// and wires the credential stores. `providers`/`vhost_registry`/`admin`/
-    /// `conn_permits`/`port_range`/`bind_tunnels`/`total_rx_bytes`/
-    /// `total_tx_bytes` must be clones of the `Server`'s own — never
-    /// re-derived.
+    /// and wires the credential stores. `providers`/`vhost_registry`/
+    /// `vhost_config`/`admin`/`conn_permits`/`port_range`/`bind_tunnels`/
+    /// `total_rx_bytes`/`total_tx_bytes` must be clones of the `Server`'s
+    /// own — never re-derived.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: SshGatewayConfig,
         providers: secret::Registry,
         vhost_registry: VhostRegistry,
+        vhost_config: Option<SharedVhostConfig>,
         admin: AdminRegistry,
         conn_permits: Arc<Semaphore>,
         port_range: RangeInclusive<u16>,
@@ -198,6 +212,7 @@ impl SshGateway {
             passwords,
             providers,
             vhost_registry,
+            vhost_config,
             admin,
             conn_permits,
             port_range,
@@ -325,6 +340,174 @@ impl GatewayHandler {
             max_conns: None,
             notes: None,
         })
+    }
+
+    /// Registers `-R vhost/<label>` (or a bare label on port 80/443) as a
+    /// vhost subdomain provider. Unlike a public tunnel there is no OS-level
+    /// listener to bind — the shared vhost HTTP(S) frontend already accepts
+    /// on the server's configured ports and looks up `vhost_registry` per
+    /// request — so the spawned task's only job is to hold the registry +
+    /// admin registrations alive (via `_guard`/`_registration`) until
+    /// `cancel_tcpip_forward` or connection teardown aborts it (I-3, same
+    /// RAII discipline as [`run_public_forward`]).
+    async fn tcpip_forward_vhost(
+        &self,
+        address: &str,
+        port: u16,
+        label: String,
+        grant: KeyGrant,
+        session: &mut Session,
+    ) -> Result<bool, russh::Error> {
+        let Some(cfg) = self.gateway.vhost_config.clone() else {
+            self.state.queue_message(
+                "bore ssh-gateway: server has no vhost.yml configured; \
+                 vhost/<label> forwards are unavailable"
+                    .to_string(),
+            );
+            return Ok(false);
+        };
+        if !permit_allows(&grant, "vhost/", &label) {
+            self.state.queue_message(format!(
+                "bore ssh-gateway: this key's permit= list does not allow vhost/{label}"
+            ));
+            return Ok(false);
+        }
+
+        let ssh_handle = session.handle();
+        let gateway = Arc::clone(&self.gateway);
+        let state = Arc::clone(&self.state);
+        let peer = self.peer;
+        let connected_address = address.to_string();
+        let key = (connected_address.clone(), port);
+        let label_for_message = label.clone();
+
+        let task = tokio::spawn(async move {
+            let (exec, env) = await_params(&state).await;
+            let params = parse_params(exec.as_deref(), &env, &grant);
+
+            let live_cfg = cfg.read().unwrap().clone();
+            let (request_headers, response_headers) =
+                match resolve_route(&live_cfg, &label, &grant.identity) {
+                    RouteDecision::Accept {
+                        request_headers,
+                        response_headers,
+                    } => (request_headers, response_headers),
+                    RouteDecision::Reject { reason } => {
+                        state.queue_message(format!("bore ssh-gateway: {reason}"));
+                        return;
+                    }
+                };
+
+            let gateway_basic_auth = params.basic_auth.as_deref().and_then(BasicAuth::parse);
+            let has_basic_auth = gateway_basic_auth.is_some();
+
+            let pool = match gateway.vhost_registry.entry(label.clone()) {
+                Entry::Occupied(_) => {
+                    state.queue_message(format!(
+                        "bore ssh-gateway: subdomain '{label}' already in use"
+                    ));
+                    return;
+                }
+                Entry::Vacant(slot) => {
+                    let opener = SshOpener::new(ssh_handle, connected_address, port);
+                    let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Ssh(Arc::new(opener))));
+                    let entry = Arc::new(VhostEntry {
+                        pool: Arc::clone(&pool),
+                        request_headers,
+                        response_headers,
+                        #[cfg(feature = "udp")]
+                        direct: vhost::DirectPool::default(),
+                        #[cfg(feature = "udp")]
+                        direct_stream_opens: AtomicU64::new(0),
+                        active: Arc::new(AtomicUsize::new(0)),
+                        webserver_log: params.webserver_log,
+                        peer,
+                        since: Instant::now(),
+                        notes: params.notes.clone(),
+                        basic_auth: has_basic_auth,
+                        udp: false,
+                        auto_reconnect: false,
+                        local_host: None,
+                        local_port: 0,
+                        relay_tx_bytes: Arc::new(AtomicU64::new(0)),
+                        relay_rx_bytes: Arc::new(AtomicU64::new(0)),
+                        gateway_basic_auth,
+                    });
+                    slot.insert(Arc::clone(&entry));
+                    pool
+                }
+            };
+            let _guard = VhostSshGuard {
+                registry: gateway.vhost_registry.clone(),
+                label: label.clone(),
+            };
+
+            let mode = resolve_mode(&live_cfg, cert_present(&live_cfg)).unwrap_or(VhostMode::Http);
+            let (http_url, https_url) = public_urls(
+                &label,
+                &live_cfg.base_domain,
+                mode,
+                live_cfg.http_port,
+                live_cfg.https_port,
+            );
+            if let Some(url) = http_url {
+                state.queue_message(format!("vhost tunnel ready: {url}"));
+            }
+            if let Some(url) = https_url {
+                state.queue_message(format!("vhost tunnel ready: {url}"));
+            }
+
+            let registration = gateway.admin.register(NewEntry {
+                role: Role::Vhost,
+                peer,
+                secret_id: Some(label.clone()),
+                public_port: None,
+                notes: params.notes.clone(),
+                basic_auth: has_basic_auth,
+                https: false,
+                force_https: false,
+                carriers: 0,
+                auto_reconnect: false,
+                webserver_log: params.webserver_log,
+                udp: false,
+                vpn_relay_only: false,
+                vpn_pin_mtu: false,
+                vpn_mtu: None,
+                vpn_forward_accept: false,
+                vpn_nat_masquerade: false,
+                vpn_route_policy: None,
+                vpn_advertised: vec![],
+                vpn_nat_udp_port: None,
+                local_proxy_port: None,
+                local_host: None,
+                local_port: None,
+                nat_udp_preferred_port: None,
+                nat_udp_release_timeout: None,
+                stun_server: None,
+                upnp: false,
+                try_port_prediction: false,
+                max_conns: None,
+                transport: Transport::Ssh,
+                identity: Some(grant.identity.clone()),
+            });
+
+            // Nothing left to do but stay alive: the shared vhost HTTP(S)
+            // frontend drives all traffic through `pool`/`registration` via
+            // the registry lookup. This task's only remaining purpose is to
+            // hold `_guard`/`pool`/`registration` until aborted.
+            let _pool = pool;
+            let _registration = registration;
+            std::future::pending::<()>().await;
+        });
+        self.state
+            .forwards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, task);
+
+        self.state
+            .queue_message(format!("vhost tunnel requested: {label_for_message}"));
+        Ok(true)
     }
 }
 
@@ -552,10 +735,28 @@ impl Handler for GatewayHandler {
         };
         let requested_port = match spec {
             ForwardSpec::Public { port } => port,
-            ForwardSpec::Vhost { .. } | ForwardSpec::SecretProvider { .. } => {
+            ForwardSpec::Vhost { label } => {
+                // RFC 4254 7.1: a `tcpip-forward` requesting the dynamic port 0
+                // MUST get the allocated port echoed back in the SUCCESS reply,
+                // or OpenSSH treats the reply as malformed and disconnects right
+                // after receiving it. Vhost forwards have no real listening
+                // port, so synthesize a fixed non-zero placeholder; the same
+                // value is reused as `connected_port` in every later
+                // `channel_open_forwarded_tcpip` for this label so the client's
+                // forward-table lookup (keyed by address+port) still matches.
+                let port16 = match u16::try_from(*port) {
+                    Ok(0) | Err(_) => 1,
+                    Ok(p) => p,
+                };
+                *port = u32::from(port16);
+                return self
+                    .tcpip_forward_vhost(address, port16, label, grant, session)
+                    .await;
+            }
+            ForwardSpec::SecretProvider { .. } => {
                 self.state.queue_message(
-                    "bore ssh-gateway: vhost/secret forwards are not implemented yet; \
-                     use a plain -R (public tunnel) forward"
+                    "bore ssh-gateway: secret forwards are not implemented yet; \
+                     use a plain -R (public tunnel) or vhost/<label> forward"
                         .to_string(),
                 );
                 return Ok(false);
@@ -727,6 +928,49 @@ fn intersect(a: &RangeInclusive<u16>, b: &RangeInclusive<u16>) -> Option<RangeIn
     (start <= end).then_some(start..=end)
 }
 
+/// Whether `grant.permit` allows a `<prefix><label>`-style forward for
+/// `label` (`prefix` is `"vhost/"` or `"secret/"`). `permit: None` means
+/// unrestricted, same as [`permitted_port_ranges`]. Otherwise requires at
+/// least one `<prefix><glob>` entry whose glob matches `label`.
+fn permit_allows(grant: &KeyGrant, prefix: &str, label: &str) -> bool {
+    match &grant.permit {
+        None => true,
+        Some(entries) => entries
+            .iter()
+            .filter_map(|e| e.strip_prefix(prefix))
+            .any(|glob| glob_match(glob, label)),
+    }
+}
+
+/// Minimal glob match: `*` matches zero or more of any character, every
+/// other character matches literally. No `?`, no character classes — the
+/// `permit=` grammar only needs prefix/suffix/contains wildcards.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn inner(p: &[u8], t: &[u8]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some(b'*') => inner(&p[1..], t) || (!t.is_empty() && inner(p, &t[1..])),
+            Some(c) => t.first() == Some(c) && inner(&p[1..], &t[1..]),
+        }
+    }
+    inner(pattern.as_bytes(), text.as_bytes())
+}
+
+/// Removes an SSH-registered vhost subdomain from the registry when the
+/// `tcpip-forward` task ends (aborted by `cancel_tcpip_forward` or the whole
+/// connection tearing down via `Drop for ConnState`). Mirrors `vhost`'s own
+/// private `Deregister` guard, kept separate since that one isn't `pub`.
+struct VhostSshGuard {
+    registry: VhostRegistry,
+    label: String,
+}
+
+impl Drop for VhostSshGuard {
+    fn drop(&mut self) {
+        self.registry.remove(&self.label);
+    }
+}
+
 /// Binds a public-tunnel listener honoring both the server's `port_range`
 /// and the connecting key's `permit=` port rules. A nonzero `requested_port`
 /// is rejected outright (no socket touched) if it falls outside the
@@ -882,6 +1126,53 @@ async fn run_public_forward(
                 trace!(%err, "ssh-gateway: proxied connection closed");
             }
         });
+    }
+}
+
+/// Opens a `forwarded-tcpip` channel toward the SSH peer that registered a
+/// vhost/secret tunnel via `-R`. Implements [`mux::ChannelOpen`] so it can be
+/// stored in a [`mux::LinkOpener::Ssh`] and driven by the shared
+/// [`CarrierPool`](crate::pool::CarrierPool)/relay code exactly like a mux
+/// [`mux::Opener`] — the vhost/secret relay paths never know the peer is SSH.
+struct SshOpener {
+    handle: Handle,
+    connected_address: String,
+    connected_port: u16,
+}
+
+impl SshOpener {
+    fn new(handle: Handle, connected_address: String, connected_port: u16) -> Self {
+        Self {
+            handle,
+            connected_address,
+            connected_port,
+        }
+    }
+}
+
+impl mux::ChannelOpen for SshOpener {
+    fn open(
+        &self,
+        forward_ip: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<mux::LinkStream>> + Send + '_>> {
+        // SSH has no STREAM_READY marker (I-4): the caller IP travels as the
+        // channel-open request's own originator-IP field instead.
+        let originator_ip = forward_ip.unwrap_or("0.0.0.0").to_string();
+        let handle = self.handle.clone();
+        let connected_address = self.connected_address.clone();
+        let connected_port = self.connected_port;
+        Box::pin(async move {
+            let channel = handle
+                .channel_open_forwarded_tcpip(
+                    connected_address,
+                    u32::from(connected_port),
+                    originator_ip,
+                    0,
+                )
+                .await
+                .map_err(io::Error::other)?;
+            Ok(Box::new(channel.into_stream()) as mux::LinkStream)
+        })
     }
 }
 
@@ -1128,10 +1419,18 @@ mod tests {
     }
 
     fn build(config: SshGatewayConfig) -> Result<SshGateway> {
+        build_with_vhost_config(config, None)
+    }
+
+    fn build_with_vhost_config(
+        config: SshGatewayConfig,
+        vhost_config: Option<SharedVhostConfig>,
+    ) -> Result<SshGateway> {
         SshGateway::new(
             config,
             secret::Registry::default(),
             VhostRegistry::default(),
+            vhost_config,
             AdminRegistry::default(),
             Arc::new(Semaphore::new(1)),
             1024..=65535,
@@ -1414,5 +1713,44 @@ mod tests {
         assert_eq!(config.keepalive_max, SSH_KEEPALIVE_MAX_MISSES);
         assert_eq!(config.inactivity_timeout, Some(SSH_PREAUTH_GRACE));
         assert_eq!(config.max_auth_attempts, SSH_MAX_AUTH_ATTEMPTS);
+    }
+
+    #[test]
+    fn glob_match_wildcards() {
+        assert!(glob_match("*", ""));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("foo", "foo"));
+        assert!(!glob_match("foo", "foobar"));
+        assert!(glob_match("foo*", "foobar"));
+        assert!(!glob_match("foo*", "barfoo"));
+        assert!(glob_match("*bar", "foobar"));
+        assert!(!glob_match("*bar", "barfoo"));
+        assert!(glob_match("foo*bar", "foo-baz-bar"));
+        assert!(!glob_match("foo*bar", "foo-baz"));
+        assert!(glob_match("*-staging", "app-1-staging"));
+    }
+
+    #[test]
+    fn permit_allows_vhost_and_secret_globs() {
+        let unrestricted = grant("alice");
+        assert!(permit_allows(&unrestricted, "vhost/", "anything"));
+        assert!(permit_allows(&unrestricted, "secret/", "anything"));
+
+        let mut scoped = grant("bob");
+        scoped.permit = Some(vec!["vhost/bob-*".to_string(), "port/9000".to_string()]);
+        assert!(permit_allows(&scoped, "vhost/", "bob-app"));
+        assert!(!permit_allows(&scoped, "vhost/", "eve-app"));
+        // A port/ rule contributes nothing to the vhost/secret grammar.
+        assert!(!permit_allows(&scoped, "secret/", "bob-app"));
+
+        let mut secret_only = grant("carol");
+        secret_only.permit = Some(vec!["secret/carol-*".to_string()]);
+        assert!(permit_allows(&secret_only, "secret/", "carol-db"));
+        assert!(!permit_allows(&secret_only, "secret/", "other-db"));
+        assert!(!permit_allows(&secret_only, "vhost/", "carol-db"));
+
+        let mut none_allowed = grant("dave");
+        none_allowed.permit = Some(vec!["port/1000".to_string()]);
+        assert!(!permit_allows(&none_allowed, "vhost/", "dave-app"));
     }
 }

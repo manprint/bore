@@ -800,7 +800,7 @@ impl StreamOpener {
 /// One forwarded stream — a yamux substream (relay) or a native QUIC bidi (direct).
 /// Both are `Unpin`, so the trait impls delegate by matching on `&mut self`.
 enum DataStream {
-    Mux(mux::Stream),
+    Mux(mux::LinkStream),
     #[cfg(feature = "udp")]
     Quic(crate::holepunch::QuicTransport),
 }

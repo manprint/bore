@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::admin::{AdminRegistry, NewEntry, Role};
+use crate::basicauth::{self, BasicAuth};
 use crate::edge;
 use crate::mux;
 use crate::pool::{CarrierPool, PendingCarriers, TokenGuard};
@@ -381,6 +382,12 @@ pub struct VhostEntry {
     pub relay_tx_bytes: Arc<AtomicU64>,
     /// Relay bytes received from the provider (provider→server).
     pub relay_rx_bytes: Arc<AtomicU64>,
+    /// Server-side HTTP Basic auth enforced on the gateway's behalf (SSH
+    /// ingress only — a native `bore vhost` provider enforces its own auth
+    /// client-side before proxying, see [`VhostEntry::basic_auth`]; an SSH
+    /// `-R` forward has no such client process, so the gateway must gate the
+    /// inbound request itself before opening a link toward the peer).
+    pub gateway_basic_auth: Option<BasicAuth>,
 }
 
 /// Upper bound on QUIC direct connections pooled per vhost subdomain. The provider
@@ -600,6 +607,7 @@ pub async fn serve_vhost_provider(
                 local_port,
                 relay_tx_bytes: Arc::new(AtomicU64::new(0)),
                 relay_rx_bytes: Arc::new(AtomicU64::new(0)),
+                gateway_basic_auth: None,
             });
             slot.insert(entry);
             pool
@@ -767,7 +775,7 @@ pub async fn serve_vhost_provider(
 /// caller's address (for logging); `subdomain` and `fqdn` are for access logging.
 #[allow(clippy::too_many_arguments)]
 pub async fn relay_vhost(
-    public: impl AsyncRead + AsyncWrite + Unpin,
+    mut public: impl AsyncRead + AsyncWrite + Unpin,
     addr: SocketAddr,
     entry: &VhostEntry,
     head: Vec<u8>,
@@ -778,6 +786,18 @@ pub async fn relay_vhost(
     fqdn: &str,
     log_ctx: LogContext,
 ) -> Result<()> {
+    // Server-side Basic auth (SSH ingress only, see `VhostEntry::gateway_basic_auth`).
+    // Gate before opening any provider link so an unauthorized caller never
+    // consumes a carrier.
+    if let Some(auth) = &entry.gateway_basic_auth {
+        if !auth.authorized(&head) {
+            public.write_all(basicauth::UNAUTHORIZED.as_bytes()).await?;
+            public.flush().await?;
+            let _ = public.shutdown().await;
+            return Ok(());
+        }
+    }
+
     // Caller IP forwarding (Phase 3), computed up front so every branch below
     // can announce readiness with it.
     let forward_ip = if entry.webserver_log {
@@ -1849,5 +1869,106 @@ reservations:
         // don't churn (open → server-close → renew → reopen → …).
         assert_eq!(clamp_direct_carriers(max + 8), max, "above cap is clamped");
         assert_eq!(clamp_direct_carriers(u16::MAX), max);
+    }
+
+    // ── gateway_basic_auth (SSH ingress server-side gate) ───────────────────
+
+    fn test_entry(gateway_basic_auth: Option<BasicAuth>) -> VhostEntry {
+        let (a, _b) = tokio::io::duplex(4096);
+        let (opener, _acceptor) = mux::client(a);
+        VhostEntry {
+            pool: Arc::new(CarrierPool::new(mux::LinkOpener::Mux(opener))),
+            request_headers: vec![],
+            response_headers: vec![],
+            #[cfg(feature = "udp")]
+            direct: DirectPool::default(),
+            #[cfg(feature = "udp")]
+            direct_stream_opens: AtomicU64::new(0),
+            active: Arc::new(AtomicUsize::new(0)),
+            webserver_log: false,
+            peer: "127.0.0.1:1".parse().unwrap(),
+            since: Instant::now(),
+            notes: None,
+            basic_auth: gateway_basic_auth.is_some(),
+            udp: false,
+            auto_reconnect: false,
+            local_host: None,
+            local_port: 0,
+            relay_tx_bytes: Arc::new(AtomicU64::new(0)),
+            relay_rx_bytes: Arc::new(AtomicU64::new(0)),
+            gateway_basic_auth,
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_basic_auth_none_is_noop() {
+        // No `gateway_basic_auth` configured: relay_vhost must not touch the
+        // head at all for auth purposes (native `bore vhost` gates client-side).
+        let entry = test_entry(None);
+        assert!(entry.gateway_basic_auth.is_none());
+    }
+
+    #[tokio::test]
+    async fn gateway_basic_auth_rejects_unauthorized_before_opening_provider() {
+        let auth = BasicAuth::parse("user:pass").unwrap();
+        let entry = test_entry(Some(auth));
+        let (public, mut peer) = tokio::io::duplex(4096);
+        let head = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+
+        let result = relay_vhost(
+            public,
+            "127.0.0.1:2".parse().unwrap(),
+            &entry,
+            head,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&entry.active),
+            "sub",
+            "sub.example.com",
+            LogContext {
+                logger: None,
+                dropped: Arc::new(AtomicU64::new(0)),
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let mut buf = vec![0u8; 12];
+        peer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"HTTP/1.1 401");
+    }
+
+    #[tokio::test]
+    async fn gateway_basic_auth_accepts_authorized_then_falls_through_to_relay() {
+        // A correctly authorized request must NOT hit the 401 short-circuit;
+        // it proceeds to the normal relay path (which then fails opening a
+        // provider link, since the mock pool has no live carrier — proving
+        // the auth gate itself let it through rather than rejecting it).
+        let auth = BasicAuth::parse("user:pass").unwrap();
+        let entry = test_entry(Some(auth));
+        let (public, _peer) = tokio::io::duplex(4096);
+        let head =
+            b"GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n".to_vec();
+
+        let result = relay_vhost(
+            public,
+            "127.0.0.1:2".parse().unwrap(),
+            &entry,
+            head,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&entry.active),
+            "sub",
+            "sub.example.com",
+            LogContext {
+                logger: None,
+                dropped: Arc::new(AtomicU64::new(0)),
+            },
+        )
+        .await;
+
+        // No live carrier ⇒ opening the provider link errors out; that error
+        // (not an early Ok(())) proves the auth gate was passed.
+        assert!(result.is_err());
     }
 }

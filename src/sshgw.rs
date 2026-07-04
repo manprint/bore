@@ -714,6 +714,22 @@ impl GatewayHandler {
             // frontend drives all traffic through `pool`/`registration` via
             // the registry lookup. This task's only remaining purpose is to
             // hold `_guard`/`pool`/`registration` until aborted.
+            //
+            // `drop(state)` is load-bearing, not cleanup theater: this task's
+            // own `state: Arc<ConnState>` clone (captured above for
+            // `await_params`/`queue_message`) would otherwise stay alive for
+            // as long as this `pending()` future exists — i.e. forever — and
+            // `ConnState`'s refcount can then never reach zero, so `Drop for
+            // ConnState` (which aborts every task in `self.forwards`,
+            // INCLUDING this one) never runs on an ungraceful connection
+            // death (found via T-SSH-N1's real half-open netns repro: the
+            // keepalive reaper correctly errors the SSH session, logged, but
+            // the admin row survived forever — this reference cycle is why).
+            // `cancel_tcpip_forward` and takeover's `apply_takeover` both
+            // route around this (they abort via a directly-held handle, not
+            // via `ConnState::drop`), which is why only the "whole session
+            // just dies" path ever hit it.
+            drop(state);
             let _pool = pool;
             let _registration = registration;
             std::future::pending::<()>().await;
@@ -874,6 +890,14 @@ impl GatewayHandler {
             // `pool` through the registry lookup in `secret::relay`/
             // `channel_open_direct_tcpip`. This task's only remaining purpose
             // is to hold `_guard`/`pool`/`registration` until aborted (I-3).
+            //
+            // `drop(state)` is load-bearing — see the matching comment in
+            // `tcpip_forward_vhost`: without it, this task's own
+            // `Arc<ConnState>` clone survives for as long as this `pending()`
+            // future exists (forever), so `ConnState`'s refcount never
+            // reaches zero and `Drop for ConnState` (which would abort this
+            // very task) never runs on an ungraceful connection death.
+            drop(state);
             let _pool = pool;
             let _registration = registration;
             std::future::pending::<()>().await;

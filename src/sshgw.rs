@@ -75,6 +75,35 @@ pub const SSH_KEEPALIVE_MAX_MISSES: usize =
 /// authentication before it is disconnected.
 pub const SSH_PREAUTH_GRACE: Duration = Duration::from_secs(30);
 
+/// Default per-channel SSH flow-control window (`russh::server::Config::
+/// window_size`), in bytes. Each proxied connection is one `forwarded-tcpip`
+/// (public/vhost) or relayed (secret) SSH channel, and SSH channel throughput
+/// is bounded by `window / RTT` (the classic SSH bandwidth-delay-product cap
+/// the OpenSSH-HPN patches exist to lift). russh's own default is a mere 2 MiB
+/// — enough to saturate a LAN, but on a 100 ms path it caps a single proxied
+/// connection at ~20 MiB/s regardless of link speed, well below what bore's
+/// native yamux carrier (whose per-stream window auto-tunes to the BDP, see
+/// `mux::config`) delivers on the same path. We raise the default to 16 MiB
+/// (~160 MiB/s at 100 ms, ~1.6 GiB/s at 10 ms) so the SSH ingress path is not
+/// gratuitously slower than the native client, and expose `--ssh-window-size`/
+/// `BORE_SSH_WINDOW_SIZE` for operators who want to trade memory for even
+/// higher single-connection throughput on very-high-BDP links. It is a receive
+/// credit ceiling, not a preallocation — an idle or LAN-speed tunnel never
+/// buffers anywhere near it.
+pub const SSH_DEFAULT_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+
+/// Per-channel SSH maximum packet size (`russh::server::Config::
+/// maximum_packet_size`), in bytes — the SSH transport default (RFC 4254
+/// negotiates the min of both peers, so a stock OpenSSH client caps this at
+/// its own 32 KiB regardless; raising it server-side only helps a peer that
+/// also raised it, and never hurts).
+pub const SSH_MAX_PACKET_SIZE: u32 = 32 * 1024;
+
+/// Floor for a configured `--ssh-window-size`: russh requires the window to be
+/// at least one maximum packet, and a window below one packet would wedge the
+/// channel. Clamped up to this with a warning rather than accepted.
+pub const SSH_MIN_WINDOW_SIZE: u32 = SSH_MAX_PACKET_SIZE;
+
 /// Maximum number of authentication attempts (any method) allowed on one
 /// connection before russh disconnects it.
 pub const SSH_MAX_AUTH_ATTEMPTS: usize = 3;
@@ -103,6 +132,15 @@ pub const SSH_MAX_AUTH_ATTEMPTS: usize = 3;
 /// interactive session.
 const PARAMS_GRACE: Duration = Duration::from_secs(5);
 
+/// Upper bound on how long a secret-consumer `direct-tcpip` (`ssh -L`) channel
+/// waits to open a substream to the provider before giving up and closing the
+/// accepted channel. Opening is done in a spawned task (never on the russh
+/// dispatch loop — see [`GatewayHandler::channel_open_direct_tcpip`]), so this
+/// only bounds that task, but a bound is still needed: a provider whose control
+/// connection is wedged-but-TCP-alive would otherwise leave the substream-open
+/// pending until the provider's own 60 s reaper fires.
+const SSH_DIRECT_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// One-line message written to the channel (then EOF+close) when a client
 /// requests an interactive shell — the gateway is ingress-only and never
 /// grants one.
@@ -124,8 +162,12 @@ pub struct SshGatewayConfig {
     pub authorized_keys_dir: Option<PathBuf>,
     /// Argon2id password file granting password auth.
     pub passwords_file: Option<PathBuf>,
-    /// Banner text sent to clients before authentication.
+    /// Banner text sent to clients before authentication (SSH
+    /// `SSH_MSG_USERAUTH_BANNER`, via [`GatewayHandler::authentication_banner`]).
     pub banner: Option<String>,
+    /// Per-channel SSH flow-control window in bytes ([`SSH_DEFAULT_WINDOW_SIZE`]);
+    /// governs single-proxied-connection throughput on high-BDP links.
+    pub window_size: u32,
 }
 
 impl SshGatewayConfig {
@@ -190,9 +232,14 @@ pub struct SshGateway {
     admin: AdminRegistry,
     /// Per-connection inbound cap, shared with the rest of the server's
     /// `--max-conns` (this bounds proxied connections, exactly like the
-    /// native public/vhost/secret accept loops — never the control
-    /// connection itself, which already holds its own single permit for its
-    /// whole lifetime from `Server::listen`'s ssh-gateway accept loop).
+    /// native public/vhost/secret accept loops). Whether the SSH *control*
+    /// connection itself also consumes a permit depends on how it arrived:
+    /// the dedicated `--ssh-port` listener acquires one for the control
+    /// connection's whole lifetime, whereas the shared control-port demux
+    /// path does NOT — matching native bore control connections, which are
+    /// likewise unmetered. Either way this semaphore is what actually bounds
+    /// proxied traffic; the control-connection accounting difference only
+    /// affects whether an idle control connection counts against `--max-conns`.
     conn_permits: Arc<Semaphore>,
     /// `permit="port/<n>"` range validation, and the pool `port == 0`
     /// auto-assign picks from.
@@ -226,7 +273,7 @@ impl SshGateway {
     /// own — never re-derived.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        config: SshGatewayConfig,
+        mut config: SshGatewayConfig,
         providers: secret::Registry,
         vhost_registry: VhostRegistry,
         vhost_config: Option<SharedVhostConfig>,
@@ -240,6 +287,16 @@ impl SshGateway {
         bind_domain: Option<String>,
     ) -> Result<Self> {
         config.validate()?;
+        // A window below one maximum packet would wedge every channel; clamp up
+        // with a warning rather than shipping a dead gateway.
+        if config.window_size < SSH_MIN_WINDOW_SIZE {
+            warn!(
+                requested = config.window_size,
+                clamped_to = SSH_MIN_WINDOW_SIZE,
+                "ssh-gateway: --ssh-window-size below the one-packet floor; clamping up"
+            );
+            config.window_size = SSH_MIN_WINDOW_SIZE;
+        }
         let host_key = load_or_generate_host_key(&config.host_key_file)?;
         let keys = config.authorized_keys_dir.clone().map(KeyStore::new);
         let passwords = config.passwords_file.clone().map(PasswordStore::new);
@@ -312,6 +369,12 @@ impl SshGateway {
             keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
             keepalive_max: SSH_KEEPALIVE_MAX_MISSES,
             max_auth_attempts: SSH_MAX_AUTH_ATTEMPTS,
+            // Lift russh's default 2 MiB per-channel window so a single proxied
+            // connection is not BDP-capped far below the native carrier on a
+            // high-RTT path (see SSH_DEFAULT_WINDOW_SIZE). `window_size` is
+            // clamped to `>= SSH_MIN_WINDOW_SIZE` in `new`.
+            window_size: self.config.window_size,
+            maximum_packet_size: SSH_MAX_PACKET_SIZE,
             ..Default::default()
         })
     }
@@ -1102,6 +1165,13 @@ impl Drop for ConnState {
 impl Handler for GatewayHandler {
     type Error = russh::Error;
 
+    /// Sends the operator-configured `--ssh-banner` (`SSH_MSG_USERAUTH_BANNER`)
+    /// before authentication succeeds — russh calls this once auth starts. A
+    /// `None` banner (the default) sends nothing, exactly as before.
+    async fn authentication_banner(&mut self) -> Result<Option<String>, Self::Error> {
+        Ok(self.gateway.config.banner.clone())
+    }
+
     async fn auth_publickey(
         &mut self,
         _user: &str,
@@ -1189,15 +1259,16 @@ impl Handler for GatewayHandler {
             return Ok(());
         };
 
-        let provider = match secret::open_with_failover(&pool, &id).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                warn!(%id, %err, "ssh-gateway: secret consumer could not reach provider");
-                reply.reject(ChannelOpenFailure::ConnectFailed).await;
-                return Ok(());
-            }
-        };
-
+        // Admin bookkeeping (sync, cheap) stays on the dispatch loop; the
+        // provider substream open (a real round trip) is deliberately deferred
+        // into the spawned relay task below. Awaiting `open_with_failover`
+        // here would block russh's single sequential handler-dispatch loop —
+        // stalling this consumer session's keepalives and every other channel
+        // on it — for as long as a wedged provider takes to fail (up to the
+        // provider's own 60 s reaper). We accept the channel unconditionally
+        // (a valid, registered id) and let the task close it on open failure,
+        // which an `ssh -L` client observes as an immediately-closed forwarded
+        // connection — the correct signal, without holding the dispatch loop.
         let consumer_entry = self.consumer_entry(&id);
         let total_rx_bytes = Arc::clone(&self.gateway.total_rx_bytes);
         let total_tx_bytes = Arc::clone(&self.gateway.total_tx_bytes);
@@ -1205,6 +1276,22 @@ impl Handler for GatewayHandler {
         reply.accept().await;
         tokio::spawn(async move {
             let _active_guard = ActiveGuard::new(Arc::clone(&consumer_entry.active));
+            let provider = match timeout(
+                SSH_DIRECT_OPEN_TIMEOUT,
+                secret::open_with_failover(&pool, &id),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(err)) => {
+                    warn!(%id, %err, "ssh-gateway: secret consumer could not reach provider; closing channel");
+                    return;
+                }
+                Err(_) => {
+                    warn!(%id, timeout_secs = SSH_DIRECT_OPEN_TIMEOUT.as_secs(), "ssh-gateway: secret provider open timed out; closing channel");
+                    return;
+                }
+            };
             let ssh_stream = channel.into_stream();
             let mut provider = provider;
             let mut counted = CountingStream::new(
@@ -1483,20 +1570,52 @@ impl Handler for GatewayHandler {
         let Ok(port16) = u16::try_from(port) else {
             return Ok(false);
         };
-        let key = (address.to_string(), port16);
-        let removed = self
+        let mut forwards = self
             .state
             .forwards
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&key);
-        match removed {
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let target = cancel_target(forwards.keys(), address, port16);
+        match target.and_then(|key| forwards.remove(&key)) {
             Some(task) => {
                 task.abort();
                 Ok(true)
             }
             None => Ok(false),
         }
+    }
+}
+
+/// Chooses which `forwards` entry a `cancel-tcpip-forward(address, port)`
+/// targets. A public forward is keyed by its real `(bind_address,
+/// allocated_port)` and matches EXACTLY. Vhost/secret forwards, however, were
+/// registered under a SYNTHESIZED placeholder port (the client requested the
+/// dynamic port 0 and RFC 4254 §7.1 forces us to echo back a nonzero value),
+/// and depending on OpenSSH version a `cancel-tcpip-forward` may carry either
+/// the client's ORIGINAL port (`0`) or the echoed placeholder — so an exact
+/// `(address, port)` match can miss and leave the forward alive until the whole
+/// session tears down (found in the ssh-gateway bug hunt). For a vhost/secret
+/// address the `(connection, address)` pair is unique, so after an exact-match
+/// miss we fall back to the entry sharing that address string, port-agnostic.
+/// Public specs never take the fallback (multiple public forwards can share a
+/// bind address on different ports — matching by address alone could abort the
+/// wrong one).
+fn cancel_target<'a, I>(keys: I, address: &str, port: u16) -> Option<(String, u16)>
+where
+    I: Iterator<Item = &'a (String, u16)>,
+{
+    let mut addr_match = None;
+    for key in keys {
+        if key.0 == address {
+            if key.1 == port {
+                return Some(key.clone()); // exact match always wins
+            }
+            addr_match.get_or_insert_with(|| key.clone());
+        }
+    }
+    match parse_forward_spec(address, u32::from(port)) {
+        Ok(ForwardSpec::Vhost { .. } | ForwardSpec::SecretProvider { .. }) => addr_match,
+        _ => None,
     }
 }
 
@@ -2189,8 +2308,6 @@ pub struct Params {
     pub basic_auth: Option<String>,
     /// Enable per-tunnel access logging.
     pub webserver_log: bool,
-    /// Explicit tunnel id override.
-    pub id: Option<String>,
     /// Terminate TLS on a PUBLIC tunnel's own port (server must have a
     /// certificate configured — `--cert-file`/`--key-file`). No effect on
     /// vhost/secret forwards: vhost already serves HTTPS server-side via
@@ -2281,7 +2398,17 @@ pub fn parse_params(
             },
             "basic-auth" => params.basic_auth = Some(value.clone()),
             "webserver-log" => params.webserver_log = value == "on",
-            "id" => params.id = Some(value.clone()),
+            // A vhost/secret tunnel's identity over SSH ingress is the
+            // authenticated SSH key/label (`grant.identity`), used directly for
+            // vhost route resolution and reserved-subdomain ownership — never a
+            // client-supplied `id=`. Honoring `id=` would let any authenticated
+            // key claim another identity's reserved routes, so it is refused
+            // with a warning, not silently ignored (I-2).
+            "id" => params.warnings.push(
+                "id: not supported via SSH ingress; the tunnel identity is your \
+                 authenticated SSH key/label"
+                    .to_string(),
+            ),
             "https" => params.https = value == "on",
             "force-https" => params.force_https = value == "on",
             k if TRANSPORT_ONLY_KEYS.contains(&k) => params.warnings.push(format!(
@@ -2324,6 +2451,7 @@ mod tests {
             authorized_keys_dir: None,
             passwords_file: None,
             banner: None,
+            window_size: SSH_DEFAULT_WINDOW_SIZE,
         }
     }
 
@@ -2530,6 +2658,76 @@ mod tests {
         // as webserver-log=.
         let params = parse_params(Some("https=yes"), &[], &grant("id"));
         assert!(!params.https);
+    }
+
+    #[test]
+    fn params_id_warns_not_silently_ignored() {
+        // `id=` is a documented native-client param, but over SSH ingress the
+        // identity is the authenticated key/label — honoring a client-supplied
+        // id would break the auth model, so it must WARN, never silently apply
+        // or silently drop (I-2). Regression guard for the dead-field bug.
+        let params = parse_params(Some("id=custom"), &[], &grant("real-id"));
+        assert_eq!(
+            params.warnings.len(),
+            1,
+            "id= must emit exactly one warning"
+        );
+        assert!(params.warnings[0].contains("id"));
+        assert!(
+            params.warnings[0].contains("not supported"),
+            "got: {}",
+            params.warnings[0]
+        );
+    }
+
+    #[test]
+    fn russh_config_uses_configured_window_and_beats_russh_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = base_config(dir.path());
+        cfg.passwords_file = Some(dir.path().join("passwords"));
+        let gw = build(cfg).unwrap();
+        let config = gw.russh_config();
+        assert_eq!(config.window_size, SSH_DEFAULT_WINDOW_SIZE);
+        assert_eq!(config.maximum_packet_size, SSH_MAX_PACKET_SIZE);
+        assert!(
+            config.window_size > 2 * 1024 * 1024,
+            "default window must exceed russh's own 2 MiB (the BDP cap we lift)"
+        );
+    }
+
+    #[test]
+    fn window_size_below_floor_is_clamped_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = base_config(dir.path());
+        cfg.passwords_file = Some(dir.path().join("passwords"));
+        cfg.window_size = 1; // absurdly small, would wedge a channel
+        let gw = build(cfg).unwrap();
+        assert_eq!(gw.russh_config().window_size, SSH_MIN_WINDOW_SIZE);
+    }
+
+    #[tokio::test]
+    async fn authentication_banner_reflects_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = base_config(dir.path());
+        cfg.passwords_file = Some(dir.path().join("passwords"));
+        cfg.banner = Some("welcome to bore".to_string());
+        let gw = Arc::new(build(cfg).unwrap());
+        let mut handler = gw.handler("127.0.0.1:2222".parse().unwrap());
+        assert_eq!(
+            handler.authentication_banner().await.unwrap(),
+            Some("welcome to bore".to_string()),
+            "configured --ssh-banner must reach the client (regression: the flag was dead)"
+        );
+
+        let mut cfg = base_config(dir.path());
+        cfg.passwords_file = Some(dir.path().join("passwords"));
+        let gw = Arc::new(build(cfg).unwrap());
+        let mut handler = gw.handler("127.0.0.1:2222".parse().unwrap());
+        assert_eq!(
+            handler.authentication_banner().await.unwrap(),
+            None,
+            "no banner configured must send nothing"
+        );
     }
 
     #[test]
@@ -2755,6 +2953,46 @@ mod tests {
             TakeoverOutcome::Proceed => panic!("native incumbent must never be evicted"),
         }
         assert!(registry.contains_key("label"), "native entry left intact");
+    }
+
+    #[test]
+    fn cancel_target_matches() {
+        // Public: exact (address, port) required; no port-agnostic fallback
+        // (two public forwards can share a bind address on different ports).
+        let keys = [("".to_string(), 9001u16), ("".to_string(), 9002u16)];
+        assert_eq!(
+            cancel_target(keys.iter(), "", 9001),
+            Some(("".to_string(), 9001))
+        );
+        assert_eq!(
+            cancel_target(keys.iter(), "", 9999),
+            None,
+            "public forward must not match a different port"
+        );
+
+        // Vhost/secret registered under the synthesized placeholder port 1;
+        // a client canceling with the original 0 (or any other port) still
+        // resolves to the unique entry sharing that address.
+        let keys = [("vhost/app".to_string(), 1u16)];
+        assert_eq!(
+            cancel_target(keys.iter(), "vhost/app", 0),
+            Some(("vhost/app".to_string(), 1)),
+            "vhost cancel with original port 0 must still find the placeholder entry"
+        );
+        assert_eq!(
+            cancel_target(keys.iter(), "vhost/app", 1),
+            Some(("vhost/app".to_string(), 1)),
+            "vhost cancel echoing the placeholder must also match"
+        );
+
+        let keys = [("secret/db".to_string(), 1u16)];
+        assert_eq!(
+            cancel_target(keys.iter(), "secret/db", 0),
+            Some(("secret/db".to_string(), 1))
+        );
+
+        // Unknown address matches nothing.
+        assert_eq!(cancel_target(keys.iter(), "vhost/other", 0), None);
     }
 
     #[test]

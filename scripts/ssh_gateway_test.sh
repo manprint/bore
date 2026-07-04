@@ -57,6 +57,7 @@ SERVER_IP="10.230.0.2"   # server-side of ns0↔nscli veth
 CLI_IP="10.230.0.1"      # nscli-side
 
 CTRL_PORT="7835"
+SSH_BANNER="bore-ssh-gateway-banner-marker"
 TMPDIR="/tmp/bore_sshgw_$$"
 
 PASS=0
@@ -115,6 +116,27 @@ wait_for_log() {
     return 1
 }
 
+# Send LINE to an echo tunnel at ip:port from nscli, RETRYING until it echoes
+# back or `tries` (default 15 × ~0.5s) elapse; echoes the last response.
+# `wait_port_up` only confirms the public LISTENER socket is bound — the
+# `forwarded-tcpip` channel round trip (server→client→local service→back) can
+# need a beat longer right after bind, so a single-shot `nc` was flaky on the
+# initial echo (the same startup-timing class the git log's PARAMS_GRACE /
+# ConnectTimeout stabilization fought; reproduced here as intermittent
+# "initial tunnel did not echo", confirmed present on the pre-bug-hunt baseline
+# too). The already-looped reconnect checks never flaked — this brings the
+# initial checks to the same robustness.
+echo_tunnel() {
+    local ip="$1" port="$2" line="$3" tries="${4:-15}"
+    local resp=""
+    for _ in $(seq 1 "$tries"); do
+        resp=$(echo "$line" | timeout 5 ip netns exec nscli nc -N -w2 "$ip" "$port" 2>/dev/null || echo "")
+        [ "$resp" = "$line" ] && break
+        sleep 0.5
+    done
+    echo "$resp"
+}
+
 # Curl the admin API from nscli (the server's control port is reachable there).
 # Usage: admin_curl <path>
 admin_curl() {
@@ -168,6 +190,7 @@ start_server() {
         --ssh-host-key-file "$TMPDIR/ssh_host_key.pem" \
         --ssh-authorized-keys-dir "$TMPDIR/keys" \
         --ssh-passwords-file "$TMPDIR/passwords" \
+        --ssh-banner "$SSH_BANNER" \
         --udp \
         >>"$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
@@ -370,7 +393,7 @@ if [ "$HAVE_AUTOSSH" = "1" ]; then
         "gwtest@$SERVER_IP" >"$TMPDIR/n2_autossh.log" 2>&1 &
     N2_PID=$!
     if wait_port_up nscli "$SERVER_IP" "$BIND2_PORT" 100; then
-        RESP=$(echo "n2-before" | timeout 5 ip netns exec nscli nc -N -w2 "$SERVER_IP" "$BIND2_PORT" 2>/dev/null || echo "")
+        RESP=$(echo_tunnel "$SERVER_IP" "$BIND2_PORT" "n2-before")
         [ "$RESP" = "n2-before" ] || fail "T-SSH-N2 initial tunnel did not echo (got '$RESP')"
 
         echo "  (killing server, restarting, waiting for autossh to reconnect...)"
@@ -559,7 +582,7 @@ if [ "$HAVE_SSHPASS" = "1" ]; then
         >"$TMPDIR/n6_ssh.log" 2>&1 &
     N6_PID=$!
     if wait_port_up nscli "$SERVER_IP" "$BIND6_PORT" 50; then
-        RESP=$(echo "n6-pw" | timeout 5 ip netns exec nscli nc -N -w2 "$SERVER_IP" "$BIND6_PORT" 2>/dev/null || echo "")
+        RESP=$(echo_tunnel "$SERVER_IP" "$BIND6_PORT" "n6-pw")
         if [ "$RESP" = "n6-pw" ]; then
             pass "T-SSH-N6 password-authenticated tunnel relays"
         else
@@ -584,6 +607,31 @@ if [ "$HAVE_SSHPASS" = "1" ]; then
 else
     echo "SKIP: T-SSH-N6 (sshpass not installed)"
 fi
+
+# ── T-SSH-N7: --ssh-banner delivered to the client ─────────────────────────
+# Regression guard: --ssh-banner used to be parsed and stored but never wired
+# into russh (the handler had no authentication_banner), so the flag was a
+# silent no-op. A stock OpenSSH client prints the pre-auth SSH_MSG_USERAUTH_
+# BANNER to stderr, so a healthy forward session must surface the marker.
+echo ""
+echo "=== Test: T-SSH-N7 (authentication banner delivered to client) ==="
+SVC7_PORT=19808
+spawn_echo_service "$SVC7_PORT" >/dev/null
+sleep 0.3
+BANNER_LOG="$TMPDIR/n7_banner.log"
+ip netns exec nscli ssh "${SSH_OPTS[@]}" -i "$CLIENT_KEY" \
+    -o BatchMode=yes -o ExitOnForwardFailure=yes \
+    -p "$CTRL_PORT" -N -R "0.0.0.0:19908:127.0.0.1:$SVC7_PORT" \
+    "gwtest@$SERVER_IP" >"$BANNER_LOG" 2>&1 &
+N7_PID=$!
+sleep 2
+if grep -qF "$SSH_BANNER" "$BANNER_LOG"; then
+    pass "T-SSH-N7 --ssh-banner reached the client"
+else
+    fail "T-SSH-N7 banner marker not seen in client output ($(head -c 200 "$BANNER_LOG" | tr '\n' ' '))"
+fi
+kill -9 "$N7_PID" 2>/dev/null || true
+wait "$N7_PID" 2>/dev/null || true
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""

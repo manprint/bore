@@ -717,6 +717,20 @@ enum Command {
         #[cfg(feature = "ssh-gateway")]
         #[clap(long, value_name = "TEXT", env = "BORE_SSH_BANNER")]
         ssh_banner: Option<String>,
+
+        /// Per-channel SSH flow-control window in bytes for the gateway. Each
+        /// proxied connection is one SSH channel, throughput-capped at
+        /// window/RTT; raise this to lift single-connection throughput on
+        /// high-latency links (costs memory per active connection). Default
+        /// 16 MiB; russh's own default is 2 MiB.
+        #[cfg(feature = "ssh-gateway")]
+        #[clap(
+            long,
+            value_name = "BYTES",
+            default_value_t = bore_cli::sshgw::SSH_DEFAULT_WINDOW_SIZE,
+            env = "BORE_SSH_WINDOW_SIZE"
+        )]
+        ssh_window_size: u32,
     },
 
     /// Diagnose this host's UDP / NAT / firewall for hole-punching (opens no
@@ -1926,6 +1940,8 @@ async fn dispatch(command: Command) -> Result<()> {
             ssh_passwords_file,
             #[cfg(feature = "ssh-gateway")]
             ssh_banner,
+            #[cfg(feature = "ssh-gateway")]
+            ssh_window_size,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -2148,6 +2164,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         authorized_keys_dir: ssh_authorized_keys_dir,
                         passwords_file: ssh_passwords_file,
                         banner: ssh_banner,
+                        window_size: ssh_window_size,
                     };
                     server.set_ssh_gateway(ssh_cfg)?;
                 }

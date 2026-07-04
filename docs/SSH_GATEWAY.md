@@ -114,7 +114,7 @@ Punti di innesto concreti già individuati:
 |---|---|
 | `src/sshgw.rs` (nuovo) | Server SSH russh: handshake, auth (chiavi/password), parsing `tcpip-forward`/`direct-tcpip`/`exec`/`env`, keepalive/reaper, mapping → registry bore |
 | Auth store | Lettura authorized-keys-dir + passwords-file a ogni tentativo (hot reload), cache per mtime |
-| Flag server | `--ssh-gateway`, `--ssh-host-key-file`, `--ssh-authorized-keys-dir`, `--ssh-passwords-file`, (opz.) `--ssh-banner` |
+| Flag server | `--ssh-gateway`, `--ssh-host-key-file`, `--ssh-authorized-keys-dir`, `--ssh-passwords-file`, (opz.) `--ssh-banner`, (opz.) `--ssh-window-size` |
 | Feature Cargo | `ssh-gateway` (russh + argon2 fuori dal binario di default) |
 
 **Invariante nuovo proposto (I-SSH1, sul modello di I-MC1/DEC-M1)**: `--ssh-gateway` assente
@@ -148,7 +148,7 @@ Valutazione onesta sui tre assi:
 
 | Asse | Tratto SSH | Note |
 |---|---|---|
-| **Banda** | Buona ma inferiore al nativo | 1 sola conn TCP (niente `--carriers`); finestra per-canale OpenSSH ~2 MiB ⇒ tetto teorico ≈ 2 MiB/RTT per connessione proxata (≈200 MB/s @10 ms, ≈20 MB/s @100 ms); crypto AES-GCM/chacha20 a line-rate su CPU moderne (multi-Gbps/core, non è il collo) |
+| **Banda** | Buona, vicina al nativo per singola connessione | 1 sola conn TCP (niente `--carriers`). La banda per-connessione è limitata dalla finestra di flow-control del canale SSH ≈ finestra/RTT. Il gateway alza la finestra lato server dai 2 MiB di default di russh a **16 MiB** (`--ssh-window-size`, `BORE_SSH_WINDOW_SIZE`) ⇒ ≈160 MB/s @100 ms per la direzione **server-riceve** (risposte del servizio locale → download del visitatore, il caso web dominante); la direzione opposta (upload verso il servizio) resta governata dalla finestra del **client OpenSSH**. Crypto AES-GCM/chacha20 a line-rate su CPU moderne (multi-Gbps/core, non è il collo) |
 | **Latenza** | Invariata | Nessun hop in più: il canale SSH termina nello stesso processo server; +1 framing trascurabile |
 | **Stabilità** | Equivalente al nativo | Con la ricetta §2.6: keepalive interno + `ServerAlive*` + autossh/systemd + takeover. La riconnessione è "ricrea tunnel" esattamente come `--auto-reconnect` |
 
@@ -157,6 +157,17 @@ Limiti strutturali del tratto SSH (non aggirabili):
   che `--carriers` risolve per il client nativo);
 - **cwnd condivisa**: tutte le connessioni proxate condividono una congestion window;
 - niente QUIC/UDP direct (→ §2.4).
+
+**Tuning finestra (`--ssh-window-size`, `BORE_SSH_WINDOW_SIZE`, byte, default 16 MiB):**
+è la finestra di ricezione per-canale annunciata dal server. Ogni connessione proxata è un
+canale SSH e il throughput della direzione *server-riceve* (client→server: le risposte del
+servizio locale, cioè i download) è limitato a ≈ finestra/RTT finché non arrivano i
+`WINDOW_ADJUST`. Alzarla migliora il throughput di singola connessione su link ad alto BDP
+(alta latenza), al costo di memoria per connessione attiva (è un tetto di credito, non una
+preallocazione: un tunnel idle o LAN non bufferizza nulla). Valori sotto una dimensione di
+pacchetto vengono clampati verso l'alto con un warning. La finestra della direzione opposta
+(upload verso il servizio locale) è governata dal client OpenSSH e non è configurabile lato
+server. `maximum_packet_size` resta il default SSH (32 KiB, negoziato al minimo tra i due peer).
 
 Conclusione: per "banda massima" il client bore nativo resta lo strumento; l'SSH gateway è la
 porta d'ingresso universale. Sono complementari, non alternativi.
@@ -266,7 +277,7 @@ Priorità proposta: **opzioni per-chiave** (authorized_keys) > **stringa comando
 | `--tcp-secret-id` | ✅ | bind_address di `-R` (provider) / host di `-L` (consumer) |
 | `--port` (public) | ✅ | Campo port di `-R` (`0` = assegnata dal server, riportata via SSH e stampata da OpenSSH: "Allocated port …") |
 | `--subdomain` (vhost) | ✅ | bind_address di `-R` |
-| `--id` (vhost client-id) | ✅ | param `id=` (default: fingerprint della chiave SSH) |
+| `--id` (vhost client-id) | ⚠️ | **Non supportato via SSH**: l'identità del tunnel (routing vhost + proprietà subdomain riservati) è la chiave/label SSH autenticata (`grant.identity`), mai un `id=` fornito dal client — onorarlo lascerebbe una chiave qualsiasi reclamare le route riservate di un'altra identità. Un `id=` esplicito produce un warning, non viene silenziosamente applicato né ignorato (I-SSH2). |
 | `--notes` | ✅ | param `notes=` |
 | `--max-conns` | ✅ | param `max-conns=` (semaforo lato gateway, parità col nativo) |
 | `--basic-auth` | ⚠️ | param `basic-auth=` — enforcement lato gateway, solo tunnel HTTP (vhost/public-http). §2.2 |

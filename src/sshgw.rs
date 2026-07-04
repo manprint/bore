@@ -1967,6 +1967,26 @@ async fn run_public_forward(
             .await
         {
             Ok(channel) => channel,
+            // `ChannelOpenFailure` (SSH_MSG_CHANNEL_OPEN_FAILURE) is the
+            // peer explicitly rejecting THIS ONE channel — most commonly
+            // `ConnectFailed` because the client's own local destination
+            // refused the connection (wrong port, service down/restarting,
+            // firewalled) — not a sign the control connection is dead.
+            // Killing the whole forward here means one bad connection
+            // attempt permanently drops every future connection until the
+            // client reconnects (found via a real repro: `spawn_echo_service`
+            // in `tests/ssh_gateway_test.rs` bound `"localhost"`, which
+            // resolved IPv6-only on a CI runner while `-R` specs target the
+            // literal IPv4 `127.0.0.1` — every proxied connection got a
+            // genuine `ConnectFailed` and nuked the tunnel for every
+            // subsequent connection too, incl. unrelated in-flight ones).
+            // Any OTHER error (`Disconnect`, `SendError`, IO failure — the
+            // channel-message channel closing under us) means the session
+            // really is gone, so `return` there is still correct.
+            Err(russh::Error::ChannelOpenFailure(reason)) => {
+                warn!(?reason, ?addr, "ssh-gateway: forwarded-tcpip channel rejected by client, dropping this connection");
+                continue;
+            }
             Err(err) => {
                 warn!(%err, "ssh-gateway: failed to open forwarded-tcpip channel, stopping forward");
                 return;

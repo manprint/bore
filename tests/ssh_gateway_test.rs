@@ -154,7 +154,7 @@ async fn free_port() -> Result<u16> {
 // PARAMS_GRACE's history in `src/sshgw.rs` for the same class of bug.
 async fn wait_port(port: u16, listening: bool) {
     for _ in 0..2000 {
-        if TcpStream::connect(("localhost", port)).await.is_ok() == listening {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() == listening {
             return;
         }
         time::sleep(Duration::from_millis(10)).await;
@@ -162,9 +162,18 @@ async fn wait_port(port: u16, listening: bool) {
 }
 
 /// A local TCP echo service standing in for the "service on localhost" that
-/// every named Phase 4.3 test forwards through the gateway.
+/// every named Phase 4.3 test forwards through the gateway. Binds the literal
+/// IPv4 loopback, not the `"localhost"` hostname: every `-R` spec in this
+/// suite targets `127.0.0.1` literally (`ssh_args`), and on a host where
+/// `"localhost"` resolves IPv6-first/-only (observed on GH Actions' hosted
+/// runners, not reproducible on every dev machine) `TcpListener::bind` would
+/// bind `[::1]` only — the real `ssh` client's own local connect attempt to
+/// `127.0.0.1:<port>` then gets a genuine `ECONNREFUSED`, which surfaces as
+/// `russh::Error::ChannelOpenFailure` on the server and (pre-hardening, see
+/// `run_public_forward` in `src/sshgw.rs`) tore down the whole forward. This
+/// was the actual root cause of every CI failure in this suite, not a race.
 async fn spawn_echo_service() -> Result<u16> {
-    let listener = TcpListener::bind("localhost:0").await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     tokio::spawn(async move {
         loop {

@@ -427,6 +427,14 @@ external assets are fetched.
 Annotate any tunnel with `--notes "..."` (on `bore local` or `bore proxy`) to label
 it on this page.
 
+#### SSH ingress gateway (no `bore` client needed)
+
+Build with `--features ssh-gateway` and start the server with `--ssh-gateway` to let a
+stock OpenSSH client create public, vhost, and secret tunnels with `ssh -R`/`-L` — no
+`bore` binary on the client side, just `ssh`/`autossh` and a key or password. Full setup,
+`~/.ssh/config` examples, systemd unit, and troubleshooting: see
+[`docs/SSH_GATEWAY.md`](docs/SSH_GATEWAY.md).
+
 ### Secret tunnels (no public port)
 
 Instead of exposing your service on a public port, you can publish it under a

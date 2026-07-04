@@ -1,7 +1,9 @@
-# SSH Access Gateway per bore — Documento di analisi
+# SSH Access Gateway per bore
 
-> **Stato**: analisi di fattibilità — NESSUNA implementazione.
-> **Data**: 2026-07-03 · branch `dev`
+> **Stato**: **implementato** (feature `ssh-gateway`, branch `ssh`). §§0-5 restano il documento
+> di analisi originale (record di design); §6 è la guida operativa, scritta dopo
+> l'implementazione e verificata comando per comando contro un server locale reale.
+> **Data analisi**: 2026-07-03 · **Data implementazione**: 2026-07-04
 > **Scopo**: valutare un gateway SSH di ingresso per creare tunnel **public**, **secret** e
 > **vhost** usando un normale client `ssh`/`autossh`, senza binario `bore` sul lato client.
 
@@ -521,6 +523,12 @@ Domanda residua (non bloccante per il piano): **porta 7835** — mantenerla espo
 retro-compatibilità dei client nativi esistenti o consolidare tutto su 443? Default proposto:
 mantenerla nel compose finché i client in campo non sono migrati, poi rimuoverla dal mapping.
 
+**Risoluzione (2026-07-04):** 7835 resta esposta nei compose file di default (vedi
+`docker/docker-compose.server.yml`/`docker-compose.server.prod.yml`) — nessun client nativo
+esistente deve cambiare `--to`. Il gateway SSH non richiede una porta dedicata: senza
+`--ssh-port`, il demux (§2.3, implementato in `src/sshgw.rs`/`src/server.rs`) lo instrada sulla
+STESSA porta di controllo già pubblicata (7835 e/o 443, a seconda della topologia).
+
 ---
 
 ## 5. Riferimenti
@@ -532,3 +540,233 @@ mantenerla nel compose finché i client in campo non sono migrati, poi rimuoverl
   stream), `secret.rs:254/441/688` (provider/consumer/relay), `vhost.rs:160/536/772/1168`
   (routing/registrazione/relay), `admin_http.rs:46` (byte-peek HTTP), `prefixed.rs` (replay),
   `auth.rs` (HMAC nativo), `shared.rs` (CONTROL_PORT, heartbeat/timeout)
+
+---
+
+## 6. Guida operativa
+
+> Ogni comando in questa sezione è stato eseguito davvero contro un `bore server` locale
+> (build `--release --features vpn,ssh-gateway`) durante la stesura — gli output riportati
+> sono reali, non ricostruiti a mano.
+
+### 6.1 Avvio del server
+
+```
+bore server \
+    --control-port 7835 \
+    --admin-token "$(openssl rand -hex 24)" \
+    --vhost-base-domain bore.example.com --vhost-http-port 7835 \
+    --ssh-gateway \
+    --ssh-host-key-file /etc/bore/ssh/host_key.pem \
+    --ssh-authorized-keys-dir /etc/bore/ssh/authorized_keys.d \
+    --ssh-passwords-file /etc/bore/ssh/passwords
+```
+
+Al primo avvio, se `--ssh-host-key-file` non esiste ancora, viene generato e il fingerprint
+loggato (formato reale osservato):
+
+```
+INFO bore_cli::sshgw: ssh-gateway: generated new ed25519 host key path=/etc/bore/ssh/host_key.pem
+INFO bore_cli::sshgw: ssh-gateway: host key ready path=/etc/bore/ssh/host_key.pem fingerprint=SHA256:3a5zdjovpFe3Y/XtIiDSgigHLPvbB3OekBd1g7QdLJw
+```
+
+`--ssh-gateway` richiede **almeno una** fra `--ssh-authorized-keys-dir`/`--ssh-passwords-file`
+— senza nessuna delle due il server fallisce all'avvio (fail-fast, non un gateway silenziosamente
+inaccessibile). Senza `--ssh-port`, SSH è servito in demux sulla STESSA porta di controllo
+(§2.3/§6.6) — nessuna porta aggiuntiva da aprire nel firewall.
+
+### 6.2 Provisioning di una chiave cliente
+
+```
+ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519_bore -C "laptop"
+```
+
+Copiare la SOLA pubkey (`~/.ssh/id_ed25519_bore.pub`) in un file dentro
+`--ssh-authorized-keys-dir` (un file per operatore o per gruppo — `KeyStore` legge OGNI file
+extensionless o `.pub` nella directory, non serve un unico `authorized_keys` monolitico):
+
+```
+# /etc/bore/ssh/authorized_keys.d/laptop
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOM1XMK7LrZvfZ+evuz//FtdfjgeVCphVmy1d95Ze0Ov laptop
+```
+
+Il commento finale della riga (`laptop` sopra) diventa l'**identità** usata per il logging
+admin (`identity` nella riga `/admin/api/v1/*`) e per il takeover a parità di identità (D-SSH2,
+§6.5). Opzioni per-chiave (tutte facoltative, davanti alla chiave, separate da spazio):
+
+```
+permit="vhost/laptop-*",max-conns=50,notes="dev laptop" ssh-ed25519 AAAA... laptop
+```
+
+### 6.3 Password auth (alternativa/aggiuntiva alle chiavi)
+
+```
+$ echo -n 'correct-horse-battery-staple' | bore hash-password
+$argon2id$v=19$m=19456,t=2,p=1$aiFZvnWxcXKlASwnEMrDwQ$SG8n3dO+w9RDJv9poqlI+kGkLfLQVt5dsuxwURkvPno
+add to the passwords file as: <label>:$argon2id$v=19$m=19456,t=2,p=1$aiFZvnWxcXKlASwnEMrDwQ$SG8n3dO+w9RDJv9poqlI+kGkLfLQVt5dsuxwURkvPno
+```
+
+Aggiungere la riga `<label>:<hash>` esattamente come stampata al file puntato da
+`--ssh-passwords-file` (mai la password in chiaro sul disco — solo l'hash argon2id). Il file è
+ricaricato ad ogni tentativo di autenticazione (hot-reload "by construction", D-SSH3), quindi
+aggiungere/ruotare una password non richiede il riavvio del server.
+
+Login con password reale (verificato):
+
+```
+$ sshpass -p 'wrong-password' ssh -p 7835 -N -R 9999:localhost:8080 alice@bore.example.com
+alice@bore.example.com: Permission denied (publickey,hostbased,keyboard-interactive).
+```
+
+```
+$ sshpass -p 'correct-horse-battery-staple' ssh -p 7835 -N -R 9998:localhost:8080 alice@bore.example.com &
+$ curl localhost:9998/
+hello
+```
+
+### 6.4 `~/.ssh/config`
+
+```
+Host bore
+    HostName bore.example.com
+    Port 7835
+    User tunnel
+    IdentityFile ~/.ssh/id_ed25519_bore
+    IdentitiesOnly yes
+    ServerAliveInterval 20
+    ServerAliveCountMax 3
+    ExitOnForwardFailure yes
+```
+
+`User` è ignorato lato server (l'auth è solo per chiave/password — nessun controllo sullo
+username SSH), sceglierne uno qualsiasi che ricordi lo scopo. Poi:
+
+```
+ssh -N -R vhost/myapp:0:localhost:8080 bore    # vhost
+ssh -N -R 9005:localhost:8080 bore              # public
+ssh -N -R secret/tcp-id:0:localhost:8080 bore   # secret provider
+ssh -N -L 8899:tcp-id:1 bore                    # secret consumer (porta finale IGNORATA, deve essere solo != 0)
+```
+
+### 6.5 Esempio verificato: tunnel vhost end-to-end
+
+```
+$ ssh -i id_ed25519_bore -p 7835 -N -f -R vhost/mysub:0:localhost:18080 localhost
+$ curl -H "Host: mysub.bore.example.com" http://<server>:7835/
+hello
+$ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://<server>:7835/admin/status/data \
+    | python3 -m json.tool | grep -A2 '"transport"'
+            "transport": "ssh",
+            "identity": "laptop"
+```
+
+**Takeover a parità di identità** (D-SSH2, verificato): una SECONDA sessione con la STESSA
+chiave che richiede lo STESSO nome sostituisce la prima invece di essere rifiutata — utile per
+`autossh`/riconnessioni deterministiche dopo un riavvio di rete:
+
+```
+$ ssh -i id_ed25519_bore -p 7835 -N -R vhost/mysub:0:localhost:18080 localhost
+Allocated port 1 for remote forward to localhost:18080
+```
+
+(la prima sessione viene sfrattata silenziosamente sul lato server; la porta `1` è il
+placeholder RFC 4254 per un forward vhost, che non ha una vera porta in ascolto — vedi §2.7).
+
+Con `permit=` restrittivo, un'etichetta non concessa è rifiutata (verificato, chiave con
+`permit="vhost/allowed-*"` che prova `vhost/notallowed`):
+
+```
+$ ssh -i id_restricted -p 7835 -N -R vhost/notallowed:0:localhost:18080 localhost
+Error: remote port forwarding failed for listen port 0
+```
+
+mentre un'etichetta che rientra nel pattern funziona:
+
+```
+$ ssh -i id_restricted -p 7835 -N -f -R vhost/allowed-app:0:localhost:18080 localhost
+$ curl -H "Host: allowed-app.bore.example.com" http://<server>:7835/
+hello
+```
+
+### 6.6 SSH-over-TLS (D-SSH4)
+
+Per client dietro un DPI/firewall che permette solo TLS in uscita, o quando la porta 443 è
+condivisa con TLS nativo (§2.3): usare `ProxyCommand` con `openssl s_client` per incapsulare
+la sessione SSH dentro una connessione TLS verso lo stesso control port:
+
+```
+ssh -o ProxyCommand='openssl s_client -quiet -verify_quiet -connect bore.example.com:443' \
+    -N -R vhost/myapp:0:localhost:8080 dummy-host
+```
+
+`-verify_quiet` accetta anche un certificato non verificabile localmente (comodo per un
+self-signed di test); in produzione con un certificato CA-emesso lasciare la verifica attiva
+rimuovendo il flag. Il server rileva il prefisso `SSH-` dopo l'handshake TLS e instrada al
+gateway (`demux_post_tls`, 6.2) esattamente come sul percorso plain.
+
+### 6.7 systemd (client persistente con autossh)
+
+```ini
+# /etc/systemd/system/bore-tunnel.service
+[Unit]
+Description=bore SSH tunnel (autossh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=AUTOSSH_GATETIME=0
+Environment=AUTOSSH_POLL=30
+ExecStart=/usr/bin/autossh -M 0 \
+    -o "ServerAliveInterval=20" -o "ServerAliveCountMax=3" \
+    -o "ExitOnForwardFailure=yes" -o "StrictHostKeyChecking=yes" \
+    -i /etc/bore/client_key -p 7835 \
+    -N -R vhost/myapp:0:localhost:8080 tunnel@bore.example.com
+Restart=always
+RestartSec=5
+User=bore-client
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`AUTOSSH_GATETIME=0` disabilita il periodo di grazia iniziale di autossh (altrimenti un fallimento
+nei primi 30s non viene considerato "instabile" e non fa ripartire subito) — utile perché il
+takeover (D-SSH2) rende una riconnessione rapida sicura anche se la sessione precedente non è
+ancora scaduta. `StrictHostKeyChecking=yes` con un `known_hosts` pre-popolato (§6.8) è la scelta
+corretta in produzione — l'esempio con `no` nel resto di questa guida è solo per i comandi ad-hoc
+di verifica.
+
+### 6.8 Fingerprint pinning dell'host key
+
+Il fingerprint stampato all'avvio (§6.1) va fissato lato client invece di fidarsi del
+TOFU (trust-on-first-use) di default:
+
+```
+$ ssh-keygen -l -E sha256 -f /etc/bore/ssh/host_key.pem
+256 SHA256:3a5zdjovpFe3Y/XtIiDSgigHLPvbB3OekBd1g7QdLJw (ED25519)
+```
+
+Popolare `known_hosts` sul client una volta, offline (non via `ssh` interattivo la prima volta):
+
+```
+echo "bore.example.com:7835 ssh-ed25519 AAAA...<pubkey del server, non del client>" >> ~/.ssh/known_hosts
+```
+
+La pubkey del server si ricava da `ssh-keyscan -p 7835 bore.example.com` la prima volta **su un
+canale fidato** (es. dalla stessa macchina server, o via un canale out-of-band) — poi ogni
+riconnessione verifica contro quella riga fissa, non contro un nuovo TOFU.
+
+### 6.9 Troubleshooting
+
+| Messaggio / sintomo | Causa | Rimedio |
+|---|---|---|
+| `Error: remote port forwarding failed for listen port 0` | `permit=` della chiave non copre l'etichetta richiesta, oppure l'etichetta è già presa da un'identità DIVERSA (mai da un tunnel nativo — trust domain diversi) | Controllare `permit=` nel file authorized_keys della chiave; se il nome è legittimamente conteso, usare un'etichetta diversa |
+| `bore ssh-gateway: this key's permit= list does not allow vhost/<label>` (visibile solo se il client apre un canale sessione, es. senza `-N`) | come sopra | come sopra |
+| `bore ssh-gateway: subdomain '<label>' already in use` / `tcp-secret-id '<id>' already in use` | stessa etichetta già registrata da un'identità diversa | scegliere un'altro nome, o autenticarsi con la STESSA chiave/label del detentore per un takeover legittimo |
+| `alice@host: Permission denied (publickey,hostbased,keyboard-interactive)` | chiave non in nessun file di `--ssh-authorized-keys-dir`, o password errata/non nel formato `label:$argon2id$...` | verificare che il file authorized_keys contenga la pubkey esatta; rigenerare l'hash con `bore hash-password` |
+| `bore ssh-gateway: <flag>: not available via SSH ingress; use the native bore client` | uno tra `udp`/`carriers`/`stun-server`/`upnp`/`try-port-prediction`/`nat-udp-preferred-port`/`auto-reconnect` passato via `exec`/env — non disponibile sul tratto SSH (§2.2/I-SSH2) | usare il client bore nativo per quella funzionalità, oppure ignorare l'avviso se il default va bene |
+| `bore ssh-gateway: <key>: unknown parameter` | typo in un parametro `exec`/env, o parametro non ancora supportato | controllare l'elenco parametri in §3/CLAUDE.md |
+| Il tunnel si blocca dopo ~60s di silenzio di rete e il forward sparisce dall'admin | comportamento CORRETTO — reaper keepalive (I-SSH3, `SSH_CTRL_TIMEOUT`=60s); non un bug | usare `autossh`/`ServerAliveInterval` lato client per mantenerlo vivo attraverso interruzioni di rete transitorie |
+| `ssh: connect to host ... port 443: Connection refused` con `ProxyCommand openssl s_client` | il server non ha TLS configurato su quella porta, o `--ssh-gateway` non è abilitato | verificare `--cert-file`/`--key-file` sul server e che la porta sia quella del control port |
+| Nessun banner SSH entro qualche secondo su una connessione raw (diagnostica) | il gateway non è abilitato su quella porta, o si sta parlando con la porta sbagliata | connettersi al control port corretto; senza `--ssh-gateway` il comportamento è quello bore nativo (nessun demux) |

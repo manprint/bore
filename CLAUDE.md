@@ -476,5 +476,58 @@ branch `android`; Phases 1-5 done — only manual physical-device acceptance rem
   no pipeline change needed. The only remaining work on this plan is running
   T-AND-M1..M5 by hand on physical hardware (tracked in `resume.md`).
 
+**SSH ingress gateway (`--ssh-gateway`, feature `ssh-gateway`, branch `ssh`, IMPLEMENTED
+2026-07-04 — Phases 1-7 done, `docs/SSH_GATEWAY.md` §6 is the operational guide):** embeds a
+`russh` server in `bore server` so a stock OpenSSH client (`ssh -R`/`-L`, no `bore` binary) can
+create public/vhost/secret tunnels. Ingress-only: from the accepted SSH channel inward, reuses
+the existing registries/relay/admin/weblog/`--max-conns` data path unmodified.
+- **D1 (naming heuristic, `parse_forward_spec`, `src/sshgw.rs`):** bare numeric port ⇒ public;
+  bare label + port 80/443 ⇒ vhost; bare label + port 0 ⇒ secret provider; any other bare-label
+  port is ambiguous and rejected. `vhost/<label>`/`secret/<id>` prefixes in the bind address
+  override the heuristic explicitly, any port. `direct-tcpip` (`-L`) to `<id>`/`secret/<id>`
+  is always a secret consumer (port is an ignored nonzero placeholder — OpenSSH's `-L` CLI
+  rejects a literal `0`, unlike `-R`).
+- **SSH leg = TCP relay only, never UDP/carriers.** No `--udp`/QUIC direct path, no
+  `--carriers>1`, no hole-punch flags on the SSH leg — those are native-bore-client-only
+  features; a client naming one via `exec`/env gets an explicit warning (I-SSH2), never silent
+  drop. A native client and an SSH client can still coexist on the same tunnel name space and
+  even the same demuxed port simultaneously.
+- **I-SSH1:** `--ssh-gateway` off (or the `ssh-gateway` feature compiled out) ⇒ the control-port
+  accept path is BYTE-IDENTICAL to before this feature existed — confirmed by `git diff` showing
+  zero removed lines in the legacy accept loop (`src/server.rs`), not just "no visible bugs".
+- **I-SSH2:** every client-transport-only parameter named via `exec`/`SetEnv`/authorized-keys
+  options gets an explicit warning line, never silently ignored or misapplied.
+- **I-SSH3:** keepalive 20s / reaper 60s in parity with the native secret-tunnel zombie-entry
+  invariant — no ghost admin rows. A REAL netfilter half-open (not a process kill) exposed a
+  genuine bug here: the vhost/secret finalize task's own strong `Arc<ConnState>` clone (held
+  for the task's entire `pending()`-forever lifetime) created a reference cycle that kept
+  `Drop for ConnState` (which aborts every task in `self.forwards`) from ever firing on an
+  ungraceful connection death. Fixed with an explicit `drop(state)` before each `pending()` tail
+  in `src/sshgw.rs` — found and verified by `scripts/ssh_gateway_test.sh`'s T-SSH-N1, which
+  cargo tests structurally cannot reproduce (no real network stack to netfilter-DROP).
+- **I-SSH4:** `mux::LinkOpener::Ssh`/`SshOpener::open` never writes the yamux `STREAM_READY`
+  marker byte — SSH has no equivalent framing; the caller IP travels as the channel-open
+  request's own originator-IP field instead.
+- **I-SSH5 (D-SSH2):** same-identity takeover — a new SSH session authenticated with the SAME
+  identity (authorized-keys comment, or password label) as the incumbent holder of a vhost
+  label/secret id evicts and replaces it (useful for deterministic `autossh` reconnection); a
+  DIFFERENT identity, or a name held by a *native* (non-SSH) tunnel, is always rejected — SSH
+  identities and the HMAC secret are different trust domains, never mixed.
+- **Control-port demux (D8, Phase 6):** with the gateway enabled, `sshgw::demux_pre_tls` peeks
+  the first byte (2s timeout — a real SSH client waits for the server's own banner and sends
+  nothing first, sslh-style) and 3-way classifies it: `Ssh` (timeout or `b'S'`) dispatches
+  straight to the gateway; `Tls` (0x16) goes through the configured TLS acceptor, then a second
+  4-byte peek (`demux_post_tls`) checks for a literal `SSH-` prefix (SSH-over-TLS via a
+  `ProxyCommand openssl s_client` tunnel, D4); anything else (`Direct`: HTTP/bore) routes
+  STRAIGHT to `route_connection`, BYPASSING any configured TLS acceptor entirely — this is what
+  lets a plain HTTP/bore client keep working on a port that also serves TLS. `SshGateway::
+  serve_connection` is generic over `mux::Transport` so it runs identically over `TcpStream`,
+  `Prefixed<TcpStream>`, and a `TlsStream`.
+- Regression/e2e: `tests/ssh_gateway_test.rs` (cargo, 19 tests incl. takeover, demux, SSH-over-TLS)
+  + `sudo -n /abs/path/scripts/ssh_gateway_test.sh` (netns chaos: T-SSH-N1..N6 — real netfilter
+  half-open, autossh recovery across a server restart, takeover under partition, mixed
+  transports on one port, throughput report, password auth). Exact-path sudo invocation only
+  (`sudo bash scripts/...` prompts and must not be used).
+
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`
 (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.

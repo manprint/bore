@@ -1080,16 +1080,20 @@ impl Server {
                                 let gateway = Arc::clone(&gateway);
                                 tokio::spawn(async move {
                                     let _permit = permit;
-                                    let config = gateway.russh_config();
-                                    let handler = gateway.handler(addr);
-                                    match russh::server::run_stream(config, stream, handler).await {
-                                        Ok(session) => {
-                                            if let Err(err) = session.await {
-                                                debug!(%err, %addr, "ssh gateway session ended");
-                                            }
+                                    match gateway.serve_connection(stream, addr).await {
+                                        Ok(()) => {}
+                                        // Zombie-entry reaper (I-3): russh's own
+                                        // keepalive_max tripped, tuned to fire at
+                                        // sshgw::SSH_CTRL_TIMEOUT — worth a warn!,
+                                        // unlike an ordinary client-initiated close.
+                                        Err(
+                                            err @ (russh::Error::KeepaliveTimeout
+                                            | russh::Error::InactivityTimeout),
+                                        ) => {
+                                            warn!(%err, %addr, "ssh gateway: reaped unresponsive connection");
                                         }
                                         Err(err) => {
-                                            debug!(%err, %addr, "ssh gateway handshake failed");
+                                            debug!(%err, %addr, "ssh gateway session ended");
                                         }
                                     }
                                 });

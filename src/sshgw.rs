@@ -41,8 +41,20 @@ pub const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 /// Silence duration after which an SSH gateway connection is treated as dead
 /// and torn down (all its forwards, registry entries and admin rows released).
 /// Parity with `SECRET_CTRL_TIMEOUT` (`src/secret.rs`) — the same zombie-entry
-/// reaper invariant applies here (I-SSH3).
+/// reaper invariant applies here (I-SSH3). Enforced by russh's own
+/// `keepalive_max` (see `SSH_KEEPALIVE_MAX_MISSES` and
+/// `SshGateway::russh_config`'s doc), not a from-scratch timer.
 pub const SSH_CTRL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `russh::server::Config::keepalive_max`: number of consecutive unanswered
+/// server keepalive probes tolerated before russh disconnects the
+/// connection on the next one. Derived so the fatal probe lands at
+/// `SSH_CTRL_TIMEOUT`: russh disconnects once `alive_timeouts >
+/// keepalive_max`, and `alive_timeouts` increments once per
+/// `SSH_KEEPALIVE_INTERVAL` tick, so the `(SSH_KEEPALIVE_MAX_MISSES + 1)`-th
+/// tick is the fatal one.
+pub const SSH_KEEPALIVE_MAX_MISSES: usize =
+    (SSH_CTRL_TIMEOUT.as_secs() / SSH_KEEPALIVE_INTERVAL.as_secs()) as usize - 1;
 
 /// Grace period given to a freshly-accepted connection to complete
 /// authentication before it is disconnected.
@@ -201,13 +213,47 @@ impl SshGateway {
     }
 
     /// A fresh `russh::server::Config` for one accepted connection: the
-    /// loaded host key, the pre-auth grace period, and the auth-attempt cap.
-    /// Keepalive tuning (`keepalive_interval`/`keepalive_max`) is set in
-    /// Phase 4.4 (I-SSH3).
+    /// loaded host key, the pre-auth grace period, the auth-attempt cap, and
+    /// the zombie-entry reaper (I-3).
+    ///
+    /// The reaper is entirely russh's own built-in keepalive machinery —
+    /// `keepalive_interval`/`keepalive_max` — NOT a from-scratch
+    /// `last_inbound`-style tracker driven by `Handler` callbacks. That was
+    /// tried first and reverted: russh calls no `Handler` method at all for
+    /// either side's keepalive traffic (a client's own `ServerAliveInterval`
+    /// probe is an unrecognized `GLOBAL_REQUEST` auto-replied
+    /// `REQUEST_FAILURE` internally; the reply to *our* probe is consumed by
+    /// the same internal match with an explicit "ignore keepalives" comment
+    /// — confirmed by reading `russh::server::session::Session::run` and
+    /// `encrypted::reply`). A callback-driven tracker can therefore never see
+    /// a purely keepalive-sustained idle connection as alive, and would
+    /// falsely reap not just an idle tunnel but any tunnel that has been
+    /// relaying real forwarded traffic for over `SSH_CTRL_TIMEOUT` without a
+    /// *new* client request in between (forwarded-tcpip data flows over a
+    /// server-opened channel via the gateway's own finalize task, which
+    /// never touches a client-driven tracker either).
+    ///
+    /// `alive_timeouts` (the counter `keepalive_max` gates on) is immune to
+    /// exactly the failure mode that motivated a custom tracker in the first
+    /// place: it resets only on `common.received_data`, which is set from
+    /// genuinely decoded incoming packets and NOT from this connection's own
+    /// internal `Handle`-driven dispatch (e.g. `channel_open_forwarded_tcpip`
+    /// for a newly accepted public connection) — so a "busy tunnel, dead
+    /// client" connection still gets reaped on schedule. `keepalive_max` is
+    /// tuned so the 3rd unanswered probe (at `keepalive_max + 1` intervals)
+    /// lands at `SSH_CTRL_TIMEOUT`.
+    ///
+    /// `inactivity_timeout` stays at `SSH_PREAUTH_GRACE` and is shared across
+    /// the whole connection lifetime (pre- and post-auth) — that field alone
+    /// resets on any internal dispatch and so cannot substitute for the
+    /// keepalive-based reaper post-auth, but it still correctly guards the
+    /// pre-auth phase, where no internal dispatch exists yet.
     pub fn russh_config(&self) -> Arc<russh::server::Config> {
         Arc::new(russh::server::Config {
             keys: vec![self.host_key.clone()],
             inactivity_timeout: Some(SSH_PREAUTH_GRACE),
+            keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
+            keepalive_max: SSH_KEEPALIVE_MAX_MISSES,
             max_auth_attempts: SSH_MAX_AUTH_ATTEMPTS,
             ..Default::default()
         })
@@ -224,6 +270,21 @@ impl SshGateway {
             grant: None,
             state: Arc::new(ConnState::default()),
         }
+    }
+
+    /// Accept-to-completion for one SSH gateway connection: builds the
+    /// `Handler` and drives the russh session (whose own keepalive/reaper
+    /// timers are configured by `russh_config`, see its doc for I-3).
+    pub async fn serve_connection(
+        self: &Arc<Self>,
+        stream: tokio::net::TcpStream,
+        addr: SocketAddr,
+    ) -> Result<(), russh::Error> {
+        let config = self.russh_config();
+        let handler = self.handler(addr);
+        russh::server::run_stream(config, stream, handler)
+            .await?
+            .await
     }
 }
 
@@ -1331,5 +1392,27 @@ mod tests {
             .expect("auto-assign within an unrestricted range must succeed");
         let port = listener.local_addr().unwrap().port();
         assert!((20000..=20010).contains(&port));
+    }
+
+    #[test]
+    fn keepalive_max_misses_lands_on_ctrl_timeout() {
+        // The (SSH_KEEPALIVE_MAX_MISSES + 1)-th missed probe is the fatal
+        // one (russh disconnects once alive_timeouts > keepalive_max), so
+        // that many intervals must equal SSH_CTRL_TIMEOUT exactly (I-3).
+        let fatal_tick = SSH_KEEPALIVE_INTERVAL * (SSH_KEEPALIVE_MAX_MISSES as u32 + 1);
+        assert_eq!(fatal_tick, SSH_CTRL_TIMEOUT);
+    }
+
+    #[test]
+    fn russh_config_wires_keepalive_reaper() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = base_config(dir.path());
+        cfg.passwords_file = Some(dir.path().join("passwords"));
+        let gw = build(cfg).unwrap();
+        let config = gw.russh_config();
+        assert_eq!(config.keepalive_interval, Some(SSH_KEEPALIVE_INTERVAL));
+        assert_eq!(config.keepalive_max, SSH_KEEPALIVE_MAX_MISSES);
+        assert_eq!(config.inactivity_timeout, Some(SSH_PREAUTH_GRACE));
+        assert_eq!(config.max_auth_attempts, SSH_MAX_AUTH_ATTEMPTS);
     }
 }

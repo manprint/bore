@@ -568,3 +568,114 @@ async fn t_ssh_cancel1_session_close_frees_forwards() -> Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// T-SSH-PREAUTH1 — a connection that never completes the SSH handshake is
+// disconnected unilaterally by russh's `inactivity_timeout` (`SSH_PREAUTH_GRACE`,
+// set in `SshGateway::russh_config`), not left to hang forever. Pure raw-socket
+// probe: no real `ssh` client involved, so no `skip_without_ssh_cli!()`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_preauth1_stalled_handshake_is_disconnected() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+
+    let gw_port = start_gateway_server(dir.path().join("host_key"), auth_dir).await?;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", gw_port)).await?;
+    stream
+        .write_all(b"SSH-2.0-t-ssh-preauth1-probe\r\n")
+        .await?;
+
+    // Never send another byte, never complete key exchange. The gateway's
+    // own version banner may arrive first; keep draining until it closes
+    // the socket (or errors) rather than expecting an immediate EOF.
+    let closed = time::timeout(Duration::from_secs(35), async {
+        let mut buf = [0u8; 64];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => return,
+                Ok(_) => continue,
+                Err(_) => return,
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "gateway did not disconnect a stalled pre-auth handshake within SSH_PREAUTH_GRACE + margin"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-KEEP1 — an idle, authenticated `-N -R` session with zero tunnel
+// traffic survives well past `SSH_CTRL_TIMEOUT` (60s) on `ServerAliveInterval`
+// keepalives alone, and the tunnel still relays afterwards (I-3: the reaper
+// must not fire on a healthy connection — see `SshGateway::russh_config`'s
+// doc for why this is russh's own `keepalive_max`, not a callback-driven
+// tracker).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_keep1_idle_session_survives_ctrl_timeout() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(&auth_dir, &client_priv, None)?;
+
+    let gw_port = start_gateway_server(dir.path().join("host_key"), auth_dir).await?;
+    let svc_port = spawn_echo_service().await?;
+
+    let fwd_port = 19012u16;
+    let mut args = vec![
+        "-o".into(),
+        "ServerAliveInterval=15".to_string(),
+        "-o".into(),
+        "ServerAliveCountMax=6".to_string(),
+    ];
+    args.extend(ssh_args(
+        gw_port,
+        &client_priv,
+        &[(fwd_port, svc_port)],
+        None,
+    ));
+    let mut child = Command::new("ssh")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh -R with ServerAlive keepalives (T-SSH-KEEP1)")?;
+
+    wait_port(fwd_port, true).await;
+    assert!(
+        roundtrip(fwd_port, b"ping-keep1-before").await?,
+        "forward not live before the idle window"
+    );
+
+    // Zero tunnel traffic for well past SSH_CTRL_TIMEOUT (60s): only the
+    // client's own ServerAliveInterval keepalives (invisible to any
+    // Handler callback) keep the connection alive on russh's side.
+    time::sleep(Duration::from_secs(90)).await;
+
+    assert!(
+        roundtrip(fwd_port, b"ping-keep1-after").await?,
+        "idle session was reaped despite healthy keepalives"
+    );
+
+    child.kill().await.ok();
+    Ok(())
+}

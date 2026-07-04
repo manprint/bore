@@ -32,9 +32,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # `--features vpn` is additive (keeps default `udp`); the one binary drives
-      # every script (vpn/vhost/secret/local/admin).
-      - run: cargo build --release --features vpn
+      # `--features vpn,ssh-gateway` is additive (keeps default `udp`); the
+      # one binary drives every script (vpn/vhost/secret/local/admin/ssh_gateway).
+      - run: cargo build --release --features vpn,ssh-gateway
       - uses: actions/upload-artifact@v4
         with:
           name: bore-bin
@@ -57,6 +57,7 @@ jobs:
           - { script: secret_netns_test,         secs: 1200 }
           - { script: vhost_netns_test,          secs: 1200 }
           - { script: vhost_netns_test_hard,     secs: 1200 }
+          - { script: ssh_gateway_test,          secs: 1200 }
           # regression gate for the carriers=1 vhost/local --udp connection-window
           # stall (R3: a fast request must complete <3 s while slow readers pin
           # the shared QUIC connection window). Guards commit 04aac76.
@@ -90,10 +91,15 @@ jobs:
           chmod +x scripts/*.sh
           # socat / iperf3 are required by the netns tests (else they SKIP);
           # wrk is an optional load generator for the bench scripts (they fall
-          # back to timeout-guarded curl loops when absent).
+          # back to timeout-guarded curl loops when absent). openssh-client
+          # ships preinstalled on the ubuntu-latest image; autossh/sshpass do
+          # not, and ssh_gateway_test.sh's T-SSH-N2/N6 skip (not fail) without
+          # them, so the install failing softly here just narrows coverage,
+          # never breaks the run.
           sudo apt-get update -qq
           sudo apt-get install -y -qq socat iperf3
           sudo apt-get install -y -qq wrk || true
+          sudo apt-get install -y -qq autossh sshpass || true
           test -c /dev/net/tun || sudo modprobe tun
           sudo modprobe nf_tables || true
 

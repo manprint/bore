@@ -29,7 +29,7 @@ FROM chef AS builder
 # (below) reuses this target dir; `cargo install` would build in a separate dir
 # and defeat the cache.
 COPY --from=planner /home/rust/src/recipe.json recipe.json
-RUN cargo chef cook --release --locked --features vpn --recipe-path recipe.json
+RUN cargo chef cook --release --locked --features vpn,ssh-gateway --recipe-path recipe.json
 # Git metadata build args come AFTER the cook step on purpose: BORE_GIT_SHA
 # changes on every commit, and an ENV before `cook` would bust the cooked-deps
 # layer every build. Placed here it only invalidates the cheap app-compile
@@ -42,7 +42,7 @@ ENV BORE_GIT_SHA=${BORE_GIT_SHA}
 # Now the real source. Only the `bore` crate recompiles from here; the cooked
 # dependencies are fingerprint-matched and skipped.
 COPY . .
-RUN cargo build --release --locked --features vpn
+RUN cargo build --release --locked --features vpn,ssh-gateway
 
 # ── runtime ──────────────────────────────────────────────────────────────────
 FROM scratch

@@ -67,8 +67,19 @@ services:
       - BORE_WEBSERVER_LOG=/logs
       - BORE_WEBSERVER_LOG_MAX_FILES=5
       - BORE_WEBSERVER_LOG_MAX_FILE_SIZE=50
+      #
+      # --- SSH ingress gateway (opt-in; disabled here) ---
+      # With no BORE_SSH_PORT, SSH demuxes onto the SAME 443:7835 mapping
+      # above alongside TLS/HTTP/native bore — no extra port to publish. See
+      # docs/SSH_GATEWAY.md. Requires an authorized-keys dir and/or a
+      # password file (generate with `bore hash-password`) mounted below.
+      # - BORE_SSH_GATEWAY=true
+      # - BORE_SSH_HOST_KEY_FILE=/etc/bore/ssh/host_key.pem
+      # - BORE_SSH_AUTHORIZED_KEYS_DIR=/etc/bore/ssh/authorized_keys.d
+      # - BORE_SSH_PASSWORDS_FILE=/etc/bore/ssh/passwords
 
     volumes:
       - ./certs:/certs:ro
       - ./config.yml:/config.yml:ro
       - ./logs:/logs:rw
+      # - ./ssh:/etc/bore/ssh   # NOT :ro — see docker-compose.server.yml's comment

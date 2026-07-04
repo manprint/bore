@@ -53,11 +53,16 @@ services:
     # The control port and the tunnel port range must be forwarded explicitly,
     # and MUST match BORE_CONTROL_PORT and BORE_MIN_PORT/BORE_MAX_PORT below.
     ports:
+      # Kept exposed even with a BORE_SSH_GATEWAY demux on the port(s) below —
+      # native bore clients (no --to scheme change needed) keep working exactly
+      # as before; SSH is additive, not a replacement.
       - "7835:7835"            # control port (TCP)
       - "7835:7835/udp"        # STUN responder fallback (UDP) for BORE_UDP direct paths
       - "6000-7000:6000-7000"  # tunnel port range
       # Optionally expose the control port on a standard web port. The scheme is
-      # decided by the certificate, not the port:
+      # decided by the certificate, not the port. With BORE_SSH_GATEWAY enabled
+      # and no BORE_SSH_PORT, SSH is demuxed onto this SAME port too — one port
+      # serves TLS/HTTP/native-bore/SSH concurrently (docs/SSH_GATEWAY.md):
       # - "80:7835"            # plain HTTP (no cert/key set) -> clients use http://bore.tld
       # - "443:7835"           # HTTPS (set BORE_CERT_FILE/BORE_KEY_FILE) -> clients use https://bore.tld
       #
@@ -164,6 +169,24 @@ services:
       # it and set the path here; base-domain/ports/mode/cert env vars still override
       # the file. The file is hot-reloaded on change.
       # - BORE_VHOST_CONFIG=/vhost/vhost.yml
+      #
+      # --- SSH ingress gateway (stock `ssh -R`/`-L`, no bore client needed) ---
+      # Lets a plain OpenSSH client create public/vhost/secret tunnels. With no
+      # BORE_SSH_PORT, SSH is demuxed onto the control port itself (the SAME
+      # 443:7835/80:7835/7835:7835 mapping above already carries it — SSH shares
+      # that port with TLS/HTTP/native bore automatically; see docs/SSH_GATEWAY.md).
+      # Set BORE_SSH_PORT only if you want SSH on its OWN dedicated port instead/
+      # as well (publish it in `ports:` too). Requires at least one credential
+      # source (authorized-keys dir and/or a password file generated with
+      # `bore hash-password`); mount them via the `volumes:` block below.
+      # - BORE_SSH_GATEWAY=true
+      # - BORE_SSH_HOST_KEY_FILE=/etc/bore/ssh/host_key.pem
+      # - BORE_SSH_AUTHORIZED_KEYS_DIR=/etc/bore/ssh/authorized_keys.d
+      # - BORE_SSH_PASSWORDS_FILE=/etc/bore/ssh/passwords
+      # - BORE_SSH_PORT=2222
     # volumes:
     #   - ./certs:/certs:ro
     #   - ./vhost:/vhost:ro
+    #   # NOT :ro — the host key is generated here on first run if it doesn't
+    #   # exist yet; a read-only mount would make that fail.
+    #   - ./ssh:/etc/bore/ssh

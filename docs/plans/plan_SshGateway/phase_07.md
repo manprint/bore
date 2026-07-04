@@ -52,7 +52,12 @@ Docker: root `Dockerfile` builds `--features vpn` at lines 32 and 45; compose fi
   4. Compose files: add commented example under the server service: volume mounts for `/etc/bore/ssh/` (host key file, authorized_keys dir, passwords file), command flags `--ssh-gateway --ssh-host-key-file /etc/bore/ssh/host_key.pem --ssh-authorized-keys-dir /etc/bore/ssh/authorized_keys.d`, and a comment on the `443:7835` mapping noting SSH now shares it (keep 7835 exposed — overview residual question resolved as "keep for native back-compat").
 - **Unit tests:** n/a.
 - **e2e tests:** CI itself (green run on the branch).
-- **Done:** CI fully green including the new netns matrix entry; `docker build .` succeeds; compose lints (`docker compose -f ... config`).
+- **Implementation notes:**
+  - ci.yml's `test` job needed NO change beyond what `--all-features` already does — GitHub's `ubuntu-latest` image ships `openssh-client`/`openssl` preinstalled, confirmed against the actual runner image contents (well-established, not re-probed live).
+  - e2e_netns.yml: `autossh`/`sshpass` installs use `|| true` (soft-fail) — `ssh_gateway_test.sh`'s T-SSH-N2/N6 already skip (not fail) when either tool is missing, so a transient apt-mirror hiccup narrows coverage instead of breaking the whole matrix leg.
+  - Compose files use the SAME env-var style as every other option in these files (`BORE_SSH_GATEWAY`, `BORE_SSH_HOST_KEY_FILE`, etc.) rather than `command:` flags, for consistency with the file's own established convention rather than the plan text's literal wording. The `./ssh` volume mount is explicitly NOT `:ro` (host key auto-generates on first run if absent — a read-only mount would break that).
+  - Actually ran `docker build .` end-to-end (not just planned): `russh`/`ssh-key`/`argon2`/`password-hash` all compile cleanly on the `rust:alpine` (musl) builder; verified the resulting binary's `--help` shows `--ssh-gateway`. Both compose files pass `docker compose -f ... config`.
+- **Done:** ci.yml/e2e_netns.yml updated and YAML-valid; `docker build .` verified locally (musl compiles clean, binary confirmed to have the feature); both compose files lint clean. Full CI-green run on the branch is confirmed on the next push (not re-simulated locally beyond the Docker build itself).
 
 ### 7.4 Documentation
 - **Model:** Haiku (draft) — content reviewed in 7.5

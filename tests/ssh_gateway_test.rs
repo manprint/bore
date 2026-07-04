@@ -149,8 +149,11 @@ async fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+// 20s cap (was 5s): a real `ssh`/subprocess-backed check needs headroom for
+// CI scheduling contention, not just localhost network latency — see
+// PARAMS_GRACE's history in `src/sshgw.rs` for the same class of bug.
 async fn wait_port(port: u16, listening: bool) {
-    for _ in 0..500 {
+    for _ in 0..2000 {
         if TcpStream::connect(("localhost", port)).await.is_ok() == listening {
             return;
         }
@@ -197,7 +200,7 @@ async fn http_get<S: AsyncRead + AsyncWrite + Unpin>(
     stream.write_all(req.as_bytes()).await?;
     stream.flush().await?;
     let mut buf = Vec::new();
-    time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await??;
+    time::timeout(Duration::from_secs(20), stream.read_to_end(&mut buf)).await??;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -208,8 +211,9 @@ async fn http_get<S: AsyncRead + AsyncWrite + Unpin>(
 /// permit (see T-SSH-PUB3: a `wait_port` probe against a `max-conns=1`
 /// forward is a real proxied connection from the gateway's point of view and
 /// raced the test's own first connection for the tunnel's sole permit).
+// 20s cap (was 5s) — same CI-scheduling-headroom reasoning as `wait_port`.
 async fn wait_admin_data_contains(needle: &str) -> Result<String> {
-    for _ in 0..200 {
+    for _ in 0..800 {
         let s = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
         let resp = http_get(s, "/admin/status/data", Some(TOKEN)).await?;
         if resp.contains(needle) {
@@ -227,7 +231,7 @@ async fn roundtrip(port: u16, payload: &[u8]) -> Result<bool> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
     stream.write_all(payload).await?;
     let mut buf = vec![0u8; payload.len()];
-    time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf)).await??;
+    time::timeout(Duration::from_secs(20), stream.read_exact(&mut buf)).await??;
     Ok(buf == payload)
 }
 
@@ -382,7 +386,7 @@ async fn tls_roundtrip(port: u16, payload: &[u8]) -> Result<bool> {
     stdin.write_all(payload).await?;
     stdin.flush().await?;
     let mut buf = vec![0u8; payload.len()];
-    let matched = time::timeout(Duration::from_secs(5), stdout.read_exact(&mut buf))
+    let matched = time::timeout(Duration::from_secs(20), stdout.read_exact(&mut buf))
         .await
         .is_ok()
         && buf == payload;
@@ -487,7 +491,7 @@ async fn send_http_auth(
     let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n{extra}\r\n");
     conn.write_all(req.as_bytes()).await?;
     let mut buf = Vec::new();
-    time::timeout(Duration::from_secs(5), conn.read_to_end(&mut buf)).await??;
+    time::timeout(Duration::from_secs(20), conn.read_to_end(&mut buf)).await??;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -669,7 +673,7 @@ async fn t_ssh_pub2_auto_assigned_port_forward() -> Result<()> {
 
     let mut stderr = child.stderr.take().expect("piped stderr");
     let mut collected = String::new();
-    let allocated_port: u16 = time::timeout(Duration::from_secs(10), async {
+    let allocated_port: u16 = time::timeout(Duration::from_secs(20), async {
         loop {
             let mut buf = [0u8; 256];
             let n = stderr.read(&mut buf).await?;
@@ -746,7 +750,7 @@ async fn t_ssh_pub3_notes_and_max_conns_enforced() -> Result<()> {
     let mut first = TcpStream::connect(("127.0.0.1", fwd_port)).await?;
     first.write_all(b"first").await?;
     let mut buf = [0u8; 5];
-    time::timeout(Duration::from_secs(5), first.read_exact(&mut buf)).await??;
+    time::timeout(Duration::from_secs(20), first.read_exact(&mut buf)).await??;
     assert_eq!(&buf, b"first");
 
     // A second concurrent connection is accepted at the TCP level, then
@@ -755,7 +759,7 @@ async fn t_ssh_pub3_notes_and_max_conns_enforced() -> Result<()> {
     let mut second = TcpStream::connect(("127.0.0.1", fwd_port)).await?;
     let _ = second.write_all(b"second").await;
     let mut sbuf = [0u8; 8];
-    match time::timeout(Duration::from_secs(5), second.read(&mut sbuf)).await {
+    match time::timeout(Duration::from_secs(20), second.read(&mut sbuf)).await {
         Ok(Ok(0)) => {} // clean close — expected refusal
         Ok(Ok(n)) => panic!("second connection should be refused at max-conns=1, got {n} bytes"),
         Ok(Err(_)) => {} // reset — also an acceptable refusal signal
@@ -934,7 +938,7 @@ async fn t_ssh_warn1_transport_only_key_warns() -> Result<()> {
 
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut collected = String::new();
-    time::timeout(Duration::from_secs(10), async {
+    time::timeout(Duration::from_secs(20), async {
         let mut buf = [0u8; 256];
         loop {
             let n = stdout.read(&mut buf).await?;
@@ -1221,7 +1225,12 @@ async fn t_ssh_vh2_basic_auth_enforced() -> Result<()> {
         .spawn()
         .context("spawn ssh (T-SSH-VH2)")?;
 
-    wait_admin_data_contains("vh2sub").await?;
+    // Wait for `basic_auth: true` specifically, not just the label's
+    // presence: the admin entry registers before the `exec`-carried
+    // `basic-auth=user:pass` param is applied (`await_params`, up to
+    // `PARAMS_GRACE`), so polling for the label alone races ahead of
+    // enforcement actually being armed and can observe a plain 200.
+    wait_admin_data_contains("\"basic_auth\":true").await?;
 
     // No credentials -> 401.
     let unauthed = send_http(http_port, "vh2sub.bore.sshtest", "/").await?;
@@ -1548,7 +1557,7 @@ async fn t_ssh_sec3_ssh_both_sides_admin_rows() -> Result<()> {
     }
 
     let mut admin = String::new();
-    for _ in 0..200 {
+    for _ in 0..800 {
         let s = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
         admin = http_get(s, "/admin/status/data", Some(TOKEN)).await?;
         if entry_json_containing(&admin, "\"role\":\"secret-consumer\"")
@@ -1641,7 +1650,7 @@ async fn t_ssh_take1_same_identity_vhost_takeover() -> Result<()> {
 
     // Session A held exactly one forward, so evicting it leaves it with zero
     // remaining forwards: the gateway must disconnect it (D2 step 2).
-    let a_exit = time::timeout(Duration::from_secs(10), child_a.wait())
+    let a_exit = time::timeout(Duration::from_secs(20), child_a.wait())
         .await
         .context("evicted session A never exited")??;
     assert!(
@@ -1652,7 +1661,7 @@ async fn t_ssh_take1_same_identity_vhost_takeover() -> Result<()> {
     // Traffic must switch to session B's backend (poll: the plan's 2s
     // switchover tolerance, given generous headroom for CI scheduling).
     let mut switched = false;
-    for _ in 0..200 {
+    for _ in 0..800 {
         if let Ok(resp) = send_http(http_port, "take1.bore.sshtest", "/").await {
             if resp.contains("body two") {
                 switched = true;

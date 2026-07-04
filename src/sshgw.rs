@@ -83,13 +83,25 @@ pub const SSH_MAX_AUTH_ATTEMPTS: usize = 3;
 /// before registering the tunnel with whatever it has. There is no
 /// round-trip dependency between the two SSH requests (`tcpip-forward` is a
 /// global request; `exec`/`env` are channel requests on an independently
-/// opened channel), so this only covers genuine network jitter — most
-/// sessions resolve in well under this. A pure `-N` session (no channel,
-/// ever) always pays the full grace period; that is the expected cost of
-/// supporting the common "just forward a port" case without special-casing
-/// it. Precedent: the `t_ssh_spike2_forwarded_tcpip` probe sleeps 300 ms in
-/// an analogous spot.
-const PARAMS_GRACE: Duration = Duration::from_millis(500);
+/// opened channel), so this only covers genuine scheduling/network jitter —
+/// most sessions resolve in well under this. A pure `-N` session (no
+/// channel, ever) always pays the full grace period; that is the expected
+/// cost of supporting the common "just forward a port" case without
+/// special-casing it.
+///
+/// Was 500 ms; raised to 5 s after `t_ssh_pub3/4/5`/`t_ssh_vh2` (which all
+/// gate on an `exec`-carried param — `notes=`/`https=on`/`force-https=on`/
+/// `basic-auth=`) were caught flaking on CI (never once green since this
+/// suite landed — every `ssh`-gateway CI run had failures) and reproduced
+/// locally by pinning the test binary to 2 CPUs under load: the real `ssh`
+/// CLI subprocess simply did not get scheduled in time to send its `exec`
+/// request within 500 ms, so the server silently registered the tunnel
+/// with defaults instead of the requested params. 500 ms was never a
+/// protocol requirement, just an untested guess; 5 s is still well under
+/// every caller's own timeout budget (the test harness's own network waits
+/// were bumped to 20 s alongside this) and imperceptible for a real
+/// interactive session.
+const PARAMS_GRACE: Duration = Duration::from_secs(5);
 
 /// One-line message written to the channel (then EOF+close) when a client
 /// requests an interactive shell — the gateway is ingress-only and never

@@ -85,6 +85,34 @@ Docker: root `Dockerfile` builds `--features vpn` at lines 32 and 45; compose fi
   2. Invariant audit: `git grep -n STREAM_READY` matches the phase-2 expectation (I-4); `--ssh-gateway` off diff-audit on the accept path (I-1); reference scenario from overview.md executed by hand end-to-end (all five lines, including the concurrent native `--udp` tunnel and the kill-9/takeover line).
   3. Test-ID sweep: every T-SSH-* in resume.md is green in CI.
   4. Close `resume.md` (all DONE, blockers none), update the project memory note per repo convention.
+- **Executed 2026-07-04:**
+  1. All gates green: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D
+     warnings`, `cargo test`, `cargo test --all-features`, `npm test` (74/74). All five netns
+     suites re-run fresh against the final `--release --features vpn,ssh-gateway` binary:
+     `secret_netns_test.sh` 29/0, `vhost_netns_test.sh` 13/0, `local_proxy_netns_test.sh` 16/0,
+     `ssh_gateway_test.sh` 10/0, `vpn_netns_test.sh` 161/0.
+  2. `git grep -n STREAM_READY` confirms it's only ever mentioned in SSH-path comments explaining
+     its ABSENCE, never called — I-4 holds. `git show <phase-6-commit> -- src/server.rs | grep
+     '^-'` shows the only removed lines are a stale comment and the dedicated `--ssh-port`
+     listener's own refactor (SSH-gateway-specific code) — zero removed lines in the actual
+     control-port accept loop — I-1 holds. The full 5-line reference scenario from `overview.md`
+     was executed by hand against a real local server: vhost/public/secret-provider/secret-
+     consumer-over-ssh all round-tripped, a concurrent native `bore local --udp` tunnel
+     established its direct QUIC path alongside the SSH tunnels, `kill -9` of the vhost session
+     freed its label within 1s (a real process kill closes the socket immediately — the slow
+     ~30-60s netfilter-silence path is what T-SSH-N1 specifically exercises), and a same-key
+     reconnect took over instantly.
+  3. Independent Opus review pass (fresh agent, no prior context) re-read the whole plan folder
+     and `src/sshgw.rs`/`src/sshgw_auth.rs` end to end, specifically hunting for: a THIRD
+     reference-cycle site beyond the two already fixed (none found — the fix is exhaustive),
+     `permit=`/glob-match bypasses (none found), takeover evicting a native tunnel (structurally
+     impossible — native entries have no owners-map entry), demux misclassification under
+     adversarial input (none found — TLS ClientHello always starts `0x16`, never `S`), and
+     identity-field JSON/admin-UI injection (none — serde handles it, no raw string interpolation
+     anywhere). Verdict: "genuinely solid and ready to ship."
+  4. `resume.md` closed: every phase and test-ID row flipped to `DONE`, three runtime decisions
+     recorded (the 3-way `PreTlsRoute` split, the single-namespace netns harness topology, and
+     the `ConnState` reference-cycle fix), no open blockers.
 - **Done:** all checks pass; resume.md closed; plan folder is the implementation record.
 
 ---

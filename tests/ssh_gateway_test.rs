@@ -93,13 +93,27 @@ async fn gen_keypair_with_comment(dir: &Path, name: &str, comment: &str) -> Resu
 /// public key, with an optional leading authorized-keys options string (e.g.
 /// `permit="port/9000-9010",max-conns=1`).
 fn write_authorized_keys(auth_dir: &Path, priv_path: &Path, options: Option<&str>) -> Result<()> {
+    write_authorized_keys_named(auth_dir, "authorized_keys", priv_path, options)
+}
+
+/// Like [`write_authorized_keys`], but under a caller-chosen filename —
+/// `KeyStore` (`src/sshgw_auth.rs`) scans every extensionless/`.pub` file in
+/// `auth_dir`, so granting a SECOND, distinct identity alongside an existing
+/// one (e.g. for a same-identity-takeover test where a third session must
+/// use a genuinely different key) just needs its own file.
+fn write_authorized_keys_named(
+    auth_dir: &Path,
+    filename: &str,
+    priv_path: &Path,
+    options: Option<&str>,
+) -> Result<()> {
     let pub_line = std::fs::read_to_string(priv_path.with_extension("pub"))?;
     let pub_line = pub_line.trim();
     let line = match options {
         Some(opts) => format!("{opts} {pub_line}\n"),
         None => format!("{pub_line}\n"),
     };
-    std::fs::write(auth_dir.join("authorized_keys"), line)?;
+    std::fs::write(auth_dir.join(filename), line)?;
     Ok(())
 }
 
@@ -1282,5 +1296,179 @@ async fn t_ssh_sec3_ssh_both_sides_admin_rows() -> Result<()> {
     drop(conns);
     provider_child.kill().await.ok();
     consumer_child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-TAKE1 (`docs/plans/plan_SshGateway/phase_05.md`, D2/I-5) — a second
+// SSH session authenticating with the SAME key as the incumbent takes over
+// an already-registered vhost label: traffic switches to the new backend,
+// and the evicted session (which had no other forwards) is disconnected by
+// the gateway.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_take1_same_identity_vhost_takeover() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    // Both sessions authenticate with this SAME key, so both get the SAME
+    // `KeyGrant::identity` — the exact scenario D2/I-5 evicts on.
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    let http_port = free_port().await?;
+    let cfg = vhost_config("bore.sshtest", http_port, vec![]);
+    let gw_port = start_gateway_server_vhost(host_key, dir.path().to_path_buf(), cfg).await?;
+
+    let svc1 = spawn_http_stub("body one").await?;
+    let svc2 = spawn_http_stub("body two").await?;
+
+    let mut child_a = Command::new("ssh")
+        .args(ssh_args_raw(
+            gw_port,
+            &client_priv,
+            &[format!("vhost/take1:0:127.0.0.1:{svc1}")],
+            None,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh session A (T-SSH-TAKE1)")?;
+
+    wait_admin_data_contains("take1").await?;
+    let first = send_http(http_port, "take1.bore.sshtest", "/").await?;
+    assert!(
+        first.contains("body one"),
+        "expected session A's backend before takeover, got: {first}"
+    );
+
+    let mut child_b = Command::new("ssh")
+        .args(ssh_args_raw(
+            gw_port,
+            &client_priv,
+            &[format!("vhost/take1:0:127.0.0.1:{svc2}")],
+            None,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh session B (T-SSH-TAKE1)")?;
+
+    // Session A held exactly one forward, so evicting it leaves it with zero
+    // remaining forwards: the gateway must disconnect it (D2 step 2).
+    let a_exit = time::timeout(Duration::from_secs(10), child_a.wait())
+        .await
+        .context("evicted session A never exited")??;
+    assert!(
+        !a_exit.success(),
+        "evicted session A should not exit cleanly, got {a_exit:?}"
+    );
+
+    // Traffic must switch to session B's backend (poll: the plan's 2s
+    // switchover tolerance, given generous headroom for CI scheduling).
+    let mut switched = false;
+    for _ in 0..200 {
+        if let Ok(resp) = send_http(http_port, "take1.bore.sshtest", "/").await {
+            if resp.contains("body two") {
+                switched = true;
+                break;
+            }
+        }
+        time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        switched,
+        "traffic never switched to the takeover winner's backend"
+    );
+
+    child_b.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-TAKE2 (`docs/plans/plan_SshGateway/phase_05.md`, D2/I-5) — a third
+// session authenticating with a DIFFERENT key can never take over a label:
+// rejected outright, and the incumbent's tunnel keeps serving.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_take2_different_identity_rejected() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let bob_priv = gen_keypair_with_comment(dir.path(), "bob", "bob").await?;
+    let carol_priv = gen_keypair_with_comment(dir.path(), "carol", "carol").await?;
+    write_authorized_keys_named(dir.path(), "authorized_keys_bob", &bob_priv, None)?;
+    write_authorized_keys_named(dir.path(), "authorized_keys_carol", &carol_priv, None)?;
+
+    let http_port = free_port().await?;
+    let cfg = vhost_config("bore.sshtest", http_port, vec![]);
+    let gw_port = start_gateway_server_vhost(host_key, dir.path().to_path_buf(), cfg).await?;
+
+    let svc_b = spawn_http_stub("bob's backend").await?;
+    let svc_c = spawn_http_stub("carol's backend").await?;
+
+    let mut child_b = Command::new("ssh")
+        .args(ssh_args_raw(
+            gw_port,
+            &bob_priv,
+            &[format!("vhost/take2:0:127.0.0.1:{svc_b}")],
+            None,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh session B (T-SSH-TAKE2)")?;
+
+    wait_admin_data_contains("take2").await?;
+    let resp = send_http(http_port, "take2.bore.sshtest", "/").await?;
+    assert!(
+        resp.contains("bob's backend"),
+        "expected bob's backend before carol's attempt, got: {resp}"
+    );
+
+    // `ExitOnForwardFailure=yes` makes a rejected `-R` exit the client
+    // non-zero — the label must never be handed to a different identity.
+    let child_c = Command::new("ssh")
+        .args(ssh_args_raw(
+            gw_port,
+            &carol_priv,
+            &[format!("vhost/take2:0:127.0.0.1:{svc_c}")],
+            None,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("spawn ssh session C (T-SSH-TAKE2)")?;
+    assert!(
+        !child_c.status.success(),
+        "a different identity's takeover attempt must be rejected, got {:?}",
+        child_c.status
+    );
+
+    // Bob's tunnel must be completely unaffected by the rejected attempt.
+    let after = send_http(http_port, "take2.bore.sshtest", "/").await?;
+    assert!(
+        after.contains("bob's backend"),
+        "incumbent's tunnel must still serve after a rejected takeover attempt, got: {after}"
+    );
+
+    child_b.kill().await.ok();
     Ok(())
 }

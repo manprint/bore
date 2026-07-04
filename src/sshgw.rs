@@ -15,18 +15,19 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, ChannelOpenHandle, Handle, Handler, Msg, Session};
-use russh::{Channel, ChannelId, ChannelOpenFailure};
+use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect};
 use tokio::net::TcpListener;
-use tokio::sync::{watch, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::sync::{oneshot, watch, Semaphore};
+use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{info, trace, warn};
 
 use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Registration, Role, Transport};
@@ -158,6 +159,13 @@ pub struct SshGateway {
     providers: secret::Registry,
     /// Wired for Phase 5.2 (`tcpip_forward` vhost-subdomain handling).
     vhost_registry: VhostRegistry,
+    /// SSH-session ownership of each SSH-registered vhost label, for
+    /// same-identity takeover (Phase 5.4, D2/I-5). Gateway-internal only —
+    /// never plumbed from `Server`, since only SSH registrations can ever be
+    /// evicted (native tunnels are a different trust domain).
+    vhost_owners: Arc<DashMap<String, ForwardOwner>>,
+    /// Same as `vhost_owners`, keyed by secret-tunnel id.
+    secret_owners: Arc<DashMap<String, ForwardOwner>>,
     /// Live vhost config (reservations, base domain, TLS mode). `None` when
     /// the server has no `vhost.yml` configured, in which case any
     /// `vhost/<label>` forward request is rejected outright.
@@ -212,6 +220,8 @@ impl SshGateway {
             passwords,
             providers,
             vhost_registry,
+            vhost_owners: Arc::new(DashMap::new()),
+            secret_owners: Arc::new(DashMap::new()),
             vhost_config,
             admin,
             conn_permits,
@@ -372,6 +382,20 @@ impl GatewayHandler {
             ));
             return Ok(false);
         }
+        if matches!(
+            peek_takeover(
+                &self.gateway.vhost_registry,
+                &self.gateway.vhost_owners,
+                &label,
+                &grant.identity,
+            ),
+            TakeoverDecision::Reject
+        ) {
+            self.state.queue_message(format!(
+                "bore ssh-gateway: subdomain '{label}' already in use"
+            ));
+            return Ok(false);
+        }
 
         let ssh_handle = session.handle();
         let gateway = Arc::clone(&self.gateway);
@@ -379,7 +403,9 @@ impl GatewayHandler {
         let peer = self.peer;
         let connected_address = address.to_string();
         let key = (connected_address.clone(), port);
+        let key_for_task = key.clone();
         let label_for_message = label.clone();
+        let (abort_tx, abort_rx) = oneshot::channel();
 
         let task = tokio::spawn(async move {
             let (exec, env) = await_params(&state).await;
@@ -401,7 +427,45 @@ impl GatewayHandler {
             let gateway_basic_auth = params.basic_auth.as_deref().and_then(BasicAuth::parse);
             let has_basic_auth = gateway_basic_auth.is_some();
 
-            let pool = match gateway.vhost_registry.entry(label.clone()) {
+            match apply_takeover(
+                &gateway.vhost_registry,
+                &gateway.vhost_owners,
+                &label,
+                &grant.identity,
+                "subdomain",
+            ) {
+                TakeoverOutcome::Reject(reason) => {
+                    state.queue_message(format!("bore ssh-gateway: {reason}"));
+                    return;
+                }
+                TakeoverOutcome::Proceed => {}
+            }
+
+            let opener = SshOpener::new(ssh_handle.clone(), connected_address, port);
+            let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Ssh(Arc::new(opener))));
+            let entry = Arc::new(VhostEntry {
+                pool: Arc::clone(&pool),
+                request_headers,
+                response_headers,
+                #[cfg(feature = "udp")]
+                direct: vhost::DirectPool::default(),
+                #[cfg(feature = "udp")]
+                direct_stream_opens: AtomicU64::new(0),
+                active: Arc::new(AtomicUsize::new(0)),
+                webserver_log: params.webserver_log,
+                peer,
+                since: Instant::now(),
+                notes: params.notes.clone(),
+                basic_auth: has_basic_auth,
+                udp: false,
+                auto_reconnect: false,
+                local_host: None,
+                local_port: 0,
+                relay_tx_bytes: Arc::new(AtomicU64::new(0)),
+                relay_rx_bytes: Arc::new(AtomicU64::new(0)),
+                gateway_basic_auth,
+            });
+            match gateway.vhost_registry.entry(label.clone()) {
                 Entry::Occupied(_) => {
                     state.queue_message(format!(
                         "bore ssh-gateway: subdomain '{label}' already in use"
@@ -409,37 +473,31 @@ impl GatewayHandler {
                     return;
                 }
                 Entry::Vacant(slot) => {
-                    let opener = SshOpener::new(ssh_handle, connected_address, port);
-                    let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Ssh(Arc::new(opener))));
-                    let entry = Arc::new(VhostEntry {
-                        pool: Arc::clone(&pool),
-                        request_headers,
-                        response_headers,
-                        #[cfg(feature = "udp")]
-                        direct: vhost::DirectPool::default(),
-                        #[cfg(feature = "udp")]
-                        direct_stream_opens: AtomicU64::new(0),
-                        active: Arc::new(AtomicUsize::new(0)),
-                        webserver_log: params.webserver_log,
-                        peer,
-                        since: Instant::now(),
-                        notes: params.notes.clone(),
-                        basic_auth: has_basic_auth,
-                        udp: false,
-                        auto_reconnect: false,
-                        local_host: None,
-                        local_port: 0,
-                        relay_tx_bytes: Arc::new(AtomicU64::new(0)),
-                        relay_rx_bytes: Arc::new(AtomicU64::new(0)),
-                        gateway_basic_auth,
-                    });
                     slot.insert(Arc::clone(&entry));
-                    pool
                 }
+            }
+            let Ok(abort) = abort_rx.await else {
+                gateway.vhost_registry.remove(&label);
+                return;
             };
+            let token = next_forward_token();
+            gateway.vhost_owners.insert(
+                label.clone(),
+                ForwardOwner {
+                    identity: grant.identity.clone(),
+                    abort,
+                    handle: ssh_handle,
+                    conn: Arc::downgrade(&state),
+                    key: key_for_task,
+                    token,
+                },
+            );
             let _guard = VhostSshGuard {
                 registry: gateway.vhost_registry.clone(),
+                owners: Arc::clone(&gateway.vhost_owners),
                 label: label.clone(),
+                entry: Arc::clone(&entry),
+                token,
             };
 
             let mode = resolve_mode(&live_cfg, cert_present(&live_cfg)).unwrap_or(VhostMode::Http);
@@ -499,6 +557,13 @@ impl GatewayHandler {
             let _registration = registration;
             std::future::pending::<()>().await;
         });
+        // Handed to the task via `abort_rx` (a oneshot, not a shared cell):
+        // the task's first await point (`await_params`, up to `PARAMS_GRACE`)
+        // guarantees this send lands well before the task reaches the point
+        // where it needs its own `AbortHandle` for `vhost_owners` (Phase 5.4)
+        // — a task cannot otherwise learn its own `JoinHandle`-derived handle
+        // from inside itself.
+        let _ = abort_tx.send(task.abort_handle());
         self.state
             .forwards
             .lock()
@@ -531,6 +596,19 @@ impl GatewayHandler {
             ));
             return Ok(false);
         }
+        if matches!(
+            peek_takeover(
+                &self.gateway.providers,
+                &self.gateway.secret_owners,
+                &id,
+                &grant.identity
+            ),
+            TakeoverDecision::Reject
+        ) {
+            self.state
+                .queue_message(format!("tcp-secret-id '{id}' already in use"));
+            return Ok(false);
+        }
 
         let ssh_handle = session.handle();
         let gateway = Arc::clone(&self.gateway);
@@ -538,27 +616,61 @@ impl GatewayHandler {
         let peer = self.peer;
         let connected_address = address.to_string();
         let key = (connected_address.clone(), port);
+        let key_for_task = key.clone();
         let id_for_message = id.clone();
+        let (abort_tx, abort_rx) = oneshot::channel();
 
         let task = tokio::spawn(async move {
             let (exec, env) = await_params(&state).await;
             let params = parse_params(exec.as_deref(), &env, &grant);
 
-            let pool = match gateway.providers.entry(id.clone()) {
+            match apply_takeover(
+                &gateway.providers,
+                &gateway.secret_owners,
+                &id,
+                &grant.identity,
+                "tcp-secret-id",
+            ) {
+                TakeoverOutcome::Reject(reason) => {
+                    state.queue_message(format!("bore ssh-gateway: {reason}"));
+                    return;
+                }
+                TakeoverOutcome::Proceed => {}
+            }
+
+            let opener = SshOpener::new(ssh_handle.clone(), connected_address, port);
+            let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Ssh(Arc::new(opener))));
+            match gateway.providers.entry(id.clone()) {
                 Entry::Occupied(_) => {
                     state.queue_message(format!("tcp-secret-id '{id}' already in use"));
                     return;
                 }
                 Entry::Vacant(slot) => {
-                    let opener = SshOpener::new(ssh_handle, connected_address, port);
-                    let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Ssh(Arc::new(opener))));
                     slot.insert(Arc::clone(&pool));
-                    pool
                 }
+            }
+            let Ok(abort) = abort_rx.await else {
+                gateway.providers.remove(&id);
+                return;
             };
+            let token = next_forward_token();
+            gateway.secret_owners.insert(
+                id.clone(),
+                ForwardOwner {
+                    identity: grant.identity.clone(),
+                    abort,
+                    handle: ssh_handle,
+                    conn: Arc::downgrade(&state),
+                    key: key_for_task,
+                    token,
+                },
+            );
             let _guard = SecretSshGuard {
                 registry: gateway.providers.clone(),
+                owners: Arc::clone(&gateway.secret_owners),
                 id: id.clone(),
+                pool: Arc::clone(&pool),
+                token,
             };
 
             state.queue_message(format!("secret tunnel provider ready: {id}"));
@@ -605,6 +717,10 @@ impl GatewayHandler {
             let _registration = registration;
             std::future::pending::<()>().await;
         });
+        // See the matching comment in `tcpip_forward_vhost`: handed via a
+        // oneshot because a task cannot learn its own `AbortHandle` from
+        // inside itself.
+        let _ = abort_tx.send(task.abort_handle());
         self.state
             .forwards
             .lock()
@@ -1217,31 +1333,229 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 /// Removes an SSH-registered vhost subdomain from the registry when the
-/// `tcpip-forward` task ends (aborted by `cancel_tcpip_forward` or the whole
-/// connection tearing down via `Drop for ConnState`). Mirrors `vhost`'s own
-/// private `Deregister` guard, kept separate since that one isn't `pub`.
+/// `tcpip-forward` task ends (aborted by `cancel_tcpip_forward`, evicted by a
+/// same-identity takeover, or the whole connection tearing down via `Drop for
+/// ConnState`). Mirrors `vhost`'s own private `Deregister` guard, kept
+/// separate since that one isn't `pub`.
+///
+/// `entry`/`token` identify exactly the registration this guard owns: a
+/// takeover (Phase 5.4) can replace `registry[label]`/`owners[label]` with a
+/// NEW registration before this (evicted) guard's `Drop` actually runs (task
+/// abort is asynchronous — the future is only dropped at its next poll), so
+/// an unconditional `remove(&label)` here would delete the WINNER's fresh
+/// entry instead of the loser's own. `remove_if` + an identity check makes
+/// the removal a no-op once this guard's registration is no longer the one
+/// installed.
 struct VhostSshGuard {
     registry: VhostRegistry,
+    owners: Arc<DashMap<String, ForwardOwner>>,
     label: String,
+    entry: Arc<VhostEntry>,
+    token: u64,
 }
 
 impl Drop for VhostSshGuard {
     fn drop(&mut self) {
-        self.registry.remove(&self.label);
+        self.registry
+            .remove_if(&self.label, |_, v| Arc::ptr_eq(v, &self.entry));
+        self.owners
+            .remove_if(&self.label, |_, o| o.token == self.token);
     }
 }
 
 /// Removes an SSH-backed secret provider's pool from the registry when its
-/// forward task ends, mirroring [`VhostSshGuard`] (I-3).
+/// forward task ends, mirroring [`VhostSshGuard`] (I-3) including the
+/// identity-checked `remove_if` (Phase 5.4 takeover safety).
 struct SecretSshGuard {
     registry: secret::Registry,
+    owners: Arc<DashMap<String, ForwardOwner>>,
     id: String,
+    pool: Arc<CarrierPool>,
+    token: u64,
 }
 
 impl Drop for SecretSshGuard {
     fn drop(&mut self) {
-        self.registry.remove(&self.id);
+        self.registry
+            .remove_if(&self.id, |_, v| Arc::ptr_eq(v, &self.pool));
+        self.owners
+            .remove_if(&self.id, |_, o| o.token == self.token);
     }
+}
+
+/// Monotonic source for [`ForwardOwner::token`]/the matching guard `token`
+/// field — cheaper than comparing `Arc` pointers across the two different
+/// concrete types (`VhostEntry`/`CarrierPool`) a single owners map must track.
+static NEXT_FORWARD_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_forward_token() -> u64 {
+    NEXT_FORWARD_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tracks which SSH session owns each SSH-registered vhost label / secret id
+/// (Phase 5.4, D2/I-5). Entries exist ONLY for SSH-registered names — a name
+/// already held by a *native* tunnel has no entry here, so a collision
+/// against one is always rejected, never evicted (SSH identities and the
+/// HMAC secret are different trust domains). Inserted (overwriting any stale
+/// leftover) at successful registration; removed by the owning
+/// `VhostSshGuard`/`SecretSshGuard` on that registration's own teardown, or
+/// by [`apply_takeover`] when a same-identity newcomer evicts it.
+struct ForwardOwner {
+    /// Identity that registered this name (`KeyGrant::identity`).
+    identity: String,
+    /// Cancels the incumbent's finalize task on eviction — dropping its
+    /// `VhostSshGuard`/`SecretSshGuard` and admin `Registration` (same
+    /// teardown `cancel_tcpip_forward` uses).
+    abort: AbortHandle,
+    /// The incumbent's own SSH session, used to disconnect it on eviction
+    /// (D2 step 2).
+    handle: Handle,
+    /// The incumbent connection's shared state — Weak so an evicted-but-not-
+    /// yet-dropped `ConnState` is never kept alive by this bookkeeping map
+    /// (that would delay its own `Drop`-driven teardown of every OTHER
+    /// forward on that same connection).
+    conn: Weak<ConnState>,
+    /// The `(bind_address, port)` key this forward is registered under in
+    /// its own connection's `forwards` map — used to check whether evicting
+    /// it leaves that connection with zero remaining forwards.
+    key: (String, u16),
+    /// Matches the owning `VhostSshGuard`/`SecretSshGuard`'s own `token`.
+    token: u64,
+}
+
+/// Pure decision table (D2/I-5) for a name collision: `incumbent` is
+/// `Some((identity, is_ssh))` when the name is already taken, `None` when
+/// free. `is_ssh == false` means a *native* tunnel holds it (no identity to
+/// compare — always rejected). Both identities must be non-empty for a match
+/// to count, defense-in-depth against an empty/placeholder identity ever
+/// matching another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TakeoverDecision {
+    /// No incumbent: register the newcomer.
+    Insert,
+    /// Incumbent is SSH-owned by the SAME identity: evict it, then register.
+    Evict,
+    /// Incumbent is native, or SSH-owned by a DIFFERENT identity: refuse.
+    Reject,
+}
+
+fn takeover_decision(incumbent: Option<(&str, bool)>, newcomer: &str) -> TakeoverDecision {
+    match incumbent {
+        None => TakeoverDecision::Insert,
+        Some((_, false)) => TakeoverDecision::Reject,
+        Some((identity, true)) => {
+            if !identity.is_empty() && !newcomer.is_empty() && identity == newcomer {
+                TakeoverDecision::Evict
+            } else {
+                TakeoverDecision::Reject
+            }
+        }
+    }
+}
+
+/// Outcome of [`apply_takeover`]: either the caller may proceed to insert its
+/// own entry (the name was free, or an eviction just freed it), or it must
+/// give up with the given user-facing reason.
+enum TakeoverOutcome {
+    Proceed,
+    Reject(String),
+}
+
+/// Non-mutating peek at what [`apply_takeover`] would decide for `label`
+/// right now. Used to reply to the SSH `tcpip-forward` global request
+/// SYNCHRONOUSLY with `Ok(false)` on a `Reject` — `ExitOnForwardFailure=yes`
+/// (T-SSH-TAKE2) only works if the rejection reaches the client as THIS
+/// request's own `REQUEST_FAILURE`, not a message queued for a possibly
+/// never-opened later channel. The full registration (including the actual
+/// eviction) still happens inside the spawned finalize task via
+/// `apply_takeover` itself, which re-decides authoritatively at the point it
+/// actually mutates the registry — this peek is optimistic, not a
+/// reservation, so a residual race between two brand-new registrations
+/// landing in the same instant is still possible (same pre-existing,
+/// accepted scope as the registry's own vacant-insert race).
+fn peek_takeover<T>(
+    registry: &DashMap<String, Arc<T>>,
+    owners: &DashMap<String, ForwardOwner>,
+    label: &str,
+    newcomer_identity: &str,
+) -> TakeoverDecision {
+    let incumbent = registry.get(label).map(|_| match owners.get(label) {
+        Some(owner) => (owner.identity.clone(), true),
+        None => (String::new(), false),
+    });
+    takeover_decision(
+        incumbent
+            .as_ref()
+            .map(|(identity, is_ssh)| (identity.as_str(), *is_ssh)),
+        newcomer_identity,
+    )
+}
+
+/// Applies the takeover decision table to a name collision on `registry`
+/// (Phase 5.4). Holds `registry`'s per-key shard lock (the `Entry` API) for
+/// the full check-and-decide step so a second concurrent registration for
+/// the same `label` cannot interleave between "decide" and "remove" — but
+/// the actual incumbent teardown (abort + maybe-disconnect) intentionally
+/// runs AFTER that lock is dropped (two-step, per the plan's race-safety
+/// note): it can take a moment and must never block other labels sharing
+/// this DashMap's shard.
+fn apply_takeover<T>(
+    registry: &DashMap<String, Arc<T>>,
+    owners: &DashMap<String, ForwardOwner>,
+    label: &str,
+    newcomer_identity: &str,
+    kind: &str,
+) -> TakeoverOutcome {
+    let evicted = match registry.entry(label.to_string()) {
+        Entry::Vacant(_) => return TakeoverOutcome::Proceed,
+        Entry::Occupied(entry) => {
+            let incumbent = match owners.get(label) {
+                Some(owner) => (owner.identity.clone(), true),
+                None => (String::new(), false),
+            };
+            match takeover_decision(Some((incumbent.0.as_str(), incumbent.1)), newcomer_identity) {
+                TakeoverDecision::Insert => unreachable!("Some(_) incumbent never yields Insert"),
+                TakeoverDecision::Reject => {
+                    return TakeoverOutcome::Reject(format!("{kind} '{label}' already in use"))
+                }
+                TakeoverDecision::Evict => {
+                    entry.remove();
+                    owners.remove(label).map(|(_, owner)| owner)
+                }
+            }
+        }
+    };
+
+    if let Some(owner) = evicted {
+        owner.abort.abort();
+        if let Some(conn) = owner.conn.upgrade() {
+            let remaining = {
+                let mut forwards = conn
+                    .forwards
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                forwards.remove(&owner.key);
+                forwards.len()
+            };
+            if remaining == 0 {
+                let handle = owner.handle.clone();
+                tokio::spawn(async move {
+                    let _ = handle
+                        .disconnect(
+                            Disconnect::ByApplication,
+                            "evicted by newer session with same identity".to_string(),
+                            String::new(),
+                        )
+                        .await;
+                });
+            } else {
+                conn.queue_message(format!(
+                    "bore ssh-gateway: {kind} '{label}' evicted by newer session with same identity"
+                ));
+            }
+        }
+    }
+    TakeoverOutcome::Proceed
 }
 
 /// Binds a public-tunnel listener honoring both the server's `port_range`
@@ -2036,5 +2350,64 @@ mod tests {
         let mut none_allowed = grant("dave");
         none_allowed.permit = Some(vec!["port/1000".to_string()]);
         assert!(!permit_allows(&none_allowed, "vhost/", "dave-app"));
+    }
+
+    #[test]
+    fn takeover_decision_table() {
+        // Free: always insert, regardless of the newcomer's identity.
+        assert_eq!(takeover_decision(None, "alice"), TakeoverDecision::Insert);
+        assert_eq!(takeover_decision(None, ""), TakeoverDecision::Insert);
+
+        // Same-identity SSH incumbent: evict.
+        assert_eq!(
+            takeover_decision(Some(("alice", true)), "alice"),
+            TakeoverDecision::Evict
+        );
+
+        // Different-identity SSH incumbent: reject.
+        assert_eq!(
+            takeover_decision(Some(("alice", true)), "bob"),
+            TakeoverDecision::Reject
+        );
+
+        // Native incumbent (no identity to compare): always reject, even if
+        // the newcomer's identity happens to equal the placeholder.
+        assert_eq!(
+            takeover_decision(Some(("", false)), "alice"),
+            TakeoverDecision::Reject
+        );
+
+        // Defense-in-depth: an empty identity on either side never matches.
+        assert_eq!(
+            takeover_decision(Some(("", true)), ""),
+            TakeoverDecision::Reject
+        );
+        assert_eq!(
+            takeover_decision(Some(("alice", true)), ""),
+            TakeoverDecision::Reject
+        );
+    }
+
+    #[test]
+    fn apply_takeover_vacant_proceeds_without_touching_owners() {
+        let registry: DashMap<String, Arc<()>> = DashMap::new();
+        let owners: DashMap<String, ForwardOwner> = DashMap::new();
+        assert!(matches!(
+            apply_takeover(&registry, &owners, "label", "alice", "thing"),
+            TakeoverOutcome::Proceed
+        ));
+        assert!(owners.is_empty());
+    }
+
+    #[test]
+    fn apply_takeover_rejects_native_incumbent() {
+        let registry: DashMap<String, Arc<()>> = DashMap::new();
+        registry.insert("label".to_string(), Arc::new(()));
+        let owners: DashMap<String, ForwardOwner> = DashMap::new();
+        match apply_takeover(&registry, &owners, "label", "alice", "thing") {
+            TakeoverOutcome::Reject(reason) => assert!(reason.contains("already in use")),
+            TakeoverOutcome::Proceed => panic!("native incumbent must never be evicted"),
+        }
+        assert!(registry.contains_key("label"), "native entry left intact");
     }
 }

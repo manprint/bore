@@ -606,9 +606,6 @@ fn ssh_local_forward_args(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_ssh_pub1_fixed_port_forward_and_admin_entry() -> Result<()> {
     let _g = SERIAL_GUARD.lock().await;
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("bore_cli=trace,russh=debug")
-        .try_init();
     skip_without_ssh_cli!();
     wait_port(CONTROL_PORT, false).await;
 
@@ -622,32 +619,19 @@ async fn t_ssh_pub1_fixed_port_forward_and_admin_entry() -> Result<()> {
     let svc_port = spawn_echo_service().await?;
 
     let fwd_port = 19005u16;
-    let mut args = ssh_args(gw_port, &client_priv, &[(fwd_port, svc_port)], None);
-    args.push("-vvv".to_string());
+    let args = ssh_args(gw_port, &client_priv, &[(fwd_port, svc_port)], None);
     let mut child = Command::new("ssh")
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .context("spawn ssh -R (T-SSH-PUB1)")?;
-    let mut ssh_stderr = child.stderr.take().expect("piped stderr");
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = String::new();
-        let _ = ssh_stderr.read_to_string(&mut buf).await;
-        buf
-    });
 
     wait_port(fwd_port, true).await;
-    let roundtrip_result = roundtrip(fwd_port, b"ping-pub1").await;
-    if roundtrip_result.is_err() {
-        child.kill().await.ok();
-        let ssh_stderr_output = stderr_task.await.unwrap_or_default();
-        eprintln!("=== DIAGNOSTIC: real ssh client stderr ===\n{ssh_stderr_output}\n=== end ssh stderr ===");
-    }
     assert!(
-        roundtrip_result?,
+        roundtrip(fwd_port, b"ping-pub1").await?,
         "forwarded connection did not echo the request"
     );
 

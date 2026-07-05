@@ -566,6 +566,18 @@ the existing registries/relay/admin/weblog/`--max-conns` data path unmodified.
   / `t_ssh_banner_secret_provider_no_n_survives_and_reports` /
   `t_ssh_banner_secret_consumer_fires_once` / `t_ssh_nokill_zero_bare_interactive_still_rejected`
   in `tests/ssh_gateway_test.rs`.
+- **I-SSH8 (inapplicable params must warn, real report 2026-07-05):** `https=on
+  force-https=on` on a VHOST forward (HTTPS there is governed server-side by `--vhost-mode`,
+  never per-tunnel) was silently swallowed — `parse_params`'s own `warnings` can't catch this
+  class of bug because it's built generically, before the caller knows which forward TYPE the
+  exec string even applies to. Secret provider had the same gap for
+  `https`/`force-https`/`basic-auth`/`webserver-log`/`max-conns` (ALL hardcoded `false`/`None`
+  in its admin entry regardless of what was requested — only `notes` was ever applied there).
+  Fixed with `deliver_inapplicable_warnings` (`src/sshgw.rs`), called from each
+  `tcpip_forward_*` task after it resolves its own `params` copy, checking exactly the fields
+  that ARE no-ops for THAT type and warning once per set field via `ConnState::deliver` (same
+  mechanism as I-SSH7's banner) — never silent, matching I-2. Test coverage:
+  `t_ssh_warn_https_inapplicable_to_vhost` / `t_ssh_warn_all_params_inapplicable_to_secret_provider`.
 - **Control-port demux (D8, Phase 6):** with the gateway enabled, `sshgw::demux_pre_tls` peeks
   the first byte (2s timeout — a real SSH client waits for the server's own banner and sends
   nothing first, sslh-style) and 3-way classifies it: `Ssh` (timeout or `b'S'`) dispatches
@@ -576,8 +588,8 @@ the existing registries/relay/admin/weblog/`--max-conns` data path unmodified.
   lets a plain HTTP/bore client keep working on a port that also serves TLS. `SshGateway::
   serve_connection` is generic over `mux::Transport` so it runs identically over `TcpStream`,
   `Prefixed<TcpStream>`, and a `TlsStream`.
-- Regression/e2e: `tests/ssh_gateway_test.rs` (cargo, 28 tests incl. takeover, demux, SSH-over-TLS,
-  the I-SSH6/I-SSH7 shell-request-fix/banner suite)
+- Regression/e2e: `tests/ssh_gateway_test.rs` (cargo, 30 tests incl. takeover, demux, SSH-over-TLS,
+  the I-SSH6/I-SSH7/I-SSH8 shell-request-fix/banner/inapplicable-param-warning suite)
   + `sudo -n /abs/path/scripts/ssh_gateway_test.sh` (netns chaos: T-SSH-N1..N6 — real netfilter
   half-open, autossh recovery across a server restart, takeover under partition, mixed
   transports on one port, throughput report, password auth). Exact-path sudo invocation only

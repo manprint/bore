@@ -354,7 +354,17 @@ Due casi distinti, non confonderli:
 **VHOST**: HTTPS è governato **lato server** dal `vhost.yml`/`--vhost-mode` (flag
 `--vhost-mode http|https|both|redirect-https|auto`, `--vhost-cert-file`/`--vhost-key-file`).
 Un tunnel vhost SSH-originato eredita automaticamente lo stesso comportamento HTTPS di un
-tunnel nativo sullo stesso host — nessun parametro per-tunnel da passare:
+tunnel nativo sullo stesso host — nessun parametro per-tunnel da passare. Passare comunque
+`https=on`/`force-https=on` (o `max-conns=`, ugualmente non applicabile a vhost) produce un
+warning esplicito sul canale invece di essere ignorato in silenzio:
+```
+bore ssh-gateway: https: not applicable to vhost tunnels; ignoring
+bore ssh-gateway: force-https: not applicable to vhost tunnels; ignoring
+```
+Stessa cosa per il provider **secret**: **nessun** parametro oltre `notes=` ha effetto lì
+(niente HTTP layer su un relay TCP opaco) — `https=`/`force-https=`/`basic-auth=`/
+`webserver-log=`/`max-conns=` producono ciascuno il proprio warning "not applicable to
+secret provider tunnels; ignoring", mai un no-op silenzioso.
 
 ```bash
 bore server --ssh-gateway ... \

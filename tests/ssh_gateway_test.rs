@@ -2593,3 +2593,118 @@ async fn t_ssh_banner_secret_consumer_fires_once() -> Result<()> {
     capture.child.kill().await.ok();
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// T-SSH-WARN-INAPPLICABLE — a real report: `https=on force-https=on` on a
+// VHOST forward (HTTPS there is governed server-side by `--vhost-mode`,
+// never per-tunnel) was silently swallowed, no warning anywhere. Secret
+// provider has the same gap for `https`/`force-https`/`basic-auth`/
+// `webserver-log`/`max-conns` — all no-ops on an opaque TCP relay. I-2
+// forbids a param looking "accepted" when it has zero effect.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_warn_https_inapplicable_to_vhost() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    let http_port = free_port().await?;
+    let cfg = vhost_config("bore.warntest", http_port, vec![]);
+    let gw_port = start_gateway_server_vhost(host_key, dir.path().to_path_buf(), cfg).await?;
+
+    let svc_port = spawn_http_stub("hello from warn-vhost").await?;
+    let raw_forward = format!("vhost/warnvh:0:127.0.0.1:{svc_port}");
+
+    let args = ssh_args_raw(
+        gw_port,
+        &client_priv,
+        &[raw_forward],
+        Some("https=on force-https=on max-conns=42"),
+    );
+    let mut capture = spawn_ssh_capturing(
+        &args,
+        "spawn vhost ssh with inapplicable https/force-https/max-conns (T-SSH-WARN-INAPPLICABLE)",
+    )?;
+
+    let seen = wait_buf_contains(
+        &capture.buf,
+        "Vhost tunnel established",
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        seen.contains("https: not applicable to vhost tunnels; ignoring"),
+        "https=on on a vhost forward must warn, not silently vanish: {seen:?}"
+    );
+    assert!(
+        seen.contains("force-https: not applicable to vhost tunnels; ignoring"),
+        "force-https=on on a vhost forward must warn, not silently vanish: {seen:?}"
+    );
+    assert!(
+        seen.contains("max-conns: not applicable to vhost tunnels; ignoring"),
+        "max-conns= on a vhost forward must warn, not silently vanish: {seen:?}"
+    );
+    // The banner itself must still show the SERVER-governed mode, unaffected
+    // by the ignored client-requested flags.
+    assert!(seen.contains(&banner_field("Mode:", "HTTP only")));
+
+    capture.child.kill().await.ok();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_warn_all_params_inapplicable_to_secret_provider() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(&auth_dir, &client_priv, None)?;
+
+    let gw_port = start_gateway_server(dir.path().join("host_key"), auth_dir).await?;
+    let svc_port = spawn_echo_service().await?;
+
+    let id = "warnsec";
+    let raw_forward = format!("secret/{id}:0:127.0.0.1:{svc_port}");
+    let args = ssh_args_raw(
+        gw_port,
+        &client_priv,
+        &[raw_forward],
+        Some("https=on force-https=on basic-auth=u:p webserver-log=on max-conns=42"),
+    );
+    let mut capture = spawn_ssh_capturing(
+        &args,
+        "spawn secret provider ssh with every param inapplicable (T-SSH-WARN-INAPPLICABLE)",
+    )?;
+
+    let seen = wait_buf_contains(
+        &capture.buf,
+        "Secret provider tunnel established",
+        Duration::from_secs(10),
+    )
+    .await;
+    for expected in [
+        "https: not applicable to secret provider tunnels; ignoring",
+        "force-https: not applicable to secret provider tunnels; ignoring",
+        "basic-auth: not applicable to secret provider tunnels; ignoring",
+        "webserver-log: not applicable to secret provider tunnels; ignoring",
+        "max-conns: not applicable to secret provider tunnels; ignoring",
+    ] {
+        assert!(
+            seen.contains(expected),
+            "secret provider must warn for every inapplicable param, missing {expected:?}: {seen:?}"
+        );
+    }
+
+    capture.child.kill().await.ok();
+    Ok(())
+}

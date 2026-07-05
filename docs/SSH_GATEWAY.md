@@ -807,6 +807,13 @@ A differenza della vhost (HTTPS già gestito lato server via `vhost.yml`), un tu
 riusando lo stesso `edge::accept` del client nativo `bore local --https`. Richiede un
 certificato server configurato (`--cert-file`/`--key-file`):
 
+`https=`/`force-https=` non hanno alcun effetto su vhost (governato da `--vhost-mode`) o su
+secret provider (relay TCP opaco, niente layer HTTP) — passarli comunque produce un warning
+esplicito (`<key>: not applicable to <vhost|secret provider> tunnels; ignoring`), mai un
+no-op silenzioso (I-2; bug-hunt 2026-07-05, `deliver_inapplicable_warnings` in `src/sshgw.rs`).
+Stesso trattamento per `max-conns=` su vhost/secret provider e per `basic-auth=`/
+`webserver-log=` su secret provider — nessuno di questi è applicato lì.
+
 > **⚠️ Vale sempre la regola di §6.4a: mai `-N`.** Con `-N` il comando `exec` non viene MAI
 > inviato (nessun canale sessione si apre affatto), quindi `https=on`/`force-https=on`
 > restano ai default **senza alcun avviso visibile**. Ricontrollare sempre i parametri

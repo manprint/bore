@@ -800,6 +800,18 @@ impl GatewayHandler {
                 identity: Some(grant.identity.clone()),
             });
 
+            deliver_inapplicable_warnings(
+                &state,
+                &ssh_handle,
+                "vhost",
+                &[
+                    ("https", params.https),
+                    ("force-https", params.force_https),
+                    ("max-conns", params.max_conns.is_some()),
+                ],
+            )
+            .await;
+
             for line in vhost_info_banner(VhostBannerInfo {
                 urls: &urls,
                 mode,
@@ -986,6 +998,20 @@ impl GatewayHandler {
                 transport: Transport::Ssh,
                 identity: Some(grant.identity.clone()),
             });
+
+            deliver_inapplicable_warnings(
+                &state,
+                &ssh_handle,
+                "secret provider",
+                &[
+                    ("https", params.https),
+                    ("force-https", params.force_https),
+                    ("basic-auth", params.basic_auth.is_some()),
+                    ("webserver-log", params.webserver_log),
+                    ("max-conns", params.max_conns.is_some()),
+                ],
+            )
+            .await;
 
             for line in secret_provider_info_banner(&id, &grant.identity, params.notes.as_deref()) {
                 state.deliver(&ssh_handle, line).await;
@@ -2644,6 +2670,38 @@ pub fn parse_params(
 /// e.g. `banner_line("Notes:", "(none)")` → `"  Notes:            (none)"`.
 fn banner_line(label: &str, value: impl std::fmt::Display) -> String {
     format!("  {label:<18}{value}")
+}
+
+/// Warns (via `ConnState::deliver`, never silently) for every `(key, is_set)`
+/// pair where `is_set` is true — i.e. the caller passed a param that has NO
+/// effect for `context`'s forward type. `parse_params`'s own `warnings`
+/// field can't cover this: it's built generically, before the caller knows
+/// which forward type (vhost/public/secret) the exec string even applies
+/// to. Found via a real report: `https=on force-https=on` on a VHOST
+/// forward (where HTTPS is governed server-side by `--vhost-mode`, never
+/// per-tunnel) was silently swallowed — no warning anywhere, violating I-2.
+/// Secret provider has the same gap for `https`/`force-https`/`basic-auth`/
+/// `webserver-log`/`max-conns` (all hardcoded `false`/`None` in its admin
+/// entry regardless of what was requested — none of them are enforced on
+/// an opaque TCP relay).
+async fn deliver_inapplicable_warnings(
+    state: &ConnState,
+    handle: &Handle,
+    context: &str,
+    checks: &[(&str, bool)],
+) {
+    for (key, is_set) in checks {
+        if *is_set {
+            state
+                .deliver(
+                    handle,
+                    format!(
+                        "bore ssh-gateway: {key}: not applicable to {context} tunnels; ignoring"
+                    ),
+                )
+                .await;
+        }
+    }
 }
 
 fn on_off(flag: bool) -> &'static str {

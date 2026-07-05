@@ -28,8 +28,8 @@ use crate::pool::{self, Carrier, CarrierPool, PendingCarriers, TokenGuard};
 use crate::prefixed::Prefixed;
 use crate::secret::{self, Registry, UdpRegistry};
 use crate::shared::{
-    proxy_buffer_size, tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions,
-    UdpDirectTuning, CONTROL_PORT, NETWORK_TIMEOUT,
+    proxy_buffer_size, resolve_https_policy, tune_tcp, ClientMessage, Delimited, ServerMessage,
+    TunnelOptions, UdpDirectTuning, CONTROL_PORT, NETWORK_TIMEOUT,
 };
 #[cfg(feature = "ssh-gateway")]
 use crate::sshgw;
@@ -1495,6 +1495,7 @@ impl Server {
                 auto_reconnect,
                 local_host,
                 local_port,
+                https_policy,
             }) => {
                 let Some(cfg) = self.vhost_config.clone() else {
                     warn!("vhost not configured on this server");
@@ -1527,6 +1528,7 @@ impl Server {
                     self.udp_tuning,
                     local_host,
                     local_port,
+                    https_policy,
                 )
                 .await
             }
@@ -1716,11 +1718,25 @@ impl Server {
         mut control: Delimited<mux::Stream>,
         opener: mux::Opener,
         port: u16,
-        opts: TunnelOptions,
+        mut opts: TunnelOptions,
         peer: SocketAddr,
     ) -> Result<()> {
-        // TLS termination on the tunnel port reuses the server's certificate.
-        if opts.https && self.tls.is_none() {
+        // Resolve effective HTTPS flags from the policy (or legacy bools if no policy).
+        let capable = self.tls.is_some();
+        let (eff_https, eff_force_https, downgraded) = match opts.https_policy {
+            Some(policy) => resolve_https_policy(policy, capable),
+            None => (opts.https, opts.force_https, false), // legacy path, byte-identical
+        };
+
+        // Handle HTTPS capability mismatches: warn (policy path) or reject (legacy path).
+        if downgraded {
+            let msg = "server has no TLS certificate (--cert-file/--key-file); \
+                       falling back to plain HTTP for this tunnel";
+            warn!(%port, "{msg}");
+            // Defer the Warning send: see the ordering comment below after CarrierToken.
+        } else if opts.https_policy.is_none() && opts.https && self.tls.is_none() {
+            // LEGACY path: an OLD client asked for https without a cert. Preserve the
+            // exact fatal behavior (old client cannot decode Warning). Byte-identical.
             control
                 .send(ServerMessage::Error(
                     "server has no TLS certificate configured".into(),
@@ -1728,6 +1744,10 @@ impl Server {
                 .await?;
             return Ok(());
         }
+
+        // Apply the resolved effective flags to opts before it's cloned per-connection.
+        opts.https = eff_https;
+        opts.force_https = eff_force_https;
 
         let listener = match self.create_listener(port).await {
             Ok(listener) => listener,
@@ -1769,6 +1789,18 @@ impl Server {
             None
         };
 
+        // Send deferred Warning after readiness handshake (Hello + CarrierToken).
+        // CRITICAL ORDERING (from Opus review): the client's one-shot registration
+        // reads (client.rs:210 public Hello, :229 carrier token) BAIL on an unexpected
+        // Warning by design; only the main control loop (client.rs:981) handles it
+        // non-fatally (warn+continue). Therefore we send Warning AFTER the readiness
+        // handshake so it is consumed on the main loop, never at a one-shot read.
+        if downgraded && opts.https_policy.is_some() {
+            let msg = "server has no TLS certificate (--cert-file/--key-file); \
+                       falling back to plain HTTP for this tunnel";
+            let _ = control.send(ServerMessage::Warning(msg.into())).await;
+        }
+
         // Register this tunnel in the admin registry for its whole lifetime; the
         // registration is removed when this function returns (client gone).
         let registration = self.admin.register(NewEntry {
@@ -1778,8 +1810,8 @@ impl Server {
             public_port: Some(port),
             notes: opts.notes.clone(),
             basic_auth: opts.basic_auth.is_some(),
-            https: opts.https,
-            force_https: opts.force_https,
+            https: eff_https,
+            force_https: eff_force_https,
             carriers: opts.carriers,
             auto_reconnect: opts.auto_reconnect,
             webserver_log: opts.webserver_log,

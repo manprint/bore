@@ -1318,6 +1318,7 @@ impl Proxy {
                         Some(ServerMessage::VpnError(err)) => error!(%err, "vpn error"),
                         Some(ServerMessage::VpnPeerJoin { .. }) => warn!("unexpected vpn peer join in 1:1 mode"),
                         Some(ServerMessage::VpnPeerLeave { .. }) => warn!("unexpected vpn peer leave in 1:1 mode"),
+                        Some(ServerMessage::Warning(msg)) => tracing::warn!("{msg}"),
                         None => return Ok(()),
                     }
                 }

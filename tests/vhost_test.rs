@@ -12,6 +12,7 @@ use bore_cli::{
     client::{Client, ProviderMeta},
     reconnect,
     server::Server,
+    shared::HttpsPolicy,
     transport::{self, Endpoint},
     vhost::{Reservation, VhostConfig, VhostModeCfg},
     weblog::{AccessLogConfig, AccessLogger},
@@ -2489,6 +2490,313 @@ async fn vhost_client_access_log() -> Result<()> {
         content.contains("127.0.0.1"),
         "client vhost log should contain caller IP: {}",
         content
+    );
+
+    Ok(())
+}
+
+// ─── Phase 2: Vhost HTTPS policy tests ──────────────────────────────────────
+
+#[tokio::test]
+async fn vhost_entry_redirect_overrides_both() -> Result<()> {
+    const CTRL: u16 = 19000;
+    const HTTP: u16 = 19001;
+
+    let _guard = SERIAL_GUARD.lock().await;
+
+    let (cert_pem, key_pem) = self_signed_for(vec!["*.example.com".into()])?;
+    let (cert_path, key_path) = write_pem_files(&cert_pem, &key_pem)?;
+
+    let cfg = VhostConfig {
+        base_domain: "example.com".to_string(),
+        mode: VhostModeCfg::Both,
+        http_port: HTTP,
+        https_port: 19002,
+        cert_file: Some(cert_path),
+        key_file: Some(key_path),
+        default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
+        reservations: vec![],
+    };
+
+    spawn_server_vhost(CTRL, cfg).await?;
+
+    let stub_port = spawn_http_stub("OK").await;
+
+    // Provider with an explicit Some(Redirect) policy under mode=Both. Both mode
+    // alone does NOT redirect, so a 308 proves the per-tunnel policy overrides it.
+    let redirect_client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("127.0.0.1:{CTRL}"),
+        "testred",
+        "client1",
+        None,
+        false,
+        1,
+        ProviderMeta {
+            https_policy: Some(HttpsPolicy::Redirect),
+            ..Default::default()
+        },
+        None,
+    )
+    .await?;
+    tokio::spawn(redirect_client.listen());
+
+    // A second provider with None policy on the same server: must NOT redirect
+    // (proves the override is per-subdomain, not global).
+    let plain_client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("127.0.0.1:{CTRL}"),
+        "plainnone",
+        "client2",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(plain_client.listen());
+    wait_port(HTTP, true).await;
+
+    // testred (Some(Redirect)) → 308 redirect to https despite Both mode.
+    let mut stream = TcpStream::connect(("127.0.0.1", HTTP)).await?;
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: testred.example.com\r\n\r\n")
+        .await?;
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.contains("308"),
+        "Some(Redirect) must 308 under Both mode: {response}"
+    );
+
+    // plainnone (None) → served plain (200), no redirect.
+    let mut stream = TcpStream::connect(("127.0.0.1", HTTP)).await?;
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: plainnone.example.com\r\n\r\n")
+        .await?;
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        (response.contains("200") || response.contains("OK")) && !response.contains("308"),
+        "None under Both must serve plain (no redirect): {response}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn vhost_entry_off_optsout_of_global_redirect() -> Result<()> {
+    const CTRL: u16 = 19010;
+    const HTTP: u16 = 19011;
+
+    let _guard = SERIAL_GUARD.lock().await;
+
+    let (cert_pem, key_pem) = self_signed_for(vec!["*.example.com".into()])?;
+    let (cert_path, key_path) = write_pem_files(&cert_pem, &key_pem)?;
+
+    let cfg = VhostConfig {
+        base_domain: "example.com".to_string(),
+        mode: VhostModeCfg::RedirectHttps,
+        http_port: HTTP,
+        https_port: 19012,
+        cert_file: Some(cert_path),
+        key_file: Some(key_path),
+        default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
+        reservations: vec![],
+    };
+
+    spawn_server_vhost(CTRL, cfg).await?;
+
+    let stub_port = spawn_http_stub("OK").await;
+
+    // Provider with Some(Off) under mode=RedirectHttps: opts OUT of the global
+    // redirect and must be served plain HTTP (200, no 308).
+    let off_client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("127.0.0.1:{CTRL}"),
+        "noredirect",
+        "client1",
+        None,
+        false,
+        1,
+        ProviderMeta {
+            https_policy: Some(HttpsPolicy::Off),
+            ..Default::default()
+        },
+        None,
+    )
+    .await?;
+    tokio::spawn(off_client.listen());
+
+    // Second provider with None under RedirectHttps: keeps the global redirect (308).
+    let inherit_client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("127.0.0.1:{CTRL}"),
+        "inheritred",
+        "client2",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(inherit_client.listen());
+    wait_port(HTTP, true).await;
+
+    // noredirect (Some(Off)) → served plain (200), NO redirect even under RedirectHttps.
+    let mut stream = TcpStream::connect(("127.0.0.1", HTTP)).await?;
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: noredirect.example.com\r\n\r\n")
+        .await?;
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        (response.contains("200") || response.contains("OK")) && !response.contains("308"),
+        "Some(Off) must opt out of the global redirect: {response}"
+    );
+
+    // inheritred (None) → global RedirectHttps still applies (308).
+    let mut stream = TcpStream::connect(("127.0.0.1", HTTP)).await?;
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: inheritred.example.com\r\n\r\n")
+        .await?;
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.contains("308"),
+        "None under RedirectHttps must still redirect: {response}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn vhost_https_request_no_cert_warns_and_serves_http() -> Result<()> {
+    const CTRL: u16 = 19020;
+    const HTTP: u16 = 19021;
+
+    let _guard = SERIAL_GUARD.lock().await;
+
+    let cfg = VhostConfig {
+        base_domain: "example.com".to_string(),
+        mode: VhostModeCfg::Http,
+        http_port: HTTP,
+        https_port: 19022,
+        cert_file: None,
+        key_file: None,
+        default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
+        reservations: vec![],
+    };
+
+    spawn_server_vhost(CTRL, cfg).await?;
+
+    let stub_port = spawn_http_stub("OK").await;
+
+    // Some(On) against a NO-cert server (mode=Http) → the server must downgrade
+    // (warn + fall back to HTTP), never reject. carriers=2 additionally regresses
+    // the Warning-ordering fix: the server sends the downgrade Warning AFTER the
+    // CarrierToken, so the client's one-shot carrier read does not bail on it. If
+    // the ordering were wrong, `new_vhost_provider` below would return an error.
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("127.0.0.1:{CTRL}"),
+        "nocert",
+        "client1",
+        None,
+        false,
+        2,
+        ProviderMeta {
+            https_policy: Some(HttpsPolicy::On),
+            ..Default::default()
+        },
+        None,
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    wait_port(HTTP, true).await;
+
+    // Plain HTTP request should work despite no cert (tunnel is up, downgraded).
+    let mut stream = TcpStream::connect(("127.0.0.1", HTTP)).await?;
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: nocert.example.com\r\n\r\n")
+        .await?;
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(response.contains("200") || response.contains("OK"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn vhost_policy_none_is_byte_identical() -> Result<()> {
+    const CTRL: u16 = 19030;
+    const HTTP: u16 = 19031;
+
+    let _guard = SERIAL_GUARD.lock().await;
+
+    let (cert_pem, key_pem) = self_signed_for(vec!["*.example.com".into()])?;
+    let (cert_path, key_path) = write_pem_files(&cert_pem, &key_pem)?;
+
+    let cfg = VhostConfig {
+        base_domain: "example.com".to_string(),
+        mode: VhostModeCfg::Both,
+        http_port: HTTP,
+        https_port: 19032,
+        cert_file: Some(cert_path),
+        key_file: Some(key_path),
+        default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
+        reservations: vec![],
+    };
+
+    spawn_server_vhost(CTRL, cfg).await?;
+
+    let stub_port = spawn_http_stub("OK").await;
+
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("127.0.0.1:{CTRL}"),
+        "identical",
+        "client1",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    wait_port(HTTP, true).await;
+
+    // None policy under Both mode → should serve 200 (no redirect with Both mode).
+    time::sleep(Duration::from_millis(100)).await;
+    let mut stream = TcpStream::connect(("127.0.0.1", HTTP)).await?;
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: identical.example.com\r\n\r\n")
+        .await?;
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.contains("200") || response.contains("OK"),
+        "None under Both mode should 200: {}",
+        response
     );
 
     Ok(())

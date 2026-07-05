@@ -45,6 +45,10 @@ pub struct ProviderMeta {
     /// to the server's admin page (via `HelloVhost`) so the Vhost section can show
     /// it, matching the public-tunnel `TunnelOptions.auto_reconnect` field.
     pub auto_reconnect: bool,
+    /// Per-tunnel HTTPS policy for a vhost provider. `None` = inherit the server's
+    /// `--vhost-mode` default (byte-identical to the pre-policy behavior). Only
+    /// meaningful for vhost providers; ignored by secret providers.
+    pub https_policy: Option<crate::shared::HttpsPolicy>,
 }
 
 /// State structure for the client.
@@ -250,6 +254,10 @@ impl Client {
                     }
                 }
                 Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+                Some(ServerMessage::Warning(msg)) => {
+                    tracing::warn!("{msg}");
+                    bail!("unexpected warning during carrier setup")
+                }
                 other => bail!("expected carrier token, got {other:?}"),
             }
         }
@@ -368,6 +376,10 @@ impl Client {
         match control.recv_timeout().await? {
             Some(ServerMessage::Ok) => {}
             Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+            Some(ServerMessage::Warning(msg)) => {
+                tracing::warn!("{msg}");
+                bail!("unexpected warning during secret registration")
+            }
             Some(ServerMessage::Challenge(_)) => {
                 bail!("server requires authentication, but no client secret was provided");
             }
@@ -408,6 +420,10 @@ impl Client {
                     }
                 }
                 Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+                Some(ServerMessage::Warning(msg)) => {
+                    tracing::warn!("{msg}");
+                    bail!("unexpected warning during carrier setup")
+                }
                 other => bail!("expected carrier token, got {other:?}"),
             }
         }
@@ -578,6 +594,7 @@ impl Client {
                 auto_reconnect: meta.auto_reconnect,
                 local_host: Some(local_host.to_string()),
                 local_port,
+                https_policy: meta.https_policy,
             })
             .await?;
 
@@ -600,6 +617,10 @@ impl Client {
                 }
             }
             Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+            Some(ServerMessage::Warning(msg)) => {
+                tracing::warn!("{msg}");
+                bail!("unexpected warning during vhost registration")
+            }
             Some(ServerMessage::Challenge(_)) => {
                 bail!("server requires authentication, but no client secret was provided");
             }
@@ -635,6 +656,10 @@ impl Client {
                     }
                 }
                 Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+                Some(ServerMessage::Warning(msg)) => {
+                    tracing::warn!("{msg}");
+                    bail!("unexpected warning during carrier setup")
+                }
                 other => bail!("expected carrier token, got {other:?}"),
             }
         }
@@ -957,6 +982,7 @@ impl Client {
                         Some(ServerMessage::VpnError(err)) => error!(%err, "vpn error"),
                         Some(ServerMessage::VpnPeerJoin { .. }) => warn!("unexpected vpn peer join in 1:1 mode"),
                         Some(ServerMessage::VpnPeerLeave { .. }) => warn!("unexpected vpn peer leave in 1:1 mode"),
+                        Some(ServerMessage::Warning(msg)) => tracing::warn!("{msg}"),
                         None => return Ok(()),
                     }
                 }

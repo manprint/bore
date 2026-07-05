@@ -500,7 +500,34 @@ default — `StrictHostKeyChecking=yes` in produzione.
 
 ---
 
-## 11. Cosa NON è disponibile via SSH (usare il client `bore` nativo)
+## 11. Messaggi client innocui
+
+**`PTY allocation request failed on channel 0`**
+
+Stampato dal client OpenSSH quando auto-richiede un PTY interattivo (qualunque `ssh`/`autossh`
+senza `-T`). Il gateway non è una shell, quindi rifiuta la PTY. **Il forward `-R`/`-L` corre su
+un canale separato e NON è affetto** — il tunnel funziona normalmente.
+
+Raccomandazione: passa `-T` a ssh/autossh per silenziarla:
+
+```bash
+ssh -T -p 443 -R vhost/app:0:localhost:5000 bore.example.com
+autossh -M0 -T -p 443 -R vhost/app:0:localhost:5000 bore.example.com
+```
+
+**Non usare `-N`** (mai): skipa interamente il canale sessione, quindi il cliente non riceve
+il banner di stato (§4.5) né gli avvisi di parametri inapplicabili — il terminale rimane muto.
+Usa `-T` al suo posto.
+
+**`Allocated port 1 for remote forward to ...`**
+
+Il placeholder RFC4254 di OpenSSH per un forward vhost/secret provider (`-R <label>:0:...`).
+Poiché vhost/secret non hanno una vera porta TCP, il server risponde con un placeholder (di
+solito `1`). Puramente cosmético, ignorare.
+
+---
+
+## 12. Cosa NON è disponibile via SSH (usare il client `bore` nativo)
 
 | Funzionalità | Motivo |
 |---|---|
@@ -517,7 +544,7 @@ restrizioni per-chiave (`permit=`), N tunnel su una sola sessione SSH, compressi
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 | Sintomo | Causa | Rimedio |
 |---|---|---|

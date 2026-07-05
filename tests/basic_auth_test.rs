@@ -197,6 +197,7 @@ async fn secret_provider_basic_auth_rejects_and_allows() -> Result<()> {
             notes: None,
             basic_auth: Some(CREDS.into()),
             auto_reconnect: false,
+            https_policy: None,
         },
         None,
     )

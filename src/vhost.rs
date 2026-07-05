@@ -298,6 +298,41 @@ pub fn cert_present(cfg: &VhostConfig) -> bool {
     cfg.cert_file.is_some() && cfg.key_file.is_some()
 }
 
+/// Compute effective admin-display HTTPS flags for a vhost entry.
+///
+/// When the entry's policy is `None`, inherit the global mode. When `Some(p)`,
+/// resolve the policy against vhost capability (can only serve HTTPS if mode
+/// serves it AND cert is present).
+pub fn vhost_display_flags(
+    policy: Option<crate::shared::HttpsPolicy>,
+    mode: VhostMode,
+    vhost_capable: bool,
+) -> (bool, bool) {
+    match policy {
+        None => (mode.serves_https(), mode.redirects_http()),
+        Some(p) => {
+            let (https, force_https, _downgraded) =
+                crate::shared::resolve_https_policy(p, vhost_capable);
+            (https, force_https)
+        }
+    }
+}
+
+/// Decide whether to 308-redirect a plain HTTP request to HTTPS for a vhost entry.
+///
+/// When the entry's policy is `None`, use global mode (byte-identical to today).
+/// When `Some(Redirect)`, redirect only if vhost is capable. Other policies never redirect.
+pub fn should_redirect(
+    entry_policy: Option<crate::shared::HttpsPolicy>,
+    global_mode: VhostMode,
+    vhost_capable: bool,
+) -> bool {
+    match entry_policy {
+        None => global_mode.redirects_http(),
+        Some(p) => matches!(p, crate::shared::HttpsPolicy::Redirect) && vhost_capable,
+    }
+}
+
 /// Compute the public URL(s) for a registered vhost subdomain.
 ///
 /// Port is omitted from the URL when it matches the scheme default (80/443).
@@ -357,6 +392,8 @@ pub struct VhostEntry {
     /// Whether this provider requested access logging with real caller IP forwarding.
     /// Wired from `HelloVhost.webserver_log`.
     pub webserver_log: bool,
+    /// Per-tunnel HTTPS policy. `None` = inherit the server default (global mode).
+    pub https_policy: Option<crate::shared::HttpsPolicy>,
     // ── Execution-info fields (parity with the public `TunnelView`) ───────────
     // These let the admin Vhost section present the same columns as Tunnels.
     // `VhostEntry` is self-sufficient here (no admin-registry join, see
@@ -559,6 +596,7 @@ pub async fn serve_vhost_provider(
     udp_tuning: UdpDirectTuning,
     local_host: Option<String>,
     local_port: u16,
+    https_policy: Option<crate::shared::HttpsPolicy>,
 ) -> Result<()> {
     // Validate against live config (resolve_route checks reservations).
     let cfg = vhost_config.read().unwrap().clone();
@@ -573,6 +611,10 @@ pub async fn serve_vhost_provider(
             return Ok(());
         }
     };
+
+    // Compute vhost capability: can serve HTTPS if mode allows it and cert is present.
+    let mode = resolve_mode(&cfg, cert_present(&cfg)).unwrap_or(VhostMode::Http);
+    let vhost_capable = mode.serves_https();
 
     // Atomic insert: reject if subdomain already live.
     let pool = match registry.entry(subdomain.clone()) {
@@ -597,6 +639,7 @@ pub async fn serve_vhost_provider(
                 direct_stream_opens: AtomicU64::new(0),
                 active: Arc::new(AtomicUsize::new(0)),
                 webserver_log,
+                https_policy,
                 peer,
                 since: Instant::now(),
                 notes: notes.clone(),
@@ -623,6 +666,9 @@ pub async fn serve_vhost_provider(
         subdomain: subdomain.clone(),
     };
 
+    // Compute effective admin display flags.
+    let (adm_https, adm_force_https) = vhost_display_flags(https_policy, mode, vhost_capable);
+
     let _admin_reg = admin.register(NewEntry {
         role: Role::Vhost,
         peer,
@@ -630,8 +676,8 @@ pub async fn serve_vhost_provider(
         public_port: None,
         notes,
         basic_auth,
-        https: false,
-        force_https: false,
+        https: adm_https,
+        force_https: adm_force_https,
         carriers: 0,
         auto_reconnect,
         webserver_log,
@@ -658,7 +704,6 @@ pub async fn serve_vhost_provider(
     });
 
     // Compute and send the public URLs based on current config.
-    let mode = resolve_mode(&cfg, cert_present(&cfg)).unwrap_or(VhostMode::Http);
     let (http_url, https_url) = public_urls(
         &subdomain,
         &cfg.base_domain,
@@ -711,6 +756,26 @@ pub async fn serve_vhost_provider(
     #[cfg(not(feature = "udp"))]
     if udp {
         debug!(%subdomain, "vhost udp requested but binary was built without udp support; using TCP relay");
+    }
+
+    // 2.3: Send the HTTPS downgrade warning LAST, after every one-shot handshake
+    // message (VhostReady + CarrierToken). The client's one-shot vhost reads
+    // (client.rs VhostReady/CarrierToken) BAIL on an unexpected Warning; only the
+    // main control loop handles it non-fatally. The vhost UDP offer (if any) is
+    // also consumed by the client's main loop, so ordering against it is moot.
+    if let Some(p) = https_policy {
+        if matches!(
+            p,
+            crate::shared::HttpsPolicy::On | crate::shared::HttpsPolicy::Redirect
+        ) && !vhost_capable
+        {
+            let msg = format!(
+                "vhost server not configured for HTTPS (mode={mode:?}, cert={}); serving this subdomain over HTTP",
+                if cert_present(&cfg) { "present" } else { "missing" }
+            );
+            warn!(%subdomain, "{msg}");
+            let _ = control.send(ServerMessage::Warning(msg)).await;
+        }
     }
 
     // Heartbeat loop until the provider disconnects.
@@ -1208,14 +1273,6 @@ pub async fn handle_http(
         .await
         .context("timed out reading HTTP request head")??;
 
-    // Redirect mode: return 308 instead of proxying.
-    if mode.redirects_http() {
-        let cfg = vhost_config.as_ref().map(|c| c.read().unwrap().clone());
-        let https_port = cfg.as_deref().map(|c| c.https_port).unwrap_or(443);
-        edge::redirect_to_https(stream, https_port, None).await?;
-        return Ok(());
-    }
-
     let cfg = vhost_config.as_ref().map(|c| c.read().unwrap().clone());
     let base_domain = cfg.as_deref().map(|c| c.base_domain.as_str()).unwrap_or("");
 
@@ -1234,9 +1291,27 @@ pub async fn handle_http(
     // Single registry lookup: clone the entry out (pool + inject headers) so no
     // DashMap guard is held across the await in `relay_vhost`.
     let Some(entry) = registry.get(&sub).map(|e| Arc::clone(e.value())) else {
+        // Unknown subdomain: use global mode for redirect decision (byte-identical to today).
+        if mode.redirects_http() {
+            let https_port = cfg.as_deref().map(|c| c.https_port).unwrap_or(443);
+            // Reuse the head already read above; re-reading would block a real
+            // (non-half-closing) client until the network timeout.
+            edge::write_https_redirect(stream, &head, https_port, None).await?;
+            return Ok(());
+        }
         debug!(%sub, "vhost http 502: no provider registered");
         return send_bad_gateway(stream).await;
     };
+
+    // Per-subdomain redirect decision: compute vhost capability and check entry policy.
+    let vhost_capable = mode.serves_https();
+    if should_redirect(entry.https_policy, mode, vhost_capable) {
+        let https_port = cfg.as_deref().map(|c| c.https_port).unwrap_or(443);
+        // Reuse the head already read above; re-reading would block a real
+        // (non-half-closing) client until the network timeout.
+        edge::write_https_redirect(stream, &head, https_port, None).await?;
+        return Ok(());
+    }
 
     let fqdn = host.unwrap_or("").to_string();
     relay_vhost(
@@ -1886,6 +1961,7 @@ reservations:
             direct_stream_opens: AtomicU64::new(0),
             active: Arc::new(AtomicUsize::new(0)),
             webserver_log: false,
+            https_policy: None,
             peer: "127.0.0.1:1".parse().unwrap(),
             since: Instant::now(),
             notes: None,
@@ -1970,5 +2046,112 @@ reservations:
         // No live carrier ⇒ opening the provider link errors out; that error
         // (not an early Ok(())) proves the auth gate was passed.
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn vhost_display_flags_none_inherits_mode() {
+        // policy=None with mode=RedirectHttps → (true, true)
+        let (https, force_https) = vhost_display_flags(None, VhostMode::RedirectHttps, true);
+        assert_eq!((https, force_https), (true, true));
+
+        // policy=None with mode=Http → (false, false)
+        let (https, force_https) = vhost_display_flags(None, VhostMode::Http, false);
+        assert_eq!((https, force_https), (false, false));
+
+        // policy=None with mode=Both → (true, false)
+        let (https, force_https) = vhost_display_flags(None, VhostMode::Both, true);
+        assert_eq!((https, force_https), (true, false));
+    }
+
+    #[test]
+    fn vhost_display_flags_off_never_redirect() {
+        let (https, force_https) = vhost_display_flags(
+            Some(crate::shared::HttpsPolicy::Off),
+            VhostMode::RedirectHttps,
+            true,
+        );
+        assert_eq!((https, force_https), (false, false));
+    }
+
+    #[test]
+    fn vhost_display_flags_on_capable() {
+        let (https, force_https) =
+            vhost_display_flags(Some(crate::shared::HttpsPolicy::On), VhostMode::Both, true);
+        assert_eq!((https, force_https), (true, false));
+    }
+
+    #[test]
+    fn vhost_display_flags_on_incapable() {
+        let (https, force_https) =
+            vhost_display_flags(Some(crate::shared::HttpsPolicy::On), VhostMode::Both, false);
+        assert_eq!((https, force_https), (false, false));
+    }
+
+    #[test]
+    fn vhost_display_flags_redirect_capable() {
+        let (https, force_https) = vhost_display_flags(
+            Some(crate::shared::HttpsPolicy::Redirect),
+            VhostMode::Both,
+            true,
+        );
+        assert_eq!((https, force_https), (true, true));
+    }
+
+    #[test]
+    fn vhost_display_flags_redirect_incapable() {
+        let (https, force_https) = vhost_display_flags(
+            Some(crate::shared::HttpsPolicy::Redirect),
+            VhostMode::Both,
+            false,
+        );
+        assert_eq!((https, force_https), (false, false));
+    }
+
+    #[test]
+    fn should_redirect_none_respects_global_mode() {
+        // None with RedirectHttps → true (global decision)
+        assert!(should_redirect(None, VhostMode::RedirectHttps, true));
+
+        // None with Both → false (no global redirect)
+        assert!(!should_redirect(None, VhostMode::Both, true));
+
+        // None with Http → false (no global redirect)
+        assert!(!should_redirect(None, VhostMode::Http, false));
+    }
+
+    #[test]
+    fn should_redirect_off_never_redirects() {
+        assert!(!should_redirect(
+            Some(crate::shared::HttpsPolicy::Off),
+            VhostMode::RedirectHttps,
+            true
+        ));
+    }
+
+    #[test]
+    fn should_redirect_on_never_redirects() {
+        assert!(!should_redirect(
+            Some(crate::shared::HttpsPolicy::On),
+            VhostMode::RedirectHttps,
+            true
+        ));
+    }
+
+    #[test]
+    fn should_redirect_redirect_capable() {
+        assert!(should_redirect(
+            Some(crate::shared::HttpsPolicy::Redirect),
+            VhostMode::Both,
+            true
+        ));
+    }
+
+    #[test]
+    fn should_redirect_redirect_incapable() {
+        assert!(!should_redirect(
+            Some(crate::shared::HttpsPolicy::Redirect),
+            VhostMode::Both,
+            false
+        ));
     }
 }

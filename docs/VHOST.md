@@ -239,6 +239,7 @@ a cert later reloads the TLS material but does not start an HTTPS listener until
 | `--to` | `BORE_SERVER` | `https://bore.0912345.xyz` | bore server address |
 | `--secret` | `BORE_SECRET` | — | Server authentication secret |
 | `--insecure` | `BORE_INSECURE` | false | Skip TLS cert verification |
+| `--https[=off\|on\|redirect]` | `BORE_HTTPS` | inherit `--vhost-mode` | Per-subdomain HTTPS policy (bare = `on`): `off` = HTTP only, no redirect (opt out of a global `redirect-https`); `on` = served over HTTPS via the server wildcard cert; `redirect` = 308 HTTP→HTTPS for this subdomain. Overrides the server default but falls back to HTTP with a warning if the server has no vhost cert. See the caveat below and the applicability matrix. |
 | `--carriers N` | `BORE_CARRIERS` | 1 | Parallel relay TCP connections (see note below) |
 | `--udp` | `BORE_VHOST_UDP` | false | Try a QUIC direct path for the server→provider hop; fall back silently to TCP relay |
 | `--basic-auth user:pass` | — | — | Reports Basic auth to admin page (display only) |
@@ -440,3 +441,35 @@ guard removes the registry entry synchronously).
   HTTP/TLS to the server, and the server still relays every byte.
 - **Per-client distinct secrets:** reservation identity is by `client_id` string only.
   Future: per-reservation secrets or mTLS.
+
+---
+
+## Parameter applicability matrix
+
+The following table documents which client parameters are applicable to each tunnel type and transport:
+
+| Parameter | `bore local` | `bore vhost` | `bore proxy` / Secret consumer | SSH public | SSH vhost | SSH secret provider |
+|---|---|---|---|---|---|---|
+| **HTTPS policy** | | | | | | |
+| `--https=off\|on\|redirect` | yes | yes | n/a | yes | yes (D10) | n/a (opaque TCP) |
+| `--force-https` | yes (deprecated→redirect) | not in CLI (prevented by clap) | n/a | yes (deprecated) | n/a on vhost (warns) | n/a (warns) |
+| **HTTP layer** | | | | | | |
+| `--basic-auth=USER:PASS` | yes (display-only) | yes | n/a (opaque relay) | yes (public only) | n/a (warns) | n/a (warns) |
+| `--webserver-log=DIR` | yes | yes | n/a | yes (public, vhost only) | yes (native vhost only) | n/a (warns) |
+| `--max-conns=N` | yes | yes | yes (native secret consumer) | yes | n/a (warns; server-wide cap only) | n/a (warns; no per-tunnel cap) |
+| **Data path / transport** | | | | | | |
+| `--carriers=N` | yes | yes | yes | transport-only (SSH warns) | transport-only (warns) | transport-only (warns) |
+| `--udp` | yes (public: server→client QUIC; secret: p2p hole-punch) | yes (server→provider QUIC) | yes (secret consumer: p2p) | transport-only (warns) | transport-only (warns) | transport-only (warns) |
+| `--stun-server=HOST:PORT` | yes (secret only; warns if public) | n/a | yes (secret consumer) | transport-only (warns) | transport-only (warns) | transport-only (warns) |
+| `--upnp` | yes (secret only; warns if public) | n/a | yes (secret consumer) | transport-only (warns) | transport-only (warns) | transport-only (warns) |
+| `--try-port-prediction` | yes (secret only; warns if public) | n/a | yes (secret consumer) | transport-only (warns) | transport-only (warns) | transport-only (warns) |
+| `--nat-udp-preferred-port=PORT` | yes (secret only; warns if public) | n/a | yes (secret consumer) | transport-only (warns) | transport-only (warns) | transport-only (warns) |
+| `--auto-reconnect` | yes | yes | yes (consumer) | transport-only (use autossh instead) | transport-only (warns) | transport-only (warns) |
+| **Metadata** | | | | | | |
+| `--notes=TEXT` | yes | yes | yes | yes | yes | yes |
+
+**Notes on per-tunnel HTTPS:**
+
+- **D10 (vhost `--https=off` caveat):** A vhost request arriving over HTTPS for an `off`-marked subdomain is still **served over HTTPS** (TLS is terminated globally at the frontend before the subdomain is known, and cannot be un-terminated per-subdomain). `off` means "HTTP is served + never force-redirect", not "refuse HTTPS connections". This is an honest limitation of the shared :80/:443 architecture — the public tunnel family (dedicated port per tunnel) does not have this constraint.
+
+- **Transport-only params via SSH:** Parameters marked `transport-only` (`--udp`, `--carriers`, `--stun-server`, `--upnp`, `--try-port-prediction`, `--nat-udp-preferred-port`, `--auto-reconnect`) are native-client features (direct QUIC paths, multi-connection, UDP hole-punching, automatic reconnection). SSH carries only a single TCP relay connection and does not support these. When passed via SSH exec params or environment, they produce an explicit warning message on the session channel (`<param>: not available via SSH ingress; use the native bore client`), never a silent no-op.

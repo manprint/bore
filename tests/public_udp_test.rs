@@ -171,6 +171,7 @@ async fn public_udp_direct_round_trip() -> Result<()> {
             max_conns: 0,
             local_host: None,
             local_port: 0,
+            https_policy: None,
         },
         None,
     )
@@ -223,6 +224,7 @@ async fn public_udp_many_concurrent_streams() -> Result<()> {
             max_conns: 0,
             local_host: None,
             local_port: 0,
+            https_policy: None,
         },
         None,
     )
@@ -286,6 +288,7 @@ async fn public_udp_carriers() -> Result<()> {
             max_conns: 0,
             local_host: None,
             local_port: 0,
+            https_policy: None,
         },
         None,
     )
@@ -354,6 +357,7 @@ async fn public_udp_large_payload() -> Result<()> {
             max_conns: 0,
             local_host: None,
             local_port: 0,
+            https_policy: None,
         },
         None,
     )
@@ -423,6 +427,7 @@ async fn public_udp_falls_back_to_relay_when_server_lacks_udp() -> Result<()> {
             max_conns: 0,
             local_host: None,
             local_port: 0,
+            https_policy: None,
         },
         None,
     )
@@ -480,6 +485,7 @@ async fn public_tcp_still_works_without_udp() -> Result<()> {
             max_conns: 0,
             local_host: None,
             local_port: 0,
+            https_policy: None,
         },
         None,
     )

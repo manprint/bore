@@ -932,3 +932,31 @@ Copertura test: `t_ssh_banner_vhost_no_n_survives_and_reports` /
 `t_ssh_banner_secret_provider_no_n_survives_and_reports` /
 `t_ssh_banner_secret_consumer_fires_once` / `t_ssh_nokill_zero_bare_interactive_still_rejected`
 in `tests/ssh_gateway_test.rs`.
+
+### 6.12 Messaggi client innocui
+
+**PTY allocation request failed on channel 0**
+
+Questo messaggio è stampato dal client OpenSSH quando auto-richiede un PTY interattivo
+(qualunque invocazione `ssh`/`autossh` senza `-T`). Il gateway non è una shell, quindi
+rifiuta la richiesta PTY (la funzione `pty_request` in `src/sshgw.rs:1460` ritorna
+`channel_failure`). **Il forward `-R`/`-L` corre su un canale separato e NON è affetto**
+— il tunnel funziona normalmente.
+
+Raccomandazione: passa `-T` al client SSH/autossh per silenziarla:
+
+```bash
+ssh -T -p 443 -R vhost/app:0:localhost:5000 bore.example.com
+autossh -M0 -T -p 443 -R vhost/app:0:localhost:5000 bore.example.com
+```
+
+Vale anche per l'asse opposto: **non usare mai `-N`** (§6.4a). `-N` salta interamente
+il canale sessione, quindi il client non riceve neppure il banner di stato del tunnel
+(§6.11) né eventuali avvisi di parametri inapplicabili — il terminale rimane muto.
+
+**Allocated port N for remote forward to ...**
+
+Questo è il placeholder RFC4254 stampato da OpenSSH per un forward vhost o secret provider
+(`-R <label>:0:...`). Poiché vhost/secret non hanno una vera porta TCP in ascolto (il
+routing è per nome, non per porta pubblica), il server risponde con un port number placeholder
+(solitamente `1`). È puramente cosmético, ignorare.

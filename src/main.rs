@@ -29,7 +29,10 @@ use bore_cli::{
     reconnect,
     secret::Proxy,
     server::Server,
-    shared::{TunnelOptions, UdpDirectTuning, UdpTestOptions, MAX_DIRECT_STREAMS, MAX_NOTES_LEN},
+    shared::{
+        HttpsPolicy, TunnelOptions, UdpDirectTuning, UdpTestOptions, MAX_DIRECT_STREAMS,
+        MAX_NOTES_LEN,
+    },
     transfer::{
         CollisionPolicy, DeviceMode, ListenerOptions as TransferListenerOptions,
         SenderOptions as TransferSenderOptions, SymlinkMode,
@@ -107,13 +110,19 @@ enum Command {
         #[clap(long, env = "BORE_INSECURE")]
         insecure: bool,
 
-        /// Terminate TLS on the tunnel port, so it is reachable over https://
-        /// (the server must have a certificate). Plain and raw access still work.
-        #[clap(long, env = "BORE_HTTPS")]
-        https: bool,
+        /// Per-tunnel HTTPS policy: `off` | `on` | `redirect`. Bare `--https` = on.
+        /// `off` = plain/raw only (no TLS, no redirect); `on` = terminate TLS and
+        /// serve both HTTP and HTTPS (raw still works); `redirect` = terminate TLS
+        /// and 308-redirect plain HTTP to https. Absent = inherit the server default.
+        /// A client request overrides the server default but falls back to HTTP with
+        /// a warning if the server has no certificate.
+        #[clap(long, value_enum, num_args = 0..=1, require_equals = true,
+               default_missing_value = "on", value_name = "off|on|redirect",
+               env = "BORE_HTTPS")]
+        https: Option<HttpsPolicy>,
 
-        /// Redirect plain HTTP requests on the tunnel port to https:// (requires
-        /// --https). Raw TCP and https:// keep working.
+        /// Deprecated: use `--https=redirect`. Kept as an alias that forces the
+        /// redirect policy. Raw TCP and https:// keep working.
         #[clap(long, requires = "https", env = "BORE_FORCE_HTTPS")]
         force_https: bool,
 
@@ -351,6 +360,17 @@ enum Command {
         /// Skip TLS certificate verification (for self-signed https:// servers).
         #[clap(long, env = "BORE_INSECURE")]
         insecure: bool,
+
+        /// Per-subdomain HTTPS policy: `off` | `on` | `redirect`. Bare `--https` = on.
+        /// `off` = served over HTTP, never force-redirect; `on` = served over HTTPS
+        /// (via the server wildcard cert), no redirect; `redirect` = 308-redirect
+        /// plain HTTP to https for this subdomain. Absent = inherit the server
+        /// `--vhost-mode`. A request overrides the server default but falls back to
+        /// HTTP with a warning if the server is not configured for HTTPS.
+        #[clap(long, value_enum, num_args = 0..=1, require_equals = true,
+               default_missing_value = "on", value_name = "off|on|redirect",
+               env = "BORE_HTTPS")]
+        https: Option<HttpsPolicy>,
 
         /// Free-form note shown on the server's admin status page (no behaviour).
         #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
@@ -1485,6 +1505,9 @@ async fn dispatch(command: Command) -> Result<()> {
                         notes,
                         basic_auth,
                         auto_reconnect,
+                        // Secret providers have no HTTPS policy (secret has no vhost
+                        // frontend). Vhost providers set this from the CLI in phase 3.
+                        https_policy: None,
                     };
                     let connect = move || {
                         let (local_host, to, id, secret, stun_server, meta, access_logger) = (
@@ -1538,9 +1561,19 @@ async fn dispatch(command: Command) -> Result<()> {
                              QUIC direct path.",
                         );
                     }
+                    // Resolve the per-tunnel HTTPS policy. `--force-https` is a
+                    // deprecated alias that forces `redirect`.
+                    if force_https {
+                        warn!("--force-https is deprecated; use `--https=redirect`");
+                    }
+                    let https_policy = resolve_cli_https_policy(https, force_https);
+                    // Derive the legacy bool fields so an OLD server (which ignores
+                    // https_policy) still sees the request; a NEW server prefers
+                    // https_policy when present (see server.rs resolve).
+                    let (https_bool, force_https_bool) = legacy_https_bools(https_policy);
                     let options = TunnelOptions {
-                        https,
-                        force_https,
+                        https: https_bool,
+                        force_https: force_https_bool,
                         basic_auth,
                         notes,
                         carriers,
@@ -1550,6 +1583,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         max_conns,
                         local_host: Some(local_host.clone()),
                         local_port,
+                        https_policy,
                     };
                     let connect = move || {
                         let (local_host, to, secret, options, access_logger) = (
@@ -2179,6 +2213,7 @@ async fn dispatch(command: Command) -> Result<()> {
             to,
             secret,
             insecure,
+            https,
             notes,
             basic_auth,
             carriers,
@@ -2194,6 +2229,8 @@ async fn dispatch(command: Command) -> Result<()> {
                 notes,
                 basic_auth: basic_auth.clone(),
                 auto_reconnect,
+                // Per-subdomain HTTPS policy from `--https`. None = inherit --vhost-mode.
+                https_policy: https,
             };
 
             // Build access logger for vhost provider.
@@ -2352,6 +2389,27 @@ async fn serve_proxy(proxy: Proxy) -> Result<()> {
 /// Parse a vhost forward target `host:port`. A leading ":" (e.g. ":8080") means
 /// `localhost`. The host may be an IP literal or a hostname (resolved at connect
 /// time), matching the local/proxy/transfer subcommands.
+/// Resolve the CLI HTTPS policy, honoring the deprecated `--force-https` alias
+/// (which forces `redirect`). Pure so it is unit-testable without logging.
+fn resolve_cli_https_policy(https: Option<HttpsPolicy>, force_https: bool) -> Option<HttpsPolicy> {
+    if force_https {
+        Some(HttpsPolicy::Redirect)
+    } else {
+        https
+    }
+}
+
+/// Derive the legacy `(https, force_https)` bool wire fields from a resolved
+/// policy, for backward compatibility with an old server that ignores
+/// `https_policy`. A new server prefers `https_policy` when present.
+fn legacy_https_bools(policy: Option<HttpsPolicy>) -> (bool, bool) {
+    match policy {
+        Some(HttpsPolicy::On) => (true, false),
+        Some(HttpsPolicy::Redirect) => (true, true),
+        Some(HttpsPolicy::Off) | None => (false, false),
+    }
+}
+
 fn parse_vhost_target(target: &str) -> Result<(String, u16)> {
     let normalized = match target.strip_prefix(':') {
         Some(port) => format!("localhost:{port}"),
@@ -2542,6 +2600,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bore_cli::shared::HttpsPolicy;
 
     use lazy_static::lazy_static;
     use std::sync::Mutex;
@@ -2809,6 +2868,119 @@ mod tests {
         }
     }
 
+    /// Clear the HTTPS env vars so `--https`/`--force-https` parse tests are not
+    /// perturbed by an ambient `BORE_HTTPS`/`BORE_FORCE_HTTPS`.
+    fn with_https_env_cleared<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved_https = std::env::var_os("BORE_HTTPS");
+        let saved_force = std::env::var_os("BORE_FORCE_HTTPS");
+        std::env::remove_var("BORE_HTTPS");
+        std::env::remove_var("BORE_FORCE_HTTPS");
+        let out = f();
+        match saved_https {
+            Some(v) => std::env::set_var("BORE_HTTPS", v),
+            None => std::env::remove_var("BORE_HTTPS"),
+        }
+        match saved_force {
+            Some(v) => std::env::set_var("BORE_FORCE_HTTPS", v),
+            None => std::env::remove_var("BORE_FORCE_HTTPS"),
+        }
+        out
+    }
+
+    fn local_https(argv: &[&str]) -> Option<HttpsPolicy> {
+        let args = Args::parse_from(argv);
+        let Command::Local { https, .. } = args.command else {
+            panic!("expected local command");
+        };
+        https
+    }
+
+    #[test]
+    fn parse_local_https_bare_is_on() {
+        with_https_env_cleared(|| {
+            assert_eq!(
+                local_https(&["bore", "local", "5000", "--https"]),
+                Some(HttpsPolicy::On)
+            );
+        });
+    }
+
+    #[test]
+    fn parse_local_https_explicit_values() {
+        with_https_env_cleared(|| {
+            assert_eq!(
+                local_https(&["bore", "local", "5000", "--https=off"]),
+                Some(HttpsPolicy::Off)
+            );
+            assert_eq!(
+                local_https(&["bore", "local", "5000", "--https=on"]),
+                Some(HttpsPolicy::On)
+            );
+            assert_eq!(
+                local_https(&["bore", "local", "5000", "--https=redirect"]),
+                Some(HttpsPolicy::Redirect)
+            );
+        });
+    }
+
+    #[test]
+    fn parse_local_https_absent_is_none() {
+        with_https_env_cleared(|| {
+            assert_eq!(local_https(&["bore", "local", "5000"]), None);
+        });
+    }
+
+    #[test]
+    fn parse_vhost_https_redirect() {
+        with_https_env_cleared(|| {
+            let args = Args::parse_from([
+                "bore",
+                "vhost",
+                "localhost:5000",
+                "--subdomain",
+                "app",
+                "--id",
+                "app",
+                "--https=redirect",
+            ]);
+            let Command::Vhost { https, .. } = args.command else {
+                panic!("expected vhost command");
+            };
+            assert_eq!(https, Some(HttpsPolicy::Redirect));
+        });
+    }
+
+    #[test]
+    fn resolve_cli_https_policy_force_https_maps_to_redirect() {
+        // Deprecated --force-https forces redirect regardless of --https value.
+        assert_eq!(
+            resolve_cli_https_policy(None, true),
+            Some(HttpsPolicy::Redirect)
+        );
+        assert_eq!(
+            resolve_cli_https_policy(Some(HttpsPolicy::On), true),
+            Some(HttpsPolicy::Redirect)
+        );
+        // Without force-https, the policy passes through unchanged.
+        assert_eq!(
+            resolve_cli_https_policy(Some(HttpsPolicy::Off), false),
+            Some(HttpsPolicy::Off)
+        );
+        assert_eq!(resolve_cli_https_policy(None, false), None);
+    }
+
+    #[test]
+    fn legacy_https_bools_mapping() {
+        assert_eq!(legacy_https_bools(None), (false, false));
+        assert_eq!(legacy_https_bools(Some(HttpsPolicy::Off)), (false, false));
+        assert_eq!(legacy_https_bools(Some(HttpsPolicy::On)), (true, false));
+        assert_eq!(
+            legacy_https_bools(Some(HttpsPolicy::Redirect)),
+            (true, true)
+        );
+    }
+
     #[test]
     fn local_server_env_overrides_default_server() {
         let _guard = ENV_GUARD.lock().unwrap();
@@ -3026,7 +3198,9 @@ mod tests {
                 assert_eq!(local_port, "10.10.16.138:5000");
                 assert_eq!(local_host, None);
                 assert_eq!(port, 9005);
-                assert!(https);
+                // `require_equals` on --https means the bare flag takes its
+                // default (on) and does NOT consume the positional target.
+                assert_eq!(https, Some(HttpsPolicy::On));
                 let (host, port) =
                     resolve_local_target(&local_port, local_host.as_deref()).unwrap();
                 assert_eq!(host, "10.10.16.138");

@@ -145,8 +145,8 @@ Options:
   -s, --secret <SECRET>        Optional secret for authentication [env: BORE_SECRET]
       --tcp-secret-id <ID>     Register as a named secret tunnel [env: BORE_TCP_SECRET_ID=]
       --insecure               Skip TLS certificate verification [env: BORE_INSECURE=]
-      --https                  Terminate TLS on the tunnel port [env: BORE_HTTPS=]
-      --force-https            Redirect plain HTTP to https:// (requires --https) [env: BORE_FORCE_HTTPS=]
+      --https[=<off|on|redirect>]  Per-tunnel HTTPS policy; bare --https = on. off=plain/raw only; on=terminate TLS, serve HTTP+HTTPS; redirect=terminate TLS + 308 HTTP→https. Absent inherits the server default; a request without server TLS falls back to HTTP with a warning [env: BORE_HTTPS=]
+      --force-https            Deprecated: use --https=redirect (kept as an alias) [env: BORE_FORCE_HTTPS=]
       --udp                    Prefer a direct UDP/QUIC data path (public: server→client QUIC; secret: hole-punched). Falls back to relay. [env: BORE_PREFER_UDP=]
       --stun-server <HOST:PORT> STUN server for the direct path [env: BORE_STUN_SERVER=]
       --upnp                   Map a router port via UPnP-IGD for the direct path [env: BORE_UPNP=]
@@ -1243,6 +1243,7 @@ The server polls `vhost.yml`, `cert_file`, and `key_file` every 2 seconds. On a 
 | `--to` | bore server address |
 | `--secret` | Optional server secret |
 | `--insecure` | Skip TLS cert verification on `https://` servers |
+| `--https[=off\|on\|redirect]` | Per-subdomain HTTPS policy (bare = on): `off` = HTTP only, no redirect; `on` = served over HTTPS via the server wildcard cert; `redirect` = 308 HTTP→HTTPS. Absent inherits the server `--vhost-mode`; falls back to HTTP with a warning if the server has no vhost cert |
 | `--carriers N` | Parallel relay connections (default 1) |
 | `--basic-auth user:pass` | Tell the admin page this provider enforces Basic auth |
 | `--notes TEXT` | Free-form note on the admin status page |

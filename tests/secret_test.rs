@@ -656,6 +656,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
             notes: Some("prov note".into()),
             basic_auth: Some("u:p".into()),
             auto_reconnect: false,
+            https_policy: None,
         },
         None,
     )

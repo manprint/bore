@@ -391,3 +391,159 @@ async fn force_https_redirects_plain_http() -> Result<()> {
 
     Ok(())
 }
+
+/// T-HP-PUB1: Policy `On` without server cert falls back to HTTP + warning.
+#[tokio::test]
+async fn policy_on_no_cert_falls_back_to_http() -> Result<()> {
+    const PORT: u16 = 17910;
+    wait_port(PORT, false).await;
+
+    // Server WITHOUT TLS.
+    let mut server = Server::new(1024..=65535, Some("sec"));
+    server.set_control_port(PORT);
+    tokio::spawn(server.listen());
+    wait_port(PORT, true).await;
+
+    let echo = echo_service_loop().await?;
+    let to = format!("http://localhost:{PORT}"); // Plain HTTP control (no TLS on server).
+    let options = TunnelOptions {
+        https_policy: Some(bore_cli::shared::HttpsPolicy::On),
+        ..Default::default()
+    };
+    // Client connects with plain HTTP control (insecure=false) since server has no TLS.
+    let client = Client::new("localhost", echo, &to, 0, Some("sec"), false, options, None).await?;
+    let tunnel = client.remote_port();
+    tokio::spawn(client.listen());
+
+    // A plain HTTP request to the tunnel should succeed (no TLS redirect or error,
+    // the server fell back due to lack of capability).
+    let mut http = TcpStream::connect(("127.0.0.1", tunnel)).await?;
+    http.write_all(b"hello-http").await?;
+    let mut buf = [0u8; 10];
+    http.read_exact(&mut buf).await?;
+    assert_eq!(&buf, b"hello-http");
+
+    Ok(())
+}
+
+/// T-HP-PUB2: Policy `Redirect` with cert produces 308 on plain HTTP.
+#[tokio::test]
+async fn policy_redirect_with_cert_308() -> Result<()> {
+    const PORT: u16 = 17911;
+    wait_port(PORT, false).await;
+
+    let (cert_pem, key_pem) = self_signed()?;
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+    let mut server = Server::new(1024..=65535, Some("sec"));
+    server.set_control_port(PORT);
+    server.set_tls(acceptor);
+    server.set_bind_domain("bore.tld".to_string());
+    tokio::spawn(server.listen());
+    wait_port(PORT, true).await;
+
+    let echo = echo_service_loop().await?;
+    let to = format!("https://localhost:{PORT}");
+    let options = TunnelOptions {
+        https_policy: Some(bore_cli::shared::HttpsPolicy::Redirect),
+        ..Default::default()
+    };
+    let client = Client::new("localhost", echo, &to, 0, Some("sec"), true, options, None).await?;
+    let tunnel = client.remote_port();
+    tokio::spawn(client.listen());
+
+    // A plain HTTP request gets 308 redirect to https://.
+    let mut http = TcpStream::connect(("127.0.0.1", tunnel)).await?;
+    let request = format!("GET / HTTP/1.1\r\nHost: example.com:{tunnel}\r\n\r\n");
+    http.write_all(request.as_bytes()).await?;
+    let mut buf = vec![0u8; 512];
+    let n = http.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.starts_with("HTTP/1.1 308"),
+        "expected 308, got: {response}"
+    );
+    assert!(
+        response.contains(&format!("Location: https://example.com:{tunnel}/")),
+        "unexpected redirect location: {response}"
+    );
+
+    Ok(())
+}
+
+/// T-HP-PUB3: Raw (non-HTTP, non-TLS) bytes pass through unchanged under every policy.
+#[tokio::test]
+async fn policy_raw_passthrough_matrix() -> Result<()> {
+    const PORT: u16 = 17912;
+    wait_port(PORT, false).await;
+
+    let (cert_pem, key_pem) = self_signed()?;
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+    let mut server = Server::new(1024..=65535, Some("sec"));
+    server.set_control_port(PORT);
+    server.set_tls(acceptor);
+    tokio::spawn(server.listen());
+    wait_port(PORT, true).await;
+
+    let echo = echo_service_loop().await?;
+    let to = format!("https://localhost:{PORT}");
+
+    // Test all three policies: Off, On, Redirect.
+    for policy in [
+        bore_cli::shared::HttpsPolicy::Off,
+        bore_cli::shared::HttpsPolicy::On,
+        bore_cli::shared::HttpsPolicy::Redirect,
+    ] {
+        let options = TunnelOptions {
+            https_policy: Some(policy),
+            ..Default::default()
+        };
+        let client =
+            Client::new("localhost", echo, &to, 0, Some("sec"), true, options, None).await?;
+        let tunnel = client.remote_port();
+        tokio::spawn(client.listen());
+
+        // Raw non-HTTP, non-TLS bytes: b"\x00\x01POSTGRES\x00"
+        let raw_payload = b"\x00\x01POSTGRES\x00";
+        let mut conn = TcpStream::connect(("127.0.0.1", tunnel)).await?;
+        conn.write_all(raw_payload).await?;
+        let mut buf = vec![0u8; raw_payload.len()];
+        conn.read_exact(&mut buf).await?;
+        assert_eq!(
+            &buf[..],
+            raw_payload,
+            "raw payload mismatch for policy {:?}",
+            policy
+        );
+
+        time::sleep(Duration::from_millis(50)).await;
+    }
+
+    Ok(())
+}
+
+/// T-HP-PUB4: Legacy client with `https_policy: None`, `https: true`, no cert gets fatal Error.
+#[tokio::test]
+async fn legacy_bools_still_reject_no_cert() -> Result<()> {
+    const PORT: u16 = 17913;
+    wait_port(PORT, false).await;
+
+    // Server WITHOUT TLS.
+    let mut server = Server::new(1024..=65535, Some("sec"));
+    server.set_control_port(PORT);
+    tokio::spawn(server.listen());
+    wait_port(PORT, true).await;
+
+    let echo = echo_service().await?;
+    let to = format!("http://localhost:{PORT}");
+    // Legacy: https_policy = None (not set), https = true, force_https = false.
+    let options = TunnelOptions {
+        https: true,
+        ..Default::default()
+    };
+    let result = Client::new("localhost", echo, &to, 0, Some("sec"), false, options, None).await;
+
+    // Expect connection to fail due to the fatal Error from the server.
+    assert!(result.is_err(), "legacy https=true without cert must fail");
+
+    Ok(())
+}

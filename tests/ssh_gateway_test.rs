@@ -2603,8 +2603,14 @@ async fn t_ssh_banner_secret_consumer_fires_once() -> Result<()> {
 // forbids a param looking "accepted" when it has zero effect.
 // ---------------------------------------------------------------------------
 
+// T-SSH-VH-HTTPS3 (was t_ssh_warn_https_inapplicable_to_vhost): I-SSH8 flip.
+// `https`/`force-https` are now APPLIED to vhost forwards (mapped to the
+// per-subdomain policy), not warned as "not applicable". Against a server with
+// NO vhost cert (mode=Http) the request DOWNGRADES: the forward comes up over
+// HTTP with a non-fatal notice, never rejected. `max-conns` remains inapplicable
+// to vhost and still warns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn t_ssh_warn_https_inapplicable_to_vhost() -> Result<()> {
+async fn t_ssh_vhost_https_downgrades_no_cert() -> Result<()> {
     let _g = SERIAL_GUARD.lock().await;
     skip_without_ssh_cli!();
     wait_port(CONTROL_PORT, false).await;
@@ -2629,7 +2635,7 @@ async fn t_ssh_warn_https_inapplicable_to_vhost() -> Result<()> {
     );
     let mut capture = spawn_ssh_capturing(
         &args,
-        "spawn vhost ssh with inapplicable https/force-https/max-conns (T-SSH-WARN-INAPPLICABLE)",
+        "spawn vhost ssh with https/force-https (applied) + inapplicable max-conns",
     )?;
 
     let seen = wait_buf_contains(
@@ -2638,21 +2644,101 @@ async fn t_ssh_warn_https_inapplicable_to_vhost() -> Result<()> {
         Duration::from_secs(10),
     )
     .await;
+    // I-SSH8 flip: https/force-https are APPLIED now, NOT warned as inapplicable.
     assert!(
-        seen.contains("https: not applicable to vhost tunnels; ignoring"),
-        "https=on on a vhost forward must warn, not silently vanish: {seen:?}"
+        !seen.contains("https: not applicable to vhost tunnels"),
+        "https is now applied to vhost, must NOT warn inapplicable: {seen:?}"
     );
     assert!(
-        seen.contains("force-https: not applicable to vhost tunnels; ignoring"),
-        "force-https=on on a vhost forward must warn, not silently vanish: {seen:?}"
+        !seen.contains("force-https: not applicable to vhost tunnels"),
+        "force-https is now applied to vhost, must NOT warn inapplicable: {seen:?}"
     );
+    // max-conns stays inapplicable to vhost and must still warn.
     assert!(
         seen.contains("max-conns: not applicable to vhost tunnels; ignoring"),
-        "max-conns= on a vhost forward must warn, not silently vanish: {seen:?}"
+        "max-conns= on a vhost forward must still warn: {seen:?}"
     );
-    // The banner itself must still show the SERVER-governed mode, unaffected
-    // by the ignored client-requested flags.
-    assert!(seen.contains(&banner_field("Mode:", "HTTP only")));
+    // No vhost cert (mode=Http) → the HTTPS request downgrades with a notice.
+    assert!(
+        seen.contains("server not configured for vhost HTTPS")
+            && seen.contains("serving warnvh over HTTP"),
+        "https=on with no vhost cert must deliver a downgrade notice: {seen:?}"
+    );
+    // The banner reports the effective (downgraded) HTTPS policy.
+    assert!(
+        seen.contains("HTTPS policy:") && seen.contains("downgraded to HTTP"),
+        "banner must report the downgraded HTTPS policy: {seen:?}"
+    );
+
+    capture.child.kill().await.ok();
+    Ok(())
+}
+
+// T-SSH-VH-HTTPS1: with a vhost cert configured (mode=both), an SSH client
+// passing `https=redirect` on a vhost forward gets a per-subdomain 308 redirect
+// (mode=both alone would NOT redirect), proving the policy is applied end-to-end
+// over the SSH ingress path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_vhost_https_redirect_applied() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    // Build a vhost config WITH a self-signed cert so mode resolves to `both`.
+    let (cert_pem, key_pem) = self_signed_cert()?;
+    let cert_path = dir.path().join("vhost_cert.pem");
+    let key_path = dir.path().join("vhost_key.pem");
+    std::fs::write(&cert_path, cert_pem)?;
+    std::fs::write(&key_path, key_pem)?;
+    let http_port = free_port().await?;
+    let https_port = free_port().await?;
+    let mut cfg = vhost_config("bore.certtest", http_port, vec![]);
+    cfg.mode = VhostModeCfg::Both;
+    cfg.cert_file = Some(cert_path);
+    cfg.key_file = Some(key_path);
+    cfg.https_port = https_port;
+
+    let gw_port = start_gateway_server_vhost(host_key, dir.path().to_path_buf(), cfg).await?;
+
+    let svc_port = spawn_http_stub("hello from redirect-vhost").await?;
+    let raw_forward = format!("vhost/redir:0:127.0.0.1:{svc_port}");
+
+    let args = ssh_args_raw(
+        gw_port,
+        &client_priv,
+        &[raw_forward],
+        Some("https=redirect"),
+    );
+    let mut capture = spawn_ssh_capturing(&args, "spawn vhost ssh with https=redirect (applied)")?;
+
+    let seen = wait_buf_contains(
+        &capture.buf,
+        "Vhost tunnel established",
+        Duration::from_secs(10),
+    )
+    .await;
+    // Banner reports the active redirect policy; no inapplicable warning.
+    assert!(
+        !seen.contains("https: not applicable to vhost tunnels"),
+        "https=redirect must be applied, not warned: {seen:?}"
+    );
+    assert!(
+        seen.contains("HTTPS policy:") && seen.contains("redirect"),
+        "banner must report the redirect policy: {seen:?}"
+    );
+
+    // Wait for the HTTP frontend, then a plain GET must get a 308 redirect.
+    wait_port(http_port, true).await;
+    let response = send_http(http_port, "redir.bore.certtest", "/").await?;
+    assert!(
+        response.contains("308"),
+        "https=redirect over SSH must 308 a plain HTTP request under mode=both: {response}"
+    );
 
     capture.child.kill().await.ok();
     Ok(())

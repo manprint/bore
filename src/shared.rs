@@ -273,6 +273,38 @@ pub fn tune_tcp(stream: &TcpStream) {
 /// the tunnel id / options) never exceeds the codec's limit.
 pub const MAX_NOTES_LEN: usize = 256;
 
+/// Per-tunnel HTTPS behavior requested by the client. `None` (an `Option<HttpsPolicy>`)
+/// means "inherit the server default".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum HttpsPolicy {
+    /// No TLS termination, no redirect; plain HTTP/raw only.
+    Off,
+    /// Terminate TLS; serve both HTTP and HTTPS; no redirect.
+    On,
+    /// Terminate TLS and 308-redirect plain HTTP to HTTPS.
+    Redirect,
+}
+
+/// Resolve a requested per-tunnel HTTPS policy against server capability into
+/// the effective `(https, force_https)` edge flags.
+///
+/// `capable` = the server can terminate TLS for this tunnel family
+/// (public: `self.tls.is_some()`; vhost: cert present and mode serves https).
+/// Returns `(https, force_https, downgraded)` where `downgraded` is true when
+/// the client asked for TLS (`On`/`Redirect`) but the server is not capable,
+/// so the caller must warn and fall back to plain HTTP.
+pub fn resolve_https_policy(policy: HttpsPolicy, capable: bool) -> (bool, bool, bool) {
+    match policy {
+        HttpsPolicy::Off => (false, false, false),
+        HttpsPolicy::On if capable => (true, false, false),
+        HttpsPolicy::On => (false, false, true),
+        HttpsPolicy::Redirect if capable => (true, true, false),
+        HttpsPolicy::Redirect => (false, false, true),
+    }
+}
+
 /// Per-tunnel options requested by the client for a public-port tunnel.
 ///
 /// No longer `Copy`: it now carries owned `String`s (basic-auth credentials and a
@@ -322,6 +354,10 @@ pub struct TunnelOptions {
     /// The client's local service port. `0` = unknown. Display-only.
     #[serde(default)]
     pub local_port: u16,
+    /// Per-tunnel HTTPS policy. `None` = inherit the server default (byte-identical
+    /// to the pre-policy behavior). `#[serde(default)]` keeps the wire backward-compatible.
+    #[serde(default)]
+    pub https_policy: Option<HttpsPolicy>,
 }
 
 /// Options negotiated by two `bore test-udp` peers once the server pairs them.
@@ -963,6 +999,10 @@ pub enum ClientMessage {
         /// The provider's local target port. `0` = unknown. Display-only.
         #[serde(default)]
         local_port: u16,
+        /// Per-tunnel HTTPS policy. `None` = inherit the server default (byte-identical
+        /// to the pre-policy behavior). `#[serde(default)]` keeps the wire backward-compatible.
+        #[serde(default)]
+        https_policy: Option<HttpsPolicy>,
     },
 
     /// Ask the server to issue a fresh vhost-UDP nonce so the provider can
@@ -1246,6 +1286,10 @@ pub enum ServerMessage {
         /// The peer's identifier (from the matching VpnPeerJoin).
         peer_id: u32,
     },
+
+    /// Non-fatal advisory from the server. The client prints it and CONTINUES.
+    /// Sent only to policy-aware clients (they sent https_policy = Some). Old clients never receive it.
+    Warning(String),
 }
 
 #[doc(hidden)]
@@ -1514,6 +1558,9 @@ impl ControlFrameSummary for ServerMessage {
             ServerMessage::VpnPeerLeave { peer_id } => {
                 format!("VpnPeerLeave {{ peer_id={} }}", peer_id)
             }
+            ServerMessage::Warning(msg) => {
+                format!("Warning {{ message={} }}", msg)
+            }
         }
     }
 }
@@ -1739,6 +1786,7 @@ mod tests {
             max_conns: 0,
             local_host: None,
             local_port: 0,
+            https_policy: None,
         };
         let json = serde_json::to_string(&full).unwrap();
         let back: TunnelOptions = serde_json::from_str(&json).unwrap();
@@ -1931,6 +1979,7 @@ fn hello_vhost_round_trips_and_fits_frame() {
         auto_reconnect: true,
         local_host: None,
         local_port: 0,
+        https_policy: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(
@@ -2303,4 +2352,136 @@ fn tunnel_options_serde_default_webserver_log() {
     let json = r#"{"https":false,"force_https":false,"basic_auth":null,"notes":null,"carriers":0,"udp":false,"auto_reconnect":false}"#;
     let opts: TunnelOptions = serde_json::from_str(json).unwrap();
     assert!(!opts.webserver_log);
+}
+
+#[test]
+fn https_policy_serde_roundtrip() {
+    assert_eq!(
+        serde_json::to_string(&HttpsPolicy::Redirect).unwrap(),
+        "\"redirect\""
+    );
+    assert_eq!(serde_json::to_string(&HttpsPolicy::On).unwrap(), "\"on\"");
+    assert_eq!(serde_json::to_string(&HttpsPolicy::Off).unwrap(), "\"off\"");
+    let redirect: HttpsPolicy = serde_json::from_str("\"redirect\"").unwrap();
+    assert_eq!(redirect, HttpsPolicy::Redirect);
+    let on: HttpsPolicy = serde_json::from_str("\"on\"").unwrap();
+    assert_eq!(on, HttpsPolicy::On);
+    let off: HttpsPolicy = serde_json::from_str("\"off\"").unwrap();
+    assert_eq!(off, HttpsPolicy::Off);
+}
+
+#[test]
+fn https_policy_valueenum_parse() {
+    use clap::ValueEnum;
+    let on = HttpsPolicy::from_str("on", false).unwrap();
+    assert_eq!(on, HttpsPolicy::On);
+    let off = HttpsPolicy::from_str("off", false).unwrap();
+    assert_eq!(off, HttpsPolicy::Off);
+    let redirect = HttpsPolicy::from_str("redirect", false).unwrap();
+    assert_eq!(redirect, HttpsPolicy::Redirect);
+    let invalid = HttpsPolicy::from_str("bogus", false);
+    assert!(invalid.is_err());
+}
+
+#[test]
+fn resolve_policy_off() {
+    let (https, force_https, downgraded) = resolve_https_policy(HttpsPolicy::Off, false);
+    assert!(!https);
+    assert!(!force_https);
+    assert!(!downgraded);
+    let (https, force_https, downgraded) = resolve_https_policy(HttpsPolicy::Off, true);
+    assert!(!https);
+    assert!(!force_https);
+    assert!(!downgraded);
+}
+
+#[test]
+fn resolve_policy_on_capable() {
+    let (https, force_https, downgraded) = resolve_https_policy(HttpsPolicy::On, true);
+    assert!(https);
+    assert!(!force_https);
+    assert!(!downgraded);
+}
+
+#[test]
+fn resolve_policy_on_incapable() {
+    let (https, force_https, downgraded) = resolve_https_policy(HttpsPolicy::On, false);
+    assert!(!https);
+    assert!(!force_https);
+    assert!(downgraded);
+}
+
+#[test]
+fn resolve_policy_redirect_capable() {
+    let (https, force_https, downgraded) = resolve_https_policy(HttpsPolicy::Redirect, true);
+    assert!(https);
+    assert!(force_https);
+    assert!(!downgraded);
+}
+
+#[test]
+fn resolve_policy_redirect_incapable() {
+    let (https, force_https, downgraded) = resolve_https_policy(HttpsPolicy::Redirect, false);
+    assert!(!https);
+    assert!(!force_https);
+    assert!(downgraded);
+}
+
+#[test]
+fn server_message_warning_roundtrip() {
+    let msg = ServerMessage::Warning("test warning".to_string());
+    let json = serde_json::to_string(&msg).unwrap();
+    let back: ServerMessage = serde_json::from_str(&json).unwrap();
+    match back {
+        ServerMessage::Warning(text) => assert_eq!(text, "test warning"),
+        _ => panic!("unexpected variant"),
+    }
+}
+
+#[test]
+fn server_message_warning_is_last_variant() {
+    let ok_msg = serde_json::from_str::<ServerMessage>(r#"{"Ok":null}"#).unwrap();
+    match ok_msg {
+        ServerMessage::Ok => {}
+        _ => panic!("unexpected variant"),
+    }
+}
+
+#[test]
+fn tunnel_options_default_policy_none() {
+    let opts = TunnelOptions::default();
+    assert!(opts.https_policy.is_none());
+}
+
+#[test]
+fn hello_vhost_serde_omits_default_policy() {
+    let msg = ClientMessage::HelloVhost {
+        subdomain: "test".to_string(),
+        client_id: "id".to_string(),
+        notes: None,
+        basic_auth: false,
+        carriers: 0,
+        udp: false,
+        webserver_log: false,
+        auto_reconnect: false,
+        local_host: None,
+        local_port: 0,
+        https_policy: None,
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let round: ClientMessage = serde_json::from_str(&json).unwrap();
+    match round {
+        ClientMessage::HelloVhost { https_policy, .. } => {
+            assert!(https_policy.is_none());
+        }
+        _ => panic!("unexpected variant"),
+    }
+    let legacy_json = r#"{"HelloVhost":{"subdomain":"test","client_id":"id","notes":null,"basic_auth":false,"carriers":0,"udp":false,"webserver_log":false,"auto_reconnect":false,"local_host":null,"local_port":0}}"#;
+    let legacy: ClientMessage = serde_json::from_str(legacy_json).unwrap();
+    match legacy {
+        ClientMessage::HelloVhost { https_policy, .. } => {
+            assert!(https_policy.is_none());
+        }
+        _ => panic!("unexpected variant"),
+    }
 }

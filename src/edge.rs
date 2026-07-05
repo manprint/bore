@@ -197,6 +197,9 @@ pub(crate) fn looks_like_http(head: &[u8]) -> bool {
 }
 
 /// Consume the HTTP request head and reply with a `308` redirect to `https://`.
+///
+/// Used by the public edge path, where the first bytes were only *peeked* (not
+/// consumed), so the request head must still be read from the stream here.
 pub(crate) async fn redirect_to_https(
     mut stream: TcpStream,
     port: u16,
@@ -205,9 +208,24 @@ pub(crate) async fn redirect_to_https(
     let request = timeout(NETWORK_TIMEOUT, read_request_head(&mut stream))
         .await
         .context("timed out reading HTTP request")??;
+    write_https_redirect(stream, &request, port, fallback_host).await
+}
 
-    let path = request_path(&request);
-    let authority = host_authority(&request, port, fallback_host);
+/// Reply with a `308` redirect to `https://`, using an ALREADY-READ request head.
+///
+/// The vhost frontend reads the request head up front (to extract the Host and
+/// route by subdomain), so it must not read it a second time — the client has
+/// already sent its request and is waiting for a response, so a second read would
+/// block until the network timeout and the client would see an empty reply. This
+/// variant reuses the buffered head instead of re-reading the stream.
+pub(crate) async fn write_https_redirect<S: AsyncWrite + Unpin>(
+    mut stream: S,
+    request_head: &[u8],
+    port: u16,
+    fallback_host: Option<&str>,
+) -> Result<()> {
+    let path = request_path(request_head);
+    let authority = host_authority(request_head, port, fallback_host);
     let location = format!("https://{authority}{path}");
 
     let response = format!(

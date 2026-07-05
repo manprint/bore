@@ -40,7 +40,7 @@ use crate::pool::CarrierPool;
 use crate::prefixed::Prefixed;
 use crate::secret;
 use crate::server::{bind_public_listener, DEFAULT_MAX_CONNS};
-use crate::shared::{proxy_buffer_size, tune_tcp, CountingStream};
+use crate::shared::{proxy_buffer_size, tune_tcp, CountingStream, HttpsPolicy};
 use crate::sshgw_auth::{KeyGrant, KeyStore, PasswordStore};
 use crate::vhost::{
     self, cert_present, public_urls, resolve_mode, resolve_route, RouteDecision, SharedVhostConfig,
@@ -709,6 +709,7 @@ impl GatewayHandler {
                 direct_stream_opens: AtomicU64::new(0),
                 active: Arc::new(AtomicUsize::new(0)),
                 webserver_log: params.webserver_log,
+                https_policy: params.https_policy,
                 peer,
                 since: Instant::now(),
                 notes: params.notes.clone(),
@@ -757,6 +758,12 @@ impl GatewayHandler {
             };
 
             let mode = resolve_mode(&live_cfg, cert_present(&live_cfg)).unwrap_or(VhostMode::Http);
+            // Effective per-subdomain HTTPS: capability is the server's global vhost
+            // TLS ability (mode serves https ⟹ a vhost cert is present, since
+            // resolve_mode requires it). The admin row shows the resolved flags.
+            let vhost_capable = mode.serves_https();
+            let (adm_https, adm_force_https) =
+                vhost::vhost_display_flags(params.https_policy, mode, vhost_capable);
             let (http_url, https_url) = public_urls(
                 &label,
                 &live_cfg.base_domain,
@@ -773,8 +780,8 @@ impl GatewayHandler {
                 public_port: None,
                 notes: params.notes.clone(),
                 basic_auth: has_basic_auth,
-                https: false,
-                force_https: false,
+                https: adm_https,
+                force_https: adm_force_https,
                 carriers: 0,
                 auto_reconnect: false,
                 webserver_log: params.webserver_log,
@@ -800,21 +807,39 @@ impl GatewayHandler {
                 identity: Some(grant.identity.clone()),
             });
 
+            // https/force-https are now APPLIED to vhost forwards (I-SSH8 flip):
+            // they map to the per-subdomain policy. Only max-conns remains a no-op.
             deliver_inapplicable_warnings(
                 &state,
                 &ssh_handle,
                 "vhost",
-                &[
-                    ("https", params.https),
-                    ("force-https", params.force_https),
-                    ("max-conns", params.max_conns.is_some()),
-                ],
+                &[("max-conns", params.max_conns.is_some())],
             )
             .await;
+
+            // Downgrade notice: the client asked for HTTPS but the server is not
+            // configured for vhost HTTPS. Non-fatal, on the SSH channel (I-SSH8).
+            if matches!(
+                params.https_policy,
+                Some(HttpsPolicy::On) | Some(HttpsPolicy::Redirect)
+            ) && !vhost_capable
+            {
+                state
+                    .deliver(
+                        &ssh_handle,
+                        format!(
+                            "bore ssh-gateway: server not configured for vhost HTTPS \
+                             (mode={mode:?}); serving {label} over HTTP"
+                        ),
+                    )
+                    .await;
+            }
 
             for line in vhost_info_banner(VhostBannerInfo {
                 urls: &urls,
                 mode,
+                https_policy: params.https_policy,
+                vhost_capable,
                 identity: &grant.identity,
                 notes: params.notes.as_deref(),
                 basic_auth: has_basic_auth,
@@ -2519,6 +2544,12 @@ pub struct Params {
     /// Meaningless without `https=on` — set alongside it without one, this
     /// is disabled with a warning rather than silently ignored (I-2).
     pub force_https: bool,
+    /// Resolved per-tunnel HTTPS policy (`off`/`on`/`redirect`), the single
+    /// source of truth for vhost forwards. `None` = inherit the server default
+    /// (`--vhost-mode` for vhost). Reconciled from `https=`/`force-https=` after
+    /// parsing; the legacy `https`/`force_https` bools above are kept in sync for
+    /// the public-tunnel path.
+    pub https_policy: Option<HttpsPolicy>,
     /// One warning per unsupported or unrecognized key, in encounter order —
     /// nothing is silently dropped (I-2).
     pub warnings: Vec<String>,
@@ -2625,7 +2656,28 @@ pub fn parse_params(
                  authenticated SSH key/label"
                     .to_string(),
             ),
-            "https" => params.https = value == "on",
+            // `https=off|on|redirect` sets the per-tunnel policy (applied to vhost
+            // forwards) and keeps the legacy `https`/`force_https` bools in sync for
+            // the public-tunnel path. Bare `on` = terminate TLS, no redirect.
+            "https" => match value.as_str() {
+                "off" => {
+                    params.https = false;
+                    params.force_https = false;
+                    params.https_policy = Some(HttpsPolicy::Off);
+                }
+                "on" => {
+                    params.https = true;
+                    params.https_policy = Some(HttpsPolicy::On);
+                }
+                "redirect" => {
+                    params.https = true;
+                    params.force_https = true;
+                    params.https_policy = Some(HttpsPolicy::Redirect);
+                }
+                other => params.warnings.push(format!(
+                    "https: invalid value {other:?}; expected off, on, or redirect"
+                )),
+            },
             "force-https" => params.force_https = value == "on",
             k if TRANSPORT_ONLY_KEYS.contains(&k) => params.warnings.push(format!(
                 "{k}: not available via SSH ingress; use the native bore client"
@@ -2650,6 +2702,16 @@ pub fn parse_params(
             "force-https: requires https=on; ignoring force-https for this tunnel".to_string(),
         );
         params.force_https = false;
+    }
+
+    // Reconcile the policy with the (possibly deprecated) `force-https` alias so
+    // `https_policy` is the single source of truth for the vhost path: an active
+    // `force-https` forces `redirect`; a plain `https=on` without an explicit
+    // policy resolves to `on`. `https=off` and "nothing set" are left as-is.
+    if params.force_https {
+        params.https_policy = Some(HttpsPolicy::Redirect);
+    } else if params.https && params.https_policy.is_none() {
+        params.https_policy = Some(HttpsPolicy::On);
     }
 
     params
@@ -2757,12 +2819,29 @@ fn max_conns_provenance(grant_max_conns: Option<usize>, effective: usize) -> Str
 struct VhostBannerInfo<'a> {
     urls: &'a [String],
     mode: crate::vhost::VhostMode,
+    https_policy: Option<HttpsPolicy>,
+    vhost_capable: bool,
     identity: &'a str,
     notes: Option<&'a str>,
     basic_auth: bool,
     webserver_log: bool,
     request_headers: &'a [(String, String)],
     response_headers: &'a [(String, String)],
+}
+
+/// Human-readable description of a per-subdomain HTTPS policy for the banner.
+fn https_policy_label(policy: Option<HttpsPolicy>, vhost_capable: bool) -> String {
+    match policy {
+        None => "inherit (server --vhost-mode)".to_string(),
+        Some(HttpsPolicy::Off) => "off (served over HTTP, no redirect)".to_string(),
+        Some(HttpsPolicy::On) if vhost_capable => "on (HTTPS served, no redirect)".to_string(),
+        Some(HttpsPolicy::Redirect) if vhost_capable => {
+            "redirect (plain HTTP -> HTTPS)".to_string()
+        }
+        Some(HttpsPolicy::On) | Some(HttpsPolicy::Redirect) => {
+            "requested but downgraded to HTTP (server not configured for HTTPS)".to_string()
+        }
+    }
 }
 
 /// Banner for a newly-established **vhost** forward.
@@ -2776,6 +2855,10 @@ fn vhost_info_banner(info: VhostBannerInfo<'_>) -> Vec<String> {
         lines.push(banner_line(label, url));
     }
     lines.push(banner_line("Mode:", vhost_mode_label(info.mode)));
+    lines.push(banner_line(
+        "HTTPS policy:",
+        https_policy_label(info.https_policy, info.vhost_capable),
+    ));
     lines.push(banner_line("Identity:", info.identity));
     lines.push(banner_line("Notes:", none_if_empty(info.notes)));
     lines.push(banner_line("Basic-auth:", on_off(info.basic_auth)));

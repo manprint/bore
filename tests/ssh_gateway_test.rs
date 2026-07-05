@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
@@ -231,6 +232,61 @@ async fn wait_admin_data_contains(needle: &str) -> Result<String> {
         time::sleep(Duration::from_millis(25)).await;
     }
     anyhow::bail!("admin data never contained {needle:?} within timeout")
+}
+
+/// Spawns `ssh` with a piped stdout, continuously drained into a shared
+/// buffer by a background task. A tunnel's info banner (§7) can be delivered
+/// seconds after the session channel opens — well past any fixed-window
+/// read — so the buffer must be a running accumulator, not a single `read`.
+fn spawn_ssh_capturing(args: &[String], context_msg: &'static str) -> Result<SshCapture> {
+    let mut child = Command::new("ssh")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context(context_msg)?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let buf = Arc::new(Mutex::new(String::new()));
+    let buf_writer = Arc::clone(&buf);
+    tokio::spawn(async move {
+        let mut chunk = [0u8; 1024];
+        loop {
+            match stdout.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf_writer
+                    .lock()
+                    .await
+                    .push_str(&String::from_utf8_lossy(&chunk[..n])),
+            }
+        }
+    });
+    Ok(SshCapture { child, buf })
+}
+
+struct SshCapture {
+    child: tokio::process::Child,
+    buf: Arc<Mutex<String>>,
+}
+
+/// Polls the captured buffer until it contains `needle` or `dur` elapses,
+/// returning the buffer's full contents so far either way (for assertion
+/// messages that show what WAS captured on a timeout).
+async fn wait_buf_contains(buf: &Arc<Mutex<String>>, needle: &str, dur: Duration) -> String {
+    let deadline = time::Instant::now() + dur;
+    loop {
+        {
+            let s = buf.lock().await;
+            if s.contains(needle) {
+                return s.clone();
+            }
+        }
+        if time::Instant::now() >= deadline {
+            return buf.lock().await.clone();
+        }
+        time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Round-trips `payload` through a plain TCP connection to `port` and reports
@@ -607,6 +663,46 @@ fn ssh_local_forward_args(
     args.push("-N".into());
     args.push("-L".into());
     args.push(format!("{bind_port}:{dest}"));
+    args.push("gwtest@127.0.0.1".into());
+    args
+}
+
+/// Like [`ssh_args_raw`] but NEVER adds `-N`, even with no `exec` command —
+/// used by the T-SSH-BANNER*/T-SSH-NOKILL* tests, which specifically cover
+/// the bare (`-N`-less, command-less) case: `-N` (`SessionType=none`) never
+/// opens a session channel at all (confirmed empirically), so it is the one
+/// invocation shape that can NEVER see an info banner, and it is also not
+/// what these tests are probing for (the shell-request bugfix, §7 of
+/// `docs/SSH_GATEWAY.md`, is specifically about the no-`-N` path).
+fn ssh_args_raw_no_n(gw_port: u16, identity: &Path, raw_forwards: &[String]) -> Vec<String> {
+    let mut args = ssh_base_args(gw_port, identity);
+    for f in raw_forwards {
+        args.push("-R".into());
+        args.push(f.clone());
+    }
+    args.push("gwtest@127.0.0.1".into());
+    args
+}
+
+/// Like [`ssh_local_forward_args`] but omits `-N` (see `ssh_args_raw_no_n`).
+fn ssh_local_forward_args_no_n(
+    gw_port: u16,
+    identity: &Path,
+    bind_port: u16,
+    dest: &str,
+) -> Vec<String> {
+    let mut args = ssh_base_args(gw_port, identity);
+    args.push("-L".into());
+    args.push(format!("{bind_port}:{dest}"));
+    args.push("gwtest@127.0.0.1".into());
+    args
+}
+
+/// A bare interactive `ssh host` invocation with no `-R`/`-L` at all and no
+/// `-N` — used by T-SSH-NOKILL-ZERO to confirm the shell-request fix didn't
+/// weaken the (still correct) rejection for a genuine no-forward mistake.
+fn ssh_args_interactive_no_forward(gw_port: u16, identity: &Path) -> Vec<String> {
+    let mut args = ssh_base_args(gw_port, identity);
     args.push("gwtest@127.0.0.1".into());
     args
 }
@@ -2102,5 +2198,398 @@ async fn t_dmx_off_gateway_disabled_ignores_ssh_looking_bytes() -> Result<()> {
         Err(_) => panic!("connection neither closed nor produced a banner within the timeout"),
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-NOKILL*/T-SSH-BANNER* — the shell-request bugfix and the §7 tunnel-
+// info banners it enables. Real report: a bare `ssh -p 443 -R
+// secret/id:0:localhost:8080 host` (no `-N`, no `exec` command — the
+// ordinary way to invoke `-R`) got "interactive shells are not supported"
+// and the WHOLE connection closed, killing the just-granted forward. Root
+// cause: OpenSSH's default (absent `-N`/a command) is to ALSO request an
+// interactive shell on the session channel; denying it with a nonzero exit
+// status makes the client treat its "primary session" as having failed and
+// disconnect entirely, taking every other channel (the forward) down with
+// it. Fix: hold the channel open instead whenever this connection has a live
+// forward — which doubles as the delivery channel for the info banners.
+//
+// Mirrors production's own `banner_line` (`  {label:<18}{value}`) exactly so
+// assertions check both label AND value, not just presence of the label.
+// ---------------------------------------------------------------------------
+
+fn banner_field(label: &str, value: &str) -> String {
+    format!("  {label:<18}{value}")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_nokill_zero_bare_interactive_still_rejected() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(&auth_dir, &client_priv, None)?;
+
+    let gw_port = start_gateway_server(dir.path().join("host_key"), auth_dir).await?;
+
+    let args = ssh_args_interactive_no_forward(gw_port, &client_priv);
+    let mut capture = spawn_ssh_capturing(&args, "spawn bare interactive ssh (T-SSH-NOKILL-ZERO)")?;
+
+    // A genuine interactive-login mistake still gets a clear, immediate
+    // diagnostic — but the channel (and connection) is deliberately no
+    // longer force-closed with a nonzero exit status (that was the exact
+    // shape of the original bug for a legitimate tunnel connection; a
+    // secret *consumer* has no way to distinguish itself from this case at
+    // shell-request time, so the fix must not act destructively on it
+    // either way — see `shell_request`'s doc). The client is expected to
+    // just sit there afterward, same as a `-N` session would.
+    let seen = wait_buf_contains(
+        &capture.buf,
+        "interactive shells are not supported",
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        seen.contains("interactive shells are not supported"),
+        "a connection with zero forwards must still get a clear diagnostic, got: {seen:?}"
+    );
+    assert!(
+        capture.child.try_wait()?.is_none(),
+        "the connection must NOT be force-closed just because nothing is \
+         established yet — see the doc comment on why"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_banner_vhost_no_n_survives_and_reports() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    let http_port = free_port().await?;
+    let cfg = vhost_config("bore.bannertest", http_port, vec![]);
+    let gw_port = start_gateway_server_vhost(host_key, dir.path().to_path_buf(), cfg).await?;
+
+    let svc_port = spawn_http_stub("hello from banner-vhost").await?;
+    let raw_forward = format!("vhost/bannervh:0:127.0.0.1:{svc_port}");
+
+    let args = ssh_args_raw_no_n(gw_port, &client_priv, &[raw_forward]);
+    let mut capture =
+        spawn_ssh_capturing(&args, "spawn bare -N-less vhost ssh (T-SSH-BANNER-VHOST)")?;
+
+    let banner = wait_buf_contains(
+        &capture.buf,
+        "Vhost tunnel established",
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        capture.child.try_wait()?.is_none(),
+        "the connection must survive the implicit shell request instead of \
+         disconnecting (the original bug); captured so far: {banner:?}"
+    );
+    assert!(banner.contains("Vhost tunnel established"));
+    assert!(banner.contains(&banner_field(
+        "Public URL:",
+        "http://bannervh.bore.bannertest"
+    )));
+    assert!(banner.contains(&banner_field("Mode:", "HTTP only")));
+    assert!(banner.contains(&banner_field("Basic-auth:", on_off_for_test(false))));
+    assert!(banner.contains(&banner_field("Webserver-log:", on_off_for_test(false))));
+    assert!(banner.contains(&banner_field(
+        "Max-conns:",
+        "n/a for vhost (server-wide --max-conns applies; no per-tunnel cap)"
+    )));
+    assert!(banner.contains(&banner_field("Request headers:", "(none)")));
+    assert!(banner.contains(&banner_field("Response headers:", "(none)")));
+    assert!(
+        banner.lines().any(|l| l.starts_with("  Identity:")),
+        "banner missing Identity line: {banner:?}"
+    );
+    assert!(
+        banner.lines().any(|l| l.starts_with("  Notes:")),
+        "banner missing Notes line: {banner:?}"
+    );
+
+    capture.child.kill().await.ok();
+
+    // Admin dashboard check (task #8): the banner delivery happens BEFORE
+    // `drop(state)` inside the finalize task — it must not interfere with
+    // the existing RAII admin-entry teardown, i.e. no stale row survives
+    // the session close.
+    let gone = time::timeout(Duration::from_secs(5), async {
+        loop {
+            let s = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
+            let resp = http_get(s, "/admin/status/data", Some(TOKEN)).await?;
+            if !resp.contains("bannervh") {
+                return anyhow::Ok(());
+            }
+            time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        gone.is_ok(),
+        "vhost admin entry must be removed within 5s of session close (no stale row)"
+    );
+
+    Ok(())
+}
+
+/// Mirrors production's `on_off` — kept separate (not `pub(crate)`-exported
+/// from the crate) so this integration test doesn't need internal access.
+fn on_off_for_test(flag: bool) -> &'static str {
+    if flag {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_banner_public_no_n_survives_and_reports() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(&auth_dir, &client_priv, None)?;
+
+    let gw_port = start_gateway_server(dir.path().join("host_key"), auth_dir).await?;
+    let svc_port = spawn_echo_service().await?;
+    let fwd_port = free_port().await?;
+
+    let raw_forward = format!("{fwd_port}:127.0.0.1:{svc_port}");
+    let args = ssh_args_raw_no_n(gw_port, &client_priv, &[raw_forward]);
+    let mut capture =
+        spawn_ssh_capturing(&args, "spawn bare -N-less public ssh (T-SSH-BANNER-PUBLIC)")?;
+
+    let banner = wait_buf_contains(
+        &capture.buf,
+        "Public tunnel established",
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        capture.child.try_wait()?.is_none(),
+        "the connection must survive the implicit shell request instead of \
+         disconnecting (the original bug); captured so far: {banner:?}"
+    );
+    assert!(banner.contains("Public tunnel established"));
+    assert!(banner.contains(&banner_field("Public port:", &fwd_port.to_string())));
+    assert!(banner.contains(&banner_field("Basic-auth:", "disabled")));
+    assert!(banner.contains(&banner_field("HTTPS:", "disabled")));
+    assert!(banner.contains(&banner_field("Force-HTTPS:", "disabled")));
+    assert!(banner.contains(&banner_field("Webserver-log:", "disabled")));
+    assert!(banner.contains(&banner_field("Max-conns:", "1024 (default)")));
+
+    // The forward must actually still carry traffic, not just "not disconnected".
+    assert!(
+        roundtrip(fwd_port, b"ping-after-banner").await?,
+        "forward must still carry traffic after the banner"
+    );
+
+    capture.child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-BANNER-PUBLIC-HTTPS — same as above but with `https=on
+// force-https=on` (via `exec`, so `-N` is correctly omitted either way):
+// confirms the banner reflects the FINAL resolved https/force-https state,
+// not just the bare-default one.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_banner_public_https_reports_enabled() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    skip_without_openssl!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(&auth_dir, &client_priv, None)?;
+
+    let gw_port = start_gateway_server_tls(dir.path().join("host_key"), auth_dir).await?;
+    let svc_port = spawn_http_stub("hello from banner-https").await?;
+    let fwd_port = 19013u16;
+
+    let args = ssh_args(
+        gw_port,
+        &client_priv,
+        &[(fwd_port, svc_port)],
+        Some("https=on force-https=on notes=\"prod api\" max-conns=250"),
+    );
+    let mut capture = spawn_ssh_capturing(
+        &args,
+        "spawn public ssh with https=on force-https=on (T-SSH-BANNER-PUBLIC-HTTPS)",
+    )?;
+
+    let banner = wait_buf_contains(
+        &capture.buf,
+        "Public tunnel established",
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(banner.contains(&banner_field("HTTPS:", "enabled")));
+    assert!(banner.contains(&banner_field("Force-HTTPS:", "enabled")));
+    assert!(banner.contains(&banner_field("Notes:", "prod api")));
+    assert!(banner.contains(&banner_field("Max-conns:", "250 (requested)")));
+
+    capture.child.kill().await.ok();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_banner_secret_provider_no_n_survives_and_reports() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(&auth_dir, &client_priv, None)?;
+
+    let gw_port = start_gateway_server(dir.path().join("host_key"), auth_dir).await?;
+    let svc_port = spawn_echo_service().await?;
+
+    let id = "bannersec";
+    let raw_forward = format!("secret/{id}:0:127.0.0.1:{svc_port}");
+    let args = ssh_args_raw_no_n(gw_port, &client_priv, &[raw_forward]);
+    let mut capture = spawn_ssh_capturing(
+        &args,
+        "spawn bare -N-less secret provider ssh (T-SSH-BANNER-SECRET-PROVIDER)",
+    )?;
+
+    let banner = wait_buf_contains(
+        &capture.buf,
+        "Secret provider tunnel established",
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        capture.child.try_wait()?.is_none(),
+        "the connection must survive the implicit shell request instead of \
+         disconnecting — this is the EXACT bug from the original report \
+         (bare `ssh -R secret/<id>:0:...` got \"interactive shells are not \
+         supported\" and disconnected); captured so far: {banner:?}"
+    );
+    assert!(banner.contains("Secret provider tunnel established"));
+    assert!(banner.contains(&banner_field("Secret ID:", id)));
+    assert!(banner.contains(&banner_field(
+        "Max-conns:",
+        "n/a for secret provider (not enforced per-tunnel)"
+    )));
+    assert!(banner.contains(&banner_field(
+        "Basic-auth:",
+        "n/a for secret provider (opaque TCP, no HTTP layer)"
+    )));
+    assert!(
+        banner.contains("Consumer command"),
+        "banner must tell the operator the exact command to run on the other \
+         side: {banner:?}"
+    );
+    assert!(
+        banner.contains(&format!("secret/{id}:1")),
+        "consumer command hint must name this exact secret id: {banner:?}"
+    );
+
+    capture.child.kill().await.ok();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_banner_secret_consumer_fires_once() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    let gw_port = start_gateway_server(host_key, dir.path().to_path_buf()).await?;
+    let svc_port = spawn_echo_service().await?;
+
+    let id = "bannersec2";
+    let provider_forward = format!("secret/{id}:0:127.0.0.1:{svc_port}");
+    let mut provider_child = Command::new("ssh")
+        .args(ssh_args_raw(
+            gw_port,
+            &client_priv,
+            &[provider_forward],
+            None,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh secret provider (T-SSH-BANNER-SECRET-CONSUMER)")?;
+
+    wait_admin_data_contains(&format!("\"secret_id\":\"{id}\"")).await?;
+
+    let lp = free_port().await?;
+    let args = ssh_local_forward_args_no_n(gw_port, &client_priv, lp, &format!("{id}:1"));
+    let mut capture = spawn_ssh_capturing(
+        &args,
+        "spawn bare -N-less secret consumer ssh (T-SSH-BANNER-SECRET-CONSUMER)",
+    )?;
+    wait_port(lp, true).await;
+
+    let banner =
+        wait_buf_contains(&capture.buf, "Attached to secret", Duration::from_secs(10)).await;
+    assert!(
+        capture.child.try_wait()?.is_none(),
+        "consumer connection must survive the implicit shell request; captured: {banner:?}"
+    );
+    assert!(
+        banner.contains(&format!("Attached to secret '{id}'")),
+        "consumer banner missing secret id, got: {banner:?}"
+    );
+    assert!(banner.contains(&banner_field("Secret ID:", id)));
+    assert!(
+        banner
+            .lines()
+            .any(|l| l.starts_with("  Provider identity:")),
+        "consumer banner missing provider identity line: {banner:?}"
+    );
+
+    // Two proxied connections through the SAME consumer session must not
+    // re-fire the banner (D11 parity: one row/one banner per session, never
+    // once per proxied connection).
+    assert!(roundtrip(lp, b"first").await?, "first roundtrip failed");
+    assert!(roundtrip(lp, b"second").await?, "second roundtrip failed");
+    time::sleep(Duration::from_millis(300)).await;
+    let final_banner = capture.buf.lock().await.clone();
+    assert_eq!(
+        final_banner.matches("Attached to secret").count(),
+        1,
+        "banner must fire exactly once per session, not once per proxied \
+         connection: {final_banner:?}"
+    );
+
+    provider_child.kill().await.ok();
+    capture.child.kill().await.ok();
     Ok(())
 }

@@ -336,18 +336,18 @@ OPTS='-o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountM
       -o ConnectTimeout=10 -o TCPKeepAlive=yes'
 
 # VHOST: mysub.bore.mydomain.tld → localhost:8080
-ssh $OPTS -p 443 -N -R mysub:80:localhost:8080 bore.mydomain.tld
-autossh -M0 $OPTS -p 443 -N -R mysub:80:localhost:8080 bore.mydomain.tld
+ssh $OPTS -p 443 -R mysub:80:localhost:8080 bore.mydomain.tld
+autossh -M0 $OPTS -p 443 -R mysub:80:localhost:8080 bore.mydomain.tld
 
 # PUBLIC: porta pubblica 9005 → localhost:8080   (porta 0 = assegnata dal server)
-ssh $OPTS -p 443 -N -R 9005:localhost:8080 bore.mydomain.tld
+ssh $OPTS -p 443 -R 9005:localhost:8080 bore.mydomain.tld
 
 # SECRET provider: registra "tcp-secret-id" → localhost:8080   (nota il ":0")
-ssh $OPTS -p 443 -N -R tcp-secret-id:0:localhost:8080 bore.mydomain.tld
+ssh $OPTS -p 443 -R tcp-secret-id:0:localhost:8080 bore.mydomain.tld
 
 # SECRET consumer: localhost:8899 → provider "tcp-secret-id"   (nota il ":0")
-ssh $OPTS -p 443 -N -L 8899:tcp-secret-id:0 bore.mydomain.tld
-autossh -M0 $OPTS -p 443 -N -L 8899:tcp-secret-id:0 bore.mydomain.tld
+ssh $OPTS -p 443 -L 8899:tcp-secret-id:0 bore.mydomain.tld
+autossh -M0 $OPTS -p 443 -L 8899:tcp-secret-id:0 bore.mydomain.tld
 
 # Con parametri (al posto di -N):
 ssh $OPTS -p 443 -R mysub:80:localhost:8080 bore.mydomain.tld -- 'notes="demo" max-conns=128'
@@ -625,12 +625,12 @@ aggiungere/ruotare una password non richiede il riavvio del server.
 Login con password reale (verificato):
 
 ```
-$ sshpass -p 'wrong-password' ssh -p 7835 -N -R 9999:localhost:8080 alice@bore.example.com
+$ sshpass -p 'wrong-password' ssh -p 7835 -R 9999:localhost:8080 alice@bore.example.com
 alice@bore.example.com: Permission denied (publickey,hostbased,keyboard-interactive).
 ```
 
 ```
-$ sshpass -p 'correct-horse-battery-staple' ssh -p 7835 -N -R 9998:localhost:8080 alice@bore.example.com &
+$ sshpass -p 'correct-horse-battery-staple' ssh -p 7835 -R 9998:localhost:8080 alice@bore.example.com &
 $ curl localhost:9998/
 hello
 ```
@@ -653,16 +653,33 @@ Host bore
 username SSH), sceglierne uno qualsiasi che ricordi lo scopo. Poi:
 
 ```
-ssh -N -R vhost/myapp:0:localhost:8080 bore    # vhost
-ssh -N -R 9005:localhost:8080 bore              # public
-ssh -N -R secret/tcp-id:0:localhost:8080 bore   # secret provider
-ssh -N -L 8899:tcp-id:1 bore                    # secret consumer (porta finale IGNORATA, deve essere solo != 0)
+ssh -R vhost/myapp:0:localhost:8080 bore    # vhost
+ssh -R 9005:localhost:8080 bore              # public
+ssh -R secret/tcp-id:0:localhost:8080 bore   # secret provider
+ssh -L 8899:tcp-id:1 bore                    # secret consumer (porta finale IGNORATA, deve essere solo != 0)
 ```
+
+#### 6.4a Mai `-N`, per nessuna modalità
+
+`-N` (`SessionType=none`) dice a OpenSSH di non aprire **nessun canale sessione** — non
+solo "niente shell": nessun canale, punto (confermato empiricamente, non solo dedotto dalla
+spec). Senza un canale, il gateway non ha modo di scrivere né i warning (`exec`-carried
+params, §2.5) né il banner di stato del tunnel (§6.11) — il terminale resta muto e basta,
+con o senza parametri. Omettendo `-N`, OpenSSH apre comunque il canale e richiede una shell
+interattiva per default (comportamento standard, non specifico di bore); il gateway la
+accetta silenziosamente e la usa come canale di stato — non si comporta come una vera shell
+(niente prompt, niente esecuzione comandi) e non chiude più la connessione per questo (era
+un bug reale: un `ssh -R secret/id:0:localhost:8080 host` senza `-N` veniva rifiutato con
+"interactive shells are not supported" e l'INTERA connessione chiudeva, uccidendo il forward
+appena concesso — OpenSSH tratta il fallimento della propria sessione "primaria" come motivo
+per disconnettersi del tutto, portandosi dietro ogni altro canale/forward attivo). Fix e
+banner sono la stessa modifica: il canale ora resta sempre aperto quando c'è qualcosa da
+riportare.
 
 ### 6.5 Esempio verificato: tunnel vhost end-to-end
 
 ```
-$ ssh -i id_ed25519_bore -p 7835 -N -f -R vhost/mysub:0:localhost:18080 localhost
+$ ssh -i id_ed25519_bore -p 7835 -f -R vhost/mysub:0:localhost:18080 localhost
 $ curl -H "Host: mysub.bore.example.com" http://<server>:7835/
 hello
 $ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://<server>:7835/admin/status/data \
@@ -676,7 +693,7 @@ chiave che richiede lo STESSO nome sostituisce la prima invece di essere rifiuta
 `autossh`/riconnessioni deterministiche dopo un riavvio di rete:
 
 ```
-$ ssh -i id_ed25519_bore -p 7835 -N -R vhost/mysub:0:localhost:18080 localhost
+$ ssh -i id_ed25519_bore -p 7835 -R vhost/mysub:0:localhost:18080 localhost
 Allocated port 1 for remote forward to localhost:18080
 ```
 
@@ -687,14 +704,14 @@ Con `permit=` restrittivo, un'etichetta non concessa è rifiutata (verificato, c
 `permit="vhost/allowed-*"` che prova `vhost/notallowed`):
 
 ```
-$ ssh -i id_restricted -p 7835 -N -R vhost/notallowed:0:localhost:18080 localhost
+$ ssh -i id_restricted -p 7835 -R vhost/notallowed:0:localhost:18080 localhost
 Error: remote port forwarding failed for listen port 0
 ```
 
 mentre un'etichetta che rientra nel pattern funziona:
 
 ```
-$ ssh -i id_restricted -p 7835 -N -f -R vhost/allowed-app:0:localhost:18080 localhost
+$ ssh -i id_restricted -p 7835 -f -R vhost/allowed-app:0:localhost:18080 localhost
 $ curl -H "Host: allowed-app.bore.example.com" http://<server>:7835/
 hello
 ```
@@ -707,7 +724,7 @@ la sessione SSH dentro una connessione TLS verso lo stesso control port:
 
 ```
 ssh -o ProxyCommand='openssl s_client -quiet -verify_quiet -connect bore.example.com:443' \
-    -N -R vhost/myapp:0:localhost:8080 dummy-host
+    -R vhost/myapp:0:localhost:8080 dummy-host
 ```
 
 `-verify_quiet` accetta anche un certificato non verificabile localmente (comodo per un
@@ -732,7 +749,7 @@ ExecStart=/usr/bin/autossh -M 0 \
     -o "ServerAliveInterval=20" -o "ServerAliveCountMax=3" \
     -o "ExitOnForwardFailure=yes" -o "StrictHostKeyChecking=yes" \
     -i /etc/bore/client_key -p 7835 \
-    -N -R vhost/myapp:0:localhost:8080 tunnel@bore.example.com
+    -R vhost/myapp:0:localhost:8080 tunnel@bore.example.com
 Restart=always
 RestartSec=5
 User=bore-client
@@ -779,6 +796,7 @@ riconnessione verifica contro quella riga fissa, non contro un nuovo TOFU.
 | `bore ssh-gateway: <flag>: not available via SSH ingress; use the native bore client` | uno tra `udp`/`carriers`/`stun-server`/`upnp`/`try-port-prediction`/`nat-udp-preferred-port`/`auto-reconnect` passato via `exec`/env — non disponibile sul tratto SSH (§2.2/I-SSH2) | usare il client bore nativo per quella funzionalità, oppure ignorare l'avviso se il default va bene |
 | `bore ssh-gateway: <key>: unknown parameter` | typo in un parametro `exec`/env, o parametro non ancora supportato | controllare l'elenco parametri in §3/CLAUDE.md |
 | Il tunnel si blocca dopo ~60s di silenzio di rete e il forward sparisce dall'admin | comportamento CORRETTO — reaper keepalive (I-SSH3, `SSH_CTRL_TIMEOUT`=60s); non un bug | usare `autossh`/`ServerAliveInterval` lato client per mantenerlo vivo attraverso interruzioni di rete transitorie |
+| `bore ssh-gateway: interactive shells are not supported; ... This channel stays open either way.` | informativo, NON un errore fatale (§6.4a) — comparso perché niente è ancora registrato su questa connessione: o una sessione interattiva genuina (nessun `-R`/`-L`), o un secret *consumer* (`-L`) la cui prima connessione proxata non è ancora arrivata (il server non ha modo di saperlo prima) | se intendevi creare un tunnel controlla il comando; altrimenti nessuna azione richiesta — il canale NON viene chiuso, la connessione resta viva |
 | `ssh: connect to host ... port 443: Connection refused` con `ProxyCommand openssl s_client` | il server non ha TLS configurato su quella porta, o `--ssh-gateway` non è abilitato | verificare `--cert-file`/`--key-file` sul server e che la porta sia quella del control port |
 | Nessun banner SSH entro qualche secondo su una connessione raw (diagnostica) | il gateway non è abilitato su quella porta, o si sta parlando con la porta sbagliata | connettersi al control port corretto; senza `--ssh-gateway` il comportamento è quello bore nativo (nessun demux) |
 
@@ -789,16 +807,10 @@ A differenza della vhost (HTTPS già gestito lato server via `vhost.yml`), un tu
 riusando lo stesso `edge::accept` del client nativo `bore local --https`. Richiede un
 certificato server configurato (`--cert-file`/`--key-file`):
 
-> **⚠️ MAI combinare `-N` con un comando `exec` di parametri.** `-N`/`SessionType none`
-> dice a OpenSSH di non apire **nessun canale sessione**, quindi il comando dopo `--` non
-> viene MAI inviato — non un caso limite raro, è il comportamento documentato di OpenSSH
-> (`man ssh_config` §SessionType: "prevent the execution of a remote command at all").
-> Con `-N` + parametri, `https=on`/`force-https=on`/`notes=`/`max-conns=` restano ai
-> default **senza alcun avviso visibile lato client** (nessun canale su cui scriverlo) — il
-> tunnel parte comunque, silenziosamente senza i parametri richiesti. Per passare parametri
-> via `exec` **omettere `-N`** (§2.5, punto 1): il gateway tiene comunque il canale sessione
-> aperto senza shell, equivalente a `-N` per tutti gli scopi pratici. Ricontrollare sempre i
-> parametri applicati nella dashboard admin (§7) dopo la connessione.
+> **⚠️ Vale sempre la regola di §6.4a: mai `-N`.** Con `-N` il comando `exec` non viene MAI
+> inviato (nessun canale sessione si apre affatto), quindi `https=on`/`force-https=on`
+> restano ai default **senza alcun avviso visibile**. Ricontrollare sempre i parametri
+> applicati nel banner di stato (§6.11) o nella dashboard admin (§7).
 
 ```bash
 ssh -i id_ed25519_bore -p 7835 -f -R 9443:localhost:8080 localhost -- 'https=on'
@@ -826,3 +838,90 @@ posto di `=`) produce a sua volta un warning esplicito (`malformed parameter "ht
 `t_ssh_pub6_zombie_port_on_ungraceful_disconnect` /
 `params_malformed_token_warns_not_silently_dropped` in `tests/ssh_gateway_test.rs` /
 `src/sshgw.rs`.
+
+### 6.11 Banner di stato del tunnel (verificato)
+
+Una volta stabilito il forward, il gateway scrive un report leggibile sul canale sessione —
+lo stesso canale che, senza `-N` (§6.4a), OpenSSH apre di default per una shell interattiva
+e che il gateway ora tiene aperto invece di rifiutarlo. Ogni riga riporta un fatto noto
+**lato server**: mai l'host:porta locale del `-R`/`-L` del client, che il protocollo SSH non
+trasmette mai al server (RFC4254 §7: `tcpip-forward`/`direct-tcpip`/`forwarded-tcpip` non
+hanno un campo per la destinazione locale — è puro stato client-side). Il valore reale può
+richiedere qualche secondo (registrazione admin + risoluzione parametri via `PARAMS_GRACE`),
+non è instantaneo.
+
+**VHOST** (`vhost_info_banner`, `src/sshgw.rs`):
+```
+Vhost tunnel established
+  Public URL:       http://mysub.bore.example.com
+  Mode:             HTTP only
+  Identity:         laptop
+  Notes:            (none)
+  Basic-auth:       disabled
+  Webserver-log:    disabled
+  Max-conns:        n/a for vhost (server-wide --max-conns applies; no per-tunnel cap)
+  Request headers:  (none)
+  Response headers: (none)
+```
+`Mode` riflette `resolve_mode` (§5.6): `HTTP only` / `HTTPS only` / `HTTP + HTTPS (no
+redirect)` / `HTTPS (HTTP redirects to HTTPS)`. `Max-conns` è sempre "n/a" per vhost: il cap
+per-tunnel non esiste su questo path (solo `--max-conns` globale del server si applica),
+esattamente come per il client nativo — non una lacuna SSH-specifica. `Request/Response
+headers` mostra il conteggio e i NOMI (mai i valori) degli header default configurati via
+`--vhost-default-headers`/`--vhost-default-response-headers` o via reservation — un modo
+sintetico per verificare che siano stati applicati senza dover ispezionare l'admin API.
+
+**PUBLIC** (`public_info_banner`):
+```
+Public tunnel established
+  Public port:      9443
+  Identity:         laptop
+  Notes:            (none)
+  Max-conns:        1024 (default)
+  Basic-auth:       disabled
+  HTTPS:            enabled
+  Force-HTTPS:      enabled
+  Webserver-log:    disabled
+```
+`Max-conns` riporta anche la provenienza: `(default)` se nessuno l'ha richiesto, `(key
+policy)` se vinta dal `permit=`/`max-conns=` della chiave in authorized_keys, `(requested)`
+se arrivata via `exec`/env (le due non sono più distinguibili una volta risolte da
+`parse_params`, quindi collassano nella stessa etichetta).
+
+**SECRET provider** (`secret_provider_info_banner`) — include il comando esatto per il
+lato consumer, con placeholder espliciti per host/porta invece di un valore indovinato: il
+gateway non può sapere con certezza il proprio hostname pubblicamente raggiungibile, e
+sbagliarlo sarebbe peggio che essere onesti sul non saperlo:
+```
+Secret provider tunnel established
+  Secret ID:        tcp-secret-id
+  Identity:         laptop
+  Notes:            (none)
+  Max-conns:        n/a for secret provider (not enforced per-tunnel)
+  Basic-auth:       n/a for secret provider (opaque TCP, no HTTP layer)
+
+Consumer command (run on the other side, same host/port you used here):
+  ssh -p <same-port> -L <local-port>:secret/tcp-secret-id:1 <same-host>
+```
+
+**SECRET consumer** (`secret_consumer_info_banner`) — mostrato **una volta per sessione**
+(al primo canale `direct-tcpip`), non una volta per connessione proxata (D11 parity, stessa
+regola del conteggio riga-admin unica per `--carriers`):
+```
+Attached to secret 'tcp-secret-id'
+  Secret ID:        tcp-secret-id
+  Identity:         laptop
+  Notes:            (none)
+  Provider identity: laptop
+```
+`Provider identity` mostra `(unknown — provider may be a native bore client)` quando il
+provider non è una sessione SSH di questo gateway (es. client `bore` nativo, o provider su
+un altro server) — il consumer funziona comunque, è solo un dettaglio diagnostico best-effort
+non sempre disponibile.
+
+Copertura test: `t_ssh_banner_vhost_no_n_survives_and_reports` /
+`t_ssh_banner_public_no_n_survives_and_reports` /
+`t_ssh_banner_public_https_reports_enabled` /
+`t_ssh_banner_secret_provider_no_n_survives_and_reports` /
+`t_ssh_banner_secret_consumer_fires_once` / `t_ssh_nokill_zero_bare_interactive_still_rejected`
+in `tests/ssh_gateway_test.rs`.

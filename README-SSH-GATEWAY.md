@@ -84,7 +84,7 @@ Solo hash argon2id sul disco, mai plaintext. Più righe valide contemporaneament
 dal server, usato solo come etichetta secondaria in login.
 
 ```bash
-sshpass -p 'correct-horse-battery-staple' ssh -p 7835 -N -R 9998:localhost:8080 alice@bore.example.com
+sshpass -p 'correct-horse-battery-staple' ssh -p 7835 -R 9998:localhost:8080 alice@bore.example.com
 ```
 
 `autossh` non presidiato + password richiede `sshpass`/`SSH_ASKPASS` (password finisce in
@@ -114,6 +114,15 @@ Consumer secret (`-L`, sempre secret, la porta finale è un placeholder ignorato
 
 ## 4. Esempi completi per modalità
 
+> **⚠️ Non usare mai `-N`, con o senza parametri.** Vale per **tutte** le modalità sotto —
+> vhost, public, secret provider, secret consumer. Motivo: `-N` (`SessionType=none`) impedisce
+> a OpenSSH di aprire il canale sessione, quindi il gateway non ha NESSUN modo di scrivere
+> né i warning né il banner di stato del tunnel (§5.1/§8) — il terminale resta muto e basta.
+> Omettendo `-N`, OpenSSH apre comunque il canale e richiede una shell interattiva di
+> default: il gateway la accetta silenziosamente e la usa come canale di stato, senza
+> comportarsi come una vera shell (niente prompt, niente comandi) e senza mai chiudere la
+> connessione per questo. Vale sia con `exec` params sia senza.
+
 Opzioni di stabilità comuni (client OpenSSH, tutte "gratis" lato gateway):
 
 ```bash
@@ -124,10 +133,10 @@ OPTS='-o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountM
 ### 4.1 VHOST — `mysub.bore.example.com` → `localhost:8080`
 
 ```bash
-ssh $OPTS -p 443 -N -R vhost/mysub:0:localhost:8080 bore.example.com
+ssh $OPTS -p 443 -R vhost/mysub:0:localhost:8080 bore.example.com
 ```
 
-Con parametri (**omettere `-N`** — vedi §5 per il perché):
+Con parametri:
 
 ```bash
 ssh $OPTS -p 443 -R vhost/mysub:0:localhost:8080 bore.example.com -- \
@@ -144,17 +153,17 @@ AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -R vhost/mysub:0:localhost:8080 \
 ### 4.2 PUBLIC — porta pubblica 9005 → `localhost:8080`
 
 ```bash
-ssh $OPTS -p 443 -N -R 9005:localhost:8080 bore.example.com
+ssh $OPTS -p 443 -R 9005:localhost:8080 bore.example.com
 ```
 
 Porta assegnata dal server (`0`):
 
 ```bash
-ssh $OPTS -p 443 -N -R 0:localhost:8080 bore.example.com
+ssh $OPTS -p 443 -R 0:localhost:8080 bore.example.com
 # OpenSSH stampa: "Allocated port NNNNN for remote forward to localhost:8080"
 ```
 
-Con parametri (**omettere `-N`**):
+Con parametri:
 
 ```bash
 ssh $OPTS -p 443 -R 9005:localhost:8080 bore.example.com -- 'notes="staging" max-conns=200'
@@ -163,12 +172,12 @@ ssh $OPTS -p 443 -R 9005:localhost:8080 bore.example.com -- 'notes="staging" max
 `autossh`:
 
 ```bash
-AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -N -R 9005:localhost:8080 bore.example.com
+AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -R 9005:localhost:8080 bore.example.com
 ```
 
 ### 4.3 SECRET provider — registra id `tcp-secret-id` → `localhost:8080`
 
-Con parametri (**omettere `-N`**):
+Con parametri:
 
 ```bash
 ssh $OPTS -p 443 -R secret/tcp-secret-id:0:localhost:8080 bore.example.com -- \
@@ -185,13 +194,13 @@ AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -R secret/tcp-secret-id:0:localhost:
 ### 4.4 SECRET consumer — `localhost:8899` → provider `tcp-secret-id`
 
 ```bash
-ssh $OPTS -p 443 -N -L 8899:secret/tcp-secret-id:1 bore.example.com
+ssh $OPTS -p 443 -L 8899:secret/tcp-secret-id:1 bore.example.com
 ```
 
 `autossh`:
 
 ```bash
-AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -N -L 8899:secret/tcp-secret-id:1 bore.example.com
+AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -L 8899:secret/tcp-secret-id:1 bore.example.com
 ```
 
 > Un consumer SSH può parlare con un provider **nativo bore** e viceversa — provider e
@@ -199,22 +208,85 @@ AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -N -L 8899:secret/tcp-secret-id:1 bo
 > L'unica funzionalità persa è il path diretto p2p (QUIC), che richiede il client bore
 > nativo su ENTRAMBI i lati (§7).
 
+### 4.5 Banner di stato del tunnel
+
+Una volta stabilito il forward, il gateway scrive un report sul canale sessione (lo stesso
+canale che una shell interattiva avrebbe usato — §4's box qui sopra spiega perché omettere
+`-N` è quello che lo rende possibile). Ogni riga riporta solo fatti che il server conosce
+per certo: **non** l'host:porta locale del tuo `-R`/`-L` (`localhost:8080` sopra) — quello
+non viaggia mai sul protocollo SSH, resta puramente lato client (RFC4254: `tcpip-forward`/
+`direct-tcpip` non hanno un campo per la destinazione locale). Il valore reale può volerci
+qualche secondo ad arrivare (registrazione admin + risoluzione parametri), non è instantaneo.
+
+**VHOST:**
+```
+Vhost tunnel established
+  Public URL:       http://mysub.bore.example.com
+  Mode:             HTTP only
+  Identity:         laptop
+  Notes:            (none)
+  Basic-auth:       disabled
+  Webserver-log:    disabled
+  Max-conns:        n/a for vhost (server-wide --max-conns applies; no per-tunnel cap)
+  Request headers:  (none)
+  Response headers: (none)
+```
+
+**PUBLIC:**
+```
+Public tunnel established
+  Public port:      9005
+  Identity:         laptop
+  Notes:            staging
+  Max-conns:        200 (requested)
+  Basic-auth:       disabled
+  HTTPS:            disabled
+  Force-HTTPS:      disabled
+  Webserver-log:    disabled
+```
+
+**SECRET provider** — nota il comando pronto all'uso per il consumer, con placeholder
+espliciti (`<same-port>`/`<same-host>`) invece di un valore indovinato: il gateway non può
+sapere con certezza il proprio hostname pubblico, e un valore sbagliato sarebbe peggio di
+un placeholder onesto:
+```
+Secret provider tunnel established
+  Secret ID:        tcp-secret-id
+  Identity:         laptop
+  Notes:            db-primary
+  Max-conns:        n/a for secret provider (not enforced per-tunnel)
+  Basic-auth:       n/a for secret provider (opaque TCP, no HTTP layer)
+
+Consumer command (run on the other side, same host/port you used here):
+  ssh -p <same-port> -L <local-port>:secret/tcp-secret-id:1 <same-host>
+```
+
+**SECRET consumer** — mostrato una volta per sessione, non una volta per connessione
+proxata:
+```
+Attached to secret 'tcp-secret-id'
+  Secret ID:        tcp-secret-id
+  Identity:         laptop
+  Notes:            (none)
+  Provider identity: laptop
+```
+
+`Provider identity` mostra `(unknown — provider may be a native bore client)` quando il
+provider non è una sessione SSH di questo gateway (es. un client `bore` nativo) — il
+consumer funziona comunque, è solo un dettaglio diagnostico che non è disponibile in quel
+caso.
+
 ---
 
 ## 5. Passaggio parametri (3 canali, precedenza: **chiave** > **exec** > **env**)
 
 ### 5.1 Stringa `exec` (dopo `--`, funziona anche con autossh)
 
-> **⚠️ MAI `-N` insieme a un comando `exec`.** `-N`/`SessionType none` dice a OpenSSH di
-> non apire **nessun canale sessione**: il comando dopo `--` non viene MAI inviato — è il
-> comportamento documentato di OpenSSH (`man ssh_config` → `SessionType`: "prevent the
-> execution of a remote command at all"), non un limite del gateway. Con `-N` + parametri,
-> `notes=`/`max-conns=`/`https=on`/ecc. restano ai default **senza alcun avviso visibile**
-> (nessun canale su cui scriverlo) — il tunnel parte comunque, in silenzio, senza i
-> parametri richiesti. Per passare parametri via `exec`, **omettere `-N`**: il gateway
-> tiene comunque il canale sessione aperto senza shell, equivalente a `-N` per tutti gli
-> scopi pratici. Verificare sempre i parametri applicati nella dashboard admin dopo la
-> connessione.
+> **⚠️ Vale la regola di §4: mai `-N`.** Con `-N` il comando dopo `--` non viene MAI
+> inviato (OpenSSH non apre alcun canale sessione — `man ssh_config` → `SessionType`),
+> quindi `notes=`/`max-conns=`/`https=on`/ecc. restano ai default **senza alcun avviso
+> visibile**. Verificare sempre i parametri applicati o nel banner di stato (§4.5) o nella
+> dashboard admin dopo la connessione.
 
 ```bash
 ssh $OPTS -p 443 -R vhost/mysub:0:localhost:8080 bore.example.com -- \
@@ -329,10 +401,10 @@ Host bore
 ```
 
 ```bash
-ssh -N -R vhost/myapp:0:localhost:8080 bore                       # vhost
-ssh -N -R 9005:localhost:8080 bore                                 # public
-ssh -N -R secret/tcp-id:0:localhost:8080 bore                      # secret provider
-ssh -N -L 8899:secret/tcp-id:1 bore                                 # secret consumer
+ssh -R vhost/myapp:0:localhost:8080 bore                       # vhost
+ssh -R 9005:localhost:8080 bore                                 # public
+ssh -R secret/tcp-id:0:localhost:8080 bore                      # secret provider
+ssh -L 8899:secret/tcp-id:1 bore                                 # secret consumer
 ```
 
 `ExitOnForwardFailure=yes` è **obbligatorio** con `autossh`: senza, una sessione con forward
@@ -376,7 +448,7 @@ autossh non riavvia se il PRIMO tentativo fallisce entro 30s (default "gate" per
 
 ```bash
 ssh -o ProxyCommand='openssl s_client -quiet -verify_quiet -connect bore.example.com:443' \
-    -N -R vhost/myapp:0:localhost:8080 dummy-host
+    -R vhost/myapp:0:localhost:8080 dummy-host
 ```
 
 Il server rileva `SSH-` dopo l'handshake TLS e instrada al gateway automaticamente. Rimuovere
@@ -392,7 +464,7 @@ precedente invece di essere rifiutata — questo rende `autossh`/riavvii di rete
 (niente flap in attesa che il reaper da 60s liberi il nome):
 
 ```bash
-$ ssh -i id_ed25519_bore -p 443 -N -R vhost/mysub:0:localhost:18080 bore.example.com
+$ ssh -i id_ed25519_bore -p 443 -R vhost/mysub:0:localhost:18080 bore.example.com
 Allocated port 1 for remote forward to localhost:18080
 ```
 

@@ -141,11 +141,14 @@ const PARAMS_GRACE: Duration = Duration::from_secs(5);
 /// pending until the provider's own 60 s reaper fires.
 const SSH_DIRECT_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// One-line message written to the channel (then EOF+close) when a client
-/// requests an interactive shell — the gateway is ingress-only and never
-/// grants one.
-const SHELL_DENIED_MESSAGE: &str =
-    "bore ssh-gateway: interactive shells are not supported; use -R/-L forwarding.\r\n";
+/// Informational (never channel-closing — see `shell_request`) line written
+/// when a client's implicit shell request arrives with nothing established
+/// yet on this connection: either a genuine interactive-login mistake, or a
+/// secret consumer whose first proxied connection just hasn't happened yet.
+const NO_FORWARD_YET_MESSAGE: &str =
+    "bore ssh-gateway: interactive shells are not supported; use -R/-L forwarding. \
+     No forward is established on this connection yet — if that's unexpected, check \
+     your ssh command. This channel stays open either way.\r\n";
 
 /// Validated configuration for the embedded SSH gateway, built from
 /// `bore server`'s `--ssh-*` flags.
@@ -739,7 +742,7 @@ impl GatewayHandler {
                 ForwardOwner {
                     identity: grant.identity.clone(),
                     abort,
-                    handle: ssh_handle,
+                    handle: ssh_handle.clone(),
                     conn: Arc::downgrade(&state),
                     key: key_for_task,
                     token,
@@ -761,12 +764,7 @@ impl GatewayHandler {
                 live_cfg.http_port,
                 live_cfg.https_port,
             );
-            if let Some(url) = http_url {
-                state.queue_message(format!("vhost tunnel ready: {url}"));
-            }
-            if let Some(url) = https_url {
-                state.queue_message(format!("vhost tunnel ready: {url}"));
-            }
+            let urls: Vec<String> = [http_url, https_url].into_iter().flatten().collect();
 
             let registration = gateway.admin.register(NewEntry {
                 role: Role::Vhost,
@@ -801,6 +799,19 @@ impl GatewayHandler {
                 transport: Transport::Ssh,
                 identity: Some(grant.identity.clone()),
             });
+
+            for line in vhost_info_banner(VhostBannerInfo {
+                urls: &urls,
+                mode,
+                identity: &grant.identity,
+                notes: params.notes.as_deref(),
+                basic_auth: has_basic_auth,
+                webserver_log: params.webserver_log,
+                request_headers: &entry.request_headers,
+                response_headers: &entry.response_headers,
+            }) {
+                state.deliver(&ssh_handle, line).await;
+            }
 
             // Nothing left to do but stay alive: the shared vhost HTTP(S)
             // frontend drives all traffic through `pool`/`registration` via
@@ -928,7 +939,7 @@ impl GatewayHandler {
                 ForwardOwner {
                     identity: grant.identity.clone(),
                     abort,
-                    handle: ssh_handle,
+                    handle: ssh_handle.clone(),
                     conn: Arc::downgrade(&state),
                     key: key_for_task,
                     token,
@@ -941,8 +952,6 @@ impl GatewayHandler {
                 pool: Arc::clone(&pool),
                 token,
             };
-
-            state.queue_message(format!("secret tunnel provider ready: {id}"));
 
             let registration = gateway.admin.register(NewEntry {
                 role: Role::SecretProvider,
@@ -978,6 +987,10 @@ impl GatewayHandler {
                 identity: Some(grant.identity.clone()),
             });
 
+            for line in secret_provider_info_banner(&id, &grant.identity, params.notes.as_deref()) {
+                state.deliver(&ssh_handle, line).await;
+            }
+
             // Nothing left to do but stay alive: native/SSH consumers reach
             // `pool` through the registry lookup in `secret::relay`/
             // `channel_open_direct_tcpip`. This task's only remaining purpose
@@ -1011,14 +1024,19 @@ impl GatewayHandler {
 
     /// The (session, id)-scoped admin entry for a secret id this session
     /// consumes via `direct-tcpip`, creating it on first use (D11).
-    fn consumer_entry(&self, id: &str) -> Arc<ConsumerEntry> {
+    /// Returns this session's `ConsumerEntry` for `id`, creating it (and its
+    /// admin row) lazily on the first `direct-tcpip` channel for that id. The
+    /// `bool` is `true` only on that first call — used to fire the "attached
+    /// to secret" info banner exactly once per session, not once per
+    /// proxied connection.
+    fn consumer_entry(&self, id: &str) -> (Arc<ConsumerEntry>, bool) {
         let mut consumers = self
             .state
             .secret_consumers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(entry) = consumers.get(id) {
-            return Arc::clone(entry);
+            return (Arc::clone(entry), false);
         }
         let grant = self.grant();
         let registration = self.gateway.admin.register(NewEntry {
@@ -1063,7 +1081,7 @@ impl GatewayHandler {
             relay_rx,
         });
         consumers.insert(id.to_string(), Arc::clone(&entry));
-        entry
+        (entry, true)
     }
 }
 
@@ -1085,14 +1103,26 @@ struct ConnState {
     /// counter, not a fire-and-forget wakeup, so there is no missed-update
     /// race to reason about.
     exec: watch::Sender<Option<String>>,
-    /// Success/diagnostic lines queued for the first session channel this
-    /// connection opens. `tcpip-forward` is always processed before any
-    /// channel exists (confirmed empirically — SPIKE_FINDINGS.md), so text
-    /// meant for the user has nowhere to go until (if ever)
-    /// `channel_open_session` fires; for a pure `-N` session (the common
-    /// case) it is simply never delivered, which is fine — OpenSSH's own
-    /// client already prints "Allocated port N for remote forward".
+    /// Success/diagnostic lines queued until a session channel exists to
+    /// write them to. `tcpip-forward` is always processed before any channel
+    /// exists (confirmed empirically — SPIKE_FINDINGS.md), so text meant for
+    /// the user has nowhere to go until (if ever) `channel_open_session`
+    /// fires. A true `-N` client (`SessionType=none`) never opens a channel
+    /// at all — confirmed empirically, not just per the RFC text — so these
+    /// are simply never delivered for `-N`; OpenSSH's own client still
+    /// prints "Allocated port N for remote forward" in that case. Once
+    /// `channel_open_session` fires, `session_channel` below is set and
+    /// every later line bypasses this queue entirely (delivered immediately
+    /// via `ConnState::deliver`) — this queue only matters for the brief
+    /// window before the channel opens.
     pending_messages: Mutex<Vec<String>>,
+    /// The session channel this connection opened, if any (set once by
+    /// `channel_open_session`). Lets a forward task that finishes its own
+    /// registration *after* the channel already opened (common — vhost/
+    /// secret/public registration crosses `PARAMS_GRACE`) push a line
+    /// directly via the cloned `Handle::data`, which works outside the
+    /// per-call `Session` reference entirely (see `ConnState::deliver`).
+    session_channel: Mutex<Option<ChannelId>>,
     /// Live per-forward tasks, keyed by `(bind_address, allocated_port)`, so
     /// `cancel_tcpip_forward` can abort exactly the right one without
     /// disturbing sibling forwards on the same connection (I-3).
@@ -1121,7 +1151,10 @@ struct ConsumerEntry {
 impl ConnState {
     /// Queue a line for delivery the next time (if ever) a session channel
     /// is open. See the `pending_messages` field doc for why this can't
-    /// simply write to a channel directly.
+    /// simply write to a channel directly. Prefer [`ConnState::deliver`] from
+    /// an async context with a `Handle` in hand — this is the fallback used
+    /// before a channel exists, or from the few sync `Handler` callbacks
+    /// that reject a request before any channel/handle is relevant.
     fn queue_message(&self, line: String) {
         self.pending_messages
             .lock()
@@ -1137,6 +1170,65 @@ impl ConnState {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
+    }
+
+    /// Records the session channel this connection opened, so later calls to
+    /// [`ConnState::deliver`] can write to it directly instead of queueing.
+    fn set_session_channel(&self, id: ChannelId) {
+        *self
+            .session_channel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id);
+    }
+
+    fn session_channel(&self) -> Option<ChannelId> {
+        *self
+            .session_channel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether this connection has (or ever had) at least one live forward
+    /// registered (`-R vhost/secret-provider/public`). Used by
+    /// `shell_request` as a best-effort signal for whether to print the
+    /// "nothing established yet" hint — NOT to decide whether to keep the
+    /// channel open (that's now unconditional, see `shell_request`'s doc).
+    fn has_forwards(&self) -> bool {
+        !self
+            .forwards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+
+    /// Whether this connection has attached to at least one secret-consumer
+    /// id (`-L <port>:secret/<id>:1`) yet. Unlike `has_forwards`, this is
+    /// necessarily a lagging signal — a consumer only registers here once
+    /// its FIRST proxied connection actually opens a `direct-tcpip` channel,
+    /// which can be well after the session channel's shell request fires.
+    fn has_secret_consumers(&self) -> bool {
+        !self
+            .secret_consumers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+
+    /// Delivers one line of info/diagnostic text to the user, right now if
+    /// the session channel is already open (via `Handle::data`, which works
+    /// from any task holding a cloned `Handle` — no `Session`/dispatch-loop
+    /// access needed), or queued for the channel's eventual first open
+    /// otherwise. This is what lets a forward task (vhost/public/secret)
+    /// report its *final*, fully-resolved state — which can finish seconds
+    /// after the channel opened, well past `channel_open_session`'s one-shot
+    /// drain — rather than only ever seeing whatever was queued at the
+    /// instant the channel appeared.
+    async fn deliver(&self, handle: &Handle, line: String) {
+        if let Some(id) = self.session_channel() {
+            let _ = handle.data(id, format!("{line}\r\n").into_bytes()).await;
+        } else {
+            self.queue_message(line);
+        }
     }
 }
 
@@ -1215,6 +1307,11 @@ impl Handler for GatewayHandler {
     ) -> Result<(), Self::Error> {
         reply.accept().await;
         let channel_id = channel.id();
+        // Order matters: record the channel BEFORE draining, so a forward
+        // task's concurrent `ConnState::deliver` call either lands in this
+        // drain (queued-before-set) or pushes directly via `Handle::data`
+        // (set-before-its-check) — never silently lost in between.
+        self.state.set_session_channel(channel_id);
         for line in self.state.drain_messages() {
             session.data(channel_id, format!("{line}\r\n").into_bytes())?;
         }
@@ -1236,7 +1333,7 @@ impl Handler for GatewayHandler {
         _originator_address: &str,
         _originator_port: u32,
         reply: ChannelOpenHandle,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
         let id = match parse_direct_tcpip_dest(host_to_connect, port_to_connect) {
             Ok(id) => id,
@@ -1269,9 +1366,31 @@ impl Handler for GatewayHandler {
         // (a valid, registered id) and let the task close it on open failure,
         // which an `ssh -L` client observes as an immediately-closed forwarded
         // connection — the correct signal, without holding the dispatch loop.
-        let consumer_entry = self.consumer_entry(&id);
+        let (consumer_entry, is_new_consumer) = self.consumer_entry(&id);
         let total_rx_bytes = Arc::clone(&self.gateway.total_rx_bytes);
         let total_tx_bytes = Arc::clone(&self.gateway.total_tx_bytes);
+
+        if is_new_consumer {
+            let grant = self.grant();
+            let provider_identity = self
+                .gateway
+                .secret_owners
+                .get(&id)
+                .map(|owner| owner.identity.clone());
+            let lines = secret_consumer_info_banner(
+                &id,
+                &grant.identity,
+                grant.notes.as_deref(),
+                provider_identity.as_deref(),
+            );
+            let handle = session.handle();
+            let state = Arc::clone(&self.state);
+            tokio::spawn(async move {
+                for line in lines {
+                    state.deliver(&handle, line).await;
+                }
+            });
+        }
 
         reply.accept().await;
         tokio::spawn(async move {
@@ -1343,10 +1462,38 @@ impl Handler for GatewayHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
-        session.data(channel, SHELL_DENIED_MESSAGE.as_bytes().to_vec())?;
-        session.exit_status_request(channel, 1)?;
-        session.eof(channel)?;
-        session.close(channel)?;
+        // A client that omits `-N` and passes no `exec` command (the common,
+        // ordinary way to invoke `-R`/`-L`) still gets OpenSSH's *default*
+        // behavior: request an interactive shell on the session channel.
+        // This is NOT the client asking for a real shell — it is the
+        // client's default absent any override — so denying it by closing
+        // the channel with a nonzero exit status is the wrong move: OpenSSH
+        // treats "my primary session's command exited nonzero" as reason to
+        // disconnect the WHOLE connection, tearing down every active
+        // `-R`/`-L` forward on it too (BUG — a real report: a bare `ssh -p
+        // 443 -R secret/id:0:localhost:8080 host` closed immediately with
+        // "interactive shells are not supported" and killed the just-granted
+        // forward). Fixed by NEVER closing this channel with a nonzero exit
+        // from here — it is held open instead, silently, exactly like a
+        // `-N` session's channel would sit, so `ConnState::deliver` can use
+        // it as the info/keepalive channel for the tunnel info banner (§7).
+        //
+        // This intentionally does NOT special-case "zero forwards" (a
+        // genuine interactive-login mistake) into a hard rejection anymore,
+        // even though an earlier version of this fix tried to: a secret
+        // *consumer* (`-L <port>:secret/<id>:1`) has NO equivalent of
+        // `tcpip-forward` to announce itself in advance — the server learns
+        // about it only when a real proxied connection arrives on the
+        // client's local port, which can be arbitrarily later than this
+        // shell request. Closing the channel for "no forward YET" would
+        // reintroduce the exact same bug for any consumer whose first
+        // connection hasn't arrived yet. A best-effort, INFORMATIONAL (never
+        // channel-closing) hint is printed instead when nothing is known
+        // yet, so a genuine mistake still gets a clear answer without ever
+        // risking a legitimate tunnel.
+        if !self.state.has_forwards() && !self.state.has_secret_consumers() {
+            session.data(channel, NO_FORWARD_YET_MESSAGE.as_bytes().to_vec())?;
+        }
         Ok(())
     }
 
@@ -1506,8 +1653,21 @@ impl Handler for GatewayHandler {
             // vhost/secret finalize tasks — this public-tunnel path has the
             // same "captured early, never used again, long-lived tail
             // future" shape and was never patched.
-            drop(state);
             let effective_max_conns = params.max_conns.unwrap_or(DEFAULT_MAX_CONNS);
+            for line in public_info_banner(PublicBannerInfo {
+                bound_port,
+                identity: &grant.identity,
+                notes: params.notes.as_deref(),
+                grant_max_conns: grant.max_conns,
+                effective_max_conns,
+                basic_auth: params.basic_auth.is_some(),
+                https: params.https,
+                force_https: params.force_https,
+                webserver_log: params.webserver_log,
+            }) {
+                state.deliver(&ssh_handle, line).await;
+            }
+            drop(state);
             let tunnel_opts = crate::shared::TunnelOptions {
                 https: params.https,
                 force_https: params.force_https,
@@ -2467,6 +2627,193 @@ pub fn parse_params(
     }
 
     params
+}
+
+// ---------------------------------------------------------------------------
+// §7 tunnel-info banners (docs/SSH_GATEWAY.md §7): a short, professional,
+// unambiguous report delivered to the session channel once a forward
+// finishes establishing (via `ConnState::deliver`, §2). Every line reports a
+// fact the SERVER actually knows — never the client's own `-R`/`-L` local
+// destination, which RFC4254's `tcpip-forward`/`direct-tcpip` messages never
+// transmit to the server (there is no wire field for it; the client alone
+// decides where to splice a channel's bytes locally). Claiming to know it
+// would be lying to the user in the one place they're looking for the truth.
+// ---------------------------------------------------------------------------
+
+/// Right-pads a label to a fixed column so every value in a banner lines up,
+/// e.g. `banner_line("Notes:", "(none)")` → `"  Notes:            (none)"`.
+fn banner_line(label: &str, value: impl std::fmt::Display) -> String {
+    format!("  {label:<18}{value}")
+}
+
+fn on_off(flag: bool) -> &'static str {
+    if flag {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
+
+fn none_if_empty(value: Option<&str>) -> &str {
+    value.filter(|v| !v.is_empty()).unwrap_or("(none)")
+}
+
+/// Human-readable label for a resolved vhost frontend mode.
+fn vhost_mode_label(mode: crate::vhost::VhostMode) -> &'static str {
+    use crate::vhost::VhostMode;
+    match mode {
+        VhostMode::Http => "HTTP only",
+        VhostMode::Https => "HTTPS only",
+        VhostMode::Both => "HTTP + HTTPS (no redirect)",
+        VhostMode::RedirectHttps => "HTTPS (HTTP redirects to HTTPS)",
+    }
+}
+
+/// `"2 configured: X-Foo, X-Bar"` / `"(none)"` — synthetic (names only, no
+/// values) so the banner stays short and never echoes header *values* that
+/// could be sensitive, while still answering "were my headers applied?".
+fn header_summary(headers: &[(String, String)]) -> String {
+    if headers.is_empty() {
+        return "(none)".to_string();
+    }
+    let names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
+    format!("{} configured: {}", headers.len(), names.join(", "))
+}
+
+/// `"200 (requested)"` / `"64 (key policy)"` / `"100 (default)"` — the
+/// precedence is grant > exec/env > default (I-2's documented order); once
+/// `parse_params` resolves it to a single value we can no longer tell exec
+/// apart from env, so both collapse to "requested".
+fn max_conns_provenance(grant_max_conns: Option<usize>, effective: usize) -> String {
+    if grant_max_conns.is_some() {
+        format!("{effective} (key policy)")
+    } else if effective == DEFAULT_MAX_CONNS {
+        format!("{effective} (default)")
+    } else {
+        format!("{effective} (requested)")
+    }
+}
+
+/// Inputs for [`vhost_info_banner`], grouped into a struct rather than a long
+/// positional argument list (`clippy::too_many_arguments`).
+struct VhostBannerInfo<'a> {
+    urls: &'a [String],
+    mode: crate::vhost::VhostMode,
+    identity: &'a str,
+    notes: Option<&'a str>,
+    basic_auth: bool,
+    webserver_log: bool,
+    request_headers: &'a [(String, String)],
+    response_headers: &'a [(String, String)],
+}
+
+/// Banner for a newly-established **vhost** forward.
+fn vhost_info_banner(info: VhostBannerInfo<'_>) -> Vec<String> {
+    let mut lines = vec!["Vhost tunnel established".to_string()];
+    if info.urls.is_empty() {
+        lines.push(banner_line("Public URL:", "(none — no cert configured)"));
+    }
+    for (i, url) in info.urls.iter().enumerate() {
+        let label = if i == 0 { "Public URL:" } else { "" };
+        lines.push(banner_line(label, url));
+    }
+    lines.push(banner_line("Mode:", vhost_mode_label(info.mode)));
+    lines.push(banner_line("Identity:", info.identity));
+    lines.push(banner_line("Notes:", none_if_empty(info.notes)));
+    lines.push(banner_line("Basic-auth:", on_off(info.basic_auth)));
+    lines.push(banner_line("Webserver-log:", on_off(info.webserver_log)));
+    lines.push(banner_line(
+        "Max-conns:",
+        "n/a for vhost (server-wide --max-conns applies; no per-tunnel cap)",
+    ));
+    lines.push(banner_line(
+        "Request headers:",
+        header_summary(info.request_headers),
+    ));
+    lines.push(banner_line(
+        "Response headers:",
+        header_summary(info.response_headers),
+    ));
+    lines
+}
+
+/// Inputs for [`public_info_banner`], grouped into a struct rather than a
+/// long positional argument list (`clippy::too_many_arguments`).
+struct PublicBannerInfo<'a> {
+    bound_port: u16,
+    identity: &'a str,
+    notes: Option<&'a str>,
+    grant_max_conns: Option<usize>,
+    effective_max_conns: usize,
+    basic_auth: bool,
+    https: bool,
+    force_https: bool,
+    webserver_log: bool,
+}
+
+/// Banner for a newly-established **public** (`-R <port>`) forward.
+fn public_info_banner(info: PublicBannerInfo<'_>) -> Vec<String> {
+    vec![
+        "Public tunnel established".to_string(),
+        banner_line("Public port:", info.bound_port),
+        banner_line("Identity:", info.identity),
+        banner_line("Notes:", none_if_empty(info.notes)),
+        banner_line(
+            "Max-conns:",
+            max_conns_provenance(info.grant_max_conns, info.effective_max_conns),
+        ),
+        banner_line("Basic-auth:", on_off(info.basic_auth)),
+        banner_line("HTTPS:", on_off(info.https)),
+        banner_line("Force-HTTPS:", on_off(info.force_https)),
+        banner_line("Webserver-log:", on_off(info.webserver_log)),
+    ]
+}
+
+/// Banner for a newly-established **secret provider** (`-R secret/<id>:0`)
+/// forward, including the exact command the other side (the "consumer")
+/// needs to reach it. The host/port in that command are deliberately left as
+/// placeholders naming what they mean rather than a guessed value: the
+/// gateway cannot reliably know its own externally-reachable hostname, and
+/// guessing wrong is worse than an honest placeholder.
+fn secret_provider_info_banner(id: &str, identity: &str, notes: Option<&str>) -> Vec<String> {
+    vec![
+        "Secret provider tunnel established".to_string(),
+        banner_line("Secret ID:", id),
+        banner_line("Identity:", identity),
+        banner_line("Notes:", none_if_empty(notes)),
+        banner_line(
+            "Max-conns:",
+            "n/a for secret provider (not enforced per-tunnel)",
+        ),
+        banner_line(
+            "Basic-auth:",
+            "n/a for secret provider (opaque TCP, no HTTP layer)",
+        ),
+        String::new(),
+        "Consumer command (run on the other side, same host/port you used here):".to_string(),
+        format!("  ssh -p <same-port> -L <local-port>:secret/{id}:1 <same-host>"),
+    ]
+}
+
+/// Banner for a newly-established **secret consumer** (`-L <port>:secret/<id>:1`)
+/// session — fired once per session (see `consumer_entry`'s `is_new`), not
+/// once per proxied connection.
+fn secret_consumer_info_banner(
+    id: &str,
+    identity: &str,
+    notes: Option<&str>,
+    provider_identity: Option<&str>,
+) -> Vec<String> {
+    vec![
+        format!("Attached to secret '{id}'"),
+        banner_line("Secret ID:", id),
+        banner_line("Identity:", identity),
+        banner_line("Notes:", none_if_empty(notes)),
+        banner_line(
+            "Provider identity:",
+            provider_identity.unwrap_or("(unknown — provider may be a native bore client)"),
+        ),
+    ]
 }
 
 #[cfg(test)]

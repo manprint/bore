@@ -523,6 +523,49 @@ the existing registries/relay/admin/weblog/`--max-conns` data path unmodified.
   label/secret id evicts and replaces it (useful for deterministic `autossh` reconnection); a
   DIFFERENT identity, or a name held by a *native* (non-SSH) tunnel, is always rejected — SSH
   identities and the HMAC secret are different trust domains, never mixed.
+- **I-SSH6 (`shell_request` must never force-close, bug-hunt 2026-07-05):** a bare `ssh -R`/
+  `-L` (no `-N`, no `exec` command — the ordinary invocation) still gets OpenSSH's *default*
+  behavior of ALSO requesting an interactive shell on the session channel. The gateway used to
+  deny it with `exit_status(1)` + `eof` + `close`; OpenSSH treats its "primary session"
+  exiting nonzero as reason to disconnect the WHOLE connection, tearing down every active
+  `-R`/`-L` forward on it too — a real report: a bare `-R secret/id:0:localhost:8080` got
+  "interactive shells are not supported" and the just-granted forward died with it. Fixed by
+  NEVER closing this channel with a nonzero exit from `shell_request` — it is held open
+  instead (this is also what makes I-SSH7 possible). Deliberately does NOT special-case "zero
+  forwards yet" into a hard rejection either: a secret *consumer* (`-L <port>:secret/<id>:1`)
+  has no `tcpip-forward`-equivalent to announce itself in advance — the server only learns
+  about it when a real proxied connection opens a `direct-tcpip` channel, which can be well
+  after the shell request fires. Closing for "nothing YET" would silently reintroduce the same
+  bug for a consumer whose first connection hasn't happened yet. Only a best-effort,
+  NON-closing informational line (`NO_FORWARD_YET_MESSAGE`) is printed when nothing is known
+  (`ConnState::has_forwards`/`has_secret_consumers` both empty) — never destructive either way.
+- **I-SSH7 (tunnel info banner, same bug-hunt):** once a vhost/public/secret-provider/
+  secret-consumer forward finishes establishing, the gateway writes a short, professional,
+  English status report to the session channel (`vhost_info_banner`/`public_info_banner`/
+  `secret_provider_info_banner`/`secret_consumer_info_banner` + `ConnState::deliver`, all in
+  `src/sshgw.rs`) — this is the fix above's actual payoff, not just a side effect. **Never**
+  reports the client's own `-R`/`-L` local host:port: RFC4254's `tcpip-forward`/`direct-tcpip`
+  wire messages have no field for it — it is pure client-local state the server cannot know,
+  and guessing would be actively misleading in the one place a user is checking for the truth.
+  Delivery is via `Handle::data(channel_id, ..)` — works from any task holding a cloned
+  `Handle`, no `Session`/dispatch-loop access needed — which is essential because a forward's
+  *final* state (bound port, cert-missing https downgrade, resolved headers) isn't known until
+  well after `channel_open_session` already fired and did its one-shot drain (crosses
+  `PARAMS_GRACE`). `ConnState::session_channel` (set by `channel_open_session`, ordered BEFORE
+  its drain so a racing `deliver` can never fall in the gap) is what lets `deliver` target the
+  channel directly instead of only queueing. Secret-provider's banner includes the exact
+  consumer command with `<same-host>`/`<same-port>` placeholders (never a guessed hostname).
+  Secret-consumer's banner fires exactly ONCE per session (`consumer_entry` now returns
+  `(entry, is_new)`), not once per proxied connection (D11 parity). **Corollary — `-N` is now
+  universally discouraged, not just when passing `exec` params:** `-N` (`SessionType=none`)
+  was confirmed empirically (not just per RFC text) to skip opening a channel AT ALL, so a
+  `-N` client can never see this banner (or any warning) regardless of exec params — every
+  doc example was updated to drop `-N` (`docs/SSH_GATEWAY.md` §6.4a, `README-SSH-GATEWAY.md`
+  §4's box). Test coverage: `t_ssh_banner_vhost_no_n_survives_and_reports` /
+  `t_ssh_banner_public_no_n_survives_and_reports` / `t_ssh_banner_public_https_reports_enabled`
+  / `t_ssh_banner_secret_provider_no_n_survives_and_reports` /
+  `t_ssh_banner_secret_consumer_fires_once` / `t_ssh_nokill_zero_bare_interactive_still_rejected`
+  in `tests/ssh_gateway_test.rs`.
 - **Control-port demux (D8, Phase 6):** with the gateway enabled, `sshgw::demux_pre_tls` peeks
   the first byte (2s timeout — a real SSH client waits for the server's own banner and sends
   nothing first, sslh-style) and 3-way classifies it: `Ssh` (timeout or `b'S'`) dispatches
@@ -533,7 +576,8 @@ the existing registries/relay/admin/weblog/`--max-conns` data path unmodified.
   lets a plain HTTP/bore client keep working on a port that also serves TLS. `SshGateway::
   serve_connection` is generic over `mux::Transport` so it runs identically over `TcpStream`,
   `Prefixed<TcpStream>`, and a `TlsStream`.
-- Regression/e2e: `tests/ssh_gateway_test.rs` (cargo, 19 tests incl. takeover, demux, SSH-over-TLS)
+- Regression/e2e: `tests/ssh_gateway_test.rs` (cargo, 28 tests incl. takeover, demux, SSH-over-TLS,
+  the I-SSH6/I-SSH7 shell-request-fix/banner suite)
   + `sudo -n /abs/path/scripts/ssh_gateway_test.sh` (netns chaos: T-SSH-N1..N6 — real netfilter
   half-open, autossh recovery across a server restart, takeover under partition, mixed
   transports on one port, throughput report, password auth). Exact-path sudo invocation only

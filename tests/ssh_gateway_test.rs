@@ -905,7 +905,22 @@ async fn t_ssh_pub5_force_https_redirects_plain_http() -> Result<()> {
         .spawn()
         .context("spawn ssh -R with https=on force-https=on (T-SSH-PUB5)")?;
 
-    wait_admin_data_contains(&format!("\"public_port\":{fwd_port}")).await?;
+    let admin_json = wait_admin_data_contains(&format!("\"public_port\":{fwd_port}")).await?;
+
+    // Regression guard: the admin dashboard's "Tunnels" section must reflect
+    // `https=on`/`force-https=on` for an SSH-originated public tunnel same
+    // as it does for a native client's `--https`/`--force-https` — this was
+    // never actually checked by a test before (only the TLS *behavior* was),
+    // so a wiring gap between `parse_params`/`NewEntry` and the admin JSON
+    // (e.g. from a future refactor) could regress silently.
+    assert!(
+        admin_json.contains("\"https\":true"),
+        "admin entry must report https:true for this https=on SSH tunnel, got: {admin_json}"
+    );
+    assert!(
+        admin_json.contains("\"force_https\":true"),
+        "admin entry must report force_https:true for this force-https=on SSH tunnel, got: {admin_json}"
+    );
 
     let stream = TcpStream::connect(("127.0.0.1", fwd_port)).await?;
     let resp = http_get(stream, "/", None).await?;
@@ -1044,6 +1059,110 @@ async fn t_ssh_cancel1_session_close_frees_forwards() -> Result<()> {
     assert!(
         freed.is_ok(),
         "both forward listeners must be freed within 2s of session close"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-PUB6 — an ungraceful disconnect (SIGKILL, no `cancel-tcpip-forward`
+// ever sent) on a PUBLIC `-R <port>:...` forward must free the bound
+// listener/admin row, just like T-SSH-CANCEL1 already proves for the
+// underlying session-close path in general. This is the *same*
+// `Arc<ConnState>` reference-cycle bug class that 523fa32 fixed for the
+// vhost/secret finalize tasks (`drop(state)` before their `pending()` tail)
+// — missed for the public path because its tail is `run_public_forward`'s
+// real accept loop, not a bare `pending()`, so a grep for the sibling
+// pattern didn't surface it. Symptom in the wild: `Ctrl+C` the ssh client,
+// reconnect with the same `-R <port>` a moment later, get "remote port
+// forwarding failed" forever.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_pub6_zombie_port_on_ungraceful_disconnect() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(&auth_dir, &client_priv, None)?;
+
+    let gw_port = start_gateway_server(dir.path().join("host_key"), auth_dir).await?;
+    let svc = spawn_echo_service().await?;
+    let fwd_port = free_port().await?;
+
+    let args_a = ssh_args(gw_port, &client_priv, &[(fwd_port, svc)], None);
+    let mut child_a = Command::new("ssh")
+        .args(&args_a)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn first ssh -R holding the port (T-SSH-PUB6)")?;
+
+    wait_port(fwd_port, true).await;
+    assert!(
+        roundtrip(fwd_port, b"ping-before-kill").await?,
+        "forward not live before the ungraceful kill"
+    );
+
+    // SIGKILL, not a graceful client exit: no `cancel-tcpip-forward` global
+    // request ever reaches the gateway — matches Ctrl+C/a crashed client.
+    child_a.kill().await.ok();
+    let _ = child_a.wait().await;
+
+    // Deliberately no probe against `fwd_port` between the kill and the
+    // reconnect attempts below: a `TcpStream::connect` reaching the dead
+    // listener's `accept()` would itself trigger `run_public_forward`'s
+    // "channel-open failed, session is gone, return" exit path and mask the
+    // exact bug under test — the *idle* zombie listener that just sits there
+    // blocking a fresh bind with no intervening traffic on the old port,
+    // which is what the real-world report looked like.
+    let mut rebound = false;
+    for _ in 0..10 {
+        let args_b = ssh_args(gw_port, &client_priv, &[(fwd_port, svc)], None);
+        let mut child_b = Command::new("ssh")
+            .args(&args_b)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawn second ssh -R reusing the same port (T-SSH-PUB6)")?;
+
+        // `ExitOnForwardFailure=yes` (baked into `ssh_base_args`) makes a
+        // denied `-R` (e.g. `EADDRINUSE` from a still-live zombie listener)
+        // exit the client with a nonzero status once the full handshake +
+        // auth + global-request round trip completes; a successful bind
+        // instead holds `-N` open indefinitely. The grace window here MUST
+        // be generous (3s, not e.g. 200ms): a `try_wait`/short-timeout check
+        // taken while the client is still mid-KEX/auth (hasn't even sent its
+        // `-R` request yet) reads as "still alive" too and is a false
+        // positive for "bind accepted" — this cost real debugging time
+        // (confirmed by instrumenting `ss -tlnp` directly: the zombie
+        // listener's fd was provably still open across the entire window a
+        // shorter check was sampling).
+        // Timing out waiting for exit means it's still running, i.e. bind accepted.
+        if time::timeout(Duration::from_secs(3), child_b.wait())
+            .await
+            .is_err()
+        {
+            rebound = true;
+            child_b.kill().await.ok();
+            break;
+        }
+        // Otherwise it already exited (forwarding denied) — retry.
+        time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert!(
+        rebound,
+        "same public port must be rebindable shortly after an ungraceful \
+         disconnect (Ctrl+C/SIGKILL), not left zombie forever"
     );
 
     Ok(())

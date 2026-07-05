@@ -1491,6 +1491,22 @@ impl Handler for GatewayHandler {
                 params.https = false;
                 params.force_https = false;
             }
+            // `drop(state)` is load-bearing — same reference-cycle bug as
+            // `tcpip_forward_vhost`/`tcpip_forward_secret` (see their matching
+            // comment): this task's own `Arc<ConnState>` clone (captured above
+            // for `await_params`/`queue_message`) would otherwise stay alive
+            // for as long as `run_public_forward`'s accept loop runs — i.e.
+            // forever — so `ConnState`'s refcount never reaches zero and
+            // `Drop for ConnState` (which aborts every task in
+            // `self.forwards`, INCLUDING this one, freeing the bound
+            // `listener`/port and the admin entry) never runs on an
+            // ungraceful connection death (e.g. Ctrl+C on the client, which
+            // closes the TCP connection without a `cancel-tcpip-forward`).
+            // This was missed when 523fa32 fixed the identical bug for the
+            // vhost/secret finalize tasks — this public-tunnel path has the
+            // same "captured early, never used again, long-lived tail
+            // future" shape and was never patched.
+            drop(state);
             let effective_max_conns = params.max_conns.unwrap_or(DEFAULT_MAX_CONNS);
             let tunnel_opts = crate::shared::TunnelOptions {
                 https: params.https,
@@ -2347,13 +2363,16 @@ fn tokenize(s: &str) -> Vec<String> {
 }
 
 /// Splits each whitespace-delimited (quote-aware) token on its first `=`
-/// into a `(key, value)` pair. Tokens without an `=` are dropped.
-fn parse_kv_tokens(s: &str) -> Vec<(String, String)> {
+/// into a `(key, value)` pair. A token without an `=` is returned as an
+/// `Err(token)` rather than dropped — I-2 forbids silently ignoring a
+/// malformed parameter (e.g. `https:on` typoed for `https=on`).
+fn parse_kv_tokens(s: &str) -> Vec<Result<(String, String), String>> {
     tokenize(s)
         .into_iter()
-        .filter_map(|tok| {
+        .map(|tok| {
             tok.split_once('=')
                 .map(|(k, v)| (k.to_string(), v.to_string()))
+                .ok_or(tok)
         })
         .collect()
 }
@@ -2382,11 +2401,22 @@ pub fn parse_params(
     grant: &crate::sshgw_auth::KeyGrant,
 ) -> Params {
     let mut merged: Vec<(String, String)> = env_params(env);
+    let mut malformed: Vec<String> = Vec::new();
     if let Some(exec) = exec {
-        merged.extend(parse_kv_tokens(exec));
+        for tok in parse_kv_tokens(exec) {
+            match tok {
+                Ok(kv) => merged.push(kv),
+                Err(tok) => malformed.push(tok),
+            }
+        }
     }
 
     let mut params = Params::default();
+    for tok in &malformed {
+        params.warnings.push(format!(
+            "malformed parameter {tok:?} (expected key=value); ignored"
+        ));
+    }
     for (key, value) in &merged {
         match key.as_str() {
             "notes" => params.notes = Some(value.clone()),
@@ -2658,6 +2688,38 @@ mod tests {
         // as webserver-log=.
         let params = parse_params(Some("https=yes"), &[], &grant("id"));
         assert!(!params.https);
+    }
+
+    #[test]
+    fn params_malformed_token_warns_not_silently_dropped() {
+        // A token with no `=` (e.g. `https:on` typoed for `https=on`, the
+        // exact mistake that triggered a real "params never applied, no
+        // warning anywhere" bug report) must WARN, never silently vanish
+        // (I-2) — `parse_kv_tokens` used to `filter_map` these away with no
+        // trace at all.
+        let params = parse_params(Some("https:on force-https=on"), &[], &grant("id"));
+        assert!(params
+            .warnings
+            .iter()
+            .any(|w| w.contains("https:on") && w.contains("expected key=value")));
+        // The malformed token contributes nothing: `https` stays off, so the
+        // well-formed `force-https=on` alongside it also gets disabled with
+        // its own separate warning (two warnings total, not a silent drop
+        // of either).
+        assert!(params
+            .warnings
+            .iter()
+            .any(|w| w.contains("force-https") && w.contains("requires https=on")));
+        assert_eq!(params.warnings.len(), 2);
+        assert!(!params.https);
+        assert!(!params.force_https);
+
+        // A well-formed token elsewhere in the same string still parses
+        // normally — one malformed token doesn't poison the rest.
+        let params = parse_params(Some("notes=ok https:on"), &[], &grant("id"));
+        assert_eq!(params.notes.as_deref(), Some("ok"));
+        assert_eq!(params.warnings.len(), 1);
+        assert!(params.warnings[0].contains("https:on"));
     }
 
     #[test]

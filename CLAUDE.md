@@ -504,7 +504,17 @@ the existing registries/relay/admin/weblog/`--max-conns` data path unmodified.
   `Drop for ConnState` (which aborts every task in `self.forwards`) from ever firing on an
   ungraceful connection death. Fixed with an explicit `drop(state)` before each `pending()` tail
   in `src/sshgw.rs` — found and verified by `scripts/ssh_gateway_test.sh`'s T-SSH-N1, which
-  cargo tests structurally cannot reproduce (no real network stack to netfilter-DROP).
+  cargo tests structurally cannot reproduce (no real network stack to netfilter-DROP). The
+  SAME reference-cycle shape (`state` captured for `await_params`/`queue_message`, never used
+  again, then a long-lived tail future) existed in the PUBLIC-tunnel `tcpip_forward` task too
+  — missed by that first pass because its tail is `run_public_forward`'s real accept loop, not
+  a `pending()`, so it wasn't grepped alongside the other two. Symptom: Ctrl+C on an `ssh -R
+  <port>:...` client left the bound listener (and the admin row) alive forever — the next
+  attempt to reuse that port failed to bind. Fixed the same way (`drop(state)` right after its
+  last use, before the accept loop starts). Whenever a NEW `tcpip_forward_*`/exec-consuming
+  task is added, it needs the same explicit `drop(state)` if `state` is unused past setup and
+  the task tail outlives the connection — the compiler will NOT drop it early on its own
+  (lexical scope, not liveness, governs async drop timing here).
 - **I-SSH4:** `mux::LinkOpener::Ssh`/`SshOpener::open` never writes the yamux `STREAM_READY`
   marker byte — SSH has no equivalent framing; the caller IP travels as the channel-open
   request's own originator-IP field instead.

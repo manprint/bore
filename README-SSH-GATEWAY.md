@@ -127,17 +127,17 @@ OPTS='-o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountM
 ssh $OPTS -p 443 -N -R vhost/mysub:0:localhost:8080 bore.example.com
 ```
 
-Con parametri (al posto di `-N`, vedi §6 per la sintassi completa):
+Con parametri (**omettere `-N`** — vedi §5 per il perché):
 
 ```bash
-ssh $OPTS -p 443 -N -R vhost/mysub:0:localhost:8080 bore.example.com -- \
+ssh $OPTS -p 443 -R vhost/mysub:0:localhost:8080 bore.example.com -- \
     'notes="api prod" max-conns=512 basic-auth=user:pass webserver-log=on'
 ```
 
 `autossh`:
 
 ```bash
-AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -N -R vhost/mysub:0:localhost:8080 \
+AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -R vhost/mysub:0:localhost:8080 \
     bore.example.com -- 'notes="api prod"'
 ```
 
@@ -154,10 +154,10 @@ ssh $OPTS -p 443 -N -R 0:localhost:8080 bore.example.com
 # OpenSSH stampa: "Allocated port NNNNN for remote forward to localhost:8080"
 ```
 
-Con parametri:
+Con parametri (**omettere `-N`**):
 
 ```bash
-ssh $OPTS -p 443 -N -R 9005:localhost:8080 bore.example.com -- 'notes="staging" max-conns=200'
+ssh $OPTS -p 443 -R 9005:localhost:8080 bore.example.com -- 'notes="staging" max-conns=200'
 ```
 
 `autossh`:
@@ -168,15 +168,17 @@ AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -N -R 9005:localhost:8080 bore.examp
 
 ### 4.3 SECRET provider — registra id `tcp-secret-id` → `localhost:8080`
 
+Con parametri (**omettere `-N`**):
+
 ```bash
-ssh $OPTS -p 443 -N -R secret/tcp-secret-id:0:localhost:8080 bore.example.com -- \
+ssh $OPTS -p 443 -R secret/tcp-secret-id:0:localhost:8080 bore.example.com -- \
     'notes="db-primary" max-conns=64'
 ```
 
 `autossh`:
 
 ```bash
-AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -N -R secret/tcp-secret-id:0:localhost:8080 \
+AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -R secret/tcp-secret-id:0:localhost:8080 \
     bore.example.com -- 'notes="db-primary"'
 ```
 
@@ -203,13 +205,26 @@ AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -N -L 8899:secret/tcp-secret-id:1 bo
 
 ### 5.1 Stringa `exec` (dopo `--`, funziona anche con autossh)
 
+> **⚠️ MAI `-N` insieme a un comando `exec`.** `-N`/`SessionType none` dice a OpenSSH di
+> non apire **nessun canale sessione**: il comando dopo `--` non viene MAI inviato — è il
+> comportamento documentato di OpenSSH (`man ssh_config` → `SessionType`: "prevent the
+> execution of a remote command at all"), non un limite del gateway. Con `-N` + parametri,
+> `notes=`/`max-conns=`/`https=on`/ecc. restano ai default **senza alcun avviso visibile**
+> (nessun canale su cui scriverlo) — il tunnel parte comunque, in silenzio, senza i
+> parametri richiesti. Per passare parametri via `exec`, **omettere `-N`**: il gateway
+> tiene comunque il canale sessione aperto senza shell, equivalente a `-N` per tutti gli
+> scopi pratici. Verificare sempre i parametri applicati nella dashboard admin dopo la
+> connessione.
+
 ```bash
-ssh $OPTS -p 443 -N -R vhost/mysub:0:localhost:8080 bore.example.com -- \
+ssh $OPTS -p 443 -R vhost/mysub:0:localhost:8080 bore.example.com -- \
     'notes="two words" max-conns=512 basic-auth=user:pass webserver-log=on id=custom-id'
 ```
 
 Grammatica `chiave=valore` spazio-separata, quoting stile shell per valori con spazi
-(`notes="due parole"`).
+(`notes="due parole"`). Un token senza `=` (es. `https:on` invece di `https=on`) produce un
+warning esplicito (`malformed parameter "https:on" (expected key=value); ignored`), non
+viene scartato in silenzio.
 
 ### 5.2 Variabili d'ambiente (`~/.ssh/config`, static)
 
@@ -250,7 +265,7 @@ multi-connessione). Sul tratto SSH producono un warning sul canale, il tunnel re
 attivo con il comportamento di default:
 
 ```bash
-$ ssh -p 443 -N -R vhost/mysub:0:localhost:8080 bore.example.com -- 'udp=on carriers=4'
+$ ssh -p 443 -R vhost/mysub:0:localhost:8080 bore.example.com -- 'udp=on carriers=4'
 bore ssh-gateway: udp: not available via SSH ingress; use the native bore client
 bore ssh-gateway: carriers: not available via SSH ingress; use the native bore client
 ```
@@ -282,10 +297,10 @@ assegnata a quel forward. Richiede che il server abbia un certificato configurat
 (`--cert-file`/`--key-file` sul control port — lo stesso usato per demux/SSH-over-TLS):
 
 ```bash
-ssh $OPTS -p 443 -N -R 9443:localhost:8080 bore.example.com -- 'https=on'
+ssh $OPTS -p 443 -R 9443:localhost:8080 bore.example.com -- 'https=on'
 # curl https://bore.example.com:9443/   → risposta del servizio locale, TLS terminato dal server
 
-ssh $OPTS -p 443 -N -R 9444:localhost:8080 bore.example.com -- 'https=on force-https=on'
+ssh $OPTS -p 443 -R 9444:localhost:8080 bore.example.com -- 'https=on force-https=on'
 # curl http://bore.example.com:9444/    → 308 redirect verso https://bore.example.com:9444/
 ```
 
@@ -342,7 +357,7 @@ ExecStart=/usr/bin/autossh -M 0 \
     -o "ServerAliveInterval=15" -o "ServerAliveCountMax=3" \
     -o "ExitOnForwardFailure=yes" -o "StrictHostKeyChecking=yes" \
     -i /etc/bore/client_key -p 443 \
-    -N -R vhost/myapp:0:localhost:8080 tunnel@bore.example.com -- 'notes="prod"'
+    -R vhost/myapp:0:localhost:8080 tunnel@bore.example.com -- 'notes="prod"'
 Restart=always
 RestartSec=5
 User=bore-client

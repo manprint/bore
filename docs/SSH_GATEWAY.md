@@ -789,8 +789,19 @@ A differenza della vhost (HTTPS già gestito lato server via `vhost.yml`), un tu
 riusando lo stesso `edge::accept` del client nativo `bore local --https`. Richiede un
 certificato server configurato (`--cert-file`/`--key-file`):
 
+> **⚠️ MAI combinare `-N` con un comando `exec` di parametri.** `-N`/`SessionType none`
+> dice a OpenSSH di non apire **nessun canale sessione**, quindi il comando dopo `--` non
+> viene MAI inviato — non un caso limite raro, è il comportamento documentato di OpenSSH
+> (`man ssh_config` §SessionType: "prevent the execution of a remote command at all").
+> Con `-N` + parametri, `https=on`/`force-https=on`/`notes=`/`max-conns=` restano ai
+> default **senza alcun avviso visibile lato client** (nessun canale su cui scriverlo) — il
+> tunnel parte comunque, silenziosamente senza i parametri richiesti. Per passare parametri
+> via `exec` **omettere `-N`** (§2.5, punto 1): il gateway tiene comunque il canale sessione
+> aperto senza shell, equivalente a `-N` per tutti gli scopi pratici. Ricontrollare sempre i
+> parametri applicati nella dashboard admin (§7) dopo la connessione.
+
 ```bash
-ssh -i id_ed25519_bore -p 7835 -N -f -R 9443:localhost:8080 localhost -- 'https=on'
+ssh -i id_ed25519_bore -p 7835 -f -R 9443:localhost:8080 localhost -- 'https=on'
 curl -k https://localhost:9443/
 hello
 ```
@@ -800,7 +811,7 @@ differenza dal comportamento pre-esistente. `force-https=on` (richiede `https=on
 stessa richiesta) redirige le richieste HTTP semplici:
 
 ```bash
-ssh -i id_ed25519_bore -p 7835 -N -f -R 9444:localhost:8080 localhost -- 'https=on force-https=on'
+ssh -i id_ed25519_bore -p 7835 -f -R 9444:localhost:8080 localhost -- 'https=on force-https=on'
 curl -i http://localhost:9444/
 HTTP/1.1 308 Permanent Redirect
 Location: https://localhost:9444/
@@ -808,5 +819,10 @@ Location: https://localhost:9444/
 
 `force-https=on` senza `https=on` è disabilitato con un warning esplicito sul canale
 (`force-https: requires https=on; ignoring force-https for this tunnel`), mai applicato in
-silenzio né rifiutato. Copertura test: `t_ssh_pub4_https_terminates_tls` /
-`t_ssh_pub5_force_https_redirects_plain_http` in `tests/ssh_gateway_test.rs`.
+silenzio né rifiutato. Un token malformato (es. `https:on` invece di `https=on`, `:` al
+posto di `=`) produce a sua volta un warning esplicito (`malformed parameter "https:on"
+(expected key=value); ignored`) invece di essere scartato senza traccia. Copertura test:
+`t_ssh_pub4_https_terminates_tls` / `t_ssh_pub5_force_https_redirects_plain_http` /
+`t_ssh_pub6_zombie_port_on_ungraceful_disconnect` /
+`params_malformed_token_warns_not_silently_dropped` in `tests/ssh_gateway_test.rs` /
+`src/sshgw.rs`.

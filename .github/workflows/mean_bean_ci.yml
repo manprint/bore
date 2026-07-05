@@ -3,9 +3,7 @@ name: Mean Bean CI
 on:
   push:
     branches:
-      - main
-      - dev
-      - ssh
+      - "**" # every branch: cross-compile checks on any push
   pull_request:
 
 jobs:

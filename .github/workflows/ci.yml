@@ -3,12 +3,7 @@ name: CI
 on:
   push:
     branches:
-      - main
-      - dev
-      - macos
-      - windows
-      - android
-      - ssh
+      - "**" # every branch: run the full CI matrix on any push
   pull_request:
 
 jobs:

@@ -16,7 +16,7 @@ name: E2E (netns)
 
 on:
   push:
-    branches: [dev, main]
+    branches: ["**"] # every branch: run all netns e2e on any push (non-blocking)
   pull_request:
   workflow_dispatch:
 

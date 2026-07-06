@@ -457,13 +457,15 @@ autossh non riavvia se il PRIMO tentativo fallisce entro 30s (default "gate" per
 ## 8. SSH-over-TLS (DPI/firewall che permette solo TLS in uscita)
 
 ```bash
-ssh -o ProxyCommand='openssl s_client -quiet -verify_quiet -connect bore.example.com:443' \
+ssh -o ProxyCommand='openssl s_client -quiet -verify_quiet -alpn ssh -connect bore.example.com:443' \
     -R vhost/myapp:0:localhost:8080 dummy-host
 ```
 
-Il server rileva `SSH-` dopo l'handshake TLS e instrada al gateway automaticamente. Rimuovere
-`-verify_quiet` in produzione con certificato CA-emesso (accetta anche self-signed, comodo
-solo per test).
+`-alpn ssh` è consigliato: il demux classifica l'ALPN del ClientHello e instrada al gateway
+SSH immediatamente (senza `-alpn` funziona comunque — il server rileva `SSH-` dopo l'handshake
+TLS, con ~2 s di attesa in più). L'ALPN tiene anche la sessione SSH nettamente separata dal
+traffico browser (`h2`/`http/1.1`) sulla stessa porta 443. Rimuovere `-verify_quiet` in
+produzione con certificato CA-emesso (accetta anche self-signed, comodo solo per test).
 
 ---
 

@@ -162,7 +162,7 @@ fn client_config(insecure: bool) -> Result<ClientConfig> {
     let builder = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_safe_default_protocol_versions()
         .context("failed to configure TLS protocol versions")?;
-    let config = if insecure {
+    let mut config = if insecure {
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
@@ -172,6 +172,13 @@ fn client_config(insecure: bool) -> Result<ClientConfig> {
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         builder.with_root_certificates(roots).with_no_client_auth()
     };
+    // Offer `bore` via ALPN so a server demuxing SSH on the control port
+    // (`--ssh-gateway`) can classify this connection at the ClientHello
+    // instead of waiting on the post-TLS first-byte peek — a slow first
+    // flight can otherwise exceed the peek timeout and be misrouted. Wire
+    // compatible: a rustls server with no `alpn_protocols` configured (every
+    // bore server, old and new) ignores the offer entirely.
+    config.alpn_protocols = vec![b"bore".to_vec()];
     Ok(config)
 }
 

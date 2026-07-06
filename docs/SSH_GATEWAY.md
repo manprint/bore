@@ -210,15 +210,30 @@ avviene subito, `server.rs:992` — un client SSH non parla TLS e farebbe fallir
 Nuovo ordine: `accept → peek(1 byte, timeout 2 s) → dispatch`; il byte peekato si replay-a col
 wrapper `Prefixed` già esistente.
 
-Due accortezze:
+Tre accortezze:
 1. **Client SSH che aspettano il banner del server** (alcuni client storici, PuTTY in certi
    casi): non mandano nulla finché il server non si presenta. Soluzione standard (è quella di
-   `sslh`): **timeout sul peek ⇒ assume SSH** e manda il banner. Sicuro: TLS/HTTP/bore parlano
-   tutti per primi entro millisecondi.
+   `sslh`): **timeout sul peek ⇒ assume SSH** e manda il banner. Sicuro **sul piano plain-TCP**:
+   TLS/HTTP/bore parlano tutti per primi entro millisecondi.
 2. **SSH-over-TLS** (DECISO: in v1 — D-SSH4): dopo il TLS accept si ri-peeka e si accetta
    `SSH-` anche *dentro* TLS → il tunnel passa i firewall/DPI che vogliono vero TLS sulla 443.
    Lato client: `ProxyCommand openssl s_client -quiet -connect %h:443` (o `stunnel`/`socat`).
    Costo marginale visto il demux a strati; il secondo peek riusa lo stesso `Prefixed`.
+3. **Dentro TLS il "silenzio ⇒ SSH" da solo è SBAGLIATO per i browser** (bug reale trovato sul
+   campo): le connessioni speculative/di pool di un browser (preconnect, socket extra per gli
+   asset) completano l'handshake TLS e poi restano MUTE ben oltre i 2 s prima della prima
+   request — il fallback le consegnava a russh, il banner `SSH-2.0-russh_…` compariva nella
+   pagina e i socket avvelenati restavano nel pool del browser (request `pending`, asset
+   mancanti anche dopo refresh). Fix: il demux post-TLS classifica **prima l'offerta ALPN del
+   ClientHello** (`accept_tls_with_alpn` + `demux_classify_alpn`, `src/sshgw.rs`): ALPN
+   presente e ≠ `ssh` (browser: `h2`/`http/1.1`; client bore nativo: `bore`) ⇒ MAI SSH, si va
+   dritti al routing HTTP con pazienza da web server (`route_connection_known_http`, 60 s per
+   la prima request, timeout ⇒ chiusura pulita, mai il path bore); ALPN letteralmente `ssh`
+   (`openssl s_client -alpn ssh`) ⇒ gateway SSH immediato, senza attesa; NESSUN ALPN (stock
+   `openssl s_client`) ⇒ resta il peek-silenzio di prima (D4 invariato). Il client bore nativo
+   offre ALPN `bore` (`transport.rs::client_config`) — wire-compatibile: un server rustls senza
+   `alpn_protocols` configurati ignora l'offerta. Regression: T-SSH-DMX3 (preconnect idle >2s
+   con ALPN http ⇒ risposta HTTP, mai banner) e T-SSH-DMX4 (`-alpn ssh` ⇒ banner).
 
 Lato UDP niente da fare: l'endpoint QUIC (`vhost_quic_port`, default già 443) e lo STUN su
 7835/udp restano invariati. **Risultato: TCP 443 = SSH + TLS(control/vhost/admin) + HTTP + bore
@@ -731,6 +746,16 @@ ssh -o ProxyCommand='openssl s_client -quiet -verify_quiet -connect bore.example
 self-signed di test); in produzione con un certificato CA-emesso lasciare la verifica attiva
 rimuovendo il flag. Il server rileva il prefisso `SSH-` dopo l'handshake TLS e instrada al
 gateway (`demux_post_tls`, 6.2) esattamente come sul percorso plain.
+
+Consigliato: aggiungere `-alpn ssh` al comando `s_client`. Il demux classifica l'offerta ALPN
+del ClientHello (§2.3, accortezza 3): con `-alpn ssh` la connessione va al gateway SSH
+immediatamente, senza i 2 s di attesa del fallback a silenzio — e resta correttamente separata
+dal traffico browser (che offre `h2`/`http/1.1`) sulla stessa porta:
+
+```
+ssh -o ProxyCommand='openssl s_client -quiet -verify_quiet -alpn ssh -connect bore.example.com:443' \
+    -R vhost/myapp:0:localhost:8080 dummy-host
+```
 
 ### 6.7 systemd (client persistente con autossh)
 

@@ -419,8 +419,14 @@ impl SshGateway {
 /// sees `SSH-2.0-...` from us. Every other supported protocol on this port
 /// talks first: a TLS `ClientHello`, an HTTP request line, or bore's own
 /// `Hello` (written eagerly — yamux is lazy, so nothing happens until the
-/// client writes). All of those arrive within milliseconds, so this can be
-/// generous without meaningfully delaying anyone.
+/// client writes). All of those arrive within milliseconds — EXCEPT a
+/// browser's speculative/pool HTTPS connection, which completes the TLS
+/// handshake and then idles until it is needed. That is why the post-TLS
+/// demux consults the `ClientHello` ALPN offer FIRST ([`AlpnRoute`],
+/// [`demux_classify_alpn`]): this silence heuristic only ever runs for
+/// no-ALPN TLS clients (a stock `openssl s_client` `ProxyCommand`) and for
+/// the plain-TCP pre-TLS peek, where every legitimate client really does
+/// talk first.
 pub const SSH_PEEK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Pure classification of a control connection's very first byte (D8, 6.1).
@@ -567,6 +573,89 @@ pub async fn demux_post_tls<S: mux::Transport>(mut socket: S) -> PostTlsRoute<S>
         Ok(Err(())) => PostTlsRoute::NotSsh(Prefixed::new(buf[..filled].to_vec(), socket)),
         Err(_) => PostTlsRoute::Ssh(Prefixed::new(buf[..filled].to_vec(), socket)),
     }
+}
+
+/// How long a TLS connection whose `ClientHello` offered an HTTP ALPN
+/// protocol ([`AlpnRoute::NotSsh`]) may stay silent before its first request
+/// byte. Browser speculative/pool connections (preconnect, spare sockets
+/// opened for parallel asset fetches) complete the TLS handshake and then
+/// idle — often WELL beyond both [`SSH_PEEK_TIMEOUT`] and the generic
+/// `NETWORK_TIMEOUT` — before carrying their first request (Chrome keeps an
+/// unused preconnect around for ~10 s). Since ALPN already told us this
+/// connection is HTTP, waiting longer costs nothing and misrouting it into
+/// the bore protocol path would force the browser into a silent
+/// close-and-retry. On expiry the socket is closed cleanly (never handed to
+/// another protocol), which is exactly how an ordinary web server's
+/// keep-alive idle timeout treats a never-used preconnect.
+pub const HTTP_ALPN_FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// TLS-layer route decided from the `ClientHello`'s ALPN offer, BEFORE (and
+/// usually instead of) the [`demux_post_tls`] silence peek.
+///
+/// The silence heuristic alone is wrong for browsers: a speculative
+/// preconnect or an idle pool spare completes the TLS handshake and then
+/// sends nothing for many seconds, so "no bytes within
+/// [`SSH_PEEK_TIMEOUT`] means SSH" handed real HTTPS connections to russh —
+/// whose `SSH-2.0-...` banner then surfaced in the page (or the request hung
+/// `pending` until russh gave up), and the browser's socket pool kept
+/// re-using the poisoned connections across reloads. ALPN disambiguates
+/// deterministically at the handshake: every browser offers `h2`/`http/1.1`,
+/// while a stock `openssl s_client` `ProxyCommand` (the documented
+/// SSH-over-TLS transport, D4) offers nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlpnRoute {
+    /// The client explicitly offered the `ssh` ALPN protocol (e.g.
+    /// `openssl s_client -alpn ssh`): hand to the gateway immediately, no
+    /// banner-silence wait needed.
+    Ssh,
+    /// The client offered ALPN and it is not `ssh` (browsers: `h2`,
+    /// `http/1.1`; native bore clients: `bore`): never SSH — skip the
+    /// post-TLS peek entirely.
+    NotSsh,
+    /// No ALPN offered: fall back to the [`demux_post_tls`] silence peek
+    /// (preserves the stock no-ALPN `openssl s_client` SSH-over-TLS path).
+    Unknown,
+}
+
+/// Classifies a `ClientHello` ALPN offer (see [`AlpnRoute`]). `None` or an
+/// empty offer is [`AlpnRoute::Unknown`]; an offer containing the literal
+/// `ssh` protocol is [`AlpnRoute::Ssh`]; any other non-empty offer is
+/// [`AlpnRoute::NotSsh`].
+pub fn demux_classify_alpn<'a>(alpn: Option<impl Iterator<Item = &'a [u8]>>) -> AlpnRoute {
+    let Some(protocols) = alpn else {
+        return AlpnRoute::Unknown;
+    };
+    let mut offered_any = false;
+    for protocol in protocols {
+        offered_any = true;
+        if protocol == b"ssh" {
+            return AlpnRoute::Ssh;
+        }
+    }
+    if offered_any {
+        AlpnRoute::NotSsh
+    } else {
+        AlpnRoute::Unknown
+    }
+}
+
+/// Accepts a TLS connection while classifying its `ClientHello` ALPN offer
+/// (via [`demux_classify_alpn`]) for the control-port demux. Functionally
+/// equivalent to `TlsAcceptor::accept` with the same `config` — the lazy
+/// two-step accept only exists so the ALPN offer can be inspected before the
+/// handshake completes.
+pub async fn accept_tls_with_alpn<S: mux::Transport>(
+    config: Arc<tokio_rustls::rustls::ServerConfig>,
+    stream: S,
+) -> io::Result<(tokio_rustls::server::TlsStream<S>, AlpnRoute)> {
+    let start = tokio_rustls::LazyConfigAcceptor::new(
+        tokio_rustls::rustls::server::Acceptor::default(),
+        stream,
+    )
+    .await?;
+    let route = demux_classify_alpn(start.client_hello().alpn());
+    let tls = start.into_stream(config).await?;
+    Ok((tls, route))
 }
 
 /// Per-connection `russh::server::Handler`. Holds only what one connection
@@ -3553,6 +3642,49 @@ mod tests {
         assert_eq!(demux_classify_first_byte(Some(b'G')), Route::Http);
         assert_eq!(demux_classify_first_byte(Some(0x00)), Route::Bore);
         assert_eq!(demux_classify_first_byte(Some(0xFF)), Route::Bore);
+    }
+
+    #[test]
+    fn demux_classify_alpn_table() {
+        // No ALPN extension at all → the silence-peek fallback.
+        assert_eq!(
+            demux_classify_alpn(None::<std::iter::Empty<&[u8]>>),
+            AlpnRoute::Unknown
+        );
+        // Extension present but empty offer → same fallback.
+        assert_eq!(
+            demux_classify_alpn(Some(std::iter::empty::<&[u8]>())),
+            AlpnRoute::Unknown
+        );
+        // A browser: h2 + http/1.1 → never SSH, never the 2s peek.
+        assert_eq!(
+            demux_classify_alpn(Some([b"h2".as_slice(), b"http/1.1"].into_iter())),
+            AlpnRoute::NotSsh
+        );
+        assert_eq!(
+            demux_classify_alpn(Some([b"http/1.1".as_slice()].into_iter())),
+            AlpnRoute::NotSsh
+        );
+        // A native bore client over TLS.
+        assert_eq!(
+            demux_classify_alpn(Some([b"bore".as_slice()].into_iter())),
+            AlpnRoute::NotSsh
+        );
+        // Explicit SSH-over-TLS (`openssl s_client -alpn ssh`).
+        assert_eq!(
+            demux_classify_alpn(Some([b"ssh".as_slice()].into_iter())),
+            AlpnRoute::Ssh
+        );
+        // `ssh` wins regardless of position in the offer.
+        assert_eq!(
+            demux_classify_alpn(Some([b"h2".as_slice(), b"ssh"].into_iter())),
+            AlpnRoute::Ssh
+        );
+        // Near-miss protocol names are NOT ssh.
+        assert_eq!(
+            demux_classify_alpn(Some([b"ssh2".as_slice()].into_iter())),
+            AlpnRoute::NotSsh
+        );
     }
 
     #[test]

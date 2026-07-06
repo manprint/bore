@@ -2284,6 +2284,130 @@ async fn t_ssh_tls1_ssh_over_tls_via_proxycommand() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// T-SSH-DMX3 — browser-shaped TLS connection (ALPN `h2,http/1.1`) that idles
+// past SSH_PEEK_TIMEOUT before its first request must be served as HTTP and
+// never handed to russh. Regression test for the field bug where a browser's
+// speculative/pool connections (which complete TLS, then idle) hit the
+// post-TLS silence fallback: russh's `SSH-2.0-russh_...` banner surfaced as
+// the page body and the poisoned sockets left asset requests hanging
+// `pending` across reloads.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_dmx3_browser_preconnect_idle_alpn_gets_http_not_ssh() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    skip_without_openssl!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    start_demux_server(host_key, dir.path().to_path_buf()).await?;
+
+    let mut child = Command::new("openssl")
+        .args([
+            "s_client",
+            "-quiet",
+            "-verify_quiet",
+            "-alpn",
+            "h2,http/1.1",
+            "-connect",
+            &format!("127.0.0.1:{CONTROL_PORT}"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn openssl s_client (T-SSH-DMX3)")?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+
+    // Idle past SSH_PEEK_TIMEOUT (2s) AND past the generic NETWORK_TIMEOUT
+    // (3s), like a browser preconnect. The buggy demux spoke the russh
+    // banner ~2s in; the server must stay silent instead.
+    let mut sniff = [0u8; 8];
+    let early = time::timeout(Duration::from_millis(4000), stdout.read(&mut sniff)).await;
+    assert!(
+        early.is_err(),
+        "server spoke first on an ALPN-http TLS connection (SSH banner leak): {early:?} {sniff:?}"
+    );
+
+    // Only now send the first request: it must be served as HTTP.
+    stdin
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await?;
+    stdin.flush().await?;
+    let mut buf = vec![0u8; 512];
+    let n = time::timeout(Duration::from_secs(10), stdout.read(&mut buf))
+        .await
+        .context("no HTTP response after the idle period (connection misrouted?)")??;
+    let head = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        !head.contains("SSH-2.0"),
+        "got an SSH banner instead of an HTTP response: {head}"
+    );
+    assert!(
+        head.starts_with("HTTP/1.1"),
+        "expected an HTTP response, got: {head}"
+    );
+
+    child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-DMX4 — explicit `-alpn ssh` on the TLS connection routes to the SSH
+// gateway immediately (no banner-silence wait): the ALPN classifier's `ssh`
+// arm, the zero-ambiguity counterpart of DMX3.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_dmx4_alpn_ssh_routes_to_gateway() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    skip_without_openssl!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    start_demux_server(host_key, dir.path().to_path_buf()).await?;
+
+    let mut child = Command::new("openssl")
+        .args([
+            "s_client",
+            "-quiet",
+            "-verify_quiet",
+            "-alpn",
+            "ssh",
+            "-connect",
+            &format!("127.0.0.1:{CONTROL_PORT}"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn openssl s_client (T-SSH-DMX4)")?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+
+    let mut buf = [0u8; 8];
+    time::timeout(Duration::from_secs(10), stdout.read_exact(&mut buf))
+        .await
+        .context("no SSH banner on an `-alpn ssh` TLS connection")??;
+    assert_eq!(&buf, b"SSH-2.0-", "expected an SSH banner, got: {buf:?}");
+
+    child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // T-DMX-OFF — gateway DISABLED, TLS configured: a client sending
 // `SSH-2.0-...` gets no SSH banner back and the connection is not served as
 // SSH (proves the demux branch is truly off; the existing TLS/plain/admin

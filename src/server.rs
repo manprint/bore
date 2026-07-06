@@ -1141,21 +1141,48 @@ impl Server {
                             }
                             sshgw::PreTlsRoute::Tls(prefixed) => {
                                 let result = match &this.tls {
-                                    Some(acceptor) => match acceptor.accept(prefixed).await {
-                                        Ok(tls) => match sshgw::demux_post_tls(tls).await {
-                                            // SSH-over-TLS (D4): a `ProxyCommand`
-                                            // tunneling ssh through this TLS
-                                            // connection.
-                                            sshgw::PostTlsRoute::Ssh(ssh_tls) => {
-                                                let result =
-                                                    gateway.serve_connection(ssh_tls, addr).await;
-                                                log_ssh_gateway_outcome(result, addr);
-                                                return;
+                                    // ALPN-aware accept: classify the ClientHello
+                                    // BEFORE the post-TLS silence peek. A browser
+                                    // preconnect/pool spare completes TLS and then
+                                    // idles past SSH_PEEK_TIMEOUT before its first
+                                    // request, so "silence means SSH" alone handed
+                                    // real HTTPS connections to russh (its banner
+                                    // surfaced in the page; poisoned sockets hung
+                                    // in the browser pool). Browsers always offer
+                                    // ALPN; a stock `openssl s_client` ProxyCommand
+                                    // (SSH-over-TLS, D4) offers none and keeps the
+                                    // silence-peek path.
+                                    Some(acceptor) => match sshgw::accept_tls_with_alpn(
+                                        Arc::clone(acceptor.config()),
+                                        prefixed,
+                                    )
+                                    .await
+                                    {
+                                        Ok((tls, sshgw::AlpnRoute::Ssh)) => {
+                                            let result = gateway.serve_connection(tls, addr).await;
+                                            log_ssh_gateway_outcome(result, addr);
+                                            return;
+                                        }
+                                        Ok((tls, sshgw::AlpnRoute::NotSsh)) => {
+                                            this.route_connection_known_http(tls, addr).await
+                                        }
+                                        Ok((tls, sshgw::AlpnRoute::Unknown)) => {
+                                            match sshgw::demux_post_tls(tls).await {
+                                                // SSH-over-TLS (D4): a `ProxyCommand`
+                                                // tunneling ssh through this TLS
+                                                // connection.
+                                                sshgw::PostTlsRoute::Ssh(ssh_tls) => {
+                                                    let result = gateway
+                                                        .serve_connection(ssh_tls, addr)
+                                                        .await;
+                                                    log_ssh_gateway_outcome(result, addr);
+                                                    return;
+                                                }
+                                                sshgw::PostTlsRoute::NotSsh(tls2) => {
+                                                    this.route_connection(tls2, addr).await
+                                                }
                                             }
-                                            sshgw::PostTlsRoute::NotSsh(tls2) => {
-                                                this.route_connection(tls2, addr).await
-                                            }
-                                        },
+                                        }
                                         Err(err) => {
                                             warn!(%err, "TLS handshake failed");
                                             return;
@@ -1252,6 +1279,50 @@ impl Server {
             // Timed out waiting for the first byte: the byte (if any) is still
             // pending, so forward the untouched socket to the protocol path.
             Err(_) => self.handle_connection(socket, peer).await,
+        }
+    }
+
+    /// [`Server::route_connection`] variant for a TLS connection whose
+    /// `ClientHello` ALPN offer already proved it is NOT SSH
+    /// ([`sshgw::AlpnRoute::NotSsh`] — browsers offer `h2`/`http/1.1`, native
+    /// bore clients offer `bore`). Two differences from the generic path:
+    /// the first-byte wait is [`sshgw::HTTP_ALPN_FIRST_REQUEST_TIMEOUT`]
+    /// (a browser preconnect/pool spare legitimately idles far past
+    /// `NETWORK_TIMEOUT` before its first request), and on timeout the
+    /// socket is CLOSED cleanly instead of being handed to the bore
+    /// protocol path — feeding a never-used browser preconnect to yamux
+    /// would just garbage-close it mid-request later; closing it idle is
+    /// exactly what any web server's keep-alive timeout does.
+    #[cfg(feature = "ssh-gateway")]
+    async fn route_connection_known_http<S: mux::Transport>(
+        &self,
+        mut socket: S,
+        peer: SocketAddr,
+    ) -> Result<()> {
+        // No HTTP handler on this port at all: same short-circuit as
+        // `route_connection` (nothing better to offer the client).
+        if self.admin_token.is_none() && self.vhost_config.is_none() {
+            return self.handle_connection(socket, peer).await;
+        }
+
+        let mut first = [0u8; 1];
+        match timeout(
+            sshgw::HTTP_ALPN_FIRST_REQUEST_TIMEOUT,
+            socket.read(&mut first),
+        )
+        .await
+        {
+            Ok(Ok(0)) | Ok(Err(_)) => Ok(()), // EOF or read error: drop
+            Ok(Ok(_)) => {
+                let stream = Prefixed::new(first.to_vec(), socket);
+                if admin_http::is_http_first_byte(first[0]) {
+                    self.serve_control_http(stream).await
+                } else {
+                    self.handle_connection(stream, peer).await
+                }
+            }
+            // Never spoke: an abandoned speculative connection. Close it.
+            Err(_) => Ok(()),
         }
     }
 

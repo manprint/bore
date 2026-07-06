@@ -588,7 +588,26 @@ the existing registries/relay/admin/weblog/`--max-conns` data path unmodified.
   lets a plain HTTP/bore client keep working on a port that also serves TLS. `SshGateway::
   serve_connection` is generic over `mux::Transport` so it runs identically over `TcpStream`,
   `Prefixed<TcpStream>`, and a `TlsStream`.
-- Regression/e2e: `tests/ssh_gateway_test.rs` (cargo, 30 tests incl. takeover, demux, SSH-over-TLS,
+- **I-SSH9 (ALPN-first post-TLS demux — the browser-preconnect misroute, field bug 2026-07-06):**
+  inside TLS, "silence ⇒ SSH" ALONE is WRONG: a browser's speculative/pool HTTPS connections
+  (preconnect, spare sockets for parallel assets) complete the TLS handshake then idle PAST the
+  2s `SSH_PEEK_TIMEOUT` before their first request — the old post-TLS fallback handed them to
+  russh, whose `SSH-2.0-russh_…` banner rendered as the page body, and the poisoned sockets sat
+  in the browser pool (requests stuck `pending`, missing assets, refresh not healing). FIX: the
+  demux consults the ClientHello ALPN offer FIRST (`sshgw::accept_tls_with_alpn` via
+  `LazyConfigAcceptor` + `demux_classify_alpn`): any ALPN ≠ `ssh` (browsers `h2`/`http/1.1`,
+  native bore `bore`) ⇒ NEVER SSH — routed via `route_connection_known_http` (60s
+  `HTTP_ALPN_FIRST_REQUEST_TIMEOUT` for the first request since ALPN already proved HTTP;
+  timeout ⇒ clean close, NEVER the bore-protocol path); ALPN literally `ssh` ⇒ gateway
+  immediately (no 2s wait; document `-alpn ssh` for ProxyCommand users); NO ALPN (stock
+  `openssl s_client`) ⇒ the legacy silence peek (D4 preserved). The native client offers ALPN
+  `bore` (`transport.rs::client_config`) — wire-compatible both ways (a rustls server with no
+  `alpn_protocols` configured ignores the offer; bore servers never set it). Do NOT re-collapse
+  the post-TLS demux to a pure timeout, and do NOT hand an ALPN-http connection that idles out
+  to `handle_connection` (garbage-close mid-request is exactly the reported instability).
+  Regression: T-SSH-DMX3 (ALPN http + idle 4s ⇒ HTTP response, never a banner — red on the old
+  code at ~2s) + T-SSH-DMX4 (`-alpn ssh` ⇒ banner) + `demux_classify_alpn_table` unit.
+- Regression/e2e: `tests/ssh_gateway_test.rs` (cargo, 34 tests incl. takeover, demux, SSH-over-TLS,
   the I-SSH6/I-SSH7/I-SSH8 shell-request-fix/banner/inapplicable-param-warning suite)
   + `sudo -n /abs/path/scripts/ssh_gateway_test.sh` (netns chaos: T-SSH-N1..N6 — real netfilter
   half-open, autossh recovery across a server restart, takeover under partition, mixed

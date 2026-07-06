@@ -960,3 +960,35 @@ Questo è il placeholder RFC4254 stampato da OpenSSH per un forward vhost o secr
 (`-R <label>:0:...`). Poiché vhost/secret non hanno una vera porta TCP in ascolto (il
 routing è per nome, non per porta pubblica), il server risponde con un port number placeholder
 (solitamente `1`). È puramente cosmético, ignorare.
+
+### 6.13 Concorrenza: più client sullo stesso tunnel (flow-control per-canale)
+
+**Invariante:** un client lento non deve MAI bloccare gli altri client dello stesso
+tunnel. Ogni connessione proxata (ogni browser/visitatore) è un canale SSH separato
+multiplexato sull'unica connessione TCP client↔gateway; il flow-control agisce **per
+canale**, quindi un consumer lento rallenta solo la propria origine, non gli altri.
+
+**Bug storico (risolto).** `russh` upstream inoltrava ogni `CHANNEL_DATA` in ingresso
+alla coda del suo canale con un `send().await` **bloccante** dentro l'unico loop di
+lettura della sessione, e ricaricava la finestra SSH **alla ricezione** (non al consumo).
+Un consumer lento o in pausa — tipicamente **un browser che bufferizza un video** e per
+qualche secondo smette di leggere il socket — riempiva la coda del suo canale e
+**parcheggiava l'intera connessione**: ogni altro canale (ogni altro browser sullo stesso
+tunnel) restava fermo finché il primo non si sbloccava o chiudeva. Sintomo sul campo: un
+secondo browser sullo stesso link resta su "caricamento" finché non si chiude il primo.
+
+**Correzione.** `bore` incorpora una copia di `russh` 0.62.1 con la patch upstream
+[`Eugeny/russh#730`](https://github.com/Eugeny/russh/pull/730) (mai unita a monte, quindi
+la portiamo noi): la consegna al canale usa `try_send` non bloccante con un backlog
+per-canale limitato, e il `WINDOW_ADJUST` viene **trattenuto finché l'applicazione non
+consuma davvero** i byte. Così un canale in stallo esaurisce la propria finestra SSH e la
+sua origine si auto-rallenta, mentre il loop resta vivo per tutti gli altri canali e per i
+keepalive. Nessun byte perso, nessuna connessione chiusa a forza: solo backpressure, come
+fa il server OpenSSH stesso. Dettagli e istruzioni di ri-applicazione in
+`crates/russh/HOL_FIX.md`.
+
+**Ambito.** Vale per tunnel SSH **public, vhost e secret** (condividono lo stesso canale
+`russh`). I path nativi di `bore` (yamux TCP, QUIC/UDP) non erano affetti (hanno già
+flow-control per-stream). Guardie di regressione: `t_ssh_hol1_slow_consumer_does_not_block_peers`
+(`tests/ssh_gateway_test.rs`, client `ssh` reale) e `T-SSH-HOL-PUB`/`-VHOST`/`-SECRET`
+(`scripts/ssh_gateway_test.sh`, netns rete reale).

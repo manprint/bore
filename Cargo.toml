@@ -128,3 +128,18 @@ tokio = { version = "1.41.0", features = ["sync", "test-util", "process"] }
 lto = true
 codegen-units = 1
 strip = true
+
+# Vendored russh 0.62.1 carrying an UNMERGED upstream fix (Eugeny/russh#730,
+# "gate WINDOW_ADJUST on consumption to fix per-channel HOL blocking"). Stock
+# russh forwards inbound CHANNEL_DATA to the per-channel mpsc with a blocking
+# `chan.send().await` inside the single session read loop, and replenishes the
+# SSH receive window on RECEIPT. One slow/paused consumer (e.g. a browser
+# buffering a video over an `ssh -R` public/vhost tunnel) fills its mpsc and
+# parks the whole connection — every OTHER channel starves until it drains.
+# The vendored copy replaces the blocking send with a bounded per-channel
+# backlog (`try_send` + queue on Full) and withholds WINDOW_ADJUST until the
+# application actually consumes, so a stalled channel drains its own window to
+# zero and its peer throttles while the loop stays live for every other
+# channel. See crates/russh/HOL_FIX.md.
+[patch.crates-io]
+russh = { path = "crates/russh" }

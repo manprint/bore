@@ -1,0 +1,1487 @@
+diff --git a/src/channels/io/rx.rs b/src/channels/io/rx.rs
+index 57080db5..010c7a2c 100644
+--- a/src/channels/io/rx.rs
++++ b/src/channels/io/rx.rs
+@@ -11,6 +11,7 @@ use super::{ChannelMsg, ChannelReadHalf};
+ pub struct ChannelRx<R> {
+     channel: R,
+     buffer: Option<(ChannelMsg, usize)>,
++    eof: bool,
+ 
+     ext: Option<u32>,
+ }
+@@ -20,6 +21,7 @@ impl<R> ChannelRx<R> {
+         Self {
+             channel,
+             buffer: None,
++            eof: false,
+             ext,
+         }
+     }
+@@ -34,12 +36,21 @@ where
+         cx: &mut Context<'_>,
+         buf: &mut tokio::io::ReadBuf<'_>,
+     ) -> Poll<io::Result<()>> {
++        if self.eof {
++            return Poll::Ready(Ok(()));
++        }
+         let (msg, mut idx) = match self.buffer.take() {
+             Some(msg) => msg,
+-            None => match ready!(self.channel.borrow_mut().receiver.poll_recv(cx)) {
+-                Some(msg) => (msg, 0),
+-                None => return Poll::Ready(Ok(())),
+-            },
++            None => {
++                let read_half = self.channel.borrow_mut();
++                match ready!(read_half.receiver.poll_recv(cx)) {
++                    Some(msg) => {
++                        read_half.notify_drained();
++                        (msg, 0)
++                    }
++                    None => return Poll::Ready(Ok(())),
++                }
++            }
+         };
+ 
+         match (&msg, self.ext) {
+@@ -72,8 +83,10 @@ where
+                 Poll::Ready(Ok(()))
+             }
+             (ChannelMsg::Eof, _) => {
+-                self.channel.borrow_mut().receiver.close();
+-
++                // Latch EOF locally rather than closing the receiver, so any
++                // backlog (ExitStatus/Close) can still be drained into the
++                // mpsc and read via `Channel::wait()` afterwards.
++                self.eof = true;
+                 Poll::Ready(Ok(()))
+             }
+             _ => {
+diff --git a/src/channels/mod.rs b/src/channels/mod.rs
+index 2573e238..8375aee0 100644
+--- a/src/channels/mod.rs
++++ b/src/channels/mod.rs
+@@ -1,7 +1,9 @@
++use std::collections::{HashMap, VecDeque};
+ use std::sync::Arc;
+ 
+ use bytes::Bytes;
+ use tokio::io::{AsyncRead, AsyncWrite};
++use tokio::sync::mpsc::error::TrySendError;
+ use tokio::sync::mpsc::{Receiver, Sender};
+ use tokio::sync::{Mutex, Notify};
+ 
+@@ -143,6 +145,10 @@ impl WindowSizeRef {
+ /// Allows you to read from a channel without borrowing the session
+ pub struct ChannelReadHalf {
+     pub(crate) receiver: Receiver<ChannelMsg>,
++    /// Shared with the session loop. Notified whenever a message is taken from
++    /// `receiver`, so the session can drain any per-channel overflow and
++    /// re-open the SSH receive window. See [`forward_channel_msg`].
++    pub(crate) drain_notify: Arc<Notify>,
+ }
+ 
+ impl std::fmt::Debug for ChannelReadHalf {
+@@ -151,10 +157,36 @@ impl std::fmt::Debug for ChannelReadHalf {
+     }
+ }
+ 
++impl Drop for ChannelReadHalf {
++    fn drop(&mut self) {
++        // Close the receiver before notifying so the session's drain() sees
++        // `TrySendError::Closed` (not `Full`), discards any backlog for this
++        // channel, and re-opens its receive window for `Handler::data()`-only
++        // consumers.
++        self.receiver.close();
++        self.drain_notify.notify_one();
++    }
++}
++
+ impl ChannelReadHalf {
++    pub(crate) fn new(receiver: Receiver<ChannelMsg>, drain_notify: Arc<Notify>) -> Self {
++        Self {
++            receiver,
++            drain_notify,
++        }
++    }
++
++    pub(crate) fn notify_drained(&self) {
++        self.drain_notify.notify_one();
++    }
++
+     /// Awaits an incoming [`ChannelMsg`], this method returns [`None`] if the channel has been closed.
+     pub async fn wait(&mut self) -> Option<ChannelMsg> {
+-        self.receiver.recv().await
++        let msg = self.receiver.recv().await;
++        if msg.is_some() {
++            self.notify_drained();
++        }
++        msg
+     }
+ 
+     /// Make a reader for the [`Channel`] to receive [`ChannelMsg::Data`]
+@@ -465,10 +497,11 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
+         max_packet_size: u32,
+         window_size: u32,
+         channel_buffer_size: usize,
++        drain_notify: Arc<Notify>,
+     ) -> (Self, ChannelRef) {
+         let (tx, rx) = tokio::sync::mpsc::channel(channel_buffer_size);
+         let window_size = WindowSizeRef::new(window_size);
+-        let read_half = ChannelReadHalf { receiver: rx };
++        let read_half = ChannelReadHalf::new(rx, drain_notify);
+         let write_half = ChannelWriteHalf {
+             id,
+             sender,
+@@ -697,6 +730,143 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
+     }
+ }
+ 
++#[derive(Debug, Default)]
++struct ChannelQueue {
++    queue: VecDeque<ChannelMsg>,
++    /// Set once a terminal message (`Close`/`OpenFailure`) has been queued.
++    /// Further forwards are dropped, and [`ChannelBacklog::drain`] removes
++    /// the channel (without re-opening its receive window) once this drains.
++    closing: bool,
++}
++
++/// Per-channel overflow for [`ChannelMsg`]s that could not be delivered to
++/// the [`Channel`] mpsc without blocking, plus deferred-close bookkeeping.
++///
++/// The session loop dispatches every incoming SSH packet serially. A
++/// `chan.send().await` would park the whole connection — including keepalives
++/// and every other channel — whenever a single channel's consumer falls
++/// behind. Instead we `try_send`, and on `Full` queue the message here. The
++/// caller withholds `WINDOW_ADJUST` for any channel with a non-empty queue,
++/// which lets the SSH window drain to zero so the *peer* stops sending on
++/// that channel while the loop stays live for everything else.
++///
++/// The queue is bounded by the SSH receive window for compliant peers
++/// (`WINDOW_ADJUST` is withheld while a backlog exists, so the peer's
++/// in-flight data cannot exceed `window_size`). A peer that ignores flow
++/// control can grow it without limit; that is the same exposure as any other
++/// resource an authenticated peer can consume, and is preferred over
++/// silently dropping messages.
++#[derive(Debug, Default)]
++pub(crate) struct ChannelBacklog {
++    backed_up: HashMap<ChannelId, ChannelQueue>,
++}
++
++impl ChannelBacklog {
++    pub(crate) fn is_empty(&self) -> bool {
++        self.backed_up.is_empty()
++    }
++
++    /// Forward `msg` to the [`Channel`] for `id` without blocking.
++    ///
++    /// Returns `true` if the channel has no backlog after this call (the only
++    /// state in which it is safe to re-open the SSH receive window). Once a
++    /// backlog exists, this method only appends — draining and the
++    /// corresponding window replenishment are owned by [`Self::drain`], so
++    /// every transition from backed-up to drained goes through a single
++    /// caller that also re-opens the window.
++    pub(crate) fn forward(
++        &mut self,
++        channels: &HashMap<ChannelId, ChannelRef>,
++        id: ChannelId,
++        msg: ChannelMsg,
++    ) -> bool {
++        let Some(chan) = channels.get(&id) else {
++            return true;
++        };
++        // WindowAdjusted is purely informational — the load-bearing side
++        // effect (updating WindowSizeRef) happens before this call. Never
++        // let it occupy backlog where it could displace real payload.
++        if matches!(msg, ChannelMsg::WindowAdjusted { .. }) {
++            if !self.backed_up.contains_key(&id) {
++                let _ = chan.try_send(msg);
++                return true;
++            }
++            return false;
++        }
++        if let Some(q) = self.backed_up.get_mut(&id) {
++            if !q.closing {
++                q.queue.push_back(msg);
++            }
++            return false;
++        }
++        match chan.try_send(msg) {
++            Ok(()) => true,
++            Err(TrySendError::Full(m)) => {
++                self.backed_up
++                    .entry(id)
++                    .or_default()
++                    .queue
++                    .push_back(m);
++                false
++            }
++            Err(TrySendError::Closed(_)) => true,
++        }
++    }
++
++    /// Forward a terminal message (`Close` or `OpenFailure`) and tear down
++    /// the channel. If it is delivered immediately the channel is removed
++    /// from `channels` now; otherwise removal is deferred to [`Self::drain`]
++    /// so a slow consumer still receives every queued message before the
++    /// sender is dropped.
++    pub(crate) fn close_with(
++        &mut self,
++        channels: &mut HashMap<ChannelId, ChannelRef>,
++        id: ChannelId,
++        msg: ChannelMsg,
++    ) {
++        if self.forward(channels, id, msg) {
++            channels.remove(&id);
++        } else if let Some(q) = self.backed_up.get_mut(&id) {
++            q.closing = true;
++        }
++    }
++
++    /// Flush every backed-up channel into its mpsc. Called when a
++    /// [`ChannelReadHalf`] signals it has freed a slot (via the shared
++    /// `drain_notify`). Returns the ids that fully drained and are *not*
++    /// closing, so the caller can re-open their SSH receive windows; closing
++    /// channels are removed from `channels` here instead.
++    pub(crate) fn drain(
++        &mut self,
++        channels: &mut HashMap<ChannelId, ChannelRef>,
++    ) -> Vec<ChannelId> {
++        let mut drained = Vec::new();
++        self.backed_up.retain(|id, q| {
++            let Some(chan) = channels.get(id) else {
++                return false;
++            };
++            while let Some(front) = q.queue.pop_front() {
++                match chan.try_send(front) {
++                    Ok(()) => {}
++                    Err(TrySendError::Full(m)) => {
++                        q.queue.push_front(m);
++                        return true;
++                    }
++                    Err(TrySendError::Closed(_)) => break,
++                }
++            }
++            if q.closing {
++                channels.remove(id);
++            } else {
++                drained.push(*id);
++            }
++            false
++        });
++        drained
++    }
++
++}
++
+ #[cfg(test)]
+ mod tests {
+     use tokio::sync::mpsc;
+@@ -825,11 +995,151 @@ mod tests {
+         assert!(receiver.try_recv().is_err());
+     }
+ 
++    fn data_msg(b: &'static [u8]) -> ChannelMsg {
++        ChannelMsg::Data {
++            data: Bytes::from_static(b),
++        }
++    }
++
++    fn recv_data(rx: &mut mpsc::Receiver<ChannelMsg>) -> Bytes {
++        match rx.try_recv() {
++            Ok(ChannelMsg::Data { data }) => data,
++            other => unreachable!("expected Data, got {other:?}"),
++        }
++    }
++
++    fn dispatch(
++        id: ChannelId,
++        cap: usize,
++    ) -> (
++        ChannelBacklog,
++        HashMap<ChannelId, ChannelRef>,
++        mpsc::Receiver<ChannelMsg>,
++    ) {
++        let (tx, rx) = mpsc::channel(cap);
++        let mut channels = HashMap::new();
++        channels.insert(id, ChannelRef::new(tx));
++        (ChannelBacklog::default(), channels, rx)
++    }
++
++    fn fwd(
++        b: &mut ChannelBacklog,
++        channels: &HashMap<ChannelId, ChannelRef>,
++        id: ChannelId,
++        msg: ChannelMsg,
++    ) -> bool {
++        b.forward(channels, id, msg)
++    }
++
++    fn queue_len(b: &ChannelBacklog, id: ChannelId) -> Option<usize> {
++        b.backed_up.get(&id).map(|q| q.queue.len())
++    }
++
++    #[test]
++    fn backlog_forward_queues_on_full_and_preserves_order() {
++        let id = ChannelId(1);
++        let (mut b, mut channels, mut rx) = dispatch(id, 1);
++
++        assert!(fwd(&mut b, &channels, id, data_msg(b"1")));
++        assert!(!fwd(&mut b, &channels, id, data_msg(b"2")));
++        assert!(!fwd(&mut b, &channels, id, data_msg(b"3")));
++        assert_eq!(queue_len(&b, id), Some(2));
++
++        // forward() never drains an existing backlog; that is owned by drain()
++        // so window replenishment has a single owner.
++        assert_eq!(recv_data(&mut rx).as_ref(), b"1");
++        assert!(!fwd(&mut b, &channels, id, data_msg(b"4")));
++        assert_eq!(queue_len(&b, id), Some(3));
++
++        assert!(b.drain(&mut channels).is_empty());
++        assert_eq!(recv_data(&mut rx).as_ref(), b"2");
++        assert!(b.drain(&mut channels).is_empty());
++        assert_eq!(recv_data(&mut rx).as_ref(), b"3");
++        assert_eq!(b.drain(&mut channels), vec![id]);
++        assert_eq!(recv_data(&mut rx).as_ref(), b"4");
++        assert!(b.is_empty());
++
++        assert!(fwd(&mut b, &channels, id, data_msg(b"5")));
++        assert_eq!(recv_data(&mut rx).as_ref(), b"5");
++    }
++
++    #[test]
++    fn backlog_drain_reports_closed_receiver_as_drained() {
++        let id = ChannelId(3);
++        let (mut b, mut channels, rx) = dispatch(id, 1);
++
++        assert!(fwd(&mut b, &channels, id, data_msg(b"a")));
++        assert!(!fwd(&mut b, &channels, id, data_msg(b"b")));
++        drop(rx);
++
++        // Closed receiver: the Handler::data() trait path is the consumer, so
++        // drain treats this as delivered for window-replenishment purposes.
++        assert_eq!(b.drain(&mut channels), vec![id]);
++        assert!(b.is_empty());
++        assert!(fwd(&mut b, &channels, id, ChannelMsg::Eof));
++    }
++
++    #[test]
++    fn backlog_close_defers_removal_until_drained() {
++        let id = ChannelId(4);
++        let (mut b, mut channels, mut rx) = dispatch(id, 1);
++
++        assert!(fwd(&mut b, &channels, id, data_msg(b"a")));
++        assert!(!fwd(&mut b, &channels, id, data_msg(b"b")));
++        assert!(!fwd(&mut b, &channels, id, ChannelMsg::Eof));
++        b.close_with(&mut channels, id, ChannelMsg::Close);
++
++        // Close is queued behind the backlog; the channel must stay registered
++        // so the sender lives until everything is delivered.
++        assert!(channels.contains_key(&id));
++        assert_eq!(queue_len(&b, id), Some(3));
++        // Further forwards after close are dropped.
++        assert!(!fwd(&mut b, &channels, id, data_msg(b"late")));
++        assert_eq!(queue_len(&b, id), Some(3));
++
++        for expect in [&b"a"[..], b"b"] {
++            assert!(b.drain(&mut channels).is_empty());
++            assert_eq!(recv_data(&mut rx).as_ref(), expect);
++        }
++        assert!(b.drain(&mut channels).is_empty());
++        assert!(matches!(rx.try_recv(), Ok(ChannelMsg::Eof)));
++        // Closing channel is removed but not returned for replenishment.
++        assert!(b.drain(&mut channels).is_empty());
++        assert!(matches!(rx.try_recv(), Ok(ChannelMsg::Close)));
++
++        assert!(!channels.contains_key(&id));
++        assert!(b.is_empty());
++        assert!(rx.try_recv().is_err());
++    }
++
++    #[test]
++    fn backlog_never_queues_window_adjusted() {
++        let id = ChannelId(5);
++        let (mut b, channels, _rx) = dispatch(id, 1);
++
++        assert!(fwd(&mut b, &channels, id, ChannelMsg::Success));
++        assert!(!fwd(&mut b, &channels, id, ChannelMsg::Success));
++        // WindowAdjusted is never queued.
++        assert!(!fwd(
++            &mut b,
++            &channels,
++            id,
++            ChannelMsg::WindowAdjusted { new_size: 1 }
++        ));
++        assert_eq!(queue_len(&b, id), Some(1));
++    }
++
+     #[tokio::test]
+     async fn channel_data_bytes_forwards_to_write_half() {
+         let (sender, mut receiver) = mpsc::channel(8);
+-        let (channel, _reference) =
+-            Channel::<(ChannelId, ChannelMsg)>::new(ChannelId(9), sender, 1024, 1024, 8);
++        let (channel, _reference) = Channel::<(ChannelId, ChannelMsg)>::new(
++            ChannelId(9),
++            sender,
++            1024,
++            1024,
++            8,
++            Arc::new(Notify::new()),
++        );
+ 
+         channel.data_bytes(Bytes::from_static(b"channel")).await.unwrap();
+ 
+diff --git a/src/client/encrypted.rs b/src/client/encrypted.rs
+index fb4dac91..51ffa338 100644
+--- a/src/client/encrypted.rs
++++ b/src/client/encrypted.rs
+@@ -379,15 +379,15 @@ impl Session {
+                     return Err(crate::Error::Inconsistent.into());
+                 };
+ 
+-                if let Some(channel) = self.channels.get(&local_id) {
+-                    channel
+-                        .send(ChannelMsg::Open {
++                if self.channels.contains_key(&local_id) {
++                    self.forward_channel_msg(
++                        local_id,
++                        ChannelMsg::Open {
+                             id: local_id,
+                             max_packet_size: msg.maximum_packet_size,
+                             window_size: msg.initial_window_size,
+-                        })
+-                        .await
+-                        .unwrap_or(());
++                        },
++                    );
+                 } else {
+                     error!("no channel for id {local_id:?}");
+                 }
+@@ -412,20 +412,17 @@ impl Session {
+                 }
+                 // Forward the close to the channel before removing it, so that
+                 // consumers waiting on `Channel::wait()` receive an explicit
+-                // `ChannelMsg::Close` instead of just seeing `None`.
+-                if let Some(chan) = self.channels.get(&channel_num) {
+-                    let _ = chan.send(ChannelMsg::Close).await;
+-                }
+-                self.channels.remove(&channel_num);
++                // `ChannelMsg::Close` instead of just seeing `None`. Removal
++                // is deferred until any backlog has drained so a slow consumer
++                // does not lose buffered Data/Eof/ExitStatus.
++                self.close_channel(channel_num, ChannelMsg::Close);
+                 client.channel_close(channel_num, self).await
+             }
+             Some((&msg::CHANNEL_EOF, mut r)) => {
+                 debug!("channel_eof");
+                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
+                 map_err!(ensure_end(&r))?;
+-                if let Some(chan) = self.channels.get(&channel_num) {
+-                    let _ = chan.send(ChannelMsg::Eof).await;
+-                }
++                self.forward_channel_msg(channel_num, ChannelMsg::Eof);
+                 client.channel_eof(channel_num, self).await
+             }
+             Some((&msg::CHANNEL_OPEN_FAILURE, mut r)) => {
+@@ -440,9 +437,7 @@ impl Session {
+                     enc.channels.remove(&channel_num);
+                 }
+ 
+-                if let Some(sender) = self.channels.remove(&channel_num) {
+-                    let _ = sender.send(ChannelMsg::OpenFailure(reason_code.clone())).await;
+-                }
++                self.close_channel(channel_num, ChannelMsg::OpenFailure(reason_code.clone()));
+ 
+                 let _ = self.sender.send(Reply::ChannelOpenFailure);
+ 
+@@ -450,57 +445,53 @@ impl Session {
+                     .channel_open_failure(channel_num, reason_code, &descr, &language, self)
+                     .await
+             }
+-            Some((&msg::CHANNEL_DATA, mut r)) => {
+-                trace!("channel_data");
++            Some((&t @ (msg::CHANNEL_DATA | msg::CHANNEL_EXTENDED_DATA), mut r)) => {
+                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
++                let ext = if t == msg::CHANNEL_EXTENDED_DATA {
++                    debug!("channel_extended_data");
++                    Some(map_err!(u32::decode(&mut r))?)
++                } else {
++                    trace!("channel_data");
++                    None
++                };
+                 let data = map_err!(Bytes::decode(&mut r))?;
+                 map_err!(ensure_end(&r))?;
+-                let target = self.common.config.window_size;
++
++                // Debit the receive window now (RFC 4254 §5.2), but defer
++                // WINDOW_ADJUST until we know the application has capacity:
++                // a slow consumer should see its peer's window drain to zero
++                // instead of stalling the whole session loop.
+                 if let Some(ref mut enc) = self.common.encrypted {
+-                    if enc.adjust_window_size(channel_num, &data, target)? {
+-                        let next_window =
+-                            client.adjust_window(channel_num, self.target_window_size);
+-                        if next_window > 0 {
+-                            self.target_window_size = next_window
+-                        }
+-                    }
++                    enc.record_received_data(channel_num, &data);
+                 }
+ 
+-                if let Some(chan) = self.channels.get(&channel_num) {
+-                    let _ = chan.send(ChannelMsg::Data { data: data.clone() }).await;
+-                }
++                // try_send to the Channel mpsc; never `.await` here. If the
++                // buffer is full the message is queued on the session and the
++                // window is *not* re-opened, so the server throttles this one
++                // channel while the loop stays live for other channels and
++                // keepalives.
++                let msg = match ext {
++                    None => ChannelMsg::Data { data: data.clone() },
++                    Some(ext) => ChannelMsg::ExtendedData {
++                        ext,
++                        data: data.clone(),
++                    },
++                };
++                let delivered = self.forward_channel_msg(channel_num, msg);
+ 
+-                client.data(channel_num, &data, self).await
+-            }
+-            Some((&msg::CHANNEL_EXTENDED_DATA, mut r)) => {
+-                debug!("channel_extended_data");
+-                let channel_num = map_err!(ChannelId::decode(&mut r))?;
+-                let extended_code = map_err!(u32::decode(&mut r))?;
+-                let data = map_err!(Bytes::decode(&mut r))?;
+-                map_err!(ensure_end(&r))?;
+-                let target = self.common.config.window_size;
+-                if let Some(ref mut enc) = self.common.encrypted {
+-                    if enc.adjust_window_size(channel_num, &data, target)? {
+-                        let next_window =
+-                            client.adjust_window(channel_num, self.target_window_size);
+-                        if next_window > 0 {
+-                            self.target_window_size = next_window
+-                        }
+-                    }
++                if let Some(ext) = ext {
++                    client.extended_data(channel_num, ext, &data, self).await?;
++                } else {
++                    client.data(channel_num, &data, self).await?;
+                 }
+ 
+-                if let Some(chan) = self.channels.get(&channel_num) {
+-                    let _ = chan
+-                        .send(ChannelMsg::ExtendedData {
+-                            ext: extended_code,
+-                            data: data.clone(),
+-                        })
+-                        .await;
++                if delivered && self.replenish_receive_window(channel_num)? {
++                    let next_window = client.adjust_window(channel_num, self.target_window_size);
++                    if next_window > 0 {
++                        self.target_window_size = next_window
++                    }
+                 }
+-
+-                client
+-                    .extended_data(channel_num, extended_code, &data, self)
+-                    .await
++                Ok(())
+             }
+             Some((&msg::CHANNEL_REQUEST, mut r)) => {
+                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
+@@ -511,18 +502,14 @@ impl Session {
+                         map_err!(u8::decode(&mut r))?; // should be 0.
+                         let client_can_do = map_err!(u8::decode(&mut r))? != 0;
+                         map_err!(ensure_end(&r))?;
+-                        if let Some(chan) = self.channels.get(&channel_num) {
+-                            let _ = chan.send(ChannelMsg::XonXoff { client_can_do }).await;
+-                        }
++                        self.forward_channel_msg(channel_num, ChannelMsg::XonXoff { client_can_do });
+                         client.xon_xoff(channel_num, client_can_do, self).await
+                     }
+                     "exit-status" => {
+                         map_err!(u8::decode(&mut r))?; // should be 0.
+                         let exit_status = map_err!(u32::decode(&mut r))?;
+                         map_err!(ensure_end(&r))?;
+-                        if let Some(chan) = self.channels.get(&channel_num) {
+-                            let _ = chan.send(ChannelMsg::ExitStatus { exit_status }).await;
+-                        }
++                        self.forward_channel_msg(channel_num, ChannelMsg::ExitStatus { exit_status });
+                         client.exit_status(channel_num, exit_status, self).await
+                     }
+                     "exit-signal" => {
+@@ -533,16 +520,15 @@ impl Session {
+                         let error_message = map_err!(String::decode(&mut r))?;
+                         let lang_tag = map_err!(String::decode(&mut r))?;
+                         map_err!(ensure_end(&r))?;
+-                        if let Some(chan) = self.channels.get(&channel_num) {
+-                            let _ = chan
+-                                .send(ChannelMsg::ExitSignal {
+-                                    signal_name: signal_name.clone(),
+-                                    core_dumped,
+-                                    error_message: error_message.to_string(),
+-                                    lang_tag: lang_tag.to_string(),
+-                                })
+-                                .await;
+-                        }
++                        self.forward_channel_msg(
++                            channel_num,
++                            ChannelMsg::ExitSignal {
++                                signal_name: signal_name.clone(),
++                                core_dumped,
++                                error_message: error_message.to_string(),
++                                lang_tag: lang_tag.to_string(),
++                            },
++                        );
+                         client
+                             .exit_signal(
+                                 channel_num,
+@@ -614,11 +600,8 @@ impl Session {
+                 }
+                 if let Some(chan) = self.channels.get(&channel_num) {
+                     chan.window_size().update(new_size).await;
+-                    // Use try_send to avoid blocking the session loop when channel buffer is full.
+-                    // WindowAdjusted is informational - the critical side effect (updating
+-                    // WindowSizeRef and notifying ChannelTx) already happens in update().
+-                    let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
+                 }
++                self.forward_channel_msg(channel_num, ChannelMsg::WindowAdjusted { new_size });
+                 client.window_adjusted(channel_num, new_size, self).await
+             }
+             Some((&msg::GLOBAL_REQUEST, mut r)) => {
+@@ -661,17 +644,13 @@ impl Session {
+             Some((&msg::CHANNEL_SUCCESS, mut r)) => {
+                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
+                 map_err!(ensure_end(&r))?;
+-                if let Some(chan) = self.channels.get(&channel_num) {
+-                    let _ = chan.send(ChannelMsg::Success).await;
+-                }
++                self.forward_channel_msg(channel_num, ChannelMsg::Success);
+                 client.channel_success(channel_num, self).await
+             }
+             Some((&msg::CHANNEL_FAILURE, mut r)) => {
+                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
+                 map_err!(ensure_end(&r))?;
+-                if let Some(chan) = self.channels.get(&channel_num) {
+-                    let _ = chan.send(ChannelMsg::Failure).await;
+-                }
++                self.forward_channel_msg(channel_num, ChannelMsg::Failure);
+                 client.channel_failure(channel_num, self).await
+             }
+             Some((&msg::CHANNEL_OPEN, mut r)) => {
+@@ -703,6 +682,7 @@ impl Session {
+                     channel_params.recipient_maximum_packet_size,
+                     channel_params.recipient_window_size,
+                     self.common.config.channel_buffer_size,
++                    self.drain_notify.clone(),
+                 );
+ 
+                 let pending = crate::PendingChannelOpen {
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index 9f770ee4..e7976007 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -55,11 +55,12 @@ use tokio::pin;
+ use tokio::sync::mpsc::{
+     Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
+ };
+-use tokio::sync::oneshot;
++use tokio::sync::{Notify, oneshot};
+ 
+ pub use crate::auth::AuthResult;
+ use crate::channels::{
+-    Channel, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf, WindowSizeRef,
++    Channel, ChannelBacklog, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf,
++    WindowSizeRef,
+ };
+ use crate::cipher::{self, OpeningKey, clear};
+ use crate::kex::{KexAlgorithmImplementor, KexCause, KexProgress, SessionKexState};
+@@ -92,6 +93,11 @@ pub struct Session {
+     receiver: Receiver<Msg>,
+     sender: UnboundedSender<Reply>,
+     channels: HashMap<ChannelId, ChannelRef>,
++    /// See [`ChannelBacklog`].
++    backlog: ChannelBacklog,
++    /// Signalled by [`ChannelReadHalf`] consumers; wakes the session loop to
++    /// drain `backlog` and re-open receive windows.
++    drain_notify: Arc<Notify>,
+     target_window_size: u32,
+     pending_reads: Vec<Vec<u8>>,
+     pending_len: u32,
+@@ -103,7 +109,11 @@ pub struct Session {
+ 
+ impl Drop for Session {
+     fn drop(&mut self) {
+-        debug!("drop session")
++        debug!("drop session");
++        // Best-effort: push whatever fits into each channel mpsc so consumers
++        // can read the tail after the sender drops. The graceful-exit path
++        // already awaited `flush_into` for full delivery.
++        let _ = self.backlog.drain(&mut self.channels);
+     }
+ }
+ 
+@@ -277,6 +287,7 @@ pub struct Handle<H: Handler> {
+     receiver: UnboundedReceiver<Reply>,
+     join: russh_util::runtime::JoinHandle<Result<(), H::Error>>,
+     channel_buffer_size: usize,
++    drain_notify: Arc<Notify>,
+ }
+ 
+ impl<H: Handler> Drop for Handle<H> {
+@@ -584,11 +595,12 @@ impl<H: Handler> Handle<H> {
+     /// Wait for confirmation that a channel is open
+     async fn wait_channel_confirmation(
+         &self,
+-        mut receiver: Receiver<ChannelMsg>,
++        receiver: Receiver<ChannelMsg>,
+         window_size_ref: WindowSizeRef,
+     ) -> Result<Channel<Msg>, crate::Error> {
++        let mut read_half = ChannelReadHalf::new(receiver, self.drain_notify.clone());
+         loop {
+-            match receiver.recv().await {
++            match read_half.wait().await {
+                 Some(ChannelMsg::Open {
+                     id,
+                     max_packet_size,
+@@ -603,7 +615,7 @@ impl<H: Handler> Handle<H> {
+                             max_packet_size,
+                             window_size: window_size_ref,
+                         },
+-                        read_half: ChannelReadHalf { receiver },
++                        read_half,
+                     });
+                 }
+                 Some(ChannelMsg::OpenFailure(reason)) => {
+@@ -1022,6 +1034,7 @@ where
+         );
+     }
+     let channel_buffer_size = config.channel_buffer_size;
++    let drain_notify = Arc::new(Notify::new());
+     let mut session = Session::new(
+         config.window_size,
+         CommonSession {
+@@ -1042,6 +1055,7 @@ where
+         },
+         session_receiver,
+         session_sender,
++        drain_notify.clone(),
+     );
+     session.begin_rekey()?;
+     let (kex_done_signal, kex_done_signal_rx) = oneshot::channel();
+@@ -1060,6 +1074,7 @@ where
+         receiver: handle_receiver,
+         join,
+         channel_buffer_size,
++        drain_notify,
+     })
+ }
+ 
+@@ -1099,6 +1114,7 @@ impl Session {
+         common: CommonSession<Arc<Config>>,
+         receiver: Receiver<Msg>,
+         sender: UnboundedSender<Reply>,
++        drain_notify: Arc<Notify>,
+     ) -> Self {
+         let (inbound_channel_sender, inbound_channel_receiver) = channel(10);
+         Self {
+@@ -1110,6 +1126,8 @@ impl Session {
+             inbound_channel_sender,
+             inbound_channel_receiver,
+             channels: HashMap::new(),
++            backlog: ChannelBacklog::default(),
++            drain_notify,
+             pending_reads: Vec::new(),
+             pending_len: 0,
+             open_global_requests: VecDeque::new(),
+@@ -1117,6 +1135,26 @@ impl Session {
+         }
+     }
+ 
++    /// See [`ChannelBacklog::forward`].
++    pub(crate) fn forward_channel_msg(&mut self, id: ChannelId, msg: ChannelMsg) -> bool {
++        self.backlog.forward(&self.channels, id, msg)
++    }
++
++    /// See [`ChannelBacklog::close_with`].
++    pub(crate) fn close_channel(&mut self, id: ChannelId, msg: ChannelMsg) {
++        self.backlog.close_with(&mut self.channels, id, msg)
++    }
++
++    /// Re-open the SSH receive window for `id` if it has dropped below half
++    /// the target. Only call this when the channel is not backed up.
++    pub(crate) fn replenish_receive_window(&mut self, id: ChannelId) -> Result<bool, Error> {
++        if let Some(ref mut enc) = self.common.encrypted {
++            enc.replenish_receive_window(id, self.target_window_size)
++        } else {
++            Ok(false)
++        }
++    }
++
+     async fn run<H: Handler + Send, R: AsyncRead + AsyncWrite + Unpin + Send>(
+         mut self,
+         stream: SshRead<R>,
+@@ -1241,6 +1279,19 @@ impl Session {
+                     debug!("timeout");
+                     return Err(crate::Error::InactivityTimeout.into());
+                 }
++                _ = self.drain_notify.notified(),
++                    if !self.backlog.is_empty() && !self.kex.active() =>
++                {
++                    for id in self.backlog.drain(&mut self.channels) {
++                        if self.replenish_receive_window(id)? {
++                            let next_window =
++                                handler.adjust_window(id, self.target_window_size);
++                            if next_window > 0 {
++                                self.target_window_size = next_window;
++                            }
++                        }
++                    }
++                }
+                 msg = self.receiver.recv(), if !self.kex.active() => {
+                     match msg {
+                         Some(msg) => self.handle_msg(msg)?,
+@@ -1796,6 +1847,7 @@ mod tests {
+             },
+             receiver,
+             reply_sender,
++            Arc::new(Notify::new()),
+         );
+         (session, sender, reply_receiver)
+     }
+@@ -1844,6 +1896,7 @@ mod tests {
+             },
+             receiver,
+             reply_sender,
++            Arc::new(Notify::new()),
+         );
+         session.open_global_requests = VecDeque::new();
+         let _ = receiver_sender;
+diff --git a/src/server/encrypted.rs b/src/server/encrypted.rs
+index af9f26fa..7325a225 100644
+--- a/src/server/encrypted.rs
++++ b/src/server/encrypted.rs
+@@ -430,9 +430,11 @@ mod tests {
+         };
+         let config = Arc::new(config);
+         let (sender, receiver) = tokio::sync::mpsc::channel(1);
++        let drain_notify = Arc::new(tokio::sync::Notify::new());
+         let handle = Handle {
+             sender,
+             channel_buffer_size: config.channel_buffer_size,
++            drain_notify: drain_notify.clone(),
+         };
+ 
+         Session {
+@@ -458,6 +460,8 @@ mod tests {
+             pending_reads: Vec::new(),
+             pending_len: 0,
+             channels: std::collections::HashMap::new(),
++            backlog: crate::channels::ChannelBacklog::default(),
++            drain_notify,
+             open_global_requests: std::collections::VecDeque::new(),
+             kex: SessionKexState::Idle,
+         }
+@@ -989,20 +993,17 @@ impl Session {
+                 }
+                 // Forward the close to the channel before removing it, so that
+                 // consumers waiting on `Channel::wait()` receive an explicit
+-                // `ChannelMsg::Close` instead of just seeing `None`.
+-                if let Some(chan) = self.channels.get(&channel_num) {
+-                    chan.send(ChannelMsg::Close).await.unwrap_or(())
+-                }
+-                self.channels.remove(&channel_num);
++                // `ChannelMsg::Close` instead of just seeing `None`. Removal
++                // is deferred until any backlog has drained so a slow consumer
++                // does not lose buffered Data/Eof/ExitStatus.
++                self.close_channel(channel_num, ChannelMsg::Close);
+                 debug!("handler.channel_close {channel_num:?}");
+                 handler.channel_close(channel_num, self).await
+             }
+             msg::CHANNEL_EOF => {
+                 let channel_num = map_err!(ChannelId::decode(r))?;
+                 map_err!(ensure_end(r))?;
+-                if let Some(chan) = self.channels.get(&channel_num) {
+-                    chan.send(ChannelMsg::Eof).await.unwrap_or(())
+-                }
++                self.forward_channel_msg(channel_num, ChannelMsg::Eof);
+                 debug!("handler.channel_eof {channel_num:?}");
+                 handler.channel_eof(channel_num, self).await
+             }
+@@ -1017,35 +1018,43 @@ impl Session {
+                 trace!("handler.data {ext:?} {channel_num:?}");
+                 let data = map_err!(Bytes::decode(r))?;
+                 map_err!(ensure_end(r))?;
+-                let target = self.target_window_size;
+ 
++                // Debit the receive window now (RFC 4254 §5.2), but defer
++                // WINDOW_ADJUST until we know the application has capacity:
++                // a slow consumer should see its peer's window drain to zero
++                // instead of stalling the whole session loop.
+                 if let Some(ref mut enc) = self.common.encrypted {
+-                    if enc.adjust_window_size(channel_num, &data, target)? {
+-                        let window = handler.adjust_window(channel_num, self.target_window_size);
+-                        if window > 0 {
+-                            self.target_window_size = window
+-                        }
+-                    }
++                    enc.record_received_data(channel_num, &data);
+                 }
+-                self.flush()?;
++
++                // try_send to the Channel mpsc; never `.await` here. If the
++                // buffer is full the message is queued on the session and the
++                // window is *not* re-opened, so the client throttles this one
++                // channel while the loop stays live for other channels and
++                // keepalives.
++                let msg = match ext {
++                    None => ChannelMsg::Data { data: data.clone() },
++                    Some(ext) => ChannelMsg::ExtendedData {
++                        ext,
++                        data: data.clone(),
++                    },
++                };
++                let delivered = self.forward_channel_msg(channel_num, msg);
++
+                 if let Some(ext) = ext {
+-                    if let Some(chan) = self.channels.get(&channel_num) {
+-                        chan.send(ChannelMsg::ExtendedData {
+-                            ext,
+-                            data: data.clone(),
+-                        })
+-                        .await
+-                        .unwrap_or(())
+-                    }
+-                    handler.extended_data(channel_num, ext, &data, self).await
++                    handler.extended_data(channel_num, ext, &data, self).await?;
+                 } else {
+-                    if let Some(chan) = self.channels.get(&channel_num) {
+-                        chan.send(ChannelMsg::Data { data: data.clone() })
+-                            .await
+-                            .unwrap_or(())
++                    handler.data(channel_num, &data, self).await?;
++                }
++
++                if delivered && self.replenish_receive_window(channel_num)? {
++                    let window = handler.adjust_window(channel_num, self.target_window_size);
++                    if window > 0 {
++                        self.target_window_size = window
+                     }
+-                    handler.data(channel_num, &data, self).await
+                 }
++                self.flush()?;
++                Ok(())
+             }
+ 
+             msg::CHANNEL_WINDOW_ADJUST => {
+@@ -1069,11 +1078,8 @@ impl Session {
+                 }
+                 if let Some(chan) = self.channels.get(&channel_num) {
+                     chan.window_size().update(new_size).await;
+-                    // Use try_send to avoid blocking the session loop when channel buffer is full.
+-                    // WindowAdjusted is informational - the critical side effect (updating
+-                    // WindowSizeRef and notifying ChannelTx) already happens in update().
+-                    let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
+                 }
++                self.forward_channel_msg(channel_num, ChannelMsg::WindowAdjusted { new_size });
+                 debug!("handler.window_adjusted {channel_num:?}");
+                 handler.window_adjusted(channel_num, new_size, self).await
+             }
+@@ -1095,15 +1101,15 @@ impl Session {
+                     return Err(Error::Inconsistent.into());
+                 };
+ 
+-                if let Some(channel) = self.channels.get(&local_id) {
+-                    channel
+-                        .send(ChannelMsg::Open {
++                if self.channels.contains_key(&local_id) {
++                    self.forward_channel_msg(
++                        local_id,
++                        ChannelMsg::Open {
+                             id: local_id,
+                             max_packet_size: msg.maximum_packet_size,
+                             window_size: msg.initial_window_size,
+-                        })
+-                        .await
+-                        .unwrap_or(());
++                        },
++                    );
+                 } else {
+                     error!("no channel for id {local_id:?}");
+                 }
+@@ -1173,19 +1179,18 @@ impl Session {
+                         }
+                         map_err!(ensure_end(r))?;
+ 
+-                        if let Some(chan) = self.channels.get(&channel_num) {
+-                            let _ = chan
+-                                .send(ChannelMsg::RequestPty {
+-                                    want_reply: true,
+-                                    term: term.clone(),
+-                                    col_width,
+-                                    row_height,
+-                                    pix_width,
+-                                    pix_height,
+-                                    terminal_modes: modes.into(),
+-                                })
+-                                .await;
+-                        }
++                        self.forward_channel_msg(
++                            channel_num,
++                            ChannelMsg::RequestPty {
++                                want_reply: true,
++                                term: term.clone(),
++                                col_width,
++                                row_height,
++                                pix_width,
++                                pix_height,
++                                terminal_modes: modes.into(),
++                            },
++                        );
+ 
+                         debug!("handler.pty_request {channel_num:?}");
+                         #[allow(clippy::indexing_slicing)] // `modes` length checked
+@@ -1209,17 +1214,16 @@ impl Session {
+                         let x11_screen_number = map_err!(u32::decode(r))?;
+                         map_err!(ensure_end(r))?;
+ 
+-                        if let Some(chan) = self.channels.get(&channel_num) {
+-                            let _ = chan
+-                                .send(ChannelMsg::RequestX11 {
+-                                    want_reply: true,
+-                                    single_connection,
+-                                    x11_authentication_cookie: x11_auth_cookie.clone(),
+-                                    x11_authentication_protocol: x11_auth_protocol.clone(),
+-                                    x11_screen_number,
+-                                })
+-                                .await;
+-                        }
++                        self.forward_channel_msg(
++                            channel_num,
++                            ChannelMsg::RequestX11 {
++                                want_reply: true,
++                                single_connection,
++                                x11_authentication_cookie: x11_auth_cookie.clone(),
++                                x11_authentication_protocol: x11_auth_protocol.clone(),
++                                x11_screen_number,
++                            },
++                        );
+                         debug!("handler.x11_request {channel_num:?}");
+                         handler
+                             .x11_request(
+@@ -1237,15 +1241,14 @@ impl Session {
+                         let env_value = map_err!(String::decode(r))?;
+                         map_err!(ensure_end(r))?;
+ 
+-                        if let Some(chan) = self.channels.get(&channel_num) {
+-                            let _ = chan
+-                                .send(ChannelMsg::SetEnv {
+-                                    want_reply: true,
+-                                    variable_name: env_variable.clone(),
+-                                    variable_value: env_value.clone(),
+-                                })
+-                                .await;
+-                        }
++                        self.forward_channel_msg(
++                            channel_num,
++                            ChannelMsg::SetEnv {
++                                want_reply: true,
++                                variable_name: env_variable.clone(),
++                                variable_value: env_value.clone(),
++                            },
++                        );
+ 
+                         debug!("handler.env_request {channel_num:?}");
+                         handler
+@@ -1254,21 +1257,19 @@ impl Session {
+                     }
+                     "shell" => {
+                         map_err!(ensure_end(r))?;
+-                        if let Some(chan) = self.channels.get(&channel_num) {
+-                            let _ = chan
+-                                .send(ChannelMsg::RequestShell { want_reply: true })
+-                                .await;
+-                        }
++                        self.forward_channel_msg(
++                            channel_num,
++                            ChannelMsg::RequestShell { want_reply: true },
++                        );
+                         debug!("handler.shell_request {channel_num:?}");
+                         handler.shell_request(channel_num, self).await
+                     }
+                     "auth-agent-req@openssh.com" => {
+                         map_err!(ensure_end(r))?;
+-                        if let Some(chan) = self.channels.get(&channel_num) {
+-                            let _ = chan
+-                                .send(ChannelMsg::AgentForward { want_reply: true })
+-                                .await;
+-                        }
++                        self.forward_channel_msg(
++                            channel_num,
++                            ChannelMsg::AgentForward { want_reply: true },
++                        );
+                         debug!("handler.agent_request {channel_num:?}");
+ 
+                         let response = handler.agent_request(channel_num, self).await?;
+@@ -1282,14 +1283,13 @@ impl Session {
+                     "exec" => {
+                         let req = map_err!(Bytes::decode(r))?;
+                         map_err!(ensure_end(r))?;
+-                        if let Some(chan) = self.channels.get(&channel_num) {
+-                            let _ = chan
+-                                .send(ChannelMsg::Exec {
+-                                    want_reply: true,
+-                                    command: req.to_vec(),
+-                                })
+-                                .await;
+-                        }
++                        self.forward_channel_msg(
++                            channel_num,
++                            ChannelMsg::Exec {
++                                want_reply: true,
++                                command: req.to_vec(),
++                            },
++                        );
+                         debug!("handler.exec_request {channel_num:?}");
+                         handler.exec_request(channel_num, &req, self).await
+                     }
+@@ -1297,14 +1297,13 @@ impl Session {
+                         let name = map_err!(String::decode(r))?;
+                         map_err!(ensure_end(r))?;
+ 
+-                        if let Some(chan) = self.channels.get(&channel_num) {
+-                            let _ = chan
+-                                .send(ChannelMsg::RequestSubsystem {
+-                                    want_reply: true,
+-                                    name: name.clone(),
+-                                })
+-                                .await;
+-                        }
++                        self.forward_channel_msg(
++                            channel_num,
++                            ChannelMsg::RequestSubsystem {
++                                want_reply: true,
++                                name: name.clone(),
++                            },
++                        );
+                         debug!("handler.subsystem_request {channel_num:?}");
+                         handler.subsystem_request(channel_num, &name, self).await
+                     }
+@@ -1315,16 +1314,15 @@ impl Session {
+                         let pix_height = map_err!(u32::decode(r))?;
+                         map_err!(ensure_end(r))?;
+ 
+-                        if let Some(chan) = self.channels.get(&channel_num) {
+-                            let _ = chan
+-                                .send(ChannelMsg::WindowChange {
+-                                    col_width,
+-                                    row_height,
+-                                    pix_width,
+-                                    pix_height,
+-                                })
+-                                .await;
+-                        }
++                        self.forward_channel_msg(
++                            channel_num,
++                            ChannelMsg::WindowChange {
++                                col_width,
++                                row_height,
++                                pix_width,
++                                pix_height,
++                            },
++                        );
+ 
+                         debug!("handler.window_change {channel_num:?}");
+                         handler
+@@ -1341,13 +1339,12 @@ impl Session {
+                     "signal" => {
+                         let signal = Sig::from_name(&map_err!(String::decode(r))?);
+                         map_err!(ensure_end(r))?;
+-                        if let Some(chan) = self.channels.get(&channel_num) {
+-                            chan.send(ChannelMsg::Signal {
++                        self.forward_channel_msg(
++                            channel_num,
++                            ChannelMsg::Signal {
+                                 signal: signal.clone(),
+-                            })
+-                            .await
+-                            .unwrap_or(())
+-                        }
++                            },
++                        );
+                         debug!("handler.signal {channel_num:?} {signal:?}");
+                         handler.signal(channel_num, signal, self).await
+                     }
+@@ -1458,12 +1455,7 @@ impl Session {
+                     enc.channels.remove(&channel_num);
+                 }
+ 
+-                if let Some(channel_sender) = self.channels.remove(&channel_num) {
+-                    channel_sender
+-                        .send(ChannelMsg::OpenFailure(reason))
+-                        .await
+-                        .map_err(|_| crate::Error::SendError)?;
+-                }
++                self.close_channel(channel_num, ChannelMsg::OpenFailure(reason));
+ 
+                 Ok(())
+             }
+@@ -1576,6 +1568,7 @@ impl Session {
+             channel_params.recipient_maximum_packet_size,
+             channel_params.recipient_window_size,
+             self.common.config.channel_buffer_size,
++            self.drain_notify.clone(),
+         );
+ 
+         let pending = PendingChannelOpen {
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 5395cccf..9984b80a 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -455,6 +455,13 @@ pub trait Handler: Sized {
+ 
+     /// Called when a data packet is received. A response can be
+     /// written to the `response` argument.
++    ///
++    /// If you consume channel data exclusively via this callback (rather
++    /// than [`Channel::wait`]), drop the [`Channel`] (or its
++    /// [`ChannelReadHalf`](crate::ChannelReadHalf)) returned from
++    /// `channel_open_*` so the SSH receive window keeps re-opening; a
++    /// retained-but-unread `Channel` throttles the peer to zero once its
++    /// buffer fills.
+     #[allow(unused_variables)]
+     fn data(
+         &mut self,
+@@ -1063,9 +1070,11 @@ where
+     // Reading SSH id and allocating a session.
+     let mut stream = SshRead::new(stream);
+     let (sender, receiver) = tokio::sync::mpsc::channel(config.event_buffer_size);
++    let drain_notify = Arc::new(tokio::sync::Notify::new());
+     let handle = server::session::Handle {
+         sender,
+         channel_buffer_size: config.channel_buffer_size,
++        drain_notify: drain_notify.clone(),
+     };
+ 
+     let common = read_ssh_id(config, &mut stream).await?;
+@@ -1077,6 +1086,8 @@ where
+         pending_reads: Vec::new(),
+         pending_len: 0,
+         channels: HashMap::new(),
++        backlog: crate::channels::ChannelBacklog::default(),
++        drain_notify,
+         open_global_requests: VecDeque::new(),
+         kex: SessionKexState::Idle,
+     };
+diff --git a/src/server/session.rs b/src/server/session.rs
+index 548ba662..21161a30 100644
+--- a/src/server/session.rs
++++ b/src/server/session.rs
+@@ -6,11 +6,14 @@ use channels::WindowSizeRef;
+ use kex::ServerKex;
+ use log::debug;
+ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
++use tokio::sync::Notify;
+ use tokio::sync::mpsc::{Receiver, Sender, channel};
+ use tokio::sync::oneshot;
+ 
+ use super::*;
+-use crate::channels::{Channel, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf};
++use crate::channels::{
++    Channel, ChannelBacklog, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf,
++};
+ use crate::helpers::NameList;
+ use crate::kex::{EXTENSION_SUPPORT_AS_CLIENT, KexCause, SessionKexState};
+ use crate::{ChannelOpenFailure, map_err, msg};
+@@ -25,10 +28,27 @@ pub struct Session {
+     pub(crate) pending_reads: Vec<Vec<u8>>,
+     pub(crate) pending_len: u32,
+     pub(crate) channels: HashMap<ChannelId, ChannelRef>,
++    /// Per-channel overflow for [`ChannelMsg`]s that could not be delivered
++    /// to the [`Channel`] mpsc without blocking. Bounded by the SSH receive
++    /// window: we withhold `WINDOW_ADJUST` while a channel is present here.
++    /// See [`ChannelBacklog`].
++    pub(crate) backlog: ChannelBacklog,
++    /// Signalled by [`ChannelReadHalf`] consumers; wakes the session loop to
++    /// drain `backlog` and re-open receive windows.
++    pub(crate) drain_notify: Arc<Notify>,
+     pub(crate) open_global_requests: VecDeque<GlobalRequestResponse>,
+     pub(crate) kex: SessionKexState<ServerKex>,
+ }
+ 
++impl Drop for Session {
++    fn drop(&mut self) {
++        // Best-effort: push whatever fits into each channel mpsc so consumers
++        // can read the tail after the sender drops. The graceful-exit path
++        // already awaited `flush_into` for full delivery.
++        let _ = self.backlog.drain(&mut self.channels);
++    }
++}
++
+ #[derive(Debug)]
+ pub enum Msg {
+     ChannelOpenAgent {
+@@ -110,6 +130,7 @@ pub type ChannelOpenHandle = crate::ChannelOpenHandleInner<Msg>;
+ pub struct Handle {
+     pub(crate) sender: Sender<Msg>,
+     pub(crate) channel_buffer_size: usize,
++    pub(crate) drain_notify: Arc<Notify>,
+ }
+ 
+ impl Handle {
+@@ -392,11 +413,12 @@ impl Handle {
+ 
+     async fn wait_channel_confirmation(
+         &self,
+-        mut receiver: Receiver<ChannelMsg>,
++        receiver: Receiver<ChannelMsg>,
+         window_size_ref: WindowSizeRef,
+     ) -> Result<Channel<Msg>, Error> {
++        let mut read_half = ChannelReadHalf::new(receiver, self.drain_notify.clone());
+         loop {
+-            match receiver.recv().await {
++            match read_half.wait().await {
+                 Some(ChannelMsg::Open {
+                     id,
+                     max_packet_size,
+@@ -411,7 +433,7 @@ impl Handle {
+                             max_packet_size,
+                             window_size: window_size_ref,
+                         },
+-                        read_half: ChannelReadHalf { receiver },
++                        read_half,
+                     });
+                 }
+                 Some(ChannelMsg::OpenFailure(reason)) => {
+@@ -574,6 +596,19 @@ impl Session {
+                     debug!("timeout");
+                     return Err(crate::Error::InactivityTimeout.into());
+                 }
++                _ = self.drain_notify.notified(),
++                    if !self.backlog.is_empty() && !self.kex.active() =>
++                {
++                    for id in self.backlog.drain(&mut self.channels) {
++                        if self.replenish_receive_window(id)? {
++                            let next_window =
++                                handler.adjust_window(id, self.target_window_size);
++                            if next_window > 0 {
++                                self.target_window_size = next_window;
++                            }
++                        }
++                    }
++                }
+                 msg = self.receiver.recv(), if !self.kex.active() => {
+                     match msg {
+                         Some(Msg::Channel(id, ChannelMsg::Data { data })) => {
+@@ -717,6 +752,26 @@ impl Session {
+         self.sender.clone()
+     }
+ 
++    /// See [`ChannelBacklog::forward`].
++    pub(crate) fn forward_channel_msg(&mut self, id: ChannelId, msg: ChannelMsg) -> bool {
++        self.backlog.forward(&self.channels, id, msg)
++    }
++
++    /// See [`ChannelBacklog::close_with`].
++    pub(crate) fn close_channel(&mut self, id: ChannelId, msg: ChannelMsg) {
++        self.backlog.close_with(&mut self.channels, id, msg)
++    }
++
++    /// Re-open the SSH receive window for `id` if it has dropped below half
++    /// the target. Only call this when the channel is not backed up.
++    pub(crate) fn replenish_receive_window(&mut self, id: ChannelId) -> Result<bool, Error> {
++        if let Some(ref mut enc) = self.common.encrypted {
++            enc.replenish_receive_window(id, self.target_window_size)
++        } else {
++            Ok(false)
++        }
++    }
++
+     pub fn writable_packet_size(&self, channel: &ChannelId) -> u32 {
+         if let Some(ref enc) = self.common.encrypted {
+             if let Some(channel) = enc.channels.get(channel) {
+@@ -1392,9 +1447,11 @@ mod tests {
+     fn authenticated_session() -> Session {
+         let config = Arc::new(crate::server::Config::default());
+         let (sender, receiver) = tokio::sync::mpsc::channel(config.event_buffer_size);
++        let drain_notify = Arc::new(Notify::new());
+         let handle = Handle {
+             sender,
+             channel_buffer_size: config.channel_buffer_size,
++            drain_notify: drain_notify.clone(),
+         };
+ 
+         Session {
+@@ -1439,6 +1496,8 @@ mod tests {
+             pending_reads: Vec::new(),
+             pending_len: 0,
+             channels: HashMap::new(),
++            backlog: ChannelBacklog::default(),
++            drain_notify,
+             open_global_requests: VecDeque::new(),
+             kex: SessionKexState::Idle,
+         }
+diff --git a/src/session.rs b/src/session.rs
+index b1eae0be..0a3a57ce 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -20,7 +20,7 @@ use std::num::Wrapping;
+ 
+ use bytes::Bytes;
+ use byteorder::{BigEndian, ByteOrder};
+-use log::{debug, trace};
++use log::{debug, trace, warn};
+ use ssh_encoding::Encode;
+ use tokio::sync::oneshot;
+ 
+@@ -282,22 +282,42 @@ impl Encrypted {
+         }
+     }
+ 
+-    pub fn adjust_window_size(
++    /// Debit `data.len()` from the channel's local receive window, without
++    /// emitting a `WINDOW_ADJUST`. Call this on every received
++    /// `CHANNEL_DATA`/`CHANNEL_EXTENDED_DATA` packet.
++    ///
++    /// Data that exceeds the remaining window is still delivered for interop
++    /// with off-by-one peers; the window saturates to zero so the next
++    /// [`Self::replenish_receive_window`] re-opens it instead of stalling.
++    pub fn record_received_data(&mut self, channel: ChannelId, data: &[u8]) {
++        let Some(channel) = self.channels.get_mut(&channel) else {
++            return;
++        };
++        let len = data.len() as u32;
++        if len > channel.sender_window_size {
++            warn!(
++                "channel {}: peer sent {} bytes exceeding receive window {}",
++                channel.sender_channel, len, channel.sender_window_size
++            );
++        }
++        channel.sender_window_size = channel.sender_window_size.saturating_sub(len);
++    }
++
++    /// Send `CHANNEL_WINDOW_ADJUST` if the channel's local receive window has
++    /// dropped below `target/2`, restoring it to `target`. Call this once the
++    /// application has consumed (or buffered with capacity for) the data —
++    /// not on receipt — so that a slow consumer naturally throttles its peer
++    /// instead of the session loop.
++    pub fn replenish_receive_window(
+         &mut self,
+         channel: ChannelId,
+-        data: &[u8],
+         target: u32,
+     ) -> Result<bool, crate::Error> {
+         if let Some(channel) = self.channels.get_mut(&channel) {
+             trace!(
+-                "adjust_window_size, channel = {}, size = {},",
++                "replenish_receive_window, channel = {}, size = {},",
+                 channel.sender_channel, target
+             );
+-            // Ignore extra data.
+-            // https://tools.ietf.org/html/rfc4254#section-5.2
+-            if data.len() as u32 <= channel.sender_window_size {
+-                channel.sender_window_size -= data.len() as u32;
+-            }
+             if channel.sender_window_size < target / 2 {
+                 debug!(
+                     "sender_window_size {:?}, target {:?}",

@@ -633,6 +633,205 @@ fi
 kill -9 "$N7_PID" 2>/dev/null || true
 wait "$N7_PID" 2>/dev/null || true
 
+# ── T-SSH-HOL: per-channel flow control ────────────────────────────────────
+# One stalled consumer on a tunnel must NEVER head-of-line-block other clients
+# on the SAME tunnel (same SSH connection). Regression guard for the vendored
+# russh fix (crates/russh, upstream Eugeny/russh#730): stock russh forwarded
+# inbound CHANNEL_DATA to the per-channel mpsc with a blocking `chan.send()`
+# inside the single session read loop and replenished the SSH window on
+# receipt, so a slow/paused consumer (a browser buffering a video over an
+# `ssh -R` tunnel) parked the whole connection and every other channel starved
+# until it drained. Reader A reads a little then STALLS (never reads again);
+# reader B, opened afterwards on the same tunnel, must still be served. Pre-fix
+# B got 0 bytes until A closed. Covered for public, vhost, AND secret tunnels.
+
+# Raw TCP flooder in nscli: floods 'X' as fast as the socket accepts, forever.
+spawn_flood_service() {
+    local port="$1"
+    ip netns exec nscli python3 - "$port" >"$TMPDIR/flood_$port.log" 2>&1 <<'PYEOF' &
+import socket, sys, threading
+port = int(sys.argv[1])
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port)); srv.listen(64)
+def handle(c):
+    b = b"X" * 65536
+    try:
+        while True:
+            c.sendall(b)
+    except OSError:
+        pass
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=handle, args=(c,), daemon=True).start()
+PYEOF
+    echo $!
+}
+
+# HTTP flooder in nscli: reads the request, replies 200 + an endless body.
+spawn_http_flood_service() {
+    local port="$1"
+    ip netns exec nscli python3 - "$port" >"$TMPDIR/hflood_$port.log" 2>&1 <<'PYEOF' &
+import socket, sys, threading
+port = int(sys.argv[1])
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port)); srv.listen(64)
+def handle(c):
+    b = b"X" * 65536
+    try:
+        c.recv(4096)
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n")
+        while True:
+            c.sendall(b)
+    except OSError:
+        pass
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=handle, args=(c,), daemon=True).start()
+PYEOF
+    echo $!
+}
+
+# hol_probe <raw|http> <ip> <port> [host_header] — from inside nscli, opens
+# reader A (reads a little, then stalls holding the socket), then reader B on
+# the same tunnel, and prints "B_bytes=<n>" (bytes B received in a 6s window
+# while A was stalled). Never aborts the harness (own errors -> B_bytes=0).
+hol_probe() {
+    local mode="$1" ip="$2" port="$3" host="${4:-x}"
+    ip netns exec nscli python3 - "$mode" "$ip" "$port" "$host" 2>/dev/null <<'PYEOF' || echo "B_bytes=0"
+import socket, sys, time, threading
+mode, ip, port, host = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+req = ("GET / HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n" % host).encode()
+def conn(t=6.0):
+    c = socket.socket(); c.settimeout(t); c.connect((ip, port))
+    if mode == "http":
+        c.sendall(req)
+    return c
+res = {}
+def reader_a():
+    try:
+        c = conn(); res['a_first'] = len(c.recv(65536)); res['a'] = True; time.sleep(16); c.close()
+    except OSError:
+        res['a'] = True
+def reader_b():
+    while not res.get('a'):
+        time.sleep(0.05)
+    time.sleep(3)
+    tot = 0; end = "timeout"
+    try:
+        c = conn(); t0 = time.time()
+        while time.time() - t0 < 6 and tot < 1_000_000:
+            d = c.recv(65536)
+            if not d:
+                end = "eof"; break
+            tot += len(d)
+        else:
+            end = "cap" if tot >= 1_000_000 else "timeout"
+        c.close()
+    except OSError as e:
+        end = "err:%s" % e
+    res['b'] = tot; res['end'] = end
+ta = threading.Thread(target=reader_a); tb = threading.Thread(target=reader_b)
+ta.start(); tb.start(); tb.join()
+print("B_bytes=%d B_end=%s A_first=%d" % (res.get('b', 0), res.get('end','?'), res.get('a_first',0)))
+PYEOF
+}
+
+# T-SSH-HOL-PUB — public tunnel
+echo ""
+echo "=== Test: T-SSH-HOL-PUB (public tunnel: stalled reader must not block peers) ==="
+HOL_PUB_FLOOD=19820
+spawn_flood_service "$HOL_PUB_FLOOD" >/dev/null
+sleep 0.3
+ssh_cmd -N -R "19821:127.0.0.1:$HOL_PUB_FLOOD" >"$TMPDIR/hol_pub_ssh.log" 2>&1 &
+HOL_PUB_SSH=$!
+sleep 2
+HOL_PUB_B=$(hol_probe raw "$SERVER_IP" 19821 | grep -oE '[0-9]+' | head -1)
+HOL_PUB_B=${HOL_PUB_B:-0}
+if [ "$HOL_PUB_B" -ge 100000 ]; then
+    pass "T-SSH-HOL-PUB reader B served concurrently ($HOL_PUB_B bytes) while A stalled"
+else
+    fail "T-SSH-HOL-PUB reader B starved ($HOL_PUB_B bytes in 6s) — per-channel HOL regression"
+fi
+kill -9 "$HOL_PUB_SSH" 2>/dev/null || true; wait "$HOL_PUB_SSH" 2>/dev/null || true
+
+# T-SSH-HOL-VHOST — vhost tunnel (over the shared control/HTTP port)
+echo ""
+echo "=== Test: T-SSH-HOL-VHOST (vhost tunnel: stalled reader must not block peers) ==="
+HOL_VH_FLOOD=19822
+spawn_http_flood_service "$HOL_VH_FLOOD" >/dev/null
+sleep 0.3
+ssh_cmd -N -R "vhost/hol:0:127.0.0.1:$HOL_VH_FLOOD" >"$TMPDIR/hol_vh_ssh.log" 2>&1 &
+HOL_VH_SSH=$!
+# A `-N` vhost forward is not routable until the gateway's PARAMS_GRACE (5s,
+# waiting for exec params that never arrive) elapses and the registry entry is
+# inserted; before that a request 404s on the fallthrough. Gate on actual
+# routability — poll until one GET truly STREAMS (a large response, not a 404 /
+# redirect) — so the concurrency probe below tests the relay, not the warm-up.
+vh_stream_bytes() {
+    ip netns exec nscli python3 - "$SERVER_IP" "$CTRL_PORT" "hol.$VHOST_DOMAIN" 2>/dev/null <<'PY' || echo 0
+import socket,sys,time
+ip,port,host=sys.argv[1],int(sys.argv[2]),sys.argv[3]
+try:
+    c=socket.socket();c.settimeout(4);c.connect((ip,port))
+    c.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n"%host).encode())
+    tot=0;t0=time.time()
+    while time.time()-t0<2 and tot<300000:
+        d=c.recv(65536)
+        if not d: break
+        tot+=len(d)
+    c.close();print(tot)
+except OSError: print(0)
+PY
+}
+HOL_VH_READY=0
+for _ in $(seq 1 20); do
+    if [ "$(vh_stream_bytes)" -ge 100000 ]; then HOL_VH_READY=1; break; fi
+    sleep 1
+done
+if [ "$HOL_VH_READY" != "1" ]; then
+    fail "T-SSH-HOL-VHOST vhost tunnel never became routable/streamable (setup)"
+else
+    HOL_VH_B=$(hol_probe http "$SERVER_IP" "$CTRL_PORT" "hol.$VHOST_DOMAIN" | grep -oE 'B_bytes=[0-9]+' | grep -oE '[0-9]+' | head -1)
+    HOL_VH_B=${HOL_VH_B:-0}
+    if [ "$HOL_VH_B" -ge 100000 ]; then
+        pass "T-SSH-HOL-VHOST reader B served concurrently ($HOL_VH_B bytes) while A stalled"
+    else
+        fail "T-SSH-HOL-VHOST reader B starved ($HOL_VH_B bytes in 6s) — per-channel HOL regression"
+    fi
+fi
+kill -9 "$HOL_VH_SSH" 2>/dev/null || true; wait "$HOL_VH_SSH" 2>/dev/null || true
+
+# T-SSH-HOL-SECRET — secret tunnel: SSH provider, native consumer. The flood
+# flows provider(SSH)->server->consumer(native); a stalled reader on the
+# consumer's local port must not block a peer, i.e. must not park the provider's
+# russh channel and starve the sibling channel.
+echo ""
+echo "=== Test: T-SSH-HOL-SECRET (secret tunnel: stalled reader must not block peers) ==="
+HOL_SEC_FLOOD=19823
+HOL_SEC_CONS=19824
+spawn_flood_service "$HOL_SEC_FLOOD" >/dev/null
+sleep 0.3
+ssh_cmd -N -R "secret/holsec:0:127.0.0.1:$HOL_SEC_FLOOD" >"$TMPDIR/hol_sec_ssh.log" 2>&1 &
+HOL_SEC_SSH=$!
+sleep 1
+ip netns exec nscli "$BORE" proxy \
+    --to "https://$SERVER_IP:$CTRL_PORT" --insecure \
+    --secret "$SECRET" --tcp-secret-id holsec \
+    --local-proxy-port ":$HOL_SEC_CONS" >"$TMPDIR/hol_sec_consumer.log" 2>&1 &
+HOL_SEC_CONS_PID=$!
+sleep 2
+HOL_SEC_B=$(hol_probe raw 127.0.0.1 "$HOL_SEC_CONS" | grep -oE '[0-9]+' | head -1)
+HOL_SEC_B=${HOL_SEC_B:-0}
+if [ "$HOL_SEC_B" -ge 100000 ]; then
+    pass "T-SSH-HOL-SECRET reader B served concurrently ($HOL_SEC_B bytes) while A stalled"
+else
+    fail "T-SSH-HOL-SECRET reader B starved ($HOL_SEC_B bytes in 6s) — per-channel HOL regression"
+fi
+kill -9 "$HOL_SEC_SSH" "$HOL_SEC_CONS_PID" 2>/dev/null || true
+wait "$HOL_SEC_SSH" "$HOL_SEC_CONS_PID" 2>/dev/null || true
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Summary ==="

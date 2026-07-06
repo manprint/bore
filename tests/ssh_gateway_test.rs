@@ -197,6 +197,34 @@ async fn spawn_echo_service() -> Result<u16> {
     Ok(port)
 }
 
+/// A local TCP service that floods `X` bytes as fast as the socket accepts
+/// them — a stand-in for a large download / continuously streaming video that
+/// a client consumes more slowly than it is produced. Used by T-SSH-HOL1 to
+/// prove one slow/stalled consumer cannot head-of-line-block its peers on the
+/// same SSH connection. Drains (and ignores) any request bytes first so it
+/// also works behind an HTTP-speaking edge.
+async fn spawn_flood_service() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            tokio::spawn(async move {
+                let chunk = vec![b'X'; 65536];
+                loop {
+                    if stream.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+                anyhow::Ok(())
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+    Ok(port)
+}
+
 /// Issues one HTTP/1.1 GET over `stream` and returns the full response text.
 async fn http_get<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
@@ -1028,6 +1056,99 @@ async fn t_ssh_pub5_force_https_redirects_plain_http() -> Result<()> {
         resp.contains("Location: https://"),
         "308 redirect must point at https://, got: {resp}"
     );
+
+    child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-HOL1 — per-channel flow control: one stalled consumer on a tunnel must
+// NEVER block other connections on the SAME tunnel (same SSH connection). This
+// is the regression guard for the head-of-line-blocking bug fixed in the
+// vendored russh (crates/russh, upstream Eugeny/russh#730): stock russh
+// forwarded inbound CHANNEL_DATA to the per-channel mpsc with a blocking
+// `chan.send().await` inside the single session read loop and replenished the
+// SSH window on receipt, so a slow/paused consumer (a browser buffering a
+// video) parked the whole connection and every other channel starved until it
+// drained. A real repro (two browsers, one streaming, the second stuck on
+// "loading" until the first closed) motivated the fix.
+//
+// Setup: one public `-R` tunnel to a byte-flooder. Reader A reads a little
+// then STALLS (never reads again, holds the socket) — enough to fill its
+// channel window + mpsc. Reader B, opened afterwards on the same tunnel, must
+// still be served concurrently. Finally A must resume cleanly (proving the
+// fix THROTTLES A's peer via the withheld WINDOW_ADJUST rather than dropping
+// data or wedging).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_ssh_hol1_slow_consumer_does_not_block_peers() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(&auth_dir, &client_priv, None)?;
+
+    let gw_port = start_gateway_server(dir.path().join("host_key"), auth_dir).await?;
+    let svc_port = spawn_flood_service().await?;
+
+    let fwd_port = free_port().await?;
+    let args = ssh_args(gw_port, &client_priv, &[(fwd_port, svc_port)], None);
+    let mut child = Command::new("ssh")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh -R (T-SSH-HOL1)")?;
+    wait_port(fwd_port, true).await;
+
+    // Reader A: pull an initial chunk to confirm the tunnel carries data, then
+    // STALL — hold the connection open without ever reading again.
+    let mut reader_a = TcpStream::connect(("127.0.0.1", fwd_port)).await?;
+    let mut probe = [0u8; 65536];
+    let first = time::timeout(Duration::from_secs(10), reader_a.read(&mut probe))
+        .await
+        .context("reader A initial read timed out")??;
+    assert!(
+        first > 0,
+        "reader A received no initial data from the tunnel"
+    );
+    // Let the flooder fill A's SSH window + channel mpsc; under the old code
+    // the session read loop is now parked on A's full mpsc.
+    time::sleep(Duration::from_secs(2)).await;
+
+    // Reader B: a second, independent connection on the SAME tunnel. It must
+    // be served promptly despite A being wedged.
+    let mut reader_b = TcpStream::connect(("127.0.0.1", fwd_port)).await?;
+    let mut got_b = 0usize;
+    let mut buf = [0u8; 65536];
+    let deadline = time::Instant::now() + Duration::from_secs(8);
+    while time::Instant::now() < deadline && got_b < 512 * 1024 {
+        match time::timeout(Duration::from_secs(5), reader_b.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => got_b += n,
+            _ => break,
+        }
+    }
+    assert!(
+        got_b >= 256 * 1024,
+        "reader B was starved ({got_b} bytes in 8s) while reader A stalled — \
+         per-channel head-of-line-blocking regression (see crates/russh)"
+    );
+
+    // A's peer was throttled (window withheld), not dropped: once A drains, it
+    // must resume delivering bytes cleanly.
+    drop(reader_b);
+    let resumed = time::timeout(Duration::from_secs(10), reader_a.read(&mut probe))
+        .await
+        .context("reader A did not resume after draining")??;
+    assert!(resumed > 0, "reader A did not resume after B finished");
 
     child.kill().await.ok();
     Ok(())

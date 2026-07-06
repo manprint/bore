@@ -9,6 +9,11 @@
 # will likely look very different (and much more reasonable).
 # See Cargo.toml.orig for the original contents.
 
+# Detach from the parent bore workspace so `cargo test` runs standalone in
+# this directory (the parent consumes this crate via [patch.crates-io], not
+# as a workspace member).
+[workspace]
+
 [package]
 edition = "2024"
 rust-version = "1.85"

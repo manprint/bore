@@ -8,4 +8,5 @@ refactorys/
 bugs/
 .env
 .serena
-bugs.ai
+bugs.ai# standalone `cargo test` runs inside the vendored crate (detached workspace)
+crates/russh/target/

@@ -607,11 +607,43 @@ the existing registries/relay/admin/weblog/`--max-conns` data path unmodified.
   to `handle_connection` (garbage-close mid-request is exactly the reported instability).
   Regression: T-SSH-DMX3 (ALPN http + idle 4s ⇒ HTTP response, never a banner — red on the old
   code at ~2s) + T-SSH-DMX4 (`-alpn ssh` ⇒ banner) + `demux_classify_alpn_table` unit.
-- Regression/e2e: `tests/ssh_gateway_test.rs` (cargo, 34 tests incl. takeover, demux, SSH-over-TLS,
-  the I-SSH6/I-SSH7/I-SSH8 shell-request-fix/banner/inapplicable-param-warning suite)
-  + `sudo -n /abs/path/scripts/ssh_gateway_test.sh` (netns chaos: T-SSH-N1..N6 — real netfilter
-  half-open, autossh recovery across a server restart, takeover under partition, mixed
-  transports on one port, throughput report, password auth). Exact-path sudo invocation only
+- **I-SSH10 (bounded channel-open + wedged-session eviction, resilience hunt 2026-07-06):** RFC
+  4254 has no deadline for a CHANNEL_OPEN reply, so a wedged-but-TCP-alive OpenSSH client (frozen
+  process/suspended laptop: kernel ACKs+answers nothing; or zero-window peer that jams the session
+  loop in `flush_into`, where keepalives are never even SENT so `keepalive_max` reaping is blind)
+  left every proxied connection `pending` FOREVER holding its `--max-conns` permit — field symptom:
+  stalled pages that only a manual ssh-client restart healed. FIX, two independent layers: (1) EVERY
+  server-initiated `forwarded-tcpip` open is bounded by `ssh_open_timeout()` (15 s;
+  `BORE_SSH_OPEN_TIMEOUT_MS` test override) — `SshOpener::open` (vhost+secret, timeout INSIDE the
+  opener so native-consumer relays through an SSH provider are covered too) and
+  `run_public_forward`'s inline open (which otherwise froze the whole PUBLIC accept loop, one conn
+  wedging all). An ANSWERED open — even `ChannelOpenFailure` (app down/restarting) — resets the
+  counter; `SSH_OPEN_TIMEOUT_EVICT=2` consecutive TIMEOUTS ⇒ `ConnState::evict()` ⇒
+  `serve_connection`'s `select!` calls `RunningSession::abort()` (vendored russh: tokio
+  `JoinHandle::abort`, run_stream SPAWNS — dropping the future does NOT stop the session; and never
+  `Handle::disconnect`, which rides the same possibly-wedged dispatch loop) ⇒ RAII teardown frees
+  label/port/admin row ⇒ autossh reconnects = the manual fix, automated. (2) vendored russh:
+  `WindowSizeRef` carries a `closed` flag; `Drop for ChannelRef` (single owner, session channel map
+  — covers close_with/drain/session-death/abort) calls `close()` which wakes+errors
+  (`BrokenPipe`/`SendError`) any writer parked on the window `Notify` — before this, a
+  `ChannelTx`/`send_bytes` blocked on an exhausted window whose channel then closed parked FOREVER
+  (splice-task + permit leak; upload-shaped). The opener state handle is `Weak<ConnState>` — a
+  strong clone inside the pool/accept-loop would resurrect the I-SSH3 reference cycle. Full
+  app-restart matrix (dufs+python, TLS/ALPN, keep-alive across restart, mid-flight kill, uploads,
+  client & server-timed rekey crossings) was reproduced RESILIENT on localhost pre-fix — the wedge
+  needs a peer that stops answering while TCP stays alive, which is exactly what the regression
+  tests do with SIGSTOP. Regression: `t_ssh_i10_wedged_client_vhost_evicts_and_recovers` /
+  `t_ssh_i10_wedged_client_public_evicts_and_frees_port` (SIGSTOP the real ssh; assert fast-fail,
+  eviction, port/label release, reconnect serves again) + russh units
+  `data_bytes_window_wait_errors_on_close` / `channel_tx_window_wait_errors_on_channel_ref_drop`.
+  Vendored-delta log: `crates/russh/HOL_FIX.md`. Rekey diagnostics env: `BORE_SSH_REKEY_BYTES`
+  / `BORE_SSH_REKEY_SECS` (server-side russh never initiates count/time rekey in practice — the
+  OpenSSH client's own RekeyLimit fires first under load; both directions verified non-wedging).
+- Regression/e2e: `tests/ssh_gateway_test.rs` (cargo, 36 tests incl. takeover, demux, SSH-over-TLS,
+  the I-SSH6/I-SSH7/I-SSH8 shell-request-fix/banner/inapplicable-param-warning suite, the I-SSH10
+  wedged-client pair) + `sudo -n /abs/path/scripts/ssh_gateway_test.sh` (netns chaos: T-SSH-N1..N6
+  — real netfilter half-open, autossh recovery across a server restart, takeover under partition,
+  mixed transports on one port, throughput report, password auth). Exact-path sudo invocation only
   (`sudo bash scripts/...` prompts and must not be used).
 
 **Version string:** `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs`

@@ -24,6 +24,20 @@ impl ChannelRef {
     }
 }
 
+/// The session's channel map holds the only `ChannelRef`; it is dropped
+/// exactly when the channel is torn down (peer CHANNEL_CLOSE processed by
+/// `ChannelBacklog::close_with`/`drain`, or the whole session ending). A
+/// writer (`ChannelTx`, `ChannelWriteHalf::send_bytes`) parked on the window
+/// notifier would otherwise never wake — the peer of a closed channel sends
+/// no further WINDOW_ADJUST — wedging its task forever (observed as leaked
+/// proxied-connection splices in bore's ssh-gateway). Closing here reaches
+/// every teardown path with a single hook.
+impl Drop for ChannelRef {
+    fn drop(&mut self) {
+        self.window_size.close();
+    }
+}
+
 impl std::ops::Deref for ChannelRef {
     type Target = Sender<ChannelMsg>;
 

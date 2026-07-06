@@ -4,6 +4,7 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::ops::DerefMut;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
@@ -50,6 +51,11 @@ pub struct ChannelTx<S> {
     window_size: Arc<Mutex<u32>>,
     notify: Arc<Notify>,
     window_size_notication: WatchNotification,
+    /// Channel-closed flag shared with the session's `WindowSizeRef` (set by
+    /// `WindowSizeRef::close` when the `ChannelRef` is torn down). A closed
+    /// channel never receives another WINDOW_ADJUST, so a writer waiting for
+    /// window credit must fail instead of parking forever.
+    closed: Arc<AtomicBool>,
     max_packet_size: u32,
     ext: Option<u32>,
 }
@@ -58,11 +64,13 @@ impl<S> ChannelTx<S>
 where
     S: From<(ChannelId, ChannelMsg)> + 'static + Send,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sender: mpsc::Sender<S>,
         id: ChannelId,
         window_size: Arc<Mutex<u32>>,
         window_size_notification: Arc<Notify>,
+        closed: Arc<AtomicBool>,
         max_packet_size: u32,
         ext: Option<u32>,
     ) -> Self {
@@ -74,12 +82,26 @@ where
             window_size_notication: WatchNotification::new(window_size_notification),
             window_size,
             window_size_fut: None,
+            closed,
             max_packet_size,
             ext,
         }
     }
 
-    fn poll_writable(&mut self, cx: &mut Context<'_>, buf_len: usize) -> Poll<NonZeroUsize> {
+    fn poll_writable(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf_len: usize,
+    ) -> Poll<io::Result<NonZeroUsize>> {
+        if self.closed.load(Ordering::SeqCst) {
+            // Re-notify so a sibling writer parked on the same notifier also
+            // observes the close (a stored permit is single-consumer).
+            self.notify.notify_one();
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "channel closed",
+            )));
+        }
         let window_size = self.window_size.clone();
         let window_size_fut = self
             .window_size_fut
@@ -95,7 +117,7 @@ where
                 if *window_size > 0 {
                     self.notify.notify_one();
                 }
-                Poll::Ready(w)
+                Poll::Ready(Ok(w))
             }
             Err(_) => {
                 drop(window_size);
@@ -111,8 +133,11 @@ where
         &mut self,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<(ChannelMsg, NonZeroUsize)> {
-        let writable = ready!(self.poll_writable(cx, buf.len()));
+    ) -> Poll<io::Result<(ChannelMsg, NonZeroUsize)>> {
+        let writable = match ready!(self.poll_writable(cx, buf.len())) {
+            Ok(writable) => writable,
+            Err(err) => return Poll::Ready(Err(err)),
+        };
 
         #[allow(clippy::indexing_slicing)] // Clamped to maximum `buf.len()` with `.poll_writable`
         let data = Bytes::copy_from_slice(&buf[..writable.into()]);
@@ -122,7 +147,7 @@ where
             Some(ext) => ChannelMsg::ExtendedData { data, ext },
         };
 
-        Poll::Ready((msg, writable))
+        Poll::Ready(Ok((msg, writable)))
     }
 
     fn activate(&mut self, msg: ChannelMsg, writable: usize) -> &mut OwnedPermitFuture<S> {
@@ -169,7 +194,10 @@ where
         let send_fut = if let Some(x) = self.send_fut.as_mut() {
             x
         } else {
-            let (msg, writable) = ready!(self.poll_mk_msg(cx, buf));
+            let (msg, writable) = match ready!(self.poll_mk_msg(cx, buf)) {
+                Ok(pair) => pair,
+                Err(err) => return Poll::Ready(Err(err)),
+            };
             self.activate(msg, writable.into())
         };
         let r = ready!(send_fut.as_mut().poll_unpin(cx));

@@ -14,7 +14,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -140,6 +140,34 @@ const PARAMS_GRACE: Duration = Duration::from_secs(5);
 /// connection is wedged-but-TCP-alive would otherwise leave the substream-open
 /// pending until the provider's own 60 s reaper fires.
 const SSH_DIRECT_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Consecutive unanswered `forwarded-tcpip` channel-opens (each already
+/// [`ssh_open_timeout`]-bounded) after which the whole SSH session is
+/// force-evicted (I-SSH10). 2 keeps the self-heal prompt (~2×15 s worst
+/// case, and a browser's parallel requests trip it in one wave) while a
+/// single flukey open — e.g. one lost to a mid-rekey stall — never kills a
+/// healthy session on its own.
+const SSH_OPEN_TIMEOUT_EVICT: u32 = 2;
+
+/// [`SSH_DIRECT_OPEN_TIMEOUT`] with a test-only override
+/// (`BORE_SSH_OPEN_TIMEOUT_MS`), read per call so a test harness can set it
+/// after startup. Applied to EVERY server-initiated `forwarded-tcpip` open
+/// (vhost/secret via [`SshOpener::open`], public via [`run_public_forward`]):
+/// RFC 4254 has no deadline for `CHANNEL_OPEN` replies, and a
+/// wedged-but-TCP-alive OpenSSH client (frozen process, half-dead NAT path
+/// still ACKing, forwarding leg jammed) that also answers keepalives keeps
+/// the reaper at bay — without this bound every proxied connection sits in
+/// `pending` forever, holding its `--max-conns` permit (the field symptom:
+/// stalled pages that only a manual ssh restart healed).
+fn ssh_open_timeout() -> Duration {
+    match std::env::var("BORE_SSH_OPEN_TIMEOUT_MS") {
+        Ok(ms) => match ms.parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => SSH_DIRECT_OPEN_TIMEOUT,
+        },
+        Err(_) => SSH_DIRECT_OPEN_TIMEOUT,
+    }
+}
 
 /// Informational (never channel-closing — see `shell_request`) line written
 /// when a client's implicit shell request arrives with nothing established
@@ -378,6 +406,26 @@ impl SshGateway {
             // clamped to `>= SSH_MIN_WINDOW_SIZE` in `new`.
             window_size: self.config.window_size,
             maximum_packet_size: SSH_MAX_PACKET_SIZE,
+            // Diagnostic overrides (undocumented, default = russh's RFC 4253
+            // §9 values: 1 GiB / 1 h): lower the rekey thresholds via env to
+            // exercise rekey behavior deterministically in tests/field
+            // debugging (e.g. BORE_SSH_REKEY_BYTES=1000000,
+            // BORE_SSH_REKEY_SECS=30).
+            limits: {
+                let mut limits = russh::Limits::default();
+                if let Ok(v) = std::env::var("BORE_SSH_REKEY_BYTES") {
+                    if let Ok(n) = v.parse::<usize>() {
+                        limits.rekey_write_limit = n;
+                        limits.rekey_read_limit = n;
+                    }
+                }
+                if let Ok(v) = std::env::var("BORE_SSH_REKEY_SECS") {
+                    if let Ok(n) = v.parse::<u64>() {
+                        limits.rekey_time_limit = std::time::Duration::from_secs(n);
+                    }
+                }
+                limits
+            },
             ..Default::default()
         })
     }
@@ -405,9 +453,27 @@ impl SshGateway {
     ) -> Result<(), russh::Error> {
         let config = self.russh_config();
         let handler = self.handler(addr);
-        russh::server::run_stream(config, stream, handler)
-            .await?
-            .await
+        // Eviction watch (I-SSH10): this is the only strong `ConnState`
+        // reference outside the handler itself, and it lives exactly as long
+        // as the session future below — no I-SSH3-style cycle.
+        let state = Arc::clone(&handler.state);
+        let mut session = russh::server::run_stream(config, stream, handler).await?;
+        tokio::select! {
+            result = &mut session => result,
+            () = state.evicted_wait() => {
+                // Hard abort, deliberately not `Handle::disconnect`: a
+                // wedged session's dispatch loop (the reason we are evicting)
+                // would never process the polite message. Aborting drops the
+                // socket + channel map; blocked writers wake via the
+                // vendored `WindowSizeRef::close`, and every forward unwinds
+                // through `Drop for ConnState`'s RAII teardown. An
+                // autossh-managed client reconnects and re-establishes the
+                // tunnel — the manual "restart the ssh client" fix, automated.
+                session.abort();
+                warn!(%addr, "ssh-gateway: session evicted after consecutive channel-open timeouts (I-SSH10)");
+                Ok(())
+            }
+        }
     }
 }
 
@@ -786,7 +852,12 @@ impl GatewayHandler {
                 TakeoverOutcome::Proceed => {}
             }
 
-            let opener = SshOpener::new(ssh_handle.clone(), connected_address, port);
+            let opener = SshOpener::new(
+                ssh_handle.clone(),
+                connected_address,
+                port,
+                Arc::downgrade(&state),
+            );
             let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Ssh(Arc::new(opener))));
             let entry = Arc::new(VhostEntry {
                 pool: Arc::clone(&pool),
@@ -1044,7 +1115,12 @@ impl GatewayHandler {
                 TakeoverOutcome::Proceed => {}
             }
 
-            let opener = SshOpener::new(ssh_handle.clone(), connected_address, port);
+            let opener = SshOpener::new(
+                ssh_handle.clone(),
+                connected_address,
+                port,
+                Arc::downgrade(&state),
+            );
             let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Ssh(Arc::new(opener))));
             match gateway.providers.entry(id.clone()) {
                 Entry::Occupied(_) => {
@@ -1275,6 +1351,23 @@ struct ConnState {
     /// parity, see `secret::serve_consumer`'s `carrier` handling). Dropped
     /// (removing the admin rows) along with the rest of `ConnState`.
     secret_consumers: Mutex<HashMap<String, Arc<ConsumerEntry>>>,
+    /// Consecutive `forwarded-tcpip` channel-open *timeouts* on this
+    /// session (I-SSH10). An open that the client ANSWERS — success or
+    /// explicit `ChannelOpenFailure` — resets it: an answering client is
+    /// healthy even if its local destination is down. Only a client that
+    /// leaves opens unanswered past [`ssh_open_timeout`] counts; at
+    /// [`SSH_OPEN_TIMEOUT_EVICT`] the session is force-evicted so a
+    /// reconnect-managed client (autossh) re-establishes a working tunnel
+    /// instead of serving `pending` forever off a wedged session.
+    open_timeouts: AtomicU32,
+    /// Set by [`ConnState::evict`]; observed by `serve_connection`, which
+    /// hard-drops the whole russh session future (socket included). A
+    /// polite `Handle::disconnect` would travel through the same session
+    /// dispatch loop that is presumed wedged — the hard drop is the point.
+    evicted: AtomicBool,
+    /// Wakes `serve_connection`'s eviction arm. Paired with `evicted` so a
+    /// notify that fires before the waiter registers is never lost.
+    evict_notify: tokio::sync::Notify,
 }
 
 /// One SSH session's live admin entry for a secret id it consumes, shared by
@@ -1310,6 +1403,40 @@ impl ConnState {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
+    }
+
+    /// Records one `forwarded-tcpip` open that hit [`ssh_open_timeout`]
+    /// unanswered; returns the consecutive count so far (I-SSH10).
+    fn record_open_timeout(&self) -> u32 {
+        self.open_timeouts.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The client answered an open (success or explicit rejection): the
+    /// session's dispatch loop is alive, reset the consecutive counter.
+    fn record_open_answered(&self) {
+        self.open_timeouts.store(0, Ordering::SeqCst);
+    }
+
+    /// Force-evict this session: `serve_connection` drops the russh session
+    /// future outright (socket included), so every forward unwinds through
+    /// the normal RAII teardown and a reconnect-managed client (autossh)
+    /// builds a fresh, working session. Idempotent.
+    fn evict(&self) {
+        self.evicted.store(true, Ordering::SeqCst);
+        self.evict_notify.notify_waiters();
+        self.evict_notify.notify_one();
+    }
+
+    /// Resolves once [`ConnState::evict`] has been called (immediately if it
+    /// already was). The flag + re-check loop makes a notify that fires
+    /// between the flag check and `notified().await` impossible to miss.
+    async fn evicted_wait(&self) {
+        loop {
+            if self.evicted.load(Ordering::SeqCst) {
+                return;
+            }
+            self.evict_notify.notified().await;
+        }
     }
 
     /// Records the session channel this connection opened, so later calls to
@@ -1807,6 +1934,10 @@ impl Handler for GatewayHandler {
             }) {
                 state.deliver(&ssh_handle, line).await;
             }
+            // Weak (never a strong clone — see the `drop(state)` comment
+            // above) handle for I-SSH10 open-health accounting inside the
+            // accept loop.
+            let state_weak = Arc::downgrade(&state);
             drop(state);
             let tunnel_opts = crate::shared::TunnelOptions {
                 https: params.https,
@@ -1865,6 +1996,7 @@ impl Handler for GatewayHandler {
                 tunnel_opts,
                 gateway.tls.clone(),
                 gateway.bind_domain.clone(),
+                state_weak,
             )
             .await;
         });
@@ -2336,6 +2468,7 @@ async fn run_public_forward(
     tunnel_opts: crate::shared::TunnelOptions,
     tls: Option<tokio_rustls::TlsAcceptor>,
     bind_domain: Option<String>,
+    state: Weak<ConnState>,
 ) {
     let _registration = registration;
     loop {
@@ -2392,15 +2525,54 @@ async fn run_public_forward(
             }
         };
 
-        let ssh_channel = match ssh_handle
-            .channel_open_forwarded_tcpip(
+        // Bounded like every other server-initiated open (I-SSH10): RFC 4254
+        // has no CHANNEL_OPEN reply deadline, and this open is deliberately
+        // awaited INLINE (see the function doc) — unbounded, a single
+        // wedged-but-TCP-alive client would freeze this accept loop, i.e.
+        // every future connection to this public port, not just this one.
+        let opened = timeout(
+            ssh_open_timeout(),
+            ssh_handle.channel_open_forwarded_tcpip(
                 connected_address.clone(),
                 u32::from(connected_port),
                 addr.ip().to_string(),
                 u32::from(addr.port()),
-            )
-            .await
-        {
+            ),
+        )
+        .await;
+        let opened = match opened {
+            Ok(result) => {
+                // Any reply (even a rejection) proves the dispatch loop is
+                // alive — reset the consecutive-timeout counter.
+                if let Some(state) = state.upgrade() {
+                    state.record_open_answered();
+                }
+                result
+            }
+            Err(_) => {
+                if let Some(state) = state.upgrade() {
+                    let strikes = state.record_open_timeout();
+                    if strikes >= SSH_OPEN_TIMEOUT_EVICT {
+                        warn!(
+                            strikes,
+                            timeout_ms = ssh_open_timeout().as_millis() as u64,
+                            "ssh-gateway: consecutive channel-open timeouts on public forward; evicting wedged session (I-SSH10)"
+                        );
+                        state.evict();
+                        // The session is being torn down; this forward task
+                        // dies with it (Drop for ConnState aborts it).
+                        return;
+                    }
+                    warn!(
+                        strikes,
+                        timeout_ms = ssh_open_timeout().as_millis() as u64,
+                        "ssh-gateway: public forwarded-tcpip channel-open timed out; dropping this connection"
+                    );
+                }
+                continue;
+            }
+        };
+        let ssh_channel = match opened {
             Ok(channel) => channel,
             // `ChannelOpenFailure` (SSH_MSG_CHANNEL_OPEN_FAILURE) is the
             // peer explicitly rejecting THIS ONE channel — most commonly
@@ -2460,14 +2632,28 @@ struct SshOpener {
     handle: Handle,
     connected_address: String,
     connected_port: u16,
+    /// This SSH session's [`ConnState`], for I-SSH10 open-health accounting
+    /// (consecutive-timeout counter + eviction). `Weak`, NEVER `Arc`: this
+    /// opener lives inside the registry entry (`VhostEntry`/provider pool),
+    /// which stays alive until the forward task is aborted — and the forward
+    /// task is aborted by `Drop for ConnState`. A strong reference here
+    /// would be exactly the I-SSH3 reference cycle (state keeps itself
+    /// alive), resurrecting the zombie-forward bug.
+    state: Weak<ConnState>,
 }
 
 impl SshOpener {
-    fn new(handle: Handle, connected_address: String, connected_port: u16) -> Self {
+    fn new(
+        handle: Handle,
+        connected_address: String,
+        connected_port: u16,
+        state: Weak<ConnState>,
+    ) -> Self {
         Self {
             handle,
             connected_address,
             connected_port,
+            state,
         }
     }
 }
@@ -2483,17 +2669,57 @@ impl mux::ChannelOpen for SshOpener {
         let handle = self.handle.clone();
         let connected_address = self.connected_address.clone();
         let connected_port = self.connected_port;
+        let state = self.state.clone();
         Box::pin(async move {
-            let channel = handle
-                .channel_open_forwarded_tcpip(
+            // RFC 4254 puts no deadline on a CHANNEL_OPEN reply, so bound it
+            // here (I-SSH10): a wedged-but-TCP-alive client would otherwise
+            // leave this — and the proxied connection awaiting it — pending
+            // forever, holding a `--max-conns` permit the whole time.
+            let opened = timeout(
+                ssh_open_timeout(),
+                handle.channel_open_forwarded_tcpip(
                     connected_address,
                     u32::from(connected_port),
                     originator_ip,
                     0,
-                )
-                .await
-                .map_err(io::Error::other)?;
-            Ok(Box::new(channel.into_stream()) as mux::LinkStream)
+                ),
+            )
+            .await;
+            match opened {
+                Ok(result) => {
+                    // Any reply — even an explicit rejection because the
+                    // client's local service is down/restarting — proves the
+                    // session dispatch loop is alive.
+                    if let Some(state) = state.upgrade() {
+                        state.record_open_answered();
+                    }
+                    let channel = result.map_err(io::Error::other)?;
+                    Ok(Box::new(channel.into_stream()) as mux::LinkStream)
+                }
+                Err(_) => {
+                    if let Some(state) = state.upgrade() {
+                        let strikes = state.record_open_timeout();
+                        if strikes >= SSH_OPEN_TIMEOUT_EVICT {
+                            warn!(
+                                strikes,
+                                timeout_ms = ssh_open_timeout().as_millis() as u64,
+                                "ssh-gateway: consecutive channel-open timeouts; evicting wedged session (I-SSH10)"
+                            );
+                            state.evict();
+                        } else {
+                            warn!(
+                                strikes,
+                                timeout_ms = ssh_open_timeout().as_millis() as u64,
+                                "ssh-gateway: forwarded-tcpip channel-open timed out"
+                            );
+                        }
+                    }
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "ssh channel open timed out",
+                    ))
+                }
+            }
         })
     }
 }

@@ -1,0 +1,356 @@
+diff --git a/crates/russh/Cargo.toml b/crates/russh/Cargo.toml
+index cfb95bb..9d2b56d 100644
+--- a/crates/russh/Cargo.toml
++++ b/crates/russh/Cargo.toml
+@@ -9,6 +9,11 @@
+ # will likely look very different (and much more reasonable).
+ # See Cargo.toml.orig for the original contents.
+ 
++# Detach from the parent bore workspace so `cargo test` runs standalone in
++# this directory (the parent consumes this crate via [patch.crates-io], not
++# as a workspace member).
++[workspace]
++
+ [package]
+ edition = "2024"
+ rust-version = "1.85"
+diff --git a/crates/russh/src/channels/channel_ref.rs b/crates/russh/src/channels/channel_ref.rs
+index d7f937c..afc4fea 100644
+--- a/crates/russh/src/channels/channel_ref.rs
++++ b/crates/russh/src/channels/channel_ref.rs
+@@ -24,6 +24,20 @@ impl ChannelRef {
+     }
+ }
+ 
++/// The session's channel map holds the only `ChannelRef`; it is dropped
++/// exactly when the channel is torn down (peer CHANNEL_CLOSE processed by
++/// `ChannelBacklog::close_with`/`drain`, or the whole session ending). A
++/// writer (`ChannelTx`, `ChannelWriteHalf::send_bytes`) parked on the window
++/// notifier would otherwise never wake — the peer of a closed channel sends
++/// no further WINDOW_ADJUST — wedging its task forever (observed as leaked
++/// proxied-connection splices in bore's ssh-gateway). Closing here reaches
++/// every teardown path with a single hook.
++impl Drop for ChannelRef {
++    fn drop(&mut self) {
++        self.window_size.close();
++    }
++}
++
+ impl std::ops::Deref for ChannelRef {
+     type Target = Sender<ChannelMsg>;
+ 
+diff --git a/crates/russh/src/channels/io/tx.rs b/crates/russh/src/channels/io/tx.rs
+index 7b8a56f..06b3775 100644
+--- a/crates/russh/src/channels/io/tx.rs
++++ b/crates/russh/src/channels/io/tx.rs
+@@ -4,6 +4,7 @@ use std::io;
+ use std::num::NonZeroUsize;
+ use std::ops::DerefMut;
+ use std::pin::Pin;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::Arc;
+ use std::task::{ready, Context, Poll};
+ 
+@@ -50,6 +51,11 @@ pub struct ChannelTx<S> {
+     window_size: Arc<Mutex<u32>>,
+     notify: Arc<Notify>,
+     window_size_notication: WatchNotification,
++    /// Channel-closed flag shared with the session's `WindowSizeRef` (set by
++    /// `WindowSizeRef::close` when the `ChannelRef` is torn down). A closed
++    /// channel never receives another WINDOW_ADJUST, so a writer waiting for
++    /// window credit must fail instead of parking forever.
++    closed: Arc<AtomicBool>,
+     max_packet_size: u32,
+     ext: Option<u32>,
+ }
+@@ -58,11 +64,13 @@ impl<S> ChannelTx<S>
+ where
+     S: From<(ChannelId, ChannelMsg)> + 'static + Send,
+ {
++    #[allow(clippy::too_many_arguments)]
+     pub fn new(
+         sender: mpsc::Sender<S>,
+         id: ChannelId,
+         window_size: Arc<Mutex<u32>>,
+         window_size_notification: Arc<Notify>,
++        closed: Arc<AtomicBool>,
+         max_packet_size: u32,
+         ext: Option<u32>,
+     ) -> Self {
+@@ -74,12 +82,26 @@ where
+             window_size_notication: WatchNotification::new(window_size_notification),
+             window_size,
+             window_size_fut: None,
++            closed,
+             max_packet_size,
+             ext,
+         }
+     }
+ 
+-    fn poll_writable(&mut self, cx: &mut Context<'_>, buf_len: usize) -> Poll<NonZeroUsize> {
++    fn poll_writable(
++        &mut self,
++        cx: &mut Context<'_>,
++        buf_len: usize,
++    ) -> Poll<io::Result<NonZeroUsize>> {
++        if self.closed.load(Ordering::SeqCst) {
++            // Re-notify so a sibling writer parked on the same notifier also
++            // observes the close (a stored permit is single-consumer).
++            self.notify.notify_one();
++            return Poll::Ready(Err(io::Error::new(
++                io::ErrorKind::BrokenPipe,
++                "channel closed",
++            )));
++        }
+         let window_size = self.window_size.clone();
+         let window_size_fut = self
+             .window_size_fut
+@@ -95,7 +117,7 @@ where
+                 if *window_size > 0 {
+                     self.notify.notify_one();
+                 }
+-                Poll::Ready(w)
++                Poll::Ready(Ok(w))
+             }
+             Err(_) => {
+                 drop(window_size);
+@@ -111,8 +133,11 @@ where
+         &mut self,
+         cx: &mut Context<'_>,
+         buf: &[u8],
+-    ) -> Poll<(ChannelMsg, NonZeroUsize)> {
+-        let writable = ready!(self.poll_writable(cx, buf.len()));
++    ) -> Poll<io::Result<(ChannelMsg, NonZeroUsize)>> {
++        let writable = match ready!(self.poll_writable(cx, buf.len())) {
++            Ok(writable) => writable,
++            Err(err) => return Poll::Ready(Err(err)),
++        };
+ 
+         #[allow(clippy::indexing_slicing)] // Clamped to maximum `buf.len()` with `.poll_writable`
+         let data = Bytes::copy_from_slice(&buf[..writable.into()]);
+@@ -122,7 +147,7 @@ where
+             Some(ext) => ChannelMsg::ExtendedData { data, ext },
+         };
+ 
+-        Poll::Ready((msg, writable))
++        Poll::Ready(Ok((msg, writable)))
+     }
+ 
+     fn activate(&mut self, msg: ChannelMsg, writable: usize) -> &mut OwnedPermitFuture<S> {
+@@ -169,7 +194,10 @@ where
+         let send_fut = if let Some(x) = self.send_fut.as_mut() {
+             x
+         } else {
+-            let (msg, writable) = ready!(self.poll_mk_msg(cx, buf));
++            let (msg, writable) = match ready!(self.poll_mk_msg(cx, buf)) {
++                Ok(pair) => pair,
++                Err(err) => return Poll::Ready(Err(err)),
++            };
+             self.activate(msg, writable.into())
+         };
+         let r = ready!(send_fut.as_mut().poll_unpin(cx));
+diff --git a/crates/russh/src/channels/mod.rs b/crates/russh/src/channels/mod.rs
+index 8375aee..5b6deb3 100644
+--- a/crates/russh/src/channels/mod.rs
++++ b/crates/russh/src/channels/mod.rs
+@@ -1,4 +1,5 @@
+ use std::collections::{HashMap, VecDeque};
++use std::sync::atomic::AtomicBool;
+ use std::sync::Arc;
+ 
+ use bytes::Bytes;
+@@ -119,6 +120,11 @@ pub enum ChannelMsg {
+ pub(crate) struct WindowSizeRef {
+     value: Arc<Mutex<u32>>,
+     notifier: Arc<Notify>,
++    /// Set once the channel is gone (peer CHANNEL_CLOSE processed, or the
++    /// session dropped its [`ChannelRef`]). Writers blocked waiting for
++    /// window credit are woken and must fail instead of parking forever —
++    /// nothing will ever adjust the window of a closed channel.
++    closed: Arc<AtomicBool>,
+ }
+ 
+ impl WindowSizeRef {
+@@ -127,6 +133,7 @@ impl WindowSizeRef {
+         Self {
+             value: Arc::new(Mutex::new(initial)),
+             notifier,
++            closed: Arc::new(AtomicBool::new(false)),
+         }
+     }
+ 
+@@ -138,6 +145,26 @@ impl WindowSizeRef {
+     pub(crate) fn subscribe(&self) -> Arc<Notify> {
+         Arc::clone(&self.notifier)
+     }
++
++    /// Marks the channel closed and wakes every writer parked on the window
++    /// notifier. `notify_waiters` only reaches currently-registered waiters,
++    /// so also leave one stored permit for a writer that races its
++    /// registration past this call; woken writers re-notify in turn (see
++    /// `ChannelTx::poll_writable`), so a stored permit is never consumed
++    /// without the close being observed.
++    pub(crate) fn close(&self) {
++        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
++        self.notifier.notify_waiters();
++        self.notifier.notify_one();
++    }
++
++    pub(crate) fn is_closed(&self) -> bool {
++        self.closed.load(std::sync::atomic::Ordering::SeqCst)
++    }
++
++    pub(crate) fn closed_flag(&self) -> Arc<AtomicBool> {
++        Arc::clone(&self.closed)
++    }
+ }
+ 
+ /// A handle to the reading part of a session channel.
+@@ -396,6 +423,12 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
+             return Err(Error::Inconsistent);
+         }
+         loop {
++            // A closed channel's window is never adjusted again — fail
++            // instead of parking forever (see `WindowSizeRef::close`).
++            if self.window_size.is_closed() {
++                self.window_size.notifier.notify_one();
++                return Err(Error::SendError);
++            }
+             let mut window_size = self.window_size.value.lock().await;
+             let writable = (self.max_packet_size as usize)
+                 .min(*window_size as usize)
+@@ -468,6 +501,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
+             self.id,
+             self.window_size.value.clone(),
+             self.window_size.subscribe(),
++            self.window_size.closed_flag(),
+             self.max_packet_size,
+             ext,
+         )
+@@ -698,6 +732,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
+                 self.write_half.id,
+                 self.write_half.window_size.value.clone(),
+                 self.write_half.window_size.subscribe(),
++                self.write_half.window_size.closed_flag(),
+                 self.write_half.max_packet_size,
+                 None,
+             ),
+@@ -985,6 +1020,57 @@ mod tests {
+         }
+     }
+ 
++    #[tokio::test]
++    async fn data_bytes_window_wait_errors_on_close() {
++        // A writer parked on a zero window must WAKE AND FAIL when the
++        // channel closes (peer CHANNEL_CLOSE / session teardown drops the
++        // ChannelRef) — nothing will ever adjust a closed channel's window,
++        // so without the close-wake the task wedges forever (the bore
++        // ssh-gateway leaked proxied-connection splices exactly this way).
++        let window_size = WindowSizeRef::new(0);
++        let (write_half, mut receiver) = test_write_half(window_size.clone(), 1024);
++        let send = tokio::spawn(async move {
++            write_half.data_bytes(Bytes::from_static(b"never-sent")).await
++        });
++
++        tokio::task::yield_now().await;
++        assert!(!send.is_finished());
++
++        window_size.close();
++        let result = tokio::time::timeout(std::time::Duration::from_secs(5), send)
++            .await
++            .expect("blocked writer must wake on close")
++            .unwrap();
++        assert!(matches!(result, Err(Error::SendError)));
++        assert!(receiver.try_recv().is_err());
++    }
++
++    #[tokio::test]
++    async fn channel_tx_window_wait_errors_on_channel_ref_drop() {
++        use tokio::io::AsyncWriteExt;
++
++        // Full-stack variant: Channel::new pairs a Channel with its
++        // ChannelRef (as the session map holds it); dropping the ChannelRef
++        // must fail a `make_writer` write blocked on the window.
++        let (sender, _receiver) = mpsc::channel::<(ChannelId, ChannelMsg)>(8);
++        let drain_notify = Arc::new(Notify::new());
++        let (channel, channel_ref) = Channel::new(ChannelId(9), sender, 1024, 0, 8, drain_notify);
++
++        let mut writer = channel.make_writer();
++        let write = tokio::spawn(async move { writer.write_all(b"never-sent").await });
++
++        tokio::task::yield_now().await;
++        assert!(!write.is_finished());
++
++        drop(channel_ref);
++        let result = tokio::time::timeout(std::time::Duration::from_secs(5), write)
++            .await
++            .expect("blocked ChannelTx must wake on ChannelRef drop")
++            .unwrap();
++        let err = result.expect_err("write on closed channel must fail");
++        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
++    }
++
+     #[tokio::test]
+     async fn data_bytes_rejects_zero_max_packet_size() {
+         let (write_half, mut receiver) = test_write_half(WindowSizeRef::new(1024), 0);
+diff --git a/crates/russh/src/server/mod.rs b/crates/russh/src/server/mod.rs
+index 9984b80..f2cbdea 100644
+--- a/crates/russh/src/server/mod.rs
++++ b/crates/russh/src/server/mod.rs
+@@ -40,7 +40,6 @@ use client::GexParams;
+ use futures::future::Future;
+ use log::{debug, error, info, warn};
+ use msg::{is_kex_msg, validate_client_msg_strict_kex};
+-use russh_util::runtime::JoinHandle;
+ use russh_util::time::Instant;
+ use ssh_key::{Certificate, PrivateKey};
+ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+@@ -1028,7 +1027,9 @@ async fn start_reading<R: AsyncRead + Unpin>(
+ /// Implements [Future] and can be awaited to wait for the session to finish.
+ pub struct RunningSession<H: Handler> {
+     handle: Handle,
+-    join: JoinHandle<Result<(), H::Error>>,
++    // tokio's JoinHandle (not russh_util's oneshot-based wrapper), so
++    // `RunningSession::abort` can actually kill the spawned task.
++    join: tokio::task::JoinHandle<Result<(), H::Error>>,
+ }
+ 
+ impl<H: Handler> RunningSession<H> {
+@@ -1036,6 +1037,17 @@ impl<H: Handler> RunningSession<H> {
+     pub fn handle(&self) -> Handle {
+         self.handle.clone()
+     }
++
++    /// Hard-aborts the spawned session task: the connection socket is
++    /// dropped without a DISCONNECT exchange and every channel unwinds
++    /// (waking blocked writers via `WindowSizeRef::close`). This is the only
++    /// teardown that works against a fully wedged session — a polite
++    /// `Handle::disconnect` travels through the same dispatch loop that may
++    /// be stuck (e.g. flushing to a zero-window peer), and dropping this
++    /// `RunningSession` alone does NOT stop the spawned task.
++    pub fn abort(&self) {
++        self.join.abort();
++    }
+ }
+ 
+ impl<H: Handler> Future for RunningSession<H> {
+@@ -1044,7 +1056,9 @@ impl<H: Handler> Future for RunningSession<H> {
+         match Future::poll(Pin::new(&mut self.join), cx) {
+             Poll::Ready(r) => Poll::Ready(match r {
+                 Ok(Ok(x)) => Ok(x),
+-                Err(e) => Err(crate::Error::from(e).into()),
++                Err(_join_error) => {
++                    Err(crate::Error::Join(russh_util::runtime::JoinError).into())
++                }
+                 Ok(Err(e)) => Err(e),
+             }),
+             Poll::Pending => Poll::Pending,
+@@ -1094,7 +1108,7 @@ where
+ 
+     session.begin_rekey()?;
+ 
+-    let join = russh_util::runtime::spawn(session.run(stream, handler));
++    let join = tokio::spawn(session.run(stream, handler));
+ 
+     Ok(RunningSession { handle, join })
+ }

@@ -3039,3 +3039,203 @@ async fn t_ssh_warn_all_params_inapplicable_to_secret_provider() -> Result<()> {
     capture.child.kill().await.ok();
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// I-SSH10 — a wedged-but-TCP-alive OpenSSH client (frozen with SIGSTOP: the
+// kernel keeps ACKing, the process answers nothing) must not leave proxied
+// connections `pending` forever. Every server-initiated `forwarded-tcpip`
+// open is bounded by `ssh_open_timeout()`; after `SSH_OPEN_TIMEOUT_EVICT`
+// consecutive unanswered opens the whole session is force-evicted
+// (`RunningSession::abort`), freeing the vhost label / public port so a
+// reconnecting client (autossh in the field) re-establishes a WORKING tunnel
+// — the manual "restart the ssh client" fix, automated.
+// ---------------------------------------------------------------------------
+
+/// Polls the admin API until `needle` is ABSENT (tunnel torn down), 20s cap.
+async fn wait_admin_data_lacks(needle: &str) -> Result<String> {
+    let mut last = String::new();
+    for _ in 0..800 {
+        let s = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
+        last = http_get(s, "/admin/status/data", Some(TOKEN)).await?;
+        if !last.contains(needle) {
+            return Ok(last);
+        }
+        time::sleep(Duration::from_millis(25)).await;
+    }
+    anyhow::bail!("admin data still contained {needle:?} after timeout: {last}")
+}
+
+/// SIGSTOP/SIGCONT by pid via the coreutils `kill` binary (avoids a libc dep
+/// in the test crate). SIGSTOP cannot be caught or ignored: the ssh client
+/// stays frozen mid-protocol, its socket kernel-alive.
+fn signal_pid(pid: u32, sig: &str) -> Result<()> {
+    let status = std::process::Command::new("kill")
+        .arg(sig)
+        .arg(pid.to_string())
+        .status()?;
+    anyhow::ensure!(status.success(), "kill {sig} {pid} failed");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_i10_wedged_client_vhost_evicts_and_recovers() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+    // Shrink the per-open timeout so the test proves eviction in seconds,
+    // not 2×15s. Healthy opens answer in milliseconds, so this cannot
+    // destabilize the rest of this serial test binary.
+    std::env::set_var("BORE_SSH_OPEN_TIMEOUT_MS", "1500");
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    let http_port = free_port().await?;
+    let cfg = vhost_config("bore.sshtest", http_port, vec![]);
+    let gw_port = start_gateway_server_vhost(host_key, dir.path().to_path_buf(), cfg).await?;
+
+    let svc_port = spawn_http_stub("hello from i10").await?;
+    let raw_forward = format!("vhost/i10sub:0:127.0.0.1:{svc_port}");
+
+    let mut child = Command::new("ssh")
+        .args(ssh_args_raw(
+            gw_port,
+            &client_priv,
+            std::slice::from_ref(&raw_forward),
+            None,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh (I-SSH10 vhost)")?;
+
+    wait_admin_data_contains("i10sub").await?;
+    let resp = send_http(http_port, "i10sub.bore.sshtest", "/").await?;
+    assert!(
+        resp.contains("hello from i10"),
+        "baseline request through the healthy tunnel must succeed: {resp}"
+    );
+
+    // Freeze the client: TCP stays established (kernel ACKs), but every
+    // forwarded-tcpip CHANNEL_OPEN from now on goes unanswered.
+    let pid = child.id().context("ssh child pid")?;
+    signal_pid(pid, "-STOP")?;
+
+    // Two consecutive unanswered opens (SSH_OPEN_TIMEOUT_EVICT) — each
+    // bounded by the 1.5s override; the caller sees a fast clean close, not
+    // an indefinite `pending`.
+    for i in 0..2 {
+        let started = time::Instant::now();
+        let resp = send_http(http_port, "i10sub.bore.sshtest", "/").await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "request {i} against the wedged tunnel must fail fast (bounded open), took {elapsed:?}"
+        );
+        if let Ok(body) = resp {
+            assert!(
+                !body.contains("hello from i10"),
+                "request {i} cannot have been served by a frozen client: {body}"
+            );
+        }
+    }
+
+    // The session must be evicted: vhost registration (and admin row) gone.
+    wait_admin_data_lacks("i10sub").await?;
+
+    // Self-heal: a fresh client (autossh's reconnect, simulated) re-registers
+    // the same label and serves traffic again.
+    signal_pid(pid, "-CONT").ok();
+    child.kill().await.ok();
+    let mut child2 = Command::new("ssh")
+        .args(ssh_args_raw(gw_port, &client_priv, &[raw_forward], None))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh reconnect (I-SSH10 vhost)")?;
+    wait_admin_data_contains("i10sub").await?;
+    let resp = send_http(http_port, "i10sub.bore.sshtest", "/").await?;
+    assert!(
+        resp.contains("hello from i10"),
+        "reconnected tunnel must serve traffic again: {resp}"
+    );
+
+    child2.kill().await.ok();
+    std::env::remove_var("BORE_SSH_OPEN_TIMEOUT_MS");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_i10_wedged_client_public_evicts_and_frees_port() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+    std::env::set_var("BORE_SSH_OPEN_TIMEOUT_MS", "1500");
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+    let gw_port = start_gateway_server(host_key, dir.path().to_path_buf()).await?;
+
+    let echo_port = spawn_echo_service().await?;
+    let bind_port = free_port().await?;
+
+    let mut child = Command::new("ssh")
+        .args(ssh_args(
+            gw_port,
+            &client_priv,
+            &[(bind_port, echo_port)],
+            None,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh (I-SSH10 public)")?;
+
+    wait_port(bind_port, true).await;
+    assert!(
+        roundtrip(bind_port, b"i10-baseline").await?,
+        "baseline roundtrip through the healthy public forward must succeed"
+    );
+
+    let pid = child.id().context("ssh child pid")?;
+    signal_pid(pid, "-STOP")?;
+
+    // Two unanswered inline opens: each is bounded, the accept loop is NOT
+    // frozen past the timeout, and the second strike evicts the session.
+    for _ in 0..2 {
+        let started = time::Instant::now();
+        let _ = time::timeout(Duration::from_secs(10), roundtrip(bind_port, b"x")).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "wedged public forward must fail fast, not hang the accept loop"
+        );
+    }
+
+    // Eviction frees the bound public port (RAII teardown of the forward).
+    let deadline = time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if TcpStream::connect(("127.0.0.1", bind_port)).await.is_err() {
+            break;
+        }
+        anyhow::ensure!(
+            time::Instant::now() < deadline,
+            "public bind port should be released after eviction"
+        );
+        time::sleep(Duration::from_millis(50)).await;
+    }
+
+    signal_pid(pid, "-CONT").ok();
+    child.kill().await.ok();
+    std::env::remove_var("BORE_SSH_OPEN_TIMEOUT_MS");
+    Ok(())
+}

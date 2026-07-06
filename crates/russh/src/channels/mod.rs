@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -119,6 +120,11 @@ pub enum ChannelMsg {
 pub(crate) struct WindowSizeRef {
     value: Arc<Mutex<u32>>,
     notifier: Arc<Notify>,
+    /// Set once the channel is gone (peer CHANNEL_CLOSE processed, or the
+    /// session dropped its [`ChannelRef`]). Writers blocked waiting for
+    /// window credit are woken and must fail instead of parking forever —
+    /// nothing will ever adjust the window of a closed channel.
+    closed: Arc<AtomicBool>,
 }
 
 impl WindowSizeRef {
@@ -127,6 +133,7 @@ impl WindowSizeRef {
         Self {
             value: Arc::new(Mutex::new(initial)),
             notifier,
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -137,6 +144,26 @@ impl WindowSizeRef {
 
     pub(crate) fn subscribe(&self) -> Arc<Notify> {
         Arc::clone(&self.notifier)
+    }
+
+    /// Marks the channel closed and wakes every writer parked on the window
+    /// notifier. `notify_waiters` only reaches currently-registered waiters,
+    /// so also leave one stored permit for a writer that races its
+    /// registration past this call; woken writers re-notify in turn (see
+    /// `ChannelTx::poll_writable`), so a stored permit is never consumed
+    /// without the close being observed.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notifier.notify_waiters();
+        self.notifier.notify_one();
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn closed_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.closed)
     }
 }
 
@@ -396,6 +423,12 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
             return Err(Error::Inconsistent);
         }
         loop {
+            // A closed channel's window is never adjusted again — fail
+            // instead of parking forever (see `WindowSizeRef::close`).
+            if self.window_size.is_closed() {
+                self.window_size.notifier.notify_one();
+                return Err(Error::SendError);
+            }
             let mut window_size = self.window_size.value.lock().await;
             let writable = (self.max_packet_size as usize)
                 .min(*window_size as usize)
@@ -468,6 +501,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
             self.id,
             self.window_size.value.clone(),
             self.window_size.subscribe(),
+            self.window_size.closed_flag(),
             self.max_packet_size,
             ext,
         )
@@ -698,6 +732,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
                 self.write_half.id,
                 self.write_half.window_size.value.clone(),
                 self.write_half.window_size.subscribe(),
+                self.write_half.window_size.closed_flag(),
                 self.write_half.max_packet_size,
                 None,
             ),
@@ -983,6 +1018,57 @@ mod tests {
             }
             msg => panic!("unexpected message: {msg:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn data_bytes_window_wait_errors_on_close() {
+        // A writer parked on a zero window must WAKE AND FAIL when the
+        // channel closes (peer CHANNEL_CLOSE / session teardown drops the
+        // ChannelRef) — nothing will ever adjust a closed channel's window,
+        // so without the close-wake the task wedges forever (the bore
+        // ssh-gateway leaked proxied-connection splices exactly this way).
+        let window_size = WindowSizeRef::new(0);
+        let (write_half, mut receiver) = test_write_half(window_size.clone(), 1024);
+        let send = tokio::spawn(async move {
+            write_half.data_bytes(Bytes::from_static(b"never-sent")).await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!send.is_finished());
+
+        window_size.close();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), send)
+            .await
+            .expect("blocked writer must wake on close")
+            .unwrap();
+        assert!(matches!(result, Err(Error::SendError)));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn channel_tx_window_wait_errors_on_channel_ref_drop() {
+        use tokio::io::AsyncWriteExt;
+
+        // Full-stack variant: Channel::new pairs a Channel with its
+        // ChannelRef (as the session map holds it); dropping the ChannelRef
+        // must fail a `make_writer` write blocked on the window.
+        let (sender, _receiver) = mpsc::channel::<(ChannelId, ChannelMsg)>(8);
+        let drain_notify = Arc::new(Notify::new());
+        let (channel, channel_ref) = Channel::new(ChannelId(9), sender, 1024, 0, 8, drain_notify);
+
+        let mut writer = channel.make_writer();
+        let write = tokio::spawn(async move { writer.write_all(b"never-sent").await });
+
+        tokio::task::yield_now().await;
+        assert!(!write.is_finished());
+
+        drop(channel_ref);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), write)
+            .await
+            .expect("blocked ChannelTx must wake on ChannelRef drop")
+            .unwrap();
+        let err = result.expect_err("write on closed channel must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[tokio::test]

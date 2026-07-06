@@ -88,6 +88,46 @@ this vendored 0.62.1 tree). To move to a newer `russh`:
 1. Replace `crates/russh` with the new pristine crate source.
 2. `cd crates/russh && patch -p1 --fuzz=3 < ../../scripts/patches/russh-hol-730.diff`
    (or port by hand if the flow-control internals moved).
-3. Rebuild + run all three regression suites above.
-4. If upstream has since merged an equivalent fix, drop the vendored crate and
+3. Apply the second delta (close-wake + abort, section below): from the repo
+   root, `git apply scripts/patches/russh-close-wake-abort.diff` (paths in
+   that diff are repo-relative), or port by hand.
+4. Rebuild + run all three regression suites above (now incl. the I-SSH10
+   pair in `tests/ssh_gateway_test.rs`).
+5. If upstream has since merged an equivalent fix, drop the vendored crate and
    the `[patch.crates-io]` entry entirely and rely on the release.
+
+---
+
+## Second vendored delta (2026-07-06, I-SSH10): close-wake for blocked writers + abortable sessions
+
+Two further deviations from pristine 0.62.1, made for the bore ssh-gateway
+resilience fix (wedged-but-TCP-alive clients; see `CLAUDE.md` I-SSH10):
+
+1. **`WindowSizeRef.closed` + `close()` (`src/channels/mod.rs`,
+   `src/channels/channel_ref.rs`, `src/channels/io/tx.rs`).** A
+   `ChannelTx::poll_write` or `ChannelWriteHalf::send_bytes` parked on the
+   window `Notify` was never woken when the channel closed (peer
+   CHANNEL_CLOSE, session teardown, task abort) — nothing ever adjusts a
+   closed channel's window, so the writing task wedged forever.
+   `Drop for ChannelRef` (single owner: the session's channel map, so every
+   teardown path is covered by one hook) sets the shared `closed` flag and
+   wakes all waiters; writers then fail with `BrokenPipe` (io path) /
+   `Error::SendError` (`send_bytes`). Woken writers re-notify so a stored
+   single permit can never swallow the close for a sibling writer.
+   Units: `data_bytes_window_wait_errors_on_close`,
+   `channel_tx_window_wait_errors_on_channel_ref_drop`.
+
+2. **`RunningSession::abort()` (`src/server/mod.rs`).** `run_stream` SPAWNS
+   the session task; dropping the returned `RunningSession` future does NOT
+   stop it, and russh-util's oneshot-based `JoinHandle` discards the tokio
+   handle (no abort possible). The vendored `run_stream` now spawns with
+   `tokio::spawn` directly and keeps `tokio::task::JoinHandle`, exposing
+   `abort()` — the only teardown that works when the session dispatch loop
+   itself is wedged (e.g. flushing to a zero-window peer, where keepalives
+   are never sent and `keepalive_max` reaping is blind). Wasm builds are not
+   a bore target; this trades russh's wasm portability in `server::run_stream`
+   for abortability.
+
+Also: the vendored crate's `Cargo.toml` gained an empty `[workspace]` table so
+`cargo test --manifest-path crates/russh/Cargo.toml` runs standalone (the
+parent consumes the crate via `[patch.crates-io]`, not as a workspace member).

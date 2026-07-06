@@ -122,11 +122,26 @@ Vincoli da NON violare in interventi futuri (vedi anche CLAUDE.md, I-SSH9):
      | openssl s_client -quiet -verify_quiet -alpn h2,http/1.1 -connect <server>:443
    # atteso: risposta HTTP; MAI "SSH-2.0"
    ```
-2. **Pending senza banner?** Allora NON è questo bug. Sospetti successivi, in ordine:
+2. **Pending senza banner?** Allora NON è questo bug. **AGGIORNAMENTO 2026-07-06 (follow-up
+   report "stalla dopo riavvio dell'app"):** l'intera matrice riavvio-app è stata riprodotta
+   in locale su questo scenario (dufs reale + python, TLS/ALPN, keep-alive che attraversa il
+   riavvio, kill a metà download/upload, richieste durante il downtime, rekey client e server)
+   e il tunnel è risultato SEMPRE resiliente — il wedge richiede un peer che smette di
+   RISPONDERE mentre il TCP resta vivo (processo ssh congelato/laptop sospeso/percorso NAT
+   mezzo-morto). Quel wedge strutturale è stato chiuso con **I-SSH10** (vedi CLAUDE.md):
+   ogni `forwarded-tcpip` open ha timeout 15 s; 2 timeout consecutivi ⇒ eviction dura della
+   sessione (`RunningSession::abort`) ⇒ label/porta liberate ⇒ autossh riconnette da solo.
+   In più il russh vendorizzato ora sveglia+erra i writer bloccati sulla finestra quando il
+   canale muore (`WindowSizeRef::close`) — prima un upload verso un'app morta poteva
+   leakare task+permit per sempre. Se rivedi `pending` persistenti con versione ≥ questo fix:
+   guarda nel log server le righe `evicting wedged session (I-SSH10)` — se APPAIONO, il
+   self-heal sta lavorando e il problema è il client/rete; se NON appaiono, sospetti residui:
    a. finestra SSH lato OpenSSH client (~2 MiB per canale — limite noto, vedi memoria
       "SSH gateway throughput"); b. `--max-conns` esaurito (`conn_rejections` su
       `/admin/status`); c. buffer socket kernel (`BORE_SSH_SOCKBUF`); d. servizio locale
-      dietro il tunnel lento/saturato (verificare bypassando il tunnel).
+      dietro il tunnel lento/saturato (verificare bypassando il tunnel); e. dufs/app dietro
+      docker-proxy con backend morto (accetta e non risponde: dal punto di vista del tunnel
+      è un'app lenta — verificare con `curl 127.0.0.1:5000` locale).
 3. **Log utili lato server**: `warn` "TLS handshake failed", righe `ssh gateway` con esito
    connessione; su `/admin/status` controllare righe tunnel + TX/RX live.
 4. **Isolare il layer**: stesso servizio via tunnel nativo (`bore local`) sulla stessa

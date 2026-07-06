@@ -40,7 +40,6 @@ use client::GexParams;
 use futures::future::Future;
 use log::{debug, error, info, warn};
 use msg::{is_kex_msg, validate_client_msg_strict_kex};
-use russh_util::runtime::JoinHandle;
 use russh_util::time::Instant;
 use ssh_key::{Certificate, PrivateKey};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -1028,13 +1027,26 @@ async fn start_reading<R: AsyncRead + Unpin>(
 /// Implements [Future] and can be awaited to wait for the session to finish.
 pub struct RunningSession<H: Handler> {
     handle: Handle,
-    join: JoinHandle<Result<(), H::Error>>,
+    // tokio's JoinHandle (not russh_util's oneshot-based wrapper), so
+    // `RunningSession::abort` can actually kill the spawned task.
+    join: tokio::task::JoinHandle<Result<(), H::Error>>,
 }
 
 impl<H: Handler> RunningSession<H> {
     /// Returns a new handle for the session.
     pub fn handle(&self) -> Handle {
         self.handle.clone()
+    }
+
+    /// Hard-aborts the spawned session task: the connection socket is
+    /// dropped without a DISCONNECT exchange and every channel unwinds
+    /// (waking blocked writers via `WindowSizeRef::close`). This is the only
+    /// teardown that works against a fully wedged session — a polite
+    /// `Handle::disconnect` travels through the same dispatch loop that may
+    /// be stuck (e.g. flushing to a zero-window peer), and dropping this
+    /// `RunningSession` alone does NOT stop the spawned task.
+    pub fn abort(&self) {
+        self.join.abort();
     }
 }
 
@@ -1044,7 +1056,9 @@ impl<H: Handler> Future for RunningSession<H> {
         match Future::poll(Pin::new(&mut self.join), cx) {
             Poll::Ready(r) => Poll::Ready(match r {
                 Ok(Ok(x)) => Ok(x),
-                Err(e) => Err(crate::Error::from(e).into()),
+                Err(_join_error) => {
+                    Err(crate::Error::Join(russh_util::runtime::JoinError).into())
+                }
                 Ok(Err(e)) => Err(e),
             }),
             Poll::Pending => Poll::Pending,
@@ -1094,7 +1108,7 @@ where
 
     session.begin_rekey()?;
 
-    let join = russh_util::runtime::spawn(session.run(stream, handler));
+    let join = tokio::spawn(session.run(stream, handler));
 
     Ok(RunningSession { handle, join })
 }

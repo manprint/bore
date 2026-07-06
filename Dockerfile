@@ -29,6 +29,16 @@ FROM chef AS builder
 # (below) reuses this target dir; `cargo install` would build in a separate dir
 # and defeat the cache.
 COPY --from=planner /home/rust/src/recipe.json recipe.json
+# The vhost/ssh-gateway build pulls in `russh` via a `[patch.crates-io]` path
+# dependency on the vendored, HOL-patched copy in `crates/russh` (see
+# crates/russh/HOL_FIX.md). cargo-chef reconstructs skeletons for workspace
+# MEMBERS from the recipe, but a non-member patch-path crate is not
+# reconstructed, so `cook` needs its real source present to build it as a
+# dependency — otherwise: "failed to read crates/russh/Cargo.toml". Copying the
+# whole `crates/` dir also covers the (linux-inert, target-gated) wintun/android
+# path crates. This only busts the cooked-deps layer when a vendored crate
+# changes, which is rare.
+COPY crates crates
 RUN cargo chef cook --release --locked --features vpn,ssh-gateway --recipe-path recipe.json
 # Git metadata build args come AFTER the cook step on purpose: BORE_GIT_SHA
 # changes on every commit, and an ENV before `cook` would bust the cooked-deps

@@ -842,6 +842,120 @@ async fn vhost_large_body_integrity() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_response_header_injection_large_keepalive_body_completes() -> Result<()> {
+    const CTRL: u16 = 17958;
+    const HTTP: u16 = 17959;
+    const LEN: usize = 109_648;
+
+    let pattern: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+    let pattern_clone = pattern.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let stub_port = listener.local_addr()?.port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let pattern = pattern_clone.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let mut total = 0;
+                loop {
+                    let n = stream.read(&mut buf[total..]).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                    if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if total >= buf.len() {
+                        break;
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/javascript; charset=UTF-8\r\nContent-Length: {LEN}\r\n\r\n"
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(&pattern).await;
+                let _ = stream.flush().await;
+                time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+
+    let mut cfg = http_config("bore.local", HTTP);
+    cfg.default_response_headers.insert(
+        "Content-Security-Policy".to_string(),
+        "default-src * 'unsafe-inline' 'unsafe-eval' data: blob;".to_string(),
+    );
+    spawn_server_vhost(CTRL, cfg).await?;
+    wait_port(HTTP, true).await;
+
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "bigkeep",
+        "client1",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    time::sleep(Duration::from_millis(50)).await;
+
+    let mut conn = time::timeout(
+        Duration::from_secs(3),
+        TcpStream::connect(("127.0.0.1", HTTP)),
+    )
+    .await??;
+    let req = b"GET /__dufs_v1.3.1__/index.js HTTP/1.1\r\nHost: bigkeep.bore.local\r\n\r\n";
+    conn.write_all(req).await?;
+
+    let response = time::timeout(Duration::from_secs(15), async {
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = conn.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..n]);
+            if let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+                let body_len = response.len().saturating_sub(header_end + 4);
+                if body_len >= LEN {
+                    return Ok::<Vec<u8>, anyhow::Error>(response);
+                }
+            }
+        }
+        Ok(response)
+    })
+    .await??;
+
+    let header_end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response missing header terminator")
+        + 4;
+    let head = String::from_utf8_lossy(&response[..header_end]);
+    assert!(
+        head.to_lowercase().contains("content-security-policy:"),
+        "response-header injection path must be active: {head}"
+    );
+    assert_eq!(
+        &response[header_end..header_end + LEN],
+        pattern.as_slice(),
+        "large keep-alive body with injected response headers must complete"
+    );
+    Ok(())
+}
+
 // ─── Concurrency smoke (control=17954, http=17955) ───────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

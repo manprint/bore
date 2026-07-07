@@ -130,3 +130,8 @@ publish_bore_client:
         -t ghcr.io/manprint/bore:client \
         --push .
     echo "Published ghcr.io/manprint/bore:client"
+
+# build local arm64 dockerhub test image
+build_from_local_arm64_dockerhub_test:
+    #!/usr/bin/env bash
+    DOCKERHUB_USERNAME="aaaa" DOCKERHUB_TOKEN="bbbb" scripts/dev/push-boretestdev-arm64.local.sh

@@ -31,9 +31,58 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time;
+use tokio_rustls::rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+use tokio_rustls::rustls::crypto::ring;
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use tokio_rustls::rustls::{
+    ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme,
+};
+use tokio_rustls::TlsConnector;
 
 lazy_static! {
     static ref SERIAL_GUARD: Mutex<()> = Mutex::new(());
+}
+
+#[derive(Debug)]
+struct TestNoVerifier;
+
+impl ServerCertVerifier for TestNoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, TlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 // A realistic >=32-char admin token (same shape as `tests/admin_test.rs`).
@@ -428,6 +477,150 @@ async fn start_demux_server(host_key_file: PathBuf, authorized_keys_dir: PathBuf
     tokio::spawn(server.listen());
     wait_port(CONTROL_PORT, true).await;
     Ok(())
+}
+
+/// Starts the real single-port deployment shape: raw SSH, HTTPS admin/vhost,
+/// and native bore all demuxed on the control port. The vhost frontend is
+/// configured with `http_port == CONTROL_PORT`, so no duplicate listener is
+/// spawned; HTTPS arrives through the control TLS acceptor and then routes by
+/// Host in `serve_control_http`.
+async fn start_unified_tls_vhost_server(
+    host_key_file: PathBuf,
+    authorized_keys_dir: PathBuf,
+    base_domain: &str,
+) -> Result<()> {
+    let (cert_pem, key_pem) = self_signed_cert()?;
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+    let config = SshGatewayConfig {
+        port: None,
+        host_key_file,
+        authorized_keys_dir: Some(authorized_keys_dir),
+        passwords_file: None,
+        banner: None,
+        window_size: bore_cli::sshgw::SSH_DEFAULT_WINDOW_SIZE,
+    };
+    let mut cfg = vhost_config(base_domain, CONTROL_PORT, vec![]);
+    cfg.https_port = CONTROL_PORT;
+    cfg.default_response_headers.insert(
+        "Content-Security-Policy".to_string(),
+        "default-src * 'unsafe-inline' 'unsafe-eval' data: blob;".to_string(),
+    );
+    cfg.default_response_headers.insert(
+        "Strict-Transport-Security".to_string(),
+        "max-age=31536000; includeSubDomains".to_string(),
+    );
+    cfg.default_response_headers
+        .insert("X-Frame-Options".to_string(), "SAMEORIGIN".to_string());
+
+    let mut server = Server::new(1024..=65535, None);
+    server.set_tls(acceptor);
+    server.set_admin_token(Some(TOKEN.to_string()));
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_vhost(cfg)?;
+    server.set_ssh_gateway(config)?;
+    tokio::spawn(server.listen());
+    wait_port(CONTROL_PORT, true).await;
+    Ok(())
+}
+
+async fn send_https_control_get(host: &str, path: &str) -> Result<String> {
+    let tcp = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
+    let mut config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .context("failed to configure test TLS protocol versions")?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(TestNoVerifier))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from("localhost".to_string())?;
+    let mut conn = connector.connect(server_name, tcp).await?;
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    conn.write_all(req.as_bytes()).await?;
+    let mut buf = Vec::new();
+    time::timeout(Duration::from_secs(20), conn.read_to_end(&mut buf)).await??;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+async fn send_https_control_get_complete_body(host: &str, path: &str) -> Result<Vec<u8>> {
+    let read_response = async {
+        let tcp = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
+        let mut config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .context("failed to configure test TLS protocol versions")?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(TestNoVerifier))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let connector = TlsConnector::from(Arc::new(config));
+        let server_name = ServerName::try_from("localhost".to_string())?;
+        let mut conn = connector.connect(server_name, tcp).await?;
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        conn.write_all(req.as_bytes()).await?;
+
+        let mut resp = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = conn.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            resp.extend_from_slice(&chunk[..n]);
+            if let Some(header_end) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&resp[..header_end + 4]);
+                let content_length = head.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                });
+                if let Some(content_length) = content_length {
+                    let body_len = resp.len().saturating_sub(header_end + 4);
+                    if body_len >= content_length {
+                        return Ok::<Vec<u8>, anyhow::Error>(resp);
+                    }
+                }
+            }
+        }
+        Ok(resp)
+    };
+    time::timeout(Duration::from_secs(20), read_response)
+        .await
+        .context("timed out waiting for the complete HTTPS response body")?
+}
+
+async fn spawn_http_body_stub(body: Vec<u8>) -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let body = Arc::new(body);
+    tokio::spawn(async move {
+        loop {
+            let (mut conn, _) = listener.accept().await?;
+            let body = Arc::clone(&body);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let mut total = 0;
+                loop {
+                    let n = conn.read(&mut buf[total..]).await?;
+                    total += n;
+                    if n == 0 || buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/javascript; charset=UTF-8\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                conn.write_all(resp.as_bytes()).await?;
+                conn.write_all(&body).await?;
+                conn.flush().await?;
+                time::sleep(Duration::from_secs(30)).await;
+                anyhow::Ok(())
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+    Ok(port)
 }
 
 /// Like [`start_gateway_server`], but the server also has a TLS certificate
@@ -2353,6 +2546,122 @@ async fn t_ssh_dmx3_browser_preconnect_idle_alpn_gets_http_not_ssh() -> Result<(
     assert!(
         head.starts_with("HTTP/1.1"),
         "expected an HTTP response, got: {head}"
+    );
+
+    child.kill().await.ok();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_ssh_dmx5_unified_tls_vhost_ssh_parallel_assets() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    start_unified_tls_vhost_server(host_key, dir.path().to_path_buf(), "bore.sshtest").await?;
+
+    let svc_port = spawn_http_stub("hello from unified vhost asset").await?;
+    let raw_forward = format!("vhost/dufsgh:0:127.0.0.1:{svc_port}");
+    let mut child = Command::new("ssh")
+        .args(ssh_args_raw(
+            CONTROL_PORT,
+            &client_priv,
+            &[raw_forward],
+            Some(r#"notes="assistenza bss dufs""#),
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh unified vhost provider")?;
+
+    wait_admin_data_contains("dufsgh").await?;
+
+    let host = "dufsgh.bore.sshtest";
+    let (doc, css, js) = tokio::try_join!(
+        send_https_control_get(host, "/"),
+        send_https_control_get(host, "/index.css"),
+        send_https_control_get(host, "/index.js"),
+    )?;
+    for resp in [doc, css, js] {
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "unified TLS vhost asset request must return 200, got: {resp}"
+        );
+        assert!(
+            resp.contains("hello from unified vhost asset"),
+            "asset response must come from the SSH-backed service, got: {resp}"
+        );
+        assert!(
+            !resp.contains("SSH-2.0"),
+            "asset response must never contain an SSH banner: {resp}"
+        );
+    }
+
+    child.kill().await.ok();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_ssh_dmx6_unified_tls_vhost_large_keepalive_asset_completes() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    start_unified_tls_vhost_server(host_key, dir.path().to_path_buf(), "bore.sshtest").await?;
+
+    const LEN: usize = 109_648;
+    let body: Vec<u8> = (0..LEN).map(|idx| (idx % 251) as u8).collect();
+    let svc_port = spawn_http_body_stub(body.clone()).await?;
+    let raw_forward = format!("vhost/dufsgh:0:127.0.0.1:{svc_port}");
+    let mut child = Command::new("ssh")
+        .args(ssh_args_raw(
+            CONTROL_PORT,
+            &client_priv,
+            &[raw_forward],
+            Some(r#"notes="assistenza bss dufs""#),
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh unified vhost provider")?;
+
+    wait_admin_data_contains("dufsgh").await?;
+
+    let resp =
+        send_https_control_get_complete_body("dufsgh.bore.sshtest", "/__dufs_v1.3.1__/index.js")
+            .await?;
+    let header_end = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .context("response missing header terminator")?
+        + 4;
+    let head = String::from_utf8_lossy(&resp[..header_end]);
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "asset request must return 200, got: {head}"
+    );
+    assert!(
+        head.to_lowercase().contains("content-security-policy:"),
+        "response-header injection path must be active: {head}"
+    );
+    assert_eq!(
+        &resp[header_end..header_end + LEN],
+        body.as_slice(),
+        "large keep-alive asset body must be complete and unmodified"
     );
 
     child.kill().await.ok();

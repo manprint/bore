@@ -1047,6 +1047,7 @@ async fn relay_response_injected(
         if !response_head.is_empty() {
             let rewritten = rewrite_head(&response_head, inject);
             public_write.write_all(&rewritten).await?;
+            public_write.flush().await?;
         }
 
         // BUG-2 fix: emit one access log entry if logger is present.
@@ -1126,6 +1127,7 @@ where
             return Ok(());
         }
         writer.write_all(&buf[..read]).await?;
+        writer.flush().await?;
     }
 }
 

@@ -523,8 +523,9 @@ async fn start_unified_tls_vhost_server(
     Ok(())
 }
 
-async fn send_https_control_get(host: &str, path: &str) -> Result<String> {
-    let tcp = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
+/// Wrap an already-connected control-port TCP stream in a test TLS client
+/// session offering browser ALPN (`h2`/`http/1.1`).
+async fn control_tls_client(tcp: TcpStream) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let mut config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_safe_default_protocol_versions()
         .context("failed to configure test TLS protocol versions")?
@@ -534,7 +535,12 @@ async fn send_https_control_get(host: &str, path: &str) -> Result<String> {
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let connector = TlsConnector::from(Arc::new(config));
     let server_name = ServerName::try_from("localhost".to_string())?;
-    let mut conn = connector.connect(server_name, tcp).await?;
+    Ok(connector.connect(server_name, tcp).await?)
+}
+
+async fn send_https_control_get(host: &str, path: &str) -> Result<String> {
+    let tcp = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
+    let mut conn = control_tls_client(tcp).await?;
     let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     conn.write_all(req.as_bytes()).await?;
     let mut buf = Vec::new();
@@ -545,16 +551,7 @@ async fn send_https_control_get(host: &str, path: &str) -> Result<String> {
 async fn send_https_control_get_complete_body(host: &str, path: &str) -> Result<Vec<u8>> {
     let read_response = async {
         let tcp = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
-        let mut config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .context("failed to configure test TLS protocol versions")?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(TestNoVerifier))
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let connector = TlsConnector::from(Arc::new(config));
-        let server_name = ServerName::try_from("localhost".to_string())?;
-        let mut conn = connector.connect(server_name, tcp).await?;
+        let mut conn = control_tls_client(tcp).await?;
         let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n");
         conn.write_all(req.as_bytes()).await?;
 
@@ -621,6 +618,143 @@ async fn spawn_http_body_stub(body: Vec<u8>) -> Result<u16> {
         anyhow::Ok(())
     });
     Ok(port)
+}
+
+/// HTTP stub that serves ANY number of sequential requests on one keep-alive
+/// connection (unlike [`spawn_http_body_stub`], which answers once and idles).
+/// Used to guard against framing desync on the response-header-injection
+/// splice path, where only the FIRST response head is rewritten.
+async fn spawn_http_keepalive_stub(body: Vec<u8>) -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let body = Arc::new(body);
+    tokio::spawn(async move {
+        loop {
+            let (mut conn, _) = listener.accept().await?;
+            let body = Arc::clone(&body);
+            tokio::spawn(async move {
+                let mut pending = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    // Wait for one complete request head (GET: no body).
+                    while !pending.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = conn.read(&mut chunk).await?;
+                        if n == 0 {
+                            return anyhow::Ok(());
+                        }
+                        pending.extend_from_slice(&chunk[..n]);
+                    }
+                    let head_end = pending
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .expect("checked above")
+                        + 4;
+                    pending.drain(..head_end);
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    conn.write_all(resp.as_bytes()).await?;
+                    conn.write_all(&body).await?;
+                    conn.flush().await?;
+                }
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+    Ok(port)
+}
+
+/// Read exactly one HTTP response (head + Content-Length-delimited body) off a
+/// keep-alive connection. Errors if the peer over-delivers past the declared
+/// body length — that is a framing desync, exactly what the injection-path
+/// regression tests are guarding against.
+async fn read_http_response<S: AsyncRead + Unpin>(conn: &mut S) -> Result<(String, Vec<u8>)> {
+    let mut resp = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        if let Some(pos) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let n = conn.read(&mut chunk).await?;
+        anyhow::ensure!(
+            n > 0,
+            "connection closed before the response head completed"
+        );
+        resp.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&resp[..header_end]).into_owned();
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .context("response missing Content-Length")?;
+    let mut body = resp[header_end..].to_vec();
+    while body.len() < content_length {
+        let n = conn.read(&mut chunk).await?;
+        anyhow::ensure!(n > 0, "connection closed mid-body");
+        body.extend_from_slice(&chunk[..n]);
+    }
+    anyhow::ensure!(
+        body.len() == content_length,
+        "read {} bytes past the declared body — response framing desync",
+        body.len() - content_length
+    );
+    Ok((head, body))
+}
+
+/// Fetch `path` over control-port TLS with a deliberately slow reader: a tiny
+/// SO_RCVBUF plus a pause between small reads keeps the server's public socket
+/// full while the relay writes, so encrypted residue is parked in the server's
+/// rustls session at the final body write — the exact field shape of the
+/// 36cd70d keep-alive stall (docs/VHOST_INJECTED_FLUSH_FIX.md). The request is
+/// keep-alive (no `Connection: close`), so nothing but an explicit flush can
+/// push that residue out.
+async fn send_https_control_get_slow_reader(
+    host: &str,
+    path: &str,
+    expected_len: usize,
+) -> Result<Vec<u8>> {
+    let read_response = async {
+        let sock = tokio::net::TcpSocket::new_v4()?;
+        sock.set_recv_buffer_size(16 * 1024)?;
+        let tcp = sock
+            .connect(format!("127.0.0.1:{CONTROL_PORT}").parse()?)
+            .await?;
+        let mut conn = control_tls_client(tcp).await?;
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        conn.write_all(req.as_bytes()).await?;
+        // Let the relay run ahead and fill every buffer between it and us
+        // before the first read.
+        time::sleep(Duration::from_millis(1500)).await;
+
+        let mut resp = Vec::new();
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            let n = conn.read(&mut chunk).await?;
+            anyhow::ensure!(
+                n > 0,
+                "keep-alive response truncated at {} of {} expected body bytes",
+                resp.len(),
+                expected_len
+            );
+            resp.extend_from_slice(&chunk[..n]);
+            if let Some(header_end) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
+                if resp.len() - (header_end + 4) >= expected_len {
+                    return Ok::<Vec<u8>, anyhow::Error>(resp);
+                }
+            }
+            // Stay slower than the relay for the whole transfer.
+            time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    time::timeout(Duration::from_secs(60), read_response)
+        .await
+        .context("timed out waiting for the slow-read HTTPS response body")?
 }
 
 /// Like [`start_gateway_server`], but the server also has a TLS certificate
@@ -2663,6 +2797,141 @@ async fn t_ssh_dmx6_unified_tls_vhost_large_keepalive_asset_completes() -> Resul
         body.as_slice(),
         "large keep-alive asset body must be complete and unmodified"
     );
+
+    child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-DMX7 — flush-before-park under REAL socket backpressure (36cd70d,
+// docs/VHOST_INJECTED_FLUSH_FIX.md). A slow reader with a tiny SO_RCVBUF keeps
+// the public socket full for the whole 12 MiB transfer, so the relay's final
+// body write is guaranteed to leave encrypted residue parked in the server's
+// rustls session; keep-alive means no EOF/shutdown ever flushes it. Without
+// the explicit flushes in `copy_one_direction_with_shutdown` the response
+// tail never arrives and this test times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_ssh_dmx7_unified_tls_vhost_slow_reader_backpressure_completes() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    start_unified_tls_vhost_server(host_key, dir.path().to_path_buf(), "bore.sshtest").await?;
+
+    // Big enough to beat kernel TCP send-buffer autotuning (tcp_wmem max is
+    // typically 4 MiB) — the relay MUST hit a full socket on the final write.
+    const LEN: usize = 12 * 1024 * 1024;
+    let body: Vec<u8> = (0..LEN).map(|idx| (idx % 251) as u8).collect();
+    let svc_port = spawn_http_body_stub(body.clone()).await?;
+    let raw_forward = format!("vhost/dufsgh:0:127.0.0.1:{svc_port}");
+    let mut child = Command::new("ssh")
+        .args(ssh_args_raw(
+            CONTROL_PORT,
+            &client_priv,
+            &[raw_forward],
+            None,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh unified vhost provider")?;
+
+    wait_admin_data_contains("dufsgh").await?;
+
+    let resp = send_https_control_get_slow_reader("dufsgh.bore.sshtest", "/big.bin", LEN).await?;
+    let header_end = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .context("response missing header terminator")?
+        + 4;
+    let head = String::from_utf8_lossy(&resp[..header_end]);
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "slow-read asset request must return 200, got: {head}"
+    );
+    assert!(
+        head.to_lowercase().contains("content-security-policy:"),
+        "response-header injection path must be active: {head}"
+    );
+    assert_eq!(
+        &resp[header_end..header_end + LEN],
+        body.as_slice(),
+        "slow-read keep-alive body must arrive complete — a missing tail means \
+         bytes were left parked unflushed in the rustls session"
+    );
+
+    child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-DMX8 — keep-alive request SEQUENCE on one TLS connection through the
+// response-header-injection path. Only the FIRST response head is rewritten
+// (MVP contract); requests 2 and 3 are spliced raw. Guards framing: a rewrite
+// that corrupts lengths, or a flush regression that strands a tail, shows up
+// as a desync or timeout on the NEXT response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_ssh_dmx8_unified_tls_vhost_keepalive_request_sequence_no_desync() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    start_unified_tls_vhost_server(host_key, dir.path().to_path_buf(), "bore.sshtest").await?;
+
+    let body = b"unified keep-alive sequence body".to_vec();
+    let svc_port = spawn_http_keepalive_stub(body.clone()).await?;
+    let raw_forward = format!("vhost/dufsgh:0:127.0.0.1:{svc_port}");
+    let mut child = Command::new("ssh")
+        .args(ssh_args_raw(
+            CONTROL_PORT,
+            &client_priv,
+            &[raw_forward],
+            None,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh unified vhost provider")?;
+
+    wait_admin_data_contains("dufsgh").await?;
+
+    let tcp = TcpStream::connect(("127.0.0.1", CONTROL_PORT)).await?;
+    let mut conn = control_tls_client(tcp).await?;
+    for idx in 0..3 {
+        let req = format!("GET /seq{idx} HTTP/1.1\r\nHost: dufsgh.bore.sshtest\r\n\r\n");
+        conn.write_all(req.as_bytes()).await?;
+        let (head, got) = time::timeout(Duration::from_secs(10), read_http_response(&mut conn))
+            .await
+            .with_context(|| format!("response {idx} never completed (keep-alive stall)"))??;
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "response {idx} must be 200, got: {head}"
+        );
+        assert_eq!(
+            got, body,
+            "response {idx} body must arrive complete and unmodified"
+        );
+        if idx == 0 {
+            assert!(
+                head.to_lowercase().contains("content-security-policy:"),
+                "first response must carry the injected headers: {head}"
+            );
+        }
+    }
 
     child.kill().await.ok();
     Ok(())

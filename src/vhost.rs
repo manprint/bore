@@ -2156,4 +2156,232 @@ reservations:
             false
         ));
     }
+
+    // ── flush-before-park (36cd70d — docs/VHOST_INJECTED_FLUSH_FIX.md) ───────
+    //
+    // These mocks encode the tokio-rustls write contract directly, so the tests
+    // are deterministic (plain `#[test]`, single poll, no runtime/timing): a
+    // TLS-backed splice loop that parks on read without flushing leaves bytes
+    // invisible in `pending` exactly like encrypted records parked in the
+    // rustls session buffer. The TLS integration tests can go green on
+    // loopback (kernel buffers absorb everything); these cannot.
+
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::sync::Mutex as StdMutex;
+    use std::task::{Context as TaskContext, Poll};
+
+    #[derive(Default)]
+    struct FlushGateState {
+        /// Written but not yet flushed — "parked in the rustls session".
+        pending: Vec<u8>,
+        /// Flushed — actually on the wire.
+        visible: Vec<u8>,
+        shutdown: bool,
+    }
+
+    /// `poll_write` accepts bytes into `pending` and returns `Ok` (like
+    /// tokio-rustls under socket backpressure); only `poll_flush` /
+    /// `poll_shutdown` publishes them to `visible`.
+    struct FlushGatedWriter(Arc<StdMutex<FlushGateState>>);
+
+    impl AsyncWrite for FlushGatedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.0.lock().unwrap().pending.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let mut st = self.0.lock().unwrap();
+            let parked = std::mem::take(&mut st.pending);
+            st.visible.extend_from_slice(&parked);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let mut st = self.0.lock().unwrap();
+            let parked = std::mem::take(&mut st.pending);
+            st.visible.extend_from_slice(&parked);
+            st.shutdown = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Yields queued chunks, then EOF or `Pending` forever. `Pending` is the
+    /// keep-alive shape: the peer stays open but has nothing more to say. It
+    /// intentionally never wakes — tests observe state through the shared
+    /// `FlushGateState` instead of awaiting completion.
+    struct ChunksThenPark {
+        chunks: VecDeque<Vec<u8>>,
+        eof_when_empty: bool,
+    }
+
+    impl AsyncRead for ChunksThenPark {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            match self.chunks.pop_front() {
+                Some(chunk) => {
+                    buf.put_slice(&chunk);
+                    Poll::Ready(Ok(()))
+                }
+                None if self.eof_when_empty => Poll::Ready(Ok(())),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// Combined duplex mock for APIs that take one `AsyncRead + AsyncWrite`.
+    struct MockDuplex {
+        read: ChunksThenPark,
+        write: FlushGatedWriter,
+    }
+
+    impl AsyncRead for MockDuplex {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.read).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for MockDuplex {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.write).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.write).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.write).poll_shutdown(cx)
+        }
+    }
+
+    /// One poll drives an async fn to its first genuine park — deterministic,
+    /// no spawn, no yield loops, no timing.
+    fn poll_once<F: std::future::Future>(fut: &mut Pin<Box<F>>) -> Poll<F::Output> {
+        let waker = futures_util::task::noop_waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        fut.as_mut().poll(&mut cx)
+    }
+
+    #[test]
+    fn copy_loop_flushes_writes_before_parking_on_read() {
+        let state = Arc::new(StdMutex::new(FlushGateState::default()));
+        let mut writer = FlushGatedWriter(state.clone());
+        let mut reader = ChunksThenPark {
+            chunks: [b"first ".to_vec(), b"second".to_vec()].into(),
+            eof_when_empty: false,
+        };
+        let mut fut = Box::pin(copy_one_direction_with_shutdown(&mut reader, &mut writer));
+        assert!(
+            poll_once(&mut fut).is_pending(),
+            "keep-alive copy must park on read, not complete"
+        );
+        drop(fut);
+
+        let st = state.lock().unwrap();
+        assert_eq!(
+            st.visible.as_slice(),
+            b"first second",
+            "all written bytes must be flushed to the wire before the loop parks on read"
+        );
+        assert!(st.pending.is_empty(), "no bytes may stay parked unflushed");
+        assert!(!st.shutdown, "no EOF seen — half-close must not fire");
+    }
+
+    #[test]
+    fn copy_loop_eof_propagates_half_close_and_publishes_tail() {
+        let state = Arc::new(StdMutex::new(FlushGateState::default()));
+        let mut writer = FlushGatedWriter(state.clone());
+        let mut reader = ChunksThenPark {
+            chunks: [b"payload".to_vec()].into(),
+            eof_when_empty: true,
+        };
+        let mut fut = Box::pin(copy_one_direction_with_shutdown(&mut reader, &mut writer));
+        match poll_once(&mut fut) {
+            Poll::Ready(res) => res.expect("EOF path must complete cleanly"),
+            Poll::Pending => panic!("EOF must complete the copy, not park"),
+        }
+        drop(fut);
+
+        let st = state.lock().unwrap();
+        assert_eq!(st.visible.as_slice(), b"payload");
+        assert!(st.shutdown, "EOF must propagate half-close via shutdown");
+    }
+
+    #[test]
+    fn injected_response_head_and_body_flushed_before_keepalive_park() {
+        let public_state = Arc::new(StdMutex::new(FlushGateState::default()));
+        let provider_state = Arc::new(StdMutex::new(FlushGateState::default()));
+        let public = MockDuplex {
+            // Request head was already consumed upstream; the connection stays
+            // open (keep-alive) with nothing more to read.
+            read: ChunksThenPark {
+                chunks: VecDeque::new(),
+                eof_when_empty: false,
+            },
+            write: FlushGatedWriter(public_state.clone()),
+        };
+        let provider = MockDuplex {
+            read: ChunksThenPark {
+                chunks: [
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n".to_vec(),
+                    b"hello".to_vec(),
+                ]
+                .into(),
+                // Keep-alive: the provider substream stays open after the body.
+                eof_when_empty: false,
+            },
+            write: FlushGatedWriter(provider_state),
+        };
+        let inject = vec![("X-Injected".to_string(), "yes".to_string())];
+        let mut fut = Box::pin(relay_response_injected(public, provider, &inject, None));
+        assert!(
+            poll_once(&mut fut).is_pending(),
+            "keep-alive relay must park, not complete"
+        );
+        drop(fut);
+
+        let st = public_state.lock().unwrap();
+        let text = String::from_utf8_lossy(&st.visible);
+        assert!(
+            text.contains("X-Injected: yes"),
+            "rewritten response head must be flushed to the wire: {text:?}"
+        );
+        assert!(
+            text.ends_with("hello"),
+            "body bytes must be flushed before parking on the provider read: {text:?}"
+        );
+        assert!(
+            st.pending.is_empty(),
+            "no bytes may stay parked unflushed while the relay waits for more data"
+        );
+    }
 }

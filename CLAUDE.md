@@ -134,6 +134,26 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
 - `HelloVpn`/`ConnectVpn` sent **before** auth (same lazy-yamux rule as `Hello`)
 - Server writes `mux::STREAM_READY` before splice (banner-first protocols need it)
 - `copy_bidirectional_with_sizes` propagates half-close; do not replace with a non-half-close variant
+- **Vhost injected-response path must `flush()` after every write, before parking on read**
+  (`relay_response_injected` + `copy_one_direction_with_shutdown`, vhost.rs; fixed 36cd70d).
+  tokio-rustls `poll_write` can return `Ok` with encrypted records still buffered in the
+  session (socket returned Pending); on a keep-alive connection there is no EOF/`shutdown`
+  to flush them and the loop parks on `read()` forever → response tail never sent → browser
+  asset stuck `pending`. ONLY the response-header-injection path is affected — the
+  no-injection path uses `copy_bidirectional_with_sizes`, whose `CopyBuffer` already
+  flushes-on-pending. Do NOT remove these flushes as "redundant", and do NOT replace the
+  hand-rolled loop with `tokio::io::copy` (8 KiB internal buffer vs `proxy_buffer_size()`
+  256 KiB default — high-BDP regression). The split + `try_join!` single-task shape is
+  REQUIRED by the yamux waker invariant (provider halves must stay in one task — never
+  "clean it up" into two spawned tasks). ENFORCING gates (red-checked: fail without the
+  flushes) are the FlushGatedWriter mock unit tests in vhost.rs `mod tests`
+  (`copy_loop_flushes_writes_before_parking_on_read`,
+  `injected_response_head_and_body_flushed_before_keepalive_park`) — every in-process TLS
+  integration test of this bug FALSE-PASSES on loopback (rustls drains opportunistically
+  via other poll paths; verified 2026-07-08), so the integration tests
+  (`vhost_response_header_injection_large_keepalive_body_completes` in vhost_test.rs,
+  `t_ssh_dmx5`..`t_ssh_dmx8` in ssh_gateway_test.rs) are belt-and-braces for truncation/
+  desync only. See docs/VHOST_INJECTED_FLUSH_FIX.md.
 - `shared::tune_tcp` (`TCP_NODELAY` + `SO_KEEPALIVE 15s`) must be applied to every new socket
 - `--max-conns` semaphore is the real bound; yamux stream limit is set generous intentionally
 - `carriers<=1` keeps the single-connection path byte-for-byte unchanged. Default is `1`

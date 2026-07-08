@@ -738,6 +738,21 @@ enum Command {
         #[clap(long, value_name = "TEXT", env = "BORE_SSH_BANNER")]
         ssh_banner: Option<String>,
 
+        /// Externally-reachable hostname of the SSH gateway (e.g.
+        /// bore.example.com behind a front proxy). Printed verbatim in
+        /// informational banners such as the secret-provider consumer
+        /// command; without it, a placeholder is shown instead.
+        #[cfg(feature = "ssh-gateway")]
+        #[clap(long, value_name = "HOST", env = "BORE_SSH_ADVERTISE_ADDRESS")]
+        ssh_advertise_address: Option<String>,
+
+        /// Externally-reachable port of the SSH gateway (e.g. 443 when a
+        /// front proxy terminates 443 onto the control port). Printed in the
+        /// same informational banners; without it, a placeholder is shown.
+        #[cfg(feature = "ssh-gateway")]
+        #[clap(long, value_name = "PORT", env = "BORE_SSH_ADVERTISE_PORT")]
+        ssh_advertise_port: Option<u16>,
+
         /// Per-channel SSH flow-control window in bytes for the gateway. Each
         /// proxied connection is one SSH channel, throughput-capped at
         /// window/RTT; raise this to lift single-connection throughput on
@@ -1975,6 +1990,10 @@ async fn dispatch(command: Command) -> Result<()> {
             #[cfg(feature = "ssh-gateway")]
             ssh_banner,
             #[cfg(feature = "ssh-gateway")]
+            ssh_advertise_address,
+            #[cfg(feature = "ssh-gateway")]
+            ssh_advertise_port,
+            #[cfg(feature = "ssh-gateway")]
             ssh_window_size,
         } => {
             let port_range = min_port..=max_port;
@@ -2199,6 +2218,8 @@ async fn dispatch(command: Command) -> Result<()> {
                         passwords_file: ssh_passwords_file,
                         banner: ssh_banner,
                         window_size: ssh_window_size,
+                        advertise_address: ssh_advertise_address,
+                        advertise_port: ssh_advertise_port,
                     };
                     server.set_ssh_gateway(ssh_cfg)?;
                 }

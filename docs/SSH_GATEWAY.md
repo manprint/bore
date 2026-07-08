@@ -114,7 +114,7 @@ Punti di innesto concreti già individuati:
 |---|---|
 | `src/sshgw.rs` (nuovo) | Server SSH russh: handshake, auth (chiavi/password), parsing `tcpip-forward`/`direct-tcpip`/`exec`/`env`, keepalive/reaper, mapping → registry bore |
 | Auth store | Lettura authorized-keys-dir + passwords-file a ogni tentativo (hot reload), cache per mtime |
-| Flag server | `--ssh-gateway`, `--ssh-host-key-file`, `--ssh-authorized-keys-dir`, `--ssh-passwords-file`, (opz.) `--ssh-banner`, (opz.) `--ssh-window-size` |
+| Flag server | `--ssh-gateway`, `--ssh-host-key-file`, `--ssh-authorized-keys-dir`, `--ssh-passwords-file`, (opz.) `--ssh-banner`, (opz.) `--ssh-advertise-address`/`--ssh-advertise-port`, (opz.) `--ssh-window-size` |
 | Feature Cargo | `ssh-gateway` (russh + argon2 fuori dal binario di default) |
 
 **Invariante nuovo proposto (I-SSH1, sul modello di I-MC1/DEC-M1)**: `--ssh-gateway` assente
@@ -921,9 +921,13 @@ se arrivata via `exec`/env (le due non sono più distinguibili una volta risolte
 `parse_params`, quindi collassano nella stessa etichetta).
 
 **SECRET provider** (`secret_provider_info_banner`) — include il comando esatto per il
-lato consumer, con placeholder espliciti per host/porta invece di un valore indovinato: il
-gateway non può sapere con certezza il proprio hostname pubblicamente raggiungibile, e
-sbagliarlo sarebbe peggio che essere onesti sul non saperlo:
+lato consumer. Di default host/porta sono placeholder espliciti invece di un valore
+indovinato: il gateway non può sapere con certezza il proprio hostname pubblicamente
+raggiungibile (un front proxy riscrive la porta, SSH non ha un equivalente di Host/SNI),
+e sbagliarlo sarebbe peggio che essere onesti sul non saperlo. Con
+`--ssh-advertise-address` + `--ssh-advertise-port` (env `BORE_SSH_ADVERTISE_ADDRESS` /
+`BORE_SSH_ADVERTISE_PORT`) l'operatore dichiara l'endpoint pubblico e il comando esce
+pronto da copiare; i due flag sono indipendenti — quello non dichiarato resta placeholder:
 ```
 Secret provider tunnel established
   Secret ID:        tcp-secret-id
@@ -933,7 +937,12 @@ Secret provider tunnel established
   Basic-auth:       n/a for secret provider (opaque TCP, no HTTP layer)
 
 Consumer command (run on the other side, same host/port you used here):
-  ssh -p <same-port> -L <local-port>:secret/tcp-secret-id:1 <same-host>
+  ssh -T -p <same-port> -L <local-port>:secret/tcp-secret-id:1 <same-host>
+```
+Con `--ssh-advertise-address bore.example.com --ssh-advertise-port 443`:
+```
+Consumer command (run on the other side):
+  ssh -T -p 443 -L <local-port>:secret/tcp-secret-id:1 bore.example.com
 ```
 
 **SECRET consumer** (`secret_consumer_info_banner`) — mostrato **una volta per sessione**

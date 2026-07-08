@@ -389,6 +389,8 @@ async fn start_gateway_server(host_key_file: PathBuf, authorized_keys_dir: PathB
         passwords_file: None,
         banner: None,
         window_size: bore_cli::sshgw::SSH_DEFAULT_WINDOW_SIZE,
+        advertise_address: None,
+        advertise_port: None,
     };
     let mut server = Server::new(1024..=65535, None);
     server.set_admin_token(Some(TOKEN.to_string()));
@@ -434,6 +436,8 @@ async fn start_gateway_server_vhost(
         passwords_file: None,
         banner: None,
         window_size: bore_cli::sshgw::SSH_DEFAULT_WINDOW_SIZE,
+        advertise_address: None,
+        advertise_port: None,
     };
     let mut server = Server::new(1024..=65535, None);
     server.set_admin_token(Some(TOKEN.to_string()));
@@ -469,6 +473,8 @@ async fn start_demux_server(host_key_file: PathBuf, authorized_keys_dir: PathBuf
         passwords_file: None,
         banner: None,
         window_size: bore_cli::sshgw::SSH_DEFAULT_WINDOW_SIZE,
+        advertise_address: None,
+        advertise_port: None,
     };
     let mut server = Server::new(1024..=65535, None);
     server.set_tls(acceptor);
@@ -498,6 +504,8 @@ async fn start_unified_tls_vhost_server(
         passwords_file: None,
         banner: None,
         window_size: bore_cli::sshgw::SSH_DEFAULT_WINDOW_SIZE,
+        advertise_address: None,
+        advertise_port: None,
     };
     let mut cfg = vhost_config(base_domain, CONTROL_PORT, vec![]);
     cfg.https_port = CONTROL_PORT;
@@ -776,6 +784,8 @@ async fn start_gateway_server_tls(
         passwords_file: None,
         banner: None,
         window_size: bore_cli::sshgw::SSH_DEFAULT_WINDOW_SIZE,
+        advertise_address: None,
+        advertise_port: None,
     };
     let mut server = Server::new(1024..=65535, None);
     server.set_tls(acceptor);

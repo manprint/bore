@@ -32,6 +32,8 @@ Flag server (tutti `#[cfg(feature = "ssh-gateway")]`):
 | `--ssh-authorized-keys-dir <DIR>` | `BORE_SSH_AUTHORIZED_KEYS_DIR` | uno dei due | Directory con file `authorized_keys`-format (uno o più file, riletti a OGNI tentativo di auth — hot-reload gratis). |
 | `--ssh-passwords-file <PATH>` | `BORE_SSH_PASSWORDS_FILE` | uno dei due | File `label:$argon2id$...`, una credenziale per riga. Generare righe con `bore hash-password`. |
 | `--ssh-banner <TEXT>` | `BORE_SSH_BANNER` | no | Testo mostrato prima dell'auth. |
+| `--ssh-advertise-address <HOST>` | `BORE_SSH_ADVERTISE_ADDRESS` | no | Hostname pubblico del gateway (es. `bore.example.com` dietro proxy); usato nei banner informativi (comando consumer pronto da copiare). Senza: placeholder. |
+| `--ssh-advertise-port <PORT>` | `BORE_SSH_ADVERTISE_PORT` | no | Porta pubblica del gateway (es. `443` quando un proxy termina la 443 sulla control port). Senza: placeholder. |
 
 Senza `--ssh-gateway` il comportamento è bore-nativo, invariato al 100%.
 
@@ -245,10 +247,15 @@ Public tunnel established
   Webserver-log:    disabled
 ```
 
-**SECRET provider** — nota il comando pronto all'uso per il consumer, con placeholder
-espliciti (`<same-port>`/`<same-host>`) invece di un valore indovinato: il gateway non può
-sapere con certezza il proprio hostname pubblico, e un valore sbagliato sarebbe peggio di
-un placeholder onesto:
+**SECRET provider** — nota il comando pronto all'uso per il consumer. Di default usa
+placeholder espliciti (`<same-port>`/`<same-host>`) invece di un valore indovinato: il
+gateway non può sapere con certezza il proprio hostname pubblico (un front proxy come
+Docker/nginx riscrive la porta, e SSH non ha un equivalente di Host/SNI), e un valore
+sbagliato sarebbe peggio di un placeholder onesto. Con `--ssh-advertise-address` +
+`--ssh-advertise-port` (env `BORE_SSH_ADVERTISE_ADDRESS` / `BORE_SSH_ADVERTISE_PORT`,
+es. `bore.example.com` + `443`) l'operatore dichiara l'endpoint pubblico e il comando
+esce pronto da copiare (ciascuno dei due indipendente: quello non dichiarato resta
+placeholder):
 ```
 Secret provider tunnel established
   Secret ID:        tcp-secret-id
@@ -257,8 +264,13 @@ Secret provider tunnel established
   Max-conns:        n/a for secret provider (not enforced per-tunnel)
   Basic-auth:       n/a for secret provider (opaque TCP, no HTTP layer)
 
+Consumer command (run on the other side):
+  ssh -T -p 443 -L <local-port>:secret/tcp-secret-id:1 bore.example.com
+```
+Senza advertise la riga resta:
+```
 Consumer command (run on the other side, same host/port you used here):
-  ssh -p <same-port> -L <local-port>:secret/tcp-secret-id:1 <same-host>
+  ssh -T -p <same-port> -L <local-port>:secret/tcp-secret-id:1 <same-host>
 ```
 
 **SECRET consumer** — mostrato una volta per sessione, non una volta per connessione

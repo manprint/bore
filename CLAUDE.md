@@ -574,7 +574,16 @@ the existing registries/relay/admin/weblog/`--max-conns` data path unmodified.
   `PARAMS_GRACE`). `ConnState::session_channel` (set by `channel_open_session`, ordered BEFORE
   its drain so a racing `deliver` can never fall in the gap) is what lets `deliver` target the
   channel directly instead of only queueing. Secret-provider's banner includes the exact
-  consumer command with `<same-host>`/`<same-port>` placeholders (never a guessed hostname).
+  consumer command with `<same-host>`/`<same-port>` placeholders (never a GUESSED hostname);
+  `--ssh-advertise-address HOST` + `--ssh-advertise-port PORT` (env
+  `BORE_SSH_ADVERTISE_ADDRESS`/`BORE_SSH_ADVERTISE_PORT`, 2026-07-08) let the OPERATOR
+  declare the public endpoint (a front proxy rewrites the port and SSH has no Host/SNI, so
+  the server can't derive it) and the command prints ready-to-copy — the two flags are
+  independent; whichever is unset keeps its placeholder (zero-regression default). Unit:
+  `secret_provider_banner_consumer_command_advertise`. Related: NO_FORWARD_YET_MESSAGE
+  explicitly notes the `-L` secret-consumer case is normal (the forward activates on the
+  first local connection — the server cannot see a `-L` earlier; `-T` only skips the PTY,
+  the session+shell request still happens, so that message is expected even with `-T`).
   Secret-consumer's banner fires exactly ONCE per session (`consumer_entry` now returns
   `(entry, is_new)`), not once per proxied connection (D11 parity). **Corollary — `-N` is now
   universally discouraged, not just when passing `exec` params:** `-N` (`SessionType=none`)

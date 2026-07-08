@@ -175,8 +175,10 @@ fn ssh_open_timeout() -> Duration {
 /// secret consumer whose first proxied connection just hasn't happened yet.
 const NO_FORWARD_YET_MESSAGE: &str =
     "bore ssh-gateway: interactive shells are not supported; use -R/-L forwarding. \
-     No forward is established on this connection yet — if that's unexpected, check \
-     your ssh command. This channel stays open either way.\r\n";
+     No forward is established on this connection yet. If you connected with \
+     -L (secret consumer) this is normal — the forward activates on the first \
+     connection to your local port. Otherwise, check your ssh command. This \
+     channel stays open either way.\r\n";
 
 /// Validated configuration for the embedded SSH gateway, built from
 /// `bore server`'s `--ssh-*` flags.
@@ -199,6 +201,18 @@ pub struct SshGatewayConfig {
     /// Per-channel SSH flow-control window in bytes ([`SSH_DEFAULT_WINDOW_SIZE`]);
     /// governs single-proxied-connection throughput on high-BDP links.
     pub window_size: u32,
+    /// Externally-reachable hostname clients should use to reach this
+    /// gateway (e.g. `bore.example.com` when a front proxy sits ahead of the
+    /// control port). Used verbatim in informational banners such as the
+    /// secret-provider "Consumer command" line — the gateway cannot reliably
+    /// derive its own public endpoint (proxies rewrite the port, and SSH
+    /// carries no Host/SNI equivalent), so this is operator-declared.
+    /// `None` keeps the honest `<same-host>` placeholder.
+    pub advertise_address: Option<String>,
+    /// Externally-reachable port paired with [`Self::advertise_address`]
+    /// (e.g. `443` when a front proxy terminates 443 onto the control port).
+    /// `None` keeps the honest `<same-port>` placeholder.
+    pub advertise_port: Option<u16>,
 }
 
 impl SshGatewayConfig {
@@ -1203,7 +1217,13 @@ impl GatewayHandler {
             )
             .await;
 
-            for line in secret_provider_info_banner(&id, &grant.identity, params.notes.as_deref()) {
+            for line in secret_provider_info_banner(
+                &id,
+                &grant.identity,
+                params.notes.as_deref(),
+                gateway.config.advertise_address.as_deref(),
+                gateway.config.advertise_port,
+            ) {
                 state.deliver(&ssh_handle, line).await;
             }
 
@@ -3227,11 +3247,29 @@ fn public_info_banner(info: PublicBannerInfo<'_>) -> Vec<String> {
 
 /// Banner for a newly-established **secret provider** (`-R secret/<id>:0`)
 /// forward, including the exact command the other side (the "consumer")
-/// needs to reach it. The host/port in that command are deliberately left as
-/// placeholders naming what they mean rather than a guessed value: the
-/// gateway cannot reliably know its own externally-reachable hostname, and
-/// guessing wrong is worse than an honest placeholder.
-fn secret_provider_info_banner(id: &str, identity: &str, notes: Option<&str>) -> Vec<String> {
+/// needs to reach it. When the operator declared the gateway's public
+/// endpoint (`--ssh-advertise-address` / `--ssh-advertise-port`) the command
+/// is printed ready to run; whatever is undeclared is deliberately left as a
+/// placeholder naming what it means rather than a guessed value: the gateway
+/// cannot reliably know its own externally-reachable endpoint (a front proxy
+/// rewrites the port, SSH has no Host/SNI equivalent), and guessing wrong is
+/// worse than an honest placeholder.
+fn secret_provider_info_banner(
+    id: &str,
+    identity: &str,
+    notes: Option<&str>,
+    advertise_address: Option<&str>,
+    advertise_port: Option<u16>,
+) -> Vec<String> {
+    let host = advertise_address.unwrap_or("<same-host>").to_string();
+    let port = advertise_port
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "<same-port>".to_string());
+    let header = if advertise_address.is_some() && advertise_port.is_some() {
+        "Consumer command (run on the other side):"
+    } else {
+        "Consumer command (run on the other side, same host/port you used here):"
+    };
     vec![
         "Secret provider tunnel established".to_string(),
         banner_line("Secret ID:", id),
@@ -3246,8 +3284,8 @@ fn secret_provider_info_banner(id: &str, identity: &str, notes: Option<&str>) ->
             "n/a for secret provider (opaque TCP, no HTTP layer)",
         ),
         String::new(),
-        "Consumer command (run on the other side, same host/port you used here):".to_string(),
-        format!("  ssh -p <same-port> -L <local-port>:secret/{id}:1 <same-host>"),
+        header.to_string(),
+        format!("  ssh -T -p {port} -L <local-port>:secret/{id}:1 {host}"),
     ]
 }
 
@@ -3285,6 +3323,8 @@ mod tests {
             passwords_file: None,
             banner: None,
             window_size: SSH_DEFAULT_WINDOW_SIZE,
+            advertise_address: None,
+            advertise_port: None,
         }
     }
 
@@ -3927,6 +3967,38 @@ mod tests {
             demux_classify_prefix(b""),
             PrefixRoute::NotSsh,
             "empty (EOF before any byte)"
+        );
+    }
+
+    /// `--ssh-advertise-address`/`--ssh-advertise-port` substitute the real
+    /// endpoint into the secret-provider "Consumer command" line; whatever is
+    /// undeclared keeps its honest placeholder (zero-regression default).
+    #[test]
+    fn secret_provider_banner_consumer_command_advertise() {
+        let cmd_line = |addr: Option<&str>, port: Option<u16>| -> String {
+            secret_provider_info_banner("myid", "u@h", None, addr, port)
+                .into_iter()
+                .rev()
+                .find(|l| l.trim_start().starts_with("ssh "))
+                .unwrap()
+        };
+        assert_eq!(
+            cmd_line(None, None),
+            "  ssh -T -p <same-port> -L <local-port>:secret/myid:1 <same-host>"
+        );
+        assert_eq!(
+            cmd_line(Some("bore.example.com"), Some(443)),
+            "  ssh -T -p 443 -L <local-port>:secret/myid:1 bore.example.com"
+        );
+        assert_eq!(
+            cmd_line(Some("bore.example.com"), None),
+            "  ssh -T -p <same-port> -L <local-port>:secret/myid:1 bore.example.com",
+            "address only: real host, placeholder port"
+        );
+        assert_eq!(
+            cmd_line(None, Some(443)),
+            "  ssh -T -p 443 -L <local-port>:secret/myid:1 <same-host>",
+            "port only: real port, placeholder host"
         );
     }
 }

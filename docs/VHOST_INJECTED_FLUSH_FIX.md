@@ -136,6 +136,36 @@ do not "simplify" them away in favor of the integration tests.
   connection through the injection path. Only the first response head is
   rewritten (MVP contract); asserts each response completes with the exact
   body and no framing desync, and that the first carries the injected headers.
+- `vhost_https_response_header_injection_large_keepalive_body_completes`
+  (`tests/vhost_test.rs`) — NATIVE provider, dedicated HTTPS frontend port
+  (`handle_https` → `relay_response_injected`): the TLS-terminated variant of
+  the plain-HTTP keep-alive test.
+- `vhost_response_header_injection_keepalive_request_sequence_no_desync`
+  (`tests/vhost_test.rs`) — NATIVE provider, three sequential keep-alive
+  requests on one connection through the injection path (desync guard).
+- `vhost_udp_response_header_injection_large_keepalive_body_completes`
+  (`tests/vhost_test.rs`) — NATIVE `--udp` provider: `relay_response_injected`
+  with the provider side on a QUIC bidi stream instead of a yamux substream
+  (previously untested combination), 1 MiB keep-alive body, asserts the direct
+  path was actually used.
+
+## Native-client path audit (2026-07-08) — no further flush-class bugs
+
+The full native `bore vhost` data path was audited for the same bug class
+after the fix; every write site is clean:
+
+| Site | Verdict |
+|---|---|
+| Client splice (`client.rs handle_connection`) | `copy_bidirectional_with_sizes` — flush-on-pending built in |
+| `weblog::HttpAccessTap`, `shared::CountingStream` | `poll_flush`/`poll_shutdown` delegate to inner (wrappers can't strand bytes) |
+| `basicauth::gate` 401 (client) + `relay_vhost` 401 (server) | explicit `flush` + `shutdown` |
+| `mux::write_stream_ready` | explicit `flush` (mux.rs) |
+| `edge::write_https_redirect` | explicit `flush` |
+| `send_bad_gateway` / `send_service_unavailable` | end with `shutdown()` (flushes) |
+| yamux substream writes over TLS control conn | the yamux connection driver flushes the underlying socket after frame batches (upstream behavior); `copy_bidirectional` flush-on-pending covers the substream layer |
+| `spawn_direct` QUIC accept loop (client `--udp`) | per-stream spawn, slot released on every exit path; quinn sends eagerly |
+| `connect_with_timeout` local service conns | `tune_tcp` applied (invariant held) |
+| `edge::read_request_head` / `read_head_async` caps | oversized heads returned partial and forwarded raw — never a desync or an error |
 
 ## Rule going forward
 

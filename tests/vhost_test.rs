@@ -956,6 +956,296 @@ async fn vhost_response_header_injection_large_keepalive_body_completes() -> Res
     Ok(())
 }
 
+// ─── Injected-response keep-alive hardening (native client) ──────────────────
+//
+// Companions to `vhost_response_header_injection_large_keepalive_body_completes`
+// covering the remaining native front/back-end combinations of the
+// `relay_response_injected` splice path (36cd70d, docs/VHOST_INJECTED_FLUSH_FIX.md):
+// dedicated HTTPS port (`handle_https`), keep-alive request sequences, and the
+// QUIC direct provider link. NOTE: like every in-process TLS test, these cannot
+// go red on the flush bug itself (loopback false-pass — the enforcing gates are
+// the FlushGatedWriter unit tests in src/vhost.rs); they guard truncation,
+// framing desync, and path wiring.
+
+/// Stub serving one keep-alive response (`body`, no `Connection: close`) per
+/// connection, then idling 30 s so no EOF can mask a stranded tail via
+/// shutdown-flush.
+async fn spawn_keepalive_body_stub(body: Vec<u8>) -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let body = Arc::new(body);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let body = Arc::clone(&body);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let mut total = 0;
+                loop {
+                    let n = stream.read(&mut buf[total..]).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    total += n;
+                    if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") || total >= buf.len() {
+                        break;
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+                let _ = stream.flush().await;
+                time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+    Ok(port)
+}
+
+/// Stub serving ANY number of sequential keep-alive requests on one connection.
+async fn spawn_keepalive_sequence_stub(body: Vec<u8>) -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let body = Arc::new(body);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let body = Arc::clone(&body);
+            tokio::spawn(async move {
+                let mut pending = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    while !pending.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        pending.extend_from_slice(&chunk[..n]);
+                    }
+                    let head_end = pending
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .expect("checked above")
+                        + 4;
+                    pending.drain(..head_end);
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    if stream.write_all(resp.as_bytes()).await.is_err()
+                        || stream.write_all(&body).await.is_err()
+                    {
+                        return;
+                    }
+                    let _ = stream.flush().await;
+                }
+            });
+        }
+    });
+    Ok(port)
+}
+
+/// Read one keep-alive response until `expected_len` body bytes have arrived
+/// (the connection stays open — `read_to_end` would hang forever).
+async fn read_keepalive_response<S: AsyncReadExt + Unpin>(
+    conn: &mut S,
+    expected_len: usize,
+) -> Result<Vec<u8>> {
+    let response = time::timeout(Duration::from_secs(15), async {
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = conn.read(&mut chunk).await?;
+            anyhow::ensure!(
+                n > 0,
+                "keep-alive response truncated at {} bytes",
+                response.len()
+            );
+            response.extend_from_slice(&chunk[..n]);
+            if let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+                if response.len() - (header_end + 4) >= expected_len {
+                    return Ok::<Vec<u8>, anyhow::Error>(response);
+                }
+            }
+        }
+    })
+    .await??;
+    Ok(response)
+}
+
+/// Split a raw response at the header terminator and assert the injected
+/// header plus the byte-exact expected body.
+fn assert_injected_and_complete(response: &[u8], expected_body: &[u8]) {
+    let header_end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response missing header terminator")
+        + 4;
+    let head = String::from_utf8_lossy(&response[..header_end]);
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "expected 200, got: {head}"
+    );
+    assert!(
+        head.to_lowercase().contains("content-security-policy:"),
+        "response-header injection path must be active: {head}"
+    );
+    assert_eq!(
+        &response[header_end..header_end + expected_body.len()],
+        expected_body,
+        "keep-alive body with injected response headers must arrive complete"
+    );
+}
+
+// Dedicated HTTPS frontend port (`handle_https` → `relay_response_injected`)
+// with a native provider — the TLS-terminated variant of the plain-HTTP
+// keep-alive test above. (control=19040, https=19041)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_https_response_header_injection_large_keepalive_body_completes() -> Result<()> {
+    const CTRL: u16 = 19040;
+    const HTTPS: u16 = 19041;
+    const LEN: usize = 109_648;
+
+    let pattern: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+    let stub_port = spawn_keepalive_body_stub(pattern.clone()).await?;
+
+    let (cert_pem, key_pem) =
+        self_signed_for(vec!["*.bore.local".to_string(), "bore.local".to_string()])?;
+    let (cert_path, key_path) = write_pem_files(&cert_pem, &key_pem)?;
+    let mut cfg = VhostConfig {
+        base_domain: "bore.local".to_string(),
+        mode: VhostModeCfg::Https,
+        http_port: 80,
+        https_port: HTTPS,
+        cert_file: Some(cert_path),
+        key_file: Some(key_path),
+        default_headers: BTreeMap::new(),
+        default_response_headers: BTreeMap::new(),
+        reservations: vec![],
+    };
+    cfg.default_response_headers.insert(
+        "Content-Security-Policy".to_string(),
+        "default-src * 'unsafe-inline' 'unsafe-eval' data: blob;".to_string(),
+    );
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_vhost(cfg)?;
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTPS, true).await;
+
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "bigtls",
+        "client1",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    time::sleep(Duration::from_millis(50)).await;
+
+    let endpoint = Endpoint {
+        host: "127.0.0.1".to_string(),
+        port: HTTPS,
+        tls: true,
+    };
+    let mut tls = transport::connect(&endpoint, true).await?;
+    // Keep-alive on purpose: no `Connection: close`, no client shutdown.
+    let req = b"GET /big.js HTTP/1.1\r\nHost: bigtls.bore.local\r\n\r\n";
+    tls.write_all(req).await?;
+    let response = read_keepalive_response(&mut tls, LEN).await?;
+    assert_injected_and_complete(&response, &pattern);
+    Ok(())
+}
+
+// Three sequential keep-alive requests on ONE connection through the
+// injection path with a native provider. Only the FIRST response head is
+// rewritten (MVP contract); guards framing desync on the follow-ups.
+// (control=19042, http=19043)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_response_header_injection_keepalive_request_sequence_no_desync() -> Result<()> {
+    const CTRL: u16 = 19042;
+    const HTTP: u16 = 19043;
+
+    let body = b"native keep-alive sequence body".to_vec();
+    let stub_port = spawn_keepalive_sequence_stub(body.clone()).await?;
+
+    let mut cfg = http_config("bore.local", HTTP);
+    cfg.default_response_headers.insert(
+        "Content-Security-Policy".to_string(),
+        "default-src * 'unsafe-inline' 'unsafe-eval' data: blob;".to_string(),
+    );
+    spawn_server_vhost(CTRL, cfg).await?;
+    wait_port(HTTP, true).await;
+
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "seqkeep",
+        "client1",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    time::sleep(Duration::from_millis(50)).await;
+
+    let mut conn = time::timeout(
+        Duration::from_secs(3),
+        TcpStream::connect(("127.0.0.1", HTTP)),
+    )
+    .await??;
+    for idx in 0..3 {
+        let req = format!("GET /seq{idx} HTTP/1.1\r\nHost: seqkeep.bore.local\r\n\r\n");
+        conn.write_all(req.as_bytes()).await?;
+        let response = read_keepalive_response(&mut conn, body.len()).await?;
+        let header_end = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response missing header terminator")
+            + 4;
+        let head = String::from_utf8_lossy(&response[..header_end]);
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "response {idx} must be 200, got: {head}"
+        );
+        assert_eq!(
+            &response[header_end..],
+            body.as_slice(),
+            "response {idx} body must arrive complete with no framing desync"
+        );
+        if idx == 0 {
+            assert!(
+                head.to_lowercase().contains("content-security-policy:"),
+                "first response must carry the injected headers: {head}"
+            );
+        }
+    }
+    Ok(())
+}
+
 // ─── Concurrency smoke (control=17954, http=17955) ───────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2250,6 +2540,77 @@ async fn vhost_udp_large_body_integrity() -> Result<()> {
     assert!(
         direct_stream_opens(&registry, "bigudp") >= 1,
         "large-body request should use the direct QUIC path"
+    );
+    Ok(())
+}
+
+// ─── QUIC direct provider link + injected response headers, keep-alive ────────
+//
+// `relay_response_injected` with the provider side on a QUIC bidi stream
+// (`--udp` direct path) instead of a yamux substream — this combination was
+// previously untested. Keep-alive public side (no `Connection: close`, stub
+// idles) so a stranded tail cannot be masked by shutdown-flush.
+// (control=19044, http=19045, quic=19046)
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_udp_response_header_injection_large_keepalive_body_completes() -> Result<()> {
+    const CTRL: u16 = 19044;
+    const HTTP: u16 = 19045;
+    const QUIC: u16 = 19046;
+    const LEN: usize = 1 << 20;
+
+    let pattern: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+    let stub_port = spawn_keepalive_body_stub(pattern.clone()).await?;
+
+    let mut cfg = http_config("bore.local", HTTP);
+    cfg.default_response_headers.insert(
+        "Content-Security-Policy".to_string(),
+        "default-src * 'unsafe-inline' 'unsafe-eval' data: blob;".to_string(),
+    );
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, Some("vhost-udp-secret"));
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(true);
+    server.set_vhost(cfg)?;
+    server.set_vhost_quic_port(QUIC);
+    let registry = server.vhost_registry();
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTP, true).await;
+
+    let client = Client::new_vhost_provider_with_udp(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "injudp",
+        "client1",
+        Some("vhost-udp-secret"),
+        false,
+        1,
+        true,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(client.listen());
+
+    wait_for_vhost_direct(&registry, "injudp", true).await;
+
+    let mut conn = time::timeout(
+        Duration::from_secs(3),
+        TcpStream::connect(("127.0.0.1", HTTP)),
+    )
+    .await??;
+    // Keep-alive on purpose: no `Connection: close`, no client shutdown.
+    let req = "GET /big.js HTTP/1.1\r\nHost: injudp.bore.local\r\n\r\n";
+    conn.write_all(req.as_bytes()).await?;
+    let response = read_keepalive_response(&mut conn, LEN).await?;
+    assert_injected_and_complete(&response, &pattern);
+    assert!(
+        direct_stream_opens(&registry, "injudp") >= 1,
+        "injected keep-alive request should ride the direct QUIC path"
     );
     Ok(())
 }

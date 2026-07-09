@@ -1,0 +1,227 @@
+# compose.ssh.yml — bore SSH-gateway tunnel client
+# Image: ghcr.io/manprint/bore-ssh-client:latest (built by .github/workflows/docker-ssh-client.yml
+# from docker/Dockerfile.ssh — openssh-client + autossh + sshpass + openssl, no bore binary).
+#
+# Client-side only: the bore SERVER must run elsewhere with --ssh-gateway enabled
+# (and --vhost-* for vhost mode, --cert-file/--key-file for TLS/https).
+#
+# Usage:
+#   mkdir -p ssh && cp <your-key> ssh/id_key            # key auth (recommended)
+#   ssh-keyscan -p 7835 bore.example.com > ssh/known_hosts   # optional host-key pinning
+#   docker compose -f compose.ssh.yml up -d
+#   docker compose -f compose.ssh.yml logs -f           # gateway status banner shows here
+#
+# Every service below is a COMPLETE standalone example for one mode — copy the one
+# you need, adjust env, delete the rest. Only tunnel-vhost is enabled by default.
+#
+# Reliability stack (defaults already set in the image, nothing else needed):
+#   - OpenSSH keepalives (ServerAliveInterval=15 x3 + TCPKeepAlive) detect dead links in <60s
+#   - ExitOnForwardFailure=yes makes a half-working session exit instead of lingering
+#   - autossh -M0 (AUTOSSH_GATETIME=0) reconnects immediately, forever
+#   - the gateway's same-identity takeover (I-SSH5) lets a reconnect evict its own
+#     stale session, so recovery never waits for a server-side timeout
+#   - restart: always + image healthcheck cover autossh/container death
+#
+# ============================================================================
+# ENVIRONMENT VARIABLE REFERENCE (all of them)
+# ============================================================================
+# --- connection (required) --------------------------------------------------
+# BORE_SSH_HOST              bore server hostname/IP                  (REQUIRED)
+# BORE_SSH_PORT              gateway port (7835; 443 if demuxed there)  [7835]
+# BORE_SSH_USER              ssh username — ignored by the gateway,
+#                            shown as a secondary label in logs        [tunnel]
+#
+# --- mode selection (required) ----------------------------------------------
+# TUNNEL_MODE                vhost | public | secret-provider | secret-consumer | raw
+#
+# --- tunnel target / naming (per mode) ---------------------------------------
+# LOCAL_HOST                 host the tunnel forwards TO (vhost/public/
+#                            secret-provider). Default reaches the Docker
+#                            host via extra_hosts        [host.docker.internal]
+#                            Use a compose service name to expose a container
+#                            on the same network instead.
+# LOCAL_PORT                 port on LOCAL_HOST to expose               (modes -R)
+# VHOST_LABEL                subdomain label, e.g. "myapp" →
+#                            myapp.<vhost-base-domain>                  (vhost)
+# PUBLIC_PORT                requested public port; 0 = server-assigned [0] (public)
+# SECRET_ID                  secret tunnel id (= native --tcp-secret-id)
+#                            (secret-provider & secret-consumer)
+# LISTEN_ADDRESS             consumer local bind address           [0.0.0.0]
+# LISTEN_PORT                consumer local listen port (map it via ports:)
+# FORWARD_SPEC               raw mode: verbatim ssh args, e.g.
+#                            "-R vhost/x:0:web:80"
+# EXTRA_FORWARDS             extra "-R spec"/"-L spec" tokens appended in ANY
+#                            mode — one container can carry several tunnels
+#
+# --- tunnel parameters (gateway exec string, sent after "--") ----------------
+# EXEC_PARAMS                key=value list, e.g.:
+#                            'notes="api prod" max-conns=512 basic-auth=user:pass webserver-log=on'
+#                            public-only extras: https=on force-https=on
+#                            Inapplicable params are warned in the banner, never
+#                            silently dropped.
+#
+# --- authentication (key OR password; key recommended for unattended) --------
+# SSH_KEY_FILE               path INSIDE the container to a private key
+#                            (mount it; it is copied+chmod 600 at start)
+# SSH_PASSWORD               password (label:argon2id hash must exist in the
+#                            server's --ssh-passwords-file)
+# SSH_PASSWORD_FILE          file containing the password (docker secret) —
+#                            wins over SSH_PASSWORD
+#
+# --- host key verification ---------------------------------------------------
+# KNOWN_HOSTS_FILE           pinned known_hosts path            [/ssh/known_hosts]
+#                            Pre-populate: ssh-keyscan -p 7835 bore.example.com
+# STRICT_HOST_KEY_CHECKING   yes | accept-new | no             [accept-new]
+#                            Production: mount known_hosts + set "yes".
+#
+# --- stability knobs (defaults already tuned; override only if needed) -------
+# SERVER_ALIVE_INTERVAL      seconds between keepalive probes          [15]
+# SERVER_ALIVE_COUNT_MAX     missed probes before disconnect            [3]
+# CONNECT_TIMEOUT            TCP connect timeout, seconds              [10]
+# EXIT_ON_FORWARD_FAILURE    yes|no                                   [yes]
+# TCP_KEEPALIVE              yes|no                                   [yes]
+# AUTOSSH_GATETIME           0 = retry even on instant failures         [0]
+# AUTOSSH_POLL               autossh internal poll interval, seconds   [30]
+# SSH_LOG_LEVEL              QUIET|ERROR|INFO|VERBOSE|DEBUG          [INFO]
+# EXTRA_SSH_OPTS             extra "-o Key=Val" tokens (no spaces in values)
+#
+# --- transport ----------------------------------------------------------------
+# SSH_OVER_TLS               on|off [off] — wraps SSH in TLS via
+#                            `openssl s_client -alpn ssh` ProxyCommand; use when
+#                            the gateway listens behind the TLS demux (e.g. :443)
+#                            and only TLS egress is allowed.
+# ============================================================================
+
+services:
+
+  # ==========================================================================
+  # MODE 1 — VHOST: expose http://myapp.<vhost-base-domain> → LOCAL_HOST:8080
+  # (server needs --vhost-base-domain/--vhost-http-port; HTTPS is decided
+  #  server-side by --vhost-mode — https=on here would only produce a warning)
+  # ==========================================================================
+  tunnel-vhost:
+    image: ghcr.io/manprint/bore-ssh-client:latest
+    restart: always
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # lets LOCAL_HOST default reach the Docker host
+    volumes:
+      - ./ssh:/ssh:ro                         # id_key (+ optionally known_hosts)
+    environment:
+      BORE_SSH_HOST: bore.example.com
+      BORE_SSH_PORT: "7835"
+      SSH_KEY_FILE: /ssh/id_key
+      TUNNEL_MODE: vhost
+      VHOST_LABEL: myapp
+      LOCAL_HOST: host.docker.internal        # or a compose service name, e.g. "web"
+      LOCAL_PORT: "8080"
+      # EXEC_PARAMS: 'notes="api prod" basic-auth=user:pass webserver-log=on'
+      # KNOWN_HOSTS_FILE: /ssh/known_hosts
+      # STRICT_HOST_KEY_CHECKING: "yes"
+      # SSH_OVER_TLS: "on"                    # with BORE_SSH_PORT: "443" behind the TLS demux
+
+  # ==========================================================================
+  # MODE 2 — PUBLIC: expose public TCP port 9005 → LOCAL_HOST:8080
+  # (PUBLIC_PORT: "0" = let the server pick; check logs/banner for the port)
+  # ==========================================================================
+  # tunnel-public:
+  #   image: ghcr.io/manprint/bore-ssh-client:latest
+  #   restart: always
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   volumes:
+  #     - ./ssh:/ssh:ro
+  #   environment:
+  #     BORE_SSH_HOST: bore.example.com
+  #     BORE_SSH_PORT: "7835"
+  #     SSH_KEY_FILE: /ssh/id_key
+  #     TUNNEL_MODE: public
+  #     PUBLIC_PORT: "9005"
+  #     LOCAL_HOST: host.docker.internal
+  #     LOCAL_PORT: "8080"
+  #     # EXEC_PARAMS: 'notes="staging" max-conns=200 https=on force-https=on'
+  #     #   https=on needs --cert-file/--key-file on the server
+
+  # ==========================================================================
+  # MODE 3 — SECRET PROVIDER: register secret id "my-secret" → LOCAL_HOST:5432
+  # (nothing public is opened; only consumers knowing the id can connect.
+  #  The banner prints the ready-to-copy consumer command when the server
+  #  sets --ssh-advertise-address/--ssh-advertise-port)
+  # ==========================================================================
+  # tunnel-secret-provider:
+  #   image: ghcr.io/manprint/bore-ssh-client:latest
+  #   restart: always
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   volumes:
+  #     - ./ssh:/ssh:ro
+  #   environment:
+  #     BORE_SSH_HOST: bore.example.com
+  #     BORE_SSH_PORT: "7835"
+  #     SSH_KEY_FILE: /ssh/id_key
+  #     TUNNEL_MODE: secret-provider
+  #     SECRET_ID: my-secret
+  #     LOCAL_HOST: host.docker.internal
+  #     LOCAL_PORT: "5432"
+  #     # EXEC_PARAMS: 'notes="db-primary"'
+
+  # ==========================================================================
+  # MODE 4 — SECRET CONSUMER: local port 8899 → provider registered as "my-secret"
+  # (the forward activates on the FIRST local connection — "no forward yet"
+  #  in the banner is normal until then. ports: exposes it outside the container)
+  # ==========================================================================
+  # tunnel-secret-consumer:
+  #   image: ghcr.io/manprint/bore-ssh-client:latest
+  #   restart: always
+  #   volumes:
+  #     - ./ssh:/ssh:ro
+  #   ports:
+  #     - "8899:8899"
+  #   environment:
+  #     BORE_SSH_HOST: bore.example.com
+  #     BORE_SSH_PORT: "7835"
+  #     SSH_KEY_FILE: /ssh/id_key
+  #     TUNNEL_MODE: secret-consumer
+  #     SECRET_ID: my-secret
+  #     LISTEN_PORT: "8899"
+  #     # LISTEN_ADDRESS: "0.0.0.0"
+
+  # ==========================================================================
+  # MODE 5 — RAW / MULTI-TUNNEL: verbatim specs, several tunnels in one session
+  # ==========================================================================
+  # tunnel-raw:
+  #   image: ghcr.io/manprint/bore-ssh-client:latest
+  #   restart: always
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   volumes:
+  #     - ./ssh:/ssh:ro
+  #   environment:
+  #     BORE_SSH_HOST: bore.example.com
+  #     BORE_SSH_PORT: "7835"
+  #     SSH_KEY_FILE: /ssh/id_key
+  #     TUNNEL_MODE: raw
+  #     FORWARD_SPEC: "-R vhost/site:0:host.docker.internal:8080"
+  #     EXTRA_FORWARDS: "-R 9005:host.docker.internal:8081 -R secret/db:0:host.docker.internal:5432"
+
+  # ==========================================================================
+  # PASSWORD AUTH variant (any mode) — docker secret instead of key
+  # ==========================================================================
+  # tunnel-password:
+  #   image: ghcr.io/manprint/bore-ssh-client:latest
+  #   restart: always
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   secrets:
+  #     - bore_ssh_password
+  #   environment:
+  #     BORE_SSH_HOST: bore.example.com
+  #     BORE_SSH_PORT: "7835"
+  #     SSH_PASSWORD_FILE: /run/secrets/bore_ssh_password
+  #     TUNNEL_MODE: public
+  #     PUBLIC_PORT: "9006"
+  #     LOCAL_HOST: host.docker.internal
+  #     LOCAL_PORT: "8080"
+
+# secrets:
+#   bore_ssh_password:
+#     file: ./ssh/password.txt

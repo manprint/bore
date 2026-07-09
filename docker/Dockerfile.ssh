@@ -1,0 +1,33 @@
+# bore SSH-gateway tunnel client image.
+#
+# Contains NO bore binary — only a stock OpenSSH client, autossh (auto-reconnect),
+# sshpass (password auth) and openssl (SSH-over-TLS ProxyCommand). It drives the
+# bore server's --ssh-gateway in every mode: vhost, public, secret provider,
+# secret consumer. Everything is configured via environment variables; see
+# compose.ssh.yml for the full reference.
+#
+# Build (from repo root):
+#   docker build -f docker/Dockerfile.ssh -t bore-ssh-tunnel .
+
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+        bash \
+        openssh-client \
+        autossh \
+        sshpass \
+        openssl \
+        ca-certificates \
+        tini
+
+COPY docker/ssh-entrypoint.sh /usr/local/bin/ssh-entrypoint.sh
+RUN chmod +x /usr/local/bin/ssh-entrypoint.sh
+
+# tini as PID 1: correct signal forwarding + zombie reaping around autossh,
+# so `docker stop` terminates the tunnel cleanly (fast takeover on restart).
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/ssh-entrypoint.sh"]
+
+# autossh must stay alive; if it dies the container exits and Docker's
+# restart policy (compose: restart: always) brings the tunnel back.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD pgrep -x autossh >/dev/null || exit 1

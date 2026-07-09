@@ -2128,7 +2128,7 @@ impl Server {
                         } else {
                             None
                         };
-                        match opener.open_ready(forward_ip.as_deref()).await {
+                        match opener.open_ready(forward_ip.as_deref(), Some(addr)).await {
                             Ok(mut stream) => {
                                 let buf = proxy_buffer_size();
                                 // Count bytes LIVE as they flow (not only on close) so the

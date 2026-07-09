@@ -1617,11 +1617,20 @@ impl Handler for GatewayHandler {
         channel: Channel<Msg>,
         host_to_connect: &str,
         port_to_connect: u32,
-        _originator_address: &str,
-        _originator_port: u32,
+        originator_address: &str,
+        originator_port: u32,
         reply: ChannelOpenHandle,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // The `-L` client's own report of who connected to its local listener.
+        // Threaded through to an SSH *provider* as the `forwarded-tcpip`
+        // originator (a native provider never sees it) — best-effort: OpenSSH
+        // always sends a literal IP here, but an unparseable value degrades
+        // to the 0.0.0.0:0 placeholder rather than failing the open.
+        let originator: Option<std::net::SocketAddr> = originator_address
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .and_then(|ip| u16::try_from(originator_port).ok().map(|p| (ip, p).into()));
         let id = match parse_direct_tcpip_dest(host_to_connect, port_to_connect) {
             Ok(id) => id,
             Err(err) => {
@@ -1684,7 +1693,7 @@ impl Handler for GatewayHandler {
             let _active_guard = ActiveGuard::new(Arc::clone(&consumer_entry.active));
             let provider = match timeout(
                 SSH_DIRECT_OPEN_TIMEOUT,
-                secret::open_with_failover(&pool, &id),
+                secret::open_with_failover(&pool, &id, originator),
             )
             .await
             {
@@ -2682,10 +2691,18 @@ impl mux::ChannelOpen for SshOpener {
     fn open(
         &self,
         forward_ip: Option<&str>,
+        caller: Option<std::net::SocketAddr>,
     ) -> Pin<Box<dyn Future<Output = io::Result<mux::LinkStream>> + Send + '_>> {
-        // SSH has no STREAM_READY marker (I-4): the caller IP travels as the
-        // channel-open request's own originator-IP field instead.
-        let originator_ip = forward_ip.unwrap_or("0.0.0.0").to_string();
+        // SSH has no STREAM_READY marker (I-4): the caller address travels as
+        // the channel-open request's own originator fields instead. Prefer the
+        // full `caller` SocketAddr (real IP AND port, always available on the
+        // vhost/public relay paths regardless of logging options); fall back
+        // to the logging-gated bare `forward_ip`, then to the RFC's
+        // "unknown" placeholder.
+        let (originator_ip, originator_port) = match caller {
+            Some(addr) => (addr.ip().to_string(), u32::from(addr.port())),
+            None => (forward_ip.unwrap_or("0.0.0.0").to_string(), 0),
+        };
         let handle = self.handle.clone();
         let connected_address = self.connected_address.clone();
         let connected_port = self.connected_port;
@@ -2701,7 +2718,7 @@ impl mux::ChannelOpen for SshOpener {
                     connected_address,
                     u32::from(connected_port),
                     originator_ip,
-                    0,
+                    originator_port,
                 ),
             )
             .await;
@@ -2781,10 +2798,30 @@ impl std::fmt::Display for SpecError {
 
 impl std::error::Error for SpecError {}
 
+/// Maximum vhost label length: DNS's own single-label limit (RFC 1035). A
+/// longer label could never match a real `Host:` header subdomain anyway, so
+/// rejecting it at registration keeps oversized attacker-chosen strings out
+/// of the registries and the admin dashboard JSON.
+const MAX_VHOST_LABEL_LEN: usize = 63;
+
+/// Maximum secret tunnel id length. More generous than the DNS bound — a
+/// secret id never appears in DNS and a native `--tcp-secret-id` has no hard
+/// limit, so an SSH consumer must still be able to name a reasonably long
+/// native-provider id — but bounded so a hostile `tcpip-forward`/`direct-tcpip`
+/// can't park megabyte-scale strings in the provider registry.
+const MAX_SECRET_ID_LEN: usize = 128;
+
 /// Validates a vhost/secret label: lowercase `[a-z0-9-]+`, single label (no
 /// dots), not starting or ending with `-` — the exact charset
-/// `vhost::extract_subdomain` (`src/vhost.rs`) accepts.
-fn validate_label(label: &str) -> Result<String, SpecError> {
+/// `vhost::extract_subdomain` (`src/vhost.rs`) accepts — and at most
+/// `max_len` bytes ([`MAX_VHOST_LABEL_LEN`]/[`MAX_SECRET_ID_LEN`]).
+fn validate_label(label: &str, max_len: usize) -> Result<String, SpecError> {
+    if label.len() > max_len {
+        return Err(SpecError(format!(
+            "label too long ({} bytes, max {max_len})",
+            label.len()
+        )));
+    }
     let valid = !label.is_empty()
         && !label.contains('.')
         && label
@@ -2816,14 +2853,17 @@ pub fn parse_forward_spec(addr: &str, port: u32) -> Result<ForwardSpec, SpecErro
         return Ok(ForwardSpec::Public { port: port16 });
     }
     if let Some(label) = addr.strip_prefix("vhost/") {
-        return validate_label(label).map(|label| ForwardSpec::Vhost { label });
+        return validate_label(label, MAX_VHOST_LABEL_LEN)
+            .map(|label| ForwardSpec::Vhost { label });
     }
     if let Some(id) = addr.strip_prefix("secret/") {
-        return validate_label(id).map(|id| ForwardSpec::SecretProvider { id });
+        return validate_label(id, MAX_SECRET_ID_LEN).map(|id| ForwardSpec::SecretProvider { id });
     }
     match port16 {
-        80 | 443 => validate_label(addr).map(|label| ForwardSpec::Vhost { label }),
-        0 => validate_label(addr).map(|id| ForwardSpec::SecretProvider { id }),
+        80 | 443 => {
+            validate_label(addr, MAX_VHOST_LABEL_LEN).map(|label| ForwardSpec::Vhost { label })
+        }
+        0 => validate_label(addr, MAX_SECRET_ID_LEN).map(|id| ForwardSpec::SecretProvider { id }),
         _ => Err(SpecError(format!(
             "ambiguous forward address {addr:?} on port {port16}; use a vhost/ or secret/ prefix"
         ))),
@@ -2841,7 +2881,8 @@ pub fn parse_forward_spec(addr: &str, port: u32) -> Result<ForwardSpec, SpecErro
 pub fn parse_direct_tcpip_dest(host: &str, port: u32) -> Result<String, SpecError> {
     let _ = port;
     let id = host.strip_prefix("secret/").unwrap_or(host);
-    validate_label(id).map_err(|_| SpecError(format!("invalid secret tunnel id {host:?}")))
+    validate_label(id, MAX_SECRET_ID_LEN)
+        .map_err(|_| SpecError(format!("invalid secret tunnel id {host:?}")))
 }
 
 /// Client-transport-only keys: features the native `bore` client implements
@@ -3669,6 +3710,36 @@ mod tests {
             "tcp-id".to_string()
         );
         assert!(parse_direct_tcpip_dest("example.com", 80).is_err());
+    }
+
+    #[test]
+    fn label_length_caps() {
+        // Vhost labels are DNS-bounded (63); secret ids get a looser 128 cap.
+        let label63 = "a".repeat(63);
+        let label64 = "a".repeat(64);
+        let id128 = "a".repeat(128);
+        let id129 = "a".repeat(129);
+
+        assert!(matches!(
+            parse_forward_spec(&format!("vhost/{label63}"), 8080).unwrap(),
+            ForwardSpec::Vhost { .. }
+        ));
+        assert!(parse_forward_spec(&format!("vhost/{label64}"), 8080).is_err());
+        // Bare-label heuristic paths hit the same caps.
+        assert!(parse_forward_spec(&label64, 80).is_err());
+        assert!(matches!(
+            parse_forward_spec(&id128, 0).unwrap(),
+            ForwardSpec::SecretProvider { .. }
+        ));
+        assert!(parse_forward_spec(&id129, 0).is_err());
+        assert!(parse_forward_spec(&format!("secret/{id129}"), 0).is_err());
+        // The error message names the size problem, not the charset.
+        let err = parse_forward_spec(&format!("vhost/{label64}"), 8080).unwrap_err();
+        assert!(err.to_string().contains("too long"), "got: {err}");
+
+        // direct-tcpip consumer lookups share the secret-id cap.
+        assert_eq!(parse_direct_tcpip_dest(&id128, 1).unwrap(), id128);
+        assert!(parse_direct_tcpip_dest(&id129, 1).is_err());
     }
 
     #[test]

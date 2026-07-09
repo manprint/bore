@@ -891,7 +891,7 @@ pub async fn relay_vhost(
                         debug!(%err, "vhost QUIC open_stream failed; using TCP carrier");
                         let opener = entry.pool.pick().context("no live vhost carrier")?;
                         opener
-                            .open_ready(forward_ip.as_deref())
+                            .open_ready(forward_ip.as_deref(), Some(addr))
                             .await
                             .context("vhost provider unavailable")?
                     }
@@ -899,7 +899,7 @@ pub async fn relay_vhost(
                 None => {
                     let opener = entry.pool.pick().context("no live vhost carrier")?;
                     opener
-                        .open_ready(forward_ip.as_deref())
+                        .open_ready(forward_ip.as_deref(), Some(addr))
                         .await
                         .context("vhost provider unavailable")?
                 }
@@ -909,7 +909,7 @@ pub async fn relay_vhost(
         {
             let opener = entry.pool.pick().context("no live vhost carrier")?;
             opener
-                .open_ready(forward_ip.as_deref())
+                .open_ready(forward_ip.as_deref(), Some(addr))
                 .await
                 .context("vhost provider unavailable")?
         }

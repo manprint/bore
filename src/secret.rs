@@ -612,7 +612,7 @@ pub async fn serve_consumer(
                     async move {
                         let _permit = permit;
                         let _active = ActiveGuard::new(active);
-                        if let Err(err) = relay(consumer_stream, registry, &id, grx, gtx, erx, etx).await {
+                        if let Err(err) = relay(consumer_stream, registry, &id, peer, grx, gtx, erx, etx).await {
                             trace!(%err, "secret relay closed");
                         }
                     }
@@ -696,15 +696,20 @@ async fn broker_udp(
 /// Shared by the native consumer relay ([`relay`]) and the SSH-gateway
 /// secret-consumer `direct-tcpip` path (`src/sshgw.rs`), so a dying provider
 /// carrier degrades identically on both transports (BUG-S4 guarantee).
+///
+/// `caller`, when known, is the consumer-side source address; it is threaded
+/// into an SSH provider's `forwarded-tcpip` originator fields and is a no-op
+/// (never on the wire) for a native mux provider.
 pub(crate) async fn open_with_failover(
     pool: &CarrierPool,
     id: &str,
+    caller: Option<SocketAddr>,
 ) -> io::Result<mux::LinkStream> {
     let attempts = pool.len().max(1);
     let mut last_err = None;
     for _ in 0..attempts {
         let Some(opener) = pool.pick() else { break };
-        match opener.open_ready(None).await {
+        match opener.open_ready(None, caller).await {
             Ok(stream) => return Ok(stream),
             Err(err) => {
                 trace!(%id, %err, "provider carrier open failed; trying next live carrier");
@@ -716,10 +721,14 @@ pub(crate) async fn open_with_failover(
 }
 
 /// Splice one consumer substream to a freshly opened provider substream.
+/// `peer` is the consumer's control-connection address, threaded to an SSH
+/// provider as the channel-open originator (native providers never see it).
+#[allow(clippy::too_many_arguments)]
 async fn relay(
     mut consumer: mux::Stream,
     registry: Registry,
     id: &str,
+    peer: SocketAddr,
     grx: Arc<std::sync::atomic::AtomicU64>,
     gtx: Arc<std::sync::atomic::AtomicU64>,
     erx: Arc<std::sync::atomic::AtomicU64>,
@@ -735,7 +744,7 @@ async fn relay(
         Some(pool) => pool,
         None => bail!("no provider registered for '{id}'"),
     };
-    let mut provider = open_with_failover(&pool, id)
+    let mut provider = open_with_failover(&pool, id, Some(peer))
         .await
         .context("all provider carriers unavailable")?;
 

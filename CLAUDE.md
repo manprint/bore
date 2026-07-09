@@ -668,6 +668,20 @@ the existing registries/relay/admin/weblog/`--max-conns` data path unmodified.
   Vendored-delta log: `crates/russh/HOL_FIX.md`. Rekey diagnostics env: `BORE_SSH_REKEY_BYTES`
   / `BORE_SSH_REKEY_SECS` (server-side russh never initiates count/time rekey in practice — the
   OpenSSH client's own RekeyLimit fires first under load; both directions verified non-wedging).
+- **I-SSH11 (originator truth + label caps, prod-readiness audit 2026-07-10):**
+  `mux::ChannelOpen::open`/`LinkOpener::open_ready` carry `caller: Option<SocketAddr>`
+  — SSH-ONLY input for the RFC 4254 `forwarded-tcpip` originator ip+port (previously
+  hardcoded port 0, ip only when webserver-log). The mux wire is governed SOLELY by
+  `forward_ip` (`Some ⟺ client_wants_logging`, bare IP — access-log format) and stays
+  byte-identical whether/what `caller` is passed — never serialize it there. Native
+  secret relay passes the consumer control-conn `peer`; SSH direct-tcpip passes the
+  `-L` client's own originator fields (best-effort parse, degrade to `0.0.0.0:0`,
+  never fail the open). Also `validate_label(label, max_len)`: vhost ≤ 63 (DNS label
+  limit), secret id ≤ 128 (roomier for native `--tcp-secret-id` interop) — bounds
+  attacker-chosen registry/admin-JSON strings. Full audit (5 dimensions, rejected
+  findings incl. why SO_*BUF on SSH sockets would HURT — clamps to `net.core.*mem_max`
+  and kills autotuning; remediation is sysctl-level):
+  `docs/SSH_GATEWAY_ASSESSMENT_2026-07-10.md`.
 - Regression/e2e: `tests/ssh_gateway_test.rs` (cargo, 36 tests incl. takeover, demux, SSH-over-TLS,
   the I-SSH6/I-SSH7/I-SSH8 shell-request-fix/banner/inapplicable-param-warning suite, the I-SSH10
   wedged-client pair) + `sudo -n /abs/path/scripts/ssh_gateway_test.sh` (netns chaos: T-SSH-N1..N6

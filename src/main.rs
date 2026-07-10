@@ -199,7 +199,9 @@ enum Command {
         /// providers (`--tcp-secret-id`) spread relayed consumer substreams
         /// across them. 1 keeps the current single-connection behaviour. >1
         /// avoids head-of-line blocking under concurrency; server-managed pools
-        /// are capped by `bore server --max-carriers`. Direct UDP ignores it.
+        /// are capped by `bore server --max-carriers`. With `--udp` it instead
+        /// sizes the direct QUIC pool: N parallel QUIC connections (each with its
+        /// own congestion controller), round-robined per proxied connection.
         #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
         carriers: u16,
 

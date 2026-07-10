@@ -1534,8 +1534,21 @@ impl DirectListener {
                 );
                 continue;
             }
-            send.write_all(&token).await?;
-            send.flush().await?;
+            // A verified peer that vanishes before we can send/flush our token
+            // reply is a benign stray, not an endpoint-level failure. Propagating
+            // it via `?` bubbled out of `accept()` and callers mislabeled it as
+            // "endpoint closed" (a misleading log plus a 100ms accept hiccup for
+            // an unrelated peer's reset). Treat it like the other stray arms above:
+            // log at debug and keep accepting. Only `.accept()`/`accept_bi()`
+            // endpoint-level errors remain fatal.
+            if let Err(err) = send.write_all(&token).await {
+                debug!(%peer, %err, "verified peer vanished before token reply sent; ignoring");
+                continue;
+            }
+            if let Err(err) = send.flush().await {
+                debug!(%peer, %err, "verified peer vanished before token reply flushed; ignoring");
+                continue;
+            }
             let _ = send.finish();
             info!(%peer, "accepted direct udp connection (provider, token verified)");
             let dc = DirectConn {

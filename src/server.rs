@@ -1844,18 +1844,17 @@ impl Server {
             let token = Uuid::new_v4().to_string();
             let (tx, rx) = mpsc::unbounded_channel();
             self.pending_carriers.insert(token.clone(), tx);
+            // Build the RAII guard BEFORE the fallible send: if the send fails,
+            // the `?` early-return unwinds through the guard's Drop and removes
+            // the token. Constructing it after the send (the previous order) left
+            // the token orphaned in `pending_carriers` forever on a send failure.
+            let guard = TokenGuard::new(Arc::clone(&self.pending_carriers), token.clone());
             control
-                .send(ServerMessage::CarrierToken {
-                    token: token.clone(),
-                    extra,
-                })
+                .send(ServerMessage::CarrierToken { token, extra })
                 .await?;
             info!(extra, "carrier pool offered");
             // The guard removes the token when this tunnel ends.
-            Some((
-                rx,
-                TokenGuard::new(Arc::clone(&self.pending_carriers), token),
-            ))
+            Some((rx, guard))
         } else {
             None
         };

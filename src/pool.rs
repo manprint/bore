@@ -127,3 +127,27 @@ pub async fn recv_carrier(
         None => std::future::pending().await,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pins the RAII contract the server relies on for BUG (CarrierToken leak):
+    // the token must be created into `pending_carriers` and a `TokenGuard` built
+    // BEFORE the fallible `CarrierToken` send, so that a send failure (`?`
+    // early-return) unwinds through this Drop and removes the orphaned token.
+    #[test]
+    fn token_guard_drop_removes_token() {
+        let registry: PendingCarriers = Arc::new(DashMap::new());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        registry.insert("tok-1".to_string(), tx);
+        {
+            let _guard = TokenGuard::new(Arc::clone(&registry), "tok-1".to_string());
+            assert!(registry.contains_key("tok-1"));
+        }
+        // Guard dropped (as it would on a `?` early-return before the send
+        // succeeds): the token is gone, no leak.
+        assert!(!registry.contains_key("tok-1"));
+        assert!(registry.is_empty());
+    }
+}

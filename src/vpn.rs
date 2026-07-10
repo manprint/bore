@@ -2488,9 +2488,83 @@ pub mod crypto {
         Ok(frame)
     }
 
+    /// A relay AEAD key with its ring key-schedule computed ONCE at link setup.
+    ///
+    /// The relay data path seals/opens one frame per packet; the previous
+    /// free-function API rebuilt `UnboundKey`/`LessSafeKey` (a fresh key
+    /// schedule) on every call. Caching the `LessSafeKey` moves that setup off
+    /// the per-packet path. The wire format is byte-identical to [`seal_with_counter`]
+    /// / [`open`] (verified by `sealkey_matches_free_fns`).
+    pub struct SealKey {
+        key: LessSafeKey,
+    }
+
+    impl SealKey {
+        /// Build a cached key. The only failure mode is a wrong key length,
+        /// which cannot occur for a `[u8; 32]` + a 32-byte-keyed algorithm.
+        pub fn new(key_bytes: &[u8; 32]) -> Result<Self> {
+            let unbound = UnboundKey::new(&CHACHA20_POLY1305, key_bytes)
+                .map_err(|_| anyhow::anyhow!("AEAD key init"))?;
+            Ok(Self {
+                key: LessSafeKey::new(unbound),
+            })
+        }
+
+        /// Seal with an explicit counter. Same output as [`seal_with_counter`].
+        pub fn seal_with_counter(&self, counter: u64, plaintext: &[u8]) -> Result<Vec<u8>> {
+            if counter >= MAX_COUNTER {
+                bail!("AEAD counter exhausted — tear down link");
+            }
+            let nonce = Nonce::assume_unique_for_key(nonce_from_counter(counter));
+            let mut buf = plaintext.to_vec();
+            self.key
+                .seal_in_place_append_tag(nonce, Aad::empty(), &mut buf)
+                .map_err(|_| anyhow::anyhow!("AEAD seal"))?;
+
+            let total_len = (8 + buf.len()) as u32;
+            let mut frame = Vec::with_capacity(4 + 8 + buf.len());
+            frame.extend_from_slice(&total_len.to_be_bytes());
+            frame.extend_from_slice(&counter.to_be_bytes());
+            frame.extend_from_slice(&buf);
+            Ok(frame)
+        }
+
+        /// Open a received frame body. Same semantics as [`open`].
+        pub fn open(&self, frame: &[u8]) -> Result<Vec<u8>> {
+            anyhow::ensure!(
+                frame.len() >= 8 + TAG_LEN,
+                "frame too short: {} bytes",
+                frame.len()
+            );
+            let ctr = u64::from_be_bytes(frame[..8].try_into().unwrap());
+            let nonce = Nonce::assume_unique_for_key(nonce_from_counter(ctr));
+            let mut buf = frame[8..].to_vec();
+            let plaintext = self
+                .key
+                .open_in_place(nonce, Aad::empty(), &mut buf)
+                .map_err(|_| anyhow::anyhow!("AEAD open — tampered or wrong key"))?;
+            Ok(plaintext.to_vec())
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn sealkey_matches_free_fns() {
+            // Wire-compat: cached-key output must be byte-identical to the
+            // free-function path, and cross-open both ways.
+            let key = [7u8; 32];
+            let sk = SealKey::new(&key).unwrap();
+            let pt = b"the quick brown fox jumps";
+            let a = sk.seal_with_counter(42, pt).unwrap();
+            let b = seal_with_counter(&key, 42, pt).unwrap();
+            assert_eq!(a, b, "cached seal must match free-fn seal");
+            // Open (frame body = bytes after the 4-byte length prefix).
+            assert_eq!(sk.open(&a[4..]).unwrap(), pt);
+            assert_eq!(open(&key, &b[4..]).unwrap(), pt);
+        }
 
         #[test]
         fn aead_roundtrip_ok() {
@@ -7709,8 +7783,9 @@ pub mod link {
         Relay {
             /// Channels to the background relay writer tasks (one per carrier).
             txs: Vec<mpsc::Sender<Bytes>>,
-            /// AEAD egress key (single key per direction, DEC-6).
-            key: [u8; 32],
+            /// AEAD egress key (single key per direction, DEC-6), with its ring
+            /// key-schedule cached once at link setup (shared across clones).
+            key: std::sync::Arc<super::crypto::SealKey>,
             /// Shared per-packet counter for nonce derivation (I-5).
             counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
             /// Round-robin cursor (local to this clone).
@@ -7729,7 +7804,7 @@ pub mod link {
                     txs, key, counter, ..
                 } => LinkSender::Relay {
                     txs: txs.clone(),
-                    key: *key,
+                    key: std::sync::Arc::clone(key),
                     counter: std::sync::Arc::clone(counter),
                     rr: 0,
                 },
@@ -7811,15 +7886,28 @@ pub mod link {
             })
             .collect();
 
+        // Cache the key schedule once per link (not per packet). Both keys are
+        // a fixed 32 bytes, so `SealKey::new` is infallible in practice.
+        let egress_key = std::sync::Arc::new(
+            super::crypto::SealKey::new(&keys.egress).expect("32-byte AEAD egress key"),
+        );
+        let ingress_key = std::sync::Arc::new(
+            super::crypto::SealKey::new(&keys.ingress).expect("32-byte AEAD ingress key"),
+        );
+
         let (fan_tx, fan_rx) = mpsc::channel::<Result<Bytes>>(RELAY_QUEUE);
         for stream in ingress {
-            tokio::spawn(relay_reader(stream, keys.ingress, fan_tx.clone()));
+            tokio::spawn(relay_reader(
+                stream,
+                std::sync::Arc::clone(&ingress_key),
+                fan_tx.clone(),
+            ));
         }
 
         (
             LinkSender::Relay {
                 txs,
-                key: keys.egress,
+                key: egress_key,
                 counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 rr: 0,
             },
@@ -7960,15 +8048,14 @@ pub mod link {
     /// loudly instead of limping on the surviving carriers.
     async fn relay_reader(
         mut read: crate::mux::Stream,
-        key: [u8; 32],
+        key: std::sync::Arc<super::crypto::SealKey>,
         fan_tx: mpsc::Sender<Result<Bytes>>,
     ) {
         let mut acc = BytesMut::with_capacity(RECV_BUF);
         let result: Result<()> = async {
             loop {
                 while let Some(frame) = take_frame(&mut acc)? {
-                    let plaintext =
-                        super::crypto::open(&key, &frame).context("AEAD open failed")?;
+                    let plaintext = key.open(&frame).context("AEAD open failed")?;
                     if fan_tx.send(Ok(Bytes::from(plaintext))).await.is_err() {
                         return Ok(()); // recver gone: normal teardown
                     }
@@ -8109,7 +8196,7 @@ pub mod link {
                         // Shared atomic counter: unique nonce even with multiple
                         // producers on the same egress key (I-5, DEC-6).
                         let ctr = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let frame = super::crypto::seal_with_counter(key, ctr, pkt)?;
+                        let frame = key.seal_with_counter(ctr, pkt)?;
                         *rr = (*rr + 1) % txs.len();
                         txs[*rr].send(Bytes::from(frame)).await.map_err(|_| {
                             anyhow::anyhow!("relay writer exited (write error on relay stream)")
@@ -8257,7 +8344,7 @@ pub mod link {
         async fn relay_sender_backpressure_no_loss() {
             // Capacity 1 so the second packet must wait for the consumer.
             let (tx, mut rx) = mpsc::channel::<Bytes>(1);
-            let key = [0u8; 32];
+            let key = std::sync::Arc::new(crate::vpn::crypto::SealKey::new(&[0u8; 32]).unwrap());
             let mut sender = LinkSender::Relay {
                 txs: vec![tx],
                 key,
@@ -8296,7 +8383,7 @@ pub mod link {
             let (tx, rx) = mpsc::channel::<Bytes>(8);
             // Drop the receiver — simulates the writer task having exited.
             drop(rx);
-            let key = [0u8; 32];
+            let key = std::sync::Arc::new(crate::vpn::crypto::SealKey::new(&[0u8; 32]).unwrap());
             let mut sender = LinkSender::Relay {
                 txs: vec![tx],
                 key,
@@ -8408,7 +8495,7 @@ pub mod link {
             }
             // Relay sender wired to owned channels so the test drains every frame.
             fn build(
-                key: [u8; 32],
+                key: Arc<super::super::crypto::SealKey>,
                 counter: Arc<AtomicU64>,
                 n: usize,
             ) -> (LinkSender, Vec<mpsc::Receiver<Bytes>>) {
@@ -8430,11 +8517,13 @@ pub mod link {
             }
 
             let mut pairs: HashSet<([u8; 32], u64)> = HashSet::new();
-            let key_a = [0xA5u8; 32];
+            let key_a =
+                std::sync::Arc::new(crate::vpn::crypto::SealKey::new(&[0xA5u8; 32]).unwrap());
+            let key_a_id = [0xA5u8; 32];
             let counter = Arc::new(AtomicU64::new(0));
 
             // 1+2. Link A: 3 carriers, 4 cloned producers, one shared counter.
-            let (sender, mut rxs) = build(key_a, Arc::clone(&counter), 3);
+            let (sender, mut rxs) = build(Arc::clone(&key_a), Arc::clone(&counter), 3);
             let mut producers = Vec::new();
             for q in 0..4u8 {
                 let mut s = sender.clone(); // shares the Arc counter (rr reset is fine)
@@ -8453,7 +8542,10 @@ pub mod link {
             for rx in &mut rxs {
                 while let Ok(frame) = rx.try_recv() {
                     let ctr = frame_ctr(&frame);
-                    assert!(pairs.insert((key_a, ctr)), "(key,ctr) reuse at ctr={ctr}");
+                    assert!(
+                        pairs.insert((key_a_id, ctr)),
+                        "(key,ctr) reuse at ctr={ctr}"
+                    );
                     count_a += 1;
                 }
             }
@@ -8462,7 +8554,7 @@ pub mod link {
 
             // 3. Fallback: a NEW clone of the SAME Arc counter (as the bridge does
             //    on FallBackToRelay). Counters must CONTINUE past 1000, never reset.
-            let (mut s2, mut rxs2) = build(key_a, Arc::clone(&counter), 1);
+            let (mut s2, mut rxs2) = build(Arc::clone(&key_a), Arc::clone(&counter), 1);
             let pkt = Bytes::from(vec![7u8; 80]);
             for _ in 0..500 {
                 s2.send_batch(std::slice::from_ref(&pkt)).await.unwrap();
@@ -8475,15 +8567,17 @@ pub mod link {
                     "fallback reset the counter to {ctr} (DEC-2 broken)"
                 );
                 assert!(
-                    pairs.insert((key_a, ctr)),
+                    pairs.insert((key_a_id, ctr)),
                     "(key,ctr) reuse after fallback: {ctr}"
                 );
             }
 
             // 4. Reconnect: fresh key, counter restarts at 0. Pairs stay unique
             //    BECAUSE the key differs — counter overlap with link A is safe.
-            let key_b = [0x3Cu8; 32];
-            assert_ne!(key_a, key_b);
+            let key_b =
+                std::sync::Arc::new(crate::vpn::crypto::SealKey::new(&[0x3Cu8; 32]).unwrap());
+            let key_b_id = [0x3Cu8; 32];
+            assert_ne!(key_a_id, key_b_id);
             let (mut s3, mut rxs3) = build(key_b, Arc::new(AtomicU64::new(0)), 1);
             for _ in 0..1000 {
                 s3.send_batch(std::slice::from_ref(&pkt)).await.unwrap();
@@ -8492,7 +8586,7 @@ pub mod link {
             while let Ok(frame) = rxs3[0].try_recv() {
                 let ctr = frame_ctr(&frame);
                 assert!(
-                    pairs.insert((key_b, ctr)),
+                    pairs.insert((key_b_id, ctr)),
                     "(key,ctr) reuse across reconnect at ctr={ctr}"
                 );
             }
@@ -9607,6 +9701,18 @@ pub mod hub {
     /// As an `async fn` the body would only run when the returned future is
     /// awaited — and the call site does not await it, so the accept task (and
     /// thus the entire relay data path) would silently never start.
+    /// Aborts the wrapped task when dropped. A bare `JoinHandle` drop does NOT
+    /// abort a tokio task, so long-lived hub tasks whose inputs (TUN, acceptor)
+    /// stay valid across the link — the accept task and coordinator — must be
+    /// held in one of these to be torn down when `run_listen_hub` returns.
+    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     fn spawn_accept_task(
         mut acceptor: crate::mux::Acceptor,
         tx: mpsc::Sender<HubSub>,
@@ -10465,8 +10571,12 @@ pub mod hub {
                 .await;
         }
 
-        // Spawn accept task.
-        let _accept_task = spawn_accept_task(acceptor, sub_tx);
+        // Spawn accept task. Guarded so it is aborted on EVERY exit path of this
+        // function (both `select!` arms return), not just leaked — a bare
+        // `JoinHandle` drop does NOT abort a tokio task, so an un-guarded accept
+        // task (and the coordinator below) would keep running after the hub link
+        // dies and accumulate one orphan set per reconnect.
+        let _accept_guard = AbortOnDrop(spawn_accept_task(acceptor, sub_tx));
 
         // Create bridge counters.
         let counters = BridgeCounters::new();
@@ -10481,12 +10591,12 @@ pub mod hub {
             router_tasks.push(task);
         }
 
-        // Spawn coordinator.
+        // Spawn coordinator (guarded, see accept task above).
         let devs_clone = devs.clone();
         let secret = args.secret.clone();
         let counters_clone = Arc::clone(&counters);
         let table_clone = Arc::clone(&peer_table);
-        let _coordinator_task = tokio::spawn(run_hub_coordinator(
+        let _coordinator_guard = AbortOnDrop(tokio::spawn(run_hub_coordinator(
             devs_clone,
             secret,
             counters_clone,
@@ -10498,30 +10608,38 @@ pub mod hub {
             args.clone(),
             admin_v2,
             out_tx.clone(),
-        ));
+        )));
 
         // Wait for any critical task to die.
-        tokio::select! {
+        let result: Result<()> = tokio::select! {
             res = ctrl_task => {
                 match res {
-                    Ok(Ok(())) => info!(link_id = %args.id, "hub control stream closed"),
+                    Ok(Ok(())) => {
+                        info!(link_id = %args.id, "hub control stream closed");
+                        Ok(())
+                    }
                     Ok(Err(e)) => {
                         warn!(link_id = %args.id, error = %e, "hub control stream error");
-                        return Err(e);
+                        Err(e)
                     }
                     Err(e) => {
                         warn!(link_id = %args.id, error = %e, "hub ctrl task panic");
-                        return Err(e.into());
+                        Err(e.into())
                     }
                 }
             }
             _ = async { futures_util::future::select_all(router_tasks.iter_mut()).await } => {
                 info!(link_id = %args.id, "hub router uplink died");
-                return Err(anyhow!("router uplink died"));
+                Err(anyhow!("router uplink died"))
             }
-        }
+        };
 
-        Ok(())
+        // Abort the surviving router uplinks; the accept/coordinator guards abort
+        // on scope exit. (The already-finished task in each arm is a no-op abort.)
+        for t in &router_tasks {
+            t.abort();
+        }
+        result
     }
 
     #[cfg(test)]

@@ -432,6 +432,35 @@ pub fn new_nonce() -> [u8; UDP_NONCE_LEN] {
     nonce
 }
 
+/// Maximum accepted VPN link id length (bytes). Bounds an attacker-chosen
+/// string that becomes a registry key, a `vpn:{id}` UDP-registry key, an admin
+/// label, and a log subject (parity with the SSH-gateway secret-id cap,
+/// I-SSH11). The id arrives on the wire in `HelloVpn`/`ConnectVpn`.
+pub const MAX_VPN_ID_LEN: usize = 128;
+
+/// Maximum number of advertised CIDRs accepted on one link. Bounds the per-link
+/// `Vec<Ipv4Net>` that is cloned into peer control messages and admin JSON.
+pub const MAX_ADVERTISED_CIDRS: usize = 64;
+
+/// Validate wire-supplied link parameters before doing any allocating work.
+/// Returns the error string to relay to the peer as `VpnError` when a bound is
+/// exceeded. Pure — unit-testable without a live connection.
+pub fn validate_link_params(id: &str, advertised: &[Ipv4Net]) -> Result<(), String> {
+    if id.len() > MAX_VPN_ID_LEN {
+        return Err(format!(
+            "vpn id too long ({} bytes, max {MAX_VPN_ID_LEN})",
+            id.len()
+        ));
+    }
+    if advertised.len() > MAX_ADVERTISED_CIDRS {
+        return Err(format!(
+            "too many advertised subnets ({}, max {MAX_ADVERTISED_CIDRS})",
+            advertised.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Check that no two subnets in `nets` overlap (including the overlay /30).
 /// Returns Some("overlapping subnets: X, Y") if overlap found.
 pub fn check_overlap(
@@ -557,6 +586,13 @@ pub async fn serve_vpn_listener(
     route_policy: Option<String>,
     nat_udp_preferred_port: u16,
 ) -> Result<()> {
+    // Bound attacker-chosen wire strings/lists before any allocating work.
+    if let Err(e) = validate_link_params(&id, &advertised) {
+        warn!(%id, error = %e, "rejecting vpn listener: invalid link params");
+        control.send(ServerMessage::VpnError(e)).await?;
+        return Ok(());
+    }
+
     // Acquire link permit (bounds live VPN links).
     // Display-only derivations for the admin panel.
     let nat_udp_display = (nat_udp_preferred_port != 0).then_some(nat_udp_preferred_port);
@@ -737,7 +773,7 @@ pub async fn serve_vpn_listener(
         // The hub's own VpnReady carries no peer routes (peer_advertised: vec![]);
         // its advertised CIDRs reach spokes via each connector's VpnReady instead.
         let (hub_overlay, hub_prefix) = {
-            let hub_state = hub.state.lock().unwrap();
+            let hub_state = hub.state.lock().unwrap_or_else(|p| p.into_inner());
             (hub_state.hub_overlay, hub_state.subnet.prefix)
         };
 
@@ -827,7 +863,7 @@ pub async fn serve_vpn_listener(
                     match msg {
                         Ok(Some(ClientMessage::UdpCandidateOffer(offer))) => {
                             {
-                                let mut hub_state = hub.state.lock().unwrap();
+                                let mut hub_state = hub.state.lock().unwrap_or_else(|p| p.into_inner());
                                 hub_state.set_hub_candidates(
                                     offer.peer_id,
                                     offer.candidates,
@@ -992,6 +1028,12 @@ pub async fn serve_vpn_connector(
     nat_udp_preferred_port: u16,
 ) -> Result<()> {
     info!(%id, "vpn connector connecting");
+    // Bound attacker-chosen wire strings/lists before any allocating work.
+    if let Err(e) = validate_link_params(&id, &advertised) {
+        warn!(%id, error = %e, "rejecting vpn connector: invalid link params");
+        control.send(ServerMessage::VpnError(e)).await?;
+        return Ok(());
+    }
     // Display-only: client's preferred holepunch port (0 = ephemeral/unset).
     let nat_udp_display = (nat_udp_preferred_port != 0).then_some(nat_udp_preferred_port);
 
@@ -1064,7 +1106,7 @@ pub async fn serve_vpn_connector(
         // the check and the alloc: two concurrent connectors can't both pass a
         // stale capacity check and over-allocate).
         let alloc = {
-            let mut state = hub.state.lock().unwrap();
+            let mut state = hub.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.peer_count() >= hub.max_clients as usize {
                 Err(format!("hub '{id}' is at capacity (--max-clients reached)"))
             } else {
@@ -1086,17 +1128,13 @@ pub async fn serve_vpn_connector(
             overlay: peer_slot.overlay,
         };
 
-        let hub_overlay = {
-            let state = hub.state.lock().unwrap();
-            state.hub_overlay
-        };
-        let hub_prefix = {
-            let state = hub.state.lock().unwrap();
-            state.subnet.prefix
-        };
-        let hub_advertised = {
-            let state = hub.state.lock().unwrap();
-            state.advertised.clone()
+        let (hub_overlay, hub_prefix, hub_advertised) = {
+            let state = hub.state.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                state.hub_overlay,
+                state.subnet.prefix,
+                state.advertised.clone(),
+            )
         };
 
         // Send VpnReady to connector
@@ -1213,7 +1251,7 @@ pub async fn serve_vpn_connector(
                 if let Some(offer) = spoke_offer.as_ref() {
                     // Clone out so no Mutex guard is held across an await point (DEC-6 pattern).
                     let hub_cands = {
-                        let hub_state = hub_clone.state.lock().unwrap();
+                        let hub_state = hub_clone.state.lock().unwrap_or_else(|p| p.into_inner());
                         hub_state.peers.get(&peer_id).map(|slot| {
                             (slot.hub_candidates.clone(), slot.hub_selected_stun.clone())
                         })
@@ -1252,7 +1290,8 @@ pub async fn serve_vpn_connector(
                             punched = true;
                             // Clear hub_candidates so the next round waits for a fresh offer from hub.
                             {
-                                let mut hub_state = hub_clone.state.lock().unwrap();
+                                let mut hub_state =
+                                    hub_clone.state.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Some(slot) = hub_state.peers.get_mut(&peer_id) {
                                     slot.hub_candidates.clear();
                                     slot.hub_selected_stun = None;
@@ -1697,6 +1736,22 @@ pub const DEFAULT_VPN_PUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_link_params_bounds() {
+        // Empty and normal ids are fine.
+        assert!(validate_link_params("", &[]).is_ok());
+        assert!(validate_link_params("home", &[]).is_ok());
+        // Id exactly at the cap passes; one byte over is rejected.
+        assert!(validate_link_params(&"a".repeat(MAX_VPN_ID_LEN), &[]).is_ok());
+        assert!(validate_link_params(&"a".repeat(MAX_VPN_ID_LEN + 1), &[]).is_err());
+        // Advertised list: at the cap passes, one over rejected.
+        let cidr: Ipv4Net = "10.0.0.0/24".parse().unwrap();
+        let at_cap = vec![cidr; MAX_ADVERTISED_CIDRS];
+        let over_cap = vec![cidr; MAX_ADVERTISED_CIDRS + 1];
+        assert!(validate_link_params("id", &at_cap).is_ok());
+        assert!(validate_link_params("id", &over_cap).is_err());
+    }
 
     fn entry_with_session(opener: mux::Opener, session: u64) -> VpnProviderEntry {
         let (pair_tx, _pair_rx) = oneshot::channel();

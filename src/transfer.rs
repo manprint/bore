@@ -7,7 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{BufRead, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,10 @@ const MAX_PARALLEL: u16 = 32;
 /// `--carriers N` is not clamped here (the server still enforces its own `--max-carriers`).
 const AUTO_CARRIER_CAP: u16 = DEFAULT_MAX_CARRIERS;
 const RESUME_FLUSH_EVERY_CHUNKS: u64 = 8;
+/// Upper bound on manifest entries a receiver will accept. Bounds both the upfront
+/// `Vec::with_capacity` (a hostile `total_entries: u64::MAX` would otherwise abort the
+/// process on allocation) and the total memory a peer can pin with manifest frames.
+const MAX_MANIFEST_ENTRIES: u64 = 2_000_000;
 const LOCAL_BIND: &str = "127.0.0.1:0";
 const LOCAL_HOST: &str = "127.0.0.1";
 const LOCAL_CONNECT_RETRIES: usize = 50;
@@ -464,6 +468,18 @@ impl ProgressTracker {
             let _ = task.await;
         }
         elapsed
+    }
+}
+
+/// Error paths drop the tracker without calling `finish()`; without this the 250 ms
+/// tick task would keep re-rendering a stale progress line for the process lifetime
+/// (one leaked task per failed transfer under a persistent listener).
+impl Drop for ProgressTracker {
+    fn drop(&mut self) {
+        self.shared.finished.store(true, Ordering::Relaxed);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -1039,7 +1055,10 @@ async fn send_stdin_stream(
         },
     )
     .await?;
-    match expect_frame(control).await? {
+    // The receiver verifies incrementally and replies right after StreamEnd, so this
+    // wait is stall-bounded (unlike the final Completed wait, which can legitimately
+    // take long while the receiver re-hashes resumed files and commits).
+    match with_stall(stall_timeout, expect_frame(control)).await? {
         Frame::StreamVerified { size, blake3 } => {
             if size != total || blake3 != digest {
                 bail!("receiver did not verify the same stdin stream");
@@ -1068,7 +1087,10 @@ async fn receive_transfer(
     let mut cleanup_stdin_dir: Option<PathBuf> = None;
 
     let outcome = async {
-        let begin = match expect_frame(&mut control).await? {
+        // The pre-manifest phase (Begin + manifest frames) must be stall-bounded too:
+        // an alive-but-silent sender would otherwise pin the listener forever (a
+        // persistent listener serves control connections sequentially).
+        let begin = match with_stall(stall_timeout, expect_frame(&mut control)).await? {
             Frame::Begin(begin) => begin,
             // A late data-stream connection from a previous (persistent) transfer. Surface it
             // as a typed, non-fatal error so the listener can skip it and keep serving.
@@ -1093,7 +1115,8 @@ async fn receive_transfer(
             "transfer incoming"
         );
 
-        let plan = receive_manifest(&mut control, begin, &dest_root, collision).await?;
+        let plan =
+            receive_manifest(&mut control, begin, &dest_root, collision, stall_timeout).await?;
 
         // Idempotent re-completion: the destination already holds content identical to this
         // manifest (a prior run committed but the Completed frame was lost, or the user simply
@@ -1368,12 +1391,56 @@ async fn receive_filesystem_streams(
     // `accept_worker_stream` watches the control connection so that if the sender dies
     // (interrupt/kill/network drop) after `ManifestAccepted` but before opening every data
     // stream, the receiver aborts with a clear error instead of blocking forever.
-    for connected in 0..expected_workers {
-        let stream = accept_worker_stream(incoming, control, stall_timeout)
+    // Bound on non-worker connections tolerated during the accept phase (e.g. a second
+    // sender's control connection): each is answered with an Error frame and dropped
+    // WITHOUT failing the in-flight transfer. The bound keeps a hostile peer from
+    // spinning this loop forever.
+    const STRAY_CONNECTION_LIMIT: usize = 64;
+    let mut strays = 0usize;
+    let mut connected = 0usize;
+    while connected < expected_workers {
+        let mut stream = accept_worker_stream(incoming, control, stall_timeout)
             .await
             .with_context(|| {
                 format!("only {connected} of {expected_workers} data streams connected")
             })?;
+        // Validate the first frame HERE instead of inside the spawned worker: a stray
+        // connection (another sender's Begin racing the in-flight transfer) used to be
+        // spawned as a worker, whose failure aborted the whole transfer.
+        match with_stall(stall_timeout, expect_frame(&mut stream)).await {
+            Ok(Frame::WorkerHello { transfer_id }) if transfer_id == resume.transfer_id => {}
+            Ok(other) => {
+                strays += 1;
+                if strays > STRAY_CONNECTION_LIMIT {
+                    bail!("too many unexpected connections while waiting for data streams");
+                }
+                let message = match other {
+                    Frame::Begin(_) => {
+                        "listener is busy with an in-flight transfer; retry when it completes"
+                            .to_string()
+                    }
+                    Frame::WorkerHello { transfer_id } => {
+                        format!("data stream for unexpected transfer id {transfer_id}")
+                    }
+                    other => format!("unexpected first worker frame: {other:?}"),
+                };
+                warn!(%message, "ignoring stray connection during transfer accept phase");
+                let _ = send_frame(&mut stream, &Frame::Error { message }).await;
+                continue;
+            }
+            Err(err) => {
+                // A stalled/broken half-open conn: drop it and keep waiting, bounded
+                // by the same stray budget.
+                strays += 1;
+                if strays > STRAY_CONNECTION_LIMIT {
+                    return Err(err)
+                        .context("too many broken connections while waiting for data streams");
+                }
+                warn!(%err, "dropping broken connection during transfer accept phase");
+                continue;
+            }
+        }
+        connected += 1;
         let resume = resume.clone();
         let progress = progress.clone();
         workers.spawn(async move {
@@ -1448,20 +1515,15 @@ fn validate_chunk_geometry(
     Ok(())
 }
 
+/// The `WorkerHello` frame has already been read and validated by the accept loop in
+/// `receive_filesystem_streams` (so a stray non-worker connection can be rejected
+/// without failing the transfer); this function starts directly at the chunk loop.
 async fn handle_worker_connection(
     mut stream: TcpStream,
     resume: Arc<ResumeShared>,
     progress: ProgressHandle,
     stall_timeout: u64,
 ) -> Result<()> {
-    match with_stall(stall_timeout, expect_frame(&mut stream)).await? {
-        Frame::WorkerHello { transfer_id } => {
-            if transfer_id != resume.transfer_id {
-                bail!("worker connected for unexpected transfer id {transfer_id}");
-            }
-        }
-        other => bail!("unexpected first worker frame: {other:?}"),
-    }
     progress.worker_started();
     let mut file_cache: HashMap<u32, tokio::fs::File> = HashMap::new();
     let worker_result = async {
@@ -1625,11 +1687,30 @@ async fn receive_manifest(
     begin: BeginFrame,
     dest_root: &Path,
     collision: CollisionPolicy,
+    stall_timeout: u64,
 ) -> Result<ReceiverPlan> {
+    if begin.total_entries > MAX_MANIFEST_ENTRIES {
+        bail!(
+            "manifest declares {} entries, above the supported maximum of {} — \
+             archive the tree (e.g. tar) and send it as a single file instead",
+            begin.total_entries,
+            MAX_MANIFEST_ENTRIES
+        );
+    }
     let mut entries = Vec::with_capacity(begin.total_entries as usize);
     loop {
-        match expect_frame(control).await? {
-            Frame::ManifestChunk { entries: chunk } => entries.extend(chunk),
+        match with_stall(stall_timeout, expect_frame(control)).await? {
+            Frame::ManifestChunk { entries: chunk } => {
+                entries.extend(chunk);
+                // Enforce the declared count *while receiving*: without this a peer
+                // could stream manifest frames unboundedly before the post-loop check.
+                if entries.len() as u64 > begin.total_entries {
+                    bail!(
+                        "peer sent more manifest entries than the declared {}",
+                        begin.total_entries
+                    );
+                }
+            }
             Frame::ManifestDone => break,
             other => bail!("unexpected frame while receiving manifest: {other:?}"),
         }
@@ -1700,12 +1781,14 @@ async fn receive_manifest(
     }
 
     let state_file = stage_dir.join(RESUME_STATE_FILE);
-    let (final_name, final_name_local, state, resumed_bytes, resume_plan) = if fs::try_exists(
-        &state_file,
-    )
-    .await?
+    let existing_state = if fs::try_exists(&state_file).await? {
+        load_resume_state(&state_file).await?
+    } else {
+        None
+    };
+    let (final_name, final_name_local, state, resumed_bytes, resume_plan) = if let Some(state) =
+        existing_state
     {
-        let state = load_resume_state(&state_file).await?;
         if state.protocol_version != PROTOCOL_VERSION {
             bail!(
                 "resume state for transfer {} was created by protocol version {}",
@@ -2081,6 +2164,32 @@ async fn destination_satisfies_manifest(
     Ok(true)
 }
 
+/// Rebase the manifest entries rooted at top-level child `name` so their `rel_path`
+/// is relative to the child itself (the child entry becomes the "" root). Used by the
+/// multi-source commit to content-check an already-committed child. Encoding is
+/// roundtrip-stable (`encode(decode(x)) == x`) for the sender-produced forms; a child
+/// whose name only exists via a decode fallback yields no matches (conservative).
+fn entries_under_child(entries: &[ManifestEntry], name: &OsStr) -> Vec<ManifestEntry> {
+    let encoded = encode_component_os(name);
+    let prefix = format!("{encoded}/");
+    entries
+        .iter()
+        .filter_map(|entry| {
+            if entry.rel_path == encoded {
+                let mut rebased = entry.clone();
+                rebased.rel_path = String::new();
+                Some(rebased)
+            } else if let Some(rest) = entry.rel_path.strip_prefix(&prefix) {
+                let mut rebased = entry.clone();
+                rebased.rel_path = rest.to_string();
+                Some(rebased)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 async fn commit_stage(plan: &ReceiverPlan, collision: CollisionPolicy) -> Result<()> {
     if plan.multi_source {
         // Flat multi-source: move each top-level child of stage_root into dest_root.
@@ -2096,6 +2205,20 @@ async fn commit_stage(plan: &ReceiverPlan, collision: CollisionPolicy) -> Result
             let src = plan.stage_root.join(&name);
             let dst = dest_root.join(&name);
             if fs::try_exists(&dst).await? {
+                // A previous run of this same transfer may have committed this child
+                // before failing on a later one; without this check a retry would hit
+                // "destination already exists" forever under Fail/Rename (the resume
+                // state keeps the transfer alive but the committed child blocks it).
+                let rebased = entries_under_child(&plan.entries, &name);
+                if !rebased.is_empty()
+                    && destination_satisfies_manifest(&dst, &rebased, false).await?
+                {
+                    debug!(
+                        child = %name.to_string_lossy(),
+                        "destination child already matches the manifest; skipping commit"
+                    );
+                    continue;
+                }
                 match collision {
                     CollisionPolicy::Fail | CollisionPolicy::Rename => {
                         bail!("destination already exists: {}", dst.display());
@@ -2187,11 +2310,10 @@ fn read_source_files(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
         let content = std::fs::read_to_string(file)
             .with_context(|| format!("failed to read source list file {}", file.display()))?;
         for line in content.lines() {
-            if line.contains('#') {
-                continue;
-            }
             let trimmed = line.trim();
-            if trimmed.is_empty() {
+            // Only a line *starting* with '#' is a comment; a '#' inside a path is
+            // legal filename material and must not silently drop the entry.
+            if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
             paths.push(PathBuf::from(trimmed));
@@ -2451,6 +2573,7 @@ fn scan_multi_filesystem_transfer(
     if entries.len() <= 1 {
         bail!("nothing to transfer from the specified sources");
     }
+    hash_planned_entries(&mut entries)?;
 
     Ok(PlannedTransfer {
         transfer_id,
@@ -2550,6 +2673,7 @@ fn scan_filesystem_transfer(
     if entries.is_empty() {
         bail!("nothing to transfer from {}", source.display());
     }
+    hash_planned_entries(&mut entries)?;
     Ok(PlannedTransfer {
         transfer_id,
         root_name,
@@ -2627,7 +2751,6 @@ fn scan_entry(
 
     if file_type.is_file() {
         let size = metadata.len();
-        let full_hash = hash_file_sync(source)?;
         *total_bytes = total_bytes
             .checked_add(size)
             .context("transfer size overflow")?;
@@ -2637,7 +2760,10 @@ fn scan_entry(
                 rel_path: rel_path_string,
                 kind: EntryKind::RegularFile,
                 size: Some(size),
-                full_hash: Some(full_hash),
+                // Filled by `hash_planned_entries` after the scan: hashing inline here
+                // serialized a full read of every file on one thread before the first
+                // byte could be sent.
+                full_hash: None,
                 chunk_count: chunk_count_for(size),
                 symlink_target: None,
                 device: None,
@@ -2718,6 +2844,68 @@ fn scan_entry(
     }
 
     bail!("unsupported special file {}", source.display())
+}
+
+/// Compute `full_hash` for every regular-file entry produced by the scan, in parallel.
+/// The scan itself stays single-threaded (ordering matters for manifest determinism);
+/// hashing is the dominant cost on large trees and is order-independent, so it fans
+/// out across a small thread pool. Runs inside the caller's `spawn_blocking` context.
+fn hash_planned_entries(entries: &mut [PlannedEntry]) -> Result<()> {
+    let jobs: Vec<(usize, PathBuf)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.manifest.kind.is_regular_file() && entry.manifest.full_hash.is_none()
+        })
+        .map(|(index, entry)| {
+            let path = entry
+                .source_path
+                .clone()
+                .context("regular file is missing its source path")?;
+            Ok((index, path))
+        })
+        .collect::<Result<_>>()?;
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8)
+        .min(jobs.len());
+    if workers <= 1 {
+        for (index, path) in &jobs {
+            entries[*index].manifest.full_hash = Some(hash_file_sync(path)?);
+        }
+        return Ok(());
+    }
+    let next = AtomicUsize::new(0);
+    let hashed: Vec<(usize, Result<String>)> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let next = &next;
+            let jobs = &jobs;
+            handles.push(scope.spawn(move || {
+                let mut done = Vec::new();
+                loop {
+                    let slot = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((index, path)) = jobs.get(slot) else {
+                        break;
+                    };
+                    done.push((*index, hash_file_sync(path)));
+                }
+                done
+            }));
+        }
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("hash worker panicked"))
+            .collect()
+    });
+    for (index, hash) in hashed {
+        entries[index].manifest.full_hash = Some(hash?);
+    }
+    Ok(())
 }
 
 fn build_chunk_tasks(
@@ -2925,30 +3113,70 @@ impl ResumeShared {
 
 async fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec(value)?).await?;
-    // On Unix `fs::rename` atomically replaces an existing target, so a
-    // concurrent reader (resume on restart, the kill/resume test poller) never
-    // observes a missing file. Windows `rename` fails if the target exists, so
-    // there the old file must be removed first — that leaves a brief
-    // non-existence window, but Unix is the hot path and stays gap-free.
-    #[cfg(windows)]
-    if fs::try_exists(path).await? {
-        let _ = fs::remove_file(path).await;
-    }
-    fs::rename(&tmp, path).await?;
-    Ok(())
-}
-
-async fn read_json<T: for<'de> serde::Deserialize<'de>>(path: &Path) -> Result<T> {
-    Ok(serde_json::from_slice(&fs::read(path).await?)?)
+    let payload = serde_json::to_vec(value)?;
+    let path = path.to_path_buf();
+    spawn_blocking(move || {
+        // The tmp file is fsynced BEFORE the rename: without it, a crash after the
+        // rename metadata reaches disk but before the data blocks do leaves an
+        // empty/truncated state.json — which used to make every resume attempt fail
+        // until the user removed the state dir by hand.
+        {
+            let mut file = std::fs::File::create(&tmp)
+                .with_context(|| format!("failed to create {}", tmp.display()))?;
+            file.write_all(&payload)
+                .with_context(|| format!("failed to write {}", tmp.display()))?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", tmp.display()))?;
+        }
+        // On Unix `fs::rename` atomically replaces an existing target, so a
+        // concurrent reader (resume on restart, the kill/resume test poller) never
+        // observes a missing file. Windows `rename` fails if the target exists, so
+        // there the old file must be removed first — that leaves a brief
+        // non-existence window, but Unix is the hot path and stays gap-free.
+        #[cfg(windows)]
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("failed to move {} into place", tmp.display()))?;
+        // Best-effort directory fsync so the rename itself survives a crash.
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("state persist task failed")?
 }
 
 async fn persist_resume_state(path: &Path, state: &ResumeState) -> Result<()> {
     write_json_atomic(path, state).await
 }
 
-async fn load_resume_state(path: &Path) -> Result<ResumeState> {
-    read_json(path).await
+/// Load the resume state, treating a corrupt/unparseable file (crash mid-write on a
+/// pre-fsync build, torn disk) as "no resume state" instead of a hard error: the safe
+/// recovery is a fresh start (all chunks re-sent and re-verified), not failing every
+/// retry until the user manually removes the state directory.
+async fn load_resume_state(path: &Path) -> Result<Option<ResumeState>> {
+    let bytes = match fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(state) => Ok(Some(state)),
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                %err,
+                "resume state file is corrupt; starting the transfer fresh"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Wraps a future in a stall timeout. If `secs == 0`, the future runs without a timeout.
@@ -4633,5 +4861,443 @@ mod tests {
             "expected a timeout error, got: {err}"
         );
         drop(_client);
+    }
+
+    // ----- Audit 2026-07-10: regression tests for B1-B8 + P1 -----
+
+    #[test]
+    fn source_files_keep_paths_containing_hash() {
+        // B6: only a line STARTING with '#' is a comment; '#' inside a path is data.
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("list.txt");
+        std::fs::write(
+            &list,
+            "# full comment\n  # indented comment\n\n/data/project#backup/file.zip\nplain.txt\n",
+        )
+        .unwrap();
+        let paths = read_source_files(&[list]).unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/data/project#backup/file.zip"),
+                PathBuf::from("plain.txt")
+            ]
+        );
+    }
+
+    fn test_begin(total_entries: u64) -> BeginFrame {
+        BeginFrame {
+            protocol_version: PROTOCOL_VERSION,
+            transfer_id: "test-transfer".to_string(),
+            root_name: encode_component_os(OsStr::new("out")),
+            root_source: RootSourceKind::Filesystem,
+            total_entries,
+            total_bytes: Some(0),
+            transport: TransportMode {
+                direct_udp: false,
+                relay_tls: false,
+            },
+            requested_parallel: 1,
+            multi_source: false,
+        }
+    }
+
+    fn root_dir_entry() -> ManifestEntry {
+        ManifestEntry {
+            id: 0,
+            rel_path: String::new(),
+            kind: EntryKind::Directory,
+            size: None,
+            full_hash: None,
+            chunk_count: 0,
+            symlink_target: None,
+            device: None,
+            mode: None,
+        }
+    }
+
+    fn file_entry(id: u32, rel: &str, content: &[u8]) -> ManifestEntry {
+        ManifestEntry {
+            id,
+            rel_path: encode_relative_path(Path::new(rel)).unwrap(),
+            kind: EntryKind::RegularFile,
+            size: Some(content.len() as u64),
+            full_hash: Some(blake3::hash(content).to_hex().to_string()),
+            chunk_count: chunk_count_for(content.len() as u64),
+            symlink_target: None,
+            device: None,
+            mode: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_manifest_rejects_oversized_total_entries() {
+        // B1: a hostile total_entries must fail BEFORE the upfront allocation.
+        let dir = tempfile::tempdir().unwrap();
+        let (_client, mut server) = tcp_pair().await;
+        let err = receive_manifest(
+            &mut server,
+            test_begin(u64::MAX),
+            dir.path(),
+            CollisionPolicy::Fail,
+            5,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("above the supported maximum"),
+            "expected the manifest-entry cap error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_manifest_rejects_more_entries_than_declared() {
+        // B1: entries streaming past the declared count must bail mid-loop, not
+        // accumulate until ManifestDone.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, mut server) = tcp_pair().await;
+        let feeder = tokio::spawn(async move {
+            let _ = send_frame(
+                &mut client,
+                &Frame::ManifestChunk {
+                    entries: vec![
+                        root_dir_entry(),
+                        file_entry(1, "a", b"x"),
+                        file_entry(2, "b", b"y"),
+                    ],
+                },
+            )
+            .await;
+            client
+        });
+        let err = receive_manifest(
+            &mut server,
+            test_begin(1),
+            dir.path(),
+            CollisionPolicy::Fail,
+            5,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("more manifest entries"),
+            "expected the over-declared error, got: {err}"
+        );
+        drop(feeder.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn load_resume_state_treats_corrupt_file_as_fresh() {
+        // B4: a truncated/corrupt state.json (crash mid-write) must degrade to a fresh
+        // start, not permanently fail every resume attempt.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RESUME_STATE_FILE);
+        fs::write(&path, b"{\"protocol_version\": 3, \"transf")
+            .await
+            .unwrap();
+        assert!(load_resume_state(&path).await.unwrap().is_none());
+        // Missing file is also "no state", not an error.
+        assert!(load_resume_state(&dir.path().join("missing.json"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn write_json_atomic_roundtrips_resume_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RESUME_STATE_FILE);
+        let state = ResumeState {
+            protocol_version: PROTOCOL_VERSION,
+            transfer_id: "t".into(),
+            manifest_hash: "h".into(),
+            final_name: "f".into(),
+            files: vec![FileResumeState {
+                entry_id: 1,
+                completed: vec![true, false],
+            }],
+        };
+        persist_resume_state(&path, &state).await.unwrap();
+        let loaded = load_resume_state(&path).await.unwrap().expect("state");
+        assert_eq!(loaded.transfer_id, "t");
+        assert_eq!(loaded.files[0].completed, vec![true, false]);
+    }
+
+    #[tokio::test]
+    async fn progress_tracker_drop_stops_tick_task() {
+        // B2: dropping the tracker on an error path must stop the background renderer.
+        let tracker = ProgressTracker::new("test", Some(100), 1);
+        let shared = Arc::clone(&tracker.shared);
+        drop(tracker);
+        assert!(shared.finished.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn entries_under_child_rebases_paths() {
+        // B5 helper: entries rooted at child "a" are rebased relative to "a".
+        let entries = vec![
+            root_dir_entry(),
+            ManifestEntry {
+                id: 1,
+                rel_path: encode_relative_path(Path::new("a")).unwrap(),
+                kind: EntryKind::Directory,
+                size: None,
+                full_hash: None,
+                chunk_count: 0,
+                symlink_target: None,
+                device: None,
+                mode: None,
+            },
+            file_entry(2, "a/inner.txt", b"hello"),
+            file_entry(3, "b", b"other"),
+        ];
+        let rebased = entries_under_child(&entries, OsStr::new("a"));
+        assert_eq!(rebased.len(), 2);
+        assert_eq!(rebased[0].rel_path, "");
+        assert_eq!(
+            rebased[1].rel_path,
+            encode_relative_path(Path::new("inner.txt")).unwrap()
+        );
+        assert!(entries_under_child(&entries, OsStr::new("missing")).is_empty());
+    }
+
+    fn multi_source_plan(
+        dest_root: &Path,
+        stage_dir: PathBuf,
+        entries: Vec<ManifestEntry>,
+    ) -> ReceiverPlan {
+        let stage_root = stage_dir.join(MULTI_SOURCE_STAGE_ROOT);
+        ReceiverPlan {
+            begin: test_begin(entries.len() as u64),
+            entries,
+            final_name: encode_component_os(OsStr::new(MULTI_SOURCE_STAGE_ROOT)),
+            final_path: dest_root.to_path_buf(),
+            stage_dir,
+            stage_root,
+            resume: None,
+            resumed_bytes: 0,
+            resume_plan: Vec::new(),
+            multi_source: true,
+            already_complete: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_stage_multi_source_skips_already_committed_child() {
+        // B5: child "a" was committed by a previous partially-failed run; a retry with
+        // collision=Fail must skip it (content match) and commit the remaining child,
+        // instead of failing "destination already exists" forever.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        let stage_dir = dest.join(".state");
+        let plan = multi_source_plan(
+            dest,
+            stage_dir.clone(),
+            vec![
+                root_dir_entry(),
+                file_entry(1, "a", b"AAAA"),
+                file_entry(2, "b", b"BBBB"),
+            ],
+        );
+        fs::create_dir_all(&plan.stage_root).await.unwrap();
+        // dest/a already committed with matching content; staged copy holds stale bytes.
+        fs::write(dest.join("a"), b"AAAA").await.unwrap();
+        fs::write(plan.stage_root.join("a"), b"stale")
+            .await
+            .unwrap();
+        fs::write(plan.stage_root.join("b"), b"BBBB").await.unwrap();
+        commit_stage(&plan, CollisionPolicy::Fail).await.unwrap();
+        assert_eq!(fs::read(dest.join("a")).await.unwrap(), b"AAAA");
+        assert_eq!(fs::read(dest.join("b")).await.unwrap(), b"BBBB");
+    }
+
+    #[tokio::test]
+    async fn commit_stage_multi_source_still_fails_on_real_collision() {
+        // B5 guard: differing destination content is a genuine collision → Fail bails.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        let stage_dir = dest.join(".state");
+        let plan = multi_source_plan(
+            dest,
+            stage_dir.clone(),
+            vec![root_dir_entry(), file_entry(1, "a", b"AAAA")],
+        );
+        fs::create_dir_all(&plan.stage_root).await.unwrap();
+        fs::write(dest.join("a"), b"DIFFERENT").await.unwrap();
+        fs::write(plan.stage_root.join("a"), b"AAAA").await.unwrap();
+        let err = commit_stage(&plan, CollisionPolicy::Fail)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("destination already exists"),
+            "expected a collision error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn hash_planned_entries_matches_sequential_hash() {
+        // P1: the parallel post-pass must produce exactly hash_file_sync's digests.
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries = vec![PlannedEntry {
+            manifest: root_dir_entry(),
+            source_path: None,
+        }];
+        for i in 0..10u32 {
+            let path = dir.path().join(format!("f{i}"));
+            let content = vec![i as u8; 1000 + i as usize];
+            std::fs::write(&path, &content).unwrap();
+            let mut manifest = file_entry(i + 1, &format!("f{i}"), &content);
+            manifest.full_hash = None; // scan now leaves this unset
+            entries.push(PlannedEntry {
+                manifest,
+                source_path: Some(path),
+            });
+        }
+        hash_planned_entries(&mut entries).unwrap();
+        for (i, entry) in entries.iter().skip(1).enumerate() {
+            let expected = hash_file_sync(&dir.path().join(format!("f{i}"))).unwrap();
+            assert_eq!(entry.manifest.full_hash.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
+    fn scan_fills_full_hashes_after_parallel_pass() {
+        // P1: end-to-end through scan_filesystem_transfer — every regular file must
+        // leave the plan with a populated full_hash (the receiver rejects None).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("one.txt"), b"one").unwrap();
+        std::fs::write(root.join("sub/two.txt"), b"two").unwrap();
+        let plan = scan_filesystem_transfer(
+            "id".into(),
+            root,
+            SymlinkMode::Exclude,
+            DeviceMode::Exclude,
+            2,
+        )
+        .unwrap();
+        for entry in &plan.entries {
+            if entry.manifest.kind.is_regular_file() {
+                assert!(
+                    entry.manifest.full_hash.is_some(),
+                    "missing hash after scan"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stray_begin_during_accept_phase_does_not_kill_transfer() {
+        // B7: a second sender's control connection (Begin frame) arriving while the
+        // receiver is collecting worker data streams must be answered with an Error
+        // frame and skipped — never spawned as a worker whose failure aborts the
+        // in-flight transfer.
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"hello stray world";
+        let entries = vec![root_dir_entry(), file_entry(1, "f", content)];
+        let mut begin = test_begin(entries.len() as u64);
+        begin.total_bytes = Some(content.len() as u64);
+
+        // Build a real ReceiverPlan through receive_manifest.
+        let (mut manifest_client, mut control) = tcp_pair().await;
+        let feeder_entries = entries.clone();
+        let feeder = tokio::spawn(async move {
+            send_frame(
+                &mut manifest_client,
+                &Frame::ManifestChunk {
+                    entries: feeder_entries,
+                },
+            )
+            .await
+            .unwrap();
+            send_frame(&mut manifest_client, &Frame::ManifestDone)
+                .await
+                .unwrap();
+            manifest_client
+        });
+        let plan = receive_manifest(&mut control, begin, dir.path(), CollisionPolicy::Fail, 5)
+            .await
+            .unwrap();
+        let mut manifest_client = feeder.await.unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<TcpStream>();
+
+        // 1) Stray connection: a foreign sender's Begin.
+        let (mut stray_client, stray_server) = tcp_pair().await;
+        tx.send(stray_server).unwrap();
+        send_frame(&mut stray_client, &Frame::Begin(test_begin(1)))
+            .await
+            .unwrap();
+
+        // 2) The real worker stream.
+        let (mut worker_client, worker_server) = tcp_pair().await;
+        tx.send(worker_server).unwrap();
+        let digest = blake3::hash(content).to_hex().to_string();
+        let worker = tokio::spawn(async move {
+            send_frame(
+                &mut worker_client,
+                &Frame::WorkerHello {
+                    transfer_id: "test-transfer".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+            send_frame(
+                &mut worker_client,
+                &Frame::ChunkStart {
+                    entry_id: 1,
+                    chunk_index: 0,
+                    offset: 0,
+                    len: content.len() as u32,
+                    blake3: digest,
+                },
+            )
+            .await
+            .unwrap();
+            worker_client.write_all(content).await.unwrap();
+            send_frame(&mut worker_client, &Frame::WorkerDone)
+                .await
+                .unwrap();
+            match expect_frame(&mut worker_client).await.unwrap() {
+                Frame::WorkerComplete => {}
+                other => panic!("expected WorkerComplete, got {other:?}"),
+            }
+        });
+
+        // Control feeder: the sender's TransferSummary once workers finish.
+        let summary = summary_from_materialized_entries(&entries).unwrap();
+        let control_summary = summary.clone();
+        let control_feeder = tokio::spawn(async move {
+            send_frame(
+                &mut manifest_client,
+                &Frame::TransferSummary(control_summary),
+            )
+            .await
+            .unwrap();
+            manifest_client
+        });
+
+        let progress = ProgressTracker::new("test", None, 1);
+        let got = tokio::time::timeout(
+            Duration::from_secs(10),
+            receive_filesystem_streams(&mut control, &mut rx, &plan, &progress.handle(), 5),
+        )
+        .await
+        .expect("receive_filesystem_streams hung")
+        .expect("transfer must survive the stray Begin connection");
+        assert_eq!(got, summary);
+
+        // The stray sender must have received an Error frame, not a worker protocol.
+        match expect_frame(&mut stray_client).await {
+            Err(err) => assert!(
+                err.to_string().contains("busy"),
+                "stray sender should be told the listener is busy, got: {err}"
+            ),
+            Ok(other) => panic!("expected an Error frame for the stray sender, got {other:?}"),
+        }
+        worker.await.unwrap();
+        drop(control_feeder.await.unwrap());
+        progress.finish().await;
     }
 }

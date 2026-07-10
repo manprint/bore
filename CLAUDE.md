@@ -130,6 +130,20 @@ corresponding markdown documentation. Docs are part of the deliverable, not opti
   connection (BUG-S4). `--carriers N>1` on a secret `--udp` consumer that goes DIRECT
   is a single QUIC connection; it `warn!`s once (N applies only to the relay fallback,
   BUG-S5) — never silently ignored. See docs/SECRET_HARDENING_ASSESSMENT.md.
+- **Transfer hardening (audit 2026-07-10, `docs/transfer/TRANSFER_ASSESSMENT_2026-07-10.md`):**
+  receiver bounds manifests (`MAX_MANIFEST_ENTRIES`, count enforced mid-loop — never
+  `with_capacity` a peer-controlled u64); the pre-manifest phase (Begin + manifest frames) is
+  `with_stall`-bounded (a silent sender must not pin a persistent listener); the worker-accept
+  loop validates the FIRST frame itself and answers strays (a 2nd sender's `Begin`) with an
+  Error frame instead of spawning them as workers (whose failure aborted the in-flight
+  transfer, B7); `commit_stage` multi-source is per-child content-idempotent (a child
+  committed by a partially-failed run is skipped on retry — without it Fail/Rename retried
+  forever, B5); `write_json_atomic` fsyncs tmp before rename and a corrupt `state.json`
+  degrades to a FRESH start, never a permanent error (B4); `ProgressTracker` has a `Drop`
+  (error paths leaked the 250 ms tick task, B2); `--source-files` comments are leading-`#`
+  only (B6); sender pre-hash runs in `hash_planned_entries` (parallel, post-scan) — do not
+  move hashing back inline into `scan_entry` (single-threaded full-tree read before the
+  first byte, P1).
 - Client sends `Hello` before auth (yamux is lazy; without it, deadlock)
 - `HelloVpn`/`ConnectVpn` sent **before** auth (same lazy-yamux rule as `Hello`)
 - Server writes `mux::STREAM_READY` before splice (banner-first protocols need it)

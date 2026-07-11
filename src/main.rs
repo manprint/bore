@@ -2199,6 +2199,14 @@ async fn dispatch(command: Command) -> Result<()> {
                     .as_ref()
                     .map(|p| p.to_string_lossy().to_string()),
                 tls: config_tls,
+                ssh_gateway: false,
+                ssh_port: None,
+                ssh_advertise_address: None,
+                ssh_advertise_port: None,
+                ssh_auth_pubkey: false,
+                ssh_auth_password: false,
+                ssh_banner: false,
+                ssh_host_key_file: None,
             };
             server.set_config_view(config_view);
 

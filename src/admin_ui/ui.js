@@ -97,6 +97,8 @@ export function flagBadges(e) {
     if (e.upnp === true) b.push({ label: 'UPnP', kind: 'default' });
     if (e.try_port_prediction === true) b.push({ label: 'Port-Pred', kind: 'default' });
     if (e.nat_udp_preferred_port > 0) b.push({ label: `NAT:${e.nat_udp_preferred_port}`, kind: 'default' });
+    if (e.max_conns && e.max_conns > 0) b.push({ label: `max-conns:${e.max_conns}`, kind: 'default' });
+    if (e.stun_server) b.push({ label: `stun:${escapeHtml(e.stun_server)}`, kind: 'default' });
     return b;
 }
 

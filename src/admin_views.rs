@@ -43,6 +43,14 @@ pub struct SummaryView {
     pub port_range: String,
     /// Bind address for tunnel listeners.
     pub bind_tunnels: String,
+    /// SSH gateway enabled.
+    pub ssh_gateway: bool,
+    /// Number of SSH gateway tunnels (Secret provider/consumer only; vhost counts separately in vhost_domains).
+    pub ssh_tunnels: usize,
+    /// SSH gateway advertised address (if configured).
+    pub ssh_advertise_address: Option<String>,
+    /// SSH gateway advertised port (if configured).
+    pub ssh_advertise_port: Option<u16>,
 }
 
 /// Public tunnel entry (role=Public).
@@ -143,6 +151,10 @@ pub struct SecretView {
     pub relay_tx_bytes: u64,
     /// Relay rx bytes.
     pub relay_rx_bytes: u64,
+    /// Client implementation (Bore native or SSH gateway).
+    pub transport: crate::admin::Transport,
+    /// Identity presented by SSH client authentication (SSH only; None for native Bore).
+    pub identity: Option<String>,
 }
 
 /// Vhost subdomain provider.
@@ -195,6 +207,10 @@ pub struct VhostView {
     pub direct_pool: usize,
     /// TLS termination.
     pub tls: bool,
+    /// Client implementation (Bore native or SSH gateway).
+    pub transport: crate::admin::Transport,
+    /// Identity presented by SSH client authentication (SSH only; None for native Bore).
+    pub identity: Option<String>,
 }
 
 /// VPN link (listener or connector).
@@ -355,6 +371,22 @@ pub struct ConfigView {
     pub vhost_cert_file: Option<String>,
     /// TLS enabled on control port.
     pub tls: bool,
+    /// SSH gateway enabled.
+    pub ssh_gateway: bool,
+    /// SSH gateway listen port (if enabled).
+    pub ssh_port: Option<u16>,
+    /// SSH advertised address (if configured).
+    pub ssh_advertise_address: Option<String>,
+    /// SSH advertised port (if configured).
+    pub ssh_advertise_port: Option<u16>,
+    /// SSH public-key auth enabled.
+    pub ssh_auth_pubkey: bool,
+    /// SSH password auth enabled.
+    pub ssh_auth_password: bool,
+    /// SSH banner text enabled.
+    pub ssh_banner: bool,
+    /// SSH host key file path (no secret material).
+    pub ssh_host_key_file: Option<String>,
 }
 
 /// Server metrics: uptime, memory, bandwidth, live counts.
@@ -385,6 +417,18 @@ pub struct MetricsView {
     pub conn_rejections: u64,
     /// Direct-to-relay fallback count.
     pub direct_fallbacks: u64,
+    /// Server-side transmitted bytes per second (1s EWMA; 0 if sampler disabled).
+    pub rate_tx_bps: u64,
+    /// Server-side received bytes per second (1s EWMA; 0 if sampler disabled).
+    pub rate_rx_bps: u64,
+    /// Unix epoch seconds when metrics were sampled.
+    pub ts: u64,
+    /// Number of SSH gateway tunnels (SecretProvider/Consumer/Vhost with Transport::Ssh).
+    pub ssh_tunnels: usize,
+    /// Count of native Bore transport tunnels.
+    pub transport_bore: usize,
+    /// Count of SSH gateway transport tunnels.
+    pub transport_ssh: usize,
 }
 
 #[cfg(test)]
@@ -412,6 +456,10 @@ mod tests {
             vhost_quic_port: Some(443),
             port_range: "5000-6000".into(),
             bind_tunnels: "0.0.0.0".into(),
+            ssh_gateway: false,
+            ssh_tunnels: 0,
+            ssh_advertise_address: None,
+            ssh_advertise_port: None,
         };
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["vhost_http_port"], 80);
@@ -503,6 +551,14 @@ mod tests {
             vhost_config: Some("/etc/bore/vhost.toml".into()),
             vhost_cert_file: Some("/certs/fullchain.pem".into()),
             tls: true,
+            ssh_gateway: false,
+            ssh_port: None,
+            ssh_advertise_address: None,
+            ssh_advertise_port: None,
+            ssh_auth_pubkey: false,
+            ssh_auth_password: false,
+            ssh_banner: false,
+            ssh_host_key_file: None,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["vhost_config"], "/etc/bore/vhost.toml");
@@ -529,6 +585,12 @@ mod tests {
             auth_failures: 0,
             conn_rejections: 0,
             direct_fallbacks: 0,
+            rate_tx_bps: 0,
+            rate_rx_bps: 0,
+            ts: 0,
+            ssh_tunnels: 0,
+            transport_bore: 0,
+            transport_ssh: 0,
         };
         let json = serde_json::to_value(&metrics).unwrap();
         assert_eq!(json["active_connections"], 42);
@@ -551,6 +613,12 @@ mod tests {
             auth_failures: 5,
             conn_rejections: 3,
             direct_fallbacks: 2,
+            rate_tx_bps: 0,
+            rate_rx_bps: 0,
+            ts: 0,
+            ssh_tunnels: 0,
+            transport_bore: 0,
+            transport_ssh: 0,
         };
         let json = serde_json::to_value(&metrics).unwrap();
         assert_eq!(json["auth_failures"], 5);
@@ -579,6 +647,10 @@ mod tests {
             vhost_quic_port: None,
             port_range: "5000-6000".into(),
             bind_tunnels: "0.0.0.0".into(),
+            ssh_gateway: false,
+            ssh_tunnels: 0,
+            ssh_advertise_address: None,
+            ssh_advertise_port: None,
         };
         let json = serde_json::to_value(&summary).unwrap();
         assert!(json["version"].is_string());
@@ -663,6 +735,14 @@ mod tests {
             vhost_config: None,
             vhost_cert_file: None,
             tls: false,
+            ssh_gateway: false,
+            ssh_port: None,
+            ssh_advertise_address: None,
+            ssh_advertise_port: None,
+            ssh_auth_pubkey: false,
+            ssh_auth_password: false,
+            ssh_banner: false,
+            ssh_host_key_file: None,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert!(json["control_port"].is_number());

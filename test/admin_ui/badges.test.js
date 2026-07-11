@@ -102,3 +102,23 @@ test('flagBadges regression: existing flags still work', () => {
     assert.ok(labels.includes('Auto-reconnect'));
     assert.ok(labels.includes('Weblog'));
 });
+
+test('flagBadges includes max_conns and stun_server badges', () => {
+    const labels = flagBadges({
+        max_conns: 10,
+        stun_server: 'stun.example.com'
+    }).map((b) => b.label);
+
+    assert.ok(labels.some((l) => l.includes('max-conns:10')), 'max-conns badge');
+    assert.ok(labels.some((l) => l.includes('stun:')), 'stun badge');
+});
+
+test('flagBadges omits max_conns and stun_server when absent or 0', () => {
+    const labels = flagBadges({
+        max_conns: 0,
+        stun_server: null
+    }).map((b) => b.label);
+
+    assert.ok(!labels.some((l) => l.includes('max-conns')), 'max-conns omitted when 0');
+    assert.ok(!labels.some((l) => l.includes('stun')), 'stun omitted when null');
+});

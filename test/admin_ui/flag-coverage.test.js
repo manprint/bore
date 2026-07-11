@@ -57,6 +57,56 @@ test('flagBadges treats both https (public) and tls (vhost) as a TLS-class badge
     assert.ok(flagBadges({ tls: true }).some((b) => b.kind === 'primary' && b.label === 'TLS'));
 });
 
+test('flagBadges: SSH badge appears when transport=ssh', () => {
+    const b = flagBadges({ transport: 'ssh' });
+    assert.ok(b.some((x) => x.label === 'SSH'), 'SSH badge present');
+    assert.equal(b[0].kind, 'primary');
+});
+
+test('flagBadges: secret entry with transport:ssh gets SSH badge', () => {
+    const secretEntry = {
+        id: 'sec1',
+        secret_id: 'mysecret',
+        role: 'secretprovider',
+        transport: 'ssh',
+        identity: 'user@client',
+        peer: '10.0.0.1:1234',
+        active: 1,
+        uptime_secs: 600,
+        relay_tx_bytes: 1000,
+        relay_rx_bytes: 500
+    };
+    const b = flagBadges(secretEntry);
+    assert.ok(b.some((x) => x.label === 'SSH'), 'SSH badge on secret SSH entry');
+});
+
+test('flagBadges: vhost entry with transport:ssh gets SSH badge', () => {
+    const vhostEntry = {
+        id: 'vh1',
+        subdomain: 'example.com',
+        transport: 'ssh',
+        identity: 'sshuser',
+        peer: '10.0.0.2:1234',
+        active: 2,
+        uptime_secs: 300,
+        relay_tx_bytes: 5000,
+        relay_rx_bytes: 2000
+    };
+    const b = flagBadges(vhostEntry);
+    assert.ok(b.some((x) => x.label === 'SSH'), 'SSH badge on vhost SSH entry');
+});
+
+test('flagBadges: SSH badge absent when transport is bore or missing', () => {
+    const boreEntry = { transport: 'bore' };
+    const missingEntry = {};
+
+    const b1 = flagBadges(boreEntry);
+    assert.ok(!b1.some((x) => x.label === 'SSH'), 'No SSH badge for bore transport');
+
+    const b2 = flagBadges(missingEntry);
+    assert.ok(!b2.some((x) => x.label === 'SSH'), 'No SSH badge for missing transport');
+});
+
 test('detail modal exposes any view field with no dedicated column (catch-all)', () => {
     // A vhost view carries fields not in the table (direct_pool, header pairs);
     // detailRows must surface every non-underscore field as a row.

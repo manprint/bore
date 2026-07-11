@@ -145,3 +145,53 @@ test('T-OVR2: overview Listeners & Ports card hidden when vhost disabled', async
     // (depends on the condition in overview.js)
     assert.ok(!foundPortsCard || !el._html?.includes('Vhost HTTP'), 'Vhost ports not shown when vhost disabled');
 });
+
+test('T-OVR-SSH: overview renders SSH Gateway card when ssh_gateway=true', async () => {
+    const data = {
+        version: '0.5.0',
+        control_port: 7835,
+        uptime_secs: 3600,
+        public_tunnels: 1,
+        secret_tunnels: 0,
+        vhost_domains: 0,
+        ssh_gateway: true,
+        ssh_advertise_address: 'ssh.example.com',
+        ssh_advertise_port: 2222,
+        ssh_tunnels: 5,
+        vpn_enabled: false,
+        vpn_links: 0
+    };
+
+    const el = document.createElement('div');
+    await overviewPanel.render(el, data);
+
+    const grid = el.children[0];
+    let foundSSH = false;
+    for (const card of grid.children) {
+        const html = card._html || '';
+        if (html.includes('SSH Gateway')) {
+            foundSSH = true;
+            assert.ok(html.includes('ssh.example.com'), 'SSH address shown');
+            assert.ok(html.includes('2222'), 'SSH port shown');
+        }
+    }
+    assert.ok(foundSSH, 'SSH Gateway card present');
+});
+
+test('T-OVR-SSH: overview omits SSH Gateway card when ssh_gateway=false', async () => {
+    const data = {
+        version: '0.5.0',
+        control_port: 7835,
+        uptime_secs: 3600,
+        public_tunnels: 1,
+        secret_tunnels: 0,
+        vhost_domains: 0,
+        ssh_gateway: false
+    };
+
+    const el = document.createElement('div');
+    await overviewPanel.render(el, data);
+
+    const text = el.textContent || '';
+    assert.ok(!text.includes('SSH Gateway'), 'SSH Gateway card not shown when disabled');
+});

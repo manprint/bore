@@ -30,6 +30,18 @@ export default {
             { label: 'Vhost', value: escapeHtml(String(data.vhost_domains || 0)) },
         ];
 
+        // SSH Gateway card
+        if (data.ssh_gateway) {
+            const advertise = [
+                data.ssh_advertise_address || '—',
+                data.ssh_advertise_port || '—'
+            ].join(':');
+            cards.push({
+                label: 'SSH Gateway',
+                value: escapeHtml(`${advertise} (${data.ssh_tunnels || 0} tunnels)`)
+            });
+        }
+
         if (data.vpn_enabled) {
             cards.push({ label: 'VPN Links', value: escapeHtml(String(data.vpn_links || 0)) });
         }

@@ -16,6 +16,10 @@ function flagBadgesHtml(link) {
     if (link.pin_mtu) parts.push(badge('Pin-MTU', 'default'));
     if (link.forward_accept) parts.push(badge('Forward-Accept', 'info'));
     if (link.nat_masquerade) parts.push(badge('NAT-Masquerade', 'warning'));
+    if (link.auto_reconnect) parts.push(badge('Auto-reconnect', 'success'));
+    if (link.mtu && link.mtu > 0) parts.push(badge(`mtu:${link.mtu}`, 'default'));
+    if (link.route_policy) parts.push(badge(`routes:${escapeHtml(link.route_policy)}`, 'default'));
+    if (link.carriers && link.carriers > 1) parts.push(badge(`x${link.carriers} carriers`, 'default'));
     if (parts.length === 0) return '';
     const html = parts.map(b => b.outerHTML).join(' ');
     return `<div><strong>Flags:</strong> ${html}</div>`;
@@ -59,7 +63,7 @@ function renderSide(link) {
             ${natHtml}
             ${flagBadgesHtml(link)}
             <div><strong>Uptime:</strong> ${escapeHtml(fmtDuration(link.uptime_secs))}</div>
-            <div><strong>TX:</strong> ${escapeHtml(fmtBytes(link.relay_tx_bytes))} | <strong>RX:</strong> ${escapeHtml(fmtBytes(link.relay_rx_bytes))}</div>
+            <div><strong>TX (relay):</strong> ${escapeHtml(fmtBytes(link.relay_tx_bytes))} | <strong>RX (relay):</strong> ${escapeHtml(fmtBytes(link.relay_rx_bytes))} <em style="font-size: 0.85em; color: #666;">(direct path shows ~0)</em></div>
         </div>
     `;
 

@@ -15,7 +15,7 @@ export const tunnelBadges = flagBadges;
 
 export default {
     id: 'tunnels',
-    title: 'Tunnels',
+    title: 'Public',
     route: 'tunnels',
     endpoint: '/admin/api/v1/tunnels',
     refreshMs: DEFAULT_REFRESH_MS,

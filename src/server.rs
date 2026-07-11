@@ -38,6 +38,22 @@ use crate::vhost::{self, VhostRegistry};
 #[cfg(feature = "vpn")]
 use crate::vpn_server;
 
+/// Compute transmitted/received bytes per second from byte counters and time delta.
+/// Returns 0 if dt_ms is 0 or if the current bytes is less than previous (saturation).
+/// Otherwise returns (cur - prev) * 1000 / dt_ms.
+pub(crate) fn compute_rate_bps(prev_bytes: u64, cur_bytes: u64, dt_ms: u64) -> u64 {
+    if dt_ms == 0 {
+        return 0;
+    }
+    match cur_bytes.checked_sub(prev_bytes) {
+        Some(delta) => {
+            // Use u128 to avoid overflow: (delta as u128) * 1000 / (dt_ms as u128)
+            ((delta as u128).saturating_mul(1000) / (dt_ms as u128)) as u64
+        }
+        None => 0, // cur < prev (wrapped or decreased)
+    }
+}
+
 /// Default cap on the number of concurrently proxied connections per tunnel
 /// connection. Bounds memory and file-descriptor use under a connection flood.
 /// Overridable with [`Server::set_max_conns`].
@@ -291,6 +307,12 @@ pub struct Server {
     /// Direct-to-relay fallback count.
     direct_fallbacks: Arc<AtomicU64>,
 
+    /// Server-side rate sampler: transmitted bytes per second (EWMA over 1s ticks).
+    rate_tx_bps: Arc<AtomicU64>,
+
+    /// Server-side rate sampler: received bytes per second (EWMA over 1s ticks).
+    rate_rx_bps: Arc<AtomicU64>,
+
     /// Serializable snapshot of server startup configuration (sanitized, D11).
     config_view: Arc<crate::admin_views::ConfigView>,
 
@@ -365,6 +387,10 @@ impl Server {
             auth_failures: Arc::new(AtomicU64::new(0)),
             conn_rejections: Arc::new(AtomicU64::new(0)),
             direct_fallbacks: Arc::new(AtomicU64::new(0)),
+
+            rate_tx_bps: Arc::new(AtomicU64::new(0)),
+            rate_rx_bps: Arc::new(AtomicU64::new(0)),
+
             config_view: Arc::new(crate::admin_views::ConfigView {
                 port_range: port_range_str,
                 control_port: CONTROL_PORT,
@@ -400,6 +426,14 @@ impl Server {
                 vhost_config: None,
                 vhost_cert_file: None,
                 tls: false,
+                ssh_gateway: false,
+                ssh_port: None,
+                ssh_advertise_address: None,
+                ssh_advertise_port: None,
+                ssh_auth_pubkey: false,
+                ssh_auth_password: false,
+                ssh_banner: false,
+                ssh_host_key_file: None,
             }),
             access_logger: None,
             access_logger_dropped: Arc::new(AtomicU64::new(0)),
@@ -507,6 +541,16 @@ impl Server {
         self.total_rx_bytes.load(Ordering::Relaxed)
     }
 
+    /// Server-side transmitted bytes per second (1s EWMA sampler).
+    pub fn rate_tx_bps(&self) -> u64 {
+        self.rate_tx_bps.load(Ordering::Relaxed)
+    }
+
+    /// Server-side received bytes per second (1s EWMA sampler).
+    pub fn rate_rx_bps(&self) -> u64 {
+        self.rate_rx_bps.load(Ordering::Relaxed)
+    }
+
     /// Shared atomic for accumulating sent bytes (used by relay code).
     pub fn total_tx_bytes_atomic(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.total_tx_bytes)
@@ -612,6 +656,12 @@ impl Server {
     /// Whether TLS is enabled on the control port.
     pub fn is_tls(&self) -> bool {
         self.tls.is_some()
+    }
+
+    /// Get the SSH gateway instance, if enabled.
+    #[cfg(feature = "ssh-gateway")]
+    pub fn ssh_gateway(&self) -> Option<Arc<crate::sshgw::SshGateway>> {
+        self.ssh_gateway.clone()
     }
 
     /// Whether UDP direct-path brokering is enabled.
@@ -789,6 +839,43 @@ impl Server {
             udp = this.udp,
             "server listening"
         );
+
+        // Server-side TX/RX rate sampler (admin metrics). Samples the global byte
+        // counters on a fixed 1 s tick and stores an EWMA-smoothed bytes/sec into
+        // `rate_tx_bps`/`rate_rx_bps`, so the admin API reports an instantaneous rate
+        // that does not depend on the client's poll cadence or wall clock (the old
+        // client-side two-poll delta showed 0 on idle 30 s intervals). Only spawned
+        // when the admin status page is enabled; it runs for the server's lifetime
+        // (`this` is owned by the process; unit tests never enter `listen`).
+        if this.admin_token.is_some() {
+            let tx_total = Arc::clone(&this.total_tx_bytes);
+            let rx_total = Arc::clone(&this.total_rx_bytes);
+            let tx_rate = Arc::clone(&this.rate_tx_bps);
+            let rx_rate = Arc::clone(&this.rate_rx_bps);
+            tokio::spawn(async move {
+                const TICK_MS: u64 = 1000;
+                let mut ticker = interval(std::time::Duration::from_millis(TICK_MS));
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                let mut prev_tx = tx_total.load(Ordering::Relaxed);
+                let mut prev_rx = rx_total.load(Ordering::Relaxed);
+                // Consume the immediate first tick (no delta yet).
+                ticker.tick().await;
+                // Light EWMA (α = 0.5): smoothed = raw/2 + previous/2 (overflow-safe).
+                let smooth = |raw: u64, slot: &Arc<AtomicU64>| {
+                    let prev = slot.load(Ordering::Relaxed);
+                    slot.store((raw / 2).saturating_add(prev / 2), Ordering::Relaxed);
+                };
+                loop {
+                    ticker.tick().await;
+                    let cur_tx = tx_total.load(Ordering::Relaxed);
+                    let cur_rx = rx_total.load(Ordering::Relaxed);
+                    smooth(compute_rate_bps(prev_tx, cur_tx, TICK_MS), &tx_rate);
+                    smooth(compute_rate_bps(prev_rx, cur_rx, TICK_MS), &rx_rate);
+                    prev_tx = cur_tx;
+                    prev_rx = cur_rx;
+                }
+            });
+        }
 
         // When vhost is configured, spawn the HTTP and/or HTTPS frontend listeners.
         if let Some(cfg_arc) = &this.vhost_config {
@@ -2200,5 +2287,50 @@ impl Server {
         while let Ok(Some(_)) = control.recv::<ClientMessage>().await {}
         alive.store(false, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn t_compute_rate_bps_zero_dt() {
+        // Zero time delta should always return 0.
+        assert_eq!(compute_rate_bps(0, 100, 0), 0);
+        assert_eq!(compute_rate_bps(100, 200, 0), 0);
+    }
+
+    #[test]
+    fn t_compute_rate_bps_growth() {
+        // 100 bytes in 1000ms = 100 B/s.
+        assert_eq!(compute_rate_bps(0, 100, 1000), 100);
+        // 1000 bytes in 500ms = 2000 B/s.
+        assert_eq!(compute_rate_bps(0, 1000, 500), 2000);
+        // 1024 bytes in 1024ms ≈ 1000 B/s.
+        assert_eq!(compute_rate_bps(0, 1024, 1024), 1000);
+    }
+
+    #[test]
+    fn t_compute_rate_bps_decrease() {
+        // Current bytes < previous bytes (wrapped or decreased) → 0.
+        assert_eq!(compute_rate_bps(200, 100, 1000), 0);
+        assert_eq!(compute_rate_bps(1000, 500, 1000), 0);
+    }
+
+    #[test]
+    fn t_compute_rate_bps_large_values() {
+        // Large byte counts should not overflow (using u128 intermediate).
+        // 1 GB transferred in 1000ms = 1 GB/s ≈ 1_000_000_000 B/s.
+        let gb = 1_000_000_000u64;
+        let rate = compute_rate_bps(0, gb, 1000);
+        assert_eq!(rate, gb); // 1 GB/s
+    }
+
+    #[test]
+    fn t_compute_rate_bps_saturation() {
+        // Saturation: rate when saturating an interval.
+        // 1 MB in 1s = 1,000,000 B/s.
+        assert_eq!(compute_rate_bps(0, 1_000_000, 1000), 1_000_000);
     }
 }

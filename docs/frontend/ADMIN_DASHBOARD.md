@@ -1,6 +1,6 @@
 # Admin Dashboard — Architecture & Operations
 
-**Status:** Phase 5 complete (2026-06-18). All API endpoints live, legacy compat verified, e2e harness ready.
+**Status:** Phase 6 complete (2026-07-11). SSH transport visibility, server-side rate sampling, production-readiness audit done.
 
 ## Overview
 
@@ -23,14 +23,14 @@ The server exposes **8 REST endpoints** under `/admin/api/v1/`, all guarded by t
 
 | Endpoint | Returns | Purpose |
 |----------|---------|---------|
-| `/admin/api/v1/summary` | `SummaryView` JSON | Version, control port, feature flags, server uptime, live section counts |
-| `/admin/api/v1/tunnels` | `[TunnelView]` | Public tunnel list: port, real peer IP, status, notes (expandable), tx/rx bytes |
-| `/admin/api/v1/secret` | `[SecretView]` | Secret (relay) tunnels: secret ID, peer, role, status, notes, bytes |
-| `/admin/api/v1/vhost` | `[VhostView]` | Vhost providers: subdomain, carrier pool, direct/relay metrics |
+| `/admin/api/v1/summary` | `SummaryView` JSON | Version, control port, feature flags, SSH gateway status, server uptime, live section counts |
+| `/admin/api/v1/tunnels` | `[TunnelView]` | Public tunnel list: port, real peer IP, status, transport (Bore\|SSH), identity, notes (expandable), tx/rx bytes |
+| `/admin/api/v1/secret` | `[SecretView]` | Secret (relay) tunnels: secret ID, peer, role, transport (Bore\|SSH), identity, status, notes, bytes |
+| `/admin/api/v1/vhost` | `[VhostView]` | Vhost providers: subdomain, transport (Bore\|SSH), identity, carrier pool, direct/relay metrics |
 | `/admin/api/v1/vpn` | `{links:[VpnLinkView]}` | VPN links + hub peers (Linux `--features vpn` only; empty array in non-VPN builds) |
 | `/admin/api/v1/certs` | `[CertView]` | TLS certificates: subject, SANs, expiry, days-remaining, path |
-| `/admin/api/v1/config` | `ConfigView` | Sanitized startup config (no secrets, tokens, or keys) |
-| `/admin/api/v1/metrics` | `MetricsView` | Uptime, RSS memory (Linux), cumulative bandwidth, live counts |
+| `/admin/api/v1/config` | `ConfigView` | Sanitized startup config: server settings + SSH Gateway summary (no secrets, tokens, or keys) |
+| `/admin/api/v1/metrics` | `MetricsView` | Uptime, RSS memory (Linux), bandwidth (cumulative + live rate), connection counts, transport breakdowns |
 
 All responses:
 - **Content-Type:** `application/json; charset=utf-8`
@@ -488,6 +488,90 @@ NAT real→exposed subnet mappings and per-connector accept/refuse route SUBNETS
 - **Vhost header values:** `request_header_pairs` and `response_header_pairs` expose full key+value pairs visible to the admin. Keys can include `Authorization`, `X-Api-Key`, etc. — this is **intentional** (operator needs them to debug gateway behavior). Token gates the entire `/admin/*` surface. A `warn!` is emitted when a sensitive key is injected, and the docs note the visibility. **No change to behavior — operator needs the data; just flagged.**
 - **CSP tightening:** removed `data:` from `img-src` to eliminate a theoretical confused-deputy surface.
 - **Token in transit:** always use TLS (`--tls`, `https://`) in production; the admin token is never logged or exposed in query strings.
+
+---
+
+## Phase 6 — SSH gateway integration & production-readiness audit (2026-07-11)
+
+Phases 1 and 2 (backend wire + frontend panels) are complete and deployed on branch `ssh`. Phase 6 is documentation and production-readiness validation.
+
+### Wire changes
+
+**SecretView, TunnelView, VhostView** (all three now include):
+```json
+{
+  "transport": "bore" | "ssh",
+  "identity": null | "string (SSH auth identity)"
+}
+```
+
+**SummaryView** now includes:
+```json
+{
+  "ssh_gateway": bool,
+  "ssh_tunnels": usize,
+  "ssh_advertise_address": "string | null",
+  "ssh_advertise_port": u16 | null
+}
+```
+
+**ConfigView** now includes SSH Gateway summary (NO secrets):
+```json
+{
+  "ssh_gateway": bool,
+  "ssh_port": u16 | null,
+  "ssh_advertise_address": "string | null",
+  "ssh_advertise_port": u16 | null,
+  "ssh_auth_pubkey": bool,
+  "ssh_auth_password": bool,
+  "ssh_banner": bool,
+  "ssh_host_key_file": "path only | null"
+}
+```
+
+**MetricsView** now includes:
+```json
+{
+  "rate_tx_bps": u64,
+  "rate_rx_bps": u64,
+  "ts": u64,
+  "ssh_tunnels": usize,
+  "transport_bore": usize,
+  "transport_ssh": usize
+}
+```
+
+The rate fields (`rate_tx_bps`, `rate_rx_bps`) are computed server-side via a 1-second EWMA sampler (enabled when `/admin/api/v1/metrics` is accessed; disabled on shutdown). Previously, frontend computed rates from two-poll deltas and showed "—"/0 when idle; this was a display bug and has been fixed.
+
+### Frontend changes
+
+**Public section renamed** from "Tunnels" to "Public" (internal route slug `#/tunnels` unchanged for back-compat). The section now shows:
+- All public tunnels with transport badge ("Bore" default, "SSH" when `transport === 'ssh'`) and `identity` in detail modal.
+
+**SSH visibility on Secret & Vhost**: Transport and identity now displayed as badges and in detail modals, matching Public.
+
+**Metrics panel**:
+- Rate TX/RX now read server-side `rate_tx_bps`/`rate_rx_bps` (no longer client-side delta).
+- New counter cards: Active Connections, Auth Failures, Conn Rejections, Direct Fallbacks, SSH Tunnels.
+- Transport breakdown: Bore vs SSH tunnel counts.
+
+**Overview panel**: New SSH Gateway card showing enabled status, advertise address:port, SSH tunnel count.
+
+**Config panel**: SSH Gateway section with pretty labels (ssh_gateway, ssh_port, advertise_address, advertise_port, auth_pubkey, auth_password, banner, host_key_file).
+
+**VPN panel**: TX/RX relabeled "TX (relay)"/"RX (relay)" with note that Direct-path links show ~0 relay bytes (expected—direct traffic bypasses relay counters).
+
+### Test coverage
+
+**Rust** (cargo test):
+- `compute_rate_bps` unit tests (rate math, sampler lifecycle)
+- `t_view_transport_default_bore`, `t_view_identity_ssh` (serialization)
+- All gates green; zero regressions vs Phase 5
+
+**JavaScript** (npm test):
+- 84 tests including SSH badge rendering, rate-not-"—" assertions
+- `metrics-rate.test.js` red-checked (reverting rate fix shows test fail)
+- Poller + app lifecycle tests confirm sampler teardown
 
 ---
 

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The three tunnel sections (Tunnels, Secret, Vhost) now share a unified column layout and logic. Vhost was refactored to be structurally identical to Tunnels, with Subdomain replacing Port and vhost-only fields isolated in dedicated columns. This parity ensures consistent UX and simplifies maintenance.
+The three tunnel sections (Public, Secret, Vhost) now share a unified column layout and logic. The "Tunnels" section has been renamed "Public" for clarity (route slug `#/tunnels` unchanged for back-compat). Vhost was refactored to be structurally identical to Public, with Subdomain replacing Port and vhost-only fields isolated in dedicated columns. All three sections now display SSH transport visibility (`transport` badge and `identity` field). This parity ensures consistent UX and simplifies maintenance.
 
 ## Column Layout
 
@@ -27,18 +27,22 @@ flag table below and `docs/frontend/ADMIN_FLAG_PARITY_PLAN.md`.
 
 All three sections use a single shared helper `flagBadges(entry)` in `src/admin_ui/ui.js` for consistency. Badges are shown when the flag is set:
 
-| Flag | Tunnels | Secret | Vhost | Badge |
-|------|---------|--------|-------|-------|
+| Flag | Public | Secret | Vhost | Badge |
+|------|--------|--------|-------|-------|
+| transport | ✓ | ✓ | ✓ | SSH (when transport='ssh') |
+| identity | ✓ | ✓ | ✓ | (shown in detail modal; SSH identity string) |
 | https | ✓ | — | — | HTTPS |
 | force_https | ✓ | — | — | Force-HTTPS |
 | tls | — | — | ✓ | TLS |
 | basic_auth | ✓ | ✓ | ✓ | Basic Auth |
 | udp | ✓ | ✓ | ✓ | UDP |
 | carriers > 1 | ✓ | ✓ | ✓ | x{N} carriers |
+| max_conns | ✓ | ✓ | — | max:{N} |
 | auto_reconnect | ✓ | ✓ | ✓ | Auto-reconnect |
 | webserver_log | ✓ | ✓ (provider) | ✓ | Weblog |
 | upnp | — | ✓ | — | UPnP |
 | try_port_prediction | — | ✓ | — | Port-Pred |
+| stun_server | — | ✓ | — | stun:{host} |
 | nat_udp_preferred_port > 0 | — | ✓ | — | NAT:{port} |
 
 Non-badge display fields surfaced in the modal: `local_host`/`local_port`
@@ -50,9 +54,9 @@ section. Secret tunnels have no public port, so `https`/`force_https` do not app
 
 ## Data Sources
 
-**Tunnels & Secret:** Serialized from the admin registry (`EntryView` → `TunnelView`/`SecretView` in `src/admin_views.rs`).
+**Public & Secret:** Serialized from the admin registry (`EntryView` → `TunnelView`/`SecretView` in `src/admin_views.rs`). As of Phase 6, both include `transport` (enum: Bore|Ssh) and `identity` (Option<String>).
 
-**Vhost:** Serialized from `VhostEntry` (in `src/vhost.rs`), which is now self-sufficient: carries peer, since, notes, basic_auth, udp, auto_reconnect, and webserver_log. Per-subdomain TX/RX counters are incremented in `relay_vhost` and require no admin-registry join.
+**Vhost:** Serialized from `VhostEntry` (in `src/vhost.rs`), which is now self-sufficient: carries peer, since, notes, basic_auth, udp, auto_reconnect, webserver_log, and as of Phase 6, `transport` and `identity`. Per-subdomain TX/RX counters are incremented in `relay_vhost` and require no admin-registry join.
 
 ## Known Gap
 

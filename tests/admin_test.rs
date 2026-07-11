@@ -376,7 +376,14 @@ fn assert_no_secret_keys(value: &serde_json::Value, path: &str) {
             // Exempt specific non-secret metadata fields:
             // - `secret_id`: public tunnel identifier (not a secret value)
             // - `secret_tunnels`: a counter of tunnels with secret IDs (not a secret value)
-            let is_exempt = key_lower == "secret_id" || key_lower == "secret_tunnels";
+            // - `ssh_host_key_file`: filesystem PATH to the host key (never the key bytes)
+            // - `ssh_auth_pubkey` / `ssh_auth_password`: bool flags "auth method enabled"
+            //   (never a key or password/hash). Substrings "key"/"password" are incidental.
+            let is_exempt = key_lower == "secret_id"
+                || key_lower == "secret_tunnels"
+                || key_lower == "ssh_host_key_file"
+                || key_lower == "ssh_auth_pubkey"
+                || key_lower == "ssh_auth_password";
             if !is_exempt {
                 assert!(
                     !key_lower.contains("secret")
@@ -458,6 +465,14 @@ fn t_views_serialize_stable() {
         vhost_config: None,
         vhost_cert_file: None,
         tls: false,
+        ssh_gateway: false,
+        ssh_port: None,
+        ssh_advertise_address: None,
+        ssh_advertise_port: None,
+        ssh_auth_pubkey: false,
+        ssh_auth_password: false,
+        ssh_banner: false,
+        ssh_host_key_file: None,
     };
     let json_config = serde_json::to_value(&config).expect("serialize ConfigView");
     assert_no_secret_keys(&json_config, "");
@@ -481,6 +496,10 @@ fn t_views_serialize_stable() {
         vhost_quic_port: Some(443),
         port_range: "5000-6000".into(),
         bind_tunnels: "0.0.0.0".into(),
+        ssh_gateway: false,
+        ssh_tunnels: 0,
+        ssh_advertise_address: None,
+        ssh_advertise_port: None,
     };
     let json_summary = serde_json::to_value(&summary).expect("serialize SummaryView");
     assert_no_secret_keys(&json_summary, "");
@@ -540,6 +559,8 @@ fn t_views_serialize_stable() {
         uptime_secs: 50,
         relay_tx_bytes: 512,
         relay_rx_bytes: 1024,
+        transport: bore_cli::admin::Transport::Bore,
+        identity: None,
     };
     let json_secret = serde_json::to_value(&secret).expect("serialize SecretView");
     assert_no_secret_keys(&json_secret, "");
@@ -574,6 +595,8 @@ fn t_views_serialize_stable() {
         response_header_pairs: vec![("x-app-version".into(), "1.0".into())],
         direct_pool: 5,
         tls: true,
+        transport: bore_cli::admin::Transport::Bore,
+        identity: None,
     };
     let json_vhost = serde_json::to_value(&vhost).expect("serialize VhostView");
     assert_no_secret_keys(&json_vhost, "");
@@ -593,6 +616,12 @@ fn t_views_serialize_stable() {
         auth_failures: 0,
         conn_rejections: 0,
         direct_fallbacks: 0,
+        rate_tx_bps: 0,
+        rate_rx_bps: 0,
+        ts: 0,
+        ssh_tunnels: 0,
+        transport_bore: 0,
+        transport_ssh: 0,
     };
     let json_metrics = serde_json::to_value(&metrics).expect("serialize MetricsView");
     assert_no_secret_keys(&json_metrics, "");

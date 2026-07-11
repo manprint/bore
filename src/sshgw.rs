@@ -371,6 +371,36 @@ impl SshGateway {
         self.config.port
     }
 
+    /// Advertised address for the gateway (operator-declared or None).
+    pub fn advertise_address(&self) -> Option<&str> {
+        self.config.advertise_address.as_deref()
+    }
+
+    /// Advertised port for the gateway (operator-declared or None).
+    pub fn advertise_port(&self) -> Option<u16> {
+        self.config.advertise_port
+    }
+
+    /// Whether public-key authentication is enabled.
+    pub fn auth_pubkey(&self) -> bool {
+        self.config.authorized_keys_dir.is_some()
+    }
+
+    /// Whether password authentication is enabled.
+    pub fn auth_password(&self) -> bool {
+        self.config.passwords_file.is_some()
+    }
+
+    /// Whether a pre-auth banner is configured.
+    pub fn has_banner(&self) -> bool {
+        self.config.banner.is_some()
+    }
+
+    /// Path to the host key file.
+    pub fn host_key_file(&self) -> &std::path::Path {
+        &self.config.host_key_file
+    }
+
     /// A fresh `russh::server::Config` for one accepted connection: the
     /// loaded host key, the pre-auth grace period, the auth-attempt cap, and
     /// the zombie-entry reaper (I-3).
@@ -895,6 +925,8 @@ impl GatewayHandler {
                 relay_tx_bytes: Arc::new(AtomicU64::new(0)),
                 relay_rx_bytes: Arc::new(AtomicU64::new(0)),
                 gateway_basic_auth,
+                transport: crate::admin::Transport::Ssh,
+                identity: Some(grant.identity.clone()),
             });
             match gateway.vhost_registry.entry(label.clone()) {
                 Entry::Occupied(_) => {

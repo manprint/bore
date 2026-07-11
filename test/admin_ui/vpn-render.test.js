@@ -231,3 +231,41 @@ test('T-VPNRENDER: vpn panel with empty links shows empty state', async () => {
 
     assert.ok(el.innerHTML.includes('No VPN links active'), 'empty state message shown');
 });
+
+
+test('T-VPNRENDER: vpn shows TX/RX labeled as relay with direct path note', async () => {
+    const data = {
+        links: [
+            {
+                id: 1,
+                link_id: 'site-a',
+                role: 'vpnlistener',
+                peer: '192.168.1.100:50000',
+                overlay: '10.99.0.1/32',
+                advertised: ['10.0.0.0/8'],
+                carriers: 1,
+                direct: false,
+                path: 'relay',
+                relay_tx_bytes: 100000,
+                relay_rx_bytes: 50000,
+                uptime_secs: 3600,
+                mode: '1:1',
+                auto_reconnect: false,
+                relay_only: false,
+                pin_mtu: false,
+                forward_accept: false,
+                nat_masquerade: false,
+                route_policy: null
+            }
+        ]
+    };
+
+    const el = document.createElement('div');
+    await vpnPanel.render(el, data);
+
+    const side = cardOf(el).children[1].children[0];
+    const text = side.innerHTML;
+    assert.ok(text.includes('TX (relay)'), 'TX labeled as relay');
+    assert.ok(text.includes('RX (relay)'), 'RX labeled as relay');
+    assert.ok(text.includes('direct path shows ~0'), 'direct path note present');
+});

@@ -15,13 +15,19 @@ pub fn summary(server: &Server) -> SummaryView {
     let vhost_reg = server.vhost_registry();
 
     let snapshot = admin.snapshot();
-    let (mut public_tunnels, mut secret_tunnels) = (0, 0);
+    let (mut public_tunnels, mut secret_tunnels, mut ssh_tunnels) = (0, 0, 0);
     // VPN link count must come from the long-lived admin registry: the provider
     // registry (`vpn_providers`) is consumed when a 1:1 link pairs, so its
     // `.len()` reads 0 for every established link. Count distinct shared ids.
     #[cfg(feature = "vpn")]
     let mut vpn_ids = std::collections::HashSet::new();
     for entry in &snapshot {
+        // Count SSH tunnels from secret provider/consumer.
+        if entry.transport == crate::admin::Transport::Ssh
+            && matches!(entry.role, Role::SecretProvider | Role::SecretConsumer)
+        {
+            ssh_tunnels += 1;
+        }
         match entry.role {
             Role::Public => public_tunnels += 1,
             Role::SecretProvider | Role::SecretConsumer => secret_tunnels += 1,
@@ -57,6 +63,10 @@ pub fn summary(server: &Server) -> SummaryView {
         vhost_quic_port: config.vhost_quic_port,
         port_range: config.port_range.clone(),
         bind_tunnels: config.bind_tunnels.clone(),
+        ssh_gateway: config.ssh_gateway,
+        ssh_tunnels,
+        ssh_advertise_address: config.ssh_advertise_address.clone(),
+        ssh_advertise_port: config.ssh_advertise_port,
     }
 }
 
@@ -125,6 +135,8 @@ pub fn secret(server: &Server) -> Vec<SecretView> {
             uptime_secs: e.uptime_secs,
             relay_tx_bytes: e.relay_tx_bytes,
             relay_rx_bytes: e.relay_rx_bytes,
+            transport: e.transport,
+            identity: e.identity,
         })
         .collect()
 }
@@ -215,6 +227,8 @@ pub fn vhost(server: &Server) -> Vec<VhostView> {
             response_header_pairs,
             direct_pool,
             tls: server.vhost_has_tls(),
+            transport: vhost_entry.transport,
+            identity: vhost_entry.identity.clone(),
         });
     }
     views.sort_by(|a, b| a.subdomain.cmp(&b.subdomain));
@@ -461,7 +475,29 @@ pub fn certs(server: &Server) -> Vec<CertView> {
 
 /// Build the server configuration view (already stored on Server).
 pub fn config(server: &Server) -> ConfigView {
-    (*server.config_view()).clone()
+    #[cfg(feature = "ssh-gateway")]
+    {
+        let mut view = (*server.config_view()).clone();
+
+        // Populate SSH gateway config from the running gateway instance.
+        if let Some(gateway) = server.ssh_gateway() {
+            view.ssh_gateway = true;
+            view.ssh_port = gateway.port();
+            view.ssh_advertise_address = gateway.advertise_address().map(|s| s.to_string());
+            view.ssh_advertise_port = gateway.advertise_port();
+            view.ssh_auth_pubkey = gateway.auth_pubkey();
+            view.ssh_auth_password = gateway.auth_password();
+            view.ssh_banner = gateway.has_banner();
+            view.ssh_host_key_file = Some(gateway.host_key_file().display().to_string());
+        }
+
+        view
+    }
+
+    #[cfg(not(feature = "ssh-gateway"))]
+    {
+        (*server.config_view()).clone()
+    }
 }
 
 /// Build the metrics section view.
@@ -470,13 +506,31 @@ pub fn metrics(server: &Server) -> MetricsView {
     let vhost_reg = server.vhost_registry();
 
     let snapshot = admin.snapshot();
-    let (mut public_tunnels, mut secret_tunnels, mut active_connections) = (0, 0, 0);
+    let (
+        mut public_tunnels,
+        mut secret_tunnels,
+        mut active_connections,
+        mut ssh_tunnels,
+        mut transport_bore,
+        mut transport_ssh,
+    ) = (0, 0, 0, 0, 0, 0);
     // See `summary`: count VPN links from the admin registry, not the ephemeral
     // provider registry (which empties on pairing).
     #[cfg(feature = "vpn")]
     let mut vpn_ids = std::collections::HashSet::new();
     for entry in &snapshot {
         active_connections += entry.active;
+        // Count transport types.
+        match entry.transport {
+            crate::admin::Transport::Bore => transport_bore += 1,
+            crate::admin::Transport::Ssh => transport_ssh += 1,
+        }
+        // Count SSH tunnels from secret provider/consumer.
+        if entry.transport == crate::admin::Transport::Ssh
+            && matches!(entry.role, Role::SecretProvider | Role::SecretConsumer)
+        {
+            ssh_tunnels += 1;
+        }
         match entry.role {
             Role::Public => public_tunnels += 1,
             Role::SecretProvider | Role::SecretConsumer => secret_tunnels += 1,
@@ -517,6 +571,15 @@ pub fn metrics(server: &Server) -> MetricsView {
         auth_failures: server.auth_failures(),
         conn_rejections: server.conn_rejections(),
         direct_fallbacks: server.direct_fallbacks(),
+        rate_tx_bps: server.rate_tx_bps(),
+        rate_rx_bps: server.rate_rx_bps(),
+        ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        ssh_tunnels,
+        transport_bore,
+        transport_ssh,
     }
 }
 
@@ -642,6 +705,12 @@ mod tests {
             auth_failures: 0,
             conn_rejections: 0,
             direct_fallbacks: 0,
+            rate_tx_bps: 0,
+            rate_rx_bps: 0,
+            ts: 0,
+            ssh_tunnels: 0,
+            transport_bore: 0,
+            transport_ssh: 0,
         };
         assert_eq!(view.public_tunnels, 0);
         assert_eq!(view.secret_tunnels, 0);
@@ -812,6 +881,14 @@ mod tests {
             vhost_config: None,
             vhost_cert_file: None,
             tls: false,
+            ssh_gateway: false,
+            ssh_port: None,
+            ssh_advertise_address: None,
+            ssh_advertise_port: None,
+            ssh_auth_pubkey: false,
+            ssh_auth_password: false,
+            ssh_banner: false,
+            ssh_host_key_file: None,
         };
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["udp_socket_send_buffer"].as_u64(), Some(16777216));
@@ -823,6 +900,14 @@ mod tests {
             udp_socket_recv_buffer: None,
             vhost_config: Some("/etc/bore/vhost.toml".into()),
             vhost_cert_file: Some("/certs/fullchain.pem".into()),
+            ssh_gateway: false,
+            ssh_port: None,
+            ssh_advertise_address: None,
+            ssh_advertise_port: None,
+            ssh_auth_pubkey: false,
+            ssh_auth_password: false,
+            ssh_banner: false,
+            ssh_host_key_file: None,
             ..view
         };
         let json_unset = serde_json::to_value(&view_unset).unwrap();
@@ -870,6 +955,14 @@ mod tests {
             vhost_config: Some("/etc/bore/vhost.toml".into()),
             vhost_cert_file: Some("/certs/cert.pem".into()),
             tls: true,
+            ssh_gateway: false,
+            ssh_port: None,
+            ssh_advertise_address: None,
+            ssh_advertise_port: None,
+            ssh_auth_pubkey: false,
+            ssh_auth_password: false,
+            ssh_banner: false,
+            ssh_host_key_file: None,
         };
         let json = serde_json::to_value(&view).unwrap();
         assert!(json["udp_stream_receive_window"].is_string());
@@ -913,12 +1006,16 @@ mod tests {
             uptime_secs: 100,
             relay_tx_bytes: 0,
             relay_rx_bytes: 0,
+            transport: crate::admin::Transport::Bore,
+            identity: None,
         };
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["notes"].as_str(), Some("provider notes"));
 
         let view_no_notes = SecretView {
             notes: None,
+            transport: crate::admin::Transport::Bore,
+            identity: None,
             ..view
         };
         let json_no_notes = serde_json::to_value(&view_no_notes).unwrap();
@@ -950,6 +1047,8 @@ mod tests {
             response_header_pairs: vec![("x-response".into(), "value2".into())],
             direct_pool: 3,
             tls: true,
+            transport: crate::admin::Transport::Bore,
+            identity: None,
         };
         let json = serde_json::to_value(&view).unwrap();
         assert!(json["request_header_pairs"].is_array());
@@ -984,6 +1083,8 @@ mod tests {
             response_header_pairs: vec![],
             direct_pool: 2,
             tls: false,
+            transport: crate::admin::Transport::Bore,
+            identity: None,
         };
         let json = serde_json::to_value(&view).unwrap();
         for key in [

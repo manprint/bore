@@ -1,5 +1,6 @@
 /**
- * T-LABELS: Table header labels test — verifies "Connections" not "Active".
+ * T-LABELS: Table header labels test — verifies "Connections" not "Active",
+ * and that the public-tunnels section is labelled "Public" (route slug unchanged).
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -7,6 +8,11 @@ import './dom-stub.js';
 import tunnelsPanel from '../../src/admin_ui/panels/tunnels.js';
 import secretPanel from '../../src/admin_ui/panels/secret.js';
 import vhostPanel from '../../src/admin_ui/panels/vhost.js';
+
+test('T-LABELS: tunnels sidebar title is "Public" (route slug unchanged)', () => {
+    assert.equal(tunnelsPanel.title, 'Public', 'Sidebar label is "Public"');
+    assert.equal(tunnelsPanel.route, 'tunnels', 'Route slug remains "tunnels"');
+});
 
 test('T-LABELS: tunnels table uses "Connections" header not "Active"', async () => {
     const data = [

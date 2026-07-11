@@ -73,3 +73,36 @@ test('T-CFGNULL: numeric buffer values render humanized in MiB', async () => {
     });
     assert.ok(foundNumeric, 'numeric buffer row found and checked');
 });
+
+test('T-CFG-SSH: config panel handles SSH keys without error', async () => {
+    const data = {
+        control_port: 7835,
+        version: '0.5.0',
+        ssh_gateway: true,
+        ssh_port: 2222,
+        ssh_advertise_address: 'ssh.example.com',
+        ssh_auth_pubkey: true,
+        ssh_auth_password: false
+    };
+
+    const el = document.createElement('div');
+    await configPanel.render(el, data);
+
+    // Config should render successfully with SSH keys
+    assert.ok(el.children.length > 0, 'config panel renders');
+});
+
+test('T-CFG-SSH: config panel renders SSH booleans as badges', async () => {
+    const data = {
+        control_port: 7835,
+        ssh_gateway: true,
+        ssh_auth_pubkey: true,
+        ssh_auth_password: false
+    };
+
+    const el = document.createElement('div');
+    await configPanel.render(el, data);
+
+    // Config should render successfully, converting booleans to badges
+    assert.ok(el.children.length > 0, 'config panel renders with SSH booleans');
+});

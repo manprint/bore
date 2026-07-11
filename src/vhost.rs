@@ -425,6 +425,10 @@ pub struct VhostEntry {
     /// `-R` forward has no such client process, so the gateway must gate the
     /// inbound request itself before opening a link toward the peer).
     pub gateway_basic_auth: Option<BasicAuth>,
+    /// Client implementation (Bore native or SSH gateway).
+    pub transport: crate::admin::Transport,
+    /// Identity presented by SSH client authentication (SSH only; None for native Bore).
+    pub identity: Option<String>,
 }
 
 /// Upper bound on QUIC direct connections pooled per vhost subdomain. The provider
@@ -651,6 +655,8 @@ pub async fn serve_vhost_provider(
                 relay_tx_bytes: Arc::new(AtomicU64::new(0)),
                 relay_rx_bytes: Arc::new(AtomicU64::new(0)),
                 gateway_basic_auth: None,
+                transport: crate::admin::Transport::Bore,
+                identity: None,
             });
             slot.insert(entry);
             pool
@@ -1975,6 +1981,8 @@ reservations:
             relay_tx_bytes: Arc::new(AtomicU64::new(0)),
             relay_rx_bytes: Arc::new(AtomicU64::new(0)),
             gateway_basic_auth,
+            transport: crate::admin::Transport::Bore,
+            identity: None,
         }
     }
 

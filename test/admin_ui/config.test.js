@@ -3,6 +3,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import './dom-stub.js';
 import configPanel from '../../src/admin_ui/panels/config.js';
 
@@ -92,7 +93,7 @@ test('T-CFG-SSH: config panel handles SSH keys without error', async () => {
     assert.ok(el.children.length > 0, 'config panel renders');
 });
 
-test('T-CFG-SSH: config panel renders SSH booleans as badges', async () => {
+test('T-CFG-SSH: SSH section keeps labels and values paired', async () => {
     const data = {
         control_port: 7835,
         ssh_gateway: true,
@@ -103,6 +104,24 @@ test('T-CFG-SSH: config panel renders SSH booleans as badges', async () => {
     const el = document.createElement('div');
     await configPanel.render(el, data);
 
-    // Config should render successfully, converting booleans to badges
-    assert.ok(el.children.length > 0, 'config panel renders with SSH booleans');
+    const container = el.children[0];
+    const headerIndex = container.children.findIndex(
+        child => child.classList.contains('config-header')
+    );
+    assert.equal(headerIndex, 1, 'SSH heading follows non-SSH rows');
+    assert.equal(container.children[headerIndex].textContent, 'SSH Gateway');
+
+    const sshRows = container.children.slice(headerIndex + 1);
+    const values = new Map(sshRows.map(row => [
+        row.children[0].textContent,
+        row.children[1].innerHTML,
+    ]));
+    assert.equal(values.get('SSH Gateway'), 'Yes');
+    assert.equal(values.get('Public-Key Auth'), 'Yes');
+    assert.equal(values.get('Password Auth'), 'No');
+});
+
+test('T-CFG-SSH: SSH heading spans both config columns', async () => {
+    const css = await readFile(new URL('../../src/admin_ui/style.css', import.meta.url), 'utf8');
+    assert.match(css, /\.config-header\s*\{[^}]*grid-column:\s*1\s*\/\s*-1;/s);
 });

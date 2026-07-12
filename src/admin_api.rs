@@ -39,7 +39,10 @@ pub fn summary(server: &Server) -> SummaryView {
         }
     }
 
-    let config = server.config_view();
+    // SSH gateway details are populated from the live gateway instance. The
+    // stored startup snapshot predates `set_ssh_gateway`, so using it here
+    // would incorrectly report a running gateway as disabled.
+    let config = config(server);
     SummaryView {
         version: format!(
             "{} - {} - {}",
@@ -977,6 +980,39 @@ mod tests {
         assert_eq!(json["vhost_cert_file"], "/certs/cert.pem");
         #[cfg(feature = "vpn")]
         assert!(json["vpn_punch_timeout"].is_number());
+    }
+
+    #[cfg(feature = "ssh-gateway")]
+    #[test]
+    fn t_ssh_gateway_config_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = crate::server::Server::new(1024..=65535, None);
+        server
+            .set_ssh_gateway(crate::sshgw::SshGatewayConfig {
+                port: Some(2222),
+                host_key_file: dir.path().join("host_key"),
+                authorized_keys_dir: Some(dir.path().join("authorized_keys.d")),
+                passwords_file: None,
+                banner: None,
+                window_size: crate::sshgw::SSH_DEFAULT_WINDOW_SIZE,
+                advertise_address: Some("ssh.example.test".into()),
+                advertise_port: Some(443),
+            })
+            .unwrap();
+
+        let config = super::config(&server);
+        assert!(config.ssh_gateway);
+        assert_eq!(config.ssh_port, Some(2222));
+        assert!(config.ssh_auth_pubkey);
+        assert!(!config.ssh_auth_password);
+
+        let summary = super::summary(&server);
+        assert!(summary.ssh_gateway);
+        assert_eq!(
+            summary.ssh_advertise_address.as_deref(),
+            Some("ssh.example.test")
+        );
+        assert_eq!(summary.ssh_advertise_port, Some(443));
     }
 
     #[test]

@@ -450,6 +450,19 @@ tr:hover {
     border-bottom: none;
 }
 
+/* A section heading is a grid item too. It must span both columns; otherwise
+   the first SSH key lands in column two and shifts every following key/value
+   pair by one cell. */
+.config-header {
+    grid-column: 1 / -1;
+    padding: 0.7rem 1rem;
+    border-top: 2px solid #dfe6e9;
+    border-bottom: 1px solid #dfe6e9;
+    background-color: #eef3f5;
+    color: #2c3e50;
+    font-weight: 700;
+}
+
 .config-key {
     background-color: #f9f9f9;
     font-weight: 600;

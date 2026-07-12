@@ -116,11 +116,21 @@ pub ssh_banner: bool,
 pub ssh_host_key_file: Option<String>,  // path ONLY, never key bytes
 ```
 
-Implementation: New `SshConfigSummary` struct stored on `Server` when `set_ssh_gateway()` is called. ConfigView builder reads this summary.
+Implementation: the ConfigView builder reads the live `SshGateway` installed by
+`set_ssh_gateway()`. This avoids the startup snapshot, created before gateway
+initialization, reporting an active gateway as disabled. The same live config
+feeds the Overview summary.
 
 **Security:** No ssh_host_key bytes, no password hashes—path + booleans only.
 
 Used by: Config panel (SSH Gateway section with pretty labels).
+
+### Layout correction (2026-07-13)
+
+`config-container` is a two-column CSS grid. Its SSH heading now spans both
+columns and has a distinct separator; without that span, the heading consumed
+the first cell and every SSH key/value pair appeared shifted and inverted.
+`T-CFG-SSH` guards both the rendered field pairing and the full-width heading.
 
 ---
 

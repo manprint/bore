@@ -13,3 +13,4 @@ crates/russh/target/
 scripts/dev/push-boretestdev-arm64.local.sh
 .agents
 skills-lock.json
+.tokensave

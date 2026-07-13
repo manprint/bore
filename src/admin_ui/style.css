@@ -154,6 +154,7 @@ tr:hover {
     font-size: 1.5rem;
     font-weight: 700;
     color: #2c3e50;
+    overflow-wrap: anywhere;
 }
 
 .notes-cell {
@@ -426,6 +427,7 @@ tr:hover {
 .config-container {
     display: grid;
     grid-template-columns: max-content 1fr;
+    grid-auto-rows: minmax(3rem, auto);
     background-color: #fff;
     border-radius: 4px;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
@@ -442,7 +444,10 @@ tr:hover {
     border-bottom: 1px solid #ecf0f1;
     font-family: monospace;
     font-size: 0.9rem;
-    align-self: start;
+    box-sizing: border-box;
+    align-self: stretch;
+    display: flex;
+    align-items: center;
 }
 
 .config-row:last-child .config-key,

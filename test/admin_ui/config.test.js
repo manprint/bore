@@ -125,3 +125,10 @@ test('T-CFG-SSH: SSH heading spans both config columns', async () => {
     const css = await readFile(new URL('../../src/admin_ui/style.css', import.meta.url), 'utf8');
     assert.match(css, /\.config-header\s*\{[^}]*grid-column:\s*1\s*\/\s*-1;/s);
 });
+
+test('T-CFG-LAYOUT: config cells share a uniform grid row height', async () => {
+    const css = await readFile(new URL('../../src/admin_ui/style.css', import.meta.url), 'utf8');
+
+    assert.match(css, /\.config-container\s*\{[^}]*grid-auto-rows:\s*minmax\(3rem,\s*auto\);/s);
+    assert.match(css, /\.config-key,\s*\.config-value\s*\{[^}]*align-self:\s*stretch;[^}]*align-items:\s*center;/s);
+});

@@ -65,8 +65,7 @@ async fn secret_provider_registers() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1024,
@@ -97,8 +96,7 @@ async fn secret_duplicate_id_rejected() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1024,
@@ -119,8 +117,7 @@ async fn secret_duplicate_id_rejected() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1024,
@@ -149,8 +146,7 @@ async fn secret_registration_requires_correct_secret() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1024,
@@ -170,8 +166,7 @@ async fn secret_registration_requires_correct_secret() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1024,
@@ -224,8 +219,7 @@ async fn spawn_secret_tunnel(id: &str, secret: Option<&str>) -> Result<std::net:
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1024,
@@ -244,8 +238,7 @@ async fn spawn_secret_tunnel(id: &str, secret: Option<&str>) -> Result<std::net:
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1, // carriers
@@ -290,8 +283,7 @@ async fn secret_tunnel_websocket_relay_round_trip() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0,
         1024,
@@ -310,8 +302,7 @@ async fn secret_tunnel_websocket_relay_round_trip() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0,
         1,
@@ -348,8 +339,7 @@ async fn secret_tunnel_websocket_direct_udp_round_trip() -> Result<()> {
         false,
         true,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0,
         1024,
@@ -369,8 +359,7 @@ async fn secret_tunnel_websocket_direct_udp_round_trip() -> Result<()> {
         false,
         true,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0,
         1,
@@ -439,8 +428,7 @@ async fn secret_multiple_consumers_concurrent() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1024,
@@ -462,8 +450,7 @@ async fn secret_multiple_consumers_concurrent() -> Result<()> {
             false,
             false,
             None,
-            false,
-            false,
+            bore_cli::holepunch::GatherOptions::from_flags(false, false),
             0,
             0, // release timeout
             1, // carriers
@@ -549,8 +536,7 @@ async fn secret_proxy_without_provider_closes() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1, // carriers
@@ -586,8 +572,7 @@ async fn secret_proxy_requires_correct_secret() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1, // carriers
@@ -646,8 +631,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1024,
@@ -672,8 +656,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1, // carriers
@@ -940,8 +923,7 @@ async fn secret_consumer_carriers_make_one_admin_entry() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0,
         1024,
@@ -962,8 +944,7 @@ async fn secret_consumer_carriers_make_one_admin_entry() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0,
         4, // carriers

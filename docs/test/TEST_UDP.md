@@ -411,6 +411,89 @@ report non è da buttare.
 
 ---
 
+### S11 — NAT lab deterministico (baseline Fase 0)
+
+Il NAT lab userspace (`tests/support/natlab.rs` + `tests/nat_traversal_test.rs`)
+esegue lo **stack di traversal di produzione** (STUN gather → punch → QUIC)
+attraverso NAT emulati con socket UDP reali su loopback: profili RFC 4787
+(mapping EIM/ADM/APDM × filtering EIF/ADF/APDF), allocazione porta
+preserve/sequential/random, hairpin, drop-all. Niente STUN pubblici, niente
+root, niente netns. Solo Linux (binda 127.0.0.0/8 per-box).
+
+```shell
+cargo test --test nat_traversal_test
+```
+
+**Tabella baseline** (esito ATTESO con lo stack attuale; ogni riga = un test):
+
+| # | Dialer (consumer) | Listener (provider) | Esito | Nota |
+|---|---|---|---|---|
+| 1 | nessun NAT | nessun NAT | **DIRECT** | `open_open_direct` |
+| 2 | EIM+APDF (cone) | EIM+APDF (cone) | **DIRECT** | `cone_cone_direct` |
+| 3 | EIM+ADF | APDM+APDF (symmetric) | **DIRECT** (era RED) | **FLIPPATA dalla Fase 2**: i connectivity check autenticati apprendono la sorgente peer-reflexive del listener simmetrico e la nominano (`…_direct_via_checks`, asserisce `learned_prflx`). Sul path legacy (peer vecchio) resta RELAY: `…_legacy_stays_relay` |
+| 4 | APDM+APDF (symmetric) | EIM+ADF | **DIRECT** | il mapping fresco del dialer passa l'ADF; il token autentica la sorgente non annunciata (I-6/D7) |
+| 5 | APDM+APDF | APDM+APDF | **RELAY** | non deve MAI diventare direct senza prediction (no falsi positivi, anche con i check) |
+| 6 | same-LAN (candidati local) | same-LAN | **DIRECT** | `same_lan_local_candidates_direct` |
+| 7 | UDP bloccato | EIM+APDF | **RELAY** | discovery senza reflexive |
+| 8 | APDM+APDF sequential(+1), prediction ON | EIM+APDF | **DIRECT** | l'unico caso in cui `--try-port-prediction` serve |
+
+Le righe 1-2, 4-8 girano sul path di PRODUZIONE Fase 2 (check autenticati,
+come ogni coppia secret new/new); la variante legacy (punch cieco) resta come
+oracolo di regressione. Regola: una tecnica di traversal nuova entra SOLO se
+flippa una riga RED del lab (o ne aggiunge una nuova rossa che poi flippa),
+senza regredire le verdi.
+
+**Smoke netns con NAT kernel reale** (binari interi + nftables masquerade,
+doppio NAT):
+
+```shell
+cargo build --release
+sudo -n /abs/path/scripts/udp_nat_netns_test.sh
+```
+
+Scenari: `T-NAT-DIRECT` (masquerade default ⇒ direct), `T-NAT-RANDOM-RELAY`
+(masquerade fully-random ⇒ relay, servizio vivo), `T-NAT-BLOCKED-RELAY` (UDP
+droppato lato consumer ⇒ relay, servizio vivo). Lo script rifiuta un binario
+release più vecchio di `src/` (stesso gate del VPN harness).
+
+> **Scoperta reale (pcap, Fase 0) — race di crossfire su conntrack.** Su un
+> router Linux con masquerade e INPUT permissivo, il punch del peer che arriva
+> **prima** che il punch locale sia uscito crea un entry conntrack INPUT sul
+> router che **ruba la reply-tuple**: il mapping del peer locale viene allora
+> rimappato a una porta random (osservato dal vivo: advertised `:59246`,
+> rimappato `:49254`) e l'hole-punch va in deadlock anche tra due NAT
+> "cone-friendly". I router domestici reali droppano l'unsolicited WAN input
+> (l'entry non confermata muore e la port preservation sopravvive) — lo script
+> emula questo con una chain INPUT drop. Nota per la Fase 2/3: il pacing dei
+> connectivity check e il peer-reflexive learning devono tener conto di questa
+> classe di NAT (crossfire troppo simmetrico ⇒ auto-avvelenamento).
+
+### S12 — Retry del diagnostico paired: round ri-brokerati (fix P1)
+
+Dal fix Fase 0, ogni retry di `test-udp --tcp-secret-id` è un **round completo**:
+socket nuovo → discovery nuova → `TestUdpJoin` fresco → il server attende il
+re-offer di ENTRAMBI i peer, conia nonce nuovo, ricalcola il piano adattivo e
+manda a entrambi un `TestUdpStart` con `generation` incrementata. Mai più punch
+su candidati stantii di un socket morto.
+
+- Output atteso: `Traversal round    : generation 0 (server retry
+  re-candidating: supported)` al pairing; su retry `re-offering N fresh
+  candidates` + `retry round generation N`.
+- **Server vecchio** (senza capability): i retry vengono SALTATI con nota
+  esplicita (i candidati stantii produrrebbero solo falsi negativi), non
+  eseguiti alla cieca come prima.
+- L'ordine adattivo dei candidati resta **advisory** nel DIAGNOSTICO: la riga
+  `Candidate order: advisory only (direct attempts dial all candidates
+  concurrently)` lo dichiara nel report (il fan-out concorrente è governato
+  dal budget, non dall'ordine). Nota Fase 3: l'ordine di default è ora
+  local-first (`local -> reflexive -> router-mapped -> predicted`), allineato
+  a `candidate_priority`; nei TUNNEL LIVE (secret/VPN 1:1) lo stesso piano
+  non è più solo advisory — governa i gruppi staggered del check round
+  (`docs/nat/NAT_TRAVERSAL.md` §17). `bore test-udp` paired resta sul path
+  legacy come baseline diagnostica.
+
+---
+
 ## 4. Checklist rapida
 
 - [ ] S0 loopback: `using direct udp path` + curl OK
@@ -425,6 +508,9 @@ report non è da buttare.
 - [ ] S9 `bore test-udp` su entrambi i peer: verdetto NAT coerente + consigli
 - [ ] S10 `test-udp --tcp-secret-id`: pairing A<->B, UDP diretto o fallback TCP, report bidirezionale
 - [ ] S10 con `--test-bandwidth`: banda/latenza misurate su UDP e TCP
+- [ ] S11 NAT lab: `cargo test --test nat_traversal_test` 8/8 (baseline rispettata)
+- [ ] S11 netns: `sudo -n /abs/path/scripts/udp_nat_netns_test.sh` PASS su direct/random/blocked
+- [ ] S12 retry paired: `generation` incrementa e i candidati sono freschi a ogni retry
 
 ---
 

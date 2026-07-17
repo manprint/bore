@@ -71,6 +71,122 @@ struct PeerStart {
     adaptive_plan: UdpAdaptivePlan,
     options: UdpTestOptions,
     tuning: UdpDirectTuning,
+    round: RoundCtx,
+}
+
+/// A re-brokered retry round delivered to one side's relay loop: fresh nonce,
+/// the OTHER peer's fresh candidates/summary, and the recomputed plan.
+struct RoundStart {
+    generation: u32,
+    nonce: [u8; UDP_NONCE_LEN],
+    peer_candidates: Vec<SocketAddr>,
+    peer_summary: UdpTestPeerSummary,
+    adaptive_plan: UdpAdaptivePlan,
+}
+
+/// Per-side handle to the paired session's retry-round broker.
+struct RoundCtx {
+    broker: Arc<RoundBroker>,
+    restarts: tokio::sync::mpsc::Receiver<RoundStart>,
+    side: usize,
+    role: UdpTestRole,
+    options: UdpTestOptions,
+    tuning: UdpDirectTuning,
+}
+
+/// Retry-round broker shared by the two server tasks of one paired session.
+///
+/// P1 fix (stale-candidate retries): a diagnostic retry used to bind a NEW
+/// socket while both peers kept punching the OLD round's candidates, so a NAT
+/// that allocates per-socket mappings made every retry a guaranteed miss. Now
+/// each side re-runs discovery and re-offers via a fresh `TestUdpJoin`; when
+/// BOTH re-offers are in, the broker mints a fresh nonce, recomputes the
+/// adaptive plan, bumps the generation, and hands both sides a [`RoundStart`].
+struct RoundBroker {
+    inner: std::sync::Mutex<RoundInner>,
+}
+
+struct RoundInner {
+    generation: u32,
+    offers: [Option<(Vec<SocketAddr>, UdpTestPeerSummary)>; 2],
+    to_side: [Option<tokio::sync::mpsc::Sender<RoundStart>>; 2],
+}
+
+impl RoundBroker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(RoundInner {
+                generation: 0,
+                offers: [None, None],
+                to_side: [None, None],
+            }),
+        })
+    }
+
+    /// Register one side's restart queue. Called once per side at pairing.
+    fn register(self: &Arc<Self>, side: usize) -> tokio::sync::mpsc::Receiver<RoundStart> {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).to_side[side] = Some(tx);
+        rx
+    }
+
+    /// Record one side's fresh re-offer. When both sides of the next round have
+    /// re-offered, fire the round: fresh nonce + recomputed plan + generation+1,
+    /// delivered to BOTH sides' restart queues. Returns the fired generation.
+    fn offer(
+        &self,
+        side: usize,
+        candidates: Vec<SocketAddr>,
+        summary: UdpTestPeerSummary,
+    ) -> Option<u32> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.offers[side] = Some((candidates, summary));
+        if !inner.offers.iter().all(Option::is_some) {
+            return None;
+        }
+        let (c0, s0) = inner.offers[0].take().expect("checked above");
+        let (c1, s1) = inner.offers[1].take().expect("checked above");
+        inner.generation += 1;
+        let generation = inner.generation;
+        let nonce = new_nonce();
+        let plan = adaptive_nat::plan_for_pair(
+            &adaptive_nat::NatProfile::from_summary(&s0),
+            &adaptive_nat::NatProfile::from_summary(&s1),
+        )
+        .to_wire();
+        // Each side receives the OTHER side's fresh candidates/summary.
+        let starts = [
+            RoundStart {
+                generation,
+                nonce,
+                peer_candidates: c1,
+                peer_summary: s1,
+                adaptive_plan: plan.clone(),
+            },
+            RoundStart {
+                generation,
+                nonce,
+                peer_candidates: c0,
+                peer_summary: s0,
+                adaptive_plan: plan,
+            },
+        ];
+        for (idx, start) in starts.into_iter().enumerate() {
+            if let Some(tx) = &inner.to_side[idx] {
+                if tx.try_send(start).is_err() {
+                    warn!(
+                        side = idx,
+                        "test-udp retry round dropped (restart queue full/closed)"
+                    );
+                }
+            }
+        }
+        info!(
+            generation,
+            "test-udp re-brokered retry round (fresh nonce + candidates + plan)"
+        );
+        Some(generation)
+    }
 }
 
 struct PendingGuard {
@@ -97,11 +213,14 @@ pub async fn serve_peer(
     registry: Registry,
     id: String,
     peer: SocketAddr,
-    candidates: Vec<SocketAddr>,
+    mut candidates: Vec<SocketAddr>,
     summary: UdpTestPeerSummary,
     options: UdpTestOptions,
     tuning: UdpDirectTuning,
 ) -> Result<()> {
+    // Peer-controlled list: validate/dedup/cap before storing/forwarding (I-11).
+    let san = holepunch::sanitize_candidates(&mut candidates);
+    holepunch::log_dropped_candidates("test-udp-join", candidates.len(), &san);
     if let Some((_key, pending)) = registry.remove(&id) {
         let nonce = new_nonce();
         let effective = merge_options(pending.options, options);
@@ -110,6 +229,25 @@ pub async fn serve_peer(
             &adaptive_nat::NatProfile::from_summary(&summary),
         )
         .to_wire();
+        // Retry-round broker: side 0 = first peer (Listener), side 1 = this
+        // peer (Dialer). Roles stay stable across retry rounds.
+        let broker = RoundBroker::new();
+        let first_round = RoundCtx {
+            broker: Arc::clone(&broker),
+            restarts: broker.register(0),
+            side: 0,
+            role: UdpTestRole::Listener,
+            options: effective,
+            tuning,
+        };
+        let second_round = RoundCtx {
+            broker: Arc::clone(&broker),
+            restarts: broker.register(1),
+            side: 1,
+            role: UdpTestRole::Dialer,
+            options: effective,
+            tuning,
+        };
         let first = PeerStart {
             role: UdpTestRole::Listener,
             nonce,
@@ -119,6 +257,7 @@ pub async fn serve_peer(
             adaptive_plan: adaptive_plan.clone(),
             options: effective,
             tuning,
+            round: first_round,
         };
         if pending.start_tx.send(first).is_ok() {
             info!(%id, first = %pending.peer, second = %peer, "paired udp diagnostic peers");
@@ -131,9 +270,11 @@ pub async fn serve_peer(
                     adaptive_plan: Some(adaptive_plan),
                     options: effective,
                     tuning,
+                    recandidate: true,
+                    generation: 0,
                 })
                 .await?;
-            return relay_loop(control, acceptor, pending.opener).await;
+            return relay_loop(control, acceptor, pending.opener, second_round).await;
         }
         warn!(%id, "waiting udp diagnostic peer disappeared before pairing");
     }
@@ -198,22 +339,51 @@ async fn wait_for_peer(
             adaptive_plan: Some(start.adaptive_plan),
             options: start.options,
             tuning: start.tuning,
+            recandidate: true,
+            generation: 0,
         })
         .await?;
-    relay_loop(control, acceptor, start.peer_opener).await
+    relay_loop(control, acceptor, start.peer_opener, start.round).await
 }
 
 async fn relay_loop(
     mut control: Delimited<mux::Stream>,
     mut acceptor: mux::Acceptor,
     peer_opener: mux::Opener,
+    mut round: RoundCtx,
 ) -> Result<()> {
     loop {
         tokio::select! {
             message = control.recv::<ClientMessage>() => {
                 match message? {
+                    // Retry re-offer (P1 fix): this side failed its direct
+                    // attempt, bound a fresh socket and re-ran discovery. Feed
+                    // the broker; when the peer re-offers too, both restart
+                    // queues get a fresh round.
+                    Some(ClientMessage::TestUdpJoin { candidates: mut cands, summary, .. }) => {
+                        let san = holepunch::sanitize_candidates(&mut cands);
+                        holepunch::log_dropped_candidates("test-udp-rejoin", cands.len(), &san);
+                        round.broker.offer(round.side, cands, summary);
+                    }
                     Some(_) => warn!("unexpected diagnostic control message after pairing"),
                     None => return Ok(()),
+                }
+            }
+            restart = round.restarts.recv() => {
+                if let Some(rs) = restart {
+                    control
+                        .send(ServerMessage::TestUdpStart {
+                            role: round.role,
+                            nonce: rs.nonce,
+                            peer_candidates: rs.peer_candidates,
+                            peer_summary: rs.peer_summary,
+                            adaptive_plan: Some(rs.adaptive_plan),
+                            options: round.options,
+                            tuning: round.tuning,
+                            recandidate: true,
+                            generation: rs.generation,
+                        })
+                        .await?;
                 }
             }
             inbound = acceptor.accept() => {
@@ -250,8 +420,7 @@ pub async fn run_peer_test(
     secret: Option<&str>,
     insecure: bool,
     stun_server: Option<&str>,
-    port_map: bool,
-    port_prediction: bool,
+    gather: holepunch::GatherOptions,
     preferred_port: u16,
     options: UdpTestOptions,
 ) -> Result<()> {
@@ -281,13 +450,15 @@ pub async fn run_peer_test(
             Vec::new()
         }
     };
-    let discovery = holepunch::gather_candidates_from_stun_targets(
-        &socket,
-        &stun_targets,
-        port_map,
-        port_prediction,
-    )
-    .await;
+    // Single-owner traversal socket: demuxed STUN chain under one budget.
+    // (inspect_local_nat above used the raw socket serially, which is safe:
+    // one reader at a time — the actor starts only now.)
+    let tsock = holepunch::UdpTraversalSocket::from_socket(socket);
+    let discovery = holepunch::gather_candidates_traversal(&tsock, &stun_targets, &gather).await;
+    let socket = tsock
+        .into_socket()
+        .await
+        .context("traversal socket handoff failed")?;
     match &discovery.selected_stun {
         Some(stun) => println!(
             "Live tunnel STUN used  : {} ({}, {}) -> {}",
@@ -349,10 +520,35 @@ pub async fn run_peer_test(
         start.options,
         &adaptive_plan,
     );
+    // Honest-output note (plan Fase 0): the adaptive candidate ORDER is
+    // advisory in this build — the direct attempt still dials all candidates
+    // concurrently under one budget. Only mode/retry/timeouts take effect.
+    println!(
+        "Candidate order    : advisory only (direct attempts dial all candidates concurrently)"
+    );
+    println!(
+        "Traversal round    : generation {} (server retry re-candidating: {})",
+        start.generation,
+        if start.recandidate {
+            "supported"
+        } else {
+            "unsupported (old server)"
+        }
+    );
 
     let token = holepunch::derive_token(secret, &start.nonce);
     let mut tcp_path = TestPath::Tcp { opener, acceptor };
 
+    let retry = RetryRegather {
+        id: tcp_secret_id,
+        endpoint: &endpoint,
+        stun_server,
+        gather: gather.clone(),
+        secret,
+        base_summary: local.summary.clone(),
+        options: start.options,
+        recandidate: start.recandidate,
+    };
     let udp = run_udp_path(
         socket,
         start.role,
@@ -362,6 +558,8 @@ pub async fn run_peer_test(
         start.options,
         &adaptive_plan,
         preferred_port,
+        &mut control,
+        &retry,
     )
     .await;
 
@@ -442,6 +640,8 @@ async fn wait_for_start(control: &mut Delimited<mux::Stream>) -> Result<StartInf
                 adaptive_plan,
                 options,
                 tuning,
+                recandidate,
+                generation,
             }) => {
                 return Ok(StartInfo {
                     role,
@@ -451,6 +651,8 @@ async fn wait_for_start(control: &mut Delimited<mux::Stream>) -> Result<StartInf
                     adaptive_plan,
                     options,
                     tuning,
+                    recandidate,
+                    generation,
                 });
             }
             Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
@@ -472,6 +674,121 @@ struct StartInfo {
     adaptive_plan: Option<UdpAdaptivePlan>,
     options: UdpTestOptions,
     tuning: UdpDirectTuning,
+    /// Server supports retry re-candidating (fresh round per retry).
+    recandidate: bool,
+    /// Traversal round number assigned by the server (0 = initial pairing).
+    generation: u32,
+}
+
+/// Context needed to re-run discovery + candidate exchange for a retry round
+/// (P1 fix: a retry binds a NEW socket, so the previous round's candidates are
+/// dead by construction on any per-socket-mapping NAT).
+#[cfg_attr(not(feature = "udp"), allow(dead_code))]
+struct RetryRegather<'a> {
+    id: &'a str,
+    endpoint: &'a Endpoint,
+    stun_server: Option<&'a str>,
+    gather: holepunch::GatherOptions,
+    secret: Option<&'a str>,
+    base_summary: UdpTestPeerSummary,
+    options: UdpTestOptions,
+    /// Server supports the re-candidate round (from `TestUdpStart`).
+    recandidate: bool,
+}
+
+/// A fresh retry round received from the server after both peers re-offered.
+#[cfg(feature = "udp")]
+struct FreshRound {
+    generation: u32,
+    nonce: [u8; UDP_NONCE_LEN],
+    peer_candidates: Vec<SocketAddr>,
+    peer_summary: UdpTestPeerSummary,
+    adaptive_plan: UdpAdaptivePlan,
+}
+
+/// How long a retrying peer waits for the server to re-broker the next round.
+/// Must exceed the OTHER peer's worst-case failed attempt + re-discovery
+/// (its own STUN chain can take several seconds before it re-offers).
+#[cfg(feature = "udp")]
+const RETRY_ROUND_WAIT: Duration = Duration::from_secs(30);
+
+/// Bind a fresh socket, re-run discovery, re-offer via `TestUdpJoin`, and wait
+/// for the re-brokered round (fresh nonce + peer candidates + plan).
+#[cfg(feature = "udp")]
+async fn regather_and_rejoin(
+    control: &mut Delimited<mux::Stream>,
+    retry: &RetryRegather<'_>,
+    preferred_port: u16,
+) -> Result<(tokio::net::UdpSocket, FreshRound)> {
+    let tsock = holepunch::UdpTraversalSocket::bind(preferred_port).await?;
+    let stun_targets = holepunch::resolve_live_stun_targets(
+        &retry.endpoint.host,
+        retry.endpoint.port,
+        retry.stun_server,
+    )
+    .await
+    .unwrap_or_default();
+    let discovery =
+        holepunch::gather_candidates_traversal(&tsock, &stun_targets, &retry.gather).await;
+    if discovery.candidates.is_empty() {
+        bail!("no fresh UDP candidates for the retry round");
+    }
+    let socket = tsock
+        .into_socket()
+        .await
+        .context("traversal socket handoff failed")?;
+    let mut summary = retry.base_summary.clone();
+    summary.candidate_kinds = discovery.candidate_kinds.clone();
+    summary.candidate_count = discovery.candidates.len();
+    summary.selected_stun = discovery
+        .selected_stun
+        .as_ref()
+        .map(|s| s.requested.clone());
+    println!(
+        "UDP direct path    : re-offering {} fresh candidates (discovery {}ms)",
+        discovery.candidates.len(),
+        discovery.discovery_ms
+    );
+    control
+        .send(ClientMessage::TestUdpJoin {
+            id: retry.id.to_string(),
+            candidates: discovery.candidates,
+            summary,
+            options: retry.options,
+        })
+        .await?;
+    let fresh = timeout(RETRY_ROUND_WAIT, async {
+        loop {
+            match control.recv().await? {
+                Some(ServerMessage::TestUdpStart {
+                    nonce,
+                    peer_candidates,
+                    peer_summary,
+                    adaptive_plan,
+                    generation,
+                    ..
+                }) => {
+                    return Ok::<_, anyhow::Error>(FreshRound {
+                        generation,
+                        nonce,
+                        peer_candidates,
+                        peer_summary,
+                        adaptive_plan: adaptive_plan
+                            .context("retry round carried no adaptive plan")?,
+                    });
+                }
+                Some(ServerMessage::Heartbeat) | Some(ServerMessage::Ok) => continue,
+                Some(ServerMessage::Error(err)) => bail!("server error: {err}"),
+                Some(_) => continue,
+                None => bail!("server closed during retry round"),
+            }
+        }
+    })
+    .await
+    .context(
+        "timed out waiting for the peer's retry round (peer may have succeeded or given up)",
+    )??;
+    Ok((socket, fresh))
 }
 
 #[cfg(feature = "udp")]
@@ -485,6 +802,8 @@ async fn run_udp_path(
     options: UdpTestOptions,
     adaptive_plan: &UdpAdaptivePlan,
     preferred_port: u16,
+    control: &mut Delimited<mux::Stream>,
+    retry: &RetryRegather<'_>,
 ) -> Option<PathMetrics> {
     println!();
     if adaptive_plan.mode == UdpAdaptiveMode::RelayOnly || peer_candidates.is_empty() {
@@ -493,41 +812,68 @@ async fn run_udp_path(
     }
     println!("UDP direct path    : trying QUIC hole punching");
     let attempts = adaptive_plan.retry_budget.max(1);
+    // Per-attempt state; every retry replaces ALL of it with a fresh round.
     let mut socket = Some(socket);
+    let mut token = token;
+    let mut peers = peer_candidates;
+    let mut read_timeout_ms = adaptive_plan.read_timeout_ms;
     for attempt in 0..attempts {
-        if attempt > 0 && adaptive_plan.send_delay_ms > 0 {
-            println!(
-                "UDP direct path    : retry {}/{} after {}ms",
-                attempt + 1,
-                attempts,
-                adaptive_plan.send_delay_ms
-            );
-            tokio::time::sleep(Duration::from_millis(adaptive_plan.send_delay_ms)).await;
-        } else if attempt > 0 {
-            println!("UDP direct path    : retry {}/{}", attempt + 1, attempts);
+        if attempt > 0 {
+            if !retry.recandidate {
+                println!(
+                    "UDP direct path    : retries skipped — this server predates retry \
+                     re-candidating (candidates from a dead socket would only produce \
+                     false negatives). Upgrade the server to re-test retries."
+                );
+                break;
+            }
+            if adaptive_plan.send_delay_ms > 0 {
+                println!(
+                    "UDP direct path    : retry {}/{} after {}ms",
+                    attempt + 1,
+                    attempts,
+                    adaptive_plan.send_delay_ms
+                );
+                tokio::time::sleep(Duration::from_millis(adaptive_plan.send_delay_ms)).await;
+            } else {
+                println!("UDP direct path    : retry {}/{}", attempt + 1, attempts);
+            }
         }
 
-        let attempt_socket = if attempt == 0 {
-            socket
-                .take()
-                .expect("direct UDP socket available for first attempt")
-        } else {
-            match holepunch::bind_socket(preferred_port).await {
-                Ok(socket) => socket,
+        let attempt_socket = match socket.take() {
+            Some(socket) => socket,
+            // Retry: full re-round — fresh socket, fresh discovery, fresh
+            // candidate exchange, fresh nonce/token and plan (P1 fix).
+            None => match regather_and_rejoin(control, retry, preferred_port).await {
+                Ok((socket, fresh)) => {
+                    token = holepunch::derive_token(retry.secret, &fresh.nonce);
+                    peers = order_peer_candidates(
+                        &fresh.peer_candidates,
+                        &fresh.peer_summary,
+                        &fresh.adaptive_plan,
+                    );
+                    read_timeout_ms = fresh.adaptive_plan.read_timeout_ms;
+                    println!(
+                        "UDP direct path    : retry round generation {} ({} fresh peer candidates)",
+                        fresh.generation,
+                        peers.len()
+                    );
+                    socket
+                }
                 Err(err) => {
-                    println!("UDP direct path    : retry socket bind failed ({err})");
+                    println!("UDP direct path    : retry round failed ({err})");
                     continue;
                 }
-            }
+            },
         };
 
         let conn = match establish_direct(
             attempt_socket,
             role,
-            peer_candidates.clone(),
+            peers.clone(),
             token,
             tuning,
-            adaptive_plan.read_timeout_ms,
+            read_timeout_ms,
         )
         .await
         {
@@ -567,6 +913,8 @@ async fn run_udp_path(
     _options: UdpTestOptions,
     _adaptive_plan: &UdpAdaptivePlan,
     _preferred_port: u16,
+    _control: &mut Delimited<mux::Stream>,
+    _retry: &RetryRegather<'_>,
 ) -> Option<PathMetrics> {
     println!();
     println!("UDP direct path    : skipped (binary built without the `udp` feature)");
@@ -2262,6 +2610,64 @@ fn format_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use crate::shared::UdpAdaptiveMode;
+
+    fn round_summary(nat_class: &str, count: usize) -> UdpTestPeerSummary {
+        UdpTestPeerSummary {
+            nat_class: nat_class.to_string(),
+            local_udp: "127.0.0.1:50000".to_string(),
+            primary_local_ip: Some("127.0.0.1".to_string()),
+            reflexive: vec![],
+            candidate_kinds: vec![],
+            selected_stun: None,
+            bore_stun: Some(true),
+            candidate_count: count,
+            port_preserved: Some(true),
+        }
+    }
+
+    /// P1-fix gate: a retry round fires ONLY when both sides re-offered, mints
+    /// a NEW generation + nonce, and hands each side the OTHER side's fresh
+    /// candidates (never the stale ones from the previous round).
+    #[tokio::test]
+    async fn round_broker_fires_new_generation_with_fresh_candidates() {
+        let broker = RoundBroker::new();
+        let mut rx0 = broker.register(0);
+        let mut rx1 = broker.register(1);
+
+        let c0: Vec<SocketAddr> = vec!["198.51.100.1:40000".parse().unwrap()];
+        let c1: Vec<SocketAddr> = vec!["198.51.100.2:41000".parse().unwrap()];
+
+        // One side alone must not fire a round.
+        assert_eq!(broker.offer(0, c0.clone(), round_summary("cone", 1)), None);
+        assert!(rx0.try_recv().is_err());
+        assert!(rx1.try_recv().is_err());
+
+        // Both sides in → generation 1 delivered to both, candidates swapped.
+        assert_eq!(
+            broker.offer(1, c1.clone(), round_summary("cone", 1)),
+            Some(1)
+        );
+        let s0 = rx0.try_recv().expect("side 0 restart");
+        let s1 = rx1.try_recv().expect("side 1 restart");
+        assert_eq!(s0.generation, 1);
+        assert_eq!(s1.generation, 1);
+        assert_eq!(s0.nonce, s1.nonce, "both sides must derive the same token");
+        assert_eq!(s0.peer_candidates, c1, "side 0 gets side 1's candidates");
+        assert_eq!(s1.peer_candidates, c0, "side 1 gets side 0's candidates");
+
+        // Next round: fresh candidates published under generation 2, new nonce.
+        let c0b: Vec<SocketAddr> = vec!["198.51.100.1:40007".parse().unwrap()];
+        let c1b: Vec<SocketAddr> = vec!["198.51.100.2:41007".parse().unwrap()];
+        assert_eq!(broker.offer(1, c1b.clone(), round_summary("cone", 1)), None);
+        assert_eq!(
+            broker.offer(0, c0b.clone(), round_summary("cone", 1)),
+            Some(2)
+        );
+        let s0b = rx0.try_recv().expect("side 0 second restart");
+        assert_eq!(s0b.generation, 2);
+        assert_eq!(s0b.peer_candidates, c1b);
+        assert_ne!(s0b.nonce, s0.nonce, "each round must mint a fresh nonce");
+    }
 
     #[test]
     fn merge_options_enables_bandwidth_and_uses_lower_quota() {

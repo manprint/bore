@@ -187,8 +187,7 @@ async fn secret_provider_basic_auth_rejects_and_allows() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1024,
@@ -212,8 +211,7 @@ async fn secret_provider_basic_auth_rejects_and_allows() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1, // carriers

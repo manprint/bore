@@ -2,6 +2,24 @@
 
 Documento di analisi, confronto e piano incrementale per portare in bore un motore di NAT traversal piu adattivo, prendendo spunto da frp ma mantenendo i vincoli di questo progetto.
 
+> **Stato di avanzamento (2026-07-16, piano `UDP_CONNECTION_IMPROVE.md`).**
+> Fase 0 (baseline, limiti candidati, metriche, retry-round del diagnostico,
+> NAT lab deterministico), Fase 1 (traversal socket single-owner, catena STUN
+> a budget globale, candidate model v2 sul wire), Fase 2 (connectivity check
+> autenticati + peer-reflexive) e **Fase 3 (policy adattiva LIVE)** sono
+> IMPLEMENTATE — vedi `docs/nat/NAT_TRAVERSAL.md` §14–17 e
+> `docs/test/TEST_UDP.md` §S11–S12. Il piano adattivo (`NatPlan`) non è più
+> solo diagnostica: il broker lo calcola dai profili NAT strutturati delle
+> offer (`UdpNatProfile`) e lo consegna nel rider `UdpPunchV2.plan` a secret
+> e VPN 1:1 (checklist a gruppi staggered, window/retry dal piano, jitter di
+> pacing, cache della coppia vincente). Kill switch server-side:
+> `--no-udp-adaptive-plan`. Anche la **Fase 5** è implementata: candidati
+> manuali (`--udp-candidate`/`--udp-no-stun`) e port mapping GESTITO
+> (PCP RFC 6887 + fallback UPnP, lease rinnovato, epoch/reboot detection,
+> re-offer su cambio, release on drop) — vedi `NAT_TRAVERSAL.md` §18.
+> IPv6 (Fase 4) esclusa su richiesta; Fase 6 (RFC 5780 a due IP) e Fase 7
+> non pianificate; hub VPN legacy v1.
+
 ## Scopo del documento
 
 Questo documento risponde a tre domande:

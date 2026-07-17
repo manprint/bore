@@ -849,6 +849,9 @@ pub async fn serve_vpn_listener(
                                     peer_selected_stun: offer.peer_selected_stun,
                                     tuning: udp_tuning,
                                     peer_id,
+                                    // Hub per-peer direct path stays legacy v1 (no v2/checks/plan yet);
+                                    // the 1:1 path adopted v2 in Fase 3.
+                                    v2: None,
                                 })
                                 .await
                                 .is_err()
@@ -861,7 +864,8 @@ pub async fn serve_vpn_listener(
                 }
                 msg = control.recv::<ClientMessage>() => {
                     match msg {
-                        Ok(Some(ClientMessage::UdpCandidateOffer(offer))) => {
+                        Ok(Some(ClientMessage::UdpCandidateOffer(mut offer))) => {
+                            crate::holepunch::sanitize_offer(&mut offer, "vpn-hub-listener-offer");
                             {
                                 let mut hub_state = hub.state.lock().unwrap_or_else(|p| p.into_inner());
                                 hub_state.set_hub_candidates(
@@ -932,6 +936,9 @@ pub async fn serve_vpn_listener(
             secret::UdpReg {
                 candidates: vec![],
                 selected_stun: None,
+                v2: None,
+                profile: None,
+                offer: Default::default(),
                 nonce: pair_msg.nonce,
                 to_provider: to_provider_tx,
             },
@@ -953,7 +960,9 @@ pub async fn serve_vpn_listener(
                 }
                 Some(offer) = to_provider_rx.recv() => {
                     // The connector offered candidates: forward the punch so the
-                    // listener can start its QUIC endpoint and punch back.
+                    // listener can start its QUIC endpoint and punch back. The
+                    // v2 rider (typed candidates + adaptive plan) was built by
+                    // the connector-side broker (Fase 3 VPN adoption).
                     info!(%id, "forwarding vpn udp punch to listener");
                     if control.send(ServerMessage::UdpPunch {
                         nonce: offer.nonce,
@@ -961,6 +970,7 @@ pub async fn serve_vpn_listener(
                         peer_selected_stun: offer.peer_selected_stun,
                         tuning: udp_tuning,
                         peer_id: 0,
+                        v2: offer.v2,
                     }).await.is_err() {
                         info!(%id, "vpn listener disconnected");
                         break;
@@ -968,15 +978,27 @@ pub async fn serve_vpn_listener(
                 }
                 msg = control.recv::<ClientMessage>() => {
                     match msg {
-                        Ok(Some(ClientMessage::UdpCandidateOffer(offer))) => {
-                            // Store candidates for the connector's broker to read.
+                        Ok(Some(ClientMessage::UdpCandidateOffer(mut offer))) => {
+                            crate::holepunch::sanitize_offer(&mut offer, "vpn-listener-offer");
+                            // Store the full offer for the connector's broker:
+                            // candidates for the punch, the v2 rider + profile
+                            // for the adaptive plan (Fase 3 VPN adoption).
                             if let Some(mut entry) = udp_providers.get_mut(&udp_id) {
-                                entry.candidates = offer.candidates;
-                                entry.selected_stun = offer.selected_stun;
+                                entry.candidates = offer.candidates.clone();
+                                entry.selected_stun = offer.selected_stun.clone();
+                                entry.v2 = crate::shared::UdpPunchV2::from_offer(&offer);
+                                entry.profile = offer.profile;
+                                entry.offer = offer;
                             }
                         }
-                        Ok(Some(ClientMessage::UdpCandidates(addrs))) => {
+                        Ok(Some(ClientMessage::UdpCandidates(mut addrs))) => {
                             // Legacy UDP candidates format.
+                            let san = crate::holepunch::sanitize_candidates(&mut addrs);
+                            crate::holepunch::log_dropped_candidates(
+                                "vpn-listener-offer-legacy",
+                                addrs.len(),
+                                &san,
+                            );
                             if let Some(mut entry) = udp_providers.get_mut(&udp_id) {
                                 entry.candidates = addrs;
                             }
@@ -1014,6 +1036,7 @@ pub async fn serve_vpn_connector(
     peer: std::net::SocketAddr,
     udp_providers: secret::UdpRegistry,
     udp_tuning: UdpDirectTuning,
+    udp_adaptive_plan: bool,
     punch_timeout: Duration,
     carriers: u16,
     max_carriers: u16,
@@ -1267,6 +1290,9 @@ pub async fn serve_vpn_connector(
                                     peer_selected_stun: stun,
                                     tuning: udp_tuning,
                                     peer_id,
+                                    // Hub per-peer direct path stays legacy v1 (no v2/checks/plan yet);
+                                    // the 1:1 path adopted v2 in Fase 3.
+                                    v2: None,
                                 })
                                 .await
                                 .is_err()
@@ -1278,6 +1304,7 @@ pub async fn serve_vpn_connector(
                                 nonce: peer_slot.nonce,
                                 peer_candidates: offer.candidates.clone(),
                                 peer_selected_stun: offer.selected_stun.clone(),
+                                v2: None,
                             };
                             let _ = hub_clone
                                 .event_tx
@@ -1325,7 +1352,8 @@ pub async fn serve_vpn_connector(
                 }
                 msg = control.recv::<ClientMessage>() => {
                     match msg {
-                        Ok(Some(ClientMessage::UdpCandidateOffer(offer))) => {
+                        Ok(Some(ClientMessage::UdpCandidateOffer(mut offer))) => {
+                            crate::holepunch::sanitize_offer(&mut offer, "vpn-spoke-offer");
                             // Fresh offer: re-arm the broker round (client retries while on relay).
                             // Store offer and reset deadline for polling hub candidates.
                             spoke_offer = Some(offer);
@@ -1340,6 +1368,7 @@ pub async fn serve_vpn_connector(
                                         nonce: peer_slot.nonce,
                                         peer_candidates: spoke_offer.as_ref().unwrap().candidates.clone(),
                                         peer_selected_stun: spoke_offer.as_ref().unwrap().selected_stun.clone(),
+                                        v2: None,
                                     },
                                 })
                                 .await;
@@ -1582,12 +1611,49 @@ pub async fn serve_vpn_connector(
                         e.selected_stun.clone(),
                         e.nonce,
                         e.to_provider.clone(),
+                        e.v2.clone(),
+                        e.profile,
+                        e.offer.clone(),
                     )
                 });
                 match provider {
-                    Some((cands, stun, nonce, to_provider)) if !cands.is_empty() => {
-                        // Both offers known: punch the connector with the
-                        // listener's candidates...
+                    Some((
+                        cands,
+                        stun,
+                        nonce,
+                        to_provider,
+                        mut listener_v2,
+                        listener_profile,
+                        listener_offer,
+                    )) if !cands.is_empty() => {
+                        // Both offers known (Fase 3 VPN adoption): attach each
+                        // side's adaptive plan when both reported a profile.
+                        let mut connector_v2 = crate::shared::UdpPunchV2::from_offer(offer);
+                        secret::attach_adaptive_plan(
+                            &mut listener_v2,
+                            (offer, offer.profile.as_ref()),
+                            (&listener_offer, listener_profile.as_ref()),
+                            udp_adaptive_plan,
+                            "vpn-connector-punch",
+                        );
+                        secret::attach_adaptive_plan(
+                            &mut connector_v2,
+                            (&listener_offer, listener_profile.as_ref()),
+                            (offer, offer.profile.as_ref()),
+                            udp_adaptive_plan,
+                            "vpn-listener-punch",
+                        );
+                        // Normalize the round generation across both riders
+                        // (check frames reject a mismatch — see the secret
+                        // broker's identical step).
+                        let round_gen = offer.generation.max(listener_offer.generation);
+                        if let Some(rider) = listener_v2.as_mut() {
+                            rider.generation = round_gen;
+                        }
+                        if let Some(rider) = connector_v2.as_mut() {
+                            rider.generation = round_gen;
+                        }
+                        // Punch the connector with the listener's candidates...
                         control
                             .send(ServerMessage::UdpPunch {
                                 nonce,
@@ -1595,6 +1661,7 @@ pub async fn serve_vpn_connector(
                                 peer_selected_stun: stun,
                                 tuning: udp_tuning,
                                 peer_id: 0,
+                                v2: listener_v2,
                             })
                             .await?;
                         // ...and forward the connector's offer to the listener.
@@ -1602,6 +1669,7 @@ pub async fn serve_vpn_connector(
                             nonce,
                             peer_candidates: offer.candidates.clone(),
                             peer_selected_stun: offer.selected_stun.clone(),
+                            v2: connector_v2,
                         };
                         let _ = to_provider.send(fwd).await;
                         info!(%id, "brokered vpn udp punch to both peers");
@@ -1616,6 +1684,9 @@ pub async fn serve_vpn_connector(
                         if let Some(mut e) = udp_providers.get_mut(&udp_id) {
                             e.candidates.clear();
                             e.selected_stun = None;
+                            e.v2 = None;
+                            e.profile = None;
+                            e.offer = Default::default();
                         }
                     }
                     Some(_) => {
@@ -1646,7 +1717,8 @@ pub async fn serve_vpn_connector(
             }
             msg = control.recv::<ClientMessage>() => {
                 match msg {
-                    Ok(Some(ClientMessage::UdpCandidateOffer(consumer_offer))) => {
+                    Ok(Some(ClientMessage::UdpCandidateOffer(mut consumer_offer))) => {
+                        crate::holepunch::sanitize_offer(&mut consumer_offer, "vpn-connector-offer");
                         // A fresh offer begins a new direct-upgrade round (the
                         // client retries while staying on relay): re-arm the
                         // broker so it punches again with the latest candidates,
@@ -1655,11 +1727,16 @@ pub async fn serve_vpn_connector(
                         offer_deadline = Some(tokio::time::Instant::now() + punch_timeout);
                         punched = false;
                     }
-                    Ok(Some(ClientMessage::UdpCandidates(consumer_cands))) => {
+                    Ok(Some(ClientMessage::UdpCandidates(mut consumer_cands))) => {
+                        let san = crate::holepunch::sanitize_candidates(&mut consumer_cands);
+                        crate::holepunch::log_dropped_candidates(
+                            "vpn-connector-offer-legacy",
+                            consumer_cands.len(),
+                            &san,
+                        );
                         connector_offer = Some(crate::shared::UdpCandidateOffer {
                             candidates: consumer_cands,
-                            selected_stun: None,
-                            peer_id: 0,
+                            ..Default::default()
                         });
                         offer_deadline = Some(tokio::time::Instant::now() + punch_timeout);
                         punched = false;
@@ -1771,6 +1848,9 @@ mod tests {
         secret::UdpReg {
             candidates: vec![],
             selected_stun: None,
+            v2: None,
+            profile: None,
+            offer: Default::default(),
             nonce,
             to_provider: tx,
         }

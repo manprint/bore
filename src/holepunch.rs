@@ -21,22 +21,155 @@
 //! token derivation — carry no `quinn` dependency and are always compiled, so a
 //! lean-built server can still rendezvous for `udp`-enabled clients.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tokio::net::UdpSocket;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::shared::{UdpCandidateKind, UdpDirectTuning, CONTROL_PORT};
+use crate::shared::{
+    UdpAdaptiveCandidateKind, UdpAdaptivePlan, UdpCandidateKind, UdpCandidateOffer,
+    UdpDirectTuning, UdpNatMapping, UdpNatProfile, UdpTypedCandidate, CONTROL_PORT,
+    UDP_CAP_CANDIDATE_V2, UDP_CAP_CHECK_V1,
+};
 
 /// Number of consecutive ports predicted past the reflexive one when
 /// `--try-port-prediction` is enabled (best-effort symmetric-NAT traversal).
 const PREDICT_RANGE: u16 = 4;
+
+/// Upper bound on UDP hole-punch candidate addresses accepted from a peer,
+/// offered on the wire, or punched/dialed in one traversal round. Every
+/// peer-controlled candidate list is clamped to this bound *before* any
+/// proportional allocation or per-candidate task fan-out. The legitimate
+/// worst case today (1 reflexive + 4 predicted + 1 UPnP + 1 local) is 7,
+/// so 16 leaves room for future manual/multi-interface candidates without
+/// letting a hostile peer turn the puncher into a scanner.
+pub const MAX_UDP_CANDIDATES: usize = 16;
+
+/// Aggregate counters from [`sanitize_candidates`]: how many entries were
+/// dropped and why. Logged as ONE line per round (never one warning per stray).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateSanitation {
+    /// Structurally unusable entries (port 0, unspecified, multicast, broadcast).
+    pub dropped_invalid: usize,
+    /// Exact duplicates of an earlier entry (order-preserving dedup).
+    pub dropped_duplicate: usize,
+    /// Entries past the [`MAX_UDP_CANDIDATES`] cap.
+    pub dropped_overflow: usize,
+}
+
+impl CandidateSanitation {
+    /// Total number of dropped entries.
+    pub fn dropped(&self) -> usize {
+        self.dropped_invalid + self.dropped_duplicate + self.dropped_overflow
+    }
+}
+
+/// Whether `addr` may be offered or punched as a UDP hole-punch candidate.
+///
+/// Private/CGNAT addresses are VALID — same-LAN peers need them, and the
+/// accepted QUIC source is authenticated by token, never by candidate list.
+/// Only addresses that are unusable by construction are rejected: port 0,
+/// unspecified, multicast, and the IPv4 broadcast address.
+pub fn valid_candidate(addr: &SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    match addr.ip() {
+        IpAddr::V4(ip) => !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast(),
+        IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_multicast(),
+    }
+}
+
+/// Validate, dedup (order-preserving) and cap a candidate list in place.
+/// Returns aggregate drop counters; log them with [`log_dropped_candidates`].
+/// Shared by the sender (before the wire), the server broker (before storing
+/// or forwarding a peer-controlled list) and the punch/dial entry points
+/// (defense in depth) — one implementation so no path drifts.
+pub fn sanitize_candidates(candidates: &mut Vec<SocketAddr>) -> CandidateSanitation {
+    let mut san = CandidateSanitation::default();
+    let mut seen: Vec<SocketAddr> = Vec::with_capacity(MAX_UDP_CANDIDATES);
+    candidates.retain(|addr| {
+        if !valid_candidate(addr) {
+            san.dropped_invalid += 1;
+            return false;
+        }
+        if seen.contains(addr) {
+            san.dropped_duplicate += 1;
+            return false;
+        }
+        if seen.len() >= MAX_UDP_CANDIDATES {
+            san.dropped_overflow += 1;
+            return false;
+        }
+        seen.push(*addr);
+        true
+    });
+    san
+}
+
+/// Sanitize a wire [`UdpCandidateOffer`] in place (server broker / receiver
+/// side). Logs one aggregate line when anything was dropped.
+pub fn sanitize_offer(offer: &mut UdpCandidateOffer, context: &'static str) {
+    let san = sanitize_candidates(&mut offer.candidates);
+    log_dropped_candidates(context, offer.candidates.len(), &san);
+}
+
+/// One aggregate log line for a sanitized candidate list. `warn` because a
+/// non-zero drop count means a peer sent something out of contract (or a local
+/// gather bug); still never per-item.
+pub fn log_dropped_candidates(context: &'static str, kept: usize, san: &CandidateSanitation) {
+    if san.dropped() == 0 {
+        return;
+    }
+    warn!(
+        context,
+        kept,
+        invalid = san.dropped_invalid,
+        duplicate = san.dropped_duplicate,
+        overflow = san.dropped_overflow,
+        limit = MAX_UDP_CANDIDATES,
+        "dropped unusable UDP candidates (aggregate)"
+    );
+}
+
+/// Sanitize the parallel `(candidates, kinds)` vectors produced by candidate
+/// discovery, keeping them index-aligned.
+fn sanitize_discovery(
+    candidates: &mut Vec<SocketAddr>,
+    kinds: &mut Vec<UdpCandidateKind>,
+) -> CandidateSanitation {
+    debug_assert_eq!(candidates.len(), kinds.len());
+    let mut san = CandidateSanitation::default();
+    let mut out_c = Vec::with_capacity(candidates.len().min(MAX_UDP_CANDIDATES));
+    let mut out_k = Vec::with_capacity(candidates.len().min(MAX_UDP_CANDIDATES));
+    for (addr, kind) in candidates.iter().zip(kinds.iter()) {
+        if !valid_candidate(addr) {
+            san.dropped_invalid += 1;
+            continue;
+        }
+        if out_c.contains(addr) {
+            san.dropped_duplicate += 1;
+            continue;
+        }
+        if out_c.len() >= MAX_UDP_CANDIDATES {
+            san.dropped_overflow += 1;
+            continue;
+        }
+        out_c.push(*addr);
+        out_k.push(*kind);
+    }
+    *candidates = out_c;
+    *kinds = out_k;
+    san
+}
 
 #[cfg(feature = "udp")]
 use crate::shared::NETWORK_TIMEOUT;
@@ -62,6 +195,82 @@ pub const TOKEN_LEN: usize = 32;
 /// Per-attempt timeout for a STUN binding request (kept short so a missing STUN
 /// server fails fast and the caller can fall back to the relay).
 const STUN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Global budget for the whole STUN chain on a [`UdpTraversalSocket`] (plan
+/// Fase 1): with N unreachable targets the legacy serial chain burned
+/// N × 3 × [`STUN_TIMEOUT`] (~12 s for 4 targets) before the relay decision;
+/// the demuxed chain runs transactions concurrently under this single budget.
+pub const STUN_CHAIN_BUDGET: Duration = Duration::from_secs(4);
+
+/// Launch offset between consecutive STUN chain targets: preserves the chain's
+/// preference order as a head start (the earlier target usually answers first)
+/// without serializing the worst case.
+const STUN_CHAIN_STAGGER: Duration = Duration::from_millis(300);
+
+/// Bounded extra wait for the SECOND STUN observation that turns a gather
+/// into a structured NAT profile (plan Fase 3). The first two chain targets
+/// launch together, so the confirming answer usually arrives within
+/// |RTT₂−RTT₁| of the winner; this cap only bites when the second server is
+/// slow or dead. Never extends [`STUN_CHAIN_BUDGET`].
+const PROFILE_CONFIRM_WAIT: Duration = Duration::from_millis(400);
+
+/// Pacing between outbound connectivity-check requests (plan Fase 2): one
+/// request every tick, round-robin across the candidate pairs. Comparable to
+/// the legacy punch cadence (5 packets / 50 ms per candidate) but paced across
+/// pairs instead of bursting, and it keeps probing for the whole window.
+const CHECK_PACE: Duration = Duration::from_millis(50);
+
+/// Default total budget for one connectivity-check round. Bounded (I-11/plan):
+/// the relay stays warm the whole time, and on a fully-blocked pair this
+/// window is ADDED to the QUIC dial budget before the relay decision — 1 s
+/// keeps the worst-case time-to-relay within ~0.75 s of the legacy path
+/// (the redundant blind punch is skipped after a check round, winning back
+/// ~250 ms; measured deltas documented in docs/nat/NAT_TRAVERSAL.md §16).
+pub const CHECK_WINDOW: Duration = Duration::from_millis(1000);
+
+/// Upper bound on connectivity-check responses sent per round — the responder
+/// is not an amplifier even under a spoofed-request flood (responses are also
+/// never larger than requests).
+const CHECK_MAX_RESPONSES: u32 = 256;
+
+/// Launch offset between consecutive candidate-kind groups in a planned check
+/// round (plan Fase 3): the preferred kind gets a clean head start, later
+/// kinds still launch well within the round window (staggered checklist —
+/// neither fully serial nor unlimited fan-out).
+const CHECK_GROUP_STAGGER: Duration = Duration::from_millis(150);
+
+/// Hard cap on one check round INCLUDING every retry pass the adaptive plan
+/// may grant — the plan governs a single bounded round, never an unbounded
+/// prober (the outer retry scheduler stays the VPN grid / secret backoff).
+const CHECK_TOTAL_CAP: Duration = Duration::from_secs(3);
+
+/// Upper bound (exclusive) on the per-probe pacing jitter. Strictly below
+/// [`CHECK_PACE`] so jitter can only ever de-synchronize the two peers'
+/// probe cadence, never reorder the pacing itself. De-synchronizing matters:
+/// the Fase-0 pcap analysis proved a conntrack "crossfire" race on masquerade
+/// routers where BOTH peers probing in lockstep makes the inbound packet
+/// claim the reply-tuple before the outbound punch egresses, remapping the
+/// mapping to a random port. Jittered pacing breaks the lockstep.
+const CHECK_JITTER_MAX: Duration = Duration::from_millis(15);
+
+/// Deterministic per-peer jitter seed: the shared check key XOR the role byte
+/// — both peers derive DIFFERENT sequences (role differs) without any extra
+/// wire exchange, and tests get full determinism.
+fn check_jitter_seed(key: &[u8; 32], role: u8) -> u64 {
+    let mut seed = u64::from_le_bytes(key[..8].try_into().expect("key >= 8 bytes"));
+    seed ^= u64::from(role).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    seed
+}
+
+/// Bounded deterministic jitter for probe `step` (SplitMix64 over the seed):
+/// always in `[0, CHECK_JITTER_MAX)`.
+fn check_jitter(seed: u64, step: u64) -> Duration {
+    let mut z = seed.wrapping_add(step.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    Duration::from_micros(z % (CHECK_JITTER_MAX.as_micros() as u64))
+}
 
 /// ALPN protocol identifier for the direct QUIC carrier.
 #[cfg(feature = "udp")]
@@ -163,6 +372,800 @@ pub async fn bind_socket(port: u16) -> Result<UdpSocket> {
         .bind(&addr.into())
         .context("failed to bind ephemeral UDP socket after fixed-port fallback")?;
     UdpSocket::from_std(socket.into()).context("failed to register UDP socket with tokio")
+}
+
+/// Single-owner UDP traversal socket (plan Fase 1, invariant I-5).
+///
+/// EXACTLY ONE task — the internal recv actor — owns `recv_from` during
+/// discovery, demultiplexing STUN responses by transaction id AND full
+/// `ip:port` source. Concurrent STUN transactions can therefore share the
+/// socket safely, which is what lets [`Self::discover_reflexive_chain`] probe
+/// the whole chain under ONE global budget ([`STUN_CHAIN_BUDGET`]) instead of
+/// the legacy serial worst case (~3 s per unreachable target). Non-STUN
+/// datagrams (early peer punches, QUIC Initials before handoff) are counted
+/// and never consumed by a STUN waiter — Fase 2 will route them to the
+/// authenticated connectivity checker.
+///
+/// [`Self::into_socket`] stops the actor FIRST and only then releases the raw
+/// socket for Quinn, so the actor can never steal Quinn's packets (one
+/// socket = one reader, always).
+pub struct UdpTraversalSocket {
+    socket: std::sync::Arc<UdpSocket>,
+    inner: std::sync::Arc<TraversalInner>,
+    actor: AbortOnDrop,
+}
+
+/// Aborts the recv actor when the traversal socket is dropped without a
+/// handoff (the actor holds an `Arc` of the socket and would leak otherwise).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct TraversalInner {
+    /// Pending STUN transactions, keyed by transaction id.
+    pending_stun: std::sync::Mutex<HashMap<[u8; 12], PendingStun>>,
+    /// Active connectivity-check round (plan Fase 2); `None` outside a round.
+    checks: std::sync::Mutex<Option<CheckState>>,
+    /// Datagrams that were not STUN responses (peer punches, QUIC, junk).
+    peer_datagrams: AtomicU64,
+    /// STUN-shaped datagrams dropped: unknown txid, wrong source, malformed.
+    stray_stun: AtomicU64,
+    /// Check-shaped datagrams dropped: bad HMAC, wrong generation/role/txid.
+    invalid_checks: AtomicU64,
+}
+
+struct PendingStun {
+    target: SocketAddr,
+    tx: oneshot::Sender<SocketAddr>,
+}
+
+/// Which side of the pair this peer plays during connectivity checks. Mirrors
+/// the QUIC roles: the provider/listener accepts, the consumer/dialer dials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckRole {
+    /// Provider side (QUIC server).
+    Listener,
+    /// Consumer side (QUIC client).
+    Dialer,
+}
+
+impl CheckRole {
+    fn byte(self) -> u8 {
+        match self {
+            CheckRole::Listener => check::ROLE_LISTENER,
+            CheckRole::Dialer => check::ROLE_DIALER,
+        }
+    }
+}
+
+/// Configuration for one connectivity-check round.
+#[derive(Debug, Clone)]
+pub struct CheckConfig {
+    /// HMAC key, derived from the direct-path token via [`derive_check_key`].
+    pub key: [u8; 32],
+    /// Traversal round generation (frames from other rounds are rejected).
+    pub generation: u32,
+    /// This peer's role.
+    pub role: CheckRole,
+    /// Total budget for the round (the relay stays warm throughout).
+    pub window: Duration,
+    /// Planned execution (plan Fase 3): staggered kind groups + retry budget.
+    /// `None` keeps the flat Fase-2 round byte-identical.
+    pub plan: Option<CheckPlan>,
+}
+
+/// Client-side execution plan for one check round (plan Fase 3), resolved
+/// from the server's [`UdpAdaptivePlan`] against the actual peer candidates.
+#[derive(Debug, Clone, Default)]
+pub struct CheckPlan {
+    /// Candidate groups in launch order: group `g` starts probing at
+    /// `initial_delay + g × CHECK_GROUP_STAGGER`. Addresses only — the kind
+    /// grouping is resolved by [`plan_check_groups`] before the round.
+    pub groups: Vec<Vec<SocketAddr>>,
+    /// Extra passes over the window after a dry first pass (paced with
+    /// doubled intervals — backoff). Bounded by [`CHECK_TOTAL_CAP`].
+    pub retry_budget: u8,
+    /// Delay before the very first probe (the plan's `send_delay_ms`).
+    pub initial_delay: Duration,
+}
+
+/// Resolve the probe-order groups for a planned check round: candidates are
+/// grouped by kind and the groups ordered by `order` (the server plan's
+/// `candidate_order`, relay entries skipped) or, absent a plan, by the
+/// default data-driven order (same-LAN local first, then reflexive,
+/// router-mapped, predicted last). The plan ORDERS candidates, it never adds
+/// or drops any: kinds missing from `order` still probe, in a final group —
+/// so "no predicted checks when prediction is off" holds by construction
+/// (no predicted candidates were offered ⇒ no predicted group exists).
+pub fn plan_check_groups(
+    typed: &[UdpTypedCandidate],
+    fallback: &[SocketAddr],
+    order: Option<&[UdpAdaptiveCandidateKind]>,
+) -> Vec<Vec<SocketAddr>> {
+    if typed.is_empty() {
+        // Legacy peer list: no kind metadata, single flat group.
+        return if fallback.is_empty() {
+            Vec::new()
+        } else {
+            vec![fallback.to_vec()]
+        };
+    }
+    const DEFAULT_ORDER: [UdpCandidateKind; 4] = [
+        UdpCandidateKind::Local,
+        UdpCandidateKind::Reflexive,
+        UdpCandidateKind::RouterMapped,
+        UdpCandidateKind::Predicted,
+    ];
+    let kind_order: Vec<UdpCandidateKind> = match order {
+        Some(order) => order
+            .iter()
+            .filter_map(|kind| match kind {
+                UdpAdaptiveCandidateKind::Local => Some(UdpCandidateKind::Local),
+                UdpAdaptiveCandidateKind::Reflexive => Some(UdpCandidateKind::Reflexive),
+                UdpAdaptiveCandidateKind::RouterMapped => Some(UdpCandidateKind::RouterMapped),
+                UdpAdaptiveCandidateKind::Predicted => Some(UdpCandidateKind::Predicted),
+                UdpAdaptiveCandidateKind::RelayFallback => None,
+            })
+            .collect(),
+        None => DEFAULT_ORDER.to_vec(),
+    };
+    let mut groups: Vec<Vec<SocketAddr>> = Vec::new();
+    let mut placed: Vec<SocketAddr> = Vec::new();
+    for kind in &kind_order {
+        let group: Vec<SocketAddr> = typed
+            .iter()
+            .filter(|c| c.kind == *kind && !placed.contains(&c.addr))
+            .map(|c| c.addr)
+            .collect();
+        if !group.is_empty() {
+            placed.extend(group.iter().copied());
+            groups.push(group);
+        }
+    }
+    // Kinds the order forgot + typed dedup leftovers: last group, never dropped.
+    let rest: Vec<SocketAddr> = typed
+        .iter()
+        .filter(|c| !placed.contains(&c.addr))
+        .map(|c| c.addr)
+        .collect();
+    if !rest.is_empty() {
+        groups.push(rest);
+    }
+    groups
+}
+
+/// Check-round window from the adaptive plan's `read_timeout_ms`, clamped so
+/// a bogus plan can neither starve the round nor stall the relay decision.
+pub fn plan_check_window(plan: &UdpAdaptivePlan) -> Duration {
+    Duration::from_millis(plan.read_timeout_ms.clamp(500, 1500))
+}
+
+/// Outcome of one connectivity-check round.
+#[derive(Debug, Clone)]
+pub struct CheckOutcome {
+    /// First candidate pair proven BIDIRECTIONAL (our authenticated request
+    /// got an authenticated response back): the nominated remote address.
+    pub nominated: Option<SocketAddr>,
+    /// Our own mapped address as observed by the nominated peer, when known.
+    pub observed: Option<SocketAddr>,
+    /// Whether a peer-reflexive candidate was learned from an authenticated
+    /// inbound request arriving from an un-offered source.
+    pub learned_prflx: bool,
+    /// Final candidate list of the round: the sanitized offer plus any
+    /// learned peer-reflexive addresses. The dialer dials THESE (a learned
+    /// source must be dialable even when nomination did not complete).
+    pub targets: Vec<SocketAddr>,
+    /// Wall-clock duration of the round (baseline metric `checks_ms`).
+    pub checks_ms: u64,
+}
+
+/// State shared between the recv actor and the driver of one check round.
+struct CheckState {
+    key: [u8; 32],
+    generation: u32,
+    role: u8,
+    /// txid -> the target the request was sent to (responses must come back
+    /// from exactly that source).
+    pending: HashMap<[u8; 12], SocketAddr>,
+    /// Validated pairs: (remote target, observed mapped address).
+    validated_tx: tokio::sync::mpsc::UnboundedSender<(SocketAddr, Option<SocketAddr>)>,
+    /// Sources of valid inbound requests (peer-reflexive learning).
+    inbound_req_tx: tokio::sync::mpsc::UnboundedSender<SocketAddr>,
+    /// Responses sent this round (anti-amplification cap).
+    responses_sent: u32,
+}
+
+/// Derive the connectivity-check HMAC key from the direct-path token
+/// (domain-separated so check frames can never be confused with any other
+/// token use). Both peers compute the same value.
+pub fn derive_check_key(token: &[u8; TOKEN_LEN]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(token).expect("HMAC accepts any key length");
+    mac.update(b"bore-connectivity-check-v1");
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&mac.finalize().into_bytes());
+    key
+}
+
+impl UdpTraversalSocket {
+    /// Bind via [`bind_socket`] (same fixed-port / no-`SO_REUSEADDR`
+    /// semantics) and start the recv actor.
+    pub async fn bind(port: u16) -> Result<Self> {
+        Ok(Self::from_socket(bind_socket(port).await?))
+    }
+
+    /// Wrap an already-bound socket and start the recv actor.
+    pub fn from_socket(socket: UdpSocket) -> Self {
+        let socket = std::sync::Arc::new(socket);
+        let inner = std::sync::Arc::new(TraversalInner {
+            pending_stun: std::sync::Mutex::new(HashMap::new()),
+            checks: std::sync::Mutex::new(None),
+            peer_datagrams: AtomicU64::new(0),
+            stray_stun: AtomicU64::new(0),
+            invalid_checks: AtomicU64::new(0),
+        });
+        let actor = AbortOnDrop(tokio::spawn(recv_actor(
+            std::sync::Arc::clone(&socket),
+            std::sync::Arc::clone(&inner),
+        )));
+        Self {
+            socket,
+            inner,
+            actor,
+        }
+    }
+
+    /// The socket's local address.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.socket.local_addr().ok()
+    }
+
+    /// Datagrams received that were not STUN responses (peer punches, QUIC
+    /// Initials before handoff). Observability for the punch crossfire.
+    pub fn peer_datagrams(&self) -> u64 {
+        self.inner.peer_datagrams.load(Ordering::Relaxed)
+    }
+
+    /// STUN-shaped datagrams dropped (unknown txid / wrong source / malformed).
+    pub fn stray_stun(&self) -> u64 {
+        self.inner.stray_stun.load(Ordering::Relaxed)
+    }
+
+    /// Check-shaped datagrams dropped (bad HMAC / wrong generation / role /
+    /// unknown txid / wrong source). Never answered — an unauthenticated
+    /// probe gets NO response, ever.
+    pub fn invalid_checks(&self) -> u64 {
+        self.inner.invalid_checks.load(Ordering::Relaxed)
+    }
+
+    /// Run one authenticated connectivity-check round (plan Fase 2).
+    ///
+    /// Paced HMAC request/response probes over the candidate pairs; an
+    /// authenticated inbound request from an un-offered source becomes a
+    /// peer-reflexive candidate and gets an immediate triggered check; the
+    /// first pair proven bidirectional is nominated. The relay is untouched:
+    /// this only decides which address the QUIC stage should dial first.
+    /// On `nominated: None` the caller falls back to the legacy dial-all.
+    pub async fn run_connectivity_checks(
+        &self,
+        peers: &[SocketAddr],
+        cfg: &CheckConfig,
+    ) -> CheckOutcome {
+        let started = Instant::now();
+        let mut targets = peers.to_vec();
+        let san = sanitize_candidates(&mut targets);
+        log_dropped_candidates("connectivity-checks", targets.len(), &san);
+
+        let (validated_tx, mut validated_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (inbound_req_tx, mut inbound_req_rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.inner.checks.lock().unwrap() = Some(CheckState {
+            key: cfg.key,
+            generation: cfg.generation,
+            role: cfg.role.byte(),
+            pending: HashMap::new(),
+            validated_tx,
+            inbound_req_tx,
+            responses_sent: 0,
+        });
+
+        let mut learned_prflx = false;
+        let mut nominated = None;
+        let mut observed = None;
+        // Per-source triggered-check throttle (a re-transmitting peer must not
+        // make us burst).
+        let mut last_triggered: HashMap<SocketAddr, Instant> = HashMap::new();
+
+        // Planned rounds (Fase 3) probe kind groups in launch order with a
+        // stagger; a flat (Fase 2) round is one group holding every target.
+        let (groups, retry_budget, initial_delay) = match &cfg.plan {
+            Some(plan) if !plan.groups.is_empty() => {
+                (plan.groups.clone(), plan.retry_budget, plan.initial_delay)
+            }
+            Some(plan) => (vec![targets.clone()], plan.retry_budget, plan.initial_delay),
+            None => (vec![targets.clone()], 0, Duration::ZERO),
+        };
+        // Probe order builds up as groups activate. Membership stays governed
+        // by the sanitized flat list: a planned entry the sanitizer dropped is
+        // never probed.
+        let mut probe_order: Vec<SocketAddr> = Vec::new();
+        let mut next_group = 0usize;
+
+        let started_at = tokio::time::Instant::now();
+        let hard_cap = started_at + CHECK_TOTAL_CAP;
+        let mut deadline = (started_at + initial_delay + cfg.window).min(hard_cap);
+        let mut pass: u32 = 0;
+        let seed = check_jitter_seed(&cfg.key, cfg.role.byte());
+        let mut probe_step: u64 = 0;
+        let mut next_probe = started_at + initial_delay;
+        let mut rr = 0usize;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(next_probe) => {
+                    // Activate every group whose stagger offset has passed.
+                    while next_group < groups.len()
+                        && tokio::time::Instant::now() >= started_at
+                            + initial_delay
+                            + CHECK_GROUP_STAGGER * next_group as u32
+                    {
+                        for addr in &groups[next_group] {
+                            if targets.contains(addr) && !probe_order.contains(addr) {
+                                probe_order.push(*addr);
+                            }
+                        }
+                        next_group += 1;
+                    }
+                    // A partial plan (e.g. a cache-seeded head group) must
+                    // never EXCLUDE candidates: once every group is live, any
+                    // target the groups missed joins the tail of the order.
+                    if next_group >= groups.len() && probe_order.len() < targets.len() {
+                        for addr in &targets {
+                            if !probe_order.contains(addr) {
+                                probe_order.push(*addr);
+                            }
+                        }
+                    }
+                    // Paced with bounded deterministic jitter (breaks the
+                    // conntrack-crossfire lockstep); retry passes back off by
+                    // doubling the pace.
+                    probe_step += 1;
+                    let pace = CHECK_PACE * 2u32.saturating_pow(pass.min(4))
+                        + check_jitter(seed, probe_step);
+                    next_probe = tokio::time::Instant::now() + pace;
+                    if probe_order.is_empty() {
+                        continue;
+                    }
+                    let target = probe_order[rr % probe_order.len()];
+                    rr += 1;
+                    self.send_check_request(target, cfg).await;
+                }
+                Some(src) = inbound_req_rx.recv() => {
+                    // Authenticated request: the peer can reach US from `src`.
+                    if !targets.contains(&src)
+                        && valid_candidate(&src)
+                        && targets.len() < MAX_UDP_CANDIDATES
+                    {
+                        info!(
+                            %src,
+                            "learned peer-reflexive candidate from authenticated check request"
+                        );
+                        targets.push(src);
+                        // A learned source outranks every waiting group: it is
+                        // the one address the peer PROVABLY egresses from.
+                        probe_order.insert(0, src);
+                        learned_prflx = true;
+                    }
+                    // Triggered check toward the observed source (throttled):
+                    // validates the reverse direction without waiting a pace slot.
+                    let trigger = last_triggered
+                        .get(&src)
+                        .is_none_or(|t| t.elapsed() >= Duration::from_millis(200));
+                    if trigger && targets.contains(&src) {
+                        last_triggered.insert(src, Instant::now());
+                        self.send_check_request(src, cfg).await;
+                    }
+                }
+                Some((target, obs)) = validated_rx.recv() => {
+                    nominated = Some(target);
+                    observed = obs;
+                    break;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    // Dry pass: the adaptive plan's retry budget grants
+                    // another paced pass (backoff), inside the hard cap —
+                    // a single bounded round, never an unbounded prober.
+                    if pass < u32::from(retry_budget)
+                        && tokio::time::Instant::now() < hard_cap
+                    {
+                        pass += 1;
+                        deadline = (deadline + cfg.window / 2).min(hard_cap);
+                        debug!(pass, "check round dry; adaptive retry pass (backoff pacing)");
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        // Disable the round: late frames are counted, never answered.
+        self.inner.checks.lock().unwrap().take();
+
+        let checks_ms = started.elapsed().as_millis() as u64;
+        info!(
+            role = ?cfg.role,
+            generation = cfg.generation,
+            nominated = ?nominated,
+            observed = ?observed,
+            learned_prflx,
+            checks_ms,
+            invalid_checks = self.invalid_checks(),
+            planned = cfg.plan.is_some(),
+            retry_passes = pass,
+            "connectivity-check round finished"
+        );
+        CheckOutcome {
+            nominated,
+            observed,
+            learned_prflx,
+            targets,
+            checks_ms,
+        }
+    }
+
+    /// Send one authenticated check request toward `target`, registering its
+    /// transaction so only a response from exactly `target` can validate it.
+    async fn send_check_request(&self, target: SocketAddr, cfg: &CheckConfig) {
+        let txid = check::new_txid();
+        let frame = check::request(&cfg.key, cfg.role.byte(), cfg.generation, &txid);
+        if let Some(state) = self.inner.checks.lock().unwrap().as_mut() {
+            state.pending.insert(txid, target);
+        }
+        let _ = self.socket.send_to(&frame, target).await;
+    }
+
+    /// One STUN binding transaction toward `target`: up to 3 tries of
+    /// [`STUN_TIMEOUT`] each, mirroring the legacy serial probe's persistence.
+    /// Safe to run concurrently with other transactions on the same socket.
+    pub async fn stun_query(&self, target: SocketAddr) -> Result<SocketAddr> {
+        for _attempt in 0..3 {
+            let (request, txid) = stun::binding_request();
+            let (tx, rx) = oneshot::channel();
+            self.inner
+                .pending_stun
+                .lock()
+                .unwrap()
+                .insert(txid, PendingStun { target, tx });
+            if let Err(err) = self.socket.send_to(&request, target).await {
+                self.inner.pending_stun.lock().unwrap().remove(&txid);
+                return Err(err).context("STUN send failed");
+            }
+            match timeout(STUN_TIMEOUT, rx).await {
+                Ok(Ok(mapped)) => return Ok(mapped),
+                Ok(Err(_actor_gone)) => bail!("traversal socket recv actor stopped"),
+                Err(_) => {
+                    self.inner.pending_stun.lock().unwrap().remove(&txid);
+                }
+            }
+        }
+        bail!("no STUN response from {target}")
+    }
+
+    /// Probe a whole STUN chain concurrently under ONE global budget
+    /// ([`STUN_CHAIN_BUDGET`]), launches staggered in chain order
+    /// ([`STUN_CHAIN_STAGGER`]) so the preferred target keeps a head start.
+    /// First success wins; `None` when every target failed or the budget ran
+    /// out. Replaces the serial chain whose worst case with N dead targets was
+    /// N × 3 × [`STUN_TIMEOUT`].
+    pub async fn discover_reflexive_chain(&self, targets: &[StunTarget]) -> Option<SelectedStun> {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+        if targets.is_empty() {
+            return None;
+        }
+        let mut probes: FuturesUnordered<_> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, target)| {
+                let target = target.clone();
+                async move {
+                    tokio::time::sleep(STUN_CHAIN_STAGGER * i as u32).await;
+                    match self.stun_query(target.addr).await {
+                        Ok(reflexive) => Some(SelectedStun {
+                            requested: target.requested.clone(),
+                            addr: target.addr,
+                            source: target.source,
+                            reflexive,
+                        }),
+                        Err(err) => {
+                            warn!(
+                                %err,
+                                stun_server = %target.requested,
+                                stun_addr = %target.addr,
+                                stun_source = target.source.as_str(),
+                                "STUN chain probe failed"
+                            );
+                            None
+                        }
+                    }
+                }
+            })
+            .collect();
+        timeout(STUN_CHAIN_BUDGET, async {
+            while let Some(res) = probes.next().await {
+                if res.is_some() {
+                    return res;
+                }
+            }
+            None
+        })
+        .await
+        .unwrap_or_else(|_| {
+            warn!(
+                budget = ?STUN_CHAIN_BUDGET,
+                targets = targets.len(),
+                "STUN chain exhausted its global budget; no reflexive discovered"
+            );
+            None
+        })
+    }
+
+    /// Probe the STUN chain like [`Self::discover_reflexive_chain`], but also
+    /// derive a structured [`UdpNatProfile`] from a SECOND observation (plan
+    /// Fase 3): identical mapped addresses from two different servers ⇒
+    /// endpoint-independent mapping, different ⇒ symmetric.
+    ///
+    /// Latency contract: the FIRST success still wins the candidate slot
+    /// (selection is unchanged), and the first two targets launch TOGETHER
+    /// (no stagger between them) so the confirming observation typically
+    /// trails the winner by only |RTT₂−RTT₁|; the extra wait for it is
+    /// bounded by [`PROFILE_CONFIRM_WAIT`] and never extends the global
+    /// [`STUN_CHAIN_BUDGET`]. With zero successes the profile still reports
+    /// `observations: 0` (STUN dead — the policy reads that as blocked-ish,
+    /// never as "no metadata").
+    pub async fn discover_reflexive_profile(
+        &self,
+        targets: &[StunTarget],
+    ) -> (Option<SelectedStun>, UdpNatProfile) {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+        let local_port = self.local_addr().map(|a| a.port()).unwrap_or(0);
+        let mut profile = UdpNatProfile::default();
+        if targets.is_empty() {
+            return (None, profile);
+        }
+        let mut probes: FuturesUnordered<_> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, target)| {
+                let target = target.clone();
+                async move {
+                    // First two together: the second answer IS the profile.
+                    let slot = i.saturating_sub(1) as u32;
+                    tokio::time::sleep(STUN_CHAIN_STAGGER * slot).await;
+                    match self.stun_query(target.addr).await {
+                        Ok(reflexive) => Some(SelectedStun {
+                            requested: target.requested.clone(),
+                            addr: target.addr,
+                            source: target.source,
+                            reflexive,
+                        }),
+                        Err(err) => {
+                            warn!(
+                                %err,
+                                stun_server = %target.requested,
+                                stun_addr = %target.addr,
+                                stun_source = target.source.as_str(),
+                                "STUN chain probe failed"
+                            );
+                            None
+                        }
+                    }
+                }
+            })
+            .collect();
+        let deadline = tokio::time::Instant::now() + STUN_CHAIN_BUDGET;
+        let mut selected: Option<SelectedStun> = None;
+        loop {
+            let next = tokio::time::timeout_at(deadline, probes.next()).await;
+            let observation = match next {
+                Ok(Some(Some(obs))) => obs,
+                Ok(Some(None)) => continue,
+                // Chain exhausted or global budget spent.
+                Ok(None) | Err(_) => break,
+            };
+            match &selected {
+                None => {
+                    profile.observations = 1;
+                    profile.port_preserved =
+                        (local_port != 0).then(|| observation.reflexive.port() == local_port);
+                    selected = Some(observation);
+                    // Bounded wait for ONE confirming observation; never past
+                    // the global budget, and only worth it if another target
+                    // is still in flight.
+                    if probes.is_empty() {
+                        break;
+                    }
+                    let confirm_by = tokio::time::Instant::now() + PROFILE_CONFIRM_WAIT;
+                    if confirm_by < deadline {
+                        // Shrink the remaining window to the confirm bound by
+                        // draining under a nested timeout below.
+                        if let Ok(Some(second)) = tokio::time::timeout_at(confirm_by, async {
+                            while let Some(res) = probes.next().await {
+                                if let Some(obs) = res {
+                                    return Some(obs);
+                                }
+                            }
+                            None
+                        })
+                        .await
+                        {
+                            apply_second_observation(&mut profile, &selected, &second);
+                        }
+                    }
+                    break;
+                }
+                Some(_) => unreachable!("loop exits after first observation"),
+            }
+        }
+        if selected.is_none() {
+            warn!(
+                budget = ?STUN_CHAIN_BUDGET,
+                targets = targets.len(),
+                "STUN chain exhausted its global budget; no reflexive discovered"
+            );
+        }
+        info!(
+            profile = %profile.summary(),
+            selected = selected.as_ref().map(|s| s.requested.as_str()),
+            "derived structured NAT self-profile from STUN chain"
+        );
+        (selected, profile)
+    }
+
+    /// Stop the recv actor, then release the raw socket for Quinn. The actor
+    /// is awaited (not just aborted) so no concurrent reader can survive the
+    /// handoff — one socket, one reader, always.
+    pub async fn into_socket(self) -> Result<UdpSocket> {
+        let UdpTraversalSocket {
+            socket, mut actor, ..
+        } = self;
+        actor.0.abort();
+        let _ = (&mut actor.0).await;
+        drop(actor);
+        std::sync::Arc::try_unwrap(socket)
+            .map_err(|_| anyhow::anyhow!("traversal socket still shared at handoff"))
+    }
+}
+
+/// Fold the confirming (second) STUN observation into the profile: two
+/// DIFFERENT servers seeing the same mapped address proves endpoint-
+/// independent mapping; different mapped addresses prove a symmetric NAT.
+/// A duplicate answer from the same server proves nothing and is ignored.
+fn apply_second_observation(
+    profile: &mut UdpNatProfile,
+    selected: &Option<SelectedStun>,
+    second: &SelectedStun,
+) {
+    let Some(first) = selected else { return };
+    if second.addr == first.addr {
+        return;
+    }
+    profile.observations = 2;
+    profile.mapping = if second.reflexive == first.reflexive {
+        UdpNatMapping::Eim
+    } else {
+        UdpNatMapping::Symmetric
+    };
+}
+
+/// Handle one check-shaped datagram: authenticate, then either record a
+/// validated pair (response) or hand back the response bytes to send
+/// (request). EVERY failure — bad HMAC, wrong generation, wrong role, unknown
+/// txid, wrong source, no active round — is counted and produces NO reply:
+/// an unauthenticated probe never gets a response (plan Fase 2 property).
+fn handle_check_frame(inner: &TraversalInner, buf: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
+    let mut guard = inner.checks.lock().unwrap();
+    let Some(state) = guard.as_mut() else {
+        inner.invalid_checks.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let Some(frame) = check::parse(&state.key, buf) else {
+        inner.invalid_checks.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    // Frames must belong to THIS round and come from the OTHER role (a peer
+    // of our own role is a reflection/misconfiguration, never a valid pair).
+    if frame.generation != state.generation || frame.role == state.role {
+        inner.invalid_checks.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    match frame.kind {
+        check::KIND_REQUEST => {
+            // Peer-reflexive learning + triggered check happen in the driver.
+            let _ = state.inbound_req_tx.send(from);
+            if state.responses_sent >= CHECK_MAX_RESPONSES {
+                return None;
+            }
+            state.responses_sent += 1;
+            Some(check::response(
+                &state.key,
+                state.role,
+                state.generation,
+                &frame.txid,
+                from,
+            ))
+        }
+        check::KIND_RESPONSE => {
+            // Only a response from EXACTLY the queried target validates the
+            // transaction (txid + full ip:port source, like the STUN demux).
+            match state.pending.get(&frame.txid) {
+                Some(target) if *target == from => {
+                    state.pending.remove(&frame.txid);
+                    let _ = state.validated_tx.send((from, frame.observed));
+                }
+                _ => {
+                    inner.invalid_checks.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            None
+        }
+        _ => {
+            inner.invalid_checks.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// The single recv owner: demux STUN responses to their transactions, count
+/// everything else. Never dies on a recv error (ICMP port-unreachable from
+/// punching a dead candidate surfaces as ECONNREFUSED on Linux).
+async fn recv_actor(socket: std::sync::Arc<UdpSocket>, inner: std::sync::Arc<TraversalInner>) {
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let (n, from) = match socket.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+        };
+        let Some(txid) = stun::response_txid(&buf[..n]) else {
+            // Connectivity-check frame? (plan Fase 2). Anything else — peer
+            // punches, QUIC Initials — is counted and left alone.
+            if check::looks_like(&buf[..n]) {
+                if let Some(reply) = handle_check_frame(&inner, &buf[..n], from) {
+                    // Response bytes are built under the lock, sent outside it.
+                    let _ = socket.send_to(&reply, from).await;
+                }
+                continue;
+            }
+            inner.peer_datagrams.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let waiter = {
+            let mut pending = inner.pending_stun.lock().unwrap();
+            match pending.get(&txid) {
+                // Demux by txid AND full ip:port source: a response from
+                // anyone but the queried server never resolves the
+                // transaction (it stays pending for the real answer).
+                Some(p) if p.target == from => pending.remove(&txid),
+                _ => None,
+            }
+        };
+        let Some(waiter) = waiter else {
+            inner.stray_stun.fetch_add(1, Ordering::Relaxed);
+            debug!(%from, "stray STUN response (unknown txid or wrong source); ignoring");
+            continue;
+        };
+        match stun::parse_response(&buf[..n], &txid) {
+            Some(mapped) => {
+                let _ = waiter.tx.send(mapped);
+            }
+            None => {
+                inner.stray_stun.fetch_add(1, Ordering::Relaxed);
+                debug!(%from, "malformed STUN response; transaction dropped");
+            }
+        }
+    }
 }
 
 #[cfg(all(feature = "udp", windows))]
@@ -338,6 +1341,64 @@ pub struct CandidateDiscovery {
     pub selected_stun: Option<SelectedStun>,
     /// Number of resolved STUN targets attempted.
     pub attempted_stun: usize,
+    /// Wall-clock time the whole gather took (STUN chain + UPnP + local), in
+    /// milliseconds. Baseline traversal metric (`discovery_ms`).
+    pub discovery_ms: u64,
+    /// Structured NAT self-profile (plan Fase 3): only produced by the
+    /// profiled traversal gather; `None` from the legacy serial gather so an
+    /// old-path offer stays byte-identical.
+    pub profile: Option<UdpNatProfile>,
+    /// Managed port-mapping lease (plan Fase 5): present when `--upnp`
+    /// acquired a PCP/UPnP mapping. Arc'd so holders that outlive this
+    /// discovery (secret provider) can keep the renewal alive; dropping the
+    /// last clone releases the mapping best-effort.
+    #[cfg(feature = "udp")]
+    pub lease: Option<std::sync::Arc<crate::portmap::LeaseHandle>>,
+}
+
+impl CandidateDiscovery {
+    /// Build the wire offer for this discovery: the legacy plain-address list
+    /// (still the source of truth for old peers) plus the typed candidate
+    /// model v2 alongside (same addresses; observe-only in Fase 1).
+    pub fn to_offer(&self, peer_id: u32, generation: u32) -> UdpCandidateOffer {
+        UdpCandidateOffer {
+            candidates: self.candidates.clone(),
+            selected_stun: self.selected_stun.as_ref().map(|s| s.requested.clone()),
+            peer_id,
+            typed_candidates: self
+                .candidates
+                .iter()
+                .zip(self.candidate_kinds.iter())
+                .enumerate()
+                .map(|(index, (addr, kind))| UdpTypedCandidate {
+                    addr: *addr,
+                    kind: *kind,
+                    priority: candidate_priority(*kind, index),
+                })
+                .collect(),
+            generation,
+            capabilities: vec![
+                UDP_CAP_CANDIDATE_V2.to_string(),
+                UDP_CAP_CHECK_V1.to_string(),
+            ],
+            profile_hint: None,
+            profile: self.profile,
+        }
+    }
+}
+
+/// Advisory candidate priority (higher = try earlier). The order becomes
+/// data-driven in Fase 3; until then it mirrors the ICE-ish default: local
+/// (same-LAN) first, then reflexive, router-mapped, predicted last. The index
+/// keeps within-kind ordering stable.
+pub fn candidate_priority(kind: UdpCandidateKind, index: usize) -> u32 {
+    let base: u32 = match kind {
+        UdpCandidateKind::Local => 900,
+        UdpCandidateKind::Reflexive => 800,
+        UdpCandidateKind::RouterMapped => 700,
+        UdpCandidateKind::Predicted => 400,
+    };
+    base.saturating_sub(index as u32)
 }
 
 /// Host:port of the bore server's own STUN responder for a control endpoint.
@@ -486,6 +1547,38 @@ pub async fn resolve_live_stun_targets_with_hint(
     Ok(targets)
 }
 
+/// Options for one candidate gather (plan Fase 5). Replaces the growing list
+/// of bool parameters on the traversal gather; the legacy serial gather keeps
+/// its old two-bool signature and builds one of these internally.
+#[derive(Debug, Clone, Default)]
+pub struct GatherOptions {
+    /// Ask the router for an explicit port mapping (`--upnp` opt-in; tries
+    /// PCP first, then UPnP-IGD — plan Fase 5 managed leases).
+    pub port_map: bool,
+    /// Advertise predicted symmetric-NAT ports (`--try-port-prediction`).
+    pub port_prediction: bool,
+    /// Operator-declared public endpoints (`--udp-candidate`, repeatable):
+    /// advertised FIRST, as `RouterMapped` typed candidates (an explicit
+    /// static port-forward IS a router mapping; reusing the existing kind
+    /// keeps the wire enum backward-compatible with old peers).
+    pub manual_candidates: Vec<SocketAddr>,
+    /// Skip the STUN chain entirely (`--udp-no-stun`): manual + local (+
+    /// port-mapped) candidates only. With no manual candidate this most
+    /// likely ends on the relay — logged loudly, never silent.
+    pub no_stun: bool,
+}
+
+impl GatherOptions {
+    /// The legacy two-bool shape used by the serial gather and older callers.
+    pub fn from_flags(port_map: bool, port_prediction: bool) -> Self {
+        Self {
+            port_map,
+            port_prediction,
+            ..Default::default()
+        }
+    }
+}
+
 /// Gather this peer's candidate addresses: the STUN-discovered reflexive address
 /// (for traversal across NATs) plus the primary local address (for same-LAN
 /// peers). Optionally adds a router-mapped candidate (`port_map`, UPnP-IGD) and
@@ -518,10 +1611,8 @@ pub async fn gather_candidates_from_stun_targets(
     port_map: bool,
     port_prediction: bool,
 ) -> CandidateDiscovery {
-    let mut candidates = Vec::new();
-    let mut candidate_kinds = Vec::new();
+    let started = Instant::now();
     let local_addr = socket.local_addr().ok();
-    let local_port = local_addr.map(|a| a.port()).unwrap_or(0);
     let mut selected_stun = None;
 
     info!(
@@ -539,46 +1630,12 @@ pub async fn gather_candidates_from_stun_targets(
         );
         match discover_reflexive(socket, target.addr).await {
             Ok(addr) => {
-                info!(
-                    stun_server = %target.requested,
-                    stun_addr = %target.addr,
-                    stun_source = target.source.as_str(),
-                    reflexive = %addr,
-                    udp_local_addr = ?local_addr,
-                    "selected STUN server for UDP candidates"
-                );
-                candidates.push(addr);
-                candidate_kinds.push(UdpCandidateKind::Reflexive);
                 selected_stun = Some(SelectedStun {
                     requested: target.requested.clone(),
                     addr: target.addr,
                     source: target.source,
                     reflexive: addr,
                 });
-
-                // Symmetric NATs allocate a *different* external port per
-                // destination, so the port toward the peer differs from the one seen
-                // by STUN — often sequentially. When explicitly enabled, advertise a
-                // few ports just past the reflexive one as extra candidates. Strictly
-                // opt-in: advertising/punching extra ports may look like a scan to
-                // strict firewalls.
-                if port_prediction {
-                    let base = addr.port();
-                    let mut added = 0u16;
-                    for delta in 1..=PREDICT_RANGE {
-                        if let Some(port) = base.checked_add(delta) {
-                            candidates.push(SocketAddr::new(addr.ip(), port));
-                            candidate_kinds.push(UdpCandidateKind::Predicted);
-                            added += 1;
-                        }
-                    }
-                    warn!(
-                        reflexive_port = base,
-                        predicted = added,
-                        "port prediction ENABLED — advertising predicted symmetric-NAT ports \
-                         (best-effort; may look like a scan to strict firewalls)"
-                    );
-                }
                 break;
             }
             Err(err) => warn!(
@@ -591,27 +1648,165 @@ pub async fn gather_candidates_from_stun_targets(
         }
     }
 
-    if selected_stun.is_none() {
+    finish_discovery(
+        local_addr,
+        selected_stun,
+        stun_targets.len(),
+        &GatherOptions::from_flags(port_map, port_prediction),
+        started,
+    )
+    .await
+}
+
+/// Run candidate discovery on a [`UdpTraversalSocket`]: same candidate
+/// assembly as the legacy serial gather, but the STUN chain is probed
+/// concurrently under ONE global budget ([`STUN_CHAIN_BUDGET`]) thanks to the
+/// socket's single-owner transaction demux (plan Fase 1). Call
+/// [`UdpTraversalSocket::into_socket`] afterwards to hand the socket to the
+/// punch/QUIC stage.
+///
+/// With `opts.no_stun` the chain is skipped entirely (plan Fase 5 manual
+/// mode): the profile reports zero observations and the offer carries the
+/// manual/local/port-mapped candidates only.
+pub async fn gather_candidates_traversal(
+    tsock: &UdpTraversalSocket,
+    stun_targets: &[StunTarget],
+    opts: &GatherOptions,
+) -> CandidateDiscovery {
+    let started = Instant::now();
+    let local_addr = tsock.local_addr();
+    info!(
+        udp_local_addr = ?local_addr,
+        requested_stun = stun_targets.len(),
+        budget = ?STUN_CHAIN_BUDGET,
+        no_stun = opts.no_stun,
+        manual = opts.manual_candidates.len(),
+        "starting UDP candidate discovery (budgeted traversal chain)"
+    );
+    let (selected_stun, profile) = if opts.no_stun {
+        info!("STUN chain skipped (--udp-no-stun); using manual/local candidates only");
+        (None, UdpNatProfile::default())
+    } else {
+        tsock.discover_reflexive_profile(stun_targets).await
+    };
+    let mut discovery = finish_discovery(
+        local_addr,
+        selected_stun,
+        if opts.no_stun { 0 } else { stun_targets.len() },
+        opts,
+        started,
+    )
+    .await;
+    discovery.profile = Some(profile);
+    discovery
+}
+
+/// Shared tail of candidate discovery: assemble reflexive + predicted +
+/// router-mapped + local candidates around the (possibly absent) selected
+/// STUN result, then validate/dedup/cap the list (I-11). One implementation
+/// so the serial (legacy) and budgeted (traversal) paths can never drift.
+async fn finish_discovery(
+    local_addr: Option<SocketAddr>,
+    selected_stun: Option<SelectedStun>,
+    attempted_stun: usize,
+    opts: &GatherOptions,
+    started: Instant,
+) -> CandidateDiscovery {
+    let port_map = opts.port_map;
+    let port_prediction = opts.port_prediction;
+    let local_port = local_addr.map(|a| a.port()).unwrap_or(0);
+    let mut candidates = Vec::new();
+    let mut candidate_kinds = Vec::new();
+
+    // Operator-declared endpoints go FIRST (plan Fase 5): the operator knows
+    // the real public mapping better than any discovery. `RouterMapped` on
+    // the wire — an explicit static port-forward IS a router mapping, and
+    // reusing the existing kind keeps old peers parsing the offer.
+    for addr in &opts.manual_candidates {
+        if !candidates.contains(addr) {
+            info!(%addr, "advertising manual UDP candidate (--udp-candidate)");
+            candidates.push(*addr);
+            candidate_kinds.push(UdpCandidateKind::RouterMapped);
+        }
+    }
+
+    if let Some(selected) = &selected_stun {
+        let addr = selected.reflexive;
+        info!(
+            stun_server = %selected.requested,
+            stun_addr = %selected.addr,
+            stun_source = selected.source.as_str(),
+            reflexive = %addr,
+            udp_local_addr = ?local_addr,
+            "selected STUN server for UDP candidates"
+        );
+        candidates.push(addr);
+        candidate_kinds.push(UdpCandidateKind::Reflexive);
+
+        // Symmetric NATs allocate a *different* external port per
+        // destination, so the port toward the peer differs from the one seen
+        // by STUN — often sequentially. When explicitly enabled, advertise a
+        // few ports just past the reflexive one as extra candidates. Strictly
+        // opt-in: advertising/punching extra ports may look like a scan to
+        // strict firewalls.
+        if port_prediction {
+            let base = addr.port();
+            let mut added = 0u16;
+            for delta in 1..=PREDICT_RANGE {
+                if let Some(port) = base.checked_add(delta) {
+                    candidates.push(SocketAddr::new(addr.ip(), port));
+                    candidate_kinds.push(UdpCandidateKind::Predicted);
+                    added += 1;
+                }
+            }
+            warn!(
+                reflexive_port = base,
+                predicted = added,
+                "port prediction ENABLED — advertising predicted symmetric-NAT ports \
+                 (best-effort; may look like a scan to strict firewalls)"
+            );
+        }
+    } else if opts.no_stun {
+        if opts.manual_candidates.is_empty() {
+            warn!(
+                "--udp-no-stun with NO --udp-candidate: only local/port-mapped candidates \
+                 will be offered — across NAT/firewalls this will almost certainly fall \
+                 back to the relay. Declare your public endpoint with --udp-candidate"
+            );
+        }
+    } else {
         warn!(
-            attempted = stun_targets.len(),
+            attempted = attempted_stun,
             "all STUN probes failed — no public address discovered; offering only non-STUN \
              candidates. Direct UDP is unlikely across NAT/firewalls and will fall back to \
              the relay if the peer cannot reach them"
         );
     }
 
-    // Router-mapped candidate via UPnP-IGD, when explicitly enabled.
+    // Router-mapped candidate via a MANAGED lease (plan Fase 5): PCP first,
+    // UPnP-IGD fallback. The returned handle keeps the mapping renewed and
+    // releases it best-effort on drop; callers that outlive the discovery
+    // (secret provider) hold it for the tunnel's life and re-offer when the
+    // external endpoint changes.
+    #[cfg(feature = "udp")]
+    let mut lease = None;
     #[cfg(feature = "udp")]
     if port_map {
-        match upnp_candidate(local_port).await {
-            Ok(addr) => {
-                warn!(%addr, "UPnP-IGD port mapping ENABLED — added router-mapped candidate");
+        match crate::portmap::acquire_lease(local_port).await {
+            Some(handle) => {
+                let addr = handle.external;
+                warn!(
+                    %addr,
+                    backend = handle.backend,
+                    "managed port mapping ENABLED — added router-mapped candidate (lease renewed automatically)"
+                );
                 if !candidates.contains(&addr) {
                     candidates.push(addr);
                     candidate_kinds.push(UdpCandidateKind::RouterMapped);
                 }
+                lease = Some(std::sync::Arc::new(handle));
             }
-            Err(err) => debug!(%err, "UPnP-IGD port mapping failed; skipping that candidate"),
+            None => debug!("no managed port mapping (PCP + UPnP both unavailable); skipping"),
         }
     }
     #[cfg(not(feature = "udp"))]
@@ -625,10 +1820,16 @@ pub async fn gather_candidates_from_stun_targets(
             candidate_kinds.push(UdpCandidateKind::Local);
         }
     }
+    // Validate + dedup + cap what we are about to put on the wire, so a local
+    // gather bug can never leak an unusable list to the peer (I-11).
+    let san = sanitize_discovery(&mut candidates, &mut candidate_kinds);
+    log_dropped_candidates("gather", candidates.len(), &san);
+    let discovery_ms = started.elapsed().as_millis() as u64;
     info!(
         udp_local_addr = ?local_addr,
         selected_stun = selected_stun.as_ref().map(|s| s.requested.as_str()),
         candidates = ?candidates,
+        discovery_ms,
         "finished UDP candidate discovery"
     );
     CandidateDiscovery {
@@ -636,37 +1837,12 @@ pub async fn gather_candidates_from_stun_targets(
         candidate_kinds,
         local_addr,
         selected_stun,
-        attempted_stun: stun_targets.len(),
+        attempted_stun,
+        discovery_ms,
+        profile: None,
+        #[cfg(feature = "udp")]
+        lease,
     }
-}
-
-/// Ask the local router (UPnP-IGD) to map an external UDP port to our socket and
-/// return the resulting public `ip:port` candidate. Helps strict *home* routers
-/// with a public WAN IP; useless behind carrier-grade NAT (the mapped address is
-/// then itself a private/CGNAT address).
-#[cfg(feature = "udp")]
-async fn upnp_candidate(local_port: u16) -> Result<SocketAddr> {
-    use igd_next::aio::tokio as igd;
-    use igd_next::{PortMappingProtocol, SearchOptions};
-
-    let local_ip = primary_local_ip().context("no local IPv4 for UPnP mapping")?;
-    let local = SocketAddr::new(local_ip, local_port);
-    let options = SearchOptions {
-        timeout: Some(Duration::from_secs(2)),
-        ..Default::default()
-    };
-    let gateway = igd::search_gateway(options)
-        .await
-        .context("no UPnP-IGD gateway found")?;
-    let external_port = gateway
-        .add_any_port(PortMappingProtocol::UDP, local, 120, "bore")
-        .await
-        .context("UPnP-IGD port mapping request failed")?;
-    let wan = gateway
-        .get_external_ip()
-        .await
-        .context("UPnP-IGD external IP query failed")?;
-    Ok(SocketAddr::new(wan, external_port))
 }
 
 /// Resolve the STUN server address: the explicit override (`host:port`), or the
@@ -1283,17 +2459,67 @@ pub async fn connect_direct(
     token: [u8; TOKEN_LEN],
     tuning: UdpDirectTuning,
 ) -> Result<DirectConn> {
-    if peers.is_empty() {
-        bail!("no peer candidates to connect to");
+    connect_direct_inner(socket, peers, None, token, tuning, true).await
+}
+
+/// Delay before the non-nominated candidates are dialed when a
+/// check-nominated pair exists (Happy-Eyeballs fallback, plan Fase 2): the
+/// validated pair gets a head start; the others only race it if it stalls.
+#[cfg(feature = "udp")]
+const NOMINATED_FALLBACK_DELAY: Duration = Duration::from_millis(500);
+
+/// Like [`connect_direct`], but dial the check-nominated candidate FIRST; the
+/// remaining candidates start only after [`NOMINATED_FALLBACK_DELAY`] as a
+/// Happy-Eyeballs fallback. Same single socket, same total budget.
+#[cfg(feature = "udp")]
+pub async fn connect_direct_nominated(
+    socket: UdpSocket,
+    peers: Vec<SocketAddr>,
+    nominated: SocketAddr,
+    token: [u8; TOKEN_LEN],
+    tuning: UdpDirectTuning,
+) -> Result<DirectConn> {
+    // The check round already opened the mappings; the blind punch is
+    // redundant (QUIC Initials are outbound datagrams themselves).
+    connect_direct_inner(socket, peers, Some(nominated), token, tuning, false).await
+}
+
+#[cfg(feature = "udp")]
+async fn connect_direct_inner(
+    socket: UdpSocket,
+    mut peers: Vec<SocketAddr>,
+    nominated: Option<SocketAddr>,
+    token: [u8; TOKEN_LEN],
+    tuning: UdpDirectTuning,
+    punch_first: bool,
+) -> Result<DirectConn> {
+    // Defense in depth: the broker already sanitizes peer-controlled lists, but
+    // this is the last gate before per-candidate task fan-out (I-11).
+    let san = sanitize_candidates(&mut peers);
+    log_dropped_candidates("connect_direct", peers.len(), &san);
+    if let Some(nominated) = nominated {
+        // The nominated pair is check-validated; make sure it is dialed even
+        // if it was not in the original offer (peer-reflexive learning).
+        if !peers.contains(&nominated) && valid_candidate(&nominated) {
+            peers.insert(0, nominated);
+        }
     }
+    if peers.is_empty() {
+        bail!("no peer candidates to connect to (fallback_reason=no-candidates)");
+    }
+    let started = Instant::now();
     configure_udp_socket_buffers(&socket, &tuning);
     let local_addr = socket.local_addr().ok();
     info!(
         udp_local_addr = ?local_addr,
         peer_candidates = ?peers,
+        nominated = ?nominated,
+        punch_first,
         "consumer punching UDP peer candidates"
     );
-    punch(&socket, &peers).await;
+    if punch_first {
+        punch(&socket, &peers).await;
+    }
     let endpoint = client_endpoint(socket, &tuning)?;
 
     // Try all candidates concurrently under a single total budget (not a full
@@ -1309,6 +2535,10 @@ pub async fn connect_direct(
             let endpoint = endpoint.clone();
             let errors = Arc::clone(&errors);
             Box::pin(async move {
+                // Happy-Eyeballs: with a nominated pair, the others wait.
+                if nominated.is_some_and(|n| n != peer) {
+                    tokio::time::sleep(NOMINATED_FALLBACK_DELAY).await;
+                }
                 debug!(%peer, "attempting direct QUIC candidate");
                 let connecting = match endpoint.connect(peer, "bore") {
                     Ok(connecting) => connecting,
@@ -1354,7 +2584,15 @@ pub async fn connect_direct(
         .collect();
 
     match timeout(NETWORK_TIMEOUT, futures_util::future::select_ok(attempts)).await {
-        Ok(Ok((conn, _losers))) => Ok(conn),
+        Ok(Ok((conn, _losers))) => {
+            info!(
+                winner = %conn.remote_address(),
+                candidates = peers.len(),
+                direct_ready_ms = started.elapsed().as_millis() as u64,
+                "direct QUIC path ready (consumer)"
+            );
+            Ok(conn)
+        }
         Ok(Err(err)) => {
             let err_summary: Vec<String> = errors
                 .lock()
@@ -1365,6 +2603,8 @@ pub async fn connect_direct(
             warn!(
                 candidates = ?peers,
                 errors = ?err_summary,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                fallback_reason = "all-candidates-failed",
                 "all {n} direct QUIC candidates failed; falling back to relay",
                 n = peers.len(),
             );
@@ -1374,6 +2614,7 @@ pub async fn connect_direct(
             warn!(
                 timeout = ?NETWORK_TIMEOUT,
                 candidates = ?peers,
+                fallback_reason = "budget-exhausted",
                 "direct QUIC connect exhausted {NETWORK_TIMEOUT:?} budget \
                  across {n} candidates; none responded — all candidates timed out \
                  (firewall/UDP blocked on both ends, or peer IP unreachable). \
@@ -1382,6 +2623,135 @@ pub async fn connect_direct(
             );
             bail!("direct connect exhausted the {NETWORK_TIMEOUT:?} budget")
         }
+    }
+}
+
+/// Fase 2 orchestration, listener/provider side: run the authenticated check
+/// round (which doubles as the punch — every request is an outbound datagram
+/// that opens the NAT), then start the QUIC listener on the SAME socket.
+/// The caller keeps its legacy accept loop unchanged.
+#[cfg(feature = "udp")]
+pub async fn listener_checks_then_quic(
+    socket: UdpSocket,
+    peers: &[SocketAddr],
+    cfg: &CheckConfig,
+    tuning: UdpDirectTuning,
+) -> Result<(DirectListener, CheckOutcome)> {
+    let tsock = UdpTraversalSocket::from_socket(socket);
+    let outcome = tsock.run_connectivity_checks(peers, cfg).await;
+    let socket = tsock.into_socket().await?;
+    let listener = DirectListener::from_checked_socket(socket, tuning)?;
+    Ok((listener, outcome))
+}
+
+/// Fase 2 orchestration, dialer/consumer side: run the check round, then dial
+/// the nominated pair first (Happy-Eyeballs fallback on the rest), or — when
+/// nothing validated — dial the round's final target list (which includes any
+/// learned peer-reflexive address) exactly like the legacy path, minus the
+/// now-redundant blind punch.
+///
+/// `cache_key`, when given, engages the winning-pair cache (plan Fase 3):
+/// the last known-good remote is probed FIRST (an extra head group), a
+/// successful QUIC handshake refreshes the entry, and ANY direct failure
+/// invalidates it immediately.
+#[cfg(feature = "udp")]
+pub async fn dialer_checks_then_quic(
+    socket: UdpSocket,
+    mut peers: Vec<SocketAddr>,
+    cfg: &CheckConfig,
+    token: [u8; TOKEN_LEN],
+    tuning: UdpDirectTuning,
+    cache_key: Option<&str>,
+) -> Result<(DirectConn, CheckOutcome)> {
+    let mut cfg = cfg.clone();
+    if let Some(key) = cache_key {
+        if let Some(cached) = pair_cache::recall(key) {
+            info!(
+                %cached,
+                key,
+                "probing cached winning pair first (invalidated on first direct failure)"
+            );
+            if !peers.contains(&cached) && valid_candidate(&cached) {
+                peers.push(cached);
+            }
+            let plan = cfg.plan.get_or_insert_with(CheckPlan::default);
+            plan.groups.insert(0, vec![cached]);
+        }
+    }
+    let tsock = UdpTraversalSocket::from_socket(socket);
+    let outcome = tsock.run_connectivity_checks(&peers, &cfg).await;
+    let socket = tsock.into_socket().await?;
+    let conn = match outcome.nominated {
+        Some(nominated) => {
+            connect_direct_inner(
+                socket,
+                outcome.targets.clone(),
+                Some(nominated),
+                token,
+                tuning,
+                false,
+            )
+            .await
+        }
+        None => {
+            connect_direct_inner(socket, outcome.targets.clone(), None, token, tuning, false).await
+        }
+    };
+    if let Some(key) = cache_key {
+        match &conn {
+            Ok(conn) => pair_cache::remember(key, conn.remote_address()),
+            Err(_) => pair_cache::invalidate(key),
+        }
+    }
+    Ok((conn?, outcome))
+}
+
+/// Short-lived winning-pair cache (plan Fase 3): remembers, per logical
+/// tunnel, the remote address that last completed a direct QUIC handshake so
+/// a reconnect probes it FIRST (head group of the next check round). Process-
+/// local and advisory only — a stale entry costs one probe, never blocks the
+/// round (membership still comes from the fresh offer + sanitizer), and the
+/// entry is invalidated on the first direct failure.
+pub mod pair_cache {
+    use super::*;
+    use std::sync::OnceLock;
+
+    /// A NAT mapping rarely outlives its idle timer; two minutes covers the
+    /// quick-reconnect case (process still up, `--auto-reconnect`) without
+    /// dragging a dead pair into genuinely new network conditions.
+    const PAIR_CACHE_TTL: Duration = Duration::from_secs(120);
+
+    fn cache() -> &'static std::sync::Mutex<HashMap<String, (SocketAddr, Instant)>> {
+        static CACHE: OnceLock<std::sync::Mutex<HashMap<String, (SocketAddr, Instant)>>> =
+            OnceLock::new();
+        CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+    }
+
+    /// Record `addr` as the winning pair for `key`.
+    pub fn remember(key: &str, addr: SocketAddr) {
+        cache()
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), (addr, Instant::now()));
+    }
+
+    /// The cached winning pair for `key`, if still within TTL (expired
+    /// entries are removed on the way out).
+    pub fn recall(key: &str) -> Option<SocketAddr> {
+        let mut guard = cache().lock().unwrap();
+        match guard.get(key) {
+            Some((addr, at)) if at.elapsed() < PAIR_CACHE_TTL => Some(*addr),
+            Some(_) => {
+                guard.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Drop the cached pair for `key` (first failure ⇒ immediate invalidation).
+    pub fn invalidate(key: &str) {
+        cache().lock().unwrap().remove(key);
     }
 }
 
@@ -1445,12 +2815,23 @@ pub struct DirectListener {
 
 #[cfg(feature = "udp")]
 impl DirectListener {
+    /// Start a QUIC server endpoint over a socket whose NAT path was ALREADY
+    /// opened by an authenticated connectivity-check round (plan Fase 2):
+    /// no blind punch — the checks were the punch.
+    pub fn from_checked_socket(socket: UdpSocket, tuning: UdpDirectTuning) -> Result<Self> {
+        configure_udp_socket_buffers(&socket, &tuning);
+        let endpoint = server_endpoint(socket, &tuning)?;
+        Ok(DirectListener { endpoint })
+    }
+
     /// Punch toward `peers` and start a QUIC server endpoint over `socket`.
     pub async fn new(
         socket: UdpSocket,
-        peers: Vec<SocketAddr>,
+        mut peers: Vec<SocketAddr>,
         tuning: UdpDirectTuning,
     ) -> Result<Self> {
+        let san = sanitize_candidates(&mut peers);
+        log_dropped_candidates("direct_listener", peers.len(), &san);
         configure_udp_socket_buffers(&socket, &tuning);
         let local_addr = socket.local_addr().ok();
         info!(
@@ -1475,8 +2856,11 @@ impl DirectListener {
     /// the consumer is a QUIC client and won't complete it, but the outbound
     /// packets punch the mapping so the consumer's own connection gets through.
     pub fn punch_via_endpoint(&self, peers: &[SocketAddr]) {
+        let mut peers = peers.to_vec();
+        let san = sanitize_candidates(&mut peers);
+        log_dropped_candidates("punch_via_endpoint", peers.len(), &san);
         info!(peer_candidates = ?peers, "provider re-punching UDP peer candidates");
-        for &peer in peers {
+        for peer in peers {
             if let Ok(connecting) = self.endpoint.connect(peer, "bore") {
                 tokio::spawn(async move {
                     let _ = timeout(NETWORK_TIMEOUT, connecting).await;
@@ -1776,6 +3160,156 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
     }
 }
 
+/// Authenticated connectivity-check frames (plan Fase 2). Not STUN: a fixed
+/// 60-byte binary frame, HMAC-authenticated with a key derived from the
+/// direct-path token ([`derive_check_key`]).
+///
+/// Layout (both kinds, always exactly [`check::FRAME_LEN`] bytes — a response
+/// is never larger than a request, so the responder cannot amplify):
+///
+/// ```text
+///  0..4    magic  b"bcc1"
+///  4       kind   1 = request, 2 = response
+///  5       role   1 = listener, 2 = dialer   (sender's role)
+///  6..10   generation (u32 BE)
+/// 10..22   transaction id (12 bytes; response echoes the request's)
+/// 22..28   observed source: IPv4 (4) + port (2 BE); zero in requests
+/// 28..60   HMAC-SHA256(key, bytes 0..28)
+/// ```
+pub mod check {
+    use super::*;
+
+    /// Total frame length, both kinds.
+    pub const FRAME_LEN: usize = 60;
+    const MAGIC: &[u8; 4] = b"bcc1";
+    /// Frame kinds.
+    pub const KIND_REQUEST: u8 = 1;
+    /// See [`KIND_REQUEST`].
+    pub const KIND_RESPONSE: u8 = 2;
+    /// Sender roles.
+    pub const ROLE_LISTENER: u8 = 1;
+    /// See [`ROLE_LISTENER`].
+    pub const ROLE_DIALER: u8 = 2;
+    const HMAC_AT: usize = 28;
+
+    /// A parsed, HMAC-verified frame.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Frame {
+        /// [`KIND_REQUEST`] or [`KIND_RESPONSE`].
+        pub kind: u8,
+        /// Sender's role byte.
+        pub role: u8,
+        /// Traversal round generation.
+        pub generation: u32,
+        /// Transaction id (a response echoes the request's).
+        pub txid: [u8; 12],
+        /// Observed source (responses only; `None` when zeroed/non-IPv4).
+        pub observed: Option<SocketAddr>,
+    }
+
+    /// Cheap shape test (magic + length) used by the recv actor to decide
+    /// whether a datagram should be counted as an (in)valid check frame or as
+    /// ordinary peer traffic. Deliberately does NOT authenticate.
+    pub fn looks_like(buf: &[u8]) -> bool {
+        buf.len() == FRAME_LEN && &buf[..4] == MAGIC
+    }
+
+    /// Fresh random transaction id from the system CSPRNG.
+    pub fn new_txid() -> [u8; 12] {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut txid = [0u8; 12];
+        SystemRandom::new()
+            .fill(&mut txid)
+            .expect("system CSPRNG must not fail");
+        txid
+    }
+
+    fn build(
+        key: &[u8; 32],
+        kind: u8,
+        role: u8,
+        generation: u32,
+        txid: &[u8; 12],
+        observed: Option<std::net::SocketAddrV4>,
+    ) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(FRAME_LEN);
+        frame.extend_from_slice(MAGIC);
+        frame.push(kind);
+        frame.push(role);
+        frame.extend_from_slice(&generation.to_be_bytes());
+        frame.extend_from_slice(txid);
+        match observed {
+            Some(v4) => {
+                frame.extend_from_slice(&v4.ip().octets());
+                frame.extend_from_slice(&v4.port().to_be_bytes());
+            }
+            None => frame.extend_from_slice(&[0u8; 6]),
+        }
+        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+        mac.update(&frame);
+        frame.extend_from_slice(&mac.finalize().into_bytes());
+        debug_assert_eq!(frame.len(), FRAME_LEN);
+        frame
+    }
+
+    /// Build an authenticated check request.
+    pub fn request(key: &[u8; 32], role: u8, generation: u32, txid: &[u8; 12]) -> Vec<u8> {
+        build(key, KIND_REQUEST, role, generation, txid, None)
+    }
+
+    /// Build the authenticated response to a request: echoes the transaction
+    /// id and reports the request's observed source address. Non-IPv4 sources
+    /// are zeroed (IPv6 is out of scope for the direct path).
+    pub fn response(
+        key: &[u8; 32],
+        role: u8,
+        generation: u32,
+        txid: &[u8; 12],
+        observed: SocketAddr,
+    ) -> Vec<u8> {
+        let v4 = match observed {
+            SocketAddr::V4(v4) => Some(v4),
+            SocketAddr::V6(_) => None,
+        };
+        build(key, KIND_RESPONSE, role, generation, txid, v4)
+    }
+
+    /// Parse + authenticate a frame. `None` on ANY mismatch (length, magic,
+    /// kind, HMAC) — the caller must not answer, only count.
+    pub fn parse(key: &[u8; 32], buf: &[u8]) -> Option<Frame> {
+        if !looks_like(buf) {
+            return None;
+        }
+        let kind = buf[4];
+        if kind != KIND_REQUEST && kind != KIND_RESPONSE {
+            return None;
+        }
+        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+        mac.update(&buf[..HMAC_AT]);
+        // Constant-time verification via the hmac crate.
+        mac.verify_slice(&buf[HMAC_AT..]).ok()?;
+
+        let role = buf[5];
+        let generation = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
+        let txid: [u8; 12] = buf[10..22].try_into().ok()?;
+        let octets: [u8; 4] = buf[22..26].try_into().ok()?;
+        let port = u16::from_be_bytes([buf[26], buf[27]]);
+        let ip = Ipv4Addr::from(octets);
+        let observed = if ip.is_unspecified() && port == 0 {
+            None
+        } else {
+            Some(SocketAddr::new(IpAddr::V4(ip), port))
+        };
+        Some(Frame {
+            kind,
+            role,
+            generation,
+            txid,
+            observed,
+        })
+    }
+}
+
 /// Minimal STUN (RFC 5389) binding-request client and a server responder, used
 /// for reflexive-address discovery. Only XOR-MAPPED-ADDRESS is supported.
 pub mod stun {
@@ -1800,6 +3334,23 @@ pub mod stun {
         msg.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
         msg.extend_from_slice(&txid);
         (msg, txid)
+    }
+
+    /// Extract the transaction id from a STUN binding success response
+    /// (message type and magic cookie checked). Used by the traversal
+    /// socket's recv actor to demultiplex concurrent transactions before
+    /// full parsing.
+    pub fn response_txid(buf: &[u8]) -> Option<[u8; 12]> {
+        if buf.len() < 20 {
+            return None;
+        }
+        if u16::from_be_bytes([buf[0], buf[1]]) != BINDING_SUCCESS {
+            return None;
+        }
+        if u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) != MAGIC_COOKIE {
+            return None;
+        }
+        buf[8..20].try_into().ok()
     }
 
     /// Parse the XOR-MAPPED-ADDRESS from a STUN binding success response.
@@ -2028,6 +3579,751 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Structurally unusable candidates (port 0, unspecified, multicast,
+    /// broadcast) are dropped, duplicates deduped order-preserving, and the
+    /// list is capped at MAX_UDP_CANDIDATES — with per-cause counters and no
+    /// allocation proportional to a hostile count (I-11).
+    #[test]
+    fn sanitize_rejects_invalid_dedups_and_caps() {
+        let mut cands: Vec<SocketAddr> = vec![
+            "203.0.113.7:1000".parse().unwrap(),
+            "203.0.113.7:0".parse().unwrap(),        // port 0
+            "0.0.0.0:1234".parse().unwrap(),         // unspecified v4
+            "[::]:1234".parse().unwrap(),            // unspecified v6
+            "224.0.0.1:1234".parse().unwrap(),       // multicast v4
+            "[ff02::1]:1234".parse().unwrap(),       // multicast v6
+            "255.255.255.255:1234".parse().unwrap(), // broadcast
+            "203.0.113.7:1000".parse().unwrap(),     // duplicate
+            "203.0.113.8:1000".parse().unwrap(),
+        ];
+        let san = sanitize_candidates(&mut cands);
+        assert_eq!(
+            cands,
+            vec![
+                "203.0.113.7:1000".parse::<SocketAddr>().unwrap(),
+                "203.0.113.8:1000".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+        assert_eq!(san.dropped_invalid, 6);
+        assert_eq!(san.dropped_duplicate, 1);
+        assert_eq!(san.dropped_overflow, 0);
+
+        // Overflow: a hostile 10_000-entry list keeps only the cap.
+        let mut flood: Vec<SocketAddr> = (0..10_000u32)
+            .map(|i| {
+                SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(198, 51, (i / 250) as u8, (i % 250) as u8 + 1)),
+                    1000 + (i % 60_000) as u16,
+                )
+            })
+            .collect();
+        let san = sanitize_candidates(&mut flood);
+        assert_eq!(flood.len(), MAX_UDP_CANDIDATES);
+        assert_eq!(san.dropped_overflow, 10_000 - MAX_UDP_CANDIDATES);
+    }
+
+    /// Private/CGNAT candidates must be preserved: same-LAN peers need them and
+    /// the token — not the candidate list — authenticates the path (I-6).
+    #[test]
+    fn sanitize_preserves_private_and_cgnat_candidates() {
+        let mut cands: Vec<SocketAddr> = vec![
+            "192.168.1.10:4000".parse().unwrap(),
+            "10.0.0.5:4000".parse().unwrap(),
+            "100.64.7.9:4000".parse().unwrap(),
+            "127.0.0.1:4000".parse().unwrap(),
+        ];
+        let san = sanitize_candidates(&mut cands);
+        assert_eq!(
+            cands.len(),
+            4,
+            "private/CGNAT/loopback candidates must survive"
+        );
+        assert_eq!(san.dropped(), 0);
+    }
+
+    /// Fase 1 gate: concurrent STUN transactions on ONE socket all resolve —
+    /// the recv actor demuxes by transaction id (no reader steals another
+    /// transaction's response), and non-STUN datagrams are counted, never
+    /// consumed by a STUN waiter.
+    #[tokio::test]
+    async fn traversal_demux_concurrent_transactions() {
+        let responder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stun_addr = responder.local_addr().unwrap();
+        tokio::spawn(run_stun_responder(responder));
+
+        let tsock = UdpTraversalSocket::bind(0).await.unwrap();
+        let port = tsock.local_addr().unwrap().port();
+        let expected: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        // A peer-punch datagram interleaved with the transactions must be
+        // counted as a peer datagram, not break any STUN waiter.
+        let noise = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        noise
+            .send_to(b"bore-punch", ("127.0.0.1", port))
+            .await
+            .unwrap();
+
+        let (a, b, c) = tokio::join!(
+            tsock.stun_query(stun_addr),
+            tsock.stun_query(stun_addr),
+            tsock.stun_query(stun_addr),
+        );
+        assert_eq!(a.unwrap(), expected);
+        assert_eq!(b.unwrap(), expected);
+        assert_eq!(c.unwrap(), expected);
+        // The punch datagram may still be in flight when the queries resolve;
+        // poll briefly instead of asserting immediately.
+        for _ in 0..50 {
+            if tsock.peer_datagrams() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(tsock.peer_datagrams() >= 1, "punch datagram not counted");
+    }
+
+    /// Fase 1 gate: a response with the WRONG transaction id, and a correct
+    /// response from the WRONG source (ip:port), are both discarded as strays
+    /// — only the queried server's genuine response resolves the transaction.
+    #[tokio::test]
+    async fn traversal_rejects_wrong_txid_and_wrong_source() {
+        let real = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let real_addr = real.local_addr().unwrap();
+        let spoofer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Scripted responder: on each request it first sends garbage-txid and
+        // wrong-source responses, THEN the genuine one.
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, from)) = real.recv_from(&mut buf).await else {
+                    break;
+                };
+                // (a) right source, wrong txid.
+                let mut req_bad = buf[..n].to_vec();
+                req_bad[8] ^= 0xff;
+                if let Some(reply) =
+                    stun::binding_response(&req_bad, "203.0.113.66:6666".parse().unwrap())
+                {
+                    let _ = real.send_to(&reply, from).await;
+                }
+                // (b) wrong source, right txid.
+                if let Some(reply) =
+                    stun::binding_response(&buf[..n], "203.0.113.66:6666".parse().unwrap())
+                {
+                    let _ = spoofer.send_to(&reply, from).await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                // (c) the genuine response.
+                if let Some(reply) = stun::binding_response(&buf[..n], from) {
+                    let _ = real.send_to(&reply, from).await;
+                }
+            }
+        });
+
+        let tsock = UdpTraversalSocket::bind(0).await.unwrap();
+        let port = tsock.local_addr().unwrap().port();
+        let expected: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mapped = tsock.stun_query(real_addr).await.unwrap();
+        assert_eq!(
+            mapped, expected,
+            "genuine response must win, never the spoofed 203.0.113.66"
+        );
+        assert!(
+            tsock.stray_stun() >= 1,
+            "wrong-txid / wrong-source responses must be counted as strays"
+        );
+    }
+
+    /// Fase 1 gate: a chain of unreachable STUN targets completes within the
+    /// GLOBAL budget (legacy serial worst case: 3 s per target).
+    #[tokio::test]
+    async fn traversal_chain_respects_global_budget() {
+        // Bound-but-silent sockets: requests vanish, no ICMP.
+        let dead: Vec<UdpSocket> = {
+            let mut v = Vec::new();
+            for _ in 0..3 {
+                v.push(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            }
+            v
+        };
+        let targets: Vec<StunTarget> = dead
+            .iter()
+            .map(|s| StunTarget {
+                requested: "dead".to_string(),
+                addr: s.local_addr().unwrap(),
+                source: StunSource::PublicDefault,
+            })
+            .collect();
+
+        let tsock = UdpTraversalSocket::bind(0).await.unwrap();
+        let started = Instant::now();
+        let selected = tsock.discover_reflexive_chain(&targets).await;
+        let elapsed = started.elapsed();
+        assert!(selected.is_none());
+        assert!(
+            elapsed < STUN_CHAIN_BUDGET + Duration::from_secs(1),
+            "chain took {elapsed:?}, exceeding the global budget {STUN_CHAIN_BUDGET:?}"
+        );
+    }
+
+    /// The budgeted traversal gather must produce the SAME candidate shape as
+    /// the legacy serial gather (default-equivalence, Fase 1 exit criterion).
+    #[tokio::test]
+    async fn traversal_gather_matches_legacy_gather() {
+        let responder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stun_addr = responder.local_addr().unwrap();
+        tokio::spawn(run_stun_responder(responder));
+        let target = |name: &str| StunTarget {
+            requested: name.to_string(),
+            addr: stun_addr,
+            source: StunSource::Single,
+        };
+
+        let legacy_sock = bind_socket(0).await.unwrap();
+        let legacy =
+            gather_candidates_from_stun_targets(&legacy_sock, &[target("t")], false, true).await;
+
+        let tsock = UdpTraversalSocket::bind(0).await.unwrap();
+        let traversal = gather_candidates_traversal(
+            &tsock,
+            &[target("t")],
+            &GatherOptions::from_flags(false, true),
+        )
+        .await;
+
+        assert_eq!(legacy.candidate_kinds, traversal.candidate_kinds);
+        assert_eq!(legacy.candidates.len(), traversal.candidates.len());
+        assert_eq!(
+            legacy.selected_stun.as_ref().map(|s| s.requested.clone()),
+            traversal
+                .selected_stun
+                .as_ref()
+                .map(|s| s.requested.clone()),
+        );
+        // Both reflexives point at the respective socket's own port (loopback).
+        assert_eq!(
+            traversal.selected_stun.unwrap().reflexive.port(),
+            tsock.local_addr().unwrap().port(),
+        );
+    }
+
+    /// Handoff: after discovery the raw socket must be fully usable (single
+    /// reader — the actor is gone). This is the Quinn-handoff spike in miniature.
+    #[tokio::test]
+    async fn traversal_into_socket_hands_off_cleanly() {
+        let tsock = UdpTraversalSocket::bind(0).await.unwrap();
+        let addr = format!("127.0.0.1:{}", tsock.local_addr().unwrap().port());
+        let socket = tsock.into_socket().await.expect("handoff");
+
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        peer.send_to(b"hello", &addr).await.unwrap();
+        let mut buf = [0u8; 16];
+        let (n, from) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+            .await
+            .expect("handoff socket must receive (actor stopped)")
+            .unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        socket.send_to(b"world", from).await.unwrap();
+        let (n, _) = timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"world");
+    }
+
+    /// `to_offer` carries the typed v2 candidates aligned with the legacy
+    /// list, plus the v2 capability — old peers keep reading `candidates`.
+    #[tokio::test]
+    async fn discovery_to_offer_builds_v2_alongside_legacy() {
+        let responder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stun_addr = responder.local_addr().unwrap();
+        tokio::spawn(run_stun_responder(responder));
+
+        let tsock = UdpTraversalSocket::bind(0).await.unwrap();
+        let disc = gather_candidates_traversal(
+            &tsock,
+            &[StunTarget {
+                requested: "t".to_string(),
+                addr: stun_addr,
+                source: StunSource::Single,
+            }],
+            &GatherOptions::from_flags(false, true),
+        )
+        .await;
+        let offer = disc.to_offer(7, 3);
+        assert_eq!(offer.peer_id, 7);
+        assert_eq!(offer.generation, 3);
+        assert_eq!(offer.candidates, disc.candidates);
+        assert_eq!(offer.typed_candidates.len(), disc.candidates.len());
+        for (typed, (addr, kind)) in offer
+            .typed_candidates
+            .iter()
+            .zip(disc.candidates.iter().zip(disc.candidate_kinds.iter()))
+        {
+            assert_eq!(&typed.addr, addr);
+            assert_eq!(&typed.kind, kind);
+        }
+        assert!(offer.capabilities.iter().any(|c| c == UDP_CAP_CANDIDATE_V2));
+        // Priorities: local outranks reflexive outranks predicted.
+        let prio = |k: UdpCandidateKind| candidate_priority(k, 0);
+        assert!(prio(UdpCandidateKind::Local) > prio(UdpCandidateKind::Reflexive));
+        assert!(prio(UdpCandidateKind::Reflexive) > prio(UdpCandidateKind::Predicted));
+    }
+
+    /// Check frames: request/response round-trip, exact frame-size equality
+    /// (no amplification), and every tampering rejected by parse.
+    #[test]
+    fn check_frames_roundtrip_and_reject_tampering() {
+        let key = [7u8; 32];
+        let txid = check::new_txid();
+        let req = check::request(&key, check::ROLE_DIALER, 3, &txid);
+        let resp = check::response(
+            &key,
+            check::ROLE_LISTENER,
+            3,
+            &txid,
+            "203.0.113.9:4444".parse().unwrap(),
+        );
+        assert_eq!(req.len(), check::FRAME_LEN);
+        assert_eq!(
+            resp.len(),
+            req.len(),
+            "a response must never be larger than a request (anti-amplification)"
+        );
+
+        let p = check::parse(&key, &req).expect("request parses");
+        assert_eq!(p.kind, check::KIND_REQUEST);
+        assert_eq!(p.role, check::ROLE_DIALER);
+        assert_eq!(p.generation, 3);
+        assert_eq!(p.txid, txid);
+        assert_eq!(p.observed, None);
+
+        let p = check::parse(&key, &resp).expect("response parses");
+        assert_eq!(p.kind, check::KIND_RESPONSE);
+        assert_eq!(p.observed, Some("203.0.113.9:4444".parse().unwrap()));
+
+        // Tampering: flipped payload byte, flipped HMAC byte, wrong key,
+        // truncated, wrong magic — all rejected.
+        let mut bad = req.clone();
+        bad[6] ^= 1;
+        assert!(check::parse(&key, &bad).is_none());
+        let mut bad = req.clone();
+        bad[59] ^= 1;
+        assert!(check::parse(&key, &bad).is_none());
+        assert!(check::parse(&[8u8; 32], &req).is_none());
+        assert!(check::parse(&key, &req[..59]).is_none());
+        let mut bad = req.clone();
+        bad[0] = b'X';
+        assert!(check::parse(&key, &bad).is_none());
+    }
+
+    /// Fase 2 security gate: forged/foreign probes get NO response, ever; a
+    /// genuine authenticated request gets exactly one response of the same
+    /// size as the request.
+    #[tokio::test]
+    async fn checks_never_answer_unauthenticated_probes() {
+        let key = [3u8; 32];
+        let tsock = UdpTraversalSocket::bind(0).await.unwrap();
+        let port = tsock.local_addr().unwrap().port();
+        let cfg = CheckConfig {
+            key,
+            generation: 7,
+            role: CheckRole::Listener,
+            window: Duration::from_millis(800),
+            plan: None,
+        };
+
+        let prober = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let probe_task = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let txid = check::new_txid();
+            // (a) wrong key
+            let forged = check::request(&[9u8; 32], check::ROLE_DIALER, 7, &txid);
+            prober.send_to(&forged, ("127.0.0.1", port)).await.unwrap();
+            // (b) right key, wrong generation
+            let wrong_gen = check::request(&key, check::ROLE_DIALER, 8, &txid);
+            prober
+                .send_to(&wrong_gen, ("127.0.0.1", port))
+                .await
+                .unwrap();
+            // (c) right key, SAME role (reflection)
+            let same_role = check::request(&key, check::ROLE_LISTENER, 7, &txid);
+            prober
+                .send_to(&same_role, ("127.0.0.1", port))
+                .await
+                .unwrap();
+            // None of the above may be answered.
+            let mut buf = [0u8; 128];
+            let silent = timeout(Duration::from_millis(300), prober.recv_from(&mut buf)).await;
+            assert!(
+                silent.is_err(),
+                "an unauthenticated/foreign probe must NEVER get a response"
+            );
+            // (d) genuine request → exactly one same-size response.
+            let good = check::request(&key, check::ROLE_DIALER, 7, &txid);
+            prober.send_to(&good, ("127.0.0.1", port)).await.unwrap();
+            let (n, _) = timeout(Duration::from_millis(500), prober.recv_from(&mut buf))
+                .await
+                .expect("genuine request must be answered")
+                .unwrap();
+            assert_eq!(n, check::FRAME_LEN, "response must not exceed request size");
+            let frame = check::parse(&key, &buf[..n]).expect("authenticated response");
+            assert_eq!(frame.kind, check::KIND_RESPONSE);
+            assert_eq!(frame.txid, txid);
+            // Observed source = the prober's own address as seen by the peer.
+            assert_eq!(frame.observed, Some(prober.local_addr().unwrap()));
+        };
+        let (outcome, ()) = tokio::join!(tsock.run_connectivity_checks(&[], &cfg), probe_task);
+        assert!(outcome.nominated.is_none());
+        assert!(
+            tsock.invalid_checks() >= 3,
+            "forged probes must be counted (got {})",
+            tsock.invalid_checks()
+        );
+        // The genuine prober source became a peer-reflexive target.
+        assert!(outcome.learned_prflx);
+        assert!(outcome.targets.contains(&prober.local_addr().unwrap()));
+    }
+
+    /// Fase 2 happy path on loopback: both roles run a round; each side
+    /// nominates the other (bidirectional proof) with matching observed
+    /// mapped addresses.
+    #[tokio::test]
+    async fn checks_nominate_bidirectionally_on_loopback() {
+        let key = [5u8; 32];
+        let a = UdpTraversalSocket::bind(0).await.unwrap();
+        let b = UdpTraversalSocket::bind(0).await.unwrap();
+        let a_addr: SocketAddr = format!("127.0.0.1:{}", a.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        let b_addr: SocketAddr = format!("127.0.0.1:{}", b.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        let l_cfg = CheckConfig {
+            key,
+            generation: 1,
+            role: CheckRole::Listener,
+            window: Duration::from_secs(2),
+            plan: None,
+        };
+        let d_cfg = CheckConfig {
+            key,
+            generation: 1,
+            role: CheckRole::Dialer,
+            window: Duration::from_secs(2),
+            plan: None,
+        };
+        let l_peers = [b_addr];
+        let d_peers = [a_addr];
+        let (l, d) = tokio::join!(
+            a.run_connectivity_checks(&l_peers, &l_cfg),
+            b.run_connectivity_checks(&d_peers, &d_cfg),
+        );
+        assert_eq!(l.nominated, Some(b_addr), "listener validates the dialer");
+        assert_eq!(d.nominated, Some(a_addr), "dialer validates the listener");
+        // Loopback: the observed mapped address is the socket's own address.
+        assert_eq!(l.observed, Some(a_addr));
+        assert_eq!(d.observed, Some(b_addr));
+        assert!(l.checks_ms < 2000 && d.checks_ms < 2000);
+    }
+
+    /// Fase 3 gate: pacing jitter is bounded (strictly below the pace) and the
+    /// two roles derive DIFFERENT sequences from the same key — that is what
+    /// breaks the conntrack-crossfire lockstep without any extra wire bytes.
+    #[test]
+    fn check_jitter_bounded_and_role_diverse() {
+        let key = [9u8; 32];
+        let l_seed = check_jitter_seed(&key, check::ROLE_LISTENER);
+        let d_seed = check_jitter_seed(&key, check::ROLE_DIALER);
+        assert_ne!(l_seed, d_seed, "roles must not share a jitter sequence");
+        let mut diverged = false;
+        for step in 0..1000u64 {
+            let l = check_jitter(l_seed, step);
+            let d = check_jitter(d_seed, step);
+            assert!(l < CHECK_JITTER_MAX && d < CHECK_JITTER_MAX);
+            assert!(l < CHECK_PACE && d < CHECK_PACE);
+            diverged |= l != d;
+            // Deterministic: same seed+step, same value.
+            assert_eq!(l, check_jitter(l_seed, step));
+        }
+        assert!(diverged, "sequences never diverged");
+    }
+
+    fn typed(addr: &str, kind: UdpCandidateKind) -> UdpTypedCandidate {
+        UdpTypedCandidate {
+            addr: addr.parse().unwrap(),
+            kind,
+            priority: 0,
+        }
+    }
+
+    /// Fase 3 gate: the plan ORDERS candidates into kind groups but never adds
+    /// or drops any — kinds missing from the server order still probe (final
+    /// group), and no predicted group exists when no predicted candidate was
+    /// offered ("no predicted checks when prediction is off").
+    #[test]
+    fn plan_check_groups_orders_and_never_drops() {
+        let cands = vec![
+            typed("198.51.100.1:1000", UdpCandidateKind::Reflexive),
+            typed("192.168.1.5:1000", UdpCandidateKind::Local),
+            typed("198.51.100.1:1001", UdpCandidateKind::Predicted),
+            typed("203.0.113.9:2000", UdpCandidateKind::RouterMapped),
+        ];
+        // Server order names only predicted + reflexive (+ relay, skipped):
+        // local + router-mapped must still probe, in a trailing group.
+        let order = [
+            UdpAdaptiveCandidateKind::Predicted,
+            UdpAdaptiveCandidateKind::Reflexive,
+            UdpAdaptiveCandidateKind::RelayFallback,
+        ];
+        let groups = plan_check_groups(&cands, &[], Some(&order));
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0], vec![cands[2].addr]);
+        assert_eq!(groups[1], vec![cands[0].addr]);
+        let mut tail = groups[2].clone();
+        tail.sort();
+        let mut expect = vec![cands[1].addr, cands[3].addr];
+        expect.sort();
+        assert_eq!(tail, expect, "unnamed kinds must never be dropped");
+
+        // Default order (no plan): local first, predicted last.
+        let groups = plan_check_groups(&cands, &[], None);
+        assert_eq!(groups[0], vec![cands[1].addr]);
+        assert_eq!(groups.last().unwrap(), &vec![cands[2].addr]);
+
+        // No predicted candidates offered ⇒ no predicted group, even when the
+        // order asks for one.
+        let no_pred: Vec<UdpTypedCandidate> = cands
+            .iter()
+            .filter(|c| c.kind != UdpCandidateKind::Predicted)
+            .copied()
+            .collect();
+        let order = [UdpAdaptiveCandidateKind::Predicted];
+        let groups = plan_check_groups(&no_pred, &[], Some(&order));
+        let all: Vec<SocketAddr> = groups.iter().flatten().copied().collect();
+        assert_eq!(all.len(), 3);
+        assert!(!all.contains(&cands[2].addr));
+
+        // Legacy peer list (no typed metadata): one flat group.
+        let fallback = [cands[0].addr, cands[1].addr];
+        let groups = plan_check_groups(&[], &fallback, None);
+        assert_eq!(groups, vec![fallback.to_vec()]);
+        assert!(plan_check_groups(&[], &[], None).is_empty());
+    }
+
+    /// Fase 3 gate: a bogus plan can neither starve the check round nor stall
+    /// the relay decision.
+    #[test]
+    fn plan_check_window_clamps() {
+        let mk = |ms| UdpAdaptivePlan {
+            mode: crate::shared::UdpAdaptiveMode::DirectFirst,
+            candidate_order: vec![],
+            retry_budget: 0,
+            read_timeout_ms: ms,
+            send_delay_ms: 0,
+        };
+        assert_eq!(plan_check_window(&mk(0)), Duration::from_millis(500));
+        assert_eq!(plan_check_window(&mk(750)), Duration::from_millis(750));
+        assert_eq!(plan_check_window(&mk(99_999)), Duration::from_millis(1500));
+    }
+
+    /// Fase 3 gate: the winning-pair cache remembers, recalls, and drops on
+    /// invalidation; unknown keys recall nothing.
+    #[test]
+    fn pair_cache_remember_recall_invalidate() {
+        let addr: SocketAddr = "198.51.100.7:4433".parse().unwrap();
+        pair_cache::remember("test:pair-cache", addr);
+        assert_eq!(pair_cache::recall("test:pair-cache"), Some(addr));
+        // Refreshing overwrites.
+        let addr2: SocketAddr = "198.51.100.7:4434".parse().unwrap();
+        pair_cache::remember("test:pair-cache", addr2);
+        assert_eq!(pair_cache::recall("test:pair-cache"), Some(addr2));
+        pair_cache::invalidate("test:pair-cache");
+        assert_eq!(pair_cache::recall("test:pair-cache"), None);
+        assert_eq!(pair_cache::recall("test:never-stored"), None);
+    }
+
+    /// Fase 3 gate: two agreeing STUN observations from DIFFERENT servers
+    /// classify the mapping as endpoint-independent; the first success still
+    /// selects the candidate (latency contract).
+    #[tokio::test]
+    async fn profile_two_agreeing_observations_is_eim() {
+        let r1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let r2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let targets = vec![
+            StunTarget {
+                requested: "one".into(),
+                addr: r1.local_addr().unwrap(),
+                source: StunSource::PublicDefault,
+            },
+            StunTarget {
+                requested: "two".into(),
+                addr: r2.local_addr().unwrap(),
+                source: StunSource::PublicDefault,
+            },
+        ];
+        tokio::spawn(run_stun_responder(r1));
+        tokio::spawn(run_stun_responder(r2));
+        let tsock = UdpTraversalSocket::bind(0).await.unwrap();
+        let port = tsock.local_addr().unwrap().port();
+        let (selected, profile) = tsock.discover_reflexive_profile(&targets).await;
+        let selected = selected.expect("a reflexive must be discovered");
+        assert_eq!(selected.reflexive.port(), port);
+        assert_eq!(profile.mapping, UdpNatMapping::Eim);
+        assert_eq!(profile.observations, 2);
+        assert_eq!(profile.port_preserved, Some(true));
+    }
+
+    /// Fase 3 gate: two DISAGREEING observations classify the mapping as
+    /// symmetric — the wire profile the plan needs to avoid burning the
+    /// retry budget on a hopeless blind punch.
+    #[tokio::test]
+    async fn profile_disagreeing_observations_is_symmetric() {
+        // r1 answers honestly; r2 reports a different mapped address, exactly
+        // what a symmetric NAT produces toward a second destination.
+        let r1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let r2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let r1_addr = r1.local_addr().unwrap();
+        let r2_addr = r2.local_addr().unwrap();
+        tokio::spawn(run_stun_responder(r1));
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, from)) = r2.recv_from(&mut buf).await else {
+                    break;
+                };
+                if let Some(reply) =
+                    stun::binding_response(&buf[..n], "203.0.113.66:6666".parse().unwrap())
+                {
+                    let _ = r2.send_to(&reply, from).await;
+                }
+            }
+        });
+        let targets = vec![
+            StunTarget {
+                requested: "honest".into(),
+                addr: r1_addr,
+                source: StunSource::PublicDefault,
+            },
+            StunTarget {
+                requested: "liar".into(),
+                addr: r2_addr,
+                source: StunSource::PublicDefault,
+            },
+        ];
+        let tsock = UdpTraversalSocket::bind(0).await.unwrap();
+        let (selected, profile) = tsock.discover_reflexive_profile(&targets).await;
+        assert!(selected.is_some());
+        assert_eq!(profile.mapping, UdpNatMapping::Symmetric);
+        assert_eq!(profile.observations, 2);
+    }
+
+    /// Fase 5 gate: manual candidates (`--udp-candidate`) are advertised
+    /// FIRST as `RouterMapped`, and `--udp-no-stun` skips the chain entirely
+    /// (fast — no budget burn) while still emitting a zero-observation
+    /// profile. Works with STUN fully dead/blocked.
+    #[tokio::test]
+    async fn gather_manual_candidates_first_no_stun_skips_chain() {
+        let manual: SocketAddr = "203.0.113.10:41641".parse().unwrap();
+        // A dead STUN target that would burn the whole budget if probed.
+        let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let targets = vec![StunTarget {
+            requested: "dead".into(),
+            addr: dead.local_addr().unwrap(),
+            source: StunSource::PublicDefault,
+        }];
+        let tsock = UdpTraversalSocket::bind(0).await.unwrap();
+        let opts = GatherOptions {
+            manual_candidates: vec![manual],
+            no_stun: true,
+            ..Default::default()
+        };
+        let disc = gather_candidates_traversal(&tsock, &targets, &opts).await;
+        assert_eq!(disc.candidates[0], manual, "manual candidate must lead");
+        assert_eq!(disc.candidate_kinds[0], UdpCandidateKind::RouterMapped);
+        assert_eq!(disc.attempted_stun, 0);
+        assert!(
+            disc.discovery_ms < 1000,
+            "no_stun must skip the chain (took {}ms)",
+            disc.discovery_ms
+        );
+        let profile = disc.profile.expect("profile still attached");
+        assert_eq!(profile.observations, 0);
+        // The offer carries the manual candidate to the peer.
+        let offer = disc.to_offer(0, 0);
+        assert!(offer.candidates.contains(&manual));
+        assert_eq!(offer.profile, Some(profile));
+    }
+
+    /// Fase 3 gate: zero observations (STUN dead) still yield a profile —
+    /// `observations: 0` — never a missing one (the policy reads absence as
+    /// "legacy peer", not as "blocked").
+    #[tokio::test]
+    async fn profile_no_observations_reports_zero() {
+        // Bound-but-silent socket: requests vanish.
+        let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let targets = vec![StunTarget {
+            requested: "dead".into(),
+            addr: dead.local_addr().unwrap(),
+            source: StunSource::PublicDefault,
+        }];
+        let tsock = UdpTraversalSocket::bind(0).await.unwrap();
+        let (selected, profile) = tsock.discover_reflexive_profile(&targets).await;
+        assert!(selected.is_none());
+        assert_eq!(profile.observations, 0);
+        assert_eq!(profile.mapping, UdpNatMapping::Unknown);
+    }
+
+    /// Fase 3 gate: a planned round with a decoy head group (dead predicted
+    /// candidate first) still validates the real pair — group stagger orders
+    /// probing, it never excludes candidates or blocks nomination.
+    #[tokio::test]
+    async fn checks_planned_decoy_head_group_still_nominates() {
+        let key = [6u8; 32];
+        let a = UdpTraversalSocket::bind(0).await.unwrap();
+        let b = UdpTraversalSocket::bind(0).await.unwrap();
+        let a_addr: SocketAddr = format!("127.0.0.1:{}", a.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        let b_addr: SocketAddr = format!("127.0.0.1:{}", b.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        // A dead-but-bound decoy so the head group probes into silence.
+        let decoy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let decoy_addr = decoy.local_addr().unwrap();
+        let l_cfg = CheckConfig {
+            key,
+            generation: 2,
+            role: CheckRole::Listener,
+            window: Duration::from_secs(2),
+            plan: None,
+        };
+        let d_cfg = CheckConfig {
+            key,
+            generation: 2,
+            role: CheckRole::Dialer,
+            window: Duration::from_secs(2),
+            plan: Some(CheckPlan {
+                groups: vec![vec![decoy_addr], vec![a_addr]],
+                retry_budget: 1,
+                initial_delay: Duration::ZERO,
+            }),
+        };
+        let l_peers = [b_addr];
+        let d_peers = [decoy_addr, a_addr];
+        let (l, d) = tokio::join!(
+            a.run_connectivity_checks(&l_peers, &l_cfg),
+            b.run_connectivity_checks(&d_peers, &d_cfg),
+        );
+        assert_eq!(l.nominated, Some(b_addr));
+        assert_eq!(
+            d.nominated,
+            Some(a_addr),
+            "real pair must win past the decoy group"
+        );
     }
 
     #[test]

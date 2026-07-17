@@ -28,6 +28,8 @@ pub mod edge;
 pub mod holepunch;
 pub mod mux;
 pub mod pool;
+#[cfg(feature = "udp")]
+pub mod portmap;
 pub mod prefixed;
 pub mod reconnect;
 pub mod secret;

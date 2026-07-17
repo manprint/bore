@@ -1021,6 +1021,9 @@ enum CtrlEvent {
         peer: Vec<std::net::SocketAddr>,
         /// Direct-UDP transport tuning requested by the server.
         tuning: crate::shared::UdpDirectTuning,
+        /// V2 rider: peer typed candidates, capabilities (the Fase-2 check
+        /// gate) and the server-computed adaptive plan (Fase 3 VPN adoption).
+        v2: Option<crate::shared::UdpPunchV2>,
     },
     /// The direct path is unavailable; stay on relay.
     Unavailable,
@@ -1085,10 +1088,11 @@ fn spawn_ctrl_actor(
                         peer_selected_stun,
                         tuning,
                         peer_id: _,
+                        v2,
                     }))) => {
                         tracing::debug!(?peer, ?peer_selected_stun, "received vpn udp punch");
                         let _ = event_tx
-                            .send(CtrlEvent::Punch { nonce, peer, tuning })
+                            .send(CtrlEvent::Punch { nonce, peer, tuning, v2 })
                             .await;
                     }
                     Ok(Ok(Some(crate::shared::ServerMessage::UdpUnavailable))) => {
@@ -1258,7 +1262,16 @@ async fn direct_upgrade_task(
     'retry: loop {
         ticker.tick().await; // immediate on the first iteration
         attempt += 1;
-        match try_direct_upgrade(&ctx, &out_tx, &mut event_rx, &upgrade_tx, &counters).await {
+        match try_direct_upgrade(
+            &ctx,
+            &out_tx,
+            &mut event_rx,
+            &upgrade_tx,
+            &counters,
+            attempt - 1,
+        )
+        .await
+        {
             Ok(()) => {
                 // Direct is up. Block until the bridge tells us it fell back, then re-arm.
                 match downgrade_rx.recv().await {
@@ -1337,9 +1350,11 @@ async fn try_direct_upgrade(
     event_rx: &mut tokio::sync::mpsc::Receiver<CtrlEvent>,
     upgrade_tx: &tokio::sync::mpsc::Sender<(link::LinkSender, link::LinkRecver)>,
     counters: &Arc<bridge::BridgeCounters>,
+    generation: u32,
 ) -> Result<()> {
-    // 1. UDP socket (0 = ephemeral port).
-    let socket = crate::holepunch::bind_socket(ctx.nat_udp_preferred_port).await?;
+    // 1. UDP socket (0 = ephemeral port), wrapped in the single-owner
+    //    traversal socket so the STUN chain runs demuxed under one budget.
+    let tsock = crate::holepunch::UdpTraversalSocket::bind(ctx.nat_udp_preferred_port).await?;
 
     // 2. STUN chain (explicit override > public chain > bore server fallback).
     let targets = crate::holepunch::resolve_live_stun_targets(
@@ -1349,24 +1364,28 @@ async fn try_direct_upgrade(
     )
     .await?;
 
-    // 3. Candidate gathering (reflexive + local; optional UPnP / port prediction).
-    let disc = crate::holepunch::gather_candidates_from_stun_targets(
-        &socket,
+    // 3. Candidate gathering (reflexive + local; optional managed port
+    //    mapping / port prediction). `disc` stays in scope for the whole
+    //    attempt, which keeps any Fase-5 lease (disc.lease) renewed until the
+    //    upgrade lands; the next retry-grid round re-gathers/re-acquires.
+    let disc = crate::holepunch::gather_candidates_traversal(
+        &tsock,
         &targets,
-        ctx.upnp,
-        ctx.try_port_prediction,
+        &crate::holepunch::GatherOptions::from_flags(ctx.upnp, ctx.try_port_prediction),
     )
     .await;
     anyhow::ensure!(!disc.candidates.is_empty(), "no usable UDP candidates");
+    // Hand the raw socket to the punch/QUIC stage (stops the recv actor).
+    let socket = tsock.into_socket().await?;
 
-    // 4. Offer our candidates to the server's broker.
+    // 4. Offer our candidates to the server's broker — full v2 offer (typed
+    //    candidates + capabilities + structured NAT profile), so the broker
+    //    can compute the adaptive plan and the peers can run authenticated
+    //    connectivity checks (Fase 3 VPN adoption). `generation` counts the
+    //    retry-grid rounds; the broker normalizes it across both riders.
     out_tx
         .send(crate::shared::ClientMessage::UdpCandidateOffer(
-            crate::shared::UdpCandidateOffer {
-                candidates: disc.candidates,
-                selected_stun: disc.selected_stun.map(|s| s.requested),
-                peer_id: 0,
-            },
+            disc.to_offer(0, generation),
         ))
         .await
         .map_err(|_| anyhow!("control actor closed"))?;
@@ -1376,12 +1395,13 @@ async fn try_direct_upgrade(
         .await
         .map_err(|_| anyhow!("no punch from server within {DIRECT_PUNCH_WAIT:?}"))?
         .ok_or_else(|| anyhow!("control stream closed"))?;
-    let (nonce, peer, tuning) = match event {
+    let (nonce, peer, tuning, punch_v2) = match event {
         CtrlEvent::Punch {
             nonce,
             peer,
             tuning,
-        } => (nonce, peer, tuning),
+            v2,
+        } => (nonce, peer, tuning, v2),
         CtrlEvent::Unavailable => bail!("server reported the direct path unavailable"),
     };
 
@@ -1410,9 +1430,72 @@ async fn try_direct_upgrade(
     //    a silently degraded count). `carriers == 1` is the legacy single path.
     let token = crate::holepunch::derive_token(Some(&ctx.secret), &nonce);
     let n = ctx.carriers.max(1) as usize;
+    // Fase 3 VPN adoption: with a check-capable peer, the authenticated
+    // connectivity-check round runs first (it doubles as the punch); the
+    // adaptive plan orders the kind groups, sets the round window/retry
+    // budget, and RelayOnly skips the attempt cleanly (relay stays warm,
+    // the retry grid re-arms as usual). A legacy peer (no rider or no
+    // `check-v1`) keeps the blind punch + dial-all path byte-identical.
+    let check_generation = punch_v2.as_ref().and_then(|v| v.check_generation());
+    let check_cfg = match (&punch_v2, check_generation) {
+        (Some(v2), Some(generation)) => {
+            let plan_wire = v2.plan.as_ref();
+            if let Some(plan) = plan_wire {
+                info!(
+                    link_id = %ctx.link_id,
+                    plan = %plan.summary(),
+                    "received adaptive traversal plan"
+                );
+                if plan.mode == crate::shared::UdpAdaptiveMode::RelayOnly {
+                    bail!(
+                        "adaptive plan is relay-only for this pair; staying on relay \
+                         (fallback_reason=plan-relay-only)"
+                    );
+                }
+            }
+            Some(crate::holepunch::CheckConfig {
+                key: crate::holepunch::derive_check_key(&token),
+                generation,
+                role: match ctx.side {
+                    DirectSide::Listener => crate::holepunch::CheckRole::Listener,
+                    DirectSide::Connector => crate::holepunch::CheckRole::Dialer,
+                },
+                window: plan_wire
+                    .map(crate::holepunch::plan_check_window)
+                    .unwrap_or(crate::holepunch::CHECK_WINDOW),
+                plan: (!v2.peer_typed.is_empty()).then(|| crate::holepunch::CheckPlan {
+                    groups: crate::holepunch::plan_check_groups(
+                        &v2.peer_typed,
+                        &peer,
+                        plan_wire.map(|p| p.candidate_order.as_slice()),
+                    ),
+                    retry_budget: plan_wire.map(|p| p.retry_budget).unwrap_or(0),
+                    initial_delay: std::time::Duration::from_millis(
+                        plan_wire.map(|p| p.send_delay_ms).unwrap_or(0),
+                    ),
+                }),
+            })
+        }
+        _ => None,
+    };
     let conns: Vec<crate::holepunch::DirectConn> = match ctx.side {
         DirectSide::Listener => {
-            let dl = crate::holepunch::DirectListener::new(socket, peer, tuning).await?;
+            let dl = match &check_cfg {
+                Some(cfg) => {
+                    let (dl, outcome) =
+                        crate::holepunch::listener_checks_then_quic(socket, &peer, cfg, tuning)
+                            .await?;
+                    info!(
+                        link_id = %ctx.link_id,
+                        nominated = ?outcome.nominated,
+                        learned_prflx = outcome.learned_prflx,
+                        checks_ms = outcome.checks_ms,
+                        "vpn listener check round finished; QUIC listener up"
+                    );
+                    dl
+                }
+                None => crate::holepunch::DirectListener::new(socket, peer, tuning).await?,
+            };
             let mut conns = Vec::with_capacity(n);
             let first = tokio::time::timeout(DIRECT_ACCEPT_WAIT, dl.accept(token))
                 .await
@@ -1429,7 +1512,32 @@ async fn try_direct_upgrade(
             conns
         }
         DirectSide::Connector => {
-            let first = crate::holepunch::connect_direct(socket, peer, token, tuning).await?;
+            let first = match &check_cfg {
+                Some(cfg) => {
+                    // Winning-pair cache: the connector (dialer) probes the
+                    // last known-good remote first on the retry grid or a
+                    // reconnect; the first failure invalidates it.
+                    let cache_key = format!("vpn:{}", ctx.link_id);
+                    let (conn, outcome) = crate::holepunch::dialer_checks_then_quic(
+                        socket,
+                        peer,
+                        cfg,
+                        token,
+                        tuning,
+                        Some(&cache_key),
+                    )
+                    .await?;
+                    info!(
+                        link_id = %ctx.link_id,
+                        nominated = ?outcome.nominated,
+                        learned_prflx = outcome.learned_prflx,
+                        checks_ms = outcome.checks_ms,
+                        "vpn connector check round finished; direct QUIC up"
+                    );
+                    conn
+                }
+                None => crate::holepunch::connect_direct(socket, peer, token, tuning).await?,
+            };
             let mut conns = Vec::with_capacity(n);
             for i in 1..n {
                 let c = tokio::time::timeout(DIRECT_CARRIER_WAIT, first.open_sibling(token))
@@ -9285,6 +9393,7 @@ mod tests {
                 peer_selected_stun: None,
                 tuning: UdpDirectTuning::default(),
                 peer_id: 0,
+                v2: None,
             })
             .await
             .unwrap();
@@ -10256,14 +10365,16 @@ pub mod hub {
         admin_v2: bool,
         relay_sender: &LinkSender,
     ) -> HubDirectOutcome {
-        // 1. Socket + STUN candidate gathering.
-        let socket = match crate::holepunch::bind_socket(args.nat_udp_preferred_port).await {
-            Ok(s) => s,
-            Err(e) => {
-                debug!(%peer_id, error=%e, "hub direct: bind socket failed");
-                return HubDirectOutcome::NoDirect;
-            }
-        };
+        // 1. Socket + STUN candidate gathering (single-owner traversal socket:
+        //    demuxed chain under one global budget).
+        let tsock =
+            match crate::holepunch::UdpTraversalSocket::bind(args.nat_udp_preferred_port).await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!(%peer_id, error=%e, "hub direct: bind socket failed");
+                    return HubDirectOutcome::NoDirect;
+                }
+            };
         let targets = match crate::holepunch::resolve_live_stun_targets(
             &endpoint.host,
             endpoint.port,
@@ -10277,17 +10388,24 @@ pub mod hub {
                 return HubDirectOutcome::NoDirect;
             }
         };
-        let disc = crate::holepunch::gather_candidates_from_stun_targets(
-            &socket,
+        let disc = crate::holepunch::gather_candidates_traversal(
+            &tsock,
             &targets,
-            args.upnp,
-            args.try_port_prediction,
+            &crate::holepunch::GatherOptions::from_flags(args.upnp, args.try_port_prediction),
         )
         .await;
         if disc.candidates.is_empty() {
             debug!(%peer_id, "hub direct: no usable candidates");
             return HubDirectOutcome::NoDirect;
         }
+        // Hand the raw socket to the punch/QUIC stage (stops the recv actor).
+        let socket = match tsock.into_socket().await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!(%peer_id, error=%e, "hub direct: socket handoff failed");
+                return HubDirectOutcome::NoDirect;
+            }
+        };
 
         // 2. Offer our candidates to the server's per-peer broker (WITH peer_id).
         if out_tx
@@ -10296,6 +10414,7 @@ pub mod hub {
                     candidates: disc.candidates,
                     selected_stun: disc.selected_stun.map(|s| s.requested),
                     peer_id,
+                    ..Default::default()
                 },
             ))
             .await

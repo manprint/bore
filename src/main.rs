@@ -150,6 +150,24 @@ enum Command {
         #[clap(long, env = "BORE_TRY_PORT_PREDICTION")]
         try_port_prediction: bool,
 
+        /// Manual UDP candidate (IP:PORT) to advertise to the peer — your own
+        /// PUBLIC endpoint (a static port-forward, a public IP, or a known
+        /// port-preserving mapping). Repeatable / comma-separated. Advertised
+        /// first, alongside any discovered candidates (plan Fase 5).
+        #[clap(
+            long,
+            value_name = "IP:PORT",
+            env = "BORE_UDP_CANDIDATES",
+            value_delimiter = ','
+        )]
+        udp_candidate: Vec<std::net::SocketAddr>,
+
+        /// Skip STUN discovery entirely and rely on manual/local/port-mapped
+        /// candidates only. With no --udp-candidate this almost certainly
+        /// stays on the relay (a loud warning says so).
+        #[clap(long, env = "BORE_UDP_NO_STUN")]
+        udp_no_stun: bool,
+
         /// Bind the UDP hole-punch socket to this fixed port instead of a random
         /// one. Open it for egress in a strict firewall (and use the same value on
         /// the peer) to allow the direct path; on a port-preserving NAT it also
@@ -284,6 +302,24 @@ enum Command {
         /// Opt-in, best-effort: it may look like a port scan to strict firewalls.
         #[clap(long, env = "BORE_TRY_PORT_PREDICTION")]
         try_port_prediction: bool,
+
+        /// Manual UDP candidate (IP:PORT) to advertise to the peer — your own
+        /// PUBLIC endpoint (a static port-forward, a public IP, or a known
+        /// port-preserving mapping). Repeatable / comma-separated. Advertised
+        /// first, alongside any discovered candidates (plan Fase 5).
+        #[clap(
+            long,
+            value_name = "IP:PORT",
+            env = "BORE_UDP_CANDIDATES",
+            value_delimiter = ','
+        )]
+        udp_candidate: Vec<std::net::SocketAddr>,
+
+        /// Skip STUN discovery entirely and rely on manual/local/port-mapped
+        /// candidates only. With no --udp-candidate this almost certainly
+        /// stays on the relay (a loud warning says so).
+        #[clap(long, env = "BORE_UDP_NO_STUN")]
+        udp_no_stun: bool,
 
         /// Bind the UDP hole-punch socket to this fixed port instead of a random
         /// one. Open it for egress in a strict firewall (and use the same value on
@@ -525,6 +561,13 @@ enum Command {
         /// STUN responder on the control port.
         #[clap(long, env = "BORE_UDP")]
         udp: bool,
+
+        /// Kill switch: do NOT compute server-side adaptive traversal plans
+        /// for pairs that report structured NAT profiles. Clients then run
+        /// their default connectivity-check rounds (candidate exchange and
+        /// checks stay active).
+        #[clap(long, env = "BORE_NO_UDP_ADAPTIVE_PLAN")]
+        no_udp_adaptive_plan: bool,
 
         /// QUIC receive window per direct-UDP stream on the server-brokered
         /// direct path. Accepts raw bytes or KB/MB/GB/KiB/MiB/GiB suffixes.
@@ -812,6 +855,24 @@ enum Command {
         /// Also advertise predicted symmetric-NAT ports in paired mode.
         #[clap(long, env = "BORE_TRY_PORT_PREDICTION")]
         try_port_prediction: bool,
+
+        /// Manual UDP candidate (IP:PORT) to advertise to the peer — your own
+        /// PUBLIC endpoint (a static port-forward, a public IP, or a known
+        /// port-preserving mapping). Repeatable / comma-separated. Advertised
+        /// first, alongside any discovered candidates (plan Fase 5).
+        #[clap(
+            long,
+            value_name = "IP:PORT",
+            env = "BORE_UDP_CANDIDATES",
+            value_delimiter = ','
+        )]
+        udp_candidate: Vec<std::net::SocketAddr>,
+
+        /// Skip STUN discovery entirely and rely on manual/local/port-mapped
+        /// candidates only. With no --udp-candidate this almost certainly
+        /// stays on the relay (a loud warning says so).
+        #[clap(long, env = "BORE_UDP_NO_STUN")]
+        udp_no_stun: bool,
 
         /// Bind the probe to this fixed UDP port (mirrors --nat-udp-preferred-port)
         /// to test whether exactly that port works through a firewall. 0 = random.
@@ -1450,6 +1511,8 @@ async fn shutdown_signal() {
 async fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::Local {
+            udp_candidate,
+            udp_no_stun,
             local_host: local_host_flag,
             local_port: local_target,
             to,
@@ -1526,8 +1589,14 @@ async fn dispatch(command: Command) -> Result<()> {
                         // frontend). Vhost providers set this from the CLI in phase 3.
                         https_policy: None,
                     };
+                    let gather = bore_cli::holepunch::GatherOptions {
+                        port_map: upnp,
+                        port_prediction: try_port_prediction,
+                        manual_candidates: udp_candidate.clone(),
+                        no_stun: udp_no_stun,
+                    };
                     let connect = move || {
-                        let (local_host, to, id, secret, stun_server, meta, access_logger) = (
+                        let (local_host, to, id, secret, stun_server, meta, access_logger, gather) = (
                             local_host.clone(),
                             to.clone(),
                             id.clone(),
@@ -1535,6 +1604,7 @@ async fn dispatch(command: Command) -> Result<()> {
                             stun_server.clone(),
                             meta.clone(),
                             access_logger.clone(),
+                            gather.clone(),
                         );
                         async move {
                             Client::new_secret_provider(
@@ -1546,8 +1616,7 @@ async fn dispatch(command: Command) -> Result<()> {
                                 insecure,
                                 udp,
                                 stun_server.as_deref(),
-                                upnp,
-                                try_port_prediction,
+                                gather,
                                 nat_udp_preferred_port,
                                 nat_udp_release_timeout,
                                 max_conns,
@@ -1565,6 +1634,8 @@ async fn dispatch(command: Command) -> Result<()> {
                         || try_port_prediction
                         || stun_server.is_some()
                         || nat_udp_preferred_port != 0
+                        || !udp_candidate.is_empty()
+                        || udp_no_stun
                     {
                         warn!(
                             upnp,
@@ -1629,6 +1700,8 @@ async fn dispatch(command: Command) -> Result<()> {
             }
         }
         Command::Proxy {
+            udp_candidate,
+            udp_no_stun,
             local_proxy_port,
             to,
             secret,
@@ -1659,13 +1732,20 @@ async fn dispatch(command: Command) -> Result<()> {
                     "resolved UDP optimization settings",
                 );
             }
+            let gather = bore_cli::holepunch::GatherOptions {
+                port_map: upnp,
+                port_prediction: try_port_prediction,
+                manual_candidates: udp_candidate.clone(),
+                no_stun: udp_no_stun,
+            };
             let connect = move || {
-                let (to, tcp_secret_id, secret, stun_server, notes) = (
+                let (to, tcp_secret_id, secret, stun_server, notes, gather) = (
                     to.clone(),
                     tcp_secret_id.clone(),
                     secret.clone(),
                     stun_server.clone(),
                     notes.clone(),
+                    gather.clone(),
                 );
                 async move {
                     Proxy::new(
@@ -1676,8 +1756,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         insecure,
                         udp,
                         stun_server.as_deref(),
-                        upnp,
-                        try_port_prediction,
+                        gather,
                         nat_udp_preferred_port,
                         nat_udp_release_timeout,
                         carriers,
@@ -1952,6 +2031,7 @@ async fn dispatch(command: Command) -> Result<()> {
             bind_addr,
             bind_tunnels,
             udp,
+            no_udp_adaptive_plan,
             udp_stream_receive_window,
             udp_connection_receive_window,
             udp_send_window,
@@ -2033,6 +2113,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 &udp_socket_send_buffer,
                 udp_max_streams,
             )?);
+            server.set_udp_adaptive_plan(!no_udp_adaptive_plan);
             server.set_control_port(control_port);
             if let Some(ref domain) = bind_domain {
                 server.set_bind_domain(domain.clone());
@@ -2302,6 +2383,8 @@ async fn dispatch(command: Command) -> Result<()> {
             reconnect::run(auto_reconnect, connect, serve_client).await?;
         }
         Command::TestUdp {
+            udp_candidate,
+            udp_no_stun,
             to,
             secret,
             tcp_secret_id,
@@ -2340,8 +2423,12 @@ async fn dispatch(command: Command) -> Result<()> {
                     secret.as_deref(),
                     insecure,
                     stun_server.as_deref(),
-                    upnp,
-                    try_port_prediction,
+                    bore_cli::holepunch::GatherOptions {
+                        port_map: upnp,
+                        port_prediction: try_port_prediction,
+                        manual_candidates: udp_candidate.clone(),
+                        no_stun: udp_no_stun,
+                    },
                     nat_udp_preferred_port,
                     UdpTestOptions {
                         bandwidth: test_bandwidth,
@@ -2358,6 +2445,18 @@ async fn dispatch(command: Command) -> Result<()> {
                             "--test-bandwidth requires --tcp-secret-id so two peers can be paired",
                         )
                         .exit();
+                }
+                // Manual-candidate flags apply to PAIRED candidate exchange;
+                // the standalone diagnostic probes NAT behaviour and has no
+                // peer to advertise to — warn, never silently ignore (I-2).
+                if !udp_candidate.is_empty() || udp_no_stun {
+                    warn!(
+                        manual_candidates = udp_candidate.len(),
+                        udp_no_stun,
+                        "--udp-candidate/--udp-no-stun apply to the PAIRED diagnostic \
+                         (--tcp-secret-id) and live tunnels; the standalone NAT probe \
+                         ignores them"
+                    );
                 }
                 info!(
                     mode = "test-udp",

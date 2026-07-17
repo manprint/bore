@@ -13,8 +13,6 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 use crate::auth::Authenticator;
 use crate::basicauth::{self, BasicAuth, Gate};
 use crate::mux;
-#[cfg(feature = "udp")]
-use crate::shared::UdpCandidateOffer;
 use crate::shared::{
     proxy_buffer_size, tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions,
     NETWORK_TIMEOUT,
@@ -79,6 +77,11 @@ pub struct Client {
     /// secret provider that opted into the `udp` direct-path mode.
     #[cfg(feature = "udp")]
     udp_socket: Option<UdpSocket>,
+    /// Managed port-mapping lease (plan Fase 5): held for the tunnel's life
+    /// so the router mapping keeps being renewed; watched in `listen` to
+    /// re-offer candidates when the external endpoint changes.
+    #[cfg(feature = "udp")]
+    udp_lease: Option<std::sync::Arc<crate::portmap::LeaseHandle>>,
 
     /// Tunnel secret, retained to derive the direct-path token.
     #[cfg(feature = "udp")]
@@ -159,8 +162,7 @@ struct CarrierDialer {
 struct UdpProviderCfg {
     endpoint: Endpoint,
     stun_server: Option<String>,
-    port_map: bool,
-    port_prediction: bool,
+    gather: crate::holepunch::GatherOptions,
     udp_port: u16,
     /// Bounds concurrently served direct-path substreams — the direct-path analog
     /// of the server's relay `--max-conns` (here it protects the provider host).
@@ -291,6 +293,8 @@ impl Client {
             #[cfg(feature = "udp")]
             udp_cfg: None,
             #[cfg(feature = "udp")]
+            udp_lease: None,
+            #[cfg(feature = "udp")]
             vhost_udp: false,
             #[cfg(feature = "udp")]
             direct_endpoint,
@@ -325,8 +329,7 @@ impl Client {
         insecure: bool,
         udp: bool,
         stun_server: Option<&str>,
-        port_map: bool,
-        port_prediction: bool,
+        gather: crate::holepunch::GatherOptions,
         udp_port: u16,
         nat_udp_release_timeout: u64,
         max_conns: usize,
@@ -361,8 +364,8 @@ impl Client {
                 nat_udp_preferred_port: udp_port,
                 nat_udp_release_timeout,
                 stun_server: stun_server.map(|s| s.to_string()),
-                upnp: port_map,
-                try_port_prediction: port_prediction,
+                upnp: gather.port_map,
+                try_port_prediction: gather.port_prediction,
                 max_conns,
                 local_host: Some(local_host.to_string()),
                 local_port,
@@ -444,13 +447,13 @@ impl Client {
                 &mut control,
                 &endpoint,
                 stun_server,
-                port_map,
-                port_prediction,
+                &gather,
                 udp_port,
+                0,
             )
             .await
             {
-                Ok(socket) => Some(socket),
+                Ok((socket, lease)) => Some((socket, lease)),
                 Err(err) => {
                     warn!(%err, "udp candidate offer failed, relay only");
                     None
@@ -458,6 +461,11 @@ impl Client {
             }
         } else {
             None
+        };
+        #[cfg(feature = "udp")]
+        let (udp_socket, udp_lease) = match udp_socket {
+            Some((socket, lease)) => (Some(socket), lease),
+            None => (None, None),
         };
         #[cfg(not(feature = "udp"))]
         if udp {
@@ -468,8 +476,7 @@ impl Client {
         let udp_cfg = udp.then(|| UdpProviderCfg {
             endpoint: endpoint.clone(),
             stun_server: stun_server.map(str::to_string),
-            port_map,
-            port_prediction,
+            gather: gather.clone(),
             udp_port,
             permits: Arc::new(Semaphore::new(max_conns)),
             nat_udp_release_timeout: Duration::from_secs(nat_udp_release_timeout),
@@ -484,6 +491,8 @@ impl Client {
             is_secret_provider: true,
             #[cfg(feature = "udp")]
             udp_socket,
+            #[cfg(feature = "udp")]
+            udp_lease,
             #[cfg(feature = "udp")]
             secret: secret.map(str::to_string),
             #[cfg(feature = "udp")]
@@ -689,6 +698,8 @@ impl Client {
             #[cfg(feature = "udp")]
             udp_cfg: None,
             #[cfg(feature = "udp")]
+            udp_lease: None,
+            #[cfg(feature = "udp")]
             vhost_udp: udp,
             #[cfg(feature = "udp")]
             direct_endpoint: direct_endpoint_val,
@@ -719,6 +730,17 @@ impl Client {
         let carrier_dialer = self.carrier_dialer.take();
         #[cfg(feature = "udp")]
         let mut udp_socket = self.udp_socket.take();
+        #[cfg(feature = "udp")]
+        let mut udp_lease = self.udp_lease.take();
+        #[cfg(feature = "udp")]
+        let mut lease_changed_rx = udp_lease.as_ref().map(|l| l.changed());
+        #[cfg(not(feature = "udp"))]
+        let mut lease_changed_rx: Option<
+            tokio::sync::watch::Receiver<std::net::SocketAddr>,
+        > = None;
+        // Fresh generation per re-offer round (broker normalizes across peers).
+        #[cfg(feature = "udp")]
+        let mut offer_generation: u32 = 0;
         #[cfg(feature = "udp")]
         let secret = self.secret.clone();
         #[cfg(feature = "udp")]
@@ -822,6 +844,7 @@ impl Client {
                             peer_selected_stun,
                             tuning,
                             peer_id: _,
+                            v2,
                         }) => {
                             #[cfg(feature = "udp")]
                             {
@@ -829,6 +852,8 @@ impl Client {
                                     role = "provider",
                                     peer_candidates = ?peer,
                                     peer_selected_stun = ?peer_selected_stun,
+                                    v2_generation = v2.as_ref().map(|v| v.generation),
+                                    v2_typed = v2.as_ref().map(|v| v.peer_typed.len()),
                                     "provider received udp punch request"
                                 );
                                 if let Some(tx) = &punch_tx {
@@ -851,13 +876,7 @@ impl Client {
                                     tokio::spawn(async move {
                                         if let Err(err) =
                                             provider_direct(
-                                                socket,
-                                                peer,
-                                                token,
-                                                tuning,
-                                                this,
-                                                rx,
-                                                permits,
+                                                socket, peer, token, tuning, this, rx, permits, v2,
                                             )
                                             .await
                                         {
@@ -870,8 +889,8 @@ impl Client {
                             }
                             #[cfg(not(feature = "udp"))]
                             {
-                                    let _ = tuning;
-                                let _ = (nonce, peer, peer_selected_stun);
+                                let _ = tuning;
+                                let _ = (nonce, peer, peer_selected_stun, v2);
                                 warn!("unexpected udp punch");
                             }
                         }
@@ -1047,6 +1066,32 @@ impl Client {
                         while direct_renew_rx.try_recv().is_ok() {}
                     }
                 }
+                // Managed port-mapping lease changed (Fase 5): the gateway
+                // reassigned our external endpoint (renew answered a different
+                // address, or it rebooted). The advertised router-mapped
+                // candidate is stale — drop the idle punch socket so the
+                // re-offer tick below announces fresh candidates with a new
+                // generation. A LIVE direct path is left alone: its 5-tuple
+                // still works, and the next negotiation re-gathers anyway.
+                changed = lease_changed(&mut lease_changed_rx) => {
+                    #[cfg(not(feature = "udp"))]
+                    let _ = changed;
+                    #[cfg(feature = "udp")]
+                    if punch_tx.is_none() {
+                        warn!(
+                            external = %changed,
+                            "managed port mapping changed; re-offering candidates with a fresh generation"
+                        );
+                        udp_socket = None;
+                        udp_retry.reset_immediately();
+                    } else {
+                        info!(
+                            external = %changed,
+                            "managed port mapping changed while the direct path is up; \
+                             new consumers will get the fresh candidate on the next offer"
+                        );
+                    }
+                }
                 // Periodically re-offer UDP candidates if the provider requested
                 // `--udp` but has no active socket yet (initial offer failed and no
                 // direct path is up). Bounded by STUN's own short timeouts.
@@ -1068,18 +1113,31 @@ impl Client {
                             }
                             let was_checking_preferred = use_preferred && cfg.udp_port != 0
                                 && preferred_port_remapped;
+                            offer_generation = offer_generation.wrapping_add(1);
                             match offer_provider_candidates(
                                 &mut control,
                                 &cfg.endpoint,
                                 cfg.stun_server.as_deref(),
-                                cfg.port_map,
-                                cfg.port_prediction,
+                                &cfg.gather,
                                 effective_port,
+                                offer_generation,
                             )
                             .await
                             {
-                                Ok(socket) => {
+                                Ok((socket, lease)) => {
                                     udp_socket = Some(socket);
+                                    // A fresh gather may carry a fresh managed
+                                    // lease (Fase 5): hold it and re-arm the
+                                    // change watcher.
+                                    if let Some(lease) = lease {
+                                        lease_changed_rx = Some(lease.changed());
+                                        // Keep-alive slot: holding the Arc is the
+                                        // point (renewal task lives while it does).
+                                        #[allow(unused_assignments)]
+                                        {
+                                            udp_lease = Some(lease);
+                                        }
+                                    }
                                     udp_reoffer_failures = 0;
                                     // When checking the preferred port, verify preservation.
                                     if was_checking_preferred {
@@ -1407,6 +1465,21 @@ fn maybe_redial_carriers(
     });
 }
 
+/// Await the next external-endpoint change on a managed port-mapping lease;
+/// pends forever when there is no lease (so the `select!` arm stays dormant).
+async fn lease_changed(
+    rx: &mut Option<tokio::sync::watch::Receiver<std::net::SocketAddr>>,
+) -> std::net::SocketAddr {
+    match rx {
+        Some(rx) => match rx.changed().await {
+            Ok(()) => *rx.borrow(),
+            // Lease dropped: never fires again.
+            Err(_) => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
+}
+
 /// Provider side: bind a UDP socket, discover candidates via STUN, and offer
 /// them to the server. The socket is held for the later punch in [`Client::listen`].
 #[cfg(feature = "udp")]
@@ -1414,13 +1487,18 @@ async fn offer_provider_candidates(
     control: &mut Delimited<mux::Stream>,
     endpoint: &Endpoint,
     stun_server: Option<&str>,
-    port_map: bool,
-    port_prediction: bool,
+    gather: &crate::holepunch::GatherOptions,
     udp_port: u16,
-) -> Result<UdpSocket> {
+    generation: u32,
+) -> Result<(
+    UdpSocket,
+    Option<std::sync::Arc<crate::portmap::LeaseHandle>>,
+)> {
     use crate::holepunch;
-    let socket = holepunch::bind_socket(udp_port).await?;
-    let local_addr = socket.local_addr().ok();
+    // Single-owner traversal socket: the STUN chain runs demuxed under one
+    // global budget; the raw socket is handed to punch/QUIC afterwards.
+    let tsock = holepunch::UdpTraversalSocket::bind(udp_port).await?;
+    let local_addr = tsock.local_addr();
     let stun_chain = holepunch::live_stun_target_names(&endpoint.host, endpoint.port, stun_server);
     info!(
         role = "provider",
@@ -1443,23 +1521,14 @@ async fn offer_provider_candidates(
             Vec::new()
         }
     };
-    let discovery = holepunch::gather_candidates_from_stun_targets(
-        &socket,
-        &stun_targets,
-        port_map,
-        port_prediction,
-    )
-    .await;
+    let discovery = holepunch::gather_candidates_traversal(&tsock, &stun_targets, gather).await;
     let selected_stun = discovery.selected_stun.as_ref();
     let selected_stun_name = selected_stun.map(|s| s.requested.as_str());
-    let selected_stun_owned = selected_stun.map(|s| s.requested.clone());
     let selected_stun_addr = selected_stun.map(|s| s.addr);
     let stun_source = selected_stun.map(|s| s.source.as_str());
     let reflexive = selected_stun.map(|s| s.reflexive);
-    let discovery_local_addr = discovery.local_addr;
     let attempted_stun = discovery.attempted_stun;
-    let candidates = discovery.candidates;
-    if candidates.is_empty() {
+    if discovery.candidates.is_empty() {
         let stun_info = if attempted_stun == 0 {
             "no STUN targets resolved".to_string()
         } else if selected_stun.is_none() {
@@ -1469,32 +1538,33 @@ async fn offer_provider_candidates(
         };
         bail!(
             "no UDP candidates for provider: {stun_info} \
-             (port_map={port_map}, port_prediction={port_prediction}, \
+             (port_map={}, port_prediction={}, \
              local_addr={}); direct path unavailable, using relay",
-            discovery_local_addr
+            gather.port_map,
+            gather.port_prediction,
+            discovery
+                .local_addr
                 .map(|a| a.to_string())
                 .unwrap_or_default(),
         );
     }
     info!(
         role = "provider",
-        udp_local_addr = ?discovery_local_addr,
+        udp_local_addr = ?discovery.local_addr,
         selected_stun = selected_stun_name,
         selected_stun_addr = ?selected_stun_addr,
         stun_source,
         reflexive = ?reflexive,
         attempted_stun,
-        ?candidates,
+        candidates = ?discovery.candidates,
         "provider offering udp candidates"
     );
+    let offer = discovery.to_offer(0, generation);
     control
-        .send(ClientMessage::UdpCandidateOffer(UdpCandidateOffer {
-            candidates,
-            selected_stun: selected_stun_owned,
-            peer_id: 0,
-        }))
+        .send(ClientMessage::UdpCandidateOffer(offer))
         .await?;
-    Ok(socket)
+    let socket = tsock.into_socket().await?;
+    Ok((socket, discovery.lease))
 }
 
 /// Provider side: punch toward the consumer, run a QUIC server endpoint, and
@@ -1504,6 +1574,7 @@ async fn offer_provider_candidates(
 /// raw socket is owned by `quinn` after setup), supporting reconnecting and
 /// additional consumers without tearing the direct path down.
 #[cfg(feature = "udp")]
+#[allow(clippy::too_many_arguments)]
 async fn provider_direct(
     socket: UdpSocket,
     peers: Vec<SocketAddr>,
@@ -1512,8 +1583,59 @@ async fn provider_direct(
     client: Arc<Client>,
     mut punch_rx: mpsc::UnboundedReceiver<Vec<SocketAddr>>,
     permits: Arc<Semaphore>,
+    v2: Option<crate::shared::UdpPunchV2>,
 ) -> Result<()> {
-    let listener = crate::holepunch::DirectListener::new(socket, peers, tuning).await?;
+    let check_generation = v2.as_ref().and_then(|v| v.check_generation());
+    let listener = match check_generation {
+        // Fase 2: the authenticated check round doubles as the punch, opens
+        // the filter toward the consumer's REAL source (peer-reflexive
+        // learning), then the QUIC listener starts on the same socket. With
+        // an adaptive plan (Fase 3) the round gains kind-group ordering and
+        // its window/retry budget; RelayOnly skips the direct path cleanly.
+        Some(generation) => {
+            let v2 = v2.as_ref().expect("check_generation implies v2");
+            let plan_wire = v2.plan.as_ref();
+            if let Some(plan) = plan_wire {
+                info!(plan = %plan.summary(), "provider received adaptive traversal plan");
+                if plan.mode == crate::shared::UdpAdaptiveMode::RelayOnly {
+                    bail!(
+                        "adaptive plan is relay-only for this pair; skipping the direct \
+                         attempt (fallback_reason=plan-relay-only)"
+                    );
+                }
+            }
+            let cfg = crate::holepunch::CheckConfig {
+                key: crate::holepunch::derive_check_key(&token),
+                generation,
+                role: crate::holepunch::CheckRole::Listener,
+                window: plan_wire
+                    .map(crate::holepunch::plan_check_window)
+                    .unwrap_or(crate::holepunch::CHECK_WINDOW),
+                plan: (!v2.peer_typed.is_empty()).then(|| crate::holepunch::CheckPlan {
+                    groups: crate::holepunch::plan_check_groups(
+                        &v2.peer_typed,
+                        &peers,
+                        plan_wire.map(|p| p.candidate_order.as_slice()),
+                    ),
+                    retry_budget: plan_wire.map(|p| p.retry_budget).unwrap_or(0),
+                    initial_delay: std::time::Duration::from_millis(
+                        plan_wire.map(|p| p.send_delay_ms).unwrap_or(0),
+                    ),
+                }),
+            };
+            let (listener, outcome) =
+                crate::holepunch::listener_checks_then_quic(socket, &peers, &cfg, tuning).await?;
+            info!(
+                nominated = ?outcome.nominated,
+                learned_prflx = outcome.learned_prflx,
+                checks_ms = outcome.checks_ms,
+                "provider check round finished; QUIC listener up"
+            );
+            listener
+        }
+        // Legacy consumer: blind punch + listener, byte-identical to before.
+        None => crate::holepunch::DirectListener::new(socket, peers, tuning).await?,
+    };
     info!("direct udp path ready, accepting connections");
     loop {
         tokio::select! {

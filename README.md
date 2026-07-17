@@ -229,7 +229,9 @@ Options:
       --force-https             Deprecated: use --https=redirect (kept as an alias) [env: BORE_FORCE_HTTPS=]
       --udp                     Prefer a direct UDP/QUIC data path (public: server→client QUIC; secret: hole-punched). Falls back to relay. [env: BORE_PREFER_UDP=]
       --stun-server <HOST:PORT> STUN server for the direct path [env: BORE_STUN_SERVER=]
-      --upnp                    Map a router port via UPnP-IGD for the direct path [env: BORE_UPNP=]
+      --upnp                    Acquire a managed router mapping (PCP first, UPnP-IGD fallback; renewed + released automatically) [env: BORE_UPNP=]
+      --udp-candidate <IP:PORT> Manual public endpoint to advertise (repeatable / comma-separated) [env: BORE_UDP_CANDIDATES=]
+      --udp-no-stun             Skip STUN discovery; manual/local/port-mapped candidates only [env: BORE_UDP_NO_STUN=]
       --try-port-prediction     Advertise predicted symmetric-NAT ports (opt-in, best-effort) [env: BORE_TRY_PORT_PREDICTION=]
       --nat-udp-preferred-port <PORT> Bind the UDP hole-punch socket to a fixed port (0=random) [env: BORE_NAT_UDP_PORT=]
       --nat-udp-release-timeout <SECS> Re-check interval when the NAT remapped the preferred UDP port (default 600s, 0=disable) [env: BORE_NAT_UDP_RELEASE_TIMEOUT=]
@@ -258,7 +260,9 @@ Options:
       --insecure                 Skip TLS certificate verification [env: BORE_INSECURE=]
       --udp                      Prefer a direct UDP hole-punched path [env: BORE_PREFER_UDP=]
       --stun-server <HOST:PORT>  STUN server for the direct path [env: BORE_STUN_SERVER=]
-      --upnp                     Map a router port via UPnP-IGD for the direct path [env: BORE_UPNP=]
+      --upnp                     Acquire a managed router mapping (PCP first, UPnP-IGD fallback; renewed + released automatically) [env: BORE_UPNP=]
+      --udp-candidate <IP:PORT>  Manual public endpoint to advertise (repeatable / comma-separated) [env: BORE_UDP_CANDIDATES=]
+      --udp-no-stun              Skip STUN discovery; manual/local/port-mapped candidates only [env: BORE_UDP_NO_STUN=]
       --try-port-prediction      Advertise predicted symmetric-NAT ports (opt-in, best-effort) [env: BORE_TRY_PORT_PREDICTION=]
       --nat-udp-preferred-port <PORT> Bind the UDP hole-punch socket to a fixed port (0=random) [env: BORE_NAT_UDP_PORT=]
       --nat-udp-release-timeout <SECS> Re-check interval when the NAT remapped the preferred UDP port (default 600s) [env: BORE_NAT_UDP_RELEASE_TIMEOUT=]
@@ -489,6 +493,7 @@ Core:
 
 Direct UDP path (--features udp, on by default):
       --udp                                      Broker UDP direct (hole-punched) paths for secret tunnels + run a STUN responder on the control port [env: BORE_UDP=]
+      --no-udp-adaptive-plan                     Kill switch: never compute server-side adaptive traversal plans (clients keep their default check rounds) [env: BORE_NO_UDP_ADAPTIVE_PLAN=]
       --udp-stream-receive-window <SIZE>         QUIC receive window per direct-UDP stream [env: BORE_UDP_STREAM_RECEIVE_WINDOW=] [default: 16MiB]
       --udp-connection-receive-window <SIZE>      Aggregate QUIC receive window per direct-UDP connection [env: BORE_UDP_CONNECTION_RECEIVE_WINDOW=] [default: 256MiB]
       --udp-send-window <SIZE>                    QUIC send window for the direct UDP path [env: BORE_UDP_SEND_WINDOW=] [default: 256MiB]
@@ -1141,12 +1146,25 @@ Notes:
   carrier established (… token verified)` in the logs. For the full control-plane story, use
   `-vv` or `RUST_LOG=bore_cli=trace,bore=trace`.
 
-**Hard NATs and firewalls.** Two extra, opt-in candidate sources help with difficult networks
-(both flags go on `bore local` and `bore proxy`, since both peers punch):
+**Hard NATs and firewalls.** Extra, opt-in candidate sources help with difficult networks
+(the flags go on `bore local` and `bore proxy`, since both peers punch):
 
-- `--upnp` — ask the local **home** router to open a port via UPnP-IGD and advertise it as a
-  candidate. Helps strict home routers with a public WAN IP; **no effect behind
+- `--upnp` — acquire a **managed router mapping** and advertise it as a candidate. Tries
+  **PCP (RFC 6887 MAP)** against the default gateway first, then falls back to
+  **UPnP-IGD**. The mapping is a live *lease*: renewed automatically at half-lifetime,
+  retried with backoff on failure (the relay is never affected), re-announced with a fresh
+  generation if the gateway reassigns the endpoint or reboots (detected via the PCP Epoch
+  Time), and released best-effort on shutdown — bore never leaves a permanent orphan
+  mapping behind. Helps strict home routers with a public WAN IP; **no effect behind
   carrier-grade NAT** (mobile/CGNAT).
+- `--udp-candidate <IP:PORT>` — declare your own **public endpoint by hand** (repeatable,
+  or comma-separated in `BORE_UDP_CANDIDATES`). For static port-forwards, machines with a
+  public IP, or port-preserving NATs where you *know* the public mapping. Advertised first,
+  alongside anything discovery finds. Pair it with `--nat-udp-preferred-port` so the local
+  socket matches the forwarded port.
+- `--udp-no-stun` — skip STUN discovery entirely and rely on manual/local/port-mapped
+  candidates only (for networks where STUN is blocked by policy). With no `--udp-candidate`
+  this almost certainly stays on the relay, and bore says so loudly.
 - `--try-port-prediction` — for **symmetric** NATs, advertise a few ports past the
   STUN-observed one. **Strictly opt-in**, best-effort, and **may look like a port scan** to
   strict firewalls.
@@ -1154,6 +1172,18 @@ Notes:
   instead of a random one. Set the *same* value on both peers and open it for **egress** in a
   strict firewall. Tip: run `bore test-udp --nat-udp-preferred-port <PORT>` on each host
   first to confirm the port punches through.
+
+Example — both peers know their public endpoints, STUN blocked by policy:
+
+```shell
+# provider (static forward 203.0.113.20:41641 → this host :41641)
+bore local 8000 --to <server> --secret S --tcp-secret-id svc --udp \
+  --udp-no-stun --nat-udp-preferred-port 41641 --udp-candidate 203.0.113.20:41641
+
+# consumer (its own public endpoint, same idea)
+bore proxy --to <server> --secret S --tcp-secret-id svc --local-proxy-port :5555 --udp \
+  --udp-no-stun --nat-udp-preferred-port 41641 --udp-candidate 198.51.100.7:41641
+```
 
 For genuinely untraversable cases (e.g. CGNAT on both ends), the **server relay is the
 reliable fallback** — `--udp` never makes a tunnel fail.
@@ -1376,7 +1406,75 @@ bore test-udp --secret mysecret --tcp-secret-id svc \
 ```
 
 Paired mode also accepts `--upnp`, `--try-port-prediction`, `--nat-udp-preferred-port`,
-`--stun-server`, and `--insecure`, mirroring the direct-path options used by `local`/`proxy`.
+`--stun-server`, `--udp-candidate`, `--udp-no-stun`, and `--insecure`, mirroring the
+direct-path options used by `local`/`proxy` (the standalone probe warns that the
+manual-candidate flags only apply to paired mode).
+
+**Retries are full rounds.** When a paired direct attempt fails, each retry binds a fresh
+socket, re-runs candidate discovery and re-offers via the server, which waits for BOTH
+peers' fresh offers, mints a new nonce, recomputes the adaptive plan, and restarts the
+round with an incremented `generation` (shown in the report). Against an older server
+that lacks this capability, retries are skipped with an explicit note instead of blindly
+re-punching stale candidates from a dead socket. The report also states that the adaptive
+candidate *order* is advisory (direct attempts still dial all candidates concurrently
+under one budget).
+
+**Candidate hardening.** Every candidate list — offered on the wire, brokered by the
+server, or punched/dialed — is validated (no port 0/unspecified/multicast/broadcast;
+private/CGNAT addresses stay valid for same-LAN), deduplicated, and capped at 16 entries
+(`MAX_UDP_CANDIDATES`) before any allocation or per-candidate fan-out. Drops are logged
+as one aggregate line. Traversal logs carry stable baseline metrics: `discovery_ms`,
+`direct_ready_ms` + `winner`, and a `fallback_reason` enum
+(`no-candidates` / `all-candidates-failed` / `budget-exhausted`).
+
+**Budgeted STUN chain, single reader.** Candidate discovery runs on a single-owner
+traversal socket: one internal task owns `recv_from` and demultiplexes STUN responses
+by transaction id + full source address, so the whole STUN chain is probed concurrently
+under ONE 4-second global budget (the old serial chain could burn ~12 s on unreachable
+targets before falling back to the relay). The socket is handed to the QUIC stage only
+after the reader task has stopped. Offers also carry an optional typed candidate model
+v2 (kind/priority/generation/capabilities) alongside the legacy address list — fully
+backward compatible; old/new peers interoperate unchanged.
+
+**Authenticated connectivity checks (hole-punch v2).** When BOTH secret-tunnel peers
+are new enough (capability-gated over the same brokered exchange), the blind punch is
+replaced by paced HMAC-authenticated request/response probes on the punch socket:
+an authenticated probe arriving from an un-offered source becomes a *peer-reflexive*
+candidate (this is how a cone-side peer now reaches a **symmetric** peer whose real
+per-destination port STUN can never see), the first bidirectionally-validated pair is
+nominated, and QUIC dials it first. Unauthenticated probes are NEVER answered, and a
+response is never larger than a request (no amplification). With any older peer the
+legacy punch path runs byte-identical, and the TCP relay stays warm throughout either
+way. Measured in the NAT lab: the cone(ADF)-dialer ↔ symmetric-listener profile flips
+from relay to direct; symmetric↔symmetric correctly stays on the relay.
+
+**Live adaptive traversal plan (Fase 3).** Each gather now also derives a structured
+NAT self-profile with a second STUN observation (the first two chain targets launch
+together; the first answer still picks the candidate, a bounded 400 ms confirm window
+classifies the mapping as endpoint-independent vs symmetric) and attaches it to the
+offer. When BOTH peers report a profile, the server computes a per-pair plan
+(`direct-first` / `direct-with-retry` / `relay-first` / `relay-only`, with stable
+reason codes in its logs) and delivers it in the punch: the client check round then
+probes candidates in staggered kind groups (same-LAN local first, predicted last —
+and no predicted probes at all unless predicted candidates were actually offered),
+takes its window/retry budget from the plan (hard-capped at 3 s), paces with a
+deterministic per-peer jitter that breaks the conntrack-crossfire lockstep of
+masquerade routers, and skips the direct attempt entirely on `relay-only`. The
+winning remote address is cached for 120 s per tunnel and probed first on
+reconnect/upgrade (invalidated on the first failure). VPN 1:1 links adopt the same
+offers/checks/plan (the multi-client hub keeps the legacy blind punch). Everything is
+capability- and profile-gated: any legacy peer or server degrades field-by-field to
+the previous behaviour. Server kill switch: `bore server --no-udp-adaptive-plan`
+(env `BORE_NO_UDP_ADAPTIVE_PLAN`) disables plan computation while keeping candidate
+exchange and checks active.
+
+**Deterministic NAT lab.** `cargo test --test nat_traversal_test` (Linux) runs the real
+traversal stack through userspace-emulated NATs (RFC 4787 mapping/filtering matrices,
+port allocation policies) with a pinned per-profile baseline table
+([`docs/test/TEST_UDP.md`](docs/test/TEST_UDP.md) §S11); a netns smoke with real kernel
+NAT (double masquerade, random-port, UDP-blocked) lives in
+`scripts/udp_nat_netns_test.sh` (run as `sudo -n /abs/path/scripts/udp_nat_netns_test.sh`
+after `cargo build --release`).
 
 ## VPN — point-to-point L3 tunnel
 

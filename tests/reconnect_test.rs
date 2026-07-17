@@ -127,7 +127,19 @@ async fn proxy_reconnects_when_server_appears() -> Result<()> {
             let to = format!("localhost:{CONTROL}");
             let bind = format!("127.0.0.1:{LOCAL_PROXY}").parse().unwrap();
             Proxy::new(
-                &to, bind, "svc", None, false, false, None, false, false, 0, 0, 1, None, false,
+                &to,
+                bind,
+                "svc",
+                None,
+                false,
+                false,
+                None,
+                bore_cli::holepunch::GatherOptions::from_flags(false, false),
+                0,
+                0,
+                1,
+                None,
+                false,
             )
             .await
         };
@@ -152,8 +164,7 @@ async fn proxy_reconnects_when_server_appears() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1024,

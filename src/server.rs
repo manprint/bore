@@ -184,6 +184,11 @@ pub struct Server {
     /// Direct-UDP transport tuning brokered to peers.
     udp_tuning: UdpDirectTuning,
 
+    /// Kill switch for the server-computed adaptive traversal plan (plan
+    /// Fase 3): when `false`, `UdpPunchV2.plan` is never filled and clients
+    /// run their default (Fase 2) check rounds.
+    udp_adaptive_plan: bool,
+
     /// Pending carrier pools, keyed by the per-tunnel token issued in
     /// [`ServerMessage::CarrierToken`]. An extra connection presenting the token
     /// (via [`ClientMessage::JoinCarrier`]) has its substream opener delivered to
@@ -342,6 +347,7 @@ impl Server {
             conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
             max_carriers: DEFAULT_MAX_CARRIERS,
             udp_tuning: UdpDirectTuning::default(),
+            udp_adaptive_plan: true,
             pending_carriers: Arc::new(DashMap::new()),
             providers: Registry::default(),
             udp_providers: UdpRegistry::default(),
@@ -498,6 +504,13 @@ impl Server {
     /// Set the direct-UDP transport tuning brokered to peers.
     pub fn set_udp_tuning(&mut self, udp_tuning: UdpDirectTuning) {
         self.udp_tuning = udp_tuning;
+    }
+
+    /// Enable/disable the server-computed adaptive traversal plan (plan
+    /// Fase 3 kill switch, `--no-udp-adaptive-plan`). Off ⇒ `UdpPunchV2.plan`
+    /// stays `None` and clients keep their default check rounds.
+    pub fn set_udp_adaptive_plan(&mut self, enabled: bool) {
+        self.udp_adaptive_plan = enabled;
     }
 
     /// Set the IP address where the control server will bind to.
@@ -1620,6 +1633,7 @@ impl Server {
                     peer,
                     notes,
                     self.udp_tuning,
+                    self.udp_adaptive_plan,
                     Arc::clone(&self.total_rx_bytes),
                     Arc::clone(&self.total_tx_bytes),
                     secret::SecretDisplay {
@@ -1822,6 +1836,7 @@ impl Server {
                         peer,
                         self.udp_providers.clone(),
                         self.udp_tuning,
+                        self.udp_adaptive_plan,
                         self.vpn_punch_timeout,
                         carriers,
                         self.max_carriers,

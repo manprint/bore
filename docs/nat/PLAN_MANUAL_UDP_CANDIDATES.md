@@ -1,5 +1,13 @@
 # Piano: candidati UDP manuali senza STUN
 
+> **IMPLEMENTATO (2026-07-16, piano `UDP_CONNECTION_IMPROVE.md` Fase 5).**
+> `--udp-candidate <IP:PORT>` (ripetibile; env `BORE_UDP_CANDIDATES`,
+> comma-separated) e `--udp-no-stun` (env `BORE_UDP_NO_STUN`) sono live su
+> `bore local` (provider secret), `bore proxy` e `bore test-udp` paired,
+> integrati nel candidate model v2 come kind `router-mapped` (wire-compat) e
+> pubblicizzati per primi. Dettagli e gate: `docs/nat/NAT_TRAVERSAL.md` §18.
+> Il resto del documento è il piano/razionale originale.
+
 ## Obiettivo
 
 Valutare e pianificare una modalita in cui `bore local --udp`, `bore proxy --udp`

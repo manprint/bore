@@ -485,6 +485,238 @@ Per ottenere il **diretto** in modo affidabile:
 
 ---
 
+## 14. Hardening e osservabilità del traversal (Fase 0)
+
+Implementati come base misurabile del piano di miglioramento UDP
+(`UDP_CONNECTION_IMPROVE.md`):
+
+- **Limite e validazione candidati (`holepunch::MAX_UDP_CANDIDATES` = 16).**
+  Ogni lista di candidati peer-controlled viene validata, deduplicata
+  (order-preserving) e cappata PRIMA di qualsiasi allocazione o fan-out di
+  task: lato mittente (fine della discovery), lato broker server (offer secret
+  provider/consumer, VPN 1:1/hub/spoke, `TestUdpJoin`) e come ultima difesa nei
+  punti d'ingresso (`connect_direct`, `DirectListener::new`,
+  `punch_via_endpoint`). Vengono rifiutati: porta 0, indirizzi unspecified,
+  multicast, broadcast. Gli indirizzi **privati/CGNAT restano validi** (servono
+  per same-LAN; il token — non la lista candidati — autentica la sorgente,
+  invariante I-6/D7). I drop sono loggati in **una riga aggregata**
+  (`dropped unusable UDP candidates (aggregate)` con contatori
+  invalid/duplicate/overflow), mai un warning per singolo elemento.
+- **Metriche baseline nei log** (campi strutturati stabili):
+  - `discovery_ms` — durata dell'intera gather (catena STUN + UPnP + local),
+    anche in `CandidateDiscovery`;
+  - `direct_ready_ms` + `winner` — tempo punch→QUIC autenticato del consumer
+    (`direct QUIC path ready (consumer)`);
+  - `fallback_reason` — enum stabile sul fallimento del direct
+    (`no-candidates` | `all-candidates-failed` | `budget-exhausted`).
+- **Retry del diagnostico paired = round ri-brokerato** (fix P1): socket nuovo ⇒
+  discovery nuova ⇒ re-`TestUdpJoin` ⇒ il server attende entrambi i re-offer,
+  conia nonce nuovo, ricalcola il piano e invia `TestUdpStart` con
+  `generation`+1 (`recandidate: true` annuncia la capability; con un server
+  vecchio i retry vengono saltati con nota esplicita, non eseguiti su candidati
+  stantii). Wire backward-compatible: campi `#[serde(default)]`.
+- **Ordine adattivo dichiarato advisory**: `connect_direct` resta un fan-out
+  concorrente sotto budget; il report paired lo dice esplicitamente
+  (`Candidate order: advisory only …`) finché la checklist della Fase 3 non lo
+  renderà operativo.
+- **NAT lab deterministico** (`tests/nat_traversal_test.rs` +
+  `tests/support/natlab.rs`, solo Linux) e smoke netns con NAT kernel reale
+  (`scripts/udp_nat_netns_test.sh`): baseline per-profilo in
+  `docs/test/TEST_UDP.md` §S11 — una nuova tecnica entra solo flippando una
+  riga RED del lab.
+
+## 15. Traversal socket + candidate model v2 (Fase 1)
+
+- **`holepunch::UdpTraversalSocket` — un solo owner di `recv_from`** (I-5).
+  Un actor interno possiede la lettura durante la discovery e demultiplexa le
+  risposte STUN per transaction id **e sorgente completa `ip:port`**: risposte
+  duplicate, fuori ordine, con txid sbagliato o da sorgente diversa dal server
+  interrogato vengono contate come stray e mai consegnate a un waiter; i
+  datagrammi non-STUN (punch del peer, QUIC Initial precoci) sono contati e
+  MAI consumati da una transazione (la Fase 2 li instraderà ai connectivity
+  check). `into_socket()` ferma l'actor e SOLO DOPO rilascia il socket a
+  Quinn — un socket, un lettore, sempre.
+- **Catena STUN a budget globale (`STUN_CHAIN_BUDGET` = 4 s).** Le transazioni
+  della catena corrono in parallelo (lanci scaglionati di 300 ms per
+  conservare la preferenza d'ordine come vantaggio di partenza); il worst case
+  legacy con N target morti era N × 3 s seriali (~12 s con 4 target) prima
+  della decisione di relay. Tutti i path live (provider secret, consumer
+  secret, VPN 1:1 e hub, `test-udp` paired + retry round) usano il traversal
+  socket; il gather seriale legacy resta per i tool diagnostici single-shot e
+  come oracolo di equivalenza nei test.
+- **Candidate model v2 sul wire, observe-only.** `UdpCandidateOffer` porta
+  (accanto alla lista legacy, che resta la fonte di verità) i campi
+  `#[serde(default)]`: `typed_candidates` (addr + kind + priority advisory),
+  `generation`, `capabilities` (`cand-v2`), `profile_hint`. `UdpPunch` porta
+  un rider opzionale `v2` (`UdpPunchV2`: generation, peer_typed,
+  peer_capabilities, `plan` sempre `None` fino alla Fase 3). Il server lo
+  inoltra pass-through per i tunnel secret e lo logga; la VPN lo adotta in
+  Fase 3 (`v2: None` oggi). Coppie legacy: il frame resta byte-identico
+  (nessuna chiave `v2` serializzata). Metadata mancanti non implicano MAI
+  `RelayOnly`.
+- **Decisione crate STUN:** valutata e rimandata. Serve solo il Binding
+  (RFC 5389 subset) e l'utente ha escluso IPv6/dual-stack; il transaction
+  layer è ora nostro (demux per txid+sorgente) e testato con vettori
+  avversariali. Una crate completa RFC 8489 entra in valutazione solo se la
+  Fase 6 (RFC 5780) verrà attivata.
+
+## 16. Connectivity check autenticati + peer-reflexive (Fase 2)
+
+Per le coppie secret in cui ENTRAMBI i peer avvertono la capability
+`check-v1` (ogni coppia new/new; il gate è il rider v2 dell'`UdpPunch`), il
+round di check autenticati SOSTITUISCE il punch cieco. Peer legacy ⇒ path
+vecchio byte-identico.
+
+- **Frame** (`holepunch::check`, 60 byte fissi, richiesta e risposta della
+  STESSA dimensione — il responder non è mai un amplificatore):
+  `magic "bcc1" | kind | role | generation | txid(12) | observed ip:port |
+  HMAC-SHA256`. Chiave = `derive_check_key(token)` (HKDF-style domain
+  separation dal token del direct path). **Nessuna risposta, MAI, a un frame
+  non autenticato** (HMAC errato, generation diversa, ruolo uguale, txid
+  sconosciuto, sorgente diversa dal target interrogato): solo contatore
+  aggregato `invalid_checks`. Risposte cappate per round
+  (`CHECK_MAX_RESPONSES`).
+- **Round** (`run_connectivity_checks`, budget `CHECK_WINDOW` = 1 s, pacing
+  50 ms round-robin sulle coppie): una richiesta autenticata in arrivo da una
+  sorgente NON offerta diventa **candidato peer-reflexive** (validato,
+  dedupato, cappato come ogni lista) + triggered check immediato (throttle
+  200 ms per sorgente); la prima coppia provata BIDIREZIONALE (nostra
+  richiesta → risposta del peer) è **nominata**. Ogni richiesta è essa stessa
+  un datagramma in uscita ⇒ il round È il punch.
+- **Dopo il round**: il dialer consegna il socket a Quinn e dial la coppia
+  nominata per prima (gli altri candidati partono dopo 500 ms, Happy
+  Eyeballs); senza nomination dial della lista finale del round (che include
+  i prflx appresi) SENZA punch ridondante. Il listener avvia il QUIC listener
+  sullo stesso socket appena il proprio round chiude (break anticipato alla
+  prima validazione). Relay intoccato per tutta la durata.
+- **Risultato misurato (NAT lab):** la riga 3 della baseline (dialer EIM+ADF
+  vs listener simmetrico) passa da RELAY a **DIRECT** con `learned_prflx`
+  asserito; APDM×APDM resta RELAY (nessun falso positivo); tutte le righe
+  verdi invariate. Costo worst-case sul fully-blocked: +~0,75 s prima della
+  decisione di relay (1 s di round − 250 ms di punch risparmiato), pagato
+  solo dalle coppie check-capable il cui UDP p2p è morto mentre STUN
+  funzionava.
+- La VPN 1:1 adotta i check nella Fase 3 (vedi §17); `bore test-udp` paired
+  resta sul path legacy come strumento diagnostico del comportamento di base.
+
+## 17. Checklist e policy adattiva live (Fase 3)
+
+La policy NAT (`src/adaptive_nat.rs`) è ora usata LIVE da secret e VPN 1:1,
+non più solo dal report di `bore test-udp`.
+
+- **Profilo NAT strutturato sul wire** (`UdpNatProfile` in
+  `UdpCandidateOffer.profile`, serde-default ⇒ frame legacy byte-identici):
+  `mapping` (`unknown|eim|symmetric`), `filtering` (sempre `unknown` fino alla
+  Fase 6 — un gather live non può osservare il filtering senza server STUN a
+  due IP), `port_preserved`, `observations` (confidenza). Derivato dal gather:
+  i primi DUE target della catena STUN partono INSIEME; la prima risposta
+  vince il candidato (p50 invariato), una SECONDA risposta da un server
+  DIVERSO — attesa bounded `PROFILE_CONFIRM_WAIT` (400 ms, mai oltre il budget
+  globale) — classifica il mapping: mapped identici ⇒ EIM, diversi ⇒
+  simmetrico. STUN morto ⇒ profilo con `observations: 0` (mai omesso).
+- **Piano server-side** (`plan_for_pair`, kill switch
+  `--no-udp-adaptive-plan` / `BORE_NO_UDP_ADAPTIVE_PLAN`): calcolato dal
+  broker SOLO quando ENTRAMBE le offer portano un profilo; riempie
+  `UdpPunchV2.plan` per ciascun lato (prospettiva propria). Nessun parsing di
+  label testuali (`NatProfile::from_wire`); `from_summary` (label) sopravvive
+  solo per il report test-udp. Metadata assenti/parziali ⇒ MAI `RelayOnly`
+  (assenza = peer legacy, non NAT ostile). **Reason code stabili** nei log del
+  broker (`computed adaptive traversal plan`): `both-direct-friendly`
+  (DirectFirst), `symmetric-escape` (DirectWithRetry), `symmetric-relay`,
+  `symmetric-strict-filtering` (APDM+APDF ⇒ RelayFirst), `peer-blocked`
+  (RelayFirst), `inconclusive` / `default` (DirectWithRetry),
+  `no-candidates` (RelayOnly).
+- **Checklist client a gruppi staggered** (`plan_check_groups` +
+  `CheckPlan`): i candidati del rider sono raggruppati per kind nell'ordine
+  del piano (default data-driven: local → reflexive → router-mapped →
+  predicted; allineato a `candidate_priority`); il gruppo *g* parte a
+  `g × CHECK_GROUP_STAGGER` (150 ms) — né fan-out illimitato né
+  serializzazione. Il piano ORDINA, non filtra: kind non citati probano in un
+  gruppo finale, e nessun check predicted esiste se nessun candidato
+  predicted è stato offerto (prediction off ⇒ zero probe predicted, per
+  costruzione). Un prflx appreso salta in TESTA all'ordine.
+- **Window/retry dal piano**: `read_timeout_ms` → window del round (clamp
+  500–1500 ms, `plan_check_window`); `send_delay_ms` → delay iniziale;
+  `retry_budget` → pass aggiuntive su round asciutto con pacing RADDOPPIATO
+  (backoff), tutto dentro il cap duro `CHECK_TOTAL_CAP` (3 s) — il piano
+  governa UN round bounded; lo scheduler esterno resta il grid VPN 30 s / il
+  backoff secret. `mode: relay-only` ⇒ il client salta del tutto il tentativo
+  diretto (`fallback_reason=plan-relay-only`), relay già caldo.
+- **Jitter di pacing deterministico** (`check_jitter`, 0–15 ms < pace 50 ms,
+  seed = chiave HMAC ⊕ ruolo ⇒ sequenze DIVERSE per i due peer senza byte sul
+  wire): rompe il lockstep che innesca la crossfire race di conntrack sui
+  router masquerade (pcap Fase 0).
+- **Generation di round normalizzata dal broker**: i frame di check rifiutano
+  generation diverse, quindi il broker (unico a vedere entrambe le offer)
+  impone `max(gen_a, gen_b)` su entrambi i rider; i retry (upgrade secret,
+  grid VPN) offrono generation crescenti ⇒ le reply di round vecchi vengono
+  scartate. Client vecchi offrono sempre 0 ⇒ pass-through legacy.
+- **Cache della coppia vincente** (`holepunch::pair_cache`, TTL 120 s,
+  process-local, solo lato dialer): al reconnect/upgrade la remote che ha
+  completato l'ultimo handshake QUIC viene provata per PRIMA (gruppo di testa
+  extra); il primo fallimento diretto la invalida subito. Advisory: la
+  membership resta l'offer fresca + sanitizer. Chiavi: `secret:<id>`,
+  `vpn:<link_id>`.
+- **Adozione VPN (1:1)**: offer via `CandidateDiscovery::to_offer` (typed +
+  capabilities + profilo), rider v2 + piano brokerati da
+  `serve_vpn_connector`, check round in `try_direct_upgrade` (listener =
+  `listener_checks_then_quic`, connector = `dialer_checks_then_quic` +
+  cache). L'HUB per-peer resta legacy v1 (punch cieco, `v2: None`), come il
+  suo direct path single-conn.
+- Peer o server legacy in QUALSIASI punto ⇒ ogni pezzo degrada al
+  comportamento Fase 2/legacy (capability-gated, campo per campo).
+
+## 18. Port mapping gestito e candidati manuali (Fase 5)
+
+I mapping espliciti del router sono ora RISORSE VIVE (`src/portmap.rs`), non
+indirizzi best-effort che scadono; e l'operatore può dichiarare endpoint
+pubblici a mano quando STUN è bloccato.
+
+- **Candidati manuali** (`--udp-candidate IP:PORT`, ripetibile /
+  `BORE_UDP_CANDIDATES` comma-separated; `--udp-no-stun` /
+  `BORE_UDP_NO_STUN`): su `bore local` (provider secret), `bore proxy` e
+  `bore test-udp` paired. Il proprio endpoint PUBBLICO (port-forward statico,
+  IP pubblico, NAT port-preserving) viene pubblicizzato PER PRIMO, sul wire
+  come kind `router-mapped` (nessuna variante enum nuova ⇒ i peer vecchi
+  continuano a deserializzare; un port-forward statico È un router mapping).
+  `--udp-no-stun` salta l'intera catena STUN (gather in millisecondi):
+  profilo `observations: 0`, e la policy NON classifica blocked un peer con
+  candidato router-mapped (⇒ `DirectWithRetry`, mai relay-first per assenza
+  di STUN). Senza `--udp-candidate` il no-stun logga un warn esplicito
+  (quasi certamente relay). Su tunnel PUBBLICI le flag sono inapplicabili e
+  warnate; sul diagnostico standalone pure. Riga NAT lab:
+  `manual_candidates_no_stun_direct` (cone/cone port-preserving, STUN mai
+  interrogato ⇒ DIRECT).
+- **Lease gestito** (`--upnp`, stesso opt-in di prima — ora significa
+  "mapping gestito"): prova **PCP (RFC 6887) MAP** verso il default gateway
+  (Linux: `/proc/net/route`; altrove si passa dritti a UPnP) e in fallback
+  **UPnP-IGD**. Il `LeaseHandle` rinnova a metà lifetime (richiesto 120 s),
+  ritenta con backoff cappato su errore (il RELAY non è mai toccato: il
+  mapping è un candidato extra, non una dipendenza), rileva il reboot del
+  gateway dall'**Epoch Time** PCP (epoch regredito ⇒ stato perso ⇒
+  re-acquire) e pubblica su un canale `watch` l'endpoint corrente quando
+  CAMBIA. Drop dell'handle ⇒ release best-effort (PCP lifetime-0 / UPnP
+  `remove_port`) — mai mapping orfani permanenti, e il RAII rilascia solo il
+  PROPRIO mapping (nonce PCP per-lease; porta esterna propria su UPnP).
+- **Re-offer su cambio**: il provider secret tiene il lease per tutta la vita
+  del tunnel e osserva il canale; se l'endpoint esterno cambia (reboot/
+  riassegnazione) ri-offre i candidati con `generation` incrementata (il
+  broker la normalizza — §17). Un mapping scaduto/cambiato non viene mai
+  ripubblicato a consumer nuovi: l'offer successiva porta sempre l'endpoint
+  CORRENTE. Consumer/VPN/test-udp tengono il lease per la durata del
+  tentativo: i loro retry ri-gatherano (e ri-acquisiscono) comunque.
+- **Ordine**: PCP → UPnP → (candidati manuali sempre inclusi) → discovery
+  implicita (STUN/local). Nessun mapping automatico senza l'opt-in `--upnp`;
+  un eventuale `--port-map auto` separato resta rimandato (piano).
+- NAT-PMP: non implementato (PCP è il successore; adapter valutabile poi).
+- Gate: unit PCP wire (fake gateway loopback: acquire/renew/reboot-epoch/
+  delete, frame tamper rejection), lease manager fake-clock (rinnovi oltre
+  2× lifetime, cambio pubblicato, failure→backoff, release-on-drop), riga
+  NAT lab manuale.
+
+---
+
 *Documenti correlati: `README.md` (uso e flag), `TEST_UDP.md` (scenari di test
-end-to-end, incl. `bore test-udp`), `CLAUDE.md` / `UPSTREAM_CHANGES.md`
-(architettura).*
+end-to-end, incl. `bore test-udp`), `ADAPTIVE_NAT.md` (policy),
+`PLAN_MANUAL_UDP_CANDIDATES.md` (piano candidati manuali — implementato),
+`CLAUDE.md` / `UPSTREAM_CHANGES.md` (architettura).*

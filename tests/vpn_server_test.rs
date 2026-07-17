@@ -899,8 +899,7 @@ async fn recv_until_unavailable(ctrl: &mut Delimited<bore_cli::mux::Stream>, wha
 fn offer(addr: &str) -> ClientMessage {
     ClientMessage::UdpCandidateOffer(bore_cli::shared::UdpCandidateOffer {
         candidates: vec![addr.parse().unwrap()],
-        selected_stun: None,
-        peer_id: 0,
+        ..Default::default()
     })
 }
 
@@ -1083,8 +1082,7 @@ async fn vpn_broker_empty_candidate_offer_times_out() {
         .send(ClientMessage::UdpCandidateOffer(
             bore_cli::shared::UdpCandidateOffer {
                 candidates: vec![], // empty
-                selected_stun: None,
-                peer_id: 0,
+                ..Default::default()
             },
         ))
         .await
@@ -1129,8 +1127,7 @@ async fn vpn_broker_ipv6_candidates_relayed() {
         .send(ClientMessage::UdpCandidateOffer(
             bore_cli::shared::UdpCandidateOffer {
                 candidates: vec!["[2001:db8::1]:1000".parse().unwrap()],
-                selected_stun: None,
-                peer_id: 0,
+                ..Default::default()
             },
         ))
         .await
@@ -1142,8 +1139,7 @@ async fn vpn_broker_ipv6_candidates_relayed() {
         .send(ClientMessage::UdpCandidateOffer(
             bore_cli::shared::UdpCandidateOffer {
                 candidates: vec!["[2001:db8::2]:2000".parse().unwrap()],
-                selected_stun: None,
-                peer_id: 0,
+                ..Default::default()
             },
         ))
         .await

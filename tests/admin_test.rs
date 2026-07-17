@@ -174,8 +174,7 @@ async fn admin_data_reflects_live_tunnels() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1024,
@@ -199,8 +198,7 @@ async fn admin_data_reflects_live_tunnels() -> Result<()> {
         false,
         false,
         None,
-        false,
-        false,
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
         0,
         0, // release timeout
         1, // carriers

@@ -21,8 +21,14 @@ SERVER_IP_PROV="10.211.0.1"
 SERVER_IP_NS0_CLI="10.213.0.2"
 SERVER_IP_CLI="10.213.0.1"
 DUR="${1:-5}"
+# Optional section filter (arg 2): all (default) | clean | impaired | wlog | btls.
+# Lets you run just one table, e.g. only the backend-tls overhead:
+#   sudo scripts/vhost_bench.sh 5 btls
+ONLY="${2:-all}"
+want() { [ "$ONLY" = "all" ] || [ "$ONLY" = "$1" ]; }
 LOG=$(mktemp -d)
 ORIGIN_PORT=8888
+ORIGIN_TLS_PORT=8889
 ORIGIN_DATA_FILE="$LOG/testfile.bin"
 
 # Create ~256MB random file for throughput testing
@@ -112,6 +118,22 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout "$LOG/key.pem" -out "$LOG/cert
 # ── Start origin HTTP server in provider ns ────────────────────────────────────
 ip netns exec nsp python3 -m http.server "$ORIGIN_PORT" --bind 127.0.0.1 \
     --directory "$LOG" >"$LOG/origin.log" 2>&1 &
+sleep 0.5
+
+# ── Start an HTTPS (TLS) origin in the provider ns, serving the SAME $LOG dir ──
+# Backend for the --backend-tls overhead comparison. Uses the self-signed cert;
+# the server's backend TLS client accepts any certificate.
+ip netns exec nsp python3 - "$ORIGIN_TLS_PORT" "$LOG" "$LOG/cert.pem" "$LOG/key.pem" \
+    >"$LOG/origin_tls.log" 2>&1 <<'PYEOF' &
+import sys, ssl, functools, http.server
+port = int(sys.argv[1]); directory = sys.argv[2]; cert, key = sys.argv[3], sys.argv[4]
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)
+httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+httpd.serve_forever()
+PYEOF
+_ORIGIN_TLS_PID=$!
 sleep 0.5
 
 # bench <name> <provider-args...>
@@ -298,8 +320,77 @@ bench_wlog_delta() {
     rm -rf "$wlog_dir" 2>/dev/null || true
 }
 
+# measure_tput <subdomain> — one throughput figure (req/s via hey, else MB/s via
+# 10x parallel curl) over the testfile. Used by bench_backend_tls_delta.
+measure_tput() {
+    local name="$1" out tp="—"
+    if command -v hey >/dev/null 2>&1; then
+        out=$(ip netns exec nsc hey -z "${DUR}s" -c 50 -q 5 \
+            -H "Host: $name.bore.local" \
+            "http://$SERVER_IP_NS0_CLI/testfile.bin" 2>/dev/null || echo "")
+        tp=$(echo "$out" | grep -oP 'Requests/sec:\s*\K[0-9.]+' | head -1 || echo "—")
+    elif command -v wrk >/dev/null 2>&1; then
+        # wrk is installed on the CI runner; DUR-bounded so the section completes
+        # well within the job's wall-clock cap (unlike the curl fallback).
+        out=$(ip netns exec nsc wrk -t 4 -c 50 -d "${DUR}s" \
+            -H "Host: $name.bore.local" \
+            "http://$SERVER_IP_NS0_CLI/testfile.bin" 2>/dev/null || echo "")
+        tp=$(echo "$out" | grep -oP 'Requests/sec\s+\K[0-9.]+' | head -1 || echo "—")
+    else
+        local sf; sf=$(mktemp)
+        for _ in $(seq 1 10); do
+            ( timeout 30 ip netns exec nsc curl -s -o /dev/null -w '%{speed_download}\n' \
+                -H "Host: $name.bore.local" \
+                "http://$SERVER_IP_NS0_CLI/testfile.bin" 2>/dev/null >>"$sf" || true ) &
+        done
+        wait
+        tp=$(awk '{s+=$1} END {printf "%.0f", s/1e6}' "$sf" 2>/dev/null || echo "?")
+        rm -f "$sf"
+    fi
+    echo "$tp"
+}
+
+# bench_backend_tls_delta <config-name> <extra-provider-args...>
+# Measures throughput of a PLAINTEXT backend (no flag) vs a self-signed HTTPS
+# backend reached with --backend-tls, over the SAME 64 MiB file, and prints the
+# overhead. This is the inherent cost of the extra server-side TLS leg (AEAD on
+# the backend hop); it is reported, not gated (unlike --webserver-log, which must
+# stay ~free).
+bench_backend_tls_delta() {
+    local name="$1"; shift
+    local pargs=("$@")
+
+    # A: plaintext backend, no --backend-tls.
+    ip netns exec nsp "$BORE" vhost 127.0.0.1:"$ORIGIN_PORT" \
+        --subdomain "$name" --id "bench-$name-plain" \
+        --to "$SERVER_IP_NS0_PROV:7835" --secret "$SECRET" \
+        "${pargs[@]}" \
+        >"$LOG/$name.plain.log" 2>&1 &
+    local PID=$!; sleep 3
+    local TP_PLAIN; TP_PLAIN=$(measure_tput "$name")
+    kill "$PID" 2>/dev/null || true; sleep 1
+
+    # B: HTTPS backend, --backend-tls.
+    ip netns exec nsp "$BORE" vhost 127.0.0.1:"$ORIGIN_TLS_PORT" \
+        --subdomain "$name" --id "bench-$name-btls" \
+        --to "$SERVER_IP_NS0_PROV:7835" --secret "$SECRET" \
+        --backend-tls "${pargs[@]}" \
+        >"$LOG/$name.btls.log" 2>&1 &
+    PID=$!; sleep 3
+    local TP_BTLS; TP_BTLS=$(measure_tput "$name")
+    kill "$PID" 2>/dev/null || true; sleep 1
+
+    local delta="—"
+    if [ "$TP_PLAIN" != "—" ] && [ "$TP_BTLS" != "—" ] && \
+       [ "$TP_PLAIN" != "?" ] && [ "$TP_BTLS" != "?" ]; then
+        delta=$(echo "scale=1; ($TP_PLAIN - $TP_BTLS) / $TP_PLAIN * 100" | bc 2>/dev/null || echo "—")
+    fi
+    echo "| $name | $TP_PLAIN | $TP_BTLS | $delta% |"
+}
+
 # ── BENCHMARK MATRIX: CLEAN LINK ───────────────────────────────────────────────
 echo "## vhost throughput/latency benchmark ($(date -u +%F), netns, ${DUR}s per test)"
+if want clean; then
 echo ""
 echo "### Clean link"
 echo ""
@@ -314,8 +405,10 @@ echo ""
 echo "Note: Single-curl throughput does not reflect multi-carrier or QUIC wins; concurrency is key."
 echo "Expected: TCP saturates on clean links; QUIC benefits under loss/RTT."
 echo ""
+fi
 
 # ── IMPAIRMENT: 40ms delay + 1% loss ───────────────────────────────────────────
+if want impaired; then
 ip netns exec ns0 tc qdisc add dev vethsp root netem delay 40ms loss 1% rate 100mbit
 
 echo "### Impaired link (40ms delay, 1% loss, 100 Mbps rate-limit)"
@@ -332,8 +425,10 @@ ip netns exec ns0 tc qdisc del dev vethsp root 2>/dev/null || true
 
 echo ""
 echo "Acceptance: QUIC gains over TCP under loss; multi-carrier > single-carrier."
+fi
 
 # ── T-WLBENCH: webserver-log bandwidth impact ────────────────────────────────────
+if want wlog; then
 echo ""
 echo "### T-WLBENCH: --webserver-log throughput impact"
 echo ""
@@ -347,3 +442,21 @@ bench_wlog_delta "wlog-udp-4c" --udp --carriers 4
 echo ""
 echo "Acceptance: throughput with --webserver-log must be within 5% of without."
 echo "The logging must never cause the data path to block or throttle."
+fi
+
+# ── T-VBTBENCH: --backend-tls overhead (server-side TLS leg to the backend) ───
+if want btls; then
+echo ""
+echo "### T-VBTBENCH: --backend-tls throughput overhead"
+echo ""
+echo "| Configuration | plaintext backend | --backend-tls (HTTPS) | Overhead % |"
+echo "|---|---|---|---|"
+bench_backend_tls_delta "btls-tcp-1c"
+bench_backend_tls_delta "btls-tcp-4c" --carriers 4
+bench_backend_tls_delta "btls-udp-1c" --udp
+fi
+
+echo ""
+echo "Informational: overhead is the inherent cost of the extra server<->backend"
+echo "TLS session (AEAD on the backend hop), not a regression — the flag is opt-in"
+echo "and OFF by default leaves the data path byte-identical."

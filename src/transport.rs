@@ -182,6 +182,34 @@ fn client_config(insecure: bool) -> Result<ClientConfig> {
     Ok(config)
 }
 
+/// Build a `TlsConnector` for connecting to a vhost provider's local HTTPS
+/// backend (`--backend-tls`).
+///
+/// Certificate verification is skipped (accept-any, reusing [`NoVerifier`]) so a
+/// self-signed local backend works with no extra configuration — the target is
+/// the provider's own service, reached through the already-authenticated tunnel.
+/// Only `http/1.1` is offered via ALPN: bore relays the backend leg as HTTP/1.x
+/// (it parses and rewrites HTTP/1.x request/response heads), so negotiating
+/// HTTP/2 would corrupt that path; the `bore` control-plane ALPN is deliberately
+/// NOT offered to a foreign server.
+pub(crate) fn insecure_tls_connector() -> Result<TlsConnector> {
+    let mut config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .context("failed to configure backend TLS protocol versions")?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// Parse a backend TLS SNI/server name into an owned (`'static`) rustls
+/// `ServerName`. Returns an error (never panics) on an invalid name.
+pub(crate) fn backend_server_name(name: &str) -> Result<ServerName<'static>> {
+    ServerName::try_from(name.to_owned())
+        .with_context(|| format!("invalid backend TLS SNI: {name}"))
+}
+
 /// Build a TLS acceptor for the server from PEM-encoded certificate and key.
 pub fn server_tls_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsAcceptor> {
     let certs = CertificateDer::pem_slice_iter(cert_pem)
@@ -304,5 +332,25 @@ mod tests {
         let endpoint = Endpoint::parse("https://bore.tld/");
         assert_eq!(endpoint.host, "bore.tld");
         assert_eq!(endpoint.port, 443);
+    }
+
+    #[test]
+    fn insecure_tls_connector_builds() {
+        // The backend TLS connector must build with the accept-any verifier and
+        // an http/1.1-only ALPN offer.
+        assert!(insecure_tls_connector().is_ok());
+    }
+
+    #[test]
+    fn backend_server_name_valid() {
+        assert!(backend_server_name("localhost").is_ok());
+        assert!(backend_server_name("app.internal").is_ok());
+    }
+
+    #[test]
+    fn backend_server_name_rejects_garbage() {
+        // An invalid SNI must return an error, never panic.
+        assert!(backend_server_name("").is_err());
+        assert!(backend_server_name("not a host").is_err());
     }
 }

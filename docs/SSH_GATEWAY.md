@@ -297,6 +297,7 @@ Priorità proposta: **opzioni per-chiave** (authorized_keys) > **stringa comando
 | `--max-conns` | ✅ | param `max-conns=` (semaforo lato gateway, parità col nativo) |
 | `--basic-auth` | ⚠️ | param `basic-auth=` — enforcement lato gateway, solo tunnel HTTP (vhost/public-http). §2.2 |
 | `--webserver-log*` | ✅ | param `webserver-log=on` (weblog server-side esistente) |
+| `--backend-tls` / `--backend-tls-sni` | ✅ (vhost) | param `backend-tls=on` / `backend-tls-sni=<name>` — il gateway origina TLS verso il backend HTTPS locale (cert self-signed accettato). Solo vhost; su public/secret produce un warning. Vedi §6.14 |
 | `--local-proxy-port` (proxy) | ✅ | bind locale di `-L` (lato client SSH) |
 | `--auto-reconnect` | ✅ | autossh/systemd (client-side) |
 | `--secret` (HMAC) | n/a | Sostituito dall'auth SSH (chiavi/password) |
@@ -1026,3 +1027,37 @@ fa il server OpenSSH stesso. Dettagli e istruzioni di ri-applicazione in
 flow-control per-stream). Guardie di regressione: `t_ssh_hol1_slow_consumer_does_not_block_peers`
 (`tests/ssh_gateway_test.rs`, client `ssh` reale) e `T-SSH-HOL-PUB`/`-VHOST`/`-SECRET`
 (`scripts/ssh_gateway_test.sh`, netns rete reale).
+
+### 6.14 `backend-tls=on` su tunnel vhost (backend HTTPS locale)
+
+Di default un forward vhost invia HTTP in chiaro al backend locale, quindi un servizio che
+parla solo HTTPS (un dev server con certificato self-signed su `https://localhost:3005`)
+resetterebbe la connessione. Il param `backend-tls=on` istruisce il gateway a stabilire una
+sessione TLS **verso il backend** (il server bore è il client TLS), decifrando la risposta
+così che routing per subdomain e header injection continuino a funzionare — stesso
+meccanismo di `bore vhost --backend-tls` nativo (il tratto SSH resta un byte-pipe opaco).
+
+```bash
+# Backend HTTPS self-signed su localhost:3005 esposto come sub.bore.example.com
+ssh -p 7835 -R vhost/sub:0:localhost:3005 bore.example.com -- 'backend-tls=on'
+
+# SNI esplicito verso il backend
+ssh -p 7835 -R vhost/sub:0:localhost:3005 bore.example.com -- 'backend-tls=on backend-tls-sni=app.internal'
+```
+
+`backend-tls-sni=<name>` imposta l'SNI/hostname inviato al backend (default `localhost`);
+ha effetto solo con `backend-tls=on`. Il banner di stato del tunnel (§6.11) riporta
+`Backend: TLS (certificate verification disabled)` quando attivo.
+
+> **Sicurezza:** la verifica del certificato del backend è **volutamente disabilitata**
+> (qualsiasi certificato è accettato). È sicuro per un backend locale fidato su `localhost`,
+> l'uso previsto. Il pinning/CA-validation del tratto backend non è ancora supportato.
+
+`backend-tls`/`backend-tls-sni` su un forward **public** o **secret** non ha significato
+(sono passthrough TCP opachi / senza frontend vhost) e produce un warning esplicito sul
+canale (`backend-tls: not applicable to public tunnels; ignoring`), mai silenzio (I-SSH8).
+`-N` resta sconsigliato (§6.4a): nessun canale sessione → nessun banner né warning visibile.
+Copertura test: `parse_params_backend_tls_on`/`_default_off` (`src/sshgw.rs`),
+`t_ssh_vbt3_backend_tls_forward_serves_https_backend`,
+`t_ssh_vbt_backend_tls_inapplicable_to_public_warns`,
+`t_ssh_warn_all_params_inapplicable_to_secret_provider` (`tests/ssh_gateway_test.rs`).

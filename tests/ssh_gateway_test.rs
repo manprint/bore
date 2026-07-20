@@ -906,6 +906,43 @@ async fn spawn_http_stub(body: &'static str) -> Result<u16> {
     Ok(port)
 }
 
+/// Like [`spawn_http_stub`], but the backend terminates TLS with the given
+/// self-signed cert — stands in for a local HTTPS service (`--backend-tls`).
+async fn spawn_https_stub(cert_pem: String, key_pem: String, body: &'static str) -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+    tokio::spawn(async move {
+        loop {
+            let (conn, _) = listener.accept().await?;
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let mut tls = acceptor.accept(conn).await?;
+                let mut buf = [0u8; 4096];
+                let mut total = 0;
+                loop {
+                    let n = tls.read(&mut buf[total..]).await?;
+                    total += n;
+                    if n == 0 || buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                tls.write_all(resp.as_bytes()).await?;
+                tls.flush().await?;
+                tls.shutdown().await?;
+                anyhow::Ok(())
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+    Ok(port)
+}
+
 /// Issues one HTTP/1.1 GET against `port` with the given `Host` header and
 /// returns the full raw response text.
 async fn send_http(port: u16, host: &str, path: &str) -> Result<String> {
@@ -1879,6 +1916,81 @@ async fn t_ssh_vh1_vhost_forward_routes_http_and_admin_entry() -> Result<()> {
     );
 
     child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-VBT3 (`docs/plans/plan_VhostBackendTls/phase_04.md`) — `-R vhost/<label>`
+// with the exec param `backend-tls=on` toward a self-signed HTTPS backend:
+// the server originates TLS to the backend and a request to the subdomain
+// returns the backend's 200. A sibling vhost forward WITHOUT the param toward
+// a plaintext backend still returns 200 (regression, I-1).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_vbt3_backend_tls_forward_serves_https_backend() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    let http_port = free_port().await?;
+    let cfg = vhost_config("bore.sshtest", http_port, vec![]);
+    let gw_port = start_gateway_server_vhost(host_key, dir.path().to_path_buf(), cfg).await?;
+
+    // Self-signed HTTPS backend (SAN localhost) → exercises the wrap.
+    let (cert_pem, key_pem) = self_signed_cert()?;
+    let tls_svc = spawn_https_stub(cert_pem, key_pem, "https-backend-ok").await?;
+    let plain_svc = spawn_http_stub("plain-backend-ok").await?;
+
+    // Vhost forward WITH backend-tls=on (exec param → no `-N`, session opens).
+    let tls_forward = format!("vhost/tlssub:0:127.0.0.1:{tls_svc}");
+    let mut tls_child = Command::new("ssh")
+        .args(ssh_args_raw(
+            gw_port,
+            &client_priv,
+            &[tls_forward],
+            Some("backend-tls=on backend-tls-sni=localhost"),
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh backend-tls (T-VBT3)")?;
+
+    // Sibling vhost forward WITHOUT the param toward a plaintext backend.
+    let plain_forward = format!("vhost/plainsub:0:127.0.0.1:{plain_svc}");
+    let mut plain_child = Command::new("ssh")
+        .args(ssh_args_raw(gw_port, &client_priv, &[plain_forward], None))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh plaintext (T-VBT3)")?;
+
+    wait_admin_data_contains("tlssub").await?;
+    wait_admin_data_contains("plainsub").await?;
+
+    let resp = send_http(http_port, "tlssub.bore.sshtest", "/").await?;
+    assert!(
+        resp.contains("200 OK") && resp.contains("https-backend-ok"),
+        "backend-tls forward must serve the HTTPS backend's 200: {resp}"
+    );
+
+    let resp = send_http(http_port, "plainsub.bore.sshtest", "/").await?;
+    assert!(
+        resp.contains("200 OK") && resp.contains("plain-backend-ok"),
+        "no-flag forward must still serve the plaintext backend: {resp}"
+    );
+
+    tls_child.kill().await.ok();
+    plain_child.kill().await.ok();
     Ok(())
 }
 
@@ -3288,6 +3400,56 @@ async fn t_ssh_banner_public_https_reports_enabled() -> Result<()> {
     Ok(())
 }
 
+// T-VBT-WARN-PUBLIC (`docs/plans/plan_VhostBackendTls/phase_04.md`, I-SSH8):
+// `backend-tls` is a vhost-only concern; on a PUBLIC SSH forward it must warn,
+// never be silently ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_vbt_backend_tls_inapplicable_to_public_warns() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(&auth_dir, &client_priv, None)?;
+
+    let gw_port = start_gateway_server(dir.path().join("host_key"), auth_dir).await?;
+    let svc_port = spawn_http_stub("hello public").await?;
+    let fwd_port = 19017u16;
+
+    let args = ssh_args(
+        gw_port,
+        &client_priv,
+        &[(fwd_port, svc_port)],
+        Some("backend-tls=on backend-tls-sni=x"),
+    );
+    let mut capture = spawn_ssh_capturing(
+        &args,
+        "spawn public ssh with backend-tls (T-VBT-WARN-PUBLIC)",
+    )?;
+
+    let seen = wait_buf_contains(
+        &capture.buf,
+        "Public tunnel established",
+        Duration::from_secs(10),
+    )
+    .await;
+    for expected in [
+        "backend-tls: not applicable to public tunnels; ignoring",
+        "backend-tls-sni: not applicable to public tunnels; ignoring",
+    ] {
+        assert!(
+            seen.contains(expected),
+            "public forward must warn for backend-tls, missing {expected:?}: {seen:?}"
+        );
+    }
+
+    capture.child.kill().await.ok();
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_ssh_banner_secret_provider_no_n_survives_and_reports() -> Result<()> {
     let _g = SERIAL_GUARD.lock().await;
@@ -3596,7 +3758,10 @@ async fn t_ssh_warn_all_params_inapplicable_to_secret_provider() -> Result<()> {
         gw_port,
         &client_priv,
         &[raw_forward],
-        Some("https=on force-https=on basic-auth=u:p webserver-log=on max-conns=42"),
+        Some(
+            "https=on force-https=on basic-auth=u:p webserver-log=on max-conns=42 \
+             backend-tls=on backend-tls-sni=x",
+        ),
     );
     let mut capture = spawn_ssh_capturing(
         &args,
@@ -3615,6 +3780,8 @@ async fn t_ssh_warn_all_params_inapplicable_to_secret_provider() -> Result<()> {
         "basic-auth: not applicable to secret provider tunnels; ignoring",
         "webserver-log: not applicable to secret provider tunnels; ignoring",
         "max-conns: not applicable to secret provider tunnels; ignoring",
+        "backend-tls: not applicable to secret provider tunnels; ignoring",
+        "backend-tls-sni: not applicable to secret provider tunnels; ignoring",
     ] {
         assert!(
             seen.contains(expected),

@@ -226,6 +226,52 @@ kill "$P1_VID" 2>/dev/null || true
 kill "$P1_HTTP_PID" 2>/dev/null || true
 sleep 0.5
 
+# ── Test 3b: native --backend-tls to a self-signed HTTPS backend ──────────────
+# The backend is itself HTTPS; the bore SERVER originates TLS to it (backend TLS
+# client, accept-any-cert). SNI defaults to localhost — irrelevant since the
+# verifier accepts any certificate, so the *.bore.local cert is fine.
+echo "=== Test 3b: native --backend-tls (HTTPS self-signed backend) ==="
+TLS_BK_PORT=8443
+ip netns exec nsp1 python3 - "$TLS_BK_PORT" "$CERT_FILE" "$KEY_FILE" \
+    >/tmp/bore_vhost_tlsbk.log 2>&1 <<'PYEOF' &
+import socket, ssl, sys, threading
+port = int(sys.argv[1]); cert, key = sys.argv[2], sys.argv[3]
+body = b"backend-tls-ok"
+resp = b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port)); srv.listen(64)
+def h(c):
+    try:
+        with ctx.wrap_socket(c, server_side=True) as t:
+            t.recv(4096); t.sendall(resp)
+    except Exception:
+        pass
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=h, args=(c,), daemon=True).start()
+PYEOF
+TLS_BK_PID=$!
+sleep 0.5
+
+TLSP_LOG="/tmp/bore_vhost_tlsp.log"
+ip netns exec nsp1 "$BORE" vhost 127.0.0.1:$TLS_BK_PORT \
+    --subdomain tlsapp --id user1 --backend-tls \
+    --to "$SERVER_IP_NS0_P1:7835" --secret "$SECRET" \
+    >"$TLSP_LOG" 2>&1 &
+TLSP_VID=$!
+sleep 1
+
+RESP=$(ip netns exec nsc curl -s --resolve tlsapp.bore.local:80:"$SERVER_IP_NS0_C" \
+    http://tlsapp.bore.local/ 2>/dev/null || echo "ERROR")
+if [ "$RESP" = "backend-tls-ok" ]; then
+    pass "native --backend-tls serves the self-signed HTTPS backend"
+else
+    fail "native --backend-tls returned '$RESP' (expected 'backend-tls-ok')"
+fi
+kill "$TLSP_VID" "$TLS_BK_PID" 2>/dev/null || true
+sleep 0.5
+
 # ── Test 4: reservation (vhost.yml config) ────────────────────────────────────
 echo "=== Test 4: reservation with vhost.yml ==="
 CONFIG_FILE="/tmp/vhost_config.yml"
@@ -466,6 +512,105 @@ else
 fi
 
 kill "$P1_VID" "$P1_HTTP_PID" 2>/dev/null || true
+sleep 0.5
+
+# Spawn a TLS-terminating HTTPS backend in netns $1 on port $2 with body $3,
+# using the shared self-signed cert (the backend TLS client accepts any cert, so
+# the *.bore.local cert works regardless of the default localhost SNI). Echoes PID.
+start_https_backend() {
+    local ns="$1" port="$2" body="$3"
+    ip netns exec "$ns" python3 - "$port" "$CERT_FILE" "$KEY_FILE" "$body" \
+        >"/tmp/bore_vhost_httpsbk_$port.log" 2>&1 <<'PYEOF' &
+import socket, ssl, sys, threading
+port = int(sys.argv[1]); cert, key, body = sys.argv[2], sys.argv[3], sys.argv[4].encode()
+resp = b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port)); srv.listen(64)
+def h(c):
+    try:
+        with ctx.wrap_socket(c, server_side=True) as t:
+            t.recv(4096); t.sendall(resp)
+    except Exception:
+        pass
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=h, args=(c,), daemon=True).start()
+PYEOF
+    echo $!
+}
+
+# ── Test 7b: UDP direct path + --backend-tls (QUIC direct to HTTPS backend) ────
+echo "=== Test 7b: --backend-tls over the UDP/QUIC direct path ==="
+kill "$SERVER_PID" 2>/dev/null || true
+wait_port_free nsp1 "$SERVER_IP_NS0_P1" 7835 || true
+SERVER_LOG="/tmp/bore_vhost_server_udp_btls.log"
+ip netns exec ns0 "$BORE" server \
+    --bind-addr 0.0.0.0 --bind-tunnels 0.0.0.0 \
+    --secret "$SECRET" \
+    --vhost-base-domain bore.local \
+    --vhost-http-port 80 \
+    --vhost-https-port 443 --vhost-cert-file "$CERT_FILE" --vhost-key-file "$KEY_FILE" \
+    --vhost-mode both \
+    --udp --vhost-quic-port 443 \
+    --control-port 7835 \
+    >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+wait_server_ready nsp1 "$SERVER_IP_NS0_P1" 7835 \
+    || die "T7b server failed to start: $(tail -3 "$SERVER_LOG" 2>/dev/null)"
+
+BTLS_BK_PID=$(start_https_backend nsp1 8443 "udp-backend-tls-ok")
+sleep 0.5
+
+BTLSU_LOG="/tmp/bore_vhost_btls_udp.log"
+ip netns exec nsp1 "$BORE" vhost 127.0.0.1:8443 \
+    --subdomain tlsudp --id user1 --backend-tls \
+    --to "$SERVER_IP_NS0_P1:7835" --secret "$SECRET" \
+    --udp \
+    >"$BTLSU_LOG" 2>&1 &
+BTLSU_VID=$!
+sleep 2
+
+if wait_for_log "$SERVER_LOG" "vhost QUIC direct carrier established" 15; then
+    RESP=$(ip netns exec nsc curl -s --resolve tlsudp.bore.local:80:"$SERVER_IP_NS0_C" \
+        http://tlsudp.bore.local/ 2>/dev/null || echo "ERROR")
+    if [ "$RESP" = "udp-backend-tls-ok" ]; then
+        pass "backend-tls over UDP direct path: QUIC carrier established, HTTPS backend served"
+    else
+        fail "backend-tls over UDP direct: HTTP returned '$RESP' (expected 'udp-backend-tls-ok')"
+    fi
+else
+    fail "backend-tls over UDP direct: no QUIC direct carrier established (relay mode)"
+fi
+kill "$BTLSU_VID" "$BTLS_BK_PID" 2>/dev/null || true
+sleep 0.5
+
+# ── Test 7c: --backend-tls + --carriers 2 (TCP relay, multi-carrier) ──────────
+echo "=== Test 7c: --backend-tls with --carriers 2 (TCP relay) ==="
+BTLS_BK2_PID=$(start_https_backend nsp1 8444 "carriers-backend-tls-ok")
+sleep 0.5
+
+BTLSC_LOG="/tmp/bore_vhost_btls_carriers.log"
+ip netns exec nsp1 "$BORE" vhost 127.0.0.1:8444 \
+    --subdomain tlscarr --id user1 --backend-tls --carriers 2 \
+    --to "$SERVER_IP_NS0_P1:7835" --secret "$SECRET" \
+    >"$BTLSC_LOG" 2>&1 &
+BTLSC_VID=$!
+sleep 2
+
+# Fire several requests so more than one carrier is exercised.
+CARR_OK=0
+for _ in $(seq 1 6); do
+    RESP=$(ip netns exec nsc curl -s --resolve tlscarr.bore.local:80:"$SERVER_IP_NS0_C" \
+        http://tlscarr.bore.local/ 2>/dev/null || echo "ERROR")
+    [ "$RESP" = "carriers-backend-tls-ok" ] && CARR_OK=$((CARR_OK+1))
+done
+if [ "$CARR_OK" = "6" ]; then
+    pass "backend-tls with --carriers 2: all 6 requests served the HTTPS backend"
+else
+    fail "backend-tls with --carriers 2: only $CARR_OK/6 requests succeeded"
+fi
+kill "$BTLSC_VID" "$BTLS_BK2_PID" 2>/dev/null || true
 sleep 0.5
 
 # ── Test 8: UDP fallback (server WITHOUT --udp, provider WITH --udp) ──────────

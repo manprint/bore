@@ -641,6 +641,8 @@ async fn admin_registry_reflects_connections() -> Result<()> {
             basic_auth: Some("u:p".into()),
             auto_reconnect: false,
             https_policy: None,
+            backend_tls: false,
+            backend_tls_sni: None,
         },
         None,
     )

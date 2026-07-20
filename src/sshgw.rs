@@ -914,6 +914,8 @@ impl GatewayHandler {
                 active: Arc::new(AtomicUsize::new(0)),
                 webserver_log: params.webserver_log,
                 https_policy: params.https_policy,
+                backend_tls: params.backend_tls,
+                backend_tls_sni: params.backend_tls_sni.clone(),
                 peer,
                 since: Instant::now(),
                 notes: params.notes.clone(),
@@ -1050,6 +1052,7 @@ impl GatewayHandler {
                 notes: params.notes.as_deref(),
                 basic_auth: has_basic_auth,
                 webserver_log: params.webserver_log,
+                backend_tls: params.backend_tls,
                 request_headers: &entry.request_headers,
                 response_headers: &entry.response_headers,
             }) {
@@ -1245,6 +1248,8 @@ impl GatewayHandler {
                     ("basic-auth", params.basic_auth.is_some()),
                     ("webserver-log", params.webserver_log),
                     ("max-conns", params.max_conns.is_some()),
+                    ("backend-tls", params.backend_tls),
+                    ("backend-tls-sni", params.backend_tls_sni.is_some()),
                 ],
             )
             .await;
@@ -1966,6 +1971,19 @@ impl Handler for GatewayHandler {
                 params.https = false;
                 params.force_https = false;
             }
+            // backend-tls is a vhost-only concern (server-side TLS to an HTTPS
+            // backend); a public SSH forward is an opaque TCP passthrough, so
+            // warn rather than silently ignore it (I-SSH8).
+            deliver_inapplicable_warnings(
+                &state,
+                &ssh_handle,
+                "public",
+                &[
+                    ("backend-tls", params.backend_tls),
+                    ("backend-tls-sni", params.backend_tls_sni.is_some()),
+                ],
+            )
+            .await;
             // `drop(state)` is load-bearing — same reference-cycle bug as
             // `tcpip_forward_vhost`/`tcpip_forward_secret` (see their matching
             // comment): this task's own `Arc<ConnState>` clone (captured above
@@ -2958,6 +2976,14 @@ pub struct Params {
     /// parsing; the legacy `https`/`force_https` bools above are kept in sync for
     /// the public-tunnel path.
     pub https_policy: Option<HttpsPolicy>,
+    /// Connect to the local backend over TLS (`backend-tls=on`). Vhost forwards
+    /// only: the server originates a TLS client session to a backend that is
+    /// itself HTTPS (self-signed cert accepted). No effect on public/secret
+    /// forwards — a warning is emitted there (I-SSH8).
+    pub backend_tls: bool,
+    /// SNI/hostname sent to the TLS backend (`backend-tls-sni=<name>`). `None` =
+    /// `localhost`. Only meaningful with `backend_tls`.
+    pub backend_tls_sni: Option<String>,
     /// One warning per unsupported or unrecognized key, in encounter order —
     /// nothing is silently dropped (I-2).
     pub warnings: Vec<String>,
@@ -3087,6 +3113,13 @@ pub fn parse_params(
                 )),
             },
             "force-https" => params.force_https = value == "on",
+            // Connect to the local backend over TLS (vhost forwards only). Accept
+            // the same truthy spellings as the native `--backend-tls` intent:
+            // `on`/`true` or a bare `backend-tls` token (empty value).
+            "backend-tls" => {
+                params.backend_tls = value.is_empty() || value == "on" || value == "true"
+            }
+            "backend-tls-sni" => params.backend_tls_sni = Some(value.clone()),
             k if TRANSPORT_ONLY_KEYS.contains(&k) => params.warnings.push(format!(
                 "{k}: not available via SSH ingress; use the native bore client"
             )),
@@ -3233,6 +3266,7 @@ struct VhostBannerInfo<'a> {
     notes: Option<&'a str>,
     basic_auth: bool,
     webserver_log: bool,
+    backend_tls: bool,
     request_headers: &'a [(String, String)],
     response_headers: &'a [(String, String)],
 }
@@ -3271,6 +3305,12 @@ fn vhost_info_banner(info: VhostBannerInfo<'_>) -> Vec<String> {
     lines.push(banner_line("Notes:", none_if_empty(info.notes)));
     lines.push(banner_line("Basic-auth:", on_off(info.basic_auth)));
     lines.push(banner_line("Webserver-log:", on_off(info.webserver_log)));
+    if info.backend_tls {
+        lines.push(banner_line(
+            "Backend:",
+            "TLS (certificate verification disabled)",
+        ));
+    }
     lines.push(banner_line(
         "Max-conns:",
         "n/a for vhost (server-wide --max-conns applies; no per-tunnel cap)",
@@ -3604,6 +3644,30 @@ mod tests {
         // as webserver-log=.
         let params = parse_params(Some("https=yes"), &[], &grant("id"));
         assert!(!params.https);
+    }
+
+    #[test]
+    fn parse_params_backend_tls_on() {
+        let params = parse_params(
+            Some("backend-tls=on backend-tls-sni=app"),
+            &[],
+            &grant("id"),
+        );
+        assert!(params.backend_tls);
+        assert_eq!(params.backend_tls_sni.as_deref(), Some("app"));
+        assert!(params.warnings.is_empty());
+
+        // `true` is accepted as a synonym for `on`.
+        let params = parse_params(Some("backend-tls=true"), &[], &grant("id"));
+        assert!(params.backend_tls);
+        assert!(params.backend_tls_sni.is_none());
+    }
+
+    #[test]
+    fn parse_params_backend_tls_default_off() {
+        let params = parse_params(Some("notes=hi"), &[], &grant("id"));
+        assert!(!params.backend_tls);
+        assert!(params.backend_tls_sni.is_none());
     }
 
     #[test]

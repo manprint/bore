@@ -394,6 +394,15 @@ pub struct VhostEntry {
     pub webserver_log: bool,
     /// Per-tunnel HTTPS policy. `None` = inherit the server default (global mode).
     pub https_policy: Option<crate::shared::HttpsPolicy>,
+    /// Whether the server originates a TLS client session toward the provider's
+    /// local backend (the backend is itself an HTTPS server). When `true`, the
+    /// relay wraps the provider-facing `LinkStream` in a `tokio-rustls` client
+    /// before splicing; certificate verification is skipped (accept-any). `false`
+    /// keeps the plaintext backend path byte-identical to the pre-feature server.
+    pub backend_tls: bool,
+    /// SNI/server name for the backend TLS ClientHello. `None` ⇒ `localhost`.
+    /// Ignored when `backend_tls` is `false`.
+    pub backend_tls_sni: Option<String>,
     // ── Execution-info fields (parity with the public `TunnelView`) ───────────
     // These let the admin Vhost section present the same columns as Tunnels.
     // `VhostEntry` is self-sufficient here (no admin-registry join, see
@@ -541,6 +550,11 @@ impl Drop for Deregister {
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Upper bound on the server-originated TLS handshake to an HTTPS backend
+/// (`entry.backend_tls`). A backend that is slow, non-TLS, or unreachable must
+/// fail the proxied connection within this window rather than hang it.
+const BACKEND_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[cfg(feature = "udp")]
 fn new_nonce() -> [u8; UDP_NONCE_LEN] {
     use ring::rand::{SecureRandom, SystemRandom};
@@ -601,6 +615,8 @@ pub async fn serve_vhost_provider(
     local_host: Option<String>,
     local_port: u16,
     https_policy: Option<crate::shared::HttpsPolicy>,
+    backend_tls: bool,
+    backend_tls_sni: Option<String>,
 ) -> Result<()> {
     // Validate against live config (resolve_route checks reservations).
     let cfg = vhost_config.read().unwrap().clone();
@@ -644,6 +660,8 @@ pub async fn serve_vhost_provider(
                 active: Arc::new(AtomicUsize::new(0)),
                 webserver_log,
                 https_policy,
+                backend_tls,
+                backend_tls_sni,
                 peer,
                 since: Instant::now(),
                 notes: notes.clone(),
@@ -920,6 +938,33 @@ pub async fn relay_vhost(
                 .context("vhost provider unavailable")?
         }
     };
+
+    // Backend TLS origination (I-1/D6): when the tunnelled backend is itself an
+    // HTTPS/TLS listener, the server (the TLS client endpoint) wraps the provider
+    // link in a client TLS session BEFORE any HTTP head is written, so the request
+    // rides ciphertext to the backend and the response is decrypted here for
+    // header injection. Gated on `entry.backend_tls`; with the flag off this block
+    // is skipped and the path below is byte-identical to the plaintext relay.
+    // `provider` stays spliced in ONE task (I-3): the wrap consumes it and rebinds
+    // the same variable, never `tokio::io::split`.
+    if entry.backend_tls {
+        let connector = crate::transport::insecure_tls_connector()?;
+        let sni = entry.backend_tls_sni.as_deref().unwrap_or("localhost");
+        let server_name = crate::transport::backend_server_name(sni)?;
+        let tls = tokio::time::timeout(
+            BACKEND_TLS_HANDSHAKE_TIMEOUT,
+            connector.connect(server_name, provider),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "backend TLS handshake timed out",
+            )
+        })?
+        .map_err(|e| std::io::Error::other(format!("backend TLS handshake failed: {e}")))?;
+        provider = Box::new(tls) as mux::LinkStream;
+    }
 
     // Keep a copy of the head for logging (before it's moved/rewritten).
     let head_for_logging = head.clone();
@@ -1970,6 +2015,8 @@ reservations:
             active: Arc::new(AtomicUsize::new(0)),
             webserver_log: false,
             https_policy: None,
+            backend_tls: false,
+            backend_tls_sni: None,
             peer: "127.0.0.1:1".parse().unwrap(),
             since: Instant::now(),
             notes: None,
@@ -1992,6 +2039,15 @@ reservations:
         // head at all for auth purposes (native `bore vhost` gates client-side).
         let entry = test_entry(None);
         assert!(entry.gateway_basic_auth.is_none());
+    }
+
+    #[tokio::test]
+    async fn vhost_entry_backend_tls_defaults_off() {
+        // Scaffolding phase: the entry carries the backend-TLS fields, defaulting
+        // to off / none so the plaintext backend path is unchanged.
+        let entry = test_entry(None);
+        assert!(!entry.backend_tls);
+        assert!(entry.backend_tls_sni.is_none());
     }
 
     #[tokio::test]
@@ -2056,6 +2112,208 @@ reservations:
         // No live carrier ⇒ opening the provider link errors out; that error
         // (not an early Ok(())) proves the auth gate was passed.
         assert!(result.is_err());
+    }
+
+    // ── backend TLS origination (Phase 1: server-side wrap) ────────────────
+    //
+    // These drive `relay_vhost` directly with a `VhostEntry` whose carrier pool
+    // is an in-memory mux link, and stand up a tunnelled backend on the peer
+    // half. When `backend_tls` is set the server wraps the provider link in a
+    // client TLS session; the backend here runs a real `tokio-rustls` server so
+    // the handshake and the decrypted HTTP round-trip are exercised end to end.
+
+    /// Build a `VhostEntry` backed by an in-memory mux carrier and return the
+    /// provider-side transport half for the test to drive as the backend.
+    fn backend_entry(
+        backend_tls: bool,
+        backend_tls_sni: Option<String>,
+    ) -> (VhostEntry, tokio::io::DuplexStream) {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (opener, _acc) = mux::client(a);
+        let mut entry = test_entry(None);
+        entry.pool = Arc::new(CarrierPool::new(mux::LinkOpener::Mux(opener)));
+        entry.backend_tls = backend_tls;
+        entry.backend_tls_sni = backend_tls_sni;
+        (entry, b)
+    }
+
+    /// Read one HTTP request head (up to CRLFCRLF) then reply a fixed 200.
+    async fn serve_one_http<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, body: &str) {
+        let mut buf = vec![0u8; 4096];
+        let mut total = 0;
+        loop {
+            let Ok(n) = s.read(&mut buf[total..]).await else {
+                return;
+            };
+            if n == 0 {
+                break;
+            }
+            total += n;
+            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if total >= buf.len() {
+                break;
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = s.write_all(response.as_bytes()).await;
+        let _ = s.flush().await;
+        // Clean TLS teardown: send close_notify so the server's read side sees a
+        // graceful EOF rather than an unexpected-EOF error.
+        let _ = s.shutdown().await;
+    }
+
+    /// Accept the server's mux stream, strip the STREAM_READY marker, then serve
+    /// one HTTP request. If `tls` is set, wrap the stream in a TLS server first
+    /// (simulating an HTTPS backend behind the tunnel).
+    fn spawn_mux_backend(
+        b: tokio::io::DuplexStream,
+        tls: Option<(String, String)>,
+        body: &'static str,
+    ) {
+        tokio::spawn(async move {
+            let (_op, mut acceptor) = mux::server(b);
+            let Some(mut stream) = acceptor.accept().await else {
+                return;
+            };
+            if mux::read_stream_ready(&mut stream, false).await.is_err() {
+                return;
+            }
+            match tls {
+                Some((cert, key)) => {
+                    let acceptor =
+                        crate::transport::server_tls_from_pem(cert.as_bytes(), key.as_bytes())
+                            .unwrap();
+                    let Ok(mut tls_stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    serve_one_http(&mut tls_stream, body).await;
+                }
+                None => serve_one_http(&mut stream, body).await,
+            }
+        });
+    }
+
+    /// Accept the mux stream, strip the marker, then drop it immediately. A
+    /// server attempting a TLS handshake against this sees EOF and fails fast
+    /// (used to prove backend_tls against a non-TLS backend does not hang).
+    fn spawn_mux_close_after_marker(b: tokio::io::DuplexStream) {
+        tokio::spawn(async move {
+            let (_op, mut acceptor) = mux::server(b);
+            let Some(mut stream) = acceptor.accept().await else {
+                return;
+            };
+            let _ = mux::read_stream_ready(&mut stream, false).await;
+            // Drop `stream` → the server's handshake read gets EOF.
+        });
+    }
+
+    /// Drive `relay_vhost` with a fixed GET, half-closing the browser side so
+    /// the relay completes, and return `(relay_result, response_bytes)`.
+    async fn drive_relay(entry: &VhostEntry, host: &str) -> (Result<()>, Vec<u8>) {
+        let (public, mut peer) = tokio::io::duplex(64 * 1024);
+        let head =
+            format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").into_bytes();
+        let relay = relay_vhost(
+            public,
+            "127.0.0.1:2".parse().unwrap(),
+            entry,
+            head,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&entry.active),
+            "sub",
+            "sub.example.com",
+            LogContext {
+                logger: None,
+                dropped: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        let read = async {
+            // Signal no browser body so the relay's public→provider half EOFs.
+            let _ = peer.shutdown().await;
+            let mut resp = Vec::new();
+            let _ = peer.read_to_end(&mut resp).await;
+            resp
+        };
+        tokio::join!(relay, read)
+    }
+
+    #[tokio::test]
+    async fn backend_tls_wrap_handshakes_with_self_signed() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.signing_key.serialize_pem();
+
+        let (entry, b) = backend_entry(true, Some("localhost".to_string()));
+        spawn_mux_backend(b, Some((cert_pem, key_pem)), "backend-tls-ok");
+
+        let (res, resp) = tokio::time::timeout(Duration::from_secs(8), drive_relay(&entry, "sub"))
+            .await
+            .expect("relay must not hang");
+        assert!(res.is_ok(), "relay over TLS backend failed: {res:?}");
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.contains("200 OK"), "expected 200 from backend: {text}");
+        assert!(
+            text.contains("backend-tls-ok"),
+            "expected backend body: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_tls_off_path_unchanged() {
+        // backend_tls == false against a plaintext backend still serves 200
+        // (guards I-1: the pre-feature relay path is untouched).
+        let (entry, b) = backend_entry(false, None);
+        spawn_mux_backend(b, None, "plaintext-ok");
+
+        let (res, resp) = tokio::time::timeout(Duration::from_secs(8), drive_relay(&entry, "sub"))
+            .await
+            .expect("relay must not hang");
+        assert!(res.is_ok(), "plaintext relay failed: {res:?}");
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.contains("200 OK"), "expected 200: {text}");
+        assert!(text.contains("plaintext-ok"), "expected body: {text}");
+    }
+
+    #[tokio::test]
+    async fn backend_tls_bad_sni_fails_gracefully() {
+        // An empty SNI is rejected by rustls' ServerName parse before any
+        // handshake; the relay must return an error (never panic, never hang).
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let (entry, b) = backend_entry(true, Some(String::new()));
+        spawn_mux_backend(
+            b,
+            Some((cert.cert.pem(), cert.signing_key.serialize_pem())),
+            "unused",
+        );
+
+        let (res, _resp) = tokio::time::timeout(Duration::from_secs(3), drive_relay(&entry, "sub"))
+            .await
+            .expect("bad SNI must fail fast, not hang");
+        assert!(res.is_err(), "empty SNI must error, got: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn backend_tls_against_plaintext_backend_times_out_or_errors() {
+        // backend_tls == true pointed at a non-TLS backend: the handshake must
+        // fail (here the backend closes after the marker → EOF) within the
+        // timeout, never hanging.
+        let (entry, b) = backend_entry(true, Some("localhost".to_string()));
+        spawn_mux_close_after_marker(b);
+
+        let (res, _resp) = tokio::time::timeout(
+            Duration::from_secs(BACKEND_TLS_HANDSHAKE_TIMEOUT.as_secs() + 2),
+            drive_relay(&entry, "sub"),
+        )
+        .await
+        .expect("non-TLS backend must not hang past the handshake timeout");
+        assert!(res.is_err(), "TLS against plaintext backend must error");
     }
 
     #[test]

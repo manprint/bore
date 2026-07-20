@@ -47,6 +47,14 @@ pub struct ProviderMeta {
     /// `--vhost-mode` default (byte-identical to the pre-policy behavior). Only
     /// meaningful for vhost providers; ignored by secret providers.
     pub https_policy: Option<crate::shared::HttpsPolicy>,
+    /// Connect to the local backend over TLS (`--backend-tls`). When set, the
+    /// server originates a TLS client session to the tunnelled backend (for a
+    /// backend that is itself HTTPS). Backend cert verification is skipped. Only
+    /// meaningful for vhost providers.
+    pub backend_tls: bool,
+    /// SNI/hostname sent to the TLS backend (`--backend-tls-sni`). `None` =
+    /// `localhost`. Only meaningful with `backend_tls`.
+    pub backend_tls_sni: Option<String>,
 }
 
 /// State structure for the client.
@@ -604,6 +612,8 @@ impl Client {
                 local_host: Some(local_host.to_string()),
                 local_port,
                 https_policy: meta.https_policy,
+                backend_tls: meta.backend_tls,
+                backend_tls_sni: meta.backend_tls_sni.clone(),
             })
             .await?;
 

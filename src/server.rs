@@ -1668,6 +1668,8 @@ impl Server {
                 local_host,
                 local_port,
                 https_policy,
+                backend_tls,
+                backend_tls_sni,
             }) => {
                 let Some(cfg) = self.vhost_config.clone() else {
                     warn!("vhost not configured on this server");
@@ -1701,6 +1703,8 @@ impl Server {
                     local_host,
                     local_port,
                     https_policy,
+                    backend_tls,
+                    backend_tls_sni,
                 )
                 .await
             }

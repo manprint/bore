@@ -1206,6 +1206,19 @@ pub enum ClientMessage {
         /// to the pre-policy behavior). `#[serde(default)]` keeps the wire backward-compatible.
         #[serde(default)]
         https_policy: Option<HttpsPolicy>,
+        /// Whether the server should connect to the provider's local backend over
+        /// TLS (the backend is itself an HTTPS server, e.g. a self-signed dev app).
+        /// The server originates a TLS client session on the provider-facing
+        /// `LinkStream`; certificate verification is skipped (accept-any).
+        /// `#[serde(default)]` keeps the wire backward-compatible (an old client
+        /// omits it ⇒ reads as `false` ⇒ the pre-feature plaintext path).
+        #[serde(default)]
+        backend_tls: bool,
+        /// SNI/server name sent in the backend TLS ClientHello. `None` ⇒ the server
+        /// defaults to `localhost`. Ignored when `backend_tls` is `false`.
+        /// `#[serde(default)]` keeps the wire backward-compatible.
+        #[serde(default)]
+        backend_tls_sni: Option<String>,
     },
 
     /// Ask the server to issue a fresh vhost-UDP nonce so the provider can
@@ -1996,6 +2009,63 @@ mod tests {
     }
 
     #[test]
+    fn hello_vhost_old_wire_defaults_backend_tls_off() {
+        // I-2: a legacy HelloVhost that predates the backend-TLS fields must still
+        // deserialize, with `backend_tls`/`backend_tls_sni` reading as their
+        // defaults (off / none) rather than failing.
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"HelloVhost":{"subdomain":"app","client_id":"c","notes":null,"basic_auth":false}}"#,
+        )
+        .expect("legacy HelloVhost must still deserialize");
+        match msg {
+            ClientMessage::HelloVhost {
+                subdomain,
+                backend_tls,
+                backend_tls_sni,
+                ..
+            } => {
+                assert_eq!(subdomain, "app");
+                assert!(!backend_tls, "missing backend_tls defaults to false");
+                assert_eq!(backend_tls_sni, None);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_vhost_backend_tls_serde_roundtrip() {
+        // The new fields survive a full serialize/deserialize round-trip.
+        let full = ClientMessage::HelloVhost {
+            subdomain: "app".into(),
+            client_id: "c".into(),
+            notes: None,
+            basic_auth: false,
+            carriers: 0,
+            udp: false,
+            webserver_log: false,
+            auto_reconnect: false,
+            local_host: Some("localhost".into()),
+            local_port: 3005,
+            https_policy: None,
+            backend_tls: true,
+            backend_tls_sni: Some("app.internal".into()),
+        };
+        let back: ClientMessage =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        match back {
+            ClientMessage::HelloVhost {
+                backend_tls,
+                backend_tls_sni,
+                ..
+            } => {
+                assert!(backend_tls, "backend_tls must round-trip on the wire");
+                assert_eq!(backend_tls_sni.as_deref(), Some("app.internal"));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
     fn tunnelopts_compat_missing_new_fields_default() {
         // I-COMPAT (D4): an old client omits `carriers`/`udp`/`auto_reconnect`;
         // a new server must read them as their defaults rather than failing.
@@ -2428,6 +2498,8 @@ fn hello_vhost_round_trips_and_fits_frame() {
         local_host: None,
         local_port: 0,
         https_policy: None,
+        backend_tls: false,
+        backend_tls_sni: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(
@@ -2915,6 +2987,8 @@ fn hello_vhost_serde_omits_default_policy() {
         local_host: None,
         local_port: 0,
         https_policy: None,
+        backend_tls: false,
+        backend_tls_sni: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let round: ClientMessage = serde_json::from_str(&json).unwrap();

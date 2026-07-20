@@ -899,6 +899,8 @@ permit="vhost/mysub",max-conns=256,notes="ci runner" ssh-ed25519 AAAA... ci@runn
 | `id=<label>` | exec, env (`BORE_ID`) | all | Explicit override of the identity/id shown (default: key fingerprint/label) |
 | `https=on` | exec, env (`BORE_HTTPS`) | **public** | Terminates TLS on the public tunnel port using the server's certificate (requires `--cert-file`/`--key-file`; without it, served as plain TCP with a warning). Reuses the same code path as the native client's `bore local --https` |
 | `force-https=on` | exec, env (`BORE_FORCE_HTTPS`) | **public** | Redirects plain HTTP on the tunnel port to `https://`. Requires `https=on` on the same request — if absent, disabled with a warning instead of silently applied or ignored |
+| `backend-tls=on` | exec, env (`BORE_BACKEND_TLS`) | **vhost** | Gateway originates TLS to a local HTTPS backend (self-signed cert accepted; verification skipped). Same as native `bore vhost --backend-tls`. On public/secret forwards it is inapplicable and warns |
+| `backend-tls-sni=<name>` | exec, env (`BORE_BACKEND_TLS_SNI`) | **vhost** | SNI/hostname sent to the TLS backend (default `localhost`); only with `backend-tls=on` |
 
 **Client-transport-only parameters — rejected with an explicit warning, never silence:**
 `udp`, `carriers`, `stun-server`, `upnp`, `try-port-prediction`, `nat-udp-preferred-port`,
@@ -967,6 +969,7 @@ Host bore
 
 ```shell
 ssh -R vhost/myapp:0:localhost:8080 bore                       # vhost
+ssh -R vhost/secureapp:0:localhost:3005 bore -- 'backend-tls=on' # vhost, HTTPS backend
 ssh -R 9005:localhost:8080 bore                                 # public
 ssh -R secret/tcp-id:0:localhost:8080 bore                       # secret provider
 ssh -L 8899:secret/tcp-id:1 bore                                 # secret consumer
@@ -1795,6 +1798,8 @@ mtime change it reloads atomically — in-flight connections are unaffected.
 | `--to` | bore server address |
 | `--secret` | Optional server secret |
 | `--insecure` | Skip TLS cert verification on `https://` servers |
+| `--backend-tls` | Connect to the local backend over TLS — use when the tunnelled service is itself HTTPS (e.g. `https://localhost:3005`). The server originates a TLS session to the backend; a self-signed backend cert is accepted (verification skipped) |
+| `--backend-tls-sni NAME` | SNI/hostname sent to the TLS backend (default `localhost`). Only meaningful with `--backend-tls` |
 | `--https[=off\|on\|redirect]` | Per-subdomain HTTPS policy (bare = on). Absent inherits the server `--vhost-mode`; falls back to HTTP with a warning if the server has no vhost cert |
 | `--carriers N` | Parallel relay connections (default 1) |
 | `--udp` | Try QUIC direct path for the server→provider hop; falls back silently to the TCP relay |
@@ -1818,7 +1823,30 @@ bore vhost localhost:8080 --subdomain myapp --secret mysecret --udp --to https:/
 
 # Reservation (fixed subdomain via ID)
 bore vhost localhost:8080 --id myreserved --to https://bore.example.com --subdomain api-reserved
+
+# Plaintext HTTP backend (default) — no flag needed
+bore vhost localhost:3000 --subdomain plainapp --to https://bore.example.com
+
+# HTTPS backend with a self-signed cert — the server originates TLS to it
+bore vhost localhost:3005 --subdomain secureapp --backend-tls --to https://bore.example.com
+
+# HTTPS backend expecting a specific SNI
+bore vhost localhost:3005 --subdomain secureapp --backend-tls --backend-tls-sni app.internal \
+  --to https://bore.example.com
 ```
+
+> **Backend TLS (`--backend-tls`).** By default `bore vhost` sends plain HTTP to
+> the local backend, so a backend that only speaks HTTPS (a dev server started
+> with a self-signed certificate on `https://localhost:3005`) would reset the
+> connection. Add `--backend-tls` and the bore server establishes a TLS session
+> to the backend on your behalf (the server is the TLS client), decrypting the
+> response so subdomain routing and header injection still work. The same flag
+> works with the SSH gateway (`backend-tls=on`, see the SSH gateway section).
+>
+> **Security:** backend certificate verification is intentionally skipped
+> (any certificate is accepted). This is safe for a trusted local backend on
+> `localhost`, which is the intended use. Certificate pinning / CA validation
+> for the backend leg is not yet supported.
 
 **Server example:**
 

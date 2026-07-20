@@ -3276,3 +3276,121 @@ async fn vhost_policy_none_is_byte_identical() -> Result<()> {
 
     Ok(())
 }
+
+// ─── Phase 2: backend TLS origination (--backend-tls) ───────────────────────
+
+/// Spawn a minimal HTTPS backend that terminates TLS with the given self-signed
+/// cert and always answers a fixed 200. Returns the ephemeral port.
+async fn spawn_https_stub(cert_pem: String, key_pem: String, body: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes()).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let mut total = 0;
+                loop {
+                    let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                    if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if total >= buf.len() {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = tls.write_all(response.as_bytes()).await;
+                let _ = tls.flush().await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    port
+}
+
+/// T-VBT2: native `bore vhost --backend-tls` against a self-signed HTTPS backend
+/// serves 200 through the subdomain; a sibling provider WITHOUT the flag against
+/// a plaintext backend still serves 200 (I-1 regression).
+#[tokio::test]
+async fn vhost_backend_tls_native_end_to_end() -> Result<()> {
+    const CTRL: u16 = 19400;
+    const HTTP: u16 = 19401;
+
+    let _guard = SERIAL_GUARD.lock().await;
+
+    spawn_server_vhost(CTRL, http_config("bore.local", HTTP)).await?;
+
+    // HTTPS backend with a self-signed cert (SAN localhost) → drives the wrap.
+    let (cert_pem, key_pem) = self_signed_for(vec!["localhost".into()])?;
+    let tls_backend = spawn_https_stub(cert_pem, key_pem, "backend-over-tls").await;
+
+    // Plaintext backend for the no-flag regression provider.
+    let plain_backend = spawn_http_stub("plaintext-backend").await;
+
+    // Provider WITH --backend-tls → server originates TLS to the HTTPS backend.
+    let tls_client = Client::new_vhost_provider(
+        "127.0.0.1",
+        tls_backend,
+        &format!("127.0.0.1:{CTRL}"),
+        "tlsapp",
+        "client-tls",
+        None,
+        false,
+        1,
+        ProviderMeta {
+            backend_tls: true,
+            backend_tls_sni: Some("localhost".into()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await?;
+    tokio::spawn(tls_client.listen());
+
+    // Provider WITHOUT the flag against a plaintext backend (regression).
+    let plain_client = Client::new_vhost_provider(
+        "127.0.0.1",
+        plain_backend,
+        &format!("127.0.0.1:{CTRL}"),
+        "plainapp",
+        "client-plain",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(plain_client.listen());
+    wait_port(HTTP, true).await;
+
+    let resp = send_http(HTTP, "tlsapp.bore.local", "/").await?;
+    assert!(
+        resp.contains("200 OK") && resp.contains("backend-over-tls"),
+        "backend-tls provider must serve the HTTPS backend's 200: {resp}"
+    );
+
+    let resp = send_http(HTTP, "plainapp.bore.local", "/").await?;
+    assert!(
+        resp.contains("200 OK") && resp.contains("plaintext-backend"),
+        "no-flag provider must still serve the plaintext backend: {resp}"
+    );
+
+    Ok(())
+}

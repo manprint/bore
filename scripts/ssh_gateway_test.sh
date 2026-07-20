@@ -262,6 +262,44 @@ PYEOF
     echo $!
 }
 
+# A local HTTPS service in nscli (TLS-terminating), standing in for a backend
+# that is itself HTTPS — the target of `backend-tls=on`. Uses the harness
+# self-signed cert; SNI is irrelevant because the server's backend TLS client
+# accepts any certificate. Prints its PID on stdout.
+spawn_https_service() {
+    local port="$1" body="$2"
+    ip netns exec nscli python3 - "$port" "$body" "$CERT_FILE" "$KEY_FILE" \
+        >"$TMPDIR/https_$port.log" 2>&1 <<'PYEOF' &
+import socket, ssl, sys, threading
+
+port = int(sys.argv[1])
+body = sys.argv[2].encode()
+cert, key = sys.argv[3], sys.argv[4]
+resp = b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(cert, key)
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port))
+srv.listen(64)
+
+def handle(conn):
+    try:
+        with ctx.wrap_socket(conn, server_side=True) as tls:
+            tls.recv(4096)
+            tls.sendall(resp)
+    except Exception:
+        pass
+
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+PYEOF
+    echo $!
+}
+
 # ── Setup ──────────────────────────────────────────────────────────────────
 echo "=== Setup: reclaiming any stale state from a prior (possibly SIGKILLed) run ==="
 for ns in ns0 nscli; do
@@ -831,6 +869,57 @@ else
 fi
 kill -9 "$HOL_SEC_SSH" "$HOL_SEC_CONS_PID" 2>/dev/null || true
 wait "$HOL_SEC_SSH" "$HOL_SEC_CONS_PID" 2>/dev/null || true
+
+# ── T-VBT-NETNS-SSH: ssh -R vhost + backend-tls=on → self-signed HTTPS backend ─
+echo ""
+echo "=== Test: T-VBT-NETNS-SSH (ssh -R vhost backend-tls=on → HTTPS backend) ==="
+VBT_TLS_PORT=19830
+VBT_PLAIN_PORT=19831
+spawn_https_service "$VBT_TLS_PORT" "vbt-https-ok" >/dev/null
+spawn_http_service "$VBT_PLAIN_PORT" "vbt-plain-ok" >/dev/null
+sleep 0.5
+
+# WITH backend-tls=on: the exec param opens a session channel (no -N) and the
+# gateway parses it as tunnel params (not a shell command). ssh_cmd cannot append
+# a trailing command (it puts the destination last), so invoke ssh directly here.
+ip netns exec nscli ssh "${SSH_OPTS[@]}" -i "$CLIENT_KEY" \
+    -o BatchMode=yes -o ExitOnForwardFailure=yes -p "$CTRL_PORT" \
+    -R "vhost/vbttls:0:127.0.0.1:$VBT_TLS_PORT" "gwtest@$SERVER_IP" 'backend-tls=on' \
+    >"$TMPDIR/vbt_tls_ssh.log" 2>&1 &
+VBT_TLS_SSH=$!
+# WITHOUT the param toward a plaintext backend (regression).
+ssh_cmd -N -R "vhost/vbtplain:0:127.0.0.1:$VBT_PLAIN_PORT" >"$TMPDIR/vbt_plain_ssh.log" 2>&1 &
+VBT_PLAIN_SSH=$!
+
+# Poll each subdomain until its SSH session has registered (a 404 means the
+# vhost route isn't live yet — the two sessions register asynchronously).
+vbt_probe() {
+    local host="$1" needle="$2" i resp
+    for i in $(seq 1 30); do
+        resp=$(http_check "$host")
+        if echo "$resp" | grep -q "$needle"; then
+            echo "$resp"
+            return 0
+        fi
+        sleep 0.5
+    done
+    echo "$resp"
+    return 1
+}
+
+if vbt_probe "vbttls.$VHOST_DOMAIN" "vbt-https-ok" >/dev/null; then
+    pass "T-VBT-NETNS-SSH backend-tls=on serves the self-signed HTTPS backend"
+else
+    fail "T-VBT-NETNS-SSH backend-tls=on failed (expected vbt-https-ok): $(http_check "vbttls.$VHOST_DOMAIN")"
+fi
+
+if vbt_probe "vbtplain.$VHOST_DOMAIN" "vbt-plain-ok" >/dev/null; then
+    pass "T-VBT-NETNS-SSH no-flag plaintext backend still serves 200"
+else
+    fail "T-VBT-NETNS-SSH plaintext regression (expected vbt-plain-ok): $(http_check "vbtplain.$VHOST_DOMAIN")"
+fi
+kill -9 "$VBT_TLS_SSH" "$VBT_PLAIN_SSH" 2>/dev/null || true
+wait "$VBT_TLS_SSH" "$VBT_PLAIN_SSH" 2>/dev/null || true
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""

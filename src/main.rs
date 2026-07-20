@@ -399,6 +399,18 @@ enum Command {
         #[clap(long, env = "BORE_INSECURE")]
         insecure: bool,
 
+        /// Connect to the local backend over TLS (accepts a self-signed cert).
+        /// Use when the tunnelled service is itself HTTPS (e.g.
+        /// `https://localhost:3005`). The server originates a TLS session to the
+        /// backend; backend certificate verification is skipped.
+        #[clap(long, env = "BORE_BACKEND_TLS")]
+        backend_tls: bool,
+
+        /// SNI/hostname sent to the TLS backend (default: localhost).
+        /// Only meaningful with --backend-tls.
+        #[clap(long, value_name = "NAME", env = "BORE_BACKEND_TLS_SNI")]
+        backend_tls_sni: Option<String>,
+
         /// Per-subdomain HTTPS policy: `off` | `on` | `redirect`. Bare `--https` = on.
         /// `off` = served over HTTP, never force-redirect; `on` = served over HTTPS
         /// (via the server wildcard cert), no redirect; `redirect` = 308-redirect
@@ -1588,6 +1600,10 @@ async fn dispatch(command: Command) -> Result<()> {
                         // Secret providers have no HTTPS policy (secret has no vhost
                         // frontend). Vhost providers set this from the CLI in phase 3.
                         https_policy: None,
+                        // Backend TLS is a vhost-only concern; secret providers
+                        // never originate TLS to the local backend.
+                        backend_tls: false,
+                        backend_tls_sni: None,
                     };
                     let gather = bore_cli::holepunch::GatherOptions {
                         port_map: upnp,
@@ -2325,6 +2341,8 @@ async fn dispatch(command: Command) -> Result<()> {
             to,
             secret,
             insecure,
+            backend_tls,
+            backend_tls_sni,
             https,
             notes,
             basic_auth,
@@ -2343,6 +2361,10 @@ async fn dispatch(command: Command) -> Result<()> {
                 auto_reconnect,
                 // Per-subdomain HTTPS policy from `--https`. None = inherit --vhost-mode.
                 https_policy: https,
+                // Backend TLS origination (`--backend-tls` / `--backend-tls-sni`):
+                // tunnel to a local HTTPS backend, server-side TLS client.
+                backend_tls,
+                backend_tls_sni,
             };
 
             // Build access logger for vhost provider.
@@ -2818,6 +2840,57 @@ mod tests {
                 max_direct_streams: 512,
             }
         );
+    }
+
+    #[test]
+    fn vhost_backend_tls_flags_parse() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let args = Args::parse_from([
+            "bore",
+            "vhost",
+            "localhost:3005",
+            "--subdomain",
+            "app",
+            "--id",
+            "c1",
+            "--backend-tls",
+            "--backend-tls-sni",
+            "app.internal",
+        ]);
+        let Command::Vhost {
+            backend_tls,
+            backend_tls_sni,
+            ..
+        } = args.command
+        else {
+            panic!("expected vhost command");
+        };
+        assert!(backend_tls);
+        assert_eq!(backend_tls_sni.as_deref(), Some("app.internal"));
+    }
+
+    #[test]
+    fn vhost_backend_tls_defaults_off() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let args = Args::parse_from([
+            "bore",
+            "vhost",
+            "localhost:3000",
+            "--subdomain",
+            "app",
+            "--id",
+            "c1",
+        ]);
+        let Command::Vhost {
+            backend_tls,
+            backend_tls_sni,
+            ..
+        } = args.command
+        else {
+            panic!("expected vhost command");
+        };
+        assert!(!backend_tls);
+        assert!(backend_tls_sni.is_none());
     }
 
     #[test]

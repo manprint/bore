@@ -184,6 +184,8 @@ async fn admin_data_reflects_live_tunnels() -> Result<()> {
             basic_auth: None,
             auto_reconnect: false,
             https_policy: None,
+            backend_tls: false,
+            backend_tls_sni: None,
         },
         None,
     )

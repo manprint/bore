@@ -1007,6 +1007,12 @@ impl Client {
                                 warn!("unexpected public udp offer");
                             }
                         }
+                        Some(ServerMessage::SshJumpReady { .. }) => {
+                            warn!("unexpected ssh jump ready")
+                        }
+                        Some(ServerMessage::SshJumpUdp { .. }) => {
+                            warn!("unexpected ssh jump udp offer")
+                        }
                         Some(ServerMessage::VpnReady { .. }) => warn!("unexpected vpn ready"),
                         Some(ServerMessage::VpnError(err)) => error!(%err, "vpn error"),
                         Some(ServerMessage::VpnPeerJoin { .. }) => warn!("unexpected vpn peer join in 1:1 mode"),

@@ -483,6 +483,7 @@ impl SshGateway {
             gateway: Arc::clone(self),
             peer,
             grant: None,
+            jump_principal: None,
             state: Arc::new(ConnState::default()),
         }
     }
@@ -781,6 +782,9 @@ pub struct GatewayHandler {
     /// synthesized unrestricted grant for a password match). `None` until
     /// authenticated.
     grant: Option<KeyGrant>,
+    /// Exact username bound to the successful credential for new jump-only
+    /// operations. Existing modes continue to use `grant` alone.
+    jump_principal: Option<String>,
     /// Shared with every forward task spawned on this connection.
     state: Arc<ConnState>,
 }
@@ -790,6 +794,12 @@ impl GatewayHandler {
     /// comment/fingerprint, or the matched password label).
     pub fn identity(&self) -> Option<&str> {
         self.grant.as_ref().map(|grant| grant.identity.as_str())
+    }
+
+    /// Classic username bound to this connection for jump-only operations.
+    /// A legacy-authenticated username mismatch intentionally returns `None`.
+    pub fn jump_principal(&self) -> Option<&str> {
+        self.jump_principal.as_deref()
     }
 
     /// This connection's grant, or an unrestricted placeholder if somehow
@@ -1590,33 +1600,35 @@ impl Handler for GatewayHandler {
 
     async fn auth_publickey(
         &mut self,
-        _user: &str,
+        user: &str,
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
         let Some(keys) = &self.gateway.keys else {
             return Ok(Auth::reject());
         };
-        match keys.check(public_key) {
-            Some(grant) => {
-                self.grant = Some(grant);
+        match keys.check_for_user(public_key, user) {
+            Some(matched) => {
+                self.grant = Some(matched.grant);
+                self.jump_principal = matched.jump_principal;
                 Ok(Auth::Accept)
             }
             None => Ok(Auth::reject()),
         }
     }
 
-    async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         let Some(passwords) = &self.gateway.passwords else {
             return Ok(Auth::reject());
         };
-        match passwords.check(password).await {
-            Some(label) => {
+        match passwords.check_for_user(password, user).await {
+            Some(matched) => {
                 self.grant = Some(KeyGrant {
-                    identity: label,
+                    identity: matched.identity,
                     permit: None,
                     max_conns: None,
                     notes: None,
                 });
+                self.jump_principal = matched.jump_principal;
                 Ok(Auth::Accept)
             }
             None => Ok(Auth::reject()),
@@ -3770,6 +3782,68 @@ mod tests {
             None,
             "no banner configured must send nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn ssh_jump_handler_key_binding_is_separate_from_legacy_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys_dir = dir.path().join("keys");
+        std::fs::create_dir(&keys_dir).unwrap();
+        let raw = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgb/HlWS8uHpiobSm01har7Rq9zHceSet95iZUVd/+b key-comment";
+        std::fs::write(keys_dir.join("fabio"), format!("{raw}\n")).unwrap();
+        let mut cfg = base_config(dir.path());
+        cfg.authorized_keys_dir = Some(keys_dir);
+        let gateway = Arc::new(build(cfg).unwrap());
+        let key = PublicKey::from_openssh(raw).unwrap();
+
+        let mut matched = gateway.handler("127.0.0.1:2222".parse().unwrap());
+        assert!(matches!(
+            matched.auth_publickey("fabio", &key).await.unwrap(),
+            Auth::Accept
+        ));
+        assert_eq!(matched.identity(), Some("key-comment"));
+        assert_eq!(matched.jump_principal(), Some("fabio"));
+
+        let mut mismatch = gateway.handler("127.0.0.1:2223".parse().unwrap());
+        assert!(matches!(
+            mismatch.auth_publickey("wrong", &key).await.unwrap(),
+            Auth::Accept
+        ));
+        assert_eq!(mismatch.identity(), Some("key-comment"));
+        assert_eq!(mismatch.jump_principal(), None);
+    }
+
+    #[tokio::test]
+    async fn ssh_jump_handler_password_binding_is_separate_from_legacy_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwords = dir.path().join("passwords");
+        let hash = crate::sshgw_auth::hash_password("correct-password").unwrap();
+        std::fs::write(&passwords, format!("fabio:{hash}\n")).unwrap();
+        let mut cfg = base_config(dir.path());
+        cfg.passwords_file = Some(passwords);
+        let gateway = Arc::new(build(cfg).unwrap());
+
+        let mut matched = gateway.handler("127.0.0.1:2222".parse().unwrap());
+        assert!(matches!(
+            matched
+                .auth_password("fabio", "correct-password")
+                .await
+                .unwrap(),
+            Auth::Accept
+        ));
+        assert_eq!(matched.identity(), Some("fabio"));
+        assert_eq!(matched.jump_principal(), Some("fabio"));
+
+        let mut mismatch = gateway.handler("127.0.0.1:2223".parse().unwrap());
+        assert!(matches!(
+            mismatch
+                .auth_password("wrong", "correct-password")
+                .await
+                .unwrap(),
+            Auth::Accept
+        ));
+        assert_eq!(mismatch.identity(), Some("fabio"));
+        assert_eq!(mismatch.jump_principal(), None);
     }
 
     #[test]

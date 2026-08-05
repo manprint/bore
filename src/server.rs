@@ -241,6 +241,18 @@ pub struct Server {
     /// Registry of live vhost providers, keyed by subdomain label.
     vhost_registry: VhostRegistry,
 
+    /// Future SSH jump namespace; remains disabled and unset in Phase 1.
+    #[allow(dead_code)]
+    ssh_jump_base_domain: Option<String>,
+
+    /// Future SSH jump provider registry; no production path writes it in Phase 1.
+    #[allow(dead_code)]
+    ssh_jump_registry: crate::ssh_jump::SshJumpRegistry,
+
+    /// Future native jump direct-path nonces; empty throughout Phase 1.
+    #[allow(dead_code)]
+    pending_ssh_jump_udp: crate::ssh_jump::PendingSshJumpUdp,
+
     /// Hot-swappable vhost config; `None` when vhost is not configured.
     vhost_config: Option<vhost::SharedVhostConfig>,
 
@@ -365,6 +377,9 @@ impl Server {
             admin_token: None,
             control_hsts: Some(DEFAULT_CONTROL_HSTS.to_string()),
             vhost_registry: VhostRegistry::default(),
+            ssh_jump_base_domain: None,
+            ssh_jump_registry: crate::ssh_jump::SshJumpRegistry::default(),
+            pending_ssh_jump_udp: crate::ssh_jump::PendingSshJumpUdp::default(),
             vhost_config: None,
             vhost_tls: Arc::new(std::sync::RwLock::new(None)),
             vhost_quic_port: 443,
@@ -433,6 +448,8 @@ impl Server {
                 vhost_cert_file: None,
                 tls: false,
                 ssh_gateway: false,
+                ssh_jump_enabled: false,
+                ssh_jump_base_domain: None,
                 ssh_port: None,
                 ssh_advertise_address: None,
                 ssh_advertise_port: None,
@@ -1708,6 +1725,15 @@ impl Server {
                 )
                 .await
             }
+            Some(ClientMessage::HelloSshJump { .. }) => {
+                warn!(%peer, "ssh jump registration received while Phase 1 service is disabled");
+                let _ = control
+                    .send(ServerMessage::Error(
+                        "SSH jump host service is not configured".into(),
+                    ))
+                    .await;
+                Ok(())
+            }
             Some(ClientMessage::Authenticate(_)) => {
                 warn!("unexpected authenticate");
                 Ok(())
@@ -1720,7 +1746,8 @@ impl Server {
             | Some(ClientMessage::UdpCandidateOffer(_))
             | Some(ClientMessage::UdpStunHintRequest)
             | Some(ClientMessage::VhostUdpRenew { .. })
-            | Some(ClientMessage::PublicUdpRenew { .. }) => {
+            | Some(ClientMessage::PublicUdpRenew { .. })
+            | Some(ClientMessage::SshJumpUdpRenew { .. }) => {
                 warn!("unexpected udp renewal as first message");
                 Ok(())
             }
@@ -2351,5 +2378,20 @@ mod tests {
         // Saturation: rate when saturating an interval.
         // 1 MB in 1s = 1,000,000 B/s.
         assert_eq!(compute_rate_bps(0, 1_000_000, 1000), 1_000_000);
+    }
+
+    #[test]
+    fn ssh_jump_phase_one_scaffolding_is_disabled_and_empty() {
+        let server = Server::new(1024..=65535, Some("must-not-leak"));
+        assert_eq!(server.ssh_jump_base_domain, None);
+        assert!(server.ssh_jump_registry.is_empty());
+        assert!(server.pending_ssh_jump_udp.is_empty());
+
+        let view = server.config_view();
+        let config = serde_json::to_value(view.as_ref()).unwrap();
+        assert_eq!(config["ssh_jump_enabled"], false);
+        assert!(config["ssh_jump_base_domain"].is_null());
+        assert!(config.get("secret").is_none());
+        assert!(!config.to_string().contains("must-not-leak"));
     }
 }

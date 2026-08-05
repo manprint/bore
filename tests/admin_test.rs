@@ -466,6 +466,8 @@ fn t_views_serialize_stable() {
         vhost_cert_file: None,
         tls: false,
         ssh_gateway: false,
+        ssh_jump_enabled: false,
+        ssh_jump_base_domain: None,
         ssh_port: None,
         ssh_advertise_address: None,
         ssh_advertise_port: None,

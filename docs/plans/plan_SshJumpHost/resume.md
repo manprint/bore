@@ -12,8 +12,48 @@
   acceptance contract for native and pure-OpenSSH providers.
 - Planning documents validated for balanced code fences, trailing whitespace,
   required files and port-topology consistency.
-- Application implementation has not started.
-- No tests were run because this turn changed planning documentation only.
+- Phase 1 implemented and green. Phase 2 has not started.
+- No `sshjhost` command or server flag is exposed yet; a Phase 1 regression
+  test pins that intentional boundary.
+- No commit was created by the implementation agent; the owner will review and
+  commit this phase.
+
+## Phase 1 checkpoint
+
+- Added bounded, validated SSH-jump protocol messages before the load-bearing
+  final client `Heartbeat` variant, with round-trip, frame-size, redaction and
+  old-peer rejection coverage.
+- Added internal alias/hostname/port contracts, registration metadata, jump
+  registry, namespaced pending-QUIC nonce state and replacement-safe RAII
+  teardown scaffolding. All production registration/routing remains disabled.
+- Added disabled/sanitized config-view fields. Existing server constructors use
+  `None`/`false`, registries start empty and the bore secret is never exposed.
+- Added jump-only classic credential metadata:
+  - public-key binding comes only from an exact `<user>` or `<user>.pub`
+    directory-entry filename;
+  - password binding comes only from an exact password-file label;
+  - existing username-agnostic SSH gateway Accept/Reject and grant identity
+    semantics remain unchanged for every legacy operation;
+  - key comments never become jump principals;
+  - both stores retain their current per-attempt hot reload behavior.
+- Added target-resolution coverage for standard/nonstandard ports and IPv6,
+  alias/routing grammar tables, stale-guard ownership tests and handler-level
+  separation between legacy grant identity and jump principal.
+- README remains unchanged in Phase 1 because no command, flag or usable
+  behavior/API is exposed yet, as required by `phase_01.md`.
+
+## Phase 1 gates
+
+Run on 2026-08-05 with all features:
+
+- `cargo fmt --all -- --check` — pass.
+- `cargo clippy --all-targets --all-features -- -D warnings` — pass.
+- `cargo test --all-features ssh_jump` — pass: 17 focused tests, 0 failed.
+- `cargo test --all-features` — pass: 884 passed, 0 failed, 2 ignored
+  (the existing root/CAP_NET_ADMIN-only tests).
+- Extra compatibility check:
+  `cargo test --no-default-features ssh_jump --no-fail-fast` — pass: 10
+  focused tests, 0 failed.
 
 ## Locked configuration
 
@@ -37,5 +77,6 @@
 
 ## Next
 
-Await explicit owner approval to begin `phase_01.md` §1.1 (red CLI and hostname
-grammar tests). Do not begin implementation automatically.
+Stop at the green Phase 1 boundary. Await the owner's review/commit and an
+explicit instruction before beginning `phase_02.md`; do not begin Phase 2
+automatically.

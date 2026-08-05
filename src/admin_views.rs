@@ -373,6 +373,10 @@ pub struct ConfigView {
     pub tls: bool,
     /// SSH gateway enabled.
     pub ssh_gateway: bool,
+    /// SSH jump-host routing enabled. Phase 1 always reports false.
+    pub ssh_jump_enabled: bool,
+    /// SSH jump base domain. Phase 1 always reports `None`.
+    pub ssh_jump_base_domain: Option<String>,
     /// SSH gateway listen port (if enabled).
     pub ssh_port: Option<u16>,
     /// SSH advertised address (if configured).
@@ -552,6 +556,8 @@ mod tests {
             vhost_cert_file: Some("/certs/fullchain.pem".into()),
             tls: true,
             ssh_gateway: false,
+            ssh_jump_enabled: false,
+            ssh_jump_base_domain: None,
             ssh_port: None,
             ssh_advertise_address: None,
             ssh_advertise_port: None,
@@ -736,6 +742,8 @@ mod tests {
             vhost_cert_file: None,
             tls: false,
             ssh_gateway: false,
+            ssh_jump_enabled: false,
+            ssh_jump_base_domain: None,
             ssh_port: None,
             ssh_advertise_address: None,
             ssh_advertise_port: None,

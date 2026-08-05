@@ -39,6 +39,26 @@ pub struct KeyGrant {
     pub notes: Option<String>,
 }
 
+/// Public-key authentication result with jump-only classic account metadata.
+/// The legacy grant remains exactly the result used by every existing mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyAuthMatch {
+    /// Existing comment/fingerprint identity and authorized-key options.
+    pub grant: KeyGrant,
+    /// Presented username when the matching key also lives in `<user>` or
+    /// `<user>.pub`; `None` for a legacy-only username mismatch.
+    pub jump_principal: Option<String>,
+}
+
+/// Password authentication result with jump-only classic account metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswordAuthMatch {
+    /// Existing first matching password-file label.
+    pub identity: String,
+    /// Presented username when its exact label also verifies this password.
+    pub jump_principal: Option<String>,
+}
+
 /// One parsed, cached authorized-keys line.
 #[derive(Debug, Clone)]
 struct ParsedKey {
@@ -155,13 +175,16 @@ fn parse_file(path: &Path) -> Vec<ParsedKey> {
     parsed
 }
 
+type ParsedKeyCache = HashMap<PathBuf, (SystemTime, Vec<ParsedKey>)>;
+type ParsedKeyCacheGuard<'a> = std::sync::MutexGuard<'a, ParsedKeyCache>;
+
 /// Hot-reloading directory of `authorized_keys`-format files. [`KeyStore::check`]
 /// re-scans the directory every call, re-parsing only files whose mtime
 /// changed since the last check (an idle directory costs one `read_dir` plus
 /// one `stat` per file per check).
 pub struct KeyStore {
     dir: PathBuf,
-    cache: Mutex<HashMap<PathBuf, (SystemTime, Vec<ParsedKey>)>>,
+    cache: Mutex<ParsedKeyCache>,
     /// Counts calls to [`parse_file`], test-only so `keystore_mtime_cache` can
     /// assert an unchanged mtime never triggers a re-parse.
     #[cfg(test)]
@@ -179,9 +202,7 @@ impl KeyStore {
         }
     }
 
-    /// Check an offered public key against every entry in the directory.
-    /// Returns the first matching grant, or `None` if nothing grants it.
-    pub fn check(&self, offered: &PublicKey) -> Option<KeyGrant> {
+    fn refresh(&self) -> Option<ParsedKeyCacheGuard<'_>> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return None;
         };
@@ -214,14 +235,57 @@ impl KeyStore {
         }
         cache.retain(|path, _| seen.contains(path));
 
+        Some(cache)
+    }
+
+    fn grant(key: &ParsedKey) -> KeyGrant {
+        KeyGrant {
+            identity: key.identity.clone(),
+            permit: key.permit.clone(),
+            max_conns: key.max_conns,
+            notes: key.notes.clone(),
+        }
+    }
+
+    fn filename_account(path: &Path) -> Option<&str> {
+        let name = path.file_name()?.to_str()?;
+        match path.extension() {
+            Some(ext) if ext == "pub" => name.strip_suffix(".pub"),
+            None => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Check an offered public key against every entry in the directory.
+    /// Returns the first matching grant, or `None` if nothing grants it.
+    pub fn check(&self, offered: &PublicKey) -> Option<KeyGrant> {
+        let cache = self.refresh()?;
+
         let offered_data = offered.key_data();
-        cache.values().flat_map(|(_, keys)| keys).find_map(|key| {
-            (&key.key_data == offered_data).then(|| KeyGrant {
-                identity: key.identity.clone(),
-                permit: key.permit.clone(),
-                max_conns: key.max_conns,
-                notes: key.notes.clone(),
-            })
+        cache
+            .values()
+            .flat_map(|(_, keys)| keys)
+            .find(|key| &key.key_data == offered_data)
+            .map(Self::grant)
+    }
+
+    /// Authenticate with legacy key semantics and independently determine
+    /// whether the key is bound to the exact presented username for jump use.
+    pub fn check_for_user(&self, offered: &PublicKey, username: &str) -> Option<KeyAuthMatch> {
+        let cache = self.refresh()?;
+        let offered_data = offered.key_data();
+        let grant = cache
+            .values()
+            .flat_map(|(_, keys)| keys)
+            .find(|key| &key.key_data == offered_data)
+            .map(Self::grant)?;
+        let bound = cache.iter().any(|(path, (_, keys))| {
+            Self::filename_account(path) == Some(username)
+                && keys.iter().any(|key| &key.key_data == offered_data)
+        });
+        Some(KeyAuthMatch {
+            grant,
+            jump_principal: bound.then(|| username.to_string()),
         })
     }
 }
@@ -301,9 +365,11 @@ impl PasswordStore {
         Some(cache.1.clone())
     }
 
-    /// Verify `password` against every stored hash; returns the label of the
-    /// first match, or `None`.
-    pub async fn check(&self, password: &str) -> Option<String> {
+    async fn verify_lines<R, F>(&self, verify: F) -> Option<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(Vec<(String, String)>) -> R + Send + 'static,
+    {
         let lines = self.load()?;
         let _permit = self.verify_permits.acquire().await.ok()?;
 
@@ -313,21 +379,64 @@ impl PasswordStore {
             self.peak_verifies.fetch_max(active, Ordering::SeqCst);
         }
 
+        let result = tokio::task::spawn_blocking(move || verify(lines))
+            .await
+            .ok();
+
+        #[cfg(test)]
+        self.active_verifies.fetch_sub(1, Ordering::SeqCst);
+
+        result
+    }
+
+    /// Verify `password` against every stored hash; returns the label of the
+    /// first match, or `None`.
+    pub async fn check(&self, password: &str) -> Option<String> {
         let password = password.to_string();
-        let result = tokio::task::spawn_blocking(move || {
+        self.verify_lines(move |lines| {
             lines
                 .into_iter()
                 .find(|(_, hash)| verify_argon2id(&password, hash))
                 .map(|(label, _)| label)
         })
         .await
-        .ok()
-        .flatten();
+        .flatten()
+    }
 
-        #[cfg(test)]
-        self.active_verifies.fetch_sub(1, Ordering::SeqCst);
-
-        result
+    /// Authenticate with legacy password semantics and independently determine
+    /// whether the exact presented username label verifies for jump use.
+    pub async fn check_for_user(
+        &self,
+        password: &str,
+        username: &str,
+    ) -> Option<PasswordAuthMatch> {
+        let password = password.to_string();
+        let username = username.to_string();
+        self.verify_lines(move |lines| {
+            let mut identity = None;
+            let mut bound = false;
+            for (label, hash) in lines {
+                let needs_legacy_match = identity.is_none();
+                let needs_exact_match = !bound && label == username;
+                if (needs_legacy_match || needs_exact_match) && verify_argon2id(&password, &hash) {
+                    if identity.is_none() {
+                        identity = Some(label.clone());
+                    }
+                    if label == username {
+                        bound = true;
+                    }
+                }
+                if identity.is_some() && bound {
+                    break;
+                }
+            }
+            identity.map(|identity| PasswordAuthMatch {
+                identity,
+                jump_principal: bound.then_some(username),
+            })
+        })
+        .await
+        .flatten()
     }
 }
 
@@ -473,6 +582,60 @@ mod tests {
         assert_eq!(grant.identity, "alice@example.com");
     }
 
+    #[test]
+    fn ssh_jump_key_binding_requires_exact_username_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fabio"), format!("{KEY_WITH_COMMENT}\n")).unwrap();
+
+        let store = KeyStore::new(dir.path().to_path_buf());
+        let offered = PublicKey::from_openssh(KEY_WITH_COMMENT).unwrap();
+        let matched = store
+            .check_for_user(&offered, "fabio")
+            .expect("legacy key authentication must succeed");
+        assert_eq!(matched.grant.identity, "alice@example.com");
+        assert_eq!(matched.jump_principal.as_deref(), Some("fabio"));
+
+        let mismatch = store
+            .check_for_user(&offered, "wrong")
+            .expect("legacy key authentication must ignore username");
+        assert_eq!(mismatch.grant.identity, "alice@example.com");
+        assert_eq!(mismatch.jump_principal, None);
+    }
+
+    #[test]
+    fn ssh_jump_key_binding_supports_pub_suffix_and_multiple_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fabio.pub"),
+            format!("{KEY_WITH_COMMENT}\n{KEY_NO_COMMENT}\n"),
+        )
+        .unwrap();
+        let store = KeyStore::new(dir.path().to_path_buf());
+
+        for raw in [KEY_WITH_COMMENT, KEY_NO_COMMENT] {
+            let offered = PublicKey::from_openssh(raw).unwrap();
+            let matched = store.check_for_user(&offered, "fabio").unwrap();
+            assert_eq!(matched.jump_principal.as_deref(), Some("fabio"));
+        }
+    }
+
+    #[test]
+    fn ssh_jump_generic_key_file_remains_legacy_only_and_hot_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let generic = dir.path().join("team.pub");
+        std::fs::write(&generic, format!("{KEY_WITH_COMMENT}\n")).unwrap();
+        let store = KeyStore::new(dir.path().to_path_buf());
+        let offered = PublicKey::from_openssh(KEY_WITH_COMMENT).unwrap();
+
+        let legacy = store.check_for_user(&offered, "fabio").unwrap();
+        assert_eq!(legacy.jump_principal, None);
+
+        std::fs::remove_file(generic).unwrap();
+        std::fs::write(dir.path().join("fabio"), format!("{KEY_WITH_COMMENT}\n")).unwrap();
+        let rebound = store.check_for_user(&offered, "fabio").unwrap();
+        assert_eq!(rebound.jump_principal.as_deref(), Some("fabio"));
+    }
+
     #[tokio::test]
     async fn hash_password_roundtrip() {
         let hash = hash_password("correct horse battery staple").unwrap();
@@ -568,6 +731,58 @@ mod tests {
         assert!(
             peak <= PASSWORD_VERIFY_CONCURRENCY,
             "peak concurrency {peak} exceeded cap {PASSWORD_VERIFY_CONCURRENCY}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_jump_password_binding_requires_exact_username_label() {
+        let hash = hash_password("correct-password").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passwords");
+        std::fs::write(&path, format!("fabio:{hash}\n")).unwrap();
+        let store = PasswordStore::new(path);
+
+        let matched = store
+            .check_for_user("correct-password", "fabio")
+            .await
+            .expect("legacy password authentication must succeed");
+        assert_eq!(matched.identity, "fabio");
+        assert_eq!(matched.jump_principal.as_deref(), Some("fabio"));
+
+        let mismatch = store
+            .check_for_user("correct-password", "wrong")
+            .await
+            .expect("legacy password authentication must ignore username");
+        assert_eq!(mismatch.identity, "fabio");
+        assert_eq!(mismatch.jump_principal, None);
+    }
+
+    #[tokio::test]
+    async fn ssh_jump_password_binding_hot_reloads_without_new_store() {
+        let hash = hash_password("correct-password").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passwords");
+        std::fs::write(&path, format!("legacy:{hash}\n")).unwrap();
+        let store = PasswordStore::new(path.clone());
+
+        assert_eq!(
+            store
+                .check_for_user("correct-password", "fabio")
+                .await
+                .unwrap()
+                .jump_principal,
+            None,
+        );
+
+        std::fs::write(&path, format!("fabio:{hash}\n# reloaded\n")).unwrap();
+        assert_eq!(
+            store
+                .check_for_user("correct-password", "fabio")
+                .await
+                .unwrap()
+                .jump_principal
+                .as_deref(),
+            Some("fabio"),
         );
     }
 }

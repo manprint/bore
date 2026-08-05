@@ -1456,6 +1456,8 @@ impl Proxy {
                         Some(ServerMessage::TestUdpWaiting) => warn!("unexpected udp diagnostic wait"),
                         Some(ServerMessage::TestUdpStart { .. }) => warn!("unexpected udp diagnostic start"),
                         Some(ServerMessage::PublicUdp { .. }) => warn!("unexpected public udp offer"),
+                        Some(ServerMessage::SshJumpReady { .. }) => warn!("unexpected ssh jump ready"),
+                        Some(ServerMessage::SshJumpUdp { .. }) => warn!("unexpected ssh jump udp offer"),
                         Some(ServerMessage::VhostReady { .. }) => warn!("unexpected vhost ready"),
                         Some(ServerMessage::VpnReady { .. }) => warn!("unexpected vpn ready"),
                         Some(ServerMessage::VpnError(err)) => error!(%err, "vpn error"),

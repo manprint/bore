@@ -35,6 +35,7 @@ pub mod reconnect;
 pub mod secret;
 pub mod server;
 pub mod shared;
+pub mod ssh_jump;
 #[cfg(feature = "ssh-gateway")]
 pub mod sshgw;
 #[cfg(feature = "ssh-gateway")]

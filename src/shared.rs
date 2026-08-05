@@ -1320,6 +1320,37 @@ pub enum ClientMessage {
         path: String,
     },
 
+    /// Register a native provider for one namespaced SSH jump target.
+    HelloSshJump {
+        /// Single-label alias below the configured SSH jump base domain.
+        alias: String,
+        /// Virtual destination port; equal to the local target port in v1.
+        ssh_port: u16,
+        /// Optional operator note shown on the admin status page.
+        notes: Option<String>,
+        /// Requested number of warm TCP/direct carriers.
+        #[serde(default)]
+        carriers: u16,
+        /// Whether the native provider requests server-direct QUIC.
+        #[serde(default)]
+        udp: bool,
+        /// Whether the native provider runs with automatic reconnect.
+        #[serde(default)]
+        auto_reconnect: bool,
+        /// Provider-local target host (display-only server metadata).
+        #[serde(default)]
+        local_host: String,
+        /// Provider-local target port; equal to `ssh_port` in v1.
+        #[serde(default)]
+        local_port: u16,
+    },
+
+    /// Ask the server for a fresh direct-path nonce for one SSH jump provider.
+    SshJumpUdpRenew {
+        /// Alias whose native direct path should be renewed.
+        alias: String,
+    },
+
     /// Periodic liveness ping from a secret provider/consumer control loop. The
     /// control channel is a yamux substream, so a half-open/abandoned peer is
     /// invisible to the server's `send`/`recv` (send buffers, recv blocks). This
@@ -1427,6 +1458,25 @@ pub enum ServerMessage {
         /// Server UDP port to dial for the QUIC direct path.
         port: u16,
         /// Session nonce; server and client derive the same token from it + secret.
+        nonce: [u8; UDP_NONCE_LEN],
+        /// Direct-UDP transport tuning requested by the server.
+        #[serde(default)]
+        tuning: UdpDirectTuning,
+    },
+
+    /// Acknowledge a native SSH jump registration.
+    SshJumpReady {
+        /// Complete virtual hostname advertised to operators.
+        hostname: String,
+        /// Virtual SSH destination port.
+        port: u16,
+    },
+
+    /// Offer the shared server-direct QUIC endpoint to a native jump provider.
+    SshJumpUdp {
+        /// Existing shared vhost/public/jump UDP endpoint port.
+        port: u16,
+        /// Session nonce used with the bore secret to derive a direct token.
         nonce: [u8; UDP_NONCE_LEN],
         /// Direct-UDP transport tuning requested by the server.
         #[serde(default)]
@@ -1653,6 +1703,28 @@ impl ControlFrameSummary for ClientMessage {
             ClientMessage::VpnPathReport { path } => {
                 format!("VpnPathReport {{ path={} }}", path)
             }
+            ClientMessage::HelloSshJump {
+                alias,
+                ssh_port,
+                notes,
+                carriers,
+                udp,
+                auto_reconnect,
+                ..
+            } => {
+                format!(
+                    "HelloSshJump {{ alias={}, ssh_port={}, notes={}, carriers={}, udp={}, auto_reconnect={} }}",
+                    alias,
+                    ssh_port,
+                    if notes.is_some() { "present" } else { "none" },
+                    carriers,
+                    if *udp { "on" } else { "off" },
+                    if *auto_reconnect { "on" } else { "off" },
+                )
+            }
+            ClientMessage::SshJumpUdpRenew { alias } => {
+                format!("SshJumpUdpRenew {{ alias={} }}", alias)
+            }
             ClientMessage::Heartbeat => "Heartbeat".to_string(),
         }
     }
@@ -1737,6 +1809,20 @@ impl ControlFrameSummary for ServerMessage {
                     "PublicUdp {{ port={}, nonce={}, tuning={{ {} }} }}",
                     port,
                     hex::encode(nonce),
+                    tuning.control_frame_summary(),
+                )
+            }
+            ServerMessage::SshJumpReady { hostname, port } => {
+                format!("SshJumpReady {{ hostname={}, port={} }}", hostname, port)
+            }
+            ServerMessage::SshJumpUdp {
+                port,
+                nonce: _,
+                tuning,
+            } => {
+                format!(
+                    "SshJumpUdp {{ port={}, nonce=<redacted>, tuning={{ {} }} }}",
+                    port,
                     tuning.control_frame_summary(),
                 )
             }
@@ -2817,6 +2903,106 @@ fn t_wire_heartbeat_roundtrip() {
     // A pre-existing variant still decodes unchanged alongside the new one.
     let auth: ClientMessage = serde_json::from_str(r#"{"Authenticate":"tok"}"#).unwrap();
     assert!(matches!(auth, ClientMessage::Authenticate(_)));
+}
+
+#[test]
+fn ssh_jump_wire_roundtrip_bounds_and_redaction() {
+    let notes = "🦀".repeat(MAX_NOTES_LEN);
+    let local_host = "h".repeat(crate::ssh_jump::MAX_LOCAL_HOST_LEN);
+    let hello = ClientMessage::HelloSshJump {
+        alias: "a".repeat(crate::ssh_jump::MAX_ALIAS_LEN),
+        ssh_port: 2222,
+        notes: Some(notes.clone()),
+        carriers: u16::MAX,
+        udp: true,
+        auto_reconnect: true,
+        local_host: local_host.clone(),
+        local_port: 2222,
+    };
+    let encoded = serde_json::to_vec(&hello).unwrap();
+    assert!(
+        encoded.len() < MAX_FRAME_LENGTH,
+        "worst-case HelloSshJump is {} bytes (limit {MAX_FRAME_LENGTH})",
+        encoded.len(),
+    );
+    let decoded: ClientMessage = serde_json::from_slice(&encoded).unwrap();
+    let validated = crate::ssh_jump::SshJumpRegistration::try_from(&decoded).unwrap();
+    assert_eq!(validated.ssh_port, 2222);
+    assert_eq!(validated.local_port, 2222);
+    let ClientMessage::HelloSshJump {
+        alias,
+        ssh_port,
+        notes: decoded_notes,
+        carriers,
+        udp,
+        auto_reconnect,
+        local_host: decoded_host,
+        local_port,
+    } = decoded
+    else {
+        panic!("unexpected SSH jump client-message variant");
+    };
+    assert_eq!(alias.len(), crate::ssh_jump::MAX_ALIAS_LEN);
+    assert_eq!(ssh_port, 2222);
+    assert_eq!(decoded_notes.as_deref(), Some(notes.as_str()));
+    assert_eq!(carriers, u16::MAX);
+    assert!(udp);
+    assert!(auto_reconnect);
+    assert_eq!(decoded_host, local_host);
+    assert_eq!(local_port, 2222);
+
+    let summary = hello.control_frame_summary();
+    assert!(summary.contains("notes=present"));
+    assert!(!summary.contains(&notes));
+    assert!(!summary.contains(&local_host));
+
+    let ready = ServerMessage::SshJumpReady {
+        hostname: "vm-test-01.ssh.bore.tld".to_string(),
+        port: 22,
+    };
+    let back: ServerMessage =
+        serde_json::from_str(&serde_json::to_string(&ready).unwrap()).unwrap();
+    assert!(matches!(back, ServerMessage::SshJumpReady { port: 22, .. }));
+
+    let udp = ServerMessage::SshJumpUdp {
+        port: 443,
+        nonce: [0xabu8; UDP_NONCE_LEN],
+        tuning: UdpDirectTuning::default(),
+    };
+    let summary = udp.control_frame_summary();
+    assert!(summary.contains("nonce=<redacted>"));
+    assert!(!summary.contains(&hex::encode([0xabu8; UDP_NONCE_LEN])));
+    let back: ServerMessage = serde_json::from_str(&serde_json::to_string(&udp).unwrap()).unwrap();
+    assert!(matches!(back, ServerMessage::SshJumpUdp { port: 443, .. }));
+}
+
+#[test]
+fn ssh_jump_unknown_to_legacy_peer_never_falls_back_to_another_mode() {
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    enum LegacyClientMessage {
+        Authenticate(String),
+        Hello(u16, TunnelOptions),
+        Heartbeat,
+    }
+
+    let hello = ClientMessage::HelloSshJump {
+        alias: "vm-test-01".to_string(),
+        ssh_port: 22,
+        notes: None,
+        carriers: 1,
+        udp: false,
+        auto_reconnect: false,
+        local_host: "localhost".to_string(),
+        local_port: 22,
+    };
+    let json = serde_json::to_string(&hello).unwrap();
+    let error = serde_json::from_str::<LegacyClientMessage>(&json)
+        .expect_err("an old server must reject the unknown jump registration");
+    assert!(error.to_string().contains("unknown variant"));
+    assert!(json.contains("HelloSshJump"));
+    assert!(!json.contains("HelloSecret"));
+    assert!(!json.starts_with("{\"Hello\":"));
 }
 
 #[test]

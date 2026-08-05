@@ -2297,6 +2297,8 @@ async fn dispatch(command: Command) -> Result<()> {
                     .map(|p| p.to_string_lossy().to_string()),
                 tls: config_tls,
                 ssh_gateway: false,
+                ssh_jump_enabled: false,
+                ssh_jump_base_domain: None,
                 ssh_port: None,
                 ssh_advertise_address: None,
                 ssh_advertise_port: None,
@@ -3371,6 +3373,39 @@ mod tests {
     fn resolve_local_target_rejects_malformed() {
         assert!(resolve_local_target("not-a-port-or-target", None).is_err());
         assert!(resolve_local_target("host:not-a-port", None).is_err());
+    }
+
+    #[test]
+    fn ssh_jump_target_contract_reuses_local_target_resolution() {
+        for (target, expected_host, expected_port) in [
+            ("localhost:22", "localhost", 22),
+            ("localhost:2222", "localhost", 2222),
+            ("[::1]:22", "::1", 22),
+        ] {
+            let (host, port) = resolve_local_target(target, None).unwrap();
+            assert_eq!(host, expected_host);
+            assert_eq!(port, expected_port);
+            assert!(bore_cli::ssh_jump::SshJumpRegistration::new(
+                "vm-test-01",
+                port,
+                None,
+                1,
+                false,
+                false,
+                &host,
+                port,
+            )
+            .is_ok());
+        }
+
+        assert!(resolve_local_target("localhost:22", Some("127.0.0.1")).is_err());
+    }
+
+    #[test]
+    fn ssh_jump_cli_is_not_exposed_in_phase_one() {
+        let error = Args::try_parse_from(["bore", "sshjhost", "localhost:22"])
+            .expect_err("Phase 1 must not expose an incomplete command");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
     #[test]

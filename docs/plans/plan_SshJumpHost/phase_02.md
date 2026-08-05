@@ -113,3 +113,25 @@ The phase is done only when a stock OpenSSH `ssh -J` command executes a command
 against the target `sshd` through both provider transports, classic-auth
 mismatch is jump-only/fail-closed, zombie/collision tests pass, and all existing
 SSH/secret regressions remain green.
+
+## Completion checkpoint — 2026-08-05
+
+**Status: complete/green.** A stock OpenSSH client executed commands against an
+in-process real SSH target through both a native `bore sshjhost` provider and a
+pure `ssh -R jump/...` provider. Key/password variants, inner authentication,
+nonstandard ports, multi-forward/takeover/collision and silent-provider reaping
+are covered by `tests/ssh_jump_test.rs`.
+
+Gate evidence:
+
+- fmt: pass;
+- Clippy all targets/features with `-D warnings`: pass;
+- `ssh_jump_test`: 4 passed;
+- `ssh_gateway_test`: 42 passed;
+- `secret_test`: 17 passed;
+- full all-features suite: 893 passed, 0 failed, 2 existing privileged tests
+  ignored;
+- no-default-features all-target check: pass with no warnings.
+
+No commit was created by the implementation agent. Phase 3 requires a new
+explicit owner instruction after review/commit.

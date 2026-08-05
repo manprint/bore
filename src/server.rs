@@ -178,6 +178,9 @@ pub struct Server {
     /// Limits the number of concurrently proxied connections per client.
     conn_permits: Arc<Semaphore>,
 
+    /// Configured per-client connection cap, retained for per-jump semaphores.
+    max_conns: usize,
+
     /// Maximum number of parallel TCP carrier connections a tunnel may use.
     max_carriers: u16,
 
@@ -241,16 +244,14 @@ pub struct Server {
     /// Registry of live vhost providers, keyed by subdomain label.
     vhost_registry: VhostRegistry,
 
-    /// Future SSH jump namespace; remains disabled and unset in Phase 1.
-    #[allow(dead_code)]
+    /// SSH jump namespace; `None` keeps every legacy path unchanged.
     ssh_jump_base_domain: Option<String>,
 
-    /// Future SSH jump provider registry; no production path writes it in Phase 1.
-    #[allow(dead_code)]
+    /// Live native and pure-OpenSSH jump providers, keyed by alias.
     ssh_jump_registry: crate::ssh_jump::SshJumpRegistry,
 
-    /// Future native jump direct-path nonces; empty throughout Phase 1.
-    #[allow(dead_code)]
+    /// Native jump direct-path nonces (unused until the QUIC phase).
+    #[cfg_attr(not(feature = "ssh-gateway"), allow(dead_code))]
     pending_ssh_jump_udp: crate::ssh_jump::PendingSshJumpUdp,
 
     /// Hot-swappable vhost config; `None` when vhost is not configured.
@@ -344,6 +345,10 @@ pub struct Server {
     /// [`secret::SECRET_CTRL_TIMEOUT`]; lowered by tests to reap fast.
     secret_ctrl_timeout: std::time::Duration,
 
+    /// Native SSH jump provider receive deadline. Separate from secret tunnels
+    /// so focused liveness tests never perturb an unrelated registry.
+    ssh_jump_ctrl_timeout: std::time::Duration,
+
     /// Embedded SSH ingress gateway (Phase 4), when enabled via `--ssh-gateway`.
     #[cfg(feature = "ssh-gateway")]
     ssh_gateway: Option<Arc<crate::sshgw::SshGateway>>,
@@ -357,6 +362,7 @@ impl Server {
         Server {
             port_range,
             conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
+            max_conns: DEFAULT_MAX_CONNS,
             max_carriers: DEFAULT_MAX_CARRIERS,
             udp_tuning: UdpDirectTuning::default(),
             udp_adaptive_plan: true,
@@ -461,6 +467,7 @@ impl Server {
             access_logger: None,
             access_logger_dropped: Arc::new(AtomicU64::new(0)),
             secret_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
+            ssh_jump_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
             #[cfg(feature = "ssh-gateway")]
             ssh_gateway: None,
         }
@@ -472,6 +479,33 @@ impl Server {
     pub fn secret_ctrl_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.secret_ctrl_timeout = timeout;
         self
+    }
+
+    /// Override native SSH jump provider liveness timeout (tests only).
+    pub fn ssh_jump_ctrl_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.ssh_jump_ctrl_timeout = timeout;
+        self
+    }
+
+    /// Configure the exact base domain used by OpenSSH `direct-tcpip` jump
+    /// destinations. Must be called before [`Server::set_ssh_gateway`].
+    pub fn set_ssh_jump_base_domain(&mut self, domain: Option<String>) -> Result<()> {
+        #[cfg(feature = "ssh-gateway")]
+        if self.ssh_gateway.is_some() {
+            anyhow::bail!("set SSH jump base domain before enabling the SSH gateway");
+        }
+        self.ssh_jump_base_domain = domain
+            .map(|domain| crate::ssh_jump::validate_base_domain(&domain))
+            .transpose()?;
+        let view = Arc::make_mut(&mut self.config_view);
+        view.ssh_jump_enabled = self.ssh_jump_base_domain.is_some();
+        view.ssh_jump_base_domain = self.ssh_jump_base_domain.clone();
+        Ok(())
+    }
+
+    /// Shared SSH jump registry (used by integration tests and the gateway).
+    pub fn ssh_jump_registry(&self) -> crate::ssh_jump::SshJumpRegistry {
+        self.ssh_jump_registry.clone()
     }
 
     /// Get the TCP port the control listener binds to.
@@ -509,6 +543,7 @@ impl Server {
     /// connection at once. See [`DEFAULT_MAX_CONNS`].
     pub fn set_max_conns(&mut self, max_conns: usize) {
         self.conn_permits = Arc::new(Semaphore::new(max_conns));
+        self.max_conns = max_conns;
     }
 
     /// Set the maximum number of parallel TCP carrier connections a single tunnel
@@ -839,10 +874,20 @@ impl Server {
     /// the exact same tunnel-serving state as the native accept paths.
     #[cfg(feature = "ssh-gateway")]
     pub fn set_ssh_gateway(&mut self, config: crate::sshgw::SshGatewayConfig) -> Result<()> {
+        let view_port = config.port;
+        let view_address = config.advertise_address.clone();
+        let view_advertise_port = config.advertise_port;
+        let view_pubkey = config.authorized_keys_dir.is_some();
+        let view_password = config.passwords_file.is_some();
+        let view_banner = config.banner.is_some();
+        let view_host_key = Some(config.host_key_file.to_string_lossy().to_string());
         let gateway = crate::sshgw::SshGateway::new(
             config,
             self.providers.clone(),
             self.vhost_registry.clone(),
+            self.ssh_jump_registry.clone(),
+            self.pending_ssh_jump_udp.clone(),
+            self.ssh_jump_base_domain.clone(),
             self.vhost_config.clone(),
             self.admin.clone(),
             Arc::clone(&self.conn_permits),
@@ -854,6 +899,15 @@ impl Server {
             self.bind_domain.clone(),
         )?;
         self.ssh_gateway = Some(Arc::new(gateway));
+        let view = Arc::make_mut(&mut self.config_view);
+        view.ssh_gateway = true;
+        view.ssh_port = view_port;
+        view.ssh_advertise_address = view_address;
+        view.ssh_advertise_port = view_advertise_port;
+        view.ssh_auth_pubkey = view_pubkey;
+        view.ssh_auth_password = view_password;
+        view.ssh_banner = view_banner;
+        view.ssh_host_key_file = view_host_key;
         Ok(())
     }
 
@@ -1725,14 +1779,60 @@ impl Server {
                 )
                 .await
             }
-            Some(ClientMessage::HelloSshJump { .. }) => {
-                warn!(%peer, "ssh jump registration received while Phase 1 service is disabled");
-                let _ = control
-                    .send(ServerMessage::Error(
-                        "SSH jump host service is not configured".into(),
-                    ))
-                    .await;
-                Ok(())
+            Some(message @ ClientMessage::HelloSshJump { .. }) => {
+                let Some(base_domain) = self.ssh_jump_base_domain.clone() else {
+                    warn!(%peer, "SSH jump registration received while service is disabled");
+                    let _ = control
+                        .send(ServerMessage::Error(
+                            "SSH jump host service is not configured".into(),
+                        ))
+                        .await;
+                    return Ok(());
+                };
+                #[cfg(not(feature = "ssh-gateway"))]
+                {
+                    let _ = (message, base_domain);
+                    let _ = control
+                        .send(ServerMessage::Error(
+                            "server was built without SSH gateway support".into(),
+                        ))
+                        .await;
+                    Ok(())
+                }
+                #[cfg(feature = "ssh-gateway")]
+                {
+                    if self.ssh_gateway.is_none() {
+                        let _ = control
+                            .send(ServerMessage::Error(
+                                "SSH jump host service requires the SSH gateway".into(),
+                            ))
+                            .await;
+                        return Ok(());
+                    }
+                    let registration =
+                        match crate::ssh_jump::SshJumpRegistration::try_from(&message) {
+                            Ok(registration) => registration,
+                            Err(err) => {
+                                let _ = control.send(ServerMessage::Error(err.to_string())).await;
+                                return Ok(());
+                            }
+                        };
+                    crate::ssh_jump::serve_native_provider(
+                        control,
+                        opener,
+                        self.ssh_jump_registry.clone(),
+                        self.pending_ssh_jump_udp.clone(),
+                        self.pending_carriers.clone(),
+                        base_domain,
+                        registration,
+                        self.admin.clone(),
+                        peer,
+                        self.max_carriers,
+                        self.max_conns,
+                        self.ssh_jump_ctrl_timeout,
+                    )
+                    .await
+                }
             }
             Some(ClientMessage::Authenticate(_)) => {
                 warn!("unexpected authenticate");
@@ -2392,6 +2492,42 @@ mod tests {
         assert_eq!(config["ssh_jump_enabled"], false);
         assert!(config["ssh_jump_base_domain"].is_null());
         assert!(config.get("secret").is_none());
+        assert!(!config.to_string().contains("must-not-leak"));
+    }
+
+    #[cfg(feature = "ssh-gateway")]
+    #[test]
+    fn ssh_jump_configuration_populates_sanitized_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("authorized_keys.d");
+        std::fs::create_dir(&keys).unwrap();
+        let mut server = Server::new(1024..=65535, Some("must-not-leak"));
+        server
+            .set_ssh_jump_base_domain(Some("SSH.Example.Test.".to_string()))
+            .unwrap();
+        server
+            .set_ssh_gateway(crate::sshgw::SshGatewayConfig {
+                port: Some(2222),
+                host_key_file: dir.path().join("host-key"),
+                authorized_keys_dir: Some(keys),
+                passwords_file: None,
+                banner: Some("test banner".to_string()),
+                window_size: crate::sshgw::SSH_DEFAULT_WINDOW_SIZE,
+                advertise_address: Some("bore.example.test".to_string()),
+                advertise_port: Some(443),
+            })
+            .unwrap();
+
+        let view = server.config_view();
+        let config = serde_json::to_value(view.as_ref()).unwrap();
+        assert_eq!(config["ssh_gateway"], true);
+        assert_eq!(config["ssh_jump_enabled"], true);
+        assert_eq!(config["ssh_jump_base_domain"], "ssh.example.test");
+        assert_eq!(config["ssh_port"], 2222);
+        assert_eq!(config["ssh_advertise_port"], 443);
+        assert_eq!(config["ssh_auth_pubkey"], true);
+        assert_eq!(config["ssh_auth_password"], false);
+        assert_eq!(config["ssh_banner"], true);
         assert!(!config.to_string().contains("must-not-leak"));
     }
 }

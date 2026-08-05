@@ -482,6 +482,60 @@ enum Command {
         webserver_log_max_file_size: u64,
     },
 
+    /// Publish a local SSH daemon as a namespaced OpenSSH ProxyJump target.
+    ///
+    /// Example: bore sshjhost localhost:22 --subdomain vm-test-01
+    #[command(name = "sshjhost")]
+    SshJHost {
+        /// Local SSH target in HOST:PORT or [IPv6]:PORT form.
+        #[clap(value_name = "TARGET")]
+        target: String,
+
+        /// Single lowercase DNS label below the server's SSH jump base domain.
+        #[clap(
+            long,
+            value_name = "LABEL",
+            env = "BORE_SSH_JUMP_SUBDOMAIN",
+            value_parser = parse_ssh_jump_alias
+        )]
+        subdomain: String,
+
+        /// Address of the remote bore server.
+        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER", default_value = DEFAULT_SERVER)]
+        to: String,
+
+        /// Existing bore shared secret used for native-provider authentication.
+        #[clap(
+            short,
+            long,
+            value_name = "SECRET",
+            env = "BORE_SECRET",
+            hide_env_values = true
+        )]
+        secret: Option<String>,
+
+        /// Skip TLS certificate verification for a self-signed control server.
+        #[clap(long, env = "BORE_INSECURE")]
+        insecure: bool,
+
+        /// Free-form note shown in server operational state.
+        #[clap(long, value_name = "TEXT", env = "BORE_NOTES")]
+        notes: Option<String>,
+
+        /// Number of warm TCP carriers requested from the server.
+        #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
+        carriers: u16,
+
+        /// Request the future server-direct QUIC path. Phase 2 records the
+        /// request and continues over warm TCP carriers.
+        #[clap(long, env = "BORE_PREFER_UDP")]
+        udp: bool,
+
+        /// Reconnect automatically with exponential backoff.
+        #[clap(long, env = "BORE_AUTO_RECONNECT")]
+        auto_reconnect: bool,
+    },
+
     /// Secure file and directory transfer over secret tunnels.
     Transfer {
         #[clap(subcommand)]
@@ -697,6 +751,11 @@ enum Command {
         /// `key_file` from vhost.yml.
         #[clap(long, value_name = "PATH", env = "BORE_VHOST_KEY_FILE")]
         vhost_key_file: Option<PathBuf>,
+
+        /// Base domain for namespaced SSH ProxyJump targets, e.g.
+        /// `ssh.bore.example.com`. Requires the embedded SSH gateway.
+        #[clap(long, value_name = "DOMAIN", env = "BORE_SSH_JUMP_BASE_DOMAIN")]
+        ssh_jump_base_domain: Option<String>,
 
         /// Enable VPN link brokering (requires --features vpn on the client).
         #[cfg(feature = "vpn")]
@@ -2064,6 +2123,7 @@ async fn dispatch(command: Command) -> Result<()> {
             vhost_mode,
             vhost_cert_file,
             vhost_key_file,
+            ssh_jump_base_domain,
             #[cfg(feature = "vpn")]
             vpn,
             #[cfg(feature = "vpn")]
@@ -2112,6 +2172,23 @@ async fn dispatch(command: Command) -> Result<()> {
                 }
             }
             let mut server = Server::new(port_range, secret.as_deref());
+            #[cfg(feature = "ssh-gateway")]
+            let ssh_gateway_enabled = ssh_gateway;
+            #[cfg(not(feature = "ssh-gateway"))]
+            let ssh_gateway_enabled = false;
+            if let Some(message) = ssh_jump_server_config_error(
+                ssh_jump_base_domain.is_some(),
+                cfg!(feature = "ssh-gateway"),
+                ssh_gateway_enabled,
+            ) {
+                Args::command()
+                    .error(ErrorKind::ArgumentConflict, message)
+                    .exit();
+            }
+            let ssh_jump_base_domain = ssh_jump_base_domain
+                .map(|domain| bore_cli::ssh_jump::validate_base_domain(&domain))
+                .transpose()?;
+            server.set_ssh_jump_base_domain(ssh_jump_base_domain.clone())?;
             server.set_webserver_log(
                 webserver_log,
                 webserver_log_max_files,
@@ -2297,8 +2374,8 @@ async fn dispatch(command: Command) -> Result<()> {
                     .map(|p| p.to_string_lossy().to_string()),
                 tls: config_tls,
                 ssh_gateway: false,
-                ssh_jump_enabled: false,
-                ssh_jump_base_domain: None,
+                ssh_jump_enabled: ssh_jump_base_domain.is_some(),
+                ssh_jump_base_domain: ssh_jump_base_domain.clone(),
                 ssh_port: None,
                 ssh_advertise_address: None,
                 ssh_advertise_port: None,
@@ -2335,6 +2412,45 @@ async fn dispatch(command: Command) -> Result<()> {
             }
 
             server.listen().await?;
+        }
+        Command::SshJHost {
+            target,
+            subdomain,
+            to,
+            secret,
+            insecure,
+            notes,
+            carriers,
+            udp,
+            auto_reconnect,
+        } => {
+            let (local_host, local_port) = resolve_local_target(&target, None)?;
+            let notes = clamp_notes(notes);
+            let connect = move || {
+                let (local_host, subdomain, to, secret, notes) = (
+                    local_host.clone(),
+                    subdomain.clone(),
+                    to.clone(),
+                    secret.clone(),
+                    notes.clone(),
+                );
+                async move {
+                    Client::new_ssh_jump_provider(
+                        &local_host,
+                        local_port,
+                        &to,
+                        &subdomain,
+                        secret.as_deref(),
+                        insecure,
+                        carriers,
+                        udp,
+                        auto_reconnect,
+                        notes,
+                    )
+                    .await
+                }
+            };
+            reconnect::run(auto_reconnect, connect, serve_client).await?;
         }
         Command::Vhost {
             target,
@@ -2517,6 +2633,26 @@ async fn dispatch(command: Command) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_ssh_jump_alias(value: &str) -> std::result::Result<String, String> {
+    bore_cli::ssh_jump::validate_alias(value).map_err(|err| err.to_string())
+}
+
+fn ssh_jump_server_config_error(
+    domain_configured: bool,
+    ssh_gateway_available: bool,
+    ssh_gateway_enabled: bool,
+) -> Option<&'static str> {
+    if !domain_configured {
+        None
+    } else if !ssh_gateway_available {
+        Some("--ssh-jump-base-domain requires a server built with the ssh-gateway feature")
+    } else if !ssh_gateway_enabled {
+        Some("--ssh-jump-base-domain requires --ssh-gateway")
+    } else {
+        None
+    }
 }
 
 /// Truncate an operator note to [`MAX_NOTES_LEN`] characters (on a char boundary)
@@ -3402,10 +3538,153 @@ mod tests {
     }
 
     #[test]
-    fn ssh_jump_cli_is_not_exposed_in_phase_one() {
-        let error = Args::try_parse_from(["bore", "sshjhost", "localhost:22"])
-            .expect_err("Phase 1 must not expose an incomplete command");
-        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    fn ssh_jump_cli_standard_and_nonstandard_ports_parse() {
+        for (target, expected_port) in [("localhost:22", 22), ("localhost:2222", 2222)] {
+            let args = Args::try_parse_from([
+                "bore",
+                "sshjhost",
+                target,
+                "--subdomain",
+                "vm-test-01",
+                "--to",
+                "https://bore.tld",
+                "--secret",
+                "test-secret",
+                "--notes",
+                "test VM",
+                "--carriers",
+                "2",
+                "--auto-reconnect",
+                "--udp",
+            ])
+            .unwrap();
+            let Command::SshJHost {
+                target,
+                subdomain,
+                to,
+                secret,
+                carriers,
+                auto_reconnect,
+                udp,
+                ..
+            } = args.command
+            else {
+                panic!("expected sshjhost command");
+            };
+            assert_eq!(
+                resolve_local_target(&target, None).unwrap().1,
+                expected_port
+            );
+            assert_eq!(subdomain, "vm-test-01");
+            assert_eq!(to, "https://bore.tld");
+            assert_eq!(secret.as_deref(), Some("test-secret"));
+            assert_eq!(carriers, 2);
+            assert!(auto_reconnect);
+            assert!(udp);
+        }
+    }
+
+    #[test]
+    fn ssh_jump_cli_rejects_invalid_alias() {
+        assert!(Args::try_parse_from([
+            "bore",
+            "sshjhost",
+            "localhost:22",
+            "--subdomain",
+            "Bad.Alias",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn ssh_jump_server_feature_combinations_fail_closed() {
+        assert_eq!(ssh_jump_server_config_error(false, false, false), None);
+        assert_eq!(ssh_jump_server_config_error(false, true, false), None);
+        assert_eq!(
+            ssh_jump_server_config_error(true, false, false),
+            Some("--ssh-jump-base-domain requires a server built with the ssh-gateway feature")
+        );
+        assert_eq!(
+            ssh_jump_server_config_error(true, true, false),
+            Some("--ssh-jump-base-domain requires --ssh-gateway")
+        );
+        assert_eq!(ssh_jump_server_config_error(true, true, true), None);
+    }
+
+    #[test]
+    fn ssh_jump_cli_and_server_env_parity() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let keys = [
+            "BORE_SSH_JUMP_SUBDOMAIN",
+            "BORE_SSH_JUMP_BASE_DOMAIN",
+            "BORE_SERVER",
+            "BORE_SECRET",
+            "BORE_NOTES",
+            "BORE_CARRIERS",
+            "BORE_PREFER_UDP",
+            "BORE_AUTO_RECONNECT",
+            "BORE_INSECURE",
+            #[cfg(feature = "ssh-gateway")]
+            "BORE_SSH_GATEWAY",
+        ];
+        let saved: Vec<_> = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+
+        std::env::set_var("BORE_SSH_JUMP_SUBDOMAIN", "env-vm");
+        std::env::set_var("BORE_SERVER", "https://env-bore.test");
+        std::env::set_var("BORE_SECRET", "env-secret");
+        std::env::set_var("BORE_NOTES", "env notes");
+        std::env::set_var("BORE_CARRIERS", "3");
+        std::env::set_var("BORE_PREFER_UDP", "true");
+        std::env::set_var("BORE_AUTO_RECONNECT", "true");
+        std::env::set_var("BORE_INSECURE", "true");
+        let args = Args::parse_from(["bore", "sshjhost", "localhost:2222"]);
+        let Command::SshJHost {
+            subdomain,
+            to,
+            secret,
+            notes,
+            carriers,
+            udp,
+            auto_reconnect,
+            insecure,
+            ..
+        } = args.command
+        else {
+            panic!("expected sshjhost command");
+        };
+        assert_eq!(subdomain, "env-vm");
+        assert_eq!(to, "https://env-bore.test");
+        assert_eq!(secret.as_deref(), Some("env-secret"));
+        assert_eq!(notes.as_deref(), Some("env notes"));
+        assert_eq!(carriers, 3);
+        assert!(udp && auto_reconnect && insecure);
+
+        std::env::set_var("BORE_SSH_JUMP_BASE_DOMAIN", "SSH.Env.Test.");
+        #[cfg(feature = "ssh-gateway")]
+        std::env::set_var("BORE_SSH_GATEWAY", "true");
+        let args = Args::parse_from(["bore", "server"]);
+        let Command::Server {
+            ssh_jump_base_domain,
+            #[cfg(feature = "ssh-gateway")]
+            ssh_gateway,
+            ..
+        } = args.command
+        else {
+            panic!("expected server command");
+        };
+        assert_eq!(ssh_jump_base_domain.as_deref(), Some("SSH.Env.Test."));
+        #[cfg(feature = "ssh-gateway")]
+        assert!(ssh_gateway);
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 
     #[test]

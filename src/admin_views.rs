@@ -373,9 +373,9 @@ pub struct ConfigView {
     pub tls: bool,
     /// SSH gateway enabled.
     pub ssh_gateway: bool,
-    /// SSH jump-host routing enabled. Phase 1 always reports false.
+    /// SSH jump-host routing enabled.
     pub ssh_jump_enabled: bool,
-    /// SSH jump base domain. Phase 1 always reports `None`.
+    /// SSH jump base domain.
     pub ssh_jump_base_domain: Option<String>,
     /// SSH gateway listen port (if enabled).
     pub ssh_port: Option<u16>,

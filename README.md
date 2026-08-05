@@ -47,6 +47,7 @@ frills attached.
   - [Serving over HTTPS/HTTP](#serving-over-httpshttp)
   - [Basic auth on tunnels](#basic-auth-on-tunnels)
   - [Admin status page](#admin-status-page)
+- [SSH jump hosts (`bore sshjhost` / OpenSSH provider)](#ssh-jump-hosts)
 - [SSH ingress gateway (no `bore` client needed)](#ssh-ingress-gateway)
 - [Secret tunnels (no public port)](#secret-tunnels-no-public-port)
   - [Direct UDP path (hole-punching)](#direct-udp-path-hole-punching)
@@ -149,7 +150,7 @@ or the SSH gateway.
 
 ## Command overview
 
-Six subcommands, plus one utility command. `-v`/`-vv` (global) raises log verbosity to
+Commands and utilities. `-v`/`-vv` (global) raises log verbosity to
 debug/trace; `RUST_LOG` overrides. All flags accept the matching `BORE_*` environment
 variable shown in each table — handy for Docker/systemd.
 
@@ -158,6 +159,7 @@ variable shown in each table — handy for Docker/systemd.
 | `bore local <PORT>` | Expose a local port: public tunnel, or secret-tunnel provider with `--tcp-secret-id` | [Detailed usage](#detailed-usage) |
 | `bore proxy` | Consume a secret tunnel, exposing it on a local port | [Detailed usage](#detailed-usage) |
 | `bore vhost <TARGET>` | Expose local HTTP(S) at a subdomain, no dedicated port | [Vhost](#vhost--subdomain-reverse-proxy) |
+| `bore sshjhost <TARGET>` | Publish an SSH daemon as a namespaced stock-OpenSSH ProxyJump target | [SSH jump hosts](#ssh-jump-hosts) |
 | `bore server` | Run the relay server (control port, tunnels, vhost, VPN broker, SSH gateway, admin page) | [Self-hosting](#self-hosting) |
 | `bore transfer listener` / `bore transfer sender` | Resumable, BLAKE3-verified file transfer over the tunnel transport | [Secure file transfer](#secure-file-transfer-bore-transfer) |
 | `bore test-udp` | NAT/UDP diagnostic; two-peer latency/bandwidth test with `--tcp-secret-id` | [Diagnosing UDP/NAT](#diagnosing-udp--nat-bore-test-udp) |
@@ -520,6 +522,7 @@ VPN broker (--features vpn):
 
 SSH ingress gateway (--features ssh-gateway; see "SSH ingress gateway" below):
       --ssh-gateway                          Enable the embedded SSH ingress gateway. Requires --ssh-authorized-keys-dir and/or --ssh-passwords-file [env: BORE_SSH_GATEWAY=]
+      --ssh-jump-base-domain <DOMAIN>        Exact namespace for ProxyJump targets, e.g. ssh.bore.tld; requires --ssh-gateway [env: BORE_SSH_JUMP_BASE_DOMAIN=]
       --ssh-port <PORT>                      Bind a dedicated extra TCP listener for SSH (default: demuxed on the control port, no extra port to open) [env: BORE_SSH_PORT=]
       --ssh-host-key-file <PATH>             ed25519 host key (OpenSSH PEM); generated on first use if absent [env: BORE_SSH_HOST_KEY_FILE=] [default: bore_ssh_host_key.pem]
       --ssh-authorized-keys-dir <DIR>         Directory of authorized_keys-format files granting public-key auth (hot-reloaded every attempt) [env: BORE_SSH_AUTHORIZED_KEYS_DIR=]
@@ -579,9 +582,9 @@ bore server --secret mysecret --admin-token "$(openssl rand -hex 24)"
 # open http://your-server:7835/admin/status and paste the token
 ```
 
-The page lists every connected tunnel — public tunnels, VPN links, vhost providers, and, for
-secret tunnels, both the provider and all attached `bore proxy` consumers (SSH-gateway
-originated tunnels included) — with their client address, options, `--notes`, live
+The page lists connected public tunnels, VPN links, vhost providers and, for secret tunnels,
+both the provider and all attached `bore proxy` consumers (SSH-gateway originated tunnels
+included) — with their client address, options, `--notes`, live
 connection count, and uptime. It refreshes automatically (polling every ~2s) and keeps **no**
 persistent state: it reflects exactly what is connected right now. The frontend is embedded
 in the binary; no external assets are fetched.
@@ -589,11 +592,180 @@ in the binary; no external assets are fetched.
 Annotate any tunnel with `--notes "..."` (on `bore local`/`bore proxy`/`bore vhost`, or
 `notes=` via the SSH gateway) to label it on this page.
 
+## SSH jump hosts
+
+`sshjhost` publishes an SSH daemon under an exact, separate hostname namespace. The
+operator uses an unmodified OpenSSH client; the inner SSH session remains end-to-end between
+the operator and the target `sshd`:
+
+```text
+operator OpenSSH -> bore SSH gateway:443 -> bore TCP carrier -> target sshd
+```
+
+For example, an alias `vm-test-01` under `ssh.bore.tld` is reached with:
+
+```shell
+ssh -J fabio@bore.tld:443 ubuntu@vm-test-01.ssh.bore.tld
+```
+
+No DNS record is required for every alias: only `bore.tld` must resolve. OpenSSH sends the
+target hostname in its `direct-tcpip` request to the gateway. The target port is exact: for
+an SSH daemon on 2222 use `ssh -p 2222 -J fabio@bore.tld:443 ...`.
+
+### Server and Docker Compose on port 443
+
+The server requires the existing SSH gateway plus one new namespace setting:
+
+```shell
+bore server \
+  --control-port 443 \
+  --ssh-gateway \
+  --ssh-jump-base-domain ssh.bore.tld \
+  --ssh-host-key-file /etc/bore/ssh/host_key.pem \
+  --ssh-authorized-keys-dir /etc/bore/ssh/authorized_keys.d \
+  --ssh-passwords-file /etc/bore/ssh/passwords
+```
+
+For the repository's bridge-network Compose, keep all existing mappings and add only the
+environment variable shown below:
+
+```yaml
+ports:
+  - "443:7835"       # existing TCP control/TLS/SSH demux
+  - "7835:7835/udp"  # existing STUN socket
+  - "443:443/udp"    # existing shared direct-QUIC socket
+environment:
+  - BORE_CONTROL_PORT=7835
+  - BORE_SSH_GATEWAY=true
+  - BORE_SSH_ADVERTISE_ADDRESS=bore.tld
+  - BORE_SSH_ADVERTISE_PORT=443
+  - BORE_SSH_JUMP_BASE_DOMAIN=ssh.bore.tld  # new
+```
+
+Do not add port 8443. TCP 443 and UDP 443 are distinct sockets; in this Compose they also
+map to different container ports. Phase 2's jump data path is TCP-only, so the existing
+`443/udp` mapping is unchanged and reserved for the later direct-QUIC phase.
+
+Server option:
+
+| Flag | Env | Description |
+|---|---|---|
+| `--ssh-jump-base-domain <DOMAIN>` | `BORE_SSH_JUMP_BASE_DOMAIN` | Enables exact `<alias>.<domain>` dispatch. Requires `--ssh-gateway` and a server built with `ssh-gateway`. |
+
+### Native `bore sshjhost` provider
+
+On the VM that owns the SSH daemon:
+
+```shell
+bore sshjhost localhost:22 \
+  --subdomain vm-test-01 \
+  --to https://bore.tld \
+  --secret "$BORE_SECRET" \
+  --notes "vm test AWS su zona eu-south-1" \
+  --auto-reconnect
+```
+
+For a nonstandard target, the local and virtual ports are the same in v1:
+
+```shell
+bore sshjhost localhost:2222 --subdomain legacy-01 \
+  --to https://bore.tld --secret "$BORE_SECRET" --auto-reconnect
+ssh -p 2222 -J fabio@bore.tld:443 admin@legacy-01.ssh.bore.tld
+```
+
+The native provider authenticates to the bore control plane with the existing
+`BORE_SECRET`; it does not use a gateway username. TCP carriers stay warm and
+`--carriers N` adds parallel carrier connections for concurrent SSH sessions.
+
+Complete Phase 2 client reference:
+
+| Argument/flag | Env | Meaning |
+|---|---|---|
+| `<TARGET>` | — | Required `HOST:PORT` or `[IPv6]:PORT`; the port is also the virtual target port. |
+| `--subdomain <LABEL>` | `BORE_SSH_JUMP_SUBDOMAIN` | Required lowercase single DNS label. |
+| `--to <ADDR>` | `BORE_SERVER` | Bore control endpoint; use `https://bore.tld` for external TCP 443. |
+| `--secret <SECRET>` | `BORE_SECRET` | Existing bore HMAC secret. |
+| `--insecure` | `BORE_INSECURE` | Accept a self-signed control TLS certificate. |
+| `--notes <TEXT>` | `BORE_NOTES` | Bounded operational note. |
+| `--carriers <N>` | `BORE_CARRIERS` | Requested warm TCP carriers (default 1; server caps with `--max-carriers`). |
+| `--auto-reconnect` | `BORE_AUTO_RECONNECT` | Re-register with exponential backoff after a disconnect. |
+| `--udp` | `BORE_PREFER_UDP` | Accepted and reported, but Phase 2 explicitly falls back to TCP; direct QUIC lands in Phase 4. |
+
+### Pure OpenSSH provider
+
+A VM without the bore binary can publish the same kind of target through a reverse SSH
+forward. The `jump/` prefix is mandatory:
+
+```shell
+ssh -T -p 443 -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  -R 'jump/vm-test-01:22:localhost:22' \
+  vm-provider@bore.tld -- 'notes="AWS eu-south-1"'
+```
+
+This provider path is TCP-only and uses the gateway's classic public-key/password auth.
+`udp=` and `carriers=` are reported as inapplicable. A reconnect using the same exact
+username may replace its previous registration; another username, a native provider, or a
+second native provider cannot take the alias. The old syntax remains unchanged:
+`ssh -R 22:localhost:22 bore.tld` requests the existing public port 22 and does not register
+a jump host.
+
+### Classic authentication and key placement
+
+Classic username binding applies only to the new jump publish/connect operations. Existing
+SSH-gateway public, vhost and secret forwarding keeps its prior username-ignored behavior.
+There is no jump ACL file: any correctly authenticated jump account may reach any registered
+alias.
+
+For public keys, put the public key in a file whose basename is the exact, case-sensitive
+gateway username (`fabio` or `fabio.pub`):
+
+```text
+/etc/bore/ssh/authorized_keys.d/fabio
+```
+
+The matching private key stays on the operator/provider host. For passwords, store only an
+Argon2id line with the exact username label:
+
+```shell
+printf '%s' 'outer-password' | bore hash-password
+# add: fabio:$argon2id$... to /etc/bore/ssh/passwords
+```
+
+Credential layers are independent:
+
+| Material | Location | Purpose |
+|---|---|---|
+| Gateway host private key | Persistent bore server volume | Identifies `bore.tld` to OpenSSH. |
+| Gateway account public key/hash | Bore server key directory/password file | Authenticates `fabio` or `vm-provider` to the outer gateway. |
+| Gateway account private key/password | Operator or pure-provider VM | Opens the outer SSH connection; never copied to the bore server as plaintext. |
+| Target host key and `authorized_keys` | Target VM's normal `sshd` paths | Normal inner SSH server identity and account authorization. |
+| Target private key/password | Operator | Authenticates directly to target `sshd`; no agent forwarding is required. |
+
+Recommended operator configuration, which also makes `ssh -J bore.tld ...` select port 443:
+
+```sshconfig
+Host bore.tld
+    Port 443
+    User fabio
+    IdentityFile ~/.ssh/id_ed25519_bore_gateway
+    IdentitiesOnly yes
+    StrictHostKeyChecking yes
+
+Host *.ssh.bore.tld
+    IdentityFile ~/.ssh/id_ed25519_target
+    IdentitiesOnly yes
+```
+
+With password authentication, OpenSSH prompts separately for the outer gateway and inner
+target credentials. The complete deployment/test matrix is also preserved in
+[`examples_usage.md`](docs/plans/plan_SshJumpHost/examples_usage.md).
+
 ## SSH ingress gateway
 
 `bore server --ssh-gateway` embeds an SSH server (via `russh`) directly in the relay server,
-so a **stock OpenSSH client** (`ssh -R`/`-L`, or `autossh`) can create public, vhost, and
-secret tunnels — **no `bore` binary on the client side at all**. Requires building with
+so a **stock OpenSSH client** (`ssh -R`/`-L`, or `autossh`) can create public, vhost, secret,
+and `jump/<alias>` provider tunnels — **no `bore` binary on the client side at all**. Requires building with
 `--features ssh-gateway` (included in `--all-features` and in every GitHub Release binary of
 this fork).
 
@@ -622,6 +794,7 @@ bore server \
   --admin-token "$(openssl rand -hex 24)" \
   --vhost-base-domain bore.example.com --vhost-http-port 7835 \
   --ssh-gateway \
+  --ssh-jump-base-domain ssh.bore.example.com \
   --ssh-host-key-file /etc/bore/ssh/host_key.pem \
   --ssh-authorized-keys-dir /etc/bore/ssh/authorized_keys.d \
   --ssh-passwords-file /etc/bore/ssh/passwords \
@@ -634,6 +807,7 @@ Server flags (all `#[cfg(feature = "ssh-gateway")]`; also listed in the
 | Flag | Env | Required? | Description |
 |---|---|---|---|
 | `--ssh-gateway` | `BORE_SSH_GATEWAY` | yes (to activate) | Enables the gateway. Requires **at least one** of `--ssh-authorized-keys-dir`/`--ssh-passwords-file` (fails fast otherwise). |
+| `--ssh-jump-base-domain <DOMAIN>` | `BORE_SSH_JUMP_BASE_DOMAIN` | no | Enables exact `<alias>.<domain>` ProxyJump dispatch. Requires `--ssh-gateway`. |
 | `--ssh-port <PORT>` | `BORE_SSH_PORT` | no | Extra dedicated SSH port. Without it, SSH is demuxed on the **same** control/vhost port (443/7835) — no extra port to open. |
 | `--ssh-host-key-file <PATH>` | `BORE_SSH_HOST_KEY_FILE` | no (default `bore_ssh_host_key.pem`) | ed25519 host key, generated on first run if absent. **Persist it on a volume** — otherwise the fingerprint changes on every restart and breaks every `autossh` client pinned with `StrictHostKeyChecking`. |
 | `--ssh-authorized-keys-dir <DIR>` | `BORE_SSH_AUTHORIZED_KEYS_DIR` | one of two | Directory of `authorized_keys`-format files (one or more), re-read on **every** auth attempt — free hot-reload. |
@@ -665,6 +839,9 @@ The trailing comment (`laptop`) becomes the **identity** (shown as owner in the 
 dashboard, and the key for same-identity takeover — see below). Per-key options go before the
 key, space-separated:
 
+For jump-only classic binding, the file basename must instead equal the login username
+exactly (`fabio` or `fabio.pub`); the comment remains the legacy-mode identity.
+
 ```
 permit="vhost/laptop-*,secret/ci-*,port/9000-9100",max-conns=50,notes="dev laptop" ssh-ed25519 AAAA... laptop
 ```
@@ -690,8 +867,9 @@ fabio:$argon2id$...
 ```
 
 Only Argon2id hashes live on disk, never plaintext. Multiple lines can be valid at once; the
-`label` of the winning line becomes the identity. The SSH username (`user@host`) is free/
-ignored by the server, used only as a secondary label at login.
+`label` of the winning line becomes the identity. The SSH username (`user@host`) remains
+free/ignored for existing public/vhost/secret modes. Jump publish/connect additionally
+requires that username to equal the winning password label exactly.
 
 ```shell
 sshpass -p 'correct-horse-battery-staple' ssh -p 7835 -R 9998:localhost:8080 alice@bore.example.com
@@ -709,6 +887,7 @@ Heuristic, plus explicit prefixes that always disambiguate (any port):
 | `<N>` (numeric port, no label) | **public** — public port `N` (`0` = server-assigned) | — |
 | `<label>:80` or `<label>:443` | **vhost** — subdomain `<label>.<base-domain>` | `vhost/<label>:<any port>` |
 | `<label>:0` | **secret provider** — registers id `<label>` | `secret/<label>:0` |
+| — | **SSH jump provider** — exact nonzero target port | `jump/<alias>:<port>` |
 | `<label>:<other port>` | ambiguous → **rejected** | use `vhost/`/`secret/` |
 
 Secret consumer (`-L`, always secret; the trailing port is an ignored placeholder — OpenSSH's
@@ -2067,15 +2246,23 @@ sudo bore server \
   --control-port 443 --cert-file /etc/bore/cert.pem --key-file /etc/bore/key.pem \
   --vhost-base-domain bore.tld \
   --ssh-gateway --ssh-host-key-file /etc/bore/ssh/host_key.pem \
+  --ssh-jump-base-domain ssh.bore.tld \
   --ssh-authorized-keys-dir /etc/bore/ssh/authorized_keys.d \
   --admin-token "$(openssl rand -hex 24)"
 
 # Client machine (only needs OpenSSH):
 ssh -T -p 443 -R vhost/myapp:0:localhost:8080 bore.tld
+
+# VM SSH provider (native bore path):
+bore sshjhost localhost:22 --subdomain vm-test-01 \
+  --to https://bore.tld --secret "$BORE_SECRET" --auto-reconnect
+
+# Operator (gateway account key file is named authorized_keys.d/fabio):
+ssh -J fabio@bore.tld:443 ubuntu@vm-test-01.ssh.bore.tld
 ```
 
-See [SSH ingress gateway](#ssh-ingress-gateway) above for every mode (public/vhost/secret
-provider/secret consumer), parameters, `autossh`/systemd templates, and troubleshooting.
+See [SSH jump hosts](#ssh-jump-hosts) and [SSH ingress gateway](#ssh-ingress-gateway) above
+for every mode, parameters, `autossh`/systemd templates, and troubleshooting.
 
 ### 11. VPN site-to-site, encrypted relay + direct QUIC fallback path
 
@@ -2144,7 +2331,9 @@ If a secret is not present in the arguments, `bore` will also attempt to read fr
 `BORE_SECRET` environment variable.
 
 The SSH ingress gateway replaces this with SSH's own authentication (public keys or Argon2id
-passwords) and host-key pinning — see [SSH ingress gateway](#ssh-ingress-gateway).
+passwords) and host-key pinning. Jump operations additionally bind the SSH username to the
+matching credential label; existing gateway modes remain username-agnostic. See
+[SSH jump hosts](#ssh-jump-hosts) and [SSH ingress gateway](#ssh-ingress-gateway).
 
 ## Troubleshooting
 

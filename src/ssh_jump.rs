@@ -2,19 +2,43 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "ssh-gateway")]
+use std::time::Duration;
 
 use anyhow::{bail, Result};
+#[cfg(feature = "ssh-gateway")]
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+#[cfg(feature = "ssh-gateway")]
+use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
+#[cfg(feature = "ssh-gateway")]
+use tokio::time::{interval, Instant, MissedTickBehavior};
+#[cfg(feature = "ssh-gateway")]
+use tracing::{info, warn};
+#[cfg(feature = "ssh-gateway")]
+use uuid::Uuid;
 
+#[cfg(feature = "ssh-gateway")]
+use crate::admin::{AdminRegistry, NewEntry, Role, Transport};
+#[cfg(feature = "ssh-gateway")]
+use crate::mux;
 use crate::pool::CarrierPool;
+#[cfg(feature = "ssh-gateway")]
+use crate::pool::{self, PendingCarriers, TokenGuard};
 use crate::shared::{ClientMessage, MAX_NOTES_LEN, UDP_NONCE_LEN};
+#[cfg(feature = "ssh-gateway")]
+use crate::shared::{Delimited, ServerMessage};
 
 /// Maximum length of the one-label jump alias carried in a DNS-style hostname.
 pub const MAX_ALIAS_LEN: usize = 63;
 
 /// Maximum encoded length of the provider's local target hostname.
 pub const MAX_LOCAL_HOST_LEN: usize = 255;
+
+/// Server heartbeat cadence for native jump-provider control channels.
+#[cfg(feature = "ssh-gateway")]
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A destination routed through the jump namespace, or an unrelated hostname
 /// that must continue through the legacy SSH-gateway parser unchanged.
@@ -48,7 +72,9 @@ pub fn validate_alias(alias: &str) -> Result<String> {
     Ok(alias.to_string())
 }
 
-fn normalize_base_domain(base_domain: &str) -> Result<String> {
+/// Validate and normalize a jump base domain (lowercase, one terminal dot
+/// ignored). Returns the canonical value stored by the server.
+pub fn validate_base_domain(base_domain: &str) -> Result<String> {
     let normalized = base_domain
         .strip_suffix('.')
         .unwrap_or(base_domain)
@@ -69,6 +95,20 @@ fn normalize_base_domain(base_domain: &str) -> Result<String> {
     Ok(normalized)
 }
 
+/// Whether a destination claims the exact configured jump namespace. This is
+/// intentionally only a suffix classifier: callers use it to require classic
+/// authentication before exposing detailed alias/port parsing errors.
+pub fn is_namespace_destination(hostname: &str, base_domain: &str) -> bool {
+    let Ok(base) = validate_base_domain(base_domain) else {
+        return false;
+    };
+    let host = hostname
+        .strip_suffix('.')
+        .unwrap_or(hostname)
+        .to_ascii_lowercase();
+    host == base || host.ends_with(&format!(".{base}"))
+}
+
 /// Classify an OpenSSH `direct-tcpip` destination against one jump base domain.
 ///
 /// Hostnames outside the exact suffix return [`JumpRoute::NotJump`] so callers
@@ -83,7 +123,7 @@ pub fn classify_destination(
     if requested_port == 0 || registered_port == 0 {
         bail!("SSH jump ports must be nonzero");
     }
-    let base = normalize_base_domain(base_domain)?;
+    let base = validate_base_domain(base_domain)?;
     let host = hostname
         .strip_suffix('.')
         .unwrap_or(hostname)
@@ -197,12 +237,13 @@ impl TryFrom<&ClientMessage> for SshJumpRegistration {
     }
 }
 
-/// One registered jump provider. Phase 1 only defines ownership and bounded
-/// metadata; serving/opening behavior remains disabled until Phase 2.
+/// One registered native-bore or pure-OpenSSH jump provider.
 pub struct SshJumpEntry {
     registration_id: u64,
     /// Warm TCP/SSH carrier pool used by the later gateway splice.
     pub pool: Arc<CarrierPool>,
+    /// Trust-domain owner used by duplicate/takeover policy.
+    pub owner: SshJumpOwner,
     /// Validated registration metadata.
     pub registration: SshJumpRegistration,
     /// Real per-tunnel concurrent connection bound.
@@ -212,6 +253,19 @@ pub struct SshJumpEntry {
     pub direct: crate::vhost::DirectPool,
 }
 
+/// Identity class that owns one live jump registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SshJumpOwner {
+    /// Native provider authenticated by the shared bore secret. It has no
+    /// stable identity and therefore can never take over another entry.
+    Native,
+    /// Pure-OpenSSH provider owned by its exact classic username.
+    Ssh {
+        /// Case-sensitive username bound to the successful gateway credential.
+        username: String,
+    },
+}
+
 impl SshJumpEntry {
     /// Build an inert registry entry from already-validated metadata.
     pub fn new(
@@ -219,10 +273,30 @@ impl SshJumpEntry {
         registration: SshJumpRegistration,
         permits: Arc<Semaphore>,
     ) -> Self {
+        Self::new_with_owner(pool, registration, permits, SshJumpOwner::Native)
+    }
+
+    /// Build an SSH-transport registry entry owned by one classic username.
+    pub fn new_ssh(
+        pool: Arc<CarrierPool>,
+        registration: SshJumpRegistration,
+        permits: Arc<Semaphore>,
+        username: String,
+    ) -> Self {
+        Self::new_with_owner(pool, registration, permits, SshJumpOwner::Ssh { username })
+    }
+
+    fn new_with_owner(
+        pool: Arc<CarrierPool>,
+        registration: SshJumpRegistration,
+        permits: Arc<Semaphore>,
+        owner: SshJumpOwner,
+    ) -> Self {
         static NEXT_REGISTRATION_ID: AtomicU64 = AtomicU64::new(1);
         Self {
             registration_id: NEXT_REGISTRATION_ID.fetch_add(1, Ordering::Relaxed),
             pool,
+            owner,
             registration,
             permits,
             #[cfg(feature = "udp")]
@@ -233,6 +307,14 @@ impl SshJumpEntry {
     /// Process-local ownership token used to make RAII teardown replacement-safe.
     pub fn registration_id(&self) -> u64 {
         self.registration_id
+    }
+
+    /// Exact classic username for a pure-SSH provider, or `None` for native.
+    pub fn ssh_owner(&self) -> Option<&str> {
+        match &self.owner {
+            SshJumpOwner::Native => None,
+            SshJumpOwner::Ssh { username } => Some(username),
+        }
     }
 }
 
@@ -303,6 +385,146 @@ impl Drop for SshJumpDeregister {
             let owner_id = self.entry.registration_id();
             self.pending_udp
                 .remove_if(&key, |_, current| current.owner_id == owner_id);
+        }
+    }
+}
+
+/// Register and serve one native TCP jump provider until its control channel
+/// closes or misses the receive deadline. QUIC negotiation is deliberately
+/// deferred to Phase 4; TCP carriers remain the complete Phase 2 data path.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "ssh-gateway")]
+pub(crate) async fn serve_native_provider(
+    mut control: Delimited<mux::Stream>,
+    opener: mux::Opener,
+    registry: SshJumpRegistry,
+    pending_udp: PendingSshJumpUdp,
+    pending_carriers: PendingCarriers,
+    base_domain: String,
+    registration: SshJumpRegistration,
+    admin: AdminRegistry,
+    peer: std::net::SocketAddr,
+    max_carriers: u16,
+    max_conns: usize,
+    ctrl_timeout: Duration,
+) -> Result<()> {
+    let alias = registration.alias.clone();
+    let requested_carriers = registration.carriers;
+    let effective_carriers = requested_carriers.clamp(1, max_carriers.max(1));
+    let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Mux(opener)));
+    let permits = Arc::new(Semaphore::new(max_conns));
+
+    let entry = Arc::new(SshJumpEntry::new(
+        Arc::clone(&pool),
+        registration.clone(),
+        permits,
+    ));
+    match registry.entry(alias.clone()) {
+        Entry::Occupied(_) => {
+            control
+                .send(ServerMessage::Error(
+                    "SSH jump alias is already registered".to_string(),
+                ))
+                .await?;
+            return Ok(());
+        }
+        Entry::Vacant(slot) => {
+            slot.insert(Arc::clone(&entry));
+        }
+    }
+    let _deregister =
+        SshJumpDeregister::new(registry, pending_udp, alias.clone(), Arc::clone(&entry));
+
+    let _admin_registration = admin.register(NewEntry {
+        role: Role::SshJumpHost,
+        peer,
+        secret_id: Some(alias.clone()),
+        public_port: Some(registration.ssh_port),
+        notes: registration.notes.clone(),
+        basic_auth: false,
+        https: false,
+        force_https: false,
+        carriers: effective_carriers,
+        auto_reconnect: registration.auto_reconnect,
+        webserver_log: false,
+        udp: registration.udp,
+        vpn_relay_only: false,
+        vpn_pin_mtu: false,
+        vpn_mtu: None,
+        vpn_forward_accept: false,
+        vpn_nat_masquerade: false,
+        vpn_route_policy: None,
+        vpn_advertised: vec![],
+        vpn_nat_udp_port: None,
+        local_proxy_port: None,
+        local_host: Some(registration.local_host.clone()),
+        local_port: Some(registration.local_port),
+        nat_udp_preferred_port: None,
+        nat_udp_release_timeout: None,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        max_conns: Some(max_conns),
+        transport: Transport::Bore,
+        identity: None,
+    });
+
+    let hostname = format!("{alias}.{base_domain}");
+    control
+        .send(ServerMessage::SshJumpReady {
+            hostname: hostname.clone(),
+            port: registration.ssh_port,
+        })
+        .await?;
+    info!(%alias, %hostname, port = registration.ssh_port, "SSH jump provider registered");
+
+    let mut carrier_rx = if requested_carriers > 1 {
+        let extra = effective_carriers - 1;
+        let token = Uuid::new_v4().to_string();
+        let (tx, rx) = mpsc::unbounded_channel();
+        pending_carriers.insert(token.clone(), tx);
+        let guard = TokenGuard::new(pending_carriers, token.clone());
+        control
+            .send(ServerMessage::CarrierToken { token, extra })
+            .await?;
+        Some((rx, guard))
+    } else {
+        None
+    };
+
+    let mut heartbeat = interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last_recv = Instant::now();
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                if control.send(ServerMessage::Heartbeat).await.is_err() {
+                    return Ok(());
+                }
+                if last_recv.elapsed() >= ctrl_timeout {
+                    warn!(%alias, timeout = ?ctrl_timeout,
+                        "SSH jump provider control idle; reaping");
+                    return Ok(());
+                }
+            }
+            message = control.recv() => {
+                last_recv = Instant::now();
+                match message? {
+                    Some(ClientMessage::Heartbeat) => {}
+                    Some(ClientMessage::SshJumpUdpRenew { .. }) => {
+                        warn!(%alias, "SSH jump QUIC renewal is unavailable in TCP phase")
+                    }
+                    Some(_) => warn!(%alias, "unexpected message from SSH jump provider"),
+                    None => return Ok(()),
+                }
+            }
+            joined = pool::recv_carrier(carrier_rx.as_mut()) => {
+                if let Some(carrier) = joined {
+                    if pool.push(carrier, effective_carriers as usize) {
+                        info!(%alias, size = pool.len(), "SSH jump carrier joined pool");
+                    }
+                }
+            }
         }
     }
 }

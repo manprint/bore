@@ -6,6 +6,11 @@
 > **Data analisi**: 2026-07-03 · **Data implementazione**: 2026-07-04
 > **Scopo**: valutare un gateway SSH di ingresso per creare tunnel **public**, **secret** e
 > **vhost** usando un normale client `ssh`/`autossh`, senza binario `bore` sul lato client.
+>
+> **Estensione SSH jump host (2026-08-05, fase 2):** il gateway supporta anche provider
+> `-R jump/<alias>:<porta>:host:<porta>` e destinazioni ProxyJump sotto
+> `--ssh-jump-base-domain`. Solo queste nuove operazioni applicano il binding classico
+> username-credenziale; public/vhost/secret conservano il comportamento documentato qui.
 
 ---
 
@@ -665,8 +670,9 @@ Host bore
     ExitOnForwardFailure yes
 ```
 
-`User` è ignorato lato server (l'auth è solo per chiave/password — nessun controllo sullo
-username SSH), sceglierne uno qualsiasi che ricordi lo scopo. Poi:
+`User` è ignorato lato server per i forward public/vhost/secret (l'auth è per
+chiave/password). Le operazioni jump fanno eccezione: richiedono che lo username coincida
+esattamente con il basename del file chiave o con la label della password (§6.15). Poi:
 
 ```
 ssh -R vhost/myapp:0:localhost:8080 bore    # vhost
@@ -1022,7 +1028,7 @@ keepalive. Nessun byte perso, nessuna connessione chiusa a forza: solo backpress
 fa il server OpenSSH stesso. Dettagli e istruzioni di ri-applicazione in
 `crates/russh/HOL_FIX.md`.
 
-**Ambito.** Vale per tunnel SSH **public, vhost e secret** (condividono lo stesso canale
+**Ambito.** Vale per tunnel SSH **public, vhost, secret e jump** (condividono lo stesso canale
 `russh`). I path nativi di `bore` (yamux TCP, QUIC/UDP) non erano affetti (hanno già
 flow-control per-stream). Guardie di regressione: `t_ssh_hol1_slow_consumer_does_not_block_peers`
 (`tests/ssh_gateway_test.rs`, client `ssh` reale) e `T-SSH-HOL-PUB`/`-VHOST`/`-SECRET`
@@ -1061,3 +1067,54 @@ Copertura test: `parse_params_backend_tls_on`/`_default_off` (`src/sshgw.rs`),
 `t_ssh_vbt3_backend_tls_forward_serves_https_backend`,
 `t_ssh_vbt_backend_tls_inapplicable_to_public_warns`,
 `t_ssh_warn_all_params_inapplicable_to_secret_provider` (`tests/ssh_gateway_test.rs`).
+
+### 6.15 SSH jump host (`jump/` e ProxyJump)
+
+Abilitazione server:
+
+```bash
+bore server --ssh-gateway \
+  --ssh-jump-base-domain ssh.bore.example.com \
+  --ssh-host-key-file /etc/bore/ssh/host_key.pem \
+  --ssh-authorized-keys-dir /etc/bore/ssh/authorized_keys.d
+```
+
+Un provider OpenSSH puro registra un target TCP/SSH con grammatica esplicita:
+
+```bash
+ssh -T -p 443 -o ExitOnForwardFailure=yes \
+  -R 'jump/vm-test-01:22:localhost:22' \
+  vm-provider@bore.example.com -- 'notes="VM eu-south-1"'
+```
+
+Il basename del file con la chiave pubblica deve essere `vm-provider` (o
+`vm-provider.pub`), oppure il file password deve contenere una riga
+`vm-provider:$argon2id$...`. Il confronto è esatto e case-sensitive. Questa regola vale
+solo per publish/connect jump; non modifica l'autenticazione dei modi preesistenti. Non
+esiste un file ACL jump separato.
+
+Lo stesso username può rimpiazzare una propria registrazione dopo una riconnessione; un
+altro username e un provider bore nativo vengono rifiutati. `udp=` e `carriers=` non si
+applicano al provider OpenSSH e generano un avviso. Il classico
+`ssh -R 22:localhost:22 ...` resta un public forward e non entra nel registry jump.
+
+Il provider alternativo usa il binario bore e il secret HMAC corrente:
+
+```bash
+bore sshjhost localhost:22 --subdomain vm-test-01 \
+  --to https://bore.example.com --secret "$BORE_SECRET" --auto-reconnect
+```
+
+Connessione operatore:
+
+```bash
+ssh -J fabio@bore.example.com:443 ubuntu@vm-test-01.ssh.bore.example.com
+ssh -p 2222 -J fabio@bore.example.com:443 admin@legacy.ssh.bore.example.com
+```
+
+Il gateway autentica `fabio`; il vero `sshd` target autentica separatamente `ubuntu` o
+`admin` con la normale chiave/password interna. Non serve agent forwarding. La fase 2 usa
+solo carrier TCP; `bore sshjhost --udp` segnala esplicitamente il fallback TCP finché il
+direct QUIC non viene implementato nella fase dedicata. Configurazione Compose, tabella
+completa dei flag e collocazione delle chiavi sono nella sezione
+[SSH jump hosts](../README.md#ssh-jump-hosts) del README, fonte operativa primaria.

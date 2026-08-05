@@ -28,6 +28,8 @@ pub enum Role {
     SecretConsumer,
     /// A vhost subdomain reverse-proxy provider (`bore vhost`).
     Vhost,
+    /// An SSH jump-host provider (native bore or pure OpenSSH transport).
+    SshJumpHost,
     /// A VPN link listener (`bore vpn listen`).
     VpnListener,
     /// A VPN link connector (`bore vpn connect`).

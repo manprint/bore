@@ -262,6 +262,12 @@ pub struct SshGateway {
     providers: secret::Registry,
     /// Wired for Phase 5.2 (`tcpip_forward` vhost-subdomain handling).
     vhost_registry: VhostRegistry,
+    /// Shared native/pure-SSH jump provider registry.
+    ssh_jump_registry: crate::ssh_jump::SshJumpRegistry,
+    /// Pending native direct-path state, shared for replacement-safe teardown.
+    ssh_jump_pending_udp: crate::ssh_jump::PendingSshJumpUdp,
+    /// Exact jump namespace; `None` leaves direct-tcpip secret routing unchanged.
+    ssh_jump_base_domain: Option<String>,
     /// SSH-session ownership of each SSH-registered vhost label, for
     /// same-identity takeover (Phase 5.4, D2/I-5). Gateway-internal only —
     /// never plumbed from `Server`, since only SSH registrations can ever be
@@ -269,6 +275,9 @@ pub struct SshGateway {
     vhost_owners: Arc<DashMap<String, ForwardOwner>>,
     /// Same as `vhost_owners`, keyed by secret-tunnel id.
     secret_owners: Arc<DashMap<String, ForwardOwner>>,
+    /// SSH-session ownership keyed by jump alias. Native entries deliberately
+    /// have no owner record and therefore cannot be evicted by SSH sessions.
+    ssh_jump_owners: Arc<DashMap<String, ForwardOwner>>,
     /// Live vhost config (reservations, base domain, TLS mode). `None` when
     /// the server has no `vhost.yml` configured, in which case any
     /// `vhost/<label>` forward request is rejected outright.
@@ -321,6 +330,9 @@ impl SshGateway {
         mut config: SshGatewayConfig,
         providers: secret::Registry,
         vhost_registry: VhostRegistry,
+        ssh_jump_registry: crate::ssh_jump::SshJumpRegistry,
+        ssh_jump_pending_udp: crate::ssh_jump::PendingSshJumpUdp,
+        ssh_jump_base_domain: Option<String>,
         vhost_config: Option<SharedVhostConfig>,
         admin: AdminRegistry,
         conn_permits: Arc<Semaphore>,
@@ -352,8 +364,12 @@ impl SshGateway {
             passwords,
             providers,
             vhost_registry,
+            ssh_jump_registry,
+            ssh_jump_pending_udp,
+            ssh_jump_base_domain,
             vhost_owners: Arc::new(DashMap::new()),
             secret_owners: Arc::new(DashMap::new()),
+            ssh_jump_owners: Arc::new(DashMap::new()),
             vhost_config,
             admin,
             conn_permits,
@@ -815,6 +831,213 @@ impl GatewayHandler {
             max_conns: None,
             notes: None,
         })
+    }
+
+    /// Registers `-R jump/<alias>:<port>:host:<port>` as a pure-OpenSSH
+    /// provider in the same registry used by native `bore sshjhost` clients.
+    #[allow(clippy::too_many_arguments)]
+    async fn tcpip_forward_ssh_jump(
+        &self,
+        address: &str,
+        port: u16,
+        alias: String,
+        principal: String,
+        grant: KeyGrant,
+        session: &mut Session,
+    ) -> Result<bool, russh::Error> {
+        let Some(base_domain) = self.gateway.ssh_jump_base_domain.clone() else {
+            self.state
+                .queue_message("bore ssh-gateway: SSH jump forwarding unavailable".to_string());
+            return Ok(false);
+        };
+        if matches!(
+            peek_takeover(
+                &self.gateway.ssh_jump_registry,
+                &self.gateway.ssh_jump_owners,
+                &alias,
+                &principal,
+            ),
+            TakeoverDecision::Reject
+        ) {
+            self.state
+                .queue_message("bore ssh-gateway: SSH jump forwarding rejected".to_string());
+            return Ok(false);
+        }
+
+        let ssh_handle = session.handle();
+        let gateway = Arc::clone(&self.gateway);
+        let state = Arc::clone(&self.state);
+        let peer = self.peer;
+        let connected_address = address.to_string();
+        let key = (connected_address.clone(), port);
+        let key_for_task = key.clone();
+        let alias_for_message = alias.clone();
+        let (abort_tx, abort_rx) = oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            let (exec, env) = await_params(&state).await;
+            let params = parse_params(exec.as_deref(), &env, &grant);
+
+            match apply_takeover(
+                &gateway.ssh_jump_registry,
+                &gateway.ssh_jump_owners,
+                &alias,
+                &principal,
+                "SSH jump alias",
+            ) {
+                TakeoverOutcome::Reject(_) => {
+                    state.queue_message(
+                        "bore ssh-gateway: SSH jump forwarding rejected".to_string(),
+                    );
+                    return;
+                }
+                TakeoverOutcome::Proceed => {}
+            }
+
+            let opener = SshOpener::new(
+                ssh_handle.clone(),
+                connected_address,
+                port,
+                Arc::downgrade(&state),
+            );
+            let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Ssh(Arc::new(opener))));
+            let max_conns = params.max_conns.unwrap_or(DEFAULT_MAX_CONNS);
+            let registration = match crate::ssh_jump::SshJumpRegistration::new(
+                &alias,
+                port,
+                params.notes.as_deref(),
+                1,
+                false,
+                false,
+                "<ssh-client>",
+                port,
+            ) {
+                Ok(registration) => registration,
+                Err(_) => {
+                    state.queue_message(
+                        "bore ssh-gateway: SSH jump forwarding rejected".to_string(),
+                    );
+                    return;
+                }
+            };
+            let entry = Arc::new(crate::ssh_jump::SshJumpEntry::new_ssh(
+                Arc::clone(&pool),
+                registration,
+                Arc::new(Semaphore::new(max_conns)),
+                principal.clone(),
+            ));
+            match gateway.ssh_jump_registry.entry(alias.clone()) {
+                Entry::Occupied(_) => {
+                    state.queue_message(
+                        "bore ssh-gateway: SSH jump forwarding rejected".to_string(),
+                    );
+                    return;
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(Arc::clone(&entry));
+                }
+            }
+            let deregister = crate::ssh_jump::SshJumpDeregister::new(
+                gateway.ssh_jump_registry.clone(),
+                gateway.ssh_jump_pending_udp.clone(),
+                alias.clone(),
+                Arc::clone(&entry),
+            );
+            let Ok(abort) = abort_rx.await else {
+                return;
+            };
+            let token = next_forward_token();
+            gateway.ssh_jump_owners.insert(
+                alias.clone(),
+                ForwardOwner {
+                    identity: principal.clone(),
+                    abort,
+                    handle: ssh_handle.clone(),
+                    conn: Arc::downgrade(&state),
+                    key: key_for_task,
+                    token,
+                },
+            );
+            let _guard = SshJumpSshGuard {
+                _deregister: deregister,
+                owners: Arc::clone(&gateway.ssh_jump_owners),
+                alias: alias.clone(),
+                token,
+            };
+            let _admin_registration = gateway.admin.register(NewEntry {
+                role: Role::SshJumpHost,
+                peer,
+                secret_id: Some(alias.clone()),
+                public_port: Some(port),
+                notes: params.notes.clone(),
+                basic_auth: false,
+                https: false,
+                force_https: false,
+                carriers: 1,
+                auto_reconnect: false,
+                webserver_log: false,
+                udp: false,
+                vpn_relay_only: false,
+                vpn_pin_mtu: false,
+                vpn_mtu: None,
+                vpn_forward_accept: false,
+                vpn_nat_masquerade: false,
+                vpn_route_policy: None,
+                vpn_advertised: vec![],
+                vpn_nat_udp_port: None,
+                local_proxy_port: None,
+                local_host: None,
+                local_port: Some(port),
+                nat_udp_preferred_port: None,
+                nat_udp_release_timeout: None,
+                stun_server: None,
+                upnp: false,
+                try_port_prediction: false,
+                max_conns: Some(max_conns),
+                transport: Transport::Ssh,
+                identity: Some(principal.clone()),
+            });
+
+            deliver_inapplicable_warnings(
+                &state,
+                &ssh_handle,
+                "SSH jump provider",
+                &[
+                    ("https", params.https),
+                    ("force-https", params.force_https),
+                    ("basic-auth", params.basic_auth.is_some()),
+                    ("webserver-log", params.webserver_log),
+                    ("backend-tls", params.backend_tls),
+                    ("backend-tls-sni", params.backend_tls_sni.is_some()),
+                ],
+            )
+            .await;
+            state
+                .deliver(
+                    &ssh_handle,
+                    format!("SSH jump host ready: {alias}.{base_domain}:{port}"),
+                )
+                .await;
+            state
+                .deliver(&ssh_handle, format!("Owner: {principal}"))
+                .await;
+            if let Some(notes) = &params.notes {
+                state.deliver(&ssh_handle, format!("Notes: {notes}")).await;
+            }
+
+            drop(state);
+            let _pool = pool;
+            std::future::pending::<()>().await;
+        });
+        let _ = abort_tx.send(task.abort_handle());
+        self.state
+            .forwards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, task);
+        self.state
+            .queue_message(format!("SSH jump tunnel requested: {alias_for_message}"));
+        Ok(true)
     }
 
     /// Registers `-R vhost/<label>` (or a bare label on port 80/443) as a
@@ -1671,6 +1894,24 @@ impl Handler for GatewayHandler {
         reply: ChannelOpenHandle,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self
+            .gateway
+            .ssh_jump_base_domain
+            .as_deref()
+            .is_some_and(|base| crate::ssh_jump::is_namespace_destination(host_to_connect, base))
+        {
+            return open_ssh_jump_channel(
+                self,
+                channel,
+                host_to_connect,
+                port_to_connect,
+                originator_address,
+                originator_port,
+                reply,
+            )
+            .await;
+        }
+
         // The `-L` client's own report of who connected to its local listener.
         // Threaded through to an SSH *provider* as the `forwarded-tcpip`
         // originator (a native provider never sees it) — best-effort: OpenSSH
@@ -1891,6 +2132,19 @@ impl Handler for GatewayHandler {
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
         let grant = self.grant();
+        // `jump/` is an explicit namespace. Enforce classic username binding
+        // before parsing its alias/port so a legacy-authenticated mismatch gets
+        // one generic failure and learns nothing about registry state.
+        let jump_principal = if address.starts_with("jump/") {
+            let Some(principal) = self.jump_principal.clone() else {
+                self.state
+                    .queue_message("bore ssh-gateway: SSH jump forwarding rejected".to_string());
+                return Ok(false);
+            };
+            Some(principal)
+        } else {
+            None
+        };
         let spec = match parse_forward_spec(address, *port) {
             Ok(spec) => spec,
             Err(err) => {
@@ -1928,6 +2182,14 @@ impl Handler for GatewayHandler {
                 *port = u32::from(port16);
                 return self
                     .tcpip_forward_secret(address, port16, id, grant, session)
+                    .await;
+            }
+            ForwardSpec::SshJumpHost { alias, ssh_port } => {
+                let principal =
+                    jump_principal.expect("jump namespace was classic-auth checked before parsing");
+                *port = u32::from(ssh_port);
+                return self
+                    .tcpip_forward_ssh_jump(address, ssh_port, alias, principal, grant, session)
                     .await;
             }
         };
@@ -2125,6 +2387,128 @@ impl Handler for GatewayHandler {
     }
 }
 
+/// Consume one namespaced ProxyJump `direct-tcpip` channel. Classic binding is
+/// checked before alias parsing or registry lookup, and all slow provider opens
+/// run outside russh's sequential handler dispatch loop.
+fn resolve_ssh_jump_target(
+    principal: Option<&str>,
+    registry: &crate::ssh_jump::SshJumpRegistry,
+    base_domain: Option<&str>,
+    hostname: &str,
+    port: u32,
+) -> Option<(String, String, u16, Arc<crate::ssh_jump::SshJumpEntry>)> {
+    // This must remain the first operation: a legacy-authenticated session
+    // whose username did not own the credential gets the same generic result
+    // for malformed, absent and present aliases.
+    let principal = principal?.to_string();
+    let base_domain = base_domain?;
+    let requested_port = u16::try_from(port).ok().filter(|port| *port != 0)?;
+    let alias = match crate::ssh_jump::classify_destination(
+        hostname,
+        requested_port,
+        base_domain,
+        requested_port,
+    )
+    .ok()?
+    {
+        crate::ssh_jump::JumpRoute::Match { alias, .. } => alias,
+        crate::ssh_jump::JumpRoute::NotJump => return None,
+    };
+    let entry = registry
+        .get(&alias)
+        .map(|entry| Arc::clone(entry.value()))?;
+    if entry.registration.ssh_port != requested_port {
+        return None;
+    }
+    Some((principal, alias, requested_port, entry))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_ssh_jump_channel(
+    handler: &mut GatewayHandler,
+    channel: Channel<Msg>,
+    host_to_connect: &str,
+    port_to_connect: u32,
+    originator_address: &str,
+    originator_port: u32,
+    reply: ChannelOpenHandle,
+) -> Result<(), russh::Error> {
+    let reject = |state: &Arc<ConnState>| {
+        state.queue_message("bore ssh-gateway: SSH jump connection rejected".to_string());
+    };
+    let Some((principal, alias, requested_port, entry)) = resolve_ssh_jump_target(
+        handler.jump_principal.as_deref(),
+        &handler.gateway.ssh_jump_registry,
+        handler.gateway.ssh_jump_base_domain.as_deref(),
+        host_to_connect,
+        port_to_connect,
+    ) else {
+        reject(&handler.state);
+        reply.reject(ChannelOpenFailure::ConnectFailed).await;
+        return Ok(());
+    };
+    let permit = match Arc::clone(&entry.permits).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            reject(&handler.state);
+            reply.reject(ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        }
+    };
+    let originator = originator_address.parse::<IpAddr>().ok().and_then(|ip| {
+        u16::try_from(originator_port)
+            .ok()
+            .map(|port| SocketAddr::new(ip, port))
+    });
+    let pool = Arc::clone(&entry.pool);
+    let total_rx_bytes = Arc::clone(&handler.gateway.total_rx_bytes);
+    let total_tx_bytes = Arc::clone(&handler.gateway.total_tx_bytes);
+    let outer_peer = handler.peer;
+    let alias_for_task = alias.clone();
+    reply.accept().await;
+    info!(
+        %principal,
+        %alias,
+        port = requested_port,
+        %outer_peer,
+        "ssh-gateway: opening SSH jump channel"
+    );
+    tokio::spawn(async move {
+        let _permit = permit;
+        let mut provider = match timeout(
+            SSH_DIRECT_OPEN_TIMEOUT,
+            secret::open_with_failover(&pool, &alias_for_task, originator),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => {
+                warn!(alias = %alias_for_task, %err, "ssh-gateway: jump provider open failed");
+                return;
+            }
+            Err(_) => {
+                warn!(alias = %alias_for_task, "ssh-gateway: jump provider open timed out");
+                return;
+            }
+        };
+        let ssh_stream = channel.into_stream();
+        let mut counted = CountingStream::new(
+            ssh_stream,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            total_rx_bytes,
+            total_tx_bytes,
+        );
+        let buf = proxy_buffer_size();
+        if let Err(err) =
+            tokio::io::copy_bidirectional_with_sizes(&mut counted, &mut provider, buf, buf).await
+        {
+            trace!(alias = %alias_for_task, %err, "ssh-gateway: jump channel closed");
+        }
+    });
+    Ok(())
+}
+
 /// Chooses which `forwards` entry a `cancel-tcpip-forward(address, port)`
 /// targets. A public forward is keyed by its real `(bind_address,
 /// allocated_port)` and matches EXACTLY. Vhost/secret forwards, however, were
@@ -2275,6 +2659,23 @@ impl Drop for SecretSshGuard {
             .remove_if(&self.id, |_, v| Arc::ptr_eq(v, &self.pool));
         self.owners
             .remove_if(&self.id, |_, o| o.token == self.token);
+    }
+}
+
+/// Pure-OpenSSH jump-provider teardown. The embedded deregistration guard owns
+/// the shared registry/pending state; this wrapper additionally removes only
+/// the matching SSH takeover-owner token.
+struct SshJumpSshGuard {
+    _deregister: crate::ssh_jump::SshJumpDeregister,
+    owners: Arc<DashMap<String, ForwardOwner>>,
+    alias: String,
+    token: u64,
+}
+
+impl Drop for SshJumpSshGuard {
+    fn drop(&mut self) {
+        self.owners
+            .remove_if(&self.alias, |_, owner| owner.token == self.token);
     }
 }
 
@@ -2845,6 +3246,13 @@ pub enum ForwardSpec {
         /// Secret tunnel id, same charset as a vhost label.
         id: String,
     },
+    /// Pure-OpenSSH provider for one namespaced ProxyJump target.
+    SshJumpHost {
+        /// Validated single-label alias.
+        alias: String,
+        /// Exact virtual and target SSH port (nonzero in v1).
+        ssh_port: u16,
+    },
 }
 
 /// Error parsing a `tcpip-forward`/`direct-tcpip` address into a
@@ -2904,6 +3312,7 @@ fn validate_label(label: &str, max_len: usize) -> Result<String, SpecError> {
 /// - empty / `localhost` / `127.0.0.1` / `0.0.0.0` / `*` → [`ForwardSpec::Public`];
 /// - `vhost/<label>` → [`ForwardSpec::Vhost`], any port;
 /// - `secret/<id>` → [`ForwardSpec::SecretProvider`], any port;
+/// - `jump/<alias>` → [`ForwardSpec::SshJumpHost`], one nonzero exact port;
 /// - a bare label on port 80/443 → [`ForwardSpec::Vhost`];
 /// - a bare label on port 0 → [`ForwardSpec::SecretProvider`];
 /// - a bare label on any other port is ambiguous and rejected — use a
@@ -2920,6 +3329,17 @@ pub fn parse_forward_spec(addr: &str, port: u32) -> Result<ForwardSpec, SpecErro
     }
     if let Some(id) = addr.strip_prefix("secret/") {
         return validate_label(id, MAX_SECRET_ID_LEN).map(|id| ForwardSpec::SecretProvider { id });
+    }
+    if let Some(alias) = addr.strip_prefix("jump/") {
+        if port16 == 0 {
+            return Err(SpecError("SSH jump port must be nonzero".to_string()));
+        }
+        return crate::ssh_jump::validate_alias(alias)
+            .map(|alias| ForwardSpec::SshJumpHost {
+                alias,
+                ssh_port: port16,
+            })
+            .map_err(|err| SpecError(err.to_string()));
     }
     match port16 {
         80 | 443 => {
@@ -3465,6 +3885,9 @@ mod tests {
             config,
             secret::Registry::default(),
             VhostRegistry::default(),
+            crate::ssh_jump::SshJumpRegistry::default(),
+            crate::ssh_jump::PendingSshJumpUdp::default(),
+            None,
             vhost_config,
             AdminRegistry::default(),
             Arc::new(Semaphore::new(1)),
@@ -3563,6 +3986,22 @@ mod tests {
                 },
             ),
             (
+                "jump/vm-test-01",
+                22,
+                ForwardSpec::SshJumpHost {
+                    alias: "vm-test-01".to_string(),
+                    ssh_port: 22,
+                },
+            ),
+            (
+                "jump/legacy-01",
+                2222,
+                ForwardSpec::SshJumpHost {
+                    alias: "legacy-01".to_string(),
+                    ssh_port: 2222,
+                },
+            ),
+            (
                 "mysub",
                 80,
                 ForwardSpec::Vhost {
@@ -3599,6 +4038,9 @@ mod tests {
             ("-bad", 80),     // leading hyphen not allowed
             ("bad-", 443),    // trailing hyphen not allowed
             ("vhost/", 9005), // empty label after prefix
+            ("jump/", 22),    // empty jump alias
+            ("jump/Vm", 22),  // jump aliases stay lowercase
+            ("jump/vm", 0),   // a jump destination port is never dynamic
         ];
         for (addr, port) in err_cases {
             assert!(
@@ -3606,6 +4048,13 @@ mod tests {
                 "addr={addr:?} port={port} should be rejected"
             );
         }
+
+        // The classic `ssh -R 22:localhost:22` request still arrives with a
+        // normal bind address and must remain the existing public forward.
+        assert_eq!(
+            parse_forward_spec("localhost", 22).unwrap(),
+            ForwardSpec::Public { port: 22 }
+        );
     }
 
     #[test]
@@ -3844,6 +4293,76 @@ mod tests {
         ));
         assert_eq!(mismatch.identity(), Some("fabio"));
         assert_eq!(mismatch.jump_principal(), None);
+    }
+
+    #[tokio::test]
+    async fn ssh_jump_resolution_is_classic_auth_first_and_suffix_scoped() {
+        let registry = crate::ssh_jump::SshJumpRegistry::default();
+        let (io, _peer) = tokio::io::duplex(1024);
+        let (opener, _acceptor) = mux::client(io);
+        let registration = crate::ssh_jump::SshJumpRegistration::new(
+            "existing",
+            2222,
+            None,
+            1,
+            false,
+            false,
+            "localhost",
+            2222,
+        )
+        .unwrap();
+        registry.insert(
+            "existing".to_string(),
+            Arc::new(crate::ssh_jump::SshJumpEntry::new(
+                Arc::new(CarrierPool::new(mux::LinkOpener::Mux(opener))),
+                registration,
+                Arc::new(Semaphore::new(4)),
+            )),
+        );
+
+        for hostname in [
+            "existing.ssh.example.test",
+            "absent.ssh.example.test",
+            "nested.bad.ssh.example.test",
+        ] {
+            assert!(resolve_ssh_jump_target(
+                None,
+                &registry,
+                Some("ssh.example.test"),
+                hostname,
+                2222,
+            )
+            .is_none());
+        }
+
+        let (principal, alias, port, _) = resolve_ssh_jump_target(
+            Some("fabio"),
+            &registry,
+            Some("ssh.example.test"),
+            "existing.ssh.example.test",
+            2222,
+        )
+        .expect("classic-authenticated exact destination should resolve");
+        assert_eq!(principal, "fabio");
+        assert_eq!(alias, "existing");
+        assert_eq!(port, 2222);
+        assert!(resolve_ssh_jump_target(
+            Some("fabio"),
+            &registry,
+            Some("ssh.example.test"),
+            "existing.ssh.example.test",
+            22,
+        )
+        .is_none());
+
+        assert!(crate::ssh_jump::is_namespace_destination(
+            "anything.ssh.example.test",
+            "ssh.example.test"
+        ));
+        assert!(!crate::ssh_jump::is_namespace_destination(
+            "legacy-secret-id",
+            "ssh.example.test"
+        ));
     }
 
     #[test]

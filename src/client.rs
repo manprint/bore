@@ -79,7 +79,7 @@ pub struct Client {
     /// [`ClientMessage::Heartbeat`] frames so the server's recv-deadline reaper
     /// (`secret::SECRET_CTRL_TIMEOUT`) can detect a wedged/abandoned control
     /// substream; public and vhost tunnels keep the legacy heartbeat-free path.
-    is_secret_provider: bool,
+    sends_ctrl_heartbeat: bool,
 
     /// UDP socket reserved for a direct hole-punched path; `Some` only for a
     /// secret provider that opted into the `udp` direct-path mode.
@@ -293,7 +293,7 @@ impl Client {
             local_host: local_host.to_string(),
             local_port,
             remote_port,
-            is_secret_provider: false,
+            sends_ctrl_heartbeat: false,
             #[cfg(feature = "udp")]
             udp_socket: None,
             #[cfg(feature = "udp")]
@@ -496,7 +496,7 @@ impl Client {
             local_host: local_host.to_string(),
             local_port,
             remote_port: 0,
-            is_secret_provider: true,
+            sends_ctrl_heartbeat: true,
             #[cfg(feature = "udp")]
             udp_socket,
             #[cfg(feature = "udp")]
@@ -700,7 +700,7 @@ impl Client {
             local_host: local_host.to_string(),
             local_port,
             remote_port: 0,
-            is_secret_provider: false,
+            sends_ctrl_heartbeat: false,
             #[cfg(feature = "udp")]
             udp_socket: None,
             #[cfg(feature = "udp")]
@@ -730,6 +730,152 @@ impl Client {
     /// Returns the port publicly available on the remote.
     pub fn remote_port(&self) -> u16 {
         self.remote_port
+    }
+
+    /// Register a native SSH jump-host provider over the normal bore control
+    /// transport. Phase 2 serves TCP carriers only; the `udp` bit is retained
+    /// on the wire for forward-compatible operator intent and admin display.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_ssh_jump_provider(
+        local_host: &str,
+        local_port: u16,
+        to: &str,
+        alias: &str,
+        secret: Option<&str>,
+        insecure: bool,
+        carriers: u16,
+        udp: bool,
+        auto_reconnect: bool,
+        notes: Option<String>,
+    ) -> Result<Self> {
+        let registration = crate::ssh_jump::SshJumpRegistration::new(
+            alias,
+            local_port,
+            notes.as_deref(),
+            carriers,
+            udp,
+            auto_reconnect,
+            local_host,
+            local_port,
+        )?;
+        let endpoint = Endpoint::parse(to);
+        let socket = transport::connect(&endpoint, insecure).await?;
+        let (opener, acceptor) = mux::client(socket);
+        let mut control = Delimited::with_label(
+            opener
+                .open()
+                .await
+                .context("failed to open SSH jump control stream")?,
+            "client/ssh-jump-provider",
+        );
+
+        control
+            .send(ClientMessage::HelloSshJump {
+                alias: registration.alias.clone(),
+                ssh_port: registration.ssh_port,
+                notes: registration.notes.clone(),
+                carriers: registration.carriers,
+                udp: registration.udp,
+                auto_reconnect: registration.auto_reconnect,
+                local_host: registration.local_host.clone(),
+                local_port: registration.local_port,
+            })
+            .await?;
+        if let Some(secret) = secret {
+            Authenticator::new(secret)
+                .client_handshake(&mut control)
+                .await?;
+        }
+        let (hostname, remote_port) = match control.recv_timeout().await? {
+            Some(ServerMessage::SshJumpReady { hostname, port }) => (hostname, port),
+            Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+            Some(ServerMessage::Challenge(_)) => {
+                bail!("server requires authentication, but no client secret was provided")
+            }
+            Some(other) => bail!("unexpected SSH jump registration response: {other:?}"),
+            None => bail!("unexpected EOF during SSH jump registration"),
+        };
+        if remote_port != registration.ssh_port {
+            bail!(
+                "server returned SSH jump port {remote_port}, expected {}",
+                registration.ssh_port
+            );
+        }
+
+        let mut carrier_acceptors = Vec::new();
+        let mut carrier_dialer = None;
+        if carriers > 1 {
+            match control.recv_timeout().await? {
+                Some(ServerMessage::CarrierToken { token, extra }) => {
+                    for _ in 0..extra {
+                        match open_carrier(&endpoint, insecure, secret, &token).await {
+                            Ok(pair) => carrier_acceptors.push(pair),
+                            Err(err) => warn!(%err, "failed to open SSH jump carrier"),
+                        }
+                    }
+                    if extra > 0 {
+                        carrier_dialer = Some(CarrierDialer {
+                            endpoint: endpoint.clone(),
+                            insecure,
+                            secret: secret.map(str::to_string),
+                            token,
+                            target_extra: extra as usize,
+                        });
+                    }
+                }
+                Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+                other => bail!("expected SSH jump carrier token, got {other:?}"),
+            }
+        }
+
+        if udp {
+            warn!(
+                "SSH jump --udp is recorded but direct QUIC is not active in the TCP phase; using warm TCP carriers"
+            );
+        }
+        let proxy_jump_host = if endpoint.host.contains(':') {
+            format!("[{}]:{}", endpoint.host, endpoint.port)
+        } else {
+            format!("{}:{}", endpoint.host, endpoint.port)
+        };
+        info!(%hostname, port = remote_port, "SSH jump host ready");
+        if remote_port == 22 {
+            info!("connect with: ssh -J {proxy_jump_host} {hostname}");
+        } else {
+            info!("connect with: ssh -J {proxy_jump_host} -p {remote_port} {hostname}");
+        }
+
+        Ok(Self {
+            control: Some(control),
+            acceptor: Some(acceptor),
+            local_host: local_host.to_string(),
+            local_port,
+            remote_port,
+            sends_ctrl_heartbeat: true,
+            #[cfg(feature = "udp")]
+            udp_socket: None,
+            #[cfg(feature = "udp")]
+            udp_lease: None,
+            #[cfg(feature = "udp")]
+            secret: secret.map(str::to_string),
+            #[cfg(feature = "udp")]
+            udp_cfg: None,
+            #[cfg(feature = "udp")]
+            vhost_udp: false,
+            #[cfg(feature = "udp")]
+            direct_endpoint: None,
+            #[cfg(feature = "udp")]
+            direct_key: None,
+            #[cfg(feature = "udp")]
+            direct_udp_carriers: 0,
+            basic_auth: None,
+            carrier_acceptors,
+            carrier_dialer,
+            webserver_log: false,
+            access_logger: None,
+            access_logger_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            vhost_subdomain: None,
+        })
     }
 
     /// Start the client, listening for new connections.
@@ -799,7 +945,7 @@ impl Client {
         let mut preferred_port_remapped = false;
         #[cfg(feature = "udp")]
         let mut next_preferred_port_check = tokio::time::Instant::now();
-        let is_secret_provider = self.is_secret_provider;
+        let sends_ctrl_heartbeat = self.sends_ctrl_heartbeat;
         let this = Arc::new(self);
 
         // Carrier pool: pump each extra carrier's accepted data substreams into a
@@ -833,7 +979,7 @@ impl Client {
         };
         loop {
             tokio::select! {
-                _ = ctrl_heartbeat.tick(), if is_secret_provider => {
+                _ = ctrl_heartbeat.tick(), if sends_ctrl_heartbeat => {
                     if control.send(ClientMessage::Heartbeat).await.is_err() {
                         return Ok(());
                     }

@@ -1,8 +1,9 @@
 # SSH Jump Host — esempi d'uso e contratto E2E
 
-> **Stato:** specifica di piano; i comandi `sshjhost`, `jump/` e la variabile
-> `BORE_SSH_JUMP_BASE_DOMAIN` saranno disponibili solo dopo l'implementazione
-> delle fasi del piano. Nessuna nuova variabile/porta QUIC è prevista.
+> **Stato:** contratto operativo aggiornato alla fase 2. I comandi `sshjhost`,
+> `jump/` e `BORE_SSH_JUMP_BASE_DOMAIN` sono implementati sul path TCP. `--udp`
+> è accettato ma segnala il fallback TCP; il direct QUIC resta lavoro di fase 4.
+> Nessuna nuova variabile/porta QUIC è prevista.
 >
 > **Scopo:** descrivere la configurazione prevista e fornire casi stabili da
 > trasformare nei test end-to-end. Non è una prova che la funzionalità esista
@@ -14,7 +15,7 @@ Un servizio SSH locale può essere registrato in due modi:
 
 | Provider sulla VM | Comando | Autenticazione provider→bore | Trasporto server→VM |
 |---|---|---|---|
-| client nativo | `bore sshjhost ...` | `BORE_SECRET` attuale | TCP; QUIC con `--udp`, fallback TCP caldo |
+| client nativo | `bore sshjhost ...` | `BORE_SECRET` attuale | TCP; `--udp` resta in fallback TCP fino alla fase 4 |
 | OpenSSH puro | `ssh -R jump/...` | username + chiave/password del gateway | solo TCP dentro la sessione SSH |
 
 Entrambi creano lo stesso nome logico nel deployment di test, per esempio
@@ -36,7 +37,7 @@ autenticazione SSH:
 |---|---|---|
 | `443/tcp` | `7835/tcp` | demux TLS/native bore/SSH gateway |
 | `7835/udp` | `7835/udp` | STUN esistente |
-| `443/udp` | `443/udp` | endpoint QUIC condiviso vhost/public e, dopo la feature, `sshjhost` |
+| `443/udp` | `443/udp` | endpoint QUIC condiviso vhost/public; fase 4 aggiungerà `sshjhost` |
 
 TCP 443 e UDP 443 sono socket indipendenti. Inoltre terminano su porte container
 diverse: il mapping TCP va alla control port 7835, mentre il mapping UDP va
@@ -76,8 +77,8 @@ Note operative:
   per ogni `*.ssh.bore.0912345.xyz`.
 
 Il `Dockerfile` del repository compila già con `vpn,ssh-gateway`. L'immagine di
-test dovrà naturalmente essere ricostruita con il commit che implementerà
-`sshjhost`; l'immagine corrente non riconosce ancora la nuova variabile/grammatica.
+test deve essere ricostruita includendo la fase 2; immagini precedenti non
+riconoscono la nuova variabile/grammatica.
 
 ### 2.1 Preparazione dei volumi
 
@@ -286,7 +287,7 @@ Questo percorso non usa un account SSH del gateway: il provider si autentica
 con il secret bore attuale. L'operatore deve comunque autenticarsi classicamente
 al gateway e poi separatamente a `sshd` sulla VM.
 
-### 5.2 QUIC server→VM con fallback TCP
+### 5.2 Richiesta QUIC durante la fase TCP
 
 ```bash
 BORE_SERVER=https://bore.0912345.xyz \
@@ -298,11 +299,10 @@ bore sshjhost localhost:22 \
   --udp
 ```
 
-Solo la gamba bore server→provider usa QUIC. OpenSSH operatore→gateway resta
-TCP/443. Il provider apre connessioni UDP in uscita verso
-`bore.0912345.xyz:443`; se
-QUIC non è disponibile, il TCP carrier già connesso serve la stessa nuova
-sessione senza rendere indisponibile l'alias.
+Nella fase 2 questo comando registra l'intenzione UDP, emette un warning e usa
+il carrier TCP già connesso. OpenSSH operatore→gateway resta comunque TCP/443.
+La fase 4 abiliterà QUIC solo sulla gamba bore server→provider, mantenendo il
+carrier TCP caldo come fallback.
 
 ### 5.3 Porta target non standard
 
@@ -470,9 +470,9 @@ Ogni scenario usa un gateway reale OpenSSH/russh, non un mock del solo parser.
 |---|---|---|
 | `E-JH-COMPOSE` | Avviare il Compose invariato nelle porte, aggiungendo solo `BORE_SSH_JUMP_BASE_DOMAIN`. | Gateway raggiungibile su 443/TCP; endpoint condiviso presente su 443/UDP; riavvio container non cambia fingerprint; modalità correnti ancora disponibili. |
 | `E-JH-NATIVE-TCP` | Provider `bore sshjhost localhost:22 --subdomain vm-test-01`; operatore esegue un comando via `ssh -J`. | Comando eseguito sul vero target; path registrato come relay TCP. |
-| `E-JH-NATIVE-UDP` | Stesso provider con `--udp`, endpoint condiviso UDP 443 raggiungibile. | Contatore/prova `jump:` direct incrementa; sessione SSH funziona senza alterare vhost/public direct. |
-| `E-JH-SHARED-UDP443` | Attivare contemporaneamente un vhost `--udp`, un public `local --udp` e un `sshjhost --udp`, tutti sul listener 443/UDP. | Le chiavi bare-vhost, `port:<N>` e `jump:<alias>` alimentano solo il proprio pool; tutti e tre i path direct funzionano e il server ha un solo listener QUIC. |
-| `E-JH-NATIVE-FALLBACK` | Bloccare UDP 443 per il provider prima dell'apertura di una nuova sessione. | Alias resta disponibile; nuova sessione usa il carrier TCP caldo. |
+| `E-JH-NATIVE-UDP` (fase 4) | Stesso provider con `--udp`, endpoint condiviso UDP 443 raggiungibile. | Contatore/prova `jump:` direct incrementa; sessione SSH funziona senza alterare vhost/public direct. |
+| `E-JH-SHARED-UDP443` (fase 4) | Attivare contemporaneamente un vhost `--udp`, un public `local --udp` e un `sshjhost --udp`, tutti sul listener 443/UDP. | Le chiavi bare-vhost, `port:<N>` e `jump:<alias>` alimentano solo il proprio pool; tutti e tre i path direct funzionano e il server ha un solo listener QUIC. |
+| `E-JH-NATIVE-FALLBACK` (fase 4) | Bloccare UDP 443 per il provider prima dell'apertura di una nuova sessione. | Alias resta disponibile; nuova sessione usa il carrier TCP caldo. |
 | `E-JH-SSH-KEY` | Provider `-R jump/...` autenticato come `vm-provider` con file chiave omonimo. | Registrazione TCP e accesso ProxyJump riusciti; nessun direct QUIC dichiarato. |
 | `E-JH-SSH-PASSWORD` | Stesso provider con password legata alla riga `vm-provider:`. | Registrazione e accesso riusciti, sempre TCP. |
 | `E-JH-OUTER-INNER-AUTH` | Eseguire le quattro combinazioni chiave/password della §7. | Gateway e target autenticano indipendentemente; nessun segreto target compare nei log bore. |
@@ -517,7 +517,7 @@ Diagnosi attese:
 | `remote port forwarding failed` | usare `jump/<alias>:<porta>`; alias occupato; username non classic-bound; porta/label non valida |
 | Target `Permission denied` | credenziali dell'account VM, non quelle del gateway |
 | Target host key changed | verificare davvero la VM/rotazione; la chiave target è indicizzata dal nome virtuale |
-| QUIC non attivo ma SSH funziona | comportamento corretto di fallback; verificare `443/udp`, `BORE_VHOST_QUIC_PORT=443` e il contatore `jump:` |
+| `sshjhost --udp` usa TCP | comportamento corretto della fase 2; il direct `jump:` arriva nella fase 4 |
 | Provider OpenSSH non usa QUIC | comportamento previsto: il client OpenSSH puro è sempre TCP-only |
 
 ## 10. Pulizia degli esempi E2E

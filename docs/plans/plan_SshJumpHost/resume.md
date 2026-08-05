@@ -12,9 +12,9 @@
   acceptance contract for native and pure-OpenSSH providers.
 - Planning documents validated for balanced code fences, trailing whitespace,
   required files and port-topology consistency.
-- Phase 1 implemented and green. Phase 2 has not started.
-- No `sshjhost` command or server flag is exposed yet; a Phase 1 regression
-  test pins that intentional boundary.
+- Phases 1 and 2 implemented and green. Phase 3 has not started.
+- `bore sshjhost`, `--ssh-jump-base-domain`, native TCP carriers, pure-OpenSSH
+  `jump/` registration and real ProxyJump dispatch are available.
 - No commit was created by the implementation agent; the owner will review and
   commit this phase.
 
@@ -55,6 +55,48 @@ Run on 2026-08-05 with all features:
   `cargo test --no-default-features ssh_jump --no-fail-fast` — pass: 10
   focused tests, 0 failed.
 
+## Phase 2 checkpoint
+
+- Added the ungated `bore sshjhost <HOST:PORT>` command with alias validation,
+  bore-secret auth, notes, carrier pool/top-up, reconnect, TCP fallback warning
+  for the future `--udp` path, and exact ProxyJump connection logging.
+- Added `--ssh-jump-base-domain` / `BORE_SSH_JUMP_BASE_DOMAIN`; it normalizes
+  the namespace, requires a feature-enabled `--ssh-gateway`, and populates the
+  sanitized server config view without exposing secrets.
+- Implemented native-provider registration with first-wins aliases, capped
+  `CarrierPool`, per-tunnel permits, 20 s client heartbeat, the required
+  500 ms-tick/60 s receive reaper and replacement-safe registry/admin teardown.
+- Added pure-OpenSSH provider grammar
+  `-R jump/<alias>:<port>:host:<port>` in the shared jump registry. Classic
+  username binding is checked before parsing; same-username reconnect takeover,
+  different-user/native collisions, cancel and multi-forward RAII are covered.
+  Numeric `-R 22:localhost:22` remains the existing public forward.
+- Added exact jump-FQDN `direct-tcpip` dispatch with generic fail-closed auth,
+  exact nonstandard-port matching, bounded provider opens, carrier failover,
+  no SSH-side `STREAM_READY`, and one-task half-close-safe splice.
+- Added real stock-OpenSSH E2E coverage in `tests/ssh_jump_test.rs`: native and
+  pure providers, provider gateway auth by key and password, inner target key
+  and password auth, two forwards in one session, takeover/collisions, wrong
+  username/port, carrier pool, liveness reaper and alias reclaim.
+- Updated README as the operational source of truth, `docs/SSH_GATEWAY.md`, and
+  `examples_usage.md`: Compose adds only
+  `BORE_SSH_JUMP_BASE_DOMAIN=ssh.bore.0912345.xyz`; no 8443 mapping is needed;
+  Phase 2 is explicitly TCP-only while existing `443/udp` remains unchanged.
+
+## Phase 2 gates
+
+Run on 2026-08-05 with all features:
+
+- `cargo fmt --all -- --check` — pass.
+- `cargo clippy --all-targets --all-features -- -D warnings` — pass.
+- `cargo test --all-features --test ssh_jump_test` — pass: 4 passed, 0 failed.
+- `cargo test --all-features --test ssh_gateway_test` — pass: 42 passed, 0 failed.
+- `cargo test --all-features --test secret_test` — pass: 17 passed, 0 failed.
+- `cargo test --all-features` — pass: 893 passed, 0 failed, 2 ignored
+  (existing root/CAP_NET_ADMIN-only tests).
+- Extra small-client compatibility check:
+  `cargo check --no-default-features --all-targets` — pass with no warnings.
+
 ## Locked configuration
 
 - SSH gateway: TCP 443 through OpenSSH config alias.
@@ -77,6 +119,6 @@ Run on 2026-08-05 with all features:
 
 ## Next
 
-Stop at the green Phase 1 boundary. Await the owner's review/commit and an
-explicit instruction before beginning `phase_02.md`; do not begin Phase 2
+Stop at the green Phase 2 boundary. Await the owner's review/commit and an
+explicit instruction before beginning `phase_03.md`; do not begin Phase 3
 automatically.

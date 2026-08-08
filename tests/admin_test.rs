@@ -468,6 +468,8 @@ fn t_views_serialize_stable() {
         ssh_gateway: false,
         ssh_jump_enabled: false,
         ssh_jump_base_domain: None,
+        ssh_jump_classic_auth_required: false,
+        ssh_jump_direct_quic_port: None,
         ssh_port: None,
         ssh_advertise_address: None,
         ssh_advertise_port: None,
@@ -491,6 +493,7 @@ fn t_views_serialize_stable() {
         public_tunnels: 1,
         secret_tunnels: 2,
         vhost_domains: 2,
+        ssh_jump_hosts: 0,
         #[cfg(feature = "vpn")]
         vpn_links: 0,
         vhost_http_port: Some(80),
@@ -603,6 +606,36 @@ fn t_views_serialize_stable() {
     let json_vhost = serde_json::to_value(&vhost).expect("serialize VhostView");
     assert_no_secret_keys(&json_vhost, "");
 
+    // Dedicated jump-host view contains operational state only: no bore secret,
+    // password/key material, classic gateway username or target account.
+    let jump = SshJumpView {
+        id: 4,
+        hostname: "vm-01.ssh.example.test".into(),
+        ssh_port: 22,
+        peer: "192.0.2.4:54324".into(),
+        provider_type: "native".into(),
+        notes: Some("production VM".into()),
+        requested_carriers: 4,
+        effective_carriers: 2,
+        udp_requested: true,
+        udp_active: false,
+        auto_reconnect: true,
+        max_conns: Some(50),
+        active_connections: 3,
+        uptime_secs: 120,
+        relay_tx_bytes: 1024,
+        relay_rx_bytes: 2048,
+        direct_tx_bytes: 0,
+        direct_rx_bytes: 0,
+        local_host: "127.0.0.1".into(),
+        local_port: 22,
+    };
+    let json_jump = serde_json::to_value(&jump).expect("serialize SshJumpView");
+    assert_no_secret_keys(&json_jump, "");
+    assert!(json_jump.get("identity").is_none());
+    assert!(json_jump.get("username").is_none());
+    assert!(json_jump.get("target_account").is_none());
+
     // MetricsView (includes new counters).
     let metrics = MetricsView {
         uptime_secs: 300,
@@ -612,6 +645,7 @@ fn t_views_serialize_stable() {
         public_tunnels: 1,
         secret_tunnels: 2,
         vhost_domains: 1,
+        ssh_jump_hosts: 0,
         #[cfg(feature = "vpn")]
         vpn_links: 0,
         active_connections: 5,
@@ -828,7 +862,11 @@ async fn t_api_requires_token() -> Result<()> {
     wait_port(PORT, true).await;
 
     // Test each endpoint without token → 401.
-    for path in &["/admin/api/v1/summary", "/admin/api/v1/tunnels"] {
+    for path in &[
+        "/admin/api/v1/summary",
+        "/admin/api/v1/tunnels",
+        "/admin/api/v1/ssh-jump",
+    ] {
         let s = TcpStream::connect(("127.0.0.1", PORT)).await?;
         let resp = http_get(s, path, None).await?;
         assert!(
@@ -840,7 +878,11 @@ async fn t_api_requires_token() -> Result<()> {
     }
 
     // With Bearer token → 200.
-    for path in &["/admin/api/v1/summary", "/admin/api/v1/tunnels"] {
+    for path in &[
+        "/admin/api/v1/summary",
+        "/admin/api/v1/tunnels",
+        "/admin/api/v1/ssh-jump",
+    ] {
         let s = TcpStream::connect(("127.0.0.1", PORT)).await?;
         let resp = http_get(s, path, Some(TOKEN)).await?;
         assert!(

@@ -30,6 +30,8 @@ pub struct SummaryView {
     pub secret_tunnels: usize,
     /// Number of live vhost domains.
     pub vhost_domains: usize,
+    /// Number of live SSH jump-host providers.
+    pub ssh_jump_hosts: usize,
     /// Number of live VPN links (cfg vpn).
     #[cfg(feature = "vpn")]
     pub vpn_links: usize,
@@ -213,6 +215,51 @@ pub struct VhostView {
     pub identity: Option<String>,
 }
 
+/// Sanitized SSH jump-host provider state.
+#[derive(Serialize, Clone)]
+pub struct SshJumpView {
+    /// Stable admin-registry id.
+    pub id: u64,
+    /// Full hostname operators use as the ProxyJump destination.
+    pub hostname: String,
+    /// Exact target SSH port registered by the provider.
+    pub ssh_port: u16,
+    /// Remote address of the provider control connection.
+    pub peer: String,
+    /// Provider class (`native` or `ssh`); never an account name.
+    pub provider_type: String,
+    /// Operator notes.
+    pub notes: Option<String>,
+    /// Number of carriers requested by the native provider.
+    pub requested_carriers: u16,
+    /// Effective bounded carrier count.
+    pub effective_carriers: u16,
+    /// Whether the provider requested direct QUIC.
+    pub udp_requested: bool,
+    /// Whether at least one direct QUIC carrier is live.
+    pub udp_active: bool,
+    /// Provider auto-reconnect setting.
+    pub auto_reconnect: bool,
+    /// Per-provider concurrent connection cap.
+    pub max_conns: Option<usize>,
+    /// Live SSH channels using this provider.
+    pub active_connections: usize,
+    /// Seconds since registration.
+    pub uptime_secs: u64,
+    /// Relay bytes sent toward the SSH client.
+    pub relay_tx_bytes: u64,
+    /// Relay bytes received from the SSH client.
+    pub relay_rx_bytes: u64,
+    /// Direct bytes sent toward the SSH client.
+    pub direct_tx_bytes: u64,
+    /// Direct bytes received from the SSH client.
+    pub direct_rx_bytes: u64,
+    /// Provider-local target host intentionally supplied in registration metadata.
+    pub local_host: String,
+    /// Provider-local target port.
+    pub local_port: u16,
+}
+
 /// VPN link (listener or connector).
 #[cfg(feature = "vpn")]
 #[derive(Serialize, Clone)]
@@ -377,6 +424,10 @@ pub struct ConfigView {
     pub ssh_jump_enabled: bool,
     /// SSH jump base domain.
     pub ssh_jump_base_domain: Option<String>,
+    /// Jump routing requires username-bound classic gateway authentication.
+    pub ssh_jump_classic_auth_required: bool,
+    /// Shared server-direct QUIC UDP port reserved for jump providers.
+    pub ssh_jump_direct_quic_port: Option<u16>,
     /// SSH gateway listen port (if enabled).
     pub ssh_port: Option<u16>,
     /// SSH advertised address (if configured).
@@ -410,6 +461,8 @@ pub struct MetricsView {
     pub secret_tunnels: usize,
     /// Number of live vhost domains.
     pub vhost_domains: usize,
+    /// Number of live SSH jump-host providers.
+    pub ssh_jump_hosts: usize,
     /// Number of live VPN links (cfg vpn).
     #[cfg(feature = "vpn")]
     pub vpn_links: usize,
@@ -453,6 +506,7 @@ mod tests {
             public_tunnels: 1,
             secret_tunnels: 2,
             vhost_domains: 2,
+            ssh_jump_hosts: 0,
             #[cfg(feature = "vpn")]
             vpn_links: 0,
             vhost_http_port: Some(80),
@@ -558,6 +612,8 @@ mod tests {
             ssh_gateway: false,
             ssh_jump_enabled: false,
             ssh_jump_base_domain: None,
+            ssh_jump_classic_auth_required: false,
+            ssh_jump_direct_quic_port: None,
             ssh_port: None,
             ssh_advertise_address: None,
             ssh_advertise_port: None,
@@ -585,6 +641,7 @@ mod tests {
             public_tunnels: 2,
             secret_tunnels: 1,
             vhost_domains: 1,
+            ssh_jump_hosts: 0,
             #[cfg(feature = "vpn")]
             vpn_links: 0,
             active_connections: 42,
@@ -613,6 +670,7 @@ mod tests {
             public_tunnels: 2,
             secret_tunnels: 1,
             vhost_domains: 1,
+            ssh_jump_hosts: 0,
             #[cfg(feature = "vpn")]
             vpn_links: 0,
             active_connections: 10,
@@ -646,6 +704,7 @@ mod tests {
             public_tunnels: 1,
             secret_tunnels: 2,
             vhost_domains: 2,
+            ssh_jump_hosts: 0,
             #[cfg(feature = "vpn")]
             vpn_links: 0,
             vhost_http_port: None,
@@ -744,6 +803,8 @@ mod tests {
             ssh_gateway: false,
             ssh_jump_enabled: false,
             ssh_jump_base_domain: None,
+            ssh_jump_classic_auth_required: false,
+            ssh_jump_direct_quic_port: None,
             ssh_port: None,
             ssh_advertise_address: None,
             ssh_advertise_port: None,

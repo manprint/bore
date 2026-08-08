@@ -1,6 +1,6 @@
 # SSH Jump Host — Resume
 
-> **Last update:** 2026-08-05
+> **Last update:** 2026-08-08
 > **Planning model:** GPT-5/Codex
 
 ## Status
@@ -12,11 +12,11 @@
   acceptance contract for native and pure-OpenSSH providers.
 - Planning documents validated for balanced code fences, trailing whitespace,
   required files and port-topology consistency.
-- Phases 1 and 2 implemented and green. Phase 3 has not started.
+- Phases 1–3 implemented and green. Phase 4 has not started.
 - `bore sshjhost`, `--ssh-jump-base-domain`, native TCP carriers, pure-OpenSSH
   `jump/` registration and real ProxyJump dispatch are available.
-- No commit was created by the implementation agent; the owner will review and
-  commit this phase.
+- Phase 2 is commit `569ef92a` (`fase2.`). Phase 3 is implemented in the current
+  uncommitted worktree for owner review.
 
 ## Phase 1 checkpoint
 
@@ -97,6 +97,42 @@ Run on 2026-08-05 with all features:
 - Extra small-client compatibility check:
   `cargo check --no-default-features --all-targets` — pass with no warnings.
 
+## Phase 3 checkpoint
+
+- Added exact per-alias active/relay counters shared by the routing registry and
+  its single `Role::SshJumpHost` admin row. The existing per-entry semaphore,
+  10 s provider-open bound, carrier failover and RAII cleanup now have focused
+  cancellation/failover/counter coverage.
+- Hardened collision/reconnect behavior: native remains first-wins; pure SSH
+  takeover remains same-username-only; concurrent native reconnect storms cannot
+  replace the owner or create extra admin rows.
+- Added dedicated token-guarded `/admin/api/v1/ssh-jump`, `SshJumpView`, summary
+  and metrics counts, config parity and the **Jump Hosts** SPA panel. The view is
+  operational-only and omits usernames, identities, secrets, passwords and keys.
+- Added structured `allow`/`deny`/`open`/`close` audit events with peer,
+  principal, alias, port, provider type/owner class and selected path. Client
+  errors stay generic; repeated username mismatches are logarithmically sampled.
+- Updated README, SSH gateway guides, admin architecture/section docs and the
+  root invariant ledger for the new behavior.
+
+## Phase 3 gates
+
+Run on 2026-08-08:
+
+- `cargo fmt --all -- --check` — pass.
+- `cargo clippy --all-targets --all-features -- -D warnings` — pass.
+- `cargo test --all-features admin` — pass: 38 focused tests, 0 failed.
+- `cargo test --all-features --test ssh_jump_test` — pass: 4 passed, 0 failed.
+- `npm test` — pass: 92 passed, 0 failed.
+- `cargo test --all-features -- --test-threads=1` — pass: 896 passed, 0 failed,
+  2 existing ignored (898 listed). Serial execution is required because the SSH
+  integration cases share process/listener state.
+- `cargo test --no-default-features` — pass: 544 tests listed, 0 failed.
+- `cargo test --no-default-features --features ssh-gateway -- --test-threads=1`
+  — pass: 656 tests listed, 0 failed.
+- `cargo build --release --all-features` — pass.
+- `sudo -n /abs/path/scripts/ssh_gateway_test.sh` — pass: 16, fail: 0.
+
 ## Locked configuration
 
 - SSH gateway: TCP 443 through OpenSSH config alias.
@@ -119,6 +155,6 @@ Run on 2026-08-05 with all features:
 
 ## Next
 
-Stop at the green Phase 2 boundary. Await the owner's review/commit and an
-explicit instruction before beginning `phase_03.md`; do not begin Phase 3
+Stop at the green Phase 3 boundary. Await the owner's review/commit and an
+explicit instruction before beginning `phase_04.md`; do not begin Phase 4
 automatically.

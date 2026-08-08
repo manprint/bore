@@ -109,6 +109,7 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             "/admin/api/v1/summary" => serde_json::to_vec(&crate::admin_api::summary(srv))?,
             "/admin/api/v1/tunnels" => serde_json::to_vec(&crate::admin_api::tunnels(srv))?,
             "/admin/api/v1/secret" => serde_json::to_vec(&crate::admin_api::secret(srv))?,
+            "/admin/api/v1/ssh-jump" => serde_json::to_vec(&crate::admin_api::ssh_jump(srv))?,
             "/admin/api/v1/vhost" => serde_json::to_vec(&crate::admin_api::vhost(srv))?,
             "/admin/api/v1/vpn" => {
                 #[cfg(feature = "vpn")]

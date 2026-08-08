@@ -1113,8 +1113,23 @@ ssh -p 2222 -J fabio@bore.example.com:443 admin@legacy.ssh.bore.example.com
 ```
 
 Il gateway autentica `fabio`; il vero `sshd` target autentica separatamente `ubuntu` o
-`admin` con la normale chiave/password interna. Non serve agent forwarding. La fase 2 usa
-solo carrier TCP; `bore sshjhost --udp` segnala esplicitamente il fallback TCP finché il
+`admin` con la normale chiave/password interna. Non serve agent forwarding. Il percorso
+attuale usa solo carrier TCP; `bore sshjhost --udp` segnala esplicitamente il fallback TCP finché il
 direct QUIC non viene implementato nella fase dedicata. Configurazione Compose, tabella
 completa dei flag e collocazione delle chiavi sono nella sezione
 [SSH jump hosts](../README.md#ssh-jump-hosts) del README, fonte operativa primaria.
+
+Ogni alias applica il proprio `max-conns`; l'apertura verso il provider ha timeout 10 s e
+failover sugli altri carrier vivi. Permit, contatore connessioni e riga admin sono RAII:
+timeout, cancellazione e morte del provider non lasciano capacità o righe zombie. Il
+registry resta first-wins per provider nativi; solo un provider OpenSSH con lo stesso
+username esatto può fare takeover della propria registrazione.
+
+La dashboard espone un pannello **Jump Hosts** dedicato, alimentato da
+`/admin/api/v1/ssh-jump`, con alias/hostname, peer, tipo provider, target locale, carrier,
+limiti, uptime e byte relay/direct. Username classici e credenziali non sono serializzati.
+La config sanitizzata riporta namespace, requisito di classic auth e porta QUIC prevista.
+
+I log strutturati `allow`/`deny`/`open`/`close` includono peer esterno, principal operatore,
+alias, porta, tipo/classe proprietario e path selezionato. Il client riceve errori generici;
+la policy dettagliata resta server-side e i mismatch ripetuti di username sono campionati.

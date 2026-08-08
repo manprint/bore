@@ -1,6 +1,6 @@
 //! SSH jump-host contracts shared by the native provider and SSH gateway.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "ssh-gateway")]
 use std::time::Duration;
@@ -248,6 +248,16 @@ pub struct SshJumpEntry {
     pub registration: SshJumpRegistration,
     /// Real per-tunnel concurrent connection bound.
     pub permits: Arc<Semaphore>,
+    /// Live proxied channels, shared with the dedicated admin row.
+    pub active: Arc<AtomicUsize>,
+    /// Relay bytes sent toward the SSH client, shared with the admin row.
+    pub relay_tx_bytes: Arc<AtomicU64>,
+    /// Relay bytes received from the SSH client, shared with the admin row.
+    pub relay_rx_bytes: Arc<AtomicU64>,
+    /// Direct-path bytes sent toward the SSH client (wired by Phase 4).
+    pub direct_tx_bytes: Arc<AtomicU64>,
+    /// Direct-path bytes received from the SSH client (wired by Phase 4).
+    pub direct_rx_bytes: Arc<AtomicU64>,
     /// Live direct QUIC connections for a native provider.
     #[cfg(feature = "udp")]
     pub direct: crate::vhost::DirectPool,
@@ -299,6 +309,11 @@ impl SshJumpEntry {
             owner,
             registration,
             permits,
+            active: Arc::new(AtomicUsize::new(0)),
+            relay_tx_bytes: Arc::new(AtomicU64::new(0)),
+            relay_rx_bytes: Arc::new(AtomicU64::new(0)),
+            direct_tx_bytes: Arc::new(AtomicU64::new(0)),
+            direct_rx_bytes: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "udp")]
             direct: crate::vhost::DirectPool::default(),
         }
@@ -314,6 +329,14 @@ impl SshJumpEntry {
         match &self.owner {
             SshJumpOwner::Native => None,
             SshJumpOwner::Ssh { username } => Some(username),
+        }
+    }
+
+    /// Stable low-cardinality provider class for logs/admin output.
+    pub fn provider_type(&self) -> &'static str {
+        match &self.owner {
+            SshJumpOwner::Native => "native",
+            SshJumpOwner::Ssh { .. } => "ssh",
         }
     }
 }
@@ -435,39 +458,44 @@ pub(crate) async fn serve_native_provider(
     let _deregister =
         SshJumpDeregister::new(registry, pending_udp, alias.clone(), Arc::clone(&entry));
 
-    let _admin_registration = admin.register(NewEntry {
-        role: Role::SshJumpHost,
-        peer,
-        secret_id: Some(alias.clone()),
-        public_port: Some(registration.ssh_port),
-        notes: registration.notes.clone(),
-        basic_auth: false,
-        https: false,
-        force_https: false,
-        carriers: effective_carriers,
-        auto_reconnect: registration.auto_reconnect,
-        webserver_log: false,
-        udp: registration.udp,
-        vpn_relay_only: false,
-        vpn_pin_mtu: false,
-        vpn_mtu: None,
-        vpn_forward_accept: false,
-        vpn_nat_masquerade: false,
-        vpn_route_policy: None,
-        vpn_advertised: vec![],
-        vpn_nat_udp_port: None,
-        local_proxy_port: None,
-        local_host: Some(registration.local_host.clone()),
-        local_port: Some(registration.local_port),
-        nat_udp_preferred_port: None,
-        nat_udp_release_timeout: None,
-        stun_server: None,
-        upnp: false,
-        try_port_prediction: false,
-        max_conns: Some(max_conns),
-        transport: Transport::Bore,
-        identity: None,
-    });
+    let _admin_registration = admin.register_with_counters(
+        NewEntry {
+            role: Role::SshJumpHost,
+            peer,
+            secret_id: Some(alias.clone()),
+            public_port: Some(registration.ssh_port),
+            notes: registration.notes.clone(),
+            basic_auth: false,
+            https: false,
+            force_https: false,
+            carriers: effective_carriers,
+            auto_reconnect: registration.auto_reconnect,
+            webserver_log: false,
+            udp: registration.udp,
+            vpn_relay_only: false,
+            vpn_pin_mtu: false,
+            vpn_mtu: None,
+            vpn_forward_accept: false,
+            vpn_nat_masquerade: false,
+            vpn_route_policy: None,
+            vpn_advertised: vec![],
+            vpn_nat_udp_port: None,
+            local_proxy_port: None,
+            local_host: Some(registration.local_host.clone()),
+            local_port: Some(registration.local_port),
+            nat_udp_preferred_port: None,
+            nat_udp_release_timeout: None,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
+            max_conns: Some(max_conns),
+            transport: Transport::Bore,
+            identity: None,
+        },
+        Arc::clone(&entry.active),
+        Arc::clone(&entry.relay_tx_bytes),
+        Arc::clone(&entry.relay_rx_bytes),
+    );
 
     let hostname = format!("{alias}.{base_domain}");
     control

@@ -1,8 +1,9 @@
 # bore SSH Gateway — guida utente
 
 `bore server --ssh-gateway` fa da server SSH embedded, così un client `ssh`/`autossh`
-**stock** (nessun binario `bore` sul client) può aprire tunnel **public**, **vhost** e
-**secret**. Documento completo di analisi/architettura: `docs/SSH_GATEWAY.md`. Questo
+**stock** (nessun binario `bore` sul client) può aprire tunnel **public**, **vhost**,
+**secret** e pubblicare/usare target **SSH jump**. Documento completo di
+analisi/architettura: `docs/SSH_GATEWAY.md`. Questo
 file è la guida rapida "come si usa", con esempi per ogni modalità, ogni parametro, e
 `autossh`/systemd per ognuna.
 
@@ -16,6 +17,7 @@ bore server \
     --admin-token "$(openssl rand -hex 24)" \
     --vhost-base-domain bore.example.com --vhost-http-port 7835 \
     --ssh-gateway \
+    --ssh-jump-base-domain ssh.bore.example.com \
     --ssh-host-key-file /etc/bore/ssh/host_key.pem \
     --ssh-authorized-keys-dir /etc/bore/ssh/authorized_keys.d \
     --ssh-passwords-file /etc/bore/ssh/passwords \
@@ -27,6 +29,7 @@ Flag server (tutti `#[cfg(feature = "ssh-gateway")]`):
 | Flag | Env | Obbligatorio | Descrizione |
 |---|---|---|---|
 | `--ssh-gateway` | `BORE_SSH_GATEWAY` | sì (per attivare) | Abilita il gateway. Richiede **almeno uno** tra `--ssh-authorized-keys-dir`/`--ssh-passwords-file` (fail-fast altrimenti). |
+| `--ssh-jump-base-domain <DOMAIN>` | `BORE_SSH_JUMP_BASE_DOMAIN` | no | Abilita il namespace esatto `<alias>.<domain>` per ProxyJump; richiede `--ssh-gateway`. |
 | `--ssh-port <PORT>` | `BORE_SSH_PORT` | no | Porta dedicata extra per SSH. Senza, SSH è servito in demux sulla STESSA porta di controllo/vhost (443/7835) — nessuna porta aggiuntiva da aprire. |
 | `--ssh-host-key-file <PATH>` | `BORE_SSH_HOST_KEY_FILE` | no (default `bore_ssh_host_key.pem`) | Host key ed25519, generata al primo avvio se assente. Persistere in un volume, altrimenti il fingerprint cambia a ogni riavvio → `StrictHostKeyChecking` rompe tutti gli autossh. |
 | `--ssh-authorized-keys-dir <DIR>` | `BORE_SSH_AUTHORIZED_KEYS_DIR` | uno dei due | Directory con file `authorized_keys`-format (uno o più file, riletti a OGNI tentativo di auth — hot-reload gratis). |
@@ -82,8 +85,10 @@ fabio:$argon2id$...
 ```
 
 Solo hash argon2id sul disco, mai plaintext. Più righe valide contemporaneamente; la
-`label` della riga vincente diventa l'identità. Username SSH (`user@host`) è libero/ignorato
-dal server, usato solo come etichetta secondaria in login.
+`label` della riga vincente diventa l'identità. Nei modi legacy lo username SSH
+(`user@host`) resta libero/ignorato. Per publish e connect jump, invece, il basename del
+file chiave o la label password deve coincidere esattamente con lo username SSH; commenti
+della chiave e identità legacy non diventano principal jump.
 
 ```bash
 sshpass -p 'correct-horse-battery-staple' ssh -p 7835 -R 9998:localhost:8080 alice@bore.example.com
@@ -210,7 +215,39 @@ AUTOSSH_GATETIME=0 autossh -M0 $OPTS -p 443 -L 8899:secret/tcp-secret-id:1 bore.
 > L'unica funzionalità persa è il path diretto p2p (QUIC), che richiede il client bore
 > nativo su ENTRAMBI i lati (§7).
 
-### 4.5 Banner di stato del tunnel
+### 4.5 SSH JUMP — ProxyJump verso un target registrato
+
+Provider OpenSSH puro, senza binario bore:
+
+```bash
+ssh $OPTS -T -p 443 -R 'jump/vm-test-01:22:localhost:22' \
+    vm-provider@bore.example.com -- 'notes="VM eu-south-1"'
+```
+
+Provider nativo alternativo:
+
+```bash
+bore sshjhost localhost:22 --subdomain vm-test-01 \
+    --to https://bore.example.com --secret "$BORE_SECRET" --auto-reconnect
+```
+
+Operatore stock OpenSSH:
+
+```bash
+ssh -J fabio@bore.example.com:443 ubuntu@vm-test-01.ssh.bore.example.com
+# target non standard: host locale e porta virtuale coincidono in v1
+ssh -p 2222 -J fabio@bore.example.com:443 admin@legacy.ssh.bore.example.com
+```
+
+Il gateway autentica `fabio`; il target autentica separatamente `ubuntu`/`admin`. Ogni
+alias ha un limite `max-conns`, apertura provider entro 10 s e failover carrier. Provider
+nativi sono first-wins; un provider OpenSSH può sostituire solo una propria registrazione
+con identico username. Il pannello admin **Jump Hosts** e
+`/admin/api/v1/ssh-jump` espongono stato/counter sanitizzati. I log strutturati riportano
+allow/deny/open/close senza credenziali; gli errori mostrati al client restano generici.
+Il path attuale è TCP; `--udp` sul provider nativo avvisa del fallback fino alla Fase 4.
+
+### 4.6 Banner di stato del tunnel
 
 Una volta stabilito il forward, il gateway scrive un report sul canale sessione (lo stesso
 canale che una shell interattiva avrebbe usato — §4's box qui sopra spiega perché omettere
@@ -297,7 +334,7 @@ caso.
 > **⚠️ Vale la regola di §4: mai `-N`.** Con `-N` il comando dopo `--` non viene MAI
 > inviato (OpenSSH non apre alcun canale sessione — `man ssh_config` → `SessionType`),
 > quindi `notes=`/`max-conns=`/`https=on`/ecc. restano ai default **senza alcun avviso
-> visibile**. Verificare sempre i parametri applicati o nel banner di stato (§4.5) o nella
+> visibile**. Verificare sempre i parametri applicati o nel banner di stato (§4.6) o nella
 > dashboard admin dopo la connessione.
 
 ```bash
@@ -530,7 +567,7 @@ autossh -M0 -T -p 443 -R vhost/app:0:localhost:5000 bore.example.com
 ```
 
 **Non usare `-N`** (mai): skipa interamente il canale sessione, quindi il cliente non riceve
-il banner di stato (§4.5) né gli avvisi di parametri inapplicabili — il terminale rimane muto.
+il banner di stato (§4.6) né gli avvisi di parametri inapplicabili — il terminale rimane muto.
 Usa `-T` al suo posto.
 
 **`Allocated port 1 for remote forward to ...`**

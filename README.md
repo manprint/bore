@@ -582,12 +582,16 @@ bore server --secret mysecret --admin-token "$(openssl rand -hex 24)"
 # open http://your-server:7835/admin/status and paste the token
 ```
 
-The page lists connected public tunnels, VPN links, vhost providers and, for secret tunnels,
-both the provider and all attached `bore proxy` consumers (SSH-gateway originated tunnels
-included) — with their client address, options, `--notes`, live
+The page lists connected public tunnels, SSH jump hosts, VPN links, vhost providers and,
+for secret tunnels, both the provider and all attached `bore proxy` consumers
+(SSH-gateway originated tunnels included) — with their client address, options, `--notes`, live
 connection count, and uptime. It refreshes automatically (polling every ~2s) and keeps **no**
 persistent state: it reflects exactly what is connected right now. The frontend is embedded
 in the binary; no external assets are fetched.
+
+SSH jump hosts have a dedicated **Jump Hosts** panel and token-guarded
+`/admin/api/v1/ssh-jump` endpoint. It reports operational metadata and counters only;
+classic usernames, credential material, the bore secret and private keys are never exposed.
 
 Annotate any tunnel with `--notes "..."` (on `bore local`/`bore proxy`/`bore vhost`, or
 `notes=` via the SSH gateway) to label it on this page.
@@ -643,7 +647,7 @@ environment:
 ```
 
 Do not add port 8443. TCP 443 and UDP 443 are distinct sockets; in this Compose they also
-map to different container ports. Phase 2's jump data path is TCP-only, so the existing
+map to different container ports. The current jump data path is TCP-only, so the existing
 `443/udp` mapping is unchanged and reserved for the later direct-QUIC phase.
 
 Server option:
@@ -677,7 +681,7 @@ The native provider authenticates to the bore control plane with the existing
 `BORE_SECRET`; it does not use a gateway username. TCP carriers stay warm and
 `--carriers N` adds parallel carrier connections for concurrent SSH sessions.
 
-Complete Phase 2 client reference:
+Complete TCP client reference:
 
 | Argument/flag | Env | Meaning |
 |---|---|---|
@@ -689,7 +693,7 @@ Complete Phase 2 client reference:
 | `--notes <TEXT>` | `BORE_NOTES` | Bounded operational note. |
 | `--carriers <N>` | `BORE_CARRIERS` | Requested warm TCP carriers (default 1; server caps with `--max-carriers`). |
 | `--auto-reconnect` | `BORE_AUTO_RECONNECT` | Re-register with exponential backoff after a disconnect. |
-| `--udp` | `BORE_PREFER_UDP` | Accepted and reported, but Phase 2 explicitly falls back to TCP; direct QUIC lands in Phase 4. |
+| `--udp` | `BORE_PREFER_UDP` | Accepted and reported, but currently falls back to TCP; direct QUIC lands in Phase 4. |
 
 ### Pure OpenSSH provider
 
@@ -709,6 +713,25 @@ username may replace its previous registration; another username, a native provi
 second native provider cannot take the alias. The old syntax remains unchanged:
 `ssh -R 22:localhost:22 bore.tld` requests the existing public port 22 and does not register
 a jump host.
+
+### Limits, lifecycle and audit
+
+Every jump alias has its own `--max-conns` semaphore. Native providers also use the
+server-capped `--carriers` pool; opening a provider channel is bounded to 10 seconds and
+retries another live carrier when one dies between selection and open. Permits, activity
+counters and the single logical admin row are RAII-owned, so cancellation, timeout and
+provider failure cannot leak capacity or duplicate dashboard rows.
+
+Native aliases are first-wins. Pure-OpenSSH reconnects may replace only a registration
+owned by the same exact classic username; cross-user and cross-transport collisions are
+rejected. Native providers heartbeat every 20 seconds and the server reaps an abandoned
+control connection after 60 seconds, checked on the 500 ms control tick.
+
+The server emits structured `allow`, `deny`, `open` and `close` events with the outer peer,
+operator principal, alias, requested port, provider type/owner class and selected path.
+Credentials are never logged; client-visible denials remain generic, detailed reasons stay
+server-side, and repeated username-mismatch diagnostics are sampled to bounded logarithmic
+volume.
 
 ### Classic authentication and key placement
 

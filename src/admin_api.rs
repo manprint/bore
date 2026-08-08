@@ -15,7 +15,8 @@ pub fn summary(server: &Server) -> SummaryView {
     let vhost_reg = server.vhost_registry();
 
     let snapshot = admin.snapshot();
-    let (mut public_tunnels, mut secret_tunnels, mut ssh_tunnels) = (0, 0, 0);
+    let (mut public_tunnels, mut secret_tunnels, mut ssh_tunnels, mut ssh_jump_hosts) =
+        (0, 0, 0, 0);
     // VPN link count must come from the long-lived admin registry: the provider
     // registry (`vpn_providers`) is consumed when a 1:1 link pairs, so its
     // `.len()` reads 0 for every established link. Count distinct shared ids.
@@ -31,6 +32,7 @@ pub fn summary(server: &Server) -> SummaryView {
         match entry.role {
             Role::Public => public_tunnels += 1,
             Role::SecretProvider | Role::SecretConsumer => secret_tunnels += 1,
+            Role::SshJumpHost => ssh_jump_hosts += 1,
             #[cfg(feature = "vpn")]
             Role::VpnListener | Role::VpnConnector => {
                 vpn_ids.insert(entry.secret_id.clone().unwrap_or_default());
@@ -59,6 +61,7 @@ pub fn summary(server: &Server) -> SummaryView {
         public_tunnels,
         secret_tunnels,
         vhost_domains: vhost_reg.len(),
+        ssh_jump_hosts,
         #[cfg(feature = "vpn")]
         vpn_links: vpn_ids.len(),
         vhost_http_port: config.vhost_http_port,
@@ -71,6 +74,67 @@ pub fn summary(server: &Server) -> SummaryView {
         ssh_advertise_address: config.ssh_advertise_address.clone(),
         ssh_advertise_port: config.ssh_advertise_port,
     }
+}
+
+/// Build the dedicated SSH jump-host section without exposing credentials or
+/// classic gateway usernames.
+pub fn ssh_jump(server: &Server) -> Vec<SshJumpView> {
+    use std::sync::atomic::Ordering;
+
+    let registry = server.ssh_jump_registry();
+    let base_domain = server.config_view().ssh_jump_base_domain.clone();
+    let mut views = Vec::new();
+    for admin in server
+        .admin_registry()
+        .snapshot()
+        .into_iter()
+        .filter(|entry| entry.role == Role::SshJumpHost)
+    {
+        let Some(alias) = admin.secret_id.as_deref() else {
+            continue;
+        };
+        let Some(entry) = registry.get(alias) else {
+            continue;
+        };
+        let hostname = base_domain
+            .as_deref()
+            .map(|domain| format!("{alias}.{domain}"))
+            .unwrap_or_else(|| alias.to_string());
+        let udp_active = {
+            #[cfg(feature = "udp")]
+            {
+                !entry.direct.is_empty()
+            }
+            #[cfg(not(feature = "udp"))]
+            {
+                false
+            }
+        };
+        views.push(SshJumpView {
+            id: admin.id,
+            hostname,
+            ssh_port: entry.registration.ssh_port,
+            peer: admin.peer,
+            provider_type: entry.provider_type().to_string(),
+            notes: admin.notes,
+            requested_carriers: entry.registration.carriers,
+            effective_carriers: admin.carriers,
+            udp_requested: entry.registration.udp,
+            udp_active,
+            auto_reconnect: entry.registration.auto_reconnect,
+            max_conns: admin.max_conns,
+            active_connections: admin.active,
+            uptime_secs: admin.uptime_secs,
+            relay_tx_bytes: admin.relay_tx_bytes,
+            relay_rx_bytes: admin.relay_rx_bytes,
+            direct_tx_bytes: entry.direct_tx_bytes.load(Ordering::Relaxed),
+            direct_rx_bytes: entry.direct_rx_bytes.load(Ordering::Relaxed),
+            local_host: entry.registration.local_host.clone(),
+            local_port: entry.registration.local_port,
+        });
+    }
+    views.sort_by(|left, right| left.hostname.cmp(&right.hostname));
+    views
 }
 
 /// Build the public tunnels section view.
@@ -514,9 +578,10 @@ pub fn metrics(server: &Server) -> MetricsView {
         mut secret_tunnels,
         mut active_connections,
         mut ssh_tunnels,
+        mut ssh_jump_hosts,
         mut transport_bore,
         mut transport_ssh,
-    ) = (0, 0, 0, 0, 0, 0);
+    ) = (0, 0, 0, 0, 0, 0, 0);
     // See `summary`: count VPN links from the admin registry, not the ephemeral
     // provider registry (which empties on pairing).
     #[cfg(feature = "vpn")]
@@ -537,6 +602,7 @@ pub fn metrics(server: &Server) -> MetricsView {
         match entry.role {
             Role::Public => public_tunnels += 1,
             Role::SecretProvider | Role::SecretConsumer => secret_tunnels += 1,
+            Role::SshJumpHost => ssh_jump_hosts += 1,
             #[cfg(feature = "vpn")]
             Role::VpnListener | Role::VpnConnector => {
                 vpn_ids.insert(entry.secret_id.clone().unwrap_or_default());
@@ -568,6 +634,7 @@ pub fn metrics(server: &Server) -> MetricsView {
         public_tunnels,
         secret_tunnels,
         vhost_domains: vhost_reg.len(),
+        ssh_jump_hosts,
         #[cfg(feature = "vpn")]
         vpn_links: vpn_ids.len(),
         active_connections,
@@ -607,6 +674,106 @@ mod tests {
 
         assert_eq!(tx.load(Ordering::Relaxed), 2000);
         assert_eq!(rx.load(Ordering::Relaxed), 1000);
+    }
+
+    #[tokio::test]
+    async fn ssh_jump_view_shares_limits_activity_and_counters() {
+        use crate::admin::{ActiveGuard, NewEntry, Transport};
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let mut server = Server::new(20000..=21000, None);
+        server
+            .set_ssh_jump_base_domain(Some("ssh.example.test".to_string()))
+            .unwrap();
+        let (socket, _peer_socket) = tokio::io::duplex(1024);
+        let (opener, _acceptor) = crate::mux::client(socket);
+        let registration = crate::ssh_jump::SshJumpRegistration::new(
+            "vm-01",
+            2222,
+            Some("edge"),
+            4,
+            true,
+            true,
+            "127.0.0.1",
+            2222,
+        )
+        .unwrap();
+        let entry = Arc::new(crate::ssh_jump::SshJumpEntry::new(
+            Arc::new(crate::pool::CarrierPool::new(crate::mux::LinkOpener::Mux(
+                opener,
+            ))),
+            registration,
+            Arc::new(Semaphore::new(1)),
+        ));
+        server
+            .ssh_jump_registry()
+            .insert("vm-01".to_string(), Arc::clone(&entry));
+
+        let admin = server.admin_registry();
+        let _admin_registration = admin.register_with_counters(
+            NewEntry {
+                role: Role::SshJumpHost,
+                peer: "192.0.2.10:45000".parse().unwrap(),
+                secret_id: Some("vm-01".to_string()),
+                public_port: Some(2222),
+                notes: Some("edge".to_string()),
+                basic_auth: false,
+                https: false,
+                force_https: false,
+                carriers: 2,
+                auto_reconnect: true,
+                webserver_log: false,
+                udp: true,
+                vpn_relay_only: false,
+                vpn_pin_mtu: false,
+                vpn_mtu: None,
+                vpn_forward_accept: false,
+                vpn_nat_masquerade: false,
+                vpn_route_policy: None,
+                vpn_advertised: vec![],
+                vpn_nat_udp_port: None,
+                local_proxy_port: None,
+                local_host: Some("127.0.0.1".to_string()),
+                local_port: Some(2222),
+                nat_udp_preferred_port: None,
+                nat_udp_release_timeout: None,
+                stun_server: None,
+                upnp: false,
+                try_port_prediction: false,
+                max_conns: Some(1),
+                transport: Transport::Bore,
+                identity: None,
+            },
+            Arc::clone(&entry.active),
+            Arc::clone(&entry.relay_tx_bytes),
+            Arc::clone(&entry.relay_rx_bytes),
+        );
+
+        let permit = Arc::clone(&entry.permits).try_acquire_owned().unwrap();
+        assert!(Arc::clone(&entry.permits).try_acquire_owned().is_err());
+        drop(permit);
+        assert!(Arc::clone(&entry.permits).try_acquire_owned().is_ok());
+
+        let active = ActiveGuard::new(Arc::clone(&entry.active));
+        entry.relay_tx_bytes.fetch_add(11, Ordering::Relaxed);
+        entry.relay_rx_bytes.fetch_add(22, Ordering::Relaxed);
+        let views = ssh_jump(&server);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].hostname, "vm-01.ssh.example.test");
+        assert_eq!(views[0].requested_carriers, 4);
+        assert_eq!(views[0].effective_carriers, 2);
+        assert_eq!(views[0].active_connections, 1);
+        assert_eq!(views[0].relay_tx_bytes, 11);
+        assert_eq!(views[0].relay_rx_bytes, 22);
+        assert_eq!(summary(&server).ssh_jump_hosts, 1);
+        assert_eq!(metrics(&server).ssh_jump_hosts, 1);
+        let json = serde_json::to_value(&views[0]).unwrap();
+        assert!(json.get("identity").is_none());
+        assert!(json.get("username").is_none());
+        assert!(json.get("secret").is_none());
+        drop(active);
+        assert_eq!(ssh_jump(&server)[0].active_connections, 0);
     }
 
     fn cert_with(label: &str, path: &str) -> CertView {
@@ -702,6 +869,7 @@ mod tests {
             public_tunnels: 0,
             secret_tunnels: 0,
             vhost_domains: 0,
+            ssh_jump_hosts: 0,
             #[cfg(feature = "vpn")]
             vpn_links: 0,
             active_connections: 0,
@@ -887,6 +1055,8 @@ mod tests {
             ssh_gateway: false,
             ssh_jump_enabled: false,
             ssh_jump_base_domain: None,
+            ssh_jump_classic_auth_required: false,
+            ssh_jump_direct_quic_port: None,
             ssh_port: None,
             ssh_advertise_address: None,
             ssh_advertise_port: None,
@@ -908,6 +1078,8 @@ mod tests {
             ssh_gateway: false,
             ssh_jump_enabled: false,
             ssh_jump_base_domain: None,
+            ssh_jump_classic_auth_required: false,
+            ssh_jump_direct_quic_port: None,
             ssh_port: None,
             ssh_advertise_address: None,
             ssh_advertise_port: None,
@@ -965,6 +1137,8 @@ mod tests {
             ssh_gateway: false,
             ssh_jump_enabled: false,
             ssh_jump_base_domain: None,
+            ssh_jump_classic_auth_required: false,
+            ssh_jump_direct_quic_port: None,
             ssh_port: None,
             ssh_advertise_address: None,
             ssh_advertise_port: None,

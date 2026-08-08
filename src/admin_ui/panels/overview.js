@@ -27,6 +27,7 @@ export default {
             { label: 'Uptime', value: escapeHtml(fmtDuration(data.uptime_secs)) },
             { label: 'Public Tunnels', value: escapeHtml(String(data.public_tunnels || 0)) },
             { label: 'Secret Tunnels', value: escapeHtml(String(data.secret_tunnels || 0)) },
+            { label: 'Jump Hosts', value: escapeHtml(String(data.ssh_jump_hosts || 0)) },
             { label: 'Vhost', value: escapeHtml(String(data.vhost_domains || 0)) },
         ];
 

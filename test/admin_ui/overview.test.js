@@ -13,6 +13,7 @@ test('T-OVR: overview renders the new summary field names', async () => {
         uptime_secs: 3600,
         public_tunnels: 1,
         secret_tunnels: 2,
+        ssh_jump_hosts: 4,
         vhost_domains: 1,
         vpn_enabled: true,
         vpn_links: 3,
@@ -34,15 +35,16 @@ test('T-OVR: overview renders the new summary field names', async () => {
 
     // Check that innerHTML contains the actual field labels (this is a proxy test since the stub
     // doesn't parse innerHTML)
-    let foundPublic = false, foundSecret = false, foundVhost = false, foundVpn = false;
+    let foundPublic = false, foundSecret = false, foundJump = false, foundVhost = false, foundVpn = false;
     for (const card of grid.children) {
         const html = card._html || '';
         if (html.includes('Public Tunnels')) foundPublic = true;
         if (html.includes('Secret Tunnels')) foundSecret = true;
+        if (html.includes('Jump Hosts')) foundJump = true;
         if (html.includes('Vhost')) foundVhost = true;
         if (html.includes('VPN Links')) foundVpn = true;
     }
-    assert.ok(foundPublic && foundSecret && foundVhost && foundVpn, 'all expected field names present in rendered HTML');
+    assert.ok(foundPublic && foundSecret && foundJump && foundVhost && foundVpn, 'all expected field names present in rendered HTML');
 
     // Check features flag section
     const flagsCard = el.children[1];

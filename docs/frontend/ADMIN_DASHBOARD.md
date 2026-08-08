@@ -1,10 +1,10 @@
 # Admin Dashboard — Architecture & Operations
 
-**Status:** Phase 6 complete (2026-07-11). SSH transport visibility, server-side rate sampling, production-readiness audit done.
+**Status:** Phase 6 complete (2026-07-11); SSH Jump Host Phase 3 admin surface added 2026-08-08.
 
 ## Overview
 
-The admin dashboard is a **modular, token-guarded, real-time monitoring SPA** served at `/admin/status` and `/admin/` when `--admin-token` is set on the control port. It surfaces all live subsystems (public tunnels, secret tunnels, vhost, VPN, certificates, config, metrics) in independent **panels**, each powered by a versioned REST API under `/admin/api/v1/`.
+The admin dashboard is a **modular, token-guarded, real-time monitoring SPA** served at `/admin/status` and `/admin/` when `--admin-token` is set on the control port. It surfaces all live subsystems (public tunnels, secret tunnels, SSH jump hosts, vhost, VPN, certificates, config, metrics) in independent **panels**, each powered by a versioned REST API under `/admin/api/v1/`.
 
 **Key properties:**
 - **Zero data-plane changes** — read-only snapshot over existing registries + atomics.
@@ -19,13 +19,14 @@ The admin dashboard is a **modular, token-guarded, real-time monitoring SPA** se
 
 ### Backend: API endpoints + views
 
-The server exposes **8 REST endpoints** under `/admin/api/v1/`, all guarded by the `--admin-token` (min-32 chars, Bearer or X-Admin-Token header):
+The server exposes **9 REST endpoints** under `/admin/api/v1/`, all guarded by the `--admin-token` (min-32 chars, Bearer or X-Admin-Token header):
 
 | Endpoint | Returns | Purpose |
 |----------|---------|---------|
 | `/admin/api/v1/summary` | `SummaryView` JSON | Version, control port, feature flags, SSH gateway status, server uptime, live section counts |
 | `/admin/api/v1/tunnels` | `[TunnelView]` | Public tunnel list: port, real peer IP, status, transport (Bore\|SSH), identity, notes (expandable), tx/rx bytes |
 | `/admin/api/v1/secret` | `[SecretView]` | Secret (relay) tunnels: secret ID, peer, role, transport (Bore\|SSH), identity, status, notes, bytes |
+| `/admin/api/v1/ssh-jump` | `[SshJumpView]` | SSH jump aliases: hostname/port, provider type, peer/local target, limits, carriers, path state and relay/direct counters; no usernames or credentials |
 | `/admin/api/v1/vhost` | `[VhostView]` | Vhost providers: subdomain, transport (Bore\|SSH), identity, carrier pool, direct/relay metrics |
 | `/admin/api/v1/vpn` | `{links:[VpnLinkView]}` | VPN links + hub peers (Linux `--features vpn` only; empty array in non-VPN builds) |
 | `/admin/api/v1/certs` | `[CertView]` | TLS certificates: subject, SANs, expiry, days-remaining, path |
@@ -71,6 +72,7 @@ src/admin_ui/
     overview.js     — version, counts, uptime, feature flags
     tunnels.js      — public tunnels table
     secret.js       — secret tunnels table
+    ssh-jump.js     — SSH jump hosts table + sanitized operational details
     vhost.js        — vhost providers table
     vpn.js          — VPN links + hub peers (feature-gated)
     certs.js        — cert expiry tracking + countdown
@@ -96,9 +98,10 @@ export default {
 ```js
 import overview from './panels/overview.js';
 import tunnels from './panels/tunnels.js';
+import sshJump from './panels/ssh-jump.js';
 // ... (one import per panel)
 
-export default [overview, tunnels, secret, vhost, vpn, certs, config, metrics];
+export default [overview, tunnels, secret, sshJump, vhost, vpn, certs, config, metrics];
 ```
 
 The sidebar and router are **generated from the registry array** — no manual route table. Adding a section requires only:
@@ -300,6 +303,7 @@ npm test          # === node --test "test/admin_ui/**/*.test.js"
 - `metrics-rate.test.js` — **BUG-5**: `rateFromSamples` delta math + NaN/Inf guards
 - `notes.test.js` — **BUG-2**: short notes plain, long notes click-to-expand
 - `badges.test.js` — **BUG-3**: all flags surface as badges; only CSS-defined kinds
+- `ssh-jump.test.js` — dedicated endpoint/registry wiring, operational columns and HTML escaping
 - `dom-stub.js` — minimal headless DOM (not a real DOM; only what the code touches)
 
 > The DOM stub + tests live in `test/` (NOT `src/admin_ui/`), so `build.rs` does

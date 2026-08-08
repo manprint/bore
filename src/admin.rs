@@ -313,6 +313,27 @@ impl AdminRegistry {
     /// Register a new live tunnel and return an RAII [`Registration`]. The entry is
     /// removed automatically when the registration is dropped.
     pub fn register(&self, new: NewEntry) -> Registration {
+        self.register_with_counters(
+            new,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    /// Register a tunnel using caller-owned activity and relay-byte counters.
+    ///
+    /// SSH jump entries need the same atomics in both their routing registry and
+    /// admin row: channels are opened from the former while the dashboard reads
+    /// the latter. Keeping one shared set avoids lagging copies and preserves
+    /// exact RAII accounting on every cancellation/error path.
+    pub(crate) fn register_with_counters(
+        &self,
+        new: NewEntry,
+        active: Arc<AtomicUsize>,
+        relay_tx_bytes: Arc<AtomicU64>,
+        relay_rx_bytes: Arc<AtomicU64>,
+    ) -> Registration {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(Entry {
             role: new.role,
@@ -328,11 +349,11 @@ impl AdminRegistry {
             webserver_log: new.webserver_log,
             since: Instant::now(),
             udp: AtomicBool::new(new.udp),
-            active: Arc::new(AtomicUsize::new(0)),
+            active,
             overlay: std::sync::Mutex::new(None),
             vpn_direct: AtomicBool::new(false),
-            relay_tx_bytes: Arc::new(AtomicU64::new(0)),
-            relay_rx_bytes: Arc::new(AtomicU64::new(0)),
+            relay_tx_bytes,
+            relay_rx_bytes,
             vpn_relay_only: new.vpn_relay_only,
             vpn_pin_mtu: new.vpn_pin_mtu,
             vpn_mtu: new.vpn_mtu,

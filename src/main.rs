@@ -2376,6 +2376,8 @@ async fn dispatch(command: Command) -> Result<()> {
                 ssh_gateway: false,
                 ssh_jump_enabled: ssh_jump_base_domain.is_some(),
                 ssh_jump_base_domain: ssh_jump_base_domain.clone(),
+                ssh_jump_classic_auth_required: ssh_jump_base_domain.is_some(),
+                ssh_jump_direct_quic_port: ssh_jump_base_domain.as_ref().and(vhost_quic_port),
                 ssh_port: None,
                 ssh_advertise_address: None,
                 ssh_advertise_port: None,

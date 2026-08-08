@@ -17,7 +17,7 @@ L'Admin UI è una singola SPA minimale (vanilla JS, ES modules) embedded come ri
   - ui.js                — helper puri e testabili (escapeHtml, badge, table, flagBadges, format)
   - modal.js             — openModal/closeModal, detailRows
   - style.css            — stili dell'interfaccia
-  - panels/*.js          — pannelli: overview, tunnels, secret, vhost, vpn, certs, config, metrics
+  - panels/*.js          — pannelli: overview, tunnels, secret, ssh-jump, vhost, vpn, certs, config, metrics
 - build.rs               — bundle static assets (include_bytes!) → OUT_DIR/admin_assets.rs
 - package.json           — `npm test` script per i test frontend (node --test ...)
 - test/admin_ui/*        — test unitari (dom-stub.js + molte suite .test.js)
@@ -153,7 +153,7 @@ Poller:
 ## Test e harness
 
 - Test folder: `test/admin_ui/` (unit tests Node). Contiene `dom-stub.js` per emulare DOM nel test environment.
-- Test principali: `badges.test.js`, `config.test.js`, `detail.test.js`, `metrics-rate.test.js`, `modal.test.js`, `poller.test.js`, `vhost-parity.test.js`, `vpn-render.test.js`, ecc.
+- Test principali: `badges.test.js`, `config.test.js`, `detail.test.js`, `metrics-rate.test.js`, `modal.test.js`, `poller.test.js`, `ssh-jump.test.js`, `vhost-parity.test.js`, `vpn-render.test.js`, ecc.
 - Eseguire i test (repo root):
 
 ```bash
@@ -200,4 +200,3 @@ Se vuoi, posso:
 - aggiungere un diagramma SVG o PNG generato automaticamente,
 - estrarre un template `NEW_PANEL.md` per creare nuovi pannelli conformi al contract,
 - aprire una PR con le modifiche consigliate (es. convertire punti `innerHTML` rischiosi).
-

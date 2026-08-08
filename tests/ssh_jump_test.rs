@@ -470,6 +470,40 @@ async fn native_provider_real_openssh_proxyjump_key_password_and_rejections() ->
         "duplicate registration replaced the first native owner"
     );
 
+    // A concurrent reconnect storm must remain first-wins: no attempt may
+    // replace the live native owner or create another logical admin row.
+    let mut storm = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let endpoint = format!("127.0.0.1:{}", harness.control_port);
+        storm.spawn(async move {
+            Client::new_ssh_jump_provider(
+                "127.0.0.1",
+                target_port,
+                &endpoint,
+                "native-vm",
+                Some(BORE_SECRET),
+                false,
+                1,
+                false,
+                false,
+                None,
+            )
+            .await
+            .is_err()
+        });
+    }
+    while let Some(result) = storm.join_next().await {
+        anyhow::ensure!(result?, "reconnect-storm registration was accepted");
+    }
+    anyhow::ensure!(
+        harness
+            .registry
+            .get("native-vm")
+            .is_some_and(|entry| entry.registration_id() == native_registration_id),
+        "reconnect storm replaced the first native owner"
+    );
+    wait_admin_role(&harness.admin, Role::SshJumpHost, 1).await?;
+
     let mut cross_transport = spawn_reverse_provider(&config, "native-vm", target_port).await?;
     let collision_status = time::timeout(Duration::from_secs(10), cross_transport.wait())
         .await

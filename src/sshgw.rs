@@ -305,6 +305,8 @@ pub struct SshGateway {
     /// traffic too.
     total_rx_bytes: Arc<AtomicU64>,
     total_tx_bytes: Arc<AtomicU64>,
+    /// Global bounded-connection rejection counter shared with `Server`.
+    conn_rejections: Arc<AtomicU64>,
     /// Server's TLS acceptor, if `--cert-file`/`--key-file` are configured —
     /// a clone of the `Server`'s own, snapshotted at `set_ssh_gateway` time
     /// (which always runs after `set_tls` in `main.rs`). Used to terminate
@@ -340,6 +342,7 @@ impl SshGateway {
         bind_tunnels: IpAddr,
         total_rx_bytes: Arc<AtomicU64>,
         total_tx_bytes: Arc<AtomicU64>,
+        conn_rejections: Arc<AtomicU64>,
         tls: Option<tokio_rustls::TlsAcceptor>,
         bind_domain: Option<String>,
     ) -> Result<Self> {
@@ -377,6 +380,7 @@ impl SshGateway {
             bind_tunnels,
             total_rx_bytes,
             total_tx_bytes,
+            conn_rejections,
             tls,
             bind_domain,
         })
@@ -964,39 +968,44 @@ impl GatewayHandler {
                 alias: alias.clone(),
                 token,
             };
-            let _admin_registration = gateway.admin.register(NewEntry {
-                role: Role::SshJumpHost,
-                peer,
-                secret_id: Some(alias.clone()),
-                public_port: Some(port),
-                notes: params.notes.clone(),
-                basic_auth: false,
-                https: false,
-                force_https: false,
-                carriers: 1,
-                auto_reconnect: false,
-                webserver_log: false,
-                udp: false,
-                vpn_relay_only: false,
-                vpn_pin_mtu: false,
-                vpn_mtu: None,
-                vpn_forward_accept: false,
-                vpn_nat_masquerade: false,
-                vpn_route_policy: None,
-                vpn_advertised: vec![],
-                vpn_nat_udp_port: None,
-                local_proxy_port: None,
-                local_host: None,
-                local_port: Some(port),
-                nat_udp_preferred_port: None,
-                nat_udp_release_timeout: None,
-                stun_server: None,
-                upnp: false,
-                try_port_prediction: false,
-                max_conns: Some(max_conns),
-                transport: Transport::Ssh,
-                identity: Some(principal.clone()),
-            });
+            let _admin_registration = gateway.admin.register_with_counters(
+                NewEntry {
+                    role: Role::SshJumpHost,
+                    peer,
+                    secret_id: Some(alias.clone()),
+                    public_port: Some(port),
+                    notes: params.notes.clone(),
+                    basic_auth: false,
+                    https: false,
+                    force_https: false,
+                    carriers: 1,
+                    auto_reconnect: false,
+                    webserver_log: false,
+                    udp: false,
+                    vpn_relay_only: false,
+                    vpn_pin_mtu: false,
+                    vpn_mtu: None,
+                    vpn_forward_accept: false,
+                    vpn_nat_masquerade: false,
+                    vpn_route_policy: None,
+                    vpn_advertised: vec![],
+                    vpn_nat_udp_port: None,
+                    local_proxy_port: None,
+                    local_host: None,
+                    local_port: Some(port),
+                    nat_udp_preferred_port: None,
+                    nat_udp_release_timeout: None,
+                    stun_server: None,
+                    upnp: false,
+                    try_port_prediction: false,
+                    max_conns: Some(max_conns),
+                    transport: Transport::Ssh,
+                    identity: Some(principal.clone()),
+                },
+                Arc::clone(&entry.active),
+                Arc::clone(&entry.relay_tx_bytes),
+                Arc::clone(&entry.relay_rx_bytes),
+            );
 
             deliver_inapplicable_warnings(
                 &state,
@@ -1650,6 +1659,9 @@ struct ConnState {
     /// reconnect-managed client (autossh) re-establishes a working tunnel
     /// instead of serving `pending` forever off a wedged session.
     open_timeouts: AtomicU32,
+    /// Count of jump attempts made without a username-bound classic grant.
+    /// Logging samples this monotonically-growing value to prevent floods.
+    jump_username_mismatches: AtomicU32,
     /// Set by [`ConnState::evict`]; observed by `serve_connection`, which
     /// hard-drops the whole russh session future (socket included). A
     /// polite `Handle::disconnect` would travel through the same session
@@ -1705,6 +1717,17 @@ impl ConnState {
     /// session's dispatch loop is alive, reset the consecutive counter.
     fn record_open_answered(&self) {
         self.open_timeouts.store(0, Ordering::SeqCst);
+    }
+
+    /// Record a jump username mismatch and return whether this occurrence
+    /// should be logged. The first three and subsequent powers of two are
+    /// retained, bounding log volume to O(log n) per SSH connection.
+    fn record_jump_username_mismatch(&self) -> (u32, bool) {
+        let count = self
+            .jump_username_mismatches
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        (count, count <= 3 || count.is_power_of_two())
     }
 
     /// Force-evict this session: `serve_connection` drops the russh session
@@ -2390,6 +2413,74 @@ impl Handler for GatewayHandler {
 /// Consume one namespaced ProxyJump `direct-tcpip` channel. Classic binding is
 /// checked before alias parsing or registry lookup, and all slow provider opens
 /// run outside russh's sequential handler dispatch loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SshJumpResolveError {
+    ClassicAuthRequired,
+    ServiceDisabled,
+    InvalidPort,
+    OutsideNamespace,
+    InvalidHostname,
+    AliasUnavailable,
+    PortMismatch,
+}
+
+impl SshJumpResolveError {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClassicAuthRequired => "classic_auth_required",
+            Self::ServiceDisabled => "service_disabled",
+            Self::InvalidPort => "invalid_port",
+            Self::OutsideNamespace => "outside_namespace",
+            Self::InvalidHostname => "invalid_hostname",
+            Self::AliasUnavailable => "alias_unavailable",
+            Self::PortMismatch => "port_mismatch",
+        }
+    }
+}
+
+fn resolve_ssh_jump_target_detailed(
+    principal: Option<&str>,
+    registry: &crate::ssh_jump::SshJumpRegistry,
+    base_domain: Option<&str>,
+    hostname: &str,
+    port: u32,
+) -> std::result::Result<
+    (String, String, u16, Arc<crate::ssh_jump::SshJumpEntry>),
+    SshJumpResolveError,
+> {
+    // This must remain the first operation: a legacy-authenticated session
+    // whose username did not own the credential gets the same generic result
+    // for malformed, absent and present aliases.
+    let principal = principal
+        .ok_or(SshJumpResolveError::ClassicAuthRequired)?
+        .to_string();
+    let base_domain = base_domain.ok_or(SshJumpResolveError::ServiceDisabled)?;
+    let requested_port = u16::try_from(port)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or(SshJumpResolveError::InvalidPort)?;
+    let alias = match crate::ssh_jump::classify_destination(
+        hostname,
+        requested_port,
+        base_domain,
+        requested_port,
+    )
+    .map_err(|_| SshJumpResolveError::InvalidHostname)?
+    {
+        crate::ssh_jump::JumpRoute::Match { alias, .. } => alias,
+        crate::ssh_jump::JumpRoute::NotJump => return Err(SshJumpResolveError::OutsideNamespace),
+    };
+    let entry = registry
+        .get(&alias)
+        .map(|entry| Arc::clone(entry.value()))
+        .ok_or(SshJumpResolveError::AliasUnavailable)?;
+    if entry.registration.ssh_port != requested_port {
+        return Err(SshJumpResolveError::PortMismatch);
+    }
+    Ok((principal, alias, requested_port, entry))
+}
+
+#[cfg(test)]
 fn resolve_ssh_jump_target(
     principal: Option<&str>,
     registry: &crate::ssh_jump::SshJumpRegistry,
@@ -2397,30 +2488,7 @@ fn resolve_ssh_jump_target(
     hostname: &str,
     port: u32,
 ) -> Option<(String, String, u16, Arc<crate::ssh_jump::SshJumpEntry>)> {
-    // This must remain the first operation: a legacy-authenticated session
-    // whose username did not own the credential gets the same generic result
-    // for malformed, absent and present aliases.
-    let principal = principal?.to_string();
-    let base_domain = base_domain?;
-    let requested_port = u16::try_from(port).ok().filter(|port| *port != 0)?;
-    let alias = match crate::ssh_jump::classify_destination(
-        hostname,
-        requested_port,
-        base_domain,
-        requested_port,
-    )
-    .ok()?
-    {
-        crate::ssh_jump::JumpRoute::Match { alias, .. } => alias,
-        crate::ssh_jump::JumpRoute::NotJump => return None,
-    };
-    let entry = registry
-        .get(&alias)
-        .map(|entry| Arc::clone(entry.value()))?;
-    if entry.registration.ssh_port != requested_port {
-        return None;
-    }
-    Some((principal, alias, requested_port, entry))
+    resolve_ssh_jump_target_detailed(principal, registry, base_domain, hostname, port).ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2436,20 +2504,68 @@ async fn open_ssh_jump_channel(
     let reject = |state: &Arc<ConnState>| {
         state.queue_message("bore ssh-gateway: SSH jump connection rejected".to_string());
     };
-    let Some((principal, alias, requested_port, entry)) = resolve_ssh_jump_target(
+    let (principal, alias, requested_port, entry) = match resolve_ssh_jump_target_detailed(
         handler.jump_principal.as_deref(),
         &handler.gateway.ssh_jump_registry,
         handler.gateway.ssh_jump_base_domain.as_deref(),
         host_to_connect,
         port_to_connect,
-    ) else {
-        reject(&handler.state);
-        reply.reject(ChannelOpenFailure::ConnectFailed).await;
-        return Ok(());
+    ) {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            let outer_peer = handler.peer;
+            if reason == SshJumpResolveError::ClassicAuthRequired {
+                let (attempt, log) = handler.state.record_jump_username_mismatch();
+                if log {
+                    warn!(
+                        event = "deny",
+                        reason = reason.as_str(),
+                        attempt,
+                        %outer_peer,
+                        hostname = %host_to_connect,
+                        port = port_to_connect,
+                        "ssh-gateway: SSH jump connection denied"
+                    );
+                }
+            } else {
+                warn!(
+                    event = "deny",
+                    reason = reason.as_str(),
+                    %outer_peer,
+                    hostname = %host_to_connect,
+                    port = port_to_connect,
+                    "ssh-gateway: SSH jump connection denied"
+                );
+            }
+            reject(&handler.state);
+            reply.reject(ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        }
+    };
+    let provider_type = entry.provider_type();
+    let provider_owner_class = match provider_type {
+        "native" => "shared-secret",
+        "ssh" => "classic-username",
+        _ => "unknown",
     };
     let permit = match Arc::clone(&entry.permits).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
+            handler
+                .gateway
+                .conn_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                event = "deny",
+                reason = "max_conns",
+                %principal,
+                %alias,
+                port = requested_port,
+                provider_type,
+                provider_owner_class,
+                outer_peer = %handler.peer,
+                "ssh-gateway: SSH jump connection denied"
+            );
             reject(&handler.state);
             reply.reject(ChannelOpenFailure::ConnectFailed).await;
             return Ok(());
@@ -2463,18 +2579,27 @@ async fn open_ssh_jump_channel(
     let pool = Arc::clone(&entry.pool);
     let total_rx_bytes = Arc::clone(&handler.gateway.total_rx_bytes);
     let total_tx_bytes = Arc::clone(&handler.gateway.total_tx_bytes);
+    let active = Arc::clone(&entry.active);
+    let relay_rx_bytes = Arc::clone(&entry.relay_rx_bytes);
+    let relay_tx_bytes = Arc::clone(&entry.relay_tx_bytes);
     let outer_peer = handler.peer;
     let alias_for_task = alias.clone();
+    let principal_for_task = principal.clone();
     reply.accept().await;
     info!(
+        event = "allow",
         %principal,
         %alias,
         port = requested_port,
         %outer_peer,
-        "ssh-gateway: opening SSH jump channel"
+        provider_type,
+        provider_owner_class,
+        selected_path = "relay",
+        "ssh-gateway: SSH jump connection allowed"
     );
     tokio::spawn(async move {
         let _permit = permit;
+        let _active_guard = ActiveGuard::new(active);
         let mut provider = match timeout(
             SSH_DIRECT_OPEN_TIMEOUT,
             secret::open_with_failover(&pool, &alias_for_task, originator),
@@ -2491,19 +2616,53 @@ async fn open_ssh_jump_channel(
                 return;
             }
         };
+        info!(
+            event = "open",
+            principal = %principal_for_task,
+            alias = %alias_for_task,
+            port = requested_port,
+            %outer_peer,
+            provider_type,
+            provider_owner_class,
+            selected_path = "relay",
+            "ssh-gateway: SSH jump channel opened"
+        );
         let ssh_stream = channel.into_stream();
         let mut counted = CountingStream::new(
             ssh_stream,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
+            relay_rx_bytes,
+            relay_tx_bytes,
             total_rx_bytes,
             total_tx_bytes,
         );
         let buf = proxy_buffer_size();
-        if let Err(err) =
-            tokio::io::copy_bidirectional_with_sizes(&mut counted, &mut provider, buf, buf).await
+        match tokio::io::copy_bidirectional_with_sizes(&mut counted, &mut provider, buf, buf).await
         {
-            trace!(alias = %alias_for_task, %err, "ssh-gateway: jump channel closed");
+            Ok((client_to_provider_bytes, provider_to_client_bytes)) => info!(
+                event = "close",
+                principal = %principal_for_task,
+                alias = %alias_for_task,
+                port = requested_port,
+                %outer_peer,
+                provider_type,
+                provider_owner_class,
+                selected_path = "relay",
+                client_to_provider_bytes,
+                provider_to_client_bytes,
+                "ssh-gateway: SSH jump channel closed"
+            ),
+            Err(err) => trace!(
+                event = "close",
+                principal = %principal_for_task,
+                alias = %alias_for_task,
+                port = requested_port,
+                %outer_peer,
+                provider_type,
+                provider_owner_class,
+                selected_path = "relay",
+                %err,
+                "ssh-gateway: SSH jump channel closed"
+            ),
         }
     });
     Ok(())
@@ -3895,6 +4054,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
             None,
             None,
         )
@@ -4363,6 +4523,67 @@ mod tests {
             "legacy-secret-id",
             "ssh.example.test"
         ));
+    }
+
+    #[test]
+    fn ssh_jump_username_mismatch_logging_is_bounded() {
+        let state = ConnState::default();
+        let decisions = (1..=9)
+            .map(|_| state.record_jump_username_mismatch())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decisions,
+            vec![
+                (1, true),
+                (2, true),
+                (3, true),
+                (4, true),
+                (5, false),
+                (6, false),
+                (7, false),
+                (8, true),
+                (9, false),
+            ]
+        );
+    }
+
+    struct TestChannelOpen {
+        fail: bool,
+    }
+
+    impl mux::ChannelOpen for TestChannelOpen {
+        fn open(
+            &self,
+            _forward_ip: Option<&str>,
+            _caller: Option<SocketAddr>,
+        ) -> Pin<Box<dyn Future<Output = io::Result<mux::LinkStream>> + Send + '_>> {
+            Box::pin(async move {
+                if self.fail {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "carrier died between pick and open",
+                    ));
+                }
+                let (stream, _peer) = tokio::io::duplex(64);
+                Ok(Box::new(stream) as mux::LinkStream)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_jump_open_fails_over_when_picked_carrier_dies() {
+        let pool = CarrierPool::new(mux::LinkOpener::Ssh(Arc::new(TestChannelOpen {
+            fail: true,
+        })));
+        assert!(pool.push(
+            crate::pool::Carrier::new(mux::LinkOpener::Ssh(Arc::new(TestChannelOpen {
+                fail: false,
+            }))),
+            2,
+        ));
+        assert!(secret::open_with_failover(&pool, "jump-vm", None)
+            .await
+            .is_ok());
     }
 
     #[test]

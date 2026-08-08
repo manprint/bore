@@ -10,6 +10,10 @@ const BYTE_KEYS = new Set(['udp_socket_send_buffer', 'udp_socket_recv_buffer']);
 // Pretty labels for SSH and other config keys
 const PRETTY_LABELS = {
     'ssh_gateway': 'SSH Gateway',
+    'ssh_jump_enabled': 'Jump Hosts Enabled',
+    'ssh_jump_base_domain': 'Jump Base Domain',
+    'ssh_jump_classic_auth_required': 'Jump Classic Auth Required',
+    'ssh_jump_direct_quic_port': 'Jump Direct QUIC Port',
     'ssh_port': 'SSH Port',
     'ssh_advertise_address': 'Advertise Address',
     'ssh_advertise_port': 'Advertise Port',

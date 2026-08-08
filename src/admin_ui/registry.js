@@ -16,6 +16,7 @@
 import overview from './panels/overview.js';
 import tunnels from './panels/tunnels.js';
 import secret from './panels/secret.js';
+import sshJump from './panels/ssh-jump.js';
 import vhost from './panels/vhost.js';
 import vpn from './panels/vpn.js';
 import certs from './panels/certs.js';
@@ -26,6 +27,7 @@ export default [
     overview,
     tunnels,
     secret,
+    sshJump,
     vhost,
     vpn,
     certs,

@@ -456,6 +456,8 @@ impl Server {
                 ssh_gateway: false,
                 ssh_jump_enabled: false,
                 ssh_jump_base_domain: None,
+                ssh_jump_classic_auth_required: false,
+                ssh_jump_direct_quic_port: None,
                 ssh_port: None,
                 ssh_advertise_address: None,
                 ssh_advertise_port: None,
@@ -500,6 +502,9 @@ impl Server {
         let view = Arc::make_mut(&mut self.config_view);
         view.ssh_jump_enabled = self.ssh_jump_base_domain.is_some();
         view.ssh_jump_base_domain = self.ssh_jump_base_domain.clone();
+        view.ssh_jump_classic_auth_required = self.ssh_jump_base_domain.is_some();
+        view.ssh_jump_direct_quic_port =
+            self.ssh_jump_base_domain.as_ref().and(view.vhost_quic_port);
         Ok(())
     }
 
@@ -675,6 +680,11 @@ impl Server {
     pub fn set_vhost_quic_port(&mut self, port: u16) {
         self.vhost_quic_port = port;
         self.vhost_quic_port_explicit = true;
+        let view = Arc::make_mut(&mut self.config_view);
+        view.vhost_quic_port = Some(port);
+        if view.ssh_jump_enabled {
+            view.ssh_jump_direct_quic_port = Some(port);
+        }
     }
 
     fn default_vhost_quic_port(cfg: &vhost::VhostConfig) -> u16 {
@@ -895,6 +905,7 @@ impl Server {
             self.bind_tunnels,
             Arc::clone(&self.total_rx_bytes),
             Arc::clone(&self.total_tx_bytes),
+            Arc::clone(&self.conn_rejections),
             self.tls.clone(),
             self.bind_domain.clone(),
         )?;
@@ -2502,6 +2513,7 @@ mod tests {
         let keys = dir.path().join("authorized_keys.d");
         std::fs::create_dir(&keys).unwrap();
         let mut server = Server::new(1024..=65535, Some("must-not-leak"));
+        server.set_vhost_quic_port(8443);
         server
             .set_ssh_jump_base_domain(Some("SSH.Example.Test.".to_string()))
             .unwrap();
@@ -2523,6 +2535,8 @@ mod tests {
         assert_eq!(config["ssh_gateway"], true);
         assert_eq!(config["ssh_jump_enabled"], true);
         assert_eq!(config["ssh_jump_base_domain"], "ssh.example.test");
+        assert_eq!(config["ssh_jump_classic_auth_required"], true);
+        assert_eq!(config["ssh_jump_direct_quic_port"], 8443);
         assert_eq!(config["ssh_port"], 2222);
         assert_eq!(config["ssh_advertise_port"], 443);
         assert_eq!(config["ssh_auth_pubkey"], true);

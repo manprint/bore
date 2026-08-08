@@ -1,8 +1,8 @@
-# Admin Dashboard — Tunnel / Secret / Vhost Sections
+# Admin Dashboard — Tunnel / Secret / SSH Jump / Vhost Sections
 
 ## Purpose
 
-The three tunnel sections (Public, Secret, Vhost) now share a unified column layout and logic. The "Tunnels" section has been renamed "Public" for clarity (route slug `#/tunnels` unchanged for back-compat). Vhost was refactored to be structurally identical to Public, with Subdomain replacing Port and vhost-only fields isolated in dedicated columns. All three sections now display SSH transport visibility (`transport` badge and `identity` field). This parity ensures consistent UX and simplifies maintenance.
+Public, Secret and Vhost share a unified column layout and logic. The "Tunnels" section has been renamed "Public" for clarity (route slug `#/tunnels` unchanged for back-compat). Vhost is structurally identical to Public, with Subdomain replacing Port and vhost-only fields isolated in dedicated columns. These three sections display SSH transport visibility (`transport` badge and `identity` field). SSH Jump is intentionally separate: one logical alias row, sanitized ownership, path and carrier state.
 
 ## Column Layout
 
@@ -10,6 +10,7 @@ The three tunnel sections (Public, Secret, Vhost) now share a unified column lay
 |----------|---------|
 | **Tunnels** | Port \| Peer \| Flags \| Connections \| Uptime \| TX \| RX \| Notes (modal also: Local target, Max-conns) |
 | **Secret** | **Grouped by `secret_id` into cards** (mirrors VPN). Each card has a Provider block and a Consumer block; rows: Peer \| Local \| Flags \| Connections \| Uptime \| TX \| RX \| Notes |
+| **SSH Jump** | Hostname \| Port \| Provider \| Peer \| Path \| Connections \| Carriers \| Uptime \| Relay TX \| Relay RX \| Notes (modal: local target, limits, direct counters) |
 | **Vhost** | Subdomain \| Peer \| Flags \| Connections \| Uptime \| TX \| RX \| Notes \| Direct Opens \| Headers (modal also: Local target) |
 
 Every row is clickable and opens a detail modal listing all fields—a catch-all for vhost-only data (direct_pool, request/response header pairs) and any field without a dedicated column.
@@ -58,6 +59,11 @@ section. Secret tunnels have no public port, so `https`/`force_https` do not app
 
 **Vhost:** Serialized from `VhostEntry` (in `src/vhost.rs`), which is now self-sufficient: carries peer, since, notes, basic_auth, udp, auto_reconnect, webserver_log, and as of Phase 6, `transport` and `identity`. Per-subdomain TX/RX counters are incremented in `relay_vhost` and require no admin-registry join.
 
+**SSH Jump:** `/admin/api/v1/ssh-jump` joins the `Role::SshJumpHost` admin row with
+the live `SshJumpRegistry` alias. Shared atomics make active connections and relay bytes
+exact; direct counters/path state are reserved for Phase 4. The view omits classic username,
+credential identity, secrets and key material by contract.
+
 ## Known Gap
 
-The VPN and Config sections have separate panels (`src/admin_ui/panels/vpn.js`, `config.js`) and are **not** part of this parity refactor.
+SSH Jump, VPN and Config have separate panels (`ssh-jump.js`, `vpn.js`, `config.js`) and are **not** part of the Public/Secret/Vhost parity refactor.

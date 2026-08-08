@@ -65,3 +65,11 @@ cargo test --all-features
 Run the dedicated SSH gateway netns/chaos harness only after rebuilding the
 release binary, never concurrently with another netns harness. Phase done means
 zero leaked permits/rows across every failure path and full admin/frontend parity.
+
+## Completion checkpoint — 2026-08-08
+
+Complete/green. Per-entry bounds/counters, carrier failover, reconnect-storm
+ownership, dedicated sanitized API/dashboard/config surface and structured audit
+logging are implemented. Rust/frontend/full-feature/feature-minimal gates and the
+serial SSH gateway netns harness pass. See `resume.md` for exact evidence. Stop
+before Phase 4 pending owner approval.

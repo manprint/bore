@@ -1,9 +1,9 @@
 # SSH Jump Host — Plan Overview
 
-> **Status:** decisions locked; implementation complete through Phase 2 on 2026-08-05
+> **Status:** decisions locked; implementation complete through Phase 3 on 2026-08-08
 > **Folder:** `docs/plans/plan_SshJumpHost/`
 > **Planning model:** GPT-5/Codex
-> **Implementation status:** Phase 2 green; Phase 3 not started
+> **Implementation status:** Phase 3 green; Phase 4 not started
 
 ## Goal
 
@@ -350,7 +350,7 @@ Host *.ssh.bore.tld
 |-------|------|---------|
 | 1 — Contracts, protocol and classic-auth binding | [phase_01.md](phase_01.md) | **Complete/green.** Internal additive scaffolding and username/credential binding tests |
 | 2 — Complete TCP path | [phase_02.md](phase_02.md) | **Complete/green.** Native or pure-OpenSSH provider → real `ssh -J` over TCP, lifecycle-safe |
-| 3 — Hardening, observability and admin | [phase_03.md](phase_03.md) | Limits, reconnect/chaos coverage, dedicated dashboard/API surface |
+| 3 — Hardening, observability and admin | [phase_03.md](phase_03.md) | **Complete/green.** Limits, reconnect/chaos coverage, dedicated dashboard/API surface |
 | 4 — Server→provider QUIC + fallback | [phase_04.md](phase_04.md) | Direct pool, warm TCP fallback, churn/recovery tests |
 | 5 — Full regression, deployment docs and acceptance | [phase_05.md](phase_05.md) | README source-of-truth, netns/e2e matrix, release-ready evidence |
 

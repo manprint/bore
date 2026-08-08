@@ -228,7 +228,8 @@ Provider nativo alternativo:
 
 ```bash
 bore sshjhost localhost:22 --subdomain vm-test-01 \
-    --to https://bore.example.com --secret "$BORE_SECRET" --auto-reconnect
+    --to https://bore.example.com --secret "$BORE_SECRET" \
+    --carriers 4 --udp --auto-reconnect
 ```
 
 Operatore stock OpenSSH:
@@ -240,12 +241,16 @@ ssh -p 2222 -J fabio@bore.example.com:443 admin@legacy.ssh.bore.example.com
 ```
 
 Il gateway autentica `fabio`; il target autentica separatamente `ubuntu`/`admin`. Ogni
-alias ha un limite `max-conns`, apertura provider entro 10 s e failover carrier. Provider
+alias ha un limite `max-conns`, apertura provider entro 15 s e failover carrier. Provider
 nativi sono first-wins; un provider OpenSSH può sostituire solo una propria registrazione
 con identico username. Il pannello admin **Jump Hosts** e
 `/admin/api/v1/ssh-jump` espongono stato/counter sanitizzati. I log strutturati riportano
 allow/deny/open/close senza credenziali; gli errori mostrati al client restano generici.
-Il path attuale è TCP; `--udp` sul provider nativo avvisa del fallback fino alla Fase 4.
+`--udp` usa sul tratto server→provider il medesimo endpoint UDP 443 configurato da
+`--vhost-quic-port`: N connessioni QUIC indipendenti, uno stream bidi per sessione, niente
+STUN/hole-punch. I carrier TCP restano caldi; pick/open QUIC fallito usa subito TCP, poi il
+provider rinnova solo il deficit. Il provider OpenSSH puro resta TCP-only. Admin mostra
+carrier direct, aperture/fallback e byte relay/direct separati.
 
 ### 4.6 Banner di stato del tunnel
 
@@ -582,7 +587,7 @@ solito `1`). Puramente cosmético, ignorare.
 
 | Funzionalità | Motivo |
 |---|---|
-| `--udp` / QUIC direct (public, vhost, secret) | SSH è TCP-only, limite di protocollo |
+| `--udp` / QUIC direct (public, vhost, secret) | SSH è TCP-only; eccezione `sshjhost`: provider bore nativo può usare QUIC sul tratto server→provider |
 | `--carriers > 1` | Una sola connessione SSH; i canali multiplexano ma senza isolamento cwnd/HOL |
 | Hole-punch (`--stun-server`, `--upnp`, `--try-port-prediction`, `--nat-udp-*`) | Ha senso solo col path UDP |
 | `bore transfer` | Protocollo applicativo del client bore, non del tunnel SSH |

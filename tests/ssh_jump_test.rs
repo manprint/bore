@@ -16,6 +16,8 @@ use lazy_static::lazy_static;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{run_stream, Auth, Config, Handler, Msg, Session};
 use russh::{Channel, ChannelId};
+#[cfg(feature = "udp")]
+use tokio::net::UdpSocket;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -59,6 +61,12 @@ fn load_public_key(private_key: &Path) -> Result<PublicKey> {
 async fn free_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     Ok(listener.local_addr()?.port())
+}
+
+#[cfg(feature = "udp")]
+async fn free_udp_port() -> Result<u16> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    Ok(socket.local_addr()?.port())
 }
 
 async fn wait_port(port: u16) -> Result<()> {
@@ -172,6 +180,7 @@ async fn spawn_bore_server(
         passwords_file,
         Some(BORE_SECRET),
         Duration::from_secs(60),
+        None,
     )
     .await
 }
@@ -182,6 +191,7 @@ async fn spawn_bore_server_with(
     passwords_file: Option<PathBuf>,
     secret: Option<&str>,
     ssh_jump_ctrl_timeout: Duration,
+    direct_quic_port: Option<u16>,
 ) -> Result<BoreHarness> {
     let control_port = free_port().await?;
     let gateway_port = free_port().await?;
@@ -190,6 +200,10 @@ async fn spawn_bore_server_with(
     server.set_bind_addr("127.0.0.1".parse()?);
     server.set_bind_tunnels("127.0.0.1".parse()?);
     server.set_control_port(control_port);
+    if let Some(port) = direct_quic_port {
+        server.set_udp(true);
+        server.set_vhost_quic_port(port);
+    }
     server.set_ssh_jump_base_domain(Some(BASE_DOMAIN.to_string()))?;
     server.set_ssh_gateway(SshGatewayConfig {
         port: Some(gateway_port),
@@ -217,6 +231,19 @@ async fn spawn_bore_server_with(
     })
 }
 
+#[cfg(feature = "udp")]
+async fn spawn_bore_server_udp(dir: &Path, authorized_keys_dir: PathBuf) -> Result<BoreHarness> {
+    spawn_bore_server_with(
+        dir,
+        authorized_keys_dir,
+        None,
+        Some(BORE_SECRET),
+        Duration::from_secs(60),
+        Some(free_udp_port().await?),
+    )
+    .await
+}
+
 async fn wait_alias(
     registry: &bore_cli::ssh_jump::SshJumpRegistry,
     alias: &str,
@@ -232,6 +259,28 @@ async fn wait_alias(
     })
     .await
     .with_context(|| format!("alias {alias:?} did not reach present={present}"))?;
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+async fn wait_direct_carriers(
+    registry: &bore_cli::ssh_jump::SshJumpRegistry,
+    alias: &str,
+    count: usize,
+) -> Result<()> {
+    time::timeout(Duration::from_secs(12), async {
+        loop {
+            if registry
+                .get(alias)
+                .is_some_and(|entry| entry.direct.len() == count)
+            {
+                return;
+            }
+            time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("direct carrier pool for {alias:?} did not reach {count}"))?;
     Ok(())
 }
 
@@ -595,6 +644,204 @@ async fn native_provider_real_openssh_proxyjump_key_password_and_rejections() ->
     Ok(())
 }
 
+#[cfg(feature = "udp")]
+#[tokio::test]
+async fn native_provider_quic_direct_falls_back_and_renews() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    if !has_program("ssh").await || !has_program("ssh-keygen").await {
+        eprintln!("WARNING: OpenSSH tooling unavailable; skipping SSH jump QUIC e2e");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let identity = gen_keypair(dir.path(), "operator").await?;
+    let accepted_key = load_public_key(&identity)?;
+    let keys_dir = dir.path().join("authorized_keys.d");
+    std::fs::create_dir(&keys_dir)?;
+    std::fs::copy(identity.with_extension("pub"), keys_dir.join("fabio"))?;
+    let (target_port, target_task) = spawn_target(accepted_key).await?;
+    let harness = spawn_bore_server_udp(dir.path(), keys_dir).await?;
+    let config = dir.path().join("ssh_config");
+    write_ssh_config(&config, harness.gateway_port, target_port, &identity)?;
+
+    let client = Client::new_ssh_jump_provider(
+        "127.0.0.1",
+        target_port,
+        &format!("127.0.0.1:{}", harness.control_port),
+        "quic-vm",
+        Some(BORE_SECRET),
+        false,
+        2,
+        true,
+        true,
+        Some("QUIC provider".to_string()),
+    )
+    .await?;
+    let client_task = tokio::spawn(async move {
+        let _ = client.listen().await;
+    });
+    wait_alias(&harness.registry, "quic-vm", true).await?;
+    wait_direct_carriers(&harness.registry, "quic-vm", 2).await?;
+
+    let output = run_jump(&config, "quic-vm.ssh.test", "direct-one").await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "direct ProxyJump failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let direct_before_failure = harness
+        .registry
+        .get("quic-vm")
+        .context("QUIC jump entry missing")?
+        .direct_stream_opens
+        .load(std::sync::atomic::Ordering::Relaxed);
+    anyhow::ensure!(
+        direct_before_failure > 0,
+        "ProxyJump did not use direct QUIC"
+    );
+
+    // Close every carrier, then open immediately. Client renewal has a 2 s
+    // minimum backoff, so this connection must exercise warm TCP fallback.
+    let direct_connections = {
+        let entry = harness
+            .registry
+            .get("quic-vm")
+            .context("QUIC jump entry missing before forced close")?;
+        vec![
+            entry.direct.pick().context("first QUIC carrier missing")?,
+            entry.direct.pick().context("second QUIC carrier missing")?,
+        ]
+    };
+    for direct in direct_connections {
+        direct.close();
+    }
+    wait_direct_carriers(&harness.registry, "quic-vm", 0).await?;
+    let fallbacks_before = harness
+        .registry
+        .get("quic-vm")
+        .context("QUIC jump entry missing before fallback")?
+        .direct_fallbacks
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let output = run_jump(&config, "quic-vm.ssh.test", "relay-fallback").await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "warm TCP fallback failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let fallbacks_after = harness
+        .registry
+        .get("quic-vm")
+        .context("QUIC jump entry missing after fallback")?
+        .direct_fallbacks
+        .load(std::sync::atomic::Ordering::Relaxed);
+    anyhow::ensure!(
+        fallbacks_after > fallbacks_before,
+        "forced QUIC failure did not increment fallback counter"
+    );
+
+    wait_direct_carriers(&harness.registry, "quic-vm", 2).await?;
+    let output = run_jump(&config, "quic-vm.ssh.test", "direct-renewed").await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "renewed direct ProxyJump failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entry = harness
+        .registry
+        .get("quic-vm")
+        .context("QUIC jump entry missing after renew")?;
+    anyhow::ensure!(
+        entry
+            .direct_stream_opens
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > direct_before_failure,
+        "renewed QUIC carriers did not serve later ProxyJump traffic"
+    );
+    anyhow::ensure!(
+        entry
+            .direct_tx_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+            && entry
+                .direct_rx_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+        "direct byte counters stayed zero"
+    );
+    drop(entry);
+
+    client_task.abort();
+    wait_alias(&harness.registry, "quic-vm", false).await?;
+    harness.task.abort();
+    target_task.abort();
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test]
+async fn native_provider_udp_blocked_at_start_uses_warm_tcp() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    if !has_program("ssh").await || !has_program("ssh-keygen").await {
+        eprintln!("WARNING: OpenSSH tooling unavailable; skipping SSH jump fallback e2e");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let identity = gen_keypair(dir.path(), "operator").await?;
+    let accepted_key = load_public_key(&identity)?;
+    let keys_dir = dir.path().join("authorized_keys.d");
+    std::fs::create_dir(&keys_dir)?;
+    std::fs::copy(identity.with_extension("pub"), keys_dir.join("fabio"))?;
+    let (target_port, target_task) = spawn_target(accepted_key).await?;
+    let harness = spawn_bore_server(dir.path(), keys_dir, None).await?;
+    let config = dir.path().join("ssh_config");
+    write_ssh_config(&config, harness.gateway_port, target_port, &identity)?;
+
+    let client = Client::new_ssh_jump_provider(
+        "127.0.0.1",
+        target_port,
+        &format!("127.0.0.1:{}", harness.control_port),
+        "blocked-vm",
+        Some(BORE_SECRET),
+        false,
+        1,
+        true,
+        false,
+        None,
+    )
+    .await?;
+    let client_task = tokio::spawn(async move {
+        let _ = client.listen().await;
+    });
+    wait_alias(&harness.registry, "blocked-vm", true).await?;
+    anyhow::ensure!(
+        harness
+            .registry
+            .get("blocked-vm")
+            .is_some_and(|entry| entry.direct.is_empty()),
+        "direct carrier appeared while server UDP was disabled"
+    );
+    let output = run_jump(&config, "blocked-vm.ssh.test", "udp-blocked").await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "UDP-disabled warm TCP fallback failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    anyhow::ensure!(
+        harness.registry.get("blocked-vm").is_some_and(|entry| {
+            entry
+                .direct_fallbacks
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        }),
+        "UDP-disabled connection did not increment fallback counter"
+    );
+
+    client_task.abort();
+    wait_alias(&harness.registry, "blocked-vm", false).await?;
+    harness.task.abort();
+    target_task.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn pure_openssh_provider_real_proxyjump_and_cancel() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
@@ -780,9 +1027,15 @@ async fn silent_native_provider_is_reaped_and_alias_can_be_reclaimed() -> Result
     let keys_dir = dir.path().join("authorized_keys.d");
     std::fs::create_dir(&keys_dir)?;
     std::fs::copy(identity.with_extension("pub"), keys_dir.join("fabio"))?;
-    let harness =
-        spawn_bore_server_with(dir.path(), keys_dir, None, None, Duration::from_millis(650))
-            .await?;
+    let harness = spawn_bore_server_with(
+        dir.path(),
+        keys_dir,
+        None,
+        None,
+        Duration::from_millis(650),
+        None,
+    )
+    .await?;
 
     let socket = TcpStream::connect(("127.0.0.1", harness.control_port)).await?;
     let (opener, _acceptor) = mux::client(socket);

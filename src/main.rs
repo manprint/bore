@@ -732,8 +732,8 @@ enum Command {
         #[clap(long, value_name = "PORT", env = "BORE_VHOST_HTTPS_PORT")]
         vhost_https_port: Option<u16>,
 
-        /// UDP port for the vhost QUIC direct path. Unset = use the resolved
-        /// vhost HTTPS port on UDP.
+        /// Shared UDP port for vhost/public/SSH-jump direct QUIC. Unset = use
+        /// the resolved vhost HTTPS port on UDP.
         #[clap(long, value_name = "PORT", env = "BORE_VHOST_QUIC_PORT")]
         vhost_quic_port: Option<u16>,
 

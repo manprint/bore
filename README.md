@@ -509,7 +509,7 @@ Vhost frontend (always available, no feature flag):
       --vhost-base-domain <DOMAIN> Base domain, e.g. bore.mydomain.com; enables vhost without a config file, overrides base_domain from the file [env: BORE_VHOST_BASE_DOMAIN=]
       --vhost-http-port <PORT>    Override http_port from vhost.yml (default 80) [env: BORE_VHOST_HTTP_PORT=]
       --vhost-https-port <PORT>   Override https_port from vhost.yml (default 443) [env: BORE_VHOST_HTTPS_PORT=]
-      --vhost-quic-port <PORT>    UDP port for the vhost QUIC direct path (default: the resolved vhost HTTPS port, on UDP) [env: BORE_VHOST_QUIC_PORT=]
+      --vhost-quic-port <PORT>    Shared UDP port for vhost/public/SSH-jump direct QUIC (default: resolved vhost HTTPS port, on UDP) [env: BORE_VHOST_QUIC_PORT=]
       --vhost-mode <MODE>         Override mode from vhost.yml: http|https|both|redirect-https|auto [env: BORE_VHOST_MODE=]
       --vhost-cert-file <PATH>    TLS cert (PEM) for the vhost HTTPS frontend, overrides vhost.yml's cert_file [env: BORE_VHOST_CERT_FILE=]
       --vhost-key-file <PATH>     TLS key (PEM) for the vhost HTTPS frontend, overrides vhost.yml's key_file [env: BORE_VHOST_KEY_FILE=]
@@ -603,7 +603,7 @@ operator uses an unmodified OpenSSH client; the inner SSH session remains end-to
 the operator and the target `sshd`:
 
 ```text
-operator OpenSSH -> bore SSH gateway:443 -> bore TCP carrier -> target sshd
+operator OpenSSH -> bore SSH gateway:443 -> QUIC direct or warm TCP -> target sshd
 ```
 
 For example, an alias `vm-test-01` under `ssh.bore.tld` is reached with:
@@ -622,8 +622,12 @@ The server requires the existing SSH gateway plus one new namespace setting:
 
 ```shell
 bore server \
-  --control-port 443 \
+  --control-port 7835 \
+  --udp \
+  --vhost-quic-port 443 \
   --ssh-gateway \
+  --ssh-advertise-address bore.tld \
+  --ssh-advertise-port 443 \
   --ssh-jump-base-domain ssh.bore.tld \
   --ssh-host-key-file /etc/bore/ssh/host_key.pem \
   --ssh-authorized-keys-dir /etc/bore/ssh/authorized_keys.d \
@@ -640,6 +644,8 @@ ports:
   - "443:443/udp"    # existing shared direct-QUIC socket
 environment:
   - BORE_CONTROL_PORT=7835
+  - BORE_UDP=true
+  - BORE_VHOST_QUIC_PORT=443
   - BORE_SSH_GATEWAY=true
   - BORE_SSH_ADVERTISE_ADDRESS=bore.tld
   - BORE_SSH_ADVERTISE_PORT=443
@@ -647,8 +653,12 @@ environment:
 ```
 
 Do not add port 8443. TCP 443 and UDP 443 are distinct sockets; in this Compose they also
-map to different container ports. The current jump data path is TCP-only, so the existing
-`443/udp` mapping is unchanged and reserved for the later direct-QUIC phase.
+map to different container ports. Native `sshjhost --udp`, public `local --udp` and
+`vhost --udp` authenticate into separate `jump:<alias>`, `port:<N>` and bare-vhost pools
+through this single shared UDP endpoint. STUN stays on container UDP 7835.
+For a bare binary with `--control-port 443`, do not also set
+`--vhost-quic-port 443`: STUN already owns UDP 443. Use distinct internal UDP ports; the
+no-8443 rule above is specific to this bridge-network Compose topology.
 
 Server option:
 
@@ -666,6 +676,8 @@ bore sshjhost localhost:22 \
   --to https://bore.tld \
   --secret "$BORE_SECRET" \
   --notes "vm test AWS su zona eu-south-1" \
+  --carriers 4 \
+  --udp \
   --auto-reconnect
 ```
 
@@ -678,10 +690,13 @@ ssh -p 2222 -J fabio@bore.tld:443 admin@legacy-01.ssh.bore.tld
 ```
 
 The native provider authenticates to the bore control plane with the existing
-`BORE_SECRET`; it does not use a gateway username. TCP carriers stay warm and
-`--carriers N` adds parallel carrier connections for concurrent SSH sessions.
+`BORE_SECRET`; it does not use a gateway username. With `--udp`, the provider dials the
+shared server QUIC endpoint: no STUN or hole-punch is needed. TCP carriers stay warm.
+Each SSH connection uses one QUIC bidi stream; on missing/failed QUIC the same connection
+immediately falls back to TCP. `--carriers N` requests N TCP carriers and N independent
+QUIC connections (both server-capped); carrier loss renews only the QUIC shortfall.
 
-Complete TCP client reference:
+Complete client reference:
 
 | Argument/flag | Env | Meaning |
 |---|---|---|
@@ -691,9 +706,9 @@ Complete TCP client reference:
 | `--secret <SECRET>` | `BORE_SECRET` | Existing bore HMAC secret. |
 | `--insecure` | `BORE_INSECURE` | Accept a self-signed control TLS certificate. |
 | `--notes <TEXT>` | `BORE_NOTES` | Bounded operational note. |
-| `--carriers <N>` | `BORE_CARRIERS` | Requested warm TCP carriers (default 1; server caps with `--max-carriers`). |
+| `--carriers <N>` | `BORE_CARRIERS` | Requested warm TCP carriers and, with `--udp`, independent QUIC connections (default 1; both capped). |
 | `--auto-reconnect` | `BORE_AUTO_RECONNECT` | Re-register with exponential backoff after a disconnect. |
-| `--udp` | `BORE_PREFER_UDP` | Accepted and reported, but currently falls back to TCP; direct QUIC lands in Phase 4. |
+| `--udp` | `BORE_PREFER_UDP` | Prefer server-direct QUIC; requires `bore server --udp`, uses `--vhost-quic-port`, always keeps TCP fallback warm. |
 
 ### Pure OpenSSH provider
 
@@ -717,10 +732,16 @@ a jump host.
 ### Limits, lifecycle and audit
 
 Every jump alias has its own `--max-conns` semaphore. Native providers also use the
-server-capped `--carriers` pool; opening a provider channel is bounded to 10 seconds and
+server-capped `--carriers` pool; opening a provider channel is bounded to 15 seconds and
 retries another live carrier when one dies between selection and open. Permits, activity
 counters and the single logical admin row are RAII-owned, so cancellation, timeout and
 provider failure cannot leak capacity or duplicate dashboard rows.
+
+For UDP-requesting native providers the gateway picks one QUIC connection round-robin per
+SSH channel, writes `STREAM_READY`, then performs the same single-task half-close-safe
+splice. A failed pick/open/readiness marker increments the fallback counter and opens the
+same channel on warm TCP. Admin exposes live direct carriers, direct opens/fallbacks and
+separate relay/direct byte totals. Pure-OpenSSH providers never advertise QUIC.
 
 Native aliases are first-wins. Pure-OpenSSH reconnects may replace only a registration
 owned by the same exact classic username; cross-user and cross-transport collisions are

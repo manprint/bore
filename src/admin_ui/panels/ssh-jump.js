@@ -32,7 +32,12 @@ export default {
             ]),
             'Peer': escapeHtml(entry.peer ?? 'N/A'),
             'Path': badgeCell([
-                { label: entry.udp_active ? 'Direct' : 'Relay', kind: entry.udp_active ? 'success' : 'secondary' }
+                {
+                    label: entry.udp_active
+                        ? `Direct (${entry.direct_carriers ?? 0})`
+                        : (entry.udp_requested ? 'Relay fallback' : 'Relay'),
+                    kind: entry.udp_active ? 'success' : 'secondary'
+                }
             ]),
             'Carriers': escapeHtml(`${entry.effective_carriers ?? 0}/${entry.requested_carriers ?? 0}`),
             'Connections': escapeHtml(String(entry.active_connections ?? 0)),

@@ -28,9 +28,9 @@ Punti fermi:
 | Domanda | Risposta breve |
 |---|---|
 | 1. Fattibile? | **Sì.** SSH sostituisce il tratto client↔server (canali SSH al posto dei substream yamux). Tutto il resto si riusa. |
-| 2. Perdiamo funzionalità? | Sul tratto SSH: **sì** — niente `--udp`/QUIC direct, niente `--carriers>1`, niente hole-punch, niente `bore transfer`. Dettaglio in §2.2. |
+| 2. Perdiamo funzionalità? | Sul tratto SSH: **sì** — niente QUIC, niente `--carriers>1`, niente hole-punch, niente `bore transfer`. Eccezione jump: un provider nativo `bore sshjhost --udp` può usare QUIC sul solo tratto server→target. Dettaglio in §2.2/§6.15. |
 | 3. Tutto su 443? | **Sì.** Demux a byte-peek su TCP 443 (SSH / TLS / HTTP / yamux) + QUIC su UDP 443. §2.3. |
-| 4. UDP? | **No sul tratto SSH** — il protocollo SSH è TCP-only, limite strutturale non aggirabile con client OpenSSH stock. UDP/QUIC resta disponibile solo col client bore nativo (che convive sullo stesso 443). §2.4. |
+| 4. UDP? | **No sul tratto OpenSSH** — il protocollo SSH è TCP-only. Per jump con provider bore nativo, server→provider può usare QUIC diretto sullo stesso UDP 443, con TCP caldo come fallback. §2.4/§6.15. |
 | 5. Parametri via SSH? | Sì, 3 canali: stringa comando `exec`, variabili `SetEnv/SendEnv`, opzioni per-chiave nel file authorized_keys. Tabella completa flag→meccanismo in §3. |
 | 6/11. Stabilità? | Sì: keepalive SSH bidirezionale (client `ServerAlive*`, server keepalive interno 20 s + reaper 60 s in parità con gli invarianti secret esistenti) + `autossh`/systemd + policy di takeover alla riconnessione. §2.6/§2.11. |
 | 7. Comandi d'esempio coerenti? | **Due su quattro sono sintatticamente invalidi** per OpenSSH; correzioni in §2.7. |
@@ -181,7 +181,7 @@ porta d'ingresso universale. Sono complementari, non alternativi.
 
 | Funzionalità | Via SSH | Perché / mitigazione |
 |---|---|---|
-| `--udp` / QUIC direct (public, vhost, secret) | ❌ | SSH è TCP-only (§2.4). Sempre relay TCP |
+| `--udp` / QUIC direct (public, vhost, secret) | ❌ | SSH è TCP-only (§2.4). Per `sshjhost`, solo un provider bore nativo può accelerare server→provider (§6.15) |
 | `--carriers > 1` | ❌ | Una sola connessione SSH. I canali danno già multiplexing, ma senza isolamento cwnd/HOL |
 | Hole-punch (`--stun-server`, `--upnp`, `--try-port-prediction`, `--nat-udp-*`) | ❌ | Ha senso solo col path UDP |
 | `bore transfer` (resume, BLAKE3, `--parallel`) | ❌ | Protocollo applicativo del client bore. Via SSH si usa il normale `scp`/`rsync`… che però non passa dal tunnel bore |
@@ -1074,6 +1074,7 @@ Abilitazione server:
 
 ```bash
 bore server --ssh-gateway \
+  --udp --vhost-quic-port 443 \
   --ssh-jump-base-domain ssh.bore.example.com \
   --ssh-host-key-file /etc/bore/ssh/host_key.pem \
   --ssh-authorized-keys-dir /etc/bore/ssh/authorized_keys.d
@@ -1102,7 +1103,8 @@ Il provider alternativo usa il binario bore e il secret HMAC corrente:
 
 ```bash
 bore sshjhost localhost:22 --subdomain vm-test-01 \
-  --to https://bore.example.com --secret "$BORE_SECRET" --auto-reconnect
+  --to https://bore.example.com --secret "$BORE_SECRET" \
+  --carriers 4 --udp --auto-reconnect
 ```
 
 Connessione operatore:
@@ -1113,21 +1115,24 @@ ssh -p 2222 -J fabio@bore.example.com:443 admin@legacy.ssh.bore.example.com
 ```
 
 Il gateway autentica `fabio`; il vero `sshd` target autentica separatamente `ubuntu` o
-`admin` con la normale chiave/password interna. Non serve agent forwarding. Il percorso
-attuale usa solo carrier TCP; `bore sshjhost --udp` segnala esplicitamente il fallback TCP finché il
-direct QUIC non viene implementato nella fase dedicata. Configurazione Compose, tabella
-completa dei flag e collocazione delle chiavi sono nella sezione
+`admin` con la normale chiave/password interna. Non serve agent forwarding. Con
+`bore sshjhost --udp` il provider nativo apre N connessioni QUIC indipendenti verso il
+medesimo endpoint `--vhost-quic-port` già usato da vhost/public; chiavi `jump:<alias>`
+separano i pool. Ogni sessione usa un solo stream bidi. Nessun STUN/hole-punch: il provider
+diala il server pubblico. I carrier TCP restano caldi; assenza/errore QUIC fa fallback
+immediato della stessa sessione, mentre il client rinnova solo il deficit. Il provider
+OpenSSH puro resta TCP-only. Configurazione Compose, tabella completa dei flag e chiavi:
 [SSH jump hosts](../README.md#ssh-jump-hosts) del README, fonte operativa primaria.
 
-Ogni alias applica il proprio `max-conns`; l'apertura verso il provider ha timeout 10 s e
+Ogni alias applica il proprio `max-conns`; l'apertura verso il provider ha timeout 15 s e
 failover sugli altri carrier vivi. Permit, contatore connessioni e riga admin sono RAII:
 timeout, cancellazione e morte del provider non lasciano capacità o righe zombie. Il
 registry resta first-wins per provider nativi; solo un provider OpenSSH con lo stesso
 username esatto può fare takeover della propria registrazione.
 
 La dashboard espone un pannello **Jump Hosts** dedicato, alimentato da
-`/admin/api/v1/ssh-jump`, con alias/hostname, peer, tipo provider, target locale, carrier,
-limiti, uptime e byte relay/direct. Username classici e credenziali non sono serializzati.
+`/admin/api/v1/ssh-jump`, con alias/hostname, peer, tipo provider, target locale, carrier
+TCP/direct, aperture/fallback, limiti, uptime e byte relay/direct. Username classici e credenziali non sono serializzati.
 La config sanitizzata riporta namespace, requisito di classic auth e porta QUIC prevista.
 
 I log strutturati `allow`/`deny`/`open`/`close` includono peer esterno, principal operatore,

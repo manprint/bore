@@ -30,6 +30,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch, Semaphore};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::timeout;
+#[cfg(feature = "udp")]
+use tracing::debug;
 use tracing::{info, trace, warn};
 
 use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Registration, Role, Transport};
@@ -2582,40 +2584,94 @@ async fn open_ssh_jump_channel(
     let active = Arc::clone(&entry.active);
     let relay_rx_bytes = Arc::clone(&entry.relay_rx_bytes);
     let relay_tx_bytes = Arc::clone(&entry.relay_tx_bytes);
+    let direct_rx_bytes = Arc::clone(&entry.direct_rx_bytes);
+    let direct_tx_bytes = Arc::clone(&entry.direct_tx_bytes);
+    let entry_for_task = Arc::clone(&entry);
     let outer_peer = handler.peer;
     let alias_for_task = alias.clone();
     let principal_for_task = principal.clone();
     reply.accept().await;
-    info!(
-        event = "allow",
-        %principal,
-        %alias,
-        port = requested_port,
-        %outer_peer,
-        provider_type,
-        provider_owner_class,
-        selected_path = "relay",
-        "ssh-gateway: SSH jump connection allowed"
-    );
     tokio::spawn(async move {
         let _permit = permit;
         let _active_guard = ActiveGuard::new(active);
-        let mut provider = match timeout(
-            SSH_DIRECT_OPEN_TIMEOUT,
-            secret::open_with_failover(&pool, &alias_for_task, originator),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err)) => {
-                warn!(alias = %alias_for_task, %err, "ssh-gateway: jump provider open failed");
-                return;
+        #[cfg(feature = "udp")]
+        let direct_provider: Option<mux::LinkStream> = if entry_for_task.registration.udp {
+            match entry_for_task.direct.pick() {
+                Some(direct) => {
+                    match timeout(SSH_DIRECT_OPEN_TIMEOUT, direct.open_stream()).await {
+                        Ok(Ok(mut stream)) => {
+                            match mux::write_stream_ready(&mut stream, None).await {
+                                Ok(()) => {
+                                    entry_for_task
+                                        .direct_stream_opens
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    Some(Box::new(stream))
+                                }
+                                Err(err) => {
+                                    debug!(alias = %alias_for_task, %err,
+                                    "ssh-gateway: SSH jump direct readiness failed; using TCP carrier");
+                                    None
+                                }
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            debug!(alias = %alias_for_task, %err,
+                            "ssh-gateway: SSH jump direct open failed; using TCP carrier");
+                            None
+                        }
+                        Err(_) => {
+                            debug!(alias = %alias_for_task,
+                            "ssh-gateway: SSH jump direct open timed out; using TCP carrier");
+                            None
+                        }
+                    }
+                }
+                None => None,
             }
-            Err(_) => {
-                warn!(alias = %alias_for_task, "ssh-gateway: jump provider open timed out");
-                return;
+        } else {
+            None
+        };
+        #[cfg(not(feature = "udp"))]
+        let direct_provider: Option<mux::LinkStream> = None;
+
+        let used_direct = direct_provider.is_some();
+        if entry_for_task.registration.udp && !used_direct {
+            entry_for_task
+                .direct_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let mut provider = if let Some(provider) = direct_provider {
+            provider
+        } else {
+            match timeout(
+                SSH_DIRECT_OPEN_TIMEOUT,
+                secret::open_with_failover(&pool, &alias_for_task, originator),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(err)) => {
+                    warn!(alias = %alias_for_task, %err, "ssh-gateway: jump provider open failed");
+                    return;
+                }
+                Err(_) => {
+                    warn!(alias = %alias_for_task, "ssh-gateway: jump provider open timed out");
+                    return;
+                }
             }
         };
+        let selected_path = if used_direct { "direct" } else { "relay" };
+        info!(
+            event = "allow",
+            principal = %principal_for_task,
+            alias = %alias_for_task,
+            port = requested_port,
+            %outer_peer,
+            provider_type,
+            provider_owner_class,
+            selected_path,
+            "ssh-gateway: SSH jump connection allowed"
+        );
         info!(
             event = "open",
             principal = %principal_for_task,
@@ -2624,14 +2680,19 @@ async fn open_ssh_jump_channel(
             %outer_peer,
             provider_type,
             provider_owner_class,
-            selected_path = "relay",
+            selected_path,
             "ssh-gateway: SSH jump channel opened"
         );
         let ssh_stream = channel.into_stream();
+        let (path_rx_bytes, path_tx_bytes) = if used_direct {
+            (direct_rx_bytes, direct_tx_bytes)
+        } else {
+            (relay_rx_bytes, relay_tx_bytes)
+        };
         let mut counted = CountingStream::new(
             ssh_stream,
-            relay_rx_bytes,
-            relay_tx_bytes,
+            path_rx_bytes,
+            path_tx_bytes,
             total_rx_bytes,
             total_tx_bytes,
         );
@@ -2646,7 +2707,7 @@ async fn open_ssh_jump_channel(
                 %outer_peer,
                 provider_type,
                 provider_owner_class,
-                selected_path = "relay",
+                selected_path,
                 client_to_provider_bytes,
                 provider_to_client_bytes,
                 "ssh-gateway: SSH jump channel closed"
@@ -2659,7 +2720,7 @@ async fn open_ssh_jump_channel(
                 %outer_peer,
                 provider_type,
                 provider_owner_class,
-                selected_path = "relay",
+                selected_path,
                 %err,
                 "ssh-gateway: SSH jump channel closed"
             ),

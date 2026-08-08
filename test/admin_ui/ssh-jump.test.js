@@ -14,6 +14,9 @@ const SAMPLE = [{
     effective_carriers: 2,
     udp_requested: true,
     udp_active: false,
+    direct_carriers: 0,
+    direct_stream_opens: 7,
+    direct_fallbacks: 2,
     active_connections: 3,
     uptime_secs: 65,
     relay_tx_bytes: 1024,
@@ -42,4 +45,5 @@ test('T-JH-UI: panel renders operational fields and escapes untrusted text', asy
     assert.ok(!hostname.includes('<script>'), 'hostname escaped');
     assert.equal(notes.innerHTML, '', 'notes never parsed as HTML');
     assert.equal(notes.textContent, SAMPLE[0].notes, 'notes rendered through textContent');
+    assert.equal(row.children[4].children[0].children[0].textContent, 'Relay fallback');
 });

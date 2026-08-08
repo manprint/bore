@@ -192,6 +192,11 @@ use tracing::trace;
 /// Length of the shared authentication token (HMAC-SHA256 output).
 pub const TOKEN_LEN: usize = 32;
 
+/// Maximum key length accepted by the shared vhost/public/jump QUIC
+/// authentication stream. Bounds allocation before reading attacker data.
+#[cfg(feature = "udp")]
+pub(crate) const MAX_SERVER_DIRECT_KEY_LEN: usize = 128;
+
 /// Per-attempt timeout for a STUN binding request (kept short so a missing STUN
 /// server fails fast and the caller can fall back to the relay).
 const STUN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -2767,6 +2772,9 @@ pub async fn vhost_connect(
     token: [u8; TOKEN_LEN],
     tuning: UdpDirectTuning,
 ) -> Result<DirectConn> {
+    if subdomain.len() > MAX_SERVER_DIRECT_KEY_LEN {
+        bail!("server-direct key exceeds {MAX_SERVER_DIRECT_KEY_LEN} bytes");
+    }
     let subdomain_len: u16 = subdomain
         .len()
         .try_into()
@@ -2969,6 +2977,9 @@ pub async fn vhost_server_handshake(
         let mut sub_len = [0u8; 2];
         recv.read_exact(&mut sub_len).await?;
         let sub_len = u16::from_be_bytes(sub_len) as usize;
+        if sub_len > MAX_SERVER_DIRECT_KEY_LEN {
+            bail!("server-direct key exceeds {MAX_SERVER_DIRECT_KEY_LEN} bytes");
+        }
 
         let mut subdomain = vec![0u8; sub_len];
         recv.read_exact(&mut subdomain).await?;
@@ -4698,6 +4709,34 @@ mod tests {
             server.is_err(),
             "server must reject the wrong vhost direct token"
         );
+    }
+
+    #[cfg(feature = "udp")]
+    #[test]
+    fn shared_direct_auth_key_length_is_bounded() {
+        assert!(
+            crate::ssh_jump::direct_key(&"a".repeat(crate::ssh_jump::MAX_ALIAS_LEN)).len()
+                <= MAX_SERVER_DIRECT_KEY_LEN
+        );
+        assert!(format!("port:{}", u16::MAX).len() <= MAX_SERVER_DIRECT_KEY_LEN);
+        assert_eq!(MAX_SERVER_DIRECT_KEY_LEN, 128);
+    }
+
+    #[cfg(feature = "udp")]
+    #[tokio::test]
+    async fn shared_direct_client_rejects_oversized_key_before_dial() {
+        let socket = bind_socket(0).await.unwrap();
+        let err = vhost_connect(
+            socket,
+            "127.0.0.1:9".parse().unwrap(),
+            &"x".repeat(MAX_SERVER_DIRECT_KEY_LEN + 1),
+            [0; TOKEN_LEN],
+            UdpDirectTuning::default(),
+        )
+        .await
+        .err()
+        .expect("oversized direct key must be rejected");
+        assert!(err.to_string().contains("server-direct key exceeds"));
     }
 
     #[test]

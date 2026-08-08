@@ -12,10 +12,10 @@
   acceptance contract for native and pure-OpenSSH providers.
 - Planning documents validated for balanced code fences, trailing whitespace,
   required files and port-topology consistency.
-- Phases 1–3 implemented and green. Phase 4 has not started.
-- `bore sshjhost`, `--ssh-jump-base-domain`, native TCP carriers, pure-OpenSSH
-  `jump/` registration and real ProxyJump dispatch are available.
-- Phase 2 is commit `569ef92a` (`fase2.`). Phase 3 is implemented in the current
+- Phases 1–4 implemented and green. Phase 5 has not started.
+- `bore sshjhost`, `--ssh-jump-base-domain`, native warm-TCP plus direct-QUIC
+  carriers, pure-OpenSSH `jump/` registration and real ProxyJump dispatch are available.
+- Phase 3 is commit `b330fd8` (`phase 3`). Phase 4 is implemented in the current
   uncommitted worktree for owner review.
 
 ## Phase 1 checkpoint
@@ -101,7 +101,7 @@ Run on 2026-08-05 with all features:
 
 - Added exact per-alias active/relay counters shared by the routing registry and
   its single `Role::SshJumpHost` admin row. The existing per-entry semaphore,
-  10 s provider-open bound, carrier failover and RAII cleanup now have focused
+  15 s provider-open bound, carrier failover and RAII cleanup now have focused
   cancellation/failover/counter coverage.
 - Hardened collision/reconnect behavior: native remains first-wins; pure SSH
   takeover remains same-username-only; concurrent native reconnect storms cannot
@@ -133,6 +133,50 @@ Run on 2026-08-08:
 - `cargo build --release --all-features` — pass.
 - `sudo -n /abs/path/scripts/ssh_gateway_test.sh` — pass: 16, fail: 0.
 
+## Phase 4 checkpoint
+
+- Reused the one server-direct QUIC endpoint and its existing
+  `--vhost-quic-port`; `jump:<alias>` joins bare vhost and `port:<N>` without a
+  second bind or new flag. Authentication keys are length-bounded and jump
+  nonces are tied to exact registration ids across replacement races.
+- Native `sshjhost --udp` opens the clamped `--carriers N` QUIC pool, processes
+  each bidi stream through the existing local splice, renews only the shortfall
+  with bounded backoff and closes all direct carriers on deregistration.
+- Each authorized ProxyJump channel selects one QUIC carrier/stream. Missing,
+  closed, timed-out or readiness-failed direct opens increment fallback state and
+  use the warm TCP carrier pool for that same channel. Pure OpenSSH stays TCP-only.
+- Added live direct carrier/open/fallback state and separate direct bytes to the
+  sanitized API/UI; updated README, both gateway guides, frontend docs and root
+  invariant ledger.
+- Added real OpenSSH E2E for N=2 direct use, carrier loss, TCP fallback, renewal,
+  resumed direct use and UDP-disabled startup fallback. Shared endpoint bounds,
+  ownership, admin and UI have focused unit tests.
+
+## Phase 4 gates
+
+Run on 2026-08-08:
+
+- `cargo fmt --all -- --check` — pass.
+- `cargo clippy --all-targets --all-features -- -D warnings` — pass.
+- `cargo test --all-features --test ssh_jump_test -- --test-threads=1` — pass:
+  6 passed, 0 failed.
+- `cargo test --all-features --test vhost_test -- --test-threads=1` — pass:
+  42 passed, 0 failed.
+- `cargo test --all-features --test public_udp_test -- --test-threads=1` — pass:
+  6 passed, 0 failed.
+- `cargo test --all-features --test ssh_gateway_test -- --test-threads=1` —
+  pass: 42 passed, 0 failed.
+- `cargo test --all-features -- --test-threads=1` — pass: 900 passed, 0 failed,
+  2 existing ignored (902 listed). The Compose/STUN collision diagnostic added
+  after that run also passes as a focused test: 1 passed, 0 failed.
+- `npm test` — pass: 92 passed, 0 failed.
+- `cargo check --no-default-features --all-targets` — pass with no warnings.
+- `cargo check --no-default-features --features ssh-gateway --all-targets` —
+  pass with no warnings.
+- `cargo build --release --all-features` — pass.
+- `sudo -n /abs/path/scripts/ssh_gateway_test.sh` — pass: 16, fail: 0.
+- `git diff --check` — pass.
+
 ## Locked configuration
 
 - SSH gateway: TCP 443 through OpenSSH config alias.
@@ -155,6 +199,6 @@ Run on 2026-08-08:
 
 ## Next
 
-Stop at the green Phase 3 boundary. Await the owner's review/commit and an
-explicit instruction before beginning `phase_04.md`; do not begin Phase 4
+Stop at the green Phase 4 boundary. Await the owner's review/commit and an
+explicit instruction before beginning `phase_05.md`; do not begin Phase 5
 automatically.

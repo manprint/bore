@@ -105,6 +105,10 @@ pub struct Client {
     #[cfg(feature = "udp")]
     vhost_udp: bool,
 
+    /// Whether this native SSH jump provider requested the QUIC direct path.
+    #[cfg(feature = "udp")]
+    ssh_jump_udp: bool,
+
     /// Control endpoint used to resolve the server's public UDP address for the
     /// direct path (both vhost and public tunnels).
     #[cfg(feature = "udp")]
@@ -304,6 +308,8 @@ impl Client {
             udp_lease: None,
             #[cfg(feature = "udp")]
             vhost_udp: false,
+            #[cfg(feature = "udp")]
+            ssh_jump_udp: false,
             #[cfg(feature = "udp")]
             direct_endpoint,
             #[cfg(feature = "udp")]
@@ -507,6 +513,8 @@ impl Client {
             udp_cfg,
             #[cfg(feature = "udp")]
             vhost_udp: false,
+            #[cfg(feature = "udp")]
+            ssh_jump_udp: false,
             #[cfg(feature = "udp")]
             direct_endpoint: None,
             #[cfg(feature = "udp")]
@@ -712,6 +720,8 @@ impl Client {
             #[cfg(feature = "udp")]
             vhost_udp: udp,
             #[cfg(feature = "udp")]
+            ssh_jump_udp: false,
+            #[cfg(feature = "udp")]
             direct_endpoint: direct_endpoint_val,
             #[cfg(feature = "udp")]
             direct_key,
@@ -733,8 +743,8 @@ impl Client {
     }
 
     /// Register a native SSH jump-host provider over the normal bore control
-    /// transport. Phase 2 serves TCP carriers only; the `udp` bit is retained
-    /// on the wire for forward-compatible operator intent and admin display.
+    /// transport. Optional QUIC carriers use the server's shared direct endpoint;
+    /// warm TCP carriers remain available for per-connection fallback.
     #[allow(clippy::too_many_arguments)]
     pub async fn new_ssh_jump_provider(
         local_host: &str,
@@ -758,6 +768,18 @@ impl Client {
             local_host,
             local_port,
         )?;
+        #[cfg(not(feature = "udp"))]
+        if udp {
+            warn!("built without udp support; ignoring SSH jump --udp");
+        }
+        #[cfg(feature = "udp")]
+        if udp && carriers as usize > crate::vhost::MAX_DIRECT_CARRIERS {
+            warn!(
+                requested = carriers,
+                cap = crate::vhost::MAX_DIRECT_CARRIERS,
+                "SSH jump --carriers exceeds the QUIC direct-pool cap; clamping"
+            );
+        }
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
         let (opener, acceptor) = mux::client(socket);
@@ -828,11 +850,16 @@ impl Client {
             }
         }
 
-        if udp {
-            warn!(
-                "SSH jump --udp is recorded but direct QUIC is not active in the TCP phase; using warm TCP carriers"
-            );
-        }
+        #[cfg(feature = "udp")]
+        let (direct_key, direct_endpoint, direct_udp_carriers) = if udp {
+            (
+                Some(crate::ssh_jump::direct_key(&registration.alias)),
+                Some(endpoint.clone()),
+                crate::vhost::clamp_direct_carriers(carriers),
+            )
+        } else {
+            (None, None, 0)
+        };
         let proxy_jump_host = if endpoint.host.contains(':') {
             format!("[{}]:{}", endpoint.host, endpoint.port)
         } else {
@@ -863,11 +890,13 @@ impl Client {
             #[cfg(feature = "udp")]
             vhost_udp: false,
             #[cfg(feature = "udp")]
-            direct_endpoint: None,
+            ssh_jump_udp: udp,
             #[cfg(feature = "udp")]
-            direct_key: None,
+            direct_endpoint,
             #[cfg(feature = "udp")]
-            direct_udp_carriers: 0,
+            direct_key,
+            #[cfg(feature = "udp")]
+            direct_udp_carriers,
             basic_auth: None,
             carrier_acceptors,
             carrier_dialer,
@@ -903,6 +932,10 @@ impl Client {
         let vhost_udp = self.vhost_udp;
         #[cfg(not(feature = "udp"))]
         let vhost_udp = false;
+        #[cfg(feature = "udp")]
+        let ssh_jump_udp = self.ssh_jump_udp;
+        #[cfg(not(feature = "udp"))]
+        let ssh_jump_udp = false;
         #[cfg(feature = "udp")]
         let direct_endpoint = self.direct_endpoint.clone();
         #[cfg(not(feature = "udp"))]
@@ -1156,8 +1189,54 @@ impl Client {
                         Some(ServerMessage::SshJumpReady { .. }) => {
                             warn!("unexpected ssh jump ready")
                         }
-                        Some(ServerMessage::SshJumpUdp { .. }) => {
-                            warn!("unexpected ssh jump udp offer")
+                        Some(ServerMessage::SshJumpUdp { port, nonce, tuning }) => {
+                            #[cfg(feature = "udp")]
+                            if ssh_jump_udp {
+                                let Some(endpoint) = direct_endpoint.as_ref() else {
+                                    warn!("SSH jump udp offer received without endpoint context");
+                                    continue;
+                                };
+                                let Some(key) = direct_key.as_deref() else {
+                                    warn!("SSH jump udp offer received without alias context");
+                                    continue;
+                                };
+                                let server_addr = match resolve_direct_server_addr(endpoint, port).await {
+                                    Ok(addr) => addr,
+                                    Err(err) => {
+                                        warn!(%err, key, "failed to resolve SSH jump direct udp endpoint; using TCP relay");
+                                        let _ = direct_renew_tx.send(());
+                                        continue;
+                                    }
+                                };
+                                let token = crate::holepunch::derive_token(secret.as_deref(), &nonce);
+                                let current = direct_live.load(Ordering::Relaxed);
+                                let need = direct_udp_target.saturating_sub(current);
+                                if need == 0 {
+                                    continue;
+                                }
+                                info!(key, need, target = direct_udp_target,
+                                    "establishing SSH jump direct udp carriers");
+                                for _ in 0..need {
+                                    direct_live.fetch_add(1, Ordering::Relaxed);
+                                    spawn_direct(
+                                        Arc::clone(&this),
+                                        server_addr,
+                                        key.to_string(),
+                                        token,
+                                        tuning,
+                                        Arc::clone(&direct_live),
+                                        direct_renew_tx.clone(),
+                                        direct_up_tx.clone(),
+                                    );
+                                }
+                            } else {
+                                warn!("unexpected SSH jump udp offer");
+                            }
+                            #[cfg(not(feature = "udp"))]
+                            {
+                                let _ = (port, nonce, tuning);
+                                warn!("unexpected SSH jump udp offer");
+                            }
                         }
                         Some(ServerMessage::VpnReady { .. }) => warn!("unexpected vpn ready"),
                         Some(ServerMessage::VpnError(err)) => error!(%err, "vpn error"),
@@ -1174,7 +1253,22 @@ impl Client {
                 }, if direct_renew_sleep.is_some() => {
                     direct_renew_sleep = None;
                     if let Some(key) = direct_key.as_deref() {
-                        if vhost_udp {
+                        if ssh_jump_udp {
+                            let Some(alias) = key.strip_prefix("jump:") else {
+                                warn!(key, "invalid SSH jump direct key during renewal");
+                                continue;
+                            };
+                            info!(%alias, "requesting SSH jump udp renewal");
+                            if control
+                                .send(ClientMessage::SshJumpUdpRenew {
+                                    alias: alias.to_string(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        } else if vhost_udp {
                             info!(key, "requesting vhost udp renewal");
                             if control
                                 .send(ClientMessage::VhostUdpRenew {

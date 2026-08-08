@@ -32,17 +32,24 @@ Rule: start Sonnet. Drop to Haiku for bulk/mechanical. Escalate to Opus only whe
 
 ## Key invariants to never break
 
-- **SSH jump TCP hardening/admin (`docs/plans/plan_SshJumpHost/` Phase 3):** one
+- **SSH jump hardening/direct/admin (`docs/plans/plan_SshJumpHost/` Phases 3–4):** one
   alias = exactly one `Role::SshJumpHost` admin row across carriers and reconnect storms.
   Native registration is first-wins; pure OpenSSH takeover requires the same exact classic
   username. Each entry owns its `max_conns` semaphore plus shared active/relay counters;
-  provider open is 10 s bounded and retries the other live carriers. Preserve RAII cleanup
+  provider open is 15 s bounded and retries the other live carriers. Preserve RAII cleanup
   on reject/timeout/cancel/provider death and the single-task
   `copy_bidirectional_with_sizes` half-close path. `/admin/api/v1/ssh-jump` and the Jump
   Hosts panel expose operational metadata only — never username/identity, secret,
   password or key material. Structured `allow`/`deny`/`open`/`close` logs carry outer peer,
   operator principal, alias, port, provider type/owner class and selected path; client
   denials stay generic and repeated username mismatches stay logarithmically sampled.
+  Native `sshjhost --udp` reuses the ONE shared `--vhost-quic-port` endpoint with auth key
+  `jump:<alias>` (bare keys stay vhost; `port:<N>` stays public); never bind another UDP
+  socket. Provider dials N independently authenticated QUIC connections, capped by
+  `MAX_DIRECT_CARRIERS`; each SSH channel uses exactly one bidi stream. Server writes
+  `STREAM_READY` before splice. Missing/dead/open-failed QUIC falls back for the SAME
+  channel to warm TCP, never kills the outer SSH session. Carrier loss renews only the
+  shortfall. Pure OpenSSH providers stay TCP-only. Direct auth-key allocation is bounded.
 - **Secret control liveness (zombie-entry reaper):** secret provider/consumer control loop = yamux substream → half-open/abandoned peer invisible to `send`/`recv` (send buffers into yamux, recv blocks forever) → RAII admin `Registration` never drops → zombie admin entry (inflates "Secret Tunnels" count). FIX: `serve_provider`/`serve_consumer` track `last_recv`, reap (return → drop entry) when `last_recv.elapsed() >= ctrl_timeout`, **checked on the 500ms heartbeat tick** — NOT `timeout(recv)` (heartbeat branch wins `select!` every 500ms → resets a `timeout(recv)` future before its deadline). secret-provider client (shared `client::listen`, gated `is_secret_provider`) + consumer client (`secret::Proxy` loop) send `ClientMessage::Heartbeat` every `CTRL_CLIENT_HEARTBEAT` (20s ≪ 60s) → healthy idle never trips. `Heartbeat` appended LAST (wire-compat: old server can't decode → upgrade server before/with clients). `Server::secret_ctrl_timeout()` lowers 60s default for tests. Public/vhost keep legacy heartbeat-free path (server loops unchanged).
 - **Secret consumer CARRIERS (`--carriers N` on `bore proxy`) must NOT register admin entry, must NOT be reaped.** Extra relay carrier dials server, sends `ClientMessage::ConnectSecret { carrier: true, .. }` (additive `#[serde(default)]` field, serde_json wire — old client omits ⇒ `false` ⇒ legacy path). `serve_consumer(carrier=true)` skips `admin.register` (else `--carriers N` showed N-1 spurious `local_proxy_port=None` "N/A" rows — BUG-S1) AND skips `ctrl_timeout` reap (carriers send no `Heartbeat` by design — only consumer MAIN conn does, every 20s — reaping degraded pool N→1 after 60s — BUG-S2). Carrier still accepts+relays data substreams. One logical tunnel = exactly ONE admin row regardless `--carriers`/transport (I-3). `carrier == false` path byte-identical. FE (`secret.js`) also dedups port-less carrier rows defensively (folds rows sharing a real consumer's peer IP) → even OLD server can't show spurious rows. Provider carriers already use leak-free `JoinCarrier`/`serve_carrier` — do not fork.
 - **Secret direct-path benign hole-punch strays are `debug`, never `WARN`.** `DirectListener::accept` (holepunch.rs) loops internally: incipient QUIC incomings from punch crossfire that never finish TLS / carry no/wrong token → logged `debug` + skipped; only endpoint-level close → `Err`. Real token-verified conn succeeds alongside. Do NOT restore per-stray WARN (BUG-S3), do NOT filter accepted source vs offered candidates / disable QUIC migration — token auth is the gate, CGNAT consumers legitimately connect from an un-offered source (`100.64/10` egress; D7).

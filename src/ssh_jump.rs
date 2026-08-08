@@ -258,6 +258,11 @@ pub struct SshJumpEntry {
     pub direct_tx_bytes: Arc<AtomicU64>,
     /// Direct-path bytes received from the SSH client (wired by Phase 4).
     pub direct_rx_bytes: Arc<AtomicU64>,
+    /// Number of SSH channels that successfully opened a direct QUIC stream.
+    pub direct_stream_opens: AtomicU64,
+    /// Number of UDP-requesting SSH channels that used warm TCP after direct
+    /// selection was unavailable or failed.
+    pub direct_fallbacks: AtomicU64,
     /// Live direct QUIC connections for a native provider.
     #[cfg(feature = "udp")]
     pub direct: crate::vhost::DirectPool,
@@ -314,6 +319,8 @@ impl SshJumpEntry {
             relay_rx_bytes: Arc::new(AtomicU64::new(0)),
             direct_tx_bytes: Arc::new(AtomicU64::new(0)),
             direct_rx_bytes: Arc::new(AtomicU64::new(0)),
+            direct_stream_opens: AtomicU64::new(0),
+            direct_fallbacks: AtomicU64::new(0),
             #[cfg(feature = "udp")]
             direct: crate::vhost::DirectPool::default(),
         }
@@ -360,6 +367,17 @@ impl PendingSshJumpNonce {
             owner_id: owner.registration_id(),
         }
     }
+
+    /// Whether this nonce still belongs to the exact live registration.
+    pub fn belongs_to(&self, owner: &SshJumpEntry) -> bool {
+        self.owner_id == owner.registration_id()
+    }
+
+    /// Exact registration id authenticated by this nonce.
+    #[cfg(feature = "udp")]
+    pub(crate) fn owner_id(&self) -> u64 {
+        self.owner_id
+    }
 }
 
 /// Pending direct-path nonce registry keyed by `jump:<alias>`.
@@ -368,6 +386,39 @@ pub type PendingSshJumpUdp = Arc<DashMap<String, PendingSshJumpNonce>>;
 /// Return the collision-proof direct-path key for one validated alias.
 pub fn direct_key(alias: &str) -> String {
     format!("jump:{alias}")
+}
+
+#[cfg(all(feature = "ssh-gateway", feature = "udp"))]
+fn new_nonce() -> [u8; UDP_NONCE_LEN] {
+    use ring::rand::{SecureRandom, SystemRandom};
+
+    let mut nonce = [0u8; UDP_NONCE_LEN];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .expect("system CSPRNG must not fail");
+    nonce
+}
+
+#[cfg(all(feature = "ssh-gateway", feature = "udp"))]
+async fn send_udp_offer(
+    control: &mut Delimited<mux::Stream>,
+    alias: &str,
+    port: u16,
+    pending_udp: &PendingSshJumpUdp,
+    entry: &SshJumpEntry,
+    tuning: crate::shared::UdpDirectTuning,
+) -> Result<()> {
+    let nonce = new_nonce();
+    pending_udp.insert(direct_key(alias), PendingSshJumpNonce::new(entry, nonce));
+    control
+        .send(ServerMessage::SshJumpUdp {
+            port,
+            nonce,
+            tuning,
+        })
+        .await?;
+    info!(%alias, port, "offered SSH jump direct udp path");
+    Ok(())
 }
 
 /// RAII deregistration guard that cannot remove a replacement entry or nonce.
@@ -399,6 +450,8 @@ impl SshJumpDeregister {
 
 impl Drop for SshJumpDeregister {
     fn drop(&mut self) {
+        #[cfg(feature = "udp")]
+        self.entry.direct.close_all();
         let removed = self
             .registry
             .remove_if(&self.alias, |_, current| Arc::ptr_eq(current, &self.entry))
@@ -412,9 +465,9 @@ impl Drop for SshJumpDeregister {
     }
 }
 
-/// Register and serve one native TCP jump provider until its control channel
-/// closes or misses the receive deadline. QUIC negotiation is deliberately
-/// deferred to Phase 4; TCP carriers remain the complete Phase 2 data path.
+/// Register and serve one native jump provider until its control channel closes
+/// or misses the receive deadline. TCP carriers stay warm while optional direct
+/// QUIC carriers are negotiated and renewed.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "ssh-gateway")]
 pub(crate) async fn serve_native_provider(
@@ -430,6 +483,9 @@ pub(crate) async fn serve_native_provider(
     max_carriers: u16,
     max_conns: usize,
     ctrl_timeout: Duration,
+    server_udp_enabled: bool,
+    direct_quic_port: u16,
+    udp_tuning: crate::shared::UdpDirectTuning,
 ) -> Result<()> {
     let alias = registration.alias.clone();
     let requested_carriers = registration.carriers;
@@ -455,8 +511,12 @@ pub(crate) async fn serve_native_provider(
             slot.insert(Arc::clone(&entry));
         }
     }
-    let _deregister =
-        SshJumpDeregister::new(registry, pending_udp, alias.clone(), Arc::clone(&entry));
+    let _deregister = SshJumpDeregister::new(
+        registry,
+        pending_udp.clone(),
+        alias.clone(),
+        Arc::clone(&entry),
+    );
 
     let _admin_registration = admin.register_with_counters(
         NewEntry {
@@ -520,6 +580,28 @@ pub(crate) async fn serve_native_provider(
         None
     };
 
+    #[cfg(feature = "udp")]
+    if registration.udp && server_udp_enabled {
+        send_udp_offer(
+            &mut control,
+            &alias,
+            direct_quic_port,
+            &pending_udp,
+            &entry,
+            udp_tuning,
+        )
+        .await?;
+    }
+    #[cfg(feature = "udp")]
+    if registration.udp && !server_udp_enabled {
+        tracing::debug!(%alias, "SSH jump udp requested but server udp is disabled; using TCP relay");
+    }
+    #[cfg(not(feature = "udp"))]
+    if registration.udp {
+        let _ = (server_udp_enabled, direct_quic_port, udp_tuning);
+        tracing::debug!(%alias, "SSH jump udp requested but binary was built without udp support; using TCP relay");
+    }
+
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_recv = Instant::now();
@@ -539,8 +621,26 @@ pub(crate) async fn serve_native_provider(
                 last_recv = Instant::now();
                 match message? {
                     Some(ClientMessage::Heartbeat) => {}
-                    Some(ClientMessage::SshJumpUdpRenew { .. }) => {
-                        warn!(%alias, "SSH jump QUIC renewal is unavailable in TCP phase")
+                    Some(ClientMessage::SshJumpUdpRenew { alias: renew_alias }) => {
+                        if renew_alias != alias {
+                            warn!(%alias, requested = %renew_alias,
+                                "unexpected SSH jump udp renew request");
+                        }
+                        #[cfg(feature = "udp")]
+                        if renew_alias == alias && registration.udp && server_udp_enabled {
+                            send_udp_offer(
+                                &mut control,
+                                &alias,
+                                direct_quic_port,
+                                &pending_udp,
+                                &entry,
+                                udp_tuning,
+                            )
+                            .await?;
+                        }
+                        if renew_alias == alias && (!registration.udp || !server_udp_enabled) {
+                            tracing::debug!(%alias, "ignoring SSH jump udp renew while udp is disabled");
+                        }
                     }
                     Some(_) => warn!(%alias, "unexpected message from SSH jump provider"),
                     None => return Ok(()),
@@ -711,6 +811,9 @@ mod tests {
             "jump:vm-test-01".to_string(),
             PendingSshJumpNonce::new(&new_entry, [2; crate::shared::UDP_NONCE_LEN]),
         );
+        assert!(pending
+            .get("jump:vm-test-01")
+            .is_some_and(|nonce| nonce.belongs_to(&new_entry) && !nonce.belongs_to(&old_entry)));
 
         drop(old_guard);
 

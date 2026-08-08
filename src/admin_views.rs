@@ -238,6 +238,12 @@ pub struct SshJumpView {
     pub udp_requested: bool,
     /// Whether at least one direct QUIC carrier is live.
     pub udp_active: bool,
+    /// Number of live direct QUIC carriers.
+    pub direct_carriers: usize,
+    /// SSH channels successfully opened over direct QUIC.
+    pub direct_stream_opens: u64,
+    /// UDP-requesting SSH channels that fell back to warm TCP.
+    pub direct_fallbacks: u64,
     /// Provider auto-reconnect setting.
     pub auto_reconnect: bool,
     /// Per-provider concurrent connection cap.

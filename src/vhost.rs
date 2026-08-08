@@ -521,6 +521,16 @@ impl DirectPool {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Close and remove every pooled connection. Used when an owning registry
+    /// entry ends so detached close monitors cannot keep QUIC carriers alive.
+    pub fn close_all(&self) {
+        let mut conns = self.conns.write().unwrap();
+        for member in conns.iter() {
+            member.conn.close();
+        }
+        conns.clear();
+    }
 }
 
 /// Registry of live vhost providers, keyed by subdomain label.

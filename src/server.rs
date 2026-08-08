@@ -54,6 +54,11 @@ pub(crate) fn compute_rate_bps(prev_bytes: u64, cur_bytes: u64, dt_ms: u64) -> u
     }
 }
 
+/// STUN and the shared server-direct QUIC endpoint require distinct UDP binds.
+fn direct_udp_collides_with_stun(control_port: u16, direct_port: u16) -> bool {
+    control_port == direct_port
+}
+
 /// Default cap on the number of concurrently proxied connections per tunnel
 /// connection. Bounds memory and file-descriptor use under a connection flood.
 /// Overridable with [`Server::set_max_conns`].
@@ -250,7 +255,7 @@ pub struct Server {
     /// Live native and pure-OpenSSH jump providers, keyed by alias.
     ssh_jump_registry: crate::ssh_jump::SshJumpRegistry,
 
-    /// Native jump direct-path nonces (unused until the QUIC phase).
+    /// Native jump direct-path nonces keyed by `jump:<alias>`.
     #[cfg_attr(not(feature = "ssh-gateway"), allow(dead_code))]
     pending_ssh_jump_udp: crate::ssh_jump::PendingSshJumpUdp,
 
@@ -1111,6 +1116,13 @@ impl Server {
         // port over UDP so clients can discover their reflexive address without
         // any external infrastructure.
         if this.udp {
+            if direct_udp_collides_with_stun(this.control_port, this.vhost_quic_port) {
+                warn!(
+                    control_port = this.control_port,
+                    direct_port = this.vhost_quic_port,
+                    "shared direct QUIC endpoint collides with the STUN UDP socket; choose distinct internal UDP ports"
+                );
+            }
             match tokio::net::UdpSocket::bind((this.bind_addr, this.control_port)).await {
                 Ok(udp) => {
                     info!(port = this.control_port, "STUN responder listening");
@@ -1127,10 +1139,12 @@ impl Server {
                     Ok(endpoint) => {
                         info!(
                             port = this.vhost_quic_port,
-                            "vhost QUIC direct endpoint listening"
+                            "shared QUIC direct endpoint listening"
                         );
                         let vhost_reg = this.vhost_registry.clone();
                         let vhost_pending = this.pending_vhost_udp.clone();
+                        let jump_reg = this.ssh_jump_registry.clone();
+                        let jump_pending = this.pending_ssh_jump_udp.clone();
                         #[cfg(feature = "udp")]
                         let public_reg = this.public_udp_registry.clone();
                         #[cfg(feature = "udp")]
@@ -1141,6 +1155,8 @@ impl Server {
                             while let Some(incoming) = ep.accept().await {
                                 let vhost_reg = vhost_reg.clone();
                                 let vhost_pending = vhost_pending.clone();
+                                let jump_reg = jump_reg.clone();
+                                let jump_pending = jump_pending.clone();
                                 #[cfg(feature = "udp")]
                                 let public_reg = public_reg.clone();
                                 #[cfg(feature = "udp")]
@@ -1156,6 +1172,7 @@ impl Server {
                                         }
                                     };
 
+                                    let matched_jump_owner = AtomicU64::new(0);
                                     let lookup = |key: &str| {
                                         if let Some(nonce) = vhost_pending.get(key) {
                                             Some(holepunch::derive_token(
@@ -1170,6 +1187,20 @@ impl Server {
                                                     nonce.value(),
                                                 ));
                                             }
+                                            if let Some(pending) = jump_pending.get(key) {
+                                                let alias = key.strip_prefix("jump:")?;
+                                                let entry = jump_reg.get(alias)?;
+                                                if pending.belongs_to(entry.value()) {
+                                                    matched_jump_owner.store(
+                                                        pending.owner_id(),
+                                                        Ordering::Relaxed,
+                                                    );
+                                                    return Some(holepunch::derive_token(
+                                                        secret.as_deref(),
+                                                        &pending.nonce,
+                                                    ));
+                                                }
+                                            }
                                             None
                                         }
                                     };
@@ -1178,8 +1209,39 @@ impl Server {
                                         .await
                                     {
                                         Ok((key, direct)) => {
+                                            if let Some(alias) =
+                                                key.strip_prefix("jump:").map(str::to_owned)
+                                            {
+                                                if let Some(entry) = jump_reg
+                                                    .get(&alias)
+                                                    .map(|entry| Arc::clone(entry.value()))
+                                                {
+                                                    if matched_jump_owner.load(Ordering::Relaxed)
+                                                        != entry.registration_id()
+                                                    {
+                                                        debug!(%alias, "stale SSH jump QUIC authentication owner; dropping carrier");
+                                                        direct.close();
+                                                        return;
+                                                    }
+                                                    match entry.direct.install(direct.clone()) {
+                                                        Some(id) => {
+                                                            info!(%alias, id, carriers = entry.direct.len(), "SSH jump QUIC direct carrier established");
+                                                            tokio::spawn(async move {
+                                                                direct.closed().await;
+                                                                entry.direct.remove(id);
+                                                                debug!(%alias, id, carriers = entry.direct.len(), "SSH jump QUIC direct carrier closed");
+                                                            });
+                                                        }
+                                                        None => {
+                                                            debug!(%alias, "SSH jump QUIC direct pool full; dropping extra carrier");
+                                                            direct.close();
+                                                        }
+                                                    }
+                                                } else {
+                                                    debug!(%alias, "SSH jump QUIC connection arrived after provider deregistered");
+                                                }
                                             // Check if this is a public tunnel (port:N key) or vhost (subdomain key)
-                                            if key.starts_with("port:") {
+                                            } else if key.starts_with("port:") {
                                                 #[cfg(feature = "udp")]
                                                 {
                                                     if let Some(entry) = public_reg
@@ -1841,6 +1903,9 @@ impl Server {
                         self.max_carriers,
                         self.max_conns,
                         self.ssh_jump_ctrl_timeout,
+                        self.udp,
+                        self.vhost_quic_port,
+                        self.udp_tuning,
                     )
                     .await
                 }
@@ -2504,6 +2569,21 @@ mod tests {
         assert!(config["ssh_jump_base_domain"].is_null());
         assert!(config.get("secret").is_none());
         assert!(!config.to_string().contains("must-not-leak"));
+    }
+
+    #[test]
+    fn ssh_jump_compose_direct_port_does_not_collide_with_stun() {
+        assert!(!direct_udp_collides_with_stun(7835, 443));
+        assert!(direct_udp_collides_with_stun(443, 443));
+
+        let mut server = Server::new(1024..=65535, None);
+        server.set_vhost_quic_port(443);
+        server
+            .set_ssh_jump_base_domain(Some("ssh.example.test".to_string()))
+            .unwrap();
+        let config = serde_json::to_value(server.config_view().as_ref()).unwrap();
+        assert_eq!(config["control_port"], 7835);
+        assert_eq!(config["ssh_jump_direct_quic_port"], 443);
     }
 
     #[cfg(feature = "ssh-gateway")]

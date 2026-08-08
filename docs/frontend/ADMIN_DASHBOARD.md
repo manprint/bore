@@ -1,6 +1,6 @@
 # Admin Dashboard — Architecture & Operations
 
-**Status:** Phase 6 complete (2026-07-11); SSH Jump Host Phase 3 admin surface added 2026-08-08.
+**Status:** Phase 6 complete (2026-07-11); SSH Jump Host Phase 4 direct-path fields added 2026-08-08.
 
 ## Overview
 
@@ -26,7 +26,7 @@ The server exposes **9 REST endpoints** under `/admin/api/v1/`, all guarded by t
 | `/admin/api/v1/summary` | `SummaryView` JSON | Version, control port, feature flags, SSH gateway status, server uptime, live section counts |
 | `/admin/api/v1/tunnels` | `[TunnelView]` | Public tunnel list: port, real peer IP, status, transport (Bore\|SSH), identity, notes (expandable), tx/rx bytes |
 | `/admin/api/v1/secret` | `[SecretView]` | Secret (relay) tunnels: secret ID, peer, role, transport (Bore\|SSH), identity, status, notes, bytes |
-| `/admin/api/v1/ssh-jump` | `[SshJumpView]` | SSH jump aliases: hostname/port, provider type, peer/local target, limits, carriers, path state and relay/direct counters; no usernames or credentials |
+| `/admin/api/v1/ssh-jump` | `[SshJumpView]` | SSH jump aliases: hostname/port, provider type, peer/local target, limits, TCP/direct carriers, direct opens/fallbacks and relay/direct byte counters; no usernames or credentials |
 | `/admin/api/v1/vhost` | `[VhostView]` | Vhost providers: subdomain, transport (Bore\|SSH), identity, carrier pool, direct/relay metrics |
 | `/admin/api/v1/vpn` | `{links:[VpnLinkView]}` | VPN links + hub peers (Linux `--features vpn` only; empty array in non-VPN builds) |
 | `/admin/api/v1/certs` | `[CertView]` | TLS certificates: subject, SANs, expiry, days-remaining, path |

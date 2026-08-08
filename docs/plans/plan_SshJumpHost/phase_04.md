@@ -4,6 +4,7 @@
 > **Intent:** implement `bore sshjhost --udp` without changing OpenSSH or making
 > UDP a liveness dependency. Pure-OpenSSH providers remain TCP-only.
 > **Precondition:** hardened TCP path and admin surface green; owner approval.
+> **Completion:** implemented and green on 2026-08-08.
 
 ## 4.1 Extend the existing shared server-direct endpoint
 
@@ -81,3 +82,22 @@ cargo test --all-features
 
 Phase done means QUIC usage is proven by counters/logs, every forced failure falls
 back to warm TCP, and vhost/public direct paths are unchanged.
+
+## Completion checkpoint — 2026-08-08
+
+- Shared endpoint now authenticates bounded `jump:<alias>` keys and binds each
+  nonce to the exact registration id; stale handshakes cannot enter a replacement
+  entry. Bare-vhost and `port:<N>` routing remain unchanged.
+- Native providers receive `SshJumpUdp` only after authenticated registration,
+  open a capped N-connection QUIC pool, accept native bidi streams through the
+  existing `Client::handle_connection`, and renew only lost capacity.
+- Gateway selection writes `STREAM_READY`, counts direct opens/bytes, and falls
+  back on the same authorized channel to warm TCP when no direct carrier exists
+  or open/readiness fails. One task retains half-close semantics.
+- Deregistration closes every direct carrier, removes its owned nonce and keeps
+  replacement cleanup race-safe. Pure-OpenSSH providers remain TCP-only.
+- Admin/API/UI expose live direct carrier count, opens, fallbacks and separate
+  direct/relay bytes without usernames or credential material.
+- Real OpenSSH E2E proves two QUIC carriers, direct traffic, forced all-carrier
+  failure, immediate TCP fallback, renewal, resumed direct traffic and server-UDP
+  disabled fallback. Vhost/public direct suites remain green.

@@ -110,6 +110,16 @@ pub fn ssh_jump(server: &Server) -> Vec<SshJumpView> {
                 false
             }
         };
+        let direct_carriers = {
+            #[cfg(feature = "udp")]
+            {
+                entry.direct.len()
+            }
+            #[cfg(not(feature = "udp"))]
+            {
+                0
+            }
+        };
         views.push(SshJumpView {
             id: admin.id,
             hostname,
@@ -121,6 +131,9 @@ pub fn ssh_jump(server: &Server) -> Vec<SshJumpView> {
             effective_carriers: admin.carriers,
             udp_requested: entry.registration.udp,
             udp_active,
+            direct_carriers,
+            direct_stream_opens: entry.direct_stream_opens.load(Ordering::Relaxed),
+            direct_fallbacks: entry.direct_fallbacks.load(Ordering::Relaxed),
             auto_reconnect: entry.registration.auto_reconnect,
             max_conns: admin.max_conns,
             active_connections: admin.active,
@@ -758,6 +771,8 @@ mod tests {
         let active = ActiveGuard::new(Arc::clone(&entry.active));
         entry.relay_tx_bytes.fetch_add(11, Ordering::Relaxed);
         entry.relay_rx_bytes.fetch_add(22, Ordering::Relaxed);
+        entry.direct_stream_opens.fetch_add(3, Ordering::Relaxed);
+        entry.direct_fallbacks.fetch_add(2, Ordering::Relaxed);
         let views = ssh_jump(&server);
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].hostname, "vm-01.ssh.example.test");
@@ -766,6 +781,9 @@ mod tests {
         assert_eq!(views[0].active_connections, 1);
         assert_eq!(views[0].relay_tx_bytes, 11);
         assert_eq!(views[0].relay_rx_bytes, 22);
+        assert_eq!(views[0].direct_carriers, 0);
+        assert_eq!(views[0].direct_stream_opens, 3);
+        assert_eq!(views[0].direct_fallbacks, 2);
         assert_eq!(summary(&server).ssh_jump_hosts, 1);
         assert_eq!(metrics(&server).ssh_jump_hosts, 1);
         let json = serde_json::to_value(&views[0]).unwrap();

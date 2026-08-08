@@ -61,8 +61,9 @@ section. Secret tunnels have no public port, so `https`/`force_https` do not app
 
 **SSH Jump:** `/admin/api/v1/ssh-jump` joins the `Role::SshJumpHost` admin row with
 the live `SshJumpRegistry` alias. Shared atomics make active connections and relay bytes
-exact; direct counters/path state are reserved for Phase 4. The view omits classic username,
-credential identity, secrets and key material by contract.
+exact. Phase 4 adds live direct carrier count, successful direct stream opens, warm-TCP
+fallbacks and separate direct byte counters. The view omits classic username, credential
+identity, secrets and key material by contract.
 
 ## Known Gap
 

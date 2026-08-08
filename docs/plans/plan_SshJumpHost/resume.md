@@ -12,11 +12,11 @@
   acceptance contract for native and pure-OpenSSH providers.
 - Planning documents validated for balanced code fences, trailing whitespace,
   required files and port-topology consistency.
-- Phases 1–4 implemented and green. Phase 5 has not started.
+- Phases 1–5 implemented and green; the plan is complete.
 - `bore sshjhost`, `--ssh-jump-base-domain`, native warm-TCP plus direct-QUIC
   carriers, pure-OpenSSH `jump/` registration and real ProxyJump dispatch are available.
-- Phase 3 is commit `b330fd8` (`phase 3`). Phase 4 is implemented in the current
-  uncommitted worktree for owner review.
+- Phase 3 is commit `b330fd8` (`phase 3`); Phase 4 is commit `34cf9c4` (`fase 4`).
+  Phase 5 is implemented in the current uncommitted worktree for owner review.
 
 ## Phase 1 checkpoint
 
@@ -177,6 +177,47 @@ Run on 2026-08-08:
 - `sudo -n /abs/path/scripts/ssh_gateway_test.sh` — pass: 16, fail: 0.
 - `git diff --check` — pass.
 
+## Phase 5 checkpoint
+
+- Added `T-SSH-JUMP` to `scripts/ssh_gateway_test.sh`, using real OpenSSH
+  `direct-tcpip` to verify UDP-blocked same-channel TCP fallback, N=2 direct
+  carrier renewal/use, simultaneous vhost/public/jump direct-pool isolation,
+  jump-only key/username binding without legacy regression, pure-OpenSSH
+  nonstandard-port dispatch and TCP-only state.
+- Corrected the `sshjhost --udp` CLI help left over from Phase 2: direct QUIC is
+  active and warm TCP remains the per-connection fallback.
+- Completed README production operations: build features, exact Compose/socket
+  table, native and pure key/password commands, all flag/env mappings, DNS and
+  `known_hosts` rotation, `ForwardAgent no`, systemd credential loading and the
+  shared-secret/no-per-alias-ACL trust boundary.
+- Updated SSH, vhost/public shared-direct, NAT-scope, admin and invariant docs.
+  `jump:<alias>`, `port:<N>` and bare vhost keys are documented as three
+  isolated namespaces on one bounded QUIC endpoint.
+
+## Phase 5 gates
+
+Run serially on 2026-08-08, Linux 7.0.0-28-generic x86_64, rustc/cargo 1.96.0,
+Node 24.14.1, npm 11.11.0 and OpenSSH_9.6p1:
+
+- `cargo fmt --all -- --check` — pass.
+- `cargo clippy --all-targets --all-features -- -D warnings` — pass.
+- `cargo test --all-features -- --test-threads=1` — pass: 901 passed, 0 failed,
+  2 existing root/CAP_NET_ADMIN-only ignored (903 listed across 28 binaries).
+- `cargo test --no-default-features -- --test-threads=1` — pass: 545 passed,
+  0 failed, 0 ignored.
+- `cargo test --no-default-features --features ssh-gateway -- --test-threads=1`
+  — pass: 657 passed, 0 failed, 0 ignored.
+- `npm test` — pass: 92 passed, 0 failed, 0 skipped.
+- `cargo build --release --all-features` — pass.
+- `sudo -n /abs/path/scripts/ssh_gateway_test.sh` — pass: 21, fail: 0,
+  including five new `T-SSH-JUMP` assertions.
+- `sudo -n /abs/path/scripts/vhost_netns_test.sh` — pass: 16, fail: 0.
+- `sudo -n /abs/path/scripts/local_proxy_netns_test.sh` — pass: 16, fail: 0.
+- `sudo -n /abs/path/scripts/secret_netns_test.sh` — pass: 29, fail: 0.
+- `sudo -n /abs/path/scripts/udp_nat_netns_test.sh` — pass: 8, fail: 0.
+- `shellcheck scripts/ssh_gateway_test.sh`, `bash -n scripts/ssh_gateway_test.sh`
+  and `git diff --check` — pass.
+
 ## Locked configuration
 
 - SSH gateway: TCP 443 through OpenSSH config alias.
@@ -199,6 +240,5 @@ Run on 2026-08-08:
 
 ## Next
 
-Stop at the green Phase 4 boundary. Await the owner's review/commit and an
-explicit instruction before beginning `phase_05.md`; do not begin Phase 5
-automatically.
+Plan complete at the green Phase 5 production-acceptance boundary. No later
+phase exists; await owner review/commit or a new scoped plan.

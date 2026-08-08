@@ -35,16 +35,22 @@ Indice:
 
 ## 1. Ambito
 
-Il percorso diretto UDP esiste **solo per i tunnel "secret"**:
+Il percorso diretto UDP con **NAT traversal/hole-punch** descritto in questo
+documento esiste solo per i tunnel "secret":
 
 - **provider** = `bore local <porta> --tcp-secret-id <id> --udp` (espone un servizio);
 - **consumer** = `bore proxy --local-proxy-port :<porta> --tcp-secret-id <id> --udp`
   (consuma il servizio su una porta locale).
 
 Entrambi si collegano in **uscita** al **server** `bore server --udp`, che fa da
-**rendezvous** (signaling) e da **STUN responder**. La modalità a porta pubblica
-(`bore local 8000 --to … -p 1234`, browser → `server:porta`) **non** è
-hole-punchabile (i client esterni sono arbitrari) ed è fuori ambito.
+**rendezvous** (signaling) e da **STUN responder**. I percorsi server-direct di
+vhost, tunnel public e provider nativo `sshjhost --udp` sono fuori ambito: il
+provider/client diala direttamente l'endpoint pubblico condiviso
+`--vhost-quic-port`, rispettivamente con chiavi bare, `port:<N>` e
+`jump:<alias>`. Non fanno STUN né hole-punch. La modalità a porta pubblica
+(`bore local 8000 --to … -p 1234`, browser → `server:porta`) non è
+hole-punchabile perché i client esterni sono arbitrari; il QUIC opzionale copre
+solo la gamba server→provider.
 
 Se il diretto non si stabilisce, i dati passano dal **relay** del server (il
 comportamento classico di bore): è sempre disponibile, quindi `--udp` non rompe

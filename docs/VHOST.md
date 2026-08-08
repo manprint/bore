@@ -307,12 +307,16 @@ Important constraints:
 
 - The **server stays in the data path**. This is not the peer-to-peer secret-tunnel `--udp` mode.
 - There is **no STUN or hole-punching** for vhost UDP. The provider dials the server's public UDP port directly.
+- The endpoint is shared with public-tunnel and native SSH-jump direct paths. Bare
+  vhost labels, `port:<N>` and `jump:<alias>` are disjoint authenticated key
+  namespaces feeding separate pools; the server still binds only one socket.
 - If UDP is blocked or the QUIC path drops, bore **falls back automatically and silently** to the existing TCP carrier relay.
 - `--carriers` still matters for the TCP fallback path; QUIC is only used when the direct server→provider hop is up.
 
 ### Firewall / port requirements
 
-If you enable `bore vhost --udp`, open one extra UDP port on the server:
+If you enable any server-direct vhost, public or native SSH-jump path, open the
+shared UDP port on the server:
 
 - `BORE_VHOST_QUIC_PORT` / `--vhost-quic-port`
 - default: the active vhost frontend port on **UDP**: `https_port` when the resolved mode serves HTTPS, otherwise `http_port`

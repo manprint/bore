@@ -486,6 +486,16 @@ Ogni scenario usa un gateway reale OpenSSH/russh, non un mock del solo parser.
 | `E-JH-NO-ALIAS-ACL` | Due account classicamente validi aprono lo stesso alias registrato. | Entrambi possono collegarsi: non esiste policy per-alias in v1. |
 | `E-JH-REAPER` | Rendere half-open il provider nativo; chiudere brutalmente quello SSH. | Entrambe le entry spariscono entro la rispettiva disciplina di liveness, senza righe admin zombie. |
 
+Automazione Fase 5: `T-SSH-JUMP` in `scripts/ssh_gateway_test.sh` promuove i
+percorsi `E-JH-NATIVE-FALLBACK`, `E-JH-NATIVE-UDP`,
+`E-JH-SHARED-UDP443`, `E-JH-KEY-USER-MISMATCH`,
+`E-JH-LEGACY-COMPAT`, `E-JH-SSH-KEY` ed `E-JH-NONSTANDARD` usando OpenSSH
+reale e namespace di rete. I sei E2E in `tests/ssh_jump_test.rs` coprono anche
+password, auth esterna/interna, takeover/collisioni, perdita carrier, rinnovo e
+reaper. `ssh_jump_compose_direct_port_does_not_collide_with_stun` fissa la
+topologia `E-JH-COMPOSE`; le suite vhost/public direct restano gate separati e
+seriali.
+
 Per le prove password interattive usare un ambiente e2e isolato con credenziali
 effimere e un driver `expect`/`SSH_ASKPASS`; non inserire password reali nei
 comandi, nei log o nel repository.

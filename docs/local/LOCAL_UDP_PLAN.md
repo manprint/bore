@@ -77,17 +77,19 @@ run privileged) to measure the true ceiling.
 
 - **DEC-LU1 (unify the QUIC endpoint).** Bind ONE server QUIC endpoint whenever
   `bore server --udp` — drop the `&& vhost_config.is_some()` gate at `server.rs:518`. It
-  serves BOTH vhost subdomains and public tunnels. Bind port = the existing
+  serves vhost subdomains, public tunnels and native SSH jump hosts. Bind port = the existing
   `vhost_quic_port` field (default 443/80 when vhost configured; for a plain `--udp`
   server expose/keep an explicit override so tests/benches pick a free high port). One
   UDP port, one accept loop, one handshake.
 - **DEC-LU2 (generalized, namespaced handshake key).** The QUIC auth handshake stays
   `[key_len u16][key][token 32]`. vhost sends the bare subdomain (a valid DNS label);
-  public tunnels send a TAGGED key `"port:{assigned_public_port}"`. The colon/`port:`
-  prefix cannot collide with a DNS label, so the server disambiguates which registry to
-  install into. Rename `vhost_server_handshake`→`direct_server_handshake`,
+  public tunnels send `"port:{assigned_public_port}"`; native SSH jump providers send
+  `"jump:{alias}"`. Neither tagged prefix can collide with a DNS label or with the other,
+  so the server disambiguates which registry to install into. Rename
+  `vhost_server_handshake`→`direct_server_handshake`,
   `vhost_connect`→`direct_connect` (keep thin aliases or update call sites). The accept
-  loop's `lookup` closure checks BOTH `pending_vhost_udp` and `pending_public_udp`.
+  loop's `lookup` closure checks vhost, public and SSH-jump pending registries and binds
+  every nonce to the exact live registration owner.
 - **DEC-LU3 (per-tunnel direct registry + RAII).** Add
   `public_udp_registry: Arc<DashMap<String, Arc<PublicDirectEntry>>>` (key = `port:{N}`)
   and `pending_public_udp: Arc<DashMap<String, ServerNonce>>`. `PublicDirectEntry { direct:

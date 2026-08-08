@@ -1,9 +1,9 @@
 # SSH Jump Host — Plan Overview
 
-> **Status:** decisions locked; implementation complete through Phase 4 on 2026-08-08
+> **Status:** implementation and production acceptance complete through Phase 5 on 2026-08-08
 > **Folder:** `docs/plans/plan_SshJumpHost/`
 > **Planning model:** GPT-5/Codex
-> **Implementation status:** Phase 4 green; Phase 5 not started
+> **Implementation status:** Phases 1–5 green; plan complete
 
 ## Goal
 

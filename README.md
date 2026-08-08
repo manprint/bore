@@ -621,6 +621,13 @@ an SSH daemon on 2222 use `ssh -p 2222 -J fabio@bore.tld:443 ...`.
 The server requires the existing SSH gateway plus one new namespace setting:
 
 ```shell
+# UDP is a default feature; ssh-gateway is opt-in for source builds.
+cargo build --release --features ssh-gateway
+# Repository/release acceptance build:
+cargo build --release --all-features
+```
+
+```shell
 bore server \
   --control-port 7835 \
   --udp \
@@ -716,10 +723,21 @@ A VM without the bore binary can publish the same kind of target through a rever
 forward. The `jump/` prefix is mandatory:
 
 ```shell
-ssh -T -p 443 -o ExitOnForwardFailure=yes \
+ssh -T -p 443 -i ~/.ssh/id_ed25519_bore_provider \
+  -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
   -R 'jump/vm-test-01:22:localhost:22' \
   vm-provider@bore.tld -- 'notes="AWS eu-south-1"'
+```
+
+Password operation is interactive and keeps the password out of arguments and logs:
+
+```shell
+ssh -T -p 443 \
+  -o PubkeyAuthentication=no -o PreferredAuthentications=password \
+  -o ExitOnForwardFailure=yes \
+  -R 'jump/vm-test-01:22:localhost:22' \
+  vm-provider@bore.tld -- 'notes="interactive provider"'
 ```
 
 This provider path is TCP-only and uses the gateway's classic public-key/password auth.
@@ -795,11 +813,87 @@ Host bore.tld
     IdentityFile ~/.ssh/id_ed25519_bore_gateway
     IdentitiesOnly yes
     StrictHostKeyChecking yes
+    ForwardAgent no
 
 Host *.ssh.bore.tld
     IdentityFile ~/.ssh/id_ed25519_target
     IdentitiesOnly yes
+    ForwardAgent no
 ```
+
+Only `bore.tld` needs DNS. Alias names are carried inside the gateway's
+`direct-tcpip` request, so wildcard DNS for `*.ssh.bore.tld` is optional and is
+not consulted by this ProxyJump flow. Pin the gateway as `[bore.tld]:443`; each
+target is pinned independently under its alias (and `[alias]:port` for a
+nonstandard port). Reinstalling or rotating a target host key therefore changes
+only that target entry. Verify the new fingerprint out of band before removing
+the exact stale entry with `ssh-keygen -R <alias>` or
+`ssh-keygen -R '[<alias>]:<port>'`. Never delete the whole `known_hosts` file.
+
+Agent forwarding is unnecessary and discouraged: the local OpenSSH process
+authenticates separately to the gateway and target. `ForwardAgent no` prevents
+the target or an intermediate process from using the operator's agent.
+
+### Native provider as a systemd service
+
+Keep ordinary settings in an environment file and the shared secret in a
+root-readable systemd credential. The secret never appears in `ExecStart` or
+the process command line:
+
+```ini
+# /etc/bore/sshjhost.env (0640 root:bore)
+BORE_SERVER=https://bore.tld
+BORE_SSH_JUMP_SUBDOMAIN=vm-test-01
+BORE_NOTES="vm-test-01 production"
+BORE_CARRIERS=4
+BORE_PREFER_UDP=true
+BORE_AUTO_RECONNECT=true
+```
+
+```sh
+#!/bin/sh
+# /usr/local/libexec/bore-sshjhost (0755 root:root)
+set -eu
+export BORE_SECRET="$(cat "${CREDENTIALS_DIRECTORY}/bore-secret")"
+exec /usr/local/bin/bore sshjhost 127.0.0.1:22
+```
+
+```ini
+# /etc/systemd/system/bore-sshjhost.service
+[Unit]
+Description=Bore SSH jump-host provider
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=bore
+EnvironmentFile=/etc/bore/sshjhost.env
+LoadCredential=bore-secret:/etc/bore/credentials/sshjhost.secret
+ExecStart=/usr/local/libexec/bore-sshjhost
+Restart=always
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Install `/etc/bore/credentials/sshjhost.secret` as `0600 root:root`, then use
+`systemctl enable --now bore-sshjhost`. Do not put `--secret` in the unit or a
+shell command. On older systemd without `LoadCredential=`, use a `0600`
+`EnvironmentFile` containing `BORE_SECRET` and restrict access to the service
+account.
+
+### Trust boundary
+
+The native provider uses the server-wide bore shared secret: any holder can
+claim any currently free native alias. Any correctly username-bound classic
+gateway account can connect to every registered jump alias; v1 has no per-alias
+ACL. First-wins and cross-transport collision checks prevent accidental
+takeover, but they do not create tenant isolation. Use separate bore servers or
+separate trust domains when providers must not be able to squat each other's
+names.
 
 With password authentication, OpenSSH prompts separately for the outer gateway and inner
 target credentials. The complete deployment/test matrix is also preserved in
@@ -2035,26 +2129,26 @@ mtime change it reloads atomically — in-flight connections are unaffected.
 
 ```shell
 # Basic
-bore vhost localhost:8080 --subdomain myapp
+bore vhost localhost:8080 --subdomain myapp --id myapp
 
 # With explicit server, HTTPS, basic auth, notes, and high concurrency
-bore vhost localhost:8080 --subdomain myapp --to https://bore.example.com \
+bore vhost localhost:8080 --subdomain myapp --id myapp --to https://bore.example.com \
   --https on --basic-auth user:password --notes "production api" --carriers 4
 
 # With UDP direct path and authentication secret
-bore vhost localhost:8080 --subdomain myapp --secret mysecret --udp --to https://bore.example.com
+bore vhost localhost:8080 --subdomain myapp --id myapp --secret mysecret --udp --to https://bore.example.com
 
 # Reservation (fixed subdomain via ID)
 bore vhost localhost:8080 --id myreserved --to https://bore.example.com --subdomain api-reserved
 
 # Plaintext HTTP backend (default) — no flag needed
-bore vhost localhost:3000 --subdomain plainapp --to https://bore.example.com
+bore vhost localhost:3000 --subdomain plainapp --id plainapp --to https://bore.example.com
 
 # HTTPS backend with a self-signed cert — the server originates TLS to it
-bore vhost localhost:3005 --subdomain secureapp --backend-tls --to https://bore.example.com
+bore vhost localhost:3005 --subdomain secureapp --id secureapp --backend-tls --to https://bore.example.com
 
 # HTTPS backend expecting a specific SNI
-bore vhost localhost:3005 --subdomain secureapp --backend-tls --backend-tls-sni app.internal \
+bore vhost localhost:3005 --subdomain secureapp --id secureapp --backend-tls --backend-tls-sni app.internal \
   --to https://bore.example.com
 ```
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SSH ingress gateway netns harness — Phase 7.2 chaos/acceptance tests.
+# SSH ingress gateway netns harness — chaos/acceptance tests, including SSH jump hosts.
 # Must be invoked directly with sudo (not via 'sudo bash ...') per sudoers setup.
 #
 # Topology:
@@ -52,11 +52,13 @@ HAVE_IPERF3=1; command -v iperf3 >/dev/null 2>&1 || HAVE_IPERF3=0
 SECRET="sshgwtest$(shuf -i 1000-9999 -n1 2>/dev/null || echo 1234)"
 ADMIN_TOKEN="0123456789abcdef0123456789abcdef01234567"  # 40 chars for --admin-token
 VHOST_DOMAIN="bore.sshgw.test"
+SSH_JUMP_DOMAIN="ssh.bore.sshgw.test"
 
 SERVER_IP="10.230.0.2"   # server-side of ns0↔nscli veth
 CLI_IP="10.230.0.1"      # nscli-side
 
 CTRL_PORT="7835"
+DIRECT_QUIC_PORT="443"
 SSH_BANNER="bore-ssh-gateway-banner-marker"
 TMPDIR="/tmp/bore_sshgw_$$"
 
@@ -144,10 +146,49 @@ admin_curl() {
     ip netns exec nscli curl -sk -m 10 -H "Authorization: Bearer $ADMIN_TOKEN" \
         -w $'\n%{http_code}' "https://$SERVER_IP:$CTRL_PORT$path" 2>/dev/null
 }
-code_of() { echo "$1" | tail -1; }
 body_of() { echo "$1" | sed '$d'; }
 
 admin_data() { body_of "$(admin_curl /admin/status/data)"; }
+jump_data() { body_of "$(admin_curl /admin/api/v1/ssh-jump)"; }
+
+# Print one sanitized jump-host field, or an empty string when the alias is not
+# registered. Keeping JSON parsing here makes the assertions independent of
+# serializer whitespace and field order.
+jump_field() {
+    local alias="$1" field="$2"
+    jump_data | python3 -c '
+import json, sys
+alias, field, domain = sys.argv[1], sys.argv[2], sys.argv[3]
+hostname = f"{alias}.{domain}"
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    rows = []
+row = next((row for row in rows if row.get("hostname") == hostname), None)
+value = "" if row is None else row.get(field, "")
+print(value if value is not None else "")
+' "$alias" "$field" "$SSH_JUMP_DOMAIN" 2>/dev/null || true
+}
+
+wait_jump_alias() {
+    local alias="$1" tries="${2:-100}"
+    for _ in $(seq 1 "$tries"); do
+        [ "$(jump_field "$alias" hostname)" = "$alias.$SSH_JUMP_DOMAIN" ] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+wait_jump_field_ge() {
+    local alias="$1" field="$2" minimum="$3" tries="${4:-150}" value
+    for _ in $(seq 1 "$tries"); do
+        value=$(jump_field "$alias" "$field")
+        case "$value" in ''|*[!0-9]*) value=0 ;; esac
+        [ "$value" -ge "$minimum" ] && return 0
+        sleep 0.1
+    done
+    return 1
+}
 
 # Count admin rows matching a grep pattern (role/secret_id/etc — the endpoint
 # returns one JSON object per line-ish blob; a plain substring count over the
@@ -186,7 +227,9 @@ start_server() {
         --control-port "$CTRL_PORT" \
         --cert-file "$CERT_FILE" --key-file "$KEY_FILE" \
         --vhost-base-domain "$VHOST_DOMAIN" --vhost-http-port "$CTRL_PORT" \
+        --vhost-quic-port "$DIRECT_QUIC_PORT" \
         --ssh-gateway \
+        --ssh-jump-base-domain "$SSH_JUMP_DOMAIN" \
         --ssh-host-key-file "$TMPDIR/ssh_host_key.pem" \
         --ssh-authorized-keys-dir "$TMPDIR/keys" \
         --ssh-passwords-file "$TMPDIR/passwords" \
@@ -338,7 +381,9 @@ openssl req -x509 -newkey rsa:2048 -keyout "$KEY_FILE" -out "$CERT_FILE" \
 CLIENT_KEY="$TMPDIR/client_key"
 ssh-keygen -t ed25519 -N '' -f "$CLIENT_KEY" -C gwtest >/dev/null 2>&1 \
     || die "ssh-keygen failed"
-cp "$CLIENT_KEY.pub" "$TMPDIR/keys/authorized_keys"
+# The basename is the classic identity used by jump-only username binding.
+# Legacy gateway modes continue to accept this key regardless of SSH username.
+cp "$CLIENT_KEY.pub" "$TMPDIR/keys/gwtest"
 
 PASSWORD="chaospass$$"
 PASS_HASH=$(echo -n "$PASSWORD" | "$BORE" hash-password 2>/dev/null | tail -1)
@@ -894,8 +939,8 @@ VBT_PLAIN_SSH=$!
 # Poll each subdomain until its SSH session has registered (a 404 means the
 # vhost route isn't live yet — the two sessions register asynchronously).
 vbt_probe() {
-    local host="$1" needle="$2" i resp
-    for i in $(seq 1 30); do
+    local host="$1" needle="$2" resp
+    for _ in $(seq 1 30); do
         resp=$(http_check "$host")
         if echo "$resp" | grep -q "$needle"; then
             echo "$resp"
@@ -920,6 +965,156 @@ else
 fi
 kill -9 "$VBT_TLS_SSH" "$VBT_PLAIN_SSH" 2>/dev/null || true
 wait "$VBT_TLS_SSH" "$VBT_PLAIN_SSH" 2>/dev/null || true
+
+# ── T-SSH-JUMP: native QUIC/fallback + pure-OpenSSH production path ─────────
+echo ""
+echo "=== Test: T-SSH-JUMP (ProxyJump dispatch, QUIC fallback/renewal, compatibility) ==="
+
+# `ssh -W` is the transport primitive used by stock OpenSSH ProxyJump. Feeding
+# it an echo line exercises the real direct-tcpip channel without installing a
+# second sshd solely for this netns harness.
+jump_via_gateway() {
+    local alias="$1" port="$2" line="$3" user="${4:-gwtest}"
+    printf '%s\n' "$line" | timeout 12 ip netns exec nscli ssh \
+        "${SSH_OPTS[@]}" -i "$CLIENT_KEY" -o BatchMode=yes \
+        -p "$CTRL_PORT" -W "$alias.$SSH_JUMP_DOMAIN:$port" \
+        "$user@$SERVER_IP" 2>/dev/null || true
+}
+
+JH_NATIVE_PORT=19840
+JH_NATIVE_ALIAS="netns-native"
+spawn_echo_service "$JH_NATIVE_PORT" >/dev/null
+sleep 0.3
+
+# Start with direct UDP blocked. Registration and the first forwarded channel
+# must remain healthy through the already-warm TCP carrier.
+ip netns exec nscli iptables -I OUTPUT -p udp -d "$SERVER_IP" \
+    --dport "$DIRECT_QUIC_PORT" -j DROP
+ip netns exec nscli "$BORE" sshjhost "127.0.0.1:$JH_NATIVE_PORT" \
+    --subdomain "$JH_NATIVE_ALIAS" \
+    --to "https://$SERVER_IP:$CTRL_PORT" --secret "$SECRET" --insecure \
+    --notes "T-SSH-JUMP native" --carriers 2 --udp --auto-reconnect \
+    >"$TMPDIR/jump_native.log" 2>&1 &
+JH_NATIVE_PID=$!
+
+if wait_jump_alias "$JH_NATIVE_ALIAS"; then
+    JH_FALLBACK_BEFORE=$(jump_field "$JH_NATIVE_ALIAS" direct_fallbacks)
+    JH_FALLBACK_BEFORE=${JH_FALLBACK_BEFORE:-0}
+    JH_RESP=$(jump_via_gateway "$JH_NATIVE_ALIAS" "$JH_NATIVE_PORT" "jump-fallback")
+    JH_FALLBACK_AFTER=$(jump_field "$JH_NATIVE_ALIAS" direct_fallbacks)
+    JH_FALLBACK_AFTER=${JH_FALLBACK_AFTER:-0}
+    if [ "$JH_RESP" = "jump-fallback" ] && \
+            [ "$JH_FALLBACK_AFTER" -gt "$JH_FALLBACK_BEFORE" ]; then
+        pass "T-SSH-JUMP UDP-blocked native provider uses warm TCP fallback"
+    else
+        fail "T-SSH-JUMP native fallback failed (response='$JH_RESP', fallback $JH_FALLBACK_BEFORE->$JH_FALLBACK_AFTER)"
+    fi
+else
+    fail "T-SSH-JUMP native alias did not register while UDP was blocked"
+fi
+
+# Remove the firewall fault. The live provider must replenish only its direct
+# shortfall, then a new channel must increment the direct-open counter.
+ip netns exec nscli iptables -D OUTPUT -p udp -d "$SERVER_IP" \
+    --dport "$DIRECT_QUIC_PORT" -j DROP 2>/dev/null || true
+if wait_jump_field_ge "$JH_NATIVE_ALIAS" direct_carriers 2 200; then
+    JH_DIRECT_BEFORE=$(jump_field "$JH_NATIVE_ALIAS" direct_stream_opens)
+    JH_DIRECT_BEFORE=${JH_DIRECT_BEFORE:-0}
+    JH_RESP=$(jump_via_gateway "$JH_NATIVE_ALIAS" "$JH_NATIVE_PORT" "jump-direct")
+    JH_DIRECT_AFTER=$(jump_field "$JH_NATIVE_ALIAS" direct_stream_opens)
+    JH_DIRECT_AFTER=${JH_DIRECT_AFTER:-0}
+    if [ "$JH_RESP" = "jump-direct" ] && \
+            [ "$JH_DIRECT_AFTER" -gt "$JH_DIRECT_BEFORE" ]; then
+        pass "T-SSH-JUMP native provider renews two QUIC carriers and uses direct"
+    else
+        fail "T-SSH-JUMP native direct path failed (response='$JH_RESP', opens $JH_DIRECT_BEFORE->$JH_DIRECT_AFTER)"
+    fi
+else
+    fail "T-SSH-JUMP native direct carrier pool did not renew to two"
+fi
+
+# Keep the native jump direct pool live while vhost and public providers join
+# the same UDP 443 endpoint. Successful traffic through all three proves the
+# bare, `port:<N>` and `jump:<alias>` key namespaces cannot cross-install.
+JH_MIX_VHOST_PORT=19842
+JH_MIX_PUBLIC_TARGET=19843
+JH_MIX_PUBLIC_PORT=19921
+spawn_http_service "$JH_MIX_VHOST_PORT" "jump-mix-vhost" >/dev/null
+spawn_echo_service "$JH_MIX_PUBLIC_TARGET" >/dev/null
+sleep 0.3
+ip netns exec nscli "$BORE" vhost "127.0.0.1:$JH_MIX_VHOST_PORT" \
+    --subdomain jumpmix --id jumpmix --to "https://$SERVER_IP:$CTRL_PORT" \
+    --secret "$SECRET" --insecure --udp \
+    >"$TMPDIR/jump_mix_vhost.log" 2>&1 &
+JH_MIX_VHOST_PID=$!
+ip netns exec nscli "$BORE" local "$JH_MIX_PUBLIC_TARGET" \
+    --to "https://$SERVER_IP:$CTRL_PORT" --secret "$SECRET" --insecure \
+    --port "$JH_MIX_PUBLIC_PORT" --udp \
+    >"$TMPDIR/jump_mix_public.log" 2>&1 &
+JH_MIX_PUBLIC_PID=$!
+
+JH_MIX_VHOST_OK=0
+JH_MIX_PUBLIC_OK=0
+wait_for_log "$SERVER_LOG" "vhost QUIC direct carrier established" 20 && JH_MIX_VHOST_OK=1
+wait_for_log "$SERVER_LOG" "public QUIC direct carrier established" 20 && JH_MIX_PUBLIC_OK=1
+JH_MIX_VHOST_RESP=$(http_check "jumpmix.$VHOST_DOMAIN")
+JH_MIX_PUBLIC_RESP=$(echo_tunnel "$SERVER_IP" "$JH_MIX_PUBLIC_PORT" "jump-mix-public")
+JH_MIX_JUMP_RESP=$(jump_via_gateway "$JH_NATIVE_ALIAS" "$JH_NATIVE_PORT" "jump-mix-native")
+if [ "$JH_MIX_VHOST_OK" -eq 1 ] && [ "$JH_MIX_PUBLIC_OK" -eq 1 ] && \
+        echo "$JH_MIX_VHOST_RESP" | grep -q "jump-mix-vhost" && \
+        [ "$JH_MIX_PUBLIC_RESP" = "jump-mix-public" ] && \
+        [ "$JH_MIX_JUMP_RESP" = "jump-mix-native" ]; then
+    pass "T-SSH-JUMP vhost/public/jump direct pools coexist on one UDP endpoint"
+else
+    fail "T-SSH-JUMP shared direct endpoint isolation failed"
+fi
+kill -9 "$JH_MIX_VHOST_PID" "$JH_MIX_PUBLIC_PID" 2>/dev/null || true
+wait "$JH_MIX_VHOST_PID" "$JH_MIX_PUBLIC_PID" 2>/dev/null || true
+
+# A mismatched classic username must fail only for jump dispatch. The exact
+# same key still authenticates a legacy public reverse forward, preserving the
+# gateway's pre-jump username-agnostic contract.
+JH_WRONG=$(jump_via_gateway "$JH_NATIVE_ALIAS" "$JH_NATIVE_PORT" "must-not-pass" "wrong")
+JH_LEGACY_PORT=19920
+ip netns exec nscli ssh "${SSH_OPTS[@]}" -i "$CLIENT_KEY" \
+    -o BatchMode=yes -o ExitOnForwardFailure=yes -p "$CTRL_PORT" \
+    -N -R "$JH_LEGACY_PORT:127.0.0.1:$JH_NATIVE_PORT" "wrong@$SERVER_IP" \
+    >"$TMPDIR/jump_legacy_wrong_user.log" 2>&1 &
+JH_LEGACY_PID=$!
+if [ -z "$JH_WRONG" ] && wait_port_up nscli "$SERVER_IP" "$JH_LEGACY_PORT" 50 && \
+        [ "$(echo_tunnel "$SERVER_IP" "$JH_LEGACY_PORT" "legacy-user-ignored")" = "legacy-user-ignored" ]; then
+    pass "T-SSH-JUMP username binding is jump-only; legacy forward unchanged"
+else
+    fail "T-SSH-JUMP username mismatch or legacy compatibility contract failed"
+fi
+kill -9 "$JH_LEGACY_PID" 2>/dev/null || true
+wait "$JH_LEGACY_PID" 2>/dev/null || true
+
+# Pure OpenSSH publishes a nonstandard virtual port through `jump/`. It stays
+# TCP-only, the exact port succeeds, and an accidental port 22 request fails.
+JH_PURE_PORT=19841
+JH_PURE_ALIAS="netns-pure"
+spawn_echo_service "$JH_PURE_PORT" >/dev/null
+sleep 0.3
+ssh_cmd -N -R "jump/$JH_PURE_ALIAS:$JH_PURE_PORT:127.0.0.1:$JH_PURE_PORT" \
+    >"$TMPDIR/jump_pure.log" 2>&1 &
+JH_PURE_PID=$!
+if wait_jump_alias "$JH_PURE_ALIAS"; then
+    JH_PURE_RESP=$(jump_via_gateway "$JH_PURE_ALIAS" "$JH_PURE_PORT" "jump-pure")
+    JH_PURE_WRONG=$(jump_via_gateway "$JH_PURE_ALIAS" 22 "wrong-port")
+    JH_PURE_DIRECT=$(jump_field "$JH_PURE_ALIAS" direct_carriers)
+    if [ "$JH_PURE_RESP" = "jump-pure" ] && [ -z "$JH_PURE_WRONG" ] && \
+            [ "${JH_PURE_DIRECT:-0}" -eq 0 ]; then
+        pass "T-SSH-JUMP pure OpenSSH nonstandard target works, wrong port denied, TCP-only"
+    else
+        fail "T-SSH-JUMP pure OpenSSH contract failed (response='$JH_PURE_RESP', wrong='$JH_PURE_WRONG', direct='${JH_PURE_DIRECT:-}')"
+    fi
+else
+    fail "T-SSH-JUMP pure OpenSSH alias did not register"
+fi
+
+kill -9 "$JH_NATIVE_PID" "$JH_PURE_PID" 2>/dev/null || true
+wait "$JH_NATIVE_PID" "$JH_PURE_PID" 2>/dev/null || true
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""

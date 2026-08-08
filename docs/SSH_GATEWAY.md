@@ -7,10 +7,12 @@
 > **Scopo**: valutare un gateway SSH di ingresso per creare tunnel **public**, **secret** e
 > **vhost** usando un normale client `ssh`/`autossh`, senza binario `bore` sul lato client.
 >
-> **Estensione SSH jump host (2026-08-05, fase 2):** il gateway supporta anche provider
+> **Estensione SSH jump host (finalizzata 2026-08-08, fasi 1–5):** il gateway supporta provider
 > `-R jump/<alias>:<porta>:host:<porta>` e destinazioni ProxyJump sotto
 > `--ssh-jump-base-domain`. Solo queste nuove operazioni applicano il binding classico
 > username-credenziale; public/vhost/secret conservano il comportamento documentato qui.
+> Il provider bore nativo può usare il QUIC server-direct condiviso con fallback TCP caldo;
+> il provider OpenSSH resta TCP-only.
 
 ---
 

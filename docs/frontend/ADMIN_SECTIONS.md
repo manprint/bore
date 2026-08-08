@@ -64,6 +64,9 @@ the live `SshJumpRegistry` alias. Shared atomics make active connections and rel
 exact. Phase 4 adds live direct carrier count, successful direct stream opens, warm-TCP
 fallbacks and separate direct byte counters. The view omits classic username, credential
 identity, secrets and key material by contract.
+Phase 5 production acceptance uses these counters as proof: UDP-blocked sessions increase
+fallbacks, restored reachability replenishes direct carriers, and the next ProxyJump
+increments direct opens without creating another logical row.
 
 ## Known Gap
 

@@ -1,6 +1,6 @@
 # Admin Dashboard — Architecture & Operations
 
-**Status:** Phase 6 complete (2026-07-11); SSH Jump Host Phase 4 direct-path fields added 2026-08-08.
+**Status:** Phase 6 complete (2026-07-11); SSH Jump Host production acceptance complete through Phase 5 (2026-08-08).
 
 ## Overview
 

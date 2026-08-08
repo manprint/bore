@@ -252,6 +252,11 @@ STUN/hole-punch. I carrier TCP restano caldi; pick/open QUIC fallito usa subito 
 provider rinnova solo il deficit. Il provider OpenSSH puro resta TCP-only. Admin mostra
 carrier direct, aperture/fallback e byte relay/direct separati.
 
+Il README principale resta la fonte operativa per build, tabella firewall
+443/TCP+UDP, pin/rotazione `known_hosts`, servizio systemd nativo senza secret
+nella command line e confine di fiducia: il secret bore consente di reclamare
+qualunque alias nativo libero e v1 non offre ACL per-alias.
+
 ### 4.6 Banner di stato del tunnel
 
 Una volta stabilito il forward, il gateway scrive un report sul canale sessione (lo stesso

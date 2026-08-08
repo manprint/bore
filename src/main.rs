@@ -526,8 +526,8 @@ enum Command {
         #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
         carriers: u16,
 
-        /// Request the future server-direct QUIC path. Phase 2 records the
-        /// request and continues over warm TCP carriers.
+        /// Prefer server-direct QUIC through the shared direct endpoint.
+        /// Warm TCP carriers remain available for per-connection fallback.
         #[clap(long, env = "BORE_PREFER_UDP")]
         udp: bool,
 

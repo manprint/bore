@@ -89,3 +89,23 @@ the new jump-host scenario. Record exact PASS/FAIL totals and environment in
 - README covers build, deploy, modes, every flag/env, auth, firewall, examples and
   troubleshooting.
 - All internal, unit, integration, e2e and full regression gates are green.
+
+## Completion checkpoint — 2026-08-08
+
+- Added production netns gate `T-SSH-JUMP` to the existing SSH-gateway harness.
+  It uses stock OpenSSH `ssh -W` (the `direct-tcpip` transport primitive behind
+  ProxyJump) and proves UDP-blocked warm-TCP fallback, N=2 QUIC renewal/direct
+  use, simultaneous bare-vhost/`port:`/`jump:` direct pools on one UDP endpoint,
+  jump-only username binding with legacy public-forward compatibility, and pure-
+  OpenSSH exact nonstandard-port/TCP-only behavior.
+- The six real-OpenSSH Rust E2E cases cover native key/password target auth and
+  rejection paths, native direct loss/fallback/renewal, UDP-disabled startup,
+  pure provider key/password operation, cancellation and native liveness reap.
+- README is the complete operational source for source builds, canonical
+  443/TCP+UDP Compose/firewall topology, both provider modes, all flags/env,
+  three independent authentication layers, DNS/`known_hosts` rotation, agent
+  forwarding policy, systemd credentials, trust boundary, observability and
+  troubleshooting. Focused SSH, direct-transport, NAT and admin docs agree.
+- Full all-feature and both no-default matrices, frontend tests, release build,
+  SSH gateway and four relevant UDP/netns harnesses are green. Exact environment
+  and PASS/FAIL totals are recorded in `resume.md`.

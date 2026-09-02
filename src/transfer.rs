@@ -3099,9 +3099,7 @@ impl ResumeShared {
                 .iter_mut()
                 .find(|file| file.entry_id == entry_id)
                 .with_context(|| format!("resume state missing entry {}", entry_id))?;
-            for done in &mut file.completed {
-                *done = false;
-            }
+            file.completed.fill(false);
             runtime.pending_persist = 0;
             runtime.state.clone()
         };
@@ -3511,8 +3509,8 @@ fn decode_unix_component(payload: &str) -> OsString {
 fn decode_windows_component(payload: &str) -> OsString {
     let bytes = hex::decode(payload).unwrap_or_default();
     let mut wide = Vec::new();
-    for chunk in bytes.chunks_exact(2) {
-        wide.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    for &chunk in bytes.as_chunks::<2>().0 {
+        wide.push(u16::from_le_bytes(chunk));
     }
     #[cfg(windows)]
     {

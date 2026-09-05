@@ -598,6 +598,9 @@ Annotate any tunnel with `--notes "..."` (on `bore local`/`bore proxy`/`bore vho
 
 ## SSH jump hosts
 
+> **Step-by-step operator guide (Italian):** [`docs/README-JUMP-HOST.md`](docs/README-JUMP-HOST.md)
+> — server setup, binary startup, Docker wrapper startup and operator access, end to end.
+
 `sshjhost` publishes an SSH daemon under an exact, separate hostname namespace. The
 operator uses an unmodified OpenSSH client; the inner SSH session remains end-to-end between
 the operator and the target `sshd`:

@@ -420,10 +420,15 @@ Usa `network_mode: host` così il container raggiunge l'`sshd` della macchina su
 # docker-compose.sshjhost.yml
 services:
   bore-sshjhost:
-    image: ghcr.io/manprint/bore:latest
+    # Tag `:client` = stesso binario dell'immagine default, ma gira come root.
+    # Serve solo con --udp: con UID non-root Docker azzera le capability anche
+    # in `privileged`, SO_*BUFFORCE fallisce e il path diretto resta limitato a
+    # net.core.{r,w}mem_max (warning "UDP socket buffer clamped below request").
+    image: ghcr.io/manprint/bore:client
     container_name: bore-sshjhost
     restart: unless-stopped
     network_mode: host
+    privileged: true          # oppure: cap_add: [NET_ADMIN]
     command: ["sshjhost", "127.0.0.1:22"]
     environment:
       - BORE_SERVER=https://bore.tld
@@ -439,6 +444,13 @@ services:
 BORE_SECRET='...' docker compose -f docker-compose.sshjhost.yml up -d
 docker compose -f docker-compose.sshjhost.yml logs -f
 ```
+
+Senza `--udp` (`BORE_PREFER_UDP` assente) va bene anche `ghcr.io/manprint/bore:latest`
+senza `privileged`: il jump host funziona identico, solo sul relay TCP. Con `--udp` e
+immagine non-root il tunnel si stabilisce comunque — il path diretto resta solo limitato
+in banda. Alternativa a root: alzare il tetto sull'host con
+`sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216` (l'opzione `--sysctl`
+di Docker non serve: `net.core.*` non è per-netns).
 
 Target su porta non standard: `command: ["sshjhost", "127.0.0.1:2222"]`. Se il
 servizio SSH da esporre è a sua volta un container sulla stessa rete, si può

@@ -8,6 +8,12 @@
 services:
   bore-client:
     image: ${BORE_IMAGE:-yourusername/bore:latest}
+    # With --udp / BORE_PREFER_UDP use the ROOT image and grant NET_ADMIN:
+    #   image: ghcr.io/manprint/bore:client
+    #   privileged: true            # or: cap_add: [NET_ADMIN]
+    # Docker clears every capability for a non-root UID (even under privileged),
+    # so the default uid-1000 image cannot call SO_*BUFFORCE and the direct UDP
+    # path stays clamped to net.core.{r,w}mem_max (WARN on every socket).
     # build:
     #   context: ..
     #   dockerfile: Dockerfile

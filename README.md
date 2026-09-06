@@ -79,12 +79,38 @@ aarch64, arm, armv7, i686), Windows (x86_64/i686), and Android (aarch64) — all
 [releases page](https://github.com/manprint/bore/releases), unzip, and move the `bore`
 executable onto your `PATH`.
 
-**Docker.** Images are pushed to the GitHub Packages registry, tagged by branch and commit
-(amd64; build `just push` / `just -f Justfile push` locally for multi-arch):
+**Docker.** Multi-arch images (`linux/amd64` + `linux/arm64`) are pushed to the GitHub
+Packages registry on **every** push, tagged by branch, commit and semver:
 
 ```shell
 docker run -it --init --rm --network host ghcr.io/manprint/bore <ARGS>
 ```
+
+| Tag | Runs as | Use for |
+|---|---|---|
+| `latest`, `<version>`, `<major>.<minor>`, `<branch>`, `sha-<sha7>` | uid **1000** (non-root) | server side, and any client that does not need the direct UDP path |
+| **`client`**, `client-<version>`, `client-<branch>`, `client-sha-<sha7>` | **root** | client side with `--udp` / `--privileged` (see below) |
+
+The `:client` tag carries the **same binary** as the default image (it is re-tagged from the
+same pipeline run, never rebuilt) and is moved on every pipeline run, so it always tracks the
+newest build. It only drops the `USER 1000:1000` line, because Docker/runc clears the whole
+capability set for a non-root UID — **even under `--privileged`** — and the direct-UDP path
+needs an effective `CAP_NET_ADMIN` for `setsockopt(SO_{RCV,SND}BUFFORCE)`. Without it the
+kernel clamps the socket buffers to `net.core.{r,w}mem_max`, direct-path throughput is capped
+at roughly `buffer/RTT`, and every socket logs `UDP socket buffer clamped below request`:
+
+```shell
+# root image + --privileged  ->  forced=true, no clamp warning
+docker run -it --init --rm --privileged --network host \
+  ghcr.io/manprint/bore:client local 8080 --to bore.example.com --udp
+```
+
+The default (non-root) image works fine for the same tunnel — it just runs with the clamped
+buffers. The alternative, if you would rather not run as root, is to raise the ceiling on the
+host: `sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216` (`--sysctl` on
+`docker run` does **not** work here: `net.core.*` is not network-namespaced). Build it
+locally with
+`docker build -f docker/Dockerfile.client --build-arg BORE_IMAGE=ghcr.io/manprint/bore:latest -t bore:client .`.
 
 Ready-to-run compose files live in [`docker/`](docker/):
 

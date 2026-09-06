@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+
+# ── bore CLIENT image — runs as ROOT (tag `:client`) ─────────────────────────
+# Identical binary to the default `ghcr.io/manprint/bore` image, minus the
+# `USER 1000:1000` line.
+#
+# Why a root variant exists: Docker/runc drops the ENTIRE capability set when
+# the container process runs under a non-root UID — even with `--privileged`
+# (`CapEff: 0000000000000000`). The direct-UDP path calls
+# `setsockopt(SO_{RCV,SND}BUFFORCE)` to bypass the `net.core.{r,w}mem_max`
+# clamp (`configure_udp_socket_buffers`, src/holepunch.rs); without an
+# effective CAP_NET_ADMIN that returns EPERM, every direct-path socket falls
+# back to the clamped setter and logs the "UDP socket buffer clamped below
+# request" warning, capping direct-path throughput at roughly mem_max/RTT.
+# Client-side subcommands (`local`, `proxy`, `sshjhost`, `vhost`, `transfer`,
+# `test-udp`, `vpn`) are the ones that need it; the default server image stays
+# unprivileged.
+#
+# This image does NOT recompile: it copies the binary out of the multi-arch
+# image the SAME pipeline run just published, so `:client` is bit-identical to
+# that run's non-root image and the build costs seconds instead of a full cargo
+# compile. `BORE_IMAGE` must be a multi-arch reference — buildx resolves the
+# matching arch per `--platform`, and since there is no `RUN` step the build
+# needs no emulation.
+#
+# Local build:
+#   docker build -f docker/Dockerfile.client \
+#     --build-arg BORE_IMAGE=ghcr.io/manprint/bore:latest -t bore:client .
+ARG BORE_IMAGE=ghcr.io/manprint/bore:latest
+FROM ${BORE_IMAGE} AS bin
+
+FROM scratch
+COPY --from=bin /bore /bore
+# Deliberately NO `USER`: stay uid 0 so `--privileged` / `--cap-add NET_ADMIN`
+# actually reach the process.
+ENTRYPOINT ["/bore"]

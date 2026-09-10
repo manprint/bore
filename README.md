@@ -380,6 +380,43 @@ bug: QUIC is reliable and congestion-controlled over UDP, while the relay uses h
 optimized kernel TCP and may sit close to one peer. Tune those constants only after measuring
 both directions with a realistic quota.
 
+**Which transport, and how much CPU it costs.** Measured on a fixed staging deployment
+(AWS `t4g.micro`, 2 burstable Graviton2 vCPU, TLS, 1500 MTU) with paired A/B runs, because a
+29 % drift in the control made unpaired comparisons meaningless:
+
+- **On a clean, low-RTT path the TCP relay is the right transport, not `--udp`.** 8 of 8
+  paired runs favoured the relay, **median 1.589×**. The relay also costs about half the
+  client CPU, **2.5× less server CPU per byte**, and **4.5× less server memory** under
+  concurrency.
+- **`--udp` is a remedy for a lossy or long-RTT path**, and a good one: **2.8×** the relay
+  at 1 % packet loss and **2.2×** at +40 ms RTT. On a clean path it is 25–110 % *slower*.
+- **`--udp` is not a bandwidth transport.** It tops out at **0.96 Gbit/s** — below a 1 Gbit/s
+  link — and **no flag moves it**: `--carriers 1→4` and 1→4 parallel streams take it from 99
+  to 120 MB/s and no further. It also draws instance-level packet-rate throttling that the
+  relay never triggers. Choose it for resilience, never for throughput.
+- **Carriers default to 1 and that is correct** for an idle tunnel: the paired median
+  `c=4/c=1` ratio is **0.941**. They earn their keep under loss (~1 MB/s per carrier at 1 %
+  loss) and under concurrent bulk load (3× p50 at `c=8`) — which is what
+  [`--carriers 0`](#adaptive-carriers-carriers-0) tracks automatically on a vhost.
+
+**Sizing a relay deployment.** The transferable number is **CPU-seconds per GiB**, not MB/s:
+absolute throughput is a property of one box and one link, while cost per byte survives a
+change of hardware. Measured: **5.74 CPU-seconds per GiB** for the TCP relay under load, on
+one Graviton2 core with TLS at 1500 MTU. Divide the target rate by it:
+
+| target | relay cores needed |
+| --- | --- |
+| 1 Gbit/s | 0.67 |
+| 2.68 Gbit/s | 1.90 (the measured ceiling on 2 burstable Graviton2 cores) |
+| 5 Gbit/s | 3.34 |
+| 10 Gbit/s | 6.7 |
+
+So **a 5 Gbit/s deployment wants 6–8 vCPU and `--carriers 4`**: bore was measured using up to
+3.61 cores, and 4 vCPU would leave no margin for TLS handshakes, the admin endpoint and the
+OS. x86 should be cheaper per byte than Graviton2 at the same clock, so treat 3.34 as the
+ceiling of the estimate rather than the middle of it. The three-script measurement sequence
+that produces these numbers on any host is documented in `scripts/perf/README.md`.
+
 **Direct-path memory: the sizing rule.** The QUIC connection receive window is a
 per-connection **ceiling, not a reservation** — a healthy tunnel buffers approximately
 nothing. It only fills when the public reader stops draining, which is what a browser
@@ -2152,13 +2189,27 @@ key_file:  /etc/bore/wildcard.key
 default_headers:
   X-Forwarded-Proto: https
 
+# Optional default headers injected on every routed response.
+default_response_headers:
+  X-Frame-Options: DENY
+
 # Optional reservations: lock a subdomain to a specific client id.
 reservations:
   - subdomain: myapp
     client_id:  my-client-id
     headers:
       X-App-Name: myapp   # merged over default_headers (this key wins)
+    response_headers:
+      X-Cache: bypass     # merged over default_response_headers
 ```
+
+The whole merged result — this file with the `--vhost-*` flags applied over it —
+is readable at `/admin/api/v1/config` as `vhost_default_request_headers`,
+`vhost_default_response_headers` and `vhost_reservations`, and in the
+Configuration panel of `/admin/status`. Those fields are **derived from the live
+configuration on every read**, so a [hot reload](#hot-reload) is reflected
+immediately; the endpoint previously reported the response headers as absent
+while the SSH gateway printed all of them to a connecting client.
 
 ```shell
 bore server --vhost-config /etc/bore/vhost.yml
@@ -2192,7 +2243,7 @@ mtime change it reloads atomically — in-flight connections are unaffected.
 | `--backend-tls` | Connect to the local backend over TLS — use when the tunnelled service is itself HTTPS (e.g. `https://localhost:3005`). The server originates a TLS session to the backend; a self-signed backend cert is accepted (verification skipped) |
 | `--backend-tls-sni NAME` | SNI/hostname sent to the TLS backend (default `localhost`). Only meaningful with `--backend-tls` |
 | `--https[=off\|on\|redirect]` | Per-subdomain HTTPS policy (bare = on). Absent inherits the server `--vhost-mode`; falls back to HTTP with a warning if the server has no vhost cert |
-| `--carriers N` | Parallel relay connections (default 1) |
+| `--carriers N` | Parallel relay connections (default 1). `0` = auto: the server sizes the pool on demand — see [Adaptive carriers](#adaptive-carriers-carriers-0) |
 | `--udp` | Try QUIC direct path for the server→provider hop; falls back silently to the TCP relay |
 | `--basic-auth user:pass` | Tell the admin page this provider enforces Basic auth |
 | `--notes TEXT` | Free-form note on the admin status page |
@@ -2249,6 +2300,86 @@ bore server --vhost-base-domain bore.example.com \
 # Config file + flag overrides
 bore server --vhost-config /etc/bore/vhost.yml --vhost-mode redirect-https
 ```
+
+### Adaptive carriers (`--carriers 0`)
+
+`bore vhost --carriers 0` hands the carrier count to the server instead of fixing it.
+The pool **starts at one** connection and the server adds one, up to **4** and never
+past its own `--max-carriers`, when it observes the condition that carriers actually
+help with:
+
+> a proxied connection has to be placed on a carrier that is *already* carrying a bulk
+> transfer — i.e. every carrier in the pool is occupied.
+
+"Bulk" is decided by **bytes moved**, not by URL, method or content type: a connection
+that has moved more than 512 KiB counts as bulk for as long as it is open, and releases
+its slot when it closes. Ordinary page assets never trip it.
+
+Why not simply default to a higher `--carriers`? Because on a clean, uncontended path
+extra carriers measurably *cost* a little (a paired A/B measured a median `c=4/c=1`
+throughput ratio of 0.941), while under concurrent bulk load they are the lever that
+spreads work across CPU cores. The right count is regime-dependent, so `0` tracks the
+regime and a fixed `N` is still there when you know your own workload.
+
+Three properties worth knowing before you turn it on:
+
+- **It is a ceiling, not a reservation.** Growth stops at 4 or at the server's
+  `--max-carriers`, whichever is lower, and an explicit `--carriers N` is never touched
+  by any of this.
+- **It decays, but it never tears down.** After a quiet minute the server lowers the
+  target by one step at a time. Lowering the target only stops the provider from
+  *replacing* a carrier that dies; an established carrier is never closed, because a
+  proxied connection is pinned to its carrier for its whole life and closing one would
+  break live traffic. The pool therefore returns to 1 on the provider's next reconnect.
+- **It needs a server that knows about it.** The count is negotiated at registration.
+  Against an older server, `--carriers 0` fails immediately with a message telling you
+  to use `--carriers N` or upgrade the server — it does not silently run degraded.
+
+With `--udp`, adaptive growth applies to the **TCP relay** pool. On the QUIC direct path
+carriers were measured *not* to help (contention there is between streams inside one
+connection, not between connections), so that path instead demotes a bulk-classified
+stream in the connection's own send scheduler once it passes 512 KiB, so a small request
+opened later is not queued behind a large in-flight burst. Neither QUIC receive window
+changes — see [Direct-path memory: the sizing rule](#parallel-carriers---carriers).
+
+### Origin failures and path failures
+
+Two failures that used to be silent now say what happened.
+
+**A dead origin answers 502.** When the tunnelled backend is down, its port is
+closed, or the provider cannot otherwise reach it, the server synthesizes:
+
+```
+HTTP/1.1 502 Bad Gateway
+Content-Type: text/plain; charset=utf-8
+Content-Length: 43
+Connection: close
+
+bore: the tunnelled origin is unreachable.
+```
+
+Previously the connection was simply closed with no status line (`curl` reports
+`000`), which is indistinguishable from "the tunnel is gone", "the server is down"
+and "the network broke". An unknown subdomain still returns **404**, and a
+restored origin still serves **200** on the same tunnel — a 502 never poisons the
+registration. A failure that happens *mid-response* still closes the connection:
+the response head has already been sent, so no status can be substituted.
+
+**A stalled QUIC direct open falls back within 3 seconds.** With `--udp`, opening
+the direct stream for a proxied request is bounded; on expiry that **same**
+request is served over the warm TCP relay instead. Before this bound a total UDP
+blackout destroyed the first request after ~10 s while every subsequent request
+was served perfectly — one broken request plus a healthy-looking tunnel, the worst
+combination for diagnosis. The deadline is deliberately below the direct path's own
+10 s idle timeout, and an *answered* failure (the origin restarting, say) is not
+treated as a stalled path.
+
+**The admin page says which path a tunnel is on right now.** `/admin/api/v1/vhost`
+gained `current_path` (`direct` / `relay` / `unknown`) and `direct_fallbacks`, and
+the Vhost table shows a **Path** column that reads `relay (7 fallbacks)` for a
+`--udp` tunnel currently serving over the relay. `direct_stream_opens` now counts
+**successful** opens only — as an attempt counter it climbed during a total UDP
+blackout, which is precisely when an operator needs it to be honest.
 
 ### Control liveness (abandoned registration reaper)
 

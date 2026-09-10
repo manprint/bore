@@ -1416,6 +1416,11 @@ impl Proxy {
                         Some(ServerMessage::CarrierToken { .. }) => warn!("unexpected carrier token"),
                         Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
                         Some(ServerMessage::VhostUdp { .. }) => warn!("unexpected vhost udp offer"),
+                        // Vhost-only (phase 03.3); a secret provider never
+                        // declares `auto_carriers`, so this cannot arrive.
+                        Some(ServerMessage::SetCarrierTarget { .. }) => {
+                            warn!("unexpected carrier growth request")
+                        }
                         // Deliver the brokered candidates to the in-flight upgrade
                         // task (which then punches + dials QUIC); else it is stray.
                         Some(ServerMessage::UdpPunch { nonce, peer, peer_selected_stun, tuning, peer_id: _, v2 }) => match nego_punch_tx.take() {

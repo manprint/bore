@@ -6,6 +6,7 @@
 //! DashMap guards held across `.await` boundaries (invariant I-7).
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 /// Summary section: version, control port, feature flags, server uptime, per-section counts.
 #[derive(Serialize, Clone)]
@@ -195,8 +196,31 @@ pub struct VhostView {
     pub active: usize,
     /// Number of parallel carrier TCP streams.
     pub carriers: u16,
-    /// Count of direct QUIC stream opens (QUIC-only).
+    /// Count of SUCCESSFUL direct QUIC stream opens (QUIC-only).
+    ///
+    /// Successful, not attempted (phase 05.3): the attempt counter climbed
+    /// during a measured total UDP blackout, so it could not answer the one
+    /// question it looked like it answered.
     pub direct_stream_opens: u64,
+    /// Proxied requests that wanted the direct path and were served by the warm
+    /// TCP relay instead (QUIC-only; `--udp` tunnels only).
+    #[serde(default)]
+    pub direct_fallbacks: u64,
+    /// Transport the most recent proxied connection actually used:
+    /// `"direct"`, `"relay"` or `"unknown"`.
+    ///
+    /// The counters above cannot express this — a tunnel that negotiated direct
+    /// and has since fallen back for every connection looks identical to a
+    /// healthy direct one — and it is what an operator actually asks.
+    #[serde(default)]
+    pub current_path: String,
+    /// Carriers the server currently WANTS in this provider's pool.
+    ///
+    /// Distinct from `carriers` (the live pool size) on an adaptive
+    /// (`--carriers 0`) tunnel, where lowering the target deliberately does not
+    /// tear down established carriers.
+    #[serde(default)]
+    pub carrier_target: usize,
     /// Injected request-header names (sanitized, no sensitive values).
     pub request_headers: Vec<String>,
     /// Injected response-header names (sanitized, no sensitive values).
@@ -358,6 +382,26 @@ pub struct CertView {
     pub error: Option<String>,
 }
 
+/// One static subdomain reservation as read from the live merged vhost
+/// configuration (F-6).
+///
+/// Header values are carried, not just names, because the per-tunnel
+/// [`VhostView`] already exposes the resolved pairs and the SSH gateway prints
+/// them to the connecting client; withholding them only here would make the
+/// endpoint an operator reads the least truthful view of the same data. The
+/// admin API is token-gated.
+#[derive(Serialize, Clone, PartialEq, Eq, Debug)]
+pub struct VhostReservationView {
+    /// Client id allowed to register this subdomain.
+    pub client_id: String,
+    /// Reserved subdomain label.
+    pub subdomain: String,
+    /// Request headers merged over the defaults for this subdomain.
+    pub headers: BTreeMap<String, String>,
+    /// Response headers merged over the defaults for this subdomain.
+    pub response_headers: BTreeMap<String, String>,
+}
+
 /// Server startup configuration (sanitized, D11).
 #[derive(Serialize, Clone)]
 pub struct ConfigView {
@@ -422,6 +466,15 @@ pub struct ConfigView {
     pub vhost_config: Option<String>,
     /// Vhost certificate file path.
     pub vhost_cert_file: Option<String>,
+    /// Request headers injected on every vhost route (`default_headers` in
+    /// `vhost.yml`), from the LIVE merged configuration — never a startup
+    /// snapshot (F-6, phase 06.4).
+    pub vhost_default_request_headers: BTreeMap<String, String>,
+    /// Response headers injected on every routed vhost response
+    /// (`default_response_headers`), from the live merged configuration.
+    pub vhost_default_response_headers: BTreeMap<String, String>,
+    /// Static subdomain reservations from the live merged configuration.
+    pub vhost_reservations: Vec<VhostReservationView>,
     /// TLS enabled on control port.
     pub tls: bool,
     /// SSH gateway enabled.
@@ -619,6 +672,9 @@ mod tests {
             vhost_mode: Some("https".into()),
             vhost_config: Some("/etc/bore/vhost.toml".into()),
             vhost_cert_file: Some("/certs/fullchain.pem".into()),
+            vhost_default_request_headers: Default::default(),
+            vhost_default_response_headers: Default::default(),
+            vhost_reservations: Vec::new(),
             tls: true,
             ssh_gateway: false,
             ssh_jump_enabled: false,
@@ -813,6 +869,9 @@ mod tests {
             vhost_mode: None,
             vhost_config: None,
             vhost_cert_file: None,
+            vhost_default_request_headers: Default::default(),
+            vhost_default_response_headers: Default::default(),
+            vhost_reservations: Vec::new(),
             tls: false,
             ssh_gateway: false,
             ssh_jump_enabled: false,

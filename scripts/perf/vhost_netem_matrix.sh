@@ -104,10 +104,20 @@ if up "$L" --carriers 1 --udp; then
   if impair udp 0 100; then
     echo "  UDP toward the server is now 100% dropped"
     sleep 3
-    echo "  single request during:  $(curl -s -o /dev/null -m 30 -w 'http=%{http_code} t=%{time_total}' https://$L.$GW/ping)"
+    # Phase 05.1's gate. Before the direct open was bounded, the FIRST request
+    # after a blackout was destroyed: http=000 after 9.90 s, while every later
+    # request was served perfectly by the fallback. So this line is measured
+    # twice on purpose — the FIRST one is the one that used to fail.
+    first=$(curl -s -o /dev/null -m 30 -w 'http=%{http_code} t=%{time_total}' https://$L.$GW/ping)
+    echo "  first request during:   $first"
+    echo "  second request during:  $(curl -s -o /dev/null -m 30 -w 'http=%{http_code} t=%{time_total}' https://$L.$GW/ping)"
+    fc=${first#http=}; fc=${fc%% *}
+    if [ "$fc" = 200 ]; then echo "    VERDICT first request survives a UDP blackout: PASS"
+    else echo "    VERDICT first request survives a UDP blackout: FAIL ($first)"; fi
     echo "  throughput during:     $(meas "$L")"
     d2=$(dso "$L")
     echo "  entry during: opens=$d2 server_fallbacks=$(adm metrics | jq -r .direct_fallbacks)"
+    echo "  per-tunnel during: $(adm vhost | jq -r --arg l "$L" '.[]|select(.subdomain==$l)|"path=\(.current_path) fallbacks=\(.direct_fallbacks)"')"
     clear_netem; sleep 6
     echo "  throughput after clear: $(meas "$L")"
     d3=$(dso "$L")

@@ -172,7 +172,12 @@ struct CarrierDialer {
     secret: Option<String>,
     token: String,
     /// Target number of extra carriers (the pool is topped back up to this).
-    target_extra: usize,
+    ///
+    /// Shared and mutable because the server may RAISE it at runtime with
+    /// [`ServerMessage::SetCarrierTarget`] when it observes bulk transfers
+    /// saturating the pool (phase 03.3). It is never lowered below what the
+    /// operator asked for.
+    target_extra: Arc<AtomicUsize>,
 }
 
 /// Provider-side direct-path configuration, retained on the [`Client`] so the
@@ -270,7 +275,7 @@ impl Client {
                             insecure,
                             secret: secret.map(str::to_string),
                             token,
-                            target_extra: extra as usize,
+                            target_extra: Arc::new(AtomicUsize::new(extra as usize)),
                         });
                     }
                 }
@@ -439,7 +444,7 @@ impl Client {
                             insecure,
                             secret: secret.map(str::to_string),
                             token,
-                            target_extra: extra as usize,
+                            target_extra: Arc::new(AtomicUsize::new(extra as usize)),
                         });
                     }
                 }
@@ -635,6 +640,12 @@ impl Client {
                 // ⇒ `false` ⇒ the server keeps the legacy un-reaped path
                 // (DEC-VE2).
                 ctrl_heartbeat: true,
+                // `--carriers auto` (0): the operator did not pick a count, so
+                // the server may grow the pool when it sees bulk transfers
+                // saturating it (phase 03.3). An explicit count is honoured
+                // exactly and this stays `false`, so the server never sends a
+                // message this client would not expect.
+                auto_carriers: carriers == 0,
             })
             .await?;
 
@@ -669,9 +680,13 @@ impl Client {
         }
         info!(%subdomain, "vhost provider ready");
 
+        let auto_carriers = carriers == 0;
         let mut carrier_acceptors = Vec::new();
         let mut carrier_dialer = None;
-        if carriers > 1 {
+        // In auto mode the server issues a token with `extra: 0` — nothing is
+        // dialed now, but the token has to be held so a later `SetCarrierTarget`
+        // can be satisfied without a second handshake.
+        if carriers > 1 || auto_carriers {
             match control.recv_timeout().await? {
                 Some(ServerMessage::CarrierToken { token, extra }) => {
                     for _ in 0..extra {
@@ -683,15 +698,16 @@ impl Client {
                     info!(
                         opened = carrier_acceptors.len(),
                         requested = extra,
+                        auto = auto_carriers,
                         "vhost carrier pool established"
                     );
-                    if extra > 0 {
+                    if extra > 0 || auto_carriers {
                         carrier_dialer = Some(CarrierDialer {
                             endpoint: endpoint.clone(),
                             insecure,
                             secret: secret.map(str::to_string),
                             token,
-                            target_extra: extra as usize,
+                            target_extra: Arc::new(AtomicUsize::new(extra as usize)),
                         });
                     }
                 }
@@ -700,7 +716,21 @@ impl Client {
                     tracing::warn!("{msg}");
                     bail!("unexpected warning during carrier setup")
                 }
-                other => bail!("expected carrier token, got {other:?}"),
+                other => {
+                    if auto_carriers {
+                        // `--carriers 0` needs a server that knows how to offer
+                        // an auto token (phase 03.3). An older server ignores
+                        // the additive `HelloVhost::auto_carriers` field and
+                        // sends nothing here, so say exactly that instead of
+                        // reporting a confusing protocol mismatch.
+                        bail!(
+                            "server did not offer a carrier token for --carriers 0 (auto); \
+                             it does not support adaptive vhost carriers — use --carriers N \
+                             (N >= 1) or upgrade the server (got {other:?})"
+                        )
+                    }
+                    bail!("expected carrier token, got {other:?}")
+                }
             }
         }
 
@@ -859,7 +889,7 @@ impl Client {
                             insecure,
                             secret: secret.map(str::to_string),
                             token,
-                            target_extra: extra as usize,
+                            target_extra: Arc::new(AtomicUsize::new(extra as usize)),
                         });
                     }
                 }
@@ -1045,6 +1075,42 @@ impl Client {
                         Some(ServerMessage::CarrierToken { .. }) => warn!("unexpected carrier token"),
                         Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
                         Some(ServerMessage::Ok) => warn!("unexpected ok"),
+                        // Phase 03.3: the server is telling us how many carriers
+                        // it currently wants. Raising the target tops the pool up
+                        // NOW rather than at the next re-dial tick — the request
+                        // is already rate-limited server-side and the point is to
+                        // help the small request that triggered it. Lowering it
+                        // only stops future top-ups: an established carrier is
+                        // never closed here, because a proxied connection is
+                        // pinned to its carrier for its whole life (N-5).
+                        Some(ServerMessage::SetCarrierTarget { target }) => {
+                            match &carrier_dialer {
+                                Some(dialer) => {
+                                    let extra = target.saturating_sub(1) as usize;
+                                    let previous =
+                                        dialer.target_extra.swap(extra, Ordering::Relaxed);
+                                    if extra > previous {
+                                        info!(target, "server raised the carrier target");
+                                        maybe_redial_carriers(
+                                            dialer,
+                                            &carrier_tx,
+                                            &carrier_live,
+                                            &carrier_redial_inflight,
+                                        );
+                                    } else if extra < previous {
+                                        info!(
+                                            target,
+                                            "server lowered the carrier target; keeping live carriers"
+                                        );
+                                    }
+                                }
+                                // Only an `auto_carriers` provider is sent this,
+                                // and such a provider always holds a dialer, so
+                                // this is a server-side bug rather than a
+                                // condition to handle.
+                                None => warn!("carrier target set without a carrier token"),
+                            }
+                        }
                         Some(ServerMessage::UdpPunch {
                             nonce,
                             peer,
@@ -1702,15 +1768,16 @@ fn maybe_redial_carriers(
     live: &Arc<AtomicUsize>,
     inflight: &Arc<AtomicBool>,
 ) {
+    let target = dialer.target_extra.load(Ordering::Relaxed);
     let current = live.load(Ordering::Relaxed);
-    if current >= dialer.target_extra {
+    if current >= target {
         return;
     }
     // Skip if a previous re-dial batch is still running.
     if inflight.swap(true, Ordering::AcqRel) {
         return;
     }
-    let need = dialer.target_extra - current;
+    let need = target - current;
     let dialer = dialer.clone();
     let tx = tx.clone();
     let live = Arc::clone(live);

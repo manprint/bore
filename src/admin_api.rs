@@ -274,6 +274,17 @@ pub fn vhost(server: &Server) -> Vec<VhostView> {
             }
         };
 
+        let direct_fallbacks = {
+            #[cfg(feature = "udp")]
+            {
+                vhost_entry.direct_fallbacks.load(Ordering::Relaxed)
+            }
+            #[cfg(not(feature = "udp"))]
+            {
+                0
+            }
+        };
+
         let direct_pool = {
             #[cfg(feature = "udp")]
             {
@@ -300,7 +311,13 @@ pub fn vhost(server: &Server) -> Vec<VhostView> {
             relay_rx_bytes: vhost_entry.relay_rx_bytes.load(Ordering::Relaxed),
             active: vhost_entry.active.load(Ordering::Relaxed),
             carriers: vhost_entry.pool.len() as u16,
+            carrier_target: vhost_entry.carrier_target.load(Ordering::Relaxed),
             direct_stream_opens,
+            direct_fallbacks,
+            current_path: crate::vhost::vhost_path_label(
+                vhost_entry.last_path.load(Ordering::Relaxed),
+            )
+            .to_string(),
             request_headers,
             response_headers,
             request_header_pairs,
@@ -553,11 +570,72 @@ pub fn certs(server: &Server) -> Vec<CertView> {
     views
 }
 
+/// Kebab-case label for a configured vhost frontend mode, matching the
+/// `--vhost-mode` vocabulary exactly (`http`, `https`, `both`,
+/// `redirect-https`, `auto`).
+fn vhost_mode_label(mode: crate::vhost::VhostModeCfg) -> &'static str {
+    match mode {
+        crate::vhost::VhostModeCfg::Http => "http",
+        crate::vhost::VhostModeCfg::Https => "https",
+        crate::vhost::VhostModeCfg::Both => "both",
+        crate::vhost::VhostModeCfg::RedirectHttps => "redirect-https",
+        crate::vhost::VhostModeCfg::Auto => "auto",
+    }
+}
+
+/// Overlay the vhost section of the configuration view from the LIVE merged
+/// vhost configuration (F-6, phase 06.4).
+///
+/// `ConfigView` is a startup snapshot built from CLI values, so it is stale by
+/// construction for anything `vhost.yml` can carry or hot-reload: the endpoint
+/// reported `default_response_headers` as absent while the SSH gateway's own
+/// `vhost_info_banner` printed all of them to a connecting client. The data is
+/// resolved and shared already — `SharedVhostConfig` holds the CLI overrides
+/// merged over the file — so the fix is to DERIVE the section on every read
+/// rather than restate it, exactly as phase 02.1 did for the UDP windows.
+///
+/// `vhost_quic_port` and `vhost_config` (the file path) are deliberately left
+/// as the startup snapshot: neither is hot-reloadable (the QUIC port is a bound
+/// socket, the path is fixed for the process lifetime) and neither lives in
+/// `VhostConfig`.
+fn overlay_vhost_config(view: &mut ConfigView, server: &Server) {
+    let Some(shared) = server.vhost_config() else {
+        return;
+    };
+    // Clone the Arc out, then drop the guard: no lock held while building the view.
+    let cfg = {
+        let guard = shared.read().unwrap();
+        std::sync::Arc::clone(&guard)
+    };
+    view.vhost_enabled = true;
+    view.vhost_base_domain = Some(cfg.base_domain.clone());
+    view.vhost_http_port = Some(cfg.http_port);
+    view.vhost_https_port = Some(cfg.https_port);
+    view.vhost_mode = Some(vhost_mode_label(cfg.mode).to_string());
+    view.vhost_cert_file = cfg
+        .cert_file
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string());
+    view.vhost_default_request_headers = cfg.default_headers.clone();
+    view.vhost_default_response_headers = cfg.default_response_headers.clone();
+    view.vhost_reservations = cfg
+        .reservations
+        .iter()
+        .map(|res| VhostReservationView {
+            client_id: res.client_id.clone(),
+            subdomain: res.subdomain.clone(),
+            headers: res.headers.clone(),
+            response_headers: res.response_headers.clone(),
+        })
+        .collect();
+}
+
 /// Build the server configuration view (already stored on Server).
 pub fn config(server: &Server) -> ConfigView {
     #[cfg(feature = "ssh-gateway")]
     {
         let mut view = (*server.config_view()).clone();
+        overlay_vhost_config(&mut view, server);
 
         // Populate SSH gateway config from the running gateway instance.
         if let Some(gateway) = server.ssh_gateway() {
@@ -576,7 +654,9 @@ pub fn config(server: &Server) -> ConfigView {
 
     #[cfg(not(feature = "ssh-gateway"))]
     {
-        (*server.config_view()).clone()
+        let mut view = (*server.config_view()).clone();
+        overlay_vhost_config(&mut view, server);
+        view
     }
 }
 
@@ -671,6 +751,116 @@ pub fn metrics(server: &Server) -> MetricsView {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    /// Phase 06.4 gate (F-6). `/admin/api/v1/config` used to report the vhost
+    /// response headers as absent while the SSH gateway's own
+    /// `vhost_info_banner` printed all of them to a connecting client: the view
+    /// is a startup snapshot of CLI values, and `default_response_headers` only
+    /// ever lives in `vhost.yml`. The section must be DERIVED from the live
+    /// merged configuration on every read.
+    ///
+    /// Red-check: hardcode any one of these (e.g. leave
+    /// `view.vhost_default_response_headers` at its `Default::default()`) and
+    /// this fails.
+    #[test]
+    fn config_view_vhost_section_equals_the_resolved_merged_configuration() {
+        // mode stays `http` because `redirect-https` fails fast without a cert.
+        let yaml = "\
+base_domain: bore.example.com
+mode: http
+http_port: 8080
+https_port: 8443
+default_headers:
+  x-forwarded-proto: https
+default_response_headers:
+  x-frame-options: DENY
+  strict-transport-security: max-age=31536000
+reservations:
+  - client_id: team-a
+    subdomain: app
+    headers:
+      x-tenant: a
+    response_headers:
+      x-cache: bypass
+";
+        let cfg = crate::vhost::parse_config(yaml).expect("parse vhost config");
+        let mut server = Server::new(20500..=20600, None);
+        server.set_vhost(cfg).expect("install vhost config");
+
+        let live = {
+            let shared = server.vhost_config().expect("vhost config installed");
+            let guard = shared.read().unwrap();
+            std::sync::Arc::clone(&guard)
+        };
+        let view = config(&server);
+
+        assert!(view.vhost_enabled, "vhost is configured");
+        assert_eq!(
+            view.vhost_base_domain.as_deref(),
+            Some(live.base_domain.as_str())
+        );
+        assert_eq!(view.vhost_http_port, Some(live.http_port));
+        assert_eq!(view.vhost_https_port, Some(live.https_port));
+        assert_eq!(view.vhost_mode.as_deref(), Some("http"));
+        assert_eq!(view.vhost_default_request_headers, live.default_headers);
+        // The measured F-6 symptom, pinned.
+        assert_eq!(
+            view.vhost_default_response_headers,
+            live.default_response_headers
+        );
+        assert_eq!(
+            view.vhost_default_response_headers
+                .get("x-frame-options")
+                .map(String::as_str),
+            Some("DENY"),
+            "the response header an operator actually reads must be present"
+        );
+        assert_eq!(view.vhost_reservations.len(), live.reservations.len());
+        let res = &view.vhost_reservations[0];
+        assert_eq!(res.client_id, "team-a");
+        assert_eq!(res.subdomain, "app");
+        assert_eq!(res.headers.get("x-tenant").map(String::as_str), Some("a"));
+        assert_eq!(
+            res.response_headers.get("x-cache").map(String::as_str),
+            Some("bypass")
+        );
+
+        // Derived, not restated: a hot-reloaded config must move the view. This
+        // is the half a startup snapshot can never satisfy.
+        {
+            let shared = server.vhost_config().unwrap();
+            let mut next = (*live).clone();
+            next.default_response_headers
+                .insert("x-reloaded".into(), "yes".into());
+            next.base_domain = "reloaded.example.com".into();
+            *shared.write().unwrap() = std::sync::Arc::new(next);
+        }
+        let after = config(&server);
+        assert_eq!(
+            after
+                .vhost_default_response_headers
+                .get("x-reloaded")
+                .map(String::as_str),
+            Some("yes"),
+            "the view must follow the live config, not the startup snapshot"
+        );
+        assert_eq!(
+            after.vhost_base_domain.as_deref(),
+            Some("reloaded.example.com")
+        );
+    }
+
+    /// A server with no vhost configured keeps its startup snapshot untouched:
+    /// the overlay must be a no-op, not a blanket `vhost_enabled = true`.
+    #[test]
+    fn config_view_vhost_overlay_is_a_no_op_without_a_vhost_config() {
+        let server = Server::new(20601..=20700, None);
+        let view = config(&server);
+        assert!(!view.vhost_enabled);
+        assert_eq!(view.vhost_base_domain, None);
+        assert!(view.vhost_default_response_headers.is_empty());
+        assert!(view.vhost_reservations.is_empty());
+    }
 
     #[test]
     fn t_total_bytes_accumulate() {
@@ -1071,6 +1261,9 @@ mod tests {
             vhost_mode: None,
             vhost_config: None,
             vhost_cert_file: None,
+            vhost_default_request_headers: Default::default(),
+            vhost_default_response_headers: Default::default(),
+            vhost_reservations: Vec::new(),
             tls: false,
             ssh_gateway: false,
             ssh_jump_enabled: false,
@@ -1095,6 +1288,9 @@ mod tests {
             udp_socket_recv_buffer: None,
             vhost_config: Some("/etc/bore/vhost.toml".into()),
             vhost_cert_file: Some("/certs/fullchain.pem".into()),
+            vhost_default_request_headers: Default::default(),
+            vhost_default_response_headers: Default::default(),
+            vhost_reservations: Vec::new(),
             ssh_gateway: false,
             ssh_jump_enabled: false,
             ssh_jump_base_domain: None,
@@ -1153,6 +1349,9 @@ mod tests {
             vhost_mode: Some("https".into()),
             vhost_config: Some("/etc/bore/vhost.toml".into()),
             vhost_cert_file: Some("/certs/cert.pem".into()),
+            vhost_default_request_headers: Default::default(),
+            vhost_default_response_headers: Default::default(),
+            vhost_reservations: Vec::new(),
             tls: true,
             ssh_gateway: false,
             ssh_jump_enabled: false,
@@ -1277,6 +1476,9 @@ mod tests {
             active: 5,
             carriers: 2,
             direct_stream_opens: 10,
+            direct_fallbacks: 0,
+            current_path: "relay".to_string(),
+            carrier_target: 1,
             request_headers: vec!["x-custom".into()],
             response_headers: vec!["x-response".into()],
             request_header_pairs: vec![("x-custom".into(), "value1".into())],
@@ -1313,6 +1515,9 @@ mod tests {
             active: 3,
             carriers: 4,
             direct_stream_opens: 7,
+            direct_fallbacks: 0,
+            current_path: "relay".to_string(),
+            carrier_target: 1,
             request_headers: vec![],
             response_headers: vec![],
             request_header_pairs: vec![],

@@ -239,7 +239,7 @@ impl CarrierPool {
     /// that carriers slightly *hurt* on a clean idle path (median c4/c1 ratio
     /// 0.941), so a scheduler that changed behaviour with nothing to schedule
     /// would itself be the regression.
-    pub fn pick_avoiding_bulk(&self) -> Option<(mux::LinkOpener, Arc<AtomicUsize>)> {
+    pub fn pick_avoiding_bulk(&self) -> Option<CarrierPick> {
         let mut carriers = self.carriers.lock().expect("carrier pool mutex");
         carriers.retain(|c| c.alive.load(Ordering::Relaxed));
         if carriers.is_empty() {
@@ -251,11 +251,49 @@ impl CarrierPool {
             .map(|c| c.bulk.load(Ordering::Relaxed))
             .collect();
         let best = choose_carrier(&loads, start);
-        Some((
-            carriers[best].opener.clone(),
-            Arc::clone(&carriers[best].bulk),
-        ))
+        Some(CarrierPick {
+            opener: carriers[best].opener.clone(),
+            bulk: Arc::clone(&carriers[best].bulk),
+            bulk_load: loads[best],
+            pool_len: carriers.len(),
+        })
     }
+
+    /// Bulk occupancy of each live carrier, in pool order.
+    ///
+    /// Diagnostic and test-facing: it is the only way to assert that a transfer
+    /// was actually CLASSIFIED as bulk (and is still holding its slot) rather
+    /// than merely running, which is the difference between testing the phase
+    /// 03.3 trigger and testing that HTTP works.
+    pub fn bulk_loads(&self) -> Vec<usize> {
+        self.carriers
+            .lock()
+            .expect("carrier pool mutex")
+            .iter()
+            .filter(|c| c.alive.load(Ordering::Relaxed))
+            .map(|c| c.bulk.load(Ordering::Relaxed))
+            .collect()
+    }
+}
+
+/// The outcome of one [`CarrierPool::pick_avoiding_bulk`].
+///
+/// Carries the picked carrier's occupancy AT PICK TIME alongside the opener,
+/// because that number is the phase 03.3 growth trigger and it cannot be read
+/// back afterwards without racing: `bulk_load > 0` on the *least*-loaded
+/// carrier means every carrier in the pool is already carrying bulk, which is
+/// exactly "bulk occupies every carrier and another connection arrives".
+pub struct CarrierPick {
+    /// Opener for the selected carrier.
+    pub opener: mux::LinkOpener,
+    /// The selected carrier's bulk-occupancy counter, to be handed to a
+    /// [`BulkTicket`] so the count is released on every exit path.
+    pub bulk: Arc<AtomicUsize>,
+    /// Bulk connections already on the selected carrier, sampled under the pool
+    /// lock before this connection was accounted for.
+    pub bulk_load: usize,
+    /// Live carriers in the pool at pick time.
+    pub pool_len: usize,
 }
 
 /// Index of the carrier to use, given each live carrier's bulk occupancy and
@@ -431,5 +469,39 @@ mod tests {
         // succeeds): the token is gone, no leak.
         assert!(!registry.contains_key("tok-1"));
         assert!(registry.is_empty());
+    }
+    /// A `LinkOpener` over an in-memory duplex, for tests that need a carrier to
+    /// EXIST rather than to open anything through it.
+    fn test_opener() -> mux::LinkOpener {
+        let (a, _b) = tokio::io::duplex(64);
+        // `_b` is dropped: nothing is ever opened on these openers, only counted.
+        mux::LinkOpener::Mux(mux::client(a).0)
+    }
+
+    #[tokio::test]
+    async fn pick_reports_the_chosen_carriers_bulk_load() {
+        // The load AT PICK TIME is the phase 03.3 growth trigger, so it has to
+        // be the load of the carrier actually handed back, not of the cursor
+        // position or of the pool as a whole.
+        // `new` already seeds the pool with the tunnel's own connection.
+        let pool = CarrierPool::new(test_opener());
+        let first = pool.pick_avoiding_bulk().expect("one carrier");
+        assert_eq!(first.bulk_load, 0, "an untouched carrier reports no bulk");
+        assert_eq!(first.pool_len, 1);
+        first.bulk.fetch_add(1, Ordering::Relaxed);
+        let crowded = pool.pick_avoiding_bulk().expect("still one carrier");
+        assert_eq!(
+            crowded.bulk_load, 1,
+            "with only a bulk-loaded carrier available, the pick reports it as crowded"
+        );
+        assert_eq!(pool.bulk_loads(), vec![1]);
+
+        // Add an idle carrier: the least-loaded one wins and reports 0, which is
+        // exactly why a two-carrier pool stops nudging for growth.
+        pool.push(Carrier::new(test_opener()), 4);
+        let spread = pool.pick_avoiding_bulk().expect("two carriers");
+        assert_eq!(spread.bulk_load, 0);
+        assert_eq!(spread.pool_len, 2);
+        assert_eq!(pool.bulk_loads(), vec![1, 0]);
     }
 }

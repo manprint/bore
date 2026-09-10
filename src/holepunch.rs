@@ -2252,8 +2252,87 @@ async fn punch(socket: &UdpSocket, peers: &[SocketAddr]) {
 pub struct QuicTransport {
     recv: quinn::RecvStream,
     send: quinn::SendStream,
+    /// Phase 03.4 send-side scheduling state for THIS stream. Whoever sends the
+    /// bulk demotes itself, so the same code serves both roles (a vhost
+    /// download is sent by the provider; an upload by the server) without
+    /// having to decide in advance which side starves the other.
+    sched: BulkSendState,
     _conn: Connection,
     _endpoint: Endpoint,
+}
+
+/// Bytes one QUIC stream may send before it is treated as bulk and demoted in
+/// the connection's send scheduler (phase 03.4).
+///
+/// Same threshold and the same rationale as the relay's
+/// `pool::BULK_CLASSIFY_BYTES`: classification is by bytes MOVED (DEC-VE4), so
+/// no ordinary asset is ever demoted and every real transfer is demoted
+/// promptly. Deliberately a separate constant — the two paths are calibrated
+/// independently in phase 03.5 and coupling them would hide that.
+#[cfg(feature = "udp")]
+pub const DIRECT_BULK_CLASSIFY_BYTES: u64 = 512 * 1024;
+
+/// quinn send priority for a bulk-classified stream. quinn schedules higher
+/// values first and every stream starts at `0`, so this is the only value that
+/// puts bulk BEHIND ordinary streams without touching anything else.
+///
+/// DEC-VE8: this replaces "give the starved stream more window". Neither
+/// `stream_receive_window` nor `connection_receive_window` moves, and the 16:1
+/// ratio `CLAUDE.md` pins stays exactly as it is.
+#[cfg(feature = "udp")]
+pub const DIRECT_BULK_STREAM_PRIORITY: i32 = -1;
+
+/// quinn streams default to priority `0` and higher values are sent first, so a
+/// non-negative bulk priority would make the demotion a silent no-op. Compile
+/// time, because there is no reason for it to be a runtime question.
+#[cfg(feature = "udp")]
+const _: () = assert!(DIRECT_BULK_STREAM_PRIORITY < 0);
+
+/// Bytes a demoted (bulk) stream may hand to the connection in one write.
+///
+/// Bounds how far ahead one bulk stream can queue between the scheduler's
+/// decisions. It is NOT a rate limit: the copy loop simply comes back for the
+/// rest, and an undemoted stream is never capped, so a single transfer with no
+/// competition is byte-for-byte unaffected.
+#[cfg(feature = "udp")]
+pub const DIRECT_BULK_SEND_BURST: usize = 128 * 1024;
+
+/// Per-stream send-side scheduling state (phase 03.4).
+///
+/// Split out as a plain value type with no quinn types in it, because the two
+/// decisions it encodes — *when* a stream becomes bulk and *how much* a bulk
+/// stream may queue — are the whole of the change and are worth asserting
+/// directly rather than through a live QUIC connection.
+#[cfg(feature = "udp")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BulkSendState {
+    /// Bytes accepted by `poll_write` on this stream so far.
+    sent: u64,
+    /// Whether the stream has already been demoted in the send scheduler.
+    demoted: bool,
+}
+
+#[cfg(feature = "udp")]
+impl BulkSendState {
+    /// How many of `want` bytes to offer the connection in this write.
+    fn allow(&self, want: usize) -> usize {
+        if self.demoted {
+            want.min(DIRECT_BULK_SEND_BURST)
+        } else {
+            want
+        }
+    }
+
+    /// Account `n` accepted bytes. Returns `true` exactly once: on the write
+    /// that takes this stream over the bulk threshold.
+    fn record(&mut self, n: usize) -> bool {
+        self.sent = self.sent.saturating_add(n as u64);
+        if !self.demoted && self.sent >= DIRECT_BULK_CLASSIFY_BYTES {
+            self.demoted = true;
+            return true;
+        }
+        false
+    }
 }
 
 /// An authenticated direct QUIC connection between a consumer and a provider.
@@ -2291,6 +2370,7 @@ impl DirectConn {
         Ok(QuicTransport {
             recv,
             send,
+            sched: BulkSendState::default(),
             _conn: self.conn.clone(),
             _endpoint: self.endpoint.clone(),
         })
@@ -2302,6 +2382,7 @@ impl DirectConn {
         Ok(QuicTransport {
             recv,
             send,
+            sched: BulkSendState::default(),
             _conn: self.conn.clone(),
             _endpoint: self.endpoint.clone(),
         })
@@ -2441,7 +2522,29 @@ impl AsyncWrite for QuicTransport {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf)
+        // Phase 03.4: a bulk stream is capped per write and demoted in the
+        // connection's send scheduler, so a small stream opened later is not
+        // scheduled behind a large in-flight burst. Until a stream crosses the
+        // threshold this is `buf` unchanged and one branch on a bool.
+        let offer = self.sched.allow(buf.len());
+        match AsyncWrite::poll_write(Pin::new(&mut self.send), cx, &buf[..offer]) {
+            Poll::Ready(Ok(n)) => {
+                if self.sched.record(n) {
+                    // `set_priority` fails only on an already-closed stream,
+                    // which the write above would have reported; scheduling is
+                    // an optimization, so a failure here is never fatal.
+                    let priority = DIRECT_BULK_STREAM_PRIORITY;
+                    if self.send.set_priority(priority).is_ok() {
+                        debug!(
+                            bytes = self.sched.sent,
+                            priority, "direct stream classified bulk; demoted in send scheduler"
+                        );
+                    }
+                }
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -4975,5 +5078,43 @@ mod tests {
 
         let _ = done_tx.send(());
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), srv_task).await;
+    }
+    /// Phase 03.4. An ordinary asset must never be demoted or capped, and a
+    /// real transfer must be demoted exactly once — the cheap half of "do not
+    /// assume", asserted directly instead of through a live QUIC connection.
+    #[test]
+    #[cfg(feature = "udp")]
+    fn bulk_send_state_demotes_once_past_the_threshold_and_never_before() {
+        let mut st = BulkSendState::default();
+        // Below the threshold: full buffer offered, nothing demoted.
+        assert_eq!(
+            st.allow(1 << 20),
+            1 << 20,
+            "an unclassified stream is never capped"
+        );
+        assert!(!st.record(4096), "4 KiB is not a bulk transfer");
+        assert!(!st.demoted);
+        assert_eq!(st.allow(1 << 20), 1 << 20);
+
+        // Exactly at the threshold: demoted, and only on that write.
+        let remaining = (DIRECT_BULK_CLASSIFY_BYTES - 4096) as usize;
+        assert!(
+            st.record(remaining),
+            "crossing DIRECT_BULK_CLASSIFY_BYTES must demote the stream"
+        );
+        assert!(st.demoted);
+        assert!(
+            !st.record(1 << 20),
+            "demotion must fire once, not on every subsequent write"
+        );
+
+        // And a demoted stream is capped per write, without changing anything
+        // about the windows (DEC-VE8).
+        assert_eq!(st.allow(1 << 20), DIRECT_BULK_SEND_BURST);
+        assert_eq!(
+            st.allow(1024),
+            1024,
+            "the cap is a ceiling, not a minimum write size"
+        );
     }
 }

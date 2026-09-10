@@ -7,8 +7,20 @@ import { badge, escapeHtml } from '../ui.js';
 // Byte counts should read in MiB, match sibling udp_*_window values.
 const BYTE_KEYS = new Set(['udp_socket_send_buffer', 'udp_socket_recv_buffer']);
 
+// Merged vhost configuration (phase 06.4): header maps and the reservation
+// list are structured values, so the generic String(value) row would render
+// them as "[object Object]".
+const HEADER_MAP_KEYS = new Set([
+    'vhost_default_request_headers',
+    'vhost_default_response_headers',
+]);
+const RESERVATIONS_KEY = 'vhost_reservations';
+
 // Pretty labels for SSH and other config keys
 const PRETTY_LABELS = {
+    'vhost_default_request_headers': 'Vhost Default Request Headers',
+    'vhost_default_response_headers': 'Vhost Default Response Headers',
+    'vhost_reservations': 'Vhost Reservations',
     'ssh_gateway': 'SSH Gateway',
     'ssh_jump_enabled': 'Jump Hosts Enabled',
     'ssh_jump_base_domain': 'Jump Base Domain',
@@ -28,6 +40,48 @@ function fmtMiB(bytes) {
     const mib = bytes / (1024 * 1024);
     const s = Number.isInteger(mib) ? String(mib) : mib.toFixed(2).replace(/\.?0+$/, '');
     return `${s} MiB`;
+}
+
+/**
+ * Render a header map ({name: value}) as one "name: value" line per entry.
+ * Empty map reads as "none" — an operator must be able to tell "no headers
+ * configured" from "the endpoint does not report them" (F-6).
+ */
+function renderHeaderMap(valEl, map) {
+    const names = Object.keys(map).sort();
+    if (names.length === 0) {
+        valEl.textContent = 'none';
+        return;
+    }
+    valEl.className = 'config-value config-value-stack';
+    for (const name of names) {
+        const line = document.createElement('div');
+        line.className = 'config-subvalue';
+        line.textContent = escapeHtml(`${name}: ${map[name]}`);
+        valEl.appendChild(line);
+    }
+}
+
+/**
+ * Render the static subdomain reservations, one line each:
+ * "app → team-a (1 req / 2 resp headers)".
+ */
+function renderReservations(valEl, list) {
+    if (!Array.isArray(list) || list.length === 0) {
+        valEl.textContent = 'none';
+        return;
+    }
+    valEl.className = 'config-value config-value-stack';
+    for (const res of list) {
+        const req = res.headers ? Object.keys(res.headers).length : 0;
+        const resp = res.response_headers ? Object.keys(res.response_headers).length : 0;
+        const line = document.createElement('div');
+        line.className = 'config-subvalue';
+        line.textContent = escapeHtml(
+            `${res.subdomain} \u2192 ${res.client_id} (${req} req / ${resp} resp headers)`
+        );
+        valEl.appendChild(line);
+    }
 }
 
 /**
@@ -78,7 +132,11 @@ export default {
             const valEl = document.createElement('div');
             valEl.className = 'config-value';
 
-            if (value === null) {
+            if (HEADER_MAP_KEYS.has(key)) {
+                renderHeaderMap(valEl, value || {});
+            } else if (key === RESERVATIONS_KEY) {
+                renderReservations(valEl, value);
+            } else if (value === null) {
                 if (BYTE_KEYS.has(key)) {
                     valEl.textContent = 'auto (OS default)';
                 } else {

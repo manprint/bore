@@ -151,6 +151,37 @@ pub(crate) async fn bind_public_listener(
     }
 }
 
+/// Log a finished connection's error at the level it deserves (F-3, phase 06.3).
+///
+/// An ordinary client close — the missing TLS `close_notify` every browser and
+/// `curl` produces, a reset, a broken pipe — is `debug!`; anything else stays
+/// `warn!`. 718 of 786 warnings in a 3 h staging window were the first kind,
+/// which buried the one line that mattered. Same rule and same warning as the
+/// secret path's benign hole-punch strays (BUG-S3): **do not re-promote these
+/// to `warn!`** — the classification is by error KIND, so a real protocol or
+/// certificate failure is unaffected.
+fn log_connection_exit(err: &anyhow::Error) {
+    if crate::shared::is_benign_disconnect(err) {
+        debug!(%err, "connection closed by peer");
+    } else {
+        warn!(%err, "connection exited with error");
+    }
+}
+
+/// The TLS-handshake half of [`log_connection_exit`].
+///
+/// A handshake that ends in EOF is a browser abandoning a speculative or
+/// preconnect socket it never used — the same behaviour that made the I-SSH9
+/// misroute possible — not an operator's problem. A certificate or protocol
+/// failure carries a different error kind and still warns.
+fn log_tls_handshake_failure(err: &std::io::Error) {
+    if crate::shared::is_benign_io_error(err) {
+        debug!(%err, "TLS handshake abandoned by peer");
+    } else {
+        warn!(%err, "TLS handshake failed");
+    }
+}
+
 /// Logs an SSH gateway connection's outcome: the zombie-entry reaper's own
 /// keepalive-timeout disconnect (I-3) is escalated to `warn!` — it means a
 /// half-open/unresponsive client was reaped, unlike an ordinary
@@ -490,6 +521,9 @@ impl Server {
                 vhost_mode: None,
                 vhost_config: None,
                 vhost_cert_file: None,
+                vhost_default_request_headers: Default::default(),
+                vhost_default_response_headers: Default::default(),
+                vhost_reservations: Vec::new(),
                 tls: false,
                 ssh_gateway: false,
                 ssh_jump_enabled: false,
@@ -1543,7 +1577,7 @@ impl Server {
                                             }
                                         }
                                         Err(err) => {
-                                            warn!(%err, "TLS handshake failed");
+                                            log_tls_handshake_failure(&err);
                                             return;
                                         }
                                     },
@@ -1558,7 +1592,7 @@ impl Server {
                                 };
                                 match result {
                                     Ok(_) => info!("connection exited"),
-                                    Err(err) => warn!(%err, "connection exited with error"),
+                                    Err(err) => log_connection_exit(&err),
                                 }
                                 return;
                             }
@@ -1570,7 +1604,7 @@ impl Server {
                                 let result = this.route_connection(prefixed, addr).await;
                                 match result {
                                     Ok(_) => info!("connection exited"),
-                                    Err(err) => warn!(%err, "connection exited with error"),
+                                    Err(err) => log_connection_exit(&err),
                                 }
                                 return;
                             }
@@ -1582,7 +1616,7 @@ impl Server {
                         Some(acceptor) => match acceptor.accept(stream).await {
                             Ok(tls) => this.route_connection(tls, addr).await,
                             Err(err) => {
-                                warn!(%err, "TLS handshake failed");
+                                log_tls_handshake_failure(&err);
                                 return;
                             }
                         },
@@ -1590,7 +1624,7 @@ impl Server {
                     };
                     match result {
                         Ok(_) => info!("connection exited"),
-                        Err(err) => warn!(%err, "connection exited with error"),
+                        Err(err) => log_connection_exit(&err),
                     }
                 }
                 .instrument(info_span!("control", ?addr)),
@@ -1930,6 +1964,7 @@ impl Server {
                 backend_tls,
                 backend_tls_sni,
                 ctrl_heartbeat,
+                auto_carriers,
             }) => {
                 let Some(cfg) = self.vhost_config.clone() else {
                     warn!("vhost not configured on this server");
@@ -1967,6 +2002,9 @@ impl Server {
                     backend_tls_sni,
                     // Reap only what declared it can be reaped (DEC-VE2).
                     ctrl_heartbeat.then_some(self.vhost_ctrl_timeout),
+                    // Grow the pool only for a provider that can receive the
+                    // request (same reason, same pattern).
+                    auto_carriers,
                 )
                 .await
             }

@@ -1414,6 +1414,17 @@ pub enum ClientMessage {
         /// client omits it ⇒ reads as `false` ⇒ the pre-feature behaviour).
         #[serde(default)]
         ctrl_heartbeat: bool,
+
+        /// Whether this provider left its carrier count to the server
+        /// (`--carriers 0`), so the server may resize the pool on demand with
+        /// [`ServerMessage::SetCarrierTarget`].
+        ///
+        /// When `false` the pool is exactly what the operator asked for and the
+        /// server NEVER sends that message — an old client cannot deserialize
+        /// an unknown `ServerMessage` variant, and on this wire that is a hard
+        /// error on its control loop rather than a skipped field.
+        #[serde(default)]
+        auto_carriers: bool,
     },
 
     /// Ask the server to issue a fresh vhost-UDP nonce so the provider can
@@ -1768,6 +1779,68 @@ pub enum ServerMessage {
     /// Non-fatal advisory from the server. The client prints it and CONTINUES.
     /// Sent only to policy-aware clients (they sent https_policy = Some). Old clients never receive it.
     Warning(String),
+
+    /// Tell a vhost provider how many carriers the server currently wants in
+    /// its pool, including the original control connection (phase 03.3).
+    ///
+    /// It is a REQUEST, never a command. Raising the target asks the provider to
+    /// dial the shortfall with the carrier token it already holds; a provider
+    /// that cannot dial simply keeps the pool it has. LOWERING the target only
+    /// stops the provider from REPLACING carriers that die — it never closes a
+    /// live one, because a proxied connection is pinned to its carrier for its
+    /// whole life (`CLAUDE.md` N-5, no migration, no striping) and churning
+    /// carriers is itself a known hazard (VH-2). That is the whole of "shrink"
+    /// on this path, and it is deliberate (DEC-VE9).
+    ///
+    /// Sent ONLY to a provider that declared `HelloVhost::auto_carriers`, for
+    /// the same reason as [`ServerMessage::Warning`]: an old client cannot
+    /// deserialize an unknown variant, and on this wire that is a hard error on
+    /// its control loop, not a skipped field.
+    SetCarrierTarget {
+        /// Total carriers wanted, including the original connection. Never
+        /// above the server's `--max-carriers`, never below 1.
+        target: u16,
+    },
+}
+
+/// Whether a connection-teardown error is ordinary client behaviour rather than
+/// a problem worth an operator's attention (F-3, phase 06.3).
+///
+/// **Measured:** 718 of 786 warnings in a 3 h staging window were
+/// `peer closed connection without sending TLS close_notify` — what every
+/// browser and `curl` does when it is finished — and a further 32 were TLS
+/// handshake EOFs, which is what a browser's speculative/preconnect sockets do
+/// when they are abandoned unused (the same behaviour that made the I-SSH9
+/// misroute possible). At WARN they train operators to ignore the log, which is
+/// worse than silence: the single genuinely important line in that window (a
+/// held-forever subdomain) sat in the same stream.
+///
+/// The project already holds this principle on the secret path — "benign
+/// hole-punch strays are `debug`, never `WARN`" (BUG-S3) — including its
+/// explicit instruction not to restore the per-event WARN later. **Do not
+/// re-promote these.** A genuinely abnormal termination still warns, because
+/// this matches on the error KIND, not on the message text.
+pub fn is_benign_disconnect(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(is_benign_io_error)
+}
+
+/// The `std::io::Error` half of [`is_benign_disconnect`].
+///
+/// Kind-based on purpose. rustls reports a missing `close_notify` as
+/// `UnexpectedEof` with that message, so matching the kind covers it without
+/// pinning a dependency's wording — and it cannot accidentally swallow a
+/// protocol or certificate error, which carry different kinds.
+pub fn is_benign_io_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
+    )
 }
 
 #[doc(hidden)]
@@ -1934,6 +2007,9 @@ impl ControlFrameSummary for ServerMessage {
             ServerMessage::Hello(port) => format!("Hello {{ port={} }}", port),
             ServerMessage::CarrierToken { token: _, extra } => {
                 format!("CarrierToken {{ token=<redacted>, extra={} }}", extra)
+            }
+            ServerMessage::SetCarrierTarget { target } => {
+                format!("SetCarrierTarget {{ target={} }}", target)
             }
             ServerMessage::Ok => "Ok".to_string(),
             ServerMessage::Heartbeat => "Heartbeat".to_string(),
@@ -2179,6 +2255,57 @@ impl<U: AsyncRead + AsyncWrite + Unpin> Delimited<U> {
 
 #[cfg(test)]
 mod tests {
+
+    /// F-3 / phase 06.3. The classification has to hold for the exact error
+    /// that flooded the log (rustls reports a missing `close_notify` as
+    /// `UnexpectedEof`) AND has to leave a genuine failure alone, or the demote
+    /// would hide real problems instead of the noise.
+    #[test]
+    fn benign_disconnects_are_recognized_and_real_failures_are_not() {
+        use std::io::{Error, ErrorKind};
+
+        // What 718 of 786 staging warnings actually were.
+        let close_notify = Error::new(
+            ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        );
+        assert!(is_benign_io_error(&close_notify));
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NotConnected,
+        ] {
+            assert!(
+                is_benign_io_error(&Error::new(kind, "peer went away")),
+                "{kind:?} is ordinary client behaviour"
+            );
+        }
+
+        // A certificate or protocol failure must still reach an operator.
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::PermissionDenied,
+            ErrorKind::TimedOut,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !is_benign_io_error(&Error::new(kind, "bad certificate")),
+                "{kind:?} must keep warning"
+            );
+        }
+
+        // And it must survive being wrapped in context, which is how these
+        // errors actually arrive at the log site.
+        let wrapped = anyhow::Error::new(close_notify).context("relaying vhost response");
+        assert!(is_benign_disconnect(&wrapped));
+        let real = anyhow::Error::new(Error::new(ErrorKind::InvalidData, "bad record mac"))
+            .context("relaying vhost response");
+        assert!(!is_benign_disconnect(&real));
+        // An error with no io cause at all is not benign by default.
+        assert!(!is_benign_disconnect(&anyhow::anyhow!("no live carrier")));
+    }
     use super::*;
     use tokio::net::TcpListener;
 
@@ -2447,6 +2574,7 @@ mod tests {
             backend_tls: true,
             backend_tls_sni: Some("app.internal".into()),
             ctrl_heartbeat: false,
+            auto_carriers: false,
         };
         let back: ClientMessage =
             serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
@@ -2477,6 +2605,7 @@ mod tests {
         {
             ClientMessage::HelloVhost {
                 ctrl_heartbeat,
+                auto_carriers,
                 subdomain,
                 ..
             } => {
@@ -2485,6 +2614,11 @@ mod tests {
                     !ctrl_heartbeat,
                     "a client that omits ctrl_heartbeat must read as false, or the \
                      server would reap a provider that cannot send heartbeats"
+                );
+                assert!(
+                    !auto_carriers,
+                    "a client that omits auto_carriers must read as false, or the \
+                     server would send it a SetCarrierTarget it cannot deserialize"
                 );
             }
             other => panic!("unexpected message: {other:?}"),
@@ -2506,11 +2640,21 @@ mod tests {
             backend_tls: false,
             backend_tls_sni: None,
             ctrl_heartbeat: true,
+            auto_carriers: true,
         };
         match serde_json::from_str::<ClientMessage>(&serde_json::to_string(&full).unwrap()).unwrap()
         {
-            ClientMessage::HelloVhost { ctrl_heartbeat, .. } => {
+            ClientMessage::HelloVhost {
+                ctrl_heartbeat,
+                auto_carriers,
+                ..
+            } => {
                 assert!(ctrl_heartbeat, "ctrl_heartbeat must round-trip on the wire");
+                assert!(
+                    auto_carriers,
+                    "auto_carriers must round-trip on the wire; it is what gates \
+                     the server->client SetCarrierTarget message"
+                );
             }
             other => panic!("unexpected message: {other:?}"),
         }
@@ -2952,6 +3096,7 @@ fn hello_vhost_round_trips_and_fits_frame() {
         backend_tls: false,
         backend_tls_sni: None,
         ctrl_heartbeat: false,
+        auto_carriers: false,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(
@@ -3542,6 +3687,7 @@ fn hello_vhost_serde_omits_default_policy() {
         backend_tls: false,
         backend_tls_sni: None,
         ctrl_heartbeat: false,
+        auto_carriers: false,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let round: ClientMessage = serde_json::from_str(&json).unwrap();

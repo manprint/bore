@@ -1,12 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-#[cfg(feature = "udp")]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-#[cfg(feature = "udp")]
 use bore_cli::vhost::VhostRegistry;
 use bore_cli::{
     client::{Client, ProviderMeta},
@@ -3541,6 +3539,9 @@ fn hello_vhost_live(subdomain: &str, ctrl_heartbeat: bool) -> ClientMessage {
         backend_tls: false,
         backend_tls_sni: None,
         ctrl_heartbeat,
+        // The liveness group tests the reaper, not the pool; a fixed
+        // `carriers: 1` provider is never sent a carrier-target request.
+        auto_carriers: false,
     }
 }
 
@@ -3713,6 +3714,508 @@ async fn vhost_real_client_survives_past_the_reap_deadline() -> Result<()> {
     assert!(
         response.contains("200 OK"),
         "the tunnel must still serve after idling past several reap deadlines: {response}"
+    );
+    Ok(())
+}
+
+// ─── Auto-carrier group (phase 03.3, serial, control=17968..17973) ───────────
+//
+// `bore vhost --carriers 0` leaves the count to the server: the pool starts at
+// one carrier — §2.15 A2 measured a median c4/c1 throughput ratio of 0.941 on a
+// clean idle path, so extra carriers are a cost when nothing is contending —
+// and the server raises the target by one whenever a proxied connection has to
+// be placed on a carrier that is ALREADY carrying bulk, which is §2.16's
+// measured head-of-line regime.
+//
+// The trigger is observable server-side (bytes moved per carrier) rather than
+// inferred from loss, which is why it is implementable at all.
+
+const AUTO_GROW: (u16, u16) = (17968, 17969);
+const AUTO_IDLE: (u16, u16) = (17970, 17971);
+const AUTO_SHRINK: (u16, u16) = (17972, 17973);
+
+/// Bytes the relay must move on one connection before it counts as bulk.
+/// Mirrors `pool::BULK_CLASSIFY_BYTES`; asserted against it below so the two
+/// cannot drift apart silently.
+const BULK_BYTES: usize = 512 * 1024;
+
+/// Spawn a vhost server with a carrier ceiling of `max_carriers` and return its
+/// registry so a test can read the live pool and target.
+async fn spawn_auto_server(
+    (control_port, http_port): (u16, u16),
+    max_carriers: u16,
+) -> Result<VhostRegistry> {
+    wait_port(control_port, false).await;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(control_port);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_max_carriers(max_carriers);
+    server.set_vhost(http_config("bore.local", http_port))?;
+    let registry = server.vhost_registry();
+    tokio::spawn(server.listen());
+    wait_port(control_port, true).await;
+    wait_port(http_port, true).await;
+    Ok(registry)
+}
+
+/// Backend with two shapes on one port:
+/// * `/bulk` — a long response that sends `BULK_BYTES * 2` promptly and then
+///   PARKS, so the connection stays open and its carrier stays occupied while
+///   the test does something else. That parking is the whole point: a bulk
+///   transfer that had already finished would have released its carrier slot.
+/// * anything else — a short 200 that closes.
+async fn spawn_bulk_backend() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                if head.contains("/bulk") {
+                    // Content-Length is deliberately larger than what is sent,
+                    // so the public reader never sees EOF and the connection
+                    // stays live and classified while the test proceeds.
+                    let total = BULK_BYTES * 8;
+                    let _ = sock
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {total}\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    let chunk = vec![b'B'; 64 * 1024];
+                    for _ in 0..(BULK_BYTES * 2 / chunk.len()) {
+                        if sock.write_all(&chunk).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = sock.flush().await;
+                    // Park: hold the connection (and therefore the carrier)
+                    // until the test drops its end.
+                    let mut sink = [0u8; 1];
+                    let _ = sock.read(&mut sink).await;
+                } else {
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nsmall",
+                        )
+                        .await;
+                    let _ = sock.flush().await;
+                }
+            });
+        }
+    });
+    Ok(port)
+}
+
+/// Start a `--carriers 0` (auto) vhost provider against `control_port`.
+async fn spawn_auto_provider(backend_port: u16, control_port: u16, subdomain: &str) -> Result<()> {
+    let client = Client::new_vhost_provider(
+        "localhost",
+        backend_port,
+        &format!("127.0.0.1:{control_port}"),
+        subdomain,
+        "auto",
+        None,
+        false,
+        0,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    Ok(())
+}
+
+/// Poll a predicate over the live entry until it holds or `ms` elapse.
+async fn wait_entry<F: Fn(&bore_cli::vhost::VhostEntry) -> bool>(
+    registry: &VhostRegistry,
+    subdomain: &str,
+    ms: u64,
+    pred: F,
+) -> bool {
+    for _ in 0..(ms / 20).max(1) {
+        if let Some(entry) = registry.get(subdomain) {
+            if pred(&entry) {
+                return true;
+            }
+        }
+        time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// Open `GET path` against the vhost HTTP port and read at least `want` body
+/// bytes, returning the still-open socket so the connection stays live.
+async fn open_and_drain(http_port: u16, host: &str, path: &str, want: usize) -> Result<TcpStream> {
+    let mut sock = TcpStream::connect(("127.0.0.1", http_port)).await?;
+    sock.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await?;
+    let mut seen = 0usize;
+    let mut buf = vec![0u8; 64 * 1024];
+    while seen < want {
+        let n = time::timeout(Duration::from_secs(10), sock.read(&mut buf)).await??;
+        if n == 0 {
+            anyhow::bail!("backend closed after {seen} bytes, wanted {want}");
+        }
+        seen += n;
+    }
+    Ok(sock)
+}
+
+#[tokio::test]
+async fn vhost_auto_carriers_grow_when_bulk_occupies_every_carrier() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    assert_eq!(
+        BULK_BYTES as u64,
+        bore_cli::pool::BULK_CLASSIFY_BYTES,
+        "this test's notion of 'bulk' must be the relay's own threshold"
+    );
+    let registry = spawn_auto_server(AUTO_GROW, 4).await?;
+    let backend = spawn_bulk_backend().await?;
+    spawn_auto_provider(backend, AUTO_GROW.0, "autogrow").await?;
+    assert!(
+        wait_entry(&registry, "autogrow", 3000, |_| true).await,
+        "the auto provider must register"
+    );
+    // The whole point of auto: it starts at one carrier.
+    assert!(
+        wait_entry(&registry, "autogrow", 1000, |e| e.pool.len() == 1
+            && e.carrier_target.load(Ordering::Relaxed) == 1)
+        .await,
+        "an auto tunnel starts with exactly one carrier and a target of 1"
+    );
+
+    // A bulk transfer takes the only carrier and holds it.
+    let _bulk = open_and_drain(AUTO_GROW.1, "autogrow.bore.local", "/bulk", BULK_BYTES + 1).await?;
+    assert!(
+        wait_entry(&registry, "autogrow", 3000, |e| e.pool.bulk_loads()
+            == vec![1])
+        .await,
+        "the bulk transfer must be classified and occupy the single carrier"
+    );
+
+    // Now an ordinary request arrives and has nowhere uncontended to go.
+    let small = send_http(AUTO_GROW.1, "autogrow.bore.local", "/small").await?;
+    assert!(
+        small.contains("200 OK"),
+        "the small request still succeeds: {small}"
+    );
+
+    assert!(
+        wait_entry(&registry, "autogrow", 5000, |e| e
+            .carrier_target
+            .load(Ordering::Relaxed)
+            >= 2)
+        .await,
+        "the server must raise the carrier target when bulk occupies every carrier"
+    );
+    assert!(
+        wait_entry(&registry, "autogrow", 5000, |e| e.pool.len() >= 2).await,
+        "and the provider must actually dial the extra carrier it was asked for"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn vhost_auto_carriers_idle_tunnel_never_grows() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    let registry = spawn_auto_server(AUTO_IDLE, 4).await?;
+    let backend = spawn_bulk_backend().await?;
+    spawn_auto_provider(backend, AUTO_IDLE.0, "autoidle").await?;
+    assert!(
+        wait_entry(&registry, "autoidle", 3000, |_| true).await,
+        "the auto provider must register"
+    );
+
+    // Ordinary traffic, none of it bulk: no carrier is ever crowded, so nothing
+    // may grow. This is the half that keeps auto from being "always 4".
+    for _ in 0..6 {
+        let resp = send_http(AUTO_IDLE.1, "autoidle.bore.local", "/small").await?;
+        assert!(resp.contains("200 OK"), "small request: {resp}");
+    }
+    time::sleep(Duration::from_millis(1500)).await;
+
+    let entry = registry.get("autoidle").expect("tunnel still registered");
+    assert_eq!(
+        entry.carrier_target.load(Ordering::Relaxed),
+        1,
+        "an idle tunnel must keep a target of exactly 1 carrier"
+    );
+    assert_eq!(
+        entry.pool.len(),
+        1,
+        "and must never dial a second carrier it has no use for"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn vhost_auto_carriers_target_decays_after_a_quiet_period() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    // Test-only override: the real quiet period is a minute (see
+    // `CARRIER_QUIET_PERIOD`), which is not a thing to spend per assertion.
+    std::env::set_var("BORE_VHOST_CARRIER_QUIET_MS", "300");
+    let registry = spawn_auto_server(AUTO_SHRINK, 4).await?;
+    let backend = spawn_bulk_backend().await?;
+    spawn_auto_provider(backend, AUTO_SHRINK.0, "autoshrink").await?;
+    assert!(
+        wait_entry(&registry, "autoshrink", 3000, |_| true).await,
+        "the auto provider must register"
+    );
+
+    let bulk = open_and_drain(
+        AUTO_SHRINK.1,
+        "autoshrink.bore.local",
+        "/bulk",
+        BULK_BYTES + 1,
+    )
+    .await?;
+    assert!(
+        wait_entry(&registry, "autoshrink", 3000, |e| e.pool.bulk_loads()
+            == vec![1])
+        .await,
+        "the bulk transfer must occupy the single carrier"
+    );
+    let _ = send_http(AUTO_SHRINK.1, "autoshrink.bore.local", "/small").await?;
+    assert!(
+        wait_entry(&registry, "autoshrink", 5000, |e| e
+            .carrier_target
+            .load(Ordering::Relaxed)
+            >= 2)
+        .await,
+        "the target must rise first, or the decay below proves nothing"
+    );
+    let grown_pool = registry
+        .get("autoshrink")
+        .map(|e| e.pool.len())
+        .unwrap_or(0);
+
+    // Release the bulk transfer and go quiet.
+    drop(bulk);
+    assert!(
+        wait_entry(&registry, "autoshrink", 5000, |e| e
+            .carrier_target
+            .load(Ordering::Relaxed)
+            == 1)
+        .await,
+        "a quiet tunnel must decay back to a target of one carrier"
+    );
+    // DEC-VE9: decay lowers the TARGET; it never closes a carrier that is
+    // already established, because a proxied connection is pinned to its
+    // carrier for its whole life and churning carriers is its own hazard (VH-2).
+    let entry = registry.get("autoshrink").expect("tunnel still registered");
+    assert!(
+        entry.pool.len() >= grown_pool.min(entry.pool.len()).max(1),
+        "decay must not tear down live carriers"
+    );
+    let resp = send_http(AUTO_SHRINK.1, "autoshrink.bore.local", "/small").await?;
+    assert!(
+        resp.contains("200 OK"),
+        "and the tunnel must still serve after decaying: {resp}"
+    );
+    std::env::remove_var("BORE_VHOST_CARRIER_QUIET_MS");
+    Ok(())
+}
+
+// ─── Origin-failure group (phase 05.2/05.3, serial, control=17974..17979) ────
+//
+// A provider that cannot reach its origin used to produce `http=000` — a bare
+// connection close with no status line, which is indistinguishable from "the
+// tunnel is gone", "the server is down" and "the network broke". An unknown
+// subdomain already returned 404 and a restored origin already served 200 on
+// the same tunnel, so routing was never the problem; it was specifically the
+// provider-side connect failure that produced nothing.
+
+const DEAD_PLAIN: (u16, u16) = (17974, 17975);
+const DEAD_INJECT: (u16, u16) = (17976, 17977);
+#[cfg(feature = "udp")]
+const PATH_VIEW: (u16, u16) = (17978, 17979);
+
+/// A port with nothing listening on it: bind, read the number, drop.
+async fn dead_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    wait_port(port, false).await;
+    Ok(port)
+}
+
+/// Vhost config that injects a response header, so the relay takes the
+/// header-injection path instead of the pure splice. The two paths synthesize
+/// the 502 in different places and both have to.
+fn inject_config(base_domain: &str, http_port: u16) -> VhostConfig {
+    let mut default_response_headers = BTreeMap::new();
+    default_response_headers.insert("X-Injected".to_string(), "yes".to_string());
+    VhostConfig {
+        default_response_headers,
+        ..http_config(base_domain, http_port)
+    }
+}
+
+async fn spawn_dead_origin_provider(control_port: u16, subdomain: &str) -> Result<u16> {
+    let port = dead_port().await?;
+    let client = Client::new_vhost_provider(
+        "localhost",
+        port,
+        &format!("127.0.0.1:{control_port}"),
+        subdomain,
+        "dead",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    Ok(port)
+}
+
+#[tokio::test]
+async fn vhost_dead_origin_answers_502_on_the_plain_path() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    let registry = spawn_auto_server(DEAD_PLAIN, 4).await?;
+    spawn_dead_origin_provider(DEAD_PLAIN.0, "deadplain").await?;
+    assert!(
+        wait_entry(&registry, "deadplain", 3000, |_| true).await,
+        "the provider must register even though its origin is down"
+    );
+
+    let response = send_http(DEAD_PLAIN.1, "deadplain.bore.local", "/").await?;
+    assert!(
+        response.contains("502 Bad Gateway"),
+        "a provider that cannot reach its origin must answer 502, not close the \
+         connection with no status line: {response:?}"
+    );
+    assert!(
+        response.contains("bore: the tunnelled origin is unreachable."),
+        "and the body must say what happened: {response:?}"
+    );
+
+    // The tunnel itself is fine: the same registration keeps serving.
+    let again = send_http(DEAD_PLAIN.1, "deadplain.bore.local", "/other").await?;
+    assert!(
+        again.contains("502 Bad Gateway"),
+        "a synthesized 502 must not poison the tunnel: {again:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn vhost_dead_origin_answers_502_on_the_injection_path() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    wait_port(DEAD_INJECT.0, false).await;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(DEAD_INJECT.0);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_vhost(inject_config("bore.local", DEAD_INJECT.1))?;
+    let registry = server.vhost_registry();
+    tokio::spawn(server.listen());
+    wait_port(DEAD_INJECT.0, true).await;
+    wait_port(DEAD_INJECT.1, true).await;
+
+    spawn_dead_origin_provider(DEAD_INJECT.0, "deadinject").await?;
+    assert!(
+        wait_entry(&registry, "deadinject", 3000, |_| true).await,
+        "the provider must register even though its origin is down"
+    );
+
+    let response = send_http(DEAD_INJECT.1, "deadinject.bore.local", "/").await?;
+    assert!(
+        response.contains("502 Bad Gateway"),
+        "the header-injection path must synthesize the 502 too — it reads the \
+         response head itself and used to write nothing when there was none: {response:?}"
+    );
+    assert!(
+        response.contains("bore: the tunnelled origin is unreachable."),
+        "including the body, which is the small write that a missing flush loses: {response:?}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "udp")]
+#[tokio::test]
+async fn vhost_direct_path_view_flips_to_relay_and_counts_the_fallback() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    wait_port(PATH_VIEW.0, false).await;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(PATH_VIEW.0);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(true);
+    server.set_vhost(http_config("bore.local", PATH_VIEW.1))?;
+    // A real port: the provider is handed this number in the UDP offer, so 0
+    // (ephemeral) would advertise a port nothing is listening on.
+    server.set_vhost_quic_port(18042);
+    let registry = server.vhost_registry();
+    tokio::spawn(server.listen());
+    wait_port(PATH_VIEW.0, true).await;
+    wait_port(PATH_VIEW.1, true).await;
+
+    let body_port = spawn_http_stub("direct-or-relay").await;
+    let client = Client::new_vhost_provider_with_udp(
+        "localhost",
+        body_port,
+        &format!("127.0.0.1:{}", PATH_VIEW.0),
+        "pathview",
+        "pv",
+        None,
+        false,
+        1,
+        true,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    wait_for_vhost_direct(&registry, "pathview", true).await;
+
+    // On the direct path: the SUCCESS counter moves and the live path says so.
+    let response = send_http(PATH_VIEW.1, "pathview.bore.local", "/").await?;
+    assert!(response.contains("200 OK"), "direct request: {response:?}");
+    let entry = registry.get("pathview").expect("registered");
+    assert_eq!(
+        entry.last_path.load(Ordering::Relaxed),
+        bore_cli::vhost::VHOST_PATH_DIRECT,
+        "a request served over QUIC must report the direct path"
+    );
+    assert!(
+        entry.direct_stream_opens.load(Ordering::Relaxed) >= 1,
+        "a successful direct open must be counted"
+    );
+    assert_eq!(
+        entry.direct_fallbacks.load(Ordering::Relaxed),
+        0,
+        "nothing has fallen back yet"
+    );
+    drop(entry);
+
+    // Kill the direct connection: the SAME tunnel must keep serving on the warm
+    // relay, the fallback must be counted, and the live path must say "relay" —
+    // the state that used to be invisible (attempts climbing, fallbacks at 0).
+    close_vhost_direct(&registry, "pathview");
+    wait_for_vhost_direct(&registry, "pathview", false).await;
+    let response = send_http(PATH_VIEW.1, "pathview.bore.local", "/").await?;
+    assert!(
+        response.contains("200 OK"),
+        "the fallback must serve the request, not fail it: {response:?}"
+    );
+    let entry = registry.get("pathview").expect("still registered");
+    assert_eq!(
+        entry.last_path.load(Ordering::Relaxed),
+        bore_cli::vhost::VHOST_PATH_RELAY,
+        "after falling back, the live path must report relay"
+    );
+    assert!(
+        entry.direct_fallbacks.load(Ordering::Relaxed) >= 1,
+        "and the fallback must be counted — it stayed at 0 through a measured \
+         total UDP blackout, which is what made the failure invisible"
     );
     Ok(())
 }

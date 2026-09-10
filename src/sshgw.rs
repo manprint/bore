@@ -1155,7 +1155,15 @@ impl GatewayHandler {
                 direct: vhost::DirectPool::default(),
                 #[cfg(feature = "udp")]
                 direct_stream_opens: AtomicU64::new(0),
+                #[cfg(feature = "udp")]
+                direct_fallbacks: AtomicU64::new(0),
+                last_path: std::sync::atomic::AtomicU8::new(crate::vhost::VHOST_PATH_UNKNOWN),
                 active: Arc::new(AtomicUsize::new(0)),
+                carrier_target: Arc::new(AtomicUsize::new(1)),
+                // SSH-registered vhosts keep the pool the gateway built for
+                // them; there is no carrier-growth protocol on the SSH leg
+                // (I-SSH2: the SSH leg is TCP relay only, no carriers).
+                carrier_nudge: None,
                 webserver_log: params.webserver_log,
                 https_policy: params.https_policy,
                 backend_tls: params.backend_tls,

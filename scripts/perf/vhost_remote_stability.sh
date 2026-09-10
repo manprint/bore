@@ -91,6 +91,13 @@ else echo "  REGISTRATION FAILED"; fi
 
 g5|all)
 echo "== G5 origin faults: dead origin, closed port, unknown subdomain =="
+# Phase 05.2 expectation: an unreachable origin must answer 502 (it answered
+# nothing at all — curl reports http=000 — before that change), while an unknown
+# subdomain stays 404 and a restored origin stays 200 on the SAME tunnel.
+verdict(){ # label expected actual
+  if [ "$3" = "$2" ]; then echo "    VERDICT $1: PASS (http=$3)";
+  else echo "    VERDICT $1: FAIL (expected $2, got $3)"; fi; }
+code(){ curl -s -o /dev/null -m 25 -w '%{http_code}' "$1"; }
 # A dedicated origin on its own port so killing it cannot disturb the other cases.
 python3 $H/bench_origin.py 5053 > $OUT/origin5053.log 2>&1 &
 O2=$!; KIDS+=("$O2")
@@ -104,11 +111,13 @@ if present "$L"; then
   kill -9 $O2 2>/dev/null; sleep 2
   echo "  origin dead, tunnel up:  $(curl -s -o /dev/null -m 25 -w 'http=%{http_code} t=%{time_total}' https://$L.${BORE_HOST}/ping)"
   echo "  second request:          $(curl -s -o /dev/null -m 25 -w 'http=%{http_code} t=%{time_total}' https://$L.${BORE_HOST}/ping)"
+  verdict "dead origin -> 502" 502 "$(code https://$L.${BORE_HOST}/ping)"
   echo "  entry after origin died: $(entry "$L")  provider_alive=$(kill -0 $P 2>/dev/null && echo yes || echo no)"
   python3 $H/bench_origin.py 5053 > $OUT/origin5053b.log 2>&1 &
   O3=$!; KIDS+=("$O3")
   for i in $(seq 40); do curl -fsS -m 2 -o /dev/null http://127.0.0.1:5053/ping 2>/dev/null && break; sleep 0.25; done
   echo "  origin back, same tunnel: $(curl -s -o /dev/null -m 25 -w 'http=%{http_code} t=%{time_total}' https://$L.${BORE_HOST}/ping)"
+  verdict "restored origin -> 200" 200 "$(code https://$L.${BORE_HOST}/ping)"
   kill -9 $O3 $P 2>/dev/null; wait_gone "$L" 20
 else echo "  REGISTRATION FAILED: $(tail -2 $OUT/$L.log)"; fi
 # a tunnel pointed at a port nothing listens on
@@ -118,9 +127,12 @@ P2=$!; KIDS+=("$P2")
 for i in $(seq 40); do present "$L2" && break; sleep 0.5; done
 if present "$L2"; then
   echo "  origin closed (port 1):  $(curl -s -o /dev/null -m 25 -w 'http=%{http_code} t=%{time_total}' https://$L2.${BORE_HOST}/ping)"
+  verdict "closed origin port -> 502" 502 "$(code https://$L2.${BORE_HOST}/ping)"
   kill -9 $P2 2>/dev/null; wait_gone "$L2" 20
 else echo "  L2 did not register"; fi
-echo "  unknown subdomain:       $(curl -s -o /dev/null -m 20 -w 'http=%{http_code} t=%{time_total}' https://doesnotexist$(date +%s).${BORE_HOST}/ping)"
+UNK=doesnotexist$(date +%s)
+echo "  unknown subdomain:       $(curl -s -o /dev/null -m 20 -w 'http=%{http_code} t=%{time_total}' https://$UNK.${BORE_HOST}/ping)"
+verdict "unknown subdomain -> 404" 404 "$(code https://$UNK.${BORE_HOST}/ping)"
 ;;&
 
 g6|all)
@@ -132,6 +144,10 @@ if up "$L" --carriers 1 --udp; then
   curl -fsS -o /dev/null -m 20 "https://$L.${BORE_HOST}/100k"
   d1=$(adm vhost | jq -r --arg l "$L" '.[]|select(.subdomain==$l)|.direct_stream_opens')
   echo "  direct before: opens $d0 -> $d1"
+  # Phase 05.3: `current_path` is the field an operator actually reads, and
+  # `direct_fallbacks` is the one that stayed at 0 through the whole blackout
+  # before this change while the opens counter kept climbing (F-14).
+  echo "  path/fallbacks before: $(adm vhost | jq -r --arg l "$L" '.[]|select(.subdomain==$l)|"path=\(.current_path) fallbacks=\(.direct_fallbacks)"')"
   echo "  throughput before: $(curl -s -o /dev/null -m 30 -w '%{speed_download}' https://$L.${BORE_HOST}/stream/524288000 | awk '{printf "%.2f MB/s", $1/1048576}')"
   NETEM tc qdisc add root handle 1: prio bands 3 2>/dev/null
   NETEM tc qdisc add parent 1:3 handle 30: netem loss 100% 2>/dev/null
@@ -142,11 +158,20 @@ if up "$L" --carriers 1 --udp; then
   echo "  throughput during:  $(curl -s -o /dev/null -m 40 -w '%{speed_download}' https://$L.${BORE_HOST}/stream/524288000 | awk '{printf "%.2f MB/s", $1/1048576}')"
   d2=$(adm vhost | jq -r --arg l "$L" '.[]|select(.subdomain==$l)|.direct_stream_opens')
   echo "  entry during: $(entry "$L")  fallbacks=$(adm metrics | jq -r .direct_fallbacks)"
+  # The per-tunnel view is the one that has to be right: a server-wide counter
+  # cannot say whether THIS tunnel is on the relay.
+  echo "  path/fallbacks during: $(adm vhost | jq -r --arg l "$L" '.[]|select(.subdomain==$l)|"path=\(.current_path) fallbacks=\(.direct_fallbacks)"')"
   NETEM tc qdisc del root 2>/dev/null
   sleep 5
   echo "  throughput after clear: $(curl -s -o /dev/null -m 40 -w '%{speed_download}' https://$L.${BORE_HOST}/stream/524288000 | awk '{printf "%.2f MB/s", $1/1048576}')"
   d3=$(adm vhost | jq -r --arg l "$L" '.[]|select(.subdomain==$l)|.direct_stream_opens')
   echo "  direct opens: before=$d1 during=$d2 after=$d3 (a rise after clear means direct came back in place)"
+  echo "  path/fallbacks after:  $(adm vhost | jq -r --arg l "$L" '.[]|select(.subdomain==$l)|"path=\(.current_path) fallbacks=\(.direct_fallbacks)"')"
+  # Phase 05.3 expectation, stated so the run is self-checking: `during` must
+  # NOT exceed `before` (opens count successes now, and there were none), and
+  # the fallback counter must have moved.
+  [ "$d2" = "$d1" ] && echo "    VERDICT opens counted successes only: PASS ($d1 -> $d2)" \
+                    || echo "    VERDICT opens counted successes only: FAIL ($d1 -> $d2 during a 100% UDP drop)"
   kill -9 $P 2>/dev/null; wait_gone "$L" 20
 else echo "  REGISTRATION FAILED"; fi
 ;;&

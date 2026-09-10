@@ -385,10 +385,44 @@ pub struct VhostEntry {
     #[cfg(feature = "udp")]
     pub direct: DirectPool,
     /// Number of proxied requests that successfully opened a direct QUIC stream.
+    ///
+    /// SUCCESSFUL opens only, announcement included (phase 05.3): it used to
+    /// count attempts, so it climbed from 1 to 12 during a measured 100 % UDP
+    /// drop — a counter that rises while the path it names is entirely dead
+    /// (F-14). Never make this an attempt counter again without renaming it.
     #[cfg(feature = "udp")]
     pub direct_stream_opens: AtomicU64,
+    /// Number of proxied requests that wanted the direct path and were served
+    /// by the warm TCP relay instead (phase 05.3).
+    ///
+    /// Counted only for a tunnel that actually asked for `--udp`; it stayed at
+    /// 0 throughout the same measured blackout, which is what made the failure
+    /// invisible from the admin API.
+    #[cfg(feature = "udp")]
+    pub direct_fallbacks: AtomicU64,
+    /// Which transport the most recent proxied connection actually used
+    /// ([`VHOST_PATH_UNKNOWN`] / [`VHOST_PATH_RELAY`] / [`VHOST_PATH_DIRECT`]).
+    pub last_path: std::sync::atomic::AtomicU8,
     /// Live count of connections currently proxied through this vhost subdomain.
     pub active: Arc<AtomicUsize>,
+    /// The carrier count the server currently WANTS in this provider's pool
+    /// (phase 03.3). Equals the operator's resolved `--carriers` for every
+    /// non-auto tunnel and never moves; for an auto tunnel it is the live target
+    /// the control loop last published with [`ServerMessage::SetCarrierTarget`].
+    ///
+    /// It is deliberately distinct from `pool.len()`: the target may drop below
+    /// the pool size, because lowering it never closes a live carrier (DEC-VE9).
+    pub carrier_target: Arc<AtomicUsize>,
+    /// Nudge channel to this provider's control loop, asking it to consider
+    /// growing the carrier pool (phase 03.3). `Some` only for a provider that
+    /// declared `HelloVhost::auto_carriers`; every other tunnel keeps its
+    /// operator-chosen pool and never receives a resize request.
+    ///
+    /// Unbounded and lossy by design: the sender is on the hot proxied-connection
+    /// path, so it must never block, and a dropped nudge costs nothing — the
+    /// control loop rate-limits growth anyway and the next crowded connection
+    /// nudges again.
+    pub carrier_nudge: Option<mpsc::UnboundedSender<()>>,
     /// Whether this provider requested access logging with real caller IP forwarding.
     /// Wired from `HelloVhost.webserver_log`.
     pub webserver_log: bool,
@@ -565,6 +599,252 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 /// fail the proxied connection within this window rather than hang it.
 const BACKEND_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Deadline for opening (and announcing) one QUIC direct stream before the
+/// request falls back to the warm TCP relay (phase 05.1, F-14).
+///
+/// `cfg(udp)`: without the feature there is no direct path to bound.
+///
+/// Three seconds because that is the direct path's own QUIC keepalive interval
+/// and the idle timeout is 10 s (`transport_config`, byte-identical since
+/// `3a5c87b`): a deadline above the idle timeout could never fire first, and a
+/// direct open that has not completed within a keepalive interval is not going
+/// to. Measured before this existed: a total UDP blackout destroyed the FIRST
+/// request with `http=000` after 9.90 s while the aggregate fallback was
+/// perfectly healthy — the worst combination for diagnosis.
+#[cfg(feature = "udp")]
+const DIRECT_OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// [`DIRECT_OPEN_TIMEOUT`] with a test-only override
+/// (`BORE_DIRECT_OPEN_TIMEOUT_MS`), read per call. Same pattern as
+/// `ssh_open_timeout`'s `BORE_SSH_OPEN_TIMEOUT_MS`, which is also what this
+/// deadline is modelled on.
+#[cfg(feature = "udp")]
+fn direct_open_timeout() -> Duration {
+    match std::env::var("BORE_DIRECT_OPEN_TIMEOUT_MS") {
+        Ok(ms) => match ms.parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => DIRECT_OPEN_TIMEOUT,
+        },
+        Err(_) => DIRECT_OPEN_TIMEOUT,
+    }
+}
+
+/// Path a proxied connection has not been assigned yet.
+pub const VHOST_PATH_UNKNOWN: u8 = 0;
+/// The most recent proxied connection used the TCP carrier relay.
+pub const VHOST_PATH_RELAY: u8 = 1;
+/// The most recent proxied connection used a QUIC direct stream.
+pub const VHOST_PATH_DIRECT: u8 = 2;
+
+/// Render [`VhostEntry::last_path`] for the admin API (phase 05.3).
+///
+/// Exists because no counter can answer the question an operator actually asks
+/// — "is this tunnel using `--udp` right now?" A tunnel that negotiated direct
+/// and has since fallen back for every connection is otherwise indistinguishable
+/// from a healthy direct one.
+pub fn vhost_path_label(path: u8) -> &'static str {
+    match path {
+        VHOST_PATH_RELAY => "relay",
+        VHOST_PATH_DIRECT => "direct",
+        _ => "unknown",
+    }
+}
+
+/// The synthesized response for a provider that could not reach its origin
+/// (phase 05.2, F-12).
+///
+/// Built rather than written out so the declared `Content-Length` cannot drift
+/// from the body — a mismatch here would desync a keep-alive connection, which
+/// is a worse failure than the `http=000` this replaces.
+fn origin_unreachable_response() -> Vec<u8> {
+    const BODY: &str = "bore: the tunnelled origin is unreachable.\n";
+    format!(
+        "HTTP/1.1 502 Bad Gateway\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {BODY}",
+        BODY.len()
+    )
+    .into_bytes()
+}
+
+/// Send the 502 and FLUSH it.
+///
+/// The flush is not optional and not redundant: tokio-rustls `poll_write` can
+/// return `Ok` with the record still buffered in the TLS session, and a
+/// synthesized error page is exactly the small-write shape that sits there
+/// unnoticed (the `36cd70d` bug). A 502 the client never receives is worse than
+/// no 502 at all, because the connection then looks like a hang.
+async fn send_origin_unreachable(public: &mut (impl AsyncWrite + Unpin)) {
+    let response = origin_unreachable_response();
+    if public.write_all(&response).await.is_ok() {
+        let _ = public.flush().await;
+    }
+}
+
+/// Wraps the PUBLIC side of the plain (no-header-injection) relay so a provider
+/// that closes without sending a single response byte yields a 502 instead of a
+/// bare connection close (phase 05.2, F-12).
+///
+/// The synthesis happens in `poll_shutdown`, which `copy_bidirectional` calls on
+/// the public side exactly when the provider half-closed — the last moment at
+/// which the public write half is still open and a status line is still legal.
+/// Two alternatives were rejected for concrete reasons:
+///
+/// * reading the first response byte BEFORE starting the splice deadlocks every
+///   upload (the origin does not answer until it has read the body, and the body
+///   is not being pumped while we wait);
+/// * writing the 502 AFTER `copy_bidirectional` returns is too late — it has
+///   already shut the public write half down, so the bytes go nowhere. That was
+///   measured, not assumed: the first version of this fix returned an empty
+///   response body on exactly this path.
+///
+/// It also preserves half-close timing: the inner shutdown still happens, in the
+/// same call, immediately after the 502 is flushed.
+struct OriginFailureResponder<S> {
+    inner: S,
+    state: ResponderState,
+}
+
+/// Where [`OriginFailureResponder`] is in the synthesize-then-shut-down sequence.
+/// An explicit state (rather than a bool) because `poll_shutdown` can return
+/// `Pending` in the middle of writing or flushing and must resume where it left
+/// off — a bool would skip the flush on the second poll and lose the response.
+enum ResponderState {
+    /// At least one response byte has gone to the client: nothing to synthesize.
+    Passthrough,
+    /// Nothing written yet; the 502 has not been started.
+    Silent,
+    /// Draining the synthesized 502 at this offset.
+    Writing(Vec<u8>, usize),
+    /// 502 written; flushing before the inner shutdown.
+    Flushing,
+}
+
+impl<S> OriginFailureResponder<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            state: ResponderState::Silent,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for OriginFailureResponder<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for OriginFailureResponder<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let written = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &written {
+            if *n > 0 {
+                this.state = ResponderState::Passthrough;
+            }
+        }
+        written
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            match &mut this.state {
+                ResponderState::Passthrough => break,
+                ResponderState::Silent => {
+                    this.state = ResponderState::Writing(origin_unreachable_response(), 0);
+                }
+                ResponderState::Writing(buf, offset) => {
+                    if *offset >= buf.len() {
+                        this.state = ResponderState::Flushing;
+                        continue;
+                    }
+                    match std::pin::Pin::new(&mut this.inner).poll_write(cx, &buf[*offset..]) {
+                        std::task::Poll::Ready(Ok(0)) | std::task::Poll::Ready(Err(_)) => {
+                            // The client is gone; there is nobody to inform.
+                            this.state = ResponderState::Passthrough;
+                        }
+                        std::task::Poll::Ready(Ok(n)) => *offset += n,
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
+                    }
+                }
+                ResponderState::Flushing => {
+                    // Flush before shutting down: a small synthesized response is
+                    // exactly the shape that stays in a tokio-rustls session
+                    // buffer (the `36cd70d` bug).
+                    match std::pin::Pin::new(&mut this.inner).poll_flush(cx) {
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
+                        _ => this.state = ResponderState::Passthrough,
+                    }
+                }
+            }
+        }
+        std::pin::Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+/// Ceiling on the carrier pool the server will grow to BY ITSELF when the
+/// provider asked for `--carriers 0` (auto, phase 03.3).
+///
+/// Four, because §2.17.1 measured the carrier count as the lever that unlocks
+/// extra cores (1.0 → 3.6 cores at c=4) while §2.15 A2 measured a median
+/// `c=4/c=1` throughput ratio of 0.941 on a clean idle path — carriers pay for
+/// themselves only under contention, so the auto ceiling matches the highest
+/// count the campaign actually measured a win for and goes no further. The
+/// operator's `--max-carriers` still bounds it.
+pub const VHOST_AUTO_CARRIER_CEILING: u16 = 4;
+
+/// Minimum wall time between two consecutive carrier target changes (phase
+/// 03.3). A carrier is a TCP connection plus a yamux session; `CLAUDE.md`
+/// records carrier churn (VH-2) as a known hazard, so the pool is allowed to
+/// move at most one step per interval no matter how many connections crowd.
+const CARRIER_TARGET_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Idle time (no crowded connection observed) after which the server lowers the
+/// carrier target by one. See [`ServerMessage::SetCarrierTarget`] for what
+/// lowering does and — importantly — does not do (DEC-VE9: it never closes a
+/// live carrier).
+const CARRIER_QUIET_PERIOD: Duration = Duration::from_secs(60);
+
+/// [`CARRIER_QUIET_PERIOD`] with a test-only override
+/// (`BORE_VHOST_CARRIER_QUIET_MS`), read per call so a harness can set it after
+/// startup. Same pattern and same reason as `BORE_CTRL_HEARTBEAT_MS`: the
+/// property worth gating — that a grown pool actually decays instead of
+/// ratcheting up forever — otherwise costs a minute of wall clock per assertion.
+fn carrier_quiet_period() -> Duration {
+    match std::env::var("BORE_VHOST_CARRIER_QUIET_MS") {
+        Ok(ms) => match ms.parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => CARRIER_QUIET_PERIOD,
+        },
+        Err(_) => CARRIER_QUIET_PERIOD,
+    }
+}
+
 #[cfg(feature = "udp")]
 fn new_nonce() -> [u8; UDP_NONCE_LEN] {
     use ring::rand::{SecureRandom, SystemRandom};
@@ -628,6 +908,7 @@ pub async fn serve_vhost_provider(
     backend_tls: bool,
     backend_tls_sni: Option<String>,
     ctrl_timeout: Option<Duration>,
+    auto_carriers: bool,
 ) -> Result<()> {
     // Validate against live config (resolve_route checks reservations).
     let cfg = vhost_config.read().unwrap().clone();
@@ -646,6 +927,20 @@ pub async fn serve_vhost_provider(
     // Compute vhost capability: can serve HTTPS if mode allows it and cert is present.
     let mode = resolve_mode(&cfg, cert_present(&cfg)).unwrap_or(VhostMode::Http);
     let vhost_capable = mode.serves_https();
+
+    // Phase 03.3 growth nudge. Created unconditionally so the receiver exists
+    // for the `select!` below; the SENDER only reaches the registry entry (and
+    // therefore the proxied-connection path) when the provider declared
+    // `auto_carriers`, so a non-auto tunnel never nudges and this receiver just
+    // pends forever. `nudge_tx` is held for the whole function, which is what
+    // keeps `recv()` pending instead of resolving `None` in a tight loop.
+    let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel::<()>();
+    // Published copy of the live carrier target, so the target is observable
+    // (and assertable) without inferring it from `pool.len()`, which by design
+    // does not follow it downward.
+    let carrier_target_pub = Arc::new(AtomicUsize::new(
+        carriers.clamp(1, max_carriers.max(1)) as usize
+    ));
 
     // Atomic insert: reject if subdomain already live.
     let pool = match registry.entry(subdomain.clone()) {
@@ -668,7 +963,12 @@ pub async fn serve_vhost_provider(
                 direct: DirectPool::default(),
                 #[cfg(feature = "udp")]
                 direct_stream_opens: AtomicU64::new(0),
+                #[cfg(feature = "udp")]
+                direct_fallbacks: AtomicU64::new(0),
+                last_path: std::sync::atomic::AtomicU8::new(VHOST_PATH_UNKNOWN),
                 active: Arc::new(AtomicUsize::new(0)),
+                carrier_target: Arc::clone(&carrier_target_pub),
+                carrier_nudge: auto_carriers.then(|| nudge_tx.clone()),
                 webserver_log,
                 https_policy,
                 backend_tls,
@@ -756,7 +1056,27 @@ pub async fn serve_vhost_provider(
 
     // Carrier pool setup (same pattern as secret provider).
     let effective = carriers.clamp(1, max_carriers.max(1));
-    let mut carrier_rx = if carriers > 1 {
+    // Phase 03.3: in auto mode (`--carriers 0`) the operator left the count to
+    // the server, so the pool STARTS at 1 — the campaign measured carriers
+    // slightly HURTING a clean idle path (median c4/c1 ratio 0.941, §2.15 A2) —
+    // and grows only under observed bulk contention, never past this ceiling.
+    // In explicit mode the ceiling IS the operator's own number and nothing in
+    // this function ever moves the target off it.
+    let auto_ceiling = auto_carrier_ceiling(auto_carriers, effective, max_carriers);
+    let mut carrier_target = effective;
+    // `None` = the target has never moved, so the FIRST growth is free. The rate
+    // limit exists to stop churn between repeated steps, not to make the first
+    // crowded connection wait out an interval it cannot benefit from.
+    let mut last_target_change: Option<TokioInstant> = None;
+    let mut last_crowded = TokioInstant::now();
+    // A token is issued for an explicit `--carriers N>1` (the client dials the
+    // shortfall immediately) and ALWAYS for an auto provider, which dials
+    // nothing now but must HOLD the token so a later `SetCarrierTarget` has
+    // something to dial with. "Always", not "only when the ceiling exceeds 1",
+    // because the auto client waits for this message: a server with
+    // `--max-carriers 1` must still answer it rather than leave the provider
+    // hanging on a handshake read.
+    let mut carrier_rx = if effective > 1 || auto_carriers {
         let extra = effective - 1;
         let token = Uuid::new_v4().to_string();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -767,7 +1087,8 @@ pub async fn serve_vhost_provider(
                 extra,
             })
             .await?;
-        info!(%subdomain, extra, "vhost carrier pool offered");
+        info!(%subdomain, extra, auto = auto_carriers, ceiling = auto_ceiling,
+            "vhost carrier pool offered");
         Some((rx, TokenGuard::new(pending_carriers.clone(), token)))
     } else {
         None
@@ -846,6 +1167,30 @@ pub async fn serve_vhost_provider(
                         return Ok(());
                     }
                 }
+                // Phase 03.3 shrink: nothing has crowded a carrier for a whole
+                // quiet period, so stop asking the provider to keep this many.
+                // This does NOT close a carrier (DEC-VE9) — it only stops the
+                // provider replacing one that dies, so the pool decays instead
+                // of being churned.
+                let quiet = carrier_quiet_period();
+                if carrier_target > 1
+                    && last_crowded.elapsed() >= quiet
+                    && last_target_change.is_some_and(|t| t.elapsed() >= quiet)
+                {
+                    carrier_target -= 1;
+                    last_target_change = Some(TokioInstant::now());
+                    carrier_target_pub
+                        .store(carrier_target as usize, std::sync::atomic::Ordering::Relaxed);
+                    info!(%subdomain, target = carrier_target,
+                        "vhost carrier pool quiet; lowering target (live carriers are kept)");
+                    if control
+                        .send(ServerMessage::SetCarrierTarget { target: carrier_target })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
             }
             message = control.recv() => {
                 last_recv = TokioInstant::now();
@@ -884,12 +1229,102 @@ pub async fn serve_vhost_provider(
             }
             joined = crate::pool::recv_carrier(carrier_rx.as_mut()) => {
                 if let Some(carrier) = joined {
-                    if pool.push(carrier, effective as usize) {
+                    // Bounded by the CEILING, not the current target: a carrier
+                    // that already paid for its dial is never thrown away
+                    // because the target moved down under it mid-flight.
+                    if pool.push(carrier, auto_ceiling as usize) {
                         info!(%subdomain, size = pool.len(), "vhost carrier joined pool");
                     }
                 }
             }
+            // Phase 03.3 growth: a proxied connection landed on a carrier that
+            // was ALREADY carrying bulk, i.e. every carrier is occupied. Only an
+            // `auto_carriers` provider can reach this arm (it is the only one
+            // whose registry entry holds the sender).
+            _ = nudge_rx.recv() => {
+                last_crowded = TokioInstant::now();
+                if carrier_target < auto_ceiling
+                    && last_target_change
+                        .is_none_or(|t| t.elapsed() >= CARRIER_TARGET_MIN_INTERVAL)
+                {
+                    carrier_target += 1;
+                    last_target_change = Some(TokioInstant::now());
+                    carrier_target_pub
+                        .store(carrier_target as usize, std::sync::atomic::Ordering::Relaxed);
+                    info!(%subdomain, target = carrier_target, ceiling = auto_ceiling,
+                        "vhost bulk contention on every carrier; raising carrier target");
+                    if control
+                        .send(ServerMessage::SetCarrierTarget { target: carrier_target })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Highest carrier count this provider's pool may ever reach.
+///
+/// Pure because it encodes the one invariant an operator cares about: adaptive
+/// means *up to*, never beyond. With `auto` off it is exactly the resolved
+/// `--carriers` value, so nothing in the growth path can move an explicitly
+/// configured pool; with `auto` on it is the smaller of
+/// [`VHOST_AUTO_CARRIER_CEILING`] and the server's own `--max-carriers`.
+fn auto_carrier_ceiling(auto: bool, effective: u16, max_carriers: u16) -> u16 {
+    if auto {
+        VHOST_AUTO_CARRIER_CEILING.min(max_carriers.max(1))
+    } else {
+        effective
+    }
+}
+
+/// Open a relayed link for one proxied connection on the least-loaded carrier
+/// (phase 03.2), nudging the pool to grow when even that carrier is already
+/// carrying bulk (phase 03.3).
+///
+/// One helper for all three call sites — the UDP fallback paths and the
+/// no-UDP build — because "pick, observe, open" has to be the same three steps
+/// everywhere or the growth trigger would silently not fire on a fallback.
+async fn open_relay_carrier(
+    entry: &VhostEntry,
+    forward_ip: Option<&str>,
+    addr: SocketAddr,
+) -> Result<(mux::LinkStream, std::sync::Arc<AtomicUsize>)> {
+    let pick = entry
+        .pool
+        .pick_avoiding_bulk()
+        .context("no live vhost carrier")?;
+    request_carrier_growth(entry, &pick);
+    let stream = pick
+        .opener
+        .open_ready(forward_ip, Some(addr))
+        .await
+        .context("vhost provider unavailable")?;
+    Ok((stream, pick.bulk))
+}
+
+/// Nudge an auto-carrier provider's control loop when a new proxied connection
+/// had to be placed on a carrier that is ALREADY carrying bulk (phase 03.3).
+///
+/// `pick.bulk_load > 0` on the *least*-loaded carrier is the whole trigger: it
+/// can only happen when every live carrier is occupied by bulk, which is exactly
+/// §2.16's measured head-of-line regime ("bulk occupies every carrier and
+/// another connection arrives"). The ceiling and the rate limit are the control
+/// loop's decision; this is only the observation, and it never blocks.
+fn request_carrier_growth(entry: &VhostEntry, pick: &crate::pool::CarrierPick) {
+    if pick.bulk_load == 0 {
+        return;
+    }
+    if let Some(tx) = &entry.carrier_nudge {
+        debug!(
+            load = pick.bulk_load,
+            carriers = pick.pool_len,
+            "vhost carrier crowded by bulk; nudging pool growth"
+        );
+        let _ = tx.send(());
     }
 }
 
@@ -937,61 +1372,92 @@ pub async fn relay_vhost(
     // the QUIC direct path, where contention is between streams inside one
     // connection and carriers were measured NOT to help (c=4 slightly worse
     // than c=1, §2.16) — that half is phase 03.4's problem, not this one.
-    let mut bulk_carrier: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> = None;
-    let mut provider: mux::LinkStream = {
+    let (mut provider, bulk_carrier): (
+        mux::LinkStream,
+        Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ) = {
         #[cfg(feature = "udp")]
         {
             // In vhost UDP the server opens the QUIC streams and the provider
             // accepts them. Pick a direct connection round-robin from the pool; if
             // none is live or opening a stream fails, fall back per-request to the
             // existing TCP carrier pool.
-            let direct = entry.direct.pick();
-            match direct {
-                Some(direct) => match direct.open_stream().await {
-                    Ok(mut stream) => {
-                        entry
-                            .direct_stream_opens
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Phase 05.1: the open AND its readiness announcement are bounded
+            // together. A half-open QUIC path can accept `open_bi` and then
+            // never deliver the marker, so bounding only the open would leave
+            // exactly the unbounded first request that F-14 measured.
+            let direct_stream = match entry.direct.pick() {
+                Some(direct) => {
+                    let deadline = direct_open_timeout();
+                    match tokio::time::timeout(deadline, async {
+                        let mut stream = direct.open_stream().await?;
                         mux::write_stream_ready(&mut stream, forward_ip.as_deref()).await?;
-                        Box::new(stream)
+                        anyhow::Ok(stream)
+                    })
+                    .await
+                    {
+                        Ok(Ok(stream)) => Some(stream),
+                        // An ANSWERED failure is not a timeout and is not
+                        // conflated with one (the I-SSH10 distinction): an
+                        // origin that is merely restarting must not look like a
+                        // wedged path.
+                        Ok(Err(err)) => {
+                            debug!(%err, "vhost QUIC open_stream failed; using TCP carrier");
+                            None
+                        }
+                        Err(_) => {
+                            warn!(
+                                ?deadline,
+                                "vhost QUIC direct open timed out; serving this request on the \
+                                 warm TCP relay"
+                            );
+                            None
+                        }
                     }
-                    Err(err) => {
-                        debug!(%err, "vhost QUIC open_stream failed; using TCP carrier");
-                        let (opener, bulk) = entry
-                            .pool
-                            .pick_avoiding_bulk()
-                            .context("no live vhost carrier")?;
-                        bulk_carrier = Some(bulk);
-                        opener
-                            .open_ready(forward_ip.as_deref(), Some(addr))
-                            .await
-                            .context("vhost provider unavailable")?
-                    }
-                },
+                }
+                None => None,
+            };
+            match direct_stream {
+                Some(stream) => {
+                    // Counted here, AFTER the announcement landed: this counter
+                    // used to count attempts and climbed during a total UDP
+                    // blackout (F-14, phase 05.3).
+                    entry
+                        .direct_stream_opens
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    entry
+                        .last_path
+                        .store(VHOST_PATH_DIRECT, std::sync::atomic::Ordering::Relaxed);
+                    // Bulk on the direct path is scheduled INSIDE the QUIC
+                    // connection (phase 03.4), not across carriers: c=4 was
+                    // measured slightly worse than c=1 there (§2.16), so the
+                    // relay's carrier accounting deliberately does not apply.
+                    (Box::new(stream) as mux::LinkStream, None)
+                }
                 None => {
-                    let (opener, bulk) = entry
-                        .pool
-                        .pick_avoiding_bulk()
-                        .context("no live vhost carrier")?;
-                    bulk_carrier = Some(bulk);
-                    opener
-                        .open_ready(forward_ip.as_deref(), Some(addr))
-                        .await
-                        .context("vhost provider unavailable")?
+                    // Only a tunnel that ASKED for the direct path can fall back
+                    // from it; a plain relay tunnel is not "falling back".
+                    if entry.udp {
+                        entry
+                            .direct_fallbacks
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let (stream, bulk) =
+                        open_relay_carrier(entry, forward_ip.as_deref(), addr).await?;
+                    entry
+                        .last_path
+                        .store(VHOST_PATH_RELAY, std::sync::atomic::Ordering::Relaxed);
+                    (stream, Some(bulk))
                 }
             }
         }
         #[cfg(not(feature = "udp"))]
         {
-            let (opener, bulk) = entry
-                .pool
-                .pick_avoiding_bulk()
-                .context("no live vhost carrier")?;
-            bulk_carrier = Some(bulk);
-            opener
-                .open_ready(forward_ip.as_deref(), Some(addr))
-                .await
-                .context("vhost provider unavailable")?
+            let (stream, bulk) = open_relay_carrier(entry, forward_ip.as_deref(), addr).await?;
+            entry
+                .last_path
+                .store(VHOST_PATH_RELAY, std::sync::atomic::Ordering::Relaxed);
+            (stream, Some(bulk))
         }
     };
     // Held for the connection's life: `Drop` releases the carrier occupancy on
@@ -1099,9 +1565,15 @@ pub async fn relay_vhost(
                 }
             }
 
+            // Phase 05.2: `OriginFailureResponder` turns "provider closed with
+            // no response at all" — what a failed connect to the origin looks
+            // like from here — into a 502 instead of the bare connection close
+            // that `http=000` reports. It wraps the counting/logging side, so
+            // the synthesized response is counted and logged like any other.
+            let mut tap = OriginFailureResponder::new(tap);
             tokio::io::copy_bidirectional_with_sizes(&mut tap, &mut provider, buf, buf).await?
         } else {
-            let mut counted = counted;
+            let mut counted = OriginFailureResponder::new(counted);
             tokio::io::copy_bidirectional_with_sizes(&mut counted, &mut provider, buf, buf).await?
         };
         // Byte counts are accumulated LIVE by `CountingStream` (per-subdomain +
@@ -1156,7 +1628,15 @@ async fn relay_response_injected(
 
     let forward_response = async {
         let response_head = read_head_async(&mut provider_read).await?;
-        if !response_head.is_empty() {
+        if response_head.is_empty() {
+            // Phase 05.2, the header-injection path's half of the same failure:
+            // no response head at all means the provider never reached its
+            // origin. Written and FLUSHED through the same writer the injected
+            // head uses, which is the path that flushes before parking (I-VH
+            // flush invariant) — a small unflushed write here would hang the
+            // client instead of telling it what happened.
+            send_origin_unreachable(&mut public_write).await;
+        } else {
             let rewritten = rewrite_head(&response_head, inject);
             public_write.write_all(&rewritten).await?;
             public_write.flush().await?;
@@ -2073,7 +2553,12 @@ reservations:
             direct: DirectPool::default(),
             #[cfg(feature = "udp")]
             direct_stream_opens: AtomicU64::new(0),
+            #[cfg(feature = "udp")]
+            direct_fallbacks: AtomicU64::new(0),
+            last_path: std::sync::atomic::AtomicU8::new(crate::vhost::VHOST_PATH_UNKNOWN),
             active: Arc::new(AtomicUsize::new(0)),
+            carrier_target: Arc::new(AtomicUsize::new(1)),
+            carrier_nudge: None,
             webserver_log: false,
             https_policy: None,
             backend_tls: false,
@@ -2709,6 +3194,199 @@ reservations:
         assert!(
             st.pending.is_empty(),
             "no bytes may stay parked unflushed while the relay waits for more data"
+        );
+    }
+    #[test]
+    fn auto_carrier_ceiling_never_exceeds_the_operator_bound() {
+        // Auto: capped by the server's --max-carriers on the way down...
+        assert_eq!(
+            auto_carrier_ceiling(true, 1, 16),
+            VHOST_AUTO_CARRIER_CEILING
+        );
+        assert_eq!(auto_carrier_ceiling(true, 1, 2), 2);
+        assert_eq!(auto_carrier_ceiling(true, 1, 1), 1);
+        // ...and by its own ceiling on the way up, whatever --max-carriers is.
+        assert_eq!(
+            auto_carrier_ceiling(true, 1, 64),
+            VHOST_AUTO_CARRIER_CEILING
+        );
+        // A server that somehow reports 0 still has to leave one usable carrier.
+        assert_eq!(auto_carrier_ceiling(true, 1, 0), 1);
+        // Not auto: the operator's resolved count, and NOTHING moves it — this
+        // is what keeps an explicit `--carriers N` byte-identical to before
+        // phase 03.3 existed.
+        for n in [1u16, 2, 8, 32] {
+            assert_eq!(auto_carrier_ceiling(false, n, 64), n);
+            assert_eq!(auto_carrier_ceiling(false, n, 1), n);
+        }
+    }
+    /// Phase 05.2. A synthesized 502 whose `Content-Length` disagreed with its
+    /// body would desync a keep-alive connection — a worse failure than the
+    /// `http=000` it replaces — so the header and the body are checked against
+    /// each other rather than against a hand-copied literal.
+    #[test]
+    fn origin_unreachable_response_is_a_well_formed_502() {
+        let bytes = origin_unreachable_response();
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let mut resp = httparse::Response::new(&mut headers);
+        let parsed = resp.parse(&bytes).expect("the 502 must be parseable HTTP");
+        let head_len = match parsed {
+            httparse::Status::Complete(n) => n,
+            httparse::Status::Partial => panic!("the 502 head must be complete"),
+        };
+        assert_eq!(resp.code, Some(502));
+        let declared: usize = resp
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+            .map(|h| std::str::from_utf8(h.value).unwrap().parse().unwrap())
+            .expect("the 502 must declare a Content-Length");
+        assert_eq!(
+            declared,
+            bytes.len() - head_len,
+            "Content-Length must equal the body actually sent, or a keep-alive \
+             connection desyncs on the next request"
+        );
+    }
+
+    /// Phase 05.2, gated where it can actually fail. A dead origin closes the
+    /// provider substream without a single response byte; the 502 that replaces
+    /// the resulting `http=000` is a SMALL write, which is exactly the shape
+    /// that sits unflushed in a TLS session buffer (the `36cd70d` bug). Every
+    /// in-process TLS integration test of that class false-passes on loopback,
+    /// so this asserts at the writer-mock level: the bytes must be VISIBLE, not
+    /// merely written.
+    #[test]
+    fn origin_unreachable_502_is_flushed_on_the_injected_path() {
+        let public_state = Arc::new(StdMutex::new(FlushGateState::default()));
+        let provider_state = Arc::new(StdMutex::new(FlushGateState::default()));
+        let public = MockDuplex {
+            read: ChunksThenPark {
+                chunks: VecDeque::new(),
+                eof_when_empty: false,
+            },
+            write: FlushGatedWriter(public_state.clone()),
+        };
+        let provider = MockDuplex {
+            // The origin was unreachable: the provider closes with no response.
+            read: ChunksThenPark {
+                chunks: VecDeque::new(),
+                eof_when_empty: true,
+            },
+            write: FlushGatedWriter(provider_state),
+        };
+        let inject = vec![("X-Injected".to_string(), "yes".to_string())];
+        let mut fut = Box::pin(relay_response_injected(public, provider, &inject, None));
+        // The public side is a keep-alive park, so the request half never
+        // finishes; polling until the response half has done its work is enough.
+        let _ = poll_once(&mut fut);
+        drop(fut);
+
+        let st = public_state.lock().unwrap();
+        let text = String::from_utf8_lossy(&st.visible);
+        assert!(
+            text.starts_with("HTTP/1.1 502 Bad Gateway"),
+            "a provider that sent no response head must yield a 502, not a bare \
+             connection close (http=000 is indistinguishable from a dead tunnel): {text:?}"
+        );
+        assert!(
+            text.contains("bore: the tunnelled origin is unreachable."),
+            "the explanatory body must arrive too: {text:?}"
+        );
+        assert!(
+            st.pending.is_empty(),
+            "the 502 must reach the wire, not stay in the session buffer: {text:?}"
+        );
+    }
+
+    /// The flush half of phase 05.2, gated where it is actually load-bearing.
+    ///
+    /// On the injected path the provider has EOF'd by definition (that is how
+    /// the failure is detected), so the shutdown that follows would make the
+    /// bytes visible anyway. On the PURE-SPLICE path nothing shuts the public
+    /// side down afterwards, so the explicit flush is the only thing that puts
+    /// a synthesized 502 on the wire — and a small write parked in a
+    /// tokio-rustls session buffer is exactly the `36cd70d` bug. Asserting on
+    /// the sender itself is what makes this gate fail when the flush is removed.
+    #[test]
+    fn origin_unreachable_502_sender_flushes_before_returning() {
+        let state = Arc::new(StdMutex::new(FlushGateState::default()));
+        let mut writer = FlushGatedWriter(state.clone());
+        let mut fut = Box::pin(send_origin_unreachable(&mut writer));
+        assert!(
+            poll_once(&mut fut).is_ready(),
+            "sending a small synthesized response must not park"
+        );
+        drop(fut);
+        let st = state.lock().unwrap();
+        assert!(
+            st.pending.is_empty(),
+            "the 502 must be FLUSHED before returning — an unflushed error page \
+             hangs the client instead of informing it"
+        );
+        assert!(
+            String::from_utf8_lossy(&st.visible).starts_with("HTTP/1.1 502 Bad Gateway"),
+            "and the visible bytes must be the 502 itself"
+        );
+    }
+
+    /// Phase 05.2 on the plain splice path, gated at the writer-mock level.
+    ///
+    /// `copy_bidirectional` shuts the public side down as soon as the provider
+    /// half-closes, so the 502 has to be written from INSIDE `poll_shutdown` —
+    /// and it has to be flushed there too. Both are asserted here because the
+    /// integration test cannot distinguish "written" from "visible" (real
+    /// rustls drains opportunistically on loopback, which is how this class of
+    /// bug false-passes).
+    #[test]
+    fn origin_failure_responder_synthesizes_and_flushes_on_shutdown() {
+        let state = Arc::new(StdMutex::new(FlushGateState::default()));
+        let mut responder = OriginFailureResponder::new(FlushGatedWriter(state.clone()));
+        let mut fut = Box::pin(async {
+            use tokio::io::AsyncWriteExt;
+            responder.shutdown().await
+        });
+        assert!(
+            poll_once(&mut fut).is_ready(),
+            "shutting down a silent connection must complete"
+        );
+        drop(fut);
+        let st = state.lock().unwrap();
+        let text = String::from_utf8_lossy(&st.visible);
+        assert!(
+            text.starts_with("HTTP/1.1 502 Bad Gateway"),
+            "a public side shut down with no response byte written must carry a \
+             502, not close silently: {text:?}"
+        );
+        assert!(
+            st.pending.is_empty(),
+            "and it must be flushed before the shutdown, or the client sees a hang"
+        );
+        assert!(st.shutdown, "the inner shutdown must still happen");
+    }
+
+    /// The other half: a connection that DID answer must be untouched. This is
+    /// the zero-regression side — every healthy request goes through this
+    /// wrapper, so a stray 502 appended to a real response would corrupt every
+    /// keep-alive connection on the plain path.
+    #[test]
+    fn origin_failure_responder_never_appends_to_a_real_response() {
+        let state = Arc::new(StdMutex::new(FlushGateState::default()));
+        let mut responder = OriginFailureResponder::new(FlushGatedWriter(state.clone()));
+        let mut fut = Box::pin(async {
+            use tokio::io::AsyncWriteExt;
+            responder
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                .await?;
+            responder.shutdown().await
+        });
+        assert!(poll_once(&mut fut).is_ready());
+        drop(fut);
+        let st = state.lock().unwrap();
+        let text = String::from_utf8_lossy(&st.visible);
+        assert_eq!(
+            text, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+            "a real response must pass through byte-for-byte with nothing appended"
         );
     }
 }

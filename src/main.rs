@@ -442,6 +442,11 @@ enum Command {
         /// many parallel QUIC direct connections the provider opens. Only helps
         /// when many connections run concurrently — a single transfer rides one
         /// connection regardless.
+        ///
+        /// `0` = AUTO: start at one carrier and let the server add one (up to 4,
+        /// and never past its `--max-carriers`) whenever it sees bulk transfers
+        /// occupying every carrier while another connection arrives, then decay
+        /// back after a quiet minute. Auto never closes a live carrier.
         #[clap(long, value_name = "N", default_value_t = 1, env = "BORE_CARRIERS")]
         carriers: u16,
 
@@ -2408,6 +2413,12 @@ async fn dispatch(command: Command) -> Result<()> {
                 vhost_cert_file: vhost_cert_file
                     .as_ref()
                     .map(|p| p.to_string_lossy().to_string()),
+                // Overlaid from the live merged vhost config on every read of
+                // /admin/api/v1/config (admin_api::overlay_vhost_config), so the
+                // startup value is only a placeholder for a server with no vhost.
+                vhost_default_request_headers: Default::default(),
+                vhost_default_response_headers: Default::default(),
+                vhost_reservations: Vec::new(),
                 tls: config_tls,
                 ssh_gateway: false,
                 ssh_jump_enabled: ssh_jump_base_domain.is_some(),

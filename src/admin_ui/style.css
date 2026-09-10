@@ -480,6 +480,19 @@ tr:hover {
     word-break: break-all;
 }
 
+/* A multi-line config value (the merged vhost header maps and reservation
+   list, phase 06.4) must stack its lines: .config-value is a flex container,
+   which would otherwise lay them out side by side on one line. */
+.config-value-stack {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.15rem;
+}
+
+.config-subvalue {
+    overflow-wrap: anywhere;
+}
+
 /* Metrics panel styles */
 .metrics-container {
     display: grid;

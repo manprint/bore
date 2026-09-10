@@ -3961,7 +3961,18 @@ async fn vhost_auto_carriers_target_decays_after_a_quiet_period() -> Result<()> 
     let _g = SERIAL_GUARD.lock().await;
     // Test-only override: the real quiet period is a minute (see
     // `CARRIER_QUIET_PERIOD`), which is not a thing to spend per assertion.
-    std::env::set_var("BORE_VHOST_CARRIER_QUIET_MS", "300");
+    //
+    // It is set in TWO stages, and the first stage is load-bearing. `vhost.rs`
+    // reads `carrier_quiet_period()` on every heartbeat tick precisely so a
+    // harness can change it mid-test, and it must be changed here: with a short
+    // quiet period in force from the start, the decay fires on the very next
+    // 500 ms tick after the target rises, so the window in which the target
+    // reads 2 is shorter than the poll loop below can reliably sample. That is
+    // a race the assertion cannot survive on a slow runner and it is exactly
+    // how this test failed on windows-latest in CI. So: a long quiet period
+    // while the RISE is proved (the decay physically cannot fire), then a short
+    // one to prove the DECAY.
+    std::env::set_var("BORE_VHOST_CARRIER_QUIET_MS", "10000");
     let registry = spawn_auto_server(AUTO_SHRINK, 4).await?;
     let backend = spawn_bulk_backend().await?;
     spawn_auto_provider(backend, AUTO_SHRINK.0, "autoshrink").await?;
@@ -3992,13 +4003,37 @@ async fn vhost_auto_carriers_target_decays_after_a_quiet_period() -> Result<()> 
         .await,
         "the target must rise first, or the decay below proves nothing"
     );
+    // Red-check for the two-stage override above: inside the quiet period the
+    // grown target must SURVIVE several heartbeat ticks. Set the override to
+    // 300 ms from the start instead and this goes red in 1.5 s — which is the
+    // race that failed on windows-latest, now an assertion rather than a matter
+    // of whether the poll loop happened to sample the 2 before it became a 1.
+    //
+    // Note what "quiet" means and does not mean: `last_crowded` advances when a
+    // small request actually CONTENDS with bulk, not merely while a bulk
+    // transfer is in flight. A tunnel moving bulk with no small requests
+    // arriving is quiet by design — the extra carrier exists to keep small
+    // requests off the bulk carrier, so with no small requests there is nothing
+    // to keep off it, and DEC-VE9 leaves the live carrier in place either way.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        registry
+            .get("autoshrink")
+            .map(|e| e.carrier_target.load(Ordering::Relaxed))
+            .unwrap_or(0)
+            >= 2,
+        "the target must hold across heartbeat ticks inside the quiet period"
+    );
     let grown_pool = registry
         .get("autoshrink")
         .map(|e| e.pool.len())
         .unwrap_or(0);
 
-    // Release the bulk transfer and go quiet.
+    // Release the bulk transfer and go quiet. Only now does the quiet period
+    // shorten, so the target held at 2 for as long as the assertion above
+    // needed.
     drop(bulk);
+    std::env::set_var("BORE_VHOST_CARRIER_QUIET_MS", "200");
     assert!(
         wait_entry(&registry, "autoshrink", 5000, |e| e
             .carrier_target

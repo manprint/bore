@@ -354,6 +354,14 @@ pub struct Server {
     /// so focused liveness tests never perturb an unrelated registry.
     ssh_jump_ctrl_timeout: std::time::Duration,
 
+    /// Vhost provider receive deadline (F-1). Applied ONLY to a provider that
+    /// declared `HelloVhost::ctrl_heartbeat`; a legacy provider is never reaped
+    /// (DEC-VE2), because a client that cannot send heartbeats would be killed
+    /// every `vhost_ctrl_timeout` while perfectly healthy. Separate from
+    /// `secret_ctrl_timeout` so a focused liveness test never perturbs an
+    /// unrelated registry.
+    vhost_ctrl_timeout: std::time::Duration,
+
     /// Embedded SSH ingress gateway (Phase 4), when enabled via `--ssh-gateway`.
     #[cfg(feature = "ssh-gateway")]
     ssh_gateway: Option<Arc<crate::sshgw::SshGateway>>,
@@ -364,6 +372,7 @@ impl Server {
     pub fn new(port_range: RangeInclusive<u16>, secret: Option<&str>) -> Self {
         assert!(!port_range.is_empty(), "must provide at least one port");
         let port_range_str = format!("{}-{}", port_range.start(), port_range.end());
+        let udp_defaults = UdpDirectTuning::default();
         Server {
             port_range,
             conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
@@ -433,10 +442,17 @@ impl Server {
                 udp: false,
                 udp_socket_send_buffer: None,
                 udp_socket_recv_buffer: None,
-                udp_stream_receive_window: "16MiB".into(),
-                udp_connection_receive_window: "16MiB".into(),
-                udp_send_window: "64MiB".into(),
-                udp_max_streams: 4096,
+                // Derived, never restated: three of these were literals that
+                // had drifted from the constants they claimed to report (F-6,
+                // phase 02.1).
+                udp_stream_receive_window: crate::shared::format_iec_size(
+                    udp_defaults.stream_receive_window as u64,
+                ),
+                udp_connection_receive_window: crate::shared::format_iec_size(
+                    udp_defaults.connection_receive_window as u64,
+                ),
+                udp_send_window: crate::shared::format_iec_size(udp_defaults.send_window),
+                udp_max_streams: udp_defaults.max_direct_streams,
                 bind_domain: None,
                 control_hsts: "max-age=31536000".into(),
                 #[cfg(feature = "vpn")]
@@ -475,6 +491,7 @@ impl Server {
             access_logger_dropped: Arc::new(AtomicU64::new(0)),
             secret_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
             ssh_jump_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
+            vhost_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
             #[cfg(feature = "ssh-gateway")]
             ssh_gateway: None,
         }
@@ -491,6 +508,14 @@ impl Server {
     /// Override native SSH jump provider liveness timeout (tests only).
     pub fn ssh_jump_ctrl_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.ssh_jump_ctrl_timeout = timeout;
+        self
+    }
+
+    /// Override the vhost provider liveness timeout (tests only). Production
+    /// keeps [`secret::SECRET_CTRL_TIMEOUT`] (60 s), comfortably above the
+    /// client's 20 s heartbeat.
+    pub fn vhost_ctrl_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.vhost_ctrl_timeout = timeout;
         self
     }
 
@@ -1814,6 +1839,7 @@ impl Server {
                 https_policy,
                 backend_tls,
                 backend_tls_sni,
+                ctrl_heartbeat,
             }) => {
                 let Some(cfg) = self.vhost_config.clone() else {
                     warn!("vhost not configured on this server");
@@ -1849,6 +1875,8 @@ impl Server {
                     https_policy,
                     backend_tls,
                     backend_tls_sni,
+                    // Reap only what declared it can be reaped (DEC-VE2).
+                    ctrl_heartbeat.then_some(self.vhost_ctrl_timeout),
                 )
                 .await
             }
@@ -2515,6 +2543,53 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-6 / phase 02.1: the admin config view must report the direct-UDP
+    /// windows actually in force on a default-configured server. Three of these
+    /// four fields were hardcoded literals that had drifted — the view claimed a
+    /// 16 MiB connection window against a real 256 MiB, i.e. a **1:1**
+    /// connection/stream ratio, which is a configuration `CLAUDE.md` forbids
+    /// (it is the carriers=1 stall). An operator reading the API to size a host
+    /// was reading fiction.
+    #[test]
+    fn config_view_udp_defaults_are_derived_from_the_tuning_in_force() {
+        let server = Server::new(1024..=65535, None);
+        let view = &server.config_view;
+        let d = UdpDirectTuning::default();
+
+        assert_eq!(
+            view.udp_stream_receive_window,
+            crate::shared::format_iec_size(d.stream_receive_window as u64)
+        );
+        assert_eq!(
+            view.udp_connection_receive_window,
+            crate::shared::format_iec_size(d.connection_receive_window as u64)
+        );
+        assert_eq!(
+            view.udp_send_window,
+            crate::shared::format_iec_size(d.send_window)
+        );
+        assert_eq!(view.udp_max_streams, d.max_direct_streams);
+
+        // And the invariant those numbers exist to express, asserted on the
+        // reported strings rather than on the constants — a view that parses
+        // back to a 1:1 ratio is the bug, whatever the constants say.
+        assert_eq!(view.udp_connection_receive_window, "256MiB");
+        assert_eq!(view.udp_stream_receive_window, "16MiB");
+    }
+
+    #[test]
+    fn format_iec_size_only_rounds_exact_multiples() {
+        use crate::shared::format_iec_size;
+        assert_eq!(format_iec_size(16 * 1024 * 1024), "16MiB");
+        assert_eq!(format_iec_size(256 * 1024 * 1024), "256MiB");
+        assert_eq!(format_iec_size(2 * 1024 * 1024 * 1024), "2GiB");
+        assert_eq!(format_iec_size(64 * 1024), "64KiB");
+        // Not an exact multiple: raw bytes, because a rounded string fed back
+        // into `--udp-connection-receive-window` would change the value.
+        assert_eq!(format_iec_size(1024 * 1024 + 1), "1048577");
+        assert_eq!(format_iec_size(0), "0");
+    }
 
     #[test]
     fn t_compute_rate_bps_zero_dt() {

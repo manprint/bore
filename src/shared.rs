@@ -252,6 +252,27 @@ pub const DIRECT_UDP_SOCKET_SEND_BUFFER: usize = 16 * 1024 * 1024;
 /// connection.
 pub const MAX_DIRECT_STREAMS: u32 = 4096;
 
+/// Renders a byte count the way the `--udp-*-window` flags accept it, so the
+/// admin config view can be DERIVED from the constants in force instead of
+/// restating them as literals — which drifted twice (F-6: the view reported a
+/// 1:1 connection/stream ratio on a default server, a configuration that would
+/// violate the direct-window invariant if it were true).
+///
+/// Exact IEC multiples only; anything else falls back to raw bytes, because a
+/// rounded string fed back to `--udp-connection-receive-window` would silently
+/// change the value.
+pub fn format_iec_size(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    const KIB: u64 = 1024;
+    for (unit, suffix) in [(GIB, "GiB"), (MIB, "MiB"), (KIB, "KiB")] {
+        if bytes >= unit && bytes % unit == 0 {
+            return format!("{}{suffix}", bytes / unit);
+        }
+    }
+    bytes.to_string()
+}
+
 /// Idle time before the first TCP keepalive probe, and the interval between
 /// probes. Kept well under common NAT/firewall idle timeouts so that long but
 /// quiet transfers (e.g. a slow `tar | rclone rcat`) keep their middlebox
@@ -1219,6 +1240,21 @@ pub enum ClientMessage {
         /// `#[serde(default)]` keeps the wire backward-compatible.
         #[serde(default)]
         backend_tls_sni: Option<String>,
+        /// Whether this provider sends periodic [`ClientMessage::Heartbeat`] frames
+        /// on the control substream, so the server may apply its recv-deadline
+        /// reaper to this tunnel.
+        ///
+        /// When `false` the server keeps the legacy heartbeat-free path and NEVER
+        /// reaps this registration (DEC-VE2): an old client cannot send heartbeats,
+        /// and reaping it would kill a healthy idle tunnel every
+        /// `vhost_ctrl_timeout`. The wedged-provider defect (F-1) therefore
+        /// persists for un-upgraded clients, which is strictly better than
+        /// destroying live ones.
+        ///
+        /// `#[serde(default)]` keeps the wire format backward-compatible (an old
+        /// client omits it ⇒ reads as `false` ⇒ the pre-feature behaviour).
+        #[serde(default)]
+        ctrl_heartbeat: bool,
     },
 
     /// Ask the server to issue a fresh vhost-UDP nonce so the provider can
@@ -2135,6 +2171,7 @@ mod tests {
             https_policy: None,
             backend_tls: true,
             backend_tls_sni: Some("app.internal".into()),
+            ctrl_heartbeat: false,
         };
         let back: ClientMessage =
             serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
@@ -2146,6 +2183,59 @@ mod tests {
             } => {
                 assert!(backend_tls, "backend_tls must round-trip on the wire");
                 assert_eq!(backend_tls_sni.as_deref(), Some("app.internal"));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_vhost_ctrl_heartbeat_roundtrips_and_defaults_false() {
+        // DEC-VE2 wire contract. Two halves, and the FIRST is the one that
+        // matters: a provider running an older binary omits `ctrl_heartbeat`, so
+        // it must deserialize as `false` and the server must never reap it.
+        // Reading a missing field as `true` would make every legacy vhost tunnel
+        // reapable and kill healthy idle ones every `vhost_ctrl_timeout`.
+        let legacy =
+            r#"{"HelloVhost":{"subdomain":"app","client_id":"c","notes":null,"basic_auth":false}}"#;
+        match serde_json::from_str::<ClientMessage>(legacy)
+            .expect("a legacy HelloVhost must still deserialize")
+        {
+            ClientMessage::HelloVhost {
+                ctrl_heartbeat,
+                subdomain,
+                ..
+            } => {
+                assert_eq!(subdomain, "app");
+                assert!(
+                    !ctrl_heartbeat,
+                    "a client that omits ctrl_heartbeat must read as false, or the \
+                     server would reap a provider that cannot send heartbeats"
+                );
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        // And the capability survives a round-trip when it IS declared.
+        let full = ClientMessage::HelloVhost {
+            subdomain: "app".into(),
+            client_id: "c".into(),
+            notes: None,
+            basic_auth: false,
+            carriers: 0,
+            udp: false,
+            webserver_log: false,
+            auto_reconnect: false,
+            local_host: None,
+            local_port: 0,
+            https_policy: None,
+            backend_tls: false,
+            backend_tls_sni: None,
+            ctrl_heartbeat: true,
+        };
+        match serde_json::from_str::<ClientMessage>(&serde_json::to_string(&full).unwrap()).unwrap()
+        {
+            ClientMessage::HelloVhost { ctrl_heartbeat, .. } => {
+                assert!(ctrl_heartbeat, "ctrl_heartbeat must round-trip on the wire");
             }
             other => panic!("unexpected message: {other:?}"),
         }
@@ -2586,6 +2676,7 @@ fn hello_vhost_round_trips_and_fits_frame() {
         https_policy: None,
         backend_tls: false,
         backend_tls_sni: None,
+        ctrl_heartbeat: false,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(
@@ -3175,6 +3266,7 @@ fn hello_vhost_serde_omits_default_policy() {
         https_policy: None,
         backend_tls: false,
         backend_tls_sni: None,
+        ctrl_heartbeat: false,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let round: ClientMessage = serde_json::from_str(&json).unwrap();

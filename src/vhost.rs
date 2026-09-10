@@ -17,7 +17,7 @@ use time;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{interval, Instant as TokioInstant, MissedTickBehavior};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -627,6 +627,7 @@ pub async fn serve_vhost_provider(
     https_policy: Option<crate::shared::HttpsPolicy>,
     backend_tls: bool,
     backend_tls_sni: Option<String>,
+    ctrl_timeout: Option<Duration>,
 ) -> Result<()> {
     // Validate against live config (resolve_route checks reservations).
     let cfg = vhost_config.read().unwrap().clone();
@@ -815,15 +816,42 @@ pub async fn serve_vhost_provider(
     // Heartbeat loop until the provider disconnects.
     let mut hb = interval(HEARTBEAT_INTERVAL);
     hb.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Recv deadline for a wedged-but-TCP-alive provider (F-1): the control
+    // channel is a yamux substream, so a half-open peer is invisible to BOTH
+    // `send` (buffers into yamux) and `recv` (blocks forever) and the RAII
+    // `Deregister` guard below never drops — the subdomain is held forever and
+    // re-registration is rejected.
+    //
+    // Checked on every heartbeat tick (≤ HEARTBEAT_INTERVAL granularity) rather
+    // than via `timeout(recv)` — the latter would reset every time the heartbeat
+    // branch wins the `select!`, so it could never reach `ctrl_timeout`
+    // (DEC-VE3, and the same trap the secret reaper documents).
+    //
+    // `ctrl_timeout` is `None` for a provider that did not declare
+    // `HelloVhost::ctrl_heartbeat`: an old client cannot send heartbeats, so
+    // reaping it would kill a healthy idle tunnel every deadline (DEC-VE2). The
+    // `Option` encodes that in the type — there is no way to reap a provider
+    // that never opted in.
+    let mut last_recv = TokioInstant::now();
     loop {
         tokio::select! {
             _ = hb.tick() => {
                 if control.send(ServerMessage::Heartbeat).await.is_err() {
                     return Ok(());
                 }
+                if let Some(deadline) = ctrl_timeout {
+                    if last_recv.elapsed() >= deadline {
+                        warn!(%subdomain, timeout = ?deadline,
+                            "vhost provider control idle; reaping (peer wedged/abandoned)");
+                        return Ok(());
+                    }
+                }
             }
             message = control.recv() => {
+                last_recv = TokioInstant::now();
                 match message? {
+                    // Liveness ping; the deadline reset above is its only effect.
+                    Some(ClientMessage::Heartbeat) => {}
                     Some(ClientMessage::HelloVhost { .. })
                     | Some(ClientMessage::HelloSecret { .. })
                     | Some(ClientMessage::ConnectSecret { .. })

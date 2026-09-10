@@ -53,10 +53,30 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 /// [`crate::server::Server::secret_ctrl_timeout`]) so tests can reap fast.
 pub(crate) const SECRET_CTRL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How often a secret provider/consumer *client* sends [`ClientMessage::Heartbeat`]
-/// up the control substream. Must stay well under [`SECRET_CTRL_TIMEOUT`] so a
-/// few lost frames never trip the server's reaper.
+/// How often a secret/vhost provider (or secret consumer) *client* sends
+/// [`ClientMessage::Heartbeat`] up the control substream. Must stay well under
+/// [`SECRET_CTRL_TIMEOUT`] so a few lost frames never trip the server's reaper.
 pub(crate) const CTRL_CLIENT_HEARTBEAT: Duration = Duration::from_secs(20);
+
+/// [`CTRL_CLIENT_HEARTBEAT`] with a test-only override
+/// (`BORE_CTRL_HEARTBEAT_MS`), read per call so a harness can set it after
+/// startup. Mirrors `ssh_open_timeout`'s `BORE_SSH_OPEN_TIMEOUT_MS`.
+///
+/// Exists because the interesting property — *the client actually sends what it
+/// declared on the wire* — is otherwise only provable by a test that idles past
+/// a 20 s beat and a longer server deadline, i.e. 25 s+ of wall clock. A client
+/// that sets `HelloVhost::ctrl_heartbeat` and then fails to beat converts every
+/// healthy tunnel into a reaped one, so that gate has to be cheap enough to
+/// keep.
+pub(crate) fn ctrl_client_heartbeat() -> Duration {
+    match std::env::var("BORE_CTRL_HEARTBEAT_MS") {
+        Ok(ms) => match ms.parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => CTRL_CLIENT_HEARTBEAT,
+        },
+        Err(_) => CTRL_CLIENT_HEARTBEAT,
+    }
+}
 
 /// How long a consumer waits for the server to broker a UDP direct path before
 /// falling back to the relay.
@@ -1339,7 +1359,7 @@ impl Proxy {
         // Periodic liveness ping so the server's recv-deadline reaper never trips
         // on a healthy idle consumer (a yamux substream hides a half-open peer).
         let mut ctrl_heartbeat = {
-            let mut t = tokio::time::interval(CTRL_CLIENT_HEARTBEAT);
+            let mut t = tokio::time::interval(ctrl_client_heartbeat());
             t.set_missed_tick_behavior(MissedTickBehavior::Delay);
             t
         };

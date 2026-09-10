@@ -74,11 +74,18 @@ pub struct Client {
     /// Port that is publicly available on the remote.
     remote_port: u16,
 
-    /// Whether this client is a secret-tunnel **provider** (registered via
-    /// [`ClientMessage::HelloSecret`]). Only secret providers send periodic
-    /// [`ClientMessage::Heartbeat`] frames so the server's recv-deadline reaper
-    /// (`secret::SECRET_CTRL_TIMEOUT`) can detect a wedged/abandoned control
-    /// substream; public and vhost tunnels keep the legacy heartbeat-free path.
+    /// Whether this client sends periodic [`ClientMessage::Heartbeat`] frames on
+    /// its control substream, so the server's recv-deadline reaper can detect a
+    /// wedged/abandoned control substream (a yamux substream hides a half-open
+    /// peer from both `send` and `recv`).
+    ///
+    /// Set for secret-tunnel **providers** (`ClientMessage::HelloSecret`) and for
+    /// **vhost** providers (`ClientMessage::HelloVhost`). PUBLIC tunnels keep the
+    /// legacy heartbeat-free path — no reaper exists on that path and the wedged
+    /// registration defect was never reproduced there.
+    ///
+    /// A vhost provider must also set `HelloVhost::ctrl_heartbeat` so the server
+    /// knows it may reap; the two are set together at the same call site.
     sends_ctrl_heartbeat: bool,
 
     /// UDP socket reserved for a direct hole-punched path; `Some` only for a
@@ -622,6 +629,12 @@ impl Client {
                 https_policy: meta.https_policy,
                 backend_tls: meta.backend_tls,
                 backend_tls_sni: meta.backend_tls_sni.clone(),
+                // This client DOES send periodic heartbeats (see the Client
+                // construction below), so the server may apply its recv-deadline
+                // reaper to this registration. An older client omits the field
+                // ⇒ `false` ⇒ the server keeps the legacy un-reaped path
+                // (DEC-VE2).
+                ctrl_heartbeat: true,
             })
             .await?;
 
@@ -708,7 +721,12 @@ impl Client {
             local_host: local_host.to_string(),
             local_port,
             remote_port: 0,
-            sends_ctrl_heartbeat: false,
+            // Vhost providers ping the server every `CTRL_CLIENT_HEARTBEAT` so its
+            // recv-deadline reaper never trips on a healthy idle tunnel. Must stay
+            // in step with `ctrl_heartbeat: true` on the wire above: declaring the
+            // capability without sending the frames converts a healthy tunnel into
+            // a reaped one.
+            sends_ctrl_heartbeat: true,
             #[cfg(feature = "udp")]
             udp_socket: None,
             #[cfg(feature = "udp")]
@@ -1006,7 +1024,7 @@ impl Client {
         // a half-open peer). Public/vhost tunnels keep the legacy heartbeat-free
         // path (branch disabled below).
         let mut ctrl_heartbeat = {
-            let mut t = tokio::time::interval(crate::secret::CTRL_CLIENT_HEARTBEAT);
+            let mut t = tokio::time::interval(crate::secret::ctrl_client_heartbeat());
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             t
         };

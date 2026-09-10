@@ -10,9 +10,9 @@ use anyhow::Result;
 use bore_cli::vhost::VhostRegistry;
 use bore_cli::{
     client::{Client, ProviderMeta},
-    reconnect,
+    mux, reconnect,
     server::Server,
-    shared::HttpsPolicy,
+    shared::{ClientMessage, Delimited, HttpsPolicy, ServerMessage},
     transport::{self, Endpoint},
     vhost::{Reservation, VhostConfig, VhostModeCfg},
     weblog::{AccessLogConfig, AccessLogger},
@@ -3392,5 +3392,248 @@ async fn vhost_backend_tls_native_end_to_end() -> Result<()> {
         "no-flag provider must still serve the plaintext backend: {resp}"
     );
 
+    Ok(())
+}
+
+// ─── Control-liveness group (F-1 reaper, serial, control=17960, http=17970) ──
+//
+// A vhost provider that is ALIVE at TCP level but DEAD at application level (a
+// frozen process, a suspended laptop) used to hold its subdomain forever: the
+// control channel is a yamux substream, so a half-open peer is invisible to
+// BOTH `send` (buffers into yamux) and `recv` (blocks forever), and the RAII
+// `Deregister` guard therefore never dropped. Measured at t+180 s with
+// `relay_tx_bytes` frozen since t+20 s, on both transports, with re-registration
+// rejected throughout — F-1 in docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md.
+//
+// These tests hold the opener AND the control substream so the TCP connection
+// stays UP while nothing is ever sent: wedged, not closed. Dropping the client
+// would merely test the ordinary disconnect path, which already worked.
+
+// One control/HTTP pair per test in this group. A `#[tokio::test]` runtime is
+// dropped — and only then are its listeners closed — AFTER the test body
+// released `SERIAL_GUARD`, so the next test can start binding while the
+// previous server still holds the port. Sharing one pair made this group
+// flaky ("Connection refused" on the raw control dial) in a full-file run.
+const LIVE_REAP: (u16, u16) = (17960, 17961);
+const LIVE_BEAT: (u16, u16) = (17962, 17963);
+const LIVE_LEGACY: (u16, u16) = (17964, 17965);
+const LIVE_CLIENT: (u16, u16) = (17966, 17967);
+
+/// Spawn a vhost server whose provider reap deadline is `ctrl_timeout`.
+async fn spawn_live_server(
+    (control_port, http_port): (u16, u16),
+    ctrl_timeout: Duration,
+) -> Result<VhostRegistry> {
+    wait_port(control_port, false).await;
+    let mut server = Server::new(1024..=65535, None).vhost_ctrl_timeout(ctrl_timeout);
+    server.set_control_port(control_port);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_vhost(http_config("bore.local", http_port))?;
+    let registry = server.vhost_registry();
+    tokio::spawn(server.listen());
+    wait_port(control_port, true).await;
+    wait_port(http_port, true).await;
+    Ok(registry)
+}
+
+/// A raw control substream, so the test controls exactly what is sent — the real
+/// `Client` would send heartbeats on its own and could never wedge.
+async fn live_raw_control(control_port: u16) -> Result<(mux::Opener, Delimited<mux::Stream>)> {
+    let tcp = TcpStream::connect(("127.0.0.1", control_port)).await?;
+    let (opener, _acc) = mux::client(tcp);
+    let stream = opener.open().await?;
+    Ok((opener, Delimited::new(stream)))
+}
+
+/// `HelloVhost` for `subdomain`, declaring the heartbeat capability or not.
+fn hello_vhost_live(subdomain: &str, ctrl_heartbeat: bool) -> ClientMessage {
+    ClientMessage::HelloVhost {
+        subdomain: subdomain.to_string(),
+        client_id: "liveness".to_string(),
+        notes: None,
+        basic_auth: false,
+        carriers: 1,
+        udp: false,
+        webserver_log: false,
+        auto_reconnect: false,
+        local_host: None,
+        local_port: 0,
+        https_policy: None,
+        backend_tls: false,
+        backend_tls_sni: None,
+        ctrl_heartbeat,
+    }
+}
+
+/// Poll the registry until `subdomain` is present/absent, up to `ms`.
+async fn wait_label(registry: &VhostRegistry, subdomain: &str, present: bool, ms: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+    loop {
+        if registry.get(subdomain).is_some() == present {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// F-1: a wedged provider that DECLARED the heartbeat capability is reaped, and
+/// its subdomain becomes registrable again. The re-registration half is the
+/// point — a released registry slot that still rejects the label would leave the
+/// operator exactly as stuck as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vhost_wedged_provider_is_reaped_and_label_freed() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let registry = spawn_live_server(LIVE_REAP, Duration::from_millis(700)).await?;
+
+    // Register, then go silent while holding the connection open.
+    let (_opener, mut control) = live_raw_control(LIVE_REAP.0).await?;
+    control.send(hello_vhost_live("wedged", true)).await?;
+    assert!(
+        matches!(
+            control.recv::<ServerMessage>().await?,
+            Some(ServerMessage::VhostReady { .. })
+        ),
+        "server acks the vhost registration"
+    );
+    assert!(
+        wait_label(&registry, "wedged", true, 1500).await,
+        "the subdomain must be registered before we wedge"
+    );
+
+    assert!(
+        wait_label(&registry, "wedged", false, 4000).await,
+        "a wedged provider past ctrl_timeout must be reaped — F-1 measured it \
+         still holding the label at t+180 s"
+    );
+
+    // The label must be usable again, not merely absent from the registry.
+    let (_opener2, mut control2) = live_raw_control(LIVE_REAP.0).await?;
+    control2.send(hello_vhost_live("wedged", true)).await?;
+    assert!(
+        matches!(
+            control2.recv::<ServerMessage>().await?,
+            Some(ServerMessage::VhostReady { .. })
+        ),
+        "the freed subdomain must accept a fresh registration"
+    );
+    Ok(())
+}
+
+/// The false-positive guard: a provider that keeps beating is NEVER reaped. A
+/// reaper that killed healthy idle tunnels would be far worse than F-1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vhost_provider_with_heartbeats_is_never_reaped() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let registry = spawn_live_server(LIVE_BEAT, Duration::from_millis(600)).await?;
+
+    let (_opener, mut control) = live_raw_control(LIVE_BEAT.0).await?;
+    control.send(hello_vhost_live("beating", true)).await?;
+    assert!(matches!(
+        control.recv::<ServerMessage>().await?,
+        Some(ServerMessage::VhostReady { .. })
+    ));
+    assert!(wait_label(&registry, "beating", true, 1500).await);
+
+    // Beat every 100 ms (≪ 600 ms deadline) for ~2 s — several reaper windows.
+    let beater = tokio::spawn(async move {
+        for _ in 0..20 {
+            if control.send(ClientMessage::Heartbeat).await.is_err() {
+                break;
+            }
+            time::sleep(Duration::from_millis(100)).await;
+        }
+        control
+    });
+    time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        registry.get("beating").is_some(),
+        "a provider sending heartbeats must never be reaped"
+    );
+    let _ = beater.await;
+    Ok(())
+}
+
+/// DEC-VE2, the zero-regression gate: a provider that did NOT declare the
+/// capability is never reaped, however silent it is. An older client cannot send
+/// heartbeats, so reaping it would destroy healthy idle tunnels every deadline.
+/// F-1 persists for un-upgraded clients, which is strictly better.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vhost_legacy_provider_without_capability_is_never_reaped() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let registry = spawn_live_server(LIVE_LEGACY, Duration::from_millis(400)).await?;
+
+    // Same wedge as the first test, but `ctrl_heartbeat: false` — i.e. exactly
+    // what an old binary puts on the wire (it omits the field entirely).
+    let (_opener, mut control) = live_raw_control(LIVE_LEGACY.0).await?;
+    control.send(hello_vhost_live("legacy", false)).await?;
+    assert!(matches!(
+        control.recv::<ServerMessage>().await?,
+        Some(ServerMessage::VhostReady { .. })
+    ));
+    assert!(wait_label(&registry, "legacy", true, 1500).await);
+
+    // Silent across several 400 ms deadlines, and still registered.
+    time::sleep(Duration::from_millis(2000)).await;
+    assert!(
+        registry.get("legacy").is_some(),
+        "a provider that never declared ctrl_heartbeat must keep the legacy \
+         un-reaped path (DEC-VE2)"
+    );
+    Ok(())
+}
+
+/// The real client must actually send what it declares. A client that sets
+/// `HelloVhost::ctrl_heartbeat: true` and then fails to beat converts every
+/// healthy tunnel into a reaped one — the worst possible combination, and
+/// invisible to the raw-control tests above, which drive the wire by hand.
+///
+/// The margin has to be the right way round or the test proves nothing: the
+/// idle period must EXCEED the server deadline, while the client's beat
+/// interval stays comfortably under it. `BORE_CTRL_HEARTBEAT_MS` shrinks the
+/// client's 20 s beat so that is expressible in a fast test — the first version
+/// of this test slept 22.5 s against a 25 s deadline, so the reaper could never
+/// fire and the test passed even with the client's heartbeat disabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vhost_real_client_survives_past_the_reap_deadline() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    // Client beats every 150 ms; server reaps after 700 ms; we idle for 2.5 s.
+    // So ~16 beats must land inside a window covering three deadlines.
+    std::env::set_var("BORE_CTRL_HEARTBEAT_MS", "150");
+    let registry = spawn_live_server(LIVE_CLIENT, Duration::from_millis(700)).await?;
+    let body_port = spawn_http_stub("ok").await;
+
+    let client = Client::new_vhost_provider(
+        "127.0.0.1",
+        body_port,
+        &format!("127.0.0.1:{}", LIVE_CLIENT.0),
+        "realclient",
+        "liveness",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(client.listen());
+    assert!(wait_label(&registry, "realclient", true, 2000).await);
+
+    time::sleep(Duration::from_millis(2500)).await;
+    std::env::remove_var("BORE_CTRL_HEARTBEAT_MS");
+    assert!(
+        registry.get("realclient").is_some(),
+        "the real vhost client must keep its registration alive by beating — it \
+         declared ctrl_heartbeat on the wire, so the server WILL reap it if the \
+         frames do not arrive"
+    );
+    // And the tunnel must still work, not merely be registered.
+    let response = send_http(LIVE_CLIENT.1, "realclient.bore.local", "/").await?;
+    assert!(
+        response.contains("200 OK"),
+        "the tunnel must still serve after idling past several reap deadlines: {response}"
+    );
     Ok(())
 }

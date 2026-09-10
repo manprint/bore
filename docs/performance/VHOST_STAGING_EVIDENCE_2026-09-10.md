@@ -2052,3 +2052,299 @@ Each of these produced a wrong conclusion before it was found:
     working notes; the server was using 1.4 of 2 cores at the time, so nothing
     was saturated. Parallel streams then reached 334.7 MB/s at 1.90 cores. A
     plateau is only a ceiling once some resource is measurably full.
+
+---
+
+## 10. HTTP/2 on the vhost edge — the phase 07 spike
+
+Phase 07 of `docs/plans/plan_VhostEnhancements/` exists so the largest
+engineering item in the plan is not committed on the back of an estimate. The
+estimate it was built on: connection setup measured **+45 ms** from a 21 ms-RTT
+client but only **+4.9 ms** at 1.84 ms RTT (§2.15 A3), so ~4.9 ms is server time
+and ~40 ms is the client's TLS round trips; a browser opens ~6 connections per
+origin, so a 30-asset page pays several waves of that, and h2 collapses the
+waves onto one connection.
+
+This section measures it. **No production code was written for it.**
+
+### 10.1 Apparatus (`scripts/vhost_h2_page_load.sh`)
+
+The impaired leg must be the **client leg only** — the provider→server and
+server→origin legs are localhost in a real deployment and must stay undelayed.
+Loopback cannot express that: the kernel picks source `127.0.0.1` for every
+loopback destination, so a `tc` filter on `dst 127.0.0.1/32` delays *every* hop.
+So the client runs in its own network namespace behind a veth pair and netem
+sits on the veth, which is the only leg it can touch. netem delay is applied at
+RTT/2 on both ends; calibrated on a bare veth it is accurate to ~0.15 ms, and
+every table below carries the *measured* RTT.
+
+Three arms, same 31-asset page, same self-signed cert, same response bytes:
+
+| arm | what it is |
+| --- | --- |
+| `tunnel-h1` | the product as it ships: HTTP/1.1 through the vhost TLS edge, `--parallel-max 6` |
+| `direct-h1` | the same protocol with the tunnel removed — a node `https` server on the host |
+| `direct-h2` | one multiplexed connection — a node `http2` server, same handler, same bytes |
+
+`direct-h1` exists so the tunnel's own contribution can be separated from the
+protocol's. Connection counts are reported from `curl`'s `%{num_connects}`
+summed over the page, so multiplexing is proved rather than assumed (6 for the
+h1 arms, 1 for h2 in every run).
+
+Two apparatus caveats, stated because they bound what may be read off the
+tables. First, `direct-h2` and `direct-h1` are node, `tunnel-h1` is bore, so any
+tunnel-versus-direct row crosses implementations — that is visible in the
+bulk-only table below, where bore's edge out-sends node's `https` by 300 ms at
+100 ms RTT. The *protocol* comparison (`direct-h2` versus `direct-h1`) is
+within one implementation and is the trustworthy one. Second, `curl -Z` is a
+browser-shaped client, not a browser: no preconnect, no priority tree, no
+render-blocking.
+
+### 10.2 Measured — the prize depends entirely on what is on the page
+
+**A realistic mixed page: 30 × ~1 KiB assets + one 2 MiB asset.**
+
+| measured RTT | tunnel-h1 | direct-h1 | direct-h2 | h2 vs tunnel | h2 vs h1 (protocol alone) |
+| --- | --- | --- | --- | --- | --- |
+| 2.08 ms | 46.0 ms | 43.0 ms | 63.2 ms | **0.73×** | 0.68× |
+| 21.18 ms | 348.0 ms | 327.7 ms | 326.7 ms | **1.07×** | 1.00× |
+| 60.22 ms | 1036.0 ms | 1033.9 ms | 732.9 ms | **1.41×** | 1.41× |
+| 100.14 ms | 1615.7 ms | 1613.3 ms | 1113.6 ms | **1.45×** | 1.45× |
+
+**The same page with the large asset removed: 30 × ~1 KiB only.** This is the
+wave structure on its own.
+
+| measured RTT | tunnel-h1 | direct-h1 | direct-h2 | h2 vs tunnel | h2 vs h1 |
+| --- | --- | --- | --- | --- | --- |
+| 2.14 ms | 24.8 ms | 25.5 ms | 16.7 ms | **1.49×** | 1.53× |
+| 21.16 ms | 161.0 ms | 158.2 ms | 94.5 ms | **1.70×** | 1.67× |
+| 60.15 ms | 432.9 ms | 431.9 ms | 250.3 ms | **1.73×** | 1.73× |
+| 100.14 ms | 713.5 ms | 712.2 ms | 410.2 ms | **1.74×** | 1.74× |
+
+**Bulk on its own: the 2 MiB asset with no small assets.**
+
+| measured RTT | tunnel-h1 | direct-h1 | direct-h2 | h2 vs h1 |
+| --- | --- | --- | --- | --- |
+| 2.11 ms | 38.9 ms | 38.0 ms | 73.8 ms | **0.51×** |
+| 100.19 ms | 1210.5 ms | 1513.3 ms | 1110.1 ms | 1.36× |
+
+Three results, and the third is the one that decides the phase.
+
+1. **The tunnel is not the page-load problem.** `tunnel-h1` and `direct-h1` are
+   within **1–3 ms of each other on a 31-asset page at every RTT** — 348.0 vs
+   327.7 ms at 21 ms, 1036.0 vs 1033.9 ms at 60 ms. Whatever a page costs, bore
+   is contributing single-digit milliseconds of it. The 45 ms per new connection
+   §2.15 measured is the client's TLS round trips, and it is paid identically
+   with or without the tunnel.
+2. **On the wave structure alone, h2 wins everywhere and by a lot** — 1.49× at
+   2 ms rising to 1.74× at 100 ms, saving 8 ms and 303 ms respectively. The
+   estimate that motivated the phase is confirmed for this half.
+3. **On bulk over one multiplexed connection, h2 loses half the throughput**
+   — 0.51× at 2 ms RTT (2 MiB in 73.8 ms against 38.0 ms, i.e. 28 MB/s against
+   55 MB/s on the same path, same server, same bytes). One connection carrying
+   every stream is exactly what h2 *is*, so this is not a tuning oversight: it
+   is the trade. It is also why the mixed page **reverses to 0.73× at 2 ms** and
+   only reaches 1.07× at 21 ms.
+
+So the prize is real, but it is a function of the viewer's RTT *and* of the
+page's composition, and at the RTT of the same-region VM (the configuration
+bore's throughput numbers are quoted at) an h2 edge would make the page
+**slower**.
+
+### 10.3 The graft (phase 07.2, read-only)
+
+The plan expected the ALPN plumbing to be "already there". It is — but only on
+one of the two listeners, and it deliberately does not negotiate.
+
+- **Unified topology** (the staging shape: the control port *is* 443). The
+  browser's TLS lands in `sshgw::accept_tls_with_alpn`, whose
+  `demux_classify_alpn` sees `h2` offered, classifies it as "not SSH", and hands
+  it to `Server::route_connection_known_http` → `serve_control_http`, which
+  reads the request head and routes by `Host`. So the offer *does* arrive
+  intact and the seam is a single function.
+- **Standalone topology** (`--vhost-https-port` on its own listener).
+  `vhost::handle_https` calls `acceptor.accept(stream)` on a plain rustls
+  acceptor. There is no ALPN classification on this path at all.
+- **Neither TLS config sets `alpn_protocols`** (`transport::load_server_tls`
+  leaves it empty; only the *client* config advertises `bore` and the backend
+  connector advertises `http/1.1`). A rustls server with no ALPN list ignores
+  the offer, so every browser silently and correctly falls back to HTTP/1.1
+  today. Nothing is half-enabled.
+
+An h2 edge therefore needs **two** seams, not one, or a refactor that gives the
+standalone frontend the same LazyConfigAcceptor treatment as the control port.
+
+**Invariant collisions, named.**
+
+1. **The response-header injection path is byte-level.**
+   `vhost::relay_response_injected` reads the h1 response head with
+   `read_head_async` and rewrites it with `rewrite_head`. h2 response headers
+   are HPACK-encoded on the wire, so none of that applies as written; injection
+   would have to move into the h2 header-frame encoder. This is the piece most
+   likely to be underestimated, and it is also the piece with a bug and a fix
+   behind it (`docs/VHOST_INJECTED_FLUSH_FIX.md`) — the flush-before-parking
+   invariant is a property of the hand-rolled copy loop that an h2 body writer
+   would replace entirely.
+2. **The bulk path is a 256 KiB splice, and h2 would replace it with a frame
+   layer.** `shared::proxy_buffer_size()` defaults to 256 KiB and `CLAUDE.md`
+   already records that dropping to `tokio::io::copy`'s 8 KiB was a high-BDP
+   regression. h2 frames at 16 KiB with per-stream flow control on top; the
+   0.51× above is that cost, measured.
+3. **Fixing (2) the obvious way is the trade DEC-VE8 forbids.** Raising h2's
+   stream and connection windows to recover bulk throughput is "buy latency
+   with buffer memory" on the edge, per connected browser — the same shape as
+   the QUIC receive-window ceiling F-13 already priced at 4.5× the relay's
+   memory under concurrency.
+4. **The yamux single-task rule is *not* a collision.** Each h2 stream would map
+   onto one proxied connection, which is already one task with one substream —
+   the shape `mux` requires (`[[yamux-stream-split-wedge]]`). Mapping N h2
+   streams onto N proxied connections needs no change to the muxer and no
+   `tokio::io::split` across tasks. This is the reassuring finding.
+5. **The origin leg stays HTTP/1.1.** It is usually localhost, where §2.15
+   measured connection setup at 4.9 ms, so pooling or upgrading it buys almost
+   nothing. That was original candidate 3 and remains untested-because-pointless.
+
+**Effort, in subphases, if it were approved:**
+
+| subphase | work | size |
+| --- | --- | --- |
+| 1 | negotiate `h2` in ALPN on both frontends (unified + standalone), behind a per-tunnel opt-in flag, default off | small |
+| 2 | terminate h2 on the edge (hyper server), map each stream to one proxied connection, preserve `--max-conns` accounting per stream | **large** |
+| 3 | re-express request/response header injection and the access log on encoded header frames | medium |
+| 4 | flow-control and buffer policy so bulk does not regress; gate with `vhost_h2_page_load.sh` + the bulk-only arm | medium, and the risky one |
+| 5 | 502/504 synthesis, keep-alive, upgrade/WebSocket and `CONNECT` fall-back to h1 for anything h2 cannot carry | medium |
+
+Subphase 2 alone is larger than every phase of this plan except 03.
+
+### 10.4 Recommendation (phase 07.3): **no-go for now, and the measurement is recorded so it is not re-asked from zero**
+
+The plan's own criteria: *go* if the measured headroom at 60–100 ms is a
+substantial fraction of page time **and** no invariant needs reworking; *no-go
+or defer* if the headroom is modest at realistic RTTs, or if the audience is
+mostly low-RTT.
+
+- The headroom at 60–100 ms **is** substantial: 1.41–1.45× on a mixed page,
+  303–502 ms off a page load.
+- But it **reverses below ~20 ms RTT** (0.73× at 2 ms) because of a 0.51× bulk
+  penalty that is intrinsic to single-connection multiplexing, and the whole
+  campaign's throughput case is built on the low-RTT configuration.
+- And it collides with the two vhost invariants that each have a shipped bug
+  behind them (the injected-flush path and the 256 KiB splice), plus DEC-VE8 if
+  the bulk penalty is bought back with window memory.
+- Meanwhile the thing an h2 edge would fix is **not bore's cost**: the tunnel
+  contributes 1–3 ms of a 31-asset page. Phase 03's carrier and bulk scheduling
+  work on the same page shape is cheaper and does not touch the edge protocol.
+
+Revisit if, and only if, a deployment shows a **predominantly >60 ms audience**
+serving **small-asset-heavy** pages. In that case subphase 1 plus a *header-only*
+h2 path (leaving bulk responses on h1 by content-length) would capture most of
+the prize without subphase 4's risk — that hybrid is worth a spike of its own
+before subphase 2 is funded.
+
+**HTTP/3 stays out of scope**, as the phase specified: it would ride the QUIC
+path, whose ceiling is 0.96 Gbit/s at 2.5× the CPU per byte (F-16).
+
+---
+
+## 11. Phase 03 verified in vivo — the bulk/small isolation actually works
+
+Phase 03.5 asked for the calibration of the bulk threshold and the growth
+timings. What it produced first is more valuable: **the acceptance measurement
+for the whole of phase 03**, on an apparatus that removes the 29 % control drift
+instead of fighting it.
+
+### 11.1 Apparatus (`scripts/vhost_bulk_isolation.sh`)
+
+The leg that queues under bulk is the **carrier** leg (server↔provider): bulk
+bytes fill the yamux carrier and a small request's substream waits behind them.
+So the provider, the origin *and* the measuring client all live in one network
+namespace, the bore server lives on the host, and netem on the veth stands in
+for the WAN — the campaign's own shape (the VM ran client + provider + origin,
+the server was remote), with the RTT under our control and a private server
+instead of frozen staging.
+
+Small-request latency is `oha -c 1` keep-alive on a 1 KiB asset over a 6–8 s
+window; bulk is 1 or 2 looped `/stream` transfers on the **same** tunnel, so each
+one is a proxied connection pinned to a carrier for its life (N-5). Every point
+also reports the live carrier count, the published `carrier_target`, and
+`direct_stream_opens` — a `--udp` case that silently served over the relay must
+not be readable as a direct-path result, which is the pitfall that cost a
+retracted finding in §4.
+
+### 11.2 Measured at 2.1 ms RTT — the DEC-VE7 regime
+
+Two independent runs (6 s and 8 s windows); both are given where they differ.
+
+| arm | bulk 0 | bulk 1 | bulk 2 | carriers observed |
+| --- | --- | --- | --- | --- |
+| relay `--carriers 1` | p50 4.26 / p95 4.46 | p50 4.78 / p95 6.21 | **p50 5.92 / p95 15.0–23.5** | 1 |
+| relay `--carriers 4` | p50 4.29 / p95 4.51 | p50 4.33 / p95 5.40 | **p50 4.41 / p95 5.4–5.6** | 4 |
+| relay `--carriers 0` (auto) | p50 4.29 / p95 4.52 | p50 4.44 / p95 5.69 | **p50 4.45 / p95 5.4–5.6** | **1 → 2 → 3** |
+| direct `--udp --carriers 1` | p50 4.33 / p95 4.63 | p50 5.31 / p95 8.86 | p50 5.10 / p95 6.7–6.9 | 1 |
+| direct `--udp --carriers 4` | p50 4.31 / p95 4.57 | p50 4.26 / p95 5.9 | p50 4.41 / p95 6.8–7.1 | 4 |
+
+Four results.
+
+1. **F-15 reproduces exactly on the legacy single-carrier path.** With two bulk
+   transfers in flight, `--carriers 1` takes p50 from 4.26 to 5.92 ms and p95
+   from 4.46 to **15.0–23.5 ms** — a 3.4–5.3× tail. Nothing about that is a
+   staging artefact: it is the same shape on a private server with 2 ms of
+   synthetic WAN.
+2. **Phase 03.2's bulk-aware selection removes it.** `--carriers 4` holds p50 at
+   4.41 ms and p95 at 5.4–5.6 ms under the same two bulk transfers — a **2.7–4.3×
+   better tail** than `--carriers 1`, and only 1.2 ms above its own unloaded p95.
+3. **Phase 03.3's adaptive pool matches the fixed pool while sizing itself.**
+   `--carriers 0` starts at **one** carrier, grows to **two** under one bulk
+   transfer and **three** under two, and lands on the same latency as
+   `--carriers 4` (p50 4.45, p95 5.4–5.6). The growth is *observed* through the
+   admin API's `carriers` and `carrier_target`, not inferred: the mechanism
+   works end to end over a real control loop, which is what the unit and
+   integration gates cannot prove on their own.
+4. **DEC-VE7's target is met with room.** The target was a 7–15 ms p50 under
+   bulk rather than the unloaded 2.5 ms. Measured p50 under two bulk transfers:
+   **4.41 ms** (`--carriers 4`) and **4.45 ms** (`--carriers 0`), i.e. inside the
+   band and near the unloaded figure. Phase 03.4's QUIC stream demotion shows
+   the same direction on the direct path: `--udp --carriers 1` under two bulk
+   transfers is p95 6.7–6.9 ms against the relay's 15.0–23.5 ms at the same
+   carrier count.
+
+### 11.3 Measured at 21.2 ms RTT — and one honest negative
+
+At browser RTT everything is round-trip-dominated: p50 is 42.4–42.7 ms in every
+arm (two round trips), and no carrier setting moves it, because there is no
+queue to remove — the wait is the network. The tails still separate, and not in
+the direct path's favour:
+
+| arm | p95, bulk 0 | p95, bulk 1 | p95, bulk 2 |
+| --- | --- | --- | --- |
+| relay `--carriers 1` | 42.83 | 43.88 | **44.22** |
+| relay `--carriers 4` | 42.90 | 42.83 | **42.80** |
+| relay `--carriers 0` (auto) | 42.78 | 43.73 (grew to 2) | **42.76** (2) |
+| direct `--udp --carriers 1` | 43.08 | 45.11 | **65.14** |
+| direct `--udp --carriers 4` | 43.06 | 44.61 | **112.68** |
+
+**The QUIC direct path's tail under concurrent bulk is worse than the relay's at
+21 ms RTT, and worse still with four carriers** (112.7 ms against the relay's
+42.8 ms). Phase 03.4's per-stream demotion caps a bulk sender's burst at 128 KiB
+and drops its priority, which is enough at 2 ms but not at 21 ms, where a
+demoted stream's next burst is a full round trip away. This is consistent with
+the campaign's own transport ranking (§2.8, F-8: the relay is the right
+transport on a clean path) and it is now also true of the *latency* tail under
+load, not only of throughput. It is a reason to keep `--udp` for lossy and
+long-RTT paths and not to reach for it under concurrency.
+
+The adaptive pool reached target 2 rather than 3 at this RTT: growth is
+rate-limited to one step per `CARRIER_TARGET_MIN_INTERVAL` (2 s) and the
+measurement window was 6 s, of which the first seconds carry the warm-up. That
+is the rate limit behaving as designed, not a failure to grow.
+
+### 11.4 What is still not calibrated, and why it was not guessed
+
+The 512 KiB bulk threshold, the 2 s growth interval and the 60 s quiet period
+are **not** swept here. `pool::BULK_CLASSIFY_BYTES`,
+`CARRIER_TARGET_MIN_INTERVAL` and `CARRIER_QUIET_PERIOD` are compile-time
+constants with no environment override, so a sweep means a rebuild per value —
+and adding an override to production code purely to sweep it would be a change
+in a phase whose acceptance is already met. The measurement above says the
+chosen values work at both RTTs; a sweep is worth doing the day one of them is
+suspected, and this harness is where it goes.

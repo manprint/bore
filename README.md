@@ -417,6 +417,19 @@ OS. x86 should be cheaper per byte than Graviton2 at the same clock, so treat 3.
 ceiling of the estimate rather than the middle of it. The three-script measurement sequence
 that produces these numbers on any host is documented in `scripts/perf/README.md`.
 
+**The browser leg speaks HTTP/1.1, and that is a measured decision, not an omission.** The
+vhost edge does not offer `h2` in its TLS ALPN list, so every browser falls back to HTTP/1.1
+and opens its usual ~6 connections. Measured with a client at controlled RTT behind netem
+(`scripts/vhost_h2_page_load.sh`), on a 31-asset page: **the tunnel contributes only 1–3 ms of
+the page at every RTT from 2 ms to 100 ms** — page-load time is the browser's TLS round trips,
+not bore's work. HTTP/2 would collapse those round trips and is **1.49–1.74× faster on
+small assets alone**, but it loses **half the bulk throughput** (0.51× on a 2 MiB asset at
+2 ms RTT) because every stream shares one connection. Net effect on a realistic mixed page:
+**0.73× at 2 ms RTT, 1.07× at 21 ms, 1.45× at 100 ms.** So h2 would make a same-region page
+slower and only pays for a distant audience serving small-asset pages. Full tables, the graft
+study and the recommendation are in
+`docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md` §10.
+
 **Direct-path memory: the sizing rule.** The QUIC connection receive window is a
 per-connection **ceiling, not a reservation** — a healthy tunnel buffers approximately
 nothing. It only fills when the public reader stops draining, which is what a browser
@@ -2320,6 +2333,19 @@ extra carriers measurably *cost* a little (a paired A/B measured a median `c=4/c
 throughput ratio of 0.941), while under concurrent bulk load they are the lever that
 spreads work across CPU cores. The right count is regime-dependent, so `0` tracks the
 regime and a fixed `N` is still there when you know your own workload.
+
+**Measured** (netns client + provider at 2.1 ms synthetic RTT, private server, two
+concurrent bulk transfers on the same tunnel, `scripts/vhost_bulk_isolation.sh`):
+
+| carriers | small-request p50 | small-request p95 | pool |
+| --- | --- | --- | --- |
+| `1` (default) | 5.92 ms | **15.0–23.5 ms** | 1 |
+| `4` (fixed) | 4.41 ms | 5.4–5.6 ms | 4 |
+| `0` (auto) | 4.45 ms | 5.4–5.6 ms | **1 → 2 → 3, as the bulk arrived** |
+
+Unloaded, all three sit at p50 4.3 ms / p95 4.5 ms. So the single carrier's tail is
+what the feature removes, and the adaptive pool buys it while running the smallest
+pool that does.
 
 Three properties worth knowing before you turn it on:
 

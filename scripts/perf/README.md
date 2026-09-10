@@ -36,6 +36,8 @@ The scripts that reach the server host over ssh additionally need
 | `vhost_remote_efficiency.sh` | measurement VM | `paired` (default) for alternating single-stream rounds, `saturate` for parallel streams. Prints the epoch window of each case so the server samplers can be matched to it |
 | `server_cpu_sample.sh` | workstation | `N IV` — N samples every IV seconds, over ssh to the server host |
 | `server_cpu_report.sh` | workstation | `<file from the sampler>` |
+| `../vhost_bulk_isolation.sh` | workstation, **root** | `sudo -n /abs/path/scripts/vhost_bulk_isolation.sh [rtt-list] [secs]`. Phase 03.5: small-request p50/p95 with 0/1/2 bulk transfers in flight, across `--carriers 1/4/0` and both transports, at a controlled RTT. **Needs no deployment access.** Lives in `scripts/` for the same sudo-path reason |
+| `../vhost_h2_page_load.sh` | workstation, **root** | `sudo -n /abs/path/scripts/vhost_h2_page_load.sh [rtt-list] [runs] [large-bytes] [small-count]`. Phase 07.1: full page load versus RTT, h1-through-tunnel / h1-direct / h2-direct. **Needs no deployment access.** Lives in `scripts/` (not here) because NOPASSWD sudo is per exact path and the glob does not cross `/` |
 | `server_ena_sample.sh` | workstation | `N IV`. AWS ENA instance-allowance counters (`bw_*_allowance_exceeded`, `pps_allowance_exceeded`) plus `/proc/net/dev`. Needs `sudo -n ethtool` on the server |
 
 Run `server_cpu_sample.sh` **concurrently** with whichever suite you care about;

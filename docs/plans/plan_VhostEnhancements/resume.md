@@ -3,7 +3,7 @@
 > Update this file at the end of every working session. It is the only file a
 > new session needs to read to know where the work stands.
 
-## Status: phases 01, 02, 03, 05 and 06 complete (code + gates). 04 and 07 need measurement.
+## Status: phases 01, 02, 03, 05, 06 and 07 done. Only 04 remains, and it needs staging on this commit.
 
 Authored 2026-09-10 by Opus, from
 `docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md`. Branch `main`.
@@ -12,11 +12,11 @@ Authored 2026-09-10 by Opus, from
 | --- | --- | --- |
 | 01 | vhost heartbeat + reaper (F-1/F-10) | **code + gates done**, in-vivo pending |
 | 02 | bound direct-path receive window (F-13) | **code + gates done** |
-| 03 | isolate small requests from bulk (F-15) — **headline** | **code + gates done**; 03.5 calibration pending |
+| 03 | isolate small requests from bulk (F-15) — **headline** | **done and verified in vivo** (§11 of the evidence doc) |
 | 04 | relay concurrency tail (OQ7) — diagnose first | **not started** — needs staging on the new code |
 | 05 | fast, legible failures (F-14/F-12) | **code + gates done**, one documented deviation |
 | 06 | documentation + observability (F-8/F-16/F-6/F-3) | **done** |
-| 07 | HTTP/2 edge — spike only | **not started** — measurement phase |
+| 07 | HTTP/2 edge — spike only | **done — measured, NO-GO recorded** |
 
 Commits: `191a2f1` (01 + 02.1), `d4b6a1e` (02 + 03.1/03.2), then this session's
 commit for 03.3, 03.4, 05 and 06.
@@ -73,6 +73,42 @@ windows and derived them from `UdpDirectTuning::default()` instead.
 - **05.3**: `/admin/api/v1/vhost` gained `current_path`, `direct_fallbacks` and
   `carrier_target`; `direct_stream_opens` now counts **successful** opens only.
 
+### 03.5 — phase 03 verified in vivo (§11 of the evidence document)
+`scripts/vhost_bulk_isolation.sh` puts the provider, the origin AND the client
+in one netns with netem on the veth, because the leg that queues under bulk is
+the CARRIER leg. At 2.1 ms RTT with two bulk transfers on the same tunnel:
+- `--carriers 1` (the legacy path) reproduces F-15 exactly: p50 4.26 → 5.92 ms,
+  **p95 4.46 → 15.0–23.5 ms**.
+- `--carriers 4` holds p50 4.41 / p95 5.4–5.6 — a 2.7–4.3× better tail.
+- `--carriers 0` matches it (p50 4.45 / p95 5.4–5.6) while the pool **grows
+  1 → 2 → 3** as the bulk arrives, observed through the admin API's `carriers`
+  and `carrier_target`. That is 03.3 proven over a real control loop.
+- **DEC-VE7 met with room**: the target was 7–15 ms p50 under bulk; measured
+  4.41–4.45 ms.
+- **One honest negative**: at 21 ms RTT the QUIC direct path's p95 under two
+  bulk transfers is 65 ms at `--carriers 1` and **112.7 ms at `--carriers 4`**,
+  against the relay's 42.8 ms. 03.4's demotion caps a bulk burst at 128 KiB,
+  which is enough at 2 ms but not when the next burst is a round trip away.
+  Consistent with F-8: `--udp` is for lossy and long-RTT paths, not for
+  concurrency.
+
+### 07 — HTTP/2 edge spike (no production code, as specified)
+Measured with a client in its own netns behind netem
+(`scripts/vhost_h2_page_load.sh`, 2 / 21 / 60 / 100 ms), three arms on the same
+31-asset page: h1 through the tunnel, h1 direct, h2 direct. Results and the
+recommendation are §10 of the evidence document. The short version:
+- **The tunnel contributes 1–3 ms of a 31-asset page at every RTT.** Page load
+  is the browser's TLS round trips, not bore's work.
+- h2 is **1.49–1.74× faster on small assets alone** but **0.51× on bulk** over
+  one multiplexed connection, so the mixed page is **0.73× at 2 ms**, 1.07× at
+  21 ms and 1.45× at 100 ms.
+- **NO-GO recorded.** Revisit only for a predominantly >60 ms, small-asset
+  audience, and then spike a header-only hybrid before funding h2 termination.
+- The graft is two seams, not one: the unified control port already classifies
+  the `h2` ALPN offer (`sshgw::accept_tls_with_alpn`), but the standalone
+  `vhost::handle_https` frontend has no ALPN handling at all, and NEITHER TLS
+  config sets `alpn_protocols` — which is why browsers correctly get h1 today.
+
 ### 06 — documentation and observability
 - **06.1/06.2**: README states the transport recommendation, the `--udp`
   0.96 Gbit/s ceiling, and the 5.74 CPU-s/GiB sizing rule *with its method*.
@@ -123,12 +159,13 @@ failing fast client-side with the remedy in the message.
   - phase 03.3 adaptive carriers end to end (server-side growth requests)
   - phase 04 g8 concurrency ladder re-measurement (OQ7)
   - phase 05.1 netem blackhole redo (`scripts/perf/vhost_netem_matrix.sh` G6)
-- **Phase 03.5 calibration** — bulk threshold, growth/shrink timings and the
-  QUIC priority side, with `scripts/perf/vhost_bulk_latency.sh` (paired design,
-  server-side `relay_tx_bytes` deltas). The *provider*-side half of 03.4 is a
-  client-only change and is measurable against frozen staging today.
-- **Phase 07** — HTTP/2 spike: 7.1 page-load measurement versus RTT, 7.2
-  read-only graft study, 7.3 go/no-go. No production code in that phase.
+- **Phase 03.5's threshold sweep** — the 512 KiB bulk threshold, the 2 s growth
+  interval and the 60 s quiet period are compile-time constants with no env
+  override, so sweeping them means a rebuild per value. §11.2 shows the chosen
+  values work at 2 ms and 21 ms RTT, so the sweep is deferred until one of them
+  is actually suspected; `scripts/vhost_bulk_isolation.sh` is where it goes.
+- **Phase 04** — the concurrency ladder, the only phase with no code and no
+  measurement yet. It needs staging on this commit.
 
 ## Decisions already locked — do not re-litigate
 
@@ -174,7 +211,12 @@ See `overview.md` for the full statements with rationale.
 
 `scripts/perf/` with its own `README.md`; the runbook is §9 of the evidence
 document and §9.6 lists the thirteen harness pitfalls that produced wrong
-conclusions. This session extended two of them: `vhost_remote_stability.sh` g5
+conclusions. This session added two self-contained root harnesses in `scripts/` (not
+`scripts/perf/` — NOPASSWD sudo is per exact path and the glob does not cross
+`/`): `vhost_bulk_isolation.sh` (phase 03.5) and `vhost_h2_page_load.sh` (phase
+07.1). Both build their own private server, provider, origin and netns client,
+so they need no deployment access and no credentials. It also extended two
+existing ones: `vhost_remote_stability.sh` g5
 now gates dead-origin→502 / restored→200 / closed-port→502 /
 unknown-subdomain→404 and g6 prints per-tunnel `path=` / `fallbacks=`;
 `vhost_netem_matrix.sh` G6 measures the FIRST request during a UDP blackout

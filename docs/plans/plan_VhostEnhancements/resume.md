@@ -3,7 +3,7 @@
 > Update this file at the end of every working session. It is the only file a
 > new session needs to read to know where the work stands.
 
-## Status: phases 01, 02, 03, 05, 06 and 07 done. Only 04 remains, and it needs staging on this commit.
+## Status: all seven phases done. Phase 04 ended in an attribution, not a fix — deliberately.
 
 Authored 2026-09-10 by Opus, from
 `docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md`. Branch `main`.
@@ -13,13 +13,14 @@ Authored 2026-09-10 by Opus, from
 | 01 | vhost heartbeat + reaper (F-1/F-10) | **code + gates done**, in-vivo pending |
 | 02 | bound direct-path receive window (F-13) | **code + gates done** |
 | 03 | isolate small requests from bulk (F-15) — **headline** | **done and verified in vivo** (§11 of the evidence doc) |
-| 04 | relay concurrency tail (OQ7) — diagnose first | **not started** — needs staging on the new code |
+| 04 | relay concurrency tail (OQ7) — diagnose first | **done — measured, all candidates falsified, deliberately unfixed** (§12 of the evidence doc) |
 | 05 | fast, legible failures (F-14/F-12) | **code + gates done**, one documented deviation |
 | 06 | documentation + observability (F-8/F-16/F-6/F-3) | **done** |
 | 07 | HTTP/2 edge — spike only | **done — measured, NO-GO recorded** |
 
-Commits: `191a2f1` (01 + 02.1), `d4b6a1e` (02 + 03.1/03.2), then this session's
-commit for 03.3, 03.4, 05 and 06.
+Commits: `191a2f1` (01 + 02.1), `d4b6a1e` (02 + 03.1/03.2), `621bd42` (03.3,
+03.4, 05, 06 — code), then the documentation/harness commits for 03.5, 07 and
+04.
 
 ## Regression at the end of this session
 
@@ -92,6 +93,47 @@ the CARRIER leg. At 2.1 ms RTT with two bulk transfers on the same tunnel:
   Consistent with F-8: `--udp` is for lossy and long-RTT paths, not for
   concurrency.
 
+### 04 — the relay's concurrency tail (§12 of the evidence document)
+
+**No production code, and that is the finding.** Harness
+`scripts/vhost_concurrency_ladder.sh` (root, netns `bore_cl`, server on the host
+pinned with `taskset` to the staging core count). The quantity is G8's: a fresh
+request — new TCP connection, new TLS handshake, one small GET — behind N held
+connections.
+
+All three candidate mechanisms the phase named are **falsified by direct
+measurement**, and a fourth and fifth added during the work are too:
+
+| experiment | result |
+| --- | --- |
+| 4.1 ladder, 16/64/256/512, both transports | 11 ms flat on **both**; staging's 966/1 436 ms is not on this curve and the transport asymmetry does not exist locally |
+| 4.2(a) `--max-conns` 512/1024/4096 | at capacity the frontend **drops** the connection in 4 ms with `http_code=000` and `conn_rejections+3`; it never queues. Excludes the semaphore |
+| 4.2(b) carriers 1/4/8 | 11 ms, invariant. Excludes yamux open serialization |
+| 4.2(c) 512 active vs 512 idle | 11 ms both. Excludes carrier byte-stream HOL |
+| 4.2(d) unified control port, `--ssh-gateway` off/on | 10–11 ms. Excludes the heavier accept path staging actually runs (`demux_pre_tls` → `accept_tls_with_alpn` → `route_connection_known_http` → `serve_control_http`) |
+| 4.2(e) load recast as 512 forked `curl` processes, client pinned to 2 cores | 11 ms. Excludes "the client's own CPU was the tail", which was the strongest surviving hypothesis |
+
+What survives is a property of the **instance**, not of bore: the t4g.micro's
+network allowance token bucket, already observed active in §2.17.3
+(1 630 `bw_out_allowance_exceeded` in 20 s), which would delay a fresh handshake
+while an established QUIC stream on a warm path passes — the one hypothesis that
+also explains the transport asymmetry. N-9 therefore stays open and stays
+unfixed on purpose: every named mechanism is excluded, so a fix would have no
+target, and it would have to touch the accept path 4.2(d) just proved clean.
+
+**Deviation:** 4.2 asks for open-path timers (accepted → substream open
+returned, separately from permit acquired). Not added — see §12.4. The whole
+request is 11 ms at 2.10 ms RTT, of which ≈8.4 ms is four unavoidable round
+trips, and it is the same 11 ms at n=16 as at n=512. There is no wait to
+decompose. If the tail reproduces against the real instance, the timers are the
+right first move *then*.
+
+**Harness bug worth remembering:** the first version of the log line sampled
+`conn_rejections` *before* running the probes, because bash expands command
+substitutions left to right — so the one rung that actually rejected printed
+`rej=0`. The metric is fine; the harness was lying. `rung()` now sequences the
+reads explicitly and says why.
+
 ### 07 — HTTP/2 edge spike (no production code, as specified)
 Measured with a client in its own netns behind netem
 (`scripts/vhost_h2_page_load.sh`, 2 / 21 / 60 / 100 ms), three arms on the same
@@ -157,15 +199,18 @@ failing fast client-side with the remedy in the message.
   The operator has offered to do it on request. Blocked on it:
   - phase 01 reaper: `scripts/perf/vhost_registration_leak_repro.sh`
   - phase 03.3 adaptive carriers end to end (server-side growth requests)
-  - phase 04 g8 concurrency ladder re-measurement (OQ7)
+  - phase 04 g8 concurrency ladder re-measurement — now the **only** way to
+    settle OQ7, since §12 excluded every mechanism reachable locally
   - phase 05.1 netem blackhole redo (`scripts/perf/vhost_netem_matrix.sh` G6)
 - **Phase 03.5's threshold sweep** — the 512 KiB bulk threshold, the 2 s growth
   interval and the 60 s quiet period are compile-time constants with no env
   override, so sweeping them means a rebuild per value. §11.2 shows the chosen
   values work at 2 ms and 21 ms RTT, so the sweep is deferred until one of them
   is actually suspected; `scripts/vhost_bulk_isolation.sh` is where it goes.
-- **Phase 04** — the concurrency ladder, the only phase with no code and no
-  measurement yet. It needs staging on this commit.
+- **OQ7 itself**, not phase 04 — the phase is done (§12) and produced an
+  attribution rather than a fix. What is still unanswered is whether the tail is
+  a property of the t4g.micro instance; that needs G8 re-run against the test
+  server from a same-region client, which needs the Docker image refreshed.
 
 ## Decisions already locked — do not re-litigate
 
@@ -207,14 +252,44 @@ See `overview.md` for the full statements with rationale.
    and a pre-splice first-byte read deadlocks uploads. Both rejected
    alternatives are recorded in the code.
 
+## The one CI failure this work produced, and its fix
+
+`621bd42`'s CI was green on Linux and macOS and **red on windows-latest**:
+`vhost_auto_carriers_target_decays_after_a_quiet_period` panicked at "the target
+must rise first, or the decay below proves nothing".
+
+Not a code bug — a test race, and a race that could only ever show on a slow
+runner. The test set `BORE_VHOST_CARRIER_QUIET_MS=300` for its whole duration.
+The decay condition is evaluated on the provider control loop's 500 ms
+heartbeat tick, so once the target rose to 2 the very next tick already
+satisfied both `last_crowded.elapsed() >= 300ms` and
+`last_target_change.elapsed() >= 300ms` and put it back to 1. The window in
+which the target reads 2 was therefore under one tick wide, and the assertion
+was a bet on the poll loop sampling inside it.
+
+Fixed by setting the override in **two stages** — 10 s while the rise is
+proved, 200 ms once the bulk is released and the decay is the thing under test.
+`vhost.rs` reads `carrier_quiet_period()` per tick precisely so a harness can
+do this, and the code comment there already said so. A strengthening assertion
+was added as the red-check: the target must still be ≥ 2 after 1.5 s inside the
+quiet period. Restoring the single-stage 300 ms makes it fail locally in 1.5 s,
+so the race is now caught on any runner rather than on the slowest one.
+
+One thing the red-check clarified, worth not re-discovering: the target decays
+while a bulk transfer is **still in flight** if no small request has contended
+in the quiet period. That is correct — `last_crowded` tracks contention, not
+the mere presence of bulk, and the extra carrier exists to keep small requests
+off the bulk carrier. With no small requests there is nothing to keep off it,
+and DEC-VE9 leaves the live carrier alone regardless.
+
 ## Harness inventory
 
 `scripts/perf/` with its own `README.md`; the runbook is §9 of the evidence
 document and §9.6 lists the thirteen harness pitfalls that produced wrong
-conclusions. This session added two self-contained root harnesses in `scripts/` (not
+conclusions. This session added three self-contained root harnesses in `scripts/` (not
 `scripts/perf/` — NOPASSWD sudo is per exact path and the glob does not cross
-`/`): `vhost_bulk_isolation.sh` (phase 03.5) and `vhost_h2_page_load.sh` (phase
-07.1). Both build their own private server, provider, origin and netns client,
+`/`): `vhost_bulk_isolation.sh` (phase 03.5), `vhost_h2_page_load.sh` (phase
+07.1) and `vhost_concurrency_ladder.sh` (phase 04). All three build their own private server, provider, origin and netns client,
 so they need no deployment access and no credentials. It also extended two
 existing ones: `vhost_remote_stability.sh` g5
 now gates dead-origin→502 / restored→200 / closed-port→502 /
@@ -225,8 +300,11 @@ separately, which is phase 05.1's actual gate.
 ## Open questions this plan carries
 
 - **OQ6** — does the stall cliff stay away at smaller QUIC windows? Phase 02.4.
-- **OQ7** — why does the relay develop a concurrency tail? Phase 04, which may
-  find Phase 03 already fixed it.
+- **OQ7** — why does the relay develop a concurrency tail? **Phase 04 answered
+  what it is not** (§12: not the semaphore, not yamux open serialization, not
+  carrier HOL, not the unified accept path, not client CPU) and left the
+  surviving instance-level hypothesis untested, because it needs the real
+  instance. Do not re-run the local discriminators; they are exhausted.
 - **OQ8** — is the 29 % control drift the server, the network or the instance?
   Not scheduled. `steal` is 0.0–0.3 %, so not burstable throttling; the ENA
   counters show the hypervisor's bandwidth token bucket active at the top of

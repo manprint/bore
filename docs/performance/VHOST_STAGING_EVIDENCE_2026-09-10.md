@@ -1648,12 +1648,22 @@ Still open:
 
 7. **Why does the TCP relay develop a 1 s tail at 256+ concurrent connections
    while QUIC does not?** (§2.13 G8: 966 ms and 1 436 ms fresh-request time
-   versus 14 ms.) Candidate causes: yamux substream open serialization on one
-   carrier, the `--max-conns` semaphore, or head-of-line on the single carrier
-   TCP connection. Note S4 showed *no* HOL with 6 slow readers, so this is a
-   scale effect, not the same phenomenon. Worth isolating because it is the
-   TCP relay's only measured weakness, and the relay is otherwise the faster
-   transport (F-8).
+   versus 14 ms.) **Attributed, not resolved, by §12** — and every candidate
+   this question named is now falsified by direct measurement on a private
+   server pinned to the staging core count: not the `--max-conns` semaphore
+   (which refuses in 4 ms with no HTTP status at all, §12.2a), not yamux open
+   serialization (invariant across 1/4/8 carriers, §12.2b), not carrier
+   head-of-line (active load identical to idle at 512 connections, §12.2c),
+   and not the heavier unified control-port accept path with the SSH demux in
+   it, which is what staging actually runs (§12.2d). Neither the tail nor the
+   transport asymmetry reproduces: relay and QUIC both read 11 ms flat from 16
+   to 512 held connections, including with the load recast as 512 forked `curl`
+   processes on a CPU-bounded client (§12.2e). What survives is a property of
+   the *instance* rather than of bore — most plausibly the t4g.micro's network
+   allowance token bucket, already observed active in §2.17.3, which would
+   delay a fresh handshake while a warm QUIC stream passes. Settling it needs
+   G8 re-run against the test server itself from a same-region client; N-9
+   therefore stays open and deliberately unfixed (§12.3).
 8. **Is the 29 % control drift the server, the network or the instance?**
    `steal` is 0.0–0.3 % across every window measured in §2.17 too, so it is
    confirmed *not* burstable CPU throttling. §2.17.3 adds a candidate the
@@ -1692,7 +1702,7 @@ Against `docs/vhost/VHOST_PERFORMANCE_ASSESSMENT_2026-09-07.md`.
 | N-6 | surface the effective merged vhost configuration in the admin API | F-6. The config endpoint shows flags, not the YAML that is actually in force |
 | N-7 | bound the direct-path receive window per server, not per tunnel | F-13. One `--udp` tunnel can occupy 256 MiB, `--carriers 4` a full GiB, and ten tunnels have no bound. On a 2 GiB production VPS this is the only finding that can take the whole server down. Cheapest first step is operational — ship smaller defaults for small hosts and document the sizing rule — but a server-wide budget is the real fix |
 | N-8 | answer origin failures with 502/504 instead of closing the connection | F-12. Currently a dead origin produces `http=000`, indistinguishable from the tunnel being gone. Low effort, high diagnostic value |
-| N-9 | investigate the TCP relay's concurrency tail | open question 7. 966–1 436 ms for a fresh request behind 256–512 concurrent connections, against QUIC's 14 ms. This is the relay's only measured weakness and the relay is otherwise the faster transport |
+| N-9 | investigate the TCP relay's concurrency tail | open question 7. 966–1 436 ms for a fresh request behind 256–512 concurrent connections, against QUIC's 14 ms. This is the relay's only measured weakness and the relay is otherwise the faster transport. **Investigated in §12 and deliberately left unfixed**: all three candidate mechanisms are falsified, the tail does not reproduce on a private server at the staging core count, and the surviving hypothesis is a property of the t4g.micro instance rather than of bore |
 | N-11 | bound the direct-open deadline so a dead UDP path costs one fast retry, not a 10 s stall | F-14. The pattern exists on the SSH path (I-SSH10) and the QUIC keepalive is already 3 s |
 | N-13 | isolate latency-sensitive requests from bulk transfers | F-15/§2.16. 11× p50 degradation on the relay, 219 ms p99 on QUIC, request rate down 82–91 %. **Carriers mitigate it on the relay (3× at c=8) and are useless for it on QUIC**, so the two transports need different treatments: a bulk-aware carrier pool on the relay, stream priorities on QUIC |
 | N-12 | fix and extend the direct-path observability counters | F-14. `direct_stream_opens` counts attempts, `direct_fallbacks` never increments, and no field says which path a tunnel is on right now |
@@ -2348,3 +2358,206 @@ and adding an override to production code purely to sweep it would be a change
 in a phase whose acceptance is already met. The measurement above says the
 chosen values work at both RTTs; a sweep is worth doing the day one of them is
 suspected, and this harness is where it goes.
+
+---
+
+## 12. Phase 04 — the relay's concurrency tail, and why it did not reproduce
+
+This section is the deliverable of phase 04 and the written answer to §5 open
+question 7. It is an **attribution, not a fix**: the phase was allowed to end in
+"diagnosed, attributed, and deliberately not changed", and that is where it
+ended — but not for the reason the phase expected. Every hypothesis the phase
+listed was falsified, and the tail itself never appeared on any apparatus
+reachable from this workstation.
+
+The quantity under test is G8's own: **a fresh request** — new TCP connection,
+new TLS handshake, one small `GET` — issued while N connections are already
+established and held on the same tunnel. Staging measured 966 ms at N=256 and
+1 436 ms at N=512 on the TCP relay, against 14 ms on QUIC direct.
+
+### 12.1 Apparatus (`scripts/vhost_concurrency_ladder.sh`)
+
+Root harness, same netns pattern as §11: netns `bore_cl` (10.80.0.x) holds the
+**origin, the vhost provider and the load client**; the server runs on the host;
+netem puts RTT/2 on each veth end. Ports CP=17838, VHSP=19463, UP=19473
+(unified), QP=19464, OP=15064. Positional args `[rtt-ms] [a|b|c|d|e|ladder|u|all]
+[server-cpu-list] [client-cpu-list]`.
+
+Four apparatus decisions matter for reading the tables:
+
+- **The load holder is one process, not N.** `$F/hold.py` (python asyncio) opens
+  N keep-alive TLS connections, completes one request on each, prints
+  `established=N`, then holds them. `slow` mode then reads
+  `/stream/1048576` at ~20 KB/s, which is G8's own load shape; `idle` mode
+  drains a small body and parks. Experiment (e) exists precisely because this
+  differs from staging — see 12.3.
+- **`fresh` is the median of three brand-new connections**, timed with
+  `-w '%{time_total}'`, and since 4.2(a) it also records `%{http_code}`: a
+  request the server *drops* is fast, and only the status separates a fast
+  success from a fast refusal. `000` means curl never saw a response.
+- **The rejection counter is read after the probes, not before.** Bash expands
+  command substitutions left to right, so the first version of the log line
+  sampled `conn_rejections` before `fresh` ran and printed `rej=0` for a rung
+  that had in fact just rejected all three probes. Fixed by sequencing the
+  reads explicitly; the comment in `rung()` says why, because the bug is
+  invisible and it silently hid the one positive result in the whole phase.
+- **The server can be pinned to the staging core count.** `[server-cpu-list]`
+  drives `taskset -c` on the server process, so the t4g.micro's 2 vCPU are
+  reproduced rather than assumed away by a 16-core workstation. Every table
+  below ran with `0,1`.
+
+### 12.2 Measured — every listed candidate falsified
+
+RTT target 2 ms, measured 2.09–2.15 ms across runs. Server pinned to 2 cores.
+
+**4.1 the ladder — the tail's own shape, both transports**
+
+| transport | n=16 | n=64 | n=256 | n=512 |
+|---|---|---|---|---|
+| relay-tcp `--carriers 1` | 11 ms | 11 ms | 11 ms | 11 ms |
+| direct-quic `--carriers 1` | 11 ms | 11 ms | 11 ms | 11 ms |
+
+`held` equals `active` at every rung (the server's own active count agrees with
+the client's established count), `rej=0`, every probe `200`. Staging's 966/1 436
+ms is **not on this curve at all**, and the transport asymmetry staging measured
+is absent: the two rows are identical.
+
+**4.2 (a) the `--max-conns` semaphore — falsified, and it fails the other way**
+
+| limit | held | rej | fresh | code |
+|---|---|---|---|---|
+| 512 | 512 | **3** | 4 ms | `000,000,000` |
+| 1024 | 512 | 0 | 11 ms | `200,200,200` |
+| 4096 | 512 | 0 | 11 ms | `200,200,200` |
+
+This is the phase's only positive result and it **excludes** the semaphore as
+the cause. At capacity the vhost frontend does not queue the connection for a
+second and a half: `try_acquire_owned` fails, `conn_rejections` increments, and
+the accept loop drops the TCP connection immediately — 4 ms to a closed socket,
+no HTTP response. A permit-starved request is *faster* than a served one and
+carries no status. Whatever produced 1 436 ms with a `200` on staging, it was
+not this code path.
+
+**4.2 (b) yamux substream-open serialization — falsified**
+
+| carriers | live | fresh |
+|---|---|---|
+| 1 | 1 | 11 ms |
+| 4 | 4 | 11 ms |
+| 8 | 8 | 11 ms |
+
+If the open path serialized behind 512 established substreams on one carrier,
+spreading them over 4 and 8 carriers would move the number. It does not move at
+all.
+
+**4.2 (c) head-of-line on the carrier byte stream — falsified**
+
+| load shape | fresh |
+|---|---|
+| 512 connections actively reading at ~20 KB/s each | 11 ms |
+| 512 connections idle, request already completed | 11 ms |
+
+Data in flight on the carrier is worth nothing here, which is consistent with
+S4's earlier no-HOL-at-6-readers result and extends it to 512.
+
+**4.2 (d) the unified control-port topology — falsified, including the SSH demux**
+
+| topology | n=64 | n=256 | n=512 |
+|---|---|---|---|
+| unified, `--ssh-gateway` off | 11 ms | 11 ms | 11 ms |
+| unified, `--ssh-gateway` on | 10 ms | 10 ms | 11 ms |
+
+This one mattered most, because it is what staging actually runs: control port
+== vhost HTTPS port, so every fresh connection traverses
+`sshgw::demux_pre_tls` → `accept_tls_with_alpn` → `route_connection_known_http`
+→ `serve_control_http`, which re-reads the request head, re-resolves the
+subdomain and takes the permit on the unified path (the VH-1 comment in
+`server.rs`). That is a materially heavier accept path than the dedicated
+listener, it is the one carrying an extra pre-TLS peek and an ALPN
+classification, and it costs nothing measurable at 512 held connections.
+
+**4.2 (e) G8's literal client shape — 512 curl processes, client CPU-bounded**
+
+| n | server-side active | fresh | code |
+|---|---|---|---|
+| 64 | 64 | 11 ms | `200,200,200` |
+| 256 | 320 | 11 ms | `200,200,200` |
+| 512 | 832 | 11 ms | `200,200,200` |
+
+Client pinned to two cores (`[client-cpu-list] = 2,3`), server to two others.
+The load here is N forked `curl` processes rather than one asyncio loop, and the
+fresh probe is a *newly forked* curl competing with them for the client's own
+CPU — the strongest remaining hypothesis for staging's number, since G8 ran on
+a 2-vCPU VM. It does not reproduce either. (`active` exceeds `n` at the upper
+rungs because the previous rung's killed connections have not yet been reaped
+server-side when the next rung is sampled; it does not affect the probe.)
+
+### 12.3 Attribution
+
+**What the tail is not.** All four causes open question 7 named are excluded by
+direct measurement on a private server at the staging core count: not the
+`--max-conns` semaphore (which refuses in 4 ms without a status), not yamux open
+serialization (invariant across 1/4/8 carriers), not carrier head-of-line
+(invariant between active and idle load), and not the unified control-port
+accept path with the SSH demux in it. The transport asymmetry — the part of G8
+that makes the finding interesting, relay 1 436 ms versus QUIC 14 ms — does not
+exist locally: both transports read 11 ms flat to 512 connections.
+
+**What is left.** Three differences between this apparatus and staging remain,
+and none of them is testable from here:
+
+1. **The instance.** t4g.micro: ARM/Graviton2, 2 vCPU, ~903 MiB RAM, burstable.
+   §2.17.3 already showed the hypervisor's bandwidth token bucket becoming
+   active at the top of the throughput range (1 630 `bw_out_allowance_exceeded`
+   in 20 s); `steal` was 0.0–0.3 % in every window measured, so CPU credit is
+   ruled out but the *network* allowance is not. A fresh connection at N=512 is
+   a handshake — small, latency-sensitive, and exactly the shape a token-bucket
+   pause would delay while an already-established QUIC stream on a warm path
+   sails past. This is the single hypothesis that survives and it also happens
+   to explain the transport asymmetry, which nothing local does.
+2. **Memory.** 903 MiB against 512 held TLS connections plus the relay's
+   256 KiB default proxy buffers is a much tighter budget than this workstation
+   ever reaches; F-13's unbounded `--udp` memory is the known-sharp edge, but
+   the relay's own footprint at that connection count was never profiled on the
+   small host.
+3. **The real WAN in front of it** — G8's client was the same-region VM, not a
+   veth pair, and its 1.4 ms path carries a real NIC, a real hypervisor vSwitch
+   and a real ENA queue set.
+
+**Consequence for the plan.** N-9 stays open and stays *unfixed on purpose*.
+There is no code change to make: a fix would have to target a mechanism, all the
+named mechanisms are falsified, and the surviving hypothesis is a property of
+the instance rather than of bore. Shipping a speculative change against an
+unreproduced tail would be the worst outcome available here — it would be
+untestable, and it would touch the accept path that §12.2(d) just proved clean.
+
+### 12.4 One deliberate deviation from the phase's instructions
+
+Phase 04's 4.2 asks for the open path to be instrumented — "time from *proxied
+connection accepted* to *substream open returned*, separately from *permit
+acquired*" — so that the wait is attributed rather than inferred. That
+instrumentation was **not** added, and the reason is arithmetic rather than
+reluctance.
+
+The whole fresh request costs 11 ms at a measured 2.10 ms RTT. A fresh
+request is four round trips before the body can arrive — TCP handshake, TLS 1.3
+handshake, the request itself, and the relay's own hop to the provider inside
+the same netns — which is ≈8.4 ms of pure RTT. That leaves under 3 ms for
+everything bore does, permit acquisition and substream open included, and it is
+the same 11 ms at n=16 as at n=512. There is no wait to decompose: the
+decomposition is bounded above by a number that does not grow with the load.
+
+Adding trace-level timers to the accept-and-open hot path — which §12.2(d) has
+just measured clean, and which is the single most latency-sensitive path in the
+server — to attribute a wait that is not there would be a change with a cost and
+no evidence behind it. If the tail does reproduce against the real instance, the
+timers are the right first move *then*, on the apparatus that shows the
+phenomenon.
+
+**How to settle it.** Re-run G8's ladder against the test bore server itself,
+from a same-region client, once its Docker image is refreshed to a build
+containing this work — that is the only apparatus that has the instance, the
+memory limit and the real path at the same time. The harness to point at it is
+`scripts/perf/vhost_staging_bench.sh`'s G8 case; the local one
+(`scripts/vhost_concurrency_ladder.sh`) has already said everything it can, and
+what it says is that the code is not where the tail lives.

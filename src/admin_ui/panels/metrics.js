@@ -184,6 +184,19 @@ export default {
             countsList.appendChild(directFb);
         }
 
+        // Direct admissions refused for the server-wide memory budget. Shown
+        // only when a budget is configured, i.e. when the number can be
+        // nonzero — an always-zero row is noise on a default server.
+        if (data.direct_budget_refusals) {
+            const budgetRef = document.createElement('div');
+            budgetRef.className = 'count-row';
+            budgetRef.innerHTML = `
+                <span class="count-label">Direct Budget Refusals</span>
+                <span class="count-value">${escapeHtml(String(data.direct_budget_refusals ?? 0))}</span>
+            `;
+            countsList.appendChild(budgetRef);
+        }
+
         // Transport breakdown
         if (data.transport_bore !== undefined || data.transport_ssh !== undefined) {
             const transportLabel = document.createElement('div');

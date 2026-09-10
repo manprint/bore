@@ -89,6 +89,43 @@ request under load. Asserts it completes < 3 s.
 | R2 `--udp --carriers 10` | 0.0 s ✅ | 0.0 s ✅ |
 | **R3 `--udp carriers=1`** | **rc=28, 30 s timeout (HANG)** ❌ | **0.0 s ✅** |
 
+## Follow-up measurements (staging campaign 2026-09-10)
+
+Two things were measured after this fix shipped, both recorded in
+`docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md`.
+
+**The memory bill (F-13).** The connection window is a ceiling, so it is only
+paid when readers stop draining — but nothing bounded the total:
+
+| condition | server RSS |
+| --- | --- |
+| 512 concurrent connections, TCP relay | 95.1 MiB |
+| 512 concurrent connections, QUIC direct | 424 MiB (**4.5×**) |
+| 32 slow readers on **one** `--udp` tunnel | **536.8 MiB** on a 903 MiB host |
+
+At 536.8 MiB the server timed out two requests, failed a registration, and made
+an unrelated tunnel lose its control connection and reconnect. No OOM kill,
+`RestartCount 0`, RSS back to 33.6 MB afterwards — exhaustion and recovery, not
+a leak, but one client's behaviour degrading the whole server. Fixed by
+`--udp-memory-budget` (a server-wide admission budget; see `README.md`).
+
+**The stall rung is the RATIO, not the size (F-17).** The G9 ladder
+(`scripts/vhost_udp_window_ladder.sh`) walked 4/8/16/24/32 slow readers across
+four window profiles. Every profile holding 16:1 — 256/16, 128/8 and 32/2 MiB,
+an 8× range — first stalled at **16** readers; an explicit 8:1 profile (64/8 MiB)
+first stalled at **8**. So:
+
+- A smaller profile costs **nothing** in stall tolerance while using up to 3.8×
+  less memory (85.0 MiB versus 320.6 MiB at the 16-reader rung). This is why
+  `--udp-memory-budget` derives both windows and enforces the ratio rather than
+  exposing it as a knob.
+- The `64 → 256 MiB` change above did **not** remove the cliff; it **moved** it
+  from ~4 stalled streams to ~16. That was enough for the reported field
+  workload, and it is still reachable by sixteen paused readers on one
+  `--carriers 1` tunnel. `--carriers N` multiplies the tolerance by N (each
+  carrier brings its own connection window); the TCP relay has no shared
+  connection window and was immune at every rung.
+
 ## Verification
 
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`: clean.

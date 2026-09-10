@@ -53,6 +53,14 @@ pub(crate) struct CountingStream<S> {
     pub(crate) grx: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Global tx counter (server total).
     pub(crate) gtx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Optional per-PROXIED-CONNECTION bulk classifier (phase 03.1).
+    ///
+    /// The four counters above are per-subdomain and server-wide, which is the
+    /// wrong granularity for scheduling: the question a scheduler asks is how
+    /// much *this* connection has moved. Attached only on the paths that
+    /// schedule (currently the vhost relay); `None` everywhere else, so those
+    /// splices are byte-for-byte unchanged.
+    pub(crate) bulk: Option<std::sync::Arc<crate::pool::BulkTicket>>,
 }
 
 impl<S> CountingStream<S> {
@@ -70,7 +78,16 @@ impl<S> CountingStream<S> {
             tx,
             grx,
             gtx,
+            bulk: None,
         }
+    }
+
+    /// Also feed every byte moved to `bulk`, so this connection classifies
+    /// itself. A separate builder rather than a new `new` parameter: every
+    /// other splice in the codebase calls `new` and must stay untouched.
+    pub(crate) fn watching_bulk(mut self, bulk: std::sync::Arc<crate::pool::BulkTicket>) -> Self {
+        self.bulk = Some(bulk);
+        self
     }
 }
 
@@ -86,6 +103,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
             let n = (buf.filled().len() - before) as u64;
             self.rx.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
             self.grx.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            if let Some(bulk) = &self.bulk {
+                bulk.record(n);
+            }
         }
         res
     }
@@ -103,6 +123,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
                 .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
             self.gtx
                 .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
+            if let Some(bulk) = &self.bulk {
+                bulk.record(*n as u64);
+            }
         }
         res
     }
@@ -266,7 +289,7 @@ pub fn format_iec_size(bytes: u64) -> String {
     const MIB: u64 = 1024 * 1024;
     const KIB: u64 = 1024;
     for (unit, suffix) in [(GIB, "GiB"), (MIB, "MiB"), (KIB, "KiB")] {
-        if bytes >= unit && bytes % unit == 0 {
+        if bytes >= unit && bytes.is_multiple_of(unit) {
             return format!("{}{suffix}", bytes / unit);
         }
     }
@@ -782,6 +805,142 @@ pub struct UdpDirectTuning {
     pub udp_socket_send_buffer: usize,
     /// Max concurrent QUIC bidi streams on the direct connection.
     pub max_direct_streams: u32,
+}
+
+/// The connection-to-stream receive-window ratio the direct path depends on.
+///
+/// `CLAUDE.md` records why it is load-bearing rather than arbitrary: the ratio
+/// is how many *stalled* streams a connection tolerates before they starve
+/// every other stream on it. At 64/16 MiB (4:1) a browser pausing four assets
+/// hung the whole tunnel; 256/16 MiB (16:1) tolerates about sixteen. Any
+/// derived profile must preserve it — shrinking the connection window toward
+/// the stream window reintroduces the stall, and raising the stream window to
+/// meet it regresses single-stream throughput.
+pub const DIRECT_WINDOW_RATIO: u32 = 16;
+
+/// Smallest per-stream receive window a derived profile will produce. Below
+/// roughly this size a single high-BDP stream cannot keep the pipe full, so a
+/// budget too small to reach it is reported rather than silently honoured.
+pub const MIN_DIRECT_STREAM_RECEIVE_WINDOW: u32 = 1024 * 1024;
+
+/// Total physical memory on this host, when it can be read cheaply.
+///
+/// Used only to decide whether to warn an operator that the direct path's
+/// worst case does not fit the machine. Best effort by design: an unknown value
+/// means no warning, never a guess and never a clamp.
+pub fn host_total_memory() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in meminfo.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kib * 1024);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// A direct-path memory profile derived from an operator's budget.
+///
+/// The budget is the **worst-case receive memory the whole server may commit to
+/// the direct UDP path**. It is a ceiling, not a reservation: a healthy tunnel
+/// buffers approximately nothing, and the windows only fill when a public
+/// reader stops draining — which is exactly what a browser pausing assets or a
+/// mobile client on a bad link does. F-13 measured one `--udp` tunnel with 32
+/// slow readers holding 536.8 MiB on a 903 MiB host, which timed out unrelated
+/// requests and made another tunnel reconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpBudgetPlan {
+    /// Windows to run with, preserving [`DIRECT_WINDOW_RATIO`].
+    pub tuning: UdpDirectTuning,
+    /// How many direct QUIC connections may be admitted server-wide. Further
+    /// connections fall back to the warm TCP relay.
+    pub direct_slots: usize,
+    /// Set when the budget could not be honoured as asked. Never a silent
+    /// clamp — the project's convention is to warn with concrete remediation.
+    pub shortfall: Option<UdpBudgetShortfall>,
+}
+
+/// Why a budget could not be honoured exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpBudgetShortfall {
+    /// The budget cannot hold `max_carriers` connections even at the floor
+    /// window, so a single `--udp --carriers N` tunnel gets `direct_slots`
+    /// direct carriers and relays the rest.
+    BelowCarrierCount {
+        /// Carriers the operator allows per tunnel.
+        max_carriers: u32,
+        /// Direct carriers the budget can actually hold.
+        slots: usize,
+    },
+    /// The budget is smaller than one floor-sized connection window, so the
+    /// single admitted connection may exceed it.
+    BelowOneConnection {
+        /// Bytes one admitted connection may hold.
+        per_connection: u64,
+    },
+}
+
+impl UdpDirectTuning {
+    /// Derive a profile from a server-wide budget, so an operator sets one
+    /// number instead of hand-computing four that must stay in a fixed ratio.
+    ///
+    /// The connection window is `budget / max_carriers`, so one tunnel at its
+    /// full carrier count fits inside the budget. It is clamped to the tested
+    /// default above (a generous budget must not inflate windows past the value
+    /// the stall fix shipped with) and to [`DIRECT_WINDOW_RATIO`] ×
+    /// [`MIN_DIRECT_STREAM_RECEIVE_WINDOW`] below. Slot count is then
+    /// `budget / connection_window`, which is the exact aggregate bound.
+    pub fn from_memory_budget(budget: u64, max_carriers: u32) -> UdpBudgetPlan {
+        let carriers = max_carriers.max(1) as u64;
+        let floor = (DIRECT_WINDOW_RATIO * MIN_DIRECT_STREAM_RECEIVE_WINDOW) as u64;
+        let ceiling = DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW as u64;
+
+        let mut conn = (budget / carriers).clamp(floor, ceiling);
+        // Keep the ratio exact so `stream = conn / RATIO` loses no bytes.
+        conn -= conn % DIRECT_WINDOW_RATIO as u64;
+
+        let slots = (budget / conn).max(1) as usize;
+        let shortfall = if budget < floor {
+            Some(UdpBudgetShortfall::BelowOneConnection {
+                per_connection: conn,
+            })
+        } else if slots < carriers as usize {
+            Some(UdpBudgetShortfall::BelowCarrierCount {
+                max_carriers: carriers as u32,
+                slots,
+            })
+        } else {
+            None
+        };
+
+        let stream = (conn / DIRECT_WINDOW_RATIO as u64) as u32;
+        UdpBudgetPlan {
+            tuning: Self {
+                stream_receive_window: stream,
+                connection_receive_window: conn as u32,
+                // The default pairs the send window with the connection
+                // window; keep that relationship rather than inventing a third
+                // number the operator would have to reason about.
+                send_window: conn,
+                ..Self::default()
+            },
+            direct_slots: slots,
+            shortfall,
+        }
+    }
+
+    /// Worst-case direct-path receive memory one tunnel can ask the server to
+    /// hold: every carrier filling its whole connection window.
+    pub fn worst_case_per_tunnel(&self, max_carriers: u32) -> u64 {
+        self.connection_receive_window as u64 * max_carriers.max(1) as u64
+    }
 }
 
 impl Default for UdpDirectTuning {
@@ -2022,6 +2181,122 @@ impl<U: AsyncRead + AsyncWrite + Unpin> Delimited<U> {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// The ratio is the whole point of the derivation: a profile that drifts
+    /// off it reintroduces the carriers=1 stall (small ratio) or regresses
+    /// single-stream throughput (large one).
+    #[test]
+    fn budget_profiles_preserve_the_connection_to_stream_ratio() {
+        for budget_mib in [16u64, 64, 256, 512, 1024, 4096, 65536] {
+            for carriers in [1u32, 2, 4, 8, 16] {
+                let plan = UdpDirectTuning::from_memory_budget(budget_mib * MIB, carriers);
+                let t = plan.tuning;
+                assert_eq!(
+                    t.connection_receive_window / DIRECT_WINDOW_RATIO,
+                    t.stream_receive_window,
+                    "budget {budget_mib} MiB, carriers {carriers}"
+                );
+                assert!(
+                    t.stream_receive_window >= MIN_DIRECT_STREAM_RECEIVE_WINDOW,
+                    "stream window fell below the floor at budget {budget_mib} MiB"
+                );
+                assert!(
+                    t.connection_receive_window <= DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW,
+                    "a generous budget must not inflate the window past the tested default"
+                );
+                assert!(plan.direct_slots >= 1);
+            }
+        }
+    }
+
+    /// The bound an operator is buying: slots x connection window never
+    /// exceeds the budget, which is what makes the worst case a number.
+    #[test]
+    fn budget_aggregate_never_exceeds_the_budget() {
+        for budget_mib in [16u64, 48, 100, 256, 700, 1024, 3000] {
+            let plan = UdpDirectTuning::from_memory_budget(budget_mib * MIB, 4);
+            let aggregate = plan.direct_slots as u64 * plan.tuning.connection_receive_window as u64;
+            assert!(
+                aggregate <= budget_mib * MIB || plan.shortfall.is_some(),
+                "budget {budget_mib} MiB admitted {aggregate} bytes with no shortfall reported"
+            );
+        }
+    }
+
+    #[test]
+    fn budget_divides_across_carriers_so_one_tunnel_fits() {
+        // 512 MiB over 4 carriers: 128 MiB per connection, 8 MiB per stream,
+        // exactly 4 slots — one full-carrier tunnel fills the budget and a
+        // second tunnel relays.
+        let plan = UdpDirectTuning::from_memory_budget(512 * MIB, 4);
+        assert_eq!(plan.tuning.connection_receive_window as u64, 128 * MIB);
+        assert_eq!(plan.tuning.stream_receive_window as u64, 8 * MIB);
+        assert_eq!(plan.tuning.send_window, 128 * MIB);
+        assert_eq!(plan.direct_slots, 4);
+        assert_eq!(plan.shortfall, None);
+    }
+
+    #[test]
+    fn generous_budget_keeps_default_windows_and_buys_slots_instead() {
+        // 4 GiB over 4 carriers would compute a 1 GiB window; the clamp keeps
+        // the tested 256 MiB default and spends the rest on concurrency.
+        let plan = UdpDirectTuning::from_memory_budget(4096 * MIB, 4);
+        assert_eq!(
+            plan.tuning.connection_receive_window,
+            DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW
+        );
+        assert_eq!(
+            plan.tuning.stream_receive_window,
+            DIRECT_QUIC_STREAM_RECEIVE_WINDOW
+        );
+        assert_eq!(plan.direct_slots, 16);
+        assert_eq!(plan.shortfall, None);
+    }
+
+    /// A budget too small to hold every carrier is honoured, not silently
+    /// widened — but it must say so, because the operator's `--carriers 8`
+    /// tunnel will relay most of its carriers.
+    #[test]
+    fn budget_below_the_carrier_count_reports_a_shortfall() {
+        let plan = UdpDirectTuning::from_memory_budget(64 * MIB, 8);
+        assert_eq!(plan.tuning.connection_receive_window as u64, 16 * MIB);
+        assert_eq!(plan.tuning.stream_receive_window as u64, MIB);
+        assert_eq!(plan.direct_slots, 4);
+        assert_eq!(
+            plan.shortfall,
+            Some(UdpBudgetShortfall::BelowCarrierCount {
+                max_carriers: 8,
+                slots: 4
+            })
+        );
+    }
+
+    /// Smaller than one floor-sized window: one connection is still admitted
+    /// (refusing every direct connection would be a worse failure than
+    /// exceeding a tiny budget), and the overshoot is reported.
+    #[test]
+    fn budget_below_one_connection_admits_one_and_reports_it() {
+        let plan = UdpDirectTuning::from_memory_budget(4 * MIB, 4);
+        assert_eq!(plan.direct_slots, 1);
+        assert_eq!(
+            plan.shortfall,
+            Some(UdpBudgetShortfall::BelowOneConnection {
+                per_connection: 16 * MIB
+            })
+        );
+    }
+
+    #[test]
+    fn worst_case_per_tunnel_is_carriers_times_the_connection_window() {
+        let t = UdpDirectTuning::default();
+        assert_eq!(t.worst_case_per_tunnel(4), 1024 * MIB);
+        assert_eq!(t.worst_case_per_tunnel(1), 256 * MIB);
+        // A zero carrier count is nonsense; treat it as one rather than
+        // reporting a worst case of zero.
+        assert_eq!(t.worst_case_per_tunnel(0), 256 * MIB);
+    }
 
     #[tokio::test]
     async fn tune_tcp_sets_nodelay_and_keepalive() {

@@ -330,6 +330,21 @@ pub struct Server {
     /// Direct-to-relay fallback count.
     direct_fallbacks: Arc<AtomicU64>,
 
+    /// Server-wide direct-path admission budget (F-13, phase 02.3), or `None`
+    /// for the historical behaviour of admitting every authenticated direct
+    /// connection. The QUIC connection receive window is a per-connection
+    /// CEILING with no aggregate bound, so `tunnels x carriers` of them had no
+    /// bound at all: one client with slow readers took 536.8 MiB on a 903 MiB
+    /// host and degraded unrelated tunnels. A permit is held for the life of an
+    /// admitted connection; a refused one falls back to the warm TCP relay,
+    /// which is a path that already exists and is already the faster transport
+    /// on a clean network (F-8).
+    udp_direct_permits: Option<Arc<Semaphore>>,
+
+    /// Direct admissions refused for budget. Counted and logged, never silent —
+    /// a number an operator can act on, unlike a silently shrinking window.
+    direct_budget_refusals: Arc<AtomicU64>,
+
     /// Server-side rate sampler: transmitted bytes per second (EWMA over 1s ticks).
     rate_tx_bps: Arc<AtomicU64>,
 
@@ -428,6 +443,8 @@ impl Server {
             auth_failures: Arc::new(AtomicU64::new(0)),
             conn_rejections: Arc::new(AtomicU64::new(0)),
             direct_fallbacks: Arc::new(AtomicU64::new(0)),
+            udp_direct_permits: None,
+            direct_budget_refusals: Arc::new(AtomicU64::new(0)),
 
             rate_tx_bps: Arc::new(AtomicU64::new(0)),
             rate_rx_bps: Arc::new(AtomicU64::new(0)),
@@ -669,6 +686,35 @@ impl Server {
     /// Connection rejections (semaphore exhaustion).
     pub fn conn_rejections(&self) -> u64 {
         self.conn_rejections.load(Ordering::Relaxed)
+    }
+
+    /// Direct admissions refused because the server-wide direct-path memory
+    /// budget was full (phase 02.3). Each refusal is one carrier that took the
+    /// warm TCP relay instead; no request fails.
+    pub fn direct_budget_refusals(&self) -> u64 {
+        self.direct_budget_refusals.load(Ordering::Relaxed)
+    }
+
+    /// Apply a server-wide direct-path memory budget. `None` restores the
+    /// unbounded historical behaviour. Sizing comes from
+    /// [`UdpDirectTuning::from_memory_budget`], whose slot count is the exact
+    /// aggregate bound; this setter takes the already-derived slot count so the
+    /// caller can also report the plan's shortfall to the operator.
+    pub fn set_udp_direct_slots(&mut self, slots: Option<usize>) {
+        self.udp_direct_permits = slots.map(|n| Arc::new(Semaphore::new(n.max(1))));
+    }
+
+    /// Shared handle to the budget-refusal counter, so a test (or an embedder)
+    /// can observe refusals after the server has been moved into `listen`.
+    pub fn direct_budget_refusals_atomic(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.direct_budget_refusals)
+    }
+
+    /// Direct-path admission slots still free, if a budget was applied.
+    pub fn udp_direct_slots(&self) -> Option<usize> {
+        self.udp_direct_permits
+            .as_ref()
+            .map(|s| s.available_permits())
     }
 
     /// Direct-to-relay fallback count.
@@ -1175,6 +1221,8 @@ impl Server {
                         #[cfg(feature = "udp")]
                         let public_pending = this.pending_public_udp.clone();
                         let secret = this.secret.clone();
+                        let direct_permits = this.udp_direct_permits.clone();
+                        let budget_refusals = Arc::clone(&this.direct_budget_refusals);
                         let ep = endpoint.clone();
                         tokio::spawn(async move {
                             while let Some(incoming) = ep.accept().await {
@@ -1187,6 +1235,8 @@ impl Server {
                                 #[cfg(feature = "udp")]
                                 let public_pending = public_pending.clone();
                                 let secret = secret.clone();
+                                let direct_permits = direct_permits.clone();
+                                let budget_refusals = Arc::clone(&budget_refusals);
                                 let endpoint = ep.clone();
                                 tokio::spawn(async move {
                                     let conn = match incoming.await {
@@ -1234,6 +1284,46 @@ impl Server {
                                         .await
                                     {
                                         Ok((key, direct)) => {
+                                            // Server-wide direct-path memory
+                                            // budget (F-13, phase 02.3). The
+                                            // per-connection receive window is
+                                            // a ceiling with no aggregate
+                                            // bound, so this is the only place
+                                            // the total can be bounded: every
+                                            // authenticated direct connection
+                                            // for every tunnel kind is
+                                            // admitted here. A refusal is not a
+                                            // failure — the provider keeps the
+                                            // warm TCP relay for this carrier.
+                                            match admit_direct(&direct_permits, &budget_refusals) {
+                                                DirectAdmission::Admitted(slot) => {
+                                                    // Hold the slot for the
+                                                    // life of the connection,
+                                                    // whichever branch below
+                                                    // claims it (or drops it
+                                                    // as a surplus carrier) —
+                                                    // every one of those paths
+                                                    // closes the connection,
+                                                    // so `closed()` is the one
+                                                    // release point that
+                                                    // cannot be missed.
+                                                    if slot.is_some() {
+                                                        let watcher = direct.clone();
+                                                        tokio::spawn(async move {
+                                                            watcher.closed().await;
+                                                            drop(slot);
+                                                        });
+                                                    }
+                                                }
+                                                DirectAdmission::RefusedForBudget => {
+                                                    warn!(
+                                                        key = %key,
+                                                        "direct UDP admission refused: server-wide memory budget is full; this carrier falls back to the warm TCP relay (raise --udp-memory-budget to admit more)"
+                                                    );
+                                                    direct.close();
+                                                    return;
+                                                }
+                                            }
                                             if let Some(alias) =
                                                 key.strip_prefix("jump:").map(str::to_owned)
                                             {
@@ -2540,6 +2630,37 @@ impl Server {
     }
 }
 
+/// Outcome of the server-wide direct-path admission check (phase 02.3).
+#[cfg(feature = "udp")]
+enum DirectAdmission {
+    /// Admitted. `Some` carries the slot to hold for the connection's life;
+    /// `None` means no budget is configured, i.e. the historical behaviour.
+    Admitted(Option<tokio::sync::OwnedSemaphorePermit>),
+    /// The budget is full. The caller closes this connection so the provider
+    /// keeps the warm TCP relay for the same carrier — never a failed request.
+    RefusedForBudget,
+}
+
+/// Take one direct-path admission slot, counting a refusal.
+///
+/// Deliberately non-blocking: waiting for a slot would leave the provider's
+/// carrier neither direct nor relayed for as long as the wait lasted, whereas
+/// an immediate refusal puts it on the warm relay at once — which F-8 measured
+/// as the faster transport on a clean network anyway.
+#[cfg(feature = "udp")]
+fn admit_direct(permits: &Option<Arc<Semaphore>>, refusals: &AtomicU64) -> DirectAdmission {
+    let Some(sem) = permits.clone() else {
+        return DirectAdmission::Admitted(None);
+    };
+    match Semaphore::try_acquire_owned(sem) {
+        Ok(slot) => DirectAdmission::Admitted(Some(slot)),
+        Err(_) => {
+            refusals.fetch_add(1, Ordering::Relaxed);
+            DirectAdmission::RefusedForBudget
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2589,6 +2710,80 @@ mod tests {
         // into `--udp-connection-receive-window` would change the value.
         assert_eq!(format_iec_size(1024 * 1024 + 1), "1048577");
         assert_eq!(format_iec_size(0), "0");
+    }
+
+    /// Phase 02.3: N+1 direct admissions against a budget of N must yield
+    /// exactly N admissions and one refusal, and the refusal must be counted.
+    /// The refused carrier is not a failure — it takes the warm TCP relay.
+    #[cfg(feature = "udp")]
+    #[test]
+    fn direct_admission_budget_admits_exactly_the_slot_count() {
+        let refusals = AtomicU64::new(0);
+        let permits = Some(Arc::new(Semaphore::new(3)));
+
+        // Hold every admitted slot, the way a live connection does.
+        let mut held = Vec::new();
+        for i in 0..3 {
+            match admit_direct(&permits, &refusals) {
+                DirectAdmission::Admitted(slot) => {
+                    held.push(slot.expect("a configured budget hands out a slot"));
+                }
+                DirectAdmission::RefusedForBudget => panic!("refused admission {i} of 3"),
+            }
+        }
+        assert_eq!(refusals.load(Ordering::Relaxed), 0);
+
+        // The fourth is refused.
+        assert!(matches!(
+            admit_direct(&permits, &refusals),
+            DirectAdmission::RefusedForBudget
+        ));
+        assert_eq!(refusals.load(Ordering::Relaxed), 1);
+
+        // A closed connection releases its slot, and the next carrier is
+        // admitted again — the bound is concurrent, not cumulative.
+        drop(held.pop());
+        assert!(matches!(
+            admit_direct(&permits, &refusals),
+            DirectAdmission::Admitted(Some(_))
+        ));
+        assert_eq!(refusals.load(Ordering::Relaxed), 1);
+    }
+
+    /// No budget configured must stay byte-for-byte the historical path: every
+    /// authenticated direct connection admitted, no permit, no counter.
+    #[cfg(feature = "udp")]
+    #[test]
+    fn direct_admission_without_a_budget_never_refuses() {
+        let refusals = AtomicU64::new(0);
+        for _ in 0..1000 {
+            match admit_direct(&None, &refusals) {
+                DirectAdmission::Admitted(slot) => assert!(slot.is_none()),
+                DirectAdmission::RefusedForBudget => panic!("refused with no budget configured"),
+            }
+        }
+        assert_eq!(refusals.load(Ordering::Relaxed), 0);
+    }
+
+    /// The budget wiring an operator actually touches: a derived plan's slot
+    /// count reaches the semaphore, and `None` restores the unbounded path.
+    #[cfg(feature = "udp")]
+    #[test]
+    fn set_udp_direct_slots_installs_the_derived_budget() {
+        let mut server = Server::new(1024..=65535, None);
+        assert_eq!(server.udp_direct_slots(), None);
+
+        let plan = UdpDirectTuning::from_memory_budget(512 * 1024 * 1024, 4);
+        assert_eq!(plan.direct_slots, 4);
+        server.set_udp_direct_slots(Some(plan.direct_slots));
+        assert_eq!(server.udp_direct_slots(), Some(4));
+
+        server.set_udp_direct_slots(None);
+        assert_eq!(server.udp_direct_slots(), None);
+        // A nonsensical zero budget still admits one connection rather than
+        // refusing the direct path outright.
+        server.set_udp_direct_slots(Some(0));
+        assert_eq!(server.udp_direct_slots(), Some(1));
     }
 
     #[test]

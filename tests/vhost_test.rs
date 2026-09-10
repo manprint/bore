@@ -2257,6 +2257,85 @@ async fn vhost_udp_multi_carrier_pool() -> Result<()> {
     Ok(())
 }
 
+/// Phase 02.3: a provider asking for more direct carriers than the server-wide
+/// memory budget allows gets the budgeted number and relays the rest — and the
+/// tunnel still serves correct responses over what it did get.
+///
+/// The point is that exceeding the budget is not a failure mode. F-8 measured
+/// the TCP relay as the faster transport on a clean path anyway, so a refused
+/// carrier costs nothing except the direct path's advantage on a lossy one.
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_udp_direct_budget_admits_its_slots_and_relays_the_rest() -> Result<()> {
+    const CTRL: u16 = 18016;
+    const HTTP: u16 = 18017;
+    const QUIC: u16 = 18018;
+
+    let stub_port = spawn_http_stub("budgeted").await;
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, Some("vhost-udp-secret"));
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(true);
+    server.set_vhost(http_config("bore.local", HTTP))?;
+    server.set_vhost_quic_port(QUIC);
+    // Room for exactly one direct connection server-wide.
+    server.set_udp_direct_slots(Some(1));
+    let registry = server.vhost_registry();
+    let refusals = server.direct_budget_refusals_atomic();
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTP, true).await;
+
+    // Ask for three; the budget holds one.
+    let client = Client::new_vhost_provider_with_udp(
+        "127.0.0.1",
+        stub_port,
+        &format!("localhost:{CTRL}"),
+        "budgetudp",
+        "client1",
+        Some("vhost-udp-secret"),
+        false,
+        3,
+        true,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(client.listen());
+
+    wait_for_vhost_direct_count(&registry, "budgetudp", 1).await;
+
+    // The two surplus carriers are refused and counted. Give them a moment to
+    // be attempted; the assertion below on the pool size is the hard bound.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while refusals.load(Ordering::Relaxed) < 2 && tokio::time::Instant::now() < deadline {
+        time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        refusals.load(Ordering::Relaxed),
+        2,
+        "three requested carriers against one slot must refuse exactly two"
+    );
+    assert_eq!(
+        registry
+            .get("budgetudp")
+            .map(|e| e.direct.len())
+            .unwrap_or(0),
+        1,
+        "the budget is the bound on the direct pool, not a suggestion"
+    );
+
+    // And the tunnel works: this is the whole reason a refusal is acceptable.
+    let response = send_http(HTTP, "budgetudp.bore.local", "/").await?;
+    assert!(
+        response.contains("budgeted"),
+        "a budget-limited tunnel must still serve: {response}"
+    );
+    Ok(())
+}
+
 #[cfg(feature = "udp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vhost_udp_falls_back_when_server_udp_disabled() -> Result<()> {

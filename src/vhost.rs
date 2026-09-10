@@ -932,6 +932,12 @@ pub async fn relay_vhost(
     } else {
         None
     };
+    // Per-proxied-connection bulk classification (phase 03.1/03.2). Set to the
+    // chosen carrier's occupancy counter on the relay path; left unaccounted on
+    // the QUIC direct path, where contention is between streams inside one
+    // connection and carriers were measured NOT to help (c=4 slightly worse
+    // than c=1, §2.16) — that half is phase 03.4's problem, not this one.
+    let mut bulk_carrier: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> = None;
     let mut provider: mux::LinkStream = {
         #[cfg(feature = "udp")]
         {
@@ -951,7 +957,11 @@ pub async fn relay_vhost(
                     }
                     Err(err) => {
                         debug!(%err, "vhost QUIC open_stream failed; using TCP carrier");
-                        let opener = entry.pool.pick().context("no live vhost carrier")?;
+                        let (opener, bulk) = entry
+                            .pool
+                            .pick_avoiding_bulk()
+                            .context("no live vhost carrier")?;
+                        bulk_carrier = Some(bulk);
                         opener
                             .open_ready(forward_ip.as_deref(), Some(addr))
                             .await
@@ -959,7 +969,11 @@ pub async fn relay_vhost(
                     }
                 },
                 None => {
-                    let opener = entry.pool.pick().context("no live vhost carrier")?;
+                    let (opener, bulk) = entry
+                        .pool
+                        .pick_avoiding_bulk()
+                        .context("no live vhost carrier")?;
+                    bulk_carrier = Some(bulk);
                     opener
                         .open_ready(forward_ip.as_deref(), Some(addr))
                         .await
@@ -969,13 +983,20 @@ pub async fn relay_vhost(
         }
         #[cfg(not(feature = "udp"))]
         {
-            let opener = entry.pool.pick().context("no live vhost carrier")?;
+            let (opener, bulk) = entry
+                .pool
+                .pick_avoiding_bulk()
+                .context("no live vhost carrier")?;
+            bulk_carrier = Some(bulk);
             opener
                 .open_ready(forward_ip.as_deref(), Some(addr))
                 .await
                 .context("vhost provider unavailable")?
         }
     };
+    // Held for the connection's life: `Drop` releases the carrier occupancy on
+    // every exit path, including error and abort.
+    let bulk_ticket = crate::pool::BulkTicket::new(bulk_carrier);
 
     // Backend TLS origination (I-1/D6): when the tunnelled backend is itself an
     // HTTPS/TLS listener, the server (the TLS client endpoint) wraps the provider
@@ -1026,7 +1047,8 @@ pub async fn relay_vhost(
             entry.relay_tx_bytes.clone(),
             grx.clone(),
             gtx.clone(),
-        );
+        )
+        .watching_bulk(std::sync::Arc::clone(&bulk_ticket));
         // Wrap in tap if logger is present (Phase 2.2 — I-WL1 guard).
         let result = if let Some(ref logger) = log_ctx.logger {
             let tx = logger.sender_for(
@@ -1108,7 +1130,8 @@ pub async fn relay_vhost(
         entry.relay_tx_bytes.clone(),
         grx.clone(),
         gtx.clone(),
-    );
+    )
+    .watching_bulk(std::sync::Arc::clone(&bulk_ticket));
     relay_response_injected(
         counted_public,
         provider,

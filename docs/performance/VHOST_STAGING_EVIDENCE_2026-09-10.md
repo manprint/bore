@@ -1538,6 +1538,76 @@ measurement apparatus.
 
 ---
 
+### 2.18 — The stall rung is the window RATIO, not the window size (G9 ladder, private server)
+
+Run with `scripts/vhost_udp_window_ladder.sh` (root, netns `ns0`/`nsp`/`nsc`,
+provider run as root so the non-root socket-buffer clamp is out of the picture)
+against a **private** server — staging is frozen, and this is precisely the test
+shape that knocked an unrelated staging tunnel offline once already.
+
+Method per rung: N slow readers (`curl --limit-rate 8k`) pinned on a 48 MiB file
+— larger than one stream window at every profile, so a stalled stream can hold a
+full per-stream buffer — then one fast 64 KiB request timed under that load.
+`STALL` means it was served but took ≥ 3 s (the same criterion as the R3 gate);
+`HUNG` means it did not complete inside 30 s.
+
+Fast-request latency under load:
+
+| profile | conn/stream | 4 | 8 | 16 | 24 | 32 |
+| --- | --- | --- | --- | --- | --- | --- |
+| default | 256/16 MiB (16:1) | 0.01 s | 0.01 s | **HUNG** | HUNG | HUNG |
+| budget512 | 128/8 MiB (16:1) | 0.01 s | 0.01 s | **23.2 s** | 24.2 s | HUNG |
+| budget128 | 32/2 MiB (16:1) | 0.01 s | 0.01 s | **24.2 s** | 22.2 s | 25.2 s |
+| ratio8 | 64/8 MiB (8:1) | 0.01 s | **24.2 s** | HUNG | 18.2 s | 23.2 s |
+
+Server RSS at the same rungs (MiB):
+
+| profile | 4 | 8 | 16 | 24 | 32 |
+| --- | --- | --- | --- | --- | --- |
+| default | 83.5 | 183.4 | 320.6 | 361.9 | 481.4 |
+| budget512 | 51.1 | 100.1 | 170.9 | 240.2 | 268.0 |
+| budget128 | 26.8 | 46.7 | 85.0 | 86.1 | 106.4 |
+| ratio8 | 49.6 | 83.6 | 109.5 | 161.2 | 151.1 |
+
+Two independent points fix the relationship. Every 16:1 profile — across an
+8× range of absolute window size — first stalls at **16** readers. The 8:1
+profile first stalls at **8**. The first stalling rung is
+`connection_window / stream_window`, which is exactly the arithmetic
+`CLAUDE.md` states, now measured rather than reasoned.
+
+### F-17 — the small-host profile costs nothing in stall tolerance, and the default's cliff is reachable — MEASURED
+
+Two conclusions, one welcome and one not.
+
+**Welcome.** Shrinking both windows together is free in the dimension that
+matters. `budget128` (32/2 MiB) tolerated the same 8 slow readers as the shipped
+256/16 MiB default and used **85.0 MiB instead of 320.6 MiB at the 16-reader
+rung — 3.8× less** — and it degraded more gracefully above it (`STALL` at every
+rung where the default `HUNG`). So `--udp-memory-budget` is not a
+performance-for-memory trade at all, provided the 16:1 ratio is preserved, which
+is why the derivation enforces it rather than exposing it.
+
+**Not welcome, and it corrects §2.13.** The default profile HUNG at 16 slow
+readers here, while G9 on staging reported 12–17 ms fast requests at every count
+up to 32. Both measurements are real; they differ in how hard the readers pin
+windows. This harness uses 8 kB/s readers on a 48 MiB file over a fast netns
+path, which holds a full 16 MiB per-stream buffer for minutes; the staging run
+did not sustain that. The correct statement is therefore **not** "the cliff is
+gone" but "the cliff moved from ~4 stalled streams to ~16" — enough for the
+originally reported field workload, and still reachable by sixteen paused
+readers on one `--carriers 1` tunnel.
+
+What this does *not* change: the 64 → 256 MiB commit was still the right fix (it
+bought 4× the tolerance for the reported bug), the ratio still must not be
+reduced, and `--carriers N` still multiplies the tolerance by N because each
+carrier brings its own connection window. What it adds is that an operator
+expecting a `--carriers 1` `--udp` tunnel to survive arbitrary numbers of paused
+readers is expecting something no window size delivers — only carriers, or the
+TCP relay, which has no shared connection window and was immune at every rung
+of the original R1 control.
+
+---
+
 ## 5. Open questions
 
 Resolved during the campaign:
@@ -1555,6 +1625,14 @@ Resolved during the campaign:
    connections).
 4. ~~Does the header-injection path cost anything?~~ **Resolved by §2.12** — no,
    +0.6 %. F-4.
+6. ~~Does the cliff stay away at smaller QUIC windows?~~ **Answered by §2.18 and
+   F-17, and the answer is better than the question assumed** — and it also
+   corrects this document. The first stalling slow-reader count is exactly
+   `connection_window / stream_window`, so every profile that keeps the 16:1
+   ratio stalls at the *same* rung as the shipped default while using up to
+   3.8× less memory. The correction: the 64 → 256 MiB change did not remove the
+   cliff, it **moved** it from ~4 to ~16 stalled streams, and §2.13's G9 run
+   (no stall to 32 readers) did not reproduce a reachable one.
 5. ~~What network bandwidth does the IONOS production VPS guarantee, and does
    bulk-throughput work matter?~~ **Answered by §2.17 and F-16, and it turned out
    not to need the provisioning figure.** Measuring bore's CPU cost per byte
@@ -1568,10 +1646,6 @@ Resolved during the campaign:
 
 Still open:
 
-6. **Does the cliff stay away at smaller QUIC windows?** F-13's remedy 1 assumes
-   `64 MiB / 8 MiB` keeps the 8:1 ratio that prevents the stall cliff. That has
-   to be measured, not assumed — rerun G9 against a private server with the
-   smaller windows.
 7. **Why does the TCP relay develop a 1 s tail at 256+ concurrent connections
    while QUIC does not?** (§2.13 G8: 966 ms and 1 436 ms fresh-request time
    versus 14 ms.) Candidate causes: yamux substream open serialization on one

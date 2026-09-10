@@ -654,6 +654,7 @@ pub fn metrics(server: &Server) -> MetricsView {
         auth_failures: server.auth_failures(),
         conn_rejections: server.conn_rejections(),
         direct_fallbacks: server.direct_fallbacks(),
+        direct_budget_refusals: server.direct_budget_refusals(),
         rate_tx_bps: server.rate_tx_bps(),
         rate_rx_bps: server.rate_rx_bps(),
         ts: std::time::SystemTime::now()
@@ -894,6 +895,7 @@ mod tests {
             auth_failures: 0,
             conn_rejections: 0,
             direct_fallbacks: 0,
+            direct_budget_refusals: 0,
             rate_tx_bps: 0,
             rate_rx_bps: 0,
             ts: 0,

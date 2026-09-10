@@ -480,6 +480,11 @@ pub struct MetricsView {
     pub conn_rejections: u64,
     /// Direct-to-relay fallback count.
     pub direct_fallbacks: u64,
+    /// Direct admissions refused because the server-wide direct-path memory
+    /// budget (`--udp-memory-budget`) was full. Each one is a carrier that took
+    /// the warm TCP relay instead; no request fails. Always 0 when no budget is
+    /// configured.
+    pub direct_budget_refusals: u64,
     /// Server-side transmitted bytes per second (1s EWMA; 0 if sampler disabled).
     pub rate_tx_bps: u64,
     /// Server-side received bytes per second (1s EWMA; 0 if sampler disabled).
@@ -654,6 +659,7 @@ mod tests {
             auth_failures: 0,
             conn_rejections: 0,
             direct_fallbacks: 0,
+            direct_budget_refusals: 0,
             rate_tx_bps: 0,
             rate_rx_bps: 0,
             ts: 0,
@@ -683,6 +689,7 @@ mod tests {
             auth_failures: 5,
             conn_rejections: 3,
             direct_fallbacks: 2,
+            direct_budget_refusals: 5,
             rate_tx_bps: 0,
             rate_rx_bps: 0,
             ts: 0,
@@ -694,6 +701,7 @@ mod tests {
         assert_eq!(json["auth_failures"], 5);
         assert_eq!(json["conn_rejections"], 3);
         assert_eq!(json["direct_fallbacks"], 2);
+        assert_eq!(json["direct_budget_refusals"], 5);
     }
 
     #[test]

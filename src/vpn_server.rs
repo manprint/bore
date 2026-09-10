@@ -1244,6 +1244,8 @@ pub async fn serve_vpn_connector(
                     tx: Arc::clone(&relay_tx),
                     grx: grx_clone,
                     gtx: gtx_clone,
+                    // VPN relay is not scheduled per proxied HTTP connection.
+                    bulk: None,
                 };
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -1578,6 +1580,8 @@ pub async fn serve_vpn_connector(
                 tx: Arc::clone(&relay_tx),
                 grx: grx_clone,
                 gtx: gtx_clone,
+                // VPN relay is not scheduled per proxied HTTP connection.
+                bulk: None,
             };
             tokio::spawn(async move {
                 let _permit = permit;
@@ -1946,6 +1950,8 @@ mod tests {
             tx: Arc::clone(&entry_tx),
             grx: Arc::clone(&global_rx),
             gtx: Arc::clone(&global_tx),
+            // VPN relay is not scheduled per proxied HTTP connection.
+            bulk: None,
         };
 
         // Spawn a task to write and read through the counting stream

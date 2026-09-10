@@ -366,7 +366,7 @@ buffer helps high-latency, high-BDP links, not single-stream throughput on a fas
 
 For bulk transfers, the direct QUIC path is tuned in code with larger flow-control windows
 than Quinn's defaults: `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` (16 MiB),
-`DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` (64 MiB), and `DIRECT_QUIC_SEND_WINDOW` (64 MiB) in
+`DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW` (256 MiB), and `DIRECT_QUIC_SEND_WINDOW` (256 MiB) in
 `src/shared.rs`. The same defaults can now be overridden on `bore server` with
 `--udp-stream-receive-window`, `--udp-connection-receive-window`, `--udp-send-window`,
 `--udp-socket-recv-buffer`, `--udp-socket-send-buffer`, and `--udp-max-streams` (or the
@@ -379,6 +379,50 @@ UDP direct with lower latency but less throughput than TCP relay, that is not au
 bug: QUIC is reliable and congestion-controlled over UDP, while the relay uses highly
 optimized kernel TCP and may sit close to one peer. Tune those constants only after measuring
 both directions with a realistic quota.
+
+**Direct-path memory: the sizing rule.** The QUIC connection receive window is a
+per-connection **ceiling, not a reservation** — a healthy tunnel buffers approximately
+nothing. It only fills when the public reader stops draining, which is what a browser
+pausing assets or a mobile client on a bad link does. The worst case is therefore:
+
+```
+tunnels x carriers x connection_receive_window   <=   available RAM
+```
+
+At the defaults that is 256 MiB per tunnel-carrier, so one `--udp --carriers 4` tunnel can
+ask the server to hold 1 GiB, and ten tunnels have no bound at all. Measured on a 903 MiB
+host: 32 slow readers on a *single* `--udp` tunnel took the server to 536.8 MiB, which timed
+out two requests, failed a registration, and made an unrelated tunnel reconnect. It
+recovered (no OOM kill, RSS back to 33.6 MB afterwards), but one client's behaviour had
+degraded the whole server. The equivalent TCP relay load held 95.1 MiB.
+
+`--udp-memory-budget <SIZE>` bounds it with one number instead of four that must stay in a
+fixed ratio:
+
+```shell
+# A 2 GiB VPS: give the direct path at most 512 MiB, in windows sized for
+# 4-carrier tunnels.
+bore server --udp --max-carriers 4 --udp-memory-budget 512MiB
+#   -> 128 MiB connection window, 8 MiB stream window, 4 admission slots
+```
+
+The connection window becomes `budget / --max-carriers`, so one tunnel at its full carrier
+count fits inside the budget; the 16:1 connection-to-stream ratio is always preserved (see
+below for why it is load-bearing), and the window is never inflated past the tested 256 MiB
+default — a generous budget buys **concurrency** (more slots) rather than bigger windows.
+Slots are then `budget / connection_window`, which is the exact aggregate bound.
+
+A direct connection beyond the last slot is **refused, not failed**: that carrier stays on
+the warm TCP relay, which F-8 measured as the faster transport on a clean path anyway. Each
+refusal is logged and counted in `/admin/api/v1/metrics` as `direct_budget_refusals`. A
+budget too small to hold every carrier is still honoured, and says so at startup with the
+figure that would hold them all. The flag conflicts with `--udp-stream-receive-window`,
+`--udp-connection-receive-window` and `--udp-send-window`, because honouring both would mean
+silently discarding one.
+
+Unset, the behaviour is unchanged: a per-connection ceiling with no aggregate bound. On a
+host whose memory cannot hold even one tunnel's worst case, the server warns at startup with
+the computed figure and this flag.
 
 **Direct-path throughput on unprivileged hosts.** The 16 MiB UDP socket buffers above are
 requested with `SO_{SND,RCV}BUFFORCE`, which bypasses the kernel's `net.core.{r,w}mem_max`
@@ -528,6 +572,7 @@ Direct UDP path (--features udp, on by default):
       --udp-socket-recv-buffer <SIZE>             UDP socket receive buffer requested for direct UDP [env: BORE_UDP_SOCKET_RECV_BUFFER=] [default: 16MiB]
       --udp-socket-send-buffer <SIZE>             UDP socket send buffer requested for direct UDP [env: BORE_UDP_SOCKET_SEND_BUFFER=] [default: 16MiB]
       --udp-max-streams <N>                        Max native QUIC bidi streams per direct UDP connection [env: BORE_UDP_MAX_STREAMS=] [default: 4096]
+      --udp-memory-budget <SIZE>                  Worst-case direct-path receive memory for the WHOLE server; derives the windows and a server-wide admission limit. Conflicts with the three window flags [env: BORE_UDP_MEMORY_BUDGET=]
         (SIZE accepts raw bytes or KB/MB/GB/KiB/MiB/GiB suffixes)
 
 Vhost frontend (always available, no feature flag):

@@ -69,9 +69,11 @@ fail() { echo "FAIL: $*"; FAIL=$((FAIL+1)); }
 
 cleanup() {
     set +e
-    pkill -f 'target/release/bore' 2>/dev/null
-    pkill -f 'http\.server' 2>/dev/null
-    pkill -9 -f 'target/release/bore' 2>/dev/null
+    # Every process this harness starts lives inside one of its own netns, so
+    # the per-netns pid sweep below is sufficient AND safe. A blanket
+    # `pkill -f target/release/bore` was here and is a standing project
+    # prohibition: it is not netns-scoped, so on a workstation it kills the
+    # operator's own unrelated tunnels.
     for ns in ns0 nsp nsc; do
         ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null
         ip netns del "$ns" 2>/dev/null

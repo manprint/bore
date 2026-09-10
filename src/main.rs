@@ -30,8 +30,8 @@ use bore_cli::{
     secret::Proxy,
     server::Server,
     shared::{
-        HttpsPolicy, TunnelOptions, UdpDirectTuning, UdpTestOptions, MAX_DIRECT_STREAMS,
-        MAX_NOTES_LEN,
+        HttpsPolicy, TunnelOptions, UdpBudgetPlan, UdpBudgetShortfall, UdpDirectTuning,
+        UdpTestOptions, MAX_DIRECT_STREAMS, MAX_NOTES_LEN,
     },
     transfer::{
         CollisionPolicy, DeviceMode, ListenerOptions as TransferListenerOptions,
@@ -689,6 +689,24 @@ enum Command {
         /// connection. 4096 matches the current default.
         #[clap(long, value_name = "N", default_value_t = MAX_DIRECT_STREAMS, env = "BORE_UDP_MAX_STREAMS")]
         udp_max_streams: u32,
+
+        /// Worst-case receive memory the whole server may commit to the direct
+        /// UDP path. Derives the QUIC windows and a server-wide admission
+        /// limit from one number instead of four that must stay in a fixed
+        /// ratio; connections beyond the limit fall back to the warm TCP relay.
+        /// Unset = today's behaviour (per-connection ceiling, no aggregate
+        /// bound). Accepts raw bytes or KB/MB/GB/KiB/MiB/GiB suffixes.
+        #[clap(
+            long,
+            value_name = "SIZE",
+            env = "BORE_UDP_MEMORY_BUDGET",
+            conflicts_with_all = [
+                "udp_stream_receive_window",
+                "udp_connection_receive_window",
+                "udp_send_window",
+            ]
+        )]
+        udp_memory_budget: Option<String>,
 
         /// Enable the admin status page at /admin/status on the control port,
         /// guarded by this token (min 32 chars). Unset = the page is disabled.
@@ -2113,6 +2131,7 @@ async fn dispatch(command: Command) -> Result<()> {
             udp_socket_recv_buffer,
             udp_socket_send_buffer,
             udp_max_streams,
+            udp_memory_budget,
             admin_token,
             control_hsts,
             vhost_config,
@@ -2198,14 +2217,31 @@ async fn dispatch(command: Command) -> Result<()> {
             server.set_control_hsts(&control_hsts);
             server.set_max_conns(max_conns);
             server.set_max_carriers(max_carriers);
-            server.set_udp_tuning(parse_udp_tuning(
+            let mut udp_tuning = parse_udp_tuning(
                 &udp_stream_receive_window,
                 &udp_connection_receive_window,
                 &udp_send_window,
                 &udp_socket_recv_buffer,
                 &udp_socket_send_buffer,
                 udp_max_streams,
-            )?);
+            )?;
+            let udp_budget = udp_memory_budget
+                .as_deref()
+                .map(parse_transfer_quota)
+                .transpose()
+                .context("--udp-memory-budget")?;
+            if let Some(budget) = udp_budget {
+                let plan = UdpDirectTuning::from_memory_budget(budget, max_carriers as u32);
+                // The budget governs the three flow-control windows only; the
+                // socket buffers and stream cap stay whatever the operator set.
+                udp_tuning.stream_receive_window = plan.tuning.stream_receive_window;
+                udp_tuning.connection_receive_window = plan.tuning.connection_receive_window;
+                udp_tuning.send_window = plan.tuning.send_window;
+                server.set_udp_direct_slots(Some(plan.direct_slots));
+                report_udp_budget(budget, max_carriers as u32, &plan);
+            }
+            warn_direct_memory_shape(udp, &udp_tuning, max_carriers as u32, udp_budget);
+            server.set_udp_tuning(udp_tuning);
             server.set_udp_adaptive_plan(!no_udp_adaptive_plan);
             server.set_control_port(control_port);
             if let Some(ref domain) = bind_domain {
@@ -2781,6 +2817,109 @@ fn parse_transfer_quota(value: &str) -> Result<u64> {
         .context("--test-transfer-quota is too large")
 }
 
+/// Report the direct-path profile a budget produced, and any shortfall.
+///
+/// A budget that cannot be honoured exactly is still honoured — never widened
+/// behind the operator's back — but it is always said out loud, with the number
+/// and the flag that changes it.
+fn report_udp_budget(budget: u64, max_carriers: u32, plan: &UdpBudgetPlan) {
+    let mib = |b: u64| b / (1024 * 1024);
+    info!(
+        budget_mib = mib(budget),
+        slots = plan.direct_slots,
+        connection_window_mib = mib(plan.tuning.connection_receive_window as u64),
+        stream_window_mib = mib(plan.tuning.stream_receive_window as u64),
+        "direct UDP memory budget applied"
+    );
+    match plan.shortfall {
+        Some(UdpBudgetShortfall::BelowCarrierCount {
+            max_carriers: carriers,
+            slots,
+        }) => warn!(
+            budget_mib = mib(budget),
+            max_carriers = carriers,
+            slots,
+            "--udp-memory-budget cannot hold every carrier at the smallest usable window: a --udp --carriers {carriers} tunnel will get {slots} direct carriers and relay the rest; raise the budget to {} MiB to hold them all",
+            mib(carriers as u64 * plan.tuning.connection_receive_window as u64)
+        ),
+        Some(UdpBudgetShortfall::BelowOneConnection { per_connection }) => warn!(
+            budget_mib = mib(budget),
+            per_connection_mib = mib(per_connection),
+            "--udp-memory-budget is smaller than one direct connection's smallest usable window; one connection is still admitted and may exceed the budget"
+        ),
+        None => {
+            let _ = max_carriers;
+        }
+    }
+}
+
+/// What to tell the operator about the direct path's memory shape, if
+/// anything. Pure so the decision can be tested without a host of a given size.
+///
+/// The per-connection QUIC receive window is a ceiling, not a reservation, so a
+/// healthy server never approaches these figures — but F-13 measured one client
+/// with slow readers reaching 536.8 MiB on a 903 MiB host, timing out unrelated
+/// requests. Without a budget there is no aggregate bound at all, so the number
+/// worth stating is what a SINGLE tunnel at full carriers can ask for.
+///
+/// The quarter-of-RAM threshold is a judgement, not a measurement: it is low
+/// enough to catch both hosts the campaign covered (a 903 MiB staging box, and
+/// the announced 2 GiB VPS whose single-tunnel worst case is 1 GiB) and high
+/// enough to stay quiet on a well-provisioned server.
+fn direct_memory_advice(
+    udp: bool,
+    tuning: &UdpDirectTuning,
+    max_carriers: u32,
+    budget: Option<u64>,
+    host_total: Option<u64>,
+) -> Option<String> {
+    if !udp {
+        return None;
+    }
+    let total = host_total?;
+    let mib = |b: u64| b / (1024 * 1024);
+    match budget {
+        Some(budget) if budget > total / 2 => Some(format!(
+            "--udp-memory-budget is {} MiB, more than half of this host's {} MiB; \
+             the direct path can commit that much before falling back to the relay",
+            mib(budget),
+            mib(total)
+        )),
+        Some(_) => None,
+        None => {
+            let worst = tuning.worst_case_per_tunnel(max_carriers);
+            (worst > total / 4).then(|| {
+                format!(
+                    "the direct UDP path has no aggregate memory bound: ONE --udp tunnel at \
+                 {max_carriers} carriers can ask this server to buffer {} MiB of {} MiB total, \
+                 and several tunnels are unbounded. Set --udp-memory-budget <SIZE> to bound it \
+                 (refused connections fall back to the warm TCP relay)",
+                    mib(worst),
+                    mib(total)
+                )
+            })
+        }
+    }
+}
+
+/// Emit [`direct_memory_advice`] against the real host.
+fn warn_direct_memory_shape(
+    udp: bool,
+    tuning: &UdpDirectTuning,
+    max_carriers: u32,
+    budget: Option<u64>,
+) {
+    if let Some(advice) = direct_memory_advice(
+        udp,
+        tuning,
+        max_carriers,
+        budget,
+        bore_cli::shared::host_total_memory(),
+    ) {
+        warn!("{advice}");
+    }
+}
+
 fn parse_udp_tuning(
     stream_receive_window: &str,
     connection_receive_window: &str,
@@ -2899,6 +3038,121 @@ mod tests {
 
     lazy_static! {
         static ref ENV_GUARD: Mutex<()> = Mutex::new(());
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// The two hosts the campaign actually covered must both be warned, and a
+    /// well-provisioned host must stay quiet — otherwise the warning is either
+    /// useless or noise.
+    #[test]
+    fn direct_memory_advice_warns_the_hosts_that_cannot_hold_the_worst_case() {
+        let t = UdpDirectTuning::default();
+
+        // Staging: 903 MiB, one 4-carrier tunnel can ask for 1 GiB.
+        let staging = direct_memory_advice(true, &t, 4, None, Some(903 * MIB));
+        assert!(staging.is_some(), "the host F-13 degraded must be warned");
+        let staging = staging.unwrap();
+        assert!(staging.contains("1024 MiB"), "{staging}");
+        assert!(staging.contains("--udp-memory-budget"), "{staging}");
+
+        // The announced 2 GiB VPS: same 1 GiB worst case, still over a quarter.
+        assert!(direct_memory_advice(true, &t, 4, None, Some(2048 * MIB)).is_some());
+
+        // A well-provisioned host: quiet.
+        assert_eq!(
+            direct_memory_advice(true, &t, 4, None, Some(16384 * MIB)),
+            None
+        );
+    }
+
+    /// `--udp` off means the direct path does not exist; an unknown host size
+    /// means no basis to judge. Neither may produce a warning.
+    #[test]
+    fn direct_memory_advice_is_silent_without_udp_or_a_known_host_size() {
+        let t = UdpDirectTuning::default();
+        assert_eq!(
+            direct_memory_advice(false, &t, 4, None, Some(512 * MIB)),
+            None
+        );
+        assert_eq!(direct_memory_advice(true, &t, 4, None, None), None);
+    }
+
+    /// A budget bounds the worst case, so the no-bound warning must stop — but
+    /// a budget larger than half the host is itself worth saying.
+    #[test]
+    fn direct_memory_advice_switches_to_judging_the_budget() {
+        let t = UdpDirectTuning::default();
+        assert_eq!(
+            direct_memory_advice(true, &t, 4, Some(256 * MIB), Some(903 * MIB)),
+            None,
+            "a budget the host can hold needs no warning"
+        );
+        let big = direct_memory_advice(true, &t, 4, Some(800 * MIB), Some(903 * MIB));
+        assert!(big.is_some());
+        assert!(big.unwrap().contains("more than half"));
+    }
+
+    #[test]
+    fn server_udp_memory_budget_flag_derives_windows_and_slots() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let args = Args::parse_from(["bore", "server", "--udp-memory-budget", "512MiB"]);
+        let Command::Server {
+            udp_memory_budget,
+            max_carriers,
+            ..
+        } = args.command
+        else {
+            panic!("expected server command");
+        };
+        let budget = parse_transfer_quota(&udp_memory_budget.expect("flag parsed")).unwrap();
+        assert_eq!(budget, 512 * MIB);
+        // The window is budget / max_carriers, so one tunnel at the maximum
+        // carrier count the server allows fits inside the budget. With the
+        // default `--max-carriers` that is a small window and many slots;
+        // an operator wanting bigger windows lowers --max-carriers or raises
+        // the budget.
+        let plan = UdpDirectTuning::from_memory_budget(budget, max_carriers as u32);
+        assert_eq!(
+            plan.tuning.connection_receive_window as u64,
+            512 * MIB / max_carriers as u64
+        );
+        assert_eq!(plan.direct_slots, max_carriers as usize);
+        assert_eq!(
+            plan.tuning.connection_receive_window / bore_cli::shared::DIRECT_WINDOW_RATIO,
+            plan.tuning.stream_receive_window
+        );
+
+        // A lower carrier cap spends the same budget on bigger windows.
+        let plan4 = UdpDirectTuning::from_memory_budget(budget, 4);
+        assert_eq!(plan4.tuning.connection_receive_window as u64, 128 * MIB);
+        assert_eq!(plan4.direct_slots, 4);
+    }
+
+    /// The budget and the hand-set windows are mutually exclusive: honouring
+    /// both would mean silently discarding one, and the operator would have no
+    /// way to tell which.
+    #[test]
+    fn server_udp_memory_budget_conflicts_with_explicit_windows() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        for flag in [
+            "--udp-connection-receive-window",
+            "--udp-stream-receive-window",
+            "--udp-send-window",
+        ] {
+            let err = Args::try_parse_from([
+                "bore",
+                "server",
+                "--udp-memory-budget",
+                "512MiB",
+                flag,
+                "64MiB",
+            ])
+            .expect_err("must be rejected");
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{flag}");
+        }
+        // And the defaults are not "explicit", so the budget alone is fine.
+        assert!(Args::try_parse_from(["bore", "server", "--udp-memory-budget", "512MiB"]).is_ok());
     }
 
     #[test]

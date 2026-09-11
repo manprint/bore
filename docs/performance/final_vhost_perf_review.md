@@ -571,7 +571,7 @@ già misurato in §4: otto corsie costano il 23 % del picco in upload, perché a
 rimette. Se un deployment fa soprattutto upload, la corsia singola forzata del
 gateway SSH è un **vantaggio**, non un limite.
 
-### E con il canale diretto UDP invece che con il relay?
+### 5.4 E con il canale diretto UDP invece che con il relay?
 
 Tutte le prove qui sopra usano il canale TCP (il *relay*). Per il gateway SSH
 non è una dimenticanza — quel percorso è TCP per progetto — ma restava da
@@ -1268,8 +1268,8 @@ La scelta che conta davvero è un'altra: **quante corsie** aprire.
 | applicazione web, pannello, API, file server usato da persone | **8** | spento |
 | un solo trasferimento grande per volta (backup, sincronizzazione) | **1** | spento |
 | non lo sai, o cambia nel tempo | **0** (automatico) | spento |
-| moltissime connessioni tenute aperte insieme | 8 | **acceso** |
-| rete con perdita di pacchetti (radio, satellite, VPN scadente) | 1 | **acceso** |
+| moltissime connessioni tenute aperte insieme | **4–8** | **acceso** |
+| rete con perdita di pacchetti (radio, satellite, VPN scadente) | **1** | **acceso** |
 
 Le evidenze dietro questa tabella:
 
@@ -1280,7 +1280,7 @@ Le evidenze dietro questa tabella:
 * **1 corsia** su trasferimento singolo: **59,10 MB/s** in download e
   **93,67 MB/s** in upload, contro 52,55 e 72,17 con 8 corsie. Otto corsie
   dividono in otto la finestra di congestione di un unico flusso: è la fisica
-  del protocollo, non un difetto (§4.3).
+  del protocollo, non un difetto (§4.2).
 * **0 corsie (automatico)**: rende quanto 8 fisse (rapporto mediano 1,033)
   tenendone aperta una sola, e ne apre altre solo quando una richiesta piccola
   **entra davvero in competizione** con un trasferimento pesante. Su un tunnel
@@ -1367,10 +1367,20 @@ si ottiene lo stesso effetto (§5.1).
 **E. I due casi in cui accendere il percorso diretto UDP**
 
 ```bash
+# molte connessioni tenute aperte insieme: 4-8 corsie = 4-8 connessioni QUIC
+bore vhost 127.0.0.1:8080 --subdomain app --id app \
+    --to "$BORE_SERVER" --secret "$BORE_SECRET" \
+    --udp --carriers 4 --auto-reconnect
+
+# rete con perdita di pacchetti: una sola, il guadagno viene dal protocollo
 bore vhost 127.0.0.1:8080 --subdomain app --id app \
     --to "$BORE_SERVER" --secret "$BORE_SECRET" \
     --udp --carriers 1 --auto-reconnect
 ```
+
+Sul percorso diretto `--carriers N` non apre N connessioni TCP ma **N
+connessioni QUIC indipendenti**, che il server usa a turno: servono quando ci
+sono molte richieste insieme, non quando c'è un solo flusso pesante.
 
 Il server deve avere `BORE_UDP=true` e la porta QUIC aperta in UDP. Se il
 percorso diretto non si stabilisce, o cade, il traffico passa **da solo** sul

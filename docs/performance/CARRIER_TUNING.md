@@ -260,17 +260,36 @@ Behavior by value:
 - TCP relay only: `> --max-carriers` is truncated by the server. (The QUIC pool is
   not affected by that cap.)
 
-For maximum performance:
+For maximum performance — **measured on staging 2026-09-11**, see
+[`VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md`](VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md)
+§8.1 — there is no single best value. Pick by workload:
 
-- Size `N` to the number of simultaneously busy browser connections the provider
-  hop carries; more than that adds overhead without gain.
+| workload | value | measured |
+| --- | --- | --- |
+| a web app: small requests alongside occasional bulk | **`--carriers 8`** | small-request p95 under one bulk transfer 14.06 → **4.92 ms**; 393 → **1162 req/s** under two. Costs ~11 % of peak single-transfer bandwidth |
+| one big transfer at a time | **`--carriers 1`** (the default) | **59.10 MB/s** down / **93.67** up from a domestic consumer, against 52.55 / 72.17 at 8 — eight carriers split one flow's congestion window eight ways |
+| unknown or mixed | **`--carriers 0`** (adaptive) | matches static 8 on throughput (median ratio 1.033) while holding one carrier; grows only when a small request actually *contends* with bulk, so a pure-bulk tunnel stays at one — by design |
+
+- On a clean, idle path carriers still **cost**: median ratio c4/c1 = 0.88. That is
+  why `1` remains the default and why the adaptive mode does nothing until there is
+  something to schedule.
 - A single large download/upload over one HTTP connection will not speed up — split
   it across connections (`aria2c -x16`, ranged requests) or use `bore transfer
-  --parallel N` for native multi-stream file transfer.
+  --parallel N` for native multi-stream file transfer. Measured: 32 parallel small
+  requests took **2.8 ms each** (360 files/s) against 66 ms one at a time.
 - `--carriers` never improves the browser↔server leg; it only widens the
   server↔provider hop.
-- On a low-latency link, also consider `BORE_PROXY_BUFFER_SIZE`; on a high-latency
-  link it can smooth throughput.
+- `BORE_PROXY_BUFFER_SIZE` was A/B/A'd over a 40 ms path, which is where a copy
+  buffer should bite: 128 KiB → 25.57 MB/s, 256 KiB → 28.53, 128 KiB again → 29.67.
+  The two identical arms differ by 16 %, so **leave it at the 256 KiB default**
+  unless you have measured your own path.
+- **`--udp` is not a throughput upgrade.** Against a real file server the TCP relay
+  was faster on small requests (93.93 vs 103.74 ms p50), equal or better on
+  sustained bulk, ~half the CPU per GiB (6.85 vs 13.00 core-seconds), and 36× cheaper
+  in cloud instance network allowance. Enable it for the two cases the relay cannot
+  serve: very many simultaneously held connections (a fresh request behind 512 of
+  them took **14 ms** direct against **1436 ms** relayed), and lossy paths (2.7×
+  faster under injected loss).
 
 ### `bore transfer listener`
 
@@ -381,13 +400,39 @@ For maximum performance:
 
 ### Vhost
 
+Measured recommendation, copy-paste ready (staging 2026-09-11):
+
+```bash
+# a web app / file server used by people — the common case
+bore vhost 127.0.0.1:8080 --subdomain app --id app \
+    --to "$BORE_SERVER" --secret "$BORE_SECRET" --carriers 8 --auto-reconnect
+
+# one big transfer at a time (backup, sync)
+bore vhost 127.0.0.1:8080 --subdomain backup --id backup \
+    --to "$BORE_SERVER" --secret "$BORE_SECRET" --carriers 1 --auto-reconnect
+
+# unknown or changing mix
+bore vhost 127.0.0.1:8080 --subdomain app --id app \
+    --to "$BORE_SERVER" --secret "$BORE_SECRET" --carriers 0 --auto-reconnect
+```
+
 - Relay-only vhost: size carriers for concurrent browser connections on the
-  server → provider hop (server-capped by `--max-carriers`).
+  server → provider hop (server-capped by `--max-carriers`). 8 was the measured
+  sweet spot for a mixed workload.
 - Vhost `--udp`: `--carriers N` opens `N` parallel QUIC connections (pooled,
   round-robined, capped at 32/subdomain). Raise it for many concurrent browser
-  connections; it does not help a single flow.
+  connections; it does not help a single flow. Enable `--udp` itself only for
+  the two cases listed above — it is not a bandwidth upgrade.
 - Single large file either way: parallelize on the client, or use
   `bore transfer --parallel N`.
+- The three provider flavours — native binary, the published Docker client
+  image, and the SSH ingress gateway — measured **equivalent** on bandwidth
+  (5.7 % spread on download). Two operational differences matter more than the
+  numbers: the Docker image needs `--network host` to reach an origin on the
+  host's loopback, and the SSH gateway is TCP-relay-only with a forced single
+  connection, which makes it the fastest for a single upload (88.25 vs
+  80.26 MB/s) and the slowest under parallelism (8 concurrent downloads move no
+  more than 1).
 
 ## Operational caveats
 

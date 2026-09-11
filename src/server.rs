@@ -501,6 +501,11 @@ impl Server {
                 ),
                 udp_send_window: crate::shared::format_iec_size(udp_defaults.send_window),
                 udp_max_streams: udp_defaults.max_direct_streams,
+                // Placeholder: derived live by `admin_api::config`.
+                proxy_buffer_size: String::new(),
+                direct_quic_keepalive_ms: None,
+                direct_quic_idle_ms: None,
+                udp_direct_slots: None,
                 bind_domain: None,
                 control_hsts: "max-age=31536000".into(),
                 #[cfg(feature = "vpn")]
@@ -642,6 +647,16 @@ impl Server {
     /// Set the direct-UDP transport tuning brokered to peers.
     pub fn set_udp_tuning(&mut self, udp_tuning: UdpDirectTuning) {
         self.udp_tuning = udp_tuning;
+    }
+
+    /// The direct-UDP transport tuning actually in force.
+    ///
+    /// Needed because `--udp-memory-budget` DERIVES the three flow-control
+    /// windows from one number after the CLI values were already snapshotted
+    /// into `ConfigView`: without this the admin API reported the requested
+    /// windows while the server ran the derived ones.
+    pub fn udp_tuning(&self) -> UdpDirectTuning {
+        self.udp_tuning
     }
 
     /// Enable/disable the server-computed adaptive traversal plan (plan

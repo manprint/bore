@@ -2388,6 +2388,12 @@ async fn dispatch(command: Command) -> Result<()> {
                 udp_connection_receive_window,
                 udp_send_window,
                 udp_max_streams,
+                // Placeholder: `admin_api::config` derives the live value on
+                // every read (see the field's doc comment).
+                proxy_buffer_size: String::new(),
+                direct_quic_keepalive_ms: None,
+                direct_quic_idle_ms: None,
+                udp_direct_slots: None,
                 bind_domain: bind_domain.clone(),
                 control_hsts,
                 #[cfg(feature = "vpn")]

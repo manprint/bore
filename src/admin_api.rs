@@ -630,12 +630,54 @@ fn overlay_vhost_config(view: &mut ConfigView, server: &Server) {
         .collect();
 }
 
+/// Overlay the tunables that live in process-wide state rather than in the
+/// startup snapshot.
+///
+/// `BORE_PROXY_BUFFER_SIZE` is resolved once inside `shared::proxy_buffer_size()`
+/// (a `OnceLock`, clamped to `[4 KiB, 16 MiB]`) and logged only at `trace`, so
+/// the startup `ConfigView` never saw it and the endpoint reported nothing
+/// while every neighbouring UDP window was reported. Deriving it here is the
+/// same fix, and the same reasoning, as `overlay_vhost_config` (F-6).
+///
+/// The direct-path QUIC liveness pair is the same shape again, with one extra
+/// reason: `holepunch::resolve_direct_quic_liveness` may TIGHTEN the requested
+/// keep-alive to keep two consecutive losses survivable, so the value in the
+/// environment is not necessarily the value in force.
+fn overlay_runtime_tunables(view: &mut ConfigView, server: &Server) {
+    view.proxy_buffer_size =
+        crate::shared::format_iec_size(crate::shared::proxy_buffer_size() as u64);
+    #[cfg(feature = "udp")]
+    {
+        let live = crate::holepunch::direct_quic_liveness();
+        view.direct_quic_keepalive_ms = Some(live.keepalive.as_millis() as u64);
+        view.direct_quic_idle_ms = Some(live.max_idle.as_millis() as u64);
+    }
+
+    // The whole direct-UDP block is derived from the tuning actually installed
+    // on the server, not from the CLI strings the startup snapshot captured.
+    // `--udp-memory-budget` computes the three windows from one number AFTER
+    // the snapshot was taken (F-13), so a server running a budget reported the
+    // requested 16MiB/256MiB while it was actually running the derived pair —
+    // the same class of gap as the vhost headers (F-6) and the proxy buffer.
+    let tuning = server.udp_tuning();
+    view.udp_stream_receive_window =
+        crate::shared::format_iec_size(tuning.stream_receive_window as u64);
+    view.udp_connection_receive_window =
+        crate::shared::format_iec_size(tuning.connection_receive_window as u64);
+    view.udp_send_window = crate::shared::format_iec_size(tuning.send_window);
+    view.udp_socket_recv_buffer = Some(tuning.udp_socket_recv_buffer);
+    view.udp_socket_send_buffer = Some(tuning.udp_socket_send_buffer);
+    view.udp_max_streams = tuning.max_direct_streams;
+    view.udp_direct_slots = server.udp_direct_slots().map(|n| n as u32);
+}
+
 /// Build the server configuration view (already stored on Server).
 pub fn config(server: &Server) -> ConfigView {
     #[cfg(feature = "ssh-gateway")]
     {
         let mut view = (*server.config_view()).clone();
         overlay_vhost_config(&mut view, server);
+        overlay_runtime_tunables(&mut view, server);
 
         // Populate SSH gateway config from the running gateway instance.
         if let Some(gateway) = server.ssh_gateway() {
@@ -656,6 +698,7 @@ pub fn config(server: &Server) -> ConfigView {
     {
         let mut view = (*server.config_view()).clone();
         overlay_vhost_config(&mut view, server);
+        overlay_runtime_tunables(&mut view, server);
         view
     }
 }
@@ -762,6 +805,112 @@ mod tests {
     /// Red-check: hardcode any one of these (e.g. leave
     /// `view.vhost_default_response_headers` at its `Default::default()`) and
     /// this fails.
+    #[test]
+    fn config_view_reports_the_live_proxy_buffer_size() {
+        // The startup snapshot deliberately carries an empty placeholder, so
+        // this assertion is red the moment `overlay_runtime_tunables` stops
+        // running: an operator who sets BORE_PROXY_BUFFER_SIZE could not
+        // otherwise confirm it took effect anywhere in the API.
+        let server = Server::new(20700..=20800, None);
+        assert_eq!(
+            server.config_view().proxy_buffer_size,
+            "",
+            "the snapshot must not restate a value it cannot keep current"
+        );
+
+        let view = config(&server);
+        assert_eq!(
+            view.proxy_buffer_size,
+            crate::shared::format_iec_size(crate::shared::proxy_buffer_size() as u64),
+            "the view must report the resolved buffer size"
+        );
+        assert!(
+            !view.proxy_buffer_size.is_empty(),
+            "the derived field must never be reported as absent"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "udp")]
+    fn config_view_reports_the_live_direct_quic_liveness() {
+        // Red-checks the same gap as the buffer-size test above, for the pair
+        // that governs how long requests are lost after UDP disappears. The
+        // snapshot carries `None`, so this is red the moment the overlay stops
+        // running — and it asserts the RESOLVED pair, because the resolver may
+        // tighten a requested keep-alive and the environment value would then
+        // not be the value in force.
+        let server = Server::new(20900..=21000, None);
+        assert_eq!(
+            server.config_view().direct_quic_keepalive_ms,
+            None,
+            "the snapshot must not restate a value it cannot keep current"
+        );
+
+        let live = crate::holepunch::direct_quic_liveness();
+        let view = config(&server);
+        assert_eq!(
+            view.direct_quic_keepalive_ms,
+            Some(live.keepalive.as_millis() as u64)
+        );
+        assert_eq!(
+            view.direct_quic_idle_ms,
+            Some(live.max_idle.as_millis() as u64)
+        );
+        assert!(
+            view.direct_quic_idle_ms.unwrap() >= 3 * view.direct_quic_keepalive_ms.unwrap(),
+            "the published pair must satisfy the same survivability rule the resolver enforces"
+        );
+    }
+
+    /// F-13 coherence gate: with `--udp-memory-budget` the server DERIVES the
+    /// three flow-control windows, and the startup snapshot — taken from the
+    /// CLI strings before the derivation ran — was still what the endpoint
+    /// reported. A staging run with a 512 MiB budget on a 1024-carrier server
+    /// therefore showed `16MiB / 256MiB` while the process was running the
+    /// derived pair, which is the worst possible answer to "is my budget on?".
+    #[test]
+    #[cfg(feature = "udp")]
+    fn config_view_reports_the_windows_the_budget_actually_installed() {
+        use crate::shared::{format_iec_size, UdpDirectTuning};
+
+        let mut server = Server::new(21100..=21200, None);
+        let snapshot = server.config_view().udp_stream_receive_window.clone();
+
+        // The exact shape the flag takes in main.rs: derive, install the
+        // windows, install the slot count.
+        let plan = UdpDirectTuning::from_memory_budget(512 * 1024 * 1024, 1024);
+        let mut tuning = server.udp_tuning();
+        tuning.stream_receive_window = plan.tuning.stream_receive_window;
+        tuning.connection_receive_window = plan.tuning.connection_receive_window;
+        tuning.send_window = plan.tuning.send_window;
+        server.set_udp_tuning(tuning);
+        server.set_udp_direct_slots(Some(plan.direct_slots));
+
+        let view = config(&server);
+        assert_eq!(
+            view.udp_stream_receive_window,
+            format_iec_size(plan.tuning.stream_receive_window as u64),
+            "the endpoint must report the DERIVED stream window, not the CLI one"
+        );
+        assert_eq!(
+            view.udp_connection_receive_window,
+            format_iec_size(plan.tuning.connection_receive_window as u64)
+        );
+        assert_eq!(
+            view.udp_send_window,
+            format_iec_size(plan.tuning.send_window)
+        );
+        assert_eq!(
+            view.udp_direct_slots,
+            Some(plan.direct_slots as u32),
+            "the aggregate bound is the only field that says the budget is on"
+        );
+        assert_ne!(
+            view.udp_stream_receive_window, snapshot,
+            "this budget does change the window, so a snapshot-equal answer means the overlay is not running"
+        );
+    }
+
     #[test]
     fn config_view_vhost_section_equals_the_resolved_merged_configuration() {
         // mode stays `http` because `redirect-https` fails fast without a cert.
@@ -1241,6 +1390,10 @@ reservations:
             udp_connection_receive_window: "16MiB".into(),
             udp_send_window: "64MiB".into(),
             udp_max_streams: 4096,
+            proxy_buffer_size: "256KiB".into(),
+            direct_quic_keepalive_ms: Some(3_000),
+            direct_quic_idle_ms: Some(10_000),
+            udp_direct_slots: None,
             bind_domain: None,
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]
@@ -1329,6 +1482,10 @@ reservations:
             udp_connection_receive_window: "16MiB".into(),
             udp_send_window: "64MiB".into(),
             udp_max_streams: 4096,
+            proxy_buffer_size: "256KiB".into(),
+            direct_quic_keepalive_ms: Some(3_000),
+            direct_quic_idle_ms: Some(10_000),
+            udp_direct_slots: None,
             bind_domain: Some("bore.example.com".into()),
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]

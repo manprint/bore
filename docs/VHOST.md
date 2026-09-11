@@ -391,6 +391,46 @@ A larger buffer trades memory (≈ `size × 2 directions × concurrent connectio
 for fewer wakeups on high-throughput, high-latency paths. It does **not** raise
 single-stream throughput on a low-latency link — see the one-transfer note above.
 
+The variable is read once into a `OnceLock` and logged only at `trace`, so the
+resolved value is published as **`proxy_buffer_size`** on
+`GET /admin/api/v1/config` (derived on every read, never a startup literal).
+Check it there rather than inferring it from the environment.
+
+### Direct-path QUIC liveness: `BORE_DIRECT_QUIC_KEEPALIVE_MS` / `BORE_DIRECT_QUIC_IDLE_MS`
+
+A `--udp` direct connection is kept alive with a keep-alive ping every **3 s**
+and declared dead after **10 s** idle. Both are overridable in milliseconds:
+
+```bash
+# faster detection of a vanished UDP path, at one ping per second per quiet connection
+BORE_DIRECT_QUIC_KEEPALIVE_MS=1000 BORE_DIRECT_QUIC_IDLE_MS=4000 bore server --udp ...
+```
+
+**Why an operator would touch this.** The fallback from QUIC direct to the warm
+TCP relay is transparent and costs ~12 ms — but only from the *second* request
+onward. The first request issued after UDP stops working is lost, because with
+the peer silent both `open_bi` and the `STREAM_READY` write succeed locally (no
+round trip is needed for either), so the request is already committed to that
+stream and waits for the connection itself to time out. That wait is exactly the
+idle timeout. Lowering it shortens the loss window proportionally; raising it
+widens it.
+
+Bounds and the one policy rule:
+
+- Idle timeout clamped to `[1 s, 600 s]`, keep-alive to a `200 ms` floor.
+- The resolved pair always satisfies `max_idle >= 3 × keepalive`, so two
+  consecutive lost pings never kill a healthy connection. If the requested pair
+  does not, the **keep-alive is tightened** (never the idle timeout relaxed —
+  the operator asked for faster detection) and a `warn!` reports the pair
+  actually installed.
+- Both resolved values are published as `direct_quic_keepalive_ms` and
+  `direct_quic_idle_ms` on `GET /admin/api/v1/config`. Read them there: because
+  the resolver can tighten the keep-alive, the environment is not authoritative.
+
+Cost of a shorter idle timeout is a spuriously torn-down direct connection on a
+path with heavy sustained loss; the connection then falls back to the warm relay,
+which on a clean path is the faster transport anyway (see the table below).
+
 ### Measured: TCP vs `--udp` (single `curl`, 1 GiB)
 
 | Direction | Transport | Throughput |

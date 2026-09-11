@@ -413,10 +413,18 @@ else
     fi
 fi
 
-# T-CFGFIELDS: GET /config has keys udp_stream_receive_window, udp_max_streams, bind_domain, control_hsts, vhost_mode
+# T-CFGFIELDS: GET /config has keys udp_stream_receive_window, udp_max_streams, bind_domain, control_hsts, vhost_mode, proxy_buffer_size, direct_quic_keepalive_ms, direct_quic_idle_ms
+# proxy_buffer_size is derived live from shared::proxy_buffer_size(); it used to
+# be absent entirely, so an operator setting BORE_PROXY_BUFFER_SIZE had no way
+# to confirm it applied. The two direct_quic_* fields are the same gap for the
+# QUIC liveness pair, which additionally may be TIGHTENED by the resolver, so
+# the environment value is not necessarily the value in force. udp_direct_slots
+# reports the F-13 aggregate bound, and the whole UDP window block is now
+# derived from the tuning actually installed rather than from the CLI strings
+# (--udp-memory-budget rewrites the windows after the snapshot was taken).
 R=$(aget /admin/api/v1/config "$ADMIN_TOKEN"); BODY=$(body_of "$R")
 fields_ok=true
-for field in "udp_stream_receive_window" "udp_max_streams" "bind_domain" "control_hsts" "vhost_mode"; do
+for field in "udp_stream_receive_window" "udp_max_streams" "bind_domain" "control_hsts" "vhost_mode" "proxy_buffer_size" "direct_quic_keepalive_ms" "direct_quic_idle_ms" "udp_direct_slots"; do
     if ! echo "$BODY" | grep -q "\"$field\""; then
         fields_ok=false
         break

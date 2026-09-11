@@ -70,7 +70,10 @@ services:
       # Per-direction relay copy buffer (public/secret/vhost). Default 256KiB;
       # KB/MB/GB/KiB/MiB/GiB suffix, clamped [4KiB,16MiB]. Memory ~= size x 2 x
       # concurrent connections. Set the same value on provider processes for an
-      # end-to-end large buffer on high-latency links.
+      # end-to-end large buffer on high-latency links. MEASURED 2026-09-11 over a
+      # 40 ms path: 128KiB and 256KiB are indistinguishable (the difference between
+      # two identical arms was larger than the difference between the two values),
+      # so leave it unset unless you have measured your own path.
       # - BORE_PROXY_BUFFER_SIZE=1MiB
 
       # Optional public domain advertised to clients for http(s):// endpoints.
@@ -87,12 +90,24 @@ services:
 
       # --- UDP direct path for secret tunnels ---
       - BORE_UDP=true
-      - BORE_UDP_STREAM_RECEIVE_WINDOW=16MiB
-      - BORE_UDP_CONNECTION_RECEIVE_WINDOW=64MiB
-      - BORE_UDP_SEND_WINDOW=64MiB
-      - BORE_UDP_SOCKET_RECV_BUFFER=16MiB
-      - BORE_UDP_SOCKET_SEND_BUFFER=16MiB
-      - BORE_UDP_MAX_STREAMS=4096
+      # These five are EXACTLY the built-in defaults (src/shared.rs DIRECT_QUIC_*),
+      # shown for visibility. Leaving them commented is identical to setting them.
+      # KEEP THE 16:1 RATIO between the connection and the stream window: at
+      # --carriers 1 every proxied connection is a bidi stream on ONE QUIC
+      # connection, so conn/stream is how many stalled streams starve all the
+      # others. 64MiB gave ~4 and produced the vhost "asset stuck pending" stall
+      # (docs/VHOST_UDP_CONCURRENCY_FIX.md); 256MiB tolerates ~16.
+      # - BORE_UDP_STREAM_RECEIVE_WINDOW=16MiB
+      # - BORE_UDP_CONNECTION_RECEIVE_WINDOW=256MiB
+      # - BORE_UDP_SEND_WINDOW=256MiB
+      # - BORE_UDP_SOCKET_RECV_BUFFER=16MiB
+      # - BORE_UDP_SOCKET_SEND_BUFFER=16MiB
+      # - BORE_UDP_MAX_STREAMS=4096
+      # Recommended instead of the three window variables: one server-wide ceiling
+      # on the memory the direct UDP path may commit. Measured 2026-09-11: peak
+      # server RSS 340.4 -> 42.2 MiB with 48 slow readers, at no throughput cost.
+      # Conflicts with the three windows above; derives them from this one number.
+      # - BORE_UDP_MEMORY_BUDGET=512MiB
 
       # --- Vhost frontend ---
       # You can enable vhost either with BORE_VHOST_BASE_DOMAIN alone or with a

@@ -359,10 +359,47 @@ per-connection when the direct path is unavailable. As always, a single flow ove
 connection is not split — see
 [`docs/performance/CARRIER_TUNING.md`](docs/performance/CARRIER_TUNING.md).
 
+**Measured recommendation for `bore vhost` (staging, 2026-09-11).** There is no single
+best carrier count; pick by workload:
+
+| workload | setting | measured |
+| --- | --- | --- |
+| web app / file server: small requests alongside occasional bulk | `--carriers 8` | small-request p95 under one bulk transfer 14.06 → **4.92 ms**; 393 → **1162 req/s** under two; costs ~11 % of peak single-transfer bandwidth |
+| one big transfer at a time | `--carriers 1` (default) | **59.10 MB/s** down / **93.67** up, against 52.55 / 72.17 at 8 — carriers split one flow's congestion window |
+| unknown or mixed | `--carriers 0` (adaptive) | matches static 8 (median ratio 1.033) while holding one carrier; grows only when a small request actually contends with bulk |
+
+On a clean idle path carriers still cost (median c4/c1 = 0.88), which is why `1` is the
+default. **`--udp` is not a bandwidth upgrade**: against a real file server the TCP relay was
+faster on small requests (93.93 vs 103.74 ms p50), equal or better on sustained bulk, about
+half the CPU per GiB, and 36× cheaper in cloud-instance network allowance. Turn it on for
+many simultaneously held connections (14 ms vs 1436 ms behind 512) or for lossy paths (2.7×).
+Full evidence:
+[`docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md`](docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md),
+and in Italian
+[`docs/performance/final_vhost_perf_review.md`](docs/performance/final_vhost_perf_review.md) §12.
+
 **Proxy copy buffer:** `BORE_PROXY_BUFFER_SIZE` (default 256 KiB; accepts a
 `KB`/`MB`/`GiB`/... suffix, clamped `[4 KiB, 16 MiB]`) sets the per-direction relay/splice
 buffer. Set it on the server (relay buffers) and/or a provider (local splice); a larger
 buffer helps high-latency, high-BDP links, not single-stream throughput on a fast LAN.
+The resolved value is reported as `proxy_buffer_size` by `GET /admin/api/v1/config` and in
+the dashboard's Configuration panel, so a deployment can be checked against the default
+rather than assumed.
+
+**Direct-path QUIC liveness:** `BORE_DIRECT_QUIC_KEEPALIVE_MS` (default 3000) and
+`BORE_DIRECT_QUIC_IDLE_MS` (default 10000, clamped `[1 s, 600 s]`) set the keep-alive
+interval and idle timeout of a `--udp` direct connection. The idle timeout is also the
+width of the window in which requests already committed to a direct stream are lost when
+UDP stops working: with the peer silent, opening the stream and writing `STREAM_READY`
+both succeed locally, so the request waits for the connection itself to time out before
+the next one falls back to the warm TCP relay (which takes ~12 ms and is transparent).
+Lowering the idle timeout shortens that window proportionally. The resolver keeps two
+consecutive keep-alive losses survivable by **tightening the keep-alive** when the
+requested pair would not (`max_idle >= 3 × keepalive`), and warns when it does — so the
+value in force can differ from the value requested, and both `direct_quic_keepalive_ms`
+and `direct_quic_idle_ms` are published on `GET /admin/api/v1/config`.
+
+**Reading what is actually in force:** `GET /admin/api/v1/config` derives the whole direct-UDP block from the tuning installed on the server rather than restating the CLI strings, because `--udp-memory-budget` computes the three windows from one number after startup. `udp_direct_slots` reports the aggregate admission bound the budget derived (`null` = no budget, the historical unbounded path).
 
 For bulk transfers, the direct QUIC path is tuned in code with larger flow-control windows
 than Quinn's defaults: `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` (16 MiB),
@@ -416,6 +453,19 @@ So **a 5 Gbit/s deployment wants 6–8 vCPU and `--carriers 4`**: bore was measu
 OS. x86 should be cheaper per byte than Graviton2 at the same clock, so treat 3.34 as the
 ceiling of the estimate rather than the middle of it. The three-script measurement sequence
 that produces these numbers on any host is documented in `scripts/perf/README.md`.
+
+**Re-running the whole staging campaign.** `scripts/perf/staging/` holds the complete
+harness behind
+[`docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md`](docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md)
+(English evidence) and
+[`docs/performance/final_vhost_perf_review.md`](docs/performance/final_vhost_perf_review.md)
+(Italian review): a server host, a same-region measurement VM and a domestic consumer,
+driven from one `env.sh` that never enters the repository. Copy
+`scripts/perf/staging/env.sh.example`, fill in the coordinates of whichever deployment you
+are measuring, run `scripts/perf/staging/provision.sh`, then follow
+`scripts/perf/staging/README.md`. Nothing in the tree hardcodes a host, a domain, a key path
+or a credential, so pointing it at a different (for example pre-production) server is a
+config change, not a code change.
 
 **The browser leg speaks HTTP/1.1, and that is a measured decision, not an omission.** The
 vhost edge does not offer `h2` in its TLS ALPN list, so every browser falls back to HTTP/1.1

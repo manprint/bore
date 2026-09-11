@@ -43,15 +43,60 @@ services:
       - BORE_CERT_FILE=/certs/cert.pem
       - BORE_KEY_FILE=/certs/key.pem
       - BORE_UDP=true
+      # DEVIATION from the built-in default of 16: lifts the server-side ceiling
+      # so a client may ask for any carrier count it likes.
+      # CAVEAT measured 2026-09-11: BORE_UDP_MEMORY_BUDGET derives its
+      # per-connection window as clamp(budget / BORE_MAX_CARRIERS, 16MiB, 256MiB),
+      # so at 1024 any practical budget lands on the 16MiB floor and then buys only
+      # admission slots, never windows. Measured harmless on this deployment (see
+      # the budget line below); lower it if you want that arithmetic to behave as
+      # documented.
       - BORE_MAX_CARRIERS=1024
+      # DEVIATION from the built-in default of 4096: doubled so one direct QUIC
+      # connection can carry more concurrent proxied connections before the stream
+      # limit binds.
       - BORE_UDP_MAX_STREAMS=8192
-      - BORE_PROXY_BUFFER_SIZE=128KiB
+      # RECOMMENDED, measured 2026-09-11 (F-13, the direct-UDP aggregate bound).
+      # WHY: without it, tunnels x carriers x connection_receive_window has no
+      # server-wide ceiling. With 48 slow readers on one --udp tunnel the server
+      # process peaked at 340.4 MiB; with it, 42.2 MiB on a 903 MiB host, and the
+      # host kept serving instead of starving.
+      # COST: none measurable. Priced from a domestic consumer on the QUIC direct
+      # path -- the one place the derived 1MiB stream window is the same order as
+      # the bandwidth-delay product -- A/B/A/B: ON 53.16/56.25 MB/s vs OFF
+      # 52.28/49.72 MB/s. A refused connection stays on the warm TCP relay and
+      # increments direct_budget_refusals; it is never a failed request.
+      # CONFLICTS with the three window variables below: setting both makes the
+      # server refuse to start.
+      - BORE_UDP_MEMORY_BUDGET=512MiB
+      # BORE_PROXY_BUFFER_SIZE intentionally NOT set -> the built-in 256KiB default
+      # applies. This deployment used to force 128KiB. MEASURED 2026-09-11 A/B/A over
+      # a 40 ms path, where a copy buffer should bite: 128KiB -> 25.57 MB/s,
+      # 256KiB -> 28.53, 128KiB again -> 29.67. The two identical arms differ by 16 %,
+      # so the parameter has no effect larger than the drift of the path. Removed so
+      # the deployment matches the tested default. Do NOT set it small: the buffer
+      # exists because an 8KiB copy loop is a known high-latency regression.
+      #
+      # Optional: cut the UDP-blackout loss window from 10 s to 4 s. Measured safe to
+      # at least 30 % packet loss; QUIC negotiates the minimum of the two peers, so
+      # setting it here alone is enough. Gate: scripts/perf/vhost_idle_window.sh
+      # - BORE_DIRECT_QUIC_IDLE_MS=4000
+      # - BORE_DIRECT_QUIC_KEEPALIVE_MS=1000
+      #
+      # The five values below are EXACTLY the built-in defaults (verified against
+      # /admin/api/v1/config). Leaving them commented is identical to setting them and
+      # is preferred, so a future change to the tested defaults is picked up. The first
+      # three CONFLICT with BORE_UDP_MEMORY_BUDGET above.
+      # KEEP THE 16:1 RATIO between connection and stream window: 64MiB there caused
+      # the vhost "asset stuck pending" stall (docs/VHOST_UDP_CONCURRENCY_FIX.md).
 #      - BORE_UDP_STREAM_RECEIVE_WINDOW=16MiB
 #      - BORE_UDP_CONNECTION_RECEIVE_WINDOW=256MiB
 #      - BORE_UDP_SEND_WINDOW=256MiB
 #      - BORE_UDP_SOCKET_RECV_BUFFER=16MiB
 #      - BORE_UDP_SOCKET_SEND_BUFFER=16MiB
-#      - BORE_UDP_MAX_STREAMS=4096
+#      - BORE_UDP_MAX_STREAMS=4096   # <- this IS the default, but the ACTIVE setting
+#                                    #    above overrides it with 8192. Kept here only
+#                                    #    to record what the default is.
       - BORE_VHOST_CONFIG=/config.yml
       - BORE_VHOST_BASE_DOMAIN=bore.0912345.xyz
       - BORE_VHOST_MODE=auto

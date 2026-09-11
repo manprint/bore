@@ -1,0 +1,88 @@
+# bore forwarder on the test VM — the configuration the 2026-09-11 performance
+# campaign concluded is optimal, with the evidence quoted on every line.
+#
+#   cd ~/bore-forwarder && sudo docker compose up -d
+#
+# Secrets live in the sibling .env (chmod 600), never in this file:
+#   BORE_SERVER=...   BORE_SECRET=...   BORE_VHOST_SUBDOMAIN=...
+#
+# Evidence: docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md
+#           docs/performance/final_vhost_perf_review.md   (Italian)
+
+services:
+  # ---------------------------------------------------------------------------
+  # The recommended default: a vhost forwarder on the TCP relay.
+  #
+  # WHY THE RELAY AND NOT --udp. Measured against a real file server from a
+  # domestic consumer: the relay is faster on small requests (93.93 vs 103.74 ms
+  # p50), equal or better on sustained bulk, costs about half the CPU per GiB
+  # (6.85 vs 13.00 core-seconds) and generates 36x fewer cloud-instance
+  # allowance misses for the same delivered bytes. Switch to --udp only for very
+  # many simultaneously held connections (14 ms vs 1436 ms behind 512 of them) or
+  # for a lossy path (2.7x faster under injected loss).
+  #
+  # WHY --carriers 8. This profile assumes a web app or a file server: small
+  # requests sharing the tunnel with occasional bulk. Measured: small-request p95
+  # under one bulk transfer 14.06 -> 4.92 ms, and 393 -> 1162 requests/s under
+  # two. It costs about 11 % of peak single-transfer bandwidth, which is the
+  # right trade for anything interactive. For a tunnel that only ever moves one
+  # big file at a time, use `--carriers 1` instead: 59.10 MB/s down / 93.67 up
+  # against 52.55 / 72.17 at 8, because eight carriers split one flow's
+  # congestion window eight ways. If the mix is unknown, `--carriers 0` adapts.
+  # ---------------------------------------------------------------------------
+  bore-vhost:
+    image: ghcr.io/manprint/bore:client
+    container_name: bore-vhost
+    pull_policy: always
+    restart: unless-stopped
+    # Host networking so the forwarder can reach the origin on 127.0.0.1 and so
+    # the direct-UDP path (if ever enabled) is not double-NATed by the bridge.
+    network_mode: host
+    command:
+      - "vhost"
+      - "127.0.0.1:5080"          # the dufs origin on this VM
+      - "--carriers"
+      - "8"
+      - "--auto-reconnect"
+    environment:
+      - BORE_SERVER=${BORE_SERVER}
+      - BORE_SECRET=${BORE_SECRET}
+      - BORE_VHOST_SUBDOMAIN=${BORE_VHOST_SUBDOMAIN}
+      - BORE_VHOST_ID=${BORE_VHOST_ID}
+      - BORE_NOTES=test VM forwarder — relay, carriers=8 (perf campaign 2026-09-11)
+      # BORE_PROXY_BUFFER_SIZE intentionally unset: measured indistinguishable
+      # from the 256KiB default even over a 40 ms path.
+      # BORE_VHOST_UDP intentionally unset: see the note above.
+
+  # ---------------------------------------------------------------------------
+  # The alternative profile, kept here as a working reference rather than a
+  # recommendation. Start it with:  sudo docker compose --profile udp up -d
+  # Use it only for the two cases the relay loses: very many held connections,
+  # or a lossy path. `--carriers 1` is correct here — on the direct path extra
+  # carriers are extra QUIC connections, and a single bulk flow rides one.
+  # ---------------------------------------------------------------------------
+  bore-vhost-udp:
+    image: ghcr.io/manprint/bore:client
+    container_name: bore-vhost-udp
+    profiles: ["udp"]
+    pull_policy: always
+    restart: unless-stopped
+    network_mode: host
+    # The UDP direct path wants CAP_NET_ADMIN to lift the kernel clamp on the
+    # per-socket UDP buffers (SO_*BUFFORCE). Without it bore still works and
+    # warns; docker clears every capability for a non-root uid, which is why
+    # this uses the root :client image.
+    cap_add: ["NET_ADMIN"]
+    command:
+      - "vhost"
+      - "127.0.0.1:5080"
+      - "--carriers"
+      - "1"
+      - "--udp"
+      - "--auto-reconnect"
+    environment:
+      - BORE_SERVER=${BORE_SERVER}
+      - BORE_SECRET=${BORE_SECRET}
+      - BORE_VHOST_SUBDOMAIN=${BORE_VHOST_SUBDOMAIN}-udp
+      - BORE_VHOST_ID=${BORE_VHOST_ID}-udp
+      - BORE_NOTES=test VM forwarder — QUIC direct, carriers=1 (perf campaign 2026-09-11)

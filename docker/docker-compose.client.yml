@@ -62,6 +62,18 @@ services:
       # Vhost direct-QUIC path (server->provider hop only). Ignored unless the
       # command is `bore vhost ...` and the server has BORE_UDP=true plus an open
       # BORE_VHOST_QUIC_PORT/udp.
+      #
+      # MEASURED RECOMMENDATION: leave it OFF for an ordinary web app or file
+      # server. On the staging campaign the TCP relay was faster on small requests
+      # (93.93 vs 103.74 ms p50 through a real file server), equal or better on
+      # sustained bulk, about half the CPU per GiB (6.85 vs 13.00 core-seconds), and
+      # far cheaper in cloud instance network allowance (the direct path generated
+      # 36x more inbound-allowance misses for the same delivered bytes).
+      # Turn it ON for the two cases where the relay cannot compete:
+      #   * very many simultaneously held connections -- a fresh request behind 512
+      #     held connections took 14 ms direct against 1436 ms through the relay;
+      #   * lossy paths -- 2.7x faster under injected packet loss.
+      # It is NOT a general throughput upgrade.
       # - BORE_VHOST_UDP=true
       # Label this tunnel on the server's admin status page:
       # - BORE_NOTES=dev box A
@@ -76,6 +88,26 @@ services:
       # NOT by BORE_MAX_CARRIERS). For secret/transfer the UDP direct path already
       # uses independent native QUIC streams, so carriers apply only to the relay.
       # A single bulk flow rides one connection regardless of N.
+      #
+      # MEASURED RECOMMENDATION (staging campaign 2026-09-11, see
+      # docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md §8.1).
+      # There is no single best value; pick by workload:
+      #   one big transfer at a time      -> BORE_CARRIERS=1  (the default)
+      #        59.10 MB/s down / 93.67 up from a domestic consumer, against
+      #        52.55 / 72.17 at 8: splitting one bulk flow across eight carriers
+      #        splits the congestion window eight ways.
+      #   a web app: small requests
+      #   alongside occasional bulk       -> BORE_CARRIERS=8
+      #        small-request p95 under one bulk transfer 14.06 -> 4.92 ms, and
+      #        393 -> 1162 requests/s under two. Costs ~11 % of peak single-transfer
+      #        bandwidth.
+      #   unknown or mixed                -> BORE_CARRIERS=0  (adaptive)
+      #        matches static 8 on throughput (median ratio 1.033) while holding one
+      #        carrier, and grows only when a small request actually CONTENDS with a
+      #        bulk transfer. A pure-bulk tunnel therefore stays at one carrier --
+      #        that is by design, not a bug.
+      # On a clean idle path carriers still COST a little (median c4/c1 = 0.88), which
+      # is why 1 remains the default.
       # - BORE_CARRIERS=4
       # Per-direction copy buffer for this provider's local-service splice. Default
       # 256KiB; KB/MB/GB/KiB/MiB/GiB suffix, clamped [4KiB,16MiB]. Match the server's

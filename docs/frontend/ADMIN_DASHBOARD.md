@@ -30,7 +30,7 @@ The server exposes **9 REST endpoints** under `/admin/api/v1/`, all guarded by t
 | `/admin/api/v1/vhost` | `[VhostView]` | Vhost providers: subdomain, transport (Bore\|SSH), identity, carrier pool, direct/relay metrics |
 | `/admin/api/v1/vpn` | `{links:[VpnLinkView]}` | VPN links + hub peers (Linux `--features vpn` only; empty array in non-VPN builds) |
 | `/admin/api/v1/certs` | `[CertView]` | TLS certificates: subject, SANs, expiry, days-remaining, path |
-| `/admin/api/v1/config` | `ConfigView` | Sanitized startup config: server settings + SSH Gateway summary (no secrets, tokens, or keys) |
+| `/admin/api/v1/config` | `ConfigView` | Sanitized startup config: server settings + SSH Gateway summary (no secrets, tokens, or keys). Two sections are **derived on every read** rather than snapshotted: the vhost block (F-6, phase 06.4) and `proxy_buffer_size` (resolved from `BORE_PROXY_BUFFER_SIZE`, which lives in a `OnceLock` and is otherwise only logged at `trace`) together with `direct_quic_keepalive_ms` / `direct_quic_idle_ms` (resolved from `BORE_DIRECT_QUIC_KEEPALIVE_MS` / `BORE_DIRECT_QUIC_IDLE_MS`, where the resolver may *tighten* the requested keep-alive, so the environment value is not necessarily the value in force), and the whole direct-UDP block (`udp_stream_receive_window`, `udp_connection_receive_window`, `udp_send_window`, `udp_socket_*_buffer`, `udp_max_streams`, `udp_direct_slots`) which `--udp-memory-budget` rewrites *after* the startup snapshot is taken (F-13). |
 | `/admin/api/v1/metrics` | `MetricsView` | Uptime, RSS memory (Linux), bandwidth (cumulative + live rate), connection counts, transport breakdowns |
 
 All responses:

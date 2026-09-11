@@ -431,6 +431,38 @@ pub struct ConfigView {
     pub udp_send_window: String,
     /// Max native QUIC bidi streams the server allows.
     pub udp_max_streams: u32,
+    /// Per-direction relay buffer size (human string, e.g. "256KiB").
+    ///
+    /// Reported because `BORE_PROXY_BUFFER_SIZE` is read once into a
+    /// `OnceLock` inside `shared::proxy_buffer_size()` and logged only at
+    /// `trace`, so an operator who set it had no way to confirm it took
+    /// effect — the same shape as the F-6 gap phase 06 closed for the vhost
+    /// headers. Derived on every read, never a startup literal.
+    pub proxy_buffer_size: String,
+    /// Keep-alive interval on a direct-path QUIC connection, in milliseconds.
+    ///
+    /// `None` when the `udp` feature is not compiled in (there is no direct
+    /// path to describe). Reported for the same reason as
+    /// `proxy_buffer_size`: `BORE_DIRECT_QUIC_KEEPALIVE_MS` and
+    /// `BORE_DIRECT_QUIC_IDLE_MS` are resolved deep inside the QUIC transport
+    /// config and the resolver may *tighten* the requested keep-alive, so an
+    /// operator has no other way to see what actually took effect. Derived on
+    /// every read, never a startup literal.
+    pub direct_quic_keepalive_ms: Option<u64>,
+    /// Idle timeout on a direct-path QUIC connection, in milliseconds.
+    ///
+    /// This is also the width of the window in which requests committed to a
+    /// direct stream are lost after UDP disappears (the residual F-14 gap), so
+    /// it is the one number an operator tuning fallback behaviour needs to see.
+    pub direct_quic_idle_ms: Option<u64>,
+    /// Aggregate direct-UDP admission slots, when `--udp-memory-budget` is set.
+    ///
+    /// `None` is the historical unbounded path (per-connection ceiling, no
+    /// server-wide bound) and is what an unconfigured server reports. A number
+    /// is the exact count of concurrent direct connections admitted before the
+    /// rest fall back to the warm TCP relay, so it is the one value that says
+    /// whether the budget is doing anything.
+    pub udp_direct_slots: Option<u32>,
     /// Bind domain for control/tunnel endpoints.
     pub bind_domain: Option<String>,
     /// HSTS header value for HTTPS control port.
@@ -652,6 +684,10 @@ mod tests {
             udp_connection_receive_window: "16MiB".into(),
             udp_send_window: "64MiB".into(),
             udp_max_streams: 4096,
+            proxy_buffer_size: "256KiB".into(),
+            direct_quic_keepalive_ms: Some(3_000),
+            direct_quic_idle_ms: Some(10_000),
+            udp_direct_slots: None,
             bind_domain: None,
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]
@@ -849,6 +885,10 @@ mod tests {
             udp_connection_receive_window: "16MiB".into(),
             udp_send_window: "64MiB".into(),
             udp_max_streams: 4096,
+            proxy_buffer_size: "256KiB".into(),
+            direct_quic_keepalive_ms: Some(3_000),
+            direct_quic_idle_ms: Some(10_000),
+            udp_direct_slots: None,
             bind_domain: None,
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]

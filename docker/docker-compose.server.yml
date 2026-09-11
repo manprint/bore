@@ -100,6 +100,10 @@ services:
       # disables server-side pools. NOTE: this caps only the TCP relay pools — the
       # vhost `--udp` QUIC direct pool is provider-driven and bounded separately
       # (32 connections per subdomain), not by this value.
+      # CAVEAT: it also divides BORE_UDP_MEMORY_BUDGET below. A very large value
+      # (1024, say) drives the derived per-connection window to its 16MiB floor
+      # for any practical budget. 16 is the built-in default and keeps the
+      # budget's window arithmetic meaningful.
       - BORE_MAX_CARRIERS=16
       # Per-direction proxy copy buffer for the relay/splice data path (public,
       # secret, and vhost). Default 256KiB, tuned for large files on high-latency
@@ -108,15 +112,70 @@ services:
       # raise single-stream throughput on a low-latency link. The same var is read
       # by client/provider processes for their local splice (see the client
       # compose). Uncomment to override the 256KiB default.
+      # MEASURED 2026-09-11 (staging, A/B/A over a 40 ms path, which is where a
+      # copy buffer should bite): 128KiB -> 25.57 MB/s, 256KiB -> 28.53,
+      # 128KiB again -> 29.67. The two identical arms differ by 16 %, so the
+      # parameter has no effect larger than the drift of the path. Leave it
+      # UNSET unless you have measured your own path; do NOT set it small.
       # - BORE_PROXY_BUFFER_SIZE=1MiB
-      # Direct-UDP tuning defaults (match src/shared.rs; override here if you
-      # want to change the brokered QUIC and socket profile on the server).
-      - BORE_UDP_STREAM_RECEIVE_WINDOW=16MiB
-      - BORE_UDP_CONNECTION_RECEIVE_WINDOW=64MiB
-      - BORE_UDP_SEND_WINDOW=64MiB
-      - BORE_UDP_SOCKET_RECV_BUFFER=16MiB
-      - BORE_UDP_SOCKET_SEND_BUFFER=16MiB
-      - BORE_UDP_MAX_STREAMS=4096
+      #
+      # Direct-UDP tuning defaults. These are EXACTLY the built-in values
+      # (src/shared.rs DIRECT_QUIC_*), repeated here for visibility. Leaving them
+      # commented is identical to setting them and is preferred, so a future
+      # change to the tested defaults is picked up automatically.
+      #
+      # CRITICAL RATIO: connection_receive_window must stay >> stream_receive_window
+      # (256MiB : 16MiB = 16:1). At --carriers 1 every proxied connection is a bidi
+      # stream on ONE QUIC connection, and a slow public reader lets quinn buffer a
+      # full 16MiB stream window against the SHARED connection window. conn/stream is
+      # therefore how many stalled streams starve every other stream: 64MiB gave ~4
+      # and produced the vhost "asset stuck pending" stall (docs/VHOST_UDP_CONCURRENCY_FIX.md);
+      # 256MiB tolerates ~16. Do NOT lower the connection window toward the stream
+      # window, and do NOT raise the stream window to meet it (that costs
+      # single-stream throughput).
+      # - BORE_UDP_STREAM_RECEIVE_WINDOW=16MiB
+      # - BORE_UDP_CONNECTION_RECEIVE_WINDOW=256MiB
+      # - BORE_UDP_SEND_WINDOW=256MiB
+      # - BORE_UDP_SOCKET_RECV_BUFFER=16MiB
+      # - BORE_UDP_SOCKET_SEND_BUFFER=16MiB
+      # - BORE_UDP_MAX_STREAMS=4096
+      #
+      # RECOMMENDED for any server that exposes --udp to untrusted providers:
+      # a server-wide ceiling on the memory the direct UDP path may commit.
+      # Without it, tunnels x carriers x connection_receive_window is unbounded.
+      # MEASURED 2026-09-11: with 48 slow readers on ONE --udp tunnel, the server
+      # process peaked at 340.4 MiB without it and 42.2 MiB with it, on a 903 MiB
+      # host, and kept serving instead of starving. Throughput cost measured from a
+      # domestic consumer on the QUIC direct path (the one place the derived window
+      # can bind): ON 53.16/56.25 MB/s vs OFF 52.28/49.72 MB/s -- i.e. none.
+      # A connection refused by the budget silently stays on the warm TCP relay and
+      # increments `direct_budget_refusals` on /admin/api/v1/metrics; it is never a
+      # failed request.
+      # CONFLICTS with the three window variables above (the server refuses to start
+      # if both are set). It derives them instead:
+      #   conn = clamp(budget / BORE_MAX_CARRIERS, 16MiB, 256MiB), stream = conn/16,
+      #   slots = budget / conn
+      # so a LARGE BORE_MAX_CARRIERS collapses the windows to the 16MiB/1MiB floor and
+      # the budget then buys only admission slots. Read back the resolved values as
+      # udp_stream_receive_window / udp_connection_receive_window / udp_direct_slots
+      # on GET /admin/api/v1/config.
+      # - BORE_UDP_MEMORY_BUDGET=512MiB
+      #
+      # Direct-path QUIC liveness. Unset = the shipped pair (3000 / 10000), which is
+      # what every published measurement assumes. The idle timeout is ALSO the width
+      # of the window in which a request already committed to a direct stream is lost
+      # when UDP stops working: with the peer silent, opening the stream and writing
+      # STREAM_READY both succeed locally, so the request can only wait for the
+      # connection to be declared dead. MEASURED: the loss window equals the idle
+      # timeout to the millisecond, and every later request is served on the warm
+      # relay in ~12 ms. QUIC negotiates the MINIMUM of the two peers' idle timeouts,
+      # so setting it here alone is enough -- providers need no change.
+      # 4000 ms was measured safe to at least 30 % packet loss and cuts the worst case
+      # from 10 s to 4 s. The resolver keeps two consecutive keep-alive losses
+      # survivable (max_idle >= 3 x keepalive) by TIGHTENING the keep-alive, and warns
+      # when it does. Regression gate: scripts/perf/vhost_idle_window.sh
+      # - BORE_DIRECT_QUIC_IDLE_MS=4000
+      # - BORE_DIRECT_QUIC_KEEPALIVE_MS=1000
       # Broker UDP hole-punched direct paths for secret tunnels and run a STUN
       # responder on the control port (UDP). Clients try public STUN first
       # (Cloudflare/Google) and use this 7835/udp responder as the self-hosted

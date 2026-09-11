@@ -291,6 +291,103 @@ const QUIC_KEEPALIVE: Duration = Duration::from_secs(3);
 #[cfg(feature = "udp")]
 const QUIC_MAX_IDLE: Duration = Duration::from_secs(10);
 
+/// Floor on the keep-alive interval: below this the ping traffic itself starts
+/// to matter across a large pool of quiet connections.
+#[cfg(feature = "udp")]
+const QUIC_KEEPALIVE_MIN: Duration = Duration::from_millis(200);
+/// Floor on the idle timeout. One second, because anything shorter cannot
+/// survive a single lost keep-alive at any legal interval.
+#[cfg(feature = "udp")]
+const QUIC_MAX_IDLE_MIN: Duration = Duration::from_secs(1);
+/// Ceiling on the idle timeout, so a typo cannot pin a dead connection open for
+/// hours while every request committed to it hangs.
+#[cfg(feature = "udp")]
+const QUIC_MAX_IDLE_MAX: Duration = Duration::from_secs(600);
+
+/// Resolved liveness timings for a direct QUIC connection.
+///
+/// These two constants are the *whole* mechanism behind the residual F-14 gap
+/// measured in `docs/performance/`: when the peer goes silent, `open_bi` and the
+/// `STREAM_READY` write both succeed locally (neither needs a round trip once
+/// stream credit exists), so the request is already committed to the stream and
+/// then simply waits for the connection to die. It dies at the idle timeout.
+/// The window in which requests are lost after UDP disappears is therefore
+/// exactly `max_idle`, and shortening it is the one lever that does not risk
+/// abandoning a slow-but-healthy origin.
+#[cfg(feature = "udp")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectQuicLiveness {
+    /// Interval between keep-alive pings on an otherwise quiet connection.
+    pub keepalive: Duration,
+    /// Idle timeout after which the connection is declared dead.
+    pub max_idle: Duration,
+    /// `true` when the requested keep-alive was tightened so that two
+    /// consecutive losses stay survivable under the requested idle timeout.
+    pub keepalive_adjusted: bool,
+}
+
+/// Read a positive millisecond override from the environment.
+///
+/// A zero or unparseable value is treated as unset rather than as an error:
+/// these are diagnostic knobs, and refusing to start over a typo in one would
+/// be a worse failure than running the shipped default.
+#[cfg(feature = "udp")]
+fn env_ms(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .filter(|ms| *ms > 0)
+}
+
+/// Resolve the direct-path QUIC liveness pair from optional operator overrides.
+///
+/// Pure, so the policy is unit-testable without an endpoint. `None` for either
+/// input means "unset" and yields the shipped constant, so an unconfigured
+/// process is byte-identical to before this knob existed.
+///
+/// The one policy decision: a keep-alive that is not comfortably shorter than
+/// the idle timeout tears down HEALTHY connections, because one lost ping then
+/// already exceeds the deadline. The resolved pair therefore always satisfies
+/// `max_idle >= 3 * keepalive` (two consecutive losses survivable). When the
+/// operator's pair does not, the KEEP-ALIVE is tightened rather than the idle
+/// timeout relaxed — the operator asked for faster death detection and that is
+/// the request honoured, with `keepalive_adjusted` set so the change is
+/// reported instead of applied silently (I-2).
+#[cfg(feature = "udp")]
+pub fn resolve_direct_quic_liveness(
+    keepalive_ms: Option<u64>,
+    idle_ms: Option<u64>,
+) -> DirectQuicLiveness {
+    let max_idle = idle_ms
+        .map(Duration::from_millis)
+        .unwrap_or(QUIC_MAX_IDLE)
+        .clamp(QUIC_MAX_IDLE_MIN, QUIC_MAX_IDLE_MAX);
+    let requested = keepalive_ms
+        .map(Duration::from_millis)
+        .unwrap_or(QUIC_KEEPALIVE)
+        .max(QUIC_KEEPALIVE_MIN);
+    let ceiling = (max_idle / 3).max(QUIC_KEEPALIVE_MIN);
+    let keepalive = requested.min(ceiling);
+    DirectQuicLiveness {
+        keepalive,
+        max_idle,
+        keepalive_adjusted: keepalive != requested,
+    }
+}
+
+/// The live direct-path QUIC liveness pair, including operator overrides.
+///
+/// Read per call — same shape as `vhost::direct_open_timeout` and
+/// `sshgw::ssh_open_timeout` — so a gate can change it without a restart.
+#[cfg(feature = "udp")]
+pub fn direct_quic_liveness() -> DirectQuicLiveness {
+    resolve_direct_quic_liveness(
+        env_ms("BORE_DIRECT_QUIC_KEEPALIVE_MS"),
+        env_ms("BORE_DIRECT_QUIC_IDLE_MS"),
+    )
+}
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// Derive the shared QUIC authentication token from the tunnel secret (if any)
@@ -3154,8 +3251,16 @@ fn into_std(socket: UdpSocket) -> Result<StdUdpSocket> {
 #[cfg(feature = "udp")]
 fn transport_config(tuning: &UdpDirectTuning) -> quinn::TransportConfig {
     let mut cfg = quinn::TransportConfig::default();
-    cfg.keep_alive_interval(Some(QUIC_KEEPALIVE));
-    cfg.max_idle_timeout(Some(QUIC_MAX_IDLE.try_into().expect("valid idle timeout")));
+    let live = direct_quic_liveness();
+    if live.keepalive_adjusted {
+        warn!(
+            keepalive_ms = live.keepalive.as_millis() as u64,
+            idle_ms = live.max_idle.as_millis() as u64,
+            "direct QUIC keep-alive tightened to stay under a third of the requested idle timeout"
+        );
+    }
+    cfg.keep_alive_interval(Some(live.keepalive));
+    cfg.max_idle_timeout(Some(live.max_idle.try_into().expect("valid idle timeout")));
 
     // High-throughput direct transfers need flow-control windows larger than
     // Quinn's defaults. The values come from the brokered tuning struct, so the
@@ -5116,5 +5221,60 @@ mod tests {
             1024,
             "the cap is a ceiling, not a minimum write size"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "udp")]
+    fn direct_quic_liveness_unset_is_the_shipped_pair() {
+        // Red-checks the zero-regression contract: an operator who sets neither
+        // variable must get exactly the constants the campaign measured, or
+        // every prior throughput and fallback figure stops applying.
+        let live = resolve_direct_quic_liveness(None, None);
+        assert_eq!(live.keepalive, QUIC_KEEPALIVE);
+        assert_eq!(live.max_idle, QUIC_MAX_IDLE);
+        assert!(!live.keepalive_adjusted);
+    }
+
+    #[test]
+    #[cfg(feature = "udp")]
+    fn direct_quic_liveness_keeps_two_losses_survivable() {
+        // The whole point of the knob is a shorter loss window after UDP dies,
+        // so the pair an operator is most likely to ask for is a low idle with
+        // the default keep-alive — which alone would tear down HEALTHY
+        // connections on a single dropped ping.
+        let live = resolve_direct_quic_liveness(None, Some(4_000));
+        assert_eq!(live.max_idle, Duration::from_secs(4));
+        assert!(
+            live.max_idle >= live.keepalive * 3,
+            "two consecutive keep-alive losses must stay survivable, got {live:?}"
+        );
+        assert!(
+            live.keepalive_adjusted,
+            "tightening the 3s default under a 4s idle must be reported, not silent"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "udp")]
+    fn direct_quic_liveness_honours_a_consistent_pair_untouched() {
+        let live = resolve_direct_quic_liveness(Some(1_000), Some(4_000));
+        assert_eq!(live.keepalive, Duration::from_secs(1));
+        assert_eq!(live.max_idle, Duration::from_secs(4));
+        assert!(!live.keepalive_adjusted);
+    }
+
+    #[test]
+    #[cfg(feature = "udp")]
+    fn direct_quic_liveness_clamps_absurd_inputs() {
+        // A typo must degrade to something serviceable, never to a connection
+        // that is declared dead between two pings or pinned open for hours.
+        let tiny = resolve_direct_quic_liveness(Some(1), Some(1));
+        assert_eq!(tiny.max_idle, QUIC_MAX_IDLE_MIN);
+        assert!(tiny.keepalive >= QUIC_KEEPALIVE_MIN);
+        assert!(tiny.max_idle >= tiny.keepalive * 3);
+
+        let huge = resolve_direct_quic_liveness(Some(u64::MAX / 2), Some(u64::MAX / 2));
+        assert_eq!(huge.max_idle, QUIC_MAX_IDLE_MAX);
+        assert!(huge.max_idle >= huge.keepalive * 3);
     }
 }

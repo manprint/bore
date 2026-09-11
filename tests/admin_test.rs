@@ -444,6 +444,10 @@ fn t_views_serialize_stable() {
         udp_connection_receive_window: "16MiB".into(),
         udp_send_window: "64MiB".into(),
         udp_max_streams: 4096,
+        proxy_buffer_size: "256KiB".into(),
+        direct_quic_keepalive_ms: Some(3_000),
+        direct_quic_idle_ms: Some(10_000),
+        udp_direct_slots: None,
         bind_domain: None,
         control_hsts: "max-age=31536000".into(),
         #[cfg(feature = "vpn")]

@@ -33,7 +33,7 @@ adm()  { curl -fsS -m 10 -H "Authorization: Bearer $ADMIN_TOKEN" "$ADMIN_URL/$1"
 # One fetch, many fields: /tunnels is polled in tight loops and a field-per-call
 # helper turns one sample into five inconsistent ones.
 # NOTE the field is `public_port`, not `port`, and the live connection count is
-# `active`, not `active` — TunnelView's names, verified against
+# `active`, not `active_conns` — TunnelView's names, verified against
 # src/admin_views.rs. Guessing them cost a whole smoke run: the tunnel was
 # registered and `present` still said no.
 tsnap() { adm tunnels | jq -c --argjson p "$1" '.[]|select(.public_port==$p)' 2>/dev/null; }

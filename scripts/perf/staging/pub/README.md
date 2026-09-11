@@ -29,7 +29,10 @@ Two origins, both started automatically:
 * `raw_origin.py` (port 5053) — **raw TCP**, one request line then bytes. A
   public tunnel forwards arbitrary TCP, so this is what most arms measure: no
   HTTP parsing on either end, and the origin itself contributes ~0.1 ms and
-  ~19 Gbit/s on loopback.
+  ~19 Gbit/s on loopback. Verbs: `GET n`, `PUT n`, `PING`, `ECHO`, and `HOLD s`
+  — the last one answers once and then moves no bytes at all, which is what the
+  concurrency ladder needs (held connections that *download* measure the link,
+  not the concurrency).
 * `bench_origin.py` (port 5052) — HTTP, used only by the P4 arm so the numbers
   can be compared with the vhost campaign.
 
@@ -88,6 +91,14 @@ never against their QUIC arms.
 **Never `pkill bore`.** This deployment carries live tunnels belonging to the
 operator. Every teardown in this harness matches an exact port or container
 name.
+
+**Hold the concurrency ladder from ONE process.** `raw_client.py hold` opens
+all N connections with asyncio inside a single interpreter. One OS process per
+connection puts 512 Python interpreters on a 2-vCPU / 3.8 GiB VM and measures
+the driver's own memory pressure. The arm also prints `up=` (how many the
+driver got answered) beside `active_at_server=` (how many the server reports),
+because a ladder that silently held fewer connections than it claims is worse
+than no ladder.
 
 **The workstation and VM numbers are not comparable.** The workstation's radio
 link caps the path well below what the in-region VM sees, so a lower number

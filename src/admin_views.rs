@@ -424,6 +424,12 @@ pub struct VhostReservationView {
 /// Server startup configuration (sanitized, D11).
 #[derive(Serialize, Clone)]
 pub struct ConfigView {
+    /// Version string of the running server binary: `"<semver> - <branch> - <sha8>"`.
+    ///
+    /// Reported so that an operator — or a measurement campaign — can name the
+    /// build without shell access to the host. Same constant the binary's
+    /// `--version` prints, so the two can never disagree.
+    pub server_version: String,
     /// Port range forwarded.
     pub port_range: String,
     /// Control port.
@@ -690,6 +696,7 @@ mod tests {
     fn t_cfgpaths() {
         // Phase 0.3: ConfigView has vhost_config and vhost_cert_file paths.
         let config = ConfigView {
+            server_version: crate::FULL_VERSION.to_string(),
             port_range: "5000-6000".into(),
             control_port: 7835,
             max_conns: 100,
@@ -902,6 +909,7 @@ mod tests {
         assert_eq!(json["webserver_log"], true);
 
         let config = ConfigView {
+            server_version: crate::FULL_VERSION.to_string(),
             port_range: "5000-6000".into(),
             control_port: 7835,
             max_conns: 100,

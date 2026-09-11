@@ -836,6 +836,29 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
+    #[test]
+    fn config_view_names_the_running_build() {
+        // A measurement campaign, an incident report and a "did my redeploy
+        // actually land?" question all need the build string, and none of them
+        // should require shell access to the container. The binary's own
+        // `--version` and this field are the SAME constant on purpose: two
+        // independent version strings drift, and a drifted one is worse than
+        // none because it is believed.
+        let server = Server::new(20701..=20801, None);
+        let view = config(&server);
+        assert_eq!(view.server_version, crate::FULL_VERSION);
+        assert!(
+            view.server_version.starts_with(env!("CARGO_PKG_VERSION")),
+            "expected the crate version to lead the build string, got {:?}",
+            view.server_version
+        );
+        assert!(
+            view.server_version.matches(" - ").count() == 2,
+            "expected \"<semver> - <branch> - <sha8>\", got {:?}",
+            view.server_version
+        );
+    }
+
     /// Phase 06.4 gate (F-6). `/admin/api/v1/config` used to report the vhost
     /// response headers as absent while the SSH gateway's own
     /// `vhost_info_banner` printed all of them to a connecting client: the view
@@ -1418,6 +1441,7 @@ reservations:
     fn t_buf_socket_buffers() {
         // T-BUF: test UDP socket buffer serialization.
         let view = ConfigView {
+            server_version: crate::FULL_VERSION.to_string(),
             port_range: "1000-2000".into(),
             control_port: 7835,
             max_conns: 1024,
@@ -1510,6 +1534,7 @@ reservations:
     fn t_cfg_new_fields() {
         // T-CFG: test ConfigView serializes new operator-tunable fields.
         let view = ConfigView {
+            server_version: crate::FULL_VERSION.to_string(),
             port_range: "1000-2000".into(),
             control_port: 7835,
             max_conns: 1024,

@@ -18,6 +18,7 @@ const RESERVATIONS_KEY = 'vhost_reservations';
 
 // Pretty labels for SSH and other config keys
 const PRETTY_LABELS = {
+    'server_version': 'Server Version',
     'vhost_default_request_headers': 'Vhost Default Request Headers',
     'vhost_default_response_headers': 'Vhost Default Response Headers',
     'vhost_reservations': 'Vhost Reservations',

@@ -554,6 +554,7 @@ impl Server {
             rate_rx_bps: Arc::new(AtomicU64::new(0)),
 
             config_view: Arc::new(crate::admin_views::ConfigView {
+                server_version: crate::FULL_VERSION.to_string(),
                 port_range: port_range_str,
                 control_port: CONTROL_PORT,
                 max_conns: DEFAULT_MAX_CONNS as u32,

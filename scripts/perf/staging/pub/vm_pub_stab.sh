@@ -18,7 +18,9 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/publib.sh"
 
-srss() { adm metrics 2>/dev/null | jq -r '.server_rss_bytes // empty' 2>/dev/null; }
+# MetricsView's RSS field is `mem_rss_bytes` (verified against
+# src/admin_views.rs — guessing a field name cost a whole smoke run once).
+srss() { adm metrics 2>/dev/null | jq -r '.mem_rss_bytes // empty' 2>/dev/null; }
 mfld() { adm metrics 2>/dev/null | jq -r --arg f "$1" '.[$f] // empty' 2>/dev/null; }
 
 s1_soak() {
@@ -28,6 +30,8 @@ s1_soak() {
     local p="$LASTPORT" pid="$LASTPID" port0="$LASTPORT"
     python3 "$RAWCLI" get "$GW" "$p" 1048576 1 >/dev/null 2>&1
     local end=$(( $(date +%s) + mins * 60 )) n=0 relay=0
+    local rss0; rss0=$(srss)
+    echo "  server RSS at start: ${rss0:-?} bytes"
     echo "  t   port opens fb  pool path  active  8MiB_MBs"
     while [ "$(date +%s)" -lt "$end" ]; do
         local r; r=$(raw_get "$p" $((8 * 1048576)) 1)
@@ -41,7 +45,12 @@ s1_soak() {
         sleep 25
     done
     local p1; p1=$(tfld "$p" public_port)
+    local rss1; rss1=$(srss)
     echo "  samples=$n on_relay=$relay port_start=$port0 port_end=${p1:-gone}"
+    echo "  server RSS start=${rss0:-?} end=${rss1:-?} delta=$(( ${rss1:-0} - ${rss0:-0} )) bytes"
+    # A leak shows as a monotonically climbing RSS across a soak that moves the
+    # same bytes every 25 s. Quoted, not judged: the server also serves the
+    # operator's own unrelated tunnels, so a threshold here would be noise."
     [ "${p1:-}" = "$port0" ] && echo "  PASS: the public port never moved" \
         || echo "  FAIL: the public port changed or the tunnel died"
     down "$pid" "$p"

@@ -24,8 +24,8 @@ ALLOW_SAME=0; [ "${1:-}" = "--same" ] && ALLOW_SAME=1
 ver() { srv "sudo -n docker exec $CONTAINER /bore --version 2>/dev/null" 2>/dev/null | tr -d '\r'; }
 
 say "what is registered right now (this restart will interrupt it)"
-adm vhost    2>/dev/null | jq -r '.[]|"  vhost   \(.subdomain) from \(.client_addr // "?")"' 2>/dev/null
-adm tunnels  2>/dev/null | jq -r '.[]|"  public  port \(.port) from \(.client_addr // "?")"' 2>/dev/null
+adm vhost    2>/dev/null | jq -r '.[]|"  vhost   \(.subdomain) from \(.peer)"' 2>/dev/null
+adm tunnels  2>/dev/null | jq -r '.[]|"  public  port \(.public_port) from \(.peer)"' 2>/dev/null
 adm secret   2>/dev/null | jq -r '.[]|"  secret  \(.secret_id // .id // "?")"' 2>/dev/null
 
 BEFORE="$(ver)"

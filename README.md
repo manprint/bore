@@ -764,6 +764,11 @@ SSH jump hosts have a dedicated **Jump Hosts** panel and token-guarded
 `/admin/api/v1/ssh-jump` endpoint. It reports operational metadata and counters only;
 classic usernames, credential material, the bore secret and private keys are never exposed.
 
+The Configuration panel — and `GET /admin/api/v1/config` — reports `server_version`, the
+running binary's own build string (`<semver> - <branch> - <sha8>`, exactly what
+`bore --version` prints). Use it to confirm a redeploy actually landed, and to name the
+build in a bug report or a benchmark result, without shell access to the host.
+
 Annotate any tunnel with `--notes "..."` (on `bore local`/`bore proxy`/`bore vhost`, or
 `notes=` via the SSH gateway) to label it on this page.
 

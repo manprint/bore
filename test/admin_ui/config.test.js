@@ -132,3 +132,24 @@ test('T-CFG-LAYOUT: config cells share a uniform grid row height', async () => {
     assert.match(css, /\.config-container\s*\{[^}]*grid-auto-rows:\s*minmax\(3rem,\s*auto\);/s);
     assert.match(css, /\.config-key,\s*\.config-value\s*\{[^}]*align-self:\s*stretch;[^}]*align-items:\s*center;/s);
 });
+
+test('T-CFGVER: server_version renders under a readable label', async () => {
+    // An operator checking "did my redeploy land?" reads this row. The raw key
+    // is machine-shaped; the panel must show the pretty label and the build
+    // string verbatim (no truncation, no badge — it is neither boolean nor
+    // a byte count).
+    const data = { server_version: '1.0.0 - main - d3660eb6', control_port: 7835 };
+
+    const el = document.createElement('div');
+    await configPanel.render(el, data);
+
+    const container = el.children[0];
+    let found = false;
+    container.children.forEach(row => {
+        if (row.children[0].textContent === 'Server Version') {
+            assert.equal(row.children[1].textContent, '1.0.0 - main - d3660eb6');
+            found = true;
+        }
+    });
+    assert.ok(found, 'Server Version row found');
+});

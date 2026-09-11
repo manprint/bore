@@ -431,6 +431,7 @@ fn t_views_serialize_stable() {
 
     // ConfigView.
     let config = ConfigView {
+        server_version: bore_cli::FULL_VERSION.to_string(),
         port_range: "5000-6000".into(),
         control_port: 7835,
         max_conns: 100,

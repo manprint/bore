@@ -13,9 +13,14 @@
 #   * the server opens a substream per INBOUND connection, so the cost of
 #     concurrency lands in a different place than it does for vhost.
 #
-# The held connections are IDLE on purpose (they have asked for bytes the
-# origin streams slowly), so what is measured is the cost of CONCURRENCY, not
-# of bandwidth: an arm that saturates the link would measure the link.
+# The held connections are IDLE on purpose: they speak the origin's `HOLD`
+# verb, which answers once and then moves NO bytes at all. An arm whose held
+# connections were downloading would saturate the link and measure the link.
+#
+# They are also held from ONE process (`raw_client.py hold` opens them all
+# with asyncio). One OS process per connection would put 512 Python
+# interpreters on a 2-vCPU / 3.8 GiB VM and measure the driver's own memory
+# pressure instead of the tunnel.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/publib.sh"
@@ -25,20 +30,29 @@ PROBES="${PROBES:-30}"
 
 start_origins || exit 1
 
-# Hold N connections open against the RAW origin, each asking for a large
-# amount it will never finish inside the measurement window, then probe.
+# Hold N idle connections open against the RAW origin, then probe a FRESH
+# connection through the same tunnel. `active_at_server` is read from the
+# admin API so the arm reports how many the SERVER actually has, not how many
+# the driver asked for — if they diverge, the number to trust is the server's
+# and the arm says so.
+HOLDSECS="${HOLDSECS:-45}"
 hold_and_probe() { # <public_port> <n>
-    local p="$1" n="$2" pids=() i
-    for i in $(seq "$n"); do
-        python3 "$RAWCLI" get "$GW" "$p" $((4 * 1073741824)) 1 30 >/dev/null 2>&1 &
-        pids+=("$!")
-    done
-    sleep 4
+    local p="$1" n="$2" hp up
+    local hf; hf="$OUT/hold-$p-$n.txt"
+    python3 "$RAWCLI" hold "$GW" "$p" "$HOLDSECS" "$n" 30 >"$hf" 2>&1 &
+    hp=$!
+    # Wait for the driver's own "up" line rather than a fixed sleep: at 512
+    # connections the ramp itself takes seconds, and probing mid-ramp measures
+    # the ramp.
+    local i
+    for i in $(seq 60); do grep -q '^held=' "$hf" 2>/dev/null && break; sleep 0.5; done
+    up=$(grep -oE 'up=[0-9]+' "$hf" | head -1 | cut -d= -f2)
+    sleep 2
     local act; act=$(tfld "$p" active)
     local res; res=$(raw_ping "$p" "$PROBES")
-    for i in "${pids[@]}"; do kill -9 "$i" 2>/dev/null; done
-    wait 2>/dev/null
-    echo "held=$n active_at_server=${act:-?} $res"
+    kill -9 "$hp" 2>/dev/null
+    wait "$hp" 2>/dev/null
+    echo "held=$n up=${up:-?} active_at_server=${act:-?} $res"
 }
 
 for mode in relay quic; do

@@ -10,6 +10,7 @@ Usage:
     raw_client.py get  <host> <port> <bytes-per-conn> [conns] [timeout]
     raw_client.py put  <host> <port> <bytes-per-conn> [conns] [timeout]
     raw_client.py ping <host> <port> <count>            [conns] [timeout]
+    raw_client.py hold <host> <port> <seconds>          [conns] [timeout]
 
 `get`/`put` report aggregate throughput across `conns` parallel connections,
 which is the only honest way to read a tunnel: a single TCP flow is bounded by
@@ -20,6 +21,15 @@ the tunnel, which is what a real client pays) and prints the latency
 percentiles instead:
 
     n=<count> p50=<ms> p95=<ms> p99=<ms> max=<ms> errs=<n>
+
+`hold` opens `conns` connections in ONE process, waits for each to be answered
+end to end, and then keeps them idle for `seconds`. One process matters: the
+ladder holds up to 512 connections on a 2-vCPU VM, and one OS process per
+connection would measure the driver's memory pressure instead of the tunnel.
+It prints as soon as the connections are up, so the caller can probe while it
+is still running:
+
+    held=<n> up=<n> errs=<n>
 """
 import asyncio
 import socket
@@ -112,6 +122,39 @@ async def main():
         print("n=%d p50=%.3f p95=%.3f p99=%.3f max=%.3f errs=%d" % (
             len(lat), pct(lat, 50), pct(lat, 95), pct(lat, 99),
             max(lat) if lat else float("nan"), errs))
+        return
+
+    if mode == "hold":
+        secs = float(n)
+        ready = 0
+        errs = 0
+        conns_open = []
+
+        async def hold_one():
+            nonlocal ready, errs
+            try:
+                r, w = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), timeout)
+                w.write(b"HOLD %d\n" % int(secs + 30))
+                await w.drain()
+                ack = await asyncio.wait_for(r.readline(), timeout)
+                if ack.strip() != b"H":
+                    raise OSError("bad ack")
+                ready += 1
+                conns_open.append(w)
+            except Exception:
+                errs += 1
+
+        await asyncio.gather(*[hold_one() for _ in range(conns)],
+                             return_exceptions=True)
+        # Report BEFORE sleeping: the caller probes while these are held.
+        print("held=%d up=%d errs=%d" % (conns, ready, errs), flush=True)
+        await asyncio.sleep(secs)
+        for w in conns_open:
+            try:
+                w.close()
+            except Exception:
+                pass
         return
 
     fn = one_get if mode == "get" else one_put

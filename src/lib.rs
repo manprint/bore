@@ -15,6 +15,21 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Full version string of this build: `"<semver> - <branch> - <sha8>"`.
+///
+/// Defined in the library, not the binary, because the admin API reports it
+/// (`/admin/api/v1/config`, field `server_version`). A measurement campaign
+/// that cannot name the build it was taken against is not evidence, and an
+/// operator asking "which build is my server running?" should not have to
+/// have shell access to the container to find out.
+pub const FULL_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " - ",
+    env!("GIT_BRANCH"),
+    " - ",
+    env!("GIT_SHA_SHORT"),
+);
+
 mod adaptive_nat;
 pub mod admin;
 pub mod admin_api;

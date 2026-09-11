@@ -44,13 +44,10 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Full version string: "bore 1.0.0 - <branch> - <sha8>".
-const FULL_VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " - ",
-    env!("GIT_BRANCH"),
-    " - ",
-    env!("GIT_SHA_SHORT"),
-);
+///
+/// Owned by the library so that the binary's `--version` and the admin API's
+/// `server_version` can never disagree about which build is running.
+use bore_cli::FULL_VERSION;
 const DEFAULT_SERVER: &str = "https://bore.0912345.xyz";
 
 #[derive(Parser, Debug)]
@@ -2390,6 +2387,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 bore_cli::shared::parse_size_bytes(&udp_socket_recv_buffer).map(|b| b as usize);
 
             let config_view = bore_cli::admin_views::ConfigView {
+                server_version: bore_cli::FULL_VERSION.to_string(),
                 port_range: format!("{}-{}", min_port, max_port),
                 control_port,
                 max_conns: max_conns as u32,

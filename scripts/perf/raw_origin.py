@@ -12,6 +12,12 @@ Protocol (one request per connection, then close):
     PUT <n>\\n   -> the server reads exactly <n> bytes, then writes "OK\\n"
     PING\\n      -> the server writes "P\\n" immediately (round-trip probe)
     ECHO\\n      -> every byte received is written back until EOF
+    HOLD <s>\\n  -> the server answers "H\\n" and then keeps the connection
+                  open, idle, for <s> seconds
+
+`HOLD` exists for the concurrency ladder. Measuring "what does a fresh
+connection cost while N others are open" with N *busy* connections measures the
+link, not the concurrency: the held arm must move no bytes at all.
 
 Zeros are fine: nothing on the path compresses, and /dev/urandom at these
 sizes is slower than the link.
@@ -54,6 +60,15 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     break
                 writer.write(buf)
                 await writer.drain()
+
+        elif verb == b"HOLD" and len(parts) == 2:
+            # Answer first so the client knows the connection is established
+            # end to end (the tunnel opened its substream and the splice is
+            # live), then go quiet. An unanswered HOLD would count connections
+            # the server has not actually wired up yet.
+            writer.write(b"H\n")
+            await writer.drain()
+            await asyncio.sleep(min(float(parts[1]), 3600.0))
 
         elif verb == b"GET" and len(parts) == 2:
             n = min(int(parts[1]), MAX)

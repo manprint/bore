@@ -103,6 +103,34 @@ pub fn fd_budget(max_conns: u64, soft: u64, hard: Option<u64>) -> FdBudget {
     }
 }
 
+/// Widen the platform's `rlim_t` into the `u64` the decision is made in.
+///
+/// `rlim_t` is NOT the same width everywhere: 64 bits on most targets, but 32
+/// on some 32-bit glibc ABIs — `arm-unknown-linux-gnueabi`, which this
+/// project's cross matrix builds, is one. Keeping [`fd_budget`] on `u64` and
+/// converting at the syscall boundary is what makes the decision (and its unit
+/// tests) independent of the target. One of the two conversions below is a
+/// no-op on any given target and clippy says so, which is why the lint is
+/// silenced rather than the conversion dropped: dropping it is exactly the
+/// build break this comment exists to prevent.
+#[cfg(unix)]
+#[allow(clippy::useless_conversion)]
+fn widen(v: nix::libc::rlim_t) -> u64 {
+    u64::from(v)
+}
+
+/// Narrow a `u64` back into the platform's `rlim_t` for the `setrlimit` call.
+///
+/// Saturating, never panicking: a value that does not fit the platform's own
+/// limit type is above every limit that platform can express, so its ceiling
+/// is the honest answer. In practice the values here are a connection bound
+/// plus 256.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_fallible_conversions)]
+fn narrow(v: u64) -> nix::libc::rlim_t {
+    nix::libc::rlim_t::try_from(v).unwrap_or(nix::libc::rlim_t::MAX)
+}
+
 /// Apply [`fd_budget`] to this process, logging what happened.
 ///
 /// Called once, at server startup, before the first listener is bound. Never
@@ -114,16 +142,17 @@ pub fn reconcile_fd_limit(max_conns: usize) {
     use nix::sys::resource::{getrlimit, setrlimit, Resource};
     use tracing::{debug, info, warn};
 
-    let (soft, hard_raw) = match getrlimit(Resource::RLIMIT_NOFILE) {
+    let (soft_raw, hard_raw) = match getrlimit(Resource::RLIMIT_NOFILE) {
         Ok(pair) => pair,
         Err(err) => {
             debug!(%err, "cannot read RLIMIT_NOFILE; leaving the descriptor limit alone");
             return;
         }
     };
+    let soft = widen(soft_raw);
     // `RLIM_INFINITY` is the sentinel for "no ceiling", which can satisfy any
     // request; anything else is a real ceiling this process cannot pass.
-    let hard_opt = (hard_raw != nix::libc::RLIM_INFINITY).then_some(hard_raw);
+    let hard_opt = (hard_raw != nix::libc::RLIM_INFINITY).then(|| widen(hard_raw));
 
     match fd_budget(max_conns as u64, soft, hard_opt) {
         FdBudget::Sufficient { soft, needed } => {
@@ -133,7 +162,7 @@ pub fn reconcile_fd_limit(max_conns: usize) {
             );
         }
         FdBudget::Raise { from, to, needed } => {
-            match setrlimit(Resource::RLIMIT_NOFILE, to, hard_raw) {
+            match setrlimit(Resource::RLIMIT_NOFILE, narrow(to), hard_raw) {
                 Ok(()) => info!(
                     from,
                     to, needed, max_conns, "raised the file-descriptor limit to cover --max-conns"
@@ -154,7 +183,7 @@ pub fn reconcile_fd_limit(max_conns: usize) {
             // Still raise to the ceiling: it is the best this process can do
             // for itself, and it is strictly better than the current soft
             // limit.
-            let _ = setrlimit(Resource::RLIMIT_NOFILE, hard, hard_raw);
+            let _ = setrlimit(Resource::RLIMIT_NOFILE, narrow(hard), hard_raw);
             warn!(
                 soft,
                 hard,
@@ -256,5 +285,23 @@ mod tests {
             fd_budget(u64::MAX, 1024, Some(524288)),
             FdBudget::Insufficient { .. }
         ));
+    }
+
+    /// The decision is made in `u64`; the syscall speaks the platform's
+    /// `rlim_t`, which is 32 bits on some 32-bit glibc ABIs. This pins the
+    /// round trip and the saturation, which is the only place the two widths
+    /// can behave differently. A `usize`-sized `--max-conns` plus the headroom
+    /// always fits, so the saturating case is a guard, not a path.
+    #[cfg(unix)]
+    #[test]
+    fn the_limit_survives_the_round_trip_through_the_platform_type() {
+        for v in [0u64, 1024, 1280, 65536, 1_048_576] {
+            assert_eq!(widen(narrow(v)), v, "round trip at {v}");
+        }
+        // Above what the platform's own limit type can express, the ceiling is
+        // the honest answer — never a wrap, which would silently LOWER the
+        // limit and reintroduce exactly the EMFILE storm this module exists
+        // to prevent.
+        assert_eq!(narrow(u64::MAX), nix::libc::rlim_t::MAX);
     }
 }

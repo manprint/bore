@@ -291,6 +291,17 @@ il tetto è già abbastanza alto, non tocca niente e **non dice niente** — un
 server che si lamenta di un problema che non esiste insegna a ignorare
 l'avviso che conta.
 
+**Un difetto della correzione stessa, trovato dalla CI.** Il tipo con cui il
+sistema operativo esprime questo tetto non ha la stessa dimensione su tutte le
+architetture: 64 bit quasi ovunque, ma **32** su alcune varianti a 32 bit di
+ARM, che questo progetto compila. La prima versione della correzione dava per
+scontata la dimensione e ha rotto la compilazione su *una* delle dodici
+architetture, mentre tutte le prove su questa macchina restavano verdi. La
+decisione resta su un tipo unico e la conversione avviene ora al confine con
+la chiamata di sistema, **saturando** e mai troncando: un troncamento
+abbasserebbe il tetto in silenzio, che è esattamente il guasto che questa
+correzione esiste per impedire. C'è una prova unitaria che lo fissa.
+
 ---
 
 ---
@@ -1289,7 +1300,12 @@ $EDITOR ~/.config/bore-perf/env.sh
 scripts/perf/staging/provision.sh
 
 # 2. metti in opera sul server la build da misurare, e verifica i tre attori
+#    (redeploy.sh termina eseguendo verify_fixes.sh, che legge dal kernel del
+#     server se le correzioni P-12 e P-13 sono davvero in vigore nel processo
+#     in esecuzione: non riavvia nulla e non muove traffico, quindi si può
+#     lanciare da solo in qualsiasi momento)
 scripts/perf/staging/srv/redeploy.sh
+scripts/perf/staging/srv/verify_fixes.sh
 
 # 3. tutta la campagna lato VM, rigorosamente in serie (ore)
 scripts/perf/staging/res/start_samplers.sh

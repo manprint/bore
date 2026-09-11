@@ -55,4 +55,13 @@ fi
 say "post-restart health"
 adm config >/dev/null 2>&1 && echo "  admin API answering" || echo "  WARNING: admin API not answering"
 srv "sudo -n docker logs --since 60s $CONTAINER 2>&1 | grep -iE 'error|panic|warn' | head -5" 2>/dev/null | sed 's/^/  /'
+
+# A deploy is not finished when the version string changes: the campaign's two
+# startup-time fixes (P-12's descriptor reconciliation, P-13's socket buffers)
+# are invisible in normal operation, which is exactly why neither was noticed
+# for as long as it existed. Read them back out of the kernel before claiming
+# the deploy is good.
+"$(dirname "$0")/verify_fixes.sh" || {
+    echo "FAIL: the build is running but its startup fixes did not take effect"; exit 1; }
+
 echo "OK: now running ${AFTER}"

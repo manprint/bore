@@ -151,8 +151,18 @@ scripts/perf/staging/srv/server_seq.sh    # the whole ordered programme
 scripts/perf/staging/srv/budget_ws.sh     # the budget, priced from the domestic consumer
 scripts/perf/staging/res/cfgkeys.sh       # what the server says is in force
 scripts/perf/staging/srv/verify.sh        # entries + resolved tunables + counters
+scripts/perf/staging/srv/verify_fixes.sh  # P-12/P-13 read back from the kernel
 scripts/perf/staging/srv/logcheck.sh      # end-of-campaign log audit
 ```
+
+`verify_fixes.sh` is the one that answers "did the deploy actually change
+anything". The public campaign's two startup-time fixes are invisible in normal
+operation — a descriptor limit that is now high enough, and a QUIC socket whose
+buffers were configured — which is precisely why neither was noticed for as long
+as it existed. So it reads both back from the **kernel**, through the container's
+PID on the host (`/proc/<pid>/limits`, and `nsenter -n ss -uapm` for the socket's
+`rb`/`tb`), never from a log line: a log only proves the server talked about it.
+`redeploy.sh` ends by calling it and fails the deploy if it fails.
 
 Two of these are worth singling out.
 

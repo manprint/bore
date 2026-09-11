@@ -1937,6 +1937,11 @@ What it tells you:
   RFC 5780 behaviour discovery, so it needs a server that runs an alternate STUN socket:
   `bore server --udp` does, and `unknown` means nobody could answer the question — never
   that the NAT is restrictive. See [`docs/nat/NAT_TRAVERSAL.md` §19](docs/nat/NAT_TRAVERSAL.md).
+- **Plan reason** (paired mode) — the server decides relay-first or direct-first from BOTH
+  peers' profiles, and now says *why* with a stable code plus the concrete remedy
+  (`peer-port-restricted`, `symmetric-strict-filtering`, `peer-blocked`, `no-candidates`).
+  The same line is logged by `bore local`/`bore proxy` when a live tunnel falls back, so the
+  machine that went to the relay is the machine that tells you what to change.
 - **Port preservation**, **CGNAT** (`100.64.0.0/10`) / double-NAT detection, and whether a
   **UPnP-IGD** router is present.
 - A **co-location/hairpin** note when public STUN works but your own bore server's UDP does

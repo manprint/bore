@@ -1023,7 +1023,13 @@ enum CtrlEvent {
         tuning: crate::shared::UdpDirectTuning,
         /// V2 rider: peer typed candidates, capabilities (the Fase-2 check
         /// gate) and the server-computed adaptive plan (Fase 3 VPN adoption).
-        v2: Option<crate::shared::UdpPunchV2>,
+        ///
+        /// BOXED on purpose: this is by far the largest thing the enum
+        /// carries (the other variant is a unit), and every `CtrlEvent` that
+        /// crosses the control channel — `Unavailable` included — would
+        /// otherwise be sized for it. The box costs one allocation per punch,
+        /// which happens once per direct-upgrade attempt.
+        v2: Option<Box<crate::shared::UdpPunchV2>>,
     },
     /// The direct path is unavailable; stay on relay.
     Unavailable,
@@ -1095,7 +1101,12 @@ fn spawn_ctrl_actor(
                     }))) => {
                         tracing::debug!(?peer, ?peer_selected_stun, "received vpn udp punch");
                         let _ = event_tx
-                            .send(CtrlEvent::Punch { nonce, peer, tuning, v2 })
+                            .send(CtrlEvent::Punch {
+                                nonce,
+                                peer,
+                                tuning,
+                                v2: v2.map(Box::new),
+                            })
                             .await;
                     }
                     Ok(Ok(Some(crate::shared::ServerMessage::UdpUnavailable))) => {

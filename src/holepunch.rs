@@ -4918,6 +4918,7 @@ mod tests {
             retry_budget: 0,
             read_timeout_ms: ms,
             send_delay_ms: 0,
+            reason_code: None,
         };
         assert_eq!(plan_check_window(&mk(0)), Duration::from_millis(500));
         assert_eq!(plan_check_window(&mk(750)), Duration::from_millis(750));

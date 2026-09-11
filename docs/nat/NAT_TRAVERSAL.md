@@ -846,3 +846,35 @@ binario `conntrack` non è installato ovunque e la chiamata falliva in silenzio
 rieseguendo una cella sola) e il flush è dichiaratamente best-effort. Regola
 generale: un banco che *crede* di aver ripulito lo stato è peggio di uno che
 non ci prova, perché fabbrica risultati invece di fallire.
+
+**La misura cambia la policy, e non nel modo intuitivo.** Con il filtering
+misurato, `adaptive_nat.rs` ha finalmente un input non-`Unknown` per la Fase 6
+— e la regola che c'era codificava l'asse sbagliato. Guardava il filtering del
+lato *symmetric*; la matrice su kernel reale dice che decide quello dell'**altro
+lato**:
+
+| local | peer | modo | `reason_code` |
+|---|---|---|---|
+| `eim` + `apdf` | symmetric | RelayFirst | `peer-port-restricted` |
+| `eim` + `adf/eif` | symmetric | DirectWithRetry | `symmetric-vs-open-filter` |
+| symmetric + `apdf` | symmetric | RelayFirst | `symmetric-strict-filtering` |
+| qualunque, filtering non misurato | symmetric | *come prima della Fase 6* | `symmetric-escape` / `symmetric-relay` |
+
+Il perché è asimmetrico e vale scriverlo, perché l'intuizione sbaglia. Devono
+passare **due** pacchetti. Quello `symmetric → altro` arriva da una porta
+sorgente che l'altro lato non ha mai potuto scrivere: quindi il filtro
+dell'**altro** lato deve essere più largo di APDF. Quello `altro → symmetric`
+arriva invece dal mapping stabile e endpoint-independent dell'altro lato, a cui
+il symmetric **ha** scritto: quindi anche un filtro APDF sul lato symmetric lo
+lascia entrare. Il lato che deve accettare una porta sorgente imprevedibile è
+quello non-symmetric, ed è l'unico il cui filtering decide la cella.
+
+`None` (mai misurato) non è mai trattato come `Some(true)`: dal socket un
+filtro non misurato e uno restrittivo sono identici e significano il contrario,
+e sbagliare verso "restrittivo" spinge sul relay una coppia che avrebbe
+bucato. Un peer senza Fase 6 prende esattamente la decisione pre-Fase-6
+(gate `an_unmeasured_filter_keeps_the_legacy_symmetric_decision`).
+
+**Confronto con lo stato dell'arte.** Dove bore sta rispetto a Tailscale, frp,
+libp2p DCUtR e ICE — e quali lacune restano, con il costo di ciascuna — è in
+[`NAT_SOTA_COMPARISON.md`](NAT_SOTA_COMPARISON.md).

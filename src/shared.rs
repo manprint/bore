@@ -579,6 +579,20 @@ pub struct UdpAdaptivePlan {
     pub read_timeout_ms: u64,
     /// Delay before retrying a failed direct-path attempt, in milliseconds.
     pub send_delay_ms: u64,
+    /// Stable machine code for WHY this mode was chosen (Fase 6).
+    ///
+    /// The server has always logged the reason; the CLIENT could only see the
+    /// mode, so an operator on the machine that actually fell back to the
+    /// relay had "relay-first" and no way to learn what to change. The codes
+    /// are the ones in `docs/nat/NAT_TRAVERSAL.md` §17/§19 and each maps to a
+    /// concrete remedy, which is the whole point of carrying it.
+    ///
+    /// Additive `Option<String>` field: an old peer ignores it, and a peer
+    /// that receives a code it does not recognise prints it verbatim rather
+    /// than failing — a new code must never be a control-loop error (the rule
+    /// that forbids new ENUM variants on this wire).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
 }
 
 impl UdpAdaptivePlan {
@@ -590,6 +604,12 @@ impl UdpAdaptivePlan {
             .map(|kind| kind.as_str())
             .collect::<Vec<_>>()
             .join(" -> ");
+        // Deliberately WITHOUT the reason code: `NatPlan::summary` and this
+        // one are pinned equal by `plan_to_wire_preserves_mode_and_order`, and
+        // the server side already has its own `summary_with_reason` for logs.
+        // The reason reaches a human through the diagnostic's own line and
+        // through the client's remedy warning, neither of which needs the
+        // two summaries to diverge.
         format!(
             "{} (retry {}, read {}ms, delay {}ms, order {})",
             self.mode.as_str(),
@@ -2969,6 +2989,7 @@ mod tests {
                     retry_budget: u8::MAX,
                     read_timeout_ms: u64::MAX,
                     send_delay_ms: u64::MAX,
+                    reason_code: Some("symmetric-strict-filtering".into()),
                 }),
             }),
         };
@@ -3038,6 +3059,7 @@ mod tests {
                     retry_budget: 2,
                     read_timeout_ms: 500,
                     send_delay_ms: 25,
+                    reason_code: None,
                 }),
             }),
         };
@@ -3215,6 +3237,7 @@ fn control_frame_summary_includes_test_udp_plan() {
             retry_budget: 1,
             read_timeout_ms: 750,
             send_delay_ms: 0,
+            reason_code: None,
         }),
         recandidate: true,
         generation: 0,

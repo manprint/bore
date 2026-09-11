@@ -2020,6 +2020,25 @@ async fn provider_direct(
             let plan_wire = v2.plan.as_ref();
             if let Some(plan) = plan_wire {
                 info!(plan = %plan.summary(), "provider received adaptive traversal plan");
+                // A relay-leaning plan is the moment the operator can still
+                // act, and the only machine where acting is possible is this
+                // one. Print the code even when this build knows no remedy for
+                // it: a newer server may name a cell this binary predates.
+                if matches!(
+                    plan.mode,
+                    crate::shared::UdpAdaptiveMode::RelayFirst
+                        | crate::shared::UdpAdaptiveMode::RelayOnly
+                ) {
+                    if let Some(code) = plan.reason_code.as_deref() {
+                        match crate::adaptive_nat::plan_remedy(code) {
+                            Some(remedy) => warn!(reason = code, "{remedy}"),
+                            None => warn!(
+                                reason = code,
+                                "the server planned a relay-leaning path for this pair"
+                            ),
+                        }
+                    }
+                }
                 if plan.mode == crate::shared::UdpAdaptiveMode::RelayOnly {
                     bail!(
                         "adaptive plan is relay-only for this pair; skipping the direct \

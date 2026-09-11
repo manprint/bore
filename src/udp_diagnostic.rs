@@ -2073,6 +2073,16 @@ fn print_pairing_report(
         bool_summary_label(peer.bore_stun)
     );
     println!("Adaptive plan      : {}", adaptive_plan.summary());
+    // The WHY, on its own line, with the remedy when this build knows one.
+    // The mode alone ("relay-first") tells an operator that something is
+    // wrong and nothing about what to change, which is the gap Fase 6 closed
+    // on the policy side and this line closes on the reporting side.
+    if let Some(code) = adaptive_plan.reason_code.as_deref() {
+        println!("Plan reason        : {code}");
+        if let Some(remedy) = crate::adaptive_nat::plan_remedy(code) {
+            println!("  -> {remedy}");
+        }
+    }
     println!(
         "Bandwidth test     : {}",
         if options.bandwidth {
@@ -2790,6 +2800,7 @@ mod tests {
             retry_budget: 1,
             read_timeout_ms: 750,
             send_delay_ms: 0,
+            reason_code: None,
         };
 
         let ordered = order_peer_candidates(&candidates, &peer_summary, &plan);

@@ -124,6 +124,10 @@ pub(crate) struct NatProfile {
     /// `Unknown` from a summary — a live gather cannot observe filtering
     /// until Fase 6's two-IP STUN server).
     pub(crate) filtering: UdpNatFiltering,
+    /// The RFC 5780 probe's own reading, when the peer measured one (Fase 6).
+    /// It is strictly more precise than `filtering` — which can only ever say
+    /// "blocked" — and the policy below prefers it.
+    pub(crate) filtering_probe: Option<crate::shared::UdpFilterProbe>,
     /// Independent STUN observations backing the mapping class (confidence).
     pub(crate) observations: u8,
     pub(crate) local_udp: String,
@@ -143,6 +147,12 @@ impl NatProfile {
         Self {
             mapping_class,
             filtering: UdpNatFiltering::Unknown,
+            // The paired diagnostic's summary carries the filtering as a
+            // human label, and this constructor's whole contract is that it
+            // is the only place a label is parsed. Re-parsing it into the
+            // precise enum would put label parsing on the policy path, which
+            // Fase 3 removed on purpose.
+            filtering_probe: None,
             observations: u8::from(summary.selected_stun.is_some()),
             local_udp: summary.local_udp.clone(),
             selected_stun: summary.selected_stun.clone(),
@@ -190,6 +200,7 @@ impl NatProfile {
         Self {
             mapping_class,
             filtering: profile.filtering,
+            filtering_probe: profile.filtering_probe,
             observations: profile.observations,
             local_udp: String::new(),
             selected_stun: offer.selected_stun.clone(),
@@ -206,6 +217,30 @@ impl NatProfile {
 
     fn has_candidate_kind(&self, kind: NatCandidateKind) -> bool {
         self.candidate_kinds.contains(&kind)
+    }
+
+    /// Is this side's filter address+port dependent (APDF)?
+    ///
+    /// `Some(true)` = measured APDF, `Some(false)` = measured ADF or EIF,
+    /// `None` = never measured. The legacy enum is consulted as a fallback
+    /// because its only non-`Unknown` value is set exactly when a probe was
+    /// BLOCKED, which is APDF; it can never carry the negative answer, which
+    /// is why the precise field exists.
+    ///
+    /// `None` must never be treated as `Some(true)`: an unmeasured filter and
+    /// a restrictive one look identical from the socket and mean the
+    /// opposite, and guessing restrictive is the expensive direction — it
+    /// pushes a punchable pair onto the relay.
+    fn port_restricted(&self) -> Option<bool> {
+        use crate::shared::UdpFilterProbe as P;
+        match self.filtering_probe {
+            Some(P::AddressAndPortDependent) => Some(true),
+            Some(P::AddressDependentOrOpen) => Some(false),
+            None => match self.filtering {
+                UdpNatFiltering::AddressDependent => Some(true),
+                _ => None,
+            },
+        }
     }
 }
 
@@ -257,6 +292,7 @@ impl NatPlan {
             retry_budget: self.retry_budget,
             read_timeout_ms: self.read_timeout_ms,
             send_delay_ms: self.send_delay_ms,
+            reason_code: Some(self.reason_code.to_string()),
         }
     }
 }
@@ -279,6 +315,42 @@ pub(crate) fn plan_for_pair(local: &NatProfile, peer: &NatProfile) -> NatPlan {
         send_delay_ms,
         reason_code,
         reasons: vec![reason],
+    }
+}
+
+/// Operator-facing remedy for a plan reason code, when there is one.
+///
+/// The SERVER decides the mode and logs the reason; until Fase 6 the machine
+/// that actually fell back to the relay saw only "relay-first", and its
+/// operator is the one who can act. Each code below maps to a change that has
+/// been MEASURED to flip the cell (`scripts/udp_nat_netns_test.sh`), and only
+/// such codes get a line: advice that does not change an outcome trains an
+/// operator to ignore the log, which costs more than it gives.
+///
+/// An unknown code returns `None` and the caller prints the code verbatim — a
+/// newer server must be able to add a code without this one guessing at it.
+pub(crate) fn plan_remedy(reason_code: &str) -> Option<&'static str> {
+    match reason_code {
+        "peer-port-restricted" => Some(
+            "the endpoint-independent side filters per address+port, which a symmetric \
+             peer's unpredictable source port cannot pass. A port mapping on THAT side \
+             (--upnp) or an operator-declared endpoint (--udp-candidate HOST:PORT) turns \
+             its filter into a static forward and makes the pair punchable",
+        ),
+        "symmetric-strict-filtering" => Some(
+            "both peers are symmetric and one filters per address+port: no port \
+             prediction lands on both sides at once. Give one side a stable endpoint \
+             (--upnp, --udp-candidate, or a static port forward), or accept the relay",
+        ),
+        "peer-blocked" => Some(
+            "one side reported no STUN reachability at all, i.e. UDP egress is blocked \
+             there. Run `bore test-udp` on both hosts; the blocked one says so",
+        ),
+        "no-candidates" => Some(
+            "neither side offered a usable direct candidate: check that --stun-server is \
+             reachable, or declare an endpoint with --udp-candidate HOST:PORT",
+        ),
+        _ => None,
     }
 }
 
@@ -313,18 +385,66 @@ fn select_mode(local: &NatProfile, peer: &NatProfile) -> (NatPlanMode, &'static 
     }
 
     if local.mapping_class.symmetric() || peer.mapping_class.symmetric() {
-        // Symmetric mapping + address/port-dependent filtering on the SAME
-        // side is the worst RFC 4787 combination (port prediction rarely
-        // lands): don't burn the retry budget on it.
-        let apdm_apdf = (local.mapping_class.symmetric()
-            && local.filtering == UdpNatFiltering::AddressDependent)
-            || (peer.mapping_class.symmetric()
-                && peer.filtering == UdpNatFiltering::AddressDependent);
-        if apdm_apdf {
+        // Exactly one side symmetric is the interesting case, and the axis
+        // that decides it is the OTHER side's FILTERING — measured on a real
+        // kernel, `scripts/udp_nat_netns_test.sh`:
+        //
+        //   eim:apdf x edm  -> RELAY      eim:adf x edm -> DIRECT
+        //   eim:eif  x edm  -> DIRECT     (control: eim:apdf + fixed port x edm -> RELAY)
+        //
+        // The reason is asymmetric and worth stating, because the intuitive
+        // rule (look at the symmetric side's own filter) is the wrong one and
+        // was what this function used to encode. Two packets have to get
+        // through. The one going symmetric -> other arrives from a source port
+        // the other side cannot have written to, so the OTHER side's filter
+        // must be looser than APDF. The one going other -> symmetric arrives
+        // from the other side's stable, endpoint-independent mapping, which
+        // the symmetric side HAS written to, so even an APDF filter on the
+        // symmetric side lets it in. Hence: the side that must accept an
+        // unpredictable source port is the non-symmetric one, and it is the
+        // only side whose filtering decides the cell.
+        let both_symmetric = local.mapping_class.symmetric() && peer.mapping_class.symmetric();
+        if !both_symmetric {
+            let other = if local.mapping_class.symmetric() {
+                peer
+            } else {
+                local
+            };
+            match other.port_restricted() {
+                Some(true) => {
+                    return (
+                        NatPlanMode::RelayFirst,
+                        "peer-port-restricted",
+                        "the non-symmetric side filters per address+port, which a symmetric \
+                         peer's unpredictable source port cannot pass; relay first"
+                            .to_string(),
+                    );
+                }
+                Some(false) => {
+                    return (
+                        NatPlanMode::DirectWithRetry,
+                        "symmetric-vs-open-filter",
+                        "the non-symmetric side accepts an unsolicited port from a known \
+                         address, which is the cell a symmetric peer can still punch"
+                            .to_string(),
+                    );
+                }
+                // Never measured: fall through to the mapping-only heuristics
+                // below, exactly as before Fase 6.
+                None => {}
+            }
+        }
+        // Both symmetric and BOTH filters strict is the worst RFC 4787
+        // combination (port prediction has to land on both sides at once):
+        // don't burn the retry budget on it.
+        if both_symmetric
+            && (local.port_restricted() == Some(true) || peer.port_restricted() == Some(true))
+        {
             return (
                 NatPlanMode::RelayFirst,
                 "symmetric-strict-filtering",
-                "a symmetric peer also filters per address/port; relay first".to_string(),
+                "both peers are symmetric and one filters per address/port; relay first"
+                    .to_string(),
             );
         }
         if local.port_preserved == Some(true)
@@ -421,6 +541,7 @@ fn candidate_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::UdpFilterProbe;
 
     fn summary(
         nat_class: &str,
@@ -671,6 +792,26 @@ mod tests {
         }
     }
 
+    /// Same as [`wire_profile`] but carrying a Fase 6 probe reading. The
+    /// legacy enum stays `Unknown` on purpose even for an APDF probe: that is
+    /// what a real Fase 6 peer puts on the wire only when the probe was
+    /// blocked, and a test that pre-agrees with the policy on both fields
+    /// cannot tell which one the policy actually read.
+    fn probe_profile(
+        mapping: UdpNatMapping,
+        probe: Option<UdpFilterProbe>,
+        port_preserved: Option<bool>,
+        observations: u8,
+    ) -> UdpNatProfile {
+        UdpNatProfile {
+            mapping,
+            filtering: UdpNatFiltering::Unknown,
+            port_preserved,
+            observations,
+            filtering_probe: probe,
+        }
+    }
+
     fn wire_profile(
         mapping: UdpNatMapping,
         filtering: UdpNatFiltering,
@@ -794,18 +935,141 @@ mod tests {
             &[UdpCandidateKind::Reflexive, UdpCandidateKind::Local],
             Some("stun.example:3478"),
         );
-        let apdm_apdf = wire_profile(
+        // BOTH symmetric, one of them measured APDF: port prediction would
+        // have to land on both sides at once.
+        let apdm_apdf = probe_profile(
             UdpNatMapping::Symmetric,
-            UdpNatFiltering::AddressDependent,
+            Some(UdpFilterProbe::AddressAndPortDependent),
+            Some(true),
+            2,
+        );
+        let apdm = wire_profile(
+            UdpNatMapping::Symmetric,
+            UdpNatFiltering::Unknown,
+            Some(true),
+            2,
+        );
+        let local = NatProfile::from_wire(&apdm_apdf, &offer);
+        let peer = NatProfile::from_wire(&apdm, &offer);
+        let plan = plan_for_pair(&local, &peer);
+        assert_eq!(plan.mode, NatPlanMode::RelayFirst);
+        assert_eq!(plan.reason_code, "symmetric-strict-filtering");
+    }
+
+    /// Every relay-leaning reason the policy can emit must carry a remedy,
+    /// and the plan must actually put the code on the wire.
+    ///
+    /// The pairing matters: a code with no remedy reaches the operator as
+    /// "relay-first, good luck", which is the state Fase 6 set out to end. A
+    /// new relay reason added without a remedy fails here rather than shipping
+    /// silently.
+    #[test]
+    fn every_relay_leaning_reason_has_a_remedy_and_reaches_the_wire() {
+        for code in [
+            "peer-port-restricted",
+            "symmetric-strict-filtering",
+            "peer-blocked",
+            "no-candidates",
+        ] {
+            assert!(
+                plan_remedy(code).is_some(),
+                "relay-leaning reason {code} has no operator remedy"
+            );
+        }
+        // An unknown code is NOT an error: a newer server may name a cell this
+        // build predates, and the caller prints it verbatim.
+        assert!(plan_remedy("some-future-code").is_none());
+
+        let offer = wire_offer(
+            &[UdpCandidateKind::Reflexive, UdpCandidateKind::Local],
+            Some("stun.example:3478"),
+        );
+        let sym = wire_profile(
+            UdpNatMapping::Symmetric,
+            UdpNatFiltering::Unknown,
+            Some(false),
+            2,
+        );
+        let cone = probe_profile(
+            UdpNatMapping::Eim,
+            Some(UdpFilterProbe::AddressAndPortDependent),
+            Some(true),
+            2,
+        );
+        let plan = plan_for_pair(
+            &NatProfile::from_wire(&cone, &offer),
+            &NatProfile::from_wire(&sym, &offer),
+        );
+        assert_eq!(
+            plan.to_wire().reason_code.as_deref(),
+            Some("peer-port-restricted")
+        );
+    }
+
+    /// Fase 6, the measured rule: with exactly ONE symmetric side, the axis
+    /// that decides the cell is the OTHER side's filtering — and the two
+    /// answers give opposite modes. This is the table
+    /// `scripts/udp_nat_netns_test.sh` measures on a real kernel
+    /// (`eim:apdf x edm` -> RELAY, `eim:adf x edm` -> DIRECT).
+    #[test]
+    fn from_wire_one_symmetric_side_is_decided_by_the_other_sides_filtering() {
+        let offer = wire_offer(
+            &[UdpCandidateKind::Reflexive, UdpCandidateKind::Local],
+            Some("stun.example:3478"),
+        );
+        let sym = wire_profile(
+            UdpNatMapping::Symmetric,
+            UdpNatFiltering::Unknown,
+            Some(false),
+            2,
+        );
+        let peer = NatProfile::from_wire(&sym, &offer);
+
+        for (probe, mode, code) in [
+            (
+                UdpFilterProbe::AddressAndPortDependent,
+                NatPlanMode::RelayFirst,
+                "peer-port-restricted",
+            ),
+            (
+                UdpFilterProbe::AddressDependentOrOpen,
+                NatPlanMode::DirectWithRetry,
+                "symmetric-vs-open-filter",
+            ),
+        ] {
+            let cone = probe_profile(UdpNatMapping::Eim, Some(probe), Some(true), 2);
+            let local = NatProfile::from_wire(&cone, &offer);
+            // Both orders: the rule must not depend on which side is `local`.
+            for plan in [plan_for_pair(&local, &peer), plan_for_pair(&peer, &local)] {
+                assert_eq!(plan.mode, mode, "probe {probe:?}");
+                assert_eq!(plan.reason_code, code, "probe {probe:?}");
+            }
+        }
+    }
+
+    /// Zero-regression: a peer that never measured its filtering must reach
+    /// exactly the pre-Fase-6 decision. `None` is not `Some(true)` — reading
+    /// an absent measurement as a restrictive filter would push a punchable
+    /// pair onto the relay, which is the expensive direction to be wrong in.
+    #[test]
+    fn an_unmeasured_filter_keeps_the_legacy_symmetric_decision() {
+        let offer = wire_offer(
+            &[UdpCandidateKind::Reflexive, UdpCandidateKind::Local],
+            Some("stun.example:3478"),
+        );
+        let sym = wire_profile(
+            UdpNatMapping::Symmetric,
+            UdpNatFiltering::Unknown,
             Some(true),
             2,
         );
         let cone = wire_profile(UdpNatMapping::Eim, UdpNatFiltering::Unknown, Some(true), 2);
-        let local = NatProfile::from_wire(&apdm_apdf, &offer);
-        let peer = NatProfile::from_wire(&cone, &offer);
-        let plan = plan_for_pair(&local, &peer);
-        assert_eq!(plan.mode, NatPlanMode::RelayFirst);
-        assert_eq!(plan.reason_code, "symmetric-strict-filtering");
+        let plan = plan_for_pair(
+            &NatProfile::from_wire(&sym, &offer),
+            &NatProfile::from_wire(&cone, &offer),
+        );
+        assert_eq!(plan.mode, NatPlanMode::DirectWithRetry);
+        assert_eq!(plan.reason_code, "symmetric-escape");
     }
 
     /// Fase 5 gate: a manual/router-mapped candidate with `--udp-no-stun`

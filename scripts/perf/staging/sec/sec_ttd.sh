@@ -42,17 +42,8 @@ poke() { # one tiny proxied connection: what triggers the direct open
         ws-vm|vm-vm) vm "python3 $VM_RAWCLI get 127.0.0.1 $PP 65536 1" >/dev/null 2>&1 ;;
     esac
 }
-start_origin() {
-    case "$TOPO" in
-        vm-ws|vm-vm) vm "pgrep -f 'raw_origin.py $RP' >/dev/null 2>&1 || \
-            (setsid nohup python3 ~/raw_origin.py $RP >~/out/raworigin.log 2>&1 </dev/null & true)" >/dev/null 2>&1 ;;
-        ws-vm) pgrep -f "raw_origin.py $RP" >/dev/null 2>&1 || {
-                   python3 "$HERE/../../raw_origin.py" "$RP" >"$OUT/raworigin.log" 2>&1 &
-                   SEC_KIDS+=("$!"); sleep 1; } ;;
-    esac
-}
 
-start_origin
+sec_start_origin "$TOPO" || exit 1
 say "secret path census: $N tunnels, topology $TOPO, flags '$FLAGS'"
 printf '  %-4s %-8s %10s %6s  %s\n' n path ttd_ms fb reason
 

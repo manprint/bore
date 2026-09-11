@@ -40,13 +40,7 @@ rc() {
     esac
 }
 
-case "$TOPO" in
-    vm-ws|vm-vm) vm "pgrep -f 'raw_origin.py $RP' >/dev/null 2>&1 || \
-        (setsid nohup python3 ~/raw_origin.py $RP >~/out/raworigin.log 2>&1 </dev/null & true)" >/dev/null 2>&1 ;;
-    ws-vm) pgrep -f "raw_origin.py $RP" >/dev/null 2>&1 || {
-               python3 "$HERE/../../raw_origin.py" "$RP" >"$OUT/raworigin.log" 2>&1 &
-               SEC_KIDS+=("$!"); sleep 1; } ;;
-esac
+sec_start_origin "$TOPO" || exit 1
 
 say "secret latency/concurrency: $PROBES probes, holds [$HOLDS], topology $TOPO"
 

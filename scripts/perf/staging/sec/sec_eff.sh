@@ -42,13 +42,7 @@ drive() { local dir="$1" per="$2" conns="$3"
         ws-vm|vm-vm) vm "python3 $VM_RAWCLI $dir 127.0.0.1 $PP $per $conns" 2>/dev/null ;;
     esac | grep -oE 'MBs=[0-9.]+' | cut -d= -f2; }
 
-case "$TOPO" in
-    vm-ws|vm-vm) vm "pgrep -f 'raw_origin.py $RP' >/dev/null 2>&1 || \
-        (setsid nohup python3 ~/raw_origin.py $RP >~/out/raworigin.log 2>&1 </dev/null & true)" >/dev/null 2>&1 ;;
-    ws-vm) pgrep -f "raw_origin.py $RP" >/dev/null 2>&1 || {
-               python3 "$HERE/../../raw_origin.py" "$RP" >"$OUT/raworigin.log" 2>&1 &
-               SEC_KIDS+=("$!"); sleep 1; } ;;
-esac
+sec_start_origin "$TOPO" || exit 1
 
 say "secret efficiency: $GIB GiB per arm over $CONNS conns, topology $TOPO"
 echo "  reduce each window with:"

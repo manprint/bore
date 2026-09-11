@@ -73,25 +73,6 @@ drive() {
 
 # The provider's origin. On the VM it is the campaign's own raw_origin.py,
 # started idempotently; on the workstation the same file from this repository.
-start_origin() {
-    case "$TOPO" in
-        vm-ws|vm-vm)
-            vm "pgrep -f 'raw_origin.py $RP' >/dev/null 2>&1 || \
-                (setsid nohup python3 ~/raw_origin.py $RP >~/out/raworigin.log 2>&1 </dev/null & true)" >/dev/null 2>&1
-            vm "python3 $VM_RAWCLI ping 127.0.0.1 $RP 1" >/dev/null 2>&1 ;;
-        ws-vm)
-            pgrep -f "raw_origin.py $RP" >/dev/null 2>&1 || {
-                python3 "$HERE/../../raw_origin.py" "$RP" >"$OUT/raworigin.log" 2>&1 &
-                SEC_KIDS+=("$!")
-            }
-            local i
-            for i in $(seq 40); do
-                python3 "$WS_RAWCLI" ping 127.0.0.1 "$RP" 1 >/dev/null 2>&1 && return 0
-                sleep 0.25
-            done
-            echo "raw origin failed to start on the workstation" >&2; return 1 ;;
-    esac
-}
 
 # one_arm <get|put> <flags...> -> "<MBs> <path> <fallbacks> <ttd_ms>"
 #
@@ -151,7 +132,7 @@ paired() { # <title> <dirn>
     echo "  median ratio direct/relay: $(printf '%s\n' "${rs[@]}" | med)"
 }
 
-start_origin || exit 1
+sec_start_origin "$TOPO" || exit 1
 say "secret A/B: topology $TOPO, ${MB} MiB per arm over $CONNS conns, $PAIRS pairs, ${COOL}s cooldown"
 echo "    provider origin: raw TCP 127.0.0.1:$RP   consumer proxy: 127.0.0.1:$PP"
 paired "S1 relay vs QUIC direct" get

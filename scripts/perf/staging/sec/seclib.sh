@@ -176,6 +176,64 @@ sec_time_to_direct() {
     done
 }
 
+# --- the provider's byte source ---------------------------------------------
+# ONE implementation, here, because four copies in four stages is exactly how
+# the public campaign's hard-won lesson failed to reach this directory:
+#
+#   a REMOTE `pgrep -f 'raw_origin.py 5053'` matches the `bash -c` that is
+#   RUNNING it — the pattern sits inside that shell's own command line — so the
+#   idempotence guard always reads "already running", the origin is never
+#   started, and every arm of the stage measures nothing.
+#
+# Measured, not reasoned: an S1 smoke returned 0.00 MB/s on all four arms while
+# the provider on the VM logged `could not connect to localhost:5053` and the
+# consumer's own log showed a perfectly healthy direct QUIC path. The bracket
+# in `raw_origin.p[y]` is what breaks the self-match (the literal `[y]` in the
+# shell's command line is not what the regex matches), and the readiness probe
+# is what makes a failure LOUD instead of a table of zeros — the same harness
+# defect class (H-8) the public campaign named.
+#
+# sec_start_origin <topo> -> 0 when the origin is SERVING, 1 otherwise.
+sec_start_origin() {
+    local topo="$1" i
+    case "$topo" in
+        vm-ws|vm-vm)
+            # The idiom is the public campaign's, verbatim, and every piece of
+            # it is load-bearing (see `pub/ws_pub.sh`, trap H-12):
+            #   * the existence check is a real TCP CONNECT, not a `pgrep` —
+            #     bracketing the pattern stops it matching its own text but NOT
+            #     the plain `raw_origin.py $RP` that the START half of the same
+            #     one-liner necessarily contains, so a `pgrep || start` guard
+            #     always believes the origin is up and never starts it;
+            #   * `sleep 1; true` keeps the ssh session alive past the spawn —
+            #     without it the freshly detached process does not survive the
+            #     session teardown on this host, measured repeatedly;
+            #   * and "a process exists" is the wrong question anyway. What the
+            #     stage needs is "something is SERVING on that port".
+            vm "mkdir -p \$HOME/out; timeout 2 bash -c '</dev/tcp/127.0.0.1/$RP' 2>/dev/null || \
+                (setsid nohup python3 \$HOME/raw_origin.py $RP > \$HOME/out/raworigin.log 2>&1 </dev/null &); \
+                sleep 1; true" >/dev/null 2>&1
+            for i in $(seq 40); do
+                vm "timeout 2 bash -c '</dev/tcp/127.0.0.1/$RP'" >/dev/null 2>&1 && return 0
+                sleep 0.25
+            done
+            echo "raw origin is NOT serving on the VM at 127.0.0.1:$RP — every arm would read 0.00" >&2
+            return 1 ;;
+        ws-vm)
+            pgrep -f "raw_origin.p[y] $RP" >/dev/null 2>&1 || {
+                python3 "$HERE_SEC/../../raw_origin.py" "$RP" >"$OUT/raworigin.log" 2>&1 &
+                SEC_KIDS+=("$!")
+            }
+            for i in $(seq 40); do
+                python3 "$WS_RAWCLI" ping 127.0.0.1 "$RP" 1 >/dev/null 2>&1 && return 0
+                sleep 0.25
+            done
+            echo "raw origin failed to start on the workstation at 127.0.0.1:$RP" >&2
+            return 1 ;;
+        *) echo "sec_start_origin: unknown topology '$topo'" >&2; return 2 ;;
+    esac
+}
+
 # --- measurement primitives -------------------------------------------------
 now()   { date +%s.%N; }
 mbs()   { LC_ALL=C awk -v b="$1" -v s="$2" -v e="$3" 'BEGIN{d=e-s; if(d<=0){print "0.00";exit} printf "%.2f", b/1048576/d}'; }

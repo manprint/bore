@@ -1051,7 +1051,10 @@ impl Client {
         let mut preferred_port_remapped = false;
         #[cfg(feature = "udp")]
         let mut next_preferred_port_check = tokio::time::Instant::now();
-        let sends_ctrl_heartbeat = self.sends_ctrl_heartbeat;
+        // Mutable: a peer that stops READING the control substream makes the
+        // client stand its heartbeat down for the rest of the session rather
+        // than wedge the whole listen loop. See `beat_once`.
+        let mut sends_ctrl_heartbeat = self.sends_ctrl_heartbeat;
         let this = Arc::new(self);
 
         // Carrier pool: pump each extra carrier's accepted data substreams into a
@@ -1089,8 +1092,21 @@ impl Client {
         loop {
             tokio::select! {
                 _ = ctrl_heartbeat.tick(), if sends_ctrl_heartbeat => {
-                    if control.send(ClientMessage::Heartbeat).await.is_err() {
-                        return Ok(());
+                    match beat_once(&mut control).await {
+                        CtrlBeat::Sent => {}
+                        CtrlBeat::Closed => return Ok(()),
+                        CtrlBeat::PeerNotReading => {
+                            warn!(
+                                timeout = ?crate::secret::ctrl_heartbeat_send_timeout(),
+                                "control heartbeat write blocked: the server is not reading \
+                                 this tunnel's control substream. Standing the heartbeat down \
+                                 for this session — continuing to beat would fill the stream's \
+                                 flow-control credit and stall the whole tunnel. A server that \
+                                 predates the public-tunnel control read arm behaves exactly \
+                                 like this; upgrade the server."
+                            );
+                            sends_ctrl_heartbeat = false;
+                        }
                     }
                 }
                 // Drain the control substream so the server's heartbeats are read;
@@ -2174,10 +2190,56 @@ pub(crate) async fn connect_with_timeout(to: &str, port: u16) -> Result<TcpStrea
     Ok(stream)
 }
 
+/// Outcome of one control-heartbeat write.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CtrlBeat {
+    /// The frame reached the peer's socket.
+    Sent,
+    /// The control substream is gone; the tunnel is over.
+    Closed,
+    /// The write did not complete inside
+    /// [`crate::secret::ctrl_heartbeat_send_timeout`]. The peer is alive at the
+    /// transport level but is not READING this substream, so its flow-control
+    /// credit is exhausted and every further beat would block too.
+    PeerNotReading,
+}
+
+/// Send one control heartbeat, bounded.
+///
+/// The bound is the whole point. This call lives in a `select!` arm, so a write
+/// that blocks forever stops the listen loop from accepting proxied
+/// connections — the tunnel goes on existing and stops working. That is not
+/// hypothetical: a client that beats at a server whose loop never reads the
+/// public control substream fills the yamux credit and wedges (measured on
+/// staging, 2026-09-11).
+///
+/// Cancelling `SinkExt::send` at the timeout is safe here. `Framed` advances its
+/// write buffer only by the bytes the socket actually accepted, so a partial
+/// flush resumes exactly where it stopped on the next write, and an item that
+/// was never encoded is simply lost — which is the correct outcome for a
+/// heartbeat that is being abandoned anyway.
+pub(crate) async fn beat_once<U>(control: &mut Delimited<U>) -> CtrlBeat
+where
+    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(
+        crate::secret::ctrl_heartbeat_send_timeout(),
+        control.send(ClientMessage::Heartbeat),
+    )
+    .await
+    {
+        Ok(Ok(())) => CtrlBeat::Sent,
+        Ok(Err(_)) => CtrlBeat::Closed,
+        Err(_) => CtrlBeat::PeerNotReading,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "udp")]
     use super::direct_renewal_stands_down;
+    use super::{beat_once, CtrlBeat, Delimited};
+    use std::time::Duration;
 
     /// A carrier coming up must NOT stand the renewal down while the direct
     /// pool is still short of its target.
@@ -2215,5 +2277,80 @@ mod tests {
     fn direct_renewal_single_carrier_default_is_unchanged() {
         assert!(!direct_renewal_stands_down(0, 1));
         assert!(direct_renewal_stands_down(1, 1));
+    }
+
+    /// A writer that accepts nothing, ever: the io-level shape of a peer that
+    /// has stopped reading the substream and whose flow-control credit is
+    /// exhausted. Reads park forever too, exactly as a live-but-silent peer's
+    /// would.
+    struct NeverWritable;
+
+    impl tokio::io::AsyncWrite for NeverWritable {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncRead for NeverWritable {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// RED-CHECK: removing the `timeout` in `beat_once` makes this test hang
+    /// forever instead of failing, which is precisely the production symptom —
+    /// the listen loop never comes back and the tunnel stops serving while
+    /// still looking registered. Verified by reverting the bound.
+    ///
+    /// Gated at the io-trait level rather than end to end on purpose: the real
+    /// wedge needs roughly 256 KiB of unread frames, which is days of uptime at
+    /// the production 20 s interval and 30 s even at a compressed 2 ms one.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn beat_once_stands_down_when_the_peer_stops_reading() {
+        let mut control = Delimited::new(NeverWritable);
+        let t0 = tokio::time::Instant::now();
+        assert_eq!(beat_once(&mut control).await, CtrlBeat::PeerNotReading);
+        assert!(
+            t0.elapsed() >= crate::secret::ctrl_heartbeat_send_timeout(),
+            "the write must be given the full deadline before standing down"
+        );
+    }
+
+    /// The ordinary path must be untouched: a peer that reads gets the frame,
+    /// and nothing waits for the deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn beat_once_sends_immediately_to_a_reading_peer() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64];
+            tokio::io::AsyncReadExt::read(&mut server, &mut buf)
+                .await
+                .unwrap()
+        });
+        let mut control = Delimited::new(client);
+        let t0 = std::time::Instant::now();
+        assert_eq!(beat_once(&mut control).await, CtrlBeat::Sent);
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        assert!(reader.await.unwrap() > 0, "the peer received the heartbeat");
     }
 }

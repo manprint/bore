@@ -78,6 +78,42 @@ pub(crate) fn ctrl_client_heartbeat() -> Duration {
     }
 }
 
+/// How long a control heartbeat write may block before the client concludes the
+/// peer is not READING the control substream, and stops beating.
+///
+/// Measured, not assumed (staging, 2026-09-11): a client that beats against a
+/// server whose loop never reads the control substream fills the yamux stream
+/// credit and then blocks forever inside `send`. Because that `send` lives in a
+/// `select!` arm, the whole listen loop stops — a public tunnel stopped serving
+/// after roughly 256 KiB of unread heartbeat frames, which at the 20 s
+/// production interval is days of uptime and at a compressed 2 ms interval was
+/// 30 seconds. Exactly the mixed-version case: a NEW client against a server
+/// predating the public read arm.
+///
+/// Standing down is correct against BOTH kinds of peer. Against such an old
+/// server there is no reaper, so the tunnel simply returns to the legacy
+/// heartbeat-free behaviour. Against a current server the write is only
+/// blocked if the control path is genuinely broken, and the server's own
+/// deadline then reaps the registration — which is what should happen.
+///
+/// Comfortably below [`SECRET_CTRL_TIMEOUT`] so a stand-down is always visible
+/// to the server as a missed deadline rather than as an ambiguous stall, and at
+/// or below [`CTRL_CLIENT_HEARTBEAT`] so beats can never queue up behind one
+/// another. `BORE_CTRL_HEARTBEAT_SEND_TIMEOUT_MS` overrides it, read per call
+/// for the same reason [`ctrl_client_heartbeat`] is.
+const CTRL_HEARTBEAT_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// [`CTRL_HEARTBEAT_SEND_TIMEOUT`] with its test-only override.
+pub(crate) fn ctrl_heartbeat_send_timeout() -> Duration {
+    match std::env::var("BORE_CTRL_HEARTBEAT_SEND_TIMEOUT_MS") {
+        Ok(ms) => match ms.parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => CTRL_HEARTBEAT_SEND_TIMEOUT,
+        },
+        Err(_) => CTRL_HEARTBEAT_SEND_TIMEOUT,
+    }
+}
+
 /// How long a consumer waits for the server to broker a UDP direct path before
 /// falling back to the relay.
 #[cfg(feature = "udp")]

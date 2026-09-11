@@ -2502,6 +2502,14 @@ Providers registered through the SSH gateway (`ssh -R vhost/...`) are not covere
 reaper and do not need to be: the gateway has its own bounded channel-open plus
 wedged-session eviction, which releases the label in 20–40 seconds.
 
+**Mixed versions are safe in both directions.** The heartbeat write itself is bounded
+(10 seconds, `BORE_CTRL_HEARTBEAT_SEND_TIMEOUT_MS`). A *new* client talking to a server old
+enough not to read the control substream would otherwise fill that substream's flow-control
+window and stop serving while still appearing registered; instead the client logs a warning
+naming the cause, stands its heartbeat down for the rest of the session and keeps forwarding
+traffic on the legacy heartbeat-free path. The remedy in that case is to upgrade the server —
+the warning says so explicitly.
+
 ## Access logging
 
 Access logs record HTTP requests and raw TCP connections in nginx "combined" format, with

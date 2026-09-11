@@ -123,6 +123,6 @@ echo "  === server view at the end ==="
 for f in native docker ssh; do
     [ -n "${LIVE[$f]:-}" ] || continue
     p="${LIVE[$f]}"
-    echo "    $f port=$p $(tsnap "$p" | jq -r '"path=\(.current_path) carriers=\(.carriers) opens=\(.direct_stream_opens) fb=\(.direct_fallbacks) pool=\(.direct_pool) active=\(.active_conns)"' 2>/dev/null)"
+    echo "    $f port=$p $(tsnap "$p" | jq -r '"path=\(.current_path) carriers=\(.carriers) opens=\(.direct_stream_opens) fb=\(.direct_fallbacks) pool=\(.direct_pool) active=\(.active)"' 2>/dev/null)"
 done
 echo DONE

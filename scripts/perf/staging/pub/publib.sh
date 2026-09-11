@@ -32,10 +32,14 @@ trap cleanup EXIT
 adm()  { curl -fsS -m 10 -H "Authorization: Bearer $ADMIN_TOKEN" "$ADMIN_URL/$1"; }
 # One fetch, many fields: /tunnels is polled in tight loops and a field-per-call
 # helper turns one sample into five inconsistent ones.
-tsnap() { adm tunnels | jq -c --argjson p "$1" '.[]|select(.port==$p)' 2>/dev/null; }
+# NOTE the field is `public_port`, not `port`, and the live connection count is
+# `active`, not `active` — TunnelView's names, verified against
+# src/admin_views.rs. Guessing them cost a whole smoke run: the tunnel was
+# registered and `present` still said no.
+tsnap() { adm tunnels | jq -c --argjson p "$1" '.[]|select(.public_port==$p)' 2>/dev/null; }
 tfld()  { tsnap "$1" | jq -r --arg f "$2" '.[$f] // empty' 2>/dev/null; }
-pport() { adm tunnels | jq -r '.[].port' 2>/dev/null; }
-present() { adm tunnels | jq -e --argjson p "$1" 'any(.[]; .port==$p)' >/dev/null 2>&1; }
+pport() { adm tunnels | jq -r '.[].public_port' 2>/dev/null; }
+present() { adm tunnels | jq -e --argjson p "$1" 'any(.[]; .public_port==$p)' >/dev/null 2>&1; }
 
 # --- origins ----------------------------------------------------------------
 start_origins() {

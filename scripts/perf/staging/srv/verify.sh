@@ -8,8 +8,18 @@
 # the 2026-09-11 admin fix, NOT that the value is unset.
 . "$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
 
+say "server build"
+# Which image is actually running. Every measurement in a campaign must be able
+# to name the build it was taken against; "the latest one" is not an answer.
+adm config | jq -r '"  version=\(.server_version // "not reported by this build")"'
+srv "sudo -n docker inspect --format '  image={{.Config.Image}} started={{.State.StartedAt}}' ${BORE_SRV_CONTAINER} 2>/dev/null" 2>/dev/null
+srv "sudo -n docker exec ${BORE_SRV_CONTAINER} /bore --version 2>/dev/null | sed 's/^/  /'" 2>/dev/null
+
 say "vhost entries"
 adm vhost | jq -r '.[]|"  \(.subdomain) path=\(.current_path) carriers=\(.carriers) target=\(.carrier_target) fallbacks=\(.direct_fallbacks)"'
+
+say "public tunnels"
+adm tunnels | jq -r '.[]|"  port=\(.public_port) path=\(.current_path) carriers=\(.carriers) opens=\(.direct_stream_opens) fallbacks=\(.direct_fallbacks) pool=\(.direct_pool) active=\(.active)"'
 
 say "resolved tunables"
 adm config | jq '{

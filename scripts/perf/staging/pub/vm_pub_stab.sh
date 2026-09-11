@@ -36,11 +36,11 @@ s1_soak() {
         local path; path=$(printf '%s' "$snap" | jq -r '.current_path // "?"')
         [ "$path" = relay ] && relay=$((relay + 1))
         printf '  %-4s %s %s\n' "$((n))" \
-            "$(printf '%s' "$snap" | jq -r '"\(.port) \(.direct_stream_opens) \(.direct_fallbacks) \(.direct_pool) \(.current_path) \(.active_conns)"')" \
+            "$(printf '%s' "$snap" | jq -r '"\(.public_port) \(.direct_stream_opens) \(.direct_fallbacks) \(.direct_pool) \(.current_path) \(.active)"')" \
             "${r:-0}"
         sleep 25
     done
-    local p1; p1=$(tfld "$p" port)
+    local p1; p1=$(tfld "$p" public_port)
     echo "  samples=$n on_relay=$relay port_start=$port0 port_end=${p1:-gone}"
     [ "${p1:-}" = "$port0" ] && echo "  PASS: the public port never moved" \
         || echo "  FAIL: the public port changed or the tunnel died"
@@ -126,14 +126,14 @@ s5_churn() {
     echo "===== S5 connection churn: 500 short connections ====="
     up_native "$RP" 0 --carriers 4 || { echo "  REGISTRATION FAILED"; return 1; }
     local p="$LASTPORT" pid="$LASTPID"
-    local a; a=$(tfld "$p" active_conns)
+    local a; a=$(tfld "$p" active)
     local t0; t0=$(date +%s)
     for i in $(seq 25); do
         python3 "$RAWCLI" get "$GW" "$p" 4096 20 20 >/dev/null 2>&1
     done
     local t1; t1=$(date +%s)
     sleep 5
-    local b; b=$(tfld "$p" active_conns)
+    local b; b=$(tfld "$p" active)
     echo "  500 connections in $((t1 - t0))s; active before=$a after=$b"
     echo "  server rejections=$(mfld conn_rejections) budget_refusals=$(mfld direct_budget_refusals)"
     [ "${b:-1}" = 0 ] && echo "  PASS: every permit came back" \

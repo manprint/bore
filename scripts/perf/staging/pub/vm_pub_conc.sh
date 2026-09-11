@@ -34,7 +34,7 @@ hold_and_probe() { # <public_port> <n>
         pids+=("$!")
     done
     sleep 4
-    local act; act=$(tfld "$p" active_conns)
+    local act; act=$(tfld "$p" active)
     local res; res=$(raw_ping "$p" "$PROBES")
     for i in "${pids[@]}"; do kill -9 "$i" 2>/dev/null; done
     wait 2>/dev/null

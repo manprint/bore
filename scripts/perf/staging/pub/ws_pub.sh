@@ -21,9 +21,9 @@ CONNS="${CONNS:-4}"
 PER=$(( MB * 1048576 / CONNS ))
 CARR="${CARR:---carriers 1}"
 
-tsnap()   { adm tunnels | jq -c --argjson p "$1" '.[]|select(.port==$p)' 2>/dev/null; }
+tsnap()   { adm tunnels | jq -c --argjson p "$1" '.[]|select(.public_port==$p)' 2>/dev/null; }
 tfld()    { tsnap "$1" | jq -r --arg f "$2" '.[$f] // empty' 2>/dev/null; }
-pub_present() { adm tunnels | jq -e --argjson p "$1" 'any(.[]; .port==$p)' >/dev/null 2>&1; }
+pub_present() { adm tunnels | jq -e --argjson p "$1" 'any(.[]; .public_port==$p)' >/dev/null 2>&1; }
 
 # Start the raw origin on the VM once; it is idempotent.
 vm "pgrep -f 'raw_origin.py $RP' >/dev/null 2>&1 || \

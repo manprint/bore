@@ -168,6 +168,15 @@ pub fn tunnels(server: &Server) -> Vec<TunnelView> {
                 .and_then(|port| server.public_direct_stats(port));
             #[cfg(not(feature = "udp"))]
             let direct: Option<()> = None;
+            // A tunnel that did not ask for `--udp` has exactly ONE possible
+            // path, and the server knows it with certainty — reporting
+            // "unknown" for it reads as "the server cannot tell", which is
+            // false and made the Path column useless for the ordinary public
+            // tunnel. "unknown" is reserved for a `--udp` tunnel that has not
+            // proxied a connection yet, which is the one case where the
+            // question genuinely has no answer.
+            let relay_only_path =
+                || crate::vhost::vhost_path_label(crate::vhost::VHOST_PATH_RELAY).to_string();
             let (direct_stream_opens, direct_fallbacks, direct_pool, current_path) = {
                 #[cfg(feature = "udp")]
                 {
@@ -178,19 +187,20 @@ pub fn tunnels(server: &Server) -> Vec<TunnelView> {
                             d.carriers,
                             crate::vhost::vhost_path_label(d.last_path).to_string(),
                         ),
-                        None => (
+                        None if e.udp => (
                             0,
                             0,
                             0,
                             crate::vhost::vhost_path_label(crate::vhost::VHOST_PATH_UNKNOWN)
                                 .to_string(),
                         ),
+                        None => (0, 0, 0, relay_only_path()),
                     }
                 }
                 #[cfg(not(feature = "udp"))]
                 {
                     let _ = direct;
-                    (0u64, 0u64, 0usize, "unknown".to_string())
+                    (0u64, 0u64, 0usize, relay_only_path())
                 }
             };
             TunnelView {
@@ -835,6 +845,78 @@ pub fn metrics(server: &Server) -> MetricsView {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn a_relay_only_public_tunnel_reports_the_relay_path_not_unknown() {
+        // The Path column exists so an operator can see which transport a
+        // tunnel is actually using. A public tunnel that never asked for
+        // `--udp` has exactly ONE possible path and the server knows it with
+        // certainty, so reporting "unknown" there says "the server cannot
+        // tell" — false, and it made the column useless for the ordinary
+        // tunnel, which is most of them.
+        //
+        // Red-check: report UNKNOWN whenever the direct registry has no entry
+        // (what the code did before) and the first assertion fails.
+        use crate::admin::{AdminRegistry, Role};
+
+        let server = Server::new(21300..=21400, None);
+        let admin: AdminRegistry = server.admin_registry();
+
+        let entry = |port: u16, udp: bool| crate::admin::NewEntry {
+            role: Role::Public,
+            peer: "127.0.0.1:1234".parse().unwrap(),
+            secret_id: None,
+            public_port: Some(port),
+            notes: None,
+            basic_auth: false,
+            https: false,
+            force_https: false,
+            carriers: 1,
+            auto_reconnect: false,
+            webserver_log: false,
+            udp,
+            vpn_relay_only: false,
+            vpn_pin_mtu: false,
+            vpn_mtu: None,
+            vpn_forward_accept: false,
+            vpn_nat_masquerade: false,
+            vpn_route_policy: None,
+            vpn_advertised: vec![],
+            vpn_nat_udp_port: None,
+            local_proxy_port: None,
+            local_host: None,
+            local_port: None,
+            nat_udp_preferred_port: None,
+            nat_udp_release_timeout: None,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
+            max_conns: None,
+            transport: crate::admin::Transport::Bore,
+            identity: None,
+        };
+        let _relay = admin.register(entry(21300, false));
+
+        let views = tunnels(&server);
+        let relay_view = views
+            .iter()
+            .find(|v| v.public_port == Some(21300))
+            .expect("the relay tunnel is listed");
+        assert_eq!(relay_view.current_path, "relay");
+        assert!(!relay_view.udp);
+
+        // A `--udp` tunnel whose direct path has not registered yet is the one
+        // case where the question genuinely has no answer, and it must keep
+        // saying so rather than claiming a relay it may never use.
+        let _direct = admin.register(entry(21301, true));
+
+        let views = tunnels(&server);
+        let udp_view = views
+            .iter()
+            .find(|v| v.public_port == Some(21301))
+            .expect("the udp tunnel is listed");
+        assert_eq!(udp_view.current_path, "unknown");
+    }
 
     #[test]
     fn config_view_names_the_running_build() {

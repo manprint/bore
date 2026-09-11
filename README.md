@@ -2464,7 +2464,10 @@ the Vhost and the Public Tunnels tables show a **Path** column that reads
 climbed during a total UDP blackout, which is precisely when an operator needs it
 to be honest. The per-tunnel `direct_fallbacks` matters because the server-wide
 metric of the same name cannot answer the question an operator actually asks,
-which is whether *this* tunnel is degraded.
+which is whether *this* tunnel is degraded. A tunnel that did **not** ask for
+`--udp` reads `relay`, not `unknown`: it has exactly one possible path and the
+server knows it. `unknown` means one thing only — a `--udp` tunnel that has not
+proxied a connection yet.
 
 **The same 3-second bound applies to a public `--udp` tunnel.** `bore local --udp`
 opens the direct stream for each inbound connection under the same deadline and

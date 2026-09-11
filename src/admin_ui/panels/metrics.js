@@ -197,6 +197,22 @@ export default {
             countsList.appendChild(budgetRef);
         }
 
+        // Direct-path admission slots still free. Shown whenever a budget is
+        // configured — `!= null`, not truthiness, because ZERO is the most
+        // important value this row can take: it means the budget is saturated
+        // and the next direct connection will take the relay. The configured
+        // TOTAL is a configuration value and lives on the Config panel; this
+        // is the live gauge (P-11).
+        if (data.udp_direct_slots_available !== undefined && data.udp_direct_slots_available !== null) {
+            const slots = document.createElement('div');
+            slots.className = 'count-row';
+            slots.innerHTML = `
+                <span class="count-label">Direct Slots Free</span>
+                <span class="count-value">${escapeHtml(String(data.udp_direct_slots_available))}</span>
+            `;
+            countsList.appendChild(slots);
+        }
+
         // Transport breakdown
         if (data.transport_bore !== undefined || data.transport_ssh !== undefined) {
             const transportLabel = document.createElement('div');

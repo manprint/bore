@@ -595,6 +595,14 @@ pub struct MetricsView {
     /// the warm TCP relay instead; no request fails. Always 0 when no budget is
     /// configured.
     pub direct_budget_refusals: u64,
+    /// Direct-path admission slots still FREE right now, when
+    /// `--udp-memory-budget` is configured (`None` when it is not, which is
+    /// the unbounded historical behaviour). The CONFIGURED total lives in
+    /// `ConfigView::udp_direct_slots`; this is the live gauge, and the pair
+    /// answers "is the budget saturated?" — a question `direct_budget_refusals`
+    /// can only answer after the fact.
+    #[serde(default)]
+    pub udp_direct_slots_available: Option<u32>,
     /// Server-side transmitted bytes per second (1s EWMA; 0 if sampler disabled).
     pub rate_tx_bps: u64,
     /// Server-side received bytes per second (1s EWMA; 0 if sampler disabled).
@@ -778,6 +786,7 @@ mod tests {
             conn_rejections: 0,
             direct_fallbacks: 0,
             direct_budget_refusals: 0,
+            udp_direct_slots_available: None,
             rate_tx_bps: 0,
             rate_rx_bps: 0,
             ts: 0,
@@ -808,6 +817,7 @@ mod tests {
             conn_rejections: 3,
             direct_fallbacks: 2,
             direct_budget_refusals: 5,
+            udp_direct_slots_available: Some(30),
             rate_tx_bps: 0,
             rate_rx_bps: 0,
             ts: 0,
@@ -820,6 +830,7 @@ mod tests {
         assert_eq!(json["conn_rejections"], 3);
         assert_eq!(json["direct_fallbacks"], 2);
         assert_eq!(json["direct_budget_refusals"], 5);
+        assert_eq!(json["udp_direct_slots_available"], 30);
     }
 
     #[test]

@@ -1,8 +1,17 @@
-# vhost staging performance campaign — re-runnable harness
+# Staging performance campaigns — re-runnable harness
 
-Everything needed to repeat the whole `bore vhost` performance and stability
-campaign against **any** deployment: the staging server it was first run on, a
-real pre-production server, a different region, a different instance size.
+Everything needed to repeat the `bore` performance and stability campaigns
+against **any** deployment: the staging server they were first run on, a real
+pre-production server, a different region, a different instance size.
+
+Two campaigns live here and share this file's topology, provisioning,
+samplers and traps:
+
+* **`bore vhost`** — the original campaign; everything below that does not say
+  otherwise is about it.
+* **`bore local` (public tunnels)** — `pub/`, with its own
+  [`README`](pub/README.md). Same three machines, same `env.sh`, same rules;
+  different origins (raw TCP, not HTTP) and its own driver.
 
 Nothing in this directory hardcodes a host, a domain, a key path or a
 credential. Re-pointing the campaign is one file (`env.sh`) plus one
@@ -77,6 +86,21 @@ the bound.
 > ICMP is blocked to most cloud hosts, so RTT comes from `curl
 > %{time_connect}`. Do **not** use `/usr/bin/time -f %e`: 10 ms resolution on a
 > ~19 ms value produced a suspiciously round 17.00 ms in an early run.
+
+### 3.1b The public-tunnel campaign
+
+```bash
+scripts/perf/staging/pub/run_campaign.sh   # one command: build proof, samplers,
+                                           # every VM stage serially, collection
+ssh <vm> '~/pub/pub_driver.sh'             # or drive the stages by hand
+ssh <vm> '~/pub/pub_driver.sh p1 conc eff' # or a subset
+scripts/perf/staging/pub/ws_pub.sh         # the workstation topology, afterwards
+scripts/perf/staging/pub/summarize.sh out/pub-<timestamp>
+```
+
+It is driven separately from the vhost stages below and must not overlap with
+them: they share one server and one allowance budget. See
+[`pub/README.md`](pub/README.md).
 
 ### 3.2 Same-region measurements (driven on the test VM)
 
@@ -232,6 +256,8 @@ do not "simplify" them back out.
 | `docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md` | the "after" campaign: paired before/after, bug verification, bottleneck per test |
 | `docs/performance/final_vhost_perf_review.md` | the same evidence in Italian, written to be readable by a non-specialist |
 | `docs/performance/CARRIER_TUNING.md` | the operator-facing tuning guide |
+| `docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md` | the public-tunnel campaign: defect register, paired transport A/B, flavours, concurrency, netem, CPU s/GiB, soak |
+| `docs/performance/final_public_perf_review.md` | the public-tunnel evidence in Italian, written to be readable by a non-specialist |
 
 Each of those names the exact script that produced each figure, so a number can
 always be traced back to a command in this directory.

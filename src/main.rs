@@ -2223,6 +2223,13 @@ async fn dispatch(command: Command) -> Result<()> {
             )?;
             server.set_admin_token(admin_token);
             server.set_control_hsts(&control_hsts);
+            // The `--max-conns` semaphore can only refuse gracefully while the
+            // process can still open a descriptor per admitted connection. Above
+            // the descriptor limit the kernel refuses first, with EMFILE, on
+            // EVERY listener — admin API included. Reconcile the two before the
+            // first listener is bound (campaign §11 measured the unreconciled
+            // case in the field).
+            bore_cli::fdlimit::reconcile_fd_limit(max_conns);
             server.set_max_conns(max_conns);
             server.set_max_carriers(max_carriers);
             let mut udp_tuning = parse_udp_tuning(

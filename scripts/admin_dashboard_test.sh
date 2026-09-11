@@ -532,6 +532,25 @@ fi
 [ "$metrics_ok" = "true" ] && pass "T-METACTIVE-E2E metrics active_connections + counters (>=0)" \
     || fail "T-METACTIVE-E2E missing/invalid counters; body=$BODY"
 
+# T-SLOTSFREE-E2E: /metrics carries udp_direct_slots_available (P-11). The KEY
+# must always be present — it is `null` on a server with no --udp-memory-budget
+# (this one) and a number when a budget is set — because the live gauge and the
+# CONFIGURED total on /config are read as a pair, and a silently absent key is
+# indistinguishable from a budget of zero. This server has no budget, so the
+# assertion is "present AND null", which is the stronger of the two.
+if $JQ_AVAIL; then
+    if echo "$BODY" | jq -e 'has("udp_direct_slots_available")
+                             and (.udp_direct_slots_available == null)' >/dev/null 2>&1; then
+        pass "T-SLOTSFREE-E2E metrics udp_direct_slots_available present and null (no budget)"
+    else
+        fail "T-SLOTSFREE-E2E udp_direct_slots_available missing or not null; body=$BODY"
+    fi
+else
+    echo "$BODY" | grep -q '"udp_direct_slots_available"' \
+        && pass "T-SLOTSFREE-E2E metrics has udp_direct_slots_available (grep)" \
+        || fail "T-SLOTSFREE-E2E udp_direct_slots_available missing; body=$BODY"
+fi
+
 # T-AUTHFAIL-E2E: make N=3 connection attempts with WRONG secret, which must fail
 # the handshake. Then GET /admin/api/v1/metrics and assert auth_failures >= 3.
 echo "  (making 3 failed auth attempts with wrong secret...)"

@@ -829,6 +829,7 @@ pub fn metrics(server: &Server) -> MetricsView {
         conn_rejections: server.conn_rejections(),
         direct_fallbacks: server.direct_fallbacks(),
         direct_budget_refusals: server.direct_budget_refusals(),
+        udp_direct_slots_available: server.udp_direct_slots_available().map(|n| n as u32),
         rate_tx_bps: server.rate_tx_bps(),
         rate_rx_bps: server.rate_rx_bps(),
         ts: std::time::SystemTime::now()
@@ -845,6 +846,50 @@ pub fn metrics(server: &Server) -> MetricsView {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    /// P-11: `/admin/api/v1/config` must publish the slot count the budget was
+    /// SIZED for, not the number still free. The two differ the moment any
+    /// direct connection is admitted, and an operator reading the config
+    /// endpoint to answer "how many slots did I configure?" would otherwise
+    /// get a number that moves with load — and reads 0 on a saturated server,
+    /// which looks exactly like "no budget at all".
+    ///
+    /// Red-check: point `Server::udp_direct_slots` back at
+    /// `available_permits()` and the second assertion fails with `8` vs `5`.
+    #[tokio::test]
+    async fn configured_direct_slots_do_not_move_with_load() {
+        let mut server = crate::server::Server::new(20000..=20000, None);
+        server.set_udp_direct_slots(Some(8));
+        assert_eq!(server.udp_direct_slots(), Some(8), "configured total");
+        assert_eq!(
+            server.udp_direct_slots_available(),
+            Some(8),
+            "nothing admitted yet, so the gauge starts at the total"
+        );
+
+        // Admit three connections' worth of budget and hold the permits.
+        let permits = server.udp_direct_permits_for_test();
+        let held: Vec<_> = (0..3)
+            .map(|_| {
+                std::sync::Arc::clone(permits.as_ref().unwrap())
+                    .try_acquire_owned()
+                    .expect("a fresh 8-slot budget has room for three")
+            })
+            .collect();
+
+        assert_eq!(
+            server.udp_direct_slots(),
+            Some(8),
+            "the CONFIGURED total is a configuration value and must not move"
+        );
+        assert_eq!(
+            server.udp_direct_slots_available(),
+            Some(5),
+            "the live gauge is the one that moves"
+        );
+        drop(held);
+        assert_eq!(server.udp_direct_slots_available(), Some(8));
+    }
 
     #[test]
     fn a_relay_only_public_tunnel_reports_the_relay_path_not_unknown() {
@@ -1381,6 +1426,7 @@ reservations:
             conn_rejections: 0,
             direct_fallbacks: 0,
             direct_budget_refusals: 0,
+            udp_direct_slots_available: None,
             rate_tx_bps: 0,
             rate_rx_bps: 0,
             ts: 0,

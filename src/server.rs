@@ -438,6 +438,15 @@ pub struct Server {
     /// on a clean network (F-8).
     udp_direct_permits: Option<Arc<Semaphore>>,
 
+    /// How many slots the budget was SIZED for, kept beside the semaphore
+    /// because `Semaphore` cannot report its own initial permit count and
+    /// `available_permits()` is a live gauge, not a configuration value
+    /// (P-11: `/admin/api/v1/config` used to publish the gauge under the
+    /// configuration's name, so an operator reading "how many slots did I
+    /// configure?" got an answer that changed with load and could read 0 on a
+    /// busy server).
+    udp_direct_slots_total: Option<usize>,
+
     /// Direct admissions refused for budget. Counted and logged, never silent —
     /// a number an operator can act on, unlike a silently shrinking window.
     direct_budget_refusals: Arc<AtomicU64>,
@@ -548,6 +557,7 @@ impl Server {
             conn_rejections: Arc::new(AtomicU64::new(0)),
             direct_fallbacks: Arc::new(AtomicU64::new(0)),
             udp_direct_permits: None,
+            udp_direct_slots_total: None,
             direct_budget_refusals: Arc::new(AtomicU64::new(0)),
 
             rate_tx_bps: Arc::new(AtomicU64::new(0)),
@@ -834,6 +844,7 @@ impl Server {
     /// caller can also report the plan's shortfall to the operator.
     pub fn set_udp_direct_slots(&mut self, slots: Option<usize>) {
         self.udp_direct_permits = slots.map(|n| Arc::new(Semaphore::new(n.max(1))));
+        self.udp_direct_slots_total = slots.map(|n| n.max(1));
     }
 
     /// Shared handle to the budget-refusal counter, so a test (or an embedder)
@@ -842,8 +853,24 @@ impl Server {
         Arc::clone(&self.direct_budget_refusals)
     }
 
-    /// Direct-path admission slots still free, if a budget was applied.
+    /// Direct-path admission slots the budget was SIZED for, if one was
+    /// applied. This is the configuration value and does not move with load —
+    /// see [`Server::udp_direct_slots_available`] for the live gauge.
     pub fn udp_direct_slots(&self) -> Option<usize> {
+        self.udp_direct_slots_total
+    }
+
+    /// The admission semaphore itself, for tests that need to hold permits.
+    #[cfg(test)]
+    pub(crate) fn udp_direct_permits_for_test(&self) -> Option<Arc<Semaphore>> {
+        self.udp_direct_permits.clone()
+    }
+
+    /// Direct-path admission slots still FREE right now, if a budget was
+    /// applied. A live gauge: it drops as connections are admitted and rises
+    /// as they close, so it belongs on `/admin/api/v1/metrics` beside
+    /// `direct_budget_refusals` and never in the config view.
+    pub fn udp_direct_slots_available(&self) -> Option<usize> {
         self.udp_direct_permits
             .as_ref()
             .map(|s| s.available_permits())
@@ -2566,6 +2593,19 @@ impl Server {
         loop {
             tokio::select! {
                 _ = heartbeat.tick() => {
+                    // This send is deliberately NOT bounded the way the CLIENT's
+                    // heartbeat is (`client::beat_once`, P-9), and the reason is
+                    // arithmetic rather than taste. A peer that never reads this
+                    // substream fills its 256 KiB yamux credit and then this
+                    // `send` blocks forever, which would also block the reap
+                    // check below it. `ServerMessage::Heartbeat` serializes to
+                    // ~15 bytes with its length delimiter, so exhausting the
+                    // credit takes ~17 000 frames, i.e. ~2.4 hours at the 500 ms
+                    // tick — 145x the 60 s reap deadline, which therefore always
+                    // fires first. IF `public_ctrl_timeout` IS EVER RAISED past
+                    // an hour, or this message ever grows, bound this send the
+                    // way `beat_once` does; until then a bound would add a
+                    // failure mode without removing one.
                     if control.send(ServerMessage::Heartbeat).await.is_err() {
                         // Assume that the client connection has been dropped.
                         return Ok(());

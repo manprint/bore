@@ -6,10 +6,19 @@
 # that exercises the consumer-side path a public tunnel actually serves.
 #
 # The numbers here are NOT comparable with the VM-side ones and must never be
-# quoted together: the vhost campaign established that this workstation's radio
-# link caps the path at ~45 MB/s regardless of the tunnel, so a slower number
-# here means the link, not the tunnel. What this topology is good for is
-# LATENCY, transport RATIOS, and proving the path works at all from outside AWS.
+# quoted together: the link is the bottleneck, not the tunnel. Measured, not
+# assumed — `pub/ws_conns.sh` showed a single connection already saturating it
+# (35.23 MB/s at one connection against 27.92 at four), so the aggregate does
+# not scale with connections and nothing in the tunnel is the bound. Note the
+# vhost campaign's ~45 MB/s figure for this radio link holds for DOWNLOAD only:
+# this stage measured 68-72 MB/s upload, with the instance's own allowance
+# counters at zero in both directions.
+#
+# What this topology is good for is LATENCY (the two medians agreed to 0.03 ms
+# over 80 probes each) and proving the path works at all from outside AWS. It is
+# NOT good for transport ratios: the eight download pairs span 0.694 to 2.607,
+# and the apparent direct-path win at four connections disappears when isolated
+# at one (median 0.943 over six pairs). Do not quote a ratio from this stage.
 set -uo pipefail
 . "$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
 
@@ -25,9 +34,41 @@ tsnap()   { adm tunnels | jq -c --argjson p "$1" '.[]|select(.public_port==$p)' 
 tfld()    { tsnap "$1" | jq -r --arg f "$2" '.[$f] // empty' 2>/dev/null; }
 pub_present() { adm tunnels | jq -e --argjson p "$1" 'any(.[]; .public_port==$p)' >/dev/null 2>&1; }
 
-# Start the raw origin on the VM once; it is idempotent.
-vm "pgrep -f 'raw_origin.py $RP' >/dev/null 2>&1 || \
+# Start the raw origin on the VM once; it is idempotent. But "already running"
+# is not the same as "running the CURRENT program": H-7 in this campaign had a
+# long-lived origin that predated an edit to its own source, and every arm that
+# used the new verb silently measured nothing. So reap it first when the process
+# is older than its script file — that PID only, never a pattern-wide pkill.
+#
+# TWO traps here, and H-12 in this campaign walked into both.
+#
+# 1. A remote `pgrep -f <name>` matches the `bash -c` that is running it, since
+#    the remote command string contains the name. Bracketing the PATTERN
+#    (`raw_origin.p[y]`) is only half the fix: it stops the pattern from
+#    matching its own text, but NOT from matching some other occurrence of the
+#    plain name in the same command — and the start command below contains
+#    `python3 $HOME/raw_origin.py $RP` for the obvious reason. So a
+#    `pgrep || start` one-liner ALWAYS believes the origin is already running,
+#    however carefully the pattern is bracketed, and never starts it.
+# 2. "A process matching this name exists" is the wrong question anyway. What
+#    the stage needs is "something is SERVING on that port", so the existence
+#    check is a real TCP connection to it. The reaper below still needs a PID,
+#    so it keeps a bracketed `pgrep` — safe because its own command text
+#    contains `raw_origin.py)` (from `stat`) and never `raw_origin.py $RP`.
+#
+# The symptom when this is wrong: the origin never starts, every arm still runs
+# and every arm reads `0.00 MB/s` — H-7's shape, a whole stage of zeros in the
+# exact format of a real measurement. The preflight further down now refuses to
+# measure in that state instead of publishing it.
+vm "pid=\$(pgrep -f 'raw_origin.p[y] $RP' | head -1); \
+    if [ -n \"\$pid\" ]; then \
+      age=\$(ps -o etimes= -p \$pid | tr -d ' '); \
+      fage=\$(( \$(date +%s) - \$(stat -c %Y \$HOME/raw_origin.py) )); \
+      [ \"\$age\" -gt \"\$fage\" ] && kill -9 \$pid; \
+    fi; true" >/dev/null 2>&1
+vm "timeout 2 bash -c '</dev/tcp/127.0.0.1/$RP' 2>/dev/null || \
     (setsid nohup python3 \$HOME/raw_origin.py $RP > \$HOME/out/raworigin.log 2>&1 </dev/null &); sleep 1; true" >/dev/null 2>&1
+echo "  origin on the VM: $(vm "timeout 2 bash -c '</dev/tcp/127.0.0.1/$RP' 2>/dev/null && pgrep -f 'raw_origin.p[y] $RP' | head -1 || echo 'NOT SERVING'" 2>/dev/null | tr -d '\r')"
 
 VM_UP=()
 vm_up() { # <public_port> <flags...>
@@ -54,12 +95,46 @@ RELAY="${PUB_WS_RELAY:-9021}"
 QUIC="${PUB_WS_QUIC:-9022}"
 
 say "workstation consumer -> AWS server -> VM forwarder"
-echo "  RTT to the gateway: $(ping -c 5 -q "$BORE_GW" 2>/dev/null | tail -1 | cut -d= -f2 || echo n/a)"
+# ICMP to the gateway may be filtered (it is, on this deployment), and a
+# `ping | cut` that silently yields an empty string is exactly the class of
+# harness lie this campaign keeps finding. Measure a TCP handshake to the
+# control port instead: it always works, it is the same first round trip every
+# arm below pays, and it cannot come back blank without saying so.
+echo "  TCP handshake RTT to the gateway: $(python3 -c '
+import socket, statistics, sys, time
+host, port = sys.argv[1], int(sys.argv[2])
+ms = []
+for _ in range(5):
+    t0 = time.perf_counter()
+    try:
+        s = socket.create_connection((host, port), timeout=5)
+        ms.append((time.perf_counter() - t0) * 1000.0)
+        s.close()
+    except OSError as err:
+        print("unreachable (%s)" % err)
+        raise SystemExit(0)
+    time.sleep(0.2)
+print("min=%.2fms median=%.2fms max=%.2fms" % (min(ms), statistics.median(ms), max(ms)))
+' "$BORE_GW" "${BORE_CTRL_PORT:-443}" 2>&1)"
 
 vm_up "$RELAY" $CARR        || { echo "relay arm failed to register"; exit 1; }
 vm_up "$QUIC"  $CARR --udp  || { echo "quic arm failed to register"; exit 1; }
-python3 "$RAWCLI" get "$BORE_GW" "$RELAY" 1048576 1 >/dev/null 2>&1
-python3 "$RAWCLI" get "$BORE_GW" "$QUIC"  1048576 1 >/dev/null 2>&1
+# The warm-up is also the PREFLIGHT, and it is parsed rather than discarded.
+# A registered tunnel proves the CONTROL path, not the DATA path: with nothing
+# listening on the forwarder's local port every arm still runs and every arm
+# reads 0.00 MB/s — H-7's shape, and how H-12 wasted a whole stage. So refuse
+# to measure until both transports have actually moved bytes.
+for warm in "$RELAY" "$QUIC"; do
+    got=$(python3 "$RAWCLI" get "$BORE_GW" "$warm" 1048576 1 2>&1 | tr -d '\r')
+    echo "  preflight port=$warm: $got"
+    case "$got" in
+        *"bytes=0 "*|"")
+            echo "PREFLIGHT FAILED on port $warm: registered, but it moved no bytes."
+            echo "  The usual cause is no raw origin on the VM. Check it with:"
+            echo "    pgrep -af 'raw_origin.p[y] $RP'"
+            exit 2 ;;
+    esac
+done
 echo "  relay=$RELAY quic=$QUIC path=$(tfld "$QUIC" current_path) pool=$(tfld "$QUIC" direct_pool)"
 
 echo

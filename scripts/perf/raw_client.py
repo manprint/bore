@@ -7,10 +7,17 @@ without jq:
     bytes=<total> secs=<wall> MBs=<MiB/s> Mbit=<Mbit/s> conns=<n> errs=<n>
 
 Usage:
-    raw_client.py get  <host> <port> <bytes-per-conn> [conns] [timeout]
-    raw_client.py put  <host> <port> <bytes-per-conn> [conns] [timeout]
+    raw_client.py get  <host> <port> <bytes-per-conn> [conns] [timeout] [window]
+    raw_client.py put  <host> <port> <bytes-per-conn> [conns] [timeout] [window]
     raw_client.py ping <host> <port> <count>            [conns] [timeout]
     raw_client.py hold <host> <port> <seconds>          [conns] [timeout]
+
+`window` (get/put only, seconds, 0 = off) caps the measurement in TIME instead
+of in bytes: ask for far more than can be moved, and after `window` seconds the
+transfers are cut and the bytes that DID move are reported. Without it the only
+way to bound a run is an external `timeout`, which kills the process before it
+prints anything — the run then reads as `bytes=0`, which is how harness defect
+H-8 turned the whole CPU-efficiency stage into zeros.
 
 `get`/`put` report aggregate throughput across `conns` parallel connections,
 which is the only honest way to read a tunnel: a single TCP flow is bounded by
@@ -38,8 +45,13 @@ import time
 
 CHUNK = b"\0" * (1 << 20)
 
+# Bytes moved so far, per connection index. Read by the windowed path after it
+# cancels a transfer mid-flight: a cancelled task has no return value, and the
+# bytes it did move are exactly what the measurement is about.
+PROGRESS = {}
 
-async def one_get(host, port, n, timeout):
+
+async def one_get(host, port, n, timeout, key=None):
     r, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
     s = w.get_extra_info("socket")
     if s is not None:
@@ -52,11 +64,13 @@ async def one_get(host, port, n, timeout):
         if not buf:
             break
         got += len(buf)
+        if key is not None:
+            PROGRESS[key] = got
     w.close()
     return got
 
 
-async def one_put(host, port, n, timeout):
+async def one_put(host, port, n, timeout, key=None):
     r, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
     s = w.get_extra_info("socket")
     if s is not None:
@@ -71,6 +85,8 @@ async def one_put(host, port, n, timeout):
         w.write(take)
         left -= len(take)
         await w.drain()
+        if key is not None:
+            PROGRESS[key] = n - left
     ack = await asyncio.wait_for(r.readline(), timeout)
     w.close()
     # The origin echoes how many bytes it actually received; trust IT, not the
@@ -109,6 +125,7 @@ async def main():
     n = int(sys.argv[4])
     conns = int(sys.argv[5]) if len(sys.argv) > 5 else 1
     timeout = float(sys.argv[6]) if len(sys.argv) > 6 else 120.0
+    window = float(sys.argv[7]) if len(sys.argv) > 7 else 0.0
 
     if mode == "ping":
         lat, errs = [], 0
@@ -159,11 +176,35 @@ async def main():
 
     fn = one_get if mode == "get" else one_put
     t0 = time.monotonic()
-    res = await asyncio.gather(*[fn(host, port, n, timeout) for _ in range(conns)],
-                               return_exceptions=True)
-    secs = time.monotonic() - t0
-    total = sum(x for x in res if isinstance(x, int))
-    errs = sum(1 for x in res if not isinstance(x, int))
+    if window > 0:
+        tasks = {asyncio.create_task(fn(host, port, n, timeout, i)): i
+                 for i in range(conns)}
+        done, pending = await asyncio.wait(tasks.keys(), timeout=window)
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        secs = time.monotonic() - t0
+        # A task that finished contributes its return value; one that was cut
+        # off contributes what it had moved when the window closed. A cut-off
+        # transfer is NOT an error — being cut off is the point.
+        total = sum(t.result() for t in done
+                    if not t.cancelled() and t.exception() is None)
+        total += sum(PROGRESS.get(tasks[t], 0) for t in pending)
+        # CAVEAT for a windowed PUT: a completed PUT is credited with the count
+        # the ORIGIN acknowledged, but a cut-off one can only be credited with
+        # what this process wrote, which includes whatever is still sitting in
+        # the socket and tunnel buffers (a few MiB). At the multi-GiB windows
+        # this option exists for that is well under 1 %; do not use a window of
+        # a second or two and then quote the PUT rate to three digits.
+        errs = sum(1 for t in done
+                   if not t.cancelled() and t.exception() is not None)
+    else:
+        res = await asyncio.gather(
+            *[fn(host, port, n, timeout) for _ in range(conns)],
+            return_exceptions=True)
+        secs = time.monotonic() - t0
+        total = sum(x for x in res if isinstance(x, int))
+        errs = sum(1 for x in res if not isinstance(x, int))
     print("bytes=%d secs=%.3f MBs=%.2f Mbit=%.0f conns=%d errs=%d" % (
         total, secs, total / 1048576.0 / secs, total * 8 / 1e6 / secs, conns, errs))
 

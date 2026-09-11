@@ -25,6 +25,13 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/publib.sh"
 
+# The ladder holds up to 512 sockets in ONE process while the probe opens more.
+# The VM's default soft limit is 1024 descriptors, which the top rung comes
+# close enough to that a slightly longer ladder would start reporting
+# connection errors that look like a server refusing connections. Raise the
+# soft limit (the hard limit is 524288) rather than discover it as data.
+ulimit -n 8192 2>/dev/null || true
+
 LADDER="${LADDER:-16 64 128 256 512}"
 PROBES="${PROBES:-30}"
 
@@ -55,6 +62,25 @@ hold_and_probe() { # <public_port> <n>
     echo "held=$n up=${up:-?} active_at_server=${act:-?} $res"
 }
 
+# A rung must start from a QUIET tunnel, or it measures the sum of itself and
+# whatever the previous rung left behind. H-9: the origin used to park on a
+# sleep instead of a read, so a killed driver left the origin's half open and
+# `active_at_server` read 80 / 208 / 464 at the 64 / 128 / 256 rungs. Both ends
+# are fixed, and this is the guard that keeps it fixed: wait for the server's
+# own count to fall back to zero, and SAY SO when it does not, rather than
+# quietly publishing a cumulative number.
+wait_quiet() { # <public_port>
+    local p="$1" i a
+    for i in $(seq 60); do
+        a=$(tfld "$p" active)
+        [ "${a:-0}" = 0 ] && return 0
+        sleep 1
+    done
+    echo "  WARNING: $(tfld "$p" active) connections still active at the server;" \
+         "the next rung would measure the sum, not the rung"
+    return 1
+}
+
 for mode in relay quic; do
     flags="--carriers 1"; [ "$mode" = quic ] && flags="--carriers 1 --udp"
     echo
@@ -65,7 +91,7 @@ for mode in relay quic; do
     echo "  baseline (nothing held): $(raw_ping "$p" "$PROBES")"
     for n in $LADDER; do
         echo "  $(hold_and_probe "$p" "$n")"
-        sleep 5
+        wait_quiet "$p"
     done
     echo "  path=$(tfld "$p" current_path) opens=$(tfld "$p" direct_stream_opens) fb=$(tfld "$p" direct_fallbacks)"
     down "$pid" "$p"
@@ -77,13 +103,25 @@ echo "===== P6b carriers under concurrency (relay only) ====="
 echo "  The carrier pool exists to break yamux head-of-line blocking. If it"
 echo "  does anything for public tunnels, it must show up HERE and not in the"
 echo "  single-stream ladder."
-for c in 1 4 8; do
-    if up_native "$RP" 0 --carriers "$c"; then
-        p="$LASTPORT"; pid="$LASTPID"
-        python3 "$RAWCLI" get "$GW" "$p" 1048576 1 >/dev/null 2>&1
-        echo "  carriers=$c $(hold_and_probe "$p" 128)"
-        down "$pid" "$p"
-        sleep 10
-    else echo "  carriers=$c REGISTRATION FAILED"; fi
+#
+# TWO rounds in OPPOSITE order, because a fixed order makes the FIRST arm pay
+# whatever the previous stage left in the instance's allowance bucket. The
+# first version of this arm ran 1, 4, 8 once and read carriers=1 at 9.956 ms
+# against 4.661 and 4.804 — while the ladder above, at the same 128 held
+# connections and the same single carrier, read 4.617 ms. Two numbers for one
+# configuration means the ORDER was being measured, which is exactly the trap
+# §4's paired-comparison rule exists for.
+for round in 1 2; do
+    order="1 4 8"; [ "$round" = 2 ] && order="8 4 1"
+    for c in $order; do
+        if up_native "$RP" 0 --carriers "$c"; then
+            p="$LASTPORT"; pid="$LASTPID"
+            python3 "$RAWCLI" get "$GW" "$p" 1048576 1 >/dev/null 2>&1
+            echo "  round=$round carriers=$c $(hold_and_probe "$p" 128)"
+            wait_quiet "$p"
+            down "$pid" "$p"
+            sleep 10
+        else echo "  round=$round carriers=$c REGISTRATION FAILED"; fi
+    done
 done
 echo DONE

@@ -1,9 +1,17 @@
-# vhost performance and stability campaign
+# Performance and stability campaigns
 
-The harness behind
-`docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md`. Read section 9 of that
-document first — it is the runbook, including how to provision the measurement
-VM and why a same-region VM is mandatory rather than convenient.
+Two campaigns share this directory and most of its plumbing:
+
+* **vhost** — `docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md`. Read
+  section 9 of that document first: it is the runbook, including how to
+  provision the measurement VM and why a same-region VM is mandatory rather
+  than convenient.
+* **public tunnels** (`bore local`) —
+  `docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md`, with the Italian
+  write-up in `docs/performance/final_public_perf_review.md`. Its harness lives
+  in `staging/pub/` and has its own
+  [`README`](staging/pub/README.md); the method is inherited from the vhost
+  campaign unchanged and the traps below apply to it verbatim.
 
 ## Credentials
 
@@ -41,6 +49,10 @@ The scripts that reach the server host over ssh additionally need
 | `../vhost_h2_page_load.sh` | workstation, **root** | `sudo -n /abs/path/scripts/vhost_h2_page_load.sh [rtt-list] [runs] [large-bytes] [small-count]`. Phase 07.1: full page load versus RTT, h1-through-tunnel / h1-direct / h2-direct. **Needs no deployment access.** Lives in `scripts/` (not here) because NOPASSWD sudo is per exact path and the glob does not cross `/` |
 | `vhost_idle_window.sh` | any Linux host, **no root, no deployment** | `ladder` (default) \| `server-only` \| `loss` \| `one` \| `all`. F-14 regression gate: runs a server, a provider and an origin inside a rootless netns (`unshare -rn`), proves the direct path from `direct_stream_opens`, blackholes the QUIC port in both directions and times the loss window. `ladder` asserts the window tracks `BORE_DIRECT_QUIC_IDLE_MS` and that request #2 is served on the warm relay |
 | `staging/` | see `staging/README.md` | the **whole staging campaign**, 41 scripts, one reference compose, coordinate-free: `provision.sh` bootstraps both remote hosts from one `env.sh`, then `vm/`, `ws/`, `srv/` and `res/` hold the harnesses that produced `docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md` |
+| `public_idle_window.sh` | any Linux host, **no root, no deployment** | `all` (default) \| `deadline` \| `ladder` \| `idle` \| `recover` \| `quicport` \| `healthy` \| `relaypath` \| `fdbudget`. The public-tunnel twin of `vhost_idle_window.sh` and the regression gate for P-1, P-6, P-7, P-8, P-10 and P-12. Runs a server, a `bore local` client and an origin inside a rootless netns (`unshare -rn`), so the UDP blackhole is a real kernel drop. `healthy` puts its `netem` loss on the QUIC PORT ONLY (a `prio` qdisc plus two `u32` filters) and asserts netem's own `sent_pkt`/`dropped` counters: whole-loopback loss also degraded the client's dial of the local origin, which is bounded at `NETWORK_TIMEOUT` 3 s, and made the arm flake on something it does not claim (H-11). `BORE_PUB_KEEP_RUN=1` keeps each arm's server and client logs and prints the path; `BORE_PUB_HEALTHY_LOSS="30"` narrows `healthy` to the named cells |
+| `raw_origin.py` | measurement VM | `raw_origin.py <port>`. Raw-TCP origin for the public campaign: `GET n`, `PUT n`, `PING`, `ECHO`, `HOLD s`. A public tunnel forwards arbitrary TCP, so measuring it through an HTTP origin would fold HTTP parsing into the result. `HOLD` answers once and then moves no bytes, which is what a concurrency ladder needs; it parks on a READ so the connection is released the instant its client goes away (H-9: parking on a sleep made consecutive ladder rungs cumulative) |
+| `raw_client.py` | measurement VM, workstation | `get\|put\|ping\|hold <host> <port> <n> [conns] [timeout] [window]`. The matching driver. `hold` opens all N connections from ONE asyncio process and prints `up=` before it sleeps, so the caller can compare what it holds with what the server reports. `window` (get/put) bounds a run in TIME — ask for more than can be moved and read what did move; bounding it with an external `timeout` instead kills the process before it prints and reads as `bytes=0` (defect H-8) |
+| `staging/pub/` | see `staging/pub/README.md` | the **public-tunnel campaign**: paired transport A/B, carrier ladder, latency, HTTP, the three forwarder flavours rotated, the concurrency ladder, the netem matrix, CPU s/GiB and the soak |
 | `server_ena_sample.sh` | workstation | `N IV`. AWS ENA instance-allowance counters (`bw_*_allowance_exceeded`, `pps_allowance_exceeded`) plus `/proc/net/dev`. Needs `sudo -n ethtool` on the server |
 
 Run `server_cpu_sample.sh` **concurrently** with whichever suite you care about;

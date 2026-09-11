@@ -671,6 +671,7 @@ fn t_views_serialize_stable() {
         conn_rejections: 0,
         direct_fallbacks: 0,
         direct_budget_refusals: 0,
+        udp_direct_slots_available: None,
         rate_tx_bps: 0,
         rate_rx_bps: 0,
         ts: 0,

@@ -373,6 +373,27 @@ default. **`--udp` is not a bandwidth upgrade**: against a real file server the 
 faster on small requests (93.93 vs 103.74 ms p50), equal or better on sustained bulk, about
 half the CPU per GiB, and 36× cheaper in cloud-instance network allowance. Turn it on for
 many simultaneously held connections (14 ms vs 1436 ms behind 512) or for lossy paths (2.7×).
+
+**Measured recommendation for a PUBLIC tunnel (`bore local`), staging 2026-09-11.** The
+numbers are NOT the same as vhost's above, and the difference is not noise — see
+[`docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md`](docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md).
+
+| workload | setting | measured |
+| --- | --- | --- |
+| several concurrent connections (a browser, parallel transfers) | `--carriers 4` | 4 concurrent transfers: **303.60 MB/s** down at 4 carriers against 210.25 at 1 (**1.44×**); upload peaks at 2 (**229.30** against 154.90, 1.48×) |
+| one big transfer at a time | `--carriers 1` (default) | a single flow rides one carrier whatever N is; the extra sockets only cost |
+| — | `--carriers 8` | worse than 4 in BOTH directions — the server's two vCPUs and the instance allowance become the bound |
+
+Why the sign differs from vhost: the vhost ladder moved ONE bulk flow (one carrier used, the
+rest idle overhead), the public ladder moves FOUR concurrent connections, which the server
+actually spreads. Match the setting to the concurrency, not to the transport.
+
+**`--udp` on a public tunnel is not a bandwidth upgrade either.** On a clean in-region path
+the TCP relay won all ten paired runs — median **1.51×** on download, **1.34×** on upload —
+and won the small-request tail as well (p95/p99 **6.23/8.77 ms** relay against 10.76/17.79 ms
+direct). It pays off where the relay cannot compete: at 32 concurrent HTTP connections the
+direct path took the tail (p95 3.48 vs 4.58 ms, p99 3.96 vs 7.27 ms), and on a lossy path it
+is the one that keeps serving.
 Full evidence:
 [`docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md`](docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md),
 and in Italian
@@ -399,7 +420,7 @@ requested pair would not (`max_idle >= 3 × keepalive`), and warns when it does 
 value in force can differ from the value requested, and both `direct_quic_keepalive_ms`
 and `direct_quic_idle_ms` are published on `GET /admin/api/v1/config`.
 
-**Reading what is actually in force:** `GET /admin/api/v1/config` derives the whole direct-UDP block from the tuning installed on the server rather than restating the CLI strings, because `--udp-memory-budget` computes the three windows from one number after startup. `udp_direct_slots` reports the aggregate admission bound the budget derived (`null` = no budget, the historical unbounded path).
+**Reading what is actually in force:** `GET /admin/api/v1/config` derives the whole direct-UDP block from the tuning installed on the server rather than restating the CLI strings, because `--udp-memory-budget` computes the three windows from one number after startup. `udp_direct_slots` reports the aggregate admission bound the budget derived (`null` = no budget, the historical unbounded path) — the CONFIGURED total, which does not move with load; the live "how many are free right now" gauge is `udp_direct_slots_available` on `/admin/api/v1/metrics`.
 
 For bulk transfers, the direct QUIC path is tuned in code with larger flow-control windows
 than Quinn's defaults: `DIRECT_QUIC_STREAM_RECEIVE_WINDOW` (16 MiB),
@@ -514,9 +535,17 @@ Slots are then `budget / connection_window`, which is the exact aggregate bound.
 
 A direct connection beyond the last slot is **refused, not failed**: that carrier stays on
 the warm TCP relay, which F-8 measured as the faster transport on a clean path anyway. Each
-refusal is logged and counted in `/admin/api/v1/metrics` as `direct_budget_refusals`. A
+refusal is logged and counted in `/admin/api/v1/metrics` as `direct_budget_refusals`. That
+counter is history — how many carriers have been turned away since the server started — so
+the same endpoint also publishes `udp_direct_slots_available`, the number of slots free
+**right now** (`null` when no budget is configured). Read the two together: refusals rising
+with the gauge at 0 means the budget is the bound; refusals rising with slots free means
+they were taken and released. The CONFIGURED total is a separate thing and lives on
+`/admin/api/v1/config` as `udp_direct_slots`, where it never moves with load. A
 budget too small to hold every carrier is still honoured, and says so at startup with the
-figure that would hold them all. The flag conflicts with `--udp-stream-receive-window`,
+figure that would hold them all — note that the figure it names raises the BUDGET, and on a
+small host the practical remedy is usually the other side of the same inequality, a lower
+`--max-carriers`. The flag conflicts with `--udp-stream-receive-window`,
 `--udp-connection-receive-window` and `--udp-send-window`, because honouring both would mean
 silently discarding one.
 
@@ -652,6 +681,23 @@ Core:
   -s, --secret <SECRET>          Optional secret for client authentication [env: BORE_SECRET=]
       --max-conns <N>            Max concurrently proxied connections per client [env: BORE_MAX_CONNS=] [default: 1024]
       --max-carriers <N>         Max parallel TCP carriers a public/provider/vhost tunnel may use (1 disables the pool). Does not cap bore proxy's own carriers. [env: BORE_MAX_CARRIERS=] [default: 16]
+
+> **`--max-conns` and the file-descriptor limit.** Each admitted connection
+> costs one descriptor, so the bound can only refuse *gracefully* (one
+> connection dropped, `conn_rejections` incremented, everything else still
+> served) while `RLIMIT_NOFILE` covers it. Above the descriptor limit the
+> kernel refuses first, with `EMFILE`, and `EMFILE` lands on `accept()` for
+> **every** listener — so one tunnel's concurrency takes the admin API and
+> every other tunnel down with it. At startup `bore server` therefore raises
+> its own soft limit to `--max-conns + 256` when the hard limit allows
+> (`raised the file-descriptor limit …` at `INFO`), and when the hard limit is
+> itself too low it raises to the ceiling and **warns** with the remedy. If you
+> see that warning, raise the limit for the process — Docker Compose
+> `ulimits: { nofile: { soft: 65536, hard: 65536 } }`, systemd
+> `LimitNOFILE=65536` — or lower `--max-conns`. Measured: a container with
+> `--max-conns 1024` and a soft limit of 1024 stopped answering on its control
+> port for ~30 s under ~976 held connections through one public tunnel, with
+> `conn_rejections` still at 0.
       --control-port <PORT>      TCP port the control connection listens on [env: BORE_CONTROL_PORT=] [default: 7835]
       --bind-domain <DOMAIN>     Public domain advertised to clients (informational) [env: BORE_BIND_DOMAIN=]
       --cert-file <PATH>        TLS certificate chain (PEM); with --key-file, serves HTTPS [env: BORE_CERT_FILE=]

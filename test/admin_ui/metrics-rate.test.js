@@ -101,3 +101,29 @@ test('metrics panel omits optional counters/transport when absent', async () => 
     assert.ok(!txt.includes('Auth Failures'), 'no Auth Failures row when field absent');
     assert.ok(!txt.includes('Transport Breakdown'), 'no transport breakdown when fields absent');
 });
+
+/**
+ * P-11: the direct-path admission budget is reported as a PAIR — the
+ * configured total on the Config panel, the live free count here. The row must
+ * appear whenever a budget is configured, and ZERO is the value that matters
+ * most: it means the budget is saturated and the next direct connection takes
+ * the relay. A truthiness check would hide exactly that case.
+ */
+test('T-SLOTSFREE: the live direct-slot gauge renders, and zero is not hidden', async () => {
+    const el = document.createElement('div');
+    await metricsPanel.render(el, { ...base, udp_direct_slots_available: 30 });
+    assert.ok(allText(el).includes('Direct Slots Free'), 'has the label');
+    assert.ok(/Direct Slots Free[\s\S]*?30/.test(allText(el)), 'renders the value');
+
+    const zero = document.createElement('div');
+    await metricsPanel.render(zero, { ...base, udp_direct_slots_available: 0 });
+    assert.ok(allText(zero).includes('Direct Slots Free'),
+        'a saturated budget (0 free) must still render — it is the alarming case');
+});
+
+test('T-SLOTSFREE: a server with no budget renders no slot row at all', async () => {
+    const el = document.createElement('div');
+    await metricsPanel.render(el, { ...base });
+    assert.ok(!allText(el).includes('Direct Slots Free'),
+        'an always-absent value must not produce an empty row');
+});

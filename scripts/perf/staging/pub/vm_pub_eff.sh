@@ -29,10 +29,17 @@ case_run() { # <tag> <flags...>
     sleep 4                      # let the sampler see an idle baseline first
     local t0 out t1
     t0=$(date +%s)
-    # Ask for far more than can be moved in the window and cut it off by
-    # timeout: the window is then exactly SECS for every case, and the byte
-    # count is whatever the path managed.
-    out=$(timeout $((SECS + 10)) python3 "$RAWCLI" get "$GW" "$p" $((8 * 1073741824)) "$CONNS" "$SECS" 2>/dev/null)
+    # Ask for far more than can be moved in the window and cut it off IN THE
+    # CLIENT (the 7th argument), so the window is exactly SECS for every case
+    # and the byte count is whatever the path managed.
+    #
+    # H-8: this used to pass SECS as the 6th argument — which is the per-socket
+    # TIMEOUT, not a window — and bound the run with an external `timeout`.
+    # An external kill gives the client no chance to print, so every case
+    # reported `bytes=0`: the whole stage produced zeros that looked like
+    # measurements. The outer `timeout` stays as a backstop only, generously
+    # above the window.
+    out=$(timeout $((SECS + 30)) python3 "$RAWCLI" get "$GW" "$p" $((8 * 1073741824)) "$CONNS" 120 "$SECS" 2>/dev/null)
     t1=$(date +%s)
     local by; by=$(printf '%s' "$out" | grep -oE 'bytes=[0-9]+' | cut -d= -f2)
     local path; path=$(tfld "$p" current_path)

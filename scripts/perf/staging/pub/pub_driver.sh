@@ -19,14 +19,15 @@ run() {
     sleep 20
 }
 
-STAGES="${*:-p1 p2 flavours conc netem eff stab}"
+STAGES="${*:-p1 p2 flavours flavours_udp conc netem eff stab}"
 for s in $STAGES; do
   case "$s" in
     p1)       run pub_ab_p1     "$HERE/vm_pub_ab.sh" p1 ;;
     p2)       run pub_ab_p2     "$HERE/vm_pub_ab.sh" p2 ;;
     p3)       run pub_ab_p3     "$HERE/vm_pub_ab.sh" p3 ;;
     p4)       run pub_ab_p4     "$HERE/vm_pub_ab.sh" p4 ;;
-    flavours) run pub_flavours  "$HERE/vm_pub_flavours.sh" ;;
+    flavours) run pub_flavours  "$HERE/vm_pub_flavours.sh" relay ;;
+    flavours_udp) run pub_flavours_udp "$HERE/vm_pub_flavours.sh" udp ;;
     conc)     run pub_conc      "$HERE/vm_pub_conc.sh" ;;
     netem)    run pub_netem     "$HERE/vm_pub_netem.sh" ;;
     eff)      run pub_eff       "$HERE/vm_pub_eff.sh" ;;

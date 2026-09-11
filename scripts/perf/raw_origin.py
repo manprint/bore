@@ -68,7 +68,21 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
             # the server has not actually wired up yet.
             writer.write(b"H\n")
             await writer.drain()
-            await asyncio.sleep(min(float(parts[1]), 3600.0))
+            # Park on a READ, never on a bare sleep (harness defect H-9).
+            # A ladder rung ends by killing its driver process, which closes
+            # the client side; a sleeping origin keeps ITS side open for the
+            # rest of the hold, the server's proxied connection stays
+            # half-open, and the next rung measures the SUM of both rungs.
+            # Measured: `active_at_server` read 80 at the 64 rung, 208 at 128
+            # and 464 at 256 — cumulative, not concurrent. A read returns
+            # b"" the instant the peer goes away, so the connection is
+            # released with it and the rungs are independent.
+            try:
+                await asyncio.wait_for(
+                    reader.read(1), timeout=min(float(parts[1]), 3600.0)
+                )
+            except asyncio.TimeoutError:
+                pass
 
         elif verb == b"GET" and len(parts) == 2:
             n = min(int(parts[1]), MAX)

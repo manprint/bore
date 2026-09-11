@@ -13,34 +13,62 @@
 # The SSH leg is TCP-relay-only by design (I-SSH2: no --udp, no --carriers>1),
 # so it is compared against the native/docker RELAY arms and never against
 # their QUIC arms. That is a property of the transport, not a defect.
+#
+# TWO MODES, because the campaign has to answer the flavour question on BOTH
+# transports and the answer cannot be assumed to carry over:
+#
+#   relay (default)  native vs docker vs OpenSSH -R, all on the TCP relay
+#   udp              native vs docker, both on the QUIC direct path
+#
+# The `udp` mode exists because the dockerized client is NOT equivalent to the
+# native one there: Docker clears every capability for a non-root UID, so the
+# default uid-1000 image cannot call SO_*BUFFORCE and its direct UDP socket
+# stays clamped to net.core.{r,w}mem_max. That is why this harness runs the
+# ROOT image (`ghcr.io/manprint/bore:client`) — and why "docker and native are
+# the same" has to be MEASURED on the direct path, not inherited from the
+# relay result.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/publib.sh"
 
+MODE="${1:-relay}"
 ROUNDS="${ROUNDS:-3}"
 CONNS="${CONNS:-4}"
 MB="${MB:-96}"
 CARR="${CARR:---carriers 8}"
 PER=$(( MB * 1048576 / CONNS ))
 
-# One fixed public port per flavour so all three can be live simultaneously.
-declare -A PORTS=( [native]="${PUB_NATIVE:-9001}" [docker]="${PUB_DOCKER:-9002}" [ssh]="${PUB_SSH:-9003}" )
+case "$MODE" in
+relay)
+    FLAVOURS=(native docker ssh)
+    UDPFLAG=""
+    declare -A PORTS=( [native]="${PUB_NATIVE:-9001}" [docker]="${PUB_DOCKER:-9002}" [ssh]="${PUB_SSH:-9003}" )
+    ;;
+udp)
+    # Distinct ports so a udp run can never be confused with, or collide
+    # against, a relay arm that is still registered.
+    FLAVOURS=(native docker)
+    UDPFLAG="--udp"
+    declare -A PORTS=( [native]="${PUB_NATIVE_UDP:-9004}" [docker]="${PUB_DOCKER_UDP:-9005}" )
+    ;;
+*)  echo "usage: $0 [relay|udp]" >&2; exit 2 ;;
+esac
 declare -A LIVE=()
 
 start_flavour() {
     local f="$1" p="${PORTS[$1]}"
     case "$f" in
     native)
-        setsid nohup "$BORE" local "$RP" --port "$p" --to "$BORE_TO" --secret "$BORE_SECRET" $CARR \
-            >"$OUT/fl-native.log" 2>&1 </dev/null & ;;
+        setsid nohup "$BORE" local "$RP" --port "$p" --to "$BORE_TO" --secret "$BORE_SECRET" $CARR $UDPFLAG \
+            >"$OUT/fl-native-$MODE.log" 2>&1 </dev/null & ;;
     docker)
         # --network host so the container reaches the origin on the VM's own
         # loopback; without it the forwarder would have to traverse the bridge
         # and the measurement would include a NAT hop the native arm never pays.
         setsid nohup sudo -n docker run --rm --name "bore-pub-$p" --network host \
             ghcr.io/manprint/bore:client local "$RP" --port "$p" \
-            --to "$BORE_TO" --secret "$BORE_SECRET" $CARR \
-            >"$OUT/fl-docker.log" 2>&1 </dev/null & ;;
+            --to "$BORE_TO" --secret "$BORE_SECRET" $CARR $UDPFLAG \
+            >"$OUT/fl-docker-$MODE.log" 2>&1 </dev/null & ;;
     ssh)
         # D1 naming heuristic: a BARE NUMERIC port on -R means a public tunnel.
         setsid nohup sshpass -p "$SSHGW_PASS" ssh -T -o StrictHostKeyChecking=no \
@@ -76,9 +104,15 @@ trap 'stop_flavours; cleanup; exit 130' INT TERM
 trap 'stop_flavours; cleanup' EXIT
 
 start_origins || exit 1
-say "flavour rotation: $ROUNDS rounds, ${MB} MiB over $CONNS conns per burst, ${COOL}s cooldown"
-echo "    carriers flag for native/docker: '$CARR' (the SSH leg is TCP-relay-only by design)"
-for f in native docker ssh; do start_flavour "$f"; done
+say "flavour rotation [$MODE]: $ROUNDS rounds, ${MB} MiB over $CONNS conns per burst, ${COOL}s cooldown"
+echo "    carriers flag for native/docker: '$CARR'${UDPFLAG:+ plus $UDPFLAG}"
+if [ "$MODE" = udp ]; then
+    echo "    the SSH leg is ABSENT from this mode on purpose: an SSH forward is"
+    echo "    TCP-relay-only by design (I-SSH2), so there is no QUIC arm to compare."
+else
+    echo "    (the SSH leg is TCP-relay-only by design)"
+fi
+for f in "${FLAVOURS[@]}"; do start_flavour "$f"; done
 [ "${#LIVE[@]}" -gt 0 ] || { echo "no flavour registered"; exit 1; }
 
 declare -A DL UP
@@ -91,20 +125,27 @@ for dir in get put; do
         line="    round $r: "
         # Rotate which flavour goes first so no arm is always measured into a
         # freshly-drained budget.
-        order=(native docker ssh)
-        shift_by=$(( (r - 1) % 3 ))
+        order=("${FLAVOURS[@]}")
+        shift_by=$(( (r - 1) % ${#FLAVOURS[@]} ))
         order=("${order[@]:$shift_by}" "${order[@]:0:$shift_by}")
         for f in "${order[@]}"; do
             [ -n "${LIVE[$f]:-}" ] || continue
             p="${LIVE[$f]}"
             if [ "$dir" = get ]; then v=$(raw_get "$p" "$PER" "$CONNS"); DL[$f]="${DL[$f]} ${v:-0}"
             else v=$(raw_put "$p" "$PER" "$CONNS"); UP[$f]="${UP[$f]} ${v:-0}"; fi
-            line="$line $f=${v:-0}"
+            # In udp mode the transport is part of the result, not an
+            # assumption: an arm that fell back is a RELAY number and must
+            # never be quoted as a QUIC one.
+            if [ "$MODE" = udp ]; then
+                line="$line $f=${v:-0}($(tfld "$p" current_path))"
+            else
+                line="$line $f=${v:-0}"
+            fi
             cool
         done
         echo "$line"
     done
-    for f in native docker ssh; do
+    for f in "${FLAVOURS[@]}"; do
         [ -n "${LIVE[$f]:-}" ] || continue
         if [ "$dir" = get ]; then vals="${DL[$f]}"; else vals="${UP[$f]}"; fi
         echo "    median $dir $f: $(printf '%s\n' $vals | med) MB/s"
@@ -113,14 +154,14 @@ done
 
 echo
 echo "  === latency, one new connection per probe ==="
-for f in native docker ssh; do
+for f in "${FLAVOURS[@]}"; do
     [ -n "${LIVE[$f]:-}" ] || continue
     echo "    $f: $(raw_ping "${LIVE[$f]}" 60)"
 done
 
 echo
 echo "  === server view at the end ==="
-for f in native docker ssh; do
+for f in "${FLAVOURS[@]}"; do
     [ -n "${LIVE[$f]:-}" ] || continue
     p="${LIVE[$f]}"
     echo "    $f port=$p $(tsnap "$p" | jq -r '"path=\(.current_path) carriers=\(.carriers) opens=\(.direct_stream_opens) fb=\(.direct_fallbacks) pool=\(.direct_pool) active=\(.active)"' 2>/dev/null)"

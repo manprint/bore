@@ -99,7 +99,7 @@ ssh-key = { version = "=0.7.0-rc.11", optional = true, features = ["rand_core"] 
 rand = { version = "0.10", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29.0", features = ["fs", "user", "socket"] }
+nix = { version = "0.29.0", features = ["fs", "user", "socket", "resource"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.18"

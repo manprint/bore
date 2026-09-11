@@ -17,7 +17,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../lib.sh"
 
-STAGES="${STAGES:-p1 p2 p3 p4 flavours conc netem eff stab}"
+STAGES="${STAGES:-p1 p2 p3 p4 flavours flavours_udp conc netem eff stab}"
 TS="$(date +%Y%m%d-%H%M%S)"
 DEST="$OUT/pub-$TS"
 mkdir -p "$DEST"

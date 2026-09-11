@@ -2713,7 +2713,6 @@ async fn connect_direct_inner(
         bail!("no peer candidates to connect to (fallback_reason=no-candidates)");
     }
     let started = Instant::now();
-    configure_udp_socket_buffers(&socket, &tuning);
     let local_addr = socket.local_addr().ok();
     info!(
         udp_local_addr = ?local_addr,
@@ -2979,7 +2978,6 @@ pub async fn vhost_connect(
         .len()
         .try_into()
         .context("vhost subdomain too long for QUIC auth frame")?;
-    configure_udp_socket_buffers(&socket, &tuning);
     let endpoint = client_endpoint(socket, &tuning)?;
     let conn = timeout(
         NETWORK_TIMEOUT,
@@ -3027,7 +3025,7 @@ impl DirectListener {
     /// opened by an authenticated connectivity-check round (plan Fase 2):
     /// no blind punch — the checks were the punch.
     pub fn from_checked_socket(socket: UdpSocket, tuning: UdpDirectTuning) -> Result<Self> {
-        configure_udp_socket_buffers(&socket, &tuning);
+        // Buffers are configured by `server_endpoint` itself (P-13).
         let endpoint = server_endpoint(socket, &tuning)?;
         Ok(DirectListener { endpoint })
     }
@@ -3040,7 +3038,6 @@ impl DirectListener {
     ) -> Result<Self> {
         let san = sanitize_candidates(&mut peers);
         log_dropped_candidates("direct_listener", peers.len(), &san);
-        configure_udp_socket_buffers(&socket, &tuning);
         let local_addr = socket.local_addr().ok();
         info!(
             udp_local_addr = ?local_addr,
@@ -3207,9 +3204,15 @@ pub async fn vhost_server_handshake(
 }
 
 /// Build a QUIC client endpoint over an already-bound UDP socket.
+///
+/// The socket buffers are configured HERE, not at the call sites, for the reason
+/// spelled out on [`server_endpoint`]: a QUIC endpoint over an untuned socket is
+/// a throughput defect that nothing reports, and the only way to make it
+/// unrepeatable is to make the constructor the single place that can grant one.
 #[cfg(feature = "udp")]
 fn client_endpoint(socket: UdpSocket, tuning: &UdpDirectTuning) -> Result<Endpoint> {
     let socket = into_std(socket)?;
+    configure_udp_socket_buffers(&socket, tuning);
     let mut endpoint = Endpoint::new(
         EndpointConfig::default(),
         None,
@@ -3224,9 +3227,32 @@ fn client_endpoint(socket: UdpSocket, tuning: &UdpDirectTuning) -> Result<Endpoi
 /// Build a QUIC server endpoint over an already-bound UDP socket. It also carries
 /// a default client config so it can fire outbound connections to punch its NAT
 /// toward reconnecting consumers (see [`DirectListener::punch_via_endpoint`]).
+///
+/// P-13: the socket buffers are configured HERE, inside the constructor, and not
+/// by the caller. They used to be the caller's job, and the ONE caller that is
+/// the server's own shared endpoint — `vhost_server_endpoint`, which serves the
+/// direct path of every vhost, public and ssh-jump tunnel on the process — never
+/// did it. That endpoint therefore ran on the kernel default
+/// (`net.core.rmem_default`, 212992 bytes on Debian/Ubuntu) while every OTHER
+/// UDP socket in this file asked for 16 MiB, and it is the RECEIVING side of
+/// every download: the bytes arrive from the provider over QUIC and leave over
+/// the public TCP socket. Measured on staging, 2026-09-11: `ss -uapm` reported
+/// `rb212992` on the live endpoint, the server received 3.885 GiB to deliver
+/// 2.279 GiB through it (1.78x — retransmission of what the socket dropped),
+/// goodput was 111 MB/s against the TCP relay's 213, and the direct path cost
+/// 13.58 CPU s/GiB against the relay's 5.35-7.04 with 2.9x the kernel softirq
+/// per delivered GiB. The doc comment on [`configure_udp_socket_buffers`] had
+/// described exactly this failure — "capped at ~buffer/RTT" — since it was
+/// written; the defect was that one socket never called it.
+///
+/// Putting the call in the constructor rather than adding a third call site is
+/// deliberate: it makes the invariant structural. No future endpoint can be
+/// built over an untuned socket, because there is no path to an `Endpoint` that
+/// does not pass through here.
 #[cfg(feature = "udp")]
 fn server_endpoint(socket: UdpSocket, tuning: &UdpDirectTuning) -> Result<Endpoint> {
     let socket = into_std(socket)?;
+    configure_udp_socket_buffers(&socket, tuning);
     let mut endpoint = Endpoint::new(
         EndpointConfig::default(),
         Some(server_config(tuning)?),

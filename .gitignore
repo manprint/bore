@@ -14,3 +14,8 @@ scripts/dev/push-boretestdev-arm64.local.sh
 .agents
 skills-lock.json
 .tokensave
+# Performance-campaign measurement output: `scripts/perf/staging/lib.sh`
+# defaults `OUT` to `$PWD/out`, so a harness run from the repository root
+# drops megabytes of raw samplers here. The evidence that matters is reduced
+# into docs/performance/; the raw streams are reproducible, not source.
+/out

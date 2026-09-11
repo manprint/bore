@@ -40,11 +40,37 @@ services:
       - BORE_AUTO_RECONNECT=true
       # Register as a named secret tunnel (no public port; reach via bore proxy):
       # - BORE_TCP_SECRET_ID=my-service
-      # Prefer a direct UDP hole-punched path to the consumer. Takes effect only
-      # together with BORE_TCP_SECRET_ID (secret-tunnel provider); ignored for a
-      # public-port tunnel. Falls back to the relay if it can't be established.
-      # Requires the server to run with BORE_UDP=true.
-      - BORE_PREFER_UDP=true
+      # Prefer a direct UDP path instead of the TCP relay. Falls back to the
+      # relay if it cannot be established. Requires the server to run with
+      # BORE_UDP=true. TWO different mechanisms share this one flag:
+      #   * with BORE_TCP_SECRET_ID (secret-tunnel provider): UDP hole-punch to
+      #     the consumer;
+      #   * on a PUBLIC-port tunnel (`bore local`, no secret id): server->client
+      #     QUIC direct to the server's BORE_VHOST_QUIC_PORT, no hole-punch.
+      #     It is NOT ignored here -- it used to be, before the public `--udp`
+      #     path existed, and this comment said so.
+      #
+      # MEASURED RECOMMENDATION for a PUBLIC tunnel (staging campaign
+      # 2026-09-11, docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md):
+      # leave it OFF unless you have one of the two problems it solves. On a
+      # clean in-region path the TCP relay beat QUIC direct in every one of ten
+      # paired runs -- median 1.51x on download and 1.34x on upload -- and it
+      # also won the p95/p99 of a small-request latency probe
+      # (6.23/8.77 ms relay against 10.76/17.79 ms direct).
+      # Turn it ON when:
+      #   * many connections are held open at once -- at 32 concurrent HTTP
+      #     connections the direct path won the tail (p95 3.48 vs 4.58 ms,
+      #     p99 3.96 vs 7.27 ms);
+      #   * the path is lossy -- the direct path is the one that keeps serving.
+      # It is NOT a general throughput upgrade.
+      #
+      # The THROUGHPUT half of that recommendation is PROVISIONAL: every paired
+      # run above was measured against a server carrying P-13 (the shared QUIC
+      # endpoint ran on an untuned 208 KiB receive buffer, which is the
+      # RECEIVING side of a download). Re-measure on a server built from this
+      # commit before relying on the ratios. The latency, concurrency and loss
+      # results stand -- none of them is bandwidth-bound.
+      # - BORE_PREFER_UDP=true
       # STUN server for UDP candidate discovery; defaults to the bore server's
       # control endpoint. Override only if the server is not also the STUN server:
       # - BORE_STUN_SERVER=stun.l.google.com:19302

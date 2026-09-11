@@ -42,7 +42,34 @@ pport() { adm tunnels | jq -r '.[].public_port' 2>/dev/null; }
 present() { adm tunnels | jq -e --argjson p "$1" 'any(.[]; .public_port==$p)' >/dev/null 2>&1; }
 
 # --- origins ----------------------------------------------------------------
+# reap_stale_origin <script_basename> <port>
+#   An origin is reused across stages on purpose (restarting it between stages
+#   would re-warm the page cache and change the numbers). But a LONG-LIVED
+#   origin can outlive an EDIT to its own source: H-7 in the public campaign
+#   had the P6 ladder report `held=N up=0 errs=N` on every rung for exactly
+#   this reason — the running `raw_origin.py` had been started 40 minutes
+#   before the `HOLD` verb was added to the file, and `pgrep` happily called
+#   that "already running". A benchmark that silently measures an older
+#   program than the one in the tree is worse than one that refuses to run.
+#   So: if the process is OLDER than its own script file, kill THAT PID (never
+#   a pattern-wide `pkill`, project rule) and let the caller start it fresh.
+reap_stale_origin() {
+    local script="$1" port="$2" pid age fage
+    pid=$(pgrep -f "$script $port" | head -1) || return 0
+    [ -n "$pid" ] || return 0
+    age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ -n "$age" ] || return 0
+    fage=$(( $(date +%s) - $(stat -c %Y "$H/$script" 2>/dev/null || echo 0) ))
+    if [ "$age" -gt "$fage" ]; then
+        echo "reaping stale $script (pid $pid, ${age}s old, script ${fage}s old)" >&2
+        kill -9 "$pid" 2>/dev/null
+        for _ in $(seq 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    fi
+}
+
 start_origins() {
+    reap_stale_origin bench_origin.py "$OP"
+    reap_stale_origin raw_origin.py "$RP"
     pgrep -f "bench_origin.py $OP" >/dev/null 2>&1 || {
         python3 "$H/bench_origin.py" "$OP" >"$OUT/origin.log" 2>&1 &
         KIDS+=("$!")
@@ -91,6 +118,13 @@ up_native() {
 # down <pid> <port> — kill the client and wait for the server to release the port.
 down() {
     kill -9 "$1" 2>/dev/null
+    # Reap the job before returning. Without this, bash notifies the death of
+    # its own background job asynchronously and prints a `... Killed  "$BORE"
+    # local ...` line into the MIDDLE of the stage log, right after whatever
+    # measurement happened to be printing next. The kill is the harness's own
+    # deliberate teardown, so the notice is pure noise in a transcript that is
+    # read as evidence.
+    wait "$1" 2>/dev/null
     local i
     for i in $(seq 30); do present "$2" || return 0; sleep 0.5; done
     return 1

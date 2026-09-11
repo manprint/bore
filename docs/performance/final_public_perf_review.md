@@ -66,7 +66,7 @@ perché condividono lo stesso server e lo stesso credito di banda.
 
 **I risultati in cinque righe.**
 
-1. **Dodici difetti del prodotto** sono emersi dalle misure e sono stati
+1. **Tredici difetti del prodotto** sono emersi dalle misure e sono stati
    corretti, tre di gravità alta: il server **non leggeva** il canale di
    controllo dei tunnel pubblici (quindi un percorso diretto caduto non
    tornava mai più); il rimedio introdotto per un altro difetto poteva a sua
@@ -78,14 +78,18 @@ perché condividono lo stesso server e lo stesso credito di banda.
    annulla.
 2. **Su rete pulita il percorso normale (TCP) è più veloce** del percorso UDP
    diretto: 1,51× in scaricamento e 1,34× in caricamento, con dieci coppie su
-   dieci concordi. **Attenzione: questa è l'unica riga di questo documento che
-   probabilmente cambierà.** Tutti i confronti di velocità sono stati misurati
-   contro un server che aveva il difetto del punto 1, e quel socket è il lato
-   *ricevente* di uno scaricamento: negli stessi dati il braccio diretto
-   riceveva 1,78 byte per ognuno che consegnava. Va rimisurato sul server
-   corretto. I risultati su rete che perde pacchetti, quelli di latenza e
-   tutto l'argomento sulla robustezza **non** sono toccati, perché nessuno di
-   quelli dipende dalla banda.
+   dieci concordi. Tutti quei confronti però sono stati misurati contro un
+   server che aveva ancora il difetto del punto 1, e quel socket è il lato
+   *ricevente* di uno scaricamento. **La misura è stata rifatta dopo la
+   correzione** (§8.1): il gonfiore in entrata del percorso diretto è passato
+   da 1,78× a 1,009×, cioè è sparito, e la sua velocità è salita da 111 a
+   143,43 MB/s (+29 %) mentre quella del relay è rimasta dov'era. La
+   classifica **non** cambia — su rete pulita in regione il percorso normale
+   resta davanti — ma il margine è **0,71 e non 0,52**: circa due quinti del
+   divario erano il difetto. I numeri 1,51× e 1,34× vanno quindi letti come
+   quelli *prima* della correzione. I risultati su rete che perde pacchetti,
+   quelli di latenza e tutto l'argomento sulla robustezza non erano toccati in
+   nessun caso, perché nessuno di quelli dipende dalla banda.
 3. **Su rete degradata il verdetto si rovescia**, e non di poco: con il 10 %
    di pacchetti persi il percorso normale consegna 0,39 MB/s — cioè si ferma —
    mentre il diretto ne consegna 51,40. `--udp` non è una manopola della
@@ -140,15 +144,24 @@ in memoria non sa riprodurre.
 | P-11 | BASSA | la pagina di configurazione pubblicava un valore **vivo** al posto di quello impostato | risolto, con controprova |
 | P-8 | — | la finestra di perdita durante un blackout UDP **è** il timeout di inattività: misurato, nessun difetto | non applicabile |
 
-A questi si aggiungono **dodici difetti degli strumenti di misura** (H-1 …
-H-12): nove di essi buttavano via dati, si rifiutavano di partire, misuravano
+A questi si aggiungono **tredici difetti degli strumenti di misura** (H-1 …
+H-13): nove di essi buttavano via dati, si rifiutavano di partire, misuravano
 un programma diverso da quello nell'albero dei sorgenti, pubblicavano la somma
 di due gradini di una scala come se fosse un gradino solo, oppure — il caso
 peggiore — **misuravano zero stampandolo nella stessa forma di una misura
 vera**. Quest'ultimo caso si è presentato **due volte** (H-7 e H-12): per
 questo la fase dalla workstation ora esegue un controllo preliminare che
 **rifiuta di misurare** un tunnel registrato che non muove byte, invece di
-affidarsi all'attenzione di chi la lancia. Sono elencati con la stessa serietà dei difetti del prodotto nel
+affidarsi all'attenzione di chi la lancia. L'ultimo della serie (H-13) è stato
+trovato durante le misure "dopo" di questa stessa campagna: lo strumento che
+rilancia una fase aspettava **all'infinito** una fase già finita, perché il
+comando che contava i processi sulla VM restituiva due righe invece di una e il
+confronto numerico diventava un errore di sintassi — che in bash è "falso", non
+"errore". Una riesecuzione è rimasta ferma **quattro ore** senza produrre
+niente, stampando ogni trenta secondi la stessa riga di avanzamento, cioè
+esattamente quello che sembra una fase lunga e sana. Ora quell'attesa ha una
+scadenza, e un conteggio che non è un numero viene segnalato invece di essere
+scambiato per uno zero. Sono elencati con la stessa serietà dei difetti del prodotto nel
 documento inglese (§17), perché uno strumento che mente è indistinguibile da
 un server che si comporta male. Uno di essi (H-9) è anche la ragione per cui
 P-12 è venuto a galla: uno strumento che teneva aperte più connessioni di
@@ -427,6 +440,15 @@ web.
 Tutte e dieci le coppie concordano nel segno: non è rumore. E il percorso
 diretto era davvero diretto — il server ha contato l'apertura di un canale
 QUIC per ognuna delle 4 connessioni in ogni singola prova.
+
+> **Questa tabella è "prima della correzione".** È stata presa sulla versione
+> `dbcc645a`, che aveva il difetto P-13 (§8.1) proprio sul socket che riceve i
+> byte di uno scaricamento. Dopo la correzione il percorso diretto guadagna il
+> 29 % e il rapporto scende da 1,92 a 1,40 sulla prova di riferimento: il
+> percorso normale resta davanti, ma di meno. Le dieci coppie complete non sono
+> state rifatte — una prova sola basta a stabilire la *causa*, non a riscrivere
+> tutte le mediane — e `pub/rerun_stage.sh p1` le rifà in circa un'ora a chi
+> servono aggiornate.
 
 **Dov'è il collo di bottiglia.** Non nel tunnel. Le due prove muovono gli
 stessi byte sugli stessi due salti; l'unica differenza è chi trasporta la
@@ -1057,19 +1079,60 @@ Il controllo `T-PUB-UDPBUF` avvia un server vero con `--udp` e rilegge i
 buffer **dal kernel**, non dal log, e fallisce tutte e tre le asserzioni se la
 chiamata viene rimossa.
 
-> **Che cosa è dimostrato e che cosa no.** Dimostrato: il socket era al valore
-> di default, la correzione lo moltiplica per quaranta, il server era muto e
-> ora non lo è, e il controllo va rosso senza la correzione. Dimostrato anche:
-> il braccio diretto riceveva 1,78 volte i byte che consegnava, mentre quello
-> relay coincideva allo 0,2 %. **Non** dimostrato: che il primo fatto causi il
-> secondo. L'inferenza è forte — un buffer che contiene 1,9 ms di traffico è
-> esattamente la cosa che perde pacchetti sotto carico, e nella misura non si
-> muove niente altro — ma il server in produzione gira ancora con la versione
-> precedente, quindi i numeri "dopo" (velocità, rapporto entrata/uscita, CPU
-> per gigabyte) sono **in attesa** del nuovo deploy e sono registrati come in
-> attesa, non previsti. Di conseguenza il dimensionamento qui sopra
-> (`GiB/s × 13,6` per il percorso diretto) va letto come il costo del
-> **difetto**, non come il costo di QUIC.
+> **Che cosa era dimostrato prima del nuovo deploy.** Dimostrato: il socket era
+> al valore di default, la correzione lo moltiplica per quaranta, il server era
+> muto e ora non lo è, e il controllo va rosso senza la correzione. Dimostrato
+> anche: il braccio diretto riceveva 1,78 volte i byte che consegnava, mentre
+> quello relay coincideva allo 0,2 %. **Non** dimostrato, a quel punto: che il
+> primo fatto causasse il secondo. L'inferenza era forte — un buffer che
+> contiene 1,9 ms di traffico è esattamente la cosa che perde pacchetti sotto
+> carico, e nella misura non si muoveva niente altro — ma il server girava
+> ancora con la versione precedente, quindi i numeri "dopo" erano registrati
+> come **in attesa**, non previsti. È l'unica cosa onesta da fare con una
+> spiegazione causale che non è ancora stata messa alla prova.
+
+#### Il "dopo": l'inferenza ha retto
+
+Il server è stato aggiornato alla versione `1.0.0 - main - 062a1095` e la
+stessa prova è stata rifatta, identica, sullo stesso percorso, con le stesse
+finestre da 20 secondi e le stesse quattro connessioni.
+
+Prima di misurare, `srv/verify_fixes.sh` ha verificato che la correzione fosse
+davvero in vigore nel processo in esecuzione, leggendola **dal kernel** e non
+da una riga di registro:
+
+```
+  socket: rb=8388608 tb=8388608   net.core.rmem_default=212992
+```
+
+Sono 8 MiB e non i 16 richiesti, perché il tetto di sistema di questa macchina
+è 8 MiB e un processo senza privilegi non lo può superare — l'avviso lo dice e
+indica il comando. Restano **quaranta volte** quello che il socket aveva prima.
+
+Poi la misura:
+
+| grandezza | prima (`dbcc645a`) | dopo (`062a1095`) |
+| --- | --- | --- |
+| diretto: byte entrati ÷ byte usciti | **1,78×** | **1,009×** |
+| relay: byte entrati ÷ byte usciti | 1,002× | 1,006× |
+| velocità diretto, 4 connessioni | 111 MB/s | **143,43 MB/s** (+29 %) |
+| velocità relay, 4 connessioni | 213 MB/s | 200,85 MB/s |
+
+In questa prova chi manda e chi riceve sono la stessa macchina in regione, per
+cui un server sano fa uscire quasi esattamente quello che gli entra: **1,0 è il
+valore giusto, e il braccio relay è il testimone che lo conferma**. Il braccio
+diretto adesso segna 1,009 contro l'1,006 del relay: l'1,78× non è ridotto, è
+**sparito**. L'inferenza ha retto — il socket di ricezione troppo piccolo
+perdeva pacchetti, QUIC li rimandava, e quel singolo meccanismo pagava tutta la
+velocità mancante.
+
+Quello che la correzione **non** ha fatto è ribaltare la classifica: sul
+percorso pulito in regione il relay resta davanti (143,43 contro 200,85, cioè
+0,71). Ma il divario era 0,52 e ora è 0,71, quindi circa **due quinti** di
+quello che la campagna aveva attribuito a QUIC erano questo difetto, e il resto
+è QUIC per davvero. La raccomandazione su `--udp` regge quindi sui suoi meriti
+e non su un difetto — che è esattamente ciò che la marcatura PROVVISORIA serviva
+a verificare.
 
 Una cosa va detta perché non venga confusa con lo stesso difetto: i socket
 **TCP** vanno bene così come sono. Il codice imposta `TCP_NODELAY` e il
@@ -1237,11 +1300,11 @@ TLS, a meno che il tunnel non abbia chiesto `--https`.
    giusta non è "quanto traffico faccio" ma "quanto è buona la mia rete".
 2. **Le corsie parallele hanno un punto ottimale, e non è il massimo.**
    Quattro corsie danno il 44 % in più di una; otto danno meno di quattro.
-3. **Dodici difetti del prodotto sono stati trovati misurando, non leggendo
+3. **Tredici difetti del prodotto sono stati trovati misurando, non leggendo
    il codice.** Due erano gravi, e nessuno dei due si sarebbe visto in un test
    in memoria: uno richiedeva un server vero che non leggesse un canale,
    l'altro richiedeva di far scorrere abbastanza traffico da riempire un
-   buffer di controllo. Lo stesso vale per gli strumenti: dei dodici difetti
+   buffer di controllo. Lo stesso vale per gli strumenti: dei tredici difetti
    dell'harness, due **misuravano zero stampandolo come una misura vera** — e
    il secondo è la ragione per cui la fase dalla workstation ora si rifiuta di
    misurare un tunnel registrato che non muove byte, invece di fidarsi di chi

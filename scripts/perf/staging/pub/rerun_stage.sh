@@ -63,6 +63,7 @@ say "build under test"
 {
   adm config | jq -r '"version_field=\(.server_version // "not reported")"'
   srv "sudo -n docker exec ${BORE_SRV_CONTAINER} /bore --version 2>/dev/null" 2>/dev/null
+  # shellcheck disable=SC2088  # the tilde is expanded by the REMOTE shell, which is the point
   echo "vm_binary=$(vm '~/bore --version' 2>/dev/null | tr -d '\r')"
   echo "stages=$STAGES"
   echo "started=$(date -Is)"
@@ -80,11 +81,44 @@ vm "rm -f ~/res/rerun_driver.log ~/res/pub_driver.log; setsid nohup ~/pub/pub_dr
 # count never falls to zero and the wait never ends. `start_samplers.sh`
 # carries a comment about the same self-match trap in its pkill; this loop had
 # to learn it too.
+#
+# H-13: and then it had to learn a SECOND one, which cost four hours of nothing.
+# `pgrep -c` prints the count — including `0` — and ALSO exits 1 when nothing
+# matched, so a `|| echo 0` fallback fires on top of the zero it already
+# printed and `n` comes back as the two lines "0\n0". That is not a comparison
+# that fails, it is a SYNTAX error in `test`:
+#
+#     $ [ "0
+#     0" -lt 1 ]; echo $?
+#     bash: [: 0\n0: integer expression expected
+#     2
+#
+# rc=2 is falsy, so `&& break` never fires and the loop spins forever on a
+# stage that finished minutes ago — silently, because everything it prints is
+# the same progress line. MEASURED: a `conc` re-run sat in this loop for four
+# hours after its stage had returned rc=0, and was found only by listing
+# processes. THREE things fix it, and all three are needed:
+#   1. drop the `|| echo 0` and take the FIRST line, so the count is one token;
+#   2. refuse a non-numeric count LOUDLY instead of treating it as zero — an
+#      ssh that fails mid-run must not look like "the stage finished";
+#   3. bound the whole wait with a deadline, because no amount of parsing care
+#      covers a VM that dies with its driver still registered.
+DEADLINE=$(( $(date +%s) + ${RERUN_MAX_WAIT:-10800} ))
 while true; do
     sleep 30
-    n=$(vm 'pgrep -c -f "pub_drive[r].sh" 2>/dev/null || echo 0' 2>/dev/null | tr -d '\r')
+    n=$(vm 'pgrep -c -f "pub_drive[r].sh" 2>/dev/null; true' 2>/dev/null | tr -d '\r' | head -1)
     echo "  $(date -Is) $(vm 'tail -1 ~/res/pub_driver.log 2>/dev/null' 2>/dev/null | tr -d '\r')"
-    [ "${n:-0}" -lt 1 ] && break
+    case "$n" in
+        ''|*[!0-9]*)
+            echo "  WARNING: cannot read the driver count from the VM (got '$n') — still waiting" ;;
+        *)
+            [ "$n" -lt 1 ] && break ;;
+    esac
+    if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+        echo "  GIVING UP: the VM driver is still registered after ${RERUN_MAX_WAIT:-10800}s."
+        echo "  Collecting whatever the stage produced; check ~/res/pub_driver.log on the VM."
+        break
+    fi
 done
 
 say "collecting"

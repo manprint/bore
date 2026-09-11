@@ -112,7 +112,7 @@ Two deployment findings (D-1, D-3) and one deployment recommendation (D-2)
 are in the same register; D-1 was a shipped compose file that enabled the
 direct path while documenting that it did nothing.
 
-Twelve harness defects (H-1 … H-12) were found and fixed along the way; they
+Thirteen harness defects (H-1 … H-13) were found and fixed along the way; they
 are listed in §17 because a harness that lies is indistinguishable from a
 server that misbehaves, and nine of them had already silently thrown away data,
 refused to run, measured a program older than the one in the tree, published
@@ -1039,17 +1039,129 @@ reported what it got. It is red-checked: with the call removed it reports
 The threshold is expressed against the host's own default rather than a fixed
 number, because the effective size is whatever `net.core.rmem_max` allows.
 
-**What is proven, and what is not.** Proven: the socket ran at the kernel
-default, the fix raises it forty-fold, the server was silent and now is not,
-and the gate fails without the fix. Also proven: the direct arm received 1.78×
-the bytes it delivered while the relay arm's agreed to 0.2 %. NOT yet proven:
-that the first causes the second. The inference is strong — a receive buffer
-holding 1.9 ms of traffic is the kind of thing that drops datagrams under load,
-and nothing else in the measurement moves — but the staging server still runs
-the pre-fix build, so the "after" figures for goodput, the inbound ratio and
-CPU s/GiB are pending a redeploy and are recorded as pending rather than
-predicted. The sizing advice above (`× 13.6` cores for the direct path) should
-therefore be read as the cost of the DEFECT, not the cost of QUIC.
+**What was proven before the redeploy, and what was left open.** Proven: the
+socket ran at the kernel default, the fix raises it forty-fold, the server was
+silent and now is not, and the gate fails without the fix. Also proven: the
+direct arm received 1.78× the bytes it delivered while the relay arm's agreed
+to 0.2 %. NOT proven at that point: that the first causes the second. The
+inference was strong — a receive buffer holding 1.9 ms of traffic is the kind
+of thing that drops datagrams under load, and nothing else in the measurement
+moves — but the staging server still ran the pre-fix build, so the "after"
+figures were recorded as PENDING rather than predicted, which is the only
+honest thing to do with a causal claim that has not been tested.
+
+### 13.2 The "after": the inference held
+
+The server was redeployed on `1.0.0 - main - 062a1095` and the same probe was
+run again, unchanged, on the same path with the same 20 s windows and the same
+four connections. `srv/verify_fixes.sh` first confirmed the fix was actually in
+force in the running process, read from the kernel and not from a log line:
+
+```
+### P-13 — the shared QUIC endpoint's socket buffers were configured
+  --vhost-quic-port: 443
+  socket: rb=8388608 tb=8388608   net.core.rmem_default=212992
+PASS: P-13: receive buffer 8388608 is far above the untuned default 212992
+PASS: P-13: send buffer 8388608 is far above the untuned default 212992
+```
+
+8 MiB rather than the 16 MiB requested, because this host's
+`net.core.rmem_max` is 8 MiB and an unprivileged process cannot pass it — the
+clamp warning says exactly that and names the sysctl. It is still **forty
+times** what the socket had. Then `pub/pktrate.sh`:
+
+```
+=== server-side packet accounting on ens5, 20 s windows, 4 conns ===
+  relay path=relay   bytes=4212265221 secs=20.000 MBs=200.85 conns=4 errs=0
+  relay   tx: 4.119 GiB  3164995 pkt  avg 1397 B/pkt  -> 768463 pkt/GiB
+  relay   rx: 4.142 GiB  3358732 pkt  avg 1324 B/pkt
+  direct path=direct bytes=3008083245 secs=20.000 MBs=143.43 conns=4 errs=0
+  direct  tx: 2.934 GiB  2129157 pkt  avg 1480 B/pkt  -> 725688 pkt/GiB
+  direct  rx: 2.960 GiB  2779571 pkt  avg 1143 B/pkt
+```
+
+| quantity | before (`dbcc645a`) | after (`062a1095`) |
+| --- | --- | --- |
+| direct, bytes in ÷ bytes out | **1.78×** | **1.009×** |
+| relay, bytes in ÷ bytes out | 1.002× | 1.006× |
+| direct goodput, 4 conns | 111 MB/s | **143.43 MB/s** (+29 %) |
+| relay goodput, 4 conns | 213 MB/s | 200.85 MB/s |
+
+Both ends of this probe are the same in-region VM, so a healthy server takes
+in almost exactly what it puts out: **1.0 is the correct value and the relay
+arm is the control that says so**. The direct arm now reads 1.009 against the
+relay's 1.006 — the 1.78× is gone, not reduced. The inference held: the
+untuned receive socket was dropping datagrams and QUIC was resending them, and
+that single mechanism was paying for the missing goodput.
+
+What the fix did NOT do is reverse the transport ranking. The relay still
+moves more on this clean in-region path (143.43 against 200.85, a ratio of
+0.714) — but the gap is now 0.71 where it was 0.52, so roughly **two fifths of
+the deficit the campaign attributed to QUIC was this defect** and the rest is
+QUIC. The `--udp` recommendation therefore stands on its merits rather than on
+a defect, which is what the PROVISIONAL mark existed to check; §18 records the
+re-measured form.
+
+One number is worth keeping in view for whoever reads the packet columns: the
+direct path's average on-wire packet is now **1480 B**, essentially the full
+1500-byte MTU, against the relay's 1397 — QUIC is not sending small datagrams,
+and the remaining CPU difference is not fragmentation.
+
+The sizing advice above (`× 13.6` cores for the direct path) was the cost of
+the DEFECT, not the cost of QUIC; §13.3 carries the re-measured figure.
+
+**What changed between the two measurements, and what did not.** Exactly one
+thing changed: the SERVER build. `BUILD.txt` of the re-run records it —
+
+```
+version_field=1.0.0 - main - 062a1095
+bore 1.0.0 - main - 062a1095
+vm_binary=bore 1.0.0 - main - dbcc645a
+```
+
+— the forwarder on the VM is still the build the "before" numbers were taken
+with. That is deliberate and it is the strongest form this comparison can
+take: the client end of the QUIC path already configured its own socket before
+P-13 (it logged `effective_recv=8388608` in the "before" run), so leaving it
+untouched isolates the server-side socket as the only variable. Same VM, same
+instance, same origin, same probe, same windows.
+
+### 13.3 The "after": CPU per GiB
+
+The §13 efficiency stage was re-run twice against the fixed server, through
+`pub/rerun_stage.sh eff`, which starts the host samplers, runs the stage
+serially on the VM and joins each case's window to the host's own `/proc/stat`
+samples — so the figure includes the softirq the host kernel spends on the
+container's behalf, which reading the container alone understates by about a
+third.
+
+| run | direct, CPU s/GiB | relay, CPU s/GiB | relay `--carriers 8` |
+| --- | --- | --- | --- |
+| A (r1/r2/r3) | 9.63 / 10.55 / 10.70 | 7.67 / 7.83 / 6.69 | 5.42 / 6.38 / 5.54 |
+| B (r1/r2/r3) | 10.77 / 9.04 / 10.64 | 6.97 / 5.90 / 7.89 | 5.41 / 4.64 / 5.28 |
+| median of all six | **10.60** | **7.32** | **5.35** |
+
+| quantity | before (`dbcc645a`) | after (`062a1095`) |
+| --- | --- | --- |
+| direct, CPU s/GiB | 13.58 | **10.60** (−22 %) |
+| relay, CPU s/GiB | 5.35 – 7.04 | 7.32 |
+| direct ÷ relay | ≈ 2.1× | **1.45×** |
+| direct goodput, this stage | 111 MB/s | **150.74 MB/s** (+36 %) |
+| relay goodput, this stage | 213 MB/s | 238.39 MB/s |
+
+Read the RATIO, not the absolute relay figure. This is a burstable instance
+whose allowance state and steal time differ from day to day — the steal column
+of the joined table ranges from 0.00 to 3.47 s across the eighteen cases — and
+the relay arm moved within that band while the direct arm moved outside it.
+The honest statement is the one the ratio makes: the direct path used to cost
+about **twice** what the relay cost per delivered GiB, and now costs about
+**one and a half times**. The remaining 1.45× is the real price of doing
+congestion control and packet handling in user space; the rest was the defect.
+
+Two runs rather than one on purpose: the first was collected by hand after
+`rerun_stage.sh` wedged (H-13, §17), and a single run of a stage this exposed
+to instance noise is not a result. The two agree to within the spread of their
+own rounds, which is what makes the −22 % readable.
 
 One thing worth stating so it is not mistaken for the same defect: the TCP
 sockets are correct as they are. `shared::tune_tcp` sets `TCP_NODELAY` and
@@ -1343,7 +1455,7 @@ an unbounded write).
 
 | id | sev | status | finding |
 |----|-----|--------|---------|
-| P-13 | **HIGH** | FIXED, red-checked | **The server's shared QUIC endpoint ran on an untuned UDP socket.** `holepunch::configure_udp_socket_buffers` — whose own doc comment warns that an untuned socket caps a congestion-controlled QUIC flow at roughly `buffer / RTT` — was the CALLER's responsibility, and the one caller that builds the server's shared endpoint (`vhost_server_endpoint`, which serves the direct path of every vhost, public and ssh-jump tunnel in the process) never called it. Every other UDP socket in the file asks for 16 MiB; that one ran on `net.core.rmem_default`. Read from the kernel on a server built from this tree: `skmem:(r0,rb212992,t0,tb212992,...)` — **208 KiB, silently**, because it never asked for more, while the CLIENT end of the same QUIC path logs `effective_recv=8388608`. A factor of forty between the two ends of one connection, with the small end being the RECEIVER: on a download the bytes arrive from the provider over QUIC and leave over the public TCP socket. At the measured 111 MB/s, 208 KiB is **1.9 ms** of traffic, and the staging container carries `caps=[]` so `SO_RCVBUFFORCE` was unavailable too. Found by following the §13 CPU gap to its cause: server-side interface accounting shows the direct arm taking in **3.885 GiB to deliver 2.279** (1.78×) while the relay arm's inbound and outbound agree to 0.2 %, with packets-per-delivered-GiB nearly identical between transports (739 363 vs 764 075) — so the cost was never per-packet overhead, it was ~1.8 data packets arriving for every one delivered. That single shape accounts for all three of the direct path's numbers: half the goodput (111 vs 213 MB/s), twice the CPU per delivered GiB (13.58 vs 5.35-7.04) and 2.9× the softirq per delivered GiB (8.05 vs 2.74). FIX: the call moves INSIDE `client_endpoint` and `server_endpoint` and is removed from all four call sites — a third call site would have fixed this instance, whereas the constructors make the invariant structural, since no path to a QUIC `Endpoint` bypasses them. AFTER: `rb8388608 tb8388608` (40×) plus the clamp warning naming the `net.core.rmem_max` remedy for the part the process cannot fix without `CAP_NET_ADMIN`. Gate `T-PUB-UDPBUF` reads `rb`/`tb` out of `ss -uapm` on a real `--udp` server in a namespace — the kernel's view, never the log, per P-12's rule — and is red-checked: without the call it reports `rb=212992`, `server said: nothing`, and fails all three assertions. NOT claimed: that the drop-and-retransmit figures improve by a measured amount; the staging server still runs the pre-fix build, so the field "after" is pending the redeploy and is recorded as pending. The TCP side is deliberately NOT symmetric: `tune_tcp` sets no `SO_*BUF` because that disables TCP auto-tuning (examined and rejected as harmful in the SSH-gateway assessment); UDP has no auto-tuning, which is why this function exists. |
+| P-13 | **HIGH** | FIXED, red-checked | **The server's shared QUIC endpoint ran on an untuned UDP socket.** `holepunch::configure_udp_socket_buffers` — whose own doc comment warns that an untuned socket caps a congestion-controlled QUIC flow at roughly `buffer / RTT` — was the CALLER's responsibility, and the one caller that builds the server's shared endpoint (`vhost_server_endpoint`, which serves the direct path of every vhost, public and ssh-jump tunnel in the process) never called it. Every other UDP socket in the file asks for 16 MiB; that one ran on `net.core.rmem_default`. Read from the kernel on a server built from this tree: `skmem:(r0,rb212992,t0,tb212992,...)` — **208 KiB, silently**, because it never asked for more, while the CLIENT end of the same QUIC path logs `effective_recv=8388608`. A factor of forty between the two ends of one connection, with the small end being the RECEIVER: on a download the bytes arrive from the provider over QUIC and leave over the public TCP socket. At the measured 111 MB/s, 208 KiB is **1.9 ms** of traffic, and the staging container carries `caps=[]` so `SO_RCVBUFFORCE` was unavailable too. Found by following the §13 CPU gap to its cause: server-side interface accounting shows the direct arm taking in **3.885 GiB to deliver 2.279** (1.78×) while the relay arm's inbound and outbound agree to 0.2 %, with packets-per-delivered-GiB nearly identical between transports (739 363 vs 764 075) — so the cost was never per-packet overhead, it was ~1.8 data packets arriving for every one delivered. That single shape accounts for all three of the direct path's numbers: half the goodput (111 vs 213 MB/s), twice the CPU per delivered GiB (13.58 vs 5.35-7.04) and 2.9× the softirq per delivered GiB (8.05 vs 2.74). FIX: the call moves INSIDE `client_endpoint` and `server_endpoint` and is removed from all four call sites — a third call site would have fixed this instance, whereas the constructors make the invariant structural, since no path to a QUIC `Endpoint` bypasses them. AFTER: `rb8388608 tb8388608` (40×) plus the clamp warning naming the `net.core.rmem_max` remedy for the part the process cannot fix without `CAP_NET_ADMIN`. Gate `T-PUB-UDPBUF` reads `rb`/`tb` out of `ss -uapm` on a real `--udp` server in a namespace — the kernel's view, never the log, per P-12's rule — and is red-checked: without the call it reports `rb=212992`, `server said: nothing`, and fails all three assertions. AFTER THE REDEPLOY (`062a1095`, §13.2, the same probe unchanged): the inbound inflation is **gone, not reduced** — direct now takes in 2.960 GiB to deliver 2.934 (**1.009×**) against the relay's 1.006×, and direct goodput rose from 111 to **143.43 MB/s** (+29 %) while the relay's stayed at 200.85. The causal claim that the untuned receive socket was the retransmission is therefore tested, not inferred. It did NOT reverse the transport ranking: direct/relay went from 0.52 to 0.714, so roughly two fifths of the deficit the campaign had attributed to QUIC was this defect and the rest is QUIC. The TCP side is deliberately NOT symmetric: `tune_tcp` sets no `SO_*BUF` because that disables TCP auto-tuning (examined and rejected as harmful in the SSH-gateway assessment); UDP has no auto-tuning, which is why this function exists. |
 | P-7 | **HIGH** | FIXED + gated | **`Server::serve_tunnel` never read the control substream at all.** Its `select!` had only `heartbeat.tick()`, `recv_carrier` and `listener.accept()` — no `control.recv()` arm — so every `ClientMessage` a public client sent was left unread in the yamux buffer. Visible effect: a public `--udp` tunnel that lost its direct path sent exactly one `PublicUdpRenew`, waited for an answer that could not come, and **stayed on the TCP relay for the rest of the control connection's life** (measured: still degraded 100 s after the UDP path healed). The vhost provider loop (`vhost.rs:1211`) and the SSH-jump loop (`ssh_jump.rs:624`) both answered their own renewal already. FIX: added the recv arm + `send_public_udp_offer()` shared by the first offer and the renewal. MEASURED AFTER: direct carrier back **5 s** after the path heals. Gate `T-PUB-RECOVER`. |
 | P-9 | **HIGH** | FIXED, red-checked | **A heartbeat the peer never reads wedges the whole client listen loop.** Introduced by P-4 itself and caught by measuring it rather than reasoning about it. `control.send()` lives in a `select!` arm, so once the yamux stream's flow-control credit is exhausted — which happens after roughly 256 KiB of unread frames — the arm blocks forever and the client stops accepting proxied connections while still looking perfectly registered. This is exactly the mixed-version case: a NEW client against a server that predates P-7's read arm. MEASURED on the real staging server (0771de98) with the beat compressed to 2 ms: served at t+5 s and t+15 s, **NO RESPONSE at t+30 s** (~15 000 frames), client log shows no further "new connection". At the production 20 s interval that is days of uptime, and any reconnect resets it — which is what makes it the kind of defect that reaches production. FIX: `client::beat_once` bounds the write with `ctrl_heartbeat_send_timeout()` (10 s, `BORE_CTRL_HEARTBEAT_SEND_TIMEOUT_MS`); on expiry the client warns and stands its heartbeat down for the session, degrading to the legacy heartbeat-free path instead of wedging. Correct against both peers: an old server has no reaper, and a current server's deadline then reaps a control path that is genuinely broken. |
 | P-12 | **HIGH** | FIXED, red-checked | **`--max-conns` was never reconciled with the process file-descriptor limit, so the graceful bound was unreachable and the kernel refused first — on every listener at once.** Found by the concurrency ladder against the real deployment (§11): at the rung where ~976 connections were genuinely held through ONE public tunnel, the server logged `failed to accept tunnel connection err=No file descriptors available (os error 24)` every 100 ms from 06:23:44 UTC and answered nothing at all on its control port for about half a minute — the ladder's own admin-API reads failed first with `curl: (35) Send failure: Connection reset by peer` and then with `curl: (7) Failed to connect … after 2 ms`. The container ran `--max-conns 1024` against a soft `RLIMIT_NOFILE` of **1024** (hard 524288), so the semaphore could not reach its bound: `conn_rejections` stayed **0** throughout. That is the whole defect — `EMFILE` is not the semaphore's per-connection refusal, it lands on `accept()` for every listener the process owns, so one tunnel's concurrency took the admin API, the vhost frontends and every other tunnel with it. FIX: `fdlimit::reconcile_fd_limit(max_conns)` at startup, before the first listener is bound: raise the soft limit to `max_conns + 256` when the hard limit allows (a process may always raise its own soft limit up to its hard limit, unprivileged), raise to the ceiling and `warn!` with both remedies when the hard limit is itself short, and say NOTHING when the limit is already sufficient. Gates: `fd_budget` unit tests across every boundary (`RLIM_INFINITY`, exact-fit, overflow) plus the field gate `T-PUB-FDBUDGET`, which starts a real server under a chosen `ulimit` and reads `/proc/<pid>/limits` back — the log line alone would only prove the server talked about it. Red-checked: with the startup call removed the limit stays where it was and the arm fails. One portability defect of the FIX itself is worth recording, because the local sweep could not have caught it: `rlim_t` is 64 bits on most targets but **32** on 32-bit glibc ABIs, so passing `getrlimit`'s output straight into the `u64` decision broke the `arm-unknown-linux-gnueabi` cross job — one job out of the whole matrix, while every gate on this workstation stayed green. The decision stays on `u64` and the two conversions now live at the syscall boundary (`fdlimit::widen`/`narrow`), saturating rather than wrapping: a wrap would silently LOWER the limit, which is the exact storm the module exists to prevent. Pinned by `the_limit_survives_the_round_trip_through_the_platform_type`. |
@@ -1400,6 +1512,7 @@ refuses to measure rather than a comment asking the operator to be careful.
 | H-10 | FIXED | Harness: a stage re-run after the campaign had finished produced measurement windows with no samples behind them. `run_campaign.sh` stops the resource samplers at the end — correct for a campaign — but `vm_pub_eff.sh` emits `window=<t0>-<t1>` lines whose only meaning comes from a host `/proc/stat` stream covering the same window, so the re-run reduced to `no samples in the window (need at least two)` for all nine cases. The reducer was honest — it refused rather than inventing a number — but the stage had already been paid for. FIX: `pub/rerun_stage.sh`, a first-class re-run entry point that pushes the harness and proves the copies match by md5, verifies the samplers are alive (starting them when they are not) BEFORE the stage runs, collects the logs and the samples afterwards, and joins the `eff` windows to the CPU samples itself so that the CPU s/GiB table is produced rather than assembled by hand. |
 | H-11 | FIXED | Harness: `T-PUB-HEALTHY` put `netem loss` on the WHOLE loopback, so the loss it applied to the QUIC path under test also hit the CLIENT'S DIAL OF THE LOCAL ORIGIN — a dial `connect_with_timeout` bounds at `NETWORK_TIMEOUT` (3 s). At 30 % loss a dial whose SYN is dropped past the third retry exceeds that bound, the client closes the substream and the public connection ends with no response at all, which the arm counted as a failure of the direct-open deadline. Found as a one-in-four flake — `000 3.205574` and `000 4.084193` in two of four cells, each with `direct_stream_opens` incrementing and `fb=0`, i.e. the direct path perfectly healthy — and settled by keeping the logs (`BORE_PUB_KEEP_RUN=1`, added for it): a cell with three failures carried `WARN could not connect to localhost:18090` at exactly the three failing timestamps. The client was working as designed; the ARM was asserting on something it does not claim. FIX: the loss is now scoped to the QUIC port with a `prio` qdisc plus two `u32` filters, so the TCP relay, the public connection and the origin dial stay clean, and the arm additionally asserts netem's OWN counters (`sent_pkt` above zero on every cell, `dropped` above zero on the lossy cells) — a loss that silently failed to apply would otherwise make the arm vacuously green, which is H-7's shape. Whole-path loss belongs to the netem matrix stage against a real server (§12), and is measured there. The arm also gained the COMPLEMENT of T-PUB-DEADLINE while it was being fixed: on the clean cell it now asserts `open timeouts logged: 0` and `fb=0`, because a deadline that fired with nothing wrong would put every connection on the relay while the served count still read 12 of 12. Those two assertions are deliberately NOT claimed as red-checked: at `BORE_PUB_HEALTHY_DEADLINE=1` the clean cell still reports zero timeouts — a loopback `open_stream` plus `write_stream_ready` costs well under a millisecond, and `direct_open_timeout` rejects 0 — so their positive control is T-PUB-DEADLINE and T-PUB-LADDER, which run the same server and the same log format and do produce a nonzero count. Incidentally measured: the 3 s default bounds an operation that costs microseconds locally. |
 | H-12 | FIXED | Harness: the workstation stage measured `0.00 MB/s` on every arm, with both tunnels correctly registered and the server reporting `path=direct pool=1`. `ws_pub.sh` starts its raw origin on the VM through `vm "pgrep -f 'raw_origin.py $RP' >/dev/null || (start it)"`, and that `pgrep` runs REMOTELY: the `bash -c` carrying the whole one-liner contains the string being searched for, so the pattern matched its own command line, the origin was reported as already running, and it was never started. The forwarder then tunnelled a local port with nothing behind it — every connection was accepted by the server, forwarded, and closed with zero bytes, which the harness printed as `0.00 MB/s` in the exact format of a real measurement. The same trap had already been found twice in this campaign (`rerun_stage.sh`'s wait loop, `start_samplers.sh`'s pkill) and the usual remedy — bracketing the pattern as `raw_origin.p[y]` — is only HALF a fix here and was measured to be: bracketing stops the pattern from matching its own text, but the start command in the same one-liner still contains the plain `raw_origin.py`, so the `pgrep` keeps self-matching and the origin still never starts. FIX, two parts. The existence check no longer asks "is there a process with this name" but "is something SERVING on that port", with a real connection (`timeout 2 bash -c '</dev/tcp/127.0.0.1/$RP'`) — the question the stage actually needs answered, and immune to the class of defect entirely. And the warm-up became a PARSED PREFLIGHT: it reads `bytes=` back from both transports and `exit 2`s with the diagnosis and the command to check, because a registered tunnel proves the CONTROL path and says nothing about the DATA path. Red-checked by construction — the broken state is what produced the transcript above, and the fixed stage refuses it: `PREFLIGHT FAILED on port 9021: registered, but it moved no bytes.` The reaper in the same block still needs a PID and still uses a bracketed `pgrep`, which is safe there because its own command text contains `raw_origin.py)` from the `stat` and never `raw_origin.py $RP`. Incidental fix in the same pass: the stage's RTT line was `ping | cut`, and ICMP to this gateway is filtered, so it printed an empty string and then `n/a` — replaced by a TCP-handshake probe to the control port, which is the same first round trip every arm below pays and cannot come back blank without saying so. |
+| H-13 | FIXED | Harness: `rerun_stage.sh` waited FOREVER for a stage that had already finished. Its wait loop polls the VM for a live driver with `n=$(vm 'pgrep -c -f "pub_drive[r].sh" || echo 0')` and breaks on `[ "${n:-0}" -lt 1 ]`. `pgrep -c` prints the count — **including `0`** — and ALSO exits 1 when nothing matched, so the `|| echo 0` fallback fires on top of the zero already printed and `n` comes back as the two lines `0\n0`. That is not a comparison that returns false, it is a syntax error in `test`: `[: 0\n0: integer expression expected`, rc=2 — falsy, so `&& break` never fires. Every 30 s it printed the same progress line, which is exactly what a healthy long stage looks like. MEASURED: a `conc` re-run sat in this loop for **four hours** after its own stage had returned `rc=0`, producing nothing, and was found only by listing processes while investigating something else. The bracketing lesson of H-12 was already applied here and was not enough — the pattern was right and the PARSING was wrong. FIX, three parts, all needed: drop the `|| echo 0` and take the first line, so the count is one token; refuse a NON-NUMERIC count loudly and keep waiting, because an ssh that fails mid-run must never look like "the stage finished"; and bound the whole wait with a deadline (`RERUN_MAX_WAIT`, 3 h) and say so when it fires, because no amount of parsing care covers a VM that dies with its driver still registered. Red-checked against the real deployment: the same `rerun_stage.sh eff` that had to be killed and collected by hand now runs to completion, collects, and prints the joined CPU table by itself. |
 
 ---
 
@@ -1422,18 +1535,27 @@ the opposite sign.
 | many connections held open at once (a busy app, long polls, websockets) | either transport, no change needed | a fresh connection costs 4.6 ms behind 512 held connections and 4.5 ms behind none, on both paths (§11); the direct path held 512 concurrent QUIC streams with zero fallbacks |
 | nothing may be installed on the machine | `ssh -R` | costs ~0.75 ms per new connection and about 1.9× on single-carrier download (§10) — and nothing else |
 
-**The `--udp` throughput recommendation is provisional, and this is the one
-line in this document that is likely to change.** Every paired throughput
-comparison in §6, §7 and §10 was measured against a server whose shared QUIC
-receive socket was 208 KiB — the kernel default, because of P-13 (§13.1) — and
-that socket is the RECEIVING side of a download. The same runs show the direct
-arm taking in 1.78 bytes for every one it delivered while the relay arm's
-inbound and outbound agreed to 0.2 %, which is what a starved receive buffer
-does. The relay's win on a clean path may therefore be smaller than 1.51×, or
-absent. It should be re-measured on a server carrying the fix before this row
-is relied on; the LOSS results (§12), the latency results (§8, §11) and the
-whole robustness argument for `--udp` are unaffected, because none of them is
+**The `--udp` throughput row was provisional until the redeploy, and it was
+re-measured.** Every paired throughput comparison in §6, §7 and §10 was taken
+against a server whose shared QUIC receive socket was 208 KiB — the kernel
+default, because of P-13 (§13.1) — and that socket is the RECEIVING side of a
+download, so the relay's win was partly a measurement of the defect. §13.2
+re-ran the packet-accounting probe against the fix on the same path: the
+inbound inflation went from **1.78× to 1.009×**, and direct goodput rose from
+111 to **143.43 MB/s** at four connections while the relay's stayed at
+200.85. The ranking did not change — the relay still wins on a clean in-region
+path — but the margin is **0.71, not 0.52**, so roughly two fifths of the gap
+was the defect. Read the 1.51× and 1.34× medians in §6 as the pre-fix numbers
+they are; the direction of the recommendation holds, the size of the advantage
+is smaller. The LOSS results (§12), the latency results (§8, §11) and the whole
+robustness argument for `--udp` were never affected, because none of them is
 bandwidth-bound.
+
+What has NOT been re-run against the fix is the full ten-pair §6 ladder and the
+concurrency sweep — one probe on one path is enough to settle the CAUSE, not
+enough to restate every median. Those tables stay labelled with the build they
+were taken on (`dbcc645a`), and `pub/rerun_stage.sh p1 conc` reproduces them on
+the new build in about an hour when someone wants the updated medians.
 
 Docker is free: native and dockerized binaries are within the round-to-round
 scatter on throughput and within 0.03 ms on latency (§10). Use the ROOT image

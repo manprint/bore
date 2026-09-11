@@ -71,7 +71,15 @@ else
     # -m is what carries skmem:(r…,rb…,t…,tb…): rb/tb are the kernel's own
     # receive and send buffer sizes for that socket, which is the whole
     # question P-13 asks.
-    SK="$(srv "sudo -n nsenter -t $PID -n ss -uapm 2>/dev/null | grep -A1 ':$QPORT' | tr '\n' ' '" 2>/dev/null | tr -d '\r')"
+    #
+    # `-n` is NOT optional. Without it `ss` resolves the port through
+    # /etc/services and prints `0.0.0.0:https` for 443, so a `grep ':443'`
+    # matches nothing and the gate reports "could not read the buffers" on a
+    # server that is perfectly fine — measured, on the first run of this
+    # script against the real deployment. A harness that cannot find the
+    # socket must say so loudly (it does, below, by dumping what it saw)
+    # rather than be read as a failing server.
+    SK="$(srv "sudo -n nsenter -t $PID -n ss -uapmn 2>/dev/null | grep -A1 ':$QPORT ' | tr '\n' ' '" 2>/dev/null | tr -d '\r')"
     RB="$(printf '%s' "$SK" | sed -n 's/.*rb\([0-9]*\).*/\1/p')"
     TB="$(printf '%s' "$SK" | sed -n 's/.*tb\([0-9]*\).*/\1/p')"
     DEF="$(srv "sudo -n sysctl -n net.core.rmem_default" 2>/dev/null | tr -d '\r')"
@@ -79,6 +87,9 @@ else
     echo "  socket: rb=${RB:-?} tb=${TB:-?}   net.core.rmem_default=$DEF"
     if [ -z "$RB" ] || [ -z "$TB" ]; then
         bad "P-13: could not read the QUIC socket's buffers from the kernel"
+        echo "  what ss returned for port $QPORT: ${SK:-<nothing>}"
+        echo "  every UDP socket the process owns:"
+        srv "sudo -n nsenter -t $PID -n ss -uapmn 2>/dev/null | head -20" 2>/dev/null | sed 's/^/    /'
     else
         # 4x the kernel default is the same threshold the lab gate uses: it is
         # far above anything the default path produces and far below the 16 MiB

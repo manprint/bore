@@ -64,12 +64,13 @@ services:
       #   * the path is lossy -- the direct path is the one that keeps serving.
       # It is NOT a general throughput upgrade.
       #
-      # The THROUGHPUT half of that recommendation is PROVISIONAL: every paired
-      # run above was measured against a server carrying P-13 (the shared QUIC
-      # endpoint ran on an untuned 208 KiB receive buffer, which is the
-      # RECEIVING side of a download). Re-measure on a server built from this
-      # commit before relying on the ratios. The latency, concurrency and loss
-      # results stand -- none of them is bandwidth-bound.
+      # The ratios above were measured against a server carrying P-13 (the
+      # shared QUIC endpoint ran on an untuned 208 KiB receive buffer, which is
+      # the RECEIVING side of a download). They were RE-MEASURED after the fix
+      # was deployed: the direct path gained 29 % (111 -> 143.43 MB/s at four
+      # connections) and the relay stayed put, so the relay still wins on a
+      # clean in-region path but by 0.71 rather than 0.52. The recommendation
+      # stands; the margin is smaller than the numbers above suggest.
       # - BORE_PREFER_UDP=true
       # STUN server for UDP candidate discovery; defaults to the bore server's
       # control endpoint. Override only if the server is not also the STUN server:

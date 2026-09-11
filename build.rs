@@ -104,6 +104,95 @@ fn bundle_admin_assets() {
     println!("cargo:rerun-if-changed=src/admin_ui");
 }
 
+/// Tell cargo to re-run this script whenever `git rev-parse HEAD` would answer
+/// something new.
+///
+/// `cargo:rerun-if-changed=.git/HEAD` ALONE IS NOT ENOUGH, and that was a real,
+/// measured defect rather than a theoretical one. On a normal checkout
+/// `.git/HEAD` holds the literal text `ref: refs/heads/main`, and git rewrites
+/// it only when the symbolic ref itself changes — a branch switch. An ordinary
+/// commit on the CURRENT branch rewrites `.git/refs/heads/<branch>` and leaves
+/// `.git/HEAD` untouched, so this script did not re-run and the binary kept
+/// reporting the SHA of whenever it last did. MEASURED on this repository:
+/// `.git/HEAD` mtime 2026-09-02 (the last checkout), `.git/refs/heads/main`
+/// mtime 2026-09-11 (the last commit), and `bore --version` five commits
+/// behind HEAD. It matters because the version string is what a deployment
+/// says when asked which build it is running — a performance campaign that
+/// attributes a change to a commit reads exactly this string.
+///
+/// Four paths are needed to cover the four ways HEAD can move:
+///   * `HEAD` itself           — branch switch, and commits while DETACHED
+///                               (a detached HEAD holds the sha directly, so
+///                               every commit rewrites this file)
+///   * the resolved loose ref  — a commit on the current branch: THE bug above
+///   * `packed-refs`           — the ref lives here after `git gc`
+///   * the loose ref's parent  — creating the loose ref (first commit after a
+///     directory                 gc packed it) changes the directory, not any
+///                               file being watched
+///
+/// Every path is emitted ONLY if it currently exists: cargo re-runs a build
+/// script whose watched path is missing, so naming an absent file would turn
+/// every build into a rebuild.
+fn watch_git_head() {
+    // `.git` is a FILE holding `gitdir: <path>` in a linked worktree or a
+    // submodule, and absent entirely in a crates.io tarball or a vendored copy.
+    let dot_git = Path::new(".git");
+    let git_dir: PathBuf = if dot_git.is_file() {
+        match fs::read_to_string(dot_git)
+            .ok()
+            .and_then(|s| s.trim().strip_prefix("gitdir:").map(|p| p.trim().to_string()))
+        {
+            Some(p) => PathBuf::from(p),
+            None => return,
+        }
+    } else if dot_git.is_dir() {
+        dot_git.to_path_buf()
+    } else {
+        return;
+    };
+
+    let head = git_dir.join("HEAD");
+    if !head.is_file() {
+        return;
+    }
+    println!("cargo:rerun-if-changed={}", head.display());
+
+    // In a linked worktree HEAD is per-worktree but the REFS live in the common
+    // directory, so resolve the symbolic ref against that when it is named.
+    let common = match fs::read_to_string(git_dir.join("commondir")) {
+        Ok(s) => {
+            let raw = PathBuf::from(s.trim());
+            if raw.is_absolute() {
+                raw
+            } else {
+                git_dir.join(raw)
+            }
+        }
+        Err(_) => git_dir.clone(),
+    };
+
+    let packed = common.join("packed-refs");
+    if packed.is_file() {
+        println!("cargo:rerun-if-changed={}", packed.display());
+    }
+
+    // A detached HEAD holds a raw sha and is already watched above; only a
+    // symbolic ref needs the file it points at.
+    if let Ok(content) = fs::read_to_string(&head) {
+        if let Some(refname) = content.trim().strip_prefix("ref:") {
+            let loose = common.join(refname.trim());
+            if loose.is_file() {
+                println!("cargo:rerun-if-changed={}", loose.display());
+            }
+            if let Some(parent) = loose.parent() {
+                if parent.is_dir() {
+                    println!("cargo:rerun-if-changed={}", parent.display());
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     // --- Admin UI asset bundling ---
     bundle_admin_assets();
@@ -138,10 +227,26 @@ fn main() {
 
     let sha_short = if sha.len() >= 8 { &sha[..8] } else { &sha };
 
+    // Where the sha came from. A freshness gate may compare the compiled-in sha
+    // with `git rev-parse HEAD` only when it came from `git` here: a CI build
+    // overrides it with GITHUB_SHA, which for a pull_request event is the
+    // MERGE commit and legitimately differs from the checkout's own HEAD.
+    let sha_source = if std::env::var("BORE_GIT_SHA").is_ok_and(|s| !s.is_empty())
+        || std::env::var("GITHUB_SHA").is_ok_and(|s| !s.is_empty())
+    {
+        "env"
+    } else if sha == "unknown" {
+        "unknown"
+    } else {
+        "git"
+    };
+
     println!("cargo:rustc-env=GIT_BRANCH={branch}");
     println!("cargo:rustc-env=GIT_SHA={sha}");
     println!("cargo:rustc-env=GIT_SHA_SHORT={sha_short}");
+    println!("cargo:rustc-env=GIT_SHA_SOURCE={sha_source}");
 
-    // Re-run when HEAD changes (local dev: commit / branch switch).
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    // Re-run when HEAD moves. NOT just `.git/HEAD` — see watch_git_head.
+    println!("cargo:rerun-if-changed=build.rs");
+    watch_git_head();
 }

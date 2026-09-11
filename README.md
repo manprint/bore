@@ -719,6 +719,7 @@ Direct UDP path (--features udp, on by default):
       --udp-socket-send-buffer <SIZE>             UDP socket send buffer requested for direct UDP [env: BORE_UDP_SOCKET_SEND_BUFFER=] [default: 16MiB]
       --udp-max-streams <N>                        Max native QUIC bidi streams per direct UDP connection [env: BORE_UDP_MAX_STREAMS=] [default: 4096]
       --udp-memory-budget <SIZE>                  Worst-case direct-path receive memory for the WHOLE server; derives the windows and a server-wide admission limit. Conflicts with the three window flags [env: BORE_UDP_MEMORY_BUDGET=]
+      --stun-alt-port <PORT>                      UDP port of the ALTERNATE STUN socket (RFC 5780 behaviour discovery). Lets clients measure NAT *filtering*, not just mapping. Unset/0 = ephemeral [env: BORE_STUN_ALT_PORT=]
         (SIZE accepts raw bytes or KB/MB/GB/KiB/MiB/GiB suffixes)
 
 Vhost frontend (always available, no feature flag):
@@ -1929,6 +1930,13 @@ What it tells you:
   works), or `symmetric` (endpoint-dependent → needs the *other* peer to be cone/open, and
   possibly `--try-port-prediction`). For symmetric it also reports whether the ports look
   **sequential** (prediction has a chance) or random.
+- **NAT filtering** — the *other* RFC 4787 axis, and the one that decides the hard cells.
+  Two NATs with the same `cone` mapping behave differently depending on whether the filter
+  keys on the peer's address only (`address dependent or open` → a symmetric peer CAN reach
+  you) or on address *and* port (`address+port dependent` → it cannot). Measured with
+  RFC 5780 behaviour discovery, so it needs a server that runs an alternate STUN socket:
+  `bore server --udp` does, and `unknown` means nobody could answer the question — never
+  that the NAT is restrictive. See [`docs/nat/NAT_TRAVERSAL.md` §19](docs/nat/NAT_TRAVERSAL.md).
 - **Port preservation**, **CGNAT** (`100.64.0.0/10`) / double-NAT detection, and whether a
   **UPnP-IGD** router is present.
 - A **co-location/hairpin** note when public STUN works but your own bore server's UDP does

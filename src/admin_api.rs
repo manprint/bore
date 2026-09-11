@@ -268,6 +268,29 @@ pub fn secret(server: &Server) -> Vec<SecretView> {
             relay_rx_bytes: e.relay_rx_bytes,
             transport: e.transport,
             identity: e.identity,
+            // P-10's rule, applied to the secret registry (S-1): an entry with
+            // exactly ONE possible path must never report "unknown". An entry
+            // that did not ask for `--udp` can only be on the relay, so it says
+            // so instead of shrugging.
+            //
+            // "unknown" is kept for the two cases the server genuinely cannot
+            // answer, and they are not the same case: a `--udp` CONSUMER that
+            // has not reported yet (it will), and a `--udp` PROVIDER, which
+            // never reports at all. The second is structural — a secret
+            // tunnel's direct path runs consumer↔provider and the server is not
+            // one of its endpoints, so the only side that can name the path is
+            // the side that chose it, and that side is the consumer. Answering
+            // "relay" on a provider row because that is the traffic the server
+            // can see would be a guess, and on a tunnel that went direct it
+            // would be exactly the wrong one: zero bytes cross the relay. Read
+            // the consumer row for the path.
+            current_path: if e.udp {
+                e.secret_path.to_string()
+            } else {
+                "relay".to_string()
+            },
+            direct_fallbacks: e.secret_direct_fallbacks,
+            path_reason: e.secret_path_reason,
         })
         .collect()
 }
@@ -964,6 +987,100 @@ mod tests {
     }
 
     #[test]
+    fn secret_consumers_report_a_path_and_a_relay_only_one_is_never_unknown() {
+        // S-1, and P-10's rule applied to the third registry. The secret path
+        // is the one place where "which transport?" is a genuinely open
+        // question — the direct leg runs consumer↔provider and never reaches
+        // this server — so the column has to distinguish three things that used
+        // to be indistinguishable: relay by construction, relay after a failed
+        // punch, and not-known-yet.
+        //
+        // Red-check: derive `current_path` from `secret_path` unconditionally
+        // (dropping the `e.udp &&` guard) and the first assertion fails with
+        // "unknown", which is exactly the useless answer P-10 removed from the
+        // public registry.
+        use crate::admin::{AdminRegistry, Role};
+
+        let server = Server::new(21500..=21600, None);
+        let admin: AdminRegistry = server.admin_registry();
+
+        let entry = |role: Role, id: &str, udp: bool| crate::admin::NewEntry {
+            role,
+            peer: "127.0.0.1:1234".parse().unwrap(),
+            secret_id: Some(id.to_string()),
+            public_port: None,
+            notes: None,
+            basic_auth: false,
+            https: false,
+            force_https: false,
+            carriers: 1,
+            auto_reconnect: false,
+            webserver_log: false,
+            udp,
+            vpn_relay_only: false,
+            vpn_pin_mtu: false,
+            vpn_mtu: None,
+            vpn_forward_accept: false,
+            vpn_nat_masquerade: false,
+            vpn_route_policy: None,
+            vpn_advertised: vec![],
+            vpn_nat_udp_port: None,
+            local_proxy_port: None,
+            local_host: None,
+            local_port: None,
+            nat_udp_preferred_port: None,
+            nat_udp_release_timeout: None,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
+            max_conns: None,
+            transport: crate::admin::Transport::Bore,
+            identity: None,
+        };
+        let find = |views: &Vec<crate::admin_views::SecretView>, id: &str| {
+            views
+                .iter()
+                .find(|v| v.secret_id.as_deref() == Some(id))
+                .cloned()
+                .unwrap_or_else(|| panic!("{id} is listed"))
+        };
+
+        // 1. A consumer that never asked for --udp has ONE possible path.
+        let _plain = admin.register(entry(Role::SecretConsumer, "plain", false));
+        assert_eq!(find(&secret(&server), "plain").current_path, "relay");
+
+        // 2. A --udp consumer that has been brokered a punch and has not
+        //    reported is the one case with no answer.
+        let udp_reg = admin.register(entry(Role::SecretConsumer, "udp", true));
+        assert_eq!(find(&secret(&server), "udp").current_path, "unknown");
+
+        // 3. Once it reports, the column says what actually happened — and the
+        //    reason is what makes a relay row actionable.
+        udp_reg.set_secret_path("relay", Some("udp egress blocked".into()));
+        let v = find(&secret(&server), "udp");
+        assert_eq!(v.current_path, "relay");
+        assert_eq!(v.direct_fallbacks, 1);
+        assert_eq!(v.path_reason.as_deref(), Some("udp egress blocked"));
+
+        udp_reg.set_secret_path("direct", None);
+        let v = find(&secret(&server), "udp");
+        assert_eq!(v.current_path, "direct");
+        assert_eq!(v.path_reason, None);
+
+        // 4. A PROVIDER never reports: the direct path runs consumer↔provider
+        //    and the server is not an endpoint of it, so a `--udp` provider is
+        //    honestly unknown. Answering "relay" here would be a guess that is
+        //    WRONG precisely when the tunnel is working best.
+        let _prov = admin.register(entry(Role::SecretProvider, "prov", true));
+        assert_eq!(find(&secret(&server), "prov").current_path, "unknown");
+
+        // 5. ...but a provider that never asked for --udp has one path, and
+        //    the rule that governs case 1 governs it too.
+        let _prov_plain = admin.register(entry(Role::SecretProvider, "provplain", false));
+        assert_eq!(find(&secret(&server), "provplain").current_path, "relay");
+    }
+
+    #[test]
     fn config_view_names_the_running_build() {
         // A measurement campaign, an incident report and a "did my redeploy
         // actually land?" question all need the build string, and none of them
@@ -1604,6 +1721,7 @@ reservations:
             vhost_http_port: None,
             vhost_https_port: None,
             vhost_quic_port: None,
+            stun_alt_port: Some(0),
             vhost_mode: None,
             vhost_config: None,
             vhost_cert_file: None,
@@ -1630,6 +1748,7 @@ reservations:
 
         // Test unset buffers serialize as null
         let view_unset = ConfigView {
+            stun_alt_port: Some(0),
             udp_socket_send_buffer: None,
             udp_socket_recv_buffer: None,
             vhost_config: Some("/etc/bore/vhost.toml".into()),
@@ -1662,6 +1781,7 @@ reservations:
     fn t_cfg_new_fields() {
         // T-CFG: test ConfigView serializes new operator-tunable fields.
         let view = ConfigView {
+            stun_alt_port: Some(0),
             server_version: crate::FULL_VERSION.to_string(),
             port_range: "1000-2000".into(),
             control_port: 7835,
@@ -1794,6 +1914,9 @@ reservations:
             relay_rx_bytes: 0,
             transport: crate::admin::Transport::Bore,
             identity: None,
+            current_path: "relay".into(),
+            direct_fallbacks: 0,
+            path_reason: None,
         };
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["notes"].as_str(), Some("provider notes"));

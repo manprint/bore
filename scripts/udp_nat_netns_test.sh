@@ -12,15 +12,48 @@
 #                                                          ns0 "internet"
 #   nscli (10.2.0.2) ─ nsnat2{10.2.0.1 | 192.0.3.1 masq} ─┘ (bore server --udp)
 #
-# Scenarios:
-#   T-NAT-DIRECT        default masquerade both sides (EIM-ish + APDF)
-#                       → hole-punch succeeds, data over the DIRECT path
-#   T-NAT-RANDOM-RELAY  fully-random masquerade both sides (APDM-ish)
-#                       → punch fails, data still flows over the RELAY
-#   T-NAT-BLOCKED-RELAY UDP dropped on the consumer NAT
-#                       → discovery fails, data still flows over the RELAY
+# What this proves that the in-process lab cannot: the RFC 4787 profile of a
+# real Linux router is produced by conntrack, not by a policy enum, and the
+# two axes are controlled by different mechanisms:
 #
-# Usage: sudo scripts/udp_nat_netns_test.sh
+#   MAPPING    `masquerade`               -> endpoint-INDEPENDENT (EIM): the
+#                                            same internal port is reused for
+#                                            every destination when it is free
+#              `masquerade fully-random`  -> endpoint-DEPENDENT (EDM, the
+#                                            "symmetric" NAT): a fresh random
+#                                            source port per flow
+#
+#   FILTERING  conntrack alone            -> address+port dependent (APDF):
+#                                            only the exact reply tuple gets
+#                                            back in. The typical home router.
+#              + dnat from a punched-addr -> address dependent (ADF): any port
+#                set                        of a peer we have sent to.
+#              + unconditional dnat       -> endpoint independent (EIF), the
+#                                            "full cone" / static port-forward.
+#
+# The filtering axis needs an explicit `dnat` because a masquerading router
+# has no other way to know WHICH inside host an unsolicited datagram belongs
+# to — which is also exactly why, in the field, "open the port" and "full
+# cone" are the same sentence. The inside peer therefore runs with
+# `--nat-udp-preferred-port` so the forward has a fixed target.
+#
+# Scenarios (provider x consumer; the DOC's §6 matrix is the oracle):
+#   T-NAT-DIRECT           EIM+APDF x EIM+APDF  -> DIRECT (crossfire punch)
+#   T-NAT-RANDOM-RELAY     EDM      x EDM       -> RELAY
+#   T-NAT-BLOCKED-RELAY    UDP egress dropped   -> RELAY
+#   T-NAT-APDF-VS-EDM      EIM+APDF x EDM       -> RELAY  (the classic
+#                          "port-restricted home provider cannot serve a
+#                           mobile/symmetric consumer" cell)
+#   T-NAT-ADF-VS-EDM       EIM+ADF  x EDM       -> DIRECT (one filtering step
+#                          looser flips the SAME cell: this is the rule the
+#                          in-process lab extracted and the reason §13's
+#                          "test-udp reports the mapping, not the filtering"
+#                          is a real gap and not a cosmetic one)
+#   T-NAT-EIF-VS-EDM       EIM+EIF  x EDM       -> DIRECT (a port-forwarded
+#                          provider serves any consumer with UDP egress)
+#
+# Usage: sudo scripts/udp_nat_netns_test.sh [scenario ...]
+#        BORE_NAT_CASES="T-NAT-ADF-VS-EDM" sudo -E scripts/udp_nat_netns_test.sh
 # Exit code: 0 = all tests passed, nonzero = failures
 
 set -euo pipefail
@@ -54,6 +87,36 @@ SERVER_IP2="192.0.3.100"       # ns0 side of the nsnat2 link
 CTRL_PORT="7835"
 ECHO_PORT="9111"
 PROXY_PORT="9555"
+# Fixed UDP ports for the sides whose router forwards a port (ADF/EIF). They
+# must differ so the two routers' rules can never be confused in a log.
+# Per-cell UDP source ports, NOT one fixed pair for the whole matrix.
+#
+# This is isolation, not cosmetics. A conntrack entry is keyed by the 5-tuple,
+# and a nat chain is traversed only by the FIRST packet of a flow: with one
+# fixed port, cell N+1's STUN flow (10.1.0.2:PORT -> server:7835) reuses cell
+# N's entry, so the router's freshly installed rules never run — the
+# `@punched` set stays empty and the `update` rule never fires. MEASURED: run
+# alone, T-NAT-FILTER-ADF reads `adf-or-eif`; run straight after
+# T-NAT-FILTER-APDF on the same port, it read `apdf`, i.e. the harness
+# reported the PREVIOUS cell's router. `flush_conntrack` was supposed to
+# prevent exactly this and could not: the `conntrack` tool is not installed on
+# every box and the flush failed silently (see below).
+#
+# The sequence number is bumped for EVERY cell, before the case filter, so a
+# cell's ports are a property of its position in this file and one cell
+# re-run in isolation uses the same ports it uses in a full run.
+PROV_UDP_PORT_BASE="41641"
+CONS_UDP_PORT_BASE="41741"
+CELL_SEQ=0
+PROV_UDP_PORT="$PROV_UDP_PORT_BASE"
+CONS_UDP_PORT="$CONS_UDP_PORT_BASE"
+cell_ports() {
+    CELL_SEQ=$((CELL_SEQ + 1))
+    PROV_UDP_PORT=$((PROV_UDP_PORT_BASE + CELL_SEQ))
+    CONS_UDP_PORT=$((CONS_UDP_PORT_BASE + CELL_SEQ))
+}
+# Optional case filter: positional arguments first, then BORE_NAT_CASES.
+CASES="${*:-${BORE_NAT_CASES:-}}"
 # Fixed dir, wiped at START (not exit) so a failed run leaves its logs behind.
 TMPDIR="/tmp/bore_udpnat_last"
 PASS=0
@@ -124,13 +187,51 @@ build_topology() {
     ip netns exec nsnat2 sysctl -qw net.ipv4.ip_forward=1
 }
 
-# nat_rules <ns> <wan-if> <mode: default|random>
+# nat_rules <ns> <wan-if> <mapping: eim|edm> [filtering: apdf|adf|eif] [lan-ip] [port]
+#
+# `mapping` and `filtering` are INDEPENDENT axes (RFC 4787 §4.1 / §5) and the
+# whole point of this harness is that a real kernel implements them with two
+# different mechanisms. Defaults reproduce the previous two-mode behaviour
+# byte-for-byte: `eim`/`edm` with no filtering argument is `apdf`, which is
+# plain conntrack and what every scenario before this matrix used.
 nat_rules() {
-    local ns="$1" wan="$2" mode="$3"
+    local ns="$1" wan="$2" mapping="$3" filtering="${4:-apdf}" lan_ip="${5:-}" port="${6:-}"
     ip netns exec "$ns" nft flush ruleset
     ip netns exec "$ns" nft add table ip nat
+    # The set of addresses this router has SENT a UDP datagram to. It is what
+    # makes address-dependent filtering expressible: "an unsolicited datagram
+    # from a peer we already talked to". The timeout is generous relative to a
+    # punch round; a real router's UDP conntrack timeout is 30-180 s.
+    if [ "$filtering" = "adf" ]; then
+        ip netns exec "$ns" nft add set ip nat punched \
+            '{ type ipv4_addr ; flags dynamic,timeout ; timeout 3m ; }'
+    fi
+    # PREROUTING first: the filtering axis. A masquerading router cannot
+    # deliver an unsolicited datagram without being told which inside host
+    # owns the port, so "looser than APDF" IS a port forward, conditional on
+    # the source for ADF and unconditional for EIF.
+    if [ "$filtering" != "apdf" ]; then
+        [ -n "$lan_ip" ] && [ -n "$port" ] || die "nat_rules $filtering needs a lan ip and a port"
+        ip netns exec "$ns" nft add chain ip nat prerouting \
+            '{ type nat hook prerouting priority -100 ; }'
+        if [ "$filtering" = "adf" ]; then
+            ip netns exec "$ns" nft add rule ip nat prerouting iifname "$wan" \
+                udp dport "$port" ip saddr @punched dnat to "$lan_ip:$port"
+        else
+            ip netns exec "$ns" nft add rule ip nat prerouting iifname "$wan" \
+                udp dport "$port" dnat to "$lan_ip:$port"
+        fi
+    fi
     ip netns exec "$ns" nft add chain ip nat postrouting '{ type nat hook postrouting priority 100 ; }'
-    if [ "$mode" = "random" ]; then
+    # Recording must come BEFORE the masquerade rule: `update` does not
+    # terminate evaluation, but a `masquerade` verdict does. A nat chain is
+    # only traversed by the FIRST packet of a flow, which is precisely the
+    # punch that opens the hole — exactly the event ADF keys on.
+    if [ "$filtering" = "adf" ]; then
+        ip netns exec "$ns" nft add rule ip nat postrouting oifname "$wan" \
+            ip protocol udp update @punched '{ ip daddr }'
+    fi
+    if [ "$mapping" = "edm" ] || [ "$mapping" = "random" ]; then
         # Fully-random per-flow port allocation ≈ endpoint-dependent mapping.
         ip netns exec "$ns" nft add rule ip nat postrouting oifname "$wan" masquerade fully-random
     else
@@ -143,6 +244,10 @@ nat_rules() {
     # random port (observed live: advertised :59246, remapped :49254) and the
     # hole-punch deadlocks. A dropped packet's conntrack entry is never
     # confirmed, so port preservation survives. Home routers behave this way.
+    #
+    # NOTE this is the router's own INPUT, never FORWARD: a packet that the
+    # prerouting dnat above redirected to a LAN host is forwarded, not input,
+    # so the two rules do not contradict each other.
     ip netns exec "$ns" nft add table ip filter
     ip netns exec "$ns" nft add chain ip filter input '{ type filter hook input priority 0 ; }'
     ip netns exec "$ns" nft add rule ip filter input ct state established,related accept
@@ -156,8 +261,17 @@ block_udp() {
     ip netns exec "$ns" nft add rule ip filter forward oifname "$wan" ip protocol udp drop
 }
 
+# Best-effort conntrack flush. It is BEST-EFFORT on purpose and must never be
+# the only thing isolating two cells: `conntrack` is a separate package
+# (conntrack-tools) that is absent on a stock box, and the old body hid that
+# behind `2>/dev/null || true` — a harness that believes it flushed when it
+# did not is worse than one that never tried, because it fabricates results
+# (see the port comment above). The real isolation is the per-cell port pair;
+# this stays because it also clears the INBOUND entries a punch leaves behind.
+CONNTRACK_TOOL="$(command -v conntrack || true)"
 flush_conntrack() {
-    ip netns exec "$1" conntrack -F 2>/dev/null || true
+    [ -n "$CONNTRACK_TOOL" ] || return 0
+    ip netns exec "$1" "$CONNTRACK_TOOL" -F >/dev/null 2>&1 || true
 }
 
 wait_tcp() {
@@ -169,15 +283,53 @@ wait_tcp() {
     return 1
 }
 
-# run_scenario <label> <nat-mode> <block-consumer-udp: yes|no> <expect: direct|relay>
+# run_scenario <label> <prov-profile> <cons-profile> <block-consumer-udp> <expect>
+#
+# A profile is `<mapping>:<filtering>` — `eim:apdf` is the typical home
+# router, `edm:apdf` the symmetric/mobile one, `eim:adf` a restricted cone and
+# `eim:eif` a full cone (a static UDP port forward). The legacy two-argument
+# form is still accepted so the three original scenarios read unchanged.
 run_scenario() {
-    local label="$1" mode="$2" block="$3" expect="$4"
+    local label="$1" prov_prof="$2" cons_prof="$3" block="$4" expect="$5"
     local id="udpnat-${label}"
     local sdir="$TMPDIR/$label"
+
+    # Before the case filter: a cell keeps its ports whether or not the rest
+    # of the matrix runs.
+    cell_ports
+
+    # Honour a case filter so ONE cell can be re-run in isolation: a matrix
+    # that takes minutes is a matrix nobody re-runs while investigating.
+    if [ -n "${CASES:-}" ] && ! printf '%s\n' $CASES | grep -qx "$label"; then
+        return
+    fi
     mkdir -p "$sdir"
 
-    nat_rules nsnat1 vn1w "$mode"
-    nat_rules nsnat2 vn2w "$mode"
+    # `<mapping>:<filtering>[:port]`. The optional third field forces
+    # `--nat-udp-preferred-port` on a side whose filtering does NOT need it,
+    # which exists for exactly one reason: it is the control that isolates the
+    # dnat as the cause of a DIRECT result. Without it, `eim:adf` differs from
+    # `eim:apdf` in TWO things — the forward AND the fixed, port-preserved
+    # mapping — and a two-variable comparison proves nothing.
+    local prov_map cons_map prov_filt cons_filt
+    prov_map="$(printf '%s' "$prov_prof" | cut -d: -f1)"
+    prov_filt="$(printf '%s' "$prov_prof" | cut -d: -f2)"
+    cons_map="$(printf '%s' "$cons_prof" | cut -d: -f1)"
+    cons_filt="$(printf '%s' "$cons_prof" | cut -d: -f2)"
+    local prov_port_flag=() cons_port_flag=()
+    # A side whose filtering is looser than APDF ALWAYS needs a fixed port:
+    # that is what the router's dnat targets, and what a real operator
+    # configures. The `:port` suffix asks for it anyway.
+    if [ "$prov_filt" != "apdf" ] || [ "${prov_prof##*:}" = "port" ]; then
+        prov_port_flag=(--nat-udp-preferred-port "$PROV_UDP_PORT")
+    fi
+    if [ "$cons_filt" != "apdf" ] || [ "${cons_prof##*:}" = "port" ]; then
+        cons_port_flag=(--nat-udp-preferred-port "$CONS_UDP_PORT")
+    fi
+
+    echo "--- $label: provider $prov_prof  x  consumer $cons_prof  (expect $expect) ---"
+    nat_rules nsnat1 vn1w "$prov_map" "$prov_filt" 10.1.0.2 "$PROV_UDP_PORT"
+    nat_rules nsnat2 vn2w "$cons_map" "$cons_filt" 10.2.0.2 "$CONS_UDP_PORT"
     if [ "$block" = "yes" ]; then block_udp nsnat2 vn2w; fi
     flush_conntrack nsnat1
     flush_conntrack nsnat2
@@ -195,6 +347,7 @@ run_scenario() {
         --to "http://$SERVER_IP:$CTRL_PORT" --secret "$SECRET" \
         --tcp-secret-id "$id" --udp \
         --stun-server "$SERVER_IP:$CTRL_PORT" \
+        "${prov_port_flag[@]}" \
         >"$sdir/provider.log" 2>&1 &
     local prov_pid=$!
     sleep 1.5
@@ -206,6 +359,7 @@ run_scenario() {
         --tcp-secret-id "$id" --udp \
         --stun-server "$SERVER_IP2:$CTRL_PORT" \
         --local-proxy-port "127.0.0.1:$PROXY_PORT" \
+        "${cons_port_flag[@]}" \
         >"$sdir/consumer.log" 2>&1 &
     local cons_pid=$!
 
@@ -255,6 +409,66 @@ run_scenario() {
     sleep 0.3
 }
 
+# run_filter_probe <label> <provider-profile> <expect: apdf|adf-or-eif>
+#
+# Runs the STANDALONE `bore test-udp` diagnostic behind a router of a known
+# filtering profile and asserts that the tool REPORTS that profile.
+#
+# This is the gate that makes the §13 gap closed rather than merely coded:
+# every other assertion in this file measures what the punch DOES, while this
+# one measures whether the diagnostic can PREDICT it. They are different
+# claims and the second is the one an operator acts on — `bore test-udp` is
+# what gets run before deciding whether a direct path is worth pursuing, and
+# until now it could only report the mapping, which the matrix above shows is
+# not the axis that decides.
+run_filter_probe() {
+    local label="$1" prof="$2" expect="$3"
+    local sdir="$TMPDIR/$label"
+
+    cell_ports
+    if [ -n "${CASES:-}" ] && ! printf '%s\n' $CASES | grep -qx "$label"; then
+        return
+    fi
+    mkdir -p "$sdir"
+    local map filt
+    map="$(printf '%s' "$prof" | cut -d: -f1)"
+    filt="$(printf '%s' "$prof" | cut -d: -f2)"
+    echo "--- $label: probe behind $prof (expect filtering=$expect) ---"
+    nat_rules nsnat1 vn1w "$map" "$filt" 10.1.0.2 "$PROV_UDP_PORT"
+    flush_conntrack nsnat1
+
+    # The fixed port is what the router's forward targets; it is also what a
+    # real operator configures, so the diagnostic is exercised in the shape it
+    # is actually used.
+    ip netns exec nsprov env RUST_LOG=info "$BORE" test-udp \
+        --to "http://$SERVER_IP:$CTRL_PORT" \
+        --stun-server "$SERVER_IP:$CTRL_PORT" \
+        --nat-udp-preferred-port "$PROV_UDP_PORT" \
+        >"$sdir/test-udp.log" 2>&1 || true
+
+    # The router's own view, captured every run: when a cell disagrees with
+    # the matrix the first question is always whether the rule matched, and
+    # re-running to find out costs a full teardown.
+    ip netns exec nsnat1 nft list ruleset >"$sdir/router.nft" 2>&1 || true
+
+    local line
+    line=$(grep -m1 '^NAT filtering' "$sdir/test-udp.log" 2>/dev/null || true)
+    if [ -z "$line" ]; then
+        fail "$label: the diagnostic printed no NAT filtering line (see $sdir/test-udp.log)"
+        return
+    fi
+    case "$expect" in
+        apdf)       want='address+port dependent' ;;
+        adf-or-eif) want='address dependent or open' ;;
+        *)          want="$expect" ;;
+    esac
+    if printf '%s' "$line" | grep -qF "$want"; then
+        pass "$label: $line"
+    else
+        fail "$label: expected '$want', got '$line'"
+    fi
+}
+
 # ── Run ─────────────────────────────────────────────────────────────────────
 build_topology
 
@@ -265,9 +479,31 @@ if ! wait_tcp ns0 "$SERVER_IP" "$CTRL_PORT"; then
     die "bore server never came up (see $TMPDIR/server.log)"
 fi
 
-run_scenario "T-NAT-DIRECT" default no direct
-run_scenario "T-NAT-RANDOM-RELAY" random no relay
-run_scenario "T-NAT-BLOCKED-RELAY" default yes relay
+# The three original smoke cells, unchanged in meaning.
+run_scenario "T-NAT-DIRECT"        eim:apdf eim:apdf no direct
+run_scenario "T-NAT-RANDOM-RELAY"  edm:apdf edm:apdf no relay
+run_scenario "T-NAT-BLOCKED-RELAY" eim:apdf eim:apdf yes relay
+
+# The matrix cells the documentation asserts and nothing on a real kernel
+# proved. All three share the SAME consumer — endpoint-dependent mapping, the
+# mobile/CGNAT shape — and differ only in the provider's FILTERING, which is
+# the axis `bore test-udp` does not currently report (§13). The outcome flips
+# across them, which is what makes that gap matter.
+run_scenario "T-NAT-APDF-VS-EDM"   eim:apdf      edm:apdf no relay
+run_scenario "T-NAT-ADF-VS-EDM"    eim:adf       edm:apdf no direct
+run_scenario "T-NAT-EIF-VS-EDM"    eim:eif       edm:apdf no direct
+
+# The control for the two DIRECT cells above: the SAME fixed, port-preserved
+# mapping, WITHOUT the router's forward. If this went direct, the forward
+# would not be what the pair is measuring and the two cells above would be
+# proving nothing — so its expected RELAY is a red-check, not a smoke test.
+run_scenario "T-NAT-FIXEDPORT-VS-EDM" eim:apdf:port edm:apdf no relay
+
+# Does the DIAGNOSTIC see what the matrix just proved? Same two routers, read
+# through `bore test-udp` instead of through a punch. A tool that cannot tell
+# these two apart cannot advise on the cells above.
+run_filter_probe "T-NAT-FILTER-APDF" eim:apdf apdf
+run_filter_probe "T-NAT-FILTER-ADF"  eim:adf  adf-or-eif
 
 kill -9 "$SERVER_PID" 2>/dev/null || true
 

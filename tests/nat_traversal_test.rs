@@ -459,6 +459,84 @@ async fn symmetric_dialer_vs_eim_adf_listener_direct() -> Result<()> {
     Ok(())
 }
 
+/// The cell `docs/nat/NAT_TRAVERSAL.md` §6 calls the common domestic failure
+/// and which, until this test, NOTHING exercised: provider behind a
+/// **port-restricted** cone (EIM + APDF — the default home router) and
+/// consumer behind a **symmetric** NAT (mobile/CGNAT/corporate).
+///
+/// It is one filtering step away from `symmetric_dialer_vs_eim_adf_listener_direct`
+/// above, and that one step is the whole outcome. With ADF the provider's
+/// filter checks only the consumer's IP, so the consumer's per-destination
+/// source PORT may differ from the one it advertised and the packet still
+/// passes. With APDF the filter checks IP **and** port, the symmetric
+/// consumer's real source port is not the advertised one, and the provider
+/// never opened a hole for it. The authenticated check round cannot rescue
+/// this: the provider's own checks leave through its NAT toward the
+/// consumer's ADVERTISED address, which the consumer's symmetric mapping
+/// does not answer on.
+///
+/// Pinned as RELAY because that is what it MUST do today — not because relay
+/// is the desired end state. This is the row a birthday-paradox / port-scan
+/// traversal would have to flip, and pinning it first is what makes such a
+/// change measurable instead of asserted. If this test ever fails with a
+/// DIRECT path, the traversal got better and the matrix in §6 owes an update.
+#[tokio::test]
+async fn symmetric_dialer_vs_port_restricted_listener_stays_relay() -> Result<()> {
+    let stun = world_stun().await?;
+    // NatPolicy::cone() is EIM + APDF: the port-restricted cone.
+    let listener = setup_peer(Some(NatBox::numbered(51, NatPolicy::cone())), stun, false).await?;
+    let dialer = setup_peer(
+        Some(NatBox::numbered(52, NatPolicy::symmetric())),
+        stun,
+        false,
+    )
+    .await?;
+    let attempt = attempt_direct(listener, dialer).await;
+    assert_relay(&attempt, "APDM dialer vs EIM+APDF listener");
+    Ok(())
+}
+
+/// The MIRROR of the row above — and it does NOT flip, which is the point.
+///
+/// Provider symmetric, consumer port-restricted (EIM+APDF). Swapping the roles
+/// of two NATs usually changes the outcome in this matrix, so the obvious
+/// guess is that this one goes direct; the neighbouring
+/// `symmetric_dialer_vs_eim_adf_listener_direct` does exactly that. It was
+/// written asserting DIRECT and the lab refuted it —
+/// `listener accept timed out` — which matches §6's row for a symmetric
+/// provider: `✗` against EVERY consumer column except via port prediction.
+///
+/// Together with its three neighbours this pins the rule that actually governs
+/// the symmetric cells, and it is about FILTERING, not mapping:
+///
+/// > When one peer is symmetric (EDM), the other peer's filter must be at most
+/// > **ADF** (address-dependent, IP only). An **APDF** (address-AND-port
+/// > dependent) filter blocks it, because the symmetric peer's real source
+/// > port is per-destination and is never the one the other side punched to.
+///
+///   symmetric listener × ADF  dialer   → DIRECT  (…_direct_via_checks)
+///   symmetric listener × APDF dialer   → RELAY   (this test)
+///   ADF  listener × symmetric dialer   → DIRECT  (symmetric_dialer_vs_eim_adf_…)
+///   APDF listener × symmetric dialer   → RELAY   (…_stays_relay above)
+///
+/// Which is why "cone" alone is not a useful answer from a diagnostic, and why
+/// §13 lists "`test-udp` detects the mapping, not the filtering" as a known
+/// limit: the two rows that differ here report the SAME mapping.
+#[tokio::test]
+async fn port_restricted_dialer_vs_symmetric_listener_stays_relay() -> Result<()> {
+    let stun = world_stun().await?;
+    let listener = setup_peer(
+        Some(NatBox::numbered(53, NatPolicy::symmetric())),
+        stun,
+        false,
+    )
+    .await?;
+    let dialer = setup_peer(Some(NatBox::numbered(54, NatPolicy::cone())), stun, false).await?;
+    let attempt = attempt_direct(listener, dialer).await;
+    assert_relay(&attempt, "EIM+APDF dialer vs APDM listener");
+    Ok(())
+}
+
 /// Baseline row 5 — symmetric/symmetric (APDM+APDF both): must stay relay,
 /// with or without future connectivity checks (no false-positive direct).
 #[tokio::test]

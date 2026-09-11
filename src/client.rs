@@ -1162,6 +1162,9 @@ impl Client {
                             tuning,
                             peer_id: _,
                             v2,
+                            // Provider role: the consumer reports the pair's
+                            // path (S-1), so this side ignores the capability.
+                            path_report: _,
                         }) => {
                             #[cfg(feature = "udp")]
                             {

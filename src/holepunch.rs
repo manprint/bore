@@ -522,7 +522,35 @@ struct TraversalInner {
 
 struct PendingStun {
     target: SocketAddr,
-    tx: oneshot::Sender<SocketAddr>,
+    /// Accept an answer from ANY port of `target`'s IP.
+    ///
+    /// Only the RFC 5780 filtering probe sets this, and it is the whole point
+    /// of that probe: the answer is REQUESTED from a port the client never
+    /// wrote to, so demuxing on the exact 5-tuple would discard exactly the
+    /// datagram being measured. Widening the match to the IP keeps the guard
+    /// that matters — a stranger cannot resolve someone else's transaction —
+    /// while the 12-byte transaction id, which the querier generated from the
+    /// system CSPRNG, remains the actual authenticator.
+    any_port: bool,
+    tx: oneshot::Sender<StunReply>,
+}
+
+/// A resolved STUN transaction: the mapped address the server reported, and
+/// the address the answer actually CAME FROM.
+///
+/// The source is carried because for a filtering probe it is the measurement:
+/// a server that ignores CHANGE-REQUEST answers from its ordinary port while
+/// still filling in whatever attributes it likes, so only the 5-tuple the
+/// kernel reports can distinguish "the server changed ports" from "the server
+/// does not implement this".
+#[derive(Debug, Clone, Copy)]
+struct StunReply {
+    mapped: SocketAddr,
+    from: SocketAddr,
+    /// The server's RFC 5780 OTHER-ADDRESS, when it published one. Its
+    /// presence — not its value — is what makes a negative filtering result
+    /// meaningful: it proves the server COULD have answered from another port.
+    other: Option<SocketAddr>,
 }
 
 /// Which side of the pair this peer plays during connectivity checks. Mirrors
@@ -930,27 +958,103 @@ impl UdpTraversalSocket {
     /// [`STUN_TIMEOUT`] each, mirroring the legacy serial probe's persistence.
     /// Safe to run concurrently with other transactions on the same socket.
     pub async fn stun_query(&self, target: SocketAddr) -> Result<SocketAddr> {
+        self.stun_query_full(target).await.map(|r| r.mapped)
+    }
+
+    /// [`Self::stun_query`], keeping the raw answer's source address.
+    async fn stun_query_full(&self, target: SocketAddr) -> Result<StunReply> {
         for _attempt in 0..3 {
             let (request, txid) = stun::binding_request();
-            let (tx, rx) = oneshot::channel();
-            self.inner
-                .pending_stun
-                .lock()
-                .unwrap()
-                .insert(txid, PendingStun { target, tx });
-            if let Err(err) = self.socket.send_to(&request, target).await {
-                self.inner.pending_stun.lock().unwrap().remove(&txid);
-                return Err(err).context("STUN send failed");
-            }
-            match timeout(STUN_TIMEOUT, rx).await {
-                Ok(Ok(mapped)) => return Ok(mapped),
-                Ok(Err(_actor_gone)) => bail!("traversal socket recv actor stopped"),
-                Err(_) => {
-                    self.inner.pending_stun.lock().unwrap().remove(&txid);
-                }
+            match self
+                .stun_transaction(target, &request, txid, false, STUN_TIMEOUT)
+                .await
+            {
+                Ok(Some(reply)) => return Ok(reply),
+                Ok(None) => continue,
+                Err(err) => return Err(err),
             }
         }
         bail!("no STUN response from {target}")
+    }
+
+    /// Run ONE STUN transaction through the recv actor. `Ok(None)` is a clean
+    /// timeout (the caller decides whether to retry); an `Err` means the send
+    /// failed or the actor is gone, neither of which retrying can fix.
+    async fn stun_transaction(
+        &self,
+        target: SocketAddr,
+        request: &[u8],
+        txid: [u8; 12],
+        any_port: bool,
+        wait: Duration,
+    ) -> Result<Option<StunReply>> {
+        let (tx, rx) = oneshot::channel();
+        self.inner.pending_stun.lock().unwrap().insert(
+            txid,
+            PendingStun {
+                target,
+                any_port,
+                tx,
+            },
+        );
+        if let Err(err) = self.socket.send_to(request, target).await {
+            self.inner.pending_stun.lock().unwrap().remove(&txid);
+            return Err(err).context("STUN send failed");
+        }
+        match timeout(wait, rx).await {
+            Ok(Ok(reply)) => Ok(Some(reply)),
+            Ok(Err(_actor_gone)) => bail!("traversal socket recv actor stopped"),
+            Err(_) => {
+                self.inner.pending_stun.lock().unwrap().remove(&txid);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Measure this socket's NAT FILTERING against an RFC 5780 server.
+    ///
+    /// The traversal-socket twin of [`probe_filtering`]; see that function for
+    /// why the answer's SOURCE, and not its RESPONSE-ORIGIN attribute, is what
+    /// classifies the result.
+    pub async fn probe_filtering(&self, target: SocketAddr) -> FilterProbe {
+        // Only a server that publishes OTHER-ADDRESS can be asked, and that
+        // has to be learned from a full response, so this runs its own
+        // baseline query rather than reusing the chain's.
+        let (request, txid) = stun::binding_request();
+        let mut supported = false;
+        for _ in 0..FILTER_PROBE_ATTEMPTS {
+            match self
+                .stun_transaction(target, &request, txid, false, STUN_TIMEOUT)
+                .await
+            {
+                Ok(Some(reply)) => {
+                    supported = reply.other.is_some();
+                    break;
+                }
+                Ok(None) => continue,
+                Err(_) => return FilterProbe::Unsupported,
+            }
+        }
+        if !supported {
+            return FilterProbe::Unsupported;
+        }
+        let (probe, probe_txid) = stun::binding_request_change_port();
+        for _ in 0..FILTER_PROBE_ATTEMPTS {
+            match self
+                .stun_transaction(target, &probe, probe_txid, true, FILTER_PROBE_TIMEOUT)
+                .await
+            {
+                Ok(Some(reply)) if reply.from.port() != target.port() => {
+                    return FilterProbe::AddressDependentOrOpen
+                }
+                // Answered from the ordinary port: the server ignored the
+                // change request, which is "cannot ask", never "blocked".
+                Ok(Some(_)) => return FilterProbe::Unsupported,
+                Ok(None) => continue,
+                Err(_) => return FilterProbe::Unsupported,
+            }
+        }
+        FilterProbe::AddressAndPortDependent
     }
 
     /// Probe a whole STUN chain concurrently under ONE global budget
@@ -1115,6 +1219,29 @@ impl UdpTraversalSocket {
                 "STUN chain exhausted its global budget; no reflexive discovered"
             );
         }
+        // FILTERING (plan Fase 6), measured against the server that just
+        // answered. Running it here rather than in a separate pass is what
+        // keeps it free: the mapping is already open, so the probe is two
+        // datagrams on a socket that is about to be used anyway.
+        //
+        // It runs ONLY when a reflexive address was found. Without one there
+        // is no mapping to measure, and a probe against an unreachable server
+        // would time out and be read as a restrictive filter — the expensive
+        // direction to be wrong in, because the plan steers toward the relay
+        // on it.
+        if let Some(sel) = &selected {
+            let probe = self.probe_filtering(sel.addr).await;
+            profile.filtering = probe.legacy();
+            profile.filtering_probe = match probe {
+                FilterProbe::AddressDependentOrOpen => {
+                    Some(crate::shared::UdpFilterProbe::AddressDependentOrOpen)
+                }
+                FilterProbe::AddressAndPortDependent => {
+                    Some(crate::shared::UdpFilterProbe::AddressAndPortDependent)
+                }
+                FilterProbe::Unsupported => None,
+            };
+        }
         info!(
             profile = %profile.summary(),
             selected = selected.as_ref().map(|s| s.requested.as_str()),
@@ -1248,8 +1375,11 @@ async fn recv_actor(socket: std::sync::Arc<UdpSocket>, inner: std::sync::Arc<Tra
             match pending.get(&txid) {
                 // Demux by txid AND full ip:port source: a response from
                 // anyone but the queried server never resolves the
-                // transaction (it stays pending for the real answer).
+                // transaction (it stays pending for the real answer). The one
+                // exception is a filtering probe, which ASKED to be answered
+                // from another port of the same server.
                 Some(p) if p.target == from => pending.remove(&txid),
+                Some(p) if p.any_port && p.target.ip() == from.ip() => pending.remove(&txid),
                 _ => None,
             }
         };
@@ -1260,7 +1390,12 @@ async fn recv_actor(socket: std::sync::Arc<UdpSocket>, inner: std::sync::Arc<Tra
         };
         match stun::parse_response(&buf[..n], &txid) {
             Some(mapped) => {
-                let _ = waiter.tx.send(mapped);
+                let other = stun::parse_other_address(&buf[..n]);
+                let _ = waiter.tx.send(StunReply {
+                    mapped,
+                    from,
+                    other,
+                });
             }
             None => {
                 inner.stray_stun.fetch_add(1, Ordering::Relaxed);
@@ -2205,10 +2340,26 @@ pub async fn diagnose(
             Err(err) => println!("  [FAIL] {server:<26} -> {err}"),
         }
     }
+    // The RESOLVED address of every server that answered is kept: the
+    // filtering probe below needs to send to the same server again, and
+    // re-resolving could land on a different address of a round-robin name,
+    // which would silently measure a different NAT path than the one just
+    // classified.
+    let mut filter_targets: Vec<SocketAddr> = Vec::new();
     if let Some(server) = stun_override {
-        match probe_one(&socket, server).await {
-            Ok(refl) => println!("  [ ok ] {server:<26} -> {refl}  (--stun-server)"),
-            Err(err) => println!("  [FAIL] {server:<26} -> {err}  (--stun-server)"),
+        match tokio::net::lookup_host(server)
+            .await
+            .ok()
+            .and_then(|mut it| it.next())
+        {
+            Some(addr) => match discover_reflexive(&socket, addr).await {
+                Ok(refl) => {
+                    println!("  [ ok ] {server:<26} -> {refl}  (--stun-server)");
+                    filter_targets.push(addr);
+                }
+                Err(err) => println!("  [FAIL] {server:<26} -> {err}  (--stun-server)"),
+            },
+            None => println!("  [FAIL] {server:<26} -> resolve failed  (--stun-server)"),
         }
     }
 
@@ -2220,6 +2371,11 @@ pub async fn diagnose(
                 Ok(refl) => {
                     println!("  [ ok ] bore server {addr:<20} -> {refl}  (your --to)");
                     bore_reachable = Some(true);
+                    // First in the list: it is the deployment the tunnel will
+                    // actually use, and the only kind of server that still
+                    // implements RFC 5780 behaviour discovery in practice.
+                    filter_targets.retain(|t| *t != addr);
+                    filter_targets.insert(0, addr);
                 }
                 Err(err) => {
                     println!("  [FAIL] bore server {addr:<20} -> {err}  (your --to)");
@@ -2271,6 +2427,43 @@ pub async fn diagnose(
                 "  -> Direct path works only if the *other* peer is cone/open. Symmetric+symmetric"
             );
             println!("     or symmetric+CGNAT cannot punch and falls back to the relay.");
+        }
+    }
+
+    // 4b. FILTERING (RFC 4787 §5, measured per RFC 5780 §4.4). The class above
+    //     is the MAPPING axis, and a real-kernel matrix
+    //     (`scripts/udp_nat_netns_test.sh`) shows it is not the axis that
+    //     decides a punch against a symmetric peer: `eim:adf` reaches one and
+    //     `eim:apdf` does not, with identical mapping and identical verdict
+    //     text above. Reporting only the mapping is what §13 of
+    //     `docs/nat/NAT_TRAVERSAL.md` listed as a known gap.
+    //
+    //     The probe costs at most two extra STUN exchanges against a server
+    //     that already answered, and it is skipped entirely when no server
+    //     published an OTHER-ADDRESS — which is the common case on the public
+    //     chain, and is reported as "unknown", never as a restriction.
+    let mut filtering = FilterProbe::Unsupported;
+    for target in &filter_targets {
+        let outcome = probe_filtering(&socket, *target).await;
+        if outcome != FilterProbe::Unsupported {
+            filtering = outcome;
+            break;
+        }
+    }
+    println!();
+    println!("NAT filtering    : {}", filtering.describe());
+    match filtering {
+        FilterProbe::AddressAndPortDependent => {
+            println!("  -> A peer whose public port you cannot predict (symmetric NAT, CGNAT,");
+            println!("     mobile) cannot reach this socket: that pair falls back to the relay.");
+        }
+        FilterProbe::AddressDependentOrOpen => {
+            println!("  -> A symmetric/CGNAT peer CAN reach this socket once you have sent to");
+            println!("     its address: this side is what makes such a pair punchable.");
+        }
+        FilterProbe::Unsupported => {
+            println!("  -> Not measured: no server answered from a second port. Point --to (or");
+            println!("     --stun-server) at a `bore server --udp`, which does.");
         }
     }
 
@@ -3565,6 +3758,18 @@ pub mod stun {
     const BINDING_REQUEST: u16 = 0x0001;
     const BINDING_SUCCESS: u16 = 0x0101;
     const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+    /// RFC 5780 §7.2. A 4-byte flags word; only two bits are defined.
+    const ATTR_CHANGE_REQUEST: u16 = 0x0003;
+    /// RFC 5780 §7.4: the server's OTHER address, i.e. the one a
+    /// change-request would answer from. Its presence is how a client learns
+    /// the server supports behaviour discovery at all.
+    const ATTR_OTHER_ADDRESS: u16 = 0x802C;
+    /// RFC 5780 §7.3: the address this very response was sent FROM. It is what
+    /// lets the client verify that the server really did change ports rather
+    /// than answering normally.
+    const ATTR_RESPONSE_ORIGIN: u16 = 0x802B;
+    const CHANGE_IP: u8 = 0x04;
+    const CHANGE_PORT: u8 = 0x02;
 
     /// Build a STUN binding request, returning the bytes and the transaction id.
     pub fn binding_request() -> (Vec<u8>, [u8; 12]) {
@@ -3579,6 +3784,105 @@ pub mod stun {
         msg.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
         msg.extend_from_slice(&txid);
         (msg, txid)
+    }
+
+    /// Build a STUN binding request carrying a RFC 5780 CHANGE-REQUEST that
+    /// asks the server to answer from its OTHER port (same IP).
+    ///
+    /// This is the probe that measures the FILTERING axis, which no amount of
+    /// plain binding requests can reach: the response arrives from a
+    /// `(ip, port)` the client has never sent to, so whether it gets back in
+    /// is exactly the question "does this NAT admit a new port from an address
+    /// I have already talked to?". A NAT that lets it through filters at most
+    /// by address (ADF, or endpoint-independent); one that drops it filters by
+    /// address AND port (APDF), which is the typical home router and the
+    /// reason a symmetric peer on the other side cannot be reached.
+    ///
+    /// Distinguishing ADF from EIF additionally needs the server to answer
+    /// from a different IP, which a single-homed deployment cannot do; the
+    /// caller reports the pair as "address-dependent or looser" rather than
+    /// guessing.
+    pub fn binding_request_change_port() -> (Vec<u8>, [u8; 12]) {
+        let (mut msg, txid) = binding_request();
+        // Message length covers the attributes only: 4 header + 4 value.
+        msg[2..4].copy_from_slice(&8u16.to_be_bytes());
+        msg.extend_from_slice(&ATTR_CHANGE_REQUEST.to_be_bytes());
+        msg.extend_from_slice(&4u16.to_be_bytes());
+        msg.extend_from_slice(&[0, 0, 0, CHANGE_PORT]);
+        (msg, txid)
+    }
+
+    /// The CHANGE-REQUEST flags of a request, as `(change_ip, change_port)`.
+    /// A request without the attribute reads `(false, false)`.
+    pub fn parse_change_request(request: &[u8]) -> (bool, bool) {
+        let mut pos = 20;
+        while pos + 4 <= request.len() {
+            let attr_type = u16::from_be_bytes([request[pos], request[pos + 1]]);
+            let attr_len = u16::from_be_bytes([request[pos + 2], request[pos + 3]]) as usize;
+            let value_start = pos + 4;
+            if value_start + attr_len > request.len() {
+                return (false, false);
+            }
+            if attr_type == ATTR_CHANGE_REQUEST && attr_len >= 4 {
+                let flags = request[value_start + 3];
+                return (flags & CHANGE_IP != 0, flags & CHANGE_PORT != 0);
+            }
+            pos = value_start + attr_len.div_ceil(4) * 4;
+        }
+        (false, false)
+    }
+
+    /// The OTHER-ADDRESS of a binding response, when the server published one.
+    /// `None` means the server does not implement RFC 5780 behaviour
+    /// discovery, which is a different answer from "the probe was filtered"
+    /// and must never be reported as one.
+    pub fn parse_other_address(buf: &[u8]) -> Option<SocketAddr> {
+        parse_plain_address_attr(buf, ATTR_OTHER_ADDRESS)
+    }
+
+    /// The RESPONSE-ORIGIN of a binding response: the address it was sent
+    /// from, as the SERVER understands it.
+    pub fn parse_response_origin(buf: &[u8]) -> Option<SocketAddr> {
+        parse_plain_address_attr(buf, ATTR_RESPONSE_ORIGIN)
+    }
+
+    /// OTHER-ADDRESS and RESPONSE-ORIGIN use the plain (NOT xor-ed) MAPPED
+    /// ADDRESS encoding of RFC 5389 §15.1.
+    fn parse_plain_address_attr(buf: &[u8], want: u16) -> Option<SocketAddr> {
+        if buf.len() < 20 || u16::from_be_bytes([buf[0], buf[1]]) != BINDING_SUCCESS {
+            return None;
+        }
+        let mut pos = 20;
+        while pos + 4 <= buf.len() {
+            let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+            let attr_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+            let value_start = pos + 4;
+            if value_start + attr_len > buf.len() {
+                return None;
+            }
+            if attr_type == want && attr_len >= 8 && buf[value_start + 1] == 0x01 {
+                let port = u16::from_be_bytes([buf[value_start + 2], buf[value_start + 3]]);
+                let addr = Ipv4Addr::from(u32::from_be_bytes([
+                    buf[value_start + 4],
+                    buf[value_start + 5],
+                    buf[value_start + 6],
+                    buf[value_start + 7],
+                ]));
+                return Some(SocketAddr::V4(SocketAddrV4::new(addr, port)));
+            }
+            pos = value_start + attr_len.div_ceil(4) * 4;
+        }
+        None
+    }
+
+    /// Encode one plain (non-xor) address attribute.
+    fn push_plain_address(msg: &mut Vec<u8>, attr: u16, addr: SocketAddrV4) {
+        msg.extend_from_slice(&attr.to_be_bytes());
+        msg.extend_from_slice(&8u16.to_be_bytes());
+        msg.push(0); // reserved
+        msg.push(0x01); // family: IPv4
+        msg.extend_from_slice(&addr.port().to_be_bytes());
+        msg.extend_from_slice(&u32::from(*addr.ip()).to_be_bytes());
     }
 
     /// Extract the transaction id from a STUN binding success response
@@ -3665,6 +3969,25 @@ pub mod stun {
     /// Build a STUN binding success response echoing `source` as a
     /// XOR-MAPPED-ADDRESS. Only IPv4 sources are encoded.
     pub fn binding_response(request: &[u8], source: SocketAddr) -> Option<Vec<u8>> {
+        binding_response_full(request, source, None, None)
+    }
+
+    /// The same, plus the two RFC 5780 attributes a behaviour-discovery client
+    /// needs: `origin` is the address this response leaves from, and `other`
+    /// is the server's alternate address — the one a CHANGE-REQUEST would be
+    /// answered from.
+    ///
+    /// Publishing `other` is what tells the client the server can be asked the
+    /// filtering question at all. Without it the client must report the
+    /// filtering as UNKNOWN, never as restrictive: "the server cannot answer"
+    /// and "the NAT dropped the answer" look identical on the wire and mean
+    /// opposite things.
+    pub fn binding_response_full(
+        request: &[u8],
+        source: SocketAddr,
+        origin: Option<SocketAddr>,
+        other: Option<SocketAddr>,
+    ) -> Option<Vec<u8>> {
         if request.len() < 20
             || u16::from_be_bytes([request[0], request[1]]) != BINDING_REQUEST
             || u32::from_be_bytes([request[4], request[5], request[6], request[7]]) != MAGIC_COOKIE
@@ -3677,9 +4000,21 @@ pub mod stun {
         let xport = v4.port() ^ (MAGIC_COOKIE >> 16) as u16;
         let xaddr = u32::from(*v4.ip()) ^ MAGIC_COOKIE;
 
-        let mut msg = Vec::with_capacity(32);
+        let origin_v4 = match origin {
+            Some(SocketAddr::V4(a)) => Some(a),
+            _ => None,
+        };
+        let other_v4 = match other {
+            Some(SocketAddr::V4(a)) => Some(a),
+            _ => None,
+        };
+        // 12 bytes for XOR-MAPPED-ADDRESS, 12 more for each optional address.
+        let attr_len =
+            12 + if origin_v4.is_some() { 12 } else { 0 } + if other_v4.is_some() { 12 } else { 0 };
+
+        let mut msg = Vec::with_capacity(20 + attr_len);
         msg.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
-        msg.extend_from_slice(&12u16.to_be_bytes()); // attribute length
+        msg.extend_from_slice(&(attr_len as u16).to_be_bytes()); // attribute length
         msg.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
         msg.extend_from_slice(&request[8..20]); // echo transaction id
         msg.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
@@ -3688,6 +4023,12 @@ pub mod stun {
         msg.push(0x01); // family: IPv4
         msg.extend_from_slice(&xport.to_be_bytes());
         msg.extend_from_slice(&xaddr.to_be_bytes());
+        if let Some(a) = origin_v4 {
+            push_plain_address(&mut msg, ATTR_RESPONSE_ORIGIN, a);
+        }
+        if let Some(a) = other_v4 {
+            push_plain_address(&mut msg, ATTR_OTHER_ADDRESS, a);
+        }
         Some(msg)
     }
 }
@@ -3696,13 +4037,71 @@ pub mod stun {
 /// the observed source address. Lets a self-hosted bore server double as the
 /// STUN server so no external infrastructure is required.
 pub async fn run_stun_responder(socket: UdpSocket) {
+    run_stun_responder_with_alt(Arc::new(socket), None).await
+}
+
+/// The same responder, plus RFC 5780 behaviour discovery when an ALTERNATE
+/// socket is supplied.
+///
+/// The alternate socket is what turns a plain reflexive-address service into
+/// one that can answer the FILTERING question. A binding request carrying
+/// CHANGE-REQUEST(change-port) is answered FROM the alternate socket, so the
+/// datagram reaches the client from an `ip:port` the client has never sent to
+/// — which is precisely the packet a port-dependent filter drops and an
+/// address-dependent one lets through. Without it, a client can measure its
+/// NAT's MAPPING and nothing else, and mapping alone does not decide whether
+/// a direct path is possible (measured: `eim:adf` and `eim:apdf` differ in
+/// filtering ONLY, and only the first reaches a symmetric peer — see
+/// `scripts/udp_nat_netns_test.sh`).
+///
+/// Both sockets publish OTHER-ADDRESS naming the other one. That attribute is
+/// load-bearing for the CLIENT, not for the server: it is how a client tells
+/// "this server cannot answer the question" apart from "my NAT ate the
+/// answer", which look identical on the wire and mean opposite things. The
+/// address published is whatever the socket is bound to, so on the usual
+/// wildcard bind the IP reads `0.0.0.0` and only the PORT is informative —
+/// the client resolves the address itself from the source of the datagram it
+/// receives, which is the only trustworthy source anyway.
+pub async fn run_stun_responder_with_alt(primary: Arc<UdpSocket>, alt: Option<Arc<UdpSocket>>) {
+    let primary_addr = primary.local_addr().ok();
+    let alt_addr = alt.as_ref().and_then(|a| a.local_addr().ok());
+    if let Some(alt) = alt.clone() {
+        // The alternate socket serves ordinary binding requests too, so a
+        // client may probe it directly. It never changes ports itself: a
+        // second hop would need a third socket and answers no new question.
+        tokio::spawn(async move { stun_serve(alt, None, primary_addr).await });
+    }
+    stun_serve(primary, alt, alt_addr).await
+}
+
+/// One responder loop. `change_port` is the socket a CHANGE-REQUEST is
+/// answered from (absent ⇒ the flag is ignored, which is exactly RFC 5780's
+/// "server does not support it"); `other` is the address published as
+/// OTHER-ADDRESS.
+async fn stun_serve(
+    listen: Arc<UdpSocket>,
+    change_port: Option<Arc<UdpSocket>>,
+    other: Option<SocketAddr>,
+) {
+    let origin = listen.local_addr().ok();
     let mut buf = [0u8; 512];
     loop {
-        match socket.recv_from(&mut buf).await {
+        match listen.recv_from(&mut buf).await {
             Ok((n, from)) => {
-                if let Some(reply) = stun::binding_response(&buf[..n], from) {
-                    if socket.send_to(&reply, from).await.is_ok() {
-                        debug!(%from, "STUN reflexive address returned");
+                let (_change_ip, want_change_port) = stun::parse_change_request(&buf[..n]);
+                // A change-IP request cannot be honoured by a single-homed
+                // server, so it is answered normally rather than dropped:
+                // the client compares the SOURCE of what it receives and will
+                // read "same port" as "not supported", which is the truth.
+                let sender: &Arc<UdpSocket> = match (want_change_port, &change_port) {
+                    (true, Some(alt)) => alt,
+                    _ => &listen,
+                };
+                let sent_from = sender.local_addr().ok().or(origin);
+                if let Some(reply) = stun::binding_response_full(&buf[..n], from, sent_from, other)
+                {
+                    if sender.send_to(&reply, from).await.is_ok() {
+                        debug!(%from, changed = want_change_port, "STUN reflexive address returned");
                     }
                 }
             }
@@ -3712,6 +4111,156 @@ pub async fn run_stun_responder(socket: UdpSocket) {
             }
         }
     }
+}
+
+/// The outcome of a NAT FILTERING probe (RFC 4787 §5, measured RFC 5780 §4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterProbe {
+    /// A datagram from an `ip:port` this host never sent to arrived: the
+    /// filter keys on the ADDRESS at most (ADF), or not at all (EIF). One
+    /// STUN IP cannot tell those two apart; both reach a symmetric peer,
+    /// which is the distinction that decides a direct path.
+    AddressDependentOrOpen,
+    /// The probe was dropped: the filter keys on address AND port (APDF).
+    /// This is the typical home router, and the reason a port-restricted
+    /// provider cannot serve a symmetric/mobile consumer.
+    AddressAndPortDependent,
+    /// The question could not be asked — no STUN server on the chain
+    /// published an OTHER-ADDRESS, or the one that did answered the
+    /// change-request from its ordinary port. NEVER report this as a
+    /// restrictive filter: an absent measurement and a blocked probe look the
+    /// same from the client's socket and mean opposite things.
+    Unsupported,
+}
+
+impl FilterProbe {
+    /// Stable lowercase label for logs, reports and the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FilterProbe::AddressDependentOrOpen => "adf-or-eif",
+            FilterProbe::AddressAndPortDependent => "apdf",
+            FilterProbe::Unsupported => "unknown",
+        }
+    }
+
+    /// Human-readable rendering, single-sourced for every report.
+    ///
+    /// Both diagnostics — the standalone `bore test-udp` report below and the
+    /// paired one in `udp_diagnostic` — render the measurement through this
+    /// one function on purpose: an operator who runs both must not have to
+    /// learn two vocabularies for the same axis. The wording never says
+    /// "restricted" for an unmeasured probe, because an absent measurement and
+    /// a blocked one look identical from this socket and mean the opposite.
+    pub fn describe(self) -> &'static str {
+        match self {
+            FilterProbe::AddressAndPortDependent => {
+                "address+port dependent (apdf) - unreachable by a symmetric peer"
+            }
+            FilterProbe::AddressDependentOrOpen => {
+                "address dependent or open (adf/eif) - reachable by a symmetric peer"
+            }
+            FilterProbe::Unsupported => {
+                "unknown (no RFC 5780 STUN server answered; run against `bore server --udp`)"
+            }
+        }
+    }
+
+    /// The coarser legacy classification carried in [`UdpNatProfile`].
+    ///
+    /// Only the BLOCKED outcome maps onto a legacy variant, and it maps onto
+    /// the one whose documented meaning ("address- or port-dependent") it
+    /// literally is. A probe that got through proves the filter is EIF *or*
+    /// ADF and a single-homed server cannot say which, so claiming
+    /// [`UdpNatFiltering::Eif`] would be a guess — the legacy field stays
+    /// `Unknown` and the precise reading rides in the additive
+    /// `filtering_probe` field beside it.
+    pub fn legacy(self) -> crate::shared::UdpNatFiltering {
+        match self {
+            FilterProbe::AddressAndPortDependent => {
+                crate::shared::UdpNatFiltering::AddressDependent
+            }
+            _ => crate::shared::UdpNatFiltering::Unknown,
+        }
+    }
+}
+
+/// How long one filtering probe waits for the alternate-port answer.
+///
+/// It must exceed a full RTT plus the server's own scheduling, and stay well
+/// under the STUN chain budget: the probe is an EXTRA measurement and must
+/// never delay the candidate gather it rides along with.
+pub const FILTER_PROBE_TIMEOUT: Duration = Duration::from_millis(900);
+/// Attempts before declaring the probe blocked. UDP loss on a clean path is
+/// rare but not zero, and a single lost datagram would otherwise be reported
+/// as a restrictive NAT — the expensive direction to be wrong in, because it
+/// steers the punch plan toward the relay.
+pub const FILTER_PROBE_ATTEMPTS: usize = 3;
+
+/// Measure the FILTERING behaviour of the NAT in front of `socket`, using
+/// `stun` as an RFC 5780 server.
+///
+/// The caller must already have a reflexive address from this very socket:
+/// the probe is meaningless without an existing mapping, and creating one is
+/// the baseline query's job, not this function's.
+///
+/// The classification reads the SOURCE of the datagram that comes back, never
+/// the RESPONSE-ORIGIN attribute inside it. A server that ignores the change
+/// request answers from its ordinary port while happily echoing whatever it
+/// likes in its attributes; the 5-tuple the kernel reports cannot be forged by
+/// the server and is the only thing that proves the packet really did arrive
+/// from an address this host had never written to.
+pub async fn probe_filtering(socket: &UdpSocket, stun: SocketAddr) -> FilterProbe {
+    // Step 1: does this server implement behaviour discovery at all? Only an
+    // OTHER-ADDRESS makes the negative result meaningful.
+    let (request, txid) = stun::binding_request();
+    let mut buf = [0u8; 512];
+    let mut supported = false;
+    for _ in 0..FILTER_PROBE_ATTEMPTS {
+        if socket.send_to(&request, stun).await.is_err() {
+            return FilterProbe::Unsupported;
+        }
+        match timeout(STUN_TIMEOUT, socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, from))) if from == stun => {
+                if stun::parse_response(&buf[..n], &txid).is_some() {
+                    supported = stun::parse_other_address(&buf[..n]).is_some();
+                    break;
+                }
+            }
+            Ok(Ok(_)) => continue,
+            _ => continue,
+        }
+    }
+    if !supported {
+        debug!(%stun, "STUN server published no OTHER-ADDRESS; filtering stays unknown");
+        return FilterProbe::Unsupported;
+    }
+
+    // Step 2: ask for the answer from the other port and watch where it lands.
+    let (probe, probe_txid) = stun::binding_request_change_port();
+    for attempt in 0..FILTER_PROBE_ATTEMPTS {
+        if socket.send_to(&probe, stun).await.is_err() {
+            return FilterProbe::Unsupported;
+        }
+        match timeout(FILTER_PROBE_TIMEOUT, socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, from))) => {
+                if stun::parse_response(&buf[..n], &probe_txid).is_none() {
+                    // Someone else's datagram on a shared socket: keep waiting
+                    // within this attempt's budget by retrying the loop body.
+                    continue;
+                }
+                if from.port() != stun.port() {
+                    debug!(%stun, %from, "filtering probe crossed a new port: adf or eif");
+                    return FilterProbe::AddressDependentOrOpen;
+                }
+                debug!(%stun, "STUN server ignored CHANGE-REQUEST; filtering stays unknown");
+                return FilterProbe::Unsupported;
+            }
+            _ => {
+                debug!(%stun, attempt, "filtering probe unanswered");
+            }
+        }
+    }
+    FilterProbe::AddressAndPortDependent
 }
 
 #[cfg(test)]
@@ -5302,5 +5851,149 @@ mod tests {
         let huge = resolve_direct_quic_liveness(Some(u64::MAX / 2), Some(u64::MAX / 2));
         assert_eq!(huge.max_idle, QUIC_MAX_IDLE_MAX);
         assert!(huge.max_idle >= huge.keepalive * 3);
+    }
+
+    // ── RFC 5780 behaviour discovery (plan Fase 6) ─────────────────────────
+    //
+    // These pin the FILTERING axis: the one `bore test-udp` used to list as a
+    // known gap (docs/nat/NAT_TRAVERSAL.md §13) and the one a real-kernel
+    // matrix shows deciding the outcome. `scripts/udp_nat_netns_test.sh`
+    // proves `eim:adf` reaches a symmetric peer and `eim:apdf` does not —
+    // identical in every other respect, including a fixed port-preserved
+    // mapping (the `T-NAT-FIXEDPORT-VS-EDM` control).
+
+    /// A plain binding request must keep reading as "no change requested", and
+    /// the change-port request must decode to exactly that one flag.
+    ///
+    /// The second half is the one that would silently break everything: a
+    /// wrong flag bit still parses, still travels, and simply makes every
+    /// server answer from its ordinary port — which the client reads as
+    /// "server does not support this" and reports as `unknown`. A measurement
+    /// that quietly degrades to "unknown" is the failure mode this whole
+    /// feature exists to remove.
+    #[test]
+    fn change_request_flags_round_trip() {
+        let (plain, _) = stun::binding_request();
+        assert_eq!(stun::parse_change_request(&plain), (false, false));
+
+        let (probe, _) = stun::binding_request_change_port();
+        assert_eq!(stun::parse_change_request(&probe), (false, true));
+
+        // The header's length field covers the attributes only, and a wrong
+        // value makes a conforming server drop the message with no diagnostic
+        // whatsoever.
+        let declared = u16::from_be_bytes([probe[2], probe[3]]) as usize;
+        assert_eq!(declared, probe.len() - 20);
+    }
+
+    /// The response builder must still produce the EXACT legacy bytes when no
+    /// optional attribute is asked for.
+    ///
+    /// Every existing client parses this message, and the two new attributes
+    /// change the header's length field — so "added an attribute" and "broke
+    /// every reflexive-address lookup in the fleet" are one edit apart.
+    #[test]
+    fn a_response_without_the_new_attributes_is_the_legacy_encoding() {
+        let (req, _) = stun::binding_request();
+        let src: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+        let legacy = stun::binding_response(&req, src).expect("legacy response");
+        assert_eq!(legacy.len(), 32, "20 header + one 12-byte attribute");
+        assert_eq!(u16::from_be_bytes([legacy[2], legacy[3]]), 12);
+        assert_eq!(
+            stun::binding_response_full(&req, src, None, None),
+            Some(legacy)
+        );
+    }
+
+    /// With both optional attributes the mapped address must still parse, and
+    /// each new attribute must decode to what was put in.
+    #[test]
+    fn a_response_with_the_new_attributes_still_carries_the_mapping() {
+        let (req, txid) = stun::binding_request();
+        let src: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+        let origin: SocketAddr = "0.0.0.0:7835".parse().unwrap();
+        let other: SocketAddr = "0.0.0.0:53211".parse().unwrap();
+        let msg = stun::binding_response_full(&req, src, Some(origin), Some(other))
+            .expect("full response");
+
+        assert_eq!(
+            u16::from_be_bytes([msg[2], msg[3]]) as usize,
+            msg.len() - 20
+        );
+        assert_eq!(stun::parse_response(&msg, &txid), Some(src));
+        assert_eq!(stun::parse_response_origin(&msg), Some(origin));
+        assert_eq!(stun::parse_other_address(&msg), Some(other));
+        // A legacy response publishes neither, which is what tells a client
+        // the server cannot be asked the filtering question.
+        let legacy = stun::binding_response(&req, src).expect("legacy response");
+        assert_eq!(stun::parse_other_address(&legacy), None);
+    }
+
+    /// End to end over real sockets: a server WITH an alternate socket answers
+    /// the change-request from the other port, and a client on an unfiltered
+    /// path classifies that as address-dependent-or-open.
+    ///
+    /// Loopback has no NAT, so this cannot prove the blocked case — that needs
+    /// a real kernel filter and lives in the netns harness. What it does prove
+    /// is the half that an integration test CAN prove and that a unit test
+    /// cannot: the request really reaches the server, the server really
+    /// switches sockets, and the client really accepts a datagram from a
+    /// source it never wrote to (the recv path's `any_port` demux).
+    #[tokio::test]
+    async fn a_server_with_an_alternate_socket_answers_from_the_other_port() {
+        let primary = UdpSocket::bind("127.0.0.1:0").await.expect("primary");
+        let alt = UdpSocket::bind("127.0.0.1:0").await.expect("alt");
+        let server_addr = primary.local_addr().unwrap();
+        let alt_addr = alt.local_addr().unwrap();
+        assert_ne!(server_addr.port(), alt_addr.port());
+        tokio::spawn(run_stun_responder_with_alt(
+            Arc::new(primary),
+            Some(Arc::new(alt)),
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client");
+        assert_eq!(
+            probe_filtering(&client, server_addr).await,
+            FilterProbe::AddressDependentOrOpen
+        );
+    }
+
+    /// The same server WITHOUT an alternate socket must make the client report
+    /// `Unsupported`, never a restrictive filter.
+    ///
+    /// This is the asymmetry the whole design turns on: a probe that gets no
+    /// answer and a server that cannot answer are indistinguishable at the
+    /// socket, and calling the second one "apdf" would mark every peer of
+    /// every pre-Fase-6 server as unreachable. Hence OTHER-ADDRESS, and hence
+    /// this gate.
+    #[tokio::test]
+    async fn a_server_without_an_alternate_socket_is_unsupported_not_blocked() {
+        let primary = UdpSocket::bind("127.0.0.1:0").await.expect("primary");
+        let server_addr = primary.local_addr().unwrap();
+        tokio::spawn(run_stun_responder_with_alt(Arc::new(primary), None));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client");
+        assert_eq!(
+            probe_filtering(&client, server_addr).await,
+            FilterProbe::Unsupported
+        );
+    }
+
+    /// A blocked probe must map onto the legacy enum's `AddressDependent`
+    /// (whose documented meaning is "address- OR port-dependent") and nothing
+    /// else may: claiming `Eif` for a probe that merely got through would tell
+    /// an old peer "full cone" on evidence that only rules out APDF.
+    #[test]
+    fn only_a_blocked_probe_sets_the_legacy_filtering_field() {
+        use crate::shared::UdpNatFiltering;
+        assert_eq!(
+            FilterProbe::AddressAndPortDependent.legacy(),
+            UdpNatFiltering::AddressDependent
+        );
+        assert_eq!(
+            FilterProbe::AddressDependentOrOpen.legacy(),
+            UdpNatFiltering::Unknown
+        );
+        assert_eq!(FilterProbe::Unsupported.legacy(), UdpNatFiltering::Unknown);
     }
 }

@@ -479,9 +479,12 @@ Per ottenere il **diretto** in modo affidabile:
 - **IPv4-only** sul path diretto (vedi §9): niente sfruttamento dell'IPv6 mobile.
 - **Niente TURN-over-UDP**: per i casi non bucabili (symmetric×symmetric, CGNAT su
   entrambi) il fallback è il **relay del server bore**, non un relay UDP esterno.
-- **`test-udp` rileva il mapping, non il filtering** (full vs restricted vs
-  port-restricted): per i provider domestici "cone" che falliscono verso un
-  consumer symmetric, assumi **port-restricted** e applica 7.1.
+- ~~**`test-udp` rileva il mapping, non il filtering**~~ — **chiuso dalla Fase 6**
+  (§19). `bore test-udp` ora misura anche il *filtering* e stampa
+  `NAT filtering : …`; resta il limite che un server STUN **mono-IP** non
+  separa EIF da ADF, per cui il verdetto positivo è `adf-or-eif` ("address
+  dependent or open"). È la distinzione che conta: entrambi sono raggiungibili
+  da un peer symmetric, `apdf` no.
 - **Port prediction**: best-effort, aiuta solo NAT simmetrici sequenziali, può
   apparire come uno scan a firewall stringenti (per questo è opt-in e loggato).
 - **Throughput UDP vs TCP**: il path diretto elimina il relay e spesso riduce RTT,
@@ -722,7 +725,124 @@ pubblici a mano quando STUN è bloccato.
 
 ---
 
+## 19. Rilevamento del filtering (Fase 6, RFC 5780)
+
+Fino alla Fase 5 bore misurava **una sola** delle due assi di RFC 4787: il
+*mapping* (EIM vs EDM/symmetric), osservato confrontando l'indirizzo riflesso
+restituito da due server STUN diversi. Il *filtering* restava `unknown` — ed è
+la riga di §13 ora cancellata.
+
+**Perché non era un limite cosmetico.** La matrice §6 dice che un provider
+"Restricted Cone (EIM+ADF)" serve un consumer symmetric (✓) mentre un provider
+"Port-Restricted Cone (EIM+APDF)" no (✗). I due profili hanno **lo stesso
+mapping**: differiscono solo per il filtering, cioè esattamente per l'asse che
+il diagnostico non misurava. Questo è ora verificato su kernel reale, non solo
+asserito:
+
+| cella (`scripts/udp_nat_netns_test.sh`) | provider | consumer | esito |
+|---|---|---|---|
+| `T-NAT-APDF-VS-EDM` | `eim:apdf` | `edm` | RELAY |
+| `T-NAT-ADF-VS-EDM` | `eim:adf` | `edm` | **DIRECT** |
+| `T-NAT-EIF-VS-EDM` | `eim:eif` | `edm` | **DIRECT** |
+| `T-NAT-FIXEDPORT-VS-EDM` | `eim:apdf` + porta fissa | `edm` | RELAY |
+
+L'ultima riga è il **controllo**: stessa porta fissa e stesso mapping
+port-preserving delle due righe DIRECT, ma senza l'inoltro sul router. Resta
+relay ⇒ ciò che ribalta la cella è il *filtering*, non la porta fissa.
+
+**Come si misura.** RFC 5780 §4.4: il client chiede al server STUN di
+rispondere **da un'altra porta** (attributo `CHANGE-REQUEST`, flag
+change-port). La risposta arriva quindi da un `ip:porta` a cui il client non
+ha **mai** scritto:
+
+- risposta ricevuta ⇒ il filtro guarda al massimo l'**indirizzo** →
+  `adf-or-eif` ("address dependent or open");
+- risposta assente ⇒ il filtro guarda **indirizzo e porta** → `apdf`;
+- nessun server sulla catena pubblica `OTHER-ADDRESS` ⇒ `unknown`.
+
+Il terzo caso è il motivo per cui `OTHER-ADDRESS` è obbligatorio nella
+decisione: dal socket del client "il server non sa rispondere" e "il mio NAT ha
+mangiato la risposta" sono **identici** e significano il contrario. La classe
+viene decisa leggendo la **sorgente** del datagramma (il 5-tuple che riporta il
+kernel), mai l'attributo `RESPONSE-ORIGIN`: un server che ignora
+`CHANGE-REQUEST` risponde dalla porta ordinaria compilando gli attributi come
+gli pare, e solo il 5-tuple non è falsificabile dal server.
+
+Separare EIF da ADF richiederebbe che il server risponda anche da un **IP**
+diverso: un deployment mono-IP non può, quindi il verdetto positivo resta
+`adf-or-eif`. Non è una perdita operativa — **entrambi** sono raggiungibili da
+un peer symmetric, `apdf` no, e quella è la distinzione che decide la cella.
+
+**Lato server.** `bore server --udp` apre un **secondo socket UDP** (il
+"alternate" di RFC 5780) e vi risponde alle richieste con change-port. Porta
+effimera di default; `--stun-alt-port PORT` / `BORE_STUN_ALT_PORT` la fissa,
+utile solo dove il firewall in **uscita** del server filtra per porta
+sorgente (con porta effimera ogni probe leggerebbe `apdf`, falsamente). Il
+fallimento del bind non è fatale: il server continua a servire indirizzi
+riflessi come prima e i client riportano `unknown`.
+
+**Lato client.** La misura viaggia in due posti:
+
+- `bore test-udp` la stampa (`NAT filtering : …`, sia locale sia del peer) con
+  una frase che dice cosa comporta, non solo la sigla;
+- il gather del profilo (`UdpNatProfile`) la porta nell'offerta, in due campi
+  additivi: il legacy `filtering` (enum) viene messo a `AddressDependent` —
+  il cui significato documentato è proprio "address- **o** port-dependent" —
+  **solo** quando il probe è stato bloccato, e il nuovo `filtering_probe`
+  porta la lettura precisa. Un probe passato NON scrive `Eif` sul campo
+  legacy: proverebbe solo che non è APDF, e dichiarare "full cone" su quella
+  evidenza sarebbe una supposizione.
+
+Regola di compatibilità applicata: **campo** nuovo sì, **variante** nuova di un
+enum esistente no. Un peer vecchio ignora un campo che non conosce, ma va in
+errore duro su una variante sconosciuta di un campo che conosce. Per lo stesso
+motivo `filtering_probe` ha esattamente i due stati che un probe mono-IP può
+produrre e "non misurato" è l'`Option::None`, non una terza variante.
+
+**Costo.** Due datagrammi su un socket già aperto, dentro il gather esistente,
+solo quando un indirizzo riflesso è già stato trovato: senza mapping non c'è
+nulla da misurare, e un probe verso un server irraggiungibile scadrebbe e
+verrebbe letto come NAT restrittivo — la direzione costosa in cui sbagliare,
+perché è quella che spinge il piano verso il relay.
+
+**Gate**: unit `change_request_flags_round_trip`,
+`a_response_without_the_new_attributes_is_the_legacy_encoding` (zero-regressione
+sul wire), `a_response_with_the_new_attributes_still_carries_the_mapping`,
+`only_a_blocked_probe_sets_the_legacy_filtering_field`; integrazione su socket
+reali `a_server_with_an_alternate_socket_answers_from_the_other_port` e
+`a_server_without_an_alternate_socket_is_unsupported_not_blocked`; campo
+`T-NAT-FILTER-APDF` / `T-NAT-FILTER-ADF` in `scripts/udp_nat_netns_test.sh`
+(kernel reale: il diagnostico deve **riportare** il profilo del router che gli
+sta davanti).
+
+---
+
 *Documenti correlati: `README.md` (uso e flag), `TEST_UDP.md` (scenari di test
 end-to-end, incl. `bore test-udp`), `ADAPTIVE_NAT.md` (policy),
 `PLAN_MANUAL_UDP_CANDIDATES.md` (piano candidati manuali — implementato),
 `CLAUDE.md` / `UPSTREAM_CHANGES.md` (architettura).*
+
+**Dove viene stampata.** `bore test-udp` ha due report: quello **standalone**
+(host singolo) e quello **appaiato** (`--tcp-secret-id`, che mostra anche il
+peer). La riga `NAT filtering` compare in entrambi e passa per un'unica
+funzione (`FilterProbe::describe`), perché un operatore che li legge in
+sequenza non deve imparare due vocabolari per la stessa misura. Nel report
+standalone il probe usa, in ordine, il server `--to` e poi `--stun-server`:
+l'indirizzo **già risolto** di chi ha risposto, mai una nuova risoluzione del
+nome — un nome in round-robin risolverebbe su un altro IP e misurerebbe un
+percorso NAT diverso da quello appena classificato.
+
+**Isolamento delle celle del banco (trappola trovata sul campo).** Le due
+celle diagnostiche giravano verdi da sole e `T-NAT-FILTER-ADF` falliva subito
+dopo `T-NAT-FILTER-APDF`, riportando `apdf` su un router ADF. Causa: una
+catena nat viene attraversata **solo dal primo pacchetto di un flusso**, e con
+una porta sorgente fissa per tutta la matrice il flusso STUN della cella N+1
+riusava la entry conntrack della cella N — le regole appena installate non
+giravano mai, il set `@punched` restava vuoto e il banco riportava il router
+*precedente*. `flush_conntrack` avrebbe dovuto impedirlo e non poteva: il
+binario `conntrack` non è installato ovunque e la chiamata falliva in silenzio
+(`2>/dev/null || true`). Ora ogni cella prende la propria coppia di porte
+(`cell_ports`, numerata sulla posizione nel file, quindi stabile anche
+rieseguendo una cella sola) e il flush è dichiaratamente best-effort. Regola
+generale: un banco che *crede* di aver ripulito lo stato è peggio di uno che
+non ci prova, perché fabbrica risultati invece di fallire.

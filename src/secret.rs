@@ -527,6 +527,10 @@ pub async fn serve_provider(
                     tuning: udp_tuning,
                     peer_id: 0,
                     v2: offer.v2,
+                    // The PROVIDER is the QUIC server and does not decide the
+                    // fallback; the consumer does, and reports for the pair.
+                    // Asking both would double-count every fallback.
+                    path_report: false,
                 };
                 if control.send(msg).await.is_err() {
                     return Ok(());
@@ -686,6 +690,7 @@ pub async fn serve_consumer(
                             udp_offer_from_legacy(consumer_cands),
                             udp_tuning,
                             udp_adaptive_plan,
+                            admin_reg.as_ref(),
                         )
                         .await?;
                     }
@@ -700,8 +705,20 @@ pub async fn serve_consumer(
                             consumer_offer,
                             udp_tuning,
                             udp_adaptive_plan,
+                            admin_reg.as_ref(),
                         )
                         .await?;
+                    }
+                    // S-1: the consumer is the only party that knows how the
+                    // data actually travelled — the direct path runs
+                    // consumer↔provider and never reaches this server — so the
+                    // admin API's `current_path` for a secret tunnel is this
+                    // message and nothing else.
+                    Some(ClientMessage::SecretPathReport { path, reason }) => {
+                        info!(%id, %peer, %path, reason = ?reason, "secret consumer reported its data path");
+                        if let Some(reg) = &admin_reg {
+                            reg.set_secret_path(&path, reason);
+                        }
                     }
                     Some(ClientMessage::UdpStunHintRequest) => {
                         let stun_server = provider_stun_hint(&udp_registry, &id);
@@ -761,6 +778,7 @@ async fn broker_udp(
     mut consumer_offer: UdpCandidateOffer,
     tuning: UdpDirectTuning,
     adaptive_plan: bool,
+    admin_reg: Option<&crate::admin::Registration>,
 ) -> Result<()> {
     // Peer-controlled list: validate/dedup/cap before forwarding (I-11).
     crate::holepunch::sanitize_offer(&mut consumer_offer, "secret-consumer-offer");
@@ -787,6 +805,13 @@ async fn broker_udp(
     )) = provider
     else {
         info!(%id, "no udp-capable provider; consumer will use relay");
+        // Recorded HERE, not by the consumer: `path_report` rides on UdpPunch,
+        // which this branch never sends, so a consumer told "unavailable" has
+        // no way to know the server would accept a report. The server knows the
+        // answer anyway — it is the one refusing.
+        if let Some(reg) = admin_reg {
+            reg.set_secret_path("relay", Some("no udp-capable provider registered".into()));
+        }
         control.send(ServerMessage::UdpUnavailable).await?;
         return Ok(());
     };
@@ -847,6 +872,9 @@ async fn broker_udp(
             "provider task vanished during UDP brokering — provider connection \
              closed between candidate offer and punch; consumer falls back to relay"
         );
+        if let Some(reg) = admin_reg {
+            reg.set_secret_path("relay", Some("provider vanished during brokering".into()));
+        }
         control.send(ServerMessage::UdpUnavailable).await?;
         return Ok(());
     }
@@ -859,6 +887,11 @@ async fn broker_udp(
             tuning,
             peer_id: 0,
             v2: provider_v2,
+            // S-1: this server records what the consumer reports back. The
+            // direct path runs consumer↔provider and never reaches the
+            // server, so this flag is the only way the admin API can answer
+            // "which path is this tunnel on?" with anything but a guess.
+            path_report: true,
         })
         .await?;
     Ok(())
@@ -1180,7 +1213,12 @@ impl Proxy {
                      Pass --secret for a strong token."
                 );
             }
-            match negotiate_direct_consumer(
+            // S-1: set by the negotiation when the server's UdpPunch declared it
+            // accepts a path report. Stays false against an old server, and the
+            // report below is then never sent — an old server cannot decode the
+            // variant and would fail its control loop.
+            let mut server_accepts_path_report = false;
+            let outcome = negotiate_direct_consumer(
                 &mut control,
                 &endpoint,
                 secret,
@@ -1188,9 +1226,18 @@ impl Proxy {
                 stun_server,
                 &gather,
                 udp_port,
+                &mut server_accepts_path_report,
             )
-            .await
-            {
+            .await;
+            // The reason is captured BEFORE the match consumes the outcome, so
+            // the report carries the same text the log line does rather than a
+            // second, drifting description of the same failure.
+            let path_reason: Option<String> = match &outcome {
+                Ok(Some(_)) => None,
+                Ok(None) => Some("server reported the direct path unavailable".into()),
+                Err(err) => Some(format!("{err:#}")),
+            };
+            match outcome {
                 #[cfg(feature = "udp")]
                 Ok(Some(conn)) => {
                     info!(%tcp_secret_id, "using direct udp path");
@@ -1214,6 +1261,21 @@ impl Proxy {
                 Ok(Some(_)) => {}
                 Ok(None) => info!(%tcp_secret_id, "udp unavailable, using relay"),
                 Err(err) => warn!(%err, "udp negotiation failed, using relay"),
+            }
+            if server_accepts_path_report {
+                let path = if direct { "direct" } else { "relay" };
+                if let Err(err) = control
+                    .send(ClientMessage::SecretPathReport {
+                        path: path.into(),
+                        reason: path_reason,
+                    })
+                    .await
+                {
+                    // Never fatal: the report is observability, and a tunnel
+                    // that works must not die because the admin page cannot be
+                    // updated.
+                    debug!(%err, "could not report the secret data path to the server");
+                }
             }
         }
 
@@ -1459,7 +1521,7 @@ impl Proxy {
                         }
                         // Deliver the brokered candidates to the in-flight upgrade
                         // task (which then punches + dials QUIC); else it is stray.
-                        Some(ServerMessage::UdpPunch { nonce, peer, peer_selected_stun, tuning, peer_id: _, v2 }) => match nego_punch_tx.take() {
+                        Some(ServerMessage::UdpPunch { nonce, peer, peer_selected_stun, tuning, peer_id: _, v2, path_report: _ }) => match nego_punch_tx.take() {
                             Some(tx) => {
                                 if let Some(v2) = &v2 {
                                     debug!(
@@ -1991,6 +2053,12 @@ async fn negotiate_direct_consumer(
     stun_server: Option<&str>,
     gather: &crate::holepunch::GatherOptions,
     udp_port: u16,
+    // S-1: set when the server declared, on its UdpPunch, that it accepts
+    // `ClientMessage::SecretPathReport`. An out-param rather than a richer
+    // return type because this function is cfg-split in two and the stub must
+    // stay trivially equivalent; the caller needs the flag on EVERY exit path,
+    // including the ones that return `None` after the punch arrived.
+    server_accepts_path_report: &mut bool,
 ) -> Result<Option<crate::holepunch::DirectConn>> {
     let provider_stun_hint = request_provider_stun_hint(control).await?;
     // `_lease` keeps a managed port mapping renewed for the whole
@@ -2020,6 +2088,7 @@ async fn negotiate_direct_consumer(
                     tuning,
                     peer_id: _,
                     v2,
+                    path_report,
                 }) => {
                     if let Some(v2) = &v2 {
                         debug!(
@@ -2035,6 +2104,7 @@ async fn negotiate_direct_consumer(
                         peer_selected_stun,
                         tuning,
                         v2,
+                        path_report,
                     )));
                 }
                 Some(ServerMessage::UdpUnavailable) => return Ok(None),
@@ -2046,7 +2116,7 @@ async fn negotiate_direct_consumer(
         }
     })
     .await;
-    let (nonce, peer, peer_selected_stun, tuning, v2) = match outcome {
+    let (nonce, peer, peer_selected_stun, tuning, v2, path_report) = match outcome {
         Ok(Ok(Some(value))) => value,
         Ok(Ok(None)) => return Ok(None),
         Ok(Err(err)) => return Err(err),
@@ -2060,6 +2130,10 @@ async fn negotiate_direct_consumer(
             return Ok(None);
         }
     };
+    // S-1: hand the capability back as soon as it is known, so the caller can
+    // report the RELAY fallback too — the report matters most exactly when the
+    // direct path did not happen.
+    *server_accepts_path_report = path_report;
     info!(
         provider_selected_stun = ?peer_selected_stun,
         "consumer received provider metadata for udp negotiation"
@@ -2214,6 +2288,7 @@ async fn negotiate_direct_consumer(
     _stun_server: Option<&str>,
     _gather: &crate::holepunch::GatherOptions,
     _udp_port: u16,
+    _server_accepts_path_report: &mut bool,
 ) -> Result<Option<DirectUpgrade>> {
     warn!("built without the `udp` feature; ignoring direct-path request");
     Ok(None)

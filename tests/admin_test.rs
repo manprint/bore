@@ -466,6 +466,7 @@ fn t_views_serialize_stable() {
         vhost_http_port: None,
         vhost_https_port: None,
         vhost_quic_port: None,
+        stun_alt_port: Some(0),
         vhost_mode: None,
         vhost_config: None,
         vhost_cert_file: None,
@@ -578,6 +579,9 @@ fn t_views_serialize_stable() {
         relay_rx_bytes: 1024,
         transport: bore_cli::admin::Transport::Bore,
         identity: None,
+        current_path: "relay".into(),
+        direct_fallbacks: 0,
+        path_reason: None,
     };
     let json_secret = serde_json::to_value(&secret).expect("serialize SecretView");
     assert_no_secret_keys(&json_secret, "");

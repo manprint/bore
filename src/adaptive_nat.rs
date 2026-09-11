@@ -440,6 +440,7 @@ mod tests {
             bore_stun: Some(true),
             candidate_count,
             port_preserved,
+            filtering: None,
         }
     }
 
@@ -681,6 +682,7 @@ mod tests {
             filtering,
             port_preserved,
             observations,
+            filtering_probe: None,
         }
     }
 

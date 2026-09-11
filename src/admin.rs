@@ -47,6 +47,33 @@ pub enum Transport {
     Ssh,
 }
 
+/// [`Entry::secret_path`]: the consumer has not reported yet.
+///
+/// A REAL state for a secret tunnel, not a placeholder for a missing feature:
+/// the direct path runs consumer↔provider, so between "the server brokered a
+/// punch" and "the consumer said what happened" the server genuinely does not
+/// know. P-10 established the rule this obeys — a tunnel with only ONE possible
+/// path must never read "unknown", so a consumer that never asked for `--udp`
+/// is derived as `relay` by the admin API instead of sitting here.
+pub const SECRET_PATH_UNKNOWN: u8 = 0;
+/// [`Entry::secret_path`]: the consumer reported the server relay.
+pub const SECRET_PATH_RELAY: u8 = 1;
+/// [`Entry::secret_path`]: the consumer reported the QUIC direct path.
+pub const SECRET_PATH_DIRECT: u8 = 2;
+
+/// Render [`Entry::secret_path`] for the admin API.
+///
+/// Deliberately a separate set from `vhost::VHOST_PATH_*` rather than a shared
+/// one: those are wired into a shipped invariant (phase 05.3) and this change
+/// has no business touching it. The two render the same three words.
+pub fn secret_path_label(path: u8) -> &'static str {
+    match path {
+        SECRET_PATH_RELAY => "relay",
+        SECRET_PATH_DIRECT => "direct",
+        _ => "unknown",
+    }
+}
+
 /// A live tunnel registration. One per accepted control connection.
 ///
 /// The immutable descriptive fields are set once at registration; the two
@@ -93,6 +120,25 @@ pub struct Entry {
     pub overlay: std::sync::Mutex<Option<String>>,
     /// VPN roles: whether the link reported the direct QUIC path as active.
     pub vpn_direct: AtomicBool,
+    /// Secret consumer: which data path the consumer last REPORTED using
+    /// ([`SECRET_PATH_UNKNOWN`] / [`SECRET_PATH_RELAY`] / [`SECRET_PATH_DIRECT`]).
+    ///
+    /// S-1. Unlike the vhost, public and ssh-jump registries, the server is not
+    /// an endpoint of a secret tunnel's direct path — it runs
+    /// consumer↔provider and never reaches the server — so this is set from
+    /// [`crate::shared::ClientMessage::SecretPathReport`] and not from
+    /// anything the server can observe. `UNKNOWN` is therefore a real state and
+    /// not a bug: a `--udp` consumer that has been brokered a punch and has not
+    /// reported yet genuinely has no answer.
+    pub secret_path: std::sync::atomic::AtomicU8,
+    /// Secret consumer: how many times it reported falling back to the relay
+    /// after asking for a direct path. A count, not a flag, because a tunnel
+    /// that flaps between the two is a different problem from one that never
+    /// got direct at all.
+    pub secret_direct_fallbacks: AtomicU64,
+    /// Secret consumer: why the direct path was not used, as the consumer
+    /// reported it. `None` while direct, or before any report.
+    pub secret_path_reason: std::sync::Mutex<Option<String>>,
     /// VPN roles: relay ciphertext bytes sent toward this client.
     pub relay_tx_bytes: Arc<AtomicU64>,
     /// VPN roles: relay ciphertext bytes received from this client.
@@ -243,6 +289,12 @@ pub struct EntryView {
     pub overlay: Option<String>,
     /// See [`Entry::vpn_direct`].
     pub vpn_direct: bool,
+    /// See [`Entry::secret_path`]; already rendered by [`secret_path_label`].
+    pub secret_path: &'static str,
+    /// See [`Entry::secret_direct_fallbacks`].
+    pub secret_direct_fallbacks: u64,
+    /// See [`Entry::secret_path_reason`].
+    pub secret_path_reason: Option<String>,
     /// See [`Entry::relay_tx_bytes`].
     pub relay_tx_bytes: u64,
     /// See [`Entry::relay_rx_bytes`].
@@ -352,6 +404,9 @@ impl AdminRegistry {
             active,
             overlay: std::sync::Mutex::new(None),
             vpn_direct: AtomicBool::new(false),
+            secret_path: std::sync::atomic::AtomicU8::new(SECRET_PATH_UNKNOWN),
+            secret_direct_fallbacks: AtomicU64::new(0),
+            secret_path_reason: std::sync::Mutex::new(None),
             relay_tx_bytes,
             relay_rx_bytes,
             vpn_relay_only: new.vpn_relay_only,
@@ -420,6 +475,13 @@ impl AdminRegistry {
                         .unwrap_or_else(|p| p.into_inner())
                         .clone(),
                     vpn_direct: entry.vpn_direct.load(Ordering::Relaxed),
+                    secret_path: secret_path_label(entry.secret_path.load(Ordering::Relaxed)),
+                    secret_direct_fallbacks: entry.secret_direct_fallbacks.load(Ordering::Relaxed),
+                    secret_path_reason: entry
+                        .secret_path_reason
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone(),
                     relay_tx_bytes: entry.relay_tx_bytes.load(Ordering::Relaxed),
                     relay_rx_bytes: entry.relay_rx_bytes.load(Ordering::Relaxed),
                     vpn_relay_only: entry.vpn_relay_only,
@@ -489,6 +551,36 @@ impl Registration {
     /// Record the VPN data-plane path reported by the client.
     pub fn set_vpn_direct(&self, direct: bool) {
         self.entry.vpn_direct.store(direct, Ordering::Relaxed);
+    }
+
+    /// Record the data path a secret consumer reported (S-1).
+    ///
+    /// Counts a fallback only on the TRANSITION into relay, so a consumer that
+    /// re-reports "relay" on every reconnect of a permanently un-punchable pair
+    /// does not inflate the counter into meaninglessness. An unrecognised label
+    /// is ignored rather than stored: the field is peer-controlled and the
+    /// admin API renders it.
+    pub fn set_secret_path(&self, path: &str, reason: Option<String>) {
+        let code = match path {
+            "direct" => SECRET_PATH_DIRECT,
+            "relay" => SECRET_PATH_RELAY,
+            _ => return,
+        };
+        let prev = self.entry.secret_path.swap(code, Ordering::Relaxed);
+        if code == SECRET_PATH_RELAY && prev != SECRET_PATH_RELAY {
+            self.entry
+                .secret_direct_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        *self
+            .entry
+            .secret_path_reason
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = if code == SECRET_PATH_DIRECT {
+            None
+        } else {
+            reason
+        };
     }
 
     /// Update the carrier count once the effective (negotiated) value is known.
@@ -610,6 +702,73 @@ mod tests {
         assert!(!reg.snapshot()[0].udp);
         handle.mark_udp();
         assert!(reg.snapshot()[0].udp);
+    }
+
+    #[test]
+    fn secret_path_report_is_recorded_and_rendered() {
+        let reg = AdminRegistry::default();
+        let handle = reg.register(sample(Role::SecretConsumer));
+        // Before any report: genuinely unknown, and it says so.
+        assert_eq!(reg.snapshot()[0].secret_path, "unknown");
+        assert_eq!(reg.snapshot()[0].secret_direct_fallbacks, 0);
+
+        handle.set_secret_path("direct", None);
+        assert_eq!(reg.snapshot()[0].secret_path, "direct");
+        assert_eq!(reg.snapshot()[0].secret_direct_fallbacks, 0);
+        assert_eq!(reg.snapshot()[0].secret_path_reason, None);
+    }
+
+    #[test]
+    fn a_fallback_is_counted_on_the_transition_and_not_on_every_report() {
+        // The counter answers "did this tunnel LOSE the direct path?", so a
+        // consumer that is permanently un-punchable and re-reports "relay" on
+        // every reconnect must read 1, not one per reconnect — otherwise a
+        // stable relay tunnel and a flapping one look the same, and flapping is
+        // the one worth waking up for.
+        let reg = AdminRegistry::default();
+        let handle = reg.register(sample(Role::SecretConsumer));
+
+        handle.set_secret_path("relay", Some("no udp-capable provider registered".into()));
+        assert_eq!(reg.snapshot()[0].secret_direct_fallbacks, 1);
+        handle.set_secret_path("relay", Some("no udp-capable provider registered".into()));
+        handle.set_secret_path("relay", Some("no udp-capable provider registered".into()));
+        assert_eq!(
+            reg.snapshot()[0].secret_direct_fallbacks,
+            1,
+            "re-reporting the same relay state must not count a new fallback"
+        );
+        assert_eq!(
+            reg.snapshot()[0].secret_path_reason.as_deref(),
+            Some("no udp-capable provider registered")
+        );
+
+        // A real flap: direct, then relay again, is a SECOND fallback.
+        handle.set_secret_path("direct", None);
+        assert_eq!(
+            reg.snapshot()[0].secret_path_reason,
+            None,
+            "a direct report must clear the stale reason"
+        );
+        handle.set_secret_path("relay", Some("checks failed".into()));
+        assert_eq!(reg.snapshot()[0].secret_direct_fallbacks, 2);
+        assert_eq!(
+            reg.snapshot()[0].secret_path_reason.as_deref(),
+            Some("checks failed")
+        );
+    }
+
+    #[test]
+    fn an_unknown_path_label_is_ignored_rather_than_stored() {
+        // `path` is peer-controlled and the admin API renders it. Storing an
+        // arbitrary string would put attacker-chosen text on the dashboard; the
+        // label set is closed, so anything else is simply not a report.
+        let reg = AdminRegistry::default();
+        let handle = reg.register(sample(Role::SecretConsumer));
+        handle.set_secret_path("direct", None);
+        handle.set_secret_path("<img src=x onerror=alert(1)>", Some("nope".into()));
+        assert_eq!(reg.snapshot()[0].secret_path, "direct");
+        assert_eq!(reg.snapshot()[0].secret_path_reason, None);
+        assert_eq!(reg.snapshot()[0].secret_direct_fallbacks, 0);
     }
 
     #[test]

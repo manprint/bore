@@ -759,6 +759,15 @@ enum Command {
         #[clap(long, value_name = "PORT", env = "BORE_VHOST_QUIC_PORT")]
         vhost_quic_port: Option<u16>,
 
+        /// UDP port for the ALTERNATE STUN socket (RFC 5780 behaviour
+        /// discovery). With `--udp`, clients probe it to tell an
+        /// address-dependent NAT filter from an address+port-dependent one —
+        /// the axis that decides whether a direct path to a symmetric peer is
+        /// possible at all. Unset/0 = an ephemeral port, which is correct
+        /// unless the server's EGRESS firewall allow-lists source ports.
+        #[clap(long, value_name = "PORT", env = "BORE_STUN_ALT_PORT")]
+        stun_alt_port: Option<u16>,
+
         /// Override the frontend mode from vhost.yml.
         /// Values: http | https | both | redirect-https | auto
         #[clap(long, value_name = "MODE", env = "BORE_VHOST_MODE")]
@@ -2147,6 +2156,7 @@ async fn dispatch(command: Command) -> Result<()> {
             vhost_http_port,
             vhost_https_port,
             vhost_quic_port,
+            stun_alt_port,
             vhost_mode,
             vhost_cert_file,
             vhost_key_file,
@@ -2341,6 +2351,9 @@ async fn dispatch(command: Command) -> Result<()> {
             if let Some(port) = vhost_quic_port {
                 server.set_vhost_quic_port(port);
             }
+            if let Some(port) = stun_alt_port {
+                server.set_stun_alt_port(port);
+            }
             if let Some(mut cfg) = vhost_cfg {
                 if let Some(domain) = vhost_base_domain {
                     cfg.base_domain = domain;
@@ -2432,6 +2445,10 @@ async fn dispatch(command: Command) -> Result<()> {
                 vhost_http_port,
                 vhost_https_port,
                 vhost_quic_port,
+                // The CONFIGURED value: `0`/unset means an ephemeral port,
+                // and an ephemeral port is precisely the case where there is
+                // nothing for an operator to pin a rule to.
+                stun_alt_port: Some(stun_alt_port.unwrap_or(0)),
                 vhost_mode: vhost_mode.clone(),
                 vhost_config: vhost_config
                     .as_ref()

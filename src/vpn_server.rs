@@ -852,6 +852,11 @@ pub async fn serve_vpn_listener(
                                     // Hub per-peer direct path stays legacy v1 (no v2/checks/plan yet);
                                     // the 1:1 path adopted v2 in Fase 3.
                                     v2: None,
+                                    // VPN has its own path reporting
+                                    // (`ClientMessage::VpnPathReport`, gated by
+                                    // `VpnReady.admin_v2`); S-1's secret report
+                                    // is not offered here.
+                                    path_report: false,
                                 })
                                 .await
                                 .is_err()
@@ -971,6 +976,9 @@ pub async fn serve_vpn_listener(
                         tuning: udp_tuning,
                         peer_id: 0,
                         v2: offer.v2,
+                        // VPN reports its own path (`VpnPathReport`); S-1's
+                        // secret report is not offered here.
+                        path_report: false,
                     }).await.is_err() {
                         info!(%id, "vpn listener disconnected");
                         break;
@@ -1295,6 +1303,11 @@ pub async fn serve_vpn_connector(
                                     // Hub per-peer direct path stays legacy v1 (no v2/checks/plan yet);
                                     // the 1:1 path adopted v2 in Fase 3.
                                     v2: None,
+                                    // VPN has its own path reporting
+                                    // (`ClientMessage::VpnPathReport`, gated by
+                                    // `VpnReady.admin_v2`); S-1's secret report
+                                    // is not offered here.
+                                    path_report: false,
                                 })
                                 .await
                                 .is_err()
@@ -1666,6 +1679,9 @@ pub async fn serve_vpn_connector(
                                 tuning: udp_tuning,
                                 peer_id: 0,
                                 v2: listener_v2,
+                                // VPN reports its own path (`VpnPathReport`);
+                                // S-1's secret report is not offered here.
+                                path_report: false,
                             })
                             .await?;
                         // ...and forward the connector's offer to the listener.

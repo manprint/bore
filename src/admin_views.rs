@@ -177,6 +177,27 @@ pub struct SecretView {
     pub transport: crate::admin::Transport,
     /// Identity presented by SSH client authentication (SSH only; None for native Bore).
     pub identity: Option<String>,
+    /// Which data path this tunnel's connections actually use: `"direct"`,
+    /// `"relay"` or `"unknown"` (S-1).
+    ///
+    /// Derived the way [`TunnelView::current_path`] is (P-10): a consumer that
+    /// never asked for `--udp` has exactly one possible path and reads
+    /// `"relay"`, never `"unknown"`. It stays `"unknown"` only in the one case
+    /// with no answer — a `--udp` consumer that was brokered a punch and has
+    /// not reported its outcome yet.
+    ///
+    /// Unlike vhost/public/ssh-jump this cannot be observed by the server: a
+    /// secret tunnel's direct path runs consumer↔provider and never reaches
+    /// it, so the value comes from
+    /// [`crate::shared::ClientMessage::SecretPathReport`].
+    pub current_path: String,
+    /// How many times this consumer reported falling back to the relay after
+    /// asking for a direct path. Counted on the TRANSITION, so a permanently
+    /// relayed tunnel reads 1, not one per reconnect.
+    pub direct_fallbacks: u64,
+    /// Why the direct path is not in use, as the consumer reported it (or as
+    /// the server recorded when it refused the punch). `None` while direct.
+    pub path_reason: Option<String>,
 }
 
 /// Vhost subdomain provider.
@@ -517,6 +538,16 @@ pub struct ConfigView {
     pub vhost_https_port: Option<u16>,
     /// Vhost QUIC port (UDP direct path).
     pub vhost_quic_port: Option<u16>,
+    /// Configured UDP port of the RFC 5780 ALTERNATE STUN socket, or `0` when
+    /// it takes an ephemeral one (the default).
+    ///
+    /// The CONFIGURED value, never the port the socket ended up on: those
+    /// differ exactly when the operator did NOT pin it, and in that case there
+    /// is nothing to pin a firewall rule to either — the socket only ever
+    /// sends. `None` = a server too old to have the field, which is also a
+    /// server whose clients cannot measure their NAT filtering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stun_alt_port: Option<u16>,
     /// Vhost frontend mode (http, https, both, redirect-https, auto).
     pub vhost_mode: Option<String>,
     /// Vhost configuration file path.
@@ -707,6 +738,7 @@ mod tests {
             server_version: crate::FULL_VERSION.to_string(),
             port_range: "5000-6000".into(),
             control_port: 7835,
+            stun_alt_port: Some(0),
             max_conns: 100,
             max_carriers: 4,
             bind_addr: "0.0.0.0".into(),
@@ -955,6 +987,7 @@ mod tests {
             vhost_http_port: None,
             vhost_https_port: None,
             vhost_quic_port: None,
+            stun_alt_port: Some(0),
             vhost_mode: None,
             vhost_config: None,
             vhost_cert_file: None,

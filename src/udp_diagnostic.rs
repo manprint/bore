@@ -1338,6 +1338,40 @@ async fn inspect_local_nat(
         }
     }
 
+    // FILTERING (plan Fase 6). This is the axis §13 used to list as a known
+    // gap, and it is not a cosmetic one: a real-kernel matrix
+    // (`scripts/udp_nat_netns_test.sh`) shows `eim:adf` and `eim:apdf`
+    // differing ONLY here, and only the first reaching a symmetric peer. The
+    // MAPPING this function already reports cannot distinguish them.
+    //
+    // The bore server is tried FIRST and, in practice, alone: RFC 5780
+    // behaviour discovery needs the server to answer from a second port, which
+    // the public STUN servers on the default chain no longer do (the ones that
+    // did have been shut down for years). A server that cannot answer yields
+    // `Unsupported` -> `None`, which is reported as "unknown" and never as a
+    // restrictive filter.
+    let mut filtering = holepunch::FilterProbe::Unsupported;
+    let mut filter_targets: Vec<SocketAddr> = Vec::new();
+    if let Some((host, port)) = bore_target {
+        if let Ok(addr) = holepunch::resolve_stun(host, port, None).await {
+            filter_targets.push(addr);
+        }
+    }
+    for probe in probes.iter().filter(|p| p.ok) {
+        if let Ok(addr) = probe.server.parse::<SocketAddr>() {
+            if !filter_targets.contains(&addr) {
+                filter_targets.push(addr);
+            }
+        }
+    }
+    for target in &filter_targets {
+        let outcome = holepunch::probe_filtering(socket, *target).await;
+        if outcome != holepunch::FilterProbe::Unsupported {
+            filtering = outcome;
+            break;
+        }
+    }
+
     let local_ips: Vec<IpAddr> = primary.into_iter().collect();
     let class = holepunch::classify_nat(&local_ips, &observations);
     let reflexive: Vec<String> = observations
@@ -1362,6 +1396,7 @@ async fn inspect_local_nat(
         bore_stun,
         candidate_count: 0,
         port_preserved,
+        filtering: Some(filtering.as_str().to_string()),
     };
 
     LocalNatReport {
@@ -1864,6 +1899,27 @@ fn pattern_buffer() -> Vec<u8> {
     (0..DEFAULT_CHUNK).map(|i| (i % 251) as u8).collect()
 }
 
+/// Render the measured FILTERING axis for a human.
+///
+/// The wording is chosen so the two useful states cannot be misread. "apdf"
+/// alone means nothing to most operators; what they need to know is that this
+/// side cannot be reached by a peer whose port they cannot predict — which is
+/// exactly the cell the A×B matrix marks ✗. And "unknown" must never look
+/// like a restriction: it means nobody could ask the question, usually
+/// because the server has no alternate STUN socket.
+fn filtering_label(filtering: Option<&str>) -> String {
+    use holepunch::FilterProbe;
+    match filtering {
+        Some("apdf") => FilterProbe::AddressAndPortDependent.describe().to_string(),
+        Some("adf-or-eif") => FilterProbe::AddressDependentOrOpen.describe().to_string(),
+        // A label this build does not know: it came off the wire from a newer
+        // peer, so show it verbatim rather than flattening it to "unknown",
+        // which would claim the measurement was never taken.
+        Some(other) if other != "unknown" => other.to_string(),
+        _ => FilterProbe::Unsupported.describe().to_string(),
+    }
+}
+
 fn nat_class_label(class: &NatClass) -> &'static str {
     match class {
         NatClass::Blocked => "blocked",
@@ -1897,6 +1953,10 @@ fn print_local_nat_report(report: &LocalNatReport, candidates: &[SocketAddr]) {
         candidate_roles_label(&report.summary.candidate_kinds)
     );
     println!("NAT class         : {}", nat_class_label(&report.class));
+    println!(
+        "NAT filtering     : {}",
+        filtering_label(report.summary.filtering.as_deref())
+    );
     for probe in &report.probes {
         if probe.ok {
             println!(
@@ -1986,6 +2046,10 @@ fn print_pairing_report(
     println!("Server pairing     : paired");
     println!("Local role         : {role:?}");
     println!("Peer NAT class     : {}", peer.nat_class);
+    println!(
+        "Peer NAT filtering : {}",
+        filtering_label(peer.filtering.as_deref())
+    );
     println!("Peer UDP socket    : {}", peer.local_udp);
     println!(
         "Peer candidate roles: {}",
@@ -2163,12 +2227,16 @@ fn print_final_report(
     println!("Final report");
     println!("============");
     println!(
-        "Local NAT         : {} ({})",
-        local.nat_class, local.local_udp
+        "Local NAT         : {} ({}, filtering {})",
+        local.nat_class,
+        local.local_udp,
+        filtering_label(local.filtering.as_deref())
     );
     println!(
-        "Peer NAT          : {} ({})",
-        peer.nat_class, peer.local_udp
+        "Peer NAT          : {} ({}, filtering {})",
+        peer.nat_class,
+        peer.local_udp,
+        filtering_label(peer.filtering.as_deref())
     );
     println!(
         "UDP direct        : {}",
@@ -2622,6 +2690,7 @@ mod tests {
             bore_stun: Some(true),
             candidate_count: count,
             port_preserved: Some(true),
+            filtering: None,
         }
     }
 
@@ -2703,6 +2772,7 @@ mod tests {
             bore_stun: Some(true),
             candidate_count: 3,
             port_preserved: Some(true),
+            filtering: None,
         };
         let candidates = vec![
             "127.0.0.1:50000".parse().unwrap(),

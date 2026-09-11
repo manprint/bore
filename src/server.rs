@@ -310,6 +310,9 @@ pub struct Server {
 
     /// Whether to broker UDP direct paths and run the STUN responder.
     udp: bool,
+    /// UDP port for the RFC 5780 ALTERNATE STUN socket, or `0` for ephemeral.
+    /// See [`Server::set_stun_alt_port`].
+    stun_alt_port: u16,
 
     /// Pending paired `bore test-udp` sessions, keyed by diagnostic id.
     udp_tests: udp_diagnostic::Registry,
@@ -512,6 +515,7 @@ impl Server {
             providers: Registry::default(),
             udp_providers: UdpRegistry::default(),
             udp: false,
+            stun_alt_port: 0,
             udp_tests: udp_diagnostic::Registry::default(),
             control_port: CONTROL_PORT,
             tls: None,
@@ -607,6 +611,7 @@ impl Server {
                 vhost_http_port: None,
                 vhost_https_port: None,
                 vhost_quic_port: None,
+                stun_alt_port: Some(0),
                 vhost_mode: None,
                 vhost_config: None,
                 vhost_cert_file: None,
@@ -835,6 +840,21 @@ impl Server {
     /// warm TCP relay instead; no request fails.
     pub fn direct_budget_refusals(&self) -> u64 {
         self.direct_budget_refusals.load(Ordering::Relaxed)
+    }
+
+    /// Pin the UDP port of the RFC 5780 ALTERNATE STUN socket.
+    ///
+    /// `0` (the default) takes an ephemeral port, which is the right answer
+    /// almost always: the socket only ever SENDS — it answers a client that
+    /// asked for its response from "the other port" — and the client learns
+    /// the address from the datagram's own source, never from configuration.
+    /// Pinning exists for the deployment whose EGRESS firewall is allow-listed
+    /// by source port, where an ephemeral port would silently make every
+    /// filtering probe read as a restrictive NAT.
+    pub fn set_stun_alt_port(&mut self, port: u16) {
+        self.stun_alt_port = port;
+        let view = Arc::make_mut(&mut self.config_view);
+        view.stun_alt_port = Some(port);
     }
 
     /// Apply a server-wide direct-path memory budget. `None` restores the
@@ -1382,8 +1402,37 @@ impl Server {
             }
             match tokio::net::UdpSocket::bind((this.bind_addr, this.control_port)).await {
                 Ok(udp) => {
+                    // The ALTERNATE socket is what makes this server able to
+                    // answer the FILTERING question (RFC 5780 §4.4): a
+                    // CHANGE-REQUEST is answered from it, so the datagram
+                    // reaches the client from an address the client never
+                    // wrote to. Mapping alone does not decide whether a direct
+                    // path is possible — `eim:adf` and `eim:apdf` differ in
+                    // filtering ONLY and only the first reaches a symmetric
+                    // peer (`scripts/udp_nat_netns_test.sh`).
+                    //
+                    // Failing to bind it is NOT fatal and is deliberately a
+                    // single info line: the server keeps serving reflexive
+                    // addresses exactly as before, and clients report their
+                    // filtering as `unknown` rather than guessing.
+                    let alt =
+                        match tokio::net::UdpSocket::bind((this.bind_addr, this.stun_alt_port))
+                            .await
+                        {
+                            Ok(sock) => {
+                                let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+                                info!(port, "alternate STUN responder listening (RFC 5780)");
+                                Some(Arc::new(sock))
+                            }
+                            Err(err) => {
+                                warn!(%err, requested = this.stun_alt_port,
+                                  "failed to bind the alternate STUN socket; \
+                                   clients cannot measure NAT filtering against this server");
+                                None
+                            }
+                        };
                     info!(port = this.control_port, "STUN responder listening");
-                    tokio::spawn(holepunch::run_stun_responder(udp));
+                    tokio::spawn(holepunch::run_stun_responder_with_alt(Arc::new(udp), alt));
                 }
                 Err(err) => warn!(%err, "failed to bind STUN responder; udp disabled"),
             }
@@ -2232,6 +2281,13 @@ impl Server {
             }
             Some(ClientMessage::VpnPathReport { .. }) => {
                 warn!("unexpected vpn path report as first message");
+                Ok(())
+            }
+            Some(ClientMessage::SecretPathReport { .. }) => {
+                // S-1: only ever valid on an ESTABLISHED secret consumer's
+                // control loop, which `serve_consumer` owns. As a first
+                // message it names no tunnel, so there is nothing to record.
+                warn!("unexpected secret path report as first message");
                 Ok(())
             }
             Some(ClientMessage::UdpCandidates(_))

@@ -1089,6 +1089,9 @@ fn spawn_ctrl_actor(
                         tuning,
                         peer_id: _,
                         v2,
+                        // VPN has its own `VpnPathReport`; the secret-tunnel
+                        // capability (S-1) does not apply to this role.
+                        path_report: _,
                     }))) => {
                         tracing::debug!(?peer, ?peer_selected_stun, "received vpn udp punch");
                         let _ = event_tx
@@ -9394,6 +9397,7 @@ mod tests {
                 tuning: UdpDirectTuning::default(),
                 peer_id: 0,
                 v2: None,
+                path_report: false,
             })
             .await
             .unwrap();

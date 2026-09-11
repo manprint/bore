@@ -1,6 +1,14 @@
 /**
  * Secret panel: secret tunnels grouped by secret_id into cards.
  * Each card shows providers and consumers, mirroring the VPN panel structure.
+ *
+ * `Path` (S-1) is the secret registry's answer to the question no counter can
+ * reach: which transport this tunnel's data is ACTUALLY on. It arrives the only
+ * way it can — the CONSUMER reports it (`ClientMessage::SecretPathReport`),
+ * because a secret tunnel's direct path runs consumer↔provider and the server
+ * is not one of its endpoints, unlike the vhost, public and ssh-jump paths
+ * where the server is the far end and can simply look. A `--udp` PROVIDER
+ * therefore reads `unknown` by construction; read the consumer row.
  */
 
 import { badge, fmtBytes, fmtDuration, escapeHtml, flagBadges, badgeCell } from '../ui.js';
@@ -129,7 +137,7 @@ function renderEntryTable(entries) {
 
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
-    ['Peer', 'Local', 'Flags', 'Connections', 'Uptime', 'TX', 'RX', 'Notes'].forEach(h => {
+    ['Peer', 'Local', 'Flags', 'Connections', 'Uptime', 'TX', 'RX', 'Path', 'Notes'].forEach(h => {
         const th = document.createElement('th');
         th.textContent = escapeHtml(h);
         headerRow.appendChild(th);
@@ -188,6 +196,28 @@ function renderEntryTable(entries) {
         const rxCell = document.createElement('td');
         rxCell.textContent = escapeHtml(fmtBytes(entry.relay_rx_bytes));
         tr.appendChild(rxCell);
+
+        // Path. Same states, same colouring and the same label shape as the
+        // Vhost panel, so an operator reads one column the same way in every
+        // section. Absent fields are `??`-defaulted, never truthiness-tested:
+        // an older server omits `current_path` and `direct_fallbacks`
+        // entirely, and that must render "unknown" rather than throw.
+        const pathCell = document.createElement('td');
+        const path = entry.current_path ?? 'unknown';
+        const fallbacks = entry.direct_fallbacks ?? 0;
+        let pathKind = 'default';
+        if (path === 'direct') pathKind = 'success';
+        else if (path === 'relay') pathKind = entry.udp ? 'warning' : 'info';
+        const pathLabel = (path === 'relay' && entry.udp && fallbacks > 0)
+            ? `relay (${fallbacks} fallback${fallbacks === 1 ? '' : 's'})`
+            : path;
+        pathCell.appendChild(badge(pathLabel, pathKind));
+        // The REASON is what makes a relay row actionable ("udp egress
+        // blocked" vs "no udp-capable provider registered"), but it is a free
+        // sentence and would wreck the column, so it rides as the cell's
+        // tooltip and lives in full in the row's detail modal.
+        if (entry.path_reason) pathCell.title = entry.path_reason;
+        tr.appendChild(pathCell);
 
         // Notes
         const notesCell = document.createElement('td');

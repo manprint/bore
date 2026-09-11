@@ -472,6 +472,19 @@ pub struct UdpTestPeerSummary {
     pub candidate_count: usize,
     /// Whether the first reflexive mapping preserved the local UDP port.
     pub port_preserved: Option<bool>,
+    /// Measured NAT FILTERING behaviour: `"adf-or-eif"`, `"apdf"` or
+    /// `"unknown"` (plan Fase 6).
+    ///
+    /// Additive and a STRING on purpose. It is a string because this axis is
+    /// expected to gain finer readings (a two-IP probe separates EIF from ADF)
+    /// and a new variant of a serde enum is a hard decode error for an older
+    /// peer, while an unrecognised string is just a label it does not act on.
+    /// It is additive because the whole point of the field is that a peer
+    /// which cannot measure it must report nothing rather than a default that
+    /// reads as a measurement — `#[serde(default)]` gives `None`, and `None`
+    /// means "not measured", never "unrestricted".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filtering: Option<String>,
 }
 
 /// Role assigned to a paired-UDP candidate address.
@@ -675,6 +688,57 @@ pub struct UdpNatProfile {
     /// confidence signal (`< 2` ⇒ mapping is at best a guess).
     #[serde(default)]
     pub observations: u8,
+    /// The FILTERING probe's own reading (plan Fase 6), or `None` when the
+    /// question could not be asked.
+    ///
+    /// It sits BESIDE `filtering` rather than replacing it because the two
+    /// answer different questions and an old peer can only understand the
+    /// first. `filtering` is the coarse legacy enum and is only ever set to
+    /// `AddressDependent` — its documented meaning, "address- OR
+    /// port-dependent" — when the probe was blocked; a probe that got through
+    /// proves the filter is EIF *or* ADF and a single-homed STUN server
+    /// cannot say which, so the legacy field stays `Unknown` rather than
+    /// claiming a full cone. This field carries the distinction the legacy
+    /// enum cannot express, for peers that understand it.
+    ///
+    /// A NEW field carrying a NEW enum is wire-safe in one direction only:
+    /// an older peer skips a field it does not know, but it would HARD-FAIL on
+    /// an unknown VARIANT of a field it does know. That is why this enum has
+    /// exactly the two states a single-IP probe can produce and why "could not
+    /// measure" is `None` rather than a third variant. A finer reading (a
+    /// two-IP probe separating EIF from ADF) must therefore NOT add a variant
+    /// here: it needs its own additive field, or a capability gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filtering_probe: Option<UdpFilterProbe>,
+}
+
+/// What a single-IP RFC 5780 filtering probe can conclude (plan Fase 6).
+///
+/// Deliberately two-valued: see the wire note on
+/// [`UdpNatProfile::filtering_probe`]. "Not measured" is the `Option`'s
+/// `None`, never a variant — an absent measurement and a restrictive filter
+/// look identical from a client socket and mean opposite things, so they must
+/// not share a representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UdpFilterProbe {
+    /// A datagram from an address+port this host never wrote to got through:
+    /// the filter keys on the ADDRESS at most (ADF), or not at all (EIF).
+    /// Both reach a symmetric peer, which is the distinction that decides
+    /// whether a direct path exists.
+    AddressDependentOrOpen,
+    /// The probe was dropped: the filter keys on address AND port (APDF) —
+    /// the typical home router.
+    AddressAndPortDependent,
+}
+
+impl UdpFilterProbe {
+    /// Stable lowercase label used in logs, reports and the diagnostic.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UdpFilterProbe::AddressDependentOrOpen => "adf-or-eif",
+            UdpFilterProbe::AddressAndPortDependent => "apdf",
+        }
+    }
 }
 
 impl UdpNatProfile {
@@ -683,7 +747,9 @@ impl UdpNatProfile {
         format!(
             "{}/{} port_preserved={} ({} obs)",
             self.mapping.as_str(),
-            self.filtering.as_str(),
+            self.filtering_probe
+                .map(UdpFilterProbe::as_str)
+                .unwrap_or(self.filtering.as_str()),
             match self.port_preserved {
                 Some(true) => "yes",
                 Some(false) => "no",
@@ -1577,6 +1643,31 @@ pub enum ClientMessage {
     /// backward-compatible (an old server fails to deserialize this variant, so
     /// clients must be deployed before / together with the server).
     Heartbeat,
+
+    /// Report which data path a secret tunnel's consumer actually used (S-1).
+    ///
+    /// Sent ONLY when the server set `path_report` on
+    /// [`ServerMessage::UdpPunch`], because an old server cannot decode an
+    /// unknown variant. Appended LAST for the same wire-compatibility reason
+    /// as `Heartbeat`.
+    ///
+    /// Why the client and not the server: for a vhost, public or ssh-jump
+    /// tunnel the server is one END of the QUIC direct connection and records
+    /// the path itself. A secret tunnel's direct path runs consumer↔provider
+    /// and the server only brokers the punch, so the server's honest answer
+    /// without this message is "unknown" — which is what it used to publish by
+    /// publishing nothing at all.
+    SecretPathReport {
+        /// `"direct"` or `"relay"`.
+        path: String,
+        /// Why the direct path was not used, when it was not. Free text from a
+        /// fixed set the consumer chooses; `None` on a direct report. This is
+        /// the field an operator actually needs — "on relay" without a reason
+        /// does not say whether to open a port, change the provider's host, or
+        /// accept it.
+        #[serde(default)]
+        reason: Option<String>,
+    },
 }
 
 /// A message from the server on the control substream.
@@ -1635,6 +1726,20 @@ pub enum ServerMessage {
         /// observe-only in Fase 1.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         v2: Option<UdpPunchV2>,
+        /// Whether this server accepts [`ClientMessage::SecretPathReport`]
+        /// (S-1). The consumer is the ONLY party that knows how a secret
+        /// tunnel's data actually travelled — the direct path goes
+        /// consumer↔provider and never touches the server — so the server
+        /// cannot observe it and must be told.
+        ///
+        /// `#[serde(default)]` keeps both directions compatible: an old server
+        /// omits the field, the consumer reads `false` and never sends the
+        /// report (an old server would fail to decode the unknown variant,
+        /// which on this wire is a hard control-loop error), and an old
+        /// consumer ignores the unknown field and simply never reports. Same
+        /// shape as `VpnReady.admin_v2`, for the same reason.
+        #[serde(default)]
+        path_report: bool,
     },
 
     /// Provider-selected STUN server hint returned to a consumer before it
@@ -1980,6 +2085,13 @@ impl ControlFrameSummary for ClientMessage {
                     carriers,
                 )
             }
+            ClientMessage::SecretPathReport { path, reason } => {
+                format!(
+                    "SecretPathReport {{ path={}, reason={} }}",
+                    path,
+                    reason.as_deref().unwrap_or("<none>")
+                )
+            }
             ClientMessage::VpnPathReport { path } => {
                 format!("VpnPathReport {{ path={} }}", path)
             }
@@ -2033,9 +2145,10 @@ impl ControlFrameSummary for ServerMessage {
                 tuning,
                 peer_id,
                 v2,
+                path_report,
             } => {
                 format!(
-                    "UdpPunch {{ nonce={}, peer={:?}, peer_selected_stun={}, tuning={{ {} }}, peer_id={}, v2={} }}",
+                    "UdpPunch {{ nonce={}, peer={:?}, peer_selected_stun={}, tuning={{ {} }}, peer_id={}, path_report={path_report}, v2={} }}",
                     hex::encode(nonce),
                     peer,
                     peer_selected_stun.as_deref().unwrap_or("<none>"),
@@ -2730,7 +2843,16 @@ mod tests {
                 tuning,
                 peer_id: _,
                 v2,
+                path_report,
             } => {
+                // S-1 wire compatibility: an OLD server's frame carries no
+                // `path_report`, so a new consumer must read `false` and stay
+                // silent — sending `SecretPathReport` to a server that cannot
+                // decode the variant is a hard control-loop error.
+                assert!(
+                    !path_report,
+                    "a legacy UdpPunch frame must not enable path reporting"
+                );
                 assert_eq!(nonce, [0; UDP_NONCE_LEN]);
                 assert_eq!(peer, vec!["127.0.0.1:3478".parse().unwrap()]);
                 assert_eq!(peer_selected_stun, None);
@@ -2777,6 +2899,7 @@ mod tests {
                 filtering: UdpNatFiltering::Unknown,
                 port_preserved: Some(true),
                 observations: 2,
+                filtering_probe: Some(UdpFilterProbe::AddressAndPortDependent),
             }),
         };
         let json = serde_json::to_string(&full).unwrap();
@@ -2819,6 +2942,7 @@ mod tests {
             peer_selected_stun: Some("stun.some-long-hostname.example.com:3478".into()),
             tuning: UdpDirectTuning::default(),
             peer_id: u32::MAX,
+            path_report: true,
             v2: Some(UdpPunchV2 {
                 generation: u32::MAX,
                 peer_typed: peers
@@ -2868,6 +2992,7 @@ mod tests {
             peer_selected_stun: None,
             tuning: UdpDirectTuning::default(),
             peer_id: 0,
+            path_report: true,
             v2: Some(UdpPunchV2 {
                 generation: 5,
                 peer_typed: vec![UdpTypedCandidate {
@@ -2898,6 +3023,7 @@ mod tests {
             peer_selected_stun: None,
             tuning: UdpDirectTuning::default(),
             peer_id: 0,
+            path_report: true,
             v2: Some(UdpPunchV2 {
                 generation: 6,
                 peer_typed: vec![],
@@ -2933,6 +3059,7 @@ mod tests {
             peer_selected_stun: None,
             tuning: UdpDirectTuning::default(),
             peer_id: 0,
+            path_report: true,
             v2: None,
         };
         let json = serde_json::to_string(&legacy).unwrap();
@@ -3074,6 +3201,7 @@ fn control_frame_summary_includes_test_udp_plan() {
             bore_stun: Some(true),
             candidate_count: 1,
             port_preserved: Some(true),
+            filtering: Some("apdf".to_string()),
         },
         options: UdpTestOptions {
             bandwidth: true,

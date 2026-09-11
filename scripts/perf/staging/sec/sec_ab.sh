@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# S1: the core secret-tunnel transport comparison — TCP relay vs hole-punched
+# QUIC direct — run PAIRED across three topologies.
+#
+# Run from the WORKSTATION: a secret tunnel has two clients and only the
+# workstation can reach both hosts. The traffic driver always runs on the
+# CONSUMER's host, against the consumer's own `--local-proxy-port` on
+# loopback, because that is where a real user's application sits.
+#
+# Topologies (TOPO=):
+#   vm-ws   provider on the test VM, consumer on this workstation   (download
+#           from a same-region provider to a home NAT — the common shape)
+#   ws-vm   provider on this workstation, consumer on the test VM   (upload
+#           out of a home NAT; the asymmetric twin, and the one where the
+#           workstation's NAT is on the RECEIVING side of the punch)
+#   vm-vm   both on the test VM (one host, two processes): no WAN between the
+#           peers, so the direct arm isolates the CPU and stack cost of QUIC
+#           from every network effect. It is a CONTROL, not a user scenario.
+#
+# Method, unchanged from the public campaign because the confounder is the
+# same instance: PAIRED arms (drift cancels in the ratio), FIXED BYTES (both
+# halves spend the same burst allowance), order alternating within the pair,
+# quote the MEDIAN RATIO. What IS new: every arm's path is read from the
+# CONSUMER's admin row and printed, and a --udp arm that fell back to the
+# relay is labelled `relay(fb=N)` instead of being averaged into a "direct"
+# median. A direct number that was silently a relay number is the one mistake
+# this whole campaign exists to avoid.
+set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/seclib.sh"
+
+TOPO="${TOPO:-vm-ws}"
+MB="${MB:-128}"
+CONNS="${CONNS:-4}"
+PAIRS="${PAIRS:-5}"
+PER=$(( MB * 1048576 / CONNS ))
+PP="$SEC_PROXY_PORT"
+
+case "$TOPO" in
+  vm-ws|ws-vm|vm-vm) ;;
+  *) echo "TOPO must be vm-ws, ws-vm or vm-vm (got '$TOPO')" >&2; exit 2 ;;
+esac
+
+# --- per-topology role placement -------------------------------------------
+# The provider always serves the RAW origin on its own loopback; the consumer
+# always publishes on its own loopback. Only WHERE each runs changes.
+start_provider() { # <secret-id> <flags...>
+    local id="$1"; shift
+    case "$TOPO" in
+        vm-ws|vm-vm) vm_provider "$RP" "$id" "$@" ;;
+        ws-vm)       ws_provider "$RP" "$id" "$@"; PROV_PID="$LASTPID" ;;
+    esac
+}
+start_consumer() { # <secret-id> <flags...>
+    local id="$1"; shift
+    case "$TOPO" in
+        vm-ws)       ws_consumer "$PP" "$id" "$@"; CONS_PID="$LASTPID" ;;
+        ws-vm|vm-vm) vm_consumer "$PP" "$id" "$@" ;;
+    esac
+}
+# drive <get|put> <bytes-per-conn> <conns> -> MB/s
+drive() {
+    local dir="$1" per="$2" conns="$3"
+    case "$TOPO" in
+        vm-ws)
+            python3 "$WS_RAWCLI" "$dir" 127.0.0.1 "$PP" "$per" "$conns" 2>/dev/null \
+                | grep -oE 'MBs=[0-9.]+' | cut -d= -f2 ;;
+        ws-vm|vm-vm)
+            vm "python3 $VM_RAWCLI $dir 127.0.0.1 $PP $per $conns" 2>/dev/null \
+                | grep -oE 'MBs=[0-9.]+' | cut -d= -f2 ;;
+    esac
+}
+
+# The provider's origin. On the VM it is the campaign's own raw_origin.py,
+# started idempotently; on the workstation the same file from this repository.
+start_origin() {
+    case "$TOPO" in
+        vm-ws|vm-vm)
+            vm "pgrep -f 'raw_origin.py $RP' >/dev/null 2>&1 || \
+                (setsid nohup python3 ~/raw_origin.py $RP >~/out/raworigin.log 2>&1 </dev/null & true)" >/dev/null 2>&1
+            vm "python3 $VM_RAWCLI ping 127.0.0.1 $RP 1" >/dev/null 2>&1 ;;
+        ws-vm)
+            pgrep -f "raw_origin.py $RP" >/dev/null 2>&1 || {
+                python3 "$HERE/../../raw_origin.py" "$RP" >"$OUT/raworigin.log" 2>&1 &
+                SEC_KIDS+=("$!")
+            }
+            local i
+            for i in $(seq 40); do
+                python3 "$WS_RAWCLI" ping 127.0.0.1 "$RP" 1 >/dev/null 2>&1 && return 0
+                sleep 0.25
+            done
+            echo "raw origin failed to start on the workstation" >&2; return 1 ;;
+    esac
+}
+
+# one_arm <get|put> <flags...> -> "<MBs> <path> <fallbacks> <ttd_ms>"
+#
+# The warm-up connection is NOT optional and is not a courtesy to QUIC: the
+# direct path is negotiated on the FIRST proxied connection, so a measurement
+# that includes it charges the punch to the transfer. `ttd` is measured
+# SEPARATELY and reported beside the rate, which is the honest way to present
+# a cost that a real user does pay once.
+one_arm() {
+    local dir="$1"; shift
+    local id; id="$(sec_id)"
+    PROV_PID=""; CONS_PID=""
+    start_provider "$id" "$@" || { echo "0 startfail 0 never"; return 1; }
+    if ! sec_wait secretprovider "$id"; then
+        sec_down "$id" ${PROV_PID:-}; echo "0 noprovider 0 never"; return 1
+    fi
+    start_consumer "$id" "$@" || { sec_down "$id" ${PROV_PID:-}; echo "0 startfail 0 never"; return 1; }
+    if ! sec_wait secretconsumer "$id"; then
+        sec_down "$id" ${PROV_PID:-} ${CONS_PID:-}; echo "0 noconsumer 0 never"; return 1
+    fi
+
+    # Warm-up: 1 MiB, one connection. Enough to trigger the direct open and
+    # far too little to matter for the allowance budget.
+    drive get 1048576 1 >/dev/null 2>&1
+    local ttd="n/a"
+    case " $* " in *" --udp "*) ttd="$(sec_time_to_direct "$id" 30)" ;; esac
+
+    local r; r=$(drive "$dir" "$PER" "$CONNS")
+    local path fb
+    path="$(sec_path "$id")"; fb="$(sec_fallbacks "$id")"
+    # A --udp arm that is on the relay is NOT a direct measurement. Say so in
+    # the label so no downstream median can quietly merge the two.
+    case " $* " in
+        *" --udp "*) [ "$path" = relay ] && path="relay(fb=$fb)" ;;
+    esac
+    sec_down "$id" ${PROV_PID:-} ${CONS_PID:-}
+    echo "${r:-0} $path ${fb:-0} $ttd"
+}
+
+paired() { # <title> <dirn>
+    local title="$1" dirn="$2"
+    echo
+    echo "===== $title ($dirn, topology $TOPO) ====="
+    printf '  %-5s %10s %10s %8s   %s\n' pair relay direct ratio "paths (ttd ms)"
+    local rs=() i a b pa pb ta tb
+    for i in $(seq "$PAIRS"); do
+        if [ $((i % 2)) = 1 ]; then
+            read -r a pa _ ta <<<"$(one_arm "$dirn")"; cool
+            read -r b pb _ tb <<<"$(one_arm "$dirn" --udp)"; cool
+        else
+            read -r b pb _ tb <<<"$(one_arm "$dirn" --udp)"; cool
+            read -r a pa _ ta <<<"$(one_arm "$dirn")"; cool
+        fi
+        local r; r=$(ratio "$b" "$a"); rs+=("$r")
+        printf '  %-5s %10s %10s %8s   %s / %s (%s)\n' "$i" "$a" "$b" "$r" "$pa" "$pb" "$tb"
+    done
+    echo "  median ratio direct/relay: $(printf '%s\n' "${rs[@]}" | med)"
+}
+
+start_origin || exit 1
+say "secret A/B: topology $TOPO, ${MB} MiB per arm over $CONNS conns, $PAIRS pairs, ${COOL}s cooldown"
+echo "    provider origin: raw TCP 127.0.0.1:$RP   consumer proxy: 127.0.0.1:$PP"
+paired "S1 relay vs QUIC direct" get
+paired "S1 relay vs QUIC direct" put
+echo
+echo DONE

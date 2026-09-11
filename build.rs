@@ -121,14 +121,14 @@ fn bundle_admin_assets() {
 /// attributes a change to a commit reads exactly this string.
 ///
 /// Four paths are needed to cover the four ways HEAD can move:
-///   * `HEAD` itself           — branch switch, and commits while DETACHED
-///                               (a detached HEAD holds the sha directly, so
-///                               every commit rewrites this file)
-///   * the resolved loose ref  — a commit on the current branch: THE bug above
-///   * `packed-refs`           — the ref lives here after `git gc`
-///   * the loose ref's parent  — creating the loose ref (first commit after a
-///     directory                 gc packed it) changes the directory, not any
-///                               file being watched
+///
+/// * `HEAD` itself — a branch switch, and every commit made while DETACHED (a
+///   detached HEAD holds the sha directly, so the commit rewrites this file).
+/// * The resolved loose ref — a commit on the current branch, THE bug above.
+/// * `packed-refs` — where the ref lives after a `git gc`.
+/// * The loose ref's parent DIRECTORY — creating the loose ref (the first
+///   commit after a gc packed it away) changes the directory, and no file
+///   that would otherwise be watched.
 ///
 /// Every path is emitted ONLY if it currently exists: cargo re-runs a build
 /// script whose watched path is missing, so naming an absent file would turn
@@ -138,10 +138,11 @@ fn watch_git_head() {
     // submodule, and absent entirely in a crates.io tarball or a vendored copy.
     let dot_git = Path::new(".git");
     let git_dir: PathBuf = if dot_git.is_file() {
-        match fs::read_to_string(dot_git)
-            .ok()
-            .and_then(|s| s.trim().strip_prefix("gitdir:").map(|p| p.trim().to_string()))
-        {
+        match fs::read_to_string(dot_git).ok().and_then(|s| {
+            s.trim()
+                .strip_prefix("gitdir:")
+                .map(|p| p.trim().to_string())
+        }) {
             Some(p) => PathBuf::from(p),
             None => return,
         }

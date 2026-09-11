@@ -142,6 +142,30 @@ count_null_consumer_ports() {
     secret_json | jq '[.[] | select(.role=="secretconsumer" and (.local_proxy_port==null or .local_proxy_port==""))] | length' 2>/dev/null || echo 0
 }
 
+# One field of the CONSUMER row for <secret_id>, as the SERVER publishes it.
+#
+# S-1: the secret registry is the only one of the four whose direct path the
+# server cannot observe — for vhost, public and ssh-jump the server is an
+# endpoint of the QUIC connection and can simply look, while a secret tunnel's
+# direct path runs consumer<->provider and never reaches it. The consumer
+# therefore reports (`ClientMessage::SecretPathReport`), and these read the
+# result back out of the admin API, which is the whole point: a measurement
+# that cannot name the transport it used is not evidence. Reading the server
+# and not the client log is deliberate (P-12's rule) — the log proves the
+# client TALKED about a path, the API proves the server BELIEVES it.
+# The row is selected by its `--local-proxy-port`, not by the secret id: a
+# secret id can carry several consumers (T-SEC-MIXED runs a TCP and a UDP one
+# on the same id), and the port is the one field that is unique per logical
+# consumer by construction.
+#
+# Usage: secret_field <local_proxy_port> <jq-field> [default]
+secret_field() {
+    local port="$1" field="$2" dflt="${3:-}"
+    secret_json | jq -r --argjson p "$port" --arg d "$dflt" \
+        "[.[] | select(.role==\"secretconsumer\" and .local_proxy_port==\$p)][0].$field // \$d" \
+        2>/dev/null || echo "$dflt"
+}
+
 # Assert equality
 assert_eq() {
     local actual="$1" expected="$2" msg="$3"
@@ -545,6 +569,23 @@ else
     fail "T-SEC-MIXED consumer count=$cons_count (expected 2)"
 fi
 
+# T-SEC-PATH-MIXED (S-1): both consumers have now moved real bytes, so the
+# server must be able to name the transport of BOTH — and they are different
+# questions. The TCP consumer never asked for `--udp`: it has exactly one
+# possible path and must read "relay", never "unknown" (P-10's rule, which is
+# the defect this whole column was built around). The `--udp` consumer may
+# legitimately land on either path depending on what the namespaces allow, so
+# what is asserted is that the server KNOWS — the one thing that was
+# impossible before the consumer started reporting. Which of the two it was is
+# printed, because that is the measurement the campaign reads.
+assert_eq "$(secret_field 9501 current_path unknown)" "relay" \
+    "T-SEC-PATH-MIXED a relay-only consumer reads relay, never unknown"
+MIXED_PATH="$(secret_field 9502 current_path unknown)"
+case "$MIXED_PATH" in
+    direct|relay) pass "T-SEC-PATH-MIXED the --udp consumer reported its path (path=$MIXED_PATH)" ;;
+    *) fail "T-SEC-PATH-MIXED the --udp consumer moved bytes and the server still reads '$MIXED_PATH'" ;;
+esac
+
 reset_clients
 
 # ── T-SEC-RECONNECT: server restart → clients auto-reconnect, no duplicates ──
@@ -625,6 +666,28 @@ fi
 
 assert_eq "$(count_secret consumer)" "1" "T-SEC-UDP-FALLBACK one consumer row despite --carriers 4 on fallback"
 assert_eq "$(count_null_consumer_ports)" "0" "T-SEC-UDP-FALLBACK no null local_proxy_port on the fallback carrier path"
+
+# T-SEC-PATH-RELAY (S-1): the whole client -> control channel -> registry ->
+# admin API path, in the form the defect was found in. The unit gate pins the
+# derivation; only this proves the report is actually SENT, decoded, and
+# rendered. A `--udp` consumer that fell back must say so, must count the
+# fallback, and must carry a reason an operator can act on — "relay" with no
+# reason is only half an answer, and "unknown" would be the P-10 shape all
+# over again.
+assert_eq "$(secret_field 9801 current_path unknown)" "relay" \
+    "T-SEC-PATH-RELAY the server reports the fallen-back consumer as relay"
+FB_N="$(secret_field 9801 direct_fallbacks 0)"
+if [ "${FB_N:-0}" -ge 1 ]; then
+    pass "T-SEC-PATH-RELAY the fallback was counted (direct_fallbacks=$FB_N)"
+else
+    fail "T-SEC-PATH-RELAY direct_fallbacks=$FB_N — a --udp consumer on the relay must count it"
+fi
+FB_WHY="$(secret_field 9801 path_reason '')"
+if [ -n "$FB_WHY" ]; then
+    pass "T-SEC-PATH-RELAY the relay row names its reason (\"$FB_WHY\")"
+else
+    fail "T-SEC-PATH-RELAY the relay row carries no reason — an operator cannot act on it"
+fi
 
 reset_clients
 

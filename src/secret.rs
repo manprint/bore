@@ -827,6 +827,15 @@ async fn broker_udp(
         // which this branch never sends, so a consumer told "unavailable" has
         // no way to know the server would accept a report. The server knows the
         // answer anyway — it is the one refusing.
+        //
+        // This verdict is PROVISIONAL. The consumer keeps retrying the upgrade
+        // on a backoff, and when one succeeds it learns the capability from
+        // that punch and reports `direct`, which overwrites this row (see
+        // `Proxy::path_report`). Before that existed this line was the LAST
+        // word for the whole session, so a tunnel that upgraded itself thirty
+        // seconds later still read `relay — no udp-capable provider
+        // registered`, which is the ordinary order of events for a pair that
+        // comes up together.
         if let Some(reg) = admin_reg {
             reg.set_secret_path("relay", Some("no udp-capable provider registered".into()));
         }
@@ -1136,6 +1145,23 @@ pub struct Proxy {
     /// Monotonically increasing attempt counter for upgrade retry logs.
     #[cfg(feature = "udp")]
     upgrade_attempt: u64,
+    /// Whether the server declared that it accepts
+    /// [`ClientMessage::SecretPathReport`], retained past registration.
+    ///
+    /// The report is the ONLY way a secret tunnel's transport reaches the admin
+    /// API (S-1: the direct path runs consumer↔provider and the server is not
+    /// on it), and the first report is sent while still on the relay whenever
+    /// the initial negotiation loses the race with the provider's offer. The
+    /// upgrade below then moves every subsequent connection onto the direct
+    /// path WITHOUT telling anyone, so `current_path` read `relay` — with a
+    /// `path_reason` explaining a failure that no longer applied — for the rest
+    /// of the session. Measured on this repository: the consumer logged
+    /// `path=direct-udp` on 200 consecutive connections while the admin API
+    /// answered `relay`. Same class as P-10 and the vhost `last_path` fix:
+    /// a path field that cannot express what is happening is worse than absent,
+    /// because an operator reads it as the truth.
+    #[cfg(feature = "udp")]
+    path_report: bool,
 }
 
 /// Initial delay (s) for the UDP upgrade exponential backoff: 2, 4, 8, 16, …
@@ -1219,6 +1245,10 @@ impl Proxy {
         let mut data_path = DataPath::Relay(Arc::clone(&pool));
         let mut direct = false;
         let mut direct_closed_rx = None;
+        // Declared HERE and not inside the negotiation below, because the
+        // answer outlives registration: a relay→direct upgrade happens minutes
+        // later and has to report itself too (see `path_report` on `Proxy`).
+        let mut path_report = false;
 
         // Optionally negotiate a direct UDP path; on any failure keep the relay so
         // the tunnel still works through the server.
@@ -1235,7 +1265,6 @@ impl Proxy {
             // accepts a path report. Stays false against an old server, and the
             // report below is then never sent — an old server cannot decode the
             // variant and would fail its control loop.
-            let mut server_accepts_path_report = false;
             let outcome = negotiate_direct_consumer(
                 &mut control,
                 &endpoint,
@@ -1244,7 +1273,7 @@ impl Proxy {
                 stun_server,
                 &gather,
                 udp_port,
-                &mut server_accepts_path_report,
+                &mut path_report,
             )
             .await;
             // The reason is captured BEFORE the match consumes the outcome, so
@@ -1280,7 +1309,7 @@ impl Proxy {
                 Ok(None) => info!(%tcp_secret_id, "udp unavailable, using relay"),
                 Err(err) => warn!(%err, "udp negotiation failed, using relay"),
             }
-            if server_accepts_path_report {
+            if path_report {
                 let path = if direct { "direct" } else { "relay" };
                 if let Err(err) = control
                     .send(ClientMessage::SecretPathReport {
@@ -1364,6 +1393,8 @@ impl Proxy {
             ),
             #[cfg(feature = "udp")]
             upgrade_attempt: 0,
+            #[cfg(feature = "udp")]
+            path_report,
         })
     }
 
@@ -1406,6 +1437,8 @@ impl Proxy {
             mut upgrade_attempt,
             #[cfg(feature = "udp")]
             nat_udp_release_timeout,
+            #[cfg(feature = "udp")]
+            mut path_report,
         } = self;
         let mut path = if direct { "direct-udp" } else { "relay" };
         #[cfg(feature = "udp")]
@@ -1539,8 +1572,21 @@ impl Proxy {
                         }
                         // Deliver the brokered candidates to the in-flight upgrade
                         // task (which then punches + dials QUIC); else it is stray.
-                        Some(ServerMessage::UdpPunch { nonce, peer, peer_selected_stun, tuning, peer_id: _, v2, path_report: _ }) => match nego_punch_tx.take() {
+                        Some(ServerMessage::UdpPunch { nonce, peer, peer_selected_stun, tuning, peer_id: _, v2, path_report: accepts_report }) => match nego_punch_tx.take() {
                             Some(tx) => {
+                                // S-1: the capability rides on `UdpPunch` and on
+                                // nothing else, so a consumer whose FIRST
+                                // negotiation was answered `UdpUnavailable` — no
+                                // provider registered yet, the ordinary order of
+                                // events for a pair that comes up together —
+                                // never learned it at registration and could not
+                                // report the upgrade it is about to complete.
+                                // Learn it here, from the punch that is about to
+                                // make the upgrade possible. Monotonic on
+                                // purpose: capability, once declared by a server,
+                                // is a property of that server for the life of
+                                // the control connection.
+                                path_report = path_report || accepts_report;
                                 if let Some(v2) = &v2 {
                                     debug!(
                                         generation = v2.generation,
@@ -1675,6 +1721,42 @@ impl Proxy {
                             data_path = DataPath::Direct(_conn);
                             direct = true;
                             path = "direct-udp";
+                            // Tell the server, or the admin API keeps answering
+                            // with the verdict from registration for the rest of
+                            // the session (see `Proxy::path_report`). The
+                            // `reason` is cleared on purpose: the field explains
+                            // why the path is what it IS, and the failure that
+                            // sent us to the relay no longer applies.
+                            //
+                            // BOUNDED, because this write lives in a `select!`
+                            // arm — the exact shape of P-9, where an unbounded
+                            // `send` against a peer that has stopped reading its
+                            // half of the substream parks forever and the
+                            // consumer stops accepting connections while still
+                            // looking registered. Observability must never cost
+                            // the data path, so a timeout here is a `debug!` and
+                            // nothing more.
+                            if path_report {
+                                let send = control.send(ClientMessage::SecretPathReport {
+                                    path: "direct".into(),
+                                    reason: None,
+                                });
+                                match tokio::time::timeout(
+                                    ctrl_heartbeat_send_timeout(),
+                                    send,
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(err)) => debug!(
+                                        %err,
+                                        "could not report the upgraded secret data path"
+                                    ),
+                                    Err(_) => debug!(
+                                        "reporting the upgraded secret data path timed out;                                          the server is not reading its control substream"
+                                    ),
+                                }
+                            }
                         }
                     }
                 }

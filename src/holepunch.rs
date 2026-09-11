@@ -4139,9 +4139,22 @@ pub mod spray {
             }
             let (n, from) = match timeout(left, socket.recv_from(buf)).await {
                 Ok(Ok(v)) => v,
-                // A hard socket error ends the escape; the caller still has
-                // its ordinary QUIC attempt and the warm relay behind it.
-                Ok(Err(_)) => return None,
+                // A recv error is TRANSIENT here, and treating it as fatal
+                // broke the escape outright on Windows. The spray sends to
+                // hundreds of ports of which at most one is open, so almost
+                // every packet earns an ICMP port-unreachable; Windows
+                // surfaces that on the SENDING socket's next `recv_from` as
+                // `WSAECONNRESET`, and Linux does the same as `ECONNREFUSED`
+                // once a socket is connected. So the one datagram that proves
+                // the escape worked arrives on a socket whose recv queue is
+                // full of errors caused by the escape's own probes: a single
+                // `return` there discards it. Same precedent, and same reason,
+                // as `recv_actor` above — pause briefly so a queued storm
+                // cannot become a busy-spin, and let the deadline end the loop.
+                Ok(Err(_)) => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
                 Err(_) => return None,
             };
             if let Some(hit) = easy_accept(socket, cfg, &buf[..n], from).await {
@@ -4334,7 +4347,12 @@ pub mod spray {
                     }
                     None => {}
                 },
-                Ok(Err(_)) => return None,
+                // Transient, for exactly the reason `listen` documents: this
+                // socket's own probes go to ports that are almost all closed,
+                // and the resulting ICMP errors are delivered here. Abandoning
+                // the socket on one of them throws away the auxiliary port
+                // whose draw may already have been won.
+                Ok(Err(_)) => tokio::time::sleep(Duration::from_millis(5)).await,
                 // Pace slot elapsed: loop around and re-send.
                 Err(_) => {}
             }
@@ -5509,21 +5527,59 @@ mod tests {
                 .await
                 .unwrap();
             // None of the above may be answered.
+            //
+            // "Answered" means a frame THIS key authenticates, not "a datagram
+            // arrived". The distinction is not pedantry: this test shares a
+            // process, and a loopback, with the sprayed-escape test, which by
+            // design fires thousands of frames at randomly chosen loopback
+            // ports and will sooner or later choose this prober's. Asserting on
+            // the mere presence of a datagram made this gate fail about one run
+            // in eight, reporting a foreign test's crossfire as a security
+            // regression — the same benign-stray reasoning the production code
+            // follows (strays are `debug`, authentication is the gate).
             let mut buf = [0u8; 128];
-            let silent = timeout(Duration::from_millis(300), prober.recv_from(&mut buf)).await;
-            assert!(
-                silent.is_err(),
-                "an unauthenticated/foreign probe must NEVER get a response"
-            );
+            let deadline = Instant::now() + Duration::from_millis(300);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                let Ok(Ok((n, _))) = timeout(left, prober.recv_from(&mut buf)).await else {
+                    break;
+                };
+                assert!(
+                    check::parse(&key, &buf[..n]).is_none(),
+                    "an unauthenticated/foreign probe must NEVER get a response"
+                );
+            }
             // (d) genuine request → exactly one same-size response.
+            //
+            // The two windows in this test are deliberately asymmetric. The
+            // SILENCE above is short because a violation would be immediate —
+            // an implementation that answers a forged probe answers it at once
+            // — so a tight bound costs nothing and keeps the test fast. This
+            // one is generous because it is a POSITIVE assertion, and a
+            // positive assertion bounded tightly measures the machine rather
+            // than the code: at 500 ms it failed roughly one run in eight while
+            // the workstation was also compiling, which is a gate that reports
+            // load as a security regression.
             let good = check::request(&key, check::ROLE_DIALER, 7, &txid);
             prober.send_to(&good, ("127.0.0.1", port)).await.unwrap();
-            let (n, _) = timeout(Duration::from_millis(500), prober.recv_from(&mut buf))
-                .await
-                .expect("genuine request must be answered")
-                .unwrap();
+            // Same reason as above: read past any crossfire and judge the first
+            // datagram this key authenticates.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (n, frame) = loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(!left.is_zero(), "genuine request must be answered");
+                let (n, _) = timeout(left, prober.recv_from(&mut buf))
+                    .await
+                    .expect("genuine request must be answered")
+                    .unwrap();
+                if let Some(frame) = check::parse(&key, &buf[..n]) {
+                    break (n, frame);
+                }
+            };
             assert_eq!(n, check::FRAME_LEN, "response must not exceed request size");
-            let frame = check::parse(&key, &buf[..n]).expect("authenticated response");
             assert_eq!(frame.kind, check::KIND_RESPONSE);
             assert_eq!(frame.txid, txid);
             // Observed source = the prober's own address as seen by the peer.
@@ -6861,6 +6917,15 @@ mod tests {
     /// stopped, and that the losers are cleaned up. It does NOT prove the
     /// mechanism beats a real NAT — only a kernel with real nftables rules can
     /// say that, which is `T-NAT-SPRAY-*` in `scripts/udp_nat_netns_test.sh`.
+    ///
+    /// It is also, unexpectedly, the WINDOWS oracle for this module, and the
+    /// only one: this test is what caught the escape abandoning its socket on
+    /// the first ICMP-driven recv error (`WSAECONNRESET`, earned by the spray's
+    /// own probes — see `spray::listen`). The failure cannot be reproduced on
+    /// Linux, where an UNCONNECTED UDP socket is not told about ICMP errors at
+    /// all, so a green run here says nothing about that path and the
+    /// `windows-latest` job is the thing to read. Same standing rule as the
+    /// macOS backend: iterate through CI, not locally.
     #[tokio::test]
     async fn the_sprayed_escape_rendezvous_finds_a_pair() {
         let key = [7u8; 32];

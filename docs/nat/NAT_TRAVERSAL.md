@@ -1075,3 +1075,37 @@ probabilità di collisione a ~1 su un banco e osservare il path ribaltarsi, e i
 default giusti su una rete vera (burst limitato, impronta conntrack limitata)
 non sono quelli che rendono un test deterministico. Stesso precedente di
 `BORE_CTRL_HEARTBEAT_MS` e `BORE_DIRECT_OPEN_TIMEOUT_MS`.
+
+### 20.10 Un errore di `recv` sul socket dello spray è TRANSITORIO, mai fatale
+
+Lo spray manda a centinaia di porte di cui al massimo una è aperta: per
+costruzione quasi ogni pacchetto si guadagna un ICMP port-unreachable. Il
+punto è **dove** arriva quell'errore. Windows lo consegna sul socket che ha
+*inviato*, come `WSAECONNRESET` sulla successiva `recv_from`; Linux fa la
+stessa cosa con `ECONNREFUSED`, ma solo su un socket connesso — e un socket
+UDP **non connesso**, come tutti quelli dello spray, su Linux non viene
+informato affatto degli errori ICMP.
+
+Conseguenza: il datagramma che dimostra che l'escape ha funzionato arriva su
+un socket la cui coda di ricezione è piena di errori causati dalle sonde
+dell'escape stesso. La prima versione di `spray::listen` e di
+`aux_socket_round` trattava `Ok(Err(_))` come fine dell'escape
+(`return None`), che su Windows lo rompeva del tutto: il primo ICMP di ritorno
+chiudeva il giro prima che qualunque risposta potesse essere letta.
+
+Misurato, non ragionato: `the_sprayed_escape_rendezvous_finds_a_pair` passava
+in locale e su ogni runner Linux, e falliva su `windows-latest` e sul cross
+check `x86_64-pc-windows-msvc` con *«the easy side found no pair»*
+(`src\holepunch.rs:6911`).
+
+La correzione segue il precedente già presente nel modulo — `recv_actor`, il
+lettore unico del socket di traversal, il cui commento dice esattamente perché
+non muore su un errore di `recv`: entrambi i loop dello spray dormono 5 ms e
+continuano, e la scadenza (il `cap`) è ciò che li termina. La pausa serve a
+non trasformare una raffica di errori già in coda in un busy-spin.
+
+Regola operativa che ne deriva, valida per qualunque loop futuro su un socket
+di punch: **l'unico errore che può terminare un giro è la scadenza**, non un
+errore per datagramma. E l'oracolo di questa classe di difetti è il job
+`windows-latest` della CI, perché su Linux il difetto è irreproducibile per
+proprietà del kernel — stessa regola già in vigore per il backend macOS.

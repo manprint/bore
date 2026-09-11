@@ -2072,6 +2072,18 @@ NAT (double masquerade, random-port, UDP-blocked) lives in
 `scripts/udp_nat_netns_test.sh` (run as `sudo -n /abs/path/scripts/udp_nat_netns_test.sh`
 after `cargo build --release`).
 
+**Secret-tunnel resource gate.** `scripts/perf/secret_leak_hunt.sh` runs a server, a
+`bore local --tcp-secret-id` provider and a `bore proxy` consumer inside a *rootless*
+network namespace (`unshare -rn` — no sudo, no host port touched) and measures what a
+correctness test cannot: descriptors and resident memory across 800–1 000 proxied
+connections on both transports, a wedge probe (16 held connections plus bulk waves killed
+mid-flight, then a timed fresh round-trip), the control-liveness reaper against a
+SIGSTOPped consumer, the punch socket's real `rb`/`tb` from `ss -uapm`, and the
+relay→direct upgrade being REPORTED to the server. Arms: `all` (default), `churn-relay`,
+`churn-direct`, `stall`, `stall-direct`, `reap`, `upgrade`, `udpbuf`. Every churn verdict
+is a rate over four identical phases, not a before/after pair — see
+[`scripts/perf/README.md`](scripts/perf/README.md).
+
 ## VPN — point-to-point L3 tunnel
 
 `bore vpn` establishes a **point-to-point Layer 3 virtual network interface** between two

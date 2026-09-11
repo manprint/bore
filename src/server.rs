@@ -132,6 +132,95 @@ impl Drop for PublicDeregister {
     }
 }
 
+/// Read the kernel's threshold below which an unprivileged process may not
+/// bind a TCP port, or `None` where the knob does not exist.
+///
+/// It is READ and never assumed, because the remedy depends on its value: a
+/// host that has already lowered it has a different problem and must not be
+/// told to lower it again.
+fn unprivileged_port_start() -> Option<u16> {
+    std::fs::read_to_string("/proc/sys/net/ipv4/ip_unprivileged_port_start")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Explain why one of the server's startup listeners could not bind.
+///
+/// Pure, so the wording is unit-testable without a privileged port.
+///
+/// The reason this exists: every startup bind used to be a bare
+/// `TcpListener::bind(..).await?`, and on failure the process printed exactly
+/// `Error: Permission denied (os error 13)` — no role, no port, and no hint
+/// which of four listeners died. MEASURED 2026-09-12 on Docker 29.8.0: that
+/// single line was the ENTIRE output of a server started under
+/// `network_mode: host`, and the cause was not the container's capabilities
+/// but `net.ipv4.ip_unprivileged_port_start`, which is PER NETWORK NAMESPACE.
+/// Docker sets it to 0 in the namespace it creates for a bridge container —
+/// which is why binding 80/443 as uid 1000 works there and nobody notices —
+/// while host networking shares the host's namespace, where it is the stock
+/// 1024. The operator had followed this repository's own advice to prefer host
+/// networking for STUN correctness, and got an error that named none of it.
+fn bind_failure_message(
+    role: &str,
+    addr: IpAddr,
+    port: u16,
+    err: &io::Error,
+    unprivileged_start: Option<u16>,
+) -> String {
+    let mut msg = format!("failed to bind the {role} listener on {addr}:{port}: {err}");
+    match err.kind() {
+        io::ErrorKind::PermissionDenied => {
+            // Only blame the threshold when the kernel actually says the port
+            // is under it. Otherwise the advice would be confidently wrong.
+            if let Some(start) = unprivileged_start {
+                if port < start {
+                    msg.push_str(&format!(
+                        " — this process does not have CAP_NET_BIND_SERVICE and the kernel \
+refuses ports below {start} to unprivileged processes \
+(net.ipv4.ip_unprivileged_port_start = {start}). In Docker this almost always means \
+`network_mode: host` with a non-root image: that sysctl is per network namespace, and \
+Docker sets it to 0 only in namespaces it creates itself. Use ONE of: run the container \
+as root (`user: \"0:0\"`), lower the host threshold \
+(`sysctl -w net.ipv4.ip_unprivileged_port_start={port}`), or keep bridge networking for \
+this port. `cap_add: [NET_BIND_SERVICE]` does NOT help a non-root process — Docker leaves \
+the capability out of the ambient set, so execve clears it."
+                    ));
+                } else {
+                    msg.push_str(
+                        " — the port is above the unprivileged threshold, so this is not the \
+usual non-root case; check for a socket LSM policy (SELinux/AppArmor) or a seccomp filter.",
+                    );
+                }
+            }
+        }
+        io::ErrorKind::AddrInUse => {
+            msg.push_str(
+                " — another process already holds that port. Under `network_mode: host` the \
+container competes with the host's own services for it.",
+            );
+        }
+        _ => {}
+    }
+    msg
+}
+
+/// Bind one of the server's startup listeners, reporting a failure in terms an
+/// operator can act on. See [`bind_failure_message`].
+async fn bind_startup_listener(role: &str, addr: IpAddr, port: u16) -> Result<TcpListener> {
+    match TcpListener::bind((addr, port)).await {
+        Ok(listener) => Ok(listener),
+        Err(err) => Err(anyhow::anyhow!(bind_failure_message(
+            role,
+            addr,
+            port,
+            &err,
+            unprivileged_port_start()
+        ))),
+    }
+}
+
 /// Binds a public tunnel listener, either on a caller-requested port (validated
 /// against `port_range`) or on a randomly chosen free port within `port_range`
 /// when `port == 0`. Shared by the native public accept loop
@@ -1207,7 +1296,7 @@ impl Server {
     /// Start the server, listening for new connections.
     pub async fn listen(self) -> Result<()> {
         let this = Arc::new(self);
-        let listener = TcpListener::bind((this.bind_addr, this.control_port)).await?;
+        let listener = bind_startup_listener("control", this.bind_addr, this.control_port).await?;
         info!(
             addr = ?this.bind_addr,
             port = this.control_port,
@@ -1272,7 +1361,9 @@ impl Server {
                 );
             }
             if mode.serves_http() && !http_unified {
-                let http_listener = TcpListener::bind((this.bind_tunnels, cfg.http_port)).await?;
+                let http_listener =
+                    bind_startup_listener("vhost HTTP frontend", this.bind_tunnels, cfg.http_port)
+                        .await?;
                 let port = http_listener.local_addr()?.port();
                 info!(port, "vhost HTTP frontend listening");
                 let this2 = Arc::clone(&this);
@@ -1326,7 +1417,12 @@ impl Server {
                 });
             }
             if mode.serves_https() && !https_unified {
-                let https_listener = TcpListener::bind((this.bind_tunnels, cfg.https_port)).await?;
+                let https_listener = bind_startup_listener(
+                    "vhost HTTPS frontend",
+                    this.bind_tunnels,
+                    cfg.https_port,
+                )
+                .await?;
                 let port = https_listener.local_addr()?.port();
                 info!(port, "vhost HTTPS frontend listening");
                 let this2 = Arc::clone(&this);
@@ -1684,7 +1780,8 @@ impl Server {
         #[cfg(feature = "ssh-gateway")]
         if let Some(gateway) = this.ssh_gateway.clone() {
             if let Some(port) = gateway.port() {
-                let ssh_listener = TcpListener::bind((this.bind_addr, port)).await?;
+                let ssh_listener =
+                    bind_startup_listener("ssh gateway", this.bind_addr, port).await?;
                 info!(port, "ssh gateway listening");
                 let this2 = Arc::clone(&this);
                 tokio::spawn(async move {
@@ -3297,5 +3394,72 @@ mod tests {
         assert_eq!(config["ssh_auth_password"], false);
         assert_eq!(config["ssh_banner"], true);
         assert!(!config.to_string().contains("must-not-leak"));
+    }
+
+    /// The failure an operator actually sees when a non-root container is
+    /// switched to host networking. It must name the listener, the port, and a
+    /// remedy that works — `cap_add` is the natural guess and was MEASURED not
+    /// to help, so the message says so rather than leaving it to be discovered.
+    #[test]
+    fn a_refused_low_port_names_the_threshold_and_the_remedies() {
+        let err = io::Error::from(io::ErrorKind::PermissionDenied);
+        let msg = bind_failure_message(
+            "vhost HTTPS frontend",
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            443,
+            &err,
+            Some(1024),
+        );
+        assert!(msg.contains("vhost HTTPS frontend"), "{msg}");
+        assert!(msg.contains("443"), "{msg}");
+        assert!(msg.contains("ip_unprivileged_port_start"), "{msg}");
+        assert!(msg.contains("network_mode: host"), "{msg}");
+        assert!(msg.contains("user: \"0:0\""), "{msg}");
+        assert!(msg.contains("NET_BIND_SERVICE"), "{msg}");
+    }
+
+    /// The other half of the same gate, and the one that keeps the advice
+    /// honest: on a host that has ALREADY lowered the threshold, a refusal is
+    /// not the non-root case and telling the operator to lower it again would
+    /// be confidently wrong.
+    #[test]
+    fn a_refusal_above_the_threshold_is_never_blamed_on_the_sysctl() {
+        let err = io::Error::from(io::ErrorKind::PermissionDenied);
+        let msg = bind_failure_message(
+            "control",
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            443,
+            &err,
+            Some(0),
+        );
+        assert!(!msg.contains("sysctl -w"), "{msg}");
+        assert!(msg.contains("not the usual non-root case"), "{msg}");
+    }
+
+    /// A port collision must not be dressed up as a permissions problem — under
+    /// host networking it is the likelier of the two.
+    #[test]
+    fn a_busy_port_says_so_and_offers_no_sysctl_advice() {
+        let err = io::Error::from(io::ErrorKind::AddrInUse);
+        let msg = bind_failure_message(
+            "control",
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            7835,
+            &err,
+            Some(1024),
+        );
+        assert!(msg.contains("already holds that port"), "{msg}");
+        assert!(!msg.contains("ip_unprivileged_port_start"), "{msg}");
+    }
+
+    /// Where the knob does not exist (non-Linux), the message stays plain
+    /// rather than inventing a cause.
+    #[test]
+    fn without_the_kernel_knob_no_cause_is_invented() {
+        let err = io::Error::from(io::ErrorKind::PermissionDenied);
+        let msg =
+            bind_failure_message("control", IpAddr::V4(Ipv4Addr::UNSPECIFIED), 80, &err, None);
+        assert!(msg.contains("failed to bind the control listener"), "{msg}");
+        assert!(!msg.contains("ip_unprivileged_port_start"), "{msg}");
     }
 }

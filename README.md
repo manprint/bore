@@ -112,6 +112,36 @@ host: `sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216` (`--sysc
 locally with
 `docker build -f docker/Dockerfile.client --build-arg BORE_IMAGE=ghcr.io/manprint/bore:latest -t bore:client .`.
 
+The **same non-root constraint has a second face**, and it bites the server rather than the
+client: under `--network host` the default image cannot bind a port **below 1024**. It exits
+immediately with `Error: Permission denied (os error 13)`, which reads like a Docker
+misconfiguration and is not one. The kernel knob that lets an unprivileged process bind a low
+port, `net.ipv4.ip_unprivileged_port_start`, is **per network namespace**: Docker sets it to
+`0` in every namespace it creates, so a bridge container binds 80/443 as uid 1000 and nobody
+ever notices — while host networking shares the *host's* namespace, where it is the stock
+`1024`. Measured on Docker 29.8.0 with this image on a free port 81:
+
+| network | user | port | result |
+|---|---|---|---|
+| bridge | 1000 | 81 | listening |
+| host | 1000 | 81 | **Permission denied (os error 13)** |
+| host | 1000 | 17835 | listening (any port ≥ 1024 is fine) |
+| host | 1000 + `cap_add: NET_BIND_SERVICE` | 81 | **Permission denied** |
+| host | `user: "0:0"` | 81 | listening |
+| host | 1000, host `ip_unprivileged_port_start=80` | 81 | listening |
+
+`cap_add: [NET_BIND_SERVICE]` is the natural guess and does **not** work, for exactly the
+reason above: the capability lands in the bounding and permitted sets, but a non-root
+`execve` clears the effective set and Docker does not raise the ambient one. Nor can you
+push the sysctl in per-container — the daemon refuses `--sysctl
+net.ipv4.ip_unprivileged_port_start=0` with *"not allowed in host network namespace"*, since
+with a shared namespace it would be silently changing the host. So, when running the server
+with host networking **and** any port below 1024 (typically `BORE_VHOST_HTTP_PORT=80` /
+`BORE_VHOST_HTTPS_PORT=443`), pick one: add `user: "0:0"` to the service, or set
+`sysctl -w net.ipv4.ip_unprivileged_port_start=80` on the host (persist it in
+`/etc/sysctl.d/`), or keep bridge networking for those frontends. Ports ≥ 1024 need none of
+this.
+
 Ready-to-run compose files live in [`docker/`](docker/):
 
 | File | Purpose |

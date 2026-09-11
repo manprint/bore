@@ -22,6 +22,15 @@ services:
     restart: always
     networks:
       - bore
+    # This deployment binds 80 and 443 (BORE_VHOST_HTTP_PORT / _HTTPS_PORT
+    # below) and therefore CANNOT be switched to `network_mode: host` as it
+    # stands: the image runs as UID 1000, and
+    # `net.ipv4.ip_unprivileged_port_start` is per network namespace — Docker
+    # sets it to 0 in the namespace it creates for a bridge container, but host
+    # networking shares the host's namespace, where it is 1024. The server then
+    # exits with `Error: Permission denied (os error 13)`. Add `user: "0:0"` or
+    # lower the host sysctl first; `cap_add: [NET_BIND_SERVICE]` does NOT help.
+    # Full measurements in docker-compose.server.yml, step 4.
     # The control port and the tunnel port range must be forwarded explicitly,
     # and MUST match BORE_CONTROL_PORT and BORE_MIN_PORT/BORE_MAX_PORT below.
     ports:

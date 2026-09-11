@@ -33,6 +33,46 @@ services:
     #   2. Comment out `networks:` and the whole `ports:` block below.
     #   3. Open BORE_CONTROL_PORT/tcp, BORE_CONTROL_PORT/udp, and the tunnel
     #      range on the host firewall / cloud security group.
+    #   4. If ANY port this server binds is below 1024 (typically
+    #      BORE_VHOST_HTTP_PORT=80 and BORE_VHOST_HTTPS_PORT=443, or a control
+    #      port on 80/443), you MUST also do ONE of:
+    #        a) add `user: "0:0"` to this service, or
+    #        b) lower the HOST sysctl:
+    #             sysctl -w net.ipv4.ip_unprivileged_port_start=80
+    #             (persist in /etc/sysctl.d/ if you want it across reboots), or
+    #        c) keep bridge networking for those frontends.
+    #      Otherwise the server exits immediately with
+    #      `Error: Permission denied (os error 13)`.
+    #
+    #      WHY, because the failure looks like a Docker bug and is not:
+    #      this image runs as `USER 1000:1000`, and the kernel setting that
+    #      lets a non-root process bind a low port —
+    #      `net.ipv4.ip_unprivileged_port_start` — is PER NETWORK NAMESPACE.
+    #      Docker sets it to 0 in every network namespace it creates, which is
+    #      why bridge mode binds 80/443 as UID 1000 without anyone noticing.
+    #      `network_mode: host` does not create a namespace: the container
+    #      shares the host's, where the value is the stock 1024. Measured on
+    #      Docker 29.8.0, 2026-09-12:
+    #        host netns .................... 1024
+    #        any bridge container .............. 0
+    #        host-network container ......... 1024
+    #      and, with this image on a free port 81:
+    #        bridge,    UID 1000 ................... listening
+    #        host,      UID 1000 ................... Permission denied (os error 13)
+    #        host,      UID 1000, port 17835 ....... listening   (>= 1024 is fine)
+    #        host,      --user 0:0 ................. listening
+    #        host,      UID 1000, sysctl = 80 ...... listening
+    #
+    #      `cap_add: [NET_BIND_SERVICE]` DOES NOT WORK and is the natural wrong
+    #      guess — measured `Permission denied` all the same. Docker puts the
+    #      capability in the bounding/permitted sets, but a non-root `execve`
+    #      clears the effective set and Docker does not raise the AMBIENT set,
+    #      so the process never actually holds it.
+    #
+    #      `--sysctl net.ipv4.ip_unprivileged_port_start=0` does not work
+    #      either: the daemon refuses it with `sysctl ... not allowed in host
+    #      network namespace`, because with a shared namespace it would be
+    #      changing the host's setting behind the operator's back.
     #
     # Trade-off: host networking is usually best for STUN correctness and lowest
     # overhead, but it shares the host network namespace and gives less Docker
@@ -186,6 +226,9 @@ services:
       # client's real source address. If reflexive discovery misbehaves (clients
       # always fall back to relay), run the server with `network_mode: host`
       # instead of bridge, or point clients at an external --stun-server.
+      # If you switch to host networking, read step 4 of the host-networking
+      # note above FIRST: this image runs as UID 1000 and cannot bind a port
+      # below 1024 in the host network namespace.
       # Public domain advertised to clients (enables http(s):// addressing):
       # - BORE_BIND_DOMAIN=bore.tld
       # Enable the read-only admin status page at /admin/status on the control

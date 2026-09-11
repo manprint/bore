@@ -357,14 +357,36 @@ async fn spawn_client_with_log(
 }
 
 /// Poll a file path up to 2 seconds, returning its contents when available.
+/// Wait until the access log has actually been WRITTEN, not merely created.
+///
+/// This used to return as soon as `read_to_string` succeeded, which it does on
+/// a zero-byte file — and the access-log writer opens the file first and
+/// appends the line afterwards, so there is a real window in which the path
+/// exists and is empty. Every caller asserts on the CONTENT, so on a runner
+/// that scheduled the read inside that window the helper handed back `""` and
+/// the test failed with its own empty message (`raw log should have content:`)
+/// as though the server had logged nothing. Observed on `aarch64-apple-darwin`
+/// in the cross matrix; the same race is latent in the two callers that look
+/// for a request line, which only lose it less often because the write is
+/// further down a longer chain.
+///
+/// So: poll for non-empty, and keep the two failure modes distinguishable —
+/// "never created" and "created but never written" are different bugs, and a
+/// helper that reports them as one sends the next reader to the wrong place.
 async fn poll_file(path: &std::path::Path, max_wait: Duration) -> Result<String> {
     let start = std::time::Instant::now();
+    let mut existed = false;
     loop {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            return Ok(content);
+        match std::fs::read_to_string(path) {
+            Ok(content) if !content.is_empty() => return Ok(content),
+            Ok(_) => existed = true,
+            Err(_) => {}
         }
         if start.elapsed() > max_wait {
-            anyhow::bail!("log file not created after {:?}", max_wait);
+            if existed {
+                anyhow::bail!("log file {path:?} was created but stayed empty for {max_wait:?}");
+            }
+            anyhow::bail!("log file {path:?} not created after {max_wait:?}");
         }
         time::sleep(Duration::from_millis(50)).await;
     }
@@ -510,6 +532,56 @@ async fn local_access_log_real_ip_forwarded() -> Result<()> {
         content
     );
 
+    Ok(())
+}
+
+/// Red-check for the helper above: an access log that EXISTS but has not been
+/// written yet must not be handed back as a result.
+///
+/// This test fails against the previous implementation — it returns `""` the
+/// instant the empty file is readable, and the assertion below is exactly the
+/// one the cross matrix failed on. It needs no server, no port and no guard:
+/// the race is entirely between "file created" and "line appended", and it is
+/// reproduced here deterministically instead of waiting for a slow runner to
+/// find it again.
+#[tokio::test]
+async fn poll_file_waits_for_content_and_does_not_accept_an_empty_file() -> Result<()> {
+    let dir = std::env::temp_dir().join("bore_test_poll_file_contract");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("access.log");
+
+    // The writer's shape: create first, append later.
+    std::fs::write(&path, "")?;
+    let writer = path.clone();
+    tokio::spawn(async move {
+        time::sleep(Duration::from_millis(300)).await;
+        let _ = std::fs::write(&writer, "GET /api/ping\n");
+    });
+
+    let content = poll_file(&path, Duration::from_secs(2)).await?;
+    assert!(
+        content.contains("GET /api/ping"),
+        "poll_file returned before the line was written: {content:?}"
+    );
+
+    // And the two failure modes stay distinguishable.
+    let empty = dir.join("never_written.log");
+    std::fs::write(&empty, "")?;
+    let err = poll_file(&empty, Duration::from_millis(200))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("stayed empty"), "unexpected error: {err}");
+
+    let missing = dir.join("never_created.log");
+    let err = poll_file(&missing, Duration::from_millis(200))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not created"), "unexpected error: {err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
 

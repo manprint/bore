@@ -111,7 +111,7 @@ aperte moltissime connessioni insieme. I comandi pronti sono nel Ricettario.
 **Quanto ci si può fidare.** Ogni confronto è a coppie con ordine alternato,
 ogni misura dichiara quale percorso ha davvero usato (letto dal server, non
 supposto), e tutte le fasi sono ripetibili con gli script inclusi nel
-repository. Durante la campagna sono stati trovati e corretti anche **dodici
+repository. Durante la campagna sono stati trovati e corretti anche **quattordici
 difetti degli strumenti di misura**: due di essi misuravano zero e lo
 stampavano nella stessa forma di una misura vera, ed è la ragione per cui i
 risultati di quelle due fasi sono stati rifatti da capo — e per cui la fase
@@ -144,8 +144,8 @@ in memoria non sa riprodurre.
 | P-11 | BASSA | la pagina di configurazione pubblicava un valore **vivo** al posto di quello impostato | risolto, con controprova |
 | P-8 | — | la finestra di perdita durante un blackout UDP **è** il timeout di inattività: misurato, nessun difetto | non applicabile |
 
-A questi si aggiungono **tredici difetti degli strumenti di misura** (H-1 …
-H-13): nove di essi buttavano via dati, si rifiutavano di partire, misuravano
+A questi si aggiungono **quattordici difetti degli strumenti di misura** (H-1 …
+H-14): nove di essi buttavano via dati, si rifiutavano di partire, misuravano
 un programma diverso da quello nell'albero dei sorgenti, pubblicavano la somma
 di due gradini di una scala come se fosse un gradino solo, oppure — il caso
 peggiore — **misuravano zero stampandolo nella stessa forma di una misura
@@ -161,7 +161,22 @@ confronto numerico diventava un errore di sintassi — che in bash è "falso", n
 niente, stampando ogni trenta secondi la stessa riga di avanzamento, cioè
 esattamente quello che sembra una fase lunga e sana. Ora quell'attesa ha una
 scadenza, e un conteggio che non è un numero viene segnalato invece di essere
-scambiato per uno zero. Sono elencati con la stessa serietà dei difetti del prodotto nel
+scambiato per uno zero. Il quattordicesimo (H-14) non è uno strumento di
+misura ma un **test di regressione**, ed è finito in questo elenco per la
+stessa ragione: ha mentito. La CI lo ha visto fallire su macOS con il
+messaggio `raw log should have content: ` — un messaggio **vuoto** — su una
+modifica che non toccava nemmeno una riga di codice Rust. La causa era nel
+test stesso: la funzione che aspetta il registro degli accessi si accontentava
+che il file **esistesse**, e un file appena creato e ancora vuoto si legge
+benissimo. Il server crea il file e ci scrive la riga subito dopo, quindi esiste
+una finestra reale in cui il file c'è ed è vuoto; su una macchina che capitava
+dentro quella finestra il test leggeva stringa vuota e la riportava come "il
+server non ha scritto niente". Ora la funzione aspetta il **contenuto**, e
+distingue "il file non è mai stato creato" da "creato ma rimasto vuoto" —
+sono due guasti diversi e confonderli manda chi indaga nel posto sbagliato. La
+correzione ha il suo collaudo alla rovescia: rimettendo il codice di prima, il
+nuovo test fallisce in zero secondi con esattamente il sintomo visto in CI.
+Sono elencati con la stessa serietà dei difetti del prodotto nel
 documento inglese (§17), perché uno strumento che mente è indistinguibile da
 un server che si comporta male. Uno di essi (H-9) è anche la ragione per cui
 P-12 è venuto a galla: uno strumento che teneva aperte più connessioni di
@@ -1304,7 +1319,7 @@ TLS, a meno che il tunnel non abbia chiesto `--https`.
    il codice.** Due erano gravi, e nessuno dei due si sarebbe visto in un test
    in memoria: uno richiedeva un server vero che non leggesse un canale,
    l'altro richiedeva di far scorrere abbastanza traffico da riempire un
-   buffer di controllo. Lo stesso vale per gli strumenti: dei tredici difetti
+   buffer di controllo. Lo stesso vale per gli strumenti: dei quattordici difetti
    dell'harness, due **misuravano zero stampandolo come una misura vera** — e
    il secondo è la ragione per cui la fase dalla workstation ora si rifiuta di
    misurare un tunnel registrato che non muove byte, invece di fidarsi di chi

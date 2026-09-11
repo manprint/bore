@@ -1722,8 +1722,8 @@ each other's namespaces mid-run and fabricate failures.
 
 | gate | command | result |
 | --- | --- | --- |
-| unit + integration, default features | `cargo test --release` | 678 passed, 0 failed |
-| unit + integration, `vpn,ssh-gateway` | `cargo test --release --features vpn,ssh-gateway` | 971 passed, 0 failed, 2 ignored |
+| unit + integration, default features | `cargo test --release` | 680 passed, 0 failed |
+| unit + integration, `vpn,ssh-gateway` | `cargo test --release --features vpn,ssh-gateway` | 973 passed, 0 failed, 2 ignored |
 | lints, both feature sets | `cargo clippy --all-targets -- -D warnings` | clean |
 | admin frontend | `npm test` | 109 passed, 0 failed |
 | admin dashboard e2e | `sudo -n scripts/admin_dashboard_test.sh` | 26 passed, 0 failed |

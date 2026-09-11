@@ -254,6 +254,9 @@ pub(crate) struct NatPlan {
     /// Stable machine-parseable code for WHY this mode was chosen (logged
     /// alongside the human `reasons`; documented in docs/nat/NAT_TRAVERSAL.md).
     pub(crate) reason_code: &'static str,
+    /// Fase 7: which half of the birthday-paradox escape the PLAN'S OWNER
+    /// plays, when the escape applies at all. See [`spray_role_for`].
+    pub(crate) spray_role: Option<&'static str>,
     pub(crate) reasons: Vec<String>,
 }
 
@@ -293,9 +296,47 @@ impl NatPlan {
             read_timeout_ms: self.read_timeout_ms,
             send_delay_ms: self.send_delay_ms,
             reason_code: Some(self.reason_code.to_string()),
+            spray_role: self.spray_role.map(str::to_string),
         }
     }
 }
+
+/// Which half of the Fase 7 birthday-paradox escape the plan's owner plays.
+///
+/// The escape exists for exactly ONE cell, and naming it precisely is what
+/// keeps it from becoming a blunt instrument: `peer-port-restricted` is
+/// returned only when exactly one side is symmetric AND the other filters per
+/// address+port, which is the measured RELAY cell of the §6 matrix. There the
+/// two sides have genuinely different jobs and the asymmetry decides who does
+/// which:
+///
+/// * the NON-symmetric side has one stable external port, so it can afford to
+///   SPRAY many destination ports — every one of them opens its own filter for
+///   that (peer ip, port) pair, which is the direction that was blocked;
+/// * the SYMMETRIC side cannot be aimed at, so it buys tickets instead: N
+///   auxiliary sockets, N independent external ports, N chances that one of
+///   them is a port the other side sprayed.
+///
+/// Every other cell gets `None`. Both-symmetric is the hard × hard pair the
+/// SOTA comparison prices at ~170 000 probes for 99.9% and explicitly rejects
+/// (docs/nat/NAT_SOTA_COMPARISON.md §4.1); every direct-leaning cell does not
+/// need an escape at all, and burning a 6-second spray window on a pair whose
+/// ordinary round merely lost a race would make the common case worse.
+fn spray_role_for(local: &NatProfile, reason_code: &str) -> Option<&'static str> {
+    if reason_code != "peer-port-restricted" {
+        return None;
+    }
+    Some(if local.mapping_class.symmetric() {
+        SPRAY_ROLE_HARD
+    } else {
+        SPRAY_ROLE_EASY
+    })
+}
+
+/// Wire value for the side that sprays destination ports (stable mapping).
+pub(crate) const SPRAY_ROLE_EASY: &str = "easy";
+/// Wire value for the side that opens auxiliary sockets (symmetric mapping).
+pub(crate) const SPRAY_ROLE_HARD: &str = "hard";
 
 pub(crate) fn plan_for_pair(local: &NatProfile, peer: &NatProfile) -> NatPlan {
     let (mode, reason_code, reason) = select_mode(local, peer);
@@ -314,6 +355,7 @@ pub(crate) fn plan_for_pair(local: &NatProfile, peer: &NatProfile) -> NatPlan {
         read_timeout_ms,
         send_delay_ms,
         reason_code,
+        spray_role: spray_role_for(local, reason_code),
         reasons: vec![reason],
     }
 }
@@ -1103,5 +1145,97 @@ mod tests {
         let plan = plan_for_pair(&profile, &profile);
         assert_ne!(plan.mode, NatPlanMode::RelayOnly);
         assert_ne!(plan.mode, NatPlanMode::RelayFirst);
+    }
+
+    /// Fase 7: the two sides of the SAME pair must be given COMPLEMENTARY
+    /// halves of the sprayed escape, and no other cell may be given one.
+    ///
+    /// The escape is a rendezvous: one side sprays destination ports, the
+    /// other opens sockets to buy tickets in the same draw. Two sides that
+    /// both spray never meet, and two sides that both draw never meet either,
+    /// so "complementary" is not a nicety — it is the mechanism. The broker
+    /// computes each side's plan from ITS OWN profile first, which is what
+    /// makes a single pure function produce both halves.
+    #[test]
+    fn the_two_sides_of_the_escape_cell_get_complementary_spray_roles() {
+        let offer = wire_offer(
+            &[UdpCandidateKind::Reflexive, UdpCandidateKind::Local],
+            Some("stun.example:3478"),
+        );
+        let symmetric = probe_profile(UdpNatMapping::Symmetric, None, Some(false), 2);
+        let port_restricted = probe_profile(
+            UdpNatMapping::Eim,
+            Some(UdpFilterProbe::AddressAndPortDependent),
+            Some(true),
+            2,
+        );
+        let sym = NatProfile::from_wire(&symmetric, &offer);
+        let cone = NatProfile::from_wire(&port_restricted, &offer);
+
+        // The rider sent to the cone side carries the cone side's plan.
+        let cone_plan = plan_for_pair(&cone, &sym);
+        let sym_plan = plan_for_pair(&sym, &cone);
+        assert_eq!(cone_plan.reason_code, "peer-port-restricted");
+        assert_eq!(sym_plan.reason_code, "peer-port-restricted");
+        assert_eq!(cone_plan.spray_role, Some(SPRAY_ROLE_EASY));
+        assert_eq!(sym_plan.spray_role, Some(SPRAY_ROLE_HARD));
+        assert_eq!(
+            cone_plan.to_wire().spray_role.as_deref(),
+            Some("easy"),
+            "the role must reach the wire, or the client never plays it"
+        );
+        assert_eq!(sym_plan.to_wire().spray_role.as_deref(), Some("hard"));
+    }
+
+    /// Every cell but the escape's own gets no role.
+    ///
+    /// Two independent reasons, and both matter. A direct-leaning pair does
+    /// not need an escape, and handing it one would make a pair that merely
+    /// lost a race pay a six-second spray window before its ordinary
+    /// fallback. A both-symmetric pair cannot win one: neither side has a
+    /// stable port to be aimed at, both sets are drawn, and 99.9% needs about
+    /// 170 000 probes — priced and rejected in
+    /// `docs/nat/NAT_SOTA_COMPARISON.md` §4.1.
+    #[test]
+    fn no_other_cell_is_given_a_spray_role() {
+        let offer = wire_offer(
+            &[UdpCandidateKind::Reflexive, UdpCandidateKind::Local],
+            Some("stun.example:3478"),
+        );
+        let symmetric = probe_profile(UdpNatMapping::Symmetric, None, Some(false), 2);
+        let sym_strict = probe_profile(
+            UdpNatMapping::Symmetric,
+            Some(UdpFilterProbe::AddressAndPortDependent),
+            Some(false),
+            2,
+        );
+        let open_cone = probe_profile(
+            UdpNatMapping::Eim,
+            Some(UdpFilterProbe::AddressDependentOrOpen),
+            Some(true),
+            2,
+        );
+        let plain_cone = probe_profile(UdpNatMapping::Eim, None, Some(true), 2);
+
+        let cases: &[(&str, &UdpNatProfile, &UdpNatProfile)] = &[
+            // Both symmetric, one strict: the hard x hard pair.
+            ("symmetric-strict-filtering", &sym_strict, &symmetric),
+            // One symmetric, the other's filter loose: already direct.
+            ("symmetric-vs-open-filter", &open_cone, &symmetric),
+            // Neither symmetric: never needed an escape.
+            ("both-direct-friendly", &plain_cone, &plain_cone),
+        ];
+        for (expected, local, peer) in cases {
+            let plan = plan_for_pair(
+                &NatProfile::from_wire(local, &offer),
+                &NatProfile::from_wire(peer, &offer),
+            );
+            assert_eq!(plan.reason_code, *expected, "unexpected cell");
+            assert_eq!(
+                plan.spray_role, None,
+                "cell {expected} was given a spray role it cannot use"
+            );
+            assert_eq!(plan.to_wire().spray_role, None);
+        }
     }
 }

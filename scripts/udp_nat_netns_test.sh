@@ -73,6 +73,12 @@ if find "$(dirname "$0")/../src" "$(dirname "$0")/../Cargo.toml" \
     exit 1
 fi
 
+# The Fase 7 escape opens a few hundred auxiliary UDP sockets on the symmetric
+# side, and it declines rather than starve a live process of descriptors. Raise
+# the SOFT limit only (`-Sn`): `ulimit -n N` sets BOTH, and a hard limit below
+# the current soft one is refused — the exact trap `T-PUB-FDBUDGET` documents.
+ulimit -Sn 8192 2>/dev/null || true
+
 for cmd in ip nft nc socat; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "SKIP: $cmd not installed" >&2
@@ -283,7 +289,15 @@ wait_tcp() {
     return 1
 }
 
-# run_scenario <label> <prov-profile> <cons-profile> <block-consumer-udp> <expect>
+# run_scenario <label> <prov-profile> <cons-profile> <block-consumer-udp> \
+#              <expect> [spray]
+#
+# `spray` is `off` (default) or `on`. OFF pins the ordinary check round — the
+# mechanism the §6 matrix is about — by giving the Fase 7 escape a zero
+# budget. ON sizes the escape so its collision probability is ~1 rather than
+# the ~95% the shipped defaults aim for: a gate that fails one run in twenty is
+# a gate that gets deleted, and the mechanism under test is the rendezvous, not
+# the dice. See `BORE_UDP_SPRAY_*` in `src/holepunch.rs`.
 #
 # A profile is `<mapping>:<filtering>` — `eim:apdf` is the typical home
 # router, `edm:apdf` the symmetric/mobile one, `eim:adf` a restricted cone and
@@ -291,6 +305,7 @@ wait_tcp() {
 # form is still accepted so the three original scenarios read unchanged.
 run_scenario() {
     local label="$1" prov_prof="$2" cons_prof="$3" block="$4" expect="$5"
+    local spray="${6:-off}"
     local id="udpnat-${label}"
     local sdir="$TMPDIR/$label"
 
@@ -327,7 +342,21 @@ run_scenario() {
         cons_port_flag=(--nat-udp-preferred-port "$CONS_UDP_PORT")
     fi
 
-    echo "--- $label: provider $prov_prof  x  consumer $cons_prof  (expect $expect) ---"
+    # 512 sockets x 4096 sprayed ports over the 64512 allocatable ones is
+    # p = 1 - (1 - 4096/64512)^512 ≈ 1 - 2.5e-15.
+    local spray_env=(BORE_UDP_SPRAY_CAP_MS=0) settle=2
+    if [ "$spray" = "on" ]; then
+        spray_env=(
+            BORE_UDP_SPRAY_SOCKETS=512
+            BORE_UDP_SPRAY_PORTS=2048
+            BORE_UDP_SPRAY_PASSES=2
+            BORE_UDP_SPRAY_PACE_US=200
+            BORE_UDP_SPRAY_CAP_MS=8000
+        )
+        settle=14
+    fi
+
+    echo "--- $label: provider $prov_prof  x  consumer $cons_prof  (expect $expect, spray $spray) ---"
     nat_rules nsnat1 vn1w "$prov_map" "$prov_filt" 10.1.0.2 "$PROV_UDP_PORT"
     nat_rules nsnat2 vn2w "$cons_map" "$cons_filt" 10.2.0.2 "$CONS_UDP_PORT"
     if [ "$block" = "yes" ]; then block_udp nsnat2 vn2w; fi
@@ -343,7 +372,7 @@ run_scenario() {
     # on the provider's own side: ns0 is multihomed and an unconnected UDP
     # reply picks its source by route, so a cross-side STUN target would answer
     # from the "wrong" IP and be discarded by the source check.
-    ip netns exec nsprov env RUST_LOG=info "$BORE" local "$ECHO_PORT" \
+    ip netns exec nsprov env RUST_LOG=info "${spray_env[@]}" "$BORE" local "$ECHO_PORT" \
         --to "http://$SERVER_IP:$CTRL_PORT" --secret "$SECRET" \
         --tcp-secret-id "$id" --udp \
         --stun-server "$SERVER_IP:$CTRL_PORT" \
@@ -354,7 +383,7 @@ run_scenario() {
 
     # Consumer (bore proxy, --udp). STUN = server IP on the consumer's side
     # (see the provider note above).
-    ip netns exec nscli env RUST_LOG=info "$BORE" proxy \
+    ip netns exec nscli env RUST_LOG=info "${spray_env[@]}" "$BORE" proxy \
         --to "http://$SERVER_IP:$CTRL_PORT" --secret "$SECRET" \
         --tcp-secret-id "$id" --udp \
         --stun-server "$SERVER_IP2:$CTRL_PORT" \
@@ -368,8 +397,10 @@ run_scenario() {
         kill -9 "$echo_pid" "$prov_pid" "$cons_pid" 2>/dev/null || true
         return
     fi
-    # Give the direct-path negotiation time to settle before probing.
-    sleep 2
+    # Give the direct-path negotiation time to settle before probing. The
+    # escape runs AFTER a dry check round, so a spray cell needs the round, the
+    # spray budget and the QUIC handshake that follows it.
+    sleep "$settle"
 
     local got
     got=$(ip netns exec nscli sh -c "printf 'hello-nat\n' | nc -w3 127.0.0.1 $PROXY_PORT" 2>/dev/null | head -1)
@@ -489,7 +520,13 @@ run_scenario "T-NAT-BLOCKED-RELAY" eim:apdf eim:apdf yes relay
 # mobile/CGNAT shape — and differ only in the provider's FILTERING, which is
 # the axis `bore test-udp` does not currently report (§13). The outcome flips
 # across them, which is what makes that gap matter.
-run_scenario "T-NAT-APDF-VS-EDM"   eim:apdf      edm:apdf no relay
+# NOTE the explicit `off` on the two RELAY cells: they measure the ordinary
+# check round, which is what the matrix is a statement about. With the Fase 7
+# escape in its default sizing both would go DIRECT — that is the point of
+# Fase 7 and it is gated separately below (`T-NAT-SPRAY-*`), but letting it
+# leak in here would silently turn the matrix into a measurement of something
+# else.
+run_scenario "T-NAT-APDF-VS-EDM"   eim:apdf      edm:apdf no relay off
 run_scenario "T-NAT-ADF-VS-EDM"    eim:adf       edm:apdf no direct
 run_scenario "T-NAT-EIF-VS-EDM"    eim:eif       edm:apdf no direct
 
@@ -497,13 +534,38 @@ run_scenario "T-NAT-EIF-VS-EDM"    eim:eif       edm:apdf no direct
 # mapping, WITHOUT the router's forward. If this went direct, the forward
 # would not be what the pair is measuring and the two cells above would be
 # proving nothing — so its expected RELAY is a red-check, not a smoke test.
-run_scenario "T-NAT-FIXEDPORT-VS-EDM" eim:apdf:port edm:apdf no relay
+run_scenario "T-NAT-FIXEDPORT-VS-EDM" eim:apdf:port edm:apdf no relay off
 
 # Does the DIAGNOSTIC see what the matrix just proved? Same two routers, read
 # through `bore test-udp` instead of through a punch. A tool that cannot tell
 # these two apart cannot advise on the cells above.
 run_filter_probe "T-NAT-FILTER-APDF" eim:apdf apdf
 run_filter_probe "T-NAT-FILTER-ADF"  eim:adf  adf-or-eif
+
+# Fase 7 — the sprayed escape (docs/nat/NAT_SOTA_COMPARISON.md §4.1).
+#
+# The cells above establish that `eim:apdf x edm` cannot be won by an ordinary
+# check round: port prediction has nothing to predict against a fully-random
+# mapping, and every probe the round sends goes, by construction, to the wrong
+# port. The escape wins it anyway, by rendezvous: the endpoint-independent side
+# sprays destination ports (each one opening its OWN filter for that peer port,
+# which is the direction that was blocked) while the symmetric side opens
+# auxiliary sockets, and one collision opens both directions at once.
+#
+# The three cells below are a SINGLE experiment with one variable. The OFF cell
+# re-measures the baseline every run rather than trusting a commit message, and
+# the two ON cells flip it — with the roles the other way round in the second,
+# because promoting an auxiliary socket on the LISTENER side (a QUIC server
+# built on a socket that did not exist when the round started) is a different
+# code path from promoting it on the dialer side, and only one of them is
+# exercised by any given cell.
+#
+# If a future change breaks the escape, OFF still passes and ON fails, which
+# says so precisely. If a future change breaks the CELL — say, by making the
+# ordinary round win it — OFF fails, and that is the more interesting failure.
+run_scenario "T-NAT-SPRAY-OFF"      eim:apdf edm:apdf no relay  off
+run_scenario "T-NAT-SPRAY-DIALER"   eim:apdf edm:apdf no direct on
+run_scenario "T-NAT-SPRAY-LISTENER" edm:apdf eim:apdf no direct on
 
 kill -9 "$SERVER_PID" 2>/dev/null || true
 

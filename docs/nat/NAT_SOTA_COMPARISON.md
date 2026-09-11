@@ -139,6 +139,32 @@ dei socket.
 la Fase 6 appena chiusa, che è ciò che permette di sapere *quando* si è in
 quella cella invece di provarci sempre.
 
+**FATTO (Fase 7).** Implementato esattamente con quel limite. Dettaglio
+completo in [`NAT_TRAVERSAL.md`](NAT_TRAVERSAL.md) §20; qui i punti che
+cambiano rispetto al preventivo qui sopra:
+
+* i default spediti sono `3 × 256` porte contro 256 socket, cioè **≈ 95 %** e
+  non 63 %: i passaggi usano insiemi di porte **diversi** e il filtro del lato
+  easy resta aperto per tutte quelle già spruzzate, quindi l'unione conta e
+  costa solo tempo, non un secondo meccanismo;
+* il modello di proprietà dei socket **non** è cambiato come temuto: i socket
+  ausiliari non usano `UdpTraversalSocket`, ognuno è letto da un task solo, e
+  solo il vincitore — restituito per valore, con il reader già chiuso — arriva
+  a Quinn. Un escape fallito restituisce il socket originale intatto;
+* il preventivo non aveva previsto il problema vero, che il banco ha trovato
+  subito: con un'estrazione generosa le collisioni sono **più di una** e i due
+  lati ne sceglievano due diverse. Risolto con un conferma a transaction id
+  già visto (§20.5), che non aggiunge niente al filo;
+* il numero di socket è limitato a metà dei descrittori rimasti, perché
+  `EMFILE` cade sull'`accept()` di ogni listener del processo (P-12);
+* «20 macchine dietro lo stesso router» resta un rischio reale e la risposta è
+  che l'escape gira **solo** dopo un round a vuoto, **solo** sulla cella che il
+  broker ha già dichiarato relay-first, e **solo** se entrambi i peer
+  annunciano `spray-v1`. Su una rete sana non parte mai.
+
+Misura di campo: `escape_ms=51` sul banco netns, con la cella OFF che nello
+stesso run resta su relay.
+
 ### 4.2 Port mapping automatico quando il piano dice che siamo noi il collo
 
 Oggi `--upnp` è opt-in; Tailscale prova sempre. La matrice mostra che una
@@ -202,8 +228,9 @@ assumono IPv4 in più punti; va pianificato come fase a sé.
 | misura del filtering (RFC 5780) sui due lati | **fatto** (Fase 6) |
 | regola di policy corretta per una sola parte symmetric | **fatto** (`peer-port-restricted` / `symmetric-vs-open-filter`) |
 | `reason_code` sul filo + rimedio azionabile sul client | **fatto** |
-| matrice A×B verificata su kernel reale | **fatto** (`scripts/udp_nat_netns_test.sh`, 20/0) |
-| birthday paradox easy×hard | **da fare** (§4.1) |
+| matrice A×B verificata su kernel reale | **fatto** (`scripts/udp_nat_netns_test.sh`, 27/0) |
+| birthday paradox easy×hard | **fatto** (Fase 7, §4.1 + `NAT_TRAVERSAL.md` §20) |
+| seconda osservazione di mapping via OTHER-ADDRESS | **fatto** (`NAT_TRAVERSAL.md` §20.7) |
 | `--upnp=auto` sul solo reason code | **da valutare** (§4.2) |
 | sincronizzazione RTT/2 | **da fare dopo 4.1** (§4.3) |
 | IPv6 | **fase a sé** (§4.4) |

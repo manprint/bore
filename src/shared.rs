@@ -593,6 +593,25 @@ pub struct UdpAdaptivePlan {
     /// that forbids new ENUM variants on this wire).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
+    /// Fase 7 role for the birthday-paradox escape (`"easy"` / `"hard"`).
+    ///
+    /// Set by the broker — the only party that sees BOTH profiles — and only
+    /// for the one cell the measured §6 matrix says an ordinary check round
+    /// cannot win: exactly one symmetric side, the other one filtering per
+    /// address+port (`reason_code == "peer-port-restricted"`). The two riders
+    /// of the same pair therefore carry COMPLEMENTARY values, which is what
+    /// lets each side pick its half of the escape with no extra round trip
+    /// and no knowledge of the peer's profile.
+    ///
+    /// `None` — the default, and the only thing a pre-Fase-7 server ever
+    /// sends — means "no escape", and an unrecognised string means the same:
+    /// a `String` rather than an enum for exactly the reason `reason_code` is
+    /// one (an unknown enum variant is a hard decode error on this wire).
+    ///
+    /// Gated on BOTH peers advertising [`UDP_CAP_SPRAY_V1`]: one side spraying
+    /// alone cannot win and would only spend its fallback budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spray_role: Option<String>,
 }
 
 impl UdpAdaptivePlan {
@@ -632,6 +651,15 @@ pub const UDP_CAP_CANDIDATE_V2: &str = "cand-v2";
 /// peer-reflexive sources BEFORE QUIC. Only active when BOTH peers advertise
 /// it; a legacy peer keeps the blind punch + dial-all path byte-identical.
 pub const UDP_CAP_CHECK_V1: &str = "check-v1";
+
+/// Capability label for the Fase 7 birthday-paradox escape: the sprayed
+/// escape round that runs after a dry check round when exactly one side is
+/// symmetric and the other filters per address+port. Only active when BOTH
+/// peers advertise it — the escape is a RENDEZVOUS (one side sprays
+/// destination ports, the other opens sockets to buy tickets in the same
+/// draw), so a peer that sprays alone cannot win and would spend its whole
+/// fallback budget proving it.
+pub const UDP_CAP_SPRAY_V1: &str = "spray-v1";
 
 /// Observed NAT *mapping* behaviour in RFC 4787 terms, self-reported in a
 /// structured enum so the server-side policy never parses text labels (plan
@@ -2976,6 +3004,7 @@ mod tests {
                 peer_capabilities: vec![
                     UDP_CAP_CANDIDATE_V2.to_string(),
                     UDP_CAP_CHECK_V1.to_string(),
+                    UDP_CAP_SPRAY_V1.to_string(),
                 ],
                 plan: Some(UdpAdaptivePlan {
                     mode: UdpAdaptiveMode::DirectWithRetry,
@@ -2990,6 +3019,7 @@ mod tests {
                     read_timeout_ms: u64::MAX,
                     send_delay_ms: u64::MAX,
                     reason_code: Some("symmetric-strict-filtering".into()),
+                    spray_role: Some("hard".into()),
                 }),
             }),
         };
@@ -3060,6 +3090,7 @@ mod tests {
                     read_timeout_ms: 500,
                     send_delay_ms: 25,
                     reason_code: None,
+                    spray_role: None,
                 }),
             }),
         };
@@ -3238,6 +3269,7 @@ fn control_frame_summary_includes_test_udp_plan() {
             read_timeout_ms: 750,
             send_delay_ms: 0,
             reason_code: None,
+            spray_role: None,
         }),
         recandidate: true,
         generation: 0,

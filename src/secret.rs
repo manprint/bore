@@ -218,14 +218,32 @@ pub(crate) fn attach_adaptive_plan(
     let local = crate::adaptive_nat::NatProfile::from_wire(r_profile, r_offer);
     let remote = crate::adaptive_nat::NatProfile::from_wire(p_profile, p_offer);
     let plan = crate::adaptive_nat::plan_for_pair(&local, &remote);
+    let mut wire = plan.to_wire();
+    // Fase 7: the sprayed escape is a RENDEZVOUS — one side sprays
+    // destination ports, the other opens sockets to buy tickets in the same
+    // draw — so a role handed to a peer whose partner cannot play it is worse
+    // than no role at all: that peer would spend its entire fallback budget
+    // spraying at a side that is not listening for it. The broker is the only
+    // party that sees both capability lists, so the gate lives here.
+    if !both_advertise(r_offer, p_offer, crate::shared::UDP_CAP_SPRAY_V1) {
+        wire.spray_role = None;
+    }
     info!(
         context,
         receiver_profile = %r_profile.summary(),
         peer_profile = %p_profile.summary(),
         plan = %plan.summary_with_reason(),
+        spray_role = ?wire.spray_role,
         "computed adaptive traversal plan"
     );
-    rider.plan = Some(plan.to_wire());
+    rider.plan = Some(wire);
+}
+
+/// Whether BOTH offers advertise `cap`. Absence on either side keeps the
+/// legacy behaviour, which is the standing rule for every traversal
+/// capability on this wire.
+fn both_advertise(a: &UdpCandidateOffer, b: &UdpCandidateOffer, cap: &str) -> bool {
+    a.capabilities.iter().any(|c| c == cap) && b.capabilities.iter().any(|c| c == cap)
 }
 
 fn register_provider_udp_offer(
@@ -2037,6 +2055,12 @@ async fn finish_direct_consumer(
                         plan_wire.map(|p| p.send_delay_ms).unwrap_or(0),
                     ),
                 }),
+                // Fase 7: the broker names the half of the sprayed escape this
+                // side plays, and only for the one cell that needs one. An
+                // unknown or absent value is `None`, which is the legacy round.
+                spray: crate::holepunch::spray::role_from_wire(
+                    plan_wire.and_then(|p| p.spray_role.as_deref()),
+                ),
             };
             let (conn, outcome) =
                 holepunch::dialer_checks_then_quic(socket, peer, &cfg, token, tuning, cache_key)
@@ -2362,5 +2386,61 @@ mod tests {
             Some("stun.cloudflare.com:3478".to_string())
         );
         assert_eq!(provider_stun_hint(&udp_registry, "missing"), None);
+    }
+
+    /// Fase 7: the broker hands out a sprayed-escape role ONLY when both
+    /// peers said they can play it.
+    ///
+    /// The escape is a rendezvous, so a role given to a peer whose partner
+    /// cannot answer is worse than no role: that peer spends its entire
+    /// fallback budget spraying at a side that is not drawing. The broker is
+    /// the only party that sees both capability lists, which is why the gate
+    /// lives here and not in the pure planner.
+    #[test]
+    fn the_spray_role_reaches_the_wire_only_when_both_peers_can_play_it() {
+        use crate::shared::{
+            UdpCandidateOffer, UdpFilterProbe, UdpNatMapping, UdpNatProfile, UDP_CAP_CHECK_V1,
+            UDP_CAP_SPRAY_V1,
+        };
+
+        let offer = |caps: &[&str]| UdpCandidateOffer {
+            candidates: vec!["203.0.113.4:41641".parse().unwrap()],
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            ..Default::default()
+        };
+        // The one cell the escape exists for: exactly one symmetric side, the
+        // other filtering per address+port.
+        let symmetric = UdpNatProfile {
+            mapping: UdpNatMapping::Symmetric,
+            observations: 2,
+            ..Default::default()
+        };
+        let port_restricted = UdpNatProfile {
+            mapping: UdpNatMapping::Eim,
+            observations: 2,
+            filtering_probe: Some(UdpFilterProbe::AddressAndPortDependent),
+            ..Default::default()
+        };
+
+        let role_for = |r_caps: &[&str], p_caps: &[&str]| {
+            let r_offer = offer(r_caps);
+            let p_offer = offer(p_caps);
+            let mut rider = crate::shared::UdpPunchV2::from_offer(&r_offer);
+            attach_adaptive_plan(
+                &mut rider,
+                (&r_offer, Some(&port_restricted)),
+                (&p_offer, Some(&symmetric)),
+                true,
+                "test",
+            );
+            rider.and_then(|r| r.plan).and_then(|p| p.spray_role)
+        };
+
+        let both = [UDP_CAP_CHECK_V1, UDP_CAP_SPRAY_V1];
+        assert_eq!(role_for(&both, &both).as_deref(), Some("easy"));
+        // Either side missing the capability ⇒ no role for EITHER rider.
+        assert_eq!(role_for(&both, &[UDP_CAP_CHECK_V1]), None);
+        assert_eq!(role_for(&[UDP_CAP_CHECK_V1], &both), None);
+        assert_eq!(role_for(&[], &[]), None);
     }
 }

@@ -1942,6 +1942,8 @@ What it tells you:
   (`peer-port-restricted`, `symmetric-strict-filtering`, `peer-blocked`, `no-candidates`).
   The same line is logged by `bore local`/`bore proxy` when a live tunnel falls back, so the
   machine that went to the relay is the machine that tells you what to change.
+  `peer-port-restricted` is also the one cell that now gets an automatic escape — see
+  **Sprayed escape** below.
 - **Port preservation**, **CGNAT** (`100.64.0.0/10`) / double-NAT detection, and whether a
   **UPnP-IGD** router is present.
 - A **co-location/hairpin** note when public STUN works but your own bore server's UDP does
@@ -1976,6 +1978,42 @@ that lacks this capability, retries are skipped with an explicit note instead of
 re-punching stale candidates from a dead socket. The report also states that the adaptive
 candidate *order* is advisory (direct attempts still dial all candidates concurrently
 under one budget).
+
+**Sprayed escape (birthday-paradox rendezvous).** One cell of the measured NAT matrix
+cannot be won by an ordinary check round: an endpoint-independent side that filters per
+address+port, facing a symmetric peer whose source port nobody can predict
+(`reason_code=peer-port-restricted` — the common "home router + mobile/CGNAT" pair). For
+that cell only, and only after a check round came back dry, bore runs a rendezvous: the
+stable side sprays an authenticated probe at many destination ports of the peer's IP
+(each one opening its OWN filter for that peer port, which is the blocked direction),
+while the symmetric side opens auxiliary sockets, each buying one more external port in
+the draw. One collision opens both directions at once. Shipped sizing is 3 × 256 sprayed
+ports against 256 sockets — `p = 1 − (1 − 768/64512)^256 ≈ 95%` — for ~2 300 datagrams of
+60 bytes across both sides; measured on a kernel NAT harness, the rendezvous closes in
+**51 ms**.
+
+It is deliberately narrow. The broker — the only party that sees both NAT profiles —
+assigns the two halves, so they are always complementary; it does so only when BOTH peers
+advertise the `spray-v1` capability; it never does so for a symmetric × symmetric pair
+(there the same trick needs ~170 000 probes for 99.9%, which is a port scan, not a
+connection); the relay stays warm throughout; a failed escape falls through to exactly
+the fallback that would have run anyway; and the auxiliary sockets are capped at half the
+process's remaining file descriptors. Server-side kill switch: `--no-udp-adaptive-plan`
+(the role rides the plan). Sizing overrides for harnesses and hostile routers:
+`BORE_UDP_SPRAY_PORTS` (256), `BORE_UDP_SPRAY_PASSES` (3), `BORE_UDP_SPRAY_SOCKETS` (256),
+`BORE_UDP_SPRAY_PACE_US` (3000), `BORE_UDP_SPRAY_REPEAT_MS` (2500), `BORE_UDP_SPRAY_CAP_MS`
+(6000; **0 disables**). Full write-up:
+[`docs/nat/NAT_TRAVERSAL.md` §20](docs/nat/NAT_TRAVERSAL.md).
+
+**Mapping classification without a second STUN server.** Classifying the NAT mapping needs
+two observations from two different server addresses, and `--stun-server HOST:PORT` builds
+a single-element chain by construction — so a private deployment reported `mapping:
+unknown` and silently lost every policy that depends on it. bore now falls back to the
+server's own RFC 5780 `OTHER-ADDRESS` for the second observation, inside the existing STUN
+budget. It is conservative on purpose: a different reflexive proves the mapping is at
+least port-dependent (symmetric), while an identical one does NOT prove
+endpoint-independence, so this path can conclude "symmetric" and never "endpoint
+independent".
 
 **Candidate hardening.** Every candidate list — offered on the wire, brokered by the
 server, or punched/dialed — is validated (no port 0/unspecified/multicast/broadcast;

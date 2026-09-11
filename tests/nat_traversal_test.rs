@@ -167,6 +167,7 @@ async fn attempt_direct(listener: Peer, dialer: Peer) -> Attempt {
             role: CheckRole::Listener,
             window: CHECK_WINDOW,
             plan: None,
+            spray: None,
         };
         let (dl, _outcome) = listener_checks_then_quic(l_sock, &l_peers, &cfg, tuning).await?;
         timeout(ACCEPT_WAIT, dl.accept(token))
@@ -182,6 +183,7 @@ async fn attempt_direct(listener: Peer, dialer: Peer) -> Attempt {
             role: CheckRole::Dialer,
             window: CHECK_WINDOW,
             plan: None,
+            spray: None,
         };
         dialer_checks_then_quic(d_sock, d_peers, &cfg, token, tuning, None).await
     };

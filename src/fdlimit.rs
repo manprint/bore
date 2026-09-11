@@ -131,6 +131,30 @@ fn narrow(v: u64) -> nix::libc::rlim_t {
     nix::libc::rlim_t::try_from(v).unwrap_or(nix::libc::rlim_t::MAX)
 }
 
+/// Descriptors this process may still open: the soft `RLIMIT_NOFILE` minus
+/// what is already open.
+///
+/// `None` when the question cannot be answered (no `/proc`, no `getrlimit`,
+/// a non-unix target). A caller must treat `None` as "no information", never
+/// as "no headroom" — the one use of this number is to stop a transient
+/// burst of sockets from spending descriptors a live server needs, and a
+/// failed measurement is not evidence that the burst is unaffordable.
+#[cfg(all(unix, target_os = "linux"))]
+pub fn fd_headroom() -> Option<u64> {
+    use nix::sys::resource::{getrlimit, Resource};
+    let used = std::fs::read_dir("/proc/self/fd").ok()?.count() as u64;
+    let (soft, _) = getrlimit(Resource::RLIMIT_NOFILE).ok()?;
+    Some(widen(soft).saturating_sub(used))
+}
+
+/// See the Linux variant. Without `/proc` there is no portable way to count
+/// the descriptors this process already holds, so the honest answer is that
+/// the question was not answered.
+#[cfg(not(all(unix, target_os = "linux")))]
+pub fn fd_headroom() -> Option<u64> {
+    None
+}
+
 /// Apply [`fd_budget`] to this process, logging what happened.
 ///
 /// Called once, at server startup, before the first listener is bound. Never

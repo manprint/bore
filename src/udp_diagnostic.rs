@@ -2801,6 +2801,7 @@ mod tests {
             read_timeout_ms: 750,
             send_delay_ms: 0,
             reason_code: None,
+            spray_role: None,
         };
 
         let ordered = order_peer_candidates(&candidates, &peer_summary, &plan);

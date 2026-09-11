@@ -878,3 +878,200 @@ bucato. Un peer senza Fase 6 prende esattamente la decisione pre-Fase-6
 **Confronto con lo stato dell'arte.** Dove bore sta rispetto a Tailscale, frp,
 libp2p DCUtR e ICE — e quali lacune restano, con il costo di ciascuna — è in
 [`NAT_SOTA_COMPARISON.md`](NAT_SOTA_COMPARISON.md).
+
+---
+
+## 20. L'escape spray: birthday paradox per `eim:apdf × symmetric` (Fase 7)
+
+### 20.1 La cella che nessun round ordinario può vincere
+
+La matrice del §19 misura una sola cella RELAY con esattamente un lato
+symmetric: `eim:apdf × edm`. Un lato con mapping stabile ma filtro
+address+port-dependent, di fronte a un lato la cui porta sorgente nessuno può
+prevedere. Nessun meccanismo ordinario la raggiunge:
+
+* la *port prediction* non ha niente da predire contro un `fully-random`;
+* ogni probe del check round va, per costruzione, sulla porta sbagliata;
+* il lato symmetric non può essere mirato, e il lato `apdf` scarta tutto ciò
+  che arriva da una `(ip, porta)` a cui non ha scritto.
+
+È la coppia "home router + mobile/CGNAT", cioè la più comune fra quelle che
+falliscono.
+
+### 20.2 Il meccanismo: un rendez-vous nello spazio delle porte
+
+L'escape funziona perché i due lati sono asimmetrici in modo **complementare**:
+
+* il lato **easy** (mapping endpoint-independent) spruzza una check request
+  autenticata su molte porte di destinazione dell'IP pubblico del peer. Ognuno
+  di quei pacchetti apre il **proprio** filtro per quella `(ip peer, porta)` —
+  esattamente la direzione che era bloccata — e non gli costa nulla, perché la
+  sua porta sorgente resta la stessa per tutte;
+* il lato **hard** (mapping symmetric) apre molti socket ausiliari e da ognuno
+  scrive all'indirizzo stabile del lato easy. Ogni socket compra un biglietto
+  in più nell'estrazione.
+
+Una sola collisione apre **entrambe** le direzioni insieme: il pacchetto del
+lato easy raggiunge il socket ausiliario (il NAT del lato hard ha un mapping su
+quella porta la cui reply tuple è proprio l'indirizzo stabile del lato easy) e
+la risposta raggiunge il lato easy (il cui filtro è stato aperto da quello
+stesso pacchetto). Per questo non servono né un terzo attore, né un secondo
+round trip, né un protocollo di retry: il primo frame che arriva da qualche
+parte *è* la risposta.
+
+### 20.3 La matematica e la taratura
+
+Con `S` porte spruzzate su uno spazio `P` e `Q` socket ausiliari:
+
+```
+p = 1 − (1 − S/P)^Q
+```
+
+I default spediti — `S = 3 × 256 = 768` su `P = 64512`, `Q = 256` — danno
+**≈ 95 %**, al costo di circa 2 300 datagrammi da 60 byte fra i due lati e di
+pochi secondi di un budget che altrimenti sarebbe stato speso a cadere sul
+relay. I passaggi usano insiemi di porte **diversi**: il filtro del lato easy
+resta aperto per ogni porta già spruzzata (conntrack tiene l'entry ben più a
+lungo della finestra), quindi il passaggio `n` si somma ai precedenti invece di
+ripeterli, e più passaggi assorbono anche lo sfasamento di partenza fra i due
+lati.
+
+Non viene usato per una coppia **hard × hard**: lì la porta stabile del lato
+easy non esiste, entrambi gli insiemi sono estratti, e arrivare al 99,9 %
+richiede dell'ordine di 170 000 probe (≈ 28 minuti a 100 pkt/s) — costo
+calcolato e rifiutato in [`NAT_SOTA_COMPARISON.md`](NAT_SOTA_COMPARISON.md)
+§4.1.
+
+### 20.4 Chi decide i ruoli, e perché sul server
+
+`UdpAdaptivePlan.spray_role` (`"easy"` / `"hard"`) è calcolato dal broker —
+l'unico che vede **entrambi** i profili — e solo per `reason_code ==
+"peer-port-restricted"`, cioè esattamente la cella del §20.1. I due rider della
+stessa coppia portano quindi valori **complementari**, e ogni lato sceglie la
+propria metà senza un round trip in più e senza conoscere il profilo del peer.
+
+Due gate lo tengono onesto:
+
+* è una `Option<String>`, non un enum: un broker più nuovo deve poter nominare
+  un ruolo che questo binario non conosce senza che sia un errore di protocollo
+  (stessa regola di `reason_code`);
+* è subordinato al fatto che **entrambi** i peer annuncino la capability
+  `spray-v1`. L'escape è un rendez-vous: un ruolo dato a un peer il cui partner
+  non sa giocarlo è peggio di nessun ruolo, perché quel peer spenderebbe tutto
+  il budget di fallback spruzzando verso un lato che non sta estraendo.
+
+Il kill switch resta `--no-udp-adaptive-plan` lato server: il ruolo viaggia sul
+piano, quindi togliere il piano toglie anche l'escape.
+
+### 20.5 Il conferma-uno-solo (bug trovato dal gate, non ragionato)
+
+Con un'estrazione generosa i due lati collidono su **più** porte insieme. Se
+ognuno tenesse la prima che gli arriva, terrebbero due prime diverse: due
+coppie diverse, e una dial verso un socket su cui nessuno ascolta. Misurato
+subito dal gate su loopback, dove il numero di collisioni è alto per
+costruzione.
+
+Quindi il lato easy decide da solo e **lo dice**: risponde al frame che lo ha
+raggiunto e poi manda tre request che portano il transaction id che il peer ha
+**già** visto. Una request spruzzata porta sempre un id fresco a 96 bit, quindi
+"un id che ho già visto" è un discriminante che lo spray stesso non può
+contraffare, e un solo socket ausiliario può riceverlo.
+
+### 20.6 Il socket promosso
+
+Sul lato hard il socket vincente **sostituisce** quello del round, ma solo se
+l'escape ha davvero vinto: un escape fallito restituisce il socket originale
+intatto, così il fallback che segue è esattamente quello che sarebbe girato
+comunque. Il socket promosso è restituito per valore, con il suo reader già
+terminato, e va a Quinn sotto la stessa regola *un socket = un reader* di ogni
+altro percorso diretto; i buffer glieli configura il costruttore dell'endpoint
+(P-13), non il chiamante. I perdenti vengono abortiti e i loro socket rilasciati
+**prima** che il vincitore venga consegnato.
+
+Il numero di socket ausiliari è limitato a metà dei descrittori rimasti
+(`fdlimit::fd_headroom`): sono un esperimento transitorio dentro un processo che
+sta anche servendo un tunnel vivo, e `EMFILE` cade sull'`accept()` di **ogni**
+listener del processo (P-12). Sotto 32 socket l'escape rinuncia invece di
+spendere la finestra.
+
+### 20.7 Seconda osservazione di mapping via OTHER-ADDRESS (RFC 5780 §4.3)
+
+Classificare il mapping richiede due osservazioni da **due indirizzi server
+diversi**, e spesso solo uno risponde: `--stun-server HOST:PORT` costruisce per
+costruzione una catena di **un solo** elemento, e un deployment privato non ha
+STUN pubblici su cui ripiegare. Una sola osservazione ⇒ `mapping: Unknown` ⇒
+ogni policy che dipende dal mapping è disattivata, in silenzio, proprio sui
+deployment che hanno configurato il proprio server. Era il caso del banco netns
+prima della Fase 7.
+
+Il secondo indirizzo è già pubblicato e già usato: l'OTHER-ADDRESS del server
+stesso, lo stesso attributo che serve alla probe di filtering. Una binding
+request in più verso di esso, dentro il budget già esistente della catena,
+risponde alla domanda.
+
+Due cautele, entrambe necessarie:
+
+1. **È deliberatamente conservativa.** Il socket alternato differisce dal
+   primario per la sola **porta**, quindi un reflexive diverso prova che il
+   mapping è almeno port-dependent (symmetric, in questo modello) mentre uno
+   **identico** non prova l'endpoint-independence — anche un NAT
+   address-dependent risponderebbe identico qui e darebbe comunque una porta
+   diversa a un peer su un altro IP. Perciò questo fallback può concludere
+   `Symmetric` e non può mai concludere `Eim`: sbagliare verso "symmetric"
+   costa un budget di retry, sbagliare verso "endpoint-independent" costa un
+   percorso diretto pianificato che non può esistere.
+2. **L'ordine è portante.** Gira **dopo** la probe di filtering, mai prima.
+   Quella probe chiede al server di rispondere dalla porta alternata e misura
+   se la risposta passa — e il fallback di mapping **scrive** proprio a quel
+   `(ip, porta)`, aprendo un filtro address+port-dependent per esso. Misurato,
+   non ragionato: con i due invertiti, il router `masquerade` semplice del banco
+   riportava `adf-or-eif` invece di `apdf`, cioè la misura descriveva l'impronta
+   della probe stessa.
+
+Un server bound su wildcard pubblica il socket alternato come `0.0.0.0:porta`,
+che è onesto (non conosce il proprio IP pubblico) e irraggiungibile: il client
+ripara l'indirizzo con l'IP di chi ha appena risposto invece di saltare la
+misura.
+
+### 20.8 Gate
+
+| Gate | Dove | Cosa prova |
+|---|---|---|
+| `the_collision_probability_is_the_one_the_documentation_quotes` | `src/holepunch.rs` | i numeri del §20.3 sono quelli che il codice usa |
+| `sprayed_ports_are_distinct_and_allocatable` | `src/holepunch.rs` | nessun doppione, nessuna porta privilegiata (abbasserebbero `p` sotto quella dichiarata) |
+| `the_sprayed_escape_rendezvous_finds_a_pair` | `src/holepunch.rs` | il rendez-vous completo su loopback: i due lati si trovano, il vincitore è promosso per valore, i perdenti vengono puliti |
+| `the_escape_never_nominates_a_peer_that_claims_its_own_role` | `src/holepunch.rs` | su loopback il lato easy spruzza prima o poi la **propria** porta: senza la guardia un host nominerebbe sé stesso |
+| `the_escape_is_skipped_without_a_role_and_on_a_nominated_round` | `src/holepunch.rs` | costo zero fuori dalla cella |
+| `the_two_sides_of_the_escape_cell_get_complementary_spray_roles` | `src/adaptive_nat.rs` | i due rider della stessa coppia sono complementari (se no non si incontrano mai) |
+| `no_other_cell_is_given_a_spray_role` | `src/adaptive_nat.rs` | nessun'altra cella paga la finestra |
+| `the_spray_role_reaches_the_wire_only_when_both_peers_can_play_it` | `src/secret.rs` | il gate di capability |
+| `T-NAT-SPRAY-OFF` | `scripts/udp_nat_netns_test.sh` | la cella **resta** non vincibile dal round ordinario, rimisurata a ogni run |
+| `T-NAT-SPRAY-DIALER` | `scripts/udp_nat_netns_test.sh` | l'escape la ribalta su kernel vero, con promozione lato dialer |
+| `T-NAT-SPRAY-LISTENER` | `scripts/udp_nat_netns_test.sh` | idem con i ruoli invertiti: promuovere un socket ausiliario lato **listener** (un server QUIC costruito su un socket che non esisteva a inizio round) è un percorso di codice diverso |
+
+Le tre celle netns sono **un solo esperimento con una sola variabile**: la cella
+OFF rimisura la baseline a ogni run invece di fidarsi di un messaggio di commit,
+le due ON la ribaltano. Se un cambiamento futuro rompe l'escape, OFF passa e ON
+fallisce, e lo dice con precisione. Se rompe la **cella** — per esempio facendola
+vincere al round ordinario — fallisce OFF, ed è il fallimento più interessante.
+
+Misura di campo (banco netns, taratura deterministica): `escape_ms=51`, cioè il
+rendez-vous si chiude in **51 ms** dal momento in cui il round ordinario si è
+dichiarato a vuoto.
+
+### 20.9 Tarature
+
+| Variabile | Default | Cosa cambia |
+|---|---|---|
+| `BORE_UDP_SPRAY_PORTS` | 256 | porte distinte spruzzate per passaggio |
+| `BORE_UDP_SPRAY_PASSES` | 3 | passaggi (insiemi di porte diversi, l'unione conta) |
+| `BORE_UDP_SPRAY_SOCKETS` | 256 | socket ausiliari del lato hard |
+| `BORE_UDP_SPRAY_PACE_US` | 3000 | intervallo fra due pacchetti spruzzati |
+| `BORE_UDP_SPRAY_REPEAT_MS` | 2500 | ogni quanto un socket ausiliario ripete |
+| `BORE_UDP_SPRAY_CAP_MS` | 6000 | tetto dell'intero escape; **0 disattiva** |
+
+Esistono perché l'unico modo onesto di gatare questo meccanismo è portare la
+probabilità di collisione a ~1 su un banco e osservare il path ribaltarsi, e i
+default giusti su una rete vera (burst limitato, impronta conntrack limitata)
+non sono quelli che rendono un test deterministico. Stesso precedente di
+`BORE_CTRL_HEARTBEAT_MS` e `BORE_DIRECT_OPEN_TIMEOUT_MS`.

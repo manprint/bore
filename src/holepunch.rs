@@ -586,6 +586,12 @@ pub struct CheckConfig {
     /// Planned execution (plan Fase 3): staggered kind groups + retry budget.
     /// `None` keeps the flat Fase-2 round byte-identical.
     pub plan: Option<CheckPlan>,
+    /// Fase 7: which half of the sprayed escape to play if — and only if —
+    /// the round comes back dry. `None`, which is what every legacy path and
+    /// every cell but one produces, keeps the round AND its fallback
+    /// byte-identical to before Fase 7.
+    #[cfg(feature = "udp")]
+    pub spray: Option<spray::SprayRole>,
 }
 
 /// Client-side execution plan for one check round (plan Fase 3), resolved
@@ -1147,13 +1153,16 @@ impl UdpTraversalSocket {
                     // First two together: the second answer IS the profile.
                     let slot = i.saturating_sub(1) as u32;
                     tokio::time::sleep(STUN_CHAIN_STAGGER * slot).await;
-                    match self.stun_query(target.addr).await {
-                        Ok(reflexive) => Some(SelectedStun {
-                            requested: target.requested.clone(),
-                            addr: target.addr,
-                            source: target.source,
-                            reflexive,
-                        }),
+                    match self.stun_query_full(target.addr).await {
+                        Ok(reply) => Some((
+                            SelectedStun {
+                                requested: target.requested.clone(),
+                                addr: target.addr,
+                                source: target.source,
+                                reflexive: reply.mapped,
+                            },
+                            reply.other,
+                        )),
                         Err(err) => {
                             warn!(
                                 %err,
@@ -1170,9 +1179,13 @@ impl UdpTraversalSocket {
             .collect();
         let deadline = tokio::time::Instant::now() + STUN_CHAIN_BUDGET;
         let mut selected: Option<SelectedStun> = None;
+        // RFC 5780 OTHER-ADDRESS of whichever server answered FIRST. It is the
+        // fallback second observation (below) for a chain that has only one
+        // reachable server.
+        let mut first_other: Option<SocketAddr> = None;
         loop {
             let next = tokio::time::timeout_at(deadline, probes.next()).await;
-            let observation = match next {
+            let (observation, other) = match next {
                 Ok(Some(Some(obs))) => obs,
                 Ok(Some(None)) => continue,
                 // Chain exhausted or global budget spent.
@@ -1183,6 +1196,7 @@ impl UdpTraversalSocket {
                     profile.observations = 1;
                     profile.port_preserved =
                         (local_port != 0).then(|| observation.reflexive.port() == local_port);
+                    first_other = other;
                     selected = Some(observation);
                     // Bounded wait for ONE confirming observation; never past
                     // the global budget, and only worth it if another target
@@ -1204,7 +1218,7 @@ impl UdpTraversalSocket {
                         })
                         .await
                         {
-                            apply_second_observation(&mut profile, &selected, &second);
+                            apply_second_observation(&mut profile, &selected, &second.0);
                         }
                     }
                     break;
@@ -1241,6 +1255,77 @@ impl UdpTraversalSocket {
                 }
                 FilterProbe::Unsupported => None,
             };
+        }
+        // ORDERING, and it is load-bearing: this runs AFTER the filtering
+        // probe above, never before. That probe asks the server to answer from
+        // its ALTERNATE port and measures whether the answer gets through —
+        // and the mapping fallback WRITES to that exact address, which opens
+        // an address+port-dependent filter for it. Measured, not reasoned:
+        // with the two swapped, `scripts/udp_nat_netns_test.sh`'s plain
+        // `masquerade` router reported `adf-or-eif` instead of `apdf`, i.e.
+        // the measurement described the probe's own footprint.
+        // MAPPING, fallback path (RFC 5780 §4.3). Classifying the mapping
+        // needs two observations from two different server addresses, and a
+        // chain often has only one that answers: `--stun-server HOST:PORT`
+        // builds a SINGLE-element chain by construction, and a private
+        // deployment has no public STUN to fall back on. One observation ⇒
+        // `mapping: Unknown` ⇒ every policy that depends on the mapping is
+        // disabled, silently, on exactly the deployments that configured
+        // their own server.
+        //
+        // The second address is already published and already trusted: the
+        // server's own OTHER-ADDRESS, the same attribute the filtering probe
+        // needs. One extra binding request to it, inside the chain's existing
+        // budget, answers the question.
+        //
+        // Deliberately CONSERVATIVE, and this is the part that matters: the
+        // alternate socket differs from the primary in PORT only, so a
+        // different reflexive proves the mapping is at least port-dependent
+        // (symmetric, in this model) while an IDENTICAL one does NOT prove
+        // endpoint-independence — an address-dependent NAT would also answer
+        // identically here and would still hand a peer at another IP a
+        // different port. So this fallback may conclude `Symmetric` and may
+        // never conclude `Eim`: being wrong toward "symmetric" costs a retry
+        // budget, being wrong toward "endpoint-independent" costs a direct
+        // path that was planned and cannot exist.
+        if profile.observations < 2 {
+            if let (Some(first), Some(other)) = (selected.as_ref(), first_other) {
+                // A server bound to a wildcard address publishes its alternate
+                // socket as `0.0.0.0:port`, which is honest (it does not know
+                // its own public IP) and unreachable. The host is the one that
+                // just answered, so repair the address rather than skip the
+                // measurement.
+                let other = if other.ip().is_unspecified() {
+                    SocketAddr::new(first.addr.ip(), other.port())
+                } else {
+                    other
+                };
+                if other != first.addr && tokio::time::Instant::now() < deadline {
+                    match tokio::time::timeout_at(deadline, self.stun_query(other)).await {
+                        Ok(Ok(reflexive)) => {
+                            if reflexive != first.reflexive {
+                                profile.observations = 2;
+                                profile.mapping = UdpNatMapping::Symmetric;
+                                debug!(
+                                    %other,
+                                    first = %first.reflexive,
+                                    second = %reflexive,
+                                    "mapping classified symmetric from the server's OTHER-ADDRESS"
+                                );
+                            } else {
+                                debug!(
+                                    %other,
+                                    "OTHER-ADDRESS observation matched the first; \
+                                     mapping stays unknown (a same-IP probe cannot \
+                                     prove endpoint-independence)"
+                                );
+                            }
+                        }
+                        Ok(Err(err)) => debug!(%err, %other, "OTHER-ADDRESS probe failed"),
+                        Err(_) => debug!(%other, "OTHER-ADDRESS probe ran out of chain budget"),
+                    }
+                }
+            }
         }
         info!(
             profile = %profile.summary(),
@@ -1617,6 +1702,7 @@ impl CandidateDiscovery {
             capabilities: vec![
                 UDP_CAP_CANDIDATE_V2.to_string(),
                 UDP_CAP_CHECK_V1.to_string(),
+                crate::shared::UDP_CAP_SPRAY_V1.to_string(),
             ],
             profile_hint: None,
             profile: self.profile,
@@ -3035,10 +3121,80 @@ pub async fn listener_checks_then_quic(
     tuning: UdpDirectTuning,
 ) -> Result<(DirectListener, CheckOutcome)> {
     let tsock = UdpTraversalSocket::from_socket(socket);
-    let outcome = tsock.run_connectivity_checks(peers, cfg).await;
+    let mut outcome = tsock.run_connectivity_checks(peers, cfg).await;
     let socket = tsock.into_socket().await?;
+    let socket = sprayed_escape(socket, &mut outcome, cfg).await;
     let listener = DirectListener::from_checked_socket(socket, tuning)?;
     Ok((listener, outcome))
+}
+
+/// Fase 7: run the sprayed escape when the check round came back DRY and the
+/// broker assigned this side a role, and return the socket QUIC should use.
+///
+/// Three deliberate properties:
+///
+/// * it runs ONLY on a dry round. A nominated pair means the ordinary
+///   mechanism worked, and spending six seconds re-proving it would make the
+///   common case worse to help a rare one;
+/// * on the hard side the promoted socket REPLACES the original only when the
+///   escape actually won. A failed escape returns the original untouched, so
+///   the fallback that follows is the one that would have run anyway;
+/// * a win is written back into the `CheckOutcome`, so the caller's existing
+///   "direct path established after check round" line reports the nominated
+///   pair without knowing the escape exists.
+#[cfg(feature = "udp")]
+async fn sprayed_escape(
+    socket: UdpSocket,
+    outcome: &mut CheckOutcome,
+    cfg: &CheckConfig,
+) -> UdpSocket {
+    let Some(role) = cfg.spray else {
+        return socket;
+    };
+    if outcome.nominated.is_some() {
+        return socket;
+    }
+    let tuning = spray::SprayTuning::from_env();
+    if !tuning.enabled() {
+        debug!("sprayed escape disabled by its tuning");
+        return socket;
+    }
+    let started = Instant::now();
+    let (socket, hit) = match role {
+        spray::SprayRole::Easy => {
+            let hit = spray::easy_side(&socket, &outcome.targets, cfg, &tuning).await;
+            (socket, hit)
+        }
+        spray::SprayRole::Hard => match spray::hard_side(&outcome.targets, cfg, &tuning).await {
+            Some((promoted, hit)) => (promoted, Some(hit)),
+            None => (socket, None),
+        },
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match hit {
+        Some(hit) => {
+            info!(
+                ?role,
+                %hit,
+                escape_ms = elapsed_ms,
+                "sprayed escape found a working pair the ordinary round could not"
+            );
+            if !outcome.targets.contains(&hit) {
+                outcome.targets.push(hit);
+            }
+            outcome.nominated = Some(hit);
+        }
+        None => {
+            warn!(
+                ?role,
+                escape_ms = elapsed_ms,
+                p_collision = format!("{:.0}%", tuning.collision_probability() * 100.0),
+                fallback_reason = "spray-exhausted",
+                "sprayed escape found no colliding port within its budget;                  continuing with the ordinary fallback (the relay stays warm)"
+            );
+        }
+    }
+    socket
 }
 
 /// Fase 2 orchestration, dialer/consumer side: run the check round, then dial
@@ -3076,24 +3232,21 @@ pub async fn dialer_checks_then_quic(
         }
     }
     let tsock = UdpTraversalSocket::from_socket(socket);
-    let outcome = tsock.run_connectivity_checks(&peers, &cfg).await;
+    let mut outcome = tsock.run_connectivity_checks(&peers, &cfg).await;
     let socket = tsock.into_socket().await?;
-    let conn = match outcome.nominated {
-        Some(nominated) => {
-            connect_direct_inner(
-                socket,
-                outcome.targets.clone(),
-                Some(nominated),
-                token,
-                tuning,
-                false,
-            )
-            .await
-        }
-        None => {
-            connect_direct_inner(socket, outcome.targets.clone(), None, token, tuning, false).await
-        }
-    };
+    // Fase 7: a dry round on the one cell the matrix says cannot be won by an
+    // ordinary round gets one sprayed escape before the fallback. A win writes
+    // itself into `outcome.nominated`, so the dial below needs no new branch.
+    let socket = sprayed_escape(socket, &mut outcome, &cfg).await;
+    let conn = connect_direct_inner(
+        socket,
+        outcome.targets.clone(),
+        outcome.nominated,
+        token,
+        tuning,
+        false,
+    )
+    .await;
     if let Some(key) = cache_key {
         match &conn {
             Ok(conn) => pair_cache::remember(key, conn.remote_address()),
@@ -3595,6 +3748,611 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+/// Fase 7 — the sprayed escape for the one cell an ordinary check round
+/// cannot win (`docs/nat/NAT_SOTA_COMPARISON.md` §4.1).
+///
+/// THE CELL. The measured §6 matrix (`scripts/udp_nat_netns_test.sh`) says a
+/// pair with exactly one symmetric side goes direct or relays according to the
+/// NON-symmetric side's filtering, and the one combination that relays is
+/// `eim:apdf × edm`: a side with a stable, endpoint-independent mapping that
+/// nevertheless filters per address+port, facing a side whose source port
+/// nobody can predict. Neither ordinary mechanism reaches it — port prediction
+/// has nothing to predict against `fully-random`, and the check round's
+/// probes go to addresses that, by construction, are the wrong port.
+///
+/// THE ESCAPE. It is a rendezvous in the port space, and it works because the
+/// two sides are asymmetric in exactly complementary ways:
+///
+/// * the EASY side (stable mapping) sprays an authenticated check request at
+///   many destination ports of the peer's public IP. Every one of those
+///   packets opens its own NAT's filter for that `(peer ip, port)` pair —
+///   which is precisely the direction that was blocked — and costs it nothing,
+///   because its own source port is the same for all of them;
+/// * the HARD side (symmetric mapping) opens many auxiliary sockets and sends
+///   from each to the easy side's known, stable address. Each socket buys one
+///   more external port in the draw.
+///
+/// A single collision between the sprayed set and the drawn set opens BOTH
+/// directions at once: the easy side's packet reaches the hard side's socket
+/// (its NAT has a mapping on that port whose reply tuple is the easy side's
+/// stable address), and the hard side's reply reaches the easy side (whose
+/// filter that same spray packet opened). That symmetry is why the escape does
+/// not need a third party, a second round trip, or a retry protocol — the
+/// first frame that arrives anywhere is the answer.
+///
+/// THE MATH. With `S` sprayed ports over a space of `P` and `Q` auxiliary
+/// sockets, `p = 1 − (1 − S/P)^Q`. The defaults below (768 sprayed over
+/// 64512, 256 sockets) give ≈ 95%, at a cost of about 2 300 datagrams of
+/// 60 bytes across both sides and a few seconds of a budget that would
+/// otherwise have been spent falling back to the relay. It is deliberately
+/// NOT used for a hard × hard pair: there the easy side's stable port does not
+/// exist, both sets are drawn, and reaching 99.9% needs on the order of
+/// 170 000 probes (≈ 28 minutes at 100 pkt/s) — priced and rejected in the
+/// SOTA comparison.
+///
+/// WHAT IT COSTS WHEN IT FAILS. Nothing that was not already lost: the escape
+/// runs only after a DRY check round on a pair the server already planned
+/// relay-first, the relay stays warm throughout, and a failed escape falls
+/// through to exactly the QUIC attempt that would have run without it.
+#[cfg(feature = "udp")]
+pub mod spray {
+    use super::*;
+
+    /// Ports the spray may use. Below 1024 is privileged and no NAT allocates
+    /// there; the space is the denominator of the birthday math.
+    const PORT_LO: u32 = 1024;
+    const PORT_HI: u32 = 65535;
+    const PORT_SPACE: u32 = PORT_HI - PORT_LO + 1;
+
+    /// Below this many auxiliary sockets the draw is too thin to be worth the
+    /// window, so the escape declines rather than spending it (P < 20% at the
+    /// default spray size).
+    const MIN_AUX_SOCKETS: usize = 32;
+
+    /// Which half of the escape this peer plays. Decided by the broker (the
+    /// only party that sees both NAT profiles) and carried on
+    /// `UdpAdaptivePlan::spray_role`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SprayRole {
+        /// Endpoint-independent mapping: one stable external port. Sprays
+        /// destination ports from the socket the round already used — the same
+        /// socket on purpose, because its stability is the whole asset.
+        Easy,
+        /// Endpoint-dependent (symmetric) mapping: a fresh external port per
+        /// destination, so no peer can aim at it. Opens auxiliary sockets.
+        Hard,
+    }
+
+    /// Parse the wire value. An unknown string is `None` — same rule as the
+    /// plan's `reason_code`: a newer broker must be able to name a role this
+    /// binary predates without that being an error.
+    pub fn role_from_wire(value: Option<&str>) -> Option<SprayRole> {
+        match value? {
+            crate::adaptive_nat::SPRAY_ROLE_EASY => Some(SprayRole::Easy),
+            crate::adaptive_nat::SPRAY_ROLE_HARD => Some(SprayRole::Hard),
+            _ => None,
+        }
+    }
+
+    /// Sizing for one escape. Every field has an env override because the one
+    /// honest way to gate this mechanism is to drive the collision probability
+    /// to ~1 in a harness and observe the path flip, and the defaults that are
+    /// right on a real network (bounded burst, bounded conntrack footprint)
+    /// are not the ones that make a test deterministic. Same precedent as
+    /// `BORE_CTRL_HEARTBEAT_MS` and `BORE_DIRECT_OPEN_TIMEOUT_MS`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SprayTuning {
+        /// Distinct destination ports the easy side sprays per pass.
+        pub ports_per_pass: usize,
+        /// Passes, each with a FRESH random port set. The union is what counts:
+        /// the easy side's filter stays open for every port it has already
+        /// sprayed (conntrack keeps the entry far longer than this window), so
+        /// pass `n` adds to the coverage of passes `1..n` instead of repeating
+        /// it. Multiple passes also absorb start skew between the two sides.
+        pub passes: usize,
+        /// Auxiliary sockets the hard side opens.
+        pub sockets: usize,
+        /// Gap between two sprayed packets, also the easy side's listen slot.
+        pub pace: Duration,
+        /// How often each auxiliary socket re-sends. Its mapping only has to
+        /// EXIST (conntrack's unreplied UDP timeout is 30 s), so this is
+        /// anti-loss insurance, not a keepalive.
+        pub repeat: Duration,
+        /// Hard cap on the whole escape, both sides.
+        pub cap: Duration,
+        /// Accept loopback candidates as escape targets.
+        ///
+        /// False everywhere but an in-process test. On a real network a
+        /// loopback candidate can never be the far side of a NAT, so spraying
+        /// 768 ports at `127.0.0.1` would be noise — but on loopback the
+        /// rendezvous is exactly the same mechanism with the NAT's port
+        /// allocation replaced by the kernel's ephemeral range, which is what
+        /// makes an honest end-to-end gate possible without a kernel harness.
+        pub loopback_candidates: bool,
+    }
+
+    impl Default for SprayTuning {
+        fn default() -> Self {
+            Self {
+                ports_per_pass: 256,
+                passes: 3,
+                sockets: 256,
+                pace: Duration::from_micros(3_000),
+                repeat: Duration::from_millis(2_500),
+                cap: Duration::from_secs(6),
+                loopback_candidates: false,
+            }
+        }
+    }
+
+    impl SprayTuning {
+        /// Defaults with the `BORE_UDP_SPRAY_*` overrides applied. Read per
+        /// call, never cached: a harness sets them per process and a bad value
+        /// is ignored rather than fatal.
+        pub fn from_env() -> Self {
+            let d = Self::default();
+            Self {
+                ports_per_pass: env_usize("BORE_UDP_SPRAY_PORTS", d.ports_per_pass),
+                passes: env_usize("BORE_UDP_SPRAY_PASSES", d.passes).max(1),
+                sockets: env_usize("BORE_UDP_SPRAY_SOCKETS", d.sockets),
+                pace: Duration::from_micros(env_u64("BORE_UDP_SPRAY_PACE_US", 3_000)),
+                repeat: Duration::from_millis(env_u64("BORE_UDP_SPRAY_REPEAT_MS", 2_500)),
+                cap: Duration::from_millis(env_u64("BORE_UDP_SPRAY_CAP_MS", 6_000)),
+                loopback_candidates: false,
+            }
+        }
+
+        /// Whether this sizing can win anything at all.
+        ///
+        /// Zero budget, zero ports or zero sockets is the off switch — a
+        /// harness needs to measure the ordinary round on a cell the escape
+        /// would otherwise flip, and an operator whose router dislikes a
+        /// bounded burst needs the same. (The broader kill switch is
+        /// server-side: `--no-udp-adaptive-plan` withholds the plan, and the
+        /// role rides the plan.)
+        pub fn enabled(&self) -> bool {
+            self.cap > Duration::ZERO && self.ports_per_pass > 0 && self.sockets > 0
+        }
+
+        /// `1 − (1 − S/P)^Q`: the probability that at least one sprayed port
+        /// coincides with one of the auxiliary sockets' external ports.
+        ///
+        /// Reported in the logs because an operator reading "the escape did
+        /// not find a pair" deserves to know whether it was unlucky or
+        /// under-provisioned, and pinned by a unit test because these are the
+        /// numbers the SOTA comparison quotes.
+        pub fn collision_probability(&self) -> f64 {
+            let sprayed = (self.ports_per_pass.saturating_mul(self.passes)) as f64;
+            let space = f64::from(PORT_SPACE);
+            let miss = 1.0 - (sprayed.min(space) / space);
+            1.0 - miss.powi(self.sockets.min(i32::MAX as usize) as i32)
+        }
+    }
+
+    fn env_usize(key: &str, default: usize) -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_u64(key: &str, default: u64) -> u64 {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default)
+    }
+
+    /// `n` distinct ports drawn uniformly from the allocatable space.
+    ///
+    /// Uniform on purpose, and NOT biased toward the peer's observed port: a
+    /// NAT whose allocation is near-sequential is already covered by the
+    /// `PREDICT_RANGE` candidates the ordinary round probes, so biasing here
+    /// would re-spend the budget on the cell that is already handled and leave
+    /// the `fully-random` cell — the one this escape exists for — thinner.
+    pub fn random_ports(n: usize) -> Vec<u16> {
+        let n = n.min(PORT_SPACE as usize);
+        let mut seen = std::collections::HashSet::with_capacity(n);
+        let mut out = Vec::with_capacity(n);
+        // Bounded: with n ≤ 2048 against 64512 slots the expected number of
+        // draws is barely above n, and the cap makes the worst case finite
+        // regardless.
+        let mut draws = 0usize;
+        while out.len() < n && draws < n.saturating_mul(8) + 64 {
+            draws += 1;
+            let port = (PORT_LO + fastrand::u32(0..PORT_SPACE)) as u16;
+            if seen.insert(port) {
+                out.push(port);
+            }
+        }
+        out
+    }
+
+    /// Distinct peer IPs worth spraying, most-preferred first, capped at two.
+    ///
+    /// The same port set is sprayed at EVERY address returned here, so the
+    /// per-address collision probability is preserved and the packet count is
+    /// multiplied — which is exactly why the list is capped rather than
+    /// unbounded. Two covers the shapes that actually occur (a reflexive
+    /// address plus a router-mapped or same-LAN one); a peer that offered
+    /// sixteen candidates would otherwise turn a bounded burst into a
+    /// sixteen-fold one.
+    fn spray_ips(peers: &[SocketAddr], t: &SprayTuning) -> Vec<IpAddr> {
+        let mut out: Vec<IpAddr> = Vec::new();
+        for addr in peers {
+            let ip = addr.ip();
+            if !is_routable_v4(ip, t.loopback_candidates) || out.contains(&ip) {
+                continue;
+            }
+            out.push(ip);
+            if out.len() == 2 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Distinct peer addresses the hard side sends to, capped for the same
+    /// reason [`spray_ips`] is: each auxiliary socket writes to every target,
+    /// so an extra target multiplies the packet count without adding a single
+    /// ticket to the draw (the draw is the number of SOCKETS).
+    fn aux_targets(peers: &[SocketAddr], t: &SprayTuning) -> Vec<SocketAddr> {
+        let mut out: Vec<SocketAddr> = Vec::new();
+        for addr in peers {
+            if !is_routable_v4(addr.ip(), t.loopback_candidates) || out.contains(addr) {
+                continue;
+            }
+            out.push(*addr);
+            if out.len() == 2 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn is_routable_v4(ip: IpAddr, loopback: bool) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                (loopback || !v4.is_loopback())
+                    && !v4.is_unspecified()
+                    && !v4.is_link_local()
+                    && !v4.is_broadcast()
+                    && !v4.is_multicast()
+            }
+            // IPv6 has no NAT cell to escape from (Fase 4 scope).
+            IpAddr::V6(_) => false,
+        }
+    }
+
+    /// How many transaction ids one auxiliary socket remembers.
+    ///
+    /// Peer-controlled input, so it is bounded: a legitimate spray hits any
+    /// one socket a handful of times, and a peer that manages hundreds is not
+    /// one this socket is going to win with anyway.
+    const AUX_SEEN_CAP: usize = 256;
+
+    /// How many copies of the confirm the easy side sends.
+    ///
+    /// The confirm is what makes the rendezvous single-valued (see
+    /// [`easy_accept`]), so losing it costs the escape — but it travels a path
+    /// that has just been proven in both directions, so three copies is
+    /// insurance, not a retry protocol.
+    const CONFIRM_COPIES: usize = 3;
+
+    /// Easy side: authenticate one datagram and, if it is a genuine peer
+    /// frame, ANNOUNCE the decision before reporting it.
+    ///
+    /// The announcement is the whole reason this is not a one-liner. With a
+    /// generous draw the two sides collide on SEVERAL ports at once, and each
+    /// side would otherwise keep whichever arrived first — two different
+    /// firsts, two different pairs, a dial into a socket nobody is listening
+    /// on. Measured immediately by the loopback gate, where the collision
+    /// count is high by construction.
+    ///
+    /// So the easy side decides alone and says so: it replies to the frame
+    /// that reached it and then sends [`CONFIRM_COPIES`] requests carrying the
+    /// transaction id the peer has ALREADY seen. A sprayed request always
+    /// carries a fresh 96-bit id, so "an id I have seen before" is a
+    /// discriminator the spray itself can never counterfeit, and exactly one
+    /// auxiliary socket can ever receive it.
+    async fn easy_accept(
+        socket: &UdpSocket,
+        cfg: &CheckConfig,
+        buf: &[u8],
+        from: SocketAddr,
+    ) -> Option<SocketAddr> {
+        let frame = check::parse(&cfg.key, buf)?;
+        if frame.generation != cfg.generation || frame.role == cfg.role.byte() {
+            return None;
+        }
+        if frame.kind == check::KIND_REQUEST {
+            // An auxiliary socket reached us first: its probe got through
+            // because a spray packet had already opened our filter for it.
+            let reply =
+                check::response(&cfg.key, cfg.role.byte(), cfg.generation, &frame.txid, from);
+            let _ = socket.send_to(&reply, from).await;
+        }
+        let confirm = check::request(&cfg.key, cfg.role.byte(), cfg.generation, &frame.txid);
+        for _ in 0..CONFIRM_COPIES {
+            let _ = socket.send_to(&confirm, from).await;
+        }
+        Some(from)
+    }
+
+    /// Hard side: one auxiliary socket's view of one datagram.
+    ///
+    /// Promotes ONLY on a confirm — a request carrying a transaction id this
+    /// socket has already seen, either because it answered it or because it
+    /// generated it. Everything else is answered where the protocol says to
+    /// answer and otherwise ignored, including a response to this socket's own
+    /// probe: being seen is not the same as being chosen, and acting on it is
+    /// exactly the disagreement the confirm exists to prevent.
+    fn aux_accept(
+        cfg: &CheckConfig,
+        seen: &mut std::collections::HashSet<[u8; 12]>,
+        buf: &[u8],
+    ) -> Option<AuxAction> {
+        let frame = check::parse(&cfg.key, buf)?;
+        if frame.generation != cfg.generation || frame.role == cfg.role.byte() {
+            return None;
+        }
+        match frame.kind {
+            check::KIND_REQUEST if seen.contains(&frame.txid) => Some(AuxAction::Promote),
+            // Full memory ⇒ stop answering NEW ids, for two reasons that
+            // happen to coincide. An id this socket cannot remember is one
+            // whose confirm it could not recognise, so answering it is a
+            // reply it can never act on; and the answer is the same size as
+            // the request, so an unbounded answer loop is a 1:1 reflector —
+            // the property `CHECK_MAX_RESPONSES` caps on the ordinary round,
+            // capped here by the same number.
+            check::KIND_REQUEST if seen.len() >= AUX_SEEN_CAP => None,
+            check::KIND_REQUEST => Some(AuxAction::Answer(frame.txid)),
+            _ => None,
+        }
+    }
+
+    /// What an auxiliary socket does with an authenticated frame.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AuxAction {
+        /// Answer this transaction id and remember it.
+        Answer([u8; 12]),
+        /// The easy side confirmed this socket: it is the pair.
+        Promote,
+    }
+
+    /// Read this socket until `budget` runs out, returning the first
+    /// authenticated peer source the easy side accepts.
+    async fn listen(
+        socket: &UdpSocket,
+        cfg: &CheckConfig,
+        buf: &mut [u8],
+        budget: Duration,
+    ) -> Option<SocketAddr> {
+        let deadline = Instant::now() + budget;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let (n, from) = match timeout(left, socket.recv_from(buf)).await {
+                Ok(Ok(v)) => v,
+                // A hard socket error ends the escape; the caller still has
+                // its ordinary QUIC attempt and the warm relay behind it.
+                Ok(Err(_)) => return None,
+                Err(_) => return None,
+            };
+            if let Some(hit) = easy_accept(socket, cfg, &buf[..n], from).await {
+                return Some(hit);
+            }
+        }
+    }
+
+    /// Easy side: spray destination ports from the round's own socket.
+    ///
+    /// Takes the socket by reference and never replaces it — its stability is
+    /// the asset the whole escape is built on, and the caller hands the SAME
+    /// socket to QUIC afterwards.
+    pub async fn easy_side(
+        socket: &UdpSocket,
+        peers: &[SocketAddr],
+        cfg: &CheckConfig,
+        t: &SprayTuning,
+    ) -> Option<SocketAddr> {
+        let ips = spray_ips(peers, t);
+        if ips.is_empty() {
+            debug!("sprayed escape skipped: no routable peer IP among the candidates");
+            return None;
+        }
+        let started = Instant::now();
+        info!(
+            ?ips,
+            ports_per_pass = t.ports_per_pass,
+            passes = t.passes,
+            p_collision = format!("{:.0}%", t.collision_probability() * 100.0),
+            "sprayed escape: spraying destination ports (easy side)"
+        );
+        let mut buf = [0u8; 2048];
+        for _ in 0..t.passes {
+            if started.elapsed() >= t.cap {
+                break;
+            }
+            for port in random_ports(t.ports_per_pass) {
+                if started.elapsed() >= t.cap {
+                    break;
+                }
+                for ip in &ips {
+                    let frame = check::request(
+                        &cfg.key,
+                        cfg.role.byte(),
+                        cfg.generation,
+                        &check::new_txid(),
+                    );
+                    let _ = socket.send_to(&frame, SocketAddr::new(*ip, port)).await;
+                }
+                // Listen DURING the pace slot rather than after the pass: the
+                // answer can arrive at any moment and a slot spent sleeping is
+                // a slot not spent reading.
+                if let Some(hit) = listen(socket, cfg, &mut buf, t.pace).await {
+                    return Some(hit);
+                }
+            }
+        }
+        // Drain the rest of the budget: the peer's own probe may still be in
+        // flight behind the last packet we sent.
+        let left = t.cap.saturating_sub(started.elapsed());
+        listen(socket, cfg, &mut buf, left).await
+    }
+
+    /// Hard side: open auxiliary sockets and return the one that wins.
+    ///
+    /// The winner is returned BY VALUE, with its task already finished, so the
+    /// caller can hand it to Quinn under the same one-socket-one-reader rule
+    /// every other direct path obeys. The losers are dropped with their tasks.
+    pub async fn hard_side(
+        peers: &[SocketAddr],
+        cfg: &CheckConfig,
+        t: &SprayTuning,
+    ) -> Option<(UdpSocket, SocketAddr)> {
+        let targets = aux_targets(peers, t);
+        if targets.is_empty() {
+            debug!("sprayed escape skipped: no routable peer address among the candidates");
+            return None;
+        }
+        let want = aux_socket_budget(t.sockets);
+        if want < MIN_AUX_SOCKETS {
+            warn!(
+                requested = t.sockets,
+                affordable = want,
+                "sprayed escape declined: not enough file-descriptor headroom for a draw \
+                 worth the window; staying on the ordinary fallback"
+            );
+            return None;
+        }
+
+        let mut set = tokio::task::JoinSet::new();
+        let mut opened = 0usize;
+        for _ in 0..want {
+            // Plain bind, NOT `bind_socket`: these sockets carry 60-byte
+            // frames and never QUIC, so the multi-megabyte buffer request
+            // would be pure waste times N — and the winner is handed to an
+            // endpoint constructor, which is where P-13 says the buffers are
+            // configured anyway. Ephemeral port, no `SO_REUSEADDR` (the
+            // direct-path rule; nothing here co-binds a fixed port).
+            let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
+                Ok(socket) => socket,
+                Err(err) => {
+                    debug!(%err, opened, "stopped opening auxiliary sockets");
+                    break;
+                }
+            };
+            opened += 1;
+            let cfg = cfg.clone();
+            let targets = targets.clone();
+            let tuning = *t;
+            set.spawn(async move { aux_socket_round(socket, targets, cfg, tuning).await });
+        }
+        if opened < MIN_AUX_SOCKETS {
+            warn!(
+                opened,
+                "sprayed escape declined: could only open {opened} auxiliary sockets"
+            );
+            set.shutdown().await;
+            return None;
+        }
+        info!(
+            sockets = opened,
+            ?targets,
+            "sprayed escape: drawing external ports (hard side)"
+        );
+
+        let deadline = Instant::now() + t.cap;
+        let mut winner = None;
+        while winner.is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match timeout(left, set.join_next()).await {
+                // Every socket finished without a hit.
+                Ok(None) => break,
+                Ok(Some(Ok(Some(hit)))) => winner = Some(hit),
+                // A loser, or a task that panicked: keep waiting for the rest.
+                Ok(Some(_)) => {}
+                Err(_) => break,
+            }
+        }
+        // Losers are aborted and their sockets released here, before the
+        // winner is handed on — a leftover reader on a leftover socket is the
+        // shape of every direct-path bug this codebase has had.
+        set.shutdown().await;
+        winner
+    }
+
+    /// One auxiliary socket's whole life: punch the targets, listen, answer.
+    async fn aux_socket_round(
+        socket: UdpSocket,
+        targets: Vec<SocketAddr>,
+        cfg: CheckConfig,
+        t: SprayTuning,
+    ) -> Option<(UdpSocket, SocketAddr)> {
+        let deadline = Instant::now() + t.cap;
+        let mut buf = [0u8; 2048];
+        let mut next_send = Instant::now();
+        // Transaction ids this socket has taken part in — the ones it
+        // generated and the ones it answered. A confirm is a request carrying
+        // one of them.
+        let mut seen: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            if now >= next_send {
+                for target in &targets {
+                    let txid = check::new_txid();
+                    let frame = check::request(&cfg.key, cfg.role.byte(), cfg.generation, &txid);
+                    if socket.send_to(&frame, *target).await.is_ok() {
+                        seen.insert(txid);
+                    }
+                }
+                next_send = now + t.repeat;
+            }
+            let left = next_send
+                .min(deadline)
+                .saturating_duration_since(Instant::now());
+            match timeout(left, socket.recv_from(&mut buf)).await {
+                Ok(Ok((n, from))) => match aux_accept(&cfg, &mut seen, &buf[..n]) {
+                    Some(AuxAction::Promote) => return Some((socket, from)),
+                    Some(AuxAction::Answer(txid)) => {
+                        let reply =
+                            check::response(&cfg.key, cfg.role.byte(), cfg.generation, &txid, from);
+                        let _ = socket.send_to(&reply, from).await;
+                        seen.insert(txid);
+                    }
+                    None => {}
+                },
+                Ok(Err(_)) => return None,
+                // Pace slot elapsed: loop around and re-send.
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// How many auxiliary sockets this process can afford.
+    ///
+    /// Never more than half the remaining descriptors: the sockets are a
+    /// transient experiment inside a process that is also serving a live
+    /// tunnel, and `EMFILE` lands on `accept()` for EVERY listener the process
+    /// owns (P-12) — spending the last descriptors on a 63%-shot would trade a
+    /// working relay for a broken server.
+    fn aux_socket_budget(requested: usize) -> usize {
+        match crate::fdlimit::fd_headroom() {
+            Some(head) => requested.min((head / 2) as usize),
+            None => requested,
+        }
     }
 }
 
@@ -4728,6 +5486,7 @@ mod tests {
             role: CheckRole::Listener,
             window: Duration::from_millis(800),
             plan: None,
+            spray: None,
         };
 
         let prober = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -4802,6 +5561,7 @@ mod tests {
             role: CheckRole::Listener,
             window: Duration::from_secs(2),
             plan: None,
+            spray: None,
         };
         let d_cfg = CheckConfig {
             key,
@@ -4809,6 +5569,7 @@ mod tests {
             role: CheckRole::Dialer,
             window: Duration::from_secs(2),
             plan: None,
+            spray: None,
         };
         let l_peers = [b_addr];
         let d_peers = [a_addr];
@@ -4919,6 +5680,7 @@ mod tests {
             read_timeout_ms: ms,
             send_delay_ms: 0,
             reason_code: None,
+            spray_role: None,
         };
         assert_eq!(plan_check_window(&mk(0)), Duration::from_millis(500));
         assert_eq!(plan_check_window(&mk(750)), Duration::from_millis(750));
@@ -5095,6 +5857,7 @@ mod tests {
             role: CheckRole::Listener,
             window: Duration::from_secs(2),
             plan: None,
+            spray: None,
         };
         let d_cfg = CheckConfig {
             key,
@@ -5106,6 +5869,7 @@ mod tests {
                 retry_budget: 1,
                 initial_delay: Duration::ZERO,
             }),
+            spray: None,
         };
         let l_peers = [b_addr];
         let d_peers = [decoy_addr, a_addr];
@@ -5996,5 +6760,263 @@ mod tests {
             UdpNatFiltering::Unknown
         );
         assert_eq!(FilterProbe::Unsupported.legacy(), UdpNatFiltering::Unknown);
+    }
+
+    // ---------------------------------------------------------------------
+    // Fase 7 — the sprayed escape (birthday-paradox rendezvous).
+    // ---------------------------------------------------------------------
+
+    /// The numbers the SOTA comparison quotes are the numbers the code uses.
+    ///
+    /// `p = 1 − (1 − S/P)^Q`. If someone retunes the defaults, this test is
+    /// where the new probability has to be written down, which is the point:
+    /// a mechanism that succeeds 63% of the time and one that succeeds 95% of
+    /// the time are different products, and the difference must not be a side
+    /// effect of an unrelated edit.
+    #[test]
+    fn the_collision_probability_is_the_one_the_documentation_quotes() {
+        let one_pass = spray::SprayTuning {
+            ports_per_pass: 256,
+            passes: 1,
+            sockets: 256,
+            ..spray::SprayTuning::default()
+        };
+        let p = one_pass.collision_probability();
+        assert!(
+            (0.62..0.65).contains(&p),
+            "256x256 should be the ~63% figure the comparison quotes, got {p}"
+        );
+
+        let defaults = spray::SprayTuning::default();
+        let p = defaults.collision_probability();
+        assert!(
+            (0.94..0.97).contains(&p),
+            "the shipped defaults should be the ~95% figure, got {p}"
+        );
+
+        // A draw with no tickets can never win, and a spray of nothing can
+        // never be drawn — neither may report a probability above zero.
+        assert_eq!(
+            spray::SprayTuning {
+                sockets: 0,
+                ..defaults
+            }
+            .collision_probability(),
+            0.0
+        );
+        assert_eq!(
+            spray::SprayTuning {
+                ports_per_pass: 0,
+                ..defaults
+            }
+            .collision_probability(),
+            0.0
+        );
+    }
+
+    /// The sprayed set must be distinct and inside the allocatable range:
+    /// a duplicate is a wasted packet and a privileged port is one no NAT
+    /// hands out, so both would quietly lower the real probability below the
+    /// one the line above pins.
+    #[test]
+    fn sprayed_ports_are_distinct_and_allocatable() {
+        let ports = spray::random_ports(1024);
+        assert_eq!(ports.len(), 1024, "the draw came up short");
+        let unique: std::collections::HashSet<u16> = ports.iter().copied().collect();
+        assert_eq!(unique.len(), ports.len(), "the draw contained a duplicate");
+        assert!(
+            ports.iter().all(|p| *p >= 1024),
+            "the draw contained a privileged port"
+        );
+    }
+
+    /// An unrecognised role is `None`, not a panic and not a default: a newer
+    /// broker must be able to name a role this binary predates, exactly as it
+    /// may name an unknown `reason_code`.
+    #[test]
+    fn an_unknown_spray_role_is_no_role() {
+        assert_eq!(
+            spray::role_from_wire(Some("easy")),
+            Some(spray::SprayRole::Easy)
+        );
+        assert_eq!(
+            spray::role_from_wire(Some("hard")),
+            Some(spray::SprayRole::Hard)
+        );
+        assert_eq!(spray::role_from_wire(Some("sideways")), None);
+        assert_eq!(spray::role_from_wire(None), None);
+    }
+
+    /// The whole rendezvous, end to end, over loopback.
+    ///
+    /// There is no NAT here, so the "collision" is literal: the easy side
+    /// sprays destination ports and wins when one of them is a port the hard
+    /// side's auxiliary sockets actually hold. The kernel's ephemeral range is
+    /// narrower than the space the escape sprays, which makes the draw
+    /// overwhelmingly likely rather than merely likely — deliberately, because
+    /// a gate that fails one run in twenty is a gate that gets deleted.
+    ///
+    /// What this proves and what it does not: it proves the two halves find
+    /// each other, that the winner is promoted by value with its reader
+    /// stopped, and that the losers are cleaned up. It does NOT prove the
+    /// mechanism beats a real NAT — only a kernel with real nftables rules can
+    /// say that, which is `T-NAT-SPRAY-*` in `scripts/udp_nat_netns_test.sh`.
+    #[tokio::test]
+    async fn the_sprayed_escape_rendezvous_finds_a_pair() {
+        let key = [7u8; 32];
+        let tuning = spray::SprayTuning {
+            ports_per_pass: 6000,
+            passes: 2,
+            sockets: 384,
+            pace: Duration::from_micros(0),
+            repeat: Duration::from_millis(250),
+            cap: Duration::from_secs(20),
+            loopback_candidates: true,
+        };
+
+        let easy_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let easy_addr: SocketAddr = (
+            Ipv4Addr::LOCALHOST,
+            easy_socket.local_addr().unwrap().port(),
+        )
+            .into();
+
+        let easy_cfg = CheckConfig {
+            key,
+            generation: 9,
+            role: CheckRole::Dialer,
+            window: CHECK_WINDOW,
+            plan: None,
+            spray: Some(spray::SprayRole::Easy),
+        };
+        let hard_cfg = CheckConfig {
+            role: CheckRole::Listener,
+            spray: Some(spray::SprayRole::Hard),
+            ..easy_cfg.clone()
+        };
+
+        let hard_tuning = tuning;
+        let hard =
+            tokio::spawn(
+                async move { spray::hard_side(&[easy_addr], &hard_cfg, &hard_tuning).await },
+            );
+
+        // The easy side is handed a peer candidate that is right about the IP
+        // and wrong about the port — which is exactly the cell: the only thing
+        // it can know about a symmetric peer is its address.
+        let peers = vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 1))];
+        let easy_hit = spray::easy_side(&easy_socket, &peers, &easy_cfg, &tuning).await;
+        let hard_result = hard.await.unwrap();
+
+        let easy_hit = easy_hit.expect("the easy side found no pair");
+        let (promoted, hard_hit) = hard_result.expect("the hard side found no pair");
+
+        assert_eq!(
+            easy_hit.port(),
+            promoted.local_addr().unwrap().port(),
+            "the easy side nominated a port the hard side did not promote"
+        );
+        assert_eq!(
+            hard_hit, easy_addr,
+            "the hard side nominated the wrong remote"
+        );
+
+        // The promoted socket is a live, sole-owner socket: the round's reader
+        // is finished, so the caller can hand it straight to Quinn.
+        promoted
+            .send_to(b"post-handoff", easy_addr)
+            .await
+            .expect("the promoted socket must still be usable by its new owner");
+    }
+
+    /// A peer that claims OUR role is never answered and never nominated.
+    ///
+    /// On loopback the easy side sprays its own ephemeral range and will
+    /// eventually spray its own port, so this is not a hypothetical: without
+    /// the guard a single host would nominate itself and hand Quinn a pair
+    /// that goes nowhere.
+    #[tokio::test]
+    async fn the_escape_never_nominates_a_peer_that_claims_its_own_role() {
+        let key = [3u8; 32];
+        let cfg = CheckConfig {
+            key,
+            generation: 4,
+            role: CheckRole::Dialer,
+            window: CHECK_WINDOW,
+            plan: None,
+            spray: Some(spray::SprayRole::Easy),
+        };
+        let tuning = spray::SprayTuning {
+            ports_per_pass: 1,
+            passes: 1,
+            pace: Duration::from_millis(1),
+            cap: Duration::from_millis(400),
+            loopback_candidates: true,
+            ..spray::SprayTuning::default()
+        };
+
+        let victim = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let victim_addr: SocketAddr =
+            (Ipv4Addr::LOCALHOST, victim.local_addr().unwrap().port()).into();
+        let impostor = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+
+        // Same role as the victim: a loopback of its own frame, or a second
+        // copy of the same side. Either way it must be ignored.
+        let frame = check::request(&key, CheckRole::Dialer.byte(), 4, &check::new_txid());
+        impostor.send_to(&frame, victim_addr).await.unwrap();
+
+        let peers = vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 1))];
+        assert_eq!(
+            spray::easy_side(&victim, &peers, &cfg, &tuning).await,
+            None,
+            "a same-role frame was accepted as a winning pair"
+        );
+    }
+
+    /// The escape must not fire outside the cell it was built for, and must
+    /// not fire at all on a nominated round: a pair the ordinary mechanism
+    /// already solved would otherwise pay the escape's whole window.
+    #[tokio::test]
+    async fn the_escape_is_skipped_without_a_role_and_on_a_nominated_round() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let no_role = CheckConfig {
+            key: [1u8; 32],
+            generation: 1,
+            role: CheckRole::Dialer,
+            window: CHECK_WINDOW,
+            plan: None,
+            spray: None,
+        };
+        let mut outcome = CheckOutcome {
+            nominated: None,
+            observed: None,
+            learned_prflx: false,
+            targets: vec![SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 4000))],
+            checks_ms: 0,
+        };
+        let started = Instant::now();
+        let socket = sprayed_escape(socket, &mut outcome, &no_role).await;
+        assert_eq!(socket.local_addr().unwrap().port(), port, "socket replaced");
+        assert_eq!(outcome.nominated, None);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "no role must cost no time"
+        );
+
+        let nominated: SocketAddr = (Ipv4Addr::new(203, 0, 113, 7), 4000).into();
+        let with_role = CheckConfig {
+            spray: Some(spray::SprayRole::Easy),
+            ..no_role
+        };
+        outcome.nominated = Some(nominated);
+        let started = Instant::now();
+        let socket = sprayed_escape(socket, &mut outcome, &with_role).await;
+        assert_eq!(socket.local_addr().unwrap().port(), port, "socket replaced");
+        assert_eq!(outcome.nominated, Some(nominated));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "a nominated round must cost no time"
+        );
     }
 }

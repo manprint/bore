@@ -2064,6 +2064,12 @@ async fn provider_direct(
                         plan_wire.map(|p| p.send_delay_ms).unwrap_or(0),
                     ),
                 }),
+                // Fase 7: the broker names the half of the sprayed escape this
+                // side plays, and only for the one cell that needs one. An
+                // unknown or absent value is `None`, which is the legacy round.
+                spray: crate::holepunch::spray::role_from_wire(
+                    plan_wire.and_then(|p| p.spray_role.as_deref()),
+                ),
             };
             let (listener, outcome) =
                 crate::holepunch::listener_checks_then_quic(socket, &peers, &cfg, tuning).await?;

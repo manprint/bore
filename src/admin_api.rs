@@ -157,29 +157,70 @@ pub fn tunnels(server: &Server) -> Vec<TunnelView> {
         .snapshot()
         .into_iter()
         .filter(|e| e.role == Role::Public)
-        .map(|e| TunnelView {
-            id: e.id,
-            peer: e.peer,
-            public_port: e.public_port,
-            notes: e.notes,
-            basic_auth: e.basic_auth,
-            https: e.https,
-            force_https: e.force_https,
-            carriers: e.carriers,
-            auto_reconnect: e.auto_reconnect,
-            webserver_log: e.webserver_log,
-            udp: e.udp,
-            local_host: e.local_host,
-            local_port: e.local_port,
-            max_conns: e.max_conns,
-            overlay: e.overlay,
-            vpn_direct: e.vpn_direct,
-            active: e.active,
-            uptime_secs: e.uptime_secs,
-            relay_tx_bytes: e.relay_tx_bytes,
-            relay_rx_bytes: e.relay_rx_bytes,
-            transport: e.transport,
-            identity: e.identity,
+        .map(|e| {
+            // Per-tunnel direct-path state. Derived on every read from the live
+            // registry, like the vhost section: the admin `Entry` is a
+            // registration snapshot and cannot know which transport the last
+            // proxied connection took.
+            #[cfg(feature = "udp")]
+            let direct = e
+                .public_port
+                .and_then(|port| server.public_direct_stats(port));
+            #[cfg(not(feature = "udp"))]
+            let direct: Option<()> = None;
+            let (direct_stream_opens, direct_fallbacks, direct_pool, current_path) = {
+                #[cfg(feature = "udp")]
+                {
+                    match direct {
+                        Some(d) => (
+                            d.stream_opens,
+                            d.fallbacks,
+                            d.carriers,
+                            crate::vhost::vhost_path_label(d.last_path).to_string(),
+                        ),
+                        None => (
+                            0,
+                            0,
+                            0,
+                            crate::vhost::vhost_path_label(crate::vhost::VHOST_PATH_UNKNOWN)
+                                .to_string(),
+                        ),
+                    }
+                }
+                #[cfg(not(feature = "udp"))]
+                {
+                    let _ = direct;
+                    (0u64, 0u64, 0usize, "unknown".to_string())
+                }
+            };
+            TunnelView {
+                id: e.id,
+                peer: e.peer,
+                public_port: e.public_port,
+                notes: e.notes,
+                basic_auth: e.basic_auth,
+                https: e.https,
+                force_https: e.force_https,
+                carriers: e.carriers,
+                auto_reconnect: e.auto_reconnect,
+                webserver_log: e.webserver_log,
+                udp: e.udp,
+                local_host: e.local_host,
+                local_port: e.local_port,
+                max_conns: e.max_conns,
+                overlay: e.overlay,
+                vpn_direct: e.vpn_direct,
+                active: e.active,
+                uptime_secs: e.uptime_secs,
+                relay_tx_bytes: e.relay_tx_bytes,
+                relay_rx_bytes: e.relay_rx_bytes,
+                direct_stream_opens,
+                direct_fallbacks,
+                direct_pool,
+                current_path,
+                transport: e.transport,
+                identity: e.identity,
+            }
         })
         .collect()
 }

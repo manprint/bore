@@ -68,7 +68,20 @@ if do_step scripts; then
   say "harnesses"
   vmcp "$HERE"/vm/*.sh "$BORE_VM_USER@$BORE_VM:~/"
   vmcp "$HERE"/res/res_sampler.sh "$BORE_VM_USER@$BORE_VM:~/"
-  vm "chmod +x ~/vm_*.sh ~/driver.sh ~/res_sampler.sh 2>/dev/null; ls -1 ~/vm_*.sh | wc -l | xargs echo '  vm scripts:'"
+  # The byte-source origin EVERY vm_* harness starts. It lived only on the VM
+  # for the first campaign, so a re-provision of a fresh VM produced scripts
+  # that all failed at "origin failed" — push it with the rest.
+  vmcp "$HERE"/../bench_origin.py "$BORE_VM_USER@$BORE_VM:~/"
+  # The PUBLIC-tunnel campaign: its own harness directory, plus the raw-TCP
+  # origin and driver it needs. A public tunnel forwards arbitrary TCP, so the
+  # HTTP origin above cannot measure it without folding HTTP parsing in.
+  vm "mkdir -p ~/pub"
+  vmcp "$HERE"/pub/*.sh "$BORE_VM_USER@$BORE_VM:~/pub/"
+  vmcp "$HERE"/../raw_origin.py "$HERE"/../raw_client.py "$BORE_VM_USER@$BORE_VM:~/"
+  vm "chmod +x ~/vm_*.sh ~/driver.sh ~/res_sampler.sh ~/bench_origin.py \
+        ~/raw_origin.py ~/raw_client.py ~/pub/*.sh 2>/dev/null
+      ls -1 ~/vm_*.sh | wc -l | xargs echo '  vm scripts:'
+      ls -1 ~/pub/*.sh | wc -l | xargs echo '  pub scripts:'"
 
   # The VM-side env.sh is DERIVED from the workstation one so the two can never
   # drift, and is written with mode 600. It is not, and must never be, in git.
@@ -88,6 +101,7 @@ export VM_HOME=\"\$HOME\"
 export IFACE='$BORE_SRV_IFACE'
 export DUFS_PORT='${BORE_DUFS_PORT:-5080}'
 export ORIGIN_PORT='${BORE_ORIGIN_PORT:-5052}'
+export RAW_ORIGIN_PORT='${BORE_RAW_ORIGIN_PORT:-5053}'
 VMENV
 chmod 600 ~/env.sh; echo '  ~/env.sh written'"
 fi

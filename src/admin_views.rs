@@ -99,6 +99,25 @@ pub struct TunnelView {
     pub relay_tx_bytes: u64,
     /// Relay rx bytes.
     pub relay_rx_bytes: u64,
+    /// Proxied connections that successfully opened a direct QUIC stream
+    /// (`--udp` tunnels only; 0 otherwise). Successful opens ONLY — as an
+    /// attempt counter this climbs during a total UDP blackout and says the
+    /// opposite of the truth.
+    #[serde(default)]
+    pub direct_stream_opens: u64,
+    /// Proxied connections that asked for the direct path and were served on
+    /// the warm TCP relay instead (`--udp` tunnels only; 0 otherwise).
+    #[serde(default)]
+    pub direct_fallbacks: u64,
+    /// Live QUIC carriers in this tunnel's direct pool (`--udp` only).
+    #[serde(default)]
+    pub direct_pool: usize,
+    /// Transport the LAST proxied connection actually used: `unknown`, `relay`
+    /// or `direct`. No counter can express this, and without it a tunnel that
+    /// negotiated `--udp` and has since fallen back for every connection looks
+    /// exactly like a healthy direct one.
+    #[serde(default)]
+    pub current_path: String,
     /// Which client implementation established this tunnel.
     pub transport: crate::admin::Transport,
     /// Identity presented at authentication (SSH) or `None` (native `bore`).
@@ -858,6 +877,10 @@ mod tests {
             uptime_secs: 10,
             relay_tx_bytes: 1024,
             relay_rx_bytes: 2048,
+            direct_stream_opens: 7,
+            direct_fallbacks: 2,
+            direct_pool: 3,
+            current_path: "direct".into(),
             transport: crate::admin::Transport::Bore,
             identity: None,
         };
@@ -868,6 +891,13 @@ mod tests {
         assert_eq!(json["carriers"], 4);
         assert_eq!(json["auto_reconnect"], true);
         assert_eq!(json["force_https"], true);
+        // The public-tunnel direct-path fields must reach the JSON: without
+        // them a `--udp` tunnel that has silently fallen back to the relay for
+        // every connection is indistinguishable from a healthy direct one.
+        assert_eq!(json["direct_stream_opens"], 7);
+        assert_eq!(json["direct_fallbacks"], 2);
+        assert_eq!(json["direct_pool"], 3);
+        assert_eq!(json["current_path"], "direct");
         // webserver_log must reach the JSON (flag-visibility parity).
         assert_eq!(json["webserver_log"], true);
 

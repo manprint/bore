@@ -77,6 +77,13 @@ bigup() {
     printf '%s' "$f"
 }
 
+# --- cooldown ---------------------------------------------------------------
+# One 4-stream 10 s burst is roughly a whole inbound allowance budget on this
+# instance class, so back-to-back arms measure the token bucket instead of the
+# tunnel. Every harness waits between bursts; the default is deliberately long.
+COOL="${COOL:-75}"
+cool() { sleep "${1:-$COOL}"; }
+
 # --- misc -------------------------------------------------------------------
 label() { printf '%s%s' "${1:-p}" "$(date +%s%N | cut -c8-13)"; }
 say()   { echo "### $* — $(date -Is)"; }

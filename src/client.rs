@@ -205,7 +205,7 @@ impl Client {
         port: u16,
         secret: Option<&str>,
         insecure: bool,
-        options: TunnelOptions,
+        mut options: TunnelOptions,
         access_logger: Option<Arc<AccessLogger>>,
     ) -> Result<Self> {
         let endpoint = Endpoint::parse(to);
@@ -231,6 +231,12 @@ impl Client {
         #[cfg(feature = "udp")]
         let options_udp = options.udp;
         let webserver_log_opt = options.webserver_log;
+        // Declare the control heartbeat (P-4). This is the ONLY thing that lets
+        // the server apply its receive deadline to this tunnel (DEC-VE2), and it
+        // must stay in lockstep with `sends_ctrl_heartbeat: true` below:
+        // declaring without beating is the one combination that reaps a healthy
+        // idle tunnel.
+        options.ctrl_heartbeat = true;
         control.send(ClientMessage::Hello(port, options)).await?;
         if let Some(secret) = secret {
             Authenticator::new(secret)
@@ -294,6 +300,18 @@ impl Client {
         // - carriers = clamped to the direct-carrier limit
         #[cfg(feature = "udp")]
         let (direct_key, direct_endpoint, direct_udp_carriers) = if options_udp {
+            // Never clamp silently: the vhost and SSH-jump constructors both
+            // warn on exactly this condition, and a public tunnel that asked
+            // for more direct carriers than the pool can hold used to get the
+            // smaller number with no line in the log (I-2 / BUG-S5 precedent).
+            if carriers as usize > crate::vhost::MAX_DIRECT_CARRIERS {
+                warn!(
+                    requested = carriers,
+                    cap = crate::vhost::MAX_DIRECT_CARRIERS,
+                    "public --carriers exceeds the QUIC direct-pool cap; clamping the DIRECT \
+                     pool (the TCP relay carrier pool still uses the full count)"
+                );
+            }
             (
                 Some(format!("port:{}", remote_port)),
                 Some(endpoint.clone()),
@@ -309,7 +327,14 @@ impl Client {
             local_host: local_host.to_string(),
             local_port,
             remote_port,
-            sends_ctrl_heartbeat: false,
+            // Public tunnels beat on the control substream (P-4). A public
+            // control substream is a yamux stream, so a half-open or abandoned
+            // peer is invisible to `send`/`recv` exactly as it was for secret
+            // and vhost providers: without a heartbeat the server can only
+            // notice the death when the TCP connection itself dies, which a
+            // wedged-but-alive peer never does — and the public PORT stays
+            // bound in the meantime.
+            sends_ctrl_heartbeat: true,
             #[cfg(feature = "udp")]
             udp_socket: None,
             #[cfg(feature = "udp")]
@@ -1049,10 +1074,13 @@ impl Client {
         // the whole session (the consumer already retries; the provider did not).
         // The first tick fires immediately, re-offering at once if needed.
         let mut udp_retry = tokio::time::interval(Duration::from_secs(15));
-        // Secret providers ping the server periodically so its recv-deadline
-        // reaper never trips on a healthy idle provider (a yamux substream hides
-        // a half-open peer). Public/vhost tunnels keep the legacy heartbeat-free
-        // path (branch disabled below).
+        // Every tunnel kind that the server reaps on a receive deadline pings it
+        // periodically, so the reaper never trips on a healthy idle peer (a yamux
+        // substream hides a half-open one). Secret providers, vhost providers,
+        // SSH-jump providers and — since P-4 — public tunnels all set
+        // `sends_ctrl_heartbeat`; the branch below is disabled for anything that
+        // does not, and the server correspondingly never applies a deadline to
+        // it (DEC-VE2).
         let mut ctrl_heartbeat = {
             let mut t = tokio::time::interval(crate::secret::ctrl_client_heartbeat());
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1394,16 +1422,31 @@ impl Client {
                         direct_renew_sleep = Some(Box::pin(tokio::time::sleep(delay)));
                     }
                 }
-                // A direct carrier came up: clear the renewal backoff so a later
-                // drop retries promptly, and cancel any pending renewal sleep.
+                // A direct carrier came up: the path works, so clear the
+                // renewal backoff — a later drop must retry promptly.
                 up = direct_up_rx.recv() => {
                     #[cfg(not(feature = "udp"))]
                     let _ = up;
                     #[cfg(feature = "udp")]
                     if up.is_some() {
                         direct_renew_backoff.reset();
-                        direct_renew_sleep = None;
-                        while direct_renew_rx.try_recv().is_ok() {}
+                        // Stand the renewal itself down ONLY once the pool has
+                        // actually reached its target. Cancelling it
+                        // unconditionally lost the shortfall in the ordinary
+                        // mixed outcome — one carrier fails fast (renewal
+                        // scheduled), another succeeds a moment later (renewal
+                        // cancelled, queue drained) — and NOTHING else tops the
+                        // direct pool up: unlike the TCP carrier pool, which has
+                        // `carrier_redial.tick()`, the direct pool is renewed
+                        // only by this signal. The tunnel then stayed below
+                        // target for the whole life of the control connection.
+                        if direct_renewal_stands_down(
+                            direct_live.load(Ordering::Relaxed),
+                            direct_udp_target,
+                        ) {
+                            direct_renew_sleep = None;
+                            while direct_renew_rx.try_recv().is_ok() {}
+                        }
                     }
                 }
                 // Managed port-mapping lease changed (Fase 5): the gateway
@@ -1630,6 +1673,26 @@ async fn resolve_direct_server_addr(endpoint: &Endpoint, port: u16) -> Result<So
         })?
         .find(SocketAddr::is_ipv4)
         .context("resolved no IPv4 address for the direct udp endpoint")
+}
+
+/// Whether a direct carrier coming up should stand the pending renewal down.
+///
+/// The policy, and the reason it is a named function rather than an inline
+/// comparison: a carrier coming up proves the PATH works, which is why the
+/// backoff is always reset — but it does not prove the POOL is whole. The
+/// renewal used to be cancelled unconditionally, which lost the shortfall in
+/// the ordinary mixed outcome where one carrier fails fast (a connect error is
+/// immediate) and another succeeds a round trip later: the failure schedules a
+/// renewal, the success then cancels it and drains the queue. Nothing else
+/// tops the direct pool up — unlike the TCP carrier pool, which has a periodic
+/// `carrier_redial` tick — so the tunnel stayed below target for the whole life
+/// of the control connection.
+///
+/// The wiring is exercised end to end by `scripts/perf/public_idle_window.sh`;
+/// this function is what pins the policy.
+#[cfg(feature = "udp")]
+pub(crate) fn direct_renewal_stands_down(live: usize, target: usize) -> bool {
+    live >= target
 }
 
 /// Establish one QUIC direct carrier toward the server and serve its
@@ -2109,4 +2172,48 @@ pub(crate) async fn connect_with_timeout(to: &str, port: u16) -> Result<TcpStrea
     // TCP_NODELAY (latency) + keepalive (stability on long, quiet transfers).
     tune_tcp(&stream);
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "udp")]
+    use super::direct_renewal_stands_down;
+
+    /// A carrier coming up must NOT stand the renewal down while the direct
+    /// pool is still short of its target.
+    ///
+    /// RED-CHECK: replacing the body with `true` (the behaviour before this
+    /// policy existed) fails the first two cases, which is exactly the bug —
+    /// a fast failure schedules a renewal, a slower success cancels it, and
+    /// the pool never returns to target because nothing else redials it.
+    #[cfg(feature = "udp")]
+    #[test]
+    fn direct_renewal_only_stands_down_once_the_pool_is_whole() {
+        assert!(
+            !direct_renewal_stands_down(1, 4),
+            "one live carrier out of four is a shortfall, not a healthy pool"
+        );
+        assert!(
+            !direct_renewal_stands_down(3, 4),
+            "a pool one carrier short must keep its scheduled renewal"
+        );
+        assert!(
+            direct_renewal_stands_down(4, 4),
+            "a whole pool stands the renewal down"
+        );
+        assert!(
+            direct_renewal_stands_down(5, 4),
+            "more carriers than asked for is still whole (the server may cap us lower)"
+        );
+    }
+
+    /// The single-carrier default, which is what almost every public tunnel
+    /// runs: one carrier up IS the whole pool, so the renewal stands down
+    /// exactly as it did before this change (zero behaviour delta).
+    #[cfg(feature = "udp")]
+    #[test]
+    fn direct_renewal_single_carrier_default_is_unchanged() {
+        assert!(!direct_renewal_stands_down(0, 1));
+        assert!(direct_renewal_stands_down(1, 1));
+    }
 }

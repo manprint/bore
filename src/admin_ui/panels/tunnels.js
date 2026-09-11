@@ -2,7 +2,7 @@
  * Tunnels panel: public tunnels table.
  */
 
-import { table, notesCell, fmtBytes, fmtDuration, escapeHtml, flagBadges, badgeCell } from '../ui.js';
+import { table, notesCell, fmtBytes, fmtDuration, escapeHtml, flagBadges, badgeCell, badge } from '../ui.js';
 import { DEFAULT_REFRESH_MS } from '../poller.js';
 import { openModal, detailRows } from '../modal.js';
 
@@ -32,10 +32,25 @@ export default {
         }
 
         const rows = data.map(tunnel => {
+            // Live data path, plus the fallback count when there is one to show.
+            // Identical rule to the Vhost panel (D5: one behaviour across
+            // sections): a `--udp` tunnel currently on the relay is the
+            // interesting state and gets a warning colour, a relay-only tunnel
+            // is simply "relay".
+            const path = tunnel.current_path ?? 'unknown';
+            const fallbacks = tunnel.direct_fallbacks ?? 0;
+            let pathKind = 'default';
+            if (path === 'direct') pathKind = 'success';
+            else if (path === 'relay') pathKind = tunnel.udp ? 'warning' : 'info';
+            const pathLabel = (path === 'relay' && tunnel.udp && fallbacks > 0)
+                ? `relay (${fallbacks} fallback${fallbacks === 1 ? '' : 's'})`
+                : path;
+
             const row = {
                 'Port': escapeHtml(String(tunnel.public_port ?? 'N/A')),
                 'Peer': escapeHtml(tunnel.peer ?? 'N/A'),
                 'Flags': badgeCell(flagBadges(tunnel)),
+                'Path': badge(pathLabel, pathKind),
                 'Connections': escapeHtml(String(tunnel.active ?? 0)),
                 'Uptime': escapeHtml(fmtDuration(tunnel.uptime_secs)),
                 'TX': escapeHtml(fmtBytes(tunnel.relay_tx_bytes)),
@@ -47,7 +62,7 @@ export default {
         });
 
         const tbl = table(
-            ['Port', 'Peer', 'Flags', 'Connections', 'Uptime', 'TX', 'RX', 'Notes'],
+            ['Port', 'Peer', 'Flags', 'Path', 'Connections', 'Uptime', 'TX', 'RX', 'Notes'],
             rows
         );
 

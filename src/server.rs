@@ -81,6 +81,33 @@ pub struct PublicDirectEntry {
     pub direct: vhost::DirectPool,
     /// Number of proxied requests that successfully opened a direct QUIC stream.
     pub direct_stream_opens: std::sync::atomic::AtomicU64,
+    /// Number of proxied connections that asked for the direct path and were
+    /// served on the warm TCP relay instead. Counted per tunnel, not only into
+    /// the server-wide metric, because the server-wide one cannot answer "is
+    /// THIS tunnel falling back?".
+    pub direct_fallbacks: std::sync::atomic::AtomicU64,
+    /// Transport the most recent proxied connection actually used
+    /// ([`vhost::VHOST_PATH_UNKNOWN`] / `_RELAY` / `_DIRECT`). No counter can
+    /// express this: a tunnel that negotiated direct and has since fallen back
+    /// for every connection is otherwise indistinguishable from a healthy one
+    /// (the same reason `VhostEntry::last_path` exists, phase 05.3).
+    pub last_path: std::sync::atomic::AtomicU8,
+}
+
+/// Snapshot of one public tunnel's direct-path state, as returned by
+/// [`Server::public_direct_stats`].
+#[cfg(feature = "udp")]
+#[derive(Debug, Clone, Copy)]
+pub struct PublicDirectStats {
+    /// Proxied connections that successfully opened a direct QUIC stream.
+    pub stream_opens: u64,
+    /// Proxied connections that fell back to the warm TCP relay.
+    pub fallbacks: u64,
+    /// Live QUIC carriers in this tunnel's direct pool.
+    pub carriers: usize,
+    /// [`vhost::VHOST_PATH_UNKNOWN`] / `_RELAY` / `_DIRECT` for the most recent
+    /// proxied connection.
+    pub last_path: u8,
 }
 
 /// Handle to the live registry of public-tunnel UDP direct paths, keyed by
@@ -149,6 +176,45 @@ pub(crate) async fn bind_public_listener(
         }
         Err("failed to find an available port")
     }
+}
+
+/// Send (or re-send) a public tunnel's direct-UDP offer, minting a FRESH nonce.
+///
+/// Factored out because the offer has two call sites that must never drift: the
+/// one made when the tunnel registers, and the one made in answer to a
+/// `PublicUdpRenew`. The nonce is regenerated on every offer, exactly as
+/// `vhost::send_vhost_udp_offer` does — carriers that already authenticated are
+/// unaffected (the token is only checked at handshake time) and a renewed dial
+/// must not be able to replay the previous one.
+#[cfg(feature = "udp")]
+async fn send_public_udp_offer(
+    control: &mut Delimited<mux::Stream>,
+    public_port: u16,
+    quic_port: u16,
+    pending: &Arc<DashMap<String, [u8; crate::shared::UDP_NONCE_LEN]>>,
+    tuning: crate::shared::UdpDirectTuning,
+) -> Result<()> {
+    let nonce = {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut n = [0u8; crate::shared::UDP_NONCE_LEN];
+        SystemRandom::new()
+            .fill(&mut n)
+            .expect("system CSPRNG must not fail");
+        n
+    };
+    pending.insert(format!("port:{public_port}"), nonce);
+    control
+        .send(ServerMessage::PublicUdp {
+            port: quic_port,
+            nonce,
+            tuning,
+        })
+        .await?;
+    info!(
+        port = public_port,
+        quic_port, "offered public direct udp path"
+    );
+    Ok(())
 }
 
 /// Log a finished connection's error at the level it deserves (F-3, phase 06.3).
@@ -408,6 +474,13 @@ pub struct Server {
     /// unrelated registry.
     vhost_ctrl_timeout: std::time::Duration,
 
+    /// Public tunnel receive deadline (P-4). Applied ONLY to a client that
+    /// declared `TunnelOptions::ctrl_heartbeat`; a legacy client is never reaped
+    /// (DEC-VE2) — it cannot beat, so a deadline would kill it every 60 s while
+    /// perfectly healthy. Separate from the other three so a focused liveness
+    /// test never perturbs an unrelated registry.
+    public_ctrl_timeout: std::time::Duration,
+
     /// Embedded SSH ingress gateway (Phase 4), when enabled via `--ssh-gateway`.
     #[cfg(feature = "ssh-gateway")]
     ssh_gateway: Option<Arc<crate::sshgw::SshGateway>>,
@@ -548,6 +621,7 @@ impl Server {
             secret_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
             ssh_jump_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
             vhost_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
+            public_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
             #[cfg(feature = "ssh-gateway")]
             ssh_gateway: None,
         }
@@ -572,6 +646,14 @@ impl Server {
     /// client's 20 s heartbeat.
     pub fn vhost_ctrl_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.vhost_ctrl_timeout = timeout;
+        self
+    }
+
+    /// Override the public-tunnel liveness timeout (tests only). Production
+    /// keeps [`secret::SECRET_CTRL_TIMEOUT`] (60 s), comfortably above the
+    /// client's 20 s heartbeat.
+    pub fn public_ctrl_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.public_ctrl_timeout = timeout;
         self
     }
 
@@ -801,7 +883,12 @@ impl Server {
         };
     }
 
-    /// Set the UDP port used by the vhost QUIC direct path.
+    /// Set the UDP port of the SHARED QUIC direct endpoint.
+    ///
+    /// Despite the name (kept for wire/flag compatibility) this is not a
+    /// vhost-only setting: the one endpoint serves vhost subdomains, public
+    /// tunnels (`port:N`) and SSH jump hosts (`jump:<alias>`), and it is bound
+    /// whenever the server runs with `--udp`, with or without a vhost config.
     pub fn set_vhost_quic_port(&mut self, port: u16) {
         self.vhost_quic_port = port;
         self.vhost_quic_port_explicit = true;
@@ -909,6 +996,28 @@ impl Server {
             .get(&key)
             .map(|entry| entry.direct.len())
             .unwrap_or(0)
+    }
+
+    /// Per-tunnel direct-path observability for a public tunnel, in ONE lookup:
+    /// `(successful stream opens, fallbacks to the relay, live QUIC carriers,
+    /// transport the last proxied connection actually used)`.
+    ///
+    /// `None` when this port has no direct path registered (the tunnel did not
+    /// ask for `--udp`, or the server has UDP disabled). Exists because the
+    /// server-wide `direct_fallbacks` metric cannot answer the question an
+    /// operator actually asks — "is THIS tunnel on QUIC right now?" — which is
+    /// the same gap `VhostEntry::last_path` closed for vhost (phase 05.3).
+    #[cfg(feature = "udp")]
+    pub fn public_direct_stats(&self, public_port: u16) -> Option<PublicDirectStats> {
+        let key = format!("port:{public_port}");
+        self.public_udp_registry
+            .get(&key)
+            .map(|entry| PublicDirectStats {
+                stream_opens: entry.direct_stream_opens.load(Ordering::Relaxed),
+                fallbacks: entry.direct_fallbacks.load(Ordering::Relaxed),
+                carriers: entry.direct.len(),
+                last_path: entry.last_path.load(Ordering::Relaxed),
+            })
     }
 
     /// Enable the vhost frontend with the given config.
@@ -1479,7 +1588,15 @@ impl Server {
                         warn!(%err, "failed to configure vhost QUIC endpoint; vhost --udp disabled")
                     }
                 },
-                Err(err) => warn!(%err, "failed to bind vhost QUIC endpoint; vhost --udp disabled"),
+                Err(err) => warn!(
+                    %err,
+                    port = this.vhost_quic_port,
+                    "failed to bind the shared QUIC direct endpoint; the direct UDP path is \
+                     disabled for vhost, public tunnels AND ssh jump hosts, and every tunnel \
+                     that asked for --udp will silently stay on the TCP relay. Choose a free \
+                     port with --vhost-quic-port (the default 443 needs root and collides with \
+                     any other HTTPS service on this host)."
+                ),
             }
         }
 
@@ -2401,33 +2518,24 @@ impl Server {
             let entry = Arc::new(PublicDirectEntry {
                 direct: vhost::DirectPool::default(),
                 direct_stream_opens: std::sync::atomic::AtomicU64::new(0),
+                direct_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                last_path: std::sync::atomic::AtomicU8::new(vhost::VHOST_PATH_UNKNOWN),
             });
             self.public_udp_registry.insert(key.clone(), entry);
 
-            // Generate a nonce for the direct-path handshake.
-            let nonce = {
-                use ring::rand::{SecureRandom, SystemRandom};
-                let mut n = [0u8; crate::shared::UDP_NONCE_LEN];
-                SystemRandom::new()
-                    .fill(&mut n)
-                    .expect("system CSPRNG must not fail");
-                n
-            };
-            self.pending_public_udp.insert(key.clone(), nonce);
-
-            // Offer the direct path to the client.
-            let tuning = self.udp_tuning;
-            if let Err(err) = control
-                .send(ServerMessage::PublicUdp {
-                    port: self.vhost_quic_port,
-                    nonce,
-                    tuning,
-                })
-                .await
+            // Offer the direct path to the client. Uses the same helper the
+            // renewal arm below uses, so a renewed offer can never drift from
+            // the first one.
+            if let Err(err) = send_public_udp_offer(
+                &mut control,
+                port,
+                self.vhost_quic_port,
+                &self.pending_public_udp,
+                self.udp_tuning,
+            )
+            .await
             {
                 warn!(%err, port, "failed to send PublicUdp offer");
-            } else {
-                info!(port, "offered public direct udp path");
             }
 
             Some(PublicDeregister {
@@ -2441,12 +2549,110 @@ impl Server {
 
         let mut heartbeat = interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        // Control-liveness reaper for public tunnels (P-4), the same shape the
+        // secret and vhost loops already use. A public tunnel holds a PUBLIC
+        // PORT, and the control substream is a yamux stream: a wedged-but-
+        // TCP-alive client (frozen process, suspended laptop, a peer whose
+        // kernel still ACKs) is invisible to both `send` (buffers into yamux)
+        // and `recv` (blocks forever), so the port stayed bound until the
+        // server restarted. `Option` IS the compat gate (DEC-VE2): only a
+        // client that declared `ctrl_heartbeat` — and therefore actually beats
+        // — is ever reaped; a legacy client gets `None` and the byte-identical
+        // historical behaviour.
+        let ctrl_timeout = opts.ctrl_heartbeat.then_some(self.public_ctrl_timeout);
+        let mut last_recv = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 _ = heartbeat.tick() => {
                     if control.send(ServerMessage::Heartbeat).await.is_err() {
                         // Assume that the client connection has been dropped.
                         return Ok(());
+                    }
+                    // Checked HERE, on the tick — never as `timeout(control.recv())`.
+                    // The heartbeat branch wins this `select!` every 500 ms and
+                    // would reset a recv timeout future before its deadline could
+                    // ever elapse (DEC-VE3).
+                    if let Some(deadline) = ctrl_timeout {
+                        if last_recv.elapsed() >= deadline {
+                            warn!(
+                                port,
+                                timeout = ?deadline,
+                                "public tunnel control idle; reaping (peer wedged/abandoned) \
+                                 and releasing the public port"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                // Messages FROM the public client. This arm used to not exist at
+                // all: the loop only ticked, accepted carriers and accepted
+                // connections, so anything the client sent on the control
+                // substream was never read. The visible consequence was that a
+                // public `--udp` tunnel whose direct path died sent exactly one
+                // `PublicUdpRenew`, waited for an answer that could not come and
+                // stayed on the TCP relay for the whole life of the control
+                // connection — measured at 100 s and still degraded
+                // (`scripts/perf/public_idle_window.sh recover`). The vhost
+                // provider loop and the SSH jump loop both answered their own
+                // renewal already; only this one did not.
+                msg = control.recv() => {
+                    // ANY frame proves the peer is alive, including the client's
+                    // own heartbeat. Advance before matching so an unexpected
+                    // frame still counts as liveness.
+                    last_recv = tokio::time::Instant::now();
+                    match msg {
+                        Ok(Some(ClientMessage::PublicUdpRenew { port: renew_port })) => {
+                            #[cfg(feature = "udp")]
+                            {
+                                if renew_port != port {
+                                    warn!(
+                                        tunnel_port = port,
+                                        requested = renew_port,
+                                        "public udp renew for a different port; ignoring"
+                                    );
+                                } else if opts.udp && self.udp {
+                                    if let Err(err) = send_public_udp_offer(
+                                        &mut control,
+                                        port,
+                                        self.vhost_quic_port,
+                                        &self.pending_public_udp,
+                                        self.udp_tuning,
+                                    )
+                                    .await
+                                    {
+                                        warn!(%err, port, "failed to re-send PublicUdp offer");
+                                        return Ok(());
+                                    }
+                                } else {
+                                    debug!(
+                                        port,
+                                        "ignoring public udp renew request while udp is disabled"
+                                    );
+                                }
+                            }
+                            #[cfg(not(feature = "udp"))]
+                            {
+                                let _ = renew_port;
+                                debug!(port, "ignoring public udp renew: built without udp");
+                            }
+                        }
+                        // A client heartbeat keeps the substream warm and is not
+                        // an error; everything else is unexpected on this loop
+                        // but must never tear the tunnel down.
+                        Ok(Some(ClientMessage::Heartbeat)) => {}
+                        Ok(Some(other)) => {
+                            debug!(port, message = %crate::shared::ControlFrameSummary::control_frame_summary(&other), "unexpected message from public client");
+                        }
+                        // EOF: the client closed its control substream. The
+                        // tunnel is over; returning here drops the registration
+                        // and frees the public port immediately instead of
+                        // waiting for the next heartbeat write to fail.
+                        Ok(None) => return Ok(()),
+                        Err(err) => {
+                            debug!(%err, port, "public control stream closed");
+                            return Ok(());
+                        }
                     }
                 }
                 // An extra connection joined the carrier pool. Cap the pool at the
@@ -2537,17 +2743,65 @@ impl Server {
                             };
                         // Try direct QUIC path first (DEC-LU4), fall back to relay on error.
                         #[cfg(feature = "udp")]
-                        let used_direct = if let Some(entry) = &public_direct_entry {
-                            if let Some(direct_conn) = entry.direct.pick() {
-                                if let Ok(mut stream) = direct_conn.open_stream().await {
-                                    // Write STREAM_READY marker (DEC-LU6) with optional caller IP (Phase 3).
-                                    let forward_ip = if client_wants_logging {
-                                        Some(addr.ip().to_string())
-                                    } else {
-                                        None
-                                    };
-                                    if mux::write_stream_ready(&mut stream, forward_ip.as_deref()).await.is_ok() {
+                        if let Some(entry) = &public_direct_entry {
+                            // Write STREAM_READY marker (DEC-LU6) with optional caller IP (Phase 3).
+                            let forward_ip = if client_wants_logging {
+                                Some(addr.ip().to_string())
+                            } else {
+                                None
+                            };
+                            // The deadline covers the open AND the marker write
+                            // TOGETHER, exactly as the vhost relay does
+                            // (`vhost::direct_open_timeout`, phase 05 F-14). On a
+                            // silent peer a half-open QUIC path accepts `open_bi`
+                            // and then never delivers the marker, so bounding only
+                            // the open would leave the whole QUIC idle timeout as
+                            // the loss window: measured at 10.00 s with
+                            // `http_code=000` before this bound existed
+                            // (`scripts/perf/public_idle_window.sh`).
+                            let direct_stream = match entry.direct.pick() {
+                                Some(direct_conn) => {
+                                    let deadline = crate::vhost::direct_open_timeout();
+                                    match tokio::time::timeout(deadline, async {
+                                        let mut stream = direct_conn.open_stream().await?;
+                                        mux::write_stream_ready(&mut stream, forward_ip.as_deref())
+                                            .await?;
+                                        anyhow::Ok(stream)
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(stream)) => Some(stream),
+                                        // An ANSWERED failure is not a timeout and
+                                        // is not conflated with one (the I-SSH10
+                                        // distinction): a client that is merely
+                                        // restarting must not look like a wedged
+                                        // path. Either way the SAME connection goes
+                                        // to the warm TCP relay.
+                                        Ok(Err(err)) => {
+                                            debug!(%err, port, "public QUIC open_stream failed; using the TCP relay");
+                                            None
+                                        }
+                                        Err(_) => {
+                                            warn!(
+                                                ?deadline,
+                                                port,
+                                                "public QUIC direct open timed out; serving this \
+                                                 connection on the warm TCP relay"
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                None => None,
+                            };
+                            if let Some(stream) = direct_stream {
+                                let mut stream = stream;
+                                {
                                         entry.direct_stream_opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        entry.last_path.store(
+                                            crate::vhost::VHOST_PATH_DIRECT,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
                                         let buf = proxy_buffer_size();
                                         // Count bytes LIVE as they flow (not only on close) so the
                                         // admin TX/RX columns update for long-lived connections.
@@ -2581,23 +2835,23 @@ impl Server {
                                             trace!(%err, "direct proxied connection closed");
                                         }
                                         return;
-                                    }
                                 }
                             }
-                            false
-                        } else {
-                            false
-                        };
-                        #[cfg(feature = "udp")]
-                        let _ = used_direct; // Silence unused variable warning (udp-only binding).
-
-                        // Direct path was attempted but failed; count the fallback.
-                        #[cfg(feature = "udp")]
-                        {
-                            if public_direct_entry.is_some() {
-                                direct_fallbacks
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
+                            // The direct path was offered and did not carry THIS
+                            // connection. Count it twice on purpose: once on the
+                            // tunnel (so an operator can see which tunnel is
+                            // degraded) and once server-wide (the existing
+                            // `direct_fallbacks` metric), and publish the path so a
+                            // permanently-degraded tunnel is not indistinguishable
+                            // from a healthy one.
+                            entry
+                                .direct_fallbacks
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            entry.last_path.store(
+                                crate::vhost::VHOST_PATH_RELAY,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            direct_fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
 
                         // Relay fallback. Announce the lazily-opened substream so the

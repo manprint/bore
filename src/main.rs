@@ -755,8 +755,10 @@ enum Command {
         #[clap(long, value_name = "PORT", env = "BORE_VHOST_HTTPS_PORT")]
         vhost_https_port: Option<u16>,
 
-        /// Shared UDP port for vhost/public/SSH-jump direct QUIC. Unset = use
-        /// the resolved vhost HTTPS port on UDP.
+        /// Shared UDP port for vhost/public/SSH-jump direct QUIC. Applies with
+        /// or without a vhost configuration: `bore server --udp` binds this one
+        /// endpoint for every direct path. Unset = the resolved vhost HTTPS
+        /// port on UDP, or 443 when no vhost is configured (which needs root).
         #[clap(long, value_name = "PORT", env = "BORE_VHOST_QUIC_PORT")]
         vhost_quic_port: Option<u16>,
 
@@ -1770,6 +1772,10 @@ async fn dispatch(command: Command) -> Result<()> {
                         local_host: Some(local_host.clone()),
                         local_port,
                         https_policy,
+                        // Declared by `Client::new`, which is also what actually
+                        // starts the heartbeat task: the two must never diverge,
+                        // so the CLI does not get a say (DEC-VE2).
+                        ctrl_heartbeat: false,
                     };
                     let connect = move || {
                         let (local_host, to, secret, options, access_logger) = (
@@ -2319,6 +2325,18 @@ async fn dispatch(command: Command) -> Result<()> {
                 None
             };
 
+            // The direct QUIC endpoint is ONE shared UDP socket serving vhost
+            // subdomains, PUBLIC tunnels (`port:N`) and SSH jump hosts
+            // (`jump:<alias>`) alike, and it is bound whenever `--udp` is on —
+            // never gated on the vhost configuration. So this flag must be
+            // applied unconditionally too: applied only inside the vhost block,
+            // a public-tunnels-only server silently ignored it and stayed on
+            // the 443 default, which needs root and collides with any real
+            // HTTPS service on the host. Must stay BEFORE `set_vhost`, which
+            // derives the port from the vhost config when it was not set here.
+            if let Some(port) = vhost_quic_port {
+                server.set_vhost_quic_port(port);
+            }
             if let Some(mut cfg) = vhost_cfg {
                 if let Some(domain) = vhost_base_domain {
                     cfg.base_domain = domain;
@@ -2359,9 +2377,6 @@ async fn dispatch(command: Command) -> Result<()> {
                             "vhost requires a base domain (set `base_domain` in --vhost-config or pass --vhost-base-domain / BORE_VHOST_BASE_DOMAIN)",
                         )
                         .exit();
-                }
-                if let Some(port) = vhost_quic_port {
-                    server.set_vhost_quic_port(port);
                 }
                 server.set_vhost(cfg)?;
                 if let Some(ref config_path) = vhost_config {

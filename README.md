@@ -2451,36 +2451,52 @@ combination for diagnosis. The deadline is deliberately below the direct path's 
 treated as a stalled path.
 
 **The admin page says which path a tunnel is on right now.** `/admin/api/v1/vhost`
-gained `current_path` (`direct` / `relay` / `unknown`) and `direct_fallbacks`, and
-the Vhost table shows a **Path** column that reads `relay (7 fallbacks)` for a
-`--udp` tunnel currently serving over the relay. `direct_stream_opens` now counts
-**successful** opens only — as an attempt counter it climbed during a total UDP
-blackout, which is precisely when an operator needs it to be honest.
+and `/admin/api/v1/tunnels` both carry `current_path` (`direct` / `relay` /
+`unknown`), `direct_fallbacks`, `direct_stream_opens` and `direct_pool`, and both
+the Vhost and the Public Tunnels tables show a **Path** column that reads
+`relay (7 fallbacks)` for a `--udp` tunnel currently serving over the relay.
+`direct_stream_opens` counts **successful** opens only — as an attempt counter it
+climbed during a total UDP blackout, which is precisely when an operator needs it
+to be honest. The per-tunnel `direct_fallbacks` matters because the server-wide
+metric of the same name cannot answer the question an operator actually asks,
+which is whether *this* tunnel is degraded.
+
+**The same 3-second bound applies to a public `--udp` tunnel.** `bore local --udp`
+opens the direct stream for each inbound connection under the same deadline and
+falls back to the warm TCP relay in place, and a public tunnel that loses its
+direct path now re-requests an offer and recovers it without reconnecting. Before
+that, a public tunnel whose direct path died stayed relay-only for the whole life
+of the control connection — measured still degraded 100 seconds after the path had
+healed, against 5 seconds now.
 
 ### Control liveness (abandoned registration reaper)
 
-A `bore vhost` provider sends a control heartbeat every 20 seconds on its control
-substream. The server tracks the last frame received from the provider and, checked on
-its own 500 ms control tick, drops a registration that has been silent for 60 seconds,
-freeing the subdomain for the next provider that claims it.
+Native `bore local` (public), `bore vhost`, `bore proxy` and `bore sshjhost` clients all
+send a control heartbeat every 20 seconds on their control substream. The server tracks
+the last frame received and, checked on its own 500 ms control tick, drops a registration
+that has been silent for 60 seconds — freeing the **subdomain** for a vhost provider and
+the **public port** for a `bore local` tunnel.
 
 This matters because the control substream is multiplexed over the tunnel's TCP
-connection: a provider whose host was suspended, whose process is wedged, or whose
+connection: a client whose host was suspended, whose process is wedged, or whose
 network went away without closing the socket stays *invisibly* alive — the server's
 `send` buffers into the muxer and its `recv` blocks forever. Without the deadline the
-subdomain stayed occupied by a dead provider until the server was restarted.
+subdomain, or the public port, stayed occupied by a dead client until the server was
+restarted. For a public tunnel that is the more painful of the two when the server runs
+a narrow `--min-port`/`--max-port` range, because a handful of zombies exhaust it.
 
 Two consequences worth knowing:
 
 - **A healthy but idle tunnel is never reaped.** The heartbeat interval (20 s) is far
   below the deadline (60 s), so a tunnel that simply carries no traffic keeps its
-  subdomain.
-- **A provider older than this feature is never reaped.** The capability is declared on
+  subdomain or port.
+- **A client older than this feature is never reaped.** The capability is declared on
   the wire during registration; a client that does not declare it keeps the previous
   heartbeat-free behaviour, because reaping a client that *cannot* heartbeat would kill a
-  healthy tunnel every 60 seconds. A stuck subdomain held by such an old client still
-  needs the provider to be restarted manually — upgrade the client to get automatic
-  recovery.
+  healthy tunnel every 60 seconds. A stuck subdomain or port held by such an old client
+  still needs the client to be restarted manually — upgrade the client to get automatic
+  recovery. (Public tunnels gained the capability after vhost and secret tunnels did, so
+  an older `bore local` is exactly this case.)
 
 Providers registered through the SSH gateway (`ssh -R vhost/...`) are not covered by this
 reaper and do not need to be: the gateway has its own bounded channel-open plus

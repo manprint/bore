@@ -618,8 +618,13 @@ const DIRECT_OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 /// (`BORE_DIRECT_OPEN_TIMEOUT_MS`), read per call. Same pattern as
 /// `ssh_open_timeout`'s `BORE_SSH_OPEN_TIMEOUT_MS`, which is also what this
 /// deadline is modelled on.
+///
+/// Shared with the PUBLIC tunnel accept loop (`Server::serve_tunnel`), which
+/// bounds its own direct open with exactly this deadline: the two paths used to
+/// differ, and the unbounded one lost its first connection for the whole QUIC
+/// idle timeout.
 #[cfg(feature = "udp")]
-fn direct_open_timeout() -> Duration {
+pub(crate) fn direct_open_timeout() -> Duration {
     match std::env::var("BORE_DIRECT_OPEN_TIMEOUT_MS") {
         Ok(ms) => match ms.parse::<u64>() {
             Ok(ms) if ms > 0 => Duration::from_millis(ms),

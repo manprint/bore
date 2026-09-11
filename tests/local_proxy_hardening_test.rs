@@ -12,8 +12,9 @@ use std::time::Duration;
 use anyhow::Result;
 use bore_cli::{
     client::Client,
+    mux,
     server::Server,
-    shared::{TunnelOptions, CONTROL_PORT},
+    shared::{ClientMessage, Delimited, ServerMessage, TunnelOptions, CONTROL_PORT},
     transport,
     weblog::{AccessLogConfig, AccessLogger},
 };
@@ -547,5 +548,218 @@ async fn local_access_log_raw() -> Result<()> {
         content
     );
 
+    Ok(())
+}
+
+// ─── Public control-liveness group (P-4 reaper, control=17980..17983) ────────
+//
+// A public tunnel that is ALIVE at TCP level but DEAD at application level (a
+// frozen process, a suspended laptop, a peer whose kernel still ACKs) used to
+// hold its PUBLIC PORT forever. The control channel is a yamux substream, so a
+// half-open peer is invisible to BOTH `send` (buffers into yamux) and `recv`
+// (blocks forever) — the exact shape already fixed for secret tunnels and then
+// for vhost (F-1). Public was explicitly left on the legacy heartbeat-free path
+// at the time; P-4 closes it now that `serve_tunnel` reads its control stream
+// at all.
+//
+// Each test owns its OWN control port and a SINGLE-PORT public range. The
+// single-port range is what makes the reap observable: the released port is not
+// merely absent from an internal map, it becomes registrable again — a freed
+// slot that still refuses the port would leave the operator exactly as stuck.
+//
+// These tests hold the opener AND the control substream so the TCP connection
+// stays UP while nothing is ever sent: wedged, not closed. Dropping the client
+// would merely exercise the ordinary disconnect path, which already worked.
+
+const PUB_LIVE_REAP: (u16, u16) = (17980, 17981);
+const PUB_LIVE_LEGACY: (u16, u16) = (17982, 17983);
+const PUB_LIVE_CLIENT: (u16, u16) = (17984, 17985);
+
+/// Spawn a server whose public reap deadline is `ctrl_timeout` and whose public
+/// port range holds exactly `public_port`.
+async fn spawn_pub_live_server(
+    (control_port, public_port): (u16, u16),
+    ctrl_timeout: Duration,
+) -> Result<()> {
+    wait_port(control_port, false).await;
+    let mut server = Server::new(public_port..=public_port, None).public_ctrl_timeout(ctrl_timeout);
+    server.set_control_port(control_port);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    tokio::spawn(server.listen());
+    wait_port(control_port, true).await;
+    Ok(())
+}
+
+/// Wait until `port` is accepting (`listening`) or fully released.
+async fn wait_port(port: u16, listening: bool) {
+    for _ in 0..500 {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() == listening {
+            return;
+        }
+        time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A raw control substream, so the test controls exactly what is sent — a real
+/// `Client` beats on its own and could never wedge.
+async fn pub_raw_control(control_port: u16) -> Result<(mux::Opener, Delimited<mux::Stream>)> {
+    let tcp = TcpStream::connect(("127.0.0.1", control_port)).await?;
+    let (opener, _acc) = mux::client(tcp);
+    let stream = opener.open().await?;
+    Ok((opener, Delimited::new(stream)))
+}
+
+/// `TunnelOptions` for a public tunnel, declaring the heartbeat capability or
+/// not. `ctrl_heartbeat: false` is byte-equivalent to an old binary, which omits
+/// the field entirely (`#[serde(default)]`).
+fn pub_opts_live(ctrl_heartbeat: bool) -> TunnelOptions {
+    TunnelOptions {
+        ctrl_heartbeat,
+        ..Default::default()
+    }
+}
+
+/// Register a public tunnel over a raw control stream and return the server's
+/// answer, keeping the connection alive in the returned handles.
+async fn pub_register(
+    control_port: u16,
+    port: u16,
+    ctrl_heartbeat: bool,
+) -> Result<(mux::Opener, Delimited<mux::Stream>, Option<ServerMessage>)> {
+    let (opener, mut control) = pub_raw_control(control_port).await?;
+    control
+        .send(ClientMessage::Hello(port, pub_opts_live(ctrl_heartbeat)))
+        .await?;
+    let reply = control.recv::<ServerMessage>().await?;
+    Ok((opener, control, reply))
+}
+
+/// Poll until the single public port is grantable again, up to `ms`.
+async fn wait_public_port_free(control_port: u16, port: u16, ms: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+    loop {
+        if let Ok((_o, _c, Some(ServerMessage::Hello(granted)))) =
+            pub_register(control_port, port, true).await
+        {
+            return granted == port;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// P-4: a wedged public client that DECLARED the heartbeat capability is reaped
+/// and its public port becomes grantable again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_wedged_client_is_reaped_and_port_freed() -> Result<()> {
+    spawn_pub_live_server(PUB_LIVE_REAP, Duration::from_millis(700)).await?;
+    let port = PUB_LIVE_REAP.1;
+
+    // Register, then go silent while holding the connection open.
+    let (_opener, _control, reply) = pub_register(PUB_LIVE_REAP.0, port, true).await?;
+    assert!(
+        matches!(reply, Some(ServerMessage::Hello(p)) if p == port),
+        "server grants the only public port in range: {reply:?}"
+    );
+    wait_port(port, true).await;
+
+    // While it is held, the port is genuinely unavailable — otherwise the
+    // re-registration below would prove nothing about the reaper.
+    let (_o2, _c2, busy) = pub_register(PUB_LIVE_REAP.0, port, true).await?;
+    assert!(
+        matches!(busy, Some(ServerMessage::Error(_))),
+        "the single public port must be refused while a live tunnel holds it: {busy:?}"
+    );
+    drop((_o2, _c2));
+
+    assert!(
+        wait_public_port_free(PUB_LIVE_REAP.0, port, 5000).await,
+        "a wedged public client past public_ctrl_timeout must be reaped and its \
+         port re-granted — before P-4 the port stayed bound until server restart"
+    );
+    Ok(())
+}
+
+/// DEC-VE2: a legacy client CANNOT beat, so applying the deadline to it would
+/// kill a healthy idle tunnel every 60 s. It must never be reaped. This is the
+/// red-check for the `Option` gate: widening the reaper to an unconditional
+/// timeout fails exactly here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_legacy_client_without_capability_is_never_reaped() -> Result<()> {
+    spawn_pub_live_server(PUB_LIVE_LEGACY, Duration::from_millis(400)).await?;
+    let port = PUB_LIVE_LEGACY.1;
+
+    let (_opener, _control, reply) = pub_register(PUB_LIVE_LEGACY.0, port, false).await?;
+    assert!(matches!(reply, Some(ServerMessage::Hello(p)) if p == port));
+    wait_port(port, true).await;
+
+    // Silent across several 400 ms deadlines, and still holding the port.
+    time::sleep(Duration::from_millis(2000)).await;
+    let (_o2, _c2, busy) = pub_register(PUB_LIVE_LEGACY.0, port, true).await?;
+    assert!(
+        matches!(busy, Some(ServerMessage::Error(_))),
+        "a client that never declared ctrl_heartbeat must keep the legacy \
+         un-reaped path (DEC-VE2), so its port stays held: {busy:?}"
+    );
+    Ok(())
+}
+
+/// The real client must actually send what it declares. A client that sets
+/// `TunnelOptions::ctrl_heartbeat: true` and then fails to beat converts every
+/// healthy tunnel into a reaped one — the worst possible combination, and
+/// invisible to the raw-control tests above, which drive the wire by hand.
+///
+/// The margin has to be the right way round or the test proves nothing: the
+/// idle period must EXCEED the server deadline while the client's beat interval
+/// stays comfortably under it. `BORE_CTRL_HEARTBEAT_MS` shrinks the client's
+/// 20 s beat so that is expressible in a fast test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_real_client_survives_past_the_reap_deadline() -> Result<()> {
+    // Client beats every 150 ms; server reaps after 700 ms; we idle for 2.5 s.
+    // So ~16 beats must land inside a window covering three deadlines.
+    std::env::set_var("BORE_CTRL_HEARTBEAT_MS", "150");
+    spawn_pub_live_server(PUB_LIVE_CLIENT, Duration::from_millis(700)).await?;
+    let port = PUB_LIVE_CLIENT.1;
+
+    let echo = TcpListener::bind("127.0.0.1:0").await?;
+    let echo_port = echo.local_addr()?.port();
+    tokio::spawn(async move {
+        while let Ok((mut conn, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let _ = conn.write_all(b"alive").await;
+            });
+        }
+    });
+
+    let client = Client::new(
+        "127.0.0.1",
+        echo_port,
+        &format!("127.0.0.1:{}", PUB_LIVE_CLIENT.0),
+        port,
+        None,
+        false,
+        TunnelOptions::default(),
+        None,
+    )
+    .await?;
+    assert_eq!(client.remote_port(), port);
+    tokio::spawn(client.listen());
+    wait_port(port, true).await;
+
+    time::sleep(Duration::from_millis(2500)).await;
+    std::env::remove_var("BORE_CTRL_HEARTBEAT_MS");
+
+    // The tunnel must still SERVE, not merely look registered: a reaped tunnel
+    // drops its listener, so a successful round trip is the real assertion.
+    let mut conn = TcpStream::connect(("127.0.0.1", port)).await?;
+    let body = read_some(&mut conn).await?;
+    assert_eq!(
+        &body, b"alive",
+        "the real public client must keep its tunnel alive by beating — it \
+         declared ctrl_heartbeat on the wire, so the server WILL reap it if the \
+         frames do not arrive"
+    );
     Ok(())
 }

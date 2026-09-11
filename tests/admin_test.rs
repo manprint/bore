@@ -538,6 +538,10 @@ fn t_views_serialize_stable() {
         uptime_secs: 100,
         relay_tx_bytes: 1024,
         relay_rx_bytes: 2048,
+        direct_stream_opens: 0,
+        direct_fallbacks: 0,
+        direct_pool: 0,
+        current_path: "unknown".into(),
         transport: bore_cli::admin::Transport::Bore,
         identity: None,
     };

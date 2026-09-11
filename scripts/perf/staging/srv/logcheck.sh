@@ -7,9 +7,14 @@ set -uo pipefail
 . "$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
 
 
-$SSH 'sudo -n docker logs bore-server > /tmp/bl.txt 2>&1; wc -l < /tmp/bl.txt' | sed 's/^/  total log lines: /'
-$SSH 'grep -c " WARN " /tmp/bl.txt || true' | sed 's/^/  WARN lines: /'
-$SSH 'grep -c " ERROR " /tmp/bl.txt || true' | sed 's/^/  ERROR lines: /'
-$SSH 'grep -ci "close_notify" /tmp/bl.txt || true' | sed 's/^/  close_notify mentions: /'
+# NOTE `srv`, not `$SSH`: `$SSH` in lib.sh carries the ssh OPTIONS only, with no
+# host, so `$SSH "cmd"` would try to connect to a host literally named by the
+# command string. These commands all run on the SERVER host.
+[ -n "$BORE_SRV" ] || { echo "BORE_SRV is not set in env.sh; nothing to audit" >&2; exit 2; }
+C="$BORE_SRV_CONTAINER"
+srv "sudo -n docker logs $C > /tmp/bl.txt 2>&1; wc -l < /tmp/bl.txt" | sed 's/^/  total log lines: /'
+srv 'grep -c " WARN " /tmp/bl.txt || true' | sed 's/^/  WARN lines: /'
+srv 'grep -c " ERROR " /tmp/bl.txt || true' | sed 's/^/  ERROR lines: /'
+srv 'grep -ci "close_notify" /tmp/bl.txt || true' | sed 's/^/  close_notify mentions: /'
 echo "  the WARN lines themselves, deduplicated by message:"
-$SSH 'grep " WARN " /tmp/bl.txt | sed "s/^[^ ]* *//" | sed "s/subdomain=[a-z0-9]*/subdomain=<label>/g" | sort | uniq -c | sort -rn | head -12' | sed 's/^/    /'
+srv 'grep " WARN " /tmp/bl.txt | sed "s/^[^ ]* *//" | sed "s/subdomain=[a-z0-9]*/subdomain=<label>/g" | sed "s/port=[0-9]*/port=<port>/g" | sort | uniq -c | sort -rn | head -12' | sed 's/^/    /'

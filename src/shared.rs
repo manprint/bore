@@ -407,6 +407,18 @@ pub struct TunnelOptions {
     /// to the pre-policy behavior). `#[serde(default)]` keeps the wire backward-compatible.
     #[serde(default)]
     pub https_policy: Option<HttpsPolicy>,
+    /// Whether this client sends periodic [`ClientMessage::Heartbeat`] frames on
+    /// the public tunnel's control substream.
+    ///
+    /// This is the compat gate for the public control-liveness reaper, exactly as
+    /// `HelloVhost::ctrl_heartbeat` is for vhost (DEC-VE2): the server applies a
+    /// receive deadline ONLY to a client that declared it. `#[serde(default)]`
+    /// means an old client reads as `false` and is therefore NEVER reaped —
+    /// reaping a client that cannot heartbeat would kill a healthy idle tunnel
+    /// every deadline. Never set this without also setting
+    /// `Client::sends_ctrl_heartbeat`.
+    #[serde(default)]
+    pub ctrl_heartbeat: bool,
 }
 
 /// Options negotiated by two `bore test-udp` peers once the server pairs them.
@@ -2675,6 +2687,11 @@ mod tests {
             !opts.auto_reconnect,
             "missing auto_reconnect defaults to false"
         );
+        assert!(
+            !opts.ctrl_heartbeat,
+            "a legacy client that cannot beat must read as ctrl_heartbeat=false, \
+             so the server never applies the public reap deadline to it (DEC-VE2)"
+        );
 
         // Round-trip with the new field set survives.
         let full = TunnelOptions {
@@ -2690,11 +2707,13 @@ mod tests {
             local_host: None,
             local_port: 0,
             https_policy: None,
+            ctrl_heartbeat: true,
         };
         let json = serde_json::to_string(&full).unwrap();
         let back: TunnelOptions = serde_json::from_str(&json).unwrap();
         assert!(back.auto_reconnect);
         assert_eq!(back.carriers, 4);
+        assert!(back.ctrl_heartbeat);
     }
 
     #[test]

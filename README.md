@@ -2079,9 +2079,12 @@ correctness test cannot: descriptors and resident memory across 800–1 000 prox
 connections on both transports, a wedge probe (16 held connections plus bulk waves killed
 mid-flight, then a timed fresh round-trip), the control-liveness reaper against a
 SIGSTOPped consumer, the punch socket's real `rb`/`tb` from `ss -uapm`, and the
-relay→direct upgrade being REPORTED to the server. Arms: `all` (default), `churn-relay`,
-`churn-direct`, `stall`, `stall-direct`, `reap`, `upgrade`, `udpbuf`. Every churn verdict
-is a rate over four identical phases, not a before/after pair — see
+relay→direct upgrade being REPORTED to the server, plus the WORST-CASE time that upgrade
+can take (`upgrade-late` holds the provider back for 90 s so the exponential backoff has
+climbed, then asserts the tunnel leaves the relay within 75 s — the cap, `UDP_UPGRADE_MAX_SECS`,
+is what that number measures). Arms: `all` (default), `churn-relay`,
+`churn-direct`, `stall`, `stall-direct`, `reap`, `upgrade`, `upgrade-late`, `udpbuf`. Every
+churn verdict is a rate over four identical phases, not a before/after pair — see
 [`scripts/perf/README.md`](scripts/perf/README.md).
 
 ## VPN — point-to-point L3 tunnel

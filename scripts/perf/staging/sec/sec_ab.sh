@@ -112,12 +112,35 @@ one_arm() {
     echo "${r:-0} $path ${fb:-0} $ttd"
 }
 
+# A pair enters the median only when BOTH of its arms are real measurements,
+# and there are exactly two ways an arm is not one:
+#
+#   * it never ran        -> one_arm printed rate 0 with path startfail /
+#                            noprovider / noconsumer;
+#   * the --udp arm is on the RELAY -> path relay(fb=N). That arm measures the
+#                            relay twice, so its ratio sits near 1.0 and
+#                            folding it in reports a TRAVERSAL failure as a
+#                            performance result. The fallback RATE is S2's
+#                            job (sec_ttd.sh), never S1's median.
+#
+# This is not hypothetical: s1-vm-ws `get` reported a median of 0.965 with two
+# startfail rows, because a failed arm entered the list as the ratio 0 and
+# dragged the median down to the smallest of the three arms that actually ran
+# (0.965 / 1.247 / 1.218, true median 1.218). The rows stay printed either way
+# — an excluded pair must remain VISIBLE, or the exclusion becomes the new way
+# to hide a failure.
+arm_is_measurement() { # <rate> <path> -> 0 when the arm measured something
+    case "$2" in startfail|noprovider|noconsumer|"relay(fb="*) return 1 ;; esac
+    case "$1" in ''|0|0.0|0.00) return 1 ;; esac
+    return 0
+}
+
 paired() { # <title> <dirn>
     local title="$1" dirn="$2"
     echo
     echo "===== $title ($dirn, topology $TOPO) ====="
     printf '  %-5s %10s %10s %8s   %s\n' pair relay direct ratio "paths (ttd ms)"
-    local rs=() i a b pa pb ta tb
+    local rs=() i a b pa pb ta tb dropped=0
     for i in $(seq "$PAIRS"); do
         if [ $((i % 2)) = 1 ]; then
             read -r a pa _ ta <<<"$(one_arm "$dirn")"; cool
@@ -126,10 +149,22 @@ paired() { # <title> <dirn>
             read -r b pb _ tb <<<"$(one_arm "$dirn" --udp)"; cool
             read -r a pa _ ta <<<"$(one_arm "$dirn")"; cool
         fi
-        local r; r=$(ratio "$b" "$a"); rs+=("$r")
+        local r
+        if arm_is_measurement "$a" "$pa" && arm_is_measurement "$b" "$pb"; then
+            r=$(ratio "$b" "$a"); rs+=("$r")
+        else
+            r="-"; dropped=$((dropped+1))
+        fi
         printf '  %-5s %10s %10s %8s   %s / %s (%s)\n' "$i" "$a" "$b" "$r" "$pa" "$pb" "$tb"
     done
-    echo "  median ratio direct/relay: $(printf '%s\n' "${rs[@]}" | med)"
+    if [ "${#rs[@]}" -gt 0 ]; then
+        echo "  median ratio direct/relay: $(printf '%s\n' "${rs[@]}" | med)   (n=${#rs[@]} of $PAIRS pairs)"
+    else
+        echo "  median ratio direct/relay: n/a — no pair produced two valid arms"
+    fi
+    if [ "$dropped" -gt 0 ]; then
+        echo "  EXCLUDED $dropped of $PAIRS pairs: an arm failed to start, or the --udp arm stayed on the relay (see the rows above)"
+    fi
 }
 
 sec_start_origin "$TOPO" || exit 1

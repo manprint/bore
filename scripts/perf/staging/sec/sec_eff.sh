@@ -27,6 +27,15 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 TOPO="${TOPO:-vm-ws}"
 GIB="${GIB:-2}"
 CONNS="${CONNS:-4}"
+# GIB and CONNS go straight into a shell arithmetic expansion, which on a
+# non-integer does NOT abort the script: `$(( 0.25 * ... ))` prints a syntax
+# error to stderr, leaves PER unset, and every arm then transfers whatever
+# `$PER` expands to. A smoke run with GIB=0.25 moved 1 MiB in under a second
+# and still printed a row, with an empty MB/s and t0 == t1 — a result shaped
+# exactly like a real one. Reject it here instead.
+case "$GIB" in ''|*[!0-9]*) echo "GIB must be a positive integer (got '$GIB')" >&2; exit 2 ;; esac
+case "$CONNS" in ''|*[!0-9]*) echo "CONNS must be a positive integer (got '$CONNS')" >&2; exit 2 ;; esac
+[ "$GIB" -gt 0 ] && [ "$CONNS" -gt 0 ] || { echo "GIB and CONNS must be > 0" >&2; exit 2; }
 PER=$(( GIB * 1073741824 / CONNS ))
 PP="$SEC_PROXY_PORT"
 
@@ -57,6 +66,16 @@ arm() { # <label> <flags...>
     start_consumer "$id" "$@"
     sec_wait secretconsumer "$id" || { echo "  $label: consumer never registered"; sec_down "$id" ${PROV_PID:-} ${CONS_PID:-}; return 1; }
     drive get 1048576 1 >/dev/null 2>&1
+    # A --udp arm must be ON the direct path BEFORE the window opens, and this
+    # is not pedantry: on 2026-09-11 the vm-ws direct arm opened its window
+    # while the peer's QUIC listener was still coming up (the S-5 stall: the
+    # provider's check round finished `nominated=None checks_ms=1126` at
+    # 21:40:30.592 while the consumer had nominated and was already dialing at
+    # 21:40:29.684), the transfer collapsed, and the stage printed
+    # `0.00 MB/s path=unknown` in a 1-second window — a row shaped like a
+    # result. sec_ab.sh already waited here; this stage did not.
+    local ttd="n/a"
+    case " $* " in *" --udp "*) ttd="$(sec_time_to_direct "$id" 30)" ;; esac
     local t0 t1 r path fb
     t0=$(date +%s)
     r=$(drive get "$PER" "$CONNS")
@@ -68,13 +87,27 @@ arm() { # <label> <flags...>
     local rtx rrx
     rtx="$(sec_field secretconsumer "$id" relay_tx_bytes 0)"
     rrx="$(sec_field secretconsumer "$id" relay_rx_bytes 0)"
-    printf '  %-8s %8s MB/s  path=%-7s fb=%-3s relay_tx=%-12s relay_rx=%-12s window=%s-%s gib=%s\n' \
-        "$label" "$r" "$path" "$fb" "$rtx" "$rrx" "$t0" "$t1" "$GIB"
+    # An arm that did not run on the transport it is named after is NOT a
+    # measurement of that transport, and a CPU-per-GiB figure reduced from its
+    # window would be attributed to the wrong path. Say so on the row, and say
+    # it in a form no downstream reduction can mistake for a rate.
+    local verdict=ok
+    case "$label" in
+        direct) [ "$path" = direct ] || verdict="INVALID (ran on '$path', not direct)" ;;
+        relay)  [ "$path" = relay  ] || verdict="INVALID (ran on '$path', not relay)"  ;;
+    esac
+    [ "$t1" -gt "$t0" ] || verdict="INVALID (empty window, ${t0}-${t1})"
+    printf '  %-8s %8s MB/s  path=%-7s fb=%-3s ttd=%-6s relay_tx=%-12s relay_rx=%-12s window=%s-%s gib=%s%s\n' \
+        "$label" "$r" "$path" "$fb" "$ttd" "$rtx" "$rrx" "$t0" "$t1" "$GIB" \
+        "$([ "$verdict" = ok ] || printf '  <<< %s' "$verdict")"
     sec_down "$id" ${PROV_PID:-} ${CONS_PID:-}
     cool
+    [ "$verdict" = ok ]
 }
 
-arm relay
-arm direct --udp
+RC=0
+arm relay      || RC=1
+arm direct --udp || RC=1
+[ "$RC" = 0 ] || echo "  one or more arms are INVALID — do not reduce their windows"
 echo
 echo DONE

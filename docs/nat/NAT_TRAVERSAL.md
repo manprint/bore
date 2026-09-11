@@ -1109,3 +1109,117 @@ di punch: **l'unico errore che può terminare un giro è la scadenza**, non un
 errore per datagramma. E l'oracolo di questa classe di difetti è il job
 `windows-latest` della CI, perché su Linux il difetto è irreproducibile per
 proprietà del kernel — stessa regola già in vigore per il backend macOS.
+
+## 21. La consegna del socket al QUIC: perché il *listener* non deve aspettare (S-5)
+
+Questa sezione non descrive una tecnica di traversal nuova. Descrive il
+**confine** fra il giro di check e il QUIC, che è dove, misurando, si nascondeva
+il secondo di latenza più costoso dell'intero percorso diretto.
+
+### 21.1 La forma del problema
+
+`listener_checks_then_quic` fa tre cose *in sequenza*: esegue il giro di
+connectivity check, riprende il socket dall'attore (`into_socket`), e solo a
+quel punto costruisce l'endpoint QUIC. Il socket è uno solo e ha un solo
+proprietario alla volta — è l'invariante di `UdpTraversalSocket`, ed è giusta.
+Ne segue però una conseguenza che non era stata prezzata: **finché il giro dura,
+su quel socket non c'è nulla che sappia rispondere a un Initial QUIC.**
+
+Dall'altra parte il dialer fa il contrario: appena una coppia è validata,
+nomina, *disabilita il proprio responder* («i frame in ritardo si contano, non si
+rispondono» — è il contratto del giro) e chiama. Il dialer, cioè, smette di
+rispondere esattamente quando il listener avrebbe più bisogno di una risposta.
+
+Se il piano adattivo del listener mette i candidati *locali* del peer nel primo
+gruppo — cosa corretta, perché una coppia in LAN si chiude lì — il gruppo
+riflessivo arriva un `CHECK_GROUP_STAGGER` (150 ms) più tardi, e a quel punto
+l'indirizzo che sta sondando ha già smesso di rispondere. Il suo giro finisce
+*a secco*, quindi consuma tutta la finestra.
+
+### 21.2 La misura (staging, 2026-09-11)
+
+`direct_ready_ms` sul consumer, 27 stabilimenti, topologia `vm-ws`:
+
+```
+37 40 41 42 42 43 43 44 44 48 49 49 50 52 52 52 52 53      <- 18
+1036 1043 1043 1044 1044 1045 1050 1052 1162               <-  9
+```
+
+Bimodale, senza nulla in mezzo. Una distribuzione con un buco così non è mai la
+rete: è un timer. E il timer si identifica in una riga: `333 ms + 4 × 166 ms =
+999 ms` è il PTO iniziale di quinn con l'`initial_rtt` di default della RFC
+9002. Il primo Initial viene perso perché arriva mentre il listener è ancora nel
+giro, e non viene ritrasmesso prima di un secondo.
+
+I log lo dicono in chiaro, appaiati:
+
+```
+consumer  role=Dialer   nominated=Some(...)  checks_ms=213   -> direct_ready_ms=1050
+provider  role=Listener nominated=None       checks_ms=1126
+```
+
+La precondizione lato listener è contabile: **8 giri su 52** lato VM sono finiti
+`nominated=None`, contro **0 su 22** lato workstation. Stessa asimmetria dello
+stallo, stessa proporzione.
+
+### 21.3 La correzione
+
+Un listener che ha appena risposto a una richiesta autenticata possiede già
+tutto ciò che la sua metà del giro può produrre: il peer ha la chiave, è su
+questa generazione, gioca il ruolo opposto e **ci raggiunge** da quel `src`.
+Tutto ciò che viene dopo è una mossa del dialer, e il dialer la fa non appena la
+propria nomina si completa — cosa che la nostra risposta è ciò che provoca.
+Restare nel giro non migliora il percorso: tiene solo il socket lontano dal QUIC
+proprio mentre il primo Initial sta arrivando.
+
+Quindi il listener nomina la sorgente autenticata ed esce. Due dettagli portano
+il peso:
+
+* **la risposta va sul filo prima che il giro venga smontato.** L'attore
+  annunciava la richiesta al driver mentre teneva ancora i byte di risposta;
+  siccome finire il giro ferma l'attore, annunciare per primo poteva mangiarsi
+  l'unico datagramma che il dialer sta aspettando. `CheckAction` porta `reply` e
+  `announce` separati, e `recv_actor` **prima invia, poi annuncia**;
+* **`nominated` viene valorizzato**, non lasciato vuoto: è ciò che disattiva
+  l'escape spray della Fase 7, e spendere sei secondi di spray per un peer che
+  ci ha appena raggiunto sarebbe lo stesso errore in formato più grande.
+  `observed` invece resta `None` per costruzione — si può imparare solo da una
+  *risposta* a una nostra richiesta — e nessun chiamante lo consuma.
+
+### 21.3b Perché NON c'è un periodo di grazia
+
+L'obiezione naturale è: il listener potrebbe continuare a rispondere ancora per
+qualche decina di millisecondi, per coprire il caso in cui la *sua* risposta si
+perda e il dialer debba richiedere. L'obiezione si respinge con l'aritmetica del
+caso comune, non con una preferenza di stile.
+
+Se il dialer riceve la risposta, nomina e chiama: il suo primo Initial arriva
+circa **un RTT** dopo. Su questo percorso l'RTT è ~20 ms. Una grazia di 100 ms
+lascerebbe quindi il socket fuori dal QUIC proprio mentre l'Initial arriva — cioè
+reintrodurrebbe esattamente il difetto, per *tutti* i giri, allo scopo di
+proteggere il sottoinsieme in cui una risposta si perde.
+
+E quel sottoinsieme non resta scoperto: un dialer che non nomina chiama comunque
+la lista di target del giro (compresi i candidati peer-reflexive appresi), e
+trova l'endpoint QUIC già in ascolto. Degrada a «chiama senza nomina», che
+funziona; la grazia degraderebbe il percorso normale, che oggi funziona in 40 ms.
+
+### 21.4 E un endpoint diretto non è mai «freddo» (S-7)
+
+I 333 ms di `initial_rtt` della RFC 9002 sono il valore per una connessione che
+non sa **nulla** del percorso. Un endpoint diretto di bore non è mai in quella
+posizione: viene costruito solo dopo uno scambio di check autenticato con quel
+peer, oppure dopo una connessione TCP di controllo verso quell'host.
+
+I due errori non sono simmetrici. Sottostimare costa **un** Initial duplicato su
+un percorso più lento, dopodiché governa il primo campione vero. Sovrastimare
+costa un PTO intero di silenzio ogni volta che il primo Initial si perde — ed è
+il pacchetto con la probabilità di perdita più alta di tutta la connessione,
+perché è il primo datagramma che attraversa una mappatura che il peer ha appena
+creato.
+
+`DIRECT_INITIAL_RTT` vale quindi 100 ms (PTO ≈ 300 ms), con override
+`BORE_DIRECT_QUIC_INITIAL_RTT_MS` e clamp in [10 ms, 333 ms]: sopra il default
+della RFC non esiste nessun valore che si possa chiamare «informato». È una
+difesa in profondità, non un sostituto: S-5 toglie la causa sistematica, S-7
+limita il costo di una perdita genuina.

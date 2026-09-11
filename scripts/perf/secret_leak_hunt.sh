@@ -71,6 +71,18 @@
 #       rest of the session. Read from the server (P-12: the log proves the
 #       client TALKED about a path, the API proves the server BELIEVES it).
 #
+#   T-SECLEAK-UPGRADE-CAP
+#       The same shape, asking the other question: not "does the upgrade
+#       happen" but "how long does the WORST case last". The provider is held
+#       back for 90 s (`SECLEAK_LATE`), which is past several steps of the
+#       upgrade's exponential backoff, and the arm then measures the seconds
+#       from "the direct path became possible" to "the admin API says direct".
+#       That number is the backoff CAP by construction, which is why the cap is
+#       what the arm asserts (<= 75 s). It red-checks the S-8 change: with the
+#       previous 256 s cap the retry grid ran 2, 4, 8, 16, 32, 64, 128, so a
+#       provider appearing at t=90 s went unnoticed until t=190 s — four
+#       minutes of relay on a network that had been fine for three of them.
+#
 #   T-SECLEAK-UDPBUF
 #       P-13 says every QUIC endpoint is built over a socket whose buffers were
 #       configured, and that the CONSTRUCTORS are what guarantee it. On the
@@ -109,12 +121,15 @@
 #   scripts/perf/secret_leak_hunt.sh reap            # ~70 s
 #   scripts/perf/secret_leak_hunt.sh udpbuf
 #   scripts/perf/secret_leak_hunt.sh upgrade
+#   scripts/perf/secret_leak_hunt.sh upgrade-late   # ~3 min
 #
 # Env:
 #   BORE_BIN              binary under test (default target/release/bore)
 #   SECLEAK_CONNS         connections per phase (default 200)
 #   SECLEAK_PHASES        churn phases; the LAST one is the verdict (default 4)
 #   SECLEAK_KEEP=1        keep the run directories for inspection
+#   SECLEAK_LATE          seconds the upgrade-late arm withholds the provider
+#                         (default 90 — must exceed several backoff steps)
 #
 # Requires: a release build (`cargo build --release`), `jq`, `python3`, `ss`,
 # `unshare` with unprivileged user namespaces, and `gdb` for the stall dump
@@ -211,7 +226,7 @@ adm metrics >/dev/null 2>&1 || { echo "RESULT server-up bad the control port nev
 # here means the direct path broke, never that discovery was slow.
 PFLAGS=(); CFLAGS=()
 case "$ARM" in
-    churn-direct|udpbuf|upgrade|stall-direct)
+    churn-direct|udpbuf|upgrade|upgrade-late|stall-direct)
         PFLAGS=(--udp --udp-no-stun --nat-udp-preferred-port "$PPORT" --udp-candidate "$DUMMY_IP:$PPORT")
         CFLAGS=(--udp --udp-no-stun --nat-udp-preferred-port "$CPORT" --udp-candidate "$DUMMY_IP:$CPORT")
         ;;
@@ -231,7 +246,14 @@ start_consumer(){
     CONS=$!; disown
 }
 
-if [ "$ARM" = upgrade ]; then
+# How long the consumer is left with no provider before the upgrade becomes
+# possible. `upgrade` keeps it at zero (the fastest deterministic late upgrade);
+# `upgrade-late` pushes it past several backoff steps so the arm measures the
+# CAP rather than the first retry.
+LATE_SECS=0
+[ "$ARM" = upgrade-late ] && LATE_SECS="${SECLEAK_LATE:-90}"
+
+if [ "$ARM" = upgrade ] || [ "$ARM" = upgrade-late ]; then
     # Deterministic late upgrade: with no provider registered, the consumer's
     # FIRST negotiation cannot succeed, so it registers on the relay and reports
     # that. Whether the initial negotiation wins its race is otherwise a matter
@@ -246,6 +268,11 @@ if [ "$ARM" = upgrade ]; then
     else
         echo "RESULT upgrade-starts-on-relay bad the consumer never reported the relay verdict"
     fi
+    # Let the exponential backoff climb before the path becomes possible. This
+    # is what turns the arm from "does an upgrade happen at all" into "how long
+    # does the WORST case last", which is the only question the cap answers.
+    [ "$LATE_SECS" -gt 0 ] && sleep "$LATE_SECS"
+    UPGRADE_POSSIBLE_AT=$(date +%s)
     start_provider
 else
     start_provider
@@ -282,11 +309,11 @@ fi
 case "$ARM" in
 
 # ---------------------------------------------------------------------------
-upgrade)
+upgrade|upgrade-late)
     # The upgrade retries on a capped backoff (2, 4, 8, … seconds), so 60 s of
     # patience covers several attempts without the gate becoming a stopwatch.
-    t0=$(date +%s); got=relay
-    for _ in $(seq 1 120); do
+    t0=${UPGRADE_POSSIBLE_AT:-$(date +%s)}; got=relay
+    for _ in $(seq 1 400); do
         got=$(cpath); [ "$got" = direct ] && break
         python3 "$RC" ping 127.0.0.1 "$PROXY" 1 1 8 >/dev/null 2>&1
         sleep 0.5
@@ -305,6 +332,17 @@ upgrade)
         echo "RESULT upgrade-reported ok the admin API reports direct ${took}s after the upgrade became possible"
     else
         echo "RESULT upgrade-reported bad the admin API still reports $got while the data path moved"
+    fi
+    # S-8: the cap is the worst case, so the arm that provoked the worst case
+    # asserts it. With the previous 256 s cap the retry grid was 2, 4, 8, 16,
+    # 32, 64, 128, … — a provider appearing at t=90 s would not have been
+    # noticed before t=190 s, which is what this bound red-checks.
+    if [ "$ARM" = upgrade-late ]; then
+        if [ "$got" = direct ] && [ "$took" -le 75 ]; then
+            echo "RESULT upgrade-cap ok the worst-case relay dwell was ${took}s"
+        else
+            echo "RESULT upgrade-cap bad the tunnel needed ${took}s to leave the relay (path=$got)"
+        fi
     fi
     # And the stale explanation must go with it: `path_reason` describes why the
     # path is what it IS, not what it once was.
@@ -351,6 +389,7 @@ churn-relay|churn-direct)
     echo "MEASURE warm fd=$p_fs/$p_fp/$p_fc rss=$p_rs/$p_rp/$p_rc"
 
     d_fs=0; d_fp=0; d_fc=0; d_rs=0; d_rp=0; d_rc=0
+    DRS=(); DRP=(); DRC=()
     for k in $(seq 1 "$PHASES"); do
         phase
         n_fs=$(fds "$SRV"); n_fp=$(fds "$PROV"); n_fc=$(fds "$CONS")
@@ -358,6 +397,7 @@ churn-relay|churn-direct)
         d_fs=$((n_fs - p_fs)); d_fp=$((n_fp - p_fp)); d_fc=$((n_fc - p_fc))
         d_rs=$((n_rs - p_rs)); d_rp=$((n_rp - p_rp)); d_rc=$((n_rc - p_rc))
         echo "MEASURE phase$k fd=$n_fs/$n_fp/$n_fc rss=$n_rs/$n_rp/$n_rc dfd=$d_fs/$d_fp/$d_fc drss=$d_rs/$d_rp/$d_rc"
+        DRS+=("$d_rs"); DRP+=("$d_rp"); DRC+=("$d_rc")
         p_fs=$n_fs; p_fp=$n_fp; p_fc=$n_fc; p_rs=$n_rs; p_rp=$n_rp; p_rc=$n_rc
     done
 
@@ -372,18 +412,71 @@ churn-relay|churn-direct)
             echo "RESULT fd-$nm bad +$v descriptors in the last phase of $CONNS connections"
         fi
     done
-    # 1024 KiB over $CONNS connections is ~5 KiB each. A real per-connection
-    # retention on this path is at least a proxy buffer (256 KiB by default) or
-    # a whole stream, so this bound catches one; and by the last phase the
-    # arenas have stopped moving, so it is not a noise floor.
-    for pair in "server:$d_rs" "provider:$d_rp" "consumer:$d_rc"; do
-        nm=${pair%%:*}; v=${pair##*:}
-        if [ "$v" -le 1024 ]; then
-            echo "RESULT rss-$nm ok +$v KiB in the last phase of $CONNS connections"
-        else
-            echo "RESULT rss-$nm bad +$v KiB in the last phase of $CONNS connections"
+    # RSS is judged on TWO statements, because one of them alone was wrong.
+    #
+    # The original gate read only the LAST phase's delta against 1024 KiB, on
+    # the stated assumption that "by the last phase the arenas have stopped
+    # moving". Its own data falsified that on 2026-09-12: the consumer of the
+    # DIRECT arm read `drss` -1136 then +1132 KiB on consecutive phases, with
+    # the provider flat at -12 and every descriptor count at +0. A leak cannot
+    # produce a negative phase. That is glibc's arena taking and returning a
+    # ~1.1 MiB chunk, and a single-phase verdict lets whichever phase the swing
+    # lands in decide the result — a coin toss dressed as a measurement.
+    #
+    # So: MAGNITUDE, then TREND.
+    #
+    # Magnitude — `RSS_PHASE_SLACK` 2048 KiB over $CONNS connections is ~10 KiB
+    # each. Still 25x below the smallest retention this path can physically
+    # have (one proxy buffer, 256 KiB by default) and ~2x above the arena
+    # oscillation measured above, so it cannot be tripped by allocator noise
+    # and cannot miss a per-connection leak.
+    #
+    # Trend — a leak is LINEAR in connections, so it is positive in every
+    # phase. Requiring "every phase after the first rose, AND the total rise
+    # exceeds one phase's slack" gives back the sensitivity the wider bound
+    # gave up: a steady 3.5 KiB/connection drift fails on the trend while
+    # every single phase of it sits under the magnitude bound, which is
+    # exactly the shape the old gate would have passed four times in a row.
+    # The first phase is excluded because it carries the tail of warm-up,
+    # which decays and is not a leak (the reason this arm warms up at all).
+    #
+    # That 3.5 KiB/connection IS the resolution of this instrument at the
+    # default 4 phases x 200 connections, and it is a floor set by the data,
+    # not by taste: the HEALTHY relay server measured on 2026-09-12 rose in
+    # all three trend phases for a total of 1088 KiB, i.e. 1.8 KiB per
+    # connection, so any bound below that would fail a process with nothing
+    # wrong with it. Resolving finer means more connections, not a tighter
+    # number — raise PHASES/CONNS, and the bound scales with neither, so say
+    # so in the run rather than quietly tightening it.
+    RSS_PHASE_SLACK="${RSS_PHASE_SLACK:-2048}"
+    rss_verdict(){ # <name> <per-phase deltas...>
+        local nm="$1"; shift
+        local -a d=("$@")
+        local n=${#d[@]}
+        local last="${d[$((n - 1))]}"
+        local i v sum=0 rose=1 amp=0 a
+        for i in $(seq 1 $((n - 1))); do
+            v="${d[$i]}"
+            sum=$((sum + v))
+            [ "$v" -gt 0 ] || rose=0
+            a="${v#-}"; [ "$a" -gt "$amp" ] && amp="$a"
+        done
+        local why=""
+        [ "$last" -gt "$RSS_PHASE_SLACK" ] && why="the last phase alone added ${last} KiB"
+        if [ "$rose" = 1 ] && [ "$sum" -gt "$RSS_PHASE_SLACK" ]; then
+            why="${why:+$why; }RSS rose in every phase after the first, ${sum} KiB in total"
         fi
-    done
+        local lastf; lastf=$(printf '%+d' "$last")
+        local sumf;  sumf=$(printf '%+d' "$sum")
+        if [ -z "$why" ]; then
+            echo "RESULT rss-$nm ok last phase $lastf KiB, trend $sumf KiB over $((n - 1)) phases, swing ${amp} KiB (slack $RSS_PHASE_SLACK)"
+        else
+            echo "RESULT rss-$nm bad $why (slack $RSS_PHASE_SLACK, $CONNS connections per phase)"
+        fi
+    }
+    rss_verdict server   "${DRS[@]}"
+    rss_verdict provider "${DRP[@]}"
+    rss_verdict consumer "${DRC[@]}"
 
     # Liveness after the churn: a process that died mid-run would report a
     # beautifully stable descriptor count.
@@ -549,11 +642,13 @@ case "$MODE" in
     reap)         run_arm reap         "T-SECLEAK-REAP" ;;
     udpbuf)       run_arm udpbuf       "T-SECLEAK-UDPBUF" ;;
     upgrade)      run_arm upgrade      "T-SECLEAK-UPGRADE" ;;
+    upgrade-late) run_arm upgrade-late "T-SECLEAK-UPGRADE-CAP" ;;
     all)
         run_arm churn-relay  "T-SECLEAK-CHURN-RELAY"
         run_arm churn-direct "T-SECLEAK-CHURN-DIRECT"
         run_arm udpbuf       "T-SECLEAK-UDPBUF"
         run_arm upgrade      "T-SECLEAK-UPGRADE"
+        run_arm upgrade-late "T-SECLEAK-UPGRADE-CAP"
         run_arm stall        "T-SECLEAK-STALL"
         run_arm stall-direct "T-SECLEAK-STALL-DIRECT"
         run_arm reap         "T-SECLEAK-REAP"

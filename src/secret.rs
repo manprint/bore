@@ -1168,9 +1168,43 @@ pub struct Proxy {
 #[cfg(feature = "udp")]
 const UDP_UPGRADE_INITIAL_SECS: u64 = 2;
 
-/// Maximum delay (s) for the UDP upgrade backoff — retry at most every ~4.3 min.
+/// Maximum delay (s) for the UDP upgrade backoff (S-8).
+///
+/// This is the WORST-CASE time a tunnel stays on the relay after the thing
+/// that was blocking the direct path goes away — a firewall rule withdrawn, a
+/// captive portal cleared, a peer that was still booting. It used to be 256 s,
+/// which is four and a half minutes of relay for a network that has been fine
+/// for four of them.
+///
+/// 60 s is chosen for consistency with the mechanism this project already
+/// ships: the VPN's direct upgrade retries on a FIXED 30 s grid
+/// (`DIRECT_RETRY_INTERVAL`), and has done so in production. A secret tunnel
+/// retrying at half that rate is the more conservative of the two, not a new
+/// risk. The politeness argument against a short cap — a permanently-relay
+/// tunnel repeats a STUN gather and a bounded check round forever — is the
+/// same argument the VPN already answered, and the round is bounded by
+/// `CHECK_TOTAL_CAP` (3 s) either way.
+///
+/// The backoff still GROWS (2, 4, 8, …): a path that is merely slow to settle
+/// is not hammered, and the cap only decides how long the worst case lasts.
 #[cfg(feature = "udp")]
-const UDP_UPGRADE_MAX_SECS: u64 = 256;
+const UDP_UPGRADE_MAX_SECS: u64 = 60;
+
+/// S-8, asserted at COMPILE time rather than in a test: the worst-case relay
+/// dwell after the direct path becomes possible again IS this cap, and the
+/// relationship — not the number — is what must survive a future "let's back
+/// off harder" change. A unit test would only report the regression after the
+/// build; this refuses to produce the build.
+#[cfg(feature = "udp")]
+const _: () = assert!(
+    UDP_UPGRADE_MAX_SECS <= 60,
+    "a tunnel must not sit on the relay for more than a minute after the direct path becomes possible again"
+);
+#[cfg(feature = "udp")]
+const _: () = assert!(
+    UDP_UPGRADE_INITIAL_SECS < UDP_UPGRADE_MAX_SECS,
+    "the upgrade backoff must still GROW from its initial delay"
+);
 
 impl Proxy {
     /// Connect to the server, register as a consumer of `tcp_secret_id`, and bind

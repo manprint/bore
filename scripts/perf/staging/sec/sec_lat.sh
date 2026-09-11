@@ -52,8 +52,20 @@ for mode in relay direct; do
     start_consumer "$id" $flags
     sec_wait secretconsumer "$id" || { echo "  $mode: consumer never registered"; sec_down "$id" ${PROV_PID:-} ${CONS_PID:-}; continue; }
     rc get 127.0.0.1 "$PP" 1048576 1 >/dev/null 2>&1
+    # Same rule as sec_ab.sh and sec_eff.sh: a --udp ladder must not start its
+    # first rung before the direct path exists. Measured on 2026-09-11 (vm-ws):
+    # the `held=0` rung ran inside the S-5 window and returned
+    # `n=0 p50=nan errs=100` — 100 failed probes against a peer whose QUIC
+    # listener came up 908 ms later — while every later rung read a clean
+    # 21.7 ms. The header then printed `path=unknown` for a ladder that in
+    # fact ended on the direct path.
+    ttd="n/a"
+    [ "$mode" = direct ] && ttd="$(sec_time_to_direct "$id" 30)"
     path="$(sec_path "$id")"
-    echo "  --- $mode (path=$path, fb=$(sec_fallbacks "$id")) ---"
+    echo "  --- $mode (path=$path, fb=$(sec_fallbacks "$id"), ttd=$ttd) ---"
+    if [ "$mode" = direct ] && [ "$path" != direct ]; then
+        echo "    WARNING: this ladder is NOT on the direct path — every rung below describes '$path'"
+    fi
     for h in $HOLDS; do
         holdpid=""
         if [ "$h" -gt 0 ]; then

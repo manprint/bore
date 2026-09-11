@@ -45,6 +45,15 @@ OP="${ORIGIN_PORT:-5052}"
 # stages cannot collide on a box that also runs the operator's tunnels.
 SEC_PROXY_PORT="${SEC_PROXY_PORT:-15300}"
 
+# Extra `NAME=value` pairs handed to EVERY bore process this library starts, on
+# both hosts. A tuning knob read through `std::env::var` is read by the process
+# that builds the QUIC endpoint, and a secret tunnel has two of those on two
+# machines: a variable exported in this shell would reach the workstation half
+# and silently miss the VM half, which is the shape of an A/B that measures one
+# peer's setting and reports it as the tunnel's. Word-split on purpose — these
+# are argv words for `env`, never a quoted string.
+SEC_ENV="${SEC_ENV:-}"
+
 # Binaries. The workstation runs the release build from this repository (the
 # same bytes the netns gates ran against); the VM runs the provisioned one.
 WS_BORE="${WS_BORE:-$HERE_SEC/../../../../target/release/bore}"
@@ -100,7 +109,7 @@ sec_id() { printf 'sec%s' "$(date +%s%N | cut -c9-14)"; }
 # ws_provider <local-port> <secret-id> [flags...]
 ws_provider() {
     local lp="$1" id="$2"; shift 2
-    "$WS_BORE" local "$lp" --to "$BORE_TO" --secret "$BORE_SECRET" \
+    env $SEC_ENV "$WS_BORE" local "$lp" --to "$BORE_TO" --secret "$BORE_SECRET" \
         --tcp-secret-id "$id" "$@" >"$OUT/prov-$id.log" 2>&1 &
     LASTPID=$!
     SEC_KIDS+=("$LASTPID")
@@ -109,24 +118,57 @@ ws_provider() {
 # ws_consumer <proxy-port> <secret-id> [flags...]
 ws_consumer() {
     local pp="$1" id="$2"; shift 2
-    "$WS_BORE" proxy --to "$BORE_TO" --secret "$BORE_SECRET" \
+    env $SEC_ENV "$WS_BORE" proxy --to "$BORE_TO" --secret "$BORE_SECRET" \
         --tcp-secret-id "$id" --local-proxy-port "127.0.0.1:$pp" "$@" \
         >"$OUT/cons-$id.log" 2>&1 &
     LASTPID=$!
     SEC_KIDS+=("$LASTPID")
 }
 
+# vm_start <id> <remote command> — one remote start, retried ONCE, with the
+# ssh error kept.
+#
+# Both of those matter and neither was there originally. The remote command
+# ends in `& true`, so a non-zero status can mean exactly one thing: the ssh
+# itself did not get to run the command. Discarding its stderr turned that into
+# a bare `startfail` row with no reason — observed twice in the S1 `vm-ws`
+# stage of 2026-09-11, from a home uplink, with no way to tell a refused
+# connection from a timed-out one after the fact. The single retry is not
+# papering over a bug: a measurement row lost to one dropped TCP handshake is
+# a hole in a paired design, and the paired design is what makes the whole
+# campaign resistant to drift.
+vm_start() {
+    local id="$1"; shift
+    local attempt tmp
+    tmp="$OUT/.sshtry-$id.log"
+    for attempt in 1 2; do
+        if vm "$@" >/dev/null 2>"$tmp"; then
+            # stderr on SUCCESS is noise, not evidence, and keeping it under a
+            # name like `sshfail-<id>.log` manufactures 43 alarming files per
+            # campaign out of one benign `Warning: Permanently added
+            # '<host>' (ED25519) to the list of known hosts.` A post-mortem
+            # that has to learn which "failures" are real has no post-mortem.
+            rm -f "$tmp"
+            return 0
+        fi
+        echo "  (ssh start attempt $attempt failed for $id)" >&2
+        sleep 2
+    done
+    mv -f "$tmp" "$OUT/sshfail-$id.log" 2>/dev/null
+    return 1
+}
+
 # vm_provider / vm_consumer — same, started detached on the test VM. The log
 # name carries the id so a post-mortem can pair it with the admin row.
 vm_provider() {
     local lp="$1" id="$2"; shift 2
-    vm "mkdir -p ~/out; setsid nohup $VM_BORE local $lp --to '$BORE_TO' --secret '$BORE_SECRET' \
-        --tcp-secret-id $id $* > ~/out/prov-$id.log 2>&1 </dev/null & true" >/dev/null 2>&1
+    vm_start "$id" "mkdir -p ~/out; setsid nohup env $SEC_ENV $VM_BORE local $lp --to '$BORE_TO' --secret '$BORE_SECRET' \
+        --tcp-secret-id $id $* > ~/out/prov-$id.log 2>&1 </dev/null & true"
 }
 vm_consumer() {
     local pp="$1" id="$2"; shift 2
-    vm "mkdir -p ~/out; setsid nohup $VM_BORE proxy --to '$BORE_TO' --secret '$BORE_SECRET' \
-        --tcp-secret-id $id --local-proxy-port 127.0.0.1:$pp $* > ~/out/cons-$id.log 2>&1 </dev/null & true" >/dev/null 2>&1
+    vm_start "$id" "mkdir -p ~/out; setsid nohup env $SEC_ENV $VM_BORE proxy --to '$BORE_TO' --secret '$BORE_SECRET' \
+        --tcp-secret-id $id --local-proxy-port 127.0.0.1:$pp $* > ~/out/cons-$id.log 2>&1 </dev/null & true"
 }
 
 # sec_down <secret-id> [local-pids...]

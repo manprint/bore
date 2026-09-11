@@ -388,6 +388,79 @@ pub fn direct_quic_liveness() -> DirectQuicLiveness {
     )
 }
 
+/// Initial RTT a direct QUIC endpoint assumes before it has a sample of its
+/// own (S-7). RFC 9002's 333 ms default is the value for a connection with NO
+/// prior information about the path; a bore direct endpoint is never in that
+/// position. It is built only after either a completed authenticated check
+/// exchange with this exact peer (the punched paths) or a TCP control
+/// connection to this exact host (vhost, public, ssh-jump), so the path has
+/// already been traversed at least once before the first QUIC packet.
+///
+/// The asymmetry of the two errors is what fixes the value. Underestimating
+/// costs ONE duplicate Initial on a path slower than the estimate, after which
+/// the first real sample governs. Overestimating costs a full PTO of silence
+/// whenever the first Initial is lost — and the first Initial of a punched
+/// path is exactly the packet most likely to be lost, because it is the first
+/// datagram to cross a mapping the peer has only just created. MEASURED on
+/// staging 2026-09-11: 9 of 27 direct establishments paid 1036..1162 ms,
+/// against 37..53 ms for the other 18, and the constant was quinn's
+/// `333 ms + 4 * 166 ms = 999 ms` initial PTO, not the network.
+#[cfg(feature = "udp")]
+pub const DIRECT_INITIAL_RTT: Duration = Duration::from_millis(100);
+
+/// Lower bound for the resolved initial RTT: below this, a healthy path's
+/// first PTO would fire inside its own handshake round trip.
+#[cfg(feature = "udp")]
+const DIRECT_INITIAL_RTT_MIN: Duration = Duration::from_millis(10);
+
+/// Upper bound: RFC 9002's own default, which is the most pessimistic value
+/// that can be called informed.
+#[cfg(feature = "udp")]
+const DIRECT_INITIAL_RTT_MAX: Duration = Duration::from_millis(333);
+
+/// Resolve the direct-path initial RTT from an optional operator override.
+/// Pure, so the policy is unit-testable without an endpoint; `None` yields the
+/// shipped constant exactly.
+#[cfg(feature = "udp")]
+pub fn resolve_direct_initial_rtt(ms: Option<u64>) -> Duration {
+    ms.map(Duration::from_millis)
+        .unwrap_or(DIRECT_INITIAL_RTT)
+        .clamp(DIRECT_INITIAL_RTT_MIN, DIRECT_INITIAL_RTT_MAX)
+}
+
+/// The live direct-path initial RTT, including the operator override.
+#[cfg(feature = "udp")]
+pub fn direct_initial_rtt() -> Duration {
+    resolve_direct_initial_rtt(env_ms("BORE_DIRECT_QUIC_INITIAL_RTT_MS"))
+}
+
+/// Ack-eliciting threshold requested from the peer through the QUIC ACK
+/// Frequency extension (draft-ietf-quic-ack-frequency-04), or `None` for
+/// quinn's default behaviour — which is the extension DISABLED and an ACK for
+/// every other ack-eliciting packet.
+///
+/// A threshold of N asks the peer to acknowledge at most once every N+1
+/// ack-eliciting packets, which on a saturated direct path removes most of the
+/// return-path packet rate. It is an experiment knob, not a default: both ends
+/// of a bore direct path are bore, so the extension is always negotiable, but
+/// acknowledging less often also delays loss detection, and a congestion
+/// controller reacts to what it is told. The default therefore stays quinn's
+/// until a measurement on this project's own paths says otherwise, and the
+/// measurement is what the env var exists for.
+///
+/// `reordering_threshold` follows quinn's own recommendation of
+/// `packet_threshold - 1` (2 with the default packet threshold of 3), so
+/// out-of-order delivery still elicits an immediate ACK and fast retransmit is
+/// unaffected by the change.
+#[cfg(feature = "udp")]
+pub fn direct_ack_eliciting_threshold() -> Option<u64> {
+    std::env::var("BORE_DIRECT_QUIC_ACK_THRESHOLD")
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+}
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// Derive the shared QUIC authentication token from the tunnel secret (if any)
@@ -837,6 +910,9 @@ impl UdpTraversalSocket {
         let mut probe_step: u64 = 0;
         let mut next_probe = started_at + initial_delay;
         let mut rr = 0usize;
+        // Whether the round ended through the listener handoff (S-5) rather
+        // than through our own request being answered.
+        let mut handoff = false;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(next_probe) => {
@@ -902,6 +978,46 @@ impl UdpTraversalSocket {
                         last_triggered.insert(src, Instant::now());
                         self.send_check_request(src, cfg).await;
                     }
+                    // S-5, THE LISTENER HANDOFF. A listener that has just
+                    // answered an authenticated request has everything its
+                    // half of the round can produce: the peer holds the key,
+                    // is on this generation, plays the other role, and reaches
+                    // us from `src`. Everything after this point is the
+                    // DIALER's move, and the dialer makes it the instant its
+                    // own nomination completes — which our answer is what
+                    // causes. Staying in the round past that answer does not
+                    // improve the path; it only keeps this socket away from
+                    // QUIC while the first Initial is already arriving, and a
+                    // dropped Initial is not retried until the QUIC PTO.
+                    //
+                    // MEASURED on staging 2026-09-11 (vm-ws, 27 establishments,
+                    // docs/performance/SECRET_STAGING_EVIDENCE_2026-09-11.md
+                    // §4.1): the distribution of `direct_ready_ms` was
+                    // BIMODAL — 18 runs in 37..53 ms and 9 runs in
+                    // 1036..1162 ms, with nothing in between. Every slow run
+                    // has a provider log reading `nominated=None
+                    // checks_ms=1126` and a consumer that nominated at ~210 ms:
+                    // the dialer nominated, tore its round down (late frames
+                    // are never answered) and dialed, while the listener — whose
+                    // adaptive plan probes the peer's LOCAL candidates first and
+                    // only reaches the reflexive group a CHECK_GROUP_STAGGER
+                    // later — was still probing an address that had already
+                    // stopped answering. It ran to its full window, and the
+                    // ~1 s constant is quinn's initial PTO (333 ms initial_rtt
+                    // => ~999 ms), not anything on the network.
+                    //
+                    // `observed` stays None on this path ON PURPOSE: it can
+                    // only be learned from a RESPONSE to our own request, and
+                    // no caller consumes it. `nominated` is set because the
+                    // round's consumers read it as "a pair is proven" — which
+                    // gates the Fase 7 sprayed escape, and spending six seconds
+                    // spraying for a peer that just reached us would be the
+                    // same mistake in a larger size.
+                    if cfg.role == CheckRole::Listener && valid_candidate(&src) {
+                        nominated = Some(src);
+                        handoff = true;
+                        break;
+                    }
                 }
                 Some((target, obs)) = validated_rx.recv() => {
                     nominated = Some(target);
@@ -938,6 +1054,7 @@ impl UdpTraversalSocket {
             invalid_checks = self.invalid_checks(),
             planned = cfg.plan.is_some(),
             retry_passes = pass,
+            handoff,
             "connectivity-check round finished"
         );
         CheckOutcome {
@@ -1376,37 +1493,49 @@ fn apply_second_observation(
 /// (request). EVERY failure — bad HMAC, wrong generation, wrong role, unknown
 /// txid, wrong source, no active round — is counted and produces NO reply:
 /// an unauthenticated probe never gets a response (plan Fase 2 property).
-fn handle_check_frame(inner: &TraversalInner, buf: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
+fn handle_check_frame(inner: &TraversalInner, buf: &[u8], from: SocketAddr) -> CheckAction {
     let mut guard = inner.checks.lock().unwrap();
     let Some(state) = guard.as_mut() else {
         inner.invalid_checks.fetch_add(1, Ordering::Relaxed);
-        return None;
+        return CheckAction::default();
     };
     let Some(frame) = check::parse(&state.key, buf) else {
         inner.invalid_checks.fetch_add(1, Ordering::Relaxed);
-        return None;
+        return CheckAction::default();
     };
     // Frames must belong to THIS round and come from the OTHER role (a peer
     // of our own role is a reflection/misconfiguration, never a valid pair).
     if frame.generation != state.generation || frame.role == state.role {
         inner.invalid_checks.fetch_add(1, Ordering::Relaxed);
-        return None;
+        return CheckAction::default();
     }
     match frame.kind {
         check::KIND_REQUEST => {
-            // Peer-reflexive learning + triggered check happen in the driver.
-            let _ = state.inbound_req_tx.send(from);
+            // Peer-reflexive learning + triggered check happen in the driver,
+            // and so does the listener's handoff (S-5) — which ENDS the round
+            // and therefore stops this actor. The announcement is carried out
+            // of here instead of being sent under the lock so the caller can
+            // put the response on the wire FIRST; announcing first would race
+            // the round's teardown against the one datagram the dialer is
+            // waiting for.
+            let announce = state.inbound_req_tx.clone();
             if state.responses_sent >= CHECK_MAX_RESPONSES {
-                return None;
+                return CheckAction {
+                    reply: None,
+                    announce: Some((announce, from)),
+                };
             }
             state.responses_sent += 1;
-            Some(check::response(
-                &state.key,
-                state.role,
-                state.generation,
-                &frame.txid,
-                from,
-            ))
+            CheckAction {
+                reply: Some(check::response(
+                    &state.key,
+                    state.role,
+                    state.generation,
+                    &frame.txid,
+                    from,
+                )),
+                announce: Some((announce, from)),
+            }
         }
         check::KIND_RESPONSE => {
             // Only a response from EXACTLY the queried target validates the
@@ -1420,13 +1549,27 @@ fn handle_check_frame(inner: &TraversalInner, buf: &[u8], from: SocketAddr) -> O
                     inner.invalid_checks.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            None
+            CheckAction::default()
         }
         _ => {
             inner.invalid_checks.fetch_add(1, Ordering::Relaxed);
-            None
+            CheckAction::default()
         }
     }
+}
+
+/// What the recv actor must do with one parsed check frame. Ordering is the
+/// whole reason this type exists: the `reply` goes on the wire BEFORE
+/// `announce` reaches the driver, because the driver may end the round on that
+/// announcement (the listener handoff, S-5) and ending the round stops the
+/// actor mid-flight.
+#[derive(Default)]
+struct CheckAction {
+    /// Authenticated response bytes to send back to the requester.
+    reply: Option<Vec<u8>>,
+    /// Source of a valid inbound request, announced to the driver after the
+    /// reply is sent.
+    announce: Option<(tokio::sync::mpsc::UnboundedSender<SocketAddr>, SocketAddr)>,
 }
 
 /// The single recv owner: demux STUN responses to their transactions, count
@@ -1446,9 +1589,14 @@ async fn recv_actor(socket: std::sync::Arc<UdpSocket>, inner: std::sync::Arc<Tra
             // Connectivity-check frame? (plan Fase 2). Anything else — peer
             // punches, QUIC Initials — is counted and left alone.
             if check::looks_like(&buf[..n]) {
-                if let Some(reply) = handle_check_frame(&inner, &buf[..n], from) {
+                let action = handle_check_frame(&inner, &buf[..n], from);
+                if let Some(reply) = action.reply {
                     // Response bytes are built under the lock, sent outside it.
                     let _ = socket.send_to(&reply, from).await;
+                }
+                if let Some((tx, src)) = action.announce {
+                    // Strictly after the send: see `CheckAction`.
+                    let _ = tx.send(src);
                 }
                 continue;
             }
@@ -3277,12 +3425,35 @@ pub mod pair_cache {
         CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
     }
 
+    /// Hard ceiling on cached pairs (S-9). The cache is process-global and
+    /// keyed by tunnel id, so a process that dials many DIFFERENT tunnels over
+    /// its lifetime — a test harness, a multi-link VPN, a long-lived box that
+    /// reconnects under new ids — accumulated one entry per id forever:
+    /// expiry only ever ran inside `recall` FOR THAT KEY, and a key that is
+    /// never recalled is never examined. Each entry is small, which is exactly
+    /// what makes this the kind of growth nobody notices.
+    pub(crate) const PAIR_CACHE_MAX: usize = 256;
+
     /// Record `addr` as the winning pair for `key`.
+    ///
+    /// Expired entries are swept here, not only in `recall`, because this is
+    /// the one call that is guaranteed to happen for every new key.
     pub fn remember(key: &str, addr: SocketAddr) {
-        cache()
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), (addr, Instant::now()));
+        let mut guard = cache().lock().unwrap();
+        guard.retain(|_, (_, at)| at.elapsed() < PAIR_CACHE_TTL);
+        if guard.len() >= PAIR_CACHE_MAX && !guard.contains_key(key) {
+            // Everything still here is inside its TTL, so there is no "least
+            // useful" entry to pick: drop the oldest, which is the one closest
+            // to expiring anyway.
+            if let Some(oldest) = guard
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| k.clone())
+            {
+                guard.remove(&oldest);
+            }
+        }
+        guard.insert(key.to_string(), (addr, Instant::now()));
     }
 
     /// The cached winning pair for `key`, if still within TTL (expired
@@ -3302,6 +3473,13 @@ pub mod pair_cache {
     /// Drop the cached pair for `key` (first failure ⇒ immediate invalidation).
     pub fn invalidate(key: &str) {
         cache().lock().unwrap().remove(key);
+    }
+
+    /// Live entry count. Exists so the bound can be asserted (S-9); nothing on
+    /// the data path reads it.
+    #[cfg(test)]
+    pub fn len() -> usize {
+        cache().lock().unwrap().len()
     }
 }
 
@@ -3633,6 +3811,21 @@ fn transport_config(tuning: &UdpDirectTuning) -> quinn::TransportConfig {
     }
     cfg.keep_alive_interval(Some(live.keepalive));
     cfg.max_idle_timeout(Some(live.max_idle.try_into().expect("valid idle timeout")));
+
+    // S-7: the path is already known to work when this endpoint is built, so
+    // the handshake does not start from RFC 9002's no-information assumption.
+    // See `DIRECT_INITIAL_RTT` for the measurement that priced the default.
+    cfg.initial_rtt(direct_initial_rtt());
+
+    // Opt-in only: unset leaves quinn's ACK behaviour byte-identical. See
+    // `direct_ack_eliciting_threshold`.
+    if let Some(threshold) = direct_ack_eliciting_threshold() {
+        let mut ack = quinn::AckFrequencyConfig::default();
+        ack.ack_eliciting_threshold(
+            quinn::VarInt::from_u64(threshold).unwrap_or(quinn::VarInt::MAX),
+        );
+        cfg.ack_frequency_config(Some(ack));
+    }
 
     // High-throughput direct transfers need flow-control windows larger than
     // Quinn's defaults. The values come from the brokered tuning struct, so the
@@ -5586,7 +5779,6 @@ mod tests {
             assert_eq!(frame.observed, Some(prober.local_addr().unwrap()));
         };
         let (outcome, ()) = tokio::join!(tsock.run_connectivity_checks(&[], &cfg), probe_task);
-        assert!(outcome.nominated.is_none());
         assert!(
             tsock.invalid_checks() >= 3,
             "forged probes must be counted (got {})",
@@ -5595,6 +5787,114 @@ mod tests {
         // The genuine prober source became a peer-reflexive target.
         assert!(outcome.learned_prflx);
         assert!(outcome.targets.contains(&prober.local_addr().unwrap()));
+        // S-5: the genuine request — and ONLY the genuine one — also ends this
+        // listener's round, nominating the source it authenticated. The three
+        // forged probes above must not have done so, which is why the
+        // assertion is on the prober's address and not merely on `is_some`.
+        assert_eq!(outcome.nominated, Some(prober.local_addr().unwrap()));
+    }
+
+    /// S-5 gate, the listener handoff. A listener whose own probes are never
+    /// answered must still END its round the moment the dialer proves it can
+    /// reach us — because everything after that answer is the dialer's move,
+    /// and the socket has to be a QUIC endpoint before the dialer's first
+    /// Initial arrives.
+    ///
+    /// RED-CHECK: remove the handoff arm and this test does not merely fail,
+    /// it takes the full 3 s window and reports `nominated=None` — which is
+    /// exactly the shape the staging logs showed on 9 of 27 establishments,
+    /// each of them paying quinn's ~1 s initial PTO for the dropped Initial.
+    ///
+    /// The peer here answers NOTHING on purpose: it models the real case,
+    /// where the dialer nominated early and tore its own responder down, so
+    /// the listener's probes fall into a hole for the rest of the window.
+    #[tokio::test]
+    async fn listener_hands_off_as_soon_as_the_dialer_proves_it_can_reach_us() {
+        let key = [11u8; 32];
+        let tsock = UdpTraversalSocket::bind(0).await.unwrap();
+        let port = tsock.local_addr().unwrap().port();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let cfg = CheckConfig {
+            key,
+            generation: 3,
+            // A three-second window: long enough that a listener which waits
+            // it out is unmistakable in the result, short enough to stay a
+            // unit test.
+            window: Duration::from_secs(3),
+            role: CheckRole::Listener,
+            plan: None,
+            spray: None,
+        };
+
+        let dialer = async {
+            // Let the round start and send a probe or two into the void.
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let txid = check::new_txid();
+            let req = check::request(&key, check::ROLE_DIALER, 3, &txid);
+            peer.send_to(&req, ("127.0.0.1", port)).await.unwrap();
+            // The response must be on the wire BEFORE the round tears itself
+            // down — the ordering `CheckAction` exists to guarantee. Without
+            // it the dialer would never nominate, which on the real path means
+            // dialing blind.
+            let mut buf = [0u8; 128];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(!left.is_zero(), "the handoff must not eat the response");
+                let Ok(Ok((n, _))) = timeout(left, peer.recv_from(&mut buf)).await else {
+                    continue;
+                };
+                if let Some(frame) = check::parse(&key, &buf[..n]) {
+                    if frame.kind == check::KIND_RESPONSE && frame.txid == txid {
+                        break;
+                    }
+                }
+            }
+        };
+
+        let started = Instant::now();
+        let peers = [peer_addr];
+        let (outcome, ()) = tokio::join!(tsock.run_connectivity_checks(&peers, &cfg), dialer);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            outcome.nominated,
+            Some(peer_addr),
+            "the listener nominates the source that authenticated to it"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "the listener waited {elapsed:?} of its 3 s window after the dialer \
+             had already reached it"
+        );
+        // And `observed` is genuinely unknown on this path: nothing ever
+        // answered our own request. Callers must not depend on it.
+        assert!(outcome.observed.is_none());
+    }
+
+    /// S-7: an unset override yields exactly the shipped constant, and any
+    /// override is clamped into a band that can still be called informed.
+    #[test]
+    #[cfg(feature = "udp")]
+    fn direct_initial_rtt_unset_is_the_shipped_constant() {
+        assert_eq!(resolve_direct_initial_rtt(None), DIRECT_INITIAL_RTT);
+        assert_eq!(
+            resolve_direct_initial_rtt(Some(1)),
+            DIRECT_INITIAL_RTT_MIN,
+            "a value that would fire the first PTO inside the handshake RTT is clamped up"
+        );
+        assert_eq!(
+            resolve_direct_initial_rtt(Some(10_000)),
+            DIRECT_INITIAL_RTT_MAX,
+            "nothing above RFC 9002's own no-information default is informed"
+        );
+        assert_eq!(
+            resolve_direct_initial_rtt(Some(40)),
+            Duration::from_millis(40)
+        );
+        // The shipped value must stay strictly below the RFC default, or S-7
+        // is a no-op that still claims to be a fix.
+        assert!(DIRECT_INITIAL_RTT < DIRECT_INITIAL_RTT_MAX);
     }
 
     /// Fase 2 happy path on loopback: both roles run a round; each side
@@ -5636,8 +5936,17 @@ mod tests {
         assert_eq!(l.nominated, Some(b_addr), "listener validates the dialer");
         assert_eq!(d.nominated, Some(a_addr), "dialer validates the listener");
         // Loopback: the observed mapped address is the socket's own address.
-        assert_eq!(l.observed, Some(a_addr));
         assert_eq!(d.observed, Some(b_addr));
+        // The LISTENER's `observed` is asserted conditionally, and that is the
+        // S-5 contract rather than a weakened assertion: a listener now ends
+        // its round on WHICHEVER of the two proofs arrives first — its own
+        // request being answered (which carries `observed`) or an authenticated
+        // request from the dialer (which does not, and needs nothing more).
+        // Which one wins is a race on loopback, so pinning it would pin the
+        // scheduler. What must always hold is the nomination above.
+        if let Some(obs) = l.observed {
+            assert_eq!(obs, a_addr);
+        }
         assert!(l.checks_ms < 2000 && d.checks_ms < 2000);
     }
 
@@ -5745,8 +6054,14 @@ mod tests {
 
     /// Fase 3 gate: the winning-pair cache remembers, recalls, and drops on
     /// invalidation; unknown keys recall nothing.
+    /// The pair cache is process-global, so its two gates must not run at the
+    /// same time: the bounded one evicts the OLDEST entry, which is exactly
+    /// what the other one has just stored.
+    static PAIR_CACHE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn pair_cache_remember_recall_invalidate() {
+        let _serial = PAIR_CACHE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let addr: SocketAddr = "198.51.100.7:4433".parse().unwrap();
         pair_cache::remember("test:pair-cache", addr);
         assert_eq!(pair_cache::recall("test:pair-cache"), Some(addr));
@@ -5757,6 +6072,38 @@ mod tests {
         pair_cache::invalidate("test:pair-cache");
         assert_eq!(pair_cache::recall("test:pair-cache"), None);
         assert_eq!(pair_cache::recall("test:never-stored"), None);
+    }
+
+    /// S-9 gate: the winning-pair cache is BOUNDED. Expiry used to run only
+    /// inside `recall` and only for the key being recalled, so a key that is
+    /// never recalled again was never examined again — one entry per tunnel
+    /// id, for the life of the process.
+    ///
+    /// The assertion is on the ceiling and on the survival of the most recent
+    /// key, not on which older key was evicted: everything in the map is
+    /// inside its TTL, so the eviction order is a tie-break, not a contract.
+    #[test]
+    fn pair_cache_is_bounded() {
+        let _serial = PAIR_CACHE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let addr: SocketAddr = "198.51.100.9:4433".parse().unwrap();
+        for i in 0..(pair_cache::PAIR_CACHE_MAX * 2) {
+            pair_cache::remember(&format!("test:bounded-{i}"), addr);
+        }
+        assert!(
+            pair_cache::len() <= pair_cache::PAIR_CACHE_MAX,
+            "cache grew to {} entries, past its {} ceiling",
+            pair_cache::len(),
+            pair_cache::PAIR_CACHE_MAX
+        );
+        let last = format!("test:bounded-{}", pair_cache::PAIR_CACHE_MAX * 2 - 1);
+        assert_eq!(
+            pair_cache::recall(&last),
+            Some(addr),
+            "the newest entry must survive its own insertion"
+        );
+        for i in 0..(pair_cache::PAIR_CACHE_MAX * 2) {
+            pair_cache::invalidate(&format!("test:bounded-{i}"));
+        }
     }
 
     /// Fase 3 gate: two agreeing STUN observations from DIFFERENT servers

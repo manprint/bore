@@ -38,6 +38,29 @@ const MAX_PARALLEL: u16 = 32;
 /// `--carriers N` is not clamped here (the server still enforces its own `--max-carriers`).
 const AUTO_CARRIER_CAP: u16 = DEFAULT_MAX_CARRIERS;
 const RESUME_FLUSH_EVERY_CHUNKS: u64 = 8;
+/// Name of the append-only completion journal that sits beside `state.json`.
+const RESUME_JOURNAL_FILE: &str = "state.log";
+/// One journal record: `entry_id` then `chunk_index`, both little-endian `u32`.
+const RESUME_JOURNAL_RECORD: usize = 8;
+/// Per-worker bound on the open-file cache.
+///
+/// Both workers used to keep an UNBOUNDED `HashMap` of open files, one entry per distinct
+/// file they touched, so a transfer of many small files ran the process out of descriptors:
+/// MEASURED with `ulimit -Sn 1024`, the sender died at ~989 of 3 000 files with
+/// `failed to open source file .../f000988.bin: Too many open files (os error 24)` and the
+/// receiver at ~970 with the same error on the staged side. The cache exists to spare a
+/// re-open when consecutive chunks of one LARGE file land on the same worker, and that
+/// needs a handful of slots, not one per file. Worst case is
+/// `MAX_PARALLEL * FILE_CACHE_PER_WORKER` descriptors, which `reconcile_fd_limit` covers.
+const FILE_CACHE_PER_WORKER: usize = 16;
+/// How many blocking tasks share the per-file staging and fsync work.
+///
+/// Both used to run as ONE serial chain: staging did a `spawn_blocking` round trip per file
+/// before a byte could be received, and `sync_staged_files` fdatasynced a batch one path at a
+/// time while holding the global persist lock, so every worker waited on it. Neither is
+/// CPU-bound — they are waiting on the filesystem — so a small fan-out converts a serial
+/// chain into a concurrent one without adding load.
+const STAGE_FANOUT: usize = 8;
 /// Upper bound on manifest entries a receiver will accept. Bounds both the upfront
 /// `Vec::with_capacity` (a hostile `total_entries: u64::MAX` would otherwise abort the
 /// process on allocation) and the total memory a peer can pin with manifest frames.
@@ -98,6 +121,9 @@ pub struct ListenerOptions {
     pub confirm_timeout: u64,
     /// Abort if no transfer data is received for this many seconds (0 = disabled).
     pub stall_timeout: u64,
+    /// Skip the per-file `fdatasync` that makes staged bytes durable before the resume
+    /// journal records their chunks as complete. See `ResumeShared::fsync_staged`.
+    pub no_fsync: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -376,14 +402,256 @@ struct ResumeShared {
     entries: Arc<BTreeMap<u32, ManifestEntry>>,
     runtime: Arc<AsyncMutex<ResumeRuntime>>,
     persist_lock: Arc<AsyncMutex<()>>,
+    journal: Arc<StdMutex<ResumeJournal>>,
+    /// Whether staged bytes — and the journal record that calls their chunks complete — are
+    /// fsynced.
+    ///
+    /// ON (the default) the resume state is correct BY CONSTRUCTION across a machine crash.
+    /// OFF it is correct by DETECTION: a chunk this run did not itself write is never counted
+    /// as "fresh", so `verify_summary` always re-hashes it and a file whose unsynced bytes
+    /// were lost fails verification and is re-sent — never silently accepted. What the fsync
+    /// buys is therefore not integrity but the cost of the recovery, and it is not free:
+    /// MEASURED at 20 000 files on loopback it was the receiver's largest non-futex syscall
+    /// cost, 22 529 calls and 18.4 s of blocking-pool time against a 5.76 s transfer.
+    ///
+    /// A clean interruption (Ctrl+C, a dropped network, a killed process) loses nothing
+    /// either way — the bytes are already in the kernel. Only a kernel panic or power loss
+    /// can reach them. rsync, rclone and croc all default to no per-file fsync for exactly
+    /// this reason; bore keeps the stricter default and lets the operator trade it.
+    ///
+    /// The ONE flag governs both halves. Syncing the journal while the data is unsynced
+    /// would be a durable claim about non-durable bytes — the combination that turns a
+    /// machine crash into a failed resume rather than a resumed one. See
+    /// `ResumeJournal::append`.
+    fsync_staged: bool,
 }
 
 #[derive(Clone, Debug)]
 struct ResumeRuntime {
     state: ResumeState,
+    /// `entry_id` -> position in `state.files`.
+    ///
+    /// Every completed chunk used to cost a LINEAR scan of the whole file list — twice
+    /// (`is_chunk_complete`, then `mark_chunk_complete`) — and `verify_summary` paid one
+    /// more per entry, so the receiver's bookkeeping was quadratic in the file count.
+    index: HashMap<u32, usize>,
     dirty_paths: BTreeSet<PathBuf>,
     pending_persist: u64,
+    /// Completions recorded since the last flush, written to the journal as one batch.
+    pending_journal: Vec<(u32, u32)>,
     fresh_chunks: BTreeMap<u32, u32>,
+}
+
+impl ResumeRuntime {
+    fn new(state: ResumeState) -> Self {
+        let index = state
+            .files
+            .iter()
+            .enumerate()
+            .map(|(pos, file)| (file.entry_id, pos))
+            .collect();
+        Self {
+            state,
+            index,
+            dirty_paths: BTreeSet::new(),
+            pending_persist: 0,
+            pending_journal: Vec::new(),
+            fresh_chunks: BTreeMap::new(),
+        }
+    }
+
+    fn file(&self, entry_id: u32) -> Result<&FileResumeState> {
+        let pos = *self
+            .index
+            .get(&entry_id)
+            .with_context(|| format!("resume state missing entry {}", entry_id))?;
+        self.state
+            .files
+            .get(pos)
+            .with_context(|| format!("resume state missing entry {}", entry_id))
+    }
+
+    fn file_mut(&mut self, entry_id: u32) -> Result<&mut FileResumeState> {
+        let pos = *self
+            .index
+            .get(&entry_id)
+            .with_context(|| format!("resume state missing entry {}", entry_id))?;
+        self.state
+            .files
+            .get_mut(pos)
+            .with_context(|| format!("resume state missing entry {}", entry_id))
+    }
+}
+
+/// Append-only record of completed chunks, sitting beside the `state.json` checkpoint.
+///
+/// The checkpoint used to be rewritten IN FULL every `RESUME_FLUSH_EVERY_CHUNKS`
+/// completions, which makes the receiver's write volume quadratic in the file count.
+/// MEASURED on loopback with 512 MiB of payload and `--parallel 8`, receiver bytes written
+/// per payload byte: 0.98x at 1 000 files, 1.21x at 5 000, **4.62x at 20 000** — 2.48 GB of
+/// disk writes to land 512 MiB — while receiver CPU went 0.71 s -> 8.52 s across the same
+/// sweep and throughput fell 825.8 -> 21.4 MB/s.
+///
+/// A journal record is 8 bytes and is appended, never rewritten, so the per-chunk cost is
+/// O(1). `state.json` is now written only at creation, on `reset_file`, and once at load
+/// after the journal has been folded into it — which is also what keeps the journal
+/// bounded at 8 bytes per chunk of a single run instead of growing across restarts.
+#[derive(Debug)]
+struct ResumeJournal {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl ResumeJournal {
+    fn new(path: PathBuf) -> Self {
+        Self { path, file: None }
+    }
+
+    /// Appends a batch. Blocking: only ever called from `spawn_blocking`.
+    ///
+    /// `durable` is `ResumeShared::fsync_staged` and is a PARAMETER rather than a field on
+    /// purpose: the journal's contract is "a chunk is announced complete only after its
+    /// bytes are durable", so the record's durability must equal the data's, and passing it
+    /// from the one call site that has just consulted the same flag makes them incapable of
+    /// diverging. A durable record of non-durable bytes is not merely wasted work (one
+    /// fsync per flush batch — 2 500 of them on a 20 000-file transfer): it is the exact
+    /// combination that turns a machine crash into a FAILED resume, because the journal
+    /// then claims chunks the page cache never wrote, the commit-time re-hash rejects the
+    /// file and the whole file is re-sent.
+    ///
+    /// Skipping the sync costs nothing anywhere else. A Ctrl+C, a dropped link or a killed
+    /// process leave BOTH the data and the journal in the kernel, so resume behaves exactly
+    /// as with the strict policy; only a kernel panic or a power cut can reach either, and
+    /// `--no-fsync` has already forfeited the data to those.
+    fn append(&mut self, records: &[(u32, u32)], durable: bool) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        if self.file.is_none() {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .with_context(|| {
+                    format!("failed to open resume journal {}", self.path.display())
+                })?;
+            self.file = Some(file);
+        }
+        let file = self
+            .file
+            .as_mut()
+            .expect("resume journal handle was just opened");
+        let mut buf = Vec::with_capacity(records.len() * RESUME_JOURNAL_RECORD);
+        for (entry_id, chunk_index) in records {
+            buf.extend_from_slice(&entry_id.to_le_bytes());
+            buf.extend_from_slice(&chunk_index.to_le_bytes());
+        }
+        file.write_all(&buf)
+            .with_context(|| format!("failed to append to {}", self.path.display()))?;
+        if durable {
+            file.sync_data()
+                .with_context(|| format!("failed to sync {}", self.path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn truncate(&mut self) -> Result<()> {
+        self.file = None;
+        remove_if_present(&self.path)
+    }
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+async fn journal_append(
+    journal: &Arc<StdMutex<ResumeJournal>>,
+    records: Vec<(u32, u32)>,
+    durable: bool,
+) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let journal = Arc::clone(journal);
+    spawn_blocking(move || {
+        let mut guard = journal
+            .lock()
+            .map_err(|_| anyhow!("resume journal lock poisoned"))?;
+        guard.append(&records, durable)
+    })
+    .await
+    .context("resume journal append task failed")?
+}
+
+async fn journal_truncate(journal: &Arc<StdMutex<ResumeJournal>>) -> Result<()> {
+    let journal = Arc::clone(journal);
+    spawn_blocking(move || {
+        let mut guard = journal
+            .lock()
+            .map_err(|_| anyhow!("resume journal lock poisoned"))?;
+        guard.truncate()
+    })
+    .await
+    .context("resume journal truncate task failed")?
+}
+
+/// Folds a journal into a checkpoint, returning how many completions it added.
+///
+/// The operation is a set UNION, so replaying the same journal twice is a no-op — that is
+/// what makes a crash between "checkpoint written" and "journal removed" harmless. A crash
+/// mid-append leaves a torn tail of fewer than `RESUME_JOURNAL_RECORD` bytes; it is
+/// discarded and the chunk is simply re-sent, which is the same outcome the old
+/// "lose up to `RESUME_FLUSH_EVERY_CHUNKS` completions" behaviour had.
+fn apply_resume_journal(state: &mut ResumeState, path: &Path) -> Result<u64> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to open resume journal {}", path.display()))
+        }
+    };
+    let index: HashMap<u32, usize> = state
+        .files
+        .iter()
+        .enumerate()
+        .map(|(pos, file)| (file.entry_id, pos))
+        .collect();
+    let mut reader = std::io::BufReader::new(file);
+    let mut record = [0u8; RESUME_JOURNAL_RECORD];
+    let mut applied = 0u64;
+    loop {
+        match reader.read_exact(&mut record) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read resume journal {}", path.display()))
+            }
+        }
+        let entry_id = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
+        let chunk_index = u32::from_le_bytes([record[4], record[5], record[6], record[7]]);
+        // A record naming an entry or chunk this manifest does not have can only come from
+        // a journal that outlived its state file; ignore it rather than fail the resume.
+        let Some(&pos) = index.get(&entry_id) else {
+            continue;
+        };
+        let Some(file) = state.files.get_mut(pos) else {
+            continue;
+        };
+        if let Some(slot) = file.completed.get_mut(chunk_index as usize) {
+            if !*slot {
+                *slot = true;
+                applied += 1;
+            }
+        }
+    }
+    Ok(applied)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -513,6 +781,11 @@ impl ProgressHandle {
 
 pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
     test_seam::warn_if_active();
+    // Each worker keeps up to FILE_CACHE_PER_WORKER open files on top of the transfer's own
+    // sockets; make sure the soft descriptor limit can cover the worst case before the first
+    // one is opened. Same reason the server reconciles it (P-12): EMFILE is not local to the
+    // open that overflowed.
+    crate::fdlimit::reconcile_fd_limit(MAX_PARALLEL as usize * FILE_CACHE_PER_WORKER);
     let transfer_id = options
         .transfer_id
         .clone()
@@ -611,6 +884,7 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
             options.ask_confirm,
             options.confirm_timeout,
             options.stall_timeout,
+            !options.no_fsync,
         )
         .await;
 
@@ -664,6 +938,11 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
 
 pub async fn run_sender(options: SenderOptions) -> Result<TransferOutcome> {
     test_seam::warn_if_active();
+    // Each worker keeps up to FILE_CACHE_PER_WORKER open files on top of the transfer's own
+    // sockets; make sure the soft descriptor limit can cover the worst case before the first
+    // one is opened. Same reason the server reconciles it (P-12): EMFILE is not local to the
+    // open that overflowed.
+    crate::fdlimit::reconcile_fd_limit(MAX_PARALLEL as usize * FILE_CACHE_PER_WORKER);
     let transfer_id = options
         .transfer_id
         .clone()
@@ -903,6 +1182,60 @@ async fn send_transfer(
     })
 }
 
+/// A small LRU of open files, shared in shape by both workers.
+///
+/// It exists to spare a re-open when consecutive chunks of one LARGE file land on the same
+/// worker. The `HashMap` it replaces was UNBOUNDED, so a transfer of many small files — where
+/// the cache can never hit, one chunk per file — grew it to one descriptor per file and died
+/// with `Too many open files (os error 24)`. See `FILE_CACHE_PER_WORKER`.
+struct OpenFiles<K: Eq + std::hash::Hash + Clone> {
+    map: HashMap<K, tokio::fs::File>,
+    order: VecDeque<K>,
+    cap: usize,
+}
+
+impl<K: Eq + std::hash::Hash + Clone> OpenFiles<K> {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    fn get_mut(&mut self, key: &K) -> Option<&mut tokio::fs::File> {
+        if !self.map.contains_key(key) {
+            return None;
+        }
+        if let Some(pos) = self.order.iter().position(|existing| existing == key) {
+            let touched = self
+                .order
+                .remove(pos)
+                .expect("position came from this deque");
+            self.order.push_back(touched);
+        }
+        self.map.get_mut(key)
+    }
+
+    /// Inserts and returns whatever had to leave to stay within `cap`.
+    ///
+    /// The evicted file is handed BACK rather than dropped here because a `tokio::fs::File`
+    /// buffers writes: the receiver must flush it, and only the caller knows whether this
+    /// cache holds readers or writers.
+    fn insert(&mut self, key: K, file: tokio::fs::File) -> Option<tokio::fs::File> {
+        if let Some(replaced) = self.map.insert(key.clone(), file) {
+            return Some(replaced);
+        }
+        self.order.push_back(key);
+        if self.map.len() > self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                return self.map.remove(&oldest);
+            }
+        }
+        None
+    }
+}
+
 async fn send_chunked_files(
     local_addr: std::net::SocketAddr,
     transfer_id: &str,
@@ -933,7 +1266,15 @@ async fn send_chunked_files(
             .await?;
             progress.worker_started();
             let worker_result = async {
-                let mut file_cache: HashMap<PathBuf, tokio::fs::File> = HashMap::new();
+                let mut file_cache: OpenFiles<PathBuf> = OpenFiles::new(FILE_CACHE_PER_WORKER);
+                // One buffer per worker, reused for every chunk. A fresh `vec![0u8; len]`
+                // per chunk allocated AND zeroed a megabyte that the very next read
+                // overwrites in full — pure cost, and at a megabyte it is large enough for
+                // glibc to hand it back to the kernel and take the page faults again on the
+                // next chunk. The buffer grows to the largest chunk seen and never shrinks,
+                // so the steady state is CHUNK_SIZE per worker: the same peak the old code
+                // reached transiently anyway.
+                let mut chunk_buf: Vec<u8> = Vec::new();
                 loop {
                     let task = {
                         let mut guard = queue.lock().await;
@@ -949,21 +1290,26 @@ async fn send_chunked_files(
                     if !task.rel_path.is_empty() {
                         progress.set_current(display_rel_path(&task.rel_path));
                     }
-                    let chunk = {
-                        let file = if let Some(f) = file_cache.get_mut(&task.path) {
-                            f
-                        } else {
-                            let f = tokio::fs::File::open(&task.path).await.with_context(|| {
-                                format!("failed to open source file {}", task.path.display())
-                            })?;
-                            file_cache.entry(task.path.clone()).or_insert(f)
-                        };
+                    if chunk_buf.len() < task.len as usize {
+                        chunk_buf.resize(task.len as usize, 0);
+                    }
+                    let chunk = &mut chunk_buf[..task.len as usize];
+                    {
+                        if file_cache.get_mut(&task.path).is_none() {
+                            let opened =
+                                tokio::fs::File::open(&task.path).await.with_context(|| {
+                                    format!("failed to open source file {}", task.path.display())
+                                })?;
+                            // Read-only handles: an eviction just closes.
+                            file_cache.insert(task.path.clone(), opened);
+                        }
+                        let file = file_cache
+                            .get_mut(&task.path)
+                            .expect("source file was just cached");
                         file.seek(std::io::SeekFrom::Start(task.offset)).await?;
-                        let mut buf = vec![0u8; task.len as usize];
-                        file.read_exact(&mut buf).await?;
-                        buf
-                    };
-                    let digest = blake3::hash(&chunk).to_hex().to_string();
+                        file.read_exact(chunk).await?;
+                    }
+                    let digest = blake3::hash(chunk).to_hex().to_string();
                     send_frame(
                         &mut stream,
                         &Frame::ChunkStart {
@@ -975,7 +1321,7 @@ async fn send_chunked_files(
                         },
                     )
                     .await?;
-                    write_all_idle(&mut stream, &chunk, stall_timeout).await?;
+                    write_all_idle(&mut stream, chunk, stall_timeout).await?;
                     progress.add_bytes(task.len as u64);
                     let count = sent.fetch_add(1, Ordering::Relaxed) + 1;
                     if let Some(limit) = injected_limit {
@@ -1072,6 +1418,7 @@ async fn send_stdin_stream(
     summary_from_materialized_entries(&[manifest])
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_transfer(
     mut control: TcpStream,
     incoming: &mut mpsc::UnboundedReceiver<TcpStream>,
@@ -1080,6 +1427,7 @@ async fn receive_transfer(
     ask_confirm: bool,
     confirm_timeout: u64,
     stall_timeout: u64,
+    fsync_staged: bool,
 ) -> Result<TransferOutcome> {
     // Tracks the stdin temp stage dir so we can clean it up on failure (F5).
     let mut cleanup_stdin_dir: Option<PathBuf> = None;
@@ -1114,7 +1462,15 @@ async fn receive_transfer(
         );
 
         let plan =
-            receive_manifest(&mut control, begin, &dest_root, collision, stall_timeout).await?;
+            receive_manifest(
+                &mut control,
+                begin,
+                &dest_root,
+                collision,
+                stall_timeout,
+                fsync_staged,
+            )
+            .await?;
 
         // Idempotent re-completion: the destination already holds content identical to this
         // manifest (a prior run committed but the Completed frame was lost, or the user simply
@@ -1255,6 +1611,14 @@ async fn receive_transfer(
         let local_summary = verify_summary(&plan).await?;
         if sender_summary != local_summary {
             bail!("sender summary does not match receiver state");
+        }
+        // Release the journal handle BEFORE the staging directory is removed. Unix
+        // unlinks an open file happily, but Windows refuses to remove a directory that
+        // still holds one and `commit_stage` swallows that error — the transfer would
+        // report success while leaving its state directory behind for every later run of
+        // the same transfer id to find.
+        if let Some(resume) = &plan.resume {
+            resume.close_journal().await?;
         }
         commit_stage(&plan, collision).await?;
         send_frame(
@@ -1523,7 +1887,10 @@ async fn handle_worker_connection(
     stall_timeout: u64,
 ) -> Result<()> {
     progress.worker_started();
-    let mut file_cache: HashMap<u32, tokio::fs::File> = HashMap::new();
+    let mut file_cache: OpenFiles<u32> = OpenFiles::new(FILE_CACHE_PER_WORKER);
+    // Reused for every chunk — see the sender's `chunk_buf` for why a per-chunk
+    // `vec![0u8; len]` is pure cost.
+    let mut payload_buf: Vec<u8> = Vec::new();
     let worker_result = async {
         loop {
             match with_stall(stall_timeout, recv_frame(&mut stream)).await? {
@@ -1543,9 +1910,12 @@ async fn handle_worker_connection(
                         bail!("chunk data is only valid for regular files");
                     }
                     validate_chunk_geometry(&entry, chunk_index, offset, len)?;
-                    let mut payload = vec![0u8; len as usize];
-                    read_exact_idle(&mut stream, &mut payload, stall_timeout).await?;
-                    let local_hash = blake3::hash(&payload).to_hex().to_string();
+                    if payload_buf.len() < len as usize {
+                        payload_buf.resize(len as usize, 0);
+                    }
+                    let payload = &mut payload_buf[..len as usize];
+                    read_exact_idle(&mut stream, payload, stall_timeout).await?;
+                    let local_hash = blake3::hash(payload).to_hex().to_string();
                     if local_hash != blake3 {
                         bail!(
                             "chunk hash mismatch for {} chunk {}",
@@ -1555,10 +1925,8 @@ async fn handle_worker_connection(
                     }
                     if !resume.is_chunk_complete(entry_id, chunk_index).await? {
                         let path = stage_path(&resume.stage_root, &entry.rel_path)?;
-                        let file = if let Some(f) = file_cache.get_mut(&entry_id) {
-                            f
-                        } else {
-                            let f = tokio::fs::OpenOptions::new()
+                        if file_cache.get_mut(&entry_id).is_none() {
+                            let opened = tokio::fs::OpenOptions::new()
                                 .create(false)
                                 .truncate(false)
                                 .write(true)
@@ -1567,10 +1935,22 @@ async fn handle_worker_connection(
                                 .with_context(|| {
                                     format!("failed to open staged file {}", path.display())
                                 })?;
-                            file_cache.entry(entry_id).or_insert(f)
-                        };
+                            if let Some(mut evicted) = file_cache.insert(entry_id, opened) {
+                                evicted.flush().await?;
+                            }
+                        }
+                        let file = file_cache
+                            .get_mut(&entry_id)
+                            .expect("staged file was just cached");
                         file.seek(std::io::SeekFrom::Start(offset)).await?;
-                        file.write_all(&payload).await?;
+                        file.write_all(payload).await?;
+                        // `tokio::fs::File::write_all` returns once the bytes are in the
+                        // File's OWN buffer, with the write still queued on the blocking
+                        // pool. `sync_staged_files` re-opens the path BY NAME, so without
+                        // this flush the fsync could run against a file description that has
+                        // not seen the bytes — the resume state would then record a chunk as
+                        // durable while its data was still inside this process.
+                        file.flush().await?;
                         resume
                             .mark_chunk_complete(entry_id, chunk_index, &path)
                             .await?;
@@ -1686,6 +2066,7 @@ async fn receive_manifest(
     dest_root: &Path,
     collision: CollisionPolicy,
     stall_timeout: u64,
+    fsync_staged: bool,
 ) -> Result<ReceiverPlan> {
     if begin.total_entries > MAX_MANIFEST_ENTRIES {
         bail!(
@@ -1779,6 +2160,7 @@ async fn receive_manifest(
     }
 
     let state_file = stage_dir.join(RESUME_STATE_FILE);
+    let journal_file = stage_dir.join(RESUME_JOURNAL_FILE);
     let existing_state = if fs::try_exists(&state_file).await? {
         load_resume_state(&state_file).await?
     } else {
@@ -1800,6 +2182,29 @@ async fn receive_manifest(
                 begin.transfer_id,
                 stage_dir.display()
             );
+        }
+        // Fold the journal into the checkpoint BEFORE planning: the checkpoint on disk is
+        // only as fresh as the last `reset_file`/creation, and everything completed since
+        // then lives in the journal. Re-writing the checkpoint and dropping the journal here
+        // is also what bounds the journal at 8 bytes per chunk of one run.
+        let (state, replayed) = {
+            let journal_file = journal_file.clone();
+            spawn_blocking(move || {
+                let mut state = state;
+                let applied = apply_resume_journal(&mut state, &journal_file)?;
+                Ok::<_, anyhow::Error>((state, applied))
+            })
+            .await
+            .context("resume journal replay task failed")??
+        };
+        if replayed > 0 {
+            debug!(
+                transfer_id = %begin.transfer_id,
+                chunks = replayed,
+                "replayed resume journal into the checkpoint"
+            );
+            persist_resume_state(&state_file, &state).await?;
+            truncate_resume_journal(&journal_file).await?;
         }
         let (resumed_bytes, resume_plan) = build_resume_plan(&entries, &state)?;
         let final_name_local = decode_component(&state.final_name);
@@ -1840,6 +2245,9 @@ async fn receive_manifest(
                 .collect(),
         };
         persist_resume_state(&state_file, &state).await?;
+        // A journal left behind by an earlier transfer that reused this staging directory
+        // would otherwise be replayed against an unrelated manifest.
+        truncate_resume_journal(&journal_file).await?;
         (final_name, final_name_local, state, 0, Vec::new())
     };
     let stage_root = stage_dir.join(&final_name_local);
@@ -1855,13 +2263,10 @@ async fn receive_manifest(
                 .map(|entry| (entry.id, entry))
                 .collect(),
         ),
-        runtime: Arc::new(AsyncMutex::new(ResumeRuntime {
-            state,
-            dirty_paths: BTreeSet::new(),
-            pending_persist: 0,
-            fresh_chunks: BTreeMap::new(),
-        })),
+        runtime: Arc::new(AsyncMutex::new(ResumeRuntime::new(state))),
         persist_lock: Arc::new(AsyncMutex::new(())),
+        journal: Arc::new(StdMutex::new(ResumeJournal::new(journal_file))),
+        fsync_staged,
     });
 
     // For multi_source, final_path is dest_root (already exists); commit_stage
@@ -1888,25 +2293,30 @@ async fn receive_manifest(
 }
 
 async fn prepare_stage_entries(stage_root: &Path, entries: &[ManifestEntry]) -> Result<()> {
+    // One `create_dir_all` per DISTINCT parent, not one per entry. A flat tree of N files
+    // made N-1 redundant calls that all returned EEXIST — MEASURED at 5 000 files: 5 001 of
+    // 5 003 `mkdir` syscalls on the receiver.
+    let mut ensured: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut regular: Vec<(PathBuf, u64)> = Vec::new();
     for entry in entries {
         let path = stage_path(stage_root, &entry.rel_path)?;
         match entry.kind {
             EntryKind::Directory => {
-                fs::create_dir_all(&path).await?;
+                if ensured.insert(path.clone()) {
+                    fs::create_dir_all(&path).await?;
+                }
             }
             EntryKind::RegularFile => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).await?;
-                }
-                prepare_regular_file(&path, entry.size.unwrap_or(0)).await?;
+                ensure_stage_parent(&path, &mut ensured).await?;
+                // Deferred so the whole set can be created concurrently; the parent has
+                // already been ensured above, so this does not depend on manifest order.
+                regular.push((path, entry.size.unwrap_or(0)));
             }
             EntryKind::Symlink => {
                 if path_exists(&path).await? {
                     continue;
                 }
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).await?;
-                }
+                ensure_stage_parent(&path, &mut ensured).await?;
                 let target = decode_native_path(
                     entry
                         .symlink_target
@@ -1919,32 +2329,67 @@ async fn prepare_stage_entries(stage_root: &Path, entries: &[ManifestEntry]) -> 
                 if path_exists(&path).await? {
                     continue;
                 }
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).await?;
-                }
+                ensure_stage_parent(&path, &mut ensured).await?;
                 create_device(entry, &path).await?;
             }
         }
     }
+    prepare_regular_files(regular).await
+}
+
+async fn ensure_stage_parent(
+    path: &Path,
+    ensured: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if ensured.contains(parent) {
+        return Ok(());
+    }
+    fs::create_dir_all(parent).await?;
+    ensured.insert(parent.to_path_buf());
     Ok(())
 }
 
-async fn prepare_regular_file(path: &Path, size: u64) -> Result<()> {
-    let path = path.to_path_buf();
-    spawn_blocking(move || {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("failed to open staged file {}", path.display()))?;
-        file.set_len(size)
-            .with_context(|| format!("failed to resize staged file {}", path.display()))?;
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("regular file preparation task failed")?
+/// Creates and sizes every staged regular file, `STAGE_FANOUT` batches at a time.
+///
+/// This is the receiver's whole cost before the first byte can land, and it used to be one
+/// `spawn_blocking` round trip per file, strictly serial.
+async fn prepare_regular_files(files: Vec<(PathBuf, u64)>) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let batches = STAGE_FANOUT.min(files.len());
+    let per_batch = files.len().div_ceil(batches);
+    let mut joins = Vec::with_capacity(batches);
+    for batch in files.chunks(per_batch) {
+        let batch = batch.to_vec();
+        joins.push(spawn_blocking(move || {
+            for (path, size) in batch {
+                prepare_regular_file_blocking(&path, size)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }));
+    }
+    for join in joins {
+        join.await
+            .context("regular file preparation task failed")??;
+    }
+    Ok(())
+}
+
+fn prepare_regular_file_blocking(path: &Path, size: u64) -> Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open staged file {}", path.display()))?;
+    file.set_len(size)
+        .with_context(|| format!("failed to resize staged file {}", path.display()))?;
+    Ok(())
 }
 
 fn validate_manifest(begin: &BeginFrame, entries: &[ManifestEntry]) -> Result<()> {
@@ -3002,13 +3447,8 @@ fn update_transfer_hash(
 impl ResumeShared {
     async fn is_chunk_complete(&self, entry_id: u32, chunk_index: u32) -> Result<bool> {
         let runtime = self.runtime.lock().await;
-        let file = runtime
-            .state
-            .files
-            .iter()
-            .find(|file| file.entry_id == entry_id)
-            .with_context(|| format!("resume state missing entry {}", entry_id))?;
-        Ok(file
+        Ok(runtime
+            .file(entry_id)?
             .completed
             .get(chunk_index as usize)
             .copied()
@@ -3023,24 +3463,28 @@ impl ResumeShared {
     ) -> Result<()> {
         let should_flush = {
             let mut runtime = self.runtime.lock().await;
-            let file = runtime
-                .state
-                .files
-                .iter_mut()
-                .find(|file| file.entry_id == entry_id)
-                .with_context(|| format!("resume state missing entry {}", entry_id))?;
-            let slot = file
-                .completed
-                .get_mut(chunk_index as usize)
-                .with_context(|| {
-                    format!(
-                        "chunk {} is out of range for entry {}",
-                        chunk_index, entry_id
-                    )
-                })?;
-            *slot = true;
+            let newly_complete = {
+                let file = runtime.file_mut(entry_id)?;
+                let slot = file
+                    .completed
+                    .get_mut(chunk_index as usize)
+                    .with_context(|| {
+                        format!(
+                            "chunk {} is out of range for entry {}",
+                            chunk_index, entry_id
+                        )
+                    })?;
+                let was_complete = *slot;
+                *slot = true;
+                !was_complete
+            };
+            if newly_complete {
+                runtime.pending_journal.push((entry_id, chunk_index));
+            }
             *runtime.fresh_chunks.entry(entry_id).or_default() += 1;
-            runtime.dirty_paths.insert(path.to_path_buf());
+            if self.fsync_staged {
+                runtime.dirty_paths.insert(path.to_path_buf());
+            }
             runtime.pending_persist += 1;
             runtime.pending_persist >= RESUME_FLUSH_EVERY_CHUNKS
         };
@@ -3054,21 +3498,30 @@ impl ResumeShared {
         let _persist = self.persist_lock.lock().await;
         let snapshot = {
             let mut runtime = self.runtime.lock().await;
-            if runtime.pending_persist == 0 && runtime.dirty_paths.is_empty() {
+            if runtime.pending_persist == 0
+                && runtime.dirty_paths.is_empty()
+                && runtime.pending_journal.is_empty()
+            {
                 None
             } else {
                 runtime.pending_persist = 0;
                 Some((
-                    runtime.state.clone(),
                     std::mem::take(&mut runtime.dirty_paths)
                         .into_iter()
                         .collect::<Vec<_>>(),
+                    std::mem::take(&mut runtime.pending_journal),
                 ))
             }
         };
-        if let Some((state, paths)) = snapshot {
-            sync_staged_files(&paths).await?;
-            persist_resume_state(&self.state_file, &state).await?;
+        if let Some((paths, records)) = snapshot {
+            // Data first, record second: a chunk is announced complete only after its bytes
+            // are durable. Reversing the two would let a resume skip a chunk it never wrote.
+            if self.fsync_staged {
+                sync_staged_files(&paths).await?;
+            }
+            // Same flag, one line apart: the record is exactly as durable as the bytes it
+            // describes. See `ResumeJournal::append`.
+            journal_append(&self.journal, records, self.fsync_staged).await?;
         }
         Ok(())
     }
@@ -3080,30 +3533,38 @@ impl ResumeShared {
 
     async fn all_chunks_complete(&self, entry_id: u32) -> Result<bool> {
         let runtime = self.runtime.lock().await;
-        let file = runtime
-            .state
-            .files
-            .iter()
-            .find(|file| file.entry_id == entry_id)
-            .with_context(|| format!("resume state missing entry {}", entry_id))?;
-        Ok(file.completed.iter().all(|done| *done))
+        Ok(runtime.file(entry_id)?.completed.iter().all(|done| *done))
+    }
+
+    /// Drops the journal's open file handle. See the call site in `receive_transfer`.
+    async fn close_journal(&self) -> Result<()> {
+        let journal = Arc::clone(&self.journal);
+        spawn_blocking(move || {
+            let mut guard = journal
+                .lock()
+                .map_err(|_| anyhow!("resume journal lock poisoned"))?;
+            guard.file = None;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("resume journal close task failed")?
     }
 
     async fn reset_file(&self, entry_id: u32) -> Result<()> {
         let _persist = self.persist_lock.lock().await;
         let state = {
             let mut runtime = self.runtime.lock().await;
-            let file = runtime
-                .state
-                .files
-                .iter_mut()
-                .find(|file| file.entry_id == entry_id)
-                .with_context(|| format!("resume state missing entry {}", entry_id))?;
-            file.completed.fill(false);
+            runtime.file_mut(entry_id)?.completed.fill(false);
             runtime.pending_persist = 0;
+            runtime.pending_journal.clear();
             runtime.state.clone()
         };
-        persist_resume_state(&self.state_file, &state).await
+        // Checkpoint first, then drop the journal. The checkpoint already carries every
+        // completion the journal held, and a replay is a set union, so a crash in between
+        // only re-marks chunks that the commit-time re-hash checks anyway (a resumed chunk
+        // is never counted as "fresh", so it is always re-hashed).
+        persist_resume_state(&self.state_file, &state).await?;
+        journal_truncate(&self.journal).await
     }
 }
 
@@ -3150,6 +3611,14 @@ async fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 async fn persist_resume_state(path: &Path, state: &ResumeState) -> Result<()> {
     write_json_atomic(path, state).await
+}
+
+/// Removes a journal by path, for the setup paths that run before a `ResumeJournal` exists.
+async fn truncate_resume_journal(path: &Path) -> Result<()> {
+    let path = path.to_path_buf();
+    spawn_blocking(move || remove_if_present(&path))
+        .await
+        .context("resume journal truncate task failed")?
 }
 
 /// Load the resume state, treating a corrupt/unparseable file (crash mid-write on a
@@ -3297,8 +3766,14 @@ async fn send_frame<S: AsyncWrite + Unpin>(stream: &mut S, frame: &Frame) -> Res
     if payload.len() > FRAME_LIMIT {
         bail!("transfer frame exceeds configured limit");
     }
-    stream.write_u32_le(payload.len() as u32).await?;
-    stream.write_all(&payload).await?;
+    // Header and body go out as ONE write. Two writes on a TCP_NODELAY socket put the
+    // 4-byte length prefix on the wire as its own segment, so every frame cost an extra
+    // syscall and an extra packet — MEASURED at 20 000 files: 137 476 `sendto` calls for
+    // 20 000 chunks, 6.9 per chunk.
+    let mut framed = Vec::with_capacity(4 + payload.len());
+    framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    framed.extend_from_slice(&payload);
+    stream.write_all(&framed).await?;
     Ok(())
 }
 
@@ -3681,27 +4156,40 @@ fn chunk_len(size: u64, chunk_index: u32) -> u64 {
     size.saturating_sub(offset).min(CHUNK_SIZE as u64)
 }
 
+/// Makes the staged bytes durable before the journal records the chunks as complete.
+///
+/// Fanned out across the blocking pool: this runs while `persist_lock` is held, so a serial
+/// chain of fdatasyncs here is time during which EVERY worker that completes a chunk is
+/// blocked. MEASURED at 5 000 files, fdatasync was the receiver's largest non-futex syscall
+/// cost at 227 us per call.
 async fn sync_staged_files(paths: &[PathBuf]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
-    let paths = paths.to_vec();
-    spawn_blocking(move || {
-        for path in paths {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .with_context(|| {
-                    format!("failed to reopen staged file {} for sync", path.display())
-                })?;
-            file.sync_data()
-                .with_context(|| format!("failed to sync staged file {}", path.display()))?;
-        }
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("stage file sync task failed")?
+    let batches = STAGE_FANOUT.min(paths.len());
+    let per_batch = paths.len().div_ceil(batches);
+    let mut joins = Vec::with_capacity(batches);
+    for batch in paths.chunks(per_batch) {
+        let batch = batch.to_vec();
+        joins.push(spawn_blocking(move || {
+            for path in batch {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .with_context(|| {
+                        format!("failed to reopen staged file {} for sync", path.display())
+                    })?;
+                file.sync_data()
+                    .with_context(|| format!("failed to sync staged file {}", path.display()))?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }));
+    }
+    for join in joins {
+        join.await.context("stage file sync task failed")??;
+    }
+    Ok(())
 }
 
 async fn hash_file_async(path: &Path) -> Result<String> {
@@ -4937,6 +5425,7 @@ mod tests {
             dir.path(),
             CollisionPolicy::Fail,
             5,
+            true,
         )
         .await
         .unwrap_err();
@@ -4944,6 +5433,124 @@ mod tests {
             err.to_string().contains("above the supported maximum"),
             "expected the manifest-entry cap error, got: {err}"
         );
+    }
+
+    fn resume_state_with(files: &[(u32, usize)]) -> ResumeState {
+        ResumeState {
+            protocol_version: PROTOCOL_VERSION,
+            transfer_id: "t".into(),
+            manifest_hash: "h".into(),
+            final_name: "n".into(),
+            files: files
+                .iter()
+                .map(|(entry_id, chunks)| FileResumeState {
+                    entry_id: *entry_id,
+                    completed: vec![false; *chunks],
+                })
+                .collect(),
+        }
+    }
+
+    fn write_journal(path: &Path, records: &[(u32, u32)], trailing_junk: usize) {
+        let mut buf = Vec::new();
+        for (entry_id, chunk_index) in records {
+            buf.extend_from_slice(&entry_id.to_le_bytes());
+            buf.extend_from_slice(&chunk_index.to_le_bytes());
+        }
+        buf.extend(std::iter::repeat_n(0xABu8, trailing_junk));
+        std::fs::write(path, buf).unwrap();
+    }
+
+    #[test]
+    fn the_journal_record_format_does_not_depend_on_the_fsync_policy() {
+        // `durable` may only decide whether the batch is fsynced. If it ever came to decide
+        // anything about WHAT is written — a different buffering, a skipped record — then a
+        // `--no-fsync` transfer and a default one would produce journals that replay
+        // differently, and the resume path is shared by both.
+        let dir = tempfile::tempdir().unwrap();
+        let records = [(7u32, 0u32), (7, 2), (9, 0)];
+        let mut bytes = Vec::new();
+        for durable in [true, false] {
+            let path = dir.path().join(format!("state-{durable}.log"));
+            let mut journal = ResumeJournal::new(path.clone());
+            journal.append(&records, durable).unwrap();
+            bytes.push(std::fs::read(&path).unwrap());
+        }
+        assert_eq!(bytes[0], bytes[1]);
+        assert_eq!(bytes[0].len(), records.len() * RESUME_JOURNAL_RECORD);
+    }
+
+    #[test]
+    fn replaying_a_journal_is_a_set_union_and_replaying_it_twice_changes_nothing() {
+        // This idempotence is what makes a crash between "checkpoint written" and
+        // "journal removed" harmless: the second boot replays records the checkpoint
+        // already contains and nothing moves.
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("state.log");
+        write_journal(&journal, &[(7, 0), (7, 2), (9, 0), (7, 0)], 0);
+        let mut state = resume_state_with(&[(7, 3), (9, 1)]);
+        assert_eq!(apply_resume_journal(&mut state, &journal).unwrap(), 3);
+        assert_eq!(state.files[0].completed, vec![true, false, true]);
+        assert_eq!(state.files[1].completed, vec![true]);
+        assert_eq!(apply_resume_journal(&mut state, &journal).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_journal_torn_by_a_crash_mid_append_keeps_every_whole_record() {
+        // A crash during the append leaves fewer than RESUME_JOURNAL_RECORD trailing
+        // bytes. Those are dropped and the chunk is re-sent — the same outcome the old
+        // "lose up to RESUME_FLUSH_EVERY_CHUNKS completions" behaviour had. What must
+        // NOT happen is the whole journal being rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("state.log");
+        write_journal(&journal, &[(1, 0), (1, 1)], RESUME_JOURNAL_RECORD - 1);
+        let mut state = resume_state_with(&[(1, 3)]);
+        assert_eq!(apply_resume_journal(&mut state, &journal).unwrap(), 2);
+        assert_eq!(state.files[0].completed, vec![true, true, false]);
+    }
+
+    #[test]
+    fn a_journal_record_outside_this_manifest_is_ignored_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("state.log");
+        write_journal(&journal, &[(42, 0), (1, 99), (1, 0)], 0);
+        let mut state = resume_state_with(&[(1, 2)]);
+        assert_eq!(apply_resume_journal(&mut state, &journal).unwrap(), 1);
+        assert_eq!(state.files[0].completed, vec![true, false]);
+        // A journal that was never written at all is simply an empty one.
+        let missing = dir.path().join("absent.log");
+        assert_eq!(apply_resume_journal(&mut state, &missing).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_resume_index_answers_by_entry_id_not_by_position() {
+        // The linear scan this replaces made every completed chunk cost O(files).
+        let mut runtime = ResumeRuntime::new(resume_state_with(&[(5, 1), (3, 2), (11, 1)]));
+        assert_eq!(runtime.file(3).unwrap().completed.len(), 2);
+        runtime.file_mut(11).unwrap().completed[0] = true;
+        assert!(runtime.file(11).unwrap().completed[0]);
+        assert!(runtime.file(4).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_open_file_cache_evicts_the_least_recently_used_and_never_exceeds_its_cap() {
+        // The unbounded map this replaces ran a many-file transfer out of descriptors.
+        let dir = tempfile::tempdir().unwrap();
+        let open = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"x").unwrap();
+            async move { tokio::fs::File::open(&path).await.unwrap() }
+        };
+        let mut cache: OpenFiles<u32> = OpenFiles::new(2);
+        assert!(cache.insert(1, open("a").await).is_none());
+        assert!(cache.insert(2, open("b").await).is_none());
+        // Touching 1 makes 2 the oldest, so inserting 3 must evict 2, not 1.
+        assert!(cache.get_mut(&1).is_some());
+        assert!(cache.insert(3, open("c").await).is_some());
+        assert_eq!(cache.map.len(), 2);
+        assert!(cache.get_mut(&2).is_none());
+        assert!(cache.get_mut(&1).is_some());
+        assert!(cache.get_mut(&3).is_some());
     }
 
     #[tokio::test]
@@ -4972,6 +5579,7 @@ mod tests {
             dir.path(),
             CollisionPolicy::Fail,
             5,
+            true,
         )
         .await
         .unwrap_err();
@@ -5212,9 +5820,16 @@ mod tests {
                 .unwrap();
             manifest_client
         });
-        let plan = receive_manifest(&mut control, begin, dir.path(), CollisionPolicy::Fail, 5)
-            .await
-            .unwrap();
+        let plan = receive_manifest(
+            &mut control,
+            begin,
+            dir.path(),
+            CollisionPolicy::Fail,
+            5,
+            true,
+        )
+        .await
+        .unwrap();
         let mut manifest_client = feeder.await.unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel::<TcpStream>();

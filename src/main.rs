@@ -1106,6 +1106,19 @@ enum TransferCommand {
         /// Abort if no transfer data is received for this many seconds (0 = disabled; default 60).
         #[clap(long, default_value_t = 60)]
         stall_timeout: u64,
+
+        /// Skip the fsync that makes staged bytes durable before the resume journal records
+        /// them, and the journal's own. The two always move together: a durable record of
+        /// non-durable bytes would claim chunks a crash never wrote. Integrity is unaffected
+        /// either way: a chunk written by an earlier run is always re-hashed before commit,
+        /// so bytes lost to a machine crash fail verification, the run errors and resets
+        /// that file's resume state, and the next run re-sends it — nothing is accepted
+        /// silently. This only trades crash-recovery cost for throughput, and only a kernel
+        /// panic or power loss can reach the bytes at all: a Ctrl+C, a dropped link or a
+        /// killed process leave both the data and the journal in the kernel, so resume
+        /// works normally.
+        #[clap(long)]
+        no_fsync: bool,
     },
 
     /// Send a file, directory, or stdin stream.
@@ -1899,6 +1912,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 ask_confirm,
                 confirm_timeout,
                 stall_timeout,
+                no_fsync,
             } => {
                 let collision = match (overwrite, rename) {
                     (true, false) => CollisionPolicy::Overwrite,
@@ -1935,6 +1949,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     ask_confirm,
                     confirm_timeout,
                     stall_timeout,
+                    no_fsync,
                 })
                 .await?;
             }

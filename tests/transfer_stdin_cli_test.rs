@@ -324,19 +324,40 @@ fn resume_state_dir(dest_root: &Path, transfer_id: &str) -> PathBuf {
     dest_root.join(format!(".bore-transfer-state-{digest}"))
 }
 
+/// How many chunks the receiver has recorded as complete, across BOTH halves of the resume
+/// state: the `state.json` checkpoint and the `state.log` journal beside it.
+///
+/// In-flight progress lives in the journal — the checkpoint is written only at creation, at
+/// load (after the journal has been folded into it) and on a verification reset, because
+/// rewriting it per batch made the receiver's write volume quadratic in the file count.
+/// Polling the checkpoint alone would therefore never observe progress at all.
 async fn completed_chunks_in_state(path: &Path) -> Result<usize> {
-    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).await?)?;
-    let files = value
-        .get("files")
-        .and_then(serde_json::Value::as_array)
-        .context("resume state is missing files")?;
-    Ok(files
-        .iter()
-        .filter_map(|file| file.get("completed"))
-        .filter_map(serde_json::Value::as_array)
-        .flatten()
-        .filter(|done| done.as_bool().unwrap_or(false))
-        .count())
+    let checkpoint = match fs::read(path).await {
+        Ok(bytes) => {
+            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let files = value
+                .get("files")
+                .and_then(serde_json::Value::as_array)
+                .context("resume state is missing files")?;
+            files
+                .iter()
+                .filter_map(|file| file.get("completed"))
+                .filter_map(serde_json::Value::as_array)
+                .flatten()
+                .filter(|done| done.as_bool().unwrap_or(false))
+                .count()
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(err.into()),
+    };
+    // One 8-byte record per completion. A torn tail (a crash mid-append) is ignored here
+    // exactly as the receiver ignores it.
+    let journal = match fs::read(path.with_file_name("state.log")).await {
+        Ok(bytes) => bytes.len() / 8,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(err.into()),
+    };
+    Ok(checkpoint + journal)
 }
 
 async fn wait_for_completed_chunks(
@@ -345,7 +366,7 @@ async fn wait_for_completed_chunks(
     minimum: usize,
 ) -> Result<()> {
     for _ in 0..1000 {
-        // The listener rewrites the state file under us; a read that races a
+        // The listener rewrites the checkpoint under us; a read that races a
         // rewrite (a transient on Windows, where the atomic write has a
         // non-existence window) must not fail the test — just poll again.
         let chunks = completed_chunks_in_state(state_file).await.unwrap_or(0);
@@ -973,6 +994,59 @@ async fn source_files_cli() -> Result<()> {
         read_file(&dest_root.join("bundle/world.txt")).await?,
         b"world"
     );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+/// `--no-fsync` reaches the listener from the command line.
+///
+/// The flag has no observable effect on the RESULT — that is its whole point, and it is why
+/// its behaviour is gated in-process (`transfer_resume_carries_completed_chunks_with_no_fsync`
+/// in `transfer_test.rs`) and its *effect* only by measurement. What this test covers is the
+/// one thing neither of those can: that the CLI still hands the flag to `ListenerOptions`.
+/// A dropped line there would be silent — every transfer would keep working and simply pay
+/// the full durability cost, which is exactly the failure the campaign already made once,
+/// with a harness knob that was never wired through and quietly re-measured the default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_filesystem_no_fsync_listener_cli() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("nofsync-source");
+    let dest_root = temp_path("nofsync-dest");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let source_file = source_root.join("payload.bin");
+    let payload = patterned_bytes(1_500_000);
+    fs::write(&source_file, &payload).await?;
+
+    let transfer_id = format!("nofsync-{}", Uuid::new_v4());
+    let mut cmd = Command::new(bore_binary()?);
+    cmd.arg("transfer")
+        .arg("listener")
+        .arg("--dest-path")
+        .arg(&dest_root)
+        .arg("--to")
+        .arg("localhost")
+        .arg("--secret")
+        .arg("transfer-secret")
+        .arg("--transfer-id")
+        .arg(&transfer_id)
+        .arg("--relay-only")
+        .arg("--no-fsync");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let listener = cmd.spawn().context("failed to spawn --no-fsync listener")?;
+
+    time::sleep(Duration::from_millis(300)).await;
+    let sender = sender_filesystem_child(&transfer_id, &source_file, true, None, Some(2))?;
+    expect_success(wait_child_output(sender).await?, "no-fsync sender")?;
+    expect_success(wait_child_output(listener).await?, "no-fsync listener")?;
+
+    assert_eq!(read_file(&dest_root.join("payload.bin")).await?, payload);
 
     let _ = fs::remove_dir_all(&source_root).await;
     let _ = fs::remove_dir_all(&dest_root).await;

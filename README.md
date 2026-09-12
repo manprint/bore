@@ -1967,6 +1967,14 @@ What the transfer command guarantees in V2:
   worker count (capped at the server's `--max-carriers`). Set `--carriers 1` to force the old
   single-connection path, or a fixed `N` to pin it. On direct UDP, carriers are irrelevant:
   each transferred connection already uses an independent native QUIC stream.
+
+  **Where the flag actually earns its keep**: on the *direct* (hole-punched) path. A single
+  QUIC stream is bounded by `window / RTT`, so on a WAN one large file nearly doubles from
+  `--parallel 1` to `8` (measured workstation → `eu-south-1` VM: 39.8 → 70.8 MB/s). The
+  *relay* path is already at its ceiling with one stream — it rides the carrier pool over
+  TCP with the kernel's own autotuning underneath — and 16 streams cost a little rather than
+  buying anything (80.3 → 74.7 MB/s across the same sweep). The automatic default is right
+  for both; raise it by hand only on a punched path with a high bandwidth-delay product.
 - **Cross-platform path fidelity**: Unix raw-byte and Windows UTF-16 path components are
   preserved losslessly on the wire.
 - **Live path visibility** in the logs: `direct-udp` or `relay`, plus `quic-encrypted`,
@@ -1987,6 +1995,33 @@ Notes:
   no progress is made within the window.
 - `--persistent` (listener): stays alive after each transfer; per-transfer errors are logged
   but don't kill the listener.
+- `--no-fsync` (listener): skip the `fdatasync` that makes staged bytes durable before the
+  resume journal records their chunks — and, with them, the journal's own. The two always
+  move together: a durable record of non-durable bytes would claim chunks a crash never
+  wrote, which is the one combination that turns a crash into a *failed* resume instead of a
+  resumed one. **Integrity is unaffected either way** — a chunk written by an earlier run is
+  always re-hashed before commit, so bytes lost to a machine crash fail verification; the
+  run then errors, resets that file's resume state and the next run re-sends it. Nothing is
+  silently accepted. Only a kernel panic or a power cut can reach those bytes at all; a
+  Ctrl+C, a dropped link or a killed process cannot, because both the data and the journal
+  are already in the kernel and resume works normally. What the flag trades is
+  crash-recovery cost for throughput, and the price of the default is not small on transfers
+  with many files:
+
+  What it costs depends entirely on where the destination lives. On a tmpfs destination the
+  two policies are indistinguishable (1374 vs 1365 MB/s at 5 000 files) — flushing a page
+  that is already RAM costs nothing, so the price is the *device*, not bore. On real storage
+  it is real, and it only bites once the file count is high enough that the network is no
+  longer the constraint:
+
+  | 512 MiB over a real link (`--parallel 8`, relay) | default | `--no-fsync` |
+  | --- | --- | --- |
+  | 1 000 files | 72.6 MB/s | 71.1 MB/s |
+  | 5 000 files | 67.0 MB/s | 71.6 MB/s |
+  | 20 000 files | 21.4 MB/s | 60.5 MB/s |
+
+  rsync, rclone and croc all default to no per-file fsync. bore keeps the stricter default
+  and lets you trade it; on a single large file the two are indistinguishable.
 - Symlinks/devices are opt-in on the sender with `--symlinks include|exclude` and `--devices
   include|exclude`. Unix device transfer is meaningful only on Unix receivers and may need
   elevated privileges to recreate the device node.

@@ -114,6 +114,22 @@ fn listener_options(
     )
 }
 
+/// `listener_options` with the durability policy as the variable. The policy governs the
+/// resume JOURNAL as well as the staged bytes, so a resume test that only ever runs one of
+/// the two settings cannot see a journal that stopped being written under the other.
+fn listener_options_fsync(
+    transfer_id: String,
+    dest_path: PathBuf,
+    relay_only: bool,
+    carriers: u16,
+    stun_server: Option<String>,
+    no_fsync: bool,
+) -> ListenerOptions {
+    ListenerOptions {
+        no_fsync,
+        ..listener_options(transfer_id, dest_path, relay_only, carriers, stun_server)
+    }
+}
 fn listener_options_with_collision(
     transfer_id: String,
     dest_path: PathBuf,
@@ -140,6 +156,7 @@ fn listener_options_with_collision(
         ask_confirm: false,
         confirm_timeout: 120,
         stall_timeout: 0, // disabled in tests to avoid false timeouts
+        no_fsync: false,
     }
 }
 
@@ -243,6 +260,7 @@ async fn transfer_single_file_over_relay() -> Result<()> {
             ask_confirm: false,
             confirm_timeout: 120,
             stall_timeout: 0,
+            no_fsync: false,
         })
         .await
     });
@@ -684,6 +702,7 @@ async fn transfer_directory_preserves_structure() -> Result<()> {
             ask_confirm: false,
             confirm_timeout: 120,
             stall_timeout: 0,
+            no_fsync: false,
         })
         .await
     });
@@ -1157,6 +1176,126 @@ async fn transfer_resume_large_file_over_relay() -> Result<()> {
     Ok(())
 }
 
+/// The existing resume test asserts only that the final bytes are right, which a receiver
+/// that carried NOTHING across the interruption also satisfies — it just re-sends
+/// everything. This one fails in that case: the second run is capped at 16 chunks for a
+/// 21-chunk file, so it can only finish if several chunks survived the interruption.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_resume_carries_completed_chunks_across_the_interruption() -> Result<()> {
+    resume_carry_case(false).await
+}
+
+/// The same gate under `--no-fsync`. The flag makes the journal's own append unsynced, and
+/// an interruption that is not a machine crash — which is what this test performs, and what
+/// almost every real interruption is — leaves those records in the kernel exactly as it
+/// leaves the data. So resume must carry chunks here too: if it stops doing so, the flag
+/// has quietly become "no resume" rather than "no fsync".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_resume_carries_completed_chunks_with_no_fsync() -> Result<()> {
+    resume_carry_case(true).await
+}
+
+async fn resume_carry_case(no_fsync: bool) -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path(&format!("resume-carry-source-{no_fsync}"));
+    let dest_root = temp_path(&format!("resume-carry-dest-{no_fsync}"));
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let source_file = source_root.join("carry.bin");
+    // 21 chunks of 1 MiB. The margin is the point. The sender's injected limit is a GLOBAL
+    // count across its workers, and the worker that trips it bails immediately — so the
+    // other workers' in-flight chunks are lost with the connection, and how many the
+    // receiver actually recorded is a race with the teardown. With a three-chunk file and a
+    // cap of two that race decides the test: under a loaded machine the receiver can end up
+    // holding nothing, and the test fails for a reason that has nothing to do with resume.
+    // (It did: this gate's first full-suite run failed exactly that way while passing 3/3 in
+    // isolation.) 21 chunks capped at 16 leaves the receiver ~12 after the worst teardown,
+    // against the 5 the second run needs — while a receiver that truly remembered nothing
+    // still needs 21 and still dies.
+    let payload = patterned_bytes(20_971_520 + 777);
+    write_file(&source_file, &payload).await?;
+
+    let transfer_id = format!("resume-carry-{}", Uuid::new_v4());
+    let first_listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options_fsync(
+                transfer_id,
+                dest_root,
+                true,
+                4,
+                None,
+                no_fsync,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    std::env::set_var("BORE_TRANSFER_TEST_MAX_CHUNKS", "16");
+    let interrupted = bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        source_file.clone(),
+        None,
+        true,
+        4,
+        4,
+        None,
+    ))
+    .await;
+    assert!(interrupted.is_err(), "first sender run must be interrupted");
+    assert!(
+        first_listener
+            .await
+            .context("listener task join failed")?
+            .is_err(),
+        "first listener run must observe the interrupted transfer"
+    );
+
+    let second_listener = tokio::spawn({
+        let transfer_id = transfer_id.clone();
+        let dest_root = dest_root.clone();
+        async move {
+            bore_cli::transfer::run_listener(listener_options_fsync(
+                transfer_id,
+                dest_root,
+                true,
+                4,
+                None,
+                no_fsync,
+            ))
+            .await
+        }
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    // Still capped at 16: a receiver that remembered nothing needs all 21 and dies here.
+    let resumed = bore_cli::transfer::run_sender(sender_options(
+        transfer_id,
+        source_file,
+        None,
+        true,
+        4,
+        4,
+        None,
+    ))
+    .await;
+    std::env::remove_var("BORE_TRANSFER_TEST_MAX_CHUNKS");
+    resumed.context("resumed run had to re-send chunks the receiver already held")?;
+    second_listener
+        .await
+        .context("listener task join failed")??;
+
+    assert_eq!(read_file(&dest_root.join("carry.bin")).await?, payload);
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfer_resume_rejects_changed_manifest_over_relay() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
@@ -1415,6 +1554,7 @@ async fn transfer_single_file_over_direct_udp() -> Result<()> {
             ask_confirm: false,
             confirm_timeout: 120,
             stall_timeout: 0,
+            no_fsync: false,
         })
         .await
     });
@@ -1988,6 +2128,7 @@ async fn transfer_persistent_listener_two_sequential_transfers() -> Result<()> {
                 ask_confirm: false,
                 confirm_timeout: 120,
                 stall_timeout: 0,
+                no_fsync: false,
             })
             .await
         }
@@ -2399,6 +2540,7 @@ async fn transfer_persistent_listener_collision_continues() -> Result<()> {
                 ask_confirm: false,
                 confirm_timeout: 120,
                 stall_timeout: 0,
+                no_fsync: false,
             })
             .await
         }

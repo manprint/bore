@@ -31,7 +31,8 @@ use bore_cli::{
     server::Server,
     shared::{
         HttpsPolicy, TunnelOptions, UdpBudgetPlan, UdpBudgetShortfall, UdpDirectTuning,
-        UdpTestOptions, MAX_DIRECT_STREAMS, MAX_NOTES_LEN,
+        UdpTestOptions, DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW, DIRECT_QUIC_STREAM_RECEIVE_WINDOW,
+        MAX_DIRECT_STREAMS, MAX_NOTES_LEN,
     },
     transfer::{
         CollisionPolicy, DeviceMode, ListenerOptions as TransferListenerOptions,
@@ -2901,10 +2902,56 @@ fn report_udp_budget(budget: u64, max_carriers: u32, plan: &UdpBudgetPlan) {
             per_connection_mib = mib(per_connection),
             "--udp-memory-budget is smaller than one direct connection's smallest usable window; one connection is still admitted and may exceed the budget"
         ),
-        None => {
-            let _ = max_carriers;
-        }
+        None => {}
     }
+    // Separate from the shortfall above ON PURPOSE: that one is about how many
+    // carriers FIT, this one is about how fast ONE stream can go. An operator
+    // told "32 of 1024 carriers" has not been told that a single direct stream
+    // is now capped at stream_window/RTT, and that is the consequence that
+    // shows up as "the direct path is slower than the relay" (measured:
+    // 376.79 Mbit/s direct against 657.25 relay at 19.13 ms RTT on a 1 MiB
+    // stream window, with quinn reporting `loss 0 pkts` and a cwnd ten times
+    // the window — flow control, not the network).
+    //
+    // The condition is "below the tested default", NOT "on the floor": with
+    // the shipped --max-carriers 16 a 512 MiB budget yields a 2 MiB stream
+    // window, which is off the floor and still an eighth of the default. The
+    // floor is only the sharpest case, and it changes the CAUSE sentence
+    // rather than whether the operator needs telling.
+    if plan.tuning.stream_receive_window < DIRECT_QUIC_STREAM_RECEIVE_WINDOW {
+        let cause = if plan.window_at_floor {
+            "--udp-memory-budget divided by --max-carriers is below the smallest usable window, so the FLOOR chose the windows and not the budget"
+        } else {
+            "--udp-memory-budget divided by --max-carriers is below the tested default window"
+        };
+        warn!(
+            budget_mib = mib(budget),
+            max_carriers,
+            stream_window_mib = mib(plan.tuning.stream_receive_window as u64),
+            default_stream_window_mib = mib(DIRECT_QUIC_STREAM_RECEIVE_WINDOW as u64),
+            window_at_floor = plan.window_at_floor,
+            "{cause}: ONE direct stream is limited to about {} MB/s at 20 ms RTT and {} MB/s at 100 ms (window/RTT), against {} and {} MB/s on the {} MiB default. Concurrent streams each get their own window, so this bounds a single large transfer, not the tunnel's aggregate. Lower --max-carriers to the carrier count tunnels actually use, or raise the budget to {} MiB, or drop --udp-memory-budget and set the three --udp-*-window flags directly",
+            stream_bandwidth_mb_s(plan.tuning.stream_receive_window, 20),
+            stream_bandwidth_mb_s(plan.tuning.stream_receive_window, 100),
+            stream_bandwidth_mb_s(DIRECT_QUIC_STREAM_RECEIVE_WINDOW, 20),
+            stream_bandwidth_mb_s(DIRECT_QUIC_STREAM_RECEIVE_WINDOW, 100),
+            mib(DIRECT_QUIC_STREAM_RECEIVE_WINDOW as u64),
+            mib(max_carriers.max(1) as u64 * DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW as u64)
+        );
+    }
+}
+
+/// Throughput ceiling of ONE flow limited by a receive window, in MB/s.
+///
+/// The window/RTT bound is the same arithmetic P-13 applies to socket buffers,
+/// one layer up: a congestion-controlled flow cannot have more than one window
+/// in flight, so it cannot exceed `window / RTT` however much capacity the path
+/// has. Pure, so the advisory's numbers are unit-tested rather than trusted.
+fn stream_bandwidth_mb_s(window_bytes: u32, rtt_ms: u64) -> u64 {
+    if rtt_ms == 0 {
+        return 0;
+    }
+    (window_bytes as u64 * 1000) / (rtt_ms * 1024 * 1024)
 }
 
 /// What to tell the operator about the direct path's memory shape, if
@@ -3084,6 +3131,23 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The advisory quotes MB/s, so the arithmetic behind those numbers is
+    /// pinned rather than trusted. `window / RTT` is the same bound P-13
+    /// applies to socket buffers: one window in flight, one RTT to get it
+    /// acknowledged.
+    #[test]
+    fn a_receive_window_bounds_one_flow_at_window_over_rtt() {
+        // The staging floor: 1 MiB at 20 ms is ~50 MB/s, which is why a single
+        // direct stream there measured 376.79 Mbit/s (47 MB/s).
+        assert_eq!(super::stream_bandwidth_mb_s(1024 * 1024, 20), 50);
+        // ... and the same window across an intercontinental leg is a tenth of
+        // that, which is the number that makes the advisory worth printing.
+        assert_eq!(super::stream_bandwidth_mb_s(1024 * 1024, 100), 10);
+        // The shipped default at the same RTT is 16x better, by construction.
+        assert_eq!(super::stream_bandwidth_mb_s(16 * 1024 * 1024, 100), 160);
+        // A zero RTT is not a division by zero.
+        assert_eq!(super::stream_bandwidth_mb_s(1024 * 1024, 0), 0);
+    }
     use super::*;
     use bore_cli::shared::HttpsPolicy;
 

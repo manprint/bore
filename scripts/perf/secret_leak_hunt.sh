@@ -126,10 +126,20 @@
 # Env:
 #   BORE_BIN              binary under test (default target/release/bore)
 #   SECLEAK_CONNS         connections per phase (default 200)
-#   SECLEAK_PHASES        churn phases; the LAST one is the verdict (default 4)
+#   SECLEAK_PHASES        churn phases (default 8 — see H-18 in rss_verdict;
+#                         four was too few for the heap to plateau)
 #   SECLEAK_KEEP=1        keep the run directories for inspection
 #   SECLEAK_LATE          seconds the upgrade-late arm withholds the provider
 #                         (default 90 — must exceed several backoff steps)
+#
+# The RSS verdict rule has its own red-check, which needs no build and no
+# namespaces and runs in a second:
+#
+#   scripts/perf/rss_verdict_check.sh
+#
+# Run it after touching `rss_verdict` — the rule is the one part of this
+# harness with no natural oracle (a run either accuses a process or does not,
+# and both answers look equally confident).
 #
 # Requires: a release build (`cargo build --release`), `jq`, `python3`, `ss`,
 # `unshare` with unprivileged user namespaces, and `gdb` for the stall dump
@@ -139,7 +149,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 BIN="${BORE_BIN:-$ROOT/target/release/bore}"
 CONNS="${SECLEAK_CONNS:-200}"
-PHASES="${SECLEAK_PHASES:-4}"
+PHASES="${SECLEAK_PHASES:-8}"
 
 [ -x "$BIN" ] || { echo "no bore binary at $BIN — run: cargo build --release" >&2; exit 2; }
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
@@ -440,15 +450,56 @@ churn-relay|churn-direct)
     # The first phase is excluded because it carries the tail of warm-up,
     # which decays and is not a leak (the reason this arm warms up at all).
     #
-    # That 3.5 KiB/connection IS the resolution of this instrument at the
-    # default 4 phases x 200 connections, and it is a floor set by the data,
-    # not by taste: the HEALTHY relay server measured on 2026-09-12 rose in
-    # all three trend phases for a total of 1088 KiB, i.e. 1.8 KiB per
-    # connection, so any bound below that would fail a process with nothing
-    # wrong with it. Resolving finer means more connections, not a tighter
-    # number — raise PHASES/CONNS, and the bound scales with neither, so say
-    # so in the run rather than quietly tightening it.
-    RSS_PHASE_SLACK="${RSS_PHASE_SLACK:-2048}"
+    # That 3.5 KiB/connection IS the resolution of this instrument at 4 phases
+    # x 200 connections, and it is a floor set by the data, not by taste: the
+    # HEALTHY relay server measured on 2026-09-12 rose in all three trend
+    # phases for a total of 1088 KiB, i.e. 1.8 KiB per connection, so any bound
+    # below that would fail a process with nothing wrong with it.
+    #
+    # H-18 (2026-09-12): FOUR PHASES IS NOT ENOUGH, AND 2048 KiB IS NOT THE
+    # RIGHT BOUND. The 4 x 200 run failed `rss-consumer` on a textbook trend —
+    # +2324, +384, +1444 KiB, every phase up, 4152 KiB in total, 6.9 KiB per
+    # connection, well above the 3.5 the paragraph above claims to resolve.
+    # Re-run at 8 x 400, the SAME process on the SAME binary reads:
+    #
+    #     p1 21776  p2 20208  p3 24228  p4 23332
+    #     p5 24008  p6 23964  p7 23836  p8 23964
+    #
+    # It PLATEAUS — the last four phases agree to 200 KiB across 1600 further
+    # connections — while a single phase swings by 4020. A leak cannot plateau.
+    # In the same run the SERVER then failed the magnitude rule (+2172 in the
+    # last phase) from a level that had been flat for five phases. Two
+    # processes, two runs, two false alarms: the bound was below the noise.
+    #
+    # WHAT THE NOISE IS. The relay allocates a `proxy_buffer_size` (256 KiB by
+    # default) per direction per proxied connection. At 256 KiB these start as
+    # mmap allocations that `free` returns to the OS — but glibc RAISES its
+    # dynamic mmap threshold once it has seen such blocks freed, after which
+    # the same allocation comes from the heap and is NOT returned. RSS
+    # therefore climbs until the arena covers PEAK CONCURRENCY and then stops.
+    #
+    # So the bound is not a taste number, it is that ceiling:
+    #
+    #     RSS_PHASE_SLACK = wave concurrency (10) x proxy buffer (256 KiB)
+    #                       x 2 directions  =  5120 KiB
+    #
+    # It does not grow with connections, which is the whole point: a leak is
+    # linear in connections and this is constant, so more connections always
+    # separate them. `BORE_PROXY_BUFFER_SIZE` is not set by this harness, so
+    # the default is the right figure; an operator who changes it must scale
+    # this with it (hence the arithmetic is written out, not folded).
+    #
+    # RESOLUTION, stated rather than implied: the trend must clear 5120 KiB
+    # across `PHASES - 1` phases, so at the default 8 x 200 this instrument
+    # resolves 5120/1600 = 3.2 KiB per connection, and at 8 x 400 it resolves
+    # 1.6. A leak below that is NOT reported as absent, it is below what this
+    # instrument can see — raise `SECLEAK_CONNS`, which is the only knob that
+    # actually buys resolution.
+    #
+    # The `swing` figure is still printed on every verdict: it is the noise the
+    # run itself measured, and a future reader comparing it to the bound can
+    # see at a glance whether the instrument was in a position to decide.
+    RSS_PHASE_SLACK="${RSS_PHASE_SLACK:-5120}"
     rss_verdict(){ # <name> <per-phase deltas...>
         local nm="$1"; shift
         local -a d=("$@")
@@ -468,10 +519,13 @@ churn-relay|churn-direct)
         fi
         local lastf; lastf=$(printf '%+d' "$last")
         local sumf;  sumf=$(printf '%+d' "$sum")
+        # Bytes per connection this run could have seen. Printed on every OK
+        # verdict so "no leak" is never read as finer than it is.
+        local res=$(( (RSS_PHASE_SLACK * 1024) / ((n - 1) * CONNS) ))
         if [ -z "$why" ]; then
-            echo "RESULT rss-$nm ok last phase $lastf KiB, trend $sumf KiB over $((n - 1)) phases, swing ${amp} KiB (slack $RSS_PHASE_SLACK)"
+            echo "RESULT rss-$nm ok last phase $lastf KiB, trend $sumf KiB over $((n - 1)) phases, swing ${amp} KiB (slack $RSS_PHASE_SLACK, resolves ${res} B per connection)"
         else
-            echo "RESULT rss-$nm bad $why (slack $RSS_PHASE_SLACK, $CONNS connections per phase)"
+            echo "RESULT rss-$nm bad $why (slack $RSS_PHASE_SLACK, $CONNS connections per phase, swing ${amp} KiB)"
         fi
     }
     rss_verdict server   "${DRS[@]}"

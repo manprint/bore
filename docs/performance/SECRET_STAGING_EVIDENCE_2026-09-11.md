@@ -701,3 +701,625 @@ probes all ran inside the S-5 window against a peer whose QUIC listener came
 up 908 ms later. It is the third stage the defect damaged, and the harness
 printed `path=unknown` in the header while the ladder in fact ended on the
 direct path — both now fixed (§3.3).
+
+## 9. The campaign, phase 2 (binary `89ef490d` — AFTER S-5/S-7/S-8/S-9)
+
+Both peers rebuilt and redeployed (`bore 1.0.0 - main - 89ef490d` on the test
+VM and on the workstation), same three topologies, same 20 tunnels each, same
+harness — with the reducer defects of §3.2 fixed, so the numbers here are also
+the first taken with an honest median.
+
+**The SERVER was deliberately not touched: it still runs `1bb3243a`**, the same
+build phase 1 ran against (verified from `/admin/api/v1/config`'s
+`server_version`, not from the deploy log). That is not an oversight and it is
+not a gap. All four fixes live in the peers — S-5 and S-7 in `holepunch.rs`,
+S-8 and S-9 in the secret client — and a secret tunnel's direct path runs
+consumer↔provider with the server off it entirely (S-1), so there is nothing
+for a server rebuild to change. Holding it constant makes phase 1 and phase 2 a
+comparison with **one** variable in it, which is worth more than a tidier
+version string. (The server's own upgrade to `89ef490` ships the unrelated
+bind-failure message and is done once, after the campaign, to avoid restarting
+live tunnels more than necessary.)
+
+### 9.1 S2 — the proof of S-5
+
+| topology | listener | slow (≥200 ms) before | after | median/max before | after |
+|---|---|---|---|---|---|
+| `vm-ws` | test VM | **7/20** | **1/20** | 107 / 1150 ms | 96 / 466 ms |
+| `vm-vm` | test VM | **3/20** | **0/20** | 96 / 452 ms | 98 / 112 ms |
+| `ws-vm` | workstation | 0/20 | 0/20 | 104 / 110 ms | 95 / 113 ms |
+
+With the VM as listener — the configuration that carried the whole defect —
+**10 of 40 tunnels were slow before and 1 of 40 after.** The distributions:
+
+```
+vm-ws before   87  88  91  95 102 103 104 104 106 107 107 107 112 | 788 790 792 800 804 1149 1150
+vm-ws after    85  85  87  90  90  90  92  93  95  95  96  96  97  97  99 100 109 109 110 | 466
+
+vm-vm before   82 ... 110 (17 samples) | 200 205 452
+vm-vm after    85  88  90  95  95  95  95  96  98  98  98  98  99  99  99 100 101 103 108 112
+```
+
+The two clusters that gave §4 its name are **gone**: nothing at ~800 ms,
+nothing at ~1150 ms. `vm-vm` — the topology where the two peers share a host
+and there is no WAN to blame — is now 20 samples inside a 27 ms band, from 3
+outliers reaching 452 ms.
+
+Two things about this table matter as much as the improvement.
+
+**The control did not move.** `ws-vm`, where the workstation is the listener,
+was already clean (0/20 before) and is still clean (0/20 after), 104→95 ms
+median. If the fix had bought its improvement by shifting some global timing
+constant, that row would have moved too. It did not, which is what makes the
+claim "this fixed the listener's round, not the clock" a measurement rather
+than an assertion.
+
+**One outlier survives, and it is reported rather than rounded away.** The
+`vm-ws` census still has a single 466 ms sample. It is not the PTO cluster —
+999 ms is the quinn constant, and 466 ms is not a multiple or a fraction of it
+— and a hole-punch is a race, so a tail is expected. What can be said honestly
+is that the failure mode with a *named mechanism* is gone and what is left is
+at the scale of the retry pass (`CHECK_TOTAL_CAP` is 3 s and a retry pass
+doubles the pace). Chasing it needs a bigger census than 20 tunnels; it is not
+claimed as fixed.
+
+### 9.2 S1b — relay vs direct, re-taken with the fixed reducer
+
+`vm-ws`, five pairs per direction, 128 MiB over 4 connections per arm,
+alternating order, 75 s cooldown. This is the cell H-13 corrupted in phase 1
+(§8.2) and the cell S-5 was most likely to damage, so it is the one worth
+re-taking.
+
+```
+get   1.019  1.092  1.337  1.372  1.355   median 1.337   n=5 of 5
+put   0.741  0.730  0.778  0.715  0.759   median 0.741   n=5 of 5
+```
+
+| direction | host sending the bulk | phase 1 | phase 2 |
+|---|---|---|---|
+| `get` | test VM | 1.218 (n=3, hand-corrected) | **1.337** (n=5 of 5) |
+| `put` | workstation | 0.757 | **0.741** (n=5 of 5) |
+
+Three things to take from it.
+
+**Every pair measured.** `n=5 of 5` in both directions — no `startfail`, no
+relay fallback, nothing excluded. In phase 1 this cell produced three usable
+arms out of five and the stage still printed a median. The reducer fix (§3.2)
+is what makes `n=` visible at all, and it is the difference between a number
+and a number you can defend.
+
+**Every direct arm was on the direct path before its window opened**, ttd
+82–110 ms across all ten arms. That is the H-15 fix doing its job: in phase 1
+this stage could open a window against a peer whose listener was still coming
+up.
+
+**The sender-host rule from §8.2 survives the re-take.** VM sends on `get` and
+direct wins (1.337); the workstation sends on `put` and direct loses (0.741).
+The two numbers moved by +0.12 and −0.016 and neither crossed 1.0. §9.3 is the
+measurement of *why*.
+
+### 9.3 S3b — the CPU bill, per process, and what it says about §8.2
+
+`vm-ws`, 2 GiB per arm over 4 connections, samplers running on all three hosts.
+`get`, so the **test VM is the sender** (provider side) and the **workstation
+is the receiver** (consumer side).
+
+```
+relay    48.55 MB/s  path=relay   fb=0  ttd=n/a  relay_tx=2148532224  window=1789170488-1789170530
+direct   55.03 MB/s  path=direct  fb=0  ttd=99   relay_tx=0           window=1789170609-1789170646
+```
+
+Per-process CPU seconds of the `bore` process itself, differenced across each
+window (`ps -eo cputimes`, so the unit is whole seconds and the quantisation is
+±1 s):
+
+| `bore` process | role on this arm | relay | direct | per delivered GiB |
+|---|---|---|---|---|
+| server | relay broker / punch broker | **11 s** | **0 s** | 5.5 → **0** |
+| test VM | provider, **sending** 2 GiB | 2 s | **7 s** | 1.0 → **3.5** |
+| workstation | consumer, receiving 2 GiB | 3 s | 4 s | 1.5 → 2.0 |
+| *sum of the three* | | 16 s | 11 s | 8.0 → **5.5** |
+
+**The server's bill goes to zero, and it goes to zero twice over.** The process
+burned 11 CPU seconds relaying 2 GiB and **0** while the same 2 GiB went
+direct; its RSS moved +4 KiB over the whole direct window. Independently,
+`relay_tx` reads 2 148 532 224 on the relay arm and **0** on the direct arm.
+Two unrelated instruments — the kernel's CPU accounting for that pid and the
+server's own byte counter for that tunnel — agree that the broker carried
+nothing. This is the claim §8.3 made on `vm-vm` and it now holds on the
+home-NAT topology as well.
+
+**The sender pays a ~3.5× premium for QUIC, the receiver pays roughly
+nothing.** 2 s → 7 s on the sending host is a 5 s difference, far outside the
+±1 s quantisation; 3 s → 4 s on the receiving host is inside it and is not
+claimed as a change. The plausible mechanism is segmentation offload: the relay
+arm's sender is TCP, where the kernel and NIC segment 2 GiB for it, while the
+direct arm's sender encrypts and paces every packet in user space. Naming it is
+not measuring it — settling it needs segment counters (`nstat`, `ethtool -S`)
+across the two arms, which was not done.
+
+**That is the mechanism behind §8.2.** The relative merit of the direct path is
+keyed to the *sending* host because the sending host is the one that pays the
+QUIC premium. A host with CPU to spare sends faster direct (it skips a WAN
+transit); a host that is already tight loses, because it now does 3.5× the
+per-byte work. The system as a whole still wins — 16 CPU seconds become 11 —
+but the 5 seconds saved are the server's, and the 5 seconds added are the
+sender's. For an operator that is the whole trade in one line: **the direct
+path bills the endpoint instead of the relay.**
+
+#### H-17 — host-wide CPU is not attributable on a shared machine
+
+The host-level reduction for the same two windows reads:
+
+```
+relay   srv busy=13.24 (6.62 s/GiB)   vm busy=4.63 (2.31)   ws busy=41.07 (20.54)
+direct  srv busy= 0.85 (0.42 s/GiB)   vm busy=9.34 (4.67)   ws busy=76.89 (38.45)
+```
+
+The server and the test VM are dedicated instances and their host figures agree
+with their process figures (srv 13.24 vs 11 s + 4.48 s softirq; vm 9.34 vs 7+1
+s), so for those two the host number is the better one — it includes the
+softirq the process never sees.
+
+**The workstation's host figures are noise and must not be quoted.** `busy`
+rose 41.07 → 76.89 (+35.8 CPU s, `user` +30.0) while every process the sampler
+watches accounts for +1 s of it. The workstation is a shared desktop running
+some thirty other processes; the sampler's regex (`bore|dufs|curl|oha|python3`)
+does not see them, and `/proc/stat` counts them all. Read at face value those
+two rows say "the direct path nearly doubled the workstation's CPU bill", which
+is a conclusion about a browser, not about bore — and it is the conclusion I
+drew from them before reducing the per-process samples.
+
+Rule for the re-run: **on a dedicated host quote `busy`; on a shared host quote
+the per-process delta and say so.** `cpu_window.sh` now prints both and warns
+when the host bill exceeds the matched processes' by more than 4× — the shape
+that says "something else on this box was busy".
+
+### 9.4 S5 — thinning the ACKs: measured, and rejected
+
+The QUIC ACK Frequency extension (draft-ietf-quic-ack-frequency-04) lets a peer
+be asked to acknowledge at most once every `threshold + 1` ack-eliciting
+packets. On a saturated direct path that would remove most of the return-path
+packet rate, and both ends of a bore direct path are bore, so the extension is
+always negotiable. `BORE_DIRECT_QUIC_ACK_THRESHOLD` existed precisely so the
+decision could be measured instead of argued.
+
+Paired arms, both `--udp`, the only difference being the env var; 128 MiB over
+4 connections, 5 pairs, order alternating, threshold 10, topology `vm-vm`:
+
+```
+get   0.539  0.964  0.622  0.020  1.035    median 0.622   n=5 of 5
+put   0.908  0.088  0.910  0.908  0.918    median 0.908   n=5 of 5
+```
+
+**The verdict is reject, and the SHAPE is the reason.** `put` is the cleaner
+view: four of five pairs sit inside 0.908–0.918, a reproducible ~9 % loss, and
+the fifth collapses to 0.088 — 268.32 → 23.49 MB/s. `get` is the same story
+with more spread: two pairs at parity (0.964, 1.035) and one at 0.020, 393.86 →
+**7.91 MB/s**. Thinning ACKs does not make this path a little slower. It makes
+it *bimodal*: usually a few percent worse, occasionally 10–50× worse.
+
+#### The mechanism, and why it means this run measured the wrong thing
+
+`AckFrequencyConfig` has three fields and the knob set one. The other two took
+their defaults, and `max_ack_delay` defaults to `None`, which quinn documents
+as "the peer's original `max_ack_delay` will be used, as obtained from its
+transport parameters" — **25 ms**. So the receiver sends an ACK when it has
+collected 11 ack-eliciting packets *or* when 25 ms have passed, whichever comes
+first.
+
+On `vm-vm` the RTT is a loopback-class number, well under a millisecond. A
+receiver that has not yet collected 11 packets therefore sits on the ACK for
+**hundreds of round trips**. Whether a connection falls into that state depends
+on whether its phases keep more than 11 packets in flight — cwnd-limited
+phases, the tail of a burst and the start of a stream do not — which is exactly
+the bimodality above, and exactly why a median alone would have understated it.
+
+So this run did not measure thinner ACKs. **It measured a 25 ms ACK delay.**
+That is a real defect of the knob rather than of the idea, and it is fixed in
+the binary rather than in the harness: `resolve_ack_frequency` now returns
+three states, and a threshold supplied without `BORE_DIRECT_QUIC_ACK_MAX_DELAY_MS`
+is `ThresholdWithoutDelay` — refused, with a `warn!` naming the 25 ms, leaving
+quinn's policy untouched. Unset on both halves remains byte-identical to every
+release before the knob existed. Gate:
+`an_ack_threshold_without_a_delay_bound_is_refused`.
+
+`sec_ack.sh` now sets both halves (`ACK_DELAY_MS`, default 1 ms — the same
+order as the direct path's RTT) and **refuses to start** when either peer's
+binary lacks the delay variable, read out of the binary itself rather than from
+a version string. Without that preflight an old peer would ignore the second
+variable, install the threshold alone, and the stage would print a full table
+of the trap under the heading of an ACK experiment — the H-13/H-15/H-16 failure
+shape a fourth time.
+
+**What stays unmeasured**, and is recorded as open rather than implied: a
+threshold with an explicit *small* delay bound. That experiment is now possible
+and was not run. The `vm-ws` leg below is the closest thing to it that this
+campaign contains, and for an accidental reason worth stating.
+
+#### Why the `vm-ws` leg is a different experiment, not a repetition
+
+The harness's own rationale for running both topologies was "`vm-vm` prices the
+saving, `vm-ws` prices the risk". Once the 25 ms is understood, the split is
+sharper than that and in a way nobody designed: **the same fixed 25 ms bound is
+a different multiple of the RTT on each leg.**
+
+Measured from the workstation, TCP handshake to the test VM, 7 samples:
+`min 18.09 ms, median 22.31 ms, max 23.37 ms`. On `vm-vm` both peers share a
+host and the RTT is a loopback-class number — S4 puts a whole new *proxied
+connection* at 0.78 ms there.
+
+```
+vm-vm    25 ms bound ≈ several hundred RTTs   -> the trap, measured above
+vm-ws    25 ms bound ≈ 1.1 RTT                -> a legitimate delay bound
+```
+
+So the `vm-ws` leg, run with exactly the same env var, happens to be close to
+the experiment the completed knob is *for*: thinner ACKs with a delay bound of
+the same order as the path RTT. It is not exactly that experiment — 25 ms was
+not chosen, it is whatever the peer advertised — and it is reported as what it
+is rather than promoted to what would have been convenient.
+
+#### The `vm-ws` leg, and what the two legs together prove
+
+Same env var, same threshold 10, same 5 paired arms:
+
+```
+get   0.979  1.011  0.909  1.064  1.144    median 1.011   n=5 of 5
+put   1.029  0.986  1.088  1.015  1.045    median 1.029   n=5 of 5
+```
+
+| leg | 25 ms bound, in RTTs | `get` median | `put` median | worst single pair |
+|---|---|---|---|---|
+| `vm-vm` | several hundred | 0.622 | 0.908 | **0.020** |
+| `vm-ws` | ≈ 1.1 | **1.011** | **1.029** | **0.909** |
+
+**On the leg where the delay bound is RTT-scale, thinning the ACKs costs
+nothing — and not one pair collapsed.** The worst of the ten `vm-ws` arms is
+0.909; the worst of the ten `vm-vm` arms is 0.020. The bimodality is not a
+property of thinning ACKs. It is a property of a delay bound that is hundreds
+of times the RTT, and it disappears exactly where that ratio does.
+
+That is a stronger result than either leg alone, and it is worth being precise
+about what it does and does not license:
+
+* **It does NOT license shipping the knob on by default.** A default has to be
+  safe on every path a user has, and a *fixed* 25 ms is not: it is benign at
+  22 ms RTT and catastrophic at 0.05 ms. Same constant, same code, opposite
+  outcome — which is the definition of a value that must not be a default.
+* **It does NOT show a gain.** `put` reads 1.029 with four of five pairs above
+  1.0, which is suggestive of a few percent, but the spread (0.986–1.088)
+  covers 1.0 and n is 5. "No measurable harm" is what this supports; "a gain"
+  is not.
+* **It DOES redeem the idea.** The extension is not refuted. What is refuted is
+  requesting a threshold while letting the delay bound default, which is the
+  only thing the knob could express before this campaign.
+
+The open experiment is therefore narrow and well-defined: a threshold with a
+delay bound chosen *from the path's own RTT* rather than inherited from a
+transport parameter. `sec_ack.sh` can now run it (`ACK_DELAY_MS`), the binary
+can now express it, and the preflight stops it being run by accident against a
+peer that would silently fall back to the trap. It was not run here.
+
+### 9.5 S3c — the CPU bill at 8 GiB, which corrects §9.3's claim about the receiver
+
+§9.3 ran 2 GiB per arm. `ps -eo cputimes` counts whole seconds, so at that size
+the per-process deltas were single digits and the receiver's `3 s → 4 s` was
+*inside* the quantisation — §9.3 said so and declined to claim it. S3c re-runs
+the same stage at `GIB=8`, which stretches the `vm-ws` arms to 176 s (relay)
+and 131 s (direct) and puts every delta in the tens of seconds.
+
+```
+GIB=8 TOPO=vm-ws scripts/perf/staging/sec/sec_eff.sh     # out/sec/s3c-vm-ws.txt
+GIB=8 TOPO=vm-vm scripts/perf/staging/sec/sec_eff.sh     # out/sec/s3c-vm-vm.txt
+```
+
+`vm-ws`, 8 GiB per arm over 4 connections, `bore` process CPU seconds only:
+
+| host | role on this leg | relay | direct | ratio |
+|---|---|---|---|---|
+| srv | relay hop | **49** | **< 1** | — (the whole point) |
+| vm | provider = sender | 11 | 31 | 2.82× |
+| ws | consumer = receiver | 13 | 22 | **1.69×** |
+| **total** | | **73** | **53** | 0.73× |
+| goodput | | 46.33 MB/s | 62.54 MB/s | 1.35× |
+
+The server's direct row carries no `process:` line at all: every sampled
+`bore` delta was ≤ 0 over 131 s, i.e. below the sampler's one-second tick. The
+honest reading is "under a second", not "exactly zero", and either way it is
+the same conclusion — **the direct path bills the endpoints instead of the
+relay**, and it bills them *less in total* (73 → 53 CPU s for the same 8 GiB)
+while delivering 35 % more goodput.
+
+**This corrects §9.3.** At 2 GiB the receiver read 3 s → 4 s and was reported
+as "flat, inside the noise". At 8 GiB it reads 13 s → 22 s, which is nine
+seconds against a ±1 s quantisation. The receiver is **not** flat: it pays
+1.69×. The sender's 2.82× survives the resolution change (2 → 7 at 2 GiB,
+11 → 31 at 8 GiB: 3.5× and 2.82×, same order, the larger sample being the one
+to quote). Nothing about the *direction* of §9.3's conclusion changes; one of
+its two "not claimed" cells is now claimed, with the opposite sign to the
+convenient guess.
+
+`vm-vm`, same stage, both endpoints on the VM so the `vm` row carries the
+sender *and* the receiver:
+
+| host | relay | direct |
+|---|---|---|
+| srv | **70** | **1** |
+| vm (both ends) | 25 | 26 |
+| **total** | **95** | **27** |
+| goodput | 209.54 MB/s | 431.07 MB/s |
+
+That is the cleanest statement of S-1 in the whole campaign: moving the two
+endpoints onto the same host and taking the server off the path costs the
+endpoints **one** CPU second (25 → 26) and saves the server **sixty-nine**,
+while doubling goodput. A direct secret tunnel is not "cheaper for the server
+because the bytes are someone else's problem" — on this leg the bytes are
+literally the same process's problem in both arms, and the total still falls
+3.5×.
+
+**H-17 in the field.** The reducer's attribution gate fired on exactly the two
+`ws` rows (`busy=81.11` vs 19 sampled CPU s; `busy=73.70` vs 29) and stayed
+silent on the four dedicated-host rows, including `srv direct` where `busy` is
+3.06 and the sampled total is 0. That is the behaviour the rule was rewritten
+for in §9.3, confirmed on a run it did not tune against.
+
+The load generator's own cost is in the table's shadow and is worth one line so
+it is not mistaken for tunnel cost: `python3` on `vm-ws` reads 3 s / 3 s (vm)
+and 6 s / 7 s (ws), i.e. invariant. On `vm-vm` it reads 15 s (relay) vs 7 s
+(direct) for the same 8 GiB, which most likely follows the delivery rate — at
+431 MB/s each `recv()` returns more bytes than at 209 MB/s, so the same
+transfer costs fewer syscalls. That is a reading, not a measurement.
+
+### 9.6 The packet counters, and the one gap this campaign did not close
+
+`sec_eff.sh` now brackets each window with `ip -s link` driver counters as well
+as `/proc/net/snmp` (§9.3's H-16 note: `Tcp: OutSegs` counts true segments via
+`tcp_skb_pcount()`, `Udp: OutDatagrams` counts `sendmsg` calls, so only the
+driver counters are comparable across transports). Per delivered GiB:
+
+| leg | arm | sender NIC tx / GiB | receiver NIC rx / GiB | sender ÷ receiver |
+|---|---|---|---|---|
+| `vm-ws` | relay | 755 235 | 749 109 | **1.008** |
+| `vm-ws` | direct | 1 136 178 | 922 985 | **1.231** |
+
+Two facts, one settled and one not.
+
+**Settled: the direct path puts 1.50× the packets on the sender's wire per
+delivered GiB.** 755 235 → 1 136 178. The mechanism is packet *size*, not
+retransmission: TCP on this path runs 1 448-byte segments, quinn's own report
+on the same host pair reads `mtu 1.42 KiB, max datagram 1.38 KiB`, and the
+sender additionally emits QUIC ACK packets for the reverse direction on its own
+NIC. This is the missing measurement §7 item 4 of the Italian report asked
+for, and it answers it: the sender's extra CPU is not *only* user-space crypto,
+it is also half again as many packets to build, encrypt and hand to the stack.
+
+**Not settled: 19 % of the sender's direct-arm packets do not appear in the
+receiver's counter.** The obvious dismissals were checked and do not hold:
+
+* *"The windows are not comparable across hosts."* They are. The **relay** arm,
+  same two hosts, same windows, same reducer, agrees to **0.8 %**. A
+  methodology that agrees to 0.8 % on one arm and 19 % on the other is not what
+  is producing the 19 %.
+* *"The workstation is shared, so its counters are noisy."* Unrelated traffic
+  would *inflate* `ws` rx, which moves the gap the wrong way.
+* *"The VM is being throttled."* The ENA allowance counters
+  (`bw_out_allowance_exceeded` and siblings) were all **zero** across the
+  window.
+
+The reading most consistent with everything else in the campaign is loss on the
+*receiver's* access link: the direct arm delivers 62.54 MB/s ≈ 500 Mbit/s to a
+residential downlink while transmitting ~600 Mbit/s of packets, quinn runs
+**BBR** (`holepunch.rs`, `BbrConfig::default()`), and BBR is loss-tolerant by
+design — which is exactly how the arm can drop a fifth of its packets and still
+beat the relay by 35 %. If that is right it is a characterisation, not a
+defect, and the relay's own throttling is the thing being out-run.
+
+It is **not confirmed**, and the reason it cannot be confirmed from this
+campaign is concrete and fixable: `bore test-udp` prints quinn's own path stats
+(`loss N pkts / N B`, `sent N pkts`) and a real tunnel does not. A separate
+`test-udp` run over the same host pair, at a lower single-stream rate, reported
+`loss 0 pkts / 0 B` — which is consistent with "the loss appears only when the
+access link is overshot" and equally consistent with "there is no loss and the
+counter gap is something else". Settling it needs the tunnel to expose the same
+counters the diagnostic already computes. That is the one experiment this
+section deliberately leaves on the table.
+
+## 10. The window floor: a default that silently caps every single direct stream
+
+This defect was found while chasing §9.6's packet gap, by running
+`bore test-udp --tcp-secret-id …` over the same host pair to get quinn's own
+loss counters. The loss counters came back clean. The rest of the report did
+not.
+
+```
+UDP direct path : sent 1.86 GiB in 42.46s (376.79 Mbit/s)
+UDP direct path : received 1.86 GiB in 48.37s (330.76 Mbit/s)
+UDP direct path QUIC    : rtt 19.13 ms, cwnd 10.31 MiB, mtu 1.42 KiB,
+                          max datagram 1.38 KiB, loss 0 pkts / 0 B, sent 1464274 pkts
+UDP direct path tuning  : stream recv 1.00 MiB (default 16.00 MiB),
+                          conn recv 16.00 MiB (default 256.00 MiB),
+                          send 16.00 MiB (default 256.00 MiB)
+TCP relay fallback : sent 1.86 GiB in 24.34s (657.25 Mbit/s)
+TCP relay fallback : received 1.86 GiB in 34.68s (461.43 Mbit/s)
+```
+
+Three lines decide it:
+
+1. **The direct path is slower than the relay** — 376.79 against 657.25
+   Mbit/s — which is the opposite of what every tunnel arm in §8 and §9
+   measured on the same pair.
+2. **`loss 0 pkts / 0 B`.** Not congestion, not the network.
+3. **`cwnd 10.31 MiB` against `stream recv 1.00 MiB`.** The congestion
+   controller has opened ten times the window the flow is *allowed* to use.
+   A flow whose cwnd is an order of magnitude above its receive window is
+   flow-control limited, by definition.
+
+`1 MiB / 19.13 ms` = 54.8 MB/s = **438 Mbit/s**, and the measurement is 376.79
+— 86 % of the bound, the remainder being the turnaround the sender spends
+waiting for a window update the receiver can only send after it drains. The
+number is not near the bound by coincidence; it *is* the bound.
+
+### 10.1 The mechanism
+
+`UdpDirectTuning::from_memory_budget` (`src/shared.rs`, F-13) divides the
+operator's budget by `max_carriers` and clamps:
+
+```rust
+let raw = budget / carriers;
+let mut conn = raw.clamp(floor, ceiling);   // floor 16 MiB, ceiling 256 MiB
+```
+
+The divisor is `--max-carriers`: the operator's **absolute ceiling** on the
+carriers one tunnel may open, not the number any tunnel actually opens. The
+shipped default is **16**; staging runs **1024**, set for concurrency. So on
+staging `raw = 512 MiB / 1024` = 512 KiB, far under the 16 MiB floor, the clamp
+chooses the window, and because the 16:1 ratio is preserved by construction
+(DEC-VE8, correctly) the stream window becomes 16 MiB / 16 = **1 MiB** — a
+sixteenth of the tested default.
+
+The floor is the sharpest case, not the whole of it. With the *shipped*
+`--max-carriers 16`, a 512 MiB budget gives `raw` = 32 MiB, which is off the
+floor and still yields a **2 MiB** stream window, an eighth of the default;
+reaching the default needs `16 × 256 MiB` = **4 GiB** of budget. The general
+statement is simply `stream = budget / max_carriers / 16`, clamped to
+[1 MiB, 16 MiB] — and **a budget buys concurrency out of single-stream
+bandwidth**, which is a real engineering trade and not a bug. The bug is that
+nothing said so.
+
+The staging server's own startup advisory has been publishing the consequence
+all along — `udp_stream_receive_window = 1MiB`,
+`udp_connection_receive_window = 16MiB`, `udp_direct_slots = 32` for
+`--udp-memory-budget 512MB` — as an `info!` line of numbers. The only `warn!`
+concerned *slots*. Nothing named the window consequence, and the window
+consequence is the one that caps throughput.
+
+### 10.2 Why the tunnel arms did not show it
+
+Because the cap is **per stream**, and every tunnel stage in this campaign runs
+four concurrent connections = four bidi streams:
+
+| leg | measured direct | per stream | RTT | `1 MiB / RTT` per stream |
+|---|---|---|---|---|
+| `vm-ws` | 62.54 MB/s | 15.6 MB/s | ≈ 22 ms | 47.7 MB/s — not binding |
+| `vm-vm` | 431.07 MB/s | 107.8 MB/s | ≈ 0.05 ms | ~20 GB/s — not binding |
+| `test-udp` | **47.1 MB/s** | **47.1 MB/s** | 19.13 ms | **54.8 MB/s — binding** |
+
+One stream on a WAN leg is precisely the shape that hits it, which is why the
+diagnostic found it and the campaign did not. It is also the shape a real user
+has: a single `scp`, a single large HTTP download, a single database restore.
+
+### 10.3 What shipped
+
+* `UdpBudgetPlan` gains `window_at_floor: bool`, set when `budget / carriers`
+  was *below* the floor rather than merely clamped by it — the distinction
+  matters, because landing on the floor from above is the designed behaviour
+  and landing on it from below means the divisor, not the budget, chose the
+  window.
+* `report_udp_budget` (`src/main.rs`) warns whenever the derived stream window
+  is **below the tested default** — not only at the floor, precisely because
+  the shipped `--max-carriers 16` produces an eighth-sized window without ever
+  touching the floor — and uses `window_at_floor` only to name the cause. It
+  states the consequence in the unit that matters (`stream_bandwidth_mb_s`, a
+  pure helper: `window × 1000 / (rtt_ms × 1 MiB)`) at two reference RTTs
+  against the default's own figures, says explicitly that concurrent streams
+  each get their own window so this bounds one large transfer rather than the
+  aggregate, and gives three remedies: lower `--max-carriers`, raise the budget
+  to `carriers × 256 MiB`, or set the three window flags explicitly (which
+  conflict with the budget flag by design, so the operator must choose).
+* Unit gates on both halves:
+  `a_budget_divided_by_the_carrier_cap_decides_the_stream_window`
+  (`src/shared.rs`: staging's 512 MiB / 1024 → floor + flag set; the shipped
+  512 MiB / 16 → 2 MiB stream with the flag **clear**, which is the case that
+  forces the advisory's condition to be "below the default" rather than "on the
+  floor"; 512 MiB / 8 → 4 MiB stream; 16 × 256 MiB / 16 → the tested default)
+  and `a_receive_window_bounds_one_flow_at_window_over_rtt`
+  (`src/main.rs`, pinning the arithmetic the advisory prints).
+
+The default itself is **not** changed. Lowering `--max-carriers` changes an
+operator-facing bound; raising the floor changes memory behaviour for every
+existing deployment; both are decisions for the operator who knows their host,
+and the defect was that the server never told them there was a decision to
+make. It tells them now.
+
+## 11. H-18 — the leak gate was measuring below its own noise floor
+
+The last gate run of the campaign failed:
+
+```
+FAIL: T-SECLEAK-CHURN-RELAY/rss-consumer: RSS rose in every phase after the
+      first, 4152 KiB in total (slack 2048, 200 connections per phase)
+```
+
+That is the shape the gate was built to catch: four phases, every one up,
+6.9 KiB per connection, comfortably above the 3.5 KiB/connection the gate's own
+comment claims to resolve. Taken at face value it is a per-connection leak in
+the secret consumer's relay path, and it reproduced on a second run.
+
+It is not one. The same arm at `SECLEAK_PHASES=8 SECLEAK_CONNS=400` — 3 200
+connections instead of 800, same binary, same host:
+
+```
+p1 21776  p2 20208  p3 24228  p4 23332
+p5 24008  p6 23964  p7 23836  p8 23964
+```
+
+**It plateaus.** The last four phases agree to 200 KiB across 1 600 further
+connections, and the trend over the seven post-warm-up phases is 2 188 KiB, i.e.
+0.8 KiB per connection. A leak is linear in connections; a leak cannot flatten.
+In the same longer run the *server* then failed the other half of the rule
+(`+2172 KiB in the last phase`) from a level that had been flat for five
+phases. Two processes, two runs, two false alarms.
+
+### 11.1 What the noise actually is
+
+The relay allocates a `proxy_buffer_size` — 256 KiB by default — per direction
+per proxied connection. At that size glibc serves the allocation with `mmap`
+and `free` returns it to the OS, so RSS should not grow at all. But glibc
+*raises its dynamic mmap threshold* once it has seen such blocks freed, after
+which the same allocation comes from the heap, where `free` does not return it.
+RSS therefore climbs until the arena covers peak concurrency, and then stops.
+
+The churn arm runs waves of ten concurrent connections, so that ceiling is
+
+```
+10 concurrent x 256 KiB x 2 directions = 5120 KiB
+```
+
+which is the scale of every drift and swing measured above (4 152 KiB at four
+phases, 4 020 KiB in a single phase at eight). The old bound was 2 048 KiB —
+**below the noise the instrument itself generates**, which is why it decided by
+coin toss and why raising the phase count changed the answer.
+
+### 11.2 The fix, which is more sensitive and not less
+
+* `SECLEAK_PHASES` defaults to **8**, not 4. Four phases cannot distinguish
+  "climbing" from "climbing towards a plateau", and that distinction is the
+  entire question.
+* `RSS_PHASE_SLACK` defaults to **5120 KiB**, derived from
+  `concurrency × proxy_buffer_size × 2` rather than chosen. It does not grow
+  with connections — which is the point: the leak does, so more connections
+  always separate the two.
+* Every OK verdict now prints the **resolution it achieved** in bytes per
+  connection (`5120 KiB / ((phases-1) × conns)`: 3.2 KiB at the default 8 × 200,
+  1.6 KiB at 8 × 400). A leak below that is reported as below what the
+  instrument can see, never as absent. The only knob that buys resolution is
+  `SECLEAK_CONNS`, and the bound scales with neither it nor the phase count, so
+  the run says so instead of implying otherwise.
+
+### 11.3 The rule now has its own red-check
+
+`scripts/perf/rss_verdict_check.sh` extracts `rss_verdict` from the harness at
+run time (so it cannot drift from the code it checks) and runs it against
+series whose right answer is known: the two measured plateaus above, which must
+pass; linear leaks above the stated resolution, which must fail however the
+jitter falls; linear leaks below it, which must pass *and be read as below
+resolution*; and zero-mean 3 MiB swings, which must pass. Eleven cases, all
+green — and the two measured rows are exactly the ones the pre-H-18 rule got
+wrong, so the check is red against the code it replaced.
+
+This is the fourth harness defect the campaign found by running its own gates
+(H-12 … H-15 in §3, H-16 in §3.4, H-17 in §9.3) and the second where the
+instrument, not the product, was the thing that was broken. The standing lesson
+is the one H-16 already stated and this repeats with a different mechanism: **a
+gate that cannot state its own resolution is not a measurement.**

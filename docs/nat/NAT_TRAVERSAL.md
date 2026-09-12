@@ -1223,3 +1223,80 @@ creato.
 della RFC non esiste nessun valore che si possa chiamare «informato». È una
 difesa in profondità, non un sostituto: S-5 toglie la causa sistematica, S-7
 limita il costo di una perdita genuina.
+
+### 21.5 Diradare gli ACK: misurato e scartato (S5)
+
+L'estensione QUIC ACK Frequency (draft-ietf-quic-ack-frequency-04) permette di
+chiedere al peer di confermare al massimo una volta ogni `soglia + 1` pacchetti
+ack-eliciting. Su un percorso diretto saturo toglierebbe quasi tutto il traffico
+di ritorno, quindi valeva la misura: entrambi gli estremi di un percorso diretto
+di bore sono bore, e l'estensione è sempre negoziabile.
+
+**Il risultato è negativo e la manopola resta spenta.** `sec_ack.sh`, `vm-vm`
+(nessuna WAN di mezzo, quindi il conto è tutto CPU e pacchetti), 128 MiB su 4
+connessioni, 5 coppie appaiate, soglia 10 contro il default:
+
+```
+  coppia    default     ack=10    rapporto
+  1         383.46     206.86     0.539
+  2         402.16     387.85     0.964
+  3         403.65     251.14     0.622
+  4         393.86       7.91     0.020      <- 393.86 -> 7.91 MB/s
+  5         379.64     392.92     1.035
+  mediana 0.622  (n=5 su 5)
+```
+
+Non è «un po' peggio»: è **bimodale**. Due coppie stanno alla pari (0.964,
+1.035), una crolla di 50 volte. La forma della distribuzione è il risultato,
+non la mediana.
+
+**Il meccanismo, ed è il motivo per cui la manopola oggi richiede due valori.**
+Impostando solo la soglia, `AckFrequencyConfig::max_ack_delay` resta a `None`,
+che quinn documenta come «viene usato il `max_ack_delay` originale del peer,
+preso dai suoi transport parameter» — cioè **25 ms** di default. Su un percorso
+diretto in regione l'RTT sta sotto il millisecondo, quindi un ricevente che non
+ha ancora accumulato `soglia + 1` pacchetti si siede sull'ACK per **centinaia di
+RTT**. Che una data connessione finisca o no in quello stato dipende da quanto
+le sue fasi stanno sopra la soglia: è esattamente la bimodalità misurata.
+
+Di conseguenza `BORE_DIRECT_QUIC_ACK_THRESHOLD` da solo viene **rifiutato** con
+un `warn!` e la politica ACK resta quella di quinn; serve anche
+`BORE_DIRECT_QUIC_ACK_MAX_DELAY_MS`. Una soglia senza un limite di ritardo non
+misura ACK più radi: misura un ritardo di ACK da 25 ms.
+
+**Cosa resta non misurato.** Questa campagna ha misurato la trappola, non l'idea:
+una soglia con un `max_ack_delay` esplicito e piccolo (dell'ordine dell'RTT del
+percorso) non è stata provata, e potrebbe benissimo essere neutra o utile su una
+tratta ad alto BDP. È un esperimento successivo, con la manopola che adesso
+permette di condurlo correttamente.
+
+### 21.6 La banda del percorso diretto non è decisa dal traversal (window floor)
+
+Chiude un equivoco che questa campagna ha visto nascere: «il percorso diretto è
+più lento del relay, quindi il traversal ha scelto una coppia scadente».
+Misurato il 2026-09-12 sulla coppia `ws ↔ vm`, con il buco riuscito e la coppia
+giusta nominata:
+
+```
+UDP direct path : sent 1.86 GiB in 42.46s (376.79 Mbit/s)
+UDP direct path QUIC : rtt 19.13 ms, cwnd 10.31 MiB, loss 0 pkts / 0 B
+TCP relay fallback : sent 1.86 GiB in 24.34s (657.25 Mbit/s)
+```
+
+`loss 0` esclude la rete; `cwnd 10.31 MiB` contro una finestra di ricezione di
+stream da 1 MiB dice che il controllo di congestione ha aperto dieci volte
+quello che al flusso è permesso usare. Il limite è `finestra / RTT` = 438
+Mbit/s, e la misura ne è l'86 %.
+
+La finestra da 1 MiB non viene dal traversal: viene da
+`UdpDirectTuning::from_memory_budget`, cioè da `--udp-memory-budget` diviso
+`--max-carriers` (dettagli e rimedi nel README e in
+[`../performance/final_secret_perf_review.md`](../performance/final_secret_perf_review.md)
+§5.7). **Nessuna manopola di traversal la cambia**, e nessun difetto di
+traversal la produce.
+
+La regola operativa per chi diagnostica: prima di sospettare il buco, leggere
+la riga `UDP direct path tuning` di `bore test-udp`, che stampa le finestre
+davvero in vigore accanto ai default. Se `stream recv` è sotto il default, la
+banda di **un** flusso è già spiegata dall'aritmetica e il traversal non
+c'entra.

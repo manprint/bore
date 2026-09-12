@@ -450,6 +450,27 @@ requested pair would not (`max_idle >= 3 × keepalive`), and warns when it does 
 value in force can differ from the value requested, and both `direct_quic_keepalive_ms`
 and `direct_quic_idle_ms` are published on `GET /admin/api/v1/config`.
 
+**Direct-path QUIC handshake and ACK policy (experiment knobs).**
+`BORE_DIRECT_QUIC_INITIAL_RTT_MS` (default 100, clamped `[10 ms, 333 ms]`) replaces
+RFC 9002's no-information initial RTT on a direct endpoint, which is only ever built
+after an authenticated check exchange with that peer — underestimating costs one
+duplicate Initial, overestimating costs a full probe timeout of silence.
+
+`BORE_DIRECT_QUIC_ACK_THRESHOLD` and `BORE_DIRECT_QUIC_ACK_MAX_DELAY_MS` request the
+QUIC ACK Frequency extension (draft-ietf-quic-ack-frequency-04) from the peer: at most
+one ACK per `threshold + 1` ack-eliciting packets, and at most `max_ack_delay`
+milliseconds of waiting when that count is not reached. **Both are required** — a
+threshold set on its own is refused with a warning and the ACK policy is left at
+Quinn's default, because a threshold alone leaves `max_ack_delay` at the peer's
+transport parameter (25 ms), which on a direct path is hundreds of round trips.
+
+Measured and **not recommended**: on an in-region direct path (`vm-vm`, 128 MiB over 4
+connections, 5 paired arms) a threshold of 10 gave a median of **0.62×** the default's
+throughput, with individual pairs ranging 0.02× to 1.04× — the knob makes throughput
+bimodal rather than merely slower. Unset — the shipped default — leaves the ACK
+behaviour byte-identical to Quinn's. Re-run it with
+`TOPO=vm-vm ACK=10 scripts/perf/staging/sec/sec_ack.sh`.
+
 **Reading what is actually in force:** `GET /admin/api/v1/config` derives the whole direct-UDP block from the tuning installed on the server rather than restating the CLI strings, because `--udp-memory-budget` computes the three windows from one number after startup. `udp_direct_slots` reports the aggregate admission bound the budget derived (`null` = no budget, the historical unbounded path) — the CONFIGURED total, which does not move with load; the live "how many are free right now" gauge is `udp_direct_slots_available` on `/admin/api/v1/metrics`.
 
 For bulk transfers, the direct QUIC path is tuned in code with larger flow-control windows
@@ -578,6 +599,38 @@ small host the practical remedy is usually the other side of the same inequality
 `--max-carriers`. The flag conflicts with `--udp-stream-receive-window`,
 `--udp-connection-receive-window` and `--udp-send-window`, because honouring both would mean
 silently discarding one.
+
+**The budget buys concurrency out of single-stream bandwidth, and the server now says so.**
+The derivation is `stream_window = budget / --max-carriers / 16`, clamped to
+[1 MiB, 16 MiB], and `--max-carriers` is the *absolute ceiling* on the carriers one tunnel
+may open — not the number any tunnel actually opens. A ceiling set generously for
+concurrency therefore shrinks every tunnel's per-stream window:
+
+| `--udp-memory-budget` | `--max-carriers` | stream window | one stream at 20 ms RTT | at 100 ms |
+|---|---|---|---|---|
+| (unset) | any | 16 MiB (default) | ~800 MB/s | ~160 MB/s |
+| 4 GiB | 16 (default) | 16 MiB | ~800 MB/s | ~160 MB/s |
+| 512 MiB | 16 (default) | 2 MiB | ~100 MB/s | ~20 MB/s |
+| 512 MiB | 1024 | 1 MiB (floor) | ~50 MB/s | ~10 MB/s |
+
+A congestion-controlled flow cannot have more than one receive window in flight, so its
+ceiling is `window / RTT` no matter how much capacity the path has — the same arithmetic
+P-13 applies to socket buffers, one layer up. **Concurrent streams each get their own
+window**, so this bounds a single large transfer (one `scp`, one big download, one database
+restore), not the tunnel's aggregate; a four-connection workload sees four times the figure
+above. Measured on staging (1 MiB window, 19.13 ms RTT): `bore test-udp` benchmarked one
+direct stream at 376.79 Mbit/s against the 438 Mbit/s the window allows, with quinn
+reporting `loss 0 pkts` and a congestion window ten times the receive window — flow control,
+not the network — and reported the direct path as *slower* than the TCP relay on the same
+pair.
+
+Whenever the derived stream window falls below the tested default, the server warns at
+startup with the MB/s figures at both reference RTTs and three remedies: lower
+`--max-carriers` to the carrier count tunnels actually use, raise the budget to
+`--max-carriers x 256 MiB`, or drop `--udp-memory-budget` and set the three `--udp-*-window`
+flags directly. `bore test-udp` prints the windows actually in force
+(`UDP direct path tuning : stream recv ... (default ...)`), which is the fastest way to
+check a running deployment.
 
 Unset, the behaviour is unchanged: a per-connection ceiling with no aggregate bound. On a
 host whose memory cannot hold even one tunnel's worst case, the server warns at startup with

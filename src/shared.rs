@@ -991,6 +991,36 @@ pub struct UdpBudgetPlan {
     /// Set when the budget could not be honoured as asked. Never a silent
     /// clamp — the project's convention is to warn with concrete remediation.
     pub shortfall: Option<UdpBudgetShortfall>,
+    /// True when `budget / max_carriers` fell BELOW the floor, so the clamp —
+    /// not the operator's budget — chose the window.
+    ///
+    /// This is a throughput fact, not a memory fact, which is why it is
+    /// reported separately from [`UdpBudgetShortfall`]: that enum is about how
+    /// many carriers fit, and an operator who reads "32 of 1024 carriers" does
+    /// not learn that a SINGLE direct stream is now capped at
+    /// `stream_receive_window / RTT`. The divisor is the operator's absolute
+    /// ceiling on carriers, which no ordinary tunnel uses, so a ceiling set
+    /// generously for concurrency silently buys that concurrency out of
+    /// single-stream bandwidth.
+    ///
+    /// The flag is the SHARPEST case, not the whole of it: the shipped
+    /// `--max-carriers` is 16, where a 512 MiB budget yields a 2 MiB stream
+    /// window — off the floor and still an eighth of the tested default. The
+    /// advisory in `main.rs` therefore fires on "below the default", and uses
+    /// this flag only to name the cause.
+    ///
+    /// MEASURED on staging 2026-09-12 with `--max-carriers 1024` and
+    /// `--udp-memory-budget 512MB`, i.e. `budget / carriers` = 512 KiB, well
+    /// under the floor: `/admin/api/v1/config` published `stream 1 MiB`, and a
+    /// paired `bore test-udp` at 19.13 ms RTT benchmarked a single direct
+    /// stream at 376.79 Mbit/s against the `1 MiB / 19.13 ms` = 438 Mbit/s
+    /// bound — 86 % of it, the remainder being the turnaround the sender
+    /// spends waiting for a window update. quinn reported `loss 0 pkts` and
+    /// `cwnd 10.31 MiB`, ten times the window it was allowed to use, so it is
+    /// flow control and not the network; and the run called the direct path
+    /// SLOWER than the TCP relay on the same pair, the opposite of what the
+    /// same link gives with the shipped default windows.
+    pub window_at_floor: bool,
 }
 
 /// Why a budget could not be honoured exactly.
@@ -1028,7 +1058,9 @@ impl UdpDirectTuning {
         let floor = (DIRECT_WINDOW_RATIO * MIN_DIRECT_STREAM_RECEIVE_WINDOW) as u64;
         let ceiling = DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW as u64;
 
-        let mut conn = (budget / carriers).clamp(floor, ceiling);
+        let raw = budget / carriers;
+        let window_at_floor = raw < floor;
+        let mut conn = raw.clamp(floor, ceiling);
         // Keep the ratio exact so `stream = conn / RATIO` loses no bytes.
         conn -= conn % DIRECT_WINDOW_RATIO as u64;
 
@@ -1059,6 +1091,7 @@ impl UdpDirectTuning {
             },
             direct_slots: slots,
             shortfall,
+            window_at_floor,
         }
     }
 
@@ -2553,6 +2586,61 @@ mod tests {
         );
         assert_eq!(plan.direct_slots, 16);
         assert_eq!(plan.shortfall, None);
+    }
+
+    /// `--udp-memory-budget` buys concurrency by SHRINKING the per-stream
+    /// window, which is a throughput fact the carrier-count shortfall does not
+    /// carry — and the divisor is `--max-carriers`, an operator-set number
+    /// whose effect on single-stream bandwidth nothing announced.
+    ///
+    /// Found in the field on 2026-09-12: staging ran `--udp-memory-budget
+    /// 512MB` with `--max-carriers 1024`, so `budget / carriers` was 512 KiB —
+    /// below the 16 MiB floor — and `/admin/api/v1/config` published
+    /// `udp_stream_receive_window = 1MiB`, 16x under the tested default. A
+    /// paired `bore test-udp` at 19.13 ms RTT then measured ONE direct stream
+    /// at 376.79 Mbit/s against the `1 MiB / 19.13 ms` = 438 Mbit/s ceiling
+    /// (86 % of it, the rest being window-update turnaround), with quinn
+    /// reporting `loss 0 pkts` and `cwnd 10.31 MiB` — ten times the window it
+    /// was allowed to use — and called the direct path SLOWER than the TCP
+    /// relay on the same host pair. The operator had been warned about
+    /// carriers and not about this.
+    #[test]
+    fn a_budget_divided_by_the_carrier_cap_decides_the_stream_window() {
+        // Staging's own shape: the divisor, not the budget, chose the window.
+        let staging = UdpDirectTuning::from_memory_budget(512 * MIB, 1024);
+        assert!(
+            staging.window_at_floor,
+            "the clamp chose the window, not the budget"
+        );
+        assert_eq!(staging.tuning.connection_receive_window as u64, 16 * MIB);
+        assert_eq!(staging.tuning.stream_receive_window as u64, MIB);
+        assert_eq!(staging.direct_slots, 32);
+
+        // The SHIPPED default is 16 carriers, and it is the case that shows why
+        // the advisory cannot be gated on the floor alone: 512 MiB / 16 is
+        // 32 MiB, comfortably off the floor, and the stream window is still an
+        // eighth of the default.
+        let shipped = UdpDirectTuning::from_memory_budget(512 * MIB, 16);
+        assert!(!shipped.window_at_floor);
+        assert_eq!(shipped.tuning.connection_receive_window as u64, 32 * MIB);
+        assert_eq!(shipped.tuning.stream_receive_window as u64, 2 * MIB);
+        assert!(shipped.tuning.stream_receive_window < DIRECT_QUIC_STREAM_RECEIVE_WINDOW);
+
+        // The remedy the advisory names must actually work: a smaller carrier
+        // ceiling lifts the window with the SAME budget.
+        let fixed = UdpDirectTuning::from_memory_budget(512 * MIB, 8);
+        assert!(!fixed.window_at_floor);
+        assert_eq!(fixed.tuning.connection_receive_window as u64, 64 * MIB);
+        assert_eq!(fixed.tuning.stream_receive_window as u64, 4 * MIB);
+
+        // And the other remedy: `carriers x 256 MiB` is exactly the budget that
+        // reaches the tested default, which is the figure the advisory prints.
+        let ample = UdpDirectTuning::from_memory_budget(16 * 256 * MIB, 16);
+        assert!(!ample.window_at_floor);
+        assert_eq!(
+            ample.tuning.stream_receive_window,
+            DIRECT_QUIC_STREAM_RECEIVE_WINDOW
+        );
     }
 
     /// A budget too small to hold every carrier is honoured, not silently

@@ -434,31 +434,89 @@ pub fn direct_initial_rtt() -> Duration {
     resolve_direct_initial_rtt(env_ms("BORE_DIRECT_QUIC_INITIAL_RTT_MS"))
 }
 
-/// Ack-eliciting threshold requested from the peer through the QUIC ACK
-/// Frequency extension (draft-ietf-quic-ack-frequency-04), or `None` for
-/// quinn's default behaviour — which is the extension DISABLED and an ACK for
-/// every other ack-eliciting packet.
+/// What the direct endpoint should ask of the peer's ACK policy.
+///
+/// An enum rather than a pair of `Option`s because the combination that is a
+/// TRAP — a threshold with no `max_ack_delay` bound — has to be a named state
+/// that the wiring must handle, not a silent default nobody notices.
+#[cfg(feature = "udp")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckFrequencyChoice {
+    /// Nothing configured: quinn's own behaviour, the extension disabled and an
+    /// ACK for every other ack-eliciting packet. Byte-identical to before this
+    /// knob existed.
+    QuinnDefault,
+    /// A threshold with no delay bound. Deliberately NOT installed.
+    ThresholdWithoutDelay {
+        /// The threshold that was asked for and is being refused.
+        threshold: u64,
+    },
+    /// Both halves given; install them.
+    Configured {
+        /// Ack-eliciting packets the peer may receive before it must ACK.
+        threshold: u64,
+        /// Upper bound on how long the peer may sit on that ACK.
+        max_ack_delay: Duration,
+    },
+}
+
+/// Resolve the direct path's ACK-frequency request
+/// (draft-ietf-quic-ack-frequency-04) from the two operator overrides.
 ///
 /// A threshold of N asks the peer to acknowledge at most once every N+1
 /// ack-eliciting packets, which on a saturated direct path removes most of the
-/// return-path packet rate. It is an experiment knob, not a default: both ends
-/// of a bore direct path are bore, so the extension is always negotiable, but
+/// return-path packet rate. It is an experiment knob and it stays one:
 /// acknowledging less often also delays loss detection, and a congestion
-/// controller reacts to what it is told. The default therefore stays quinn's
-/// until a measurement on this project's own paths says otherwise, and the
-/// measurement is what the env var exists for.
+/// controller reacts to what it is told.
 ///
-/// `reordering_threshold` follows quinn's own recommendation of
-/// `packet_threshold - 1` (2 with the default packet threshold of 3), so
-/// out-of-order delivery still elicits an immediate ACK and fast retransmit is
-/// unaffected by the change.
+/// **MEASURED AND REJECTED AS A DEFAULT** (S5, `scripts/perf/staging/sec/sec_ack.sh`,
+/// 2026-09-12, `vm-vm`, 128 MiB over 4 connections, 5 paired arms, threshold 10
+/// against the shipped default): median ratio **0.622**, individual pairs
+/// 0.539 / 0.964 / 0.622 / **0.020** / 1.035. The knob does not merely cost
+/// throughput, it makes throughput BIMODAL — one pair collapsed from 393.86 to
+/// **7.91 MB/s** on a path with no WAN in it.
+///
+/// The mechanism is why `Configured` needs both halves. Setting only the
+/// threshold leaves `AckFrequencyConfig::max_ack_delay` at `None`, which quinn
+/// documents as "the peer's original `max_ack_delay` will be used, as obtained
+/// from its transport parameters" — 25 ms by default. On an in-region direct
+/// path the RTT is well under a millisecond, so a receiver that has not yet
+/// collected N+1 packets sits on the ACK for **hundreds of RTTs**. Whether a
+/// given connection falls into that state depends on whether its phases stay
+/// above the threshold, which is exactly the bimodality measured. A threshold
+/// alone therefore does not measure thinner ACKs; it measures a 25 ms ACK
+/// delay, and it is refused rather than installed.
+///
+/// `reordering_threshold` is left at quinn's default of 2, its own recommended
+/// `packet_threshold - 1`, so out-of-order delivery still elicits an immediate
+/// ACK and fast retransmit is unaffected by the change.
+///
+/// Pure, so the policy is unit-testable without an endpoint.
 #[cfg(feature = "udp")]
-pub fn direct_ack_eliciting_threshold() -> Option<u64> {
-    std::env::var("BORE_DIRECT_QUIC_ACK_THRESHOLD")
-        .ok()?
-        .parse::<u64>()
-        .ok()
-        .filter(|n| *n > 0)
+pub fn resolve_ack_frequency(
+    threshold: Option<u64>,
+    max_ack_delay_ms: Option<u64>,
+) -> AckFrequencyChoice {
+    match (
+        threshold.filter(|n| *n > 0),
+        max_ack_delay_ms.filter(|ms| *ms > 0),
+    ) {
+        (None, _) => AckFrequencyChoice::QuinnDefault,
+        (Some(threshold), None) => AckFrequencyChoice::ThresholdWithoutDelay { threshold },
+        (Some(threshold), Some(ms)) => AckFrequencyChoice::Configured {
+            threshold,
+            max_ack_delay: Duration::from_millis(ms),
+        },
+    }
+}
+
+/// The live ACK-frequency request, including the operator overrides.
+#[cfg(feature = "udp")]
+pub fn direct_ack_frequency() -> AckFrequencyChoice {
+    resolve_ack_frequency(
+        env_ms("BORE_DIRECT_QUIC_ACK_THRESHOLD"),
+        env_ms("BORE_DIRECT_QUIC_ACK_MAX_DELAY_MS"),
+    )
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -3817,14 +3875,32 @@ fn transport_config(tuning: &UdpDirectTuning) -> quinn::TransportConfig {
     // See `DIRECT_INITIAL_RTT` for the measurement that priced the default.
     cfg.initial_rtt(direct_initial_rtt());
 
-    // Opt-in only: unset leaves quinn's ACK behaviour byte-identical. See
-    // `direct_ack_eliciting_threshold`.
-    if let Some(threshold) = direct_ack_eliciting_threshold() {
-        let mut ack = quinn::AckFrequencyConfig::default();
-        ack.ack_eliciting_threshold(
-            quinn::VarInt::from_u64(threshold).unwrap_or(quinn::VarInt::MAX),
-        );
-        cfg.ack_frequency_config(Some(ack));
+    // Opt-in only: unset leaves quinn's ACK behaviour byte-identical. A
+    // threshold WITHOUT a delay bound is refused rather than installed — see
+    // `resolve_ack_frequency` for the measurement that made that a refusal.
+    match direct_ack_frequency() {
+        AckFrequencyChoice::QuinnDefault => {}
+        AckFrequencyChoice::ThresholdWithoutDelay { threshold } => {
+            warn!(
+                threshold,
+                "BORE_DIRECT_QUIC_ACK_THRESHOLD is set without \
+                 BORE_DIRECT_QUIC_ACK_MAX_DELAY_MS, so the ACK policy is left at \
+                 quinn's default: a threshold alone leaves max_ack_delay at the \
+                 peer's transport parameter (25 ms), which on a direct path is \
+                 hundreds of RTTs and measured a 50x throughput collapse"
+            );
+        }
+        AckFrequencyChoice::Configured {
+            threshold,
+            max_ack_delay,
+        } => {
+            let mut ack = quinn::AckFrequencyConfig::default();
+            ack.ack_eliciting_threshold(
+                quinn::VarInt::from_u64(threshold).unwrap_or(quinn::VarInt::MAX),
+            );
+            ack.max_ack_delay(Some(max_ack_delay));
+            cfg.ack_frequency_config(Some(ack));
+        }
     }
 
     // High-throughput direct transfers need flow-control windows larger than
@@ -5895,6 +5971,51 @@ mod tests {
         // The shipped value must stay strictly below the RFC default, or S-7
         // is a no-op that still claims to be a fix.
         assert!(DIRECT_INITIAL_RTT < DIRECT_INITIAL_RTT_MAX);
+    }
+
+    /// S5: an unset knob is quinn's own behaviour, and a threshold given
+    /// WITHOUT a delay bound is refused rather than installed.
+    ///
+    /// The refusal is the whole point. Setting only the threshold leaves
+    /// quinn's `max_ack_delay` at `None`, i.e. the peer's transport parameter
+    /// (25 ms) — hundreds of RTTs on a direct path. Measured 2026-09-12 on
+    /// `vm-vm`: median 0.622 against the default, with one pair at 0.020
+    /// (393.86 -> 7.91 MB/s). If this ever returns `Configured` for a bare
+    /// threshold, the knob has silently become that experiment again.
+    #[test]
+    #[cfg(feature = "udp")]
+    fn an_ack_threshold_without_a_delay_bound_is_refused() {
+        assert_eq!(
+            resolve_ack_frequency(None, None),
+            AckFrequencyChoice::QuinnDefault
+        );
+        assert_eq!(
+            resolve_ack_frequency(None, Some(5)),
+            AckFrequencyChoice::QuinnDefault,
+            "a delay bound alone configures nothing — there is no threshold to bound"
+        );
+        assert_eq!(
+            resolve_ack_frequency(Some(10), None),
+            AckFrequencyChoice::ThresholdWithoutDelay { threshold: 10 },
+            "a bare threshold must never reach the endpoint"
+        );
+        assert_eq!(
+            resolve_ack_frequency(Some(10), Some(2)),
+            AckFrequencyChoice::Configured {
+                threshold: 10,
+                max_ack_delay: Duration::from_millis(2)
+            }
+        );
+        // Zero on either half means "unset", exactly as `env_ms` treats it, so
+        // `...=0` disables rather than requesting an ACK for every packet.
+        assert_eq!(
+            resolve_ack_frequency(Some(0), Some(2)),
+            AckFrequencyChoice::QuinnDefault
+        );
+        assert_eq!(
+            resolve_ack_frequency(Some(10), Some(0)),
+            AckFrequencyChoice::ThresholdWithoutDelay { threshold: 10 }
+        );
     }
 
     /// Fase 2 happy path on loopback: both roles run a round; each side

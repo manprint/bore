@@ -1080,13 +1080,48 @@ impl UdpTraversalSocket {
                 Some((target, obs)) = validated_rx.recv() => {
                     nominated = Some(target);
                     observed = obs;
+                    // S-5's COROLLARY. A listener may not leave on its own
+                    // validation, because its own validation has given the
+                    // dialer nothing: a dialer nominates on a response to a
+                    // request OF ITS OWN and on nothing else, and only our
+                    // answer can produce one. Leaving here disables the round
+                    // ("late frames are counted, never answered") and the
+                    // dialer's request — which on the ordinary ordering is the
+                    // very next datagram, because a dialer answers our request
+                    // before sending its own triggered check — arrives at a
+                    // socket that has stopped answering. The dialer is not
+                    // stranded — `dialer_checks_then_quic` dials
+                    // `outcome.targets` whether or not it nominated (§21.3b) —
+                    // but it has lost the ONE address the peer provably
+                    // egresses from and must try the whole list instead, and a
+                    // round that reads dry is also what arms the Fase 7 spray,
+                    // so a pair that was already proven can cost the escape's
+                    // whole budget. We threw that away for nothing: we had
+                    // already answered nobody.
+                    //
+                    // So the LISTENER's exit is the handoff below and not this
+                    // one. That is not a return to the pre-S-5 stall: the
+                    // dialer cannot nominate without our answer, and our answer
+                    // is what queues the handoff announcement — so whenever the
+                    // pair is actually working, the handoff is already on its
+                    // way and ends this round microseconds later. When the peer
+                    // never asks, we run out our window exactly as a legacy
+                    // round did, which is the safe direction.
+                    //
+                    // Keep the nomination: it is proven, and a later handoff
+                    // only ever replaces it with the source that peer PROVABLY
+                    // egresses from.
+                    if cfg.role == CheckRole::Listener {
+                        continue;
+                    }
                     break;
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     // Dry pass: the adaptive plan's retry budget grants
                     // another paced pass (backoff), inside the hard cap —
                     // a single bounded round, never an unbounded prober.
-                    if pass < u32::from(retry_budget)
+                    if nominated.is_none()
+                        && pass < u32::from(retry_budget)
                         && tokio::time::Instant::now() < hard_cap
                     {
                         pass += 1;
@@ -6356,6 +6391,115 @@ mod tests {
         assert!(selected.is_none());
         assert_eq!(profile.observations, 0);
         assert_eq!(profile.mapping, UdpNatMapping::Unknown);
+    }
+
+    /// S-5 corollary, and the one exit that used to break it: a LISTENER may
+    /// not leave the round on its OWN validation.
+    ///
+    /// There are two ways a listener can nominate. One is the S-5 handoff — it
+    /// ANSWERED an authenticated request, so the dialer is about to nominate
+    /// and dial. The other is `validated_rx`: the dialer answered a request of
+    /// OURS. Those two are not interchangeable, because only the first one has
+    /// given the dialer anything. A dialer nominates on a response to its own
+    /// request and on nothing else, so a listener that validates and tears its
+    /// round down (`self.inner.checks.lock().take()` — "late frames are
+    /// counted, never answered") can leave the dialer with no way to nominate
+    /// at all: its request arrives at a socket that has stopped answering.
+    ///
+    /// The window is small but it is the ordinary ordering, not a contrived
+    /// one: on receiving our request the dialer answers it FIRST and only then
+    /// sends its own triggered check, so the two frames arrive back to back and
+    /// the teardown races the second one. It surfaced as
+    /// `checks_planned_decoy_head_group_still_nominates` failing on macos-14 CI
+    /// with `l.nominated = Some(..)` and `d.nominated = None` — the listener
+    /// declaring a pair proven while the dialer came away with nothing. The
+    /// dialer still dials (it dials `targets` regardless, §21.3b), so this is a
+    /// lost fast path rather than a lost tunnel: it forgets the one address the
+    /// peer provably egresses from, and a dry round is also what arms the
+    /// Fase 7 sprayed escape.
+    ///
+    /// This gate forces the losing order deterministically rather than hoping a
+    /// scheduler produces it: the fake dialer answers, waits long enough for the
+    /// listener's driver to have certainly processed that validation, and only
+    /// then asks its own question. Without the fix the answer never comes.
+    #[tokio::test]
+    async fn a_listener_keeps_answering_until_it_has_answered_the_dialer() {
+        let key = [9u8; 32];
+        let listener = UdpTraversalSocket::bind(0).await.unwrap();
+        let l_addr: SocketAddr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        // A hand-rolled dialer: the real one cannot be made to answer first and
+        // ask later, which is exactly the order under test.
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let p_addr: SocketAddr = peer.local_addr().unwrap();
+
+        let cfg = CheckConfig {
+            key,
+            generation: 5,
+            role: CheckRole::Listener,
+            window: Duration::from_secs(3),
+            plan: None,
+            spray: None,
+        };
+        let peers = [p_addr];
+        let round = tokio::spawn(async move {
+            let sock = listener;
+            let out = sock.run_connectivity_checks(&peers, &cfg).await;
+            (out, sock)
+        });
+
+        // 1. Take the listener's request and ANSWER it. This validates the
+        //    listener's own transaction — the exit under test.
+        let mut buf = [0u8; 256];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("listener never probed")
+            .unwrap();
+        let req = check::parse(&key, &buf[..n]).expect("listener frame must authenticate");
+        assert_eq!(req.kind, check::KIND_REQUEST);
+        let answer = check::response(&key, check::ROLE_DIALER, 5, &req.txid, from);
+        peer.send_to(&answer, l_addr).await.unwrap();
+
+        // 2. Let the listener's driver certainly observe that validation. The
+        //    race this pins is sub-millisecond; 150 ms removes it entirely, so a
+        //    failure here is the defect and never the scheduler.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // 3. NOW ask our own question — the one the dialer's nomination depends
+        //    on. The listener must still be answering.
+        let txid = check::new_txid();
+        let ask = check::request(&key, check::ROLE_DIALER, 5, &txid);
+        peer.send_to(&ask, l_addr).await.unwrap();
+
+        // A listener that is still in its round is also still PROBING, so its
+        // own paced requests are interleaved with the answer we are waiting
+        // for. Drain until our transaction comes back; the deadline, not the
+        // frame count, is what fails this test.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let answered = loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Ok(Ok((n, src))) = tokio::time::timeout(left, peer.recv_from(&mut buf)).await
+            else {
+                break false;
+            };
+            assert_eq!(src, l_addr);
+            let frame = check::parse(&key, &buf[..n]).expect("frame must authenticate");
+            if frame.kind == check::KIND_RESPONSE && frame.txid == txid {
+                break true;
+            }
+        };
+        assert!(
+            answered,
+            "the listener stopped answering after validating itself"
+        );
+
+        let (out, _sock) = round.await.unwrap();
+        assert_eq!(
+            out.nominated,
+            Some(p_addr),
+            "the listener still nominates the peer it proved"
+        );
     }
 
     /// Fase 3 gate: a planned round with a decoy head group (dead predicted

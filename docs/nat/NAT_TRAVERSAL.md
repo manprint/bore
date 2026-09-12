@@ -1204,6 +1204,37 @@ la lista di target del giro (compresi i candidati peer-reflexive appresi), e
 trova l'endpoint QUIC già in ascolto. Degrada a «chiama senza nomina», che
 funziona; la grazia degraderebbe il percorso normale, che oggi funziona in 40 ms.
 
+### 21.3c Il corollario: quando il listener NON deve uscire
+
+§21.3 dice quando il listener *può* chiudere il giro. La metà mancante è quando
+non deve, e l'uscita che la violava è `validated_rx`.
+
+Un listener nomina in due modi. Uno è la consegna: ha **risposto** a una
+richiesta autenticata. L'altro è: il dialer ha risposto a una richiesta
+**nostra**. Non sono intercambiabili, perché solo il primo ha dato qualcosa al
+dialer — *un dialer nomina su una risposta a una richiesta propria e su
+nient'altro*. Un listener che si valida da solo, esce e smonta il giro lascia
+quindi la richiesta del dialer su un socket che ha smesso di rispondere. E
+l'ordine che lo produce è quello ordinario: ricevuta la nostra richiesta il
+dialer prima la risponde e poi manda il proprio check innescato, quindi i due
+frame arrivano attaccati e lo smontaggio corre contro il secondo.
+
+Il costo è quello descritto in §21.3b al contrario: il dialer chiama comunque
+l'intera lista di target, quindi il diretto di norma si stabilisce, ma perde
+l'unico indirizzo da cui il peer dimostrabilmente esce — e un giro a secco è
+anche ciò che arma lo spray della Fase 7.
+
+**Correzione:** il listener registra la nomina e **continua**; la sua uscita è la
+consegna. Non è lo stallo pre-S-5: il dialer non può nominare senza la nostra
+risposta, e la nostra risposta è ciò che accoda l'annuncio di consegna, quindi
+quando la coppia funziona il giro chiude pochi microsecondi dopo; quando il peer
+non chiede nulla si esaurisce la finestra come in un giro legacy. Un giro che ha
+già nominato smette anche di spendere passaggi del `retry_budget` alla scadenza.
+
+Gate deterministico (nessuna fortuna di scheduler):
+`a_listener_keeps_answering_until_it_has_answered_the_dialer` — un dialer scritto
+a mano che prima risponde e poi, 150 ms dopo, chiede. Verificato in rosso.
+
 ### 21.4 E un endpoint diretto non è mai «freddo» (S-7)
 
 I 333 ms di `initial_rtt` della RFC 9002 sono il valore per una connessione che

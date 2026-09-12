@@ -133,6 +133,56 @@ valorizzato perché è ciò che disattiva l'escape spray della Fase 7 — spende
 sei secondi di spray per un peer che ci ha appena raggiunto sarebbe lo stesso
 errore in formato più grande.
 
+### 1.1 Il corollario, trovato dopo — e l'uscita che lo violava
+
+La correzione qui sopra dice quando il listener **può** uscire. Non diceva
+quando **non deve**, e quella metà mancava.
+
+Un listener può nominare in due modi. Uno è la consegna S-5: ha *risposto* a una
+richiesta autenticata, quindi il dialer sta per nominare e chiamare. L'altro è
+`validated_rx`: il dialer ha risposto a una richiesta **nostra**. I due non sono
+intercambiabili, perché solo il primo ha dato qualcosa al dialer. **Un dialer
+nomina su una risposta a una richiesta propria e su nient'altro.** Quindi un
+listener che si valida da solo, esce e smonta il giro («i frame in ritardo si
+contano, non si rispondono») può lasciare il dialer senza alcun modo di
+nominare: la sua richiesta arriva su un socket che ha smesso di rispondere.
+
+La finestra è stretta ma l'ordine è quello **ordinario**, non uno costruito ad
+arte: ricevuta la nostra richiesta il dialer prima la *risponde* e solo poi manda
+il proprio check innescato, quindi i due frame arrivano attaccati e lo smontaggio
+corre contro il secondo.
+
+**Quanto costa, per la precisione.** Non è un tunnel perso: `dialer_checks_then_quic`
+chiama comunque l'intera lista di target, con o senza nomina (§21.3b), quindi il
+percorso diretto di norma si stabilisce lo stesso. Quello che si perde è la via
+rapida — l'unico indirizzo da cui il peer *dimostrabilmente* esce — e al suo posto
+si provano tutti i candidati. E un giro che risulta a secco è anche ciò che arma
+l'escape spray della Fase 7: una coppia già dimostrata può finire per costare
+l'intero budget dello spray. Abbiamo buttato via tutto questo per niente, visto
+che a nessuno avevamo ancora risposto.
+
+È emerso dalla CI macos-14 come `checks_planned_decoy_head_group_still_nominates`
+fallito con `l.nominated=Some(..)` e `d.nominated=None` — cioè con il listener
+convinto e il dialer a mani vuote. Sulla workstation non si riproduceva: 100
+esecuzioni verdi da ferma e 40 sotto carico. Non è stato quindi inseguito lo
+scheduler, ma costruito un gate **deterministico** che forza l'ordine perdente —
+un dialer scritto a mano che prima risponde e poi, 150 ms dopo, chiede — e su
+quello il difetto si riproduce ogni volta, anche su Linux.
+
+**La correzione:** il listener registra la nomina e **continua**; la sua uscita è
+la consegna. Non è un ritorno allo stallo pre-S-5: il dialer non può nominare
+senza la nostra risposta, e la nostra risposta è ciò che accoda l'annuncio di
+consegna — quindi ogni volta che la coppia funziona davvero la consegna chiude il
+giro pochi microsecondi dopo. Quando invece il peer non chiede nulla, si esaurisce
+la finestra esattamente come faceva un giro legacy, che è la direzione sicura. Un
+giro che ha già nominato smette anche di spendere passaggi del `retry_budget` alla
+scadenza: quel budget serve a *trovare* una coppia, non a continuare a sondare
+dopo averla trovata.
+
+Gate: `a_listener_keeps_answering_until_it_has_answered_the_dialer`, verificato in
+rosso (rimuovendo la correzione il test fallisce con «the listener stopped
+answering after validating itself»).
+
 ## 2. Gli altri tre interventi
 
 | id | cosa | perché |

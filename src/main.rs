@@ -2913,6 +2913,13 @@ fn report_udp_budget(budget: u64, max_carriers: u32, plan: &UdpBudgetPlan) {
     // stream window, with quinn reporting `loss 0 pkts` and a cwnd ten times
     // the window — flow control, not the network).
     //
+    // The remedy ORDER is deliberate and the budget figure is deliberately not
+    // presented as the recommendation: at --max-carriers 1024 it computes to
+    // 262144 MiB (256 GiB), and an advisory that opens with an absurd number
+    // teaches the operator to stop reading it. The carrier cap is the half of
+    // the inequality that is usually wrong, exactly as the existing shortfall
+    // warning already notes for the same reason.
+    //
     // The condition is "below the tested default", NOT "on the floor": with
     // the shipped --max-carriers 16 a 512 MiB budget yields a 2 MiB stream
     // window, which is off the floor and still an eighth of the default. The
@@ -2930,7 +2937,7 @@ fn report_udp_budget(budget: u64, max_carriers: u32, plan: &UdpBudgetPlan) {
             stream_window_mib = mib(plan.tuning.stream_receive_window as u64),
             default_stream_window_mib = mib(DIRECT_QUIC_STREAM_RECEIVE_WINDOW as u64),
             window_at_floor = plan.window_at_floor,
-            "{cause}: ONE direct stream is limited to about {} MB/s at 20 ms RTT and {} MB/s at 100 ms (window/RTT), against {} and {} MB/s on the {} MiB default. Concurrent streams each get their own window, so this bounds a single large transfer, not the tunnel's aggregate. Lower --max-carriers to the carrier count tunnels actually use, or raise the budget to {} MiB, or drop --udp-memory-budget and set the three --udp-*-window flags directly",
+            "{cause}: ONE direct stream is limited to about {} MB/s at 20 ms RTT and {} MB/s at 100 ms (window/RTT), against {} and {} MB/s on the {} MiB default. Concurrent streams each get their own window, so this bounds a single large transfer, not the tunnel's aggregate. Lower --max-carriers to the carrier count tunnels actually use — the windows come from the CEILING, not from what tunnels open; the same windows through the budget would need {} MiB, which is the other side of the same inequality; or drop --udp-memory-budget and set the three --udp-*-window flags directly",
             stream_bandwidth_mb_s(plan.tuning.stream_receive_window, 20),
             stream_bandwidth_mb_s(plan.tuning.stream_receive_window, 100),
             stream_bandwidth_mb_s(DIRECT_QUIC_STREAM_RECEIVE_WINDOW, 20),

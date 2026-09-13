@@ -4498,3 +4498,314 @@ Nota di metodo: questa riserva non nasce da una nuova misura ma dal **fare le
 conseguenze** di una misura già fatta. Un difetto trovato in una fase va
 riportato all'indietro su tutte le fasi che ne condividono il presupposto —
 qui il presupposto era «il braccio etichettato `--udp` va davvero su UDP».
+
+## 51. Le due domande aperte che si chiudono con una ripetizione: i carrier del relay VPN, e il prezzo del relay sul jump host
+
+### 51.1 `--carriers` sul relay VPN a 4 e 8 flussi — chiusa: **non recuperano**
+
+§45.5 aveva una risposta netta a **un** flusso (dannosi: 0,824 → 0,286/0,440,
+insiemi non sovrapposti) e nessuna a 4 e 8: là gli intervalli si sovrapponevano
+quasi per intero e una cella era perfino bimodale. La medicina era quella di
+§42 — poche celle, molte ripetizioni. Rieseguita con **12 ripetizioni** per
+cella, controllo nudo campionato in ogni ripetizione (V-9), 2424 s:
+
+| cella | mediana Mbit/s | del nudo |
+|---|---|---|
+| `relay/c1/f4` | 418,5 | **0,562** |
+| `relay/c4/f4` | 314,7 | **0,423** |
+| `relay/c1/f8` | 292,2 | **0,392** |
+| `relay/c4/f8` | 291,2 | **0,390** |
+
+**A 4 flussi c4 vale il 75 % di c1; a 8 flussi sono pari.** In nessun punto i
+carrier recuperano: la domanda «recuperano quando i flussi sono tanti quanto i
+carrier?» ha risposta **no**, e la risposta vale ora su dodici ripetizioni
+invece che su tre.
+
+Ma la cosa che i campioni grezzi dicono e la mediana no è **dove** è finita la
+differenza:
+
+| cella | min | max | escursione |
+|---|---|---|---|
+| `relay/c1/f4` | 0,273 | 0,926 | **3,4×** |
+| `relay/c1/f8` | 0,318 | 0,861 | **2,7×** |
+| `relay/c4/f4` | 0,276 | 0,561 | 2,0× |
+| `relay/c4/f8` | 0,306 | 0,497 | 1,6× |
+
+A 4 flussi l'intervallo di `c1` **contiene** per intero quello di `c4`
+(0,273–0,926 contro 0,276–0,561): stesso pavimento, soffitto molto più alto. A 8
+flussi la contenenza **non** vale — il pavimento di `c4` è 0,306 contro 0,318 di
+`c1`, dodici millesimi sotto — e quello che regge su entrambe le righe è
+l'**escursione**, non la contenenza. (Scritto prima al contrario, «contiene in
+entrambe le righe»: corretto ricalcolando dai campioni grezzi. Un enunciato che
+vale su una riga e si estende all'altra per simmetria è esattamente la classe di
+affermazione che questa campagna verifica invece di dedurre.) I carrier non
+comprano banda — **spianano**. È coerente con BW-F2 letto al contrario: il round-robin
+per datagramma sul relay distribuisce il flusso su tutti i carrier, e ciò che
+distribuisce è anche ciò che impedisce a una singola ripetizione fortunata di
+andare a 0,93.
+
+Conseguenza pratica: il default `--carriers 1` resta giusto, e la ragione ora è
+misurata su tre regimi (1, 4, 8 flussi) invece che su uno. Chi cerca
+**prevedibilità** invece che picco ha però un motivo reale per alzarli, ed è la
+prima volta che questa campagna può dirlo con un numero.
+
+Da non dimenticare accanto a questi valori: la dispersione del **relay** arriva
+a 3,4× sulla stessa cella, contro l'1 % del percorso **diretto** (§45.5). È il
+relay a essere variabile, non la misura a essere sciatta — e a 8 flussi il relay
+rende lo 0,39 della linea contro il ~0,95 del diretto (§45.5), quindi la scelta
+del percorso pesa molto più di qualunque scelta di carrier.
+
+### 51.2 `jump_stab` ripetuta — 16/16 identici, e §44.9 si chiude
+
+Seconda esecuzione completa, 476 s, **PASS 16 / FAIL 0 / SKIP 0**, gli stessi
+numeri della prima: caduta sul relay in **11 s** (budget 30), ritorno al diretto
+in **15 e 16 s** (budget 90), sessione fresca aperta in 600,8 e 608,7 ms con UDP
+buttato via, `direct_fallbacks` 0 → 1 con i carrier 1 → 0, **5 rekey**
+attraversati, **una sola riga** admin durante tutto il blackout, sessione ancora
+viva dopo 130 s. Una fase di stabilità che dà due volte lo stesso verdetto è
+l'unica prova che il verdetto non era fortuna.
+
+**E la domanda aperta di §44.9 ha ora la sua risposta.** Quella nota diceva: la
+fase non può separare «il relay costa» da «è passato del tempo», perché la
+baseline è sempre prima e il relay sempre dopo; la correzione è campionare una
+**seconda baseline dopo il ritorno al diretto**. È esattamente quello che la fase
+ora fa, e la riga `recovered` è quella seconda baseline:
+
+| fase | rapporto sulla propria baseline | campioni |
+|---|---|---|
+| blackout (relay) | **0,923** | 0,943 · 0,903 |
+| recovered (di nuovo diretto) | **0,922** | 0,948 · 0,896 |
+| rekey | 0,9235 | 0,947 · 0,900 |
+
+`recovered` e `blackout` coincidono a **un millesimo**. Se il relay costasse
+latenza, `recovered` tornerebbe verso 1,00 quando il percorso torna diretto:
+non torna. Quindi quel −7,7 % **non è il prezzo del relay, è deriva** — il primo
+blocco di battute è semplicemente il più lento, e tutto ciò che viene dopo sta
+7-10 ms sotto e ci resta.
+
+Il che chiude il cerchio con §44.6, che misurava relay e diretto **interlacciati**
+dentro la stessa ripetizione e li trovava indistinguibili allo 0,4 %: due
+strumenti diversi, disegnati contro bias opposti, ora dicono la stessa cosa. Per
+un jump host **`--udp` non serve alla latenza**, e ora lo dicono due fasi.
+
+Nota di metodo, perché è la seconda volta in questa finestra: la correzione non
+ha richiesto un braccio nuovo né un'altra esecuzione: ha richiesto di campionare
+una grandezza che la fase già produceva, in un momento in cui non la campionava.
+
+## 47.8 La riesecuzione con il MITTENTE staffato: quanti pacchetti costa davvero il percorso diretto
+
+§47.4 aveva dovuto ritirare la propria conclusione: la colonna `in` del server
+somma il payload che arriva dalla VM e il flusso di ACK che arriva dalla
+workstation sulla stessa interfaccia, e la separazione è **sottodeterminata**
+(ritrasmissioni su entrambe le tratte e rapporto GRO del ricevente, nessuno dei
+due misurato). Sei celle su sei non chiudevano contro il minimo di frame. La
+correzione di §47.7 era staffare il **mittente**, cioè contare i pacchetti dove
+vengono generati, e verificare prima che il contatore del mittente sia una
+misura e non un pavimento.
+
+**La premessa è stata verificata per prima, e regge.** La tabella degli offload
+stampata dalla fase dice, sulla NIC della VM che è il mittente di entrambi i
+bracci: `tcp-segmentation-offload=off` **e** `tx-udp-segmentation=off`. Con la
+segmentazione hardware spenta il driver vede i pacchetti veri, non i
+super-pacchetti, per **entrambi** i protocolli — che è esattamente la
+condizione senza la quale i due bracci potrebbero essere distorti in direzioni
+opposte e fabbricare la differenza che la fase cerca.
+
+Tre ripetizioni, 460 MiB per braccio su 4 connessioni, contatori della VM:
+
+| rip. | braccio | pkt per MiB consegnato | B/pkt | byte sul filo / byte consegnati |
+|---|---|---|---|---|
+| 1 | relay | 733,2 | 1501,8 | 1,0500 |
+| 1 | quic  | 937,6 | 1244,7 | 1,1129 |
+| 2 | relay | 732,8 | 1502,4 | 1,0499 |
+| 2 | quic  | 910,7 | 1262,5 | 1,0965 |
+| 3 | relay | 732,0 | 1503,4 | 1,0496 |
+| 3 | quic  | 931,4 | 1251,6 | 1,1118 |
+
+**Mediane: 732,8 contro 931,4 pacchetti per MiB — il percorso diretto ne spende
+il 27,1 % in più.** I tre rapporti per ripetizione sono 1,279 / 1,243 / 1,272:
+la risposta non dipende dalla ripetizione, che è più di quanto §47.4 potesse
+dire di qualunque sua cella.
+
+E il 27 % si scompone in due addendi di taglia molto diversa:
+
+- **+5,9 % sono byte in più** (1,0499 → 1,1118 di rapporto filo/payload): il
+  costo per-pacchetto di QUIC contro TCP, header più AEAD più ACK.
+- **il resto — circa 20 punti — sono gli STESSI byte tagliati più fini**:
+  1502 B/frame contro 1252.
+
+### 47.8.1 E il taglio fine ha un nome: la connessione è rimasta all'MTU iniziale
+
+L'aritmetica chiude su un'ipotesi sola. Braccio quic, ripetizione 1:
+536 802 070 B / 431 280 pkt = **1244,7 B per frame** → meno 14 B Ethernet, 20 IP
+e 8 UDP = **1202,7 B di payload UDP**. Cioè 1200, che è `INITIAL_MTU` di
+quinn-proto (`src/lib.rs:332`), **non** i 1452 del limite superiore. Lo scarto
+è lo 0,2 %: per 460 MiB e 45 s quella connessione non ha mai alzato l'MTU.
+
+Non è una configurazione sbagliata di bore. Verificato nella versione bloccata
+(quinn-proto 0.11.15): `TransportConfig::default()` porta
+`mtu_discovery_config: Some(MtuDiscoveryConfig::default())` con `upper_bound:
+1452`, e `EndpointConfig` annuncia un `max_udp_payload_size` di **1472**
+(`1500 - 28`), quindi il limite di ricerca effettivo è
+`clamp(1452, 1200, 1472) = 1452`. `holepunch::transport_config` non tocca
+`initial_mtu`, `min_mtu` né `mtu_discovery_config`: la scoperta è **attiva**,
+con 252 byte di margine disponibile, e non li ha presi.
+
+**Questa è una domanda nuova e aperta, non una correzione.** Vale il ~17 % dei
+pacchetti del percorso diretto (1452/1200 in meno di frame per lo stesso
+payload) e non va toccata a intuito — è precisamente ciò che questa campagna non
+fa. Lo strumento per aprirla però **esiste già e non va scritto**:
+`bore test-udp` pubblica `current_mtu_bytes` da `ConnectionStats.path.current_mtu`
+(`src/udp_diagnostic.rs:2070`) e avvisa già sotto 1200. Il primo esperimento è
+leggere quel campo su una connessione diretta reale tra queste due macchine e
+vedere se la ricerca non parte, parte e fallisce, o parte e riesce su un
+percorso diverso da quello staffato qui.
+
+### 47.8.2 La conseguenza operativa, che è la parte cara
+
+I pacchetti più piccoli non costano solo pacchetti. Il contatore
+`pps_allowance_exceeded` del server, letto come **delta attorno a ogni
+braccio**:
+
+| braccio | rip. 1 | rip. 2 | rip. 3 | mediana |
+|---|---|---|---|---|
+| relay | 140 | 109 | 8 | **109** |
+| quic  | 18 936 | 13 117 | 18 714 | **18 714** |
+
+**172×**, a payload consegnato identico. L'istanza non limita i byte qui —
+limita i pacchetti, e il percorso diretto gliene offre il 27 % in più, più
+piccoli. È la stessa famiglia di meccanismo che resta l'unica ipotesi
+sopravvissuta per N-9 (§12 di `VHOST_STAGING_EVIDENCE_2026-09-10.md`: il bucket
+dell'istanza è l'unica cosa che spieghi l'asimmetria fra trasporti), e qui la si
+vede **direttamente sul contatore** invece che per esclusione.
+
+Nota di lettura, perché la fase la stampa e sarebbe facile citarla male: il
+throughput di questi bracci **non** è un confronto fra trasporti. Entrambi
+girano fino al 97 % della linea di questa workstation, quindi la linea è il
+vincolo attivo (V-9) e `MiB/s` qui non decide niente. Le colonne informative
+sono i contatori di pacchetti; ed è per questo che la fase esiste.
+
+## 52. I cancelli di P-14, e i quattro difetti di strumento che hanno provato a farli mentire
+
+La correzione di P-14 è stata scritta a metà campagna e tenuta **deliberatamente
+non compilata** finché una fase misurava (mai compilare mentre una fase misura:
+la CPU è parte dello strumento). Quando la linea si è liberata, i cancelli sono
+partiti. Sono verdi — e ci sono arrivati attraverso quattro difetti che vale la
+pena raccontare, perché tutti e quattro appartengono alla stessa famiglia:
+**uno strumento che ha risposto senza aver misurato**.
+
+### 52.1 Il red-check ancorato a un testo che un altro cancello riscrive
+
+Il primo tentativo revertiva la correzione sostituendo il testo sorgente esatto
+dei due monitor. Ha trovato **zero** occorrenze: `cargo fmt --all` gira tre
+righe più su nello stesso script e aveva appena riavvolto
+`let entry_ref =` su due righe. Il revert non ha fatto nulla, il test è girato
+**con** la correzione, è passato, e il cancello ha stampato
+`INSTRUMENT FAILURE: the test passes WITHOUT the fix` — un verdetto che mi
+avrebbe mandato a riscrivere un test **corretto**. Il revert ora è
+`git checkout HEAD -- src/server.rs`, esatto perché l'intera differenza in
+albero di quel file **è** la correzione (30 inserzioni / 10 cancellazioni,
+verificato), e dopo il checkout il numero di siti è asserito uguale a 0.
+Trappola 50.
+
+### 52.2 Il ripristino che ripristina i byte e non la compilazione
+
+Con l'ancora corretta il red-check ha funzionato — `rc=101`, e con
+l'asserzione giusta: `left: 0, right: 1`, cioè la pool è vuota, che è
+esattamente §48. Poi la correzione è stata rimessa con `cp -p` e **i tre
+cancelli successivi hanno girato il binario revertito**. `cp -p` preserva la
+mtime della copia salvata (14:11:01), più vecchia degli artefatti che il
+red-check aveva appena costruito dal sorgente revertito (14:12:46): cargo non ha
+trovato niente da ricostruire. `cargo test` è fallito sul test nuovo mentre
+`git diff` mostrava la correzione presente e corretta — **l'albero innocente, la
+build colpevole**. `cp` senza `-p` più un `touch` esplicito; e soprattutto il
+ripristino è ora esso stesso **un cancello**: rieseguo il singolo test e pretendo
+che passi prima di continuare, altrimenti il guasto si presenta tre cancelli
+dopo travestito da «la correzione è rotta», che è il suo opposto. Trappola 51.
+
+### 52.3 Un conteggio che vale zero e stampa due righe
+
+Il cancello di campo `T-PUB-POOLRECYCLE` è fallito con
+`[: 0\n0: attesa espressione intera`, una volta per iterazione. `grep -c` stampa
+`0` **ed esce 1** quando non conta niente, quindi la coda `|| echo 0` si aggiunge
+allo zero che c'è già. Il ciclo d'attesa non ha mai avuto successo, la premessa
+non si è mai armata, e l'arm ha dichiarato «did not run».
+
+La parte istruttiva non è il bug: è che **`jump_stab.sh` aveva già imparato
+questa trappola e ci aveva scritto sopra un commento**, e io l'ho reintrodotta
+in uno script nuovo lo stesso. Una trappola registrata come commento nel file
+che l'ha trovata protegge esattamente quel file. Ora è l'**ottavo compilatore**
+di `lint.sh` — e alla prima esecuzione ne ha trovata una quarta istanza in
+`provision.sh` che nessuno cercava. Red-checkato in entrambi i versi. Trappola 52.
+
+### 52.4 Un verdetto deciso dalla pulizia
+
+Corretto il conteggio, l'arm continuava a dire «did not run» — ma senza errori.
+Il blocco interno finisce con `kill -9 "$C2" "$SRV"`, e lo stato d'uscita di una
+shell è quello del suo ultimo comando: un client già morto rende quel `kill`
+non-zero. Il chiamante faceva `out=$(caso) || fail "did not run"`, quindi
+**un'esecuzione che aveva misurato tutto correttamente e stampato una riga di
+risultato perfetta veniva riportata come mai avvenuta**. Si giudica l'OUTPUT,
+non lo stato: la pulizia è best effort (`|| true`, `exit 0` esplicito) e la
+guardia vera è il controllo di premessa a valle, che è esplicito su cosa
+pretende. Trappola 53.
+
+E dietro questi quattro c'era un quinto, banale e onesto: `--admin-token` deve
+essere di almeno 32 caratteri e il mio era di 14, quindi il server non partiva
+affatto. Lo strumento però **non ha pubblicato un numero**: ha stampato
+`established=0` e ha rifiutato di leggere il risultato, che è precisamente il
+comportamento per cui il controllo di premessa esiste.
+
+### 52.5 I cancelli, e il red-check di campo
+
+Con tutto corretto:
+
+| cancello | esito |
+|---|---|
+| `cargo fmt --all` + `--check` | rc=0 |
+| il test nuovo da solo | rc=0 |
+| **red-check unitario** (correzione revertita) | **rc=101**, `left: 0 right: 1` |
+| il test nuovo di nuovo (prova che il ripristino ha ricostruito) | rc=0 |
+| clippy default / vpn / ssh-gateway | rc=0 / 0 / 0 |
+| test default / vpn / ssh-gateway | rc=0 / 0 / 0 |
+| build release `--features vpn,ssh-gateway` | rc=0 |
+| `T-PUB-POOLRECYCLE` | **PASS 3 / FAIL 0** — `early=1 pool=1 established=2` |
+
+E il cancello di **campo** è stato red-checkato a sua volta, perché un cancello
+di campo che non è mai stato visto fallire non prova niente. Ricostruito il
+binario **senza** la correzione e rieseguito:
+
+```
+early=1 pool=0 established=2
+PASS: both tunnels established a direct carrier (established=2)
+PASS: the second tunnel had its carrier before the old one closed
+FAIL: pool=0 -- the previous tunnel's close monitor evicted the current
+      tunnel's live carrier (P-14)
+```
+
+Si legga **quali** righe passano: la premessa regge (due registrazioni vere, un
+carrier ciascuna, il secondo tunnel aveva il suo carrier **prima** che il
+vecchio chiudesse) e cade solo la misura. È la forma che serve: un cancello che
+fallisse sulla premessa proverebbe soltanto che si è rotto.
+
+### 52.6 Il test che falliva solo sui runner Apple, e non era una fluttuazione
+
+Seguendo la CI ho trovato due esecuzioni fallite sul ramo, ed erano **lo stesso
+test**: `mux::tests::a_connection_closes_when_its_last_substream_is_dropped`,
+stesso job (`aarch64-apple-darwin`), stessa riga (`src/mux.rs:596`), su commit
+che non toccano **una riga di Rust** — più un'occorrenza precedente su
+`macos-14`. Tre volte, un test solo, sempre su bersagli Apple. Avevo archiviato
+le prime due come «due fluttuazioni indipendenti»: erano **un difetto solo**, e
+l'inquadramento era sbagliato.
+
+Il meccanismo è nel test, non nel prodotto. Il client scrive `ping`, poi lascia
+cadere opener, acceptor e substream: il conteggio di M-1 va a zero
+**immediatamente**, il driver ritorna `Step::Done` e chiude — che è il
+comportamento sotto test. Se il peer abbia fatto in tempo a far emergere il
+substream in entrata prima che la chiusura arrivi è pura schedulazione: Linux
+vince la corsa, i runner Apple ogni tanto la perdono e `acceptor.accept()`
+risponde `None`. Corretto ordinando l'**osservazione** — il peer segnala via
+`oneshot` di aver accettato e letto, e solo allora il client lascia cadere —
+mai ritardando la chiusura, che sarebbe l'unica modifica capace di far smettere
+al test di testare. Il red-check resta quello di prima: senza il conteggio di
+M-1 il secondo `accept()` non ritorna mai `None` e il test scade.

@@ -199,12 +199,12 @@ domanda che una fase esistente non poteva chiudere):
 | `pub_origin_cpu` | escludere la CPU su origine, VM e client | 348 s |
 | `pub_ws_conns_procs` | l'ultima variabile lato client: 1 processo × n contro n × 1 | 1944 s |
 | `ws_conns_var` | perché la stessa cella si ripete al 6 % fino a n=2 e al 19–48 % da n=4 | 3387 s |
-| `udp_pktsize` | quanti PACCHETTI spende ogni trasporto per byte consegnato | 519 s |
-| `ws_first_conn` con il **ritardo** come asse | il costo della prima connessione è funzione del tempo dalla registrazione o del numero d'ordine? | in corso |
+| `udp_pktsize` | quanti PACCHETTI spende ogni trasporto per byte consegnato | 519 s + **546 s** di riesecuzione col mittente staffato (§47.8) |
+| `ws_first_conn` con il **ritardo** come asse | il costo della prima connessione è funzione del tempo dalla registrazione o del numero d'ordine? | 3833 s — e ha misurato P-14 invece della domanda (§49) |
 | `udp_pool_recycle` | il pool diretto muore per un timeout o perché su quella porta è appena morto un tunnel? | 234 s, **zero byte** |
 | `udp_pool_life` | il pool inattivo muore o non è mai salito | **scritta, NON eseguita** — dichiarata, non sparita: §48 risponde già alla sua domanda (il pool non muore di inattività, lo sfratta il monitor del tunnel precedente) e `udp_pool_recycle` ha misurato il braccio FRESH che tiene il carrier per tutti i 45 s, due volte su due. I suoi 40 minuti sono stati spesi a **verificare la correzione** invece che a riosservare il difetto. Resta nell'albero, pronta |
-| `vpn_carriers` in profondità | i carrier del relay recuperano a 4 e 8 flussi? | 1655 s / 2055 s |
-| `jump_stab` ripetuto | la stabilità del jump host è riproducibile | 340/342/343 s |
+| `vpn_carriers` in profondità | i carrier del relay recuperano a 4 e 8 flussi? | 1655 s / 2055 s + **2424 s** (12 rip./cella, §51.1) — risposta: **no** |
+| `jump_stab` ripetuto | la stabilità del jump host è riproducibile | 340/342/343 s + **476 s** con la fase `recovered` (§51.2) — 16/0/0 due volte su due |
 | `udp_pool_recycle_fix` | la correzione P-14 tiene sul percorso reale, contro un server vero? | dopo i cancelli, **zero byte** |
 
 Queste tredici non sono «extra». Nove nascono da una domanda che una fase

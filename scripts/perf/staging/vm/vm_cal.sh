@@ -13,7 +13,7 @@ SRV=$SRV; GW=$GW
 adm(){ curl -fsS -m 10 -H "Authorization: Bearer $ADMIN_TOKEN" "$ADMIN_URL/$1"; }
 
 echo "=== client (measurement VM) ==="
-echo "  $(. /etc/os-release; echo "$PRETTY_NAME")  $(uname -m)  vcpu=$(nproc)  mem=$(free -m | awk '/Mem:/{print $2" MiB"}')"
+echo "  $(. /etc/os-release; echo "${PRETTY_NAME:-unknown}")  $(uname -m)  vcpu=$(nproc)  mem=$(free -m | awk '/Mem:/{print $2" MiB"}')"
 echo "  client build: $($BORE --version)"
 echo "  baseline build kept for interop: $($H/bore.f15a3de --version)"
 echo "  iface toward server: $(ip route get $SRV | awk '{print $5;exit}')"

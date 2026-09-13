@@ -501,6 +501,10 @@ pub async fn run_peer_test(
     let start = wait_for_start(&mut control).await?;
     let peer_profile = adaptive_nat::NatProfile::from_summary(&start.peer_summary);
     let local_plan = adaptive_nat::plan_for_pair(&local_profile, &peer_profile);
+    // Recorded BEFORE the plan is consumed, because it is a different fact: it
+    // says the plan came from the SERVER, which is what makes the two spray
+    // roles complementary. A locally derived plan carries no spray role at all.
+    let server_brokered = start.adaptive_plan.is_some();
     let adaptive_plan = start.adaptive_plan.unwrap_or_else(|| local_plan.to_wire());
     trace!(
         ?local_profile,
@@ -520,12 +524,24 @@ pub async fn run_peer_test(
         start.options,
         &adaptive_plan,
     );
-    // Honest-output note (plan Fase 0): the adaptive candidate ORDER is
-    // advisory in this build — the direct attempt still dials all candidates
-    // concurrently under one budget. Only mode/retry/timeouts take effect.
-    println!(
-        "Candidate order    : advisory only (direct attempts dial all candidates concurrently)"
-    );
+    // Honest-output note. Until V-2 the candidate ORDER was advisory here and
+    // nowhere else — the diagnostic dialled every candidate concurrently while
+    // the real tunnel paths ran the authenticated round in planned kind
+    // groups. It now runs the same round the tunnel does, but ONLY when the
+    // peer can answer one, so the line has to say which of the two happened
+    // rather than describe a fixed behaviour.
+    if start.peer_summary.checks {
+        println!(
+            "Candidate order    : enforced (authenticated check round, planned kind groups \
+             — the same path a real tunnel takes)"
+        );
+    } else {
+        println!(
+            "Candidate order    : advisory only (peer predates the authenticated check \
+             round; this run uses the legacy blind punch and a real tunnel to this peer \
+             would too)"
+        );
+    }
     println!(
         "Traversal round    : generation {} (server retry re-candidating: {})",
         start.generation,
@@ -553,6 +569,10 @@ pub async fn run_peer_test(
         socket,
         start.role,
         ordered_peer_candidates,
+        &start.peer_candidates,
+        &start.peer_summary,
+        start.generation,
+        server_brokered,
         token,
         start.tuning,
         start.options,
@@ -797,6 +817,16 @@ async fn run_udp_path(
     socket: tokio::net::UdpSocket,
     role: UdpTestRole,
     peer_candidates: Vec<SocketAddr>,
+    // The candidates in the order the PEER offered them, which is the order
+    // `peer_summary.candidate_kinds` labels. `peer_candidates` above is the
+    // plan-ORDERED list, and zipping that one against the kinds would attach
+    // every label to the wrong address.
+    peer_candidates_as_offered: &[SocketAddr],
+    peer_summary: &UdpTestPeerSummary,
+    generation: u32,
+    // Whether `adaptive_plan` came from the SERVER. Only a server-brokered
+    // plan may carry a sprayed-escape role (see `check_config_for`).
+    server_brokered: bool,
     token: [u8; holepunch::TOKEN_LEN],
     tuning: UdpDirectTuning,
     options: UdpTestOptions,
@@ -817,6 +847,15 @@ async fn run_udp_path(
     let mut token = token;
     let mut peers = peer_candidates;
     let mut read_timeout_ms = adaptive_plan.read_timeout_ms;
+    // Everything the authenticated round needs is per-ROUND, not per-run: a
+    // retry re-offers, so the server brokers a fresh generation with fresh
+    // candidates and a fresh plan, and a round configured from the previous
+    // one's metadata would be rejected by the peer for the generation alone.
+    let mut typed = typed_peer_candidates(peer_candidates_as_offered, peer_summary);
+    let mut generation = generation;
+    let mut plan = adaptive_plan.clone();
+    let mut summary_checks = peer_summary.checks;
+    let mut brokered = server_brokered;
     for attempt in 0..attempts {
         if attempt > 0 {
             if !retry.recandidate {
@@ -853,6 +892,14 @@ async fn run_udp_path(
                         &fresh.adaptive_plan,
                     );
                     read_timeout_ms = fresh.adaptive_plan.read_timeout_ms;
+                    typed = typed_peer_candidates(&fresh.peer_candidates, &fresh.peer_summary);
+                    generation = fresh.generation;
+                    summary_checks = fresh.peer_summary.checks;
+                    plan = fresh.adaptive_plan.clone();
+                    // A retry round only exists because the SERVER re-brokered
+                    // it (`regather_and_rejoin` fails without a plan), so from
+                    // here on the plan is always the broker's.
+                    brokered = true;
                     println!(
                         "UDP direct path    : retry round generation {} ({} fresh peer candidates)",
                         fresh.generation,
@@ -867,6 +914,24 @@ async fn run_udp_path(
             },
         };
 
+        let mut round_summary = peer_summary.clone();
+        round_summary.checks = summary_checks;
+        let check = check_config_for(
+            role,
+            generation,
+            &token,
+            &peers,
+            &typed,
+            &round_summary,
+            &plan,
+            brokered,
+        );
+        if check.is_none() {
+            println!(
+                "UDP direct path    : peer does not run the authenticated check round; \
+                 using the legacy blind punch (this is NOT what a current tunnel does)"
+            );
+        }
         let conn = match establish_direct(
             attempt_socket,
             role,
@@ -874,6 +939,7 @@ async fn run_udp_path(
             token,
             tuning,
             read_timeout_ms,
+            check.as_ref(),
         )
         .await
         {
@@ -908,6 +974,10 @@ async fn run_udp_path(
     _socket: tokio::net::UdpSocket,
     _role: UdpTestRole,
     _peer_candidates: Vec<SocketAddr>,
+    _peer_candidates_as_offered: &[SocketAddr],
+    _peer_summary: &UdpTestPeerSummary,
+    _generation: u32,
+    _server_brokered: bool,
     _token: [u8; holepunch::TOKEN_LEN],
     _tuning: UdpDirectTuning,
     _options: UdpTestOptions,
@@ -921,7 +991,105 @@ async fn run_udp_path(
     None
 }
 
+/// Zip a peer's candidate addresses with the kinds it reported for them.
+///
+/// A length mismatch yields an EMPTY list, which is exactly what
+/// [`holepunch::plan_check_groups`] reads as "legacy peer, one flat group". A
+/// kind list that does not line up with the addresses would mislabel every
+/// candidate, and a confidently mislabelled plan is worse than no plan: it
+/// would order the round by fiction and then report the resulting failure as a
+/// property of the network.
 #[cfg(feature = "udp")]
+fn typed_peer_candidates(
+    addrs: &[SocketAddr],
+    summary: &UdpTestPeerSummary,
+) -> Vec<crate::shared::UdpTypedCandidate> {
+    if addrs.is_empty() || addrs.len() != summary.candidate_kinds.len() {
+        return Vec::new();
+    }
+    addrs
+        .iter()
+        .zip(summary.candidate_kinds.iter())
+        .map(|(addr, kind)| crate::shared::UdpTypedCandidate {
+            addr: *addr,
+            kind: *kind,
+            priority: 0,
+        })
+        .collect()
+}
+
+/// Configuration for the authenticated check round, or `None` when this pair
+/// must stay on the legacy blind punch.
+///
+/// WHY THIS EXISTS AT ALL (V-2). `bore test-udp` is the tool an operator
+/// reaches for when the real tunnel will not go direct, so a diagnostic that
+/// traverses differently from the tunnel answers a question nobody asked. Until
+/// this function, it did: the real secret and VPN 1:1 paths gate on
+/// `UdpPunchV2`'s check generation and run the authenticated round, while the
+/// diagnostic went straight to `DirectListener::new`/`connect_direct` — the
+/// blind punch, with no check round, no plan ordering, no peer-reflexive
+/// learning and no sprayed escape. On the cells where the round is what makes
+/// the pair work, the diagnostic would report RELAY for a pair the product
+/// connects directly; on the cells where the blind punch happens to work it
+/// would report DIRECT without exercising any of the machinery the tunnel
+/// actually uses. Both directions of that error are bad, and the second is
+/// worse, because it is silent.
+///
+/// The gate is the PEER's `checks` capability, never this build's own: a round
+/// is only useful if the other end answers it, and an unanswered round is
+/// indistinguishable from a network that ate the frames — the exact false
+/// negative this tool exists not to produce.
+// Eight inputs, and they are eight because the round's configuration is
+// assembled from four independent sources: this side's role, the wire
+// generation, the token, and the peer's own summary and plan. Bundling them
+// into a struct would only move the same list one line up.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "udp")]
+fn check_config_for(
+    role: UdpTestRole,
+    generation: u32,
+    token: &[u8; holepunch::TOKEN_LEN],
+    ordered_peers: &[SocketAddr],
+    typed: &[crate::shared::UdpTypedCandidate],
+    peer_summary: &UdpTestPeerSummary,
+    plan: &UdpAdaptivePlan,
+    server_brokered: bool,
+) -> Option<holepunch::CheckConfig> {
+    if !peer_summary.checks {
+        return None;
+    }
+    Some(holepunch::CheckConfig {
+        key: holepunch::derive_check_key(token),
+        generation,
+        role: match role {
+            UdpTestRole::Listener => holepunch::CheckRole::Listener,
+            UdpTestRole::Dialer => holepunch::CheckRole::Dialer,
+        },
+        window: holepunch::plan_check_window(plan),
+        plan: (!typed.is_empty()).then(|| holepunch::CheckPlan {
+            groups: holepunch::plan_check_groups(
+                typed,
+                ordered_peers,
+                Some(plan.candidate_order.as_slice()),
+            ),
+            retry_budget: plan.retry_budget,
+            initial_delay: Duration::from_millis(plan.send_delay_ms),
+        }),
+        // The sprayed escape's two halves must be COMPLEMENTARY, and the only
+        // party that can make them so is the one holding both NAT profiles:
+        // the broker. When the server sent no plan each side computes
+        // `plan_for_pair` from its own point of view, and two independently
+        // computed roles are not guaranteed to be opposite — two "easy" sides
+        // spray at each other and neither opens a filter. A locally derived
+        // plan therefore carries NO spray role, which is the legacy round.
+        spray: server_brokered
+            .then(|| holepunch::spray::role_from_wire(plan.spray_role.as_deref()))
+            .flatten(),
+    })
+}
+
+#[cfg(feature = "udp")]
+#[allow(clippy::too_many_arguments)]
 async fn establish_direct(
     socket: tokio::net::UdpSocket,
     role: UdpTestRole,
@@ -929,9 +1097,47 @@ async fn establish_direct(
     token: [u8; holepunch::TOKEN_LEN],
     tuning: UdpDirectTuning,
     read_timeout_ms: u64,
+    check: Option<&holepunch::CheckConfig>,
 ) -> Result<holepunch::DirectConn> {
-    match role {
-        UdpTestRole::Listener => {
+    match (role, check) {
+        // The authenticated round, the same orchestration the secret and VPN
+        // 1:1 paths run — same entry points, not a reimplementation of them.
+        (UdpTestRole::Listener, Some(cfg)) => {
+            let (listener, outcome) =
+                holepunch::listener_checks_then_quic(socket, &peer_candidates, cfg, tuning)
+                    .await
+                    .context("diagnostic listener check round")?;
+            report_check_round(&outcome);
+            Ok(timeout(
+                Duration::from_millis(read_timeout_ms.max(1)),
+                listener.accept(token),
+            )
+            .await
+            .context("timed out waiting for direct QUIC peer")??)
+        }
+        (UdpTestRole::Dialer, Some(cfg)) => {
+            // `cache_key` is None ON PURPOSE. The winning-pair cache makes the
+            // SECOND connection between a pair fast by recalling the address
+            // that worked; a diagnostic that used it would report the speed and
+            // the success of a pair it did not actually have to find, which is
+            // the one number an operator running this tool must not be given.
+            // Every `bore test-udp` run measures a cold pair.
+            let (conn, outcome) = holepunch::dialer_checks_then_quic(
+                socket,
+                peer_candidates,
+                cfg,
+                token,
+                tuning,
+                None,
+            )
+            .await
+            .context("diagnostic dialer check round")?;
+            report_check_round(&outcome);
+            Ok(conn)
+        }
+        // Legacy peer (or a peer that cannot answer a round): byte-identical
+        // to the path this tool has always taken.
+        (UdpTestRole::Listener, None) => {
             let listener = holepunch::DirectListener::new(socket, peer_candidates, tuning)
                 .await
                 .context("start diagnostic QUIC listener")?;
@@ -942,9 +1148,32 @@ async fn establish_direct(
             .await
             .context("timed out waiting for direct QUIC peer")??)
         }
-        UdpTestRole::Dialer => {
+        (UdpTestRole::Dialer, None) => {
             holepunch::connect_direct(socket, peer_candidates, token, tuning).await
         }
+    }
+}
+
+/// Print what the round actually did. A dry round that still reaches direct
+/// through the fallback is a materially different result from a round that
+/// nominated a pair, and only this line separates them.
+#[cfg(feature = "udp")]
+fn report_check_round(outcome: &holepunch::CheckOutcome) {
+    match outcome.nominated {
+        Some(addr) => println!(
+            "UDP direct path    : authenticated check round nominated {addr} in {} ms{}",
+            outcome.checks_ms,
+            if outcome.learned_prflx {
+                " (peer-reflexive address learned)"
+            } else {
+                ""
+            }
+        ),
+        None => println!(
+            "UDP direct path    : authenticated check round came back DRY after {} ms \
+             (falling through to dialing every candidate)",
+            outcome.checks_ms
+        ),
     }
 }
 
@@ -1397,6 +1626,10 @@ async fn inspect_local_nat(
         candidate_count: 0,
         port_preserved,
         filtering: Some(filtering.as_str().to_string()),
+        // Asserted from the feature gate, not from the version: a binary built
+        // without `udp` has no check round to run, and telling the peer
+        // otherwise would strand it waiting for frames that can never arrive.
+        checks: cfg!(feature = "udp"),
     };
 
     LocalNatReport {
@@ -2701,6 +2934,8 @@ mod tests {
             candidate_count: count,
             port_preserved: Some(true),
             filtering: None,
+            // Legacy shape on purpose: the capability defaults OFF.
+            checks: false,
         }
     }
 
@@ -2783,6 +3018,8 @@ mod tests {
             candidate_count: 3,
             port_preserved: Some(true),
             filtering: None,
+            // Legacy shape on purpose: the capability defaults OFF.
+            checks: false,
         };
         let candidates = vec![
             "127.0.0.1:50000".parse().unwrap(),
@@ -2814,6 +3051,151 @@ mod tests {
                 "127.0.0.1:50000".parse().unwrap(),
             ]
         );
+    }
+
+    /// V-2 gate 1: the round is GATED on the peer's declared capability, and
+    /// the capability is read off the PEER's summary rather than off a version
+    /// number. A peer that cannot answer the frames is indistinguishable from
+    /// a network that ate them, which is exactly the false negative this
+    /// diagnostic exists not to produce — so a legacy peer keeps both sides on
+    /// the byte-identical blind path.
+    #[cfg(feature = "udp")]
+    #[test]
+    fn check_config_is_none_for_a_peer_that_cannot_answer_the_round() {
+        let mut peer = round_summary("cone", 1);
+        let plan = v2_plan(None);
+        let token = [7u8; holepunch::TOKEN_LEN];
+        let peers: Vec<SocketAddr> = vec!["198.51.100.7:40000".parse().unwrap()];
+
+        peer.checks = false;
+        assert!(
+            check_config_for(
+                UdpTestRole::Dialer,
+                3,
+                &token,
+                &peers,
+                &[],
+                &peer,
+                &plan,
+                true
+            )
+            .is_none(),
+            "a peer without the capability must stay on the legacy blind punch"
+        );
+
+        peer.checks = true;
+        let cfg = check_config_for(
+            UdpTestRole::Dialer,
+            3,
+            &token,
+            &peers,
+            &[],
+            &peer,
+            &plan,
+            true,
+        )
+        .expect("a capable peer runs the round");
+        assert_eq!(
+            cfg.generation, 3,
+            "the round must carry the wire generation"
+        );
+        assert!(matches!(cfg.role, holepunch::CheckRole::Dialer));
+        assert!(
+            cfg.plan.is_none(),
+            "no typed candidates means no planned groups, not an empty group list"
+        );
+    }
+
+    /// V-2 gate 2: the spray role rides the plan, and only a SERVER-brokered
+    /// plan carries one. The two halves of the escape must be complementary
+    /// and only the broker sees both profiles; two locally derived plans can
+    /// independently choose the same role, which sprays at each other and
+    /// opens no filter.
+    #[cfg(feature = "udp")]
+    #[test]
+    fn spray_role_is_taken_only_from_a_server_brokered_plan() {
+        let mut peer = round_summary("cone", 1);
+        peer.checks = true;
+        let token = [9u8; holepunch::TOKEN_LEN];
+        let peers: Vec<SocketAddr> = vec!["198.51.100.9:40000".parse().unwrap()];
+        let plan = v2_plan(Some(crate::adaptive_nat::SPRAY_ROLE_EASY.to_string()));
+
+        let brokered = check_config_for(
+            UdpTestRole::Listener,
+            1,
+            &token,
+            &peers,
+            &[],
+            &peer,
+            &plan,
+            true,
+        )
+        .expect("capable peer");
+        assert!(
+            matches!(brokered.spray, Some(holepunch::spray::SprayRole::Easy)),
+            "a brokered plan's role must reach the round"
+        );
+
+        let local = check_config_for(
+            UdpTestRole::Listener,
+            1,
+            &token,
+            &peers,
+            &[],
+            &peer,
+            &plan,
+            false,
+        )
+        .expect("capable peer");
+        assert!(
+            local.spray.is_none(),
+            "a locally derived plan carries no spray role, whatever the string says"
+        );
+    }
+
+    /// V-2 gate 3: the typed list is built by ZIPPING two independently sent
+    /// wire fields, so a length mismatch would silently mislabel every
+    /// candidate past the first divergence — a kind is what the planner groups
+    /// on. A mismatch yields NO typed candidates (the round then runs
+    /// unplanned) rather than a plausible-looking wrong one.
+    #[cfg(feature = "udp")]
+    #[test]
+    fn typed_peer_candidates_refuses_a_length_mismatch() {
+        let mut peer = round_summary("cone", 2);
+        peer.candidate_kinds = vec![UdpCandidateKind::Reflexive];
+        let two: Vec<SocketAddr> = vec![
+            "198.51.100.1:40000".parse().unwrap(),
+            "198.51.100.2:40001".parse().unwrap(),
+        ];
+        assert!(
+            typed_peer_candidates(&two, &peer).is_empty(),
+            "2 addresses against 1 kind must produce nothing"
+        );
+        assert!(
+            typed_peer_candidates(&[], &peer).is_empty(),
+            "no addresses must produce nothing"
+        );
+
+        peer.candidate_kinds = vec![UdpCandidateKind::Local, UdpCandidateKind::Reflexive];
+        let typed = typed_peer_candidates(&two, &peer);
+        assert_eq!(typed.len(), 2);
+        assert_eq!(typed[0].addr, two[0]);
+        assert!(matches!(typed[1].kind, UdpCandidateKind::Reflexive));
+    }
+
+    /// Plan fixture for the V-2 gates. Deliberately minimal: these tests pin
+    /// the POLICY that reads the plan, not the planner that produces it.
+    #[cfg(feature = "udp")]
+    fn v2_plan(spray_role: Option<String>) -> UdpAdaptivePlan {
+        UdpAdaptivePlan {
+            mode: UdpAdaptiveMode::DirectFirst,
+            candidate_order: vec![UdpAdaptiveCandidateKind::Reflexive],
+            retry_budget: 1,
+            read_timeout_ms: 750,
+            send_delay_ms: 0,
+            reason_code: None,
+            spray_role,
+        }
     }
 
     #[test]

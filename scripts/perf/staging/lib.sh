@@ -40,7 +40,15 @@ WORK="${BORE_PERF_WORK:-$HOME/.cache/bore-perf}"
 OUT="${BORE_PERF_OUT:-$PWD/out}"
 mkdir -p "$WORK" "$OUT"
 
-SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i "$BORE_SSH_KEY")
+# `-o LogLevel=ERROR` is not cosmetic: without it ssh writes
+# "Warning: Permanently added '<address>' (ED25519) to the list of known hosts."
+# to STDERR, and a stage that captures stderr puts a COORDINATE into its own
+# result file. MEASURED: `secret_scan.sh --out out/eth` reported 48 hits and the
+# large majority were that one line, in `xfer_bw`, `vpn_hub`, `ws_ref` and
+# `sec_ack`. The address never came from the harness's prose or its code -- it
+# came from a tool being helpful on a channel nobody had thought about.
+# Errors still print; only the advisory is silenced.
+SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=ERROR -o ConnectTimeout=10 -i "$BORE_SSH_KEY")
 # shellcheck disable=SC2086
 vm()  { ssh "${SSH_OPTS[@]}" "$BORE_VM_USER@$BORE_VM" "$@"; }
 srv() { [ -n "$BORE_SRV" ] || return 1; ssh "${SSH_OPTS[@]}" "$BORE_SRV_USER@$BORE_SRV" "$@"; }
@@ -64,7 +72,46 @@ ena_out() {
 }
 
 # --- statistics -------------------------------------------------------------
-med()  { LC_ALL=C sort -n | awk '{v[NR]=$1} END{if(NR==0){print "n/a";exit} print (NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2}'; }
+# A MEDIAN MUST REFUSE WHAT IT CANNOT MEASURE, AND SAY SO.
+#
+# Two separate traps meet in this one helper.
+#
+# (1) `sort -n` is locale-dependent (V-11): under a comma-decimal locale
+#     {397.46, 264.01, 408} sorts to {408, 264.01, 397.46}. `LC_ALL=C` fixed
+#     that, but the sort is gone now anyway -- awk compares the values as
+#     NUMBERS, which no locale can reinterpret.
+#
+# (2) A sample that is not a number is not a slow measurement, it is the
+#     ABSENCE of one, and the harness has now been bitten by that three times:
+#     `cf()` published `0` for a Cloudflare download that fetched nothing,
+#     `vpn_hub` exited 0 having measured nothing, and `vpn_relay_attrib`
+#     printed `0.00` for endpoints no packet could reach. Every one of those
+#     was a zero that meant "the instrument failed". Individual stages grew
+#     their own `add()`/`keep()` guards one at a time; this is the chokepoint
+#     every one of them ends at, so the guard belongs here as well.
+#
+# A refused sample goes to STDERR, not stdout: the value is consumed inline by
+# `printf`/`awk` at the call sites, so a note on stdout would corrupt the very
+# table it is warning about -- while stderr is captured into the stage's `.out`
+# by the driver and so is read by whoever reads the result.
+#
+# Note what is NOT refused: a genuine measured `0`. A blackholed arm really
+# does deliver 0 Mbit/s, and that is a result. Distinguishing the two is the
+# job of the producer (`tcp_mbps` now prints FAILED when iperf3 produced no
+# usable JSON at all), not of this function.
+med()  {
+    LC_ALL=C awk '
+        /^[0-9]+(\.[0-9]+)?$/ { v[++n] = $1 + 0; next }
+        NF { bad++ }
+        END {
+            if (bad) printf "  med(): refused %d non-numeric sample(s)\n", bad > "/dev/stderr"
+            if (n == 0) { print "n/a"; exit }
+            for (i = 1; i <= n; i++)
+                for (j = i + 1; j <= n; j++)
+                    if (v[j] < v[i]) { t = v[i]; v[i] = v[j]; v[j] = t }
+            print (n % 2) ? v[(n + 1) / 2] : (v[n / 2] + v[n / 2 + 1]) / 2
+        }'
+}
 rate() { LC_ALL=C awk -v by="$1" -v s="$2" -v e="$3" 'BEGIN{printf "%7.2f MB/s (%4.0f Mbit/s)", by/1048576/(e-s), by*8/1000000/(e-s)}'; }
 mbps() { LC_ALL=C awk -v m="$1" 'BEGIN{printf "%.0f", m*8.388608}'; }
 

@@ -485,6 +485,22 @@ pub struct UdpTestPeerSummary {
     /// means "not measured", never "unrestricted".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filtering: Option<String>,
+    /// Whether this peer runs the AUTHENTICATED connectivity-check round
+    /// (Fase 2) on its direct attempt, rather than the legacy blind punch.
+    ///
+    /// This flag IS the compatibility gate, and it is read off the OTHER
+    /// peer's summary: `bore test-udp` must reproduce what the real tunnel
+    /// paths do, and the real paths gate the round on `UdpPunchV2`'s check
+    /// generation — a capability the peer asserts. The diagnostic has no
+    /// equivalent rider, so the capability travels here. `#[serde(default)]`
+    /// gives `false` for every peer built before this field existed, and
+    /// `false` keeps BOTH sides on the byte-identical blind path: a round is
+    /// only useful if the other end answers it, and a peer that cannot answer
+    /// is indistinguishable from a network that ate the frames — which is
+    /// precisely the false negative this diagnostic exists to avoid
+    /// producing.
+    #[serde(default)]
+    pub checks: bool,
 }
 
 /// Role assigned to a paired-UDP candidate address.
@@ -3343,6 +3359,8 @@ fn control_frame_summary_includes_test_udp_plan() {
             candidate_count: 1,
             port_preserved: Some(true),
             filtering: Some("apdf".to_string()),
+            // Legacy shape on purpose: the capability defaults OFF.
+            checks: false,
         },
         options: UdpTestOptions {
             bandwidth: true,

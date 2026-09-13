@@ -2930,6 +2930,196 @@ async fn transfer_receiver_ask_confirm_rejects() -> Result<()> {
     Ok(())
 }
 
+/// `--persistent`: one listener that survives a failed transfer.
+///
+/// The flag had no test anywhere. Its whole content is the two `if
+/// !options.persistent { return }` arms in `run_listener`'s loop: without it a
+/// failed transfer ENDS the listener, and the operator restarts it by hand.
+/// That is precisely what every other resume test in this file does — each one
+/// spawns a SECOND listener — so none of them can see this flag working or
+/// stop it from regressing.
+///
+/// The discriminating assertion is not "the retry succeeded": it is that the
+/// SAME listener task was still running between the two senders. A test that
+/// only checked the second transfer would pass just as happily against a
+/// listener that had died and been replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_persistent_listener_keeps_serving_after_a_failed_transfer() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    let source_root = temp_path("persistent-src");
+    let dest_root = temp_path("persistent-dst");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let source_file = source_root.join("persistent.bin");
+    let payload = patterned_bytes(2_100_777);
+    write_file(&source_file, &payload).await?;
+
+    let transfer_id = format!("persistent-{}", Uuid::new_v4());
+    let mut opts = listener_options(transfer_id.clone(), dest_root.clone(), true, 4, None);
+    opts.persistent = true;
+    let listener = tokio::spawn(bore_cli::transfer::run_listener(opts));
+    time::sleep(Duration::from_millis(200)).await;
+
+    // --- first sender: interrupted part-way through.
+    std::env::set_var("BORE_TRANSFER_TEST_MAX_CHUNKS", "2");
+    let interrupted = bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        source_file.clone(),
+        None,
+        true,
+        4,
+        4,
+        None,
+    ))
+    .await;
+    std::env::remove_var("BORE_TRANSFER_TEST_MAX_CHUNKS");
+    assert!(interrupted.is_err(), "the first run must be interrupted");
+
+    // THE assertion this test exists for: the listener did not exit with it.
+    time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !listener.is_finished(),
+        "a --persistent listener must outlive a failed transfer; without the flag          this is exactly where run_listener returns Err"
+    );
+
+    // --- second sender: the same listener serves the retry.
+    bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        source_file,
+        None,
+        true,
+        4,
+        4,
+        None,
+    ))
+    .await?;
+
+    // The bytes landed, whole — a resumed transfer that delivers a truncated or
+    // mixed file would otherwise pass every assertion above.
+    let received = read_file(&dest_root.join("persistent.bin")).await?;
+    assert_eq!(
+        received.len(),
+        payload.len(),
+        "resumed file is the wrong size"
+    );
+    assert_eq!(received, payload, "resumed file does not match the source");
+
+    // And it is STILL serving: a persistent listener does not stop on success
+    // either, which is the other half of the flag.
+    assert!(
+        !listener.is_finished(),
+        "a --persistent listener must keep serving after a SUCCESSFUL transfer too"
+    );
+    listener.abort();
+    let _ = listener.await;
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+    Ok(())
+}
+
+/// `--confirm-timeout`: the receiver who walked away from the keyboard.
+///
+/// The flag had no test of any kind — not here, not as a unit — and its whole
+/// behaviour is one branch that runs ONLY when the confirmation read outlasts
+/// the bound. Two arms, one variable (`confirm_timeout`), so the rejection is
+/// attributable to the bound and not to the delay:
+///
+///   * bound 1 s against a 6 s answer  -> REJECTED, and quickly
+///   * bound 60 s against the same 6 s -> ACCEPTED, and the bytes arrive
+///
+/// The second arm is the red-check. Without it, "the transfer failed" would
+/// pass just as well if the delay alone broke the transfer, or if
+/// `--ask-confirm` were rejecting everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_confirm_timeout_rejects_only_when_the_answer_outlasts_the_bound() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(false).await;
+
+    // A "yes" that takes six seconds to type.
+    std::env::set_var("BORE_TEST_CONFIRM_RESPONSE", "y");
+    let _cleanup_resp = EnvVarGuard("BORE_TEST_CONFIRM_RESPONSE");
+    std::env::set_var("BORE_TEST_CONFIRM_DELAY_MS", "6000");
+    let _cleanup_delay = EnvVarGuard("BORE_TEST_CONFIRM_DELAY_MS");
+
+    // ---- arm 1: the bound is shorter than the answer.
+    let source_root = temp_path("rx-confirm-timeout-src");
+    let dest_root = temp_path("rx-confirm-timeout-dst");
+    fs::create_dir_all(&source_root).await?;
+    fs::create_dir_all(&dest_root).await?;
+    let source_file = source_root.join("late.txt");
+    write_file(&source_file, b"answered too late").await?;
+
+    let transfer_id = format!("rx-confirm-timeout-{}", Uuid::new_v4());
+    let mut listener_opts = listener_options(transfer_id.clone(), dest_root.clone(), true, 1, None);
+    listener_opts.ask_confirm = true;
+    listener_opts.confirm_timeout = 1;
+
+    let listener_task = tokio::spawn(bore_cli::transfer::run_listener(listener_opts));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let started = std::time::Instant::now();
+    let sender_err = bore_cli::transfer::run_sender(sender_options(
+        transfer_id.clone(),
+        source_file.clone(),
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await
+    .expect_err("sender must fail when the receiver never answers in time");
+    let elapsed = started.elapsed();
+
+    let err_str = format!("{sender_err}");
+    assert!(
+        err_str.contains("timed out") || err_str.contains("peer reported an error"),
+        "error must mention the confirmation timeout, got: {err_str}"
+    );
+    // The bound is the point: a rejection that arrives after the full delay
+    // would mean the timeout did not fire and something else refused.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the rejection must arrive on the BOUND (1 s), not after the 6 s answer; took {elapsed:?}"
+    );
+    let _ = listener_task.await;
+    let _ = fs::remove_dir_all(&dest_root).await;
+
+    // ---- arm 2 (the red-check): same delay, a bound that accommodates it.
+    let dest_root2 = temp_path("rx-confirm-intime-dst");
+    fs::create_dir_all(&dest_root2).await?;
+    let transfer_id2 = format!("rx-confirm-intime-{}", Uuid::new_v4());
+    let mut opts2 = listener_options(transfer_id2.clone(), dest_root2.clone(), true, 1, None);
+    opts2.ask_confirm = true;
+    opts2.confirm_timeout = 60;
+
+    let listener2 = tokio::spawn(bore_cli::transfer::run_listener(opts2));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    bore_cli::transfer::run_sender(sender_options(
+        transfer_id2.clone(),
+        source_file,
+        None,
+        true,
+        1,
+        0,
+        None,
+    ))
+    .await?;
+    let outcome = listener2.await??;
+    assert_eq!(
+        read_file(&outcome.final_path).await?,
+        b"answered too late",
+        "a slow but in-time confirmation must still deliver the bytes"
+    );
+
+    let _ = fs::remove_dir_all(&source_root).await;
+    let _ = fs::remove_dir_all(&dest_root2).await;
+    Ok(())
+}
+
 /// Feature 002: when sender uses stdin, receiver --ask-confirm is silently ignored.
 /// The unit-level assertion is in transfer::tests::receiver_ask_confirm_ignored_for_stdin.
 /// This integration test verifies the listener starts up cleanly with ask_confirm=true

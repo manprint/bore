@@ -70,7 +70,7 @@ v0)
   log "   PUT  32 MiB      : $(mb "$(curl -s -o /dev/null -m 60 -X PUT -T $H/up32.bin -H 'Expect:' -w '%{speed_upload}' http://127.0.0.1:$OP/sink)") MB/s"
   log "-- TCP RTT to server:443, 20 handshakes"
   for i in $(seq 20); do curl -s -o /dev/null -w '%{time_connect}\n' --connect-timeout 5 https://${BORE_HOST}/ ; done \
-    | sort -n | awk '{a[NR]=$1} END{printf "   min=%.2f p50=%.2f p90=%.2f max=%.2f ms\n", a[1]*1000, a[int(NR*0.5)+1]*1000, a[int(NR*0.9)]*1000, a[NR]*1000}'
+    | LC_ALL=C sort -n | awk '{a[NR]=$1} END{printf "   min=%.2f p50=%.2f p90=%.2f max=%.2f ms\n", a[1]*1000, a[int(NR*0.5)+1]*1000, a[int(NR*0.9)]*1000, a[NR]*1000}'
   log "-- server-owned asset delivery (single transit, server HTTP stack)"
   for c in 1 8 32; do
     log "   /admin/ui/app.js c=$c : $(timeout 30 $OHA -z 8s -c $c --no-tui --output-format json -H "Authorization: Bearer $ADMIN_TOKEN" https://${BORE_HOST}/admin/ui/app.js 2>/dev/null \

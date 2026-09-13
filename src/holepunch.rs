@@ -418,6 +418,220 @@ const DIRECT_INITIAL_RTT_MIN: Duration = Duration::from_millis(10);
 #[cfg(feature = "udp")]
 const DIRECT_INITIAL_RTT_MAX: Duration = Duration::from_millis(333);
 
+/// Datagram send-buffer depth for the direct path, in bytes.
+///
+/// A knob, deliberately NOT a latency fix. The value it replaced (a hardcoded
+/// 8 MiB) is still the default, because the experiment that was expected to
+/// justify lowering it FALSIFIED the reason for doing so.
+///
+/// The hypothesis was reasonable and is worth recording so it is not retried:
+/// this buffer is the VPN uplink's queue rather than a mere allocation, since
+/// the 1:1 uplink sends through `send_batch_wait`, which AWAITS room instead of
+/// letting quinn drop the oldest queued datagram (BW-F3) — so backpressure to
+/// the TUN, and through it to the inner TCP senders, engages when this buffer
+/// fills and not one byte earlier. At the measured ~490 Mbit/s and 21 ms RTT
+/// the path's BDP is about 1.3 MB, so 8 MiB looked like roughly six times the
+/// in-flight window and therefore like pure standing queue.
+///
+/// MEASURED on the real path (workstation <-> same-region AWS, 2026-09-12),
+/// interleaved, 3 repetitions, upload throughput and loaded RTT sampled inside
+/// the SAME transfer (`scripts/perf/staging/vpn/vpn_sndbuf.sh`):
+///
+///   8 MiB    468 Mbit/s   RTT under load 52.3 ms
+///   2 MiB    481 Mbit/s   RTT under load 54.5 ms
+///   512 KiB  468 Mbit/s   RTT under load 54.0 ms
+///
+/// Sixteen times the depth changes neither quantity: every rung sits inside the
+/// run-to-run spread of the bare path measured alongside them (552..696
+/// Mbit/s). The buffer is not the queue the loaded RTT comes from, because on
+/// this path it never fills — quinn only buffers what the congestion window
+/// will not yet accept, and the inner TCP never outruns the window by megabytes.
+/// The loaded RTT and the gap to bare therefore have some OTHER cause, and
+/// lowering this value would have "fixed" it by coincidence at best.
+///
+/// What the knob is genuinely for is MEMORY, and hub mode is where that bites:
+/// `--max-clients N` holds one direct connection per peer, so the depth is paid
+/// N times on one host. An operator with many spokes on a small instance can
+/// lower it with no measured throughput or latency cost.
+///
+/// Only the VPN is affected either way: QUIC datagrams are used by no other
+/// subsystem here (secret, vhost, public and ssh-jump direct paths all carry
+/// their bytes on bidirectional STREAMS).
+#[cfg(feature = "udp")]
+pub const DIRECT_DATAGRAM_SEND_BUFFER: usize = 8 * 1024 * 1024;
+
+/// Floor: below roughly one BDP of a fast path the uplink would stall on its
+/// own backpressure between congestion-window releases, trading latency for
+/// throughput instead of buying it for free.
+#[cfg(feature = "udp")]
+const DIRECT_DATAGRAM_SEND_BUFFER_MIN: usize = 256 * 1024;
+
+/// Ceiling, 64 MiB.
+///
+/// This used to be the shipped default itself, on the strength of a ladder
+/// (V-3) that walked 8 MiB / 2 MiB / 512 KiB and found neither throughput nor
+/// loaded RTT moving — so "nothing above the default buys anything" and a knob
+/// that could only lower the depth looked like the safe shape.
+///
+/// That ladder was driven by an INNER TCP FLOW, and inner TCP self-paces to the
+/// congestion window: it never hands the uplink more than the window will take,
+/// so the buffer never filled and its depth could not matter. Under a FIXED
+/// UDP OFFER it does. Measured 2026-09-12 on the real path at 540 Mbit/s
+/// offered, one link held across the ladder, bare control in every repetition:
+/// 8 MiB delivers 434.8 Mbit/s and 1 MiB delivers 388.4, with every sample of
+/// the shallow arm below every sample of the deep one. The buffer is on the
+/// critical path of the thing this campaign is trying to raise.
+///
+/// A ceiling equal to the default made that question unaskable without editing
+/// this file, which is the wrong place for an experiment to live. It is now 8x
+/// the default: enough room to walk the knob upward and find where the trade
+/// turns, and still bounded, because this buffer is a QUEUE whose depth the
+/// sender experiences as delay (V-10's whole lesson) and an unbounded one would
+/// be a bufferbloat generator with an operator's name on it.
+#[cfg(feature = "udp")]
+const DIRECT_DATAGRAM_SEND_BUFFER_MAX: usize = 64 * 1024 * 1024;
+
+/// The default must lie inside its own resolver's range, or the constant would
+/// be clamped by the very function that reads it and would not be the shipped
+/// value it claims to be.
+#[cfg(feature = "udp")]
+const _: () = assert!(DIRECT_DATAGRAM_SEND_BUFFER <= DIRECT_DATAGRAM_SEND_BUFFER_MAX);
+
+/// ...and the default must sit at or above the floor, or it would be clamped by
+/// its own resolver and the constant would not be the shipped value it says it
+/// is.
+#[cfg(feature = "udp")]
+const _: () = assert!(DIRECT_DATAGRAM_SEND_BUFFER >= DIRECT_DATAGRAM_SEND_BUFFER_MIN);
+
+/// Resolve the datagram send-buffer depth from an optional operator override.
+/// Pure, so the policy is unit-testable without an endpoint; `None` yields the
+/// shipped constant exactly.
+#[cfg(feature = "udp")]
+pub fn resolve_datagram_send_buffer(bytes: Option<u64>) -> usize {
+    bytes
+        .map(|b| b as usize)
+        .unwrap_or(DIRECT_DATAGRAM_SEND_BUFFER)
+        .clamp(
+            DIRECT_DATAGRAM_SEND_BUFFER_MIN,
+            DIRECT_DATAGRAM_SEND_BUFFER_MAX,
+        )
+}
+
+/// The live datagram send-buffer depth, including the operator override.
+#[cfg(feature = "udp")]
+pub fn datagram_send_buffer() -> usize {
+    resolve_datagram_send_buffer(env_bytes("BORE_DIRECT_DGRAM_SEND_BUF"))
+}
+
+/// Floor for the direct path's UDP socket SEND buffer.
+///
+/// A send buffer is not a throughput knob, it is the amount of unacknowledged
+/// traffic the sender may hand the qdisc and the driver at once. Below roughly
+/// one BDP the sender stalls on its own `sendmsg` instead of on congestion
+/// control, so the floor exists to stop an operator turning a latency knob into
+/// a throughput cliff.
+#[cfg(feature = "udp")]
+const DIRECT_UDP_SEND_BUFFER_MIN: usize = 256 * 1024;
+
+/// Ceiling for the direct path's UDP socket SEND buffer.
+///
+/// Deliberately the pre-measurement default (16 MiB), so the knob spans the
+/// whole range that has ever shipped and an operator can restore the old
+/// behaviour exactly for comparison.
+#[cfg(feature = "udp")]
+const DIRECT_UDP_SEND_BUFFER_MAX: usize = 16 * 1024 * 1024;
+
+/// Resolve the direct path's UDP socket send buffer.
+///
+/// `configured` is whatever the tuning profile asked for (the shipped default,
+/// or an operator's `--udp-socket-send-buffer`); the override wins when set.
+/// Pure, so the policy is unit-testable without a socket.
+#[cfg(feature = "udp")]
+pub fn resolve_udp_socket_send_buffer(configured: usize, override_bytes: Option<u64>) -> usize {
+    override_bytes
+        .map(|b| b as usize)
+        .unwrap_or(configured)
+        .clamp(DIRECT_UDP_SEND_BUFFER_MIN, DIRECT_UDP_SEND_BUFFER_MAX)
+}
+
+/// The live UDP socket send-buffer size, including the operator override.
+#[cfg(feature = "udp")]
+pub fn udp_socket_send_buffer(configured: usize) -> usize {
+    resolve_udp_socket_send_buffer(configured, env_bytes("BORE_DIRECT_UDP_SEND_BUF"))
+}
+
+/// Which congestion controller the direct QUIC path uses.
+///
+/// Not a style preference: on a LOSSLESS bottleneck (a WiFi driver queue, a
+/// shaper that delays rather than drops) a loss-based controller has no signal
+/// to stop growing, and a model-based one is only as good as its estimate.
+/// Measured 2026-09-12 on a 375 Mbit/s path with a ~940 KiB BDP, BBR settled on
+/// a congestion window of 13-15 MiB -- roughly fifteen times the pipe -- with
+/// `lost_pct=0.00`, and the surplus was sent as bursts the radio queued. The
+/// knob exists so the controller can be priced against the alternative on a
+/// real path instead of argued about.
+#[cfg(feature = "udp")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectCongestion {
+    /// quinn's BBR. The shipped default.
+    Bbr,
+    /// CUBIC: loss-based, the QUIC/TCP default elsewhere.
+    Cubic,
+    /// NewReno: the reference controller, least aggressive.
+    NewReno,
+}
+
+/// Resolve the congestion controller from an optional operator override.
+///
+/// Unrecognised input is the DEFAULT, never a panic and never a silent third
+/// behaviour: this is read from the environment on a data path, where a typo
+/// must not change how the tunnel congestion-controls.
+#[cfg(feature = "udp")]
+pub fn resolve_direct_congestion(name: Option<&str>) -> DirectCongestion {
+    match name.map(|n| n.trim().to_ascii_lowercase()).as_deref() {
+        Some("cubic") => DirectCongestion::Cubic,
+        Some("newreno") | Some("reno") => DirectCongestion::NewReno,
+        _ => DirectCongestion::Bbr,
+    }
+}
+
+/// The live congestion controller, including the operator override.
+#[cfg(feature = "udp")]
+pub fn direct_congestion() -> DirectCongestion {
+    resolve_direct_congestion(std::env::var("BORE_DIRECT_QUIC_CC").ok().as_deref())
+}
+
+/// Whether the direct path may use UDP generic segmentation offload.
+///
+/// GSO is what lets one `sendmsg` carry many packets, and it is why this path
+/// costs so little CPU. It also means the sender hands the driver a burst
+/// rather than a paced stream, which on a wireless link is queued as a unit.
+/// Default is quinn's own (enabled); `BORE_DIRECT_QUIC_GSO=0` turns it off so
+/// the burst hypothesis can be tested against the CPU it saves.
+#[cfg(feature = "udp")]
+pub fn resolve_direct_gso(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+/// The live GSO setting, including the operator override.
+#[cfg(feature = "udp")]
+pub fn direct_gso() -> bool {
+    resolve_direct_gso(std::env::var("BORE_DIRECT_QUIC_GSO").ok().as_deref())
+}
+
+/// Read a positive byte count from the environment. Mirrors [`env_ms`]: a zero
+/// or unparseable value is "unset", never a silently applied zero.
+fn env_bytes(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .filter(|b| *b > 0)
+}
+
 /// Resolve the direct-path initial RTT from an optional operator override.
 /// Pure, so the policy is unit-testable without an endpoint; `None` yields the
 /// shipped constant exactly.
@@ -1736,18 +1950,23 @@ fn configure_udp_socket_buffers<S: std::os::windows::io::AsSocket>(
     socket: &S,
     tuning: &UdpDirectTuning,
 ) {
+    // The override is applied HERE, inside the one funnel every direct-path
+    // socket passes through, for the same reason P-13 moved the call itself
+    // here: a knob honoured at some call sites and not others is worse than no
+    // knob, because the exception is invisible.
+    let send_buf = udp_socket_send_buffer(tuning.udp_socket_send_buffer);
     let socket = socket2::SockRef::from(socket);
     if let Err(err) = socket.set_recv_buffer_size(tuning.udp_socket_recv_buffer) {
         debug!(%err, requested = tuning.udp_socket_recv_buffer, "failed to raise UDP receive buffer");
     }
-    if let Err(err) = socket.set_send_buffer_size(tuning.udp_socket_send_buffer) {
-        debug!(%err, requested = tuning.udp_socket_send_buffer, "failed to raise UDP send buffer");
+    if let Err(err) = socket.set_send_buffer_size(send_buf) {
+        debug!(%err, requested = send_buf, "failed to raise UDP send buffer");
     }
 
     debug!(
         requested_recv = tuning.udp_socket_recv_buffer,
         actual_recv = ?socket.recv_buffer_size().ok(),
-        requested_send = tuning.udp_socket_send_buffer,
+        requested_send = send_buf,
         actual_send = ?socket.send_buffer_size().ok(),
         "configured UDP socket buffers"
     );
@@ -1755,6 +1974,11 @@ fn configure_udp_socket_buffers<S: std::os::windows::io::AsSocket>(
 
 #[cfg(all(feature = "udp", target_os = "linux"))]
 fn configure_udp_socket_buffers<S: std::os::fd::AsFd>(socket: &S, tuning: &UdpDirectTuning) {
+    // The override is applied HERE, inside the one funnel every direct-path
+    // socket passes through, for the same reason P-13 moved the call itself
+    // here: a knob honoured at some call sites and not others is worse than no
+    // knob, because the exception is invisible.
+    let send_buf = udp_socket_send_buffer(tuning.udp_socket_send_buffer);
     // CRITICAL for direct-path throughput: the kernel silently clamps
     // SO_SNDBUF/SO_RCVBUF to net.core.{w,r}mem_max (Ubuntu/Debian default
     // 212992 = 208 KiB). A single congestion-controlled QUIC datagram flow is
@@ -1775,9 +1999,9 @@ fn configure_udp_socket_buffers<S: std::os::fd::AsFd>(socket: &S, tuning: &UdpDi
     if !recv_forced {
         let _ = setsockopt(&fd, sockopt::RcvBuf, &tuning.udp_socket_recv_buffer);
     }
-    let send_forced = setsockopt(&fd, sockopt::SndBufForce, &tuning.udp_socket_send_buffer).is_ok();
+    let send_forced = setsockopt(&fd, sockopt::SndBufForce, &send_buf).is_ok();
     if !send_forced {
-        let _ = setsockopt(&fd, sockopt::SndBuf, &tuning.udp_socket_send_buffer);
+        let _ = setsockopt(&fd, sockopt::SndBuf, &send_buf);
     }
 
     // getsockopt(SO_{SND,RCV}BUF) returns the kernel's internal value, which is
@@ -1788,13 +2012,13 @@ fn configure_udp_socket_buffers<S: std::os::fd::AsFd>(socket: &S, tuning: &UdpDi
     // A clamp leaves the effective buffer well under the request; the kernel
     // doubling means "healthy" is actual >= requested, so flag actual < requested.
     let recv_clamped = actual_recv < tuning.udp_socket_recv_buffer;
-    let send_clamped = actual_send < tuning.udp_socket_send_buffer;
+    let send_clamped = actual_send < send_buf;
 
     if recv_clamped || send_clamped {
         tracing::warn!(
             requested_recv = tuning.udp_socket_recv_buffer,
             effective_recv = actual_recv,
-            requested_send = tuning.udp_socket_send_buffer,
+            requested_send = send_buf,
             effective_send = actual_send,
             recv_forced,
             send_forced,
@@ -1808,7 +2032,7 @@ fn configure_udp_socket_buffers<S: std::os::fd::AsFd>(socket: &S, tuning: &UdpDi
         info!(
             requested_recv = tuning.udp_socket_recv_buffer,
             effective_recv = actual_recv,
-            requested_send = tuning.udp_socket_send_buffer,
+            requested_send = send_buf,
             effective_send = actual_send,
             forced = recv_forced && send_forced,
             "configured UDP socket buffers"
@@ -1818,18 +2042,20 @@ fn configure_udp_socket_buffers<S: std::os::fd::AsFd>(socket: &S, tuning: &UdpDi
 
 #[cfg(all(feature = "udp", unix, not(target_os = "linux")))]
 fn configure_udp_socket_buffers<S: std::os::fd::AsFd>(socket: &S, tuning: &UdpDirectTuning) {
+    // See the linux variant: the override belongs in the funnel, not the callers.
+    let send_buf = udp_socket_send_buffer(tuning.udp_socket_send_buffer);
     let socket = socket2::SockRef::from(socket);
     if let Err(err) = socket.set_recv_buffer_size(tuning.udp_socket_recv_buffer) {
         debug!(%err, requested = tuning.udp_socket_recv_buffer, "failed to raise UDP receive buffer");
     }
-    if let Err(err) = socket.set_send_buffer_size(tuning.udp_socket_send_buffer) {
-        debug!(%err, requested = tuning.udp_socket_send_buffer, "failed to raise UDP send buffer");
+    if let Err(err) = socket.set_send_buffer_size(send_buf) {
+        debug!(%err, requested = send_buf, "failed to raise UDP send buffer");
     }
 
     debug!(
         requested_recv = tuning.udp_socket_recv_buffer,
         actual_recv = ?socket.recv_buffer_size().ok(),
-        requested_send = tuning.udp_socket_send_buffer,
+        requested_send = send_buf,
         actual_send = ?socket.send_buffer_size().ok(),
         "configured UDP socket buffers"
     );
@@ -2453,6 +2679,23 @@ pub async fn check_reflexive_port(port: u16, stun_addr: SocketAddr) -> Option<bo
     match discover_reflexive(&socket, stun_addr).await {
         Ok(addr) => Some(addr.port() == port),
         Err(_) => None,
+    }
+}
+
+/// Read a [`check_reflexive_port`] probe into the "is the preferred port
+/// remapped" flag that `--nat-udp-release-timeout` re-checks on its grid.
+///
+/// The load-bearing arm is `None`. An unreachable STUN server has measured
+/// NOTHING, and the two tempting readings are both wrong in a way that costs
+/// the direct path: read as "preserved" it sends the offer back to a port the
+/// NAT is remapping, and read as "remapped" it abandons a preferred port that
+/// may well still work — permanently, since nothing else ever re-arms the
+/// flag. So an unmeasured probe carries the flag through unchanged, exactly
+/// as an unmeasured NAT filter is not a restrictive one (Fase 6).
+pub fn preferred_port_verdict(probe: Option<bool>, current: bool) -> bool {
+    match probe {
+        Some(preserved) => !preserved,
+        None => current,
     }
 }
 
@@ -3948,7 +4191,27 @@ fn transport_config(tuning: &UdpDirectTuning) -> quinn::TransportConfig {
     // TCP relay often benefits from kernel BBR. Use Quinn's BBR controller for
     // the direct QUIC path too, so high-BDP peer-to-peer transfers are not stuck
     // with the default CUBIC behavior when the network favors model-based pacing.
-    cfg.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    // Overridable because a controller is only right for the bottleneck it
+    // actually meets — see `DirectCongestion`.
+    match direct_congestion() {
+        DirectCongestion::Bbr => {
+            cfg.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
+        DirectCongestion::Cubic => {
+            cfg.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+        }
+        DirectCongestion::NewReno => {
+            cfg.congestion_controller_factory(
+                Arc::new(quinn::congestion::NewRenoConfig::default()),
+            );
+        }
+    }
+
+    // Left at quinn's own default unless an operator disables it: GSO is what
+    // makes this path cheap, so turning it off is a deliberate trade.
+    if !direct_gso() {
+        cfg.enable_segmentation_offload(false);
+    }
 
     // One native QUIC stream per proxied connection: raise the concurrent-stream
     // limit well above quinn's small default so it is not the bottleneck.
@@ -3956,8 +4219,12 @@ fn transport_config(tuning: &UdpDirectTuning) -> quinn::TransportConfig {
 
     // VPN datagram path: pre-allocate large buffers so RX/TX bursts of IP
     // packets don't stall waiting for the application loop to drain them.
+    // The RECEIVE buffer is a true buffer: it absorbs an inbound burst while
+    // the application loop is busy, and holding it costs the reader nothing in
+    // latency. The SEND buffer is a queue whose depth the sender experiences as
+    // delay, so only that one is policy. See `DIRECT_DATAGRAM_SEND_BUFFER`.
     cfg.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
-    cfg.datagram_send_buffer_size(8 * 1024 * 1024);
+    cfg.datagram_send_buffer_size(datagram_send_buffer());
 
     cfg
 }
@@ -5413,6 +5680,10 @@ mod tests {
         let socket =
             Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create socket");
         let tuning = UdpDirectTuning::default();
+        // What the funnel will actually request, override included — asking for
+        // the raw profile value here would make the gate lie the moment an
+        // operator sets BORE_DIRECT_UDP_SEND_BUF.
+        let send_buf = udp_socket_send_buffer(tuning.udp_socket_send_buffer);
         configure_udp_socket_buffers(&socket, &tuning);
 
         let actual_send = getsockopt(&socket, sockopt::SndBuf).expect("getsockopt SndBuf");
@@ -5421,22 +5692,18 @@ mod tests {
         // self-referential.
         let probe =
             Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create probe");
-        let can_force = nix::sys::socket::setsockopt(
-            &probe,
-            sockopt::SndBufForce,
-            &tuning.udp_socket_send_buffer,
-        )
-        .is_ok();
+        let can_force =
+            nix::sys::socket::setsockopt(&probe, sockopt::SndBufForce, &send_buf).is_ok();
 
         if can_force {
             // Forced: effective buffer must reach the request (kernel reports ~2×),
             // and crucially exceed the sysctl ceiling that would otherwise clamp it.
             assert!(
-                actual_send >= tuning.udp_socket_send_buffer,
+                actual_send >= send_buf,
                 "forced send buffer {actual_send} < requested {} — force ineffective",
-                tuning.udp_socket_send_buffer
+                send_buf
             );
-            if wmem_max > 0 && wmem_max < tuning.udp_socket_send_buffer {
+            if wmem_max > 0 && wmem_max < send_buf {
                 assert!(
                     actual_send > wmem_max,
                     "forced send buffer {actual_send} did not exceed wmem_max {wmem_max} \
@@ -5448,7 +5715,7 @@ mod tests {
             // kernel allows (>= ceiling), proving the fallback path ran.
             if wmem_max > 0 {
                 assert!(
-                    actual_send >= wmem_max.min(tuning.udp_socket_send_buffer),
+                    actual_send >= wmem_max.min(send_buf),
                     "fallback send buffer {actual_send} below kernel ceiling {wmem_max}"
                 );
             }
@@ -5986,7 +6253,130 @@ mod tests {
     /// S-7: an unset override yields exactly the shipped constant, and any
     /// override is clamped into a band that can still be called informed.
     #[test]
+    fn udp_socket_send_buffer_unset_is_the_configured_value() {
+        // Unset must be EXACTLY the profile's own value: this resolver sits in
+        // the funnel every direct-path socket passes through, so an override
+        // that altered the default would silently re-tune vhost, public, secret
+        // and ssh-jump as well as the VPN.
+        let shipped = crate::shared::DIRECT_UDP_SOCKET_SEND_BUFFER;
+        assert_eq!(resolve_udp_socket_send_buffer(shipped, None), shipped);
+
+        // An operator may lower it (the whole point: a deep send buffer is a
+        // standing queue, measured at ~250 ms against a 20 ms path)...
+        assert_eq!(
+            resolve_udp_socket_send_buffer(shipped, Some(1024 * 1024)),
+            1024 * 1024
+        );
+        // ...but never below one BDP, where the sender would stall on `sendmsg`
+        // instead of on congestion control.
+        assert_eq!(
+            resolve_udp_socket_send_buffer(shipped, Some(1024)),
+            DIRECT_UDP_SEND_BUFFER_MIN
+        );
+        // ...and never above the value that shipped before this knob existed,
+        // so the range cannot be used to make queueing worse than it ever was.
+        assert_eq!(
+            resolve_udp_socket_send_buffer(shipped, Some(1024 * 1024 * 1024)),
+            DIRECT_UDP_SEND_BUFFER_MAX
+        );
+    }
+
+    #[test]
     #[cfg(feature = "udp")]
+    fn datagram_send_buffer_unset_is_the_shipped_constant() {
+        assert_eq!(
+            resolve_datagram_send_buffer(None),
+            DIRECT_DATAGRAM_SEND_BUFFER
+        );
+        assert_eq!(
+            resolve_datagram_send_buffer(Some(1024)),
+            DIRECT_DATAGRAM_SEND_BUFFER_MIN,
+            "a buffer below one BDP of a fast path would stall the uplink on its own backpressure"
+        );
+        assert_eq!(
+            resolve_datagram_send_buffer(Some(1024 * 1024 * 1024)),
+            DIRECT_DATAGRAM_SEND_BUFFER_MAX,
+            "the queue an operator may ask for is bounded: its depth IS delay"
+        );
+        assert_eq!(
+            resolve_datagram_send_buffer(Some(32 * 1024 * 1024)),
+            32 * 1024 * 1024,
+            "the range must reach ABOVE the default, or the deep rungs of the \
+             V-13 ladder could not be walked without editing the source"
+        );
+        assert_eq!(resolve_datagram_send_buffer(Some(1024 * 1024)), 1024 * 1024);
+        // The two facts about the default that must hold are asserted at
+        // COMPILE time, beside the constants themselves: a unit test reports
+        // such a regression after the build, a const assertion refuses to
+        // produce it (the S-8 precedent).
+    }
+
+    /// V-12 makes the direct path's congestion controller a DECISION -- `bbr`
+    /// stays, measured against `newreno` (+3.3 %) and `cubic`, and the knob is
+    /// there for an operator who has qualified their link. A decision that no
+    /// test pins is an accident waiting to be "cleaned up".
+    ///
+    /// The second half matters as much: this value is read from the
+    /// ENVIRONMENT, on the data path. A typo must not change how the tunnel
+    /// congestion-controls, and must not panic -- so every unrecognised input
+    /// resolves to the shipped default, which is what makes the knob safe to
+    /// document.
+    #[cfg(feature = "udp")]
+    #[test]
+    fn direct_congestion_unset_or_mistyped_is_the_shipped_controller() {
+        assert!(matches!(
+            resolve_direct_congestion(None),
+            DirectCongestion::Bbr
+        ));
+        assert!(matches!(
+            resolve_direct_congestion(Some("cubic")),
+            DirectCongestion::Cubic
+        ));
+        assert!(matches!(
+            resolve_direct_congestion(Some("  CUBIC  ")),
+            DirectCongestion::Cubic
+        ));
+        // Both spellings of the same controller, because an operator reading
+        // the RFC and one reading the Linux sysctl write it differently.
+        assert!(matches!(
+            resolve_direct_congestion(Some("newreno")),
+            DirectCongestion::NewReno
+        ));
+        assert!(matches!(
+            resolve_direct_congestion(Some("reno")),
+            DirectCongestion::NewReno
+        ));
+        // A typo, an empty value and a controller that does not exist are all
+        // the default -- never a panic, never a silent third behaviour.
+        for junk in ["", "   ", "bbr2", "vegas", "cubik", "0"] {
+            assert!(
+                matches!(resolve_direct_congestion(Some(junk)), DirectCongestion::Bbr),
+                "{junk:?} must fall back to the shipped controller"
+            );
+        }
+    }
+
+    /// GSO is ON by default (it is why this path costs so little CPU) and the
+    /// knob exists to turn it OFF while testing the burst hypothesis. So the
+    /// asymmetry is deliberate: only an explicit, recognisable "off" disables
+    /// it, and everything else -- including a typo an operator meant as "off"
+    /// -- leaves the shipped behaviour in place.
+    #[cfg(feature = "udp")]
+    #[test]
+    fn direct_gso_is_on_unless_explicitly_turned_off() {
+        assert!(resolve_direct_gso(None), "unset is quinn's own default: on");
+        for off in ["0", "off", "false", "no", "OFF", " False "] {
+            assert!(!resolve_direct_gso(Some(off)), "{off:?} must disable GSO");
+        }
+        for on in ["1", "on", "true", "yes", "", "maybe"] {
+            assert!(
+                resolve_direct_gso(Some(on)),
+                "{on:?} must leave the shipped default alone"
+            );
+        }
+    }
+
+    #[test]
     fn direct_initial_rtt_unset_is_the_shipped_constant() {
         assert_eq!(resolve_direct_initial_rtt(None), DIRECT_INITIAL_RTT);
         assert_eq!(
@@ -6955,6 +7345,36 @@ mod tests {
         assert!(err.to_string().contains("server-direct key exceeds"));
     }
 
+    /// `--nat-udp-release-timeout`'s decision table. The two measured arms
+    /// are obvious; the third is the one that matters, and it is the one a
+    /// reasonable implementation gets wrong.
+    ///
+    /// RED-CHECK: `None => false` (read an unreachable STUN as "preserved")
+    /// fails the fourth case — and in production it keeps offering a port the
+    /// NAT is remapping, which reads as a dead direct path. `None => true`
+    /// fails the third, and strands a working preferred port forever, since
+    /// only a successful probe ever clears the flag again.
+    #[test]
+    fn an_unreachable_stun_probe_moves_the_preferred_port_flag_nowhere() {
+        // Measured: the flag is the probe, whatever it was before.
+        assert!(
+            !preferred_port_verdict(Some(true), true),
+            "preserved clears"
+        );
+        assert!(!preferred_port_verdict(Some(true), false), "stays cleared");
+        assert!(preferred_port_verdict(Some(false), false), "remapped sets");
+        assert!(preferred_port_verdict(Some(false), true), "stays set");
+        // Unmeasured: carried through, both ways.
+        assert!(
+            !preferred_port_verdict(None, false),
+            "an unreachable probe must not invent a remap"
+        );
+        assert!(
+            preferred_port_verdict(None, true),
+            "an unreachable probe must not clear a known remap"
+        );
+    }
+
     #[test]
     fn cgnat_range_is_detected() {
         assert!(is_cgnat("100.64.0.1".parse().unwrap()));
@@ -7433,6 +7853,50 @@ mod tests {
     // ---------------------------------------------------------------------
     // Fase 7 — the sprayed escape (birthday-paradox rendezvous).
     // ---------------------------------------------------------------------
+
+    /// `SprayTuning::enabled()` IS the escape's off switch, and three netns
+    /// cells depend on it being exactly that.
+    ///
+    /// `T-NAT-SPRAY-OFF` measures the ORDINARY check round on a cell the
+    /// escape would otherwise flip, and it does so by setting
+    /// `BORE_UDP_SPRAY_CAP_MS=0`. If this predicate ever stopped reading a
+    /// zero cap as "off", that cell would quietly run the escape, go DIRECT,
+    /// and the three-cell experiment -- whose whole design is one variable --
+    /// would collapse into three copies of the same arm without failing.
+    /// Nothing else in the tree pins it.
+    ///
+    /// Each of the three zeroes is asserted ALONE, because an `&&` chain that
+    /// lost one term still passes any test that zeroes all three at once.
+    #[test]
+    fn the_sprayed_escape_is_off_when_any_of_its_three_budgets_is_zero() {
+        let d = spray::SprayTuning::default();
+        assert!(d.enabled(), "the shipped sizing must be able to win");
+
+        assert!(
+            !spray::SprayTuning {
+                cap: Duration::ZERO,
+                ..spray::SprayTuning::default()
+            }
+            .enabled(),
+            "a zero time budget is the off switch the netns matrix uses"
+        );
+        assert!(
+            !spray::SprayTuning {
+                ports_per_pass: 0,
+                ..spray::SprayTuning::default()
+            }
+            .enabled(),
+            "spraying zero ports cannot collide with anything"
+        );
+        assert!(
+            !spray::SprayTuning {
+                sockets: 0,
+                ..spray::SprayTuning::default()
+            }
+            .enabled(),
+            "zero auxiliary sockets buy no tickets in the draw"
+        );
+    }
 
     /// The numbers the SOTA comparison quotes are the numbers the code uses.
     ///

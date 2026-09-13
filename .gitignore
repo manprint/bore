@@ -19,3 +19,12 @@ skills-lock.json
 # drops megabytes of raw samplers here. The evidence that matters is reduced
 # into docs/performance/; the raw streams are reproducible, not source.
 /out
+
+# Campaign credentials. The real file belongs OUTSIDE the repository
+# (`~/.config/bore-perf/env.sh`, mode 600) and `env.sh.example` is the committed
+# template with every credential field blank. This rule is belt-and-braces: the
+# README tells you to copy the template to ~/.config, but a copy made in place
+# would otherwise be a plain-text credential file that `git add -A` picks up.
+# `env.sh.example` is negated below so the template stays tracked.
+scripts/perf/staging/env.sh
+!scripts/perf/staging/env.sh.example

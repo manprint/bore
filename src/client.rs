@@ -2177,34 +2177,29 @@ async fn resolve_stun_and_check(
     let Some(addr) = addrs.find(|a| a.is_ipv4()) else {
         return false;
     };
-    match crate::holepunch::check_reflexive_port(preferred_port, addr).await {
-        Some(true) => {
-            *preferred_port_remapped = false;
-            info!(
-                port = preferred_port,
-                "preferred port :{preferred_port} is now PRESERVED on NAT",
-            );
-            false
-        }
-        Some(false) => {
-            *preferred_port_remapped = true;
-            info!(
-                port = preferred_port,
-                recheck_s = release_timeout.as_secs(),
-                "port :{preferred_port} REMAPPED by NAT; \
-                 switching to ephemeral, will re-check in {:?}",
-                release_timeout,
-            );
-            true
-        }
-        None => {
-            debug!(
-                port = preferred_port,
-                "STUN check for preferred port :{preferred_port} failed (unreachable)",
-            );
-            *preferred_port_remapped
-        }
+    let probe = crate::holepunch::check_reflexive_port(preferred_port, addr).await;
+    match probe {
+        Some(true) => info!(
+            port = preferred_port,
+            "preferred port :{preferred_port} is now PRESERVED on NAT",
+        ),
+        Some(false) => info!(
+            port = preferred_port,
+            recheck_s = release_timeout.as_secs(),
+            "port :{preferred_port} REMAPPED by NAT; \
+             switching to ephemeral, will re-check in {:?}",
+            release_timeout,
+        ),
+        None => debug!(
+            port = preferred_port,
+            "STUN check for preferred port :{preferred_port} failed (unreachable)",
+        ),
     }
+    // ONE decision point: the flag and the return value are the same fact, and
+    // an unreachable probe leaves both where they were.
+    *preferred_port_remapped =
+        crate::holepunch::preferred_port_verdict(probe, *preferred_port_remapped);
+    *preferred_port_remapped
 }
 
 pub(crate) async fn connect_with_timeout(to: &str, port: u16) -> Result<TcpStream> {
@@ -2266,8 +2261,58 @@ where
 mod tests {
     #[cfg(feature = "udp")]
     use super::direct_renewal_stands_down;
-    use super::{beat_once, CtrlBeat, Delimited};
+    use super::{beat_once, lease_changed, CtrlBeat, Delimited};
     use std::time::Duration;
+
+    /// `lease_changed` is the DORMANT half of a `select!` arm, and a `select!`
+    /// arm that returns when it has nothing to say is a busy loop, not a
+    /// no-op: the loop re-polls it immediately, forever, burning the core the
+    /// control connection shares. Both of its quiet cases must therefore
+    /// PEND — no lease at all, and a lease whose sender has been dropped.
+    ///
+    /// RED-CHECK: replacing the `Err(_)` arm with `Default::default()` (the
+    /// obvious "there is nothing to report" answer) makes the third case
+    /// return 0.0.0.0:0 instead of timing out, which is precisely the spin.
+    #[tokio::test(start_paused = true)]
+    async fn lease_changed_pends_unless_there_is_a_real_change() {
+        // 1. No lease: the arm must never fire.
+        let mut none: Option<tokio::sync::watch::Receiver<std::net::SocketAddr>> = None;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3600), lease_changed(&mut none))
+                .await
+                .is_err(),
+            "with no lease the arm must stay dormant"
+        );
+
+        // 2. A real reassignment is reported, once.
+        let first: std::net::SocketAddr = "203.0.113.7:41000".parse().unwrap();
+        let second: std::net::SocketAddr = "203.0.113.7:41001".parse().unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(first);
+        let mut rx = Some(rx);
+        tx.send(second).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), lease_changed(&mut rx))
+                .await
+                .expect("a published change must wake the arm"),
+            second
+        );
+        // …and not again for the same value.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3600), lease_changed(&mut rx))
+                .await
+                .is_err(),
+            "one change must not fire twice"
+        );
+
+        // 3. The lease is gone (handle dropped): still dormant, never a spin.
+        drop(tx);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3600), lease_changed(&mut rx))
+                .await
+                .is_err(),
+            "a dropped lease must pend forever, not resolve on every poll"
+        );
+    }
 
     /// A carrier coming up must NOT stand the renewal down while the direct
     /// pool is still short of its target.

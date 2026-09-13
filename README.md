@@ -450,6 +450,77 @@ requested pair would not (`max_idle >= 3 × keepalive`), and warns when it does 
 value in force can differ from the value requested, and both `direct_quic_keepalive_ms`
 and `direct_quic_idle_ms` are published on `GET /admin/api/v1/config`.
 
+**VPN TUN transmit queue (`BORE_VPN_TUN_TXQUEUELEN`, default 128).**
+A TUN device has **two** queues in series: the qdisc, and then the device's own skb
+queue — bounded by `txqueuelen` — which the application reads from. The qdisc only
+builds a backlog once the device queue is full, so a deep device queue makes the
+`fq_codel` most systems install by default completely inert (`tc -s qdisc` duly reports
+`backlog 0b 0p` while the path carries hundreds of milliseconds of traffic).
+
+The bound counts **packets**, and the VPN runs with TUN offload, so one entry is a GSO
+super-packet — measured at ~34 KB (603 MB carried in 17 827 entries). The kernel default
+of 500 is therefore up to ~17 MB of buffering, or ~360 ms at 375 Mbit/s, and bore used to
+leave it in place. Measured on a real path (workstation → AWS eu-south-1, one link held
+across the ladder so only this value changed, inner TCP upload):
+
+| `txqueuelen` | goodput | RTT under load |
+|---:|---:|---:|
+| 500 (kernel default) | 248.3 Mbit/s | 147.0 ms |
+| 256 | 272.3 Mbit/s | 110.6 ms |
+| 192 | 277.6 Mbit/s | 114.5 ms |
+| **128 (bore default)** | **265.7 Mbit/s** | **97.0 ms** |
+| 64 | 258.2 Mbit/s | 92.3 ms |
+
+The kernel default is the worst rung on *both* axes. 128 rather than 64 because the
+useful region has a cliff below it (32 → 91.5 Mbit/s, 8 → 5.6 Mbit/s), so the shipped
+value sits in the middle of the good region and not at its edge. Set
+`BORE_VPN_TUN_TXQUEUELEN=0` to leave the kernel's own value untouched; other values are
+clamped to `[16, 500]`. Linux only; applying it is best effort, so a kernel that refuses
+the write leaves a working tunnel rather than failing the link.
+
+**Direct-path UDP socket send buffer (`BORE_DIRECT_UDP_SEND_BUF`, default 16 MiB).**
+The *receive* buffer is a true buffer and must stay large — an untuned one caps a
+congestion-controlled QUIC flow at roughly `buffer / RTT` (see the UDP socket buffer note
+above). The *send* buffer is the opposite quantity: it is how much the sender may hand
+the qdisc before being told to wait, so depth is experienced as latency. Lowering it
+moved the direct carrier's own RTT from 89 ms to 35 ms but did **not** raise throughput
+on its own, because the queue re-forms one stage earlier — the dominant queue was the TUN
+device queue above. Clamped to `[256 KiB, 16 MiB]`; the receive buffer is unaffected.
+
+**Direct-path congestion controller (`BORE_DIRECT_QUIC_CC`, default `bbr`).**
+Accepts `bbr`, `cubic`, `newreno`; anything unrecognised is the default rather than a
+panic or a silent third behaviour, because this is read on a data path where a typo must
+not change how the tunnel congestion-controls. On a **lossless** bottleneck — a wireless
+driver queue, or a shaper that delays rather than drops — a loss-based controller has no
+signal to stop growing and a model-based one is only as good as its estimate: measured on
+a 375 Mbit/s path with a ~940 KiB bandwidth-delay product, BBR settled on a congestion
+window of 13–15 MiB with `lost_pct=0.00`.
+
+MEASURED 2026-09-12, 4 interleaved repetitions, workstation → AWS eu-south-1 over the
+direct path with the TUN queue already bounded (inner TCP upload, medians; bare control
+423.3 Mbit/s sampled in the same repetitions):
+
+| controller | goodput | % of bare | tunnel rtt avg | tunnel rtt **min** | cwnd |
+|---|---:|---:|---:|---:|---:|
+| `bbr` (default) | 272.0 Mbit/s | 64.3 % | 123.0 ms | 26.1 ms | 11 MB |
+| `cubic` | 278.6 Mbit/s | 65.8 % | 116.0 ms | 26.8 ms | 37 MB |
+| `newreno` | 280.9 Mbit/s | 66.4 % | 108.3 ms | 33.4 ms | 37 MB |
+
+The default stays `bbr` even though it lost every paired sample (its best repetition,
+273 Mbit/s, is below `newreno`'s worst, 281). Three reasons, in order: the gain is
+**+3.3 %**, which does not touch the deficit this campaign is chasing; `newreno` pays for
+it with a higher rtt **minimum** under load — the minimum is the standing queue, and a
+controller that holds 37 MB in flight against a ~940 KiB BDP is being flattered by a
+bottleneck that never drops; and a loss-based controller that is measured only on a
+`lost_pct=0.00` link has not been measured on the case it is worst at. On a link you have
+qualified as clean, `BORE_DIRECT_QUIC_CC=newreno` is worth the 3 %.
+
+**Direct-path segmentation offload (`BORE_DIRECT_QUIC_GSO`, default on).**
+`BORE_DIRECT_QUIC_GSO=0` disables UDP GSO. GSO is what makes this path cheap (one
+`sendmsg` carries many packets) at the cost of handing the driver a burst rather than a
+paced stream. Measured: disabling it made throughput *worse* (251.1 vs 254.2 Mbit/s), so
+it is left enabled and the knob exists to re-test the trade on a different link.
+
 **Direct-path QUIC handshake and ACK policy (experiment knobs).**
 `BORE_DIRECT_QUIC_INITIAL_RTT_MS` (default 100, clamped `[10 ms, 333 ms]`) replaces
 RFC 9002's no-information initial RTT on a direct endpoint, which is only ever built
@@ -2093,9 +2164,26 @@ socket, re-runs candidate discovery and re-offers via the server, which waits fo
 peers' fresh offers, mints a new nonce, recomputes the adaptive plan, and restarts the
 round with an incremented `generation` (shown in the report). Against an older server
 that lacks this capability, retries are skipped with an explicit note instead of blindly
-re-punching stale candidates from a dead socket. The report also states that the adaptive
-candidate *order* is advisory (direct attempts still dial all candidates concurrently
-under one budget).
+re-punching stale candidates from a dead socket.
+
+**The diagnostic traverses exactly the way a tunnel does.** Paired mode runs the
+**authenticated connectivity-check round** — HMAC frames, generation matching, planned
+kind groups, peer-reflexive learning and the sprayed escape — through the same
+`listener_checks_then_quic` / `dialer_checks_then_quic` entry points the secret and VPN
+paths use. It did not always: until this was fixed it went straight to a blind punch, so
+it could report `relay` for a pair a real tunnel connects directly, and could report
+`direct` without exercising any of the machinery a real tunnel depends on. The report
+names which round ran (`Candidate order : enforced …`) and prints the round's own result —
+the nominated address and its timing, or `DRY` when no pair was proven and the attempt
+fell through to dialing every candidate.
+
+Two deliberate limits. The round is gated on the **peer's** capability, advertised in its
+pairing summary: against a peer built before this existed, both sides use the legacy blind
+punch and the report says so, because a round the other end cannot answer is
+indistinguishable from a network that ate the frames — a false negative, which is the one
+thing a diagnostic must not manufacture. And the **winning-pair cache is deliberately not
+consulted**: every run measures a cold pair, because the speed and success of a pair that
+was recalled rather than found is not the number an operator running this tool needs.
 
 **Sprayed escape (birthday-paradox rendezvous).** One cell of the measured NAT matrix
 cannot be won by an ordinary check round: an endpoint-independent side that filters per

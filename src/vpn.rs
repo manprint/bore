@@ -2638,26 +2638,50 @@ pub mod crypto {
             })
         }
 
-        /// Seal with an explicit counter. Same output as [`seal_with_counter`].
+        /// Seal with an explicit counter. Byte-identical output to
+        /// [`seal_with_counter`] — pinned by `sealkey_matches_free_fns`.
+        ///
+        /// **ONE allocation and ONE copy of the packet** (V-14b). The obvious
+        /// spelling costs three of each, and all three are on the relay's
+        /// per-packet path: `plaintext.to_vec()` allocates exactly `len` bytes
+        /// and copies, `seal_in_place_append_tag` then appends the 16-byte tag
+        /// to a `Vec` with no spare capacity — which REALLOCATES and copies the
+        /// packet a second time — and building the framed output copies it a
+        /// third. At a 1350-byte MTU and 570 Mbit/s that is ~53 000 packets per
+        /// second, so each redundant copy is ~2 % of a core in each direction,
+        /// paid by both VPN endpoints and buying nothing.
+        ///
+        /// The fix is to lay the frame out FIRST and encrypt in place:
+        /// `seal_in_place_separate_tag` takes a plain `&mut [u8]` and hands the
+        /// tag back, and `seal_in_place_append_tag` is defined as exactly that
+        /// followed by the append — which is why the wire bytes cannot differ.
         pub fn seal_with_counter(&self, counter: u64, plaintext: &[u8]) -> Result<Vec<u8>> {
             if counter >= MAX_COUNTER {
                 bail!("AEAD counter exhausted — tear down link");
             }
             let nonce = Nonce::assume_unique_for_key(nonce_from_counter(counter));
-            let mut buf = plaintext.to_vec();
-            self.key
-                .seal_in_place_append_tag(nonce, Aad::empty(), &mut buf)
-                .map_err(|_| anyhow::anyhow!("AEAD seal"))?;
-
-            let total_len = (8 + buf.len()) as u32;
-            let mut frame = Vec::with_capacity(4 + 8 + buf.len());
+            // [u32 total_len][u64 counter][ciphertext][tag], where total_len
+            // counts everything after itself.
+            let total_len = (8 + plaintext.len() + TAG_LEN) as u32;
+            let mut frame = Vec::with_capacity(4 + 8 + plaintext.len() + TAG_LEN);
             frame.extend_from_slice(&total_len.to_be_bytes());
             frame.extend_from_slice(&counter.to_be_bytes());
-            frame.extend_from_slice(&buf);
+            frame.extend_from_slice(plaintext);
+            let tag = self
+                .key
+                .seal_in_place_separate_tag(nonce, Aad::empty(), &mut frame[12..])
+                .map_err(|_| anyhow::anyhow!("AEAD seal"))?;
+            frame.extend_from_slice(tag.as_ref());
             Ok(frame)
         }
 
         /// Open a received frame body. Same semantics as [`open`].
+        ///
+        /// **ONE allocation and ONE copy** (V-14b), for the same reason as
+        /// [`SealKey::seal_with_counter`]: `open_in_place` returns a `&mut [u8]`
+        /// that is a PREFIX of the buffer it was given, so truncating to its
+        /// length yields exactly the plaintext without the second `to_vec()`
+        /// the obvious spelling pays on every packet.
         pub fn open(&self, frame: &[u8]) -> Result<Vec<u8>> {
             anyhow::ensure!(
                 frame.len() >= 8 + TAG_LEN,
@@ -2667,11 +2691,13 @@ pub mod crypto {
             let ctr = u64::from_be_bytes(frame[..8].try_into().unwrap());
             let nonce = Nonce::assume_unique_for_key(nonce_from_counter(ctr));
             let mut buf = frame[8..].to_vec();
-            let plaintext = self
+            let len = self
                 .key
                 .open_in_place(nonce, Aad::empty(), &mut buf)
-                .map_err(|_| anyhow::anyhow!("AEAD open — tampered or wrong key"))?;
-            Ok(plaintext.to_vec())
+                .map_err(|_| anyhow::anyhow!("AEAD open — tampered or wrong key"))?
+                .len();
+            buf.truncate(len);
+            Ok(buf)
         }
     }
 
@@ -2692,6 +2718,63 @@ pub mod crypto {
             // Open (frame body = bytes after the 4-byte length prefix).
             assert_eq!(sk.open(&a[4..]).unwrap(), pt);
             assert_eq!(open(&key, &b[4..]).unwrap(), pt);
+        }
+
+        /// V-14b: the single-allocation seal must produce EXACTLY the bytes the
+        /// three-allocation one did, at every size the relay actually carries —
+        /// not just at the 25-byte payload the compat test above happens to use.
+        ///
+        /// This is the red-check for that change: the free function
+        /// `seal_with_counter` is deliberately left in its original shape
+        /// (`to_vec` + `seal_in_place_append_tag`) so it can serve as the
+        /// oracle. A rewrite that got the layout, the length prefix or the tag
+        /// placement wrong fails here byte for byte instead of failing in the
+        /// field as "AEAD open — tampered or wrong key" on the peer.
+        #[test]
+        fn sealkey_frame_is_byte_identical_across_sizes() {
+            let key = [0x5au8; 32];
+            let sk = SealKey::new(&key).unwrap();
+            // 0 is the degenerate case the arithmetic must still get right; 1350
+            // is the shipped TUN MTU; 1500 and 65535 are the other two sizes a
+            // relay frame can legitimately reach.
+            for len in [0usize, 1, 1350, 1500, 65535] {
+                let pt: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                for ctr in [0u64, 1, 0x0102_0304_0506_0708] {
+                    let a = sk.seal_with_counter(ctr, &pt).unwrap();
+                    let b = seal_with_counter(&key, ctr, &pt).unwrap();
+                    assert_eq!(a, b, "len={len} ctr={ctr}: wire bytes must not move");
+                    // The length prefix counts everything after itself, and the
+                    // frame is exactly that long: an off-by-TAG_LEN here would
+                    // desync the peer's framing rather than fail its AEAD.
+                    let declared = u32::from_be_bytes(a[..4].try_into().unwrap()) as usize;
+                    assert_eq!(declared, 8 + len + TAG_LEN, "len={len}: declared length");
+                    assert_eq!(a.len(), 4 + declared, "len={len}: frame length");
+                    // Round-trip through both openers, in both directions.
+                    assert_eq!(sk.open(&a[4..]).unwrap(), pt, "len={len} cached open");
+                    assert_eq!(open(&key, &b[4..]).unwrap(), pt, "len={len} free open");
+                }
+            }
+        }
+
+        /// The cached opener must still REFUSE a tampered frame. Truncating to
+        /// the plaintext length instead of copying it out is the kind of change
+        /// that could accidentally return the buffer before checking the tag.
+        #[test]
+        fn sealkey_open_rejects_tampering_and_short_frames() {
+            let key = [9u8; 32];
+            let sk = SealKey::new(&key).unwrap();
+            let pt = vec![3u8; 1350];
+            let frame = sk.seal_with_counter(7, &pt).unwrap();
+            let mut bad = frame[4..].to_vec();
+            bad[20] ^= 0x01; // one ciphertext bit
+            assert!(sk.open(&bad).is_err(), "tampered ciphertext must not open");
+            let mut bad_tag = frame[4..].to_vec();
+            let last = bad_tag.len() - 1;
+            bad_tag[last] ^= 0x01;
+            assert!(sk.open(&bad_tag).is_err(), "tampered tag must not open");
+            // A frame that cannot even hold a counter and a tag is a framing
+            // error, not an AEAD failure, and must be rejected before ring.
+            assert!(sk.open(&frame[4..4 + 8 + TAG_LEN - 1]).is_err());
         }
 
         #[test]
@@ -5190,6 +5273,75 @@ pub mod hostcfg {
             .output();
     }
 
+    /// Default transmit-queue depth for the VPN's TUN device, in PACKETS.
+    ///
+    /// bore used to leave this at the kernel default of 500, which is not a
+    /// neutral choice on this device. A TUN has two queues in series -- the
+    /// qdisc, and then the device's own skb queue that the application reads
+    /// from -- and only the second is bounded by this value. A deep device
+    /// queue keeps the qdisc empty, so the fq_codel the system installs by
+    /// default never builds a backlog and none of its AQM ever engages;
+    /// `tc -s qdisc` duly reports `backlog 0b 0p` while the path is carrying
+    /// hundreds of milliseconds of traffic.
+    ///
+    /// The bound is in packets, and this path runs with TUN offload, so an
+    /// entry is a GSO super-packet: measured at ~34 KB (603 MB in 17 827
+    /// entries), 500 entries is up to ~17 MB, or ~360 ms at 375 Mbit/s.
+    ///
+    /// MEASURED 2026-09-12, workstation -> AWS eu-south-1 over the direct path,
+    /// one link held across the whole ladder so only this value changed
+    /// (medians of 2 interleaved repetitions, inner TCP upload):
+    ///
+    /// | txqueuelen | goodput      | rtt avg |
+    /// |-----------:|-------------:|--------:|
+    /// |        500 | 248.3 Mbit/s |  147 ms |
+    /// |        256 | 272.3 Mbit/s |  111 ms |
+    /// |        192 | 277.6 Mbit/s |  114 ms |
+    /// |        128 | 265.7 Mbit/s |   97 ms |
+    /// |         64 | 258.2 Mbit/s |   92 ms |
+    ///
+    /// The kernel default is the worst rung on BOTH axes. 128 is chosen rather
+    /// than 64 or 192 because an earlier sweep that changed the value while the
+    /// inner flow was already in loss recovery collapsed at 32 (91 Mbit/s) and
+    /// at 8 (5.6 Mbit/s): the useful region has a cliff below it, so the default
+    /// sits in the middle of the good region and not at its edge.
+    ///
+    /// `BORE_VPN_TUN_TXQUEUELEN=0` restores the kernel default untouched, which
+    /// is the escape hatch for a path where this measurement does not hold.
+    pub const VPN_TUN_TXQUEUELEN: u32 = 128;
+
+    /// Smallest depth the knob will apply. Below roughly this the uplink task
+    /// cannot keep the pipe full between reads and the inner TCP reads the tail
+    /// drops as congestion — measured, not assumed.
+    const VPN_TUN_TXQUEUELEN_MIN: u32 = 16;
+
+    /// Largest depth the knob will apply: the kernel default, so the knob spans
+    /// everything that has ever shipped and can restore the old behaviour
+    /// exactly for comparison.
+    const VPN_TUN_TXQUEUELEN_MAX: u32 = 500;
+
+    /// Resolve the TUN transmit-queue depth from an optional operator override.
+    ///
+    /// `None` is the shipped default; `Some(0)` means "leave the kernel's own
+    /// value alone" and is the only way to get no write at all. Pure, so the
+    /// policy is unit-testable without creating a device.
+    pub fn resolve_tun_txqueuelen(override_value: Option<u32>) -> Option<u32> {
+        match override_value {
+            Some(0) => None,
+            Some(v) => Some(v.clamp(VPN_TUN_TXQUEUELEN_MIN, VPN_TUN_TXQUEUELEN_MAX)),
+            None => Some(VPN_TUN_TXQUEUELEN),
+        }
+    }
+
+    /// The live TUN transmit-queue depth, including the operator override.
+    pub fn tun_txqueuelen() -> Option<u32> {
+        resolve_tun_txqueuelen(
+            std::env::var("BORE_VPN_TUN_TXQUEUELEN")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok()),
+        )
+    }
+
     /// Create a TUN device with `queues` kernel queues (C1).
     ///
     /// Resolves "auto" name to the first free `boreN` (N=0..=255); explicit names are used
@@ -5268,6 +5420,26 @@ pub mod hostcfg {
                 }
             }
         };
+
+        // Bound the DEVICE queue so the qdisc above it can actually do its job.
+        // Best effort by design: a kernel that will not accept the write leaves
+        // a working tunnel with the old latency, which is strictly better than
+        // failing to bring the link up over a tuning value.
+        if let Some(qlen) = tun_txqueuelen() {
+            let path = format!("/sys/class/net/{resolved_name}/tx_queue_len");
+            match std::fs::write(&path, format!("{qlen}\n")) {
+                Ok(()) => tracing::info!(
+                    %resolved_name,
+                    txqueuelen = qlen,
+                    "TUN transmit queue bounded (kernel default 500 measured at +50% latency \
+                     and -11% throughput on the direct path)"
+                ),
+                Err(err) => tracing::warn!(
+                    %resolved_name, %err, txqueuelen = qlen,
+                    "could not set TUN txqueuelen; leaving the kernel default in place"
+                ),
+            }
+        }
 
         let mut devs = vec![first];
         for i in 1..queues {
@@ -7494,6 +7666,100 @@ pub mod hostcfg {
                 .contains(&cmd_iptables_filter_del_chain(&fwd)));
         }
 
+        // ── `--no-route-manage` ───────────────────────────────────────────────
+        //
+        // The flag is plumbed through ten sites in this file and, before these
+        // two tests, was exercised by nothing: no unit test, no netns gate, no
+        // perf stage. (A test named `no_route_manage_prints_netmap_and_scoped_
+        // masquerade` exists below, but it drives `gateway_nft_cmds` and never
+        // passes the flag — the name is the only connection.)
+        //
+        // A flag whose entire content is "do not do something" rots in exactly
+        // one way: the something starts happening again and nothing notices. So
+        // these are a PAIR — the first proves the route is installed without the
+        // flag, which is what makes the second's absence meaningful. Delete the
+        // `if !no_route_manage` guard in `apply` and the second fails; that is
+        // the red-check, and it is why the positive half is not redundant.
+
+        #[tokio::test]
+        async fn peer_routes_are_installed_without_no_route_manage() {
+            use crate::vpn::hostcfg_cmd::*;
+            let runner = TestRunner::new();
+            let peer_routes = vec![net("192.168.77.0/24")];
+            let cfg = NetConfig::apply(
+                &runner,
+                "nrm",
+                "connect",
+                "bore0",
+                "10.0.0.2".parse().unwrap(),
+                30,
+                &peer_routes,
+                &[],
+                &[],
+                false, // no_route_manage OFF
+                false,
+                false,
+                false,
+            )
+            .await
+            .expect("apply ok");
+            let calls = runner.get_calls().await;
+            assert!(
+                has(&calls, &cmd_route_add("192.168.77.0/24", "bore0")),
+                "the peer route must be installed when routing is managed; calls: {calls:?}"
+            );
+            // And registered for RAII revert, or the host keeps it after exit.
+            assert!(cfg
+                .revert_cmds
+                .contains(&cmd_route_del("192.168.77.0/24", "bore0")));
+        }
+
+        #[tokio::test]
+        async fn no_route_manage_installs_no_peer_routes_at_all() {
+            let runner = TestRunner::new();
+            let peer_routes = vec![net("192.168.77.0/24"), net("172.16.9.0/24")];
+            let cfg = NetConfig::apply(
+                &runner,
+                "nrm",
+                "connect",
+                "bore0",
+                "10.0.0.2".parse().unwrap(),
+                30,
+                &peer_routes,
+                &[],
+                &[],
+                true, // no_route_manage ON
+                false,
+                false,
+                false,
+            )
+            .await
+            .expect("apply ok");
+            let calls = runner.get_calls().await;
+            // Not "no route for THIS subnet" but no route command whatsoever:
+            // the promise is that bore does not touch routing, so an `ip route`
+            // for any destination breaks it.
+            let routed: Vec<_> = calls
+                .iter()
+                // `len() >= 3` before indexing c[2]: `ip route` on its own is a
+                // two-element argv and indexing past it would panic the test
+                // rather than fail it. `ip route get` is a QUERY the gateway path
+                // uses to resolve the LAN interface -- it changes nothing, so it
+                // is not a violation of "does not manage routes".
+                .filter(|c| c.len() >= 3 && c[0] == "ip" && c[1] == "route" && c[2] != "get")
+                .collect();
+            assert!(
+                routed.is_empty(),
+                "--no-route-manage must issue no routing commands; got: {routed:?}"
+            );
+            // Nothing to revert either -- a revert entry would mean something
+            // was applied that the caller was told would not be.
+            assert!(!cfg
+                .revert_cmds
+                .iter()
+                .any(|c| c.len() >= 2 && c[0] == "ip" && c[1] == "route"));
+        }
+
         #[test]
         fn no_route_manage_prints_netmap_and_scoped_masquerade() {
             use crate::vpn::hostcfg_cmd::*;
@@ -7858,7 +8124,7 @@ pub mod link {
     use anyhow::{Context, Result};
     use bytes::{Buf, Bytes, BytesMut};
     use futures_util::FutureExt;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::sync::mpsc;
 
     use super::crypto::DirectionKeys;
@@ -8161,12 +8427,50 @@ pub mod link {
     /// egress substream. This task is the stream's only owner. Exits on write
     /// error after logging it; the channel then closes and the uplink's next
     /// `send_batch` fails, tearing down the bridge loudly.
-    async fn relay_writer(mut egress: crate::mux::Stream, mut rx: mpsc::Receiver<Bytes>) {
-        while let Some(frame) = rx.recv().await {
-            if let Err(e) = egress.write_all(&frame).await {
+    /// How many already-queued frames one write may carry.
+    ///
+    /// This is a COST bound, never a delay: `recv_many` returns as soon as ONE
+    /// frame is available and then takes whatever else is already queued
+    /// without waiting, so a link carrying one packet at a time behaves exactly
+    /// as it did before batching existed. 32 x ~1.4 KB keeps the scratch buffer
+    /// at roughly 45 KB per carrier, and relay frames are inner IP packets
+    /// bounded by the TUN MTU (the offload pumps split GRO reads into
+    /// individual packets before sealing), so the bound holds.
+    const RELAY_WRITE_BATCH: usize = 32;
+
+    /// Background task: write sealed frames onto one egress substream.
+    ///
+    /// Frames are COALESCED into one write whenever more than one is already
+    /// queued. The wire is unchanged by construction — the format is a stream
+    /// of `[u32 len][body]` and `relay_reader` already parses as many frames as
+    /// a read produced (`take_frame` loops over the accumulator) — but the cost
+    /// is not: one `write_all` per packet is one `yamux` data frame (12-byte
+    /// header) and one trip through the connection driver per packet, which at
+    /// a 1350-byte MTU is ~52 000 of each per second per 570 Mbit/s.
+    async fn relay_writer<W: AsyncWrite + Unpin>(mut egress: W, mut rx: mpsc::Receiver<Bytes>) {
+        let mut batch: Vec<Bytes> = Vec::with_capacity(RELAY_WRITE_BATCH);
+        let mut scratch = BytesMut::with_capacity(RELAY_WRITE_BATCH * 2048);
+        loop {
+            // Zero means every sender is gone: the link is being torn down.
+            if rx.recv_many(&mut batch, RELAY_WRITE_BATCH).await == 0 {
+                return;
+            }
+            let out: &[u8] = if batch.len() == 1 {
+                // The single-packet path allocates and copies nothing, so a
+                // latency-shaped link keeps exactly its old behaviour.
+                &batch[0]
+            } else {
+                scratch.clear();
+                for frame in &batch {
+                    scratch.extend_from_slice(frame);
+                }
+                &scratch
+            };
+            if let Err(e) = egress.write_all(out).await {
                 tracing::warn!(error = %e, "vpn relay egress write failed; tearing down link");
                 return;
             }
+            batch.clear();
         }
     }
 
@@ -8502,6 +8806,132 @@ pub mod link {
             drop(sender);
             let frames = consumer.await.unwrap();
             assert_eq!(frames.len(), 2, "both sealed frames must reach the writer");
+        }
+
+        /// A writer that records every write SEPARATELY. Counting writes is
+        /// the whole point: the bytes were always correct, the number of trips
+        /// through `yamux` and the socket was not.
+        #[derive(Clone, Default)]
+        struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+        impl RecordingWriter {
+            fn writes(&self) -> Vec<Vec<u8>> {
+                self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+            }
+        }
+
+        impl tokio::io::AsyncWrite for RecordingWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(buf.to_vec());
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        /// Frames already queued travel in ONE write, and the bytes on the wire
+        /// are the plain concatenation — the format is a stream of
+        /// `[u32 len][body]`, so coalescing is invisible to the peer.
+        ///
+        /// RED-CHECK: with `rx.recv()` in place of `recv_many` this asserts 1
+        /// and gets 8. That count is the entire value of the change: one write
+        /// per packet is one `yamux` frame header and one driver trip per
+        /// packet, ~52 000 of each per second at a 1350-byte MTU and 570
+        /// Mbit/s.
+        #[tokio::test]
+        async fn relay_writer_coalesces_queued_frames_into_one_write() {
+            let (tx, rx) = mpsc::channel::<Bytes>(64);
+            let key = crate::vpn::crypto::SealKey::new(&[7u8; 32]).unwrap();
+
+            // Queue REAL sealed frames (not arbitrary bytes) so the round trip
+            // below is the same parser the peer runs.
+            let mut expected = Vec::new();
+            for i in 0..8u8 {
+                let frame = Bytes::from(key.seal_with_counter(i as u64, &[i; 100]).unwrap());
+                expected.push(frame.clone());
+                tx.send(frame).await.unwrap();
+            }
+            drop(tx); // the writer returns once the queue drains
+
+            let sink = RecordingWriter::default();
+            relay_writer(sink.clone(), rx).await;
+
+            let writes = sink.writes();
+            assert_eq!(
+                writes.len(),
+                1,
+                "eight already-queued frames must travel in one write, got {} writes",
+                writes.len()
+            );
+
+            let flat: Vec<u8> = expected.iter().flat_map(|f| f.to_vec()).collect();
+            assert_eq!(writes[0], flat, "the wire must be the plain concatenation");
+
+            // ...and the peer's own parser must recover exactly those frames.
+            let mut acc = BytesMut::from(&writes[0][..]);
+            for (i, want) in expected.iter().enumerate() {
+                let got = take_frame(&mut acc)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("frame {i} did not parse out of the batch"));
+                // `take_frame` strips the 4-byte length prefix.
+                assert_eq!(got[..], want[4..], "frame {i} differs after reassembly");
+            }
+            assert!(take_frame(&mut acc).unwrap().is_none());
+            assert!(acc.is_empty(), "no trailing bytes may survive the batch");
+        }
+
+        /// Batching may never become waiting: a lone frame goes out on its own,
+        /// with nothing queued behind it and no timer in the path.
+        ///
+        /// This is the twin the first test needs — "one write" is also what a
+        /// writer that waits for a full batch would produce, and that writer
+        /// would add up to 31 packets of delay to an interactive flow.
+        #[tokio::test(start_paused = true)]
+        async fn relay_writer_sends_a_lone_frame_without_waiting_for_company() {
+            let (tx, rx) = mpsc::channel::<Bytes>(64);
+            let key = crate::vpn::crypto::SealKey::new(&[9u8; 32]).unwrap();
+            let sink = RecordingWriter::default();
+
+            let task = tokio::spawn(relay_writer(sink.clone(), rx));
+            tx.send(Bytes::from(key.seal_with_counter(0, &[1u8; 64]).unwrap()))
+                .await
+                .unwrap();
+
+            // Time never advances here: the loop always has a ready task, so
+            // tokio's paused clock cannot auto-advance and a writer that waited
+            // on ANY timer could not have written yet. Bounded, so a writer
+            // that waits fails the assertion instead of hanging the suite.
+            for _ in 0..200 {
+                if !sink.writes().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+
+            assert_eq!(
+                sink.writes().len(),
+                1,
+                "a lone frame was held back waiting for a batch"
+            );
+            drop(tx);
+            task.await.unwrap();
         }
 
         /// When the writer task exits (e.g. relay stream broken), the next
@@ -9498,6 +9928,37 @@ mod tests {
         assert_eq!(pmtu_decision(1162, &[1414, 1414, 1414], None), Some(1414));
     }
 
+    /// The TUN transmit queue is a LATENCY policy, so its resolver is pinned:
+    /// the kernel default it replaces was measured at +50% RTT and -11%
+    /// throughput on the direct path.
+    #[test]
+    fn tun_txqueuelen_resolution() {
+        // Unset ships the measured default, not the kernel's.
+        assert_eq!(
+            hostcfg::resolve_tun_txqueuelen(None),
+            Some(hostcfg::VPN_TUN_TXQUEUELEN)
+        );
+        assert_ne!(
+            hostcfg::VPN_TUN_TXQUEUELEN,
+            500,
+            "500 is the value this replaces"
+        );
+
+        // An explicit value is honoured...
+        assert_eq!(hostcfg::resolve_tun_txqueuelen(Some(192)), Some(192));
+
+        // ...but never below the depth where the uplink starves between reads
+        // (measured: 32 -> 91 Mbit/s, 8 -> 5.6 Mbit/s), nor above the kernel
+        // default, so the knob cannot make queueing worse than it ever was.
+        assert_eq!(hostcfg::resolve_tun_txqueuelen(Some(1)), Some(16));
+        assert_eq!(hostcfg::resolve_tun_txqueuelen(Some(100_000)), Some(500));
+
+        // Zero is the escape hatch: leave the kernel's own value untouched.
+        // It must be None (no write at all), NOT a clamp to the minimum —
+        // clamping would make "don't touch it" mean "set it to 16".
+        assert_eq!(hostcfg::resolve_tun_txqueuelen(Some(0)), None);
+    }
+
     /// TUN name auto-resolution.
     #[test]
     fn pick_tun_name_explicit_passthrough() {
@@ -9811,6 +10272,14 @@ pub mod hub {
             peer: Vec<std::net::SocketAddr>,
             /// Direct-UDP transport tuning requested by the server.
             tuning: crate::shared::UdpDirectTuning,
+            /// Server-computed traversal rider: the peer's typed candidates,
+            /// capabilities and the adaptive plan.
+            ///
+            /// `None` means the pair could not be planned (one side is an older
+            /// client, or the kill switch is set), which is the legacy blind
+            /// punch. Boxed because `UdpPunchV2` is large and this variant is
+            /// moved through two channels per round.
+            v2: Option<Box<crate::shared::UdpPunchV2>>,
         },
     }
 
@@ -10129,6 +10598,7 @@ pub mod hub {
                             nonce,
                             peer,
                             tuning,
+                            v2,
                         } => {
                             // Phase 4.2c: route to peer's direct task (when added).
                             if let Some((_dl_task, _peer_handle, punch_tx)) = live_peers.get(&peer_id) {
@@ -10137,6 +10607,7 @@ pub mod hub {
                                     nonce,
                                     peer,
                                     tuning,
+                                    v2,
                                 }).await;
                             } else {
                                 debug!(?peer_id, "hub coordinator: punch event for unknown peer; peer may be removed");
@@ -10324,6 +10795,7 @@ pub mod hub {
 
         let mut ticker = tokio::time::interval(super::DIRECT_RETRY_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut generation: u32 = 0;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {}
@@ -10334,6 +10806,7 @@ pub mod hub {
             }
             match try_hub_peer_direct(
                 peer_id,
+                generation,
                 &peer,
                 &mut punch_rx,
                 &args,
@@ -10356,6 +10829,9 @@ pub mod hub {
                 }
                 HubDirectOutcome::PeerGone => return,
             }
+            // A fresh round is a fresh generation: the previous round's check
+            // frames must not authenticate against this one's socket.
+            generation = generation.wrapping_add(1);
         }
     }
 
@@ -10374,6 +10850,10 @@ pub mod hub {
     #[allow(clippy::too_many_arguments)]
     async fn try_hub_peer_direct(
         peer_id: u32,
+        // Which retry-grid round this is. Rides the offer so the broker can
+        // normalize it across both riders: check frames carry the generation
+        // and a mismatch is silent mutual rejection.
+        generation: u32,
         peer: &Arc<PeerHandle>,
         punch_rx: &mut tokio::sync::mpsc::Receiver<HubEvent>,
         args: &super::VpnListenArgs,
@@ -10429,14 +10909,17 @@ pub mod hub {
         };
 
         // 2. Offer our candidates to the server's per-peer broker (WITH peer_id).
+        //
+        // The FULL v2 offer -- typed candidates, capabilities and the structured
+        // NAT profile -- exactly as the 1:1 path sends. A bare candidate list
+        // was what used to hold hub mode a traversal generation behind: the
+        // broker computes the adaptive plan only when it holds BOTH profiles,
+        // so an offer without one silently disabled the authenticated check
+        // round, the plan and the sprayed escape for EVERY spoke, and both
+        // sides then fell back to the legacy blind punch.
         if out_tx
             .send(crate::shared::ClientMessage::UdpCandidateOffer(
-                crate::shared::UdpCandidateOffer {
-                    candidates: disc.candidates,
-                    selected_stun: disc.selected_stun.map(|s| s.requested),
-                    peer_id,
-                    ..Default::default()
-                },
+                disc.to_offer(peer_id, generation),
             ))
             .await
             .is_err()
@@ -10445,18 +10928,35 @@ pub mod hub {
         }
 
         // 3. Await the brokered punch (peer candidates + nonce + tuning).
-        let (nonce, peer_addrs, tuning) =
-            match tokio::time::timeout(super::DIRECT_PUNCH_WAIT, punch_rx.recv()).await {
+        //
+        // A punch carrying NO candidates is a PROD, not a punch: the server
+        // sends one to ask this hub to offer for a peer, and it necessarily
+        // arrives BEFORE the planned punch, because the broker cannot compute a
+        // plan until this hub has answered. Consuming it as the punch is what
+        // used to drop hub mode onto the legacy blind path; it is skipped, and
+        // the wait continues for the real one within the same budget.
+        let punch_deadline = tokio::time::Instant::now() + super::DIRECT_PUNCH_WAIT;
+        let (nonce, peer_addrs, tuning, punch_v2) = loop {
+            let left = punch_deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, punch_rx.recv()).await {
                 Ok(Some(HubEvent::Punch {
                     nonce,
                     peer,
                     tuning,
+                    v2,
                     ..
-                })) => (nonce, peer, tuning),
+                })) => {
+                    if peer.is_empty() {
+                        debug!(%peer_id, "hub direct: prod (no candidates); still waiting for the brokered punch");
+                        continue;
+                    }
+                    break (nonce, peer, tuning, v2);
+                }
                 Ok(Some(_)) => return HubDirectOutcome::NoDirect, // unexpected event
                 Ok(None) => return HubDirectOutcome::PeerGone,    // peer removed
                 Err(_) => return HubDirectOutcome::NoDirect,      // no punch in time
-            };
+            }
+        };
 
         // 4. Drop candidates inside tunneled subnets (would loop through the VPN).
         let (peer_addrs, dropped) = super::filter_tunneled_candidates(&peer_addrs, tunneled);
@@ -10468,13 +10968,68 @@ pub mod hub {
         }
 
         // 5. QUIC handshake — the hub is the listener (QUIC server).
+        //
+        // When the broker planned the pair, the round is the AUTHENTICATED one
+        // (Fase 2/3/7), identical to the 1:1 path: HMAC check frames, the
+        // plan's candidate ordering and pacing, and the sprayed escape for the
+        // one NAT cell an ordinary round cannot win. That also brings S-5 --
+        // the listener ends its round the moment the dialer authenticates to
+        // it, instead of probing an address that has already gone quiet.
+        // Without a plan the legacy blind punch is used unchanged.
         let token = crate::holepunch::derive_token(Some(&args.secret), &nonce);
-        let dl = match crate::holepunch::DirectListener::new(socket, peer_addrs, tuning).await {
-            Ok(dl) => dl,
-            Err(e) => {
-                debug!(%peer_id, error=%e, "hub direct: listener setup failed");
-                return HubDirectOutcome::NoDirect;
+        let check_cfg = punch_v2.as_deref().map(|v2| {
+            let plan_wire = v2.plan.as_ref();
+            crate::holepunch::CheckConfig {
+                key: crate::holepunch::derive_check_key(&token),
+                generation: v2.generation,
+                role: crate::holepunch::CheckRole::Listener,
+                window: plan_wire
+                    .map(crate::holepunch::plan_check_window)
+                    .unwrap_or(crate::holepunch::CHECK_WINDOW),
+                plan: (!v2.peer_typed.is_empty()).then(|| crate::holepunch::CheckPlan {
+                    groups: crate::holepunch::plan_check_groups(
+                        &v2.peer_typed,
+                        &peer_addrs,
+                        plan_wire.map(|p| p.candidate_order.as_slice()),
+                    ),
+                    retry_budget: plan_wire.map(|p| p.retry_budget).unwrap_or(0),
+                    initial_delay: std::time::Duration::from_millis(
+                        plan_wire.map(|p| p.send_delay_ms).unwrap_or(0),
+                    ),
+                }),
+                spray: crate::holepunch::spray::role_from_wire(
+                    plan_wire.and_then(|p| p.spray_role.as_deref()),
+                ),
             }
+        });
+        let dl = match &check_cfg {
+            Some(cfg) => {
+                match crate::holepunch::listener_checks_then_quic(socket, &peer_addrs, cfg, tuning)
+                    .await
+                {
+                    Ok((dl, outcome)) => {
+                        info!(
+                            %peer_id,
+                            nominated = ?outcome.nominated,
+                            learned_prflx = outcome.learned_prflx,
+                            checks_ms = outcome.checks_ms,
+                            "hub peer check round finished; QUIC listener up"
+                        );
+                        dl
+                    }
+                    Err(e) => {
+                        debug!(%peer_id, error=%e, "hub direct: listener setup failed");
+                        return HubDirectOutcome::NoDirect;
+                    }
+                }
+            }
+            None => match crate::holepunch::DirectListener::new(socket, peer_addrs, tuning).await {
+                Ok(dl) => dl,
+                Err(e) => {
+                    debug!(%peer_id, error=%e, "hub direct: listener setup failed");
+                    return HubDirectOutcome::NoDirect;
+                }
+            },
         };
         let conn = match tokio::time::timeout(super::DIRECT_ACCEPT_WAIT, dl.accept(token)).await {
             Ok(Ok(c)) => c,
@@ -10677,6 +11232,7 @@ pub mod hub {
                                     nonce,
                                     peer,
                                     tuning,
+                                    v2,
                                     ..
                                 }))) => {
                                     debug!(?peer_id, ?peer, "hub ctrl: received vpn udp punch");
@@ -10686,6 +11242,11 @@ pub mod hub {
                                             nonce,
                                             peer,
                                             tuning,
+                                            // Boxed on the way in: the wire
+                                            // type is unboxed, the event is
+                                            // boxed so the large variant is
+                                            // cheap to move between channels.
+                                            v2: v2.map(Box::new),
                                         })
                                         .await;
                                 }

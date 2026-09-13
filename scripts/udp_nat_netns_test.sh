@@ -49,6 +49,13 @@
 #                          in-process lab extracted and the reason §13's
 #                          "test-udp reports the mapping, not the filtering"
 #                          is a real gap and not a cosmetic one)
+#   T-NAT-MANUAL-CAND      --udp-candidate      -> DIRECT (the operator's own
+#                          + --udp-no-stun                static forward, with
+#                                                         no discovery at all)
+#   T-NAT-NOSTUN-BARE      --udp-no-stun alone  -> RELAY  (its red-check)
+#   T-NAT-PLAN-KILL        server --no-udp-adaptive-plan: no plan is computed
+#                          and none reaches a peer, AND the pair still goes
+#                          DIRECT (a kill switch, not a way to break traversal)
 #   T-NAT-EIF-VS-EDM       EIM+EIF  x EDM       -> DIRECT (a port-forwarded
 #                          provider serves any consumer with UDP egress)
 #
@@ -303,9 +310,21 @@ wait_tcp() {
 # router, `edm:apdf` the symmetric/mobile one, `eim:adf` a restricted cone and
 # `eim:eif` a full cone (a static UDP port forward). The legacy two-argument
 # form is still accepted so the three original scenarios read unchanged.
+# <label> <prov-profile> <cons-profile> <block-udp> <expect> [spray] [discovery]
+#
+# `discovery` governs how the PROVIDER finds the address it advertises:
+#   stun     (default)  the harness STUN server, as every cell before this one
+#   declared            `--udp-no-stun --udp-candidate <router WAN>:<port>` --
+#                       the operator declaring a static forward, which the
+#                       product advertises as kind RouterMapped
+#   nostun              `--udp-no-stun` with NOTHING declared -- the RED-CHECK
+#                       twin: it proves the DIRECT result above came from the
+#                       declared candidate and not from something else on the
+#                       path, because with the same router and the same
+#                       forward, minus the declaration, the pair must relay.
 run_scenario() {
     local label="$1" prov_prof="$2" cons_prof="$3" block="$4" expect="$5"
-    local spray="${6:-off}"
+    local spray="${6:-off}" discovery="${7:-stun}"
     local id="udpnat-${label}"
     local sdir="$TMPDIR/$label"
 
@@ -372,10 +391,19 @@ run_scenario() {
     # on the provider's own side: ns0 is multihomed and an unconnected UDP
     # reply picks its source by route, so a cross-side STUN target would answer
     # from the "wrong" IP and be discarded by the source check.
+    # How the provider discovers what to advertise. `--udp-candidate` names the
+    # router's WAN address and the forwarded port -- the two facts an operator
+    # has and STUN would otherwise have to rediscover -- and `--udp-no-stun`
+    # proves it did not quietly fall back to discovery.
+    local prov_disc=(--stun-server "$SERVER_IP:$CTRL_PORT")
+    case "$discovery" in
+        declared) prov_disc=(--udp-no-stun --udp-candidate "192.0.2.1:$PROV_UDP_PORT") ;;
+        nostun)   prov_disc=(--udp-no-stun) ;;
+    esac
     ip netns exec nsprov env RUST_LOG=info "${spray_env[@]}" "$BORE" local "$ECHO_PORT" \
         --to "http://$SERVER_IP:$CTRL_PORT" --secret "$SECRET" \
         --tcp-secret-id "$id" --udp \
-        --stun-server "$SERVER_IP:$CTRL_PORT" \
+        "${prov_disc[@]}" \
         "${prov_port_flag[@]}" \
         >"$sdir/provider.log" 2>&1 &
     local prov_pid=$!
@@ -432,6 +460,23 @@ run_scenario() {
             pass "$label: consumer logged an explicit relay-fallback reason"
         else
             fail "$label: no relay-fallback reason in consumer log"
+        fi
+    fi
+
+    # A verdict is not enough for the declared cell: DIRECT could in principle
+    # come from a candidate the provider found some other way, and the claim
+    # under test is specifically that the OPERATOR'S declaration reached the
+    # wire without any discovery behind it. So both halves are asserted.
+    if [ "$discovery" = "declared" ]; then
+        if grep -q "advertising manual UDP candidate" "$sdir/provider.log"; then
+            pass "$label: provider advertised the operator-declared candidate"
+        else
+            fail "$label: --udp-candidate left no trace in the provider log"
+        fi
+        if grep -q "selected STUN server for UDP candidates" "$sdir/provider.log"; then
+            fail "$label: --udp-no-stun did not skip the STUN chain"
+        else
+            pass "$label: --udp-no-stun skipped the STUN chain"
         fi
     fi
 
@@ -500,6 +545,121 @@ run_filter_probe() {
     fi
 }
 
+# run_paired_diag <label> <provider-profile> <consumer-profile> <expect: direct|relay>
+#
+# Runs PAIRED `bore test-udp --tcp-secret-id` across the same two routers the
+# matrix above drives a real tunnel through, and asserts two things:
+#
+#   1. the diagnostic ran the AUTHENTICATED check round, not the blind punch;
+#   2. its direct/relay verdict AGREES with what the real tunnel does on that
+#      cell.
+#
+# WHY THIS GATE EXISTS (V-2). Until the round was wired into the diagnostic,
+# `bore test-udp` traversed differently from every tunnel it is used to
+# troubleshoot: `establish_direct` went straight to `DirectListener::new` /
+# `connect_direct`, so there was no check round, no plan ordering, no
+# peer-reflexive learning and no sprayed escape. On a cell the round wins it
+# would report RELAY for a pair the product connects directly, and on a cell
+# the blind punch happens to win it would report DIRECT while exercising none
+# of the machinery the product depends on. The second error is the worse one
+# because it is silent, and no unit test can catch either: they are both
+# statements about two real peers behind two real NATs.
+#
+# The `eim:adf x edm` cell is the one chosen on purpose. It is a cell the
+# matrix above proves DIRECT *through the check round* — the blind punch has
+# nothing to aim at against a fully random peer mapping — so a regression that
+# removed the round would flip this case to a failed direct attempt rather
+# than quietly passing.
+run_paired_diag() {
+    local label="$1" prov_prof="$2" cons_prof="$3" expect="$4"
+    local sdir="$TMPDIR/$label"
+
+    cell_ports
+    if [ -n "${CASES:-}" ] && ! printf '%s\n' $CASES | grep -qx "$label"; then
+        return
+    fi
+    mkdir -p "$sdir"
+    local id="diag$$"
+    local prov_map prov_filt cons_map cons_filt
+    prov_map="$(printf '%s' "$prov_prof" | cut -d: -f1)"
+    prov_filt="$(printf '%s' "$prov_prof" | cut -d: -f2)"
+    cons_map="$(printf '%s' "$cons_prof" | cut -d: -f1)"
+    cons_filt="$(printf '%s' "$cons_prof" | cut -d: -f2)"
+    local prov_port_flag=() cons_port_flag=()
+    [ "$prov_filt" != "apdf" ] && prov_port_flag=(--nat-udp-preferred-port "$PROV_UDP_PORT")
+    [ "$cons_filt" != "apdf" ] && cons_port_flag=(--nat-udp-preferred-port "$CONS_UDP_PORT")
+
+    echo "--- $label: paired diagnostic, provider $prov_prof x consumer $cons_prof (expect $expect) ---"
+    nat_rules nsnat1 vn1w "$prov_map" "$prov_filt" 10.1.0.2 "$PROV_UDP_PORT"
+    nat_rules nsnat2 vn2w "$cons_map" "$cons_filt" 10.2.0.2 "$CONS_UDP_PORT"
+    flush_conntrack nsnat1
+    flush_conntrack nsnat2
+
+    # Both peers, started together: paired mode blocks until the server has
+    # BOTH offers, so a sequential start would just make the first one wait.
+    # `--udp-only` keeps the run to the question being asked — the TCP relay
+    # fallback is measured by its own cells and only adds a minute here.
+    ip netns exec nsprov env RUST_LOG=info "$BORE" test-udp \
+        --to "http://$SERVER_IP:$CTRL_PORT" --secret "$SECRET" \
+        --tcp-secret-id "$id" --udp-only \
+        --stun-server "$SERVER_IP:$CTRL_PORT" \
+        "${prov_port_flag[@]}" \
+        >"$sdir/prov.log" 2>&1 &
+    local prov_pid=$!
+    ip netns exec nscli env RUST_LOG=info "$BORE" test-udp \
+        --to "http://$SERVER_IP2:$CTRL_PORT" --secret "$SECRET" \
+        --tcp-secret-id "$id" --udp-only \
+        --stun-server "$SERVER_IP2:$CTRL_PORT" \
+        "${cons_port_flag[@]}" \
+        >"$sdir/cons.log" 2>&1 &
+    local cons_pid=$!
+    wait "$prov_pid" 2>/dev/null || true
+    wait "$cons_pid" 2>/dev/null || true
+
+    # (1) The round ran. Asserted on BOTH sides: the capability is read off the
+    # PEER's summary, so a one-sided pass would mean exactly the half-wired
+    # state this gate exists to refuse.
+    local enforced
+    # `grep -l` (files that match), counted. NOT `grep -lc`: the two flags
+    # contradict each other and the result would be a count of lines in a list
+    # of filenames, which happens to be 2 whenever both files merely EXIST.
+    #
+    # `|| true` is LOAD-BEARING, not defensive: this script runs under
+    # `set -euo pipefail`, and "no match" is grep's exit 1 — a perfectly normal
+    # outcome for an assertion that is allowed to fail. Without it a failing
+    # check kills the whole harness instead of reporting itself, and because
+    # the EXIT trap runs the cleanup the script still exits 0: the suite stops
+    # early and LOOKS like it passed. That is exactly what happened the first
+    # time this gate ran, and it took the Fase 7 cells and the final PASS/FAIL
+    # tally with it.
+    enforced=$({ grep -l 'Candidate order    : enforced' "$sdir/prov.log" "$sdir/cons.log" 2>/dev/null || true; } | wc -l)
+    if [ "$enforced" -eq 2 ]; then
+        pass "$label: both peers ran the authenticated check round"
+    else
+        fail "$label: the check round did not run on both peers (see $sdir/*.log)"
+    fi
+
+    # (2) The verdict agrees with the product.
+    local failed
+    # Same `|| true` rule as above, and here the no-match case is the EXPECTED
+    # one on a `direct` cell -- `grep -c` still prints `file:0` for every file,
+    # so the sum is correct and only the exit status needed neutralising.
+    failed=$({ grep -c 'UDP direct path    : FAILED' "$sdir/prov.log" "$sdir/cons.log" 2>/dev/null || true; } \
+             | awk -F: '{n+=$2} END{print n+0}')
+    if [ "$expect" = direct ]; then
+        if [ "$failed" -eq 0 ]; then
+            pass "$label: diagnostic reached the direct path, as the real tunnel does on this cell"
+        else
+            fail "$label: diagnostic FAILED the direct path on a cell the real tunnel wins"
+        fi
+    elif [ "$failed" -ge 1 ]; then
+        pass "$label: diagnostic reported no direct path, as the real tunnel does on this cell"
+    else
+        fail "$label: diagnostic claimed a direct path on a cell the real tunnel cannot win"
+    fi
+    sleep 0.3
+}
+
 # ── Run ─────────────────────────────────────────────────────────────────────
 build_topology
 
@@ -530,6 +690,17 @@ run_scenario "T-NAT-APDF-VS-EDM"   eim:apdf      edm:apdf no relay off
 run_scenario "T-NAT-ADF-VS-EDM"    eim:adf       edm:apdf no direct
 run_scenario "T-NAT-EIF-VS-EDM"    eim:eif       edm:apdf no direct
 
+# Fase 5: the operator declaring their own static forward, instead of STUN
+# discovering it. Same router, same forward, same peer as the cell above --
+# only the provider's DISCOVERY changes, so the pair is a one-variable
+# experiment and the second cell is the first one's red-check: without the
+# declaration the provider has nothing reachable to advertise and the pair
+# must fall back to the relay. A single "declared -> direct" cell would pass
+# just as happily if the declaration were ignored and something else on the
+# path were doing the work.
+run_scenario "T-NAT-MANUAL-CAND"   eim:eif       edm:apdf no direct off declared
+run_scenario "T-NAT-NOSTUN-BARE"   eim:eif       edm:apdf no relay  off nostun
+
 # The control for the two DIRECT cells above: the SAME fixed, port-preserved
 # mapping, WITHOUT the router's forward. If this went direct, the forward
 # would not be what the pair is measuring and the two cells above would be
@@ -541,6 +712,11 @@ run_scenario "T-NAT-FIXEDPORT-VS-EDM" eim:apdf:port edm:apdf no relay off
 # these two apart cannot advise on the cells above.
 run_filter_probe "T-NAT-FILTER-APDF" eim:apdf apdf
 run_filter_probe "T-NAT-FILTER-ADF"  eim:adf  adf-or-eif
+
+# ...and does the diagnostic TRAVERSE the way the product does? Same cell as
+# T-NAT-ADF-VS-EDM above, which the matrix proves the check round wins and the
+# blind punch cannot.
+run_paired_diag "T-NAT-DIAG-ROUND" eim:adf edm:apdf direct
 
 # Fase 7 — the sprayed escape (docs/nat/NAT_SOTA_COMPARISON.md §4.1).
 #
@@ -566,6 +742,56 @@ run_filter_probe "T-NAT-FILTER-ADF"  eim:adf  adf-or-eif
 run_scenario "T-NAT-SPRAY-OFF"      eim:apdf edm:apdf no relay  off
 run_scenario "T-NAT-SPRAY-DIALER"   eim:apdf edm:apdf no direct on
 run_scenario "T-NAT-SPRAY-LISTENER" edm:apdf eim:apdf no direct on
+
+# --no-udp-adaptive-plan: the documented kill switch, which until now had a
+# unit test for the VALUE (`the_adaptive_plan_kill_switch_actually_kills_the
+# _plan`) and no gate for the WIRING at all. The flag lives on the SERVER --
+# the broker is the only party that sees both profiles -- so this is the one
+# gate in this file that has to restart it.
+#
+# TWO claims, and the second is the one that makes it a kill switch rather
+# than a way to break traversal:
+#   (a) with the flag, no plan is computed and none reaches a peer;
+#   (b) the pair STILL goes direct. A kill switch that also kills the feature
+#       it is meant to make optional is not a kill switch.
+#
+# The red-check is the run that already happened: every cell above ran against
+# a server WITHOUT the flag, so `server.log` must contain the very line whose
+# absence is asserted below. Without that control, "no plan line" would pass
+# just as well if the line had been renamed or the profiles had never arrived.
+if [ -z "${CASES:-}" ] || printf '%s\n' $CASES | grep -qx "T-NAT-PLAN-KILL"; then
+    if grep -q "computed adaptive traversal plan" "$TMPDIR/server.log"; then
+        pass "T-NAT-PLAN-KILL/control: the default server DOES compute plans"
+    else
+        fail "T-NAT-PLAN-KILL/control: no plan was ever computed with the switch ON -- the absence below would prove nothing"
+    fi
+
+    kill -9 "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    sleep 0.5
+    ip netns exec ns0 env RUST_LOG=info "$BORE" server \
+        --secret "$SECRET" --udp --no-udp-adaptive-plan \
+        >"$TMPDIR/server-plankill.log" 2>&1 &
+    SERVER_PID=$!
+    if ! wait_tcp ns0 "$SERVER_IP" "$CTRL_PORT"; then
+        fail "T-NAT-PLAN-KILL: server with --no-udp-adaptive-plan never came up"
+    else
+        # Same cell as T-NAT-ADF-VS-EDM, whose DIRECT result the matrix above
+        # already established against a plan-carrying server: one variable.
+        run_scenario "T-NAT-PLAN-KILL" eim:adf edm:apdf no direct
+
+        if grep -q "computed adaptive traversal plan" "$TMPDIR/server-plankill.log"; then
+            fail "T-NAT-PLAN-KILL: the server computed a plan despite --no-udp-adaptive-plan"
+        else
+            pass "T-NAT-PLAN-KILL: no plan computed with the kill switch on"
+        fi
+        if grep -q "received adaptive traversal plan" "$TMPDIR/T-NAT-PLAN-KILL/consumer.log" 2>/dev/null; then
+            fail "T-NAT-PLAN-KILL: a plan reached the consumer despite the kill switch"
+        else
+            pass "T-NAT-PLAN-KILL: no plan reached the consumer"
+        fi
+    fi
+fi
 
 kill -9 "$SERVER_PID" 2>/dev/null || true
 

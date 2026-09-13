@@ -13,6 +13,23 @@
 #
 # The path is read back from the SENDER's own log, never assumed: a `--udp`
 # run that failed to punch is a relay measurement wearing a direct label.
+#
+# OPEN QUESTION RAISED BY THE WIRED RUN (2026-09-13), AND ONE HYPOTHESIS ALREADY
+# FALSIFIED. The direct arm at `--parallel 1` read 45.8 MiB/s where every other
+# cell in the table read 86-88 (the line rate for this direction), and doubling
+# to `--parallel 2` recovered it exactly (87.8). A per-stream bound that halves
+# with one stream and vanishes with two is the shape of `something / RTT`, and
+# `CHUNK_SIZE / RTT` is 1 MiB / 19 ms = 52.6 MiB/s, which is the right size.
+# **That hypothesis is dead on arrival**: the RELAY arm runs the SAME chunk
+# protocol at the SAME RTT and read 87.5 MiB/s at `--parallel 1`, so nothing in
+# the chunk loop can be the bound. Nor is it flow control — `holepunch::
+# transport_config` is the ONE place a `quinn::TransportConfig` is built in this
+# crate (checked), and it installs a 16 MiB stream window, which at 19 ms is
+# 842 MB/s. What is left is specific to ONE QUIC stream on the direct path:
+# congestion control, pacing, or receive-side CPU on the 2-vCPU listener. It is
+# a SINGLE sample and is not a finding yet. Settling it needs the loss and RTT
+# beside the rate (V-15's rule, which this stage does not yet obey) and a second
+# repetition; `REPS=2 PARS="1 2" ARMS=direct` is the cheap form.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/xferlib.sh"

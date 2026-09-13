@@ -1809,16 +1809,23 @@ impl Proxy {
                         && nat_udp_release_timeout.as_secs() > 0
                     {
                         if let Some(ref stun_addr) = check_stun_addr {
-                            match crate::holepunch::check_reflexive_port(
+                            let probe = crate::holepunch::check_reflexive_port(
                                 udp_port, *stun_addr,
-                            ).await {
+                            ).await;
+                            // ONE decision point, shared with the public
+                            // client: an unreachable probe measured nothing
+                            // and must leave the flag exactly as it was.
+                            preferred_port_remapped =
+                                crate::holepunch::preferred_port_verdict(
+                                    probe, preferred_port_remapped,
+                                );
+                            match probe {
                                 Some(true) => {
                                     info!(
                                         port = udp_port,
                                         "port :{udp_port} is now PRESERVED on NAT! \
                                          Scheduling immediate direct path upgrade",
                                     );
-                                    preferred_port_remapped = false;
                                     upgrade_backoff.reset();
                                     effective_udp_port = udp_port;
                                     // Force an immediate upgrade attempt.
@@ -2558,5 +2565,103 @@ mod tests {
         assert_eq!(role_for(&both, &[UDP_CAP_CHECK_V1]), None);
         assert_eq!(role_for(&[UDP_CAP_CHECK_V1], &both), None);
         assert_eq!(role_for(&[], &[]), None);
+    }
+
+    /// `bore server --no-udp-adaptive-plan` is the documented kill switch for
+    /// the whole Fase 3 planner, and before this test nothing anywhere pulled
+    /// it: not a unit test, not `vpn_netns_test.sh`, not `udp_nat_netns_test.sh`.
+    /// The one existing caller in these tests passes `enabled: true`.
+    ///
+    /// A kill switch nobody tests is a kill switch that may not kill, and this
+    /// one is the operator's only escape if the planner ever misroutes a pair.
+    /// So the inputs here are deliberately the BEST case for computing a plan —
+    /// both profiles present, both peers advertising every capability, the exact
+    /// pairing that `the_spray_role_reaches_the_wire_only_when_both_peers_can_
+    /// play_it` above proves yields `Some("easy")` — and the only difference is
+    /// the flag. Anything less would pass for the wrong reason.
+    ///
+    /// The rider itself must SURVIVE: disabling the planner must fall back to
+    /// the legacy blind punch, not suppress the punch. A rider that came back
+    /// `None` would be a different and much worse bug than a missing plan.
+    #[test]
+    fn the_adaptive_plan_kill_switch_actually_kills_the_plan() {
+        use crate::shared::{
+            UdpCandidateKind, UdpCandidateOffer, UdpFilterProbe, UdpNatMapping, UdpNatProfile,
+            UdpTypedCandidate, UDP_CAP_CHECK_V1, UDP_CAP_SPRAY_V1,
+        };
+
+        // The rider carries `typed_candidates`, NOT the legacy `candidates`
+        // list -- `UdpPunchV2` has no field for the latter at all. An offer
+        // that fills only the legacy list therefore produces a rider with an
+        // empty `peer_typed`, which is the product behaving correctly and a
+        // test asserting the wrong thing. Both lists are populated here
+        // because a real offer carries both.
+        let offer = || UdpCandidateOffer {
+            candidates: vec!["203.0.113.4:41641".parse().unwrap()],
+            typed_candidates: vec![UdpTypedCandidate {
+                addr: "203.0.113.4:41641".parse().unwrap(),
+                kind: UdpCandidateKind::Reflexive,
+                priority: 100,
+            }],
+            capabilities: [UDP_CAP_CHECK_V1, UDP_CAP_SPRAY_V1]
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        let symmetric = UdpNatProfile {
+            mapping: UdpNatMapping::Symmetric,
+            observations: 2,
+            ..Default::default()
+        };
+        let port_restricted = UdpNatProfile {
+            mapping: UdpNatMapping::Eim,
+            observations: 2,
+            filtering_probe: Some(UdpFilterProbe::AddressAndPortDependent),
+            ..Default::default()
+        };
+
+        let plan_with = |enabled: bool| {
+            let r_offer = offer();
+            let p_offer = offer();
+            let mut rider = crate::shared::UdpPunchV2::from_offer(&r_offer);
+            attach_adaptive_plan(
+                &mut rider,
+                (&r_offer, Some(&port_restricted)),
+                (&p_offer, Some(&symmetric)),
+                enabled,
+                "test",
+            );
+            rider
+        };
+
+        // Control: with the switch ON these exact inputs produce a plan.
+        // Without this half, the assertion below could pass because the inputs
+        // were wrong rather than because the flag worked.
+        let on = plan_with(true).expect("rider must exist with the planner on");
+        assert!(
+            on.plan.is_some(),
+            "control arm produced no plan, so the kill-switch assertion would be vacuous"
+        );
+
+        // The switch itself.
+        let off = plan_with(false).expect("disabling the PLANNER must not remove the PUNCH");
+        assert!(
+            off.plan.is_none(),
+            "--no-udp-adaptive-plan must leave the rider with no plan, got {:?}",
+            off.plan
+        );
+        // And the candidates still ride on BOTH arms, or the peer has nothing
+        // to punch to. An `||` here would pass on the control arm alone, which
+        // is precisely the arm the kill switch does not touch -- the assertion
+        // has to bind the arm under test.
+        assert!(
+            !on.peer_typed.is_empty(),
+            "control arm carries no candidates, so the assertion below is vacuous"
+        );
+        assert!(
+            !off.peer_typed.is_empty(),
+            "disabling the planner must leave the candidates for the legacy blind punch"
+        );
     }
 }

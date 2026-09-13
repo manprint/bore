@@ -16,7 +16,11 @@ set -uo pipefail
 
 
 
-UPF="$B/up256.bin"
+# `$B` was never defined in this file (nor in two of its siblings): under
+# `set -u` the stage died on this line before measuring anything. lib.sh
+# already provides WORK, which lives outside the repository -- and this
+# payload is 256 MB, so it must not land in the working tree.
+UPF="$WORK/up256.bin"
 DUR="${DUR:-20}"
 CFG="${1:-all}"
 [ -f "$UPF" ] || head -c 268435456 /dev/zero > "$UPF"

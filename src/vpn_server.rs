@@ -79,6 +79,15 @@ pub struct PeerSlot {
     pub hub_candidates: Vec<std::net::SocketAddr>,
     /// Hub's selected STUN server for this peer (advisory, Phase 4).
     pub hub_selected_stun: Option<String>,
+    /// The hub's FULL candidate offer for this peer: typed candidates,
+    /// capabilities and the structured NAT profile.
+    ///
+    /// Kept whole rather than reduced to the bare address list because the
+    /// adaptive plan (Fase 3) and the sprayed escape (Fase 7) are computable
+    /// only from both sides' profiles and capability lists, and the broker is
+    /// the sole party that sees both. Storing only `hub_candidates` is what
+    /// used to pin every hub spoke to the legacy blind punch.
+    pub hub_offer: Option<crate::shared::UdpCandidateOffer>,
 }
 
 /// Event a connector handler sends to the hub listener handler.
@@ -148,6 +157,7 @@ impl HubState {
                     overlay,
                     nonce,
                     hub_candidates: vec![],
+                    hub_offer: None,
                     hub_selected_stun: None,
                 };
                 self.peers.insert(peer_id, slot.clone());
@@ -167,16 +177,17 @@ impl HubState {
         self.peers.len()
     }
 
-    /// Store the hub's UDP candidates for `peer_id` (Phase 4 rendezvous).
-    pub fn set_hub_candidates(
-        &mut self,
-        peer_id: u32,
-        cands: Vec<std::net::SocketAddr>,
-        stun: Option<String>,
-    ) {
-        if let Some(slot) = self.peers.get_mut(&peer_id) {
-            slot.hub_candidates = cands;
-            slot.hub_selected_stun = stun;
+    /// Store the hub's UDP offer for `peer_id` (Phase 4 rendezvous).
+    ///
+    /// Takes the WHOLE offer. The candidate list alone is enough to punch, but
+    /// not enough to plan: the broker needs this side's profile and capability
+    /// list to compute the adaptive plan and to decide whether both peers can
+    /// play the sprayed-escape rendezvous.
+    pub fn set_hub_offer(&mut self, offer: crate::shared::UdpCandidateOffer) {
+        if let Some(slot) = self.peers.get_mut(&offer.peer_id) {
+            slot.hub_candidates = offer.candidates.clone();
+            slot.hub_selected_stun = offer.selected_stun.clone();
+            slot.hub_offer = Some(offer);
         }
     }
 }
@@ -849,9 +860,17 @@ pub async fn serve_vpn_listener(
                                     peer_selected_stun: offer.peer_selected_stun,
                                     tuning: udp_tuning,
                                     peer_id,
-                                    // Hub per-peer direct path stays legacy v1 (no v2/checks/plan yet);
-                                    // the 1:1 path adopted v2 in Fase 3.
-                                    v2: None,
+                                    // The rider the broker computed for the HUB
+                                    // side of this pair. Dropping it here was
+                                    // the last hop that kept hub mode on the
+                                    // legacy blind punch even after both the
+                                    // broker and the hub client had been
+                                    // aligned: the spoke ran its authenticated
+                                    // round against a hub that was not
+                                    // answering, and its round read
+                                    // `nominated=None checks_ms=1126` -- S-5's
+                                    // exact slow shape, one full initial PTO.
+                                    v2: offer.v2,
                                     // VPN has its own path reporting
                                     // (`ClientMessage::VpnPathReport`, gated by
                                     // `VpnReady.admin_v2`); S-1's secret report
@@ -873,11 +892,7 @@ pub async fn serve_vpn_listener(
                             crate::holepunch::sanitize_offer(&mut offer, "vpn-hub-listener-offer");
                             {
                                 let mut hub_state = hub.state.lock().unwrap_or_else(|p| p.into_inner());
-                                hub_state.set_hub_candidates(
-                                    offer.peer_id,
-                                    offer.candidates,
-                                    offer.selected_stun,
-                                );
+                                hub_state.set_hub_offer(offer);
                             }
                         }
                         Ok(Some(ClientMessage::VpnPathReport { path })) => {
@@ -1286,13 +1301,61 @@ pub async fn serve_vpn_connector(
                     let hub_cands = {
                         let hub_state = hub_clone.state.lock().unwrap_or_else(|p| p.into_inner());
                         hub_state.peers.get(&peer_id).map(|slot| {
-                            (slot.hub_candidates.clone(), slot.hub_selected_stun.clone())
+                            (
+                                slot.hub_candidates.clone(),
+                                slot.hub_selected_stun.clone(),
+                                slot.hub_offer.clone(),
+                            )
                         })
                     };
 
                     match hub_cands {
-                        Some((cands, stun)) if !cands.is_empty() => {
-                            // Both offers ready: punch the spoke with hub's candidates.
+                        Some((cands, stun, hub_offer)) if !cands.is_empty() => {
+                            // Both offers ready. Build the v2 rider for EACH
+                            // side from the pair of offers, exactly as the 1:1
+                            // and secret brokers do: the rider sent to a peer
+                            // carries THAT peer's plan (its own profile first),
+                            // so the two sides receive the same pairing seen
+                            // from their own perspective.
+                            //
+                            // A hub that offered no v2 payload (an older client)
+                            // leaves both riders `None`, which is the legacy
+                            // blind punch — the standing rule for every
+                            // traversal capability on this wire.
+                            let hub_offer_ref = hub_offer.as_ref();
+                            let mut spoke_v2 = crate::shared::UdpPunchV2::from_offer(offer);
+                            let mut hub_v2 =
+                                hub_offer_ref.and_then(crate::shared::UdpPunchV2::from_offer);
+                            if let Some(h) = hub_offer_ref {
+                                secret::attach_adaptive_plan(
+                                    &mut spoke_v2,
+                                    (offer, offer.profile.as_ref()),
+                                    (h, h.profile.as_ref()),
+                                    udp_adaptive_plan,
+                                    "vpn-hub-spoke-punch",
+                                );
+                                secret::attach_adaptive_plan(
+                                    &mut hub_v2,
+                                    (h, h.profile.as_ref()),
+                                    (offer, offer.profile.as_ref()),
+                                    udp_adaptive_plan,
+                                    "vpn-hub-listener-punch",
+                                );
+                                // Normalize the traversal-round generation
+                                // across BOTH riders: check frames carry it and
+                                // a mismatch is silent mutual rejection, so the
+                                // broker -- the only party that sees both
+                                // offers -- makes them agree. Old clients offer
+                                // 0, where max() degenerates to pass-through.
+                                let gen = offer.generation.max(h.generation);
+                                if let Some(v) = spoke_v2.as_mut() {
+                                    v.generation = gen;
+                                }
+                                if let Some(v) = hub_v2.as_mut() {
+                                    v.generation = gen;
+                                }
+                            }
+                            // Punch the spoke with hub's candidates.
                             if control
                                 .send(ServerMessage::UdpPunch {
                                     nonce: peer_slot.nonce,
@@ -1300,9 +1363,7 @@ pub async fn serve_vpn_connector(
                                     peer_selected_stun: stun,
                                     tuning: udp_tuning,
                                     peer_id,
-                                    // Hub per-peer direct path stays legacy v1 (no v2/checks/plan yet);
-                                    // the 1:1 path adopted v2 in Fase 3.
-                                    v2: None,
+                                    v2: spoke_v2,
                                     // VPN has its own path reporting
                                     // (`ClientMessage::VpnPathReport`, gated by
                                     // `VpnReady.admin_v2`); S-1's secret report
@@ -1319,7 +1380,7 @@ pub async fn serve_vpn_connector(
                                 nonce: peer_slot.nonce,
                                 peer_candidates: offer.candidates.clone(),
                                 peer_selected_stun: offer.selected_stun.clone(),
-                                v2: None,
+                                v2: hub_v2,
                             };
                             let _ = hub_clone
                                 .event_tx
@@ -1337,6 +1398,10 @@ pub async fn serve_vpn_connector(
                                 if let Some(slot) = hub_state.peers.get_mut(&peer_id) {
                                     slot.hub_candidates.clear();
                                     slot.hub_selected_stun = None;
+                                    // The offer goes with the candidates: a
+                                    // stale profile would plan round N+1
+                                    // against round N's socket.
+                                    slot.hub_offer = None;
                                 }
                             }
                         }
@@ -1374,15 +1439,34 @@ pub async fn serve_vpn_connector(
                             spoke_offer = Some(offer);
                             offer_deadline = Some(tokio::time::Instant::now() + punch_timeout);
                             punched = false;
-                            // Push the spoke's offer to the hub listener so it can punch back.
+                            // Wake the hub so it gathers and offers for this
+                            // peer. This is a PROD, not a punch, and it carries
+                            // NO candidates on purpose.
+                            //
+                            // It used to carry the spoke's candidate list with
+                            // `v2: None`, which made it indistinguishable from a
+                            // real punch — and it always arrives FIRST, because
+                            // the broker cannot compute a plan until the hub has
+                            // answered this very prod. The hub, already waiting
+                            // inside its direct attempt, consumed it and punched
+                            // blind; the planned punch that followed had nothing
+                            // left to arrive at. That single line kept hub mode
+                            // on the legacy path even with the broker and both
+                            // clients aligned, and the spoke's round read
+                            // `nominated=None checks_ms=1126` — S-5's slow shape.
+                            //
+                            // An empty candidate list is the discriminator: no
+                            // real punch has ever carried one, so an older hub
+                            // client cannot be confused by it, and a current one
+                            // treats it as "offer again, keep waiting".
                             let _ = hub_clone
                                 .event_tx
                                 .send(HubPeerEvent::Punch {
                                     peer_id,
                                     offer: secret::UdpOffer {
                                         nonce: peer_slot.nonce,
-                                        peer_candidates: spoke_offer.as_ref().unwrap().candidates.clone(),
-                                        peer_selected_stun: spoke_offer.as_ref().unwrap().selected_stun.clone(),
+                                        peer_candidates: Vec::new(),
+                                        peer_selected_stun: None,
                                         v2: None,
                                     },
                                 })

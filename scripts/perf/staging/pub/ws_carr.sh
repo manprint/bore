@@ -9,9 +9,19 @@
 # must close the gap. If it is not, carriers will change nothing and the
 # reversal needs another explanation. Both tunnels are up SIMULTANEOUSLY and
 # hit in alternating order, so neither pays the other's residue.
+# TRANSFER SIZE, AND WHY IT IS NOW A VARIABLE
+# -------------------------------------------
+# The 96 MiB in this stage was sized for WiFi, where it lasted about two
+# seconds. Wired the same transfer lasts 0.83 s at 922 Mbit/s, most of it TCP
+# slow start, so the number it produces is a RAMP rather than a rate -- and the
+# spread says so: the wired run of this campaign's public stages produced paired
+# ratios from 0.623 to 1.323 on arms that should have agreed. `XFER_MB` is the
+# TOTAL moved per arm; the wired default is 384 MiB (~3.3 s at line rate) and
+# `XFER_MB=96` reproduces the original figures exactly.
 . "$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
 RAWCLI="$(cd "$(dirname "$0")/../.." && pwd)/raw_client.py"
-RP=5053; P1=9033; P4=9034; PER=$((96*1048576/4))
+XFER_MB="${XFER_MB:-384}"
+RP=5053; P1=9033; P4=9034; PER=$(( XFER_MB*1048576/4 ))
 UP=()
 up() { vm "setsid nohup \$HOME/bore local $RP --port $1 --to '$BORE_TO' --secret '$BORE_SECRET' --carriers $2 \
         > \$HOME/out/wscarr-$1.log 2>&1 </dev/null & true" >/dev/null 2>&1
@@ -23,7 +33,7 @@ up "$P1" 1 || { echo "carriers=1 arm failed to register"; exit 1; }
 up "$P4" 4 || { echo "carriers=4 arm failed to register"; exit 1; }
 g() { python3 "$RAWCLI" get "$BORE_GW" "$1" "$PER" 4 2>/dev/null | grep -oE 'MBs=[0-9.]+' | cut -d= -f2; }
 carr() { adm tunnels | jq -r --argjson p "$1" '.[]|select(.public_port==$p)|.carriers' 2>/dev/null; }
-echo "=== relay download, carriers 1 vs 4, from the workstation (96 MiB / 4 conns) ==="
+echo "=== relay download, carriers 1 vs 4, from the workstation (${XFER_MB} MiB / 4 conns) ==="
 echo "  server reports carriers: port=$P1 -> $(carr "$P1")  port=$P4 -> $(carr "$P4")"
 printf '  %-6s %10s %10s %8s\n' round c1_MBs c4_MBs c4/c1
 RS=()

@@ -604,6 +604,8 @@ mod tests {
             candidate_count,
             port_preserved,
             filtering: None,
+            // Legacy shape on purpose: the capability defaults OFF.
+            checks: false,
         }
     }
 

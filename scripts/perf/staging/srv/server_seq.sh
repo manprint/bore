@@ -8,7 +8,7 @@ set -uo pipefail
 . "$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
 B="$(cd "$(dirname "$0")" && pwd)"
 
-VSSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i $K $VMU@$V"
+VSSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i $BORE_SSH_KEY $VMU@$V"
 O="$B/../out"; mkdir -p "$O"
 st(){ echo; echo "##########  $* — $(date -Is)"; }
 

@@ -73,4 +73,4 @@ sleep 5; of2=$(arm off_2)
 
 echo "  ON  : $on1 $on2  -> median $(printf '%s\n%s\n' "$on1" "$on2" | med) MB/s"
 echo "  OFF : $of1 $of2  -> median $(printf '%s\n%s\n' "$of1" "$of2" | med) MB/s"
-say done
+say "done"

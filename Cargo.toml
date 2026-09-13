@@ -50,7 +50,7 @@ bytes = "1"
 clap = { version = "4.5.0", features = ["derive", "env"] }
 dashmap = "5.2.0"
 fastrand = "2"
-futures-util = { version = "0.3.21", features = ["sink"] }
+futures-util = { version = "0.3.21", features = ["sink", "io"] }
 hex = "0.4.3"
 hmac = "0.12.1"
 # CSPRNG for the direct-path session nonce and STUN transaction id. `ring` is

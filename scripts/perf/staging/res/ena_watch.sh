@@ -7,7 +7,7 @@
 set -uo pipefail
 . "$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
 
-g(){ ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i $K $SRVU@$S \
+g(){ ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "$BORE_SSH_KEY" $SRVU@$S \
       "sudo -n ethtool -S $IFACE | grep -E 'bw_in_allowance_exceeded|bw_out_allowance_exceeded|pps_allowance_exceeded' | tr -d ' '" 2>/dev/null; }
 a=$(g); sleep "${1:-30}"; b=$(g)
 join -t: <(printf '%s\n' "$a" | sort) <(printf '%s\n' "$b" | sort) \

@@ -130,14 +130,38 @@ async fn invalid_address() -> Result<()> {
             Err(_) => Ok(()),
         }
     }
+    // The "cannot resolve" cases rest on a premise about the NETWORK, not about
+    // bore: that a nonexistent name fails to resolve. Plenty of consumer ISPs
+    // break that premise by answering every NXDOMAIN with an address of their
+    // own -- MEASURED on the development network, where
+    // `nonexistent.domain.for.demonstration` resolves, via an appended search
+    // domain, to **127.0.0.1**. The name then points at loopback, and because
+    // this test deliberately runs WITHOUT `SERIAL_GUARD` another test's server
+    // may be listening there, so `Client::new` succeeds and the assertion fails
+    // for a reason that has nothing to do with the code under test.
+    //
+    // So the premise is checked instead of assumed. Where it holds (CI, any
+    // resolver that returns NXDOMAIN) the cases run exactly as before; where it
+    // does not, they are skipped LOUDLY rather than passing or failing for the
+    // wrong reason. The other four cases are unaffected: "resolves but is not a
+    // bore server" and "is not a URI at all" do not depend on the resolver.
+    const BOGUS: &str = "nonexistent.domain.for.demonstration";
+    let resolver_is_honest = tokio::net::lookup_host((BOGUS, 7835)).await.is_err();
+    if !resolver_is_honest {
+        eprintln!(
+            "SKIPPING the resolution-failure cases: this network resolves {BOGUS}              instead of returning NXDOMAIN, so they cannot be exercised here"
+        );
+    }
+
     tokio::try_join!(
         check_address("google.com", false),
         check_address("google.com", true),
-        check_address("nonexistent.domain.for.demonstration", false),
-        check_address("nonexistent.domain.for.demonstration", true),
         check_address("malformed !$uri$%", false),
         check_address("malformed !$uri$%", true),
     )?;
+    if resolver_is_honest {
+        tokio::try_join!(check_address(BOGUS, false), check_address(BOGUS, true))?;
+    }
     Ok(())
 }
 

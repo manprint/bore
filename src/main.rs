@@ -3269,6 +3269,53 @@ mod tests {
         assert_eq!(plan4.direct_slots, 4);
     }
 
+    /// `parse_transfer_quota` is the parser behind SEVEN flags -- the five
+    /// QUIC window/buffer sizes, `--udp-memory-budget` and
+    /// `--test-transfer-quota` -- and it had no test at all. A misparse here
+    /// does not fail: it silently reconfigures every direct-path window, which
+    /// is the single most expensive kind of quiet wrong answer this binary can
+    /// give.
+    ///
+    /// The load-bearing assertion is the SI/binary split: `k`/`m`/`g` are
+    /// powers of ten and `ki`/`mi`/`gi` are powers of two. That is a
+    /// convention, not a fact, so it is pinned -- "fixing" `m` to 1048576
+    /// would move every shipped default by 4.9 % without changing a single
+    /// documented number.
+    #[test]
+    fn transfer_quota_suffixes_are_si_or_binary_exactly_as_documented() {
+        let ok = |v: &str| parse_transfer_quota(v).expect(v);
+        assert_eq!(ok("1"), 1, "no suffix is bytes");
+        assert_eq!(ok("1B"), 1);
+        // SI: powers of ten.
+        assert_eq!(ok("1k"), 1_000);
+        assert_eq!(ok("1kb"), 1_000);
+        assert_eq!(ok("2MB"), 2_000_000);
+        assert_eq!(ok("3g"), 3_000_000_000);
+        // Binary: powers of two. NEVER the same as the SI pair above.
+        assert_eq!(ok("1ki"), 1024);
+        assert_eq!(ok("1KiB"), 1024);
+        assert_eq!(ok("16MiB"), 16 * 1024 * 1024);
+        assert_eq!(ok("1GiB"), 1024 * 1024 * 1024);
+        assert_ne!(ok("1m"), ok("1mi"), "SI and binary must not collapse");
+        // Case and surrounding whitespace are not part of the value.
+        assert_eq!(ok(" 256 MiB "), 256 * 1024 * 1024);
+        assert_eq!(ok("256mib"), ok("256MIB"));
+
+        // Every rejection is an ERROR, never a silent default: a value the
+        // parser cannot read must stop the process, because the alternative is
+        // a server running windows the operator never chose.
+        for bad in ["", "   ", "MiB", "-1", "1tb", "1 mb extra", "1.5MiB"] {
+            assert!(
+                parse_transfer_quota(bad).is_err(),
+                "{bad:?} must be rejected, not silently reinterpreted"
+            );
+        }
+        // Overflow is caught rather than wrapped -- a wrap would produce a
+        // small window from an absurd request, the opposite of the intent.
+        assert!(parse_transfer_quota("99999999999999999999GiB").is_err());
+        assert!(parse_transfer_quota(&format!("{}GiB", u64::MAX)).is_err());
+    }
+
     /// The budget and the hand-set windows are mutually exclusive: honouring
     /// both would mean silently discarding one, and the operator would have no
     /// way to tell which.

@@ -53,5 +53,7 @@ rs=(); for n in $(seq "$PAIRS"); do
   rs+=("$r")
   printf "  %-5s %-10s %-9s %-22s relay=%s quic=%s\n" "$n" "$a" "$b" "$r" "$ap" "$bp"
 done
-printf '%s\n' "${rs[@]}" | sort -n | awk '{v[NR]=$1} END{printf "  median ratio: %s\n", v[int((NR+1)/2)]}'
+# LC_ALL=C on the sort (V-11): under a comma-decimal locale `sort -n` puts an
+# integer-valued ratio ahead of every decimal one, and the median moves.
+printf '%s\n' "${rs[@]}" | LC_ALL=C sort -n | awk '{v[NR]=$1} END{printf "  median ratio: %s\n", v[int((NR+1)/2)]}'
 echo "##### END $TAG"

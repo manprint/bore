@@ -60,10 +60,19 @@ PORTCLASH_VPN_CONN_PID=""
 PORTCLASH_SECRET_PROV_PID=""
 PORTCLASH_SECRET_CONS_PID=""
 PORTCLASH_HTTP_PID=""
+CTRLLEAK_CONN_PID=""
+CTRLLEAK_LISTEN_PID=""
 MIX_PIDS=()
 
 pass() { echo "PASS: $*"; PASS=$((PASS+1)); }
 fail() { echo "FAIL: $*"; FAIL=$((FAIL+1)); }
+# A gate whose STIMULUS did not apply has not passed and has not failed: it did
+# not run. Counting it as a pass is how a suite goes green while measuring
+# nothing, so it gets its own counter and is printed in the summary. It does not
+# affect the exit status -- a skip is information for the operator, not a
+# regression.
+SKIP=0
+skip() { echo "SKIP: $*"; SKIP=$((SKIP+1)); }
 die()  { echo "ERROR: $*" >&2; cleanup; exit 1; }
 
 cleanup() {
@@ -76,6 +85,8 @@ cleanup() {
     [ -n "$PORTCLASH_SECRET_PROV_PID" ] && kill "$PORTCLASH_SECRET_PROV_PID" 2>/dev/null; PORTCLASH_SECRET_PROV_PID=""
     [ -n "$PORTCLASH_SECRET_CONS_PID" ] && kill "$PORTCLASH_SECRET_CONS_PID" 2>/dev/null; PORTCLASH_SECRET_CONS_PID=""
     [ -n "$PORTCLASH_HTTP_PID" ] && kill "$PORTCLASH_HTTP_PID" 2>/dev/null; PORTCLASH_HTTP_PID=""
+    [ -n "$CTRLLEAK_CONN_PID" ] && kill "$CTRLLEAK_CONN_PID" 2>/dev/null; CTRLLEAK_CONN_PID=""
+    [ -n "$CTRLLEAK_LISTEN_PID" ] && kill "$CTRLLEAK_LISTEN_PID" 2>/dev/null; CTRLLEAK_LISTEN_PID=""
     for pid in "${MIX_PIDS[@]}"; do kill "$pid" 2>/dev/null; done; MIX_PIDS=()
     [ -n "$BORE_SERVER_PID"  ] && kill "$BORE_SERVER_PID"  2>/dev/null; BORE_SERVER_PID=""
     sleep 0.5
@@ -460,6 +471,243 @@ fi
 kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
 kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
 sleep 0.5
+
+# ── Test T-RF4: --accept-routes (the SELECTIVE list) ──────────────────────────
+# `filter_accepted` is well unit-tested, but until now NO field gate passed
+# `--accept-routes` at all -- the suite used `--accept-all-routes` 33 times and
+# the selective form zero. The selective form is the one with a matching RULE
+# (a flag CIDR must EQUAL or be a SUPERNET of an advertised CIDR), and a rule
+# that resolves correctly in a pure function can still fail to reach the routing
+# table. Both directions are checked in one gate: a CIDR that should match, and
+# an unrelated one that must not.
+echo "=== T-RF4: --accept-routes selective (match and non-match) ==="
+rf4_case() { # <label> <accept-cidr> <expect yes|no>
+    local label="$1" cidr="$2" want="$3" got
+    ip netns exec ns1 "$BORE" vpn listen \
+        --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "t-rf4-$label" \
+        --advertise "$FAKE_LAN" \
+        >"$BORE_LOG.listen_rf4_$label" 2>&1 &
+    BORE_LISTEN_PID=$!
+    sleep 0.5
+    ip netns exec ns2 "$BORE" vpn connect \
+        --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "t-rf4-$label" \
+        --accept-routes "$cidr" \
+        >"$BORE_LOG.connect_rf4_$label" 2>&1 &
+    BORE_CONNECT_PID=$!
+    if wait_for_log "$BORE_LOG.listen_rf4_$label" "vpn link paired\|VpnReady" 10; then
+        sleep 1
+        if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$FAKE_LAN"; then got=yes; else got=no; fi
+        if [ "$got" = "$want" ]; then
+            pass "T-RF4/$label: --accept-routes $cidr -> route $got (expected $want)"
+        else
+            fail "T-RF4/$label: --accept-routes $cidr -> route $got (expected $want)"
+        fi
+    else
+        fail "T-RF4/$label: listener did not pair"
+    fi
+    kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+    kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+    sleep 0.5
+}
+# Exact match, and a supernet of it: both must accept.
+rf4_case exact    "$FAKE_LAN"      yes
+rf4_case supernet "192.168.0.0/16" yes
+# An unrelated block must NOT accept -- this is the half that makes the gate
+# discriminating rather than a test that always passes.
+rf4_case unrelated "10.0.0.0/8"    no
+
+# ── Test T-RF5: --refuse-all-routes ──────────────────────────────────────────
+# Same OUTCOME as the default (T-RF1), different INPUT: the flag exists so a
+# script can state the policy explicitly. Zero field coverage before this. It
+# must deny, and it must not make the link fail.
+echo "=== T-RF5: --refuse-all-routes (explicit deny) ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-rf5-refuse-all \
+    --advertise "$FAKE_LAN" \
+    >"$BORE_LOG.listen_rf5" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-rf5-refuse-all \
+    --accept-all-routes --refuse-all-routes \
+    >"$BORE_LOG.connect_rf5" 2>&1 &
+BORE_CONNECT_PID=$!
+if wait_for_log "$BORE_LOG.listen_rf5" "vpn link paired\|VpnReady" 10; then
+    sleep 1
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$FAKE_LAN"; then
+        fail "T-RF5: route installed despite --refuse-all-routes (it must beat --accept-all-routes)"
+    else
+        pass "T-RF5: --refuse-all-routes beats --accept-all-routes"
+    fi
+    NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    if [ -n "$NS1_OVL" ] && ip netns exec ns2 ping -c 1 -W 3 "$NS1_OVL" >/dev/null 2>&1; then
+        pass "T-RF5: overlay still works with every route refused"
+    else
+        fail "T-RF5: overlay ping failed -- refusing routes must not break the link"
+    fi
+else
+    fail "T-RF5: listener did not pair"
+fi
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
+# ── Test T-RF6: --no-route-manage ────────────────────────────────────────────
+# The flag is plumbed through ten sites in src/vpn.rs and was exercised by
+# nothing: no unit test, no netns gate, no perf stage. Its whole content is "do
+# not do something", which is the kind that rots silently -- the something comes
+# back and no test notices.
+#
+# The discriminating pairing is with T-RF2, which passes the SAME
+# `--accept-all-routes` and expects the route to appear. Here the policy accepts
+# the route and the flag must still keep it out of the table, while the overlay
+# keeps working: "bore does not manage routes" must not mean "bore does not
+# work".
+echo "=== T-RF6: --no-route-manage (accepted route must still not be installed) ==="
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-rf6-nrm \
+    --advertise "$FAKE_LAN" \
+    >"$BORE_LOG.listen_rf6" 2>&1 &
+BORE_LISTEN_PID=$!
+sleep 0.5
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id t-rf6-nrm \
+    --accept-all-routes --no-route-manage \
+    >"$BORE_LOG.connect_rf6" 2>&1 &
+BORE_CONNECT_PID=$!
+if wait_for_log "$BORE_LOG.listen_rf6" "vpn link paired\|VpnReady" 10; then
+    sleep 1
+    if ip netns exec ns2 ip route show 2>/dev/null | grep -q "$FAKE_LAN"; then
+        fail "T-RF6: route installed despite --no-route-manage (T-RF2 shows the policy accepted it)"
+    else
+        pass "T-RF6: --no-route-manage installed no route for an ACCEPTED subnet"
+    fi
+    NS2_OVL=$(ip netns exec ns2 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    NS1_OVL=$(ip netns exec ns1 ip addr show bore0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    if [ -n "$NS1_OVL" ] && [ -n "$NS2_OVL" ]; then
+        if ip netns exec ns2 ping -c 1 -W 3 "$NS1_OVL" >/dev/null 2>&1; then
+            pass "T-RF6: overlay still reachable (the TUN's own connected route is not 'managed')"
+        else
+            fail "T-RF6: overlay ping failed -- --no-route-manage must not break the link itself"
+        fi
+    fi
+else
+    fail "T-RF6: listener did not pair"
+fi
+kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+sleep 0.5
+
+# ── Test T-PINMTU: --pin-mtu is OBSERVE-ONLY ─────────────────────────────────
+# BW-F4 says the PMTU monitor under `--pin-mtu` warns about a path-MTU shortfall
+# and NEVER resizes the TUN. The pure decision functions (`pmtu_decision`,
+# `pmtu_shrink_now`) are unit-tested; the flag that gates whether their answer is
+# APPLIED had no test anywhere -- not here, not in udp_nat_netns_test.sh, not in
+# tests/. `pmtu_monitor` takes a live `DirectConn` and builds its own runner, so
+# a unit test cannot reach it: this is the only layer that can.
+#
+# The gate is a PAIR and runs the control FIRST. Shrinking an intermediate link
+# is only a valid stimulus if it actually moves an unpinned TUN; if it does not
+# -- quinn may not re-probe within the window on a given kernel -- then the
+# pinned arm proves nothing and the whole gate reports SKIP rather than a pass
+# it did not earn.
+echo "=== T-PINMTU: --pin-mtu never resizes the TUN (paired with a control) ==="
+
+pinmtu_tun_mtu() { # <ns>
+    ip netns exec "$1" ip -o link show dev bore0 2>/dev/null \
+        | grep -oE 'mtu [0-9]+' | awk '{print $2}'
+}
+
+pinmtu_run() { # <label> <extra-connector-flags...> ; echoes "before after"
+    local label="$1"; shift
+    local before after i
+    ip netns exec ns1 "$BORE" vpn listen \
+        --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "t-pinmtu-$label" \
+        >"$BORE_LOG.listen_pin_$label" 2>&1 &
+    BORE_LISTEN_PID=$!
+    sleep 0.5
+    ip netns exec ns2 "$BORE" vpn connect \
+        --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id "t-pinmtu-$label" "$@" \
+        >"$BORE_LOG.connect_pin_$label" 2>&1 &
+    BORE_CONNECT_PID=$!
+
+    if ! wait_for_log "$BORE_LOG.connect_pin_$label" "upgraded to direct\|bridge switched to direct" 45; then
+        # Kill BEFORE returning: an early `return` that leaves two bore
+        # processes running hands every later gate in this file a peer it did
+        # not start, on the same overlay addresses.
+        kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+        kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+        sleep 1
+        echo "NODIRECT"; return
+    fi
+    # Let the MTU settle before disturbing it, or the "before" reading is taken
+    # mid-climb and any later difference is the climb, not the stimulus.
+    sleep 12
+    before="$(pinmtu_tun_mtu ns2)"
+
+    # The stimulus: squeeze the path well below the TUN's own MTU.
+    ip netns exec ns0 ip link set dev veth0s mtu 1280 2>/dev/null
+    ip netns exec ns0 ip link set dev veth1s mtu 1280 2>/dev/null
+    ip netns exec ns1 ip link set dev veth0p mtu 1280 2>/dev/null
+    ip netns exec ns2 ip link set dev veth1p mtu 1280 2>/dev/null
+
+    # The monitor ticks every 5 s and shrinks on a single low sample.
+    after="$before"
+    for i in $(seq 1 12); do
+        sleep 5
+        after="$(pinmtu_tun_mtu ns2)"
+        [ -n "$after" ] && [ "$after" != "$before" ] && break
+    done
+
+    # Restore, or every later test runs on a 1280 path.
+    ip netns exec ns0 ip link set dev veth0s mtu 1500 2>/dev/null
+    ip netns exec ns0 ip link set dev veth1s mtu 1500 2>/dev/null
+    ip netns exec ns1 ip link set dev veth0p mtu 1500 2>/dev/null
+    ip netns exec ns2 ip link set dev veth1p mtu 1500 2>/dev/null
+
+    kill "$BORE_LISTEN_PID" 2>/dev/null; BORE_LISTEN_PID=""
+    kill "$BORE_CONNECT_PID" 2>/dev/null; BORE_CONNECT_PID=""
+    sleep 1
+    echo "$before $after"
+}
+
+PIN_CTRL="$(pinmtu_run control)"
+if [ "$PIN_CTRL" = NODIRECT ]; then
+    skip "T-PINMTU: control arm never reached the direct path -- stimulus not applicable"
+else
+    # `read` rather than `set --`: this runs in the script BODY, where `set --`
+    # would overwrite the script's own positional parameters for everything that
+    # follows.
+    read -r CTRL_BEFORE CTRL_AFTER <<<"$PIN_CTRL"
+    if [ -z "$CTRL_BEFORE" ] || [ "$CTRL_BEFORE" = "$CTRL_AFTER" ]; then
+        skip "T-PINMTU: shrinking the path did not move an UNPINNED TUN ($CTRL_BEFORE -> $CTRL_AFTER); the pinned arm could not discriminate, so it is not run"
+    else
+        pass "T-PINMTU/control: unpinned TUN followed the path ($CTRL_BEFORE -> $CTRL_AFTER)"
+        PIN_ON="$(pinmtu_run pinned --pin-mtu)"
+        if [ "$PIN_ON" = NODIRECT ]; then
+            skip "T-PINMTU/pinned: never reached the direct path"
+        else
+            read -r PIN_BEFORE PIN_AFTER <<<"$PIN_ON"
+            if [ "$PIN_BEFORE" = "$PIN_AFTER" ]; then
+                pass "T-PINMTU/pinned: TUN held at $PIN_BEFORE while the control moved (observe-only)"
+            else
+                fail "T-PINMTU/pinned: --pin-mtu resized the TUN $PIN_BEFORE -> $PIN_AFTER (must never resize)"
+            fi
+            # The other half of BW-F4: it must still SAY something.
+            # The STRUCTURED FIELD, not a phrase: `pinned_mtu=` appears on the
+            # warn and on its recovery INFO and nowhere else, so it cannot be
+            # matched by a log line that merely mentions the flag. An earlier
+            # draft grepped for "pin-mtu", which the real message
+            # ("pinned --mtu exceeds the direct path MTU...") does not contain
+            # at all -- the assertion would have failed on correct code.
+            if grep -q 'pinned_mtu=' "$BORE_LOG.connect_pin_pinned" 2>/dev/null; then
+                pass "T-PINMTU/pinned: the monitor announced observe-only mode"
+            else
+                fail "T-PINMTU/pinned: no observe-only announcement -- a silent pin is indistinguishable from a broken monitor"
+            fi
+        fi
+    fi
+fi
 
 # ── Test 3: relay fallback ─────────────────────────────────────────────────────
 echo "=== Test 3: relay fallback (block UDP between peers) ==="
@@ -2462,7 +2710,12 @@ if wait_for_log "$BORE_LOG.natkill_listen" "vpn link paired" 10; then
     if wait_for_log "$BORE_LOG.natkill_listen2" "vpn link paired" 15; then
         sleep 1
         # nft table should exist exactly once (reclaimed and re-created)
-        NFT_COUNT=$(ip netns exec ns1 nft list tables 2>/dev/null | grep -c "bore_vpn_t-natkill" || echo 0)
+        # `|| true`, not `|| echo 0`: on no match grep already PRINTS 0 and then
+        # exits 1, so `|| echo 0` appends a second line and the comparison sees
+        # "0\n0". `|| true` also stops the non-match from killing the whole
+        # harness under `set -euo pipefail` -- which would exit 0 through the
+        # cleanup trap and read as a pass.
+        NFT_COUNT=$(ip netns exec ns1 nft list tables 2>/dev/null | grep -c "bore_vpn_t-natkill" || true)
         if [ "$NFT_COUNT" = "1" ]; then
             pass "T-NATKILL: nft table reclaimed and re-created (count=1)"
         else
@@ -2828,8 +3081,11 @@ fi
 # Hub data plane established: both spokes brought up their overlay TUN. (Spoke→spoke
 # is blocked by isolation by design — see T-HUBNAT2 — and the hub gateway overlay
 # addressing is config-specific, so assert the TUNs are up rather than a fixed IP.)
-HUB_S2=$(ip netns exec ns2 ip addr show bore0 2>/dev/null | grep -c "inet ")
-HUB_S3=$(ip netns exec ns3 ip addr show bore0 2>/dev/null | grep -c "inet ")
+# `|| true` for the same reason as T-NATKILL above: a spoke whose TUN never came
+# up is the FAILURE this check exists to report, and without it grep's exit 1
+# ends the run through the cleanup trap with status 0 instead.
+HUB_S2=$(ip netns exec ns2 ip addr show bore0 2>/dev/null | grep -c "inet " || true)
+HUB_S3=$(ip netns exec ns3 ip addr show bore0 2>/dev/null | grep -c "inet " || true)
 if [ "${HUB_S2:-0}" -ge 1 ] && [ "${HUB_S3:-0}" -ge 1 ]; then
     pass "T-STRESS-MIX: hub spokes ns2+ns3 overlay TUN up (hub data plane established)"
     MIX_CONN_OK=$((MIX_CONN_OK + 1))
@@ -2881,7 +3137,99 @@ for pid in "${MIX_PIDS[@]}"; do kill "$pid" 2>/dev/null; done
 MIX_PIDS=()
 sleep 1
 
+# ── Test T-CTRLLEAK: one reconnect must not cost one control connection ───────
+# The `yamux::Connection` lives in a DETACHED driver task, and `drive()` used to
+# leave its loop only when the PEER closed. Both ends run that same driver, so
+# neither ever initiated the close: a finished connection sat `ESTABLISHED` at
+# both ends forever, answering the `SO_KEEPALIVE` probes because the socket
+# really was still open. MEASURED on the real path as 1 -> 2 -> 3 -> 4 sockets
+# across three reconnects, none reaped in 120 s, and independently as one
+# descriptor per reconnect in /proc/<pid>/fd.
+#
+# This is the netns twin of `scripts/perf/staging/vpn/vpn_ctrl_leak.sh`: same
+# assertion, no VM, no WAN, so it runs in CI and catches a REGRESSION rather
+# than only confirming the original fix.
+#
+# `--relay-only` on purpose: the defect is in the control connection, which is
+# identical on both paths, and the direct path would add its 10 s idle timeout
+# to every cycle for nothing.
+echo "=== T-CTRLLEAK: control connections after repeated reconnects ==="
+CTRLLEAK_CYCLES=3
+
+ip netns exec ns1 "$BORE" vpn listen \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id ctrlleak --relay-only \
+    >"$BORE_LOG.ctrlleak_listen" 2>&1 &
+CTRLLEAK_LISTEN_PID=$!
+sleep 1
+
+ip netns exec ns2 "$BORE" vpn connect \
+    --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id ctrlleak --relay-only \
+    --auto-reconnect \
+    >"$BORE_LOG.ctrlleak_conn" 2>&1 &
+CTRLLEAK_CONN_PID=$!
+
+# `ss` inside ns2 toward the server's control port. Counting by DESTINATION
+# rather than by pid keeps this honest even if the process is restarted by
+# something else: every socket toward 7835 from this namespace belongs to this
+# connector.
+ctrlleak_socks() {
+    ip netns exec ns2 ss -tn state established "dst $SERVER_IP_NS0_A:7835" 2>/dev/null \
+        | grep -c "$SERVER_IP_NS0_A:7835" || true
+}
+ctrlleak_fds() { ls "/proc/$CTRLLEAK_CONN_PID/fd" 2>/dev/null | wc -l; }
+
+if ! wait_for_log "$BORE_LOG.ctrlleak_conn" "vpn link bridge starting" 20; then
+    fail "T-CTRLLEAK: connector never paired (cannot test the reconnect path)"
+else
+    sleep 2
+    CTRLLEAK_S0=$(ctrlleak_socks); CTRLLEAK_F0=$(ctrlleak_fds)
+    echo "  start: control sockets=$CTRLLEAK_S0 fds=$CTRLLEAK_F0"
+
+    for c in $(seq 1 "$CTRLLEAK_CYCLES"); do
+        kill -TERM "$CTRLLEAK_LISTEN_PID" 2>/dev/null
+        wait "$CTRLLEAK_LISTEN_PID" 2>/dev/null
+        # The connector must actually go round again: counting sockets without
+        # proving a reconnect happened would pass trivially.
+        WANT=$((c + 1))
+        for _ in $(seq 1 300); do
+            STARTS=$(grep -c "vpn connector starting" "$BORE_LOG.ctrlleak_conn" 2>/dev/null || echo 0)
+            [ "${STARTS:-0}" -ge "$WANT" ] && break
+            sleep 0.1
+        done
+        ip netns exec ns1 "$BORE" vpn listen \
+            --to "$SERVER_IP_NS0_A" --secret "$SECRET" --id ctrlleak --relay-only \
+            >>"$BORE_LOG.ctrlleak_listen" 2>&1 &
+        CTRLLEAK_LISTEN_PID=$!
+        sleep 3
+        echo "  cycle $c: control sockets=$(ctrlleak_socks) fds=$(ctrlleak_fds)"
+    done
+
+    # A settle window, because a socket on its way out through a normal close is
+    # not a leak and this assertion must not race one.
+    sleep 5
+    CTRLLEAK_S1=$(ctrlleak_socks); CTRLLEAK_F1=$(ctrlleak_fds)
+    CTRLLEAK_STARTS=$(grep -c "vpn connector starting" "$BORE_LOG.ctrlleak_conn" 2>/dev/null || echo 0)
+    echo "  after $CTRLLEAK_CYCLES reconnects ($CTRLLEAK_STARTS attempts): control sockets=$CTRLLEAK_S1 fds=$CTRLLEAK_F1"
+
+    if [ "${CTRLLEAK_STARTS:-0}" -lt $((CTRLLEAK_CYCLES + 1)) ]; then
+        fail "T-CTRLLEAK: only $CTRLLEAK_STARTS connector attempts, expected $((CTRLLEAK_CYCLES + 1)) — the stimulus did not happen"
+    elif [ "${CTRLLEAK_S1:-0}" -eq 1 ]; then
+        pass "T-CTRLLEAK: exactly one control connection after $CTRLLEAK_CYCLES reconnects (fds $CTRLLEAK_F0 -> $CTRLLEAK_F1)"
+    else
+        fail "T-CTRLLEAK: $CTRLLEAK_S1 control connections after $CTRLLEAK_CYCLES reconnects (expected 1) — the mux driver is leaking finished connections again"
+        ip netns exec ns2 ss -tn state established "dst $SERVER_IP_NS0_A:7835" 2>/dev/null | sed 's/^/    /'
+    fi
+fi
+
+kill "$CTRLLEAK_CONN_PID" "$CTRLLEAK_LISTEN_PID" 2>/dev/null
+CTRLLEAK_CONN_PID=""; CTRLLEAK_LISTEN_PID=""
+sleep 1
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== Results: PASS=$PASS FAIL=$FAIL ==="
+echo "=== Results: PASS=$PASS FAIL=$FAIL SKIP=$SKIP ==="
+if [ "$SKIP" -gt 0 ]; then
+    echo "    $SKIP gate(s) did not run -- their stimulus did not apply. A skip is"
+    echo "    not a pass: grep 'SKIP:' above before reading this suite as green."
+fi
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

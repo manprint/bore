@@ -54,7 +54,9 @@ cleanup(){
 }
 trap cleanup EXIT
 
-med(){ sort -n | awk '{v[NR]=$1} END{ if(NR==0){print "-";exit} print (NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2 }'; }
+# LC_ALL=C: V-11 -- under a comma-decimal locale `sort -n` orders
+# {397.46, 264.01, 408} as {408, 264.01, 397.46}, and this IS the median.
+med(){ LC_ALL=C sort -n | awk '{v[NR]=$1} END{ if(NR==0){print "-";exit} print (NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2 }'; }
 # CPU seconds to two decimals: a whole-second reading is useless here, because
 # a fast cell finishes in about a second and every bill would round to 0 or 1.
 cpu_of(){ # <pid> -> CPU seconds (user+sys), two decimals

@@ -12,9 +12,19 @@
 # the direct path still wins consistently the effect is real and belongs to the
 # tunnel; if it vanishes, the W1 reversal was the multi-connection regime and
 # must not be quoted as a transport verdict.
+# TRANSFER SIZE, AND WHY IT IS NOW A VARIABLE
+# -------------------------------------------
+# The 96 MiB in this stage was sized for WiFi, where it lasted about two
+# seconds. Wired the same transfer lasts 0.83 s at 922 Mbit/s, most of it TCP
+# slow start, so the number it produces is a RAMP rather than a rate -- and the
+# spread says so: the wired run of this campaign's public stages produced paired
+# ratios from 0.623 to 1.323 on arms that should have agreed. `XFER_MB` is the
+# TOTAL moved per arm; the wired default is 384 MiB (~3.3 s at line rate) and
+# `XFER_MB=96` reproduces the original figures exactly.
 . "$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
 RAWCLI="$(cd "$(dirname "$0")/../.." && pwd)/raw_client.py"
-RP=5053; R=9044; Q=9045; PER=$((96*1048576))
+XFER_MB="${XFER_MB:-384}"
+RP=5053; R=9044; Q=9045; PER=$(( XFER_MB*1048576 ))
 UP=()
 up() { vm "setsid nohup \$HOME/bore local $RP --port $1 --to '$BORE_TO' --secret '$BORE_SECRET' --carriers 1 $2 \
         > \$HOME/out/wsdl1-$1.log 2>&1 </dev/null & true" >/dev/null 2>&1
@@ -25,7 +35,7 @@ trap 'down' EXIT
 up "$R" ""      || { echo "relay arm failed to register"; exit 1; }
 up "$Q" "--udp" || { echo "quic arm failed to register"; exit 1; }
 g() { python3 "$RAWCLI" get "$BORE_GW" "$1" "$PER" 1 2>/dev/null | grep -oE 'MBs=[0-9.]+' | cut -d= -f2; }
-echo "=== W1c download, ONE connection, 96 MiB, six pairs, order alternating ==="
+echo "=== W1c download, ONE connection, ${XFER_MB} MiB, six pairs, order alternating ==="
 printf '  %-6s %10s %10s %8s\n' pair relay_MBs quic_MBs ratio
 RS=()
 for i in 1 2 3 4 5 6; do

@@ -14,19 +14,112 @@ use std::future::poll_fn;
 #[cfg(feature = "ssh-gateway")]
 use std::future::Future;
 use std::io;
-#[cfg(feature = "ssh-gateway")]
 use std::pin::Pin;
-#[cfg(feature = "ssh-gateway")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 
+use futures_util::task::AtomicWaker;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use yamux::{Config, Connection, Mode};
 
 /// A multiplexed substream exposing Tokio's async I/O traits.
-pub type Stream = Compat<yamux::Stream>;
+pub type Stream = Compat<TrackedStream>;
+
+/// Everything that can still make a connection useful, counted in one place:
+/// every live [`Opener`], the [`Acceptor`], and every substream handed out.
+///
+/// The `yamux::Connection` lives in a detached driver task, so nothing the
+/// caller holds owns it and nothing the caller drops takes it away. Before this
+/// existed the driver left its loop only on `Step::Done` — which needs the
+/// *peer* to close — and both peers run this same driver, so neither ever
+/// initiated it: a mutual liveness deadlock that held one `ESTABLISHED` socket
+/// per finished connection at both ends. MEASURED on the real path: a VPN
+/// connector with `--auto-reconnect` leaked exactly one control connection per
+/// reconnect (1→2→3→4, none reaped in 120 s), confirmed independently through
+/// `/proc/<pid>/fd`. See `docs/vpn/VPN_CTRL_CONN_LEAK.md`.
+#[derive(Debug, Default)]
+struct Liveness {
+    handles: AtomicUsize,
+    waker: AtomicWaker,
+}
+
+/// One count on a connection's [`Liveness`]. Held by each `Opener`, by the
+/// `Acceptor`, and by every substream; dropping the last one wakes the driver,
+/// which then closes the connection.
+///
+/// Counting SUBSTREAMS is what makes this safe: substreams routinely outlive
+/// the `Opener` (the relay hands a stream to a task and drops the opener), so
+/// "close when the opener is gone" would tear down live traffic. Only a
+/// connection with no handles AND no streams has nothing left to do.
+#[derive(Debug)]
+struct ConnRef(Arc<Liveness>);
+
+impl ConnRef {
+    fn new(liveness: &Arc<Liveness>) -> Self {
+        liveness.handles.fetch_add(1, Ordering::Relaxed);
+        ConnRef(Arc::clone(liveness))
+    }
+}
+
+impl Clone for ConnRef {
+    fn clone(&self) -> Self {
+        ConnRef::new(&self.0)
+    }
+}
+
+impl Drop for ConnRef {
+    fn drop(&mut self) {
+        // `AcqRel` so the driver's `Acquire` load cannot observe a stale count:
+        // the wake and the decrement must not be reordered around each other.
+        if self.0.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.waker.wake();
+        }
+    }
+}
+
+/// A `yamux` substream that keeps its connection's driver alive for as long as
+/// it exists.
+///
+/// This is the inner type of [`Stream`] and is otherwise transparent: every
+/// read/write delegates to the substream unchanged. It exists only to carry a
+/// [`ConnRef`], so a caller that holds a substream after dropping the `Opener`
+/// and `Acceptor` — the ordinary relay shape — still owns a live connection.
+#[derive(Debug)]
+pub struct TrackedStream {
+    inner: yamux::Stream,
+    _alive: ConnRef,
+}
+
+impl futures_util::io::AsyncRead for TrackedStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl futures_util::io::AsyncWrite for TrackedStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_close(cx)
+    }
+}
 
 /// Any byte stream `yamux` can run over (a plain TCP socket, a TLS stream, ...).
 pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
@@ -79,6 +172,9 @@ fn disconnected() -> io::Error {
 #[derive(Clone)]
 pub struct Opener {
     requests: mpsc::Sender<oneshot::Sender<io::Result<Stream>>>,
+    /// Keeps the connection's driver alive: a pool that holds only an opener
+    /// (the server's `CarrierPool` does exactly that) still owns a connection.
+    _alive: ConnRef,
 }
 
 impl Opener {
@@ -198,6 +294,8 @@ impl LinkOpener {
 /// Handle for accepting inbound substreams opened by the peer.
 pub struct Acceptor {
     inbound: mpsc::Receiver<Stream>,
+    /// Keeps the connection's driver alive; see [`Liveness`].
+    _alive: ConnRef,
 }
 
 impl Acceptor {
@@ -220,13 +318,19 @@ pub fn server<S: Transport>(socket: S) -> (Opener, Acceptor) {
 fn spawn_driver<S: Transport>(conn: Connection<Compat<S>>) -> (Opener, Acceptor) {
     let (open_tx, open_rx) = mpsc::channel(32);
     let (inbound_tx, inbound_rx) = mpsc::channel(32);
-    tokio::spawn(drive(conn, open_rx, inbound_tx));
-    (
-        Opener { requests: open_tx },
-        Acceptor {
-            inbound: inbound_rx,
-        },
-    )
+    let liveness: Arc<Liveness> = Arc::default();
+    // Both handles are counted BEFORE the driver starts, so the driver can
+    // never observe a zero count in the gap between spawning and returning.
+    let opener = Opener {
+        requests: open_tx,
+        _alive: ConnRef::new(&liveness),
+    };
+    let acceptor = Acceptor {
+        inbound: inbound_rx,
+        _alive: ConnRef::new(&liveness),
+    };
+    tokio::spawn(drive(conn, open_rx, inbound_tx, liveness));
+    (opener, acceptor)
 }
 
 /// Drive the connection: this is the single owner of the `yamux::Connection`.
@@ -239,6 +343,7 @@ async fn drive<S: Transport>(
     mut conn: Connection<Compat<S>>,
     mut open_rx: mpsc::Receiver<oneshot::Sender<io::Result<Stream>>>,
     inbound_tx: mpsc::Sender<Stream>,
+    liveness: Arc<Liveness>,
 ) {
     enum Step {
         Inbound(yamux::Stream),
@@ -254,6 +359,16 @@ async fn drive<S: Transport>(
 
     loop {
         let step = poll_fn(|cx| {
+            // Register FIRST, then read the count: the reverse order can miss
+            // the wake of a handle dropped between the two.
+            liveness.waker.register(cx.waker());
+            if liveness.handles.load(Ordering::Acquire) == 0 {
+                // No opener, no acceptor, no substream: nothing can ever ask
+                // this connection for anything again. Closing here is what
+                // makes the peer's own driver reach `Step::Done`, so one side
+                // noticing releases the socket at BOTH ends.
+                return Poll::Ready(Step::Done);
+            }
             if pending.is_none() && !openers_gone {
                 match open_rx.poll_recv(cx) {
                     Poll::Ready(Some(reply)) => pending = Some(reply),
@@ -279,7 +394,7 @@ async fn drive<S: Transport>(
                 if let Some(reply) = pending.take() {
                     let _ = reply.send(
                         result
-                            .map(FuturesAsyncReadCompatExt::compat)
+                            .map(|s| track(s, &liveness))
                             .map_err(io::Error::other),
                     );
                 }
@@ -287,13 +402,23 @@ async fn drive<S: Transport>(
             Step::Inbound(stream) => {
                 // If the `Acceptor` is gone, drop the stream but keep driving for
                 // any streams still in flight.
-                let _ = inbound_tx.send(stream.compat()).await;
+                let _ = inbound_tx.send(track(stream, &liveness)).await;
             }
             Step::Done => break,
         }
     }
 
     let _ = poll_fn(|cx| conn.poll_close(cx)).await;
+}
+
+/// Hand a raw `yamux` substream to a caller with a [`ConnRef`] attached, so the
+/// connection stays alive exactly as long as the substream does.
+fn track(stream: yamux::Stream, liveness: &Arc<Liveness>) -> Stream {
+    TrackedStream {
+        inner: stream,
+        _alive: ConnRef::new(liveness),
+    }
+    .compat()
 }
 
 /// Write the STREAM_READY marker with optional caller IP forwarding.
@@ -378,6 +503,156 @@ pub async fn read_stream_ready<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::{timeout, Duration};
+
+    // Connection liveness group.
+    //
+    // These four tests are ONE statement with four faces: a connection stays
+    // alive exactly as long as something can still use it, and not one moment
+    // longer. The first is the red-check for the measured leak (it times out
+    // without `Liveness`); the other three refuse the over-eager fixes that
+    // would pass the first one while tearing down live traffic — which is why
+    // they are here rather than in a follow-up. Real sockets throughout:
+    // `tokio::io::duplex` cannot express "the peer never closes".
+
+    /// A mux connection whose handles are ALL gone has nothing left to do, and
+    /// must close rather than park on the socket forever.
+    ///
+    /// RED-CHECK: with the `Liveness` count removed from `drive()`, this test
+    /// times out — the production symptom exactly (one leaked `ESTABLISHED`
+    /// control connection per VPN reconnect, at BOTH ends, because both peers
+    /// run this same driver and each waits for the other to close first).
+    #[tokio::test]
+    async fn a_connection_whose_handles_are_all_dropped_closes_itself() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // The PEER never closes first — it only reports what it observes.
+        let peer = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (_opener, mut acceptor) = server(sock);
+            acceptor.accept().await.is_none() // None <=> the client closed
+        });
+
+        let (opener, acceptor) = client(TcpStream::connect(addr).await.unwrap());
+        drop(opener);
+        drop(acceptor);
+
+        let observed_close = timeout(Duration::from_secs(5), peer)
+            .await
+            .expect("client never closed a connection it had finished with")
+            .unwrap();
+        assert!(observed_close);
+    }
+
+    /// The other half of the same invariant, and the reason the obvious fix is
+    /// wrong: substreams routinely OUTLIVE the `Opener` (the relay hands a
+    /// stream to a task and drops the opener), so "exit when the Opener is
+    /// gone" would tear down live traffic.
+    #[tokio::test]
+    async fn a_connection_with_a_live_substream_keeps_driving() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (_o, mut acceptor) = server(sock);
+            let mut s = acceptor.accept().await.expect("inbound substream");
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).await.unwrap();
+            s.write_all(b"pong").await.unwrap();
+            s.flush().await.unwrap();
+        });
+
+        let (opener, acceptor) = client(TcpStream::connect(addr).await.unwrap());
+        let mut stream = opener.open().await.unwrap();
+        drop(opener); // the ordinary relay shape
+        drop(acceptor);
+
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the connection was torn down under a live substream")
+            .unwrap();
+        assert_eq!(&buf, b"pong");
+        peer.await.unwrap();
+    }
+
+    /// ...and it closes as soon as that last substream goes too. This is the
+    /// test that pins the count itself: the two above are also satisfied by
+    /// "close when the Opener AND Acceptor are gone", which would fail this one
+    /// the other way round (it would close early and the write would fail).
+    #[tokio::test]
+    async fn a_connection_closes_when_its_last_substream_is_dropped() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (_o, mut acceptor) = server(sock);
+            let mut s = acceptor.accept().await.expect("inbound substream");
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).await.unwrap();
+            // Still open here: the client holds the substream.
+            drop(s);
+            acceptor.accept().await.is_none()
+        });
+
+        let (opener, acceptor) = client(TcpStream::connect(addr).await.unwrap());
+        let mut stream = opener.open().await.unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+        drop(opener);
+        drop(acceptor);
+        drop(stream);
+
+        let observed_close = timeout(Duration::from_secs(5), peer)
+            .await
+            .expect("the connection outlived its last substream")
+            .unwrap();
+        assert!(observed_close);
+    }
+
+    /// An `Opener` on its own keeps the connection: the server's `CarrierPool`
+    /// stores exactly that (`LinkOpener::Mux(Opener)`) and opens substreams
+    /// through it for the whole life of a tunnel, long after the acceptor that
+    /// came with it was dropped.
+    #[tokio::test]
+    async fn an_opener_alone_keeps_the_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (_o, mut acceptor) = server(sock);
+            let mut s = acceptor.accept().await.expect("inbound substream");
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).await.unwrap();
+            s.write_all(b"pong").await.unwrap();
+            s.flush().await.unwrap();
+        });
+
+        let (opener, acceptor) = client(TcpStream::connect(addr).await.unwrap());
+        drop(acceptor);
+        // A round trip AFTER the acceptor is gone, on a substream opened after
+        // it is gone: nothing here would work if dropping it closed the link.
+        let mut stream = timeout(Duration::from_secs(5), opener.open())
+            .await
+            .expect("dropping the Acceptor closed the connection")
+            .unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("no answer on a substream opened after the Acceptor died")
+            .unwrap();
+        assert_eq!(&buf, b"pong");
+        peer.await.unwrap();
+    }
 
     #[tokio::test]
     async fn readiness_legacy_plain() {

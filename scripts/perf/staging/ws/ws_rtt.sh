@@ -7,14 +7,25 @@
 # median comes from sort(1) instead.)
 set -uo pipefail
 . "$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
-for hp in "$V:22" "$SRV:443" "$GW:443"; do
-  h=${hp%%:*}; p=${hp##*:}
+# The LABEL is the role, never the address. A results file that names the host
+# it probed has published a coordinate, and these files get quoted into
+# documents -- which is exactly how the three live hits of the first
+# `secret_scan` run got there. The role is also what a reader needs: nobody
+# reads an RTT table to find out which IP answered.
+for hp in "test-vm:$V:22" "server:$SRV:443" "gateway:$GW:443"; do
+  lbl=${hp%%:*}; rest=${hp#*:}; h=${rest%%:*}; p=${rest##*:}
   f=$(mktemp)
   for i in $(seq 12); do
     curl -s -o /dev/null --connect-timeout 5 --max-time 6 -w '%{time_connect}\n' \
       "http://$h:$p/" 2>/dev/null | grep -v '^0.000000$' >> "$f" || true
   done
-  sort -n "$f" | LC_ALL=C awk -v l="$hp" '{v[NR]=$1*1000; s+=$1*1000}
+  # LC_ALL=C on the SORT as well as on the awk (V-11). Under a comma-decimal
+  # locale `sort -n` orders {397.46, 264.01, 408} as {408, 264.01, 397.46} --
+  # MEASURED here, on this workstation, under it_IT.UTF-8. It happens not to
+  # bite today because curl prints every sample as `0.nnnnnn`, where numeric
+  # and lexical order coincide; one sample of 1 s or more and the median this
+  # stage publishes would be wrong with nothing in the output to show it.
+  LC_ALL=C sort -n "$f" | LC_ALL=C awk -v l="$lbl" '{v[NR]=$1*1000; s+=$1*1000}
     END{if(NR) printf "  %-26s min=%.2f median=%.2f mean=%.2f ms over %d\n", l, v[1], v[int((NR+1)/2)], s/NR, NR; else printf "  %-26s no samples\n", l}'
   rm -f "$f"
 done

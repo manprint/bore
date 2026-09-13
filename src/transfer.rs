@@ -2800,6 +2800,12 @@ fn format_bytes(bytes: u64) -> String {
 
 fn read_confirmation_line() -> Result<String> {
     if let Some(val) = test_seam::confirm_response() {
+        // Blocking on purpose: this whole function runs inside `spawn_blocking`,
+        // and the point of the delay is to make the CALLER's `timeout` the
+        // thing under test.
+        if let Some(delay) = test_seam::confirm_delay() {
+            std::thread::sleep(delay);
+        }
         return Ok(val);
     }
 
@@ -4354,6 +4360,7 @@ mod test_seam {
             let active = [
                 "BORE_TRANSFER_TEST_MAX_CHUNKS",
                 "BORE_TEST_CONFIRM_RESPONSE",
+                "BORE_TEST_CONFIRM_DELAY_MS",
             ]
             .iter()
             .any(|v| std::env::var(v).is_ok());
@@ -4379,6 +4386,24 @@ mod test_seam {
         std::env::var("BORE_TEST_CONFIRM_RESPONSE")
             .ok()
             .map(|v| format!("{v}\n"))
+    }
+
+    /// How long the injected confirmation should take to arrive.
+    ///
+    /// `--confirm-timeout` exists for the receiver who walked away from the
+    /// keyboard, and its whole behaviour lives in a branch that only runs when
+    /// the confirmation read takes LONGER than the bound. Without a delay that
+    /// branch is unreachable from a test: with no tty the read fails
+    /// immediately, and with `BORE_TEST_CONFIRM_RESPONSE` it answers
+    /// immediately — so the timeout would never fire and a test asserting it
+    /// would be asserting the fast path under a different name.
+    pub fn confirm_delay() -> Option<std::time::Duration> {
+        std::env::var("BORE_TEST_CONFIRM_DELAY_MS")
+            .ok()?
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis)
     }
 }
 

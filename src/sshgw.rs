@@ -110,6 +110,66 @@ pub const SSH_MIN_WINDOW_SIZE: u32 = SSH_MAX_PACKET_SIZE;
 /// connection before russh disconnects it.
 pub const SSH_MAX_AUTH_ATTEMPTS: usize = 3;
 
+/// Constant-time delay russh applies before answering a REJECTED
+/// authentication attempt (`russh::server::Config::auth_rejection_time`).
+/// This is russh's own default, restated here so the pair below is legible in
+/// one place: a wrong credential is answered slowly, on purpose.
+pub const SSH_AUTH_REJECTION_TIME: Duration = Duration::from_secs(1);
+
+/// Delay before answering the FIRST authentication attempt of a connection
+/// (`russh::server::Config::auth_rejection_time_initial`) — **zero**, and that
+/// is the whole point of this constant existing.
+///
+/// Every OpenSSH client opens with a `none` authentication request. It is not
+/// a credential guess: RFC 4252 §5.2 makes `none` the method-ENUMERATION
+/// probe, and the server's rejection is what carries the
+/// `Authentications that can continue: publickey,password,...` list the client
+/// needs before it can offer anything at all. russh's default leaves
+/// `auth_rejection_time_initial` as `None`, which falls back to
+/// `auth_rejection_time` — so the probe was answered after a full second.
+///
+/// MEASURED on the real path 2026-09-13, `ssh -v` with per-line timestamps
+/// through the jump host (workstation -> gateway on the test VM, 24 ms RTT):
+/// key exchange completed at 0.133 s, `Authentications that can continue`
+/// arrived at **1.155 s** — 1.022 s in that one gap — the channel opened at
+/// 1.202 s and the inner sshd's banner came back at 1.252 s. So of a 1.25 s
+/// session open, the gateway's own work was ~46 ms and a fixed sleep was
+/// **82 %**. It is charged to EVERY session on EVERY ingress the gateway
+/// serves (jump host, vhost `ssh -R`, public, secret), and for the jump host
+/// — where the deliverable is the round trip and not the throughput — it was
+/// the single largest term by an order of magnitude.
+///
+/// Delaying it buys nothing a defender wants: `none` carries no secret, so
+/// there is no guess to slow down, and the attacker's alternative is a fresh
+/// TCP connection plus a full key exchange, which already costs far more than
+/// the second removed. A wrong KEY or PASSWORD is still answered after
+/// `SSH_AUTH_REJECTION_TIME`, and `SSH_MAX_AUTH_ATTEMPTS` still bounds the
+/// attempts per connection. russh's own examples ship exactly this pairing.
+///
+/// Both are overridable — `BORE_SSH_AUTH_REJECT_MS` and
+/// `BORE_SSH_AUTH_REJECT_INITIAL_MS` — so an operator who wants the old
+/// behaviour, or a harsher one, does not have to edit the source.
+pub const SSH_AUTH_REJECTION_TIME_INITIAL: Duration = Duration::ZERO;
+
+/// Resolve the two rejection delays from their environment overrides.
+///
+/// Pure on purpose (it takes the raw strings rather than reading the
+/// environment itself): the environment is process-global and a test that set
+/// it would race every other test in the binary. An unparseable or absent
+/// value keeps the shipped default — a malformed knob must never silently
+/// become zero, which here would mean "answer every wrong password instantly".
+pub fn auth_rejection_times(reject: Option<&str>, initial: Option<&str>) -> (Duration, Duration) {
+    fn ms(v: Option<&str>, dflt: Duration) -> Duration {
+        v.and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(dflt)
+    }
+    (
+        ms(reject, SSH_AUTH_REJECTION_TIME),
+        ms(initial, SSH_AUTH_REJECTION_TIME_INITIAL),
+    )
+}
+
 /// How long a granted `tcpip-forward` waits for `exec`/`env` parameters
 /// before registering the tunnel with whatever it has. There is no
 /// round-trip dependency between the two SSH requests (`tcpip-forward` is a
@@ -460,12 +520,24 @@ impl SshGateway {
     /// keepalive-based reaper post-auth, but it still correctly guards the
     /// pre-auth phase, where no internal dispatch exists yet.
     pub fn russh_config(&self) -> Arc<russh::server::Config> {
+        let (auth_reject, auth_reject_initial) = auth_rejection_times(
+            std::env::var("BORE_SSH_AUTH_REJECT_MS").ok().as_deref(),
+            std::env::var("BORE_SSH_AUTH_REJECT_INITIAL_MS")
+                .ok()
+                .as_deref(),
+        );
         Arc::new(russh::server::Config {
             keys: vec![self.host_key.clone()],
             inactivity_timeout: Some(SSH_PREAUTH_GRACE),
             keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
             keepalive_max: SSH_KEEPALIVE_MAX_MISSES,
             max_auth_attempts: SSH_MAX_AUTH_ATTEMPTS,
+            // The `none` probe every OpenSSH client opens with is answered
+            // immediately; a wrong credential is still answered slowly. See
+            // SSH_AUTH_REJECTION_TIME_INITIAL for the measurement that made
+            // this a one-line, 82%-of-session-open fix.
+            auth_rejection_time: auth_reject,
+            auth_rejection_time_initial: Some(auth_reject_initial),
             // Lift russh's default 2 MiB per-channel window so a single proxied
             // connection is not BDP-capped far below the native carrier on a
             // high-RTT path (see SSH_DEFAULT_WINDOW_SIZE). `window_size` is
@@ -4809,7 +4881,62 @@ mod tests {
         assert_eq!(config.keepalive_interval, Some(SSH_KEEPALIVE_INTERVAL));
         assert_eq!(config.keepalive_max, SSH_KEEPALIVE_MAX_MISSES);
         assert_eq!(config.inactivity_timeout, Some(SSH_PREAUTH_GRACE));
+        // THE WIRING, not the policy. russh leaves
+        // `auth_rejection_time_initial` at `None`, which falls back to the
+        // 1 s `auth_rejection_time` and charges every session a full second
+        // for the `none` method-enumeration probe that opens it. `None` here
+        // is the production defect, so this assertion is what refuses it:
+        // deleting the field from `russh_config` fails this test.
+        assert_eq!(config.auth_rejection_time, SSH_AUTH_REJECTION_TIME);
+        assert_eq!(
+            config.auth_rejection_time_initial,
+            Some(SSH_AUTH_REJECTION_TIME_INITIAL)
+        );
+        assert_eq!(
+            SSH_AUTH_REJECTION_TIME_INITIAL,
+            Duration::ZERO,
+            "the initial `none` probe carries no secret to guess; delaying it \
+             only delays the client learning which methods exist"
+        );
         assert_eq!(config.max_auth_attempts, SSH_MAX_AUTH_ATTEMPTS);
+    }
+
+    /// THE POLICY, independent of the environment it is read from.
+    #[test]
+    fn auth_rejection_times_default_to_slow_credentials_and_a_fast_probe() {
+        let (reject, initial) = auth_rejection_times(None, None);
+        assert_eq!(reject, SSH_AUTH_REJECTION_TIME);
+        assert_eq!(initial, Duration::ZERO);
+    }
+
+    #[test]
+    fn auth_rejection_times_honour_both_overrides() {
+        let (reject, initial) = auth_rejection_times(Some("250"), Some("40"));
+        assert_eq!(reject, Duration::from_millis(250));
+        assert_eq!(initial, Duration::from_millis(40));
+    }
+
+    /// A MALFORMED KNOB MUST NOT BECOME ZERO. `Duration::default()` is zero,
+    /// and zero here means "answer every wrong password instantly" — the one
+    /// value an operator setting this knob would never intend. Garbage keeps
+    /// the shipped default instead.
+    #[test]
+    fn a_malformed_auth_rejection_override_keeps_the_shipped_default() {
+        for bad in ["", "abc", "-1", "1.5", "1e3"] {
+            let (reject, initial) = auth_rejection_times(Some(bad), Some(bad));
+            assert_eq!(reject, SSH_AUTH_REJECTION_TIME, "reject, from {bad:?}");
+            assert_eq!(
+                initial, SSH_AUTH_REJECTION_TIME_INITIAL,
+                "initial, from {bad:?}"
+            );
+        }
+    }
+
+    /// An operator may put the old behaviour back without editing the source.
+    #[test]
+    fn the_pre_fix_behaviour_is_still_reachable_through_the_knob() {
+        let (_, initial) = auth_rejection_times(None, Some("1000"));
+        assert_eq!(initial, Duration::from_secs(1));
     }
 
     #[test]

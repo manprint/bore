@@ -85,8 +85,8 @@ echo "  relay  : $RELAY"
 echo "  failed : $FAILED  (tunnel never registered — not a traversal result)"
 if [ "${#TTDS[@]}" -gt 0 ]; then
     echo "  time-to-direct ms: median $(printf '%s\n' "${TTDS[@]}" | med)  \
-min $(printf '%s\n' "${TTDS[@]}" | sort -n | head -1)  \
-max $(printf '%s\n' "${TTDS[@]}" | sort -n | tail -1)"
+min $(printf '%s\n' "${TTDS[@]}" | LC_ALL=C sort -n | head -1)  \
+max $(printf '%s\n' "${TTDS[@]}" | LC_ALL=C sort -n | tail -1)"
 fi
 if [ "${#REASONS[@]}" -gt 0 ]; then
     echo "  relay reasons:"

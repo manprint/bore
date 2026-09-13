@@ -16,7 +16,10 @@ set -uo pipefail
 
 
 DPORT=$DUFS_PORT
-WORK="$B/work"; mkdir -p "$WORK"
+# Was `WORK="$B/work"` with `$B` undefined -- fatal under `set -u`, and had
+# it resolved it would have written a 1 GB payload into a directory git does
+# not ignore. lib.sh's WORK is outside the tree.
+mkdir -p "$WORK"
 BIGUP="$WORK/up1g.bin"; [ -f "$BIGUP" ] || head -c 1073741824 /dev/zero > "$BIGUP"
 
 ROUNDS="${ROUNDS:-3}"

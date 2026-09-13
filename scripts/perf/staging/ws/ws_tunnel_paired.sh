@@ -70,7 +70,10 @@ for cfg in "c0auto:--carriers 0" "quic-c1:--carriers 1 --udp" "quic-c4:--carrier
     rs+=("$r")
     printf "    pair %s: ref=%-8s cfg=%-8s ratio=%-7s allowance_misses ref=+%s cfg=+%s\n" "$n" "$a" "$b" "$r" "$ae" "$be"
   done
-  printf '%s\n' "${rs[@]}" | sort -n | awk '{v[NR]=$1} END{printf "    median ratio cfg/ref: %s\n", v[int((NR+1)/2)]}'
+  # LC_ALL=C on the sort (V-11): a ratio of exactly `1` among decimals is the
+  # shape that breaks under a comma-decimal locale, and ratios are what this
+  # line publishes.
+  printf '%s\n' "${rs[@]}" | LC_ALL=C sort -n | awk '{v[NR]=$1} END{printf "    median ratio cfg/ref: %s\n", v[int((NR+1)/2)]}'
   echo "    pool cfg: carriers=$(fld "$LT" carriers) target=$(fld "$LT" carrier_target) path=$(fld "$LT" current_path) fallbacks=$(fld "$LT" direct_fallbacks)"
   down "$LT"; down "$LR"
 done

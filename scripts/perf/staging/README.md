@@ -1237,6 +1237,52 @@ do not "simplify" them back out.
 
 ---
 
+50. **A RED-CHECK ANCHORED ON TEXT ANOTHER GATE IS ALLOWED TO REWRITE PROVES
+    NOTHING, AND SAYS SO IN THE WRONG DIRECTION.** The P-14 gate runner reverted
+    the fix by substituting the exact source text of the two close monitors, then
+    ran the test expecting failure. It matched **zero** times: `cargo fmt --all`
+    runs three lines earlier in the same script and had just rewrapped
+    `let entry_ref =` onto two lines. The revert silently did nothing, the test
+    ran WITH the fix, passed, and the gate printed `INSTRUMENT FAILURE: the test
+    passes WITHOUT the fix` — a verdict that would have sent me to rewrite a
+    CORRECT test. Anchor a revert on something a formatter cannot move: here the
+    whole uncommitted diff of that one file IS the fix, so `git checkout HEAD --`
+    is exact, and the count of fix sites is asserted to be 0 after it.
+
+51. **A RESTORE THAT PRESERVES THE TIMESTAMP RESTORES THE BYTES AND NOT THE
+    BUILD.** With the anchor fixed, the red-check ran correctly (rc=101, the
+    right assertion), the fix was copied back with `cp -p` — and the next three
+    gates ran the **reverted binary**. `cp -p` preserves the saved copy's mtime
+    (14:11:01), which was OLDER than the artefacts the red-check had just built
+    from the reverted source (14:12:46), so cargo found nothing to rebuild.
+    `cargo test` then failed on the new test while `git diff` showed the fix
+    present and correct — the tree innocent, the build guilty. Restore with a
+    plain `cp` plus an explicit `touch`, and GATE THE RESTORE: re-run the one
+    test and require it to pass before continuing, or the next failure is
+    reported three gates later as "the fix is broken", which is its opposite.
+
+52. **`grep -c ... || echo 0` PRINTS TWO LINES WHEN THE COUNT IS ZERO, AND THE
+    LESSON DOES NOT TRAVEL BY ITSELF.** `grep -c` prints `0` **and** exits 1 when
+    it matches nothing, so the `||` fallback fires on top of the `0` that is
+    already there and the helper returns `0\n0`. Every later `[ "$x" -ge 1 ]`
+    then dies with "integer expression expected", the wait loop never succeeds,
+    and the stage reports a premise failure that has nothing to do with the
+    product. `jump_stab.sh` had already hit this and carries a comment saying so
+    — and it was reintroduced in `public_idle_window.sh` anyway, which is the
+    real lesson: a trap recorded only as a comment in the file that found it
+    protects exactly that file. Capture into a variable, then default
+    (`n=$(grep -c ...); echo "${n:-0}"`). `pgrep -c` has the identical
+    behaviour. Now refused by the eighth compiler in `lint.sh`.
+
+53. **A STAGE WHOSE VERDICT IS ITS CLEANUP'S EXIT STATUS.** `poolrecycle_case`
+    ended with `kill -9 "$C2" "$SRV"`, so the inner shell's status was the
+    status of that kill — and a client that had already died makes it non-zero.
+    The caller ran `out=$(poolrecycle_case) || fail "did not run"`, so a run that
+    measured everything correctly and printed a perfect result line was reported
+    as never having run. Judge the OUTPUT, not the status: cleanup is best
+    effort (`|| true`, explicit `exit 0`), and the premise check downstream is
+    the real guard because it is explicit about what it requires.
+
 ## 6. Where the results live
 
 | document | what it is |

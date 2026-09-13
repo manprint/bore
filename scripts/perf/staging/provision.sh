@@ -141,7 +141,7 @@ vm "echo '  bore:  '\$(~/bore --version 2>/dev/null || echo MISSING)
     echo '  oha:   '\$(~/oha --version 2>/dev/null || echo MISSING)
     echo '  env:   '\$( [ -f ~/env.sh ] && stat -c %a ~/env.sh || echo MISSING)
     echo '  disk:  '\$(df -Pm / | awk 'NR==2{print \$4\" MiB free\"}')
-    echo '  vhosts registered right now: '\$(pgrep -fc 'bore vhost' 2>/dev/null || echo 0)"
+    echo '  vhosts registered right now: '\$(pgrep -fc 'bore vhost' 2>/dev/null || true)"
 if [ -n "$BORE_SRV" ]; then
   say "server host reachability"
   srv "echo '  uname: '\$(uname -m); echo '  allowance counter: '\$(sudo -n ethtool -S $BORE_SRV_IFACE 2>/dev/null | grep -c bw_in_allowance_exceeded)" \

@@ -93,7 +93,15 @@ ctr() { echo "$1" | tr ' ' '\n' | awk -F= -v k="$2" '$1==k{print $2}'; }
 # --- the quic stats the product already logs --------------------------------
 # Counted, not timestamped: the lines arrive every 5 s, so the ones that appeared
 # between the two counts are exactly the ones covering the transfer.
-quic_lines_count() { ws_log "$1" 6000 | grep -c 'direct carrier quic stats' 2>/dev/null || echo 0; }
+# `|| echo 0` on a `grep -c` emits TWO lines when the count is zero (grep
+# prints 0 AND exits 1). It never fired in the runs this campaign published --
+# every one of them matched at least once -- but it is a landmine: the two-line
+# value reaches arithmetic below. Capture, then default.
+quic_lines_count() {
+    local n
+    n=$(ws_log "$1" 6000 | grep -c 'direct carrier quic stats' 2>/dev/null)
+    echo "${n:-0}"
+}
 quic_window() { # <tag> <n_new>
     local n="$2"
     [ "${n:-0}" -gt 0 ] || { echo ""; return; }

@@ -142,6 +142,31 @@ else
     fi
 fi
 
+# ---------------------------------------------------------------- compiler 8
+# `grep -c PATTERN FILE || echo 0` returns TWO lines when the count is zero:
+# grep prints `0` AND exits 1, so the fallback fires on top of it. Every later
+# integer comparison then dies with "integer expression expected" and the stage
+# fails on its own premise. `jump_stab.sh` learned this and wrote a comment;
+# `public_idle_window.sh` reintroduced it anyway (trap 52). A comment protects
+# one file -- a compiler protects the harness. Same for `pgrep -c`.
+echo
+echo "== a zero count does not become two lines (trap 52) =="
+badcount=""
+while IFS= read -r f; do
+    hits=$(grep -nvE '^[[:space:]]*#' "$f" 2>/dev/null \
+        | grep -E '\b(grep|pgrep)[^|]*[[:space:]]-[A-Za-z]*c[A-Za-z]*[[:space:]][^|]*\|\|[[:space:]]*echo[[:space:]]+[0-9]' || true)
+    [ -n "$hits" ] && badcount+="  $f
+$(printf '%s\n' "$hits" | sed 's/^/    /')
+"
+done < <(find "$ROOT/scripts/perf" -name '*.sh' | sort)
+if [ -n "$badcount" ]; then
+    printf '%s' "$badcount"
+    echo "FAIL -- a counting grep/pgrep with an '|| echo N' tail emits two lines on a zero count"
+    fail=1
+else
+    echo "PASS -- no counting grep/pgrep defaults its own zero into a second line"
+fi
+
 echo
 if [ "$fail" = 0 ]; then
     echo "PASS -- $n file(s) clean"

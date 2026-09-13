@@ -49,7 +49,10 @@ done
 [ "$bad" = 0 ] && echo "  every copy matches" || { echo "  refusing to run against a stale harness"; exit 1; }
 
 say "samplers"
-alive=$(srv 'pgrep -c -f "res_sample[r].sh" 2>/dev/null || echo 0' 2>/dev/null | tr -d '\r')
+# Same shape as the `grep -c` trap: `pgrep -c` prints 0 and exits 1 when it
+# counts nothing, so the `|| echo 0` tail would make this TWO lines.
+alive=$(srv 'pgrep -c -f "res_sample[r].sh" 2>/dev/null; true' 2>/dev/null | head -1 | tr -d '\r')
+alive=${alive:-0}
 last=$(srv 'tail -1 ~/pres.stat 2>/dev/null | cut -d" " -f1' 2>/dev/null | tr -d '\r')
 now=$(date +%s)
 if [ "${alive:-0}" -lt 1 ] || [ $(( now - ${last:-0} )) -gt 30 ]; then

@@ -32,7 +32,7 @@
 #
 # It never kills anything: it reports what it found and the caller stands down.
 
-DRIVER_NAMES="${DRIVER_NAMES:-rerun_eth.sh rerun_eth_p7.sh rerun_vpn_deep.sh rerun_jump.sh p5_build_gate.sh}"
+DRIVER_NAMES="${DRIVER_NAMES:-rerun_eth.sh rerun_eth_p7.sh rerun_vpn_deep.sh rerun_jump.sh rerun_open.sh p5_build_gate.sh}"
 
 # Print "<pid> <argv>" for every OTHER process that is running a campaign
 # driver. Prints nothing when the link is free.

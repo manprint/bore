@@ -28,3 +28,5 @@ skills-lock.json
 # `env.sh.example` is negated below so the template stays tracked.
 scripts/perf/staging/env.sh
 !scripts/perf/staging/env.sh.example
+__pycache__/
+*.pyc

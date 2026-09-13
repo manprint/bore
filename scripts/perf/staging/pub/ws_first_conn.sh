@@ -36,15 +36,52 @@
 # drift is common to both. They cannot be interleaved within a transfer -- a
 # tunnel has exactly one first connection, which is the quantity under test.
 #
-# COST: 6 arms x XFER_MB. Every arm is a download, so every arm is AWS egress:
-# 2.25 GiB at the default. Declared, because a stage whose cost is invisible
-# gets re-run without thinking.
+# THE RESIDUAL, AND THE AXIS THAT CLOSES IT (`DELAYS`)
+# -----------------------------------------------------
+# This stage ran and attributed the cost: the direct pool already reads 1 BEFORE
+# a byte moves and `direct_fallbacks` stays 0, so it is neither a lazy pool nor
+# a fallback in disguise -- it is a cold congestion controller. But it measured
+# the penalty at 4,2 % where §35 measured 18,6 % on the same line, and the one
+# structural difference between the two is TIME: this stage registers both
+# tunnels up front and spends ~40 s on the no-traffic rows and the control arm
+# before the QUIC arm's first byte, while `ws_dl1` transfers almost immediately.
+#
+# That makes the residual a testable statement rather than a caveat: if the cost
+# is a function of the TIME SINCE REGISTRATION it falls as the delay grows; if
+# it is a function of the ORDER of the transfer it does not move at all.
+#
+# `DELAYS="0 5 20 60"` runs that axis. A tunnel has exactly ONE first
+# connection, so each delay needs its OWN freshly registered pair -- the axis
+# cannot be walked on one tunnel, which is also why it costs what it costs.
+# Each cell then measures the SAME tunnel's later transfers, so the penalty is a
+# within-tunnel ratio and the line cancels out of it.
+#
+# `DELAYS` unset keeps the legacy single-pass body byte-for-byte, because its
+# output is what §40 cites.
+#
+# COST: legacy, 6 arms x XFER_MB -- every arm a download, so every arm AWS
+# egress: 2.25 GiB at the default. The delay axis costs
+# REPS x len(DELAYS) x (XFERS + CTRL_XFERS) x XFER_MB, which at the defaults is
+# 22.5 GiB. Declared, because a stage whose cost is invisible gets re-run
+# without thinking.
 . "$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
 export LC_ALL=C
 RAWCLI="$(cd "$(dirname "$0")/../.." && pwd)/raw_client.py"
 XFER_MB="${XFER_MB:-384}"
 XFERS="${XFERS:-3}"
 RP=5053; R=9047; Q=9048; PER=$(( XFER_MB*1048576 ))
+# --- the delay axis (unset = legacy body, byte-for-byte) --------------------
+DELAYS="${DELAYS:-}"
+REPS="${REPS:-3}"            # repetitions of the whole delay sweep
+CTRL_XFERS="${CTRL_XFERS:-2}"  # transfers on the relay control per cell
+# The cell re-registers on the SAME two ports rather than walking upward. What
+# the axis varies is the AGE of a tunnel, and a tunnel torn down and raised
+# again is fresh whatever its port number -- while a port nobody has used before
+# is an untested premise: this deployment's public range is opened by an AWS
+# security group, not by `--min-port/--max-port` (the server reports both null),
+# so a stage that invents port numbers can fail for a reason that has nothing to
+# do with its question. `down_one` waits for the server to FORGET the entry
+# before the next cell raises it, which is what makes reuse safe.
 
 UP=()
 up() { # <port> <extra flags>
@@ -79,6 +116,137 @@ view() { # <port> -> "path opens fallbacks pool"
 }
 
 g() { python3 "$RAWCLI" get "$BORE_GW" "$1" "$PER" 1 2>/dev/null | grep -oE 'MBs=[0-9.]+' | cut -d= -f2; }
+
+down_one() { # <port> -- kill this tunnel and WAIT for the server to forget it.
+    # Not cosmetic: the next cell re-registers on a NEARBY port and a server
+    # still holding the previous entry makes the new tunnel's "before any
+    # traffic" row describe the old one. Bounded, then given up on loudly.
+    vm "pkill -9 -f \"local $RP --port $1\" 2>/dev/null; true" >/dev/null 2>&1
+    local i js
+    for i in $(seq 60); do
+        # AN UNANSWERED API IS NOT AN ABSENT PORT. `adm | jq -e` exits non-zero
+        # both when the tunnel is gone AND when `adm` produced nothing at all,
+        # so the obvious `|| return 0` reports "released" for a server that
+        # never answered -- the same "a zero that means the instrument failed"
+        # shape this campaign keeps paying for. The JSON is captured first and
+        # its emptiness is a separate, louder case.
+        js="$(adm tunnels 2>/dev/null)"
+        if [ -z "$js" ]; then
+            echo "    WARNING: the admin API did not answer while releasing port $1"
+            sleep 1; continue
+        fi
+        printf '%s' "$js" | jq -e --argjson p "$1" 'any(.[]; .public_port==$p)' >/dev/null 2>&1 || return 0
+        sleep 0.5
+    done
+    echo "    WARNING: port $1 still registered after 30 s"
+    return 1
+}
+
+delay_axis() {
+    local rep d arm port_r port_q idx=0
+    declare -A PEN   # PEN[arm|delay] = space separated penalty percentages
+    declare -A FIRST LATER
+    echo "=== first-connection cost vs TIME SINCE REGISTRATION ==="
+    echo "  delays: $DELAYS s   reps=$REPS   ${XFER_MB} MiB per transfer, ONE connection"
+    echo "  per cell: a FRESH pair is registered, the delay is waited out, then"
+    echo "  $XFERS transfers on the --udp arm and $CTRL_XFERS on the relay control."
+    echo "  penalty = 1 - first / median(later), WITHIN the same tunnel."
+    echo
+
+    for rep in $(seq 1 "$REPS"); do
+        local order="$DELAYS"
+        # Even repetitions walk the delays downward, so a line that drifts
+        # during the sweep shows up as disagreement BETWEEN repetitions rather
+        # than as a slope along the axis -- the same correction ws_conns.sh
+        # carries, and for the same reason.
+        [ $((rep % 2)) -eq 0 ] && order="$(printf '%s\n' $DELAYS | tac | tr '\n' ' ')"
+        echo "  --- rep $rep  (delays: $order)"
+        for d in $order; do
+            idx=$((idx + 1))
+            port_r=$R; port_q=$Q
+            UP=()
+            if ! up "$port_r" "" || ! up "$port_q" "--udp"; then
+                echo "    delay=${d}s  FAILED to register the pair (r=$port_r q=$port_q)"
+                down_one "$port_r"; down_one "$port_q"; continue
+            fi
+            # The clock starts when the SERVER says the tunnel exists, which is
+            # what "time since registration" has to mean -- not when the ssh
+            # that launched it returned.
+            sleep "$d"
+            local pre_q pre_r
+            pre_q="$(view "$port_q")"; pre_r="$(view "$port_r")"
+            printf '    delay=%-3ss  quic  before: %s\n' "$d" "$pre_q"
+            printf '    delay=%-3ss  relay before: %s\n' "$d" "$pre_r"
+
+            local n mbs
+            for arm in quic relay; do
+                local port lim
+                case "$arm" in quic) port=$port_q; lim=$XFERS ;; relay) port=$port_r; lim=$CTRL_XFERS ;; esac
+                local got=""
+                for n in $(seq 1 "$lim"); do
+                    mbs=$(g "$port")
+                    case "${mbs:-}" in ''|*[!0-9.]*) mbs=FAILED ;; esac
+                    got+=" $mbs"
+                    printf '      %-5s xfer %-2s %-9s %s\n' "$arm" "$n" "$mbs" "$(view "$port")"
+                    cool 75
+                done
+                # first vs the median of the rest, inside this one tunnel.
+                # shellcheck disable=SC2086
+                set -- $got
+                local f="$1"; shift
+                local l; l=$(printf '%s\n' "$@" | med)
+                FIRST["$arm|$d"]+=" $f"; LATER["$arm|$d"]+=" $l"
+                case "$f$l" in
+                    *FAILED*|*n/a*) printf '      %-5s penalty: n/a (a transfer failed)\n' "$arm" ;;
+                    *) local pct; pct=$(LC_ALL=C awk -v f="$f" -v l="$l" 'BEGIN{if(l+0==0){print "n/a"}else{printf "%.1f", 100*(1-f/l)}}')
+                       PEN["$arm|$d"]+=" $pct"
+                       printf '      %-5s penalty: %s%% (first %s vs later %s)\n' "$arm" "$pct" "$f" "$l" ;;
+                esac
+            done
+            down_one "$port_q"; down_one "$port_r"
+        done
+    done
+
+    echo
+    echo "=== penalty of the first transfer, by delay (%) ==="
+    printf '  %-6s %-8s %-10s %-10s %s\n' arm delay median first later
+    for arm in quic relay; do
+        for d in $DELAYS; do
+            printf '  %-6s %-8s %-10s %-10s %s\n' "$arm" "${d}s" \
+                "$(printf '%s\n' ${PEN["$arm|$d"]:-} | med)" \
+                "$(printf '%s\n' ${FIRST["$arm|$d"]:-} | med)" \
+                "$(printf '%s\n' ${LATER["$arm|$d"]:-} | med)"
+        done
+    done
+    echo
+    echo "=== raw penalties ==="
+    for k in "${!PEN[@]}"; do printf '  %-12s%s\n' "$k" "${PEN[$k]}"; done | sort
+
+    echo
+    echo "=== how to read it ==="
+    echo "  A quic penalty that FALLS as the delay grows means the cost is a"
+    echo "  function of the time since registration -- the direct path is still"
+    echo "  settling, and §35's 18,6 % and §40's 4,2 % are the same phenomenon"
+    echo "  measured at two different ages. A penalty FLAT across the axis means"
+    echo "  it is the transfer's ORDER and not its age, and the two figures then"
+    echo "  need a different reconciliation than this one."
+    echo "  The relay column is the control: if it moves with the delay too, the"
+    echo "  effect belongs to registration in general and not to the direct path."
+    echo "  Read the 'before' rows in every cell: a quic tunnel whose path still"
+    echo "  reads relay at delay=0 is a THIRD answer -- the first transfer was"
+    echo "  never on the direct path at all."
+
+    local got=0
+    for k in "${!PEN[@]}"; do [ -n "${PEN[$k]}" ] && got=1; done
+    [ "$got" = 1 ] || { echo; echo "INSTRUMENT FAILURE: no cell produced a penalty."; return 2; }
+    return 0
+}
+
+if [ -n "$DELAYS" ]; then
+    delay_axis; rc=$?
+    echo; echo "DONE"
+    exit $rc
+fi
 
 echo "=== first-connection cost, ${XFER_MB} MiB per transfer, ONE connection, $XFERS transfers per arm ==="
 echo "  relay tunnel on $R (control), --udp tunnel on $Q; registered up front, driven alternately"

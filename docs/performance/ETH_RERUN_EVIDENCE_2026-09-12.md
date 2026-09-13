@@ -3766,3 +3766,362 @@ una misura invece che un guasto.
 
 **La domanda da farsi davanti a un controllo che passa sempre è la stessa che si
 fa davanti a uno zero: cosa lo farebbe fallire?**
+
+---
+
+## 46. `ws_conns_var` — perché il ladder pubblico non si ripete a n≥4: due dei tre candidati sono **esclusi**, e il terzo non è dove lo cercavamo
+
+§42 aveva chiuso con un debito preciso: la stessa cella ripetuta **15 volte**
+invece di 3, su un solo gradino, con i contatori di allowance letti come delta
+attorno a ogni ripetizione. Finché non girava, il ladder pubblico andava citato
+fino a n=2. Questa è quella fase.
+
+Disegno: due bracci (relay, `--udp`), la cella sotto esame a **n=4**, il
+controllo a **n=1** *dentro la stessa esecuzione* (una ripetizione su tre),
+460 MiB per gradino, 75 s di raffreddamento, ordine dei bracci alternato fra
+ripetizioni. 40 celle, 3387 s. Baseline nuda presa prima e dopo: **924 → 928
+Mbit/s in download, 733 → 732 in upload** — la linea non si è mossa, quindi
+nulla di quanto segue è deriva.
+
+E una cosa in più che §42 non aveva chiesto: oltre ai contatori di allowance,
+ogni cella legge **`steal` da `/proc/stat`** su entrambi gli host. «Scheduling
+dell'istanza» non è una metafora: su un'istanza condivisa la decisione
+dell'hypervisor di far girare qualcun altro il kernel ospite la *riporta*, nel
+campo 9 della riga `cpu`. Una campagna che elenca lo scheduling fra i candidati
+e poi non legge l'unico contatore che lo dichiara non ha guardato.
+
+### 46.1 La premessa, misurata prima di spendere l'ora
+
+Tutto ciò che segue è un ragionamento su **delta**, e vale solo se i contatori
+che bracciano un trasferimento appartengono a quel trasferimento. Il server
+porta anche i tunnel vivi dell'operatore, quindi è una domanda vera.
+
+Controllo fuori banda, sei campioni da 8 s presi dentro i raffreddamenti della
+fase, con nulla di nostro in volo (`pub_ws_conns_var_idle_control.out`):
+
+```
+  idle 8s: in+0 out+0 pps+0      (x5)
+  idle 8s: in+0 out+0 pps+13     (x1)
+```
+
+**0,27 eventi/s di linea di fondo**, e zero su entrambi i contatori di banda.
+Contro i ~4 800/s di una cella `--udp` carica: **quattro ordini di grandezza**.
+L'attribuzione è misurata, non assunta.
+
+### 46.2 La dispersione, con il controllo dentro la stessa esecuzione
+
+| braccio | n | min | mediana | max | escursione | rip. |
+|---|---|---|---|---|---|---|
+| relay | 1 | 106,37 | 106,63 | 108,25 | **1,8 %** | 5 |
+| quic | 1 | 71,87 | 106,70 | 107,38 | 33,3 % | 5 |
+| quic | 4 | 71,76 | 88,67 | 107,08 | **39,8 %** | 15 |
+| relay | 4 | 54,73 | 79,23 | 107,36 | **66,4 %** | 15 |
+
+**§42.3 regge, e ora è misurato dentro una sola esecuzione invece che fra due
+esecuzioni a ore di distanza.** Il relay a una connessione si ripete entro
+l'1,8 %; a quattro arriva al 66,4 %. Il gradino *è* la variabile.
+
+Il 33,3 % della riga `quic n=1` non è un'eccezione a quella conclusione: è
+**una cella sola**, e ha una causa con un nome. Le altre quattro stanno fra
+106,49 e 107,38 — **0,8 %**. Vedi §46.3.
+
+### 46.3 `steal`: colto sul fatto, e non è dove serviva
+
+Le tre celle più lente di ogni serie, con tutto ciò che era vero attorno a
+*quel* trasferimento:
+
+| braccio | n | MiB/s | srv_in | srv_pps | srv_busy | **srv_steal** | vm_busy |
+|---|---|---|---|---|---|---|---|
+| quic | 1 | **71,87** | 0 | 23 | 54,9 % | **21,55 %** | 9,6 % |
+| quic | 1 | 106,49 | 0 | 3094 | 37,3 % | 0,00 % | 11,7 % |
+| quic | 1 | 106,70 | 0 | 4115 | 38,4 % | 0,00 % | 12,8 % |
+| relay | 4 | **54,73** | 135 | 5 | 11,7 % | 0,00 % | 4,7 % |
+| relay | 4 | 58,55 | 216 | 51 | 10,2 % | 0,11 % | 5,3 % |
+| relay | 4 | 65,18 | 206 | 65 | 10,9 % | 0,06 % | 6,3 % |
+
+L'unica cella lenta del controllo `quic n=1` è **l'unica cella dell'intera
+esecuzione con `steal` a 21,55 %**; tutte le altre stanno fra 0,00 e 0,26 %.
+Quindi: lo scheduling dell'istanza **esiste**, è misurabile, e costa il 33 % del
+throughput quando capita — ma è capitato **una volta su quaranta, e a n=1**.
+Non è il meccanismo di n≥4.
+
+### 46.4 Il bucket di allowance è ESCLUSO, e il colpo d'occhio diceva il contrario
+
+Correlazione di rango (Spearman) fra il *rate* di una cella e ciascun candidato,
+sulla stessa cella ripetuta:
+
+| braccio | n | srv_in | srv_pps | srv_busy | srv_steal | vm_busy | rip. |
+|---|---|---|---|---|---|---|---|
+| quic | 4 | **+0,04** | +0,06 | +0,95 | −0,55 | +0,97 | 15 |
+| relay | 4 | **−0,12** | +0,21 | +0,84 | +0,16 | +0,95 | 15 |
+
+`srv_in` non ha **nessuna** associazione con il rate a n=4 (−0,12 e +0,04). E il
+segno, dove si vede, è quello sbagliato per un'ipotesi di strozzatura: le due
+celle `relay n=1` **più veloci** dell'esecuzione (108,24 e 108,25 MB/s, cioè
+piena linea) portano `in+235` e `in+430`, mentre le celle `relay n=4` lente
+portano `in+135`/`in+206`/`in+216`. **Il contatore segue il traffico, non lo
+strozza.**
+
+Vale la pena dire come è stato preso questo punto, perché è una regola e non un
+aneddoto. Alla prima ripetizione avevo letto a occhio `65,18 → in+206`,
+`54,73 → in+135`, `79,23 → in+13` e concluso «i lenti sono gli strozzati».
+Su quindici ripetizioni il rho dice −0,12. **Leggere una correlazione dalla
+pagina è il modo in cui un lettore trova il pattern che è andato a cercare**:
+l'analisi è per questo uno script (`pub/analyze_conns_var.py`) che legge
+l'output della fase e stampa rho accanto a `n`, e rifiuta di leggerlo sotto
+n=6.
+
+### 46.5 E la CPU segue il rate, non lo causa — il che restringe davvero
+
+`srv_busy` e `vm_busy` correlano **+0,84…+0,97** col rate su entrambi i bracci.
+È la direzione attesa se la CPU è *conseguenza* del throughput: più byte, più
+lavoro. Il fatto decisivo è nella tabella di §46.3: le celle `relay n=4` più
+lente girano con il server al **10–12 %** di un core e la VM al **4,7–6,3 %**.
+
+Quindi a n=4, nella cella lenta, **nessuno dei due host misurati sta facendo
+qualcosa**. Il trasferimento è lento mentre entrambe le estremità note sono
+ferme.
+
+### 46.6 Il verdetto su §42.4, e il buco che ha aperto
+
+I tre candidati che §42.4 elencava senza misurarne nessuno:
+
+| candidato | esito a n≥4 |
+|---|---|
+| 3. micro-bursting dell'allowance ENA | **ESCLUSO** — rho −0,12/+0,04; le celle più veloci sono quelle che lo toccano di più |
+| 2. scheduling dell'istanza | **ESCLUSO a n≥4** — rho +0,16/−0,55 con le celle lente a `steal` 0,00–0,31 %. Confermato *esistente*, ma a n=1 e una volta sola |
+| 1. percorso di accept pubblico del server sotto concorrenza | **non escluso, ma indebolito**: il server è al 10–12 % di un core proprio nelle celle lente |
+
+**Il ladder pubblico si può ora citare oltre n=2 dichiarando l'escursione
+accanto al valore**, che è la forma in cui §42.5 aveva già detto che andava
+citato. Quello che NON si può ancora dire è *perché* la cella a n=4 vari del
+66 %.
+
+E misurando questo è emerso un buco che nessuna fase di questa campagna aveva:
+**bracciamo il server e la VM, e nessuno dei due è il ricevente.** In un
+download i byte finiscono su **questa workstation**, la cui NIC, il cui
+softirq e le cui code di ricezione TCP possono limitare il rate quanto
+qualunque cosa a monte — e nessuna fase le ha mai lette attorno a un
+trasferimento. `origin_cpu` aveva misurato la CPU del client come percentuale,
+che risponde a «era saturo» e non a «ha buttato via qualcosa».
+
+`pub/udp_pktsize.sh` fa girare **lo stesso identico snapshot su tutti e tre gli
+host**, allo stesso n=4: è la fase che chiude questo buco, ed è anche la fase
+nata dalla scoperta di §46.7.
+
+### 46.7 I due bracci inciampano in LIMITI DIVERSI dello stesso carico
+
+Non è un dettaglio della cella lenta: è vero in ogni ripetizione.
+
+```
+  n=4 relay   in+206  out+0  pps+65        <- bucket di BANDA
+  n=4 quic    in+0    out+0  pps+23957     <- bucket di PACCHETTI
+```
+
+Lo stesso payload, negli stessi secondi, e i due trasporti toccano contatori
+d'istanza **diversi**: il relay fa doppio transito sul server come flusso di
+byte e si vede sulla banda in ingresso; il percorso diretto si vede sui
+**pacchetti** — gli stessi byte in datagrammi molto più numerosi e più piccoli.
+
+Un limite di pacchetti al secondo è un'affermazione sulla **dimensione del
+pacchetto**, e su un percorso QUIC la dimensione del pacchetto è una cosa che
+il prodotto sceglie. È l'unica cosa emersa da questa fase che possa implicare
+una modifica al codice, e per questo `udp_pktsize` gira **subito dopo** e non
+alla fine.
+
+## 47. `udp_pktsize` — il percorso diretto spende **l'11–19 % di pacchetti in più** per lo stesso payload; ma il criterio che la fase si era data **non è decidibile** con i contatori che ha usato
+
+§46.7 aveva chiuso con una frase impegnativa: la dimensione del pacchetto, su un
+percorso QUIC, è una cosa che **il prodotto sceglie**, quindi è l'unica cosa
+emersa da §46 che possa implicare una modifica al codice. `pub/udp_pktsize.sh`
+è nato per deciderla, e si era dato un criterio esplicito, scritto dentro la
+fase stessa prima di vedere un solo numero:
+
+> media in ingresso vicina a **1200 B** sul braccio quic ⇒ quinn non ha mai
+> alzato la dimensione del datagramma oltre il valore iniziale conservativo, e
+> un quinto del budget di pacchetti se ne va in niente — **si cambia il codice**.
+> Vicina a **~1450** ⇒ la discovery ha funzionato e il resto è framing QUIC più
+> acknowledgement, cioè il prezzo del trasporto e non un difetto.
+
+La colonna ha stampato **1135 B**. Secondo quel criterio la risposta sarebbe
+«si cambia il codice», e sarebbe **sbagliata**: quel numero non misura la
+dimensione del datagramma. Questa sezione mostra che cosa misura davvero, che
+cosa invece i dati dicono in modo esatto, e perché la domanda resta aperta.
+
+### 47.1 Il controllo tiene, e va detto prima
+
+Ogni ripetizione apre con una cella `idle` che bracketta sei secondi di niente:
+
+```
+  rep 1  idle  rx    106 pkts /    10370 B | tx  137 pkts /  16537 B
+  rep 2  idle  rx    140 pkts /    12345 B | tx  144 pkts /  17121 B
+  rep 3  idle  rx    134 pkts /    11935 B | tx  138 pkts /  16683 B
+```
+
+Da 106 a 140 pacchetti, contro le ~400 000 delle celle cariche: **tre parti su
+diecimila**. Il traffico altrui del server non è dentro questi numeri. Il
+controllo è la prima cosa da leggere, non l'ultima, perché se avesse letto
+50 000 nessuna delle righe sotto sarebbe stata per-braccio.
+
+### 47.2 Quello che è **esatto**: la differenza fra i bracci
+
+La gamba server→workstation è TCP su **entrambi** i bracci, e si misura che è la
+stessa cella per cella — non si assume:
+
+```
+  rep 1  ws rx  335222 (relay) vs 335170 (quic)   delta  -52 pkts  (-0,016 %)
+  rep 2  ws rx  335068        vs 335173            delta +105 pkts  (+0,031 %)
+  rep 3  ws rx  335091        vs 335269            delta +178 pkts  (+0,053 %)
+```
+
+Cinque centesimi di punto percentuale. Quindi **il flusso di ACK che la
+workstation rimanda al server è comune ai due bracci**, e sparisce nella
+sottrazione: la differenza fra i due `rx` del server è attribuibile *interamente*
+alla gamba VM→server, che è l'unica cosa che cambia fra i bracci.
+
+```
+  rep   pacchetti in più   byte in più   %pkt     %byte   B per pacchetto in più
+   1         +46 330       +4 454 116   +11,5 %   +0,88 %          96,1
+   2         +71 642       +5 722 128   +19,5 %   +1,14 %          79,9
+   3         +45 706       +4 356 303   +11,0 %   +0,86 %          95,3
+```
+
+Il segno è stabile 3 su 3: **il braccio diretto mette sulla gamba VM→server dall'11
+al 19,5 % di pacchetti in più per lo stesso payload consegnato.**
+
+E la forma di quel costo si legge nell'ultima colonna. Ogni pacchetto in più
+porta con sé solo **80–96 byte** in più: non porta payload nuovo, porta
+un'intestazione. Ottanta-novanta byte è esattamente un IP+UDP+intestazione
+QUIC+tag AEAD, oppure un IP+TCP. Cioè: **gli stessi byte tagliati più fini**,
+non byte aggiuntivi. In totale i byte crescono dello 0,86–1,14 %, i pacchetti
+dell'11–19,5 %.
+
+### 47.3 La dispersione della cella ripetuta (regola §42.5)
+
+Un confronto fra celle va pubblicato con l'escursione della cella ripetuta,
+altrimenti la differenza sopra non ha scala:
+
+```
+  relay  rx pkts   min 368 294   mediana 402 493   max 415 903   escursione 47 609  (11,8 % della mediana)
+  quic   rx pkts   min 439 936   mediana 448 823   max 461 609   escursione 21 673  ( 4,8 % della mediana)
+```
+
+L'escursione del braccio relay (47 609) è **più grande della differenza mediana
+fra i bracci** (46 330). Per lo stesso identico payload il relay si ripartisce
+in un numero di pacchetti che varia del 12 % da una ripetizione all'altra —
+segmentazione, pacing e finestra non si ripetono. Quindi:
+
+- la **direzione** è solida (3 ripetizioni su 3, appaiate, ordine alternato);
+- la **grandezza** non è fissata a n=3, e va letta come «fra l'11 e il 19,5 %»,
+  mai come «46 330».
+
+### 47.4 Quello che **non** è decidibile: la media assoluta in B/pkt
+
+Il criterio della fase legge la colonna `in B/pkt` come se fosse la dimensione
+del datagramma in arrivo dalla VM. Non lo è: `rx` del server somma **due**
+flussi sulla stessa interfaccia — il payload dalla VM *e* gli ACK dalla
+workstation — e il secondo non è misurato separatamente da nessuna parte.
+
+Si può provare a risolverlo per sottrazione, e il tentativo **fallisce in modo
+informativo**. Prendendo il payload che la workstation ha davvero ricevuto
+(`ws rx bytes − 66·ws rx pkts`) e chiedendo che i pacchetti in ingresso al
+server ci stiano sopra con almeno il frame ethernet minimo (60 B):
+
+```
+  cella        payload ws   budget di byte sopra il payload   pavimento minimo per i pkt rx   chiude?
+  rep1 relay   483,71 MB              21,24 MB                        24,15 MB                 NO
+  rep1 quic    483,71 MB              25,69 MB                        26,93 MB                 NO
+  rep2 relay   483,69 MB              19,48 MB                        22,10 MB                 NO
+  rep2 quic    483,76 MB              25,13 MB                        26,40 MB                 NO
+  rep3 relay   483,69 MB              21,98 MB                        24,95 MB                 NO
+  rep3 quic    483,73 MB              26,30 MB                        27,70 MB                 NO
+```
+
+Sei celle su sei: il server ha ricevuto **meno** byte di quanti ne servirebbero
+per portare quel payload in quel numero di pacchetti, anche assegnando a ogni
+pacchetto il minimo assoluto. Manca da 1,3 a 2,9 MB.
+
+Non è un errore di misura: è la prova che una delle grandezze non è quello che
+la legenda assume. Il payload che la workstation riceve **non** è il payload che
+ha attraversato la gamba VM→server, perché la gamba server→workstation è TCP e
+**ritrasmette** — byte che escono dal server due volte ed entrano una volta
+sola. Con le ritrasmissioni incognite su entrambe le gambe e il rapporto di ACK
+incognito (dipende dal coalescing GRO del ricevente, che nessuno qui misura),
+il sistema ha più incognite che equazioni.
+
+**Conclusione operativa: la colonna `in B/pkt` non decide il criterio di §47, e
+la domanda «quinn ha alzato la dimensione del datagramma?» resta APERTA.** Il
+difetto non è nel prodotto: è nello strumento, ed è la firma di questa campagna
+al contrario — non uno zero che vuol dire che lo strumento ha fallito, ma **un
+numero plausibile che non può fallire**, perché stampa sempre qualcosa di
+credibile qualunque cosa stia succedendo.
+
+E si noti che la differenza di §47.2 sopravvive comunque: è una sottrazione fra
+due celle in cui tutto l'ignoto è comune. Quello che *non* sopravvive è la sua
+scomposizione in «datagrammi più piccoli» contro «più ritrasmissioni» — due
+diagnosi opposte che da questi contatori hanno lo stesso aspetto.
+
+### 47.5 I due bracci toccano limiti diversi, e il diretto ne spende molto di più
+
+```
+  braccio   pps_allowance_exceeded (delta per ripetizione)
+  relay       +130      +45      +20
+  quic     +11 774  +30 139  +16 791
+```
+
+Da due a tre **ordini di grandezza**. È la conferma diretta di §46.7 su una fase
+costruita apposta: lo stesso payload, negli stessi secondi, e il percorso
+diretto consuma il bucket dei *pacchetti* mentre il relay non lo tocca.
+
+E tuttavia il braccio quic è stato **più veloce** in ogni ripetizione
+(99,34 / 100,59 / 106,84 contro 76,88 / 88,00 / 102,69 MiB/s). Lo shaping dei
+pacchetti non gli è costato banda **in questa fase**. È un margine speso, non
+una perdita incassata — e vale la pena distinguere le due cose, perché la
+seconda si vede in un grafico e la prima no.
+
+### 47.6 Ma la banda, qui, non dice niente — e va detto
+
+La linea nuda di questa finestra è **924 Mbit/s in download**, cioè
+**110,2 MiB/s**. Il braccio quic migliore ha letto 106,84 MiB/s: il **97 % della
+linea di accesso della workstation**. Entrambi i bracci corrono contro il tetto
+dell'accesso, non contro il trasporto.
+
+Quindi il confronto di throughput di questa fase **non è un confronto fra
+trasporti** e non va citato come tale (V-9: i rapporti valgono, gli assoluti
+vanno qualificati con la linea — e qui la linea è il vincolo attivo). L'unica
+colonna informativa di `udp_pktsize` è quella dei contatori di pacchetti, che è
+poi la ragione per cui la fase esiste.
+
+### 47.7 La correzione dello strumento: bracchettare il **mittente**
+
+L'unica vista non confusa della dimensione del pacchetto è quella di chi lo
+mette sul filo. I contatori `tx` della VM non hanno nessuno dei due problemi:
+non sommano un secondo flusso, e contano prima che qualunque cosa a valle possa
+fondere pacchetti insieme.
+
+`pub/udp_pktsize.sh` ora installa lo **stesso** snapshot anche sulla VM e
+bracchetta ogni trasferimento anche lì:
+
+```
+  vm tx  <pkts> pkts / <bytes> B = <B/pkt> | vm drops tx+<n>
+```
+
+con la colonna `VM tx B/pkt` in testa alla tabella delle mediane, prima di
+`in B/pkt`, perché è quella che decide il criterio e l'altra no.
+
+Resta una cosa che nemmeno questo bracket separa da solo — la segmentazione
+hardware (TSO sul braccio relay, GSO UDP su quello quic) fa contare al mittente
+un'unica voce per quello che sul filo diventano più pacchetti. Per questo la
+ri-esecuzione registra anche `ethtool -k` dei due estremi: se l'offload è
+attivo, il numero del mittente è un *limite inferiore* dichiarato come tale e
+non una misura, e la fase deve dirlo invece di stampare una media.
+
+**Stato: la fase è stata corretta e rimessa in coda.** I numeri di questa
+sezione vengono tutti dalla **prima** esecuzione, conservata come
+`out/eth/pub_udp_pktsize_r1.out`; la seconda riscrive `pub_udp_pktsize.out` e
+chiuderà §47. La prima resta nell'albero di proposito: una campagna che
+cancella l'esecuzione che l'ha ingannata non può più mostrare a nessuno perché
+la regola esiste. Finché quel numero non c'è, la posizione di
+questo documento è che **non si tocca il codice**: cambiare la dimensione del
+datagramma sulla base della colonna `in B/pkt` significherebbe intervenire su una
+misura che §47.4 ha appena dimostrato non essere quella grandezza.

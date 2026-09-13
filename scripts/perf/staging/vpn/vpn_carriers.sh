@@ -30,7 +30,7 @@
 # as a ratio against a line measured in the same minutes, and the absolute
 # numbers are reported beside it rather than instead of it.
 #
-# Usage: vpn_carriers.sh     (REPS, SECS, CELLS overridable)
+# Usage: vpn_carriers.sh     (REPS, SECS and CELLS_SPEC overridable)
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
@@ -65,6 +65,20 @@ SECS="${SECS:-10}"
 # count where the collapse actually is: at flows=4 the relay is at 373 of 575
 # and the effect is half visible; at flows=8 it is at 204 and unmistakable.
 # Three more cells, 3 reps x 10 s each, all UPLOAD -- which AWS does not bill.
+#
+# `CELLS_SPEC` OVERRIDES THE LIST, and until now the usage line above LIED about
+# that: it advertised `CELLS` as overridable while the array below was a plain
+# assignment that clobbered anything the caller exported. The distinction
+# matters because the open question this stage left is not "run it again" but
+# "run FEWER cells MANY more times" -- at flows=4 and flows=8 the intervals
+# overlap almost entirely and one cell is bimodal (0,916 against two values at
+# 0,38), which is a dispersion problem and dispersion needs repetitions, not
+# neighbours. Space separated, same `path|carriers|flows` spelling.
+CELLS_SPEC="${CELLS_SPEC:-}"
+if [ -n "$CELLS_SPEC" ]; then
+    # shellcheck disable=SC2206
+    CELLS=($CELLS_SPEC)
+else
 CELLS=(
     "relay|1|1"  "relay|2|1"  "relay|4|1"
     "relay|1|4"  "relay|2|4"  "relay|4|4"
@@ -72,6 +86,15 @@ CELLS=(
     "direct|1|4" "direct|4|4"
     "direct|1|8" "direct|4|8"
 )
+fi
+# A cell spelled wrong is a cell that silently never runs, so the shape is
+# checked HERE rather than discovered as a missing row in the medians table.
+for _c in "${CELLS[@]}"; do
+    case "$_c" in
+        relay\|[0-9]*\|[0-9]*|direct\|[0-9]*\|[0-9]*) ;;
+        *) echo "bad cell spec '$_c' (want path|carriers|flows, path in relay|direct)"; exit 2 ;;
+    esac
+done
 
 vpn_hdr "VPN --carriers on both paths -- $REPS reps, ${SECS}s per cell"
 echo "  relay stripes per DATAGRAM across N substream pairs (DEC-7);"

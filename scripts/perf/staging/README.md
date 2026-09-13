@@ -461,6 +461,64 @@ server and drops the operator's live tunnels, and needs explicit approval.
 
 ---
 
+## 3.11 The open questions (`rerun_open.sh`)
+
+§8 of `docs/performance/RELAZIONE_FINALE_CABLATO_2026-09-13.md` lists what the
+wired campaign could not close. Four of those items are small, have a stated
+method, and each forces a published claim to be hedged — so they have their own
+driver rather than being folded into a general re-run.
+
+| stage | the question | the method |
+| --- | --- | --- |
+| `pub/ws_conns_var.sh` | why does the public ladder stop repeating at n≥4? | ONE cell, 15 repetitions, ENA allowance **and `/proc/stat` steal** read as deltas around every transfer, with the n=1 cell as an **in-run** control |
+| `pub/ws_first_conn.sh DELAYS="0 5 20 60"` | is the first connection's cost a function of the transfer's ORDER or of the tunnel's AGE? | a freshly registered pair per delay (a tunnel has exactly one first connection), penalty computed **within** that tunnel |
+| `vpn/vpn_carriers.sh CELLS_SPEC=…` | do relay carriers recover when the flows are as many as the carriers? | the six open cells only, many repetitions — dispersion needs repetitions, not neighbours |
+| `jump/jump_stab.sh` | does the relay cost latency, or did time merely pass? | warm-up sample discarded (trap 36), ratios computed **inside** each repetition (trap 37) |
+| `pub/udp_pktsize.sh` | how many PACKETS does each transport spend per delivered byte? | `/proc/net/dev` bracketed around each arm on **all three hosts** — the VM's `tx` is the answering column (trap 42), the server's `rx` decides only the arm-to-arm *difference* (trap 41) — plus an **idle bracket** as the control and an `ethtool -k` offload table (trap 43) |
+
+`pub/udp_pktsize.sh` is the one stage here that was not on §8's list: it exists
+because `ws_conns_var`'s first repetition showed the two arms tripping
+*different* instance limits for the same payload — the relay the bandwidth
+bucket, the direct path the packets-per-second bucket at ~4 800 shaping events
+per second against an idle line of 0,27. A packets-per-second limit is a
+statement about packet size, and packet size on a QUIC path is something the
+product chooses, so the question became answerable and small.
+
+The analysis step is a script too — `pub/analyze_conns_var.py` reads the
+stage's own output and prints the spread of each repeated cell plus the rank
+correlation of the rate against every counter. Reading a correlation off the
+page is how a reader finds whichever pattern they went looking for; it also
+caught me reading the relay's sign backwards from four rows.
+
+**`udp_pktsize` ran twice, and the first run is kept on purpose.** Its first
+pass (`out/eth/pub_udp_pktsize_r1.out`) bracketed only the server, printed
+`in 1135 B/pkt`, and its own legend turned that into "change the code" — a
+conclusion §47.4 then falsified against the stage's own byte budget. The
+stage now brackets the VM as well and records the offload state of all three
+ends; the second pass reruns as `pub_udp_pktsize`. Traps 41, 42 and 43 are
+that episode. The first output stays in the tree because a campaign that
+deletes the run that misled it cannot show anyone why the rule exists.
+
+```bash
+./scripts/perf/staging/rerun_open.sh                 # the first stage only
+STAGES=all ./scripts/perf/staging/rerun_open.sh      # once every script is ready
+STAGES="first_conn carriers" ./scripts/perf/staging/rerun_open.sh
+```
+
+The stage set is a PARAMETER and not a fixed sequence, which is not a
+convenience: three of the four needed a change to the script they invoke, and a
+driver that listed them unconditionally would have reached them with the
+unmodified scripts, run them, and written a `_done.` marker over a result that
+answers the old question under the new question's name. **A marker on the wrong
+answer is more expensive than no answer at all.**
+
+Every one of the four is a DISPERSION question, and that sets their common
+shape: few cells, many repetitions, controls sampled inside the same run. §42.5
+is the rule they are built to satisfy — a phase that publishes a comparison
+between cells must also publish the spread of the repeated cell.
+
+---
+
 ## 3.10 Qualify the access link BEFORE quoting any absolute figure
 
 This is the most expensive lesson in the whole harness, so it is a numbered step
@@ -982,6 +1040,112 @@ do not "simplify" them back out.
     in neither column. Forcing such an observation into PASS hides a real
     limitation from the reader; forcing it into FAIL fabricates a defect and, as
     above, buries the checks that matter.
+
+36. **THE FIRST SAMPLE AFTER A SESSION EVENT IS NOT A SAMPLE OF THE STEADY
+    STATE.** `jump_stab`'s `recovered` cell read 246.2 ms and 213.1 ms as its
+    first sample against ~147 and ~120 for every other sample beside it. One
+    such outlier in a ten-sample cell moved the phase to 1,21x baseline —
+    WORSE than the blackout it was meant to be a control for — and the table
+    then said "returning to the direct path costs more than losing it", which
+    is not a thing that happened. Rule: after a path switch, a session reopen
+    or a rekey, take one sample, PRINT it, and exclude it from the cell. Print
+    it because the warm-up column is where "the path just switched" is actually
+    visible; exclude it because a per-phase median is the wrong statistic for a
+    value that occurs exactly once.
+
+37. **AN AGGREGATE MEDIAN ACROSS REPETITIONS CAN MIX TWO POPULATIONS.** The
+    same `jump_stab` run sat at ~128 ms of baseline in repetition 1 and ~113 in
+    repetition 2. Those are two levels, not noise around one, and a pooled
+    median describes neither. V-9 already says the ratio against a control
+    sampled in the SAME repetition is the quantity that survives a moving line;
+    this is the same rule applied to LATENCY. Compute the ratio inside the
+    repetition, then take the median OF THE RATIOS — never the ratio of the
+    medians.
+
+38. **IF YOU HAVE EDITED A SCRIPT THAT IS RUNNING, MEASURE THE DAMAGE INSTEAD
+    OF REASONING ABOUT IT.** The rule is "never edit a live script", because
+    bash reads a script incrementally and an insertion BEFORE the read head
+    shifts every byte after it. But when it has already happened, the question
+    is answerable exactly rather than by argument:
+
+    ```
+    cat /proc/<pid>/fdinfo/255        # 255 is bash's own script fd: pos = read head
+    ```
+
+    Compare `pos` with the byte offset of the edit (`awk` over the file,
+    accumulating `length($0)+1`). MEASURED on this campaign: read head at byte
+    10883 — immediately past the repetition loop's `done` at 10875 — against an
+    edit at 11923, i.e. 1040 bytes AHEAD of the head, so the new text was read
+    fresh and correctly. Ahead of the head is safe; behind it is corruption,
+    and the answer is to let the stage finish and re-run it rather than to
+    guess. The rule stands: this is the post-mortem, not a licence.
+
+39. **A STAGE THAT PRINTS EVERY CELL TWICE WILL BE COUNTED TWICE BY ITS OWN
+    ANALYSER.** `ws_conns_var` prints each cell inline as it measures (so a run
+    in progress is readable) and again in an end-of-run evidence block (so a
+    reader can quote one contiguous thing). Both are right. But
+    `analyze_conns_var.py` parsed the whole file and reported **30 repetitions
+    of a 15-repetition cell** — and `n` is precisely what decides whether a
+    correlation means anything, so every rho looked twice as well-supported as
+    it was. The medians survived it untouched (a doubled multiset has the same
+    median), which is what made it invisible in the table a reader looks at
+    first.
+
+    The fix is to skip the second block **by position**, not to deduplicate
+    identical rows: two cells can legitimately produce the same numbers, and a
+    parser must never silently discard a real measurement to work around its own
+    double read.
+
+40. **A RANK CORRELATION IS NOT A FAVOUR TO THE READER, IT IS A DEFENCE AGAINST
+    THE AUTHOR.** On `ws_conns_var`'s first repetition the allowance deltas read
+    `65.18 -> in+206`, `54.73 -> in+135`, `79.23 -> in+13`, and the obvious
+    reading is "the slow cells are the shaped ones". Over fifteen repetitions
+    Spearman's rho is **−0.12** — no association — and the two FASTEST cells of
+    the whole run carry the two LARGEST counters. Reading a correlation off the
+    page is how a reader finds the pattern they went looking for. Compute it,
+    print `n` beside it, and refuse to read it below n=6.
+
+41. **A NUMBER THAT CANNOT FAIL IS WORSE THAN A ZERO THAT MEANS THE INSTRUMENT
+    FAILED.** This campaign's signature defect is a zero that silently means
+    "the probe broke". Its mirror is more dangerous, because nothing looks
+    wrong: `udp_pktsize` printed `in 1135 B/pkt` and its own legend said an
+    inbound average near 1200 B means "quinn never raised the datagram size --
+    change the code". But the server's `rx` on one interface sums the payload
+    arriving from the VM **and** the ACK stream arriving from the workstation,
+    and the split is underdetermined (retransmissions on both legs, and the
+    receiver's GRO ratio, are all unmeasured). The check that exposed it is
+    arithmetic anyone can run: take the payload the far end actually received
+    and ask whether the receiving interface's byte count can even hold it at the
+    minimum 60-byte frame. **Six cells out of six failed to close, by 1.3-2.9
+    MB.** A column that prints a plausible value whatever happens has to be
+    falsified on purpose, because it will never raise its own hand. Evidence:
+    `ETH_RERUN_EVIDENCE_2026-09-12.md` §47.4.
+
+42. **WHEN THE QUESTION IS PACKET SIZE, BRACKET THE SENDER.** The receiver's
+    counters mix every flow that arrives on the interface and sit downstream of
+    coalescing; the sender's count one entry per thing it handed the NIC, on the
+    one leg that changes between arms. `udp_pktsize` was built with the server
+    bracketed and the VM not, so the only unconfounded view of the quantity it
+    exists to measure was the one view it did not take. **The DIFFERENCE between
+    arms survives anyway** — the unchanged leg is common and cancels, verified
+    at 0.05% — which is why that stage still produced a result (+11-19.5%
+    packets on the direct arm, each extra packet carrying 80-96 B: the same
+    bytes cut finer). What does not survive is the decomposition into "smaller
+    datagrams" versus "more retransmissions", two opposite diagnoses that look
+    identical from those counters.
+
+43. **AN OFFLOAD THAT IS ON FOR ONE ARM AND OFF FOR THE OTHER MANUFACTURES THE
+    DIFFERENCE YOU ARE LOOKING FOR.** Fixing trap 42 by reading the sender's
+    `tx` count is only a fix if segmentation is off. With TSO the kernel hands
+    the NIC one oversized entry and counts **one** packet for what leaves as
+    many; with `tx-udp-segmentation` it does the same for UDP. Measured on this
+    workstation: `tcp-segmentation-offload=on`, `tx-udp-segmentation=off` — so a
+    TCP arm's sender count is a floor while a QUIC arm's is a measurement, biased
+    in **opposite directions**, which is exactly the shape of "the direct path
+    sends more, smaller packets". Record `ethtool -k` for every end before
+    producing a number, and print whether each column is a measurement or a
+    declared lower bound. A sender bracket with the offload table missing is
+    trap 41 again in a new place.
 
 ---
 

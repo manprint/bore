@@ -75,7 +75,9 @@ JUMP_SERVER_EXTRA="${JUMP_SERVER_EXTRA:---udp --vhost-quic-port 7847}"
 # non-numeric sample -- that guard earned its keep here), but it reached an
 # EVIDENCE FILE, which is precisely how coordinates escape: through prose and
 # output, never through code.
-declare -A SAMP          # SAMP[phase] = keystroke samples
+declare -A SAMP          # SAMP[phase]      = keystroke samples, all reps
+declare -A RSAMP         # RSAMP[rep|phase]  = keystroke samples of ONE rep
+declare -A WARM          # WARM[rep|phase]   = the discarded warm-up sample
 declare -a CHECKS     # "PASS|name|observation"
 
 note()  { CHECKS+=("$1|$2|$3"); printf '    [%s] %-26s %s\n' "$1" "$2" "$3"; }
@@ -99,12 +101,32 @@ wait_path_secs() {
     echo FAILED
 }
 
-sample_phase() { # <phase> <n>
-    local ph="$1" n="$2" i e
+# THE FIRST KEYSTROKE AFTER A SESSION EVENT IS NOT A KEYSTROKE MEASUREMENT.
+#
+# MEASURED (§44.9, and visible only because the raw samples are printed): the
+# first sample of `recovered` read 246.2 ms and 213.1 ms in the two repetitions
+# against ~147 and ~120 for every other sample in the same cell. One outlier in
+# a ten-sample cell moved `recovered` to 1,21x baseline -- WORSE than the relay
+# it was supposed to be a control for -- and the phase then read as "returning
+# to direct costs more than the blackout", which is not a thing that happened.
+#
+# The event is real (a channel is opened over a path that has just changed, or
+# a rekey has just completed) and the cost is real, but it is a ONE-OFF cost of
+# the event and not the steady-state keystroke this table compares. So it is
+# taken, PRINTED, and excluded from the cell -- excluded rather than averaged,
+# because a per-phase median is the wrong statistic for a value that occurs
+# exactly once. Discarding silently would be the worse fix: the warm-up column
+# below is where "the path just switched" is actually visible.
+sample_phase() { # <phase> <n> <rep>
+    local ph="$1" n="$2" rep="${3:-0}" i e w
+    w=$(jump_echo_ms)
+    keep "$w" && WARM["$rep|$ph"]="$w"
     for i in $(seq 1 "$n"); do
         e=$(jump_echo_ms)
-        keep "$e" && SAMP["$ph"]+=" $e"
+        if keep "$e"; then SAMP["$ph"]+=" $e"; RSAMP["$rep|$ph"]+=" $e"; fi
     done
+    printf '    %-6s %-26s warm-up %-8s then%s\n' "" "(keystrokes: $ph)" \
+        "${WARM["$rep|$ph"]:-FAILED}" "${RSAMP["$rep|$ph"]:- (none)}"
 }
 
 # A ControlMaster that LOGS, so the rekey phase has an oracle. The overriding
@@ -197,7 +219,7 @@ for rep in $(seq 1 "$REPS"); do
         note SKIP "session held open" "ControlMaster did not establish"
         kill -TERM "$pid" 2>/dev/null; sleep 3; continue
     fi
-    sample_phase baseline "$SAMPLES"
+    sample_phase baseline "$SAMPLES" "$rep"
     kex0=$(kexinits)
 
     # ---- phase 2: the direct path dies underneath a live session -----------
@@ -280,7 +302,7 @@ for rep in $(seq 1 "$REPS"); do
 
     # Sampling needs a live session, and the one we started with is gone.
     if master_reopen; then
-        sample_phase blackout "$SAMPLES"
+        sample_phase blackout "$SAMPLES" "$rep"
     else
         note SKIP "keystroke latency on the relay" "no session could be established to sample"
     fi
@@ -315,7 +337,7 @@ for rep in $(seq 1 "$REPS"); do
     else
         note FAIL "session survives recovery" "a live relay session was torn down by the path returning to direct"
     fi
-    sample_phase recovered "$SAMPLES"
+    sample_phase recovered "$SAMPLES" "$rep"
     read -r opens2 fb2 carr2 <<<"$(jump_counters)"
     printf '    %-6s %-26s opens=%s fallbacks=%s carriers=%s\n' "" "(counters after recovery)" \
         "${opens2:-?}" "${fb2:-?}" "${carr2:-?}"
@@ -333,7 +355,7 @@ for rep in $(seq 1 "$REPS"); do
             note FAIL "rekey crossed" "$((kex1 - kex0)) rekey(s) then the session stopped answering"
         fi
         keep "$e" && SAMP["rekey"]+=" $e"
-        sample_phase rekey "$SAMPLES"
+        sample_phase rekey "$SAMPLES" "$rep"
     else
         # Not a pass. The client may simply not have sent enough to trip it.
         note SKIP "rekey crossed" "no KEXINIT beyond the initial one in ${HOLD_SECS}s"
@@ -363,25 +385,64 @@ done
 printf '  PASS %d   FAIL %d   SKIP %d\n' "$pass" "$fail" "$skip"
 echo "  A SKIP is not a pass: it marks a promise this run could not put to the test."
 
+# AN AGGREGATE MEDIAN ACROSS REPETITIONS MIXES TWO POPULATIONS.
+#
+# MEASURED (§44.9): repetition 1 sat at ~128 ms of baseline and repetition 2 at
+# ~113. Those are not noise around one value, they are two levels -- the second
+# repetition ran on a different state of the path -- and pooling their samples
+# produces a median that describes neither. The ratio is the quantity that
+# survives it, and V-9 already says so for throughput: a ratio against a control
+# sampled in the SAME repetition is valid whatever the line is doing, an
+# absolute is not. This table applies that rule to latency.
 echo
-echo "=== keystroke latency by phase (median ms) ==="
-printf '  %-11s %-10s %s\n' phase median 'vs baseline'
-base=$(printf '%s\n' ${SAMP["baseline"]:-} | med)
-for ph in baseline blackout recovered rekey; do
-    m=$(printf '%s\n' ${SAMP["$ph"]:-} | med)
-    LC_ALL=C awk -v p="$ph" -v m="$m" -v b="$base" 'BEGIN{
-        r = (b+0>0 && m+0>0 && p!="baseline") ? sprintf("%.2fx", m/b) : "-"
-        printf "  %-11s %-10s %s\n", p, m, r }'
+echo "=== keystroke latency, PER REPETITION (median ms, and vs that rep's own baseline) ==="
+printf '  %-4s %-11s %-10s %-10s %s\n' rep phase median warm-up 'vs its own baseline'
+declare -A RATIO
+for rep in $(seq 1 "$REPS"); do
+    rbase=$(printf '%s\n' ${RSAMP["$rep|baseline"]:-} | med)
+    for ph in baseline blackout recovered rekey; do
+        m=$(printf '%s\n' ${RSAMP["$rep|$ph"]:-} | med)
+        [ "$m" = "n/a" ] && continue
+        r=$(LC_ALL=C awk -v m="$m" -v b="$rbase" -v p="$ph" 'BEGIN{
+            if (p=="baseline") { print "-"; exit }
+            if (b+0<=0 || m+0<=0) { print "n/a"; exit }
+            printf "%.3f", m/b }')
+        case "$r" in -|n/a) ;; *) RATIO["$ph"]+=" $r" ;; esac
+        printf '  %-4s %-11s %-10s %-10s %s\n' "$rep" "$ph" "$m" "${WARM["$rep|$ph"]:-n/a}" "$r"
+    done
+done
+
+echo
+echo "=== the answer: median of the WITHIN-REPETITION ratios ==="
+printf '  %-11s %-10s %s\n' phase 'vs baseline' 'samples'
+for ph in blackout recovered rekey; do
+    printf '  %-11s %-10s %s\n' "$ph" \
+        "$(printf '%s\n' ${RATIO["$ph"]:-} | med)" "${RATIO["$ph"]:-  (none)}"
 done
 echo
-echo "  The blackout row is the price of the warm relay, measured on the same"
-echo "  session that was on QUIC a moment earlier. It is a COST, not a fault:"
-echo "  the fault would be the session not being there to measure."
+echo "  'recovered' IS the second baseline this phase was missing: it is sampled"
+echo "  after the path has returned to direct, so recovered-vs-baseline is drift"
+echo "  and nothing else, and blackout-vs-baseline is only the relay's price once"
+echo "  that drift is beside it. A recovered ratio near 1,00 makes the blackout"
+echo "  row readable as a cost; a recovered ratio as far from 1 as the blackout"
+echo "  row says this phase measured the passage of time, and the answer is"
+echo "  jump_lat's interleaved arms instead."
+echo "  The blackout row is a COST, not a fault: the fault would be the session"
+echo "  not being there to measure."
 
 echo
 echo "=== raw samples (a median with no samples beside it has not been read) ==="
+echo "  pooled across repetitions -- kept because §44.9 is quoted against it,"
+echo "  and NOT the basis of the tables above:"
 for ph in baseline blackout recovered rekey; do
     printf '  %-11s%s\n' "$ph" "${SAMP["$ph"]:-  (none)}"
+done
+echo "  per repetition, which is what the tables above are built from:"
+for rep in $(seq 1 "$REPS"); do
+    for ph in baseline blackout recovered rekey; do
+        printf '  rep %-2s %-11s warm=%-9s%s\n' "$rep" "$ph" \
+            "${WARM["$rep|$ph"]:-n/a}" "${RSAMP["$rep|$ph"]:-  (none)}"
+    done
 done
 
 # A STAGE THAT MEASURED NOTHING MUST NOT EXIT 0 -- see the note in jump_lat.sh.

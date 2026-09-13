@@ -171,13 +171,25 @@ for rep in $(seq 1 "$REPS"); do
     RECOVER+="  rep $rep:$rec"$'\n'
     scored=$((scored + 1))
 
+    # THE CLIENT'S OWN ACCOUNT, PER REPETITION.
+    # The server's pool is the state (P-12); this is what decides WHY it is
+    # empty, and every line that matters is at `info` except the close itself:
+    #   "direct udp carrier ready"        -- it came up
+    #   "direct udp carrier closed"       -- DEBUG, so normally invisible
+    #   "scheduling direct udp renewal"   -- the client noticed and backed off
+    #   "requesting public udp renewal"   -- the renewal actually went out
+    # A pool that is empty with NO renewal line is a different defect from one
+    # that is empty despite repeated renewal lines.
+    echo "    client log (direct/renew lines only):"
+    vm "grep -aE 'direct udp carrier|udp renewal|direct connection|udp direct' \$HOME/out/poollife-$Q.log 2>/dev/null | tail -n 20" 2>/dev/null \
+        | sed 's/^/      /'
+    [ -n "$(vm "grep -acE 'udp renewal' \$HOME/out/poollife-$Q.log 2>/dev/null" 2>/dev/null | tr -d '[:space:]')" ] || \
+        echo "      (no renewal line at all -- note the carrier close is logged at DEBUG)"
+
     down_one "$Q"; down_one "$R"
     cool 30
 done
 
-echo
-echo "=== what the client itself said (complementary -- the SERVER's pool is the state) ==="
-vm "tail -n 25 \$HOME/out/poollife-$Q.log 2>/dev/null" 2>/dev/null | sed 's/^/    /'
 
 echo
 echo "=== verdict ==="

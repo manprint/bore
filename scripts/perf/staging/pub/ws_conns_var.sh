@@ -167,12 +167,28 @@ echo
 up "$R" ""      || { echo "relay arm failed to register"; exit 1; }
 up "$Q" "--udp" || { echo "quic arm failed to register"; exit 1; }
 
+# WHICH TRANSPORT ACTUALLY CARRIED THIS CELL -- read from the SERVER, per cell.
+# This stage used to take the arm's LABEL as the transport, and §48 is why that
+# is no longer acceptable: a public `--udp` tunnel can lose its direct carrier
+# silently and serve every later connection on the relay while still looking
+# healthy. An unverified `quic` arm is then a relay arm wearing the wrong label,
+# and two arms that are secretly the same transport agree beautifully -- which
+# is the one result this stage could never tell apart from a real finding.
+# Cheap by construction: one admin call per cell, zero bytes.
+path_of() { # <port> -> "<current_path>/<direct_pool>/<direct_fallbacks>"
+    adm tunnels 2>/dev/null | jq -r --argjson p "$1" \
+        '[.[]|select(.public_port==$p)] as $t | if ($t|length)==0 then "gone/?/?" else
+         "\($t[0].current_path // "?")/\($t[0].direct_pool // "?")/\($t[0].direct_fallbacks // 0)" end' \
+        2>/dev/null || printf '?/?/?'
+}
+
 cell() { # arm port n rep
     local arm="$1" port="$2" n="$3" rep="$4"
-    local sb vb sa va mbs t0 t1
+    local sb vb sa va mbs t0 t1 pth
     sb=$(snap_srv); vb=$(snap_vm); t0=$(date +%s.%N)
     mbs=$(g "$port" "$n")
     t1=$(date +%s.%N); sa=$(snap_srv); va=$(snap_vm)
+    pth=$(path_of "$port")
 
     local sal val_ scpu vcpu secs flag=''
     sal=$(allow_line "$sb" "$sa"); val_=$(allow_line "$vb" "$va")
@@ -183,8 +199,10 @@ cell() { # arm port n rep
 
     [ -n "${mbs:-}" ] && SAMP["$arm|$n"]+=" $mbs"
     local row
-    row=$(printf '    rep %-3s n=%-2s %-5s %-9s %5ss | srv %s %s | vm %s %s%s' \
-        "$rep" "$n" "$arm" "${mbs:-FAILED}" "$secs" "$sal" "$scpu" "$val_" "$vcpu" "$flag")
+    # The path column sits BEFORE the counters because it decides whether the
+    # counters describe the experiment the label claims.
+    row=$(printf '    rep %-3s n=%-2s %-5s %-9s %5ss %-16s | srv %s %s | vm %s %s%s' \
+        "$rep" "$n" "$arm" "${mbs:-FAILED}" "$secs" "$pth" "$sal" "$scpu" "$val_" "$vcpu" "$flag")
     echo "$row"; ROWS+=("$row")
     cool "$COOL"
 }

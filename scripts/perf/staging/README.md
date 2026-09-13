@@ -1217,6 +1217,24 @@ do not "simplify" them back out.
     V-11 already forces every summary to print its raw samples beside it: the
     corrected table was recomputed from the artefact, with no re-run.
 
+49. **AN ARM'S LABEL IS NOT ITS TRANSPORT, AND TWO ARMS THAT ARE SECRETLY THE
+    SAME ONE AGREE BEAUTIFULLY.** `jump_lat` has always verified its direct arm
+    from the admin API, with the comment "an unverified 'direct' arm is a relay
+    measurement wearing the wrong label". §48 turned that from prudence into a
+    requirement: a public `--udp` tunnel can lose its direct carrier **silently**
+    — nothing closes, the client never renews, the removal is logged at `debug`
+    — and serve every later connection on the relay while the admin API still
+    lists it as a healthy `--udp` tunnel. `ws_conns.sh` and `ws_conns_var.sh`
+    took the label as the transport, so nothing in their artefacts can now
+    establish which transport carried the `quic` arm. Note what that does to a
+    RESULT: if the arm silently fell back, the comparison is relay against
+    relay, which produces close agreement — and "the two transports are equal"
+    is exactly the conclusion §35 drew at 0.9995. Both stages now print
+    `current_path/direct_pool/direct_fallbacks` per cell, read from the SERVER
+    (P-12), at the cost of one admin call and zero bytes. A stage that names a
+    transport must read it back; the cheapest possible column is the one that
+    decides whether every other column means what it says.
+
 ---
 
 ## 6. Where the results live

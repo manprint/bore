@@ -83,8 +83,8 @@ non il prodotto. Dettagli e tabelle: §38 delle evidenze.
 | secret | **92–94 %** | e regge sotto concorrenza, +0,2 ms |
 | VPN diretto | **94,2 % su / 89,3 % giù** | il "deficit del 37 %" era la radio |
 | VPN relay | **50 % giù / 63 % su** | 467/474 Mbit/s contro 933/748, a **~1 core intero**. Il braccio di controllo (doppio transito senza bore) è bloccato dai security group: il rapporto è pubblicato, la separazione fra deployment e codice **no** — §28 |
-| public, 1–2 connessioni | **96,8–98,3 %** della linea (relay) | e il percorso diretto non serve a questo: 0,96–0,98 del relay. A connessione singola i due trasporti sono pari entro l'**1 ‰** (0,9995) — §35 |
-| public, 4+ connessioni | **non citabile** | la cella ripetuta ha un'escursione del **38 %** a n≥4 (contro il 2–6 % a n=1 e n=2), quindi la separazione fra i due bracci su cui §36 concludeva non regge alla replica: rimisurate, le due celle si sovrappongono su quasi tutto l'intervallo. §36 è **ritirato** e con esso la sua correzione. Il ladder pubblico va citato **fino a n=2**. Perché la varianza compaia a n≥4 resta aperto, con tre candidati non separati — §42 |
+| public, 1–2 connessioni | **96,8–98,3 %** della linea (relay) | e il percorso diretto non serve a questo: 0,96–0,98 del relay. A connessione singola i due trasporti sono pari entro l'**1 ‰** (0,9995) — §35. **Da leggere con la riserva di §50.1**: quelle fasi non rileggevano il trasporto dal server, e §48 rende la riserva concreta — un braccio `--udp` che ha perso il carrier serve tutto sul relay senza dirlo, e due bracci che sono in segreto lo stesso trasporto si somigliano moltissimo. La cifra resta pubblicata perché è quella misurata; quello che non è dimostrato è **quale trasporto** l'ha prodotta |
+| public, 4+ connessioni | **non citabile**, e ora per **due** ragioni | la cella ripetuta ha un'escursione del **38 %** a n≥4 (contro il 2–6 % a n=1 e n=2), quindi la separazione fra i due bracci su cui §36 concludeva non regge alla replica: rimisurate, le due celle si sovrappongono su quasi tutto l'intervallo. §36 è **ritirato** e con esso la sua correzione. Il ladder pubblico va citato **fino a n=2**. Perché la varianza compaia a n≥4 resta aperto, con tre candidati non separati — §42. **La seconda ragione è §50**: la fase non rileggeva il trasporto dal server, quindi non è dimostrato che il braccio `quic` sia andato su UDP. Corretto nell'harness (una chiamata all'admin API per cella, zero byte); i dati già raccolti non si possono però correggere a posteriori |
 | public, asimmetria | download/upload **1,116** (appaiato) | l'asimmetria del tunnel era **della radio**: in WiFi 0,38, cablata 1,116 — invertita, non ridotta. L'allowance in **uscita** dell'istanza è assolta da sei bracci con delta zero. Le percentuali sulla linea restano **provvisorie** finché `asym_qualify` non gira in questa finestra — §34 |
 | jump host, apertura sessione | **250 ms** di handshake esterno + canale (era 1249) | di cui **~46 ms sono bore**: il resto è l'handshake SSH imposto da RFC 4253/4252. Il secondo che c'era prima era un `sleep` di russh, corretto — §44.2, §44.5 |
 | jump host, tasto a sessione aperta | `chan` **87–89 ms**, `echo` **129–130 ms** | due attraversate della forcina a due host; il termine di bore non è misurabile a questa scala |
@@ -597,7 +597,7 @@ numeri che sembrano veri.
     spostando il doppione in fondo come **46** invece di rinumerare sul posto:
     spostarne uno tiene valide dodici citazioni, rinumerare le rompe tutte.
     Verificato con un controllo che confronta ogni numero scritto con la sua
-    posizione — oggi **48 su 48**.
+    posizione — oggi **49 su 49**.
 31. **`med()` rifiutava i numeri NEGATIVI, e il bias inventava sempre un
     costo.** Il filtro della mediana condivisa era `^[0-9]+(\.[0-9]+)?$`:
     senza segno. Un `-0,2` finiva nel ramo «non è un numero» — scartato dalla
@@ -686,10 +686,10 @@ Dettaglio in §25–26 delle evidenze. In breve:
 | domande aperte | `scripts/perf/staging/rerun_open.sh` — il driver nato **dentro** la finestra, per le fasi che nessuna domanda del piano prevedeva: `ws_conns_var`, `udp_pktsize`, `ws_first_conn` con il ritardo come asse, `vpn_carriers` in profondità, `jump_stab` ripetuto |
 | costo AWS | `aws_cost.sh` (finestra) e `cost_watch.sh` (per fase) |
 | scansione segreti | `secret_scan.sh` — i pattern arrivano da `~/.config/bore-perf/env.sh`, **mai** dal repository |
-| lint dell'harness | `lint.sh` — **sette compilatori**: `bash -n`, shellcheck mirato, `unbound_scan.sh` (variabili lette e mai assegnate), `shadow_scan.sh` (array che oscura uno scalare di libreria), `order_scan.sh` (chiamata di livello superiore prima della definizione), e il cancello V-11 che rifiuta un `sort -n` senza `LC_ALL=C`, e il controllo che l'elenco delle trappole numeri sé stesso onestamente (ogni numero scritto uguale alla posizione che markdown renderà). Oggi: **151 file puliti, 48 trappole coerenti** |
+| lint dell'harness | `lint.sh` — **sette compilatori**: `bash -n`, shellcheck mirato, `unbound_scan.sh` (variabili lette e mai assegnate), `shadow_scan.sh` (array che oscura uno scalare di libreria), `order_scan.sh` (chiamata di livello superiore prima della definizione), e il cancello V-11 che rifiuta un `sort -n` senza `LC_ALL=C`, e il controllo che l'elenco delle trappole numeri sé stesso onestamente (ogni numero scritto uguale alla posizione che markdown renderà). Oggi: **152 file puliti, 49 trappole coerenti** |
 | guardia di contesa | `driverlib.sh` — sorgente dei quattro driver **e** della finestra di build: un solo file identifica un processo da `/proc/<pid>/cmdline`, mai dal testo della riga di comando |
 | segreti nei risultati | `secret_scan.sh --out` — **prima** di citare un `.out` in un documento |
-| runbook e **48 trappole** | `scripts/perf/staging/README.md` |
+| runbook e **49 trappole** | `scripts/perf/staging/README.md` |
 | coordinate e credenziali | `~/.config/bore-perf/env.sh` (fuori dal repo, 600) |
 
 Ogni fase scrive `out/eth/<fase>.out` e un marker `_done.<fase>`; un driver

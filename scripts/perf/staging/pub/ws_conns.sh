@@ -104,6 +104,22 @@ g() { python3 "$RAWCLI" get "$BORE_GW" "$1" "$(per_conn "$2")" "$2" 2>/dev/null 
 # EVIDENCE FILE, which is precisely how coordinates escape: through prose and
 # output, never through code.
 declare -A SAMP      # SAMP[arm|n] = space separated MB/s samples
+
+# WHICH TRANSPORT ACTUALLY CARRIED THE QUIC ARM -- read from the SERVER, per
+# rung. This ladder used to take the arm's LABEL as the transport. §48 is why
+# that is no longer acceptable: a public `--udp` tunnel can lose its direct
+# carrier silently and serve every later connection on the relay while still
+# looking healthy, so an unverified `quic` arm may be a relay arm under another
+# name -- and two arms that are secretly the same transport agree closely,
+# which this stage could never distinguish from a real finding. One admin call
+# per rung, zero bytes. The relay arm needs no such column: it has no direct
+# path to lose.
+path_of() { # <port> -> "<current_path>/<direct_pool>/<direct_fallbacks>"
+    adm tunnels 2>/dev/null | jq -r --argjson p "$1" \
+        '[.[]|select(.public_port==$p)] as $t | if ($t|length)==0 then "gone/?/?" else
+         "\($t[0].current_path // "?")/\($t[0].direct_pool // "?")/\($t[0].direct_fallbacks // 0)" end' \
+        2>/dev/null || printf '?/?/?'
+}
 if [ -n "$PER_FIXED" ]; then
     echo "=== download vs connection count -- $((PER_FIXED/1048576)) MiB PER CONNECTION (legacy shape), carriers=1 ==="
 else
@@ -122,10 +138,10 @@ for rep in $(seq 1 "$REPS"); do
     echo "  --- rep $rep  (rungs: $order)"
     for n in $order; do
         a=$(g "$R" "$n"); cool "$COOL"
-        b=$(g "$Q" "$n"); cool "$COOL"
+        b=$(g "$Q" "$n"); qp=$(path_of "$Q"); cool "$COOL"
         [ -n "${a:-}" ] && SAMP["relay|$n"]+=" $a"
         [ -n "${b:-}" ] && SAMP["quic|$n"]+=" $b"
-        printf '    n=%-3s relay=%-9s quic=%-9s\n' "$n" "${a:-FAILED}" "${b:-FAILED}"
+        printf '    n=%-3s relay=%-9s quic=%-9s  quic_path=%s\n' "$n" "${a:-FAILED}" "${b:-FAILED}" "$qp"
     done
 done
 

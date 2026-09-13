@@ -101,7 +101,7 @@ Tutto quello che segue è nel repository e non richiede di ricostruire nulla:
 |---|---|
 | driver dello sweep | `scripts/perf/staging/rerun_eth.sh` |
 | driver dell'attribuzione | `scripts/perf/staging/rerun_eth_p7.sh` (si rifiuta di partire se il primo è vivo) |
-| runbook completo dell'harness | `scripts/perf/staging/README.md` — §3.8 VPN, §3.9 jump host, §3.10 **qualificare la linea prima di citare qualunque valore assoluto**, e le 48 trappole |
+| runbook completo dell'harness | `scripts/perf/staging/README.md` — §3.8 VPN, §3.9 jump host, §3.10 **qualificare la linea prima di citare qualunque valore assoluto**, e le 49 trappole |
 | evidenze del cablato | `docs/performance/ETH_RERUN_EVIDENCE_2026-09-12.md` |
 | coordinate e credenziali | `~/.config/bore-perf/env.sh` (fuori dal repo, 600); il template vuoto è `scripts/perf/staging/env.sh.example` |
 

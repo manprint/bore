@@ -4443,3 +4443,58 @@ distinguere «il percorso diretto si assesta» da «il percorso diretto è stato
 rimosso». Si richiude con una riga sola di lavoro — rieseguire questa fase
 contro un server **con la correzione** — e allora le nove celle misurano tutte
 quello che dicono di misurare.
+
+## 50. Una conseguenza di §48 che tocca risultati già pubblicati: l'etichetta di un braccio non è il suo trasporto
+
+### 50.1 Quali fasi rileggono il trasporto, e quali no
+
+`jump_lat` verifica il proprio braccio diretto dall'admin API da sempre, e il
+commento in testa alla funzione dice perché: «un braccio "direct" non verificato
+è una misura di relay con l'etichetta sbagliata». Finché il percorso diretto
+moriva **rumorosamente** quella era prudenza. §48 la rende un requisito: un
+tunnel public `--udp` può perdere il carrier **in silenzio** — non si chiude
+niente, il client non rinnova, la rimozione è a `debug` — e servire ogni
+connessione successiva sul relay mentre l'admin API continua a elencarlo come un
+tunnel `--udp` sano.
+
+Passate in rassegna le fasi public:
+
+| fase | rileggeva il trasporto? |
+|---|---|
+| `ws_first_conn`, `ws_dl`, `ws_pub`, `pktrate`, i quattro `vm_pub_*` | **sì** |
+| `ws_conns`, `ws_conns_var` | **no** |
+
+Le due che non lo rileggevano sono esattamente quelle dietro il ladder public
+(§36) e l'analisi di varianza (§42, §46).
+
+### 50.2 Perché la riserva è concreta e non teorica
+
+Se il braccio `quic` fosse caduto sul relay senza dirlo, il confronto sarebbe
+**relay contro relay** — e due bracci che sono in segreto lo stesso trasporto si
+somigliano moltissimo. Il risultato che ne uscirebbe è «i due trasporti sono
+pari», che è precisamente la conclusione di §35 a **0,9995**.
+
+Questo **non** dimostra che §35 e §36 siano sbagliati. Dimostra che i loro
+artefatti non contengono l'informazione che servirebbe a escluderlo, e la
+differenza fra le due affermazioni è tutto quello che questa campagna cerca di
+difendere. Quello che resta vero senza riserve è la cifra del braccio **relay**,
+che non ha percorso diretto da perdere.
+
+Va anche detto cosa **non** è in dubbio: `ws_conns_var` registra i due tunnel
+**una volta sola** e li tiene per tutta l'esecuzione, quindi P-14 non si arma
+*dentro* una corsa — il difetto ha bisogno di una **ri-registrazione sulla stessa
+porta**, che è ciò che `ws_first_conn` fa a ogni cella e che l'ha esposto. La
+riserva è dunque «non verificato», non «probabilmente falso».
+
+### 50.3 La correzione all'harness, e cosa costa
+
+Entrambe le fasi ora stampano, per cella, `current_path/direct_pool/direct_fallbacks`
+letti **dal server** (P-12: lo stato si legge dal kernel o dal server, mai dal
+log). Costa una chiamata all'admin API per cella e **zero byte**. È la colonna
+più economica dell'intero harness ed è quella che decide se tutte le altre
+significano quello che dicono. Trappola 49.
+
+Nota di metodo: questa riserva non nasce da una nuova misura ma dal **fare le
+conseguenze** di una misura già fatta. Un difetto trovato in una fase va
+riportato all'indietro su tutte le fasi che ne condividono il presupposto —
+qui il presupposto era «il braccio etichettato `--udp` va davvero su UDP».

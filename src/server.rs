@@ -1697,14 +1697,27 @@ impl Server {
                                                         match entry.direct.install(direct.clone()) {
                                                             Some(id) => {
                                                                 info!(key = %key, id, carriers = entry.direct.len(), "public QUIC direct carrier established");
-                                                                let public_reg = public_reg.clone();
+                                                                // Remove from the pool this carrier was INSTALLED
+                                                                // into, never from whatever the key resolves to
+                                                                // at close time. A tunnel that re-registers on
+                                                                // the same port gets a FRESH PublicDirectEntry
+                                                                // whose DirectPool ids restart at 0, so a stale
+                                                                // monitor re-resolving `port:<N>` removed id 0
+                                                                // from the NEW tunnel's pool -- evicting a live
+                                                                // carrier. MEASURED: FRESH port survived 45 s
+                                                                // idle 2/2, RECYCLED port died at t=12 s 2/2
+                                                                // (the previous connection's idle timeout),
+                                                                // while tcpdump showed that connection still
+                                                                // exchanging keep-alives. See §48.
+                                                                // `Weak`, not `Arc`: a monitor waiting on a
+                                                                // connection that outlives the registration must
+                                                                // not keep the entry alive (I-SSH10's precedent).
+                                                                let entry_ref =
+                                                                    Arc::downgrade(&entry);
                                                                 tokio::spawn(async move {
                                                                     direct.closed().await;
-                                                                    if let Some(entry) = public_reg
-                                                                        .get(&key)
-                                                                        .map(|e| {
-                                                                            Arc::clone(e.value())
-                                                                        })
+                                                                    if let Some(entry) =
+                                                                        entry_ref.upgrade()
                                                                     {
                                                                         entry.direct.remove(id);
                                                                         debug!(key = %key, id, carriers = entry.direct.len(), "public QUIC direct carrier closed");
@@ -1729,12 +1742,19 @@ impl Server {
                                                     match entry.direct.install(direct.clone()) {
                                                         Some(id) => {
                                                             info!(subdomain = %key, id, carriers = entry.direct.len(), "vhost QUIC direct carrier established");
-                                                            let vhost_reg = vhost_reg.clone();
+                                                            // Same defect, same fix as the public branch above:
+                                                            // a provider that reconnects gets a fresh VhostEntry
+                                                            // under the same label, whose DirectPool ids restart
+                                                            // at 0, so the previous provider's monitor evicted
+                                                            // the new provider's live carrier. vhost is the MORE
+                                                            // exposed of the two -- a provider reconnects as a
+                                                            // matter of course (autossh, restart, a network
+                                                            // blip) and every reconnection armed one of these.
+                                                            let entry_ref = Arc::downgrade(&entry);
                                                             tokio::spawn(async move {
                                                                 direct.closed().await;
-                                                                if let Some(entry) = vhost_reg
-                                                                    .get(&key)
-                                                                    .map(|e| Arc::clone(e.value()))
+                                                                if let Some(entry) =
+                                                                    entry_ref.upgrade()
                                                                 {
                                                                     entry.direct.remove(id);
                                                                     debug!(subdomain = %key, id, carriers = entry.direct.len(), "vhost QUIC direct carrier closed");

@@ -5,6 +5,7 @@
 //! or by measuring throughput improvements and validating the tunnel works.
 #![cfg(feature = "udp")]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -503,6 +504,144 @@ async fn public_tcp_still_works_without_udp() -> Result<()> {
 
     // TCP relay should work when UDP is not requested
     assert_eq!(round_trip(remote_addr, b"tcp only").await?, b"tcp only");
+
+    Ok(())
+}
+
+/// A tunnel that re-registers on the same port must keep ITS OWN direct carrier
+/// when the PREVIOUS tunnel's connection finally closes.
+///
+/// THE DEFECT THIS REFUSES (§48, measured in the field before it was fixed).
+/// `Server::serve_tunnel` builds a fresh `PublicDirectEntry` on every
+/// registration, so its `DirectPool` ids restart at 0, and it inserts it under
+/// the same `port:<N>` key. The close monitor used to re-resolve that key AT
+/// CLOSE TIME, so when the previous tunnel's connection closed its monitor
+/// found the entry that existed NOW and removed id 0 from it -- evicting the
+/// new tunnel's live carrier. Every later connection then took the relay, for
+/// the life of the tunnel, and nothing said so: the QUIC connection was never
+/// closed (so the client never noticed and never renewed), the direct pool is
+/// topped up ONLY by that close signal, and the removal is logged at `debug`.
+///
+/// Field measurement: a port nobody had used survived 45 s of idle 2/2, while
+/// the same port re-registered right after a tunnel died on it lost its carrier
+/// at t=12 s 2/2 -- the previous connection's QUIC idle timeout.
+///
+/// WHY THE OLD CONNECTION IS CLOSED BY HAND HERE. In the field the old client
+/// was killed, so its socket vanished and the server's side idle-timed-out ten
+/// seconds later -- comfortably after the new tunnel had registered. In process
+/// the old client's direct task is still alive and still answering keep-alives,
+/// so the connection would never close on its own. The test therefore holds the
+/// OLD entry (the registry drops it, but an `Arc` keeps it reachable) and closes
+/// its pool at exactly the moment the field arranged by accident: after the new
+/// tunnel is up. That is the whole experiment, and it is what makes this a
+/// red-check rather than a smoke test -- revert the fix and the assertion at the
+/// end reads 0 instead of 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reregistered_tunnel_keeps_its_carrier_when_the_previous_one_closes() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+
+    let reg = spawn_server_udp().await?;
+    let echo_port = spawn_echo_service().await?;
+
+    let opts = || bore_cli::shared::TunnelOptions {
+        https: false,
+        force_https: false,
+        basic_auth: None,
+        notes: None,
+        carriers: 1,
+        udp: true,
+        auto_reconnect: false,
+        webserver_log: false,
+        max_conns: 0,
+        local_host: None,
+        local_port: 0,
+        https_policy: None,
+        ctrl_heartbeat: false,
+    };
+
+    // The first tunnel on this port.
+    let first = Client::new(
+        "localhost",
+        echo_port,
+        "localhost",
+        0,
+        None,
+        false,
+        opts(),
+        None,
+    )
+    .await?;
+    let port = first.remote_port();
+    let first_task = tokio::spawn(first.listen());
+    wait_for_direct_carrier(&reg, port, 1).await;
+
+    // Keep the OLD entry reachable after the registry drops it. This is the
+    // stale monitor's victim-to-be, and holding it is how the test can decide
+    // WHEN that monitor fires instead of waiting on an idle timeout.
+    let old_entry = reg
+        .get(&format!("port:{port}"))
+        .map(|e| Arc::clone(e.value()))
+        .expect("the first tunnel must be registered");
+
+    // Drop the first tunnel's control connection. Its detached direct task
+    // stays alive, so the old QUIC connection stays OPEN -- exactly the state a
+    // killed client leaves behind for the length of its idle timeout.
+    first_task.abort();
+    let deadline = time::Instant::now() + Duration::from_secs(5);
+    while reg.get(&format!("port:{port}")).is_some() {
+        assert!(
+            time::Instant::now() < deadline,
+            "the server never released port {port} after the first tunnel ended"
+        );
+        time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The second tunnel, on the SAME port: a fresh entry, a fresh pool, and a
+    // carrier that is once again id 0.
+    let second = Client::new(
+        "localhost",
+        echo_port,
+        "localhost",
+        port,
+        None,
+        false,
+        opts(),
+        None,
+    )
+    .await?;
+    assert_eq!(
+        second.remote_port(),
+        port,
+        "the re-registration must reuse the port"
+    );
+    let _second_task = tokio::spawn(second.listen());
+    wait_for_direct_carrier(&reg, port, 1).await;
+
+    // Now let the PREVIOUS tunnel's connection close, which is what arms the
+    // stale monitor.
+    old_entry.direct.close_all();
+
+    // The new tunnel's carrier must survive it. Poll rather than sleep once, so
+    // a slow monitor is still caught rather than silently passing.
+    let deadline = time::Instant::now() + Duration::from_secs(2);
+    while time::Instant::now() < deadline {
+        assert_eq!(
+            direct_carriers(&reg, port),
+            1,
+            "the previous tunnel's close monitor evicted the CURRENT tunnel's \
+             live direct carrier: both pools mint id 0, so re-resolving the \
+             registry key at close time cannot tell them apart (§48)"
+        );
+        time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // And the surviving carrier is a working one, not merely a counter.
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    assert_eq!(round_trip(addr, b"still-direct").await?, b"still-direct");
+    assert!(
+        direct_opens(&reg, port) > 0,
+        "the re-registered tunnel served on the relay, so its direct path is gone"
+    );
 
     Ok(())
 }

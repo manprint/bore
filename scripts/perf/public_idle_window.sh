@@ -87,6 +87,7 @@
 #   scripts/perf/public_idle_window.sh quicport     # --vhost-quic-port with no vhost
 #   scripts/perf/public_idle_window.sh healthy      # a short deadline must not break a lossy path
 #   scripts/perf/public_idle_window.sh relaypath    # a relay-only tunnel reports "relay", not "unknown"
+#   scripts/perf/public_idle_window.sh poolrecycle  # a re-registered tunnel keeps its own direct carrier
 #   scripts/perf/public_idle_window.sh fdbudget     # --max-conns is reconciled with RLIMIT_NOFILE
 #   scripts/perf/public_idle_window.sh udpbuf       # the shared QUIC endpoint runs on a tuned socket
 #
@@ -744,9 +745,143 @@ run_udpbuf() {
     esac
 }
 
+
+# ---------------------------------------------------------------------------
+# T-PUB-POOLRECYCLE: a tunnel that re-registers on a port must keep ITS OWN
+# direct carrier when the PREVIOUS tunnel's connection finally closes (P-14).
+#
+# The server builds a FRESH `PublicDirectEntry` per registration, so its
+# `DirectPool` ids restart at 0, and inserts it under the same `port:<N>` key.
+# The close monitor used to re-resolve that key AT CLOSE TIME, so the previous
+# tunnel's monitor removed id 0 from the CURRENT tunnel's pool -- evicting a
+# live carrier. Every later connection then took the relay for the life of the
+# tunnel, silently: nothing closed, so the client never renewed, and the removal
+# is logged at `debug`.
+#
+# WHY THIS ARM EXISTS ALONGSIDE THE CARGO TEST. In process the old client's
+# direct task stays alive and keeps answering keep-alives, so its connection
+# never closes on its own and the cargo test has to close it by hand. Here the
+# client is a real PROCESS and is KILLED, so its socket vanishes and the
+# server's side idle-times-out exactly as it did in the field -- comfortably
+# after the new tunnel registered. That is the condition an in-process test
+# cannot reproduce, which is precisely why the defect survived the existing
+# suite.
+#
+# The server's idle timeout is shortened so the dead connection's close lands
+# in seconds rather than ten; QUIC negotiates the minimum of the two advertised
+# values, and the client keeps the shipped default.
+# ---------------------------------------------------------------------------
+poolrecycle_case() { # -> prints "pool=<n> established=<count>"
+    unshare -rn bash -s "$BIN" <<'INNER'
+set -uo pipefail
+BIN=$1
+ip link set lo up
+RUN=$(mktemp -d)
+SEC=poolrecycle; TOK=perf-public-poolrecycle-token-0123456789abcdef
+CTRL=17871; PUB=19131; QUIC=17872; ORIGIN=18141
+
+# No origin is needed: this arm never proxies a byte. The direct carrier is
+# established from the tunnel's registration, not from traffic, and the pool
+# count is what is being read.
+env BORE_DIRECT_QUIC_IDLE_MS=2000 \
+  "$BIN" server --secret "$SEC" --udp --min-port "$PUB" --max-port "$PUB" \
+    --vhost-base-domain t.local --vhost-http-port 18191 \
+    --vhost-quic-port "$QUIC" --control-port "$CTRL" \
+    --admin-token "$TOK" >"$RUN/server.log" 2>&1 &
+SRV=$!
+for _ in $(seq 40); do
+  curl -fsS -m 1 -o /dev/null "http://127.0.0.1:$CTRL/admin/api/v1/config" \
+      -H "Authorization: Bearer $TOK" 2>/dev/null && break
+  sleep 0.25
+done
+
+pool_now() {
+  curl -fsS -m 2 "http://127.0.0.1:$CTRL/admin/api/v1/tunnels" \
+      -H "Authorization: Bearer $TOK" 2>/dev/null \
+    | jq -r --argjson p "$PUB" \
+        '[.[]|select(.public_port==$p)] as $t | if ($t|length)==0 then "absent" else "\($t[0].direct_pool)" end' 2>/dev/null
+}
+# `grep -c` prints 0 AND exits 1 when it counts nothing, so a `|| echo 0`
+# tail emits TWO lines and every later `-ge` comparison dies with "integer
+# expression expected" -- the wait loop below then never succeeds, the premise
+# never arms, and the arm reports "did not run". Capture, then default.
+# (`jump_stab.sh` had already learned this; the lesson did not travel.)
+carriers_established() {
+  local n
+  n=$(grep -c 'public QUIC direct carrier established' "$RUN/server.log" 2>/dev/null)
+  echo "${n:-0}"
+}
+
+# --- the FIRST tunnel on this port
+env -u BORE_DIRECT_QUIC_IDLE_MS \
+  "$BIN" local "$ORIGIN" --to "127.0.0.1:$CTRL" --port "$PUB" \
+    --secret "$SEC" --udp >"$RUN/client1.log" 2>&1 &
+C1=$!
+for _ in $(seq 60); do [ "$(carriers_established)" -ge 1 ] && break; sleep 0.25; done
+
+# --- kill it for real, and wait for the server to release the port
+kill -9 "$C1" 2>/dev/null
+for _ in $(seq 80); do [ "$(pool_now)" = absent ] && break; sleep 0.25; done
+
+# --- the SECOND tunnel, same port: fresh entry, fresh pool, id 0 again
+env -u BORE_DIRECT_QUIC_IDLE_MS \
+  "$BIN" local "$ORIGIN" --to "127.0.0.1:$CTRL" --port "$PUB" \
+    --secret "$SEC" --udp >"$RUN/client2.log" 2>&1 &
+C2=$!
+for _ in $(seq 60); do [ "$(carriers_established)" -ge 2 ] && break; sleep 0.25; done
+EARLY=$(pool_now)
+
+# --- now let the DEAD client's connection idle out, which arms its monitor
+sleep 6
+echo "early=$EARLY pool=$(pool_now) established=$(carriers_established)"
+
+# Cleanup is BEST EFFORT and must not become the verdict: `kill -9` on a client
+# that already died returns non-zero, and the inner shell's status is the status
+# of its last command -- so a run that measured everything correctly was reported
+# as "T-PUB-POOLRECYCLE did not run". The premise check downstream (`est >= 2`)
+# is the real guard and it is explicit; this exit is not allowed to pre-empt it.
+kill -9 "$C2" "$SRV" 2>/dev/null || true
+exit 0
+INNER
+}
+
+run_poolrecycle() {
+    echo "########## T-PUB-POOLRECYCLE: a re-registered tunnel keeps its own direct carrier"
+    local out early pool est
+    # Judge the OUTPUT, not the exit status -- see the cleanup note above.
+    out=$(poolrecycle_case)
+    [ -n "$out" ] || { fail "T-PUB-POOLRECYCLE did not run (no output at all)"; return; }
+    echo "  $out"
+    early=$(printf '%s' "$out" | grep -oE 'early=[a-z0-9]+' | cut -d= -f2)
+    pool=$(printf  '%s' "$out" | grep -oE 'pool=[a-z0-9]+'  | cut -d= -f2)
+    est=$(printf   '%s' "$out" | grep -oE 'established=[0-9]+' | cut -d= -f2)
+
+    # The PREMISE first: without two real registrations and a carrier on each,
+    # a surviving pool proves nothing.
+    if [ "${est:-0}" -ge 2 ]; then
+        pass "T-PUB-POOLRECYCLE: both tunnels established a direct carrier (established=$est)"
+    else
+        fail "T-PUB-POOLRECYCLE: only $est carrier(s) were established -- the premise failed, so the result below is not a measurement"
+        return
+    fi
+    if [ "${early:-0}" = "1" ]; then
+        pass "T-PUB-POOLRECYCLE: the second tunnel had its carrier before the old one closed"
+    else
+        fail "T-PUB-POOLRECYCLE: the second tunnel never had a carrier (early=$early)"
+        return
+    fi
+    # THE CLAIM: the dead tunnel's close must not reach the live tunnel's pool.
+    if [ "${pool:-x}" = "1" ]; then
+        pass "T-PUB-POOLRECYCLE: the carrier survived the previous tunnel's close (pool=1)"
+    else
+        fail "T-PUB-POOLRECYCLE: pool=$pool -- the previous tunnel's close monitor evicted the current tunnel's live carrier (P-14)"
+    fi
+}
+
 case "${1:-all}" in
     deadline) run_deadline ;;
     relaypath) run_relaypath ;;
+    poolrecycle) run_poolrecycle ;;
     fdbudget) run_fdbudget ;;
     udpbuf)   run_udpbuf ;;
     ladder)   run_ladder ;;
@@ -756,7 +891,7 @@ case "${1:-all}" in
     healthy)  run_healthy ;;
     all)      run_deadline; echo; run_ladder; echo; run_idle; echo
               run_recover; echo; run_quicport; echo; run_healthy; echo
-              run_relaypath; echo; run_fdbudget; echo; run_udpbuf ;;
+              run_relaypath; echo; run_poolrecycle; echo; run_fdbudget; echo; run_udpbuf ;;
     *)        echo "unknown mode: $1" >&2; exit 2 ;;
 esac
 

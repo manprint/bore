@@ -18,10 +18,10 @@ Un servizio SSH locale può essere registrato in due modi:
 | OpenSSH puro | `ssh -R jump/...` | username + chiave/password del gateway | solo TCP dentro la sessione SSH |
 
 Entrambi creano lo stesso nome logico nel deployment di test, per esempio
-`vm-test-01.ssh.bore.0912345.xyz`. L'operatore usa OpenSSH standard:
+`vm-test-01.ssh.brp.0912345.xyz`. L'operatore usa OpenSSH standard:
 
 ```bash
-ssh -J bore.0912345.xyz ubuntu@vm-test-01.ssh.bore.0912345.xyz
+ssh -J brp.0912345.xyz ubuntu@vm-test-01.ssh.brp.0912345.xyz
 ```
 
 Il server bore termina soltanto la sessione SSH esterna verso il gateway. La
@@ -50,9 +50,9 @@ La sola riga nuova richiesta nel Compose di test è il namespace jump:
      environment:
        - BORE_VHOST_QUIC_PORT=443
        - BORE_SSH_GATEWAY=true
-       - BORE_SSH_ADVERTISE_ADDRESS=bore.0912345.xyz
+       - BORE_SSH_ADVERTISE_ADDRESS=brp.0912345.xyz
        - BORE_SSH_ADVERTISE_PORT=443
-+      - BORE_SSH_JUMP_BASE_DOMAIN=ssh.bore.0912345.xyz
++      - BORE_SSH_JUMP_BASE_DOMAIN=ssh.brp.0912345.xyz
 ```
 
 Note operative:
@@ -66,13 +66,13 @@ Note operative:
 - se i valori di `BORE_SECRET`/`BORE_ADMIN_TOKEN` incollati nel Compose sono
   reali e il contesto in cui sono stati condivisi non è strettamente privato,
   ruotarli; preferire variabili da `.env` protetto o Docker secrets;
-- il certificato control deve coprire `bore.0912345.xyz`. Non serve un nuovo
-  wildcard per `*.ssh.bore.0912345.xyz`: il nome target viaggia nel messaggio
+- il certificato control deve coprire `brp.0912345.xyz`. Non serve un nuovo
+  wildcard per `*.ssh.brp.0912345.xyz`: il nome target viaggia nel messaggio
   SSH `direct-tcpip`, non in una nuova connessione TLS/DNS;
 - il firewall/security group ha già le aperture richieste se consente
   `443/tcp`, `443/udp` e l'esistente `7835/udp`;
-- per ProxyJump basta il record A/AAAA di `bore.0912345.xyz`. Non servono record
-  per ogni `*.ssh.bore.0912345.xyz`.
+- per ProxyJump basta il record A/AAAA di `brp.0912345.xyz`. Non servono record
+  per ogni `*.ssh.brp.0912345.xyz`.
 
 Il `Dockerfile` del repository compila già con `vpn,ssh-gateway`. L'immagine di
 test deve essere ricostruita includendo la fase 4; immagini precedenti non
@@ -117,7 +117,7 @@ docker compose -f docker/docker-compose.server.yml logs --tail=100 bore-server
 La regola username-bound si applica **solo** alle nuove operazioni jump:
 
 - pubblicazione OpenSSH `-R jump/...`;
-- connessione ProxyJump verso `*.ssh.bore.0912345.xyz`.
+- connessione ProxyJump verso `*.ssh.brp.0912345.xyz`.
 
 Tutte le modalità SSH gateway già esistenti continuano a ignorare lo username
 come oggi. Non viene introdotto alcun file ACL e il corrente `permit=` delle
@@ -140,7 +140,7 @@ install -m 0600 /percorso/id_ed25519_bore_gateway.pub \
 sudo chown 1000:1000 docker/ssh/authorized_keys.d/fabio
 ```
 
-Questo permette `fabio@bore.0912345.xyz`. Anche `fabio.pub` è un nome valido per il
+Questo permette `fabio@brp.0912345.xyz`. Anche `fabio.pub` è un nome valido per il
 file. Il confronto dello username è esatto e case-sensitive. Il commento finale
 della chiave non sostituisce lo username.
 
@@ -153,7 +153,7 @@ docker/ssh/authorized_keys.d/vm-provider
 contenente la public key della VM. La private key corrispondente resta sulla VM.
 
 Compatibilità intenzionale: se la stessa chiave è presentata come
-`nome-sbagliato@bore.0912345.xyz`, l'autenticazione legacy può ancora riuscire e i
+`nome-sbagliato@brp.0912345.xyz`, l'autenticazione legacy può ancora riuscire e i
 forward vhost/public/secret esistenti restano utilizzabili, ma publish/connect
 jump viene rifiutato genericamente.
 
@@ -216,17 +216,17 @@ Dal client, `ssh-keyscan` può raccogliere la chiave ma non sostituisce la
 verifica del fingerprint:
 
 ```bash
-ssh-keyscan -p 443 bore.0912345.xyz >> ~/.ssh/known_hosts
+ssh-keyscan -p 443 brp.0912345.xyz >> ~/.ssh/known_hosts
 ```
 
 ## 4. Configurazione OpenSSH dell'operatore
 
 Configurazione consigliata per mantenere il comando richiesto esattamente
-`ssh -J bore.0912345.xyz ...`:
+`ssh -J brp.0912345.xyz ...`:
 
 ```sshconfig
-Host bore.0912345.xyz
-    HostName bore.0912345.xyz
+Host brp.0912345.xyz
+    HostName brp.0912345.xyz
     Port 443
     User fabio
     IdentityFile ~/.ssh/id_ed25519_bore_gateway
@@ -235,7 +235,7 @@ Host bore.0912345.xyz
     ServerAliveInterval 15
     ServerAliveCountMax 3
 
-Host *.ssh.bore.0912345.xyz
+Host *.ssh.brp.0912345.xyz
     IdentityFile ~/.ssh/id_ed25519_vm
     IdentitiesOnly yes
     StrictHostKeyChecking yes
@@ -247,14 +247,14 @@ necessario e non è consigliato `ForwardAgent yes`.
 Senza configurazione della porta si può usare la forma esplicita:
 
 ```bash
-ssh -J fabio@bore.0912345.xyz:443 ubuntu@vm-test-01.ssh.bore.0912345.xyz
+ssh -J fabio@brp.0912345.xyz:443 ubuntu@vm-test-01.ssh.brp.0912345.xyz
 ```
 
-Per usare una password sul gateway, il blocco `Host bore.0912345.xyz` può invece avere:
+Per usare una password sul gateway, il blocco `Host brp.0912345.xyz` può invece avere:
 
 ```sshconfig
-Host bore.0912345.xyz
-    HostName bore.0912345.xyz
+Host brp.0912345.xyz
+    HostName brp.0912345.xyz
     Port 443
     User fabio
     PubkeyAuthentication no
@@ -262,7 +262,7 @@ Host bore.0912345.xyz
     StrictHostKeyChecking yes
 ```
 
-OpenSSH chiederà prima la password esterna di `fabio@bore.0912345.xyz` e poi, se il
+OpenSSH chiederà prima la password esterna di `fabio@brp.0912345.xyz` e poi, se il
 target la richiede, la password interna di `ubuntu@vm-test-01...`. Sono due
 account e due verifiche indipendenti.
 
@@ -273,7 +273,7 @@ account e due verifiche indipendenti.
 Sulla VM che espone `localhost:22`:
 
 ```bash
-BORE_SERVER=https://bore.0912345.xyz \
+BORE_SERVER=https://brp.0912345.xyz \
 BORE_SECRET='secret-esistente' \
 bore sshjhost localhost:22 \
   --subdomain vm-test-01 \
@@ -288,7 +288,7 @@ al gateway e poi separatamente a `sshd` sulla VM.
 ### 5.2 QUIC server→provider con fallback TCP caldo
 
 ```bash
-BORE_SERVER=https://bore.0912345.xyz \
+BORE_SERVER=https://brp.0912345.xyz \
 BORE_SECRET='secret-esistente' \
 bore sshjhost localhost:22 \
   --subdomain vm-test-01 \
@@ -309,7 +309,7 @@ il client rinnova poi solo le connessioni direct mancanti.
 Se `sshd` ascolta su `localhost:2222`:
 
 ```bash
-BORE_SERVER=https://bore.0912345.xyz BORE_SECRET='secret-esistente' \
+BORE_SERVER=https://brp.0912345.xyz BORE_SECRET='secret-esistente' \
 bore sshjhost localhost:2222 \
   --subdomain vm-test-legacy \
   --auto-reconnect --udp
@@ -318,7 +318,7 @@ bore sshjhost localhost:2222 \
 La porta virtuale coincide con quella target in v1:
 
 ```bash
-ssh -p 2222 -J bore.0912345.xyz admin@vm-test-legacy.ssh.bore.0912345.xyz
+ssh -p 2222 -J brp.0912345.xyz admin@vm-test-legacy.ssh.brp.0912345.xyz
 ```
 
 Una richiesta alla porta 22 viene rifiutata, anche se l'alias esiste.
@@ -338,7 +338,7 @@ ssh -T -p 443 \
   -o ServerAliveInterval=15 \
   -o ServerAliveCountMax=3 \
   -R jump/vm-test-01:22:localhost:22 \
-  vm-provider@bore.0912345.xyz -- \
+  vm-provider@brp.0912345.xyz -- \
   'notes="vm test AWS su zona eu-south-1"'
 ```
 
@@ -356,7 +356,7 @@ AUTOSSH_GATETIME=0 autossh -M 0 -T -p 443 \
   -o ServerAliveInterval=15 \
   -o ServerAliveCountMax=3 \
   -R jump/vm-test-01:22:localhost:22 \
-  vm-provider@bore.0912345.xyz -- \
+  vm-provider@brp.0912345.xyz -- \
   'notes="vm test AWS su zona eu-south-1"'
 ```
 
@@ -372,7 +372,7 @@ ssh -T -p 443 \
   -o PreferredAuthentications=password \
   -o ExitOnForwardFailure=yes \
   -R jump/vm-test-01:22:localhost:22 \
-  vm-provider@bore.0912345.xyz -- \
+  vm-provider@brp.0912345.xyz -- \
   'notes="provider interattivo"'
 ```
 
@@ -386,21 +386,21 @@ ssh -T -p 443 \
   -i ~/.ssh/id_ed25519_bore_provider \
   -o ExitOnForwardFailure=yes \
   -R jump/vm-test-legacy:2222:localhost:2222 \
-  vm-provider@bore.0912345.xyz
+  vm-provider@brp.0912345.xyz
 ```
 
 Accesso:
 
 ```bash
-ssh -p 2222 -J bore.0912345.xyz admin@vm-test-legacy.ssh.bore.0912345.xyz
+ssh -p 2222 -J brp.0912345.xyz admin@vm-test-legacy.ssh.brp.0912345.xyz
 ```
 
-### 6.4 Perché `ssh -R 22:localhost:22 bore.0912345.xyz` non basta
+### 6.4 Perché `ssh -R 22:localhost:22 brp.0912345.xyz` non basta
 
 Questo comando resta valido con il significato attuale del gateway:
 
 ```bash
-ssh -p 443 -R 22:localhost:22 vm-provider@bore.0912345.xyz
+ssh -p 443 -R 22:localhost:22 vm-provider@brp.0912345.xyz
 ```
 
 È un **public remote forward numerico**, non registra un alias jump. Può inoltre
@@ -409,7 +409,7 @@ Per la nuova funzionalità nominata, mantenendo un client OpenSSH puro, serve il
 prefisso esplicito:
 
 ```bash
-ssh -p 443 -R jump/vm-test-01:22:localhost:22 vm-provider@bore.0912345.xyz
+ssh -p 443 -R jump/vm-test-01:22:localhost:22 vm-provider@brp.0912345.xyz
 ```
 
 Questa scelta conserva byte-per-byte la grammatica e il comportamento di tutti
@@ -430,34 +430,34 @@ liberamente:
 Esempio chiave gateway + chiave target, con la configurazione §4:
 
 ```bash
-ssh -J bore.0912345.xyz ubuntu@vm-test-01.ssh.bore.0912345.xyz
+ssh -J brp.0912345.xyz ubuntu@vm-test-01.ssh.brp.0912345.xyz
 ```
 
 Esempio chiave gateway + password target: mantenere la chiave nel blocco gateway
 e disabilitare le chiavi soltanto nel blocco del target.
 
 ```sshconfig
-Host bore.0912345.xyz
-    HostName bore.0912345.xyz
+Host brp.0912345.xyz
+    HostName brp.0912345.xyz
     Port 443
     User fabio
     IdentityFile ~/.ssh/id_ed25519_bore_gateway
     IdentitiesOnly yes
 
-Host vm-test-01.ssh.bore.0912345.xyz
+Host vm-test-01.ssh.brp.0912345.xyz
     PubkeyAuthentication no
     PreferredAuthentications password
 ```
 
 ```bash
-ssh -J bore.0912345.xyz ubuntu@vm-test-01.ssh.bore.0912345.xyz
+ssh -J brp.0912345.xyz ubuntu@vm-test-01.ssh.brp.0912345.xyz
 ```
 
 Evitare `-o PubkeyAuthentication=no` globale: può influenzare anche il jump host.
 Nei test, mantenere sempre separate le opzioni dei due blocchi `Host`.
 
 Il target vede l'utente `ubuntu` (o quello indicato prima di `@`); il gateway
-vede l'utente esterno configurato per `bore.0912345.xyz`, per esempio `fabio`.
+vede l'utente esterno configurato per `brp.0912345.xyz`, per esempio `fabio`.
 Bore non
 riceve la password target e non possiede le private key target.
 
@@ -506,10 +506,10 @@ Comandi utili:
 
 ```bash
 # Porta gateway
-ssh -vvv -p 443 fabio@bore.0912345.xyz
+ssh -vvv -p 443 fabio@brp.0912345.xyz
 
 # Configurazione OpenSSH effettiva del target
-ssh -G -J bore.0912345.xyz ubuntu@vm-test-01.ssh.bore.0912345.xyz
+ssh -G -J brp.0912345.xyz ubuntu@vm-test-01.ssh.brp.0912345.xyz
 
 # Porte pubblicate dal container
 docker compose -f docker/docker-compose.server.yml ps

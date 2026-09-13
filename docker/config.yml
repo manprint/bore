@@ -3,7 +3,7 @@
 #   - ./config.yml:/vhost/config.yml:ro
 #   - BORE_VHOST_CONFIG=/vhost/config.yml
 
-base_domain: bore.0912345.xyz
+base_domain: brp.0912345.xyz
 mode: auto
 
 # Optional when you want HTTPS on the vhost frontend.

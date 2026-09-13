@@ -80,7 +80,7 @@ Run on 2026-08-05 with all features:
   username/port, carrier pool, liveness reaper and alias reclaim.
 - Updated README as the operational source of truth, `docs/ssh-gateway/SSH_GATEWAY.md`, and
   `examples_usage.md`: Compose adds only
-  `BORE_SSH_JUMP_BASE_DOMAIN=ssh.bore.0912345.xyz`; no 8443 mapping is needed;
+  `BORE_SSH_JUMP_BASE_DOMAIN=ssh.brp.0912345.xyz`; no 8443 mapping is needed;
   Phase 2 is explicitly TCP-only while existing `443/udp` remains unchanged.
 
 ## Phase 2 gates
@@ -234,7 +234,7 @@ Node 24.14.1, npm 11.11.0 and OpenSSH_9.6p1:
   7835; STUN remains 7835/udp; sshjhost reuses the existing vhost/public direct
   endpoint on 443/udp. No 8443 mapping or new QUIC-port variable is needed.
 - Compose delta: add only
-  `BORE_SSH_JUMP_BASE_DOMAIN=ssh.bore.0912345.xyz`; every current port, vhost,
+  `BORE_SSH_JUMP_BASE_DOMAIN=ssh.brp.0912345.xyz`; every current port, vhost,
   VPN, SSH-gateway and volume setting remains unchanged.
 - Ports: standard and nonstandard supported; virtual port equals TARGET port in v1.
 

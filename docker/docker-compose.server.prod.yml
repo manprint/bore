@@ -72,7 +72,7 @@ services:
       - BORE_MAX_PORT=9100
       - BORE_MAX_CONNS=1024
       # Public domain advertised to clients (enables http(s):// addressing):
-      - BORE_BIND_DOMAIN=bore.0912345.xyz
+      - BORE_BIND_DOMAIN=brp.0912345.xyz
       - BORE_ADMIN_TOKEN=zzzzzzzzzzzzzzzzzzzzz
       - BORE_CERT_FILE=/certs/cert.pem
       - BORE_KEY_FILE=/certs/key.pem
@@ -204,7 +204,7 @@ services:
 #                                    #    above overrides it with 8192. Kept here only
 #                                    #    to record what the default is.
       - BORE_VHOST_CONFIG=/config.yml
-      - BORE_VHOST_BASE_DOMAIN=bore.0912345.xyz
+      - BORE_VHOST_BASE_DOMAIN=brp.0912345.xyz
       - BORE_VHOST_MODE=auto
       - BORE_VHOST_HTTP_PORT=80
       - BORE_VHOST_HTTPS_PORT=443

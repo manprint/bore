@@ -99,9 +99,25 @@ ena_out() {
 # does deliver 0 Mbit/s, and that is a result. Distinguishing the two is the
 # job of the producer (`tcp_mbps` now prints FAILED when iperf3 produced no
 # usable JSON at all), not of this function.
+# A SAMPLE MAY BE NEGATIVE, AND THIS FILTER USED TO CALL THAT "NON-NUMERIC".
+# The pattern was `^[0-9]+(\.[0-9]+)?$`, so a leading minus made a perfectly
+# good sample fall into the `bad` arm: dropped from the median, counted in a
+# note on stderr that nothing reads. Every quantity that can go BELOW zero --
+# a penalty, a delta, a difference, a change expressed as a percentage -- was
+# therefore medianed over its POSITIVE samples only, which can only drag the
+# answer UP. MEASURED in `pub_ws_first_conn_delay` (2026-09-13): FIVE of the
+# six rows in its summary table were wrong, every one of them reporting a
+# positive first-transfer penalty where the median of all three samples is
+# zero or negative (quic 20 s printed 0.7 with samples {0.7, -0.2, -0.2};
+# relay 60 s printed 0.8 with {0.8, -1.7, -51.3}). Note the DIRECTION: the
+# bias always invents a cost that is not there, which is the single worst
+# direction for a table whose whole subject is whether a cost exists. The
+# refusal MESSAGE stays -- it is what
+# catches a `FAILED` cell, and it is what made this visible -- but it now
+# fires only for something that really is not a number.
 med()  {
     LC_ALL=C awk '
-        /^[0-9]+(\.[0-9]+)?$/ { v[++n] = $1 + 0; next }
+        /^[+-]?[0-9]+(\.[0-9]+)?$/ { v[++n] = $1 + 0; next }
         NF { bad++ }
         END {
             if (bad) printf "  med(): refused %d non-numeric sample(s)\n", bad > "/dev/stderr"

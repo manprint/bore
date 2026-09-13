@@ -475,7 +475,7 @@ driver rather than being folded into a general re-run.
 | `vpn/vpn_carriers.sh CELLS_SPEC=…` | do relay carriers recover when the flows are as many as the carriers? | the six open cells only, many repetitions — dispersion needs repetitions, not neighbours |
 | `jump/jump_stab.sh` | does the relay cost latency, or did time merely pass? | warm-up sample discarded (trap 36), ratios computed **inside** each repetition (trap 37) |
 | `pub/udp_pool_recycle.sh` | does a public `--udp` tunnel lose its direct carrier because the PREVIOUS tunnel on that port died? | FRESH vs RECYCLED on one port, **zero bytes transferred** — the one variable an idle timeout cannot see (trap 45) |
-| `pub/udp_pool_life.sh` | how long does an idle direct pool live, and does it come back? | 2 s grid from before the pool can fill, the whole series printed, plus a relay tunnel as the "did the TUNNEL die instead" control |
+| `pub/udp_pool_life.sh` | how long does an idle direct pool live, and does it come back? | 2 s grid from before the pool can fill, the whole series printed, plus a relay tunnel as the "did the TUNNEL die instead" control — **written and deliberately NOT run in the 2026-09-13 wired window**: §48 had already answered its question (an idle pool does not die of idleness; the previous tunnel's close monitor evicts it) and `udp_pool_recycle` measured the FRESH arm holding its carrier for the whole 45 s watch, twice. Declared rather than deleted, and ready as it stands |
 | `pub/udp_pktsize.sh` | how many PACKETS does each transport spend per delivered byte? | `/proc/net/dev` bracketed around each arm on **all three hosts** — the VM's `tx` is the answering column (trap 42), the server's `rx` decides only the arm-to-arm *difference* (trap 41) — plus an **idle bracket** as the control and an `ethtool -k` offload table (trap 43) |
 
 `pub/udp_pktsize.sh` is the one stage here that was not on §8's list: it exists
@@ -674,21 +674,6 @@ do not "simplify" them back out.
 15. **Two drivers must refuse each other symmetrically.** A guard that names only
     the main sweep lets a second special-purpose driver through. `rerun_eth.sh`,
     `rerun_eth_p7.sh` and `rerun_vpn_deep.sh` all scan for all three.
-16. **A stage that dies on an undefined variable looks exactly like a stage that
-    ran.** `ws_tunnel.sh`, `ws_flavours.sh` and `ws_dufs_relay_vs_quic.sh` all
-    referenced `$B` and none of them defined it; under `set -u` each aborts on
-    its first line of real work. The driver logs `FAIL ... elapsed=0s` and moves
-    on, so the only signal is the elapsed time — the same signal that exposed
-    `vpn_hub`'s silent skip (trap in §3.8 rule 5). Two of the three were still
-    queued when the first one failed. Had `$B` resolved, the payload would have
-    been written to `scripts/perf/staging/ws/work/`, which **git does not
-    ignore**, at 256 MB and 1 GB. Both now use lib.sh's `WORK`, outside the tree.
-    Sweep for this class with a scan that compares every `$VAR` against the
-    assignments in the file plus `lib.sh`/`env.sh` — but expect false positives
-    from `awk -v` names and from `lib.sh`'s multi-assignment lines
-    (`V="$BORE_VM"; SRV="$BORE_SRV"; GW="$BORE_GW"`), where only the first name
-    sits at the start of a line.
-
 16. **A transfer shorter than the ramp measures the ramp** (V-19). The
     public-tunnel stages moved 96 MiB per arm, sized when this workstation was
     on WiFi and that took about two seconds. Wired, 96 MiB at 922 Mbit/s lasts
@@ -859,25 +844,6 @@ do not "simplify" them back out.
     VM -> server ingest LEG. An allowance delta convicts a leg, never a
     direction.
 
-25. **Identifying a process by TEXT gives a wrong answer, and this campaign has
-    now paid for it three times.** A `pkill -f` killed the session that issued
-    it. A driver guard matched its own command-substitution subshell. And on
-    2026-09-13, with P7 finished and nothing running, `rerun_eth_p7.sh` refused
-    to start: the process it named as "the main sweep still running" was a
-    MONITOR whose `bash -c` body MENTIONED the driver while following its log.
-
-    `ps -eo pid,args | awk '$0 ~ /rerun_eth\.sh/'` finds the name anywhere on
-    the line, in any field. The sound rule is POSITIONAL: a process is running a
-    driver only when the driver's filename is one of the first two arguments of
-    its argv, read from `/proc/<pid>/cmdline` -- NUL-separated, so it is
-    unambiguous where one argument ends, unlike `ps args` where a filename and a
-    sentence quoting it look identical. A `bash -c '<text>'` puts the text at
-    argv[2] and can never match.
-
-    It lives in `driverlib.sh` and the four drivers source it. A guard copied
-    four times is a defect to fix four times -- and all four copies carried this
-    one.
-
 24. **A TOP-LEVEL call to a function defined LATER in the same file is a
     SILENT no-op.** bash resolves a call when the line RUNS, so the call fails
     with `command not found`, exit 127 -- and a call to one's own function is
@@ -904,6 +870,25 @@ do not "simplify" them back out.
     arriving between install and definition runs a handler in which the check
     is not a command yet, and the cleanup happens while the CHECK silently does
     not.
+
+25. **Identifying a process by TEXT gives a wrong answer, and this campaign has
+    now paid for it three times.** A `pkill -f` killed the session that issued
+    it. A driver guard matched its own command-substitution subshell. And on
+    2026-09-13, with P7 finished and nothing running, `rerun_eth_p7.sh` refused
+    to start: the process it named as "the main sweep still running" was a
+    MONITOR whose `bash -c` body MENTIONED the driver while following its log.
+
+    `ps -eo pid,args | awk '$0 ~ /rerun_eth\.sh/'` finds the name anywhere on
+    the line, in any field. The sound rule is POSITIONAL: a process is running a
+    driver only when the driver's filename is one of the first two arguments of
+    its argv, read from `/proc/<pid>/cmdline` -- NUL-separated, so it is
+    unambiguous where one argument ends, unlike `ps args` where a filename and a
+    sentence quoting it look identical. A `bash -c '<text>'` puts the text at
+    argv[2] and can never match.
+
+    It lives in `driverlib.sh` and the four drivers source it. A guard copied
+    four times is a defect to fix four times -- and all four copies carried this
+    one.
 
 26. **A helper called in `$( )` CANNOT publish a variable, and the failure is
     silent in exactly the same way.** Command substitution runs the helper in a
@@ -1178,6 +1163,58 @@ do not "simplify" them back out.
     both times**. An idle timeout cannot produce that asymmetry. Before
     publishing a mechanism, write down what the rival explanation predicts — if
     it predicts the same numbers, the measurement is not evidence for either.
+
+46. **A stage that dies on an undefined variable looks exactly like a stage that
+    ran.** `ws_tunnel.sh`, `ws_flavours.sh` and `ws_dufs_relay_vs_quic.sh` all
+    referenced `$B` and none of them defined it; under `set -u` each aborts on
+    its first line of real work. The driver logs `FAIL ... elapsed=0s` and moves
+    on, so the only signal is the elapsed time — the same signal that exposed
+    `vpn_hub`'s silent skip (trap in §3.8 rule 5). Two of the three were still
+    queued when the first one failed. Had `$B` resolved, the payload would have
+    been written to `scripts/perf/staging/ws/work/`, which **git does not
+    ignore**, at 256 MB and 1 GB. Both now use lib.sh's `WORK`, outside the tree.
+    Sweep for this class with a scan that compares every `$VAR` against the
+    assignments in the file plus `lib.sh`/`env.sh` — but expect false positives
+    from `awk -v` names and from `lib.sh`'s multi-assignment lines
+    (`V="$BORE_VM"; SRV="$BORE_SRV"; GW="$BORE_GW"`), where only the first name
+    sits at the start of a line.
+    (This trap carried the number 16 beside another one for a whole campaign.
+    Markdown renumbers an ordered list from its ORDER, so the duplicate made
+    every rendered number after it disagree with the literal one every other
+    document cites — a numbering that lies about itself, in the file whose
+    subject is instruments that lie. It was moved here rather than renumbered in
+    place because moving one item keeps twelve existing citations valid and
+    renumbering in place breaks all of them.)
+
+
+47. **A SECTION HEADER IS A CLAIM ABOUT WHOSE EVIDENCE THIS IS, AND IT CAN BE
+    FALSE.** `udp_pool_recycle.sh` printed `=== the server's own account of each
+    carrier install (id restarts = fresh pool) ===` over a grep of the **client's**
+    log on the VM. The client's line proves a carrier came up; it cannot say which
+    **id** the server minted, and the id is the entire claim — a global id would
+    read 0, 1, 2, 3 across re-registrations of one port and a per-pool id reads 0
+    every time. Nobody misreads a number here: the reader supplies the missing
+    evidence from the header, which is worse, because the artefact looks complete.
+    Name the witness in the header, and when the witness is unreachable print
+    `NOT READ` and say what the claim rests on instead. Same family as trap 41 (a
+    number that cannot fail) one level up: here it is a HEADING that cannot fail.
+
+48. **A NUMERIC FILTER THAT FORGETS THE SIGN TURNS EVERY NEGATIVE SAMPLE INTO
+    "NOT A NUMBER".** `lib.sh`'s `med()` matched `^[0-9]+(\.[0-9]+)?$`, so
+    `-0.2` fell into the `bad` arm: dropped from the median, counted in a
+    stderr note nothing reads. Every quantity that can go below zero — a
+    penalty, a delta, a difference, a percentage CHANGE — was medianed over its
+    POSITIVE samples only. MEASURED in `pub_ws_first_conn_delay`: five of six
+    rows wrong, every one of them inventing a positive cost where the true
+    median is zero or negative, in the table whose only subject is whether that
+    cost exists. **The direction is the point**: this bias can only remove low
+    samples, so it always manufactures the finding rather than hiding it. Two
+    habits catch it. Accept a sign wherever a sample can carry one
+    (`^[+-]?[0-9]+(\.[0-9]+)?$`), and keep the refusal MESSAGE — a filter that
+    discards silently is how this survived a whole campaign, and the message is
+    what finally showed it. Note also that the recovery cost nothing because
+    V-11 already forces every summary to print its raw samples beside it: the
+    corrected table was recomputed from the artefact, with no re-run.
 
 ---
 

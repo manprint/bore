@@ -101,7 +101,7 @@ Tutto quello che segue è nel repository e non richiede di ricostruire nulla:
 |---|---|
 | driver dello sweep | `scripts/perf/staging/rerun_eth.sh` |
 | driver dell'attribuzione | `scripts/perf/staging/rerun_eth_p7.sh` (si rifiuta di partire se il primo è vivo) |
-| runbook completo dell'harness | `scripts/perf/staging/README.md` — §3.8 VPN, §3.9 jump host, §3.10 **qualificare la linea prima di citare qualunque valore assoluto**, e le 13 trappole |
+| runbook completo dell'harness | `scripts/perf/staging/README.md` — §3.8 VPN, §3.9 jump host, §3.10 **qualificare la linea prima di citare qualunque valore assoluto**, e le 48 trappole |
 | evidenze del cablato | `docs/performance/ETH_RERUN_EVIDENCE_2026-09-12.md` |
 | coordinate e credenziali | `~/.config/bore-perf/env.sh` (fuori dal repo, 600); il template vuoto è `scripts/perf/staging/env.sh.example` |
 
@@ -197,4 +197,20 @@ domanda che una fase esistente non poteva chiudere):
 | `ws_tunnel` | mai girata: `$B` non inizializzato sotto `set -u` | 620 s |
 | `pub_ws_first_conn` | attribuire il costo della prima connessione | 477 s |
 | `pub_origin_cpu` | escludere la CPU su origine, VM e client | 348 s |
-| `pub_ws_conns_procs` | l'ultima variabile lato client: 1 processo × n contro n × 1 | in corso |
+| `pub_ws_conns_procs` | l'ultima variabile lato client: 1 processo × n contro n × 1 | 1944 s |
+| `ws_conns_var` | perché la stessa cella si ripete al 6 % fino a n=2 e al 19–48 % da n=4 | 3387 s |
+| `udp_pktsize` | quanti PACCHETTI spende ogni trasporto per byte consegnato | 519 s |
+| `ws_first_conn` con il **ritardo** come asse | il costo della prima connessione è funzione del tempo dalla registrazione o del numero d'ordine? | in corso |
+| `udp_pool_recycle` | il pool diretto muore per un timeout o perché su quella porta è appena morto un tunnel? | 234 s, **zero byte** |
+| `udp_pool_life` | il pool inattivo muore o non è mai salito | **scritta, NON eseguita** — dichiarata, non sparita: §48 risponde già alla sua domanda (il pool non muore di inattività, lo sfratta il monitor del tunnel precedente) e `udp_pool_recycle` ha misurato il braccio FRESH che tiene il carrier per tutti i 45 s, due volte su due. I suoi 40 minuti sono stati spesi a **verificare la correzione** invece che a riosservare il difetto. Resta nell'albero, pronta |
+| `vpn_carriers` in profondità | i carrier del relay recuperano a 4 e 8 flussi? | 1655 s / 2055 s |
+| `jump_stab` ripetuto | la stabilità del jump host è riproducibile | 340/342/343 s |
+
+Queste dodici non sono «extra». Nove nascono da una domanda che una fase
+esistente **non poteva** chiudere; due (`udp_pool_recycle`, `udp_pool_life`)
+nascono da un difetto di prodotto colto a metà di un'altra fase; e una
+(`ws_tunnel`) esisteva già ma non aveva mai girato, perché moriva sulla prima
+riga per una variabile mai assegnata. È il motivo per cui il vincolo della
+finestra non è stata la misura ma la **scrittura**: il piano preventivava
+~14 h di misure e ne sono bastate 5 h 49 per le 36 fasi previste, mentre queste
+dodici e i documenti che ne sono usciti hanno riempito tutto il resto.

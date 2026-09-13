@@ -210,7 +210,7 @@ done
 # so the numbers below can be read straight against them.
 spread() { # samples on stdin
     LC_ALL=C awk '
-        /^[0-9]+(\.[0-9]+)?$/ { v[++n] = $1 + 0 }
+        /^[+-]?[0-9]+(\.[0-9]+)?$/ { v[++n] = $1 + 0 }   # a sign is a number, not junk (lib.sh med)
         END {
             if (n == 0) { print "n/a n/a n/a n/a 0"; exit }
             for (i = 1; i <= n; i++) for (j = i+1; j <= n; j++)

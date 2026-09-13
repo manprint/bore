@@ -151,8 +151,31 @@ for rep in $(seq 1 "$REPS"); do
 done
 
 echo
-echo "=== the server's own account of each carrier install (id restarts = fresh pool) ==="
+# TWO accounts, and the header of each must name WHOSE it is. This block used to
+# be titled "the server's own account" while grepping the CLIENT's log on the VM
+# -- the client's line proves a carrier came up, and says nothing about the id
+# the SERVER minted, which is the whole claim. A section that promises one
+# witness and produces another is the same defect class this stage exists to
+# document, one level up.
+echo "=== the CLIENT's account: a carrier came up, and was never renewed ==="
 vm "grep -a 'direct udp carrier ready' \$HOME/out/poolrecycle-$P.log 2>/dev/null | tail -n 8" 2>/dev/null | sed 's/^/    /'
+
+# The SERVER's account is the one that carries the id, and the id is the
+# evidence: a GLOBAL id would read 0, 1, 2, 3 across re-registrations of one
+# port, and a per-pool id reads 0 every time. Absent (no shell on the server, or
+# a container whose log is not readable) this says so -- it never prints nothing
+# and lets a reader supply the missing line from memory.
+echo
+echo "=== the SERVER's account: which id each install minted on port $P ==="
+srv_log=$(srv "sudo -n docker logs --since 30m $BORE_SRV_CONTAINER 2>&1 | grep -a 'port:$P' | grep -a 'direct carrier' | tail -n 8" 2>/dev/null || true)
+if [ -n "$srv_log" ]; then
+    printf '%s\n' "$srv_log" | sed 's/^/    /'
+    echo "    (an id that restarts at 0 on every re-registration is the defect;"
+    echo "     a global id would read 0, 1, 2, 3.)"
+else
+    echo "    NOT READ -- no reachable server log. The id claim rests on the"
+    echo "    series above and on the code, not on this run."
+fi
 
 echo
 echo "=== verdict ==="

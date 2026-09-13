@@ -116,6 +116,32 @@ else
     echo "PASS -- every numeric sort pins LC_ALL=C"
 fi
 
+
+# The seventh: the traps list must number itself honestly. Markdown renumbers an
+# ordered list from its ORDER, so a duplicate or an out-of-sequence literal makes
+# every RENDERED number after it disagree with the WRITTEN one that stages and
+# evidence documents cite by number. Measured 2026-09-13: item 16 appeared twice
+# and items 24/25 were swapped, so a comment citing "trap 25" pointed a reader at
+# trap 24. A numbering that lies about itself, in the file whose subject is
+# instruments that lie.
+echo
+echo "== the traps list numbers itself honestly =="
+nums=$(sed -n '/^## 5\. The traps/,/^## 6\./p' "$ROOT/scripts/perf/staging/README.md" \
+    | grep -oE '^[0-9]+\. \*\*' | grep -oE '^[0-9]+' || true)
+if [ -z "$nums" ]; then
+    echo "FAIL -- the traps section produced no numbered items; the section moved or its heading changed"
+    fail=1
+else
+    bad=$(printf '%s\n' "$nums" | awk '{ if ($1 != NR) printf "  position %d carries the literal %d\n", NR, $1 }')
+    if [ -n "$bad" ]; then
+        printf '%s\n' "$bad"
+        echo "FAIL -- a written trap number does not match the number markdown will render"
+        fail=1
+    else
+        echo "PASS -- $(printf '%s\n' "$nums" | wc -l) trap(s), every literal equal to its rendered position"
+    fi
+fi
+
 echo
 if [ "$fail" = 0 ]; then
     echo "PASS -- $n file(s) clean"

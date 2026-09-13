@@ -4319,3 +4319,127 @@ lacuna è reale ed è quella che ha lasciato passare il difetto.
 
 **Stato: difetto CONFERMATO sul campo, correzione non ancora scritta** — la
 finestra cablata è per le misure e non si compila mentre una fase misura.
+
+## 49. `ws_first_conn` con il **ritardo** come asse — tre risposte, e nessuna è quella che la fase cercava
+
+`pub_ws_first_conn_delay`, 3 ripetizioni × 3 ritardi (0, 20, 60 s), 384 MiB per
+trasferimento, una sola connessione, con un tunnel relay registrato in parallelo
+come controllo e i ritardi **permutati** fra le ripetizioni. 3833 s.
+
+La domanda era quella lasciata aperta da §40: il costo della prima connessione è
+funzione del **tempo dalla registrazione** (il percorso diretto si assesta) o del
+**numero d'ordine** del trasferimento? La fase misura la penalità
+`1 − primo / mediana(successivi)` **dentro lo stesso tunnel**, così la deriva
+della linea non entra.
+
+### 49.1 Il braccio «quic» non era quic — in **6 celle su 9**
+
+La prima cosa da leggere non è la penalità: è la riga `before` e la colonna del
+percorso, che la fase stampa per ogni trasferimento come `path opens fallbacks
+pool`. Tutte e sei le celle a **20 s e 60 s** leggono così:
+
+```
+    delay=20 s  quic  before: unknown 0 0 0
+      quic  xfer 1  105.92    relay 0 1 0
+      quic  xfer 2  106.96    relay 0 2 0
+      quic  xfer 3  106.42    relay 0 3 0
+```
+
+`pool 0` **prima** che passi un byte, `opens 0` sempre, `fallbacks` che sale
+1, 2, 3. In quelle celle il percorso diretto **non esisteva**: il braccio
+etichettato `quic` ha misurato il relay, e la penalità che ne esce descrive il
+relay misurato due volte. È esattamente l'errore contro cui `jump_lat` si
+difende verificando il percorso dall'admin API invece di assumerlo — qui la
+verifica c'era, stampata, e la tabella riassuntiva la ignorava.
+
+**Il perché è §48.** Ogni cella registra una coppia nuova sulla **stessa porta**,
+quindi ogni cella dopo la prima nasce con un monitor di chiusura pendente del
+tunnel precedente. A 20 s quel monitor ha già tolto il carrier. Quindi l'asse
+del ritardo non misura l'invecchiamento del controllo di congestione: misura
+**quanto tempo passa prima che P-14 svuoti la pool**, e la risposta è «meno di
+20 secondi, tutte le volte».
+
+### 49.2 Le tre celle a ritardo zero, e l'unico confronto onesto della fase
+
+| rip. | xfer 1 | xfer 2 | xfer 3 | percorsi |
+|---|---|---|---|---|
+| 1 | 104,74 | 106,30 | 105,86 | **direct, direct, direct** |
+| 2 | **54,95** | 106,66 | 107,61 | direct, relay, relay (pool 1 → 0) |
+| 3 | 105,32 | 107,51 | 105,90 | direct, relay, relay (pool 1 → 0) |
+
+Solo la **ripetizione 1** ha tenuto il percorso diretto per tutti e tre i
+trasferimenti, ed è quindi l'unica cella dell'intera fase in cui «primo contro
+successivi» confronta diretto con diretto. Lì la penalità è **1,3 %**, contro
+**0,8 %** del controllo relay nella stessa ripetizione. Una differenza di mezzo
+punto, con n=1.
+
+**Quindi a 384 MiB la penalità della prima connessione non si vede.** §35 la
+misurava al **18,6 %** su trasferimenti da 96 MiB: quella è la firma di V-19 —
+96 MiB a 922 Mbit/s durano 0,83 s e sono quasi tutti rampa, così il primo
+trasferimento paga lo slow start e i successivi no. Allungato il trasferimento
+fino a farlo durare ~3,6 s, il costo sparisce in entrambi i bracci. Non è una
+correzione al prodotto: è una correzione a una misura.
+
+Da dire con precisione, perché n=1 non regge una tesi generale: la fase **non ha
+trovato** una penalità del percorso diretto dove ha potuto guardarla, e ha potuto
+guardarla una volta sola. Le altre otto celle non dicono di no — non hanno
+guardato.
+
+### 49.3 Il difetto dello strumento: `med()` rifiutava i **negativi**
+
+La tabella riassuntiva stampava sei righe e, fra una riga e l'altra, sei volte:
+
+```
+  med(): refused 2 non-numeric sample(s)
+```
+
+I campioni erano `-0.2`, `-1.2`, `-51.3`: numeri perfetti. Il filtro di `med()`
+in `lib.sh` era `^[0-9]+(\.[0-9]+)?$` — **senza segno**, quindi un meno faceva
+cadere il campione nel ramo «non è un numero»: scartato dalla mediana, contato
+in un avviso su stderr che nessuno legge. Ogni grandezza che può andare **sotto
+zero** — una penalità, un delta, una differenza, una variazione percentuale — è
+stata quindi mediata **sui soli campioni positivi**.
+
+La direzione dell'errore è la parte grave: si possono solo perdere valori bassi,
+mai alti, quindi il bias **inventa un costo che non c'è** — nella tabella il cui
+unico argomento è se quel costo esista.
+
+Ricalcolato dai campioni grezzi che la fase stampa (è la seconda volta in questa
+campagna che la regola V-11 «chi pubblica una statistica pubblica anche i
+campioni» paga il suo prezzo):
+
+| braccio | ritardo | campioni | pubblicato | corretto |
+|---|---|---|---|---|
+| quic | 0 s | 1,3 · 48,7 · 1,3 | 1,3 | **1,3** |
+| quic | 20 s | 0,7 · −0,2 · −0,2 | 0,7 | **−0,2** |
+| quic | 60 s | −0,7 · −1,2 · 1,1 | 1,1 | **−0,7** |
+| relay | 0 s | 0,8 · −0,1 · −0,0 | 0,8 | **0,0** |
+| relay | 20 s | 0,9 · −0,7 · −0,3 | 0,9 | **−0,3** |
+| relay | 60 s | 0,8 · −1,7 · −51,3 | 0,8 | **−1,7** |
+
+**Cinque righe su sei erano sbagliate**, tutte nella stessa direzione. Corretto
+in `lib.sh` (`^[+-]?[0-9]+(\.[0-9]+)?$`) e nell'unico altro filtro della stessa
+forma (`ws_conns_var.sh`, dove i campioni sono velocità e non possono essere
+negativi — ma un guardiano che insegna lo schema sbagliato va corretto lo
+stesso). Il **messaggio** di rifiuto resta: è quello che intercetta una cella
+`FAILED`, ed è quello che ha reso visibile questo difetto.
+
+### 49.4 Due anomalie che restano, e non si fingono spiegate
+
+1. **Un trasferimento diretto a 54,95 MB/s**, metà degli altri quattro
+   (104,74 · 106,30 · 105,86 · 105,32). Non è P-14: quello **toglie** il percorso,
+   non lo dimezza, e infatti quel trasferimento è andato `direct` con
+   `opens=1`. Una su cinque; non c'è abbastanza per dire altro.
+2. **Il controllo relay ha perso metà banda una volta** (69,91 contro 105,80
+   nella stessa cella, ripetizione 3 a 60 s). Il braccio relay non ha percorso
+   diretto da perdere, quindi qui P-14 è escluso per costruzione: è dispersione
+   del relay, la stessa che §46 misura fino a 3,2× sulla stessa cella.
+
+### 49.5 Cosa resta aperto
+
+La domanda di §40 **non è chiusa**, ed è cambiata di forma: finché P-14 non è
+corretto sul server che la fase interroga, l'asse del ritardo non può
+distinguere «il percorso diretto si assesta» da «il percorso diretto è stato
+rimosso». Si richiude con una riga sola di lavoro — rieseguire questa fase
+contro un server **con la correzione** — e allora le nove celle misurano tutte
+quello che dicono di misurare.

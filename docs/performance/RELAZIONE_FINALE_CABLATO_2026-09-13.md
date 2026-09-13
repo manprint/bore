@@ -148,6 +148,62 @@ non il prodotto. Dettagli e tabelle: §38 delle evidenze.
    sigillo e due per apertura, su ~53 000 pacchetti/s per direzione su entrambi
    gli estremi. Le funzioni libere restano **come oracolo**: un test confronta
    byte per byte a 0/1/1350/1500/65535 byte e tre contatori.
+5. **P-14: un tunnel public `--udp` che si ri-registra sulla stessa porta perde
+   il percorso diretto, per sempre e in silenzio.** È il difetto più grave
+   trovato in questa finestra, e non è stato trovato cercandolo: `ws_first_conn`
+   lo ha colto **a metà cella**, con `delay=0`, dove il primo trasferimento va
+   `direct` e il secondo `relay` con la pool a 0.
+
+   **La misura, prima del meccanismo.** L'admin API del server porta
+   `direct_pool` da 1 a 0 entro ~20 s e poi legge **0 in 76 campioni su 76** in
+   150 s, con `direct_fallbacks` che sale a ogni connessione. La lettura ovvia —
+   un idle timeout — è **falsificata da un pacchetto**: `tcpdump` sulla socket
+   QUIC del client mostra keep-alive ogni 3 s in **entrambe** le direzioni,
+   risposti in circa un millisecondo. La connessione è viva mentre il server
+   dice che non c'è. Il log del client lo conferma dall'altro lato: una sola
+   riga `direct udp carrier ready` e **zero** rinnovi — il client non ha nulla
+   da rinnovare, perché la sua connessione non è mai caduta.
+
+   **Meccanismo.** A ogni registrazione `Server::serve_tunnel` costruisce un
+   `PublicDirectEntry` nuovo con una `DirectPool::default()`, i cui id
+   **ripartono da 0**, e lo inserisce sotto la stessa chiave `port:<N>`. Il
+   monitor di chiusura ri-risolveva quella chiave **al momento della chiusura**,
+   così quando la connessione del tunnel *precedente* moriva il monitor
+   risolveva `port:<N>` al tunnel che esiste **adesso** e ne rimuoveva l'id 0 —
+   cioè il carrier vivo del tunnel nuovo. Il commento nel codice diceva
+   «keyed by a monotonic id so a stale close-monitor never evicts a newer
+   member», ed è vero **solo dentro una pool**. Il log del server è d'accordo:
+   quattro ri-registrazioni della stessa porta, `id=0` tutte e quattro, dove un
+   id globale avrebbe letto 0, 1, 2, 3.
+
+   **Falsificazione, non conferma** (`pub/udp_pool_recycle.sh`, zero byte
+   trasferiti): due bracci che differiscono in **una** cosa sola — se su quella
+   porta è appena morto un tunnel. FRESH ha tenuto la pool a 1 per tutti i 45 s
+   **2 volte su 2**; RECYCLED l'ha persa a **t=12 s 2 volte su 2**, cioè
+   all'idle timeout della connessione appena morta. Nessun timeout sa
+   distinguere due bracci uguali in tutto il resto.
+
+   **Ambito:** public **e** vhost. `ssh-jump` è immune perché il suo monitor
+   cattura l'entry invece di ri-risolvere l'alias — ed è per questo il
+   **precedente** della correzione, non un caso fortunato.
+
+   **Correzione:** rimuovere dalla pool in cui il carrier è stato *installato*,
+   mai da ciò a cui la chiave risolve alla chiusura — `Arc::downgrade(&entry)`
+   fuori dal task e `upgrade()` dentro. `Weak` e non `Arc` perché un monitor in
+   attesa su una connessione che sopravvive alla registrazione non deve tenere
+   viva l'entry (precedente I-SSH10). Cancelli: l'unit
+   `a_reregistered_tunnel_keeps_its_carrier_when_the_previous_one_closes` — che
+   tiene l'entry vecchia con un `Arc` per decidere *quando* il monitor scatta,
+   invece di aspettare un idle timeout — più il gate di campo
+   `T-PUB-POOLRECYCLE` in `scripts/perf/public_idle_window.sh`, che afferma la
+   premessa (`established>=2`, `early=1`) prima della tesi (`pool=1`).
+
+   **Adiacente, misurato e NON corretto di proposito:** `close_all` è chiamato
+   solo da `ssh_jump.rs`, quindi le pool deregistrate restano finché la
+   connessione non scade da sola, trattenendo i permessi di `admit_direct`. È
+   una osservazione, non una misura: nessuna campagna l'ha ancora messa alla
+   prova, e questa finestra non inventa correzioni per difetti non misurati.
+   §48.
 
 ---
 
@@ -531,6 +587,33 @@ numeri che sembrano veri.
     aggiungevano i cancelli di I-SSH12: erano verdi a mano, e il gate non li
     avrebbe mai fatti girare. Aggiunto `test_jump`; alla prima esecuzione ha
     impiegato **586 s** — non era una lacuna teorica, era una suite intera.
+30. **L'elenco delle trappole aveva due volte il numero 16, quindi mentiva su
+    sé stesso.** Markdown numera una lista ordinata dall'**ordine**, non dai
+    numeri scritti: con un doppione, ogni numero *reso* dopo di esso non
+    coincideva più con quello *scritto* che gli altri documenti citano — e le
+    posizioni 24 e 25 erano anche invertite nel sorgente. Una citazione
+    «trappola 25» atterrava sulla 24. È il difetto di questa campagna in
+    miniatura, nel file il cui argomento sono gli strumenti che mentono. Corretto
+    spostando il doppione in fondo come **46** invece di rinumerare sul posto:
+    spostarne uno tiene valide dodici citazioni, rinumerare le rompe tutte.
+    Verificato con un controllo che confronta ogni numero scritto con la sua
+    posizione — oggi **48 su 48**.
+31. **`med()` rifiutava i numeri NEGATIVI, e il bias inventava sempre un
+    costo.** Il filtro della mediana condivisa era `^[0-9]+(\.[0-9]+)?$`:
+    senza segno. Un `-0,2` finiva nel ramo «non è un numero» — scartato dalla
+    mediana, contato in un avviso su stderr che nessuno legge. Ogni grandezza
+    che può andare sotto zero (penalità, delta, differenze, variazioni
+    percentuali) è stata quindi mediata **sui soli campioni positivi**. Nella
+    tabella di `pub_ws_first_conn_delay`: **cinque righe su sei sbagliate**,
+    tutte nella stessa direzione, cioè quella che fa comparire un costo dove i
+    dati dicono che non c'è — nella tabella il cui unico argomento è se quel
+    costo esista. Corretto in `lib.sh` e nell'unico altro filtro della stessa
+    forma; il **messaggio** di rifiuto resta, perché è quello che intercetta
+    una cella `FAILED` ed è quello che ha reso visibile il difetto. La tabella
+    corretta è stata **ricalcolata dall'artefatto**, senza rieseguire nulla,
+    perché V-11 impone già di stampare i campioni grezzi accanto a ogni
+    statistica: è la seconda volta nella campagna che quella regola si ripaga.
+    §49.3.
 
 ---
 
@@ -600,12 +683,13 @@ Dettaglio in §25–26 delle evidenze. In breve:
 | approfondimento VPN | `scripts/perf/staging/rerun_vpn_deep.sh` |
 | jump host | `scripts/perf/staging/rerun_jump.sh` — tre fasi: `jump_lat` (latenza), `jump_hol` (isolamento fra canali), `jump_stab` (stabilità e fallback). La mappa **domanda del piano → fase** è in testa al driver, così una domanda scoperta si vede |
 | finestra di build | `scripts/perf/staging/p5_build_gate.sh` |
+| domande aperte | `scripts/perf/staging/rerun_open.sh` — il driver nato **dentro** la finestra, per le fasi che nessuna domanda del piano prevedeva: `ws_conns_var`, `udp_pktsize`, `ws_first_conn` con il ritardo come asse, `vpn_carriers` in profondità, `jump_stab` ripetuto |
 | costo AWS | `aws_cost.sh` (finestra) e `cost_watch.sh` (per fase) |
 | scansione segreti | `secret_scan.sh` — i pattern arrivano da `~/.config/bore-perf/env.sh`, **mai** dal repository |
-| lint dell'harness | `lint.sh` — **sei compilatori**: `bash -n`, shellcheck mirato, `unbound_scan.sh` (variabili lette e mai assegnate), `shadow_scan.sh` (array che oscura uno scalare di libreria), `order_scan.sh` (chiamata di livello superiore prima della definizione), e il cancello V-11 che rifiuta un `sort -n` senza `LC_ALL=C`. Oggi: **144 file puliti** |
+| lint dell'harness | `lint.sh` — **sette compilatori**: `bash -n`, shellcheck mirato, `unbound_scan.sh` (variabili lette e mai assegnate), `shadow_scan.sh` (array che oscura uno scalare di libreria), `order_scan.sh` (chiamata di livello superiore prima della definizione), e il cancello V-11 che rifiuta un `sort -n` senza `LC_ALL=C`, e il controllo che l'elenco delle trappole numeri sé stesso onestamente (ogni numero scritto uguale alla posizione che markdown renderà). Oggi: **151 file puliti, 48 trappole coerenti** |
 | guardia di contesa | `driverlib.sh` — sorgente dei quattro driver **e** della finestra di build: un solo file identifica un processo da `/proc/<pid>/cmdline`, mai dal testo della riga di comando |
 | segreti nei risultati | `secret_scan.sh --out` — **prima** di citare un `.out` in un documento |
-| runbook e **26 trappole** | `scripts/perf/staging/README.md` |
+| runbook e **48 trappole** | `scripts/perf/staging/README.md` |
 | coordinate e credenziali | `~/.config/bore-perf/env.sh` (fuori dal repo, 600) |
 
 Ogni fase scrive `out/eth/<fase>.out` e un marker `_done.<fase>`; un driver
@@ -691,15 +775,19 @@ troncata si ripete, non sparisce.
   poteva vedere: **il ricevente non era mai stato bracchettato**. È quello che
   ha generato `pub/udp_pktsize.sh`, e il ladder pubblico resta citabile fino a
   n=2 finché il buco non è chiuso (§42, §46, §47).
-- **Il costo della PRIMA connessione di un tunnel `--udp`** — **ATTRIBUITO,
-  con un residuo.** `pub/ws_first_conn.sh` ha girato: il pool diretto vale già 1
-  **prima** che passi un byte e `direct_fallbacks` resta 0, quindi non è né la
-  composizione del pool né un fallback travestito — è il controllo di
-  congestione che parte freddo. Il residuo è che là il costo misura **4,2 %** e
-  in §35 misurava 18,6 %: l'unica differenza strutturale è che questa fase
-  registra i tunnel in anticipo e fa passare ~40 s prima del primo byte, il che
-  suggerisce che il costo sia funzione del **tempo dalla registrazione** e non
-  del numero d'ordine del trasferimento. Ipotesi, non misura: la chiude la
-  stessa fase con il ritardo come asse (0, 5, 20, 60 s). Fino ad allora si cita
-  il caso peggiore, 18,6 % (§40).
+- **Il costo della PRIMA connessione di un tunnel `--udp`** — **l'asse del
+  ritardo ha girato e ha dato TRE risposte, nessuna delle quali è quella
+  cercata (§49).** (a) In **6 celle su 9** il braccio «quic» non era quic: la
+  pool leggeva 0 **prima** del primo byte e ogni trasferimento è andato in
+  relay, perché ogni cella si registra sulla stessa porta e quindi eredita il
+  monitor pendente di §48 — l'asse misurava quanto ci mette P-14 a svuotare la
+  pool, e la risposta è «meno di 20 s, sempre». (b) Nell'unica cella che ha
+  tenuto il diretto per tutti e tre i trasferimenti la penalità è **1,3 %**
+  contro **0,8 %** del controllo relay nella stessa ripetizione: a 384 MiB la
+  penalità **non si vede**, e il 18,6 % di §35 è la firma di V-19 (96 MiB
+  durano 0,83 s e sono quasi tutti rampa). Con n=1 questo non chiude la
+  domanda: dice che dove si è potuto guardare non c'era. (c) La tabella
+  riassuntiva era essa stessa sbagliata per il difetto di `med()` qui sopra.
+  **Si richiude rieseguendo la fase contro un server con la correzione P-14**,
+  e allora tutte e nove le celle misurano ciò che dichiarano.
 - Le riserve «percorso lossy» di §5.

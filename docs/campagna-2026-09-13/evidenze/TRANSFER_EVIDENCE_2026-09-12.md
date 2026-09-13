@@ -5,10 +5,10 @@ command that produced it; where a number is inferred rather than measured, the t
 
 Companion documents:
 
-* `docs/performance/final_secret_perf_review.md` — the Italian review of the secret-tunnel
+* `docs/campagna-2026-09-13/secret/final_secret_perf_review.md` — the Italian review of the secret-tunnel
   campaign. **Read it first**: `bore transfer` is a secret tunnel with a file protocol on
   top, so every result there applies here unchanged.
-* `docs/performance/SECRET_STAGING_EVIDENCE_2026-09-11.md` — the secret-tunnel evidence,
+* `docs/campagna-2026-09-13/evidenze/SECRET_STAGING_EVIDENCE_2026-09-11.md` — the secret-tunnel evidence,
   in particular §10 (the receive-window floor) and §4 (S-5, the check-round asymmetry).
 * `docs/transfer/TRANSFER_ASSESSMENT_2026-07-10.md` — the earlier correctness audit
   (B1…B8, P1). This campaign did not revisit those; it starts where they left off.

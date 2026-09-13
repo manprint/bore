@@ -92,7 +92,7 @@ request under load. Asserts it completes < 3 s.
 ## Follow-up measurements (staging campaign 2026-09-10)
 
 Two things were measured after this fix shipped, both recorded in
-`docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md`.
+`docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10.md`.
 
 **The memory bill (F-13).** The connection window is a ceiling, so it is only
 paid when readers stop draining — but nothing bounded the total:

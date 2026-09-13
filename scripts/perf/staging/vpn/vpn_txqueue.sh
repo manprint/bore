@@ -66,7 +66,7 @@ ws_ready tq 45 >/dev/null || { echo "link never came up"; vpn_cleanup; exit 1; }
 # This stage holds ONE link across the whole ladder -- which is why its ten
 # samples came back within 699.9-706.5 Mbit/s at rtt_min 30.6-31.3 while the
 # stages that build a fresh link per rung produced a contaminated low group
-# (see docs/performance/ETH_RERUN_EVIDENCE_2026-09-12.md section 9). Settling
+# (see docs/campagna-2026-09-13/evidenze/ETH_RERUN_EVIDENCE_2026-09-12.md section 9). Settling
 # ONCE is therefore correct here; discarding the RESULT was not. If the single
 # link never settles the entire ladder is uncomparable, so this aborts rather
 # than annotating.

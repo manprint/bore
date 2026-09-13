@@ -1664,7 +1664,7 @@ di produrre un numero — che è l'ordine giusto.
 
 ### 27.1 La mappa domanda → fase, che non esisteva
 
-`docs/performance/ETH_CAMPAIGN_PLAN.md` §P6 pone al jump host cinque domande.
+`docs/campagna-2026-09-13/ETH_CAMPAIGN_PLAN.md` §P6 pone al jump host cinque domande.
 `rerun_jump.sh` dichiarava **una sola fase**, `jump_lat`:
 
 | # | domanda del piano | fase | stato prima |

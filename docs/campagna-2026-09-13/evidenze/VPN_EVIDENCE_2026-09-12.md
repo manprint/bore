@@ -6,7 +6,7 @@ path**, hunting bugs, races, leaks and optimizations, with the standing goal of
 maximizing bandwidth and minimizing latency.
 
 This document is the raw evidence and the method. The conclusions in Italian are
-in [`final_vpn_perf_review.md`](final_vpn_perf_review.md).
+in [`final_vpn_perf_review.md`](../vpn/final_vpn_perf_review.md).
 
 ---
 

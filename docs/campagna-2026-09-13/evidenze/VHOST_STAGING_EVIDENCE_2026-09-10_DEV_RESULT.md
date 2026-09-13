@@ -4,7 +4,7 @@
 That document is the **before**: it measured the pre-plan binary
 (`f15a3de`) against a frozen staging deployment, produced findings F-1…F-17 and
 open questions OQ1…OQ8, and the plan
-[`docs/plans/plan_VhostEnhancements/`](../plans/plan_VhostEnhancements/) was built
+[`docs/plans/plan_VhostEnhancements/`](../../plans/plan_VhostEnhancements/) was built
 from it. This document is the **after**: the same apparatus, the same server, the
 same test VM, the same suites, run against the deployed plan code, plus the
 measurements the operator asked for that the first campaign never made — a

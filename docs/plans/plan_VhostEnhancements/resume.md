@@ -6,7 +6,7 @@
 ## Status: all seven phases done. Phase 04 ended in an attribution, not a fix — deliberately.
 
 Authored 2026-09-10 by Opus, from
-`docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md`. Branch `main`.
+`docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10.md`. Branch `main`.
 
 | phase | subject | state |
 | --- | --- | --- |

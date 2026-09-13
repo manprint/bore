@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The OPEN QUESTIONS of the wired window, and only those.
 #
-# §8 of `docs/performance/RELAZIONE_FINALE_CABLATO_2026-09-13.md` lists what the
+# §8 of `docs/campagna-2026-09-13/RELAZIONE_FINALE_CABLATO_2026-09-13.md` lists what the
 # campaign could not close. Four of those items share a property that makes them
 # worth a driver of their own: each is small, each has a stated method, and each
 # currently forces a published claim to be hedged. They are not new questions --

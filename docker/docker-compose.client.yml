@@ -51,7 +51,7 @@ services:
       #     path existed, and this comment said so.
       #
       # MEASURED RECOMMENDATION for a PUBLIC tunnel (staging campaign
-      # 2026-09-11, docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md):
+      # 2026-09-11, docs/campagna-2026-09-13/evidenze/PUBLIC_STAGING_EVIDENCE_2026-09-11.md):
       # leave it OFF unless you have one of the two problems it solves. On a
       # clean in-region path the TCP relay beat QUIC direct in every one of ten
       # paired runs -- median 1.51x on download and 1.34x on upload -- and it
@@ -117,7 +117,7 @@ services:
       # A single bulk flow rides one connection regardless of N.
       #
       # MEASURED RECOMMENDATION (staging campaign 2026-09-11, see
-      # docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md §8.1).
+      # docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md §8.1).
       # There is no single best value; pick by workload:
       #   one big transfer at a time      -> BORE_CARRIERS=1  (the default)
       #        59.10 MB/s down / 93.67 up from a domestic consumer, against
@@ -142,7 +142,7 @@ services:
       # them as ratios: a faster line moves all of them at once, and a byte
       # count calibrated against one line silently becomes a different
       # experiment on another. The CABLED re-run of 2026-09-13
-      # (docs/performance/ETH_RERUN_EVIDENCE_2026-09-12.md) changed none of the
+      # (docs/campagna-2026-09-13/evidenze/ETH_RERUN_EVIDENCE_2026-09-12.md) changed none of the
       # recommendations above, and section 51.1 adds WHY carriers do not help a
       # single flow: on the relay they SPREAD it. Twelve repetitions per cell,
       # bare control sampled inside each one -- the c1 excursion is 3.4x and the

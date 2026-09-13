@@ -295,7 +295,7 @@ in cui il relay muore mentre entrambi i peer sono vivi.**
    netmap `real@virtual`, `--forward-accept`. È l'ultimo buco di copertura.
    `LAN_HOST` non è impostato, quindi la sonda sulla catena FORWARD verrà saltata
    rumorosamente (e va bene così, ma va detto nel documento).
-3. **Sezioni mancanti di `docs/performance/final_vpn_perf_review.md`**: stabilità
+3. **Sezioni mancanti di `docs/campagna-2026-09-13/vpn/final_vpn_perf_review.md`**: stabilità
    e leak, modi, domande aperte, chiusura. §0–§6 sono scritte.
 4. **Riportare stabilità e modi anche in `VPN_EVIDENCE_2026-09-12.md`.**
 5. **Commit + push + CI verde al 100% con `gh`.** Prima del push: grep del diff in
@@ -357,8 +357,8 @@ Branch `main`. Non committato al momento dell'handoff:
   `scripts/vpn_netns_test.sh`, `src/adaptive_nat.rs`, `src/holepunch.rs`,
   `src/shared.rs`, `src/udp_diagnostic.rs`, `src/vpn.rs`, `src/vpn_server.rs`
 - non tracciati: `scripts/vpn_tun_endpoint.sh`, `scripts/perf/staging/vpn/`,
-  `docs/performance/VPN_EVIDENCE_2026-09-12.md`,
-  `docs/performance/final_vpn_perf_review.md`, questo file,
+  `docs/campagna-2026-09-13/evidenze/VPN_EVIDENCE_2026-09-12.md`,
+  `docs/campagna-2026-09-13/vpn/final_vpn_perf_review.md`, questo file,
   `docs/vhost/VHOST_PERFORMANCE_ASSESSMENT_2026-09-07.md` (preesistente)
 
 ## 6. Stato della workstation al riavvio

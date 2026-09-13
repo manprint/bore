@@ -6,9 +6,9 @@
 > è "quanti byte al secondo" ma **quanta coda c'è in mezzo**.
 >
 > Le prove grezze stanno in
-> [`VPN_EVIDENCE_2026-09-12.md`](VPN_EVIDENCE_2026-09-12.md); la meccanica del
-> traversal sta in [`../nat/NAT_TRAVERSAL.md`](../nat/NAT_TRAVERSAL.md) e il
-> comportamento del prodotto in [`../vpn/VPN.md`](../vpn/VPN.md). Qui si tirano
+> [`VPN_EVIDENCE_2026-09-12.md`](../evidenze/VPN_EVIDENCE_2026-09-12.md); la meccanica del
+> traversal sta in [`../nat/NAT_TRAVERSAL.md`](../../nat/NAT_TRAVERSAL.md) e il
+> comportamento del prodotto in [`../vpn/VPN.md`](../../vpn/VPN.md). Qui si tirano
 > le somme: cosa è stato misurato, cosa era rotto, cosa è stato cambiato, cosa
 > resta aperto e perché.
 

@@ -242,7 +242,7 @@ Non ho accesso alla macchina, quindi alcune spiegazioni stanno nei log e solo tu
 ## 8. Deliverable
 
 1. **Scheda capacità** dell'ambiente (fase A).
-2. `docs/performance/STAGING_REAL_BENCH_RESULTS_<data>.md`: condizioni esatte, matrice eseguita, tabelle con percentili,
+2. `docs/campagna-<data>/evidenze/…_EVIDENCE_<data>.md`: condizioni esatte, matrice eseguita, tabelle con percentili,
    collo di bottiglia identificato per scenario (macchina / rete / crediti / bore), e **cosa non è stato misurato**.
 3. Dati grezzi (CSV) + script client riutilizzabili, per rifare identici i test dopo ogni ottimizzazione.
 4. Raccomandazione ordinata sulle voci di

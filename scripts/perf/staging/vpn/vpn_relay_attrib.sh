@@ -264,7 +264,7 @@ fi
 if [ "$HAVE_LEGS" = 0 ] && [ "$HAVE_CTRL" = 0 ]; then
     echo "  PER-LEG ATTRIBUTION UNAVAILABLE -- the instrument bound but nothing can"
     echo "  reach it. This is the security groups plus the server's Docker DNAT, not"
-    echo "  a bug in the stage; see docs/performance/ETH_RERUN_EVIDENCE_2026-09-12.md"
+    echo "  a bug in the stage; see docs/campagna-2026-09-13/evidenze/ETH_RERUN_EVIDENCE_2026-09-12.md"
     echo "  section 25.6. The bore relay arm below is still measured and still valid."
 fi
 [ "$HAVE_CTRL" = 1 ] || echo "  CONTROL RELAY UNAVAILABLE -- the strongest discriminator is missing."

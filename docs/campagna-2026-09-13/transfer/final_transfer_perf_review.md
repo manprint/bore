@@ -4,7 +4,7 @@
 
 Questo documento è la sintesi ragionata della campagna sul trasferimento file. Le misure
 complete, con i comandi che le hanno prodotte, stanno in
-`docs/performance/TRANSFER_EVIDENCE_2026-09-12.md`; qui c'è ciò che è stato trovato, perché,
+`docs/campagna-2026-09-13/evidenze/TRANSFER_EVIDENCE_2026-09-12.md`; qui c'è ciò che è stato trovato, perché,
 cosa è stato cambiato e cosa resta aperto.
 
 ---
@@ -14,7 +14,7 @@ cosa è stato cambiato e cosa resta aperto.
 `bore transfer` **non è un quinto trasporto**. `transfer listener` si registra come
 *provider* di un tunnel segreto e RICEVE; `transfer sender` è il *consumer*
 (`secret::Proxy`) e INVIA. Di conseguenza ogni risultato della campagna sui tunnel segreti
-(`docs/performance/final_secret_perf_review.md`) vale qui senza modifiche:
+(`docs/campagna-2026-09-13/secret/final_secret_perf_review.md`) vale qui senza modifiche:
 
 * sul braccio **diretto** i byte vanno sender ↔ listener su QUIC bucato, con il server
   fuori dal percorso (S-1); sul braccio **relay** attraversano il server due volte;

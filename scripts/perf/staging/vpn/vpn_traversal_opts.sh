@@ -5,7 +5,7 @@
 # ------------
 # `--stun-server`, `--nat-udp-preferred-port`, `--try-port-prediction` and
 # `--upnp` are shipped, documented, and exercised by NO stage in this campaign
-# (`docs/performance/VPN_DEEP_DIVE_PLAN.md` §1). They also do not belong on a
+# (`docs/campagna-2026-09-13/vpn/VPN_DEEP_DIVE_PLAN.md` §1). They also do not belong on a
 # bandwidth axis: none of them moves a byte faster. What they change is whether
 # -- and how quickly -- a link stops being a relay link.
 #

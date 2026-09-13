@@ -3480,7 +3480,7 @@ async fn vhost_backend_tls_native_end_to_end() -> Result<()> {
 // BOTH `send` (buffers into yamux) and `recv` (blocks forever), and the RAII
 // `Deregister` guard therefore never dropped. Measured at t+180 s with
 // `relay_tx_bytes` frozen since t+20 s, on both transports, with re-registration
-// rejected throughout — F-1 in docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md.
+// rejected throughout — F-1 in docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10.md.
 //
 // These tests hold the opener AND the control substream so the TCP connection
 // stays UP while nothing is ever sent: wedged, not closed. Dropping the client

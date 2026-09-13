@@ -261,7 +261,7 @@ Behavior by value:
   not affected by that cap.)
 
 For maximum performance — **measured on staging 2026-09-11**, see
-[`VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md`](VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md)
+[`VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md`](../evidenze/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md)
 §8.1 — there is no single best value. Pick by workload:
 
 | workload | value | measured |

@@ -6,8 +6,8 @@
 # Secrets live in the sibling .env (chmod 600), never in this file:
 #   BORE_SERVER=...   BORE_SECRET=...   BORE_VHOST_SUBDOMAIN=...
 #
-# Evidence: docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md
-#           docs/performance/final_vhost_perf_review.md   (Italian)
+# Evidence: docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md
+#           docs/campagna-2026-09-13/vhost/final_vhost_perf_review.md   (Italian)
 
 services:
   # ---------------------------------------------------------------------------

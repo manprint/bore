@@ -29,7 +29,7 @@
 #     in use`. The default base here is 21400.
 #
 # The run directory must be on tmpfs or the disk becomes the variable (see
-# docs/performance/TRANSFER_EVIDENCE_2026-09-12.md §7.1); TMPDIR is set for you.
+# docs/campagna-2026-09-13/evidenze/TRANSFER_EVIDENCE_2026-09-12.md §7.1); TMPDIR is set for you.
 #
 # Usage:
 #   BEFORE=/path/to/old/bore [FILES="10 100 1000"] [MB=2048] [PAR=8] [REPS=7] [PAIRS=2] \

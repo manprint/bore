@@ -7,7 +7,7 @@ domestic workstation, with the native binary, the dockerized binary and the
 OpenSSH gateway.
 
 This is the raw-evidence companion to
-[`final_public_perf_review.md`](final_public_perf_review.md) (Italian, written
+[`final_public_perf_review.md`](../public/final_public_perf_review.md) (Italian, written
 for a reader who is not expected to know the codebase). Everything here is a
 transcript or a number taken from one; nothing is reconstructed from memory.
 
@@ -1652,7 +1652,7 @@ UDP socket buffers and logs a warning on every socket.
 Nothing in this document depends on a host name, a port or a credential that
 lives in the repository. The whole harness is re-pointed at another deployment
 by editing one `env.sh`, and
-[`scripts/perf/staging/pub/README.md`](../../scripts/perf/staging/pub/README.md)
+[`scripts/perf/staging/pub/README.md`](../../../scripts/perf/staging/pub/README.md)
 is its reference — layout, the two origins, and the traps that make results
 wrong.
 

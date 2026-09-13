@@ -387,7 +387,7 @@ parallelizing per-connection crypto/congestion across cores (capped at 32, not b
 `--max-carriers`). Both need `bore server --udp`; both fall back to the TCP relay
 per-connection when the direct path is unavailable. As always, a single flow over one
 connection is not split — see
-[`docs/performance/CARRIER_TUNING.md`](docs/performance/CARRIER_TUNING.md).
+[`docs/campagna-2026-09-13/public/CARRIER_TUNING.md`](docs/campagna-2026-09-13/public/CARRIER_TUNING.md).
 
 **Measured recommendation for `bore vhost` (staging, 2026-09-11).** There is no single
 best carrier count; pick by workload:
@@ -406,7 +406,7 @@ many simultaneously held connections (14 ms vs 1436 ms behind 512) or for lossy 
 
 **Measured recommendation for a PUBLIC tunnel (`bore local`), staging 2026-09-11.** The
 numbers are NOT the same as vhost's above, and the difference is not noise — see
-[`docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md`](docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md).
+[`docs/campagna-2026-09-13/evidenze/PUBLIC_STAGING_EVIDENCE_2026-09-11.md`](docs/campagna-2026-09-13/evidenze/PUBLIC_STAGING_EVIDENCE_2026-09-11.md).
 
 | workload | setting | measured |
 | --- | --- | --- |
@@ -425,9 +425,9 @@ direct). It pays off where the relay cannot compete: at 32 concurrent HTTP conne
 direct path took the tail (p95 3.48 vs 4.58 ms, p99 3.96 vs 7.27 ms), and on a lossy path it
 is the one that keeps serving.
 Full evidence:
-[`docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md`](docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md),
+[`docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md`](docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md),
 and in Italian
-[`docs/performance/final_vhost_perf_review.md`](docs/performance/final_vhost_perf_review.md) §12.
+[`docs/campagna-2026-09-13/vhost/final_vhost_perf_review.md`](docs/campagna-2026-09-13/vhost/final_vhost_perf_review.md) §12.
 
 **Proxy copy buffer:** `BORE_PROXY_BUFFER_SIZE` (default 256 KiB; accepts a
 `KB`/`MB`/`GiB`/... suffix, clamped `[4 KiB, 16 MiB]`) sets the per-direction relay/splice
@@ -599,9 +599,9 @@ that produces these numbers on any host is documented in `scripts/perf/README.md
 
 **Re-running the whole staging campaign.** `scripts/perf/staging/` holds the complete
 harness behind
-[`docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md`](docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md)
+[`docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md`](docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md)
 (English evidence) and
-[`docs/performance/final_vhost_perf_review.md`](docs/performance/final_vhost_perf_review.md)
+[`docs/campagna-2026-09-13/vhost/final_vhost_perf_review.md`](docs/campagna-2026-09-13/vhost/final_vhost_perf_review.md)
 (Italian review): a server host, a same-region measurement VM and a domestic consumer,
 driven from one `env.sh` that never enters the repository. Copy
 `scripts/perf/staging/env.sh.example`, fill in the coordinates of whichever deployment you
@@ -621,7 +621,7 @@ small assets alone**, but it loses **half the bulk throughput** (0.51× on a 2 M
 **0.73× at 2 ms RTT, 1.07× at 21 ms, 1.45× at 100 ms.** So h2 would make a same-region page
 slower and only pays for a distant audience serving small-asset pages. Full tables, the graft
 study and the recommendation are in
-`docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md` §10.
+`docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10.md` §10.
 
 **Direct-path memory: the sizing rule.** The QUIC connection receive window is a
 per-connection **ceiling, not a reservation** — a healthy tunnel buffers approximately

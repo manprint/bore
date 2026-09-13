@@ -38,7 +38,7 @@ services:
     # limit the kernel refuses FIRST with EMFILE, and EMFILE lands on accept()
     # for EVERY listener the process owns -- so one tunnel's concurrency takes
     # down the admin API, the vhost frontends and every other tunnel. MEASURED
-    # 2026-09-11 (docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md
+    # 2026-09-11 (docs/campagna-2026-09-13/evidenze/PUBLIC_STAGING_EVIDENCE_2026-09-11.md
     # section 11): BORE_MAX_CONNS=1024 against a soft RLIMIT_NOFILE of 1024, at
     # ~976 held connections through ONE tunnel, logged `No file descriptors
     # available (os error 24)` every 100 ms and answered nothing on its control
@@ -110,7 +110,7 @@ services:
       # the rate to use is the server's aggregate, not one tunnel's.
       #
       # MEASURED
-      # 2026-09-11 (docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md
+      # 2026-09-11 (docs/campagna-2026-09-13/evidenze/PUBLIC_STAGING_EVIDENCE_2026-09-11.md
       # section 13.1): the direct arm took IN 3.885 GiB to DELIVER 2.279
       # (1.78x -- retransmission, not per-packet overhead) while the relay
       # arm's inbound and outbound agreed to 0.2 %. It cost half the goodput

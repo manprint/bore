@@ -8,9 +8,9 @@
 > intermediare.
 >
 > Le prove grezze stanno in
-> [`SECRET_STAGING_EVIDENCE_2026-09-11.md`](SECRET_STAGING_EVIDENCE_2026-09-11.md);
+> [`SECRET_STAGING_EVIDENCE_2026-09-11.md`](../evidenze/SECRET_STAGING_EVIDENCE_2026-09-11.md);
 > la meccanica del traversal sta in
-> [`../nat/NAT_TRAVERSAL.md`](../nat/NAT_TRAVERSAL.md). Qui si tirano le somme:
+> [`../nat/NAT_TRAVERSAL.md`](../../nat/NAT_TRAVERSAL.md). Qui si tirano le somme:
 > cosa è stato misurato, cosa era rotto, cosa è stato cambiato, e come si
 > colloca bore rispetto allo stato dell'arte.
 
@@ -204,7 +204,7 @@ Tutti i numeri di questo capitolo vengono dalla campagna su staging con il
 binario **precedente** alle correzioni (`1bb3243a`): sono la base di confronto,
 e sono anche il posto in cui due dei quattro difetti si vedono mentre fanno
 danno invece che mentre esistono. Le tabelle grezze stanno in
-[`SECRET_STAGING_EVIDENCE_2026-09-11.md`](SECRET_STAGING_EVIDENCE_2026-09-11.md)
+[`SECRET_STAGING_EVIDENCE_2026-09-11.md`](../evidenze/SECRET_STAGING_EVIDENCE_2026-09-11.md)
 §8.
 
 ### 3.1 Il traversal funziona: 60 tunnel su 60 diretti

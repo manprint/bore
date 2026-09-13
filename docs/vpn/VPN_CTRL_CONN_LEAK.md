@@ -8,11 +8,11 @@ fix rispondono alla domanda sbagliata.
 **Perché è qui e non in uno scratchpad:** è l'unico difetto di prodotto ancora
 aperto della campagna VPN, e la campagna deve poter essere ripresa a freddo fra
 un mese. Contesto e stato generale in
-`docs/performance/VPN_CAMPAIGN_HANDOFF.md`; misure in
-`docs/performance/ETH_RERUN_EVIDENCE_2026-09-12.md`.
+`docs/campagna-2026-09-13/vpn/VPN_CAMPAIGN_HANDOFF.md`; misure in
+`docs/campagna-2026-09-13/evidenze/ETH_RERUN_EVIDENCE_2026-09-12.md`.
 
 **Quando eseguirlo:** nella finestra di build (P5 in
-`docs/performance/ETH_CAMPAIGN_PLAN.md`), mai mentre una fase sta misurando —
+`docs/campagna-2026-09-13/ETH_CAMPAIGN_PLAN.md`), mai mentre una fase sta misurando —
 compilare occupa la CPU, e la CPU fa parte dello strumento.
 
 ---

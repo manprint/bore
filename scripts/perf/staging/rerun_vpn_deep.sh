@@ -5,7 +5,7 @@
 # ---------------
 # The brief is "the VPN must have no defects", so the useful question is not
 # "is it fast" but "which part of the shipped product has never been measured".
-# `docs/performance/VPN_DEEP_DIVE_PLAN.md` holds the coverage matrix that answers
+# `docs/campagna-2026-09-13/vpn/VPN_DEEP_DIVE_PLAN.md` holds the coverage matrix that answers
 # it -- extracted from `VpnListenArgs`/`VpnConnectArgs` and the `BORE_*` reads in
 # the source, then crossed against the stages that actually pass each flag.
 #

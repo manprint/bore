@@ -175,7 +175,7 @@ fi
 # never decrease.
 echo
 echo "== the evidence document's sections do not go backwards =="
-EV="$ROOT/docs/performance/ETH_RERUN_EVIDENCE_2026-09-12.md"
+EV="$ROOT/docs/campagna-2026-09-13/evidenze/ETH_RERUN_EVIDENCE_2026-09-12.md"
 if [ ! -f "$EV" ]; then
     echo "PASS -- (no evidence document at the expected path; nothing to check)"
 else
@@ -188,6 +188,38 @@ else
     else
         echo "PASS -- $(grep -cE '^## [0-9]+\.' "$EV") section(s), never decreasing"
     fi
+fi
+
+# --------------------------------------------------------------- compiler 10
+# A campaign's documents get REORGANISED -- moved into a dated folder, split by
+# component -- and every relative link inside them silently becomes a lie. The
+# move of 2026-09-13 broke 11 of 14 links in one pass, and a broken link in an
+# evidence document is worse than a missing one: it reads as if the reference
+# had been checked. A human re-checking 67 links by hand will not do it twice.
+echo
+echo "== every link inside a campaign folder resolves =="
+links=0
+broken=0
+while IFS= read -r doc; do
+    dir=$(dirname "$doc")
+    while IFS= read -r target; do
+        [ -z "$target" ] && continue
+        case "$target" in http://*|https://*|"#"*|mailto:*) continue ;; esac
+        links=$((links + 1))
+        t=${target%%#*}
+        [ -z "$t" ] && continue
+        case "$t" in
+            docs/*) cand="$ROOT/$t" ;;
+            *)      cand="$dir/$t" ;;
+        esac
+        [ -e "$cand" ] || { echo "  ${doc#"$ROOT/"} -> $target"; broken=$((broken + 1)); }
+    done < <(grep -oE '\]\([^)]+\)' "$doc" | sed 's/^\](//; s/)$//')
+done < <(find "$ROOT/docs" -path '*/campagna-*' -name '*.md' -type f | LC_ALL=C sort)
+if [ "$broken" -gt 0 ]; then
+    echo "FAIL -- $broken broken link(s) out of $links; a document that moves takes its references with it"
+    fail=1
+else
+    echo "PASS -- $links link(s), every one resolves"
 fi
 
 echo

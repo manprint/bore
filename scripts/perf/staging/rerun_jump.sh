@@ -13,7 +13,7 @@
 #
 # THE FIVE QUESTIONS, AND THE THREE STAGES THAT ANSWER THEM
 # ----------------------------------------------------------
-# The campaign plan (`docs/performance/ETH_CAMPAIGN_PLAN.md` §P6) asks five
+# The campaign plan (`docs/campagna-2026-09-13/ETH_CAMPAIGN_PLAN.md` §P6) asks five
 # things of the jump host. For a long time ONE stage was wired, covering four of
 # them and leaving the fifth -- the one whose failure a user experiences as "my
 # session dropped" -- entirely unmeasured. The mapping is now explicit, so a

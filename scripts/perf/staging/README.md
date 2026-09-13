@@ -271,7 +271,7 @@ scripts/perf/staging/vpn/vpn_overhead.sh         # wire bytes per delivered byte
 **The deep-dive set (`scripts/perf/staging/rerun_vpn_deep.sh`)** exists because
 the list above measures the VPN's PERFORMANCE and says nothing about the shipped
 options it never passes. The coverage matrix is
-`docs/performance/VPN_DEEP_DIVE_PLAN.md`; the five stages are:
+`docs/campagna-2026-09-13/vpn/VPN_DEEP_DIVE_PLAN.md`; the five stages are:
 
 ```bash
 scripts/perf/staging/vpn/vpn_wiring.sh          # D1 knobs read back from the KERNEL, no traffic
@@ -351,7 +351,7 @@ same one-per-reconnect growth (12 → 13 → 14) that `ss` sees as ESTABLISHED
 connections. In the same run the tunnel's throughput fell from 712 Mbit/s to
 95–160 by the third reconnect while the bare path measured 733 up moments
 later — so the leak is a candidate throughput regression, not a cosmetic
-descriptor count. See §15 of `docs/performance/ETH_RERUN_EVIDENCE_2026-09-12.md`.
+descriptor count. See §15 of `docs/campagna-2026-09-13/evidenze/ETH_RERUN_EVIDENCE_2026-09-12.md`.
 
 ### `vpn_relay_attrib.sh` — why no relay percentage is a sentence about bore until this runs
 
@@ -463,7 +463,7 @@ server and drops the operator's live tunnels, and needs explicit approval.
 
 ## 3.11 The open questions (`rerun_open.sh`)
 
-§8 of `docs/performance/RELAZIONE_FINALE_CABLATO_2026-09-13.md` lists what the
+§8 of `docs/campagna-2026-09-13/RELAZIONE_FINALE_CABLATO_2026-09-13.md` lists what the
 wired campaign could not close. Four of those items are small, have a stated
 method, and each forces a published claim to be hedged — so they have their own
 driver rather than being folded into a general re-run.
@@ -1300,22 +1300,23 @@ do not "simplify" them back out.
 
 | document | what it is |
 | --- | --- |
-| `docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md` | the "before" campaign |
-| `docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md` | the "after" campaign: paired before/after, bug verification, bottleneck per test |
-| `docs/performance/final_vhost_perf_review.md` | the same evidence in Italian, written to be readable by a non-specialist |
-| `docs/performance/CARRIER_TUNING.md` | the operator-facing tuning guide |
-| `docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md` | the public-tunnel campaign: defect register, paired transport A/B, flavours, concurrency, netem, CPU s/GiB, soak |
-| `docs/performance/final_public_perf_review.md` | the public-tunnel evidence in Italian, written to be readable by a non-specialist |
-| `docs/performance/SECRET_STAGING_EVIDENCE_2026-09-11.md` | the secret/peer-to-peer campaign |
-| `docs/performance/final_secret_perf_review.md` | the same, in Italian |
-| `docs/performance/TRANSFER_EVIDENCE_2026-09-12.md` | the `bore transfer` campaign |
-| `docs/performance/final_transfer_perf_review.md` | the same, in Italian |
-| `docs/performance/VPN_EVIDENCE_2026-09-12.md` | the VPN campaign (WiFi; superseded on every absolute figure) |
-| `docs/performance/final_vpn_perf_review.md` | the same, in Italian |
-| `docs/performance/ETH_CAMPAIGN_PLAN.md` | the wired window: schedule, rules, what is NOT re-measured and why |
-| `docs/performance/ETH_RERUN_EVIDENCE_2026-09-12.md` | **the wired re-run** — which earlier conclusions invert, and which survive |
-| `docs/performance/VPN_CAMPAIGN_HANDOFF.md` | campaign state, for picking the work back up cold |
-| `docs/performance/VPN_DEEP_DIVE_PLAN.md` | **the VPN coverage matrix** — every CLI option and `BORE_*` knob against the stage that exercises it, and what is still uncovered |
+| `docs/campagna-2026-09-13/README.md` | **start here** — the campaign index: one folder per component, each with a `FINALE.md` in Italian (result, optimisations applied, what stays open) |
+| `docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10.md` | the "before" campaign |
+| `docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10_DEV_RESULT.md` | the "after" campaign: paired before/after, bug verification, bottleneck per test |
+| `docs/campagna-2026-09-13/vhost/final_vhost_perf_review.md` | the same evidence in Italian, written to be readable by a non-specialist |
+| `docs/campagna-2026-09-13/public/CARRIER_TUNING.md` | the operator-facing tuning guide |
+| `docs/campagna-2026-09-13/evidenze/PUBLIC_STAGING_EVIDENCE_2026-09-11.md` | the public-tunnel campaign: defect register, paired transport A/B, flavours, concurrency, netem, CPU s/GiB, soak |
+| `docs/campagna-2026-09-13/public/final_public_perf_review.md` | the public-tunnel evidence in Italian, written to be readable by a non-specialist |
+| `docs/campagna-2026-09-13/evidenze/SECRET_STAGING_EVIDENCE_2026-09-11.md` | the secret/peer-to-peer campaign |
+| `docs/campagna-2026-09-13/secret/final_secret_perf_review.md` | the same, in Italian |
+| `docs/campagna-2026-09-13/evidenze/TRANSFER_EVIDENCE_2026-09-12.md` | the `bore transfer` campaign |
+| `docs/campagna-2026-09-13/transfer/final_transfer_perf_review.md` | the same, in Italian |
+| `docs/campagna-2026-09-13/evidenze/VPN_EVIDENCE_2026-09-12.md` | the VPN campaign (WiFi; superseded on every absolute figure) |
+| `docs/campagna-2026-09-13/vpn/final_vpn_perf_review.md` | the same, in Italian |
+| `docs/campagna-2026-09-13/ETH_CAMPAIGN_PLAN.md` | the wired window: schedule, rules, what is NOT re-measured and why |
+| `docs/campagna-2026-09-13/evidenze/ETH_RERUN_EVIDENCE_2026-09-12.md` | **the wired re-run** — which earlier conclusions invert, and which survive |
+| `docs/campagna-2026-09-13/vpn/VPN_CAMPAIGN_HANDOFF.md` | campaign state, for picking the work back up cold |
+| `docs/campagna-2026-09-13/vpn/VPN_DEEP_DIVE_PLAN.md` | **the VPN coverage matrix** — every CLI option and `BORE_*` knob against the stage that exercises it, and what is still uncovered |
 | `docs/vpn/VPN_CTRL_CONN_LEAK.md` | the one open product defect: mechanism, red-check, fix options |
 
 Each of those names the exact script that produced each figure, so a number can

@@ -12,7 +12,7 @@ set -uo pipefail
 #   BORE_PERF_ENV  path to an env file exporting BORE_HOST, BORE_TO, BORE_SECRET,
 #                  ADMIN_URL, ADMIN_TOKEN (chmod 600, kept outside the repo)
 #   BORE_PERF_OUT  writable directory for logs and results (default: mktemp -d)
-# See docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md section 9.
+# See docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10.md section 9.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 B="${BORE_PERF_OUT:-$(mktemp -d -t bore-perf-XXXXXX)}"; mkdir -p "$B/logs"
 . "${BORE_PERF_ENV:?set BORE_PERF_ENV to an env file exporting BORE_HOST/BORE_TO/BORE_SECRET/ADMIN_URL/ADMIN_TOKEN}"

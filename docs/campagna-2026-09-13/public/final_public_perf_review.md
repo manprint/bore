@@ -28,7 +28,7 @@ che cosa avrebbe potuto fare il collegamento.
 > resto è la dimostrazione.
 
 Il documento gemello in inglese,
-[`PUBLIC_STAGING_EVIDENCE_2026-09-11.md`](PUBLIC_STAGING_EVIDENCE_2026-09-11.md),
+[`PUBLIC_STAGING_EVIDENCE_2026-09-11.md`](../evidenze/PUBLIC_STAGING_EVIDENCE_2026-09-11.md),
 contiene le trascrizioni integrali di ogni singola prova: qui si riportano i
 risultati e il loro significato, lì si trova la prova che i numeri sono veri.
 

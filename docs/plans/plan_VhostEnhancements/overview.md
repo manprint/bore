@@ -3,7 +3,7 @@
 > **Status:** planning | **Opus authored:** 2026-09-10
 > **Folder:** `docs/plans/plan_VhostEnhancements/`
 > **Branch:** main (campaign artifacts currently uncommitted)
-> **Evidence base:** `docs/performance/VHOST_STAGING_EVIDENCE_2026-09-10.md`
+> **Evidence base:** `docs/campagna-2026-09-13/evidenze/VHOST_STAGING_EVIDENCE_2026-09-10.md`
 > (findings F-1…F-16, candidate assessment §6, runbook §9)
 
 ## Goal

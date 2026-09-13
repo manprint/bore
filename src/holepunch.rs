@@ -1263,7 +1263,7 @@ impl UdpTraversalSocket {
                     // dropped Initial is not retried until the QUIC PTO.
                     //
                     // MEASURED on staging 2026-09-11 (vm-ws, 27 establishments,
-                    // docs/performance/SECRET_STAGING_EVIDENCE_2026-09-11.md
+                    // docs/campagna-2026-09-13/evidenze/SECRET_STAGING_EVIDENCE_2026-09-11.md
                     // §4.1): the distribution of `direct_ready_ms` was
                     // BIMODAL — 18 runs in 37..53 ms and 9 runs in
                     // 1036..1162 ms, with nothing in between. Every slow run

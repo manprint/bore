@@ -4653,13 +4653,22 @@ con 252 byte di margine disponibile, e non li ha presi.
 
 **Questa è una domanda nuova e aperta, non una correzione.** Vale il ~17 % dei
 pacchetti del percorso diretto (1452/1200 in meno di frame per lo stesso
-payload) e non va toccata a intuito — è precisamente ciò che questa campagna non
-fa. Lo strumento per aprirla però **esiste già e non va scritto**:
-`bore test-udp` pubblica `current_mtu_bytes` da `ConnectionStats.path.current_mtu`
-(`src/udp_diagnostic.rs:2070`) e avvisa già sotto 1200. Il primo esperimento è
-leggere quel campo su una connessione diretta reale tra queste due macchine e
-vedere se la ricerca non parte, parte e fallisce, o parte e riesce su un
-percorso diverso da quello staffato qui.
+payload) e non va toccata a intuito. Lo strumento per aprirla esisteva già e non
+è stato scritto: `bore test-udp` pubblica `current_mtu_bytes` da
+`ConnectionStats.path.current_mtu` (`src/udp_diagnostic.rs:2070`).
+
+**Ed è stato eseguito subito, e la risposta RESTRINGE l'ipotesi invece di
+confermarla** (§54): su un percorso WAN reale fra queste stesse due macchine,
+con questa stessa `transport_config`, quinn **alza** l'MTU — `mtu 1.42 KiB, max
+datagram 1.38 KiB`, con `PLPMTUD: sent 4, lost 0, black holes 0`, riportato
+identico dai due capi. Quindi «bore non sonda mai» è **falso**, e la frase
+qui sopra andava letta come quello che era: un'ipotesi aritmetica, non un
+meccanismo osservato. Quello che resta aperto è molto più stretto e molto più
+interessante — perché il percorso **VM → server** del braccio public gira a 1200
+mentre il traffico TCP sulla STESSA tratta viaggia in frame da 1502, e mentre
+una connessione QUIC costruita dallo stesso binario su un'altra tratta arriva a
+1452. La domanda non è più «bore sonda?» ma «che cosa ha di diverso quella
+tratta, o quel percorso di codice».
 
 ### 47.8.2 La conseguenza operativa, che è la parte cara
 
@@ -4895,3 +4904,97 @@ letterale no. Due correzioni, e la seconda conta quanto la prima: due grafie
 distinte (`REMOTE_SCP` relativo per scp, `REMOTE` con `$HOME` per ssh), e
 **stderr conservato e stampato** nel messaggio di guasto. Uno strumento che
 fallisce deve dire che cosa è fallito; questo lo sapeva e non lo diceva.
+
+## 54. La sonda MTU, e la capability che il server cancella passando
+
+§47.8.1 aveva chiuso un conto aritmetico su un'ipotesi: la connessione diretta
+del braccio public ha girato per 460 MiB a 1202,7 B di payload UDP, cioè
+`INITIAL_MTU`, con 252 byte di margine disponibili e non presi. La regola della
+campagna è che un'ipotesi si apre con una misura, non con una riga di codice — e
+lo strumento c'era già.
+
+### 54.1 La misura: su un percorso reale, la scoperta MTU funziona
+
+`bore test-udp --tcp-secret-id` in modalità accoppiata fra questa workstation e
+la VM di test, **stesso binario ai due capi** (`82bff809`), trasferimento
+bidirezionale di 61 MiB per direzione:
+
+```
+UDP direct path QUIC    : rtt 18.89 ms, cwnd 8.28 MiB, mtu 1.42 KiB,
+                          max datagram 1.38 KiB, loss 0 pkts, sent 51834 pkts
+UDP direct path PLPMTUD : sent 4, lost 0, black holes 0
+```
+
+e il capo opposto riporta gli stessi due numeri (`mtu 1.42 KiB`, `PLPMTUD sent
+4 / lost 0 / black holes 0`). **Quattro sonde, nessuna persa, MTU a ~1452.**
+
+Quindi «bore non alza mai l'MTU» è **falso**, e la formulazione di §47.8.1
+andava letta per quello che era: aritmetica che chiude su un'ipotesi, non un
+meccanismo osservato. Corretta sul posto.
+
+La domanda che resta è più stretta e vale di più. Sulla tratta **VM → server**
+del braccio public convivono tre fatti misurati:
+
+- il TCP del braccio relay viaggia in frame da **1502 B** — la tratta porta
+  pacchetti pieni;
+- il QUIC del braccio direct viaggia a **1244,7 B** di frame per 460 MiB;
+- lo **stesso binario**, su un'altra tratta, arriva a 1452 con quattro sonde e
+  zero perse.
+
+Non è più «bore sonda?». È «che cosa ha di diverso quella tratta — o quel
+percorso di codice». Le due ipotesi che questa misura lascia in piedi sono che
+la tratta VM→server scarti i datagrammi UDP grandi (un buco nero che il TCP non
+vede perché frammenta e ritrasmette diversamente), oppure che l'endpoint
+costruito per il percorso public-direct non sia lo stesso di quello costruito
+per il punch peer-to-peer. Nessuna delle due è stata misurata e **nessuna va
+corretta prima di esserlo**.
+
+### 54.2 Il regalo non richiesto: due peer correnti, entrambi declassati
+
+La stessa esecuzione ha stampato, **da entrambi i capi**:
+
+```
+Candidate order : advisory only (peer predates the authenticated check round;
+                  this run uses the legacy blind punch ...)
+UDP direct path : peer does not run the authenticated check round
+```
+
+I due peer sono lo **stesso binario**, il più recente. Ognuno dichiara che
+l'altro è vecchio. Un falso negativo reciproco ha una sola forma possibile: il
+segnale si perde **in transito**.
+
+E il transito è il server. `ClientMessage::TestUdpJoin` porta
+`summary: UdpTestPeerSummary` **al server**, e il server risponde all'altro peer
+con `peer_summary: UdpTestPeerSummary`: lo deserializza nella **propria**
+definizione della struct e lo riserializza. Il campo che V-2 usa come gate,
+`pub checks: bool`, sta in `src/shared.rs:503` — ed è **assente dalla struct**
+alla revisione che il server di staging esegue (`1.0.0 - main - ed50a40f`,
+verificato con `git show ed50a40f:src/shared.rs`). Un campo che il server non
+conosce non sopravvive al giro: i due peer leggono il `#[serde(default)]`, cioè
+`false`, e concludono ciascuno che l'altro non sa fare il round.
+
+**La lezione sta nella regola che questo progetto già applica.** Un campo
+additivo con `#[serde(default)]` è sicuro su un filo **punto-a-punto**: il peer
+vecchio ignora ciò che non conosce, il nuovo mette il default. Non è sicuro
+quando in mezzo c'è una parte che **riscrive** il messaggio: lì «additivo» vuol
+dire «cancellato dal middlebox», e il default che protegge la compatibilità
+diventa il valore che disattiva la funzione. Il server è l'unica parte che non
+si può presumere aggiornata — i client si aggiornano indipendentemente, ed è
+esattamente l'argomento di P-9.
+
+Conseguenze pratiche, nessuna delle quali è stata applicata in questa finestra:
+
+1. Il messaggio del diagnostico **incolpa la parte sbagliata**. Dice «peer
+   predates the authenticated check round» quando la causa può essere il server,
+   e aggiunge «a real tunnel to this peer would too», che è un'affermazione sul
+   prodotto derivata dallo stesso segnale corrotto. È una correzione di onestà da
+   una riga, ed è la prima da fare.
+2. Il gate resta **giusto nell'intento** — V-2 legge la capability del peer e non
+   la propria versione, ed è la scelta corretta. È il canale a essere fragile.
+3. Vale la pena chiedersi se la capability debba viaggiare dove il server non
+   riscrive; ma è una modifica di protocollo, e questa finestra non ne apre.
+
+Da notare, perché è la parte confortante: il fallback ha **funzionato**. I due
+peer sono andati diretti lo stesso (`direct_ready_ms=298`, 0 perdite) con il
+punch cieco legacy. Il difetto costa il percorso veloce e la diagnosi corretta,
+non il tunnel.

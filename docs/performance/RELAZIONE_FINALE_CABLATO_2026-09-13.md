@@ -808,12 +808,35 @@ troncata si ripete, non sparisce.
   nessuno dei tre campi — quindi ci sono 252 byte di margine e la connessione non
   li ha presi per 460 MiB e 45 s. Vale il ~17 % dei pacchetti del percorso
   diretto e, dato il bucket PPS dell'istanza, i pacchetti sono la valuta che
-  conta. **Non va toccata a intuito**: lo strumento per aprirla esiste già e non
-  va scritto — `bore test-udp` pubblica `current_mtu_bytes` da
-  `ConnectionStats.path.current_mtu` (`src/udp_diagnostic.rs:2070`) e avvisa già
-  sotto 1200. Primo esperimento: leggere quel campo su una connessione diretta
-  reale fra queste due macchine, e distinguere «la ricerca non parte» da «parte e
-  fallisce» da «riesce su un percorso diverso da quello staffato qui».
+  conta. **L'esperimento è stato fatto invece di essere solo proposto** (§54), e
+  ha ristretto la domanda invece di confermarla: su un percorso WAN reale fra
+  queste stesse due macchine, con lo stesso binario ai due capi, quinn **alza**
+  l'MTU a 1452 — `PLPMTUD sent 4, lost 0, black holes 0`, identico dai due lati.
+  Quindi «bore non sonda» è falso. Restano in piedi tre fatti misurati sulla
+  tratta VM→server: il TCP del relay viaggia in frame da 1502, il QUIC del
+  direct a 1244,7 per 460 MiB, e lo stesso binario su un'altra tratta arriva a
+  1452. La domanda ora è **quale delle due** — la tratta scarta i datagrammi
+  grandi, o l'endpoint del percorso public-direct non è quello del punch
+  peer-to-peer. Nessuna delle due misurata, nessuna da correggere prima.
+
+- **Il server cancella una capability passando, e il diagnostico incolpa il
+  peer (§54.2).** Trovata di rimbalzo dalla sonda MTU: due peer con lo **stesso
+  binario, il più recente**, si sono dichiarati a vicenda «predates the
+  authenticated check round» e sono andati entrambi sul punch cieco legacy. Un
+  falso negativo reciproco si può perdere solo in transito, e il transito è il
+  server: `TestUdpJoin` porta `UdpTestPeerSummary` **al server**, che lo
+  deserializza nella propria definizione e lo riserializza, e il campo
+  `pub checks: bool` (`src/shared.rs:503`) **non esiste** alla revisione che
+  staging esegue (verificato con `git show`). La lezione generalizza una regola
+  che il progetto già applica: un campo additivo con `#[serde(default)]` è sicuro
+  su un filo punto-a-punto, **non** quando in mezzo c'è una parte che riscrive il
+  messaggio — lì «additivo» significa «cancellato», e il default che protegge la
+  compatibilità è il valore che spegne la funzione. Il fallback ha comunque
+  funzionato (diretto lo stesso, `direct_ready_ms=298`): costa il percorso veloce
+  e la diagnosi corretta, non il tunnel. La prima correzione da fare è di
+  **onestà del messaggio** — dire che la causa può essere il server invece di
+  accusare il peer — ed è una riga; spostare la capability dove il server non
+  riscrive è una modifica di protocollo e questa finestra non ne apre.
 - **N-9**, la coda di concorrenza del relay vhost — nessun meccanismo da
   colpire; si chiude solo rimisurando dalla stessa regione.
 - **Perché l'upload del relay ha una rampa e il download no.** Campioni grezzi

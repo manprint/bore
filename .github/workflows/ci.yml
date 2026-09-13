@@ -5,6 +5,10 @@ on:
     branches:
       - "**" # every branch: run the full CI matrix on any push
   pull_request:
+  # Callable so `release.yml` gates a tag on THIS matrix rather than a copy of
+  # it. A release gate that duplicated these jobs would drift from them, and the
+  # drift would only ever be discovered by shipping something CI had not run.
+  workflow_call:
 
 jobs:
   test:
@@ -368,6 +372,30 @@ jobs:
             BORE_ANDROID_BIN=$PWD/target/x86_64-linux-android/release/bore
             BORE_SPIKE_BIN=$PWD/target/x86_64-linux-android/release/examples/android_vpn_spike
             ./scripts/android_vpn_test.sh
+
+  # The workflow files are code, and until now nothing checked them. A broken
+  # one is invisible until the event that triggers it fires — for `release.yml`
+  # that event is a version tag, i.e. the least recoverable moment available.
+  # actionlint parses every workflow, type-checks the `${{ }}` expressions
+  # against the real context schemas, refuses a `needs:` naming a job that does
+  # not exist (red-checked) and runs shellcheck over every `run:` block.
+  #
+  # It earns its place on evidence, not on principle: its first run on this
+  # repository reported that `mean_bean_ci`'s macOS job still used
+  # `actions-rs/toolchain@v1` and `actions-rs/cargo@v1`, whose runner "is too
+  # old to run on GitHub Actions" — an archived action heading for a hard
+  # failure, in the job that gates two of the shipped Darwin targets. Note the
+  # limit too: it does NOT check what a reusable workflow does with the inputs
+  # it is given, so a called workflow stays as honest as its own tests.
+  workflows:
+    name: Workflow lint (actionlint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: actionlint
+      - run: actionlint -no-color -oneline
 
   audit:
     name: Security audit

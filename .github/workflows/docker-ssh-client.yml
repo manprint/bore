@@ -6,6 +6,10 @@
 # is fast and simpler.
 name: Docker SSH client (GHCR)
 
+# Same split as docker.yml: branches publish directly, a `v*` tag arrives
+# through `release.yml` AFTER the gates. Note the `paths:` filter is a property
+# of the PUSH trigger only -- a release must rebuild this image whether or not
+# its inputs changed in that commit, because the tag has to name a real image.
 on:
   push:
     branches:
@@ -14,9 +18,8 @@ on:
       - "docker/Dockerfile.ssh"
       - "docker/ssh-entrypoint.sh"
       - ".github/workflows/docker-ssh-client.yml"
-    tags:
-      - "v*"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -58,6 +61,7 @@ jobs:
           tags: |
             type=raw,value=latest
             type=ref,event=branch
+            type=semver,pattern=v{{version}}
             type=semver,pattern={{version}}
             type=sha
 

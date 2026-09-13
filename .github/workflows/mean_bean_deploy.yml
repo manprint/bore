@@ -1,10 +1,14 @@
+# Same split as docker.yml: a branch push publishes its rolling pre-release
+# here directly; a `v*` tag is published by `release.yml` only after the full
+# test matrix is green. Do not restore `tags:` here -- a GitHub Release is as
+# immutable in practice as a registry tag, and this is the workflow that
+# attaches the binaries people download.
 on:
   push:
     branches:
       - "**" # every branch
-    tags:
-      - "v*" # version tags, e.g. v1.0.0
   workflow_dispatch:
+  workflow_call:
 
 name: Mean Bean Deploy
 env:

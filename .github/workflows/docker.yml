@@ -1,12 +1,17 @@
 name: Docker (GHCR)
 
+# A BRANCH push builds and publishes here directly -- that is a mutable,
+# throwaway tag and the convenience is the point. A `v*` TAG does NOT: it is
+# called by `release.yml`, which runs the full test matrix FIRST. Publishing an
+# immutable release image that no gate had to pass is the defect this split
+# exists to remove; do not put `tags:` back on this trigger, or a red test suite
+# would ship `:v1.1.0` again.
 on:
   push:
     branches:
-      - "**" # every branch
-    tags:
-      - "v*"
+      - "**" # every branch (mutable tags only -- see above)
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -113,8 +118,16 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY_IMAGE }}
+          # BOTH spellings of a release tag, deliberately. `{{version}}` strips
+          # the leading `v` (Docker convention, `:1.1.0`); `v{{version}}` keeps
+          # it, which is the form this project publishes and documents
+          # (`:v1.1.0`). They are two tags on ONE manifest, so the second costs
+          # a registry pointer and nothing else -- and dropping either would
+          # break whoever pinned that spelling.
           tags: |
+            type=semver,pattern=v{{version}}
             type=semver,pattern={{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
             type=semver,pattern={{major}}.{{minor}}
             type=ref,event=branch
             type=sha
@@ -129,6 +142,12 @@ jobs:
       - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
+          # shellcheck disable=SC2046
+          # The word splitting is the POINT on both lines: one manifest carries
+          # every tag metadata-action resolved and every per-arch digest, so the
+          # two substitutions must expand into SEPARATE argv entries. Quoting
+          # them would pass "-t a -t b" as one argument and push a single image
+          # named after the concatenation.
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
@@ -162,7 +181,9 @@ jobs:
             latest=false
           tags: |
             type=raw,value=client
+            type=semver,pattern=v{{version}},prefix=client-
             type=semver,pattern={{version}},prefix=client-
+            type=semver,pattern=v{{major}}.{{minor}},prefix=client-
             type=semver,pattern={{major}}.{{minor}},prefix=client-
             type=ref,event=branch,prefix=client-
             type=sha,prefix=client-sha-

@@ -6,9 +6,22 @@ name: E2E (netns)
 # container jobs can't create netns/TUN without --privileged, which Actions
 # does not expose). No Docker required.
 #
-# NON-BLOCKING BY DESIGN: the matrix job is `continue-on-error: true` and
-# `fail-fast: false`, so any script failing/timing out is surfaced (failed
-# matrix leg + uploaded log) without failing the workflow or blocking a PR.
+# NON-BLOCKING ON A BRANCH, BLOCKING FOR A RELEASE. On an ordinary push the
+# matrix job is `continue-on-error: true` and `fail-fast: false`, so any script
+# failing/timing out is surfaced (failed matrix leg + uploaded log) without
+# failing the workflow or blocking a PR. Called with `gate: true` (only
+# `release.yml` does), the CORRECTNESS scripts become blocking and a failure
+# stops the release.
+#
+# WHY THAT IS SAFE, AND WHY IT IS ONLY THE CORRECTNESS SCRIPTS. Measured before
+# the switch was made, not assumed: the last four completed runs on `main`
+# (ed50a40, 6d7b6bd, a883391, 3115987) were 15/15 green in every one, so making
+# this suite decide a release is not a flakiness gamble. The BENCH and DEBUG
+# legs stay non-blocking even under `gate`, because a bench on a shared CI VM
+# measures the VM -- it has no pass threshold to fail against, and a noisy
+# neighbour must never be the reason a release does not ship. `matrix.gate`
+# is the per-script switch; it is deliberately DATA in the matrix rather than a
+# name pattern, so adding a script forces a decision about which kind it is.
 #
 # Each script runs in its OWN matrix job (own runner, own netns, own timeout):
 # one hung script can never consume another's budget or cancel the whole run —
@@ -19,6 +32,12 @@ on:
     branches: ["**"] # every branch: run all netns e2e on any push (non-blocking)
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      gate:
+        description: "Make the correctness scripts blocking (release gate)."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -45,34 +64,37 @@ jobs:
     name: ${{ matrix.script }}
     needs: build
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # `inputs.gate` is unset (falsy) for push/PR/dispatch, so an ordinary run is
+    # byte-for-byte the old behaviour: every leg non-blocking. Only a leg that
+    # is BOTH a correctness script and part of a gated call can fail the run.
+    continue-on-error: ${{ !(inputs.gate && matrix.gate) }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          # e2e netns tests
-          - { script: admin_dashboard_test,      secs: 600 }
-          - { script: local_proxy_netns_test,    secs: 900 }
-          - { script: secret_netns_test,         secs: 1200 }
-          - { script: vhost_netns_test,          secs: 1200 }
-          - { script: vhost_netns_test_hard,     secs: 1200 }
-          - { script: ssh_gateway_test,          secs: 1200 }
+          # e2e netns tests -- correctness, so `gate: true`
+          - { script: admin_dashboard_test,      secs: 600,  gate: true }
+          - { script: local_proxy_netns_test,    secs: 900,  gate: true }
+          - { script: secret_netns_test,         secs: 1200, gate: true }
+          - { script: vhost_netns_test,          secs: 1200, gate: true }
+          - { script: vhost_netns_test_hard,     secs: 1200, gate: true }
+          - { script: ssh_gateway_test,          secs: 1200, gate: true }
           # regression gate for the carriers=1 vhost/local --udp connection-window
           # stall (R3: a fast request must complete <3 s while slow readers pin
           # the shared QUIC connection window). Guards commit 04aac76.
-          - { script: vhost_udp_concurrency_repro, secs: 600 }
-          - { script: vpn_netns_test,            secs: 1500 }
-          - { script: vpn_netns_test_hard,       secs: 1500 }
-          # benchmarks (noisy on shared CI VMs; smoke signal only)
-          - { script: local_bench,               secs: 900 }
-          - { script: vhost_bench,                secs: 900 }
-          - { script: vpn_bench,                  secs: 900 }
-          # debug scenarios (fixed scenario, then exit)
-          - { script: vhost_debug,                secs: 300 }
-          - { script: vpn_debug,                  secs: 300 }
-          # teardown helper
-          - { script: vhost_cleanup,              secs: 120 }
+          - { script: vhost_udp_concurrency_repro, secs: 600, gate: true }
+          - { script: vpn_netns_test,            secs: 1500, gate: true }
+          - { script: vpn_netns_test_hard,       secs: 1500, gate: true }
+          # benchmarks (noisy on shared CI VMs; smoke signal only) -- never a gate
+          - { script: local_bench,               secs: 900,  gate: false }
+          - { script: vhost_bench,                secs: 900,  gate: false }
+          - { script: vpn_bench,                  secs: 900,  gate: false }
+          # debug scenarios (fixed scenario, then exit) -- never a gate
+          - { script: vhost_debug,                secs: 300,  gate: false }
+          - { script: vpn_debug,                  secs: 300,  gate: false }
+          # teardown helper -- never a gate
+          - { script: vhost_cleanup,              secs: 120,  gate: false }
     steps:
       - uses: actions/checkout@v4
 

@@ -1,0 +1,370 @@
+# Release — the ONLY path by which a `v*` tag becomes a published artifact.
+#
+# WHY THIS WORKFLOW EXISTS
+# ------------------------
+# `docker.yml`, `docker-ssh-client.yml` and `mean_bean_deploy.yml` used to carry
+# `tags: ["v*"]` on their own `push` trigger. GitHub starts every matching
+# workflow in PARALLEL and none of the three has ever depended on `ci.yml`, so a
+# tag push published `ghcr.io/manprint/bore:…` and a GitHub Release with the
+# binaries attached WHILE the test matrix was still running — and published them
+# just the same if it went red. Nothing in the repository could tell afterwards
+# which release had been tested, because nothing ever had to be.
+#
+# That is this project's signature defect in release clothing: a green-looking
+# result whose instrument was never consulted. The fix is structural, not a
+# habit — the three publishing workflows no longer answer to a tag at all, and
+# the only trigger left that does is this one, which runs the gates FIRST and
+# `needs:` them.
+#
+# It has happened: `v1.0.0` and `v1.0.1` both published `ghcr.io/manprint/bore`
+# images this way, with no gate consulted on either.
+#
+# AND THE OLD FILTER WAS WIDER THAN IT LOOKED. `tags: ["v*"]` is an fnmatch
+# glob, not a semver test, so it also matched this repository's ~50 historical
+# `vpn-<sha>`, `vhost-<sha>` and `vhost_gpt-<sha>` tags — every one of those
+# pushes started the three publishers too. The trigger below is `v[0-9]*`, which
+# a version tag matches and a branch-snapshot tag does not; the preflight then
+# rejects anything that reaches it and is still not `vMAJOR.MINOR.PATCH`.
+#
+# `workflow_dispatch` with `publish: false` is the rehearsal: gates run, nothing
+# is published. Use it whenever the release path itself has changed, because a
+# publishing bug otherwise surfaces at the least recoverable moment there is.
+#
+# WHAT "COMPLETE GATES" MEANS HERE
+# --------------------------------
+#   gate-ci     ubuntu full `cargo test --all-features` + fmt + clippy + audit;
+#               macOS and Windows transfer-path tests; the VPN cross checks for
+#               windows-msvc / apple-darwin / android; REAL device e2e on
+#               windows-latest (WinTun, routes, firewall, WinNAT) and on
+#               macos-14 (utun, PF); two Android emulator e2e suites.
+#   gate-cross  build AND test on every target `mean_bean_deploy` ships:
+#               7 Linux targets under `cross`, both windows-msvc, both Darwin.
+#   gate-e2e    the nine root netns correctness suites, BLOCKING for a release
+#               (`gate: true`); the benches stay advisory — see e2e_netns.yml.
+#
+# Everything the release publishes is therefore compiled, and almost all of it
+# executed, on the architecture it is published for.
+name: Release
+
+on:
+  push:
+    tags:
+      # `v[0-9]*`, not `v*`: the latter is a glob and this repository is full of
+      # `vpn-<sha>` / `vhost-<sha>` snapshot tags that a release must ignore.
+      - "v[0-9]*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish after the gates. Leave false for a rehearsal (gates only, nothing published)."
+        type: boolean
+        default: false
+
+# The maximum the called workflows may use; each of them narrows it further.
+permissions:
+  contents: write # create the GitHub Release and upload its assets
+  packages: write # push images to GHCR
+
+# Never cancel a release in flight: a half-published tag is worse than a slow one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── The cheap checks, first, so a mistyped tag costs seconds and not an hour
+  preflight:
+    name: Preflight (tag ↔ crate version ↔ main)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the ancestry check below needs real history
+
+      - name: The tag, the crate version and main must agree
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "Not a tag ref (${{ github.ref }}) — rehearsal mode, tag checks skipped."
+            exit 0
+          fi
+
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag: $TAG"
+
+          # 1. The tag must be a version, not a label. `mean_bean_deploy` names
+          #    the release after it and docker/metadata-action derives the image
+          #    tags from it; a non-semver tag silently produces no semver image
+          #    tag at all, which reads as "the release has no version".
+          if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'$TAG' is not vMAJOR.MINOR.PATCH[-prerelease]"
+            exit 1
+          fi
+
+          # 2. The BINARY must agree with the label on the box. `bore --version`
+          #    prints Cargo.toml's version, so a v1.1.0 tag on a crate still at
+          #    1.0.0 ships an image called v1.1.0 whose contents introduce
+          #    themselves as 1.0.0 — undiagnosable from the outside, and exactly
+          #    the class of mismatch this repository refuses elsewhere.
+          CRATE=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p}' Cargo.toml | head -n 1)
+          echo "crate version: $CRATE"
+          if [ "$TAG" != "v$CRATE" ]; then
+            echo "::error::tag '$TAG' does not match Cargo.toml version '$CRATE' (expected tag 'v$CRATE')"
+            exit 1
+          fi
+
+          # 3. Cargo.lock must already contain that version, or the release
+          #    builds would rewrite the lock file they were supposed to pin.
+          cargo metadata --locked --format-version 1 >/dev/null
+          echo "Cargo.lock is in sync with Cargo.toml"
+
+          # 4. A release comes from main. A tag on a side branch would publish
+          #    code that main does not contain, and nothing downstream could see
+          #    the difference.
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tagged commit $GITHUB_SHA is not an ancestor of origin/main"
+            exit 1
+          fi
+          echo "tagged commit is on main"
+
+          # 5. The tag must be ANNOTATED, not lightweight. A lightweight tag is
+          #    a bare ref with no tagger, date or message, so a tag that was
+          #    moved and one that was always there are indistinguishable after
+          #    the fact. An annotated tag is its own object: recreating it
+          #    produces a different object id, which is a record. This is the
+          #    in-repository half of "v1.1.0 always means this code"; the other
+          #    half is the ruleset on `refs/tags/v*` that refuses to delete or
+          #    update it at all.
+          if [ "$(git cat-file -t "refs/tags/$TAG")" != "tag" ]; then
+            echo "::error::'$TAG' is a lightweight tag; a release tag must be annotated (git tag -a)"
+            exit 1
+          fi
+          echo "tag is annotated: $(git for-each-ref --format='%(objectname)' "refs/tags/$TAG")"
+
+          {
+            echo "### Release preflight"
+            echo ""
+            echo "| check | value |"
+            echo "| --- | --- |"
+            echo "| tag | \`$TAG\` |"
+            echo "| crate version | \`$CRATE\` |"
+            echo "| commit | \`$GITHUB_SHA\` |"
+            echo ""
+            echo "Images this run will publish:"
+            echo ""
+            echo '```'
+            echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/bore:$TAG"
+            echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/bore:$CRATE"
+            echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/bore:client-$TAG"
+            echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/bore:client-$CRATE"
+            echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/bore-ssh-client:$TAG"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  # ── The gates. Reused, never copied: a duplicated gate drifts from the CI it
+  #    was copied from, and the drift is only discovered by shipping.
+  gate-ci:
+    name: Gate / CI matrix
+    needs: preflight
+    # A gate reads; only the publish jobs below are allowed to write.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  gate-cross:
+    name: Gate / cross-architecture
+    needs: preflight
+    # A gate reads; only the publish jobs below are allowed to write.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/mean_bean_ci.yml
+
+  gate-e2e:
+    name: Gate / netns e2e (blocking)
+    needs: preflight
+    permissions:
+      contents: read
+    uses: ./.github/workflows/e2e_netns.yml
+    with:
+      gate: true
+
+  # ── Publication. Nothing below starts until every gate above is green.
+  publish-images:
+    name: Publish / GHCR bore + bore:client
+    needs: [preflight, gate-ci, gate-cross, gate-e2e]
+    if: github.event_name == 'push' || inputs.publish
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+
+  publish-ssh-client:
+    name: Publish / GHCR bore-ssh-client
+    needs: [preflight, gate-ci, gate-cross, gate-e2e]
+    if: github.event_name == 'push' || inputs.publish
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-ssh-client.yml
+
+  publish-binaries:
+    name: Publish / GitHub Release binaries
+    needs: [preflight, gate-ci, gate-cross, gate-e2e]
+    if: github.event_name == 'push' || inputs.publish
+    permissions:
+      contents: write
+    # `mean_bean_deploy` prefers `secrets.RELEASE_TOKEN` when one is configured;
+    # a called workflow receives no secrets unless they are passed.
+    secrets: inherit
+    uses: ./.github/workflows/mean_bean_deploy.yml
+
+  # ── The coordinates that CANNOT be re-pointed.
+  #
+  # A registry tag is a mutable pointer and a git tag is a ref: both are fixed
+  # only by convention and by the ruleset that guards them. A DIGEST is fixed by
+  # construction — it is the hash of the manifest, so `…/bore@sha256:…` either
+  # resolves to exactly these bytes or does not resolve. This job resolves the
+  # digests this release just published and writes them into the run summary AND
+  # into the GitHub Release body, so "pin v1.1.0" has an answer that survives
+  # anything done to the tags afterwards.
+  pin:
+    name: Record immutable coordinates
+    runs-on: ubuntu-latest
+    needs: [preflight, publish-images, publish-ssh-client, publish-binaries]
+    if: github.event_name == 'push' && needs['publish-images'].result == 'success'
+    permissions:
+      contents: write # append the pinning block to the release body
+      packages: read
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve digests and publish them
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          OWNER="${GITHUB_REPOSITORY_OWNER}"
+
+          # A digest that could not be read must be REPORTED as unreadable, not
+          # printed as an empty string next to an image name -- an empty pin is
+          # worse than an absent one, because it looks like an answer.
+          digest_of() {
+            local ref="$1" d
+            if d=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2>/dev/null) &&
+              [ -n "$d" ]; then
+              printf '%s' "$d"
+            else
+              printf 'UNRESOLVED'
+            fi
+          }
+
+          BORE_D=$(digest_of "ghcr.io/$OWNER/bore:$TAG")
+          CLIENT_D=$(digest_of "ghcr.io/$OWNER/bore:client-$TAG")
+          SSH_D=$(digest_of "ghcr.io/$OWNER/bore-ssh-client:$TAG")
+
+          # A QUOTED here-document plus a substitution pass, rather than an
+          # interpolating one. The body is markdown: it is full of backticks,
+          # and in an unquoted here-document a backtick is command substitution
+          # -- the shell would try to RUN the fenced code block. Quoting makes
+          # every character literal and `sed` puts the values in afterwards.
+          # (Indentation matters too: YAML dedents this block scalar, so the
+          # terminator lands in column 0 as the shell requires.)
+          cat >/tmp/pin.tpl <<'MD'
+
+          ---
+
+          ### Pinning this release
+
+          `@TAG@` is an annotated git tag on commit `@SHA@`, and a `v*` tag in this repository
+          never moves: a ruleset refuses to update or delete one, so the tag is a fixed
+          reference to this exact code rather than a pointer that merely has not moved yet.
+
+          The images are published under both spellings of the version (`@TAG@` and the same
+          without the leading `v`). The digests below are immutable by construction -- they are
+          the hash of the manifest, so they either resolve to exactly these bytes or do not
+          resolve at all -- and are the right thing to pin in a deployment.
+
+          ```
+          ghcr.io/@OWNER@/bore:@TAG@
+          ghcr.io/@OWNER@/bore@@BORE_D@
+
+          ghcr.io/@OWNER@/bore:client-@TAG@
+          ghcr.io/@OWNER@/bore@@CLIENT_D@
+
+          ghcr.io/@OWNER@/bore-ssh-client:@TAG@
+          ghcr.io/@OWNER@/bore-ssh-client@@SSH_D@
+          ```
+
+          The binary built from this tag identifies itself as `bore <version> - @TAG@ - <sha8>`.
+          MD
+
+          sed -e "s|@TAG@|$TAG|g" \
+              -e "s|@OWNER@|$OWNER|g" \
+              -e "s|@SHA@|$GITHUB_SHA|g" \
+              -e "s|@BORE_D@|$BORE_D|g" \
+              -e "s|@CLIENT_D@|$CLIENT_D|g" \
+              -e "s|@SSH_D@|$SSH_D|g" \
+              /tmp/pin.tpl >/tmp/pin-block.md
+
+          cat /tmp/pin-block.md >>"$GITHUB_STEP_SUMMARY"
+
+          # Append rather than replace: the release body already lists the assets.
+          gh release view "$TAG" --json body --jq .body >/tmp/body.md
+          cat /tmp/pin-block.md >>/tmp/body.md
+          gh release edit "$TAG" --notes-file /tmp/body.md
+          echo "release body updated with the pinning block"
+
+  # ── One place that states what happened, including when it did not happen.
+  #    A release that published nothing must SAY so: "no images appeared" and
+  #    "the run was skipped" look identical from a registry.
+  outcome:
+    name: Outcome
+    runs-on: ubuntu-latest
+    needs: [preflight, gate-ci, gate-cross, gate-e2e, publish-images, publish-ssh-client, publish-binaries, pin]
+    if: always()
+    steps:
+      - name: Report
+        run: |
+          set -u
+          {
+            echo "### Release outcome — \`${GITHUB_REF_NAME}\`"
+            echo ""
+            echo "| stage | result |"
+            echo "| --- | --- |"
+            echo "| preflight | ${{ needs.preflight.result }} |"
+            echo "| gate: CI matrix | ${{ needs['gate-ci'].result }} |"
+            echo "| gate: cross-architecture | ${{ needs['gate-cross'].result }} |"
+            echo "| gate: netns e2e | ${{ needs['gate-e2e'].result }} |"
+            echo "| publish: images | ${{ needs['publish-images'].result }} |"
+            echo "| publish: ssh client | ${{ needs['publish-ssh-client'].result }} |"
+            echo "| publish: binaries | ${{ needs['publish-binaries'].result }} |"
+            echo "| pin: digests recorded | ${{ needs.pin.result }} |"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      # A skipped publish is the NORMAL outcome of a rehearsal and a FAILURE of
+      # a tag push. Distinguishing them here means the run's own conclusion
+      # carries the answer, instead of a human comparing the registry with the
+      # log.
+      - name: A tag push that published nothing is a failed release
+        if: github.event_name == 'push'
+        run: |
+          set -u
+          fail=0
+          for r in "${{ needs['publish-images'].result }}" \
+                   "${{ needs['publish-ssh-client'].result }}" \
+                   "${{ needs['publish-binaries'].result }}"; do
+            [ "$r" = "success" ] || fail=1
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::the tag was pushed but at least one publication did not succeed"
+            exit 1
+          fi
+          echo "every publication succeeded"

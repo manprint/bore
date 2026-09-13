@@ -35,6 +35,7 @@ frills attached.
 ## Table of contents
 
 - [Installation](#installation)
+  - [Releases and how a release is gated](#releases-and-how-a-release-is-gated)
 - [Command overview](#command-overview)
 - [Detailed usage (`bore local` / `bore proxy`)](#detailed-usage)
   - [Local forwarding](#local-forwarding)
@@ -72,15 +73,27 @@ fork's VPN, vhost, secure-transfer, or SSH-gateway features. To get everything d
 this file, install from **this repository** instead, via one of:
 
 **GitHub Releases (recommended, no build toolchain needed).** This fork publishes a release
-for **every push** (any branch): named `<branch>-<sha7>` (branch builds are pre-release;
-`vX.Y.Z` tags are full releases), with binaries for macOS (x86_64/arm64), Linux (x86_64,
-aarch64, arm, armv7, i686), Windows (x86_64/i686), and Android (aarch64) — all built with
-`--all-features` (VPN + SSH gateway + UDP direct path). Download from the
+for **every push** (any branch), named `<branch>-<sha7>`, plus one per `vX.Y.Z` tag — with
+binaries for macOS (x86_64/arm64), Linux (x86_64, aarch64, arm, armv7, i686), Windows
+(x86_64/i686), and Android (aarch64), all built with `--all-features` (VPN + SSH gateway +
+UDP direct path). Download from the
 [releases page](https://github.com/manprint/bore/releases), unzip, and move the `bore`
 executable onto your `PATH`.
 
+**Which of those is a fixed point, and which is not.** `/releases/latest/` follows the most
+recent build of ANY kind, branch builds included, so it moves under you — it is the right URL
+for "give me the newest thing" and the wrong one for anything you want to still mean the same
+in six months. A **`vX.Y.Z` tag is the fixed point**: the git tag is annotated and protected
+against being moved or deleted, the binary it produces says so about itself
+(`bore 1.1.0 - v1.1.0 - <sha8>` — the middle field is the tag, not a branch), and the release
+run records the image **digests** so a deployment can pin something that cannot be re-pointed
+at all. Reference a release as `/releases/tag/vX.Y.Z` or
+`/releases/download/vX.Y.Z/<asset>`, never through `latest`.
+
 **Docker.** Multi-arch images (`linux/amd64` + `linux/arm64`) are pushed to the GitHub
-Packages registry on **every** push, tagged by branch, commit and semver:
+Packages registry on **every branch push**, tagged by branch and commit. A **`vX.Y.Z` tag**
+takes a different route and publishes only after the full test matrix is green — see
+[Releases and how a release is gated](#releases-and-how-a-release-is-gated):
 
 ```shell
 docker run -it --init --rm --network host ghcr.io/manprint/bore <ARGS>
@@ -88,8 +101,12 @@ docker run -it --init --rm --network host ghcr.io/manprint/bore <ARGS>
 
 | Tag | Runs as | Use for |
 |---|---|---|
-| `latest`, `<version>`, `<major>.<minor>`, `<branch>`, `sha-<sha7>` | uid **1000** (non-root) | server side, and any client that does not need the direct UDP path |
-| **`client`**, `client-<version>`, `client-<branch>`, `client-sha-<sha7>` | **root** | client side with `--udp` / `--privileged` (see below) |
+| `latest`, `v<version>`, `<version>`, `v<major>.<minor>`, `<major>.<minor>`, `<branch>`, `sha-<sha7>` | uid **1000** (non-root) | server side, and any client that does not need the direct UDP path |
+| **`client`**, `client-v<version>`, `client-<version>`, `client-v<major>.<minor>`, `client-<major>.<minor>`, `client-<branch>`, `client-sha-<sha7>` | **root** | client side with `--udp` / `--privileged` (see below) |
+
+A release is published under **both** spellings of its version — `:v1.1.0` and `:1.1.0`,
+`:client-v1.1.0` and `:client-1.1.0` — which are two names for one manifest, not two images.
+Pin whichever you prefer; neither will be withdrawn in favour of the other.
 
 The `:client` tag carries the **same binary** as the default image (it is re-tagged from the
 same pipeline run, never rebuilt) and is moved on every pipeline run, so it always tracks the
@@ -185,6 +202,64 @@ just windows-amd64     # Windows x86_64
 just build             # all of the above
 just push              # build + push a multi-arch (amd64+arm64) image to Docker Hub
 ```
+
+### Releases and how a release is gated
+
+A **branch push** publishes immediately: a rolling `<branch>-<sha7>` GitHub pre-release and
+mutable `<branch>` / `sha-<sha7>` images. That is deliberate — those artifacts are disposable
+and the convenience is the point.
+
+A **`vX.Y.Z` tag** does not. `.github/workflows/release.yml` is the only workflow that answers
+to a tag, and it runs the gates FIRST:
+
+| Gate | What it covers |
+|---|---|
+| CI matrix | `cargo fmt` / `clippy -D warnings` / `cargo test --all-features` on Linux; transfer-path tests on macOS and Windows; VPN cross-checks for windows-msvc, apple-darwin and both Android ABIs; **real device e2e** on `windows-latest` (WinTun adapter, routes, firewall, WinNAT, stale-reclaim) and on `macos-14` (utun, PF); two Android emulator e2e suites; `cargo audit`; `actionlint` over the workflows themselves |
+| Cross-architecture | build **and test** on every target the release ships: 7 Linux targets under `cross` (x86_64/aarch64/armv7/arm/i686, musl + gnueabi), `i686`/`x86_64-pc-windows-msvc`, `aarch64-apple-darwin`; `x86_64-apple-darwin` is cross-built here (the hosted macOS runner is arm64) |
+| netns e2e | the nine root network-namespace correctness suites — admin dashboard, local/proxy, secret, vhost (+ hard), SSH gateway, the `--udp` connection-window regression, VPN (+ hard) — **blocking** for a release, unlike on a branch push |
+
+Only then do the three publishing workflows run, as called workflows: the GHCR images, the
+`bore-ssh-client` image, and the GitHub Release with every target binary attached.
+
+Before any of that, a preflight refuses the release unless the tag is `vMAJOR.MINOR.PATCH`,
+**`Cargo.toml`'s version equals the tag without the `v`**, `Cargo.lock` is already in sync,
+and the tagged commit is an ancestor of `main`. The version check is the one that matters in
+practice: `bore --version` prints `Cargo.toml`'s version, so a `v1.1.0` tag on a crate still
+at `1.0.0` would ship an image named `v1.1.0` whose contents introduce themselves as `1.0.0`
+— a mismatch invisible from outside the container.
+
+To cut a release:
+
+```shell
+# 1. bump the crate version and let Cargo.lock follow
+#    (edit Cargo.toml's [package] version, then)
+cargo metadata --format-version 1 >/dev/null
+
+# 2. commit on main and let CI go green
+# 3. tag the exact commit CI validated, and push the tag
+git tag -a v1.1.0 -m "bore v1.1.0"
+git push origin v1.1.0
+```
+
+Run `Release` from the Actions tab with **`publish: false`** to rehearse: the gates run and
+nothing is published. Worth doing whenever the release path itself changed, because a
+publishing bug otherwise surfaces at the least recoverable moment there is.
+
+**Tags never move.** A repository ruleset (`Tags are immutable`, target `tag`, applied to
+every tag) refuses `deletion`, `update` and `non_fast_forward` on the server side, so a tag
+in this repository is a fixed reference to one commit — not a pointer that merely has not been
+moved yet. Verified against the live server, not assumed: a delete and a force-move both come
+back `push declined due to repository rule violations`. A release therefore has three
+independent fixed coordinates: the tag, the commit it names, and the image **digests** the
+release run records in the release notes. The digest is the strongest of the three, because a
+registry tag is still a pointer and a digest is the content's own hash.
+
+The rule is deliberately wide. It also covers the repository's historical `vpn-<sha>`,
+`vhost-<sha>` and `windows-<sha>` snapshot tags, which means tidying those up now needs the
+ruleset disabled for the duration — a deliberate trade, made because "a tag is a fixed point"
+is easier to rely on when it has no exceptions. Note the related trap the release trigger had
+to dodge: `tags: ["v*"]` is a glob, not a semver test, so it matched every one of those
+snapshot tags too; `release.yml` triggers on `v[0-9]*`.
 
 ### Upstream-only channels (plain tunnel, no VPN/vhost/transfer/SSH-gateway)
 

@@ -5,34 +5,42 @@ on:
     branches:
       - "**" # every branch: cross-compile checks on any push
   pull_request:
+  # Callable: this is the cross-architecture half of the release gate.
+  workflow_call:
 
 jobs:
+  # BOTH Darwin targets, because `mean_bean_deploy.yml` SHIPS both and a target
+  # that is only ever built at release time fails after the gates have already
+  # passed -- the one moment a failure costs the most. The hosted macOS runner
+  # is arm64, so `aarch64-apple-darwin` is native and runs the test suite;
+  # `x86_64-apple-darwin` is a cross-build from it and is BUILT, not run. Do not
+  # "fix" that by running the x86_64 tests under Rosetta: Rosetta 2 is not a
+  # documented guarantee of the hosted arm64 image, so a green leg would be
+  # attesting to the runner image rather than to the code.
   macos:
     runs-on: macos-latest
     strategy:
       fail-fast: true
       matrix:
-        channel: [stable]
-        target:
-          - aarch64-apple-darwin
+        include:
+          - { channel: stable, target: aarch64-apple-darwin, native: true }
+          - { channel: stable, target: x86_64-apple-darwin, native: false }
 
     steps:
       - name: Setup | Checkout
         uses: actions/checkout@v4
       - name: Setup | Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          override: true
-          profile: minimal
-          target: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
       - run: ci/set_rust_version.bash ${{ matrix.channel }} ${{ matrix.target }}
-      - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --target ${{ matrix.target }}
-          use-cross: false
+      - name: Test (native target)
+        if: matrix.native
+        run: cargo test --target ${{ matrix.target }}
+      - name: Build (cross target -- compiled here, exercised by the release binary)
+        if: '!matrix.native'
+        run: cargo build --target ${{ matrix.target }}
 
   linux:
     runs-on: ubuntu-latest

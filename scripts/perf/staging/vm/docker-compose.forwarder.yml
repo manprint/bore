@@ -29,6 +29,16 @@ services:
   # big file at a time, use `--carriers 1` instead: 59.10 MB/s down / 93.67 up
   # against 52.55 / 72.17 at 8, because eight carriers split one flow's
   # congestion window eight ways. If the mix is unknown, `--carriers 0` adapts.
+  #
+  # THE LINE THESE NUMBERS WERE CALIBRATED AGAINST (V-9 / V-19): a domestic
+  # consumer over WiFi, September 2026. Absolute MB/s belong to the access link,
+  # not to bore -- read them as ratios and re-derive them on another line. The
+  # cabled re-run of 2026-09-13 left every recommendation here standing, and
+  # strengthened the first one: on the direct path bore spends +27.1 % packets
+  # per delivered byte (measured with segmentation off on both protocols, so it
+  # is not an artefact of offload), of which only 5.9 points are extra bytes --
+  # the rest is the same bytes cut finer. The instance meters PACKETS, which is
+  # what turns that into 172x the pps-allowance events at identical payload.
   # ---------------------------------------------------------------------------
   bore-vhost:
     image: ghcr.io/manprint/bore:client

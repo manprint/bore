@@ -135,6 +135,20 @@ services:
       #        that is by design, not a bug.
       # On a clean idle path carriers still COST a little (median c4/c1 = 0.88), which
       # is why 1 remains the default.
+      #
+      # THE LINE THESE NUMBERS WERE CALIBRATED AGAINST (V-9 / V-19). Every MB/s
+      # above was measured from a domestic consumer over WiFi in September 2026.
+      # An absolute rate is a property of the ACCESS LINK, not of bore, so read
+      # them as ratios: a faster line moves all of them at once, and a byte
+      # count calibrated against one line silently becomes a different
+      # experiment on another. The CABLED re-run of 2026-09-13
+      # (docs/performance/ETH_RERUN_EVIDENCE_2026-09-12.md) changed none of the
+      # recommendations above, and section 51.1 adds WHY carriers do not help a
+      # single flow: on the relay they SPREAD it. Twelve repetitions per cell,
+      # bare control sampled inside each one -- the c1 excursion is 3.4x and the
+      # c4 excursion 2.0x, same floor, much lower ceiling. Carriers do not buy
+      # bandwidth; they flatten it. Re-derive the absolutes before quoting any
+      # of them on a different link.
       # - BORE_CARRIERS=4
       # Per-direction copy buffer for this provider's local-service splice. Default
       # 256KiB; KB/MB/GB/KiB/MiB/GiB suffix, clamped [4KiB,16MiB]. Match the server's

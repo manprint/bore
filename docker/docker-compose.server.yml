@@ -81,10 +81,27 @@ services:
     networks:
       - bore
 
-    # Raise this when BORE_MAX_CONNS / BORE_MAX_CARRIERS are increased. Each
-    # relayed connection and carrier consumes file descriptors; too low a limit
-    # causes accept/connect failures under load. The host/Docker daemon must also
-    # allow the requested value.
+    # FILE DESCRIPTORS vs BORE_MAX_CONNS (P-12). The --max-conns semaphore
+    # promises a GRACEFUL bound: at capacity one connection is dropped,
+    # `conn_rejections` increments, every other connection keeps serving. That
+    # promise needs one descriptor per admitted connection. Above the descriptor
+    # limit the kernel refuses FIRST with EMFILE, and EMFILE lands on accept()
+    # for EVERY listener the process owns -- so one tunnel's concurrency takes
+    # down the admin API, the vhost frontends and every other tunnel. MEASURED
+    # 2026-09-11 (docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md
+    # section 11): BORE_MAX_CONNS=1024 against a soft RLIMIT_NOFILE of 1024, at
+    # ~976 held connections through ONE tunnel, logged `No file descriptors
+    # available (os error 24)` every 100 ms and answered nothing on its control
+    # port for ~30 s -- while `conn_rejections` stayed 0, because the configured
+    # bound was unreachable by construction.
+    #
+    # The server now RECONCILES this at startup, before it binds its first
+    # listener: it raises its own SOFT limit to BORE_MAX_CONNS + 256 whenever
+    # the HARD limit allows, and warns with both remedies when the hard limit is
+    # itself short. A limit already sufficient is left alone and stays silent.
+    # So this block is needed only when the container's HARD limit is below
+    # BORE_MAX_CONNS + 256, which the default Docker daemon does not do.
+    # Uncomment it if that startup warning ever appears.
     # ulimits:
     #   nofile:
     #     soft: 1048576
@@ -158,6 +175,47 @@ services:
       # parameter has no effect larger than the drift of the path. Leave it
       # UNSET unless you have measured your own path; do NOT set it small.
       # - BORE_PROXY_BUFFER_SIZE=1MiB
+      #
+      # ------------------------------------------------------------------
+      # HOST PREREQUISITE for BORE_UDP -- the UDP socket buffer (P-13).
+      # ------------------------------------------------------------------
+      # bore asks every QUIC endpoint's socket for 16MiB inside the endpoint
+      # constructor, and the kernel SILENTLY CLAMPS that request to
+      # net.core.rmem_max / net.core.wmem_max. Stock Ubuntu/AWS ship 212992
+      # bytes, so the server's SHARED endpoint -- the one serving the direct
+      # path of every vhost, public and ssh-jump tunnel in this process -- ran
+      # on 208KiB, which at 111 MB/s holds 1.9 ms of traffic. MEASURED
+      # 2026-09-11 (docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md
+      # section 13.1): the direct arm took IN 3.885 GiB to DELIVER 2.279
+      # (1.78x -- retransmission, not per-packet overhead) while the relay
+      # arm's inbound and outbound agreed to 0.2 %. It cost half the goodput
+      # (111 vs 213 MB/s), double the CPU per delivered GiB and 2.9x softirq.
+      #
+      # A CONTAINER CANNOT SET THIS ITSELF. net.core.* is global, not
+      # per-network-namespace, so a `sysctls:` entry here does not work -- the
+      # daemon refuses the container outright. VERIFIED 2026-09-13, Docker
+      # 29.8.0:
+      #
+      #   docker run --sysctl net.core.rmem_max=16777216 alpine:3 true
+      #   -> Error response from daemon: ... open sysctl net.core.rmem_max
+      #      file: reopen fd 8: permission denied
+      #
+      # Set it on the HOST instead:
+      #
+      #   sudo sysctl -w net.core.rmem_max=16777216
+      #   sudo sysctl -w net.core.wmem_max=16777216
+      #   # persist across reboots:
+      #   printf 'net.core.rmem_max=16777216\nnet.core.wmem_max=16777216\n' \
+      #     | sudo tee /etc/sysctl.d/99-bore-udp.conf
+      #
+      # The other half of the remedy is CAP_NET_ADMIN, which lets bore call
+      # SO_*BUFFORCE and bypass the clamp -- but Docker clears every capability
+      # for a non-root UID even under `privileged`, so that path needs the ROOT
+      # image. The sysctl is the simpler half and is sufficient on its own.
+      #
+      # VERIFY FROM THE KERNEL, never from the log: `ss -uapm` on the server
+      # and read the rb/tb fields of bore's UDP socket. bore additionally warns
+      # on any socket whose 16MiB request survived clamped.
       #
       # Direct-UDP tuning defaults. These are EXACTLY the built-in values
       # (src/shared.rs DIRECT_QUIC_*), repeated here for visibility. Leaving them

@@ -267,6 +267,14 @@ jobs:
       - name: Resolve digests and publish them
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job deliberately does NOT check the repository out -- it needs
+          # a registry and an API, not a working tree -- and `gh` derives the
+          # repository from `git remote` when it is not told one. MEASURED on
+          # the v1.1.0 release run (34780391954): `gh release view` died with
+          # `failed to run git: fatal: not a git repository`, after every image
+          # had already been published, so the release body kept its assets and
+          # lost its digests. `GH_REPO` is the answer `gh` was looking for.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"

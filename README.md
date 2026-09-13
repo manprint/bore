@@ -223,10 +223,14 @@ Only then do the three publishing workflows run, as called workflows: the GHCR i
 
 Before any of that, a preflight refuses the release unless the tag is `vMAJOR.MINOR.PATCH`,
 **`Cargo.toml`'s version equals the tag without the `v`**, `Cargo.lock` is already in sync,
-and the tagged commit is an ancestor of `main`. The version check is the one that matters in
-practice: `bore --version` prints `Cargo.toml`'s version, so a `v1.1.0` tag on a crate still
-at `1.0.0` would ship an image named `v1.1.0` whose contents introduce themselves as `1.0.0`
-— a mismatch invisible from outside the container.
+the tagged commit is an ancestor of `main`, and the tag is **annotated** (`git tag -a`). The
+version check is the one that matters in practice: `bore --version` prints `Cargo.toml`'s
+version, so a `v1.1.0` tag on a crate still at `1.0.0` would ship an image named `v1.1.0`
+whose contents introduce themselves as `1.0.0` — a mismatch invisible from outside the
+container. The annotated check asks the **GitHub API**, not the checkout: `actions/checkout`
+fetches a tag push as `+<commit sha>:refs/tags/<tag>`, so the runner's local ref is a
+lightweight ref to the commit however the real tag was made, and `git cat-file -t` on it
+answers `commit` for a perfectly annotated tag.
 
 To cut a release:
 
@@ -243,7 +247,9 @@ git push origin v1.1.0
 
 Run `Release` from the Actions tab with **`publish: false`** to rehearse: the gates run and
 nothing is published. Worth doing whenever the release path itself changed, because a
-publishing bug otherwise surfaces at the least recoverable moment there is.
+publishing bug otherwise surfaces at the least recoverable moment there is. Know its one
+limit: a rehearsal runs on a branch, so `github.ref_type` is not `tag` and the five preflight
+tag checks report "rehearsal mode" and are skipped. They are exercised only by a real tag.
 
 **Tags never move.** A repository ruleset (`Tags are immutable`, target `tag`, applied to
 every tag) refuses `deletion`, `update` and `non_fast_forward` on the server side, so a tag

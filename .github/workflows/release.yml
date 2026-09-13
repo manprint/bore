@@ -82,6 +82,8 @@ jobs:
           fetch-depth: 0 # the ancestry check below needs real history
 
       - name: The tag, the crate version and main must agree
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -122,8 +124,14 @@ jobs:
           # 4. A release comes from main. A tag on a side branch would publish
           #    code that main does not contain, and nothing downstream could see
           #    the difference.
+          #    Against FETCH_HEAD and not `origin/main`: on a tag push
+          #    `actions/checkout` fetches ONE refspec and configures no
+          #    remote-tracking branch of its own, so whether `origin/main`
+          #    exists depends on an opportunistic update this check does not
+          #    need to depend on. FETCH_HEAD is what the fetch on the line above
+          #    just wrote, unconditionally.
           git fetch --quiet origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
             echo "::error::tagged commit $GITHUB_SHA is not an ancestor of origin/main"
             exit 1
           fi
@@ -137,11 +145,22 @@ jobs:
           #    in-repository half of "v1.1.0 always means this code"; the other
           #    half is the ruleset on `refs/tags/v*` that refuses to delete or
           #    update it at all.
-          if [ "$(git cat-file -t "refs/tags/$TAG")" != "tag" ]; then
-            echo "::error::'$TAG' is a lightweight tag; a release tag must be annotated (git tag -a)"
+          #
+          #    ASKED OF THE SERVER, NEVER OF THE CHECKOUT. `actions/checkout`
+          #    fetches a tag push as `+<commit sha>:refs/tags/<tag>` -- MEASURED
+          #    in run 34770980504:
+          #      git fetch --no-tags ... +480236ee...:refs/tags/v0.0.0-rulecheck
+          #    so the LOCAL ref is a lightweight ref to the COMMIT however the
+          #    real tag was made, and `git cat-file -t refs/tags/$TAG` answers
+          #    `commit` for a perfectly annotated tag. This check read that
+          #    answer and would have failed every correct release -- on a tag
+          #    that, by design, cannot then be deleted or moved.
+          OBJ_TYPE=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.type')
+          if [ "$OBJ_TYPE" != "tag" ]; then
+            echo "::error::'$TAG' is a lightweight tag (ref object type '$OBJ_TYPE'); a release tag must be annotated (git tag -a)"
             exit 1
           fi
-          echo "tag is annotated: $(git for-each-ref --format='%(objectname)' "refs/tags/$TAG")"
+          echo "tag is annotated: $(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')"
 
           {
             echo "### Release preflight"

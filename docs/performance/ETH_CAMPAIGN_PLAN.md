@@ -205,12 +205,14 @@ domanda che una fase esistente non poteva chiudere):
 | `udp_pool_life` | il pool inattivo muore o non è mai salito | **scritta, NON eseguita** — dichiarata, non sparita: §48 risponde già alla sua domanda (il pool non muore di inattività, lo sfratta il monitor del tunnel precedente) e `udp_pool_recycle` ha misurato il braccio FRESH che tiene il carrier per tutti i 45 s, due volte su due. I suoi 40 minuti sono stati spesi a **verificare la correzione** invece che a riosservare il difetto. Resta nell'albero, pronta |
 | `vpn_carriers` in profondità | i carrier del relay recuperano a 4 e 8 flussi? | 1655 s / 2055 s |
 | `jump_stab` ripetuto | la stabilità del jump host è riproducibile | 340/342/343 s |
+| `udp_pool_recycle_fix` | la correzione P-14 tiene sul percorso reale, contro un server vero? | dopo i cancelli, **zero byte** |
 
-Queste dodici non sono «extra». Nove nascono da una domanda che una fase
-esistente **non poteva** chiudere; due (`udp_pool_recycle`, `udp_pool_life`)
-nascono da un difetto di prodotto colto a metà di un'altra fase; e una
-(`ws_tunnel`) esisteva già ma non aveva mai girato, perché moriva sulla prima
-riga per una variabile mai assegnata. È il motivo per cui il vincolo della
-finestra non è stata la misura ma la **scrittura**: il piano preventivava
-~14 h di misure e ne sono bastate 5 h 49 per le 36 fasi previste, mentre queste
-dodici e i documenti che ne sono usciti hanno riempito tutto il resto.
+Queste tredici non sono «extra». Nove nascono da una domanda che una fase
+esistente **non poteva** chiudere; tre (`udp_pool_recycle`, `udp_pool_life`,
+`udp_pool_recycle_fix`) nascono da un difetto di prodotto colto a metà di
+un'altra fase; e una (`ws_tunnel`) esisteva già ma non aveva mai girato, perché
+moriva sulla prima riga per una variabile mai assegnata. È il motivo per cui il
+vincolo della finestra non è stata la misura ma la **scrittura**: il piano
+preventivava ~14 h di misure e ne sono bastate 5 h 49 per le 36 fasi previste,
+mentre queste tredici e i documenti che ne sono usciti hanno riempito tutto il
+resto.

@@ -224,6 +224,46 @@ non il prodotto. Dettagli e tabelle: §38 delle evidenze.
    prova, e questa finestra non inventa correzioni per difetti non misurati.
    §48.
 
+6. **W-1: un server vecchio cancella una capability che si limita a far
+   passare, e i due peer si accusano a vicenda.** Trovato di rimbalzo dalla
+   sonda MTU di §54, e non cercandolo: due peer con lo **stesso binario, il più
+   recente**, hanno stampato ciascuno che l'altro «predates the authenticated
+   check round» e sono andati **entrambi** sul punch cieco legacy.
+
+   **Meccanismo.** Il riassunto del peer non viaggia da peer a peer.
+   `ClientMessage::TestUdpJoin` lo porta **al server**, che lo tiene come struct
+   **tipata** (`PendingPeer.summary: UdpTestPeerSummary`,
+   `src/udp_diagnostic.rs:60`) e lo riserializza dentro
+   `ServerMessage::TestUdpStart { peer_summary }` per l'altro peer. Un server la
+   cui definizione non ha un campo **non può inoltrarlo**: i due peer leggono il
+   `#[serde(default)]`, cioè `false`. Verificato, non dedotto: `pub checks: bool`
+   sta in `src/shared.rs:503` e **non esiste** alla revisione che staging esegue
+   (`main - ed50a40f`, controllata con `git show`).
+
+   **La regola che generalizza.** Un campo additivo con `#[serde(default)]` è
+   sicuro su un filo **punto-a-punto** — è la premessa di DEC-VE2 e di ogni
+   campo additivo di questo progetto — e **non** lo è attraverso una parte che
+   **riscrive** il messaggio: lì «additivo» significa «cancellato dal
+   middlebox», e il default che protegge la compatibilità è il valore che
+   **spegne** la funzione. Il server è l'unica parte che non si può presumere
+   aggiornata, ed è l'argomento di P-9. In `CLAUDE.md` come **W-1**.
+
+   **Cosa è stato corretto e cosa no.** Corretto: i due messaggi del diagnostico,
+   che attribuivano al peer una causa che può essere del server, e che ora
+   nominano **entrambe** le cause e rimandano alla riga `Traversal round`
+   adiacente — la quale porta già una lettura indipendente sull'anzianità del
+   server. Non corretto di proposito: spostare la capability su un canale che il
+   server non riscrive è una **modifica di protocollo**, e questa finestra
+   misura prima di cambiare. Il gate di V-2 resta giusto nell'intento — legge la
+   capability del peer e non la propria versione; è il **canale** a essere
+   fragile.
+
+   **Costo reale.** Il fallback ha funzionato: i due peer sono andati diretti lo
+   stesso (`direct_ready_ms=298`, zero perdite). Il difetto costa il percorso
+   veloce e la diagnosi corretta, non il tunnel — ed è per questo che è
+   sopravvissuto fino a quando uno strumento non ha stampato nella stessa
+   esecuzione la vista di **entrambi** i lati l'uno sull'altro.
+
 ---
 
 ## 4. Difetti trovati — harness
@@ -742,7 +782,7 @@ Dettaglio in §25–26 delle evidenze. In breve:
 | approfondimento VPN | `scripts/perf/staging/rerun_vpn_deep.sh` |
 | jump host | `scripts/perf/staging/rerun_jump.sh` — tre fasi: `jump_lat` (latenza), `jump_hol` (isolamento fra canali), `jump_stab` (stabilità e fallback). La mappa **domanda del piano → fase** è in testa al driver, così una domanda scoperta si vede |
 | finestra di build | `scripts/perf/staging/p5_build_gate.sh` |
-| domande aperte | `scripts/perf/staging/rerun_open.sh` — il driver nato **dentro** la finestra, per le fasi che nessuna domanda del piano prevedeva: `ws_conns_var`, `udp_pktsize`, `ws_first_conn` con il ritardo come asse, `vpn_carriers` in profondità, `jump_stab` ripetuto |
+| domande aperte | `scripts/perf/staging/rerun_open.sh` — il driver nato **dentro** la finestra, per le fasi che nessuna domanda del piano prevedeva: `ws_conns_var`, `udp_pktsize`, `ws_first_conn` con il ritardo come asse, `vpn_carriers` in profondità, `jump_stab` ripetuto. Fuori driver e da lanciare a mano, perché verificano una correzione invece di misurare una domanda: `pub/udp_pool_recycle_fix.sh` (P-14 sul percorso reale, §53) e la sonda MTU accoppiata `bore test-udp --tcp-secret-id` fra workstation e VM di test (§54) |
 | costo AWS | `aws_cost.sh` (finestra) e `cost_watch.sh` (per fase) |
 | scansione segreti | `secret_scan.sh` — i pattern arrivano da `~/.config/bore-perf/env.sh`, **mai** dal repository |
 | lint dell'harness | `lint.sh` — **nove compilatori**: `bash -n`, shellcheck mirato, `unbound_scan.sh` (variabili lette e mai assegnate), `shadow_scan.sh` (array che oscura uno scalare di libreria), `order_scan.sh` (chiamata di livello superiore prima della definizione), e il cancello V-11 che rifiuta un `sort -n` senza `LC_ALL=C`, il controllo che l'elenco delle trappole numeri sé stesso onestamente (ogni numero scritto uguale alla posizione che markdown renderà), il rifiuto di un `grep -c`/`pgrep -c` con coda `|| echo N` (che su conto zero emette due righe), e il rifiuto di una sezione del documento di evidenze il cui numero **torna indietro** (un documento append-only mette una risposta tardiva nel posto sbagliato). Oggi: **152 file puliti, 54 trappole coerenti** |

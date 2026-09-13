@@ -590,12 +590,25 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        // The peer signals that it has ACCEPTED and READ the substream BEFORE
+        // the client drops anything. Without this handshake the test races its
+        // own subject: the client's liveness count reaches zero the instant it
+        // drops, the driver returns `Step::Done` and closes, and whether the
+        // peer surfaced the inbound substream first is pure scheduling.
+        // MEASURED: three failures on Apple targets (`aarch64-apple-darwin`
+        // twice, `macos-14` once) on commits touching ZERO Rust, every one of
+        // them `acceptor.accept()` answering `None` at the `expect` below,
+        // while every Linux run passed. The close is the BEHAVIOUR UNDER TEST,
+        // so the fix orders the observation -- it must never delay the close,
+        // which would be the one change that makes the test stop testing.
+        let (read_tx, read_rx) = oneshot::channel();
         let peer = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
             let (_o, mut acceptor) = server(sock);
             let mut s = acceptor.accept().await.expect("inbound substream");
             let mut buf = [0u8; 4];
             s.read_exact(&mut buf).await.unwrap();
+            let _ = read_tx.send(());
             // Still open here: the client holds the substream.
             drop(s);
             acceptor.accept().await.is_none()
@@ -605,6 +618,9 @@ mod tests {
         let mut stream = opener.open().await.unwrap();
         stream.write_all(b"ping").await.unwrap();
         stream.flush().await.unwrap();
+        read_rx
+            .await
+            .expect("the peer never accepted and read the substream");
         drop(opener);
         drop(acceptor);
         drop(stream);

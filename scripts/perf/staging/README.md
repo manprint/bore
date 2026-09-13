@@ -1283,6 +1283,19 @@ do not "simplify" them back out.
     effort (`|| true`, explicit `exit 0`), and the premise check downstream is
     the real guard because it is explicit about what it requires.
 
+54. **AN APPEND-ONLY DOCUMENT PUTS A LATE ANSWER IN THE WRONG PLACE, AND THE
+    HEADING KEEPS THE OLD NUMBER.** The evidence document is written by
+    appending, so a section written later to answer an EARLIER question lands
+    after everything written in between: the headings ran 49, 50, 51, **47.8**,
+    52, and a reader following the numbers is simply lost. Worse, the superseded
+    section's own HEADING still announced its retracted figure ("the direct path
+    spends 11-19% more packets") while the section that replaced it read 27.1% —
+    a heading that cannot fail, trap 47's family, in the one place a skimming
+    reader trusts most. Move the block so physical order equals logical order,
+    and make the superseded heading say it is superseded. Now refused by the
+    ninth compiler in `lint.sh`, which fails when a top-level section number
+    decreases; red-checked.
+
 ## 6. Where the results live
 
 | document | what it is |

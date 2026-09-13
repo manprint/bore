@@ -3929,7 +3929,7 @@ il prodotto sceglie. È l'unica cosa emersa da questa fase che possa implicare
 una modifica al codice, e per questo `udp_pktsize` gira **subito dopo** e non
 alla fine.
 
-## 47. `udp_pktsize` — il percorso diretto spende **l'11–19 % di pacchetti in più** per lo stesso payload; ma il criterio che la fase si era data **non è decidibile** con i contatori che ha usato
+## 47. `udp_pktsize` — il criterio che la fase si era data **non è decidibile** con i contatori che ha usato (il «11–19 %» di questo titolo è **superato da §47.8**, che rifà la misura col mittente staffato e legge **27,1 %**)
 
 §46.7 aveva chiuso con una frase impegnativa: la dimensione del pacchetto, su un
 percorso QUIC, è una cosa che **il prodotto sceglie**, quindi è l'unica cosa
@@ -4125,6 +4125,109 @@ la regola esiste. Finché quel numero non c'è, la posizione di
 questo documento è che **non si tocca il codice**: cambiare la dimensione del
 datagramma sulla base della colonna `in B/pkt` significherebbe intervenire su una
 misura che §47.4 ha appena dimostrato non essere quella grandezza.
+
+## 47.8 La riesecuzione con il MITTENTE staffato: quanti pacchetti costa davvero il percorso diretto
+
+§47.4 aveva dovuto ritirare la propria conclusione: la colonna `in` del server
+somma il payload che arriva dalla VM e il flusso di ACK che arriva dalla
+workstation sulla stessa interfaccia, e la separazione è **sottodeterminata**
+(ritrasmissioni su entrambe le tratte e rapporto GRO del ricevente, nessuno dei
+due misurato). Sei celle su sei non chiudevano contro il minimo di frame. La
+correzione di §47.7 era staffare il **mittente**, cioè contare i pacchetti dove
+vengono generati, e verificare prima che il contatore del mittente sia una
+misura e non un pavimento.
+
+**La premessa è stata verificata per prima, e regge.** La tabella degli offload
+stampata dalla fase dice, sulla NIC della VM che è il mittente di entrambi i
+bracci: `tcp-segmentation-offload=off` **e** `tx-udp-segmentation=off`. Con la
+segmentazione hardware spenta il driver vede i pacchetti veri, non i
+super-pacchetti, per **entrambi** i protocolli — che è esattamente la
+condizione senza la quale i due bracci potrebbero essere distorti in direzioni
+opposte e fabbricare la differenza che la fase cerca.
+
+Tre ripetizioni, 460 MiB per braccio su 4 connessioni, contatori della VM:
+
+| rip. | braccio | pkt per MiB consegnato | B/pkt | byte sul filo / byte consegnati |
+|---|---|---|---|---|
+| 1 | relay | 733,2 | 1501,8 | 1,0500 |
+| 1 | quic  | 937,6 | 1244,7 | 1,1129 |
+| 2 | relay | 732,8 | 1502,4 | 1,0499 |
+| 2 | quic  | 910,7 | 1262,5 | 1,0965 |
+| 3 | relay | 732,0 | 1503,4 | 1,0496 |
+| 3 | quic  | 931,4 | 1251,6 | 1,1118 |
+
+**Mediane: 732,8 contro 931,4 pacchetti per MiB — il percorso diretto ne spende
+il 27,1 % in più.** I tre rapporti per ripetizione sono 1,279 / 1,243 / 1,272:
+la risposta non dipende dalla ripetizione, che è più di quanto §47.4 potesse
+dire di qualunque sua cella.
+
+E il 27 % si scompone in due addendi di taglia molto diversa:
+
+- **+5,9 % sono byte in più** (1,0499 → 1,1118 di rapporto filo/payload): il
+  costo per-pacchetto di QUIC contro TCP, header più AEAD più ACK.
+- **il resto — circa 20 punti — sono gli STESSI byte tagliati più fini**:
+  1502 B/frame contro 1252.
+
+### 47.8.1 E il taglio fine ha un nome: la connessione è rimasta all'MTU iniziale
+
+L'aritmetica chiude su un'ipotesi sola. Braccio quic, ripetizione 1:
+536 802 070 B / 431 280 pkt = **1244,7 B per frame** → meno 14 B Ethernet, 20 IP
+e 8 UDP = **1202,7 B di payload UDP**. Cioè 1200, che è `INITIAL_MTU` di
+quinn-proto (`src/lib.rs:332`), **non** i 1452 del limite superiore. Lo scarto
+è lo 0,2 %: per 460 MiB e 45 s quella connessione non ha mai alzato l'MTU.
+
+Non è una configurazione sbagliata di bore. Verificato nella versione bloccata
+(quinn-proto 0.11.15): `TransportConfig::default()` porta
+`mtu_discovery_config: Some(MtuDiscoveryConfig::default())` con `upper_bound:
+1452`, e `EndpointConfig` annuncia un `max_udp_payload_size` di **1472**
+(`1500 - 28`), quindi il limite di ricerca effettivo è
+`clamp(1452, 1200, 1472) = 1452`. `holepunch::transport_config` non tocca
+`initial_mtu`, `min_mtu` né `mtu_discovery_config`: la scoperta è **attiva**,
+con 252 byte di margine disponibile, e non li ha presi.
+
+**Questa è una domanda nuova e aperta, non una correzione.** Vale il ~17 % dei
+pacchetti del percorso diretto (1452/1200 in meno di frame per lo stesso
+payload) e non va toccata a intuito. Lo strumento per aprirla esisteva già e non
+è stato scritto: `bore test-udp` pubblica `current_mtu_bytes` da
+`ConnectionStats.path.current_mtu` (`src/udp_diagnostic.rs:2070`).
+
+**Ed è stato eseguito subito, e la risposta RESTRINGE l'ipotesi invece di
+confermarla** (§54): su un percorso WAN reale fra queste stesse due macchine,
+con questa stessa `transport_config`, quinn **alza** l'MTU — `mtu 1.42 KiB, max
+datagram 1.38 KiB`, con `PLPMTUD: sent 4, lost 0, black holes 0`, riportato
+identico dai due capi. Quindi «bore non sonda mai» è **falso**, e la frase
+qui sopra andava letta come quello che era: un'ipotesi aritmetica, non un
+meccanismo osservato. Quello che resta aperto è molto più stretto e molto più
+interessante — perché il percorso **VM → server** del braccio public gira a 1200
+mentre il traffico TCP sulla STESSA tratta viaggia in frame da 1502, e mentre
+una connessione QUIC costruita dallo stesso binario su un'altra tratta arriva a
+1452. La domanda non è più «bore sonda?» ma «che cosa ha di diverso quella
+tratta, o quel percorso di codice».
+
+### 47.8.2 La conseguenza operativa, che è la parte cara
+
+I pacchetti più piccoli non costano solo pacchetti. Il contatore
+`pps_allowance_exceeded` del server, letto come **delta attorno a ogni
+braccio**:
+
+| braccio | rip. 1 | rip. 2 | rip. 3 | mediana |
+|---|---|---|---|---|
+| relay | 140 | 109 | 8 | **109** |
+| quic  | 18 936 | 13 117 | 18 714 | **18 714** |
+
+**172×**, a payload consegnato identico. L'istanza non limita i byte qui —
+limita i pacchetti, e il percorso diretto gliene offre il 27 % in più, più
+piccoli. È la stessa famiglia di meccanismo che resta l'unica ipotesi
+sopravvissuta per N-9 (§12 di `VHOST_STAGING_EVIDENCE_2026-09-10.md`: il bucket
+dell'istanza è l'unica cosa che spieghi l'asimmetria fra trasporti), e qui la si
+vede **direttamente sul contatore** invece che per esclusione.
+
+Nota di lettura, perché la fase la stampa e sarebbe facile citarla male: il
+throughput di questi bracci **non** è un confronto fra trasporti. Entrambi
+girano fino al 97 % della linea di questa workstation, quindi la linea è il
+vincolo attivo (V-9) e `MiB/s` qui non decide niente. Le colonne informative
+sono i contatori di pacchetti; ed è per questo che la fase esiste.
+
 
 ## 48. Un tunnel pubblico `--udp` che si ri-registra sulla stessa porta **perde il percorso diretto per sempre**, e in silenzio
 
@@ -4591,108 +4694,6 @@ un jump host **`--udp` non serve alla latenza**, e ora lo dicono due fasi.
 Nota di metodo, perché è la seconda volta in questa finestra: la correzione non
 ha richiesto un braccio nuovo né un'altra esecuzione: ha richiesto di campionare
 una grandezza che la fase già produceva, in un momento in cui non la campionava.
-
-## 47.8 La riesecuzione con il MITTENTE staffato: quanti pacchetti costa davvero il percorso diretto
-
-§47.4 aveva dovuto ritirare la propria conclusione: la colonna `in` del server
-somma il payload che arriva dalla VM e il flusso di ACK che arriva dalla
-workstation sulla stessa interfaccia, e la separazione è **sottodeterminata**
-(ritrasmissioni su entrambe le tratte e rapporto GRO del ricevente, nessuno dei
-due misurato). Sei celle su sei non chiudevano contro il minimo di frame. La
-correzione di §47.7 era staffare il **mittente**, cioè contare i pacchetti dove
-vengono generati, e verificare prima che il contatore del mittente sia una
-misura e non un pavimento.
-
-**La premessa è stata verificata per prima, e regge.** La tabella degli offload
-stampata dalla fase dice, sulla NIC della VM che è il mittente di entrambi i
-bracci: `tcp-segmentation-offload=off` **e** `tx-udp-segmentation=off`. Con la
-segmentazione hardware spenta il driver vede i pacchetti veri, non i
-super-pacchetti, per **entrambi** i protocolli — che è esattamente la
-condizione senza la quale i due bracci potrebbero essere distorti in direzioni
-opposte e fabbricare la differenza che la fase cerca.
-
-Tre ripetizioni, 460 MiB per braccio su 4 connessioni, contatori della VM:
-
-| rip. | braccio | pkt per MiB consegnato | B/pkt | byte sul filo / byte consegnati |
-|---|---|---|---|---|
-| 1 | relay | 733,2 | 1501,8 | 1,0500 |
-| 1 | quic  | 937,6 | 1244,7 | 1,1129 |
-| 2 | relay | 732,8 | 1502,4 | 1,0499 |
-| 2 | quic  | 910,7 | 1262,5 | 1,0965 |
-| 3 | relay | 732,0 | 1503,4 | 1,0496 |
-| 3 | quic  | 931,4 | 1251,6 | 1,1118 |
-
-**Mediane: 732,8 contro 931,4 pacchetti per MiB — il percorso diretto ne spende
-il 27,1 % in più.** I tre rapporti per ripetizione sono 1,279 / 1,243 / 1,272:
-la risposta non dipende dalla ripetizione, che è più di quanto §47.4 potesse
-dire di qualunque sua cella.
-
-E il 27 % si scompone in due addendi di taglia molto diversa:
-
-- **+5,9 % sono byte in più** (1,0499 → 1,1118 di rapporto filo/payload): il
-  costo per-pacchetto di QUIC contro TCP, header più AEAD più ACK.
-- **il resto — circa 20 punti — sono gli STESSI byte tagliati più fini**:
-  1502 B/frame contro 1252.
-
-### 47.8.1 E il taglio fine ha un nome: la connessione è rimasta all'MTU iniziale
-
-L'aritmetica chiude su un'ipotesi sola. Braccio quic, ripetizione 1:
-536 802 070 B / 431 280 pkt = **1244,7 B per frame** → meno 14 B Ethernet, 20 IP
-e 8 UDP = **1202,7 B di payload UDP**. Cioè 1200, che è `INITIAL_MTU` di
-quinn-proto (`src/lib.rs:332`), **non** i 1452 del limite superiore. Lo scarto
-è lo 0,2 %: per 460 MiB e 45 s quella connessione non ha mai alzato l'MTU.
-
-Non è una configurazione sbagliata di bore. Verificato nella versione bloccata
-(quinn-proto 0.11.15): `TransportConfig::default()` porta
-`mtu_discovery_config: Some(MtuDiscoveryConfig::default())` con `upper_bound:
-1452`, e `EndpointConfig` annuncia un `max_udp_payload_size` di **1472**
-(`1500 - 28`), quindi il limite di ricerca effettivo è
-`clamp(1452, 1200, 1472) = 1452`. `holepunch::transport_config` non tocca
-`initial_mtu`, `min_mtu` né `mtu_discovery_config`: la scoperta è **attiva**,
-con 252 byte di margine disponibile, e non li ha presi.
-
-**Questa è una domanda nuova e aperta, non una correzione.** Vale il ~17 % dei
-pacchetti del percorso diretto (1452/1200 in meno di frame per lo stesso
-payload) e non va toccata a intuito. Lo strumento per aprirla esisteva già e non
-è stato scritto: `bore test-udp` pubblica `current_mtu_bytes` da
-`ConnectionStats.path.current_mtu` (`src/udp_diagnostic.rs:2070`).
-
-**Ed è stato eseguito subito, e la risposta RESTRINGE l'ipotesi invece di
-confermarla** (§54): su un percorso WAN reale fra queste stesse due macchine,
-con questa stessa `transport_config`, quinn **alza** l'MTU — `mtu 1.42 KiB, max
-datagram 1.38 KiB`, con `PLPMTUD: sent 4, lost 0, black holes 0`, riportato
-identico dai due capi. Quindi «bore non sonda mai» è **falso**, e la frase
-qui sopra andava letta come quello che era: un'ipotesi aritmetica, non un
-meccanismo osservato. Quello che resta aperto è molto più stretto e molto più
-interessante — perché il percorso **VM → server** del braccio public gira a 1200
-mentre il traffico TCP sulla STESSA tratta viaggia in frame da 1502, e mentre
-una connessione QUIC costruita dallo stesso binario su un'altra tratta arriva a
-1452. La domanda non è più «bore sonda?» ma «che cosa ha di diverso quella
-tratta, o quel percorso di codice».
-
-### 47.8.2 La conseguenza operativa, che è la parte cara
-
-I pacchetti più piccoli non costano solo pacchetti. Il contatore
-`pps_allowance_exceeded` del server, letto come **delta attorno a ogni
-braccio**:
-
-| braccio | rip. 1 | rip. 2 | rip. 3 | mediana |
-|---|---|---|---|---|
-| relay | 140 | 109 | 8 | **109** |
-| quic  | 18 936 | 13 117 | 18 714 | **18 714** |
-
-**172×**, a payload consegnato identico. L'istanza non limita i byte qui —
-limita i pacchetti, e il percorso diretto gliene offre il 27 % in più, più
-piccoli. È la stessa famiglia di meccanismo che resta l'unica ipotesi
-sopravvissuta per N-9 (§12 di `VHOST_STAGING_EVIDENCE_2026-09-10.md`: il bucket
-dell'istanza è l'unica cosa che spieghi l'asimmetria fra trasporti), e qui la si
-vede **direttamente sul contatore** invece che per esclusione.
-
-Nota di lettura, perché la fase la stampa e sarebbe facile citarla male: il
-throughput di questi bracci **non** è un confronto fra trasporti. Entrambi
-girano fino al 97 % della linea di questa workstation, quindi la linea è il
-vincolo attivo (V-9) e `MiB/s` qui non decide niente. Le colonne informative
-sono i contatori di pacchetti; ed è per questo che la fase esiste.
 
 ## 52. I cancelli di P-14, e i quattro difetti di strumento che hanno provato a farli mentire
 

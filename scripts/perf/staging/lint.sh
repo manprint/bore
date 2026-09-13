@@ -167,6 +167,29 @@ else
     echo "PASS -- no counting grep/pgrep defaults its own zero into a second line"
 fi
 
+# ---------------------------------------------------------------- compiler 9
+# The evidence document is append-only, so a section written later to answer an
+# EARLIER question lands after the sections that came between -- and a reader
+# following the numbers hits 49, 50, 51, 47.8, 52. Found exactly that way.
+# Physical order must equal logical order: the top-level section numbers must
+# never decrease.
+echo
+echo "== the evidence document's sections do not go backwards =="
+EV="$ROOT/docs/performance/ETH_RERUN_EVIDENCE_2026-09-12.md"
+if [ ! -f "$EV" ]; then
+    echo "PASS -- (no evidence document at the expected path; nothing to check)"
+else
+    back=$(grep -oE '^## [0-9]+\.' "$EV" | grep -oE '[0-9]+' \
+        | awk 'NR>1 && $1 < prev { printf "  section %d follows section %d\n", $1, prev } { prev = $1 }')
+    if [ -n "$back" ]; then
+        printf '%s\n' "$back"
+        echo "FAIL -- a section number decreases; move the block to where its number belongs"
+        fail=1
+    else
+        echo "PASS -- $(grep -cE '^## [0-9]+\.' "$EV") section(s), never decreasing"
+    fi
+fi
+
 echo
 if [ "$fail" = 0 ]; then
     echo "PASS -- $n file(s) clean"

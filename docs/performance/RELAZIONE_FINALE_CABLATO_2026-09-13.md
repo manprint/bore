@@ -745,10 +745,10 @@ Dettaglio in §25–26 delle evidenze. In breve:
 | domande aperte | `scripts/perf/staging/rerun_open.sh` — il driver nato **dentro** la finestra, per le fasi che nessuna domanda del piano prevedeva: `ws_conns_var`, `udp_pktsize`, `ws_first_conn` con il ritardo come asse, `vpn_carriers` in profondità, `jump_stab` ripetuto |
 | costo AWS | `aws_cost.sh` (finestra) e `cost_watch.sh` (per fase) |
 | scansione segreti | `secret_scan.sh` — i pattern arrivano da `~/.config/bore-perf/env.sh`, **mai** dal repository |
-| lint dell'harness | `lint.sh` — **otto compilatori**: `bash -n`, shellcheck mirato, `unbound_scan.sh` (variabili lette e mai assegnate), `shadow_scan.sh` (array che oscura uno scalare di libreria), `order_scan.sh` (chiamata di livello superiore prima della definizione), e il cancello V-11 che rifiuta un `sort -n` senza `LC_ALL=C`, il controllo che l'elenco delle trappole numeri sé stesso onestamente (ogni numero scritto uguale alla posizione che markdown renderà), e il rifiuto di un `grep -c`/`pgrep -c` con coda `|| echo N` (che su conto zero emette due righe). Oggi: **152 file puliti, 53 trappole coerenti** |
+| lint dell'harness | `lint.sh` — **nove compilatori**: `bash -n`, shellcheck mirato, `unbound_scan.sh` (variabili lette e mai assegnate), `shadow_scan.sh` (array che oscura uno scalare di libreria), `order_scan.sh` (chiamata di livello superiore prima della definizione), e il cancello V-11 che rifiuta un `sort -n` senza `LC_ALL=C`, il controllo che l'elenco delle trappole numeri sé stesso onestamente (ogni numero scritto uguale alla posizione che markdown renderà), il rifiuto di un `grep -c`/`pgrep -c` con coda `|| echo N` (che su conto zero emette due righe), e il rifiuto di una sezione del documento di evidenze il cui numero **torna indietro** (un documento append-only mette una risposta tardiva nel posto sbagliato). Oggi: **152 file puliti, 54 trappole coerenti** |
 | guardia di contesa | `driverlib.sh` — sorgente dei quattro driver **e** della finestra di build: un solo file identifica un processo da `/proc/<pid>/cmdline`, mai dal testo della riga di comando |
 | segreti nei risultati | `secret_scan.sh --out` — **prima** di citare un `.out` in un documento |
-| runbook e **53 trappole** | `scripts/perf/staging/README.md` |
+| runbook e **54 trappole** | `scripts/perf/staging/README.md` |
 | coordinate e credenziali | `~/.config/bore-perf/env.sh` (fuori dal repo, 600) |
 
 Ogni fase scrive `out/eth/<fase>.out` e un marker `_done.<fase>`; un driver

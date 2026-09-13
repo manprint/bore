@@ -235,7 +235,14 @@ services:
       # The other half of the remedy is CAP_NET_ADMIN, which lets bore call
       # SO_*BUFFORCE and bypass the clamp -- but Docker clears every capability
       # for a non-root UID even under `privileged`, so that path needs the ROOT
-      # image. The sysctl is the simpler half and is sufficient on its own.
+      # image. VERIFIED IN THE FIELD 2026-09-13 on a deployment that DOES set
+      # `privileged: true` and still runs as UID 1000: bore logged
+      # `recv_forced=false effective_recv=8388608` against a 16777216 request,
+      # i.e. privileged bought it nothing and the host ceiling was the only
+      # limit that applied. The sysctl is the simpler half and is sufficient on
+      # its own: after raising it, the same server logged
+      # `effective_recv=33554432 forced=false` and `ss` reported rb33554432
+      # with the socket's kernel drop counter back to 0 from 5224.
       #
       # VERIFY FROM THE KERNEL, never from the log: `ss -uapm` on the server
       # and read the rb/tb fields of bore's UDP socket. bore additionally warns

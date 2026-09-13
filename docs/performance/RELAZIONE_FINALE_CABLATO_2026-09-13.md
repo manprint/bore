@@ -675,10 +675,22 @@ troncata si ripete, non sparisce.
   processi separati non fanno meglio di uno, entro il 13 % e sotto il rumore).
   Restano non separati: il percorso di accept pubblico del server sotto
   concorrenza, lo scheduling dell'istanza, e il micro-bursting dell'allowance
-  ENA. La fase che chiude è piccola — la stessa cella ripetuta **15 volte** su
-  un solo gradino, con i contatori di allowance letti come delta attorno a ogni
-  ripetizione — e finché non gira **il ladder pubblico si cita fino a n=2**
-  (§42).
+  ENA. **La fase ha girato (§46) e due dei tre sono ESCLUSI.**
+
+  L'allowance ENA è scagionato dalla statistica, non dal colpo d'occhio: su 15
+  ripetizioni il rho di Spearman fra rate e contatori è **−0,12** — nessuna
+  associazione — e le due celle **più veloci** dell'intera esecuzione portano i
+  due contatori **più grandi**. (Sulle prime quattro righe avevo letto il segno
+  al contrario: è la ragione per cui l'analisi ora è uno script che stampa `n`
+  accanto al rho e si rifiuta di leggerlo sotto n=6 — trappola 40.) Lo `steal`
+  è stato **colto sul fatto** ma non spiega la dispersione: compare in celle
+  che non sono le lente. La CPU **segue** il rate invece di causarlo.
+
+  Resta in piedi, indebolito, il percorso di accept del server sotto
+  concorrenza — e §46.6 ha aperto un buco che nessuna delle fasi precedenti
+  poteva vedere: **il ricevente non era mai stato bracchettato**. È quello che
+  ha generato `pub/udp_pktsize.sh`, e il ladder pubblico resta citabile fino a
+  n=2 finché il buco non è chiuso (§42, §46, §47).
 - **Il costo della PRIMA connessione di un tunnel `--udp`** — **ATTRIBUITO,
   con un residuo.** `pub/ws_first_conn.sh` ha girato: il pool diretto vale già 1
   **prima** che passi un byte e `direct_fallbacks` resta 0, quindi non è né la

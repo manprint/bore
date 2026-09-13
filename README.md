@@ -80,15 +80,17 @@ UDP direct path). Download from the
 [releases page](https://github.com/manprint/bore/releases), unzip, and move the `bore`
 executable onto your `PATH`.
 
-**Which of those is a fixed point, and which is not.** `/releases/latest/` follows the most
-recent build of ANY kind, branch builds included, so it moves under you — it is the right URL
-for "give me the newest thing" and the wrong one for anything you want to still mean the same
-in six months. A **`vX.Y.Z` tag is the fixed point**: the git tag is annotated and protected
-against being moved or deleted, the binary it produces says so about itself
+**Which of those is a fixed point, and which is not.** `/releases/latest/` follows the newest
+**`vX.Y.Z` release** and nothing else: a branch build is published as a pre-release and never
+claims the label. It used to claim it — `make_latest` was unconditional, so the newest branch
+build won, and right after `v1.1.0` was published `/releases/latest` answered `main-7c3a82f`,
+a snapshot from fourteen minutes later. So `latest` moves, but only from one release to the
+next. A **`vX.Y.Z` tag is the fixed point**: the git tag is annotated and protected against
+being moved or deleted, the binary it produces says so about itself
 (`bore 1.1.0 - v1.1.0 - <sha8>` — the middle field is the tag, not a branch), and the release
 run records the image **digests** so a deployment can pin something that cannot be re-pointed
-at all. Reference a release as `/releases/tag/vX.Y.Z` or
-`/releases/download/vX.Y.Z/<asset>`, never through `latest`.
+at all. For anything that must still mean the same thing in six months, reference
+`/releases/download/vX.Y.Z/<asset>` or an image digest, not `latest`.
 
 **Docker.** Multi-arch images (`linux/amd64` + `linux/arm64`) are pushed to the GitHub
 Packages registry on **every branch push**, tagged by branch and commit. A **`vX.Y.Z` tag**

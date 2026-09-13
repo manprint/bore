@@ -61,6 +61,42 @@ if ! adb get-state >/dev/null 2>&1; then
     exit 1
 fi
 
+# `sys.boot_completed` IS NOT THE END OF BOOT, and this harness measured that.
+#
+# `reactivecircus/android-emulator-runner` declares "Emulator booted." the
+# moment that property reads 1, and this script used to start one second later.
+# On CI run 34771148278 the property flipped at 17:33:22, the emulator's own
+# log printed `Boot completed in 26314 ms` at 17:33:26, and an `am broadcast`
+# was still refused with `Cannot broadcast before boot completed` at 17:33:31 --
+# i.e. the device kept finishing boot for another NINE SECONDS after the signal
+# the harness trusted. T-AND-E1 and T-AND-E2 ran inside that window and failed
+# (`got ''`, `sender exited non-zero`) while T-AND-E3..E6, running after it on
+# identical code paths, all passed. The failure was the instrument, not bore.
+#
+# So wait for the FRAMEWORK, not for the property: the package manager and the
+# activity manager answering are what "booted" has to mean for a test that then
+# competes with the rest of boot for two emulated cores. `init.svc.bootanim` is
+# deliberately NOT consulted -- the workflow passes `-no-boot-anim`, so that
+# service may never run and a wait on it would never end.
+wait_for_device_ready() {
+    local deadline=$((SECONDS + ${1:-300}))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n')" = "1" ] &&
+            adb shell "service check activity" 2>/dev/null | grep -q "found" &&
+            adb shell "pm path android" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+echo "Waiting for the framework to finish booting..."
+if ! wait_for_device_ready 300; then
+    echo "ERROR: the device never became ready (boot_completed + pm + activity manager)." >&2
+    exit 1
+fi
+
 TMPDIR="/tmp/bore_android_$$"
 mkdir -p "$TMPDIR"
 
@@ -100,7 +136,14 @@ echo "Starting host server (min-port 40000, max-port 40100, --udp)..."
 "$BORE_HOST_BIN" server --min-port 40000 --max-port 40100 --udp \
     >"$TMPDIR/server.log" 2>&1 &
 HOST_SERVER_PID=$!
-sleep 1
+# Same rule as the guest waits below: the condition, not a guess. A server that
+# has not bound its control port yet is a `bore local` that exits immediately,
+# and that failure would land on whichever test happened to run first.
+for _ in $(seq 1 60); do
+    kill -0 "$HOST_SERVER_PID" 2>/dev/null || break
+    grep -q "server listening" "$TMPDIR/server.log" 2>/dev/null && break
+    sleep 0.5
+done
 if ! kill -0 "$HOST_SERVER_PID" 2>/dev/null; then
     echo "ERROR: host server failed to start:" >&2
     cat "$TMPDIR/server.log" >&2
@@ -136,12 +179,55 @@ fetch_guest_log() {
     adb shell "cat /data/local/tmp/$1" 2>/dev/null || true
 }
 
+# A FIXED SLEEP IS A GUESS ABOUT A MACHINE WE DO NOT CONTROL.
+#
+# Every readiness wait in this file used to be `sleep 1`, which is generous on
+# an idle emulator and far too short on one still finishing boot on two shared
+# CI cores -- exactly the run described above, where the guest `nc` had not yet
+# bound its port when `curl` fired, so the tunnel reported an empty body and the
+# harness blamed the tunnel. The two helpers below wait for the CONDITION and
+# fail loudly when it never arrives, so a slow device costs seconds instead of
+# producing a wrong verdict.
+
+# The guest listener is read out of /proc, not out of `netstat`/`ss`: those
+# differ across API levels and toybox builds, while /proc/net/tcp does not.
+# Column 2 is `local_address` as HEX:HEX and column 4 is the state, 0A = LISTEN.
+guest_wait_listen() {
+    local port="$1" deadline=$((SECONDS + ${2:-30})) hex
+    hex=$(printf '%04X' "$port")
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if adb shell "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null" 2>/dev/null | tr -d '\r' |
+            awk -v h=":$hex" '$4 == "0A" && index($2, h)' | grep -q .; then
+            return 0
+        fi
+        sleep 0.3
+    done
+    echo "WARN: guest port $port never reached LISTEN within ${2:-30}s" >&2
+    return 1
+}
+
+# A guest bore process is ready when it SAYS it is. The pattern is the role's
+# own readiness line, so a process that died during startup is caught here
+# rather than three commands later as a mysterious empty response.
+guest_wait_log() {
+    local logname="$1" pattern="$2" deadline=$((SECONDS + ${3:-45}))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if fetch_guest_log "$logname" | grep -q "$pattern"; then
+            return 0
+        fi
+        sleep 0.3
+    done
+    echo "WARN: '$pattern' never appeared in $logname within ${3:-45}s" >&2
+    fetch_guest_log "$logname" >&2
+    return 1
+}
+
 # ── T-AND-E1: public tunnel, guest provides the local service ───────────────
 kill_guest_bore
 guest_bore_bg "e1.log" local 8080 --to "$HOST_TO" --port 40010
-sleep 1
+guest_wait_log e1.log "listening at" || true
 guest_http_responder 8080
-sleep 1
+guest_wait_listen 8080 || true
 BODY="$(curl -sf --max-time 5 "http://127.0.0.1:40010" || true)"
 if [ "$BODY" = "hello" ]; then
     pass "T-AND-E1 public tunnel served 'hello'"
@@ -156,7 +242,7 @@ kill_guest_bore
 adb shell "rm -rf $DEV_INBOX && mkdir -p $DEV_INBOX"
 guest_bore_bg "e2.log" transfer listener --dest-path "$DEV_INBOX" \
     --to "$HOST_TO" --transfer-id T_AND_E2
-sleep 1
+guest_wait_log e2.log "transfer listener starting" || true
 
 SRC_FILE="$TMPDIR/e2_src.bin"
 head -c 8388608 /dev/urandom >"$SRC_FILE"
@@ -179,9 +265,9 @@ fi
 # ── T-AND-E3: secret tunnel, provider in guest ───────────────────────────────
 kill_guest_bore
 guest_bore_bg "e3.log" local 8080 --to "$HOST_TO" --tcp-secret-id T_AND_E3
-sleep 1
+guest_wait_log e3.log "registered secret tunnel" || true
 guest_http_responder 8080
-sleep 1
+guest_wait_listen 8080 || true
 BODY="$("$BORE_HOST_BIN" proxy --to "$HOST_LOOPBACK" --tcp-secret-id T_AND_E3 \
     --local-proxy-port ":40031" >"$TMPDIR/e3_proxy.log" 2>&1 &
     E3_PID=$!
@@ -216,9 +302,9 @@ fi
 # ── T-AND-E5: public tunnel --udp direct path (direct or fallback = pass) ──
 kill_guest_bore
 guest_bore_bg "e5.log" local 8080 --to "$HOST_TO" --port 40015 --udp
-sleep 1
+guest_wait_log e5.log "listening at" || true
 guest_http_responder 8080
-sleep 1
+guest_wait_listen 8080 || true
 BODY="$(curl -sf --max-time 5 "http://127.0.0.1:40015" || true)"
 if [ "$BODY" = "hello" ]; then
     pass "T-AND-E5 public --udp tunnel served 'hello'"

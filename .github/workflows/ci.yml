@@ -392,9 +392,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@v2
+      # `go install`, not `taiki-e/install-action`: actionlint is a Go program
+      # and has no crates.io crate, so install-action does not carry it and
+      # falls back to cargo-binstall, which fails with `For crate actionlint:
+      # actionlint is not found` and exit code 76 (measured, run 34771148278).
+      # The version is PINNED and the Go checksum database verifies the module,
+      # so this step cannot silently start linting with different rules.
+      - uses: actions/setup-go@v5
         with:
-          tool: actionlint
+          go-version: "1.24"
+      - run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
       - run: actionlint -no-color -oneline
 
   audit:

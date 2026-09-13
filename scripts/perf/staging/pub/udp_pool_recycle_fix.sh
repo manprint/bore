@@ -47,7 +47,13 @@ REPS="${REPS:-2}"
 WATCH="${WATCH:-45}"
 POLL="${POLL:-2}"
 WS_BORE="${WS_BORE:-$PWD/target/release/bore}"
-REMOTE="\$HOME/bore-p14"
+# TWO spellings on purpose. `scp` in OpenSSH 9 speaks SFTP, and SFTP does NOT
+# expand `$HOME` -- a destination of `$HOME/bore-p14.new` creates, or fails to
+# create, a literal directory called `$HOME`. SFTP resolves a RELATIVE path
+# against the login directory, which is what is wanted. Every later command
+# goes through `ssh`, where a real shell does expand it.
+REMOTE_SCP="bore-p14"         # for scp: relative, resolved by SFTP against $HOME
+REMOTE="\$HOME/bore-p14"      # for ssh: expanded by the remote shell
 
 RUN="p14$(date +%s%N | tail -c 6)"
 WS_PIDS=()
@@ -85,8 +91,14 @@ echo "  local  : $sha_local  $ver_local"
 vm "mkdir -p \$HOME/out" >/dev/null 2>&1
 # Copy BESIDE then rename: writing onto a file a previous run may still be
 # executing fails with ETXTBSY, and `mv` unlinks the old inode instead.
-if ! scp -q "${SSH_OPTS[@]}" "$WS_BORE" "$BORE_VM_USER@$BORE_VM:$REMOTE.new" 2>/dev/null; then
-    echo "INSTRUMENT FAILURE: could not ship the binary to the test VM"; exit 2
+# stderr is KEPT and reported. Discarding it cost a debugging round: the
+# failure line said only "could not ship the binary" while scp was explaining
+# exactly what was wrong with the destination path.
+if ! scp_err=$(scp -q "${SSH_OPTS[@]}" "$WS_BORE" \
+        "$BORE_VM_USER@$BORE_VM:$REMOTE_SCP.new" 2>&1); then
+    echo "INSTRUMENT FAILURE: could not ship the binary to the test VM"
+    [ -n "$scp_err" ] && echo "  scp said: $scp_err"
+    exit 2
 fi
 vm "mv -f $REMOTE.new $REMOTE && chmod +x $REMOTE" >/dev/null 2>&1
 sha_vm=$(vm "sha256sum $REMOTE | cut -c1-16" 2>/dev/null | tr -d '\r\n ')

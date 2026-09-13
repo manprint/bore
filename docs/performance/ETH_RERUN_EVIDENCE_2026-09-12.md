@@ -4809,3 +4809,89 @@ risponde `None`. Corretto ordinando l'**osservazione** — il peer segnala via
 mai ritardando la chiusura, che sarebbe l'unica modifica capace di far smettere
 al test di testare. Il red-check resta quello di prima: senza il conteggio di
 M-1 il secondo `accept()` non ritorna mai `None` e il test scade.
+
+## 53. La correzione P-14 sul percorso reale: l'esperimento di §48, con una variabile cambiata
+
+I due cancelli in processo (l'unitario red-checkato e `T-PUB-POOLRECYCLE` in
+netns) sono necessari e non bastano: nessuno dei due ha **la forma in cui il
+difetto è stato misurato** — un client su un host, un server su un altro, il
+timeout di idle da 10 s che si spedisce davvero, e una WAN in mezzo. Il netns
+taglia l'idle a 2 s proprio per far accadere in fretta l'eventuale sfratto, che
+è utile e non è la stessa cosa.
+
+Quindi la stessa esperienza di `udp_pool_recycle.sh` — stessi due bracci, larga
+una variabile — con **una** cosa diversa: il server è il binario corretto. Il
+risultato del vecchio stage è il red-check ed è già a verbale (§48: FRESH
+sopravvive 45 s 2/2, RECYCLED muore a t=12 s 2/2). Un «dopo» senza un «prima»
+accanto non dimostra una correzione; §43 è quella regola e questa coppia è il
+modo in cui la si rispetta.
+
+**La direzione è deliberatamente invertita rispetto a §48.** Là il client stava
+sulla VM e il server era staging. Qui è il contrario, perché il binario corretto
+è quello del **server** ed è il server la parte che possiede il difetto; il
+client è questa workstation, così il carrier QUIC attraversa la WAN esattamente
+come quello di un utente. Il server è la **VM di test**, mai staging: quella
+dell'operatore porta tunnel vivi e riavviarla richiede un'approvazione esplicita
+che non è in questo piano.
+
+E la premessa è **asserita, non assunta** — una fase che spedisce quello che
+capita di trovare in `target/release` e poi annuncia «il difetto non c'è più» ha
+misurato il deploy, non la correzione:
+
+```
+  local  : b061627f6ba27c9f  bore 1.0.0 - perf/jump-host-campaign-2026-09-13 - 82bff809
+  on VM  : b061627f6ba27c9f  bore 1.0.0 - perf/jump-host-campaign-2026-09-13 - 82bff809
+  server : 1.0.0 - perf/jump-host-campaign-2026-09-13 - 82bff809  keepalive=3000ms idle=10000ms
+```
+
+Checksum uguali ai due capi, stesso commit, e i timer di liveness sono quelli di
+produzione (3 s / 10 s), non quelli accorciati del netns.
+
+### 53.1 Il risultato
+
+2 ripetizioni, finestra di 45 s campionata ogni 2 s, **zero byte proxati** —
+nessuno si connette mai alla porta pubblica, perché il carrier diretto nasce
+dalla registrazione e non dal traffico:
+
+| braccio | rip. 1 | rip. 2 |
+|---|---|---|
+| FRESH (niente è morto su questa porta di recente) | 1 per tutti i 45 s | 1 per tutti i 45 s |
+| RECYCLED (un tunnel è morto su questa porta un attimo fa) | **1 per tutti i 45 s** | **1 per tutti i 45 s** |
+
+```
+died: FRESH 0/2, RECYCLED 0/2
+(prima della correzione, sulla stessa esperienza: FRESH 0/2, RECYCLED 2/2 -- §48)
+```
+
+Il braccio RECYCLED è quello che in §48 perdeva il carrier a t=12 s, due volte
+su due, mentre `tcpdump` sulla socket del client mostrava quella connessione
+ancora viva e rispondente. Ora tiene per l'intera finestra, due volte su due.
+
+Il conto del server mostra anche **perché** il difetto era invisibile:
+
+```
+13:08:35  public QUIC direct carrier established key=port:9081 id=0 carriers=1
+13:09:23  public QUIC direct carrier established key=port:9081 id=0 carriers=1
+13:10:11  public QUIC direct carrier established key=port:9081 id=0 carriers=1
+13:10:58  public QUIC direct carrier established key=port:9081 id=0 carriers=1
+```
+
+Ogni installazione conia `id=0`, perché gli id sono **per-pool**
+(`AtomicU64` in `DirectPool::default()`) e ogni registrazione costruisce una
+pool nuova. È esattamente l'ambiguità su cui il monitor sbagliava, e nessuna
+riga di log la mostra: ciò che la correzione cambia è **da quale pool** il
+monitor rimuove, e quello non è osservabile dall'esterno. Per questo il
+verdetto è la sopravvivenza del carrier e non una riga di log (P-12).
+
+### 53.2 Una nota sullo strumento, perché è costata un giro
+
+La prima esecuzione è morta su
+`INSTRUMENT FAILURE: could not ship the binary to the test VM`, e quella riga
+era tutto ciò che diceva — perché lo `scp` aveva `2>/dev/null`. La causa: la
+destinazione era `$HOME/bore-p14.new` con `$HOME` da espandere **sul lato
+remoto**, ma `scp` in OpenSSH 9 parla SFTP, e SFTP non espande niente: un
+percorso relativo lo risolve rispetto alla directory di login, un `$HOME`
+letterale no. Due correzioni, e la seconda conta quanto la prima: due grafie
+distinte (`REMOTE_SCP` relativo per scp, `REMOTE` con `$HOME` per ssh), e
+**stderr conservato e stampato** nel messaggio di guasto. Uno strumento che
+fallisce deve dire che cosa è fallito; questo lo sapeva e non lo diceva.

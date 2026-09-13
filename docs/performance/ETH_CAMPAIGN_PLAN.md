@@ -205,7 +205,7 @@ domanda che una fase esistente non poteva chiudere):
 | `udp_pool_life` | il pool inattivo muore o non è mai salito | **scritta, NON eseguita** — dichiarata, non sparita: §48 risponde già alla sua domanda (il pool non muore di inattività, lo sfratta il monitor del tunnel precedente) e `udp_pool_recycle` ha misurato il braccio FRESH che tiene il carrier per tutti i 45 s, due volte su due. I suoi 40 minuti sono stati spesi a **verificare la correzione** invece che a riosservare il difetto. Resta nell'albero, pronta |
 | `vpn_carriers` in profondità | i carrier del relay recuperano a 4 e 8 flussi? | 1655 s / 2055 s + **2424 s** (12 rip./cella, §51.1) — risposta: **no** |
 | `jump_stab` ripetuto | la stabilità del jump host è riproducibile | 340/342/343 s + **476 s** con la fase `recovered` (§51.2) — 16/0/0 due volte su due |
-| `udp_pool_recycle_fix` | la correzione P-14 tiene sul percorso reale, contro un server vero? | dopo i cancelli, **zero byte** |
+| `udp_pool_recycle_fix` | la correzione P-14 tiene sul percorso reale, contro un server vero? | 201 s, **zero byte** — RECYCLED sopravvive 45 s 2/2 (§53) |
 
 Queste tredici non sono «extra». Nove nascono da una domanda che una fase
 esistente **non poteva** chiudere; tre (`udp_pool_recycle`, `udp_pool_life`,

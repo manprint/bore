@@ -198,6 +198,25 @@ non il prodotto. Dettagli e tabelle: §38 delle evidenze.
    `T-PUB-POOLRECYCLE` in `scripts/perf/public_idle_window.sh`, che afferma la
    premessa (`established>=2`, `early=1`) prima della tesi (`pool=1`).
 
+   **Entrambi i cancelli sono red-checkati, e il secondo sul binario vero.**
+   L'unit senza la correzione legge 0 invece di 1. Il gate di campo, rieseguito
+   contro un binario ricostruito **senza** la correzione, stampa `pool=0` e
+   fallisce sulla **misura** mentre le due premesse passano ancora — che è la
+   forma che serve: uno che fallisse sulla premessa proverebbe solo di essersi
+   rotto.
+
+   **E la correzione è stata verificata sul percorso REALE** (§53), perché
+   nessuno dei due cancelli ha la forma in cui il difetto è stato misurato: un
+   client su un host, un server su un altro, il timeout di idle di produzione
+   (3 s / 10 s, non i 2 s accorciati del netns) e una WAN in mezzo. Stessa
+   esperienza di §48 con una variabile cambiata — il server è il binario
+   corretto, con checksum e commit asseriti uguali ai due capi
+   (`b061627f…`, `82bff809`) prima di misurare. Direzione invertita di
+   proposito: il binario corretto è quello del **server**, quindi il client è
+   questa workstation e il carrier attraversa la WAN come quello di un utente.
+   Risultato, zero byte proxati: **RECYCLED sopravvive 45 s, 2 volte su 2**,
+   dove prima moriva a t=12 s 2 volte su 2.
+
    **Adiacente, misurato e NON corretto di proposito:** `close_all` è chiamato
    solo da `ssh_jump.rs`, quindi le pool deregistrate restano finché la
    connessione non scade da sola, trattenendo i permessi di `admit_direct`. È

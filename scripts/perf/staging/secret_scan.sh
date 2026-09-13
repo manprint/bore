@@ -37,10 +37,44 @@ ENVF="$HOME/.config/bore-perf/env.sh"
 # shellcheck disable=SC1090
 . "$ENVF"
 
+# THE ONE COORDINATE THIS PROJECT PUBLISHES ON PURPOSE.
+#
+# `DEFAULT_SERVER` in `src/main.rs` is compiled into EVERY released binary, so
+# the host it names is public by construction: anyone running `bore local 8080`
+# with no `--to` opens a tunnel through it, and README.md documents it as the
+# product's front door. A gate that refused that host would refuse the shipped
+# default -- there would be no way to document what the binary already does, and
+# the pressure would be to weaken the gate for everything instead.
+#
+# It is READ FROM THE SOURCE rather than written down here, for two reasons.
+# Changing where the binary points stays the one-line edit that
+# `default_server_address_is_not_duplicated` promises, and the allowance cannot
+# drift from what the binary actually ships: point `DEFAULT_SERVER` somewhere
+# else and the old host becomes scannable again in the same commit.
+#
+# A source file we cannot read, or a const we cannot parse, yields NO allowance.
+# The gate fails CLOSED -- the only safe direction for a gate, and the reason
+# this is a `sed` over one anchored line rather than a fuzzy search.
+#
+# SCOPE: this exempts EXACTLY that host, and only where a coordinate IS it. The
+# server's IP address, the test VM, the tunnel secret, the admin token and the
+# ssh key name are untouched and still refused.
+PUBLIC_HOST=$(sed -n 's/^const DEFAULT_SERVER: &str = "\(.*\)";$/\1/p' src/main.rs 2>/dev/null \
+    | sed -e 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' -e 's#[:/].*$##' | head -n 1)
+
 # Anything that identifies the environment or authenticates to it. A value that
 # is empty contributes NO pattern -- an empty alternative would match every line.
+# A value that is exactly the published host contributes none either, and SAYS SO
+# on stderr: a gate that narrows itself quietly is a gate nobody audits.
 PATS=()
-add_pat() { [ -n "${1:-}" ] && PATS+=("$(printf '%s' "$1" | sed 's/[][\.*^$(){}?+|/]/\\&/g')"); }
+add_pat() {
+    [ -n "${1:-}" ] || return 0
+    if [ -n "$PUBLIC_HOST" ] && [ "$1" = "$PUBLIC_HOST" ]; then
+        echo "secret_scan: '$PUBLIC_HOST' is src/main.rs's DEFAULT_SERVER -- published by construction, not scanned" >&2
+        return 0
+    fi
+    PATS+=("$(printf '%s' "$1" | sed 's/[][\.*^$(){}?+|/]/\\&/g')")
+}
 add_pat "${BORE_SRV:-}"
 add_pat "${BORE_VM:-}"
 add_pat "${BORE_GW:-}"

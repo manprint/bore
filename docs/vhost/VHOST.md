@@ -236,7 +236,7 @@ a cert later reloads the TLS material but does not start an HTTPS listener until
 | `<TARGET>` | — | — | Local `host:port` (`127.0.0.1:8080`, `localhost:8080`, `:8080`, `[::1]:8080`) |
 | `--subdomain` | `BORE_VHOST_SUBDOMAIN` | — | Subdomain label to register |
 | `--id` | `BORE_VHOST_ID` | — | Client id for reservation matching |
-| `--to` | `BORE_SERVER` | `https://bore.0912345.xyz` | bore server address |
+| `--to` | `BORE_SERVER` | `https://brp.0912345.xyz` | bore server address |
 | `--secret` | `BORE_SECRET` | — | Server authentication secret |
 | `--insecure` | `BORE_INSECURE` | false | Skip TLS cert verification |
 | `--https[=off\|on\|redirect]` | `BORE_HTTPS` | inherit `--vhost-mode` | Per-subdomain HTTPS policy (bare = `on`): `off` = HTTP only, no redirect (opt out of a global `redirect-https`); `on` = served over HTTPS via the server wildcard cert; `redirect` = 308 HTTP→HTTPS for this subdomain. Overrides the server default but falls back to HTTP with a warning if the server has no vhost cert. See the caveat below and the applicability matrix. |

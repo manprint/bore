@@ -419,7 +419,7 @@ Stateless 1:1 netmap does not rewrite IPs embedded in application payloads. Prot
 
 | Flag | Short | Env var | Type | Default | Description |
 |------|-------|---------|------|---------|-------------|
-| `--to` | `-t` | `BORE_SERVER` | `ADDR` | `bore.0912345.xyz` | Server address (`host`, `host:port`, or `https://host`) |
+| `--to` | `-t` | `BORE_SERVER` | `ADDR` | `brp.0912345.xyz` | Server address (`host`, `host:port`, or `https://host`) |
 | `--secret` | `-s` | `BORE_SECRET` | `SECRET` | **required** | Shared secret for auth + relay encryption |
 | `--id` | | `BORE_VPN_ID` | `ID` | **required** | Link identifier; connector must use the same value |
 | `--advertise` | | `BORE_VPN_ADVERTISE` | `ITEM[,ITEM...]` | — | Subnets to expose; comma-separated; `ITEM` = `<cidr>` (plain) or `<real>@<virtual>` (NAT); enables gateway mode when non-empty |

@@ -49,7 +49,22 @@ use tracing::{info, warn};
 /// Owned by the library so that the binary's `--version` and the admin API's
 /// `server_version` can never disagree about which build is running.
 use bore_cli::FULL_VERSION;
-const DEFAULT_SERVER: &str = "https://bore.0912345.xyz";
+/// The server every client subcommand points at when `--to` / `BORE_SERVER` is
+/// omitted: `bore local`, `proxy`, `vhost`, `transfer listener`/`sender`,
+/// `test-udp`, `vpn listen`/`connect` and `sshjhost` all take their
+/// `default_value` from here.
+///
+/// THIS IS THE ONLY PLACE THE ADDRESS APPEARS IN THE CODE, and it must stay
+/// that way: changing where the shipped binary points is one line, not nine
+/// `default_value` attributes to keep in step. `default_server_address_is_not_duplicated`
+/// enforces it — the literal must occur exactly once in this file, so a
+/// tenth subcommand that spells the address inline fails the build's tests
+/// instead of quietly pointing somewhere else than the other nine.
+///
+/// It is compiled into every published binary, so it is a PUBLIC value by
+/// construction, not a coordinate: anyone running `bore local 8080` with no
+/// `--to` opens a tunnel through this host.
+const DEFAULT_SERVER: &str = "https://brp.0912345.xyz";
 
 #[derive(Parser, Debug)]
 #[clap(name = "bore", author, version = FULL_VERSION, about)]
@@ -3570,6 +3585,29 @@ mod tests {
             Some(value) => std::env::set_var("BORE_SERVER", value),
             None => std::env::remove_var("BORE_SERVER"),
         }
+    }
+
+    /// The shipped default must be changeable in ONE line.
+    ///
+    /// Nine subcommands take their `--to` default from `DEFAULT_SERVER`, and the
+    /// cost of a tenth spelling the address inline is not a compile error:
+    /// it is a binary where the nine point one way and the tenth points
+    /// another, which nobody notices until a tunnel lands on the wrong host.
+    /// So the invariant is checked mechanically against the source itself —
+    /// the address may appear exactly once in this file, in the constant.
+    ///
+    /// `include_str!` reads the file at COMPILE time, so this costs nothing at
+    /// runtime and cannot be fooled by the working directory a test runs from.
+    #[test]
+    fn default_server_address_is_not_duplicated() {
+        let source = include_str!("main.rs");
+        let occurrences = source.matches(DEFAULT_SERVER).count();
+        assert_eq!(
+            occurrences, 1,
+            "the default server address appears {occurrences} times in src/main.rs; \
+             it must appear exactly once, in DEFAULT_SERVER, so that changing where \
+             the shipped binary points stays a one-line edit"
+        );
     }
 
     #[test]

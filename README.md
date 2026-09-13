@@ -25,7 +25,7 @@ bore local 8000
 ```
 
 This exposes local port `8000` to the public internet through the default server
-`https://bore.0912345.xyz`, with a public port assigned randomly.
+`https://brp.0912345.xyz`, with a public port assigned randomly.
 
 Similar to [localtunnel](https://github.com/localtunnel/localtunnel) and
 [ngrok](https://ngrok.io/), except `bore` is intended to be a highly efficient, unopinionated
@@ -223,7 +223,7 @@ variable shown in each table — handy for Docker/systemd.
 | `bore hash-password` | Generate an Argon2id hash line for `--ssh-passwords-file` (`--features ssh-gateway`) | [SSH ingress gateway](#ssh-ingress-gateway) |
 
 The default server for every client/proxy/transfer/test-udp command, if `--to`/`BORE_SERVER`
-is omitted, is `https://bore.0912345.xyz`.
+is omitted, is `https://brp.0912345.xyz`.
 
 The `--to` value selects the control-connection transport:
 
@@ -243,7 +243,7 @@ This section describes detailed usage for the `bore` CLI command.
 
 You can forward a port on your local machine by using the `bore local` command. This takes a
 positional argument, the local port to forward. If you omit `--to`, the client defaults to
-`https://bore.0912345.xyz`; pass `--to` or `BORE_SERVER` to override it.
+`https://brp.0912345.xyz`; pass `--to` or `BORE_SERVER` to override it.
 
 ```shell
 bore local 5000
@@ -278,7 +278,7 @@ Options:
                                 must match PORT's embedded host if it has
                                 one, else rejected as conflicting)
   -v, --verbose...              Increase log verbosity (-v debug, -vv trace; RUST_LOG overrides)
-  -t, --to <ADDR>               Address of the remote server [env: BORE_SERVER=] [default: https://bore.0912345.xyz]
+  -t, --to <ADDR>               Address of the remote server [env: BORE_SERVER=] [default: https://brp.0912345.xyz]
   -p, --port <PORT>             Optional port on the remote server to select [default: 0]
   -s, --secret <SECRET>         Optional secret for authentication [env: BORE_SECRET]
       --tcp-secret-id <ID>      Register as a named secret tunnel [env: BORE_TCP_SECRET_ID=]
@@ -312,7 +312,7 @@ Usage: bore proxy [OPTIONS] --local-proxy-port <ADDR> --tcp-secret-id <ID>
 Options:
       --local-proxy-port <ADDR>  Local address to listen on, e.g. ":5555" or "127.0.0.1:5555" [env: BORE_LOCAL_PROXY_PORT=]
   -v, --verbose...               Increase log verbosity (-v debug, -vv trace; RUST_LOG overrides)
-  -t, --to <ADDR>                Address of the remote server [env: BORE_SERVER=] [default: https://bore.0912345.xyz]
+  -t, --to <ADDR>                Address of the remote server [env: BORE_SERVER=] [default: https://brp.0912345.xyz]
   -s, --secret <SECRET>          Optional secret for authentication [env: BORE_SECRET]
       --tcp-secret-id <ID>       Identifier of the secret tunnel to connect to [env: BORE_TCP_SECRET_ID=]
       --insecure                 Skip TLS certificate verification [env: BORE_INSECURE=]
@@ -798,7 +798,7 @@ End-to-end tests cover public tunnels, secret tunnels, and vhost WebSocket flows
 ## Self-hosting
 
 As mentioned in the startup instructions, the CLI defaults to the public server
-`https://bore.0912345.xyz`. To self-host `bore` on your own network:
+`https://brp.0912345.xyz`. To self-host `bore` on your own network:
 
 ```shell
 bore server
@@ -1900,7 +1900,7 @@ receiver, multiple worker streams, per-chunk BLAKE3 checks, and a final whole-tr
 verification before the staged tree is committed. The server never stores the payload; it
 only brokers the rendezvous or relays the encrypted/plain byte streams when a direct path is
 unavailable. If `--to` is omitted, both listener and sender default to
-`https://bore.0912345.xyz`.
+`https://brp.0912345.xyz`.
 
 ```shell
 # Receiver
@@ -2103,7 +2103,7 @@ Notes:
 
 Before blaming the tunnel, find out what *your* network allows. `bore test-udp` opens no
 tunnel — it probes public STUN servers and, by default, the bore STUN responder behind
-`https://bore.0912345.xyz`. Pass `--to` to probe a different server instead, then classify
+`https://brp.0912345.xyz`. Pass `--to` to probe a different server instead, then classify
 the NAT and print advice:
 
 ```shell
@@ -2407,7 +2407,7 @@ bore server \
 
 | Flag | Env var | Default | Description |
 |------|---------|---------|-------------|
-| `-t, --to <ADDR>` | `BORE_SERVER` | `bore.0912345.xyz` | Server address |
+| `-t, --to <ADDR>` | `BORE_SERVER` | `brp.0912345.xyz` | Server address |
 | `-s, --secret <SECRET>` | `BORE_SECRET` | **required** | Shared secret |
 | `--id <ID>` | `BORE_VPN_ID` | **required** | Link identifier |
 | `--advertise <CIDRs>` | `BORE_VPN_ADVERTISE` | — | Subnets to expose (comma-sep); enables gateway mode |

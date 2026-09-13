@@ -474,6 +474,8 @@ driver rather than being folded into a general re-run.
 | `pub/ws_first_conn.sh DELAYS="0 5 20 60"` | is the first connection's cost a function of the transfer's ORDER or of the tunnel's AGE? | a freshly registered pair per delay (a tunnel has exactly one first connection), penalty computed **within** that tunnel |
 | `vpn/vpn_carriers.sh CELLS_SPEC=…` | do relay carriers recover when the flows are as many as the carriers? | the six open cells only, many repetitions — dispersion needs repetitions, not neighbours |
 | `jump/jump_stab.sh` | does the relay cost latency, or did time merely pass? | warm-up sample discarded (trap 36), ratios computed **inside** each repetition (trap 37) |
+| `pub/udp_pool_recycle.sh` | does a public `--udp` tunnel lose its direct carrier because the PREVIOUS tunnel on that port died? | FRESH vs RECYCLED on one port, **zero bytes transferred** — the one variable an idle timeout cannot see (trap 45) |
+| `pub/udp_pool_life.sh` | how long does an idle direct pool live, and does it come back? | 2 s grid from before the pool can fill, the whole series printed, plus a relay tunnel as the "did the TUNNEL die instead" control |
 | `pub/udp_pktsize.sh` | how many PACKETS does each transport spend per delivered byte? | `/proc/net/dev` bracketed around each arm on **all three hosts** — the VM's `tx` is the answering column (trap 42), the server's `rx` decides only the arm-to-arm *difference* (trap 41) — plus an **idle bracket** as the control and an `ethtool -k` offload table (trap 43) |
 
 `pub/udp_pktsize.sh` is the one stage here that was not on §8's list: it exists
@@ -1146,6 +1148,36 @@ do not "simplify" them back out.
     producing a number, and print whether each column is a measurement or a
     declared lower bound. A sender bracket with the offload table missing is
     trap 41 again in a new place.
+
+44. **A CLEANUP TASK MUST ACT ON WHAT IT CAPTURED, NEVER ON WHAT THE KEY
+    RESOLVES TO LATER.** `pub/ws_first_conn.sh` showed a public `--udp` tunnel
+    holding `direct_pool=1` at registration and `0` twenty seconds later, then
+    serving every connection on the relay for the rest of its life. The obvious
+    reading is an idle timeout, and it is WRONG: `tcpdump` on the client's own
+    QUIC socket showed keep-alives every 3 s in BOTH directions, each answered
+    in about a millisecond, while the server's pool said the carrier was gone.
+    The connection was alive and had been EVICTED. Mechanism: the server builds
+    a fresh entry with a `DirectPool::default()` on every registration, so ids
+    restart at 0, and the close monitor re-resolves the registry key AT CLOSE
+    TIME — so the previous tunnel's monitor removes id 0 from the CURRENT
+    tunnel's pool. The guard the code relied on ("a monotonic id so a stale
+    monitor never evicts a newer member") holds only WITHIN one pool.
+    Generalise it: any task that outlives the thing it cleans up must hold a
+    handle to that thing (a `Weak` if retention matters), never a name it looks
+    up again — names get reused, and the reuse is exactly when the cleanup is
+    still pending.
+
+45. **AN EXPERIMENT THAT CANNOT DISTINGUISH TWO CAUSES HAS NOT TESTED EITHER.**
+    "The pool empties after ~10 s of idle" and "the pool empties because the
+    previous tunnel on this port died ~10 s ago" predict the SAME series on
+    every cell this campaign had run, because every cell re-registered on the
+    same port. The separating experiment is one variable wide and costs nothing:
+    watch a port nobody used recently (FRESH), then watch the same port right
+    after killing a tunnel on it (RECYCLED). Measured, 2 reps, ZERO bytes
+    transferred: FRESH survived 45 s of idle twice; RECYCLED died at **t=12 s
+    both times**. An idle timeout cannot produce that asymmetry. Before
+    publishing a mechanism, write down what the rival explanation predicts — if
+    it predicts the same numbers, the measurement is not evidence for either.
 
 ---
 

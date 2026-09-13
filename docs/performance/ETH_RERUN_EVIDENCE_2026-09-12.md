@@ -4125,3 +4125,197 @@ la regola esiste. Finché quel numero non c'è, la posizione di
 questo documento è che **non si tocca il codice**: cambiare la dimensione del
 datagramma sulla base della colonna `in B/pkt` significherebbe intervenire su una
 misura che §47.4 ha appena dimostrato non essere quella grandezza.
+
+## 48. Un tunnel pubblico `--udp` che si ri-registra sulla stessa porta **perde il percorso diretto per sempre**, e in silenzio
+
+Questa sezione non nasce da una domanda del piano. Nasce da una colonna che
+`pub/ws_first_conn.sh` stampava per un altro motivo, e che diceva una cosa che
+non poteva essere vera.
+
+### 48.1 La riga che non tornava
+
+L'asse dei ritardi di `ws_first_conn` registra un tunnel `--udp` nuovo, aspetta,
+e solo dopo muove un byte. Legge i quattro campi dall'API di amministrazione del
+**server** (P-12, mai il log del client): `current_path direct_stream_opens
+direct_fallbacks direct_pool`.
+
+```
+  --- rep 1  (delays: 0 20 60)
+    delay=0  s  quic  before: unknown 0 0 1   ->  ogni trasferimento  direct
+    delay=20 s  quic  before: unknown 0 0 0   ->  ogni trasferimento  relay, fallback 1,2,3
+    delay=60 s  quic  before: unknown 0 0 0   ->  ogni trasferimento  relay, fallback 1,2,3
+  --- rep 2  (delays: 60 20 0)
+    delay=60 s  quic  before: unknown 0 0 0
+    delay=20 s  quic  before: unknown 0 0 0
+```
+
+Il pool vale 1 subito dopo la registrazione ed è **vuoto** venti secondi dopo,
+senza che nulla lo abbia usato nel frattempo. E non si riprende: una sonda di
+sola lettura sul tunnel già esistente ha letto **76 campioni su 76 a zero in
+150 s**, con `direct_fallbacks` che intanto saliva da 2 a 3.
+
+### 48.2 La spiegazione ovvia è FALSA, e a ucciderla è un pacchetto
+
+Il server pubblica `direct_quic_keepalive_ms=3000` dentro
+`direct_quic_idle_ms=10000`, e i due estremi costruiscono la loro transport
+config con la **stessa** `holepunch::transport_config`. Un keepalive ogni 3 s
+dentro un timeout di 10 s non dovrebbe far scadere niente — ma «morto fra 10 e
+20 secondi» somiglia troppo a un idle timeout per lasciarlo all'intuito.
+
+`tcpdump` sul socket QUIC del client, mentre il pool del server legge 0:
+
+```
+  10:35:07.627  Out  .38527 > .443: UDP, length 30
+  10:35:07.628  In   .443 > .38527: UDP, length 30      <- risposta in 1,2 ms
+  10:35:10.655  Out  .38527 > .443: UDP, length 30
+  10:35:10.657  In   .443 > .38527: UDP, length 30      <- risposta in 1,7 ms
+```
+
+Keepalive ogni 3 s, in **entrambe** le direzioni, tutti risposti. **La
+connessione QUIC è viva.** Non è scaduta: è stata tolta dal pool mentre
+funzionava. Da qui in poi «timeout» è escluso e la domanda cambia forma.
+
+### 48.3 Il meccanismo, letto nel codice
+
+A ogni registrazione di un tunnel pubblico `--udp`, `Server::serve_tunnel`
+costruisce un'entry **nuova** e la inserisce sotto la **stessa** chiave:
+
+```rust
+let entry = Arc::new(PublicDirectEntry {
+    direct: vhost::DirectPool::default(),   // pool nuovo: gli id RIPARTONO DA 0
+    ...
+});
+self.public_udp_registry.insert(key.clone(), entry);   // chiave "port:<N>"
+```
+
+Il monitor di chiusura, però, ri-risolve quella chiave **al momento della
+chiusura**, non al momento dell'installazione:
+
+```rust
+tokio::spawn(async move {
+    direct.closed().await;
+    if let Some(entry) = public_reg.get(&key).map(|e| Arc::clone(e.value())) {
+        entry.direct.remove(id);
+    }
+});
+```
+
+Quindi quando la connessione del tunnel **precedente** finalmente si chiude, il
+suo monitor risolve `port:<N>` sull'entry che esiste **adesso** e rimuove
+`id = 0` — che è il carrier **nuovo e vivo**.
+
+Il commento nel sorgente dice: *«keyed by a monotonic id so a stale close-monitor
+never evicts a newer member»*. È vero **solo dentro un pool**. Attraverso una
+ri-registrazione il pool è nuovo, gli id ripartono, e la collisione è esatta.
+
+Il log del server lo conferma senza bisogno di altro — quattro ri-registrazioni
+della stessa porta:
+
+```
+  10:07:36  INFO public QUIC direct carrier established key=port:9048 id=0 carriers=1
+  10:14:15  INFO public QUIC direct carrier established key=port:9048 id=0 carriers=1
+  10:21:13  INFO public QUIC direct carrier established key=port:9048 id=0 carriers=1
+  10:28:52  INFO public QUIC direct carrier established key=port:9048 id=0 carriers=1
+```
+
+**`id=0` tutte e quattro.** Con id globali si leggerebbe 0, 1, 2, 3.
+
+### 48.4 L'esperimento che poteva falsificarlo — e non l'ha fatto
+
+Una storia così ordinata è esattamente quella di cui questa campagna si è già
+sbagliata una volta (trappola 40). Quindi è stata messa a rischio con l'unica
+variabile che la separa da **qualunque** spiegazione a tempo:
+
+- **FRESH** — il primo tunnel che questa fase mette sulla porta: nessun monitor
+  pendente. Previsione: il pool resta 1.
+- **RECYCLED** — la stessa porta, tunnel precedente ucciso un istante prima:
+  monitor pendente. Previsione: il pool cade entro ~10 s.
+
+Le due celle sono identiche in tutto il resto — stessa porta, stesso client,
+stesso server, stessa durata di inattività. Un idle timeout **non può**
+distinguerle. `pub/udp_pool_recycle.sh`, 2 ripetizioni, griglia di 2 s,
+**zero byte trasferiti**:
+
+```
+  rep 1 FRESH     0s:1 2s:1 ... 44s:1                    survived
+  rep 1 RECYCLED  0s:1 ... 10s:1  12s:0 ... 44s:0        died=12
+  rep 2 FRESH     0s:1 2s:1 ... 44s:1                    survived
+  rep 2 RECYCLED  0s:1 ... 10s:1  12s:0 ... 44s:0        died=12
+
+  morti: FRESH 0/2, RECYCLED 2/2
+```
+
+Due su due, allo **stesso secondo** — 12 s, cioè il timeout di inattività da
+10 s della connessione *precedente* più la granularità della griglia. E
+FRESH sopravvive a 45 s di inattività completa, il che chiude la questione: il
+pool non muore per inattività, muore perché **qualcosa d'altro è morto su quella
+porta**.
+
+### 48.5 Portata: `public` e `vhost` sì, `ssh-jump` no — e il perché è la correzione
+
+Le tre registry hanno lo stesso monitor, ma **non** lo stesso codice:
+
+```rust
+// ssh-jump (server.rs:1676) -- CORRETTO
+direct.closed().await;
+entry.direct.remove(id);                 // l'entry CATTURATA all'installazione
+
+// public (server.rs:1702) e vhost (server.rs:1734) -- DIFETTOSI
+direct.closed().await;
+if let Some(entry) = reg.get(&key) { entry.direct.remove(id); }   // ri-risolta
+```
+
+Il percorso jump rimuove dal pool in cui **ha installato**: se l'entry è stata
+sostituita, il vecchio pool è spazzatura e toglierne un elemento non fa danno.
+È già il precedente corretto, nello stesso file.
+
+`vhost` ha la forma identica (`Entry::Vacant` → `VhostEntry` nuova con
+`DirectPool::default()` sotto lo stesso sottodominio) ed è **più esposto** del
+pubblico, non meno: un provider vhost si riconnette di mestiere (autossh,
+riavvio del client, un buco di rete), e ogni riconnessione sulla stessa etichetta
+arma un monitor che ucciderà il carrier successivo.
+
+### 48.6 Perché non se n'era accorto nessuno
+
+Tre silenzi in fila, ed è la combinazione a rendere il difetto invisibile:
+
+1. **La connessione non si chiude**, quindi il client non vede niente. Il suo
+   log dice `direct udp carrier ready` una volta e **zero** righe di rinnovo:
+   `spawn_direct` è ancora fermo sulla sua `accept_stream()`, convinto di essere
+   a posto.
+2. **Il rinnovo è guidato da un segnale**, non da un tick. Il commento nel
+   sorgente lo dice: *«NOTHING else tops the direct pool up: unlike the TCP
+   carrier pool, which has `carrier_redial.tick()`, the direct pool is renewed
+   only by this signal»*. Nessuna chiusura ⇒ nessun segnale ⇒ nessun rinnovo,
+   per tutta la vita del tunnel.
+3. **La rimozione è loggata a `debug`**. A livello `info` — cioè in produzione —
+   si vede solo `carrier established`. Il tunnel sembra sano: registrato, vivo,
+   con il suo carrier «stabilito».
+
+Il risultato è la forma peggiore che questo progetto conosca, la stessa di P-9
+in un'altra registry: **registrato ma non serviente**. Il tunnel funziona, serve
+ogni connessione — sul relay, per sempre, pagando `direct_fallbacks` a ogni
+richiesta, senza che nulla lo dica.
+
+### 48.7 La correzione, e come va verificata
+
+Catturare l'entry all'installazione invece di ri-risolvere la chiave, come fa
+già il percorso jump — ma con una `Weak` e non una `Arc`, perché un monitor in
+attesa di una connessione che sopravvive alla registrazione non deve tenere viva
+l'entry (è il precedente di I-SSH10, che usa `Weak<ConnState>` per la stessa
+ragione).
+
+Il red-check è obbligatorio e ha una forma precisa: **senza** la correzione il
+gate deve fallire, e deve farlo per il motivo giusto. Serve quindi un test che
+ri-registri sulla stessa chiave e verifichi che il carrier del tunnel nuovo
+sopravviva alla chiusura di quello vecchio — non un test che guardi solo un
+tunnel alla volta, che è precisamente ciò che l'attuale copertura fa.
+
+Copertura attuale, verificata: `T-PUB-RECOVER` in
+`scripts/perf/public_idle_window.sh` copre il ritorno del percorso diretto
+**dopo un blackout UDP**, e non questo caso; nessun test unitario o e2e
+esercita una ri-registrazione sulla stessa chiave con un monitor pendente. La
+lacuna è reale ed è quella che ha lasciato passare il difetto.
+
+**Stato: difetto CONFERMATO sul campo, correzione non ancora scritta** — la
+finestra cablata è per le misure e non si compila mentre una fase misura.

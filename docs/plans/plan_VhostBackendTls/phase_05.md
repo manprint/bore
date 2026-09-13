@@ -54,7 +54,7 @@
 ### 4.3 Final consolidated documentation read (Opus)
 - **Model:** Opus
 - **Files:** `README.md` (vhost section `:325`–`:441`, and the SSH gateway
-  section), `docs/vhost/`, `docs/SSH_GATEWAY.md` / `README-SSH-GATEWAY.md`,
+  section), `docs/vhost/`, `docs/ssh-gateway/SSH_GATEWAY.md` / `README-SSH-GATEWAY.md`,
   `CLAUDE.md` (add a one-line invariant note for backend-TLS if warranted).
 - **Change:** verify the docs match the shipped behavior exactly (flag/param
   names, default OFF, self-signed skip-verify caveat, both reference examples,

@@ -2,7 +2,7 @@
 
 > **Status:** planning | **Opus authored:** 2026-07-03
 > **Folder:** `docs/plans/plan_SshGateway/`
-> **Analysis source:** `docs/SSH_GATEWAY.md` (decisions D-SSH1..4, invariants I-SSH1..5 — read it once before Phase 1)
+> **Analysis source:** `docs/ssh-gateway/SSH_GATEWAY.md` (decisions D-SSH1..4, invariants I-SSH1..5 — read it once before Phase 1)
 
 ## Goal
 

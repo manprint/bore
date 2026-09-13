@@ -2974,7 +2974,7 @@ reservations:
         ));
     }
 
-    // ── flush-before-park (36cd70d — docs/VHOST_INJECTED_FLUSH_FIX.md) ───────
+    // ── flush-before-park (36cd70d — docs/vhost/VHOST_INJECTED_FLUSH_FIX.md) ───────
     //
     // These mocks encode the tokio-rustls write contract directly, so the tests
     // are deterministic (plain `#[test]`, single poll, no runtime/timing): a

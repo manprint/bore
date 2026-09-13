@@ -52,7 +52,7 @@ Fuori ambito:
 
 ### Discovery e candidati
 
-[src/holepunch.rs](src/holepunch.rs) oggi:
+[src/holepunch.rs](../../src/holepunch.rs) oggi:
 
 - crea un solo socket wildcard IPv4 con `bind_socket`;
 - prova una catena STUN: peer hint, Cloudflare, Google e server bore;
@@ -68,8 +68,8 @@ Binding minimo e non RFC 5780.
 
 ### Broker e tentativo diretto
 
-[src/secret.rs](src/secret.rs), [src/client.rs](src/client.rs),
-[src/vpn.rs](src/vpn.rs) e [src/vpn_server.rs](src/vpn_server.rs):
+[src/secret.rs](../../src/secret.rs), [src/client.rs](../../src/client.rs),
+[src/vpn.rs](../../src/vpn.rs) e [src/vpn_server.rs](../../src/vpn_server.rs):
 
 - scambiano i candidati sul control channel del tunnel, protetto
   dall'autenticazione applicativa quando viene configurato `--secret`;
@@ -86,9 +86,9 @@ Binding minimo e non RFC 5780.
 
 ### Policy adattiva
 
-[src/adaptive_nat.rs](src/adaptive_nat.rs) contiene `NatProfile`, `NatPlan`,
+[src/adaptive_nat.rs](../../src/adaptive_nat.rs) contiene `NatProfile`, `NatPlan`,
 ordine dei tipi, timeout e retry budget. Oggi e collegato solo alla diagnostica
-paired in [src/udp_diagnostic.rs](src/udp_diagnostic.rs), non al live path secret
+paired in [src/udp_diagnostic.rs](../../src/udp_diagnostic.rs), non al live path secret
 o VPN.
 
 Anche nella diagnostica l'ordine calcolato ha effetto limitato: `connect_direct`

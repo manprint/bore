@@ -477,7 +477,7 @@ File/aree certamente coinvolti:
 - `src/sshgw.rs`: grammatica, permit, takeover, banner;
 - `src/admin_api.rs`, `src/admin_views.rs`, `src/admin_ui/panels/vhost.js`;
 - test vhost/SSH/UDP e harness;
-- `README.md`, `docs/VHOST.md`, guida SSH e test matrix.
+- `README.md`, `docs/vhost/VHOST.md`, guida SSH e test matrix.
 
 Valutazione qualitativa:
 

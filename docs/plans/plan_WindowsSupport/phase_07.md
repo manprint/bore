@@ -26,7 +26,7 @@
 
 ### 6.3 Update install/package docs
 - **Model:** Haiku 4.5
-- **Files:** `docs/INSTALL_BORE.md`, `docs/vpn/VPN.md`, `README.md` if it lists supported platforms, release packaging workflow if present
+- **Files:** `docs/install/INSTALL_BORE.md`, `docs/vpn/VPN.md`, `README.md` if it lists supported platforms, release packaging workflow if present
 - **Change:** Document Windows binary install and VPN prerequisites. Required: `bore.exe` placement; `wintun.dll` placement or env var; elevation requirement; Windows firewall prompt; server mode firewall rules; PowerShell examples; troubleshooting missing DLL/admin errors; uninstall/cleanup. Do not overstate automatic UAC prompt if implementation only errors.
 - **Unit tests:** docs link check if available.
 - **e2e tests:** T-WIN-INSTALL1 — fresh Windows VM follows install doc and passes T-WIN-LOCAL1 plus T-WIN-VPN-RELAY1.

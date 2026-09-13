@@ -73,7 +73,7 @@ Feature-gated: this phase compiles only under `--features ssh-gateway`.
 - **Model:** Haiku (banner + docs) + Sonnet (e2e)
 - **Files:** `src/sshgw.rs` `vhost_info_banner` (locate by symbol; I-SSH7);
   `tests/ssh_gateway_test.rs` (real OpenSSH driver, `TestNoVerifier:43`);
-  `docs/SSH_GATEWAY.md` if present else `README-SSH-GATEWAY.md` / the README SSH
+  `docs/ssh-gateway/SSH_GATEWAY.md` if present else `README-SSH-GATEWAY.md` / the README SSH
   section; the netns script `scripts/ssh_gateway_test.sh`.
 - **Change:**
   - Banner: when the vhost forward has `backend_tls` on, add a short line to

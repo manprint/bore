@@ -60,7 +60,7 @@ session: &mut Session)` — note the channel is handed to you ALREADY (unlike
 `tcpip_forward`, there is no separate "open" call); `reply.accept().await` (or
 `reply.reject(ChannelOpenFailure)`) is purely the accept/reject signal, and
 `channel.into_stream()` is the data path, same `ChannelStream` type as SPIKE2.
-**Deviation from `docs/SSH_GATEWAY.md`/plan assumption:** the plan's spec text
+**Deviation from `docs/ssh-gateway/SSH_GATEWAY.md`/plan assumption:** the plan's spec text
 used `-L <lport>:testname:0` (target port `0`, mirroring `-R`'s `:0` meaning
 "let the far end pick"). OpenSSH's CLIENT-SIDE parser rejects this outright
 before ever contacting the server — `Bad local forwarding specification

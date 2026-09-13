@@ -119,7 +119,7 @@ services:
       # Optionally expose the control port on a standard web port. The scheme is
       # decided by the certificate, not the port. With BORE_SSH_GATEWAY enabled
       # and no BORE_SSH_PORT, SSH is demuxed onto this SAME port too — one port
-      # serves TLS/HTTP/native-bore/SSH concurrently (docs/SSH_GATEWAY.md):
+      # serves TLS/HTTP/native-bore/SSH concurrently (docs/ssh-gateway/SSH_GATEWAY.md):
       # - "80:7835"            # plain HTTP (no cert/key set) -> clients use http://bore.tld
       # - "443:7835"           # HTTPS (set BORE_CERT_FILE/BORE_KEY_FILE) -> clients use https://bore.tld
       #
@@ -258,7 +258,7 @@ services:
       # stream on ONE QUIC connection, and a slow public reader lets quinn buffer a
       # full 16MiB stream window against the SHARED connection window. conn/stream is
       # therefore how many stalled streams starve every other stream: 64MiB gave ~4
-      # and produced the vhost "asset stuck pending" stall (docs/VHOST_UDP_CONCURRENCY_FIX.md);
+      # and produced the vhost "asset stuck pending" stall (docs/vhost/VHOST_UDP_CONCURRENCY_FIX.md);
       # 256MiB tolerates ~16. Do NOT lower the connection window toward the stream
       # window, and do NOT raise the stream window to meet it (that costs
       # single-stream throughput).
@@ -338,7 +338,7 @@ services:
       #   bore vhost 127.0.0.1:8080 --subdomain app --id myid --to <this-server>
       #   -> http(s)://app.<base-domain>
       # DNS: point a wildcard *.<base-domain> at this host. Also publish the vhost
-      # frontend ports in the `ports:` block above. See ../docs/VHOST.md.
+      # frontend ports in the `ports:` block above. See ../docs/vhost/VHOST.md.
       # - BORE_VHOST_BASE_DOMAIN=bore.mydomain.com
       # Frontend mode: http | https | both | redirect-https | auto. Default auto =
       # http when no cert, both when a cert is present.
@@ -365,7 +365,7 @@ services:
       # Lets a plain OpenSSH client create public/vhost/secret tunnels. With no
       # BORE_SSH_PORT, SSH is demuxed onto the control port itself (the SAME
       # 443:7835/80:7835/7835:7835 mapping above already carries it — SSH shares
-      # that port with TLS/HTTP/native bore automatically; see docs/SSH_GATEWAY.md).
+      # that port with TLS/HTTP/native bore automatically; see docs/ssh-gateway/SSH_GATEWAY.md).
       # Set BORE_SSH_PORT only if you want SSH on its OWN dedicated port instead/
       # as well (publish it in `ports:` too). Requires at least one credential
       # source (authorized-keys dir and/or a password file generated with

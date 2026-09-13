@@ -620,7 +620,7 @@ take `relay_response_injected` + `copy_one_direction_with_shutdown`. Its
 *performance implication does not*: this is not an optimization lever, and the
 enhancement plan should not spend effort here. (The flush-after-every-write is a
 correctness requirement, not overhead worth removing — see
-`docs/VHOST_INJECTED_FLUSH_FIX.md`.)
+`docs/vhost/VHOST_INJECTED_FLUSH_FIX.md`.)
 
 ---
 
@@ -1182,7 +1182,7 @@ noise floor.
 
 Consequence for the enhancement plan: **do not touch this path for performance
 reasons.** The flush-after-every-write is a correctness requirement
-(`docs/VHOST_INJECTED_FLUSH_FIX.md`), it is not overhead. F-4 is retained only
+(`docs/vhost/VHOST_INJECTED_FLUSH_FIX.md`), it is not overhead. F-4 is retained only
 as an accurate statement of which code path staging exercises — which matters
 because it means every other number in this document was measured on the
 injected path, i.e. on the slower of the two, and is therefore conservative.
@@ -1264,7 +1264,7 @@ the one SSH TCP connection, consistent with the previously measured cause:
 leg cannot use `--carriers` to work around it (SSH leg is single-connection by
 design).
 
-Note the prior assessment (`docs/SSH_GATEWAY_ASSESSMENT_2026-07-10.md`) rejected
+Note the prior assessment (`docs/ssh-gateway/SSH_GATEWAY_ASSESSMENT_2026-07-10.md`) rejected
 setting `SO_*BUF` on SSH sockets as *harmful* — it clamps to `net.core.*mem_max`
 and disables autotuning. That rejection stands. The remediation is sysctl-level
 on the server host, and at 1.84 ms RTT the effect is small; it is a real ceiling
@@ -1338,7 +1338,7 @@ Low severity, low effort, high diagnostic value. Should be part of the plan.
 The mechanism is the documented one and is working as designed: the direct QUIC
 path sets `connection_receive_window` 256 MiB against
 `stream_receive_window` 16 MiB precisely so that stalled streams cannot starve
-each other (`docs/VHOST_UDP_CONCURRENCY_FIX.md`). G9 confirms the fix — **there
+each other (`docs/vhost/VHOST_UDP_CONCURRENCY_FIX.md`). G9 confirms the fix — **there
 is no stall cliff at 4, 8, 16, 24 or 32 slow readers; fast requests stayed at
 12–17 ms throughout.** The cost is that the tolerance is paid in buffered bytes,
 and 256 MiB is *per QUIC connection*, i.e. per tunnel per carrier.
@@ -2192,7 +2192,7 @@ standalone frontend the same LazyConfigAcceptor treatment as the control port.
    are HPACK-encoded on the wire, so none of that applies as written; injection
    would have to move into the h2 header-frame encoder. This is the piece most
    likely to be underestimated, and it is also the piece with a bug and a fix
-   behind it (`docs/VHOST_INJECTED_FLUSH_FIX.md`) — the flush-before-parking
+   behind it (`docs/vhost/VHOST_INJECTED_FLUSH_FIX.md`) — the flush-before-parking
    invariant is a property of the hand-rolled copy loop that an h2 body writer
    would replace entirely.
 2. **The bulk path is a 256 KiB splice, and h2 would replace it with a frame

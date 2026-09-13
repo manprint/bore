@@ -361,7 +361,7 @@ suite) per CLAUDE.md.
 5. **Candidates VH-C1…C6** — write each test (§4b/§4c); promote to a fix only if
    the test reproduces a real defect.
 6. **Coverage fill** — remaining §4a unit tests, TEST-INT-11/12, `vhost_netns_
-   test_hard.sh`. Update `docs/VHOST_TEST_MATRIX.md` as rows go green.
+   test_hard.sh`. Update `docs/vhost/VHOST_TEST_MATRIX.md` as rows go green.
 
 Docs are part of the deliverable: every behavior/API/invariant change updates
-`docs/VHOST.md` / `VHOST_PLAN_UDP.md` and this file.
+`docs/vhost/VHOST.md` / `VHOST_PLAN_UDP.md` and this file.

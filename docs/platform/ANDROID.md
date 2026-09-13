@@ -1,6 +1,6 @@
 # bore on Android
 
-Companion to the [operational plan](plans/plan_AndroidSupport/). Covers running any `bore`
+Companion to the [operational plan](../plans/plan_AndroidSupport/). Covers running any `bore`
 subcommand on Android (Termux or a raw shell), and documents the **host-only VPN client**
 implementation in depth, now SHIPPED AND VALIDATED on CI (2026-07-03).
 
@@ -30,7 +30,7 @@ binary is statically-ish linked against the Android NDK's libc and needs nothing
 VPN mode additionally needs root: install `tsu` (`pkg install tsu`) to bridge Termux to a
 Magisk/KernelSU root grant — see "Root VPN quickstart" below.
 
-The generic install script (`docs/INSTALL_BORE.md`) also auto-detects Android/arm64 and works
+The generic install script (`docs/install/INSTALL_BORE.md`) also auto-detects Android/arm64 and works
 unmodified under Termux, since it's bash-only:
 
 ```bash
@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/manprint/bore/main/install.sh | bas
 
 None of the non-VPN subcommands touch a TUN device, `ip_forward`, or any routing table — they're
 plain userspace TCP/UDP sockets, so they behave like any other Linux CLI network tool under
-Termux. See [Limits and unsupported features](vpn/limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md) for
+Termux. See [Limits and unsupported features](../vpn/limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md) for
 the full non-root-VPN rationale.
 
 ---
@@ -308,7 +308,7 @@ adb shell chmod +x /data/local/tmp/bore
 - ✅ Zero regressions on Linux (netns 161/0 pass)
 
 **Manual device acceptance (physical hardware, Phase 5.2):**
-- Procedure written: [`VPN_ANDROID_ACCEPTANCE.md`](VPN_ANDROID_ACCEPTANCE.md) (T-AND-M1..M5) —
+- Procedure written: [`VPN_ANDROID_ACCEPTANCE.md`](../vpn/VPN_ANDROID_ACCEPTANCE.md) (T-AND-M1..M5) —
   not yet RUN on physical hardware; tracked as the project's only remaining open item.
 
 **Known open questions (Phase 5.2+):**
@@ -381,7 +381,7 @@ paths, CLI guards, and SIGKILL reclaim.
 
 #### Manual device acceptance (Phase 5.2)
 
-See [`VPN_ANDROID_ACCEPTANCE.md`](VPN_ANDROID_ACCEPTANCE.md) — T-AND-M1..M5, covering both
+See [`VPN_ANDROID_ACCEPTANCE.md`](../vpn/VPN_ANDROID_ACCEPTANCE.md) — T-AND-M1..M5, covering both
 non-root subcommands and the root VPN host-only path (connect/teardown, SIGKILL reclaim,
 30-minute longevity vs the phantom-process killer). Android is host-only, so there is no
 multi-device gateway/NAT scenario to cover, unlike the macOS/Windows acceptance docs.
@@ -390,8 +390,8 @@ multi-device gateway/NAT scenario to cover, unlike the macOS/Windows acceptance 
 
 ## See also
 
-- [CLAUDE.md — VPN Android port](../CLAUDE.md) — terse invariant list (D-A4/D-A6/D-A9) and status
-- [plan_AndroidSupport](plans/plan_AndroidSupport/) — full project plan + status + resume
-- [SPIKE_FINDINGS.md](plans/plan_AndroidSupport/SPIKE_FINDINGS.md) — CI findings (netd quirk, ip rule duplicate handling)
-- [Limits and unsupported features](vpn/limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md)
-- [VPN_ANDROID_ACCEPTANCE.md](vpn/VPN_ANDROID_ACCEPTANCE.md) — manual physical-device test procedure (T-AND-M1..M5)
+- [CLAUDE.md — VPN Android port](../../CLAUDE.md) — terse invariant list (D-A4/D-A6/D-A9) and status
+- [plan_AndroidSupport](../plans/plan_AndroidSupport/) — full project plan + status + resume
+- [SPIKE_FINDINGS.md](../plans/plan_AndroidSupport/SPIKE_FINDINGS.md) — CI findings (netd quirk, ip rule duplicate handling)
+- [Limits and unsupported features](../vpn/limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md)
+- [VPN_ANDROID_ACCEPTANCE.md](../vpn/VPN_ANDROID_ACCEPTANCE.md) — manual physical-device test procedure (T-AND-M1..M5)

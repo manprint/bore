@@ -12,7 +12,7 @@
 
 ### 6.1 Document the PTY message
 - **Model:** Haiku
-- **Files:** `docs/SSH_GATEWAY.md` (§6 operational guide) and `README-SSH-GATEWAY.md`
+- **Files:** `docs/ssh-gateway/SSH_GATEWAY.md` (§6 operational guide) and `README-SSH-GATEWAY.md`
   (§4 examples box). Follow the existing structure; do NOT create new files.
 - **Change:** Add a short subsection, e.g. "Harmless client messages":
   - Explain: `PTY allocation request failed on channel 0` is printed by the OpenSSH
@@ -61,6 +61,6 @@
 
 ## Phase done criterion
 
-`docs/SSH_GATEWAY.md` and `README-SSH-GATEWAY.md` explain the PTY / `Allocated port 1`
+`docs/ssh-gateway/SSH_GATEWAY.md` and `README-SSH-GATEWAY.md` explain the PTY / `Allocated port 1`
 messages and recommend `-T`; `pty_request` is untouched; 6.2 is either delivered
 harmlessly or explicitly skipped.

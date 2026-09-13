@@ -24,7 +24,7 @@ Riferimenti: [relay_vhost](../../src/vhost.rs#L876), [handle_connection](../../s
 | Finestre QUIC ampie | Ricezione: 16 MiB per stream, 256 MiB per connessione; invio: 256 MiB. Limite: 4096 stream. [shared.rs](../../src/shared.rs#L217) |
 | Buffer UDP | Richiesti 16 MiB per direzione; gestione del limite kernel e segnalazione del clamp già presenti. [holepunch.rs](../../src/holepunch.rs#L1199) |
 | Copia e socket TCP | Buffer di copia configurabile, default 256 KiB per direzione; `TCP_NODELAY` e keepalive già applicati. [shared.rs](../../src/shared.rs#L157), [tune_tcp](../../src/shared.rs#L268) |
-| Correzioni di concorrenza e parsing | Già risolti la finestra QUIC condivisa troppo piccola, i flush TLS mancanti e la scansione ripetuta dell'intero header. [fix QUIC](../VHOST_UDP_CONCURRENCY_FIX.md), [fix flush](../VHOST_INJECTED_FLUSH_FIX.md), [parser](../../src/vhost.rs#L1468) |
+| Correzioni di concorrenza e parsing | Già risolti la finestra QUIC condivisa troppo piccola, i flush TLS mancanti e la scansione ripetuta dell'intero header. [fix QUIC](VHOST_UDP_CONCURRENCY_FIX.md), [fix flush](VHOST_INJECTED_FLUSH_FIX.md), [parser](../../src/vhost.rs#L1468) |
 | Offload UDP | Quinn abilita GSO per default; quinn-udp espone offload in invio/ricezione. Disponibilità reale dipendente dall'ambiente. [TransportConfig](https://docs.rs/quinn-proto/0.11.15/quinn_proto/struct.TransportConfig.html#method.enable_segmentation_offload), [quinn-udp](https://docs.rs/quinn-udp/0.5.14/quinn_udp/) |
 
 QUIC elimina l'obbligo di consegna ordinata **fra stream** imposto dal TCP del carrier; rimangono condivisi congestione, capacità del collegamento e credito di connessione. Non significa banda illimitata o isolamento completo da un consumatore lento.
@@ -59,7 +59,7 @@ Priorità alta per il riuso del connector quando `--backend-tls` è frequente; p
 
 ### 4. Numero di carrier adattivo
 
-**Evidenza:** il vhost ha un numero configurato, default 1. Il ripristino dei carrier mancanti mantiene quel numero; non lo ridimensiona in funzione del traffico. Per QUIC, [clamp_direct_carriers](../../src/vhost.rs#L459) tratta anche 0 come 1. L'idea di un valore automatico era già proposta nel [precedente audit](../VHOST_AUDIT.md#L245), ma non risulta implementata.
+**Evidenza:** il vhost ha un numero configurato, default 1. Il ripristino dei carrier mancanti mantiene quel numero; non lo ridimensiona in funzione del traffico. Per QUIC, [clamp_direct_carriers](../../src/vhost.rs#L459) tratta anche 0 come 1. L'idea di un valore automatico era già proposta nel [precedente audit](VHOST_AUDIT.md#L245), ma non risulta implementata.
 
 **Proposta:** una modalità automatica esplicita, con minimo, massimo, crescita su pressione persistente e riduzione a inattività prolungata. Controllare separatamente la necessità di carrier QUIC attivi e il costo del relay mantenuto caldo; rispettare i limiti di entrambi i pool e mantenere invariato `--carriers 1`.
 

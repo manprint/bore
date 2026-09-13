@@ -975,7 +975,7 @@ Annotate any tunnel with `--notes "..."` (on `bore local`/`bore proxy`/`bore vho
 
 ## SSH jump hosts
 
-> **Step-by-step operator guide (Italian):** [`docs/README-JUMP-HOST.md`](docs/README-JUMP-HOST.md)
+> **Step-by-step operator guide (Italian):** [`docs/ssh-gateway/README-JUMP-HOST.md`](docs/ssh-gateway/README-JUMP-HOST.md)
 > — server setup, binary startup, Docker wrapper startup and operator access, end to end.
 
 `sshjhost` publishes an SSH daemon under an exact, separate hostname namespace. The
@@ -1781,7 +1781,7 @@ port, the server answers with a placeholder (usually `1`). Purely cosmetic, igno
 | `connect to host ... port 443: Connection refused` with `ProxyCommand openssl s_client` | Server has no TLS on that port, or `--ssh-gateway` disabled | Check `--cert-file`/`--key-file` and the control port |
 
 Full architecture/analysis doc (including invariants I-SSH1..11):
-[`docs/SSH_GATEWAY.md`](docs/SSH_GATEWAY.md).
+[`docs/ssh-gateway/SSH_GATEWAY.md`](docs/ssh-gateway/SSH_GATEWAY.md).
 
 ## Secret tunnels (no public port)
 
@@ -2318,7 +2318,7 @@ spoke isolation are not yet implemented on Windows. See
 
 On Android, `bore vpn` is **host-only** — no `--advertise`, no `--nat-masquerade`, no
 `--forward-accept`, no hub mode, no multi-queue TUN. Enforced by a fail-fast CLI guard. See
-[docs/ANDROID.md](docs/ANDROID.md).
+[docs/platform/ANDROID.md](docs/platform/ANDROID.md).
 
 ### Requirements
 

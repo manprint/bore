@@ -1,14 +1,14 @@
 # VPN Android — Actual Limits vs Linux
 
 **Status: IMPLEMENTED (host-only).** `bore vpn` ships on Android as a root-only CLI client —
-see `docs/ANDROID.md` for the user guide. This doc lists what remains a hard limit vs what's
+see `docs/platform/ANDROID.md` for the user guide. This doc lists what remains a hard limit vs what's
 now testable, so you know what NOT to test (and why) as opposed to what's simply unverified
 pending physical-device access.
 
 Purpose: know what NOT to test on Android. Linux = reference full impl. This doc lists
 gaps only — anything not listed here works same as Linux.
 
-Sources: `src/vpn.rs`, `crates/bore-android-tun`, `docs/ANDROID.md`,
+Sources: `src/vpn.rs`, `crates/bore-android-tun`, `docs/platform/ANDROID.md`,
 `SPIKE_FINDINGS.md`, `docs/plans/plan_AndroidSupport/resume.md`.
 
 ## Testable now (host-only relay/direct, listen + connect)
@@ -32,7 +32,7 @@ green (`android-vpn-e2e`, 8/8, rooted x86_64 emulator API 30). Both `bore vpn li
    by hard invariant (D-A4/D-A6/D-A9); gateway mode is forbidden at CLI. Unlike item 1 above,
    this is a deliberate v1 scoping decision, not a technical wall — Android's `ip`/routing
    primitives could support a gateway role in principle. (`vpn.rs:628-660`, `vpn.rs:3554-3560`,
-   `docs/ANDROID.md` design scope)
+   `docs/platform/ANDROID.md` design scope)
 
 3. **`--nat-masquerade`** — no NAT backend wired up on Android; gateway feature, forbidden at
    CLI alongside `--advertise`. (`vpn.rs:628-660`)
@@ -84,7 +84,7 @@ green (`android-vpn-e2e`, 8/8, rooted x86_64 emulator API 30). Both `bore vpn li
     overlay subnet a device has used stays in `ip rule show` until reboot. Harmless in
     practice (idempotent, low-priority, subnet-scoped) but a real, permanent teardown gap
     vs Linux/macOS/Windows, which fully revert their routing state on link exit. See
-    `docs/ANDROID.md`'s troubleshooting section. (`vpn.rs:5260-5285`)
+    `docs/platform/ANDROID.md`'s troubleshooting section. (`vpn.rs:5260-5285`)
 
 ## Works same as Linux (no gap)
 

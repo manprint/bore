@@ -4,7 +4,7 @@
 //! `ssh -R`/`-L` and no `bore` binary on the client side. The gateway is
 //! ingress-only: from the accepted SSH channel inward, the existing server
 //! data path (registries, relay, admin, weblog, `--max-conns`) is reused
-//! unmodified. See `docs/SSH_GATEWAY.md` for the design and
+//! unmodified. See `docs/ssh-gateway/SSH_GATEWAY.md` for the design and
 //! `docs/plans/plan_SshGateway/` for the implementation plan.
 
 use std::collections::HashMap;
@@ -3891,7 +3891,7 @@ pub fn parse_params(
 }
 
 // ---------------------------------------------------------------------------
-// §7 tunnel-info banners (docs/SSH_GATEWAY.md §7): a short, professional,
+// §7 tunnel-info banners (docs/ssh-gateway/SSH_GATEWAY.md §7): a short, professional,
 // unambiguous report delivered to the session channel once a forward
 // finishes establishing (via `ConnState::deliver`, §2). Every line reports a
 // fact the SERVER actually knows — never the client's own `-R`/`-L` local

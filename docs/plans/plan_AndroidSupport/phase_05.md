@@ -27,14 +27,14 @@ Context for the implementer (do not re-explore):
 
 ---
 
-### 5.1 — `docs/ANDROID.md` user guide + limits refresh
+### 5.1 — `docs/platform/ANDROID.md` user guide + limits refresh
 
 **Model:** Haiku
-**Files:** new `docs/ANDROID.md`; update
+**Files:** new `docs/platform/ANDROID.md`; update
 `docs/vpn/limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md`; touch
-`docs/INSTALL_BORE.md` + `docs/DOWNLOAD_URLS.md` (add android rows/links only)
+`docs/install/INSTALL_BORE.md` + `docs/install/DOWNLOAD_URLS.md` (add android rows/links only)
 **Change:**
-1. `docs/ANDROID.md`, sections in this order:
+1. `docs/platform/ANDROID.md`, sections in this order:
    - Install (Termux): download aarch64 binary (link pattern from
      DOWNLOAD_URLS.md), `chmod +x`, optional `pkg install` deps (none required
      for non-VPN; `tsu` + root for VPN).
@@ -57,7 +57,7 @@ Context for the implementer (do not re-explore):
 **Unit tests:** n/a.
 **e2e tests:** n/a.
 **Done-criteria:** docs build no broken relative links
-(`grep -o '](\S*\.md' docs/ANDROID.md` targets all exist); feature matrix
+(`grep -o '](\S*\.md' docs/platform/ANDROID.md` targets all exist); feature matrix
 consistent with the phase 3.3 guard matrix and phase 2/4 test results.
 
 ---

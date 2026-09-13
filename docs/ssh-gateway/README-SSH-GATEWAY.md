@@ -3,7 +3,7 @@
 `bore server --ssh-gateway` fa da server SSH embedded, così un client `ssh`/`autossh`
 **stock** (nessun binario `bore` sul client) può aprire tunnel **public**, **vhost**,
 **secret** e pubblicare/usare target **SSH jump**. Documento completo di
-analisi/architettura: `docs/SSH_GATEWAY.md`. Questo
+analisi/architettura: `docs/ssh-gateway/SSH_GATEWAY.md`. Questo
 file è la guida rapida "come si usa", con esempi per ogni modalità, ogni parametro, e
 `autossh`/systemd per ognuna.
 
@@ -617,4 +617,4 @@ restrizioni per-chiave (`permit=`), N tunnel su una sola sessione SSH, compressi
 | Tunnel sparisce dopo ~60s di silenzio di rete | reaper keepalive (comportamento corretto, non un bug) | `ServerAliveInterval`/autossi lato client per attraversare interruzioni brevi |
 | `connect to host ... port 443: Connection refused` con `ProxyCommand openssl s_client` | server senza TLS su quella porta, o `--ssh-gateway` disabilitato | verificare `--cert-file`/`--key-file` e la porta del control port |
 
-Guida di analisi/architettura completa (incl. invarianti I-SSH1..5): `docs/SSH_GATEWAY.md`.
+Guida di analisi/architettura completa (incl. invarianti I-SSH1..5): `docs/ssh-gateway/SSH_GATEWAY.md`.

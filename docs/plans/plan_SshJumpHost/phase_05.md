@@ -32,7 +32,7 @@ Update `README.md` in the same change with:
 - both provider modes from `examples_usage.md`: native bore (TCP/QUIC) and pure
   OpenSSH `-R jump/...` (TCP-only), including key/password operation.
 
-Update focused docs: `docs/SSH_GATEWAY.md`, `docs/README-SSH-GATEWAY.md`, UDP/direct
+Update focused docs: `docs/ssh-gateway/SSH_GATEWAY.md`, `docs/ssh-gateway/README-SSH-GATEWAY.md`, UDP/direct
 transport docs, admin architecture/sections and `CLAUDE.md` invariants. Add a
 short standalone operator guide only if README becomes unwieldy; README remains
 the single source of truth.

@@ -444,7 +444,7 @@ was still open one field over.
   snapshot deliberately carries an empty placeholder;
 * the frontend Configuration panel renders it automatically (it iterates the
   config object generically, which is why no JS change was needed);
-* `README.md`, `docs/VHOST.md` and `docs/frontend/ADMIN_DASHBOARD.md` all say
+* `README.md`, `docs/vhost/VHOST.md` and `docs/frontend/ADMIN_DASHBOARD.md` all say
   where to read the resolved value.
 
 **Gates.** New unit `config_view_reports_the_live_proxy_buffer_size`, which
@@ -517,7 +517,7 @@ harnesses changed; every one of them carries a gate, and every new gate was
 | `tests/admin_test.rs` | the new fields in the wire-shape fixture | it *is* the gate for the serialized shape | — |
 | `scripts/admin_dashboard_test.sh` | `T-CFGFIELDS` extended to the four new keys | runs against a live server; a field that stops being served fails it | yes — removing a field from the overlay fails `T-CFGFIELDS` |
 | `scripts/perf/vhost_idle_window.sh` | new | it is itself the F-14 regression gate: `ladder` asserts the loss window tracks the configured idle within −0.5/+1.5 s **and** that request #2 is served | yes — with the override ignored, every rung reports 10 s and the assertion fails |
-| `README.md`, `docs/VHOST.md`, `docs/frontend/ADMIN_DASHBOARD.md` | the two new variables, the clamp, the policy rule, and where to read resolved values | the project rule that "not in README.md ⇒ not done" | — |
+| `README.md`, `docs/vhost/VHOST.md`, `docs/frontend/ADMIN_DASHBOARD.md` | the two new variables, the clamp, the policy rule, and where to read resolved values | the project rule that "not in README.md ⇒ not done" | — |
 
 No behaviour change ships without a default-preserving test. That is the one
 property that matters most here: `direct_quic_liveness_unset_is_the_shipped_pair`

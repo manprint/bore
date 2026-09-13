@@ -26,7 +26,7 @@ on-device is the source of truth, not this doc.
 - A second machine reachable from the phone's network (a Linux box is assumed
   below; macOS/Windows work identically for the non-VPN tests).
 - A `bore server` reachable from both sides (either the project's public demo
-  server, or your own — see `docs/ANDROID.md`'s "Root VPN quickstart").
+  server, or your own — see `docs/platform/ANDROID.md`'s "Root VPN quickstart").
 - For T-AND-M3/M4/M5 (root tests): root via Magisk or KernelSU, plus `tsu`
   (`pkg install tsu`).
 - For T-AND-M5: the Termux:API add-on (`pkg install termux-api`, plus the
@@ -145,7 +145,7 @@ tsu
 **Expected observation:** both sides log a successful link establishment
 (overlay addresses assigned from the server pool, since neither side passed
 `--vpn-addr`). `ip addr show bore0` (or `bore1`, etc. — see `pick_tun_name` in
-`docs/ANDROID.md`) on the Android side shows the assigned overlay IP.
+`docs/platform/ANDROID.md`) on the Android side shows the assigned overlay IP.
 
 **Bidirectional ping:**
 
@@ -159,7 +159,7 @@ ping -c 4 <phone-overlay-ip>
 
 **Expected observation:** both directions succeed (0% packet loss). This is
 the direct confirmation of the netd routing-policy fix documented in
-`docs/ANDROID.md` (`ip rule add to <subnet> lookup main priority 100`) — a
+`docs/platform/ANDROID.md` (`ip rule add to <subnet> lookup main priority 100`) — a
 regression there shows up as the *host-initiated* ping direction hanging while
 guest-initiated replies work.
 
@@ -194,7 +194,7 @@ kill -9 <pid>
 
 **Expected observation:** the process disappears with no teardown at all (no
 RAII on SIGKILL — the TUN device and `ip rule`/route state are left behind
-exactly as documented in `docs/ANDROID.md`'s "No RAII state files on Android"
+exactly as documented in `docs/platform/ANDROID.md`'s "No RAII state files on Android"
 section). This is expected, not a failure.
 
 **Relaunch:**
@@ -284,6 +284,6 @@ likely to explain a platform-specific deviation from CI's emulator behavior.
 
 ## See also
 
-- [docs/ANDROID.md](../ANDROID.md) — install, feature matrix, CLI guard matrix, VPN backend reference
+- [docs/platform/ANDROID.md](../platform/ANDROID.md) — install, feature matrix, CLI guard matrix, VPN backend reference
 - [Limits and unsupported features](limits_win_mac/VPN_ANDROID_ACTUAL_LIMIT.md)
 - [plan_AndroidSupport](../plans/plan_AndroidSupport/) — full project plan + status + resume

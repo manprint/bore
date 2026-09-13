@@ -188,7 +188,7 @@ services:
       # --carriers 1 every proxied connection is a bidi stream on ONE QUIC
       # connection, so conn/stream is how many stalled streams starve all the
       # others. 64MiB gave ~4 and produced the vhost "asset stuck pending" stall
-      # (docs/VHOST_UDP_CONCURRENCY_FIX.md); 256MiB tolerates ~16.
+      # (docs/vhost/VHOST_UDP_CONCURRENCY_FIX.md); 256MiB tolerates ~16.
       # - BORE_UDP_STREAM_RECEIVE_WINDOW=16MiB
       # - BORE_UDP_CONNECTION_RECEIVE_WINDOW=256MiB
       # - BORE_UDP_SEND_WINDOW=256MiB

@@ -8,7 +8,7 @@ explicitly rather than improvising.
 
 **Status:** design approved. No code written yet. Branch `vhost_gpt`.
 
-**Companion docs:** `docs/VHOST.md` (user-facing vhost reference, to be extended in
+**Companion docs:** `docs/vhost/VHOST.md` (user-facing vhost reference, to be extended in
 Phase 6), `src/holepunch.rs` (the QUIC/`--udp` stack this feature reuses).
 
 ---
@@ -568,7 +568,7 @@ the public internet.
 
 ## 13. Documentation
 
-- `docs/VHOST.md`: new "UDP / QUIC data path" section — the honest value-add table (§1),
+- `docs/vhost/VHOST.md`: new "UDP / QUIC data path" section — the honest value-add table (§1),
   the "server stays in the path; only the provider hop upgrades; no offload" topology, the
   one extra UDP firewall port and that it is distinct from `control_port/udp`, the
   weak-auth-without-secret caveat. Add a `--udp` row to the client flag table and a

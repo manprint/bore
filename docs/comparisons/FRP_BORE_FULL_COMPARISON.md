@@ -14,17 +14,17 @@ Il documento distingue volutamente i due piani perché in bore oggi convivono du
 
 Riferimenti utili nel repo:
 
-- [src/holepunch.rs](src/holepunch.rs)
-- [src/udp_diagnostic.rs](src/udp_diagnostic.rs)
-- [src/secret.rs](src/secret.rs)
-- [src/client.rs](src/client.rs)
-- [src/shared.rs](src/shared.rs)
-- [src/main.rs](src/main.rs)
-- [ADAPTIVE_NAT.md](ADAPTIVE_NAT.md)
-- [TEST_UDP.md](TEST_UDP.md)
-- [NAT_TRAVERSAL.md](NAT_TRAVERSAL.md)
-- [SERVER_UDP_OPTIMIZATION.md](SERVER_UDP_OPTIMIZATION.md)
-- [FIREWALL_LIMITATION.md](FIREWALL_LIMITATION.md)
+- [src/holepunch.rs](../../src/holepunch.rs)
+- [src/udp_diagnostic.rs](../../src/udp_diagnostic.rs)
+- [src/secret.rs](../../src/secret.rs)
+- [src/client.rs](../../src/client.rs)
+- [src/shared.rs](../../src/shared.rs)
+- [src/main.rs](../../src/main.rs)
+- [ADAPTIVE_NAT.md](../nat/ADAPTIVE_NAT.md)
+- [TEST_UDP.md](../test/TEST_UDP.md)
+- [NAT_TRAVERSAL.md](../nat/NAT_TRAVERSAL.md)
+- [SERVER_UDP_OPTIMIZATION.md](../server/SERVER_UDP_OPTIMIZATION.md)
+- [FIREWALL_LIMITATION.md](../nat/FIREWALL_LIMITATION.md)
 
 ---
 
@@ -71,11 +71,11 @@ Questa distinzione è importante:
 - nel caso standalone bore è uno strumento di diagnosi;
 - nel caso paired bore è già un piccolo motore di traversal coordinato.
 
-Nel codice questo si vede bene in [src/main.rs](src/main.rs) e in [src/udp_diagnostic.rs](src/udp_diagnostic.rs):
+Nel codice questo si vede bene in [src/main.rs](../../src/main.rs) e in [src/udp_diagnostic.rs](../../src/udp_diagnostic.rs):
 
 - `test-udp` senza `--tcp-secret-id` va in `holepunch::diagnose`;
 - con `--tcp-secret-id` va in `udp_diagnostic::run_peer_test`;
-- il paired flow calcola `NatProfile`/`NatPlan` in [src/adaptive_nat.rs](src/adaptive_nat.rs) e passa un `UdpAdaptivePlan` nel control plane.
+- il paired flow calcola `NatProfile`/`NatPlan` in [src/adaptive_nat.rs](../../src/adaptive_nat.rs) e passa un `UdpAdaptivePlan` nel control plane.
 
 ### 3. Differenze chiave FRP vs bore nel test-udp
 
@@ -107,7 +107,7 @@ bore:
 - usa messaggi più compatti e più specializzati;
 - `UdpCandidateOffer`, `UdpPunch`, `UdpStunHint`, `TestUdpJoin`, `TestUdpStart`;
 - nel paired `test-udp` aggiunge `adaptive_plan`, `candidate_kinds` e `selected_stun`;
-- il framing è tracciato con label e summary redatti in [src/shared.rs](src/shared.rs).
+- il framing è tracciato con label e summary redatti in [src/shared.rs](../../src/shared.rs).
 
 Questo rende bore più leggibile e più sicuro da operare, ma meno generico di FRP.
 
@@ -119,7 +119,7 @@ FRP:
 
 bore:
 
-- classifica la NAT in [src/holepunch.rs](src/holepunch.rs#L732) con `classify_nat`;
+- classifica la NAT in [src/holepunch.rs](../../src/holepunch.rs#L732) con `classify_nat`;
 - nel paired diagnostic costruisce un profilo locale/peer e decide un piano adattivo;
 - in standalone la classificazione serve soprattutto a spiegare l’operatore, non a pilotare una policy globale.
 
@@ -171,7 +171,7 @@ Qui conviene distinguere tra **mancanze vere** e **mancanze solo rispetto alla r
 
 Bore oggi è molto forte sul piano della diagnosi leggibile:
 
-- traccia `tx`/`rx` del control plane con [src/shared.rs](src/shared.rs#L720);
+- traccia `tx`/`rx` del control plane con [src/shared.rs](../../src/shared.rs#L720);
 - summary redatti e label di canale;
 - `selected_stun`, `candidate_kinds`, `port_preserved`, `stun_aligned`, `adaptive_plan`.
 
@@ -212,10 +212,10 @@ Se QUIC non parte, bore non prova KCP o altre famiglie di trasporto. Il fallback
 
 Parte della logica vive in:
 
-- [src/holepunch.rs](src/holepunch.rs)
-- [src/udp_diagnostic.rs](src/udp_diagnostic.rs)
-- [src/client.rs](src/client.rs)
-- [src/secret.rs](src/secret.rs)
+- [src/holepunch.rs](../../src/holepunch.rs)
+- [src/udp_diagnostic.rs](../../src/udp_diagnostic.rs)
+- [src/client.rs](../../src/client.rs)
+- [src/secret.rs](../../src/secret.rs)
 
 Questa distribuzione è sana finché resta piccola; diventa un problema se la policy cresce senza una home chiara.
 
@@ -229,7 +229,7 @@ Questa è una scelta corretta, ma rispetto a FRP significa meno “intelligenza 
 Ordine consigliato, dal più importante al meno urgente:
 
 1. **Unificare la policy adattiva in un modulo condiviso e documentato**.
-   - Oggi [src/adaptive_nat.rs](src/adaptive_nat.rs) contiene la semantica più vicina a un policy engine.
+   - Oggi [src/adaptive_nat.rs](../../src/adaptive_nat.rs) contiene la semantica più vicina a un policy engine.
    - Va tenuto come fonte unica di verità per il paired `test-udp`.
 
 2. **Formalizzare meglio i ruoli dei candidati**.

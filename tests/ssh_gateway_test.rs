@@ -719,7 +719,7 @@ async fn read_http_response<S: AsyncRead + Unpin>(conn: &mut S) -> Result<(Strin
 /// SO_RCVBUF plus a pause between small reads keeps the server's public socket
 /// full while the relay writes, so encrypted residue is parked in the server's
 /// rustls session at the final body write — the exact field shape of the
-/// 36cd70d keep-alive stall (docs/VHOST_INJECTED_FLUSH_FIX.md). The request is
+/// 36cd70d keep-alive stall (docs/vhost/VHOST_INJECTED_FLUSH_FIX.md). The request is
 /// keep-alive (no `Connection: close`), so nothing but an explicit flush can
 /// push that residue out.
 async fn send_https_control_get_slow_reader(
@@ -1075,7 +1075,7 @@ fn ssh_local_forward_args(
 /// opens a session channel at all (confirmed empirically), so it is the one
 /// invocation shape that can NEVER see an info banner, and it is also not
 /// what these tests are probing for (the shell-request bugfix, §7 of
-/// `docs/SSH_GATEWAY.md`, is specifically about the no-`-N` path).
+/// `docs/ssh-gateway/SSH_GATEWAY.md`, is specifically about the no-`-N` path).
 fn ssh_args_raw_no_n(gw_port: u16, identity: &Path, raw_forwards: &[String]) -> Vec<String> {
     let mut args = ssh_base_args(gw_port, identity);
     for f in raw_forwards {
@@ -2924,7 +2924,7 @@ async fn t_ssh_dmx6_unified_tls_vhost_large_keepalive_asset_completes() -> Resul
 
 // ---------------------------------------------------------------------------
 // T-SSH-DMX7 — flush-before-park under REAL socket backpressure (36cd70d,
-// docs/VHOST_INJECTED_FLUSH_FIX.md). A slow reader with a tiny SO_RCVBUF keeps
+// docs/vhost/VHOST_INJECTED_FLUSH_FIX.md). A slow reader with a tiny SO_RCVBUF keeps
 // the public socket full for the whole 12 MiB transfer, so the relay's final
 // body write is guaranteed to leave encrypted residue parked in the server's
 // rustls session; keep-alive means no EOF/shutdown ever flushes it. Without

@@ -23,13 +23,13 @@
 
 ### 7.2 User-facing documentation
 - **Model:** Haiku (draft) → Sonnet (technical accuracy pass)
-- **Files:** `docs/VHOST.md`, `docs/SSH_GATEWAY.md`, top-level `README.md`. Existing files; no new dirs.
+- **Files:** `docs/vhost/VHOST.md`, `docs/ssh-gateway/SSH_GATEWAY.md`, top-level `README.md`. Existing files; no new dirs.
 - **Change:**
-  - `docs/VHOST.md`: document the per-subdomain `--https off|on|redirect`, the
+  - `docs/vhost/VHOST.md`: document the per-subdomain `--https off|on|redirect`, the
     capability bound (vhost cert + `--vhost-mode`), the D10 `off`-on-shared-:443
     caveat, and the downgrade-warning behavior. Cross-reference the phase_06 §5.2
     param matrix.
-  - `docs/SSH_GATEWAY.md`: document `https=on|off|redirect` / `force-https` params
+  - `docs/ssh-gateway/SSH_GATEWAY.md`: document `https=on|off|redirect` / `force-https` params
     for vhost forwards (now applied, not warned), the banner "HTTPS policy" line, and
     the PTY note from phase_06.
   - `README.md`: update the `bore local` / `bore vhost` flag list to show

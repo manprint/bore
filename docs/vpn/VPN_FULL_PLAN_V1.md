@@ -557,7 +557,7 @@ connect_closure, vpn::run_listen|run_connect)`.
   kill the connection unparsed),
   `vpn_relay_substream_is_opaque` (push AEAD frames through the relay; assert the bytes
   the server splices contain **no** plaintext IP header — i.e. server can't read).
-- **Docs:** server-side VPN section notes in `docs/VPN.md` draft.
+- **Docs:** server-side VPN section notes in `docs/vpn/VPN.md` draft.
 - **Acceptance:** gates green; no change to secret-tunnel tests.
 
 ### Phase 5 — TUN + `NetConfig` (root-gated) (`vpn::hostcfg`)
@@ -614,11 +614,11 @@ connect_closure, vpn::run_listen|run_connect)`.
 ### Phase 8 — Documentation & test matrix
 - **8.1** `README.md` VPN section (3 topologies, copy-paste commands, root requirement,
   `--features vpn` build note). Source of truth for commands + expected behavior: §16.
-- **8.2** `docs/VPN.md`: concept; the 3 topologies fully worked; privilege/firewall/UDP
+- **8.2** `docs/vpn/VPN.md`: concept; the 3 topologies fully worked; privilege/firewall/UDP
   notes; **overlap limitation**; **IPv4-only**; MTU notes; security model (direct
   QUIC-TLS E2E + relay AEAD E2E, server-sees-ciphertext); troubleshooting via
   `bore test-udp`.
-- **8.3** `docs/VPN_TEST_MATRIX.md` + the netns script under `scripts/`. The matrix
+- **8.3** `docs/vpn/VPN_TEST_MATRIX.md` + the netns script under `scripts/`. The matrix
   **must** include the §16 traceability table (every §16 bullet → covering test) and
   the manual procedures for the few bullets that cannot be automated (§16 mandate).
 - **8.4** Update `CLAUDE.md` ("what this is" + new invariants: HelloVpn-before-auth,
@@ -637,7 +637,7 @@ is sparsely documented and may not match this plan's assumptions.
   mis-segments or mis-coalesces. Compiling is not working. Do not "adapt creatively"
   around an API that doesn't fit — that is exactly the "unworkable" case.
 - **Concrete unworkable criteria** (any one of these → stop, fall back to 6.1, record
-  the decision in the code and in `docs/VPN.md`, move offload to §V2):
+  the decision in the code and in `docs/vpn/VPN.md`, move offload to §V2):
   1. The crate cannot enable `IFF_VNET_HDR` + expose the `virtio_net_hdr` per buffer.
   2. After **2 focused attempts**, the segmentation/coalescing unit tests still fail.
   3. The netns `iperf3` run shows **no measurable improvement** over the 6.1 baseline.
@@ -760,25 +760,25 @@ no fixed `sleep`); root-only tests `#[ignore]` + documented.
 - `iperf3` over the overlay shows the data path is not syscall-bound.
 - Every §16 expected-behavior bullet holds **and is traceably covered by a test**
   (automated where possible, documented manual procedure otherwise) — the §16
-  traceability table in `docs/VPN_TEST_MATRIX.md` is complete, no empty rows.
+  traceability table in `docs/vpn/VPN_TEST_MATRIX.md` is complete, no empty rows.
 - **Zero regressions on existing functionality**: every pre-existing test passes
   unmodified in all three builds; no existing test was edited, weakened, or removed.
 - All §1 invariants hold; `#![forbid(unsafe_code)]` intact; only **one** new Rust dep.
-- `docs/VPN.md`, `docs/VPN_TEST_MATRIX.md`, README section, `CLAUDE.md` update all written.
+- `docs/vpn/VPN.md`, `docs/vpn/VPN_TEST_MATRIX.md`, README section, `CLAUDE.md` update all written.
 
 ---
 
 ## §16. End-to-end usage reference — commands, options, expected behavior
 
 > This section is the **user-facing acceptance contract**. Phase 8 docs (`README`,
-> `docs/VPN.md`) are written from it, and the netns harness (§13) asserts it. If the
+> `docs/vpn/VPN.md`) are written from it, and the netns harness (§13) asserts it. If the
 > implementation cannot satisfy a bullet here, stop and surface it.
 >
 > **MANDATORY — test coverage of this section (no exceptions):**
 > 1. **Every scenario in §16.0–§16.8 must be covered by a detailed, precise,
 >    repeatable test** — an automated one wherever technically possible (unit /
 >    in-process integration / netns harness §13), and where automation is genuinely
->    impossible, a written manual test procedure in `docs/VPN_TEST_MATRIX.md` with
+>    impossible, a written manual test procedure in `docs/vpn/VPN_TEST_MATRIX.md` with
 >    exact commands, exact expected output, and a checkbox. The test matrix must
 >    contain a **traceability table**: one row per §16 bullet → the test (file +
 >    test name, or matrix procedure id) that covers it. A §16 bullet with no row is
@@ -913,7 +913,7 @@ itself applied (the interface).
 | Pool exhausted | `VpnError`, names the pool |
 | Overlapping subnets | `VpnError` listing the offending CIDRs |
 
-### §16.8 Quick troubleshooting map (goes into docs/VPN.md)
+### §16.8 Quick troubleshooting map (goes into docs/vpn/VPN.md)
 
 - Link pairs but no `ping` → check `path=` in logs; if `relay`, run `bore test-udp`
   between the hosts to see why direct failed (NAT type).

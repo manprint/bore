@@ -958,7 +958,7 @@ async fn vhost_response_header_injection_large_keepalive_body_completes() -> Res
 //
 // Companions to `vhost_response_header_injection_large_keepalive_body_completes`
 // covering the remaining native front/back-end combinations of the
-// `relay_response_injected` splice path (36cd70d, docs/VHOST_INJECTED_FLUSH_FIX.md):
+// `relay_response_injected` splice path (36cd70d, docs/vhost/VHOST_INJECTED_FLUSH_FIX.md):
 // dedicated HTTPS port (`handle_https`), keep-alive request sequences, and the
 // QUIC direct provider link. NOTE: like every in-process TLS test, these cannot
 // go red on the flush bug itself (loopback false-pass — the enforcing gates are

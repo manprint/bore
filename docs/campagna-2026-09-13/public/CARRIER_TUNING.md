@@ -20,7 +20,7 @@ That distinction matters:
 
 > Orthogonal knob: `BORE_PROXY_BUFFER_SIZE` (default 256 KiB) sets the
 > per-direction copy buffer at each relay/splice hop — a memory/latency trade for
-> high-BDP links, not a concurrency knob. See `docs/VHOST.md`.
+> high-BDP links, not a concurrency knob. See `docs/vhost/VHOST.md`.
 
 ## `--carriers` vs `--parallel` — two different axes
 

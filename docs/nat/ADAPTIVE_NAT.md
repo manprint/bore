@@ -51,13 +51,13 @@ Il comportamento attuale e gia abbastanza ricco, ma e ancora piu vicino a un sis
 
 ### I pezzi gia presenti
 
-- [src/holepunch.rs](src/holepunch.rs) gestisce la scoperta STUN, la raccolta candidati, la logica di fallback e il path diretto QUIC.
-- [src/secret.rs](src/secret.rs) orchestra provider e consumer, brokera il path UDP diretto e mantiene il relay come fallback garantito.
-- [src/udp_diagnostic.rs](src/udp_diagnostic.rs) esegue la diagnostica paired, misura il direct path e il relay, e produce report operativi molto dettagliati.
-- [src/shared.rs](src/shared.rs) contiene i messaggi e i dati condivisi, inclusi candidati, tuning QUIC e opzioni test.
-- [TEST_UDP.md](TEST_UDP.md) documenta il path diagnostico, i segnali NAT e i casi operativi.
+- [src/holepunch.rs](../../src/holepunch.rs) gestisce la scoperta STUN, la raccolta candidati, la logica di fallback e il path diretto QUIC.
+- [src/secret.rs](../../src/secret.rs) orchestra provider e consumer, brokera il path UDP diretto e mantiene il relay come fallback garantito.
+- [src/udp_diagnostic.rs](../../src/udp_diagnostic.rs) esegue la diagnostica paired, misura il direct path e il relay, e produce report operativi molto dettagliati.
+- [src/shared.rs](../../src/shared.rs) contiene i messaggi e i dati condivisi, inclusi candidati, tuning QUIC e opzioni test.
+- [TEST_UDP.md](../test/TEST_UDP.md) documenta il path diagnostico, i segnali NAT e i casi operativi.
 - [NAT_TRAVERSAL.md](NAT_TRAVERSAL.md) descrive gia bene il modello NAT e il ragionamento su provider/consumer.
-- [README.md](README.md) spiega il direct path UDP, i candidati, il fallback e i flag operativi.
+- [README.md](../../README.md) spiega il direct path UDP, i candidati, il fallback e i flag operativi.
 
 ### Comportamento attuale del direct path
 
@@ -403,7 +403,7 @@ Questa e la parte importante: bore ha gia diversi mattoni che possono diventare 
 
 ### 1. Candidate discovery
 
-In [src/holepunch.rs](src/holepunch.rs) abbiamo gia:
+In [src/holepunch.rs](../../src/holepunch.rs) abbiamo gia:
 
 - chain STUN con fallback;
 - metadata del STUN selezionato;
@@ -416,13 +416,13 @@ Questo e gia molto vicino al concetto di assisted addresses, solo che oggi e usa
 
 ### 2. NAT classification
 
-In [src/holepunch.rs](src/holepunch.rs) esiste gia `NatClass` con segnali utili per capire se il mapping e cone, symmetric o altro.
+In [src/holepunch.rs](../../src/holepunch.rs) esiste gia `NatClass` con segnali utili per capire se il mapping e cone, symmetric o altro.
 
 Questa classificazione e la base naturale per un future `NatProfile`.
 
 ### 3. Broker e nonce stabile
 
-In [src/secret.rs](src/secret.rs) il server gia:
+In [src/secret.rs](../../src/secret.rs) il server gia:
 
 - registra provider e consumer separatamente;
 - mantiene un nonce stabile per il provider;
@@ -434,7 +434,7 @@ Questo e un ottimo punto di estensione per un piano adattivo.
 
 ### 4. Tuning e diagnostica
 
-In [src/udp_diagnostic.rs](src/udp_diagnostic.rs) abbiamo gia:
+In [src/udp_diagnostic.rs](../../src/udp_diagnostic.rs) abbiamo gia:
 
 - report host;
 - report QUIC;
@@ -493,7 +493,7 @@ Test da aggiungere:
 
 Documentazione da aggiornare:
 
-- [TEST_UDP.md](TEST_UDP.md)
+- [TEST_UDP.md](../test/TEST_UDP.md)
 - [NAT_TRAVERSAL.md](NAT_TRAVERSAL.md)
 
 Exit criteria:
@@ -533,8 +533,8 @@ Test da aggiungere:
 
 Documentazione da aggiornare:
 
-- [README.md](README.md)
-- [TEST_UDP.md](TEST_UDP.md)
+- [README.md](../../README.md)
+- [TEST_UDP.md](../test/TEST_UDP.md)
 - [NAT_TRAVERSAL.md](NAT_TRAVERSAL.md)
 
 Exit criteria:
@@ -568,8 +568,8 @@ Test da aggiungere:
 
 Documentazione da aggiornare:
 
-- [src/udp_diagnostic.rs](src/udp_diagnostic.rs) come riferimento interno della diagnostica;
-- [TEST_UDP.md](TEST_UDP.md);
+- [src/udp_diagnostic.rs](../../src/udp_diagnostic.rs) come riferimento interno della diagnostica;
+- [TEST_UDP.md](../test/TEST_UDP.md);
 - [ADAPTIVE_NAT.md](ADAPTIVE_NAT.md) stesso documento, se la fase viene raffinata.
 
 Exit criteria:
@@ -602,8 +602,8 @@ Test da aggiungere:
 
 Documentazione da aggiornare:
 
-- [README.md](README.md)
-- [TEST_UDP.md](TEST_UDP.md)
+- [README.md](../../README.md)
+- [TEST_UDP.md](../test/TEST_UDP.md)
 - [NAT_TRAVERSAL.md](NAT_TRAVERSAL.md)
 
 Exit criteria:
@@ -636,9 +636,9 @@ Test da aggiungere:
 
 Documentazione da aggiornare:
 
-- [TEST_UDP.md](TEST_UDP.md);
-- [SERVER_UDP_OPTIMIZATION.md](SERVER_UDP_OPTIMIZATION.md) se la fase impatta i parametri che il server espone;
-- [README.md](README.md).
+- [TEST_UDP.md](../test/TEST_UDP.md);
+- [SERVER_UDP_OPTIMIZATION.md](../server/SERVER_UDP_OPTIMIZATION.md) se la fase impatta i parametri che il server espone;
+- [README.md](../../README.md).
 
 Exit criteria:
 
@@ -671,10 +671,10 @@ Test da aggiungere:
 
 Documentazione da aggiornare:
 
-- [TEST_UDP.md](TEST_UDP.md)
+- [TEST_UDP.md](../test/TEST_UDP.md)
 - [NAT_TRAVERSAL.md](NAT_TRAVERSAL.md)
-- [README.md](README.md)
-- [SERVER_UDP_OPTIMIZATION.md](SERVER_UDP_OPTIMIZATION.md)
+- [README.md](../../README.md)
+- [SERVER_UDP_OPTIMIZATION.md](../server/SERVER_UDP_OPTIMIZATION.md)
 
 Exit criteria:
 
@@ -819,9 +819,9 @@ La strategia giusta e questa:
 Questo file deve essere letto insieme a:
 
 - [NAT_TRAVERSAL.md](NAT_TRAVERSAL.md) per la teoria NAT e la matrice di compatibilita.
-- [SERVER_UDP_OPTIMIZATION.md](SERVER_UDP_OPTIMIZATION.md) per tuning, buffer e capacità server.
-- [TEST_UDP.md](TEST_UDP.md) per il comportamento della diagnostica e i casi operativi.
-- [README.md](README.md) per la user experience attuale e il contratto pubblico del progetto.
+- [SERVER_UDP_OPTIMIZATION.md](../server/SERVER_UDP_OPTIMIZATION.md) per tuning, buffer e capacità server.
+- [TEST_UDP.md](../test/TEST_UDP.md) per il comportamento della diagnostica e i casi operativi.
+- [README.md](../../README.md) per la user experience attuale e il contratto pubblico del progetto.
 
 ## Conclusione finale
 

@@ -1,5 +1,5 @@
 # bore VPN development — passwordless sudo, restricted to the network-test commands
-# the VPN plan needs (docs/VPN_FULL_PLAN_V1.md §11.9-B, §13 netns harness).
+# the VPN plan needs (docs/vpn/VPN_FULL_PLAN_V1.md §11.9-B, §13 netns harness).
 #
 # Install (one-time):
 #   sudo install -o root -g root -m 0440 scripts/dev/bore-vpn-sudoers /etc/sudoers.d/bore-vpn-dev

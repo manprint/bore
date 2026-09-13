@@ -102,7 +102,7 @@ operator rather than assumed:
   substantial fraction of total page time) **and** 7.2 finds no collision with
   the yamux single-task or injected-flush invariants that requires reworking
   them. Those two invariants each have a bug and a fix behind them
-  (`[[yamux-stream-split-wedge]]`, `docs/VHOST_INJECTED_FLUSH_FIX.md`); an h2
+  (`[[yamux-stream-split-wedge]]`, `docs/vhost/VHOST_INJECTED_FLUSH_FIX.md`); an h2
   design that needs them relaxed is a much larger and riskier piece of work than
   one that sits alongside them.
 - **No-go, or defer** if the headroom is modest at realistic RTTs, or if the

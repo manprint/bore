@@ -1322,7 +1322,7 @@ Mbit/s, e la misura ne è l'86 %.
 La finestra da 1 MiB non viene dal traversal: viene da
 `UdpDirectTuning::from_memory_budget`, cioè da `--udp-memory-budget` diviso
 `--max-carriers` (dettagli e rimedi nel README e in
-[`../performance/final_secret_perf_review.md`](../performance/final_secret_perf_review.md)
+[`../performance/final_secret_perf_review.md`](../campagna-2026-09-13/secret/final_secret_perf_review.md)
 §5.7). **Nessuna manopola di traversal la cambia**, e nessun difetto di
 traversal la produce.
 

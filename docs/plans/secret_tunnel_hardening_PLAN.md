@@ -302,7 +302,7 @@ No persisted-schema or public-API breakage.
 
 #### 5.1 Docs
 - **Model:** Haiku (draft) → Opus read
-- **Files:** new/updated `docs/SECRET_HARDENING_ASSESSMENT.md` (findings BUG-S1..S6 + verdicts incl. rejected D7), update `CLAUDE.md` "Secret control liveness" block with the **consumer-carrier invariant** (carriers do not register/reap; heartbeat is main-connection-only), document `scripts/secret_netns_test.sh` usage + T-IDs.
+- **Files:** new/updated `docs/secret/SECRET_HARDENING_ASSESSMENT.md` (findings BUG-S1..S6 + verdicts incl. rejected D7), update `CLAUDE.md` "Secret control liveness" block with the **consumer-carrier invariant** (carriers do not register/reap; heartbeat is main-connection-only), document `scripts/secret_netns_test.sh` usage + T-IDs.
 - **Unit/e2e:** n/a.
 - **Done:** docs match shipped behavior; CLAUDE.md invariant added.
 

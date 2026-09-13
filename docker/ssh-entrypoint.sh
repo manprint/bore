@@ -16,7 +16,7 @@
 #   3. Docker `restart: always` restarts the whole container if autossh itself dies.
 #
 # NOTE: never use -N (the gateway's status banner and all warnings arrive on the
-# session channel, which -N suppresses entirely — see docs/SSH_GATEWAY.md §6.4a).
+# session channel, which -N suppresses entirely — see docs/ssh-gateway/SSH_GATEWAY.md §6.4a).
 # -T is used instead: it only skips the PTY, keeping the banner visible in logs.
 set -euo pipefail
 

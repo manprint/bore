@@ -108,6 +108,6 @@ non fa perdere una colonna, ne **corrompe un'altra** per sottrazione.
 |---|---|
 | [`../evidenze/ETH_RERUN_EVIDENCE_2026-09-12.md`](../evidenze/ETH_RERUN_EVIDENCE_2026-09-12.md) | **§44** (la sezione lunga: difetto dello strumento, poi quello del prodotto), §51.2 |
 | [`../ETH_CAMPAIGN_PLAN.md`](../ETH_CAMPAIGN_PLAN.md) | §P6: le cinque domande che il blocco jump doveva rispondere |
-| [`../../SSH_GATEWAY.md`](../../SSH_GATEWAY.md) | la guida operativa dell'ingresso SSH |
-| [`../../README-JUMP-HOST.md`](../../README-JUMP-HOST.md) | il jump host lato utente |
+| [`../../SSH_GATEWAY.md`](../../ssh-gateway/SSH_GATEWAY.md) | la guida operativa dell'ingresso SSH |
+| [`../../README-JUMP-HOST.md`](../../ssh-gateway/README-JUMP-HOST.md) | il jump host lato utente |
 | [`../../../scripts/perf/staging/jump/`](../../../scripts/perf/staging/jump/) | le tre fasi: `jump_lat`, `jump_hol`, `jump_stab` |

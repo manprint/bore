@@ -4,7 +4,7 @@
 > secret tunnels served to stock `ssh -R`/`-L` clients). Date: 2026-07-04.
 > Scope: `src/sshgw.rs`, `src/sshgw_auth.rs`, the `server.rs` demux/accept wiring,
 > the `main.rs` CLI, and the two test suites (`tests/ssh_gateway_test.rs`,
-> `scripts/ssh_gateway_test.sh`). Companion to `docs/SSH_GATEWAY.md`.
+> `scripts/ssh_gateway_test.sh`). Companion to `docs/ssh-gateway/SSH_GATEWAY.md`.
 
 ## Verdict
 

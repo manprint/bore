@@ -194,7 +194,7 @@ services:
       # is preferred, so a future change to the tested defaults is picked up. The first
       # three CONFLICT with BORE_UDP_MEMORY_BUDGET above.
       # KEEP THE 16:1 RATIO between connection and stream window: 64MiB there caused
-      # the vhost "asset stuck pending" stall (docs/VHOST_UDP_CONCURRENCY_FIX.md).
+      # the vhost "asset stuck pending" stall (docs/vhost/VHOST_UDP_CONCURRENCY_FIX.md).
 #      - BORE_UDP_STREAM_RECEIVE_WINDOW=16MiB
 #      - BORE_UDP_CONNECTION_RECEIVE_WINDOW=256MiB
 #      - BORE_UDP_SEND_WINDOW=256MiB
@@ -222,7 +222,7 @@ services:
       # --- SSH ingress gateway (opt-in; disabled here) ---
       # With no BORE_SSH_PORT, SSH demuxes onto the SAME 443:7835 mapping
       # above alongside TLS/HTTP/native bore — no extra port to publish. See
-      # docs/SSH_GATEWAY.md. Requires an authorized-keys dir and/or a
+      # docs/ssh-gateway/SSH_GATEWAY.md. Requires an authorized-keys dir and/or a
       # password file (generate with `bore hash-password`) mounted below.
       # - BORE_SSH_GATEWAY=true
       # - BORE_SSH_HOST_KEY_FILE=/etc/bore/ssh/host_key.pem

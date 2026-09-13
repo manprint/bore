@@ -17,7 +17,7 @@ snapshot tests). Model per phase noted inline.
 - ✅ Phase 1: gate flip to `cfg(all(feature="vpn", any(target_os="linux", target_os="macos")))`.
 - ✅ Phases 2–3: utun `create_tun` (single-queue, no-offload); `NetConfig::apply`/`Drop`/`stale_reclaim` for macOS (routes, sysctl, PF anchor).
 - ✅ Phase 4–5: edge cases + e2e + CI matrix green (build + `clippy -D warnings` + unit suite + smoke test examples/macos_vpn_spike.rs).
-- **Full phased status:** see [docs/plans/plan_VpnMacosCompletion/](../../plans/plan_VpnMacosCompletion/).
+- **Full phased status:** see [docs/plans/plan_VpnMacosCompletion/](../plans/plan_VpnMacosCompletion/).
 - ⏳ DEFERRED (v1): two-host manual acceptance `docs/vpn/VPN_MACOS_ACCEPTANCE.md` (T-MAC-MANUAL) — CI is single-host, PF rules already validated.
 
 ---

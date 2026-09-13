@@ -27,7 +27,7 @@ All findings below are fixed in the working tree. Gate: `cargo fmt --check` clea
 | F3 | fixed | `main.rs::parse_vhost_target` accepts hostnames + `:port` + IPv6 | `parse_vhost_target_accepts_*/rejects_malformed` |
 | F4 | fixed | `handle_https` routes via `extract_subdomain(host, base_domain)`; `extract_subdomain_from_registry` deleted | `vhost_https_rejects_foreign_base_domain` (E2E) |
 | F5 | fixed | reload forces TLS swap on cert/key **path** change | covered by `vhost_config_hot_reload`; cert-DER inspection deferred (see file note) |
-| F6 | fixed (documented + warned) | reload `warn!`s on mode/port change; `docs/VHOST.md` says restart-only | — |
+| F6 | fixed (documented + warned) | reload `warn!`s on mode/port change; `docs/vhost/VHOST.md` says restart-only | — |
 | F7 | fixed | no-terminator head returned unchanged; cap 8→16 KiB | `rewrite_head_without_terminator_is_returned_unchanged` |
 | F8 | fixed | single `cert_present(cfg)` helper used everywhere | existing mode tests |
 | F9 | fixed | `debug!` on every 502 (no subdomain / no provider) | — |

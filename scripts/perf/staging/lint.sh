@@ -191,13 +191,17 @@ else
 fi
 
 # --------------------------------------------------------------- compiler 10
-# A campaign's documents get REORGANISED -- moved into a dated folder, split by
-# component -- and every relative link inside them silently becomes a lie. The
-# move of 2026-09-13 broke 11 of 14 links in one pass, and a broken link in an
-# evidence document is worse than a missing one: it reads as if the reference
-# had been checked. A human re-checking 67 links by hand will not do it twice.
+# Documents get REORGANISED -- moved into folders, split by component -- and
+# every relative link inside them silently becomes a lie. Two passes on
+# 2026-09-13 broke 11 of 14 links and then 16 more, and the tidy-up ALSO found
+# 59 links that had been broken for far longer with nobody noticing. A broken
+# link in a document is worse than a missing one: it reads as if the reference
+# had been checked. A human re-checking 247 links by hand will not do it twice.
+#
+# Targets that are pure prose ("write docs/CHANGELOG.md one day") are NOT links
+# and are deliberately out of scope: this checks `](path)` and nothing else.
 echo
-echo "== every link inside a campaign folder resolves =="
+echo "== every relative link under docs/ resolves =="
 links=0
 broken=0
 while IFS= read -r doc; do
@@ -205,6 +209,9 @@ while IFS= read -r doc; do
     while IFS= read -r target; do
         [ -z "$target" ] && continue
         case "$target" in http://*|https://*|"#"*|mailto:*) continue ;; esac
+        # Un bersaglio con metacaratteri non e' un percorso: e' un pattern grep
+        # dentro uno span di codice, che `](` fa sembrare un link.
+        case "$target" in *[\\*\'\"\`]*) continue ;; esac
         links=$((links + 1))
         t=${target%%#*}
         [ -z "$t" ] && continue
@@ -213,8 +220,8 @@ while IFS= read -r doc; do
             *)      cand="$dir/$t" ;;
         esac
         [ -e "$cand" ] || { echo "  ${doc#"$ROOT/"} -> $target"; broken=$((broken + 1)); }
-    done < <(grep -oE '\]\([^)]+\)' "$doc" | sed 's/^\](//; s/)$//')
-done < <(find "$ROOT/docs" -path '*/campagna-*' -name '*.md' -type f | LC_ALL=C sort)
+    done < <(grep -oE '\]\([^)[:space:]]+\)' "$doc" | sed 's/^\](//; s/)$//')
+done < <(find "$ROOT/docs" -name '*.md' -type f | LC_ALL=C sort)
 if [ "$broken" -gt 0 ]; then
     echo "FAIL -- $broken broken link(s) out of $links; a document that moves takes its references with it"
     fail=1

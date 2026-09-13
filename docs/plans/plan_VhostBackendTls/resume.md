@@ -46,7 +46,7 @@ Status values: `TODO` · `IN_PROGRESS` · `DONE` · `SKIPPED` · `BLOCKED`
 | File | Status | Notes |
 |------|--------|-------|
 | README.md (vhost section) | `DONE` | --backend-tls / --backend-tls-sni table rows + examples + security note (verification-skipped) |
-| README.md (SSH gateway section) / docs/SSH_GATEWAY.md | `DONE` | exec-param table row + example; SSH_GATEWAY.md §3 row + new §6.14 (security caveat) |
+| README.md (SSH gateway section) / docs/ssh-gateway/SSH_GATEWAY.md | `DONE` | exec-param table row + example; SSH_GATEWAY.md §3 row + new §6.14 (security caveat) |
 | docs/vhost/ | `TODO` | flag reference if a dedicated doc exists |
 | CLAUDE.md | `DONE` | backend-TLS invariant bullet added under vhost notes |
 
@@ -116,7 +116,7 @@ Status values: `TODO` · `IN_PROGRESS` · `DONE` · `SKIPPED` · `BLOCKED`
   array. VHOST intentionally does NOT warn (applicable there).
 - Banner: `VhostBannerInfo` +`backend_tls`; `vhost_info_banner` emits
   `Backend: TLS (certificate verification disabled)` only when set.
-- docs/SSH_GATEWAY.md: §6.11 is the banner section and is referenced elsewhere —
+- docs/ssh-gateway/SSH_GATEWAY.md: §6.11 is the banner section and is referenced elsewhere —
   did NOT renumber; added backend-tls as new §6.14 and pointed the §3 table row
   at §6.14.
 

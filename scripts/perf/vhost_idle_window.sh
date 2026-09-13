@@ -16,7 +16,7 @@
 # WHY IT IS SOUND ON LOOPBACK
 # ---------------------------
 # Throughput and the injected-flush class false-pass on loopback and must be
-# measured on a real network (see docs/VHOST_INJECTED_FLUSH_FIX.md). A DEADLINE
+# measured on a real network (see docs/vhost/VHOST_INJECTED_FLUSH_FIX.md). A DEADLINE
 # does not: the mechanism under test is a quinn timer, and the staging
 # measurement in docs/performance/ is reproduced here to the millisecond,
 # counters included. Everything runs inside a ROOTLESS network namespace

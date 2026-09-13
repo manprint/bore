@@ -22,8 +22,8 @@
 - Feature lives in `src/transfer.rs` (~3816 lines), dispatched from `src/main.rs`
   (`TransferCommand::Listener` / `TransferCommand::Sender`).
 - Tests: `tests/transfer_test.rs` (35), `tests/transfer_stdin_cli_test.rs` (15), in-module
-  `#[cfg(test)]` units (~36). Docs: `README.md` transfer section, `docs/TRANSFER_FEASIBILITY.md`,
-  `docs/TRANSFER_TEST_MATRIX.md`, `docs/TRANSFER_UPGRADE_PLAN.md`.
+  `#[cfg(test)]` units (~36). Docs: `README.md` transfer section, `docs/transfer/TRANSFER_FEASIBILITY.md`,
+  `docs/transfer/TRANSFER_TEST_MATRIX.md`, `docs/transfer/TRANSFER_UPGRADE_PLAN.md`.
 - **Known pre-existing flaky/failing tests (NOT introduced by you, do not "fix" by hiding):**
   `admin_test`, `secret_test`, and stdin-injected `receiver_ask_confirm_*`. Confirm the
   baseline with `git stash` if a failure looks new; the bar is "no NEW regressions".
@@ -591,7 +591,7 @@ flag tables (both sides, including new flags + defaults), resume semantics + bre
 collision policies, stdin limitations, idempotent re-completion, timeouts, persistent mode
 constraint, and the protocol sequence diagram from the top of this file.
 
-## P6.3 — `docs/TRANSFER_TEST_MATRIX.md`
+## P6.3 — `docs/transfer/TRANSFER_TEST_MATRIX.md`
 Add rows for every test added in P1–P5; move the now-closed items out of "coverage gaps"
 (oversized-len, stdin temp cleanup, confirm timeout, stall timeout, idempotent re-completion,
 persistent drain). Re-state remaining gaps honestly (real-tty input, >10 GiB files,

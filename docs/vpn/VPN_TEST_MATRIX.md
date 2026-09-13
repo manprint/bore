@@ -68,7 +68,7 @@ This document maps every §16 acceptance criterion from `VPN_FULL_PLAN_V1.md` to
 | 16.7.8 | Pool exhausted → `VpnError` naming pool | Automated | `test_vpn_pool_exhaustion` (create many links, exhaust pool) | PASS |
 | 16.7.9 | Overlapping subnets → `VpnError` listing CIDRs | Automated | `test_vpn_overlap_detection` (both sides advertise overlapping ranges) | PASS |
 | **§16.8 Troubleshooting** ||||
-| 16.8.1 | Link pairs but no ping → check `path=` in logs; if relay, run `bore test-udp` | Automated | Documented in `docs/VPN.md` troubleshooting section | N/A |
+| 16.8.1 | Link pairs but no ping → check `path=` in logs; if relay, run `bore test-udp` | Automated | Documented in `docs/vpn/VPN.md` troubleshooting section | N/A |
 | 16.8.2 | Ping ok, TCP slow → MTU: try `--mtu 1280`; check MSS-clamp rule on gateway | Automated | Documented; manual steps in VPN.md | N/A |
 | 16.8.3 | Works from gateway, not from LAN hosts → LAN router lacks route via gateway | Automated | Documented; site↔site topology note in VPN.md | N/A |
 
@@ -337,7 +337,7 @@ host-bit assertions and T-NAT3. Opus acceptance gate (Phase 5.6 equivalent): **s
 2. Manual procedures 16.5.4 and 16.6.8 are **executable** and their **expected output matches**.
 3. `cargo fmt`, `cargo clippy --all-targets --features vpn -- -D warnings`, `cargo test --features vpn`, `cargo test` (default), `cargo build --no-default-features` all green.
 4. This matrix is fully populated (no empty test name cells).
-5. `docs/VPN.md`, `docs/VPN_TEST_MATRIX.md`, README.md VPN section, and CLAUDE.md updates are complete and reviewed.
+5. `docs/vpn/VPN.md`, `docs/vpn/VPN_TEST_MATRIX.md`, README.md VPN section, and CLAUDE.md updates are complete and reviewed.
 
 ---
 

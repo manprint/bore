@@ -535,7 +535,7 @@ Coperto in §2.6 (4 strati + takeover). Aggiunte specifiche:
 | CLI | `src/main.rs` | Flag `--ssh-gateway*`, sottocomando `bore hash-password` |
 | Build | `Cargo.toml` | feature `ssh-gateway` (russh, argon2) |
 | Test | `tests/`, `scripts/ssh_gateway_test.sh` | Unit + e2e netns + CI |
-| Docs | `docs/SSH_GATEWAY.md` (questo file → guida utente), compose | Esempi, security notes |
+| Docs | `docs/ssh-gateway/SSH_GATEWAY.md` (questo file → guida utente), compose | Esempi, security notes |
 
 Invarianti da sancire nel piano: **I-SSH1** (flag off ⇒ byte-identico), **I-SSH2** (parametri
 non supportati via SSH ⇒ warn esplicito, mai silenzio), **I-SSH3** (keepalive 20 s/reaper 60 s
@@ -1124,7 +1124,7 @@ separano i pool. Ogni sessione usa un solo stream bidi. Nessun STUN/hole-punch: 
 diala il server pubblico. I carrier TCP restano caldi; assenza/errore QUIC fa fallback
 immediato della stessa sessione, mentre il client rinnova solo il deficit. Il provider
 OpenSSH puro resta TCP-only. Configurazione Compose, tabella completa dei flag e chiavi:
-[SSH jump hosts](../README.md#ssh-jump-hosts) del README, fonte operativa primaria.
+[SSH jump hosts](../../README.md#ssh-jump-hosts) del README, fonte operativa primaria.
 
 Ogni alias applica il proprio `max-conns`; l'apertura verso il provider ha timeout 15 s e
 failover sugli altri carrier vivi. Permit, contatore connessioni e riga admin sono RAII:

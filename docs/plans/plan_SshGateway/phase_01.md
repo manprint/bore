@@ -7,7 +7,7 @@
 Context (self-contained): bore is an async Rust tunnel server (`#![forbid(unsafe_code)]`,
 edition 2021). The plan adds an embedded SSH ingress. This phase only adds the feature
 gate, empty modules, and a spike test validating the russh API. Design reference:
-`docs/SSH_GATEWAY.md`.
+`docs/ssh-gateway/SSH_GATEWAY.md`.
 
 ---
 
@@ -41,7 +41,7 @@ gate, empty modules, and a spike test validating the russh API. Design reference
   - **T-SSH-SPIKE3 (direct-tcpip):** client runs `-N -L <lport>:testname:0 ...`; test connects to `127.0.0.1:<lport>`, writes `b"ping"`; assert handler's `channel_open_direct_tcpip` sees host `"testname"` port `0`, echo back over the channel stream, client socket reads `b"ping"`.
   - **T-SSH-SPIKE4 (exec + env):** client runs `-o SetEnv=BORE_NOTES=spike ... 'notes=cli'`; assert handler receives env `BORE_NOTES=spike` (requires `-o SendEnv=BORE_*`? record actual behavior) and exec string `notes=cli`; server writes a line to the channel and asserts the client prints it (capture ssh stdout).
   - **T-SSH-SPIKE5 (keepalive):** client runs with `-o ServerAliveInterval=1 -o ServerAliveCountMax=2 -N -R ...`; server answers global requests (record which russh hook fires for `keepalive@openssh.com`); assert the session is still alive after 5 s. Also record how the server can SEND a global request to the client (needed for I-3) — if russh cannot send `keepalive@openssh.com` from the server side, record the fallback (e.g. `SSH_MSG_IGNORE`/channel window probe) in the findings file.
-  Write `SPIKE_FINDINGS.md`: one bullet per primitive — exact russh version pinned, handler method names/signatures actually used, any deviation from the design assumptions in `docs/SSH_GATEWAY.md` §1, and the server-initiated-keepalive answer. Phases 4-6 implementers read this file INSTEAD of re-discovering the API.
+  Write `SPIKE_FINDINGS.md`: one bullet per primitive — exact russh version pinned, handler method names/signatures actually used, any deviation from the design assumptions in `docs/ssh-gateway/SSH_GATEWAY.md` §1, and the server-initiated-keepalive answer. Phases 4-6 implementers read this file INSTEAD of re-discovering the API.
 - **Unit tests:** the five tests above are the tests.
 - **e2e tests:** T-SSH-SPIKE1..5 (cargo, feature-gated).
 - **Done:** `cargo test --features ssh-gateway --test ssh_gateway_spike_test` green locally; `SPIKE_FINDINGS.md` written; default-features `cargo test` untouched and green.

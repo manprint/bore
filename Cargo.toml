@@ -41,7 +41,7 @@ default = ["udp"]
 udp = ["dep:quinn", "dep:rcgen", "dep:igd-next"]
 vpn = ["udp", "dep:tun-rs", "dep:bore-wintun", "dep:bore-android-tun"]
 # Embedded SSH ingress (russh) letting a stock OpenSSH client create public,
-# vhost and secret tunnels via `ssh -R`/`-L`. Off by default; see docs/SSH_GATEWAY.md.
+# vhost and secret tunnels via `ssh -R`/`-L`. Off by default; see docs/ssh-gateway/SSH_GATEWAY.md.
 ssh-gateway = ["dep:russh", "dep:argon2", "dep:password-hash", "dep:ssh-key", "dep:rand"]
 
 [dependencies]

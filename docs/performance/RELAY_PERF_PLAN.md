@@ -95,7 +95,7 @@ frames are small, a total deadline is correct there. Default stays 60 s.
 - `README.md` / `USER_GUIDE.md`: `--carriers 0` auto behavior; relay vs UDP perf notes.
 - `CLAUDE.md`: update the carriers invariant (default now `0`/auto; `carriers=1` still the
   byte-for-byte single path).
-- `docs/TRANSFER_TEST_MATRIX.md`: new test rows.
+- `docs/transfer/TRANSFER_TEST_MATRIX.md`: new test rows.
 
 ## CI gates (per CLAUDE.md)
 `cargo fmt` · `cargo clippy -- -D warnings` · `cargo test` (full). Zero regressions.

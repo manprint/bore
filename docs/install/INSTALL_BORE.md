@@ -102,7 +102,7 @@ Every non-VPN subcommand (`local`, `proxy`, `server`, `vhost`, `transfer`,
 `connect` additionally needs:
 
 - **`wintun.dll`** next to `bore.exe` (already bundled in the release zip —
-  see [docs/vpn/VPN_WINDOWS.md](vpn/VPN_WINDOWS.md) for the pinned version/
+  see [docs/vpn/VPN_WINDOWS.md](../vpn/VPN_WINDOWS.md) for the pinned version/
   hash and the redistribution rationale) or pointed to via the
   `BORE_WINTUN_DLL` environment variable if you keep it elsewhere.
 - **An elevated (Administrator) shell.** Right-click PowerShell/cmd → "Run as

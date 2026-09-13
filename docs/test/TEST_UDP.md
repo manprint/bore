@@ -7,7 +7,7 @@ traversata.
 
 > Per la **teoria** (come funziona l'hole-punch) e la **matrice completa
 > provider×consumer** di NAT/firewall con i rimedi da amministratore, vedi
-> [`NAT_TRAVERSAL.md`](NAT_TRAVERSAL.md).
+> [`NAT_TRAVERSAL.md`](../nat/NAT_TRAVERSAL.md).
 
 ---
 

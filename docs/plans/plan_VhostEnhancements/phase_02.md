@@ -195,7 +195,7 @@ so it needs no deployment access.
 
 ## 2.5 — Documentation
 
-**Files:** `README.md`, `docs/VHOST_UDP_CONCURRENCY_FIX.md`, `CLAUDE.md`
+**Files:** `README.md`, `docs/vhost/VHOST_UDP_CONCURRENCY_FIX.md`, `CLAUDE.md`
 
 - The sizing rule, stated as arithmetic:
   `tunnels × carriers × connection_receive_window` ≤ available RAM, with the
@@ -203,7 +203,7 @@ so it needs no deployment access.
 - The new budget flag, in `README.md` (single source of truth) with an example.
 - `CLAUDE.md`: extend the existing `--udp` window invariant with the aggregate
   bound and the reason the per-connection ratio still may not be reduced.
-- `docs/VHOST_UDP_CONCURRENCY_FIX.md` gains the F-13 measurements: the 4.5×
+- `docs/vhost/VHOST_UDP_CONCURRENCY_FIX.md` gains the F-13 measurements: the 4.5×
   relay-versus-QUIC RSS ratio and the 536.8 MiB single-tunnel figure.
 
 ## Phase acceptance

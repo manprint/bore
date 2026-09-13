@@ -654,10 +654,10 @@ Per `CLAUDE.md`, docs are part of the deliverable.
 **7.1 `README.md`** — add a `vhost` section: the command, the produced URL, a `vhost.yml`
 example, the mode table, and the wildcard-cert/DNS prerequisite
 (`*.bore.mydomain.com` + `bore.mydomain.com` → public IP).
-**7.2 `docs/`** — add `docs/VHOST.md` (user guide) and a `vhost.yml` reference (every field,
+**7.2 `docs/`** — add `docs/vhost/VHOST.md` (user guide) and a `vhost.yml` reference (every field,
 defaults, hot-reload behavior, header precedence, modes).
-**7.3 Test matrix** — add `docs/VHOST_TEST_MATRIX.md` mirroring the style of
-`docs/TRANSFER_TEST_MATRIX.md`: one row per scenario with the covering test name and status,
+**7.3 Test matrix** — add `docs/vhost/VHOST_TEST_MATRIX.md` mirroring the style of
+`docs/transfer/TRANSFER_TEST_MATRIX.md`: one row per scenario with the covering test name and status,
 plus a "coverage gaps / future work" section listing: QUIC tunnel transport, multi-map per
 command, full per-request header injection on keep-alive, SNI-based multi-cert, nested
 subdomain labels, per-client distinct secrets.
@@ -698,7 +698,7 @@ subdomain labels, per-client distinct secrets.
   `cargo test` all pass on the final tree (also `--all-features` for the udp-gated paths).
 - The default (no `--vhost-config`) server behavior is **byte-for-byte unchanged** — verify
   by running the full pre-existing suite with zero modifications to existing tests' meaning.
-- `README.md`, `docs/VHOST.md`, the `vhost.yml` reference, and `docs/VHOST_TEST_MATRIX.md`
+- `README.md`, `docs/vhost/VHOST.md`, the `vhost.yml` reference, and `docs/vhost/VHOST_TEST_MATRIX.md`
   are written and accurate.
 - Every "Tests for Phase N" bullet has a corresponding, passing test.
 - All invariants in §2 hold. No `unsafe`. No new dependency beyond the one YAML crate.
@@ -719,6 +719,6 @@ subdomain labels, per-client distinct secrets.
 | `src/admin.rs` | add `Role::Vhost` and extend all `Role` matches |
 | `src/main.rs` | `bore vhost` subcommand + `VhostOptions`; server `--vhost-*` flags |
 | `tests/vhost_test.rs` | **NEW** — all integration tests above |
-| `README.md`, `docs/VHOST.md`, `docs/VHOST_TEST_MATRIX.md` | **NEW/updated** docs |
+| `README.md`, `docs/vhost/VHOST.md`, `docs/vhost/VHOST_TEST_MATRIX.md` | **NEW/updated** docs |
 
 Implement deliberately, test as you go, keep every gate green. Good luck.

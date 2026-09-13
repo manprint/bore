@@ -148,7 +148,7 @@ single-connection direct path (by design).
 
 | ID | Sev | Status | Issue |
 |----|-----|--------|-------|
-| BUG-LP1 | LOW (UX/correctness) | **fixed, then superseded** | Public `bore local` silently dropped every direct-path-only flag and still logged `"resolved UDP optimization settings"`. First fixed with a `warn!` + scoped log. **Now superseded:** `bore local --udp` on a public tunnel is a real feature (server→client QUIC direct path, mirrors vhost) — see `docs/LOCAL_UDP_PLAN.md`. `--udp` works; only the hole-punch helper flags (`--upnp`/`--stun-server`/`--try-port-prediction`/`--nat-udp-*`) remain secret-only and still `warn!` on a public tunnel. |
+| BUG-LP1 | LOW (UX/correctness) | **fixed, then superseded** | Public `bore local` silently dropped every direct-path-only flag and still logged `"resolved UDP optimization settings"`. First fixed with a `warn!` + scoped log. **Now superseded:** `bore local --udp` on a public tunnel is a real feature (server→client QUIC direct path, mirrors vhost) — see `docs/local/LOCAL_UDP_PLAN.md`. `--udp` works; only the hole-punch helper flags (`--upnp`/`--stun-server`/`--try-port-prediction`/`--nat-udp-*`) remain secret-only and still `warn!` on a public tunnel. |
 | (prior) | — | already fixed | Slowloris TLS-handshake permit pin (timeout) and non-uniform per-conn logging — see `LOCAL_PROXY_TESTUDP_AUDIT.md`. |
 
 Re-verified as **NOT bugs** (carried from the prior audit, still valid): `mux::drive`
@@ -205,10 +205,10 @@ secrets.
 
 | Doc | Issue | Action |
 |-----|-------|--------|
-| `docs/LOCAL_PROXY_TESTUDP_AUDIT.md` | Says **"64 KiB copy buffers"** — actual default is **256 KiB** (`shared.rs:43`). Stale since the buffer was bumped. | Fix to 256 KiB. |
+| `docs/local/LOCAL_PROXY_TESTUDP_AUDIT.md` | Says **"64 KiB copy buffers"** — actual default is **256 KiB** (`shared.rs:43`). Stale since the buffer was bumped. | Fix to 256 KiB. |
 | README + `local`/`proxy` `--help` | `--udp` described as "secret tunnels only" but no note that it is a **no-op on public tunnels**, nor that `--udp` is a *transport*, not UDP-app forwarding. | Add a one-line clarification (ties to BUG-LP1). |
 | README / secret-tunnel docs | Non-root `SO_*BUF` clamp (Ceiling 1) and its `sysctl` remediation are documented only for VPN, not for secret `--udp` tunnels. | Add a "direct-path throughput on unprivileged hosts" note. |
-| `docs/CARRIER_TUNING.md` / README | Re-confirm the "single flow ⇒ one carrier" + "direct ignores carriers for secret" statements still match code (they do) — no change, just verify on edit. | Verify. |
+| `docs/campagna-2026-09-13/public/CARRIER_TUNING.md` / README | Re-confirm the "single flow ⇒ one carrier" + "direct ignores carriers for secret" statements still match code (they do) — no change, just verify on edit. | Verify. |
 
 ---
 

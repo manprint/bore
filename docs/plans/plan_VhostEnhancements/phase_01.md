@@ -272,7 +272,7 @@ only — `sudo bash scripts/...` prompts and must not be used).
 
 ## 1.6 — Documentation
 
-**Files:** `README.md`, `docs/VHOST_PLAN.md` or `docs/vhost/`, `CLAUDE.md`
+**Files:** `README.md`, `docs/vhost/VHOST_PLAN.md` or `docs/vhost/`, `CLAUDE.md`
 
 - `README.md`: the vhost section states that a provider sends a control
   heartbeat every 20 s and that a server reaps a silent registration after

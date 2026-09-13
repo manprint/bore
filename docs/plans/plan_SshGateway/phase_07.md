@@ -61,17 +61,17 @@ Docker: root `Dockerfile` builds `--features vpn` at lines 32 and 45; compose fi
 
 ### 7.4 Documentation
 - **Model:** Haiku (draft) — content reviewed in 7.5
-- **Files:** `docs/SSH_GATEWAY.md` (update), `CLAUDE.md` (add invariants block), `README.md` (one feature bullet + link)
+- **Files:** `docs/ssh-gateway/SSH_GATEWAY.md` (update), `CLAUDE.md` (add invariants block), `README.md` (one feature bullet + link)
 - **Change:**
-  1. `docs/SSH_GATEWAY.md`: flip status header to implemented; append a "Guida operativa" section: final verified commands (from the e2e tests, not from the analysis draft), `~/.ssh/config` block, systemd unit, autossh env, `bore hash-password` usage, host-key fingerprint pinning, key provisioning walkthrough, troubleshooting table (forward rejected / name in use / warning lines). Keep the analysis sections intact (they are the design record).
+  1. `docs/ssh-gateway/SSH_GATEWAY.md`: flip status header to implemented; append a "Guida operativa" section: final verified commands (from the e2e tests, not from the analysis draft), `~/.ssh/config` block, systemd unit, autossh env, `bore hash-password` usage, host-key fingerprint pinning, key provisioning walkthrough, troubleshooting table (forward rejected / name in use / warning lines). Keep the analysis sections intact (they are the design record).
   2. `CLAUDE.md`: add a compact SSH-gateway block in the invariants style of the existing file: I-SSH1..5 (one line each), the D1 naming heuristic, the "SSH leg = TCP relay only, never UDP/carriers" rule, and the netns invocation line for `ssh_gateway_test.sh`.
-  3. `README.md`: one bullet in the feature list + link to docs/SSH_GATEWAY.md.
+  3. `README.md`: one bullet in the feature list + link to docs/ssh-gateway/SSH_GATEWAY.md.
 - **Unit tests:** n/a. **e2e tests:** n/a.
 - **Implementation note:** README has no single bulleted "Features" list (prose-based, `####`
   subsections per capability) — added a new `#### SSH ingress gateway` subsection next to the
   other server-side ingress features (Admin status page, Secret tunnels) instead, matching the
   file's actual structure rather than the plan text's literal "feature list" wording.
-- **Done:** every command in `docs/SSH_GATEWAY.md` §6 was actually executed against a real local
+- **Done:** every command in `docs/ssh-gateway/SSH_GATEWAY.md` §6 was actually executed against a real local
   server (`--release --features vpn,ssh-gateway` build) during the writing of this section —
   outputs quoted verbatim (host-key fingerprint, `bore hash-password` hash, `curl` bodies, exact
   OpenSSH rejection/error text for permit=/wrong-password/name-in-use-takeover), not

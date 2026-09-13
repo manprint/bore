@@ -12,8 +12,8 @@
 | 2 — Vhost wire + per-subdomain router (G2,G5) | phase_03.md | `DONE` | VhostEntry.https_policy + helpers; per-subdomain redirect; warning after VhostReady; T-HP-VH1..4 green; cargo test 3x green |
 | 3 — Native CLI unification (G3) | phase_04.md | `DONE` | `--https[=off\|on\|redirect]` on local+vhost (require_equals); `--force-https` deprecated→redirect; wired to TunnelOptions+ProviderMeta; parse tests green |
 | 4 — SSH gateway apply (G4) | phase_05.md | `DONE` | Params.https_policy (off/on/redirect parse+reconcile); vhost APPLIES policy (VhostEntry+admin flags); https/force-https no longer warned inapplicable on vhost (max-conns still is); downgrade notice; banner HTTPS policy line; I-SSH8 flip test rewritten + cert-redirect e2e added |
-| 5 — Startup param logging (G6) | phase_06.md | `DONE` | §5.1: clap structure prevents most inapplicable flags; local already warns on public tunnel re: secret-only UDP flags. No code change needed. §5.2: added param-applicability matrix table to docs/VHOST.md (22 rows × 6 columns: native local/vhost/proxy, SSH public/vhost/secret) |
-| 6 — PTY docs (G7) | phase_07.md | `DONE` | §6.1: added "Harmless client messages" subsection to docs/SSH_GATEWAY.md (§6.12, Italian) and README-SSH-GATEWAY.md (§11, Italian); explains PTY alloc failure + Allocated port placeholder. Recommends `-T` over `-N`. §6.2: SKIPPED — no code change to pty_request (is correct); docs-only sufficient. Renumbered subsequent README sections 11→12, 12→13 |
+| 5 — Startup param logging (G6) | phase_06.md | `DONE` | §5.1: clap structure prevents most inapplicable flags; local already warns on public tunnel re: secret-only UDP flags. No code change needed. §5.2: added param-applicability matrix table to docs/vhost/VHOST.md (22 rows × 6 columns: native local/vhost/proxy, SSH public/vhost/secret) |
+| 6 — PTY docs (G7) | phase_07.md | `DONE` | §6.1: added "Harmless client messages" subsection to docs/ssh-gateway/SSH_GATEWAY.md (§6.12, Italian) and README-SSH-GATEWAY.md (§11, Italian); explains PTY alloc failure + Allocated port placeholder. Recommends `-T` over `-N`. §6.2: SKIPPED — no code change to pty_request (is correct); docs-only sufficient. Renumbered subsequent README sections 11→12, 12→13 |
 | 7 — Final e2e + docs + review | phase_08.md | `DONE` | README.md updated; full gate green (fmt/clippy/cargo test --all-features 0 fails); netns ssh 11/0 + vhost 13/0 (zero regression); Opus coherence sign-off (I-2/I-5/I-6 verified) |
 
 Status values: `TODO` · `IN_PROGRESS` · `DONE` · `SKIPPED` · `BLOCKED`
@@ -59,8 +59,8 @@ Status values: `TODO` · `IN_PROGRESS` · `DONE` · `SKIPPED` · `BLOCKED`
 
 | File | Status | Notes |
 |------|--------|-------|
-| docs/VHOST.md | `DONE` | --https client-flag row, D10 caveat, param applicability matrix |
-| docs/SSH_GATEWAY.md | `DONE` | PTY "Harmless client messages" §6.12 |
+| docs/vhost/VHOST.md | `DONE` | --https client-flag row, D10 caveat, param applicability matrix |
+| docs/ssh-gateway/SSH_GATEWAY.md | `DONE` | PTY "Harmless client messages" §6.12 |
 | README.md | `DONE` | bore local + bore vhost --https[=off\|on\|redirect]; --force-https deprecated |
 | README-SSH-GATEWAY.md | `DONE` | PTY / -T note §11 |
 

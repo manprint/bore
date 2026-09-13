@@ -78,7 +78,7 @@ Run on 2026-08-05 with all features:
   pure providers, provider gateway auth by key and password, inner target key
   and password auth, two forwards in one session, takeover/collisions, wrong
   username/port, carrier pool, liveness reaper and alias reclaim.
-- Updated README as the operational source of truth, `docs/SSH_GATEWAY.md`, and
+- Updated README as the operational source of truth, `docs/ssh-gateway/SSH_GATEWAY.md`, and
   `examples_usage.md`: Compose adds only
   `BORE_SSH_JUMP_BASE_DOMAIN=ssh.bore.0912345.xyz`; no 8443 mapping is needed;
   Phase 2 is explicitly TCP-only while existing `443/udp` remains unchanged.

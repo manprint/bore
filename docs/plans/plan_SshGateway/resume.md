@@ -51,7 +51,7 @@ against the same `--release --features vpn,ssh-gateway` binary on 2026-07-04: `s
 | File | Status | Notes |
 |------|--------|-------|
 | docs/plans/plan_SshGateway/SPIKE_FINDINGS.md | `DONE` | written in phase 1.2 |
-| docs/SSH_GATEWAY.md (operational guide + status flip) | `DONE` | status header flipped to implemented; new §6 Guida operativa, every command verified against a real local server (2026-07-04) |
+| docs/ssh-gateway/SSH_GATEWAY.md (operational guide + status flip) | `DONE` | status header flipped to implemented; new §6 Guida operativa, every command verified against a real local server (2026-07-04) |
 | CLAUDE.md (I-SSH block) | `DONE` | compact I-SSH1..5 + D1 + demux block added, includes the reference-cycle bug and fix |
 | README.md (feature bullet) | `DONE` | new `#### SSH ingress gateway` subsection (README has no single bulleted feature list; matched the file's actual `####`-per-capability structure instead) |
 

@@ -37,8 +37,8 @@
 
 ### 5.2 Param-applicability matrix doc
 - **Model:** Haiku
-- **Files:** `docs/VHOST.md` (append a section) and/or a new small table referenced
-  from `docs/SSH_GATEWAY.md`. Follow the existing docs structure — do NOT create a
+- **Files:** `docs/vhost/VHOST.md` (append a section) and/or a new small table referenced
+  from `docs/ssh-gateway/SSH_GATEWAY.md`. Follow the existing docs structure — do NOT create a
   new directory; these files already exist.
 - **Change:** Add one table: rows = every user-facing param (https, force-https,
   basic-auth, webserver-log, max-conns, carriers, udp, auto-reconnect, notes,
@@ -49,7 +49,7 @@
   inapplicable at `803-813`,`1002-1014`).
 - **Unit tests:** none.
 - **e2e tests:** none.
-- **Done:** the matrix table renders in `docs/VHOST.md`; every cell matches actual
+- **Done:** the matrix table renders in `docs/vhost/VHOST.md`; every cell matches actual
   code behavior after phases 1-5.
 
 ---
@@ -64,4 +64,4 @@
 ## Phase done criterion
 
 The native client warns for each set-but-inapplicable flag (parity with SSH
-I-SSH8), and `docs/VHOST.md` carries an accurate param-applicability matrix.
+I-SSH8), and `docs/vhost/VHOST.md` carries an accurate param-applicability matrix.

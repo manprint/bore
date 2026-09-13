@@ -181,10 +181,34 @@ services:
       # ------------------------------------------------------------------
       # bore asks every QUIC endpoint's socket for 16MiB inside the endpoint
       # constructor, and the kernel SILENTLY CLAMPS that request to
-      # net.core.rmem_max / net.core.wmem_max. Stock Ubuntu/AWS ship 212992
-      # bytes, so the server's SHARED endpoint -- the one serving the direct
-      # path of every vhost, public and ssh-jump tunnel in this process -- ran
-      # on 208KiB, which at 111 MB/s holds 1.9 ms of traffic. MEASURED
+      # net.core.rmem_max / net.core.wmem_max.
+      #
+      # THE VALUE THAT PRODUCED THE FAILURE IS NOT THE VALUE TO CHECK. P-13's
+      # defect was that the server's SHARED endpoint -- the one serving the
+      # direct path of every vhost, public and ssh-jump tunnel in this process,
+      # and the RECEIVING side of every download -- never ASKED, so it ran on
+      # net.core.rmem_DEFAULT: 212992 bytes, which at 111 MB/s holds 1.9 ms of
+      # traffic. It asks now, and what it gets is min(16MiB, net.core.rmem_MAX).
+      #
+      # CHECK YOUR OWN KERNEL, because that ceiling has moved. MEASURED
+      # 2026-09-13 on two AWS hosts running 7.0.0-*-aws, neither of which
+      # carries a sysctl file for it:
+      #
+      #   net.core.rmem_max      4194304   <- kernel default now 4MiB
+      #   net.core.wmem_max      4194304
+      #   net.core.rmem_default   212992   <- unchanged, and still exactly what
+      #                                       an un-asking socket would get
+      #
+      # Older kernels ship 212992 for all three. So on an older host the clamp
+      # sits 16x below the request and IS the P-13 failure; on 7.0 it sits 4x
+      # below it and still covers the bandwidth-delay product of a 22 ms,
+      # 1 Gbit/s path (2.6 MB) with room left. Raising it to 16MiB has NOT been
+      # measured to buy anything on such a path -- the measurement below is the
+      # 208KiB case, which is 16x smaller. Raise it when bore warns, and when
+      # rate x RTT approaches the ceiling; the socket is ONE per endpoint, so
+      # the rate to use is the server's aggregate, not one tunnel's.
+      #
+      # MEASURED
       # 2026-09-11 (docs/performance/PUBLIC_STAGING_EVIDENCE_2026-09-11.md
       # section 13.1): the direct arm took IN 3.885 GiB to DELIVER 2.279
       # (1.78x -- retransmission, not per-packet overhead) while the relay

@@ -4966,7 +4966,11 @@ segnale si perde **in transito**.
 E il transito è il server. `ClientMessage::TestUdpJoin` porta
 `summary: UdpTestPeerSummary` **al server**, e il server risponde all'altro peer
 con `peer_summary: UdpTestPeerSummary`: lo deserializza nella **propria**
-definizione della struct e lo riserializza. Il campo che V-2 usa come gate,
+definizione della struct e lo riserializza. Non è dedotto dal comportamento —
+è nel tipo: il server tiene `PendingPeer.summary: UdpTestPeerSummary`
+(`src/udp_diagnostic.rs:60`), cioè la struct **tipata**, e da lì la rispedisce
+dentro `ServerMessage::TestUdpStart`. Ciò che la sua definizione non ha, non
+può inoltrarlo. Il campo che V-2 usa come gate,
 `pub checks: bool`, sta in `src/shared.rs:503` — ed è **assente dalla struct**
 alla revisione che il server di staging esegue (`1.0.0 - main - ed50a40f`,
 verificato con `git show ed50a40f:src/shared.rs`). Un campo che il server non

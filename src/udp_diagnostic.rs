@@ -536,10 +536,27 @@ pub async fn run_peer_test(
              — the same path a real tunnel takes)"
         );
     } else {
+        // `checks` arrives FALSE for two different reasons and this line used to
+        // assert the first one. The peer's summary travels to the SERVER
+        // (`ClientMessage::TestUdpJoin`) and comes back to the other peer inside
+        // `peer_summary`, so the server deserializes it into ITS OWN definition
+        // of the struct and re-serializes it: a server older than the field
+        // drops it, both peers read the `#[serde(default)]` false, and each
+        // blames the other. MEASURED 2026-09-13: two peers running the SAME,
+        // newest binary each reported the other as legacy through a server at
+        // `main - ed50a40f`, a revision whose `UdpTestPeerSummary` has no
+        // `checks` field at all. An additive `#[serde(default)]` field is safe
+        // on a POINT-TO-POINT wire; it is not safe across a party that rewrites
+        // the message. The adjacent "Traversal round" line carries an
+        // independent read on the server's vintage, so it is named here rather
+        // than guessed at.
         println!(
-            "Candidate order    : advisory only (peer predates the authenticated check \
-             round; this run uses the legacy blind punch and a real tunnel to this peer \
-             would too)"
+            "Candidate order    : advisory only (the peer's check-round capability did \
+             not arrive — either the peer predates it, or the SERVER does: the summary \
+             is re-serialized by the server, so one older than the field drops it \
+             silently. See the Traversal round line below for an independent read on \
+             the server's vintage.) This run uses the legacy blind punch, and a real \
+             tunnel through this server would too."
         );
     }
     println!(
@@ -927,9 +944,12 @@ async fn run_udp_path(
             brokered,
         );
         if check.is_none() {
+            // Same two causes as the "Candidate order" line above: say both.
             println!(
-                "UDP direct path    : peer does not run the authenticated check round; \
-                 using the legacy blind punch (this is NOT what a current tunnel does)"
+                "UDP direct path    : the authenticated check round is not in use — the \
+                 capability did not arrive from the peer, which means the peer predates \
+                 it OR the server between them dropped it; using the legacy blind punch \
+                 (this is NOT what a current tunnel on a current server does)"
             );
         }
         let conn = match establish_direct(

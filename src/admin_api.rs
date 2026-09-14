@@ -1704,6 +1704,8 @@ reservations:
             direct_quic_keepalive_ms: Some(3_000),
             direct_quic_idle_ms: Some(10_000),
             udp_direct_slots: None,
+            web_transfer_enabled: false,
+            web_transfer_base_origin: None,
             bind_domain: None,
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]
@@ -1800,6 +1802,8 @@ reservations:
             direct_quic_keepalive_ms: Some(3_000),
             direct_quic_idle_ms: Some(10_000),
             udp_direct_slots: None,
+            web_transfer_enabled: false,
+            web_transfer_base_origin: None,
             bind_domain: Some("bore.example.com".into()),
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]

@@ -468,6 +468,11 @@ pub struct Server {
     /// Path to the vhost config file, retained for the hot-reload task.
     vhost_config_path: Option<PathBuf>,
 
+    /// Web-transfer room registry; `None` keeps every legacy path unchanged.
+    /// Exactly one shared registry per enabled server, built once from the
+    /// validated `--web-transfer-*` flags before the first listener binds.
+    web_transfer: Option<Arc<crate::web_transfer::WebTransferRegistry>>,
+
     /// Registry of live public-tunnel UDP direct paths, keyed by `port:{N}`.
     #[cfg(feature = "udp")]
     public_udp_registry: Arc<DashMap<String, Arc<PublicDirectEntry>>>,
@@ -479,7 +484,6 @@ pub struct Server {
     /// Whether VPN brokering is enabled.
     #[cfg(feature = "vpn")]
     vpn_enabled: bool,
-
     /// The overlay address pool for VPN (from --vpn-pool).
     #[cfg(feature = "vpn")]
     vpn_pool: Option<crate::vpn_server::VpnPoolHandle>,
@@ -582,6 +586,11 @@ pub struct Server {
     /// test never perturbs an unrelated registry.
     public_ctrl_timeout: std::time::Duration,
 
+    /// Web-transfer owner control receive deadline. Defaults to
+    /// [`crate::web_transfer::WEB_TRANSFER_CTRL_TIMEOUT`]; lowered by tests
+    /// to reap fast. Separate from the other four so a focused liveness test
+    /// never perturbs an unrelated registry.
+    web_transfer_ctrl_timeout: std::time::Duration,
     /// Embedded SSH ingress gateway (Phase 4), when enabled via `--ssh-gateway`.
     #[cfg(feature = "ssh-gateway")]
     ssh_gateway: Option<Arc<crate::sshgw::SshGateway>>,
@@ -627,6 +636,7 @@ impl Server {
             vhost_quic_port_explicit: false,
             pending_vhost_udp: vhost::PendingVhostUdp::default(),
             vhost_config_path: None,
+            web_transfer: None,
             #[cfg(feature = "udp")]
             public_udp_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "udp")]
@@ -683,6 +693,8 @@ impl Server {
                 direct_quic_keepalive_ms: None,
                 direct_quic_idle_ms: None,
                 udp_direct_slots: None,
+                web_transfer_enabled: false,
+                web_transfer_base_origin: None,
                 bind_domain: None,
                 control_hsts: "max-age=31536000".into(),
                 #[cfg(feature = "vpn")]
@@ -727,6 +739,7 @@ impl Server {
             ssh_jump_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
             vhost_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
             public_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
+            web_transfer_ctrl_timeout: crate::web_transfer::WEB_TRANSFER_CTRL_TIMEOUT,
             #[cfg(feature = "ssh-gateway")]
             ssh_gateway: None,
         }
@@ -759,6 +772,13 @@ impl Server {
     /// client's 20 s heartbeat.
     pub fn public_ctrl_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.public_ctrl_timeout = timeout;
+        self
+    }
+
+    /// Override the web-transfer owner control timeout (tests only).
+    /// Production keeps [`crate::web_transfer::WEB_TRANSFER_CTRL_TIMEOUT`].
+    pub fn web_transfer_ctrl_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.web_transfer_ctrl_timeout = timeout;
         self
     }
 
@@ -829,6 +849,29 @@ impl Server {
     /// [`DEFAULT_MAX_CARRIERS`].
     pub fn set_max_carriers(&mut self, max_carriers: u16) {
         self.max_carriers = max_carriers;
+    }
+
+    /// Enable the web-transfer service from an already-validated config.
+    /// Builds exactly one shared room registry; publishes only the enabled
+    /// bit and the base origin on the admin config view (full totals/gauges
+    /// arrive in Phase 6, never conflated per P-11).
+    pub fn set_web_transfer(
+        &mut self,
+        config: crate::web_transfer::WebTransferConfig,
+    ) -> anyhow::Result<()> {
+        let origin = config.base_url.origin().to_string();
+        let registry = crate::web_transfer::WebTransferRegistry::new(config)
+            .map_err(|e| anyhow::anyhow!("invalid web-transfer config: {e}"))?;
+        self.web_transfer = Some(Arc::new(registry));
+        let view = Arc::make_mut(&mut self.config_view);
+        view.web_transfer_enabled = true;
+        view.web_transfer_base_origin = Some(origin);
+        Ok(())
+    }
+
+    /// Shared web-transfer room registry, or `None` when disabled.
+    pub fn web_transfer(&self) -> Option<Arc<crate::web_transfer::WebTransferRegistry>> {
+        self.web_transfer.clone()
     }
 
     /// Set the direct-UDP transport tuning brokered to peers.
@@ -2392,6 +2435,24 @@ impl Server {
                     .await
                 }
             }
+            Some(
+                msg @ (ClientMessage::CreateWebTransferRoom { .. }
+                | ClientMessage::ResumeWebTransferRoom { .. }
+                | ClientMessage::CloseWebTransferRoom { .. }),
+            ) => {
+                // Owner control runs its own dedicated loop (heartbeat tick
+                // reaper, epoch-matched close). Auth ordering and transport
+                // setup above are unchanged; a disabled service answers the
+                // generic upgrade error from inside.
+                crate::web_transfer::serve_owner_first_message(
+                    self.web_transfer.clone(),
+                    &mut control,
+                    msg,
+                    self.web_transfer_ctrl_timeout,
+                )
+                .await?;
+                Ok(())
+            }
             Some(ClientMessage::Authenticate(_)) => {
                 warn!("unexpected authenticate");
                 Ok(())
@@ -3481,5 +3542,45 @@ mod tests {
             bind_failure_message("control", IpAddr::V4(Ipv4Addr::UNSPECIFIED), 80, &err, None);
         assert!(msg.contains("failed to bind the control listener"), "{msg}");
         assert!(!msg.contains("ip_unprivileged_port_start"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod web_transfer_config_tests {
+    use super::Server;
+
+    #[test]
+    fn disabled_server_has_no_registry() {
+        let server = Server::new(1024..=65535, None);
+        assert!(server.web_transfer().is_none());
+        let view = serde_json::to_value(server.config_view().as_ref()).unwrap();
+        assert_eq!(view["web_transfer_enabled"], false);
+        assert!(view["web_transfer_base_origin"].is_null());
+    }
+
+    #[test]
+    fn enabled_server_constructs_one_shared_registry() {
+        let mut server = Server::new(1024..=65535, None);
+        let args = crate::web_transfer::WebTransferServerArgs {
+            base_url: Some("https://files.example.com".to_string()),
+            ..crate::web_transfer::WebTransferServerArgs::default()
+        };
+        let config = crate::web_transfer::resolve_server_config(&args, false, 7835)
+            .unwrap()
+            .unwrap();
+        server.set_web_transfer(config).unwrap();
+        let first = server.web_transfer().unwrap();
+        let second = server.web_transfer().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            first.totals(),
+            crate::web_transfer::WebTransferLimits::default()
+        );
+        let view = serde_json::to_value(server.config_view().as_ref()).unwrap();
+        assert_eq!(view["web_transfer_enabled"], true);
+        assert_eq!(
+            view["web_transfer_base_origin"],
+            "https://files.example.com"
+        );
     }
 }

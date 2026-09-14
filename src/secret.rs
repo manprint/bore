@@ -1599,6 +1599,12 @@ impl Proxy {
                         Some(ServerMessage::CarrierToken { .. }) => warn!("unexpected carrier token"),
                         Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
                         Some(ServerMessage::VhostUdp { .. }) => warn!("unexpected vhost udp offer"),
+                        // Web-transfer owner replies; a secret tunnel never
+                        // opens an owner session, so these cannot arrive here.
+                        Some(ServerMessage::WebTransferRoomCreated { .. })
+                        | Some(ServerMessage::WebTransferRoomResumed { .. }) => {
+                            warn!("unexpected web-transfer room reply")
+                        }
                         // Vhost-only (phase 03.3); a secret provider never
                         // declares `auto_carriers`, so this cannot arrive.
                         Some(ServerMessage::SetCarrierTarget { .. }) => {

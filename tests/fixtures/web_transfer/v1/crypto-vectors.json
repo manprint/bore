@@ -1,0 +1,33 @@
+{
+  "_generated_by": "node web/transfer/tests/unit/vectors.mjs (see docs/transfer/WEB_TRANSFER_PROTOCOL.md \u00a79); inputs below are fixed, expected outputs are runner-produced and pinned by both implementations",
+  "inputs": {
+    "room_id": "0f1e2d3c4b5a69780f1e2d3c4b5a6978",
+    "room_key": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    "transfer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "attempt_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "plaintext_hex": "68656c6c6f20626f72650a",
+    "seq": 7,
+    "multichunk_seeds": [
+      "chunk-a",
+      "chunk-b",
+      "chunk-c"
+    ]
+  },
+  "expected": {
+    "leaf_hello_hex": "094c9eb526be7e2dea0b396331085eaba0d76f639116ccc014055c490b48daac",
+    "manifest_key_hex": "cd3fe8d9f1764c27f35db06271edfaf7cd93461f04799163cf5d93c91d55effc",
+    "manifest_mac_hex": "2d570b03108da614edda605c1a58e07cac14ad89f864619be386edc2e95b252d",
+    "root_empty_hex": "3851a391362e8aaa3bbf639dfaedbfc5d442d3098dcfae80c81a006c14818724",
+    "root_single_hex": "4d2cfc38cbddafe4fdadf16cc2517f44f66b920939eab20bd4f7cc49dba9984e",
+    "root_multi_hex": "d07d811d9510582c788131ed7c30b2a5e6213fcbbcf64e8e853559c67522ec2a",
+    "multichunk_leaves_hex": [
+      "ba6e04391775aa27f39df72198b6394dbf99fc52a39f26acbd5f3d78983b745c",
+      "0f276ace01c571d7587f5417db6f19cb95c1ce4891f3cee9852d278ca385c442",
+      "36317defccb8df3ec7f8ae18211cd03656e004af2a2a22fc5ee6513f9fdeb7e3"
+    ],
+    "attempt_key_hex": "ab3ff2d297453404c0e2c8487110b0477155ba8bd327faf5065633b85f2a1f08",
+    "nonce_seq7_hex": "000000000000000700000000",
+    "frame_data_seq7_hex": "4257543100010100000000070000001bdb263a101a4693f35daac2b5974419a4f3490ffc7d8b01169c6d13",
+    "frame_final_seq7_hex": "42575431000102000000000700000018b343567c7566f19702766e30f20b6e72a92d99377ab1ba0d"
+  }
+}

@@ -1765,6 +1765,43 @@ pub enum ClientMessage {
         #[serde(default)]
         reason: Option<String>,
     },
+
+    /// Creates a web-transfer room and takes its owner lease (Phase 1.3).
+    /// Appended LAST: an old server fails the whole frame, so a new client
+    /// maps the failure to "upgrade the server and set
+    /// --web-transfer-base-url". Carries only token HASHES, never the raw
+    /// member token or room key.
+    CreateWebTransferRoom {
+        /// Browser/native protocol version (must be 1).
+        version: u16,
+        /// SHA-256 of the member token browsers will present.
+        member_token_hash: [u8; 32],
+        /// SHA-256 of the CLI owner token.
+        owner_token_hash: [u8; 32],
+    },
+
+    /// Resumes a detached web-transfer room on a fresh control connection.
+    /// Appended LAST, same wire-compat reason as above. The raw owner token
+    /// rides ONLY this authenticated yamux stream; the server hashes it
+    /// immediately and drops the stack value after comparison.
+    ResumeWebTransferRoom {
+        /// Browser/native protocol version (must be 1).
+        version: u16,
+        /// Room to resume.
+        room_id: crate::web_transfer::RoomId,
+        /// Owner token proving the lease.
+        owner_token: crate::web_transfer::OwnerToken,
+    },
+
+    /// Destroys a web-transfer room immediately (clean owner close).
+    /// Appended LAST, same wire-compat reason as above. Must match the live
+    /// room AND lease epoch or the loop terminates without destroying.
+    CloseWebTransferRoom {
+        /// Room to destroy.
+        room_id: crate::web_transfer::RoomId,
+        /// Lease epoch that must still be current.
+        owner_epoch: u64,
+    },
 }
 
 /// A message from the server on the control substream.
@@ -2015,6 +2052,36 @@ pub enum ServerMessage {
         /// above the server's `--max-carriers`, never below 1.
         target: u16,
     },
+
+    /// Answers [`ClientMessage::CreateWebTransferRoom`]: the room exists and
+    /// this connection holds its owner lease. Appended LAST: an old client
+    /// fails its control loop on this variant, which is the correct signal
+    /// that the client predates web transfer. `base_url` is the origin only,
+    /// never carrying a fragment.
+    WebTransferRoomCreated {
+        /// Browser/native protocol version.
+        version: u16,
+        /// New room ID.
+        room_id: crate::web_transfer::RoomId,
+        /// Same-origin root serving the browser shell.
+        base_url: String,
+        /// Initial lease epoch (0).
+        owner_epoch: u64,
+    },
+
+    /// Answers [`ClientMessage::ResumeWebTransferRoom`]: the detached room is
+    /// attached to this connection under a fresh epoch. Appended LAST, same
+    /// wire-compat reason as above.
+    WebTransferRoomResumed {
+        /// Browser/native protocol version.
+        version: u16,
+        /// Resumed room ID.
+        room_id: crate::web_transfer::RoomId,
+        /// Same-origin root serving the browser shell.
+        base_url: String,
+        /// Fresh lease epoch.
+        owner_epoch: u64,
+    },
 }
 
 /// Whether a connection-teardown error is ordinary client behaviour rather than
@@ -2214,6 +2281,18 @@ impl ControlFrameSummary for ClientMessage {
             ClientMessage::SshJumpUdpRenew { alias } => {
                 format!("SshJumpUdpRenew {{ alias={} }}", alias)
             }
+            ClientMessage::CreateWebTransferRoom { version, .. } => {
+                format!("CreateWebTransferRoom {{ version={version} }}")
+            }
+            ClientMessage::ResumeWebTransferRoom { room_id, .. } => {
+                format!("ResumeWebTransferRoom {{ room={room_id} }}")
+            }
+            ClientMessage::CloseWebTransferRoom {
+                room_id,
+                owner_epoch,
+            } => {
+                format!("CloseWebTransferRoom {{ room={room_id}, epoch={owner_epoch} }}")
+            }
             ClientMessage::Heartbeat => "Heartbeat".to_string(),
         }
     }
@@ -2231,6 +2310,20 @@ impl ControlFrameSummary for ServerMessage {
             }
             ServerMessage::SetCarrierTarget { target } => {
                 format!("SetCarrierTarget {{ target={} }}", target)
+            }
+            ServerMessage::WebTransferRoomCreated {
+                room_id,
+                owner_epoch,
+                ..
+            } => {
+                format!("WebTransferRoomCreated {{ room={room_id}, epoch={owner_epoch} }}")
+            }
+            ServerMessage::WebTransferRoomResumed {
+                room_id,
+                owner_epoch,
+                ..
+            } => {
+                format!("WebTransferRoomResumed {{ room={room_id}, epoch={owner_epoch} }}")
             }
             ServerMessage::Ok => "Ok".to_string(),
             ServerMessage::Heartbeat => "Heartbeat".to_string(),
@@ -2806,6 +2899,101 @@ mod tests {
                 assert!(carrier, "carrier flag must round-trip on the wire");
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_client_and_server_message_fixtures_are_byte_identical() {
+        // Appending web-transfer variants must not alter one byte of the old
+        // wire: these literals pin the historical encodings exactly.
+        assert_eq!(
+            serde_json::to_string(&ClientMessage::Heartbeat).unwrap(),
+            r#""Heartbeat""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ServerMessage::Heartbeat).unwrap(),
+            r#""Heartbeat""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ServerMessage::Ok).unwrap(),
+            r#""Ok""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ServerMessage::Error("boom".to_string())).unwrap(),
+            r#"{"Error":"boom"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ClientMessage::JoinCarrier {
+                token: "t".to_string()
+            })
+            .unwrap(),
+            r#"{"JoinCarrier":{"token":"t"}}"#
+        );
+        // And the old literals still decode to the old variants.
+        let msg: ClientMessage = serde_json::from_str(r#""Heartbeat""#).unwrap();
+        assert!(matches!(msg, ClientMessage::Heartbeat));
+        let msg: ServerMessage = serde_json::from_str(r#""Ok""#).unwrap();
+        assert!(matches!(msg, ServerMessage::Ok));
+    }
+
+    #[test]
+    fn new_owner_variants_are_appended_and_round_trip() {
+        let room_id = crate::web_transfer::RoomId::from_bytes([0xabu8; 16]);
+        let owner_token = crate::web_transfer::OwnerToken::from_bytes([0xcdu8; 32]);
+        let create = ClientMessage::CreateWebTransferRoom {
+            version: 1,
+            member_token_hash: [1u8; 32],
+            owner_token_hash: [2u8; 32],
+        };
+        let json = serde_json::to_string(&create).unwrap();
+        assert!(json.starts_with(r#"{"CreateWebTransferRoom":{"#), "{json}");
+        let back: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+
+        let resume = ClientMessage::ResumeWebTransferRoom {
+            version: 1,
+            room_id,
+            owner_token,
+        };
+        let json = serde_json::to_string(&resume).unwrap();
+        // IDs and tokens ride as canonical lowercase hex, never byte arrays.
+        assert!(json.contains(&"ab".repeat(16)), "{json}");
+        assert!(json.contains(&"cd".repeat(32)), "{json}");
+        let back: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+
+        let close = ClientMessage::CloseWebTransferRoom {
+            room_id,
+            owner_epoch: 3,
+        };
+        let json = serde_json::to_string(&close).unwrap();
+        let back: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+
+        for (msg, tag) in [
+            (
+                ServerMessage::WebTransferRoomCreated {
+                    version: 1,
+                    room_id,
+                    base_url: "https://files.example.com".to_string(),
+                    owner_epoch: 0,
+                },
+                "WebTransferRoomCreated",
+            ),
+            (
+                ServerMessage::WebTransferRoomResumed {
+                    version: 1,
+                    room_id,
+                    base_url: "https://files.example.com".to_string(),
+                    owner_epoch: 1,
+                },
+                "WebTransferRoomResumed",
+            ),
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            assert!(json.starts_with(&format!(r#"{{"{tag}":{{"#)), "{json}");
+            let back: ServerMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
         }
     }
 

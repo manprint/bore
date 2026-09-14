@@ -53,6 +53,12 @@ fastrand = "2"
 futures-util = { version = "0.3.21", features = ["sink", "io"] }
 hex = "0.4.3"
 hmac = "0.12.1"
+# Reuses the lockfile's subtle 2.x resolution; canonical constant-time digest
+# comparison (`token_digests_equal`) without homebrew timing logic.
+subtle = "2.6"
+# Manifest path NFC validation (web-transfer protocol v1). Pure Rust, no build
+# script; pinned direct because both sides must agree on `is_nfc`.
+unicode-normalization = "0.1"
 # CSPRNG for the direct-path session nonce and STUN transaction id. `ring` is
 # already compiled (tokio-rustls/quinn ring provider), so this adds no build cost.
 ring = "0.17"
@@ -75,6 +81,16 @@ x509-parser = "0.16"
 # `time` is already pulled transitively by x509-parser/rustls; named directly here
 # to format certificate validity timestamps (RFC3339) without a separate dep.
 time = { version = "0.3", features = ["formatting", "local-offset"] }
+# Web-transfer browser control/relay surface (Phase 0, `src/web_transfer*`).
+# `url` reuses the lockfile's 2.5.x resolution; named directly because server
+# config parsing (`WebTransferBaseUrl`) needs a stable public type.
+url = "2.5"
+# Minimal handshake/runtime WebSocket features only: server `accept_hdr_async`
+# (handshake) + client connect (connect) + split streams (stream). No TLS here —
+# the existing tokio-rustls listener terminates TLS before the WS handshake.
+tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["connect", "handshake", "stream"] }
+# `--open` for `bore transfer web`: cross-platform default-browser opener.
+webbrowser = "1.1.0"
 
 # Optional, enabled by the `udp` feature (see [features]). These must stay in the
 # top-level dependency set so `--all-features` keeps working on Windows too.

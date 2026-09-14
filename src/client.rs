@@ -1119,6 +1119,13 @@ impl Client {
                         Some(ServerMessage::CarrierToken { .. }) => warn!("unexpected carrier token"),
                         Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
                         Some(ServerMessage::Ok) => warn!("unexpected ok"),
+                        // Web-transfer owner replies; a local/vhost/secret
+                        // client never opens an owner session, so these cannot
+                        // arrive here.
+                        Some(ServerMessage::WebTransferRoomCreated { .. })
+                        | Some(ServerMessage::WebTransferRoomResumed { .. }) => {
+                            warn!("unexpected web-transfer room reply")
+                        }
                         // Phase 03.3: the server is telling us how many carriers
                         // it currently wants. Raising the target tops the pool up
                         // NOW rather than at the next re-dial tick — the request

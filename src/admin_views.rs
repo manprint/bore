@@ -509,6 +509,10 @@ pub struct ConfigView {
     /// rest fall back to the warm TCP relay, so it is the one value that says
     /// whether the budget is doing anything.
     pub udp_direct_slots: Option<u32>,
+    /// Web-transfer browser surface enabled via `--web-transfer-base-url`.
+    pub web_transfer_enabled: bool,
+    /// Same-origin root enabling it; `None` (JSON null) means disabled.
+    pub web_transfer_base_origin: Option<String>,
     /// Bind domain for control/tunnel endpoints.
     pub bind_domain: Option<String>,
     /// HSTS header value for HTTPS control port.
@@ -754,6 +758,8 @@ mod tests {
             direct_quic_keepalive_ms: Some(3_000),
             direct_quic_idle_ms: Some(10_000),
             udp_direct_slots: None,
+            web_transfer_enabled: false,
+            web_transfer_base_origin: None,
             bind_domain: None,
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]
@@ -970,6 +976,8 @@ mod tests {
             direct_quic_keepalive_ms: Some(3_000),
             direct_quic_idle_ms: Some(10_000),
             udp_direct_slots: None,
+            web_transfer_enabled: false,
+            web_transfer_base_origin: None,
             bind_domain: None,
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]

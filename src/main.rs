@@ -919,7 +919,7 @@ enum Command {
         /// Per-channel SSH flow-control window in bytes for the gateway. Each
         /// proxied connection is one SSH channel, throughput-capped at
         /// window/RTT; raise this to lift single-connection throughput on
-        /// high-latency links (costs memory per active connection). Default
+        /// high-latency legs (costs memory per active connection). Default
         /// 16 MiB; russh's own default is 2 MiB.
         #[cfg(feature = "ssh-gateway")]
         #[clap(
@@ -929,6 +929,81 @@ enum Command {
             env = "BORE_SSH_WINDOW_SIZE"
         )]
         ssh_window_size: u32,
+
+        /// Same-origin root enabling the `bore transfer web` browser surface
+        /// (e.g. https://files.example.com; loopback http for development).
+        /// Alone it enables the service; every other --web-transfer-* flag
+        /// without it is rejected rather than silently ignored.
+        #[clap(long, value_name = "URL", env = "BORE_WEB_TRANSFER_BASE_URL")]
+        web_transfer_base_url: Option<String>,
+
+        /// Custom STUN server for browser ICE (`stun:HOST[:PORT]`).
+        /// Repeatable / comma-separated; replaces the defaults. Conflicts
+        /// with --web-transfer-no-stun. Never TURN.
+        #[clap(
+            long,
+            value_name = "stun:HOST[:PORT]",
+            env = "BORE_WEB_TRANSFER_STUN",
+            value_delimiter = ','
+        )]
+        web_transfer_stun: Vec<String>,
+
+        /// Offer host candidates only (no STUN). Conflicts with
+        /// --web-transfer-stun.
+        #[clap(
+            long,
+            env = "BORE_WEB_TRANSFER_NO_STUN",
+            conflicts_with = "web_transfer_stun"
+        )]
+        web_transfer_no_stun: bool,
+
+        /// Maximum live web-transfer rooms on this server.
+        #[clap(long, value_name = "N", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().max_rooms, env = "BORE_WEB_TRANSFER_MAX_ROOMS")]
+        web_transfer_max_rooms: u64,
+
+        /// Maximum web-transfer peers summed over all rooms.
+        #[clap(long, value_name = "N", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().max_peers_global, env = "BORE_WEB_TRANSFER_MAX_PEERS")]
+        web_transfer_max_peers: u64,
+
+        /// Maximum web-transfer peers in one room.
+        #[clap(long, value_name = "N", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().max_peers_per_room, env = "BORE_WEB_TRANSFER_MAX_PEERS_PER_ROOM")]
+        web_transfer_max_peers_per_room: u64,
+
+        /// Maximum offers published by one web-transfer peer.
+        #[clap(long, value_name = "N", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().max_offers_per_peer, env = "BORE_WEB_TRANSFER_MAX_OFFERS_PER_PEER")]
+        web_transfer_max_offers_per_peer: u64,
+
+        /// Maximum manifest entries in one web-transfer offer.
+        #[clap(long, value_name = "N", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().max_entries_per_offer, env = "BORE_WEB_TRANSFER_MAX_ENTRIES_PER_OFFER")]
+        web_transfer_max_entries_per_offer: u64,
+
+        /// Maximum logical bytes in one web-transfer offer.
+        #[clap(long, value_name = "N", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().max_offer_bytes, env = "BORE_WEB_TRANSFER_MAX_OFFER_BYTES")]
+        web_transfer_max_offer_bytes: u64,
+
+        /// Maximum control/catalog metadata held for one web-transfer room.
+        #[clap(long, value_name = "N", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().max_metadata_per_room_bytes, env = "BORE_WEB_TRANSFER_MAX_METADATA_PER_ROOM")]
+        web_transfer_max_metadata_per_room: u64,
+
+        /// Maximum control/catalog metadata held server-wide.
+        #[clap(long, value_name = "N", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().max_metadata_total_bytes, env = "BORE_WEB_TRANSFER_MAX_METADATA_TOTAL")]
+        web_transfer_max_metadata_total: u64,
+
+        /// Maximum concurrent web-transfers one peer takes part in.
+        #[clap(long, value_name = "N", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().max_transfers_per_peer, env = "BORE_WEB_TRANSFER_MAX_TRANSFERS_PER_PEER")]
+        web_transfer_max_transfers_per_peer: u64,
+
+        /// Maximum live opaque web-transfer relay pairs server-wide.
+        #[clap(long, value_name = "N", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().max_relays_global, env = "BORE_WEB_TRANSFER_MAX_RELAYS")]
+        web_transfer_max_relays: u64,
+
+        /// Web-transfer relay throttle per room (bytes/s); 0 disables it.
+        #[clap(long, value_name = "N", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().relay_rate_bytes_per_s, env = "BORE_WEB_TRANSFER_RELAY_RATE")]
+        web_transfer_relay_rate: u64,
+
+        /// Grace after abnormal web-transfer owner loss before the room dies.
+        #[clap(long, value_name = "SECS", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().owner_grace_secs, env = "BORE_WEB_TRANSFER_OWNER_GRACE")]
+        web_transfer_owner_grace: u64,
     },
 
     /// Diagnose this host's UDP / NAT / firewall for hole-punching (opens no
@@ -2221,6 +2296,21 @@ async fn dispatch(command: Command) -> Result<()> {
             ssh_advertise_port,
             #[cfg(feature = "ssh-gateway")]
             ssh_window_size,
+            web_transfer_base_url,
+            web_transfer_stun,
+            web_transfer_no_stun,
+            web_transfer_max_rooms,
+            web_transfer_max_peers,
+            web_transfer_max_peers_per_room,
+            web_transfer_max_offers_per_peer,
+            web_transfer_max_entries_per_offer,
+            web_transfer_max_offer_bytes,
+            web_transfer_max_metadata_per_room,
+            web_transfer_max_metadata_total,
+            web_transfer_max_transfers_per_peer,
+            web_transfer_max_relays,
+            web_transfer_relay_rate,
+            web_transfer_owner_grace,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -2240,6 +2330,32 @@ async fn dispatch(command: Command) -> Result<()> {
                 }
             }
             let mut server = Server::new(port_range, secret.as_deref());
+            // Web-transfer flags resolve before the first listener binds: a
+            // bad relation exits here, never after half the ports are open.
+            let web_transfer_config = bore_cli::web_transfer::resolve_server_config(
+                &bore_cli::web_transfer::WebTransferServerArgs {
+                    base_url: web_transfer_base_url,
+                    stun: web_transfer_stun,
+                    no_stun: web_transfer_no_stun,
+                    max_rooms: web_transfer_max_rooms,
+                    max_peers_global: web_transfer_max_peers,
+                    max_peers_per_room: web_transfer_max_peers_per_room,
+                    max_offers_per_peer: web_transfer_max_offers_per_peer,
+                    max_entries_per_offer: web_transfer_max_entries_per_offer,
+                    max_offer_bytes: web_transfer_max_offer_bytes,
+                    max_metadata_per_room_bytes: web_transfer_max_metadata_per_room,
+                    max_metadata_total_bytes: web_transfer_max_metadata_total,
+                    max_transfers_per_peer: web_transfer_max_transfers_per_peer,
+                    max_relays_global: web_transfer_max_relays,
+                    relay_rate_bytes_per_s: web_transfer_relay_rate,
+                    owner_grace_secs: web_transfer_owner_grace,
+                },
+                udp,
+                control_port,
+            )?;
+            if let Some(config) = web_transfer_config {
+                server.set_web_transfer(config)?;
+            }
             #[cfg(feature = "ssh-gateway")]
             let ssh_gateway_enabled = ssh_gateway;
             #[cfg(not(feature = "ssh-gateway"))]
@@ -2458,6 +2574,8 @@ async fn dispatch(command: Command) -> Result<()> {
                 direct_quic_keepalive_ms: None,
                 direct_quic_idle_ms: None,
                 udp_direct_slots: None,
+                web_transfer_enabled: false,
+                web_transfer_base_origin: None,
                 bind_domain: bind_domain.clone(),
                 control_hsts,
                 #[cfg(feature = "vpn")]
@@ -4464,5 +4582,50 @@ mod tests {
         assert_eq!(la.advertise.len(), 2);
         assert_eq!(la.advertise[0], "192.168.1.0/24");
         assert_eq!(la.advertise[1], "192.168.2.0/24");
+    }
+
+    #[test]
+    fn web_transfer_server_flags_default_to_disabled() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        for var in [
+            "BORE_WEB_TRANSFER_BASE_URL",
+            "BORE_WEB_TRANSFER_STUN",
+            "BORE_WEB_TRANSFER_NO_STUN",
+            "BORE_WEB_TRANSFER_MAX_ROOMS",
+            "BORE_WEB_TRANSFER_OWNER_GRACE",
+        ] {
+            std::env::remove_var(var);
+        }
+        let args = Args::parse_from(["bore", "server"]);
+        let Command::Server {
+            web_transfer_base_url,
+            web_transfer_stun,
+            web_transfer_no_stun,
+            web_transfer_max_rooms,
+            web_transfer_owner_grace,
+            ..
+        } = args.command
+        else {
+            panic!("expected server command");
+        };
+        assert_eq!(web_transfer_base_url, None);
+        assert!(web_transfer_stun.is_empty());
+        assert!(!web_transfer_no_stun);
+        let defaults = bore_cli::web_transfer::WebTransferLimits::default();
+        assert_eq!(web_transfer_max_rooms, defaults.max_rooms);
+        assert_eq!(web_transfer_owner_grace, defaults.owner_grace_secs);
+    }
+
+    #[test]
+    fn web_transfer_no_stun_conflicts_with_stun_at_parse_time() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let result = Args::try_parse_from([
+            "bore",
+            "server",
+            "--web-transfer-no-stun",
+            "--web-transfer-stun",
+            "stun:stun.example.com:3478",
+        ]);
+        assert!(result.is_err(), "clap must reject the conflicting pair");
     }
 }

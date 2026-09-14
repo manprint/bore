@@ -31,6 +31,100 @@ fn content_type_for_ext(ext: &str) -> &'static str {
     }
 }
 
+/// Walk `dir` recursively, collecting `(url_path, absolute_path, content_type)`
+/// with `url_prefix` prepended to each slash-joined relative path. Shared by
+/// the admin UI bundler and the web-transfer shell bundler; entries come out
+/// sorted so generated sources are reproducible.
+fn walk_asset_dir(dir: &Path, url_prefix: &str) -> Vec<(String, String, String)> {
+    fn walk(
+        dir: &Path,
+        strip: &Path,
+        url_prefix: &str,
+        out: &mut Vec<(String, String, String)>,
+    ) -> std::io::Result<()> {
+        let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|e| e.path());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() && !path.ends_with(".git") {
+                walk(&path, strip, url_prefix, out)?;
+            } else if path.is_file() {
+                let rel = path.strip_prefix(strip).unwrap_or(&path);
+                let url_path = format!("{url_prefix}{}", rel.to_string_lossy().replace('\\', "/"));
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let abs = std::fs::canonicalize(&path)?.to_string_lossy().into_owned();
+                out.push((url_path, abs, content_type_for_ext(ext).to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    let mut assets = Vec::new();
+    if let Err(e) = walk(dir, dir, url_prefix, &mut assets) {
+        eprintln!("Warning: failed to walk {}: {}", dir.display(), e);
+    }
+    assets
+}
+
+/// Emit `out_file` in OUT_DIR defining `pub static {static_name}` over assets.
+fn emit_asset_table(
+    out_file: &str,
+    static_name: &str,
+    doc: &str,
+    assets: &[(String, String, String)],
+) {
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let mut code = format!(
+        "// Auto-generated asset table (build.rs)\n/// {doc}\n\
+         pub static {static_name}: &[(&str, &[u8], &str)] = &[\n"
+    );
+    for (url_path, abs_path, ct) in assets {
+        code.push_str(&format!(
+            "    ({:?}, include_bytes!({:?}), {:?}),\n",
+            url_path, abs_path, ct
+        ));
+    }
+    code.push_str("];\n");
+    fs::write(PathBuf::from(&out_dir).join(out_file), code).expect("write asset table");
+}
+
+/// Embed the committed web-transfer browser shell. Unlike the admin UI this
+/// FAILS when the required dist assets are absent: `cargo build` must never
+/// silently ship a server whose /transfer routes serve nothing. Never runs
+/// npm from here; the frontend pipeline (`npm run build --prefix
+/// web/transfer`) owns dist generation.
+fn bundle_web_transfer_assets() {
+    const SOURCE: &str = "web/transfer/dist";
+    const REQUIRED: &[&str] = &["index.html", "app.js", "app.css"];
+    if !Path::new(SOURCE).exists() {
+        panic!(
+            "build.rs: {SOURCE} missing — run `npm run build --prefix web/transfer` \
+             to generate the committed frontend shell"
+        );
+    }
+    let assets = walk_asset_dir(Path::new(SOURCE), "/transfer/assets/");
+    let mut missing = Vec::new();
+    for name in REQUIRED {
+        let want = format!("/transfer/assets/{name}");
+        if !assets.iter().any(|(url, _, _)| url == &want) {
+            missing.push(want);
+        }
+    }
+    if !missing.is_empty() {
+        panic!(
+            "build.rs: {SOURCE} lacks required assets: {}",
+            missing.join(", ")
+        );
+    }
+    emit_asset_table(
+        "web_transfer_assets.rs",
+        "WEB_TRANSFER_ASSETS",
+        "Web-transfer browser shell: (url_path, bytes, content_type)",
+        &assets,
+    );
+    println!("cargo:rerun-if-changed={SOURCE}");
+}
+
 /// Walk src/admin_ui/ recursively and emit a static asset table.
 fn bundle_admin_assets() {
     let admin_ui_path = Path::new("src/admin_ui");
@@ -197,6 +291,9 @@ fn watch_git_head() {
 fn main() {
     // --- Admin UI asset bundling ---
     bundle_admin_assets();
+
+    // --- Web-transfer browser shell (committed dist, no npm at build time) ---
+    bundle_web_transfer_assets();
 
     // --- Git branch ---
     // Priority: custom env var (Docker builds) → GitHub Actions env var → git

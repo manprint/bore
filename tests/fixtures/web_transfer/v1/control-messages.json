@@ -1,0 +1,192 @@
+[
+ {
+  "name": "hello",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"hello\",\"body\":{\"memberToken\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}"
+ },
+ {
+  "name": "ping",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"ping\",\"body\":{}}"
+ },
+ {
+  "name": "peer.rename",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"peer.rename\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"displayName\":\"Bobi\"}}"
+ },
+ {
+  "name": "offer.publish",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"offer.publish\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"offerId\":\"cccccccccccccccccccccccccccccccc\",\"manifest\":{\"offer\":\"cccccccccccccccccccccccccccccccc\",\"mode\":\"single\",\"entries\":[]},\"mac\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}"
+ },
+ {
+  "name": "offer.withdraw",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"offer.withdraw\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"offerId\":\"cccccccccccccccccccccccccccccccc\"}}"
+ },
+ {
+  "name": "transfer.request",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"transfer.request\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"offerId\":\"cccccccccccccccccccccccccccccccc\",\"entryIds\":[\"hello.txt\"],\"selectionDigest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"mode\":\"raw\"}}"
+ },
+ {
+  "name": "transfer.source_ready",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"transfer.source_ready\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}"
+ },
+ {
+  "name": "transfer.reject",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"transfer.reject\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"code\":\"CANCELLED\"}}"
+ },
+ {
+  "name": "rtc.offer",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"rtc.offer\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"sdp\":\"v=0...\"}}"
+ },
+ {
+  "name": "rtc.answer",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"rtc.answer\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"sdp\":\"v=0...\"}}"
+ },
+ {
+  "name": "rtc.ice",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"rtc.ice\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"candidate\":\"candidate:1...\"}}"
+ },
+ {
+  "name": "transfer.direct_ready",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"transfer.direct_ready\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}"
+ },
+ {
+  "name": "transfer.direct_failed",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"transfer.direct_failed\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reason\":\"ice-failed\"}}"
+ },
+ {
+  "name": "transfer.cancel",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"transfer.cancel\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}"
+ },
+ {
+  "name": "transfer.progress",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"transfer.progress\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"receivedBytes\":\"11\"}}"
+ },
+ {
+  "name": "transfer.complete",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"transfer.complete\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"root\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}"
+ },
+ {
+  "name": "welcome",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"welcome\",\"body\":{\"peerId\":\"11111111111111111111111111111111\",\"roomId\":\"0f1e2d3c4b5a69780f1e2d3c4b5a6978\"}}"
+ },
+ {
+  "name": "snapshot.begin",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"snapshot.begin\",\"body\":{}}"
+ },
+ {
+  "name": "snapshot.peer",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"snapshot.peer\",\"body\":{\"peerId\":\"11111111111111111111111111111111\"}}"
+ },
+ {
+  "name": "snapshot.offer",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"snapshot.offer\",\"body\":{\"peerId\":\"11111111111111111111111111111111\",\"offerId\":\"cccccccccccccccccccccccccccccccc\",\"manifest\":{},\"mac\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}"
+ },
+ {
+  "name": "snapshot.end",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"snapshot.end\",\"body\":{}}"
+ },
+ {
+  "name": "ack",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"ack\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"result\":{\"roomId\":\"22222222222222222222222222222222\"}}}"
+ },
+ {
+  "name": "error",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"error\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"code\":\"UNAUTHORIZED\"}}"
+ },
+ {
+  "name": "pong",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"pong\",\"body\":{}}"
+ },
+ {
+  "name": "peer.joined",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"peer.joined\",\"body\":{\"peerId\":\"11111111111111111111111111111111\"}}"
+ },
+ {
+  "name": "peer.renamed",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"peer.renamed\",\"body\":{\"peerId\":\"11111111111111111111111111111111\",\"displayName\":\"Bobi\"}}"
+ },
+ {
+  "name": "peer.left",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"peer.left\",\"body\":{\"peerId\":\"11111111111111111111111111111111\"}}"
+ },
+ {
+  "name": "offer.added",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"offer.added\",\"body\":{\"peerId\":\"11111111111111111111111111111111\",\"offerId\":\"cccccccccccccccccccccccccccccccc\",\"manifest\":{},\"mac\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}"
+ },
+ {
+  "name": "offer.removed",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"offer.removed\",\"body\":{\"peerId\":\"11111111111111111111111111111111\",\"offerId\":\"cccccccccccccccccccccccccccccccc\"}}"
+ },
+ {
+  "name": "transfer.incoming",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"transfer.incoming\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offerId\":\"cccccccccccccccccccccccccccccccc\",\"fromPeerId\":\"11111111111111111111111111111111\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}"
+ },
+ {
+  "name": "transfer.direct_start",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"transfer.direct_start\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"attemptNumber\":1,\"role\":\"recipient\",\"iceServers\":[],\"deadlineMs\":10000}}"
+ },
+ {
+  "name": "transfer.path_commit",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"transfer.path_commit\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"path\":\"direct\"}}"
+ },
+ {
+  "name": "transfer.relay_ticket",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"transfer.relay_ticket\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"ticket\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}"
+ },
+ {
+  "name": "transfer.cancelled",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"transfer.cancelled\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"byPeerId\":\"11111111111111111111111111111111\"}}"
+ },
+ {
+  "name": "transfer.completed",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"transfer.completed\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"root\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}"
+ },
+ {
+  "name": "room_closed",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"room_closed\",\"body\":{\"reason\":\"owner-close\"}}"
+ },
+ {
+  "name": "relay.attach",
+  "direction": "relay",
+  "json": "{\"v\":1,\"peerId\":\"11111111111111111111111111111111\",\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"role\":\"source\",\"ticket\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}"
+ },
+ {
+  "name": "relay.attach",
+  "direction": "relay",
+  "json": "{\"v\":1,\"peerId\":\"11111111111111111111111111111111\",\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"role\":\"recipient\",\"ticket\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}"
+ }
+]

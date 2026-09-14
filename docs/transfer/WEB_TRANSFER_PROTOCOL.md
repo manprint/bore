@@ -59,19 +59,19 @@ Server → client `type` values (`ack`/`error` echo the client's `requestId`):
 
 | type | body |
 |------|------|
-| `welcome` | `{peerId, roomId}` |
-| `snapshot.begin` | `{}` |
-| `snapshot.peer` | `{peerId, displayName?}` |
-| `snapshot.offer` | `{peerId, offerId, manifest, mac}` |
-| `snapshot.end` | `{}` |
+| `welcome` | `{peerId, roomId, displayName, limits, iceServers}` |
+| `snapshot.begin` | `{revision}` |
+| `snapshot.peer` | `{peerId, displayName?, revision}` |
+| `snapshot.offer` | `{peerId, offerId, manifest, mac, revision}` |
+| `snapshot.end` | `{revision}` |
 | `ack` | `{requestId, result?}` |
-| `error` | `{requestId, code, message?}` |
+| `error` | `{requestId?, code, message?}` (`requestId` absent only when the offending message carried none) |
 | `pong` | `{}` |
-| `peer.joined` | `{peerId, displayName?}` |
-| `peer.renamed` | `{peerId, displayName?}` |
-| `peer.left` | `{peerId}` |
-| `offer.added` | `{peerId, offerId, manifest, mac}` |
-| `offer.removed` | `{peerId, offerId}` |
+| `peer.joined` | `{peerId, displayName?, revision}` |
+| `peer.renamed` | `{peerId, displayName?, revision}` |
+| `peer.left` | `{peerId, revision}` |
+| `offer.added` | `{peerId, offerId, manifest, mac, revision}` |
+| `offer.removed` | `{peerId, offerId, revision}` |
 | `transfer.incoming` | `{transferId, offerId, fromPeerId, attemptId}` |
 | `transfer.direct_start` | `{transferId, attemptId, attemptNumber, role, iceServers, deadlineMs}` |
 | `transfer.path_commit` | `{transferId, attemptId, path}` (`path` is `direct` or `relay`) |
@@ -130,21 +130,39 @@ Signing, hashing and digest inputs use canonical JSON:
 {
   "offer": "<offer-id 32hex>",
   "mode": "single",
+  "label": "Photos",
+  "kind": "file",
+  "chunkSize": "1048576",
+  "createdAt": "2026-09-14T12:00:00Z",
   "entries": [
-    {"path": "hello.txt", "size": "11", "mtime": "1757779200",
-     "chunks": ["<sha256hex of the 1 MiB chunk>"]}
+    {"id": "0", "path": "hello.txt", "size": "11", "mtime": "1757779200",
+     "chunks": ["<sha256hex of the 1 MiB chunk>"],
+     "chunkCount": "1", "root": "<rolling root hex>"}
   ]
 }
 ```
 
 - `mode` is `single` (one file) or `multi` (tree/ZIP source).
-- `size`/`mtime` are decimal strings (Unix seconds for `mtime`).
+- `label` is the catalog title (1..128 chars, NFC, trimmed, no controls).
+- `kind` is `file` (one single file entry), `files` (flat files, `multi`)
+  or `folder` (tree, `multi`, may hold directories).
+- `chunkSize` is always `"1048576"` (1 MiB); `createdAt` is ISO-8601 UTC
+  (`YYYY-MM-DDTHH:MM:SS[.frac]Z`, at most 32 bytes).
+- `size`/`mtime`/`chunkCount`/`id` are canonical decimal **strings**, never
+  numbers; `id` values are 0-based sequential in path-sorted entry order.
 - `chunks` holds one SHA-256 hex per 1 MiB logical chunk (last chunk short).
-  At most `max_entries_per_offer` entries; manifest bytes at most
+  `chunkCount` always equals the chunk hash count. At most
+  `max_entries_per_offer` entries; manifest bytes at most
   `WEB_TRANSFER_MAX_MANIFEST_BYTES` (256 KiB).
+- A directory entry has empty `chunks`, `chunkCount`/`size` `"0"` and a null
+  `root` (only under kind `folder`); every file entry carries the rolling
+  root below, verified by the server at publish. An empty file is still a
+  file: its root is the empty-input root, never null.
 - Path rules: `/`-separated segments, no leading/trailing `/`, no empty,
   `.` or `..` segments, no `\`, no control characters, NFC-normalized,
-  each segment at most 255 bytes, whole path at most 4096 bytes.
+  each segment at most 255 bytes, whole path at most 4096 bytes. Entries
+  arrive strictly path-sorted; duplicates and NFC+casefold collisions are
+  rejected (casefold is lowercase-over-NFC, exact for ASCII paths).
 
 Content root ("fixed rolling-root", order-sensitive):
 

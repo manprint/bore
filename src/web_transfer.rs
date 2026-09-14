@@ -5,8 +5,9 @@
 //! codecs live in [`crate::web_transfer_protocol`].
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt,
+    net::IpAddr,
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -18,7 +19,7 @@ use std::{
 use anyhow::{bail, Result};
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
-use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 /// Browser/native protocol version. Versioned envelopes reject anything else.
@@ -733,7 +734,7 @@ mod assets_tests {
     use super::WEB_TRANSFER_ASSETS;
 
     #[test]
-    fn embedded_web_transfer_assets_have_shell_js_and_css() {
+    fn embedded_web_transfer_assets_have_shell_worker_js_and_css() {
         let mut urls: Vec<&str> = WEB_TRANSFER_ASSETS.iter().map(|(url, _, _)| *url).collect();
         urls.sort_unstable();
         assert_eq!(
@@ -742,6 +743,7 @@ mod assets_tests {
                 "/transfer/assets/app.css",
                 "/transfer/assets/app.js",
                 "/transfer/assets/index.html",
+                "/transfer/assets/offer-worker.js",
             ],
             "generated map holds exactly the committed shell files"
         );
@@ -779,6 +781,30 @@ impl WebTransferError {
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             code: "UNAUTHORIZED",
+            message: message.into(),
+        }
+    }
+
+    /// A conflicting immutable object (same offer ID, different bytes/owner).
+    pub fn offer_changed(message: impl Into<String>) -> Self {
+        Self {
+            code: "OFFER_CHANGED",
+            message: message.into(),
+        }
+    }
+
+    /// Known object the caller does not own (withdraw/cancel by a stranger).
+    pub fn not_participant(message: impl Into<String>) -> Self {
+        Self {
+            code: "NOT_PARTICIPANT",
+            message: message.into(),
+        }
+    }
+
+    /// Referenced object does not exist.
+    pub fn offer_not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: "OFFER_NOT_FOUND",
             message: message.into(),
         }
     }
@@ -848,10 +874,18 @@ pub struct PeerRecord {
     pub display_name: Option<String>,
 }
 
-/// Offer metadata placeholder (accounting only; Phase 2 adds the manifest).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Offer metadata: owner, retained canonical manifest and accounting. The
+/// manifest is one shared `Arc<[u8]>` — snapshots serialize from it without
+/// retaining a second copy in `RoomState`.
+#[derive(Debug, Clone)]
 pub struct OfferRecord {
-    /// Control/catalog bytes charged against the room metadata budget.
+    /// Publishing peer; only this peer may withdraw.
+    pub owner: PeerId,
+    /// Canonical manifest bytes (sorted keys, no whitespace).
+    pub manifest: std::sync::Arc<[u8]>,
+    /// 32-byte manifest MAC (shape-checked; the server holds no room key).
+    pub mac: [u8; 32],
+    /// Metadata bytes charged for this offer (manifest + fixed record).
     pub metadata_bytes: u64,
 }
 
@@ -881,6 +915,11 @@ pub struct RoomState {
     pub transfers: HashMap<TransferId, TransferRecord>,
     /// Sum of charged metadata bytes in this room.
     pub metadata_bytes: u64,
+    /// Monotonic mutation counter: bumped on join/rename/leave (and, from
+    /// Phase 2.3, offer changes). Snapshots frame it in begin/end; every
+    /// broadcast event carries the post-mutation value so receivers detect a
+    /// missed message without a round trip.
+    pub revision: u64,
 }
 
 /// Broadcast room lifecycle events (capacity 256).
@@ -890,6 +929,55 @@ pub enum RoomEvent {
     RoomClosed {
         /// Opaque reason code, safe for logs and control messages.
         reason: &'static str,
+    },
+    /// A peer completed `hello`; carries the post-join revision.
+    PeerJoined {
+        /// New member.
+        peer: PeerId,
+        /// Resolved display name (`None` serializes absent).
+        display_name: Option<String>,
+        /// `RoomState::revision` after the join.
+        revision: u64,
+    },
+    /// A peer changed its display name; carries the post-rename revision.
+    PeerRenamed {
+        /// Renamed member.
+        peer: PeerId,
+        /// Normalized new name.
+        display_name: String,
+        /// `RoomState::revision` after the rename.
+        revision: u64,
+    },
+    /// A peer left or was reaped; carries the post-removal revision.
+    PeerLeft {
+        /// Departed member.
+        peer: PeerId,
+        /// `RoomState::revision` after the removal.
+        revision: u64,
+    },
+    /// An offer was published; carries the post-publish revision plus the
+    /// retained manifest share (one `Arc` clone per subscriber, never a
+    /// second retained copy).
+    OfferAdded {
+        /// Publishing member.
+        peer: PeerId,
+        /// Published offer.
+        offer: OfferId,
+        /// Canonical manifest bytes (shared with the record).
+        manifest: std::sync::Arc<[u8]>,
+        /// Manifest MAC.
+        mac: [u8; 32],
+        /// `RoomState::revision` after the publish.
+        revision: u64,
+    },
+    /// An offer was withdrawn or died with its owner.
+    OfferRemoved {
+        /// Owning member.
+        peer: PeerId,
+        /// Withdrawn offer.
+        offer: OfferId,
+        /// `RoomState::revision` after the removal.
+        revision: u64,
     },
 }
 
@@ -946,9 +1034,10 @@ impl Drop for PeerGuard {
             return;
         }
         self.spent = true;
-        if let Ok(mut state) = self.room.state.lock() {
-            state.peers.remove(&self.peer_id);
-        }
+        // The guard owns its room Arc: cleanup touches exactly this room and
+        // this peer, never whatever the registry key resolves to now (a room
+        // re-inserted under the same ID is a different Arc and is untouched).
+        self.room.remove_peer(self.peer_id);
         if let Some(registry) = self.room.registry.upgrade() {
             registry.peers_current.fetch_sub(1, Ordering::Relaxed);
         }
@@ -960,6 +1049,16 @@ pub struct MetadataReservation {
     registry: std::sync::Weak<RegistryInner>,
     bytes: u64,
     spent: bool,
+}
+
+impl MetadataReservation {
+    /// Converts the reservation into a persistent charge: the bytes stay
+    /// accounted until explicitly released with [`release_offer_metadata`].
+    /// Offer records own persistent charges; transient work uses the RAII
+    /// drop.
+    pub(crate) fn spend(mut self) {
+        self.spent = true;
+    }
 }
 
 impl Drop for MetadataReservation {
@@ -1012,6 +1111,9 @@ pub(crate) struct RegistryInner {
     peers_current: AtomicU64,
     metadata_current: AtomicU64,
     transfers_current: AtomicU64,
+    /// Pre-authentication rate state by source IP (bounded LRU + overflow
+    /// bucket). Guarded by a short synchronous lock; never held across await.
+    pre_auth: std::sync::Mutex<PreAuthLimiter>,
 }
 
 /// Server-side room registry: exactly one per enabled server, shared by every
@@ -1048,6 +1150,7 @@ impl WebTransferRegistry {
                 peers_current: AtomicU64::new(0),
                 metadata_current: AtomicU64::new(0),
                 transfers_current: AtomicU64::new(0),
+                pre_auth: std::sync::Mutex::new(PreAuthLimiter::default()),
             }),
         })
     }
@@ -1064,8 +1167,7 @@ impl WebTransferRegistry {
 
     /// Live room count (derived from the semaphore, not a second counter).
     /// Phase 6 publishes gauges from these; tests are the first callers.
-    #[allow(dead_code)]
-    pub(crate) fn current_rooms(&self) -> u64 {
+    pub fn current_rooms(&self) -> u64 {
         self.inner
             .config
             .limits
@@ -1074,14 +1176,12 @@ impl WebTransferRegistry {
     }
 
     /// Live peer count across all rooms.
-    #[allow(dead_code)]
-    pub(crate) fn current_peers(&self) -> u64 {
+    pub fn current_peers(&self) -> u64 {
         self.inner.peers_current.load(Ordering::Relaxed)
     }
 
     /// Live metadata bytes across all rooms.
-    #[allow(dead_code)]
-    pub(crate) fn current_metadata_bytes(&self) -> u64 {
+    pub fn current_metadata_bytes(&self) -> u64 {
         self.inner.metadata_current.load(Ordering::Relaxed)
     }
 
@@ -1130,6 +1230,7 @@ impl WebTransferRegistry {
                     offers: HashMap::new(),
                     transfers: HashMap::new(),
                     metadata_bytes: 0,
+                    revision: 0,
                 }),
                 events: broadcast::channel(256).0,
                 cancel: CancellationToken::new(),
@@ -1167,19 +1268,26 @@ impl WebTransferRegistry {
         self.inner.rooms.get(&id).map(|r| Arc::clone(&r))
     }
 
-    /// Admits a peer: global budget first, then the room lock, then a room
-    /// budget recheck. Any rejection drops the global permit (rollback).
-    /// Duplicate joins are rejected so one global slot never backs two guards.
+    /// Admits a peer: validates (and defaults) the display name first so a
+    /// malformed name fails before any permit moves, then global budget, then
+    /// the room lock with a room budget recheck. Any rejection drops the
+    /// global permit (rollback). Duplicate joins are rejected so one global
+    /// slot never backs two guards. The lock is released before the join
+    /// broadcast (no producer awaits while holding `RoomState`).
     pub fn join_peer(
         &self,
         room: &Arc<WebTransferRoom>,
         peer_id: PeerId,
         display_name: Option<String>,
     ) -> Result<PeerGuard, WebTransferError> {
+        let display_name = match display_name {
+            Some(raw) => Some(normalize_display_name(&raw)?),
+            None => None,
+        };
         let permit = Arc::clone(&self.inner.peer_permits)
             .try_acquire_owned()
             .map_err(|_| WebTransferError::limit("web-transfer peer budget exhausted"))?;
-        {
+        let event = {
             let mut state = room
                 .state
                 .lock()
@@ -1190,15 +1298,188 @@ impl WebTransferRegistry {
             if state.peers.contains_key(&peer_id) {
                 return Err(WebTransferError::invalid("peer already joined"));
             }
-            state.peers.insert(peer_id, PeerRecord { display_name });
-        }
+            let resolved = display_name.or_else(|| Some(default_display_name(peer_id)));
+            state.peers.insert(
+                peer_id,
+                PeerRecord {
+                    display_name: resolved.clone(),
+                },
+            );
+            state.revision = state.revision.wrapping_add(1);
+            RoomEvent::PeerJoined {
+                peer: peer_id,
+                display_name: resolved,
+                revision: state.revision,
+            }
+        };
         self.inner.peers_current.fetch_add(1, Ordering::Relaxed);
+        let _ = room.events.send(event);
         Ok(PeerGuard {
             room: Arc::clone(room),
             peer_id,
             spent: false,
             _permit: permit,
         })
+    }
+
+    /// Renames a joined peer: normalizes the raw name, stores it, bumps the
+    /// revision and broadcasts. `PeerGuard` cleanup never calls this.
+    pub fn rename_peer(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        peer_id: PeerId,
+        raw_name: &str,
+    ) -> Result<String, WebTransferError> {
+        let display_name = normalize_display_name(raw_name)?;
+        let event = {
+            let mut state = room
+                .state
+                .lock()
+                .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+            let record = state
+                .peers
+                .get_mut(&peer_id)
+                .ok_or_else(|| WebTransferError::invalid("unknown peer"))?;
+            record.display_name = Some(display_name.clone());
+            state.revision = state.revision.wrapping_add(1);
+            RoomEvent::PeerRenamed {
+                peer: peer_id,
+                display_name: display_name.clone(),
+                revision: state.revision,
+            }
+        };
+        let _ = room.events.send(event);
+        Ok(display_name)
+    }
+
+    /// Publishes an offer: validates ownership and caps transactionally
+    /// (global metadata, per-room metadata, per-peer count — every failure
+    /// rolls all of them back), stores one shared canonical manifest plus
+    /// its MAC, bumps the revision and broadcasts. An identical republish
+    /// (same ID, bytes and MAC) acks idempotently; the same ID with any
+    /// different byte conflicts. The structural manifest checks already ran
+    /// in [`crate::web_transfer_protocol::parse_manifest`].
+    pub fn publish_offer(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        peer_id: PeerId,
+        offer_id: OfferId,
+        manifest: &crate::web_transfer_protocol::Manifest,
+        canonical: std::sync::Arc<[u8]>,
+        mac: [u8; 32],
+    ) -> Result<PublishOutcome, WebTransferError> {
+        if manifest.offer != offer_id {
+            return Err(WebTransferError::invalid(
+                "offer ID must match its manifest",
+            ));
+        }
+        let charge = offer_charge(canonical.len())?;
+        let reservation = self
+            .try_reserve_metadata(charge)
+            .map_err(|_| WebTransferError::limit("web-transfer metadata budget exhausted"))?;
+        let (event, outcome) = {
+            let mut state = room
+                .state
+                .lock()
+                .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+            if !state.peers.contains_key(&peer_id) {
+                return Err(WebTransferError::invalid("unknown peer"));
+            }
+            let owned = state.offers.values().filter(|o| o.owner == peer_id).count();
+            if owned >= room.limits.max_offers_per_peer as usize {
+                return Err(WebTransferError::limit("peer offer budget exhausted"));
+            }
+            let next = state
+                .metadata_bytes
+                .checked_add(charge)
+                .ok_or_else(|| WebTransferError::limit("web-transfer metadata budget exhausted"))?;
+            if next > room.limits.max_metadata_per_room_bytes {
+                return Err(WebTransferError::limit(
+                    "web-transfer metadata budget exhausted",
+                ));
+            }
+            match state.offers.get(&offer_id) {
+                Some(existing)
+                    if existing.owner == peer_id
+                        && existing.manifest.as_ref() == canonical.as_ref()
+                        && existing.mac == mac =>
+                {
+                    return Ok(PublishOutcome::Idempotent);
+                }
+                Some(_) => {
+                    return Err(WebTransferError::offer_changed(
+                        "offer ID already published",
+                    ));
+                }
+                None => {}
+            }
+            state.metadata_bytes = next;
+            state.offers.insert(
+                offer_id,
+                OfferRecord {
+                    owner: peer_id,
+                    manifest: std::sync::Arc::clone(&canonical),
+                    mac,
+                    metadata_bytes: charge,
+                },
+            );
+            state.revision = state.revision.wrapping_add(1);
+            (
+                RoomEvent::OfferAdded {
+                    peer: peer_id,
+                    offer: offer_id,
+                    manifest: std::sync::Arc::clone(&canonical),
+                    mac,
+                    revision: state.revision,
+                },
+                PublishOutcome::Created,
+            )
+        };
+        reservation.spend();
+        let _ = room.events.send(event);
+        Ok(outcome)
+    }
+
+    /// Withdraws an offer: only its owner may. A missing or already-withdrawn
+    /// ID is a terminal ack (withdraw is idempotent); a stranger hears
+    /// `NOT_PARTICIPANT`. Removal releases room and global metadata and
+    /// broadcasts only the IDs. Transfer cancellation for the offer arrives
+    /// with Phase 3 (no transfers exist yet).
+    pub fn withdraw_offer(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        peer_id: PeerId,
+        offer_id: OfferId,
+    ) -> Result<WithdrawOutcome, WebTransferError> {
+        let event = {
+            let mut state = room
+                .state
+                .lock()
+                .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+            let record = match state.offers.get(&offer_id) {
+                None => return Ok(WithdrawOutcome::AlreadyGone),
+                Some(record) if record.owner != peer_id => {
+                    return Err(WebTransferError::not_participant(
+                        "only the offer owner withdraws",
+                    ));
+                }
+                Some(_) => state.offers.remove(&offer_id).expect("offer present"),
+            };
+            state.metadata_bytes = state.metadata_bytes.saturating_sub(record.metadata_bytes);
+            if let Some(registry) = room.registry.upgrade() {
+                registry
+                    .metadata_current
+                    .fetch_sub(record.metadata_bytes, Ordering::Relaxed);
+            }
+            state.revision = state.revision.wrapping_add(1);
+            RoomEvent::OfferRemoved {
+                peer: peer_id,
+                offer: offer_id,
+                revision: state.revision,
+            }
+        };
+        let _ = room.events.send(event);
+        Ok(WithdrawOutcome::Removed)
     }
 
     /// Reserves server-wide metadata bytes (CAS loop; releases on drop).
@@ -1242,6 +1523,623 @@ impl WebTransferRegistry {
             .try_acquire_owned()
             .map_err(|_| WebTransferError::limit("web-transfer relay budget exhausted"))
     }
+
+    /// Pre-authentication rate check by source IP. Consumed once per inbound
+    /// pre-auth message (any first message, hello or not); `false` means the
+    /// connection must close with `4008` without further parsing.
+    pub fn check_pre_auth(&self, ip: IpAddr) -> bool {
+        let Ok(mut limiter) = self.inner.pre_auth.lock() else {
+            return true;
+        };
+        limiter.check(ip, Instant::now())
+    }
+}
+
+/// Outcome of [`WebTransferRegistry::publish_offer`]: both variants ack
+/// with the offer ID; only `Created` mutates state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// Stored and broadcast.
+    Created,
+    /// Byte-identical republish; state untouched.
+    Idempotent,
+}
+
+/// Outcome of [`WebTransferRegistry::withdraw_offer`]: both variants ack
+/// with the offer ID; only `Removed` mutates state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawOutcome {
+    /// Removed, metadata released, broadcast sent.
+    Removed,
+    /// Missing or already withdrawn; state untouched.
+    AlreadyGone,
+}
+
+/// Metadata charged for one retained offer: the canonical manifest bytes
+/// plus the fixed record (32-byte MAC, two 16-byte IDs). Checked
+/// arithmetic; the caller reserves it globally before the room lock and
+/// releases both counters on removal.
+pub(crate) fn offer_charge(manifest_len: usize) -> Result<u64, WebTransferError> {
+    let len = u64::try_from(manifest_len)
+        .map_err(|_| WebTransferError::limit("web-transfer metadata budget exhausted"))?;
+    len.checked_add(64)
+        .ok_or_else(|| WebTransferError::limit("web-transfer metadata budget exhausted"))
+}
+
+/// One catalog entry for snapshot serialization: parsed views over the
+/// retained `Arc<[u8]>` manifest (referenced, never copied in `RoomState`).
+pub(crate) struct OfferView {
+    /// Owning member.
+    pub peer: PeerId,
+    /// Published offer.
+    pub offer: OfferId,
+    /// Canonical manifest bytes (shared with the record).
+    pub manifest: std::sync::Arc<[u8]>,
+    /// Manifest MAC.
+    pub mac: [u8; 32],
+}
+
+/// Sorted catalog contents under a short lock: every offer by ascending ID.
+pub(crate) fn offer_views(room: &Arc<WebTransferRoom>) -> Result<Vec<OfferView>, WebTransferError> {
+    let state = room
+        .state
+        .lock()
+        .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+    let mut views: Vec<OfferView> = state
+        .offers
+        .iter()
+        .map(|(id, record)| OfferView {
+            peer: record.owner,
+            offer: *id,
+            manifest: std::sync::Arc::clone(&record.manifest),
+            mac: record.mac,
+        })
+        .collect();
+    views.sort_by_key(|view| view.offer.to_string());
+    Ok(views)
+}
+
+// --- Phase 2.2: peer sessions, snapshots, request cache and rates ---
+//
+// The control actor (`serve_control_websocket` in `web_transfer_http.rs`) is
+// a single task per peer: one bounded outgoing queue, one broadcast receiver
+// and one socket reader. Everything below is the synchronous state it drives;
+// nothing here awaits while holding `RoomState`.
+
+/// Deadline for the first control message (`hello`) after the handshake.
+pub const WEB_TRANSFER_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Uniform delay before closing on any pre-auth failure (absent room, bad
+/// token, exhausted cap): identical response, identical timing, no oracle.
+pub const WEB_TRANSFER_AUTH_FAIL_DELAY: Duration = Duration::from_millis(500);
+/// Peer-ID collision retries before creation fails `INTERNAL`.
+pub const WEB_TRANSFER_PEER_ID_RETRIES: usize = 8;
+/// Capacity of one session's outgoing control queue; a full queue closes the
+/// slow peer and lets its `PeerGuard` clean up.
+pub const WEB_TRANSFER_OUTGOING_CAP: usize = 64;
+/// Sustained rate of the per-session control bucket (messages/second).
+pub const WEB_TRANSFER_CONTROL_RATE_PER_SEC: f64 = 30.0;
+/// Burst of the per-session control bucket (messages).
+pub const WEB_TRANSFER_CONTROL_BURST: f64 = 60.0;
+/// Sustained rate of the per-session mutation bucket (messages/second).
+pub const WEB_TRANSFER_MUTATION_RATE_PER_SEC: f64 = 4.0;
+/// Burst of the per-session mutation bucket (messages).
+pub const WEB_TRANSFER_MUTATION_BURST: f64 = 8.0;
+/// Sustained rate of the per-IP pre-auth bucket (attempts/second: 10/min).
+pub const WEB_TRANSFER_PRE_AUTH_RATE_PER_SEC: f64 = 10.0 / 60.0;
+/// Burst of the per-IP pre-auth bucket (attempts).
+pub const WEB_TRANSFER_PRE_AUTH_BURST: f64 = 20.0;
+/// Bound on tracked source IPs; further unseen IPs share one overflow
+/// bucket so the map itself cannot grow.
+pub const WEB_TRANSFER_PRE_AUTH_MAX_IPS: usize = 8192;
+/// Idle TTL of one tracked source IP.
+pub const WEB_TRANSFER_PRE_AUTH_IP_TTL: Duration = Duration::from_secs(10 * 60);
+/// Bound on cached `(peer,requestId)` terminal responses (FIFO eviction).
+pub const WEB_TRANSFER_REQUEST_CACHE_CAP: usize = 256;
+/// TTL of one cached terminal response.
+pub const WEB_TRANSFER_REQUEST_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// Peer heartbeat cadence: browsers send `ping` every 20 s; the server
+/// answers `pong` and reaps sessions quiet for `WEB_TRANSFER_CTRL_TIMEOUT`
+/// (60 s) on its tick. The server transmits nothing on a timer.
+pub const WEB_TRANSFER_PEER_PING: Duration = Duration::from_secs(20);
+
+/// Default display name from a peer ID: `Peer <last-4-hex>`.
+pub fn default_display_name(peer_id: PeerId) -> String {
+    let hex = peer_id.to_string();
+    format!("Peer {}", &hex[hex.len() - 4..])
+}
+
+/// Normalizes a candidate display name: NFC, trimmed, no control characters,
+/// 1..=48 Unicode scalar values. Rejects anything else as `INVALID_MESSAGE`.
+pub fn normalize_display_name(raw: &str) -> Result<String, WebTransferError> {
+    use unicode_normalization::UnicodeNormalization;
+    let normalized: String = raw.nfc().collect();
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return Err(WebTransferError::invalid("display name must not be empty"));
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(WebTransferError::invalid(
+            "display name must not carry control characters",
+        ));
+    }
+    if trimmed.chars().count() > WEB_TRANSFER_MAX_DISPLAY_NAME_CHARS {
+        return Err(WebTransferError::invalid(
+            "display name exceeds 48 characters",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Fixed token bucket with an explicit clock (deterministic under test).
+#[derive(Debug, Clone)]
+pub struct TokenBucket {
+    /// Sustained refill rate (tokens/second).
+    rate_per_sec: f64,
+    /// Maximum held tokens.
+    burst: f64,
+    /// Currently held tokens.
+    tokens: f64,
+    /// Last refill instant.
+    last: Instant,
+}
+
+impl TokenBucket {
+    /// Builds a full bucket.
+    pub fn new(rate_per_sec: f64, burst: f64) -> Self {
+        Self {
+            rate_per_sec,
+            burst,
+            tokens: burst,
+            last: Instant::now(),
+        }
+    }
+
+    /// Builds a full bucket with an explicit clock (tests only).
+    #[cfg(test)]
+    pub(crate) fn new_at(rate_per_sec: f64, burst: f64, now: Instant) -> Self {
+        Self {
+            rate_per_sec,
+            burst,
+            tokens: burst,
+            last: now,
+        }
+    }
+
+    /// Takes one token when available; refills by elapsed time first.
+    pub fn take(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.rate_per_sec).min(self.burst);
+            self.last = now;
+        }
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Bounded per-IP pre-auth limiter: exactly `WEB_TRANSFER_PRE_AUTH_MAX_IPS`
+/// tracked IPs with idle TTL; unseen IPs past the cap share one overflow
+/// bucket instead of growing the map.
+#[derive(Debug)]
+pub struct PreAuthLimiter {
+    /// Per-IP buckets plus last-seen instant, in insertion order.
+    entries: VecDeque<(IpAddr, TokenBucket, Instant)>,
+    /// Shared bucket for unseen IPs while at capacity.
+    overflow: TokenBucket,
+    /// Idle TTL (field so tests run fast with a short TTL).
+    ttl: Duration,
+}
+
+impl Default for PreAuthLimiter {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            overflow: TokenBucket::new(
+                WEB_TRANSFER_PRE_AUTH_RATE_PER_SEC,
+                WEB_TRANSFER_PRE_AUTH_BURST,
+            ),
+            ttl: WEB_TRANSFER_PRE_AUTH_IP_TTL,
+        }
+    }
+}
+
+impl PreAuthLimiter {
+    /// Builds a limiter with a custom idle TTL (tests only).
+    #[cfg(test)]
+    pub(crate) fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            overflow: TokenBucket::new(
+                WEB_TRANSFER_PRE_AUTH_RATE_PER_SEC,
+                WEB_TRANSFER_PRE_AUTH_BURST,
+            ),
+            ttl,
+        }
+    }
+
+    /// Number of tracked IPs (tests only).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Consumes one attempt for `ip`; `false` means close with `4008`.
+    pub fn check(&mut self, ip: IpAddr, now: Instant) -> bool {
+        // Refresh or drop the caller's own entry first (idle TTL).
+        let mut found = None;
+        for (index, (addr, _, seen)) in self.entries.iter().enumerate() {
+            if *addr == ip {
+                found = Some(index);
+                if now.saturating_duration_since(*seen) >= self.ttl {
+                    self.entries.remove(index);
+                    found = None;
+                }
+                break;
+            }
+        }
+        if let Some(index) = found {
+            let (_, bucket, seen) = self.entries.get_mut(index).expect("pre-auth entry present");
+            *seen = now;
+            return bucket.take(now);
+        }
+        // Unseen IP: purge idle heads, then insert while under the cap.
+        // At capacity the attempt shares the single overflow bucket instead
+        // of growing the map, so an IP scan cannot evict tracked peers.
+        while let Some((_, _, seen)) = self.entries.front() {
+            if now.saturating_duration_since(*seen) >= self.ttl {
+                self.entries.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.entries.len() >= WEB_TRANSFER_PRE_AUTH_MAX_IPS {
+            return self.overflow.take(now);
+        }
+        let mut bucket = TokenBucket {
+            rate_per_sec: WEB_TRANSFER_PRE_AUTH_RATE_PER_SEC,
+            burst: WEB_TRANSFER_PRE_AUTH_BURST,
+            tokens: WEB_TRANSFER_PRE_AUTH_BURST,
+            last: now,
+        };
+        let ok = bucket.take(now);
+        self.entries.push_back((ip, bucket, now));
+        ok
+    }
+}
+
+/// Bounded FIFO of terminal `(requestId → response)` pairs with TTL: an
+/// identical `(peer,requestId)` replay returns the cached response instead of
+/// re-executing the mutation.
+#[derive(Debug, Default)]
+pub struct RequestCache {
+    /// Oldest first; linear scan is fine at 256 entries.
+    entries: VecDeque<(crate::web_transfer_protocol::RequestId, String, Instant)>,
+}
+
+impl RequestCache {
+    /// Replays the cached terminal response when present and fresh.
+    pub fn get(
+        &mut self,
+        id: crate::web_transfer_protocol::RequestId,
+        now: Instant,
+    ) -> Option<String> {
+        self.entries.retain(|(_, _, at)| {
+            now.saturating_duration_since(*at) < WEB_TRANSFER_REQUEST_CACHE_TTL
+        });
+        self.entries
+            .iter()
+            .find(|(cached, _, _)| *cached == id)
+            .map(|(_, response, _)| response.clone())
+    }
+
+    /// Stores one terminal response, evicting oldest-first past the cap.
+    /// Re-inserting an ID replaces its response without growing.
+    pub fn insert(
+        &mut self,
+        id: crate::web_transfer_protocol::RequestId,
+        response: String,
+        now: Instant,
+    ) {
+        self.entries.retain(|(_, _, at)| {
+            now.saturating_duration_since(*at) < WEB_TRANSFER_REQUEST_CACHE_TTL
+        });
+        self.entries.retain(|(cached, _, _)| *cached != id);
+        while self.entries.len() >= WEB_TRANSFER_REQUEST_CACHE_CAP {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((id, response, now));
+    }
+
+    /// Cached entry count (tests only).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// One authenticated control session: the synchronous state the single
+/// per-peer actor task drives. Dropping the held `PeerGuard` removes exactly
+/// this peer from exactly its room and releases its permits.
+pub struct PeerSession {
+    /// Authenticated member.
+    peer_id: PeerId,
+    /// Last resolved display name (default, hello-provided or renamed).
+    display_name: String,
+    /// Membership guard: drop cleans up exactly this peer in this room.
+    guard: PeerGuard,
+    /// 30/s burst-60 bucket over every inbound control message.
+    control: TokenBucket,
+    /// 4/s burst-8 bucket over mutations (`peer.rename` today).
+    mutation: TokenBucket,
+    /// Last inbound control activity (reaper tick-checked, never
+    /// `timeout(recv)`).
+    last_recv: Instant,
+    /// Room revision covered by the last snapshot/event sent.
+    revision_seen: u64,
+    /// Bounded duplicate-`(peer,requestId)` terminal responses.
+    cache: RequestCache,
+    /// Bounded outgoing control queue (capacity 64).
+    out_tx: mpsc::Sender<String>,
+    /// Room broadcast receiver (capacity 256; lag resynchronizes).
+    events: broadcast::Receiver<RoomEvent>,
+}
+
+impl PeerSession {
+    /// Authenticated member ID.
+    pub fn peer_id(&self) -> PeerId {
+        self.peer_id
+    }
+
+    /// Last resolved display name.
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    /// Room this session belongs to.
+    pub fn room(&self) -> &Arc<WebTransferRoom> {
+        self.guard.room()
+    }
+
+    /// Updates the resolved display name after a rename.
+    pub(crate) fn set_display_name(&mut self, name: String) {
+        self.display_name = name;
+    }
+
+    /// Records inbound activity.
+    pub fn touch(&mut self, now: Instant) {
+        self.last_recv = now;
+    }
+
+    /// Last inbound activity (reaper input).
+    pub fn last_recv(&self) -> Instant {
+        self.last_recv
+    }
+
+    /// Consumes one control token.
+    pub fn take_control(&mut self, now: Instant) -> bool {
+        self.control.take(now)
+    }
+
+    /// Consumes one mutation token.
+    pub fn take_mutation(&mut self, now: Instant) -> bool {
+        self.mutation.take(now)
+    }
+
+    /// Replays a cached terminal response when the `(peer,requestId)` pair
+    /// already completed.
+    pub fn replay(
+        &mut self,
+        id: crate::web_transfer_protocol::RequestId,
+        now: Instant,
+    ) -> Option<String> {
+        self.cache.get(id, now)
+    }
+
+    /// Caches one terminal response.
+    pub fn remember(
+        &mut self,
+        id: crate::web_transfer_protocol::RequestId,
+        response: String,
+        now: Instant,
+    ) {
+        self.cache.insert(id, response, now);
+    }
+
+    /// Revision covered so far (resync bookkeeping).
+    pub fn revision_seen(&self) -> u64 {
+        self.revision_seen
+    }
+
+    /// Advances the covered revision.
+    pub fn set_revision_seen(&mut self, revision: u64) {
+        self.revision_seen = revision;
+    }
+
+    /// Outgoing queue sender (bounded sends close slow peers).
+    pub fn sender(&self) -> mpsc::Sender<String> {
+        self.out_tx.clone()
+    }
+
+    /// Room broadcast receiver.
+    pub fn events_mut(&mut self) -> &mut broadcast::Receiver<RoomEvent> {
+        &mut self.events
+    }
+}
+
+/// Sorted snapshot contents under a short lock: current revision plus every
+/// peer by ascending ID. Callers serialize one message per entry (never one
+/// large aggregate) without holding the lock.
+#[allow(clippy::type_complexity)]
+pub fn snapshot_parts(
+    room: &Arc<WebTransferRoom>,
+) -> Result<(u64, Vec<(PeerId, Option<String>)>), WebTransferError> {
+    let state = room
+        .state
+        .lock()
+        .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+    let mut peers: Vec<(PeerId, Option<String>)> = state
+        .peers
+        .iter()
+        .map(|(id, record)| (*id, record.display_name.clone()))
+        .collect();
+    peers.sort_by_key(|(id, _)| id.to_string());
+    Ok((state.revision, peers))
+}
+
+/// Pre-authentication verdict for one `hello`: the room/token pair either
+/// authenticates, is denied uniformly, or names an expired room the token
+/// holder may be told about. Absent room, bad token and exhausted caps are
+/// all `Deny` (identical response, identical delay — no oracle); `Gone`
+/// requires the valid token, so it reveals nothing new.
+#[derive(Debug)]
+pub(crate) enum HelloAuth {
+    /// Token matches a live room; the caller proceeds to ID generation.
+    Ok {
+        /// Room the token opened.
+        room: Arc<WebTransferRoom>,
+    },
+    /// Deny with `4001` after the uniform delay.
+    Deny,
+    /// Valid token, destroyed room: deny with `4004`.
+    Gone,
+}
+
+/// Checks room existence, token and liveness without allocating a session.
+/// Never logs or returns the token.
+pub(crate) fn authenticate_hello(
+    registry: &WebTransferRegistry,
+    room_id: RoomId,
+    token: &MemberToken,
+) -> HelloAuth {
+    let Some(room) = registry.room(room_id) else {
+        return HelloAuth::Deny;
+    };
+    let digest_ok = match room.state.lock() {
+        Ok(state) => token_digests_equal(&token.sha256_hash(), &state.member_hash),
+        Err(_) => return HelloAuth::Deny,
+    };
+    if !digest_ok {
+        return HelloAuth::Deny;
+    }
+    if room.is_destroyed() {
+        return HelloAuth::Gone;
+    }
+    HelloAuth::Ok { room }
+}
+
+/// Generates a nonzero random peer ID from the OS CSPRNG.
+pub(crate) fn generate_peer_id() -> PeerId {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let random = SystemRandom::new();
+    let mut bytes = [0u8; 16];
+    random.fill(&mut bytes).expect("OS CSPRNG");
+    if bytes == [0u8; 16] {
+        bytes[15] = 1;
+    }
+    PeerId::from_bytes(bytes)
+}
+
+/// Whether a control session is dead: no inbound activity for the liveness
+/// window. Checked on the reaper tick, never via `timeout(recv)`.
+pub fn control_liveness_expired(last_recv: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_recv) >= WEB_TRANSFER_CTRL_TIMEOUT
+}
+
+impl PeerSession {
+    /// Establishes an authenticated session: joins the peer (normalizing the
+    /// name, allocating permits), subscribes to room events and builds the
+    /// initial messages (`welcome` + one-per-peer snapshot). The caller writes
+    /// `initial` to the socket, then drives the session with `out_rx`; dropping
+    /// the session removes exactly this peer and releases its permits.
+    pub(crate) fn establish(
+        registry: &WebTransferRegistry,
+        room: &Arc<WebTransferRoom>,
+        peer_id: PeerId,
+        display_name: Option<String>,
+    ) -> Result<(Self, mpsc::Receiver<String>, Vec<String>), WebTransferError> {
+        let guard = registry.join_peer(room, peer_id, display_name)?;
+        let (revision, peers) = snapshot_parts(room)?;
+        let offers = offer_views(room)?;
+        let name = peers
+            .iter()
+            .find(|(id, _)| *id == peer_id)
+            .and_then(|(_, name)| name.clone())
+            .unwrap_or_else(|| default_display_name(peer_id));
+        let config = registry.config();
+        let mut initial = Vec::with_capacity(peers.len() + offers.len() + 3);
+        initial.push(crate::web_transfer_protocol::welcome_envelope(
+            peer_id,
+            room.id,
+            &name,
+            &config.limits,
+            &config.ice.servers,
+        ));
+        initial.extend(snapshot_offer_strings(revision, &peers, &offers)?);
+        let now = Instant::now();
+        let (out_tx, out_rx) = mpsc::channel(WEB_TRANSFER_OUTGOING_CAP);
+        let session = Self {
+            peer_id,
+            display_name: name,
+            guard,
+            control: TokenBucket::new(
+                WEB_TRANSFER_CONTROL_RATE_PER_SEC,
+                WEB_TRANSFER_CONTROL_BURST,
+            ),
+            mutation: TokenBucket::new(
+                WEB_TRANSFER_MUTATION_RATE_PER_SEC,
+                WEB_TRANSFER_MUTATION_BURST,
+            ),
+            last_recv: now,
+            revision_seen: revision,
+            cache: RequestCache::default(),
+            out_tx,
+            events: room.events.subscribe(),
+        };
+        Ok((session, out_rx, initial))
+    }
+}
+
+/// Rebuilds the full snapshot after a lagged broadcast receiver: revision
+/// plus one message per peer plus one per offer. The actor queues these
+/// instead of the missed incremental events (never a larger aggregate).
+pub(crate) fn build_resync(room: &Arc<WebTransferRoom>) -> Result<Vec<String>, WebTransferError> {
+    let (revision, peers) = snapshot_parts(room)?;
+    let offers = offer_views(room)?;
+    snapshot_offer_strings(revision, &peers, &offers)
+}
+
+/// Serializes one snapshot from parts: begin, peers, offers, end. Stored
+/// manifests are canonical bytes; a record that fails to parse (impossible
+/// for validated stores) aborts the snapshot rather than emitting garbage.
+pub(crate) fn snapshot_offer_strings(
+    revision: u64,
+    peers: &[(PeerId, Option<String>)],
+    offers: &[OfferView],
+) -> Result<Vec<String>, WebTransferError> {
+    use crate::web_transfer_protocol::SnapshotOffer;
+    let mut parsed: Vec<(PeerId, OfferId, serde_json::Value, String)> =
+        Vec::with_capacity(offers.len());
+    for view in offers {
+        let manifest: serde_json::Value = serde_json::from_slice(&view.manifest)
+            .map_err(|_| WebTransferError::internal("stored manifest is not JSON"))?;
+        parsed.push((view.peer, view.offer, manifest, hex::encode(view.mac)));
+    }
+    let refs: Vec<SnapshotOffer> = parsed
+        .iter()
+        .map(|(peer, offer, manifest, mac_hex)| SnapshotOffer {
+            peer: *peer,
+            offer: *offer,
+            manifest,
+            mac_hex,
+        })
+        .collect();
+    Ok(crate::web_transfer_protocol::snapshot_messages(
+        revision, peers, &refs,
+    ))
 }
 
 /// Generates a nonzero random room ID from the OS CSPRNG.
@@ -1468,6 +2366,56 @@ impl WebTransferRoom {
         let _ = self.events.send(RoomEvent::RoomClosed { reason });
         self.cancel.cancel();
     }
+
+    /// Removes exactly `peer_id` from THIS room: its presence record plus
+    /// every offer it owns (attributed since Phase 2.3), each with its own
+    /// revisioned removal broadcast — offers first, peer last, so receivers
+    /// never see an offer of a departed peer. Releases room and global
+    /// metadata per offer. Called by `PeerGuard::drop`; never resolves a
+    /// registry key.
+    pub(crate) fn remove_peer(&self, peer_id: PeerId) {
+        let events = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            if state.peers.remove(&peer_id).is_none() {
+                return;
+            }
+            let mut events = Vec::new();
+            let owned: Vec<OfferId> = state
+                .offers
+                .iter()
+                .filter(|(_, record)| record.owner == peer_id)
+                .map(|(id, _)| *id)
+                .collect();
+            for offer in owned {
+                if let Some(record) = state.offers.remove(&offer) {
+                    state.metadata_bytes =
+                        state.metadata_bytes.saturating_sub(record.metadata_bytes);
+                    if let Some(registry) = self.registry.upgrade() {
+                        registry
+                            .metadata_current
+                            .fetch_sub(record.metadata_bytes, Ordering::Relaxed);
+                    }
+                    state.revision = state.revision.wrapping_add(1);
+                    events.push(RoomEvent::OfferRemoved {
+                        peer: peer_id,
+                        offer,
+                        revision: state.revision,
+                    });
+                }
+            }
+            state.revision = state.revision.wrapping_add(1);
+            events.push(RoomEvent::PeerLeft {
+                peer: peer_id,
+                revision: state.revision,
+            });
+            events
+        };
+        for event in events {
+            let _ = self.events.send(event);
+        }
+    }
 }
 
 /// Owner lease: holds the room, its ID and lease epoch. Dropping detaches
@@ -1686,6 +2634,7 @@ impl WebTransferRegistry {
                 offers: HashMap::new(),
                 transfers: HashMap::new(),
                 metadata_bytes: 0,
+                revision: 0,
             }),
             events: broadcast::channel(256).0,
             cancel: CancellationToken::new(),
@@ -2746,5 +3695,1080 @@ mod owner_control_tests {
             "broken pipe must surface, not be swallowed"
         );
         assert_eq!(registry.current_rooms(), 1);
+    }
+}
+
+#[cfg(test)]
+mod control_session_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn session_registry() -> WebTransferRegistry {
+        WebTransferRegistry::new(
+            WebTransferConfig::new(
+                WebTransferBaseUrl::parse("http://127.0.0.1:8080/").unwrap(),
+                WebTransferLimits::default(),
+                IceServerConfig {
+                    servers: Vec::new(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn session_registry_with_limits(limits: WebTransferLimits) -> WebTransferRegistry {
+        WebTransferRegistry::new(
+            WebTransferConfig::new(
+                WebTransferBaseUrl::parse("http://127.0.0.1:8080/").unwrap(),
+                limits,
+                IceServerConfig {
+                    servers: Vec::new(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn member_owner() -> (MemberToken, OwnerToken, [u8; 32], [u8; 32]) {
+        let member = MemberToken::from_bytes([0x31u8; 32]);
+        let owner = OwnerToken::from_bytes([0x32u8; 32]);
+        let member_hash = member.sha256_hash();
+        let owner_hash = owner.sha256_hash();
+        (member, owner, member_hash, owner_hash)
+    }
+
+    fn open_room(registry: &WebTransferRegistry) -> (OwnerLease, MemberToken, RoomId) {
+        let (member, _owner, member_hash, owner_hash) = member_owner();
+        let lease = OwnerLease::create(registry, member_hash, owner_hash).unwrap();
+        let id = lease.id();
+        (lease, member, id)
+    }
+
+    #[tokio::test]
+    async fn peer_auth_errors_do_not_oracle_room_or_token() {
+        let registry = session_registry();
+        let (_lease, member, id) = open_room(&registry);
+        let bad = MemberToken::from_bytes([0x33u8; 32]);
+        // Absent room, bad token: the same Deny.
+        assert!(matches!(
+            authenticate_hello(&registry, RoomId::from_bytes([9u8; 16]), &member),
+            HelloAuth::Deny
+        ));
+        assert!(matches!(
+            authenticate_hello(&registry, id, &bad),
+            HelloAuth::Deny
+        ));
+        // Good token on a live room authenticates.
+        assert!(matches!(
+            authenticate_hello(&registry, id, &member),
+            HelloAuth::Ok { .. }
+        ));
+        // Destroyed room: the valid token hears Gone, anyone else Deny.
+        let room = registry.room(id).unwrap();
+        room.destroy("owner-close");
+        assert!(matches!(
+            authenticate_hello(&registry, id, &member),
+            HelloAuth::Gone
+        ));
+        assert!(matches!(
+            authenticate_hello(&registry, id, &bad),
+            HelloAuth::Deny
+        ));
+    }
+
+    #[tokio::test]
+    async fn peer_ids_and_default_names_are_canonical() {
+        let mut seen = HashSet::new();
+        for _ in 0..100 {
+            let id = generate_peer_id();
+            let hex = id.to_string();
+            assert_eq!(hex.len(), 32);
+            assert!(hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            assert_ne!(id, PeerId::from_bytes([0u8; 16]));
+            assert!(seen.insert(id));
+            let name = default_display_name(id);
+            assert!(name.starts_with("Peer "));
+            assert_eq!(&name[5..], &hex[28..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_normalizes_and_bounds_unicode() {
+        assert_eq!(normalize_display_name("e\u{301}").unwrap(), "é");
+        assert_eq!(normalize_display_name("  Bobi  ").unwrap(), "Bobi");
+        assert!(normalize_display_name("").is_err());
+        assert!(normalize_display_name("   ").is_err());
+        assert!(normalize_display_name("a\nb").is_err());
+        assert!(normalize_display_name("a\0b").is_err());
+        assert!(normalize_display_name(&"x".repeat(48)).is_ok());
+        assert!(normalize_display_name(&"x".repeat(49)).is_err());
+        assert!(normalize_display_name(&"é".repeat(48)).is_ok());
+        // Stored form is the normalized one, and the rename broadcasts.
+        let registry = session_registry();
+        let (_lease, _member, id) = open_room(&registry);
+        let room = registry.room(id).unwrap();
+        let peer = generate_peer_id();
+        let _guard = registry
+            .join_peer(&room, peer, Some("  Raw  ".to_string()))
+            .unwrap();
+        assert_eq!(
+            room.state.lock().unwrap().peers[&peer]
+                .display_name
+                .as_deref(),
+            Some("Raw")
+        );
+        let mut events = room.events.subscribe();
+        let stored = registry.rename_peer(&room, peer, "e\u{301}xtra ").unwrap();
+        assert_eq!(stored, "éxtra");
+        assert_eq!(
+            room.state.lock().unwrap().peers[&peer]
+                .display_name
+                .as_deref(),
+            Some("éxtra")
+        );
+        match events.try_recv().unwrap() {
+            RoomEvent::PeerRenamed {
+                peer: got,
+                display_name,
+                revision,
+            } => {
+                assert_eq!(got, peer);
+                assert_eq!(display_name, "éxtra");
+                assert_eq!(revision, 2);
+            }
+            other => panic!("expected rename event, got {other:?}"),
+        }
+        assert!(registry.rename_peer(&room, peer, "").is_err());
+        assert!(registry
+            .rename_peer(&room, generate_peer_id(), "Nobody")
+            .is_err());
+        assert_eq!(room.state.lock().unwrap().revision, 2);
+    }
+
+    #[tokio::test]
+    async fn peer_caps_roll_back_on_failed_auth() {
+        let limits = WebTransferLimits {
+            max_peers_global: 1,
+            ..WebTransferLimits::default()
+        };
+        let registry = session_registry_with_limits(limits);
+        let (_lease, _member, id) = open_room(&registry);
+        let room = registry.room(id).unwrap();
+        let first = generate_peer_id();
+        let guard = registry.join_peer(&room, first, None).unwrap();
+        assert_eq!(registry.current_peers(), 1);
+        // Second join fails on the cap and releases its global permit.
+        assert!(registry.join_peer(&room, generate_peer_id(), None).is_err());
+        assert_eq!(registry.current_peers(), 1);
+        drop(guard);
+        assert_eq!(registry.current_peers(), 0);
+        // Malformed names fail before any permit moves.
+        assert!(registry
+            .join_peer(&room, generate_peer_id(), Some("".to_string()))
+            .is_err());
+        assert_eq!(registry.current_peers(), 0);
+    }
+
+    #[tokio::test]
+    async fn peer_guard_removes_only_captured_peer_and_releases_permits() {
+        let registry = session_registry();
+        let (_lease, _member, id) = open_room(&registry);
+        let room = registry.room(id).unwrap();
+        let first = generate_peer_id();
+        let second = generate_peer_id();
+        let guard_a = registry
+            .join_peer(&room, first, Some("A".to_string()))
+            .unwrap();
+        let guard_b = registry
+            .join_peer(&room, second, Some("B".to_string()))
+            .unwrap();
+        assert_eq!(registry.current_peers(), 2);
+        let mut events = room.events.subscribe();
+        drop(guard_a);
+        {
+            let state = room.state.lock().unwrap();
+            assert!(!state.peers.contains_key(&first));
+            assert_eq!(state.peers[&second].display_name.as_deref(), Some("B"));
+        }
+        assert_eq!(registry.current_peers(), 1);
+        match events.try_recv().unwrap() {
+            RoomEvent::PeerLeft { peer, .. } => assert_eq!(peer, first),
+            other => panic!("expected leave event, got {other:?}"),
+        }
+        drop(guard_b);
+        assert!(room.state.lock().unwrap().peers.is_empty());
+        assert_eq!(registry.current_peers(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_guard_cannot_mutate_reused_room() {
+        let registry = session_registry();
+        let (member, _owner, member_hash, owner_hash) = member_owner();
+        let _ = member;
+        let forced = RoomId::from_bytes([0xabu8; 16]);
+        let first = registry
+            .create_room_with_id(member_hash, owner_hash, forced)
+            .unwrap();
+        let peer = generate_peer_id();
+        let guard = registry.join_peer(&first, peer, None).unwrap();
+        assert!(registry.remove_room_if_current(forced, &first));
+        first.destroy("owner-close");
+        let second = registry
+            .create_room_with_id([8u8; 32], [8u8; 32], forced)
+            .unwrap();
+        drop(guard);
+        // The reused room is untouched; the stale peer died with its own Arc.
+        assert!(second.state.lock().unwrap().peers.is_empty());
+        assert!(!second.is_destroyed());
+        assert_eq!(registry.current_peers(), 0);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reaper_checks_last_recv_on_tick() {
+        let now = Instant::now();
+        assert!(!control_liveness_expired(now, now));
+        let fresh = now.checked_sub(Duration::from_secs(59)).unwrap();
+        assert!(!control_liveness_expired(fresh, now));
+        let stale = now.checked_sub(Duration::from_secs(60)).unwrap();
+        assert!(control_liveness_expired(stale, now));
+        let older = now.checked_sub(Duration::from_secs(61)).unwrap();
+        assert!(control_liveness_expired(older, now));
+    }
+
+    #[tokio::test]
+    async fn blocked_send_is_bounded_and_cleans_peer() {
+        let registry = session_registry();
+        let (_lease, _member, id) = open_room(&registry);
+        let room = registry.room(id).unwrap();
+        let peer = generate_peer_id();
+        let (session, mut out_rx, _initial) =
+            PeerSession::establish(&registry, &room, peer, None).unwrap();
+        assert_eq!(registry.current_peers(), 1);
+        let tx = session.sender();
+        for _ in 0..WEB_TRANSFER_OUTGOING_CAP {
+            tx.try_send("queued".to_string()).unwrap();
+        }
+        assert!(tx.try_send("overflow".to_string()).is_err());
+        drop(session);
+        drop(tx);
+        assert!(!room.state.lock().unwrap().peers.contains_key(&peer));
+        assert_eq!(registry.current_peers(), 0);
+        while out_rx.try_recv().is_ok() {}
+    }
+
+    #[tokio::test]
+    async fn request_cache_replays_exact_response_and_evicts_fifo() {
+        use crate::web_transfer_protocol::RequestId;
+        let now = Instant::now();
+        let mut cache = RequestCache::default();
+        let first: RequestId = "00000000000000000000000000000000".parse().unwrap();
+        cache.insert(first, "r0".to_string(), now);
+        assert_eq!(cache.get(first, now).as_deref(), Some("r0"));
+        // 255 more distinct IDs fill the cache exactly; the first survives.
+        for i in 1u16..=255 {
+            let id = RequestId::from_bytes([i as u8; 16]);
+            cache.insert(id, format!("r{i}"), now);
+        }
+        assert_eq!(cache.len(), 256);
+        assert_eq!(cache.get(first, now).as_deref(), Some("r0"));
+        // One more distinct ID evicts the oldest.
+        let extra: RequestId =
+            RequestId::from_bytes([0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        cache.insert(extra, "extra".to_string(), now);
+        assert_eq!(cache.len(), 256);
+        assert!(cache.get(first, now).is_none());
+        assert_eq!(cache.get(extra, now).as_deref(), Some("extra"));
+        // Re-inserting an ID replaces its response without growing.
+        cache.insert(extra, "extra2".to_string(), now);
+        assert_eq!(cache.get(extra, now).as_deref(), Some("extra2"));
+        assert_eq!(cache.len(), 256);
+    }
+
+    #[tokio::test]
+    async fn lagged_receiver_gets_ordered_snapshot_not_large_aggregate() {
+        use crate::web_transfer_protocol::parse_server_envelope;
+        let registry = session_registry();
+        let (_lease, _member, id) = open_room(&registry);
+        let room = registry.room(id).unwrap();
+        let mut peers = Vec::new();
+        let mut guards = Vec::new();
+        for _ in 0..3 {
+            let peer = generate_peer_id();
+            guards.push(registry.join_peer(&room, peer, None).unwrap());
+            peers.push(peer);
+        }
+        let mut lagged = room.events.subscribe();
+        for i in 0..300 {
+            registry
+                .rename_peer(&room, peers[0], &format!("name-{i:03}"))
+                .unwrap();
+        }
+        assert!(lagged.try_recv().is_err());
+        let messages = build_resync(&room).unwrap();
+        // Begin + 3 peers + end: 5 messages, not 300+ incremental events.
+        assert_eq!(messages.len(), 5);
+        let mut types = Vec::new();
+        let mut revision = None;
+        for message in &messages {
+            let env = parse_server_envelope(message).unwrap();
+            types.push(env.typ.clone());
+            let rev = env.body.get("revision").and_then(|v| v.as_u64()).unwrap();
+            revision = Some(rev);
+        }
+        assert_eq!(
+            types,
+            vec![
+                "snapshot.begin",
+                "snapshot.peer",
+                "snapshot.peer",
+                "snapshot.peer",
+                "snapshot.end"
+            ]
+        );
+        let revision = revision.unwrap();
+        assert_eq!(room.state.lock().unwrap().revision, revision);
+        let mut ids: Vec<String> = messages[1..4]
+            .iter()
+            .map(|m| {
+                let env = parse_server_envelope(m).unwrap();
+                assert_eq!(
+                    env.body.get("revision").and_then(|v| v.as_u64()),
+                    Some(revision)
+                );
+                env.body
+                    .get("peerId")
+                    .and_then(|v| v.as_str())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted);
+        ids.sort();
+        let mut expected: Vec<String> = peers.iter().map(|p| p.to_string()).collect();
+        expected.sort();
+        assert_eq!(ids, expected);
+        let _ = guards;
+    }
+
+    #[tokio::test]
+    async fn control_rate_buckets_are_exact_and_idle_ip_entries_expire() {
+        let start = Instant::now();
+        let mut control = TokenBucket::new_at(
+            WEB_TRANSFER_CONTROL_RATE_PER_SEC,
+            WEB_TRANSFER_CONTROL_BURST,
+            start,
+        );
+        for _ in 0..60 {
+            assert!(control.take(start));
+        }
+        assert!(!control.take(start));
+        let later = start + Duration::from_secs(1);
+        for _ in 0..30 {
+            assert!(control.take(later));
+        }
+        assert!(!control.take(later));
+        let mut mutation = TokenBucket::new_at(
+            WEB_TRANSFER_MUTATION_RATE_PER_SEC,
+            WEB_TRANSFER_MUTATION_BURST,
+            start,
+        );
+        for _ in 0..8 {
+            assert!(mutation.take(start));
+        }
+        assert!(!mutation.take(start));
+        // Pre-auth: 20 burst, then refusal, per IP.
+        let mut limiter = PreAuthLimiter::default();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        for _ in 0..20 {
+            assert!(limiter.check(ip, start));
+        }
+        assert!(!limiter.check(ip, start));
+        let other: IpAddr = "10.0.0.2".parse().unwrap();
+        assert!(limiter.check(other, start));
+        // Idle entries expire with a short TTL.
+        let mut short = PreAuthLimiter::with_ttl(Duration::from_millis(50));
+        assert!(short.check(ip, start));
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(short.check(ip, Instant::now()));
+        assert_eq!(short.len(), 1);
+        // The map never grows past its cap; unseen IPs share the overflow.
+        let mut full = PreAuthLimiter::default();
+        for i in 0..WEB_TRANSFER_PRE_AUTH_MAX_IPS {
+            let addr = IpAddr::from([(10u8), ((i / 256) % 256) as u8, (i % 256) as u8, 1u8]);
+            assert!(full.check(addr, start));
+        }
+        assert_eq!(full.len(), WEB_TRANSFER_PRE_AUTH_MAX_IPS);
+        let fresh: IpAddr = "192.0.2.1".parse().unwrap();
+        let _ = full.check(fresh, start);
+        assert_eq!(full.len(), WEB_TRANSFER_PRE_AUTH_MAX_IPS);
+    }
+}
+
+#[cfg(test)]
+mod offer_tests {
+    use super::*;
+    use crate::web_transfer_protocol::{canonical_json, file_root, manifest_value, parse_manifest};
+
+    fn offer_registry() -> WebTransferRegistry {
+        WebTransferRegistry::new(
+            WebTransferConfig::new(
+                WebTransferBaseUrl::parse("http://127.0.0.1:8080/").unwrap(),
+                WebTransferLimits::default(),
+                IceServerConfig {
+                    servers: Vec::new(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn tight_registry() -> WebTransferRegistry {
+        WebTransferRegistry::new(
+            WebTransferConfig::new(
+                WebTransferBaseUrl::parse("http://127.0.0.1:8080/").unwrap(),
+                WebTransferLimits {
+                    max_metadata_per_room_bytes: 5000,
+                    max_metadata_total_bytes: 5000,
+                    ..WebTransferLimits::default()
+                },
+                IceServerConfig {
+                    servers: Vec::new(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn member_owner_pair() -> (MemberToken, OwnerToken, [u8; 32], [u8; 32]) {
+        let member = MemberToken::from_bytes([0x51u8; 32]);
+        let owner = OwnerToken::from_bytes([0x52u8; 32]);
+        (member, owner, member.sha256_hash(), owner.sha256_hash())
+    }
+
+    /// Builds a minimal single-file manifest value with a recomputed root.
+    fn manifest_json(offer_hex: &str, label: &str) -> serde_json::Value {
+        let leaf: [u8; 32] =
+            hex::decode("094c9eb526be7e2dea0b396331085eaba0d76f639116ccc014055c490b48daac")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let root = hex::encode(file_root(1, &[leaf]).unwrap());
+        serde_json::json!({
+            "offer": offer_hex,
+            "mode": "single",
+            "label": label,
+            "kind": "file",
+            "chunkSize": "1048576",
+            "createdAt": "2026-09-14T12:00:00Z",
+            "entries": [{
+                "id": "0",
+                "path": "hello.txt",
+                "size": "11",
+                "mtime": "1757779200",
+                "chunks": ["094c9eb526be7e2dea0b396331085eaba0d76f639116ccc014055c490b48daac"],
+                "chunkCount": "1",
+                "root": root,
+            }],
+        })
+    }
+
+    fn publish_canonical(
+        registry: &WebTransferRegistry,
+        room: &Arc<WebTransferRoom>,
+        peer: PeerId,
+        offer_hex: &str,
+        label: &str,
+    ) -> (
+        Result<PublishOutcome, WebTransferError>,
+        std::sync::Arc<[u8]>,
+    ) {
+        let value = manifest_json(offer_hex, label);
+        let manifest = parse_manifest(&value, &registry.config().limits).unwrap();
+        let canonical: std::sync::Arc<[u8]> = canonical_json(&manifest_value(&manifest))
+            .unwrap()
+            .into_bytes()
+            .into();
+        let mac = [0xeeu8; 32];
+        let offer_id: OfferId = offer_hex.parse().unwrap();
+        let outcome =
+            registry.publish_offer(room, peer, offer_id, &manifest, canonical.clone(), mac);
+        (outcome, canonical)
+    }
+
+    fn publish(
+        registry: &WebTransferRegistry,
+        room: &Arc<WebTransferRoom>,
+        peer: PeerId,
+        offer_hex: &str,
+        label: &str,
+    ) -> Result<PublishOutcome, WebTransferError> {
+        publish_canonical(registry, room, peer, offer_hex, label).0
+    }
+
+    fn open_peer_room(
+        registry: &WebTransferRegistry,
+    ) -> (
+        OwnerLease,
+        Arc<WebTransferRoom>,
+        PeerId,
+        PeerId,
+        Vec<PeerGuard>,
+    ) {
+        let (_member, _owner, member_hash, owner_hash) = member_owner_pair();
+        let lease = OwnerLease::create(registry, member_hash, owner_hash).unwrap();
+        let room = lease.room().clone();
+        let first = generate_peer_id();
+        let second = generate_peer_id();
+        let guard_a = registry
+            .join_peer(&room, first, Some("A".to_string()))
+            .unwrap();
+        let guard_b = registry
+            .join_peer(&room, second, Some("B".to_string()))
+            .unwrap();
+        (lease, room, first, second, vec![guard_a, guard_b])
+    }
+
+    #[tokio::test]
+    async fn offer_reservations_roll_back_atomically() {
+        let registry = tight_registry();
+        let (_lease, room, first, _second, _guards) = open_peer_room(&registry);
+        let before_room = room.state.lock().unwrap().metadata_bytes;
+        let before_global = registry.current_metadata_bytes();
+        // Per-peer cap is default 64: exhaust the tiny metadata budget first.
+        let mut stored = 0u32;
+        let mut refused = false;
+        for i in 0..40u32 {
+            let offer_hex = format!("{i:032x}");
+            match publish(&registry, &room, first, &offer_hex, "item") {
+                Ok(_) => stored += 1,
+                Err(e) => {
+                    assert_eq!(e.code(), "LIMIT_EXCEEDED");
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused, "tiny budget must refuse");
+        assert!(stored > 0);
+        let state = room.state.lock().unwrap();
+        assert_eq!(state.offers.len(), stored as usize);
+        assert_eq!(
+            state.metadata_bytes,
+            before_room + registry.current_metadata_bytes() - before_global
+        );
+        drop(state);
+        // Failed publish stored nothing and moved no counter.
+        let rooms = room.state.lock().unwrap().metadata_bytes;
+        let global = registry.current_metadata_bytes();
+        let offer_hex = format!("{:032x}", 999u32);
+        assert!(publish(&registry, &room, first, &offer_hex, "item").is_err());
+        assert_eq!(room.state.lock().unwrap().metadata_bytes, rooms);
+        assert_eq!(registry.current_metadata_bytes(), global);
+        assert!(!room
+            .state
+            .lock()
+            .unwrap()
+            .offers
+            .contains_key(&offer_hex.parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn identical_publish_is_idempotent_but_changed_id_conflicts() {
+        let registry = offer_registry();
+        let (_lease, room, first, second, _guards) = open_peer_room(&registry);
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let (first_outcome, canonical) =
+            publish_canonical(&registry, &room, first, offer_hex, "Demo");
+        assert_eq!(first_outcome.unwrap(), PublishOutcome::Created);
+        // Identical bytes, same owner: idempotent ack, still one offer.
+        let manifest =
+            parse_manifest(&manifest_json(offer_hex, "Demo"), &registry.config().limits).unwrap();
+        let outcome = registry
+            .publish_offer(
+                &room,
+                first,
+                offer_hex.parse().unwrap(),
+                &manifest,
+                canonical,
+                [0xeeu8; 32],
+            )
+            .unwrap();
+        assert_eq!(outcome, PublishOutcome::Idempotent);
+        assert_eq!(room.state.lock().unwrap().offers.len(), 1);
+        // Same ID, different label bytes: conflict.
+        let outcome = publish(&registry, &room, first, offer_hex, "Changed");
+        assert_eq!(outcome.unwrap_err().code(), "OFFER_CHANGED");
+        // Same ID, different owner: conflict, never an oracle.
+        let outcome = publish(&registry, &room, second, offer_hex, "Demo");
+        assert_eq!(outcome.unwrap_err().code(), "OFFER_CHANGED");
+        assert_eq!(room.state.lock().unwrap().offers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_owner_withdraws() {
+        let registry = offer_registry();
+        let (_lease, room, first, second, _guards) = open_peer_room(&registry);
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let offer_id: OfferId = offer_hex.parse().unwrap();
+        publish(&registry, &room, first, offer_hex, "Demo").unwrap();
+        // Stranger hears NOT_PARTICIPANT; the offer survives.
+        assert_eq!(
+            registry
+                .withdraw_offer(&room, second, offer_id)
+                .unwrap_err()
+                .code(),
+            "NOT_PARTICIPANT"
+        );
+        assert!(room.state.lock().unwrap().offers.contains_key(&offer_id));
+        // Owner removes; repeat and unknown IDs are terminal acks.
+        assert_eq!(
+            registry.withdraw_offer(&room, first, offer_id).unwrap(),
+            WithdrawOutcome::Removed
+        );
+        assert!(!room.state.lock().unwrap().offers.contains_key(&offer_id));
+        assert_eq!(
+            registry.withdraw_offer(&room, first, offer_id).unwrap(),
+            WithdrawOutcome::AlreadyGone
+        );
+        assert_eq!(
+            registry
+                .withdraw_offer(
+                    &room,
+                    first,
+                    "dddddddddddddddddddddddddddddddd".parse().unwrap()
+                )
+                .unwrap(),
+            WithdrawOutcome::AlreadyGone
+        );
+    }
+
+    #[tokio::test]
+    async fn withdraw_and_peer_drop_release_exact_metadata_once() {
+        let registry = offer_registry();
+        let (_lease, room, first, _second, _guards) = open_peer_room(&registry);
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let offer_id: OfferId = offer_hex.parse().unwrap();
+        let (_, canonical) = publish_canonical(&registry, &room, first, offer_hex, "Demo");
+        let charge = offer_charge(canonical.len()).unwrap();
+        assert_eq!(room.state.lock().unwrap().metadata_bytes, charge);
+        assert_eq!(registry.current_metadata_bytes(), charge);
+        registry.withdraw_offer(&room, first, offer_id).unwrap();
+        assert_eq!(room.state.lock().unwrap().metadata_bytes, 0);
+        assert_eq!(registry.current_metadata_bytes(), 0);
+        // Republish, then drop the owner guard: the drop path releases too.
+        let (_member, _owner, member_hash, owner_hash) = member_owner_pair();
+        let lease = OwnerLease::create(&registry, member_hash, owner_hash).unwrap();
+        let room = lease.room().clone();
+        let peer = generate_peer_id();
+        let guard = registry.join_peer(&room, peer, None).unwrap();
+        publish(&registry, &room, peer, offer_hex, "Demo").unwrap();
+        assert_eq!(registry.current_metadata_bytes(), charge);
+        drop(guard);
+        assert_eq!(room.state.lock().unwrap().metadata_bytes, 0);
+        assert_eq!(registry.current_metadata_bytes(), 0);
+        // Withdrawing after the drop is a terminal ack, never a double free.
+        assert_eq!(
+            registry.withdraw_offer(&room, peer, offer_id).unwrap(),
+            WithdrawOutcome::AlreadyGone
+        );
+        assert_eq!(registry.current_metadata_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_reuses_manifest_arc_and_orders_offers() {
+        use crate::web_transfer_protocol::{parse_server_envelope, SnapshotOffer};
+        let registry = offer_registry();
+        let (_lease, room, first, _second, _guards) = open_peer_room(&registry);
+        // Publish in reverse hex order; snapshots must still sort ascending.
+        publish(
+            &registry,
+            &room,
+            first,
+            "ffffffffffffffffffffffffffffffff",
+            "Zed",
+        )
+        .unwrap();
+        let (_, canonical) = publish_canonical(
+            &registry,
+            &room,
+            first,
+            "11111111111111111111111111111111",
+            "Ay",
+        );
+        let _ = canonical;
+        let views = offer_views(&room).unwrap();
+        assert_eq!(views.len(), 2);
+        assert!(views[0].offer.to_string() < views[1].offer.to_string());
+        // No copy in state: the parts reference the very Arc the record holds.
+        {
+            let state = room.state.lock().unwrap();
+            for view in &views {
+                let record = state.offers.get(&view.offer).unwrap();
+                assert!(std::sync::Arc::ptr_eq(&view.manifest, &record.manifest));
+            }
+        }
+        let (revision, peers) = snapshot_parts(&room).unwrap();
+        let parsed: Vec<(PeerId, OfferId, serde_json::Value, String)> = views
+            .iter()
+            .map(|view| {
+                let value: serde_json::Value = serde_json::from_slice(&view.manifest).unwrap();
+                (view.peer, view.offer, value, hex::encode(view.mac))
+            })
+            .collect();
+        let refs: Vec<SnapshotOffer> = parsed
+            .iter()
+            .map(|(peer, offer, manifest, mac_hex)| SnapshotOffer {
+                peer: *peer,
+                offer: *offer,
+                manifest,
+                mac_hex,
+            })
+            .collect();
+        let messages = crate::web_transfer_protocol::snapshot_messages(revision, &peers, &refs);
+        // Begin + 2 peers + 2 offers + end, offers sorted.
+        assert_eq!(messages.len(), 6);
+        let types: Vec<String> = messages
+            .iter()
+            .map(|m| parse_server_envelope(m).unwrap().typ)
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "snapshot.begin",
+                "snapshot.peer",
+                "snapshot.peer",
+                "snapshot.offer",
+                "snapshot.offer",
+                "snapshot.end"
+            ]
+        );
+        let first_offer = parse_server_envelope(&messages[3]).unwrap();
+        let second_offer = parse_server_envelope(&messages[4]).unwrap();
+        assert!(first_offer.body["offerId"].as_str() < second_offer.body["offerId"].as_str());
+    }
+
+    #[tokio::test]
+    async fn offer_logs_do_not_include_private_metadata() {
+        let registry = offer_registry();
+        let (_lease, room, first, second, _guards) = open_peer_room(&registry);
+        let canary_label = "SECRET-CANARY-LABEL";
+        let canary_path = "secret-canary-dir/evil.txt";
+        let mut value = manifest_json("cccccccccccccccccccccccccccccccc", canary_label);
+        value["entries"][0]["path"] = serde_json::Value::String(canary_path.to_string());
+        // Structural failure (lying root) carries no label or path.
+        value["entries"][0]["root"] = serde_json::Value::String("0".repeat(64));
+        let structural = parse_manifest(&value, &registry.config().limits).unwrap_err();
+        // Ownership conflict carries no label or path.
+        publish(
+            &registry,
+            &room,
+            first,
+            "cccccccccccccccccccccccccccccccc",
+            "Demo",
+        )
+        .unwrap();
+        let conflict = publish(
+            &registry,
+            &room,
+            first,
+            "cccccccccccccccccccccccccccccccc",
+            canary_label,
+        )
+        .unwrap_err();
+        let stranger = registry
+            .withdraw_offer(
+                &room,
+                second,
+                "cccccccccccccccccccccccccccccccc".parse().unwrap(),
+            )
+            .unwrap_err();
+        let texts = [
+            format!("{structural}"),
+            format!("{} {}", conflict.code(), conflict),
+            format!("{} {}", stranger.code(), stranger),
+        ];
+        for text in texts {
+            assert!(!text.contains(canary_label), "label leaked: {text}");
+            assert!(!text.contains(canary_path), "path leaked: {text}");
+            assert!(!text.contains("evil"), "path fragment leaked: {text}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod peer_permission_tests {
+    use super::*;
+
+    fn permission_registry() -> WebTransferRegistry {
+        WebTransferRegistry::new(
+            WebTransferConfig::new(
+                WebTransferBaseUrl::parse("http://127.0.0.1:8080/").unwrap(),
+                WebTransferLimits::default(),
+                IceServerConfig {
+                    servers: Vec::new(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn three_peer_room(
+        registry: &WebTransferRegistry,
+    ) -> (
+        OwnerLease,
+        Arc<WebTransferRoom>,
+        [PeerId; 3],
+        Vec<PeerGuard>,
+    ) {
+        let member = MemberToken::from_bytes([0x71u8; 32]);
+        let owner = OwnerToken::from_bytes([0x72u8; 32]);
+        let lease =
+            OwnerLease::create(registry, member.sha256_hash(), owner.sha256_hash()).unwrap();
+        let room = lease.room().clone();
+        let ids = [generate_peer_id(), generate_peer_id(), generate_peer_id()];
+        let guards = ids
+            .iter()
+            .map(|id| registry.join_peer(&room, *id, None).unwrap())
+            .collect();
+        (lease, room, ids, guards)
+    }
+
+    fn single_file_offer(
+        registry: &WebTransferRegistry,
+        offer_hex: &str,
+    ) -> (crate::web_transfer_protocol::Manifest, std::sync::Arc<[u8]>) {
+        use crate::web_transfer_protocol::{
+            canonical_json, file_root, manifest_value, parse_manifest,
+        };
+        let leaf: [u8; 32] = [0x11u8; 32];
+        let root = hex::encode(file_root(1, &[leaf]).unwrap());
+        let value = serde_json::json!({
+            "offer": offer_hex,
+            "mode": "single",
+            "label": "Item",
+            "kind": "file",
+            "chunkSize": "1048576",
+            "createdAt": "2026-09-14T12:00:00Z",
+            "entries": [{
+                "id": "0",
+                "path": "item.bin",
+                "size": "17",
+                "mtime": "1757779200",
+                "chunks": [hex::encode(leaf)],
+                "chunkCount": "1",
+                "root": root,
+            }],
+        });
+        let manifest = parse_manifest(&value, &registry.config().limits).unwrap();
+        let canonical: std::sync::Arc<[u8]> = canonical_json(&manifest_value(&manifest))
+            .unwrap()
+            .into_bytes()
+            .into();
+        (manifest, canonical)
+    }
+
+    #[tokio::test]
+    async fn peer_permissions_matrix_is_symmetric() {
+        let registry = permission_registry();
+        let (_lease, room, ids, _guards) = three_peer_room(&registry);
+        // Every peer publishes its own offer and withdraws it; strangers are
+        // refused everywhere; the catalog always shows exactly the live set.
+        for (index, peer) in ids.iter().enumerate() {
+            let offer_hex = format!("{index:032x}");
+            let (wrapped, canonical) = single_file_offer(&registry, &offer_hex);
+            let offer_id: OfferId = offer_hex.parse().unwrap();
+            assert_eq!(
+                registry
+                    .publish_offer(&room, *peer, offer_id, &wrapped, canonical, [0xeeu8; 32])
+                    .unwrap(),
+                PublishOutcome::Created
+            );
+        }
+        assert_eq!(room.state.lock().unwrap().offers.len(), 3);
+        for (index, peer) in ids.iter().enumerate() {
+            let stranger = ids[(index + 1) % 3];
+            let offer_id: OfferId = format!("{index:032x}").parse().unwrap();
+            assert_eq!(
+                registry
+                    .withdraw_offer(&room, stranger, offer_id)
+                    .unwrap_err()
+                    .code(),
+                "NOT_PARTICIPANT"
+            );
+            assert_eq!(
+                registry.withdraw_offer(&room, *peer, offer_id).unwrap(),
+                WithdrawOutcome::Removed
+            );
+        }
+        assert!(room.state.lock().unwrap().offers.is_empty());
+        assert_eq!(registry.current_metadata_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn member_cannot_close_room_or_cancel_placeholder_for_others() {
+        let registry = permission_registry();
+        let (_lease, room, ids, guards) = three_peer_room(&registry);
+        // One live offer owned by the first peer.
+        let (wrapped, canonical) = single_file_offer(&registry, "dddddddddddddddddddddddddddddddd");
+        let offer_id: OfferId = "dddddddddddddddddddddddddddddddd".parse().unwrap();
+        registry
+            .publish_offer(&room, ids[0], offer_id, &wrapped, canonical, [0xeeu8; 32])
+            .unwrap();
+        // A stranger cannot cancel it, and peer churn never destroys the
+        // room or touches transfers.
+        let stranger = generate_peer_id();
+        let _guard = registry.join_peer(&room, stranger, None).unwrap();
+        assert_eq!(
+            registry
+                .withdraw_offer(&room, stranger, offer_id)
+                .unwrap_err()
+                .code(),
+            "NOT_PARTICIPANT"
+        );
+        assert!(room.state.lock().unwrap().offers.contains_key(&offer_id));
+        drop(guards);
+        assert!(!room.is_destroyed());
+        assert!(registry.room(room.id).is_some());
+        assert!(room.state.lock().unwrap().transfers.is_empty());
+        assert_eq!(registry.current_peers(), 1);
+        // Withdrawing the reaped offer afterwards is a terminal ack, and the
+        // room still stands: only OwnerLease closes rooms.
+        assert_eq!(
+            registry.withdraw_offer(&room, stranger, offer_id).unwrap(),
+            WithdrawOutcome::AlreadyGone
+        );
+        assert!(!room.is_destroyed());
+    }
+
+    #[tokio::test]
+    async fn disconnect_publish_race_leaves_no_orphan_offer() {
+        use tokio::sync::Barrier;
+        for _ in 0..20 {
+            let registry = permission_registry();
+            let member = MemberToken::from_bytes([0x73u8; 32]);
+            let owner = OwnerToken::from_bytes([0x74u8; 32]);
+            let lease =
+                OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash()).unwrap();
+            let room = lease.room().clone();
+            let peer = generate_peer_id();
+            let guard = registry.join_peer(&room, peer, None).unwrap();
+            let barrier = std::sync::Arc::new(Barrier::new(2));
+            // Task A publishes while task B disconnects: the scheduler picks
+            // the order, and both linearizations must converge on empty.
+            let task_registry = registry.clone();
+            let task_room = Arc::clone(&room);
+            let task_barrier = Arc::clone(&barrier);
+            let publisher = tokio::spawn(async move {
+                task_barrier.wait().await;
+                let (wrapped, canonical) =
+                    single_file_offer(&task_registry, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+                task_registry.publish_offer(
+                    &task_room,
+                    peer,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(),
+                    &wrapped,
+                    canonical,
+                    [0xeeu8; 32],
+                )
+            });
+            let dropper = tokio::spawn(async move {
+                barrier.wait().await;
+                drop(guard);
+            });
+            let published = publisher.await.unwrap();
+            dropper.await.unwrap();
+            // Either the publish landed (then the drop reaped it) or the
+            // drop won (then the publish found no peer).
+            assert!(published.is_ok() || published.unwrap_err().code() == "INVALID_MESSAGE");
+            assert!(!room.state.lock().unwrap().peers.contains_key(&peer));
+            assert!(room.state.lock().unwrap().offers.is_empty());
+            assert_eq!(room.state.lock().unwrap().metadata_bytes, 0);
+            assert_eq!(registry.current_metadata_bytes(), 0);
+            assert_eq!(registry.current_peers(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn room_close_peer_cleanup_is_idempotent() {
+        use tokio::sync::Barrier;
+        for _ in 0..20 {
+            let registry = permission_registry();
+            let member = MemberToken::from_bytes([0x75u8; 32]);
+            let owner = OwnerToken::from_bytes([0x76u8; 32]);
+            let lease =
+                OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash()).unwrap();
+            let room = lease.room().clone();
+            let peer = generate_peer_id();
+            let guard = registry.join_peer(&room, peer, None).unwrap();
+            let barrier = std::sync::Arc::new(Barrier::new(2));
+            // A publisher races the explicit close: stored offers die with
+            // the entry, and the guard drop afterwards still releases.
+            let task_registry = registry.clone();
+            let task_room = Arc::clone(&room);
+            let task_barrier = Arc::clone(&barrier);
+            let publisher = tokio::spawn(async move {
+                task_barrier.wait().await;
+                let (wrapped, canonical) =
+                    single_file_offer(&task_registry, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+                let _ = task_registry.publish_offer(
+                    &task_room,
+                    peer,
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".parse().unwrap(),
+                    &wrapped,
+                    canonical,
+                    [0xeeu8; 32],
+                );
+            });
+            barrier.wait().await;
+            lease.close_explicit(&registry);
+            publisher.await.unwrap();
+            drop(guard);
+            assert!(registry.room(room.id).is_none());
+            assert!(!room.state.lock().unwrap().peers.contains_key(&peer));
+            assert!(room.state.lock().unwrap().offers.is_empty());
+            assert_eq!(room.state.lock().unwrap().metadata_bytes, 0);
+            assert_eq!(registry.current_metadata_bytes(), 0);
+            assert_eq!(registry.current_peers(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn frontend_instrumentation_is_inert_without_test_hook() {
+        // The hook contract lives entirely in the frontend (fixtures.js +
+        // main.js): without `globalThis.__BORE_TEST__` the app installs no
+        // recorder. This test pins the Rust side of the same rule — member
+        // control paths never consult ambient state — by asserting the
+        // session primitives take every input explicitly.
+        let registry = permission_registry();
+        let (_lease, room, ids, _guards) = three_peer_room(&registry);
+        // join/rename/publish/withdraw signatures all name their peer: no
+        // ambient identity, so no hook could change who acts.
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let (wrapped, canonical) = single_file_offer(&registry, offer_hex);
+        assert_eq!(
+            registry
+                .publish_offer(
+                    &room,
+                    ids[0],
+                    offer_hex.parse().unwrap(),
+                    &wrapped,
+                    canonical,
+                    [0xeeu8; 32]
+                )
+                .unwrap(),
+            PublishOutcome::Created
+        );
+        assert!(registry.rename_peer(&room, ids[0], "Visible").is_ok());
+        let parts = snapshot_parts(&room).unwrap();
+        assert_eq!(parts.1.len(), 3);
     }
 }

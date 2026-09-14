@@ -1,4 +1,7 @@
-// T-WEB-SCAFFOLD: the committed dist serves an inert shell on every engine.
+// T-WEB-SCAFFOLD: the committed dist serves the room shell on every engine.
+// Static (no room link): the app boots to "Link incompleto" without opening
+// any socket. Live room behavior lives in room.spec.mjs against a real
+// server.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -51,19 +54,23 @@ test.afterAll(async () => {
   await new Promise((resolve) => server.close(resolve));
 });
 
-test("T-WEB-SCAFFOLD inert embedded shell", async ({ page }) => {
+test("T-WEB-SCAFFOLD room shell without a link", async ({ page }) => {
   const failures = [];
+  const sockets = [];
   page.on("pageerror", (error) => failures.push(`pageerror: ${error.message}`));
   page.on("console", (message) => {
     if (message.type() === "error") {
       failures.push(`console: ${message.text()}`);
     }
   });
+  page.on("websocket", (socket) => sockets.push(socket.url()));
   await page.goto(`${baseUrl}/`);
-  await expect(page.locator("#room-status")).toContainText("Connessione alla room");
+  await expect(page.locator("#room-status")).toContainText("Link incompleto");
+  // No fragment, no storage, no socket: nothing leaves the page.
+  expect(sockets).toEqual([]);
   assertClean(failures);
 });
 
 function assertClean(failures) {
-  expect(failures, "no console/page errors on the inert shell").toEqual([]);
+  expect(failures, "no console/page errors on the static shell").toEqual([]);
 }

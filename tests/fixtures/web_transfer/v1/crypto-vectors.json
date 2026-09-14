@@ -16,7 +16,7 @@
   "expected": {
     "leaf_hello_hex": "094c9eb526be7e2dea0b396331085eaba0d76f639116ccc014055c490b48daac",
     "manifest_key_hex": "cd3fe8d9f1764c27f35db06271edfaf7cd93461f04799163cf5d93c91d55effc",
-    "manifest_mac_hex": "2d570b03108da614edda605c1a58e07cac14ad89f864619be386edc2e95b252d",
+    "manifest_mac_hex": "72c93520960dc4364dd5f00c8e028bc37dffa32a4fc66004afdd599d731e86ff",
     "root_empty_hex": "3851a391362e8aaa3bbf639dfaedbfc5d442d3098dcfae80c81a006c14818724",
     "root_single_hex": "4d2cfc38cbddafe4fdadf16cc2517f44f66b920939eab20bd4f7cc49dba9984e",
     "root_multi_hex": "d07d811d9510582c788131ed7c30b2a5e6213fcbbcf64e8e853559c67522ec2a",

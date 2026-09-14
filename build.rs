@@ -95,7 +95,7 @@ fn emit_asset_table(
 /// web/transfer`) owns dist generation.
 fn bundle_web_transfer_assets() {
     const SOURCE: &str = "web/transfer/dist";
-    const REQUIRED: &[&str] = &["index.html", "app.js", "app.css"];
+    const REQUIRED: &[&str] = &["index.html", "app.js", "app.css", "offer-worker.js"];
     if !Path::new(SOURCE).exists() {
         panic!(
             "build.rs: {SOURCE} missing — run `npm run build --prefix web/transfer` \

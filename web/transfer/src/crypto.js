@@ -87,6 +87,14 @@ export function manifestKey(roomKey, roomId) {
   return hkdf32(roomKey, textEncoder.encode("bore-web-manifest-v1"), roomId);
 }
 
+/// Manifest authentication tag: HMAC-SHA-256 over canonical manifest bytes
+/// under the room-derived manifest key. The server checks the shape only;
+/// secrecy of the room key is what authenticates.
+export async function manifestMac(roomKeyBytes, roomIdBytes, canonicalBytes) {
+  const key = await manifestKey(roomKeyBytes, roomIdBytes);
+  return hmacSign(key, canonicalBytes);
+}
+
 export function attemptKey(roomKey, transferId, attemptId) {
   const info = new Uint8Array(32);
   info.set(transferId, 0);

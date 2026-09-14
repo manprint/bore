@@ -18,7 +18,7 @@ import {
   sealFrame,
   sha256Hex,
 } from "../../src/crypto.js";
-import { canonicalize, parseManifest } from "../../src/protocol.js";
+import { canonicalize, manifestValue, parseManifest } from "../../src/protocol.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtureDir = join(here, "..", "..", "..", "..", "tests", "fixtures", "web_transfer", "v1");
@@ -35,11 +35,7 @@ const plaintext = hexToBytes(inputs.plaintext_hex);
 const seq = inputs.seq;
 
 const manifest = parseManifest(JSON.parse(manifestRaw));
-const canonical = canonicalize({
-  entries: manifest.entries,
-  mode: manifest.mode,
-  offer: manifest.offer,
-});
+const canonical = canonicalize(manifestValue(manifest));
 const mkey = await manifestKey(roomKey, roomId);
 const mac = await hmacSign(mkey, new TextEncoder().encode(canonical));
 const akey = await attemptKey(roomKey, transferId, attemptId);

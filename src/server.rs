@@ -37,6 +37,7 @@ use crate::udp_diagnostic;
 use crate::vhost::{self, VhostRegistry};
 #[cfg(feature = "vpn")]
 use crate::vpn_server;
+use crate::web_transfer_http;
 
 /// Compute transmitted/received bytes per second from byte counters and time delta.
 /// Returns 0 if dt_ms is 0 or if the current bytes is less than previous (saturation).
@@ -2017,9 +2018,11 @@ impl Server {
         mut socket: S,
         peer: SocketAddr,
     ) -> Result<()> {
-        // Neither admin page nor vhost frontend → never inspect; behave exactly as
-        // before (the plain bore-protocol path stays byte-for-byte unchanged).
-        if self.admin_token.is_none() && self.vhost_config.is_none() {
+        // Neither admin page, vhost frontend nor web-transfer surface → never
+        // inspect; behave exactly as before (the plain bore-protocol path stays
+        // byte-for-byte unchanged).
+        if self.admin_token.is_none() && self.vhost_config.is_none() && self.web_transfer.is_none()
+        {
             return self.handle_connection(socket, peer).await;
         }
 
@@ -2033,7 +2036,7 @@ impl Server {
             Ok(Ok(_)) => {
                 let stream = Prefixed::new(first.to_vec(), socket);
                 if admin_http::is_http_first_byte(first[0]) {
-                    self.serve_control_http(stream).await
+                    self.serve_control_http(stream, peer).await
                 } else {
                     self.handle_connection(stream, peer).await
                 }
@@ -2063,7 +2066,8 @@ impl Server {
     ) -> Result<()> {
         // No HTTP handler on this port at all: same short-circuit as
         // `route_connection` (nothing better to offer the client).
-        if self.admin_token.is_none() && self.vhost_config.is_none() {
+        if self.admin_token.is_none() && self.vhost_config.is_none() && self.web_transfer.is_none()
+        {
             return self.handle_connection(socket, peer).await;
         }
 
@@ -2078,7 +2082,7 @@ impl Server {
             Ok(Ok(_)) => {
                 let stream = Prefixed::new(first.to_vec(), socket);
                 if admin_http::is_http_first_byte(first[0]) {
-                    self.serve_control_http(stream).await
+                    self.serve_control_http(stream, peer).await
                 } else {
                     self.handle_connection(stream, peer).await
                 }
@@ -2088,17 +2092,58 @@ impl Server {
         }
     }
 
-    /// Handle an HTTP request that arrived on the control port. When a vhost
-    /// frontend is configured, route by Host header to the matching live subdomain,
-    /// so a single public port (e.g. 443) serves both the bore control protocol and
-    /// the vhost reverse proxy. A request that matches no subdomain falls through to
-    /// the admin status page (if enabled) or a 404.
-    async fn serve_control_http<S: mux::Transport>(&self, mut stream: Prefixed<S>) -> Result<()> {
-        if let Some(cfg_lock) = &self.vhost_config {
-            // Read the request head so we can route by Host; on timeout/error, drop.
+    /// Handle an HTTP request that arrived on the control port. When the
+    /// web-transfer surface is enabled and the `Host` exactly matches its
+    /// configured authority, `/transfer/` paths are served here; anything else
+    /// replays the already-read head into the existing vhost-first/admin
+    /// chain byte-for-byte. When a vhost frontend is configured, route by Host
+    /// header to the matching live subdomain, so a single public port (e.g.
+    /// 443) serves both the bore control protocol and the vhost reverse proxy.
+    /// A request that matches no subdomain falls through to the admin status
+    /// page (if enabled) or a 404.
+    async fn serve_control_http<S: mux::Transport>(
+        &self,
+        mut stream: Prefixed<S>,
+        peer: SocketAddr,
+    ) -> Result<()> {
+        if let Some(registry) = self.web_transfer.clone() {
+            // Read the head once so authority/path can be classified; the
+            // fallthrough path replays these exact bytes, never re-reads.
             let head = match timeout(NETWORK_TIMEOUT, vhost::read_head_async(&mut stream)).await {
                 Ok(Ok(head)) => head,
                 _ => return Ok(()),
+            };
+            let control_hsts = if self.tls.is_some() {
+                self.control_hsts.as_deref()
+            } else {
+                None
+            };
+            match web_transfer_http::try_serve(stream, head, &registry, control_hsts, peer).await {
+                web_transfer_http::TryServeOutcome::Handled => return Ok(()),
+                web_transfer_http::TryServeOutcome::Fallthrough(stream, head) => {
+                    return self.serve_control_http_after_web(stream, Some(head)).await;
+                }
+            }
+        }
+        self.serve_control_http_after_web(stream, None).await
+    }
+
+    /// Vhost-first/admin-fallback chain shared by the legacy path (no
+    /// pre-read head) and the web-transfer fallthrough (exact replayed head).
+    async fn serve_control_http_after_web<S: mux::Transport>(
+        &self,
+        mut stream: Prefixed<S>,
+        pre_read: Option<Vec<u8>>,
+    ) -> Result<()> {
+        if let Some(cfg_lock) = &self.vhost_config {
+            // Read the request head so we can route by Host; on timeout/error, drop.
+            // A web-transfer fallthrough supplies the exact already-read bytes.
+            let head = match pre_read {
+                Some(head) => head,
+                None => match timeout(NETWORK_TIMEOUT, vhost::read_head_async(&mut stream)).await {
+                    Ok(Ok(head)) => head,
+                    _ => return Ok(()),
+                },
             };
             let cfg = cfg_lock.read().unwrap().clone();
             let sub = vhost::extract_host_from_head(&head)
@@ -2143,6 +2188,12 @@ impl Server {
                 }
             }
             // Not a vhost route: replay the already-read head for the admin / 404 path.
+            let replayed = Prefixed::new(head, stream);
+            return self.serve_admin_http(replayed).await;
+        }
+        // No vhost frontend. A web-transfer fallthrough still replays its exact
+        // head so the admin reader sees the same bytes as the legacy path.
+        if let Some(head) = pre_read {
             let replayed = Prefixed::new(head, stream);
             return self.serve_admin_http(replayed).await;
         }

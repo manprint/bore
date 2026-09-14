@@ -2,7 +2,7 @@
   "name": "bore-web-transfer",
   "version": "1.0.0",
   "private": true,
-  "description": "Browser peer for bore transfer web rooms (Phase 0 scaffold: inert shell only).",
+    "description": "Browser peer for bore transfer web rooms (Phase 2 room client: control session, peer/catalog UI).",
   "type": "module",
   "engines": {
     "node": ">=20"

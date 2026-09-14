@@ -137,3 +137,89 @@ pub async fn spawn_proxy(listen_port: u16, target_port: u16) -> Result<ProxyRese
         port,
     })
 }
+
+/// One real control-WebSocket peer (Phase 2.2): a tungstenite client with the
+/// exact `Origin` and subprotocol the server requires, speaking application
+/// text messages. Pongs and pings are answered by the library; the test only
+/// ever sees text, close and transport errors.
+pub struct WsPeer {
+    ws: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+}
+
+impl WsPeer {
+    /// Handshakes `ws://{host}/transfer/ws/control/{room}` with `Origin` and
+    /// `bore-transfer-v1`; asserts the 101 and the subprotocol echo.
+    pub async fn connect(host: &str, room_hex: &str, origin: &str) -> Result<Self> {
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
+        let url = format!("ws://{host}/transfer/ws/control/{room_hex}");
+        let mut request = url.into_client_request()?;
+        request
+            .headers_mut()
+            .insert("Origin", HeaderValue::from_str(origin)?);
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_static("bore-transfer-v1"),
+        );
+        let (ws, response) = tokio_tungstenite::connect_async(request).await?;
+        anyhow::ensure!(
+            response.status()
+                == tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS,
+            "expected 101, got {}",
+            response.status()
+        );
+        let echo = response
+            .headers()
+            .get("sec-websocket-protocol")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        anyhow::ensure!(
+            echo.split(',')
+                .map(str::trim)
+                .any(|t| t == "bore-transfer-v1"),
+            "missing subprotocol echo in {response:?}"
+        );
+        Ok(Self { ws })
+    }
+
+    /// Sends one application text message.
+    pub async fn send_text(&mut self, text: String) -> Result<()> {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        self.ws.send(Message::Text(text.into())).await?;
+        Ok(())
+    }
+
+    /// Sends `hello` (no `requestId`, per the protocol).
+    pub async fn hello(
+        &mut self,
+        member_token_hex: &str,
+        display_name: Option<&str>,
+    ) -> Result<()> {
+        let name = display_name
+            .map(|n| format!(r#","displayName":{n:?}"#))
+            .unwrap_or_default();
+        self.send_text(format!(
+            r#"{{"v":1,"type":"hello","body":{{"memberToken":"{member_token_hex}"{name}}}}}"#
+        ))
+        .await
+    }
+
+    /// Next application text message within `wait`; `None` means the peer was
+    /// closed or the transport broke. Ping/pong/binary frames are skipped.
+    pub async fn next_text(&mut self, wait: Duration) -> Result<Option<String>> {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+        loop {
+            let next = tokio::time::timeout(wait, self.ws.next()).await?;
+            match next {
+                None => return Ok(None),
+                Some(Err(_)) => return Ok(None),
+                Some(Ok(Message::Text(text))) => return Ok(Some(text.to_string())),
+                Some(Ok(Message::Close(_))) => return Ok(None),
+                Some(Ok(_)) => continue,
+            }
+        }
+    }
+}

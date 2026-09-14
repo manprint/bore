@@ -6,8 +6,17 @@ export const CONTROL_SUBPROTOCOL = "bore-transfer-v1";
 export const MAX_CONTROL_BYTES = 320 * 1024;
 export const MAX_MANIFEST_BYTES = 256 * 1024;
 export const MAX_DISPLAY_NAME_CHARS = 48;
+export const MAX_LABEL_CHARS = 128;
 export const MAX_PATH_BYTES = 4096;
 export const MAX_PATH_SEGMENT_BYTES = 255;
+export const CHUNK_BYTES = 1024 * 1024;
+
+// Documented admission defaults, mirrored from WebTransferLimits::default.
+// parseManifest accepts overrides so tests pin small caps.
+export const DEFAULT_MANIFEST_LIMITS = {
+  maxEntriesPerOffer: 10000,
+  maxOfferBytes: 1099511627776,
+};
 
 export const CLIENT_TYPES = [
   "hello",
@@ -206,11 +215,12 @@ export function parseClientEnvelope(raw) {
 
 export function parseServerEnvelope(raw) {
   const env = parseEnvelope(raw, SERVER_TYPES, "server");
-  const needs = env.type === "ack" || env.type === "error";
-  if (needs && env.requestId === null) {
-    throw new Error(`server ${env.type} must echo requestId`);
+  // `ack` echoes the mutation's requestId; `error` echoes it when the
+  // offending message carried one (hello/ping failures travel without it).
+  if (env.type === "ack" && env.requestId === null) {
+    throw new Error("server ack must echo requestId");
   }
-  if (!needs && env.requestId !== null) {
+  if (env.type !== "ack" && env.type !== "error" && env.requestId !== null) {
     throw new Error(`server ${env.type} must not carry requestId`);
   }
   return env;
@@ -268,19 +278,98 @@ export function validateDisplayName(name) {
   }
 }
 
-export function parseManifest(value) {
-  const obj = exactObject(value, "manifest", ["offer", "mode", "entries"]);
+export function validateLabel(label) {
+  if (typeof label !== "string") {
+    throw new Error("manifest label must be a string");
+  }
+  const trimmed = label.normalize("NFC").trim();
+  if (trimmed.length === 0) {
+    throw new Error("manifest label must not be empty");
+  }
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) {
+    throw new Error("manifest label must not carry control characters");
+  }
+  if ([...trimmed].length > MAX_LABEL_CHARS) {
+    throw new Error("manifest label exceeds 128 characters");
+  }
+  return trimmed;
+}
+
+export function validateCreatedAt(s) {
+  if (typeof s !== "string" || s.length === 0 || s.length > 32) {
+    throw new Error("manifest createdAt must be ASCII within 32 bytes");
+  }
+  if (!/^[\x20-\x7e]+$/.test(s) || !s.endsWith("Z") || !s.includes("T")) {
+    throw new Error("manifest createdAt must look like 2026-09-14T21:00:00Z");
+  }
+  const inner = s.slice(0, -1);
+  const sep = inner.indexOf("T");
+  const date = inner.slice(0, sep);
+  const time = inner.slice(sep + 1);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{2}:\d{2}:\d{2}(\.\d{1,9})?$/.test(time)) {
+    throw new Error("manifest createdAt must look like 2026-09-14T21:00:00Z");
+  }
+  const month = Number(date.slice(5, 7));
+  const day = Number(date.slice(8, 10));
+  const hour = Number(time.slice(0, 2));
+  const minute = Number(time.slice(3, 5));
+  const second = Number(time.slice(6, 8));
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) {
+    throw new Error("manifest createdAt carries an impossible date or time");
+  }
+}
+
+function foldPath(path) {
+  return path.normalize("NFC").toLowerCase();
+}
+
+export function parseManifest(value, limits = DEFAULT_MANIFEST_LIMITS) {
+  const obj = exactObject(value, "manifest", [
+    "offer",
+    "mode",
+    "label",
+    "kind",
+    "chunkSize",
+    "createdAt",
+    "entries",
+  ]);
   if (!isHex(obj.offer, 32)) {
     throw new Error("manifest offer must be 32 lowercase hex chars");
   }
   if (obj.mode !== "single" && obj.mode !== "multi") {
     throw new Error(`manifest mode must be single|multi, got ${JSON.stringify(obj.mode)}`);
   }
+  const label = validateLabel(getString(obj, "manifest", "label"));
+  if (obj.kind !== "file" && obj.kind !== "files" && obj.kind !== "folder") {
+    throw new Error(`manifest kind must be file|files|folder, got ${JSON.stringify(obj.kind)}`);
+  }
+  const chunkSize = parseDecimalU64("manifest chunkSize", getString(obj, "manifest", "chunkSize"));
+  if (chunkSize !== BigInt(CHUNK_BYTES)) {
+    throw new Error(`manifest chunkSize must be ${CHUNK_BYTES}`);
+  }
+  validateCreatedAt(getString(obj, "manifest", "createdAt"));
   if (!Array.isArray(obj.entries) || obj.entries.length === 0) {
     throw new Error("manifest needs at least one entry");
   }
-  const entries = obj.entries.map((entry) => {
-    const e = exactObject(entry, "manifest entry", ["path", "size", "mtime", "chunks"]);
+  if (obj.entries.length > limits.maxEntriesPerOffer) {
+    throw new Error("manifest exceeds the per-offer entry cap");
+  }
+  let total = 0n;
+  let prevFold = null;
+  const entries = obj.entries.map((entry, position) => {
+    const e = exactObject(entry, "manifest entry", [
+      "id",
+      "path",
+      "size",
+      "mtime",
+      "chunks",
+      "chunkCount",
+      "root",
+    ]);
+    if (parseDecimalU64("entry id", getString(e, "manifest entry", "id")) !== BigInt(position)) {
+      throw new Error("manifest entry IDs must be 0-based sequential");
+    }
     validateManifestPath(getString(e, "manifest entry", "path"));
     const size = parseDecimalU64("entry size", getString(e, "manifest entry", "size"));
     parseDecimalU64("entry mtime", getString(e, "manifest entry", "mtime"));
@@ -292,26 +381,76 @@ export function parseManifest(value) {
         throw new Error("chunk hash must be 64 lowercase hex chars");
       }
     }
-    const want = size === 0n ? 0 : Number((size + 1048575n) / 1048576n);
+    const want = size === 0n ? 0 : Number((size + BigInt(CHUNK_BYTES - 1)) / BigInt(CHUNK_BYTES));
     if (e.chunks.length !== want) {
       throw new Error(`entry ${JSON.stringify(e.path)} needs ${want} chunk hashes`);
     }
+    if (parseDecimalU64("entry chunkCount", getString(e, "manifest entry", "chunkCount")) !== BigInt(want)) {
+      throw new Error(`entry ${JSON.stringify(e.path)} chunkCount must equal its chunk hash count`);
+    }
+    // Directories carry a null root with empty chunks; files carry a hex
+    // root. Root equality against the rolling root is verified by the server
+    // at publish and by the browser at download (async fileRoot) — never
+    // here, where no async crypto runs.
+    if (e.root === null) {
+      if (e.chunks.length !== 0 || size !== 0n) {
+        throw new Error(`entry ${JSON.stringify(e.path)} with null root must be an empty directory`);
+      }
+      if (obj.kind !== "folder") {
+        throw new Error(`entry ${JSON.stringify(e.path)} directory needs kind folder`);
+      }
+    } else if (!isHex(e.root, 64)) {
+      throw new Error(`entry ${JSON.stringify(e.path)} root must be hex or null`);
+    }
+    total += size;
+    const fold = foldPath(e.path);
+    if (prevFold !== null && fold <= prevFold) {
+      throw new Error("manifest entries must be sorted with no path collisions");
+    }
+    prevFold = fold;
     return e;
   });
+  if (total > BigInt(limits.maxOfferBytes)) {
+    throw new Error("manifest exceeds the per-offer byte cap");
+  }
   if (obj.mode === "single" && entries.length !== 1) {
     throw new Error("single manifest needs exactly one entry");
   }
-  return { offer: obj.offer, mode: obj.mode, entries };
+  if (obj.kind === "file" && (obj.mode !== "single" || entries.length !== 1 || entries[0].root === null)) {
+    throw new Error("kind file needs one single file entry");
+  }
+  if (obj.kind === "files" && (obj.mode !== "multi" || entries.some((e) => e.root === null))) {
+    throw new Error("kind files needs multiple file entries");
+  }
+  if (obj.kind === "folder" && obj.mode !== "multi") {
+    throw new Error("kind folder needs multi mode");
+  }
+  return {
+    offer: obj.offer,
+    mode: obj.mode,
+    label,
+    kind: obj.kind,
+    chunkSize: obj.chunkSize,
+    createdAt: obj.createdAt,
+    entries,
+  };
 }
 
 export function manifestValue(manifest) {
   return {
+    chunkSize: manifest.chunkSize,
+    createdAt: manifest.createdAt,
     entries: manifest.entries.map((e) => ({
+      chunkCount: e.chunkCount,
       chunks: e.chunks,
+      id: e.id,
       mtime: e.mtime,
       path: e.path,
+      root: e.root,
       size: e.size,
     })),
+    kind: manifest.kind,
+    label: manifest.label,
     mode: manifest.mode,
     offer: manifest.offer,
   };

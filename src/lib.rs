@@ -75,5 +75,6 @@ pub mod vpn_server;
 pub mod web_transfer;
 #[doc(hidden)]
 pub mod web_transfer_cli;
+pub mod web_transfer_http;
 pub mod web_transfer_protocol;
 pub mod weblog;

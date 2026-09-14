@@ -1,20 +1,30 @@
 {
   "offer": "cccccccccccccccccccccccccccccccc",
   "mode": "multi",
+  "label": "Demo",
+  "kind": "files",
+  "chunkSize": "1048576",
+  "createdAt": "2026-09-14T12:00:00Z",
   "entries": [
     {
+      "id": "0",
       "path": "empty.txt",
       "size": "0",
       "mtime": "1757779200",
-      "chunks": []
+      "chunks": [],
+      "chunkCount": "0",
+      "root": "3851a391362e8aaa3bbf639dfaedbfc5d442d3098dcfae80c81a006c14818724"
     },
     {
+      "id": "1",
       "path": "hello.txt",
       "size": "11",
       "mtime": "1757779200",
       "chunks": [
         "094c9eb526be7e2dea0b396331085eaba0d76f639116ccc014055c490b48daac"
-      ]
+      ],
+      "chunkCount": "1",
+      "root": "4d2cfc38cbddafe4fdadf16cc2517f44f66b920939eab20bd4f7cc49dba9984e"
     }
   ]
 }

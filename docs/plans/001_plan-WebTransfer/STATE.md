@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-15 00:38 CEST | **By:** muse-spark1.3 (executor, single-agent) | **Session:** 3
+> **Last updated:** 2026-09-15 02:11 CEST | **By:** Codex GPT-5 (agent-1 implementer) | **Session:** 4
 
 ## 0. Protocol
 
@@ -28,11 +28,11 @@ This is the only execution-state file — position, progress, ledger, and blocke
 - **Type:** `sub-phase`
 - **ID:** 3.1
 - **Status:** `none`
-- **Intent:** first relay vertical slice (`phase_04.md` §3.1).
-- **Phase:** 3 — Relay cifrato e prima vertical slice (`phase_04.md`)
-- **Next action:** Open sub-phase 3.1 in this section, read only `phase_04.md` §3.1, then implement.
-- **Assigned:** `agent:muse-spark1.3`
-- **Repo state:** branch `dev` | working tree `dirty (phase 2 code + tests, uncommitted)` | last commit `c15c450 webroom, ph1`
+- **Intent:** implement relay transfer state and authority in the next execution session; V001 audited and corrected only implemented Phases 0–2.
+- **Phase:** 3 — `phase_04.md § 3.1`
+- **Next action:** on a future `execute 001`, open `phase_04.md § 3.1`; do not infer any Phase-3 implementation from V001.
+- **Assigned:** `agent:gpt-5.6-luna`
+- **Repo state:** branch `dev` | working tree `dirty` with uncommitted V001 source corrections plus report/register/state; WIP commits remain off | last commit `563e8e2`
 
 ## 2. Feature context (self-contained recap)
 
@@ -61,7 +61,7 @@ The authoritative gate commands. Identical to the phase gates and to `overview.m
 - **Repo root:** `/mnt/fabio/dati/Git/Github-manprint/bore-forked`
 - **Build:** `cargo build --all-features` · **Fmt:** `cargo fmt --all -- --check` · **Lint:** `cargo clippy --all-features --all-targets -- -D warnings`
 - **Unit tests:** `cargo test --all-features --lib && npm ci --prefix web/transfer && npm run check --prefix web/transfer` · **E2E:** `cargo test --all-features --test web_transfer_test -- --test-threads=1 && npm run test:e2e --prefix web/transfer`
-- **Asset/regression:** `npm run build --prefix web/transfer && git diff --exit-code -- web/transfer/dist && cargo test --all-features -- --skip t_ssh_ --skip t_dmx_ && cargo test --all-features --test ssh_gateway_test --test ssh_gateway_spike_test -- --test-threads=1`
+- **Asset/regression:** `npm run build --prefix web/transfer && git diff --exit-code -- web/transfer/dist && cargo test --all-features -- --skip t_ssh_ --skip t_dmx_ --test-threads=1 && cargo test --all-features --test ssh_gateway_test --test ssh_gateway_spike_test -- --test-threads=1`
 - **Setup / caveats:** Phase 0.1 marks npm commands N/A until 0.2 creates `web/transfer`; use Node >=20 thereafter. Frontend dist is committed and Cargo must build without node_modules. Bind tests use dynamic ports and `web_transfer_test` runs serially. Existing sudo/netns harnesses authorized in `AGENTS.md` run serially when host prerequisites exist. TokenSave was synced for branch `dev`, but the active MCP process still served `main` at plan time; use branch `dev` after MCP restart or inspect source directly until then.
 - **WIP commits:** `off`
 
@@ -87,6 +87,12 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 14 | sub-phase | 2.5 | agent:muse-spark1.3 | worker hashing/MAC + offers manager + catalog UI wiring + T-WEB-OFFER | web/transfer/src/{offer-worker,offers}.js, web/transfer/src/{control,view,main}.js, web/transfer/esbuild.mjs, web/transfer/tests/unit/offers.test.mjs, web/transfer/tests/e2e/{catalog.spec,helpers}.mjs, web/transfer/dist/*, src/web_transfer_http.rs (worker route), src/web_transfer.rs (assets test), build.rs (REQUIRED) | fmt+clippy+lib 729+JS 35+e2e 33+drift-idempotent+full-regression green (SSH skipped §8.30) | uncommitted |
 | 15 | sub-phase | 2.6 | agent:muse-spark1.3 | hook recorders + deferred republish + T-WEB-NOAUTO/EQUAL-PEERS/REPUBLISH + races | web/transfer/src/{main,control,state}.js, web/transfer/tests/e2e/{fixtures,multipeer.spec}.mjs, web/transfer/tests/unit/state.test.mjs, src/web_transfer.rs (permission+race tests), tests/web_transfer_test.rs (t_web_offer_races) | fmt+clippy+lib 734+web 8/8+JS 36+e2e 42+full-regression green (SSH skipped §8.30) | uncommitted |
 | 16 | sub-phase | 2.7 | agent:muse-spark1.3 | README verified accurate, byte-identical (no user-visible change) | — | existing transfer docs intact, no web-transfer mention; full phase gates incl. SSH 47 green | uncommitted |
+| 17 | verify | V001 | agent-1:Codex-GPT-5 (recon agent-3:gpt-5.6-luna) | audited only claimed phases 0–2; PASS WITH FINDINGS (0 blocker, 5 major, 1 minor; F06 fixed by state re-sync) | verify/verify_001_2026-09-15.md, verify/index.md, STATE.md | build/fmt/clippy + Rust unit 734 + web 36 + Rust e2e 8 + browser e2e 42 + assets + SSH 47 pass; non-netns command exposed F05 | uncommitted |
+| 18 | correction | V001-C1 | agent-1:Codex-GPT-5 | existing OfferId identity is resolved before new-offer reservations/caps; saturated retries keep protocol idempotency | src/web_transfer.rs, verify/verify_001_2026-09-15.md, verify/index.md, STATE.md | red regression then green; fmt+clippy+Rust lib 735 pass | uncommitted |
+| 19 | correction | V001-C2 | agent-1:Codex-GPT-5 | checked room revisions across join/rename/publish/withdraw/RAII cleanup; exhaustion rolls back fallible mutations and closes incremental consumers after cleanup | src/web_transfer.rs, verify/verify_001_2026-09-15.md, verify/index.md, STATE.md | red regression then green; no revision wrapping sites; fmt+clippy+Rust lib 736 pass | uncommitted |
+| 20 | correction | V001-C3 | agent-1:Codex-GPT-5 | strict fallible Host authority parser rejects malformed bracketed IPv6/suffix/ports while preserving exact/default-port matches | src/web_transfer_http.rs, verify/verify_001_2026-09-15.md, verify/index.md, STATE.md | red IPv6 matrix then green; fmt+clippy+Rust lib 736 pass | uncommitted |
+| 21 | correction | V001-C4 | agent-1:Codex-GPT-5 | single strict STUN parser validates DNS/IPv4/bracketed IPv6 and exact optional port before browsers receive config | src/web_transfer.rs, verify/verify_001_2026-09-15.md, verify/index.md, STATE.md | red matrix then green; STUN-focused 16 + fmt+clippy+Rust lib 736 pass | uncommitted |
+| 22 | correction | V001-C5 | agent-1:Codex-GPT-5 (review: cavecrew-reviewer:gpt-5.6-luna) | serial authoritative regression restored; final review also completed revision-exhaustion lifecycle by removing, destroying and cancelling the exhausted room | src/web_transfer.rs, verify/verify_001_2026-09-15.md, verify/index.md, STATE.md | final matrix: build/fmt/clippy, Rust lib 736, web 36, Rust e2e 8, browser 42, asset drift, corrected non-netns and SSH 47 all pass | uncommitted |
 
 ## 5. Files touched
 
@@ -173,29 +179,40 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | src/web_transfer_http.rs | /transfer/assets/offer-worker.js route + 2.1 asset test extended | 2.5 |
 | src/web_transfer.rs | assets-table test gains offer-worker.js | 2.5 |
 | build.rs | REQUIRED gains offer-worker.js | 2.5 |
+| docs/plans/001_plan-WebTransfer/verify/verify_001_2026-09-15.md | V001 exhaustive audit, six findings and executable correction plan | V001 |
+| docs/plans/001_plan-WebTransfer/verify/index.md | persistent audit/finding register | V001 |
+| src/web_transfer.rs | V001-C1: saturated-cap offer replay ordering + regression | V001-C1 |
+| src/web_transfer.rs | V001-C2: checked revision arithmetic + overflow rollback/cleanup regression | V001-C2 |
+| src/web_transfer_http.rs | V001-C3: strict exact-authority parser + IPv6 malformed matrix | V001-C3 |
+| src/web_transfer.rs | V001-C4: strict shared STUN target parser + valid/malformed matrix | V001-C4 |
+| src/web_transfer.rs | V001-C5 review: revision-exhaustion cleanup removes/destroys/cancels the room + lifecycle assertions | V001-C5 |
+| docs/plans/001_plan-WebTransfer/{STATE.md,verify/verify_001_2026-09-15.md,verify/index.md} | close C5, final gate evidence, zero open V001 findings | V001-C5 |
 
 ## 6. In-flight work
 
-none — tree consistent (Phase 2 DONE through 2.7; next 3.1)
+none — tree consistent; V001 corrections closed, no Phase-3 code started
 
 ## 7. Verification state
 
 | Gate / test | Command | Last result | When |
 |-------------|---------|-------------|------|
-| build | `cargo build --all-features` | `pass` | 2.1, 21:34 CEST |
-| fmt | `cargo fmt --all -- --check` | `pass` | 2.1, 21:34 CEST |
-| lint | `cargo clippy --all-features --all-targets -- -D warnings` | `pass` | 2.1, 21:34 CEST |
-| Rust unit | `cargo test --all-features --lib` | `pass 734` | 2.7, 00:46 CEST |
-| frontend install/check | `npm ci --prefix web/transfer && npm run check --prefix web/transfer` | `pass 36` | 2.7, 00:46 CEST |
-| web-transfer Rust e2e | `cargo test --all-features --test web_transfer_test -- --test-threads=1` | `pass 8/8` | 2.7, 00:46 CEST |
-| browser e2e | `npm run test:e2e --prefix web/transfer` | `pass 42 (3 scaffold + 24 room + 6 catalog + 9 multipeer)` | 2.7, 00:46 CEST |
-| asset drift | `npm run build --prefix web/transfer && git diff --exit-code -- web/transfer/dist` | `pass-idempotent` | 2.7, 00:46 CEST |
-| full non-netns regression | `cargo test --all-features -- --skip t_ssh_ --skip t_dmx_` | `pass (0 failed)` | 2.7, 00:46 CEST |
-| serial SSH regression | `cargo test --all-features --test ssh_gateway_test --test ssh_gateway_spike_test -- --test-threads=1` | `pass 47 (42+5, no flake)` | 2.7, 00:46 CEST |
+| build | `cargo build --all-features` | `pass` | V001-C5 final matrix, 02:07 CEST |
+| fmt | `cargo fmt --all -- --check` | `pass` | V001-C5 final matrix, 02:07 CEST |
+| lint | `cargo clippy --all-features --all-targets -- -D warnings` | `pass` | V001-C5 final matrix, 02:07 CEST |
+| Rust unit | `cargo test --all-features --lib` | `pass 736, ignored 2` | V001-C5 final matrix, 02:07 CEST |
+| frontend install/check | `npm ci --prefix web/transfer && npm run check --prefix web/transfer` | `pass 36` | V001-C5 final matrix, 02:07 CEST |
+| web-transfer Rust e2e | `cargo test --all-features --test web_transfer_test -- --test-threads=1` | `pass 8/8` | V001-C5 final matrix, 02:07 CEST |
+| browser e2e | `npm run test:e2e --prefix web/transfer` | `pass 42` | V001-C5 final matrix, 02:07 CEST |
+| asset drift | `npm run build --prefix web/transfer && git diff --exit-code -- web/transfer/dist` | `pass-idempotent` | V001-C5 final matrix, 02:07 CEST |
+| full non-netns regression | `cargo test --all-features -- --skip t_ssh_ --skip t_dmx_ --test-threads=1` | `pass` | V001-C5 final matrix, 02:07 CEST |
+| serial SSH regression | `cargo test --all-features --test ssh_gateway_test --test ssh_gateway_spike_test -- --test-threads=1` | `pass 47 (42+5)` | V001-C5 final matrix, 02:07 CEST |
 
-**Failing output (verbatim, trimmed to the error):**
+**Superseded audit failure (kept for traceability):**
 ```text
-<none>
+t_web_catalog_server: the non-netns aggregate reran the explicitly serial test binary in parallel;
+its tracing privacy assertion observed CANARY-LABEL-aardvark. The dedicated
+`--test-threads=1` run passed 8/8. V001-F05 corrected the aggregate command;
+the exact corrected full regression now passes.
 ```
 
 ## 8. Runtime deviations from the plan
@@ -206,7 +223,6 @@ none — tree consistent (Phase 2 DONE through 2.7; next 3.1)
 | 2 | constant-time compare "using the existing cryptographic dependency" | `subtle = "2.6"` named directly (lockfile reuse, url-pattern) + `ConstantTimeEq` | `ring::constant_time` deprecated in ring 0.17 (clippy deny); subtle already transitive | none; no new compiled dep |
 | 3 | tokio-tungstenite "only the handshake/runtime features required" | features `connect,handshake,stream`, no default, no TLS | server accept + client connect + split streams; TLS stays on existing rustls listener | 0.2+/Phase 2 use this set; widen only with reason |
 | 4 | Files line names `WebTransferConfig` with no Change fields | minimal aggregate `{base_url, limits, ice}` + validating `new()` | Change authoritative; server-flag wiring deferred to Phase 1 | Phase 1 extends, never redefines |
-| 5 | Files line names `WebTransferConfig` with no Change fields | minimal aggregate `{base_url, limits, ice}` + validating `new()` | Change authoritative; server-flag wiring deferred to Phase 1 | Phase 1 extends, never redefines |
 | 5 | raw-byte accessors with no consumers yet | `pub(crate) as_bytes` + `#[allow(dead_code)]` (first consumers Phase 1 / 0.3) | `-D warnings` denies dead code on the non-test target | remove allows only if a phase leaves them truly unused |
 | 6 | 0.2 node --test directory arg | scripts use quoted `tests/unit/**/*.test.mjs` glob | node 24 loads a directory arg as CJS module | none |
 | 7 | 0.2 ESM ignores NODE_PATH | repro test symlinks real node_modules into tmp copy | ESM resolution is path-based | none |
@@ -247,6 +263,8 @@ none — tree consistent (Phase 2 DONE through 2.7; next 3.1)
 | 42 | offline invisible without events | dead link silent until heartbeat/close (mobile strands a cycle) | online/offline listeners cycle the socket; reconnect re-hellos | genuine product fix; makes T-WEB-REPUBLISH deterministic |
 | 43 | per-test timeout details object had no effect | `{ timeout }` second arg left the 30 s default in these runs | `test.setTimeout()` inside the body governs | none |
 | 44 | engine fault-injection wording differs | Chromium/Firefox/WebKit log failed handshakes differently | filter all three wordings; app itself never console-logs | none |
+| 45 | full non-netns gate omitted serial harness setting | appended `--test-threads=1`; dedicated and aggregate invocations now use the test file's declared isolation | parallel tracing dispatch makes the log-privacy assertion nondeterministic; seriality changes no coverage | corrected exact gate passed in C5 |
+| 46 | final matrix first Rust-unit run had one unrelated UDP mismatch | `a_listener_keeps_answering_until_it_has_answered_the_dialer` observed a loopback source-port mismatch once; exact rerun passed 3/3 and the complete Rust lib rerun passed 736/736 | V001 edits are confined to Web Transfer; the result was not reproducible and no UDP code changed | none; preserve the evidence and monitor if it recurs |
 
 ## 9. Blockers and open questions
 
@@ -276,9 +294,9 @@ none — tree consistent (Phase 2 DONE through 2.7; next 3.1)
 
 | Phase | File | Status | Notes |
 |-------|------|--------|-------|
-| 0 — Fondazioni, contratti e pipeline asset | phase_01.md | `DONE` | 0.1–0.4 closed; fixtures + embed + README verified |
+| 0 — Fondazioni, contratti e pipeline asset | phase_01.md | `DONE` | 0.1–0.4 implemented; V001-F04 fixed and final gates green |
 | 1 — Registry room e lease proprietario | phase_02.md | `DONE` | 1.1–1.5 closed; native owner lifecycle proved |
-| 2 — HTTP, WebSocket controllo e catalogo | phase_03.md | `DONE` | 2.1–2.7 closed; harness room + catalog + noauto proof |
+| 2 — HTTP, WebSocket controllo e catalogo | phase_03.md | `DONE` | implemented through 2.7; V001-F01/F02/F03/F05 fixed and final gates green |
 | 3 — Relay cifrato e prima vertical slice | phase_04.md | `TODO` | first public relay-only release |
 | 4 — WebRTC diretto con fallback | phase_05.md | `TODO` | direct-first behavior |
 | 5 — Cartelle, ZIP e UX multippeer | phase_06.md | `TODO` | final functional flow |
@@ -290,8 +308,8 @@ Status values: `TODO` · `IN_PROGRESS` · `DONE` · `SKIPPED` · `BLOCKED`
 
 | ID | Type | Status | Notes |
 |----|------|--------|-------|
-| T-WEB-SCAFFOLD | browser e2e | `TODO` | inert embedded shell on three engines |
-| T-WEB-E2EE-FIXTURE | cross-language | `TODO` | Rust/JS canonical and crypto bytes match |
+| T-WEB-SCAFFOLD | browser e2e | `DONE` | 0.2: inert embedded shell on three engines |
+| T-WEB-E2EE-FIXTURE | cross-language | `DONE` | 0.3: Rust/JS canonical and crypto bytes match |
 | T-WEB-CONFIG | Rust e2e | `DONE` | 1.1: valid binds, invalid exits nonzero, disabled absent |
 | T-WEB-REGISTRY-LIFE | Rust e2e | `DONE` | 1.2: resume-same-room, expiry, stale-monitor vs reused ID (x3) |
 | T-WEB-NATIVE-WIRE | Rust e2e | `DONE` | 1.3: create/heartbeat/drop/resume/close + disabled/version errors |
@@ -360,7 +378,7 @@ Status values: `TODO` · `IN_PROGRESS` · `DONE` · `SKIPPED` · `BLOCKED`
 | README.md | 4 | `TODO` | direct-first, fallback and STUN |
 | README.md | 5 | `TODO` | folders, ZIP and final peer flow |
 | README.md | 6 | `TODO` | full production/deploy/admin/troubleshooting review |
-| docs/transfer/WEB_TRANSFER_PROTOCOL.md | 0 | `TODO` | normative protocol v1 and fixtures |
+| docs/transfer/WEB_TRANSFER_PROTOCOL.md | 0 | `DONE` | 0.3: normative protocol v1 and fixtures |
 | docs/transfer/WEB_TRANSFER_PROTOCOL.md | 6 | `TODO` | final state/error/operations/versioning audit |
 | Docker/compose deployment examples | 6 | `TODO` | disabled-by-default config and no payload volume |
 
@@ -368,4 +386,4 @@ Status values: `TODO` · `IN_PROGRESS` · `DONE` · `SKIPPED` · `BLOCKED`
 
 | Report | Date | Verdict | Open findings |
 |--------|------|---------|---------------|
-| <none yet> | — | — | — |
+| V001 | 2026-09-15 | `PASS WITH FINDINGS` | 0 (F01–F06 fixed) |

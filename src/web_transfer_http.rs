@@ -160,32 +160,43 @@ pub fn parse_request_line(head: &[u8]) -> Option<(String, String)> {
     Some((method, target))
 }
 
-/// Splits `host[:port]` into `(hostname, port)`. Bracketed IPv6 literals keep
-/// their brackets on the hostname side so both sides compare the same shape.
-fn split_host_port(value: &str) -> (String, Option<u16>) {
+/// Strictly splits `host[:port]` into `(hostname, port)`. Bracketed IPv6
+/// literals keep their brackets on the hostname side so both sides compare the
+/// same shape; malformed brackets, suffixes and ports reject the authority.
+fn split_host_port(value: &str) -> Option<(String, Option<u16>)> {
     let value = value.trim();
+    if value.is_empty() || value.contains([' ', '\t', '@', '/', '?', '#']) {
+        return None;
+    }
     if let Some(rest) = value.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            let host = format!("[{}]", &rest[..end]);
-            let port = rest[end + 1..]
-                .strip_prefix(':')
-                .and_then(|p| p.parse::<u16>().ok())
-                .filter(|p| *p != 0);
-            return (host, port);
-        }
-        return (value.to_string(), None);
+        let end = rest.find(']')?;
+        let literal = &rest[..end];
+        literal.parse::<std::net::Ipv6Addr>().ok()?;
+        let suffix = &rest[end + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            let raw = suffix.strip_prefix(':')?;
+            let port = raw.parse::<u16>().ok().filter(|port| *port != 0)?;
+            Some(port)
+        };
+        return Some((format!("[{literal}]"), port));
     }
-    if value.matches(':').count() == 1 {
-        if let Some((h, p)) = value.rsplit_once(':') {
-            if let Ok(port) = p.parse::<u16>() {
-                if port != 0 {
-                    return (h.to_string(), Some(port));
-                }
+    if value.contains(['[', ']']) {
+        return None;
+    }
+    match value.matches(':').count() {
+        0 => Some((value.to_string(), None)),
+        1 => {
+            let (host, raw) = value.rsplit_once(':')?;
+            if host.is_empty() {
+                return None;
             }
-            return (value.to_string(), None);
+            let port = raw.parse::<u16>().ok().filter(|port| *port != 0)?;
+            Some((host.to_string(), Some(port)))
         }
+        _ => None,
     }
-    (value.to_string(), None)
 }
 
 /// Whether `Host` exactly equals the configured authority: case-insensitive
@@ -202,8 +213,12 @@ pub fn host_matches_authority(host_header: &str, base_url: &WebTransferBaseUrl) 
         "http" => Some(80u16),
         _ => None,
     };
-    let (got_host, got_port) = split_host_port(host_header);
-    let (want_host, want_port) = split_host_port(base_url.authority());
+    let Some((got_host, got_port)) = split_host_port(host_header) else {
+        return false;
+    };
+    let Some((want_host, want_port)) = split_host_port(base_url.authority()) else {
+        return false;
+    };
     if !got_host.eq_ignore_ascii_case(&want_host) {
         return false;
     }
@@ -1223,6 +1238,24 @@ mod tests {
         let loopback80 = WebTransferBaseUrl::parse("http://127.0.0.1/").expect("port-80 url");
         assert!(host_matches_authority("127.0.0.1", &loopback80));
         assert!(host_matches_authority("127.0.0.1:80", &loopback80));
+
+        let ipv6 = WebTransferBaseUrl::parse("http://[::1]/").expect("IPv6 loopback url");
+        assert!(host_matches_authority("[::1]", &ipv6));
+        assert!(host_matches_authority("[::1]:80", &ipv6));
+        for malformed in [
+            "[::1]:abc",
+            "[::1]:0",
+            "[::1]:65536",
+            "[::1]evil",
+            "[]",
+            "[::1",
+            "::1",
+        ] {
+            assert!(
+                !host_matches_authority(malformed, &ipv6),
+                "malformed authority matched: {malformed}"
+            );
+        }
     }
 
     #[test]

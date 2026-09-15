@@ -450,16 +450,8 @@ impl IceServerConfig {
             return Ok(Self { servers: vec![] });
         }
         if !custom.is_empty() {
-            for entry in custom {
-                let target = entry.strip_prefix("stun:").ok_or_else(|| {
-                    anyhow::anyhow!("STUN server must look like stun:HOST[:PORT], got {entry}")
-                })?;
-                if target.is_empty() {
-                    bail!("STUN server must look like stun:HOST[:PORT], got {entry}");
-                }
-            }
             return Ok(Self {
-                servers: custom.to_vec(),
+                servers: parse_stun_list(custom)?,
             });
         }
         let mut servers = Vec::new();
@@ -708,9 +700,48 @@ mod tests {
         let resolved =
             IceServerConfig::resolve(false, &custom, true, "bore.example.com", 7835).unwrap();
         assert_eq!(resolved.servers, custom);
+        let valid = vec![
+            " stun:[2001:db8::1]:3478, stun:192.0.2.1 ".to_string(),
+            "stun:stun.example.com".to_string(),
+        ];
+        let resolved =
+            IceServerConfig::resolve(false, &valid, true, "bore.example.com", 7835).unwrap();
+        assert_eq!(
+            resolved.servers,
+            [
+                "stun:[2001:db8::1]:3478",
+                "stun:192.0.2.1",
+                "stun:stun.example.com"
+            ]
+        );
         assert!(
             IceServerConfig::resolve(false, &["example.com".to_string()], true, "h", 1).is_err()
         );
+        for malformed in [
+            "stun:[]",
+            "stun:[::1]:0",
+            "stun:[::1]:abc",
+            "stun:[::1]:65536",
+            "stun:[::1]evil",
+            "stun:[::1",
+            "stun:::1",
+            "stun:host/path",
+            "stun:user@host",
+            "stun:host?query",
+            "stun:host name",
+        ] {
+            assert!(
+                IceServerConfig::resolve(
+                    false,
+                    &[malformed.to_string()],
+                    true,
+                    "bore.example.com",
+                    7835,
+                )
+                .is_err(),
+                "malformed STUN target accepted: {malformed}"
+            );
+        }
     }
 
     #[test]
@@ -922,10 +953,21 @@ pub struct RoomState {
     pub revision: u64,
 }
 
+/// Computes a future room revision with checked arithmetic. Callers obtain the
+/// revision before mutating state so exhaustion cannot leave a partial change.
+fn checked_room_revision(current: u64, steps: usize) -> Result<u64, WebTransferError> {
+    let steps =
+        u64::try_from(steps).map_err(|_| WebTransferError::internal("room revision exhausted"))?;
+    current
+        .checked_add(steps)
+        .ok_or_else(|| WebTransferError::internal("room revision exhausted"))
+}
+
 /// Broadcast room lifecycle events (capacity 256).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoomEvent {
-    /// Room destroyed; `reason` is an opaque code (`owner-close`, `expired`).
+    /// Room destroyed; `reason` is an opaque code (`owner-close`, `expired`,
+    /// `revision-exhausted`).
     RoomClosed {
         /// Opaque reason code, safe for logs and control messages.
         reason: &'static str,
@@ -1298,6 +1340,7 @@ impl WebTransferRegistry {
             if state.peers.contains_key(&peer_id) {
                 return Err(WebTransferError::invalid("peer already joined"));
             }
+            let revision = checked_room_revision(state.revision, 1)?;
             let resolved = display_name.or_else(|| Some(default_display_name(peer_id)));
             state.peers.insert(
                 peer_id,
@@ -1305,7 +1348,7 @@ impl WebTransferRegistry {
                     display_name: resolved.clone(),
                 },
             );
-            state.revision = state.revision.wrapping_add(1);
+            state.revision = revision;
             RoomEvent::PeerJoined {
                 peer: peer_id,
                 display_name: resolved,
@@ -1336,12 +1379,13 @@ impl WebTransferRegistry {
                 .state
                 .lock()
                 .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
-            let record = state
-                .peers
-                .get_mut(&peer_id)
-                .ok_or_else(|| WebTransferError::invalid("unknown peer"))?;
+            if !state.peers.contains_key(&peer_id) {
+                return Err(WebTransferError::invalid("unknown peer"));
+            }
+            let revision = checked_room_revision(state.revision, 1)?;
+            let record = state.peers.get_mut(&peer_id).expect("peer checked above");
             record.display_name = Some(display_name.clone());
-            state.revision = state.revision.wrapping_add(1);
+            state.revision = revision;
             RoomEvent::PeerRenamed {
                 peer: peer_id,
                 display_name: display_name.clone(),
@@ -1374,9 +1418,6 @@ impl WebTransferRegistry {
             ));
         }
         let charge = offer_charge(canonical.len())?;
-        let reservation = self
-            .try_reserve_metadata(charge)
-            .map_err(|_| WebTransferError::limit("web-transfer metadata budget exhausted"))?;
         let (event, outcome) = {
             let mut state = room
                 .state
@@ -1384,19 +1425,6 @@ impl WebTransferRegistry {
                 .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
             if !state.peers.contains_key(&peer_id) {
                 return Err(WebTransferError::invalid("unknown peer"));
-            }
-            let owned = state.offers.values().filter(|o| o.owner == peer_id).count();
-            if owned >= room.limits.max_offers_per_peer as usize {
-                return Err(WebTransferError::limit("peer offer budget exhausted"));
-            }
-            let next = state
-                .metadata_bytes
-                .checked_add(charge)
-                .ok_or_else(|| WebTransferError::limit("web-transfer metadata budget exhausted"))?;
-            if next > room.limits.max_metadata_per_room_bytes {
-                return Err(WebTransferError::limit(
-                    "web-transfer metadata budget exhausted",
-                ));
             }
             match state.offers.get(&offer_id) {
                 Some(existing)
@@ -1413,6 +1441,23 @@ impl WebTransferRegistry {
                 }
                 None => {}
             }
+            let reservation = self
+                .try_reserve_metadata(charge)
+                .map_err(|_| WebTransferError::limit("web-transfer metadata budget exhausted"))?;
+            let owned = state.offers.values().filter(|o| o.owner == peer_id).count();
+            if owned >= room.limits.max_offers_per_peer as usize {
+                return Err(WebTransferError::limit("peer offer budget exhausted"));
+            }
+            let next = state
+                .metadata_bytes
+                .checked_add(charge)
+                .ok_or_else(|| WebTransferError::limit("web-transfer metadata budget exhausted"))?;
+            if next > room.limits.max_metadata_per_room_bytes {
+                return Err(WebTransferError::limit(
+                    "web-transfer metadata budget exhausted",
+                ));
+            }
+            let revision = checked_room_revision(state.revision, 1)?;
             state.metadata_bytes = next;
             state.offers.insert(
                 offer_id,
@@ -1423,7 +1468,8 @@ impl WebTransferRegistry {
                     metadata_bytes: charge,
                 },
             );
-            state.revision = state.revision.wrapping_add(1);
+            state.revision = revision;
+            reservation.spend();
             (
                 RoomEvent::OfferAdded {
                     peer: peer_id,
@@ -1435,7 +1481,6 @@ impl WebTransferRegistry {
                 PublishOutcome::Created,
             )
         };
-        reservation.spend();
         let _ = room.events.send(event);
         Ok(outcome)
     }
@@ -1456,22 +1501,24 @@ impl WebTransferRegistry {
                 .state
                 .lock()
                 .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
-            let record = match state.offers.get(&offer_id) {
+            match state.offers.get(&offer_id) {
                 None => return Ok(WithdrawOutcome::AlreadyGone),
                 Some(record) if record.owner != peer_id => {
                     return Err(WebTransferError::not_participant(
                         "only the offer owner withdraws",
                     ));
                 }
-                Some(_) => state.offers.remove(&offer_id).expect("offer present"),
-            };
+                Some(_) => {}
+            }
+            let revision = checked_room_revision(state.revision, 1)?;
+            let record = state.offers.remove(&offer_id).expect("offer checked above");
             state.metadata_bytes = state.metadata_bytes.saturating_sub(record.metadata_bytes);
             if let Some(registry) = room.registry.upgrade() {
                 registry
                     .metadata_current
                     .fetch_sub(record.metadata_bytes, Ordering::Relaxed);
             }
-            state.revision = state.revision.wrapping_add(1);
+            state.revision = revision;
             RoomEvent::OfferRemoved {
                 peer: peer_id,
                 offer: offer_id,
@@ -2213,6 +2260,67 @@ impl Default for WebTransferServerArgs {
     }
 }
 
+/// Validates the target portion of `stun:HOST[:PORT]` without normalizing it.
+fn validate_stun_target(target: &str, whole: &str) -> Result<()> {
+    if target.is_empty()
+        || target.chars().any(char::is_whitespace)
+        || target.contains(['@', '/', '?', '#'])
+    {
+        bail!("STUN server must look like stun:HOST[:PORT], got {whole:?}");
+    }
+
+    let validate_port = |raw: &str| -> Result<()> {
+        if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("STUN server port must be numeric in {whole:?}");
+        }
+        match raw.parse::<u16>() {
+            Ok(port) if port != 0 => Ok(()),
+            _ => bail!("STUN server port must be 1..=65535 in {whole:?}"),
+        }
+    };
+
+    if let Some(rest) = target.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| anyhow::anyhow!("STUN IPv6 host has unmatched brackets in {whole:?}"))?;
+        let literal = &rest[..end];
+        literal.parse::<std::net::Ipv6Addr>().map_err(|_| {
+            anyhow::anyhow!("STUN bracketed host must be an IPv6 literal in {whole:?}")
+        })?;
+        let suffix = &rest[end + 1..];
+        if suffix.is_empty() {
+            return Ok(());
+        }
+        let raw = suffix
+            .strip_prefix(':')
+            .ok_or_else(|| anyhow::anyhow!("STUN IPv6 host has an invalid suffix in {whole:?}"))?;
+        return validate_port(raw);
+    }
+
+    if target.contains(['[', ']']) {
+        bail!("STUN host has unmatched brackets in {whole:?}");
+    }
+    let (host, port) = match target.matches(':').count() {
+        0 => (target, None),
+        1 => {
+            let (host, raw) = target
+                .rsplit_once(':')
+                .ok_or_else(|| anyhow::anyhow!("invalid STUN target in {whole:?}"))?;
+            (host, Some(raw))
+        }
+        _ => bail!("STUN IPv6 literals must be bracketed in {whole:?}"),
+    };
+    match url::Host::parse(host) {
+        Ok(url::Host::Ipv6(_)) => bail!("STUN IPv6 literals must be bracketed in {whole:?}"),
+        Ok(_) => {}
+        Err(_) => bail!("invalid STUN host in {whole:?}"),
+    }
+    if let Some(raw) = port {
+        validate_port(raw)?;
+    }
+    Ok(())
+}
+
 /// Parses one `--web-transfer-stun` list: splits commas, trims delimiter
 /// whitespace, requires the `stun:` scheme with a host and optional numeric
 /// port, deduplicates preserving first occurrence. `turn:` is never accepted.
@@ -2233,18 +2341,7 @@ pub fn parse_stun_list(entries: &[String]) -> Result<Vec<String>> {
             if target.is_empty() {
                 bail!("STUN server must look like stun:HOST[:PORT], got {part:?}");
             }
-            // Optional `:port` (a bare IPv6 literal keeps its colons: only a
-            // single `:digits` suffix on a non-bracketed host counts).
-            if !target.starts_with('[') && target.matches(':').count() == 1 {
-                if let Some((_, port)) = target.rsplit_once(':') {
-                    match port.parse::<u16>() {
-                        Ok(p) if p != 0 => {}
-                        _ => bail!("STUN server port must be 1..=65535 in {part:?}"),
-                    }
-                }
-            } else if target.ends_with(':') {
-                bail!("STUN server port must not be empty in {part:?}");
-            }
+            validate_stun_target(target, part)?;
             let normalized = format!("stun:{target}");
             if !out.contains(&normalized) {
                 out.push(normalized);
@@ -2322,7 +2419,6 @@ pub fn resolve_server_config(
         owner_grace_secs: args.owner_grace_secs,
     };
     limits.validate()?;
-    let stun = parse_stun_list(&args.stun)?;
     // Derived server STUN uses the base-URL host (the address browsers reach)
     // with the control UDP port. Keep IPv6 brackets so `host:port` stays
     // parseable; strip an explicit port otherwise.
@@ -2337,7 +2433,13 @@ pub fn resolve_server_config(
     } else {
         authority
     };
-    let ice = IceServerConfig::resolve(args.no_stun, &stun, server_udp, host_part, control_port)?;
+    let ice = IceServerConfig::resolve(
+        args.no_stun,
+        &args.stun,
+        server_udp,
+        host_part,
+        control_port,
+    )?;
     Ok(Some(WebTransferConfig::new(base_url, limits, ice)?))
 }
 
@@ -2370,24 +2472,34 @@ impl WebTransferRoom {
     /// Removes exactly `peer_id` from THIS room: its presence record plus
     /// every offer it owns (attributed since Phase 2.3), each with its own
     /// revisioned removal broadcast — offers first, peer last, so receivers
-    /// never see an offer of a departed peer. Releases room and global
-    /// metadata per offer. Called by `PeerGuard::drop`; never resolves a
-    /// registry key.
-    pub(crate) fn remove_peer(&self, peer_id: PeerId) {
-        let events = {
+    /// never see an offer of a departed peer. If the complete revision range
+    /// cannot be represented, cleanup still runs, the exhausted room is
+    /// removed and destroyed, and subscribers receive one opaque room-close
+    /// event instead of a wrapped incremental revision.
+    /// Releases room and global metadata per offer. Called by `PeerGuard::drop`;
+    /// never resolves a registry key.
+    pub(crate) fn remove_peer(self: &Arc<Self>, peer_id: PeerId) {
+        let (events, revision_exhausted) = {
             let Ok(mut state) = self.state.lock() else {
                 return;
             };
-            if state.peers.remove(&peer_id).is_none() {
+            if !state.peers.contains_key(&peer_id) {
                 return;
             }
-            let mut events = Vec::new();
             let owned: Vec<OfferId> = state
                 .offers
                 .iter()
                 .filter(|(_, record)| record.owner == peer_id)
                 .map(|(id, _)| *id)
                 .collect();
+            let incremental = owned
+                .len()
+                .checked_add(1)
+                .and_then(|steps| checked_room_revision(state.revision, steps).ok())
+                .is_some();
+            state.peers.remove(&peer_id);
+            let mut events = Vec::new();
+            let mut revision = state.revision;
             for offer in owned {
                 if let Some(record) = state.offers.remove(&offer) {
                     state.metadata_bytes =
@@ -2397,21 +2509,36 @@ impl WebTransferRoom {
                             .metadata_current
                             .fetch_sub(record.metadata_bytes, Ordering::Relaxed);
                     }
-                    state.revision = state.revision.wrapping_add(1);
-                    events.push(RoomEvent::OfferRemoved {
-                        peer: peer_id,
-                        offer,
-                        revision: state.revision,
-                    });
+                    if incremental {
+                        revision = checked_room_revision(revision, 1)
+                            .expect("revision range was checked before cleanup");
+                        events.push(RoomEvent::OfferRemoved {
+                            peer: peer_id,
+                            offer,
+                            revision,
+                        });
+                    }
                 }
             }
-            state.revision = state.revision.wrapping_add(1);
-            events.push(RoomEvent::PeerLeft {
-                peer: peer_id,
-                revision: state.revision,
-            });
-            events
+            if incremental {
+                revision = checked_room_revision(revision, 1)
+                    .expect("revision range was checked before cleanup");
+                state.revision = revision;
+                events.push(RoomEvent::PeerLeft {
+                    peer: peer_id,
+                    revision,
+                });
+            }
+            (events, !incremental)
         };
+        if revision_exhausted {
+            if let Some(registry) = self.registry.upgrade() {
+                let holder = WebTransferRegistry { inner: registry };
+                holder.remove_room_if_current(self.id, self);
+            }
+            self.destroy("revision-exhausted");
+            return;
+        }
         for event in events {
             let _ = self.events.send(event);
         }
@@ -4310,6 +4437,179 @@ mod offer_tests {
         let outcome = publish(&registry, &room, second, offer_hex, "Demo");
         assert_eq!(outcome.unwrap_err().code(), "OFFER_CHANGED");
         assert_eq!(room.state.lock().unwrap().offers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn identical_publish_is_idempotent_at_saturated_caps() {
+        let offer_hex = "dddddddddddddddddddddddddddddddd";
+        let value = manifest_json(offer_hex, "Saturated");
+        let limits_for_parse = WebTransferLimits::default();
+        let manifest = parse_manifest(&value, &limits_for_parse).unwrap();
+        let canonical: std::sync::Arc<[u8]> = canonical_json(&manifest_value(&manifest))
+            .unwrap()
+            .into_bytes()
+            .into();
+        let charge = offer_charge(canonical.len()).unwrap();
+        let registry = WebTransferRegistry::new(
+            WebTransferConfig::new(
+                WebTransferBaseUrl::parse("http://127.0.0.1:8080/").unwrap(),
+                WebTransferLimits {
+                    max_offers_per_peer: 1,
+                    max_metadata_per_room_bytes: charge,
+                    max_metadata_total_bytes: charge,
+                    ..WebTransferLimits::default()
+                },
+                IceServerConfig {
+                    servers: Vec::new(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (_lease, room, first, _second, _guards) = open_peer_room(&registry);
+        let offer_id: OfferId = offer_hex.parse().unwrap();
+        assert_eq!(
+            registry
+                .publish_offer(
+                    &room,
+                    first,
+                    offer_id,
+                    &manifest,
+                    std::sync::Arc::clone(&canonical),
+                    [0xee; 32],
+                )
+                .unwrap(),
+            PublishOutcome::Created
+        );
+        assert_eq!(room.state.lock().unwrap().metadata_bytes, charge);
+        assert_eq!(registry.current_metadata_bytes(), charge);
+
+        assert_eq!(
+            registry
+                .publish_offer(
+                    &room,
+                    first,
+                    offer_id,
+                    &manifest,
+                    std::sync::Arc::clone(&canonical),
+                    [0xee; 32],
+                )
+                .unwrap(),
+            PublishOutcome::Idempotent
+        );
+
+        let changed_value = manifest_json(offer_hex, "Changed");
+        let changed_manifest = parse_manifest(&changed_value, &limits_for_parse).unwrap();
+        let changed_canonical: std::sync::Arc<[u8]> =
+            canonical_json(&manifest_value(&changed_manifest))
+                .unwrap()
+                .into_bytes()
+                .into();
+        assert_eq!(
+            registry
+                .publish_offer(
+                    &room,
+                    first,
+                    offer_id,
+                    &changed_manifest,
+                    changed_canonical,
+                    [0xee; 32],
+                )
+                .unwrap_err()
+                .code(),
+            "OFFER_CHANGED"
+        );
+        assert_eq!(room.state.lock().unwrap().offers.len(), 1);
+        assert_eq!(room.state.lock().unwrap().metadata_bytes, charge);
+        assert_eq!(registry.current_metadata_bytes(), charge);
+    }
+
+    #[tokio::test]
+    async fn room_revision_overflow_never_wraps_or_leaks_state() {
+        let registry = offer_registry();
+        let (_lease, room, first, _second, mut guards) = open_peer_room(&registry);
+        let guard_a = guards.remove(0);
+        let guard_b = guards.remove(0);
+        room.state.lock().unwrap().revision = u64::MAX;
+
+        let extra = generate_peer_id();
+        assert_eq!(
+            registry
+                .join_peer(&room, extra, Some("Extra".to_string()))
+                .unwrap_err()
+                .code(),
+            "INTERNAL"
+        );
+        assert!(!room.state.lock().unwrap().peers.contains_key(&extra));
+        assert_eq!(registry.current_peers(), 2);
+
+        let original_name = room.state.lock().unwrap().peers[&first]
+            .display_name
+            .clone();
+        assert_eq!(
+            registry
+                .rename_peer(&room, first, "Changed")
+                .unwrap_err()
+                .code(),
+            "INTERNAL"
+        );
+        assert_eq!(
+            room.state.lock().unwrap().peers[&first].display_name,
+            original_name
+        );
+
+        let offer_hex = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        assert_eq!(
+            publish(&registry, &room, first, offer_hex, "Overflow")
+                .unwrap_err()
+                .code(),
+            "INTERNAL"
+        );
+        assert!(room.state.lock().unwrap().offers.is_empty());
+        assert_eq!(registry.current_metadata_bytes(), 0);
+
+        room.state.lock().unwrap().revision = u64::MAX - 1;
+        assert_eq!(
+            publish(&registry, &room, first, offer_hex, "Overflow").unwrap(),
+            PublishOutcome::Created
+        );
+        let offer_id: OfferId = offer_hex.parse().unwrap();
+        let charge = room.state.lock().unwrap().metadata_bytes;
+        assert!(charge > 0);
+        assert_eq!(room.state.lock().unwrap().revision, u64::MAX);
+        assert_eq!(
+            registry
+                .withdraw_offer(&room, first, offer_id)
+                .unwrap_err()
+                .code(),
+            "INTERNAL"
+        );
+        assert!(room.state.lock().unwrap().offers.contains_key(&offer_id));
+        assert_eq!(registry.current_metadata_bytes(), charge);
+
+        let mut events = room.events.subscribe();
+        drop(guard_a);
+        {
+            let state = room.state.lock().unwrap();
+            assert!(!state.peers.contains_key(&first));
+            assert!(!state.offers.contains_key(&offer_id));
+            assert_eq!(state.metadata_bytes, 0);
+            assert_eq!(state.revision, u64::MAX);
+        }
+        assert_eq!(registry.current_metadata_bytes(), 0);
+        assert_eq!(registry.current_peers(), 1);
+        assert!(room.is_destroyed());
+        assert!(room.cancel.is_cancelled());
+        assert!(registry.room(room.id).is_none());
+        match events.try_recv().unwrap() {
+            RoomEvent::RoomClosed { reason } => assert_eq!(reason, "revision-exhausted"),
+            event => panic!("revision exhaustion emitted incremental event {event:?}"),
+        }
+        assert!(events.try_recv().is_err());
+
+        drop(guard_b);
+        assert_eq!(registry.current_peers(), 0);
+        assert!(room.state.lock().unwrap().peers.is_empty());
     }
 
     #[tokio::test]

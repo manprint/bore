@@ -609,3 +609,45 @@ Il filo conduttore dei due giri, in una riga: **ogni numero assoluto in un
 gate è un'ipotesi sulla macchina.** Di tredici difetti trovati dalla CI, uno
 solo era nel prodotto (B-A002); gli altri erano un harness che descriveva la
 workstation su cui era stato scritto, o che leggeva più di quanto affermasse.
+
+### Esito — terzo giro di CI su `dev` (`6356e10`, 2026-09-16)
+
+Quattro workflow su cinque verdi: `E2E (netns)`, `Docker (GHCR)`,
+`Mean Bean Deploy` e — per la prima volta — `Mean Bean CI`. Rosso il solo
+workflow `CI`, per due job e due difetti, entrambi dell'harness.
+
+- **B-A014** (`windows-latest`): `cargo clippy --features vpn --all-targets --
+  -D warnings` rifiuta `unused variable: pid` due volte e il crate di test non
+  compila. Il warning è però la parte piccola: `t_web_cli` usa quel pid solo
+  dentro `#[cfg(unix)] signal_pid(..)`, quindi su windows sarebbe stato
+  compilato ed ESEGUITO senza mai chiudere i processi che avvia — tre join da
+  dieci secondi, poi l'accusa al prodotto di non essere uscito. Tre delle sue
+  quattro gambe sono segnali, e `t_web_room_life` aveva già la forma giusta:
+  il test intero è ora `#[cfg(unix)]`. Un test che non può eseguire il proprio
+  soggetto va saltato, non indebolito.
+- **B-A015** (`macos-14`): `t_web_fairness` di nuovo rosso, e stavolta contro
+  il rimedio di B-A007 — «answered in 1.747280833s (budget 1.346883625s, relay
+  4.040650875s, idle 279.709µs)». Cioè il control plane è stato **2,3 volte
+  più veloce** della cosa che era accusato di aspettare. `elapsed_b / 3`
+  *sembra* un rapporto e non lo è: il relay è limitato dal token bucket del
+  server, quindi `elapsed_b` è una costante di configurazione e dividerla
+  produce un budget assoluto travestito — V-9 al secondo giro, sulla stessa
+  asserzione. Il verdetto stava per giunta sul PEGGIORE di dieci campioni,
+  cioè sulla singola pausa di scheduler di un runner condiviso.
+
+  Il rimedio viene dall'aritmetica del difetto invece che da un numero: un
+  control plane bloccato risponde a un ping mandato a `t` solo quando il relay
+  finisce a `T`, quindi ogni campione costa `T - t` e dieci campioni a 200 ms
+  danno mediana ≈ 0,55·`T` e peggiore ≈ `T`. Un control plane sano risponde in
+  microsecondi, e lo scheduler allunga i CAMPIONI, mai la mediana di dieci. Il
+  gate giudica ora `mediana < elapsed_b / 4` — tre ordini di grandezza di
+  margine — e tiene `peggiore < elapsed_b` come forma letterale del difetto.
+  Misurato in locale dopo il cambio: `FAIRNESS a=4.01s b=4.01s control-rtt
+  median=0ms worst=1ms idle=0.2ms samples=[0,0,0,0,0,0,0,0,0,0]`.
+
+Il conto dopo tre giri: **quindici difetti trovati dalla CI, uno solo nel
+prodotto** (B-A002). E una lezione che il secondo giro non aveva ancora
+imparato: non basta che un limite *abbia la forma* di un rapporto — il
+denominatore deve misurare la stessa cosa che il numeratore rischia di
+misurare. Un denominatore che è una costante di configurazione riporta
+l'asserzione esattamente da dove veniva.

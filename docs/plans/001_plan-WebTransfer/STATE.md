@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-16 18:40 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 9
+> **Last updated:** 2026-09-16 20:10 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 9
 
 ## 0. Protocol
 
@@ -30,9 +30,9 @@ This is the only execution-state file — position, progress, ledger, and blocke
 - **Status:** `none`
 - **Intent:** Revisione finale dell'intero piano 001: rieseguire ogni gate autorevole di §3 in blocco (fmt, clippy, build, Rust lib, suite seriale web-transfer, regressione completa non-netns, unit e e2e browser sui tre motori, drift degli asset, fuzzing, cross, package, release, container, harness admin sudo e SSH seriale), verificare la coerenza fra piano, codice e README, poi commit e push su `dev` seguendo la CI fino al verde.
 - **Phase:** 6 — `phase_07.md`
-- **Next action:** nessuna sotto-fase aperta. Il piano 001 e' COMPLETO: fasi 0-6 chiuse, revisione finale eseguita e verde. Il commit `84cd16d` e' su `dev`; la CI ha trovato otto difetti che i gate locali non potevano vedere (T-A002 e B-A002..B-A008, tutti chiusi e red-checked dove il difetto lo permetteva). Resta da seguire la CI del push successivo fino al verde.
+- **Next action:** nessuna sotto-fase aperta. Il piano 001 e' COMPLETO: fasi 0-6 chiuse e revisione finale verde. Tre giri di CI su `dev` hanno trovato quindici difetti che i gate locali non potevano vedere: `84cd16d` → T-A002 e B-A002..B-A008, `111a98c` → B-A009..B-A013, `6356e10` → B-A014 (windows: `-D warnings` su un binding che solo unix usa, e un test che su windows non avrebbe mai chiuso il processo che avvia) e B-A015 (macos: il budget «a rapporto» di B-A007 non era un rapporto). Resta da seguire la CI del quarto push fino al verde.
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | working tree `dirty (le correzioni CI T-A002 e B-A002..B-A008, non ancora committate)` | last commit `84cd16d feat(web-transfer): browser-to-browser transfer rooms (\`bore transfer web\`)`
+- **Repo state:** branch `dev` | working tree `dirty (le correzioni B-A014 e B-A015, non ancora committate)` | last commit `6356e10 fix(web-transfer): five harness defects the second CI round exposed`
 
 ## 2. Feature context (self-contained recap)
 
@@ -153,6 +153,8 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 72 | bug | B-A011 | agent-1:Claude-Opus-5 | il gate di privacy leggeva il log dell'INTERO processo e lo chiamava log del server: a `TRACE` il ponte `log` ci portava dentro il dump dei frame di `tungstenite`, cioe' i byte spediti dal test stesso | tests/web_transfer_test.rs | suite in parallelo, tre esecuzioni verdi | uncommitted |
 | 73 | bug | B-A012 | agent-1:Claude-Opus-5 | i due tentativi di `T-WEB-PATH-UI` erano decorativi: l'attesa di `relay` era una `expect` dura dentro il ciclo, quindi il primo tentativo sfortunato abortiva il test | web/transfer/tests/e2e/ui.spec.mjs | `--repeat-each=3` su firefox, piu' firefox+webkit | uncommitted |
 | 74 | bug | B-A013 | agent-1:Claude-Opus-5 | il budget di 300 s di `T-WEB-ZIP-SOURCE-CHANGE` descriveva la workstation, non il prodotto | web/transfer/tests/e2e/zip-resume.spec.mjs | 22 s su webkit in locale; il runner CI e' l'oracolo del caso lento | uncommitted |
+| 75 | bug | B-A014 | agent-1:Claude-Opus-5 | `t_web_cli` e' fatto di segnali per tre gambe su quattro: fuori da unix il binding del pid non lo usa nessuno (`-D warnings` rosso) e il test sarebbe comunque girato senza mai chiudere il processo che avvia. Ora e' `#[cfg(unix)]` come `t_web_room_life` | tests/web_transfer_test.rs | clippy `-D warnings` pulito, `t_web_cli` verde su Linux; il job windows e' l'oracolo dell'altro ramo | uncommitted |
+| 76 | bug | B-A015 | agent-1:Claude-Opus-5 | il budget di B-A007 dividerva una COSTANTE (il relay e' limitato dal token bucket) e giudicava il peggiore di dieci campioni: un budget assoluto travestito da rapporto. Il verdetto e' ora mediana `< elapsed_b / 4` piu' peggiore `< elapsed_b` | tests/web_transfer_test.rs | `t_web_fairness` verde con mediana 0 ms e campioni tutti a 0 ms contro un relay di 4,01 s | uncommitted |
 
 ## 5. Files touched
 
@@ -507,6 +509,8 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | web/transfer/package.json | B-A003: `check` e `test:unit` fanno espandere il glob alla shell, cosi' la versione di Node non decide piu' se i test girano | B-A003 |
 | tests/web_transfer_test.rs | B-A009: il tetto del burst di controllo e' ora pavimento (il burst configurato) piu' quanto il rate configurato puo' aver ricaricato nel tempo misurato, invece del numero 60 | B-A009 |
 | tests/web_transfer_test.rs | B-A004..B-A008: `proc_fs_available`/`kib_or_na`, i rami `N/A` di RSS/descrittori/limiti, l'aggancio `BROWSER` solo dove esiste, l'attesa dell'esito al posto dei 400 ms, il budget di controllo come rapporto e il refill monotono del soak | B-A004..B-A008 |
+| tests/web_transfer_test.rs | B-A014: `t_web_cli` marcato `#[cfg(unix)]` (i due `#[cfg(unix)]` sulle chiamate a `signal_pid` diventano superflui) | B-A014 |
+| tests/web_transfer_test.rs | B-A015: `t_web_fairness` raccoglie i dieci RTT di controllo, giudica sulla MEDIANA (`< elapsed_b / 4`) piu' il peggiore (`< elapsed_b`) e stampa i campioni grezzi accanto alle statistiche | B-A015 |
 
 | tests/support/web_transfer.rs | B-A010: `free_port` da un cursore atomico sotto l'intervallo effimero, spostato dal pid; `wait_port` con budget di 20 s e `panic!` alla scadenza | B-A010 |
 | web/transfer/tests/e2e/ui.spec.mjs | B-A012: attesa morbida dentro il ciclo a due tentativi, con l'esito di ognuno nel messaggio di fallimento | B-A012 |
@@ -551,6 +555,8 @@ the exact corrected full regression now passes.
 ```
 | audit | `cargo audit --ignore RUSTSEC-2023-0071` | `pass` (0 vulnerabilita', 7 warning gia' ammesse) | T-A002, 2026-09-16 |
 | CI `dev` @ `84cd16d` | GitHub Actions | `E2E (netns)` pass, `Docker (GHCR)` pass, `Mean Bean Deploy` pass; `CI` e `Mean Bean CI` fail — otto difetti, tutti dell'harness o delle dipendenze, chiusi come T-A002 e B-A002..B-A008 | 2026-09-16 |
+| CI `dev` @ `111a98c` | GitHub Actions | `E2E (netns)` pass, `Docker (GHCR)` pass, `Mean Bean Deploy` pass; `CI` e `Mean Bean CI` fail — cinque difetti, tutti dell'harness, chiusi come B-A009..B-A013 | 2026-09-16 |
+| CI `dev` @ `6356e10` | GitHub Actions | `E2E (netns)` pass, `Docker (GHCR)` pass, `Mean Bean CI` pass, `Mean Bean Deploy` pass; solo `CI` fail — due difetti dell'harness (B-A014 windows, B-A015 macos). Quattro workflow su cinque verdi, e `Mean Bean CI` verde per la prima volta | 2026-09-16 |
 
 ## 8. Runtime deviations from the plan
 
@@ -709,6 +715,7 @@ the exact corrected full regression now passes.
 | 136 | il testo di un errore invecchia insieme al codice che lo produce | il codice `MULTI_ENTRY` e' rimasto raggiungibile (richiesta `raw` di un'offerta con piu' file) mentre la sua FRASE («cartelle e selezioni multiple non ancora supportate») era diventata falsa con la 5.x | testo riscritto sul caso reale e `t_web_readme` ora confronta la tabella di troubleshooting con la mappa `ERROR_TEXT` di `state.js` | 6.6 |
 | 137 | 6.1 «il budget globale dei peer deve tornare entro 10 s dalla chiusura della stanza» | il ritorno peggiore e' UN `WEB_TRANSFER_CTRL_SEND_TIMEOUT` (10 s) per ogni peer che ha smesso di leggere | il numero del piano non era raggiungibile per costruzione, non per un difetto: `bounded_ws_send` puo' parcheggiare una sessione per l'intero timeout e il `PeerGuard` — quindi il permesso — si libera solo alla fine della sessione. MISURATO: 19 permessi tornano in 13 ms, gli ultimi 13 a 10,57 s, esattamente un timeout dopo. Il gate ora DERIVA la propria scadenza dalla costante del server (due timeout piu' cinque secondi) invece di ripetere un numero, cosi' se un giorno la costante cambia il gate la segue. Il prodotto non e' cambiato: il limite c'e', e' gia' bounded ed e' corretto | nessuno: il gate resta nella fase 6.1 e misura la stessa proprieta', con la scadenza legata alla costante che la governa |
 
+| 138 | 6.1 «il control plane risponde entro un budget mentre il relay lavora» | il budget non puo' essere ne' un numero assoluto ne' una frazione di una quantita' che non misura la macchina | il relay e' limitato dal token bucket del server, quindi `elapsed_b` e' una costante di configurazione: `elapsed_b / 3` era un budget assoluto travestito da rapporto (V-9 al secondo giro, dopo B-A007). Il difetto ha pero' un'aritmetica propria — un control plane bloccato paga `T - t` su OGNI campione, quindi mediana ≈ 0,55·T e peggiore ≈ T — mentre lo scheduler di un runner condiviso allunga i campioni e non la mediana di dieci. Il gate giudica ora sulla MEDIANA con tre ordini di grandezza di margine e tiene il peggiore come forma letterale del difetto | nessuno: stessa proprieta', stessa fase, verdetto che non dipende piu' dalla velocita' del runner |
 ## 9. Blockers and open questions
 
 - ~~**Phase 3 cannot close before the serial SSH regression runs**~~ — run at 3.7 and green

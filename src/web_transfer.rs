@@ -5694,6 +5694,31 @@ pub struct OwnerControlOutcome {
 pub const WEB_TRANSFER_DISABLED_ERROR: &str =
     "web transfer is not enabled on this server: upgrade the server and set --web-transfer-base-url";
 
+/// Grace for the last frame of a terminal error. A `send` on a muxed control
+/// stream only QUEUES the frame in the connection: returning drops the
+/// substream, M-1 then closes the whole connection as soon as nothing holds it,
+/// and a peer that has not been scheduled yet reads a clean EOF instead of the
+/// message it was owed — which is how "unsupported version" becomes "server
+/// unreachable" at the one moment the operator needs the real reason. MEASURED
+/// on windows-latest: the `t_web_native_wire` arm that passes on Linux read
+/// `None`.
+const WEB_TRANSFER_ERROR_LINGER: Duration = Duration::from_secs(5);
+
+/// Holds a control stream open after a terminal error until the PEER closes it,
+/// bounded by [`WEB_TRANSFER_ERROR_LINGER`]. The peer's own close is the proof
+/// it read; the bound is what keeps a client that never reads from pinning the
+/// task. Whatever arrives here is discarded — the session is already over, and
+/// this only keeps the error ahead of the teardown that would race it.
+async fn linger_after_error<S>(control: &mut crate::shared::Delimited<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let _ = tokio::time::timeout(WEB_TRANSFER_ERROR_LINGER, async {
+        while let Ok(Some(_)) = control.recv::<crate::shared::ClientMessage>().await {}
+    })
+    .await;
+}
+
 /// Dispatches the FIRST message of a native owner control stream. Version is
 /// verified before any allocation; a disabled service answers the existing
 /// generic protocol error so the client can map it. Returns the loop outcome.
@@ -5724,6 +5749,7 @@ where
                 control.send(ServerMessage::Error(format!(
                     "unsupported web-transfer version {version}: upgrade the client and server together"
                 ))).await?;
+                linger_after_error(control).await;
                 return Ok(idle());
             }
             let Some(registry) = registry else {
@@ -5732,6 +5758,7 @@ where
                         WEB_TRANSFER_DISABLED_ERROR.to_string(),
                     ))
                     .await?;
+                linger_after_error(control).await;
                 return Ok(idle());
             };
             let lease = OwnerLease::create(&registry, member_token_hash, owner_token_hash)
@@ -5757,6 +5784,7 @@ where
                 control.send(ServerMessage::Error(format!(
                     "unsupported web-transfer version {version}: upgrade the client and server together"
                 ))).await?;
+                linger_after_error(control).await;
                 return Ok(idle());
             }
             let Some(registry) = registry else {
@@ -5765,6 +5793,7 @@ where
                         WEB_TRANSFER_DISABLED_ERROR.to_string(),
                     ))
                     .await?;
+                linger_after_error(control).await;
                 return Ok(idle());
             };
             // Hash immediately. The raw token is `Copy`, so no drop can scrub
@@ -5789,6 +5818,7 @@ where
                     control
                         .send(ServerMessage::Error("room unavailable".to_string()))
                         .await?;
+                    linger_after_error(control).await;
                     idle()
                 }
             };
@@ -5804,6 +5834,7 @@ where
                         WEB_TRANSFER_DISABLED_ERROR.to_string(),
                     ))
                     .await?;
+                linger_after_error(control).await;
                 return Ok(idle());
             };
             // Idempotent close: a missing room is already gone (success).
@@ -6445,20 +6476,33 @@ mod owner_control_tests {
     async fn create_rejects_disabled_service_and_wrong_version_without_allocating() {
         let (owner, member_hash, owner_hash) = owner_pair();
         let _ = owner;
-        // Disabled service: generic error, no room.
+        // Disabled service: generic error, no room. The call is SPAWNED and the
+        // client closes only after reading, because a terminal error now
+        // outlives the teardown that would race it (`linger_after_error`).
         let (mut client, mut server) = duplex_pair().await;
-        let outcome = serve_owner_first_message(
-            None,
-            &mut server,
-            ClientMessage::CreateWebTransferRoom {
-                version: 1,
-                member_token_hash: member_hash,
-                owner_token_hash: owner_hash,
-            },
-            Duration::from_secs(60),
-        )
-        .await
-        .unwrap();
+        let server_task = tokio::spawn(async move {
+            serve_owner_first_message(
+                None,
+                &mut server,
+                ClientMessage::CreateWebTransferRoom {
+                    version: 1,
+                    member_token_hash: member_hash,
+                    owner_token_hash: owner_hash,
+                },
+                Duration::from_secs(60),
+            )
+            .await
+        });
+        assert!(matches!(
+            client.recv::<ServerMessage>().await.unwrap(),
+            Some(ServerMessage::Error(_))
+        ));
+        drop(client);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("the peer's close ends the linger")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             outcome,
             OwnerControlOutcome {
@@ -6467,30 +6511,78 @@ mod owner_control_tests {
                 timed_out: false
             }
         );
-        assert!(matches!(
-            client.recv::<ServerMessage>().await.unwrap(),
-            Some(ServerMessage::Error(_))
-        ));
         // Wrong version: rejected before any allocation.
         let registry = test_registry();
+        let task_registry = Arc::new(registry.clone());
         let (mut client, mut server) = duplex_pair().await;
-        serve_owner_first_message(
-            Some(Arc::new(registry.clone())),
-            &mut server,
-            ClientMessage::CreateWebTransferRoom {
-                version: 2,
-                member_token_hash: member_hash,
-                owner_token_hash: owner_hash,
-            },
-            Duration::from_secs(60),
-        )
-        .await
-        .unwrap();
+        let server_task = tokio::spawn(async move {
+            serve_owner_first_message(
+                Some(task_registry),
+                &mut server,
+                ClientMessage::CreateWebTransferRoom {
+                    version: 2,
+                    member_token_hash: member_hash,
+                    owner_token_hash: owner_hash,
+                },
+                Duration::from_secs(60),
+            )
+            .await
+        });
         assert!(matches!(
             client.recv::<ServerMessage>().await.unwrap(),
             Some(ServerMessage::Error(_))
         ));
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("the peer's close ends the linger")
+            .unwrap()
+            .unwrap();
         assert_eq!(registry.current_rooms(), 0);
+    }
+
+    /// A terminal error must reach the peer BEFORE the connection can be torn
+    /// down. `send` only queues the frame on a muxed control stream, and M-1
+    /// closes the whole connection the moment nothing holds it, so returning
+    /// straight after the send leaves the frame racing the close — the peer
+    /// then reads a clean EOF and reports "server unreachable" for what was a
+    /// version mismatch. Red-check: without `linger_after_error` the call is
+    /// already finished here while the peer still holds its half open.
+    #[tokio::test]
+    async fn a_terminal_error_outlives_the_teardown_that_would_race_it() {
+        let (owner, member_hash, owner_hash) = owner_pair();
+        let _ = owner;
+        let (mut client, mut server) = duplex_pair().await;
+        let server_task = tokio::spawn(async move {
+            serve_owner_first_message(
+                None,
+                &mut server,
+                ClientMessage::CreateWebTransferRoom {
+                    version: 1,
+                    member_token_hash: member_hash,
+                    owner_token_hash: owner_hash,
+                },
+                Duration::from_secs(60),
+            )
+            .await
+        });
+        // The peer has not closed, so the server must still be holding on.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !server_task.is_finished(),
+            "the error's frame was abandoned to the teardown"
+        );
+        // Reading it and then closing is what releases the server, at once.
+        assert!(matches!(
+            client.recv::<ServerMessage>().await.unwrap(),
+            Some(ServerMessage::Error(_))
+        ));
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("the peer's close must end the linger immediately")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

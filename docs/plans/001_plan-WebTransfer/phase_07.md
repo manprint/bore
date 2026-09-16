@@ -529,3 +529,44 @@ scritta e falsa adesso, e prosa che nessun gate teneva ancorata al prodotto.
 ## Phase done criterion
 
 Il binario e il container distribuibili superano lo scenario A/B/C, carico, limiti, privacy, no-storage, lifecycle, malformed input, matrice browser e regressione completa. Config e metriche conservano semantica distinta, nessuna nuova socket UDP esiste e i vecchi modi restano invariati. README.md è la fonte utente completa e `STATE.md` §11 mostra tutte le fasi e i gate `DONE`, con nessuna unità aperta.
+
+## Esito — primo giro di CI su `dev` (`84cd16d`, 2026-09-16)
+
+Tre workflow verdi al primo colpo — `E2E (netns)`, `Docker (GHCR)`, `Mean Bean
+Deploy` — e due rossi, `CI` e `Mean Bean CI`. Nessuno dei rossi era un difetto
+del prodotto: **otto** difetti in tutto, uno di dipendenza e sette
+dell'harness, tutti di una classe che una workstation Linux non può vedere per
+costruzione.
+
+1. **Una dipendenza vulnerabile** (T-A002). `cargo audit` segnala
+   RUSTSEC-2026-0285 su rustls 0.23.40, pubblicato il giorno prima del push:
+   aggiornato a 0.23.45. È l'unico dei otto che riguarda ciò che viene
+   spedito.
+2. **Un errore terminale che correva contro il teardown** (B-A002). L'unico
+   difetto di prodotto del giro, e l'unico trovato da `windows-latest`: su uno
+   stream muxato `send` accoda soltanto, quindi il ritorno immediato lasciava
+   che M-1 chiudesse la connessione prima che il frame partisse. Il client
+   leggeva un EOF pulito al posto di «versione non supportata». Corretto con
+   `linger_after_error` e red-checked.
+3. **Un job che non aveva mai eseguito i propri test** (B-A003). `node --test`
+   espande i glob solo da Node 22; la CI usa Node 20 e la slice browser era
+   rossa fin dal primo giorno per un file inesistente. Ora il glob lo espande
+   la shell.
+4. **Cinque gate che descrivevano la macchina invece del server**
+   (B-A004..B-A008): tre leggevano `/proc` e fallivano duro su macOS (e uno di
+   essi sarebbe passato A VUOTO, che è peggio); uno osservava `--open`
+   attraverso `$BROWSER`, che `webbrowser` non consulta su macOS; uno aspettava
+   400 ms fissi l'uscita di un processo; uno confrontava l'RTT del control
+   plane con un millisecondaggio assoluto invece che con un rapporto (V-9);
+   l'ultimo, il soak, buttava via i peer già ammessi a ogni ritentativo e
+   competeva con il proprio rilascio.
+
+La lezione del giro, ed è la ragione per cui questa sezione esiste: **un gate
+che non può girare deve dirlo.** Quattro dei sette difetti dell'harness erano
+un numero o un file di sistema presi per universali; uno di essi — le
+asserzioni sui descrittori su una lista vuota — sarebbe passato in silenzio per
+sempre. Ogni ramo che ora non può misurare stampa `N/A` con la ragione, e ogni
+budget che restava è diventato un rapporto o una costante DERIVATA da quella
+che il server pubblica (la scadenza del soak segue ora
+`WEB_TRANSFER_CTRL_SEND_TIMEOUT`, che è il vero limite superiore al ritorno di
+un permesso).

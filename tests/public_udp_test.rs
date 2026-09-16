@@ -20,6 +20,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time;
 
+/// How long a port wait may take before the harness declares its OWN failure.
+/// A silent timeout hands the failure to the next line, where a precondition
+/// that never held reads as a product defect (B-A019).
+const PORT_WAIT_BUDGET: Duration = Duration::from_secs(30);
+
 lazy_static! {
     /// Serializes tests that bind the fixed control port.
     static ref SERIAL_GUARD: Mutex<()> = Mutex::new(());
@@ -28,7 +33,8 @@ lazy_static! {
 /// Wait until the control port is either accepting connections (`listening`) or
 /// fully released.
 async fn wait_for_control_port(listening: bool) {
-    for _ in 0..500 {
+    let deadline = time::Instant::now() + PORT_WAIT_BUDGET;
+    loop {
         if TcpStream::connect(("localhost", CONTROL_PORT))
             .await
             .is_ok()
@@ -36,6 +42,11 @@ async fn wait_for_control_port(listening: bool) {
         {
             return;
         }
+        assert!(
+            time::Instant::now() < deadline,
+            "port {CONTROL_PORT} never became {} within {PORT_WAIT_BUDGET:?}",
+            if listening { "reachable" } else { "free" },
+        );
         time::sleep(Duration::from_millis(10)).await;
     }
 }

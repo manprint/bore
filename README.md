@@ -2378,6 +2378,10 @@ focused control is always outlined, and a running transfer is a real progress ba
 screen reader. The path badge carries a **shape as well as a word** — `◌ in connessione`,
 `◆ diretto`, `▲ relay` — so it survives a colour-blind reader, a printout and a
 high-contrast theme, and hovering it explains in one line what that transport means.
+The badge only ever names a transport that has already delivered a **verified** byte, and
+it is never taken back at the end: a data channel that closes right after the last frame
+is how an ordinary transfer finishes, so that close completes the transfer — it does not
+send the row back to `in connessione`, and it does not restart the file.
 
 1. **Join.** Open the link. `Il tuo nome` ("your name") is the label other peers see — it
    is local, never authenticated, and can be changed at any time.

@@ -30,13 +30,60 @@ lazy_static! {
     static ref SERIAL_GUARD: Mutex<()> = Mutex::new(());
 }
 
+/// How long a port wait may take before the harness declares its own failure.
+/// Generous on purpose: on a loaded runner a finished test's runtime can hold
+/// its listeners for seconds, and the previous 5 s bound was reached in CI.
+const PORT_WAIT_BUDGET: Duration = Duration::from_secs(30);
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Wait until `port` is (or is no longer) accepting connections.
+///
+/// The budget is generous and running out of it is LOUD. A harness that returns
+/// SILENTLY when its precondition never held hands the failure to the next line,
+/// where it reads as a product defect: the registration group shares one port
+/// pair, a `#[tokio::test]` runtime closes its listeners only after the body
+/// released `SERIAL_GUARD`, and the old 5 s silent timeout turned "the previous
+/// test still holds the port" into `could not connect to localhost:17920:
+/// Connection refused` one line later (B-A019, B-A010's family).
 async fn wait_port(port: u16, listening: bool) {
-    for _ in 0..500 {
+    let deadline = time::Instant::now() + PORT_WAIT_BUDGET;
+    loop {
         if TcpStream::connect(("127.0.0.1", port)).await.is_ok() == listening {
             return;
         }
+        assert!(
+            time::Instant::now() < deadline,
+            "port {port} never became {} within {PORT_WAIT_BUDGET:?}",
+            if listening { "reachable" } else { "free" },
+        );
+        time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Wait for the server we just spawned to answer on `port`, and fail with ITS
+/// OWN error when it never bound.
+///
+/// `tokio::spawn` discards `listen()`'s `Result`, so "our server is up" and
+/// "somebody else's listener is still up" were the same observation — which is
+/// how a port still held by the previous test's runtime produced a refused
+/// connection attributed to the client (B-A019).
+async fn wait_bound(port: u16, handle: tokio::task::JoinHandle<Result<()>>) {
+    let deadline = time::Instant::now() + PORT_WAIT_BUDGET;
+    loop {
+        if handle.is_finished() {
+            panic!(
+                "server on port {port} stopped before it served: {:?}",
+                handle.await
+            );
+        }
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            return;
+        }
+        assert!(
+            time::Instant::now() < deadline,
+            "server on port {port} never accepted within {PORT_WAIT_BUDGET:?}",
+        );
         time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -145,8 +192,8 @@ async fn spawn_server_vhost(control: u16, cfg: VhostConfig) -> Result<()> {
     server.set_control_port(control);
     server.set_bind_tunnels("127.0.0.1".parse()?);
     server.set_vhost(cfg)?;
-    tokio::spawn(server.listen());
-    wait_port(control, true).await;
+    let handle = tokio::spawn(server.listen());
+    wait_bound(control, handle).await;
     Ok(())
 }
 
@@ -1609,8 +1656,8 @@ async fn vhost_config_hot_reload() -> Result<()> {
 
 #[tokio::test]
 async fn vhost_bad_config_ignored() -> Result<()> {
-    const CTRL: u16 = 17958;
-    const HTTP: u16 = 17959;
+    const CTRL: u16 = 18220;
+    const HTTP: u16 = 18221;
 
     let yaml_path = temp_yaml_path();
     let initial_yaml = format!(

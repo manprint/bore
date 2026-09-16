@@ -3,7 +3,12 @@
 // total. Sealing lives in crypto.js; `decodeFrame` below is the strict
 // receive side (exact sequence, then AEAD open).
 
-import { FINAL_ARCHIVE_BYTES, openFrame, openFrameWithKey } from "./crypto.js";
+import {
+  FINAL_ARCHIVE_BYTES,
+  FRAME_HEADER_LEN,
+  openFrame,
+  openFrameWithKey,
+} from "./crypto.js";
 
 /** Logical chunk size: 1 MiB, the manifest's hashing unit. */
 export const CHUNK_BYTES = 1024 * 1024;
@@ -15,6 +20,30 @@ export const MAX_MESSAGE_BYTES = 32 * 1024;
 export const FRAME_DATA = 1;
 /** FINAL frame type (8-byte u64be total). */
 export const FRAME_FINAL = 2;
+
+/**
+ * Frame type of a frame that has NOT been opened yet, or `null` when the
+ * bytes cannot be read here — a `Blob` (no transport of ours produces one:
+ * both set `binaryType = "arraybuffer"`) or too few bytes to hold a header.
+ *
+ * The 16-byte header is CLEARTEXT: it is the AEAD's additional data, so the
+ * type is readable before the key is consulted, and the AEAD still
+ * authenticates it afterwards. The ONLY decision taken on this peek is
+ * whether to WAIT for the receive pipeline, so a forged byte can cost a
+ * wait and nothing else.
+ */
+export function peekFrameType(data) {
+  const bytes =
+    data instanceof Uint8Array
+      ? data
+      : data instanceof ArrayBuffer
+        ? new Uint8Array(data)
+        : null;
+  if (bytes === null || bytes.length < FRAME_HEADER_LEN) {
+    return null;
+  }
+  return bytes[6];
+}
 
 /**
  * Byte window of one logical chunk.

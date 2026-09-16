@@ -41,7 +41,7 @@ impl Drop for EnvVarGuard {
 
 const TEST_CHUNK_SIZE: usize = 1024 * 1024;
 const TEST_MANIFEST_CHUNK: usize = 128;
-const TRANSFER_TLS_CONTROL_PORT: u16 = 17910;
+const TRANSFER_TLS_CONTROL_PORT: u16 = 18212;
 
 async fn wait_for_control_port(listening: bool) {
     for _ in 0..500 {

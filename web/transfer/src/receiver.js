@@ -28,6 +28,7 @@ import {
   CHUNK_BYTES,
   FRAME_DATA,
   FRAME_FINAL,
+  peekFrameType,
   chunkWindow,
   decodeFrameWithKey,
   parseArchiveFinalPayload,
@@ -824,6 +825,28 @@ export function createReceiver({
    * OPENED several at a time and PROCESSED strictly in order — see
    * {@link pumpFrames}.
    */
+  /**
+   * True when the counterpart has already written FINAL — the frame is
+   * queued but not yet opened. That is the ONE case where the close of a
+   * transport is the end of a SUCCESSFUL transfer rather than a failure, so
+   * it is the one case worth waiting for the pipeline over. Read off the
+   * cleartext header; an unreadable frame counts as FINAL, because waiting
+   * for nothing costs a moment and tearing down a finished transfer costs
+   * the transfer.
+   */
+  function finalIsQueued(transfer) {
+    for (const queue of [transfer.inbox, transfer.pendingFrames]) {
+      if (queue.length === 0) {
+        continue;
+      }
+      const type = peekFrameType(queue[queue.length - 1]);
+      if (type === null || type === FRAME_FINAL) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   function deliverFrame(transfer, data) {
     if (transfer.attemptClosed) {
       // The attempt is over: a frame the transport had already queued
@@ -1485,15 +1508,25 @@ export function createReceiver({
       if (opened === undefined || opened.attemptId !== attemptId) {
         return null;
       }
-      // Appended to the chain rather than awaited as a snapshot, so work
-      // queued while we wait is covered too — exactly what the relay leg
-      // does with `known.chain = known.chain.then(...)`.
-      const drained = opened.chain.then(
-        () => {},
-        () => {},
-      );
-      opened.chain = drained;
-      await drained;
+      // The wait is NOT unconditional, and that is the whole design. A
+      // transport that dies MID-transfer must be reported at once: the
+      // ranges are what the server puts in the relay attempt's commit, and
+      // both ends notice the same dead channel, so a recipient that pauses
+      // to hash a chunk loses the race to the source — whose notice carries
+      // no ranges at all — and the replacement attempt re-sends bytes that
+      // were already on disk. Waiting is right ONLY where the counterpart
+      // has already written FINAL.
+      if (finalIsQueued(opened) || opened.state === "complete-pending") {
+        // Appended to the chain rather than awaited as a snapshot, so work
+        // queued while we wait is covered too — exactly what the relay leg
+        // does with `known.chain = known.chain.then(...)`.
+        const drained = opened.chain.then(
+          () => {},
+          () => {},
+        );
+        opened.chain = drained;
+        await drained;
+      }
       const transfer = transfers.get(transferId);
       if (transfer === undefined || transfer.attemptId !== attemptId) {
         return null;

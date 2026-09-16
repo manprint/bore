@@ -787,3 +787,83 @@ Nota di metodo: il gate vive al livello dell'ATTORE, non in un e2e. Un e2e in
 loopback non può decidere se il close arriva prima o dopo il drenaggio — è la
 stessa ragione per cui i bug di flush del vhost si gatano sul mock e non su
 TLS in-process.
+
+### Esito — sesto giro (`c74241e`): la correzione era essa stessa una regressione
+
+Il push che portava B-A017 e B-A018 ha reso rossi due gate e2e che erano
+sempre stati verdi: `T-WEB-DIRECT-FALLBACK` e `T-WEB-PATH-UI`, su chromium e
+webkit, entrambi su
+`expect(Array.isArray(relayCommit.resumeRanges)).toBe(true)`.
+
+Il meccanismo è la corsa che il drenaggio aveva spostato. `directFailed`
+attendeva **sempre** la catena di elaborazione prima di decidere; su un canale
+che muore a metà trasferimento quell'attesa non serve a nulla e ritarda il
+`transfer.direct_failed` del destinatario. La sorgente, che nel frattempo si
+accorge della morte per conto proprio, vince la corsa e apre il commit sul
+relay *prima* che le range del destinatario siano arrivate: il commit parte
+senza `resumeRanges`, cioè con «ricomincia da zero» al posto di «riparti da
+dove eri». Il difetto di campo era un trasferimento che non finiva mai; la mia
+correzione lo aveva scambiato con un trasferimento che ricomincia. In locale
+era verde perché in locale la sorgente è lenta a notare.
+
+**La discriminante è nell'header in chiaro.** I 16 byte di intestazione sono
+*additional data* dell'AEAD, quindi leggibili senza chiave e senza toccare la
+pipeline: `header[6]` è il tipo di frame. `peekFrameType` (nuovo in
+`framing.js`) legge quel byte dall'ultimo elemento di `inbox` e
+`pendingFrames`, e `finalIsQueued` risponde alla sola domanda che conta —
+*«questo canale si sta chiudendo dopo l'ultimo frame, o sta morendo a metà?»*.
+Il drenaggio avviene **solo** nel primo caso (o quando lo stato è già
+`complete-pending`); nel secondo `directFailed` risponde subito com'è sempre
+stato.
+
+Red-check nelle due direzioni, perché una correzione che ne rompe un'altra si
+riconosce solo così:
+
+| forzatura | risultato | difetto riprodotto |
+|---|---|---|
+| attesa incondizionata (`if (true)`) | `[[0, 1]]` invece di `[]` | la regressione di questo giro |
+| nessuna attesa (`if (false)`) | `[]` su un trasferimento completato | il difetto di campo B-A017 |
+
+Secondo gate, per pinnare il ramo che il drenaggio non deve rallentare:
+`a_channel_that_dies_mid_transfer_is_reported_without_waiting`, che presigilla
+ogni frame e li consegna in un solo turno. Unit: 14/14. E2E: 148 pass sui tre
+motori, con `T-WEB-DIRECT-FALLBACK`, `T-WEB-PATH-UI` e `T-WEB-MULTIPEER-FINAL`
+verdi.
+
+### Esito — sesto giro, seconda parte: `Connection refused` non era del client (B-A019)
+
+Nello stesso giro `Build, test & lint` è caduto su
+`vhost_subdomain_freed_after_disconnect` con
+`could not connect to localhost:17920: Connection refused` — un test di
+`vhost_test.rs`, estraneo a questa funzione, che accusa il client vhost di non
+saper raggiungere un server appena avviato.
+
+Dietro quel messaggio c'erano tre difetti dell'harness in fila, tutti della
+famiglia di B-A010:
+
+1. **`wait_port` tornava in silenzio alla scadenza.** Cinque secondi, poi
+   `return` come se la condizione fosse vera. Il gruppo di registrazione
+   condivide **una sola** coppia di porte e un runtime `#[tokio::test]` chiude
+   i propri listener solo *dopo* che il corpo ha rilasciato `SERIAL_GUARD`:
+   quando il test precedente teneva ancora la porta, «la porta non si è mai
+   liberata» usciva come errore alla riga successiva del chiamante.
+2. **L'errore di bind era scartato.** `tokio::spawn(server.listen())` butta via
+   il `Result`, quindi «il nostro server è su» e «il listener di qualcun altro
+   è ancora su» erano la stessa osservazione: il `wait_port(control, true)`
+   successivo veniva soddisfatto dal listener *morente* del test precedente,
+   che spariva un istante dopo. È esattamente il rifiuto misurato.
+3. **Nove porte erano cablate in binari di test diversi** — 17910/17911 fra
+   `reconnect`, `tls` e `transfer`; 17970-17975 e 17979 fra `admin` e `vhost` —
+   più una coppia duplicata dentro `vhost_test.rs` (17958/17959). Cargo esegue
+   i binari in **parallelo**: ogni coppia era un lancio di moneta a ogni giro.
+
+Correzioni: ogni waiter di porta condiviso (dieci, in nove file) ha ora un
+budget di 30 s e alla scadenza fa `panic!` nominando porta e direzione; il
+nuovo `wait_bound` tiene il `JoinHandle` e fallisce con **l'errore del
+server** quando il task finisce prima di servire; le porte in conflitto sono
+spostate in blocchi liberi (18200+, 18210+, 18220+) e la disgiunzione è
+verificata meccanicamente, file per file.
+
+La regola che questo giro conferma: *un harness che non riesce a stabilire la
+propria precondizione deve dirlo con parole sue.* Finché tace, ogni suo
+fallimento viene attribuito al prodotto.

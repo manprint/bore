@@ -903,7 +903,7 @@ fn t_vpn_panel_groups_and_fields() {
 async fn t_api_requires_token() -> Result<()> {
     // (T-AUTH) Each /admin/api/v1/* returns 401 without token, 200 with valid Bearer
     // and 200 with valid X-Admin-Token.
-    const PORT: u16 = 17970;
+    const PORT: u16 = 18200;
     let _g = SERIAL_GUARD.lock().await;
     wait_port(PORT, false).await;
 
@@ -973,7 +973,7 @@ async fn t_api_requires_token() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_api_tunnels_shape() -> Result<()> {
     // (T-COMPAT part 1) JSON response has expected keys even when empty.
-    const PORT: u16 = 17971;
+    const PORT: u16 = 18201;
     let _g = SERIAL_GUARD.lock().await;
     wait_port(PORT, false).await;
 
@@ -1143,7 +1143,7 @@ async fn t_api_vhost_shape() -> Result<()> {
     // (T-VHOST-PARITY) The vhost endpoint serves a JSON array (empty when no
     // providers) — the parity fields are asserted in the admin_views/admin_api
     // unit tests; this confirms the endpoint is wired and token-guarded.
-    const PORT: u16 = 17979;
+    const PORT: u16 = 18202;
     let _g = SERIAL_GUARD.lock().await;
     wait_port(PORT, false).await;
 
@@ -1222,7 +1222,7 @@ async fn t_assets_table_nonempty() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_asset_exact_key_only() -> Result<()> {
     // (Phase 3.2) Asset route only serves exact keys from ADMIN_ASSETS, no filesystem or path traversal.
-    const PORT: u16 = 17972;
+    const PORT: u16 = 18203;
     let _g = SERIAL_GUARD.lock().await;
     wait_port(PORT, false).await;
 
@@ -1263,7 +1263,7 @@ async fn t_asset_exact_key_only() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_shell_served() -> Result<()> {
     // (Phase 3.2) /admin/status returns 200 text/html.
-    const PORT: u16 = 17973;
+    const PORT: u16 = 18204;
     let _g = SERIAL_GUARD.lock().await;
     wait_port(PORT, false).await;
 
@@ -1300,7 +1300,7 @@ async fn t_shell_served() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_csp() -> Result<()> {
     // (Phase 4 / F10) CSP header must have img-src 'self' only (no data:).
-    const PORT: u16 = 17975;
+    const PORT: u16 = 18205;
     let _g = SERIAL_GUARD.lock().await;
     wait_port(PORT, false).await;
 
@@ -1342,7 +1342,7 @@ async fn t_legacy_data_compat() -> Result<()> {
     // Top-level keys: "server" object and "tunnels" array.
     // Server object must have: control_port, tls, udp
     // Tunnels array contains entries with standard EntryView fields.
-    const PORT: u16 = 17974;
+    const PORT: u16 = 18206;
     let _g = SERIAL_GUARD.lock().await;
     wait_port(PORT, false).await;
 

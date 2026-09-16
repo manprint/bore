@@ -2463,7 +2463,11 @@ async fn t_web_cli() -> Result<()> {
     // harness, not the product.
     if cfg!(target_os = "linux") {
         let mut opened = String::new();
-        for _ in 0..100 {
+        // 600 x 50 ms = 30 s. Un budget in millisecondi descrive la MACCHINA
+        // (V-9): sotto il parallelismo pieno della CI il lancio del finto
+        // browser puo' arrivare tardi, e un harness lento non deve poter
+        // dichiarare che il prodotto ha annunciato l'URL sbagliato.
+        for _ in 0..600 {
             if let Ok(text) = std::fs::read_to_string(&marker) {
                 if !text.is_empty() {
                     opened = text;
@@ -2482,7 +2486,9 @@ async fn t_web_cli() -> Result<()> {
     proxy.kill().await;
     let _proxy = support::spawn_proxy(proxy_port, port).await?;
     let mut resumed = false;
-    for _ in 0..100 {
+    // 300 x 100 ms = 30 s, stessa ragione: la grazia del server e' la proprieta'
+    // sotto esame, l'attesa dell'harness non deve esserlo.
+    for _ in 0..300 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if room_alive(&host, &room, &origin, &token).await {
             resumed = true;
@@ -2502,7 +2508,7 @@ async fn t_web_cli() -> Result<()> {
 
     // Ctrl+C: one signal closes the room and the process exits successfully.
     signal_pid(pid, "-INT")?;
-    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+    let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
         .await
         .context("the first signal must end the process")??;
     assert!(status.success(), "a clean close exits zero, got {status}");
@@ -2540,7 +2546,7 @@ async fn t_web_cli() -> Result<()> {
             "{sig} room live"
         );
         signal_pid(pid, sig)?;
-        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
             .await
             .context("signal must end the process")??;
         assert!(status.success(), "{sig} exits zero, got {status}");

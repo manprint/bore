@@ -73,7 +73,7 @@ async fn await_roundtrip(addr: (&str, u16)) -> bool {
 
 #[tokio::test]
 async fn client_reconnects_when_server_appears() -> Result<()> {
-    const CONTROL: u16 = 17910;
+    const CONTROL: u16 = 18210;
     const REMOTE: u16 = 16100;
     wait_port(CONTROL, false).await;
 
@@ -115,7 +115,7 @@ async fn client_reconnects_when_server_appears() -> Result<()> {
 
 #[tokio::test]
 async fn proxy_reconnects_when_server_appears() -> Result<()> {
-    const CONTROL: u16 = 17911;
+    const CONTROL: u16 = 18211;
     const LOCAL_PROXY: u16 = 16101;
     wait_port(CONTROL, false).await;
 

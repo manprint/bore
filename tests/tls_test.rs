@@ -9,14 +9,25 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time;
 
+/// How long a port wait may take before the harness declares its OWN failure.
+/// A silent timeout hands the failure to the next line, where a precondition
+/// that never held reads as a product defect (B-A019).
+const PORT_WAIT_BUDGET: Duration = Duration::from_secs(30);
+
 #[path = "support/websocket.rs"]
 mod websocket;
 
 async fn wait_port(port: u16, listening: bool) {
-    for _ in 0..500 {
+    let deadline = time::Instant::now() + PORT_WAIT_BUDGET;
+    loop {
         if TcpStream::connect(("localhost", port)).await.is_ok() == listening {
             return;
         }
+        assert!(
+            time::Instant::now() < deadline,
+            "port {port} never became {} within {PORT_WAIT_BUDGET:?}",
+            if listening { "reachable" } else { "free" },
+        );
         time::sleep(Duration::from_millis(10)).await;
     }
 }

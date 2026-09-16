@@ -408,6 +408,56 @@ describe("web-transfer attempt coordination", () => {
     assert.deepEqual(dst.events.errors, [], "nothing failed");
   });
 
+  it("a_channel_that_dies_mid_transfer_is_reported_without_waiting", async () => {
+    // The other half of the contract, and the one that pays for the first:
+    // a transport that dies MID-transfer must be reported AT ONCE. Those
+    // ranges are what the server puts in the relay attempt's commit, and
+    // BOTH ends notice the same dead channel — so a recipient that pauses to
+    // hash a chunk loses the race to the source, whose notice carries no
+    // ranges at all, and the replacement attempt re-sends bytes that were
+    // already on disk. Making the wait unconditional did exactly that, and
+    // `T-WEB-DIRECT-FALLBACK` read the empty commit on two engines.
+    //
+    // Determinism, not luck: every frame is sealed FIRST, then handed over
+    // in one turn, so the pipeline has had no turn of its own when the close
+    // is observed. `finalIsQueued` is false, the decision is taken in that
+    // same turn, and the answer is what is on disk — nothing yet.
+    const bytes = payload(CHUNK);
+    const dst = await sinkHarness(bytes);
+    const key = await keyFor(ATTEMPT_A);
+    assert.equal(dst.receiver.beginDirect(TRANSFER_ID, ATTEMPT_A), true);
+    dst.receiver.handleControl({
+      type: "transfer.path_commit",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, path: "direct" },
+    });
+    await tick(20);
+    const frames = [];
+    let seq = 0;
+    for (let at = 0; at < bytes.length; at += FRAGMENT) {
+      frames.push(
+        await sealFrame(key, seq, 1, bytes.subarray(at, Math.min(at + FRAGMENT, bytes.length))),
+      );
+      seq += 1;
+    }
+    for (const frame of frames) {
+      assert.equal(
+        dst.receiver.deliverDirectFrame(TRANSFER_ID, ATTEMPT_A, frame),
+        true,
+      );
+    }
+    const ranges = await dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A);
+    assert.deepEqual(
+      ranges,
+      [],
+      "the report is what is on disk at the close, not what the pipeline might still produce",
+    );
+    assert.equal(
+      dst.receiver.transfers().get(TRANSFER_ID).attemptClosed,
+      true,
+      "the attempt is closed in the same turn the close was observed",
+    );
+  });
+
   it("old_attempt_frames_callbacks_and_keys_are_ignored", async () => {
     // A DataChannel that dies mid-transfer can still deliver what the
     // browser had already queued. Those frames belong to an attempt that no

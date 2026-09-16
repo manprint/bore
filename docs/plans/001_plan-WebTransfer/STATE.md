@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-16 22:40 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 9
+> **Last updated:** 2026-09-17 00:20 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 9
 
 ## 0. Protocol
 
@@ -32,7 +32,7 @@ This is the only execution-state file — position, progress, ledger, and blocke
 - **Phase:** 6 — `phase_07.md`
 - **Next action:** nessuna sotto-fase aperta. Il piano 001 e' COMPLETO: fasi 0-6 chiuse e revisione finale verde. Sei giri di CI su `dev` hanno trovato diciannove difetti che i gate locali non potevano vedere: `84cd16d` → T-A002 e B-A002..B-A008, `111a98c` → B-A009..B-A013, `6356e10` → B-A014 e B-A015, `e612b19` → il seguito di B-A014 (`room_alive` orfano), `06defa8` → B-A016 (checkout CRLF), `c74241e` → il seguito di B-A017 (il drenaggio incondizionato era esso stesso una regressione) e B-A019 (tre difetti dell'harness dietro un `Connection refused` attribuito al client vhost). Di questi diciannove, UNO solo era nel prodotto (B-A002); i due difetti veri di questa funzione (B-A017, B-A018) li ha trovati un utente sul campo, non la CI. Resta da seguire la CI del settimo push fino al verde.
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | working tree `dirty (il drenaggio condizionato di B-A017 e le correzioni B-A019, non ancora committate)` | last commit `c74241e fix(web-transfer): a direct channel closing after FINAL ends a transfer`
+- **Repo state:** branch `dev` | working tree `clean` | last commit: la rete di sicurezza dell'harness e2e (B-A021). Il commit precedente, `69d22b5`, e' il primo con tutti e cinque i workflow verdi
 
 ## 2. Feature context (self-contained recap)
 
@@ -162,6 +162,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 81 | bug | B-A017 (seguito) | agent-1:Claude-Opus-5 | drenare SEMPRE prima di decidere era a sua volta una regressione: ritardava il `direct_failed` del destinatario, la sorgente vinceva la corsa e il commit sul relay partiva senza `resumeRanges` (`T-WEB-DIRECT-FALLBACK` e `T-WEB-PATH-UI` rossi su chromium e webkit). Il drenaggio e' ora condizionato a un FINAL gia' in coda, letto dal tipo di frame nell'header in chiaro | web/transfer/src/{framing.js,receiver.js}, web/transfer/tests/unit/attempt.test.mjs, web/transfer/dist/app.js | `node --test tests/unit/attempt.test.mjs` 14/14, red-checked nelle due direzioni; e2e 148 pass sui tre motori | 112e02d |
 | 82 | bug | B-A019 | agent-1:Claude-Opus-5 | tre difetti dell'harness in fila dietro un `Connection refused` attribuito al client vhost: un `wait_port` che tornava in silenzio alla scadenza, un `tokio::spawn(server.listen())` che scarta l'errore di bind, e nove porte cablate in binari di test che cargo esegue in parallelo | tests/{vhost,admin,reconnect,transfer,tls,control_port,e2e,local_host_port_target,secret,transfer_stdin_cli,public_udp,local_proxy_hardening,websocket}_test.rs | `cargo test --all-features --workspace` con il parallelismo di default; zero collisioni di porta residue, verificate meccanicamente | 112e02d |
 | 83 | bug | B-A020 | agent-1:Claude-Opus-5 | quattro budget assoluti in millisecondi dentro `t_web_cli`: con l'intero workspace in parallelo un harness lento poteva dichiarare che il prodotto aveva annunciato l'URL sbagliato. Budget a 30 s, proprieta' invariate | tests/web_transfer_test.rs | workspace intero verde (36 binari, exit 0); il giro precedente era 38 pass / 1 fail | 112e02d |
+| 84 | bug | B-A021 | agent-1:Claude-Opus-5 | 39 processi orfani dell'harness e2e sulla macchina di sviluppo; i figli sono ora registrati e uccisi su `process.on("exit")`. Meccanismo non riprodotto: la rete di sicurezza e' dichiarata NON PROVATA | web/transfer/tests/e2e/helpers.mjs | una spec e2e verde con zero orfani al termine; red-check non discriminante | uncommitted |
 
 ## 5. Files touched
 
@@ -575,6 +576,7 @@ the exact corrected full regression now passes.
 | CI `dev` @ `e612b19` + `06defa8` | GitHub Actions | quattro workflow su cinque verdi; solo `CI` fail — un difetto dell'harness: marcare `t_web_cli` come `#[cfg(unix)]` aveva reso orfano `room_alive` e su windows `-D warnings` lo respinge come `never used`. Un lavoro che non finisce di compilare non esegue nulla, quindi i difetti windows si scoprono UNO PER GIRO | 2026-09-16 |
 | CI `dev` @ `c75e083` | GitHub Actions | `CI` fail su windows con `t_web_readme`: il runner fa checkout CRLF e il gate citava needle LF (B-A016). `Security audit` rosso con `couldn't fetch advisory database: git operation failed` — rete del runner, non una scoperta: `cargo audit` in locale esce 0, e il giro dopo il job e' tornato verde da solo | 2026-09-16 |
 | CI `dev` @ `c74241e` | GitHub Actions | tre fallimenti, di cui uno MIO: (a) `T-WEB-DIRECT-FALLBACK` e `T-WEB-PATH-UI` rossi su chromium e webkit — il drenaggio incondizionato introdotto per B-A017 ritardava il `direct_failed` del destinatario e il commit sul relay partiva senza `resumeRanges`; (b) `vhost_subdomain_freed_after_disconnect` in `Build, test & lint` con `Connection refused` (B-A019, harness); (c) `android-emu-e2e` rosso con `Error on ZipFile unknown archive` preparando l'SDK — infrastruttura del runner, l'emulatore non e' mai partito | 2026-09-16 |
+| CI `dev` @ `112e02d` + `69d22b5` | GitHub Actions | **tutti e cinque i workflow verdi**, il primo giro completamente verde: `CI` (16 job, windows compreso), `Mean Bean CI`, `Mean Bean Deploy`, `Docker (GHCR)`, `E2E (netns)`. Sette giri di CI hanno prodotto ventuno difetti; uno solo era nel prodotto (B-A002) | 2026-09-17 |
 
 ## 8. Runtime deviations from the plan
 
@@ -817,6 +819,7 @@ the exact corrected full regression now passes.
 - Do not treat a closed transport as a failed attempt: ask the transfer actor whether the attempt is still carrying, or every successful direct transfer ends by requesting a relay attempt nobody wants.
 - Do not let a browser declare `transfer.direct_ready` before its own SDP step is done: the server refuses it and the refusal burns the attempt.
 - Do not leave the Phase 3 relay e2e gates on the default path once direct is the default: they then measure the direct path under a relay name.
+- Non ritentare con un aggancio JavaScript la reclamazione dei processi figli dell'harness e2e: `process.on("exit")` non gira quando il runner viene ucciso con SIGKILL, e da node non si imposta un parent-death signal (`PR_SET_PDEATHSIG`) senza un wrapper nativo. Se il problema torna, la strada e' il wrapper oppure il rimedio operativo (`pkill -f 'debug/bore server'; pkill -f web_transfer_e2e_owner`).
 
 ## 11. Progress board
 

@@ -9,18 +9,29 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium, firefox, webkit } from "@playwright/test";
-import { disableWebRtc, forceIceRelayOnly, installTestHooks } from "./fixtures.js";
+import {
+  disableWebRtc,
+  forceIceRelayOnly,
+  installTestHooks,
+} from "./fixtures.js";
 
 /** Persistent-profile launchers by Playwright project browser name. */
 const PERSISTENT_ENGINES = { chromium, firefox, webkit };
 
-export const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
+export const root = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "..",
+  "..",
+);
 // The binaries under test. `debug` by default, because that is what a
 // developer has just built; `BORE_E2E_BIN` / `BORE_E2E_OWNER_BIN` point the
 // whole suite at the RELEASE build instead, which is what the deployment
 // gates run — the acceptance claim is about the artefact that ships, and a
 // debug binary is not it.
-export const boreBin = process.env.BORE_E2E_BIN ?? join(root, "target", "debug", "bore");
+export const boreBin =
+  process.env.BORE_E2E_BIN ?? join(root, "target", "debug", "bore");
 export const ownerBin =
   process.env.BORE_E2E_OWNER_BIN ??
   join(root, "target", "debug", "examples", "web_transfer_e2e_owner");
@@ -88,39 +99,83 @@ export function externalRoomEnv() {
   };
 }
 
-export async function spawnRoomEnv({ relayRate, ownerGrace, noStun = false } = {}) {
+/**
+ * Every child this module starts, so a run that ends WITHOUT reaching its own
+ * teardown — a spec that throws, a worker the runner ends after a timeout, a
+ * Ctrl+C — does not leave a server and a room owner behind. MEASURED on the
+ * dev box: 39 orphaned processes, the oldest alive for 24 hours, each holding
+ * a control port and a room. The registry is the structural half; a `cleanup()`
+ * a spec forgets to call is the half that has to be remembered.
+ *
+ * `exit` is the one event that fires for a normal end, an uncaught exception
+ * and a signal the runner handles, and it cannot await — so the kill is
+ * synchronous. A SIGKILL of the runner itself cannot be covered by anything
+ * inside it.
+ */
+const spawnedChildren = new Set();
+
+function track(child) {
+  spawnedChildren.add(child);
+  child.on("exit", () => spawnedChildren.delete(child));
+  return child;
+}
+
+process.on("exit", () => {
+  for (const child of spawnedChildren) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Already gone: reaping twice is not an error.
+    }
+  }
+  spawnedChildren.clear();
+});
+
+export async function spawnRoomEnv({
+  relayRate,
+  ownerGrace,
+  noStun = false,
+} = {}) {
   const port = await freePort();
-  const server = spawn(
-    boreBin,
-    [
-      "server",
-      "--control-port",
-      String(port),
-      "--web-transfer-base-url",
-      `http://127.0.0.1:${port}/`,
-      ...(relayRate === undefined
-        ? []
-        : ["--web-transfer-relay-rate", String(relayRate)]),
-      // The security suite needs the room to die WHILE a relay is running;
-      // with the shipped 60 s grace that case cannot be observed at all.
-      ...(ownerGrace === undefined
-        ? []
-        : ["--web-transfer-owner-grace", String(ownerGrace)]),
-      // Host candidates only. On a loopback pair a reflexive address buys
-      // nothing, and the public STUN chain is a real network dependency
-      // inside a measurement: the benchmark asks for it explicitly.
-      ...(noStun ? ["--web-transfer-no-stun"] : []),
-    ],
-    { stdio: ["ignore", "pipe", "pipe"] },
+  const server = track(
+    spawn(
+      boreBin,
+      [
+        "server",
+        "--control-port",
+        String(port),
+        "--web-transfer-base-url",
+        `http://127.0.0.1:${port}/`,
+        ...(relayRate === undefined
+          ? []
+          : ["--web-transfer-relay-rate", String(relayRate)]),
+        // The security suite needs the room to die WHILE a relay is running;
+        // with the shipped 60 s grace that case cannot be observed at all.
+        ...(ownerGrace === undefined
+          ? []
+          : ["--web-transfer-owner-grace", String(ownerGrace)]),
+        // Host candidates only. On a loopback pair a reflexive address buys
+        // nothing, and the public STUN chain is a real network dependency
+        // inside a measurement: the benchmark asks for it explicitly.
+        ...(noStun ? ["--web-transfer-no-stun"] : []),
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    ),
   );
   server.on("error", (error) => {
-    throw new Error(`cannot spawn ${boreBin}: ${error.message} (run cargo build --all-features first)`);
+    throw new Error(
+      `cannot spawn ${boreBin}: ${error.message} (run cargo build --all-features first)`,
+    );
   });
   if (process.env.BORE_E2E_LOG) {
     // Opt-in: the server's own view of a run, for diagnosing a failure the
     // page cannot see. Off by default so a green run stays quiet.
-    server.stderr.on("data", (chunk) => process.stderr.write(`[server] ${chunk}`));
-    server.stdout.on("data", (chunk) => process.stderr.write(`[server] ${chunk}`));
+    server.stderr.on("data", (chunk) =>
+      process.stderr.write(`[server] ${chunk}`),
+    );
+    server.stdout.on("data", (chunk) =>
+      process.stderr.write(`[server] ${chunk}`),
+    );
   }
   await waitPort(port);
   // Freshness: the server embeds dist at compile time; a stale binary
@@ -130,18 +185,31 @@ export async function spawnRoomEnv({ relayRate, ownerGrace, noStun = false } = {
   }).then((response) => response.text());
   if (!asset.includes("peer-list")) {
     server.kill("SIGKILL");
-    throw new Error("stale embedded app bundle: run cargo build --all-features after npm run build");
+    throw new Error(
+      "stale embedded app bundle: run cargo build --all-features after npm run build",
+    );
   }
-  const owner = spawn(ownerBin, [`127.0.0.1:${port}`], { stdio: ["ignore", "pipe", "pipe"] });
+  const owner = track(
+    spawn(ownerBin, [`127.0.0.1:${port}`], {
+      stdio: ["ignore", "pipe", "pipe"],
+    }),
+  );
   owner.on("error", (error) => {
-    throw new Error(`cannot spawn ${ownerBin}: ${error.message} (run cargo build --all-features first)`);
+    throw new Error(
+      `cannot spawn ${ownerBin}: ${error.message} (run cargo build --all-features first)`,
+    );
   });
   let buffered = "";
   const roomUrl = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("owner printed no room URL in time")), 30_000);
+    const timer = setTimeout(
+      () => reject(new Error("owner printed no room URL in time")),
+      30_000,
+    );
     owner.stdout.on("data", (chunk) => {
       buffered += String(chunk);
-      const line = buffered.split("\n").find((candidate) => candidate.startsWith("WEB_TRANSFER_ROOM_URL="));
+      const line = buffered
+        .split("\n")
+        .find((candidate) => candidate.startsWith("WEB_TRANSFER_ROOM_URL="));
       if (line !== undefined) {
         clearTimeout(timer);
         resolve(line.slice("WEB_TRANSFER_ROOM_URL=".length).trim());

@@ -3,7 +3,7 @@ members = [".", "crates/bore-wintun", "crates/bore-android-tun"]
 
 [package]
 name = "bore-cli"
-version = "1.1.0"
+version = "1.2.0-rc.1"
 authors = [
     "Fabio Pierri <fabio.pierri@synclab.it>",
     "Eric Zhang <ekzhang1@gmail.com> (original bore)",

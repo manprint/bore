@@ -245,9 +245,31 @@ cargo metadata --format-version 1 >/dev/null
 
 # 2. commit on main and let CI go green
 # 3. tag the exact commit CI validated, and push the tag
-git tag -a v1.1.0 -m "bore v1.1.0"
-git push origin v1.1.0
+git tag -a v1.2.0 -m "bore v1.2.0"
+git push origin v1.2.0
 ```
+
+**Prereleases (`v1.2.0-rc.1`) are the one exception, and they may be cut from any branch.**
+A prerelease exists to be installed and exercised *before* the code reaches `main`, so
+requiring `main` first would leave it nothing to test — the ancestry check above is the only
+one it is exempt from, and the tag shape, the crate version (`1.2.0-rc.1` in `Cargo.toml`
+too), `Cargo.lock` and the annotation are all still enforced. The same gates run: a
+prerelease is published only after the full CI matrix, the cross-architecture matrix and the
+blocking netns e2e suites are green.
+
+What it buys with that exemption is that **nothing pointing at a moving target can receive it
+by accident**. Whether a release is a prerelease is derived from the tag itself — a semver
+prerelease identifier, i.e. anything after a `-` — never from a flag somebody has to
+remember, so the two can never disagree:
+
+| coordinate | `v1.2.0` | `v1.2.0-rc.1` |
+| --- | --- | --- |
+| GitHub Release | release | **pre-release** |
+| `/releases/latest/download/...` | this one | never |
+| `ghcr.io/manprint/bore:` | `v1.2.0`, `1.2.0`, `v1.2`, `1.2`, `latest` | `v1.2.0-rc.1`, `1.2.0-rc.1` only |
+
+Install a prerelease by naming it exactly — `ghcr.io/manprint/bore:v1.2.0-rc.1`, or the asset
+URL under `/releases/download/v1.2.0-rc.1/` — or better, by the digest the release body pins.
 
 Run `Release` from the Actions tab with **`publish: false`** to rehearse: the gates run and
 nothing is published. Worth doing whenever the release path itself changed, because a

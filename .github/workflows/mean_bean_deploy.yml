@@ -46,8 +46,9 @@ jobs:
           token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ${{ steps.ver.outputs.name }}
-          # ONLY A VERSION TAG IS "LATEST", and `is_tag` is what says which this
-          # is. With `make_latest: "true"` on every build, the newest BRANCH
+          # ONLY A STABLE VERSION TAG IS "LATEST", and `is_latest` is what says
+          # which this is -- a PRERELEASE tag (`v1.2.0-rc.1`) is a real release
+          # with real assets and must not win that label either. With `make_latest: "true"` on every build, the newest BRANCH
           # build won the label: MEASURED right after v1.1.0 was published, when
           # `/releases/latest` answered `main-7c3a82f` -- a rolling snapshot from
           # fourteen minutes later -- so the documented
@@ -55,8 +56,8 @@ jobs:
           # instead of the release. A branch build is also marked `prerelease`,
           # which is what README has always called it and what keeps it out of
           # this contest even if the flag above is ever bypassed.
-          make_latest: ${{ steps.ver.outputs.is_tag }}
-          prerelease: ${{ steps.ver.outputs.is_tag != 'true' }}
+          make_latest: ${{ steps.ver.outputs.is_latest }}
+          prerelease: ${{ steps.ver.outputs.is_prerelease }}
           draft: false
 
   macos:
@@ -106,8 +107,8 @@ jobs:
           # Repeated here on purpose: `action-gh-release` defaults `make_latest`
           # to true, so an upload job would re-claim for a branch build exactly
           # the label the create job above just declined.
-          make_latest: ${{ steps.ver.outputs.is_tag }}
-          prerelease: ${{ steps.ver.outputs.is_tag != 'true' }}
+          make_latest: ${{ steps.ver.outputs.is_latest }}
+          prerelease: ${{ steps.ver.outputs.is_prerelease }}
           files: |
             ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz
             ${{ env.BIN }}-${{ matrix.target }}
@@ -152,8 +153,8 @@ jobs:
           # Repeated here on purpose: `action-gh-release` defaults `make_latest`
           # to true, so an upload job would re-claim for a branch build exactly
           # the label the create job above just declined.
-          make_latest: ${{ steps.ver.outputs.is_tag }}
-          prerelease: ${{ steps.ver.outputs.is_tag != 'true' }}
+          make_latest: ${{ steps.ver.outputs.is_latest }}
+          prerelease: ${{ steps.ver.outputs.is_prerelease }}
           files: |
             ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.tar.gz
             ${{ env.BIN }}-${{ matrix.target }}
@@ -207,8 +208,8 @@ jobs:
           # Repeated here on purpose: `action-gh-release` defaults `make_latest`
           # to true, so an upload job would re-claim for a branch build exactly
           # the label the create job above just declined.
-          make_latest: ${{ steps.ver.outputs.is_tag }}
-          prerelease: ${{ steps.ver.outputs.is_tag != 'true' }}
+          make_latest: ${{ steps.ver.outputs.is_latest }}
+          prerelease: ${{ steps.ver.outputs.is_prerelease }}
           files: |
             ${{ env.BIN }}-${{ steps.ver.outputs.name }}-${{ matrix.target }}.zip
             ${{ env.BIN }}-${{ matrix.target }}.exe
@@ -246,8 +247,8 @@ jobs:
           # Repeated here on purpose: `action-gh-release` defaults `make_latest`
           # to true, so an upload job would re-claim for a branch build exactly
           # the label the create job above just declined.
-          make_latest: ${{ steps.ver.outputs.is_tag }}
-          prerelease: ${{ steps.ver.outputs.is_tag != 'true' }}
+          make_latest: ${{ steps.ver.outputs.is_latest }}
+          prerelease: ${{ steps.ver.outputs.is_prerelease }}
           files: |
             ${{ env.BIN }}-${{ steps.ver.outputs.name }}-aarch64-linux-android.tar.gz
             ${{ env.BIN }}-aarch64-linux-android

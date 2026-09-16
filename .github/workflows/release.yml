@@ -121,21 +121,38 @@ jobs:
           cargo metadata --locked --format-version 1 >/dev/null
           echo "Cargo.lock is in sync with Cargo.toml"
 
-          # 4. A release comes from main. A tag on a side branch would publish
-          #    code that main does not contain, and nothing downstream could see
-          #    the difference.
+          # 4. A STABLE release comes from main. A tag on a side branch would
+          #    publish code that main does not contain, and nothing downstream
+          #    could see the difference.
+          #
+          #    A PRERELEASE is the deliberate exception, and the exception is
+          #    the whole point of the thing: `v1.2.0-rc.1` exists to be
+          #    installed and exercised BEFORE the code reaches main, so
+          #    requiring main first would leave nothing for it to test. It pays
+          #    for the exemption in the open — it is marked `prerelease`, it is
+          #    never `/releases/latest`, and its images carry only the exact
+          #    version spellings (`docker/metadata-action` withholds the
+          #    `{{major}}.{{minor}}` and `latest` tags from a prerelease), so
+          #    nobody following a moving pointer can receive it by accident.
+          #    Everything else in this preflight still applies to it: the tag
+          #    shape, the crate version, the lock file, the annotation.
+          #
           #    Against FETCH_HEAD and not `origin/main`: on a tag push
           #    `actions/checkout` fetches ONE refspec and configures no
           #    remote-tracking branch of its own, so whether `origin/main`
           #    exists depends on an opportunistic update this check does not
-          #    need to depend on. FETCH_HEAD is what the fetch on the line above
-          #    just wrote, unconditionally.
-          git fetch --quiet origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
-            echo "::error::tagged commit $GITHUB_SHA is not an ancestor of origin/main"
-            exit 1
+          #    need to depend on. FETCH_HEAD is what the fetch below writes,
+          #    unconditionally.
+          if printf '%s' "$TAG" | grep -q -- '-'; then
+            echo "prerelease tag '$TAG': the ancestry check does not apply (see the comment above)"
+          else
+            git fetch --quiet origin main
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+              echo "::error::tagged commit $GITHUB_SHA is not an ancestor of origin/main"
+              exit 1
+            fi
+            echo "tagged commit is on main"
           fi
-          echo "tagged commit is on main"
 
           # 5. The tag must be ANNOTATED, not lightweight. A lightweight tag is
           #    a bare ref with no tagger, date or message, so a tag that was

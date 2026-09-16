@@ -156,6 +156,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 75 | bug | B-A014 | agent-1:Claude-Opus-5 | `t_web_cli` e' fatto di segnali per tre gambe su quattro: fuori da unix il binding del pid non lo usa nessuno (`-D warnings` rosso) e il test sarebbe comunque girato senza mai chiudere il processo che avvia. Ora e' `#[cfg(unix)]` come `t_web_room_life` | tests/web_transfer_test.rs | clippy `-D warnings` pulito, `t_web_cli` verde su Linux; il job windows e' l'oracolo dell'altro ramo | uncommitted |
 | 76 | bug | B-A015 | agent-1:Claude-Opus-5 | il budget di B-A007 dividerva una COSTANTE (il relay e' limitato dal token bucket) e giudicava il peggiore di dieci campioni: un budget assoluto travestito da rapporto. Il verdetto e' ora mediana `< elapsed_b / 4` piu' peggiore `< elapsed_b` | tests/web_transfer_test.rs | `t_web_fairness` verde con mediana 0 ms e campioni tutti a 0 ms contro un relay di 4,01 s | uncommitted |
 | 77 | bug | B-A014 (seguito) | agent-1:Claude-Opus-5 | marcare `t_web_cli` come `#[cfg(unix)]` ha reso orfano `room_alive`: su windows `-D warnings` lo respinge come `never used`. Gated anche l'helper, e trovato un oracolo locale per il ramo non-unix | tests/web_transfer_test.rs | `#[cfg(unix)]` → `#[cfg(any())]` su tutto il file e clippy `-D warnings`: exit 0 | uncommitted |
+| 78 | bug | B-A016 | agent-1:Claude-Opus-5 | il runner windows fa checkout CRLF: una needle che attraversa un a capo non poteva combaciare. `read_doc_text` normalizza i tre file letti per confronto testuale | tests/web_transfer_test.rs | oracolo CRLF locale (`sed -i 's/$/\r/'`), verde con la correzione e red-checked senza | uncommitted |
 
 ## 5. Files touched
 
@@ -512,6 +513,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | tests/web_transfer_test.rs | B-A004..B-A008: `proc_fs_available`/`kib_or_na`, i rami `N/A` di RSS/descrittori/limiti, l'aggancio `BROWSER` solo dove esiste, l'attesa dell'esito al posto dei 400 ms, il budget di controllo come rapporto e il refill monotono del soak | B-A004..B-A008 |
 | tests/web_transfer_test.rs | B-A014: `t_web_cli` marcato `#[cfg(unix)]` (i due `#[cfg(unix)]` sulle chiamate a `signal_pid` diventano superflui) | B-A014 |
 | tests/web_transfer_test.rs | B-A014 (seguito): `room_alive` marcato `#[cfg(unix)]` perche' i suoi unici chiamanti lo sono | B-A014 |
+| tests/web_transfer_test.rs | B-A016: `read_doc_text` (CRLF → LF) su `README.md`, `web/transfer/src/state.js` e `src/admin_views.rs` | B-A016 |
 | tests/web_transfer_test.rs | B-A015: `t_web_fairness` raccoglie i dieci RTT di controllo, giudica sulla MEDIANA (`< elapsed_b / 4`) piu' il peggiore (`< elapsed_b`) e stampa i campioni grezzi accanto alle statistiche | B-A015 |
 
 | tests/support/web_transfer.rs | B-A010: `free_port` da un cursore atomico sotto l'intervallo effimero, spostato dal pid; `wait_port` con budget di 20 s e `panic!` alla scadenza | B-A010 |
@@ -557,6 +559,7 @@ the exact corrected full regression now passes.
 ```
 | audit | `cargo audit --ignore RUSTSEC-2023-0071` | `pass` (0 vulnerabilita', 7 warning gia' ammesse) | T-A002, 2026-09-16 |
 | windows (ramo non-unix) | `sed 's/#\[cfg(unix)\]/#[cfg(any())]/g' tests/web_transfer_test.rs && cargo clippy --all-features --test web_transfer_test -- -D warnings` | `pass` (exit 0) — oracolo locale del ramo che il job windows compila; mingw assente, quindi `--target x86_64-pc-windows-gnu` non e' disponibile | B-A014, 2026-09-16 |
+| windows (checkout CRLF) | `sed -i 's/$/\r/' README.md web/transfer/src/state.js src/admin_views.rs && cargo test --all-features --test web_transfer_test t_web_readme` | `pass` con la correzione, `FAILED` con il messaggio esatto della CI senza: e' il red-check | B-A016, 2026-09-16 |
 | CI `dev` @ `84cd16d` | GitHub Actions | `E2E (netns)` pass, `Docker (GHCR)` pass, `Mean Bean Deploy` pass; `CI` e `Mean Bean CI` fail — otto difetti, tutti dell'harness o delle dipendenze, chiusi come T-A002 e B-A002..B-A008 | 2026-09-16 |
 | CI `dev` @ `111a98c` | GitHub Actions | `E2E (netns)` pass, `Docker (GHCR)` pass, `Mean Bean Deploy` pass; `CI` e `Mean Bean CI` fail — cinque difetti, tutti dell'harness, chiusi come B-A009..B-A013 | 2026-09-16 |
 | CI `dev` @ `6356e10` | GitHub Actions | `E2E (netns)` pass, `Docker (GHCR)` pass, `Mean Bean CI` pass, `Mean Bean Deploy` pass; solo `CI` fail — due difetti dell'harness (B-A014 windows, B-A015 macos). Quattro workflow su cinque verdi, e `Mean Bean CI` verde per la prima volta | 2026-09-16 |

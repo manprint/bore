@@ -2315,6 +2315,17 @@ fn signal_pid(pid: u32, sig: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reads a text file the way this suite compares it: with `\r\n` folded to
+/// `\n`. The windows-latest runner checks the repository out with
+/// `core.autocrlf=true`, so every file in the tree arrives CRLF there — and a
+/// needle that spans a newline (`"...files or\n> a whole folder..."`) then
+/// matches on Linux and macOS and can never match on Windows. The defect is
+/// the harness reading a file in one encoding and quoting it in another, not
+/// the documentation.
+fn read_doc_text(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    Ok(std::fs::read_to_string(path)?.replace("\r\n", "\n"))
+}
+
 /// Splits a room URL into `(room_id_hex, member_token_hex)`. The fragment is
 /// the capability: this is the only place the test reads it, and it never
 /// reaches the server.
@@ -4016,9 +4027,7 @@ fn t_web_readme() -> Result<()> {
             .output()?
             .stdout,
     )?;
-    let readme = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"),
-    )?;
+    let readme = read_doc_text(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))?;
 
     // (1) The binary's own flags, straight out of clap.
     let truth = help_flags(&server_help);
@@ -4240,7 +4249,7 @@ fn t_web_readme() -> Result<()> {
     // longer shows sends a reader searching for words that do not exist, and
     // the failure is silent because both files are prose to the compiler.
     // So the table's rows are read back OUT of the product's own error map.
-    let error_map = std::fs::read_to_string(
+    let error_map = read_doc_text(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/transfer/src/state.js"),
     )
     .context("web/transfer/src/state.js is not readable")?;
@@ -4284,10 +4293,9 @@ fn t_web_readme() -> Result<()> {
     // field name out of the README and grepping a JSON response for it is
     // the whole point of documenting them, and a renamed field leaves the
     // guide pointing at something no endpoint answers.
-    let views = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/admin_views.rs"),
-    )
-    .context("src/admin_views.rs is not readable")?;
+    let views =
+        read_doc_text(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/admin_views.rs"))
+            .context("src/admin_views.rs is not readable")?;
     // Only a name the guide quotes as code IS a field name; a script path
     // (`scripts/perf/web_transfer_bench.sh`) shares the prefix and is not one.
     let mut rest: &str = readme.as_str();

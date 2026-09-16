@@ -685,3 +685,47 @@ Due rossi, nessuno dei due nel prodotto.
   mostrato esattamente il `never used` della CI. Questo comando è ora in
   `STATE.md` §7 come gate del ramo non-unix: una modifica `cfg` non va spedita
   alla CI per sapere se compila.
+
+### Esito — quinto giro di CI su `dev` (`06defa8`, 2026-09-16)
+
+Quattro workflow verdi (`E2E (netns)`, `Docker (GHCR)`, `Mean Bean CI`,
+`Mean Bean Deploy`) e `Security audit` di nuovo verde: la caduta del giro
+precedente era davvero la rete del runner. Il gating di `room_alive` ha
+risolto il clippy Windows, e per la prima volta il job `windows-latest` ha
+superato la compilazione ed è arrivato a ESEGUIRE la suite web-transfer.
+Che è come è stato trovato **B-A016**.
+
+`t_web_readme` fallisce con «README no longer states the release scope
+(`"**a file, a selection of files or\n> a whole folder**"`)», unico rosso di
+una suite per il resto verde (35 passed, 1 failed). Il gate accusa la
+documentazione di non dire più una cosa che dice.
+
+Il runner Windows fa il checkout con `core.autocrlf=true`, quindi ogni file
+dell'albero arriva **CRLF**. Il test legge `README.md` così com'è e lo
+confronta con needle scritte nel sorgente Rust, dove `\n` è LF: una needle che
+attraversa un a capo combacia su Linux e macOS e **non può** combaciare su
+Windows. Il difetto è l'harness che legge un file in una codifica e lo cita in
+un'altra — la documentazione non c'entra.
+
+`read_doc_text` legge e ripiega `\r\n` in `\n`, applicato ai tre file letti
+per confronto testuale: `README.md`, `web/transfer/src/state.js` e
+`src/admin_views.rs`. Gli altri due lettori di testo del file restano
+invariati di proposito: uno cerca needle di una riga sola (CRLF-safe), l'altro
+legge `/proc` (Linux).
+
+Anche qui l'oracolo è locale, non la CI:
+
+```sh
+sed -i 's/$/\r/' README.md web/transfer/src/state.js src/admin_views.rs
+cargo test --all-features --test web_transfer_test t_web_readme
+```
+
+Verde con la correzione; **red-checked** rimettendo `std::fs::read_to_string`
+sul solo README, che riproduce il messaggio della CI parola per parola. È in
+`STATE.md` §7 accanto all'oracolo non-unix.
+
+Il filo dei due ultimi giri: **un job che non ha mai finito di compilare non
+ha mai eseguito niente.** I due difetti Windows erano in fila, e il secondo era
+invisibile finché il primo non è caduto — motivo per cui i due oracoli locali
+(cfg sempre falso, CRLF) valgono più di un altro giro di CI: rendono osservabile
+qui ciò che prima si poteva vedere solo là, un difetto alla volta.

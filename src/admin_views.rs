@@ -513,6 +513,51 @@ pub struct ConfigView {
     pub web_transfer_enabled: bool,
     /// Same-origin root enabling it; `None` (JSON null) means disabled.
     pub web_transfer_base_origin: Option<String>,
+    /// Configured web-transfer TOTALS. Every one of them is immutable
+    /// configuration, never a live gauge (P-11): the matching gauges live on
+    /// `MetricsView` and a `null` here means the service is disabled, never
+    /// "saturated". `web_transfer_stun_count` is a COUNT on purpose — the
+    /// STUN list itself is never published.
+    #[serde(default)]
+    pub web_transfer_max_rooms: Option<u64>,
+    /// Global peer cap.
+    #[serde(default)]
+    pub web_transfer_max_peers: Option<u64>,
+    /// Per-room peer cap.
+    #[serde(default)]
+    pub web_transfer_max_peers_per_room: Option<u64>,
+    /// Per-peer offer cap.
+    #[serde(default)]
+    pub web_transfer_max_offers_per_peer: Option<u64>,
+    /// Per-offer manifest entry cap.
+    #[serde(default)]
+    pub web_transfer_max_entries_per_offer: Option<u64>,
+    /// Per-offer logical byte cap.
+    #[serde(default)]
+    pub web_transfer_max_offer_bytes: Option<u64>,
+    /// Per-room metadata cap in bytes.
+    #[serde(default)]
+    pub web_transfer_max_metadata_per_room: Option<u64>,
+    /// Server-wide metadata cap in bytes.
+    #[serde(default)]
+    pub web_transfer_max_metadata_total: Option<u64>,
+    /// Per-peer concurrent transfer cap.
+    #[serde(default)]
+    pub web_transfer_max_transfers_per_peer: Option<u64>,
+    /// Server-wide relay-pair cap.
+    #[serde(default)]
+    pub web_transfer_max_relays: Option<u64>,
+    /// Per-room relay rate in bytes per second (0 disables throttling).
+    #[serde(default)]
+    pub web_transfer_relay_rate_bytes_per_second: Option<u64>,
+    /// Grace after an abnormal owner loss, in seconds.
+    #[serde(default)]
+    pub web_transfer_owner_grace_seconds: Option<u64>,
+    /// How many STUN servers are brokered to browsers. The list itself is
+    /// deliberately absent: a count answers "is ICE configured", a list
+    /// publishes infrastructure the admin view has no reason to expose.
+    #[serde(default)]
+    pub web_transfer_stun_count: Option<u64>,
     /// Bind domain for control/tunnel endpoints.
     pub bind_domain: Option<String>,
     /// HSTS header value for HTTPS control port.
@@ -644,6 +689,49 @@ pub struct MetricsView {
     pub rate_rx_bps: u64,
     /// Unix epoch seconds when metrics were sampled.
     pub ts: u64,
+    /// Live web-transfer gauges and totals. All `None` when the service is
+    /// disabled; a live gauge that is genuinely zero must read `0`, never
+    /// `null` (P-11: zero available is the alarming value, and a truthiness
+    /// check in the panel would hide exactly it).
+    #[serde(default)]
+    pub web_transfer_rooms_current: Option<u64>,
+    /// Live peers across all rooms.
+    #[serde(default)]
+    pub web_transfer_peers_current: Option<u64>,
+    /// Live offers across all rooms.
+    #[serde(default)]
+    pub web_transfer_offers_current: Option<u64>,
+    /// Live catalog metadata bytes across all rooms.
+    #[serde(default)]
+    pub web_transfer_metadata_bytes_current: Option<u64>,
+    /// Live (non-terminal) transfers.
+    #[serde(default)]
+    pub web_transfer_transfers_active: Option<u64>,
+    /// Live relay pairs.
+    #[serde(default)]
+    pub web_transfer_relays_active: Option<u64>,
+    /// Relay slots still free; the configured total is
+    /// `ConfigView::web_transfer_max_relays`.
+    #[serde(default)]
+    pub web_transfer_relay_slots_available: Option<u64>,
+    /// Cumulative ciphertext bytes forwarded by the relay.
+    #[serde(default)]
+    pub web_transfer_relay_ciphertext_bytes_total: Option<u64>,
+    /// Cumulative attempts that carried verified bytes on the DIRECT path.
+    #[serde(default)]
+    pub web_transfer_direct_commits_total: Option<u64>,
+    /// Cumulative attempts that carried verified bytes on the RELAY path.
+    #[serde(default)]
+    pub web_transfer_relay_commits_total: Option<u64>,
+    /// Cumulative transfers that completed.
+    #[serde(default)]
+    pub web_transfer_completed_total: Option<u64>,
+    /// Cumulative transfers that were cancelled.
+    #[serde(default)]
+    pub web_transfer_cancelled_total: Option<u64>,
+    /// Cumulative admissions refused because a cap or rate was reached.
+    #[serde(default)]
+    pub web_transfer_rejected_total: Option<u64>,
     /// Number of SSH gateway tunnels (SecretProvider/Consumer/Vhost with Transport::Ssh).
     pub ssh_tunnels: usize,
     /// Count of native Bore transport tunnels.
@@ -760,6 +848,19 @@ mod tests {
             udp_direct_slots: None,
             web_transfer_enabled: false,
             web_transfer_base_origin: None,
+            web_transfer_max_rooms: None,
+            web_transfer_max_peers: None,
+            web_transfer_max_peers_per_room: None,
+            web_transfer_max_offers_per_peer: None,
+            web_transfer_max_entries_per_offer: None,
+            web_transfer_max_offer_bytes: None,
+            web_transfer_max_metadata_per_room: None,
+            web_transfer_max_metadata_total: None,
+            web_transfer_max_transfers_per_peer: None,
+            web_transfer_max_relays: None,
+            web_transfer_relay_rate_bytes_per_second: None,
+            web_transfer_owner_grace_seconds: None,
+            web_transfer_stun_count: None,
             bind_domain: None,
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]
@@ -828,6 +929,19 @@ mod tests {
             rate_tx_bps: 0,
             rate_rx_bps: 0,
             ts: 0,
+            web_transfer_rooms_current: None,
+            web_transfer_peers_current: None,
+            web_transfer_offers_current: None,
+            web_transfer_metadata_bytes_current: None,
+            web_transfer_transfers_active: None,
+            web_transfer_relays_active: None,
+            web_transfer_relay_slots_available: None,
+            web_transfer_relay_ciphertext_bytes_total: None,
+            web_transfer_direct_commits_total: None,
+            web_transfer_relay_commits_total: None,
+            web_transfer_completed_total: None,
+            web_transfer_cancelled_total: None,
+            web_transfer_rejected_total: None,
             ssh_tunnels: 0,
             transport_bore: 0,
             transport_ssh: 0,
@@ -859,6 +973,19 @@ mod tests {
             rate_tx_bps: 0,
             rate_rx_bps: 0,
             ts: 0,
+            web_transfer_rooms_current: None,
+            web_transfer_peers_current: None,
+            web_transfer_offers_current: None,
+            web_transfer_metadata_bytes_current: None,
+            web_transfer_transfers_active: None,
+            web_transfer_relays_active: None,
+            web_transfer_relay_slots_available: None,
+            web_transfer_relay_ciphertext_bytes_total: None,
+            web_transfer_direct_commits_total: None,
+            web_transfer_relay_commits_total: None,
+            web_transfer_completed_total: None,
+            web_transfer_cancelled_total: None,
+            web_transfer_rejected_total: None,
             ssh_tunnels: 0,
             transport_bore: 0,
             transport_ssh: 0,
@@ -978,6 +1105,19 @@ mod tests {
             udp_direct_slots: None,
             web_transfer_enabled: false,
             web_transfer_base_origin: None,
+            web_transfer_max_rooms: None,
+            web_transfer_max_peers: None,
+            web_transfer_max_peers_per_room: None,
+            web_transfer_max_offers_per_peer: None,
+            web_transfer_max_entries_per_offer: None,
+            web_transfer_max_offer_bytes: None,
+            web_transfer_max_metadata_per_room: None,
+            web_transfer_max_metadata_total: None,
+            web_transfer_max_transfers_per_peer: None,
+            web_transfer_max_relays: None,
+            web_transfer_relay_rate_bytes_per_second: None,
+            web_transfer_owner_grace_seconds: None,
+            web_transfer_stun_count: None,
             bind_domain: None,
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]

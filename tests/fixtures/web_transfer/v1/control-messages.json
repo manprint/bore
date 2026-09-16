@@ -30,6 +30,11 @@
   "json": "{\"v\":1,\"type\":\"transfer.request\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"offerId\":\"cccccccccccccccccccccccccccccccc\",\"entryIds\":[\"hello.txt\"],\"selectionDigest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"mode\":\"raw\"}}"
  },
  {
+  "name": "transfer.request.zip",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"transfer.request\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"offerId\":\"cccccccccccccccccccccccccccccccc\",\"entryIds\":[\"0\",\"1\",\"10\",\"2\"],\"selectionDigest\":\"abababababababababababababababababababababababababababababababab\",\"mode\":\"zip\"}}"
+ },
+ {
   "name": "transfer.source_ready",
   "direction": "client",
   "json": "{\"v\":1,\"type\":\"transfer.source_ready\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}"
@@ -147,12 +152,17 @@
  {
   "name": "transfer.incoming",
   "direction": "server",
-  "json": "{\"v\":1,\"type\":\"transfer.incoming\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offerId\":\"cccccccccccccccccccccccccccccccc\",\"fromPeerId\":\"11111111111111111111111111111111\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}"
+  "json": "{\"v\":1,\"type\":\"transfer.incoming\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offerId\":\"cccccccccccccccccccccccccccccccc\",\"fromPeerId\":\"11111111111111111111111111111111\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"mode\":\"raw\"}}"
+ },
+ {
+  "name": "transfer.incoming.zip",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"transfer.incoming\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offerId\":\"cccccccccccccccccccccccccccccccc\",\"fromPeerId\":\"11111111111111111111111111111111\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"mode\":\"zip\"}}"
  },
  {
   "name": "transfer.direct_start",
   "direction": "server",
-  "json": "{\"v\":1,\"type\":\"transfer.direct_start\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"attemptNumber\":1,\"role\":\"recipient\",\"iceServers\":[],\"deadlineMs\":10000}}"
+  "json": "{\"v\":1,\"type\":\"transfer.direct_start\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"attemptNumber\":1,\"role\":\"offerer\",\"iceServers\":[],\"deadlineMs\":10000}}"
  },
  {
   "name": "transfer.path_commit",
@@ -188,5 +198,60 @@
   "name": "relay.attach",
   "direction": "relay",
   "json": "{\"v\":1,\"peerId\":\"11111111111111111111111111111111\",\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"role\":\"recipient\",\"ticket\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}"
+ },
+ {
+  "name": "error.direct_failed",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"error\",\"body\":{\"code\":\"DIRECT_FAILED\",\"message\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}"
+ },
+ {
+  "name": "transfer.path_commit.resume",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"transfer.path_commit\",\"body\":{\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"path\":\"relay\",\"resumeRanges\":[[0,4],[8,9]],\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}"
+ },
+ {
+  "name": "transfer.request.resume",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"transfer.request\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"entryIds\":[\"0\"],\"mode\":\"raw\",\"offerId\":\"cccccccccccccccccccccccccccccccc\",\"resume\":{\"outputLength\":6291467,\"verifiedRanges\":[[0,2]]},\"selectionDigest\":\"abababababababababababababababababababababababababababababababab\"}}"
+ },
+ {
+  "name": "rtc.offer.forwarded",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"rtc.offer\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"sdp\":\"v=0...\"}}"
+ },
+ {
+  "name": "rtc.answer.forwarded",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"rtc.answer\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"sdp\":\"v=0...\"}}"
+ },
+ {
+  "name": "rtc.ice.forwarded",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"rtc.ice\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"candidate\":\"candidate:1...\",\"sdpMid\":\"0\",\"sdpMLineIndex\":0}}"
+ },
+ {
+  "name": "rtc.ice.end_of_candidates",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"rtc.ice\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"candidate\":null}}"
+ },
+ {
+  "name": "transfer.direct_failed.forwarded",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"transfer.direct_failed\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reason\":\"ice-failed\",\"resumeRanges\":[[0,2]]}}"
+ },
+ {
+  "name": "transfer.progress",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"transfer.progress\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"receivedBytes\":\"1048576\"}}"
+ },
+ {
+  "name": "transfer.progress.forwarded",
+  "direction": "server",
+  "json": "{\"v\":1,\"type\":\"transfer.progress\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"receivedBytes\":\"1048576\",\"path\":\"direct\"}}"
+ },
+ {
+  "name": "transfer.direct_failed.ranges",
+  "direction": "client",
+  "json": "{\"v\":1,\"type\":\"transfer.direct_failed\",\"requestId\":\"dddddddddddddddddddddddddddddddd\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reason\":\"channel-closed\",\"resumeRanges\":[[0,2]]}}"
  }
 ]

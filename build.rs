@@ -95,7 +95,13 @@ fn emit_asset_table(
 /// web/transfer`) owns dist generation.
 fn bundle_web_transfer_assets() {
     const SOURCE: &str = "web/transfer/dist";
-    const REQUIRED: &[&str] = &["index.html", "app.js", "app.css", "offer-worker.js"];
+    const REQUIRED: &[&str] = &[
+        "index.html",
+        "app.js",
+        "app.css",
+        "offer-worker.js",
+        "stage-worker.js",
+    ];
     if !Path::new(SOURCE).exists() {
         panic!(
             "build.rs: {SOURCE} missing — run `npm run build --prefix web/transfer` \
@@ -114,6 +120,44 @@ fn bundle_web_transfer_assets() {
         panic!(
             "build.rs: {SOURCE} lacks required assets: {}",
             missing.join(", ")
+        );
+    }
+    // Every asset the SHELL asks for must be one the binary carries. The
+    // required list above only proves the bundler ran; it does not prove the
+    // page and the bundle agree. A renamed chunk leaves both checks happy and
+    // 404s at runtime, in a page whose whole job is to load one script — so
+    // the references in `index.html` are read and resolved here, at compile
+    // time, where the fix is one command away.
+    let index_path = assets
+        .iter()
+        .find(|(url, _, _)| url == "/transfer/assets/index.html")
+        .map(|(_, path, _)| path.clone())
+        .expect("index.html is in the required list above");
+    let index = fs::read_to_string(&index_path)
+        .unwrap_or_else(|e| panic!("build.rs: cannot read {index_path}: {e}"));
+    let mut dangling = Vec::new();
+    for reference in index.split('"') {
+        let reference = reference.trim();
+        if !reference.starts_with("/transfer/assets/") {
+            continue;
+        }
+        // A query string or a fragment is not part of the path.
+        let path = reference
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(reference)
+            .to_string();
+        if !assets.iter().any(|(url, _, _)| url == &path) {
+            dangling.push(path);
+        }
+    }
+    if !dangling.is_empty() {
+        dangling.sort();
+        dangling.dedup();
+        panic!(
+            "build.rs: {SOURCE}/index.html references assets the bundle does not \
+             contain: {} — run `npm run build --prefix web/transfer`",
+            dangling.join(", ")
         );
     }
     emit_asset_table(

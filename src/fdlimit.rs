@@ -39,6 +39,38 @@ pub fn fds_needed(max_conns: u64) -> u64 {
     max_conns.saturating_add(FD_HEADROOM)
 }
 
+/// Descriptors the browser-transfer surface can hold open at once, on top of
+/// the proxied-connection bound.
+///
+/// Every one of the three is a socket this process owns for as long as the
+/// thing it belongs to lives: a room's owner lease rides one control
+/// connection, a browser peer is one control WebSocket, and a relay pair is
+/// TWO — one socket per side, which is why that term is doubled. They are
+/// admitted by their own semaphores and are invisible to `--max-conns`, so
+/// without this term a server sized for its tunnels meets `EMFILE` on every
+/// listener the moment the browser surface fills (P-12: `EMFILE` lands on
+/// `accept()` for every listener the process owns, admin API included).
+///
+/// Saturating for the same reason `fd_budget` is: a wrap would silently
+/// LOWER the limit, which is the storm this module exists to prevent.
+pub fn web_transfer_fds(max_rooms: u64, max_peers_global: u64, max_relays_global: u64) -> u64 {
+    max_rooms
+        .saturating_add(max_peers_global)
+        .saturating_add(max_relays_global.saturating_mul(2))
+}
+
+/// The bound [`reconcile_fd_limit`] must be given.
+///
+/// `web` is `None` when the browser surface is off, and the result is then
+/// the historical value unchanged — a server that does not serve rooms must
+/// not raise its own descriptor limit because the feature exists.
+pub fn conn_bound_with_web(max_conns: usize, web: Option<u64>) -> usize {
+    match web {
+        None => max_conns,
+        Some(fds) => max_conns.saturating_add(usize::try_from(fds).unwrap_or(usize::MAX)),
+    }
+}
+
 /// What the process should do about its descriptor limit, given the bound it
 /// was configured with and the limits it currently has.
 ///
@@ -163,8 +195,36 @@ pub fn fd_headroom() -> Option<u64> {
 /// now rather than during an `EMFILE` storm.
 #[cfg(unix)]
 pub fn reconcile_fd_limit(max_conns: usize) {
+    reconcile_fd_limit_with_web(max_conns, 0);
+}
+
+/// [`reconcile_fd_limit`] for a bound that already INCLUDES a browser-transfer
+/// share, which the advisory then names separately.
+///
+/// The remedy line is the whole value of the warning, and it used to read
+/// "lower --max-conns to about N" against a bound the operator never typed:
+/// with the web surface folded in, `--max-conns 64` is reported as 5696, and
+/// an operator who follows that advice lowers the wrong number. `web` is the
+/// part of `bound` that came from [`web_transfer_fds`], so the message can
+/// say which of the two to lower.
+#[cfg(unix)]
+pub fn reconcile_fd_limit_with_web(bound: usize, web: u64) {
     use nix::sys::resource::{getrlimit, setrlimit, Resource};
     use tracing::{debug, info, warn};
+
+    let max_conns = bound;
+    // `--max-conns` on its own, for the operator: the bound minus the share
+    // the browser surface contributed.
+    let conns_only = (bound as u64).saturating_sub(web);
+    let remedy = if web > 0 {
+        format!(
+            " (of that bound {web} descriptors are the web-transfer surface and \
+             {conns_only} are --max-conns: lower --max-conns, or \
+             --web-transfer-max-rooms/--web-transfer-max-peers/--web-transfer-max-relays)"
+        )
+    } else {
+        String::new()
+    };
 
     let (soft_raw, hard_raw) = match getrlimit(Resource::RLIMIT_NOFILE) {
         Ok(pair) => pair,
@@ -198,7 +258,7 @@ pub fn reconcile_fd_limit(max_conns: usize) {
                      refuses gracefully, and EMFILE affects every listener including the \
                      admin API. Raise the limit for this process (container: \
                      `ulimits: nofile:`; systemd: `LimitNOFILE=`) or lower --max-conns to \
-                     about {}",
+                     about {}{remedy}",
                     from.saturating_sub(FD_HEADROOM)
                 ),
             }
@@ -219,7 +279,7 @@ pub fn reconcile_fd_limit(max_conns: usize) {
                  refuse with EMFILE before --max-conns refuses gracefully, and EMFILE \
                  affects every listener including the admin API. Raise the hard limit \
                  for this process (container: `ulimits: nofile:`; systemd: \
-                 `LimitNOFILE=`) or lower --max-conns",
+                 `LimitNOFILE=`) or lower --max-conns{remedy}",
                 hard.saturating_sub(FD_HEADROOM)
             );
         }
@@ -230,6 +290,10 @@ pub fn reconcile_fd_limit(max_conns: usize) {
 /// process by a different mechanism that a process cannot raise at runtime.
 #[cfg(not(unix))]
 pub fn reconcile_fd_limit(_max_conns: usize) {}
+
+/// Non-unix twin of [`reconcile_fd_limit_with_web`].
+#[cfg(not(unix))]
+pub fn reconcile_fd_limit_with_web(_bound: usize, _web: u64) {}
 
 #[cfg(test)]
 mod tests {
@@ -327,5 +391,36 @@ mod tests {
         // limit and reintroduce exactly the EMFILE storm this module exists
         // to prevent.
         assert_eq!(narrow(u64::MAX), nix::libc::rlim_t::MAX);
+    }
+
+    /// The three terms and their weights, and the saturation that keeps a
+    /// misconfigured maximum from wrapping into a LOWER limit.
+    #[test]
+    fn web_fd_budget_adds_rooms_peers_and_two_relay_sockets_without_wrap() {
+        // The shipped defaults: 1024 rooms, 4096 peers, 256 relay PAIRS.
+        assert_eq!(web_transfer_fds(1024, 4096, 256), 1024 + 4096 + 512);
+        // A relay is two sockets, and only a relay is.
+        assert_eq!(web_transfer_fds(0, 0, 1), 2);
+        assert_eq!(web_transfer_fds(1, 1, 0), 2);
+        // Saturation on every term, including the doubling.
+        assert_eq!(web_transfer_fds(u64::MAX, 1, 1), u64::MAX);
+        assert_eq!(web_transfer_fds(0, 0, u64::MAX), u64::MAX);
+        assert_eq!(web_transfer_fds(u64::MAX, u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    /// A server without the browser surface reconciles exactly the bound it
+    /// always did: the feature costs nothing where it is off.
+    #[test]
+    fn fd_reconcile_existing_behavior_is_unchanged_when_web_disabled() {
+        for conns in [0usize, 1, 1024, 65536] {
+            assert_eq!(conn_bound_with_web(conns, None), conns);
+        }
+        assert_eq!(conn_bound_with_web(1024, Some(0)), 1024);
+        assert_eq!(
+            conn_bound_with_web(1024, Some(web_transfer_fds(1024, 4096, 256))),
+            1024 + 1024 + 4096 + 512
+        );
+        // usize saturates rather than panicking on a 32-bit target.
+        assert_eq!(conn_bound_with_web(usize::MAX, Some(1)), usize::MAX);
     }
 }

@@ -58,6 +58,15 @@ export const SERVER_TYPES = [
   "transfer.cancelled",
   "transfer.completed",
   "room_closed",
+  // Phase 4 signaling: the server forwards these verbatim-shaped between the
+  // two participants of an attempt, so the same names travel both ways.
+  "rtc.offer",
+  "rtc.answer",
+  "rtc.ice",
+  "transfer.direct_failed",
+  // The recipient's verified-byte report, forwarded to the source with the
+  // path the SERVER committed — the source cannot read it off its own socket.
+  "transfer.progress",
 ];
 
 export const ERROR_CODES = [
@@ -491,4 +500,25 @@ export function parseRelayAttach(raw) {
     throw new Error(`relay role must be source|recipient, got ${JSON.stringify(obj.role)}`);
   }
   return obj;
+}
+
+/**
+ * Body of the client's `transfer.direct_failed`. The wire NAME of the
+ * recipient's ranges lives here and nowhere else: the server refuses an
+ * unknown body key, so sending them under the recipient's internal name
+ * (`verifiedRanges`) made the whole message `INVALID_MESSAGE` and the relay
+ * attempt re-sent chunks that were already on disk.
+ *
+ * @param {string} transferId
+ * @param {string} attemptId
+ * @param {string} reason one of the fixed reason codes
+ * @param {Array<[number, number]>} [resumeRanges] verified `[start, end)`
+ * chunk ranges; omitted when empty (only the recipient ever has any)
+ */
+export function directFailedBody(transferId, attemptId, reason, resumeRanges) {
+  const body = { transferId, attemptId, reason };
+  if (Array.isArray(resumeRanges) && resumeRanges.length > 0) {
+    body.resumeRanges = resumeRanges;
+  }
+  return body;
 }

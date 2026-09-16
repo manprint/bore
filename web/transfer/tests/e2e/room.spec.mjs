@@ -106,6 +106,19 @@ test.afterAll(async () => {
 
 // One instrumented context: RTC construction counting, clipboard capture,
 // websocket frame audit. Returns { context, page, frames, rtcCount }.
+/**
+ * True for a console line the ENGINE writes about a socket the test itself
+ * expects to fail. Firefox reports "The connection to ws://... was
+ * interrupted while the page was loading" when a WebSocket is closed before
+ * the document finished loading — which is exactly what a ghost room does,
+ * and what closing the context does to a live room. The app's own errors say
+ * something else and are never filtered: this list names ENGINE text, one
+ * pattern per case, so a real failure cannot hide behind it.
+ */
+function isEngineNoise(text) {
+  return /was interrupted while the page was loading/i.test(text);
+}
+
 async function openRoom(browser, url, {rtcHook = true} = {}) {
   const context = await browser.newContext();
   if (rtcHook) {
@@ -148,7 +161,7 @@ async function openRoom(browser, url, {rtcHook = true} = {}) {
   const frames = { sent: [], received: [], urls: [] };
   page.on("pageerror", (error) => failures.push(`pageerror: ${error.message}`));
   page.on("console", (message) => {
-    if (message.type() === "error") {
+    if (message.type() === "error" && !isEngineNoise(message.text())) {
       failures.push(`console: ${message.text()}`);
     }
   });
@@ -322,6 +335,33 @@ test.describe.serial("room", () => {
     expect(broken.frames.urls).toEqual([]);
     expect(broken.failures).toEqual([]);
     await broken.context.close();
+  });
+
+  test("a name being typed survives a room event", async ({ browser }) => {
+    // `render` runs on every room event, and it used to overwrite the name
+    // field unconditionally — so a peer joining while someone typed emptied
+    // the box and, on submit, re-sent the OLD name. The gate is a real event
+    // landing BETWEEN the typing and the submit, which is the production
+    // shape and is deterministic; the flake it caused elsewhere was not.
+    const typist = await openRoom(browser, roomUrl);
+    await expectConnected(typist.page);
+    await typist.page.locator("#rename-input").fill("Dattilografo");
+    const before = await typist.page.locator("#peer-list li").count();
+    const bystander = await openRoom(browser, roomUrl);
+    await expectConnected(bystander.page);
+    // The join reached the typist's page: its roster grew, so a render ran
+    // between the typing and the submit below.
+    await expect(typist.page.locator("#peer-list li")).toHaveCount(before + 1, {
+      timeout: 10_000,
+    });
+    await expect(typist.page.locator("#rename-input")).toHaveValue("Dattilografo");
+    await typist.page.locator("#rename-form").evaluate((form) => form.requestSubmit());
+    await expect(typist.page.locator("#peer-list")).toContainText("Dattilografo", {
+      timeout: 10_000,
+    });
+    expect(typist.failures).toEqual([]);
+    await bystander.context.close();
+    await typist.context.close();
   });
 
   test("no transfer, rtc, relay or notification surface", async ({ browser }) => {

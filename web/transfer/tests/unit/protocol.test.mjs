@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import {
   canonicalize,
+  directFailedBody,
   manifestValue,
   parseClientEnvelope,
   parseManifest,
@@ -59,6 +60,37 @@ describe("web-transfer protocol", () => {
       parseClientEnvelope('{"v":1,"type":"transfer.request","body":{}}'),
     );
     assert.throws(() => parseServerEnvelope('{"v":2,"type":"pong","body":{}}'));
+  });
+
+  it("direct_failed_ranges_travel_under_the_name_the_server_accepts", () => {
+    // The server refuses an unknown body key, so a body that names the
+    // recipient's ranges `verifiedRanges` is rejected WHOLE — the failure is
+    // still reported, the ranges are not, and the relay attempt re-sends
+    // chunks the recipient already holds. The fixture is the wire.
+    const corpus = JSON.parse(fixture("control-messages.json"));
+    const entry = corpus.find((m) => m.name === "transfer.direct_failed.ranges");
+    assert.ok(entry, "the corpus covers a failure that carries ranges");
+    const wire = JSON.parse(entry.json);
+    assert.deepEqual(
+      directFailedBody(
+        wire.body.transferId,
+        wire.body.attemptId,
+        wire.body.reason,
+        [[0, 2]],
+      ),
+      wire.body,
+    );
+    // Empty ranges are omitted, never sent as an empty array.
+    assert.deepEqual(directFailedBody("a", "b", "ice-failed", []), {
+      transferId: "a",
+      attemptId: "b",
+      reason: "ice-failed",
+    });
+    assert.deepEqual(directFailedBody("a", "b", "ice-failed"), {
+      transferId: "a",
+      attemptId: "b",
+      reason: "ice-failed",
+    });
   });
 
   it("manifest_path_rules_reject_nonportable_entries", () => {

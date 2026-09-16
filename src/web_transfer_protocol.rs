@@ -63,6 +63,20 @@ pub const SERVER_TYPES: &[&str] = &[
     "transfer.cancelled",
     "transfer.completed",
     "room_closed",
+    // Phase 4 signaling: the server FORWARDS these three verbatim-shaped to
+    // the counterpart of the current attempt, so the same names travel in
+    // both directions. It never stores, parses or logs what they carry.
+    "rtc.offer",
+    "rtc.answer",
+    "rtc.ice",
+    // The counterpart's notice that the direct attempt is over, carrying a
+    // FIXED reason code (never the peer's own string) and bounded ranges.
+    "transfer.direct_failed",
+    // The recipient's verified-byte report, FORWARDED to the source with the
+    // path the server itself committed. The source has no other way to learn
+    // what the far end verified, and no way at all to read the path off its
+    // own socket (a relay leg and a DataChannel both just carry bytes).
+    "transfer.progress",
 ];
 
 /// Fixed error-code set; anything else on the wire maps to `INTERNAL`.
@@ -160,14 +174,121 @@ pub struct ParsedEnvelope {
     pub body: serde_json::Value,
 }
 
+/// Parses untrusted JSON in ONE pass, refusing an object that repeats a key.
+///
+/// `serde_json` keeps the LAST value for a duplicate key, silently. On a
+/// control wire that turns one message into two readings of itself: the
+/// browser's own `JSON.parse` also keeps the last, but a proxy, a log or a
+/// future parser need not, and every check the server performed would then
+/// have applied to a value the peer never meant. The protocol has no use for
+/// a repeated key, so the honest answer is to refuse the message rather than
+/// to pick a winner.
+///
+/// The detection has to happen WHILE parsing: once `serde_json` has built its
+/// map the duplicate is already gone, so a check on the finished value always
+/// passes. Building the value here rather than parsing twice keeps the cost
+/// of the check at zero — a 320 KiB control message is parsed once, exactly
+/// as before.
+pub fn parse_json_no_duplicate_keys(raw: &str, what: &str) -> Result<serde_json::Value> {
+    use serde::de::DeserializeSeed;
+
+    let mut de = serde_json::Deserializer::from_str(raw);
+    let value = NoDupes(what)
+        .deserialize(&mut de)
+        .map_err(|e| anyhow::anyhow!("{what} is not JSON: {e}"))?;
+    de.end()
+        .map_err(|e| anyhow::anyhow!("{what} has trailing content: {e}"))?;
+    Ok(value)
+}
+
+/// Deserialization seed that builds a `serde_json::Value` and fails on the
+/// first object key seen twice at the same level. Recursive because a
+/// manifest is an object of arrays of objects, and the ENTRY is where a
+/// repeat would be useful to an attacker (two `path`s, two `size`s).
+struct NoDupes<'a>(&'a str);
+
+impl<'de> serde::de::DeserializeSeed<'de> for NoDupes<'_> {
+    type Value = serde_json::Value;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for NoDupes<'_> {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "any JSON value")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        let mut out = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let value = map.next_value_seed(NoDupes(self.0))?;
+            if out.insert(key.clone(), value).is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "{} repeats the key {key:?}",
+                    self.0
+                )));
+            }
+        }
+        Ok(serde_json::Value::Object(out))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        let mut out = Vec::new();
+        while let Some(item) = seq.next_element_seed(NoDupes(self.0))? {
+            out.push(item);
+        }
+        Ok(serde_json::Value::Array(out))
+    }
+
+    fn visit_bool<E>(self, v: bool) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(v))
+    }
+    fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::from(v))
+    }
+    fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::from(v))
+    }
+    fn visit_f64<E>(self, v: f64) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::from(v))
+    }
+    fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::String(v.to_string()))
+    }
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        d: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
 /// Shared envelope checks: size cap, object shape, exact top-level fields,
 /// version, known type and requestId presence rules.
 fn parse_envelope(raw: &str, known: &[&str], side: &str) -> Result<ParsedEnvelope> {
     if raw.len() > WEB_TRANSFER_MAX_CONTROL_BYTES {
         bail!("{side} control message exceeds 320 KiB");
     }
-    let value: serde_json::Value = serde_json::from_str(raw)
-        .map_err(|e| anyhow::anyhow!("{side} control message is not JSON: {e}"))?;
+    let value = parse_json_no_duplicate_keys(raw, &format!("{side} control message"))?;
     let obj = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("{side} control message must be an object"))?;
@@ -413,6 +534,981 @@ pub fn parse_rename_body(env: &ParsedEnvelope) -> Result<(RequestId, String)> {
         .ok_or_else(|| anyhow::anyhow!("peer.rename needs string displayName"))?
         .to_string();
     Ok((request_id, display_name))
+}
+
+/// Largest accepted resume range count per request.
+pub const MAX_RESUME_RANGES: usize = 4096;
+
+/// Validated `transfer.request` body.
+#[derive(Clone, Debug)]
+pub struct TransferRequestBody {
+    /// Offered object being pulled.
+    pub offer_id: OfferId,
+    /// Selected entry IDs: sorted, unique, decimal strings.
+    pub entry_ids: Vec<String>,
+    /// Claimed selection digest (verified against the stored manifest+MAC).
+    pub selection_digest: [u8; 32],
+    /// Transfer mode; only `raw` in this phase.
+    pub mode: String,
+    /// Optional resume descriptor (shape-checked here, verified at send).
+    pub resume: Option<ResumeDescriptorBody>,
+}
+
+/// Validated resume descriptor: verified chunk ranges plus output length.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeDescriptorBody {
+    /// Sorted non-overlapping `[start, endExclusive]` chunk ranges.
+    pub verified_ranges: Vec<(u64, u64)>,
+    /// Expected output length in bytes.
+    pub output_length: u64,
+}
+
+fn parse_entry_ids(obj: &serde_json::Map<String, serde_json::Value>) -> Result<Vec<String>> {
+    let raw = obj
+        .get("entryIds")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("transfer.request needs entryIds array"))?;
+    let mut ids = Vec::with_capacity(raw.len().min(64));
+    for entry in raw {
+        let id = entry
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("entry ID must be a string"))?;
+        // Canonical decimal u32 IDs, mirroring the manifest rule.
+        parse_decimal_u64("entry ID", id)?;
+        ids.push(id.to_string());
+    }
+    let mut sorted = ids.clone();
+    sorted.sort();
+    if sorted != ids {
+        bail!("entry IDs must be sorted");
+    }
+    sorted.dedup();
+    if sorted.len() != ids.len() {
+        bail!("entry IDs must be sorted and unique");
+    }
+    Ok(sorted)
+}
+
+/// Parses a `transfer.request` body into `(requestId, parts)`.
+pub fn parse_transfer_request_body(
+    env: &ParsedEnvelope,
+) -> Result<(RequestId, TransferRequestBody)> {
+    if env.typ != "transfer.request" {
+        bail!("expected transfer.request, got {:?}", env.typ);
+    }
+    let request_id = env
+        .request_id
+        .ok_or_else(|| anyhow::anyhow!("transfer.request requires requestId"))?;
+    let obj = check_body_keys(
+        &env.body,
+        "transfer.request",
+        &["offerId", "entryIds", "selectionDigest", "mode", "resume"],
+    )?;
+    let offer_id = obj
+        .get("offerId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.request needs string offerId"))?
+        .parse::<OfferId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let entry_ids = parse_entry_ids(obj)?;
+    let digest_hex = obj
+        .get("selectionDigest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.request needs string selectionDigest"))?;
+    let selection_digest = crate::web_transfer::parse_hex_id::<32>("selectionDigest", digest_hex)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let mode = obj
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.request needs string mode"))?
+        .to_string();
+    let resume = match obj.get("resume") {
+        None => None,
+        Some(value) => Some(parse_resume_descriptor(value)?),
+    };
+    Ok((
+        request_id,
+        TransferRequestBody {
+            offer_id,
+            entry_ids,
+            selection_digest,
+            mode,
+            resume,
+        },
+    ))
+}
+
+/// Parses a resume descriptor value.
+pub fn parse_resume_descriptor(value: &serde_json::Value) -> Result<ResumeDescriptorBody> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("resume descriptor must be an object"))?;
+    for key in obj.keys() {
+        if key != "verifiedRanges" && key != "outputLength" {
+            bail!("resume descriptor has unknown field {key:?}");
+        }
+    }
+    let ranges_raw = obj
+        .get("verifiedRanges")
+        .ok_or_else(|| anyhow::anyhow!("resume descriptor needs verifiedRanges array"))?;
+    let verified_ranges = parse_verified_ranges(ranges_raw)?;
+    let output_length = obj
+        .get("outputLength")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("resume descriptor needs integer outputLength"))?;
+    Ok(ResumeDescriptorBody {
+        verified_ranges,
+        output_length,
+    })
+}
+
+/// Parses a bounded, sorted, disjoint `[[start, endExclusive], ...]` array.
+/// Shared by `transfer.request`'s resume descriptor and the direct-path
+/// failure notice, so a range list has exactly one set of rules whichever
+/// message carries it.
+pub fn parse_verified_ranges(value: &serde_json::Value) -> Result<Vec<(u64, u64)>> {
+    let ranges_raw = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("verifiedRanges must be an array"))?;
+    if ranges_raw.len() > MAX_RESUME_RANGES {
+        bail!("resume descriptor exceeds 4096 ranges");
+    }
+    let mut verified_ranges = Vec::with_capacity(ranges_raw.len().min(64));
+    for range in ranges_raw {
+        let pair = range
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("resume range must be a [start, end] pair"))?;
+        if pair.len() != 2 {
+            bail!("resume range must be a [start, end] pair");
+        }
+        let start = pair[0]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("resume range bounds must be integers"))?;
+        let end = pair[1]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("resume range bounds must be integers"))?;
+        if start >= end {
+            bail!("resume range must satisfy start < end");
+        }
+        verified_ranges.push((start, end));
+    }
+    verified_ranges.sort();
+    for window in verified_ranges.windows(2) {
+        if window[0].1 > window[1].0 {
+            bail!("resume ranges must not overlap");
+        }
+    }
+    Ok(verified_ranges)
+}
+
+/// Selection digest: `SHA256(canonical {entryIds, manifestMac, mode,
+/// offerId})`. The server recomputes it from the stored manifest and MAC;
+/// any mismatch means the source changed since publish.
+pub fn selection_digest(
+    offer_id: &OfferId,
+    manifest_mac: &[u8; 32],
+    entry_ids: &[String],
+    mode: &str,
+) -> [u8; 32] {
+    let mut body = BTreeMap::new();
+    body.insert(
+        "entryIds".to_string(),
+        serde_json::Value::Array(
+            entry_ids
+                .iter()
+                .map(|id| serde_json::Value::String(id.clone()))
+                .collect(),
+        ),
+    );
+    body.insert(
+        "manifestMac".to_string(),
+        serde_json::Value::String(hex::encode(manifest_mac)),
+    );
+    body.insert(
+        "mode".to_string(),
+        serde_json::Value::String(mode.to_string()),
+    );
+    body.insert(
+        "offerId".to_string(),
+        serde_json::Value::String(offer_id.to_string()),
+    );
+    let canonical = canonical_json(&serde_json::Value::Object(body.into_iter().collect()))
+        .expect("digest input is canonical JSON");
+    sha256(canonical.as_bytes())
+}
+
+/// Validated `transfer.source_ready` body: the attempt plus the selection
+/// digest the source re-verified against its live `File` (freshness
+/// attestation, not just an echo).
+#[derive(Clone, Debug)]
+pub struct SourceReadyBody {
+    /// Transfer being readied.
+    pub transfer_id: TransferId,
+    /// Attempt the source answers for.
+    pub attempt_id: AttemptId,
+    /// Digest over the source's current selection (must match stored).
+    pub selection_digest: [u8; 32],
+}
+
+/// Parses a `transfer.source_ready` body.
+pub fn parse_source_ready_body(env: &ParsedEnvelope) -> Result<(RequestId, SourceReadyBody)> {
+    if env.typ != "transfer.source_ready" {
+        bail!("expected transfer.source_ready, got {:?}", env.typ);
+    }
+    let request_id = env
+        .request_id
+        .ok_or_else(|| anyhow::anyhow!("transfer.source_ready requires requestId"))?;
+    let obj = check_body_keys(
+        &env.body,
+        "transfer.source_ready",
+        &["transferId", "attemptId", "selectionDigest"],
+    )?;
+    let transfer_id = obj
+        .get("transferId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.source_ready needs string transferId"))?
+        .parse::<TransferId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let attempt_id = obj
+        .get("attemptId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.source_ready needs string attemptId"))?
+        .parse::<AttemptId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let digest_hex = obj
+        .get("selectionDigest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.source_ready needs string selectionDigest"))?;
+    let selection_digest = crate::web_transfer::parse_hex_id::<32>("selectionDigest", digest_hex)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok((
+        request_id,
+        SourceReadyBody {
+            transfer_id,
+            attempt_id,
+            selection_digest,
+        },
+    ))
+}
+
+/// Parses a `transfer.reject` body into `(requestId, transferId)`.
+pub fn parse_reject_body(env: &ParsedEnvelope) -> Result<(RequestId, TransferId)> {
+    if env.typ != "transfer.reject" {
+        bail!("expected transfer.reject, got {:?}", env.typ);
+    }
+    let request_id = env
+        .request_id
+        .ok_or_else(|| anyhow::anyhow!("transfer.reject requires requestId"))?;
+    let obj = check_body_keys(&env.body, "transfer.reject", &["transferId", "code"])?;
+    let transfer_id = obj
+        .get("transferId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.reject needs string transferId"))?
+        .parse::<TransferId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok((request_id, transfer_id))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 direct-path signaling. Every body below is FORWARD-ONLY: the server
+// validates shape and bounds, hands the value to exactly one counterpart and
+// keeps nothing. SDP and ICE candidates are never parsed, rewritten, stored
+// or logged — they are opaque strings with a length cap and nothing else.
+
+/// Validated `rtc.offer` / `rtc.answer` body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RtcSdpBody {
+    /// Transfer the description belongs to.
+    pub transfer_id: TransferId,
+    /// Attempt the description belongs to.
+    pub attempt_id: AttemptId,
+    /// Opaque session description, 1..=64 KiB of UTF-8. Never inspected.
+    pub sdp: String,
+}
+
+/// Parses `rtc.offer` (`typ == "rtc.offer"`) or `rtc.answer`.
+pub fn parse_rtc_sdp_body(env: &ParsedEnvelope, typ: &str) -> Result<(RequestId, RtcSdpBody)> {
+    debug_assert!(typ == "rtc.offer" || typ == "rtc.answer");
+    if env.typ != typ {
+        bail!("expected {typ}, got {:?}", env.typ);
+    }
+    let request_id = env
+        .request_id
+        .ok_or_else(|| anyhow::anyhow!("{typ} requires requestId"))?;
+    let obj = check_body_keys(&env.body, typ, &["transferId", "attemptId", "sdp"])?;
+    let transfer_id = obj
+        .get("transferId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{typ} needs string transferId"))?
+        .parse::<TransferId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let attempt_id = obj
+        .get("attemptId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{typ} needs string attemptId"))?
+        .parse::<AttemptId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let sdp = obj
+        .get("sdp")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{typ} needs string sdp"))?;
+    // The bound is on BYTES, not chars: the cap exists to bound what the
+    // server forwards, and a multi-byte char costs what it costs.
+    if sdp.is_empty() || sdp.len() > crate::web_transfer::WEB_TRANSFER_MAX_SDP_BYTES {
+        bail!("{typ} sdp is out of range");
+    }
+    Ok((
+        request_id,
+        RtcSdpBody {
+            transfer_id,
+            attempt_id,
+            sdp: sdp.to_string(),
+        },
+    ))
+}
+
+/// Validated `rtc.ice` body. `candidate == None` IS the end-of-candidates
+/// marker (the browser's own null candidate); it carries no other fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RtcIceBody {
+    /// Transfer the candidate belongs to.
+    pub transfer_id: TransferId,
+    /// Attempt the candidate belongs to.
+    pub attempt_id: AttemptId,
+    /// Opaque candidate line, <= 4 KiB. `None` ends this side's gathering.
+    pub candidate: Option<String>,
+    /// Opaque media stream identification, <= 64 bytes.
+    pub sdp_mid: Option<String>,
+    /// Media description index, `u16` or absent.
+    pub sdp_m_line_index: Option<u16>,
+}
+
+impl RtcIceBody {
+    /// Whether this message is the end-of-candidates marker.
+    pub fn is_end_of_candidates(&self) -> bool {
+        self.candidate.is_none()
+    }
+}
+
+/// Parses an `rtc.ice` body.
+pub fn parse_rtc_ice_body(env: &ParsedEnvelope) -> Result<(RequestId, RtcIceBody)> {
+    if env.typ != "rtc.ice" {
+        bail!("expected rtc.ice, got {:?}", env.typ);
+    }
+    let request_id = env
+        .request_id
+        .ok_or_else(|| anyhow::anyhow!("rtc.ice requires requestId"))?;
+    let obj = check_body_keys(
+        &env.body,
+        "rtc.ice",
+        &[
+            "transferId",
+            "attemptId",
+            "candidate",
+            "sdpMid",
+            "sdpMLineIndex",
+        ],
+    )?;
+    let transfer_id = obj
+        .get("transferId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("rtc.ice needs string transferId"))?
+        .parse::<TransferId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let attempt_id = obj
+        .get("attemptId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("rtc.ice needs string attemptId"))?
+        .parse::<AttemptId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    // An absent key, an explicit `null` and an empty string all mean the same
+    // thing to a browser: this side is done gathering. Normalize to `None` so
+    // the forwarded marker has exactly one shape on the wire.
+    let candidate = match obj.get("candidate") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s.is_empty() => None,
+        Some(serde_json::Value::String(s)) => {
+            if s.len() > crate::web_transfer::WEB_TRANSFER_MAX_ICE_CANDIDATE_BYTES {
+                bail!("rtc.ice candidate is too long");
+            }
+            Some(s.clone())
+        }
+        Some(_) => bail!("rtc.ice candidate must be a string or null"),
+    };
+    let sdp_mid = match obj.get("sdpMid") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => {
+            if s.len() > crate::web_transfer::WEB_TRANSFER_MAX_ICE_SDP_MID_BYTES {
+                bail!("rtc.ice sdpMid is too long");
+            }
+            Some(s.clone())
+        }
+        Some(_) => bail!("rtc.ice sdpMid must be a string or null"),
+    };
+    let sdp_m_line_index = match obj.get("sdpMLineIndex") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let n = value
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("rtc.ice sdpMLineIndex must be an integer"))?;
+            Some(
+                u16::try_from(n)
+                    .map_err(|_| anyhow::anyhow!("rtc.ice sdpMLineIndex does not fit u16"))?,
+            )
+        }
+    };
+    // The marker carries nothing else: a "done gathering" that also names a
+    // media section is a shape nobody produces and one more thing to forward.
+    if candidate.is_none() && (sdp_mid.is_some() || sdp_m_line_index.is_some()) {
+        bail!("rtc.ice end-of-candidates carries no media fields");
+    }
+    Ok((
+        request_id,
+        RtcIceBody {
+            transfer_id,
+            attempt_id,
+            candidate,
+            sdp_mid,
+            sdp_m_line_index,
+        },
+    ))
+}
+
+/// Parses `transfer.direct_ready` into `(requestId, transferId, attemptId)`.
+pub fn parse_direct_ready_body(env: &ParsedEnvelope) -> Result<(RequestId, TransferId, AttemptId)> {
+    if env.typ != "transfer.direct_ready" {
+        bail!("expected transfer.direct_ready, got {:?}", env.typ);
+    }
+    let request_id = env
+        .request_id
+        .ok_or_else(|| anyhow::anyhow!("transfer.direct_ready requires requestId"))?;
+    let obj = check_body_keys(
+        &env.body,
+        "transfer.direct_ready",
+        &["transferId", "attemptId"],
+    )?;
+    let transfer_id = obj
+        .get("transferId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.direct_ready needs string transferId"))?
+        .parse::<TransferId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let attempt_id = obj
+        .get("attemptId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.direct_ready needs string attemptId"))?
+        .parse::<AttemptId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok((request_id, transfer_id, attempt_id))
+}
+
+/// The complete set of reason codes a direct attempt can end with. A peer's
+/// `reason` is MAPPED into this set and never forwarded verbatim: the string
+/// is attacker-controlled and the counterpart only needs to know whether to
+/// wait for a relay ticket, which every one of these implies.
+pub const DIRECT_FAIL_REASONS: &[&str] = &[
+    "ice-failed",
+    "channel-closed",
+    "send-error",
+    "unsupported",
+    "timeout",
+    "protocol",
+    "unknown",
+];
+
+/// Maps a peer-supplied reason onto [`DIRECT_FAIL_REASONS`]; anything else
+/// (including a missing reason) becomes `"unknown"`.
+pub fn direct_fail_reason(raw: Option<&str>) -> &'static str {
+    match raw {
+        Some(value) => DIRECT_FAIL_REASONS
+            .iter()
+            .copied()
+            .find(|known| *known == value)
+            .unwrap_or("unknown"),
+        None => "unknown",
+    }
+}
+
+/// Validated `transfer.direct_failed` body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectFailedBody {
+    /// Transfer whose direct attempt ended.
+    pub transfer_id: TransferId,
+    /// Attempt that ended (a stale one is ignored by the registry).
+    pub attempt_id: AttemptId,
+    /// Reason code, already mapped into [`DIRECT_FAIL_REASONS`].
+    pub reason: &'static str,
+    /// Verified `[start, endExclusive)` chunk ranges the recipient holds,
+    /// sorted and disjoint. Bounded by the same parser the request uses.
+    pub verified_ranges: Vec<(u64, u64)>,
+}
+
+/// Parses a `transfer.direct_failed` body.
+pub fn parse_direct_failed_body(env: &ParsedEnvelope) -> Result<(RequestId, DirectFailedBody)> {
+    if env.typ != "transfer.direct_failed" {
+        bail!("expected transfer.direct_failed, got {:?}", env.typ);
+    }
+    let request_id = env
+        .request_id
+        .ok_or_else(|| anyhow::anyhow!("transfer.direct_failed requires requestId"))?;
+    let obj = check_body_keys(
+        &env.body,
+        "transfer.direct_failed",
+        &["transferId", "attemptId", "reason", "resumeRanges"],
+    )?;
+    let transfer_id = obj
+        .get("transferId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.direct_failed needs string transferId"))?
+        .parse::<TransferId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let attempt_id = obj
+        .get("attemptId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.direct_failed needs string attemptId"))?
+        .parse::<AttemptId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let reason = direct_fail_reason(obj.get("reason").and_then(serde_json::Value::as_str));
+    let verified_ranges = match obj.get("resumeRanges") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => parse_verified_ranges(value)?,
+    };
+    Ok((
+        request_id,
+        DirectFailedBody {
+            transfer_id,
+            attempt_id,
+            reason,
+            verified_ranges,
+        },
+    ))
+}
+
+/// Builds `transfer.direct_start {transferId, attemptId, attemptNumber, role,
+/// iceServers, deadlineMs}`. `role` is the SDP role this peer plays and is
+/// fixed by the protocol: the recipient is always `offerer`, the source
+/// always `answerer`.
+pub fn transfer_direct_start_envelope(
+    transfer_id: TransferId,
+    attempt_id: AttemptId,
+    attempt_number: u64,
+    role: &str,
+    ice_servers: &[String],
+    deadline_ms: u64,
+) -> String {
+    let mut body = BTreeMap::new();
+    body.insert(
+        "transferId".to_string(),
+        serde_json::Value::String(transfer_id.to_string()),
+    );
+    body.insert(
+        "attemptId".to_string(),
+        serde_json::Value::String(attempt_id.to_string()),
+    );
+    body.insert(
+        "attemptNumber".to_string(),
+        serde_json::Value::from(attempt_number),
+    );
+    body.insert(
+        "role".to_string(),
+        serde_json::Value::String(role.to_string()),
+    );
+    body.insert(
+        "iceServers".to_string(),
+        serde_json::Value::Array(
+            ice_servers
+                .iter()
+                .map(|url| serde_json::Value::String(url.clone()))
+                .collect(),
+        ),
+    );
+    body.insert(
+        "deadlineMs".to_string(),
+        serde_json::Value::from(deadline_ms),
+    );
+    server_envelope("transfer.direct_start", None, body)
+}
+
+/// Builds the forwarded `rtc.offer` / `rtc.answer`. The SDP travels through
+/// unchanged and unread; only the envelope is rebuilt, so the peer's own
+/// `requestId` never leaks to the counterpart.
+pub fn rtc_sdp_envelope(typ: &str, body: &RtcSdpBody) -> String {
+    debug_assert!(typ == "rtc.offer" || typ == "rtc.answer");
+    let mut out = BTreeMap::new();
+    out.insert(
+        "transferId".to_string(),
+        serde_json::Value::String(body.transfer_id.to_string()),
+    );
+    out.insert(
+        "attemptId".to_string(),
+        serde_json::Value::String(body.attempt_id.to_string()),
+    );
+    out.insert(
+        "sdp".to_string(),
+        serde_json::Value::String(body.sdp.clone()),
+    );
+    server_envelope(typ, None, out)
+}
+
+/// Builds the forwarded `rtc.ice`. The end-of-candidates marker is a `null`
+/// candidate and nothing else.
+pub fn rtc_ice_envelope(body: &RtcIceBody) -> String {
+    let mut out = BTreeMap::new();
+    out.insert(
+        "transferId".to_string(),
+        serde_json::Value::String(body.transfer_id.to_string()),
+    );
+    out.insert(
+        "attemptId".to_string(),
+        serde_json::Value::String(body.attempt_id.to_string()),
+    );
+    out.insert(
+        "candidate".to_string(),
+        match &body.candidate {
+            Some(value) => serde_json::Value::String(value.clone()),
+            None => serde_json::Value::Null,
+        },
+    );
+    if let Some(mid) = &body.sdp_mid {
+        out.insert("sdpMid".to_string(), serde_json::Value::String(mid.clone()));
+    }
+    if let Some(index) = body.sdp_m_line_index {
+        out.insert("sdpMLineIndex".to_string(), serde_json::Value::from(index));
+    }
+    server_envelope("rtc.ice", None, out)
+}
+
+/// Builds the forwarded `transfer.direct_failed {transferId, attemptId,
+/// reason, resumeRanges?}`. `reason` is always one of
+/// [`DIRECT_FAIL_REASONS`]; `resumeRanges` is omitted when empty so a failure
+/// with nothing to resume is the smallest envelope there is.
+pub fn transfer_direct_failed_envelope(
+    transfer_id: TransferId,
+    attempt_id: AttemptId,
+    reason: &str,
+    resume_ranges: &[(u64, u64)],
+) -> String {
+    let mut body = BTreeMap::new();
+    body.insert(
+        "transferId".to_string(),
+        serde_json::Value::String(transfer_id.to_string()),
+    );
+    body.insert(
+        "attemptId".to_string(),
+        serde_json::Value::String(attempt_id.to_string()),
+    );
+    body.insert(
+        "reason".to_string(),
+        serde_json::Value::String(direct_fail_reason(Some(reason)).to_string()),
+    );
+    if !resume_ranges.is_empty() {
+        body.insert(
+            "resumeRanges".to_string(),
+            serde_json::Value::Array(
+                resume_ranges
+                    .iter()
+                    .map(|(start, end)| {
+                        serde_json::Value::Array(vec![
+                            serde_json::Value::from(*start),
+                            serde_json::Value::from(*end),
+                        ])
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    server_envelope("transfer.direct_failed", None, body)
+}
+
+/// Parses a `transfer.cancel` body into `(requestId, transferId)`.
+pub fn parse_cancel_body(env: &ParsedEnvelope) -> Result<(RequestId, TransferId)> {
+    if env.typ != "transfer.cancel" {
+        bail!("expected transfer.cancel, got {:?}", env.typ);
+    }
+    let request_id = env
+        .request_id
+        .ok_or_else(|| anyhow::anyhow!("transfer.cancel requires requestId"))?;
+    let obj = check_body_keys(&env.body, "transfer.cancel", &["transferId", "reason"])?;
+    let transfer_id = obj
+        .get("transferId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.cancel needs string transferId"))?
+        .parse::<TransferId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok((request_id, transfer_id))
+}
+
+/// Validated `transfer.complete` body.
+#[derive(Clone, Debug)]
+pub struct CompleteBody {
+    /// Finished transfer.
+    pub transfer_id: TransferId,
+    /// Finished attempt.
+    pub attempt_id: AttemptId,
+    /// Final content root the recipient verified.
+    pub root: [u8; 32],
+}
+
+/// Parses a `transfer.complete` body.
+pub fn parse_complete_body(env: &ParsedEnvelope) -> Result<(RequestId, CompleteBody)> {
+    if env.typ != "transfer.complete" {
+        bail!("expected transfer.complete, got {:?}", env.typ);
+    }
+    let request_id = env
+        .request_id
+        .ok_or_else(|| anyhow::anyhow!("transfer.complete requires requestId"))?;
+    let obj = check_body_keys(
+        &env.body,
+        "transfer.complete",
+        &["transferId", "attemptId", "root"],
+    )?;
+    let transfer_id = obj
+        .get("transferId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.complete needs string transferId"))?
+        .parse::<TransferId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let attempt_id = obj
+        .get("attemptId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.complete needs string attemptId"))?
+        .parse::<AttemptId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let root_hex = obj
+        .get("root")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.complete needs string root"))?;
+    let root = crate::web_transfer::parse_hex_id::<32>("root", root_hex)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok((
+        request_id,
+        CompleteBody {
+            transfer_id,
+            attempt_id,
+            root,
+        },
+    ))
+}
+
+/// Builds `transfer.incoming {transferId, offerId, fromPeerId, attemptId}`.
+pub fn transfer_incoming_envelope(
+    transfer_id: TransferId,
+    offer_id: OfferId,
+    from_peer: PeerId,
+    attempt_id: AttemptId,
+    mode: &str,
+) -> String {
+    let mut body = BTreeMap::new();
+    body.insert(
+        "transferId".to_string(),
+        serde_json::Value::String(transfer_id.to_string()),
+    );
+    body.insert(
+        "offerId".to_string(),
+        serde_json::Value::String(offer_id.to_string()),
+    );
+    body.insert(
+        "fromPeerId".to_string(),
+        serde_json::Value::String(from_peer.to_string()),
+    );
+    body.insert(
+        "attemptId".to_string(),
+        serde_json::Value::String(attempt_id.to_string()),
+    );
+    // The SOURCE has to know which selection it is about to serve: it
+    // recomputes the selection digest itself (that is what makes a forged
+    // request fail at the source and not only at the server), and the digest
+    // covers the mode. Additive field, appended last on a
+    // server-to-client message the browser reads by key.
+    body.insert(
+        "mode".to_string(),
+        serde_json::Value::String(mode.to_string()),
+    );
+    server_envelope("transfer.incoming", None, body)
+}
+
+/// Builds `transfer.relay_ticket {transferId, attemptId, ticket}` carrying
+/// only the recipient's own ticket.
+pub fn transfer_relay_ticket_envelope(
+    transfer_id: TransferId,
+    attempt_id: AttemptId,
+    ticket_hex: &str,
+) -> String {
+    let mut body = BTreeMap::new();
+    body.insert(
+        "transferId".to_string(),
+        serde_json::Value::String(transfer_id.to_string()),
+    );
+    body.insert(
+        "attemptId".to_string(),
+        serde_json::Value::String(attempt_id.to_string()),
+    );
+    body.insert(
+        "ticket".to_string(),
+        serde_json::Value::String(ticket_hex.to_string()),
+    );
+    server_envelope("transfer.relay_ticket", None, body)
+}
+
+/// Validated `transfer.progress` body.
+#[derive(Clone, Copy, Debug)]
+pub struct ProgressBody {
+    /// Transfer being reported on.
+    pub transfer_id: TransferId,
+    /// Attempt the report belongs to.
+    pub attempt_id: AttemptId,
+    /// Plaintext bytes the recipient has VERIFIED, resumed chunks included.
+    pub received_bytes: u64,
+}
+
+/// Parses a `transfer.progress` body. `receivedBytes` travels as a decimal
+/// string (the manifest's convention for every 64-bit quantity); a plain
+/// number is accepted too, so a hand-written client is not tripped by it.
+pub fn parse_progress_body(env: &ParsedEnvelope) -> Result<(RequestId, ProgressBody)> {
+    if env.typ != "transfer.progress" {
+        bail!("expected transfer.progress, got {:?}", env.typ);
+    }
+    let request_id = env
+        .request_id
+        .ok_or_else(|| anyhow::anyhow!("transfer.progress requires requestId"))?;
+    let obj = check_body_keys(
+        &env.body,
+        "transfer.progress",
+        &["transferId", "attemptId", "receivedBytes"],
+    )?;
+    let transfer_id = obj
+        .get("transferId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.progress needs string transferId"))?
+        .parse::<TransferId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let attempt_id = obj
+        .get("attemptId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transfer.progress needs string attemptId"))?
+        .parse::<AttemptId>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let received_bytes = match obj.get("receivedBytes") {
+        Some(serde_json::Value::String(text)) => text
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("transfer.progress receivedBytes is not a u64"))?,
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("transfer.progress receivedBytes is not a u64"))?,
+        None => bail!("transfer.progress needs receivedBytes"),
+    };
+    Ok((
+        request_id,
+        ProgressBody {
+            transfer_id,
+            attempt_id,
+            received_bytes,
+        },
+    ))
+}
+
+/// Builds the FORWARDED `transfer.progress {transferId, attemptId,
+/// receivedBytes, path}`. `path` is the server's OWN committed path, never
+/// anything the reporting peer said: a peer may attest what it verified, and
+/// nothing else.
+pub fn transfer_progress_envelope(
+    transfer_id: TransferId,
+    attempt_id: AttemptId,
+    received_bytes: u64,
+    path: &str,
+) -> String {
+    let mut body = BTreeMap::new();
+    body.insert(
+        "transferId".to_string(),
+        serde_json::Value::String(transfer_id.to_string()),
+    );
+    body.insert(
+        "attemptId".to_string(),
+        serde_json::Value::String(attempt_id.to_string()),
+    );
+    body.insert(
+        "receivedBytes".to_string(),
+        serde_json::Value::String(received_bytes.to_string()),
+    );
+    body.insert(
+        "path".to_string(),
+        serde_json::Value::String(path.to_string()),
+    );
+    server_envelope("transfer.progress", None, body)
+}
+
+/// Builds `transfer.path_commit {transferId, attemptId, path}` announcing the
+/// transport both legs are now spliced through (`"relay"` in Phase 3).
+///
+/// `resume_ranges` carries the recipient's verified `[start, end)` chunk
+/// ranges to the SOURCE, and is the only way the source can skip them: the
+/// descriptor travels on `transfer.request`, which the source never sees.
+/// The field is additive and omitted entirely when the recipient holds
+/// nothing, so a full transfer's envelope is byte-identical to Phase 3.1's.
+pub fn transfer_path_commit_envelope(
+    transfer_id: TransferId,
+    attempt_id: AttemptId,
+    path: &str,
+    resume_ranges: &[(u64, u64)],
+) -> String {
+    let mut body = BTreeMap::new();
+    body.insert(
+        "transferId".to_string(),
+        serde_json::Value::String(transfer_id.to_string()),
+    );
+    body.insert(
+        "attemptId".to_string(),
+        serde_json::Value::String(attempt_id.to_string()),
+    );
+    body.insert(
+        "path".to_string(),
+        serde_json::Value::String(path.to_string()),
+    );
+    if !resume_ranges.is_empty() {
+        body.insert(
+            "resumeRanges".to_string(),
+            serde_json::Value::Array(
+                resume_ranges
+                    .iter()
+                    .map(|(start, end)| {
+                        serde_json::Value::Array(vec![
+                            serde_json::Value::from(*start),
+                            serde_json::Value::from(*end),
+                        ])
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    server_envelope("transfer.path_commit", None, body)
+}
+
+/// Builds `transfer.cancelled {transferId, byPeerId}`.
+pub fn transfer_cancelled_envelope(transfer_id: TransferId, by_peer: PeerId) -> String {
+    let mut body = BTreeMap::new();
+    body.insert(
+        "transferId".to_string(),
+        serde_json::Value::String(transfer_id.to_string()),
+    );
+    body.insert(
+        "byPeerId".to_string(),
+        serde_json::Value::String(by_peer.to_string()),
+    );
+    server_envelope("transfer.cancelled", None, body)
+}
+
+/// Builds `transfer.completed {transferId, root}`.
+pub fn transfer_completed_envelope(transfer_id: TransferId, root: &[u8; 32]) -> String {
+    let mut body = BTreeMap::new();
+    body.insert(
+        "transferId".to_string(),
+        serde_json::Value::String(transfer_id.to_string()),
+    );
+    body.insert(
+        "root".to_string(),
+        serde_json::Value::String(hex::encode(root)),
+    );
+    server_envelope("transfer.completed", None, body)
 }
 
 /// Validated `offer.publish` body: offer ID, raw manifest value and MAC.
@@ -1140,6 +2236,85 @@ pub fn validate_created_at(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// Entry ID reserved for the ZIP payload itself.
+///
+/// A `mode: "zip"` transfer carries ONE synthetic entry — the archive — and it
+/// needs an ID that no manifest entry can ever claim, so that a partial record,
+/// a resume key or a progress report about the archive can never be confused
+/// with one about a file. Manifest IDs are therefore `0..=0xffff_fffe` and this
+/// value is refused on the way in, at the only door manifests come through.
+pub const RESERVED_ZIP_ENTRY_ID: u32 = u32::MAX;
+
+/// A validated `transfer.request` selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    /// One raw file entry, named by its manifest ID. Never a directory: a
+    /// directory has no bytes to send.
+    Raw(u32),
+    /// The whole offer as one archive. The SET of selected IDs is exactly the
+    /// manifest's, directories included; the archive writes them in manifest
+    /// order, while the `entryIds` array on the wire keeps the canonical
+    /// lexicographic order every request already uses.
+    Zip,
+}
+
+/// Validates a selection against the offer's manifest — the only selection
+/// rule the server enforces, because it is the only one it can check without
+/// holding payload: `raw` is exactly one file, `zip` is exactly the whole
+/// manifest.
+pub fn validate_selection(
+    mode: &str,
+    entry_ids: &[String],
+    manifest: &Manifest,
+) -> Result<Selection> {
+    fn entry_id(raw: &str) -> Result<u32> {
+        let id = parse_decimal_u64("entry ID", raw)?;
+        let id = u32::try_from(id).map_err(|_| anyhow::anyhow!("entry ID exceeds u32"))?;
+        if id == RESERVED_ZIP_ENTRY_ID {
+            bail!("entry ID {RESERVED_ZIP_ENTRY_ID} is reserved for the archive");
+        }
+        Ok(id)
+    }
+    match mode {
+        "raw" => {
+            if entry_ids.len() != 1 {
+                bail!("raw selects exactly one entry");
+            }
+            let id = entry_id(&entry_ids[0])?;
+            let entry = manifest
+                .entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("unknown entry ID"))?;
+            if entry.root.is_none() {
+                bail!("raw cannot select a directory entry");
+            }
+            Ok(Selection::Raw(id))
+        }
+        "zip" => {
+            // Length + membership + no repeat is set equality, and it reads
+            // the same whatever order the array arrived in.
+            if entry_ids.len() != manifest.entries.len() {
+                bail!("zip selects every manifest entry");
+            }
+            let mut seen = vec![false; manifest.entries.len()];
+            for raw in entry_ids {
+                let id = entry_id(raw)?;
+                let position = manifest
+                    .entries
+                    .iter()
+                    .position(|entry| entry.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown entry ID"))?;
+                if std::mem::replace(&mut seen[position], true) {
+                    bail!("zip selects every manifest entry exactly once");
+                }
+            }
+            Ok(Selection::Zip)
+        }
+        other => bail!("unknown transfer mode {other:?}"),
+    }
+}
+
 /// Parses and validates a manifest value (unknown fields rejected).
 /// `limits` bounds the entry count and the summed logical bytes with checked
 /// arithmetic before any large allocation.
@@ -1201,6 +2376,12 @@ pub fn parse_manifest(
             ],
         )?;
         let id = parse_decimal_u64("entry id", get_str(e, "manifest entry", "id")?)?;
+        // Checked BEFORE the sequence rule so the reserved ID is refused as
+        // itself: a manifest that claims it is not a mis-numbered manifest,
+        // it is one trying to name the archive.
+        if id == RESERVED_ZIP_ENTRY_ID as u64 {
+            bail!("manifest entry ID {RESERVED_ZIP_ENTRY_ID} is reserved for the archive");
+        }
         let want_id = u64::try_from(position).map_err(|_| anyhow::anyhow!("manifest too long"))?;
         if id != want_id {
             bail!("manifest entry IDs must be 0-based sequential");
@@ -1508,6 +2689,29 @@ fn frame_key(key: &[u8; 32]) -> Result<aead::LessSafeKey> {
     Ok(aead::LessSafeKey::new(unbound))
 }
 
+/// FINAL plaintext of a RAW transfer: `u64be(total)`.
+pub const FINAL_RAW_LEN: usize = 8;
+
+/// FINAL plaintext of an ARCHIVE transfer:
+/// `u64be(total) || u64be(chunk_count) || root[32]`.
+///
+/// An archive is GENERATED, so none of those three quantities is in the
+/// manifest and none of them can be checked against it: this frame is where
+/// the recipient learns what it should have received, and the AEAD over it
+/// is what makes that claim the source's own. Which length is expected
+/// follows from the transfer's mode, so the two shapes are never ambiguous.
+/// The server never opens a frame on the live path — it relays ciphertext —
+/// so this rule is the codec's, shared with the browser and the fixtures.
+pub const FINAL_ARCHIVE_LEN: usize = 8 + 8 + 32;
+
+const FINAL_LEN_ERROR: &str =
+    "FINAL plaintext must be u64be(total) (8 bytes) or the archive tuple (48 bytes)";
+
+/// The FINAL plaintext lengths this protocol defines.
+fn is_final_len(len: usize) -> bool {
+    len == FINAL_RAW_LEN || len == FINAL_ARCHIVE_LEN
+}
+
 /// Seals one frame: header + `AES-256-GCM(key, nonce(seq), aad=header)`.
 pub fn seal_frame(key: &[u8; 32], seq: u32, ftype: FrameType, plaintext: &[u8]) -> Result<Vec<u8>> {
     match ftype {
@@ -1517,8 +2721,8 @@ pub fn seal_frame(key: &[u8; 32], seq: u32, ftype: FrameType, plaintext: &[u8]) 
             }
         }
         FrameType::Final => {
-            if plaintext.len() != 8 {
-                bail!("FINAL plaintext must be u64be(total), 8 bytes");
+            if !is_final_len(plaintext.len()) {
+                bail!(FINAL_LEN_ERROR);
             }
         }
     }
@@ -1586,8 +2790,8 @@ pub fn open_frame(key: &[u8; 32], msg: &[u8], min_seq: u32) -> Result<DecodedFra
             }
         }
         FrameType::Final => {
-            if plaintext.len() != 8 {
-                bail!("FINAL plaintext must be u64be(total), 8 bytes");
+            if !is_final_len(plaintext.len()) {
+                bail!(FINAL_LEN_ERROR);
             }
         }
     }
@@ -1637,8 +2841,7 @@ pub fn parse_relay_attach(raw: &str) -> Result<RelayAttach> {
     if raw.len() > WEB_TRANSFER_MAX_CONTROL_BYTES {
         bail!("relay.attach exceeds 320 KiB");
     }
-    let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("relay.attach is not JSON: {e}"))?;
+    let value = parse_json_no_duplicate_keys(raw, "relay.attach")?;
     let obj = exact_object(
         &value,
         "relay.attach",
@@ -1680,6 +2883,203 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         );
         std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("read fixture {name}"))
+    }
+
+    /// 6.3: a repeated key is refused, at every nesting level, on both the
+    /// control envelope and the relay attach.
+    ///
+    /// `serde_json` keeps the last value silently, and so does the browser's
+    /// `JSON.parse` — but nothing on the wire GUARANTEES the two agree, and a
+    /// message that reads differently to two parsers is a message the server
+    /// cannot honestly validate.
+    #[test]
+    fn duplicate_json_keys_are_rejected() {
+        // Top level.
+        let err = parse_client_envelope(r#"{"v":1,"type":"ping","body":{},"body":{"x":1}}"#)
+            .expect_err("a repeated top-level key must be refused");
+        assert!(format!("{err:#}").contains("repeats the key"), "{err:#}");
+
+        // Inside the body.
+        let err = parse_client_envelope(
+            r#"{"v":1,"type":"hello","requestId":"00000000000000000000000000000001","body":{"memberToken":"a","memberToken":"b"}}"#,
+        )
+        .expect_err("a repeated body key must be refused");
+        assert!(format!("{err:#}").contains("repeats the key"), "{err:#}");
+
+        // Inside an array element two levels down — a manifest entry is
+        // exactly this shape, and two `path`s is the useful attack.
+        let err = parse_client_envelope(
+            r#"{"v":1,"type":"offer.publish","requestId":"00000000000000000000000000000001","body":{"manifest":{"entries":[{"path":"a","path":"b"}]}}}"#,
+        )
+        .expect_err("a repeated key in a nested entry must be refused");
+        assert!(format!("{err:#}").contains("repeats the key"), "{err:#}");
+
+        // The relay attach shares the rule.
+        let err = parse_relay_attach(r#"{"v":1,"role":"source","role":"recipient"}"#)
+            .expect_err("a repeated relay.attach key must be refused");
+        assert!(format!("{err:#}").contains("repeats the key"), "{err:#}");
+
+        // ... and a message with no repeat still parses, unchanged.
+        // `ping` carries no requestId by contract, so the positive case is
+        // written the way the protocol actually looks.
+        let ok = parse_client_envelope(r#"{"v":1,"type":"ping","body":{}}"#)
+            .expect("a well-formed message still parses");
+        assert_eq!(ok.typ, "ping");
+
+        // Trailing content after a complete value is refused too: two
+        // concatenated messages in one frame are two readings of one frame.
+        let err = parse_json_no_duplicate_keys(r#"{"a":1}{"b":2}"#, "test")
+            .expect_err("trailing content must be refused");
+        assert!(format!("{err:#}").contains("trailing"), "{err:#}");
+    }
+
+    /// 6.3: every decoder that reads peer bytes survives a hostile corpus —
+    /// no panic, no unbounded allocation, and a stable error for each.
+    ///
+    /// The corpus is DETERMINISTIC on purpose: a fuzzer finds inputs, a
+    /// corpus keeps them. Each case is one of the classes the phase contract
+    /// names (truncated, oversize, unknown field, duplicate, invalid UTF-8
+    /// escape, invalid number, invalid hex, integer boundary, reordered
+    /// lifecycle), and the assertion is the same for all of them: `Err`, not
+    /// a panic and not a success.
+    #[test]
+    fn all_web_decoders_are_panic_free_and_allocation_bounded() {
+        let limits = crate::web_transfer::WebTransferLimits::default();
+        let mut corpus: Vec<String> = vec![
+            String::new(),
+            "{".into(),
+            "}".into(),
+            "[]".into(),
+            "null".into(),
+            "0".into(),
+            "\"".into(),
+            "{\"v\":1}".into(),
+            "{\"v\":1,\"type\":\"ping\"}".into(),
+            // Unknown top-level field.
+            r#"{"v":1,"type":"ping","requestId":"00000000000000000000000000000001","body":{},"extra":1}"#.into(),
+            // Wrong version, and a version that does not fit u64.
+            r#"{"v":2,"type":"ping","requestId":"00000000000000000000000000000001","body":{}}"#.into(),
+            r#"{"v":99999999999999999999999,"type":"ping","body":{}}"#.into(),
+            // Unknown type, and a type that is not a string.
+            r#"{"v":1,"type":"nope","requestId":"00000000000000000000000000000001","body":{}}"#.into(),
+            r#"{"v":1,"type":7,"body":{}}"#.into(),
+            // requestId of every wrong shape.
+            r#"{"v":1,"type":"ping","requestId":"","body":{}}"#.into(),
+            r#"{"v":1,"type":"ping","requestId":"00000000000000000000000000000001aa","body":{}}"#.into(),
+            r#"{"v":1,"type":"ping","requestId":"0000000000000000000000000000000G","body":{}}"#.into(),
+            r#"{"v":1,"type":"ping","requestId":"0000000000000000000000000000000A","body":{}}"#.into(),
+            r#"{"v":1,"type":"ping","requestId":1,"body":{}}"#.into(),
+            // Body that is not an object.
+            r#"{"v":1,"type":"ping","requestId":"00000000000000000000000000000001","body":[]}"#.into(),
+            // Lone surrogate escape — valid JSON grammar, invalid Unicode.
+            r#"{"v":1,"type":"peer.rename","requestId":"00000000000000000000000000000001","body":{"displayName":"\ud800"}}"#.into(),
+            // Deep nesting: the parser must refuse, never recurse to death.
+            format!("{}{}", "[".repeat(512), "]".repeat(512)),
+        ];
+        // One control message just over the cap, and one just under it.
+        corpus.push(format!(
+            r#"{{"v":1,"type":"peer.rename","requestId":"00000000000000000000000000000001","body":{{"displayName":"{}"}}}}"#,
+            "a".repeat(WEB_TRANSFER_MAX_CONTROL_BYTES + 1)
+        ));
+
+        for raw in &corpus {
+            // Every text decoder sees every case. The contract is uniform:
+            // an error, never a panic and never a silent success.
+            let client = parse_client_envelope(raw);
+            let server = parse_server_envelope(raw);
+            let attach = parse_relay_attach(raw);
+            assert!(
+                attach.is_err(),
+                "relay.attach accepted a corpus case: {raw:.80}"
+            );
+            // A valid envelope in the corpus is a bug in the corpus, not in
+            // the decoder: every case above is malformed by construction.
+            assert!(
+                client.is_err() && server.is_err(),
+                "a malformed corpus case parsed: {raw:.80}"
+            );
+        }
+
+        // Envelope-VALID messages whose BODY is hostile: the envelope is not
+        // the place that rejects them, and asserting otherwise would pin the
+        // wrong layer. Each one must fail in its own body parser.
+        let body_corpus: Vec<(&str, String)> = vec![
+            // An integer past u64 where a byte count is expected.
+            (
+                "transfer.progress",
+                r#"{"v":1,"type":"transfer.progress","requestId":"00000000000000000000000000000001","body":{"transferId":"00000000000000000000000000000001","attemptId":"00000000000000000000000000000001","bytes":18446744073709551616}}"#.into(),
+            ),
+            // A display name that is not a string.
+            (
+                "peer.rename",
+                r#"{"v":1,"type":"peer.rename","requestId":"00000000000000000000000000000001","body":{"displayName":7}}"#.into(),
+            ),
+            // An unknown body field: the body tables are exact.
+            (
+                "peer.rename",
+                r#"{"v":1,"type":"peer.rename","requestId":"00000000000000000000000000000001","body":{"displayName":"ok","extra":1}}"#.into(),
+            ),
+            // A transfer id of the wrong width.
+            (
+                "transfer.cancel",
+                r#"{"v":1,"type":"transfer.cancel","requestId":"00000000000000000000000000000001","body":{"transferId":"00"}}"#.into(),
+            ),
+            // An SDP that is not a string, and one past the cap.
+            (
+                "rtc.offer",
+                r#"{"v":1,"type":"rtc.offer","requestId":"00000000000000000000000000000001","body":{"transferId":"00000000000000000000000000000001","attemptId":"00000000000000000000000000000001","sdp":[]}}"#.into(),
+            ),
+        ];
+        for (typ, raw) in &body_corpus {
+            let env = parse_client_envelope(raw)
+                .unwrap_or_else(|e| panic!("corpus case is not envelope-valid: {typ}: {e:#}"));
+            let refused = match *typ {
+                "transfer.progress" => parse_progress_body(&env).is_err(),
+                "peer.rename" => parse_rename_body(&env).is_err(),
+                "transfer.cancel" => parse_cancel_body(&env).is_err(),
+                "rtc.offer" => parse_rtc_sdp_body(&env, "rtc.offer").is_err(),
+                other => panic!("corpus names a body parser nobody drives: {other}"),
+            };
+            assert!(refused, "a hostile {typ} body parsed: {raw:.120}");
+        }
+
+        // Value-level decoders, driven directly with hostile values.
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(0),
+            serde_json::json!("x"),
+            serde_json::json!({}),
+            serde_json::json!([[0]]),
+            serde_json::json!([[1, 0]]),
+            serde_json::json!([[0, u64::MAX]]),
+            serde_json::json!([["0", "1"]]),
+            serde_json::json!(vec![vec![0u64, 1u64]; MAX_RESUME_RANGES + 1]),
+        ] {
+            let _ = parse_verified_ranges(&value);
+            let _ = parse_resume_descriptor(&value);
+            let _ = parse_manifest(&value, &limits);
+        }
+
+        // Binary frames: every truncation of a valid frame, plus a header
+        // that claims a body it does not carry.
+        let key = [7u8; 32];
+        let frame = seal_frame(&key, 0, FrameType::Data, b"payload").expect("seal");
+        for cut in 0..frame.len() {
+            assert!(
+                open_frame(&key, &frame[..cut], 0).is_err(),
+                "a truncated frame opened at {cut} bytes"
+            );
+        }
+        let mut lying = frame.clone();
+        let claimed = u32::MAX.to_be_bytes();
+        lying[12..16].copy_from_slice(&claimed);
+        assert!(
+            open_frame(&key, &lying, 0).is_err(),
+            "a frame claiming 4 GiB of body opened"
+        );
+        // ... and the untouched frame still opens, so the loop above proves
+        // rejection and not a broken fixture.
+        assert!(open_frame(&key, &frame, 0).is_ok(), "the valid frame broke");
     }
 
     #[test]
@@ -2197,6 +3597,45 @@ mod tests {
         }
     }
 
+    /// A FINAL frame carries ONE of two shapes, and no third: `u64be(total)`
+    /// for a raw transfer, or the archive tuple for a `zip` one. The archive
+    /// shape exists because none of its three quantities is in the manifest.
+    #[test]
+    fn final_frames_carry_the_raw_total_or_the_archive_tuple_and_nothing_else() {
+        let key = [7u8; 32];
+        assert_eq!(FINAL_RAW_LEN, 8);
+        assert_eq!(FINAL_ARCHIVE_LEN, 48);
+        let raw = [0u8; FINAL_RAW_LEN];
+        let archive = [0u8; FINAL_ARCHIVE_LEN];
+        let sealed_raw = seal_frame(&key, 0, FrameType::Final, &raw).unwrap();
+        assert_eq!(
+            open_frame(&key, &sealed_raw, 0).unwrap().plaintext.len(),
+            FINAL_RAW_LEN
+        );
+        let sealed_archive = seal_frame(&key, 1, FrameType::Final, &archive).unwrap();
+        assert_eq!(
+            open_frame(&key, &sealed_archive, 0)
+                .unwrap()
+                .plaintext
+                .len(),
+            FINAL_ARCHIVE_LEN
+        );
+        // Every other length is refused on BOTH sides — one byte either way
+        // around each shape, and the empty frame.
+        for len in [0usize, 7, 9, 16, 47, 49, 64] {
+            let plaintext = vec![0u8; len];
+            assert!(
+                seal_frame(&key, 0, FrameType::Final, &plaintext).is_err(),
+                "sealed a {len}-byte FINAL"
+            );
+        }
+        // And a peer that seals a length this codec refuses cannot make it
+        // open either: the rule is applied after the AEAD, not instead of it.
+        let mut forged = sealed_archive.clone();
+        forged.truncate(forged.len() - 1);
+        assert!(open_frame(&key, &forged, 0).is_err());
+    }
+
     #[test]
     fn wrong_key_modified_aad_reserved_bits_and_reused_sequence_are_rejected() {
         let key = [9u8; 32];
@@ -2370,5 +3809,389 @@ mod tests {
 
     fn hex_to_32(s: &str) -> [u8; 32] {
         hex::decode(s).unwrap().try_into().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod transfer_bodies_tests {
+    use super::*;
+
+    fn envelope(typ: &str, request_id: Option<&str>, body: serde_json::Value) -> String {
+        let mut top = std::collections::BTreeMap::new();
+        top.insert("v".to_string(), serde_json::Value::from(1u64));
+        top.insert(
+            "type".to_string(),
+            serde_json::Value::String(typ.to_string()),
+        );
+        if let Some(id) = request_id {
+            top.insert(
+                "requestId".to_string(),
+                serde_json::Value::String(id.to_string()),
+            );
+        }
+        top.insert("body".to_string(), body);
+        canonical_json(&serde_json::Value::Object(top.into_iter().collect())).unwrap()
+    }
+
+    const RID: &str = "dddddddddddddddddddddddddddddddd";
+    const OFFER: &str = "cccccccccccccccccccccccccccccccc";
+    const TRANSFER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ATTEMPT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const HEX64: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+    #[test]
+    fn transfer_bodies_parse_strictly_and_builders_round_trip() {
+        // request
+        let raw = envelope(
+            "transfer.request",
+            Some(RID),
+            serde_json::json!({
+                "offerId": OFFER,
+                "entryIds": ["0"],
+                "selectionDigest": HEX64,
+                "mode": "raw",
+            }),
+        );
+        let env = parse_client_envelope(&raw).unwrap();
+        let (id, body) = parse_transfer_request_body(&env).unwrap();
+        assert_eq!(id.to_string(), RID);
+        assert_eq!(body.offer_id.to_string(), OFFER);
+        assert_eq!(body.entry_ids, vec!["0".to_string()]);
+        assert_eq!(body.mode, "raw");
+        assert!(body.resume.is_none());
+        // unsorted/duplicated IDs, bad mode shape, oversized resume rejected
+        for bad in [
+            serde_json::json!({"offerId": OFFER, "entryIds": ["1", "0"], "selectionDigest": HEX64, "mode": "raw"}),
+            serde_json::json!({"offerId": OFFER, "entryIds": ["0", "0"], "selectionDigest": HEX64, "mode": "raw"}),
+            serde_json::json!({"offerId": OFFER, "entryIds": ["0"], "selectionDigest": HEX64, "mode": "raw", "extra": 1}),
+        ] {
+            let env = parse_client_envelope(&envelope("transfer.request", Some(RID), bad)).unwrap();
+            assert!(parse_transfer_request_body(&env).is_err());
+        }
+        // resume descriptor bounds
+        let resume_ok: serde_json::Value = serde_json::json!({
+            "verifiedRanges": [[0, 4], [8, 9]],
+            "outputLength": 11,
+        });
+        parse_resume_descriptor(&resume_ok).unwrap();
+        assert!(parse_resume_descriptor(
+            &serde_json::json!({"verifiedRanges": [[5, 3]], "outputLength": 0})
+        )
+        .is_err());
+        assert!(parse_resume_descriptor(
+            &serde_json::json!({"verifiedRanges": [[0, 4], [2, 9]], "outputLength": 0})
+        )
+        .is_err());
+        // ready / reject / cancel / complete
+        let env = parse_client_envelope(&envelope(
+            "transfer.source_ready",
+            Some(RID),
+            serde_json::json!({"transferId": TRANSFER, "attemptId": ATTEMPT, "selectionDigest": HEX64}),
+        ))
+        .unwrap();
+        let (_, ready) = parse_source_ready_body(&env).unwrap();
+        assert_eq!(ready.transfer_id.to_string(), TRANSFER);
+        let env = parse_client_envelope(&envelope(
+            "transfer.reject",
+            Some(RID),
+            serde_json::json!({"transferId": TRANSFER}),
+        ))
+        .unwrap();
+        assert!(parse_reject_body(&env).is_ok());
+        let env = parse_client_envelope(&envelope(
+            "transfer.cancel",
+            Some(RID),
+            serde_json::json!({"transferId": TRANSFER}),
+        ))
+        .unwrap();
+        assert!(parse_cancel_body(&env).is_ok());
+        let env = parse_client_envelope(&envelope(
+            "transfer.complete",
+            Some(RID),
+            serde_json::json!({"transferId": TRANSFER, "attemptId": ATTEMPT, "root": HEX64}),
+        ))
+        .unwrap();
+        let (_, complete) = parse_complete_body(&env).unwrap();
+        assert_eq!(complete.attempt_id.to_string(), ATTEMPT);
+        // builders round-trip through the server envelope parser
+        let peer: PeerId = "11111111111111111111111111111111".parse().unwrap();
+        let offer: OfferId = OFFER.parse().unwrap();
+        let transfer: TransferId = TRANSFER.parse().unwrap();
+        let attempt: AttemptId = ATTEMPT.parse().unwrap();
+        for (typ, raw) in [
+            (
+                "transfer.incoming",
+                transfer_incoming_envelope(transfer, offer, peer, attempt, "raw"),
+            ),
+            (
+                "transfer.relay_ticket",
+                transfer_relay_ticket_envelope(transfer, attempt, &"ab".repeat(16)),
+            ),
+            (
+                "transfer.cancelled",
+                transfer_cancelled_envelope(transfer, peer),
+            ),
+            (
+                "transfer.completed",
+                transfer_completed_envelope(transfer, &[7u8; 32]),
+            ),
+            (
+                "transfer.path_commit",
+                transfer_path_commit_envelope(transfer, attempt, "relay", &[]),
+            ),
+        ] {
+            let env = parse_server_envelope(&raw).unwrap();
+            assert_eq!(env.typ, typ);
+        }
+        let commit: serde_json::Value = serde_json::from_str(&transfer_path_commit_envelope(
+            transfer,
+            attempt,
+            "relay",
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(commit["body"]["path"].as_str(), Some("relay"));
+        assert_eq!(commit["body"]["attemptId"].as_str(), Some(ATTEMPT));
+        // A recipient holding nothing gets the Phase 3.1 envelope unchanged;
+        // ranges appear only when there is something for the source to skip.
+        assert!(commit["body"].get("resumeRanges").is_none());
+        let resumed: serde_json::Value = serde_json::from_str(&transfer_path_commit_envelope(
+            transfer,
+            attempt,
+            "relay",
+            &[(0, 4), (8, 9)],
+        ))
+        .unwrap();
+        assert_eq!(
+            resumed["body"]["resumeRanges"],
+            serde_json::json!([[0, 4], [8, 9]])
+        );
+        // selection digest is deterministic and input-sensitive
+        let mac = [0xeeu8; 32];
+        let first = selection_digest(&offer, &mac, &["0".to_string()], "raw");
+        assert_eq!(
+            selection_digest(&offer, &mac, &["0".to_string()], "raw"),
+            first
+        );
+        assert_ne!(
+            selection_digest(&offer, &mac, &["1".to_string()], "raw"),
+            first
+        );
+        assert_ne!(
+            selection_digest(&offer, &[0xefu8; 32], &["0".to_string()], "raw"),
+            first
+        );
+    }
+}
+
+#[cfg(test)]
+mod direct_signaling_body_tests {
+    use super::*;
+
+    fn envelope(typ: &str, body: serde_json::Value) -> ParsedEnvelope {
+        let raw = serde_json::json!({
+            "v": 1,
+            "type": typ,
+            "requestId": "dddddddddddddddddddddddddddddddd",
+            "body": body,
+        })
+        .to_string();
+        parse_client_envelope(&raw).unwrap()
+    }
+
+    const TID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const AID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn sdp_bodies_bound_bytes_and_reject_foreign_fields() {
+        let ok = envelope(
+            "rtc.offer",
+            serde_json::json!({
+                "transferId": TID, "attemptId": AID, "sdp": "v=0",
+            }),
+        );
+        let (_, body) = parse_rtc_sdp_body(&ok, "rtc.offer").unwrap();
+        assert_eq!(body.sdp, "v=0");
+        // A body for the other type does not parse as this one.
+        assert!(parse_rtc_sdp_body(&ok, "rtc.answer").is_err());
+        for bad in [
+            serde_json::json!({"transferId": TID, "attemptId": AID, "sdp": ""}),
+            serde_json::json!({"transferId": TID, "attemptId": AID, "sdp": 5}),
+            serde_json::json!({"transferId": TID, "attemptId": AID}),
+            serde_json::json!({"transferId": TID, "attemptId": AID, "sdp": "v=0", "type": "offer"}),
+            serde_json::json!({"transferId": "nope", "attemptId": AID, "sdp": "v=0"}),
+        ] {
+            let env = envelope("rtc.offer", bad);
+            assert!(parse_rtc_sdp_body(&env, "rtc.offer").is_err());
+        }
+        // Exactly at the cap parses; one byte over does not.
+        let at_cap = "x".repeat(crate::web_transfer::WEB_TRANSFER_MAX_SDP_BYTES);
+        let env = envelope(
+            "rtc.offer",
+            serde_json::json!({
+                "transferId": TID, "attemptId": AID, "sdp": at_cap,
+            }),
+        );
+        assert!(parse_rtc_sdp_body(&env, "rtc.offer").is_ok());
+        let over = "x".repeat(crate::web_transfer::WEB_TRANSFER_MAX_SDP_BYTES + 1);
+        let env = envelope(
+            "rtc.offer",
+            serde_json::json!({
+                "transferId": TID, "attemptId": AID, "sdp": over,
+            }),
+        );
+        assert!(parse_rtc_sdp_body(&env, "rtc.offer").is_err());
+    }
+
+    #[test]
+    fn ice_bodies_normalize_the_end_marker_and_bound_every_field() {
+        // Absent, null and empty are one marker with one wire shape.
+        for marker in [
+            serde_json::json!({"transferId": TID, "attemptId": AID}),
+            serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": null}),
+            serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": ""}),
+        ] {
+            let env = envelope("rtc.ice", marker);
+            let (_, body) = parse_rtc_ice_body(&env).unwrap();
+            assert!(body.is_end_of_candidates());
+            let out: serde_json::Value = serde_json::from_str(&rtc_ice_envelope(&body)).unwrap();
+            assert!(out["body"]["candidate"].is_null());
+            assert!(out["body"].get("sdpMid").is_none());
+        }
+        let env = envelope(
+            "rtc.ice",
+            serde_json::json!({
+                "transferId": TID, "attemptId": AID,
+                "candidate": "candidate:1 1 udp", "sdpMid": "0", "sdpMLineIndex": 0,
+            }),
+        );
+        let (_, body) = parse_rtc_ice_body(&env).unwrap();
+        assert_eq!(body.candidate.as_deref(), Some("candidate:1 1 udp"));
+        assert_eq!(body.sdp_m_line_index, Some(0));
+        let long_candidate =
+            "c".repeat(crate::web_transfer::WEB_TRANSFER_MAX_ICE_CANDIDATE_BYTES + 1);
+        let long_mid = "m".repeat(crate::web_transfer::WEB_TRANSFER_MAX_ICE_SDP_MID_BYTES + 1);
+        for bad in [
+            serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": long_candidate}),
+            serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": "c", "sdpMid": long_mid}),
+            serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": "c", "sdpMLineIndex": 70000}),
+            serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": "c", "sdpMLineIndex": -1}),
+            serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": 7}),
+            // A marker that also names a media section is nobody's shape.
+            serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": null, "sdpMid": "0"}),
+        ] {
+            let env = envelope("rtc.ice", bad);
+            assert!(parse_rtc_ice_body(&env).is_err());
+        }
+    }
+
+    #[test]
+    fn direct_failure_reasons_are_a_fixed_set_and_ranges_are_bounded() {
+        // A peer's own string never travels: it is mapped or it is unknown.
+        assert_eq!(direct_fail_reason(Some("ice-failed")), "ice-failed");
+        assert_eq!(
+            direct_fail_reason(Some("<script>alert(1)</script>")),
+            "unknown"
+        );
+        assert_eq!(direct_fail_reason(None), "unknown");
+        let env = envelope(
+            "transfer.direct_failed",
+            serde_json::json!({
+                "transferId": TID, "attemptId": AID,
+                "reason": "totally made up",
+                "resumeRanges": [[2, 4], [0, 2]],
+            }),
+        );
+        let (_, body) = parse_direct_failed_body(&env).unwrap();
+        assert_eq!(body.reason, "unknown");
+        // Sorted and merged by the shared range parser, exactly as a resume
+        // descriptor on `transfer.request` would be.
+        assert_eq!(body.verified_ranges, vec![(0, 2), (2, 4)]);
+        for bad in [
+            serde_json::json!({"transferId": TID, "attemptId": AID, "resumeRanges": [[4, 2]]}),
+            serde_json::json!({"transferId": TID, "attemptId": AID, "resumeRanges": [[0, 3], [1, 4]]}),
+            serde_json::json!({"transferId": TID, "attemptId": AID, "resumeRanges": [[0]]}),
+            serde_json::json!({"transferId": TID, "attemptId": AID, "extra": 1}),
+        ] {
+            let env = envelope("transfer.direct_failed", bad);
+            assert!(parse_direct_failed_body(&env).is_err());
+        }
+        let ranges = vec![(0u64, 2u64)];
+        let out: serde_json::Value = serde_json::from_str(&transfer_direct_failed_envelope(
+            TID.parse().unwrap(),
+            AID.parse().unwrap(),
+            "not a code",
+            &ranges,
+        ))
+        .unwrap();
+        assert_eq!(out["body"]["reason"].as_str(), Some("unknown"));
+        assert_eq!(out["body"]["resumeRanges"][0][1].as_u64(), Some(2));
+        // Nothing to resume means the field is absent, not an empty array.
+        let out: serde_json::Value = serde_json::from_str(&transfer_direct_failed_envelope(
+            TID.parse().unwrap(),
+            AID.parse().unwrap(),
+            "timeout",
+            &[],
+        ))
+        .unwrap();
+        assert!(out["body"].get("resumeRanges").is_none());
+    }
+
+    #[test]
+    fn direct_start_and_ready_envelopes_carry_the_fixed_contract() {
+        let out: serde_json::Value = serde_json::from_str(&transfer_direct_start_envelope(
+            TID.parse().unwrap(),
+            AID.parse().unwrap(),
+            3,
+            "offerer",
+            &["stun:stun.example:3478".to_string()],
+            10_000,
+        ))
+        .unwrap();
+        assert_eq!(out["type"].as_str(), Some("transfer.direct_start"));
+        assert_eq!(out["body"]["role"].as_str(), Some("offerer"));
+        assert_eq!(out["body"]["attemptNumber"].as_u64(), Some(3));
+        assert_eq!(out["body"]["deadlineMs"].as_u64(), Some(10_000));
+        assert_eq!(
+            out["body"]["iceServers"][0].as_str(),
+            Some("stun:stun.example:3478")
+        );
+        assert!(out.get("requestId").is_none());
+        // It parses back as a server message, so the fixture and the wire
+        // agree about which direction each of these names travels in.
+        let raw = transfer_direct_start_envelope(
+            TID.parse().unwrap(),
+            AID.parse().unwrap(),
+            1,
+            "answerer",
+            &[],
+            10_000,
+        );
+        assert!(parse_server_envelope(&raw).is_ok());
+        for typ in [
+            "rtc.offer",
+            "rtc.answer",
+            "rtc.ice",
+            "transfer.direct_failed",
+        ] {
+            assert!(SERVER_TYPES.contains(&typ), "{typ} must be forwardable");
+            assert!(CLIENT_TYPES.contains(&typ), "{typ} must be sendable");
+        }
+        let env = envelope(
+            "transfer.direct_ready",
+            serde_json::json!({
+                "transferId": TID, "attemptId": AID,
+            }),
+        );
+        let (_, id, attempt) = parse_direct_ready_body(&env).unwrap();
+        assert_eq!(id.to_string(), TID);
+        assert_eq!(attempt.to_string(), AID);
+        let env = envelope(
+            "transfer.direct_ready",
+            serde_json::json!({
+                "transferId": TID, "attemptId": AID, "why": "no",
+            }),
+        );
+        assert!(parse_direct_ready_body(&env).is_err());
     }
 }

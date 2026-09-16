@@ -36,16 +36,44 @@ export function createOfferManager({ createWorker, roomIdHex, roomKeyHex, sendCo
       .slice(-32);
   }
 
-  function labelFor(kind, files) {
+  function labelFor(kind, entries) {
     if (kind === "file") {
-      return files[0].name || "file";
+      return entries[0].file?.name || entries[0].path || "file";
     }
     if (kind === "folder") {
-      const first = files[0].webkitRelativePath || files[0].name || "";
-      const top = first.split("/").filter(Boolean)[0];
-      return top || `${files.length} files`;
+      const top = (entries[0].path ?? "").split("/").filter(Boolean)[0];
+      return top || `${entries.length} files`;
     }
-    return `${files.length} files`;
+    return `${entries.length} files`;
+  }
+
+  /**
+   * One selection shape for every intake. A caller may still pass plain
+   * `File` objects (the picker and the drop did, before folders existed) and
+   * they are adapted here, so there is exactly ONE representation past this
+   * point and no branch downstream can see the difference.
+   */
+  function normalizeSelection(items) {
+    return [...items].map((item) => {
+      if (item !== null && typeof item === "object" && typeof item.path === "string") {
+        return item.directory === true
+          ? { directory: true, path: item.path, mtimeSec: item.mtimeSec ?? 0, file: null }
+          : { directory: false, path: item.path, mtimeSec: 0, file: item.file };
+      }
+      const relative =
+        typeof item?.webkitRelativePath === "string" && item.webkitRelativePath !== ""
+          ? item.webkitRelativePath
+          : item?.name;
+      if (typeof relative !== "string" || relative === "") {
+        throw new Error("selezione non valida");
+      }
+      return {
+        directory: false,
+        path: relative.startsWith("/") ? relative.slice(1) : relative,
+        mtimeSec: 0,
+        file: item,
+      };
+    });
   }
 
   const manager = {
@@ -66,6 +94,9 @@ export function createOfferManager({ createWorker, roomIdHex, roomKeyHex, sendCo
         return false;
       }
       for (const seen of record.observed) {
+        if (seen.directory === true) {
+          continue;
+        }
         const current = record.files.get(seen.path);
         if (
           !current ||
@@ -95,7 +126,12 @@ export function createOfferManager({ createWorker, roomIdHex, roomKeyHex, sendCo
      * sending anything.
      */
     prepareSelection({ kind, files, label = null }) {
-      const list = [...files];
+      let list;
+      try {
+        list = normalizeSelection(files);
+      } catch (error) {
+        return { error: String(error?.message ?? error) };
+      }
       if (list.length === 0) {
         return { error: "Seleziona almeno un file" };
       }
@@ -105,13 +141,19 @@ export function createOfferManager({ createWorker, roomIdHex, roomKeyHex, sendCo
       if (kind === "file" && list.length !== 1) {
         return { error: "Un solo file per questa offerta" };
       }
+      // A directory entry describes something only a TREE can hold, and the
+      // server refuses one under any other kind — so refusing it here keeps
+      // the local error legible instead of arriving as a publish rejection.
+      if (kind !== "folder" && list.some((entry) => entry.directory)) {
+        return { error: "Le cartelle richiedono un'offerta cartella" };
+      }
       // Duplicate (case-insensitive, NFC) paths collapse the file map, so
       // they fail here — before any hashing — exactly like the worker and
       // the server would reject them.
       {
         const seen = new Set();
-        for (const file of list) {
-          const fold = workerRelativePath(file).normalize("NFC").toLowerCase();
+        for (const entry of list) {
+          const fold = entry.path.normalize("NFC").toLowerCase();
           if (seen.has(fold)) {
             return { error: "File duplicati nella selezione" };
           }
@@ -127,8 +169,8 @@ export function createOfferManager({ createWorker, roomIdHex, roomKeyHex, sendCo
       }
       let total = 0n;
       try {
-        for (const file of list) {
-          total += BigInt(file.size);
+        for (const entry of list) {
+          total += entry.directory ? 0n : BigInt(entry.file.size);
         }
       } catch {
         return { error: "File non leggibile" };
@@ -144,7 +186,11 @@ export function createOfferManager({ createWorker, roomIdHex, roomKeyHex, sendCo
         kind,
         label: label ?? labelFor(kind, list),
         createdAt: new Date().toISOString(),
-        files: new Map(list.map((file) => [fileKey(file), { file }])),
+        files: new Map(
+          list
+            .filter((entry) => !entry.directory)
+            .map((entry) => [entry.path, { file: entry.file }]),
+        ),
         status: "preparing",
         manifest: null,
         macHex: null,
@@ -159,10 +205,11 @@ export function createOfferManager({ createWorker, roomIdHex, roomKeyHex, sendCo
           kind,
           label: record.label,
           createdAt: record.createdAt,
-          files: list.map((file) => ({
-            file,
-            relativePath: workerRelativePath(file),
-          })),
+          files: list.map((entry) =>
+            entry.directory
+              ? { directory: true, relativePath: entry.path, mtimeSec: entry.mtimeSec }
+              : { file: entry.file, relativePath: entry.path },
+          ),
           roomIdHex,
           roomKeyHex,
           limits: caps,
@@ -237,10 +284,12 @@ export function createOfferManager({ createWorker, roomIdHex, roomKeyHex, sendCo
         record.macHex = message.macHex;
         record.observed = message.observed;
         record.files = new Map(
-          message.observed.map((seen) => {
-            const kept = record.files.get(seen.path);
-            return [seen.path, kept ?? { file: null }];
-          }),
+          message.observed
+            .filter((seen) => seen.directory !== true)
+            .map((seen) => {
+              const kept = record.files.get(seen.path);
+              return [seen.path, kept ?? { file: null }];
+            }),
         );
         record.status = "ready";
         const rid = requestId();
@@ -329,13 +378,4 @@ export function createOfferManager({ createWorker, roomIdHex, roomKeyHex, sendCo
 
   return manager;
 
-  function fileKey(file) {
-    const relative =
-      file.webkitRelativePath && file.webkitRelativePath !== "" ? file.webkitRelativePath : file.name;
-    return relative.startsWith("/") ? relative.slice(1) : relative;
-  }
-
-  function workerRelativePath(file) {
-    return fileKey(file);
-  }
 }

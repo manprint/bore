@@ -106,6 +106,9 @@ ip netns exec ns0 "$BORE" server \
     --vhost-http-port "$VHOST_HTTP_PORT" \
     --vhost-https-port "$VHOST_HTTPS_PORT" \
     --secret "$SERVER_SECRET" \
+    --web-transfer-base-url "https://$SRV_IP:$CTRL_PORT/" \
+    --web-transfer-max-rooms 5 \
+    --web-transfer-max-relays 2 \
     >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -577,6 +580,87 @@ else
 fi
 [ "$authfail_ok" = "true" ] && pass "T-AUTHFAIL-E2E auth_failures >= 3 after wrong-secret attempts" \
     || fail "T-AUTHFAIL-E2E auth_failures too low ($failures); body=$BODY"
+
+# ── Web Transfer group (plan 001 sub-phase 6.2) ──────────────────────────────
+# The dashboard's Web Transfer section is driven ENTIRELY by these keys, and
+# the null-vs-zero rule (P-11) is what decides whether the section renders at
+# all: `null` means this server does not run web transfer, `0` means it does
+# and there is nothing right now. A harness that only checked "the key exists"
+# would pass on the exact confusion the rule exists to prevent.
+R=$(aget /admin/api/v1/config "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+webcfg_ok=false
+if $JQ_AVAIL; then
+    if echo "$BODY" | jq -e '.web_transfer_enabled == true
+                             and .web_transfer_max_rooms == 5
+                             and .web_transfer_max_relays == 2
+                             and (.web_transfer_stun_count | type) == "number"
+                             and (.web_transfer_base_origin | type) == "string"' >/dev/null 2>&1; then
+        webcfg_ok=true
+    fi
+else
+    echo "$BODY" | grep -q '"web_transfer_enabled":true' \
+        && echo "$BODY" | grep -q '"web_transfer_max_rooms":5' \
+        && echo "$BODY" | grep -q '"web_transfer_max_relays":2' \
+        && webcfg_ok=true
+fi
+[ "$webcfg_ok" = "true" ] && pass "T-WEBUI-E2E config publishes the CONFIGURED web-transfer totals" \
+    || fail "T-WEBUI-E2E config web-transfer totals missing/wrong; body=$BODY"
+
+# The STUN list itself is infrastructure and must never reach the admin view —
+# only its COUNT does (a list is a fingerprint of the deployment).
+echo "$BODY" | grep -q '"stun:' \
+    && fail "T-WEBUI-E2E the STUN server list reached /config; body=$BODY" \
+    || pass "T-WEBUI-E2E /config publishes a STUN count, never the list"
+
+# Live gauges: present, numeric, and ZERO on an idle server — never null, which
+# on this endpoint means "the feature is off" and would hide the section.
+R=$(aget /admin/api/v1/metrics "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+webmet_ok=false
+if $JQ_AVAIL; then
+    if echo "$BODY" | jq -e '.web_transfer_rooms_current == 0
+                             and .web_transfer_peers_current == 0
+                             and .web_transfer_offers_current == 0
+                             and .web_transfer_metadata_bytes_current == 0
+                             and .web_transfer_transfers_active == 0
+                             and .web_transfer_relays_active == 0
+                             and .web_transfer_relay_slots_available == 2
+                             and .web_transfer_relay_ciphertext_bytes_total == 0
+                             and .web_transfer_direct_commits_total == 0
+                             and .web_transfer_relay_commits_total == 0
+                             and .web_transfer_completed_total == 0
+                             and .web_transfer_cancelled_total == 0
+                             and .web_transfer_rejected_total == 0' >/dev/null 2>&1; then
+        webmet_ok=true
+    fi
+else
+    echo "$BODY" | grep -q '"web_transfer_rooms_current":0' \
+        && echo "$BODY" | grep -q '"web_transfer_relay_slots_available":2' \
+        && echo "$BODY" | grep -q '"web_transfer_rejected_total":0' \
+        && webmet_ok=true
+fi
+[ "$webmet_ok" = "true" ] && pass "T-WEBUI-E2E metrics publish every web-transfer gauge as a visible zero" \
+    || fail "T-WEBUI-E2E web-transfer gauges missing/null/non-zero; body=$BODY"
+
+# The room surface answers on the same origin the config advertises, which is
+# what the dashboard's link is for: a section that reports a service nobody can
+# reach is worse than no section. The asset is the right probe — `/transfer/`
+# with no room id is a malformed path BY DESIGN (a room shell exists only for a
+# room), so a 200 there would mean the router lost its shape.
+# The request must carry the ADVERTISED host: the web surface is same-origin
+# by construction and a request for `127.0.0.1` falls through to the admin
+# chain, which is the correct answer to a wrong Host and not a missing asset.
+code=$(ip netns exec ns0 curl -sk -o /dev/null -w '%{http_code}' \
+    "https://$SRV_IP:$CTRL_PORT/transfer/assets/app.js" 2>/dev/null)
+[ "$code" = "200" ] && pass "T-WEBUI-E2E the advertised web-transfer origin serves the room app" \
+    || fail "T-WEBUI-E2E /transfer/assets/app.js answered $code"
+
+# The dashboard bundle must actually CONTAIN the section — the API half above
+# is only useful if the page renders it, and the asset is embedded at compile
+# time so a stale bundle is invisible from the API side.
+R=$(aget /admin/ui/panels/metrics.js "$ADMIN_TOKEN"); BODY=$(body_of "$R")
+echo "$BODY" | grep -q 'web_transfer_rooms_current' \
+    && pass "T-WEBUI-E2E the served metrics panel renders the Web Transfer section" \
+    || fail "T-WEBUI-E2E the served metrics panel has no Web Transfer section"
 
 # T-VPNFLAGS-E2E: VPN requires --features vpn + netns harness.
 # ASSESSMENT: VPN flag display is covered by Rust unit tests (T-VPNFLAGS in admin_views.rs)

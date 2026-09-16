@@ -1315,6 +1315,35 @@ enum TransferCommand {
         #[clap(long, default_value_t = 60)]
         stall_timeout: u64,
     },
+
+    /// Open a browser-to-browser transfer room and hold it until Ctrl+C.
+    ///
+    /// Selects no file: the room URL is a capability every browser peer uses
+    /// to publish and download. The URL fragment holds the room key and the
+    /// member token, so it never reaches the server, the logs or the admin API.
+    Web {
+        /// Address of the remote server hosting the room.
+        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER", default_value = DEFAULT_SERVER)]
+        to: String,
+
+        /// Optional secret for authentication.
+        #[clap(
+            short,
+            long,
+            value_name = "SECRET",
+            env = "BORE_SECRET",
+            hide_env_values = true
+        )]
+        secret: Option<String>,
+
+        /// Skip TLS certificate verification (for self-signed https:// servers).
+        #[clap(long, env = "BORE_INSECURE")]
+        insecure: bool,
+
+        /// Open the room URL in the default browser once it is on stdout.
+        #[clap(long)]
+        open: bool,
+    },
 }
 
 #[cfg(all(
@@ -1682,6 +1711,18 @@ async fn run(command: Command) -> Result<()> {
     // Race the command against a shutdown signal so Ctrl-C / SIGTERM (e.g.
     // `docker stop`, systemd) exit cleanly with a log line instead of an abrupt
     // kill mid-transfer.
+    // `bore transfer web` owns its own signal lifecycle: the first signal
+    // must DESTROY the room (bounded close) and only a second may force the
+    // process out. The generic race below just returns, which would leave the
+    // room alive on the server for the whole owner grace.
+    if matches!(
+        &command,
+        Command::Transfer {
+            command: TransferCommand::Web { .. }
+        }
+    ) {
+        return dispatch(command).await;
+    }
     tokio::select! {
         res = dispatch(command) => res,
         _ = shutdown_signal() => {
@@ -2099,6 +2140,23 @@ async fn dispatch(command: Command) -> Result<()> {
                 })
                 .await?;
             }
+            TransferCommand::Web {
+                to,
+                secret,
+                insecure,
+                open,
+            } => {
+                bore_cli::web_transfer_cli::run_web_transfer(
+                    bore_cli::web_transfer_cli::OwnerClientConfig {
+                        endpoint: to,
+                        secret,
+                        insecure,
+                        open_browser: open,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
         },
         #[cfg(all(
             feature = "vpn",
@@ -2353,6 +2411,18 @@ async fn dispatch(command: Command) -> Result<()> {
                 udp,
                 control_port,
             )?;
+            // The browser surface holds descriptors of its own — one per room
+            // lease, one per peer control socket and TWO per relay pair — and
+            // they are admitted by their own semaphores, so `--max-conns` does
+            // not see them. Computed here, while the resolved config is still
+            // in hand, and applied to the descriptor reconciliation below.
+            let web_fds = web_transfer_config.as_ref().map(|config| {
+                bore_cli::fdlimit::web_transfer_fds(
+                    config.limits.max_rooms,
+                    config.limits.max_peers_global,
+                    config.limits.max_relays_global,
+                )
+            });
             if let Some(config) = web_transfer_config {
                 server.set_web_transfer(config)?;
             }
@@ -2386,7 +2456,10 @@ async fn dispatch(command: Command) -> Result<()> {
             // EVERY listener — admin API included. Reconcile the two before the
             // first listener is bound (campaign §11 measured the unreconciled
             // case in the field).
-            bore_cli::fdlimit::reconcile_fd_limit(max_conns);
+            bore_cli::fdlimit::reconcile_fd_limit_with_web(
+                bore_cli::fdlimit::conn_bound_with_web(max_conns, web_fds),
+                web_fds.unwrap_or(0),
+            );
             server.set_max_conns(max_conns);
             server.set_max_carriers(max_carriers);
             let mut udp_tuning = parse_udp_tuning(
@@ -2576,6 +2649,21 @@ async fn dispatch(command: Command) -> Result<()> {
                 udp_direct_slots: None,
                 web_transfer_enabled: false,
                 web_transfer_base_origin: None,
+                // `set_web_transfer` fills every total when the service is
+                // enabled; a disabled server publishes null, never a zero.
+                web_transfer_max_rooms: None,
+                web_transfer_max_peers: None,
+                web_transfer_max_peers_per_room: None,
+                web_transfer_max_offers_per_peer: None,
+                web_transfer_max_entries_per_offer: None,
+                web_transfer_max_offer_bytes: None,
+                web_transfer_max_metadata_per_room: None,
+                web_transfer_max_metadata_total: None,
+                web_transfer_max_transfers_per_peer: None,
+                web_transfer_max_relays: None,
+                web_transfer_relay_rate_bytes_per_second: None,
+                web_transfer_owner_grace_seconds: None,
+                web_transfer_stun_count: None,
                 bind_domain: bind_domain.clone(),
                 control_hsts,
                 #[cfg(feature = "vpn")]
@@ -3937,6 +4025,168 @@ mod tests {
             Some(value) => std::env::set_var("BORE_SERVER", value),
             None => std::env::remove_var("BORE_SERVER"),
         }
+    }
+
+    /// Every flag `bore transfer web` documents parses with the documented
+    /// default, and nothing undocumented does: this command selects no file
+    /// and carries no transport knob, so an accidentally inherited flag
+    /// would be a promise the browser path cannot keep.
+    #[test]
+    fn transfer_web_cli_accepts_only_documented_flags() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = std::env::var_os("BORE_SERVER");
+        std::env::remove_var("BORE_SERVER");
+
+        // Bare command: valid, with the project's public default endpoint.
+        let args = Args::parse_from(["bore", "transfer", "web"]);
+        let Command::Transfer {
+            command:
+                TransferCommand::Web {
+                    to,
+                    secret,
+                    insecure,
+                    open,
+                },
+        } = args.command
+        else {
+            panic!("expected transfer web command");
+        };
+        assert_eq!(to, DEFAULT_SERVER);
+        assert_eq!(secret, None);
+        assert!(!insecure);
+        assert!(!open);
+
+        // All four documented flags together.
+        let args = Args::parse_from([
+            "bore",
+            "transfer",
+            "web",
+            "--to",
+            "https://rooms.example.test",
+            "--secret",
+            "s3cr3t",
+            "--insecure",
+            "--open",
+        ]);
+        let Command::Transfer {
+            command:
+                TransferCommand::Web {
+                    to,
+                    secret,
+                    insecure,
+                    open,
+                },
+        } = args.command
+        else {
+            panic!("expected transfer web command");
+        };
+        assert_eq!(to, "https://rooms.example.test");
+        assert_eq!(secret.as_deref(), Some("s3cr3t"));
+        assert!(insecure);
+        assert!(open);
+
+        // Everything else is refused, including a file selection, a transport
+        // knob and a positional argument.
+        for bad in [
+            vec!["--dest-path", "/tmp/inbox"],
+            vec!["--sources", "/etc/hosts"],
+            vec!["--relay-only"],
+            vec!["--carriers", "4"],
+            vec!["--parallel", "8"],
+            vec!["--transfer-id", "room"],
+            vec!["--room", "name"],
+            vec!["/etc/hosts"],
+        ] {
+            let mut argv = vec!["bore", "transfer", "web"];
+            argv.extend(bad.iter().copied());
+            assert!(
+                Args::try_parse_from(&argv).is_err(),
+                "`bore transfer web` must refuse {bad:?}"
+            );
+        }
+
+        match saved {
+            Some(value) => std::env::set_var("BORE_SERVER", value),
+            None => std::env::remove_var("BORE_SERVER"),
+        }
+    }
+
+    /// The two pre-existing transfer modes keep their exact flag set and
+    /// their exact order. A third mode must be additive on the wire AND on
+    /// the command line: a moved or renamed flag breaks somebody's script.
+    #[test]
+    fn transfer_listener_sender_cli_snapshots_unchanged() {
+        let command = Args::command();
+        let transfer = command
+            .get_subcommands()
+            .find(|sub| sub.get_name() == "transfer")
+            .expect("transfer subcommand");
+        let flags = |name: &str| -> Vec<String> {
+            transfer
+                .get_subcommands()
+                .find(|sub| sub.get_name() == name)
+                .unwrap_or_else(|| panic!("{name} subcommand"))
+                .get_arguments()
+                .filter_map(|arg| arg.get_long())
+                .filter(|long| *long != "help" && *long != "verbose")
+                .map(String::from)
+                .collect()
+        };
+        assert_eq!(
+            flags("listener"),
+            [
+                "dest-path",
+                "to",
+                "secret",
+                "transfer-id",
+                "insecure",
+                "relay-only",
+                "stun-server",
+                "upnp",
+                "try-port-prediction",
+                "nat-udp-preferred-port",
+                "nat-udp-release-timeout",
+                "carriers",
+                "overwrite",
+                "rename",
+                "persistent",
+                "ask-confirm",
+                "confirm-timeout",
+                "stall-timeout",
+                "no-fsync",
+            ]
+        );
+        assert_eq!(
+            flags("sender"),
+            [
+                "sources",
+                "source-files",
+                "ask-confirm",
+                "output",
+                "to",
+                "secret",
+                "transfer-id",
+                "insecure",
+                "relay-only",
+                "stun-server",
+                "upnp",
+                "try-port-prediction",
+                "nat-udp-preferred-port",
+                "nat-udp-release-timeout",
+                "carriers",
+                "parallel",
+                "symlinks",
+                "devices",
+                "stall-timeout",
+            ]
+        );
+        // Help ordering: the new mode comes last, so no existing entry moved.
+        let modes: Vec<&str> = transfer
+            .get_subcommands()
+            .map(|sub| sub.get_name())
+            .filter(|name| *name != "help")
+            .collect();
+        assert_eq!(modes, ["listener", "sender", "web"]);
     }
 
     #[test]

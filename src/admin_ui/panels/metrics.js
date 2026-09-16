@@ -245,6 +245,55 @@ export default {
         countsSection.appendChild(countsCard);
         container.appendChild(countsSection);
 
+        // Web Transfer. The whole section appears only when the service is
+        // enabled: every field is `null` on a server without it, and a row of
+        // zeros would claim a browser surface that does not exist. Inside the
+        // section the test is `!= null` and never truthiness — a live gauge
+        // reading 0 (no free relay slot, for instance) is the value an
+        // operator most needs to see, and truthiness hides exactly it (P-11).
+        if (data.web_transfer_rooms_current !== undefined && data.web_transfer_rooms_current !== null) {
+            const webSection = document.createElement('div');
+            webSection.className = 'metrics-counts';
+            const webCard = document.createElement('div');
+            webCard.className = 'card';
+            const webTitle = document.createElement('div');
+            webTitle.className = 'count-label';
+            webTitle.textContent = 'Web Transfer';
+            webCard.appendChild(webTitle);
+            const webList = document.createElement('div');
+            webList.className = 'counts-list';
+
+            const webRow = (label, value, format) => {
+                if (value === undefined || value === null) return;
+                const row = document.createElement('div');
+                row.className = 'count-row';
+                const shown = format ? format(value) : String(value);
+                row.innerHTML = `
+                    <span class="count-label">${escapeHtml(label)}</span>
+                    <span class="count-value">${escapeHtml(shown)}</span>
+                `;
+                webList.appendChild(row);
+            };
+
+            webRow('Rooms', data.web_transfer_rooms_current);
+            webRow('Peers', data.web_transfer_peers_current);
+            webRow('Offers', data.web_transfer_offers_current);
+            webRow('Catalog Metadata', data.web_transfer_metadata_bytes_current, fmtBytes);
+            webRow('Transfers Active', data.web_transfer_transfers_active);
+            webRow('Relays Active', data.web_transfer_relays_active);
+            webRow('Relay Slots Free', data.web_transfer_relay_slots_available);
+            webRow('Relay Ciphertext', data.web_transfer_relay_ciphertext_bytes_total, fmtBytes);
+            webRow('Direct Commits', data.web_transfer_direct_commits_total);
+            webRow('Relay Commits', data.web_transfer_relay_commits_total);
+            webRow('Completed', data.web_transfer_completed_total);
+            webRow('Cancelled', data.web_transfer_cancelled_total);
+            webRow('Rejected', data.web_transfer_rejected_total);
+
+            webCard.appendChild(webList);
+            webSection.appendChild(webCard);
+            container.appendChild(webSection);
+        }
+
         el.appendChild(container);
     }
 };

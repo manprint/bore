@@ -1,7 +1,9 @@
-//! Owner lease client for `bore transfer web` rooms (Phase 1.4).
+//! Owner lease client and public run path for `bore transfer web` rooms
+//! (Phases 1.4 and 3.6).
 //!
-//! Internal API exercised by `T-WEB-OWNER-LEASE`; the public `bore transfer
-//! web` command arrives in Phase 3 and reuses exactly this loop. Generates
+//! Exercised by `T-WEB-OWNER-LEASE` and `T-WEB-CLI`; the command reuses
+//! exactly this loop and adds stdout, the browser open and OS signals on top
+//! of it — the lease itself never writes to stdout. Generates
 //! the room secrets once, holds the owner lease across reconnects (resume
 //! only, never a silent replacement room) and destroys the room on clean
 //! lifecycle events. Every log/error line carries the room ID and phase only
@@ -9,6 +11,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -31,6 +34,14 @@ pub const OWNER_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 pub const RESUME_BACKOFF: &[u64] = &[250, 500, 1000, 2000, 4000];
 /// Backoff ceiling once the ladder is exhausted.
 pub const RESUME_BACKOFF_MAX_MS: u64 = 5000;
+/// The only actionable thing an operator can do about a server that cannot
+/// create a room: the wire text never reaches the terminal (it can carry a
+/// server-chosen string), so this is the whole message.
+pub const OLD_SERVER_ERROR: &str =
+    "web transfer requires an upgraded server configured with --web-transfer-base-url";
+/// Second signal: the room close is already running and bounded, so the user
+/// asking twice gets out now. 128 + SIGINT, the shell convention.
+pub const FORCED_EXIT_CODE: i32 = 130;
 
 /// Lifecycle events driving the owner loop. Tests supply these; OS signal
 /// wiring arrives with the public command in Phase 3.
@@ -159,15 +170,26 @@ struct OwnerSession<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> OwnerSession<S> {
-    /// Sends a graceful close, bounded so a dead peer cannot pin shutdown.
+    /// Sends a graceful close and waits for the server to drop the owner
+    /// control, bounded so a dead peer cannot pin shutdown.
+    ///
+    /// The wait is not politeness: the control rides a yamux substream whose
+    /// driver is a DETACHED task, so a process that returns the moment `send`
+    /// resolves can exit with the close frame still queued — the room then
+    /// lives on for the whole owner grace and the URL the user just abandoned
+    /// still works. The server drops this control as soon as it has processed
+    /// the close, so reading to the end IS the acknowledgement.
     async fn close_bounded(&mut self) {
-        let _ = tokio::time::timeout(
-            OWNER_CLOSE_TIMEOUT,
-            self.control.send(ClientMessage::CloseWebTransferRoom {
-                room_id: self.room_id,
-                owner_epoch: self.epoch,
-            }),
-        )
+        let _ = tokio::time::timeout(OWNER_CLOSE_TIMEOUT, async {
+            self.control
+                .send(ClientMessage::CloseWebTransferRoom {
+                    room_id: self.room_id,
+                    owner_epoch: self.epoch,
+                })
+                .await?;
+            while let Some(_msg) = self.control.recv::<ServerMessage>().await? {}
+            Ok::<(), anyhow::Error>(())
+        })
         .await;
     }
 }
@@ -200,6 +222,7 @@ async fn owner_connect(
             .context("owner could not open control stream")?,
         "client/web-transfer-owner",
     );
+    let creating = matches!(first, ClientMessage::CreateWebTransferRoom { .. });
     control
         .send(first)
         .await
@@ -209,11 +232,24 @@ async fn owner_connect(
             .client_handshake(&mut control)
             .await?;
     }
-    let reply = control
-        .recv_timeout::<ServerMessage>()
-        .await
-        .context("owner got no open reply")?
-        .context("server closed the owner control")?;
+    let reply = match control.recv_timeout::<ServerMessage>().await {
+        Ok(Some(reply)) => reply,
+        // A server that never answers a CREATE either predates web transfer
+        // (an unknown control variant closes its side) or has it disabled;
+        // both are the same operator action, and neither is a transient
+        // loss. A RESUME that goes unanswered is exactly that transient
+        // loss, so it keeps its own diagnostic and its retry.
+        Ok(None) if creating => {
+            tracing::debug!("server closed the owner control before answering the create");
+            bail!(OLD_SERVER_ERROR);
+        }
+        Ok(None) => bail!("server closed the owner control"),
+        Err(err) if creating => {
+            tracing::debug!("owner got no create reply: {err:#}");
+            bail!(OLD_SERVER_ERROR);
+        }
+        Err(err) => return Err(err).context("owner got no open reply"),
+    };
     Ok((control, reply))
 }
 
@@ -369,8 +405,16 @@ where
             owner_epoch,
             ..
         } => (room_id, owner_epoch, base_url),
-        ServerMessage::Error(err) => bail!("server refused room creation: {err}"),
-        other => bail!("unexpected open reply: {}", other.control_frame_summary()),
+        ServerMessage::Error(err) => {
+            // The wire text is server-chosen: it goes to the log, never to
+            // the terminal, and the operator gets the one actionable line.
+            tracing::debug!("server refused room creation: {err}");
+            bail!(OLD_SERVER_ERROR);
+        }
+        other => {
+            tracing::debug!("unexpected open reply: {}", other.control_frame_summary());
+            bail!(OLD_SERVER_ERROR);
+        }
     };
     let display_url = build_display_url(&base_url, room_id, &secrets.member, &secrets.key);
     if created_tx
@@ -390,13 +434,9 @@ where
         session.close_bounded().await;
         return Ok(OwnerShutdown::DeliveryAborted);
     }
-    if config.open_browser {
-        // Delivery already succeeded; a browser failure must not fail the
-        // lease, and the URL itself never reaches the log.
-        if let Err(err) = webbrowser::open(&display_url) {
-            tracing::warn!(room = %room_id, "could not open browser: {err}");
-        }
-    }
+    // The browser open belongs to the run path, AFTER the URL is flushed to
+    // stdout (3.6): a lease that opened it here would race the print, and a
+    // user whose browser steals focus first has nothing to copy if it fails.
 
     let mut session = OwnerSession {
         control,
@@ -448,6 +488,185 @@ pub async fn run_owner_lease(
         async move { owner_connect(endpoint_ref, insecure, secret.as_deref(), first).await }
     };
     run_owner_lease_with(&config, created_tx, &mut lifecycle_rx, &mut connect).await
+}
+
+/// The injected browser opener: production passes `webbrowser::open`, tests
+/// pass a recorder, and a `None` means `--open` was not asked for.
+pub(crate) type BrowserOpener<'a> = &'a mut dyn FnMut(&str) -> io::Result<()>;
+
+/// Writes the two announcement lines and FLUSHES before anything else may
+/// touch the terminal, then opens the browser when asked. The order is the
+/// contract: a browser that steals focus (or fails) before the URL is on the
+/// terminal leaves the user with nothing to copy. `open` is injected so that
+/// order is provable without a browser.
+pub(crate) fn announce_room(
+    out: &mut dyn Write,
+    err_out: &mut dyn Write,
+    url: &str,
+    open: Option<BrowserOpener<'_>>,
+) -> io::Result<()> {
+    writeln!(out, "room: {url}")?;
+    writeln!(out, "room active; press Ctrl+C to close")?;
+    out.flush()?;
+    if let Some(open) = open {
+        if let Err(err) = open(url) {
+            // Redacted: the kind only. The URL is a capability and a browser
+            // launcher echoes its argument back in its own error text.
+            let _ = writeln!(
+                err_out,
+                "warning: could not open the browser ({})",
+                err.kind()
+            );
+            let _ = err_out.flush();
+        }
+    }
+    Ok(())
+}
+
+/// Maps a lease outcome onto the process result. Only a clean close is a
+/// success: an expired grace destroyed the room the user is still looking at.
+fn lease_result(shutdown: Result<OwnerShutdown>) -> Result<()> {
+    match shutdown? {
+        OwnerShutdown::CleanClose => Ok(()),
+        OwnerShutdown::DeliveryAborted => {
+            bail!("web transfer room was abandoned before it could be announced")
+        }
+        OwnerShutdown::GraceExpired => {
+            bail!(
+                "web transfer room expired: the owner lease could not be resumed inside the grace"
+            )
+        }
+    }
+}
+
+/// Announces the created room, then holds the lease to its end. Takes the
+/// lease as a future so every branch — including the stdout failure, which
+/// must close the room and exit nonzero — is driven in a unit test without a
+/// server.
+pub(crate) async fn announce_and_hold<F>(
+    lease: F,
+    created_rx: oneshot::Receiver<CreatedRoom>,
+    lifecycle_tx: mpsc::Sender<OwnerLifecycle>,
+    out: &mut dyn Write,
+    err_out: &mut dyn Write,
+    open: Option<BrowserOpener<'_>>,
+) -> Result<()>
+where
+    F: Future<Output = Result<OwnerShutdown>>,
+{
+    tokio::pin!(lease);
+    let created = tokio::select! {
+        // Biased: a room that WAS created is announced even when the lease
+        // finished in the same poll — the user must see the URL of a room
+        // that briefly existed, not silence.
+        biased;
+        created = created_rx => created,
+        // The lease ended before it delivered a room: its own error is the
+        // answer, never a second invented one.
+        done = &mut lease => return lease_result(done),
+    };
+    let created = match created {
+        Ok(created) => created,
+        Err(_) => return lease_result(lease.await),
+    };
+    if let Err(err) = announce_room(out, err_out, &created.display_url, open) {
+        // Nobody can reach a room whose URL never landed. `Fatal` runs the
+        // same bounded close as a signal; the wait is bounded too, so a dead
+        // peer cannot pin the exit.
+        let _ = lifecycle_tx.send(OwnerLifecycle::Fatal).await;
+        let _ = tokio::time::timeout(OWNER_CLOSE_TIMEOUT * 2, &mut lease).await;
+        return Err(err).context("could not write the room URL to stdout");
+    }
+    lease_result(lease.await)
+}
+
+/// First signal returns `true` (close the room cleanly), every later one
+/// `false` (force the process out). Pure so the decision is unit-pinned;
+/// the exit itself is the only part a test cannot take.
+pub(crate) fn signal_action(first: &std::sync::atomic::AtomicBool) -> bool {
+    first.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// One signal: close cleanly the first time, force out the second.
+async fn on_signal(
+    tx: &mpsc::Sender<OwnerLifecycle>,
+    first: &std::sync::atomic::AtomicBool,
+    event: OwnerLifecycle,
+) {
+    if signal_action(first) {
+        let _ = tx.send(event).await;
+    } else {
+        std::process::exit(FORCED_EXIT_CODE);
+    }
+}
+
+/// Installs the documented handlers: Ctrl+C everywhere, SIGTERM and SIGHUP
+/// on Unix (a closed shell must destroy the room, not orphan it). A handler
+/// that cannot be installed is skipped, never fatal — the room still closes
+/// on the handlers that did install.
+fn spawn_signal_handlers(tx: mpsc::Sender<OwnerLifecycle>) {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let first = Arc::new(AtomicBool::new(true));
+
+    {
+        let tx = tx.clone();
+        let first = Arc::clone(&first);
+        tokio::spawn(async move {
+            while tokio::signal::ctrl_c().await.is_ok() {
+                on_signal(&tx, &first, OwnerLifecycle::Interrupt).await;
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        for (kind, event) in [
+            (SignalKind::terminate(), OwnerLifecycle::Terminate),
+            (SignalKind::hangup(), OwnerLifecycle::Hangup),
+        ] {
+            let Ok(mut stream) = signal(kind) else {
+                tracing::debug!("signal handler unavailable; skipping one source");
+                continue;
+            };
+            let tx = tx.clone();
+            let first = Arc::clone(&first);
+            tokio::spawn(async move {
+                while stream.recv().await.is_some() {
+                    on_signal(&tx, &first, event).await;
+                }
+            });
+        }
+    }
+}
+
+/// Runs `bore transfer web`: create one room, print exactly two lines, open
+/// the browser when asked, then hold the owner lease until a signal closes
+/// the room (or the grace expires). Never selects, reads or names a file.
+pub async fn run_web_transfer(config: OwnerClientConfig) -> Result<()> {
+    let open_browser = config.open_browser;
+    let (created_tx, created_rx) = oneshot::channel();
+    let (lifecycle_tx, lifecycle_rx) = mpsc::channel(4);
+    spawn_signal_handlers(lifecycle_tx.clone());
+    let lease = run_owner_lease(config, created_tx, lifecycle_rx);
+    let mut opener = |url: &str| webbrowser::open(url);
+    let open: Option<BrowserOpener<'_>> = if open_browser {
+        Some(&mut opener)
+    } else {
+        None
+    };
+    let mut out = io::stdout();
+    let mut err_out = io::stderr();
+    announce_and_hold(
+        lease,
+        created_rx,
+        lifecycle_tx,
+        &mut out,
+        &mut err_out,
+        open,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -671,5 +890,257 @@ mod tests {
         // Exactly one close inside a fraction of the one-second bound.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(*fake.closes.lock().await, vec![room]);
+    }
+
+    /// What the announcement did, in order. `Flush` and `Open` are separate
+    /// events because their ORDER is the property under test.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Step {
+        Wrote(String),
+        Flushed,
+        Opened(String),
+    }
+
+    /// A stdout that records, and can be made to fail on its first write.
+    struct RecordingOut {
+        steps: std::sync::Arc<std::sync::Mutex<Vec<Step>>>,
+        fail: bool,
+    }
+
+    impl Write for RecordingOut {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.fail {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdout is gone"));
+            }
+            self.steps
+                .lock()
+                .unwrap()
+                .push(Step::Wrote(String::from_utf8_lossy(buf).to_string()));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdout is gone"));
+            }
+            self.steps.lock().unwrap().push(Step::Flushed);
+            Ok(())
+        }
+    }
+
+    const CANARY_URL: &str =
+        "http://127.0.0.1:8080/transfer/aabb#m=CANARY-MEMBER-TOKEN&k=CANARY-ROOM-KEY";
+
+    #[test]
+    fn web_stdout_is_exactly_two_lines_and_flush_precedes_open() {
+        let steps = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut out = RecordingOut {
+            steps: std::sync::Arc::clone(&steps),
+            fail: false,
+        };
+        let mut err_out = Vec::new();
+        let opened = std::sync::Arc::clone(&steps);
+        let mut open = move |url: &str| -> io::Result<()> {
+            opened.lock().unwrap().push(Step::Opened(url.to_string()));
+            Ok(())
+        };
+        announce_room(&mut out, &mut err_out, CANARY_URL, Some(&mut open)).expect("announced");
+
+        let steps = steps.lock().unwrap().clone();
+        let written: String = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Wrote(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Exactly two lines, exactly these.
+        assert_eq!(
+            written,
+            format!("room: {CANARY_URL}\nroom active; press Ctrl+C to close\n")
+        );
+        let flush = steps
+            .iter()
+            .position(|step| *step == Step::Flushed)
+            .expect("flushed");
+        let open_at = steps
+            .iter()
+            .position(|step| matches!(step, Step::Opened(_)))
+            .expect("opened");
+        // The whole point: every byte is flushed BEFORE the browser is asked
+        // to take the screen.
+        assert!(flush < open_at, "flush must precede open, got {steps:?}");
+        assert!(
+            steps
+                .iter()
+                .take(flush)
+                .all(|step| matches!(step, Step::Wrote(_))),
+            "nothing but the two lines may precede the flush: {steps:?}"
+        );
+        assert!(err_out.is_empty(), "a successful open says nothing");
+    }
+
+    #[test]
+    fn browser_open_failure_is_nonfatal_and_redacted() {
+        let steps = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut out = RecordingOut { steps, fail: false };
+        let mut err_out = Vec::new();
+        let mut open = |_: &str| -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no browser could open {CANARY_URL}"),
+            ))
+        };
+        // Non-fatal: the room stays up and the user still has the URL.
+        announce_room(&mut out, &mut err_out, CANARY_URL, Some(&mut open))
+            .expect("a failed browser never fails the announcement");
+        let warning = String::from_utf8(err_out).expect("utf8 warning");
+        assert!(
+            warning.starts_with("warning: could not open the browser"),
+            "unexpected warning: {warning}"
+        );
+        // Redacted: the launcher echoed the capability back at us and it must
+        // not reach stderr.
+        assert!(!warning.contains("CANARY-MEMBER-TOKEN"));
+        assert!(!warning.contains("CANARY-ROOM-KEY"));
+        assert!(!warning.contains("#m="));
+    }
+
+    #[tokio::test]
+    async fn stdout_failure_closes_room() {
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(4);
+        let (created_tx, created_rx) = oneshot::channel();
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lease_closed = std::sync::Arc::clone(&closed);
+        // A lease that closes its room on `Fatal`, exactly as the real one does.
+        let lease = async move {
+            match lifecycle_rx.recv().await {
+                Some(OwnerLifecycle::Fatal) => {
+                    lease_closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    bail!("owner fatal")
+                }
+                other => bail!("expected Fatal, got {other:?}"),
+            }
+        };
+        created_tx
+            .send(CreatedRoom {
+                display_url: CANARY_URL.to_string(),
+                room_id: RoomId::from_bytes([0x55u8; 16]),
+            })
+            .expect("delivered");
+        let mut out = RecordingOut {
+            steps: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail: true,
+        };
+        let mut err_out = Vec::new();
+        let err = announce_and_hold(
+            lease,
+            created_rx,
+            lifecycle_tx,
+            &mut out,
+            &mut err_out,
+            None,
+        )
+        .await
+        .expect_err("a room nobody can reach is a failure");
+        assert!(
+            err.to_string().contains("could not write the room URL"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            closed.load(std::sync::atomic::Ordering::SeqCst),
+            "a room whose URL never landed must be closed, not leaked"
+        );
+    }
+
+    #[test]
+    fn first_signal_closes_second_forces() {
+        let first = std::sync::atomic::AtomicBool::new(true);
+        // First: close cleanly. Every later one: force out.
+        assert!(signal_action(&first));
+        assert!(!signal_action(&first));
+        assert!(!signal_action(&first));
+    }
+
+    #[tokio::test]
+    async fn old_server_error_is_actionable() {
+        // A server that refuses the create (disabled, or too old to know the
+        // message) must produce the one actionable line, never its own text.
+        const WIRE_CANARY: &str = "CANARY-WIRE-DETAIL";
+        let config = OwnerClientConfig::default();
+        let (created_tx, _created_rx) = oneshot::channel();
+        let (_lifecycle_tx, mut lifecycle_rx) = mpsc::channel(4);
+        let mut connect = |_first: ClientMessage| async move {
+            let (run_io, _srv_io) = tokio::io::duplex(4096);
+            Ok((
+                Delimited::new(run_io),
+                ServerMessage::Error(WIRE_CANARY.to_string()),
+            ))
+        };
+        let err = run_owner_lease_with(&config, created_tx, &mut lifecycle_rx, &mut connect)
+            .await
+            .expect_err("a refused create fails");
+        let text = format!("{err:#}");
+        assert_eq!(text, OLD_SERVER_ERROR);
+        assert!(text.contains("--web-transfer-base-url"), "{text}");
+        assert!(
+            !text.contains(WIRE_CANARY),
+            "wire text reached the terminal: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_logs_never_contain_fragment_tokens() {
+        // The run path handles the URL; nothing it emits may carry it. The
+        // capture is this module's own writer, so the assertion covers every
+        // tracing line the announcement path produces.
+        #[derive(Clone)]
+        struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl io::Write for LogSink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = LogSink(std::sync::Arc::clone(&buf));
+        let _ = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(4);
+        let (created_tx, created_rx) = oneshot::channel();
+        created_tx
+            .send(CreatedRoom {
+                display_url: CANARY_URL.to_string(),
+                room_id: RoomId::from_bytes([0x66u8; 16]),
+            })
+            .expect("delivered");
+        let lease = async { Ok(OwnerShutdown::CleanClose) };
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let mut open = |_: &str| -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::NotFound, "no browser"))
+        };
+        announce_and_hold(
+            lease,
+            created_rx,
+            lifecycle_tx,
+            &mut out,
+            &mut err_out,
+            Some(&mut open),
+        )
+        .await
+        .expect("clean close");
+
+        let logs = String::from_utf8_lossy(&buf.lock().unwrap().clone()).to_string();
+        for secret in ["CANARY-MEMBER-TOKEN", "CANARY-ROOM-KEY", "#m=", "&k="] {
+            assert!(!logs.contains(secret), "tracing leaked {secret}: {logs}");
+        }
+        // The URL is on stdout, which is where the user asked for it.
+        assert!(String::from_utf8_lossy(&out).contains(CANARY_URL));
     }
 }

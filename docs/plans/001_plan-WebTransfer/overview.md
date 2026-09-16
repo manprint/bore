@@ -42,6 +42,9 @@ Il messaggio dell'utente “tutti default” approva tutte le opzioni raccomanda
 | **D18 (user, all defaults)** | Prima slice pubblica relay-only, poi cambio dichiarato a direct-first. | README segue solo ciò che ciascuna fase rende realmente usabile. |
 | **D19 (user, all defaults)** | Nuove varianti native additive e server aggiornato richiesto. | Vecchi listener/sender restano byte-identici; client nuovo mostra errore upgrade/config chiaro. |
 | **D20 (user, all defaults)** | Tutte le subfasi sono eseguite da GPT-5.6 Luna con self-review. | Il piano prescrive simboli, algoritmi, limiti, test e criteri Done senza scelte lasciate a Luna. |
+| **D21 (user, 2026-09-15)** | Le performance sono un requisito di prodotto, non un effetto collaterale: bore si distingue per il throughput. | Sub-fase **3.9** costruisce l'harness di benchmark (bracci interleaved, campioni grezzi, mediane `LC_ALL=C`, `T-WEB-PERF`); ogni fase successiva che tocca il data path aggiunge il suo braccio invece di dichiarare "nessuna regressione". |
+| **D22 (user, 2026-09-15)** | Il percorso DIRECT (WebRTC/SCTP su UDP) è la strada principale, il relay è il fallback — coerente con l'investimento di bore su UDP/QUIC. | Conferma e rafforza D5: **4.6** porta sul percorso browser le ottimizzazioni misurate del resto di bore (backpressure, dimensionamento frammento, niente striping per-messaggio, nessuna coda profonda) e le misura con `T-WEB-PERF-DIRECT`; nessun flag utente per forzare relay. |
+| **D23 (user, 2026-09-15)** | L'interfaccia è parte del prodotto: pulita, ordinata, intuitiva, con evidenza esplicita se il trasferimento è `direct` o `relay`, e drag & drop per la selezione. | **5.6** possiede layout, stati, accessibilità, badge di path e drop di file E cartelle, con `T-WEB-UI`, `T-WEB-PATH-UI` e `T-WEB-DND` nell'harness; il badge resta governato dalla regola del primo chunk verificato (nessun path dichiarato prima della prova). |
 
 ## Open questions
 
@@ -206,6 +209,11 @@ No external point used by the plan remains `UNVERIFIED`.
 | asset drift | `npm run build --prefix web/transfer && git diff --exit-code -- web/transfer/dist` | Phase 0.2 onward |
 | full regression | `cargo test --all-features -- --skip t_ssh_ --skip t_dmx_` | every phase |
 | serial SSH regression | `cargo test --all-features --test ssh_gateway_test --test ssh_gateway_spike_test -- --test-threads=1` | every phase |
+| decoder fuzzing | `cargo test --all-features --test web_transfer_fuzz` (`BORE_WEB_FUZZ_SECS`, `BORE_WEB_FUZZ_SEED`) | Phase 6.3 onward |
+| cross-engine matrix | `STAGES=cross scripts/web_transfer_e2e.sh` | Phase 6.4 onward |
+| packaging | `bash scripts/web_transfer_package_test.sh` | Phase 6.4 onward |
+| release artefact | `STAGES=release scripts/web_transfer_e2e.sh` | Phase 6.5 onward |
+| container (no storage) | `bash scripts/web_transfer_container_test.sh` | Phase 6.5 onward |
 
 **Acceptance:** T-WEB-MULTIPEER-FINAL proves A/B/C publish and explicit direct/relay downloads; T-WEB-NOAUTO proves no pre-click transfer; T-WEB-CANCEL-RESUME proves cancellation and explicit verified resume; T-WEB-ROOM-LIFE proves owner-close invalidation; T-WEB-NOSTORE proves relay persistence absence; T-WEB-E2EE proves payload confidentiality; T-WEB-ZIP proves per-offer streaming archive; T-WEB-LEGACY proves old modes unchanged.
 

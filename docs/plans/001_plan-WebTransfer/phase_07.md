@@ -35,6 +35,108 @@
 - **e2e tests:** `T-WEB-SOAK` — carico esatto e bound RSS/counter sopra; `T-WEB-FDBUDGET` — server reale sotto soft/hard rlimit scelti alza soft quando possibile e avverte quando hard insufficiente; `T-WEB-FAIRNESS` — room rate-limited non riduce throughput/cadenza controllo di seconda room; `T-WEB-NOSTORE` resta verde con 64 MiB.
 - **Done:** gates green (all authoritative commands in `STATE.md` §3) + T-WEB-SOAK/FDBUDGET/FAIRNESS/NOSTORE passano + profiler/contatori non mostrano crescita non limitata + self-review elenca formula e massimo di ogni collection/channel/buffer/task + closed in `STATE.md` (§1 → 6.2, §4 ledger row, §6 `none`, §11 board).
 
+**Esito 6.1 (2026-09-17, `agent-1:Claude-Opus-5`).** La superficie web ora dichiara le
+proprie risorse e le prova su un processo vero. Quattro cose implementate e quattro
+imparate.
+
+**Implementato.**
+
+1. **Ammissione dell'handshake.** `WEB_TRANSFER_PENDING_HANDSHAKES = 256` è un semaforo
+   sul REGISTRY, preso in cima a entrambi i rami di upgrade (`ControlWs` e `RelayWs`) e
+   rilasciato appena l'accept finisce: limita l'handshake e mai la sessione che ne segue.
+   Un rifiuto è un `503` generico che non nomina la room — un 503 che dicesse «room
+   sconosciuta» sarebbe un oracolo di esistenza per chi tira a indovinare gli URL. L'accept
+   è avvolto in `WEB_TRANSFER_HANDSHAKE_TIMEOUT` (10 s), quindi un client che apre la
+   connessione e non parla occupa uno slot per dieci secondi e non per sempre.
+2. **Budget di file descriptor.** `fdlimit::web_transfer_fds(max_rooms, max_peers,
+   max_relays) = rooms + peers + 2*relays` (2 per relay: la coppia è due socket) sommato
+   con saturazione a `--max-conns` da `conn_bound_with_web` prima di
+   `reconcile_fd_limit`, che continua ad aggiungere il proprio headroom di 256. Il
+   messaggio di rimedio di P-12 diceva «lower --max-conns to about N» su un numero che
+   l'operatore non ha mai scritto: con la superficie web inclusa, `--max-conns 64` veniva
+   riportato come 5696. `reconcile_fd_limit_with_web` nomina ora le due quote separate e
+   i flag che abbassano quella web. `web` assente ⇒ percorso storico identico.
+3. **Limiter pre-auth esatto.** LRU di 8192 IP, TTL di inattività 10 minuti, 10/minuto con
+   burst 20, e oltre le 8192 chiavi un bucket di overflow condiviso con gli stessi
+   parametri: la mappa non cresce e nessuna IP nuova entra gratis.
+4. **Tripwire di allocazione.** `every_protocol_length_is_checked_before_allocation` legge
+   i tre file della superficie con `include_str!` e rifiuta ogni `with_capacity` il cui
+   argomento non sia clampato (`.min(`), derivato da qualcosa già in memoria (`.len()`) o
+   letterale. L'ago è composto da due pezzi (`concat!("with_", "capacity(")`) apposta:
+   scritto per intero comparirebbe nel file e il test segnalerebbe la propria riga.
+
+**Gate nuovi.** `T-WEB-FDBUDGET` (`t_web_fdbudget`) avvia il binario vero sotto una coppia
+`ulimit` scelta e rilegge `/proc/<pid>/limits` — il log proverebbe soltanto che il server
+ne ha PARLATO (P-12) — in tre bracci: limite hard capiente ⇒ soft esattamente
+`64 + 5632 + 256 = 5952`; limite hard corto (2048) ⇒ soft alzato al soffitto e advisory che
+nomina la quota web e i flag; nessuna superficie web ⇒ `64 + 256 = 320`, cioè zero
+regressione. `T-WEB-FAIRNESS` (`t_web_fairness`) fa relayare due room insieme a 2 MiB/s con
+12 MiB ciascuna: pagare solo per sé costa `(12-4)/2 = 4 s`, condividere un bucket ne
+costerebbe `(24-4)/2 = 10 s`. Misurato: 4,01 s e 4,01 s, RTT di controllo peggiore 1 ms.
+Red-check: la stessa room con 24 MiB legge 10,01 s e fa fallire la soglia. `T-WEB-SOAK`
+(`t_web_soak`) è il carico esatto del piano — 32 peer di controllo, 64 offerte ciascuno
+(2048), 32 relay concorrenti, metà annullati e ripresi a metà finestra — contro un processo
+vero di cui si legge la RSS dal kernel.
+
+**Imparato.**
+
+1. **Un soak ha senso solo se il server è della misura del carico.** Ai limiti di default
+   il finale del test («dopo la chiusura tutto torna») non proverebbe niente: ci sarebbero
+   migliaia di permit liberi in cui nascondere una perdita. Il server del gate parte con
+   `--web-transfer-max-peers 32 --web-transfer-max-relays 32 --web-transfer-max-rooms 2`,
+   esattamente il carico, quindi la room fresca che ammette di nuovo 32 peer e una coppia
+   relay può riuscire SOLO se ogni permit è tornato. Per lo stesso motivo l'annullo e la
+   ripresa di metà dei trasferimenti sono un'asserzione e non un contorno: con 32 permit
+   relay in tutto, un permit non restituito dall'annullo fa fallire l'attach della ripresa.
+2. **Il limiter pre-auth è per IP, e un test di carico è molte IP.** 32 peer da
+   127.0.0.1 esauriscono il burst di 20: è il prodotto che si comporta bene. Ogni peer del
+   soak parte quindi dal proprio indirizzo di 127.0.0.0/8, che è anche il modo in cui 32
+   browser veri arrivano.
+3. **Un peer «lasciato cadere» non chiude il socket se la metà in lettura vive in un
+   task.** La prima versione di `PumpedPeer` teneva lo stream in un task e il sink nel
+   test: rilasciare il peer non chiudeva niente, il server continuava a contarlo e il
+   finale leggeva «permit perso» — un difetto dell'harness travestito da difetto di
+   prodotto. Ora `Drop for PumpedPeer` fa `abort()` sul task.
+4. **La coda di uscita per peer è 64 messaggi.** Un soak che pubblica 2048 offerte fa
+   arrivare a ogni peer ~2000 eventi: un client che legge solo ciò che aspetta riempie
+   quella coda e viene scartato per lentezza. `PumpedPeer` legge tutto e RICORDA solo i
+   tipi che un'asserzione guarda (un `error` non è mai scartato: un rifiuto sotto carico È
+   il risultato).
+
+**Self-review — formula e massimo di ogni risorsa.**
+
+| Risorsa | Formula | Massimo (default) |
+| --- | --- | --- |
+| `rooms` (DashMap) | ≤ `max_rooms`, permit RAII sulla room | 1024 |
+| `peers` per room (HashMap) | ≤ `max_peers_per_room`, e la somma ≤ `max_peers_global` | 32 / 4096 |
+| `offers` per peer | ≤ `max_offers_per_peer`, manifest ≤ 256 KiB ciascuno | 64 |
+| `entries` per offerta | ≤ `max_entries_per_offer` | 10000 |
+| metadata per room / totale | contatori esatti, rifiuto oltre il cap | 16 MiB / 256 MiB |
+| `transfers` per peer | ≤ `max_transfers_per_peer` | 8 |
+| coppie relay | semaforo globale `max_relays_global`, 2 socket ciascuna | 256 |
+| handshake in volo | semaforo `WEB_TRANSFER_PENDING_HANDSHAKES`, timeout 10 s | 256 |
+| coda uscita per peer | `mpsc::channel(WEB_TRANSFER_OUTGOING_CAP)` | 64 messaggi |
+| eventi per room | `broadcast::channel(256)`, il lag risincronizza | 256 |
+| cache richieste per peer | `WEB_TRANSFER_REQUEST_CACHE_CAP`, TTL 5 min | 256 |
+| limiter pre-auth | LRU `WEB_TRANSFER_PRE_AUTH_MAX_IPS` + overflow, TTL 10 min | 8192 IP |
+| frame relay | `WEB_TRANSFER_RELAY_MAX_FRAME_LEN` letto a uno a uno, mai bufferizzato | 32 KiB |
+| messaggio di controllo | `WEB_TRANSFER_MAX_CONTROL_BYTES` | 320 KiB |
+| SDP / candidati ICE | `MAX_SDP_BYTES`, `MAX_ICE_CANDIDATE_BYTES` x `MAX_ICE_CANDIDATES_PER_SIDE` | 64 KiB / 4 KiB x 128 |
+| task spawnati | uno per attempt diretto (deadline, si estingue), uno per attempt relay in coda, uno per room staccata (grace) | ≤ transfers + rooms |
+| descrittori | `max_conns + rooms + peers + 2*relays + 256` | riconciliato all'avvio |
+
+**Memoria indipendente dalla dimensione del payload (il requisito dei 4 GiB).** Misurato
+sullo stesso gate con due finestre: 15 s muovono **740,8 MiB** con RSS 38,1 → 57,1 MiB;
+90 s ne muovono **4510,8 MiB** (4,4 GiB) con RSS 37,8 → **56,7 MiB**. Sei volte i byte,
+la stessa RSS di picco: il relay inoltra un frame alla volta (≤ 32 KiB) e non materializza
+mai il payload. Nello stesso run, 66080 eventi di catalogo consegnati e scartati dai peer,
+descrittori del server 11 → 43 (2 per coppia relay + i listener), crescita nelle ultime tre
+campionature sotto la soglia di 8 MiB.
+
+**Gate eseguiti.** `cargo fmt` 0, `cargo clippy --all-features --all-targets -D warnings` 0,
+Rust lib 798/0/2 (+7), suite e2e Rust seriale 26 passed / 1 ignored (166 s), stage
+`resources` di `scripts/web_transfer_e2e.sh` con la finestra da 300 s del piano.
+
 ### 6.2 Pubblicare config e metriche aggregate senza dati sensibili
 
 - **Model:** `agent:gpt-5.6-luna`
@@ -44,6 +146,94 @@
 - **Unit tests:** `web_config_reports_totals_and_null_when_disabled`; `web_config_totals_do_not_move_under_load`; `web_metrics_report_live_zero_as_zero_not_null`; `web_metrics_counters_follow_guard_lifecycle_exactly`; `path_counter_changes_only_after_recipient_verified_report`; `admin_json_never_contains_canary_names_paths_tokens_sdp_candidates_or_manifest`; frontend `web_metrics_panel_preserves_zero_available_and_hides_when_disabled`; serialization fixture prova additive defaults.
 - **e2e tests:** `T-WEB-ADMIN` — sotto direct, relay, saturation, cancel e cleanup leggere config/metrics reali e verificare totali stabili/gauge mobili/zero visibile; `T-WEB-LOG-PRIVACY` — usare canary in ogni campo vietato e provarne assenza da log/admin, mantenendo ID/conteggi utili.
 - **Done:** gates green (all authoritative commands in `STATE.md` §3) + T-WEB-ADMIN e T-WEB-LOG-PRIVACY passano + vecchie fixture admin decodificano con default + self-review privacy campo-per-campo e distinzione total/current/available + closed in `STATE.md` (§1 → 6.3, §4 ledger row, §6 `none`, §11 board).
+
+**Esito 6.2 (2026-09-17, `agent-1:Claude-Opus-5`).** La superficie admin risponde ora alle
+due domande di un operatore — «cosa ho configurato?» e «cosa sta succedendo adesso?» —
+senza mai rispondere alla terza, «chi sta trasferendo cosa», che il contratto vieta.
+
+**Implementato.**
+
+1. **Tredici totali configurati e tredici valori vivi, mai confusi.** `ConfigView` porta
+   `web_transfer_enabled` più i tredici totali (nomi esatti del piano) e `MetricsView` i
+   tredici gauge/totali. I totali vengono catturati da `Server::set_web_transfer` PRIMA
+   che la config venga spostata nel registry (`registry_limits` + `stun_count`), quindi
+   sono uno snapshot dell'avvio e non possono diventare un gauge: è esattamente il difetto
+   P-11, dove `/config` pubblicava `Semaphore::available_permits()` e leggeva 0 su un
+   server saturo, cioè la stessa cosa che «non configurato».
+2. **Contatori che seguono la guardia, non l'intenzione.** `offers_current` si muove
+   accanto a `state.offers.insert/remove` e nella pulizia del peer che esce;
+   `relay_bytes_total` accanto a `stats.bytes` dentro `run_relay_pair`;
+   `completed_total`/`cancelled_total` in `terminate_locked` (il terminale `Failed` resta
+   deliberatamente non contato: non è un esito dell'utente). `rejected_total` passa da
+   `refused()`, un unico punto cablato sui dieci siti di capacità più `try_acquire_handshake`
+   e `check_pre_auth` — un rifiuto contato in dieci posti diverse è un rifiuto contato male.
+3. **La lista STUN non esce, il suo numero sì.** `web_transfer_stun_count` è un conteggio
+   per scelta: la lista dei server è un'impronta del deployment, il numero è ciò che serve
+   per sapere se ICE ha dove andare. Il gate lo verifica cercando `stun:` nel JSON.
+4. **Sezione Web Transfer nel pannello metriche.** Compare solo quando
+   `web_transfer_rooms_current` non è `undefined` né `null`, e ogni riga usa un controllo
+   null esplicito (`webRow`) e mai la verità booleana: `0` slot relay liberi è il valore
+   ALLARMANTE e un guard per truthiness nasconde proprio quello (la lezione di P-11 lato
+   frontend, già pagata con `udp_direct_slots_available`).
+5. **Sampling logaritmico dei rifiuti pre-auth.** `AuthFailureSampler` conta i fallimenti
+   per IP nello stesso bound del limiter (8192 IP, TTL 10 minuti) e riporta l'1°, il 2°,
+   il 4°, l'8°… La riga porta IP, conteggio e una classe grossolana; non porta la room né
+   il token, perché il rifiuto è costruito apposta per rendere indistinguibili room
+   assente, token malformato e token sbagliato, e una riga di log non è un'eccezione a
+   quella proprietà. Le due alternative sono entrambe difetti: una riga per rifiuto rende
+   uno scanner un attacco al disco dell'operatore, zero righe nasconde un indirizzo che
+   fallisce diecimila volte.
+
+**Imparato.**
+
+- **Un gate sulla privacy deve provare anche la metà utile.** La prima versione di
+  `T-WEB-LOG-PRIVACY` provava solo l'assenza dei canary e sarebbe passata su un server che
+  non logga NIENTE — cioè sul peggior server possibile per un operatore. Il gate ora guida
+  anche un braccio relay e pretende che la riga di chiusura porti transfer id, byte e
+  frame: è una garanzia di privacy, non di silenzio.
+- **Il percorso diretto non logga: l'unico log del web transfer è la chiusura del relay.**
+  La prima stesura asseriva che il log nominasse la room dopo un flusso diretto e falliva
+  legittimamente. Il server non scrive nulla lungo la segnalazione diretta, ed è corretto
+  così (i frame che passa sono SDP e candidati, cioè proprio ciò che non va scritto).
+- **`tracing_subscriber` colora i nomi dei campi.** Senza `.with_ansi(false)` la stringa
+  `bytes=` non compare mai letteralmente e un'asserzione su di essa fallisce per un motivo
+  che non c'entra con ciò che viene loggato.
+- **Il ciclo `while let Ok(permit) = try_acquire...` conta già un rifiuto** — quello che lo
+  fa uscire. Una baseline presa prima del ciclo produce un off-by-one che sembra un bug del
+  contatore e non lo è.
+
+**Self-review privacy, campo per campo.** Ogni campo pubblicato è un conteggio, un byte
+count, un totale configurato o un booleano; nessuno è una stringa di origine utente.
+L'unica stringa è `web_transfer_base_origin`, che è un parametro dell'operatore
+(`--web-transfer-base-url`) e non un dato di un utente. Nomi peer, label/percorsi/manifest
+delle offerte, token, MAC, SDP e candidati ICE sono provati assenti da `/config`,
+`/metrics`, `/admin/status/data` e dai log (canary distinti per campo, così un fallimento
+NOMINA il campo che perde).
+
+**Total vs current vs available.** `max_*` = totale configurato, immobile sotto carico
+(gate `web_config_totals_do_not_move_under_load`, che satura rooms e relay e riconfronta);
+`*_current`/`*_active` = gauge, tornano a zero a room chiusa; `*_total` = cumulativi, non
+tornano mai (asserito esplicitamente dopo la pulizia in `t_web_admin`);
+`relay_slots_available` = l'unico «quanto ne resta», ed è l'unico il cui ZERO è la notizia.
+
+**Test aggiunti.** Rust unit: `web_metrics_counters_follow_guard_lifecycle_exactly`,
+`repeated_pre_auth_failures_are_logged_logarithmically`. Rust e2e:
+`web_config_reports_totals_and_null_when_disabled`, `web_config_totals_do_not_move_under_load`,
+`web_metrics_report_live_zero_as_zero_not_null`,
+`admin_json_never_contains_canary_names_paths_tokens_sdp_candidates_or_manifest`,
+`admin_web_transfer_fields_are_additive_and_match_the_fixture` (fixture
+`tests/fixtures/web_transfer/v1/admin-fields.json`), `web_pre_auth_failures_are_sampled_in_the_log`,
+`t_web_admin` (T-WEB-ADMIN), `t_web_log_privacy` (T-WEB-LOG-PRIVACY). Frontend:
+`test/admin_ui/metrics-web-transfer.test.js` (4 casi). Harness: gruppo `T-WEBUI-E2E` in
+`scripts/admin_dashboard_test.sh`, che ora avvia il server di riferimento con
+`--web-transfer-base-url` e verifica totali configurati, assenza della lista STUN, gauge a
+zero VISIBILE, `/transfer/` servito sull'origine annunciata e la sezione presente nel
+bundle servito.
+
+**Red-check.** `t_web_log_privacy` è stato reso rosso aggiungendo un `debug!` che logga il
+nome del peer: fallisce con «the peer display name reached the server log:
+CANARY-NAME-pangolin». Il pannello frontend era già stato red-checked in 6.2 sostituendo il
+controllo null con `if (!value) return;` (2 test su 4 falliscono, quelli sullo zero).
 
 ### 6.3 Eseguire hardening protocollo, sicurezza browser e compatibilità legacy
 
@@ -55,6 +245,111 @@
 - **e2e tests:** `T-WEB-MALFORMED` — corpus su server reale lascia room/peer sano operativo; `T-WEB-XSS-CSRF` — browser prova origin/CSP/markup senza esecuzione o secret referrer; `T-WEB-LEGACY` — listener/sender/public/secret/vhost/ssh regression complete; `T-WEB-UDP-ENDPOINT` — lista socket prima/dopo prova nessun nuovo bind UDP.
 - **Done:** gates green (all authoritative commands in `STATE.md` §3) + quattro gate passano + fuzz/property run minimo 60 s per decoder in CI-safe harness senza crash/hang + self-review mappa I-WEB1..15 e ogni invariant AGENTS to test evidence + closed in `STATE.md` (§1 → 6.4, §4 ledger row, §6 `none`, §11 board).
 
+**Esito 6.3 (2026-09-16, `agent-1:Claude-Opus-5`).** L'hardening ha trovato un difetto
+vero nella parte piu' esposta della superficie — quella che un altro peer sceglie — e ha
+chiuso le tre matrici che restavano aperte: decoder, origine, rifiuto.
+
+**Implementato.**
+
+1. **Le stringhe remote non possono piu' mentire su se stesse.** Il gate browser
+   `T-WEB-XSS-CSRF` ha misurato che i caratteri di controllo bidirezionale
+   (`U+202A`-`U+202E`, `U+2066`-`U+2069`, `U+061C`, `U+200E`/`U+200F`) arrivavano nel
+   documento: sopravvivono all'escaping HTML perche' non sono markup, e riordinano il
+   testo al momento del rendering — `fattura\u202Efdp.exe` si legge `fattura exe.pdf`
+   esattamente nella scheda in cui il destinatario decide se scaricare. Non e' un XSS
+   (il testo resta un text node, cosa che `remote_strings_use_text_nodes` gia' fissava)
+   ma e' una bugia, ed e' la stessa classe. Il fix e' strutturale: `inertText` in
+   `view.js`, applicato dentro `el()` e sulle poche assegnazioni dirette di
+   `textContent`, cioe' l'UNICO imbuto per cui passa ogni stringa remota (`view.js` e'
+   l'unico modulo che scrive nel DOM: verificato, non assunto). Strippare e non
+   rifiutare, perche' il server vede un nome come byte opachi e rifiutare renderebbe
+   inusabile un nome legittimamente RTL: e' un obbligo del client, ed e' scritto come
+   tale nel protocollo (§7.2).
+2. **La matrice origine e' chiusa da una pagina VERA di un'altra origine.** L'upgrade
+   WebSocket non e' soggetto alla same-origin policy come `fetch`: qualunque pagina puo'
+   aprirne uno. Cio' che non puo' fare e' falsificare `Origin`, quindi il controllo
+   esatto del server e' l'intero confine — e va provato da una pagina reale, altrimenti
+   si sta testando il test. Il gate serve la pagina attaccante da un server HTTP
+   effimero suo (`node:http` su una porta propria) e non da una seconda porta di bore:
+   bore non risponde su un `Host` che non ha annunciato, quindi la scorciatoia
+   `localhost` vs `127.0.0.1` non mette in scena l'attacco, lo fa fallire prima
+   (misurato: `NS_ERROR_NET_EMPTY_RESPONSE`).
+3. **Ogni rifiuto pre-auth e' una sola classe.** Token non esadecimale, token esadecimale
+   sbagliato e token valido per una stanza inesistente sono tre fatti diversi; chi
+   riesce a distinguerli enumera le stanze con un token che ha gia'. Il server rispondeva
+   gia' allo stesso modo — `t_web_auth_refusals_are_one_class` lo FISSA, sullo stesso
+   close code e con il ritardo uniforme come PAVIMENTO e mai come uguaglianza: una rete
+   non e' costante e un gate che pretende tempi costanti e' un gate instabile, non uno
+   piu' forte. Il controllo positivo nello stesso test (il token giusto entra) impedisce
+   che la proprieta' sia soddisfatta da un server che rifiuta tutto.
+4. **Fuzzing con budget, seme e deadline per chiamata.** `tests/web_transfer_fuzz.rs`
+   muta corpus validi (bit flip, splice di byte su cui un parser JSON ramifica,
+   troncamento, cancellazione, ripetizione di slice) entro il cap che il chiamante vero
+   applica, e verifica tre proprieta' che non dipendono dalla validita' dell'input:
+   nessun panic, nessuna chiamata oltre `MAX_CALL` (una decodifica quadratica si vede
+   come fallimento e non come timeout di CI senza colpevole) e nessun valore restituito
+   oltre i limiti con cui e' stato parsato. Deterministico: `BORE_WEB_FUZZ_SEED` e
+   `BORE_WEB_FUZZ_SECS`, default 1 s per decoder perche' un `cargo test` ordinario deve
+   restare veloce, ed e' lo stesso test che in CI gira con un budget maggiore.
+
+**Lezioni.**
+
+- **Un gate di sicurezza deve poter fallire per il motivo giusto.** Il primo tentativo
+  del gate CSRF passava per un errore d'ambiente (nessuna risposta dal server su un
+  `Host` sconosciuto), cioe' avrebbe continuato a passare anche con il controllo
+  d'origine rimosso. La versione che conta e' quella che monta una vera origine
+  straniera.
+- **Escaping e riordino sono due problemi diversi.** L'HTML escaping neutralizza il
+  markup e lascia intatti i controlli bidi; `textContent` non li tocca per definizione.
+  Il primo gate copriva solo il primo dei due, ed e' passato per anni.
+
+**Test aggiunti.**
+
+| Test | Livello | Cosa fissa |
+|------|---------|-----------|
+| `T-WEB-XSS-CSRF` (`security.spec.mjs`) | browser, 3 motori | origine straniera rifiutata; markup inerte; nessun controllo bidi nel documento |
+| `remote_markup_and_bidi_do_not_execute_or_spoof_controls` | unit JS | stesso invariante al livello del renderer, red-checked |
+| `t_web_auth_refusals_are_one_class` | e2e Rust | un solo close code e un pavimento di ritardo per tre rifiuti diversi |
+| `envelope_decoder_…`, `value_decoders_…`, `relay_attach_decoder_…`, `sealed_frame_decoder_…` | fuzz Rust | nessun panic, nessun hang, nessun risultato fuori limite |
+| `T-WEB-MALFORMED`, `T-WEB-UDP-ENDPOINT`, `duplicate_json_keys_are_rejected`, `all_web_decoders_are_panic_free_and_allocation_bounded`, `origin_host_and_subprotocol_matrix_is_closed`, `csp_contains_self_only_and_no_inline_escape`, `token_ticket_request_replays_are_idempotent_or_rejected`, `crypto_failure_writes_zero_bytes` | vari | i gate 6.3 gia' verdi prima di questa tranche |
+
+**Red-check.** Sostituendo il corpo di `inertText` con `return value;` il gate unit
+fallisce con «a bidi control reached the document: "\u202E"» — il difetto in produzione,
+non una variante di laboratorio.
+
+**Invarianti I-WEB1..15, evidenza.**
+
+| Invariante | Evidenza |
+|-----------|----------|
+| I-WEB1 no payload sul server | `t_web_nostore`, `t_web_relay_opaque` |
+| I-WEB2 solo un click crea un transfer | `T-WEB-DOWNLOAD` + `t_web_transfer_state` |
+| I-WEB3 permessi uguali, owner separato | `T-WEB-OWNER-SEPARATION`, `t_web_owner_lease` |
+| I-WEB4 chiusura pulita immediata, grace autenticata | `t_web_room_life` |
+| I-WEB5 direct poi relay nello stesso TransferId | `T-WEB-DIRECT-FALLBACK`, `t_web_signaling` |
+| I-WEB6 AES-GCM su entrambi i percorsi, chiave mai al server | `crypto.test.mjs`, `t_web_relay_opaque`, `t_web_log_privacy` |
+| I-WEB7 solo la sorgente originale | `T-WEB-SOURCE-ONLY` |
+| I-WEB8 tutto limitato | `t_web_limits`, `t_web_fdbudget`, `t_web_fairness`, fuzz |
+| I-WEB9 vecchio wire invariato | `t_web_legacy`, `t_web_native_wire`, fixture v1 |
+| I-WEB10 direct e' WebRTC, nessun endpoint UDP | `web_transfer_opens_no_udp_socket` |
+| I-WEB11 autorizzazioni di withdraw/cancel/close | `t_web_offer_races`, `t_web_room_life` |
+| I-WEB12 cleanup su Arc/Weak catturati | `t_web_registry_life` (P-14 in `a_reregistered_tunnel_keeps_its_carrier_when_the_previous_one_closes`) |
+| I-WEB13 heartbeat bounded, reaper su `last_recv` | `t_web_peers`, gate storici P-4/P-7/P-9 rieseguiti |
+| I-WEB14 totali e gauge separati | `web_config_totals_do_not_move_under_load`, `web_metrics_report_live_zero_as_zero_not_null` |
+| I-WEB15 log/admin senza segreti | `t_web_log_privacy`, `admin_json_never_contains_canary_…` |
+
+**Gate storici rieseguiti (AGENTS.md).** Nella regressione completa: P-4
+`public_real_client_survives_past_the_reap_deadline`; P-7/P-9
+`beat_once_sends_immediately_to_a_reading_peer` e
+`beat_once_stands_down_when_the_peer_stops_reading`, `direct_renewal_*`; P-14
+`a_reregistered_tunnel_keeps_its_carrier_when_the_previous_one_closes`; vhost
+`vhost_real_client_survives_past_the_reap_deadline`; secret carrier/path report
+`secret_path_report_is_recorded_and_rendered`, `set_carriers_updates_snapshot`; SSH jump
+`ssh_jump_open_fails_over_when_picked_carrier_dies` piu' la suite
+`ssh_gateway_test`. Nessun timeout o registry toccato. Gli harness netns/sudo
+(`secret_leak_hunt.sh`, `public_idle_window.sh`, `vpn_netns_test.sh`) restano fuori da
+questa sotto-fase: misurano percorsi che il web transfer non usa e richiedono uno
+staging, e la 6.5 li rieseguira' serialmente registrando ogni N/A ambientale.
+
 ### 6.4 Rendere riproducibili CI e matrice browser
 
 - **Model:** `agent:gpt-5.6-luna`
@@ -64,6 +359,68 @@
 - **Unit tests:** `playwright_config_defines_required_projects_and_secret_safe_artifacts`; `package_lock_versions_equal_plan_pins`; `cargo_package_contains_dist_but_not_node_modules`; CI syntax/lint già adottato dal repository.
 - **e2e tests:** `T-WEB-CROSS` — matrix obbligatoria sopra; `T-WEB-ASSET-DRIFT` — rebuild pulita produce dist identico; `T-WEB-PACKAGE` — artefatto Cargo senza Node serve shell e completa relay; `T-WEB-BRANDED` — Chrome/Edge scheduled/manual con esito esplicito.
 - **Done:** gates green (all authoritative commands in `STATE.md` §3) + workflow locale/CI passa per tre engine e package test + nessun artifact name/log CI contiene fragment + self-review controlla exact pins e che nessun test critico sia mascherato da conditional/skip + closed in `STATE.md` (§1 → 6.5, §4 ledger row, §6 `none`, §11 board).
+
+**Esito 6.4 (2026-09-16, `agent-1:Claude-Opus-5`).** La matrice browser esisteva gia' su
+tre motori; mancava la cosa che un trasferimento e' davvero — una COPPIA — e mancava la
+prova che l'artefatto distribuibile contenga cio' che serve.
+
+**Implementato.**
+
+1. **`T-WEB-CROSS`, la matrice delle coppie.** Ogni altra spec mette lo stesso motore sui
+   due lati, una volta per progetto: prova che ciascun motore parla con SE STESSO. La
+   promessa del prodotto e' un'altra — «manda un file dal tuo Firefox al suo Safari» — e i
+   due lati NEGOZIANO (SDP, ICE, i limiti del DataChannel e le dimensioni dei frammenti che
+   ne derivano). `cross.spec.mjs` apre quindi coppie nominando i motori da dentro il test:
+   cinque coppie sul percorso diretto (chromium, firefox, webkit con se stessi, piu'
+   chromium↔firefox e chromium↔webkit) e le stesse cinque sul relay, dove il server deve
+   restare cieco al motore. Gira sotto UN solo progetto, altrimenti la stessa matrice
+   verrebbe ripetuta tre volte. Ogni braccio verifica anche i BYTE: una prova di interop
+   che si ferma a «si sono connessi» e' la prova a cui un bug di frammentazione
+   sopravvive. Risultato: 10/10.
+2. **`T-WEB-PACKAGE`, l'artefatto.** Il binario incorpora `web/transfer/dist` a tempo di
+   compilazione e il bundle e' committato proprio perche' `cargo install bore-cli` non
+   debba avere Node. Quella promessa riguarda l'INSIEME DI FILE che `cargo package`
+   spedisce, non questo checkout: un `dist` escluso compila qui e restituisce 404 li'.
+   Lo script impacchetta, controlla la lista (i cinque asset presenti; `node_modules`,
+   `test-results`, `playwright-report` assenti), ricostruisce l'albero dai SOLI file
+   elencati, compila senza alcun albero Node e poi CHIEDE l'asset al binario via HTTP
+   confrontandolo byte a byte con quello committato. `Cargo.toml` dichiara ora l'`exclude`
+   esplicito, e il gate `cargo_package_contains_dist_but_not_node_modules` lo fissa anche
+   nella suite ordinaria, cioe' dove si modifica `Cargo.toml`.
+3. **`build.rs` confronta la pagina con il bundle.** La lista degli asset richiesti provava
+   solo che il bundler fosse girato; non che pagina e bundle fossero d'accordo. Ora ogni
+   riferimento `/transfer/assets/...` dentro `index.html` deve risolvere in un asset
+   incorporato, a tempo di compilazione — red-checked rinominando `app.js` nella pagina:
+   il build fallisce nominando il file mancante invece di produrre un server che serve una
+   404 nella pagina il cui unico compito e' caricare uno script.
+4. **CI e canali branded.** Il job esistente esegue ora anche la matrice delle coppie, i
+   fuzzer con un budget CI e il gate del pacchetto. Chrome ed Edge stanno in un job
+   separato `workflow_dispatch`/schedule che li INSTALLA e fallisce se non puo': uno skip
+   silenzioso e' esattamente il modo in cui una voce di checklist diventa verde senza
+   essere mai stata eseguita. Lo stage `branded` dello script stampa `NOT-INSTALLED` per
+   canale invece di saltare in silenzio (su questa macchina: Chrome presente e verde, Edge
+   assente e dichiarato tale).
+5. **Contratto CI verificato come dato.** `ci.test.mjs` pinna i tre motori piu' i due
+   canali branded nella config, il lock esatto rispetto a `package.json` (nessun range: un
+   range e' un'installazione diversa su ogni macchina, e la matrice browser e' il posto
+   dove questo costa ore) e il fatto che `test:e2e` NOMINI i tre progetti — un progetto
+   sparito dalla config altrimenti smetterebbe di girare, in silenzio e in verde.
+
+**Lezione (misurata, non supposta): un aiuto al debug non deve cambiare cio' che osserva.**
+Attivare trace e screenshot «solo al fallimento» ha reso `three peers appear, rename and
+leave` ROSSO su WebKit in modo deterministico: entrambi STRUMENTANO la pagina — le
+snapshot del trace iniettano markup, lo screenshot WebKit inietta un foglio di stile per
+nascondere il caret — e questa pagina vive sotto `style-src 'self'` senza `unsafe-inline`.
+WebKit rifiuta, logga, e le spec trattano un errore di console come un fallimento: il gate
+falliva sulla CSP che funziona. Verificato uno alla volta (tutto spento: verde; solo video:
+verde; solo screenshot: rosso), quindi restano il video al fallimento e nient'altro. E' la
+stessa famiglia di §8: un harness che fabbrica il proprio difetto.
+
+**Test aggiunti.** `T-WEB-CROSS` (10 casi), `T-WEB-PACKAGE`
+(`scripts/web_transfer_package_test.sh` + `cargo_package_contains_dist_but_not_node_modules`),
+`playwright_config_defines_required_projects_and_secret_safe_artifacts`,
+`package_lock_versions_equal_plan_pins`, il controllo dei riferimenti in `build.rs`
+(red-checked) e gli stage `cross`, `fuzz`, `branded`, `package` nel driver.
 
 ### 6.5 Validare deployment, protocollo operativo e accettazione completa
 
@@ -75,6 +432,48 @@
 - **e2e tests:** `T-WEB-DEPLOY` — compose/release binary serve same-origin WebSocket dietro TLS/reverse-proxy fixture e completa direct+relay; `T-WEB-ACCEPTANCE` — scenario finale A/B/C con cartella ZIP, republish peer, cancel/resume e owner close; `T-WEB-NOSTORE-CONTAINER` — root read-only e filesystem/fd/log invariati; eseguire i netns/SSH gate esistenti serialmente quando prerequisiti host disponibili e registrare esplicitamente ogni N/A ambientale.
 - **Done:** gates green (all authoritative commands in `STATE.md` §3) + T-WEB-DEPLOY/ACCEPTANCE/NOSTORE-CONTAINER passano dal binario/immagine distribuibile + protocol doc e compose coincidono con flag/help + self-review operativo completa su TLS, reverse proxy, firewall, fd, memory e shutdown + closed in `STATE.md` (§1 → 6.6, §4 ledger row, §6 `none`, §11 board).
 
+**Esito 6.5 (2026-09-16, `agent-1:Claude-Opus-5`).** Il deployment e' la parte che
+nessun test unitario raggiunge: gli esempi che un operatore copia, il proxy davanti,
+il binario che spedisce e l'immagine che gira. Quattro cose sono state PROVATE invece
+che dichiarate.
+
+1. **Gli esempi di deploy sono ora verificati dal compilatore, non riletti.** I tre
+   compose portano un blocco `--- Web transfer ---` commentato: spento senza
+   `BORE_WEB_TRANSFER_BASE_URL`, NESSUNA porta nuova (la superficie vive sulla porta di
+   controllo), nessun volume (il server non conserva payload, quindi non ha niente da
+   scrivere), i requisiti del reverse proxy (`Host` e `Origin` passati intatti,
+   `Upgrade` permesso, buffering spento, timeout oltre i 70 s) e i dodici valori di
+   capacita'. `tests/web_transfer_deploy_test.rs` legge quei file: ogni variabile
+   nominata deve essere una che la CLI legge davvero, nessun esempio puo' aggiungere
+   una porta UDP o un volume, e ogni default citato e' confrontato con
+   `WebTransferLimits::default()`. Quest'ultimo gate ha trovato **cinque default
+   sbagliati** che avevo scritto a mano nei commenti — esattamente la deriva che rende
+   un esempio peggiore dell'assenza di un esempio.
+2. **`T-WEB-DEPLOY`: il proxy davvero in mezzo.** Il server ascolta su una porta e la
+   base URL e' quella del PROXY; la shell e il `welcome` arrivano attraverso il proxy,
+   e un client che scavalca il proxy presentando l'authority del listener viene
+   rifiutato — che e' il punto: `X-Forwarded-*` non e' letto e l'origine e'
+   confrontata esattamente. Il test prima scadeva invece di fallire, perche' il proxy
+   di supporto non propagava il FIN: `spawn_proxy` ora chiude la meta' di scrittura
+   opposta a EOF. Un harness che scade nasconde la differenza tra «rifiutato» e
+   «mai risposto», che e' la sola cosa che questo gate misura.
+3. **Il binario di RELEASE, non quello di debug.** Lo stage `release` costruisce
+   `--release` e ci fa girare l'accettazione (`folder-zip` + `multipeer`), il flusso
+   del README (`T-WEB-README-RELEASE`) e un confronto fra l'`--help` del binario che
+   spedisce e i flag documentati: un profilo diverso che accendesse o spegnesse una
+   feature lascerebbe la guida a descrivere bandierine che il binario scaricato non ha.
+4. **`T-WEB-NOSTORE-CONTAINER`: l'immagine spedita, root in sola lettura, nessun
+   volume.** Serve il bundle committato byte per byte, non apre alcun socket UDP,
+   ospita un trasferimento vero fatto da browser veri (1 MiB, sha256 confrontato, path
+   `relay`), esce con `docker diff` VUOTO e pubblica i gauge admin. Una lezione l'ha
+   insegnata il gate stesso: l'immagine e' `FROM scratch` — un solo binario statico,
+   niente shell e niente `cat` — quindi `docker exec ... cat /proc/net/udp` risponde
+   127 e sotto `set -e` il gate finiva in silenzio dopo due PASS, con exit 0. Ora la
+   tabella del kernel e' letta da un SIDECAR che condivide il network namespace del
+   container (`docker run --network container:<name>`), e se quell'immagine non c'e' il
+   gate stampa `N/A` invece di passare: un controllo che non ha potuto girare deve
+   dirlo.
+
 ### 6.6 Update README.md
 
 - **Model:** `agent:gpt-5.6-luna`
@@ -84,6 +483,35 @@
 - **Unit tests:** docs/help/env/default/link consistency; verifica automatica che ogni `--web-transfer-*` appaia una sola volta nella tabella autorevole e che esempi non contengano secret reali.
 - **e2e tests:** `T-WEB-README-RELEASE` — da checkout/build puliti seguire soltanto README per binary, reverse proxy e container, completare scenario A/B/C e troubleshooting principali con output atteso.
 - **Done:** un nuovo utente e un operatore possono installare, configurare, usare, osservare e diagnosticare il servizio dalla sola README; tutti gli esempi sono stati eseguiti; tutti i gate fase/repository sono verdi; self-review finale non trova dettagli interni o contraddizioni; closed in `STATE.md` con §1 `Status: none`, §6 `none`, tutte le righe §11 e stato piano `COMPLETE`.
+
+**Esito 6.6 (2026-09-16, `agent-1:Claude-Opus-5`).** La revisione finale del README ha
+trovato quello che una revisione finale deve trovare: prosa vera al momento in cui fu
+scritta e falsa adesso, e prosa che nessun gate teneva ancorata al prodotto.
+
+1. **Una riga di troubleshooting prometteva il contrario di cio' che il prodotto fa.**
+   `Cartelle e selezioni multiple non ancora supportate` era il testo di `MULTI_ENTRY`
+   dalla 3.8 — e la 5.x ha spedito cartelle, ZIP e la scelta di un singolo file
+   dall'albero, trecento righe piu' in su nella stessa pagina. Il rifiuto pero' NON e'
+   morto: e' difensivo, e si raggiunge solo quando arriva una richiesta `raw` per
+   un'offerta con piu' di un file senza nominarne uno (il pulsante della card chiede lo
+   ZIP, quindi in pratica significa che l'offerta e' cambiata fra il render e il click).
+   Il codice resta, il TESTO ora descrive il caso reale: «Offerta con piu' file: scegli
+   un file o scarica lo ZIP». Corretti insieme `state.js`, il bundle e il README.
+2. **Mancavano le righe che il piano chiedeva** — file cambiato alla sorgente, sorgente
+   irraggiungibile, offerta cambiata, bundle servito da una cache (il server manda
+   `Cache-Control: no-cache` e il bundle e' compilato DENTRO il binario, quindi un
+   bundle vecchio e' sempre un proxy che riscrive quell'header) e versione non
+   supportata. La sezione admin ora documenta anche le metriche della superficie web,
+   dicendo esplicitamente che sono AGGREGATE: rispondono a «cosa ho configurato» e «cosa
+   sta succedendo», mai a «chi trasferisce cosa».
+3. **Quattro nuovi ancoraggi in `t_web_readme`, tutti red-checked.** Una riga di flag
+   duplicata (la tabella era letta in una mappa, quindi un doppione diventava
+   silenziosamente l'ultima riga); una stringa esadecimale lunga nella guida (un id, una
+   chiave o un token VERO incollato in un esempio consegna una room a ogni lettore); un
+   messaggio di troubleshooting che la pagina non mostra piu', letto direttamente dalla
+   mappa `ERROR_TEXT` di `state.js`; e un campo admin citato che nessuna view pubblica.
+   Il tema e' sempre lo stesso: la documentazione che cita una COSTANTE del prodotto
+   deve derivarla dal prodotto, altrimenti divergono in silenzio.
 
 ---
 

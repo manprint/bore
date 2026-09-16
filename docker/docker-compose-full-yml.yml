@@ -220,6 +220,64 @@ services:
       # - BORE_VHOST_MODE=both
       # - BORE_VHOST_MODE=redirect-https
 
+      #
+      # --- Web transfer (browser-to-browser rooms on the control port) ---
+      # DISABLED until BORE_WEB_TRANSFER_BASE_URL is set. That is not a
+      # convenience: the base URL is what the server compares every WebSocket
+      # `Origin` and `Host` against, so a server with no base URL has no
+      # same-origin boundary to enforce and refuses to serve the feature at
+      # all rather than serve it unguarded.
+      #
+      # NO NEW PORTS. The room shell, the control socket and the relay all
+      # ride the control port already published above, and the DIRECT path is
+      # browser-to-browser WebRTC negotiated by the two peers themselves —
+      # this container opens no UDP socket for it (gated by
+      # `web_transfer_opens_no_udp_socket`). STUN is an OUTBOUND client
+      # concern; the servers in the list are contacted by the browsers, not
+      # by bore.
+      #
+      # The URL must be the origin a USER types, including the scheme and any
+      # non-default port, with a trailing slash:
+      # - BORE_WEB_TRANSFER_BASE_URL=https://bore.mydomain.com/
+      #
+      # Behind a reverse proxy, the hop from the proxy to bore may be plain
+      # HTTP on loopback while the base URL stays the public HTTPS origin —
+      # but the proxy MUST pass `Host` and `Origin` through unchanged (bore
+      # never trusts `X-Forwarded-*`), MUST allow the HTTP/1.1 `Upgrade`
+      # handshake on /transfer/ws/*, MUST NOT buffer or compress those
+      # connections, and MUST allow them to stay open: the control socket is
+      # idle between heartbeats, so a proxy read timeout below ~70 s cuts
+      # healthy rooms.
+      #
+      # STUN servers the BROWSERS use to find each other; empty list or
+      # BORE_WEB_TRANSFER_NO_STUN=true keeps them on host candidates (a LAN
+      # works, most NATs do not, and the relay takes over). No TURN.
+      # - BORE_WEB_TRANSFER_STUN=stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302
+      # - BORE_WEB_TRANSFER_NO_STUN=false
+      #
+      # Capacity. Every one of these is a CONFIGURED total, published on
+      # /admin/api/v1/config and never confused with the live gauges on
+      # /admin/api/v1/metrics. Defaults shown; leaving them commented is the
+      # same as setting them and picks up a future change to the tested
+      # values.
+      # - BORE_WEB_TRANSFER_MAX_ROOMS=1024
+      # - BORE_WEB_TRANSFER_MAX_PEERS=4096
+      # - BORE_WEB_TRANSFER_MAX_PEERS_PER_ROOM=32
+      # - BORE_WEB_TRANSFER_MAX_OFFERS_PER_PEER=64
+      # - BORE_WEB_TRANSFER_MAX_ENTRIES_PER_OFFER=10000
+      # - BORE_WEB_TRANSFER_MAX_OFFER_BYTES=1099511627776
+      # - BORE_WEB_TRANSFER_MAX_METADATA_PER_ROOM=16777216
+      # - BORE_WEB_TRANSFER_MAX_METADATA_TOTAL=268435456
+      # - BORE_WEB_TRANSFER_MAX_TRANSFERS_PER_PEER=8
+      # - BORE_WEB_TRANSFER_MAX_RELAYS=256
+      # - BORE_WEB_TRANSFER_RELAY_RATE=104857600
+      # - BORE_WEB_TRANSFER_OWNER_GRACE=60
+      #
+      # NO VOLUME IS NEEDED, and none should be added. The server holds no
+      # payload: relayed frames are opaque ciphertext passed between two
+      # sockets and never touch the filesystem, so this service is compatible
+      # with a read-only root filesystem and every file a room produces lives
+      # in the RECIPIENT's browser (OPFS).
     volumes:
       - ./certs:/certs:ro
       - ./config-full.example.yml:/vhost/config-full.example.yml:ro

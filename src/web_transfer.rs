@@ -18,9 +18,13 @@ use std::{
 
 use anyhow::{bail, Result};
 use dashmap::DashMap;
+use futures_util::stream::BoxStream;
 use sha2::{Digest, Sha256};
-use tokio::sync::{broadcast, mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, warn};
 
 /// Browser/native protocol version. Versioned envelopes reject anything else.
 pub const WEB_TRANSFER_PROTOCOL_VERSION: u16 = 1;
@@ -59,6 +63,8 @@ pub const WEB_TRANSFER_MAX_SDP_BYTES: usize = 64 * 1024;
 pub const WEB_TRANSFER_MAX_ICE_CANDIDATE_BYTES: usize = 4 * 1024;
 /// Largest accepted ICE candidate count per side.
 pub const WEB_TRANSFER_MAX_ICE_CANDIDATES_PER_SIDE: usize = 128;
+/// Maximum `sdpMid` length on a forwarded ICE candidate.
+pub const WEB_TRANSFER_MAX_ICE_SDP_MID_BYTES: usize = 64;
 /// Largest accepted peer display name (Unicode scalar values).
 pub const WEB_TRANSFER_MAX_DISPLAY_NAME_CHARS: usize = 48;
 /// Largest accepted manifest entry path (bytes).
@@ -229,6 +235,13 @@ impl OwnerToken {
 
 impl RoomKey {
     /// Hash used only as a key-derivation domain separator input, never logged.
+    pub fn sha256_hash(&self) -> [u8; 32] {
+        sha256_bytes(self.0.as_slice())
+    }
+}
+
+impl RelayTicket {
+    /// Hash stored server-side; the raw ticket is shown once to its peer.
     pub fn sha256_hash(&self) -> [u8; 32] {
         sha256_bytes(self.0.as_slice())
     }
@@ -775,6 +788,7 @@ mod assets_tests {
                 "/transfer/assets/app.js",
                 "/transfer/assets/index.html",
                 "/transfer/assets/offer-worker.js",
+                "/transfer/assets/stage-worker.js",
             ],
             "generated map holds exactly the committed shell files"
         );
@@ -836,6 +850,30 @@ impl WebTransferError {
     pub fn offer_not_found(message: impl Into<String>) -> Self {
         Self {
             code: "OFFER_NOT_FOUND",
+            message: message.into(),
+        }
+    }
+
+    /// Referenced transfer does not exist.
+    pub fn transfer_not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: "TRANSFER_NOT_FOUND",
+            message: message.into(),
+        }
+    }
+
+    /// Serving peer is not online.
+    pub fn source_offline(message: impl Into<String>) -> Self {
+        Self {
+            code: "SOURCE_OFFLINE",
+            message: message.into(),
+        }
+    }
+
+    /// Source content no longer matches the published offer.
+    pub fn source_changed(message: impl Into<String>) -> Self {
+        Self {
+            code: "SOURCE_CHANGED",
             message: message.into(),
         }
     }
@@ -920,11 +958,237 @@ pub struct OfferRecord {
     pub metadata_bytes: u64,
 }
 
-/// Transfer metadata placeholder (accounting only; Phase 3 adds state).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Server-side transfer lifecycle state. The record's presence in a
+/// non-terminal state IS each party's active permit (counted against
+/// `max_transfers_per_peer`); the relay semaphore permit lives in the live
+/// attempt and drops exactly at the terminal transition.
+#[derive(Debug)]
 pub struct TransferRecord {
-    /// Control bytes charged against the room metadata budget.
-    pub metadata_bytes: u64,
+    /// Server-allocated transfer ID (map key, duplicated for events).
+    pub transfer_id: TransferId,
+    /// Offer being pulled.
+    pub offer_id: OfferId,
+    /// Publishing peer (only it may ready/reject for its side).
+    pub source: PeerId,
+    /// Requesting peer (only it may request/complete).
+    pub recipient: PeerId,
+    /// Digest over the selection, recomputed from stored state per message.
+    pub selection_digest: [u8; 32],
+    /// Selected file entry ID for `raw`; the reserved archive ID
+    /// ([`crate::web_transfer_protocol::RESERVED_ZIP_ENTRY_ID`]) for `zip`.
+    pub entry_id: u32,
+    /// Rolling root of the selected entry, copied from the manifest at
+    /// request time (completions compare against it without re-parsing).
+    /// `None` for `zip`: an archive's root is dynamic and the server never
+    /// learns it — the recipient checks it against the sealed FINAL frame.
+    pub entry_root: Option<[u8; 32]>,
+    /// Logical size of the selected entry in bytes, `None` for `zip` for the
+    /// same reason as `entry_root`.
+    pub entry_size: Option<u64>,
+    /// Transfer mode.
+    pub mode: TransferMode,
+    /// Optional resume descriptor (shape-checked; verified at send).
+    pub resume: Option<ResumeDescriptor>,
+    /// Lifecycle state.
+    pub state: TransferState,
+    /// Current attempt number (1-based, checked increments).
+    pub attempt_number: u64,
+    /// Current attempt ID, if any attempt started.
+    pub attempt_id: Option<AttemptId>,
+    /// Live attempt resources (relay permit); `None` before admission.
+    pub attempt: Option<AttemptState>,
+    /// The direct attempt that most recently fell back, if any. It is what
+    /// lets a recipient's `transfer.direct_failed` that LOST the race to the
+    /// source's own report still be recognised as describing that attempt —
+    /// see `adopt_late_recipient_resume`.
+    pub last_direct_attempt: Option<AttemptId>,
+    /// The attempt whose path has already been counted as CARRIED. An
+    /// attempt counts at most once, at the first recipient report with
+    /// verified bytes on it; a fallback that carried bytes on both paths
+    /// counts on both, which is the truth about that transfer.
+    pub carried_attempt: Option<AttemptId>,
+    /// Set at the terminal transition; the record lingers this long so late
+    /// duplicates answer idempotently, then GC frees it.
+    pub terminated_at: Option<Instant>,
+    /// Cancelled exactly once at the terminal transition. The relay pump and
+    /// any parked attach waiter select on it; both exit without further
+    /// notices (the transition that cancelled them already notified).
+    pub cancel: CancellationToken,
+}
+
+/// Transfer lifecycle states (protocol order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferState {
+    /// Validated and recorded; incoming send pending.
+    Requested,
+    /// `transfer.incoming` sent; awaiting the source reply.
+    WaitingSource,
+    /// Source ready; attempt minted, relay admission pending or retryable.
+    /// Reached from the direct path's fallback, never from `source_ready`
+    /// itself — Phase 4 always tries WebRTC before any relay slot is asked
+    /// for.
+    WaitingRelay,
+    /// Source ready and the direct attempt is negotiating: both peers hold a
+    /// `transfer.direct_start`, signaling is forwarded between exactly the
+    /// two of them and the 10 s deadline is armed. **No relay permit is
+    /// held in this state** — a direct transfer that never needs one must
+    /// never take one.
+    NegotiatingDirect {
+        /// When `transfer.direct_start` went out; the deadline runs from it.
+        started_at: Instant,
+        /// The source declared its DataChannel usable.
+        ready_source: bool,
+        /// The recipient declared its DataChannel usable.
+        ready_recipient: bool,
+        /// Forwarded `rtc.ice` messages from the source (cap 128).
+        candidates_source: u32,
+        /// Forwarded `rtc.ice` messages from the recipient (cap 128).
+        candidates_recipient: u32,
+        /// The recipient's single `rtc.offer` has been forwarded.
+        offer_seen: bool,
+        /// The source's single `rtc.answer` has been forwarded.
+        answer_seen: bool,
+    },
+    /// Both peers ready and `path_commit direct` sent: payload rides the
+    /// DataChannel and the server is on no part of it.
+    ActiveDirect,
+    /// Both legs attached (Phase 3.2 relay pump owns the transition here).
+    Active,
+    /// Recipient-verified completion.
+    Completed,
+    /// Cancelled by a participant (or source rejection / cleanup).
+    Cancelled,
+    /// Failed attach or attempt fault (reached from Phase 3.2 paths).
+    Failed,
+}
+
+impl TransferState {
+    /// Whether the transfer still holds permits and accepts messages.
+    pub fn is_live(self) -> bool {
+        matches!(
+            self,
+            TransferState::Requested
+                | TransferState::WaitingSource
+                | TransferState::WaitingRelay
+                | TransferState::NegotiatingDirect { .. }
+                | TransferState::ActiveDirect
+                | TransferState::Active
+        )
+    }
+
+    /// Whether the direct attempt is still negotiating (the only state the
+    /// deadline timer and the signaling forwarders accept).
+    pub fn is_negotiating_direct(self) -> bool {
+        matches!(self, TransferState::NegotiatingDirect { .. })
+    }
+
+    /// Whether payload may be moving on this state, on either transport.
+    /// `transfer.complete` is valid from exactly these two.
+    pub fn is_carrying(self) -> bool {
+        matches!(self, TransferState::Active | TransferState::ActiveDirect)
+    }
+}
+
+/// SDP role a peer plays in the direct attempt. Fixed by the protocol and
+/// never negotiated: the recipient is always the offerer (it also creates
+/// the one DataChannel), the source always the answerer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectRole {
+    /// Creates the DataChannel, the offer and sends `rtc.offer`.
+    Offerer,
+    /// Answers with `rtc.answer` and takes the channel from `ondatachannel`.
+    Answerer,
+}
+
+impl DirectRole {
+    /// Wire value carried by `transfer.direct_start`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DirectRole::Offerer => "offerer",
+            DirectRole::Answerer => "answerer",
+        }
+    }
+}
+
+/// Transfer mode (only `raw` on the wire in this phase).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferMode {
+    /// Raw single-file bytes.
+    Raw,
+    /// The whole offer as one generated archive. The archive's length and
+    /// root are DYNAMIC — they are not in the manifest, because the archive
+    /// does not exist until it is generated — so the server holds neither
+    /// and the recipient authenticates both from the sealed FINAL frame.
+    Zip,
+}
+
+/// Resume descriptor carried on requests (verified at send time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeDescriptor {
+    /// Verified `[start, endExclusive)` chunk ranges, sorted, disjoint.
+    pub verified_ranges: Vec<(u64, u64)>,
+    /// Expected output length in bytes.
+    pub output_length: u64,
+}
+
+/// Live attempt resources. Dropping releases the relay permit immediately;
+/// terminal transitions take it out first so release never waits for GC.
+#[derive(Debug)]
+pub struct AttemptState {
+    /// Attempt this state belongs to.
+    pub attempt_id: AttemptId,
+    /// 1-based attempt number.
+    pub attempt_number: u64,
+    /// Held relay slot, if admission granted one.
+    pub relay_permit: Option<OwnedSemaphorePermit>,
+}
+
+/// One relay ticket as stored: hash only, never the raw value.
+#[derive(Debug, Clone)]
+pub struct RelayTicketRecord {
+    /// SHA-256 of the raw ticket (lookup key).
+    pub ticket_hash: [u8; 32],
+    /// Transfer the ticket attaches.
+    pub transfer_id: TransferId,
+    /// Attempt the ticket attaches.
+    pub attempt_id: AttemptId,
+    /// Peer the ticket was issued to.
+    pub peer_id: PeerId,
+    /// Leg the ticket opens.
+    pub role: RelayRole,
+    /// Deadline for both legs to attach (30 s from issue).
+    pub expires_at: Instant,
+}
+
+/// Relay leg a ticket opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayRole {
+    /// Offering peer's leg.
+    Source,
+    /// Requesting peer's leg.
+    Recipient,
+}
+
+/// Validated ticket use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TicketGrant {
+    /// Transfer the leg attaches.
+    pub transfer_id: TransferId,
+    /// Attempt the leg attaches.
+    pub attempt_id: AttemptId,
+    /// Peer the ticket was issued to.
+    pub peer_id: PeerId,
+}
+
+/// Why a presented ticket is refused (typed for the attach path's mapping).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketDeny {
+    /// Unknown hash or already consumed.
+    Unknown,
+    /// Past its deadline.
+    Expired,
+    /// Bound to the other leg.
+    RoleMismatch,
 }
 
 /// Room metadata: token hashes, owner lease, member maps and counters. Never
@@ -1046,6 +1310,30 @@ pub struct WebTransferRoom {
     /// Holds one global room slot for the room's whole life.
     #[allow(dead_code)]
     room_permit: OwnedSemaphorePermit,
+    /// Live control sessions by peer for targeted delivery (incoming,
+    /// tickets, cancel/complete notices). Bounded by the per-room peer cap.
+    /// Lock order: `state` first, then `sessions` — never the reverse.
+    pub(crate) sessions: std::sync::Mutex<HashMap<PeerId, mpsc::Sender<String>>>,
+    /// Shared relay throttle for this room's pumps (rate from limits, burst
+    /// exactly 2×rate capped at 200 MiB, disabled when the rate is 0).
+    /// Short lock per forwarded frame; never held across await.
+    pub(crate) relay_throttle: std::sync::Mutex<RelayThrottle>,
+}
+
+impl WebTransferRoom {
+    /// Best-effort targeted delivery to one live control session. Never
+    /// blocks: a full queue means the peer's own slow-path machinery reaps
+    /// it; the transition already committed.
+    pub(crate) fn send_to(&self, peer_id: PeerId, message: String) -> bool {
+        let sender = match self.sessions.lock() {
+            Ok(sessions) => sessions.get(&peer_id).cloned(),
+            Err(_) => None,
+        };
+        match sender {
+            Some(tx) => tx.try_send(message).is_ok(),
+            None => false,
+        }
+    }
 }
 
 /// RAII peer membership: holds one global peer slot; dropping removes the
@@ -1150,12 +1438,62 @@ pub(crate) struct RegistryInner {
     room_permits: Arc<Semaphore>,
     peer_permits: Arc<Semaphore>,
     relay_permits: Arc<Semaphore>,
+    /// Upgrades in flight; released the moment the handshake finishes, so it
+    /// bounds the HANDSHAKE and never the session that follows it.
+    handshake_permits: Arc<Semaphore>,
     peers_current: AtomicU64,
     metadata_current: AtomicU64,
     transfers_current: AtomicU64,
+    /// Live offers across all rooms: incremented when a record enters a
+    /// room's catalog and decremented on every path that removes one
+    /// (withdraw, the owner peer leaving, room destruction).
+    offers_current: AtomicU64,
+    /// Cumulative CIPHERTEXT bytes forwarded by the relay. Counted per
+    /// forwarded frame, not at the end of a pump: a total that only moves
+    /// when a transfer finishes cannot answer "is the relay busy now".
+    relay_bytes_total: AtomicU64,
+    /// Cumulative transfers that reached `Completed` / `Cancelled`.
+    completed_total: AtomicU64,
+    cancelled_total: AtomicU64,
+    /// Cumulative admissions REFUSED because a configured cap or rate was
+    /// reached: room/peer/offer/metadata/transfer/relay budgets, the
+    /// pre-auth rate limiter and the pending-handshake semaphore. A failure
+    /// is not a refusal and is deliberately not counted here.
+    rejected_total: AtomicU64,
+    /// Attempts that CARRIED on each path, counted once per attempt at the
+    /// first recipient report with verified bytes on it — never at the
+    /// commit. F-12 measured the other shape on the native side:
+    /// `direct_stream_opens` counted attempts and climbed 1 -> 12 during a
+    /// blackout that moved nothing, so an operator reading it saw a healthy
+    /// direct path serving a tunnel that was entirely on the relay. These
+    /// two follow the ONLY party that knows (the recipient verified the
+    /// bytes) and the ONLY path the server itself committed.
+    direct_carried: AtomicU64,
+    relay_carried: AtomicU64,
     /// Pre-authentication rate state by source IP (bounded LRU + overflow
     /// bucket). Guarded by a short synchronous lock; never held across await.
     pre_auth: std::sync::Mutex<PreAuthLimiter>,
+    /// Pre-authentication FAILURES by source IP, sampled logarithmically.
+    /// Same bound and same TTL as the limiter above: a log line per refusal
+    /// is itself an amplifier (one scanner writes the disk), and a counter
+    /// per IP with no bound is the same memory leak the limiter avoids.
+    auth_failures: std::sync::Mutex<AuthFailureSampler>,
+    /// Live relay tickets by hash (hash only, never raw values). Entries die
+    /// on consume, on their terminal transition, or lazily at expiry — never
+    /// by timer task.
+    tickets: DashMap<[u8; 32], RelayTicketRecord>,
+    /// First-leg sockets parked while waiting for their pair, keyed by
+    /// `(transfer, attempt)`. The parked task owns its own socket and removes
+    /// the entry on every exit; entries hold only a handoff sender plus
+    /// metadata, never payload.
+    relay_waiters: DashMap<(TransferId, AttemptId), RelayWaiter>,
+    /// How long relay admission waits for a slot (30 s; tests shorten it).
+    admit_timeout: std::sync::Mutex<Duration>,
+    /// How long the direct attempt has to reach both-ready before the
+    /// automatic relay fallback (10 s; tests shorten it).
+    direct_deadline: std::sync::Mutex<Duration>,
+    /// Relay ticket lifetime (30 s; both legs must attach inside it).
+    ticket_ttl: Duration,
 }
 
 /// Server-side room registry: exactly one per enabled server, shared by every
@@ -1189,10 +1527,24 @@ impl WebTransferRegistry {
                 room_permits: new_sem(limits.max_rooms)?,
                 peer_permits: new_sem(limits.max_peers_global)?,
                 relay_permits: new_sem(limits.max_relays_global)?,
+                handshake_permits: Arc::new(Semaphore::new(WEB_TRANSFER_PENDING_HANDSHAKES)),
                 peers_current: AtomicU64::new(0),
                 metadata_current: AtomicU64::new(0),
                 transfers_current: AtomicU64::new(0),
+                offers_current: AtomicU64::new(0),
+                relay_bytes_total: AtomicU64::new(0),
+                completed_total: AtomicU64::new(0),
+                cancelled_total: AtomicU64::new(0),
+                rejected_total: AtomicU64::new(0),
+                direct_carried: AtomicU64::new(0),
+                relay_carried: AtomicU64::new(0),
                 pre_auth: std::sync::Mutex::new(PreAuthLimiter::default()),
+                auth_failures: std::sync::Mutex::new(AuthFailureSampler::default()),
+                tickets: DashMap::new(),
+                relay_waiters: DashMap::new(),
+                admit_timeout: std::sync::Mutex::new(WEB_TRANSFER_RELAY_ADMIT_TIMEOUT),
+                direct_deadline: std::sync::Mutex::new(WEB_TRANSFER_DIRECT_DEADLINE),
+                ticket_ttl: WEB_TRANSFER_TICKET_TTL,
             }),
         })
     }
@@ -1227,20 +1579,85 @@ impl WebTransferRegistry {
         self.inner.metadata_current.load(Ordering::Relaxed)
     }
 
-    /// Live transfer count across all rooms. First consumers arrive in Phase 3.
-    #[allow(dead_code)]
-    pub(crate) fn current_transfers(&self) -> u64 {
+    /// Live transfer count across all rooms (records in non-terminal
+    /// states). First consumers arrive in Phase 3.
+    pub fn current_transfers(&self) -> u64 {
         self.inner.transfers_current.load(Ordering::Relaxed)
     }
 
+    /// Live offer count across all rooms.
+    pub fn current_offers(&self) -> u64 {
+        self.inner.offers_current.load(Ordering::Relaxed)
+    }
+
+    /// Relay slots still FREE right now. The CONFIGURED total is
+    /// `max_relays_global`; publishing both is P-11's rule, and a zero here
+    /// is the alarming value, never the absent one.
+    pub fn relay_slots_available(&self) -> u64 {
+        self.inner.relay_permits.available_permits() as u64
+    }
+
+    /// Cumulative ciphertext bytes the relay has forwarded.
+    pub fn relay_ciphertext_bytes(&self) -> u64 {
+        self.inner.relay_bytes_total.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative transfers that reached `Completed`.
+    pub fn completed_total(&self) -> u64 {
+        self.inner.completed_total.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative transfers that reached `Cancelled`.
+    pub fn cancelled_total(&self) -> u64 {
+        self.inner.cancelled_total.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative admissions refused for capacity (see `rejected_total`).
+    pub fn rejected_total(&self) -> u64 {
+        self.inner.rejected_total.load(Ordering::Relaxed)
+    }
+
+    /// Counts one capacity refusal and hands the error back to propagate.
+    ///
+    /// Every LIMIT_EXCEEDED the registry produces goes through here, so the
+    /// counter cannot drift from the refusals an operator actually sees: a
+    /// new cap added later is counted by construction if it is refused with
+    /// this helper.
+    fn refused(&self, error: WebTransferError) -> WebTransferError {
+        self.inner.rejected_total.fetch_add(1, Ordering::Relaxed);
+        error
+    }
+
+    /// Cumulative attempts that carried verified bytes on the DIRECT path.
+    /// A TOTAL, never a gauge (P-11): it only grows, and it answers "how
+    /// many transfers has this server seen ride the DataChannel", which no
+    /// live value can express.
+    pub fn direct_carried(&self) -> u64 {
+        self.inner.direct_carried.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative attempts that carried verified bytes on the RELAY path.
+    /// Same rule as [`Self::direct_carried`]; the pair is only meaningful
+    /// read together, because a fallback contributes to both.
+    pub fn relay_carried(&self) -> u64 {
+        self.inner.relay_carried.load(Ordering::Relaxed)
+    }
+
     /// Live relay-pair count (derived from the semaphore).
-    #[allow(dead_code)]
-    pub(crate) fn current_relays(&self) -> u64 {
+    pub fn current_relays(&self) -> u64 {
         self.inner
             .config
             .limits
             .max_relays_global
             .saturating_sub(self.inner.relay_permits.available_permits() as u64)
+    }
+
+    /// Overrides the relay admission wait (default 30 s). Intended for
+    /// tests; production uses [`WEB_TRANSFER_RELAY_ADMIT_TIMEOUT`].
+    pub fn set_relay_admit_timeout(&self, timeout: Duration) {
+        if let Ok(mut slot) = self.inner.admit_timeout.lock() {
+            *slot = timeout;
+        }
     }
 
     /// Creates a room: reserves the global slot, generates a nonzero ID
@@ -1257,7 +1674,11 @@ impl WebTransferRegistry {
             }
             let permit = Arc::clone(&self.inner.room_permits)
                 .try_acquire_owned()
-                .map_err(|_| WebTransferError::limit("web-transfer room budget exhausted"))?;
+                .map_err(|_| {
+                    self.refused(WebTransferError::limit(
+                        "web-transfer room budget exhausted",
+                    ))
+                })?;
             let room = Arc::new(WebTransferRoom {
                 id,
                 limits: self.inner.config.limits,
@@ -1280,6 +1701,10 @@ impl WebTransferRegistry {
                 destroyed: AtomicBool::new(false),
                 registry: Arc::downgrade(&self.inner),
                 room_permit: permit,
+                sessions: std::sync::Mutex::new(HashMap::new()),
+                relay_throttle: std::sync::Mutex::new(RelayThrottle::new(
+                    self.inner.config.limits.relay_rate_bytes_per_s,
+                )),
             });
             match self.inner.rooms.entry(id) {
                 dashmap::mapref::entry::Entry::Occupied(_) => continue,
@@ -1328,14 +1753,18 @@ impl WebTransferRegistry {
         };
         let permit = Arc::clone(&self.inner.peer_permits)
             .try_acquire_owned()
-            .map_err(|_| WebTransferError::limit("web-transfer peer budget exhausted"))?;
+            .map_err(|_| {
+                self.refused(WebTransferError::limit(
+                    "web-transfer peer budget exhausted",
+                ))
+            })?;
         let event = {
             let mut state = room
                 .state
                 .lock()
                 .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
             if state.peers.len() >= room.limits.max_peers_per_room as usize {
-                return Err(WebTransferError::limit("room peer budget exhausted"));
+                return Err(self.refused(WebTransferError::limit("room peer budget exhausted")));
             }
             if state.peers.contains_key(&peer_id) {
                 return Err(WebTransferError::invalid("peer already joined"));
@@ -1446,19 +1875,20 @@ impl WebTransferRegistry {
                 .map_err(|_| WebTransferError::limit("web-transfer metadata budget exhausted"))?;
             let owned = state.offers.values().filter(|o| o.owner == peer_id).count();
             if owned >= room.limits.max_offers_per_peer as usize {
-                return Err(WebTransferError::limit("peer offer budget exhausted"));
+                return Err(self.refused(WebTransferError::limit("peer offer budget exhausted")));
             }
             let next = state
                 .metadata_bytes
                 .checked_add(charge)
                 .ok_or_else(|| WebTransferError::limit("web-transfer metadata budget exhausted"))?;
             if next > room.limits.max_metadata_per_room_bytes {
-                return Err(WebTransferError::limit(
+                return Err(self.refused(WebTransferError::limit(
                     "web-transfer metadata budget exhausted",
-                ));
+                )));
             }
             let revision = checked_room_revision(state.revision, 1)?;
             state.metadata_bytes = next;
+            self.inner.offers_current.fetch_add(1, Ordering::Relaxed);
             state.offers.insert(
                 offer_id,
                 OfferRecord {
@@ -1496,7 +1926,7 @@ impl WebTransferRegistry {
         peer_id: PeerId,
         offer_id: OfferId,
     ) -> Result<WithdrawOutcome, WebTransferError> {
-        let event = {
+        let (event, outbox) = {
             let mut state = room
                 .state
                 .lock()
@@ -1512,20 +1942,37 @@ impl WebTransferRegistry {
             }
             let revision = checked_room_revision(state.revision, 1)?;
             let record = state.offers.remove(&offer_id).expect("offer checked above");
+            self.inner.offers_current.fetch_sub(1, Ordering::Relaxed);
             state.metadata_bytes = state.metadata_bytes.saturating_sub(record.metadata_bytes);
-            if let Some(registry) = room.registry.upgrade() {
+            let inner = room.registry.upgrade();
+            if let Some(registry) = &inner {
                 registry
                     .metadata_current
                     .fetch_sub(record.metadata_bytes, Ordering::Relaxed);
             }
+            // Withdrawing cancels every transfer of this offer first.
+            let mut outbox = Vec::new();
+            cancel_where_locked(
+                inner.as_deref(),
+                &mut state,
+                peer_id,
+                |transfer| transfer.offer_id == offer_id,
+                &mut outbox,
+            );
             state.revision = revision;
-            RoomEvent::OfferRemoved {
-                peer: peer_id,
-                offer: offer_id,
-                revision: state.revision,
-            }
+            (
+                RoomEvent::OfferRemoved {
+                    peer: peer_id,
+                    offer: offer_id,
+                    revision: state.revision,
+                },
+                outbox,
+            )
         };
         let _ = room.events.send(event);
+        for (peer, message) in outbox {
+            let _ = room.send_to(peer, message);
+        }
         Ok(WithdrawOutcome::Removed)
     }
 
@@ -1541,9 +1988,9 @@ impl WebTransferRegistry {
                 .checked_add(bytes)
                 .ok_or_else(|| WebTransferError::limit("web-transfer metadata budget exhausted"))?;
             if next > cap {
-                return Err(WebTransferError::limit(
+                return Err(self.refused(WebTransferError::limit(
                     "web-transfer metadata budget exhausted",
-                ));
+                )));
             }
             match self.inner.metadata_current.compare_exchange_weak(
                 current,
@@ -1568,7 +2015,48 @@ impl WebTransferRegistry {
     pub fn try_acquire_relay(&self) -> Result<OwnedSemaphorePermit, WebTransferError> {
         Arc::clone(&self.inner.relay_permits)
             .try_acquire_owned()
-            .map_err(|_| WebTransferError::limit("web-transfer relay budget exhausted"))
+            .map_err(|_| {
+                self.refused(WebTransferError::limit(
+                    "web-transfer relay budget exhausted",
+                ))
+            })
+    }
+
+    /// Acquires one pending-handshake slot, or `None` when they are all held.
+    ///
+    /// Non-blocking by design: queueing here would convert a burst into a
+    /// pile of waiting tasks, which is the state this bound exists to refuse.
+    /// The caller answers a generic `503` and closes — the refusal says
+    /// nothing about the room, which is the same rule every other pre-auth
+    /// refusal on this surface follows.
+    pub fn try_acquire_handshake(&self) -> Option<OwnedSemaphorePermit> {
+        let permit = Arc::clone(&self.inner.handshake_permits)
+            .try_acquire_owned()
+            .ok();
+        if permit.is_none() {
+            // A 503 is a refusal for capacity like any other, and this one
+            // happens BEFORE there is a session to report it on: if it were
+            // not counted here it would be counted nowhere.
+            self.inner.rejected_total.fetch_add(1, Ordering::Relaxed);
+        }
+        permit
+    }
+
+    /// Pending-handshake slots still free (tests and the audit gate).
+    pub fn handshake_slots_available(&self) -> usize {
+        self.inner.handshake_permits.available_permits()
+    }
+
+    /// Records a pre-authentication FAILURE from `ip` and answers with the
+    /// running count when this one is worth a log line (1st, 2nd, 4th, 8th …).
+    ///
+    /// The caller logs the IP and the count and NOTHING else: which room was
+    /// addressed, and whether the token was absent, malformed or simply
+    /// wrong, are all things the refusal deliberately keeps
+    /// indistinguishable, and a log line is not an exception to that.
+    pub fn note_auth_failure(&self, ip: IpAddr) -> Option<u64> {
+        let mut sampler = self.inner.auth_failures.lock().ok()?;
+        sampler.note(ip, Instant::now())
     }
 
     /// Pre-authentication rate check by source IP. Consumed once per inbound
@@ -1578,7 +2066,11 @@ impl WebTransferRegistry {
         let Ok(mut limiter) = self.inner.pre_auth.lock() else {
             return true;
         };
-        limiter.check(ip, Instant::now())
+        let allowed = limiter.check(ip, Instant::now());
+        if !allowed {
+            self.inner.rejected_total.fetch_add(1, Ordering::Relaxed);
+        }
+        allowed
     }
 }
 
@@ -1658,7 +2150,15 @@ pub const WEB_TRANSFER_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Uniform delay before closing on any pre-auth failure (absent room, bad
 /// token, exhausted cap): identical response, identical timing, no oracle.
 pub const WEB_TRANSFER_AUTH_FAIL_DELAY: Duration = Duration::from_millis(500);
-/// Peer-ID collision retries before creation fails `INTERNAL`.
+/// How long relay admission waits for a global slot before answering
+/// `RELAY_BUSY` and leaving the transfer resumable without a permit.
+pub const WEB_TRANSFER_RELAY_ADMIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Relay ticket lifetime: both legs must attach inside it (Phase 3.2).
+pub const WEB_TRANSFER_TICKET_TTL: Duration = Duration::from_secs(30);
+/// Terminal transfer records linger this long so late duplicates answer
+/// idempotently, then GC frees them (permits release at transition, not GC).
+pub const WEB_TRANSFER_TERMINAL_RETENTION: Duration = Duration::from_secs(5 * 60);
+/// Peer-ID/transfer/attempt ID collision retries before failing `INTERNAL`.
 pub const WEB_TRANSFER_PEER_ID_RETRIES: usize = 8;
 /// Capacity of one session's outgoing control queue; a full queue closes the
 /// slow peer and lets its `PeerGuard` clean up.
@@ -1675,6 +2175,20 @@ pub const WEB_TRANSFER_MUTATION_BURST: f64 = 8.0;
 pub const WEB_TRANSFER_PRE_AUTH_RATE_PER_SEC: f64 = 10.0 / 60.0;
 /// Burst of the per-IP pre-auth bucket (attempts).
 pub const WEB_TRANSFER_PRE_AUTH_BURST: f64 = 20.0;
+/// Upgrades that may sit in the WebSocket handshake at the same time.
+///
+/// The handshake is the one stretch of an inbound connection that is paid for
+/// before anything about the caller is known: it has passed the Origin and
+/// subprotocol check and nothing else, so it is not yet a peer, not yet a
+/// room member and not counted by any of the caps below. Without a bound, a
+/// caller that opens sockets and then falls silent buys unbounded server-side
+/// task and buffer state for free.
+pub const WEB_TRANSFER_PENDING_HANDSHAKES: usize = 256;
+/// Deadline for ONE WebSocket upgrade, from the accepted socket to the
+/// completed handshake. A caller that takes longer is not distinguishable
+/// from one that will never finish, and the slot it holds is the scarce
+/// thing.
+pub const WEB_TRANSFER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound on tracked source IPs; further unseen IPs share one overflow
 /// bucket so the map itself cannot grow.
 pub const WEB_TRANSFER_PRE_AUTH_MAX_IPS: usize = 8192;
@@ -1766,6 +2280,31 @@ impl TokenBucket {
             false
         }
     }
+
+    /// Takes `n` tokens for a byte-sized forward; returns how long the
+    /// caller must wait first (`ZERO` when covered). Debt is bounded by one
+    /// burst so a huge frame cannot mortgage the far future.
+    pub fn take_bytes(&mut self, now: Instant, n: u64) -> Duration {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.rate_per_sec).min(self.burst);
+            self.last = now;
+        }
+        self.tokens -= n as f64;
+        if self.tokens >= 0.0 {
+            return Duration::ZERO;
+        }
+        if self.tokens < -self.burst {
+            self.tokens = -self.burst;
+        }
+        Duration::from_secs_f64((-self.tokens) / self.rate_per_sec)
+    }
+
+    /// Burst ceiling for tests.
+    #[cfg(test)]
+    pub fn burst_for_test(&self) -> f64 {
+        self.burst
+    }
 }
 
 /// Bounded per-IP pre-auth limiter: exactly `WEB_TRANSFER_PRE_AUTH_MAX_IPS`
@@ -1855,6 +2394,89 @@ impl PreAuthLimiter {
         let ok = bucket.take(now);
         self.entries.push_back((ip, bucket, now));
         ok
+    }
+}
+
+/// Bounded per-IP counter of pre-authentication failures, reported
+/// LOGARITHMICALLY: the 1st, 2nd, 4th, 8th … failure from one address.
+///
+/// Same rule as the SSH gateway's repeated username mismatches, and for the
+/// same reason: a line per refusal turns a scanner into a log-volume attack
+/// on the operator, while silence hides the one case a human must see — a
+/// single address failing thousands of times. Powers of two report the
+/// ORDER OF MAGNITUDE, which is what the operator actually acts on, at a cost
+/// that grows as log(n).
+#[derive(Debug)]
+pub struct AuthFailureSampler {
+    /// `(ip, failures, last seen)`, oldest first; linear scan at 8192 is
+    /// cheaper than a second index, exactly as in the limiter above.
+    entries: VecDeque<(IpAddr, u64, Instant)>,
+    /// Idle TTL (field so tests run fast with a short TTL).
+    ttl: Duration,
+}
+
+impl Default for AuthFailureSampler {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            ttl: WEB_TRANSFER_PRE_AUTH_IP_TTL,
+        }
+    }
+}
+
+impl AuthFailureSampler {
+    /// Records one failure for `ip`; returns the running count when this
+    /// failure is one the caller should LOG, and `None` when it is one of the
+    /// many between two powers of two.
+    ///
+    /// At capacity an unseen IP is counted as a FIRST failure and not
+    /// tracked: reporting it once is the useful half, and evicting a tracked
+    /// address to make room would let an IP scan silence the sampler.
+    pub fn note(&mut self, ip: IpAddr, now: Instant) -> Option<u64> {
+        let mut found = None;
+        for (index, (addr, _, seen)) in self.entries.iter().enumerate() {
+            if *addr == ip {
+                found = Some(index);
+                if now.saturating_duration_since(*seen) >= self.ttl {
+                    self.entries.remove(index);
+                    found = None;
+                }
+                break;
+            }
+        }
+        if let Some(index) = found {
+            let (_, count, seen) = self.entries.get_mut(index).expect("auth entry present");
+            *count = count.saturating_add(1);
+            *seen = now;
+            let count = *count;
+            return count.is_power_of_two().then_some(count);
+        }
+        while let Some((_, _, seen)) = self.entries.front() {
+            if now.saturating_duration_since(*seen) >= self.ttl {
+                self.entries.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.entries.len() < WEB_TRANSFER_PRE_AUTH_MAX_IPS {
+            self.entries.push_back((ip, 1, now));
+        }
+        Some(1)
+    }
+
+    /// Number of tracked IPs (tests only).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Builds a sampler with a custom idle TTL (tests only).
+    #[cfg(test)]
+    pub(crate) fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            ttl,
+        }
     }
 }
 
@@ -2128,6 +2750,9 @@ impl PeerSession {
         initial.extend(snapshot_offer_strings(revision, &peers, &offers)?);
         let now = Instant::now();
         let (out_tx, out_rx) = mpsc::channel(WEB_TRANSFER_OUTGOING_CAP);
+        if let Ok(mut sessions) = room.sessions.lock() {
+            sessions.insert(peer_id, out_tx.clone());
+        }
         let session = Self {
             peer_id,
             display_name: name,
@@ -2187,6 +2812,2250 @@ pub(crate) fn snapshot_offer_strings(
     Ok(crate::web_transfer_protocol::snapshot_messages(
         revision, peers, &refs,
     ))
+}
+
+// --- Phase 3.1: relay transfer state machine ----------------------------------
+// Every transition verifies room, participants, offer and current attempt
+// under a single short lock, then delivers notices after unlocking (never
+// awaiting while holding `RoomState`). Outbound delivery is best-effort
+// `try_send` into each peer's bounded session queue: a dead peer's own
+// machinery reaps it, and the transition already committed.
+
+/// Outcome of [`WebTransferRegistry::request_transfer`]: both ack
+/// identically with the transfer ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestOutcome {
+    /// Validated, recorded, `transfer.incoming` sent to the source.
+    Created,
+    /// A live transfer already covers this selection; same ID re-acked.
+    Existing,
+}
+
+/// Outcome of [`WebTransferRegistry::source_ready`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyOutcome {
+    /// Direct attempt opened: both peers hold `transfer.direct_start` and
+    /// the caller arms the deadline. No relay permit is held.
+    Negotiating,
+    /// Relay slot held; both tickets issued, queued for post-ack delivery.
+    Admitted,
+    /// No slot right now; the actor spawns the 30 s admission waiter.
+    Queued,
+    /// Nothing to do: the message named an attempt that is no longer
+    /// current, or a transfer that already left the direct path.
+    Ignored,
+}
+
+/// Which forwarded signaling step a message is, for the one validator the
+/// three of them share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalKind {
+    /// `rtc.offer`, recipient only, once.
+    Offer,
+    /// `rtc.answer`, source only, once, after the offer.
+    Answer,
+    /// `rtc.ice`, either side, 128 per side.
+    Ice,
+}
+
+/// Outcome of [`WebTransferRegistry::cancel_transfer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// Moved to `Cancelled`; the notice is queued for post-ack delivery.
+    Cancelled,
+    /// Already terminal; acked without resending or double-releasing.
+    AlreadyTerminal,
+}
+
+/// Ordered peer notices a transfer transition produced. The registry never
+/// sends these itself: the HTTP actor replies the request ack FIRST and then
+/// drains the outbox, so a peer always sees its own ack before any event the
+/// same request caused (same mpsc queue, FIFO). Best-effort, in order.
+pub(crate) type TransferOutbox = Vec<(PeerId, String)>;
+
+/// What [`WebTransferRegistry::fallback_to_relay`] produces: the admission
+/// outcome for the FRESH relay attempt, the notices to deliver after the ack,
+/// and the verified ranges that attempt carries (the counterpart's
+/// `transfer.direct_failed` quotes them, so they are returned once rather
+/// than read back out of the record twice).
+pub(crate) type FallbackOutcome = (ReadyOutcome, TransferOutbox, Vec<(u64, u64)>);
+
+/// Drains a [`TransferOutbox`] in order. Delivery failures are dropped: the
+/// transition already committed and the peer's own slow-path machinery (reap
+/// on next tick, resync on reconnect) converges it.
+pub(crate) fn drain_transfer_outbox(room: &WebTransferRoom, outbox: TransferOutbox) {
+    for (peer, message) in outbox {
+        let _ = room.send_to(peer, message);
+    }
+}
+
+/// Next attempt number with checked increment (`u64::MAX` is unrepresentable
+/// and fails loudly instead of wrapping into a reused number).
+pub(crate) fn next_attempt_number(current: u64) -> Result<u64, WebTransferError> {
+    current
+        .checked_add(1)
+        .ok_or_else(|| WebTransferError::internal("attempt number exhausted"))
+}
+
+fn random_transfer_16() -> [u8; 16] {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let random = SystemRandom::new();
+    let mut bytes = [0u8; 16];
+    random.fill(&mut bytes).expect("OS CSPRNG");
+    if bytes == [0u8; 16] {
+        bytes[15] = 1;
+    }
+    bytes
+}
+
+fn generate_transfer_id() -> TransferId {
+    TransferId::from_bytes(random_transfer_16())
+}
+
+fn generate_attempt_id() -> AttemptId {
+    AttemptId::from_bytes(random_transfer_16())
+}
+
+fn generate_relay_ticket() -> RelayTicket {
+    RelayTicket::from_bytes(random_transfer_16())
+}
+
+/// Live transfers involving `peer` (either side).
+fn live_count_for(state: &RoomState, peer: PeerId) -> usize {
+    state
+        .transfers
+        .values()
+        .filter(|record| {
+            record.state.is_live() && (record.source == peer || record.recipient == peer)
+        })
+        .count()
+}
+
+/// Moves a live transfer to a terminal state, releasing its relay permit
+/// exactly once (taken out of the attempt before drop) and dropping its
+/// tickets. Returns false when the record is missing or already terminal —
+/// callers ack idempotently without resending. Permits release HERE, never
+/// at GC: the retained terminal record holds no resources.
+fn terminate_locked(
+    inner: Option<&RegistryInner>,
+    state: &mut RoomState,
+    id: TransferId,
+    terminal: TransferState,
+) -> bool {
+    debug_assert!(matches!(
+        terminal,
+        TransferState::Completed | TransferState::Cancelled | TransferState::Failed
+    ));
+    let Some(record) = state.transfers.get_mut(&id) else {
+        return false;
+    };
+    if !record.state.is_live() {
+        return false;
+    }
+    record.state = terminal;
+    record.terminated_at = Some(Instant::now());
+    // The permit drops with the attempt; the pump/parked waiter selected on
+    // `cancel` exits quietly (whoever terminates already notified).
+    record.attempt.take();
+    record.cancel.cancel();
+    if let Some(inner) = inner {
+        inner.tickets.retain(|_, ticket| ticket.transfer_id != id);
+        inner.transfers_current.fetch_sub(1, Ordering::Relaxed);
+        // One funnel for every terminal transition, so the totals cannot
+        // disagree with the states the room actually reached. `Failed` has
+        // no total of its own: a failure is not a refusal and the plan's
+        // metric set names only these two.
+        match terminal {
+            TransferState::Completed => {
+                inner.completed_total.fetch_add(1, Ordering::Relaxed);
+            }
+            TransferState::Cancelled => {
+                inner.cancelled_total.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+    gc_terminals_locked(state, Instant::now());
+    true
+}
+
+/// Drops terminal records older than the retention window (FIFO by
+/// termination order). Runs inside every mutating transition.
+fn gc_terminals_locked(state: &mut RoomState, now: Instant) {
+    state.transfers.retain(|_, record| {
+        record.state.is_live()
+            || record.terminated_at.is_none_or(|at| {
+                now.saturating_duration_since(at) < WEB_TRANSFER_TERMINAL_RETENTION
+            })
+    });
+}
+
+/// Cancels every live transfer matching `matches` as `by_peer`, notifying
+/// the other party of each. Shared by offer withdraw, peer drop and room
+/// teardown paths, each under its own single lock section.
+fn cancel_where_locked(
+    inner: Option<&RegistryInner>,
+    state: &mut RoomState,
+    by_peer: PeerId,
+    mut matches: impl FnMut(&TransferRecord) -> bool,
+    outbox: &mut Vec<(PeerId, String)>,
+) {
+    let ids: Vec<TransferId> = state
+        .transfers
+        .iter()
+        .filter(|(_, record)| record.state.is_live() && matches(record))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
+        let other = state.transfers.get(&id).map(|record| {
+            if record.source == by_peer {
+                record.recipient
+            } else {
+                record.source
+            }
+        });
+        if terminate_locked(inner, state, id, TransferState::Cancelled) {
+            if let Some(other) = other {
+                if other != by_peer {
+                    outbox.push((
+                        other,
+                        crate::web_transfer_protocol::transfer_cancelled_envelope(id, by_peer),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+impl WebTransferRegistry {
+    /// Requests a transfer: validates recipient, offer, live source,
+    /// single-file raw selection, digest, caps and resume bounds, then
+    /// records `Requested` and sends `transfer.incoming` to the source —
+    /// all checks and the insert under one lock, delivery after unlock. A
+    /// live transfer for the same parties and selection re-acks instead of
+    /// duplicating; a permit-less `WaitingRelay` match upgrades to a fresh
+    /// attempt (relay-busy retry) and re-enters `WaitingSource`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_transfer(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        recipient: PeerId,
+        offer_id: OfferId,
+        entry_ids: Vec<String>,
+        selection_digest: [u8; 32],
+        mode: &str,
+        resume: Option<crate::web_transfer_protocol::ResumeDescriptorBody>,
+    ) -> Result<(TransferId, RequestOutcome), WebTransferError> {
+        use crate::web_transfer_protocol::selection_digest as compute_digest;
+        struct Checked {
+            source: PeerId,
+            attempt_id: AttemptId,
+            upgraded: bool,
+            id: TransferId,
+        }
+        let checked = {
+            let mut state = room
+                .state
+                .lock()
+                .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+            if !state.peers.contains_key(&recipient) {
+                return Err(WebTransferError::invalid("unknown peer"));
+            }
+            let offer = state
+                .offers
+                .get(&offer_id)
+                .ok_or_else(|| WebTransferError::offer_not_found("unknown offer"))?;
+            let source = offer.owner;
+            // Source must be joined AND live: the sessions map mirrors joins
+            // (both mutations are synchronous with no await between), so a
+            // joined peer without a session is already half-gone.
+            let source_live = state.peers.contains_key(&source)
+                && room
+                    .sessions
+                    .lock()
+                    .map(|sessions| sessions.contains_key(&source))
+                    .unwrap_or(false);
+            if !source_live {
+                return Err(WebTransferError::source_offline("source offline"));
+            }
+            let manifest_value: serde_json::Value = serde_json::from_slice(&offer.manifest)
+                .map_err(|_| WebTransferError::internal("stored manifest is not JSON"))?;
+            let manifest =
+                crate::web_transfer_protocol::parse_manifest(&manifest_value, &room.limits)
+                    .map_err(|_| WebTransferError::internal("stored manifest failed validation"))?;
+            // The selection rule is pure and lives beside the manifest it is
+            // checked against. An archive's root and length are DYNAMIC —
+            // they are in no manifest, because the archive does not exist
+            // until the source generates it — so the record carries `None`
+            // for both and the expectation moves to the recipient, which
+            // authenticates them from the sealed FINAL frame (5.2).
+            let entry_number =
+                match crate::web_transfer_protocol::validate_selection(mode, &entry_ids, &manifest)
+                    .map_err(|e| WebTransferError::invalid(e.to_string()))?
+                {
+                    crate::web_transfer_protocol::Selection::Raw(id) => Some(id),
+                    crate::web_transfer_protocol::Selection::Zip => None,
+                };
+            // For `raw` the manifest holds the entry's root and size, and
+            // the server checks the completion against them. For `zip` it
+            // holds NEITHER — the archive does not exist until the source
+            // generates it — so the server carries no expectation and the
+            // recipient authenticates the dynamic tuple from the sealed
+            // FINAL frame instead. That is the whole difference between the
+            // two modes on this side.
+            let entry = match entry_number {
+                Some(id) => Some(
+                    manifest
+                        .entries
+                        .iter()
+                        .find(|entry| entry.id == id)
+                        .ok_or_else(|| WebTransferError::internal("validated entry ID vanished"))?,
+                ),
+                None => None,
+            };
+            let entry_root =
+                match entry {
+                    Some(entry) => Some(entry.root.ok_or_else(|| {
+                        WebTransferError::internal("validated entry has no root")
+                    })?),
+                    None => None,
+                };
+            let entry_size = entry.map(|entry| entry.size);
+            let transfer_mode = if entry_number.is_some() {
+                TransferMode::Raw
+            } else {
+                TransferMode::Zip
+            };
+            let entry_number =
+                entry_number.unwrap_or(crate::web_transfer_protocol::RESERVED_ZIP_ENTRY_ID);
+            let expected = compute_digest(&offer_id, &offer.mac, &entry_ids, mode);
+            if !token_digests_equal(&expected, &selection_digest) {
+                return Err(WebTransferError::source_changed(
+                    "selection does not match the offer",
+                ));
+            }
+            let resume = match resume {
+                None => None,
+                Some(descriptor) => {
+                    // Only a `raw` selection has manifest bounds to check
+                    // against; an archive's are not knowable here, and the
+                    // recipient refuses a tuple that differs from the one it
+                    // stored on the first attempt.
+                    if let Some(entry) = entry {
+                        for (_start, end) in &descriptor.verified_ranges {
+                            if *end > entry.chunks.len() as u64 {
+                                return Err(WebTransferError::invalid(
+                                    "resume range exceeds chunk count",
+                                ));
+                            }
+                        }
+                        if descriptor.output_length > entry.size {
+                            return Err(WebTransferError::invalid(
+                                "resume length exceeds entry size",
+                            ));
+                        }
+                    }
+                    Some(ResumeDescriptor {
+                        verified_ranges: descriptor.verified_ranges,
+                        output_length: descriptor.output_length,
+                    })
+                }
+            };
+            if live_count_for(&state, source) >= room.limits.max_transfers_per_peer as usize
+                || live_count_for(&state, recipient) >= room.limits.max_transfers_per_peer as usize
+            {
+                return Err(self.refused(WebTransferError::limit("peer transfer budget exhausted")));
+            }
+            // Same parties + same selection + live: no duplicate. A
+            // permit-less WaitingRelay match is a busy retry and upgrades to
+            // a fresh attempt; anything else re-acks the same ID.
+            if let Some((id, upgrade)) = state.transfers.iter().find_map(|(id, record)| {
+                (record.state.is_live()
+                    && record.offer_id == offer_id
+                    && record.source == source
+                    && record.recipient == recipient
+                    && record.entry_id == entry_number
+                    && record.mode == transfer_mode)
+                    .then(|| {
+                        (
+                            *id,
+                            record.state == TransferState::WaitingRelay
+                                && record
+                                    .attempt
+                                    .as_ref()
+                                    .map(|attempt| attempt.relay_permit.is_none())
+                                    .unwrap_or(false),
+                        )
+                    })
+            }) {
+                if !upgrade {
+                    return Ok((id, RequestOutcome::Existing));
+                }
+                let number = next_attempt_number(
+                    state
+                        .transfers
+                        .get(&id)
+                        .map(|record| record.attempt_number)
+                        .unwrap_or(0),
+                )?;
+                let attempt_id = generate_attempt_id();
+                if let Some(record) = state.transfers.get_mut(&id) {
+                    record.attempt_number = number;
+                    record.attempt_id = Some(attempt_id);
+                    record.attempt = Some(AttemptState {
+                        attempt_id,
+                        attempt_number: number,
+                        relay_permit: None,
+                    });
+                    record.state = TransferState::WaitingSource;
+                }
+                Checked {
+                    source,
+                    attempt_id,
+                    upgraded: true,
+                    id,
+                }
+            } else {
+                let mut new_id = generate_transfer_id();
+                for _ in 0..8 {
+                    if !state.transfers.contains_key(&new_id) {
+                        break;
+                    }
+                    new_id = generate_transfer_id();
+                }
+                if state.transfers.contains_key(&new_id) {
+                    return Err(WebTransferError::internal(
+                        "transfer ID collision exhaustion",
+                    ));
+                }
+                let attempt_id = generate_attempt_id();
+                state.transfers.insert(
+                    new_id,
+                    TransferRecord {
+                        transfer_id: new_id,
+                        offer_id,
+                        source,
+                        recipient,
+                        selection_digest,
+                        entry_id: entry_number,
+                        mode: transfer_mode,
+                        resume,
+                        state: TransferState::Requested,
+                        attempt_number: 1,
+                        attempt_id: Some(attempt_id),
+                        attempt: Some(AttemptState {
+                            attempt_id,
+                            attempt_number: 1,
+                            relay_permit: None,
+                        }),
+                        entry_root,
+                        entry_size,
+                        last_direct_attempt: None,
+                        carried_attempt: None,
+                        terminated_at: None,
+                        cancel: CancellationToken::new(),
+                    },
+                );
+                self.inner.transfers_current.fetch_add(1, Ordering::Relaxed);
+                gc_terminals_locked(&mut state, Instant::now());
+                Checked {
+                    source,
+                    attempt_id,
+                    upgraded: false,
+                    id: new_id,
+                }
+            }
+        };
+        // Deliver outside the lock; a source that vanished in the gap
+        // cancels immediately instead of stranding a permit.
+        if !room.send_to(
+            checked.source,
+            crate::web_transfer_protocol::transfer_incoming_envelope(
+                checked.id,
+                offer_id,
+                recipient,
+                checked.attempt_id,
+                mode,
+            ),
+        ) {
+            let mut state = room
+                .state
+                .lock()
+                .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+            terminate_locked(
+                room.registry.upgrade().as_deref(),
+                &mut state,
+                checked.id,
+                TransferState::Cancelled,
+            );
+            return Err(WebTransferError::source_offline("source unreachable"));
+        }
+        // Requested → WaitingSource once the notice is on the wire. A retry
+        // already sits in WaitingSource; a racing terminal wins instead.
+        if let Ok(mut state) = room.state.lock() {
+            if let Some(record) = state.transfers.get_mut(&checked.id) {
+                if record.state == TransferState::Requested {
+                    record.state = TransferState::WaitingSource;
+                }
+            }
+        }
+        Ok((
+            checked.id,
+            if checked.upgraded {
+                RequestOutcome::Existing
+            } else {
+                RequestOutcome::Created
+            },
+        ))
+    }
+}
+
+impl WebTransferRegistry {
+    /// Source answers `transfer.incoming`: only the source, only in
+    /// `WaitingSource`, only for the current attempt, only with the stored
+    /// digest (freshness attestation over its live `File`).
+    ///
+    /// Phase 4 changed what success means: it opens the DIRECT attempt.
+    /// The transfer moves to `NegotiatingDirect`, both peers receive
+    /// `transfer.direct_start` with their fixed SDP role, and the caller
+    /// arms the 10 s deadline. **No relay permit is taken here** — the relay
+    /// is the fallback, and a direct transfer that never needs a slot must
+    /// never hold one while it negotiates.
+    ///
+    /// The notices are RETURNED, not sent: the HTTP actor acks first, then
+    /// drains the outbox (same-peer ack-before-event order).
+    pub fn source_ready(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        source: PeerId,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+        digest: [u8; 32],
+    ) -> Result<(ReadyOutcome, TransferOutbox), WebTransferError> {
+        use crate::web_transfer_protocol::transfer_direct_start_envelope;
+        let (recipient, attempt_number) = {
+            let mut state = room
+                .state
+                .lock()
+                .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+            let record = state
+                .transfers
+                .get(&transfer_id)
+                .ok_or_else(|| WebTransferError::transfer_not_found("unknown transfer"))?;
+            if record.source != source {
+                if record.recipient == source {
+                    return Err(WebTransferError::invalid("only the source readies"));
+                }
+                return Err(WebTransferError::not_participant(
+                    "stranger to this transfer",
+                ));
+            }
+            if record.state != TransferState::WaitingSource {
+                return Err(WebTransferError::invalid(
+                    "transfer is not awaiting its source",
+                ));
+            }
+            if record.attempt_id != Some(attempt_id) {
+                return Err(WebTransferError::invalid("stale attempt"));
+            }
+            if !token_digests_equal(&record.selection_digest, &digest) {
+                return Err(WebTransferError::source_changed("selection does not match"));
+            }
+            let recipient = record.recipient;
+            let attempt_number = record.attempt_number;
+            if let Some(record) = state.transfers.get_mut(&transfer_id) {
+                record.state = TransferState::NegotiatingDirect {
+                    started_at: Instant::now(),
+                    ready_source: false,
+                    ready_recipient: false,
+                    candidates_source: 0,
+                    candidates_recipient: 0,
+                    offer_seen: false,
+                    answer_seen: false,
+                };
+            }
+            (recipient, attempt_number)
+        };
+        let ice = &self.inner.config.ice.servers;
+        let deadline_ms = u64::try_from(self.direct_deadline().as_millis()).unwrap_or(u64::MAX);
+        // The recipient acts first (it creates the one DataChannel and the
+        // offer), so it hears first. The source's own notice is queued into
+        // its session before any forwarded signaling can be: the recipient
+        // cannot answer a message it has not yet received.
+        let outbox = vec![
+            (
+                recipient,
+                transfer_direct_start_envelope(
+                    transfer_id,
+                    attempt_id,
+                    attempt_number,
+                    DirectRole::Offerer.as_str(),
+                    ice,
+                    deadline_ms,
+                ),
+            ),
+            (
+                source,
+                transfer_direct_start_envelope(
+                    transfer_id,
+                    attempt_id,
+                    attempt_number,
+                    DirectRole::Answerer.as_str(),
+                    ice,
+                    deadline_ms,
+                ),
+            ),
+        ];
+        Ok((ReadyOutcome::Negotiating, outbox))
+    }
+
+    /// The direct deadline in force (10 s; tests shorten it).
+    pub fn direct_deadline(&self) -> Duration {
+        self.inner
+            .direct_deadline
+            .lock()
+            .map(|slot| *slot)
+            .unwrap_or(WEB_TRANSFER_DIRECT_DEADLINE)
+    }
+
+    /// Test seam: shortens the direct deadline so a fallback is observable
+    /// without sleeping ten seconds.
+    pub fn set_direct_deadline(&self, deadline: Duration) {
+        if let Ok(mut slot) = self.inner.direct_deadline.lock() {
+            *slot = deadline;
+        }
+    }
+
+    /// Forwards one `rtc.offer`. Only the RECIPIENT may send it, only once,
+    /// only while its own attempt negotiates. The SDP is neither parsed nor
+    /// stored nor logged: it is copied into a fresh envelope for the source
+    /// and dropped.
+    pub fn forward_rtc_offer(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        from: PeerId,
+        body: &crate::web_transfer_protocol::RtcSdpBody,
+    ) -> Result<TransferOutbox, WebTransferError> {
+        let counterpart = self.signal_slot(
+            room,
+            from,
+            body.transfer_id,
+            body.attempt_id,
+            SignalKind::Offer,
+        )?;
+        Ok(vec![(
+            counterpart,
+            crate::web_transfer_protocol::rtc_sdp_envelope("rtc.offer", body),
+        )])
+    }
+
+    /// Forwards one `rtc.answer`. Only the SOURCE may send it, only once and
+    /// only after the offer it answers has been forwarded.
+    pub fn forward_rtc_answer(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        from: PeerId,
+        body: &crate::web_transfer_protocol::RtcSdpBody,
+    ) -> Result<TransferOutbox, WebTransferError> {
+        let counterpart = self.signal_slot(
+            room,
+            from,
+            body.transfer_id,
+            body.attempt_id,
+            SignalKind::Answer,
+        )?;
+        Ok(vec![(
+            counterpart,
+            crate::web_transfer_protocol::rtc_sdp_envelope("rtc.answer", body),
+        )])
+    }
+
+    /// Forwards one `rtc.ice`, from either side, up to 128 per side. The
+    /// end-of-candidates marker rides the same budget and the same path; the
+    /// candidate line itself is opaque here as everywhere else.
+    pub fn forward_rtc_ice(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        from: PeerId,
+        body: &crate::web_transfer_protocol::RtcIceBody,
+    ) -> Result<TransferOutbox, WebTransferError> {
+        let counterpart = self.signal_slot(
+            room,
+            from,
+            body.transfer_id,
+            body.attempt_id,
+            SignalKind::Ice,
+        )?;
+        Ok(vec![(
+            counterpart,
+            crate::web_transfer_protocol::rtc_ice_envelope(body),
+        )])
+    }
+
+    /// One participant declares its DataChannel usable. Valid only from a
+    /// participant of the CURRENT attempt, only after that side's own
+    /// signaling step, and idempotent. The second distinct ready commits the
+    /// direct path: `transfer.path_commit {path:"direct"}` to the recipient
+    /// first, then the source (the source may not read a byte before it).
+    pub fn direct_ready(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        from: PeerId,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+    ) -> Result<TransferOutbox, WebTransferError> {
+        let committed = {
+            let mut state = room
+                .state
+                .lock()
+                .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+            let record = state
+                .transfers
+                .get(&transfer_id)
+                .ok_or_else(|| WebTransferError::transfer_not_found("unknown transfer"))?;
+            let is_source = record.source == from;
+            if !is_source && record.recipient != from {
+                return Err(WebTransferError::not_participant(
+                    "stranger to this transfer",
+                ));
+            }
+            if record.attempt_id != Some(attempt_id) {
+                return Err(WebTransferError::invalid("stale attempt"));
+            }
+            let TransferState::NegotiatingDirect {
+                started_at,
+                mut ready_source,
+                mut ready_recipient,
+                candidates_source,
+                candidates_recipient,
+                offer_seen,
+                answer_seen,
+            } = record.state
+            else {
+                return Err(WebTransferError::invalid("transfer is not negotiating"));
+            };
+            // "After signaling" is per-side and exact: the offerer has had
+            // its offer forwarded, the answerer its answer. A ready before
+            // that describes a channel that cannot exist yet.
+            if is_source {
+                if !answer_seen {
+                    return Err(WebTransferError::invalid("answer not sent yet"));
+                }
+                ready_source = true;
+            } else {
+                if !offer_seen {
+                    return Err(WebTransferError::invalid("offer not sent yet"));
+                }
+                ready_recipient = true;
+            }
+            let both = ready_source && ready_recipient;
+            let source = record.source;
+            let recipient = record.recipient;
+            let resume_ranges = record
+                .resume
+                .as_ref()
+                .map(|resume| resume.verified_ranges.clone())
+                .unwrap_or_default();
+            if let Some(record) = state.transfers.get_mut(&transfer_id) {
+                record.state = if both {
+                    TransferState::ActiveDirect
+                } else {
+                    TransferState::NegotiatingDirect {
+                        started_at,
+                        ready_source,
+                        ready_recipient,
+                        candidates_source,
+                        candidates_recipient,
+                        offer_seen,
+                        answer_seen,
+                    }
+                };
+            }
+            both.then_some((source, recipient, resume_ranges))
+        };
+        let Some((source, recipient, resume_ranges)) = committed else {
+            return Ok(Vec::new());
+        };
+        let commit = crate::web_transfer_protocol::transfer_path_commit_envelope(
+            transfer_id,
+            attempt_id,
+            "direct",
+            &resume_ranges,
+        );
+        Ok(vec![(recipient, commit.clone()), (source, commit)])
+    }
+
+    /// One participant reports the direct attempt over. The attempt is
+    /// invalidated EXACTLY once (a second report, or one naming an attempt
+    /// that is no longer current, is acked and ignored), the counterpart
+    /// hears a fixed reason code plus the recipient's bounded verified
+    /// ranges, and the SAME transfer continues on a fresh relay attempt.
+    ///
+    /// Only the recipient's ranges are believed: it is the only side that
+    /// knows what it verified and wrote.
+    pub fn direct_failed(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        from: PeerId,
+        body: &crate::web_transfer_protocol::DirectFailedBody,
+    ) -> Result<(ReadyOutcome, TransferOutbox), WebTransferError> {
+        let transfer_id = body.transfer_id;
+        let (is_recipient, counterpart) = {
+            let state = room
+                .state
+                .lock()
+                .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+            let record = state
+                .transfers
+                .get(&transfer_id)
+                .ok_or_else(|| WebTransferError::transfer_not_found("unknown transfer"))?;
+            if record.source == from {
+                (false, record.recipient)
+            } else if record.recipient == from {
+                (true, record.source)
+            } else {
+                return Err(WebTransferError::not_participant(
+                    "stranger to this transfer",
+                ));
+            }
+        };
+        let ranges = if is_recipient {
+            body.verified_ranges.clone()
+        } else {
+            Vec::new()
+        };
+        match self.fallback_to_relay(room, transfer_id, body.attempt_id, ranges) {
+            Some((outcome, mut outbox, forwarded_ranges)) => {
+                // The counterpart hears WHY before it hears its ticket: the
+                // notice explains the new attempt the ticket belongs to.
+                outbox.insert(
+                    0,
+                    (
+                        counterpart,
+                        crate::web_transfer_protocol::transfer_direct_failed_envelope(
+                            transfer_id,
+                            body.attempt_id,
+                            body.reason,
+                            &forwarded_ranges,
+                        ),
+                    ),
+                );
+                Ok((outcome, outbox))
+            }
+            // Stale attempt, already fallen back, or terminal: acked and
+            // ignored. A late failure must never touch a newer attempt —
+            // except for the one thing only the recipient can say.
+            None => {
+                if is_recipient && !body.verified_ranges.is_empty() {
+                    self.adopt_late_recipient_resume(
+                        room,
+                        transfer_id,
+                        body.attempt_id,
+                        &body.verified_ranges,
+                    )?;
+                }
+                Ok((ReadyOutcome::Ignored, Vec::new()))
+            }
+        }
+    }
+
+    /// Takes the recipient's verified ranges from a `transfer.direct_failed`
+    /// that arrived AFTER the attempt had already fallen back.
+    ///
+    /// The source learns its DataChannel is dead on its very next write,
+    /// which is synchronous, while the recipient learns it from a `close`
+    /// event; so in the ordinary case the SOURCE reports first, and a source
+    /// is never believed about ranges (D3). Without this the fallback threw
+    /// away the only resume information that exists: the relay attempt
+    /// re-sent every chunk already on disk while the recipient, planning
+    /// around what it held, read the first relayed chunk as a digest
+    /// mismatch.
+    ///
+    /// Accepted only while the replacement attempt is still `WaitingRelay`
+    /// and only for the attempt that actually failed. The ranges ride
+    /// `transfer.path_commit`, which is sent when both relay legs attach, so
+    /// nothing the source has already been told can change under it.
+    fn adopt_late_recipient_resume(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        transfer_id: TransferId,
+        failed_attempt: AttemptId,
+        ranges: &[(u64, u64)],
+    ) -> Result<(), WebTransferError> {
+        let mut state = room
+            .state
+            .lock()
+            .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+        let Some(record) = state.transfers.get_mut(&transfer_id) else {
+            return Ok(());
+        };
+        if record.state != TransferState::WaitingRelay
+            || record.last_direct_attempt != Some(failed_attempt)
+        {
+            return Ok(());
+        }
+        // `zip` has no manifest length; the recipient carries its own and
+        // the source regenerates from byte zero either way.
+        let output_length = record.entry_size.unwrap_or(0);
+        record.resume = Some(ResumeDescriptor {
+            verified_ranges: ranges.to_vec(),
+            output_length,
+        });
+        Ok(())
+    }
+
+    /// Turns a live direct attempt into a fresh RELAY attempt, reusing the
+    /// Phase 3 admission and ticket flow unchanged. Returns `None` — and
+    /// changes nothing — unless the transfer is still on `failed_attempt`
+    /// in a direct state, which is what makes the deadline timer, a late
+    /// `transfer.direct_failed` and a racing terminal converge on one
+    /// fallback instead of three.
+    ///
+    /// On success the outbox holds each peer's own relay ticket
+    /// ([`ReadyOutcome::Admitted`]) or is empty and the caller must spawn
+    /// [`Self::admit_relay`] for the new attempt ([`ReadyOutcome::Queued`]).
+    pub fn fallback_to_relay(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        transfer_id: TransferId,
+        failed_attempt: AttemptId,
+        recipient_ranges: Vec<(u64, u64)>,
+    ) -> Option<FallbackOutcome> {
+        use crate::web_transfer_protocol::transfer_relay_ticket_envelope;
+        let mut state = room.state.lock().ok()?;
+        let record = state.transfers.get(&transfer_id)?;
+        // Direct states only: a transfer already on the relay has had its one
+        // automatic fallback, and a terminal one keeps its terminal.
+        if !record.state.is_negotiating_direct() && record.state != TransferState::ActiveDirect {
+            return None;
+        }
+        if record.attempt_id != Some(failed_attempt) {
+            return None;
+        }
+        let source = record.source;
+        let recipient = record.recipient;
+        let output_length = record.entry_size.unwrap_or(0);
+        let number = next_attempt_number(record.attempt_number).ok()?;
+        let attempt_id = generate_attempt_id();
+        let ranges = if recipient_ranges.is_empty() {
+            record
+                .resume
+                .as_ref()
+                .map(|resume| resume.verified_ranges.clone())
+                .unwrap_or_default()
+        } else {
+            recipient_ranges
+        };
+        {
+            let record = state.transfers.get_mut(&transfer_id)?;
+            record.attempt_number = number;
+            record.attempt_id = Some(attempt_id);
+            // Dropping the old attempt releases nothing (a direct attempt
+            // never held a relay permit) and is what makes a late frame or a
+            // stale timer unable to reach the new one.
+            record.attempt = Some(AttemptState {
+                attempt_id,
+                attempt_number: number,
+                relay_permit: None,
+            });
+            record.state = TransferState::WaitingRelay;
+            record.last_direct_attempt = Some(failed_attempt);
+            if !ranges.is_empty() {
+                record.resume = Some(ResumeDescriptor {
+                    verified_ranges: ranges.clone(),
+                    output_length,
+                });
+            }
+        }
+        // Exactly the Phase 3 admission: try the global semaphore inline,
+        // mint two distinct role-bound tickets and hand each peer its own;
+        // a busy relay leaves the transfer retryable without a permit.
+        let granted = match Arc::clone(&self.inner.relay_permits).try_acquire_owned() {
+            Ok(permit) => {
+                let (source_ticket, recipient_ticket) = loop {
+                    let first = generate_relay_ticket();
+                    let second = generate_relay_ticket();
+                    if first.to_string() != second.to_string() {
+                        break (first, second);
+                    }
+                };
+                let expires_at = Instant::now() + self.inner.ticket_ttl;
+                if let Some(registry) = room.registry.upgrade() {
+                    for (ticket, peer, role) in [
+                        (&source_ticket, source, RelayRole::Source),
+                        (&recipient_ticket, recipient, RelayRole::Recipient),
+                    ] {
+                        registry.tickets.insert(
+                            ticket.sha256_hash(),
+                            RelayTicketRecord {
+                                ticket_hash: ticket.sha256_hash(),
+                                transfer_id,
+                                attempt_id,
+                                peer_id: peer,
+                                role,
+                                expires_at,
+                            },
+                        );
+                    }
+                }
+                if let Some(record) = state.transfers.get_mut(&transfer_id) {
+                    if let Some(attempt) = record.attempt.as_mut() {
+                        attempt.relay_permit = Some(permit);
+                    }
+                }
+                Some((source_ticket.to_string(), recipient_ticket.to_string()))
+            }
+            Err(_) => None,
+        };
+        drop(state);
+        match granted {
+            Some((source_ticket, recipient_ticket)) => Some((
+                ReadyOutcome::Admitted,
+                vec![
+                    (
+                        source,
+                        transfer_relay_ticket_envelope(transfer_id, attempt_id, &source_ticket),
+                    ),
+                    (
+                        recipient,
+                        transfer_relay_ticket_envelope(transfer_id, attempt_id, &recipient_ticket),
+                    ),
+                ],
+                ranges,
+            )),
+            None => Some((ReadyOutcome::Queued, Vec::new(), ranges)),
+        }
+    }
+
+    /// The attempt ID a transfer is currently on, for callers that must
+    /// follow a fallback (the deadline timer's `admit_relay` hand-off).
+    pub fn current_attempt(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        transfer_id: TransferId,
+    ) -> Option<AttemptId> {
+        room.state
+            .lock()
+            .ok()
+            .and_then(|state| state.transfers.get(&transfer_id).and_then(|r| r.attempt_id))
+    }
+
+    /// Arms the direct deadline for one attempt. The task captures a `Weak`
+    /// room (P-14's rule: a monitor must never resolve a key later and reach
+    /// a newer object, and must never pin what it watches) plus the transfer
+    /// and attempt IDs; at the deadline it falls back only when all three
+    /// still identify the same live direct attempt.
+    pub fn spawn_direct_deadline(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+    ) {
+        let registry = self.clone();
+        let weak = Arc::downgrade(room);
+        let deadline = self.direct_deadline();
+        tokio::spawn(async move {
+            tokio::time::sleep(deadline).await;
+            let Some(room) = weak.upgrade() else {
+                return;
+            };
+            registry
+                .direct_deadline_elapsed(&room, transfer_id, attempt_id)
+                .await;
+        });
+    }
+
+    /// The deadline body, separated from the sleep so a test can fire it
+    /// without a clock. Falls back once and then hands a queued attempt to
+    /// the ordinary relay admission waiter.
+    pub async fn direct_deadline_elapsed(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+    ) {
+        let Some((outcome, outbox, ranges)) =
+            self.fallback_to_relay(room, transfer_id, attempt_id, Vec::new())
+        else {
+            return;
+        };
+        let counterparts = room
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .transfers
+                    .get(&transfer_id)
+                    .map(|record| (record.source, record.recipient))
+            })
+            .map(|(source, recipient)| vec![source, recipient])
+            .unwrap_or_default();
+        // A timeout has no reporting peer, so BOTH hear the same fixed code.
+        for peer in counterparts {
+            let _ = room.send_to(
+                peer,
+                crate::web_transfer_protocol::transfer_direct_failed_envelope(
+                    transfer_id,
+                    attempt_id,
+                    "timeout",
+                    &ranges,
+                ),
+            );
+        }
+        drain_transfer_outbox(room, outbox);
+        if matches!(outcome, ReadyOutcome::Queued) {
+            if let Some(next) = self.current_attempt(room, transfer_id) {
+                self.admit_relay(room, transfer_id, next).await;
+            }
+        }
+    }
+
+    /// Shared validation for the three forwarded signaling messages: the
+    /// sender must be the side the protocol assigns to that step, on the
+    /// current attempt of a negotiating transfer, inside the per-side
+    /// candidate budget. Returns the counterpart to forward to.
+    fn signal_slot(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        from: PeerId,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+        kind: SignalKind,
+    ) -> Result<PeerId, WebTransferError> {
+        let mut state = room
+            .state
+            .lock()
+            .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+        let record = state
+            .transfers
+            .get(&transfer_id)
+            .ok_or_else(|| WebTransferError::transfer_not_found("unknown transfer"))?;
+        let is_source = record.source == from;
+        if !is_source && record.recipient != from {
+            return Err(WebTransferError::not_participant(
+                "stranger to this transfer",
+            ));
+        }
+        if record.attempt_id != Some(attempt_id) {
+            return Err(WebTransferError::invalid("stale attempt"));
+        }
+        let TransferState::NegotiatingDirect {
+            started_at,
+            ready_source,
+            ready_recipient,
+            mut candidates_source,
+            mut candidates_recipient,
+            mut offer_seen,
+            mut answer_seen,
+        } = record.state
+        else {
+            return Err(WebTransferError::invalid("transfer is not negotiating"));
+        };
+        let counterpart = if is_source {
+            record.recipient
+        } else {
+            record.source
+        };
+        match kind {
+            SignalKind::Offer => {
+                if is_source {
+                    return Err(WebTransferError::invalid("only the recipient offers"));
+                }
+                if offer_seen {
+                    return Err(WebTransferError::invalid("offer already sent"));
+                }
+                offer_seen = true;
+            }
+            SignalKind::Answer => {
+                if !is_source {
+                    return Err(WebTransferError::invalid("only the source answers"));
+                }
+                if !offer_seen {
+                    return Err(WebTransferError::invalid("no offer to answer"));
+                }
+                if answer_seen {
+                    return Err(WebTransferError::invalid("answer already sent"));
+                }
+                answer_seen = true;
+            }
+            SignalKind::Ice => {
+                let counter = if is_source {
+                    &mut candidates_source
+                } else {
+                    &mut candidates_recipient
+                };
+                let cap =
+                    u32::try_from(WEB_TRANSFER_MAX_ICE_CANDIDATES_PER_SIDE).unwrap_or(u32::MAX);
+                if *counter >= cap {
+                    return Err(self.refused(WebTransferError::limit("candidate budget spent")));
+                }
+                *counter += 1;
+            }
+        }
+        if let Some(record) = state.transfers.get_mut(&transfer_id) {
+            record.state = TransferState::NegotiatingDirect {
+                started_at,
+                ready_source,
+                ready_recipient,
+                candidates_source,
+                candidates_recipient,
+                offer_seen,
+                answer_seen,
+            };
+        }
+        Ok(counterpart)
+    }
+
+    /// Source declines `transfer.incoming`: only the source, terminal
+    /// `Cancelled` with the recipient notified (a decline is a cancel by
+    /// the serving side, so no new message type is needed). The notice is
+    /// returned for post-ack delivery.
+    pub fn source_reject(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        source: PeerId,
+        transfer_id: TransferId,
+    ) -> Result<TransferOutbox, WebTransferError> {
+        let notice = {
+            let mut state = room
+                .state
+                .lock()
+                .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+            let record = state
+                .transfers
+                .get(&transfer_id)
+                .ok_or_else(|| WebTransferError::transfer_not_found("unknown transfer"))?;
+            if record.source != source {
+                if record.recipient == source {
+                    return Err(WebTransferError::invalid("only the source declines"));
+                }
+                return Err(WebTransferError::not_participant(
+                    "stranger to this transfer",
+                ));
+            }
+            if !record.state.is_live() {
+                return Ok(Vec::new());
+            }
+            let recipient = record.recipient;
+            let registry = room.registry.upgrade();
+            let changed = terminate_locked(
+                registry.as_deref(),
+                &mut state,
+                transfer_id,
+                TransferState::Cancelled,
+            );
+            changed.then(|| {
+                (
+                    recipient,
+                    crate::web_transfer_protocol::transfer_cancelled_envelope(transfer_id, source),
+                )
+            })
+        };
+        if let Some((peer, message)) = notice {
+            Ok(vec![(peer, message)])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Cancels a transfer: only source or recipient; strangers hear
+    /// `NOT_PARTICIPANT`. Terminal repeats ack without resending or
+    /// double-releasing. Cancelling drops tickets and frees both permits
+    /// at the transition. The notice is returned for post-ack delivery.
+    pub fn cancel_transfer(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        peer: PeerId,
+        transfer_id: TransferId,
+    ) -> Result<(CancelOutcome, TransferOutbox), WebTransferError> {
+        let notice = {
+            let mut state = room
+                .state
+                .lock()
+                .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+            let record = state
+                .transfers
+                .get(&transfer_id)
+                .ok_or_else(|| WebTransferError::transfer_not_found("unknown transfer"))?;
+            if !record.state.is_live() {
+                return Ok((CancelOutcome::AlreadyTerminal, Vec::new()));
+            }
+            if peer != record.source && peer != record.recipient {
+                return Err(WebTransferError::not_participant(
+                    "stranger to this transfer",
+                ));
+            }
+            let other = if record.source == peer {
+                record.recipient
+            } else {
+                record.source
+            };
+            let registry = room.registry.upgrade();
+            terminate_locked(
+                registry.as_deref(),
+                &mut state,
+                transfer_id,
+                TransferState::Cancelled,
+            );
+            (
+                other,
+                crate::web_transfer_protocol::transfer_cancelled_envelope(transfer_id, peer),
+            )
+        };
+        Ok((CancelOutcome::Cancelled, vec![notice]))
+    }
+
+    /// The recipient reports VERIFIED bytes, and the server forwards the
+    /// report to the source with the path it committed itself.
+    ///
+    /// Two rules live here and nowhere else. First, only the RECIPIENT may
+    /// report: it is the only party that verified a digest against the
+    /// manifest, and a source reporting its own progress would be attesting
+    /// bytes nobody checked. Second, the `path` in the forwarded message is
+    /// the SERVER's, derived from the transfer's own state — a peer may say
+    /// what it verified and nothing else, so no peer can move another
+    /// transfer's path or claim a transport it is not on.
+    ///
+    /// A report naming a stale attempt, or arriving once the transfer is no
+    /// longer carrying, is acked and dropped: it describes a world that has
+    /// already ended.
+    pub fn report_progress(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        reporter: PeerId,
+        body: &crate::web_transfer_protocol::ProgressBody,
+    ) -> Result<TransferOutbox, WebTransferError> {
+        let mut state = room
+            .state
+            .lock()
+            .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+        let record = state
+            .transfers
+            .get_mut(&body.transfer_id)
+            .ok_or_else(|| WebTransferError::transfer_not_found("unknown transfer"))?;
+        if record.recipient != reporter {
+            if record.source == reporter {
+                return Err(WebTransferError::invalid("only the recipient reports"));
+            }
+            return Err(WebTransferError::not_participant(
+                "stranger to this transfer",
+            ));
+        }
+        if record.attempt_id != Some(body.attempt_id) || !record.state.is_carrying() {
+            // Stale or terminal: acked and ignored, exactly as a late
+            // `transfer.direct_failed` is.
+            return Ok(Vec::new());
+        }
+        if record
+            .entry_size
+            .is_some_and(|size| body.received_bytes > size)
+        {
+            return Err(WebTransferError::invalid("progress past the entry size"));
+        }
+        // The first report with bytes on it is what makes the path REAL: up
+        // to that moment the transport is committed but nothing has been
+        // verified over it, and a path nobody has carried a verified byte on
+        // is not a fact about the transfer yet.
+        if body.received_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let direct = record.state == TransferState::ActiveDirect;
+        let path = if direct { "direct" } else { "relay" };
+        // Count the attempt exactly once, HERE and nowhere else: this is the
+        // first moment a verified byte exists on this path, and the counter
+        // has to mean "carried" rather than "attempted" (F-12).
+        if record.carried_attempt != Some(body.attempt_id) {
+            record.carried_attempt = Some(body.attempt_id);
+            let counter = if direct {
+                &self.inner.direct_carried
+            } else {
+                &self.inner.relay_carried
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        let source = record.source;
+        let notice = crate::web_transfer_protocol::transfer_progress_envelope(
+            body.transfer_id,
+            body.attempt_id,
+            body.received_bytes,
+            path,
+        );
+        Ok(vec![(source, notice)])
+    }
+
+    /// Completes a transfer: only the recipient, only the current attempt,
+    /// only with the manifest entry root (server-side cross-check of the
+    /// recipient's local verification). The source notice is returned for
+    /// post-ack delivery.
+    pub fn complete_transfer(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        recipient: PeerId,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+        root: [u8; 32],
+    ) -> Result<TransferOutbox, WebTransferError> {
+        let notice = {
+            let mut state = room
+                .state
+                .lock()
+                .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+            let record = state
+                .transfers
+                .get(&transfer_id)
+                .ok_or_else(|| WebTransferError::transfer_not_found("unknown transfer"))?;
+            if record.recipient != recipient {
+                if record.source == recipient {
+                    return Err(WebTransferError::invalid("only the recipient completes"));
+                }
+                return Err(WebTransferError::not_participant(
+                    "stranger to this transfer",
+                ));
+            }
+            if !record.state.is_live() {
+                return Err(WebTransferError::invalid("transfer already terminated"));
+            }
+            // Completion attests verified bytes on the wire, which only
+            // exists once both legs attached (Phase 3.2 drives Active).
+            // Earlier states reject here; their success path is 3.2-tested.
+            // Either transport may be the one that carried it: `Active` is
+            // the relay pump's state, `ActiveDirect` the DataChannel's.
+            if !record.state.is_carrying() {
+                return Err(WebTransferError::invalid("transfer is not active"));
+            }
+            if record.attempt_id != Some(attempt_id) {
+                return Err(WebTransferError::invalid("stale attempt"));
+            }
+            // `raw` is checked against the manifest the server holds; an
+            // archive has no manifest root to check against, and the
+            // recipient has already refused a mismatch of its own before it
+            // could ever report completion.
+            if record.entry_root.is_some_and(|expected| expected != root) {
+                return Err(WebTransferError::invalid("root does not match manifest"));
+            }
+            let source = record.source;
+            let registry = room.registry.upgrade();
+            terminate_locked(
+                registry.as_deref(),
+                &mut state,
+                transfer_id,
+                TransferState::Completed,
+            );
+            (
+                source,
+                crate::web_transfer_protocol::transfer_completed_envelope(transfer_id, &root),
+            )
+        };
+        Ok(vec![notice])
+    }
+
+    /// Fails a transfer (Phase 3.2 attach faults own this path): terminal
+    /// `Failed` with both permits released. Notices are the caller's job —
+    /// 3.2 maps attach faults to its retryable errors there.
+    #[allow(dead_code)]
+    pub(crate) fn fail_transfer(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        transfer_id: TransferId,
+    ) -> bool {
+        let Ok(mut state) = room.state.lock() else {
+            return false;
+        };
+        terminate_locked(
+            room.registry.upgrade().as_deref(),
+            &mut state,
+            transfer_id,
+            TransferState::Failed,
+        )
+    }
+
+    /// Admits one queued attempt: waits up to the configured timeout for a
+    /// global relay slot, then — only if the transfer still waits for this
+    /// exact attempt without a permit — stores the permit, mints two
+    /// distinct role-bound tickets and sends each peer only its own. On
+    /// timeout the recipient hears `RELAY_BUSY` (with the transfer ID for
+    /// correlation) and the transfer stays resumable without a permit; a
+    /// fresh click/requestId retries it. Spawned by the actor, never awaited
+    /// while holding `RoomState`.
+    pub async fn admit_relay(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+    ) {
+        let wait = self
+            .inner
+            .admit_timeout
+            .lock()
+            .map(|timeout| *timeout)
+            .unwrap_or(WEB_TRANSFER_RELAY_ADMIT_TIMEOUT);
+        let permit =
+            match timeout(wait, Arc::clone(&self.inner.relay_permits).acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    let recipient = room.state.lock().ok().and_then(|state| {
+                        state
+                            .transfers
+                            .get(&transfer_id)
+                            .filter(|record| {
+                                record.state == TransferState::WaitingRelay
+                                    && record.attempt_id == Some(attempt_id)
+                            })
+                            .map(|record| record.recipient)
+                    });
+                    if let Some(recipient) = recipient {
+                        room.send_to(
+                            recipient,
+                            crate::web_transfer_protocol::error_envelope_anon(
+                                "RELAY_BUSY",
+                                Some(&transfer_id.to_string()),
+                            ),
+                        );
+                    }
+                    return;
+                }
+            };
+        struct Issued {
+            source: PeerId,
+            recipient: PeerId,
+            source_ticket: String,
+            recipient_ticket: String,
+        }
+        let issued = {
+            let mut state = match room.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            let current = state.transfers.get(&transfer_id).map(|record| {
+                (
+                    record.state,
+                    record.attempt_id,
+                    record
+                        .attempt
+                        .as_ref()
+                        .map(|attempt| attempt.relay_permit.is_none())
+                        .unwrap_or(false),
+                    record.source,
+                    record.recipient,
+                )
+            });
+            let Some((TransferState::WaitingRelay, Some(current), true, source, recipient)) =
+                current
+            else {
+                return;
+            };
+            let (source_ticket, recipient_ticket) = loop {
+                let first = generate_relay_ticket();
+                let second = generate_relay_ticket();
+                if first.to_string() != second.to_string() {
+                    break (first, second);
+                }
+            };
+            let expires_at = Instant::now() + self.inner.ticket_ttl;
+            if let Some(registry) = room.registry.upgrade() {
+                for (ticket, peer, role) in [
+                    (&source_ticket, source, RelayRole::Source),
+                    (&recipient_ticket, recipient, RelayRole::Recipient),
+                ] {
+                    registry.tickets.insert(
+                        ticket.sha256_hash(),
+                        RelayTicketRecord {
+                            ticket_hash: ticket.sha256_hash(),
+                            transfer_id,
+                            attempt_id: current,
+                            peer_id: peer,
+                            role,
+                            expires_at,
+                        },
+                    );
+                }
+            }
+            if let Some(record) = state.transfers.get_mut(&transfer_id) {
+                if let Some(attempt) = record.attempt.as_mut() {
+                    attempt.relay_permit = Some(permit);
+                }
+            }
+            Issued {
+                source,
+                recipient,
+                source_ticket: source_ticket.to_string(),
+                recipient_ticket: recipient_ticket.to_string(),
+            }
+        };
+        use crate::web_transfer_protocol::transfer_relay_ticket_envelope;
+        let _ = room.send_to(
+            issued.source,
+            transfer_relay_ticket_envelope(transfer_id, attempt_id, &issued.source_ticket),
+        );
+        let _ = room.send_to(
+            issued.recipient,
+            transfer_relay_ticket_envelope(transfer_id, attempt_id, &issued.recipient_ticket),
+        );
+    }
+
+    /// Consumes one relay ticket atomically (single lookup-and-remove):
+    /// unknown or already-used hashes, expired deadlines and wrong-leg
+    /// presentments all fail, and a failed presentment still burns the
+    /// ticket. `now` is a parameter so expiry unit-tests need no clock.
+    pub fn consume_relay_ticket(
+        &self,
+        ticket_hex: &str,
+        role: RelayRole,
+        peer: PeerId,
+        now: Instant,
+    ) -> Result<TicketGrant, TicketDeny> {
+        let ticket: RelayTicket = ticket_hex.parse().map_err(|_| TicketDeny::Unknown)?;
+        let (_, record) = self
+            .inner
+            .tickets
+            .remove(&ticket.sha256_hash())
+            .ok_or(TicketDeny::Unknown)?;
+        if now > record.expires_at {
+            return Err(TicketDeny::Expired);
+        }
+        if record.role != role || record.peer_id != peer {
+            return Err(TicketDeny::RoleMismatch);
+        }
+        Ok(TicketGrant {
+            transfer_id: record.transfer_id,
+            attempt_id: record.attempt_id,
+            peer_id: record.peer_id,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Opaque relay pair (Phase 3.2): two role-bound WebSocket legs spliced by one
+// pump task. The server never holds payload beyond the frame being forwarded:
+// no mpsc payload queue, no accumulating Vec, no temp file, no clone of the
+// ciphertext bytes (tungstenite `Bytes` move straight through).
+// ---------------------------------------------------------------------------
+
+/// First relay leg message deadline: the one text `relay.attach` must arrive
+/// within 10 s of the handshake; anything else closes the socket.
+pub const WEB_TRANSFER_RELAY_FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-forward send deadline on the warm recipient leg (10 s).
+pub const WEB_TRANSFER_RELAY_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Grace to drain the peer's close echo after our own Close frame (2 s).
+/// Dropping TCP first resets the connection, which browsers log as an
+/// error even when every byte arrived.
+pub const WEB_TRANSFER_RELAY_CLOSE_GRACE: Duration = Duration::from_secs(2);
+/// Smallest forwardable source binary: 16-byte header + ≥1 ciphertext byte.
+pub const WEB_TRANSFER_RELAY_MIN_FRAME_LEN: usize = 17;
+
+/// Relay frame type: one chunk of payload.
+pub const RELAY_FRAME_TYPE_DATA: u8 = 1;
+
+/// Relay frame type: the last frame of an attempt. It is the END OF STREAM
+/// on this transport exactly as it is on the DataChannel — the pump stops on
+/// it and never waits for the source's transport to close.
+pub const RELAY_FRAME_TYPE_FINAL: u8 = 2;
+/// Largest forwardable source binary: one encrypted frame per message.
+pub const WEB_TRANSFER_RELAY_MAX_FRAME_LEN: usize = 32 * 1024;
+/// Throttle burst ceiling: exactly 2×rate, never above 200 MiB.
+pub const WEB_TRANSFER_RELAY_BURST_CAP: u64 = 200 * 1024 * 1024;
+/// Encrypted-frame magic the pump checks without decrypting (`BWT1`).
+pub const RELAY_FRAME_MAGIC: u32 = 0x42575431;
+/// Encrypted-frame version the pump accepts.
+pub const RELAY_FRAME_VERSION: u16 = 1;
+
+/// Why a source binary frame is refused. Header-only: the pump never holds a
+/// key and never decrypts, so a well-formed header with a bad body still
+/// forwards (the recipient's AEAD rejects it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayFrameReject {
+    /// Fewer than 17 bytes (cannot hold header + 1 ciphertext byte).
+    TooShort,
+    /// More than 32768 bytes (transport already caps this; defense in depth).
+    Oversize,
+    /// Magic is not `BWT1`.
+    BadMagic,
+    /// Version is not 1.
+    BadVersion,
+    /// Type is not DATA (1) or FINAL (2).
+    BadType,
+    /// Reserved flags are not 0.
+    BadFlags,
+    /// `body_len` does not equal the trailing bytes.
+    LengthMismatch,
+    /// Sequence is not exactly previous + 1 (first frame must be 0).
+    StaleSeq,
+}
+
+/// Validates one encrypted-frame header per the protocol §6 layout, without
+/// touching the ciphertext. Returns the accepted sequence number.
+pub fn check_relay_frame(prev_seq: Option<u32>, bytes: &[u8]) -> Result<u32, RelayFrameReject> {
+    use RelayFrameReject as R;
+    if bytes.len() < WEB_TRANSFER_RELAY_MIN_FRAME_LEN {
+        return Err(R::TooShort);
+    }
+    if bytes.len() > WEB_TRANSFER_RELAY_MAX_FRAME_LEN {
+        return Err(R::Oversize);
+    }
+    let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if magic != RELAY_FRAME_MAGIC {
+        return Err(R::BadMagic);
+    }
+    let version = u16::from_be_bytes([bytes[4], bytes[5]]);
+    if version != RELAY_FRAME_VERSION {
+        return Err(R::BadVersion);
+    }
+    if bytes[6] != RELAY_FRAME_TYPE_DATA && bytes[6] != RELAY_FRAME_TYPE_FINAL {
+        return Err(R::BadType);
+    }
+    if bytes[7] != 0 {
+        return Err(R::BadFlags);
+    }
+    let seq = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let body_len = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
+    if body_len != bytes.len() - 16 {
+        return Err(R::LengthMismatch);
+    }
+    let expected = match prev_seq {
+        None => 0,
+        Some(prev) => prev.checked_add(1).ok_or(R::StaleSeq)?,
+    };
+    if seq != expected {
+        return Err(R::StaleSeq);
+    }
+    Ok(seq)
+}
+
+/// Shared per-room relay throttle. Rate comes from limits
+/// (`relay_rate_bytes_per_s`); burst is exactly 2×rate capped at 200 MiB; a
+/// zero rate disables throttling entirely (no delay, no debt).
+#[derive(Debug)]
+pub struct RelayThrottle {
+    bucket: Option<TokenBucket>,
+}
+
+impl RelayThrottle {
+    /// Builds the room throttle from the configured byte rate.
+    pub fn new(rate_bytes_per_s: u64) -> Self {
+        if rate_bytes_per_s == 0 {
+            return Self { bucket: None };
+        }
+        let rate = rate_bytes_per_s as f64;
+        let burst = (2.0 * rate).min(WEB_TRANSFER_RELAY_BURST_CAP as f64);
+        Self {
+            bucket: Some(TokenBucket::new(rate, burst)),
+        }
+    }
+
+    /// Returns how long `n` bytes must wait. Zero when throttling is
+    /// disabled or the bucket covers the bytes.
+    pub fn delay_for(&mut self, now: Instant, n: u64) -> Duration {
+        match self.bucket.as_mut() {
+            None => Duration::ZERO,
+            Some(bucket) => bucket.take_bytes(now, n),
+        }
+    }
+
+    /// Effective burst for tests (0 when disabled).
+    #[cfg(test)]
+    pub fn burst(&self) -> f64 {
+        self.bucket
+            .as_ref()
+            .map(|b| b.burst_for_test())
+            .unwrap_or(0.0)
+    }
+}
+
+/// Boxed relay write half: `Sink` is object-safe, so the pairing map never
+/// names the transport type (plain TCP, TLS and prefixed streams all pair).
+pub type RelaySink =
+    std::pin::Pin<Box<dyn futures_util::sink::Sink<Message, Error = WsError> + Send + 'static>>;
+/// Boxed relay read half, same type erasure as the sink.
+pub type RelayStream = BoxStream<'static, Result<Message, WsError>>;
+
+/// One attached relay leg with its boxed halves.
+pub struct RelayLeg {
+    /// Attaching peer (already ticket-bound).
+    pub peer: PeerId,
+    /// Which side this leg serves.
+    pub role: RelayRole,
+    /// Write half (recipient data + close/pong both sides).
+    pub sink: RelaySink,
+    /// Read half (source data, violation watch on the recipient).
+    pub stream: RelayStream,
+}
+
+/// Parked first leg: only a handoff sender plus metadata, never payload.
+pub(crate) struct RelayWaiter {
+    /// Role of the parked leg; the pair must be complementary.
+    pub first_role: RelayRole,
+    /// Peer holding the parked socket.
+    pub first_peer: PeerId,
+    /// Receives the second leg's halves; the parked task becomes the pump.
+    pub tx: oneshot::Sender<RelayLeg>,
+}
+
+/// One spliced relay pair: the four halves plus the identities and policy
+/// the pump needs. Built by the parked task after activation; the pump takes
+/// it whole so no call site can mix up the legs.
+pub(crate) struct RelayPair {
+    /// Transfer being relayed.
+    pub transfer_id: TransferId,
+    /// Attempt being relayed.
+    pub attempt_id: AttemptId,
+    /// Uploading peer (reads only).
+    pub source: PeerId,
+    /// Downloading peer (writes only).
+    pub recipient: PeerId,
+    /// Source write half (close/pong only).
+    pub source_sink: RelaySink,
+    /// Source read half (payload).
+    pub source_stream: RelayStream,
+    /// Recipient write half (payload + close/pong).
+    pub recipient_sink: RelaySink,
+    /// Recipient read half (violation watch only).
+    pub recipient_stream: RelayStream,
+    /// Transfer-level cancel token (terminal transitions fire it).
+    pub cancel: CancellationToken,
+    /// Per-forward send deadline on the warm recipient leg.
+    pub send_timeout: Duration,
+    /// Grace to drain the close echo at pump end (tests shorten it).
+    pub close_grace: Duration,
+}
+
+/// Opaque pump counters: aggregate bytes/frames only, never content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RelayStats {
+    /// Ciphertext bytes forwarded.
+    pub bytes: u64,
+    /// Frames forwarded.
+    pub frames: u64,
+    /// Pump start (elapsed derived at the end).
+    pub started: Instant,
+}
+
+/// How a relay pump ended. Only `Clean` keeps the transfer `Active` (the
+/// recipient verifies and completes over control); `Cancelled` is already
+/// terminal; every other end fails the attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayEnd {
+    /// Source closed orderly after its payload.
+    Clean,
+    /// Source transport broke.
+    SourceGone,
+    /// Recipient transport broke or closed first.
+    RecipientGone,
+    /// Malformed source frame, source text, or any recipient payload.
+    Violation,
+    /// Warm recipient leg did not drain within the send deadline.
+    SendTimeout,
+    /// Transfer terminated underneath the pump.
+    Cancelled,
+}
+
+/// Outcome of offering one leg to the pairing rendezvous.
+pub(crate) enum RelayJoin {
+    /// First leg: keep the socket, wait for the peer on `wait` until
+    /// `deadline`, selecting on `cancel` too.
+    Park {
+        /// Own halves, kept by the parking task.
+        leg: RelayLeg,
+        /// Receives the second leg; the parked task then pumps.
+        wait: oneshot::Receiver<RelayLeg>,
+        /// Pairing deadline (30 s after this attach).
+        deadline: Instant,
+        /// Transfer-level cancel token (terminal transitions fire it).
+        cancel: CancellationToken,
+    },
+    /// Second leg: hand `leg` to the parked peer, then exit quietly — the
+    /// parked task owns both sockets from here on.
+    Pair {
+        /// Own halves, moved to the parked task.
+        leg: RelayLeg,
+        /// Sends to the parked task; failure means it left (abort instead).
+        send_to_parked: oneshot::Sender<RelayLeg>,
+    },
+}
+
+impl WebTransferRegistry {
+    /// Pair the transfer's relay legs: consume the ticket atomically, bind the
+    /// leg to its validated role, then park (first) or hand off (second).
+    /// Invalid tickets, stale attempts and duplicate legs all deny with
+    /// `TRANSFER_NOT_FOUND`: the caller closes the socket without a control
+    /// notice, so every failure shape is indistinguishable on the wire.
+    pub(crate) fn join_relay_pair(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        attach: &crate::web_transfer_protocol::RelayAttach,
+        ticket_hex: &str,
+        sink: RelaySink,
+        stream: RelayStream,
+    ) -> Result<RelayJoin, WebTransferError> {
+        let now = Instant::now();
+        // The wire role duplicates the registry role by design (protocol and
+        // registry evolve independently); map once at the boundary.
+        let role = match attach.role {
+            crate::web_transfer_protocol::RelayRole::Source => RelayRole::Source,
+            crate::web_transfer_protocol::RelayRole::Recipient => RelayRole::Recipient,
+        };
+        let grant = self
+            .consume_relay_ticket(ticket_hex, role, attach.peer_id, now)
+            .map_err(|_| WebTransferError::transfer_not_found("unknown or spent ticket"))?;
+        // The body repeats the ticket's own binding; incoherence denies.
+        if attach.transfer_id != grant.transfer_id || attach.attempt_id != grant.attempt_id {
+            return Err(WebTransferError::transfer_not_found(
+                "attach does not match ticket",
+            ));
+        }
+        let cancel = {
+            let state = room
+                .state
+                .lock()
+                .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+            let record = state
+                .transfers
+                .get(&grant.transfer_id)
+                .ok_or_else(|| WebTransferError::transfer_not_found("unknown transfer"))?;
+            if !record.state.is_live() || record.state != TransferState::WaitingRelay {
+                return Err(WebTransferError::transfer_not_found(
+                    "transfer not awaiting relay",
+                ));
+            }
+            if record.attempt_id != Some(grant.attempt_id) {
+                return Err(WebTransferError::transfer_not_found("stale attempt"));
+            }
+            let parties_match = match role {
+                RelayRole::Source => record.source == attach.peer_id,
+                RelayRole::Recipient => record.recipient == attach.peer_id,
+            };
+            if !parties_match {
+                return Err(WebTransferError::transfer_not_found(
+                    "leg does not match record",
+                ));
+            }
+            record.cancel.clone()
+        };
+        let key = (grant.transfer_id, grant.attempt_id);
+        let leg = RelayLeg {
+            peer: attach.peer_id,
+            role,
+            sink,
+            stream,
+        };
+        match self.inner.relay_waiters.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                let waiter = entry.get();
+                // Same role twice (or the same peer twice) is a duplicate
+                // leg: deny, the parked first leg keeps waiting.
+                if waiter.first_role == role || waiter.first_peer == attach.peer_id {
+                    return Err(WebTransferError::transfer_not_found("duplicate relay leg"));
+                }
+                let waiter = entry.remove();
+                Ok(RelayJoin::Pair {
+                    leg,
+                    send_to_parked: waiter.tx,
+                })
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                let (tx, wait) = oneshot::channel();
+                slot.insert(RelayWaiter {
+                    first_role: role,
+                    first_peer: attach.peer_id,
+                    tx,
+                });
+                Ok(RelayJoin::Park {
+                    leg,
+                    wait,
+                    deadline: now + WEB_TRANSFER_RELAY_ATTACH_TIMEOUT,
+                    cancel,
+                })
+            }
+        }
+    }
+
+    /// Drops a pairing waiter if still present (parked task leaving via
+    /// timeout or cancel). `false` means the peer already took it and owns
+    /// the outcome — the caller must exit quietly, never abort.
+    pub(crate) fn abandon_relay_waiter(
+        &self,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+    ) -> bool {
+        self.inner
+            .relay_waiters
+            .remove(&(transfer_id, attempt_id))
+            .is_some()
+    }
+
+    /// Moves a paired transfer to `Active` and hands out its cancel token.
+    /// `None` means the attempt went stale while pairing (the pair aborts).
+    pub(crate) fn activate_relay(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+    ) -> Option<CancellationToken> {
+        let mut state = room.state.lock().ok()?;
+        let record = state.transfers.get_mut(&transfer_id)?;
+        if !record.state.is_live() || record.state != TransferState::WaitingRelay {
+            return None;
+        }
+        if record.attempt_id != Some(attempt_id) {
+            return None;
+        }
+        record.state = TransferState::Active;
+        Some(record.cancel.clone())
+    }
+
+    /// Fails a relay attempt once: terminal `Failed` plus a retryable
+    /// `DIRECT_FAILED` notice naming the transfer on both control sockets.
+    /// Idempotent — only the transition winner notifies.
+    pub(crate) fn abort_relay_attempt(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+    ) {
+        let parties = {
+            let Ok(state) = room.state.lock() else {
+                return;
+            };
+            let Some(record) = state.transfers.get(&transfer_id) else {
+                return;
+            };
+            if record.attempt_id != Some(attempt_id) {
+                return;
+            }
+            (record.source, record.recipient)
+        };
+        if self.fail_transfer(room, transfer_id) {
+            let notice = crate::web_transfer_protocol::error_envelope_anon(
+                "DIRECT_FAILED",
+                Some(&transfer_id.to_string()),
+            );
+            let _ = room.send_to(parties.0, notice.clone());
+            let _ = room.send_to(parties.1, notice);
+        }
+    }
+
+    /// Releases the attempt's relay permit exactly once (pump end and
+    /// terminal transitions both take-if-present; the second is a no-op).
+    pub(crate) fn release_relay_permit(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+    ) -> bool {
+        let Ok(mut state) = room.state.lock() else {
+            return false;
+        };
+        let Some(record) = state.transfers.get_mut(&transfer_id) else {
+            return false;
+        };
+        if record.attempt_id != Some(attempt_id) {
+            return false;
+        }
+        match record.attempt.as_mut() {
+            Some(attempt) => attempt.relay_permit.take().is_some(),
+            None => false,
+        }
+    }
+
+    /// Sends Close on one leg and drains its close echo (or the
+    /// transport end) within `grace`, so the TCP close never resets a
+    /// fully-delivered connection out from under the browser.
+    pub(crate) async fn graceful_relay_close(
+        mut sink: RelaySink,
+        mut stream: RelayStream,
+        grace: Duration,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        let _ = sink.close().await;
+        let _ = timeout(grace, async {
+            while let Some(message) = stream.next().await {
+                match message {
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+    }
+
+    /// Runs one paired relay: reads a source frame, rate-limits, forwards it
+    /// to the recipient, then reads the next — at most one application frame
+    /// is ever held. Ends `Clean` only on the source's orderly close (the
+    /// recipient then verifies and completes over control); every other end
+    /// fails the attempt. Releases the relay permit exactly once and logs
+    /// opaque aggregates only (IDs, role, bytes, frames, outcome).
+    pub(crate) async fn run_relay_pair(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        pair: RelayPair,
+    ) -> (RelayEnd, RelayStats) {
+        use futures_util::{SinkExt, StreamExt};
+        let RelayPair {
+            transfer_id,
+            attempt_id,
+            source,
+            recipient,
+            mut source_sink,
+            mut source_stream,
+            mut recipient_sink,
+            mut recipient_stream,
+            cancel,
+            send_timeout,
+            close_grace,
+        } = pair;
+        let mut stats = RelayStats {
+            bytes: 0,
+            frames: 0,
+            started: Instant::now(),
+        };
+        // The recipient's verified ranges reach the SOURCE here and nowhere
+        // else: the descriptor rides `transfer.request`, which the source
+        // never sees. Absent record (already terminal) means no skipping.
+        let resume_ranges = room
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .transfers
+                    .get(&transfer_id)
+                    .and_then(|record| record.resume.as_ref())
+                    .map(|resume| resume.verified_ranges.clone())
+            })
+            .unwrap_or_default();
+        let commit = crate::web_transfer_protocol::transfer_path_commit_envelope(
+            transfer_id,
+            attempt_id,
+            "relay",
+            &resume_ranges,
+        );
+        let _ = room.send_to(source, commit.clone());
+        let _ = room.send_to(recipient, commit);
+        let mut last_seq: Option<u32> = None;
+        let end = loop {
+            tokio::select! {
+                msg = source_stream.next() => {
+                    match msg {
+                        Some(Ok(Message::Binary(body))) => {
+                            let len = body.len();
+                            let seq = match check_relay_frame(last_seq, &body) {
+                                Ok(seq) => seq,
+                                Err(_) => break RelayEnd::Violation,
+                            };
+                            // Read before the frame is moved into the send.
+                            let is_final = body[6] == RELAY_FRAME_TYPE_FINAL;
+                            let delay = match room.relay_throttle.lock() {
+                                Ok(mut throttle) => throttle.delay_for(Instant::now(), len as u64),
+                                Err(_) => Duration::ZERO,
+                            };
+                            if !delay.is_zero() {
+                                tokio::time::sleep(delay).await;
+                            }
+                            match timeout(
+                                send_timeout,
+                                recipient_sink.send(Message::Binary(body)),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    stats.bytes += len as u64;
+                                    stats.frames += 1;
+                                    self.inner
+                                        .relay_bytes_total
+                                        .fetch_add(len as u64, Ordering::Relaxed);
+                                    last_seq = Some(seq);
+                                    if is_final {
+                                        // The attempt ends on its own terms.
+                                        // Waiting for the source's TRANSPORT
+                                        // to close instead made the end of
+                                        // the stream a property of the
+                                        // engine: MEASURED on WebKit, a
+                                        // source that had written all
+                                        // 8 388 613 bytes and then closed
+                                        // its socket delivered 7 087 168 of
+                                        // them — the close outran the frames
+                                        // still queued behind it, the pump
+                                        // read the stream as ended and
+                                        // failed a COMPLETE transfer for
+                                        // both peers. A close cannot
+                                        // truncate a stream that has already
+                                        // said it was over.
+                                        break RelayEnd::Clean;
+                                    }
+                                }
+                                _ => break RelayEnd::SendTimeout,
+                            }
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            let _ = source_sink.send(Message::Pong(payload)).await;
+                        }
+                        Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(Message::Close(_))) => break RelayEnd::Clean,
+                        Some(Ok(Message::Text(_))) => break RelayEnd::Violation,
+                        // Raw fragments never carry a complete frame: the
+                        // sender must emit whole Binary messages.
+                        Some(Ok(Message::Frame(_))) => break RelayEnd::Violation,
+                        Some(Err(_)) | None => break RelayEnd::SourceGone,
+                    }
+                }
+                msg = recipient_stream.next() => {
+                    match msg {
+                        // The recipient leg never carries payload upstream.
+                        Some(Ok(Message::Binary(_)))
+                        | Some(Ok(Message::Text(_)))
+                        | Some(Ok(Message::Frame(_))) => break RelayEnd::Violation,
+                        Some(Ok(Message::Ping(payload))) => {
+                            let _ = recipient_sink.send(Message::Pong(payload)).await;
+                        }
+                        Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                            break RelayEnd::RecipientGone
+                        }
+                    }
+                }
+                _ = cancel.cancelled() => break RelayEnd::Cancelled,
+            }
+        };
+        let _ = tokio::join!(
+            Self::graceful_relay_close(source_sink, source_stream, close_grace),
+            Self::graceful_relay_close(recipient_sink, recipient_stream, close_grace)
+        );
+        let _ = self.release_relay_permit(room, transfer_id, attempt_id);
+        let elapsed = stats.started.elapsed();
+        match end {
+            RelayEnd::Clean => {
+                debug!(
+                    transfer = %transfer_id,
+                    attempt = %attempt_id,
+                    bytes = stats.bytes,
+                    frames = stats.frames,
+                    elapsed_ms = elapsed.as_millis(),
+                    "relay pair closed clean",
+                );
+            }
+            RelayEnd::Cancelled => {
+                debug!(
+                    transfer = %transfer_id,
+                    attempt = %attempt_id,
+                    bytes = stats.bytes,
+                    frames = stats.frames,
+                    "relay pair cancelled",
+                );
+            }
+            failed => {
+                warn!(
+                    transfer = %transfer_id,
+                    attempt = %attempt_id,
+                    bytes = stats.bytes,
+                    frames = stats.frames,
+                    outcome = ?failed,
+                    "relay pair failed",
+                );
+                self.abort_relay_attempt(room, transfer_id, attempt_id);
+            }
+        }
+        (end, stats)
+    }
 }
 
 /// Generates a nonzero random room ID from the OS CSPRNG.
@@ -2469,17 +5338,19 @@ impl WebTransferRoom {
         self.cancel.cancel();
     }
 
-    /// Removes exactly `peer_id` from THIS room: its presence record plus
-    /// every offer it owns (attributed since Phase 2.3), each with its own
-    /// revisioned removal broadcast — offers first, peer last, so receivers
-    /// never see an offer of a departed peer. If the complete revision range
-    /// cannot be represented, cleanup still runs, the exhausted room is
-    /// removed and destroyed, and subscribers receive one opaque room-close
-    /// event instead of a wrapped incremental revision.
+    /// Removes exactly `peer_id` from THIS room: its presence record, every
+    /// offer it owns (attributed since Phase 2.3) and every live transfer it
+    /// takes part in (cancelled as the departed peer), each removal with its
+    /// own revisioned removal broadcast — offers first, peer last, so
+    /// receivers never see an offer of a departed peer. Transfer cancels go
+    /// direct to the other party. If the complete revision range cannot be
+    /// represented, cleanup still runs, the exhausted room is removed and
+    /// destroyed, and subscribers receive one opaque room-close event
+    /// instead of a wrapped incremental revision.
     /// Releases room and global metadata per offer. Called by `PeerGuard::drop`;
     /// never resolves a registry key.
     pub(crate) fn remove_peer(self: &Arc<Self>, peer_id: PeerId) {
-        let (events, revision_exhausted) = {
+        let (events, outbox, revision_exhausted) = {
             let Ok(mut state) = self.state.lock() else {
                 return;
             };
@@ -2498,16 +5369,22 @@ impl WebTransferRoom {
                 .and_then(|steps| checked_room_revision(state.revision, steps).ok())
                 .is_some();
             state.peers.remove(&peer_id);
+            if let Ok(mut sessions) = self.sessions.lock() {
+                sessions.remove(&peer_id);
+            }
+            let inner = self.registry.upgrade();
             let mut events = Vec::new();
+            let mut outbox = Vec::new();
             let mut revision = state.revision;
             for offer in owned {
                 if let Some(record) = state.offers.remove(&offer) {
                     state.metadata_bytes =
                         state.metadata_bytes.saturating_sub(record.metadata_bytes);
-                    if let Some(registry) = self.registry.upgrade() {
+                    if let Some(registry) = &inner {
                         registry
                             .metadata_current
                             .fetch_sub(record.metadata_bytes, Ordering::Relaxed);
+                        registry.offers_current.fetch_sub(1, Ordering::Relaxed);
                     }
                     if incremental {
                         revision = checked_room_revision(revision, 1)
@@ -2520,6 +5397,13 @@ impl WebTransferRoom {
                     }
                 }
             }
+            cancel_where_locked(
+                inner.as_deref(),
+                &mut state,
+                peer_id,
+                |transfer| transfer.source == peer_id || transfer.recipient == peer_id,
+                &mut outbox,
+            );
             if incremental {
                 revision = checked_room_revision(revision, 1)
                     .expect("revision range was checked before cleanup");
@@ -2529,8 +5413,11 @@ impl WebTransferRoom {
                     revision,
                 });
             }
-            (events, !incremental)
+            (events, outbox, !incremental)
         };
+        for (peer, message) in outbox {
+            let _ = self.send_to(peer, message);
+        }
         if revision_exhausted {
             if let Some(registry) = self.registry.upgrade() {
                 let holder = WebTransferRegistry { inner: registry };
@@ -2746,7 +5633,11 @@ impl WebTransferRegistry {
     ) -> Result<Arc<WebTransferRoom>, WebTransferError> {
         let permit = Arc::clone(&self.inner.room_permits)
             .try_acquire_owned()
-            .map_err(|_| WebTransferError::limit("web-transfer room budget exhausted"))?;
+            .map_err(|_| {
+                self.refused(WebTransferError::limit(
+                    "web-transfer room budget exhausted",
+                ))
+            })?;
         let room = Arc::new(WebTransferRoom {
             id,
             limits: self.inner.config.limits,
@@ -2769,6 +5660,10 @@ impl WebTransferRegistry {
             destroyed: AtomicBool::new(false),
             registry: Arc::downgrade(&self.inner),
             room_permit: permit,
+            sessions: std::sync::Mutex::new(HashMap::new()),
+            relay_throttle: std::sync::Mutex::new(RelayThrottle::new(
+                self.inner.config.limits.relay_rate_bytes_per_s,
+            )),
         });
         match self.inner.rooms.entry(id) {
             dashmap::mapref::entry::Entry::Occupied(_) => {
@@ -3873,6 +6768,170 @@ mod control_session_tests {
         (lease, member, id)
     }
 
+    /// 6.3: every credential on this surface is either single-use or
+    /// idempotent, and nothing in between.
+    ///
+    /// Three replays, three different right answers. A relay TICKET is
+    /// single-use: presenting it twice must fail the second time, and a
+    /// WRONG presentment must still burn it (otherwise a guesser gets one
+    /// free role probe per ticket). A requestId REPLAY is idempotent: the
+    /// same terminal response comes back and the mutation does not run twice.
+    /// A member TOKEN is the room credential and is meant to be reused — by
+    /// every peer, for the life of the room — so the property worth pinning
+    /// is that it is bound to ITS room and dies with it.
+    #[tokio::test]
+    async fn token_ticket_request_replays_are_idempotent_or_rejected() {
+        use crate::web_transfer_protocol::RequestId;
+
+        let registry = session_registry();
+        let (lease, member, id) = open_room(&registry);
+        let now = Instant::now();
+
+        // --- ticket: single use ------------------------------------------
+        let peer = generate_peer_id();
+        let ticket = generate_relay_ticket();
+        let record = RelayTicketRecord {
+            ticket_hash: ticket.sha256_hash(),
+            transfer_id: TransferId::from_bytes([1u8; 16]),
+            attempt_id: AttemptId::from_bytes([2u8; 16]),
+            peer_id: peer,
+            role: RelayRole::Source,
+            expires_at: now + Duration::from_secs(30),
+        };
+        registry.inner.tickets.insert(ticket.sha256_hash(), record);
+        let granted = registry
+            .consume_relay_ticket(&ticket.to_string(), RelayRole::Source, peer, now)
+            .expect("the first presentment is the legitimate leg");
+        assert_eq!(granted.peer_id, peer);
+        assert!(
+            matches!(
+                registry.consume_relay_ticket(&ticket.to_string(), RelayRole::Source, peer, now),
+                Err(TicketDeny::Unknown)
+            ),
+            "a relay ticket must not work twice"
+        );
+
+        // A WRONG presentment burns the ticket too: the legitimate leg then
+        // fails, which is the correct outcome — the attempt falls back — and
+        // it is what stops a guesser from probing roles for free.
+        let ticket2 = generate_relay_ticket();
+        registry.inner.tickets.insert(
+            ticket2.sha256_hash(),
+            RelayTicketRecord {
+                ticket_hash: ticket2.sha256_hash(),
+                transfer_id: TransferId::from_bytes([1u8; 16]),
+                attempt_id: AttemptId::from_bytes([2u8; 16]),
+                peer_id: peer,
+                role: RelayRole::Source,
+                expires_at: now + Duration::from_secs(30),
+            },
+        );
+        assert!(matches!(
+            registry.consume_relay_ticket(&ticket2.to_string(), RelayRole::Recipient, peer, now),
+            Err(TicketDeny::RoleMismatch)
+        ));
+        assert!(matches!(
+            registry.consume_relay_ticket(&ticket2.to_string(), RelayRole::Source, peer, now),
+            Err(TicketDeny::Unknown)
+        ));
+
+        // An expired ticket is refused and burned as well.
+        let ticket3 = generate_relay_ticket();
+        registry.inner.tickets.insert(
+            ticket3.sha256_hash(),
+            RelayTicketRecord {
+                ticket_hash: ticket3.sha256_hash(),
+                transfer_id: TransferId::from_bytes([1u8; 16]),
+                attempt_id: AttemptId::from_bytes([2u8; 16]),
+                peer_id: peer,
+                role: RelayRole::Source,
+                expires_at: now,
+            },
+        );
+        assert!(matches!(
+            registry.consume_relay_ticket(
+                &ticket3.to_string(),
+                RelayRole::Source,
+                peer,
+                now + Duration::from_secs(1)
+            ),
+            Err(TicketDeny::Expired)
+        ));
+        // A ticket that was never issued is `Unknown`, never a panic.
+        assert!(matches!(
+            registry.consume_relay_ticket("not-hex", RelayRole::Source, peer, now),
+            Err(TicketDeny::Unknown)
+        ));
+
+        // --- requestId: idempotent ----------------------------------------
+        let mut cache = RequestCache::default();
+        let request: RequestId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        assert!(cache.get(request, now).is_none());
+        cache.insert(request, "{\"type\":\"ack\"}".to_string(), now);
+        assert_eq!(
+            cache.get(request, now).as_deref(),
+            Some("{\"type\":\"ack\"}"),
+            "a replayed requestId must replay its own terminal response"
+        );
+        // ... and it expires, so a replay is idempotent for a bounded window
+        // and not forever (the cache is 256 entries, not a log).
+        assert!(cache
+            .get(
+                request,
+                now + WEB_TRANSFER_REQUEST_CACHE_TTL + Duration::from_secs(1)
+            )
+            .is_none());
+
+        // --- member token: reusable, but bound to its room ----------------
+        assert!(matches!(
+            authenticate_hello(&registry, id, &member),
+            HelloAuth::Ok { .. }
+        ));
+        assert!(matches!(
+            authenticate_hello(&registry, id, &member),
+            HelloAuth::Ok { .. }
+        ));
+        // A second room with its OWN token: `open_room` mints a fixed one,
+        // so the binding has to be tested against a room that really has a
+        // different credential.
+        let other_member = MemberToken::from_bytes([0x7au8; 32]);
+        let other_owner = OwnerToken::from_bytes([0x7bu8; 32]);
+        let other_lease = OwnerLease::create(
+            &registry,
+            other_member.sha256_hash(),
+            other_owner.sha256_hash(),
+        )
+        .expect("a second room");
+        let other_id = other_lease.id();
+        assert!(
+            matches!(
+                authenticate_hello(&registry, other_id, &member),
+                HelloAuth::Deny
+            ),
+            "a token must not open a room it was not minted for"
+        );
+        assert!(
+            matches!(
+                authenticate_hello(&registry, id, &other_member),
+                HelloAuth::Deny
+            ),
+            "and the binding holds in the other direction too"
+        );
+        lease.close_explicit(&registry);
+        // After an explicit close the room is removed from the registry, so
+        // the answer is `Deny` (unknown room) rather than `Gone` (known and
+        // destroyed) — which is what a peer arriving late must hear anyway.
+        // The property under test is that it is never `Ok`.
+        assert!(
+            !matches!(
+                authenticate_hello(&registry, id, &member),
+                HelloAuth::Ok { .. }
+            ),
+            "a token must die with its room"
+        );
+        other_lease.close_explicit(&registry);
+    }
+
     #[tokio::test]
     async fn peer_auth_errors_do_not_oracle_room_or_token() {
         let registry = session_registry();
@@ -4233,6 +7292,52 @@ mod control_session_tests {
         assert_eq!(full.len(), WEB_TRANSFER_PRE_AUTH_MAX_IPS);
         let fresh: IpAddr = "192.0.2.1".parse().unwrap();
         let _ = full.check(fresh, start);
+        assert_eq!(full.len(), WEB_TRANSFER_PRE_AUTH_MAX_IPS);
+    }
+
+    /// 6.2: repeated pre-auth failures from one address are reported at the
+    /// 1st, 2nd, 4th, 8th … attempt and nowhere in between.
+    ///
+    /// Both ends of this are defects: a line per refusal makes one scanner a
+    /// log-volume attack on the operator, and no line at all hides a single
+    /// address failing ten thousand times. The powers of two are the order of
+    /// magnitude, which is what an operator acts on.
+    #[test]
+    fn repeated_pre_auth_failures_are_logged_logarithmically() {
+        let start = Instant::now();
+        let mut sampler = AuthFailureSampler::default();
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let mut reported = Vec::new();
+        for _ in 0..64 {
+            if let Some(count) = sampler.note(ip, start) {
+                reported.push(count);
+            }
+        }
+        assert_eq!(reported, vec![1, 2, 4, 8, 16, 32, 64]);
+
+        // Another address is another story: the count is per IP, so a second
+        // attacker is never hidden by the first one's silence.
+        let other: IpAddr = "203.0.113.8".parse().unwrap();
+        assert_eq!(sampler.note(other, start), Some(1));
+
+        // An idle entry expires: a host that failed once yesterday starts
+        // again at "first failure" rather than at the old address's count.
+        let mut short = AuthFailureSampler::with_ttl(Duration::from_millis(50));
+        assert_eq!(short.note(ip, start), Some(1));
+        assert_eq!(short.note(ip, start), Some(2));
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(short.note(ip, Instant::now()), Some(1));
+
+        // The map never grows past the limiter's own cap, and an IP scan at
+        // capacity is still reported once instead of silencing the sampler.
+        let mut full = AuthFailureSampler::default();
+        for i in 0..WEB_TRANSFER_PRE_AUTH_MAX_IPS {
+            let addr = IpAddr::from([(10u8), ((i / 256) % 256) as u8, (i % 256) as u8, 2u8]);
+            assert_eq!(full.note(addr, start), Some(1));
+        }
+        assert_eq!(full.len(), WEB_TRANSFER_PRE_AUTH_MAX_IPS);
+        let fresh: IpAddr = "198.51.100.9".parse().unwrap();
+        assert_eq!(full.note(fresh, start), Some(1));
         assert_eq!(full.len(), WEB_TRANSFER_PRE_AUTH_MAX_IPS);
     }
 }
@@ -5070,5 +8175,3385 @@ mod peer_permission_tests {
         assert!(registry.rename_peer(&room, ids[0], "Visible").is_ok());
         let parts = snapshot_parts(&room).unwrap();
         assert_eq!(parts.1.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod transfer_state_tests {
+    use super::*;
+    use crate::web_transfer_protocol::{
+        canonical_json, file_root, manifest_value, parse_manifest, selection_digest,
+        DirectFailedBody, RtcIceBody, RtcSdpBody,
+    };
+
+    fn busy_registry() -> WebTransferRegistry {
+        WebTransferRegistry::new(
+            WebTransferConfig::new(
+                WebTransferBaseUrl::parse("http://127.0.0.1:8080/").unwrap(),
+                WebTransferLimits {
+                    max_relays_global: 1,
+                    ..WebTransferLimits::default()
+                },
+                IceServerConfig {
+                    servers: Vec::new(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn transfer_registry() -> WebTransferRegistry {
+        WebTransferRegistry::new(
+            WebTransferConfig::new(
+                WebTransferBaseUrl::parse("http://127.0.0.1:8080/").unwrap(),
+                WebTransferLimits::default(),
+                IceServerConfig {
+                    servers: Vec::new(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn tight_transfer_registry() -> WebTransferRegistry {
+        WebTransferRegistry::new(
+            WebTransferConfig::new(
+                WebTransferBaseUrl::parse("http://127.0.0.1:8080/").unwrap(),
+                WebTransferLimits {
+                    max_transfers_per_peer: 1,
+                    ..WebTransferLimits::default()
+                },
+                IceServerConfig {
+                    servers: Vec::new(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn transfer_room(registry: &WebTransferRegistry) -> (OwnerLease, Arc<WebTransferRoom>) {
+        let member = MemberToken::from_bytes([0x81u8; 32]);
+        let owner = OwnerToken::from_bytes([0x82u8; 32]);
+        let lease =
+            OwnerLease::create(registry, member.sha256_hash(), owner.sha256_hash()).unwrap();
+        let room = lease.room().clone();
+        (lease, room)
+    }
+
+    /// Joins a peer AND registers a live session queue, returning the
+    /// receiver so tests assert targeted delivery without sockets.
+    fn live_peer(
+        registry: &WebTransferRegistry,
+        room: &Arc<WebTransferRoom>,
+        name: Option<&str>,
+    ) -> (PeerId, PeerGuard, mpsc::Receiver<String>) {
+        let id = generate_peer_id();
+        let guard = registry
+            .join_peer(room, id, name.map(str::to_string))
+            .unwrap();
+        let (tx, rx) = mpsc::channel(64);
+        room.sessions.lock().unwrap().insert(id, tx);
+        (id, guard, rx)
+    }
+
+    fn offer_fixture(
+        registry: &WebTransferRegistry,
+        room: &Arc<WebTransferRoom>,
+        owner: PeerId,
+        offer_hex: &str,
+    ) -> [u8; 32] {
+        let leaf: [u8; 32] = [0x11u8; 32];
+        let root = hex::encode(file_root(1, &[leaf]).unwrap());
+        let value = serde_json::json!({
+            "offer": offer_hex,
+            "mode": "single",
+            "label": "Item",
+            "kind": "file",
+            "chunkSize": "1048576",
+            "createdAt": "2026-09-14T12:00:00Z",
+            "entries": [{
+                "id": "0",
+                "path": "item.bin",
+                "size": "17",
+                "mtime": "1757779200",
+                "chunks": [hex::encode(leaf)],
+                "chunkCount": "1",
+                "root": root,
+            }],
+        });
+        let manifest = parse_manifest(&value, &registry.config().limits).unwrap();
+        let canonical: std::sync::Arc<[u8]> = canonical_json(&manifest_value(&manifest))
+            .unwrap()
+            .into_bytes()
+            .into();
+        let mac = [0xeeu8; 32];
+        let offer_id: OfferId = offer_hex.parse().unwrap();
+        registry
+            .publish_offer(room, owner, offer_id, &manifest, canonical, mac)
+            .unwrap();
+        mac
+    }
+
+    /// A FOLDER offer: one directory entry and two files, which is the
+    /// smallest shape a `zip` selection can be asked for.
+    fn folder_offer_fixture(
+        registry: &WebTransferRegistry,
+        room: &Arc<WebTransferRoom>,
+        owner: PeerId,
+        offer_hex: &str,
+    ) -> [u8; 32] {
+        let leaf: [u8; 32] = [0x22u8; 32];
+        let root = hex::encode(file_root(1, &[leaf]).unwrap());
+        let value = serde_json::json!({
+            "offer": offer_hex,
+            "mode": "multi",
+            "label": "tree",
+            "kind": "folder",
+            "chunkSize": "1048576",
+            "createdAt": "2026-09-16T12:00:00Z",
+            "entries": [
+                {
+                    "id": "0",
+                    "path": "tree",
+                    "size": "0",
+                    "mtime": "1757779200",
+                    "chunks": [],
+                    "chunkCount": "0",
+                    "root": serde_json::Value::Null,
+                },
+                {
+                    "id": "1",
+                    "path": "tree/a.bin",
+                    "size": "9",
+                    "mtime": "1757779200",
+                    "chunks": [hex::encode(leaf)],
+                    "chunkCount": "1",
+                    "root": root,
+                },
+                {
+                    "id": "2",
+                    "path": "tree/b.bin",
+                    "size": "11",
+                    "mtime": "1757779200",
+                    "chunks": [hex::encode(leaf)],
+                    "chunkCount": "1",
+                    "root": root,
+                },
+            ],
+        });
+        let manifest = parse_manifest(&value, &registry.config().limits).unwrap();
+        let canonical: std::sync::Arc<[u8]> = canonical_json(&manifest_value(&manifest))
+            .unwrap()
+            .into_bytes()
+            .into();
+        let mac = [0xabu8; 32];
+        let offer_id: OfferId = offer_hex.parse().unwrap();
+        registry
+            .publish_offer(room, owner, offer_id, &manifest, canonical, mac)
+            .unwrap();
+        mac
+    }
+
+    fn request_fixture(
+        registry: &WebTransferRegistry,
+        room: &Arc<WebTransferRoom>,
+        recipient: PeerId,
+        offer_hex: &str,
+        mac: &[u8; 32],
+    ) -> (TransferId, AttemptId) {
+        let offer_id: OfferId = offer_hex.parse().unwrap();
+        let digest = selection_digest(&offer_id, mac, &["0".to_string()], "raw");
+        let (id, _) = registry
+            .request_transfer(
+                room,
+                recipient,
+                offer_id,
+                vec!["0".to_string()],
+                digest,
+                "raw",
+                None,
+            )
+            .unwrap();
+        let attempt = room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .unwrap()
+            .attempt_id
+            .unwrap();
+        (id, attempt)
+    }
+
+    /// Phase 4 made `source_ready` open the DIRECT attempt, so the relay is
+    /// reached only through the one automatic fallback. This is the shape a
+    /// browser with no usable DataChannel produces, and it is what every
+    /// relay assertion below goes through.
+    ///
+    /// The two `transfer.direct_start` envelopes and the counterpart's
+    /// `transfer.direct_failed` are dropped rather than delivered: they are
+    /// the direct step's own traffic, asserted by the direct tests, and
+    /// delivering them here would only shift every `recv_text` by two.
+    /// Returns the relay outcome, the FRESH attempt ID and the relay notices.
+    fn ready_then_relay(
+        registry: &WebTransferRegistry,
+        room: &Arc<WebTransferRoom>,
+        source: PeerId,
+        id: TransferId,
+        attempt: AttemptId,
+        digest: [u8; 32],
+    ) -> (ReadyOutcome, AttemptId, TransferOutbox) {
+        let (outcome, starts) = registry
+            .source_ready(room, source, id, attempt, digest)
+            .unwrap();
+        assert_eq!(outcome, ReadyOutcome::Negotiating);
+        assert_eq!(starts.len(), 2, "both peers hear transfer.direct_start");
+        let body = crate::web_transfer_protocol::DirectFailedBody {
+            transfer_id: id,
+            attempt_id: attempt,
+            reason: "unsupported",
+            verified_ranges: Vec::new(),
+        };
+        let (relay, mut outbox) = registry.direct_failed(room, source, &body).unwrap();
+        if !outbox.is_empty() {
+            // Index 0 is the counterpart's `transfer.direct_failed` notice.
+            outbox.remove(0);
+        }
+        let next = registry.current_attempt(room, id).unwrap();
+        (relay, next, outbox)
+    }
+
+    async fn recv_text(rx: &mut mpsc::Receiver<String>) -> (String, serde_json::Value) {
+        let raw = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        (
+            value["type"].as_str().unwrap().to_string(),
+            value["body"].clone(),
+        )
+    }
+
+    /// `per_peer_transfer_cap_counts_raw_and_zip_together`: the budget is a
+    /// property of the PEER, not of a mode. An archive costs a source the
+    /// same as a file — it reads every file in the offer, so if anything it
+    /// costs more — and counting the two in separate budgets would let a
+    /// peer hold twice the transfers the operator configured by alternating
+    /// between them. The check is in `request_transfer`, before a record is
+    /// created, so neither ordering can slip past the other.
+    #[tokio::test]
+    async fn per_peer_transfer_cap_counts_raw_and_zip_together() {
+        let file_hex = "cccccccccccccccccccccccccccccccc";
+        let folder_hex = "dddddddddddddddddddddddddddddddd";
+        // Both orderings, against a registry whose budget is exactly one.
+        for zip_first in [false, true] {
+            let registry = tight_transfer_registry();
+            let (_lease, room) = transfer_room(&registry);
+            let (source, _guard_a, _rx_a) = live_peer(&registry, &room, Some("A"));
+            let (recipient, _guard_b, _rx_b) = live_peer(&registry, &room, Some("B"));
+            let file_mac = offer_fixture(&registry, &room, source, file_hex);
+            let folder_mac = folder_offer_fixture(&registry, &room, source, folder_hex);
+            let file_id: OfferId = file_hex.parse().unwrap();
+            let folder_id: OfferId = folder_hex.parse().unwrap();
+            let raw_ids = vec!["0".to_string()];
+            let zip_ids = vec!["0".to_string(), "1".to_string(), "2".to_string()];
+            let raw = (
+                file_id,
+                raw_ids.clone(),
+                selection_digest(&file_id, &file_mac, &raw_ids, "raw"),
+                "raw",
+            );
+            let zip = (
+                folder_id,
+                zip_ids.clone(),
+                selection_digest(&folder_id, &folder_mac, &zip_ids, "zip"),
+                "zip",
+            );
+            let (first, second) = if zip_first {
+                (zip.clone(), raw.clone())
+            } else {
+                (raw.clone(), zip.clone())
+            };
+            registry
+                .request_transfer(&room, recipient, first.0, first.1, first.2, first.3, None)
+                .unwrap_or_else(|error| {
+                    panic!("the first request must be admitted, got {error:?}")
+                });
+            let refused = registry
+                .request_transfer(
+                    &room, recipient, second.0, second.1, second.2, second.3, None,
+                )
+                .expect_err("the second request must exhaust the shared budget");
+            assert_eq!(
+                refused.code(),
+                "LIMIT_EXCEEDED",
+                "a {} request after a {} one must hit the SAME per-peer budget",
+                second.3,
+                first.3
+            );
+        }
+    }
+
+    /// `cli_owner_has_no_browser_privileges_or_peer_id`: the CLI that opens
+    /// the room holds a LEASE, not a seat. There is no owner `PeerId`
+    /// anywhere in the room state — `OwnerState` carries an epoch and a
+    /// deadline and nothing else — so the room's peer list is exactly the
+    /// browsers that joined, and the first browser to arrive is an ordinary
+    /// peer like every other. The two halves matter separately: a room whose
+    /// peer list counted its owner would let a `--web-transfer-max-peers-per-room`
+    /// of N admit N-1 browsers, and an "owner browser" would be a privilege
+    /// the fragment cannot express (every peer holds the same member token).
+    /// 6.1 — the pending-handshake bound, at the level of the thing that
+    /// holds it. The wiring (a generic 503, the rest of the surface still
+    /// serving, the slot back after the upgrade) is `t_web_handshake_admission`
+    /// over a real socket; this pins the bound itself and, above all, that a
+    /// released permit is released EXACTLY once — a double release would widen
+    /// the semaphore permanently and silently.
+    #[test]
+    fn pending_handshake_semaphore_and_timeout_release_exactly_once() {
+        let registry = transfer_registry();
+        assert_eq!(
+            registry.handshake_slots_available(),
+            WEB_TRANSFER_PENDING_HANDSHAKES
+        );
+        // The deadline is a property of the upgrade, not of a session: it has
+        // to be short enough that a silent caller cannot hold a slot for
+        // long, and it is quoted here so a change has to be deliberate.
+        assert_eq!(WEB_TRANSFER_HANDSHAKE_TIMEOUT, Duration::from_secs(10));
+
+        let mut held = Vec::new();
+        while let Some(permit) = registry.try_acquire_handshake() {
+            held.push(permit);
+        }
+        assert_eq!(held.len(), WEB_TRANSFER_PENDING_HANDSHAKES);
+        assert_eq!(registry.handshake_slots_available(), 0);
+        // Saturated means REFUSED, never queued: a queue would turn a burst
+        // into a pile of waiting tasks, which is the state this bound exists
+        // to refuse.
+        assert!(registry.try_acquire_handshake().is_none());
+
+        // One release gives back exactly one slot.
+        drop(held.pop().expect("a permit to release"));
+        assert_eq!(registry.handshake_slots_available(), 1);
+        let again = registry.try_acquire_handshake().expect("the freed slot");
+        assert_eq!(registry.handshake_slots_available(), 0);
+        drop(again);
+        assert_eq!(registry.handshake_slots_available(), 1);
+
+        // And releasing the rest returns exactly the initial count — no more.
+        drop(held);
+        assert_eq!(
+            registry.handshake_slots_available(),
+            WEB_TRANSFER_PENDING_HANDSHAKES
+        );
+    }
+
+    /// 6.1 — the pre-auth limiter is bounded in SIZE as well as in rate.
+    ///
+    /// The rate alone would still let a source-address scan grow the map
+    /// without bound, which is the allocation the limiter is supposed to
+    /// prevent. Past the cap an unseen address shares ONE overflow bucket,
+    /// and — the part that matters — a tracked address keeps its own.
+    #[test]
+    fn preauth_lru_caps_at_8192_and_uses_overflow_bucket() {
+        let mut limiter = PreAuthLimiter::default();
+        let now = Instant::now();
+        let ip = |n: u32| IpAddr::from(std::net::Ipv4Addr::from(n));
+
+        // A tracked address that must survive the scan below.
+        assert!(limiter.check(ip(1), now));
+        for n in 2..=(WEB_TRANSFER_PRE_AUTH_MAX_IPS as u32) {
+            assert!(limiter.check(ip(n), now), "first attempt from {n}");
+        }
+        assert_eq!(limiter.len(), WEB_TRANSFER_PRE_AUTH_MAX_IPS);
+
+        // Past the cap the map does not grow, and the newcomers share one
+        // bucket: its burst is spent once, by all of them together.
+        let mut allowed = 0;
+        for n in 0..1000u32 {
+            if limiter.check(ip(1_000_000 + n), now) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(limiter.len(), WEB_TRANSFER_PRE_AUTH_MAX_IPS, "map grew");
+        assert_eq!(
+            allowed, WEB_TRANSFER_PRE_AUTH_BURST as i32,
+            "the overflow bucket is one bucket, not one per address"
+        );
+
+        // The scan cost the tracked address nothing: it still has its own
+        // bucket, with its own remaining burst.
+        assert!(limiter.check(ip(1), now), "a tracked address was evicted");
+
+        // Idle entries age out, which is what keeps the cap from being
+        // reached by addresses nobody has seen for ten minutes.
+        let mut short = PreAuthLimiter::with_ttl(Duration::from_millis(1));
+        assert!(short.check(ip(7), now));
+        assert_eq!(short.len(), 1);
+        assert!(short.check(ip(8), now + Duration::from_millis(5)));
+        assert_eq!(short.len(), 1, "the idle entry was not purged");
+    }
+
+    /// 6.1 — a capacity is never taken from a number a peer chose.
+    ///
+    /// `Vec::with_capacity(n)` allocates `n` before a single element exists,
+    /// so a peer-controlled `n` is a one-message allocation primitive (the
+    /// transfer receiver's own B1). The rule is a tripwire and not a review
+    /// because it has to hold for code written later: every `with_capacity`
+    /// on this surface is either clamped with `.min(` or derived from bytes
+    /// already received.
+    #[test]
+    fn every_protocol_length_is_checked_before_allocation() {
+        let call = concat!("with_", "capacity(");
+        let assoc = format!("::{call}");
+        let method = format!(".{call}");
+        for (name, source) in [
+            ("web_transfer.rs", include_str!("web_transfer.rs")),
+            (
+                "web_transfer_protocol.rs",
+                include_str!("web_transfer_protocol.rs"),
+            ),
+            ("web_transfer_http.rs", include_str!("web_transfer_http.rs")),
+        ] {
+            for (number, line) in source.lines().enumerate() {
+                // A comment mentioning the rule is not an allocation: this
+                // very doc comment is the first thing the scan would flag.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // Matched on the CALL, and the needle is assembled from two
+                // pieces on purpose: written whole it would appear in this
+                // file and the scan would flag its own source line.
+                let Some(rest) = line
+                    .split_once(assoc.as_str())
+                    .or_else(|| line.split_once(method.as_str()))
+                else {
+                    continue;
+                };
+                let argument = rest.1;
+                let clamped = argument.contains(".min(");
+                // `x.len()` is the length of something already in memory, so
+                // it is bounded by whatever bounded that. A bare parsed
+                // count is not, and that is what this refuses.
+                let from_existing = argument.contains(".len()");
+                let literal = argument.chars().next().is_some_and(|c| c.is_ascii_digit());
+                assert!(
+                    clamped || from_existing || literal,
+                    "{name}:{}: with_capacity from an unclamped value: {}",
+                    number + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
+
+    /// 6.1 — one room's throttle is one room's problem.
+    ///
+    /// The relay pump takes the room's throttle lock, computes a delay and
+    /// RELEASES it before sleeping; the throttle itself lives on the room and
+    /// not on the registry. Both halves matter: a throttle held across the
+    /// await would stall the room's other relays, and a shared throttle would
+    /// let a rate-limited room slow every other room on the server. This test
+    /// holds one room's throttle and then does, on the SAME thread, what the
+    /// pump of another room does — a shared lock would deadlock here rather
+    /// than fail, which is the honest shape of this defect.
+    #[tokio::test]
+    async fn throttled_room_does_not_hold_registry_or_other_room_lock() {
+        let registry = transfer_registry();
+        let (_lease_a, room_a) = transfer_room(&registry);
+        let member = MemberToken::from_bytes([0x91u8; 32]);
+        let owner = OwnerToken::from_bytes([0x92u8; 32]);
+        let lease_b =
+            OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash()).unwrap();
+        let room_b = lease_b.room().clone();
+        assert_ne!(room_a.id, room_b.id);
+
+        let held = room_a.relay_throttle.lock().expect("room A throttle");
+        // The registry is still readable: the throttle is not on it.
+        assert!(registry.room(room_b.id).is_some());
+        // And room B's own throttle is a different lock, which its pump can
+        // take while room A's is held.
+        let delay = room_b
+            .relay_throttle
+            .lock()
+            .expect("room B throttle")
+            .delay_for(Instant::now(), 1024);
+        assert_eq!(delay, Duration::ZERO, "room B paid for room A's budget");
+        drop(held);
+    }
+
+    /// 6.1 — a refusal leaves nothing behind.
+    ///
+    /// Every admission on this surface is an RAII guard, and the failure
+    /// shape that matters is the one where a guard is taken and the operation
+    /// then fails: the counter must come back on its own, or a server slowly
+    /// runs out of a resource nobody is using. Checked across the three
+    /// counted things — rooms, peers and relays — plus a refusal that has to
+    /// leave the live count untouched.
+    #[tokio::test]
+    async fn all_guards_release_on_panic_free_error_paths() {
+        let registry = transfer_registry();
+        let rooms_before = registry.current_rooms();
+        let peers_before = registry.current_peers();
+
+        let (lease, room) = transfer_room(&registry);
+        assert_eq!(registry.current_rooms(), rooms_before + 1);
+        {
+            let (_peer, _guard, _rx) = live_peer(&registry, &room, Some("A"));
+            assert_eq!(registry.current_peers(), peers_before + 1);
+            // A relay permit taken and dropped without ever attaching.
+            let permit = registry.try_acquire_relay().expect("a relay slot");
+            drop(permit);
+        }
+        // The peer guard and the permit went out of scope: their counts come
+        // back on their own, with nothing to reap.
+        assert_eq!(registry.current_peers(), peers_before);
+        // The ROOM is deliberately not in that set: dropping the lease
+        // DETACHES with the owner grace, so the room stays counted until the
+        // grace expires or the owner closes it explicitly. Closing it is what
+        // returns the count, and a room count that fell on a dropped lease
+        // would be the bug (a reconnecting owner would find nothing).
+        assert_eq!(registry.current_rooms(), rooms_before + 1);
+        lease.close_explicit(&registry);
+        // The permit lives ON the room, so the count comes back when the last
+        // `Arc` goes — which is the property worth pinning: a permit released
+        // at close while a pump still held the room would over-admit.
+        assert_eq!(registry.current_rooms(), rooms_before + 1);
+        drop(room);
+        assert_eq!(registry.current_rooms(), rooms_before);
+
+        // Exhausting a budget refuses instead of leaking: taking every relay
+        // slot, failing to take one more, and releasing them all returns the
+        // budget exactly.
+        let mut held = Vec::new();
+        while let Ok(permit) = registry.try_acquire_relay() {
+            held.push(permit);
+        }
+        assert!(registry.try_acquire_relay().is_err());
+        let count = held.len();
+        drop(held);
+        let mut again = Vec::new();
+        while let Ok(permit) = registry.try_acquire_relay() {
+            again.push(permit);
+        }
+        assert_eq!(again.len(), count, "the relay budget did not come back");
+    }
+
+    /// 6.2: every counter the admin surface publishes moves with the GUARD
+    /// that owns the resource, and never on its own schedule.
+    ///
+    /// A gauge is only worth reading if it goes back down, and a total is only
+    /// worth reading if it never does. The distinction is the whole contract
+    /// of the metrics endpoint, so it is pinned per counter here rather than
+    /// inferred from an end-to-end flow.
+    #[tokio::test]
+    async fn web_metrics_counters_follow_guard_lifecycle_exactly() {
+        let registry = transfer_registry();
+        let rooms_before = registry.current_rooms();
+        let peers_before = registry.current_peers();
+        let relays_before = registry.relay_slots_available();
+        let rejected_before = registry.rejected_total();
+        let bytes_before = registry.relay_ciphertext_bytes();
+
+        let (lease, room) = transfer_room(&registry);
+        assert_eq!(registry.current_rooms(), rooms_before + 1);
+        {
+            let (_peer, _guard, _rx) = live_peer(&registry, &room, Some("A"));
+            assert_eq!(registry.current_peers(), peers_before + 1);
+            let permit = registry.try_acquire_relay().expect("a relay slot");
+            assert_eq!(registry.relay_slots_available(), relays_before - 1);
+            drop(permit);
+            assert_eq!(registry.relay_slots_available(), relays_before);
+        }
+        assert_eq!(registry.current_peers(), peers_before);
+
+        // A REFUSAL is counted once per refusal, and only on a refusal: the
+        // counter is what tells an operator a limit is the reason, so a
+        // successful acquisition must leave it alone.
+        let mut held = Vec::new();
+        while let Ok(permit) = registry.try_acquire_relay() {
+            held.push(permit);
+        }
+        // The loop EXITS on a refusal, so that refusal is already counted:
+        // the baseline for the assertions below is taken here, after it.
+        assert_eq!(
+            registry.rejected_total(),
+            rejected_before + 1,
+            "exhausting the budget refuses exactly once"
+        );
+        let rejected_saturated = registry.rejected_total();
+        assert!(registry.try_acquire_relay().is_err());
+        assert_eq!(registry.rejected_total(), rejected_saturated + 1);
+        assert!(registry.try_acquire_relay().is_err());
+        assert_eq!(registry.rejected_total(), rejected_saturated + 2);
+        drop(held);
+
+        // A cumulative total NEVER comes back: the ciphertext counter is not
+        // touched by any of the releases above, and the gauges are.
+        assert_eq!(registry.relay_ciphertext_bytes(), bytes_before);
+        lease.close_explicit(&registry);
+        drop(room);
+        assert_eq!(registry.current_rooms(), rooms_before);
+        assert_eq!(registry.current_offers(), 0);
+        assert_eq!(registry.current_transfers(), 0);
+        assert_eq!(registry.current_metadata_bytes(), 0);
+        assert_eq!(registry.relay_slots_available(), relays_before);
+        // The totals survived the whole lifecycle, which is what makes them
+        // totals and not gauges.
+        assert_eq!(registry.rejected_total(), rejected_saturated + 2);
+        assert_eq!(registry.relay_ciphertext_bytes(), bytes_before);
+    }
+
+    #[tokio::test]
+    async fn cli_owner_has_no_browser_privileges_or_peer_id() {
+        let registry = transfer_registry();
+        let (lease, room) = transfer_room(&registry);
+        // A live lease, and not one peer: nobody is in the room yet.
+        assert!(matches!(
+            room.state.lock().unwrap().owner,
+            OwnerState::Attached { .. }
+        ));
+        assert!(
+            room.state.lock().unwrap().peers.is_empty(),
+            "the owner lease must not occupy a peer slot"
+        );
+
+        // Two browsers join. The peer list is exactly those two.
+        let (first, _guard_a, _rx_a) = live_peer(&registry, &room, Some("A"));
+        let (second, _guard_b, _rx_b) = live_peer(&registry, &room, Some("B"));
+        {
+            let state = room.state.lock().unwrap();
+            let mut ids: Vec<PeerId> = state.peers.keys().copied().collect();
+            ids.sort_by_key(|id| id.to_string());
+            let mut want = vec![first, second];
+            want.sort_by_key(|id| id.to_string());
+            assert_eq!(ids, want, "the room holds the browsers and nobody else");
+        }
+
+        // The FIRST browser has no extra right over the second's offer: the
+        // only thing that decides a withdraw is who published it.
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let _mac = offer_fixture(&registry, &room, second, offer_hex);
+        let offer_id: OfferId = offer_hex.parse().unwrap();
+        let refused = registry
+            .withdraw_offer(&room, first, offer_id)
+            .expect_err("a peer cannot withdraw another peer's offer");
+        assert_eq!(refused.code(), "NOT_PARTICIPANT");
+        // And the publisher still can.
+        registry.withdraw_offer(&room, second, offer_id).unwrap();
+
+        // Closing the lease is what ends the room — the peers do not own it.
+        lease.close_explicit(&registry);
+        assert!(registry.room(room.id).is_none());
+    }
+
+    /// `concurrent_transfer_cleanup_isolated_by_transfer_id`: two transfers
+    /// live at once, and cancelling one must reach exactly one record and
+    /// exactly one counterpart. The cleanup path is keyed by transfer ID and
+    /// not by peer or offer, which is the property this pins: the two
+    /// transfers here deliberately SHARE their source peer and differ in
+    /// mode, so a cleanup that keyed on either would take both down.
+    #[tokio::test]
+    async fn concurrent_transfer_cleanup_isolated_by_transfer_id() {
+        let file_hex = "cccccccccccccccccccccccccccccccc";
+        let folder_hex = "dddddddddddddddddddddddddddddddd";
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _guard_a, _rx_a) = live_peer(&registry, &room, Some("A"));
+        let (b, _guard_b, _rx_b) = live_peer(&registry, &room, Some("B"));
+        let (c, _guard_c, _rx_c) = live_peer(&registry, &room, Some("C"));
+        let file_mac = offer_fixture(&registry, &room, source, file_hex);
+        let folder_mac = folder_offer_fixture(&registry, &room, source, folder_hex);
+        let file_id: OfferId = file_hex.parse().unwrap();
+        let folder_id: OfferId = folder_hex.parse().unwrap();
+
+        let raw_ids = vec!["0".to_string()];
+        let (raw_transfer, _) = registry
+            .request_transfer(
+                &room,
+                b,
+                file_id,
+                raw_ids.clone(),
+                selection_digest(&file_id, &file_mac, &raw_ids, "raw"),
+                "raw",
+                None,
+            )
+            .unwrap();
+        let zip_ids = vec!["0".to_string(), "1".to_string(), "2".to_string()];
+        let (zip_transfer, _) = registry
+            .request_transfer(
+                &room,
+                c,
+                folder_id,
+                zip_ids.clone(),
+                selection_digest(&folder_id, &folder_mac, &zip_ids, "zip"),
+                "zip",
+                None,
+            )
+            .unwrap();
+        assert_ne!(raw_transfer, zip_transfer);
+        assert_eq!(room.state.lock().unwrap().transfers.len(), 2);
+
+        // B cancels its own. Exactly one notice, and it goes to the SOURCE —
+        // C is a stranger to this transfer and hears nothing.
+        let (outcome, outbox) = registry.cancel_transfer(&room, b, raw_transfer).unwrap();
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].0, source);
+
+        {
+            let state = room.state.lock().unwrap();
+            let cancelled = state.transfers.get(&raw_transfer).unwrap();
+            assert!(!cancelled.state.is_live(), "the cancelled one is terminal");
+            let survivor = state.transfers.get(&zip_transfer).unwrap();
+            assert!(survivor.state.is_live(), "the other one is untouched");
+            assert_eq!(survivor.recipient, c);
+            assert_eq!(survivor.source, source);
+        }
+
+        // A stranger still cannot cancel the survivor, and the survivor's own
+        // recipient still can — the cancel of the first changed neither.
+        assert_eq!(
+            registry
+                .cancel_transfer(&room, b, zip_transfer)
+                .expect_err("a stranger cannot cancel")
+                .code(),
+            "NOT_PARTICIPANT"
+        );
+        let (outcome, outbox) = registry.cancel_transfer(&room, c, zip_transfer).unwrap();
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].0, source);
+    }
+
+    #[tokio::test]
+    async fn request_requires_recipient_click_source_online_and_single_file() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _guard_a, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, _rx_b) = live_peer(&registry, &room, Some("B"));
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let offer_id: OfferId = offer_hex.parse().unwrap();
+        let digest = selection_digest(&offer_id, &mac, &["0".to_string()], "raw");
+        // Unknown offer.
+        assert_eq!(
+            registry
+                .request_transfer(
+                    &room,
+                    recipient,
+                    "dddddddddddddddddddddddddddddddd".parse().unwrap(),
+                    vec!["0".to_string()],
+                    digest,
+                    "raw",
+                    None,
+                )
+                .unwrap_err()
+                .code(),
+            "OFFER_NOT_FOUND"
+        );
+        // Source joined but without a live session.
+        let ghost = generate_peer_id();
+        let _guard_ghost = registry.join_peer(&room, ghost, None).unwrap();
+        let ghost_offer = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        offer_fixture(&registry, &room, ghost, ghost_offer);
+        let ghost_digest = selection_digest(
+            &ghost_offer.parse().unwrap(),
+            &mac,
+            &["0".to_string()],
+            "raw",
+        );
+        assert_eq!(
+            registry
+                .request_transfer(
+                    &room,
+                    recipient,
+                    ghost_offer.parse().unwrap(),
+                    vec!["0".to_string()],
+                    ghost_digest,
+                    "raw",
+                    None,
+                )
+                .unwrap_err()
+                .code(),
+            "SOURCE_OFFLINE"
+        );
+        // Mode, entry count and entry identity.
+        for (ids, mode) in [
+            (vec!["0".to_string(), "1".to_string()], "raw"),
+            (vec!["7".to_string()], "raw"),
+            (vec!["0".to_string()], "zip"),
+        ] {
+            assert!(registry
+                .request_transfer(&room, recipient, offer_id, ids, digest, mode, None)
+                .is_err());
+        }
+        // Lying digest.
+        let mut bad_digest = digest;
+        bad_digest[0] ^= 1;
+        assert_eq!(
+            registry
+                .request_transfer(
+                    &room,
+                    recipient,
+                    offer_id,
+                    vec!["0".to_string()],
+                    bad_digest,
+                    "raw",
+                    None
+                )
+                .unwrap_err()
+                .code(),
+            "SOURCE_CHANGED"
+        );
+        // Valid request: recorded plus incoming on the source queue.
+        let (id, attempt) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let (typ, body) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.incoming");
+        assert_eq!(body["transferId"].as_str(), Some(id.to_string()).as_deref());
+        assert_eq!(body["offerId"].as_str(), Some(offer_hex));
+        assert_eq!(
+            body["fromPeerId"].as_str(),
+            Some(recipient.to_string()).as_deref()
+        );
+        assert_eq!(
+            body["attemptId"].as_str(),
+            Some(attempt.to_string()).as_deref()
+        );
+        let state = room.state.lock().unwrap().transfers.get(&id).unwrap().state;
+        assert_eq!(state, TransferState::WaitingSource);
+        assert_eq!(registry.current_transfers(), 1);
+    }
+
+    #[tokio::test]
+    async fn source_ready_must_match_source_and_selection_digest() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _guard_a, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, _rx_b) = live_peer(&registry, &room, Some("B"));
+        let (stranger, _guard_c, _rx_c) = live_peer(&registry, &room, Some("C"));
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let (id, attempt) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        // Wrong role and strangers.
+        assert_eq!(
+            registry
+                .source_ready(&room, recipient, id, attempt, digest)
+                .unwrap_err()
+                .code(),
+            "INVALID_MESSAGE"
+        );
+        assert_eq!(
+            registry
+                .source_ready(&room, stranger, id, attempt, digest)
+                .unwrap_err()
+                .code(),
+            "NOT_PARTICIPANT"
+        );
+        // Stale attempt and lying digest.
+        assert!(registry
+            .source_ready(&room, source, id, generate_attempt_id(), digest)
+            .is_err());
+        let mut bad = digest;
+        bad[1] ^= 1;
+        assert_eq!(
+            registry
+                .source_ready(&room, source, id, attempt, bad)
+                .unwrap_err()
+                .code(),
+            "SOURCE_CHANGED"
+        );
+        // Correct ready admits inline (free budget) with distinct tickets.
+        let (outcome, _attempt, outbox) =
+            ready_then_relay(&registry, &room, source, id, attempt, digest);
+        assert_eq!(outcome, ReadyOutcome::Admitted);
+        drain_transfer_outbox(&room, outbox);
+        let (typ, source_ticket) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.relay_ticket");
+        assert_eq!(
+            source_ticket["transferId"].as_str(),
+            Some(id.to_string()).as_deref()
+        );
+        let ticket_a = source_ticket["ticket"].as_str().unwrap().to_string();
+        assert_eq!(ticket_a.len(), 32);
+        assert!(
+            room.state.lock().unwrap().transfers.get(&id).unwrap().state
+                == TransferState::WaitingRelay
+        );
+        assert_eq!(registry.current_relays(), 1);
+        let _ = ticket_a;
+    }
+
+    #[tokio::test]
+    async fn active_caps_reserve_both_peers_and_roll_back() {
+        let registry = tight_transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (a, _ga, _rx_a) = live_peer(&registry, &room, Some("A"));
+        let (b, _gb, _rx_b) = live_peer(&registry, &room, Some("B"));
+        let (c, _gc, _rx_c) = live_peer(&registry, &room, Some("C"));
+        offer_fixture(&registry, &room, a, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        offer_fixture(&registry, &room, c, "cccccccccccccccccccccccccccccccc");
+        let mac = [0xeeu8; 32];
+        let digest_a = selection_digest(
+            &"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(),
+            &mac,
+            &["0".to_string()],
+            "raw",
+        );
+        request_fixture(
+            &registry,
+            &room,
+            b,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &mac,
+        );
+        assert_eq!(registry.current_transfers(), 1);
+        // Source at cap.
+        let digest_c = selection_digest(
+            &"cccccccccccccccccccccccccccccccc".parse().unwrap(),
+            &mac,
+            &["0".to_string()],
+            "raw",
+        );
+        assert_eq!(
+            registry
+                .request_transfer(
+                    &room,
+                    c,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(),
+                    vec!["0".to_string()],
+                    digest_a,
+                    "raw",
+                    None,
+                )
+                .unwrap_err()
+                .code(),
+            "LIMIT_EXCEEDED"
+        );
+        // Recipient at cap.
+        assert_eq!(
+            registry
+                .request_transfer(
+                    &room,
+                    b,
+                    "cccccccccccccccccccccccccccccccc".parse().unwrap(),
+                    vec!["0".to_string()],
+                    digest_c,
+                    "raw",
+                    None,
+                )
+                .unwrap_err()
+                .code(),
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(registry.current_transfers(), 1);
+        assert_eq!(room.state.lock().unwrap().transfers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn relay_busy_is_bounded_and_retryable() {
+        let registry = WebTransferRegistry::new(
+            WebTransferConfig::new(
+                WebTransferBaseUrl::parse("http://127.0.0.1:8080/").unwrap(),
+                WebTransferLimits {
+                    max_relays_global: 1,
+                    ..WebTransferLimits::default()
+                },
+                IceServerConfig {
+                    servers: Vec::new(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        registry.set_relay_admit_timeout(Duration::from_millis(50));
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _guard_a, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        // Saturate the single relay slot outside the transfer.
+        let _held = registry.try_acquire_relay().unwrap();
+        let (id, attempt1) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+
+        let _ = recv_text(&mut source_rx).await;
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (outcome, attempt1, outbox) =
+            ready_then_relay(&registry, &room, source, id, attempt1, digest);
+        assert_eq!(outcome, ReadyOutcome::Queued);
+        assert!(outbox.is_empty());
+        // Admission times out fast: busy notice, still resumable, no permit.
+        registry.admit_relay(&room, id, attempt1).await;
+        let (typ, body) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "error");
+        assert_eq!(body["code"].as_str(), Some("RELAY_BUSY"));
+        assert_eq!(body["message"].as_str(), Some(id.to_string()).as_deref());
+        let (state_now, has_permit) = {
+            let guard = room.state.lock().unwrap();
+            let record = guard.transfers.get(&id).unwrap();
+            (
+                record.state,
+                record.attempt.as_ref().unwrap().relay_permit.is_some(),
+            )
+        };
+        assert_eq!(state_now, TransferState::WaitingRelay);
+        assert!(!has_permit);
+        // Free the slot and retry with a fresh request: new attempt, tickets.
+        drop(_held);
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (retry_id, _) = registry
+            .request_transfer(
+                &room,
+                recipient,
+                offer_hex.parse().unwrap(),
+                vec!["0".to_string()],
+                digest,
+                "raw",
+                None,
+            )
+            .unwrap();
+        assert_eq!(retry_id, id);
+        let attempt2 = room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .unwrap()
+            .attempt_id
+            .unwrap();
+        assert_ne!(attempt1, attempt2);
+        let _ = recv_text(&mut source_rx).await;
+        let (outcome, _attempt2, outbox) =
+            ready_then_relay(&registry, &room, source, id, attempt2, digest);
+        assert_eq!(outcome, ReadyOutcome::Admitted);
+        drain_transfer_outbox(&room, outbox);
+        let (typ, _) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.relay_ticket");
+        let (typ, _) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "transfer.relay_ticket");
+        assert_eq!(registry.current_relays(), 1);
+    }
+
+    #[tokio::test]
+    async fn tickets_are_distinct_role_bound_hashed_one_use_and_expire() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _guard_a, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let (id, attempt) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (outcome, attempt, outbox) =
+            ready_then_relay(&registry, &room, source, id, attempt, digest);
+        assert_eq!(outcome, ReadyOutcome::Admitted);
+        drain_transfer_outbox(&room, outbox);
+        let (_, source_body) = recv_text(&mut source_rx).await;
+        let (_, recipient_body) = recv_text(&mut recipient_rx).await;
+        let ticket_a = source_body["ticket"].as_str().unwrap().to_string();
+        let ticket_b = recipient_body["ticket"].as_str().unwrap().to_string();
+        assert_ne!(ticket_a, ticket_b);
+        let now = Instant::now();
+        // Hash-only storage: keys are digests, values carry no raw ticket.
+        let parsed_a: RelayTicket = ticket_a.parse().unwrap();
+        assert!(registry.inner.tickets.contains_key(&parsed_a.sha256_hash()));
+        // Correct use grants once; replay is unknown (burned on first use).
+        let grant = registry
+            .consume_relay_ticket(&ticket_a, RelayRole::Source, source, now)
+            .unwrap();
+        assert_eq!(grant.transfer_id, id);
+        assert_eq!(grant.attempt_id, attempt);
+        assert_eq!(
+            registry
+                .consume_relay_ticket(&ticket_a, RelayRole::Source, source, now)
+                .unwrap_err(),
+            TicketDeny::Unknown
+        );
+        // Wrong leg burns the ticket too.
+        assert_eq!(
+            registry
+                .consume_relay_ticket(&ticket_b, RelayRole::Source, recipient, now)
+                .unwrap_err(),
+            TicketDeny::RoleMismatch
+        );
+        assert_eq!(
+            registry
+                .consume_relay_ticket(&ticket_b, RelayRole::Recipient, recipient, now)
+                .unwrap_err(),
+            TicketDeny::Unknown
+        );
+        // Expiry is a pure clock comparison.
+        let offer2 = "dddddddddddddddddddddddddddddddd";
+        let (id2, attempt2) = {
+            offer_fixture(&registry, &room, source, offer2);
+            request_fixture(&registry, &room, recipient, offer2, &mac)
+        };
+        let _ = recv_text(&mut source_rx).await;
+        let digest2 = selection_digest(&offer2.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (outcome, _attempt2, outbox) =
+            ready_then_relay(&registry, &room, source, id2, attempt2, digest2);
+        assert_eq!(outcome, ReadyOutcome::Admitted);
+        drain_transfer_outbox(&room, outbox);
+        let (_, fresh_body) = recv_text(&mut source_rx).await;
+        let fresh = fresh_body["ticket"].as_str().unwrap().to_string();
+        assert_eq!(
+            registry
+                .consume_relay_ticket(
+                    &fresh,
+                    RelayRole::Source,
+                    source,
+                    now + Duration::from_secs(31)
+                )
+                .unwrap_err(),
+            TicketDeny::Expired
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_ids_never_repeat_and_increment_checked() {
+        assert!(next_attempt_number(u64::MAX).is_err());
+        assert_eq!(next_attempt_number(1).unwrap(), 2);
+        let registry = busy_registry();
+        registry.set_relay_admit_timeout(Duration::from_millis(20));
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _guard_a, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let _held = registry.try_acquire_relay().unwrap();
+        // Attempt 1 is the DIRECT attempt; its fallback mints attempt 2,
+        // which queues behind the held budget (256 default would admit).
+        let (id, attempt1) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (outcome, attempt2, outbox) =
+            ready_then_relay(&registry, &room, source, id, attempt1, digest);
+        assert_eq!(outcome, ReadyOutcome::Queued);
+        assert!(outbox.is_empty());
+        assert_ne!(attempt1, attempt2);
+        // Drain the busy notice so later reads stay aligned.
+        registry.admit_relay(&room, id, attempt2).await;
+        let (typ, _) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "error");
+        drop(_held);
+        // Retry mints attempt 3 with a fresh ID; both older ones are stale.
+        let (retry_id, _) = registry
+            .request_transfer(
+                &room,
+                recipient,
+                offer_hex.parse().unwrap(),
+                vec!["0".to_string()],
+                digest,
+                "raw",
+                None,
+            )
+            .unwrap();
+        assert_eq!(retry_id, id);
+        // Neither stale attempt readies.
+        assert!(registry
+            .source_ready(&room, source, id, attempt1, digest)
+            .is_err());
+        assert!(registry
+            .source_ready(&room, source, id, attempt2, digest)
+            .is_err());
+        let (attempt_number, attempt_now) = {
+            let guard = room.state.lock().unwrap();
+            let record = guard.transfers.get(&id).unwrap();
+            (record.attempt_number, record.attempt_id.unwrap())
+        };
+        assert_eq!(attempt_number, 3);
+        assert_ne!(attempt_now, attempt1);
+        assert_ne!(attempt_now, attempt2);
+    }
+
+    #[tokio::test]
+    async fn only_participants_cancel() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _guard_a, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let (stranger, _guard_c, _rx_c) = live_peer(&registry, &room, Some("C"));
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let (id, attempt) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (outcome, _attempt, outbox) =
+            ready_then_relay(&registry, &room, source, id, attempt, digest);
+        assert_eq!(outcome, ReadyOutcome::Admitted);
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut source_rx).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        // Stranger hears NOT_PARTICIPANT and nothing moves.
+        assert_eq!(
+            registry
+                .cancel_transfer(&room, stranger, id)
+                .unwrap_err()
+                .code(),
+            "NOT_PARTICIPANT"
+        );
+        assert!(recipient_rx.try_recv().is_err());
+        // Source cancels: recipient is told exactly once.
+        let (outcome, outbox) = registry.cancel_transfer(&room, source, id).unwrap();
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        drain_transfer_outbox(&room, outbox);
+        let (typ, body) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "transfer.cancelled");
+        assert_eq!(
+            body["byPeerId"].as_str(),
+            Some(source.to_string()).as_deref()
+        );
+        assert_eq!(registry.current_transfers(), 0);
+        assert_eq!(registry.current_relays(), 0);
+    }
+
+    #[tokio::test]
+    async fn withdraw_disconnect_and_room_close_cancel_related_transfers() {
+        // Withdraw cancels the offer's transfers.
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _guard_a, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let (id, attempt) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (outcome, attempt, outbox) =
+            ready_then_relay(&registry, &room, source, id, attempt, digest);
+        assert_eq!(outcome, ReadyOutcome::Admitted);
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut source_rx).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        registry
+            .withdraw_offer(&room, source, offer_hex.parse().unwrap())
+            .unwrap();
+        let (typ, body) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "transfer.cancelled");
+        assert_eq!(
+            body["byPeerId"].as_str(),
+            Some(source.to_string()).as_deref()
+        );
+        assert_eq!(registry.current_transfers(), 0);
+        assert_eq!(registry.current_relays(), 0);
+        // Disconnect cancels too: fresh room, live transfer, drop the source.
+        let (_lease, room) = transfer_room(&registry);
+        let (source, guard_a, _source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let _ = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        drop(guard_a);
+        let (typ, _) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "transfer.cancelled");
+        assert_eq!(registry.current_transfers(), 0);
+        assert_eq!(registry.current_relays(), 0);
+        let _ = (id, attempt);
+        // Room destroy plus guard drops converge on released counters.
+        // Earlier sub-cases still hold their guards, so assert the delta
+        // against the live baseline, not absolute zero.
+        let peers_before = registry.current_peers();
+        assert_eq!(registry.current_metadata_bytes(), 0);
+        assert_eq!(registry.current_transfers(), 0);
+        let (_lease, room) = transfer_room(&registry);
+        let (source, guard_a, _source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, guard_b, _recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let _ = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        room.destroy("owner-close");
+        drop(guard_a);
+        drop(guard_b);
+        assert_eq!(registry.current_transfers(), 0);
+        assert_eq!(registry.current_metadata_bytes(), 0);
+        assert_eq!(registry.current_peers(), peers_before);
+    }
+
+    #[tokio::test]
+    async fn terminal_transitions_release_permits_exactly_once() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _guard_a, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let (id, attempt) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (outcome, _attempt, outbox) =
+            ready_then_relay(&registry, &room, source, id, attempt, digest);
+        assert_eq!(outcome, ReadyOutcome::Admitted);
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut source_rx).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        assert_eq!(registry.current_relays(), 1);
+        // Cancel releases once; the repeat acks without resending.
+        let (outcome, outbox) = registry.cancel_transfer(&room, recipient, id).unwrap();
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        drain_transfer_outbox(&room, outbox);
+        assert_eq!(registry.current_transfers(), 0);
+        assert_eq!(registry.current_relays(), 0);
+        assert!(registry.inner.tickets.is_empty());
+        let (typ, _) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.cancelled");
+        let (outcome, outbox) = registry.cancel_transfer(&room, recipient, id).unwrap();
+        assert_eq!(outcome, CancelOutcome::AlreadyTerminal);
+        assert!(outbox.is_empty());
+        assert!(source_rx.try_recv().is_err());
+        assert_eq!(registry.current_transfers(), 0);
+        assert_eq!(registry.current_relays(), 0);
+        // Reject path releases the same way.
+        let (id, attempt) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let outbox = registry.source_reject(&room, source, id).unwrap();
+        drain_transfer_outbox(&room, outbox);
+        assert_eq!(registry.current_transfers(), 0);
+        let (typ, _) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "transfer.cancelled");
+        let _ = attempt;
+        // Direct failure releases without notices (3.2 owns failure notices).
+        let (id, _) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        assert!(registry.fail_transfer(&room, id));
+        assert!(!registry.fail_transfer(&room, id));
+        assert_eq!(registry.current_transfers(), 0);
+        // Complete before Active is rejected, state untouched (3.2 owns it).
+        let (id, attempt) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let root = room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .unwrap()
+            .entry_root
+            .expect("a raw transfer carries the manifest root");
+        assert!(registry
+            .complete_transfer(&room, recipient, id, attempt, root)
+            .is_err());
+        assert!(room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .unwrap()
+            .state
+            .is_live());
+    }
+
+    #[tokio::test]
+    async fn stale_attempt_messages_do_not_change_current_state() {
+        let registry = busy_registry();
+        registry.set_relay_admit_timeout(Duration::from_millis(20));
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _guard_a, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let _held = registry.try_acquire_relay().unwrap();
+        let (id, attempt1) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        // The direct attempt falls back to a relay attempt that queues.
+        let (outcome, relay_attempt, outbox) =
+            ready_then_relay(&registry, &room, source, id, attempt1, digest);
+        assert_eq!(outcome, ReadyOutcome::Queued);
+        assert!(outbox.is_empty());
+        registry.admit_relay(&room, id, relay_attempt).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        drop(_held);
+        // Retry upgrades to a fresh attempt; both older ones are now stale.
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (retry_id, _) = registry
+            .request_transfer(
+                &room,
+                recipient,
+                offer_hex.parse().unwrap(),
+                vec!["0".to_string()],
+                digest,
+                "raw",
+                None,
+            )
+            .unwrap();
+        assert_eq!(retry_id, id);
+        let before = format!("{:?}", room.state.lock().unwrap().transfers.get(&id));
+        for stale in [attempt1, relay_attempt] {
+            assert!(registry
+                .source_ready(&room, source, id, stale, digest)
+                .is_err());
+            assert!(registry
+                .complete_transfer(&room, recipient, id, stale, [0u8; 32])
+                .is_err());
+        }
+        // A fresh ready for the current attempt still works afterwards.
+        let current = room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .unwrap()
+            .attempt_id
+            .unwrap();
+        assert_ne!(attempt1, current);
+        assert_ne!(relay_attempt, current);
+        let (outcome, _next, outbox) =
+            ready_then_relay(&registry, &room, source, id, current, digest);
+        assert_eq!(outcome, ReadyOutcome::Admitted);
+        assert_eq!(outbox.len(), 2);
+        drain_transfer_outbox(&room, outbox);
+        let after = format!("{:?}", room.state.lock().unwrap().transfers.get(&id));
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn terminal_cache_is_bounded_and_idempotent() {
+        // Covered at the actor layer (same rid replays bytes); here the
+        // registry proves terminal repeats stay side-effect free.
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _guard_a, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let (id, _) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let (outcome, outbox) = registry.cancel_transfer(&room, recipient, id).unwrap();
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut source_rx).await;
+        // Repeating the terminal cancel changes nothing and resends nothing.
+        let (outcome, outbox) = registry.cancel_transfer(&room, recipient, id).unwrap();
+        assert_eq!(outcome, CancelOutcome::AlreadyTerminal);
+        assert!(outbox.is_empty());
+        assert!(source_rx.try_recv().is_err());
+        assert!(recipient_rx.try_recv().is_err());
+        assert_eq!(registry.current_transfers(), 0);
+    }
+    // ---- Phase 3.2 relay tests: MemSocket halves + live-pair helper ----
+
+    use futures_util::{Sink, Stream};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// In-memory relay half: programmable inbound, recorded outbox, polled
+    /// counters and controllable sink readiness. Both boxed halves may share
+    /// one state; tests read it back after the pump drops its boxes.
+    #[derive(Clone, Default)]
+    struct MemSocket {
+        state: std::sync::Arc<std::sync::Mutex<MemState>>,
+    }
+
+    #[derive(Default)]
+    struct MemState {
+        inbound: VecDeque<Message>,
+        polls: usize,
+        outbox: Vec<Message>,
+        sink_ready: bool,
+        send_polls: usize,
+    }
+
+    impl MemSocket {
+        fn with_inbound(messages: Vec<Message>) -> Self {
+            Self {
+                state: std::sync::Arc::new(std::sync::Mutex::new(MemState {
+                    inbound: messages.into(),
+                    ..Default::default()
+                })),
+            }
+        }
+
+        fn ready_sink() -> Self {
+            Self {
+                state: std::sync::Arc::new(std::sync::Mutex::new(MemState {
+                    sink_ready: true,
+                    ..Default::default()
+                })),
+            }
+        }
+
+        fn boxed_pair(self) -> (RelaySink, RelayStream) {
+            (
+                Box::pin(self.clone()) as RelaySink,
+                Box::pin(self) as RelayStream,
+            )
+        }
+
+        fn polls(&self) -> usize {
+            self.state.lock().unwrap().polls
+        }
+
+        fn outbox(&self) -> Vec<Message> {
+            self.state.lock().unwrap().outbox.clone()
+        }
+
+        fn inbound_len(&self) -> usize {
+            self.state.lock().unwrap().inbound.len()
+        }
+    }
+
+    impl Stream for MemSocket {
+        type Item = Result<Message, WsError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let mut state = self.state.lock().unwrap();
+            state.polls += 1;
+            match state.inbound.pop_front() {
+                Some(message) => Poll::Ready(Some(Ok(message))),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl Sink<Message> for MemSocket {
+        type Error = WsError;
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            let mut state = self.state.lock().unwrap();
+            state.send_polls += 1;
+            if state.sink_ready {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), WsError> {
+            self.state.lock().unwrap().outbox.push(item);
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            self.state.lock().unwrap().outbox.push(Message::Close(None));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Builds one encrypted-frame wire image (header valid, body opaque
+    /// filler — the pump never decrypts, so filler proves the no-decrypt
+    /// property when the frame still forwards).
+    fn relay_frame(seq: u32, body_len: usize, frame_type: u8) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(16 + body_len);
+        frame.extend_from_slice(&RELAY_FRAME_MAGIC.to_be_bytes());
+        frame.extend_from_slice(&RELAY_FRAME_VERSION.to_be_bytes());
+        frame.push(frame_type);
+        frame.push(0);
+        frame.extend_from_slice(&seq.to_be_bytes());
+        frame.extend_from_slice(&(body_len as u32).to_be_bytes());
+        frame.extend(std::iter::repeat_n(0xABu8, body_len));
+        frame
+    }
+
+    /// Drives one transfer to admitted-with-tickets over the real registry,
+    /// returning both control receivers so tests drain the exact envelopes.
+    async fn relay_live_pair(
+        registry: &WebTransferRegistry,
+        room: &Arc<WebTransferRoom>,
+        offer_hex: &str,
+    ) -> (
+        PeerId,
+        PeerGuard,
+        PeerId,
+        PeerGuard,
+        mpsc::Receiver<String>,
+        mpsc::Receiver<String>,
+        TransferId,
+        AttemptId,
+        String,
+        String,
+    ) {
+        let (source, guard_a, mut source_rx) = live_peer(registry, room, Some("A"));
+        let (recipient, guard_b, mut recipient_rx) = live_peer(registry, room, Some("B"));
+        let mac = offer_fixture(registry, room, source, offer_hex);
+        let (id, attempt) = request_fixture(registry, room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (outcome, attempt, outbox) =
+            ready_then_relay(registry, room, source, id, attempt, digest);
+        assert_eq!(outcome, ReadyOutcome::Admitted);
+        drain_transfer_outbox(room, outbox);
+        let (_, source_body) = recv_text(&mut source_rx).await;
+        let (_, recipient_body) = recv_text(&mut recipient_rx).await;
+        let source_ticket = source_body["ticket"].as_str().unwrap().to_string();
+        let recipient_ticket = recipient_body["ticket"].as_str().unwrap().to_string();
+        (
+            source,
+            guard_a,
+            recipient,
+            guard_b,
+            source_rx,
+            recipient_rx,
+            id,
+            attempt,
+            source_ticket,
+            recipient_ticket,
+        )
+    }
+
+    /// Asserts a denied join (boxed halves are not `Debug` by design, so
+    /// no `unwrap_err` on the join result).
+    fn assert_join_denied(result: Result<RelayJoin, WebTransferError>) {
+        match result {
+            Ok(_) => panic!("denied join unexpectedly parked or paired"),
+            Err(error) => assert_eq!(error.code(), "TRANSFER_NOT_FOUND"),
+        }
+    }
+
+    fn relay_attach_body(
+        peer: PeerId,
+        transfer: TransferId,
+        attempt: AttemptId,
+        role: &str,
+        ticket: &str,
+    ) -> crate::web_transfer_protocol::RelayAttach {
+        let raw = serde_json::json!({
+            "v": 1,
+            "peerId": peer.to_string(),
+            "transferId": transfer.to_string(),
+            "attemptId": attempt.to_string(),
+            "role": role,
+            "ticket": ticket,
+        })
+        .to_string();
+        crate::web_transfer_protocol::parse_relay_attach(&raw).unwrap()
+    }
+
+    #[tokio::test]
+    async fn relay_attach_requires_first_text_message_and_exact_identity() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, _srx, _rrx, id, attempt, src_ticket, rcpt_ticket) =
+            relay_live_pair(&registry, &room, "cccccccccccccccccccccccccccccccc").await;
+        // Happy path first: park the source leg, pair the recipient leg.
+        let attach = relay_attach_body(source, id, attempt, "source", &src_ticket);
+        let (park_sink, park_stream) = MemSocket::default().boxed_pair();
+        let join = registry
+            .join_relay_pair(&room, &attach, &src_ticket, park_sink, park_stream)
+            .unwrap();
+        assert!(matches!(join, RelayJoin::Park { .. }));
+        let attach = relay_attach_body(recipient, id, attempt, "recipient", &rcpt_ticket);
+        let (sink, stream) = MemSocket::default().boxed_pair();
+        let join = registry
+            .join_relay_pair(&room, &attach, &rcpt_ticket, sink, stream)
+            .unwrap();
+        assert!(matches!(join, RelayJoin::Pair { .. }));
+        // The waiter is gone with the pair: no third leg can follow.
+        assert!(!registry.abandon_relay_waiter(id, attempt));
+        // The pre-pair phase accepts a TEXT attach and nothing else: the
+        // parser the loop calls refuses anything that is not a JSON attach
+        // object, so a binary or garbage first message can never produce one
+        // (the transport-level "text only" branch is pinned end to end by
+        // `t_web_relay_opaque`).
+        for hostile in [
+            String::from_utf8_lossy(&relay_frame(0, 32, 1)).into_owned(),
+            String::new(),
+            "not json".to_string(),
+            serde_json::json!({ "v": 1, "role": "source" }).to_string(),
+        ] {
+            assert!(
+                crate::web_transfer_protocol::parse_relay_attach(&hostile).is_err(),
+                "a non-attach first message must never parse"
+            );
+        }
+        // Deny shapes, one fresh live pair each (a failed presentment burns
+        // its ticket, so cases cannot share a pair).
+        deny_replay(&registry, &room).await;
+        deny_swapped_role(&registry, &room).await;
+        deny_incoherent_body(&registry, &room).await;
+        deny_stranger(&registry, &room).await;
+    }
+
+    /// Same ticket twice: the atomic consume burned it on first use.
+    async fn deny_replay(registry: &WebTransferRegistry, room: &Arc<WebTransferRoom>) {
+        let (source, _ga, _rcpt, _gb, _srx, _rrx, id, attempt, src_ticket, _rt) =
+            relay_live_pair(registry, room, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").await;
+        let attach = relay_attach_body(source, id, attempt, "source", &src_ticket);
+        let (sink, stream) = MemSocket::default().boxed_pair();
+        assert!(matches!(
+            registry
+                .join_relay_pair(room, &attach, &src_ticket, sink, stream)
+                .unwrap(),
+            RelayJoin::Park { .. }
+        ));
+        let attach = relay_attach_body(source, id, attempt, "source", &src_ticket);
+        let (sink, stream) = MemSocket::default().boxed_pair();
+        assert_join_denied(registry.join_relay_pair(room, &attach, &src_ticket, sink, stream));
+        assert!(registry.abandon_relay_waiter(id, attempt));
+    }
+
+    /// Presenting the recipient ticket as the source denies (role-bound).
+    async fn deny_swapped_role(registry: &WebTransferRegistry, room: &Arc<WebTransferRoom>) {
+        let (source, _ga, _rcpt, _gb, _srx, _rrx, id, attempt, _st, rcpt_ticket) =
+            relay_live_pair(registry, room, "dddddddddddddddddddddddddddddddd").await;
+        let attach = relay_attach_body(source, id, attempt, "source", &rcpt_ticket);
+        let (sink, stream) = MemSocket::default().boxed_pair();
+        assert_join_denied(registry.join_relay_pair(room, &attach, &rcpt_ticket, sink, stream));
+    }
+
+    /// A body disagreeing with its ticket denies even with a live ticket:
+    /// right peer and role, but an attempt ID the ticket was not cut for.
+    async fn deny_incoherent_body(registry: &WebTransferRegistry, room: &Arc<WebTransferRoom>) {
+        let (_source, _ga, recipient, _gb, _srx, _rrx, id, _attempt, _st, rcpt_ticket) =
+            relay_live_pair(registry, room, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").await;
+        let attach = relay_attach_body(
+            recipient,
+            id,
+            generate_attempt_id(),
+            "recipient",
+            &rcpt_ticket,
+        );
+        let (sink, stream) = MemSocket::default().boxed_pair();
+        assert_join_denied(registry.join_relay_pair(room, &attach, &rcpt_ticket, sink, stream));
+    }
+
+    /// A stranger presenting a stolen ticket hex denies as unknown.
+    async fn deny_stranger(registry: &WebTransferRegistry, room: &Arc<WebTransferRoom>) {
+        let (_source, _ga, _rcpt, _gb, _srx, _rrx, id, attempt, src_ticket, _rt) =
+            relay_live_pair(registry, room, "ffffffffffffffffffffffffffffffff").await;
+        let stranger = generate_peer_id();
+        let attach = relay_attach_body(stranger, id, attempt, "source", &src_ticket);
+        let (sink, stream) = MemSocket::default().boxed_pair();
+        assert_join_denied(registry.join_relay_pair(room, &attach, &src_ticket, sink, stream));
+    }
+
+    #[tokio::test]
+    async fn relay_ticket_is_consumed_atomically() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, _srx, _recipient, _gb, _rrx, id, attempt, src_ticket, _rcpt) =
+            relay_live_pair(&registry, &room, "cccccccccccccccccccccccccccccccc").await;
+        let attach = relay_attach_body(source, id, attempt, "source", &src_ticket);
+        let raw = serde_json::json!({
+            "v": 1,
+            "peerId": source.to_string(),
+            "transferId": id.to_string(),
+            "attemptId": attempt.to_string(),
+            "role": "source",
+            "ticket": src_ticket,
+        })
+        .to_string();
+        let _ = attach;
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let parsed = crate::web_transfer_protocol::parse_relay_attach(&raw).unwrap();
+                let (sink, stream) = MemSocket::default().boxed_pair();
+                registry
+                    .join_relay_pair(&room, &parsed, &parsed.ticket.to_string(), sink, stream)
+                    .map(|join| matches!(join, RelayJoin::Park { .. }))
+            });
+            let second = scope.spawn(|| {
+                let parsed = crate::web_transfer_protocol::parse_relay_attach(&raw).unwrap();
+                let (sink, stream) = MemSocket::default().boxed_pair();
+                registry
+                    .join_relay_pair(&room, &parsed, &parsed.ticket.to_string(), sink, stream)
+                    .map(|join| matches!(join, RelayJoin::Park { .. }))
+            });
+            let (first, second) = (first.join().unwrap(), second.join().unwrap());
+            // Exactly one thread parks; the loser meets the burned ticket.
+            assert_ne!(
+                first.is_ok(),
+                second.is_ok(),
+                "atomic consume grants exactly once"
+            );
+            for result in [first, second] {
+                match result {
+                    Ok(true) => {}
+                    Err(e) => assert_eq!(e.code(), "TRANSFER_NOT_FOUND"),
+                    Ok(false) => panic!("both threads paired with one ticket"),
+                }
+            }
+        });
+        assert!(registry.abandon_relay_waiter(id, attempt));
+    }
+
+    #[test]
+    fn relay_checks_magic_and_sequence_without_decrypting() {
+        // Filler body is invalid AEAD input, yet the header still passes:
+        // the pump never holds a key.
+        assert_eq!(check_relay_frame(None, &relay_frame(0, 1, 1)), Ok(0));
+        assert_eq!(check_relay_frame(Some(0), &relay_frame(1, 24576, 1)), Ok(1));
+        assert_eq!(check_relay_frame(Some(41), &relay_frame(42, 16, 2)), Ok(42));
+        // First frame must be 0; replays, gaps and wraps refuse.
+        assert_eq!(
+            check_relay_frame(None, &relay_frame(1, 1, 1)),
+            Err(RelayFrameReject::StaleSeq)
+        );
+        assert_eq!(
+            check_relay_frame(Some(7), &relay_frame(7, 1, 1)),
+            Err(RelayFrameReject::StaleSeq)
+        );
+        assert_eq!(
+            check_relay_frame(Some(7), &relay_frame(9, 1, 1)),
+            Err(RelayFrameReject::StaleSeq)
+        );
+        assert_eq!(
+            check_relay_frame(Some(u32::MAX), &relay_frame(0, 1, 1)),
+            Err(RelayFrameReject::StaleSeq)
+        );
+        // Shape faults, each distinct.
+        assert_eq!(
+            check_relay_frame(None, &[0u8; 16]),
+            Err(RelayFrameReject::TooShort)
+        );
+        assert_eq!(
+            check_relay_frame(None, &vec![0u8; 32769]),
+            Err(RelayFrameReject::Oversize)
+        );
+        let mut bad = relay_frame(0, 1, 1);
+        bad[0] ^= 1;
+        assert_eq!(
+            check_relay_frame(None, &bad),
+            Err(RelayFrameReject::BadMagic)
+        );
+        let mut bad = relay_frame(0, 1, 1);
+        bad[4] ^= 1;
+        assert_eq!(
+            check_relay_frame(None, &bad),
+            Err(RelayFrameReject::BadVersion)
+        );
+        let mut bad = relay_frame(0, 1, 1);
+        bad[6] = 3;
+        assert_eq!(
+            check_relay_frame(None, &bad),
+            Err(RelayFrameReject::BadType)
+        );
+        let mut bad = relay_frame(0, 1, 1);
+        bad[7] = 1;
+        assert_eq!(
+            check_relay_frame(None, &bad),
+            Err(RelayFrameReject::BadFlags)
+        );
+        let mut bad = relay_frame(0, 1, 1);
+        bad[12] ^= 1;
+        assert_eq!(
+            check_relay_frame(None, &bad),
+            Err(RelayFrameReject::LengthMismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn room_token_bucket_rate_and_burst_are_exact() {
+        // Default 100 MiB/s: burst is exactly 2×rate (200 MiB cap not hit).
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let burst = room.relay_throttle.lock().unwrap().burst();
+        assert_eq!(burst, 2.0 * 104857600.0);
+        // Unit math on a small bucket: full burst covers, then exact delay.
+        let mut bucket = TokenBucket::new(1000.0, 2000.0);
+        let now = Instant::now();
+        assert_eq!(bucket.take_bytes(now, 1500), Duration::ZERO);
+        assert_eq!(bucket.take_bytes(now, 1000), Duration::from_millis(500));
+        // Debt clamps at one burst: a huge frame waits 2 s, not longer.
+        assert_eq!(bucket.take_bytes(now, 10000), Duration::from_secs(2));
+        assert_eq!(bucket.take_bytes(now, 10000), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn zero_rate_disables_throttling() {
+        let mut throttle = RelayThrottle::new(0);
+        assert_eq!(throttle.burst(), 0.0);
+        assert_eq!(throttle.delay_for(Instant::now(), u64::MAX), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn relay_holds_at_most_one_application_frame() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, _srx, _rrx, id, attempt, _st, _rt) =
+            relay_live_pair(&registry, &room, "cccccccccccccccccccccccccccccccc").await;
+        let token = registry.activate_relay(&room, id, attempt).unwrap();
+        // Two frames queued, recipient never drains: the pump must read the
+        // first, park on the blocked send, and never touch the second.
+        let source_stream = MemSocket::with_inbound(vec![
+            Message::Binary(relay_frame(0, 64, 1).into()),
+            Message::Binary(relay_frame(1, 64, 1).into()),
+        ]);
+        let source_sink = MemSocket::ready_sink();
+        let recipient_stream = MemSocket::default();
+        let recipient_sink = MemSocket::default();
+        let pair = RelayPair {
+            transfer_id: id,
+            attempt_id: attempt,
+            source,
+            recipient,
+            source_sink: Box::pin(source_sink) as RelaySink,
+            source_stream: Box::pin(source_stream.clone()) as RelayStream,
+            recipient_sink: Box::pin(recipient_sink.clone()) as RelaySink,
+            recipient_stream: Box::pin(recipient_stream) as RelayStream,
+            cancel: token,
+            send_timeout: Duration::from_secs(30),
+            close_grace: Duration::from_millis(20),
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(200),
+            registry.run_relay_pair(&room, pair),
+        )
+        .await;
+        assert!(outcome.is_err(), "blocked recipient parks the pump");
+        assert_eq!(source_stream.polls(), 1, "second frame never read");
+        assert_eq!(source_stream.inbound_len(), 1, "second frame still queued");
+        assert!(recipient_sink.outbox().is_empty());
+    }
+
+    /// Every runtime refusal of the pump, in one table: an oversize frame,
+    /// a text message on the payload leg, and any upstream message on the
+    /// recipient leg all end the pair as a violation — plus the transport
+    /// config that keeps compression off and the bounds small.
+    #[tokio::test]
+    async fn relay_rejects_oversize_text_binary_compression_and_recipient_binary() {
+        for (label, source_inbound, recipient_inbound) in [
+            (
+                "oversize binary",
+                vec![Message::Binary(relay_frame(0, 32 * 1024, 1).into())],
+                vec![],
+            ),
+            (
+                "text on the payload leg",
+                vec![Message::Text("relay.attach".into())],
+                vec![],
+            ),
+            (
+                "binary from the recipient",
+                vec![],
+                vec![Message::Binary(relay_frame(0, 64, 1).into())],
+            ),
+            (
+                "text from the recipient",
+                vec![],
+                vec![Message::Text("hello".into())],
+            ),
+        ] {
+            let registry = transfer_registry();
+            let (_lease, room) = transfer_room(&registry);
+            let (source, _ga, recipient, _gb, _srx, _rrx, id, attempt, _st, _rt) =
+                relay_live_pair(&registry, &room, "cccccccccccccccccccccccccccccccc").await;
+            let token = registry.activate_relay(&room, id, attempt).unwrap();
+            let recipient_sink = MemSocket::ready_sink();
+            let pair = RelayPair {
+                transfer_id: id,
+                attempt_id: attempt,
+                source,
+                recipient,
+                source_sink: Box::pin(MemSocket::ready_sink()) as RelaySink,
+                source_stream: Box::pin(MemSocket::with_inbound(source_inbound)) as RelayStream,
+                recipient_sink: Box::pin(recipient_sink.clone()) as RelaySink,
+                recipient_stream: Box::pin(MemSocket::with_inbound(recipient_inbound))
+                    as RelayStream,
+                cancel: token,
+                send_timeout: Duration::from_secs(30),
+                close_grace: Duration::from_millis(20),
+            };
+            let (end, stats) =
+                tokio::time::timeout(Duration::from_secs(5), registry.run_relay_pair(&room, pair))
+                    .await
+                    .unwrap_or_else(|_| panic!("{label}: the pump must end, not park"));
+            assert_eq!(end, RelayEnd::Violation, "{label}");
+            assert_eq!(stats.bytes, 0, "{label}: no payload crossed");
+            assert_eq!(stats.frames, 0, "{label}");
+        }
+        // The transport itself never negotiates compression and never lets a
+        // message past the frame bound.
+        let config = crate::web_transfer_http::relay_websocket_config();
+        assert_eq!(
+            config.max_message_size,
+            Some(WEB_TRANSFER_MAX_RELAY_MESSAGE_BYTES)
+        );
+        assert_eq!(
+            config.max_frame_size,
+            Some(WEB_TRANSFER_MAX_RELAY_FRAME_BYTES)
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_recipient_times_out_and_releases_permit() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt, _st, _rt) =
+            relay_live_pair(&registry, &room, "cccccccccccccccccccccccccccccccc").await;
+        let token = registry.activate_relay(&room, id, attempt).unwrap();
+        let source_stream =
+            MemSocket::with_inbound(vec![Message::Binary(relay_frame(0, 64, 1).into())]);
+        let pair = RelayPair {
+            transfer_id: id,
+            attempt_id: attempt,
+            source,
+            recipient,
+            source_sink: Box::pin(MemSocket::ready_sink()) as RelaySink,
+            source_stream: Box::pin(source_stream) as RelayStream,
+            recipient_sink: Box::pin(MemSocket::default()) as RelaySink,
+            recipient_stream: Box::pin(MemSocket::default()) as RelayStream,
+            cancel: token,
+            send_timeout: Duration::from_millis(50),
+            close_grace: Duration::from_millis(20),
+        };
+        let (end, stats) = registry.run_relay_pair(&room, pair).await;
+        assert_eq!(end, RelayEnd::SendTimeout);
+        assert_eq!((stats.bytes, stats.frames), (0, 0));
+        // Failed exactly once: permit gone, second release is a no-op.
+        assert_eq!(registry.current_relays(), 0);
+        assert!(!registry.release_relay_permit(&room, id, attempt));
+        assert!(registry.activate_relay(&room, id, attempt).is_none());
+        // Both control legs hear path_commit then one retryable failure.
+        for rx in [&mut source_rx, &mut recipient_rx] {
+            let (typ, _) = recv_text(rx).await;
+            assert_eq!(typ, "transfer.path_commit");
+            let (typ, body) = recv_text(rx).await;
+            assert_eq!(typ, "error");
+            assert_eq!(body["code"].as_str(), Some("DIRECT_FAILED"));
+            assert_eq!(body["message"].as_str(), Some(id.to_string()).as_deref());
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_cancel_closes_both_sides() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt, _st, _rt) =
+            relay_live_pair(&registry, &room, "cccccccccccccccccccccccccccccccc").await;
+        // Control cancels first: terminal already, notices already drained.
+        let (outcome, outbox) = registry.cancel_transfer(&room, source, id).unwrap();
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut recipient_rx).await;
+        let token = room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .unwrap()
+            .cancel
+            .clone();
+        let source_sink = MemSocket::ready_sink();
+        let recipient_sink = MemSocket::ready_sink();
+        let pair = RelayPair {
+            transfer_id: id,
+            attempt_id: attempt,
+            source,
+            recipient,
+            source_sink: Box::pin(source_sink.clone()) as RelaySink,
+            source_stream: Box::pin(MemSocket::default()) as RelayStream,
+            recipient_sink: Box::pin(recipient_sink.clone()) as RelaySink,
+            recipient_stream: Box::pin(MemSocket::default()) as RelayStream,
+            cancel: token,
+            send_timeout: Duration::from_secs(10),
+            close_grace: Duration::from_millis(20),
+        };
+        let (end, _) = registry.run_relay_pair(&room, pair).await;
+        assert_eq!(end, RelayEnd::Cancelled);
+        // Both legs got their Close; nothing further was notified.
+        for socket in [&source_sink, &recipient_sink] {
+            assert!(
+                socket
+                    .outbox()
+                    .iter()
+                    .any(|m| matches!(m, Message::Close(_))),
+                "leg closed"
+            );
+        }
+        let (typ, _) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.path_commit");
+        let (typ, _) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "transfer.path_commit");
+        assert!(source_rx.try_recv().is_err());
+        assert!(recipient_rx.try_recv().is_err());
+        assert_eq!(registry.current_relays(), 0);
+    }
+
+    #[tokio::test]
+    async fn relay_logs_only_opaque_aggregates() {
+        #[derive(Clone)]
+        struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = LogSink(std::sync::Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard =
+            tracing::dispatcher::set_default(&tracing::dispatcher::Dispatch::new(subscriber));
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, _srx, _rrx, id, attempt, _st, _rt) =
+            relay_live_pair(&registry, &room, "cccccccccccccccccccccccccccccccc").await;
+        let token = registry.activate_relay(&room, id, attempt).unwrap();
+        // Ciphertext carries a canary the server must never repeat.
+        let mut body = relay_frame(0, 64, 1);
+        let canary = b"CANARY-RELAY-9f2c";
+        body[16..16 + canary.len()].copy_from_slice(canary);
+        let source_stream =
+            MemSocket::with_inbound(vec![Message::Binary(body.into()), Message::Close(None)]);
+        let recipient_sink = MemSocket::ready_sink();
+        let pair = RelayPair {
+            transfer_id: id,
+            attempt_id: attempt,
+            source,
+            recipient,
+            source_sink: Box::pin(MemSocket::ready_sink()) as RelaySink,
+            source_stream: Box::pin(source_stream) as RelayStream,
+            recipient_sink: Box::pin(recipient_sink.clone()) as RelaySink,
+            recipient_stream: Box::pin(MemSocket::default()) as RelayStream,
+            cancel: token,
+            send_timeout: Duration::from_secs(10),
+            close_grace: Duration::from_millis(20),
+        };
+        let (end, stats) = registry.run_relay_pair(&room, pair).await;
+        assert_eq!(end, RelayEnd::Clean);
+        assert_eq!((stats.bytes, stats.frames), (80, 1));
+        assert_eq!(
+            recipient_sink
+                .outbox()
+                .iter()
+                .filter(|m| matches!(m, Message::Binary(_)))
+                .count(),
+            1
+        );
+        let logs = String::from_utf8_lossy(&buffer.lock().unwrap()).into_owned();
+        assert!(logs.contains("relay pair closed clean"));
+        assert!(logs.contains(&id.to_string()));
+        assert!(
+            !logs.contains("CANARY-RELAY"),
+            "payload leaked to logs:\n{logs}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 4.1: direct-path negotiation, signaling and relay fallback.
+    // Every test below asserts the SERVER's half: role order, bounds,
+    // exactly-once commit, exactly-once fallback and the fact that a
+    // direct attempt never touches the relay semaphore.
+    // -----------------------------------------------------------------
+
+    /// Opens a transfer and readies it, leaving it negotiating. Returns the
+    /// participants, their queues, the transfer and the attempt, with both
+    /// `transfer.direct_start` envelopes already delivered.
+    async fn negotiating_fixture_for(
+        registry: &WebTransferRegistry,
+        room: &Arc<WebTransferRoom>,
+        offer_hex: &str,
+    ) -> (
+        PeerId,
+        PeerGuard,
+        PeerId,
+        PeerGuard,
+        mpsc::Receiver<String>,
+        mpsc::Receiver<String>,
+        TransferId,
+        AttemptId,
+        [u8; 32],
+    ) {
+        let (source, guard_a, mut source_rx) = live_peer(registry, room, Some("A"));
+        let (recipient, guard_b, recipient_rx) = live_peer(registry, room, Some("B"));
+        let mac = offer_fixture(registry, room, source, offer_hex);
+        let (id, attempt) = request_fixture(registry, room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (outcome, outbox) = registry
+            .source_ready(room, source, id, attempt, digest)
+            .unwrap();
+        assert_eq!(outcome, ReadyOutcome::Negotiating);
+        drain_transfer_outbox(room, outbox);
+        (
+            source,
+            guard_a,
+            recipient,
+            guard_b,
+            source_rx,
+            recipient_rx,
+            id,
+            attempt,
+            digest,
+        )
+    }
+
+    /// The common case: one offer, the room's default fixture offer ID.
+    #[allow(clippy::type_complexity)]
+    async fn negotiating_fixture(
+        registry: &WebTransferRegistry,
+        room: &Arc<WebTransferRoom>,
+    ) -> (
+        PeerId,
+        PeerGuard,
+        PeerId,
+        PeerGuard,
+        mpsc::Receiver<String>,
+        mpsc::Receiver<String>,
+        TransferId,
+        AttemptId,
+        [u8; 32],
+    ) {
+        negotiating_fixture_for(registry, room, "cccccccccccccccccccccccccccccccc").await
+    }
+
+    fn sdp_body(id: TransferId, attempt: AttemptId, sdp: &str) -> RtcSdpBody {
+        RtcSdpBody {
+            transfer_id: id,
+            attempt_id: attempt,
+            sdp: sdp.to_string(),
+        }
+    }
+
+    fn ice_body(id: TransferId, attempt: AttemptId, candidate: Option<&str>) -> RtcIceBody {
+        RtcIceBody {
+            transfer_id: id,
+            attempt_id: attempt,
+            candidate: candidate.map(str::to_string),
+            sdp_mid: candidate.map(|_| "0".to_string()),
+            sdp_m_line_index: candidate.map(|_| 0u16),
+        }
+    }
+
+    fn failed_body(
+        id: TransferId,
+        attempt: AttemptId,
+        reason: &'static str,
+        ranges: Vec<(u64, u64)>,
+    ) -> DirectFailedBody {
+        DirectFailedBody {
+            transfer_id: id,
+            attempt_id: attempt,
+            reason,
+            verified_ranges: ranges,
+        }
+    }
+
+    #[tokio::test]
+    async fn recipient_is_fixed_offerer_and_source_fixed_answerer() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (_s, _ga, _r, _gb, mut source_rx, mut recipient_rx, id, attempt, _digest) =
+            negotiating_fixture(&registry, &room).await;
+        // The recipient hears first: it creates the one DataChannel.
+        let (typ, body) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "transfer.direct_start");
+        assert_eq!(body["role"].as_str(), Some("offerer"));
+        assert_eq!(body["transferId"].as_str(), Some(id.to_string()).as_deref());
+        assert_eq!(
+            body["attemptId"].as_str(),
+            Some(attempt.to_string()).as_deref()
+        );
+        assert_eq!(body["attemptNumber"].as_u64(), Some(1));
+        assert_eq!(body["deadlineMs"].as_u64(), Some(10_000));
+        assert!(body["iceServers"].is_array());
+        let (typ, body) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.direct_start");
+        assert_eq!(body["role"].as_str(), Some("answerer"));
+        assert_eq!(body["deadlineMs"].as_u64(), Some(10_000));
+        // Every advertised ICE server is a STUN URL: a TURN credential the
+        // server does not have must never appear here.
+        for url in body["iceServers"].as_array().unwrap() {
+            assert!(url.as_str().unwrap().starts_with("stun:"));
+        }
+        assert!(room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .unwrap()
+            .state
+            .is_negotiating_direct());
+    }
+
+    #[tokio::test]
+    async fn sdp_order_roles_sizes_and_singletons_are_enforced() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt, _d) =
+            negotiating_fixture(&registry, &room).await;
+        let (stranger, _gc, _rx_c) = live_peer(&registry, &room, Some("C"));
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        let offer = sdp_body(id, attempt, "v=0 offer");
+        let answer = sdp_body(id, attempt, "v=0 answer");
+        // The answer cannot precede the offer it answers.
+        assert_eq!(
+            registry
+                .forward_rtc_answer(&room, source, &answer)
+                .unwrap_err()
+                .code(),
+            "INVALID_MESSAGE"
+        );
+        // Roles are fixed: the source never offers, the recipient never
+        // answers, and a stranger is neither.
+        assert_eq!(
+            registry
+                .forward_rtc_offer(&room, source, &offer)
+                .unwrap_err()
+                .code(),
+            "INVALID_MESSAGE"
+        );
+        assert_eq!(
+            registry
+                .forward_rtc_offer(&room, stranger, &offer)
+                .unwrap_err()
+                .code(),
+            "NOT_PARTICIPANT"
+        );
+        let outbox = registry
+            .forward_rtc_offer(&room, recipient, &offer)
+            .unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].0, source);
+        drain_transfer_outbox(&room, outbox);
+        let (typ, body) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "rtc.offer");
+        assert_eq!(body["sdp"].as_str(), Some("v=0 offer"));
+        // Exactly once, each.
+        assert!(registry
+            .forward_rtc_offer(&room, recipient, &offer)
+            .is_err());
+        assert_eq!(
+            registry
+                .forward_rtc_answer(&room, recipient, &answer)
+                .unwrap_err()
+                .code(),
+            "INVALID_MESSAGE"
+        );
+        let outbox = registry.forward_rtc_answer(&room, source, &answer).unwrap();
+        assert_eq!(outbox[0].0, recipient);
+        drain_transfer_outbox(&room, outbox);
+        let (typ, body) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "rtc.answer");
+        assert_eq!(body["sdp"].as_str(), Some("v=0 answer"));
+        assert!(registry.forward_rtc_answer(&room, source, &answer).is_err());
+        // A stale attempt is refused whatever the role.
+        let stale = sdp_body(id, generate_attempt_id(), "v=0 offer");
+        assert!(registry
+            .forward_rtc_offer(&room, recipient, &stale)
+            .is_err());
+        // Size is enforced by the PARSER, which is the only place an SDP is
+        // ever looked at, and the bound counts bytes.
+        let too_big = "x".repeat(WEB_TRANSFER_MAX_SDP_BYTES + 1);
+        let raw = serde_json::json!({
+            "v": 1,
+            "type": "rtc.offer",
+            "requestId": "dddddddddddddddddddddddddddddddd",
+            "body": {"transferId": id.to_string(), "attemptId": attempt.to_string(), "sdp": too_big},
+        })
+        .to_string();
+        let env = crate::web_transfer_protocol::parse_client_envelope(&raw).unwrap();
+        assert!(crate::web_transfer_protocol::parse_rtc_sdp_body(&env, "rtc.offer").is_err());
+    }
+
+    #[tokio::test]
+    async fn ice_candidates_are_bounded_per_side_and_end_marker_forwards() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt, _d) =
+            negotiating_fixture(&registry, &room).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        // Both sides gather from the first message: ICE needs no ordering
+        // against the offer, and holding candidates back would only delay it.
+        let cap = WEB_TRANSFER_MAX_ICE_CANDIDATES_PER_SIDE;
+        for i in 0..cap {
+            let body = ice_body(id, attempt, Some(&format!("candidate:{i}")));
+            let outbox = registry.forward_rtc_ice(&room, recipient, &body).unwrap();
+            assert_eq!(outbox[0].0, source);
+            assert_eq!(
+                registry
+                    .forward_rtc_ice(&room, source, &body)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            if i == 0 {
+                drain_transfer_outbox(&room, outbox);
+                let (typ, forwarded) = recv_text(&mut source_rx).await;
+                assert_eq!(typ, "rtc.ice");
+                assert_eq!(forwarded["candidate"].as_str(), Some("candidate:0"));
+                assert_eq!(forwarded["sdpMid"].as_str(), Some("0"));
+                assert_eq!(forwarded["sdpMLineIndex"].as_u64(), Some(0));
+            }
+        }
+        // The budget is per side and the 129th is refused on both.
+        let extra = ice_body(id, attempt, Some("candidate:over"));
+        assert_eq!(
+            registry
+                .forward_rtc_ice(&room, recipient, &extra)
+                .unwrap_err()
+                .code(),
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            registry
+                .forward_rtc_ice(&room, source, &extra)
+                .unwrap_err()
+                .code(),
+            "LIMIT_EXCEEDED"
+        );
+        // A fresh negotiation gets its own budget, and the end-of-candidates
+        // marker travels as a null candidate with nothing else on it.
+        let (_s2, _ga2, r2, _gb2, mut src_rx2, mut rcp_rx2, id2, attempt2, _d2) =
+            negotiating_fixture_for(&registry, &room, "dddddddddddddddddddddddddddddddd").await;
+        let _ = recv_text(&mut rcp_rx2).await;
+        let _ = recv_text(&mut src_rx2).await;
+        let marker = ice_body(id2, attempt2, None);
+        assert!(marker.is_end_of_candidates());
+        let outbox = registry.forward_rtc_ice(&room, r2, &marker).unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let (typ, forwarded) = recv_text(&mut src_rx2).await;
+        assert_eq!(typ, "rtc.ice");
+        assert!(forwarded["candidate"].is_null());
+        assert!(forwarded.get("sdpMid").is_none());
+        assert!(forwarded.get("sdpMLineIndex").is_none());
+    }
+
+    #[tokio::test]
+    async fn signaling_is_forward_only_and_never_logged() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (_source, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt, _d) =
+            negotiating_fixture(&registry, &room).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        let secret_sdp = "v=0 SECRET-SDP-MARKER";
+        let secret_candidate = "candidate:SECRET-CANDIDATE-MARKER";
+        let outbox = registry
+            .forward_rtc_offer(&room, recipient, &sdp_body(id, attempt, secret_sdp))
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let (_, forwarded) = recv_text(&mut source_rx).await;
+        assert_eq!(forwarded["sdp"].as_str(), Some(secret_sdp));
+        let outbox = registry
+            .forward_rtc_ice(
+                &room,
+                recipient,
+                &ice_body(id, attempt, Some(secret_candidate)),
+            )
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut source_rx).await;
+        // The server keeps neither: the whole record's Debug — which is what
+        // any log line could ever print — contains no part of them.
+        let dump = format!("{:?}", room.state.lock().unwrap().transfers.get(&id));
+        assert!(!dump.contains("SECRET-SDP-MARKER"), "{dump}");
+        assert!(!dump.contains("SECRET-CANDIDATE-MARKER"), "{dump}");
+        // A refusal names the step, never the value.
+        let err = registry
+            .forward_rtc_offer(&room, recipient, &sdp_body(id, attempt, secret_sdp))
+            .unwrap_err();
+        let text = format!("{err:?} {}", err.code());
+        assert!(!text.contains("SECRET-SDP-MARKER"), "{text}");
+        // The forwarded envelope carries no requestId: the peer's own
+        // correlation ID belongs to its own ack and to nothing else.
+        let envelope = crate::web_transfer_protocol::rtc_sdp_envelope(
+            "rtc.offer",
+            &sdp_body(id, attempt, secret_sdp),
+        );
+        let value: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+        assert!(value.get("requestId").is_none());
+    }
+
+    #[tokio::test]
+    async fn both_ready_commit_direct_recipient_then_source() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt, _d) =
+            negotiating_fixture(&registry, &room).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        // Ready before that side's own signaling step is refused.
+        assert!(registry
+            .direct_ready(&room, recipient, id, attempt)
+            .is_err());
+        let outbox = registry
+            .forward_rtc_offer(&room, recipient, &sdp_body(id, attempt, "v=0 offer"))
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut source_rx).await;
+        assert!(registry.direct_ready(&room, source, id, attempt).is_err());
+        let outbox = registry
+            .forward_rtc_answer(&room, source, &sdp_body(id, attempt, "v=0 answer"))
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut recipient_rx).await;
+        // First ready commits nothing and is idempotent.
+        assert!(registry
+            .direct_ready(&room, recipient, id, attempt)
+            .unwrap()
+            .is_empty());
+        assert!(registry
+            .direct_ready(&room, recipient, id, attempt)
+            .unwrap()
+            .is_empty());
+        // The second distinct ready commits, recipient first.
+        let outbox = registry.direct_ready(&room, source, id, attempt).unwrap();
+        assert_eq!(outbox.len(), 2);
+        assert_eq!(outbox[0].0, recipient);
+        assert_eq!(outbox[1].0, source);
+        drain_transfer_outbox(&room, outbox);
+        for rx in [&mut recipient_rx, &mut source_rx] {
+            let (typ, body) = recv_text(rx).await;
+            assert_eq!(typ, "transfer.path_commit");
+            assert_eq!(body["path"].as_str(), Some("direct"));
+            assert_eq!(
+                body["attemptId"].as_str(),
+                Some(attempt.to_string()).as_deref()
+            );
+        }
+        assert_eq!(
+            room.state.lock().unwrap().transfers.get(&id).unwrap().state,
+            TransferState::ActiveDirect
+        );
+        // A repeat after the commit does not commit twice.
+        assert!(registry.direct_ready(&room, source, id, attempt).is_err());
+        // Direct carried it, so completion is valid from ActiveDirect.
+        assert_eq!(registry.current_relays(), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_timeout_falls_back_once_with_fresh_attempt() {
+        let registry = transfer_registry();
+        registry.set_direct_deadline(Duration::from_millis(40));
+        let (_lease, room) = transfer_room(&registry);
+        let (_s, _ga, _r, _gb, mut source_rx, mut recipient_rx, id, attempt, _d) =
+            negotiating_fixture(&registry, &room).await;
+        let (_, start) = recv_text(&mut recipient_rx).await;
+        assert_eq!(start["deadlineMs"].as_u64(), Some(40));
+        let _ = recv_text(&mut source_rx).await;
+        assert_eq!(registry.current_relays(), 0);
+        // The real timer: armed the way the actor arms it, fired by time.
+        registry.spawn_direct_deadline(&room, id, attempt);
+        let (typ, body) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "transfer.direct_failed");
+        assert_eq!(body["reason"].as_str(), Some("timeout"));
+        let (typ, _) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "transfer.relay_ticket");
+        let (typ, _) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.direct_failed");
+        let (typ, ticket) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.relay_ticket");
+        let next: AttemptId = ticket["attemptId"].as_str().unwrap().parse().unwrap();
+        assert_ne!(next, attempt);
+        let (state_now, number, current) = {
+            let guard = room.state.lock().unwrap();
+            let record = guard.transfers.get(&id).unwrap();
+            (record.state, record.attempt_number, record.attempt_id)
+        };
+        assert_eq!(state_now, TransferState::WaitingRelay);
+        assert_eq!(number, 2);
+        assert_eq!(current, Some(next));
+        assert_eq!(registry.current_relays(), 1);
+        // Firing again changes nothing: one fallback, one permit.
+        registry.direct_deadline_elapsed(&room, id, attempt).await;
+        assert_eq!(registry.current_relays(), 1);
+        assert_eq!(
+            room.state
+                .lock()
+                .unwrap()
+                .transfers
+                .get(&id)
+                .unwrap()
+                .attempt_id,
+            Some(next)
+        );
+        assert!(recipient_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn direct_failure_mid_active_preserves_transfer_and_ranges() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt, _d) =
+            negotiating_fixture(&registry, &room).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        let outbox = registry
+            .forward_rtc_offer(&room, recipient, &sdp_body(id, attempt, "v=0 offer"))
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut source_rx).await;
+        let outbox = registry
+            .forward_rtc_answer(&room, source, &sdp_body(id, attempt, "v=0 answer"))
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = registry
+            .direct_ready(&room, recipient, id, attempt)
+            .unwrap();
+        let outbox = registry.direct_ready(&room, source, id, attempt).unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        // The channel dies after two verified chunks: the RECIPIENT reports
+        // what it holds, and the same transfer continues on the relay.
+        let (outcome, outbox) = registry
+            .direct_failed(
+                &room,
+                recipient,
+                &failed_body(id, attempt, "channel-closed", vec![(0, 2)]),
+            )
+            .unwrap();
+        assert_eq!(outcome, ReadyOutcome::Admitted);
+        drain_transfer_outbox(&room, outbox);
+        let (typ, notice) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.direct_failed");
+        assert_eq!(notice["reason"].as_str(), Some("channel-closed"));
+        assert_eq!(notice["resumeRanges"][0][0].as_u64(), Some(0));
+        assert_eq!(notice["resumeRanges"][0][1].as_u64(), Some(2));
+        let (typ, source_ticket) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.relay_ticket");
+        let (typ, recipient_ticket) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "transfer.relay_ticket");
+        assert_ne!(
+            source_ticket["ticket"].as_str(),
+            recipient_ticket["ticket"].as_str()
+        );
+        let (kept_id, ranges, state_now) = {
+            let guard = room.state.lock().unwrap();
+            let record = guard.transfers.get(&id).unwrap();
+            (
+                record.transfer_id,
+                record
+                    .resume
+                    .as_ref()
+                    .map(|r| r.verified_ranges.clone())
+                    .unwrap_or_default(),
+                record.state,
+            )
+        };
+        assert_eq!(kept_id, id);
+        assert_eq!(ranges, vec![(0, 2)]);
+        assert_eq!(state_now, TransferState::WaitingRelay);
+        // Only the recipient knows what it verified: a source-reported range
+        // list is not believed, and a second failure does nothing at all.
+        let (outcome, outbox) = registry
+            .direct_failed(
+                &room,
+                source,
+                &failed_body(id, attempt, "channel-closed", vec![(0, 9999)]),
+            )
+            .unwrap();
+        assert_eq!(outcome, ReadyOutcome::Ignored);
+        assert!(outbox.is_empty());
+        assert_eq!(
+            room.state
+                .lock()
+                .unwrap()
+                .transfers
+                .get(&id)
+                .unwrap()
+                .resume
+                .as_ref()
+                .unwrap()
+                .verified_ranges,
+            vec![(0, 2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_busy_after_direct_failure_is_retryable() {
+        let registry = busy_registry();
+        registry.set_relay_admit_timeout(Duration::from_millis(20));
+        let (_lease, room) = transfer_room(&registry);
+        let held = registry.try_acquire_relay().unwrap();
+        let (_s, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt, _d) =
+            negotiating_fixture(&registry, &room).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        let (outcome, outbox) = registry
+            .direct_failed(
+                &room,
+                recipient,
+                &failed_body(id, attempt, "ice-failed", vec![]),
+            )
+            .unwrap();
+        assert_eq!(outcome, ReadyOutcome::Queued);
+        // Only the counterpart notice: no ticket exists to send.
+        assert_eq!(outbox.len(), 1);
+        drain_transfer_outbox(&room, outbox);
+        let (typ, _) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.direct_failed");
+        let next = registry.current_attempt(&room, id).unwrap();
+        assert_ne!(next, attempt);
+        registry.admit_relay(&room, id, next).await;
+        let (typ, body) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "error");
+        assert_eq!(body["code"].as_str(), Some("RELAY_BUSY"));
+        let (state_now, has_permit) = {
+            let guard = room.state.lock().unwrap();
+            let record = guard.transfers.get(&id).unwrap();
+            (
+                record.state,
+                record.attempt.as_ref().unwrap().relay_permit.is_some(),
+            )
+        };
+        // Retryable, not terminal, and still holding no permit.
+        assert_eq!(state_now, TransferState::WaitingRelay);
+        assert!(!has_permit);
+        assert!(state_now.is_live());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn stale_direct_timer_and_messages_cannot_touch_new_attempt() {
+        // The relay is full, so the one fallback QUEUES without a permit —
+        // the only shape `transfer.request` upgrades, which is how this test
+        // gets a THIRD attempt to prove the first two cannot reach.
+        let registry = busy_registry();
+        registry.set_relay_admit_timeout(Duration::from_millis(20));
+        let (_lease, room) = transfer_room(&registry);
+        let held = registry.try_acquire_relay().unwrap();
+        let (source, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt1, digest) =
+            negotiating_fixture(&registry, &room).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        let (outcome, outbox) = registry
+            .direct_failed(
+                &room,
+                recipient,
+                &failed_body(id, attempt1, "ice-failed", vec![]),
+            )
+            .unwrap();
+        assert_eq!(outcome, ReadyOutcome::Queued);
+        drain_transfer_outbox(&room, outbox);
+        let relay_attempt = registry.current_attempt(&room, id).unwrap();
+        assert_ne!(relay_attempt, attempt1);
+        while source_rx.try_recv().is_ok() {}
+        while recipient_rx.try_recv().is_ok() {}
+        // A fresh click on a permit-less WaitingRelay upgrades the attempt.
+        let (_, _) = registry
+            .request_transfer(
+                &room,
+                recipient,
+                "cccccccccccccccccccccccccccccccc".parse().unwrap(),
+                vec!["0".to_string()],
+                digest,
+                "raw",
+                None,
+            )
+            .unwrap();
+        let attempt3 = registry.current_attempt(&room, id).unwrap();
+        assert_ne!(attempt3, attempt1);
+        assert_ne!(attempt3, relay_attempt);
+        let _ = recv_text(&mut source_rx).await;
+        let (outcome, outbox) = registry
+            .source_ready(&room, source, id, attempt3, digest)
+            .unwrap();
+        assert_eq!(outcome, ReadyOutcome::Negotiating);
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        // Every stale message and the stale timer are inert.
+        for stale in [attempt1, relay_attempt] {
+            assert!(registry
+                .forward_rtc_offer(&room, recipient, &sdp_body(id, stale, "v=0 offer"))
+                .is_err());
+            assert!(registry
+                .forward_rtc_ice(&room, recipient, &ice_body(id, stale, Some("candidate:x")))
+                .is_err());
+            assert!(registry.direct_ready(&room, recipient, id, stale).is_err());
+            let (outcome, outbox) = registry
+                .direct_failed(
+                    &room,
+                    recipient,
+                    &failed_body(id, stale, "ice-failed", vec![]),
+                )
+                .unwrap();
+            assert_eq!(outcome, ReadyOutcome::Ignored);
+            assert!(outbox.is_empty());
+            registry.direct_deadline_elapsed(&room, id, stale).await;
+        }
+        let (state_now, current) = {
+            let guard = room.state.lock().unwrap();
+            let record = guard.transfers.get(&id).unwrap();
+            (record.state, record.attempt_id)
+        };
+        assert!(state_now.is_negotiating_direct());
+        assert_eq!(current, Some(attempt3));
+        // The only permit in flight is the one this test holds by hand:
+        // nothing the stale traffic did took a second.
+        assert_eq!(registry.current_relays(), 1);
+        assert!(recipient_rx.try_recv().is_err());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn cancel_disconnect_withdraw_win_over_fallback() {
+        // Cancel beats the timer.
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (_s, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt, _d) =
+            negotiating_fixture(&registry, &room).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        let (outcome, outbox) = registry.cancel_transfer(&room, recipient, id).unwrap();
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut source_rx).await;
+        registry.direct_deadline_elapsed(&room, id, attempt).await;
+        let (_, outbox) = registry
+            .direct_failed(
+                &room,
+                recipient,
+                &failed_body(id, attempt, "ice-failed", vec![]),
+            )
+            .unwrap();
+        assert!(outbox.is_empty());
+        assert_eq!(
+            room.state.lock().unwrap().transfers.get(&id).unwrap().state,
+            TransferState::Cancelled
+        );
+        assert_eq!(registry.current_relays(), 0);
+
+        // Withdrawing the offer beats it too.
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, _r, _gb, mut source_rx, mut recipient_rx, id, attempt, _d) =
+            negotiating_fixture(&registry, &room).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        registry
+            .withdraw_offer(
+                &room,
+                source,
+                "cccccccccccccccccccccccccccccccc".parse().unwrap(),
+            )
+            .unwrap();
+        registry.direct_deadline_elapsed(&room, id, attempt).await;
+        assert!(!room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .unwrap()
+            .state
+            .is_live());
+        assert_eq!(registry.current_relays(), 0);
+
+        // So does the source's control session going away.
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (_s, guard_a, _r, _gb, mut source_rx, mut recipient_rx, id, attempt, _d) =
+            negotiating_fixture(&registry, &room).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        drop(guard_a);
+        registry.direct_deadline_elapsed(&room, id, attempt).await;
+        let terminal = room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .map(|record| !record.state.is_live())
+            .unwrap_or(true);
+        assert!(terminal);
+        assert_eq!(registry.current_relays(), 0);
+    }
+
+    fn progress_body(
+        id: TransferId,
+        attempt: AttemptId,
+        received: u64,
+    ) -> crate::web_transfer_protocol::ProgressBody {
+        crate::web_transfer_protocol::ProgressBody {
+            transfer_id: id,
+            attempt_id: attempt,
+            received_bytes: received,
+        }
+    }
+
+    /// Drives one transfer to `ActiveDirect`: both peers ready, both
+    /// `path_commit direct` drained.
+    #[allow(clippy::type_complexity)]
+    async fn active_direct_fixture(
+        registry: &WebTransferRegistry,
+        room: &Arc<WebTransferRoom>,
+    ) -> (
+        PeerId,
+        PeerGuard,
+        PeerId,
+        PeerGuard,
+        mpsc::Receiver<String>,
+        mpsc::Receiver<String>,
+        TransferId,
+        AttemptId,
+    ) {
+        let (source, guard_a, recipient, guard_b, mut source_rx, mut recipient_rx, id, attempt, _d) =
+            negotiating_fixture(registry, room).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        let outbox = registry
+            .forward_rtc_offer(room, recipient, &sdp_body(id, attempt, "v=0 offer"))
+            .unwrap();
+        drain_transfer_outbox(room, outbox);
+        let _ = recv_text(&mut source_rx).await;
+        let outbox = registry
+            .forward_rtc_answer(room, source, &sdp_body(id, attempt, "v=0 answer"))
+            .unwrap();
+        drain_transfer_outbox(room, outbox);
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = registry.direct_ready(room, recipient, id, attempt).unwrap();
+        let outbox = registry.direct_ready(room, source, id, attempt).unwrap();
+        drain_transfer_outbox(room, outbox);
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        (
+            source,
+            guard_a,
+            recipient,
+            guard_b,
+            source_rx,
+            recipient_rx,
+            id,
+            attempt,
+        )
+    }
+
+    #[tokio::test]
+    async fn progress_is_recipient_only_and_bounded_by_the_entry() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, _source_rx, _recipient_rx, id, attempt) =
+            active_direct_fixture(&registry, &room).await;
+        let entry_size = room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .unwrap()
+            .entry_size
+            .expect("a raw transfer carries the manifest size");
+        // The source verified nothing — it wrote the bytes. Letting it
+        // report would put an unchecked count on the recipient's progress
+        // bar and, worse, make the path a thing a peer can assert.
+        assert_eq!(
+            registry
+                .report_progress(&room, source, &progress_body(id, attempt, 1))
+                .unwrap_err()
+                .code(),
+            "INVALID_MESSAGE"
+        );
+        let (stranger, _gc, _rx) = live_peer(&registry, &room, Some("C"));
+        assert_eq!(
+            registry
+                .report_progress(&room, stranger, &progress_body(id, attempt, 1))
+                .unwrap_err()
+                .code(),
+            "NOT_PARTICIPANT"
+        );
+        assert_eq!(
+            registry
+                .report_progress(
+                    &room,
+                    recipient,
+                    &progress_body(TransferId::from_bytes([7u8; 16]), attempt, 1)
+                )
+                .unwrap_err()
+                .code(),
+            "TRANSFER_NOT_FOUND"
+        );
+        // More than the entry holds cannot be true of any attempt.
+        assert_eq!(
+            registry
+                .report_progress(
+                    &room,
+                    recipient,
+                    &progress_body(id, attempt, entry_size + 1)
+                )
+                .unwrap_err()
+                .code(),
+            "INVALID_MESSAGE"
+        );
+        // Zero is the state before the first verified chunk: acked, and
+        // nothing is forwarded, so no path is declared on the strength of it.
+        assert!(registry
+            .report_progress(&room, recipient, &progress_body(id, attempt, 0))
+            .unwrap()
+            .is_empty());
+        // A stale attempt describes a world that has already ended.
+        assert!(registry
+            .report_progress(
+                &room,
+                recipient,
+                &progress_body(id, AttemptId::from_bytes([9u8; 16]), 1)
+            )
+            .unwrap()
+            .is_empty());
+        // The whole entry is a legal report.
+        assert_eq!(
+            registry
+                .report_progress(&room, recipient, &progress_body(id, attempt, entry_size))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_progress_path_is_the_servers_and_goes_only_to_the_source() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt) =
+            active_direct_fixture(&registry, &room).await;
+        let entry_size = room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .unwrap()
+            .entry_size
+            .expect("a raw transfer carries the manifest size");
+        let half = entry_size / 2;
+        let outbox = registry
+            .report_progress(&room, recipient, &progress_body(id, attempt, half))
+            .unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].0, source, "the report goes to the source alone");
+        drain_transfer_outbox(&room, outbox);
+        let (typ, body) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.progress");
+        assert_eq!(body["transferId"].as_str(), Some(id.to_string().as_str()));
+        assert_eq!(
+            body["attemptId"].as_str(),
+            Some(attempt.to_string().as_str())
+        );
+        // A 64-bit quantity travels as a decimal string, like every other
+        // one on this wire.
+        assert_eq!(
+            body["receivedBytes"].as_str(),
+            Some(half.to_string().as_str())
+        );
+        assert_eq!(body["path"].as_str(), Some("direct"));
+        // The path is DERIVED, never taken from the reporter: the same peer
+        // sending the same body on the relay is told `relay`.
+        {
+            let mut guard = room.state.lock().unwrap();
+            guard.transfers.get_mut(&id).unwrap().state = TransferState::Active;
+        }
+        let outbox = registry
+            .report_progress(&room, recipient, &progress_body(id, attempt, entry_size))
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let (typ, body) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.progress");
+        assert_eq!(body["path"].as_str(), Some("relay"));
+        assert_eq!(
+            body["receivedBytes"].as_str(),
+            Some(entry_size.to_string().as_str())
+        );
+        // Terminal: acked and dropped, so a late report cannot resurrect a
+        // completed transfer's progress bar.
+        {
+            let mut guard = room.state.lock().unwrap();
+            guard.transfers.get_mut(&id).unwrap().state = TransferState::Completed;
+        }
+        assert!(registry
+            .report_progress(&room, recipient, &progress_body(id, attempt, entry_size))
+            .unwrap()
+            .is_empty());
+        assert!(
+            recipient_rx.try_recv().is_err(),
+            "the recipient hears nothing about its own report"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_never_acquires_relay_permit() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt, _d) =
+            negotiating_fixture(&registry, &room).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        let no_permit = |state: &Arc<WebTransferRoom>| {
+            let guard = state.state.lock().unwrap();
+            let record = guard.transfers.get(&id).unwrap();
+            record
+                .attempt
+                .as_ref()
+                .map(|attempt| attempt.relay_permit.is_none())
+                .unwrap_or(true)
+        };
+        assert_eq!(registry.current_relays(), 0);
+        assert!(no_permit(&room));
+        let outbox = registry
+            .forward_rtc_offer(&room, recipient, &sdp_body(id, attempt, "v=0 offer"))
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut source_rx).await;
+        let outbox = registry
+            .forward_rtc_answer(&room, source, &sdp_body(id, attempt, "v=0 answer"))
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_text(&mut recipient_rx).await;
+        assert_eq!(registry.current_relays(), 0);
+        let _ = registry
+            .direct_ready(&room, recipient, id, attempt)
+            .unwrap();
+        let outbox = registry.direct_ready(&room, source, id, attempt).unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let (typ, _) = recv_text(&mut recipient_rx).await;
+        assert_eq!(typ, "transfer.path_commit");
+        let (typ, _) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.path_commit");
+        // Committed direct and still holding nothing: the whole point.
+        assert_eq!(
+            room.state.lock().unwrap().transfers.get(&id).unwrap().state,
+            TransferState::ActiveDirect
+        );
+        assert_eq!(registry.current_relays(), 0);
+        assert!(no_permit(&room));
+        // Completing on the direct path releases nothing because nothing was
+        // taken, and the relay budget is untouched at the end.
+        let root = room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .unwrap()
+            .entry_root
+            .expect("a raw transfer carries the manifest root");
+        let outbox = registry
+            .complete_transfer(&room, recipient, id, attempt, root)
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let (typ, _) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.completed");
+        assert_eq!(registry.current_relays(), 0);
+    }
+    /// 4.4 — the attempt counters follow the RECIPIENT's report and nothing
+    /// else. Not the commit: F-12 measured that shape on the native side,
+    /// where `direct_stream_opens` counted attempts and climbed 1 -> 12
+    /// during a blackout that moved zero bytes, so an operator read a
+    /// healthy direct path on a tunnel that was entirely on the relay. Not
+    /// the source either — it wrote the bytes, it verified none of them.
+    #[tokio::test]
+    async fn direct_and_relay_attempt_counters_follow_recipient_report() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, _srx, _rrx, id, attempt) =
+            active_direct_fixture(&registry, &room).await;
+        // The direct path is COMMITTED here and nothing has been verified on
+        // it, so neither counter may have moved.
+        assert_eq!(
+            (registry.direct_carried(), registry.relay_carried()),
+            (0, 0)
+        );
+        // A report with no bytes on it describes no carried byte.
+        assert!(registry
+            .report_progress(&room, recipient, &progress_body(id, attempt, 0))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            (registry.direct_carried(), registry.relay_carried()),
+            (0, 0)
+        );
+        // The SOURCE cannot move it: a refused report counts nothing.
+        assert_eq!(
+            registry
+                .report_progress(&room, source, &progress_body(id, attempt, 4))
+                .unwrap_err()
+                .code(),
+            "INVALID_MESSAGE"
+        );
+        assert_eq!(
+            (registry.direct_carried(), registry.relay_carried()),
+            (0, 0)
+        );
+        // First verified byte: the direct attempt counts, exactly once, and
+        // a second report on the SAME attempt adds nothing.
+        let outbox = registry
+            .report_progress(&room, recipient, &progress_body(id, attempt, 4))
+            .unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(
+            (registry.direct_carried(), registry.relay_carried()),
+            (1, 0)
+        );
+        let _ = registry
+            .report_progress(&room, recipient, &progress_body(id, attempt, 9))
+            .unwrap();
+        assert_eq!(
+            (registry.direct_carried(), registry.relay_carried()),
+            (1, 0)
+        );
+
+        // The relay half, on its own transfer between two other peers: the
+        // same first-verified-byte rule, counted on the other side.
+        let (_src2, _gc, rcpt2, _gd, _srx2, _rrx2, id2, attempt2, _st, _rt) =
+            relay_live_pair(&registry, &room, "dddddddddddddddddddddddddddddddd").await;
+        // Admitted with tickets and not yet carrying: still nothing.
+        assert_eq!(
+            (registry.direct_carried(), registry.relay_carried()),
+            (1, 0)
+        );
+        let _token = registry.activate_relay(&room, id2, attempt2).unwrap();
+        let _ = registry
+            .report_progress(&room, rcpt2, &progress_body(id2, attempt2, 3))
+            .unwrap();
+        assert_eq!(
+            (registry.direct_carried(), registry.relay_carried()),
+            (1, 1)
+        );
+    }
+
+    /// 4.4 — a recipient is authority over ITS OWN transfer and no other.
+    /// The path a peer sees is the server's, derived from the record; a
+    /// report naming someone else's transfer is refused and leaves that
+    /// transfer's state, its counter and its path exactly as they were.
+    #[tokio::test]
+    async fn recipient_report_cannot_change_unrelated_transfer_path() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        // T1: A -> B on the direct path.
+        let (_source, _ga, recipient, _gb, _srx, _rrx, id, attempt) =
+            active_direct_fixture(&registry, &room).await;
+        // T2: C -> D on the relay, live and carrying.
+        let (_src2, _gc, rcpt2, _gd, _srx2, _rrx2, id2, attempt2, _st, _rt) =
+            relay_live_pair(&registry, &room, "dddddddddddddddddddddddddddddddd").await;
+        let _token = registry.activate_relay(&room, id2, attempt2).unwrap();
+
+        // T1's recipient reporting on T2 is a stranger there, whichever
+        // attempt id it names — its own or T2's.
+        for named in [attempt, attempt2] {
+            assert_eq!(
+                registry
+                    .report_progress(&room, recipient, &progress_body(id2, named, 5))
+                    .unwrap_err()
+                    .code(),
+                "NOT_PARTICIPANT"
+            );
+        }
+        // And T2's recipient cannot touch T1 either.
+        assert_eq!(
+            registry
+                .report_progress(&room, rcpt2, &progress_body(id, attempt, 5))
+                .unwrap_err()
+                .code(),
+            "NOT_PARTICIPANT"
+        );
+        // Nothing moved: neither counter, neither state, neither record's
+        // carried attempt.
+        assert_eq!(
+            (registry.direct_carried(), registry.relay_carried()),
+            (0, 0)
+        );
+        {
+            let state = room.state.lock().unwrap();
+            let t1 = state.transfers.get(&id).unwrap();
+            let t2 = state.transfers.get(&id2).unwrap();
+            assert_eq!(t1.state, TransferState::ActiveDirect);
+            assert_eq!(t2.state, TransferState::Active);
+            assert_eq!(t1.carried_attempt, None);
+            assert_eq!(t2.carried_attempt, None);
+        }
+        // Each recipient reporting on its OWN transfer still works, and each
+        // gets the path the SERVER committed for it — never the other's.
+        let outbox = registry
+            .report_progress(&room, recipient, &progress_body(id, attempt, 5))
+            .unwrap();
+        assert_eq!(path_of_progress(&outbox), "direct");
+        let outbox = registry
+            .report_progress(&room, rcpt2, &progress_body(id2, attempt2, 5))
+            .unwrap();
+        assert_eq!(path_of_progress(&outbox), "relay");
+        assert_eq!(
+            (registry.direct_carried(), registry.relay_carried()),
+            (1, 1)
+        );
+    }
+
+    /// 4.4 — receiving a file publishes nothing. The catalogue after a
+    /// completed transfer is the catalogue before it: one offer, owned by
+    /// the source. A recipient that seeded what it just downloaded would
+    /// turn one click into a second source nobody chose to be.
+    #[tokio::test]
+    async fn downloaded_file_does_not_create_offer_or_seed() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, mut source_rx, _rrx, id, attempt) =
+            active_direct_fixture(&registry, &room).await;
+        let before: Vec<(String, PeerId)> = {
+            let state = room.state.lock().unwrap();
+            let mut rows: Vec<_> = state
+                .offers
+                .iter()
+                .map(|(offer, record)| (offer.to_string(), record.owner))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            rows
+        };
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].1, source);
+
+        let _ = registry
+            .report_progress(&room, recipient, &progress_body(id, attempt, 17))
+            .unwrap();
+        let root = room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .unwrap()
+            .entry_root
+            .expect("a raw transfer carries the manifest root");
+        let outbox = registry
+            .complete_transfer(&room, recipient, id, attempt, root)
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let (typ, _) = recv_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.completed");
+
+        // Same catalogue, same owner, and nothing owned by the recipient.
+        let after: Vec<(String, PeerId)> = {
+            let state = room.state.lock().unwrap();
+            let mut rows: Vec<_> = state
+                .offers
+                .iter()
+                .map(|(offer, record)| (offer.to_string(), record.owner))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            rows
+        };
+        assert_eq!(after, before);
+        assert!(
+            after.iter().all(|(_, owner)| *owner != recipient),
+            "the recipient became a source by downloading"
+        );
+        // The room's own snapshot agrees — the peers see what the map holds.
+        let (_revision, peers) = snapshot_parts(&room).unwrap();
+        assert_eq!(peers.len(), 2);
+    }
+
+    /// The `path` a `transfer.progress` notice carries, for the assertions
+    /// above: it is the SERVER's word, so the test reads it off the wire.
+    fn path_of_progress(outbox: &TransferOutbox) -> String {
+        assert_eq!(
+            outbox.len(),
+            1,
+            "progress goes to the source and nowhere else"
+        );
+        let value: serde_json::Value = serde_json::from_str(&outbox[0].1).unwrap();
+        assert_eq!(value["type"], "transfer.progress");
+        value["body"]["path"].as_str().unwrap().to_string()
     }
 }

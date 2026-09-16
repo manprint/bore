@@ -133,6 +133,178 @@ input:focus-visible,
   font-size: 0.875rem;
 }
 
+.transfer-row {
+  border: 1px solid var(--accent);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  margin: 0.5rem 0;
+}
+
+.transfer-row h4 {
+  margin: 0 0 0.25rem;
+}
+
+.transfer-meta,
+.transfer-state {
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+/* The path badge answers the one question this feature exists for: are the
+   bytes going peer to peer, or through the server? It reads `in connessione`
+   until the recipient has VERIFIED a chunk over the committed transport. */
+.transfer-path {
+  display: inline-block;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.transfer-path[data-path="connecting"] {
+  color: #6b7280;
+}
+
+.transfer-path[data-path="direct"] {
+  color: #15803d;
+}
+
+.transfer-path[data-path="relay"] {
+  color: #b45309;
+}
+
+.transfer-progress {
+  width: 100%;
+}
+
+/* State is carried by text as well as colour: colour alone is not a signal. */
+.transfer-state[data-state="failed"] {
+  font-weight: 600;
+}
+
+.transfer-state[data-state="cancelled"] {
+  font-style: italic;
+}
+
+/* Catalog tree: one indent level per directory, sizes right of the name.
+   The disclosure triangle is the native one, so keyboard and screen reader
+   behaviour comes from the engine and not from this file. */
+.offer-tree,
+.tree-children {
+  list-style: none;
+  margin: 0.25rem 0 0;
+  padding-left: 1rem;
+}
+
+.offer-tree {
+  padding-left: 0;
+}
+
+.tree-file,
+.offer-tree summary {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+
+.offer-tree summary {
+  cursor: pointer;
+}
+
+.offer-tree summary:focus-visible {
+  outline: 2px solid #1d4ed8;
+  outline-offset: 2px;
+}
+
+.tree-size {
+  color: #6b7280;
+  font-size: 0.85em;
+}
+
+/* --- 5.6: three stable zones, drag feedback, empty states --------------
+
+   The page is three zones in a fixed order — la mia room, offerte,
+   trasferimenti — and nothing moves between them while a transfer runs. The
+   visual order IS the DOM order, which is what makes the tab order match it
+   without a single `tabindex`. */
+.zone {
+  margin: 1.5rem 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.75rem;
+}
+
+.zone > h2 {
+  margin-top: 0;
+}
+
+.zone section {
+  margin: 0.75rem 0;
+}
+
+/* Drag feedback. The change is a THICKER border and a tinted background,
+   not a hue swap: a target that only changes colour tells a colour-blind
+   user nothing, and a filter/animation would fight prefers-reduced-motion. */
+#dropzone[data-dragging="true"] {
+  border-width: 3px;
+  border-style: solid;
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg));
+  font-weight: 600;
+}
+
+#dropzone[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Empty states are text, in the zone they describe, and they say what to do
+   next rather than only that something is missing. */
+/* The announcement line is seen as well as announced: a message only a
+   screen reader receives is a message the product did not deliver. */
+.app-toast-live {
+  margin: 0 0 1rem;
+  padding: 0.5rem 0.75rem;
+  border-left: 4px solid var(--accent);
+  border-radius: 0.25rem;
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg));
+  font-size: 0.9375rem;
+}
+
+.empty-state {
+  margin: 0.25rem 0;
+  font-size: 0.9375rem;
+  opacity: 0.85;
+}
+
+/* The badge's shape sits before its word. Both carry the answer, so losing
+   colour — print, a screen capture, a colour-blind reader — loses nothing. */
+.path-mark {
+  margin-right: 0.3rem;
+}
+
+/* Dark scheme: the two hardcoded greys above are chosen for a light Canvas
+   and fall under AA on a dark one, so they are restated here rather than
+   left to be read at 2.9:1. */
+@media (prefers-color-scheme: dark) {
+  .tree-size {
+    color: #a1a1aa;
+  }
+
+  .transfer-path[data-path="connecting"] {
+    color: #a1a1aa;
+  }
+
+  .transfer-path[data-path="direct"] {
+    color: #4ade80;
+  }
+
+  .transfer-path[data-path="relay"] {
+    color: #fbbf24;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     transition: none;

@@ -152,6 +152,50 @@ describe("control session", () => {
     session.stop();
   });
 
+  it("a_room_that_stays_gone_stops_reconnecting_and_says_so", async () => {
+    // The server answers a hello for a dead room exactly as it answers a
+    // bad token (4001, existence is never oracled), so the page cannot tell
+    // them apart — and must not spin on "reconnecting" forever either way.
+    const { session, socket, events } = startSession();
+    socket.open();
+    socket.serverText({
+      v: 1,
+      type: "welcome",
+      body: { peerId: "1".repeat(32), roomId: "2".repeat(32) },
+    });
+    socket.serverClose(4001);
+    await sleep(600);
+    assert.equal(instances.length, 2, "the first refusal still heals an idle reap");
+    const retry = instances[1];
+    retry.open();
+    retry.serverClose(4001);
+    await sleep(900);
+    assert.equal(instances.length, 2, "a second refusal must not dial again");
+    assert.deepEqual(events.closes.at(-1), { code: 4001, terminal: true });
+    session.stop();
+  });
+
+  it("a_hello_timeout_is_not_a_refusal", async () => {
+    // The local timeout closes with its own code: two slow answers from a
+    // live server must never be mistaken for a room that is gone.
+    const { session, socket, events } = startSession();
+    socket.open();
+    socket.serverText({
+      v: 1,
+      type: "welcome",
+      body: { peerId: "1".repeat(32), roomId: "2".repeat(32) },
+    });
+    socket.serverClose(4002);
+    await sleep(600);
+    const retry = instances[1];
+    retry.open();
+    retry.serverClose(4002);
+    await sleep(900);
+    assert.ok(instances.length >= 3, "a timed-out hello keeps retrying");
+    assert.equal(events.closes.at(-1).terminal, false);
+    session.stop();
+  });
+
   it("rename_request_id_is_canonical_and_offline_send_fails", () => {
     const { session, socket } = startSession();
     assert.equal(session.rename("Nope"), false);

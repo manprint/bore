@@ -53,6 +53,7 @@ frills attached.
 - [Secret tunnels (no public port)](#secret-tunnels-no-public-port)
   - [Direct UDP path (hole-punching)](#direct-udp-path-hole-punching)
 - [Secure file transfer (`bore transfer`)](#secure-file-transfer-bore-transfer)
+  - [Browser-to-browser transfer (`bore transfer web`)](#browser-to-browser-transfer-bore-transfer-web)
 - [Diagnosing UDP / NAT (`bore test-udp`)](#diagnosing-udp--nat-bore-test-udp)
 - [VPN — point-to-point L3 tunnel (`bore vpn`)](#vpn--point-to-point-l3-tunnel)
 - [Vhost — subdomain reverse proxy (`bore vhost`)](#vhost--subdomain-reverse-proxy)
@@ -218,6 +219,7 @@ to a tag, and it runs the gates FIRST:
 |---|---|
 | CI matrix | `cargo fmt` / `clippy -D warnings` / `cargo test --all-features` on Linux; transfer-path tests on macOS and Windows; VPN cross-checks for windows-msvc, apple-darwin and both Android ABIs; **real device e2e** on `windows-latest` (WinTun adapter, routes, firewall, WinNAT, stale-reclaim) and on `macos-14` (utun, PF); two Android emulator e2e suites; `cargo audit`; `actionlint` over the workflows themselves |
 | Cross-architecture | build **and test** on every target the release ships: 7 Linux targets under `cross` (x86_64/aarch64/armv7/arm/i686, musl + gnueabi), `i686`/`x86_64-pc-windows-msvc`, `aarch64-apple-darwin`; `x86_64-apple-darwin` is cross-built here (the hosted macOS runner is arm64) |
+| Browser slice | the `web-transfer` job: frontend unit tests, a bundle rebuild that must leave `web/transfer/dist` unchanged, the serial Rust web-transfer suite, the full browser e2e on **Chromium, Firefox and WebKit**, the cross-engine pair matrix, a time-budgeted fuzz pass over every wire decoder and the packaging gate. Real Chrome and Edge run in a separate `web-transfer-branded` job, on demand and weekly |
 | netns e2e | the nine root network-namespace correctness suites — admin dashboard, local/proxy, secret, vhost (+ hard), SSH gateway, the `--udp` connection-window regression, VPN (+ hard) — **blocking** for a release, unlike on a branch push |
 
 Only then do the three publishing workflows run, as called workflows: the GHCR images, the
@@ -301,6 +303,7 @@ variable shown in each table — handy for Docker/systemd.
 | `bore sshjhost <TARGET>` | Publish an SSH daemon as a namespaced stock-OpenSSH ProxyJump target | [SSH jump hosts](#ssh-jump-hosts) |
 | `bore server` | Run the relay server (control port, tunnels, vhost, VPN broker, SSH gateway, admin page) | [Self-hosting](#self-hosting) |
 | `bore transfer listener` / `bore transfer sender` | Resumable, BLAKE3-verified file transfer over the tunnel transport | [Secure file transfer](#secure-file-transfer-bore-transfer) |
+| `bore transfer web` | Open a browser-to-browser end-to-end encrypted transfer room and hold it | [Browser-to-browser transfer](#browser-to-browser-transfer-bore-transfer-web) |
 | `bore test-udp` | NAT/UDP diagnostic; two-peer latency/bandwidth test with `--tcp-secret-id` | [Diagnosing UDP/NAT](#diagnosing-udp--nat-bore-test-udp) |
 | `bore vpn listen` / `bore vpn connect` | Point-to-point L3 VPN (`--features vpn`, root/`CAP_NET_ADMIN`) | [VPN](#vpn--point-to-point-l3-tunnel) |
 | `bore hash-password` | Generate an Argon2id hash line for `--ssh-passwords-file` (`--features ssh-gateway`) | [SSH ingress gateway](#ssh-ingress-gateway) |
@@ -897,6 +900,12 @@ network while allowing tunnel connections over a public interface, or vice versa
 The control port defaults to `7835` but is configurable with `--control-port`; clients then
 connect with `--to host:port`.
 
+The control port also serves the browser surface of
+[`bore transfer web`](#browser-to-browser-transfer-bore-transfer-web) when the server is
+started with `--web-transfer-base-url`; no additional port is bound for it. That stays
+true when two browsers transfer **directly**: the WebRTC path runs between them and
+needs outbound UDP from each, never an inbound port on the server.
+
 ### Full server flag reference
 
 ```shell
@@ -987,6 +996,23 @@ SSH ingress gateway (--features ssh-gateway; see "SSH ingress gateway" below):
       --ssh-advertise-port <PORT>             Externally-reachable port, printed in the same banners; placeholder if unset [env: BORE_SSH_ADVERTISE_PORT=]
       --ssh-window-size <BYTES>               Per-channel SSH flow-control window; raise on high-latency links (costs memory per connection) [env: BORE_SSH_WINDOW_SIZE=] [default: 16777216 (16 MiB)]
 
+Browser-to-browser transfer (always available; see "Browser-to-browser transfer" below):
+      --web-transfer-base-url <URL>               Same-origin root enabling the `bore transfer web` browser surface (e.g. https://files.example.com; loopback http for development). Alone it enables the service; every other --web-transfer-* flag without it is rejected rather than silently ignored [env: BORE_WEB_TRANSFER_BASE_URL=]
+      --web-transfer-stun <stun:HOST[:PORT]>      Custom STUN server for browser ICE. Repeatable / comma-separated; replaces the defaults. Conflicts with --web-transfer-no-stun. Never TURN [env: BORE_WEB_TRANSFER_STUN=]
+      --web-transfer-no-stun                      Offer host candidates only (no STUN). Conflicts with --web-transfer-stun [env: BORE_WEB_TRANSFER_NO_STUN=]
+      --web-transfer-max-rooms <N>                Maximum live web-transfer rooms on this server [env: BORE_WEB_TRANSFER_MAX_ROOMS=] [default: 1024]
+      --web-transfer-max-peers <N>                Maximum web-transfer peers summed over all rooms [env: BORE_WEB_TRANSFER_MAX_PEERS=] [default: 4096]
+      --web-transfer-max-peers-per-room <N>       Maximum web-transfer peers in one room [env: BORE_WEB_TRANSFER_MAX_PEERS_PER_ROOM=] [default: 32]
+      --web-transfer-max-offers-per-peer <N>      Maximum offers published by one web-transfer peer [env: BORE_WEB_TRANSFER_MAX_OFFERS_PER_PEER=] [default: 64]
+      --web-transfer-max-entries-per-offer <N>    Maximum manifest entries in one web-transfer offer [env: BORE_WEB_TRANSFER_MAX_ENTRIES_PER_OFFER=] [default: 10000]
+      --web-transfer-max-offer-bytes <N>          Maximum logical bytes in one web-transfer offer [env: BORE_WEB_TRANSFER_MAX_OFFER_BYTES=] [default: 1099511627776 (1 TiB)]
+      --web-transfer-max-metadata-per-room <N>    Maximum control/catalog metadata held for one web-transfer room [env: BORE_WEB_TRANSFER_MAX_METADATA_PER_ROOM=] [default: 16777216 (16 MiB)]
+      --web-transfer-max-metadata-total <N>       Maximum control/catalog metadata held server-wide [env: BORE_WEB_TRANSFER_MAX_METADATA_TOTAL=] [default: 268435456 (256 MiB)]
+      --web-transfer-max-transfers-per-peer <N>   Maximum concurrent web-transfers one peer takes part in [env: BORE_WEB_TRANSFER_MAX_TRANSFERS_PER_PEER=] [default: 8]
+      --web-transfer-max-relays <N>               Maximum live opaque web-transfer relay pairs server-wide [env: BORE_WEB_TRANSFER_MAX_RELAYS=] [default: 256]
+      --web-transfer-relay-rate <N>               Web-transfer relay throttle per room (bytes/s); 0 disables it [env: BORE_WEB_TRANSFER_RELAY_RATE=] [default: 104857600 (100 MiB/s)]
+      --web-transfer-owner-grace <SECS>           Grace after abnormal web-transfer owner loss before the room dies; accepted range 5-600 [env: BORE_WEB_TRANSFER_OWNER_GRACE=] [default: 60]
+
 Access logging (always available):
       --webserver-log <DIR>                   Write access logs in nginx-combined format to <DIR> (off by default) [env: BORE_WEBSERVER_LOG=]
       --webserver-log-max-files <N>            Max rotated log files retained per target [env: BORE_WEBSERVER_LOG_MAX_FILES=] [default: 4]
@@ -1052,6 +1078,22 @@ The Configuration panel — and `GET /admin/api/v1/config` — reports `server_v
 running binary's own build string (`<semver> - <branch> - <sha8>`, exactly what
 `bore --version` prints). Use it to confirm a redeploy actually landed, and to name the
 build in a bug report or a benchmark result, without shell access to the host.
+
+A server started with `--web-transfer-base-url` also gets a **Web Transfer** section in the
+Metrics panel, and the same numbers on `GET /admin/api/v1/metrics`: live rooms, peers,
+offers, catalogue metadata bytes, active transfers, active relay pairs, free relay slots
+(`web_transfer_relay_slots_available` — `0` free is the interesting value, so the panel
+prints it and never hides it behind a "no data" dash) and the counters that only grow —
+relayed ciphertext bytes, transfers committed to the direct path, transfers committed to
+the relay, completed, cancelled and rejected. The configured ceilings sit beside them on
+`GET /admin/api/v1/config` (`web_transfer_enabled`, the base origin, the thirteen limits
+and the number of STUN servers offered — never their addresses' contents beyond a count).
+
+Every one of those numbers is an **aggregate**. The admin surface answers "what did I
+configure?" and "what is happening right now?", and it cannot answer "who is transferring
+what": no room id, no room key, no member token, no peer name, no file name and no SDP is
+exposed there, logged, or held anywhere the API can reach — the server does not have the
+key, and the payload is ciphertext it never stores.
 
 Annotate any tunnel with `--notes "..."` (on `bore local`/`bore proxy`/`bore vhost`, or
 `notes=` via the SSH gateway) to label it on this page.
@@ -2182,6 +2224,385 @@ Notes:
 - `bore transfer listener` also accepts the legacy `--tcp-secret-id` flag as an alias of
   `--transfer-id`.
 
+### Browser-to-browser transfer (`bore transfer web`)
+
+`bore transfer web` opens a **room**: a URL that any number of browsers open to publish
+their own files and download each other's. The command selects no file and moves no
+payload — the browsers do, end to end. The server relays ciphertext it cannot read and
+stores nothing on disk.
+
+> **What this release does.** One browser publishes **a file, a selection of files or
+> a whole folder**, another browser downloads it — a single file as itself, and a
+> folder or a multi-file selection as **one ZIP archive** — and the bytes
+> travel as AES-256-GCM ciphertext — **browser to
+> browser over a WebRTC DataChannel** when the two ends can reach each other, and
+> over an **opaque WebSocket relay** on the bore server when they cannot. One click
+> covers both: every transfer tries the direct path first and falls back to the
+> relay by itself, keeping what is already on disk. The row in the page says which
+> one carried the bytes (`diretto` or `relay`), and it says so only once a chunk has
+> actually been verified over it.
+> Both kinds of download resume after an interruption, and a folder offer can also be
+> opened to download **one file out of it** rather than the whole archive.
+> **Not yet included:** picking an arbitrary *subset* of a folder (several files at
+> once, but not all of them) — that is the next milestone, not a hidden limitation.
+
+#### Who does what
+
+| Party | Does | Never does |
+|---|---|---|
+| `bore transfer web` (the CLI) | Creates the room, prints the link, holds the room alive until it exits | Read, select, send or receive a single byte of your files |
+| The bore server | Registers the room, relays opaque frames between two browsers, enforces the limits | Learn the room key, decrypt anything, write payload to disk |
+| Each browser in the room | Picks files, announces them, downloads someone else's on an explicit click, verifies and saves | Start a download, or resume one, without a click |
+
+Two consequences worth stating plainly, because they surprise people who expect a
+"file-sharing server":
+
+- **"Uploading" a file only announces it.** The bytes stay in the tab that picked it.
+  Nothing is sent until another peer clicks `Scarica` ("Download"), and the publishing tab
+  must stay open for that to work — close it and the offer disappears from the room.
+- **The room is symmetric.** Every browser holding the link can publish *and* download;
+  there is no "sender side" and "receiver side" to set up.
+- **A browser serves only what it published itself.** Downloading a folder does not make
+  you a source for it: what you receive is yours to keep, and it appears in the room again
+  only if you publish it yourself, as a new offer with your name on it. There is no
+  room-wide "download everything" button either — every download control belongs to one
+  offer and one publisher.
+
+#### Server setup
+
+The server must be started with a same-origin root for the browser surface. The surface is
+served by the control port, so no extra port has to be opened:
+
+```bash
+bore server --control-port 7835 --web-transfer-base-url https://files.example.com
+```
+
+`--web-transfer-base-url` alone enables the feature; every other `--web-transfer-*` flag
+without it is rejected rather than silently ignored. On a development box a loopback
+`http://` origin is accepted (`--web-transfer-base-url http://127.0.0.1:7835/`).
+
+| Server flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--web-transfer-base-url <URL>` | `BORE_WEB_TRANSFER_BASE_URL` | *(off)* | Same-origin root; enables the feature |
+| `--web-transfer-stun <stun:HOST[:PORT]>` | `BORE_WEB_TRANSFER_STUN` | public defaults | STUN servers offered to browsers (never TURN) |
+| `--web-transfer-no-stun` | `BORE_WEB_TRANSFER_NO_STUN` | off | Host candidates only |
+| `--web-transfer-max-rooms <N>` | `BORE_WEB_TRANSFER_MAX_ROOMS` | 1024 | Live rooms on this server |
+| `--web-transfer-max-peers <N>` | `BORE_WEB_TRANSFER_MAX_PEERS` | 4096 | Peers summed over all rooms |
+| `--web-transfer-max-peers-per-room <N>` | `BORE_WEB_TRANSFER_MAX_PEERS_PER_ROOM` | 32 | Peers in one room |
+| `--web-transfer-max-offers-per-peer <N>` | `BORE_WEB_TRANSFER_MAX_OFFERS_PER_PEER` | 64 | Offers published by one peer |
+| `--web-transfer-max-entries-per-offer <N>` | `BORE_WEB_TRANSFER_MAX_ENTRIES_PER_OFFER` | 10000 | Manifest entries in one offer |
+| `--web-transfer-max-offer-bytes <N>` | `BORE_WEB_TRANSFER_MAX_OFFER_BYTES` | 1099511627776 (1 TiB) | Logical bytes in one offer |
+| `--web-transfer-max-metadata-per-room <N>` | `BORE_WEB_TRANSFER_MAX_METADATA_PER_ROOM` | 16777216 (16 MiB) | Catalog metadata held for one room |
+| `--web-transfer-max-metadata-total <N>` | `BORE_WEB_TRANSFER_MAX_METADATA_TOTAL` | 268435456 (256 MiB) | Catalog metadata held server-wide |
+| `--web-transfer-max-transfers-per-peer <N>` | `BORE_WEB_TRANSFER_MAX_TRANSFERS_PER_PEER` | 8 | Concurrent transfers one peer takes part in |
+| `--web-transfer-max-relays <N>` | `BORE_WEB_TRANSFER_MAX_RELAYS` | 256 | Live relay pairs server-wide |
+| `--web-transfer-relay-rate <N>` | `BORE_WEB_TRANSFER_RELAY_RATE` | 104857600 (100 MiB/s) | Relay throttle per room in bytes/s |
+| `--web-transfer-owner-grace <SECS>` | `BORE_WEB_TRANSFER_OWNER_GRACE` | 60 | Grace after an abnormal owner loss before the room dies |
+
+**What the server refuses at startup**, rather than accepting and behaving oddly later:
+
+- any `--web-transfer-*` flag without `--web-transfer-base-url`;
+- `--web-transfer-stun` together with `--web-transfer-no-stun` (they contradict);
+- `--web-transfer-owner-grace` outside `5..=600` seconds
+  (`--web-transfer-owner-grace must be 5..=600s`);
+- a base URL whose scheme is neither `https://` nor a loopback `http://`.
+
+`--web-transfer-relay-rate 0` means *unthrottled* — every other value is a per-room
+ceiling in bytes per second. The throttle is per room, so two rooms on one server each get
+their own budget.
+
+**Behind a reverse proxy or a load balancer**, `--web-transfer-base-url` must be the URL
+the *browser* uses, not the internal one, and the proxy must forward WebSocket upgrades on
+that origin. The room link's fragment never reaches the proxy (see below), so no proxy
+configuration can leak it — but a proxy that rewrites the path or the origin breaks the
+same-origin requirement and the page will not load.
+
+#### Opening a room
+
+```bash
+bore transfer web --to https://files.example.com
+room: https://files.example.com/transfer/8f1c…#m=…&k=…
+room active; press Ctrl+C to close
+```
+
+| Client flag | Env | Default | Meaning |
+|---|---|---|---|
+| `-t`, `--to <ADDR>` | `BORE_SERVER` | `https://brp.0912345.xyz` | Server hosting the room |
+| `-s`, `--secret <SECRET>` | `BORE_SECRET` | none | Server authentication secret, when required |
+| `--insecure` | `BORE_INSECURE` | off | Skip TLS verification (self-signed `https://`) |
+| `--open` | — | off | Open the room URL in the default browser, after it is printed |
+
+Exactly two lines go to stdout — the URL, then the ready line — so `bore transfer web | head
+-1` is a valid way to script it. Everything else, including warnings, goes to stderr.
+`--open` never changes that order: the URL is flushed to stdout *before* the browser is
+launched, so a pipe reading stdout is never beaten by the browser.
+
+- **The fragment (`#m=…&k=…`) is the capability.** It holds the room key and the member
+  token, and a URL fragment is never sent to a server: not to bore, not to a proxy, not into
+  a log or the admin API. Share the whole link only with the people who may join, over a
+  channel you trust. Anyone who has it can join the room.
+- **Ctrl+C destroys the room immediately** — the page, the control sockets and any transfer
+  in flight. So do `SIGTERM` (`docker stop`, systemd) and `SIGHUP` (the shell that started
+  it going away). A second signal forces the process out without waiting.
+- **A network drop is not a closed room.** The owner reconnects with backoff and keeps the
+  same URL for up to `--web-transfer-owner-grace` seconds; it never prints a second URL and
+  never silently creates a replacement room. Past the grace the room and its transfers are
+  gone.
+- **A page whose room is gone says so.** While the owner is away the tab reconnects with
+  backoff; once the room is really gone the tab stops and reports the room unavailable,
+  instead of showing "reconnecting" about something that can never come back. Open the link
+  again only after the owner has started a new room — the old URL is dead.
+- **An offer the room did not sign never appears.** Every file announcement carries a tag
+  computed from the room key, which only the browsers in the room hold — not the server.
+  A browser drops an announcement whose tag does not verify, says so, and never requests a
+  byte for it.
+- A server without `--web-transfer-base-url`, or one too old to know the command, fails with
+  `web transfer requires an upgraded server configured with --web-transfer-base-url`.
+
+#### In the browser
+
+The page is in Italian; the labels below are quoted verbatim with their meaning.
+
+**What the page looks like.** Three zones, always in this order and always in the same
+place: `La mia room` ("my room" — your name, the peers currently in the room and
+`Copia link room`), `Offerte` ("offers" — the publish controls and the catalog, grouped by
+the peer that published each one) and `Trasferimenti` ("transfers" — one row per transfer
+with its progress, its path and its actions). **Nothing moves while a transfer runs:** a
+row grows in place, so a button you are about to press does not travel out from under the
+pointer. A zone with nothing in it says what would fill it — an empty catalog explains that
+your bytes stay in the tab until somebody asks for them, and an empty transfer list says a
+download only ever starts on a click.
+
+Every control is reachable with the keyboard in the order it is read on the screen, the
+focused control is always outlined, and a running transfer is a real progress bar for a
+screen reader. The path badge carries a **shape as well as a word** — `◌ in connessione`,
+`◆ diretto`, `▲ relay` — so it survives a colour-blind reader, a printout and a
+high-contrast theme, and hovering it explains in one line what that transport means.
+
+1. **Join.** Open the link. `Il tuo nome` ("your name") is the label other peers see — it
+   is local, never authenticated, and can be changed at any time.
+2. **Publish.** `Aggiungi file` ("add file"), `Aggiungi cartella` ("add folder") or drag
+   and drop onto `Trascina qui file o cartelle`. The file is hashed locally and the
+   announcement — name, size, per-chunk digests, all signed with the room key — goes to the
+   room. `Ritira` ("withdraw") removes it again.
+   A folder becomes **one** offer: every peer sees its tree — names, sizes and per-folder
+   counts — read from the signed announcement alone, before anyone asks for a byte.
+   Two browser limits are worth knowing, because they are the browser's and not bore's:
+   an **empty directory** survives only where the engine exposes a directory picker
+   (Chrome and Edge today); through the `webkitdirectory` fallback that Firefox and
+   Safari use, an empty directory is invisible to the page and cannot be announced.
+   Dragging a **folder** likewise needs an engine that hands over directory handles;
+   where it does not, the page says so and points at `Aggiungi cartella` instead of
+   silently publishing nothing.
+   The drop target highlights while something is held over it, so the gesture is
+   answered before it is completed, and a drop that arrives while the room is
+   unavailable is **refused with a message** (`Room non disponibile: non è possibile
+   pubblicare adesso`) rather than quietly ignored. A drop publishes an offer — like
+   every other way of publishing, it sends nothing until somebody asks.
+3. **Download.** Another peer's offer shows exactly one button, and which one it is
+   follows from the offer: a single file shows `Scarica` ("download") and arrives as
+   that file; a folder or a multi-file selection shows `Scarica ZIP` and arrives as one
+   archive named after the offer. One click starts one transfer; nothing starts by
+   itself. The row shows live progress, and `Annulla` ("cancel") stops it from either
+   side.
+
+   A folder offer's tree is also **clickable**: every file in it carries its own
+   `Scarica` button, so one file can be pulled out of a published folder without
+   downloading the whole archive. It arrives as that file, verified chunk by chunk
+   against the same signed manifest, and it resumes independently of the archive —
+   the two partials never mix.
+
+   The archive is built **while it is being sent** — it is never assembled on the
+   publishing side first, so publishing a 40 GiB folder costs the same memory as
+   publishing a 4 MiB one, and the sending browser never writes a temporary copy. It is
+   a stored (uncompressed) ZIP64: the transfer is not slowed down to re-compress data,
+   the format does not change shape at 4 GiB, and empty directories survive wherever the
+   page could see them in the first place (see the picker limit above). The same folder
+   produces byte-identical archives every time, on every supported browser. While a ZIP
+   download runs, its progress bar counts against an estimate — the archive's real size
+   is known only when it ends — so a bar that sits at 100 % for a moment before the
+   file is ready is the estimate being corrected, not a stall.
+4. **Save.** A finished download — a file or an archive — is `Verificato, da salvare`
+   ("verified, to be saved") and
+   nothing has touched your Downloads folder yet. `Salva file verificato` ("save verified
+   file") writes it out; `Scarta` ("discard") throws the staged bytes away.
+
+**Staging, quota and the explicit save.** While a download runs, the bytes are staged in
+the browser's own private storage (OPFS) by a dedicated worker — not in your Downloads
+folder, and not anywhere another site can read. A browser without the worker's fast
+storage API keeps the same behaviour on the page's own thread; nothing about the file,
+the verification or the resume changes. Every 1 MiB chunk is verified against the signed manifest as it
+arrives, and only a fully verified file becomes saveable. Before starting, the page asks
+the browser for a storage estimate and refuses with `Spazio su disco insufficiente` ("not
+enough disk space") when the file cannot fit, instead of failing at 90 %. Two practical
+consequences: a download needs roughly the file's size **twice** at save time (staged copy
+plus the saved copy), and a browser in private/incognito mode usually offers a much smaller
+quota — sometimes none at all.
+
+**Cancel and resume.** Cancelling from either side ends the transfer for both. What was
+already verified is kept, and the offer then shows `Disponibile per ripresa` ("available to
+resume") with a `Riprendi` ("resume") button: the resume re-checks every recorded chunk,
+drops anything truncated or corrupt, and asks the source only for what is missing. Resume
+is **click-only** — reconnecting, reloading the tab or coming back to the room never
+restarts a transfer on its own. Resume state is per browser profile and per room: it
+survives a reload of the same tab, not a different browser or a new room.
+
+A **ZIP download resumes too**, with one difference that follows from what an archive is:
+a generated archive has no per-chunk fingerprint in any manifest, so only a *contiguous*
+prefix of it can be resumed. The page keeps `[0, n)` verified chunks and the publishing
+browser regenerates the archive from the start, re-reading (and re-hashing) the folder so
+the whole-archive check still covers the part you already have, while sending only the
+bytes past `n`. So a resumed ZIP saves network, not disk reads on the publishing side.
+A file pulled out of a folder and the folder's own archive are separate partials and never
+resume into each other.
+
+**If the source changed under a paused download**, the publishing browser's files no longer
+produce the archive the partial belongs to. The page detects it at the end of the attempt,
+says `La sorgente è cambiata: la ripresa non è più valida` ("the source changed: the resume
+is no longer valid"), and **keeps** what is on disk rather than deleting it. Nothing is
+saved, because nothing verified as a whole. A `Riparti da zero` ("start over") button is
+the only thing that discards those bytes and downloads the new content — one explicit
+gesture, never automatic.
+
+**Reloading the tab.** The fragment is consumed once, moved into that tab's
+`sessionStorage` and scrubbed from the address bar — so the room key never sits in the
+browser history. Reloading the *same* tab therefore works; opening
+`https://…/transfer/<id>` in another tab or another browser without the fragment shows
+`Link incompleto` ("incomplete link"). Use the full link again, or `Copia link room`
+("copy room link") from a tab that is already in.
+
+**Browsers.** The room runs on Chrome/Chromium, Firefox and Safari (WebKit); every browser
+test in this repository runs on all three engines. A transfer needs OPFS to stage the
+download — a browser without it can still publish and send, and says so
+(`Download non supportato da questo browser`) instead of failing silently. The engines
+differ in how fast their own storage and crypto are, so the benchmark below reports each
+one separately and never averages them.
+
+**Performance.** The browser path is benchmarked like the rest of bore, not assumed:
+`scripts/perf/web_transfer_bench.sh` measures three arms in the same run — the server's
+relay with no application crypto, the shipped AES-GCM framing and chunk digest on their
+own, and a real browser pair end to end — and prints every raw sample beside the median,
+plus a per-stage breakdown taken inside the page. Method, the current baseline, the
+before/after of every optimisation and what each arm bounds live in
+[`docs/transfer/WEB_TRANSFER_PERF.md`](docs/transfer/WEB_TRANSFER_PERF.md). Rates are
+machine-specific, so that file quotes ratios; the one knob an operator has is
+`--web-transfer-relay-rate`, the per-room relay throttle (100 MiB/s by default) —
+which bounds the relay path only, never a transfer the two browsers carry directly.
+The harness also measures `direct / relay` as a ratio taken in the same repetition,
+and the honest answer so far is that the badge says which path carried the bytes, not
+which one was faster: on two browsers sitting on the same machine the relay is a
+localhost hop and wins, while the direct path exists for the case the relay cannot be
+— two peers far apart, with the server out of the data path entirely.
+
+#### Direct or relay, and what decides it
+
+Every transfer tries the **direct path first** and falls back to the relay by itself.
+There is no flag for it on either side, and the fallback never costs a second click.
+
+- **The default is direct.** When the recipient clicks `Scarica` or `Scarica ZIP`, the two browsers
+  negotiate a WebRTC DataChannel through the room's control socket: the server forwards
+  the offer, the answer and the ICE candidates, and never parses, stores or logs any of
+  them. If the channel opens, the payload never reaches the server at all.
+- **Anything that stops it ends on the relay, on the same click.** A pair that cannot
+  reach each other, a browser with WebRTC disabled by policy, a network that drops UDP,
+  or a channel that dies with the file half sent — each produces exactly one automatic
+  replacement attempt over the encrypted WebSocket relay, on the same transfer. A
+  failure in the middle keeps what the recipient has already **verified** and asks the
+  source only for the rest, so a fallback near the end costs seconds, not the file.
+- **The row says which path carried the bytes** — `diretto` or `relay` — and it says so
+  only once a chunk has been verified over that path. Until then it reads
+  `in connessione`: a path that has carried nothing is not yet a fact about the
+  transfer, and the page never claims one it cannot prove.
+- **Both paths are encrypted identically.** The relay is opaque — the server forwards
+  AES-256-GCM frames it holds no key for — so falling back changes the route, not the
+  guarantee.
+
+**STUN, and why bore hands out no TURN.** The server gives each browser a STUN list so
+the two peers can learn the addresses they are seen at. With neither STUN flag set, that
+list is the server's own STUN responder first — only when `bore server --udp` gives it
+one — followed by the same public chain the rest of bore uses:
+`stun.cloudflare.com:3478`, `stun.l.google.com:19302`, `stun1.l.google.com:19302`.
+`--web-transfer-stun stun:HOST[:PORT]` **replaces** that list (repeatable, or
+comma-separated), and `--web-transfer-no-stun` offers host candidates only — the right
+choice on a closed LAN, or inside a measurement that must not depend on a public
+service, but on the open internet it sends nearly every pair to the relay. The two
+flags contradict each other and the server refuses them together at startup.
+
+**bore never hands out a TURN server, and the page never asks for one.** A TURN server
+is a relay you would have to run, credential and trust — and bore already has a relay:
+its own, on the port the room is already served from, carrying ciphertext it cannot
+read. The pair TURN would rescue is exactly the pair the fallback already serves,
+without a second service and without a second set of credentials.
+
+**Ports and firewalls.** The server needs nothing beyond the control port that already
+serves the room (HTTPS plus the WebSocket upgrade); the direct path binds no port on it.
+What the direct path needs is **outbound UDP from both browsers** — to the STUN servers,
+then to each other. No inbound port has to be opened anywhere: ICE works by both sides
+sending out. A network that blocks outbound UDP, or a pair behind two strict NATs with
+no TURN to bridge them, simply lands on the relay, which is TCP on the port that is
+already open.
+
+**When the direct path is impossible, nothing looks broken.** Same click, same file,
+same hash; only the badge differs — and on the relay `--web-transfer-relay-rate` is what
+bounds the result.
+
+#### A complete run, three browsers
+
+Nothing below needs a second tool: one server, one `bore transfer web`, three browsers.
+
+1. **Open the room.** On the server host, `bore server --control-port 7835
+   --web-transfer-base-url https://files.example.com`; anywhere with network access to it,
+   `bore transfer web --to https://files.example.com`. The command prints the link and
+   holds the room; it never reads a file.
+2. **A joins and publishes a folder.** A opens the link, presses `Aggiungi cartella` (or
+   drops the folder on `Trascina qui file o cartelle`) and picks a directory. The tab
+   hashes it locally and announces it. The catalog now holds **one** offer with A's name
+   on it, and a tree every other browser can expand — names, sizes and counts — without a
+   single byte having moved.
+3. **B joins and downloads the folder.** B opens the same link, expands the offer and
+   presses `Scarica ZIP`. That one click starts one transfer: the row appears under
+   `Trasferimenti`, reads `in connessione` at first and then `diretto` once the first
+   chunk has been verified browser to browser. When it ends, `Salva file verificato`
+   writes the archive out — until then nothing has touched B's Downloads folder.
+4. **C joins from a network that blocks the direct path.** C presses the same button on
+   the same offer. The direct attempt fails, one automatic replacement attempt takes over
+   on the relay without a second click, and C's row reads `relay` — same file, same hash,
+   same archive, only a different route. If C only wants one file out of the folder, the
+   tree's own `Scarica` button next to that file is the shorter path.
+5. **B publishes something of its own.** B presses `Aggiungi file`. Now the catalog holds
+   two offers with two different publishers, and everyone — including A — can download
+   either one. A downloading B's file does not turn A into a source for it.
+6. **Somebody changes their mind.** Either side of a running transfer can press `Annulla`;
+   the other side sees it stop. What was verified stays on disk, the offer shows
+   `Riprendi`, and the transfer resumes on a click and never on its own — not on a reload,
+   not on a reconnect.
+7. **A closes the room.** Ctrl+C on `bore transfer web` (or `SIGTERM` from systemd or
+   `docker stop`) destroys the room at once: every page says `Room non disponibile`,
+   every transfer in flight stops, and the URL is dead. A new run prints a new link.
+
+#### Troubleshooting a room
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `web transfer requires an upgraded server configured with --web-transfer-base-url` | The server has the feature off, or is older than the command | Start the server with `--web-transfer-base-url`, and check `bore --version` on both sides |
+| The room link 404s, or the page loads but never connects | `--web-transfer-base-url` is not the origin the browser actually uses, or a proxy is not forwarding the WebSocket upgrade | Set the base URL to the browser-facing origin; allow `Upgrade: websocket` on that path |
+| `Link incompleto` ("incomplete link") | The URL was opened without its `#…` fragment — usually copied from the address bar of a tab that had already scrubbed it, or pasted into another browser | Share the link the CLI printed, or use `Copia link room` from a tab that is in the room |
+| `Room non disponibile` ("room unavailable") | The `bore transfer web` process exited, or stayed away past `--web-transfer-owner-grace` | Start a new room; the old URL is dead by design. Raise the grace if flaky links are normal for you |
+| `Spazio su disco insufficiente` ("not enough disk space") | The browser's storage estimate cannot hold the staged file | Free space, save/discard old staged downloads, or leave private/incognito mode — its quota is much smaller |
+| `Download non supportato da questo browser` | No OPFS in this browser or context | Use an up-to-date Chrome/Firefox/Safari over HTTPS or loopback; publishing still works without OPFS |
+| `Relay occupato: riprova tra poco` ("relay busy") | `--web-transfer-max-relays` reached server-wide, or the peer already has `--web-transfer-max-transfers-per-peer` transfers | Retry; raise the limit if this is normal load |
+| `Offerta non autentica: ignorata` ("offer not authentic") | An announcement arrived whose tag does not verify against the room key | Expected and correct — the offer is dropped. If it repeats, treat the room link as compromised and open a new room |
+| Every transfer reads `relay`, even between two machines on the same LAN | `--web-transfer-no-stun` is set (host candidates only), or outbound UDP is blocked on one of the two sides | Drop the flag, or point `--web-transfer-stun` at a STUN server both browsers can reach, and allow outbound UDP — the direct path needs it from **both** browsers, and no inbound port from either |
+| A row changed from `diretto` to `relay` while it was running | The DataChannel died mid-transfer; the replacement attempt took over | Nothing to do. The verified chunks were kept and only the rest was re-requested; the saved file is byte-identical either way |
+| A row sits on `in connessione` for a while before showing a path | No chunk has been verified on either path yet — ICE is still trying, or the first chunk is still arriving | Expected. The badge follows verified bytes, not intentions; a direct attempt gives up after 10 s and the relay takes over |
+| A download is slower than the link | The row reads `relay`: the two browsers could not reach each other directly, and the relay is throttled per room | Raise or disable `--web-transfer-relay-rate` (`0` = unthrottled). A direct path needs UDP out of both networks; a strict NAT or firewall on either side forces the relay |
+| `Offerta con più file: scegli un file o scarica lo ZIP` | A raw (single-file) download was asked for an offer that holds more than one file — the card's own button asks for the ZIP, so this normally means the offer changed shape between the render and the click | Reload the catalogue and use `Scarica ZIP`, or open the folder and pick one file |
+| `File modificato alla sorgente` ("file changed at the source") | The file on the publisher's disk changed after it was announced: the bytes no longer match the hashes the offer was signed with | Republish the file; a transfer already running stops rather than saving a mixture of two versions |
+| `Sorgente non raggiungibile` ("source unreachable") | The publishing peer left the room, closed the tab or lost its connection while the transfer was running | Wait for that peer to come back and start the download again — verified chunks are kept, so it resumes rather than restarting |
+| `Offerta cambiata: ripubblica il file` | The offer was replaced by a new announcement for the same ID while a download was being set up | Reload the catalogue and download the current offer |
+| The page loads but behaves like an older build, or the console reports a module error right after a server upgrade | A proxy or CDN is serving `/transfer/assets/…` from its own cache. The bundle is compiled **into the binary**, so it changes with the binary, and the server itself answers every asset with `Cache-Control: no-cache` | Purge that path on the proxy (or stop it overriding `Cache-Control`) and reload; the bytes the server serves always match the running binary |
+| `Versione non supportata: aggiorna la pagina` | An open tab is talking to a server that was replaced by a newer one while the tab stayed open | Reload the page. The room itself is gone with the old process, so the link has to be a new one |
+
 ## Diagnosing UDP / NAT (`bore test-udp`)
 
 Before blaming the tunnel, find out what *your* network allows. `bore test-udp` opens no
@@ -2360,6 +2781,18 @@ port allocation policies) with a pinned per-profile baseline table
 NAT (double masquerade, random-port, UDP-blocked) lives in
 `scripts/udp_nat_netns_test.sh` (run as `sudo -n /abs/path/scripts/udp_nat_netns_test.sh`
 after `cargo build --release`).
+
+**Web-transfer acceptance.** `scripts/web_transfer_e2e.sh` runs the whole browser slice
+without root and without network namespaces — the feature is a server process, a browser
+and loopback, so a harness that needed `sudo` would be gating something the product does
+not do. Four stages, each skippable through `STAGES`: the browser peer's unit tests plus a
+fresh bundle and its drift check, the debug binary built *after* that bundle (the binary
+embeds it at compile time), the Rust web-transfer suite run serially (it binds real ports
+and spawns real servers), and Playwright on chromium, firefox and webkit. Examples:
+`scripts/web_transfer_e2e.sh`, `STAGES=rust scripts/web_transfer_e2e.sh`,
+`ENGINES=chromium scripts/web_transfer_e2e.sh`. One of those browser legs runs the
+server and room commands **copied out of this section**, so a documented command that
+stopped working fails the acceptance run rather than a reader's evening.
 
 **Secret-tunnel resource gate.** `scripts/perf/secret_leak_hunt.sh` runs a server, a
 `bore local --tcp-secret-id` provider and a `bore proxy` consumer inside a *rootless*
@@ -3159,6 +3592,58 @@ sudo bore vpn connect --to bore.example.com --secret S3cret --id s2s \
 See [VPN](#vpn--point-to-point-l3-tunnel) above for host↔host and site↔host topologies, hub
 mode, and NAT'd overlapping subnets.
 
+### 12. Browser-to-browser transfer room over HTTPS
+
+The browser surface is same-origin and rides the control port, so the only new requirement
+is that the control port is the one the browser reaches, over TLS:
+
+```shell
+# On the server (443 needs the capability or root, like the recipes above)
+sudo bore server --secret S3cret \
+  --control-port 443 --bind-domain files.example.com \
+  --cert-file /etc/bore/cert.pem --key-file /etc/bore/key.pem \
+  --web-transfer-base-url https://files.example.com \
+  --web-transfer-relay-rate 52428800
+
+# Anywhere — hold a room and print its link
+bore transfer web --to https://files.example.com --secret S3cret --open
+```
+
+Docker Compose, with the same two values:
+
+```yaml
+services:
+  bore:
+    image: ghcr.io/manprint/bore:latest
+    command: >
+      server --secret ${BORE_SECRET}
+      --control-port 443 --bind-domain files.example.com
+      --cert-file /etc/bore/cert.pem --key-file /etc/bore/key.pem
+      --web-transfer-base-url https://files.example.com
+    ports: ["443:443"]
+    volumes: ["/etc/bore:/etc/bore:ro"]
+    ulimits: { nofile: { soft: 65536, hard: 65536 } }
+```
+
+The service needs **no writable volume and no extra port**: it stores no payload, so the
+only mount above is the read-only certificate directory, and the container runs with a
+read-only root filesystem (`read_only: true`, or `docker run --read-only`) exactly as it
+is tested. The commented `BORE_WEB_TRANSFER_*` block in
+[`docker/docker-compose.server.yml`](docker/docker-compose.server.yml) lists every
+capacity variable with its shipped default; without `BORE_WEB_TRANSFER_BASE_URL` the
+feature stays off and the rest of the server is unaffected.
+
+Nothing above configures the direct path: two browsers that can reach each other use a
+WebRTC DataChannel and the bytes never enter this server, while a pair that cannot falls
+back to the relay bounded by `--web-transfer-relay-rate`. On a closed network with no
+route to a public STUN server, add `--web-transfer-no-stun` so the browsers stop waiting
+for one and use host candidates.
+
+Share the printed link — fragment included — only with the people who may join; `Ctrl+C`
+ends the room. See
+[Browser-to-browser transfer](#browser-to-browser-transfer-bore-transfer-web) for the flags,
+the browser flow and the troubleshooting table.
+
 ## Protocol
 
 There is a _control port_, `7835` by default (configurable with `--control-port`). The
@@ -3190,7 +3675,10 @@ decrypted stream forwarded), a plain HTTP request is redirected to `https://` if
 
 The SSH ingress gateway demuxes the same control port by peeking the ClientHello ALPN
 (`ssh` vs. browser/native-client ALPNs) or, absent ALPN, by a short silence-then-`SSH-`
-timeout — see [SSH ingress gateway](#ssh-ingress-gateway) for the full demux story.
+timeout — see [SSH ingress gateway](#ssh-ingress-gateway) for the full demux story. The
+browser surface of [`bore transfer web`](#browser-to-browser-transfer-bore-transfer-web)
+is on the HTTP side of that same demux, so `--ssh-gateway` and `--web-transfer-base-url`
+run together on one port with no extra configuration.
 
 ## Authentication
 
@@ -3233,6 +3721,7 @@ matching credential label; existing gateway modes remain username-agnostic. See
 | Basic-auth credentials travel in the clear | Tunnel/control not encrypted | Use a TLS server and `--https` on the public tunnel. |
 | Connections refused under load | `--max-conns` reached | Raise `--max-conns` (server and/or provider). |
 | SSH gateway issues | — | See [Troubleshooting the SSH gateway](#troubleshooting-the-ssh-gateway) above. |
+| Browser-to-browser room issues (`Link incompleto`, `Room non disponibile`, quota, relay busy) | — | See [Troubleshooting a room](#troubleshooting-a-room). |
 
 *For NAT/firewall theory, see [`docs/nat/NAT_TRAVERSAL.md`](docs/nat/NAT_TRAVERSAL.md).*
 

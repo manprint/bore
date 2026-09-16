@@ -4,10 +4,11 @@
 // `onmessage` wrapper below only exists inside real workers.
 //
 // Rules (mirrored server-side, which re-checks every one of them):
-// one picker/drop action is one offer; FileList and dropped files only
-// (directory traversal lands in Phase 5); 1 MiB slices read sequentially
-// per file with at most two files hashing concurrently; paths NFC,
-// relative, collision-checked before any publish; WebCrypto only.
+// one picker/drop action is one offer; the selection arrives already walked
+// (see `folders.js`) as files and, for a folder, the EMPTY directories that
+// the file paths cannot imply; 1 MiB slices read sequentially per file with
+// at most two files hashing concurrently; paths NFC, relative,
+// collision-checked before any publish; WebCrypto only.
 import {
   canonicalize,
   manifestValue,
@@ -81,8 +82,12 @@ async function mapPool(items, limit, signal, fn) {
 /**
  * Builds a signed offer manifest from selected files.
  * @param {object} job `{ offerId, kind, label, createdAt, files, roomIdHex, roomKeyHex, limits }`
- * - `files`: `[{ file, relativePath }]`; `file` duck-typed
- *   (`name/size/lastModified/slice/arrayBuffer`), read but never stored.
+ * - `files`: `[{ file, relativePath }]` for a file, or
+ *   `[{ directory: true, relativePath, mtimeSec }]` for an empty directory;
+ *   `file` duck-typed (`name/size/lastModified/slice/arrayBuffer`), read but
+ *   never stored. A directory entry is hashed not at all: size 0, no chunks
+ *   and a null root, which is the shape the server accepts only for a
+ *   `folder` offer.
  * - `limits`: `{ maxEntriesPerOffer, maxOfferBytes }` (checked before
  *   hashing and again after serialization).
  * - `signal`: AbortSignal; `onProgress({ offerId, doneBytes, totalBytes })`.
@@ -108,10 +113,17 @@ export async function prepareOffer({
     throw new Error("offer exceeds the per-offer entry cap");
   }
   // Validate and sort paths before any hashing; collisions fail here.
-  const pending = files.map(({ file, relativePath }) => {
-    const path = typeof relativePath === "string" ? relativePath : workerEntryRelativePath(file);
+  const pending = files.map(({ file, relativePath, directory = false, mtimeSec = 0 }) => {
+    const path =
+      typeof relativePath === "string" ? relativePath : workerEntryRelativePath(file);
     validateManifestPath(path);
-    return { file, path };
+    if (directory === true) {
+      if (file !== undefined && file !== null) {
+        throw new Error("a directory entry carries no file");
+      }
+      return { file: null, path, directory: true, mtimeSec };
+    }
+    return { file, path, directory: false, mtimeSec: 0 };
   });
   pending.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   {
@@ -125,15 +137,21 @@ export async function prepareOffer({
     }
   }
   let totalBytes = 0n;
-  for (const { file } of pending) {
-    totalBytes += BigInt(file.size);
+  for (const { file, directory } of pending) {
+    totalBytes += directory ? 0n : BigInt(file.size);
   }
   if (totalBytes > BigInt(limits.maxOfferBytes)) {
     throw new Error("offer exceeds the per-offer byte cap");
   }
   const totalNumber = Number(totalBytes);
   let doneBytes = 0;
-  const hashed = await mapPool(pending, WORKER_MAX_CONCURRENT_FILES, signal, async ({ file, path }) => {
+  const hashed = await mapPool(pending, WORKER_MAX_CONCURRENT_FILES, signal, async (entry) => {
+    const { file, path, directory, mtimeSec: dirMtime } = entry;
+    if (directory === true) {
+      // Nothing to read and nothing to hash: the entry IS the statement that
+      // this directory exists and holds nothing.
+      return { path, size: 0, mtimeSec: dirMtime, chunkHexes: [], root: null };
+    }
     const size = file.size;
     const mtimeSec = Math.floor(file.lastModified / 1000);
     const chunkHexes = await hashFileChunks(file, size, signal, (bytes) => {
@@ -178,7 +196,14 @@ export async function prepareOffer({
     manifest,
     manifestCanonical: canonical,
     macHex: bytesToHex(mac),
-    observed: hashed.map(({ path, size, mtimeSec }) => ({ path, size, mtimeSec })),
+    // A directory is marked, because a freshness check has nothing to
+    // re-read for one and must not read its absence as a changed file.
+    observed: hashed.map(({ path, size, mtimeSec, root }) => ({
+      path,
+      size,
+      mtimeSec,
+      directory: root === null,
+    })),
   };
 }
 

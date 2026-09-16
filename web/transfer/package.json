@@ -2,7 +2,7 @@
   "name": "bore-web-transfer",
   "version": "1.0.0",
   "private": true,
-    "description": "Browser peer for bore transfer web rooms (Phase 2 room client: control session, peer/catalog UI).",
+  "description": "Browser peer for bore transfer web rooms (Phase 2 room client: control session, peer/catalog UI).",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -11,7 +11,10 @@
     "build": "node esbuild.mjs",
     "check": "node --test \"tests/unit/**/*.test.mjs\" && npm run build",
     "test:unit": "node --test \"tests/unit/**/*.test.mjs\"",
-    "test:e2e": "playwright test --project=chromium --project=firefox --project=webkit"
+    "test:e2e": "playwright test --project=chromium --project=firefox --project=webkit",
+    "test:e2e:branded": "playwright test --project=branded-chrome --project=branded-edge",
+    "test:perf": "playwright test --config=playwright.perf.config.mjs --project=chromium",
+    "perf:crypto": "node tests/perf/crypto-bench.mjs"
   },
   "dependencies": {
     "@zip.js/zip.js": "2.15.0"

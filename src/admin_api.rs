@@ -836,6 +836,14 @@ pub fn metrics(server: &Server) -> MetricsView {
         }
     };
 
+    // The browser surface publishes gauges and totals only when it is
+    // enabled: `None` means "no service", which is a different statement from
+    // a zero and must stay distinguishable from it (P-11).
+    let web = server.web_transfer();
+    let web_gauge = |read: fn(&crate::web_transfer::WebTransferRegistry) -> u64| -> Option<u64> {
+        web.as_ref().map(|registry| read(registry))
+    };
+
     MetricsView {
         uptime_secs: server.uptime_secs(),
         mem_rss_bytes,
@@ -859,6 +867,19 @@ pub fn metrics(server: &Server) -> MetricsView {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        web_transfer_rooms_current: web_gauge(|r| r.current_rooms()),
+        web_transfer_peers_current: web_gauge(|r| r.current_peers()),
+        web_transfer_offers_current: web_gauge(|r| r.current_offers()),
+        web_transfer_metadata_bytes_current: web_gauge(|r| r.current_metadata_bytes()),
+        web_transfer_transfers_active: web_gauge(|r| r.current_transfers()),
+        web_transfer_relays_active: web_gauge(|r| r.current_relays()),
+        web_transfer_relay_slots_available: web_gauge(|r| r.relay_slots_available()),
+        web_transfer_relay_ciphertext_bytes_total: web_gauge(|r| r.relay_ciphertext_bytes()),
+        web_transfer_direct_commits_total: web_gauge(|r| r.direct_carried()),
+        web_transfer_relay_commits_total: web_gauge(|r| r.relay_carried()),
+        web_transfer_completed_total: web_gauge(|r| r.completed_total()),
+        web_transfer_cancelled_total: web_gauge(|r| r.cancelled_total()),
+        web_transfer_rejected_total: web_gauge(|r| r.rejected_total()),
         ssh_tunnels,
         transport_bore,
         transport_ssh,
@@ -1547,6 +1568,19 @@ reservations:
             rate_tx_bps: 0,
             rate_rx_bps: 0,
             ts: 0,
+            web_transfer_rooms_current: None,
+            web_transfer_peers_current: None,
+            web_transfer_offers_current: None,
+            web_transfer_metadata_bytes_current: None,
+            web_transfer_transfers_active: None,
+            web_transfer_relays_active: None,
+            web_transfer_relay_slots_available: None,
+            web_transfer_relay_ciphertext_bytes_total: None,
+            web_transfer_direct_commits_total: None,
+            web_transfer_relay_commits_total: None,
+            web_transfer_completed_total: None,
+            web_transfer_cancelled_total: None,
+            web_transfer_rejected_total: None,
             ssh_tunnels: 0,
             transport_bore: 0,
             transport_ssh: 0,
@@ -1706,6 +1740,19 @@ reservations:
             udp_direct_slots: None,
             web_transfer_enabled: false,
             web_transfer_base_origin: None,
+            web_transfer_max_rooms: None,
+            web_transfer_max_peers: None,
+            web_transfer_max_peers_per_room: None,
+            web_transfer_max_offers_per_peer: None,
+            web_transfer_max_entries_per_offer: None,
+            web_transfer_max_offer_bytes: None,
+            web_transfer_max_metadata_per_room: None,
+            web_transfer_max_metadata_total: None,
+            web_transfer_max_transfers_per_peer: None,
+            web_transfer_max_relays: None,
+            web_transfer_relay_rate_bytes_per_second: None,
+            web_transfer_owner_grace_seconds: None,
+            web_transfer_stun_count: None,
             bind_domain: None,
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]
@@ -1804,6 +1851,19 @@ reservations:
             udp_direct_slots: None,
             web_transfer_enabled: false,
             web_transfer_base_origin: None,
+            web_transfer_max_rooms: None,
+            web_transfer_max_peers: None,
+            web_transfer_max_peers_per_room: None,
+            web_transfer_max_offers_per_peer: None,
+            web_transfer_max_entries_per_offer: None,
+            web_transfer_max_offer_bytes: None,
+            web_transfer_max_metadata_per_room: None,
+            web_transfer_max_metadata_total: None,
+            web_transfer_max_transfers_per_peer: None,
+            web_transfer_max_relays: None,
+            web_transfer_relay_rate_bytes_per_second: None,
+            web_transfer_owner_grace_seconds: None,
+            web_transfer_stun_count: None,
             bind_domain: Some("bore.example.com".into()),
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]

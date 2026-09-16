@@ -9,6 +9,12 @@ on:
   # it. A release gate that duplicated these jobs would drift from them, and the
   # drift would only ever be discovered by shipping something CI had not run.
   workflow_call:
+  # The branded-channel smoke below is opt-in: Chrome and Edge are not on
+  # every runner image, and a job that quietly skips them is worse than one
+  # that never ran.
+  workflow_dispatch:
+  schedule:
+    - cron: "37 4 * * 1"
 
 jobs:
   test:
@@ -64,6 +70,128 @@ jobs:
         run: |
           cargo test --all-features --test transfer_stdin_cli_test transfer_stdin_reserved_windows_output_name_over_relay_cli
           cargo test --all-features --test transfer_stdin_cli_test transfer_stdin_invalid_windows_char_output_name_over_relay_cli
+
+  web-transfer:
+    name: Web transfer (browser slice)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/transfer/package-lock.json
+
+      - name: Install browser peer dependencies
+        working-directory: web/transfer
+        run: npm ci
+
+      # Unit tests, a fresh bundle and the drift check in one command: the
+      # binary embeds `web/transfer/dist` at compile time, so a stale bundle
+      # would make every browser test below exercise yesterday's app.
+      - name: Unit tests, bundle and drift check
+        working-directory: web/transfer
+        run: npm run check
+
+      - name: Fail on an uncommitted bundle
+        run: git diff --exit-code -- web/transfer/dist
+
+      # Built AFTER the bundle, for the same reason.
+      - name: Build the server and the e2e room owner
+        run: cargo build --all-features --bin bore --example web_transfer_e2e_owner
+
+      # Serial: these tests bind real ports and spawn real server processes,
+      # and a parallel run fabricates failures out of the contention.
+      - name: Rust web-transfer suite (serial)
+        run: cargo test --all-features --test web_transfer_test -- --test-threads=1
+
+      - name: Install Playwright browsers
+        working-directory: web/transfer
+        run: npx playwright install --with-deps chromium firefox webkit
+
+      # All three engines: a compatibility claim proved on one engine is not
+      # a compatibility claim. Performance is NOT gated here — a shared
+      # runner cannot produce a number worth comparing.
+      - name: Browser e2e (chromium, firefox, webkit)
+        working-directory: web/transfer
+        run: npx playwright test --project=chromium --project=firefox --project=webkit --reporter=line
+
+      # The pairs nobody else runs: every other spec puts the same engine on
+      # both sides, and a transfer is a NEGOTIATION between two of them.
+      # Driven by one project because the spec names its own engines.
+      - name: Cross-engine pair matrix (T-WEB-CROSS)
+        working-directory: web/transfer
+        run: npx playwright test cross.spec.mjs --project=chromium --reporter=line
+
+      # Budgeted, seeded, and printed: a crash found here reproduces exactly
+      # with BORE_WEB_FUZZ_SEED. Ten seconds per decoder in CI; the plan's
+      # 60 s run is the same test with a bigger budget.
+      - name: Decoder fuzzing (CI budget)
+        env:
+          BORE_WEB_FUZZ_SECS: 10
+        run: cargo test --all-features --test web_transfer_fuzz -- --nocapture
+
+      # The claim `cargo install bore-cli` needs no Node is about the PACKED
+      # crate, not about this checkout.
+      - name: Crate artifact serves the shell (T-WEB-PACKAGE)
+        run: bash scripts/web_transfer_package_test.sh
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: web-transfer-playwright
+          path: web/transfer/test-results
+          retention-days: 7
+
+  web-transfer-branded:
+    name: Web transfer (branded Chrome/Edge smoke)
+    # Only on a manual run or the weekly schedule: on a push it would either
+    # double the matrix or report a skip that reads like a pass.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/transfer/package-lock.json
+
+      - name: Install browser peer dependencies
+        working-directory: web/transfer
+        run: npm ci
+
+      - name: Bundle and build the server
+        run: |
+          npm run build --prefix web/transfer
+          cargo build --all-features --bin bore --example web_transfer_e2e_owner
+
+      # `install chrome msedge` fails loudly when a channel cannot be
+      # installed on this image, which is the report we want — not a skip.
+      - name: Install branded channels
+        working-directory: web/transfer
+        run: npx playwright install --with-deps chrome msedge
+
+      - name: Branded smoke (T-WEB-BRANDED)
+        working-directory: web/transfer
+        run: npm run test:e2e:branded
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: web-transfer-branded
+          path: web/transfer/test-results
+          retention-days: 7
 
   vpn-cross-build:
     name: VPN cross check (${{ matrix.target }})

@@ -1,0 +1,43 @@
+{
+  "_comment": [
+    "The exact web-transfer keys the admin surface publishes (plan 001, 6.2).",
+    "It is a FIXTURE and not a list in a test on purpose: adding a field to",
+    "ConfigView or MetricsView without deciding what the dashboard does with",
+    "it shows up here as a diff, which is the moment to decide. `config` keys",
+    "are CONFIGURED totals and never move under load (P-11); `metrics` keys",
+    "are live gauges and cumulative totals, published as a number when the",
+    "feature runs and as null when it does not."
+  ],
+  "config": [
+    "web_transfer_enabled",
+    "web_transfer_base_origin",
+    "web_transfer_max_rooms",
+    "web_transfer_max_peers",
+    "web_transfer_max_peers_per_room",
+    "web_transfer_max_offers_per_peer",
+    "web_transfer_max_entries_per_offer",
+    "web_transfer_max_offer_bytes",
+    "web_transfer_max_metadata_per_room",
+    "web_transfer_max_metadata_total",
+    "web_transfer_max_transfers_per_peer",
+    "web_transfer_max_relays",
+    "web_transfer_relay_rate_bytes_per_second",
+    "web_transfer_owner_grace_seconds",
+    "web_transfer_stun_count"
+  ],
+  "metrics": [
+    "web_transfer_rooms_current",
+    "web_transfer_peers_current",
+    "web_transfer_offers_current",
+    "web_transfer_metadata_bytes_current",
+    "web_transfer_transfers_active",
+    "web_transfer_relays_active",
+    "web_transfer_relay_slots_available",
+    "web_transfer_relay_ciphertext_bytes_total",
+    "web_transfer_direct_commits_total",
+    "web_transfer_relay_commits_total",
+    "web_transfer_completed_total",
+    "web_transfer_cancelled_total",
+    "web_transfer_rejected_total"
+  ]
+}

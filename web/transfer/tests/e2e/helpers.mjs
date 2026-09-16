@@ -4,12 +4,26 @@
 // `cargo test --all-features` / `cargo build --all-features`.
 import { spawn } from "node:child_process";
 import net from "node:net";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { chromium, firefox, webkit } from "@playwright/test";
+import { disableWebRtc, forceIceRelayOnly, installTestHooks } from "./fixtures.js";
+
+/** Persistent-profile launchers by Playwright project browser name. */
+const PERSISTENT_ENGINES = { chromium, firefox, webkit };
 
 export const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
-export const boreBin = join(root, "target", "debug", "bore");
-export const ownerBin = join(root, "target", "debug", "examples", "web_transfer_e2e_owner");
+// The binaries under test. `debug` by default, because that is what a
+// developer has just built; `BORE_E2E_BIN` / `BORE_E2E_OWNER_BIN` point the
+// whole suite at the RELEASE build instead, which is what the deployment
+// gates run — the acceptance claim is about the artefact that ships, and a
+// debug binary is not it.
+export const boreBin = process.env.BORE_E2E_BIN ?? join(root, "target", "debug", "bore");
+export const ownerBin =
+  process.env.BORE_E2E_OWNER_BIN ??
+  join(root, "target", "debug", "examples", "web_transfer_e2e_owner");
 
 export function freePort() {
   return new Promise((resolve, reject) => {
@@ -43,17 +57,71 @@ export async function waitPort(target, retries = 100) {
 /**
  * Starts a server plus one lease-holding owner. Returns
  * `{ port, roomUrl, roomId, memberToken, roomKey, cleanup }`.
+ *
+ * `relayRate` (bytes/s) throttles the room's relay, which is what makes a
+ * mid-transfer cancel observable without a huge file: the pace is the
+ * server's, so the leg does not depend on how fast this machine is.
  */
-export async function spawnRoomEnv() {
+/**
+ * A room that ALREADY exists, created by something outside this process.
+ *
+ * `spawnRoomEnv` starts its own server, which is the right default for every
+ * ordinary spec. The deployment gates are different: the server under test is
+ * a container, or a release binary behind a proxy, and the point is precisely
+ * that this process did not build it. The room URL then arrives through
+ * `BORE_WEB_E2E_ROOM_URL` and the caller owns the server's life.
+ *
+ * Returns `null` when the variable is unset, so a spec can skip rather than
+ * invent a server and quietly test something else.
+ */
+export function externalRoomEnv() {
+  const roomUrl = process.env.BORE_WEB_E2E_ROOM_URL;
+  if (!roomUrl) {
+    return null;
+  }
+  const url = new URL(roomUrl);
+  return {
+    roomUrl,
+    port: Number(url.port),
+    roomId: url.pathname.split("/").pop(),
+    cleanup: () => {},
+  };
+}
+
+export async function spawnRoomEnv({ relayRate, ownerGrace, noStun = false } = {}) {
   const port = await freePort();
   const server = spawn(
     boreBin,
-    ["server", "--control-port", String(port), "--web-transfer-base-url", `http://127.0.0.1:${port}/`],
+    [
+      "server",
+      "--control-port",
+      String(port),
+      "--web-transfer-base-url",
+      `http://127.0.0.1:${port}/`,
+      ...(relayRate === undefined
+        ? []
+        : ["--web-transfer-relay-rate", String(relayRate)]),
+      // The security suite needs the room to die WHILE a relay is running;
+      // with the shipped 60 s grace that case cannot be observed at all.
+      ...(ownerGrace === undefined
+        ? []
+        : ["--web-transfer-owner-grace", String(ownerGrace)]),
+      // Host candidates only. On a loopback pair a reflexive address buys
+      // nothing, and the public STUN chain is a real network dependency
+      // inside a measurement: the benchmark asks for it explicitly.
+      ...(noStun ? ["--web-transfer-no-stun"] : []),
+    ],
     { stdio: ["ignore", "pipe", "pipe"] },
   );
   server.on("error", (error) => {
     throw new Error(`cannot spawn ${boreBin}: ${error.message} (run cargo build --all-features first)`);
   });
+  if (process.env.BORE_E2E_LOG) {
+    // Opt-in: the server's own view of a run, for diagnosing a failure the
+    // page cannot see. Off by default so a green run stays quiet.
+    server.stderr.on("data", (chunk) => process.stderr.write(`[server] ${chunk}`));
+    server.stdout.on("data", (chunk) => process.stderr.write(`[server] ${chunk}`));
+  }
   await waitPort(port);
   // Freshness: the server embeds dist at compile time; a stale binary
   // serves a shell with no room logic and every test times out.
@@ -96,6 +164,9 @@ export async function spawnRoomEnv() {
     roomId,
     memberToken,
     roomKey,
+    // Kills ONLY the lease holder: the server keeps running, so the room's
+    // own expiry is what the test observes.
+    killOwner: () => owner.kill("SIGKILL"),
     cleanup: () => {
       owner.kill("SIGKILL");
       server.kill("SIGKILL");
@@ -123,4 +194,74 @@ export function canonicalize(value) {
     return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalize(value[k])}`).join(",")}}`;
   }
   throw new Error("no canonical form");
+}
+
+/**
+ * A peer running in a browser context with a real on-disk profile.
+ *
+ * OPFS needs one. In Playwright's default (ephemeral) WebKit context
+ * `navigator.storage.getDirectory` exists as a function and then rejects with
+ * `UnknownError`, so a download leg run there reports the whole feature as
+ * unsupported instead of exercising it; with a persistent profile the same
+ * call succeeds on all three engines (V002-F02). Every engine gets the same
+ * treatment so the legs stay identical.
+ *
+ * @param {string} url room URL
+ * @param {object} options `{ browserName, channel, init }` — `init` is an
+ * init script evaluated before the app boots
+ * @returns `{ context, page, failures, cleanup }`
+ */
+export async function openPersistentPeer(
+  url,
+  { browserName, channel, init, noWebRtc = false, iceRelayOnly = false } = {},
+) {
+  const engine = PERSISTENT_ENGINES[browserName];
+  if (engine === undefined) {
+    throw new Error(`no persistent launcher for browser ${browserName}`);
+  }
+  const profile = mkdtempSync(join(tmpdir(), "bore-profile-"));
+  const context = await engine.launchPersistentContext(profile, {
+    acceptDownloads: true,
+    ...(channel === undefined ? {} : { channel }),
+  });
+  await installTestHooks(context);
+  if (noWebRtc) {
+    await disableWebRtc(context);
+  }
+  if (iceRelayOnly) {
+    await forceIceRelayOnly(context);
+  }
+  if (init) {
+    await context.addInitScript(init);
+  }
+  const page = context.pages()[0] ?? (await context.newPage());
+  const failures = [];
+  page.on("pageerror", (error) => failures.push(`pageerror: ${error.message}`));
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      failures.push(`console: ${message.text()}`);
+    }
+  });
+  await page.goto(url);
+  return {
+    context,
+    page,
+    failures,
+    cleanup: async () => {
+      await context.close().catch(() => {});
+      rmSync(profile, { recursive: true, force: true });
+    },
+  };
+}
+
+/** True when this context can really open OPFS (not merely expose it). */
+export async function opfsWorks(page) {
+  return page.evaluate(() =>
+    navigator.storage?.getDirectory === undefined
+      ? false
+      : navigator.storage.getDirectory().then(
+          () => true,
+          () => false,
+        ),
+  );
 }

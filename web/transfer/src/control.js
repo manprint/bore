@@ -13,6 +13,15 @@ export const HELLO_TIMEOUT_MS = 10_000;
 export const PING_INTERVAL_MS = 20_000;
 export const RECONNECT_MIN_MS = 250;
 export const RECONNECT_MAX_MS = 5_000;
+/// Close code this client uses for its OWN hello timeout. Distinct from the
+/// server's 4001 on purpose: a slow server must never be counted as a
+/// refusal (see `AUTH_REFUSALS_BEFORE_TERMINAL`).
+export const HELLO_TIMEOUT_CLOSE = 4002;
+/// Consecutive server refusals of a hello that once succeeded before the
+/// session gives up. One retry heals an idle reap; a second refusal means
+/// the room (or the token) is gone, and retrying it forever leaves the page
+/// saying "reconnecting" about something that can never come back.
+export const AUTH_REFUSALS_BEFORE_TERMINAL = 2;
 
 /// Backoff for attempt `n` (0-based): 250 ms doubling to the 5 s ceiling.
 export function reconnectDelayMs(attempt) {
@@ -37,6 +46,7 @@ export function createControlSession({ url, memberToken, displayName, events }) 
   let reconnectTimer = null;
   let helloAcked = false;
   let everAcked = false;
+  let authRefusals = 0;
   let stopped = false;
   let requestSeq = 0;
 
@@ -63,9 +73,16 @@ export function createControlSession({ url, memberToken, displayName, events }) 
       const hook = globalThis.__BORE_TEST__;
       if (hook && Array.isArray(hook.outboundTypes)) {
         try {
-          const kind = JSON.parse(text).type;
+          const parsed = JSON.parse(text);
+          const kind = parsed.type;
           if (typeof kind === "string") {
             hook.outboundTypes.push(kind);
+          }
+          // 3.5: the resume descriptor a request carried (or `null`), so an
+          // e2e can tell a fresh download from a resumed one. Ranges only —
+          // no filename, no token, no key.
+          if (kind === "transfer.request" && Array.isArray(hook.resumeRequests)) {
+            hook.resumeRequests.push(parsed.body?.resume?.verifiedRanges ?? null);
           }
         } catch {
           /* unparseable outbound: still send it */
@@ -119,7 +136,7 @@ export function createControlSession({ url, memberToken, displayName, events }) 
     socket = next;
     helloTimer = setTimeout(() => {
       try {
-        socket?.close(4001);
+        socket?.close(HELLO_TIMEOUT_CLOSE);
       } catch {
         /* already gone */
       }
@@ -143,6 +160,7 @@ export function createControlSession({ url, memberToken, displayName, events }) 
           helloTimer = null;
         }
         attempt = 0;
+        authRefusals = 0;
         armPing();
         events.onHelloAck?.();
       }
@@ -152,13 +170,21 @@ export function createControlSession({ url, memberToken, displayName, events }) 
       clearTimers();
       socket = null;
       helloAcked = false;
-      // Terminal codes never reconnect — except a 4001 on a session the
-      // server already acked (idle reaped): a fresh hello heals that, while
-      // retrying a refused hello would hammer forever.
+      // Terminal codes never reconnect — except the FIRST 4001 on a session
+      // the server already acked (idle reaped): a fresh hello heals that.
+      // The room's own death is also a 4001 (existence is never oracled), so
+      // the healing retry is bounded: a second consecutive refusal is the
+      // answer, not a reason to keep dialling.
+      if (event.code === 4001) {
+        authRefusals += 1;
+      } else {
+        authRefusals = 0;
+      }
       const terminal =
         event.code === 4004 ||
         event.code === 4010 ||
-        (event.code === 4001 && !everAcked);
+        (event.code === 4001 &&
+          (!everAcked || authRefusals >= AUTH_REFUSALS_BEFORE_TERMINAL));
       if (terminal) {
         events.onClose?.(event.code, true);
         return;

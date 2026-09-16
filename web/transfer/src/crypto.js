@@ -113,6 +113,27 @@ export const FRAME_MAGIC = 0x42575431;
 export const FRAME_MAX_PLAINTEXT = 24 * 1024;
 export const FRAME_MAX_BODY = 32 * 1024;
 export const FRAME_HEADER_LEN = 16;
+/** FINAL plaintext of a RAW transfer: `u64be(total)`. */
+export const FINAL_RAW_BYTES = 8;
+/**
+ * FINAL plaintext of an ARCHIVE transfer:
+ * `u64be(total) || u64be(chunkCount) || root[32]`.
+ *
+ * An archive is GENERATED, so none of those three is in the manifest and
+ * none of them can be checked against it: this frame is where the recipient
+ * learns what it should have received, and the AEAD over it is what makes
+ * that claim the source's own. Which of the two lengths is expected follows
+ * from the transfer's mode, so the two shapes are never ambiguous.
+ */
+export const FINAL_ARCHIVE_BYTES = 8 + 8 + 32;
+
+/** The FINAL plaintext lengths this protocol defines: raw, then archive. */
+function isFinalLength(length) {
+  return length === FINAL_RAW_BYTES || length === FINAL_ARCHIVE_BYTES;
+}
+
+const FINAL_LENGTH_ERROR =
+  "FINAL plaintext must be u64be(total) (8 bytes) or the archive tuple (48 bytes)";
 
 function frameHeader(ftype, seq, bodyLen) {
   const header = new Uint8Array(FRAME_HEADER_LEN);
@@ -130,13 +151,49 @@ async function importAesKey(key) {
   return getSubtle().importKey("raw", key, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
 
+/// Imports raw attempt-key bytes as a non-extractable AES-GCM key. The
+/// sender keeps an encrypt-only handle and drops the raw bytes, so the key
+/// never leaves WebCrypto; references are abandoned on abort/done.
+export async function importAttemptAesKey(keyBytes, usages = ["encrypt"]) {
+  if (!(keyBytes instanceof Uint8Array) || keyBytes.length !== 32) {
+    throw new Error("attempt key must be 32 bytes");
+  }
+  return getSubtle().importKey("raw", keyBytes, "AES-GCM", false, usages);
+}
+
+/// Seals one frame with an already-imported (possibly non-extractable) key.
+/// Byte-identical to `sealFrame` for the same inputs.
+export async function sealFrameWithKey(aesKey, seq, ftype, plaintext) {
+  if (ftype === 1 && (plaintext.length === 0 || plaintext.length > FRAME_MAX_PLAINTEXT)) {
+    throw new Error("DATA plaintext must be 1..=24576 bytes");
+  }
+  if (ftype === 2 && !isFinalLength(plaintext.length)) {
+    throw new Error(FINAL_LENGTH_ERROR);
+  }
+  if (ftype !== 1 && ftype !== 2) {
+    throw new Error(`unknown frame type ${ftype}`);
+  }
+  const header = frameHeader(ftype, seq, plaintext.length + 16);
+  const body = new Uint8Array(
+    await getSubtle().encrypt(
+      { name: "AES-GCM", iv: frameNonce(seq), additionalData: header },
+      aesKey,
+      plaintext,
+    ),
+  );
+  const out = new Uint8Array(FRAME_HEADER_LEN + body.length);
+  out.set(header, 0);
+  out.set(body, FRAME_HEADER_LEN);
+  return out;
+}
+
 // Frame types: 1 = DATA (1..=24576 plaintext bytes), 2 = FINAL (u64be total).
 export async function sealFrame(key, seq, ftype, plaintext) {
   if (ftype === 1 && (plaintext.length === 0 || plaintext.length > FRAME_MAX_PLAINTEXT)) {
     throw new Error("DATA plaintext must be 1..=24576 bytes");
   }
-  if (ftype === 2 && plaintext.length !== 8) {
-    throw new Error("FINAL plaintext must be u64be(total), 8 bytes");
+  if (ftype === 2 && !isFinalLength(plaintext.length)) {
+    throw new Error(FINAL_LENGTH_ERROR);
   }
   if (ftype !== 1 && ftype !== 2) {
     throw new Error(`unknown frame type ${ftype}`);
@@ -160,11 +217,25 @@ export async function sealFrame(key, seq, ftype, plaintext) {
 }
 
 export async function openFrame(key, msg, minSeq) {
+  return openWithKey(await importAesKey(key), msg, minSeq);
+}
+
+/// Opens one frame with an already-imported (possibly non-extractable) key.
+/// Byte-identical verdicts to `openFrame` for the same inputs.
+export async function openFrameWithKey(aesKey, msg, minSeq) {
+  return openWithKey(aesKey, msg, minSeq);
+}
+
+async function openWithKey(aes, msg, minSeq) {
   if (msg.length < FRAME_HEADER_LEN + 16) {
     throw new Error("frame shorter than header plus tag");
   }
-  const header = msg.slice(0, FRAME_HEADER_LEN);
-  const body = msg.slice(FRAME_HEADER_LEN);
+  // Views, not copies (V-14b in the browser): `slice` allocated the whole
+  // frame a second and a third time on every message — ~1400 messages per
+  // 32 MiB — and WebCrypto takes a BufferSource, so the header can be the
+  // AAD and the body the ciphertext exactly where they already are.
+  const header = msg.subarray(0, FRAME_HEADER_LEN);
+  const body = msg.subarray(FRAME_HEADER_LEN);
   const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
   if (view.getUint32(0, false) !== FRAME_MAGIC) {
     throw new Error("bad frame magic");
@@ -190,7 +261,6 @@ export async function openFrame(key, msg, minSeq) {
   if (seq < minSeq) {
     throw new Error("frame sequence is stale");
   }
-  const aes = await importAesKey(key);
   let plaintext;
   try {
     plaintext = new Uint8Array(
@@ -206,8 +276,8 @@ export async function openFrame(key, msg, minSeq) {
   if (ftype === 1 && (plaintext.length === 0 || plaintext.length > FRAME_MAX_PLAINTEXT)) {
     throw new Error("DATA plaintext must be 1..=24576 bytes");
   }
-  if (ftype === 2 && plaintext.length !== 8) {
-    throw new Error("FINAL plaintext must be u64be(total), 8 bytes");
+  if (ftype === 2 && !isFinalLength(plaintext.length)) {
+    throw new Error(FINAL_LENGTH_ERROR);
   }
   return { ftype, seq, plaintext };
 }

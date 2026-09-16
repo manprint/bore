@@ -356,6 +356,44 @@ fn log_ssh_gateway_outcome(result: Result<(), russh::Error>, addr: SocketAddr) {
     }
 }
 
+/// The CONFIGURED web-transfer totals published on `/admin/api/v1/config`.
+///
+/// They live beside the registry rather than only inside a `ConfigView`
+/// because `main.rs` builds and installs its view AFTER enabling the service:
+/// holding them here is what lets `set_config_view` refill them, so the order
+/// of the two calls cannot change what an operator reads.
+#[derive(Clone)]
+struct WebTransferConfigView {
+    /// Same-origin root browsers reach (`--web-transfer-base-url`).
+    origin: String,
+    /// Validated caps, immutable for the life of the process.
+    limits: crate::web_transfer::WebTransferLimits,
+    /// How many STUN servers are brokered — never which ones.
+    stun_count: u64,
+}
+
+impl WebTransferConfigView {
+    /// Writes the enabled bit and every configured total into `view`.
+    fn apply(&self, view: &mut crate::admin_views::ConfigView) {
+        view.web_transfer_enabled = true;
+        view.web_transfer_base_origin = Some(self.origin.clone());
+        let limits = &self.limits;
+        view.web_transfer_max_rooms = Some(limits.max_rooms);
+        view.web_transfer_max_peers = Some(limits.max_peers_global);
+        view.web_transfer_max_peers_per_room = Some(limits.max_peers_per_room);
+        view.web_transfer_max_offers_per_peer = Some(limits.max_offers_per_peer);
+        view.web_transfer_max_entries_per_offer = Some(limits.max_entries_per_offer);
+        view.web_transfer_max_offer_bytes = Some(limits.max_offer_bytes);
+        view.web_transfer_max_metadata_per_room = Some(limits.max_metadata_per_room_bytes);
+        view.web_transfer_max_metadata_total = Some(limits.max_metadata_total_bytes);
+        view.web_transfer_max_transfers_per_peer = Some(limits.max_transfers_per_peer);
+        view.web_transfer_max_relays = Some(limits.max_relays_global);
+        view.web_transfer_relay_rate_bytes_per_second = Some(limits.relay_rate_bytes_per_s);
+        view.web_transfer_owner_grace_seconds = Some(limits.owner_grace_secs);
+        view.web_transfer_stun_count = Some(self.stun_count);
+    }
+}
+
 /// State structure for the server.
 pub struct Server {
     /// Range of TCP ports that can be forwarded.
@@ -473,6 +511,12 @@ pub struct Server {
     /// Exactly one shared registry per enabled server, built once from the
     /// validated `--web-transfer-*` flags before the first listener binds.
     web_transfer: Option<Arc<crate::web_transfer::WebTransferRegistry>>,
+
+    /// The CONFIGURED web-transfer totals, kept beside the registry so any
+    /// config view installed later can be refilled from them (see
+    /// `set_config_view`). `None` when the service is disabled, which is what
+    /// makes a disabled server publish `null` and never a zero.
+    web_transfer_view: Option<WebTransferConfigView>,
 
     /// Registry of live public-tunnel UDP direct paths, keyed by `port:{N}`.
     #[cfg(feature = "udp")]
@@ -638,6 +682,7 @@ impl Server {
             pending_vhost_udp: vhost::PendingVhostUdp::default(),
             vhost_config_path: None,
             web_transfer: None,
+            web_transfer_view: None,
             #[cfg(feature = "udp")]
             public_udp_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "udp")]
@@ -695,6 +740,19 @@ impl Server {
                 direct_quic_idle_ms: None,
                 udp_direct_slots: None,
                 web_transfer_enabled: false,
+                web_transfer_max_rooms: None,
+                web_transfer_max_peers: None,
+                web_transfer_max_peers_per_room: None,
+                web_transfer_max_offers_per_peer: None,
+                web_transfer_max_entries_per_offer: None,
+                web_transfer_max_offer_bytes: None,
+                web_transfer_max_metadata_per_room: None,
+                web_transfer_max_metadata_total: None,
+                web_transfer_max_transfers_per_peer: None,
+                web_transfer_max_relays: None,
+                web_transfer_relay_rate_bytes_per_second: None,
+                web_transfer_owner_grace_seconds: None,
+                web_transfer_stun_count: None,
                 web_transfer_base_origin: None,
                 bind_domain: None,
                 control_hsts: "max-age=31536000".into(),
@@ -853,20 +911,30 @@ impl Server {
     }
 
     /// Enable the web-transfer service from an already-validated config.
-    /// Builds exactly one shared room registry; publishes only the enabled
-    /// bit and the base origin on the admin config view (full totals/gauges
-    /// arrive in Phase 6, never conflated per P-11).
+    /// Builds exactly one shared room registry and records the CONFIGURED
+    /// totals the admin config view publishes (live gauges are metrics and
+    /// are never conflated with them, P-11).
     pub fn set_web_transfer(
         &mut self,
         config: crate::web_transfer::WebTransferConfig,
     ) -> anyhow::Result<()> {
         let origin = config.base_url.origin().to_string();
+        let limits = config.limits;
+        // A COUNT, never the list: the admin view has no reason to publish
+        // which STUN servers a deployment brokers to browsers.
+        let stun_count = config.ice.servers.len() as u64;
         let registry = crate::web_transfer::WebTransferRegistry::new(config)
             .map_err(|e| anyhow::anyhow!("invalid web-transfer config: {e}"))?;
         self.web_transfer = Some(Arc::new(registry));
-        let view = Arc::make_mut(&mut self.config_view);
-        view.web_transfer_enabled = true;
-        view.web_transfer_base_origin = Some(origin);
+        self.web_transfer_view = Some(WebTransferConfigView {
+            origin,
+            limits,
+            stun_count,
+        });
+        let totals = self.web_transfer_view.clone();
+        if let Some(totals) = totals {
+            totals.apply(Arc::make_mut(&mut self.config_view));
+        }
         Ok(())
     }
 
@@ -913,9 +981,24 @@ impl Server {
         self.admin_token = token;
     }
 
-    /// Update the server configuration view (called from main.rs after construction).
+    /// Update the server configuration view (called from main.rs after
+    /// construction).
+    ///
+    /// The web-transfer totals are RE-APPLIED from the enabled service, so the
+    /// order of `set_web_transfer` and this call cannot matter. It mattered:
+    /// `main.rs` enables the service first and installs its own view later,
+    /// so a view built from the CLI values — which do not know the resolved
+    /// limits — silently replaced every total with `null` and the enabled bit
+    /// with `false`. Every Rust test passed because a test builds its
+    /// `Server` directly and never installs a second view, so a real server
+    /// reported "web transfer is off" while serving it. Do not "simplify"
+    /// this back to a plain assignment.
     pub fn set_config_view(&mut self, view: crate::admin_views::ConfigView) {
         self.config_view = Arc::new(view);
+        let totals = self.web_transfer_view.clone();
+        if let Some(totals) = totals {
+            totals.apply(Arc::make_mut(&mut self.config_view));
+        }
     }
 
     /// Retrieve the server configuration view.
@@ -3633,5 +3716,63 @@ mod web_transfer_config_tests {
             view["web_transfer_base_origin"],
             "https://files.example.com"
         );
+    }
+
+    /// A config view installed AFTER the service was enabled must not erase
+    /// what the service published.
+    ///
+    /// This is the real shape of `main.rs`: it enables web transfer while the
+    /// resolved config is in hand, then builds its own `ConfigView` from the
+    /// CLI values — which do not know the resolved limits — and installs it.
+    /// Before the fix that second install replaced the enabled bit with
+    /// `false` and every total with `null`, so a real server reported "web
+    /// transfer is off" on `/admin/api/v1/config` while serving the rooms,
+    /// and no Rust test saw it: a test builds its `Server` directly and never
+    /// installs a second view. Found by the `T-WEBUI-E2E` group in
+    /// `scripts/admin_dashboard_test.sh`, which reads a REAL server.
+    #[test]
+    fn a_config_view_installed_later_keeps_the_web_transfer_totals() {
+        let mut server = Server::new(1024..=65535, None);
+        let args = crate::web_transfer::WebTransferServerArgs {
+            base_url: Some("https://files.example.com".to_string()),
+            max_rooms: 5,
+            max_relays_global: 2,
+            ..crate::web_transfer::WebTransferServerArgs::default()
+        };
+        let config = crate::web_transfer::resolve_server_config(&args, false, 7835)
+            .unwrap()
+            .unwrap();
+        server.set_web_transfer(config).unwrap();
+
+        // The view main.rs builds: every web-transfer field at its default,
+        // because the CLI literal cannot know the resolved values.
+        let mut later = (*server.config_view()).clone();
+        later.web_transfer_enabled = false;
+        later.web_transfer_base_origin = None;
+        later.web_transfer_max_rooms = None;
+        later.web_transfer_max_relays = None;
+        later.web_transfer_stun_count = None;
+        server.set_config_view(later);
+
+        let view = serde_json::to_value(server.config_view().as_ref()).unwrap();
+        assert_eq!(view["web_transfer_enabled"], true);
+        assert_eq!(
+            view["web_transfer_base_origin"],
+            "https://files.example.com"
+        );
+        assert_eq!(view["web_transfer_max_rooms"], 5);
+        assert_eq!(view["web_transfer_max_relays"], 2);
+        assert!(
+            view["web_transfer_stun_count"].is_u64(),
+            "the STUN count came back as {}",
+            view["web_transfer_stun_count"]
+        );
+        // ... and a DISABLED server is still untouched by the same path.
+        let mut plain = Server::new(1024..=65535, None);
+        let plain_view = (*plain.config_view()).clone();
+        plain.set_config_view(plain_view);
+        let view = serde_json::to_value(plain.config_view().as_ref()).unwrap();
+        assert_eq!(view["web_transfer_enabled"], false);
+        assert!(view["web_transfer_max_rooms"].is_null());
     }
 }

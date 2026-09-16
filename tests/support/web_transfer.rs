@@ -1,6 +1,7 @@
-//! Shared harness for `tests/web_transfer_test.rs`: ephemeral ports, valid
+//! Shared harness for `tests/web_transfer_test.rs`: loopback ports, valid
 //! flag sets and in-process servers with the web-transfer registry enabled.
-//! All tests pick dynamic ports and run serially (`--test-threads=1`).
+//! The dedicated CI job runs this suite with `--test-threads=1`, but the
+//! workspace-wide `cargo test` does NOT — so nothing here may assume it.
 
 use anyhow::Result;
 use bore_cli::{
@@ -11,21 +12,64 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
-/// A reserved loopback port (bind-then-drop; small reuse race, retried by
-/// callers via `wait_port`).
+/// A loopback port this process hands out exactly once, taken from BELOW the
+/// ephemeral range.
+///
+/// The obvious version — bind `:0`, read the port, drop the listener — is a
+/// TOCTOU: the port is free again the instant it is read, and the kernel
+/// hands ephemeral ports back out in a way that makes an immediate reuse
+/// likely. Under `cargo test`'s DEFAULT parallelism (which is what the
+/// `Build, test & lint` job runs, whatever this module's header says about
+/// `--test-threads=1`) two tests were handed the same number: the second
+/// `Server::listen` failed its bind inside a `tokio::spawn` that discards the
+/// error, and the test that believed it owned the port talked to the other
+/// test's server. MEASURED on the ubuntu CI runner as
+/// `Connection refused (os error 111)` from one test and a welcome that never
+/// arrived in another — both reading as product defects. The cursor makes a
+/// collision inside this process impossible, the process id spreads different
+/// test binaries apart, the probe still covers everything else, and the range
+/// keeps the kernel from handing the same number to an ephemeral socket.
 pub async fn free_port() -> Result<u16> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    Ok(listener.local_addr()?.port())
+    use std::sync::atomic::{AtomicU16, Ordering};
+    const BASE: u16 = 21_000;
+    const SPAN: u16 = 9_000;
+    static CURSOR: AtomicU16 = AtomicU16::new(0);
+    let start = (std::process::id() as u16) % SPAN;
+    for _ in 0..SPAN {
+        let step = CURSOR.fetch_add(1, Ordering::Relaxed);
+        let port = BASE + start.wrapping_add(step) % SPAN;
+        if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            drop(listener);
+            return Ok(port);
+        }
+    }
+    anyhow::bail!("no free loopback port in {BASE}..{}", BASE + SPAN)
 }
 
-/// Waits until `port` accepts (or stops accepting) on 127.0.0.1.
+/// Waits until `port` accepts (or stops accepting) on 127.0.0.1, and PANICS
+/// rather than answer wrongly.
+///
+/// Returning quietly on timeout is what turned a server that never bound into
+/// a `Connection refused` at the caller's next line, which reads as a defect
+/// in the product; a harness that cannot establish its own precondition has
+/// to say so, in its own words.
 pub async fn wait_port(port: u16, listening: bool) {
-    for _ in 0..500 {
+    let budget = Duration::from_secs(20);
+    let started = std::time::Instant::now();
+    while started.elapsed() < budget {
         if TcpStream::connect(("127.0.0.1", port)).await.is_ok() == listening {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    panic!(
+        "port {port} never {} within {budget:?}",
+        if listening {
+            "started accepting"
+        } else {
+            "stopped accepting"
+        }
+    );
 }
 
 /// Flag set enabling the service on loopback HTTP with exact defaults.

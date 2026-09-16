@@ -296,13 +296,32 @@ async fn t_web_native_wire() -> Result<()> {
     Ok(())
 }
 
+/// Keeps only the SERVER's own line, and drops everything else the process
+/// happens to print.
+///
+/// These buffers exist to answer "what did the server log?", and the capture
+/// is process-wide: at `TRACE` the `log` bridge puts the test's OWN WebSocket
+/// client in there, and `tungstenite::protocol` prints
+/// `Sending frame: ... payload: b"..."` — the bytes the test just sent. Read
+/// as the server's log, that is an accusation of a payload leak the product
+/// does not have. MEASURED under `cargo test`'s default parallelism, where
+/// the order of the tests decides whether the bridge is at `TRACE` when this
+/// capture is installed: `LEAKLINE [relayed payload] ... TRACE
+/// tungstenite::protocol: Sending frame: ... frame-CANARY-PAYLOAD-numbat`.
+/// The claim is about the server, so the evidence has to be the server's.
+fn is_server_line(buf: &[u8]) -> bool {
+    String::from_utf8_lossy(buf).contains(" bore_cli")
+}
+
 /// Captured tracing output for the log-privacy assertion.
 #[derive(Clone)]
 struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl std::io::Write for LogSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        if is_server_line(buf) {
+            self.0.lock().unwrap().extend_from_slice(buf);
+        }
         Ok(buf.len())
     }
 
@@ -1309,7 +1328,9 @@ struct CatalogLogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl std::io::Write for CatalogLogSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        if is_server_line(buf) {
+            self.0.lock().unwrap().extend_from_slice(buf);
+        }
         Ok(buf.len())
     }
 
@@ -2997,6 +3018,7 @@ async fn t_web_limits() -> Result<()> {
 
     // --- L4: the control bucket refuses a flood, and only the flooder -------
     let mut limited = None;
+    let flood_started = std::time::Instant::now();
     for _ in 0..200u32 {
         victim
             .send_text(r#"{"v":1,"type":"ping","body":{}}"#.to_string())
@@ -3028,9 +3050,24 @@ async fn t_web_limits() -> Result<()> {
     // The burst must meet the bucket AND be answered: before 3.7 the reply
     // could not leave, because the queue's only drainer was the same task
     // that was reading the burst.
-    assert_eq!(
-        pongs, 60,
-        "the control burst is 60 (closed={closed}); a different count means the bucket moved"
+    //
+    // A token bucket REFILLS while the burst is being served, so an exact
+    // count measures how fast this machine drains 200 messages, not where the
+    // bucket is. The floor is the burst itself — it must have been full — and
+    // the ceiling is everything the configured rate can have added in the time
+    // the exchange actually took. MEASURED on macos-14: 63 against a
+    // hardcoded 60, i.e. one tenth of a second of refill. Both bounds come
+    // from the server's own constants, so a bucket that really moves still
+    // fails in either direction.
+    let flood_elapsed = flood_started.elapsed();
+    let burst = bore_cli::web_transfer::WEB_TRANSFER_CONTROL_BURST as u32;
+    let refilled = (bore_cli::web_transfer::WEB_TRANSFER_CONTROL_RATE_PER_SEC
+        * flood_elapsed.as_secs_f64())
+    .ceil() as u32;
+    assert!(
+        pongs >= burst && pongs <= burst + refilled,
+        "the control burst is {burst} plus at most {refilled} refilled in {flood_elapsed:?} \
+         (closed={closed}); {pongs} answered, so the bucket moved"
     );
     assert!(
         limited.is_some(),

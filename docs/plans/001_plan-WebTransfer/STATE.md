@@ -147,6 +147,13 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 68 | bug | B-A007 | agent-1:Claude-Opus-5 | il budget dell'RTT di controllo era un valore assoluto, cioe' una proprieta' della macchina (V-9): ora e' un terzo della durata del relay, con pavimento all'RTT a vuoto della stessa socket e a un secondo | tests/web_transfer_test.rs | suite su Linux e macOS | uncommitted |
 | 69 | bug | B-A008 | agent-1:Claude-Opus-5 | il refill del soak buttava via i peer gia' ammessi a ogni ritentativo e competeva con il proprio rilascio: ora e' monotono, che e' anche la lettura piu' severa | tests/web_transfer_test.rs | suite `--test web_transfer_test -- --test-threads=1` | uncommitted |
 
+| 70 | bug | B-A009 | agent-1:Claude-Opus-5 | un token bucket si ricarica mentre il burst viene servito: il conteggio esatto misurava la macchina, non il bucket. Pavimento e soffitto derivano ora dalle costanti del server | tests/web_transfer_test.rs | `cargo test --test web_transfer_test t_web_limits` verde | uncommitted |
+
+| 71 | bug | B-A010 | agent-1:Claude-Opus-5 | `free_port` era un TOCTOU e `wait_port` mentiva alla scadenza: sotto il parallelismo di default due test condividevano una porta e il secondo server falliva il bind dentro uno `spawn` che scarta l'errore | tests/support/web_transfer.rs | suite senza `--test-threads=1`, verde ripetutamente | uncommitted |
+| 72 | bug | B-A011 | agent-1:Claude-Opus-5 | il gate di privacy leggeva il log dell'INTERO processo e lo chiamava log del server: a `TRACE` il ponte `log` ci portava dentro il dump dei frame di `tungstenite`, cioe' i byte spediti dal test stesso | tests/web_transfer_test.rs | suite in parallelo, tre esecuzioni verdi | uncommitted |
+| 73 | bug | B-A012 | agent-1:Claude-Opus-5 | i due tentativi di `T-WEB-PATH-UI` erano decorativi: l'attesa di `relay` era una `expect` dura dentro il ciclo, quindi il primo tentativo sfortunato abortiva il test | web/transfer/tests/e2e/ui.spec.mjs | `--repeat-each=3` su firefox, piu' firefox+webkit | uncommitted |
+| 74 | bug | B-A013 | agent-1:Claude-Opus-5 | il budget di 300 s di `T-WEB-ZIP-SOURCE-CHANGE` descriveva la workstation, non il prodotto | web/transfer/tests/e2e/zip-resume.spec.mjs | 22 s su webkit in locale; il runner CI e' l'oracolo del caso lento | uncommitted |
+
 ## 5. Files touched
 
 | Path | What was done | Unit |
@@ -498,7 +505,12 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | Cargo.lock | T-A002: rustls 0.23.45 e rustls-webpki 0.103.15, il rimedio di RUSTSEC-2026-0285 | T-A002 |
 | src/web_transfer.rs | B-A002: `WEB_TRANSFER_ERROR_LINGER` + `linger_after_error`, applicato ai sei rami terminali di `serve_owner_first_message`, piu' il gate red-checked | B-A002 |
 | web/transfer/package.json | B-A003: `check` e `test:unit` fanno espandere il glob alla shell, cosi' la versione di Node non decide piu' se i test girano | B-A003 |
+| tests/web_transfer_test.rs | B-A009: il tetto del burst di controllo e' ora pavimento (il burst configurato) piu' quanto il rate configurato puo' aver ricaricato nel tempo misurato, invece del numero 60 | B-A009 |
 | tests/web_transfer_test.rs | B-A004..B-A008: `proc_fs_available`/`kib_or_na`, i rami `N/A` di RSS/descrittori/limiti, l'aggancio `BROWSER` solo dove esiste, l'attesa dell'esito al posto dei 400 ms, il budget di controllo come rapporto e il refill monotono del soak | B-A004..B-A008 |
+
+| tests/support/web_transfer.rs | B-A010: `free_port` da un cursore atomico sotto l'intervallo effimero, spostato dal pid; `wait_port` con budget di 20 s e `panic!` alla scadenza | B-A010 |
+| web/transfer/tests/e2e/ui.spec.mjs | B-A012: attesa morbida dentro il ciclo a due tentativi, con l'esito di ognuno nel messaggio di fallimento | B-A012 |
+| web/transfer/tests/e2e/zip-resume.spec.mjs | B-A013: budget del test portato a 600 s con la ragione accanto | B-A013 |
 
 ## 6. In-flight work
 

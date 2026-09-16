@@ -570,3 +570,42 @@ budget che restava è diventato un rapporto o una costante DERIVATA da quella
 che il server pubblica (la scadenza del soak segue ora
 `WEB_TRANSFER_CTRL_SEND_TIMEOUT`, che è il vero limite superiore al ritorno di
 un permesso).
+
+## Esito — secondo giro di CI su `dev` (`111a98c`, 2026-09-16)
+
+Quattro workflow su cinque verdi: `E2E (netns)`, `Docker (GHCR)`,
+`Mean Bean Deploy` e — per la prima volta — nessun fallimento di `Security
+audit`, `macOS VPN build` o `Windows`. Restano rosse `CI` e `Mean Bean CI`, e
+il giro ha insegnato la cosa più utile di tutte: **aggiustare B-A003 ha fatto
+GIRARE la slice browser**, che ha subito riportato 145 passati e 2 falliti. Un
+job che non era mai partito non stava dando alcuna garanzia; ora ne dà una.
+
+Cinque difetti nuovi, tutti nell'harness, e tre di essi della stessa famiglia
+dei precedenti:
+
+- **B-A009**: il conteggio esatto del burst di controllo. Un token bucket si
+  ricarica mentre il burst viene servito, quindi `60` misurava quanto in fretta
+  la macchina drena 200 messaggi. Pavimento e soffitto vengono ora dalle
+  costanti del server.
+- **B-A010**, il più serio: `free_port()` faceva bind su `:0` e rilasciava. Il
+  job `Build, test & lint` gira l'intero workspace con il parallelismo di
+  DEFAULT, quindi due test ricevevano la stessa porta, il secondo
+  `Server::listen` falliva il bind dentro uno `spawn` che scarta l'errore, e il
+  test che si credeva padrone della porta parlava con il server di un altro.
+  `wait_port` completava l'inganno tornando in silenzio dopo cinque secondi.
+  Ora le porte vengono da un cursore atomico sotto l'intervallo effimero e
+  `wait_port` fa `panic!` con porta e direzione.
+- **B-A011**, il più istruttivo: `t_web_log_privacy` accusava il prodotto di
+  aver stampato il payload. La riga era di `tungstenite::protocol`, cioè del
+  client WebSocket DEL TEST, catturata perché il buffer prendeva tutto il
+  processo e il ponte `log` era a `TRACE`. Un gate di privacy che legge il log
+  di chiunque non sta misurando il server.
+- **B-A012**: i due tentativi di `T-WEB-PATH-UI` erano decorativi, perché
+  l'attesa che può legittimamente fallire era una `expect` dura dentro il
+  ciclo.
+- **B-A013**: 300 s di budget per un test che su due core ne vuole di più.
+
+Il filo conduttore dei due giri, in una riga: **ogni numero assoluto in un
+gate è un'ipotesi sulla macchina.** Di tredici difetti trovati dalla CI, uno
+solo era nel prodotto (B-A002); gli altri erano un harness che descriveva la
+workstation su cui era stato scritto, o che leggeva più di quanto affermasse.

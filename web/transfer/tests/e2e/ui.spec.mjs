@@ -310,6 +310,7 @@ test.describe.serial("ui", () => {
     // say whether the scenario happened instead of the assertion guessing.
     // Two attempts; a direct leg that never comes up twice is a real finding.
     let trail = null;
+    const attempts = [];
     for (let attempt = 1; attempt <= 2 && trail === null; attempt += 1) {
       const falling = await openPeer({ init: killChannelAfter(2 * CHUNK_BYTES) });
       await expectConnected(falling.page);
@@ -323,11 +324,22 @@ test.describe.serial("ui", () => {
       // reached long before the last byte: waiting for the file to finish
       // would re-prove a recovery `T-WEB-DIRECT-FALLBACK` already owns, and
       // that tail is what stalled this gate once under full-suite load.
-      await expect(falling.page.locator(".transfer-path")).toHaveAttribute(
-        "data-path",
-        "relay",
-        { timeout: 240_000 },
-      );
+      // A SOFT wait, not an assertion: an assertion here aborts the loop on
+      // the first attempt, which makes the two attempts above decorative. The
+      // whole reason there are two is that what this gate needs — a direct
+      // leg that comes up, carries a verified chunk and then dies — is a
+      // preference of the product and not a guarantee (§8.55). On the ubuntu
+      // CI runner, two cores serving three engines, attempt 1 spent the whole
+      // budget at `connecting` and took the gate down with it while attempt 2
+      // was never allowed to run.
+      const reached = await falling.page
+        .waitForFunction(
+          () => document.querySelector(".transfer-path")?.dataset.path === "relay",
+          null,
+          { timeout: 240_000 },
+        )
+        .then(() => true)
+        .catch(() => false);
       const seen = await pathTrail(falling.page);
       const killed = await falling.page.evaluate(
         () => window.__BORE_TEST__.killedAt ?? null,
@@ -335,8 +347,9 @@ test.describe.serial("ui", () => {
       // True of EVERY attempt, direct or not: the badge never opens on a
       // transport it has not verified.
       expect(seen[0]).toBe("connecting");
-      expect(seen.at(-1)).toBe("relay");
-      if (killed !== null) {
+      attempts.push({ attempt, reached, killed, seen });
+      if (reached && killed !== null) {
+        expect(seen.at(-1)).toBe("relay");
         trail = seen;
       }
       // Leave nothing running behind: the transfer is cancelled, not finished.
@@ -351,7 +364,10 @@ test.describe.serial("ui", () => {
       }
       await falling.cleanup();
     }
-    expect(trail, "the direct leg never carried a verified chunk in two attempts").not.toBeNull();
+    expect(
+      trail,
+      `no attempt showed a direct leg that carried a verified chunk and then fell back: ${JSON.stringify(attempts)}`,
+    ).not.toBeNull();
     // The kill only fires once the badge has NAMED the direct leg, so the
     // trail must carry it.
     expect(trail).toContain("direct");

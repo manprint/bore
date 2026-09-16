@@ -263,7 +263,11 @@ test.describe.serial("zip-resume", () => {
   });
 
   test("T-WEB-ZIP-SOURCE-CHANGE: a changed source cannot overwrite a verified partial", async () => {
-    test.setTimeout(300_000);
+    // V-9's rule applies to a test budget too: 300 s described the
+    // workstation. On the ubuntu CI runner this one test exceeded it while
+    // the whole WebKit zip-resume file took 5.1 minutes — two cores, three
+    // engines and a full tree published, resumed and re-verified.
+    test.setTimeout(600_000);
     const a = await openPeer(env.roomUrl);
     const b = await openPeer(env.roomUrl);
     await expectConnected(a.page);

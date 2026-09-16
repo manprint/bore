@@ -14,6 +14,7 @@ import {
   openFrame,
   sealFrame,
 } from "../../src/crypto.js";
+import { FRAME_FINAL } from "../../src/framing.js";
 import { canonicalize, manifestValue } from "../../src/protocol.js";
 import { createReceiver } from "../../src/receiver.js";
 import { createSender } from "../../src/sender.js";
@@ -345,6 +346,68 @@ describe("web-transfer attempt coordination", () => {
     assert.equal(dst.receiver.transfers().get(TRANSFER_ID).state, "receiving");
   });
 
+  it("a_channel_closing_after_final_completes_instead_of_failing", async () => {
+    // The counterpart closes the DataChannel in the same turn it writes
+    // FINAL — that is the ORDINARY end of a successful direct transfer, not
+    // a failure. The frames it already handed us are still in the inbox and
+    // still decrypting when the close event fires, so a decision taken on
+    // the spot is taken on a state that has not happened yet.
+    //
+    // Answering immediately cleared `inbox`, which threw away the FINAL of a
+    // transfer whose every byte was already verified on disk. Nothing failed
+    // and nothing completed: the row sat at `100% · transferring` for ever
+    // with the badge walked back to `connecting`, and only a reload and a
+    // resume could finish it. The relay leg has drained before deciding
+    // since it was written (`socket.onclose`); this is that rule on the
+    // direct leg.
+    const bytes = payload(CHUNK);
+    const dst = await sinkHarness(bytes);
+    const key = await keyFor(ATTEMPT_A);
+    const emit = async (frame) => {
+      assert.equal(
+        dst.receiver.deliverDirectFrame(TRANSFER_ID, ATTEMPT_A, frame),
+        true,
+      );
+    };
+    assert.equal(dst.receiver.beginDirect(TRANSFER_ID, ATTEMPT_A), true);
+    dst.receiver.handleControl({
+      type: "transfer.path_commit",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, path: "direct" },
+    });
+    await tick(20);
+    const seq = await feedChunk(emit, key, 0, bytes, 0);
+    await emit(await sealFrame(key, seq, FRAME_FINAL, finalPayload(bytes.length)));
+    // NO tick here: the close is observed while the pipeline is still busy,
+    // which is the whole point. A `tick` would test a race that does not
+    // happen.
+    const ranges = await dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A);
+    assert.equal(
+      ranges,
+      null,
+      "a channel that closed after FINAL has nothing to report: the transfer succeeded",
+    );
+    const live = dst.receiver.transfers().get(TRANSFER_ID);
+    assert.equal(live.state, "complete-pending", "FINAL was processed, not discarded");
+    const complete = dst.control.find((m) => m.type === "transfer.complete");
+    assert.ok(complete, "the recipient asked the server to complete the transfer");
+    assert.deepEqual(
+      dst.events.paths,
+      ["direct"],
+      "the transport that carried the bytes was named once and never withdrawn",
+    );
+    // And the completion really lands: the ack stages the verified file.
+    assert.equal(
+      dst.receiver.handleControl({
+        type: "ack",
+        requestId: complete.requestId,
+        body: { result: { transferId: TRANSFER_ID } },
+      }),
+      true,
+    );
+    await waitFor(() => dst.events.staged.length === 1, "the staged file");
+    assert.deepEqual(dst.events.errors, [], "nothing failed");
+  });
+
   it("old_attempt_frames_callbacks_and_keys_are_ignored", async () => {
     // A DataChannel that dies mid-transfer can still deliver what the
     // browser had already queued. Those frames belong to an attempt that no
@@ -375,7 +438,7 @@ describe("web-transfer attempt coordination", () => {
       "the first chunk to verify",
     );
     // The direct attempt ends; the server mints a relay attempt.
-    assert.deepEqual(dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A), [[0, 1]]);
+    assert.deepEqual(await dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A), [[0, 1]]);
     dst.receiver.handleControl({
       type: "transfer.relay_ticket",
       body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_B, ticket: "ab".repeat(16) },
@@ -425,12 +488,12 @@ describe("web-transfer attempt coordination", () => {
       "the first chunk to verify",
     );
     assert.deepEqual(
-      dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A),
+      await dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A),
       [[0, 1]],
       "whoever notices first is told what is on disk",
     );
     assert.equal(
-      dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A),
+      await dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A),
       null,
       "the other end's notice for the SAME attempt reports nothing",
     );
@@ -442,7 +505,7 @@ describe("web-transfer attempt coordination", () => {
     });
     await tick(20);
     assert.deepEqual(
-      dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_B),
+      await dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_B),
       [[0, 1]],
       "the replacement attempt can be reported in its turn",
     );
@@ -457,7 +520,7 @@ describe("web-transfer attempt coordination", () => {
     const dst = await sinkHarness(bytes);
     assert.equal(dst.receiver.beginDirect(TRANSFER_ID, ATTEMPT_A), true);
     await tick(20);
-    assert.deepEqual(dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A), []);
+    assert.deepEqual(await dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A), []);
     assert.equal(dst.sockets.length, 0, "a dead direct attempt opened no relay by itself");
     dst.receiver.handleControl({
       type: "transfer.relay_ticket",
@@ -521,7 +584,7 @@ describe("web-transfer attempt coordination", () => {
     await deliver(await sealFrame(keyA, seq + 1, 1, bytes.subarray(CHUNK + FRAGMENT, CHUNK + 2 * FRAGMENT)));
     await tick(20);
     assert.deepEqual(
-      dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A),
+      await dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A),
       [[0, 1]],
       "only the complete chunk is forwarded",
     );
@@ -558,7 +621,7 @@ describe("web-transfer attempt coordination", () => {
       () => dst.receiver.transfers().get(TRANSFER_ID).verifiedRanges.length === 1,
       "chunk 0 to verify",
     );
-    dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A);
+    await dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A);
     dst.receiver.handleControl({
       type: "transfer.relay_ticket",
       body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_B, ticket: "ab".repeat(16) },
@@ -615,7 +678,7 @@ describe("web-transfer attempt coordination", () => {
       () => dst.receiver.transfers().get(TRANSFER_ID).verifiedRanges.length === 1,
       "chunk 0 to verify",
     );
-    dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A);
+    await dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A);
     dst.receiver.handleControl({
       type: "transfer.relay_ticket",
       body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_B, ticket: "ab".repeat(16) },
@@ -813,7 +876,7 @@ describe("web-transfer attempt coordination", () => {
       "the direct transfer to complete",
     );
     assert.equal(
-      dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A),
+      await dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A),
       null,
       "a completed transfer reports no failure",
     );
@@ -861,7 +924,7 @@ describe("web-transfer attempt coordination", () => {
     const dst = await sinkHarness(bytes);
     dst.receiver.beginDirect(TRANSFER_ID, ATTEMPT_A);
     await tick(20);
-    dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A);
+    await dst.receiver.directFailed(TRANSFER_ID, ATTEMPT_A);
     dst.receiver.handleControl({
       type: "transfer.relay_ticket",
       body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_B, ticket: "ab".repeat(16) },

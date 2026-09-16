@@ -1466,9 +1466,34 @@ export function createReceiver({
      * (it is verified by construction) and is reported back to the server so
      * the relay attempt skips it; the caller puts these ranges in
      * `transfer.direct_failed`.
-     * @returns the bounded verified ranges, or `null` for an unknown transfer
+     * A channel that closes right after FINAL is the END of a successful
+     * transfer, not a failure — and the frames it already delivered may still
+     * be decrypting when the close event fires. So the decision is taken
+     * ONLY after the processing chain drains. The relay leg has had this
+     * rule since it was written (`socket.onclose`); the direct leg did not,
+     * and answering immediately cleared `inbox` — throwing away the FINAL of
+     * a transfer whose every byte was already verified on disk. The row then
+     * sat at `100% · transferring` for ever, with the badge walked back to
+     * `connecting`, and only a reload and a resume could finish it.
+     *
+     * @returns a promise of the bounded verified ranges, or `null` when
+     * there is nothing to report: an unknown transfer, an attempt already
+     * reported, or a transfer that COMPLETED while we waited for the drain.
      */
-    directFailed(transferId, attemptId) {
+    async directFailed(transferId, attemptId) {
+      const opened = transfers.get(transferId);
+      if (opened === undefined || opened.attemptId !== attemptId) {
+        return null;
+      }
+      // Appended to the chain rather than awaited as a snapshot, so work
+      // queued while we wait is covered too — exactly what the relay leg
+      // does with `known.chain = known.chain.then(...)`.
+      const drained = opened.chain.then(
+        () => {},
+        () => {},
+      );
+      opened.chain = drained;
+      await drained;
       const transfer = transfers.get(transferId);
       if (transfer === undefined || transfer.attemptId !== attemptId) {
         return null;

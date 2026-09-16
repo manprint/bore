@@ -421,10 +421,11 @@ function sendDirectFailed(
  * the last byte is the end of a successful transfer, not a failure, and a
  * notice there would cost a relay attempt nobody needs.
  */
-function failDirect(transferId, attemptId, reason, recipient) {
+async function failDirect(transferId, attemptId, reason, recipient) {
   closeDirect(transferId);
   if (recipient) {
-    const ranges = receiver?.directFailed(transferId, attemptId) ?? null;
+    const ranges =
+      (await (receiver?.directFailed(transferId, attemptId) ?? null)) ?? null;
     if (ranges === null) {
       // The transfer is past this attempt (verified, staged or gone): the
       // channel closing is the END of a successful transfer, not a failure,
@@ -456,27 +457,35 @@ function failDirect(transferId, attemptId, reason, recipient) {
  * takes nothing from it but the ranges, so reporting is free and silence is
  * the only way to lose them.
  */
-function abandonDirect(body) {
+async function abandonDirect(body) {
   const { transferId, attemptId, reason } = body;
   if (typeof transferId !== "string") {
     return;
   }
   closeDirect(transferId);
-  // The committed path is dead: the badge goes back to `in connessione`
-  // until the replacement attempt has a VERIFIED chunk of its own (5.6).
-  applyTransferEvent({ kind: "transfer.path_reset", transferId });
-  if (typeof attemptId === "string") {
-    const ranges = receiver?.directFailed(transferId, attemptId) ?? null;
-    if (ranges !== null) {
-      sendDirectFailed(
-        transferId,
-        attemptId,
-        typeof reason === "string" ? reason : "unknown",
-        true,
-        ranges,
-      );
-    }
-    sender?.detachDirect(transferId, attemptId);
+  if (typeof attemptId !== "string") {
+    return;
+  }
+  // The badge is reset ONLY where a failure is actually declared. It used to
+  // be reset here, unconditionally, before either side was asked whether the
+  // attempt had failed at all — and the counterpart's notice winning the
+  // race is the ORDINARY case, not the exception. A channel that closes
+  // after the last byte ends a SUCCESSFUL transfer, so resetting there made
+  // the row stop naming the transport that had just carried the whole file.
+  const ranges =
+    (await (receiver?.directFailed(transferId, attemptId) ?? null)) ?? null;
+  if (ranges !== null) {
+    applyTransferEvent({ kind: "transfer.path_reset", transferId });
+    sendDirectFailed(
+      transferId,
+      attemptId,
+      typeof reason === "string" ? reason : "unknown",
+      true,
+      ranges,
+    );
+  }
+  if (sender?.detachDirect(transferId, attemptId) === true) {
+    applyTransferEvent({ kind: "transfer.path_reset", transferId });
   }
 }
 
@@ -531,7 +540,7 @@ function startDirectAttempt(body) {
           !recipient &&
           sender?.attachDirect(transferId, attemptId, actor.sink) !== true
         ) {
-          failDirect(transferId, attemptId, "protocol", recipient);
+          void failDirect(transferId, attemptId, "protocol", recipient);
           return;
         }
         session?.send("transfer.direct_ready", randomRequestId(), {
@@ -544,8 +553,9 @@ function startDirectAttempt(body) {
           receiver?.deliverDirectFrame(transferId, attemptId, data);
         }
       },
-      onFailed: (reason) =>
-        failDirect(transferId, attemptId, reason, recipient),
+      onFailed: (reason) => {
+        void failDirect(transferId, attemptId, reason, recipient);
+      },
     },
   });
   directAttempts.set(transferId, { actor, attemptId, recipient });
@@ -974,7 +984,7 @@ function startSession() {
           // The COUNTERPART gave up. Our side drops the attempt without
           // sending a notice of its own: the server already knows, and the
           // relay attempt it minted arrives as a ticket.
-          abandonDirect(message.body ?? {});
+          void abandonDirect(message.body ?? {});
           return;
         }
         // Source-side transfer traffic (incoming/ticket/commit/cancel):

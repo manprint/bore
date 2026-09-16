@@ -729,3 +729,61 @@ ha mai eseguito niente.** I due difetti Windows erano in fila, e il secondo era
 invisibile finché il primo non è caduto — motivo per cui i due oracoli locali
 (cfg sempre falso, CRLF) valgono più di un altro giro di CI: rendono osservabile
 qui ciò che prima si poteva vedere solo là, un difetto alla volta.
+
+### Segnalazione dal campo — un trasferimento diretto che non finiva (B-A017/B-A018)
+
+Un file da 334,8 MiB a 86 MiB/s (velocità da percorso diretto): la riga arriva a
+`100% · Trasferimento in corso` e **non finisce mai**, con il badge tornato a
+`in connessione`. Un reload mostra `Riprendi`; il resume conclude in un istante
+e passa a `Verificato, da salvare`, e il file si scarica. Nessun errore, da
+nessuna parte — che è la parte peggiore: il prodotto non falliva e non
+completava.
+
+Due difetti della stessa famiglia, entrambi sulla gamba DIRETTA, entrambi
+figli della stessa domanda mal posta: *quando un canale si chiude, è un
+guasto?*
+
+**B-A017 — decidere prima di aver drenato.** La controparte chiude il
+DataChannel nello stesso turno in cui scrive FINAL. È la fine ORDINARIA di un
+trasferimento riuscito, e i frame già consegnati stanno ancora decifrando.
+`directFailed` decideva sul posto: marcava l'attempt chiuso e **svuotava
+`inbox`**, buttando via il FINAL di un trasferimento i cui byte erano già tutti
+verificati su disco.
+
+La cosa notevole è che il rimedio era già scritto — sull'altra gamba. Il
+`socket.onclose` del relay porta da sempre questo commento:
+
+> *decide only after the processing chain drains: the server closes right
+> after FINAL, while queued frames may still be decrypting.*
+
+La gamba diretta non aveva mai avuto quella regola. Ora `directFailed` è
+`async` e APPENDE alla stessa `transfer.chain` (non attende un'istantanea:
+così copre anche il lavoro accodato durante l'attesa, esattamente come fa il
+relay), poi rilegge lo stato — `complete-pending` o `staged` ⇒ `null`, cioè
+«non c'è niente da segnalare, è andata bene».
+
+**B-A018 — azzerare il badge prima di sapere.** `abandonDirect` applicava
+`transfer.path_reset` incondizionatamente, in cima, prima di chiedere a
+chiunque se l'attempt fosse davvero fallito. E la notifica della controparte
+che vince la corsa è il caso ORDINARIO, non l'eccezione — lo dice il commento
+accanto a `directFailed`. Così un trasferimento appena concluso smetteva di
+dire quale trasporto aveva portato i byte, che è la domanda per cui questa
+funzione esiste. Ora il badge si azzera solo nel ramo che dichiara un guasto
+vero: lato destinatario quando `directFailed` restituisce delle range, lato
+sorgente quando `detachDirect` conferma di aver staccato un attempt vivo — la
+struttura che `failDirect` aveva già e che `abandonDirect` era l'unico a non
+avere.
+
+**Il gate, e cosa ha rivelato il red-check.** `a_channel_closing_after_final_
+completes_instead_of_failing` (`attempt.test.mjs`) consegna il chunk e il
+FINAL e chiama `directFailed` **senza `tick`** — la corsa vera, resa
+deterministica invece che sperata. Togliendo il drenaggio il test non
+fallisce con un «fallito» qualunque: risponde **`[]`**, cioè *«non ho niente
+su disco»*, mentre un chunk intero stava per essere committato. Il tentativo
+di rimpiazzo si sarebbe rispedito i 334 MiB da zero. Il difetto era quindi
+più grave del sintomo che l'ha fatto notare.
+
+Nota di metodo: il gate vive al livello dell'ATTORE, non in un e2e. Un e2e in
+loopback non può decidere se il close arriva prima o dopo il drenaggio — è la
+stessa ragione per cui i bug di flush del vhost si gatano sul mock e non su
+TLS in-process.

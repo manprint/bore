@@ -157,6 +157,8 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 76 | bug | B-A015 | agent-1:Claude-Opus-5 | il budget di B-A007 dividerva una COSTANTE (il relay e' limitato dal token bucket) e giudicava il peggiore di dieci campioni: un budget assoluto travestito da rapporto. Il verdetto e' ora mediana `< elapsed_b / 4` piu' peggiore `< elapsed_b` | tests/web_transfer_test.rs | `t_web_fairness` verde con mediana 0 ms e campioni tutti a 0 ms contro un relay di 4,01 s | uncommitted |
 | 77 | bug | B-A014 (seguito) | agent-1:Claude-Opus-5 | marcare `t_web_cli` come `#[cfg(unix)]` ha reso orfano `room_alive`: su windows `-D warnings` lo respinge come `never used`. Gated anche l'helper, e trovato un oracolo locale per il ramo non-unix | tests/web_transfer_test.rs | `#[cfg(unix)]` → `#[cfg(any())]` su tutto il file e clippy `-D warnings`: exit 0 | uncommitted |
 | 78 | bug | B-A016 | agent-1:Claude-Opus-5 | il runner windows fa checkout CRLF: una needle che attraversa un a capo non poteva combaciare. `read_doc_text` normalizza i tre file letti per confronto testuale | tests/web_transfer_test.rs | oracolo CRLF locale (`sed -i 's/$/\r/'`), verde con la correzione e red-checked senza | uncommitted |
+| 79 | bug | B-A017 | agent-1:Claude-Opus-5 | la gamba diretta decideva la chiusura senza drenare la pipeline e buttava via il FINAL: trasferimento fermo al 100% per sempre. `directFailed` ora attende la `chain` come fa il relay | web/transfer/src/{receiver.js,main.js}, web/transfer/tests/unit/attempt.test.mjs, web/transfer/dist/app.js | unit nuovo red-checked (senza drenaggio risponde `[]`, cioe' «niente su disco») | uncommitted |
+| 80 | bug | B-A018 | agent-1:Claude-Opus-5 | `abandonDirect` azzerava il badge del percorso incondizionatamente, anche quando il canale si era chiuso DOPO l'ultimo byte di un trasferimento riuscito | web/transfer/src/main.js | lo stesso unit: `events.paths == ["direct"]` | uncommitted |
 
 ## 5. Files touched
 
@@ -514,6 +516,10 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | tests/web_transfer_test.rs | B-A014: `t_web_cli` marcato `#[cfg(unix)]` (i due `#[cfg(unix)]` sulle chiamate a `signal_pid` diventano superflui) | B-A014 |
 | tests/web_transfer_test.rs | B-A014 (seguito): `room_alive` marcato `#[cfg(unix)]` perche' i suoi unici chiamanti lo sono | B-A014 |
 | tests/web_transfer_test.rs | B-A016: `read_doc_text` (CRLF → LF) su `README.md`, `web/transfer/src/state.js` e `src/admin_views.rs` | B-A016 |
+| web/transfer/src/receiver.js | B-A017: `directFailed` e' async e appende alla `transfer.chain` prima di decidere | B-A017 |
+| web/transfer/src/main.js | B-A017/B-A018: i chiamanti attendono l'esito e `path_reset` e' applicato solo nel ramo che dichiara un guasto | B-A017, B-A018 |
+| web/transfer/tests/unit/attempt.test.mjs | B-A017: `a_channel_closing_after_final_completes_instead_of_failing`, piu' i dieci `directFailed` esistenti ora attesi | B-A017 |
+| web/transfer/dist/app.js | ricostruito: il binario incorpora `dist` a COMPILE time | B-A017 |
 | tests/web_transfer_test.rs | B-A015: `t_web_fairness` raccoglie i dieci RTT di controllo, giudica sulla MEDIANA (`< elapsed_b / 4`) piu' il peggiore (`< elapsed_b`) e stampa i campioni grezzi accanto alle statistiche | B-A015 |
 
 | tests/support/web_transfer.rs | B-A010: `free_port` da un cursore atomico sotto l'intervallo effimero, spostato dal pid; `wait_port` con budget di 20 s e `panic!` alla scadenza | B-A010 |

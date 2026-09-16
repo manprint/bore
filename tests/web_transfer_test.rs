@@ -2335,6 +2335,7 @@ fn split_room_url(url: &str) -> Result<(String, String)> {
 
 /// `true` when the room still answers a real control hello with a welcome.
 /// A destroyed room either refuses the handshake or closes without one.
+#[cfg(unix)]
 async fn room_alive(host: &str, room: &str, origin: &str, token: &str) -> bool {
     let Ok(mut peer) = support::WsPeer::connect(host, room, origin).await else {
         return false;

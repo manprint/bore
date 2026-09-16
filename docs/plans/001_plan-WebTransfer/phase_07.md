@@ -651,3 +651,37 @@ imparato: non basta che un limite *abbia la forma* di un rapporto — il
 denominatore deve misurare la stessa cosa che il numeratore rischia di
 misurare. Un denominatore che è una costante di configurazione riporta
 l'asserzione esattamente da dove veniva.
+
+### Esito — quarto giro di CI su `dev` (`e612b19`, 2026-09-16)
+
+Due rossi, nessuno dei due nel prodotto.
+
+- **`Security audit`** non ha trovato nulla: è morto prima di poter auditare,
+  con `error: couldn't fetch advisory database: git operation failed: An IO
+  error occurred when talking to the server`. Guasto di rete del runner
+  mentre clonava il database RustSec. In locale, con il DB presente, lo stesso
+  comando esce 0 con zero vulnerabilità e le sette warning già ammesse. Il job
+  è stato rilanciato.
+- **B-A014, secondo giro**: marcare `t_web_cli` come `#[cfg(unix)]` ha reso
+  ORFANO `room_alive`, i cui unici due chiamanti erano quel test e
+  `t_web_room_life` (già `#[cfg(unix)]`). Su windows `-D warnings` lo respinge
+  come `never used` e il crate di test non compila — lo stesso job di prima,
+  un difetto più in là. `split_room_url` e `next_line` invece restano
+  disponibili ovunque, perché `t_web_nostore` e `t_web_soak` li usano.
+
+  La lezione vera è sull'**oracolo**. Gating condizionale si verifica solo
+  compilando il ramo che si è disabilitato, e questa workstation non ha mingw,
+  quindi `--target x86_64-pc-windows-gnu` non parte (`cc-rs: failed to find
+  tool "x86_64-w64-mingw32-gcc"`). Ma ciò che conta non è Windows: è
+  «gli item `cfg(unix)` non esistono», e quello si riproduce in locale con un
+  cfg sempre falso —
+
+  ```sh
+  sed -i 's/#\[cfg(unix)\]/#[cfg(any())]/g' tests/web_transfer_test.rs
+  cargo clippy --all-features --test web_transfer_test -- -D warnings   # exit 0
+  ```
+
+  Dopo la correzione esce 0, e con `room_alive` ancora pubblico avrebbe
+  mostrato esattamente il `never used` della CI. Questo comando è ora in
+  `STATE.md` §7 come gate del ramo non-unix: una modifica `cfg` non va spedita
+  alla CI per sapere se compila.

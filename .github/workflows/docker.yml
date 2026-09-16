@@ -119,13 +119,28 @@ jobs:
         with:
           images: ${{ env.REGISTRY_IMAGE }}
           # BOTH spellings of a release tag, deliberately. `{{version}}` strips
-          # the leading `v` (Docker convention, `:1.1.0`); `v{{version}}` keeps
-          # it, which is the form this project publishes and documents
-          # (`:v1.1.0`). They are two tags on ONE manifest, so the second costs
-          # a registry pointer and nothing else -- and dropping either would
-          # break whoever pinned that spelling.
+          # the leading `v` (Docker convention, `:1.1.0`); the `v` spelling is
+          # the form this project publishes and documents (`:v1.1.0`). They are
+          # two tags on ONE manifest, so the second costs a registry pointer and
+          # nothing else -- and dropping either would break whoever pinned that
+          # spelling.
+          #
+          # THE `v` SPELLING COMES FROM `{{raw}}`, NOT FROM `v{{version}}`.
+          # MEASURED on the v1.2.0-rc.1 release run (35137699783): a PRERELEASE
+          # semver tag produced `1.2.0-rc.1` and NOTHING ELSE -- the
+          # `v{{version}}` entry emitted no tag at all, so
+          # `ghcr.io/manprint/bore:v1.2.0-rc.1` was `not found` while
+          # `:1.2.0-rc.1` resolved, and the release body's three pins all read
+          # `UNRESOLVED`. `{{raw}}` is the tag exactly as pushed, which is the
+          # `v` spelling by construction and is emitted for a prerelease too.
+          # For a stable tag the two are identical (`v1.1.0`), so this is not a
+          # behaviour change there.
+          #
+          # `{{major}}.{{minor}}` staying as it is IS the intent: metadata-action
+          # withholds it from a prerelease, which is what keeps `:1.2` from ever
+          # pointing at a release candidate.
           tags: |
-            type=semver,pattern=v{{version}}
+            type=semver,pattern={{raw}}
             type=semver,pattern={{version}}
             type=semver,pattern=v{{major}}.{{minor}}
             type=semver,pattern={{major}}.{{minor}}
@@ -181,7 +196,9 @@ jobs:
             latest=false
           tags: |
             type=raw,value=client
-            type=semver,pattern=v{{version}},prefix=client-
+            # `{{raw}}` and not `v{{version}}` -- see the note on the server
+            # image above: the latter emits nothing for a prerelease tag.
+            type=semver,pattern={{raw}},prefix=client-
             type=semver,pattern={{version}},prefix=client-
             type=semver,pattern=v{{major}}.{{minor}},prefix=client-
             type=semver,pattern={{major}}.{{minor}},prefix=client-

@@ -61,7 +61,10 @@ jobs:
           tags: |
             type=raw,value=latest
             type=ref,event=branch
-            type=semver,pattern=v{{version}}
+            # `{{raw}}` is the tag exactly as pushed, so it carries the `v`
+            # for a PRERELEASE too; `v{{version}}` emits nothing for one.
+            # MEASURED on the v1.2.0-rc.1 run -- see the note in docker.yml.
+            type=semver,pattern={{raw}}
             type=semver,pattern={{version}}
             type=sha
 

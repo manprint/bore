@@ -360,11 +360,30 @@ jobs:
 
           cat /tmp/pin-block.md >>"$GITHUB_STEP_SUMMARY"
 
+          # AN UNRESOLVED PIN IS A FAILED RELEASE. Reporting `UNRESOLVED` is
+          # already better than printing an empty digest, but this job used to
+          # report it and then exit 0 -- so on v1.2.0-rc.1 the release was green
+          # with all three pins unusable, and nothing said so. That is this
+          # repository's signature defect one more time: an instrument that
+          # names the failure and then declares success.
+
           # Append rather than replace: the release body already lists the assets.
           gh release view "$TAG" --json body --jq .body >/tmp/body.md
           cat /tmp/pin-block.md >>/tmp/body.md
           gh release edit "$TAG" --notes-file /tmp/body.md
           echo "release body updated with the pinning block"
+
+          # AN UNRESOLVED PIN IS A FAILED RELEASE, and the check comes AFTER the
+          # body is written so the evidence survives the failure. Reporting
+          # `UNRESOLVED` is already better than printing an empty digest, but
+          # this job used to report it and then exit 0 -- so on v1.2.0-rc.1 the
+          # release went green with all three pins unusable and nothing said so.
+          # That is this repository's signature defect one more time: an
+          # instrument that names the failure and then declares success.
+          if grep -q 'UNRESOLVED' /tmp/pin-block.md; then
+            echo "::error::at least one image digest could not be resolved; the release body cannot pin what was published"
+            exit 1
+          fi
 
   # ── One place that states what happened, including when it did not happen.
   #    A release that published nothing must SAY so: "no images appeared" and

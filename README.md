@@ -268,6 +268,13 @@ remember, so the two can never disagree:
 | `/releases/latest/download/...` | this one | never |
 | `ghcr.io/manprint/bore:` | `v1.2.0`, `1.2.0`, `v1.2`, `1.2`, `latest` | `v1.2.0-rc.1`, `1.2.0-rc.1` only |
 
+The `v` spelling of an image tag comes from `{{raw}}` — the tag exactly as pushed — and not
+from a `v{{version}}` pattern: `docker/metadata-action` emits **nothing** for the latter when
+the semver tag is a prerelease, which is how `v1.2.0-rc.1` shipped under `:1.2.0-rc.1` alone
+and left all three digests in its release body unresolved. The withholding of
+`{{major}}.{{minor}}` from a prerelease is the opposite case and is deliberate: it is what
+keeps `:1.2` from ever pointing at a release candidate.
+
 Install a prerelease by naming it exactly — `ghcr.io/manprint/bore:v1.2.0-rc.1`, or the asset
 URL under `/releases/download/v1.2.0-rc.1/` — or better, by the digest the release body pins.
 

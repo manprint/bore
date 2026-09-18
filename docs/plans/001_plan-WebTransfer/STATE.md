@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-18 23:10 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 13
+> **Last updated:** 2026-09-19 01:05 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 13
 
 ## 0. Protocol
 
@@ -25,14 +25,14 @@ This is the only execution-state file — position, progress, ledger, and blocke
 
 ## 1. Current unit
 
-- **Type:** `release`
-- **ID:** `v1.2.0-rc.3`
-- **Status:** `OPEN`
-- **Intent:** Tagliare la prerelease che porta B-A037 — la scadenza di negoziazione non degrada piu' un percorso diretto commesso — piu' la causa della chiusura nella traccia e la correzione dell'harness B-A038. `dev` e' verde su tutti e cinque i workflow a `0518658`.
+- **Type:** `none`
+- **ID:** `-`
+- **Status:** `none`
+- **Intent:** `v1.2.0-rc.3` e' pubblicata e B-A039 e' chiuso; nessuna unita' in volo.
 - **Phase:** 7 (`phase_08.md`)
-- **Next action:** committare il bump di `Cargo.toml`/`Cargo.lock`, creare il tag annotato `v1.2.0-rc.3`, spingerlo e seguire il workflow Release (preflight, gate-ci, gate-cross, gate-e2e, poi la pubblicazione).
+- **Next action:** rimisurare il confronto diretto/relay di `WEB_TRANSFER_PERF.md` §7.6 con un braccio piu' lungo della scadenza (`SIZE_MB=512`), l'unica domanda che B-A037 ha lasciato aperta.
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | HEAD `0518658` = origin/dev, CI verde | albero con il solo bump di versione
+- **Repo state:** branch `dev` | tag `v1.2.0-rc.3` pubblicato su `2e8da87` | albero con la sola correzione del gate B-A039
 
 ## 2. Feature context (self-contained recap)
 
@@ -202,6 +202,10 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 118 | release | v1.2.0-rc.2 | agent-1:Claude-Opus-5 | prerelease tagliata su `dev`: `v1.2.0-rc.1` resta intatto, la rc.2 porta la campagna a due host, le sei correzioni di prodotto che ha trovato e l'igiene di CI | Cargo.toml, Cargo.lock | Release verde: preflight, gate-ci, gate-cross, gate-e2e; 26 asset, `prerelease: true`, `latest` fermo a v1.1.0 | 9a428ed |
 | 119 | bug | B-A037 | agent-1:Claude-Opus-5 | segnalazione dal campo su una LAN: la scadenza di NEGOZIAZIONE da 10 s degradava sul relay un percorso diretto COMMESSO e sano (tutti e quattro i carrier chiusi a t=10000 ms, `reason: null`, coppie ICE `succeeded` a 10-15 ms, ~124 MB gia' passati). `FallbackCause::{Reported,Deadline}` separa cio' che un peer puo' chiudere da cio' che un orologio puo' chiudere; in piu' ogni chiusura del percorso diretto scrive ora la propria CAUSA nella traccia, che e' cio' che mancava alla segnalazione per spiegarsi da sola | src/web_transfer.rs, web/transfer/src/webrtc.js, web/transfer/src/main.js, web/transfer/tests/unit/webrtc.test.mjs, web/transfer/tests/e2e/direct.spec.mjs, web/transfer/dist/app.js, docs/transfer/WEB_TRANSFER_PERF.md, README.md | unit `the_deadline_never_demotes_a_committed_direct_attempt` red-checked (`left: WaitingRelay, right: ActiveDirect`); e2e `T-WEB-DIRECT-DEADLINE` 3/3 su chromium+firefox+webkit, red-checked (due `path_commit` senza la correzione); `--lib` 820/0/2; frontend 203/203 su Node 24 E su Node 20 (l'oracolo della CI); `--test web_transfer_test` 40/0/1; fmt+clippy puliti | uncommitted |
 | 120 | bug | B-A038 | agent-1:Claude-Opus-5 | la CI ha bocciato `the_commit_moves_the_recipient_onto_the_probe...` su un prodotto corretto: l'helper `relaying()` aspettava la gamma verificata, che si muove un `await` PRIMA della nominazione del trasporto, e tornava dentro quella finestra | web/transfer/tests/unit/attempt.test.mjs | red-check deterministico allargando la finestra dentro `saveRecord`: pre-correzione riproduce `actual: ['direct']` della CI, post-correzione 24/24 con la finestra ancora allargata; `npm run check` 203/203 su Node 24 e Node 20 | uncommitted |
+| 121 | release | v1.2.0-rc.3 | agent-1:Claude-Opus-5 | prerelease tagliata su `dev`: porta B-A037 (la scadenza di negoziazione non degrada piu' un percorso diretto commesso), la causa della chiusura su ogni marker della traccia e la correzione d'harness B-A038 | Cargo.toml, Cargo.lock | Release verde e pubblicata (26 asset, prerelease). Due gate rossi al PRIMO campione — `cross/macos aarch64-apple-darwin` e `Web transfer e2e (firefox)` — verdi al secondo sullo stesso albero, senza toccare nulla; il secondo ha lasciato una scoperta vera sul gate, aperta come B-A039 | 2e8da87 |
+
+| 122 | bug | B-A039 | agent-1:Claude-Opus-5 | il gate `T-WEB-DIRECT-FALLBACK` non costruiva la finestra che pretende di usare: su un runner dal filo veloce e dalla pipeline di hash lenta il file INTERO atterrava prima che il badge nominasse il percorso, e lo shim — armato solo sull'evento `message` — non si risvegliava mai piu' | web/transfer/tests/e2e/direct.spec.mjs | red-check deterministico (badge ritardato di 2,5 s: tre motori rossi senza il pacing, tre verdi con) + suite e2e 160/0/23 | uncommitted |
+
 ## 5. Files touched
 
 | Path | What was done | Unit |
@@ -632,10 +636,11 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | web/transfer/dist/app.js | bundle ricostruito | B-A034 |
 | web/transfer/tests/e2e/direct.spec.mjs | il gate host-only registra il percorso con le prove invece di pretenderlo | B-A035 |
 | .github/workflows/ci.yml | input `only` per girare da solo il job del browser | T-A013 |
+| web/transfer/tests/e2e/direct.spec.mjs | `paceSendAfter` sulla sorgente del gate di fallback: la finestra in cui l'uccisione puo' scattare esiste per costruzione | B-A039 |
 
 ## 6. In-flight work
 
-`v1.2.0-rc.3` claimed — version bumped in `Cargo.toml`/`Cargo.lock`, not yet committed; tag not yet created.
+none — tree consistent
 
 ## 7. Verification state
 
@@ -728,6 +733,8 @@ the exact corrected full regression now passes.
 | B-A037 — web-transfer Rust e2e | `cargo test --all-features --test web_transfer_test -- --test-threads=1` | `pass 40, fail 0, ignored 1` (170 s) | B-A037, 2026-09-18 |
 | B-A037 — e2e browser completa | `npm run test:e2e --prefix web/transfer` | `pass 160, fail 0, skipped 23` (2,2 min) | B-A037, 2026-09-18 |
 | B-A037 — regressione workspace | `cargo test --all-features -- --skip t_ssh_ --skip t_dmx_ --skip t_web_soak --test-threads=1` | `exit 0`, 32 suite tutte `ok`, 0 fail | B-A037, 2026-09-18 |
+| B-A039 — red-check del gate | badge ritardato di 2,5 s nello shim, `-g T-WEB-DIRECT-FALLBACK` sui tre motori | senza pacing `3 failed` (`the kill never fired on the wire`), con pacing `3 passed` | B-A039, 2026-09-19 |
+| B-A039 — e2e browser completa | `npx playwright test --project=chromium --project=firefox --project=webkit` | `pass 160, fail 0, skipped 23` (2,3 min) | B-A039, 2026-09-19 |
 
 ## 8. Runtime deviations from the plan
 

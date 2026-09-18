@@ -191,6 +191,56 @@ function stallSendFor(ms) {
   })();`;
 }
 
+/**
+ * Init script for the SOURCE: the first `bytes` go at full speed, every
+ * fragment after them is handed to the channel one at a time, `ms` apart, in
+ * order.
+ *
+ * `T-WEB-DIRECT-FALLBACK` needs a moment that is genuinely MID-transfer: the
+ * recipient past the kill threshold, the path already NAMED, and most of the
+ * file still to come. No file size guarantees that moment. On a CI runner
+ * whose wire is fast and whose hash pipeline is not, all four carriers
+ * delivered the whole 8 MiB in 1.0 s while the badge was still unnamed, so
+ * the window in which the kill may fire never opened at all and the gate read
+ * `killedAt = 0` against a transport that had already delivered everything
+ * (B-A039). Pacing the TAIL builds that window instead of hoping for it: the
+ * head is big enough to carry the recipient past the threshold, and the tail
+ * cannot outrun the recipient's own verification.
+ *
+ * Nothing is faked — the same bytes go over the same channels, in the same
+ * order, only spread out. NO BACKTICK in here: template literal.
+ */
+function paceSendAfter(bytes, ms) {
+  return `(() => {
+    const AFTER = ${bytes};
+    const GAP = ${ms};
+    const proto = window.RTCDataChannel && window.RTCDataChannel.prototype;
+    if (!proto || typeof proto.send !== "function") { return; }
+    const real = proto.send;
+    const state = (window.__BORE_PACE__ = { sent: 0, queue: [], pumping: false });
+    const step = () => {
+      const next = state.queue.shift();
+      if (!next) { state.pumping = false; return; }
+      try { real.call(next[0], next[1]); } catch {}
+      setTimeout(step, GAP);
+    };
+    proto.send = function (data) {
+      const size =
+        data && data.byteLength !== undefined ? data.byteLength : (data && data.size) || 0;
+      if (state.sent < AFTER) {
+        state.sent += size;
+        return real.call(this, data);
+      }
+      state.queue.push([this, data]);
+      if (!state.pumping) {
+        state.pumping = true;
+        setTimeout(step, GAP);
+      }
+      return undefined;
+    };
+  })();`;
+}
+
 test.describe.serial("direct", () => {
   test("T-WEB-DIRECT one click moves the file on a real DataChannel", async () => {
     const a = await openPeer(env.roomUrl);
@@ -486,7 +536,12 @@ test.describe.serial("direct", () => {
     // sending. The same TransferId must finish over the relay, on a new
     // attempt, without re-sending what is already verified and without the
     // user touching anything.
-    const a = await openPeer(env.roomUrl);
+    // The source paces everything past its first MiB, which is BELOW the
+    // recipient's 2 MiB kill threshold on purpose: the recipient can then
+    // reach that threshold only through paced traffic, so the file cannot
+    // land before the kill and the window the gate needs exists by
+    // construction rather than by the runner being slow (B-A039).
+    const a = await openPeer(env.roomUrl, { init: paceSendAfter(1024 * 1024, 25) });
     const b = await openPeer(env.roomUrl, { init: killChannelAfter(2 * 1024 * 1024) });
     await expectConnected(a.page);
     await expectConnected(b.page);

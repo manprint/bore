@@ -751,3 +751,14 @@ WT_HIGH_WATER=524288 WT_LOW_WATER=131072 SIZE_MB=128 REPS=5 ARMS=direct \
 (`/home/ubuntu/wt`). Size it against the LINE, not against a round number
 (V-19): 128 MiB is ~6 s of transfer on a 222 Mbit/s uplink, which is well past
 the ramp; on a slower link raise it rather than keep the number.
+
+### What this campaign did NOT measure
+
+Two axes were swept here — send-queue depth and carrier count — and three were
+not: the fragment size (24 KiB, chosen on LOOPBACK in phase 5, which is the
+class of evidence this campaign already overturned once), the channel's
+ordering, and whether the recipient's OPFS staging is what stalls the sender
+through SCTP's receive window. None of them is closed, so "the direct path has
+no margin left" is not something these numbers establish. The queue of
+experiments, each with its discriminator, its cost and the bound it must
+respect, is `WEB_TRANSFER_DIRECT_NEXT.md`.

@@ -864,6 +864,22 @@ the exact corrected full regression now passes.
 
 ## 9. Blockers and open questions
 
+**2026-09-18 — il percorso diretto ha margine, e non e' stato esaurito.** La
+campagna 7.6 ha spazzato DUE assi (profondita' della coda, numero di carrier) e
+non tre: dimensione del frammento (24 KiB, scelti in LOOPBACK nella fase 5 —
+la stessa classe di evidenza che B-A032 ha appena ribaltato), ordinamento del
+canale, e se sia lo staging OPFS del destinatario a strozzare la sorgente
+attraverso la finestra di ricezione SCTP. La coda degli esperimenti, ognuno col
+suo discriminante, il suo costo e il vincolo che deve rispettare, e'
+`docs/transfer/WEB_TRANSFER_DIRECT_NEXT.md`. Il piu' grosso e' gia' misurato:
+otto carrier danno 33,85 MiB/s contro i 22,08 di quattro (+54 %) e non sono il
+default solo perche' due tentativi su tre abortivano — e' la stabilita' a
+mancare, non la banda. **Lacuna di osservabilita' da chiudere per prima:**
+`availableOutgoingBitrate` legge `?` in ogni traccia prodotta
+(`out_bitrate=?`), ed e' la cosa piu' vicina alla finestra di congestione che
+un browser esponga — la sola che trasformerebbe «limite per associazione» da
+inferenza a misura.
+
 - ~~**Phase 3 cannot close before the serial SSH regression runs**~~ — run at 3.7 and green
   (gateway 42/0 in 273 s, spike 5/0). No blocker remains for phase 3.
 - **Open (4.6, V003-F01): the two-host run has not happened; the loopback question is

@@ -127,12 +127,17 @@ jobs:
         working-directory: web/transfer
         run: npx playwright install --with-deps chromium firefox webkit
 
-      # All three engines: a compatibility claim proved on one engine is not
-      # a compatibility claim. Performance is NOT gated here — a shared
-      # runner cannot produce a number worth comparing.
-      - name: Browser e2e (chromium, firefox, webkit)
-        working-directory: web/transfer
-        run: npx playwright test --project=chromium --project=firefox --project=webkit --reporter=line
+      # The three engines run in the `web-transfer-e2e` matrix below, one
+      # runner each. They used to run here, all three on this runner, and the
+      # suite outgrew it: 180 tests, two Playwright workers, four browser
+      # contexts and two server processes on four vCPUs, with BLAKE3 hashing
+      # a folder inside the page. What that produced was ONE failure per run
+      # and a different test each time — twice a claim the environment could
+      # not meet, once a control socket the page lost and spent the rest of
+      # the test reconnecting (`Riconnessione…` in the failure snapshot).
+      # Splitting by engine gives each one a whole runner and a third of the
+      # tests, at the same wall clock, and an engine-specific failure lands
+      # in its own job instead of being one line in three engines' output.
 
       # The pairs nobody else runs: every other spec puts the same engine on
       # both sides, and a transfer is a NEGOTIATION between two of them.
@@ -158,6 +163,58 @@ jobs:
         if: failure()
         with:
           name: web-transfer-playwright
+          path: web/transfer/test-results
+          retention-days: 7
+
+  web-transfer-e2e:
+    name: Web transfer e2e (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Never cancel a sibling: an engine-specific failure is exactly the
+      # thing this split exists to show, and the other two engines' verdicts
+      # are what say whether it is the engine or the change.
+      fail-fast: false
+      matrix:
+        project: [chromium, firefox, webkit]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/transfer/package-lock.json
+
+      - name: Install browser peer dependencies
+        working-directory: web/transfer
+        run: npm ci
+
+      # The bundle only. The unit tests and the drift check belong to the
+      # `web-transfer` job and running them here would run them three times.
+      - name: Build the browser bundle
+        working-directory: web/transfer
+        run: npm run build
+
+      # Built AFTER the bundle: the binary embeds it at compile time.
+      - name: Build the server and the e2e room owner
+        run: cargo build --all-features --bin bore --example web_transfer_e2e_owner
+
+      - name: Install Playwright browser
+        working-directory: web/transfer
+        run: npx playwright install --with-deps ${{ matrix.project }}
+
+      - name: Browser e2e (${{ matrix.project }})
+        working-directory: web/transfer
+        run: npx playwright test --project=${{ matrix.project }} --reporter=line
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: web-transfer-playwright-${{ matrix.project }}
           path: web/transfer/test-results
           retention-days: 7
 

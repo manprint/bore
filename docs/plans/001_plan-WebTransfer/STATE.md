@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-18 16:40 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
+> **Last updated:** 2026-09-18 17:05 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
 
 ## 0. Protocol
 
@@ -30,9 +30,9 @@ This is the only execution-state file — position, progress, ledger, and blocke
 - **Status:** `none`
 - **Intent:** CI verde su `dev`, poi il tag.
 - **Phase:** 7 (`phase_08.md`)
-- **Next action:** push di B-A036 + T-A013; lanciare il job "Web transfer (browser slice)" DA SOLO via `workflow_dispatch only=web-transfer`; quando e' verde, la matrice intera; poi il tag `v1.2.0-rc.1`.
+- **Next action:** push di T-A014; seguire i tre job `web-transfer e2e (<motore>)`; quando sono verdi, il tag `v1.2.0-rc.1`.
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | HEAD `f0214ff` = origin/dev | B-A036 + T-A013 in albero
+- **Repo state:** branch `dev` | HEAD `20edc4d` = origin/dev | T-A014 in albero
 
 ## 2. Feature context (self-contained recap)
 
@@ -197,6 +197,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 113 | bug | B-A035 | agent-1:Claude-Opus-5 | il gate e2e nuovo `a host-only negotiation delivers the peer's end-of-candidates marker` pretendeva `direct` su webkit in CI: resta duro il marker (che e' cio' che il test misura), il percorso diventa una registrazione con le prove che lo spiegano | web/transfer/tests/e2e/direct.spec.mjs | quel test 3/3 su chromium+firefox+webkit, con la riga di prova stampata | uncommitted |
 | 114 | bug | B-A036 | agent-1:Claude-Opus-5 | `T-WEB-DIRECT-FALLBACK` pretendeva la `reason` sulle tracce del destinatario, che e' il lato che CHIUDE il canale: firefox non gli consegna un `close`. La ragione ora si legge sull'unione dei due lati e le tracce si stampano | web/transfer/tests/e2e/direct.spec.mjs | quel file 48/48 su tre motori, due ripetizioni | uncommitted |
 | 115 | task | T-A013 | agent-1:Claude-Opus-5 | `ci.yml` accetta un input `workflow_dispatch` `only`: con `web-transfer` gli altri dodici job si skippano, cosi' il job che varia di piu' si prova da solo prima di pagare quindici minuti di matrice | .github/workflows/ci.yml | actionlint pulito; `inputs` e' vuoto su push/PR/schedule, quindi il percorso normale non cambia | uncommitted |
+| 116 | task | T-A014 | agent-1:Claude-Opus-5 | i tre motori passano a un job a matrice, un runner ciascuno: la suite aveva superato il suo runner e produceva un fallimento per giro, un test diverso ogni volta | .github/workflows/ci.yml | actionlint pulito | uncommitted |
 ## 5. Files touched
 
 | Path | What was done | Unit |

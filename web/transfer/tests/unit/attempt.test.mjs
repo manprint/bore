@@ -1278,6 +1278,19 @@ describe("web-transfer relay to direct upgrade (7.5)", () => {
       () => dst.receiver.transfers().get(TRANSFER_ID).verifiedRanges.length > 0,
       "the relay to deliver chunk 0",
     );
+    // ...AND to have named itself, which is a LATER fact (B-A038).
+    // `transfer.verifiedRanges` moves BEFORE the `await
+    // repository.saveRecord(...)` of the same chunk and `nameTransport`
+    // runs after it, so a precondition that waits only for the range
+    // returns INSIDE that window. The upgrade below then moves the attempt
+    // id, and the naming still pending fires once — as `direct`. Seen on a
+    // CI runner as `paths == ['direct']` on a transfer whose relay chunk was
+    // correctly on disk: the harness had accused the product of forgetting
+    // to name a transport it was about to name.
+    await waitFor(
+      () => dst.events.paths.includes("relay"),
+      "the relay leg to name its transport",
+    );
     return { dst, keyA, seq };
   }
 

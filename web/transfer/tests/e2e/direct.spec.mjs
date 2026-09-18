@@ -145,6 +145,52 @@ function killChannelAfter(limit) {
   })();`;
 }
 
+/**
+ * Init script for the SOURCE: holds every `RTCDataChannel.send` from the
+ * first one onwards for `ms`, then flushes the queue in order and gets out
+ * of the way. Nothing is faked — the same bytes go over the same channel,
+ * only later — and it is the one way to observe from outside the page a
+ * direct transfer that is STILL ALIVE when the server's 10 s negotiation
+ * deadline expires (B-A037). The source sends its first byte only after
+ * `transfer.path_commit`, so arming on the first send is arming on a
+ * committed path.
+ *
+ * Deliberately below the recipient's 20 s direct idle clock: a stall long
+ * enough to trip THAT would be the product working, and would prove nothing
+ * about the deadline. NO BACKTICK in here: template literal.
+ */
+function stallSendFor(ms) {
+  return `(() => {
+    const MS = ${ms};
+    const proto = window.RTCDataChannel && window.RTCDataChannel.prototype;
+    if (!proto || typeof proto.send !== "function") { return; }
+    const real = proto.send;
+    const state = (window.__BORE_STALL__ = {
+      armed: false,
+      done: false,
+      queue: [],
+      armedAt: 0,
+      releasedAt: 0,
+    });
+    proto.send = function (data) {
+      if (state.done) { return real.call(this, data); }
+      if (!state.armed) {
+        state.armed = true;
+        state.armedAt = Date.now();
+        setTimeout(() => {
+          state.done = true;
+          state.releasedAt = Date.now();
+          for (const held of state.queue.splice(0)) {
+            try { real.call(held[0], held[1]); } catch {}
+          }
+        }, MS);
+      }
+      state.queue.push([this, data]);
+      return undefined;
+    };
+  })();`;
+}
+
 test.describe.serial("direct", () => {
   test("T-WEB-DIRECT one click moves the file on a real DataChannel", async () => {
     const a = await openPeer(env.roomUrl);
@@ -228,6 +274,83 @@ test.describe.serial("direct", () => {
       b.page.locator("#save-file").click(),
     ]).then(([event]) => event);
     expect(download.suggestedFilename()).toBe("direct.bin");
+    const saved = readFileSync(await download.path());
+    expect(saved.length).toBe(fileBytes.length);
+    expect(createHash("sha256").update(saved).digest("hex")).toBe(fileHashHex);
+
+    for (const peer of [a, b]) {
+      expect(peer.failures).toEqual([]);
+      await peer.cleanup();
+    }
+  });
+
+  test("T-WEB-DIRECT-DEADLINE a committed direct path outlives the negotiation deadline", async () => {
+    // B-A037, reported from the field on a LAN: a direct transfer that was
+    // moving ~124 MB over `succeeded` host-host ICE pairs at 10-15 ms rtt
+    // had all four of its carriers closed at t=10000 ms with no reason. The
+    // server's negotiation deadline had expired against a path that had long
+    // since committed, and `transfer.direct_failed reason=timeout` is what
+    // makes the browser close its carriers. Deterministic, so a gate can
+    // hold a transfer past the REAL deadline and read the result.
+    test.setTimeout(180_000);
+    const STALL_MS = 13_000;
+    const a = await openPeer(env.roomUrl, { init: stallSendFor(STALL_MS) });
+    const b = await openPeer(env.roomUrl);
+    await expectConnected(a.page);
+    await expectConnected(b.page);
+    expect(await opfsWorks(b.page)).toBe(true);
+
+    await a.page.locator("#file-input").setInputFiles([join(roomDir, "direct.bin")]);
+    const offer = await poll(a.page, () => {
+      const catalog = window.__BORE_TEST__.getCatalogSnapshot();
+      return catalog.length === 1 ? catalog[0] : null;
+    });
+    const started = await b.page.evaluate(
+      (offerId) => window.__BORE_TEST__.requestDownload(offerId),
+      offer.offerId,
+    );
+    expect(started).toEqual({ pending: true });
+
+    // The path commits, the source writes its first byte, and then the wire
+    // is quiet for longer than the deadline.
+    await poll(
+      b.page,
+      () => (window.__BORE_TEST__.pathCommits.length > 0 ? window.__BORE_TEST__.pathCommits[0] : null),
+      60_000,
+    );
+    await poll(a.page, () => (window.__BORE_STALL__?.armed ? 1 : null), 60_000);
+    const held = await poll(
+      a.page,
+      () =>
+        window.__BORE_STALL__?.done === true
+          ? window.__BORE_STALL__.releasedAt - window.__BORE_STALL__.armedAt
+          : null,
+      60_000,
+    );
+    // The gate is only a gate if the quiet really outlasted the deadline.
+    expect(held, `the stall lasted ${held} ms`).toBeGreaterThanOrEqual(12_000);
+
+    // The transfer finishes — on the SAME attempt, on the direct path, with
+    // exactly one commit. A demotion would have produced a second one.
+    await expect(b.page.locator("#save-file")).toBeVisible({ timeout: 60_000 });
+    for (const peer of [a, b]) {
+      const commits = await peer.page.evaluate(() => [...window.__BORE_TEST__.pathCommits]);
+      expect(commits.map((c) => c.path)).toEqual(["direct"]);
+    }
+    // And neither peer was ever told the attempt failed, which is the half
+    // the browser reacts to by closing its carriers.
+    for (const peer of [a, b]) {
+      const inbound = await peer.page.evaluate(() => [...window.__BORE_TEST__.inboundTypes]);
+      expect(inbound.filter((type) => type === "transfer.direct_failed")).toEqual([]);
+      const events = await peer.page.evaluate(() => [...window.__BORE_TEST__.directEvents]);
+      expect(events.filter((event) => event.kind === "failed")).toEqual([]);
+    }
+    expect(relaySockets((await hookCounters(b.page)).wsUrls)).toEqual([]);
+
+    const download = await Promise.all([
+      b.page.waitForEvent("download", { timeout: 30_000 }),
+      b.page.locator("#save-file").click(),
+    ]).then(([event]) => event);
     const saved = readFileSync(await download.path());
     expect(saved.length).toBe(fileBytes.length);
     expect(createHash("sha256").update(saved).digest("hex")).toBe(fileHashHex);

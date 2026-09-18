@@ -817,6 +817,50 @@ test("one_carrier_is_the_actor_itself_and_puts_no_carrier_on_the_wire", async ()
   h.actor.close();
 });
 
+test("a_deliberate_close_records_why_it_happened_on_every_carrier", async () => {
+  // B-A037's diagnosis surface. A field report arrived as four carrier
+  // traces ending in `{"ev":"closed"}` with `reason: null` while their ICE
+  // pairs read `succeeded` at 10-15 ms rtt — and a bare `closed` mark cannot
+  // be told from any other, so "the transfer finished", "the user cancelled"
+  // and "the SERVER declared this attempt failed" looked identical. They mean
+  // opposite things. The cause now rides the mark, through the trace's own
+  // allow-list, so it can only ever be a short lowercase enumeration.
+  const h = groupHarness("offerer", 2);
+  await h.actor.start();
+  h.actor.close("server-failed", "timeout");
+  const traces = h.actor.diagnostics();
+  assert.equal(traces.length, 2, "one trace per carrier");
+  for (const trace of traces) {
+    const closed = trace.events.filter((event) => event.ev === "closed");
+    assert.equal(closed.length, 1, `one closed mark: ${JSON.stringify(trace.events)}`);
+    assert.equal(closed[0].cause, "server-failed");
+    assert.equal(closed[0].code, "timeout");
+  }
+
+  // A teardown with nothing to say still leaves a bare mark: the field is
+  // additive, never invented.
+  const q = groupHarness("offerer", 1);
+  await q.actor.start();
+  q.actor.close();
+  for (const trace of [].concat(q.actor.diagnostics())) {
+    const closed = trace.events.filter((event) => event.ev === "closed");
+    assert.equal(closed.length, 1);
+    assert.equal(closed[0].cause, undefined);
+    assert.equal(closed[0].code, undefined);
+  }
+
+  // And the allow-list is the gate, not the caller: a cause that is not a
+  // short lowercase enumeration is DROPPED rather than written.
+  const r = groupHarness("offerer", 1);
+  await r.actor.start();
+  r.actor.close("Server said: 10.0.0.7 timed out", "ok");
+  for (const trace of [].concat(r.actor.diagnostics())) {
+    const closed = trace.events.filter((event) => event.ev === "closed");
+    assert.equal(closed[0].cause, undefined);
+    assert.equal(closed[0].code, "ok");
+  }
+});
+
 test("each_carrier_negotiates_under_its_own_index", async () => {
   const h = groupHarness("offerer", 3);
   await h.actor.start();

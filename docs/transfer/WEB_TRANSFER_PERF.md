@@ -701,10 +701,13 @@ Three repetitions per value, at the shipped 512 KiB mark:
 
 | carriers | direct median MiB/s | ratio to relay | direct attempts that died (of 3) |
 |----------|---------------------|----------------|----------------------------------|
-| 1        | 10.84               | 0.248x         | 1 |
+| 1        | 10.84 †             | 0.248x †       | 1 † |
 | 2        | 23.05               | 0.528x         | 2 |
 | **4**    | **22.08**           | 0.502x         | **0** |
 | 8        | 33.85               | 0.780x         | 2 |
+
+† **This row is contaminated and is the only one that is** — see "The defect
+this campaign was one row away from finding" below.
 
 One carrier cannot fill this path and is half of every other value. Eight is
 the fastest median but two of its three attempts aborted mid-transfer and
@@ -751,6 +754,40 @@ WT_HIGH_WATER=524288 WT_LOW_WATER=131072 SIZE_MB=128 REPS=5 ARMS=direct \
 (`/home/ubuntu/wt`). Size it against the LINE, not against a round number
 (V-19): 128 MiB is ~6 s of transfer on a 222 Mbit/s uplink, which is well past
 the ramp; on a slower link raise it rather than keep the number.
+
+### The defect this campaign was one row away from finding (B-A037)
+
+Reported from the field the day after this campaign, on a LAN: a direct
+transfer moving ~124 MB over `succeeded` host-host ICE pairs at 10-15 ms rtt
+had **all four carriers closed at t=9999/10000 ms with `reason: null`**,
+`drain.timeouts: 0`, and finished on the relay. The server's 10 s NEGOTIATION
+deadline (`WEB_TRANSFER_DIRECT_DEADLINE`) was armed at `source_ready`, was
+never cancelled, and `fallback_to_relay` accepted `TransferState::ActiveDirect`
+— so it demoted a committed, healthy, actively carrying direct path and told
+both peers `transfer.direct_failed reason=timeout`, which is what makes the
+browser close its carriers. Deterministic, not flaky: **every direct transfer
+longer than ten seconds end to end finished on the relay.**
+
+Why 7.6 did not find it, and what that costs these numbers. The arm size was
+128 MiB, chosen against the LINE (V-19). At the rates measured here that is
+2.9 s on the relay and 3.8-6.8 s on direct — comfortably under ten seconds,
+by accident. The one arm that is not under it is **carriers=1 at 10.84 MiB/s,
+which needs 11.8 s of carrying alone**: that row crossed the deadline in every
+repetition, its single "death" is the server demoting it rather than a
+transport failure, and its median is a mixture of a direct start and a relay
+finish. It is marked † above and must not be quoted. Every other row here,
+the whole queue-depth ladder and the headline relay-vs-direct comparison at
+the shipped `carriers=4` (5.8 s of carrying) completed before the deadline and
+stand as measured.
+
+The general lesson is V-19's, one turn further: a payload sized against the
+line is also sized against every TIMEOUT the path contains, and a campaign
+whose arms all sit just under one measures a product that has no such
+timeout. An arm deliberately longer than the longest deadline in the path is
+now part of re-running this (`SIZE_MB=512` on this link), and the defect
+itself is gated without a WAN by `T-WEB-DIRECT-DEADLINE`, which holds a
+committed direct transfer quiet for 13 s and asserts exactly one
+`path_commit`.
 
 ### What this campaign did NOT measure
 

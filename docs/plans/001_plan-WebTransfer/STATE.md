@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-18 21:45 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
+> **Last updated:** 2026-09-18 23:10 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 13
 
 ## 0. Protocol
 
@@ -25,14 +25,14 @@ This is the only execution-state file — position, progress, ledger, and blocke
 
 ## 1. Current unit
 
-- **Type:** `release`
-- **ID:** `v1.2.0-rc.2`
+- **Type:** `bug`
+- **ID:** `B-A037`
 - **Status:** `none`
-- **Intent:** CHIUSA. Prerelease `v1.2.0-rc.2` pubblicata il 2026-09-18 su `9a428ed`, 26 asset, `prerelease: true`, e `/releases/latest` resta su `v1.1.0` — nessun puntatore mobile puo' consegnarla per sbaglio. Preflight, gate-ci, gate-cross e gate-e2e tutti verdi; il primo giro aveva un solo rosso, `vhost_reservation_enforced_rejected` su aarch64-darwin (contesa di porte, la classe che l'helper `wait_bound` documenta da B-A019), passato al secondo campione senza toccare nulla.
+- **Intent:** CHIUSA. La scadenza di negoziazione da 10 s degradava sul relay un percorso diretto COMMESSO e sano — segnalazione dal campo su una LAN, quattro carrier chiusi a t=10000 ms con `reason: null`, coppie ICE `succeeded` a 10-15 ms, ~124 MB gia' passati, `drain.timeouts: 0`. Deterministico: ogni trasferimento diretto piu' lungo di dieci secondi finiva sul relay. `FallbackCause::{Reported, Deadline}` separa dentro l'unico lock cio' che un peer puo' chiudere da cio' che un orologio puo' chiudere; in piu' ogni chiusura del percorso diretto scrive ora la propria CAUSA nella traccia, che e' l'informazione senza la quale la segnalazione non poteva spiegarsi da sola.
 - **Phase:** 7 (`phase_08.md`)
-- **Next action:** in attesa della decisione dell'utente sul link di stanza (valutazione consegnata: master unico nel frammento + derivazione HKDF, 27 caratteri dopo l'origine, 1-2 giorni; oppure base64url a campo singolo, 119 caratteri, mezza giornata). Il `#` non e' eliminabile senza dare le chiavi al server.
+- **Next action:** tagliare la prerelease `v1.2.0-rc.3` su `dev` (bump di `Cargo.toml`/`Cargo.lock`, tag annotato, CI verde, poi Release). Dopo il rilascio resta APERTA in §9 la rimisura di 7.6 con un braccio piu' lungo della scadenza (`SIZE_MB=512`), che e' l'unico modo di sapere quanto vale davvero il diretto su un trasferimento lungo.
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | HEAD `9a428ed` = origin/dev | tag `v1.2.0-rc.2` pubblicato | albero pulito
+- **Repo state:** branch `dev` | HEAD `0fc363e` = origin/dev | albero con le modifiche di B-A037 non ancora committate
 
 ## 2. Feature context (self-contained recap)
 
@@ -200,10 +200,19 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 116 | task | T-A014 | agent-1:Claude-Opus-5 | i tre motori passano a un job a matrice, un runner ciascuno: la suite aveva superato il suo runner e produceva un fallimento per giro, un test diverso ogni volta | .github/workflows/ci.yml | actionlint pulito | uncommitted |
 | 117 | task | T-A015 | agent-1:Claude-Opus-5 | `t_web_soak` non gira piu' nel passaggio parallelo di `Build, test & lint`: misura un budget che ritorna e un runner affamato glielo fa leggere come una perdita. Resta dov'e' seriale, nel job `web-transfer` | .github/workflows/ci.yml | actionlint pulito | uncommitted |
 | 118 | release | v1.2.0-rc.2 | agent-1:Claude-Opus-5 | prerelease tagliata su `dev`: `v1.2.0-rc.1` resta intatto, la rc.2 porta la campagna a due host, le sei correzioni di prodotto che ha trovato e l'igiene di CI | Cargo.toml, Cargo.lock | Release verde: preflight, gate-ci, gate-cross, gate-e2e; 26 asset, `prerelease: true`, `latest` fermo a v1.1.0 | 9a428ed |
+| 119 | bug | B-A037 | agent-1:Claude-Opus-5 | segnalazione dal campo su una LAN: la scadenza di NEGOZIAZIONE da 10 s degradava sul relay un percorso diretto COMMESSO e sano (tutti e quattro i carrier chiusi a t=10000 ms, `reason: null`, coppie ICE `succeeded` a 10-15 ms, ~124 MB gia' passati). `FallbackCause::{Reported,Deadline}` separa cio' che un peer puo' chiudere da cio' che un orologio puo' chiudere; in piu' ogni chiusura del percorso diretto scrive ora la propria CAUSA nella traccia, che e' cio' che mancava alla segnalazione per spiegarsi da sola | src/web_transfer.rs, web/transfer/src/webrtc.js, web/transfer/src/main.js, web/transfer/tests/unit/webrtc.test.mjs, web/transfer/tests/e2e/direct.spec.mjs, web/transfer/dist/app.js, docs/transfer/WEB_TRANSFER_PERF.md, README.md | unit `the_deadline_never_demotes_a_committed_direct_attempt` red-checked (`left: WaitingRelay, right: ActiveDirect`); e2e `T-WEB-DIRECT-DEADLINE` 3/3 su chromium+firefox+webkit, red-checked (due `path_commit` senza la correzione); `--lib` 820/0/2; frontend 203/203 su Node 24 E su Node 20 (l'oracolo della CI); `--test web_transfer_test` 40/0/1; fmt+clippy puliti | uncommitted |
 ## 5. Files touched
 
 | Path | What was done | Unit |
 |------|---------------|------|
+| src/web_transfer.rs | `FallbackCause` NUOVO, letto dentro l'unico lock di `fallback_to_relay`: la scadenza puo' chiudere solo un tentativo che non ha ancora iniziato a portare, un peer puo' chiuderne uno in qualunque momento. Doc della costante, di `spawn_direct_deadline` e di `NegotiatingDirect` allineate | B-A037 |
+| web/transfer/src/webrtc.js | `close(cause, code)` sull'attore e sul gruppo: il marker `closed` porta la ragione della chiusura, attraverso l'allow-list della traccia | B-A037 |
+| web/transfer/src/main.js | `closeDirect(transferId, cause, code)` e la causa a tutti e undici i punti di chiusura; `server-failed` e' quello che la segnalazione dal campo non poteva identificare | B-A037 |
+| web/transfer/tests/unit/webrtc.test.mjs | gate `a_deliberate_close_records_why_it_happened_on_every_carrier` | B-A037 |
+| web/transfer/dist/app.js | ricostruito | B-A037 |
+| web/transfer/tests/e2e/direct.spec.mjs | `stallSendFor` NUOVO (tiene in coda ogni `RTCDataChannel.send` della sorgente e la rilascia in ordine) + gate `T-WEB-DIRECT-DEADLINE` | B-A037 |
+| docs/transfer/WEB_TRANSFER_PERF.md | §7.6: la riga `carriers=1` marcata come contaminata, e la sottosezione che spiega perche' una campagna i cui bracci stanno tutti appena sotto una scadenza misura un prodotto che quella scadenza non ce l'ha | B-A037 |
+| README.md | il diretto non e' piu' limitato dalla scadenza di negoziazione, con la nota su cosa vedeva un utente prima; la riga `carriers=1` annotata | B-A037 |
 | docs/plans/001_plan-WebTransfer/verify/verify_003_2026-09-16.md | audit V003: evidenze, finding F01–F05, gate e piano di correzione C1–C5 | V003 |
 | docs/plans/001_plan-WebTransfer/verify/index.md | registro V003 e stati OPEN delle cinque finding | V003 |
 | web/transfer/src/diagnostics.js | NUOVO: traccia per tentativo (eventi, campioni `getStats()`, contabilita' del drenaggio) limitata e redatta per allow-list; store di pagina limitato e report copiabile | V003-C3 |
@@ -625,7 +634,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 
 ## 6. In-flight work
 
-`none — tree consistent`.
+`none` — tree consistent.
 
 ## 7. Verification state
 
@@ -710,6 +719,14 @@ the exact corrected full regression now passes.
 | 7.5 + B-A024 — web transfer e2e | `cargo test --all-features --test web_transfer_test` | `pass 39, fail 0, ignored 1` (70 s) | 2026-09-18 |
 | 7.5 + B-A024 — browser unit | `npm run check --prefix web/transfer` | `pass 201, fail 0` (191 -> 201: 4 gate di B-A024, 3 della scadenza di inattivita', 3 della risalita) | 2026-09-18 |
 | unit frontend su Node 20 (l'oracolo della CI) | `docker run --rm -v "$PWD":/w -w /w/web/transfer node:20-slim node --test tests/unit/*.test.mjs` | `202 pass / 0 fail / 0 cancelled` | B-A034, 2026-09-18 |
+| B-A037 — Rust unit | `cargo test --all-features --lib` | `pass 820, fail 0, ignored 2` | B-A037, 2026-09-18 |
+| B-A037 — fmt + clippy | `cargo fmt --all -- --check` / `cargo clippy --all-features --all-targets -- -D warnings` | `pass` | B-A037, 2026-09-18 |
+| B-A037 — gate e2e nuovo | `npx playwright test -g T-WEB-DIRECT-DEADLINE` (chromium+firefox+webkit) | `pass 3/3` (45,9 s), red-checked | B-A037, 2026-09-18 |
+| B-A037 — frontend unit | `npm run check --prefix web/transfer` | `pass 203, fail 0` (202 -> 203) | B-A037, 2026-09-18 |
+| B-A037 — frontend unit su Node 20 | `docker run … node:20-slim sh -c 'node --test tests/unit/*.test.mjs'` | `203 pass / 0 fail / 0 cancelled` | B-A037, 2026-09-18 |
+| B-A037 — web-transfer Rust e2e | `cargo test --all-features --test web_transfer_test -- --test-threads=1` | `pass 40, fail 0, ignored 1` (170 s) | B-A037, 2026-09-18 |
+| B-A037 — e2e browser completa | `npm run test:e2e --prefix web/transfer` | `pass 160, fail 0, skipped 23` (2,2 min) | B-A037, 2026-09-18 |
+| B-A037 — regressione workspace | `cargo test --all-features -- --skip t_ssh_ --skip t_dmx_ --skip t_web_soak --test-threads=1` | `exit 0`, 32 suite tutte `ok`, 0 fail | B-A037, 2026-09-18 |
 
 ## 8. Runtime deviations from the plan
 
@@ -849,6 +866,7 @@ the exact corrected full regression now passes.
 | 117 | un test che raccoglie N locator e poi li clicca clicca N elementi | il primo click ridisegna il catalogo e gli altri handle sono staccati; `click()` non ha timeout di default e aspetta per sempre | gemello UI di §8.66 nel dominio del test: il rendering incrementale non salva un gate che tiene in mano nodi vecchi. Il ciclo ri-risolve a ogni passata e verifica il conteggio residuo. Sintomo osservato: `T-WEB-DND` in timeout a 180 s con la pagina in «Riconnessione…» — cioe' il browser che si spegneva, non la room che cadeva | 2026-09-16 |
 | 118 | «stessa riga» si misura confrontando i `top`, e la stabilita' del layout con `getBoundingClientRect` | «stessa riga» e' una SOVRAPPOSIZIONE verticale; la stabilita' si misura in coordinate del DOCUMENTO | in una riga centrata il controllo piu' alto ha il `top` piu' piccolo (input 206 px, pulsante 202 px) e il confronto sui soli `top` leggeva quel layout corretto come un salto all'indietro; e lo scroll che Playwright stesso fa prima di un click spostava ogni riquadro di 388 px, indistinguibile da un layout che si muove. Che la pagina non scorra da sola durante il trasferimento e' ora un'asserzione separata, ed e' la promessa vera | 2026-09-16 |
 | 119 | un errore di pagina e' sempre un difetto del prodotto | WebKit riporta come errore di pagina la `send` su un canale appena ucciso | «Error sending binary data through RTCDataChannel.» non e' catturabile da JS: al momento della `send` il canale legge ancora `open` e il trasporto e' gia' sparito, quindi ne' la guardia del sink (`readyState !== "open"`) ne' il suo `try/catch` vedono nulla. Il gate filtra quella sola riga, per messaggio, e conta tutto il resto — la tolleranza e' di una frase, non di una categoria | 2026-09-16 |
+| 120 | una scadenza armata per limitare un HANDSHAKE puo' restare armata, tanto l'attempt id la rende innocua | l'attempt id non cambia quando il percorso si IMPEGNA, quindi il timer resta valido per il tentativo che e' diventato il trasporto | la guardia di `fallback_to_relay` metteva nello stesso insieme due permessi diversi: quello di un peer che ha visto rompersi il canale (legittimo in qualunque momento) e quello di un orologio (legittimo solo prima del commit). Un permesso condiviso da due chiamanti che sanno cose diverse e' la forma del difetto, non l'orologio in se'. Corollario di misura: una campagna i cui bracci durano 3-7 s non puo' vedere una scadenza di 10 s — a 128 MiB ogni braccio tranne `carriers=1` (11,8 s) stava sotto, per caso. Dimensionare il payload contro la LINEA (V-19) significa anche dimensionarlo contro i TIMEOUT del percorso, e serve un braccio piu' lungo del piu' lungo di essi | 2026-09-18 |
 | 120 | «uccidere il canale dopo un chunk verificato» mette il gate nello scenario che vuole provare | il chunk e' verificato un istante PRIMA che il percorso venga committato (per un archivio il commit aspetta anche la scrittura del record), quindi la morte puo' cadere in quella finestra | il prodotto resta corretto — il badge non ha mai nominato il diretto, quindi non c'e' nulla da riportare indietro — ma lo scenario non avviene: `T-WEB-PATH-UI` leggeva `["connecting", "relay"]` e `T-WEB-DIRECT-FALLBACK` un solo path commit invece di due. Il killer aspetta ora che il BADGE nomini il diretto, cioe' lo stesso fatto osservato dopo che e' diventato tale; corretto in entrambi i file, perche' era lo stesso killer copiato | 2026-09-16 |
 | 121 | una gamba diretta che non si alza e' un fallimento del gate | e' la preferenza del prodotto (§8.55), non una garanzia | sotto il carico della suite completa sui tre motori un peer atterra legittimamente sul relay. `T-WEB-PATH-UI` prova fino a due volte e usa `killedAt` per sapere se lo scenario e' avvenuto; le asserzioni sempre vere (il badge non apre mai su un trasporto non verificato, e non finisce mai su uno morto) valgono su OGNI tentativo, e due gambe dirette mancate di fila restano un fallimento vero | 2026-09-16 |
 | 123 | il messaggio di P-12 puo' restare invariato quando il bound cresce | «lower --max-conns to about N» e' l'unica parte azionabile dell'advisory, e con la superficie web inclusa N non e' piu' `--max-conns` | con `--max-conns 64` e i default web il bound e' 5696: un operatore che segue il consiglio abbassa il numero sbagliato. `reconcile_fd_limit_with_web` separa le due quote e nomina i flag web; `reconcile_fd_limit` resta identico (quota web 0) | 2026-09-17 |
@@ -876,6 +894,20 @@ the exact corrected full regression now passes.
 **2026-09-18, B-A030/B-A031 — due commenti che affermavano un fatto sbagliato, e cio' che e' costato.** Il parser di `rtc.ice` rifiutava l'end-of-candidates per sezione m con il commento «una forma che nessuno produce»: la producono Firefox e WebKit, perche' la specifica la prescrive, e il costo e' stato 62 messaggi rifiutati in una singola esecuzione. `signal_slot` chiamava `INVALID_MESSAGE` la segnalazione in ritardo, cioe' la corsa ORDINARIA fra un trickle ICE che dura secondi e una negoziazione che finisce in millisecondi. Regola operativa: **un commento che dice «nessuno fa X» e' un'ipotesi, e va misurata come tale** — qui bastava un gate che leggesse gli errori di controllo della pagina, che infatti non esisteva e ora esiste. Corollario trovato subito dopo: aggiungere un codice d'errore in UN solo elenco lo fa uscire sul filo come `INTERNAL` (`error_envelope` riscrive gli sconosciuti), e un `INTERNAL` che non lascia traccia nel log non e' diagnosticabile — per questo `WebTransferError::internal` ora logga.
 
 ## 9. Blockers and open questions
+
+**2026-09-18 — il confronto diretto/relay di 7.6 va RIFATTO con un braccio piu'
+lungo della scadenza (B-A037).** Fino a questa correzione ogni trasferimento
+diretto piu' lungo di dieci secondi veniva degradato sul relay dal server, e i
+bracci della campagna duravano 2,9-6,8 s: sotto la scadenza, per caso. La
+contaminazione e' quindi STRETTA e localizzata — la riga `carriers=1` (10,84
+MiB/s, cioe' 11,8 s di sola portata) e' l'unica che l'ha attraversata, e la sua
+unica "morte" e' il server che la degrada, non un guasto di trasporto. Tutto il
+resto di 7.6 resta valido come misurato. Quello che NON e' stato misurato da
+nessuno e' il diretto su un trasferimento LUNGO, che fino a ieri non poteva
+esistere: e' l'unico modo di sapere se il rapporto 0,5x verso il relay tiene
+oltre la finestra in cui il prodotto lo teneva prigioniero. `SIZE_MB=512` sullo
+stesso collegamento e' il braccio minimo che lo dice.
+
 
 **2026-09-18 — il percorso diretto ha margine, e non e' stato esaurito.** La
 campagna 7.6 ha spazzato DUE assi (profondita' della coda, numero di carrier) e

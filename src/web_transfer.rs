@@ -34,7 +34,12 @@ pub const WEB_TRANSFER_CLIENT_HEARTBEAT: Duration = Duration::from_secs(20);
 pub const WEB_TRANSFER_CTRL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Server reaper tick; liveness is checked here, never via `timeout(recv)`.
 pub const WEB_TRANSFER_REAPER_TICK: Duration = Duration::from_millis(500);
-/// Deadline for one direct-path (WebRTC) negotiation attempt.
+/// Deadline for one direct-path (WebRTC) NEGOTIATION attempt.
+///
+/// It bounds the handshake and nothing after it: once both peers are ready
+/// and `path_commit direct` has gone out, this clock has no standing over the
+/// path (`FallbackCause::Deadline`, B-A037). A transfer that takes longer
+/// than ten seconds to MOVE is the ordinary case, not a failure.
 pub const WEB_TRANSFER_DIRECT_DEADLINE: Duration = Duration::from_secs(10);
 /// How long a transfer carries on the RELAY before the server offers the
 /// direct path again.
@@ -1282,7 +1287,8 @@ pub enum TransferState {
     WaitingRelay,
     /// Source ready and the direct attempt is negotiating: both peers hold a
     /// `transfer.direct_start`, signaling is forwarded between exactly the
-    /// two of them and the 10 s deadline is armed. **No relay permit is
+    /// two of them and the 10 s deadline is armed — it expires against THIS
+    /// state and no other. **No relay permit is
     /// held in this state** — a direct transfer that never needs one must
     /// never take one.
     NegotiatingDirect {
@@ -3146,6 +3152,31 @@ pub(crate) type TransferOutbox = Vec<(PeerId, String)>;
 /// than read back out of the record twice).
 pub(crate) type FallbackOutcome = (ReadyOutcome, TransferOutbox, Vec<(u64, u64)>);
 
+/// Why a direct attempt is being taken to the relay, and — because the two
+/// causes know different things — what it is allowed to end (B-A037).
+///
+/// A peer's `transfer.direct_failed` comes from the side that HELD the
+/// DataChannel: it saw the channel break, so it may end an attempt at any
+/// point of its life, carrying or not. The negotiation deadline knows only
+/// that a clock ran out; it was armed to bound a HANDSHAKE and has no
+/// evidence about a path that has since committed and is moving bytes.
+///
+/// Letting the timer inherit the peer's permission is what made a healthy
+/// direct transfer on a LAN fall to the relay at the tenth second, every
+/// time, with all carriers closed by the server's own `direct_failed` while
+/// their ICE pairs were `succeeded` at 10-15 ms rtt. A committed attempt that
+/// STALLS is still bounded — by the recipient's idle clock, which ends it
+/// with a reported failure, from the side that can actually see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FallbackCause {
+    /// A peer reported the attempt broken. May end a negotiating OR a
+    /// committed (`ActiveDirect`) attempt.
+    Reported,
+    /// The negotiation deadline expired. May end ONLY an attempt that has not
+    /// started carrying.
+    Deadline,
+}
+
 /// Drains a [`TransferOutbox`] in order. Delivery failures are dropped: the
 /// transition already committed and the peer's own slow-path machinery (reap
 /// on next tick, resync on reconnect) converges it.
@@ -4038,7 +4069,13 @@ impl WebTransferRegistry {
         } else {
             Vec::new()
         };
-        match self.fallback_to_relay(room, transfer_id, body.attempt_id, ranges) {
+        match self.fallback_to_relay(
+            room,
+            transfer_id,
+            body.attempt_id,
+            ranges,
+            FallbackCause::Reported,
+        ) {
             Some((outcome, mut outbox, forwarded_ranges)) => {
                 // The counterpart hears WHY before it hears its ticket: the
                 // notice explains the new attempt the ticket belongs to.
@@ -4121,9 +4158,12 @@ impl WebTransferRegistry {
     /// Turns a live direct attempt into a fresh RELAY attempt, reusing the
     /// Phase 3 admission and ticket flow unchanged. Returns `None` — and
     /// changes nothing — unless the transfer is still on `failed_attempt`
-    /// in a direct state, which is what makes the deadline timer, a late
-    /// `transfer.direct_failed` and a racing terminal converge on one
-    /// fallback instead of three.
+    /// in a direct state that `cause` is allowed to end, which is what makes
+    /// the deadline timer, a late `transfer.direct_failed` and a racing
+    /// terminal converge on one fallback instead of three.
+    ///
+    /// See [`FallbackCause`] for why the two callers do not get the same
+    /// permission.
     ///
     /// On success the outbox holds each peer's own relay ticket
     /// ([`ReadyOutcome::Admitted`]) or is empty and the caller must spawn
@@ -4134,12 +4174,25 @@ impl WebTransferRegistry {
         transfer_id: TransferId,
         failed_attempt: AttemptId,
         recipient_ranges: Vec<(u64, u64)>,
+        cause: FallbackCause,
     ) -> Option<FallbackOutcome> {
         let mut state = room.state.lock().ok()?;
         let record = state.transfers.get(&transfer_id)?;
         // Direct states only: a transfer already on the relay has had its one
-        // automatic fallback, and a terminal one keeps its terminal.
-        if !record.state.is_negotiating_direct() && record.state != TransferState::ActiveDirect {
+        // automatic fallback, and a terminal one keeps its terminal. WHICH
+        // direct states depends on the cause, and the difference is B-A037:
+        // only a peer that held the channel may end an attempt that is
+        // carrying. The deadline bounds the handshake and stops there — it is
+        // read here, inside the one lock that also checks the attempt id, so
+        // an attempt that commits between the timer waking and this check is
+        // covered by the same decision rather than by a second one.
+        let permitted = match cause {
+            FallbackCause::Reported => {
+                record.state.is_negotiating_direct() || record.state == TransferState::ActiveDirect
+            }
+            FallbackCause::Deadline => record.state.is_negotiating_direct(),
+        };
+        if !permitted {
             return None;
         }
         if record.attempt_id != Some(failed_attempt) {
@@ -4481,7 +4534,9 @@ impl WebTransferRegistry {
     /// room (P-14's rule: a monitor must never resolve a key later and reach
     /// a newer object, and must never pin what it watches) plus the transfer
     /// and attempt IDs; at the deadline it falls back only when all three
-    /// still identify the same live direct attempt.
+    /// still identify the same live direct attempt AND that attempt is still
+    /// NEGOTIATING. The timer is never cancelled — it does not need to be,
+    /// because a committed attempt refuses it (B-A037).
     pub fn spawn_direct_deadline(
         &self,
         room: &Arc<WebTransferRoom>,
@@ -4504,16 +4559,25 @@ impl WebTransferRegistry {
 
     /// The deadline body, separated from the sleep so a test can fire it
     /// without a clock. Falls back once and then hands a queued attempt to
-    /// the ordinary relay admission waiter.
+    /// the ordinary relay admission waiter — and does nothing at all to an
+    /// attempt that has already committed to the direct path (B-A037).
     pub async fn direct_deadline_elapsed(
         &self,
         room: &Arc<WebTransferRoom>,
         transfer_id: TransferId,
         attempt_id: AttemptId,
     ) {
-        let Some((outcome, outbox, ranges)) =
-            self.fallback_to_relay(room, transfer_id, attempt_id, Vec::new())
-        else {
+        let Some((outcome, outbox, ranges)) = self.fallback_to_relay(
+            room,
+            transfer_id,
+            attempt_id,
+            Vec::new(),
+            FallbackCause::Deadline,
+        ) else {
+            // Nothing to report and nothing to notify. In particular a
+            // COMMITTED direct attempt is left exactly as it is: the clock
+            // that bounded its handshake has no standing over the path that
+            // handshake produced (B-A037).
             return;
         };
         let counterparts = room
@@ -12005,6 +12069,64 @@ mod transfer_state_tests {
             Some(next)
         );
         assert!(recipient_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_deadline_never_demotes_a_committed_direct_attempt() {
+        // B-A037, from the field: two devices on the SAME LAN, all four
+        // carriers closed at t=9999/10000 ms with `reason: null` while their
+        // ICE pairs were `succeeded` at 10-15 ms rtt and ~124 MB had already
+        // moved. The server had sent `transfer.direct_failed reason=timeout`
+        // to both peers, and the browser closes its carriers when it hears
+        // that — so the "instability" was the negotiation deadline expiring
+        // against a path that had long since committed.
+        let registry = transfer_registry();
+        registry.set_direct_deadline(Duration::from_millis(40));
+        let (_lease, room) = transfer_room(&registry);
+        let (_source, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt) =
+            active_direct_fixture(&registry, &room).await;
+        // Armed exactly as the HTTP actor arms it at `ReadyOutcome::
+        // Negotiating`, and never cancelled — the STATE is what refuses it.
+        registry.spawn_direct_deadline(&room, id, attempt);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (state_now, current) = {
+            let guard = room.state.lock().unwrap();
+            let record = guard.transfers.get(&id).unwrap();
+            (record.state, record.attempt_id)
+        };
+        assert_eq!(
+            state_now,
+            TransferState::ActiveDirect,
+            "the handshake deadline ended a path that had already committed"
+        );
+        assert_eq!(current, Some(attempt), "the committed attempt was replaced");
+        assert_eq!(
+            registry.current_relays(),
+            0,
+            "a direct transfer that never needed a relay permit took one"
+        );
+        // And neither peer heard anything, which is the half the browser
+        // reacts to: no `transfer.direct_failed`, no `abandonDirect`, no
+        // carrier closed under a transfer that was working.
+        assert!(recipient_rx.try_recv().is_err());
+        assert!(source_rx.try_recv().is_err());
+        // The attempt is still endable — by the side that can actually see
+        // the channel. This is what bounds a committed path that STALLS, and
+        // it is why refusing the timer opens no hole.
+        let (outcome, outbox) = registry
+            .direct_failed(
+                &room,
+                recipient,
+                &failed_body(id, attempt, "stalled", vec![]),
+            )
+            .unwrap();
+        assert_ne!(outcome, ReadyOutcome::Ignored);
+        assert!(!outbox.is_empty());
+        assert_eq!(
+            room.state.lock().unwrap().transfers.get(&id).unwrap().state,
+            TransferState::WaitingRelay
+        );
+        assert_eq!(registry.current_relays(), 1);
     }
 
     #[tokio::test]

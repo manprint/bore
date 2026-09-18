@@ -830,12 +830,23 @@ export function createAttemptRtc({
   return {
     start,
     handleSignal,
-    close() {
+    /**
+     * Deliberate teardown of the whole group. `cause` and `code` are written
+     * into the trace because a `closed` mark with nothing beside it cannot be
+     * told apart from any other `closed` mark — which is exactly what made a
+     * field report of B-A037 (four carriers closed at t=10000 ms, `reason`
+     * null, ICE pairs `succeeded`) readable only by pairing it with the
+     * server's source. Both go through the trace's own allow-list, so they
+     * are short lowercase enumerations or they are dropped.
+     * @param {string} [cause] why this teardown happened
+     * @param {string} [code] the reason code that came with it, when one did
+     */
+    close(cause, code) {
       if (done) {
         return;
       }
       done = true;
-      trace.mark("closed");
+      trace.mark("closed", { cause, code });
       close();
       events.onClosed?.();
     },
@@ -1087,13 +1098,20 @@ export function createCarrierGroup({ carriers = 1, events = {}, ...rest }) {
       }
       return member.actor.handleSignal(type, body);
     },
-    close() {
+    /**
+     * Tears the whole group down, giving every carrier the SAME reason. A
+     * group closes for one reason, and a per-carrier answer would suggest the
+     * carriers decided separately when they did not (B-A037).
+     * @param {string} [cause] why this teardown happened
+     * @param {string} [code] the reason code that came with it, when one did
+     */
+    close(cause, code) {
       if (closed) {
         return;
       }
       closed = true;
       for (const member of members) {
-        member.actor.close();
+        member.actor.close(cause, code);
       }
       events.onClosed?.();
     },

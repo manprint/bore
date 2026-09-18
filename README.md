@@ -2406,9 +2406,11 @@ launched, so a pipe reading stdout is never beaten by the browser.
   else — not because it is quicker. The numbers, the carrier ladder and the send-queue
   ladder behind the current defaults are in `docs/transfer/WEB_TRANSFER_PERF.md` §7.6.
 - **`--web-transfer-direct-carriers` defaults to 4 because 4 was the value that finished.**
-  One carrier reaches half the throughput of any other value on that path; eight has the
-  best median but two of its three attempts aborted mid-transfer and completed on the
-  relay; four completed every attempt it started across eleven repetitions. Raising it is
+  One carrier reaches half the throughput of any other value on that path (that row is the
+  one the deadline defect below contaminated, so read it as "clearly the slowest" and not
+  as a number); eight has the best median but two of its three attempts aborted
+  mid-transfer and completed on the relay; four completed every attempt it started across
+  eleven repetitions. Raising it is
   reasonable on a path you have measured, and the transfer stays correct either way — an
   aborted direct attempt resumes on the relay from the chunks the recipient has already
   verified.
@@ -2585,7 +2587,13 @@ There is no flag for it on either side, and the fallback never costs a second cl
 - **Anything that stops it ends on the relay, on the same click.** A pair that cannot
   reach each other, a browser with WebRTC disabled by policy, a network that drops UDP,
   or a channel that dies with the file half sent — each produces exactly one automatic
-  replacement attempt over the encrypted WebSocket relay, on the same transfer. A
+  replacement attempt over the encrypted WebSocket relay, on the same transfer.
+- **A slow transfer is not a stopped one.** The server's 10 s deadline bounds the
+  *negotiation* and nothing after it: once the channel is open and carrying, the transfer
+  stays direct for as long as it takes, whether that is ten seconds or ten minutes. Until
+  1.2.0-rc.3 that clock kept running, so every direct transfer longer than ten seconds was
+  demoted to the relay mid-file — healthy channel, LAN, no error anywhere. If you saw a
+  large download switch to `relay` at the ten-second mark, that was this. A
   failure in the middle keeps what the recipient has already **verified** and asks the
   source only for the rest, so a fallback near the end costs seconds, not the file.
 - **The row says which path carried the bytes** — `diretto` or `relay` — and it says so

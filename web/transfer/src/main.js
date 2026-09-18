@@ -203,7 +203,7 @@ const view = createView(document, app, {
   },
   onCancelTransfer: (transferId) => {
     // Abort first (inside the actors), then the idempotent control message.
-    closeDirect(transferId);
+    closeDirect(transferId, "cancelled-here");
     const cancelled = receiver?.cancelTransfer(transferId) === true;
     const aborted = sender?.abortTransfer(transferId) === true;
     if (aborted && !cancelled) {
@@ -400,13 +400,19 @@ const directAttempts = new Map();
 const directTraces = createTraceStore();
 
 /** Drops the actor for this transfer, if any, without telling the server. */
-function closeDirect(transferId) {
+function closeDirect(transferId, cause, code) {
   const entry = directAttempts.get(transferId);
   if (entry === undefined) {
     return;
   }
   directAttempts.delete(transferId);
-  entry.actor.close();
+  // `cause` (and the `code` that came with it, when one did) reach the
+  // attempt's trace: every teardown used to leave the same bare `closed`
+  // mark, so a diagnostic could not say whether the carriers went away
+  // because the transfer ENDED, because the user cancelled, or because the
+  // SERVER declared the attempt failed — the three look identical in the
+  // trace and mean opposite things (B-A037).
+  entry.actor.close(cause, code);
   // Read LAZILY: the attempt's last `getStats()` sample is issued inside
   // `close()` and lands a moment later, so a snapshot taken now would be the
   // one that is missing exactly the sample describing the failure.
@@ -438,7 +444,7 @@ function installDiagnosticsHook() {
 /** Closes every live attempt (room death, page teardown). */
 function closeAllDirect() {
   for (const transferId of [...directAttempts.keys()]) {
-    closeDirect(transferId);
+    closeDirect(transferId, "room-gone");
   }
 }
 
@@ -483,7 +489,7 @@ function sendDirectFailed(
  * notice there would cost a relay attempt nobody needs.
  */
 async function failDirect(transferId, attemptId, reason, recipient, upgrade = false) {
-  closeDirect(transferId);
+  closeDirect(transferId, "failed-here", reason);
   if (upgrade) {
     // A probe that failed changes NOTHING: the relay never stopped carrying,
     // there is no path to reset and no ranges to report. Telling the server
@@ -540,7 +546,13 @@ async function abandonDirect(body) {
   if (typeof transferId !== "string") {
     return;
   }
-  closeDirect(transferId);
+  // The SERVER declared this attempt failed: the one teardown the page
+  // did not decide, and the one the field report could not identify.
+  closeDirect(
+    transferId,
+    "server-failed",
+    typeof reason === "string" ? reason : undefined,
+  );
   if (typeof attemptId !== "string") {
     return;
   }
@@ -597,7 +609,7 @@ function startDirectAttempt(body) {
   // field is emitted only for a probe, so an ordinary first negotiation
   // reads it as absent and takes the path it always took.
   const upgrade = body.upgrade === true;
-  closeDirect(transferId);
+  closeDirect(transferId, "superseded");
   if (typeof globalThis.RTCPeerConnection !== "function") {
     // An engine without WebRTC (or a page that had it removed) says so at
     // once, so the relay attempt starts now instead of at the deadline.
@@ -729,7 +741,7 @@ function makeReceiver() {
       },
       onComplete: () => {},
       onCancelled: (transferId) => {
-        closeDirect(transferId);
+        closeDirect(transferId, "cancelled");
         applyTransferEvent({
           kind: "transfer.state",
           transferId,
@@ -740,7 +752,7 @@ function makeReceiver() {
         refreshResumable();
       },
       onStaged: (info) => {
-        closeDirect(info.transferId);
+        closeDirect(info.transferId, "staged");
         applyTransferEvent({
           kind: "transfer.state",
           transferId: info.transferId,
@@ -761,7 +773,7 @@ function makeReceiver() {
       },
       onError: (transferId, code, detail) => {
         if (typeof transferId === "string") {
-          closeDirect(transferId);
+          closeDirect(transferId, "transfer-error");
         }
         try {
           const hook = globalThis.__BORE_TEST__;
@@ -955,7 +967,7 @@ function makeSender() {
       onChunk: () => {},
       onEntryDone: () => {},
       onCancelled: (transferId) => {
-        closeDirect(transferId);
+        closeDirect(transferId, "cancelled");
         applyTransferEvent({
           kind: "transfer.state",
           transferId,
@@ -965,7 +977,7 @@ function makeSender() {
         view.announce("Trasferimento annullato");
       },
       onDone: (transferId) => {
-        closeDirect(transferId);
+        closeDirect(transferId, "done");
         applyTransferEvent({
           kind: "transfer.state",
           transferId,
@@ -975,7 +987,7 @@ function makeSender() {
       },
       onError: (transferId, code) => {
         if (typeof transferId === "string") {
-          closeDirect(transferId);
+          closeDirect(transferId, "transfer-error");
         }
         try {
           const hook = globalThis.__BORE_TEST__;

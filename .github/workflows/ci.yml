@@ -207,9 +207,29 @@ jobs:
         working-directory: web/transfer
         run: npx playwright install --with-deps ${{ matrix.project }}
 
+      # ONE worker, and `T-WEB-CROSS` excluded.
+      #
+      # The cross-engine spec names its own engines, so it cannot run in a job
+      # that installed one of them; it keeps running in the `web-transfer` job,
+      # which installs all three.
+      #
+      # The worker count is the lever this split was really about. Playwright
+      # defaults to half the vCPUs, so the runner drives two tests at once —
+      # two rooms, four browser contexts and two server processes on four
+      # vCPUs — and each context BLAKE3-hashes its share of the payload. With
+      # all three engines on one runner the pressure at least fell on three
+      # different engines; with one engine per runner it falls twice on the
+      # heaviest one, which is how firefox started losing its direct leg
+      # before the gate's own byte threshold (`killedAt: 0`, and a
+      # `channel-closed` the product correctly survives by falling back). One
+      # worker gives each test the whole runner, which is the condition the
+      # same suite passes under locally, and the three engines still run at
+      # once because they are three jobs.
       - name: Browser e2e (${{ matrix.project }})
         working-directory: web/transfer
-        run: npx playwright test --project=${{ matrix.project }} --reporter=line
+        run: >-
+          npx playwright test --project=${{ matrix.project }}
+          --grep-invert "T-WEB-CROSS" --workers=1 --reporter=line
 
       - uses: actions/upload-artifact@v4
         if: failure()

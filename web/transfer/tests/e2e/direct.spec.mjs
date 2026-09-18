@@ -382,10 +382,20 @@ test.describe.serial("direct", () => {
 
     await expect(b.page.locator("#save-file")).toBeVisible({ timeout: 120_000 });
     await expect(b.page.locator("#save-name")).toHaveText("fallback.bin");
-    // The kill really fired on the wire, not on a timer.
-    expect(await b.page.evaluate(() => window.__BORE_TEST__.killedAt ?? 0)).toBeGreaterThanOrEqual(
-      2 * 1024 * 1024,
-    );
+    // The kill really fired on the wire, not on a timer. When it did NOT,
+    // the interesting fact is never the zero — it is what the direct leg did
+    // instead, so the trace goes in the message: a leg that closed on its own
+    // before the threshold (seen on a starved runner) reads as a
+    // `channel-error` with the engine's own `detail`/`sctp` cause, which is a
+    // different finding from a leg that never carried at all.
+    const killedAt = await b.page.evaluate(() => window.__BORE_TEST__.killedAt ?? 0);
+    if (killedAt < 2 * 1024 * 1024) {
+      const why = await b.page.evaluate(() => window.__BORE_TEST__.readDirectDiagnostics());
+      expect(
+        killedAt,
+        `the kill never fired on the wire: ${JSON.stringify([...why.finished, ...why.live])}`,
+      ).toBeGreaterThanOrEqual(2 * 1024 * 1024);
+    }
 
     // The SOURCE must not call a completed transfer failed. The relay leg is
     // torn down as soon as the recipient has verified, which lands while the

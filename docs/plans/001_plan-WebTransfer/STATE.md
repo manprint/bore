@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-18 06:55 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
+> **Last updated:** 2026-09-18 08:05 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
 
 ## 0. Protocol
 
@@ -28,11 +28,11 @@ This is the only execution-state file — position, progress, ledger, and blocke
 - **Type:** `release`
 - **ID:** `v1.2.0-rc.1`
 - **Status:** `none`
-- **Intent:** coerenza del frontend e documentazione di chiusura. La 7.6 e' CHIUSA: la campagna WAN e' stata eseguita, il default dei carrier resta 4 perche' misurato, la profondita' della coda e' scesa a 512 KiB (B-A032) e `docs/transfer/WEB_TRANSFER_PERF.md` §7.6 porta le tre scale.
+- **Intent:** portare la CI di `dev` al verde con B-A034 e poi tagliare la prerelease.
 - **Phase:** 7 (`phase_08.md`)
-- **Next action:** rileggere il frontend per coerenza (badge del percorso, etichette degli errori, il pannello diagnostico) e chiudere la documentazione; poi l'intero set di gate in serie, commit su `dev`, CI verde, prerelease `v1.2.0-rc.1`.
+- **Next action:** commit di B-A034 su `dev`, push, seguire la CI fino al verde; poi creare e pushare il tag `v1.2.0-rc.1` e seguire il workflow Release.
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | HEAD `e57fcf4` | tutto COMMITTATO in `e57fcf4`: V003 C1-C5 + 7.1-7.7 + B-A023..B-A033 + T-A012. Suite browser e2e **157 pass / 0 fail**, regressione Rust seriale completa exit 0
+- **Repo state:** branch `dev` | HEAD `8b64870` (locale) / `7dabc7b` (origin/dev) | B-A034 in albero, non committato
 
 ## 2. Feature context (self-contained recap)
 
@@ -62,7 +62,7 @@ The authoritative gate commands. Identical to the phase gates and to `overview.m
 - **Build:** `cargo build --all-features` · **Fmt:** `cargo fmt --all -- --check` · **Lint:** `cargo clippy --all-features --all-targets -- -D warnings`
 - **Unit tests:** `cargo test --all-features --lib && npm ci --prefix web/transfer && npm run check --prefix web/transfer` · **E2E:** `cargo test --all-features --test web_transfer_test -- --test-threads=1 && npm run test:e2e --prefix web/transfer`
 - **Asset/regression:** `npm run build --prefix web/transfer && git diff --exit-code -- web/transfer/dist && cargo test --all-features -- --skip t_ssh_ --skip t_dmx_ --test-threads=1 && cargo test --all-features --test ssh_gateway_test --test ssh_gateway_spike_test -- --test-threads=1`
-- **Setup / caveats:** Phase 0.1 marks npm commands N/A until 0.2 creates `web/transfer`; use Node >=20 thereafter. Frontend dist is committed and Cargo must build without node_modules. Bind tests use dynamic ports and `web_transfer_test` runs serially. Existing sudo/netns harnesses authorized in `AGENTS.md` run serially when host prerequisites exist. TokenSave was synced for branch `dev`, but the active MCP process still served `main` at plan time; use branch `dev` after MCP restart or inspect source directly until then.
+- **Setup / caveats:** Phase 0.1 marks npm commands N/A until 0.2 creates `web/transfer`; use Node >=20 thereafter. **La CI gira Node 20, la workstation Node 24, e i due runner di `node --test` non si comportano allo stesso modo su un timer `unref`ato (B-A034): un gate frontend verde in locale NON e' il gate. L'oracolo locale per Node 20 e' `docker run --rm -v "$PWD":/w -w /w/web/transfer node:20-slim node --test tests/unit/*.test.mjs`.** Frontend dist is committed and Cargo must build without node_modules. Bind tests use dynamic ports and `web_transfer_test` runs serially. Existing sudo/netns harnesses authorized in `AGENTS.md` run serially when host prerequisites exist. TokenSave was synced for branch `dev`, but the active MCP process still served `main` at plan time; use branch `dev` after MCP restart or inspect source directly until then.
 - **WIP commits:** `off`
 
 ## 4. Work ledger (append-only, one row per closed unit)
@@ -193,6 +193,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 109 | bug | B-A033 | agent-1:Claude-Opus-5 | `T-WEB-DIRECT-FALLBACK` asseriva `ready` su qualunque traccia morta: c'e' una traccia PER CARRIER e uno puo' morire prima di esserlo mai stato | web/transfer/tests/e2e/direct.spec.mjs | sei esecuzioni webkit consecutive verdi | e57fcf4 |
 | 110 | sub-phase | 7.6 | agent-1:Claude-Opus-5 | campagna WAN su due host veri: default dei carrier CONFERMATO a 4 misurandolo (c1 e' meta' di tutto il resto, c2 e c8 hanno perso 2 tentativi su 3), profondita' della coda portata a 512 KiB, e il risultato che conta: su una WAN pulita il RELAY e' il doppio del diretto e non ha mai fallito | docs/transfer/WEB_TRANSFER_PERF.md, README.md, scripts/perf/web_transfer_wan.sh, web/transfer/tests/perf/wan-source.mjs | `T-WEB-PERF-WAN`: 12 ripetizioni relay 43,1-46,3 MiB/s contro 10,8-33,9 del diretto | e57fcf4 |
 | 111 | sub-phase | 7.7 | agent-1:Claude-Opus-5 | coerenza del frontend e documentazione: README sul percorso misurato e sui carrier, `STALE_ATTEMPT` etichettato, e il gate browser `T-WEB-RELAY-ONLY` che prova la specifica dell'utente — una room `--relay-only` non fa costruire NESSUNA `RTCPeerConnection` a una coppia di browser pienamente capaci | examples/web_transfer_e2e_owner.rs, web/transfer/tests/e2e/helpers.mjs, web/transfer/tests/e2e/direct.spec.mjs, README.md | `T-WEB-RELAY-ONLY` red-checked (senza la policy `counters.rtc` legge 4) + e2e 157/0 | e57fcf4 |
+| 112 | bug | B-A034 | agent-1:Claude-Opus-5 | la CI su `dev` cancellava 12 test unit del frontend (`Promise resolution is still pending but the event loop has already resolved`) che in locale passano: la CI gira Node 20 e la workstation Node 24, e `unref()` su una scadenza che un test ASPETTA fa dichiarare risolto il loop al runner di Node 20. `unref` resta solo dove nessuno osserva lo scatto | web/transfer/src/webrtc.js, web/transfer/src/receiver.js, web/transfer/dist/app.js | `node:20-slim` PRIMA 176/12 cancelled (identico alla CI) DOPO 202/0/0; Node 24 202/0/0; `cargo test --all-features web_transfer` 178/0; e2e browser 157/0 | uncommitted |
 ## 5. Files touched
 
 | Path | What was done | Unit |
@@ -610,6 +611,9 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | src/web_transfer_protocol.rs | i campi media dell'end-of-candidates scartati invece che rifiutati (B-A030) + `STALE_ATTEMPT` in `ERROR_CODES` (B-A031) | B-A030/31 |
 | src/web_transfer.rs | `WebTransferError::stale_attempt` usato in `signal_slot`/`direct_ready`; `internal` ora logga a `error` | B-A031 |
 | web/transfer/tests/e2e/direct.spec.mjs | `T-WEB-DIRECT-FALLBACK`: nessun errore della sorgente, nessuna riga `Non riuscito`, nessun errore di controllo diverso da `STALE_ATTEMPT`; rimosso il blocco di dump da 45 s | B-A029/31 |
+| web/transfer/src/webrtc.js | `unref()` tolto dalla scadenza di drain e dalla grazia di disconnessione, tenuto sul poller delle stats, con la regola scritta accanto a ciascuno | B-A034 |
+| web/transfer/src/receiver.js | `unref()` tolto dal backoff del retry di `complete`, tenuto su `idleTimer` e `requestTimer` con la ragione accanto | B-A034 |
+| web/transfer/dist/app.js | bundle ricostruito | B-A034 |
 
 ## 6. In-flight work
 
@@ -697,6 +701,7 @@ the exact corrected full regression now passes.
 | 7.5 + B-A024 — Rust unit | `cargo test --all-features --lib` | `pass 819, fail 0, ignored 2` — due corse intere consecutive verdi. NOTA: una terza corsa ha visto `holepunch::tests::a_listener_keeps_answering_until_it_has_answered_the_dialer` fallire UNA volta e passare 3/3 isolata e nelle due corse intere successive; e' un test su socket reali, estraneo a questo lavoro, e la scheggia e' registrata come tale, non nascosta | 2026-09-18 |
 | 7.5 + B-A024 — web transfer e2e | `cargo test --all-features --test web_transfer_test` | `pass 39, fail 0, ignored 1` (70 s) | 2026-09-18 |
 | 7.5 + B-A024 — browser unit | `npm run check --prefix web/transfer` | `pass 201, fail 0` (191 -> 201: 4 gate di B-A024, 3 della scadenza di inattivita', 3 della risalita) | 2026-09-18 |
+| unit frontend su Node 20 (l'oracolo della CI) | `docker run --rm -v "$PWD":/w -w /w/web/transfer node:20-slim node --test tests/unit/*.test.mjs` | `202 pass / 0 fail / 0 cancelled` | B-A034, 2026-09-18 |
 
 ## 8. Runtime deviations from the plan
 
@@ -906,6 +911,7 @@ inferenza a misura.
 
 ## 10. Do-not-repeat
 
+- Do not trust a green frontend gate run only on the workstation's Node: la CI e' su Node 20, la workstation su Node 24, e sotto Node 20 un timer `unref`ato che un test aspetta fa cancellare il test (B-A034). Non rimettere `unref()` su una scadenza il cui scatto e' il comportamento.
 - Do not ask the CLI to select or read paths; selection belongs to every browser peer.
 - Do not reuse native QUIC/holepunch types for browser data or bind another UDP socket.
 - Do not add HTTP upload, server file/temp storage, TURN, CDN assets, service workers, OS notifications or telemetry.

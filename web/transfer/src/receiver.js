@@ -310,6 +310,9 @@ export function createReceiver({
       stopIdleClock(transfer);
       failAttempt(transfer, "stalled");
     }, directIdleCheckMs);
+    // Keeps its `unref` (B-A034): this is a repeating poller, and the timer
+    // itself is what a waiting test sees as a live handle — reffing it would
+    // instead hold a Node process open for the whole life of the transfer.
     if (typeof transfer.idleTimer?.unref === "function") {
       transfer.idleTimer.unref();
     }
@@ -805,6 +808,9 @@ export function createReceiver({
     transfer.requestTimer = setTimeout(() => {
       pendingRequests.delete(requestId);
     }, 30_000);
+    // Keeps its `unref` (B-A034): nothing observes this firing — it drops a
+    // map entry no later read reaches — and a reffed 30 s cleanup would add
+    // 30 s to the end of every test process that ever sent a request.
     if (typeof transfer.requestTimer?.unref === "function") {
       transfer.requestTimer.unref();
     }
@@ -1727,9 +1733,10 @@ export function createReceiver({
       }
       sendComplete(pending.transferId, pending.body, pending.tries + 1);
     }, wait);
-    if (typeof timer?.unref === "function") {
-      timer.unref();
-    }
+    // Reffed on purpose (B-A034): the expiry of this backoff IS the retry, so
+    // a test waiting for the next `transfer.complete` must not have the
+    // runtime declare the loop idle underneath it. See `sink.waitLow` in
+    // `webrtc.js` for the rule and the failure it came from.
   }
 
   /** Stages the verified file after the server echoes completion. */

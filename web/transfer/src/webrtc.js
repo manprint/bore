@@ -223,6 +223,9 @@ export function createAttemptRtc({
       return;
     }
     statsTimer = globalThis.setInterval(sampleStats, STATS_POLL_MS);
+    // This one KEEPS its `unref` (B-A034): a repeating poller whose firing
+    // nothing observes must not hold a Node process open for the life of the
+    // attempt. The rule is the firing, not the timer.
     if (typeof statsTimer?.unref === "function") {
       statsTimer.unref();
     }
@@ -486,9 +489,10 @@ export function createAttemptRtc({
               fail("ice-failed");
             }
           }, DISCONNECT_GRACE_MS);
-          if (typeof disconnectTimer?.unref === "function") {
-            disconnectTimer.unref();
-          }
+          // Reffed on purpose — see the drain deadline below (B-A034): the
+          // expiry of this grace period IS the observable, so a test that
+          // waits for `ice-failed` must not have the runtime tell it the
+          // loop is idle.
         }
         return;
       }
@@ -799,10 +803,21 @@ export function createAttemptRtc({
           onAbort();
           return;
         }
+        // NOT `unref()`ed, and that is the point (B-A034). `unref` is a
+        // Node-only call that does nothing in a browser, so its only effect
+        // is on the test runner — and there the effect is a lie: it tells the
+        // runtime "nothing is waiting on this timer" while the promise above
+        // is waiting on exactly it. Under Node 20 the runner then declares
+        // the event loop resolved and CANCELS the test with `Promise
+        // resolution is still pending but the event loop has already
+        // resolved` (12 tests, CI run 35313196060; invisible on Node 24,
+        // which is what the workstation runs). The rule this file follows:
+        // `unref` belongs on a timer whose firing nothing observes — the
+        // stats poller below — and never on a DEADLINE whose expiry is the
+        // behaviour. Nothing is held open by reffing it: every exit path
+        // clears it, and the one that does not (`onDeadline`) IS the timer
+        // firing.
         const timer = setTimeout(onDeadline, drainTimeoutMs);
-        if (typeof timer?.unref === "function") {
-          timer.unref();
-        }
         waiters.add(finish);
         signal?.addEventListener("abort", onAbort, { once: true });
       });

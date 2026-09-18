@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-18 19:30 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
+> **Last updated:** 2026-09-18 21:45 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
 
 ## 0. Protocol
 
@@ -27,12 +27,12 @@ This is the only execution-state file — position, progress, ledger, and blocke
 
 - **Type:** `release`
 - **ID:** `v1.2.0-rc.2`
-- **Status:** `OPEN`
-- **Intent:** `v1.2.0-rc.1` resta dov'e', pubblicato e intatto: muovere un tag gia' scaricato darebbe artefatti diversi sotto lo stesso nome. La rc.2 porta le dieci commit successive — la campagna a due host e le sei correzioni di prodotto che ha prodotto (`e57fcf4`), B-A034..B-A036 e l'igiene di CI che ha reso il job del browser leggibile.
+- **Status:** `none`
+- **Intent:** CHIUSA. Prerelease `v1.2.0-rc.2` pubblicata il 2026-09-18 su `9a428ed`, 26 asset, `prerelease: true`, e `/releases/latest` resta su `v1.1.0` — nessun puntatore mobile puo' consegnarla per sbaglio. Preflight, gate-ci, gate-cross e gate-e2e tutti verdi; il primo giro aveva un solo rosso, `vhost_reservation_enforced_rejected` su aarch64-darwin (contesa di porte, la classe che l'helper `wait_bound` documenta da B-A019), passato al secondo campione senza toccare nulla.
 - **Phase:** 7 (`phase_08.md`)
-- **Next action:** commit del bump `1.2.0-rc.2`, tag annotato, push, poi il workflow Release fino al verde (preflight, gate-ci, gate-cross, gate-e2e, publish).
+- **Next action:** in attesa della decisione dell'utente sul link di stanza (valutazione consegnata: master unico nel frammento + derivazione HKDF, 27 caratteri dopo l'origine, 1-2 giorni; oppure base64url a campo singolo, 119 caratteri, mezza giornata). Il `#` non e' eliminabile senza dare le chiavi al server.
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | HEAD `49453f4` | bump di versione in albero
+- **Repo state:** branch `dev` | HEAD `9a428ed` = origin/dev | tag `v1.2.0-rc.2` pubblicato | albero pulito
 
 ## 2. Feature context (self-contained recap)
 
@@ -199,6 +199,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 115 | task | T-A013 | agent-1:Claude-Opus-5 | `ci.yml` accetta un input `workflow_dispatch` `only`: con `web-transfer` gli altri dodici job si skippano, cosi' il job che varia di piu' si prova da solo prima di pagare quindici minuti di matrice | .github/workflows/ci.yml | actionlint pulito; `inputs` e' vuoto su push/PR/schedule, quindi il percorso normale non cambia | uncommitted |
 | 116 | task | T-A014 | agent-1:Claude-Opus-5 | i tre motori passano a un job a matrice, un runner ciascuno: la suite aveva superato il suo runner e produceva un fallimento per giro, un test diverso ogni volta | .github/workflows/ci.yml | actionlint pulito | uncommitted |
 | 117 | task | T-A015 | agent-1:Claude-Opus-5 | `t_web_soak` non gira piu' nel passaggio parallelo di `Build, test & lint`: misura un budget che ritorna e un runner affamato glielo fa leggere come una perdita. Resta dov'e' seriale, nel job `web-transfer` | .github/workflows/ci.yml | actionlint pulito | uncommitted |
+| 118 | release | v1.2.0-rc.2 | agent-1:Claude-Opus-5 | prerelease tagliata su `dev`: `v1.2.0-rc.1` resta intatto, la rc.2 porta la campagna a due host, le sei correzioni di prodotto che ha trovato e l'igiene di CI | Cargo.toml, Cargo.lock | Release verde: preflight, gate-ci, gate-cross, gate-e2e; 26 asset, `prerelease: true`, `latest` fermo a v1.1.0 | 9a428ed |
 ## 5. Files touched
 
 | Path | What was done | Unit |
@@ -624,7 +625,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 
 ## 6. In-flight work
 
-`claimed — bump di versione scritto, tag non ancora creato` (v1.2.0-rc.2).
+`none — tree consistent`.
 
 ## 7. Verification state
 

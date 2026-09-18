@@ -1778,6 +1778,14 @@ pub enum ClientMessage {
         member_token_hash: [u8; 32],
         /// SHA-256 of the CLI owner token.
         owner_token_hash: [u8; 32],
+        /// `--relay-only`: no transfer in this room may negotiate the direct
+        /// path. Additive `#[serde(default)]`, so an old CLI omits it and
+        /// reads `false` — the historical behaviour. A server that predates
+        /// the field would IGNORE it, which would silently give the owner the
+        /// opposite of what they asked for, so the answer echoes the value
+        /// back and the CLI refuses a room that did not confirm it.
+        #[serde(default)]
+        relay_only: bool,
     },
 
     /// Resumes a detached web-transfer room on a fresh control connection.
@@ -2067,6 +2075,12 @@ pub enum ServerMessage {
         base_url: String,
         /// Initial lease epoch (0).
         owner_epoch: u64,
+        /// The relay-only policy the server actually installed. Additive
+        /// `#[serde(default)]`: a server that predates the field answers
+        /// `false`, which is exactly what lets the CLI tell "not supported"
+        /// from "granted" instead of assuming it was honoured.
+        #[serde(default)]
+        relay_only: bool,
     },
 
     /// Answers [`ClientMessage::ResumeWebTransferRoom`]: the detached room is
@@ -2944,6 +2958,7 @@ mod tests {
             version: 1,
             member_token_hash: [1u8; 32],
             owner_token_hash: [2u8; 32],
+            relay_only: false,
         };
         let json = serde_json::to_string(&create).unwrap();
         assert!(json.starts_with(r#"{"CreateWebTransferRoom":{"#), "{json}");
@@ -2977,6 +2992,7 @@ mod tests {
                     room_id,
                     base_url: "https://files.example.com".to_string(),
                     owner_epoch: 0,
+                    relay_only: false,
                 },
                 "WebTransferRoomCreated",
             ),

@@ -1046,3 +1046,33 @@ describe("interface", () => {
     assert.equal(bar.attributes["aria-valuenow"], "37");
   });
 });
+
+describe("web-transfer relay-only room", () => {
+  it("reads the policy from welcome, and only as a literal true", () => {
+    // `relayOnly` is ADVISORY here — the server is what enforces it, by never
+    // opening a direct attempt — so the page's only job is to report it
+    // faithfully. An older server omits the field, and "absent" has to read
+    // as the historical behaviour, never as the policy: a page that showed
+    // "relay (imposto)" on an ordinary room would be telling the user the
+    // direct path is disabled when it is simply not in use yet.
+    assert.equal(createInitialState().relayOnly, false);
+
+    const on = messageToEvent({
+      type: "welcome",
+      body: { peerId: "11", roomId: "22", relayOnly: true },
+    });
+    assert.equal(on.relayOnly, true);
+    assert.equal(reduce(createInitialState(), on).relayOnly, true);
+
+    for (const body of [
+      { peerId: "11", roomId: "22" },
+      { peerId: "11", roomId: "22", relayOnly: false },
+      { peerId: "11", roomId: "22", relayOnly: "true" },
+      { peerId: "11", roomId: "22", relayOnly: 1 },
+    ]) {
+      const event = messageToEvent({ type: "welcome", body });
+      assert.equal(event.relayOnly, false, JSON.stringify(body));
+      assert.equal(reduce(createInitialState(), event).relayOnly, false);
+    }
+  });
+});

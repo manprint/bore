@@ -39,6 +39,14 @@ pub const RESUME_BACKOFF_MAX_MS: u64 = 5000;
 /// server-chosen string), so this is the whole message.
 pub const OLD_SERVER_ERROR: &str =
     "web transfer requires an upgraded server configured with --web-transfer-base-url";
+/// `--relay-only` asked for and NOT confirmed by the server. The field is
+/// additive, so a server that predates it parses the request, creates an
+/// ordinary room and answers success: silence would hand the owner a room
+/// whose transfers take the direct path, which is the exact opposite of what
+/// they asked for. The room this message accompanies is closed, never used.
+pub const RELAY_ONLY_UNSUPPORTED_ERROR: &str =
+    "--relay-only needs a server that supports it: this one created the room without it, so \
+     transfers could still go direct. Upgrade the server, or drop --relay-only.";
 /// Second signal: the room close is already running and bounded, so the user
 /// asking twice gets out now. 128 + SIGINT, the shell convention.
 pub const FORCED_EXIT_CODE: i32 = 130;
@@ -81,6 +89,8 @@ pub struct OwnerClientConfig {
     pub insecure: bool,
     /// Open the room URL in the default browser after delivery.
     pub open_browser: bool,
+    /// Ask for a room whose transfers never negotiate the direct path.
+    pub relay_only: bool,
     /// Resume deadline after the first loss (mirrors the server grace).
     pub owner_grace_secs: u64,
 }
@@ -92,6 +102,7 @@ impl Default for OwnerClientConfig {
             secret: None,
             insecure: false,
             open_browser: false,
+            relay_only: false,
             owner_grace_secs: 60,
         }
     }
@@ -396,6 +407,7 @@ where
         version: PROTOCOL_VERSION,
         member_token_hash: member_hash,
         owner_token_hash: owner_hash,
+        relay_only: config.relay_only,
     })
     .await?;
     let (room_id, epoch, base_url) = match reply {
@@ -403,8 +415,24 @@ where
             room_id,
             base_url,
             owner_epoch,
+            relay_only,
             ..
-        } => (room_id, owner_epoch, base_url),
+        } => {
+            if config.relay_only && !relay_only {
+                // The room EXISTS on the server and would serve direct
+                // transfers. Closing it is part of the refusal: a room the
+                // operator refused must not stay reachable behind a URL
+                // that was never printed.
+                let mut session = OwnerSession {
+                    control,
+                    room_id,
+                    epoch: owner_epoch,
+                };
+                session.close_bounded().await;
+                bail!(RELAY_ONLY_UNSUPPORTED_ERROR);
+            }
+            (room_id, owner_epoch, base_url)
+        }
         ServerMessage::Error(err) => {
             // The wire text is server-chosen: it goes to the log, never to
             // the terminal, and the operator gets the one actionable line.
@@ -769,6 +797,7 @@ mod tests {
             version: 1,
             member_token_hash: [3u8; 32],
             owner_token_hash: [4u8; 32],
+            relay_only: false,
         };
         assert!(matches!(
             create,
@@ -782,6 +811,11 @@ mod tests {
     struct FakeConnector {
         room: RoomId,
         closes: std::sync::Arc<tokio::sync::Mutex<Vec<RoomId>>>,
+        /// A server that knows `relay_only` echoes what it installed. `false`
+        /// stands for one that predates the field: it parses the request,
+        /// creates an ordinary room and answers success — which is exactly
+        /// the silent downgrade the client has to catch.
+        relay_only_supported: bool,
     }
 
     impl FakeConnector {
@@ -790,7 +824,7 @@ mod tests {
             first: ClientMessage,
         ) -> Result<(Delimited<tokio::io::DuplexStream>, ServerMessage)> {
             match first {
-                ClientMessage::CreateWebTransferRoom { .. } => {
+                ClientMessage::CreateWebTransferRoom { relay_only, .. } => {
                     let (run_io, srv_io) = tokio::io::duplex(65536);
                     let mut srv = Delimited::new(srv_io);
                     let closes = std::sync::Arc::clone(&self.closes);
@@ -808,6 +842,7 @@ mod tests {
                             room_id: self.room,
                             base_url: "http://127.0.0.1:8080".to_string(),
                             owner_epoch: 0,
+                            relay_only: relay_only && self.relay_only_supported,
                         },
                     ))
                 }
@@ -824,6 +859,7 @@ mod tests {
             FakeConnector {
                 room: RoomId::from_bytes([0x77u8; 16]),
                 closes: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                relay_only_supported: true,
             },
             OwnerClientConfig::default(),
         )
@@ -853,6 +889,78 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, OwnerShutdown::DeliveryAborted);
         // Exactly one close, for the created room.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(*fake.closes.lock().await, vec![fake.room]);
+    }
+
+    #[tokio::test]
+    async fn relay_only_asked_and_confirmed_opens_the_room() {
+        // The other half of the red-check below: with a server that DOES
+        // support the flag, asking for it must still produce a room. A
+        // refusal that fired on every server would pass the negative test
+        // and break the feature.
+        let (mut fake, mut config) = fake_pair();
+        fake.relay_only_supported = true;
+        config.relay_only = true;
+        let fake = std::sync::Arc::new(fake);
+        let (created_tx, created_rx) = oneshot::channel();
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(4);
+        let interrupter = tokio::spawn(async move {
+            let created: CreatedRoom = created_rx.await.expect("created delivered");
+            lifecycle_tx.send(OwnerLifecycle::Interrupt).await.unwrap();
+            created.room_id
+        });
+        let mut connect = {
+            let fake = std::sync::Arc::clone(&fake);
+            move |first: ClientMessage| {
+                let fake = std::sync::Arc::clone(&fake);
+                async move { fake.call(first).await }
+            }
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_owner_lease_with(&config, created_tx, &mut lifecycle_rx, &mut connect),
+        )
+        .await
+        .expect("run ends")
+        .unwrap();
+        assert_eq!(outcome, OwnerShutdown::CleanClose);
+        assert_eq!(interrupter.await.unwrap(), fake.room);
+    }
+
+    #[tokio::test]
+    async fn relay_only_not_confirmed_refuses_and_closes_the_room() {
+        // A server that predates the field answers success WITHOUT the flag.
+        // Accepting that would hand the owner a room whose transfers take the
+        // direct path — the opposite of what they asked for — so the run must
+        // fail, name the flag, and close the room it is refusing to use.
+        let (mut fake, mut config) = fake_pair();
+        fake.relay_only_supported = false;
+        config.relay_only = true;
+        let fake = std::sync::Arc::new(fake);
+        let (created_tx, created_rx) = oneshot::channel();
+        let (_lifecycle_tx, mut lifecycle_rx) = mpsc::channel(4);
+        let mut connect = {
+            let fake = std::sync::Arc::clone(&fake);
+            move |first: ClientMessage| {
+                let fake = std::sync::Arc::clone(&fake);
+                async move { fake.call(first).await }
+            }
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_owner_lease_with(&config, created_tx, &mut lifecycle_rx, &mut connect),
+        )
+        .await
+        .expect("run ends")
+        .expect_err("an unconfirmed --relay-only must fail the run");
+        assert!(
+            error.to_string().contains("--relay-only"),
+            "the message must name the flag: {error}"
+        );
+        // The URL was never delivered, so nothing could join; the room the
+        // server did create is closed rather than left reachable.
+        assert!(created_rx.await.is_err(), "no room URL is delivered");
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(*fake.closes.lock().await, vec![fake.room]);
     }

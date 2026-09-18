@@ -1004,6 +1004,10 @@ enum Command {
         /// Grace after abnormal web-transfer owner loss before the room dies.
         #[clap(long, value_name = "SECS", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().owner_grace_secs, env = "BORE_WEB_TRANSFER_OWNER_GRACE")]
         web_transfer_owner_grace: u64,
+
+        /// Parallel WebRTC connections one direct web-transfer uses (1..=8).
+        #[clap(long, value_name = "N", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().direct_carriers, env = "BORE_WEB_TRANSFER_DIRECT_CARRIERS")]
+        web_transfer_direct_carriers: u64,
     },
 
     /// Diagnose this host's UDP / NAT / firewall for hole-punching (opens no
@@ -1343,6 +1347,12 @@ enum TransferCommand {
         /// Open the room URL in the default browser once it is on stdout.
         #[clap(long)]
         open: bool,
+
+        /// Force every transfer in this room onto the encrypted relay: no
+        /// peer ever negotiates the direct WebRTC path. Needs a server that
+        /// supports it — an older one is refused, never silently ignored.
+        #[clap(long)]
+        relay_only: bool,
     },
 }
 
@@ -2145,6 +2155,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 secret,
                 insecure,
                 open,
+                relay_only,
             } => {
                 bore_cli::web_transfer_cli::run_web_transfer(
                     bore_cli::web_transfer_cli::OwnerClientConfig {
@@ -2152,6 +2163,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         secret,
                         insecure,
                         open_browser: open,
+                        relay_only,
                         ..Default::default()
                     },
                 )
@@ -2369,6 +2381,7 @@ async fn dispatch(command: Command) -> Result<()> {
             web_transfer_max_relays,
             web_transfer_relay_rate,
             web_transfer_owner_grace,
+            web_transfer_direct_carriers,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -2407,6 +2420,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     max_relays_global: web_transfer_max_relays,
                     relay_rate_bytes_per_s: web_transfer_relay_rate,
                     owner_grace_secs: web_transfer_owner_grace,
+                    direct_carriers: web_transfer_direct_carriers,
                 },
                 udp,
                 control_port,
@@ -4029,8 +4043,10 @@ mod tests {
 
     /// Every flag `bore transfer web` documents parses with the documented
     /// default, and nothing undocumented does: this command selects no file
-    /// and carries no transport knob, so an accidentally inherited flag
-    /// would be a promise the browser path cannot keep.
+    /// and carries no transport TUNING, so an accidentally inherited flag
+    /// would be a promise the browser path cannot keep. `--relay-only` is the
+    /// exception the room owner asked for — a policy the SERVER enforces by
+    /// never opening a direct attempt, not a knob the browser has to honour.
     #[test]
     fn transfer_web_cli_accepts_only_documented_flags() {
         let _guard = ENV_GUARD.lock().unwrap();
@@ -4046,6 +4062,7 @@ mod tests {
                     secret,
                     insecure,
                     open,
+                    relay_only,
                 },
         } = args.command
         else {
@@ -4055,8 +4072,12 @@ mod tests {
         assert_eq!(secret, None);
         assert!(!insecure);
         assert!(!open);
+        // The default is OFF: the direct path is the one worth having, and a
+        // room that quietly forced the relay would cost the server's
+        // bandwidth for every transfer nobody asked it to carry.
+        assert!(!relay_only);
 
-        // All four documented flags together.
+        // All five documented flags together.
         let args = Args::parse_from([
             "bore",
             "transfer",
@@ -4067,6 +4088,7 @@ mod tests {
             "s3cr3t",
             "--insecure",
             "--open",
+            "--relay-only",
         ]);
         let Command::Transfer {
             command:
@@ -4075,6 +4097,7 @@ mod tests {
                     secret,
                     insecure,
                     open,
+                    relay_only,
                 },
         } = args.command
         else {
@@ -4084,13 +4107,16 @@ mod tests {
         assert_eq!(secret.as_deref(), Some("s3cr3t"));
         assert!(insecure);
         assert!(open);
+        assert!(relay_only);
 
         // Everything else is refused, including a file selection, a transport
-        // knob and a positional argument.
+        // knob and a positional argument. `--relay-only` is the ONE policy
+        // this command shares with `bore transfer`, and it is not a transport
+        // knob in the same sense: it selects which of the two paths the room
+        // may use, it is enforced by the server, and it carries no tuning.
         for bad in [
             vec!["--dest-path", "/tmp/inbox"],
             vec!["--sources", "/etc/hosts"],
-            vec!["--relay-only"],
             vec!["--carriers", "4"],
             vec!["--parallel", "8"],
             vec!["--transfer-id", "room"],

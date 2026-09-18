@@ -1041,6 +1041,7 @@ Browser-to-browser transfer (always available; see "Browser-to-browser transfer"
       --web-transfer-max-relays <N>               Maximum live opaque web-transfer relay pairs server-wide [env: BORE_WEB_TRANSFER_MAX_RELAYS=] [default: 256]
       --web-transfer-relay-rate <N>               Web-transfer relay throttle per room (bytes/s); 0 disables it [env: BORE_WEB_TRANSFER_RELAY_RATE=] [default: 104857600 (100 MiB/s)]
       --web-transfer-owner-grace <SECS>           Grace after abnormal web-transfer owner loss before the room dies; accepted range 5-600 [env: BORE_WEB_TRANSFER_OWNER_GRACE=] [default: 60]
+      --web-transfer-direct-carriers <N>          Parallel WebRTC connections one direct web-transfer uses (1..=8) [env: BORE_WEB_TRANSFER_DIRECT_CARRIERS=] [default: 4]
 
 Access logging (always available):
       --webserver-log <DIR>                   Write access logs in nginx-combined format to <DIR> (off by default) [env: BORE_WEBSERVER_LOG=]
@@ -2327,6 +2328,7 @@ without it is rejected rather than silently ignored. On a development box a loop
 | `--web-transfer-max-relays <N>` | `BORE_WEB_TRANSFER_MAX_RELAYS` | 256 | Live relay pairs server-wide |
 | `--web-transfer-relay-rate <N>` | `BORE_WEB_TRANSFER_RELAY_RATE` | 104857600 (100 MiB/s) | Relay throttle per room in bytes/s |
 | `--web-transfer-owner-grace <SECS>` | `BORE_WEB_TRANSFER_OWNER_GRACE` | 60 | Grace after an abnormal owner loss before the room dies |
+| `--web-transfer-direct-carriers <N>` | `BORE_WEB_TRANSFER_DIRECT_CARRIERS` | 4 | Parallel WebRTC connections one direct transfer uses |
 
 **What the server refuses at startup**, rather than accepting and behaving oddly later:
 
@@ -2334,6 +2336,7 @@ without it is rejected rather than silently ignored. On a development box a loop
 - `--web-transfer-stun` together with `--web-transfer-no-stun` (they contradict);
 - `--web-transfer-owner-grace` outside `5..=600` seconds
   (`--web-transfer-owner-grace must be 5..=600s`);
+- `--web-transfer-direct-carriers` outside `1..=8`;
 - a base URL whose scheme is neither `https://` nor a loopback `http://`.
 
 `--web-transfer-relay-rate 0` means *unthrottled* — every other value is a per-room
@@ -2360,12 +2363,55 @@ room active; press Ctrl+C to close
 | `-s`, `--secret <SECRET>` | `BORE_SECRET` | none | Server authentication secret, when required |
 | `--insecure` | `BORE_INSECURE` | off | Skip TLS verification (self-signed `https://`) |
 | `--open` | — | off | Open the room URL in the default browser, after it is printed |
+| `--relay-only` | — | off | Every transfer in this room goes through the encrypted relay; no peer ever negotiates the direct WebRTC path |
 
 Exactly two lines go to stdout — the URL, then the ready line — so `bore transfer web | head
 -1` is a valid way to script it. Everything else, including warnings, goes to stderr.
 `--open` never changes that order: the URL is flushed to stdout *before* the browser is
 launched, so a pipe reading stdout is never beaten by the browser.
 
+- **`--relay-only` forces the relay, and the server is what enforces it.** A room opened
+  with the flag never sends a peer the message that starts a direct attempt, so no browser
+  in it builds an `RTCPeerConnection` and no ICE candidate — no local or reflexive address —
+  ever leaves a participant's machine. Use it when the direct path is unwanted rather than
+  merely unavailable: the bytes stay end-to-end encrypted either way (the server relays
+  ciphertext it cannot read), but on the relay they travel through the server, which costs
+  its bandwidth and its `--web-transfer-max-relays` budget. Each transfer's badge in the page
+  reads `relay (imposto)` so nobody mistakes the policy for a failed direct attempt.
+  **A server that predates the flag is refused, never silently obeyed:** the field is
+  additive, so an old server would create an ordinary room and answer success; the CLI
+  compares what it asked for with what the server confirms, closes the room it will not use
+  and exits with an error naming the flag.
+- **The path is chosen per transfer, and it is chosen twice.** A transfer starts by trying
+  the direct WebRTC path and falls back to the relay when it cannot be built or when it
+  breaks. Two things make the fall reliable rather than lucky. The recipient runs an
+  **idle deadline** (20 s) on a direct attempt: a channel whose carriers go silent
+  *without closing* — a path that black-holes rather than resets, which is what a sleeping
+  laptop or a stateful firewall produces — used to leave the download waiting for ever,
+  and now fails and falls back like any other dead path. And a transfer that ended up on
+  the relay does not stay there: the server offers the direct path again on a finite grid
+  (after 20 s, then 40 s, then 80 s, three attempts) by negotiating a **probe** *beside*
+  the relay that is still delivering. A probe that fails costs nothing — it never touches
+  the live transfer — and only when it succeeds does the transfer move, resuming from the
+  chunks the relay already delivered rather than restarting. A room opened with
+  `--relay-only` is never offered a probe.
+- **Which path is FASTER is a measurement, and on a clean WAN it is the relay.** Between
+  two real hosts 21 ms apart on a 222 Mbit/s uplink (`scripts/perf/web_transfer_wan.sh`,
+  128 MiB per arm, arms alternated inside each repetition) the relay moved **43.5 MiB/s**
+  with a spread of 43.1–46.3 across twelve repetitions, while the direct path moved
+  10.8–33.9 MiB/s depending on `--web-transfer-direct-carriers` and occasionally aborted
+  mid-transfer. A browser DataChannel is SCTP over DTLS over UDP implemented inside the
+  tab; a relay leg is kernel TCP with the server applying backpressure. So choose the
+  direct path because it spends no server bandwidth and puts the payload through nobody
+  else — not because it is quicker. The numbers, the carrier ladder and the send-queue
+  ladder behind the current defaults are in `docs/transfer/WEB_TRANSFER_PERF.md` §7.6.
+- **`--web-transfer-direct-carriers` defaults to 4 because 4 was the value that finished.**
+  One carrier reaches half the throughput of any other value on that path; eight has the
+  best median but two of its three attempts aborted mid-transfer and completed on the
+  relay; four completed every attempt it started across eleven repetitions. Raising it is
+  reasonable on a path you have measured, and the transfer stays correct either way — an
+  aborted direct attempt resumes on the relay from the chunks the recipient has already
+  verified.
 - **The fragment (`#m=…&k=…`) is the capability.** It holds the room key and the member
   token, and a URL fragment is never sent to a server: not to bore, not to a proxy, not into
   a log or the admin API. Share the whole link only with the people who may join, over a
@@ -2625,16 +2671,49 @@ Nothing below needs a second tool: one server, one `bore transfer web`, three br
 | `Download non supportato da questo browser` | No OPFS in this browser or context | Use an up-to-date Chrome/Firefox/Safari over HTTPS or loopback; publishing still works without OPFS |
 | `Relay occupato: riprova tra poco` ("relay busy") | `--web-transfer-max-relays` reached server-wide, or the peer already has `--web-transfer-max-transfers-per-peer` transfers | Retry; raise the limit if this is normal load |
 | `Offerta non autentica: ignorata` ("offer not authentic") | An announcement arrived whose tag does not verify against the room key | Expected and correct — the offer is dropped. If it repeats, treat the room link as compromised and open a new room |
-| Every transfer reads `relay`, even between two machines on the same LAN | `--web-transfer-no-stun` is set (host candidates only), or outbound UDP is blocked on one of the two sides | Drop the flag, or point `--web-transfer-stun` at a STUN server both browsers can reach, and allow outbound UDP — the direct path needs it from **both** browsers, and no inbound port from either |
-| A row changed from `diretto` to `relay` while it was running | The DataChannel died mid-transfer; the replacement attempt took over | Nothing to do. The verified chunks were kept and only the rest was re-requested; the saved file is byte-identical either way |
+| Every transfer reads `relay`, even between two machines on the same LAN | Two different things, and they need different fixes. On one LAN the browsers normally pair on their **host** candidates and STUN is not involved at all, so `--web-transfer-no-stun` does **not** by itself force the relay — it only removes the reflexive candidates two machines on the same subnet were not going to need. What does force it here is the two machines being unable to send UDP to each other: client isolation ("AP isolation", "guest network") on the access point, a host firewall dropping inbound UDP, or the two devices being on different subnets/VLANs with no route between them | First read `Copia diagnostica percorso` on the receiving tab: it names the **type** of candidate pair that carried the bytes (`host`, `srflx`, `prflx`) and the reason the direct attempt ended. If it never pairs at all, test UDP between the two machines directly (for example `nc -u`), turn off client isolation on the access point, and allow UDP on both host firewalls. Only if the two are on **different** networks does STUN matter: drop `--web-transfer-no-stun` or point `--web-transfer-stun` at a server both browsers can reach. The direct path needs outbound UDP from **both** browsers and an inbound port from neither |
+| A row changed from `diretto` to `relay` while it was running | The DataChannel died mid-transfer, or it stopped draining for 10 s (a path that is up but no longer moving bytes counts as dead); the replacement attempt took over | Nothing to do. The verified chunks were kept and only the rest was re-requested; the saved file is byte-identical either way. `Copia diagnostica percorso` says which of the two it was |
 | A row sits on `in connessione` for a while before showing a path | No chunk has been verified on either path yet — ICE is still trying, or the first chunk is still arriving | Expected. The badge follows verified bytes, not intentions; a direct attempt gives up after 10 s and the relay takes over |
-| A download is slower than the link | The row reads `relay`: the two browsers could not reach each other directly, and the relay is throttled per room | Raise or disable `--web-transfer-relay-rate` (`0` = unthrottled). A direct path needs UDP out of both networks; a strict NAT or firewall on either side forces the relay |
+| A download is slower than the link, and the row reads `relay` | The relay is throttled per room, and the default is already **100 MiB/s** — so this explains a slow transfer only if you lowered it, or if the room's traffic is crossing a WAN link that is itself the limit. Both legs go through the server, so a relay transfer is bounded by the slower of the two peers' links to it, not by the link between the peers | Check the value actually in force on `/admin/api/v1/config` before changing it; raise or disable it with `--web-transfer-relay-rate` (`0` = unthrottled) only if it is the bound. If the server is remote, measure the two legs (for example `iperf3` from each peer to the server host) — a transfer between two machines in one room routed through a server on another continent pays that round trip twice |
+| A download is slower than the link, and the row reads `diretto` | The direct path is **not** uniformly fast. Measured on Chromium, the DataChannel send path can freeze once per transfer for 1.3–1.7 s while the queue drains — long enough to cut an 8 MiB transfer to a fifth of its normal rate. It does not happen on Firefox on the same machine and same path, it is not packet loss, and nothing in the page can prevent it | Use `Copia diagnostica percorso`: `drain_longest` in the report is exactly this wait, and a value in the hundreds or thousands of milliseconds is the whole explanation. There is no setting to change — retry, or use Firefox for the transfer if it repeats. The full measurement is in `docs/transfer/WEB_TRANSFER_PERF.md` §4.6 |
 | `Offerta con più file: scegli un file o scarica lo ZIP` | A raw (single-file) download was asked for an offer that holds more than one file — the card's own button asks for the ZIP, so this normally means the offer changed shape between the render and the click | Reload the catalogue and use `Scarica ZIP`, or open the folder and pick one file |
 | `File modificato alla sorgente` ("file changed at the source") | The file on the publisher's disk changed after it was announced: the bytes no longer match the hashes the offer was signed with | Republish the file; a transfer already running stops rather than saving a mixture of two versions |
 | `Sorgente non raggiungibile` ("source unreachable") | The publishing peer left the room, closed the tab or lost its connection while the transfer was running | Wait for that peer to come back and start the download again — verified chunks are kept, so it resumes rather than restarting |
 | `Offerta cambiata: ripubblica il file` | The offer was replaced by a new announcement for the same ID while a download was being set up | Reload the catalogue and download the current offer |
 | The page loads but behaves like an older build, or the console reports a module error right after a server upgrade | A proxy or CDN is serving `/transfer/assets/…` from its own cache. The bundle is compiled **into the binary**, so it changes with the binary, and the server itself answers every asset with `Cache-Control: no-cache` | Purge that path on the proxy (or stop it overriding `Cache-Control`) and reload; the bytes the server serves always match the running binary |
 | `Versione non supportata: aggiorna la pagina` | An open tab is talking to a server that was replaced by a newer one while the tab stayed open | Reload the page. The room itself is gone with the old process, so the link has to be a new one |
+
+#### Why a transfer ended up on the relay
+
+A row that went from `diretto` to `relay` — or never reached `diretto` — has three very
+different causes, and they used to look identical from outside: the ICE path never worked,
+the DataChannel died, or the channel stopped draining and the queue was abandoned. The page
+now keeps a small trace of its own for the last few direct attempts, and
+**`Copia diagnostica percorso`** (under `Trasferimenti`) puts it on the clipboard:
+
+- the fixed reason the attempt ended with (`ice-failed`, `channel-closed`, `send-error`,
+  `timeout`, `unsupported`, `protocol`);
+- the timeline of ICE and channel states, with milliseconds;
+- the **type** of candidate pair the browser actually selected — `host` (the two devices
+  reached each other directly on the LAN), `srflx` (through a NAT, via STUN) — which is the
+  one thing "both on the same Wi-Fi" does not tell you;
+- the transport counters `getStats()` publishes: round-trip time, congestion window, bytes
+  and messages, and how long the send queue stayed above its high-water mark.
+
+It carries **no address, no port, no candidate line, no SDP, no file name, no peer name and
+no room secret** — numbers and short labels only — and it never leaves the page unless you
+press that button.
+
+On the server side the matching line is written when a browser reports its direct attempt
+as failed:
+
+```text
+INFO web-transfer direct attempt failed transfer=<id> attempt=<id> reason=ice-failed verified_ranges=2
+```
+
+It carries the same fixed reason and the server's own opaque IDs, and nothing about the
+peers. Read the two together: the server says *that* a path was abandoned and when, the
+browser trace says *why*.
 
 ## Diagnosing UDP / NAT (`bore test-udp`)
 

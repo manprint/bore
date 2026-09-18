@@ -87,6 +87,7 @@ export const ERROR_CODES = [
   "STORAGE_QUOTA",
   "CANCELLED",
   "INTERNAL",
+  "STALE_ATTEMPT",
 ];
 
 export function clientTypeRequiresRequestId(type) {

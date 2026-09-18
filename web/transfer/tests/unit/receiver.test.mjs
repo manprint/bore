@@ -14,8 +14,13 @@ import {
   sealFrame,
   sha256Hex,
 } from "../../src/crypto.js";
-import { canonicalize, manifestValue } from "../../src/protocol.js";
-import { FRAME_PIPELINE_DEPTH, createReceiver } from "../../src/receiver.js";
+import { CHUNK_BYTES, canonicalize, manifestValue } from "../../src/protocol.js";
+import {
+  COMPLETE_MAX_RETRIES,
+  FRAME_PIPELINE_DEPTH,
+  createReceiver,
+  progressIsDue,
+} from "../../src/receiver.js";
 import { chunkPartName, createRepository } from "../../src/storage.js";
 import { fakeBackends } from "./fakes.mjs";
 
@@ -975,5 +980,132 @@ describe("web-transfer receiver", () => {
     assert.equal(typeof request.body.resume.outputLength, "number");
     assert.equal(request.body.resume.outputLength, Number(entry.size));
     assert.deepEqual(Object.keys(request.body.resume).sort(), ["outputLength", "verifiedRanges"]);
+  });
+});
+
+describe("web-transfer completion under a rate limit (B-A024)", () => {
+  /** Drives one whole transfer and returns its `transfer.complete`. */
+  async function completed(h, bytes) {
+    const { key } = await startFlow(h, bytes);
+    let seq = 0;
+    for (let at = 0; at < bytes.length; at += 24 * 1024) {
+      h.sockets[0].emit(
+        await sealFrame(key, seq, 1, bytes.subarray(at, at + 24 * 1024)),
+      );
+      seq += 1;
+    }
+    const total = new Uint8Array(8);
+    new DataView(total.buffer).setBigUint64(0, BigInt(bytes.length), false);
+    h.sockets[0].emit(await sealFrame(key, seq, 2, total));
+    await waitFor(() => h.control.some((m) => m.type === "transfer.complete"));
+    return h.control.filter((m) => m.type === "transfer.complete");
+  }
+
+  it("a_refused_completion_is_sent_again_instead_of_stranding_a_verified_file", async () => {
+    // MEASURED on loopback at 256 MiB before this fix: every byte received
+    // and verified on disk, `transfer.complete` refused RATE_LIMITED, and the
+    // row stayed `complete-pending` for as long as it was watched. The file
+    // could never be saved and the source never learned the transfer ended.
+    const h = harness();
+    const bytes = new Uint8Array(24 * 1024 * 3).map((_, i) => (i * 5 + 1) % 251);
+    const first = await completed(h, bytes);
+    assert.equal(first.length, 1);
+    assert.equal(
+      h.receiver.handleControl({
+        type: "error",
+        requestId: first[0].requestId,
+        body: { code: "RATE_LIMITED" },
+      }),
+      true,
+      "a refusal naming the completion is HANDLED, not dropped on the floor",
+    );
+    await waitFor(
+      () => h.control.filter((m) => m.type === "transfer.complete").length === 2,
+      "the completion to be sent again",
+    );
+    const sent = h.control.filter((m) => m.type === "transfer.complete");
+    assert.notEqual(
+      sent[0].requestId,
+      sent[1].requestId,
+      "a fresh requestId: the server answers per request, and the first verdict is spent",
+    );
+    assert.deepEqual(sent[0].body, sent[1].body, "the same statement, re-made");
+    assert.equal(
+      h.receiver.handleControl({
+        type: "ack",
+        requestId: sent[1].requestId,
+        body: { result: {} },
+      }),
+      true,
+    );
+    await waitFor(() => h.events.staged.length === 1);
+    assert.deepEqual(h.events.errors, []);
+  });
+
+  it("a_completion_refused_past_the_grid_fails_loudly_instead_of_hanging", async () => {
+    // The grid is finite on purpose: a row frozen at 100% forever is worse
+    // than a visible failure the user can act on.
+    const h = harness();
+    const bytes = new Uint8Array(24 * 1024 * 2).map((_, i) => (i * 3 + 7) % 251);
+    await completed(h, bytes);
+    for (let round = 0; round <= COMPLETE_MAX_RETRIES; round += 1) {
+      const sent = h.control.filter((m) => m.type === "transfer.complete");
+      const last = sent[sent.length - 1];
+      h.receiver.handleControl({
+        type: "error",
+        requestId: last.requestId,
+        body: { code: "RATE_LIMITED" },
+      });
+      if (h.events.errors.length > 0) {
+        break;
+      }
+      await waitFor(
+        () =>
+          h.control.filter((m) => m.type === "transfer.complete").length ===
+          sent.length + 1,
+        `retry ${round + 1}`,
+      );
+    }
+    assert.equal(h.events.errors.length, 1, "the user is told, exactly once");
+    assert.equal(h.events.errors[0][1], "RATE_LIMITED");
+    assert.equal(h.events.staged.length, 0);
+  });
+
+  it("a_completion_refused_for_a_reason_that_will_not_pass_fails_at_once", async () => {
+    // Retrying a verdict that cannot change is a way to spend the very
+    // budget that is short. Only a RETRYABLE code is re-sent.
+    const h = harness();
+    const bytes = new Uint8Array(24 * 1024).map((_, i) => (i * 11 + 2) % 251);
+    const sent = await completed(h, bytes);
+    h.receiver.handleControl({
+      type: "error",
+      requestId: sent[0].requestId,
+      body: { code: "INVALID_MESSAGE" },
+    });
+    await tick(60);
+    assert.equal(
+      h.control.filter((m) => m.type === "transfer.complete").length,
+      1,
+      "no retry for a verdict that will not change",
+    );
+    assert.deepEqual(h.events.errors, [[sent[0].body.transferId, "INVALID_MESSAGE"]]);
+  });
+
+  it("a_progress_report_is_due_on_time_and_never_on_bytes", async () => {
+    // The cause of the wedge, pinned as policy. The rule used to fire on
+    // EITHER 500 ms or a megabyte, so a fast path produced a report per
+    // megabyte — MEASURED at ~50 a second against a server bucket of 4 a
+    // second — and the exhausted bucket is what refused the completion.
+    assert.equal(progressIsDue(1000, 0, true, 1), true, "the first always leaves");
+    assert.equal(progressIsDue(1000, 900, false, 1), false, "100 ms is too soon");
+    assert.equal(progressIsDue(1500, 1000, false, 1), true, "500 ms is due");
+    // Whatever the bytes, the answer depends on the CLOCK alone: this
+    // signature has no byte term to pass.
+    assert.equal(progressIsDue(1100, 1000, false, 1), false);
+    // The rate is SHARED: eight downloads report once every four seconds
+    // each, which is the same two a second in total.
+    assert.equal(progressIsDue(2000, 0, false, 8), false, "8 live => 4 s apart");
+    assert.equal(progressIsDue(4000, 0, false, 8), true);
+    assert.equal(progressIsDue(1500, 1000, false, 0), true, "0 is read as 1");
   });
 });

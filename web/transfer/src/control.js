@@ -77,6 +77,18 @@ export function createControlSession({ url, memberToken, displayName, events }) 
           const kind = parsed.type;
           if (typeof kind === "string") {
             hook.outboundTypes.push(kind);
+            // An `error` reply names only the `requestId` it answers, so
+            // without this map a rejected message is unattributable: the
+            // gate sees `INVALID_MESSAGE` and cannot say WHICH message the
+            // server refused. Recording the type by id is what makes a
+            // control error diagnosable from the page alone.
+            if (
+              typeof parsed.requestId === "string" &&
+              hook.outboundById !== null &&
+              typeof hook.outboundById === "object"
+            ) {
+              hook.outboundById[parsed.requestId] = kind;
+            }
           }
           // 3.5: the resume descriptor a request carried (or `null`), so an
           // e2e can tell a fresh download from a resumed one. Ranges only —

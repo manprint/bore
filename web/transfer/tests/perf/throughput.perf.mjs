@@ -227,7 +227,7 @@ async function measureOnce(a, b, into, name, bytes) {
  * "first in the repetition" a second variable and hands it entirely to one
  * arm (§8.85).
  */
-async function runComparison(a, recipients, tag, onSize) {
+async function runComparison(a, recipients, tag, onSize, onRep) {
   for (const sizeMiB of sizes) {
     const bytes = payloadOf(sizeMiB);
     const samples = new Map(recipients.map(({ label }) => [label, newSamples()]));
@@ -235,6 +235,15 @@ async function runComparison(a, recipients, tag, onSize) {
       const order = rep % 2 === 0 ? recipients : [...recipients].reverse();
       for (const { label, peer: b } of order) {
         await measureOnce(a, b, samples.get(label), `perf-${tag}-${sizeMiB}-${rep}-${label}.bin`, bytes);
+      }
+      // Read the per-attempt trace HERE, not after the last repetition: the
+      // page's store is bounded (`MAX_TRACED_ATTEMPTS`), so a run with more
+      // attempts than slots silently drops the OLDEST — which on a bimodal
+      // arm is exactly the slow repetition the trace exists to explain. It
+      // did: the first instrumented run lost a 3.3 s drain and published the
+      // five fast repetitions under six rep numbers that were store indexes.
+      if (onRep) {
+        await onRep(rep, sizeMiB);
       }
     }
     await onSize(sizeMiB, samples);
@@ -322,6 +331,28 @@ test("direct versus relay throughput", async () => {
   }
 
   console.log(`PERF host=browser (${engine}, direct vs relay, OPFS staging, loopback)`);
+  /** Attempt traces, keyed by the attempt that produced them, newest last. */
+  const pathTraces = [];
+  const seenAttempts = new Set();
+  const collectTraces = async (rep) => {
+    for (const [side, page] of [
+      ["src", a.page],
+      ["dst", recipients[0].peer.page],
+    ]) {
+      const traces = await page.evaluate(() => {
+        const read = window.__BORE_TEST__.readDirectDiagnostics();
+        return [...read.finished, ...read.live];
+      });
+      for (const trace of traces) {
+        const key = `${side}:${trace.attemptId}`;
+        if (seenAttempts.has(key)) {
+          continue;
+        }
+        seenAttempts.add(key);
+        pathTraces.push({ side, rep, trace });
+      }
+    }
+  };
   await runComparison(a, recipients, "path", async (sizeMiB, samples) => {
     for (const { label } of recipients) {
       reportArm(`${label}-${engine}`, sizeMiB, samples.get(label));
@@ -340,7 +371,38 @@ test("direct versus relay throughput", async () => {
         .map((r) => (Number.isFinite(r) ? r.toFixed(3) : "FAILED"))
         .join(" ")}]`,
     );
-  });
+  }, collectTraces);
+
+  // V003-C1: the direct arm's own trace, one line per repetition, printed
+  // BESIDE the rates. A bimodal throughput number cannot say whether a slow
+  // repetition used a different KIND of path, sat on a stalled queue or paid
+  // a congestion window that never opened — and the performance document
+  // used to name SCTP loss as the cause with no measurement behind it. These
+  // are the numbers that decide, and they cost nothing to print.
+  // BOTH sides: the SOURCE is the one that waits for the channel to drain
+  // (`src.drain` is its stage), so a queue diagnosis read only from the
+  // recipient would report zero on exactly the repetitions it must explain.
+  {
+    await collectTraces(reps - 1);
+    for (const { side, rep, trace } of pathTraces) {
+      const last = trace.stats.at(-1) ?? {};
+      const pair = last.pair ?? {};
+      const sctp = last.sctp ?? {};
+      const channel = last.channel ?? {};
+      console.log(
+        `PERF direct-path-${engine} side=${side} rep=${rep} ` +
+          `pair=${pair.localType ?? "?"}/${pair.remoteType ?? "?"} rtt=${pair.rttMs ?? "?"}ms ` +
+          `out_bitrate=${pair.outBitrate ?? "?"} pair_bytes=${pair.bytesSent ?? "?"} ` +
+          `discarded=${pair.discardedOnSend ?? "?"} cwnd=${sctp.cwnd ?? "?"} ` +
+          `sctp_rtt=${sctp.rttMs ?? "?"}ms unack=${sctp.unackData ?? "?"} ` +
+          `chan_msgs=${channel.messagesSent ?? "?"} chan_bytes=${channel.bytesSent ?? "?"} ` +
+          `drain_waits=${trace.drain.waits} drain_timeouts=${trace.drain.timeouts} ` +
+          `drain_longest=${trace.drain.longestMs}ms drain_total=${trace.drain.waitedMs}ms ` +
+          `peak_queued=${trace.drain.peakQueued} elapsed=${trace.elapsedMs}ms ` +
+          `reason=${trace.reason ?? "none"}`,
+      );
+    }
+  }
 
   // A direct arm that produced no bytes is THE defect, not a missing number:
   // fail loudly rather than publish a silent relay figure under a direct

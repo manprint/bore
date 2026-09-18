@@ -36,6 +36,28 @@ pub const WEB_TRANSFER_CTRL_TIMEOUT: Duration = Duration::from_secs(60);
 pub const WEB_TRANSFER_REAPER_TICK: Duration = Duration::from_millis(500);
 /// Deadline for one direct-path (WebRTC) negotiation attempt.
 pub const WEB_TRANSFER_DIRECT_DEADLINE: Duration = Duration::from_secs(10);
+/// How long a transfer carries on the RELAY before the server offers the
+/// direct path again.
+///
+/// A transfer reaches the relay for reasons that are usually temporary — a
+/// browser that had not finished gathering when the deadline ran out, a NAT
+/// that dropped one flow, a radio that went away — and before this the relay
+/// was where it stayed for the whole transfer, however long that was. The
+/// direct path is what takes the server off the wire, so leaving a transfer
+/// on the relay costs the operator bandwidth for every byte and costs the
+/// peers privacy they did not choose to give up.
+///
+/// The probe runs BESIDE the relay, which never stops carrying: a probe that
+/// fails costs nothing but the signalling it sent, and a probe that succeeds
+/// switches at a chunk boundary through the same commit the fallback uses in
+/// the other direction. The grid GROWS (20 s, 40 s, 80 s) and stops after
+/// [`WEB_TRANSFER_UPGRADE_TRIES`], so a pair that genuinely cannot reach each
+/// other is asked three times and then left alone — the same shape, and for
+/// the same reason, as the secret tunnel's `UDP_UPGRADE_MAX_SECS` (S-8).
+pub const WEB_TRANSFER_UPGRADE_DELAY: Duration = Duration::from_secs(20);
+/// How many times the server offers the direct path to a relaying transfer.
+pub const WEB_TRANSFER_UPGRADE_TRIES: u32 = 3;
+
 /// Time a recipient waits for the peer's relay leg to attach.
 pub const WEB_TRANSFER_RELAY_ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on one control-channel heartbeat write (`beat_once` shape).
@@ -61,8 +83,21 @@ pub const WEB_TRANSFER_LOW_WATER_BYTES: usize = 1024 * 1024;
 pub const WEB_TRANSFER_MAX_SDP_BYTES: usize = 64 * 1024;
 /// Largest accepted single ICE candidate line (bytes).
 pub const WEB_TRANSFER_MAX_ICE_CANDIDATE_BYTES: usize = 4 * 1024;
-/// Largest accepted ICE candidate count per side.
+/// Largest accepted ICE candidate count per side. The budget is per SIDE and
+/// per ATTEMPT, not per carrier: an attempt that negotiates several carriers
+/// gathers roughly the same addresses on each, so a per-carrier budget would
+/// multiply a bound whose purpose is to cap what the server forwards.
 pub const WEB_TRANSFER_MAX_ICE_CANDIDATES_PER_SIDE: usize = 128;
+/// Carriers one direct attempt may negotiate: the ceiling on the index the
+/// signalling carries, and the width of the per-carrier bitmask the room
+/// state keeps (`u16`, so this can never exceed 16).
+///
+/// The direct path's throughput is bound PER SCTP ASSOCIATION — one
+/// association per `RTCPeerConnection`, its send buffer divided by the RTT —
+/// so carriers are the only way past it. MEASURED between two hosts 31 ms
+/// apart: 1 association 5.38 MiB/s, 2 associations 10.57, 4 associations
+/// 41.42, with the receiving host's CPU idle throughout.
+pub const WEB_TRANSFER_MAX_DIRECT_CARRIERS: usize = 8;
 /// Maximum `sdpMid` length on a forwarded ICE candidate.
 pub const WEB_TRANSFER_MAX_ICE_SDP_MID_BYTES: usize = 64;
 /// Largest accepted peer display name (Unicode scalar values).
@@ -281,6 +316,16 @@ pub struct WebTransferLimits {
     pub relay_rate_bytes_per_s: u64,
     /// Grace after abnormal owner loss before the room dies (seconds).
     pub owner_grace_secs: u64,
+    /// Carriers a direct attempt negotiates: N `RTCPeerConnection`s, so N
+    /// independent SCTP associations carrying one frame stream.
+    ///
+    /// The direct path's throughput is bound PER ASSOCIATION — the send
+    /// buffer divided by the round-trip time — and that bound does not move
+    /// with the size of the transfer. MEASURED between two hosts 31 ms apart:
+    /// one association 5.38 MiB/s, two 10.57, four 41.42, with the receiving
+    /// host idle throughout. `1` is the path as it was before carriers,
+    /// message for message.
+    pub direct_carriers: u64,
 }
 
 impl Default for WebTransferLimits {
@@ -298,6 +343,7 @@ impl Default for WebTransferLimits {
             max_relays_global: 256,
             relay_rate_bytes_per_s: 104857600,
             owner_grace_secs: 60,
+            direct_carriers: 4,
         }
     }
 }
@@ -342,6 +388,13 @@ impl WebTransferLimits {
                 self.owner_grace_secs
             );
         }
+        if !(1..=WEB_TRANSFER_MAX_DIRECT_CARRIERS as u64).contains(&self.direct_carriers) {
+            bail!(
+                "web-transfer direct carriers must be 1..={}, got {}",
+                WEB_TRANSFER_MAX_DIRECT_CARRIERS,
+                self.direct_carriers
+            );
+        }
         if self.max_metadata_total_bytes < self.max_metadata_per_room_bytes {
             bail!(
                 "web-transfer total metadata {} must cover one room {}",
@@ -372,6 +425,19 @@ pub struct WebTransferBaseUrl {
     authority: String,
 }
 
+/// Whether an `http` base URL's host is loopback, decided from the host
+/// ALONE. Pure on purpose: the rule must not depend on a resolver, on the
+/// network the server booted on, or on the moment the question is asked.
+/// `localhost` is the one name, because it is the one name a browser grants
+/// a secure context to; every other name is rejected however it resolves.
+fn http_host_is_loopback(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(v4) => v4.is_loopback(),
+        url::Host::Ipv6(v6) => v6.is_loopback(),
+    }
+}
+
 impl WebTransferBaseUrl {
     /// Parses and validates `input`. Rejects userinfo, query, fragment and any
     /// path other than empty/`/`; normalizes a trailing slash away.
@@ -381,23 +447,33 @@ impl WebTransferBaseUrl {
         match url.scheme() {
             "https" => {}
             "http" => {
+                // Loopback is decided by the URL ITSELF — an IP literal in
+                // `127.0.0.0/8` or `::1`, or the name `localhost` — and never
+                // by resolving the host.
+                //
+                // It used to ask the resolver, and on a network whose router
+                // answers every unknown name with `127.0.0.1` (measured on an
+                // ordinary consumer line: `files.example.com` resolved to
+                // `127.0.0.1` through `*.homenet.telecomitalia.it`) that
+                // turned "loopback-only" into "whatever DNS says today",
+                // accepting a plaintext base URL for a public name. Two
+                // things were wrong with it: the answer could change after
+                // the check, and `Iterator::all` on an EMPTY address list is
+                // vacuously true, so a resolver returning no addresses read
+                // as loopback.
+                //
+                // The literal rule is also the browser's own: a secure
+                // context is granted to `localhost` and to loopback
+                // literals, never to some other name that happens to resolve
+                // there — so a base URL this accepts is exactly one whose
+                // page can use `crypto.subtle`, OPFS and WebRTC.
                 let host = url
-                    .host_str()
+                    .host()
                     .ok_or_else(|| anyhow::anyhow!("http base URL needs a host"))?;
-                let loopback = host.eq_ignore_ascii_case("localhost")
-                    || url
-                        .socket_addrs(|| None)
-                        .map(|addrs| {
-                            addrs.iter().all(|a| match a {
-                                std::net::SocketAddr::V4(v4) => v4.ip().octets()[0] == 127,
-                                std::net::SocketAddr::V6(v6) => v6.ip().is_loopback(),
-                            })
-                        })
-                        .unwrap_or(false)
-                    || host == "[::1]"
-                    || host == "::1";
-                if !loopback {
-                    bail!("http base URL is loopback-only, got host {host}");
+                if !http_host_is_loopback(&host) {
+                    bail!(
+                        "http base URL is loopback-only (localhost, 127.0.0.0/8 or [::1]), got host {host}"
+                    );
                 }
             }
             scheme => bail!("base URL scheme must be https (loopback http allowed), got {scheme}"),
@@ -672,6 +748,49 @@ mod tests {
     }
 
     #[test]
+    fn the_http_loopback_rule_never_consults_a_resolver() {
+        // The rule this pins is a property of the HOST, so the test can state
+        // it without a network. It is here because the old rule asked the
+        // resolver: on an ordinary consumer line whose router answers every
+        // unknown name with `127.0.0.1`, `http://files.example.com` was
+        // ACCEPTED as loopback — and `Iterator::all` over an empty address
+        // list made "the resolver returned nothing" read as loopback too.
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        for name in [
+            "files.example.com",
+            // Names that resolve to 127.0.0.1 on many hosts. Whether they do
+            // HERE is exactly what must not matter.
+            "localhost.localdomain",
+            "loopback.test",
+            // A prefix or suffix of the one accepted name is not that name.
+            "localhosts",
+            "notlocalhost",
+            "localhost.example.com",
+        ] {
+            assert!(
+                !http_host_is_loopback(&url::Host::Domain(name)),
+                "must not be loopback: {name}"
+            );
+        }
+        assert!(http_host_is_loopback(&url::Host::Domain("localhost")));
+        assert!(http_host_is_loopback(&url::Host::Domain("LocalHost")));
+        assert!(http_host_is_loopback(&url::Host::Ipv4(Ipv4Addr::new(
+            127, 0, 0, 1
+        ))));
+        // The whole 127.0.0.0/8, not just .0.1.
+        assert!(http_host_is_loopback(&url::Host::Ipv4(Ipv4Addr::new(
+            127, 53, 0, 2
+        ))));
+        assert!(!http_host_is_loopback(&url::Host::Ipv4(Ipv4Addr::new(
+            192, 168, 1, 2
+        ))));
+        assert!(http_host_is_loopback(&url::Host::Ipv6(Ipv6Addr::LOCALHOST)));
+        assert!(!http_host_is_loopback(&url::Host::Ipv6(Ipv6Addr::new(
+            0, 0, 0, 0, 0, 0, 0, 2
+        ))));
+    }
+
+    #[test]
     fn base_url_rejects_path_query_fragment_and_userinfo() {
         for input in [
             "https://files.example.com/transfer",
@@ -894,11 +1013,35 @@ impl WebTransferError {
         }
     }
 
-    /// Server-side fault (ID collision exhaustion, poisoned lock).
+    /// Signalling that names an attempt the transfer has moved past. It is
+    /// NOT `INVALID_MESSAGE`: the message is well formed and the sender was
+    /// right to send it. Trickle ICE gathers for seconds while an attempt can
+    /// end in milliseconds, so a candidate for the attempt that just died is
+    /// the ORDINARY race, not a defect — MEASURED in `T-WEB-DIRECT-FALLBACK`,
+    /// where a Firefox source had **62** candidates refused after the
+    /// recipient killed the channel, every one of them answered
+    /// `INVALID_MESSAGE`. Giving the race its own code is what lets a gate
+    /// assert that no MALFORMED message is ever sent.
+    pub fn stale_attempt(message: impl Into<String>) -> Self {
+        Self {
+            code: "STALE_ATTEMPT",
+            message: message.into(),
+        }
+    }
+
+    /// Server-side fault (ID collision exhaustion, poisoned lock). It LOGS,
+    /// at `error`, because this is the one code that always means the server
+    /// itself is wrong: a poisoned room lock, for instance, is permanent for
+    /// that room and every later call answers `INTERNAL` too. Without the
+    /// line the operator (and a gate) sees only the code, which names no
+    /// cause — it took a reproduction attempt per occurrence to learn which
+    /// of a dozen sites produced one.
     pub fn internal(message: impl Into<String>) -> Self {
+        let message = message.into();
+        tracing::error!("web-transfer internal fault: {message}");
         Self {
             code: "INTERNAL",
-            message: message.into(),
+            message,
         }
     }
 
@@ -1002,6 +1145,14 @@ pub struct TransferRecord {
     /// source's own report still be recognised as describing that attempt —
     /// see `adopt_late_recipient_resume`.
     pub last_direct_attempt: Option<AttemptId>,
+    /// A direct attempt being negotiated while the relay carries. `None` on
+    /// every transfer that is not probing, which is every transfer that has
+    /// not fallen back and every transfer whose probes are spent.
+    pub upgrade: Option<UpgradeState>,
+    /// Probes already offered. Bounded by
+    /// [`WEB_TRANSFER_UPGRADE_TRIES`] so a pair that cannot reach each other
+    /// is asked a few times and then left alone.
+    pub upgrade_tries: u32,
     /// The attempt whose path has already been counted as CARRIED. An
     /// attempt counts at most once, at the first recipient report with
     /// verified bytes on it; a fallback that carried bytes on both paths
@@ -1014,6 +1165,107 @@ pub struct TransferRecord {
     /// any parked attach waiter select on it; both exit without further
     /// notices (the transition that cancelled them already notified).
     pub cancel: CancellationToken,
+}
+
+/// The negotiation counters of ONE direct attempt.
+///
+/// The same six values live in [`TransferState::NegotiatingDirect`] and in
+/// [`UpgradeState`], and they are validated by exactly the same rules, so
+/// they are ONE type and one pure function ([`apply_signal`]). Two copies of
+/// this policy would drift, and the half that drifted would be the one that
+/// runs while the relay is carrying — the half nobody watches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NegotiationBits {
+    /// The source declared at least one DataChannel usable.
+    pub ready_source: bool,
+    /// The recipient declared at least one DataChannel usable.
+    pub ready_recipient: bool,
+    /// Forwarded `rtc.ice` messages from the source (cap 128).
+    pub candidates_source: u32,
+    /// Forwarded `rtc.ice` messages from the recipient (cap 128).
+    pub candidates_recipient: u32,
+    /// One bit per carrier: the recipient's offer has been forwarded.
+    pub offer_seen: u16,
+    /// One bit per carrier: the source's answer has been forwarded.
+    pub answer_seen: u16,
+}
+
+/// A direct attempt being negotiated WHILE the relay carries the payload.
+///
+/// It is deliberately NOT a `TransferState`: the transfer's state is what the
+/// payload is riding, and during a probe that is still the relay. Keeping the
+/// probe in its own field is what lets every frame, ticket and timer that
+/// names the LIVE attempt keep working untouched — a probe that fails is a
+/// field set back to `None` and nothing else, and a probe that succeeds is
+/// the ordinary attempt switch the fallback already performs, in the other
+/// direction.
+#[derive(Debug, Clone, Copy)]
+pub struct UpgradeState {
+    /// The probe's own attempt ID. It is NOT `record.attempt_id` until the
+    /// probe commits.
+    pub attempt_id: AttemptId,
+    /// When the probe's `transfer.direct_start` went out.
+    pub started_at: Instant,
+    /// Negotiation counters, validated exactly as the first attempt's are.
+    pub bits: NegotiationBits,
+}
+
+/// Applies one forwarded signal to a negotiation, or says why it may not be
+/// forwarded. Pure: it is the whole policy of who may send what, when.
+fn apply_signal(
+    bits: NegotiationBits,
+    is_source: bool,
+    carrier: u8,
+    kind: SignalKind,
+) -> Result<NegotiationBits, WebTransferError> {
+    // The parsers bound the index, so this cannot shift out of the mask; the
+    // check is here anyway because a mask that silently wrapped would let one
+    // carrier answer for another.
+    if usize::from(carrier) >= WEB_TRANSFER_MAX_DIRECT_CARRIERS {
+        return Err(WebTransferError::invalid("carrier index out of range"));
+    }
+    let bit: u16 = 1 << carrier;
+    let mut bits = bits;
+    match kind {
+        SignalKind::Offer => {
+            if is_source {
+                return Err(WebTransferError::invalid("only the recipient offers"));
+            }
+            // One offer per CARRIER, still exactly one each: a second offer
+            // for a carrier already negotiated is the protocol error it always
+            // was, and with a single carrier the mask is one bit and the rule
+            // is byte for byte the old one.
+            if bits.offer_seen & bit != 0 {
+                return Err(WebTransferError::invalid("offer already sent"));
+            }
+            bits.offer_seen |= bit;
+        }
+        SignalKind::Answer => {
+            if !is_source {
+                return Err(WebTransferError::invalid("only the source answers"));
+            }
+            if bits.offer_seen & bit == 0 {
+                return Err(WebTransferError::invalid("no offer to answer"));
+            }
+            if bits.answer_seen & bit != 0 {
+                return Err(WebTransferError::invalid("answer already sent"));
+            }
+            bits.answer_seen |= bit;
+        }
+        SignalKind::Ice => {
+            let counter = if is_source {
+                &mut bits.candidates_source
+            } else {
+                &mut bits.candidates_recipient
+            };
+            let cap = u32::try_from(WEB_TRANSFER_MAX_ICE_CANDIDATES_PER_SIDE).unwrap_or(u32::MAX);
+            if *counter >= cap {
+                return Err(WebTransferError::limit("candidate budget spent"));
+            }
+            *counter += 1;
+        }
+    }
+    Ok(bits)
 }
 
 /// Transfer lifecycle states (protocol order).
@@ -1044,10 +1296,14 @@ pub enum TransferState {
         candidates_source: u32,
         /// Forwarded `rtc.ice` messages from the recipient (cap 128).
         candidates_recipient: u32,
-        /// The recipient's single `rtc.offer` has been forwarded.
-        offer_seen: bool,
-        /// The source's single `rtc.answer` has been forwarded.
-        answer_seen: bool,
+        /// One bit per carrier: the recipient's `rtc.offer` for that carrier
+        /// has been forwarded. A bitmask and not a bool because an attempt
+        /// negotiates one `RTCPeerConnection` per carrier and each needs its
+        /// own offer — while a SECOND offer for a carrier already answered is
+        /// still the protocol error it always was.
+        offer_seen: u16,
+        /// One bit per carrier: the source's `rtc.answer` for that carrier.
+        answer_seen: u16,
     },
     /// Both peers ready and `path_commit direct` sent: payload rides the
     /// DataChannel and the server is on no part of it.
@@ -1295,6 +1551,11 @@ pub struct WebTransferRoom {
     pub id: RoomId,
     /// Immutable admission caps for this room.
     pub limits: WebTransferLimits,
+    /// The room's owner asked for `--relay-only`: no transfer in it ever
+    /// negotiates the direct path. Immutable for the room's life, because a
+    /// transport policy that could change under a live transfer would be a
+    /// policy nobody could rely on.
+    pub relay_only: bool,
     /// Short synchronous lock; never held across `.await`.
     pub state: std::sync::Mutex<RoomState>,
     /// Lifecycle broadcast (capacity 256).
@@ -1492,6 +1753,7 @@ pub(crate) struct RegistryInner {
     /// How long the direct attempt has to reach both-ready before the
     /// automatic relay fallback (10 s; tests shorten it).
     direct_deadline: std::sync::Mutex<Duration>,
+    upgrade_delay: std::sync::Mutex<Duration>,
     /// Relay ticket lifetime (30 s; both legs must attach inside it).
     ticket_ttl: Duration,
 }
@@ -1544,6 +1806,7 @@ impl WebTransferRegistry {
                 relay_waiters: DashMap::new(),
                 admit_timeout: std::sync::Mutex::new(WEB_TRANSFER_RELAY_ADMIT_TIMEOUT),
                 direct_deadline: std::sync::Mutex::new(WEB_TRANSFER_DIRECT_DEADLINE),
+                upgrade_delay: std::sync::Mutex::new(WEB_TRANSFER_UPGRADE_DELAY),
                 ticket_ttl: WEB_TRANSFER_TICKET_TTL,
             }),
         })
@@ -1666,6 +1929,7 @@ impl WebTransferRegistry {
         &self,
         member_hash: [u8; 32],
         owner_hash: [u8; 32],
+        relay_only: bool,
     ) -> Result<Arc<WebTransferRoom>, WebTransferError> {
         for _ in 0..ROOM_ID_RETRIES {
             let id = generate_room_id();
@@ -1682,6 +1946,7 @@ impl WebTransferRegistry {
             let room = Arc::new(WebTransferRoom {
                 id,
                 limits: self.inner.config.limits,
+                relay_only,
                 state: std::sync::Mutex::new(RoomState {
                     member_hash,
                     owner_hash,
@@ -2746,6 +3011,7 @@ impl PeerSession {
             &name,
             &config.limits,
             &config.ice.servers,
+            room.relay_only,
         ));
         initial.extend(snapshot_offer_strings(revision, &peers, &offers)?);
         let now = Instant::now();
@@ -3251,6 +3517,8 @@ impl WebTransferRegistry {
                         entry_root,
                         entry_size,
                         last_direct_attempt: None,
+                        upgrade: None,
+                        upgrade_tries: 0,
                         carried_attempt: None,
                         terminated_at: None,
                         cancel: CancellationToken::new(),
@@ -3332,7 +3600,6 @@ impl WebTransferRegistry {
         attempt_id: AttemptId,
         digest: [u8; 32],
     ) -> Result<(ReadyOutcome, TransferOutbox), WebTransferError> {
-        use crate::web_transfer_protocol::transfer_direct_start_envelope;
         let (recipient, attempt_number) = {
             let mut state = room
                 .state
@@ -3356,13 +3623,33 @@ impl WebTransferRegistry {
                 ));
             }
             if record.attempt_id != Some(attempt_id) {
-                return Err(WebTransferError::invalid("stale attempt"));
+                return Err(WebTransferError::stale_attempt("stale attempt"));
             }
             if !token_digests_equal(&record.selection_digest, &digest) {
                 return Err(WebTransferError::source_changed("selection does not match"));
             }
             let recipient = record.recipient;
             let attempt_number = record.attempt_number;
+            if room.relay_only {
+                // No direct attempt is opened at all, so there is nothing to
+                // fall back FROM: the transfer goes on the relay keeping its
+                // own attempt, which is why this is not `fallback_to_relay`.
+                // An attempt NUMBER that jumped to 2 without a first attempt
+                // would put a fiction in every log and admin row this room
+                // ever produces.
+                if let Some(record) = state.transfers.get_mut(&transfer_id) {
+                    record.attempt = Some(AttemptState {
+                        attempt_id,
+                        attempt_number,
+                        relay_permit: None,
+                    });
+                    record.state = TransferState::WaitingRelay;
+                }
+                let (outcome, outbox) =
+                    self.admit_relay_attempt(&mut state, room, transfer_id, attempt_id);
+                drop(state);
+                return Ok((outcome, outbox));
+            }
             if let Some(record) = state.transfers.get_mut(&transfer_id) {
                 record.state = TransferState::NegotiatingDirect {
                     started_at: Instant::now(),
@@ -3370,42 +3657,20 @@ impl WebTransferRegistry {
                     ready_recipient: false,
                     candidates_source: 0,
                     candidates_recipient: 0,
-                    offer_seen: false,
-                    answer_seen: false,
+                    offer_seen: 0,
+                    answer_seen: 0,
                 };
             }
             (recipient, attempt_number)
         };
-        let ice = &self.inner.config.ice.servers;
-        let deadline_ms = u64::try_from(self.direct_deadline().as_millis()).unwrap_or(u64::MAX);
-        // The recipient acts first (it creates the one DataChannel and the
-        // offer), so it hears first. The source's own notice is queued into
-        // its session before any forwarded signaling can be: the recipient
-        // cannot answer a message it has not yet received.
-        let outbox = vec![
-            (
-                recipient,
-                transfer_direct_start_envelope(
-                    transfer_id,
-                    attempt_id,
-                    attempt_number,
-                    DirectRole::Offerer.as_str(),
-                    ice,
-                    deadline_ms,
-                ),
-            ),
-            (
-                source,
-                transfer_direct_start_envelope(
-                    transfer_id,
-                    attempt_id,
-                    attempt_number,
-                    DirectRole::Answerer.as_str(),
-                    ice,
-                    deadline_ms,
-                ),
-            ),
-        ];
+        let outbox = self.direct_start_outbox(
+            transfer_id,
+            attempt_id,
+            attempt_number,
+            source,
+            recipient,
+            false,
+        );
         Ok((ReadyOutcome::Negotiating, outbox))
     }
 
@@ -3441,6 +3706,7 @@ impl WebTransferRegistry {
             from,
             body.transfer_id,
             body.attempt_id,
+            body.carrier,
             SignalKind::Offer,
         )?;
         Ok(vec![(
@@ -3462,6 +3728,7 @@ impl WebTransferRegistry {
             from,
             body.transfer_id,
             body.attempt_id,
+            body.carrier,
             SignalKind::Answer,
         )?;
         Ok(vec![(
@@ -3484,6 +3751,7 @@ impl WebTransferRegistry {
             from,
             body.transfer_id,
             body.attempt_id,
+            body.carrier,
             SignalKind::Ice,
         )?;
         Ok(vec![(
@@ -3503,7 +3771,16 @@ impl WebTransferRegistry {
         from: PeerId,
         transfer_id: TransferId,
         attempt_id: AttemptId,
+        recipient_ranges: Vec<(u64, u64)>,
     ) -> Result<TransferOutbox, WebTransferError> {
+        // A ready naming the PROBE is the upgrade's own half and is answered
+        // there: the transfer's state is the relay that is still carrying,
+        // and it must not be touched until the probe actually commits.
+        if let Some(outbox) =
+            self.upgrade_ready(room, from, transfer_id, attempt_id, &recipient_ranges)?
+        {
+            return Ok(outbox);
+        }
         let committed = {
             let mut state = room
                 .state
@@ -3520,7 +3797,7 @@ impl WebTransferRegistry {
                 ));
             }
             if record.attempt_id != Some(attempt_id) {
-                return Err(WebTransferError::invalid("stale attempt"));
+                return Err(WebTransferError::stale_attempt("stale attempt"));
             }
             let TransferState::NegotiatingDirect {
                 started_at,
@@ -3532,18 +3809,33 @@ impl WebTransferRegistry {
                 answer_seen,
             } = record.state
             else {
-                return Err(WebTransferError::invalid("transfer is not negotiating"));
+                // Late, not malformed — the same family as `stale attempt`
+                // above and the same code. Trickle ICE keeps gathering after
+                // the path is committed, so a candidate that arrives once the
+                // transfer has left `NegotiatingDirect` is the ordinary race;
+                // MEASURED, it is what remained of the Firefox source's 62
+                // refusals once the dead-attempt half was classified. There is
+                // nothing left to forward it to (the negotiation's own
+                // candidate budget lives in that state) so it is still
+                // refused, but never as a protocol error.
+                return Err(WebTransferError::stale_attempt(
+                    "transfer is not negotiating",
+                ));
             };
             // "After signaling" is per-side and exact: the offerer has had
             // its offer forwarded, the answerer its answer. A ready before
             // that describes a channel that cannot exist yet.
+            // With carriers this is "at least one", because the count is a
+            // CEILING and not a reservation: an attempt that establishes
+            // fewer carriers than it asked for uses the ones it has, and only
+            // zero is a failed direct path.
             if is_source {
-                if !answer_seen {
+                if answer_seen == 0 {
                     return Err(WebTransferError::invalid("answer not sent yet"));
                 }
                 ready_source = true;
             } else {
-                if !offer_seen {
+                if offer_seen == 0 {
                     return Err(WebTransferError::invalid("offer not sent yet"));
                 }
                 ready_recipient = true;
@@ -3585,6 +3877,121 @@ impl WebTransferRegistry {
         Ok(vec![(recipient, commit.clone()), (source, commit)])
     }
 
+    /// The upgrade's half of `transfer.direct_ready`.
+    ///
+    /// `Ok(None)` means the ready did not name a probe and the ordinary path
+    /// owns it. Otherwise the probe's bit is set and, once BOTH sides have a
+    /// usable channel, the transfer switches: the probe becomes the live
+    /// attempt, the relay permit is released, and both peers get the same
+    /// `transfer.path_commit direct` the fallback sends in the other
+    /// direction — which is what makes the switch cost no new code in either
+    /// browser beyond knowing not to tear the relay down early.
+    ///
+    /// The ranges come from the RECIPIENT and from nowhere else. The server
+    /// relayed the bytes but never counted them, and by the time a probe is
+    /// ready the relay has carried a great deal more than `record.resume`
+    /// knows about; committing on the server's own stale view would resend
+    /// everything the relay had already delivered. A range set that is
+    /// slightly behind costs a re-verified chunk and nothing worse (the
+    /// recipient plans from the COMMIT, never from disk), so a source-side
+    /// ready simply contributes no ranges.
+    fn upgrade_ready(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        from: PeerId,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+        recipient_ranges: &[(u64, u64)],
+    ) -> Result<Option<TransferOutbox>, WebTransferError> {
+        let mut state = room
+            .state
+            .lock()
+            .map_err(|_| WebTransferError::internal("room state lock poisoned"))?;
+        let record = state
+            .transfers
+            .get(&transfer_id)
+            .ok_or_else(|| WebTransferError::transfer_not_found("unknown transfer"))?;
+        let Some(up) = record.upgrade else {
+            return Ok(None);
+        };
+        if up.attempt_id != attempt_id {
+            return Ok(None);
+        }
+        let is_source = record.source == from;
+        if !is_source && record.recipient != from {
+            return Err(WebTransferError::not_participant(
+                "stranger to this transfer",
+            ));
+        }
+        // Same rule as the first negotiation: "after signaling" is per-side
+        // and exact, and with carriers it is "at least one".
+        let mut bits = up.bits;
+        if is_source {
+            if bits.answer_seen == 0 {
+                return Err(WebTransferError::invalid("answer not sent yet"));
+            }
+            bits.ready_source = true;
+        } else {
+            if bits.offer_seen == 0 {
+                return Err(WebTransferError::invalid("offer not sent yet"));
+            }
+            bits.ready_recipient = true;
+        }
+        let both = bits.ready_source && bits.ready_recipient;
+        let source = record.source;
+        let recipient = record.recipient;
+        let known_ranges = record
+            .resume
+            .as_ref()
+            .map(|resume| resume.verified_ranges.clone())
+            .unwrap_or_default();
+        let ranges = if is_source || recipient_ranges.is_empty() {
+            known_ranges
+        } else {
+            recipient_ranges.to_vec()
+        };
+        let output_length = record.entry_size.unwrap_or(0);
+        let number = next_attempt_number(record.attempt_number)
+            .map_err(|_| WebTransferError::invalid("attempt budget spent"))?;
+        let Some(record) = state.transfers.get_mut(&transfer_id) else {
+            return Ok(Some(Vec::new()));
+        };
+        if !both {
+            if let Some(up) = record.upgrade.as_mut() {
+                up.bits = bits;
+            }
+            return Ok(Some(Vec::new()));
+        }
+        // The switch. Dropping the old `AttemptState` releases the relay
+        // permit, which is what makes an upgraded transfer stop costing a
+        // relay slot; every frame still in flight on the relay names an
+        // attempt that is no longer current and is discarded by the peers
+        // exactly as a stale frame always was.
+        record.upgrade = None;
+        record.attempt_number = number;
+        record.attempt_id = Some(up.attempt_id);
+        record.attempt = Some(AttemptState {
+            attempt_id: up.attempt_id,
+            attempt_number: number,
+            relay_permit: None,
+        });
+        record.state = TransferState::ActiveDirect;
+        if !ranges.is_empty() {
+            record.resume = Some(ResumeDescriptor {
+                verified_ranges: ranges.clone(),
+                output_length,
+            });
+        }
+        drop(state);
+        let commit = crate::web_transfer_protocol::transfer_path_commit_envelope(
+            transfer_id,
+            up.attempt_id,
+            "direct",
+            &ranges,
+        );
+        Ok(Some(vec![(recipient, commit.clone()), (source, commit)]))
+    }
+
     /// One participant reports the direct attempt over. The attempt is
     /// invalidated EXACTLY once (a second report, or one naming an attempt
     /// that is no longer current, is acked and ignored), the counterpart
@@ -3619,6 +4026,13 @@ impl WebTransferRegistry {
                 ));
             }
         };
+        // A failure naming the PROBE ends the probe and nothing else: the
+        // relay never stopped carrying, so there is nothing to fall back to
+        // and no peer to notify. The next offer is armed on the grown grid.
+        if self.clear_upgrade(room, transfer_id, body.attempt_id) {
+            self.spawn_direct_upgrade(room, transfer_id);
+            return Ok((ReadyOutcome::Ignored, Vec::new()));
+        }
         let ranges = if is_recipient {
             body.verified_ranges.clone()
         } else {
@@ -3721,7 +4135,6 @@ impl WebTransferRegistry {
         failed_attempt: AttemptId,
         recipient_ranges: Vec<(u64, u64)>,
     ) -> Option<FallbackOutcome> {
-        use crate::web_transfer_protocol::transfer_relay_ticket_envelope;
         let mut state = room.state.lock().ok()?;
         let record = state.transfers.get(&transfer_id)?;
         // Direct states only: a transfer already on the relay has had its one
@@ -3732,8 +4145,6 @@ impl WebTransferRegistry {
         if record.attempt_id != Some(failed_attempt) {
             return None;
         }
-        let source = record.source;
-        let recipient = record.recipient;
         let output_length = record.entry_size.unwrap_or(0);
         let number = next_attempt_number(record.attempt_number).ok()?;
         let attempt_id = generate_attempt_id();
@@ -3767,9 +4178,38 @@ impl WebTransferRegistry {
                 });
             }
         }
-        // Exactly the Phase 3 admission: try the global semaphore inline,
-        // mint two distinct role-bound tickets and hand each peer its own;
-        // a busy relay leaves the transfer retryable without a permit.
+        let (outcome, outbox) = self.admit_relay_attempt(&mut state, room, transfer_id, attempt_id);
+        drop(state);
+        // The transfer is on the relay now, and the relay is where it would
+        // have stayed for the whole transfer. Armed HERE and not at the
+        // `Active` transition because this is the ONE place a transfer
+        // reaches the relay from the direct path — arming at the transition
+        // would mean finding every future one.
+        self.spawn_direct_upgrade(room, transfer_id);
+        Some((outcome, outbox, ranges))
+    }
+
+    /// The relay admission half, shared by the direct fallback and by a
+    /// relay-only room — which never has a direct attempt to fall back FROM,
+    /// and so cannot reach it through `fallback_to_relay`.
+    ///
+    /// The record must ALREADY be on `WaitingRelay` for `attempt_id`, holding
+    /// an `AttemptState` with no permit. Exactly the Phase 3 admission: try
+    /// the global semaphore inline, mint two distinct role-bound tickets and
+    /// hand each peer its own; a busy relay leaves the transfer retryable
+    /// without a permit.
+    fn admit_relay_attempt(
+        &self,
+        state: &mut RoomState,
+        room: &Arc<WebTransferRoom>,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+    ) -> (ReadyOutcome, TransferOutbox) {
+        use crate::web_transfer_protocol::transfer_relay_ticket_envelope;
+        let Some(record) = state.transfers.get(&transfer_id) else {
+            return (ReadyOutcome::Ignored, Vec::new());
+        };
+        let (source, recipient) = (record.source, record.recipient);
         let granted = match Arc::clone(&self.inner.relay_permits).try_acquire_owned() {
             Ok(permit) => {
                 let (source_ticket, recipient_ticket) = loop {
@@ -3807,9 +4247,8 @@ impl WebTransferRegistry {
             }
             Err(_) => None,
         };
-        drop(state);
         match granted {
-            Some((source_ticket, recipient_ticket)) => Some((
+            Some((source_ticket, recipient_ticket)) => (
                 ReadyOutcome::Admitted,
                 vec![
                     (
@@ -3821,9 +4260,8 @@ impl WebTransferRegistry {
                         transfer_relay_ticket_envelope(transfer_id, attempt_id, &recipient_ticket),
                     ),
                 ],
-                ranges,
-            )),
-            None => Some((ReadyOutcome::Queued, Vec::new(), ranges)),
+            ),
+            None => (ReadyOutcome::Queued, Vec::new()),
         }
     }
 
@@ -3838,6 +4276,205 @@ impl WebTransferRegistry {
             .lock()
             .ok()
             .and_then(|state| state.transfers.get(&transfer_id).and_then(|r| r.attempt_id))
+    }
+
+    /// The pair of `transfer.direct_start` notices that opens ONE negotiation.
+    ///
+    /// Shared by the first attempt and by an upgrade probe, because the two
+    /// differ in exactly one bit — whether something is still carrying — and
+    /// letting them drift is how a probe would end up tearing down the relay
+    /// it is supposed to run beside.
+    ///
+    /// The recipient acts first (it creates the DataChannels and the offers),
+    /// so it hears first. The source's own notice is queued into its session
+    /// before any forwarded signaling can be: the recipient cannot answer a
+    /// message it has not yet received.
+    fn direct_start_outbox(
+        &self,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+        attempt_number: u64,
+        source: PeerId,
+        recipient: PeerId,
+        upgrade: bool,
+    ) -> TransferOutbox {
+        let ice = &self.inner.config.ice.servers;
+        let deadline_ms = u64::try_from(self.direct_deadline().as_millis()).unwrap_or(u64::MAX);
+        // A CEILING, not a reservation (C7-6): the peers use the carriers
+        // they manage to establish, and only zero is a failed direct path.
+        let carriers = u8::try_from(self.inner.config.limits.direct_carriers).unwrap_or(1);
+        let start = |role: &'static str| {
+            crate::web_transfer_protocol::transfer_direct_start_envelope(
+                &crate::web_transfer_protocol::DirectStart {
+                    transfer_id,
+                    attempt_id,
+                    attempt_number,
+                    role,
+                    ice_servers: ice,
+                    deadline_ms,
+                    carriers,
+                    upgrade,
+                },
+            )
+        };
+        vec![
+            (recipient, start(DirectRole::Offerer.as_str())),
+            (source, start(DirectRole::Answerer.as_str())),
+        ]
+    }
+
+    /// How long a relaying transfer waits before the server offers the direct
+    /// path again. `Duration::ZERO` disables upgrades entirely, and with it
+    /// every line of this machinery: the transfer stays on the relay exactly
+    /// as it did before upgrades existed.
+    pub fn upgrade_delay(&self) -> Duration {
+        self.inner
+            .upgrade_delay
+            .lock()
+            .map(|slot| *slot)
+            .unwrap_or(WEB_TRANSFER_UPGRADE_DELAY)
+    }
+
+    /// Test seam for [`Self::upgrade_delay`], and the operator's kill switch.
+    pub fn set_upgrade_delay(&self, delay: Duration) {
+        if let Ok(mut slot) = self.inner.upgrade_delay.lock() {
+            *slot = delay;
+        }
+    }
+
+    /// Ends the probe named by `attempt_id`, if that is what it names.
+    /// Returns whether anything was cleared, which is also the answer to
+    /// "was this a probe?".
+    fn clear_upgrade(
+        &self,
+        room: &Arc<WebTransferRoom>,
+        transfer_id: TransferId,
+        attempt_id: AttemptId,
+    ) -> bool {
+        let Ok(mut state) = room.state.lock() else {
+            return false;
+        };
+        let Some(record) = state.transfers.get_mut(&transfer_id) else {
+            return false;
+        };
+        if record.upgrade.map(|up| up.attempt_id) != Some(attempt_id) {
+            return false;
+        }
+        record.upgrade = None;
+        true
+    }
+
+    /// Arms the next upgrade offer for a transfer that is on the relay.
+    ///
+    /// The grid GROWS with the number of offers already made, so a pair that
+    /// cannot reach each other is asked at 20 s, 60 s and 140 s and then left
+    /// alone; a pair whose path came back is usually found on the first one.
+    /// The task holds a `Weak` room (P-14: a monitor must never resolve a key
+    /// later and reach a newer object, and must never pin what it watches).
+    pub fn spawn_direct_upgrade(&self, room: &Arc<WebTransferRoom>, transfer_id: TransferId) {
+        let delay = self.upgrade_delay();
+        if delay.is_zero() || room.relay_only {
+            // A relay-only room never negotiates a direct path, by the flag's
+            // own contract (C7-5): no probe, so no browser ever builds an
+            // `RTCPeerConnection` and no candidate leaves a participant's
+            // machine. Enforced here as well as at `source_ready` because an
+            // upgrade is the one other place that could open one.
+            return;
+        }
+        let tries = room
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.transfers.get(&transfer_id).map(|r| r.upgrade_tries))
+            .unwrap_or(u32::MAX);
+        if tries >= WEB_TRANSFER_UPGRADE_TRIES {
+            return;
+        }
+        let wait = delay.saturating_mul(1 << tries.min(8));
+        // Armed from inside `fallback_to_relay`, which a unit test may call
+        // with no runtime under it. A missing runtime means no timer, never a
+        // panic — the upgrade is an optimisation and must never be able to
+        // take the fallback down with it.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let registry = self.clone();
+        let weak = Arc::downgrade(room);
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            let Some(room) = weak.upgrade() else {
+                return;
+            };
+            registry.direct_upgrade_elapsed(&room, transfer_id);
+        });
+    }
+
+    /// The upgrade body, separated from the sleep so a test can fire it
+    /// without a clock. Offers the direct path to a transfer that is carrying
+    /// on the relay, and does nothing at all to any other transfer.
+    pub fn direct_upgrade_elapsed(&self, room: &Arc<WebTransferRoom>, transfer_id: TransferId) {
+        // The operator's `--relay-only` is a PROPERTY OF THE ROOM, so the check
+        // belongs on the one function that mints a probe, not only on the timer
+        // that usually calls it: a room that asked for the relay must never see
+        // a `transfer.direct_start`, whatever woke the upgrade.
+        if room.relay_only {
+            return;
+        }
+        let started = {
+            let Ok(mut state) = room.state.lock() else {
+                return;
+            };
+            let Some(record) = state.transfers.get_mut(&transfer_id) else {
+                return;
+            };
+            // Only a transfer that is CARRYING on the relay is offered an
+            // upgrade. `Active` is that state and nothing else is: a transfer
+            // still negotiating has a direct attempt already, one that is
+            // waiting for a relay slot has no path at all to run beside, and a
+            // terminal one is done.
+            if record.state != TransferState::Active || record.upgrade.is_some() {
+                return;
+            }
+            if record.upgrade_tries >= WEB_TRANSFER_UPGRADE_TRIES {
+                return;
+            }
+            let attempt_id = generate_attempt_id();
+            record.upgrade_tries += 1;
+            record.upgrade = Some(UpgradeState {
+                attempt_id,
+                started_at: Instant::now(),
+                bits: NegotiationBits::default(),
+            });
+            // The probe ANNOUNCES the number the transfer would move to, so
+            // both peers can tell this attempt from the one carrying without
+            // the server having to commit to it yet.
+            let number = record.attempt_number.saturating_add(1);
+            Some((attempt_id, number, record.source, record.recipient))
+        };
+        let Some((attempt_id, number, source, recipient)) = started else {
+            return;
+        };
+        let outbox =
+            self.direct_start_outbox(transfer_id, attempt_id, number, source, recipient, true);
+        drain_transfer_outbox(room, outbox);
+        // A probe that nobody answers must not sit in the record for ever:
+        // the same deadline the first negotiation gets, and at the end of it
+        // the next offer on the grown grid.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let registry = self.clone();
+        let weak = Arc::downgrade(room);
+        let deadline = self.direct_deadline();
+        tokio::spawn(async move {
+            tokio::time::sleep(deadline).await;
+            let Some(room) = weak.upgrade() else {
+                return;
+            };
+            if registry.clear_upgrade(&room, transfer_id, attempt_id) {
+                registry.spawn_direct_upgrade(&room, transfer_id);
+            }
+        });
     }
 
     /// Arms the direct deadline for one attempt. The task captures a `Weak`
@@ -3921,6 +4558,7 @@ impl WebTransferRegistry {
         from: PeerId,
         transfer_id: TransferId,
         attempt_id: AttemptId,
+        carrier: u8,
         kind: SignalKind,
     ) -> Result<PeerId, WebTransferError> {
         let mut state = room
@@ -3937,64 +4575,28 @@ impl WebTransferRegistry {
                 "stranger to this transfer",
             ));
         }
-        if record.attempt_id != Some(attempt_id) {
-            return Err(WebTransferError::invalid("stale attempt"));
-        }
-        let TransferState::NegotiatingDirect {
-            started_at,
-            ready_source,
-            ready_recipient,
-            mut candidates_source,
-            mut candidates_recipient,
-            mut offer_seen,
-            mut answer_seen,
-        } = record.state
-        else {
-            return Err(WebTransferError::invalid("transfer is not negotiating"));
-        };
         let counterpart = if is_source {
             record.recipient
         } else {
             record.source
         };
-        match kind {
-            SignalKind::Offer => {
-                if is_source {
-                    return Err(WebTransferError::invalid("only the recipient offers"));
-                }
-                if offer_seen {
-                    return Err(WebTransferError::invalid("offer already sent"));
-                }
-                offer_seen = true;
-            }
-            SignalKind::Answer => {
-                if !is_source {
-                    return Err(WebTransferError::invalid("only the source answers"));
-                }
-                if !offer_seen {
-                    return Err(WebTransferError::invalid("no offer to answer"));
-                }
-                if answer_seen {
-                    return Err(WebTransferError::invalid("answer already sent"));
-                }
-                answer_seen = true;
-            }
-            SignalKind::Ice => {
-                let counter = if is_source {
-                    &mut candidates_source
-                } else {
-                    &mut candidates_recipient
-                };
-                let cap =
-                    u32::try_from(WEB_TRANSFER_MAX_ICE_CANDIDATES_PER_SIDE).unwrap_or(u32::MAX);
-                if *counter >= cap {
-                    return Err(self.refused(WebTransferError::limit("candidate budget spent")));
-                }
-                *counter += 1;
-            }
-        }
-        if let Some(record) = state.transfers.get_mut(&transfer_id) {
-            record.state = TransferState::NegotiatingDirect {
+        // Two negotiations can be in flight: the transfer's own attempt, and
+        // a PROBE running beside a relay that is carrying. They are told
+        // apart by the attempt ID alone, so neither can answer for the other.
+        let on_probe = if record.attempt_id == Some(attempt_id) {
+            false
+        } else if record.upgrade.map(|up| up.attempt_id) == Some(attempt_id) {
+            true
+        } else {
+            return Err(WebTransferError::stale_attempt("stale attempt"));
+        };
+        let (started_at, bits) = if on_probe {
+            let up = record
+                .upgrade
+                .ok_or_else(|| WebTransferError::stale_attempt("stale attempt"))?;
+            (up.started_at, up.bits)
+        } else {
+            let TransferState::NegotiatingDirect {
                 started_at,
                 ready_source,
                 ready_recipient,
@@ -4002,7 +4604,59 @@ impl WebTransferRegistry {
                 candidates_recipient,
                 offer_seen,
                 answer_seen,
+            } = record.state
+            else {
+                // Late signalling, not malformed: same family and same code
+                // as `stale attempt` above (see `WebTransferError::
+                // stale_attempt`). Trickle ICE gathers for SECONDS while a
+                // negotiation ends in milliseconds, so candidates arriving
+                // after the path is committed are the ordinary race — 14 of
+                // one Firefox source's refusals in `T-WEB-DIRECT-FALLBACK`
+                // were this, and calling them protocol errors is what made
+                // "no malformed message" unassertable. Still refused: the
+                // candidate budget lives in the negotiating state and there
+                // is nothing left to charge them to.
+                return Err(WebTransferError::stale_attempt(
+                    "transfer is not negotiating",
+                ));
             };
+            (
+                started_at,
+                NegotiationBits {
+                    ready_source,
+                    ready_recipient,
+                    candidates_source,
+                    candidates_recipient,
+                    offer_seen,
+                    answer_seen,
+                },
+            )
+        };
+        let bits = apply_signal(bits, is_source, carrier, kind).map_err(|error| {
+            // A spent candidate budget is a REFUSAL the registry counts; every
+            // other verdict is a plain protocol error.
+            if error.code() == "LIMIT_EXCEEDED" {
+                self.refused(error)
+            } else {
+                error
+            }
+        })?;
+        if let Some(record) = state.transfers.get_mut(&transfer_id) {
+            if on_probe {
+                if let Some(up) = record.upgrade.as_mut() {
+                    up.bits = bits;
+                }
+            } else {
+                record.state = TransferState::NegotiatingDirect {
+                    started_at,
+                    ready_source: bits.ready_source,
+                    ready_recipient: bits.ready_recipient,
+                    candidates_source: bits.candidates_source,
+                    candidates_recipient: bits.candidates_recipient,
+                    offer_seen: bits.offer_seen,
+                    answer_seen: bits.answer_seen,
+                };
+            }
         }
         Ok(counterpart)
     }
@@ -4225,7 +4879,7 @@ impl WebTransferRegistry {
                 return Err(WebTransferError::invalid("transfer is not active"));
             }
             if record.attempt_id != Some(attempt_id) {
-                return Err(WebTransferError::invalid("stale attempt"));
+                return Err(WebTransferError::stale_attempt("stale attempt"));
             }
             // `raw` is checked against the manifest the server holds; an
             // archive has no manifest root to check against, and the
@@ -5102,6 +5756,8 @@ pub struct WebTransferServerArgs {
     pub max_relays_global: u64,
     /// Per-room relay rate (0 disables throttling).
     pub relay_rate_bytes_per_s: u64,
+    /// Carriers per direct attempt, 1..=8.
+    pub direct_carriers: u64,
     /// Abnormal owner-loss grace, 5..=600 s.
     pub owner_grace_secs: u64,
 }
@@ -5125,6 +5781,7 @@ impl Default for WebTransferServerArgs {
             max_relays_global: limits.max_relays_global,
             relay_rate_bytes_per_s: limits.relay_rate_bytes_per_s,
             owner_grace_secs: limits.owner_grace_secs,
+            direct_carriers: limits.direct_carriers,
         }
     }
 }
@@ -5267,6 +5924,7 @@ pub fn resolve_server_config(
         check_default!(max_relays_global, "--web-transfer-max-relays");
         check_default!(relay_rate_bytes_per_s, "--web-transfer-relay-rate");
         check_default!(owner_grace_secs, "--web-transfer-owner-grace");
+        check_default!(direct_carriers, "--web-transfer-direct-carriers");
         return Ok(None);
     };
     if args.no_stun && !args.stun.is_empty() {
@@ -5286,6 +5944,7 @@ pub fn resolve_server_config(
         max_relays_global: args.max_relays_global,
         relay_rate_bytes_per_s: args.relay_rate_bytes_per_s,
         owner_grace_secs: args.owner_grace_secs,
+        direct_carriers: args.direct_carriers,
     };
     limits.validate()?;
     // Derived server STUN uses the base-URL host (the address browsers reach)
@@ -5448,8 +6107,9 @@ impl OwnerLease {
         registry: &WebTransferRegistry,
         member_hash: [u8; 32],
         owner_hash: [u8; 32],
+        relay_only: bool,
     ) -> Result<Self, WebTransferError> {
-        let room = registry.create_room(member_hash, owner_hash)?;
+        let room = registry.create_room(member_hash, owner_hash, relay_only)?;
         Ok(Self {
             id: room.id,
             epoch: 0,
@@ -5630,6 +6290,7 @@ impl WebTransferRegistry {
         member_hash: [u8; 32],
         owner_hash: [u8; 32],
         id: RoomId,
+        relay_only: bool,
     ) -> Result<Arc<WebTransferRoom>, WebTransferError> {
         let permit = Arc::clone(&self.inner.room_permits)
             .try_acquire_owned()
@@ -5641,6 +6302,7 @@ impl WebTransferRegistry {
         let room = Arc::new(WebTransferRoom {
             id,
             limits: self.inner.config.limits,
+            relay_only,
             state: std::sync::Mutex::new(RoomState {
                 member_hash,
                 owner_hash,
@@ -5744,6 +6406,7 @@ where
             version,
             member_token_hash,
             owner_token_hash,
+            relay_only,
         } => {
             if version != PROTOCOL_VERSION {
                 control.send(ServerMessage::Error(format!(
@@ -5761,8 +6424,9 @@ where
                 linger_after_error(control).await;
                 return Ok(idle());
             };
-            let lease = OwnerLease::create(&registry, member_token_hash, owner_token_hash)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let lease =
+                OwnerLease::create(&registry, member_token_hash, owner_token_hash, relay_only)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (id, epoch) = (lease.id(), lease.epoch());
             let base_url = registry.config().base_url.origin().to_string();
             control
@@ -5771,6 +6435,10 @@ where
                     room_id: id,
                     base_url,
                     owner_epoch: epoch,
+                    // Echoed from the room, never from the request: the
+                    // client's check is worth something only if it reads
+                    // what the server INSTALLED.
+                    relay_only: lease.room().relay_only,
                 })
                 .await?;
             Ok(serve_owner_control(lease, control, ctrl_timeout).await?)
@@ -6088,9 +6756,9 @@ mod server_config_tests {
     #[test]
     fn registry_global_and_room_admission_rolls_back_on_failure() {
         let registry = WebTransferRegistry::new(tiny_config()).unwrap();
-        let room_a = registry.create_room([1u8; 32], [2u8; 32]).unwrap();
-        let room_b = registry.create_room([3u8; 32], [4u8; 32]).unwrap();
-        assert!(registry.create_room([5u8; 32], [6u8; 32]).is_err());
+        let room_a = registry.create_room([1u8; 32], [2u8; 32], false).unwrap();
+        let room_b = registry.create_room([3u8; 32], [4u8; 32], false).unwrap();
+        assert!(registry.create_room([5u8; 32], [6u8; 32], false).is_err());
         assert_eq!(registry.current_rooms(), 2);
 
         let _guard_a = registry.join_peer(&room_a, peer_id(1), None).unwrap();
@@ -6114,7 +6782,7 @@ mod server_config_tests {
     fn configured_totals_do_not_change_after_permit_acquisition() {
         let registry = WebTransferRegistry::new(tiny_config()).unwrap();
         let before = registry.totals();
-        let room = registry.create_room([1u8; 32], [2u8; 32]).unwrap();
+        let room = registry.create_room([1u8; 32], [2u8; 32], false).unwrap();
         let _peer = registry
             .join_peer(&room, peer_id(9), Some("Ada".to_string()))
             .unwrap();
@@ -6177,15 +6845,21 @@ mod lifecycle_tests {
         )
         .unwrap();
         let registry = WebTransferRegistry::new(config).unwrap();
-        let room = registry.create_room(MEMBER_HASH, OWNER_HASH).unwrap();
+        let room = registry
+            .create_room(MEMBER_HASH, OWNER_HASH, false)
+            .unwrap();
         assert_eq!(registry.current_rooms(), 1);
-        assert!(registry.create_room(MEMBER_HASH, OWNER_HASH).is_err());
+        assert!(registry
+            .create_room(MEMBER_HASH, OWNER_HASH, false)
+            .is_err());
         let id = room.id;
         assert!(registry.remove_room_if_current(id, &room));
         assert!(!registry.remove_room_if_current(id, &room));
         drop(room);
         // Slot released only after every Arc is gone: creation works again.
-        let room2 = registry.create_room(MEMBER_HASH, OWNER_HASH).unwrap();
+        let room2 = registry
+            .create_room(MEMBER_HASH, OWNER_HASH, false)
+            .unwrap();
         assert_eq!(registry.current_rooms(), 1);
         let _ = room2;
     }
@@ -6195,10 +6869,10 @@ mod lifecycle_tests {
         let registry = registry();
         let id = RoomId::from_bytes([77u8; 16]);
         let first = registry
-            .create_room_with_id(MEMBER_HASH, OWNER_HASH, id)
+            .create_room_with_id(MEMBER_HASH, OWNER_HASH, id, false)
             .unwrap();
         let err = registry
-            .create_room_with_id([9u8; 32], [9u8; 32], id)
+            .create_room_with_id([9u8; 32], [9u8; 32], id, false)
             .unwrap_err();
         assert_eq!(err.code(), "INVALID_MESSAGE");
         let current = registry.room(id).unwrap();
@@ -6209,7 +6883,7 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn owner_guard_drop_detaches_instead_of_destroying() {
         let registry = registry();
-        let lease = OwnerLease::create(&registry, MEMBER_HASH, OWNER_HASH).unwrap();
+        let lease = OwnerLease::create(&registry, MEMBER_HASH, OWNER_HASH, false).unwrap();
         let id = lease.id();
         drop(lease);
         // Still registered, now detached — never destroyed by a drop.
@@ -6222,7 +6896,7 @@ mod lifecycle_tests {
     #[test]
     fn explicit_close_destroys_once() {
         let registry = registry();
-        let lease = OwnerLease::create(&registry, MEMBER_HASH, OWNER_HASH).unwrap();
+        let lease = OwnerLease::create(&registry, MEMBER_HASH, OWNER_HASH, false).unwrap();
         let id = lease.id();
         let room = lease.room().clone();
         let mut events = room.events.subscribe();
@@ -6244,7 +6918,7 @@ mod lifecycle_tests {
     async fn resume_requires_matching_token_and_detached_state() {
         let registry = registry();
         let token = owner_token(5);
-        let lease = OwnerLease::create(&registry, MEMBER_HASH, owner_hash(5)).unwrap();
+        let lease = OwnerLease::create(&registry, MEMBER_HASH, owner_hash(5), false).unwrap();
         let id = lease.id();
         // Attached: even the right token is UNAUTHORIZED.
         assert_eq!(
@@ -6278,7 +6952,7 @@ mod lifecycle_tests {
     async fn resume_increments_epoch() {
         let registry = registry();
         let token = owner_token(5);
-        let lease = OwnerLease::create(&registry, MEMBER_HASH, owner_hash(5)).unwrap();
+        let lease = OwnerLease::create(&registry, MEMBER_HASH, owner_hash(5), false).unwrap();
         let id = lease.id();
         drop(lease);
         let first = OwnerLease::resume(&registry, id, &token).unwrap();
@@ -6292,7 +6966,7 @@ mod lifecycle_tests {
     async fn stale_expiry_cannot_destroy_resumed_room() {
         let registry = registry();
         let token = owner_token(5);
-        let lease = OwnerLease::create(&registry, MEMBER_HASH, owner_hash(5)).unwrap();
+        let lease = OwnerLease::create(&registry, MEMBER_HASH, owner_hash(5), false).unwrap();
         let id = lease.id();
         let room = lease.room().clone();
         drop(lease);
@@ -6310,14 +6984,14 @@ mod lifecycle_tests {
         let registry = registry();
         let id = RoomId::from_bytes([55u8; 16]);
         let room = registry
-            .create_room_with_id(MEMBER_HASH, OWNER_HASH, id)
+            .create_room_with_id(MEMBER_HASH, OWNER_HASH, id, false)
             .unwrap();
         OwnerLease::detach_with_grace(&room, Duration::from_millis(60));
         // Recreate under the same ID before the old monitor fires.
         assert!(registry.remove_room_if_current(id, &room));
         room.destroy("owner-close");
         let room2 = registry
-            .create_room_with_id([9u8; 32], [9u8; 32], id)
+            .create_room_with_id([9u8; 32], [9u8; 32], id, false)
             .unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
         let current = registry
@@ -6330,7 +7004,7 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn expiry_releases_all_counters_and_cancels_waiters() {
         let registry = registry();
-        let lease = OwnerLease::create(&registry, MEMBER_HASH, OWNER_HASH).unwrap();
+        let lease = OwnerLease::create(&registry, MEMBER_HASH, OWNER_HASH, false).unwrap();
         let room = lease.room().clone();
         let mut events = room.events.subscribe();
         drop(lease);
@@ -6355,7 +7029,7 @@ mod lifecycle_tests {
         for _ in 0..25 {
             let registry = registry();
             let token = owner_token(5);
-            let lease = OwnerLease::create(&registry, MEMBER_HASH, owner_hash(5)).unwrap();
+            let lease = OwnerLease::create(&registry, MEMBER_HASH, owner_hash(5), false).unwrap();
             let id = lease.id();
             let room = lease.room().clone();
             drop(lease);
@@ -6488,6 +7162,7 @@ mod owner_control_tests {
                     version: 1,
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
+                    relay_only: false,
                 },
                 Duration::from_secs(60),
             )
@@ -6523,6 +7198,7 @@ mod owner_control_tests {
                     version: 2,
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
+                    relay_only: false,
                 },
                 Duration::from_secs(60),
             )
@@ -6561,6 +7237,7 @@ mod owner_control_tests {
                     version: 1,
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
+                    relay_only: false,
                 },
                 Duration::from_secs(60),
             )
@@ -6600,6 +7277,7 @@ mod owner_control_tests {
                     version: 1,
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
+                    relay_only: false,
                 },
                 Duration::from_secs(60),
             )
@@ -6626,7 +7304,7 @@ mod owner_control_tests {
         let (owner, member_hash, owner_hash) = owner_pair();
         let owner_hex = owner.to_string();
         let registry = test_registry();
-        let lease = OwnerLease::create(&registry, member_hash, owner_hash).unwrap();
+        let lease = OwnerLease::create(&registry, member_hash, owner_hash, false).unwrap();
         let id = lease.id();
         let room = lease.room().clone();
         drop(lease);
@@ -6672,6 +7350,7 @@ mod owner_control_tests {
                     version: 1,
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
+                    relay_only: false,
                 },
                 Duration::from_millis(300),
             )
@@ -6711,7 +7390,7 @@ mod owner_control_tests {
     #[tokio::test]
     async fn owner_reaper_checks_on_tick_not_timeout_recv() {
         let registry = test_registry();
-        let lease = OwnerLease::create(&registry, [1u8; 32], [2u8; 32]).unwrap();
+        let lease = OwnerLease::create(&registry, [1u8; 32], [2u8; 32], false).unwrap();
         let (_client, mut server) = duplex_pair().await;
         let started = Instant::now();
         // Silent but OPEN control: a `timeout(recv)` implementation would park
@@ -6743,6 +7422,7 @@ mod owner_control_tests {
                     version: 1,
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
+                    relay_only: false,
                 },
                 Duration::from_secs(60),
             )
@@ -6792,6 +7472,7 @@ mod owner_control_tests {
                     version: 1,
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
+                    relay_only: false,
                 },
                 Duration::from_secs(60),
             )
@@ -6855,7 +7536,7 @@ mod control_session_tests {
 
     fn open_room(registry: &WebTransferRegistry) -> (OwnerLease, MemberToken, RoomId) {
         let (member, _owner, member_hash, owner_hash) = member_owner();
-        let lease = OwnerLease::create(registry, member_hash, owner_hash).unwrap();
+        let lease = OwnerLease::create(registry, member_hash, owner_hash, false).unwrap();
         let id = lease.id();
         (lease, member, id)
     }
@@ -6992,6 +7673,7 @@ mod control_session_tests {
             &registry,
             other_member.sha256_hash(),
             other_owner.sha256_hash(),
+            false,
         )
         .expect("a second room");
         let other_id = other_lease.id();
@@ -7189,14 +7871,14 @@ mod control_session_tests {
         let _ = member;
         let forced = RoomId::from_bytes([0xabu8; 16]);
         let first = registry
-            .create_room_with_id(member_hash, owner_hash, forced)
+            .create_room_with_id(member_hash, owner_hash, forced, false)
             .unwrap();
         let peer = generate_peer_id();
         let guard = registry.join_peer(&first, peer, None).unwrap();
         assert!(registry.remove_room_if_current(forced, &first));
         first.destroy("owner-close");
         let second = registry
-            .create_room_with_id([8u8; 32], [8u8; 32], forced)
+            .create_room_with_id([8u8; 32], [8u8; 32], forced, false)
             .unwrap();
         drop(guard);
         // The reused room is untouched; the stale peer died with its own Arc.
@@ -7547,7 +8229,7 @@ mod offer_tests {
         Vec<PeerGuard>,
     ) {
         let (_member, _owner, member_hash, owner_hash) = member_owner_pair();
-        let lease = OwnerLease::create(registry, member_hash, owner_hash).unwrap();
+        let lease = OwnerLease::create(registry, member_hash, owner_hash, false).unwrap();
         let room = lease.room().clone();
         let first = generate_peer_id();
         let second = generate_peer_id();
@@ -7862,7 +8544,7 @@ mod offer_tests {
         assert_eq!(registry.current_metadata_bytes(), 0);
         // Republish, then drop the owner guard: the drop path releases too.
         let (_member, _owner, member_hash, owner_hash) = member_owner_pair();
-        let lease = OwnerLease::create(&registry, member_hash, owner_hash).unwrap();
+        let lease = OwnerLease::create(&registry, member_hash, owner_hash, false).unwrap();
         let room = lease.room().clone();
         let peer = generate_peer_id();
         let guard = registry.join_peer(&room, peer, None).unwrap();
@@ -8029,7 +8711,7 @@ mod peer_permission_tests {
         let member = MemberToken::from_bytes([0x71u8; 32]);
         let owner = OwnerToken::from_bytes([0x72u8; 32]);
         let lease =
-            OwnerLease::create(registry, member.sha256_hash(), owner.sha256_hash()).unwrap();
+            OwnerLease::create(registry, member.sha256_hash(), owner.sha256_hash(), false).unwrap();
         let room = lease.room().clone();
         let ids = [generate_peer_id(), generate_peer_id(), generate_peer_id()];
         let guards = ids
@@ -8154,7 +8836,8 @@ mod peer_permission_tests {
             let member = MemberToken::from_bytes([0x73u8; 32]);
             let owner = OwnerToken::from_bytes([0x74u8; 32]);
             let lease =
-                OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash()).unwrap();
+                OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
+                    .unwrap();
             let room = lease.room().clone();
             let peer = generate_peer_id();
             let guard = registry.join_peer(&room, peer, None).unwrap();
@@ -8202,7 +8885,8 @@ mod peer_permission_tests {
             let member = MemberToken::from_bytes([0x75u8; 32]);
             let owner = OwnerToken::from_bytes([0x76u8; 32]);
             let lease =
-                OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash()).unwrap();
+                OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
+                    .unwrap();
             let room = lease.room().clone();
             let peer = generate_peer_id();
             let guard = registry.join_peer(&room, peer, None).unwrap();
@@ -8330,9 +9014,71 @@ mod transfer_state_tests {
         let member = MemberToken::from_bytes([0x81u8; 32]);
         let owner = OwnerToken::from_bytes([0x82u8; 32]);
         let lease =
-            OwnerLease::create(registry, member.sha256_hash(), owner.sha256_hash()).unwrap();
+            OwnerLease::create(registry, member.sha256_hash(), owner.sha256_hash(), false).unwrap();
         let room = lease.room().clone();
         (lease, room)
+    }
+
+    /// The same room, opened with `--relay-only`.
+    fn relay_only_room(registry: &WebTransferRegistry) -> (OwnerLease, Arc<WebTransferRoom>) {
+        let member = MemberToken::from_bytes([0x91u8; 32]);
+        let owner = OwnerToken::from_bytes([0x92u8; 32]);
+        let lease =
+            OwnerLease::create(registry, member.sha256_hash(), owner.sha256_hash(), true).unwrap();
+        let room = lease.room().clone();
+        (lease, room)
+    }
+
+    /// Reads until the named message type arrives, so a test asserting about
+    /// ONE message never has to count the ones that precede it.
+    async fn recv_until(rx: &mut mpsc::Receiver<String>, want: &str) -> serde_json::Value {
+        for _ in 0..16 {
+            let (typ, body) = recv_text(rx).await;
+            if typ == want {
+                return body;
+            }
+        }
+        panic!("never saw a {want}");
+    }
+
+    /// Drives one transfer through a FAILED direct attempt onto the relay,
+    /// which is the only state an upgrade is ever offered from. Returns the
+    /// transfer and the direct attempt that died.
+    async fn fallen_back(
+        registry: &WebTransferRegistry,
+        room: &Arc<WebTransferRoom>,
+        source: PeerId,
+        recipient: PeerId,
+    ) -> (TransferId, AttemptId) {
+        let offer_hex = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let mac = offer_fixture(registry, room, source, offer_hex);
+        let (id, attempt) = request_fixture(registry, room, recipient, offer_hex, &mac);
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (_, outbox) = registry
+            .source_ready(room, source, id, attempt, digest)
+            .unwrap();
+        drain_transfer_outbox(room, outbox);
+        let (_, outbox) = registry
+            .direct_failed(
+                room,
+                recipient,
+                &crate::web_transfer_protocol::DirectFailedBody {
+                    transfer_id: id,
+                    attempt_id: attempt,
+                    reason: "ice-failed",
+                    verified_ranges: Vec::new(),
+                },
+            )
+            .unwrap();
+        drain_transfer_outbox(room, outbox);
+        (id, attempt)
+    }
+
+    /// Puts a relaying transfer in the state the relay pump would: carrying.
+    /// Only a transfer that is CARRYING is offered an upgrade.
+    fn active_relay(room: &Arc<WebTransferRoom>, id: TransferId) {
+        let mut state = room.state.lock().unwrap();
+        state.transfers.get_mut(&id).unwrap().state = TransferState::Active;
     }
 
     /// Joins a peer AND registers a live session queue, returning the
@@ -8761,7 +9507,8 @@ mod transfer_state_tests {
         let member = MemberToken::from_bytes([0x91u8; 32]);
         let owner = OwnerToken::from_bytes([0x92u8; 32]);
         let lease_b =
-            OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash()).unwrap();
+            OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
+                .unwrap();
         let room_b = lease_b.room().clone();
         assert_ne!(room_a.id, room_b.id);
 
@@ -9120,6 +9867,284 @@ mod transfer_state_tests {
         let state = room.state.lock().unwrap().transfers.get(&id).unwrap().state;
         assert_eq!(state, TransferState::WaitingSource);
         assert_eq!(registry.current_transfers(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_relaying_transfer_is_offered_the_direct_path_again() {
+        // The transfer reached the relay because ONE negotiation failed, and
+        // before this it stayed there for the whole transfer however long
+        // that was. The probe runs BESIDE the relay: nothing about the live
+        // attempt moves, so a probe that fails costs only the signalling it
+        // sent.
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _gb, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let (id, attempt) = fallen_back(&registry, &room, source, recipient).await;
+        let _ = recv_until(&mut source_rx, "transfer.relay_ticket").await;
+        let _ = recv_until(&mut recipient_rx, "transfer.relay_ticket").await;
+        let relay_attempt = registry.current_attempt(&room, id).unwrap();
+        assert_ne!(relay_attempt, attempt, "the relay runs on its own attempt");
+        active_relay(&room, id);
+
+        registry.direct_upgrade_elapsed(&room, id);
+        for rx in [&mut recipient_rx, &mut source_rx] {
+            let body = recv_until(rx, "transfer.direct_start").await;
+            assert_eq!(
+                body["upgrade"].as_bool(),
+                Some(true),
+                "the peers must know something is still carrying"
+            );
+            assert_ne!(
+                body["attemptId"].as_str(),
+                Some(relay_attempt.to_string()).as_deref(),
+                "the probe is its OWN attempt: the relay's keeps carrying"
+            );
+        }
+        // The transfer itself has not moved: it is still relaying.
+        let state = room.state.lock().unwrap();
+        let record = state.transfers.get(&id).unwrap();
+        assert_eq!(record.state, TransferState::Active);
+        assert_eq!(record.attempt_id, Some(relay_attempt));
+        assert!(record.upgrade.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_answered_probe_switches_the_transfer_onto_it_with_the_recipients_ranges() {
+        // The switch is the fallback's own machinery run in the other
+        // direction, and the ranges are the RECIPIENT's: the server relayed
+        // the bytes but never counted them, so committing on its own stale
+        // view would resend everything the relay had already delivered.
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _gb, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let (id, _attempt) = fallen_back(&registry, &room, source, recipient).await;
+        let _ = recv_until(&mut source_rx, "transfer.relay_ticket").await;
+        let _ = recv_until(&mut recipient_rx, "transfer.relay_ticket").await;
+        let relay_attempt = registry.current_attempt(&room, id).unwrap();
+        active_relay(&room, id);
+        registry.direct_upgrade_elapsed(&room, id);
+        let body = recv_until(&mut recipient_rx, "transfer.direct_start").await;
+        let _ = recv_until(&mut source_rx, "transfer.direct_start").await;
+        let probe: AttemptId = body["attemptId"].as_str().unwrap().parse().unwrap();
+
+        // Signalling routes to the PROBE, told apart from the live attempt by
+        // its ID alone.
+        let outbox = registry
+            .forward_rtc_offer(&room, recipient, &sdp_body_on(id, probe, "v=0", 0))
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_until(&mut source_rx, "rtc.offer").await;
+        let outbox = registry
+            .forward_rtc_answer(&room, source, &sdp_body_on(id, probe, "v=0", 0))
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_until(&mut recipient_rx, "rtc.answer").await;
+
+        let outbox = registry
+            .direct_ready(&room, source, id, probe, Vec::new())
+            .unwrap();
+        assert!(outbox.is_empty(), "one side ready is not a commit");
+        let outbox = registry
+            .direct_ready(&room, recipient, id, probe, vec![(0, 7)])
+            .unwrap();
+        assert_eq!(outbox.len(), 2, "both peers hear the same commit");
+        drain_transfer_outbox(&room, outbox);
+        for rx in [&mut recipient_rx, &mut source_rx] {
+            let body = recv_until(rx, "transfer.path_commit").await;
+            assert_eq!(body["path"].as_str(), Some("direct"));
+            assert_eq!(
+                body["attemptId"].as_str(),
+                Some(probe.to_string()).as_deref()
+            );
+            assert_eq!(
+                body["resumeRanges"],
+                serde_json::json!([[0, 7]]),
+                "the recipient's ranges, not the server's stale view"
+            );
+        }
+        let state = room.state.lock().unwrap();
+        let record = state.transfers.get(&id).unwrap();
+        assert_eq!(record.state, TransferState::ActiveDirect);
+        assert_eq!(record.attempt_id, Some(probe));
+        assert_ne!(record.attempt_id, Some(relay_attempt));
+        assert!(record.upgrade.is_none(), "the probe is the attempt now");
+        assert!(
+            record.attempt.as_ref().unwrap().relay_permit.is_none(),
+            "an upgraded transfer stops costing a relay slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_fails_leaves_the_relay_carrying() {
+        // The whole safety of the design: a probe is not the transfer, so
+        // its failure must not reach the transfer.
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _gb, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let (id, _attempt) = fallen_back(&registry, &room, source, recipient).await;
+        let _ = recv_until(&mut source_rx, "transfer.relay_ticket").await;
+        let _ = recv_until(&mut recipient_rx, "transfer.relay_ticket").await;
+        let relay_attempt = registry.current_attempt(&room, id).unwrap();
+        active_relay(&room, id);
+        registry.direct_upgrade_elapsed(&room, id);
+        let body = recv_until(&mut recipient_rx, "transfer.direct_start").await;
+        let _ = recv_until(&mut source_rx, "transfer.direct_start").await;
+        let probe: AttemptId = body["attemptId"].as_str().unwrap().parse().unwrap();
+
+        let (outcome, outbox) = registry
+            .direct_failed(
+                &room,
+                recipient,
+                &crate::web_transfer_protocol::DirectFailedBody {
+                    transfer_id: id,
+                    attempt_id: probe,
+                    reason: "ice-failed",
+                    verified_ranges: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome, ReadyOutcome::Ignored);
+        assert!(outbox.is_empty(), "nobody is told: nothing changed");
+        let state = room.state.lock().unwrap();
+        let record = state.transfers.get(&id).unwrap();
+        assert_eq!(record.state, TransferState::Active, "still relaying");
+        assert_eq!(record.attempt_id, Some(relay_attempt));
+        assert!(record.upgrade.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_relay_only_room_is_never_offered_an_upgrade() {
+        // C7-5 says a relay-only room never negotiates a direct path. The
+        // upgrade is the one other place that could open one, so it is
+        // refused here as well as at `source_ready`.
+        let registry = transfer_registry();
+        let (_lease, room) = relay_only_room(&registry);
+        let (source, _ga, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _gb, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let offer_hex = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let (id, attempt) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (_, outbox) = registry
+            .source_ready(&room, source, id, attempt, digest)
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_until(&mut source_rx, "transfer.relay_ticket").await;
+        let _ = recv_until(&mut recipient_rx, "transfer.relay_ticket").await;
+        active_relay(&room, id);
+
+        registry.direct_upgrade_elapsed(&room, id);
+        let state = room.state.lock().unwrap();
+        assert!(
+            state.transfers.get(&id).unwrap().upgrade.is_none(),
+            "no probe exists to negotiate"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_upgrade_grid_is_finite() {
+        // A pair that genuinely cannot reach each other is asked a few times
+        // and then left alone: an unbounded retry would spend the peers'
+        // control budget for the life of the transfer.
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _gb, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let (id, _attempt) = fallen_back(&registry, &room, source, recipient).await;
+        let _ = recv_until(&mut source_rx, "transfer.relay_ticket").await;
+        let _ = recv_until(&mut recipient_rx, "transfer.relay_ticket").await;
+        active_relay(&room, id);
+        for _ in 0..WEB_TRANSFER_UPGRADE_TRIES + 3 {
+            registry.direct_upgrade_elapsed(&room, id);
+            let probe = room
+                .state
+                .lock()
+                .unwrap()
+                .transfers
+                .get(&id)
+                .unwrap()
+                .upgrade
+                .map(|up| up.attempt_id);
+            if let Some(probe) = probe {
+                let _ = recv_until(&mut recipient_rx, "transfer.direct_start").await;
+                let _ = recv_until(&mut source_rx, "transfer.direct_start").await;
+                registry.clear_upgrade(&room, id, probe);
+            }
+        }
+        let tries = room
+            .state
+            .lock()
+            .unwrap()
+            .transfers
+            .get(&id)
+            .unwrap()
+            .upgrade_tries;
+        assert_eq!(tries, WEB_TRANSFER_UPGRADE_TRIES);
+    }
+
+    #[tokio::test]
+    async fn a_relay_only_room_admits_the_relay_without_ever_opening_a_direct_attempt() {
+        // The whole point of the flag: no `transfer.direct_start` is emitted,
+        // so no peer ever builds an `RTCPeerConnection` and no candidate ever
+        // leaves the machine. Asserting the ABSENCE of the message is the
+        // test, because the page cannot negotiate what it is never told to.
+        let registry = transfer_registry();
+        let (_lease, room) = relay_only_room(&registry);
+        assert!(room.relay_only);
+        let (source, _guard_a, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let offer_hex = "dddddddddddddddddddddddddddddddd";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let (id, attempt) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+
+        let (outcome, outbox) = registry
+            .source_ready(&room, source, id, attempt, digest)
+            .unwrap();
+        assert_eq!(outcome, ReadyOutcome::Admitted);
+        assert_eq!(outbox.len(), 2, "one relay ticket each, nothing else");
+        drain_transfer_outbox(&room, outbox);
+        for rx in [&mut source_rx, &mut recipient_rx] {
+            let (typ, body) = recv_text(rx).await;
+            assert_eq!(typ, "transfer.relay_ticket", "no direct step is offered");
+            // The SAME attempt: a relay-only room has no direct attempt to
+            // fall back from, so an attempt number that jumped to 2 would be
+            // a fiction in every log and admin row the room ever produces.
+            assert_eq!(
+                body["attemptId"].as_str(),
+                Some(attempt.to_string()).as_deref()
+            );
+        }
+        let record = room.state.lock().unwrap().transfers.get(&id).unwrap().state;
+        assert_eq!(record, TransferState::WaitingRelay);
+        assert_eq!(registry.current_attempt(&room, id), Some(attempt));
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_room_still_opens_the_direct_attempt() {
+        // The red-check's other half: the branch above must be reached ONLY
+        // by a relay-only room. Skipping the direct step everywhere would
+        // pass the test above and delete the feature.
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        assert!(!room.relay_only);
+        let (source, _guard_a, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, _rx_b) = live_peer(&registry, &room, Some("B"));
+        let offer_hex = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let (id, attempt) = request_fixture(&registry, &room, recipient, offer_hex, &mac);
+        let _ = recv_text(&mut source_rx).await;
+        let digest = selection_digest(&offer_hex.parse().unwrap(), &mac, &["0".to_string()], "raw");
+        let (outcome, outbox) = registry
+            .source_ready(&room, source, id, attempt, digest)
+            .unwrap();
+        assert_eq!(outcome, ReadyOutcome::Negotiating);
+        assert_eq!(outbox.len(), 2, "both peers hear transfer.direct_start");
     }
 
     #[tokio::test]
@@ -10498,10 +11523,15 @@ mod transfer_state_tests {
     }
 
     fn sdp_body(id: TransferId, attempt: AttemptId, sdp: &str) -> RtcSdpBody {
+        sdp_body_on(id, attempt, sdp, 0)
+    }
+
+    fn sdp_body_on(id: TransferId, attempt: AttemptId, sdp: &str, carrier: u8) -> RtcSdpBody {
         RtcSdpBody {
             transfer_id: id,
             attempt_id: attempt,
             sdp: sdp.to_string(),
+            carrier,
         }
     }
 
@@ -10512,6 +11542,7 @@ mod transfer_state_tests {
             candidate: candidate.map(str::to_string),
             sdp_mid: candidate.map(|_| "0".to_string()),
             sdp_m_line_index: candidate.map(|_| 0u16),
+            carrier: 0,
         }
     }
 
@@ -10565,6 +11596,80 @@ mod transfer_state_tests {
             .unwrap()
             .state
             .is_negotiating_direct());
+    }
+
+    #[tokio::test]
+    async fn each_carrier_negotiates_once_and_the_index_is_bounded() {
+        // One `RTCPeerConnection` per carrier means one offer and one answer
+        // per carrier — and a SECOND offer for a carrier already negotiated
+        // is the protocol error it always was. The two rules live in one
+        // bitmask, so a test that only proved the first would pass with the
+        // mask replaced by "anything goes".
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, recipient, _gb, mut source_rx, mut recipient_rx, id, attempt, _d) =
+            negotiating_fixture(&registry, &room).await;
+        let _ = recv_text(&mut recipient_rx).await;
+        let _ = recv_text(&mut source_rx).await;
+        for carrier in 0..3u8 {
+            let offer = sdp_body_on(id, attempt, "v=0 offer", carrier);
+            let outbox = registry
+                .forward_rtc_offer(&room, recipient, &offer)
+                .unwrap();
+            drain_transfer_outbox(&room, outbox);
+            let (typ, body) = recv_text(&mut source_rx).await;
+            assert_eq!(typ, "rtc.offer");
+            // Carrier 0 is the only carrier a single-carrier attempt has, so
+            // it is omitted: that attempt's forwarded signalling is byte for
+            // byte the message this server sent before carriers existed.
+            if carrier == 0 {
+                assert!(
+                    body.get("carrier").is_none(),
+                    "carrier 0 stays off the wire"
+                );
+            } else {
+                assert_eq!(body["carrier"].as_u64(), Some(u64::from(carrier)));
+            }
+            // A repeat on the SAME carrier is refused …
+            assert_eq!(
+                registry
+                    .forward_rtc_offer(&room, recipient, &offer)
+                    .unwrap_err()
+                    .code(),
+                "INVALID_MESSAGE"
+            );
+            // … and the answer belongs to the carrier it answers: an answer
+            // on a carrier that never offered has nothing to answer.
+            let unoffered = sdp_body_on(id, attempt, "v=0 answer", carrier + 4);
+            assert_eq!(
+                registry
+                    .forward_rtc_answer(&room, source, &unoffered)
+                    .unwrap_err()
+                    .code(),
+                "INVALID_MESSAGE"
+            );
+            let answer = sdp_body_on(id, attempt, "v=0 answer", carrier);
+            let outbox = registry.forward_rtc_answer(&room, source, &answer).unwrap();
+            drain_transfer_outbox(&room, outbox);
+            let (typ, _) = recv_text(&mut recipient_rx).await;
+            assert_eq!(typ, "rtc.answer");
+            assert!(registry.forward_rtc_answer(&room, source, &answer).is_err());
+        }
+        // The index is bounded by the mask's width, checked before the shift:
+        // a shift that wrapped would let one carrier answer for another.
+        let out_of_range = sdp_body_on(
+            id,
+            attempt,
+            "v=0 offer",
+            WEB_TRANSFER_MAX_DIRECT_CARRIERS as u8,
+        );
+        assert_eq!(
+            registry
+                .forward_rtc_offer(&room, recipient, &out_of_range)
+                .unwrap_err()
+                .code(),
+            "INVALID_MESSAGE"
+        );
     }
 
     #[tokio::test]
@@ -10629,11 +11734,43 @@ mod transfer_state_tests {
         assert_eq!(typ, "rtc.answer");
         assert_eq!(body["sdp"].as_str(), Some("v=0 answer"));
         assert!(registry.forward_rtc_answer(&room, source, &answer).is_err());
-        // A stale attempt is refused whatever the role.
+        // A stale attempt is refused whatever the role, and it is refused as
+        // `STALE_ATTEMPT` — never `INVALID_MESSAGE`. The message is well
+        // formed and the race is the ordinary one (trickle ICE gathers for
+        // seconds, an attempt can die in milliseconds), so calling it
+        // malformed hid 62 real refusals behind the code a gate uses to catch
+        // actual protocol bugs.
         let stale = sdp_body(id, generate_attempt_id(), "v=0 offer");
-        assert!(registry
-            .forward_rtc_offer(&room, recipient, &stale)
-            .is_err());
+        assert_eq!(
+            registry
+                .forward_rtc_offer(&room, recipient, &stale)
+                .unwrap_err()
+                .code(),
+            "STALE_ATTEMPT",
+        );
+        // Every code this registry produces must be one the wire knows:
+        // `error_envelope` rewrites an unknown code to `INTERNAL`, so a code
+        // added here and not there reaches the client as a SERVER FAULT. It
+        // did — ten `INTERNAL`s for `rtc.ice` against zero internal errors
+        // built anywhere in the server.
+        assert!(crate::web_transfer_protocol::is_known_error_code(
+            WebTransferError::stale_attempt("x").code()
+        ));
+        let stale_ice = crate::web_transfer_protocol::RtcIceBody {
+            transfer_id: id,
+            attempt_id: generate_attempt_id(),
+            candidate: Some("candidate:1 1 udp".to_string()),
+            sdp_mid: Some("0".to_string()),
+            sdp_m_line_index: Some(0),
+            carrier: 0,
+        };
+        assert_eq!(
+            registry
+                .forward_rtc_ice(&room, source, &stale_ice)
+                .unwrap_err()
+                .code(),
+            "STALE_ATTEMPT",
+        );
         // Size is enforced by the PARSER, which is the only place an SDP is
         // ever looked at, and the bound counts bytes.
         let too_big = "x".repeat(WEB_TRANSFER_MAX_SDP_BYTES + 1);
@@ -10768,14 +11905,16 @@ mod transfer_state_tests {
         let _ = recv_text(&mut source_rx).await;
         // Ready before that side's own signaling step is refused.
         assert!(registry
-            .direct_ready(&room, recipient, id, attempt)
+            .direct_ready(&room, recipient, id, attempt, Vec::new())
             .is_err());
         let outbox = registry
             .forward_rtc_offer(&room, recipient, &sdp_body(id, attempt, "v=0 offer"))
             .unwrap();
         drain_transfer_outbox(&room, outbox);
         let _ = recv_text(&mut source_rx).await;
-        assert!(registry.direct_ready(&room, source, id, attempt).is_err());
+        assert!(registry
+            .direct_ready(&room, source, id, attempt, Vec::new())
+            .is_err());
         let outbox = registry
             .forward_rtc_answer(&room, source, &sdp_body(id, attempt, "v=0 answer"))
             .unwrap();
@@ -10783,15 +11922,17 @@ mod transfer_state_tests {
         let _ = recv_text(&mut recipient_rx).await;
         // First ready commits nothing and is idempotent.
         assert!(registry
-            .direct_ready(&room, recipient, id, attempt)
+            .direct_ready(&room, recipient, id, attempt, Vec::new())
             .unwrap()
             .is_empty());
         assert!(registry
-            .direct_ready(&room, recipient, id, attempt)
+            .direct_ready(&room, recipient, id, attempt, Vec::new())
             .unwrap()
             .is_empty());
         // The second distinct ready commits, recipient first.
-        let outbox = registry.direct_ready(&room, source, id, attempt).unwrap();
+        let outbox = registry
+            .direct_ready(&room, source, id, attempt, Vec::new())
+            .unwrap();
         assert_eq!(outbox.len(), 2);
         assert_eq!(outbox[0].0, recipient);
         assert_eq!(outbox[1].0, source);
@@ -10810,7 +11951,9 @@ mod transfer_state_tests {
             TransferState::ActiveDirect
         );
         // A repeat after the commit does not commit twice.
-        assert!(registry.direct_ready(&room, source, id, attempt).is_err());
+        assert!(registry
+            .direct_ready(&room, source, id, attempt, Vec::new())
+            .is_err());
         // Direct carried it, so completion is valid from ActiveDirect.
         assert_eq!(registry.current_relays(), 0);
     }
@@ -10883,9 +12026,11 @@ mod transfer_state_tests {
         drain_transfer_outbox(&room, outbox);
         let _ = recv_text(&mut recipient_rx).await;
         let _ = registry
-            .direct_ready(&room, recipient, id, attempt)
+            .direct_ready(&room, recipient, id, attempt, Vec::new())
             .unwrap();
-        let outbox = registry.direct_ready(&room, source, id, attempt).unwrap();
+        let outbox = registry
+            .direct_ready(&room, source, id, attempt, Vec::new())
+            .unwrap();
         drain_transfer_outbox(&room, outbox);
         let _ = recv_text(&mut recipient_rx).await;
         let _ = recv_text(&mut source_rx).await;
@@ -11056,7 +12201,9 @@ mod transfer_state_tests {
             assert!(registry
                 .forward_rtc_ice(&room, recipient, &ice_body(id, stale, Some("candidate:x")))
                 .is_err());
-            assert!(registry.direct_ready(&room, recipient, id, stale).is_err());
+            assert!(registry
+                .direct_ready(&room, recipient, id, stale, Vec::new())
+                .is_err());
             let (outcome, outbox) = registry
                 .direct_failed(
                     &room,
@@ -11199,8 +12346,12 @@ mod transfer_state_tests {
             .unwrap();
         drain_transfer_outbox(room, outbox);
         let _ = recv_text(&mut recipient_rx).await;
-        let _ = registry.direct_ready(room, recipient, id, attempt).unwrap();
-        let outbox = registry.direct_ready(room, source, id, attempt).unwrap();
+        let _ = registry
+            .direct_ready(room, recipient, id, attempt, Vec::new())
+            .unwrap();
+        let outbox = registry
+            .direct_ready(room, source, id, attempt, Vec::new())
+            .unwrap();
         drain_transfer_outbox(room, outbox);
         let _ = recv_text(&mut recipient_rx).await;
         let _ = recv_text(&mut source_rx).await;
@@ -11397,9 +12548,11 @@ mod transfer_state_tests {
         let _ = recv_text(&mut recipient_rx).await;
         assert_eq!(registry.current_relays(), 0);
         let _ = registry
-            .direct_ready(&room, recipient, id, attempt)
+            .direct_ready(&room, recipient, id, attempt, Vec::new())
             .unwrap();
-        let outbox = registry.direct_ready(&room, source, id, attempt).unwrap();
+        let outbox = registry
+            .direct_ready(&room, source, id, attempt, Vec::new())
+            .unwrap();
         drain_transfer_outbox(&room, outbox);
         let (typ, _) = recv_text(&mut recipient_rx).await;
         assert_eq!(typ, "transfer.path_commit");

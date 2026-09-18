@@ -15,6 +15,7 @@ import {
   sealFrame,
 } from "../../src/crypto.js";
 import { FRAME_FINAL } from "../../src/framing.js";
+import { REORDER_MAX_FRAMES } from "../../src/receiver.js";
 import { canonicalize, manifestValue } from "../../src/protocol.js";
 import { createReceiver } from "../../src/receiver.js";
 import { createSender } from "../../src/sender.js";
@@ -222,10 +223,17 @@ async function sourceHarness(bytes) {
 }
 
 /** The recipient side: a receiver over the in-memory OPFS/IDB doubles. */
-async function sinkHarness(bytes) {
+async function sinkHarness(bytes, idle = {}) {
   const control = [];
   const sockets = [];
-  const events = { progress: [], complete: [], staged: [], errors: [], paths: [] };
+  const events = {
+    progress: [],
+    complete: [],
+    staged: [],
+    errors: [],
+    paths: [],
+    attemptFailed: [],
+  };
   const backends = fakeBackends();
   const receiver = createReceiver({
     sendControl: (message) => {
@@ -242,12 +250,15 @@ async function sinkHarness(bytes) {
     roomKeyHex: ROOM_KEY,
     getSelfPeerId: () => SINK_PEER,
     repository: createRepository(backends),
+    ...idle,
     events: {
       onProgress: (info) => events.progress.push(info),
       onComplete: (info) => events.complete.push(info),
       onStaged: (info) => events.staged.push(info),
       onError: (transferId, code) => events.errors.push([transferId, code]),
       onPath: (transferId, path) => events.paths.push(path),
+      onAttemptFailed: (transferId, attemptId, reason) =>
+        events.attemptFailed.push([transferId, attemptId, reason]),
     },
   });
   const manifest = await manifestFor(bytes);
@@ -456,6 +467,144 @@ describe("web-transfer attempt coordination", () => {
       true,
       "the attempt is closed in the same turn the close was observed",
     );
+  });
+
+  it("frames_arriving_out_of_order_across_carriers_are_put_back_in_order", async () => {
+    // With several carriers the arrival order is the order N independent
+    // associations happened to deliver in, and the receiver reorders on the
+    // sequence in each frame's own CLEARTEXT header. The chunk still has to
+    // verify against the manifest digest, which is what proves the bytes were
+    // reassembled in the right order and not merely accepted.
+    const bytes = payload(CHUNK);
+    const dst = await sinkHarness(bytes);
+    const key = await keyFor(ATTEMPT_A);
+    assert.equal(dst.receiver.beginDirect(TRANSFER_ID, ATTEMPT_A, 4), true);
+    dst.receiver.handleControl({
+      type: "transfer.path_commit",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, path: "direct" },
+    });
+    await tick(20);
+    const frames = [];
+    await feedChunk(async (frame) => frames.push(frame), key, 0, bytes, 0);
+    assert.ok(frames.length > 8, "a 1 MiB chunk is many fragments");
+    // A deterministic shuffle standing for four carriers draining at
+    // different rates: every fourth frame first, then the rest. No frame is
+    // lost and none is duplicated — only the order changes.
+    const order = [];
+    for (let lane = 0; lane < 4; lane += 1) {
+      for (let at = lane; at < frames.length; at += 4) {
+        order.push(at);
+      }
+    }
+    for (const at of order) {
+      assert.equal(
+        dst.receiver.deliverDirectFrame(TRANSFER_ID, ATTEMPT_A, frames[at]),
+        true,
+      );
+    }
+    await waitFor(
+      () => dst.receiver.transfers().get(TRANSFER_ID).verifiedRanges.length === 1,
+      "the shuffled chunk to verify",
+    );
+    assert.deepEqual(dst.events.errors, [], "reordering is not a failure");
+    assert.deepEqual(dst.events.attemptFailed, []);
+  });
+
+  it("a_single_carrier_attempt_keeps_the_strict_in_order_rule", async () => {
+    // The red-check of the gate above: one transport delivers in order, so a
+    // gap there is not skew — it is a stream that no longer means what the
+    // attempt assumes, and it must still fail exactly as it did before the
+    // reorder window existed. A window armed unconditionally would make this
+    // transfer WAIT for a frame that is never coming.
+    const bytes = payload(CHUNK);
+    const dst = await sinkHarness(bytes);
+    const key = await keyFor(ATTEMPT_A);
+    assert.equal(dst.receiver.beginDirect(TRANSFER_ID, ATTEMPT_A, 1), true);
+    dst.receiver.handleControl({
+      type: "transfer.path_commit",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, path: "direct" },
+    });
+    await tick(20);
+    dst.receiver.deliverDirectFrame(
+      TRANSFER_ID,
+      ATTEMPT_A,
+      await sealFrame(key, 0, 1, bytes.subarray(0, FRAGMENT)),
+    );
+    dst.receiver.deliverDirectFrame(
+      TRANSFER_ID,
+      ATTEMPT_A,
+      await sealFrame(key, 2, 1, bytes.subarray(FRAGMENT, 2 * FRAGMENT)),
+    );
+    await waitFor(() => dst.events.errors.length === 1, "the gap to fail");
+    assert.equal(dst.events.errors[0][1], "FAILED");
+    assert.deepEqual(
+      dst.events.attemptFailed,
+      [],
+      "a single carrier never reaches the window",
+    );
+  });
+
+  it("the_reorder_window_is_bounded_and_ends_the_attempt_not_the_transfer", async () => {
+    // A carrier that has STOPPED, rather than merely fallen behind, would
+    // otherwise hold the window open for ever while the others fill it. The
+    // bound turns that into the end of the ATTEMPT: the transfer continues on
+    // the relay from what is already verified on disk, so the user sees a
+    // slower transfer and not a failed one. Failing the TRANSFER here would
+    // throw away every verified chunk for a transport problem.
+    const bytes = payload(CHUNK);
+    const dst = await sinkHarness(bytes);
+    const key = await keyFor(ATTEMPT_A);
+    assert.equal(dst.receiver.beginDirect(TRANSFER_ID, ATTEMPT_A, 4), true);
+    dst.receiver.handleControl({
+      type: "transfer.path_commit",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, path: "direct" },
+    });
+    await tick(20);
+    // Sequence 0 never arrives. Small frames so the FRAME ceiling is the one
+    // that binds and the test stays quick.
+    for (let seq = 1; seq <= REORDER_MAX_FRAMES + 1; seq += 1) {
+      dst.receiver.deliverDirectFrame(
+        TRANSFER_ID,
+        ATTEMPT_A,
+        await sealFrame(key, seq, 1, bytes.subarray(0, 64)),
+      );
+      if (dst.events.attemptFailed.length > 0) {
+        break;
+      }
+    }
+    await waitFor(
+      () => dst.events.attemptFailed.length === 1,
+      "the window to bound the attempt",
+    );
+    assert.equal(dst.events.attemptFailed[0][0], TRANSFER_ID);
+    assert.equal(dst.events.attemptFailed[0][1], ATTEMPT_A);
+    assert.equal(dst.events.attemptFailed[0][2], "stalled");
+    assert.deepEqual(dst.events.errors, [], "the TRANSFER is untouched");
+    assert.ok(
+      dst.receiver.transfers().has(TRANSFER_ID),
+      "the transfer is still open for the relay attempt",
+    );
+  });
+
+  it("a_duplicate_inside_the_reorder_window_ends_the_attempt", async () => {
+    // A reliable transport cannot deliver the same frame twice, so a
+    // duplicate is not skew either. It is caught before the AEAD, because the
+    // window would otherwise hold it as if it were a different frame.
+    const bytes = payload(CHUNK);
+    const dst = await sinkHarness(bytes);
+    const key = await keyFor(ATTEMPT_A);
+    assert.equal(dst.receiver.beginDirect(TRANSFER_ID, ATTEMPT_A, 2), true);
+    dst.receiver.handleControl({
+      type: "transfer.path_commit",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, path: "direct" },
+    });
+    await tick(20);
+    const ahead = await sealFrame(key, 3, 1, bytes.subarray(0, 64));
+    dst.receiver.deliverDirectFrame(TRANSFER_ID, ATTEMPT_A, ahead);
+    dst.receiver.deliverDirectFrame(TRANSFER_ID, ATTEMPT_A, ahead);
+    await waitFor(() => dst.events.attemptFailed.length === 1, "the duplicate");
+    assert.equal(dst.events.attemptFailed[0][2], "protocol");
+    assert.deepEqual(dst.events.errors, []);
   });
 
   it("old_attempt_frames_callbacks_and_keys_are_ignored", async () => {
@@ -1005,5 +1154,290 @@ describe("web-transfer attempt coordination", () => {
       false,
     );
     assert.equal(dst.sockets.length, 1);
+  });
+});
+
+describe("web-transfer direct idle deadline", () => {
+  const IDLE = { directIdleTimeoutMs: 120, directIdleCheckMs: 10 };
+
+  it("a_silent_direct_attempt_is_abandoned_so_the_relay_can_finish_it", async () => {
+    // A carrier that CLOSES reports itself. A carrier that goes silent does
+    // not: the channel stays `open` and every frame the source writes
+    // disappears. Nothing else in the path has a deadline — the server is
+    // not on the direct path at all — so without this the row sits at its
+    // last verified byte for ever.
+    const bytes = payload(CHUNK * 2);
+    const dst = await sinkHarness(bytes, IDLE);
+    const key = await keyFor(ATTEMPT_A);
+    assert.equal(dst.receiver.beginDirect(TRANSFER_ID, ATTEMPT_A), true);
+    dst.receiver.handleControl({
+      type: "transfer.path_commit",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, path: "direct" },
+    });
+    await tick(20);
+    // One chunk arrives and is verified; then the path goes quiet.
+    await feedChunk(
+      async (frame) => {
+        dst.receiver.deliverDirectFrame(TRANSFER_ID, ATTEMPT_A, frame);
+      },
+      key,
+      0,
+      bytes,
+      0,
+    );
+    await waitFor(
+      () => dst.events.attemptFailed.length > 0,
+      "the silent attempt to be abandoned",
+    );
+    assert.deepEqual(dst.events.attemptFailed[0], [
+      TRANSFER_ID,
+      ATTEMPT_A,
+      "stalled",
+    ]);
+    // The ATTEMPT died, not the transfer: what was verified is still on disk
+    // and is what the relay attempt will skip.
+    assert.ok(dst.receiver.transfers().has(TRANSFER_ID));
+  });
+
+  it("a_recipient_that_is_merely_busy_is_never_mistaken_for_a_dead_path", async () => {
+    // The other half, and the one that makes the deadline safe: a recipient
+    // that is BEHIND makes the source's queue fill, so frames stop arriving
+    // for a reason that has nothing to do with the path. A clock that did
+    // not look at the inbox would abandon a healthy attempt under exactly
+    // the load carriers exist to serve.
+    const bytes = payload(CHUNK);
+    const dst = await sinkHarness(bytes, IDLE);
+    assert.equal(dst.receiver.beginDirect(TRANSFER_ID, ATTEMPT_A), true);
+    dst.receiver.handleControl({
+      type: "transfer.path_commit",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, path: "direct" },
+    });
+    const live = dst.receiver.transfers().get(TRANSFER_ID);
+    live.pumping = true;
+    live.lastFrameAt = Date.now() - 10_000;
+    await tick(400);
+    assert.equal(
+      dst.events.attemptFailed.length,
+      0,
+      "work still in hand is not an idle path",
+    );
+    live.pumping = false;
+    await waitFor(
+      () => dst.events.attemptFailed.length > 0,
+      "the deadline to resume once the recipient has nothing left to do",
+    );
+  });
+
+  it("the_relay_leg_never_arms_the_direct_idle_clock", async () => {
+    // The relay's stall is the server's to notice and its socket reports a
+    // close; arming a second deadline on it would give a slow relay a way to
+    // fail that it never had.
+    const bytes = payload(CHUNK);
+    const dst = await sinkHarness(bytes, IDLE);
+    dst.receiver.handleControl({
+      type: "transfer.relay_ticket",
+      body: {
+        transferId: TRANSFER_ID,
+        attemptId: ATTEMPT_A,
+        ticket: "t".repeat(32),
+        role: "recipient",
+      },
+    });
+    await tick(400);
+    assert.equal(dst.events.attemptFailed.length, 0);
+    assert.equal(
+      dst.receiver.transfers().get(TRANSFER_ID).idleTimer,
+      null,
+      "no clock was armed for a relay attempt",
+    );
+  });
+});
+
+describe("web-transfer relay to direct upgrade (7.5)", () => {
+  /** A download running on the relay, with chunk 0 already verified. */
+  async function relaying(bytes) {
+    const dst = await sinkHarness(bytes);
+    dst.receiver.handleControl({
+      type: "transfer.relay_ticket",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, ticket: "ab".repeat(16) },
+    });
+    await tick(20);
+    assert.equal(dst.sockets.length, 1, "the ticket opened exactly one relay leg");
+    dst.sockets[0].onopen?.();
+    assert.equal(
+      dst.receiver.handleControl({
+        type: "transfer.path_commit",
+        body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, path: "relay" },
+      }),
+      true,
+    );
+    const keyA = await keyFor(ATTEMPT_A);
+    const emit = (frame) => dst.sockets[0].emit(frame);
+    const seq = await feedChunk(emit, keyA, 0, bytes, 0);
+    await waitFor(
+      () => dst.receiver.transfers().get(TRANSFER_ID).verifiedRanges.length > 0,
+      "the relay to deliver chunk 0",
+    );
+    return { dst, keyA, seq };
+  }
+
+  it("a_probe_never_disturbs_the_relay_that_is_carrying", async () => {
+    // The whole point of the re-upgrade is that it costs nothing when it
+    // fails: the relay is DELIVERING while the probe negotiates, so a probe
+    // that touched the live attempt would turn a working download into a
+    // gamble. Nothing about the live attempt may move until the server's
+    // own commit says so.
+    const bytes = payload(CHUNK * 2);
+    const { dst } = await relaying(bytes);
+    const live = dst.receiver.transfers().get(TRANSFER_ID);
+
+    assert.equal(dst.receiver.prepareUpgrade(TRANSFER_ID, ATTEMPT_B, 2), true);
+    assert.equal(live.attemptId, ATTEMPT_A, "the carrying attempt is untouched");
+    assert.equal(live.transport, "relay");
+    assert.equal(dst.sockets[0].closed, false, "the relay leg is still open");
+    assert.deepEqual(
+      dst.receiver.upgradeRanges(TRANSFER_ID, ATTEMPT_B),
+      [[0, 1]],
+      "the probe reports what the relay already delivered",
+    );
+    // A frame of the live attempt during the probe: still accepted, because
+    // the relay never stopped carrying.
+    assert.equal(
+      dst.receiver.deliverDirectFrame(
+        TRANSFER_ID,
+        ATTEMPT_B,
+        new Uint8Array(32),
+      ),
+      false,
+      "a frame on the probe is refused while the probe is not committed",
+    );
+
+    // Abandoning it is equally free.
+    assert.equal(dst.receiver.abandonUpgrade(TRANSFER_ID, ATTEMPT_B), true);
+    assert.equal(live.attemptId, ATTEMPT_A);
+    assert.equal(live.transport, "relay");
+    assert.equal(dst.sockets[0].closed, false);
+    assert.deepEqual(dst.events.errors, [], "a probe that came to nothing is not an error");
+  });
+
+  it("the_commit_moves_the_recipient_onto_the_probe_and_resumes_where_the_relay_stopped", async () => {
+    const bytes = payload(CHUNK * 2);
+    const { dst } = await relaying(bytes);
+    assert.equal(dst.receiver.prepareUpgrade(TRANSFER_ID, ATTEMPT_B, 2), true);
+    const ranges = dst.receiver.upgradeRanges(TRANSFER_ID, ATTEMPT_B);
+
+    assert.equal(
+      dst.receiver.handleControl({
+        type: "transfer.path_commit",
+        body: {
+          transferId: TRANSFER_ID,
+          attemptId: ATTEMPT_B,
+          path: "direct",
+          resumeRanges: ranges,
+        },
+      }),
+      true,
+    );
+    const live = dst.receiver.transfers().get(TRANSFER_ID);
+    assert.equal(live.attemptId, ATTEMPT_B, "the download adopted the probe");
+    assert.equal(live.transport, "direct");
+    assert.equal(live.expectedSeq, 0, "the new attempt's sequence restarts at zero");
+    assert.equal(live.reorderWindow, true, "a multi-carrier probe arms the window");
+    assert.equal(dst.sockets[0].closed, true, "the relay leg was released");
+    assert.deepEqual(live.plan, [1], "the chunk the relay delivered is not sent again");
+    assert.equal(live.upgrade, null);
+
+    const keyB = await keyFor(ATTEMPT_B);
+    let seq = await feedChunk(
+      (frame) => dst.receiver.deliverDirectFrame(TRANSFER_ID, ATTEMPT_B, frame),
+      keyB,
+      0,
+      bytes,
+      1,
+    );
+    dst.receiver.deliverDirectFrame(
+      TRANSFER_ID,
+      ATTEMPT_B,
+      await sealFrame(keyB, seq, FRAME_FINAL, finalPayload(CHUNK)),
+    );
+    await waitFor(
+      () => dst.control.some((m) => m.type === "transfer.complete"),
+      "the upgraded download to finish",
+    );
+    assert.deepEqual(
+      dst.receiver.transfers().get(TRANSFER_ID).verifiedRanges,
+      [[0, 2]],
+      "the relay's chunk and the direct path's chunk are one file",
+    );
+    assert.deepEqual(dst.events.paths, ["relay", "direct"], "both transports were named in turn");
+    const complete = dst.control.find((m) => m.type === "transfer.complete");
+    assert.equal(
+      dst.receiver.handleControl({
+        type: "ack",
+        requestId: complete.requestId,
+        body: { result: { transferId: TRANSFER_ID } },
+      }),
+      true,
+    );
+    await waitFor(() => dst.events.staged.length === 1, "the staged file");
+    assert.deepEqual(dst.events.errors, []);
+  });
+
+  it("the_source_stages_a_probe_and_switches_onto_it_only_on_the_commit", async () => {
+    const bytes = payload(CHUNK * 2);
+    const src = await sourceHarness(bytes);
+    assert.equal(
+      src.sender.handleControl({
+        type: "transfer.relay_ticket",
+        body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, ticket: "ab".repeat(16) },
+      }),
+      true,
+    );
+    await tick(20);
+    assert.equal(src.sockets.length, 1);
+    src.sender.handleControl({
+      type: "transfer.path_commit",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, path: "relay" },
+    });
+    await waitFor(() => src.sockets[0].sent.length > 1, "the relay pipeline to start");
+
+    const sink = fakeSink();
+    assert.equal(src.sender.attachUpgrade(TRANSFER_ID, ATTEMPT_B, sink), true);
+    await tick(20);
+    assert.equal(
+      src.sender.transfers().get(TRANSFER_ID).attemptId,
+      ATTEMPT_A,
+      "staging a probe does not move the attempt that is sending",
+    );
+    assert.equal(sink.frames.length, 0, "nothing is written into an uncommitted probe");
+
+    assert.equal(
+      src.sender.handleControl({
+        type: "transfer.path_commit",
+        body: {
+          transferId: TRANSFER_ID,
+          attemptId: ATTEMPT_B,
+          path: "direct",
+          resumeRanges: [[0, 1]],
+        },
+      }),
+      true,
+    );
+    const fragments = Math.ceil(CHUNK / FRAGMENT);
+    await waitFor(() => sink.frames.length === fragments + 1, "the upgraded source to send");
+    const live = src.sender.transfers().get(TRANSFER_ID);
+    assert.equal(live.attemptId, ATTEMPT_B);
+    assert.equal(live.direct, true);
+    assert.equal(live.socket, null, "the relay leg was released");
+    // Only the chunk the relay had NOT delivered travelled, plus FINAL: the
+    // upgrade resumes, it does not restart.
+    const keyB = await keyFor(ATTEMPT_B);
+    const first = await openFrame(keyB, new Uint8Array(sink.frames[0]), 0);
+    assert.deepEqual(
+      Array.from(first.plaintext.subarray(0, 16)),
+      Array.from(bytes.subarray(CHUNK, CHUNK + 16)),
+      "the first frame of the probe is the chunk the relay never delivered",
+    );
+    assert.deepEqual(src.events.errors, [], "switching path is not a failure");
   });
 });

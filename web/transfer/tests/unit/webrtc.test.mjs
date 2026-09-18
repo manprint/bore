@@ -12,8 +12,11 @@ import {
   DISCONNECT_GRACE_MS,
   MAX_FRAGMENT_BYTES,
   MAX_REMOTE_CANDIDATES,
+  MAX_CARRIERS,
   RTC_HIGH_WATER,
+  RTC_LOW_WATER,
   createAttemptRtc,
+  createCarrierGroup,
   filterIceServers,
   fragmentBytesFor,
 } from "../../src/webrtc.js";
@@ -129,7 +132,7 @@ class FakePc extends EventTarget {
 }
 
 /** One actor plus everything a test needs to drive and observe it. */
-function harness(role, { maxMessageSize } = {}) {
+function harness(role, { maxMessageSize, drainTimeoutMs } = {}) {
   const signals = [];
   const events = { ready: [], failed: [], messages: [], closed: 0 };
   let pc = null;
@@ -138,6 +141,10 @@ function harness(role, { maxMessageSize } = {}) {
     transferId: TID,
     attemptId: AID,
     iceServers: ["stun:stun.example:3478"],
+    // The deadline is a seam, not a clock to wait out: a test that needed the
+    // shipped ten seconds would either be ten seconds long or would not test
+    // the deadline at all.
+    ...(drainTimeoutMs === undefined ? {} : { drainTimeoutMs }),
     sendSignal: (type, body) => {
       signals.push({ type, body });
       return true;
@@ -168,6 +175,57 @@ function harness(role, { maxMessageSize } = {}) {
 }
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** A group of N carriers over the same doubles, plus what a test needs. */
+function groupHarness(role, carriers, { drainTimeoutMs } = {}) {
+  const signals = [];
+  const events = { ready: [], failed: [], messages: [], closed: 0 };
+  const pcs = [];
+  const actor = createCarrierGroup({
+    role,
+    transferId: TID,
+    attemptId: AID,
+    carriers,
+    iceServers: ["stun:stun.example:3478"],
+    ...(drainTimeoutMs === undefined ? {} : { drainTimeoutMs }),
+    sendSignal: (type, body) => {
+      signals.push({ type, body });
+      return true;
+    },
+    createPeerConnection: (config) => {
+      const pc = new FakePc(config);
+      pcs.push(pc);
+      return pc;
+    },
+    events: {
+      onReady: (info) => events.ready.push(info),
+      onFailed: (reason) => events.failed.push(reason),
+      onMessage: (data) => events.messages.push(data),
+      onClosed: () => {
+        events.closed += 1;
+      },
+    },
+  });
+  return { actor, signals, events, pcs };
+}
+
+/**
+ * Brings one carrier of an offerer group to `open`: its own offer goes out,
+ * the peer answers it, and the channel it created opens.
+ */
+async function openCarrier(h, index) {
+  const pc = h.pcs[index];
+  h.actor.handleSignal("rtc.answer", {
+    transferId: TID,
+    attemptId: AID,
+    ...(index === 0 ? {} : { carrier: index }),
+    sdp: "v=0\r\nremote-answer",
+  });
+  await wait(0);
+  pc.created[0].becomeOpen();
+  await wait(0);
+  return pc.created[0];
+}
 
 test("web-transfer webrtc", async (t) => {
   await t.test("receiver_creates_exactly_one_ordered_reliable_channel", async () => {
@@ -266,9 +324,109 @@ test("web-transfer webrtc", async (t) => {
     // After the description, candidates go straight through.
     await ok.actor.handleSignal("rtc.ice", { candidate: "candidate:c udp" });
     assert.equal(ok.pc().addedCandidates.length, 3);
-    // The end marker is not a candidate and adds nothing.
+    // The end marker REACHES the agent (see the next test), exactly once.
     await ok.actor.handleSignal("rtc.ice", { candidate: null });
-    assert.equal(ok.pc().addedCandidates.length, 3);
+    assert.deepEqual(ok.pc().addedCandidates[3], null);
+    await ok.actor.handleSignal("rtc.ice", { candidate: null });
+    assert.equal(ok.pc().addedCandidates.length, 4, "the marker is idempotent");
+  });
+
+  // V003-F05. The marker used to be DROPPED here, on the argument that an
+  // engine can read the end from its own gathering state — which is about the
+  // LOCAL candidates and says nothing about the peer's. WebRTC 1.0 passes an
+  // end-of-candidates indication to `addIceCandidate()`, with `null` meaning
+  // "for every media description".
+  await t.test("remote_end_of_candidates_is_applied_after_queued_candidates", async () => {
+    const early = harness("offerer");
+    await early.actor.start();
+    // The marker arrives BEFORE the description, together with candidates
+    // that must go in first: it waits in one bounded slot.
+    await early.actor.handleSignal("rtc.ice", { candidate: "candidate:a udp", sdpMid: "0" });
+    await early.actor.handleSignal("rtc.ice", { candidate: null });
+    await early.actor.handleSignal("rtc.ice", { candidate: null });
+    assert.equal(early.pc().addedCandidates.length, 0, "nothing is added before the description");
+    assert.equal(
+      early.actor.state().pendingCandidates,
+      1,
+      "the marker does not occupy a candidate slot",
+    );
+    await early.actor.handleSignal("rtc.answer", { sdp: "v=0 remote" });
+    assert.deepEqual(
+      early.pc().addedCandidates,
+      [{ candidate: "candidate:a udp", sdpMid: "0" }, null],
+      "the candidate goes in first and the marker exactly once after it",
+    );
+    // A marker arriving later cannot repeat it.
+    await early.actor.handleSignal("rtc.ice", { candidate: null });
+    assert.equal(early.pc().addedCandidates.length, 2);
+
+    // A whole queue drains before the marker, in order.
+    const many = harness("offerer");
+    await many.actor.start();
+    for (let i = 0; i < 5; i += 1) {
+      await many.actor.handleSignal("rtc.ice", { candidate: `candidate:${i} udp` });
+    }
+    await many.actor.handleSignal("rtc.ice", { candidate: null });
+    await many.actor.handleSignal("rtc.answer", { sdp: "v=0 remote" });
+    const added = many.pc().addedCandidates;
+    assert.equal(added.length, 6);
+    assert.deepEqual(
+      added.slice(0, 5).map((init) => init.candidate),
+      ["candidate:0 udp", "candidate:1 udp", "candidate:2 udp", "candidate:3 udp", "candidate:4 udp"],
+    );
+    assert.equal(added[5], null, "the marker is last");
+    // The 128-candidate bound is untouched by the marker.
+    assert.equal(many.actor.state().pendingCandidates, 0);
+  });
+
+  // V003-F02. The deadline used to RESOLVE while the queue was still above
+  // the high-water mark, and `sendArchive` answered by reading and queueing
+  // the next 1 MiB chunk into a browser queue that had stopped draining.
+  await t.test("stalled_channel_never_queues_after_drain_deadline", async () => {
+    const h = harness("answerer", { drainTimeoutMs: 30 });
+    await h.actor.start();
+    const channel = new FakeChannel(CHANNEL_LABEL, { protocol: CHANNEL_PROTOCOL });
+    h.pc().handOverChannel(channel);
+    await h.actor.handleSignal("rtc.offer", { sdp: "v=0 remote" });
+    channel.becomeOpen();
+    assert.equal(h.events.ready.length, 1);
+
+    const sink = h.actor.sink;
+    channel.bufferedAmount = RTC_HIGH_WATER + 1;
+    const queuedBefore = channel.bufferedAmount;
+    const sentBefore = channel.sent.length;
+    const outcome = await sink
+      .waitLow(new AbortController().signal)
+      .then(() => "resolved", (error) => error.name);
+
+    // The wait REJECTS, which is what the sender reads as "this attempt was
+    // abandoned": it stops reading the file and waits for the relay attempt.
+    assert.equal(outcome, "AbortError");
+    // Exactly one failure, with the fixed reason the wire already carries.
+    assert.deepEqual(h.events.failed, ["timeout"]);
+    // And nothing more can be queued: the channel is gone with the attempt.
+    assert.throws(
+      () => sink.send(new Uint8Array(16)),
+      (error) => error.name === "AbortError",
+    );
+    assert.equal(channel.sent.length, sentBefore, "no byte was queued after the deadline");
+    assert.equal(channel.bufferedAmount, queuedBefore, "the queue never grew");
+
+    // The one case resolving is right for: the queue really did drain and
+    // only the engine's event was missed.
+    const missed = harness("answerer", { drainTimeoutMs: 30 });
+    await missed.actor.start();
+    const quiet = new FakeChannel(CHANNEL_LABEL, { protocol: CHANNEL_PROTOCOL });
+    missed.pc().handOverChannel(quiet);
+    await missed.actor.handleSignal("rtc.offer", { sdp: "v=0 remote" });
+    quiet.becomeOpen();
+    quiet.bufferedAmount = RTC_HIGH_WATER + 1;
+    const parked = missed.actor.sink
+      .waitLow(new AbortController().signal)
+      .then(() => "resolved", (error) => error.name);
+    quiet.bufferedAmount = 0;
+    assert.equal(await parked, "resolved");
+    assert.deepEqual(missed.events.failed, []);
   });
 
   await t.test("ready_requires_open_valid_channel_and_min_message_size", async () => {
@@ -417,7 +575,7 @@ test("web-transfer webrtc", async (t) => {
     assert.equal(h.events.ready.length, 1);
     // The low-water threshold is declared to the engine, so the drain event
     // exists at all.
-    assert.equal(channel.bufferedAmountLowThreshold, 1024 * 1024);
+    assert.equal(channel.bufferedAmountLowThreshold, RTC_LOW_WATER);
 
     const sink = h.actor.sink;
     // Below high water the pipeline never waits.
@@ -635,4 +793,193 @@ test("web-transfer webrtc", async (t) => {
     await actor.start();
     assert.deepEqual(failures, ["unsupported"]);
   });
+});
+
+test("one_carrier_is_the_actor_itself_and_puts_no_carrier_on_the_wire", async () => {
+  // The count is a ceiling, and at its lowest value the group must not exist
+  // at all: an attempt that asked for one carrier runs the code that ran
+  // before carriers, and its signalling carries no field that did not exist
+  // then. This is what `carriers <= 1` promises, and it is the cheapest thing
+  // to break by "unifying" the two paths.
+  const h = groupHarness("offerer", 1);
+  await h.actor.start();
+  assert.equal(h.pcs.length, 1, "one peer connection");
+  assert.ok(h.signals.length > 0, "the offerer offers");
+  for (const signal of h.signals) {
+    assert.ok(
+      !Object.hasOwn(signal.body, "carrier"),
+      `carrier 0 stays off the wire: ${JSON.stringify(signal.body)}`,
+    );
+  }
+  // Not the group's shape: the single actor's.
+  assert.equal(h.actor.state().carriers, undefined);
+  assert.equal(h.actor.state().role, "offerer");
+  h.actor.close();
+});
+
+test("each_carrier_negotiates_under_its_own_index", async () => {
+  const h = groupHarness("offerer", 3);
+  await h.actor.start();
+  assert.equal(h.pcs.length, 3, "one peer connection per carrier");
+  const offers = h.signals.filter((s) => s.type === "rtc.offer");
+  assert.equal(offers.length, 3);
+  assert.deepEqual(
+    offers.map((s) => s.body.carrier ?? 0),
+    [0, 1, 2],
+    "one offer each, indexed",
+  );
+  assert.ok(!Object.hasOwn(offers[0].body, "carrier"), "carrier 0 is implicit");
+  // An answer is routed to the carrier it names, and to no other.
+  await openCarrier(h, 2);
+  const states = h.actor.state().members;
+  assert.equal(states[2].ready, true);
+  assert.equal(states[0].ready, false);
+  assert.equal(states[1].ready, false);
+  h.actor.close();
+});
+
+test("the_attempt_is_ready_on_the_first_carrier_and_dead_only_on_the_last", async () => {
+  // A ceiling and not a reservation: three carriers out of four is a working
+  // direct path, and reporting the attempt failed while any carrier still
+  // carries bytes would send a healthy transfer to the relay.
+  const h = groupHarness("offerer", 3);
+  await h.actor.start();
+  await openCarrier(h, 0);
+  assert.equal(h.events.ready.length, 1, "ready once, on the first carrier");
+  await openCarrier(h, 1);
+  assert.equal(h.events.ready.length, 1, "ready is a per-attempt statement");
+  assert.equal(h.actor.state().readyCount, 2);
+  // Two of three die: the attempt is still alive.
+  h.pcs[0].created[0].close();
+  await wait(0);
+  assert.deepEqual(h.events.failed, [], "one carrier is not the attempt");
+  h.pcs[1].created[0].close();
+  await wait(0);
+  // Carrier 2 never opened; closing the group ends it. The failure is
+  // reported only when nothing is left to carry bytes.
+  assert.deepEqual(h.events.failed, [], "the third carrier is still trying");
+  h.actor.close();
+});
+
+test("the_sink_writes_to_the_least_loaded_carrier", async () => {
+  // Work-conserving on purpose. A fixed round-robin parks the writer on a
+  // carrier whose queue is full while the others sit idle — the head-of-line
+  // that carriers exist to remove.
+  const h = groupHarness("offerer", 3);
+  await h.actor.start();
+  const channels = [
+    await openCarrier(h, 0),
+    await openCarrier(h, 1),
+    await openCarrier(h, 2),
+  ];
+  // Three writes with everything idle: one each, because each write makes
+  // the carrier it chose the most loaded.
+  for (let n = 0; n < 3; n += 1) {
+    h.actor.sink.send(new Uint8Array(100));
+  }
+  assert.deepEqual(
+    channels.map((channel) => channel.sent.length),
+    [1, 1, 1],
+    "the load spreads",
+  );
+  // Now make carrier 1 the emptiest by hand: every following write goes
+  // there until it is no longer the emptiest.
+  channels[1].bufferedAmount = 0;
+  h.actor.sink.send(new Uint8Array(10));
+  assert.equal(channels[1].sent.length, 2);
+  // And the aggregate the sender reads is the sum, not one carrier's.
+  assert.equal(
+    h.actor.sink.bufferedAmount,
+    channels.reduce((total, channel) => total + channel.bufferedAmount, 0),
+  );
+  h.actor.close();
+});
+
+test("a_carrier_that_dies_under_a_write_is_skipped_not_fatal", async () => {
+  const h = groupHarness("offerer", 2);
+  await h.actor.start();
+  const first = await openCarrier(h, 0);
+  const second = await openCarrier(h, 1);
+  // The emptiest carrier dies between the choice and the write, which is
+  // exactly the race a live channel can lose.
+  first.readyState = "closed";
+  h.actor.sink.send(new Uint8Array(100));
+  assert.equal(second.sent.length, 1, "the frame went to the live carrier");
+  assert.deepEqual(h.events.failed, [], "the attempt is still alive");
+  // With nothing left, the write fails the way a single channel does, so the
+  // sender reads it as an abandoned attempt and waits for the relay.
+  second.readyState = "closed";
+  assert.throws(
+    () => h.actor.sink.send(new Uint8Array(100)),
+    (error) => error?.name === "AbortError",
+  );
+  h.actor.close();
+});
+
+test("an_attempt_is_reported_dead_however_its_last_carrier_left", async () => {
+  // A carrier can leave by more than one door: its own failure, or a write
+  // that throws under the sink. While only the first door was counted, a
+  // MIXED death left the tally one short of the carrier count for ever, so
+  // `onFailed` never fired. MEASURED on a real browser pair: the page never
+  // learned its direct attempt was dead, so it never attached the relay leg
+  // the server had already ticketed, and the transfer sat until the 30 s
+  // pairing timeout with the file half delivered.
+  const h = groupHarness("offerer", 2);
+  await h.actor.start();
+  const first = await openCarrier(h, 0);
+  await openCarrier(h, 1);
+
+  // Door one: a write that throws.
+  first.readyState = "closed";
+  h.actor.sink.send(new Uint8Array(10));
+  assert.deepEqual(h.events.failed, [], "one carrier of two is not the attempt");
+
+  // Door two: the other carrier fails on its own.
+  h.pcs[1].created[0].close();
+  await wait(0);
+  assert.equal(
+    h.events.failed.length,
+    1,
+    "the attempt is reported dead exactly once, whichever door the last carrier took",
+  );
+  h.actor.close();
+});
+
+test("wait_low_returns_as_soon_as_any_carrier_drains", async () => {
+  const h = groupHarness("offerer", 2, { drainTimeoutMs: 50 });
+  await h.actor.start();
+  const first = await openCarrier(h, 0);
+  const second = await openCarrier(h, 1);
+  first.bufferedAmount = RTC_HIGH_WATER + 1;
+  second.bufferedAmount = RTC_HIGH_WATER + 1;
+  let settled = false;
+  const waiting = h.actor.sink.waitLow().then(() => {
+    settled = true;
+  });
+  await wait(0);
+  assert.equal(settled, false, "both carriers are above the mark");
+  // ONE of them drains. The writer is released: waiting for the other would
+  // be the head-of-line again, one level up.
+  second.drain();
+  await waiting;
+  assert.equal(settled, true);
+  h.actor.close();
+});
+
+test("the_carrier_count_is_bounded_however_the_server_names_it", async () => {
+  // The page must not open an unbounded number of peer connections because a
+  // message said so. The server enforces the same ceiling; this is the half
+  // that does not depend on the server being the one that sent it.
+  for (const [asked, expected] of [
+    [0, 1],
+    [-4, 1],
+    ["3", 3],
+    [MAX_CARRIERS + 9, MAX_CARRIERS],
+    [Number.NaN, 1],
+  ]) {
+    const h = groupHarness("offerer", asked);
+    await h.actor.start();
+    assert.equal(h.pcs.length, expected, `carriers=${asked}`);
+    h.actor.close();
+  }
 });

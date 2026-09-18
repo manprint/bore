@@ -161,7 +161,19 @@ function killChannelAfter(limit) {
     const create = Real.prototype.createDataChannel;
     Real.prototype.createDataChannel = function (...args) {
       const channel = create.apply(this, args);
-      let seen = 0;
+      // ACROSS CARRIERS, both the count and the kill. A direct attempt is
+      // several peer connections now (one per carrier, see
+      // --web-transfer-direct-carriers), each with its own channel, and the
+      // attempt dies only when the LAST one is gone: a per-channel counter
+      // both fired late (each carrier sees its own share of the bytes) and
+      // killed one carrier of N, which the product correctly survives -- so
+      // the transition this gate exists for never happened and the gate timed
+      // out instead of failing. NO BACKTICK in here: template literal.
+      const shared = (window.__BORE_KILL__ = window.__BORE_KILL__ || {
+        seen: 0,
+        channels: [],
+      });
+      shared.channels.push(channel);
       // The precondition is the BADGE, not a verified chunk. A chunk is
       // verified a moment before the path is committed (the commit is what
       // makes the transport real, and for an archive it waits on a record
@@ -180,10 +192,12 @@ function killChannelAfter(limit) {
       };
       channel.addEventListener("message", (event) => {
         const data = event.data;
-        seen += data && data.byteLength !== undefined ? data.byteLength : (data && data.size) || 0;
-        if (seen >= LIMIT && channel.readyState === "open" && named()) {
-          try { window.__BORE_TEST__.killedAt = seen; } catch {}
-          channel.close();
+        shared.seen += data && data.byteLength !== undefined ? data.byteLength : (data && data.size) || 0;
+        if (shared.seen >= LIMIT && named()) {
+          try { window.__BORE_TEST__.killedAt = shared.seen; } catch {}
+          for (const open of shared.channels) {
+            try { open.close(); } catch {}
+          }
         }
       });
       return channel;
@@ -332,11 +346,16 @@ test.describe.serial("ui", () => {
       // CI runner, two cores serving three engines, attempt 1 spent the whole
       // budget at `connecting` and took the gate down with it while attempt 2
       // was never allowed to run.
+      // 90 s, not 240: TWO attempts have to fit inside this test's own
+      // 420 s budget together with the first half of the gate. At 240 s each
+      // a product that never falls back makes the gate TIME OUT instead of
+      // failing with the message below — measured, and the timeout says
+      // nothing about which side did not move.
       const reached = await falling.page
         .waitForFunction(
           () => document.querySelector(".transfer-path")?.dataset.path === "relay",
           null,
-          { timeout: 240_000 },
+          { timeout: 90_000 },
         )
         .then(() => true)
         .catch(() => false);
@@ -347,7 +366,24 @@ test.describe.serial("ui", () => {
       // True of EVERY attempt, direct or not: the badge never opens on a
       // transport it has not verified.
       expect(seen[0]).toBe("connecting");
-      attempts.push({ attempt, reached, killed, seen });
+      attempts.push({
+        attempt,
+        reached,
+        killed,
+        seen,
+        // Both sides' own account, because a fallback that does not happen is
+        // one side not moving and the badge cannot say which.
+        recipient: await falling.page.evaluate(() => ({
+          direct: [...window.__BORE_TEST__.directEvents],
+          commits: [...window.__BORE_TEST__.pathCommits],
+        })),
+        source: await a.page.evaluate(() => ({
+          direct: [...window.__BORE_TEST__.directEvents],
+          inbound: [...window.__BORE_TEST__.inboundMarks].map((m) =>
+            m.type === "error" ? `error:${m.code}` : m.type,
+          ),
+        })),
+      });
       if (reached && killed !== null) {
         expect(seen.at(-1)).toBe("relay");
         trail = seen;

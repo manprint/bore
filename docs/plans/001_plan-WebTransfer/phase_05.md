@@ -100,8 +100,8 @@
 - **Model:** `agent:gpt-5.6-luna`
 - **Assignment:** implementare gli attori WebRTC con ruoli fissi e limiti browser; fare self-review degli handler, cleanup e backpressure.
 - **Files:** `web/transfer/src/webrtc.js:new — peer connection and signaling actor`; `web/transfer/src/main.js:attempt orchestration — direct wiring`; `web/transfer/src/control.js:rtc dispatch — signaling routing`; `web/transfer/src/sender.js:EncryptedFrameSink — DataChannel adapter`; `web/transfer/src/receiver.js:EncryptedFrameSource — DataChannel adapter`; `web/transfer/tests/unit/webrtc.test.mjs:new`; `web/transfer/tests/e2e/direct.spec.mjs:new`; `web/transfer/dist/:generated — rebuilt assets`.
-- **Change:** costruire `RTCPeerConnection({iceServers})` soltanto dopo `transfer.direct_start`, filtrando config server a URL `stun:` già validate e senza TURN credentials. Recipient crea subito un solo DataChannel con contratto fisso, installa handler, crea/setta local offer e invia rtc.offer; source setta remote offer, riceve esattamente quel channel via `ondatachannel`, crea/setta local answer e invia rtc.answer. Entrambi inoltrano trickle candidate e marker finale, accettano remote candidate soltanto dopo remote description usando una coda locale massima 128 e poi la svuotano. SDP/candidate non vanno in console/error UI. Considerare ready soltanto quando connectionState non è failed/closed, channel `open`, label/protocol/order corretti e `pc.sctp.maxMessageSize` consente almeno 1024 byte. Calcolare frammento plaintext per questo attempt come `min(24576, maxMessageSize - 64)`, con floor 1024; il path relay mantiene 24576. Inviare direct_ready una volta. Impostare `bufferedAmountLowThreshold=1048576`; se bufferedAmount supera 4194304, sospendere future File reads e attendere `bufferedamountlow`, AbortSignal o timeout 10 s. Ricevere solo ArrayBuffer; text/Blob non convertibile, messaggio oversized, channel aggiuntivo o signaling duplicato produce direct_failed. Ogni actor possiede listener cleanup e `close()` idempotente che rimuove callback, chiude data channel e pc. `failed`, `closed`, `disconnected` persistente per 2 s o send error prima completion invia direct_failed una volta. `disconnected` recuperato entro 2 s non fa fallback. Nessuna chiamata getUserMedia/permission. R1 — API e stato RTCPeerConnection/DataChannel ([W3C](https://www.w3.org/TR/webrtc/)); R2 — canale ordinato/affidabile e message boundaries ([RFC 8831](https://www.rfc-editor.org/rfc/rfc8831.html)); R3 — rispettare `max-message-size` del peer ([RFC 8841](https://www.rfc-editor.org/rfc/rfc8841.html)); R11 — `bufferedAmountLowThreshold` segnala il drenaggio ([MDN](https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/bufferedAmount)).
-- **Unit tests:** `receiver_creates_exactly_one_ordered_reliable_channel`; `source_never_creates_channel_and_accepts_only_expected_one`; `offer_answer_and_candidates_follow_fixed_roles`; `remote_candidates_queue_is_bounded_until_description`; `ready_requires_open_valid_channel_and_min_message_size`; `fragment_size_respects_negotiated_max`; `high_low_water_pauses_before_next_file_read`; `transient_disconnect_has_two_second_grace`; `failure_is_reported_once_and_cleanup_is_idempotent`; `no_media_or_permission_api_is_called`.
+- **Change:** costruire `RTCPeerConnection({iceServers})` soltanto dopo `transfer.direct_start`, filtrando config server a URL `stun:` già validate e senza TURN credentials. Recipient crea subito un solo DataChannel con contratto fisso, installa handler, crea/setta local offer e invia rtc.offer; source setta remote offer, riceve esattamente quel channel via `ondatachannel`, crea/setta local answer e invia rtc.answer. Entrambi inoltrano trickle candidate e marker finale, accettano remote candidate soltanto dopo remote description usando una coda locale massima 128 e poi la svuotano. **Corretto da V003-C5 (2026-09-17): il marker remoto di fine candidati viene CONSEGNATO all'agente** (`pc.addIceCandidate(null)`, WebRTC 1.0), una volta sola e dopo i candidati che lo precedono; se arriva prima della remote description aspetta in UNO slot dedicato, che non consuma il budget di 128. Veniva scartato con la motivazione che il motore legge la fine dal proprio `iceGatheringState` — che riguarda i candidati LOCALI e non dice nulla del peer. SDP/candidate non vanno in console/error UI. Considerare ready soltanto quando connectionState non è failed/closed, channel `open`, label/protocol/order corretti e `pc.sctp.maxMessageSize` consente almeno 1024 byte. Calcolare frammento plaintext per questo attempt come `min(24576, maxMessageSize - 64)`, con floor 1024; il path relay mantiene 24576. Inviare direct_ready una volta. Impostare `bufferedAmountLowThreshold=1048576`; se bufferedAmount supera 4194304, sospendere future File reads e attendere `bufferedamountlow`, AbortSignal o timeout 10 s. **Corretto da V003-C2 (2026-09-17): alla scadenza il tentativo FALLISCE** con la ragione fissa `timeout` e l'attesa viene rigettata — un canale che non ha drenato in 10 s è un percorso diretto morto, e risolvere l'attesa faceva accodare il chunk successivo su una coda che non drenava più. Ricevere solo ArrayBuffer; text/Blob non convertibile, messaggio oversized, channel aggiuntivo o signaling duplicato produce direct_failed. Ogni actor possiede listener cleanup e `close()` idempotente che rimuove callback, chiude data channel e pc. `failed`, `closed`, `disconnected` persistente per 2 s o send error prima completion invia direct_failed una volta. `disconnected` recuperato entro 2 s non fa fallback. Nessuna chiamata getUserMedia/permission. R1 — API e stato RTCPeerConnection/DataChannel ([W3C](https://www.w3.org/TR/webrtc/)); R2 — canale ordinato/affidabile e message boundaries ([RFC 8831](https://www.rfc-editor.org/rfc/rfc8831.html)); R3 — rispettare `max-message-size` del peer ([RFC 8841](https://www.rfc-editor.org/rfc/rfc8841.html)); R11 — `bufferedAmountLowThreshold` segnala il drenaggio ([MDN](https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/bufferedAmount)).
+- **Unit tests:** `receiver_creates_exactly_one_ordered_reliable_channel`; `source_never_creates_channel_and_accepts_only_expected_one`; `offer_answer_and_candidates_follow_fixed_roles`; `remote_candidates_queue_is_bounded_until_description`; `remote_end_of_candidates_is_applied_after_queued_candidates` (V003-C5); `ready_requires_open_valid_channel_and_min_message_size`; `fragment_size_respects_negotiated_max`; `high_low_water_pauses_before_next_file_read`; `stalled_channel_never_queues_after_drain_deadline` (V003-C2); `transient_disconnect_has_two_second_grace`; `failure_is_reported_once_and_cleanup_is_idempotent`; `no_media_or_permission_api_is_called`.
 - **e2e tests:** `T-WEB-DIRECT` — browser A/B stabiliscono DataChannel reale, il primo file read avviene dopo path_commit, bytes verificati sono esatti e nessuna `/relay/` socket viene aperta; eseguire almeno Chromium↔Chromium e Firefox↔Firefox, più WebKit quando il runner supporta WebRTC loopback.
 - **Done:** gates green (all authoritative commands in `STATE.md` §3) + `T-WEB-DIRECT` passa sui progetti supportati senza fake del DataChannel + instrumentation conferma una connection per transfer e zero relay + self-review verifica rimozione di tutti gli event listener e bounded candidate queue + closed in `STATE.md` (§1 → 4.3, §4 ledger row, §6 `none`, §11 board).
 
@@ -132,7 +132,14 @@
   1 MiB, e sopra 4 MiB accodati il mittente **aspetta `bufferedamountlow`**
   invece di accodare oltre — una coda profonda compra throughput e paga latenza,
   e qui la coda vive nella heap del tab. Un canale che non drena mai non parcheggia
-  la pipeline per sempre: 10 s di timeout e il `send` successivo decide.
+  la pipeline per sempre: 10 s di timeout. **V003-C2 (2026-09-17)**: la scadenza
+  FALLISCE il tentativo (`timeout`) invece di risolvere l'attesa. «Il `send`
+  successivo decide» era falso — un canale ancora `open` accetta il chunk
+  successivo, quindi una coda ferma cresceva di 1 MiB ogni dieci secondi mentre
+  il trasferimento sembrava vivo. La coda resta limitata per costruzione, il
+  fallback sul relay riprende dagli intervalli già verificati, e l'unica
+  risoluzione rimasta è il caso in cui la coda è davvero scesa sotto la soglia e
+  solo l'evento del motore è mancato.
 - **Un solo transport nel codice**: `sender.js` scrive su un `sink`
   (`{fragmentBytes, highWater, bufferedAmount, send, waitLow, close}`) che è il
   WebSocket del relay o il DataChannel; `receiver.js` riceve da `deliverFrame`
@@ -533,11 +540,28 @@ e documentato. Tabelle, campioni grezzi e comandi in
   0,697x a 8 MiB. **Due ipotesi testate e falsificate:** la profondità della
   coda (sweep 4 MiB/1 MiB, 1 MiB/256 KiB, 256 KiB/64 KiB — il crollo c'è a
   ogni profondità) e la catena STUN pubblica (ri-misurato con
-  `--web-transfer-no-stun`, solo candidati host — 3 crolli su 6). Resta il
-  transport: SCTP ordinato e affidabile su UDP che perde un pacchetto e paga
-  un RTO. È la forma browser di P-13, ed è l'unica manopola che una pagina non
-  può raggiungere — il motivo per cui la voce 6 del catalogo RIFIUTA il tuning
-  della socket invece di tentarlo.
+  `--web-transfer-no-stun`, solo candidati host — 3 crolli su 6).
+- **Che cosa sia, MISURATO (V003-C1, 2026-09-17).** La riga che qui diceva
+  «resta il transport: SCTP che perde un pacchetto e paga un RTO» non era
+  misurata, ed è falsa. Strumentato l'attempt con la traccia di V003-C3 e
+  letta DOPO OGNI RIPETIZIONE (lo store tiene otto attempt: leggerlo alla fine
+  scarta il più vecchio, cioè proprio la ripetizione lenta — la prima corsa
+  strumentata ha perso così uno stallo da 3,3 s), il crollo è **UNA sola
+  attesa** di 1,3-1,7 s del `waitLow` della sorgente: con le soglie abbassate
+  a 512 KiB/128 KiB una attesa su sette dura 1654 ms e le altre sei sommano
+  47 ms. Non è la profondità della coda (picco 4,5 MB contro 1,17 MB, stesso
+  stallo), non è il tipo di coppia ICE (`host/host` in ogni ripetizione, lenta
+  o veloce), non è la perdita sul percorso: `packetsDiscardedOnSend` non
+  correla (una ripetizione veloce ne scarta 1209, la più lenta 38) e
+  soprattutto **firefox sullo stesso loopback non crolla mai** (6 ripetizioni
+  26,40-35,56 MiB/s, attesa massima 155 ms, rapporto 0,882x). Due motori sullo
+  stesso percorso, uno solo si ferma. Resta quindi un **limite del browser**:
+  un blocco da ~1,3-1,7 s del send path della DataChannel di chromium, al più
+  una volta per trasferimento. La durata è quella di un timer da un secondo
+  (RTO o zero-window probe dentro il motore) e resta **un'ipotesi**, perché
+  chromium non espone le statistiche `sctp-transport` (`cwnd`, `rwnd`,
+  `unackData` leggono `?`). La voce 6 del catalogo RIFIUTA il tuning della
+  socket per lo stesso motivo: la manopola non è raggiungibile da una pagina.
 - **E il rapporto non è un'affermazione sul prodotto.** Qui entrambi i
   "percorsi" sono loopback: il braccio relay è un salto TCP su localhost verso
   un server Rust sulla stessa macchina, cioè la condizione più favorevole che
@@ -546,6 +570,21 @@ e documentato. Tabelle, campioni grezzi e comandi in
   link prima di citare un valore assoluto**, e questo link non è quello per
   cui il percorso diretto esiste. Solo una misura a due host può dire chi
   vince in esercizio, ed è l'ambiente di 4.4, non di 4.6.
+- **`T-WEB-PERF-LAN` (V003-C1).** La misura a due host ora è un harness, non
+  un consiglio: `scripts/perf/web_transfer_lan.sh` serve la room in HTTPS
+  sull'indirizzo LAN, la crea con il comando SPEDITO `bore transfer web`,
+  guida la SORGENTE con `web/transfer/tests/perf/lan.perf.mjs` e lascia il
+  destinatario a un browser che qualcuno apre sull'altro dispositivo. Tre
+  scelte obbligate: guida solo la sorgente (un telefono non si guida con
+  Playwright, e F01 è un telefono — la fine del trasferimento è comunque il
+  destinatario, che conferma solo range VERIFICATI); HTTPS non è opzionale (il
+  server rifiuta un base URL in chiaro fuori loopback, e senza secure context
+  non esistono `crypto.subtle`, OPFS né `RTCPeerConnection`); il braccio si
+  sceglie sulla SORGENTE togliendole `RTCPeerConnection`, così il destinatario
+  non ha bisogno di alcun flag. `pathCommits` è asserito: un braccio la cui
+  etichetta e il cui trasporto non coincidono fallisce invece di pubblicare il
+  numero del relay sotto il nome `direct`. **La corsa sul campo resta da fare**
+  (V003-F01 aperta): serve la rete e il file da 400 MB del segnalatore.
 - **La sola ottimizzazione con un guadagno misurato: una allocazione e una
   copia per frame (V-14b).** `openWithKey` faceva due `slice` del messaggio in
   arrivo — header e body — allocando e copiando l'INTERO frame due volte in
@@ -558,6 +597,17 @@ e documentato. Tabelle, campioni grezzi e comandi in
   sempre un `ArrayBuffer` nuovo e non esiste variante in place, quindi una
   allocazione e una copia del ciphertext sono il pavimento;
   `new Uint8Array(arrayBuffer)` avvolge e non copia, quindi ci siamo già.
+- **SUPERATA il 2026-09-18 (B-A032), e la clausola che la rendeva falsa è
+  scritta qui dentro: «confrontando solo le ripetizioni sane».** Quella scala
+  era in LOOPBACK e scartava proprio le ripetizioni che la coda profonda
+  causa. Su due host reali (21 ms di RTT) 4 MiB non è «indistinguibile da
+  1 MiB»: fa ABORTIRE l'associazione SCTP (`errorDetail: "sctp-failure"`,
+  `sctpCauseCode: 12`) e il trasferimento finisce sul relay. La profondità
+  spedita è ora 512 KiB/128 KiB, e rimisurata IN LOOPBACK con le stesse sei
+  ripetizioni la mediana sale (46,27 contro 45,82 MiB/s) e i campioni
+  catastrofici spariscono (il peggiore passa da 2,36 a 14,02 MiB/s) — cioè la
+  bimodalità che questa fase aveva osservato e messo da parte ERA lo stesso
+  difetto. Vedi `docs/transfer/WEB_TRANSFER_PERF.md` §7.6.
 - **Le altre quattro voci: adottate senza cambiare nulla, ma ora misurate e
   vincolate.** Backpressure 4 MiB/1 MiB confermata (confrontando solo le
   ripetizioni sane, 4 MiB e 1 MiB sono indistinguibili e 256 KiB è **25 %

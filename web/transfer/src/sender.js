@@ -375,6 +375,10 @@ export function createSender({
       return false;
     }
     transfer.state = "sending";
+    // This attempt has not written its end-of-stream marker yet. It is
+    // per-ATTEMPT, so a relay leg that follows a dead direct one starts
+    // honest again.
+    transfer.finalSent = false;
     transfer.attemptAbort = new AbortController();
     const { signal } = transfer.attemptAbort;
     try {
@@ -500,6 +504,9 @@ export function createSender({
         return false;
       }
       transfer.sink.send(final);
+      // FINAL is written: from here the source has nothing left to say, and
+      // a close is no longer evidence of failure (see `socket.onclose`).
+      transfer.finalSent = true;
       perfEnd("src.wall", wallAt, transfer.attemptBytes);
       // Wait until the transport has actually WRITTEN everything the loop
       // handed it. `send` returns as soon as the bytes are queued, and on
@@ -656,6 +663,8 @@ export function createSender({
       sink: null,
       direct: false,
       pendingResumeRanges: [],
+      /** A staged direct channel awaiting the server's upgrade commit. */
+      upgrade: null,
       ticket: null,
       abort: new AbortController(),
       // A SECOND controller, scoped to one attempt: abandoning the direct
@@ -728,8 +737,17 @@ export function createSender({
         return;
       }
       // Anything before FINAL is a failure the server already reported (or
-      // will), and the record dies with it.
-      if (known.state !== "done-pending") {
+      // will), and the record dies with it. `finalSent` and not yet
+      // `done-pending` is the window between the FINAL write and the end of
+      // the flush wait, and it is REACHED: the recipient verifies and the
+      // server tears the leg down while the source is still draining its
+      // own queue. MEASURED on chromium in `T-WEB-DIRECT-FALLBACK` — the
+      // recipient read `relay 100% · Verificato` and the source, for the
+      // same transfer, `relay 100% · Non riuscito`. The source cannot tell
+      // a truncated queue from a completed one anyway (it is the writer),
+      // so once FINAL is out the verdict belongs to the server's own
+      // terminal message, exactly as it does after `done-pending`.
+      if (known.state !== "done-pending" && !known.finalSent) {
         events.onError?.(transfer.transferId, "FAILED");
         forget(transfer.transferId);
         return;
@@ -796,30 +814,37 @@ export function createSender({
         ) {
           return false;
         }
-        // A ticket naming a DIFFERENT attempt is the server saying the direct
-        // attempt was abandoned and this same transfer continues on the relay
-        // with a fresh key and nonce sequence. Adopt it — but only before the
-        // first byte, so a late ticket can never move a transfer that is
-        // already sending, and the key derived below is always the new one.
+        // A ticket naming a DIFFERENT attempt is the server saying the
+        // previous attempt was abandoned and this same transfer continues on
+        // the relay with a fresh key and nonce sequence. The SERVER is the
+        // authority on attempts, so this is adopted whatever this end was
+        // doing — including mid-send.
+        //
+        // It used to be refused unless the source had not written a byte yet,
+        // and that was wrong in the one case it matters. With carriers the
+        // recipient's failure report regularly reaches the server while this
+        // end is still pushing into a dead channel group: the server mints
+        // the relay attempt and tickets it, this end reads `committed`,
+        // refuses the ticket, never attaches its relay leg — and the
+        // recipient's leg, already attached, waits alone until the 30 s
+        // pairing timeout and the transfer dies with the file half
+        // delivered. MEASURED: `T-WEB-DIRECT-FALLBACK` fails with four
+        // carriers and passes with one, on the same 8 MiB and the same kill.
+        //
+        // Aborting in flight is the same move the upgrade commit makes in
+        // the other direction: the send unwinds through `beginSend`'s
+        // AbortError arm and leaves the record in place.
         if (transfer.attemptId !== body.attemptId) {
-          if (
-            transfer.state !== "waiting-commit" &&
-            transfer.state !== "committed-waiting-ticket" &&
-            transfer.state !== "committed-waiting-direct"
-          ) {
-            return false;
-          }
+          transfer.attemptAbort.abort();
           transfer.attemptId = body.attemptId;
-          // The direct attempt is over: its channel is closed by the actor
+          // The previous attempt is over: its channel is closed by the actor
           // that owns it, and the relay leg below installs the new sink. A
           // commit that was parked waiting for that channel is void — the
           // relay commit for the NEW attempt is what starts the pipeline.
           transfer.sink = null;
           transfer.direct = false;
           transfer.pendingResumeRanges = [];
-          if (transfer.state === "committed-waiting-direct") {
-            transfer.state = "waiting-commit";
-          }
+          transfer.state = "waiting-commit";
         }
         transfer.ticket = body.ticket;
         if (transfer.state === "waiting-commit") {
@@ -835,7 +860,37 @@ export function createSender({
       }
       if (message.type === "transfer.path_commit") {
         const transfer = transfers.get(body.transferId);
-        if (transfer === undefined || transfer.attemptId !== body.attemptId) {
+        if (transfer === undefined) {
+          return false;
+        }
+        // The UPGRADE commit: the server has decided this transfer moves off
+        // the relay and onto the probe both peers just negotiated. It is the
+        // ONLY thing that may switch a sending transfer's transport, and it
+        // is the same message the fallback uses in the other direction.
+        if (
+          body.path === "direct" &&
+          transfer.upgrade !== null &&
+          transfer.upgrade.attemptId === body.attemptId
+        ) {
+          const staged = transfer.upgrade;
+          transfer.upgrade = null;
+          // Stop the RELAY pipeline the way a fallback stops a direct one: an
+          // in-flight send unwinds through the AbortError arm of `beginSend`
+          // and leaves the record in place.
+          transfer.attemptAbort.abort();
+          transfer.attemptId = body.attemptId;
+          transfer.sink = staged.sink;
+          transfer.direct = true;
+          transfer.socket = null;
+          transfer.ticket = null;
+          transfer.state = "committed";
+          // A fresh key and a fresh nonce sequence, from the new attempt ID —
+          // `beginSend` derives both, exactly as it does for a relay attempt
+          // minted by a fallback.
+          void beginSend(transfer.transferId, body.resumeRanges ?? []);
+          return true;
+        }
+        if (transfer.attemptId !== body.attemptId) {
           return false;
         }
         if (body.path === "direct") {
@@ -980,6 +1035,38 @@ export function createSender({
       if (transfer.state === "sending" || transfer.state === "committed") {
         transfer.state = "waiting-commit";
       }
+      return true;
+    },
+
+    /**
+     * A direct channel for an UPGRADE: the transfer is sending on the relay
+     * right now and must keep sending until the server commits the switch.
+     *
+     * So the sink is only STAGED. Nothing about the live attempt moves here —
+     * not the attempt ID, not the key, not the pipeline — because a probe
+     * that fails must leave the relay exactly as it found it, and a probe
+     * that succeeds is switched by the commit, which is the one message both
+     * peers receive.
+     */
+    attachUpgrade(transferId, attemptId, sink) {
+      const transfer = transfers.get(transferId);
+      if (transfer === undefined || typeof attemptId !== "string") {
+        return false;
+      }
+      if (transfer.attemptId === attemptId) {
+        return false;
+      }
+      transfer.upgrade = { attemptId, sink };
+      return true;
+    },
+
+    /** The probe is over; the relay was never touched, so nothing unwinds. */
+    detachUpgrade(transferId, attemptId) {
+      const transfer = transfers.get(transferId);
+      if (transfer === undefined || transfer.upgrade?.attemptId !== attemptId) {
+        return false;
+      }
+      transfer.upgrade = null;
       return true;
     },
 

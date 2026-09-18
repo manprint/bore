@@ -98,6 +98,12 @@ pub const ERROR_CODES: &[&str] = &[
     "STORAGE_QUOTA",
     "CANCELLED",
     "INTERNAL",
+    // Signalling about an attempt the transfer has moved past. A code missing
+    // from this list is rewritten to `INTERNAL` by `error_envelope`, which is
+    // the guard working as intended and is exactly how the omission was
+    // caught: the client read ten `INTERNAL`s for `rtc.ice` while the server
+    // had built no internal error at all.
+    "STALE_ATTEMPT",
 ];
 
 /// Returns true for a known error code.
@@ -824,6 +830,10 @@ pub struct RtcSdpBody {
     pub attempt_id: AttemptId,
     /// Opaque session description, 1..=64 KiB of UTF-8. Never inspected.
     pub sdp: String,
+    /// Which carrier of the attempt this description negotiates. Absent on
+    /// the wire means `0`, so a single-carrier attempt sends exactly the
+    /// message it sent before carriers existed.
+    pub carrier: u8,
 }
 
 /// Parses `rtc.offer` (`typ == "rtc.offer"`) or `rtc.answer`.
@@ -835,7 +845,11 @@ pub fn parse_rtc_sdp_body(env: &ParsedEnvelope, typ: &str) -> Result<(RequestId,
     let request_id = env
         .request_id
         .ok_or_else(|| anyhow::anyhow!("{typ} requires requestId"))?;
-    let obj = check_body_keys(&env.body, typ, &["transferId", "attemptId", "sdp"])?;
+    let obj = check_body_keys(
+        &env.body,
+        typ,
+        &["transferId", "attemptId", "sdp", "carrier"],
+    )?;
     let transfer_id = obj
         .get("transferId")
         .and_then(serde_json::Value::as_str)
@@ -863,8 +877,25 @@ pub fn parse_rtc_sdp_body(env: &ParsedEnvelope, typ: &str) -> Result<(RequestId,
             transfer_id,
             attempt_id,
             sdp: sdp.to_string(),
+            carrier: parse_carrier(obj, typ)?,
         },
     ))
+}
+
+/// Reads the optional `carrier` index, bounded by
+/// [`crate::web_transfer::WEB_TRANSFER_MAX_DIRECT_CARRIERS`]. Absent is `0`,
+/// which is what an older peer — and any single-carrier attempt — sends.
+fn parse_carrier(obj: &serde_json::Map<String, serde_json::Value>, typ: &str) -> Result<u8> {
+    let Some(value) = obj.get("carrier") else {
+        return Ok(0);
+    };
+    let index = value
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("{typ} carrier must be an unsigned integer"))?;
+    if index >= crate::web_transfer::WEB_TRANSFER_MAX_DIRECT_CARRIERS as u64 {
+        bail!("{typ} carrier is out of range");
+    }
+    Ok(index as u8)
 }
 
 /// Validated `rtc.ice` body. `candidate == None` IS the end-of-candidates
@@ -881,6 +912,9 @@ pub struct RtcIceBody {
     pub sdp_mid: Option<String>,
     /// Media description index, `u16` or absent.
     pub sdp_m_line_index: Option<u16>,
+    /// Which carrier of the attempt this candidate belongs to; absent on the
+    /// wire means `0`.
+    pub carrier: u8,
 }
 
 impl RtcIceBody {
@@ -907,6 +941,7 @@ pub fn parse_rtc_ice_body(env: &ParsedEnvelope) -> Result<(RequestId, RtcIceBody
             "candidate",
             "sdpMid",
             "sdpMLineIndex",
+            "carrier",
         ],
     )?;
     let transfer_id = obj
@@ -957,11 +992,26 @@ pub fn parse_rtc_ice_body(env: &ParsedEnvelope) -> Result<(RequestId, RtcIceBody
             )
         }
     };
-    // The marker carries nothing else: a "done gathering" that also names a
-    // media section is a shape nobody produces and one more thing to forward.
-    if candidate.is_none() && (sdp_mid.is_some() || sdp_m_line_index.is_some()) {
-        bail!("rtc.ice end-of-candidates carries no media fields");
-    }
+    // The marker carries nothing else, and the media fields are DROPPED
+    // rather than refused. This used to `bail!` on the argument that "a done
+    // gathering that also names a media section is a shape nobody produces".
+    // That is false, and it was measured: WebRTC's end-of-candidates
+    // indication is PER m-section, so Firefox and WebKit deliver
+    // `candidate: ""` together with `sdpMid: "0"` and `sdpMLineIndex: 0`,
+    // while Chromium delivers a null event. In `T-WEB-DIRECT-FALLBACK` the
+    // server answered `INVALID_MESSAGE` to **62** `rtc.ice` messages from
+    // one Firefox peer, so the marker never reached the other side and the
+    // peer could only learn that gathering had ended by timing out. A
+    // browser sending what the specification tells it to send must never be
+    // refused. Nothing is lost by dropping them: one carrier is one
+    // PeerConnection with exactly one m-section, and WHICH carrier ended is
+    // what `carrier` says — it is NOT a media field, which is why it
+    // survives here.
+    let (sdp_mid, sdp_m_line_index) = if candidate.is_none() {
+        (None, None)
+    } else {
+        (sdp_mid, sdp_m_line_index)
+    };
     Ok((
         request_id,
         RtcIceBody {
@@ -970,12 +1020,25 @@ pub fn parse_rtc_ice_body(env: &ParsedEnvelope) -> Result<(RequestId, RtcIceBody
             candidate,
             sdp_mid,
             sdp_m_line_index,
+            carrier: parse_carrier(obj, "rtc.ice")?,
         },
     ))
 }
 
 /// Parses `transfer.direct_ready` into `(requestId, transferId, attemptId)`.
-pub fn parse_direct_ready_body(env: &ParsedEnvelope) -> Result<(RequestId, TransferId, AttemptId)> {
+/// `transfer.direct_ready`, parsed: who is asking, about which attempt, and
+/// — on an UPGRADE, from the recipient only — what it has already verified.
+pub struct DirectReadyBody {
+    /// The transfer this ready is about.
+    pub transfer_id: TransferId,
+    /// The attempt whose channel the sender declares usable.
+    pub attempt_id: AttemptId,
+    /// Verified ranges, empty except on a recipient's upgrade ready.
+    pub resume_ranges: Vec<(u64, u64)>,
+}
+
+/// Parses `transfer.direct_ready {transferId, attemptId, resumeRanges?}`.
+pub fn parse_direct_ready_body(env: &ParsedEnvelope) -> Result<(RequestId, DirectReadyBody)> {
     if env.typ != "transfer.direct_ready" {
         bail!("expected transfer.direct_ready, got {:?}", env.typ);
     }
@@ -985,7 +1048,7 @@ pub fn parse_direct_ready_body(env: &ParsedEnvelope) -> Result<(RequestId, Trans
     let obj = check_body_keys(
         &env.body,
         "transfer.direct_ready",
-        &["transferId", "attemptId"],
+        &["transferId", "attemptId", "resumeRanges"],
     )?;
     let transfer_id = obj
         .get("transferId")
@@ -999,7 +1062,23 @@ pub fn parse_direct_ready_body(env: &ParsedEnvelope) -> Result<(RequestId, Trans
         .ok_or_else(|| anyhow::anyhow!("transfer.direct_ready needs string attemptId"))?
         .parse::<AttemptId>()
         .map_err(|e| anyhow::anyhow!(e))?;
-    Ok((request_id, transfer_id, attempt_id))
+    // Present only on an UPGRADE, and only from the recipient: it is the one
+    // party that knows what is verified on disk, and by the time a probe is
+    // ready the relay has carried bytes the server never counted. Absent is
+    // the ordinary first negotiation, where the server's own `record.resume`
+    // is already the whole truth.
+    let resume_ranges = match obj.get("resumeRanges") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => parse_verified_ranges(value)?,
+    };
+    Ok((
+        request_id,
+        DirectReadyBody {
+            transfer_id,
+            attempt_id,
+            resume_ranges,
+        },
+    ))
 }
 
 /// The complete set of reason codes a direct attempt can end with. A peer's
@@ -1085,17 +1164,46 @@ pub fn parse_direct_failed_body(env: &ParsedEnvelope) -> Result<(RequestId, Dire
 }
 
 /// Builds `transfer.direct_start {transferId, attemptId, attemptNumber, role,
-/// iceServers, deadlineMs}`. `role` is the SDP role this peer plays and is
-/// fixed by the protocol: the recipient is always `offerer`, the source
-/// always `answerer`.
-pub fn transfer_direct_start_envelope(
-    transfer_id: TransferId,
-    attempt_id: AttemptId,
-    attempt_number: u64,
-    role: &str,
-    ice_servers: &[String],
-    deadline_ms: u64,
-) -> String {
+/// iceServers, deadlineMs, carriers?, upgrade?}`. `role` is the SDP role this peer
+/// plays and is fixed by the protocol: the recipient is always `offerer`, the
+/// source always `answerer`.
+///
+/// `carriers` is emitted ONLY above 1, so a single-carrier attempt produces
+/// the message byte for byte as it was before carriers existed — and a peer
+/// that does not know the field reads one carrier, which is what it can do.
+/// Everything one `transfer.direct_start` says, so the builder takes ONE
+/// argument per idea instead of a positional list nobody can read.
+pub struct DirectStart<'a> {
+    /// The transfer being opened.
+    pub transfer_id: TransferId,
+    /// The attempt this negotiation belongs to.
+    pub attempt_id: AttemptId,
+    /// The number the transfer is on, or moving to on an upgrade.
+    pub attempt_number: u64,
+    /// The SDP role, fixed by the protocol.
+    pub role: &'a str,
+    /// ICE servers, as configured.
+    pub ice_servers: &'a [String],
+    /// How long the peers have to finish negotiating.
+    pub deadline_ms: u64,
+    /// Carrier CEILING for this attempt.
+    pub carriers: u8,
+    /// This negotiation runs BESIDE a relay that is still carrying.
+    pub upgrade: bool,
+}
+
+/// Builds one peer's `transfer.direct_start` from [`DirectStart`].
+pub fn transfer_direct_start_envelope(start: &DirectStart<'_>) -> String {
+    let DirectStart {
+        transfer_id,
+        attempt_id,
+        attempt_number,
+        role,
+        ice_servers,
+        deadline_ms,
+        carriers,
+        upgrade,
+    } = *start;
     let mut body = BTreeMap::new();
     body.insert(
         "transferId".to_string(),
@@ -1126,6 +1234,16 @@ pub fn transfer_direct_start_envelope(
         "deadlineMs".to_string(),
         serde_json::Value::from(deadline_ms),
     );
+    if carriers > 1 {
+        body.insert("carriers".to_string(), serde_json::Value::from(carriers));
+    }
+    // Emitted ONLY on a probe, so an ordinary first negotiation is the
+    // message byte for byte as it was before upgrades existed. It tells the
+    // peer the one thing it cannot work out for itself: that something is
+    // still carrying, and must keep carrying until the commit arrives.
+    if upgrade {
+        body.insert("upgrade".to_string(), serde_json::Value::Bool(true));
+    }
     server_envelope("transfer.direct_start", None, body)
 }
 
@@ -1147,6 +1265,7 @@ pub fn rtc_sdp_envelope(typ: &str, body: &RtcSdpBody) -> String {
         "sdp".to_string(),
         serde_json::Value::String(body.sdp.clone()),
     );
+    insert_carrier(&mut out, body.carrier);
     server_envelope(typ, None, out)
 }
 
@@ -1175,7 +1294,17 @@ pub fn rtc_ice_envelope(body: &RtcIceBody) -> String {
     if let Some(index) = body.sdp_m_line_index {
         out.insert("sdpMLineIndex".to_string(), serde_json::Value::from(index));
     }
+    insert_carrier(&mut out, body.carrier);
     server_envelope("rtc.ice", None, out)
+}
+
+/// Writes `carrier` only when it is not 0. Carrier 0 is the only carrier a
+/// single-carrier attempt has, so omitting it is what keeps that attempt's
+/// forwarded signalling identical to the wire before carriers existed.
+fn insert_carrier(out: &mut BTreeMap<String, serde_json::Value>, carrier: u8) {
+    if carrier != 0 {
+        out.insert("carrier".to_string(), serde_json::Value::from(carrier));
+    }
 }
 
 /// Builds the forwarded `transfer.direct_failed {transferId, attemptId,
@@ -1590,14 +1719,21 @@ pub fn parse_withdraw_body(env: &ParsedEnvelope) -> Result<(RequestId, OfferId)>
 }
 
 /// Builds `welcome`: fixture-pinned `{peerId, roomId}` plus the additive
-/// `{displayName, limits, iceServers}` the browser needs at join (unknown
-/// JSON fields are ignored by older readers, so this stays compatible).
+/// `{displayName, limits, iceServers, relayOnly}` the browser needs at join
+/// (unknown JSON fields are ignored by older readers, so this stays
+/// compatible).
+///
+/// `relayOnly` is advisory for the page — the server is what ENFORCES it, by
+/// never opening a direct attempt — and exists so the interface can say which
+/// path a transfer will take before one runs, instead of letting the user
+/// infer a policy from an absence.
 pub fn welcome_envelope(
     peer: PeerId,
     room: RoomId,
     display_name: &str,
     limits: &WebTransferLimits,
     ice_servers: &[String],
+    relay_only: bool,
 ) -> String {
     let mut limits_map = BTreeMap::new();
     for (name, value) in [
@@ -1648,6 +1784,7 @@ pub fn welcome_envelope(
                 .collect(),
         ),
     );
+    body.insert("relayOnly".to_string(), serde_json::Value::Bool(relay_only));
     server_envelope("welcome", None, body)
 }
 
@@ -3133,6 +3270,7 @@ mod tests {
             "Bobi",
             &WebTransferLimits::default(),
             &["stun:x".to_string()],
+            false,
         );
         let env = parse_server_envelope(&raw).unwrap();
         assert_eq!(env.typ, "welcome");
@@ -4003,6 +4141,65 @@ mod direct_signaling_body_tests {
     const AID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     #[test]
+    fn the_carrier_index_is_optional_bounded_and_the_same_on_all_three_signals() {
+        // Absent means carrier 0, which is what an older peer sends and what
+        // every single-carrier attempt sends; anything at or past the mask's
+        // width is refused at the PARSER, so the server's own bitmask never
+        // sees an index it cannot represent.
+        let max = crate::web_transfer::WEB_TRANSFER_MAX_DIRECT_CARRIERS as u64;
+        for typ in ["rtc.offer", "rtc.answer"] {
+            let absent = envelope(
+                typ,
+                serde_json::json!({ "transferId": TID, "attemptId": AID, "sdp": "v=0" }),
+            );
+            assert_eq!(parse_rtc_sdp_body(&absent, typ).unwrap().1.carrier, 0);
+            let third = envelope(
+                typ,
+                serde_json::json!({
+                    "transferId": TID, "attemptId": AID, "sdp": "v=0", "carrier": 3,
+                }),
+            );
+            assert_eq!(parse_rtc_sdp_body(&third, typ).unwrap().1.carrier, 3);
+            for bad in [
+                serde_json::json!(max),
+                serde_json::json!(-1),
+                serde_json::json!("2"),
+                serde_json::json!(1.5),
+            ] {
+                let env = envelope(
+                    typ,
+                    serde_json::json!({
+                        "transferId": TID, "attemptId": AID, "sdp": "v=0", "carrier": bad,
+                    }),
+                );
+                assert!(
+                    parse_rtc_sdp_body(&env, typ).is_err(),
+                    "{typ} must refuse carrier {bad}"
+                );
+            }
+        }
+        let ice = envelope(
+            "rtc.ice",
+            serde_json::json!({
+                "transferId": TID, "attemptId": AID, "candidate": "candidate:1 1 udp 1 1.2.3.4 1 typ host",
+                "sdpMid": "0", "sdpMLineIndex": 0, "carrier": 2,
+            }),
+        );
+        assert_eq!(parse_rtc_ice_body(&ice).unwrap().1.carrier, 2);
+        // The end-of-candidates marker ends gathering for ONE carrier, so it
+        // must be able to say which — the carrier is not a media field.
+        let done = envelope(
+            "rtc.ice",
+            serde_json::json!({
+                "transferId": TID, "attemptId": AID, "candidate": null, "carrier": 2,
+            }),
+        );
+        let (_, body) = parse_rtc_ice_body(&done).unwrap();
+        assert!(body.is_end_of_candidates());
+        assert_eq!(body.carrier, 2);
+    }
+
+    #[test]
     fn sdp_bodies_bound_bytes_and_reject_foreign_fields() {
         let ok = envelope(
             "rtc.offer",
@@ -4058,6 +4255,29 @@ mod direct_signaling_body_tests {
             assert!(out["body"]["candidate"].is_null());
             assert!(out["body"].get("sdpMid").is_none());
         }
+        // What Firefox and WebKit actually send when gathering ends: the
+        // empty candidate NAMES its m-section. Accepted, normalized to the
+        // one marker shape, never refused (red-check: the old `bail!` here
+        // reads `INVALID_MESSAGE` for 62 messages of a real Firefox run).
+        for marker in [
+            serde_json::json!({
+                "transferId": TID, "attemptId": AID,
+                "candidate": "", "sdpMid": "0", "sdpMLineIndex": 0,
+            }),
+            serde_json::json!({
+                "transferId": TID, "attemptId": AID,
+                "candidate": null, "sdpMid": "0",
+            }),
+        ] {
+            let env = envelope("rtc.ice", marker);
+            let (_, body) = parse_rtc_ice_body(&env).unwrap();
+            assert!(body.is_end_of_candidates());
+            assert_eq!(body.sdp_mid, None);
+            assert_eq!(body.sdp_m_line_index, None);
+            let out: serde_json::Value = serde_json::from_str(&rtc_ice_envelope(&body)).unwrap();
+            assert!(out["body"]["candidate"].is_null());
+            assert!(out["body"].get("sdpMid").is_none());
+        }
         let env = envelope(
             "rtc.ice",
             serde_json::json!({
@@ -4071,14 +4291,16 @@ mod direct_signaling_body_tests {
         let long_candidate =
             "c".repeat(crate::web_transfer::WEB_TRANSFER_MAX_ICE_CANDIDATE_BYTES + 1);
         let long_mid = "m".repeat(crate::web_transfer::WEB_TRANSFER_MAX_ICE_SDP_MID_BYTES + 1);
+        let long_mid2 = long_mid.clone();
         for bad in [
             serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": long_candidate}),
             serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": "c", "sdpMid": long_mid}),
             serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": "c", "sdpMLineIndex": 70000}),
             serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": "c", "sdpMLineIndex": -1}),
             serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": 7}),
-            // A marker that also names a media section is nobody's shape.
-            serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": null, "sdpMid": "0"}),
+            // A marker's media fields are dropped, but they are still BOUNDED
+            // first: normalization is not an escape from the length checks.
+            serde_json::json!({"transferId": TID, "attemptId": AID, "candidate": "", "sdpMid": long_mid2}),
         ] {
             let env = envelope("rtc.ice", bad);
             assert!(parse_rtc_ice_body(&env).is_err());
@@ -4139,15 +4361,18 @@ mod direct_signaling_body_tests {
 
     #[test]
     fn direct_start_and_ready_envelopes_carry_the_fixed_contract() {
-        let out: serde_json::Value = serde_json::from_str(&transfer_direct_start_envelope(
-            TID.parse().unwrap(),
-            AID.parse().unwrap(),
-            3,
-            "offerer",
-            &["stun:stun.example:3478".to_string()],
-            10_000,
-        ))
-        .unwrap();
+        let out: serde_json::Value =
+            serde_json::from_str(&transfer_direct_start_envelope(&DirectStart {
+                transfer_id: TID.parse().unwrap(),
+                attempt_id: AID.parse().unwrap(),
+                attempt_number: 3,
+                role: "offerer",
+                ice_servers: &["stun:stun.example:3478".to_string()],
+                deadline_ms: 10_000,
+                carriers: 1,
+                upgrade: false,
+            }))
+            .unwrap();
         assert_eq!(out["type"].as_str(), Some("transfer.direct_start"));
         assert_eq!(out["body"]["role"].as_str(), Some("offerer"));
         assert_eq!(out["body"]["attemptNumber"].as_u64(), Some(3));
@@ -4159,14 +4384,16 @@ mod direct_signaling_body_tests {
         assert!(out.get("requestId").is_none());
         // It parses back as a server message, so the fixture and the wire
         // agree about which direction each of these names travels in.
-        let raw = transfer_direct_start_envelope(
-            TID.parse().unwrap(),
-            AID.parse().unwrap(),
-            1,
-            "answerer",
-            &[],
-            10_000,
-        );
+        let raw = transfer_direct_start_envelope(&DirectStart {
+            transfer_id: TID.parse().unwrap(),
+            attempt_id: AID.parse().unwrap(),
+            attempt_number: 1,
+            role: "answerer",
+            ice_servers: &[],
+            deadline_ms: 10_000,
+            carriers: 1,
+            upgrade: false,
+        });
         assert!(parse_server_envelope(&raw).is_ok());
         for typ in [
             "rtc.offer",
@@ -4183,9 +4410,9 @@ mod direct_signaling_body_tests {
                 "transferId": TID, "attemptId": AID,
             }),
         );
-        let (_, id, attempt) = parse_direct_ready_body(&env).unwrap();
-        assert_eq!(id.to_string(), TID);
-        assert_eq!(attempt.to_string(), AID);
+        let (_, ready) = parse_direct_ready_body(&env).unwrap();
+        assert_eq!(ready.transfer_id.to_string(), TID);
+        assert_eq!(ready.attempt_id.to_string(), AID);
         let env = envelope(
             "transfer.direct_ready",
             serde_json::json!({

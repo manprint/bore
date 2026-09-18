@@ -1537,14 +1537,21 @@ async fn handle_text(registry: &WebTransferRegistry, session: &mut PeerSession, 
         // second time (singletons) or one more candidate (bounded), and a
         // cached ack would hide both.
         "rtc.offer" | "rtc.answer" => {
+            // Deliberately NOT on the mutation bucket, for the same reason as
+            // `rtc.ice` below and one more that CARRIERS added. The offer and
+            // the answer are singletons PER CARRIER per attempt, enforced by
+            // `apply_signal`'s `offer_seen`/`answer_seen` masks: the hard cap
+            // is the negotiated carrier count, which the SERVER chose, and no
+            // token bucket improves on it. Charging them to a bucket of 8
+            // starved the messages that bucket exists for — MEASURED with the
+            // shipped default of four carriers, a source spent its budget on
+            // four `rtc.answer`s and then had its `transfer.source_ready`
+            // refused, so the relay leg it had just been given a ticket for
+            // was never attached and the transfer hung for the 30 s pairing
+            // timeout with the page reading "Percorso interrotto: riprova".
+            // The control bucket (30/s, burst 60) still applies to every
+            // message, including these.
             let typ = env.typ.clone();
-            if !session.take_mutation(now) {
-                let message = match request_id {
-                    Some(id) => error_envelope(id, "RATE_LIMITED", None),
-                    None => error_envelope_anon("RATE_LIMITED", None),
-                };
-                return reply(session, message).await;
-            }
             let (id, body) = match parse_rtc_sdp_body(&env, &typ) {
                 Ok(parsed) => parsed,
                 Err(_) => {
@@ -1605,7 +1612,7 @@ async fn handle_text(registry: &WebTransferRegistry, session: &mut PeerSession, 
                 };
                 return reply(session, message).await;
             }
-            let (id, transfer_id, attempt_id) = match parse_direct_ready_body(&env) {
+            let (id, ready) = match parse_direct_ready_body(&env) {
                 Ok(parsed) => parsed,
                 Err(_) => {
                     let message = match request_id {
@@ -1615,8 +1622,13 @@ async fn handle_text(registry: &WebTransferRegistry, session: &mut PeerSession, 
                     return reply(session, message).await;
                 }
             };
-            match registry.direct_ready(session.room(), session.peer_id(), transfer_id, attempt_id)
-            {
+            match registry.direct_ready(
+                session.room(),
+                session.peer_id(),
+                ready.transfer_id,
+                ready.attempt_id,
+                ready.resume_ranges,
+            ) {
                 Ok(outbox) => {
                     let queued = reply(session, ack_envelope(id, None)).await;
                     // path_commit drains after the ack, recipient then
@@ -1648,6 +1660,24 @@ async fn handle_text(registry: &WebTransferRegistry, session: &mut PeerSession, 
             match registry.direct_failed(session.room(), session.peer_id(), &body) {
                 Ok((outcome, outbox)) => {
                     use crate::web_transfer::ReadyOutcome;
+                    // The one server-side record of a direct path giving up
+                    // (V003-C3). Until it existed the log showed a relay
+                    // starting and nothing about the path it replaced, so a
+                    // field report of "it fell back" had no counterpart here
+                    // at all. It carries the FIXED reason and the server's
+                    // own opaque ids — never a peer name, a label, an SDP, a
+                    // candidate or an address, none of which this handler
+                    // has — and it is written only for an attempt the
+                    // registry ACCEPTED, so a stale or forged report cannot
+                    // fill the log. The browser's own bounded trace holds
+                    // the detail this line cannot.
+                    tracing::info!(
+                        transfer = %body.transfer_id,
+                        attempt = %body.attempt_id,
+                        reason = body.reason,
+                        verified_ranges = body.verified_ranges.len(),
+                        "web-transfer direct attempt failed",
+                    );
                     let queued = reply(session, ack_envelope(id, None)).await;
                     crate::web_transfer::drain_transfer_outbox(session.room(), outbox);
                     // A busy relay leaves the fresh attempt retryable: the
@@ -2534,8 +2564,8 @@ mod transfer_actor_tests {
         let registry = actor_registry();
         let member = MemberToken::from_bytes([0x91u8; 32]);
         let owner = OwnerToken::from_bytes([0x92u8; 32]);
-        let lease =
-            OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash()).unwrap();
+        let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
+            .unwrap();
         let room = lease.room().clone();
         // Both parties need live sessions: the recipient drives, the source
         // receives the incoming on its own queue.
@@ -2608,8 +2638,8 @@ mod transfer_actor_tests {
         let registry = actor_registry();
         let member = MemberToken::from_bytes([0x93u8; 32]);
         let owner = OwnerToken::from_bytes([0x94u8; 32]);
-        let lease =
-            OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash()).unwrap();
+        let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
+            .unwrap();
         let room = lease.room().clone();
         let source = generate_peer_id();
         let (mut recipient_session, mut recipient_rx, _) =

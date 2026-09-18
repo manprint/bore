@@ -95,7 +95,19 @@ function killChannelAfter(limit) {
     const create = Real.prototype.createDataChannel;
     Real.prototype.createDataChannel = function (...args) {
       const channel = create.apply(this, args);
-      let seen = 0;
+      // ACROSS CARRIERS, both the count and the kill. A direct attempt is
+      // several peer connections now (one per carrier, see
+      // --web-transfer-direct-carriers), each with its own channel, and the
+      // attempt dies only when the LAST one is gone: a per-channel counter
+      // both fired late (each carrier sees its own share of the bytes) and
+      // killed one carrier of N, which the product correctly survives -- so
+      // the transition this gate exists for never happened and the gate timed
+      // out instead of failing. NO BACKTICK in here: template literal.
+      const shared = (window.__BORE_KILL__ = window.__BORE_KILL__ || {
+        seen: 0,
+        channels: [],
+      });
+      shared.channels.push(channel);
       // The kill waits for BYTES **and** for the badge to have named this
       // transport. Bytes off the socket are not verified work: hashing runs
       // behind the wire, and under load this engine has been seen holding
@@ -120,10 +132,12 @@ function killChannelAfter(limit) {
       };
       channel.addEventListener("message", (event) => {
         const data = event.data;
-        seen += data && data.byteLength !== undefined ? data.byteLength : (data && data.size) || 0;
-        if (seen >= LIMIT && channel.readyState === "open" && named()) {
-          try { window.__BORE_TEST__.killedAt = seen; } catch {}
-          channel.close();
+        shared.seen += data && data.byteLength !== undefined ? data.byteLength : (data && data.size) || 0;
+        if (shared.seen >= LIMIT && named()) {
+          try { window.__BORE_TEST__.killedAt = shared.seen; } catch {}
+          for (const open of shared.channels) {
+            try { open.close(); } catch {}
+          }
         }
       });
       return channel;
@@ -178,11 +192,19 @@ test.describe.serial("direct", () => {
       (await a.page.evaluate(() => window.__BORE_TEST__.directEvents))[0].recipient,
     ).toBe(false);
 
-    // ONE peer connection per transfer, and no relay socket anywhere: the
-    // room's control channel is the only WebSocket either page opened.
+    // EXACTLY the negotiated number of peer connections per transfer, and no
+    // relay socket anywhere: the room's control channel is the only WebSocket
+    // either page opened. The number comes from the page's own record of what
+    // the SERVER asked for (`transfer.direct_start` carries `carriers`), not
+    // from a constant here — a gate pinned to 1 breaks the day the shipped
+    // default moves, which is exactly what happened when it became 4.
     for (const peer of [a, b]) {
       const counters = await hookCounters(peer.page);
-      expect(counters.rtc).toBe(1);
+      const ready = (
+        await peer.page.evaluate(() => [...window.__BORE_TEST__.directEvents])
+      ).find((event) => event.kind === "ready");
+      expect(ready, "the attempt came up").toBeDefined();
+      expect(counters.rtc).toBe(ready.carriers);
       expect(relaySockets(counters.wsUrls)).toEqual([]);
     }
 
@@ -277,6 +299,61 @@ test.describe.serial("direct", () => {
     }
   });
 
+  test("T-WEB-RELAY-ONLY a room opened with --relay-only never builds a peer connection", async () => {
+    // The OPERATOR's policy, and the server is what enforces it: a room
+    // opened with `--relay-only` must never send a peer the message that
+    // starts a direct attempt, so a full-capability browser pair — WebRTC
+    // available, nothing disabled on the page side — must still construct
+    // ZERO `RTCPeerConnection`s. That is the difference between a policy and
+    // a preference, and it is the half a user can see; the registry's half
+    // is pinned by `a_relay_only_room_admits_the_relay_without_ever_opening_a_direct_attempt`.
+    const room = await spawnRoomEnv({ relayOnly: true });
+    try {
+      const a = await openPeer(room.roomUrl);
+      const b = await openPeer(room.roomUrl);
+      await expectConnected(a.page);
+      await expectConnected(b.page);
+      expect(await opfsWorks(b.page)).toBe(true);
+
+      await a.page.locator("#file-input").setInputFiles([join(roomDir, "direct.bin")]);
+      const offer = await poll(a.page, () => {
+        const catalog = window.__BORE_TEST__.getCatalogSnapshot();
+        return catalog.length === 1 ? catalog[0] : null;
+      });
+      expect(
+        await b.page.evaluate(
+          (offerId) => window.__BORE_TEST__.requestDownload(offerId),
+          offer.offerId,
+        ),
+      ).toEqual({ pending: true });
+
+      await expect(b.page.locator("#save-file")).toBeVisible({ timeout: 60_000 });
+      const download = await Promise.all([
+        b.page.waitForEvent("download", { timeout: 30_000 }),
+        b.page.locator("#save-file").click(),
+      ]).then(([event]) => event);
+      expect(createHash("sha256").update(readFileSync(await download.path())).digest("hex")).toBe(
+        fileHashHex,
+      );
+
+      for (const peer of [a, b]) {
+        const counters = await hookCounters(peer.page);
+        // No peer connection AT ALL, so no ICE candidate — no local and no
+        // reflexive address — ever left either machine.
+        expect(counters.rtc).toBe(0);
+        expect(relaySockets(counters.wsUrls).length).toBe(1);
+        const events = await peer.page.evaluate(() => [...window.__BORE_TEST__.directEvents]);
+        expect(events).toEqual([]);
+        const commits = await peer.page.evaluate(() => [...window.__BORE_TEST__.pathCommits]);
+        expect(commits.map((c) => c.path)).toEqual(["relay"]);
+        expect(peer.failures).toEqual([]);
+        await peer.cleanup();
+      }
+    } finally {
+      room.cleanup();
+    }
+  });
+
   test("T-WEB-DIRECT-FALLBACK a channel that dies mid-transfer finishes on the relay", async () => {
     // Two transports, 8 MiB and a staging pass: well past the suite default.
     test.setTimeout(180_000);
@@ -309,6 +386,37 @@ test.describe.serial("direct", () => {
     expect(await b.page.evaluate(() => window.__BORE_TEST__.killedAt ?? 0)).toBeGreaterThanOrEqual(
       2 * 1024 * 1024,
     );
+
+    // The SOURCE must not call a completed transfer failed. The relay leg is
+    // torn down as soon as the recipient has verified, which lands while the
+    // source is still draining its own write queue: before B-A028 that close
+    // was reported as `FAILED` and the source's row read
+    // `relay 100% · Non riuscito` for the transfer the recipient had just
+    // saved. This is the red-check for it.
+    expect(await a.page.evaluate(() => [...window.__BORE_TEST__.senderErrors])).toEqual([]);
+    expect(
+      await a.page.evaluate(() =>
+        [...document.querySelectorAll(".transfer-row")]
+          .map((row) => row.textContent ?? "")
+          .join(" ~ "),
+      ),
+    ).not.toMatch(/Non riuscito/);
+
+    // No control message either peer sent may be MALFORMED. `STALE_ATTEMPT`
+    // is excluded and nothing else is: a candidate for the attempt that just
+    // died is the ordinary trickle-ICE race (a Firefox source produced 62 of
+    // them in this very test), while an `INVALID_MESSAGE` here would mean the
+    // client is building a body the server cannot parse — which is exactly
+    // what this assertion existed to catch, and what the shared code hid.
+    for (const [who, peer] of [["source", a], ["recipient", b]]) {
+      const errs = await peer.page.evaluate(() =>
+        [...window.__BORE_TEST__.controlErrors].map((e) => `${e.code}:${e.sent ?? "?"}`),
+      );
+      expect({ who, errs: errs.filter((e) => !e.startsWith("STALE_ATTEMPT:")) }).toEqual({
+        who,
+        errs: [],
+      });
+    }
 
     // One transfer, two attempts: direct first, then relay, same TransferId.
     for (const peer of [a, b]) {
@@ -352,11 +460,14 @@ test.describe.serial("direct", () => {
       () => [...window.__BORE_TEST__.pathCommits],
     ))[0].attemptId);
 
-    // One peer connection and one relay leg per page: the fallback opened
-    // exactly one, and nothing retried itself into a second.
+    // The negotiated peer connections and ONE relay leg per page: the
+    // fallback opened exactly one, and nothing retried itself into a second.
     for (const peer of [a, b]) {
       const counters = await hookCounters(peer.page);
-      expect(counters.rtc).toBe(1);
+      const ready = (
+        await peer.page.evaluate(() => [...window.__BORE_TEST__.directEvents])
+      ).find((event) => event.kind === "ready");
+      expect(counters.rtc).toBe(ready?.carriers ?? 1);
       expect(relaySockets(counters.wsUrls).length).toBe(1);
       expect(counters.outboundTypes.filter((t) => t === "transfer.request").length).toBeLessThan(2);
     }
@@ -375,8 +486,202 @@ test.describe.serial("direct", () => {
     expect(saved.length).toBe(bigBytes.length);
     expect(createHash("sha256").update(saved).digest("hex")).toBe(bigHashHex);
 
+    // V003-C3: the dead attempt left EVIDENCE. Before this, a fallback in
+    // the field produced a relay and nothing else — no selected pair type,
+    // no timeline, nothing to tell a broken path from a stalled queue.
+    const diag = await b.page.evaluate(() => window.__BORE_TEST__.readDirectDiagnostics());
+    const traces = [...diag.finished, ...diag.live];
+    expect(traces.length).toBeGreaterThan(0);
+    // ONE TRACE PER CARRIER, so "the trace that has a reason" is not
+    // necessarily the carrier that was carrying: with four carriers one can
+    // die before it ever reached `ready`, and asserting `ready` on whichever
+    // trace came first made this gate fail on webkit about half the time
+    // while the product was doing exactly the right thing. The claim that
+    // matters is about the carrier that DIED CARRYING, so pick that one and
+    // require that at least one dead carrier had reached `ready`.
+    const deadAll = traces.filter((trace) => trace.reason !== null);
+    expect(deadAll.length, "the failed attempt kept its reason").toBeGreaterThan(0);
+    for (const trace of deadAll) {
+      expect(["channel-closed", "send-error", "timeout", "protocol"]).toContain(trace.reason);
+    }
+    const dead =
+      deadAll.find((trace) => trace.events.some((event) => event.ev === "ready")) ?? deadAll[0];
+    expect(
+      dead.events.some((event) => event.ev === "ready"),
+      "no dead carrier had ever been ready",
+    ).toBe(true);
+    // It is the QUEUE that is exonerated here, and the trace says so: this
+    // attempt died on its channel, not on a drain that never came.
+    expect(dead.drain.timeouts).toBe(0);
+
     for (const peer of [a, b]) {
       await peer.cleanup();
+    }
+  });
+
+  // T-WEB-DIRECT-DIAG (V003-C3). The page can now say WHICH kind of path an
+  // attempt used and what ended it, and the same evidence must be safe to
+  // hand to a stranger: the report is produced on a real engine and searched
+  // for everything it must never contain.
+  test("T-WEB-DIRECT-DIAG the direct path keeps a redacted, copyable trace", async () => {
+    const a = await openPeer(env.roomUrl);
+    const b = await openPeer(env.roomUrl);
+    await expectConnected(a.page);
+    await expectConnected(b.page);
+    expect(await opfsWorks(b.page)).toBe(true);
+
+    await a.page.locator("#file-input").setInputFiles([join(roomDir, "direct.bin")]);
+    const offer = await poll(a.page, () => {
+      const catalog = window.__BORE_TEST__.getCatalogSnapshot();
+      return catalog.length === 1 ? catalog[0] : null;
+    });
+    await b.page.evaluate(
+      (offerId) => window.__BORE_TEST__.requestDownload(offerId),
+      offer.offerId,
+    );
+    await expect(b.page.locator("#save-file")).toBeVisible({ timeout: 60_000 });
+    const commits = await b.page.evaluate(() => [...window.__BORE_TEST__.pathCommits]);
+    expect(commits.map((c) => c.path)).toEqual(commits.map(() => "direct"));
+
+    // The stats sample lands asynchronously, on a timer and again at close.
+    const diag = await poll(
+      b.page,
+      () => {
+        const read = window.__BORE_TEST__.readDirectDiagnostics();
+        const traces = [...read.finished, ...read.live];
+        return traces.some((trace) => trace.stats.length > 0) ? { traces } : null;
+      },
+      30_000,
+    );
+    const withStats = diag.traces.find((trace) => trace.stats.length > 0);
+    const sample = withStats.stats.at(-1);
+    // THE question the field case could not answer: which kind of candidate
+    // pair carried it. On loopback it is `host`; what is gated is that the
+    // page knows and can say it.
+    expect(sample.pair, "the selected pair is described").toBeDefined();
+    expect(["host", "srflx", "prflx", "relay"]).toContain(sample.pair.localType);
+    expect(withStats.events.some((event) => event.ev === "ready")).toBe(true);
+    expect(withStats.transferId).toBe(commits[0].transferId);
+
+    // The copy gesture — the only way any of this leaves the page — and what
+    // it puts on the clipboard.
+    await b.page.evaluate(() => {
+      window.__clipboard = null;
+      const stub = { writeText: async (text) => { window.__clipboard = text; } };
+      try {
+        Object.defineProperty(navigator, "clipboard", { value: stub, configurable: true });
+      } catch {
+        navigator.clipboard.writeText = stub.writeText;
+      }
+    });
+    await b.page.locator("#copy-diagnostics").click();
+    const copied = await poll(b.page, () => window.__clipboard ?? null, 15_000);
+    expect(copied).toContain("bore-web-transfer-direct-diagnostics");
+    expect(copied).toContain("\"localType\"");
+
+    // The redaction, on the real engine's own strings: no address, no
+    // candidate line, no SDP, no file name, no room secret.
+    expect(copied).not.toMatch(/\b\d{1,3}(\.\d{1,3}){3}\b/);
+    expect(copied).not.toContain("candidate:");
+    expect(copied).not.toContain("v=0");
+    expect(copied).not.toContain("direct.bin");
+    const secret = new URL(env.roomUrl).hash;
+    for (const value of secret.replace("#", "").split("&")) {
+      const hex = value.split("=")[1];
+      if (hex) {
+        expect(copied).not.toContain(hex);
+      }
+    }
+    // And the general form of the same claim, which is what makes this gate
+    // hold for a field nobody has added yet: EVERY string in the report is
+    // either one of the server's own opaque ids or a short enumeration.
+    // An address, a URL, a name or a candidate line is neither.
+    const strings = [];
+    const walk = (value) => {
+      if (typeof value === "string") {
+        strings.push(value);
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.forEach(walk);
+        return;
+      }
+      if (value !== null && typeof value === "object") {
+        Object.values(value).forEach(walk);
+      }
+    };
+    walk(JSON.parse(copied));
+    for (const value of strings) {
+      expect(
+        /^[0-9a-f]{32}$/.test(value) ||
+          /^[a-z][a-z-]{0,23}$/.test(value) ||
+          value === "bore-web-transfer-direct-diagnostics",
+        `"${value}" is neither an opaque id nor a short enumeration`,
+      ).toBe(true);
+    }
+
+    for (const peer of [a, b]) {
+      await peer.cleanup();
+    }
+  });
+
+  // V003-C5. The peer's end-of-candidates marker used to be dropped on the
+  // receiving side; it now reaches the ICE agent, once, after every candidate
+  // that preceded it. The room runs with NO STUN so the negotiation is
+  // host-only — the pure case, where the marker is the only thing that tells
+  // the remote agent the list is complete.
+  test("a host-only negotiation delivers the peer's end-of-candidates marker", async () => {
+    const hostOnly = await spawnRoomEnv({ noStun: true });
+    try {
+      const a = await openPeer(hostOnly.roomUrl);
+      const b = await openPeer(hostOnly.roomUrl);
+      await expectConnected(a.page);
+      await expectConnected(b.page);
+      expect(await opfsWorks(b.page)).toBe(true);
+
+      await a.page.locator("#file-input").setInputFiles([join(roomDir, "direct.bin")]);
+      const offer = await poll(a.page, () => {
+        const catalog = window.__BORE_TEST__.getCatalogSnapshot();
+        return catalog.length === 1 ? catalog[0] : null;
+      });
+      await b.page.evaluate(
+        (offerId) => window.__BORE_TEST__.requestDownload(offerId),
+        offer.offerId,
+      );
+      await expect(b.page.locator("#save-file")).toBeVisible({ timeout: 60_000 });
+
+      for (const peer of [a, b]) {
+        const commits = await peer.page.evaluate(() => [...window.__BORE_TEST__.pathCommits]);
+        expect(commits.map((c) => c.path)).toEqual(commits.map(() => "direct"));
+        // The marker was APPLIED, on both sides. The trace is the only
+        // observer of it: `addIceCandidate(null)` has no return value and no
+        // event, so what is gated is the call the actor makes.
+        const diag = await peer.page.evaluate(() =>
+          window.__BORE_TEST__.readDirectDiagnostics(),
+        );
+        const traces = [...diag.finished, ...diag.live];
+        expect(
+          traces.some((trace) => trace.events.some((e) => e.ev === "remote-candidates-done")),
+          "the peer's end-of-candidates marker reached the ICE agent",
+        ).toBe(true);
+        // Host-only really means host-only: no reflexive candidate exists to
+        // hide a missing marker behind.
+        const gathered = traces.flatMap((trace) => Object.keys(trace.candidates.local));
+        expect(gathered).not.toContain("srflx");
+      }
+
+      const download = await Promise.all([
+        b.page.waitForEvent("download", { timeout: 60_000 }),
+        b.page.locator("#save-file").click(),
+      ]).then(([event]) => event);
+      const saved = readFileSync(await download.path());
+      expect(createHash("sha256").update(saved).digest("hex")).toBe(fileHashHex);
+
+      for (const peer of [a, b]) {
+        await peer.cleanup();
+      }
+    } finally {
+      hostOnly.cleanup();
     }
   });
 

@@ -191,7 +191,13 @@ test.describe.serial("readme-direct", () => {
     }
     const directCounters = await hookCounters(direct.page);
     expect(directCounters.wsUrls.filter((url) => url.includes("/transfer/ws/relay/")).length).toBe(0);
-    expect(directCounters.rtc).toBe(1);
+    // The negotiated carrier count, read off the page's own record of what
+    // the server asked for: a constant here breaks whenever the shipped
+    // default moves, which is what happened when it became 4.
+    const directReady = (
+      await direct.page.evaluate(() => [...window.__BORE_TEST__.directEvents])
+    ).find((event) => event.kind === "ready");
+    expect(directCounters.rtc).toBe(directReady?.carriers ?? 1);
     const blockedCounters = await hookCounters(blocked.page);
     expect(blockedCounters.wsUrls.filter((url) => url.includes("/transfer/ws/relay/")).length).toBe(1);
 

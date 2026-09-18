@@ -330,10 +330,14 @@ test.describe.serial("multipeer scenario", () => {
       expect(events.filter((entry) => entry.kind === "ready").length).toBe(1);
       expect(events.filter((entry) => entry.kind === "failed")).toEqual([]);
       const counters = await hookCounters(b.page);
-      // Not one relay socket, and exactly one peer connection: the server
-      // carried none of it.
+      // Not one relay socket, and exactly the negotiated number of peer
+      // connections: the server carried none of it. The count comes from the
+      // page's own record of what the server asked for, never from a constant
+      // here — pinning it to 1 broke the day the shipped default became 4.
       expect(relaySockets(counters.wsUrls)).toEqual([]);
-      expect(counters.rtc).toBe(1);
+      expect(counters.rtc).toBe(
+        events.find((entry) => entry.kind === "ready")?.carriers ?? 1,
+      );
       // The source's own view of this leg is the server's word.
       const notices = await a.page.evaluate(() => [...window.__BORE_TEST__.progressNotices]);
       expect(notices.length).toBeGreaterThan(0);

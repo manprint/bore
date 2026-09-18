@@ -29,6 +29,7 @@ import {
   FRAME_DATA,
   FRAME_FINAL,
   peekFrameType,
+  peekFrameSeq,
   chunkWindow,
   decodeFrameWithKey,
   parseArchiveFinalPayload,
@@ -51,10 +52,124 @@ import {
  */
 export const FRAME_PIPELINE_DEPTH = 8;
 
-/** A verified-bytes report leaves at most this often … */
+/**
+ * Frames held out of order while their predecessors are still in flight, and
+ * the bytes they may occupy. Whichever is reached first ends the attempt.
+ *
+ * One transport delivers a frame stream in order and never holds anything
+ * here, so this costs nothing until a transfer runs on SEVERAL carriers, when
+ * the arrival order is the order N independent associations happened to
+ * deliver in. The window absorbs the skew between them; it does not absorb a
+ * carrier that has stopped. 8 MiB is roughly 256 fragments at the 32 KiB
+ * ceiling — about a second of skew at the rate a single association sustains
+ * over a 30 ms path, which is far more than carriers between the same pair of
+ * hosts can drift.
+ *
+ * Overflowing is a failure of the ATTEMPT, not of the transfer: the direct
+ * path is abandoned, the transfer continues on the relay from the ranges
+ * already verified on disk, and the user sees a slower transfer rather than a
+ * failed one.
+ */
+export const REORDER_MAX_FRAMES = 512;
+/** … and the byte ceiling, reached first whenever fragments are full size. */
+export const REORDER_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * How long a DIRECT attempt may deliver NOTHING, while the recipient has
+ * nothing of its own left to do, before the attempt is abandoned.
+ *
+ * A carrier that closes reports itself and the group notices immediately.
+ * A carrier that goes SILENT does not: a NAT that forgets the UDP flow, a
+ * radio that drops, a peer whose tab is frozen — DTLS holds the channel
+ * `open` and every frame the source writes disappears. Nothing in the path
+ * had a deadline, so the download sat at its last verified byte for ever and
+ * only a reload could end it. The server is not on the direct path and cannot
+ * see this; the recipient is the only party that can.
+ *
+ * The clock runs ONLY while the recipient is idle — nothing in the inbox and
+ * no pump running. That distinction is what keeps a SLOW recipient alive: a
+ * recipient that is behind makes the source's queue fill, so frames stop
+ * arriving for a reason that has nothing to do with the path, and a timer
+ * that did not look would abandon a perfectly healthy attempt under exactly
+ * the load the carriers exist to serve.
+ *
+ * 20 s is long against every legitimate pause with an idle recipient (the
+ * source reading its next chunk off disk) and short against a user watching a
+ * row that will never move again. The attempt dies, never the transfer: the
+ * relay finishes it from the ranges already verified on disk.
+ */
+export const DIRECT_IDLE_TIMEOUT_MS = 20_000;
+/** How often the idle clock is read. Coarse on purpose: this must cost
+ * nothing on a transfer that is running. */
+export const DIRECT_IDLE_CHECK_MS = 1_000;
+
+/**
+ * A verified-bytes report leaves at most this often, PER LIVE TRANSFER SHARE.
+ *
+ * `transfer.progress` is a control message and spends from the session's
+ * mutation bucket, which the server sizes for room mutations: 4 a second,
+ * burst 8. This used to report every `PROGRESS_MIN_MS` **or** every megabyte
+ * of newly verified bytes, whichever came first — and on any path worth
+ * having, the megabyte rule is the one that fires. MEASURED on loopback with
+ * a 256 MiB transfer: ~50 reports a second, the bucket empty within the first
+ * second, and then **`transfer.complete` itself refused `RATE_LIMITED`** —
+ * the one terminal message of the transfer, dropped, with every byte received
+ * and verified on disk. The row sat at `complete-pending` for as long as it
+ * was watched (236 s), the file was never offered for saving, and the source
+ * never learned the transfer had finished. The faster the path, the more
+ * certain the failure, which is exactly backwards.
+ *
+ * A progress report is OBSERVABILITY, and observability must never cost the
+ * data path. So the cadence is a RATE and nothing else, and the rate is
+ * divided among this peer's live transfers: eight concurrent downloads report
+ * once every four seconds each, which is the same two a second in total and
+ * leaves the rest of the bucket for the messages that carry meaning.
+ */
 export const PROGRESS_MIN_MS = 500;
-/** … or per this many newly verified bytes, whichever comes first. */
-export const PROGRESS_MIN_BYTES = 1024 * 1024;
+
+/**
+ * How many times `transfer.complete` is re-sent after a RETRYABLE refusal.
+ *
+ * The cadence fix above removes the cause, but not the exposure: the mutation
+ * bucket is shared with every other control message this peer sends, so a
+ * burst — several transfers finishing together, a rename, a republish — can
+ * still refuse the one message that ends a transfer. Every byte is on disk
+ * and verified at that point, so a dropped `transfer.complete` is a transfer
+ * that can never finish and a file the user can never save.
+ *
+ * It is therefore re-sent, on a growing grid, with a fresh `requestId` each
+ * time (the server answers per request, and a reused ID would be answered
+ * from the first verdict). Completion is idempotent server-side, so a retry
+ * that crosses a late ack costs an ignored answer and nothing more. When the
+ * grid runs out the transfer FAILS LOUDLY with the refusal's own code —
+ * a visible failure the user can act on, never a row frozen at 100%.
+ */
+export const COMPLETE_MAX_RETRIES = 8;
+
+/**
+ * Whether a verified-bytes report may leave now.
+ *
+ * Pure, and exported, because it is the whole policy and the policy is what
+ * broke: the rule used to be "every `PROGRESS_MIN_MS` **or** every megabyte,
+ * whichever comes first", and on a fast path the megabyte is always first.
+ * There is no byte term here at all, by design — bytes are what the report is
+ * ABOUT, never what decides that it is sent.
+ *
+ * @param {number} now `Date.now()`
+ * @param {number} lastReportAt when this transfer last reported
+ * @param {boolean} first no report has left for this transfer yet
+ * @param {number} liveTransfers how many transfers this peer has in flight
+ */
+export function progressIsDue(now, lastReportAt, first, liveTransfers) {
+  if (first) {
+    // One per transfer cannot flood anything, and it is what moves the bar
+    // off zero and resolves the path badge.
+    return true;
+  }
+  return now - lastReportAt >= PROGRESS_MIN_MS * Math.max(1, liveTransfers);
+}
+/** First backoff before re-sending `transfer.complete`; doubles each time. */
+export const COMPLETE_RETRY_BASE_MS = 250;
 
 function randomRequestId() {
   const bytes = new Uint8Array(16);
@@ -85,12 +200,18 @@ export function createReceiver({
   getSelfPeerId,
   repository,
   events = {},
+  directIdleTimeoutMs = DIRECT_IDLE_TIMEOUT_MS,
+  directIdleCheckMs = DIRECT_IDLE_CHECK_MS,
 }) {
   /** transferId → live download state (deleted at every terminal step). */
   const transfers = new Map();
   /** requestId → pending request (bound to a transfer on ack). */
   const pendingRequests = new Map();
-  /** complete requestId → transferId (the recipient's only completion signal). */
+  /**
+   * complete requestId → `{ transferId, body, tries }`, the recipient's only
+   * completion signal. It holds the BODY because a refusal has to be
+   * answerable by sending the same statement again.
+   */
   const pendingCompletes = new Map();
   /** Staged verified files awaiting explicit save/discard. */
   const stagedFiles = new Map();
@@ -101,6 +222,7 @@ export function createReceiver({
       return;
     }
     transfer.abort.abort();
+    stopIdleClock(transfer);
     try {
       transfer.socket?.close();
     } catch {
@@ -109,9 +231,87 @@ export function createReceiver({
     transfer.aesKey = null;
     transfers.delete(transferId);
     for (const [requestId, bound] of pendingCompletes) {
-      if (bound === transferId) {
+      if (bound.transferId === transferId) {
         pendingCompletes.delete(requestId);
       }
+    }
+  }
+
+  /** Stops the direct idle clock, wherever the attempt ended. */
+  function stopIdleClock(transfer) {
+    if (transfer.idleTimer !== null && transfer.idleTimer !== undefined) {
+      clearInterval(transfer.idleTimer);
+      transfer.idleTimer = null;
+    }
+  }
+
+  /**
+   * Arms the idle clock for the direct attempt now current. Re-armable: the
+   * previous attempt's clock is stopped first, so an upgrade or a fallback
+   * never leaves two running.
+   */
+  /**
+   * Names the transport of the CURRENT attempt, once, and corrects it if the
+   * commit that decides it lost a race to the first verified chunk.
+   *
+   * The badge's rule is that only a verified chunk may name a transport, and
+   * that rule stands. But the transport a chunk proves is read off
+   * `transfer.transport`, which starts at `"relay"` and is set by
+   * `transfer.path_commit` — a CONTROL message, on a different socket from
+   * the frames. With several carriers the first frame regularly beats it:
+   * MEASURED on loopback with four carriers, the recipient verified chunk 0
+   * before dispatching the commit, latched `relay` for the attempt and then
+   * never told the truth again, on a transfer that ran entirely direct and
+   * whose bytes were correct. So the commit re-names the path when what it
+   * says disagrees with what was latched FOR THE SAME ATTEMPT; a different
+   * attempt is a different badge and is left alone.
+   *
+   * @param {object} transfer live download state
+   */
+  function nameTransport(transfer) {
+    if (
+      transfer.pathAttempt === transfer.attemptId &&
+      transfer.path === transfer.transport
+    ) {
+      return;
+    }
+    transfer.pathAttempt = transfer.attemptId;
+    transfer.path = transfer.transport;
+    events.onPath?.(transfer.transferId, transfer.transport);
+  }
+
+  function startIdleClock(transfer) {
+    stopIdleClock(transfer);
+    if (!(directIdleTimeoutMs > 0)) {
+      return;
+    }
+    transfer.lastFrameAt = Date.now();
+    transfer.idleTimer = setInterval(() => {
+      const live = transfers.get(transfer.transferId);
+      if (live !== transfer || transfer.attemptClosed) {
+        stopIdleClock(transfer);
+        return;
+      }
+      if (transfer.state !== "direct" && transfer.state !== "receiving") {
+        // Negotiating, relaying, or past the last byte: not this clock's
+        // business. `complete-pending` in particular is a recipient that is
+        // idle ON PURPOSE, waiting for the server's ack.
+        stopIdleClock(transfer);
+        return;
+      }
+      if (transfer.pumping || transfer.inbox.length > 0) {
+        // Busy with what already arrived: the path owes us nothing yet.
+        transfer.lastFrameAt = Date.now();
+        return;
+      }
+      if (Date.now() - transfer.lastFrameAt < directIdleTimeoutMs) {
+        return;
+      }
+      stopIdleClock(transfer);
+      failAttempt(transfer, "stalled");
+    }, directIdleCheckMs);
+    if (typeof transfer.idleTimer?.unref === "function") {
+      transfer.idleTimer.unref();
     }
   }
 
@@ -133,9 +333,14 @@ export function createReceiver({
    */
   function adoptAttempt(transfer, attemptId) {
     transfer.attemptId = attemptId;
+    stopIdleClock(transfer);
     transfer.aesKey = null;
     transfer.pendingFrames = [];
     transfer.inbox = [];
+    transfer.reorder = new Map();
+    transfer.reorderBytes = 0;
+    transfer.reorderNext = 0;
+    transfer.reorderWindow = false;
     // A pump still draining the DEAD attempt's last batch returns without
     // touching this flag (its attempt no longer matches), so clearing it
     // here is what lets the new attempt's first frame start a pump.
@@ -529,6 +734,22 @@ export function createReceiver({
       record,
       aesKey: null,
       pendingFrames: [],
+      // Frames that arrived AHEAD of their place in the stream, keyed by the
+      // sequence in their own header; empty on a single transport.
+      reorder: new Map(),
+      reorderBytes: 0,
+      // Armed only by an attempt that runs on MORE THAN ONE carrier, which
+      // is the only way frames can arrive out of order.
+      reorderWindow: false,
+      /** Direct-path idle clock: handle, and when a frame last arrived. */
+      idleTimer: null,
+      lastFrameAt: 0,
+      /** A direct attempt being negotiated while the relay still carries. */
+      upgrade: null,
+      // The next sequence to RELEASE into the inbox. Distinct from
+      // `expectedSeq`, which is the next sequence to be OPENED: everything
+      // between the two is in the inbox, in order, waiting for the pipeline.
+      reorderNext: 0,
       inbox: [],
       pumping: false,
       // The current attempt is over and nothing more may be verified under
@@ -859,12 +1080,109 @@ export function createReceiver({
       transfer.pendingFrames.push(data);
       return;
     }
-    transfer.inbox.push(data);
+    if (!admitInOrder(transfer, data)) {
+      return;
+    }
     if (transfer.pumping) {
       return;
     }
     transfer.pumping = true;
     transfer.chain = transfer.chain.then(() => pumpFrames(transfer));
+  }
+
+  /**
+   * Puts one frame in its place in the stream, releasing into the inbox
+   * everything that is now contiguous. Returns false when nothing was
+   * released — the caller then has no pump to start.
+   *
+   * The sequence is read from the frame's own cleartext header, which the
+   * AEAD authenticates, and is used ONLY to decide where the frame goes. The
+   * authority is unchanged: `pumpFrames` still opens the Nth released frame
+   * against sequence N, so a frame put in the wrong place fails to open
+   * exactly as it did before this existed. That is what makes reordering
+   * free of any security consequence — a peer that lies about a sequence can
+   * cost itself a failed attempt and nothing else.
+   *
+   * A frame whose header cannot be read here (a `Blob`, which no transport of
+   * ours produces) is taken as the next one in order, which is precisely the
+   * behaviour of every version before carriers existed.
+   */
+  function admitInOrder(transfer, data) {
+    if (!transfer.reorderWindow) {
+      // ONE transport delivers the frame stream in the order it was sent, so
+      // there is nothing to reorder and a gap is not skew — it is a stream
+      // that no longer means what this attempt assumes. This is the path the
+      // relay leg and a single-carrier direct attempt take, and it is exactly
+      // the code that existed before carriers: the frame goes straight to the
+      // inbox and `pumpFrames` assigns the sequence, so a gap, a duplicate or
+      // a reorder fails the open just as it always did.
+      transfer.inbox.push(data);
+      return true;
+    }
+    const seq = peekFrameSeq(data);
+    if (seq === null || seq === transfer.reorderNext) {
+      transfer.inbox.push(data);
+      transfer.reorderNext += 1;
+      // Whatever was waiting on this frame can go now, and so can whatever
+      // was waiting on THAT — a single carrier catching up releases its whole
+      // run in one pass.
+      while (transfer.reorder.has(transfer.reorderNext)) {
+        const next = transfer.reorder.get(transfer.reorderNext);
+        transfer.reorder.delete(transfer.reorderNext);
+        transfer.reorderBytes -= frameByteLength(next);
+        transfer.inbox.push(next);
+        transfer.reorderNext += 1;
+      }
+      return true;
+    }
+    if (seq < transfer.reorderNext || transfer.reorder.has(seq)) {
+      // Already released, or already held: a duplicate is not a reorder. On
+      // a reliable transport it cannot happen at all, so it is a stream that
+      // no longer means what this attempt assumes.
+      failAttempt(transfer, "protocol");
+      return false;
+    }
+    transfer.reorder.set(seq, data);
+    transfer.reorderBytes += frameByteLength(data);
+    if (
+      transfer.reorder.size > REORDER_MAX_FRAMES ||
+      transfer.reorderBytes > REORDER_MAX_BYTES
+    ) {
+      // One carrier is not merely behind, it has stopped. Abandoning the
+      // ATTEMPT hands the transfer to the relay, which finishes it from the
+      // ranges already verified on disk.
+      failAttempt(transfer, "stalled");
+      return false;
+    }
+    return false;
+  }
+
+  /** Byte length of a frame however the transport delivered it. */
+  function frameByteLength(data) {
+    if (data instanceof ArrayBuffer) {
+      return data.byteLength;
+    }
+    if (ArrayBuffer.isView(data)) {
+      return data.byteLength;
+    }
+    return Number(data?.size ?? 0);
+  }
+
+  /**
+   * Ends the current attempt without ending the transfer. The caller upward
+   * turns this into the `transfer.direct_failed` the server answers with a
+   * relay attempt; a receiver with no such caller simply stops feeding a
+   * transport it cannot follow.
+   */
+  function failAttempt(transfer, reason) {
+    if (transfer.attemptClosed) {
+      return;
+    }
+    stopIdleClock(transfer);
+    transfer.inbox = [];
+    transfer.reorder = new Map();
+    transfer.reorderBytes = 0;
+    events.onAttemptFailed?.(transfer.transferId, transfer.attemptId, reason);
   }
 
   /** As `Uint8Array`, whatever the socket delivered (or a test handed us). */
@@ -1076,11 +1394,7 @@ export function createReceiver({
     // until then the path is committed but has carried nothing. Keyed by
     // attempt, so a fallback's badge flips to `relay` on its own first
     // verified chunk and not one moment earlier.
-    if (transfer.pathAttempt !== transfer.attemptId) {
-      transfer.pathAttempt = transfer.attemptId;
-      transfer.path = transfer.transport;
-      events.onPath?.(transfer.transferId, transfer.transport);
-    }
+    nameTransport(transfer);
     reportProgress(transfer, true);
   }
 
@@ -1185,11 +1499,7 @@ export function createReceiver({
     if (stale()) {
       return;
     }
-    if (transfer.pathAttempt !== transfer.attemptId) {
-      transfer.pathAttempt = transfer.attemptId;
-      transfer.path = transfer.transport;
-      events.onPath?.(transfer.transferId, transfer.transport);
-    }
+    nameTransport(transfer);
     reportProgress(transfer, true);
   }
 
@@ -1224,11 +1534,7 @@ export function createReceiver({
     }
     const now = Date.now();
     const first = transfer.lastReportBytes === null;
-    if (
-      !first &&
-      now - transfer.lastReportAt < PROGRESS_MIN_MS &&
-      verified - transfer.lastReportBytes < PROGRESS_MIN_BYTES
-    ) {
+    if (!progressIsDue(now, transfer.lastReportAt, first, transfers.size)) {
       return;
     }
     transfer.lastReportAt = now;
@@ -1367,23 +1673,63 @@ export function createReceiver({
     perfEnd("dst.wall", transfer.firstFrameAt, transfer.receivedBytes);
     transfer.completeAt = perfStart();
     transfer.state = "complete-pending";
+    // Past the last byte the recipient waits for the server on purpose.
+    stopIdleClock(transfer);
     // The server notifies only the source on completion; the recipient
     // learns it from this request's ack, tracked below.
+    if (
+      !sendComplete(transfer.transferId, {
+        transferId: transfer.transferId,
+        attemptId: transfer.attemptId,
+        root: transfer.entry.root,
+      })
+    ) {
+      throw new Error("offline at complete");
+    }
+  }
+
+  /**
+   * Puts one `transfer.complete` on the wire and remembers it so a refusal
+   * can be answered. Each send gets a FRESH `requestId`: the server answers
+   * per request, so reusing one would only collect the first verdict again.
+   */
+  function sendComplete(transferId, body, tries = 0) {
     const completeId = randomRequestId();
     const sent = sendControl({
       v: 1,
       type: "transfer.complete",
       requestId: completeId,
-      body: {
-        transferId: transfer.transferId,
-        attemptId: transfer.attemptId,
-        root: transfer.entry.root,
-      },
+      body,
     });
     if (!sent) {
-      throw new Error("offline at complete");
+      return false;
     }
-    pendingCompletes.set(completeId, transfer.transferId);
+    pendingCompletes.set(completeId, { transferId, body, tries });
+    return true;
+  }
+
+  /**
+   * A refused `transfer.complete`. A retryable code is re-sent on a growing
+   * grid; anything else, and a spent grid, fails the transfer with the code
+   * the server gave — the user sees why, instead of a row stuck at 100%.
+   */
+  function completeRefused(pending, code) {
+    const retryable = code === "RATE_LIMITED" || code === "INTERNAL";
+    if (!retryable || pending.tries >= COMPLETE_MAX_RETRIES) {
+      events.onError?.(pending.transferId, code);
+      return;
+    }
+    const wait = COMPLETE_RETRY_BASE_MS * 2 ** pending.tries;
+    const timer = setTimeout(() => {
+      // The transfer may have been abandoned while we waited.
+      if (!transfers.has(pending.transferId)) {
+        return;
+      }
+      sendComplete(pending.transferId, pending.body, pending.tries + 1);
+    }, wait);
+    if (typeof timer?.unref === "function") {
+      timer.unref();
+    }
   }
 
   /** Stages the verified file after the server echoes completion. */
@@ -1457,7 +1803,7 @@ export function createReceiver({
      * what keeps the first frame from waiting on WebCrypto — and the frames
      * arrive through `deliverDirectFrame`.
      */
-    beginDirect(transferId, attemptId) {
+    beginDirect(transferId, attemptId, carriers = 1) {
       const transfer = transfers.get(transferId);
       if (transfer === undefined || typeof attemptId !== "string") {
         return false;
@@ -1466,8 +1812,65 @@ export function createReceiver({
         return false;
       }
       adoptAttempt(transfer, attemptId);
+      // More than one carrier means the arrival order is the order N
+      // independent associations happened to deliver in, so the receiver
+      // reorders on the sequence in each frame's own header. With one
+      // carrier the window stays disarmed and the path is the one that
+      // existed before carriers, down to which failures are which.
+      transfer.reorderWindow = Number(carriers) > 1;
       transfer.state = "direct";
+      startIdleClock(transfer);
       void deriveAttemptKey(transfer);
+      return true;
+    },
+
+    /**
+     * A direct attempt to be negotiated WHILE the relay keeps carrying.
+     *
+     * Nothing about the live attempt moves: not the ID, not the key, not the
+     * plan. The relay is still delivering frames and must go on delivering
+     * them, because a probe that fails has to leave the download exactly as
+     * it found it. The switch happens in one place only — the server's
+     * `transfer.path_commit direct` naming this attempt.
+     */
+    prepareUpgrade(transferId, attemptId, carriers = 1) {
+      const transfer = transfers.get(transferId);
+      if (transfer === undefined || typeof attemptId !== "string") {
+        return false;
+      }
+      if (transfer.attemptId === attemptId) {
+        return false;
+      }
+      // Only a download that is actually running on the relay is worth
+      // upgrading; anything else already has a path or has none to leave.
+      if (transfer.state !== "receiving" && transfer.state !== "ticketed") {
+        return false;
+      }
+      transfer.upgrade = { attemptId, carriers: Number(carriers) || 1 };
+      return true;
+    },
+
+    /**
+     * What this peer has VERIFIED on disk, for the upgrade's
+     * `transfer.direct_ready`. The server relayed the bytes but never counted
+     * them, so without this the commit would resend everything the relay had
+     * already delivered.
+     */
+    upgradeRanges(transferId, attemptId) {
+      const transfer = transfers.get(transferId);
+      if (transfer === undefined || transfer.upgrade?.attemptId !== attemptId) {
+        return null;
+      }
+      return transfer.verifiedRanges.map((range) => [...range]);
+    },
+
+    /** The probe is over; the relay was never touched. */
+    abandonUpgrade(transferId, attemptId) {
+      const transfer = transfers.get(transferId);
+      if (transfer === undefined || transfer.upgrade?.attemptId !== attemptId) {
+        return false;
+      }
+      transfer.upgrade = null;
       return true;
     },
 
@@ -1480,6 +1883,10 @@ export function createReceiver({
       if (transfer.state !== "direct" && transfer.state !== "receiving") {
         return false;
       }
+      // The clock reads arrival, not progress: a frame that turns out to be
+      // unopenable still proves the path is carrying, and it is the path this
+      // deadline is about.
+      transfer.lastFrameAt = Date.now();
       deliverFrame(transfer, data);
       return true;
     },
@@ -1555,6 +1962,8 @@ export function createReceiver({
       transfer.chunkBuffers = [];
       transfer.inbox = [];
       transfer.pendingFrames = [];
+      transfer.reorder = new Map();
+      transfer.reorderBytes = 0;
       return capRanges(coalesceRanges(transfer.verifiedRanges));
     },
 
@@ -1578,11 +1987,18 @@ export function createReceiver({
         }
       }
       if (message.type === "ack" || message.type === "error") {
-        if (message.type === "ack" && message.requestId !== undefined) {
-          const completedId = pendingCompletes.get(message.requestId);
-          if (completedId !== undefined) {
+        if (message.requestId !== undefined) {
+          const completing = pendingCompletes.get(message.requestId);
+          if (completing !== undefined) {
             pendingCompletes.delete(message.requestId);
-            void stageCompleted(completedId);
+            if (message.type === "ack") {
+              void stageCompleted(completing.transferId);
+            } else {
+              // An ERROR here used to fall through to the request table, miss,
+              // and return false — so a refused completion was dropped in
+              // silence and the transfer could never finish.
+              completeRefused(completing, body.code ?? "INTERNAL");
+            }
             return true;
           }
         }
@@ -1657,6 +2073,32 @@ export function createReceiver({
           return false;
         }
         if (body.path === "direct") {
+          // The UPGRADE commit: the server has decided this download moves
+          // off the relay onto the probe both peers just negotiated. This is
+          // the only place a running download changes transport, and it is
+          // the same message the fallback uses in the other direction.
+          if (transfer.upgrade?.attemptId === body.attemptId) {
+            const carriers = transfer.upgrade.carriers;
+            try {
+              transfer.socket?.close();
+            } catch {
+              /* already gone */
+            }
+            transfer.socket = null;
+            // `adoptAttempt` resets the key, the sequence and the inbox, and
+            // stops the old attempt's idle clock; every frame still in flight
+            // on the relay names an attempt that is no longer current and is
+            // discarded exactly as a stale frame always was.
+            adoptAttempt(transfer, body.attemptId);
+            transfer.upgrade = null;
+            transfer.reorderWindow = carriers > 1;
+            transfer.transport = "direct";
+            applyCommitPlan(transfer, body.resumeRanges);
+            transfer.state = "receiving";
+            startIdleClock(transfer);
+            void deriveAttemptKey(transfer);
+            return true;
+          }
           // The channel and the key were built at `direct_start`; the commit
           // only says the source may begin, and must name THIS attempt.
           if (transfer.attemptId !== body.attemptId) {
@@ -1666,6 +2108,13 @@ export function createReceiver({
           applyCommitPlan(transfer, body.resumeRanges);
           if (transfer.state === "direct") {
             transfer.state = "receiving";
+          }
+          // Only when a chunk of THIS attempt has already been verified: the
+          // commit then corrects a badge that named the pre-commit transport.
+          // With nothing verified yet the badge stays `in connessione`, which
+          // is the rule this call must not break.
+          if (transfer.pathAttempt === transfer.attemptId) {
+            nameTransport(transfer);
           }
           return true;
         }
@@ -1677,6 +2126,9 @@ export function createReceiver({
         applyCommitPlan(transfer, body.resumeRanges);
         if (transfer.state === "ticketed" || transfer.state === "requested") {
           transfer.state = "receiving";
+        }
+        if (transfer.pathAttempt === transfer.attemptId) {
+          nameTransport(transfer);
         }
         return true;
       }

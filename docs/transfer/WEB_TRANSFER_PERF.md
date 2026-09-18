@@ -370,10 +370,56 @@ time in a collapsed repetition is that one wait.
    measurement.* Re-run with `--web-transfer-no-stun`, so the page has host
    candidates only: still 3/6 collapsed, `src.drain` 2240 ms and 1670 ms.
 
-What survives is the transport itself: an ordered, reliable SCTP association
-over UDP, losing a packet and paying a retransmission timeout. That is the
-browser's form of P-13 — and it is the one knob a page cannot reach, which is
-exactly why entry 6 below refuses socket tuning rather than attempting it.
+**What it IS, measured this time (V003-C1, 2026-09-17).** The paragraph that
+used to stand here named "an ordered, reliable SCTP association losing a
+packet and paying a retransmission timeout" as the cause. Nothing had measured
+that, and instrumenting the attempt (V003-C3's trace, printed beside every
+rate by the harness) says it is wrong. Six alternated repetitions, chromium,
+8 MiB, with the per-attempt trace read AFTER EACH REPETITION — the page's
+store keeps eight attempts and a run that reads it at the end silently drops
+the oldest, which is how the first instrumented run lost a 3.3 s stall and
+published five fast repetitions under six rep numbers that were store indexes:
+
+| rep | direct | `drain_longest` | `discardedOnSend` | selected pair |
+|---|---|---|---|---|
+| 0 | 55.21 MiB/s | 54 ms | 715 | `host/host` |
+| 1 | 62.94 MiB/s | 25 ms | 0 | `host/host` |
+| 2 | 40.20 MiB/s | 75 ms | 1209 | `host/host` |
+| 3 | 68.09 MiB/s | 34 ms | 0 | `host/host` |
+| 4 | **5.87 MiB/s** | **1273 ms** | 965 | `host/host` |
+| 5 | **5.18 MiB/s** | **1434 ms** | 38 | `host/host` |
+
+Four facts, each of which removes a candidate explanation:
+
+1. **It is ONE wait, not a slow path.** In a repetition whose marks were
+   lowered to 512 KiB/128 KiB so the source waits seven times, ONE wait took
+   1654 ms and the other six totalled 47 ms. A transport running slowly would
+   spread the cost over every wait.
+2. **It is not the queue depth.** At 4 MiB/1 MiB the peak queue is ~4.5 MB and
+   at 512 KiB/128 KiB it is ~1.17 MB; the stall is 1.3–1.7 s in both. (The
+   first low-mark run came back clean and looked like a fix — the second
+   reproduced the collapse. One run is not a measurement.)
+3. **It is not the ICE path.** Every repetition, fast and slow, selects
+   `host/host`. The slow ones are not a different KIND of path.
+4. **It is not packet loss on the path, and this is what falsifies the old
+   sentence.** `packetsDiscardedOnSend` does not correlate at all — a fast
+   repetition discarded 1209 and the slowest discarded 38 — and, decisively,
+   **firefox on the same loopback pair never shows the collapse**: six
+   repetitions of 26.40–35.56 MiB/s, longest wait 155 ms, `direct / relay`
+   **0.882x** (samples 0.918 0.846 0.938 0.785 1.000 0.713). Two engines share
+   the loopback path; only one of them stalls. A path that lost packets would
+   lose them for Gecko too.
+
+So the measured statement is: **a ~1.3–1.7 s freeze of chromium's DataChannel
+send path, at most once per transfer, independent of the queue depth, of the
+selected candidate pair and of the send discards, and absent on Gecko.** Its
+duration is the length of a one-second-class timer, which is suggestive of an
+SCTP RTO or zero-window probe inside the engine — and that stays a HYPOTHESIS,
+because chromium exposes no `sctp-transport` statistics (`cwnd`, `rwnd` and
+`unackData` read `?` in every trace above) and a page has no other way to see
+inside the association. It is a browser limit, recorded as one, and entry 6
+below refuses socket tuning for the same reason: the knob is not reachable
+from here.
 
 **And the ratio itself must not be read as a statement about the product.**
 Both "paths" here are loopback: the relay arm is a localhost TCP hop through a
@@ -500,12 +546,59 @@ red-checked by adding a single `setTimeout(…, 0)` to the send loop.
 
 ### What 4.6 leaves open
 
-The bimodal collapse on chromium's DataChannel is **identified and not fixed**,
-because every mechanism reachable from a page was tested and none of them is
-it. Before anything else is attempted, the ratio needs a two-host measurement:
-on loopback the relay is a localhost hop and the comparison flatters it, and a
-stall caused by a loopback UDP path may not exist on a real one at all. That
-measurement is 4.4's environment, not this one's.
+The bimodal collapse on chromium's DataChannel is **identified, characterised
+and not fixed**, because every mechanism reachable from a page was tested and
+none of them is it (above). What remains is a two-host run: on loopback the
+relay is a localhost hop and the comparison flatters it, and a stall inside an
+engine's own send path may behave differently when the association is carrying
+a real RTT.
+
+`T-WEB-PERF-LAN` is that run, and it is a harness rather than a paragraph of
+advice: `scripts/perf/web_transfer_lan.sh` serves the room over HTTPS on this
+host's LAN address, creates it with the SHIPPED `bore transfer web`, drives
+the SOURCE with `web/transfer/tests/perf/lan.perf.mjs`, and leaves the
+recipient to a browser somebody opens on the other device.
+
+Three decisions inside it are worth stating, because each one was forced:
+
+- **It drives only the source.** An Android phone cannot be driven by
+  Playwright, and F01 is a phone report. The source's own view is sufficient
+  because the recipient acknowledges only VERIFIED ranges, so the instant the
+  transfer leaves `senderState()` is the instant the other side finished
+  hashing it — not the instant this side emptied a buffer.
+- **HTTPS is not optional.** The server refuses a plaintext base URL off
+  loopback and is right to: `crypto.subtle`, OPFS and `RTCPeerConnection` all
+  need a secure context, so a phone pointed at `http://192.168.x.y` would not
+  have the APIs this product is made of. With no `CERT`/`KEY` the script
+  generates a self-signed certificate for the LAN address and says so; that
+  shape measures throughput, never TLS overhead.
+- **The arm is selected on the SOURCE**, by removing `RTCPeerConnection` from
+  that context so the page answers `unsupported` immediately. The recipient
+  therefore needs no flag, which is exactly what lets the other host be a
+  phone, and `pathCommits` is asserted so an arm whose label and transport
+  disagree fails instead of publishing the relay's number under `direct`.
+
+Run:
+
+```bash
+npm --prefix web/transfer run build && cargo build --all-features
+SIZE_MB=400 REPS=3 scripts/perf/web_transfer_lan.sh
+# open the printed URL on the other device, tap Scarica when it says so
+```
+
+It prints every raw sample, the per-attempt trace beside it, `direct / relay`
+and an explicit `goal=50.00MiB/s … verdict=MET|NOT-MET`. Qualify the link
+first (V-9): `iperf3 -c <other host> -t 20`, then `-P 8` — a per-flow limit
+opens with parallelism and a policer does not — and take the native baseline
+with `bore transfer` over the same route in the same session.
+
+**Not yet run on the reporter's network**, which is why V003-F01 stays open:
+that measurement needs the two hosts and the 400 MB file it was reported
+from, and it cannot be produced from the development machine. The smoke run
+that proves the harness itself works is loopback and is not a result: 8 MiB,
+`direct` 3.71 MiB/s with one 2087 ms drain wait, `relay` 69.57 MiB/s — the
+same defect this section characterises, found by the new harness on its first
+execution.
 
 ## Re-running and comparing
 
@@ -531,5 +624,130 @@ BORE_PERF_FRAGMENTS=8192,16384,24576 ... --grep "direct fragment size sweep"
 BORE_PERF_MARKS=4194304:1048576,1048576:262144 ... --grep "direct backpressure sweep"
 ```
 
+The two-host run is a driver, not a test — it needs a person at the other
+device — and it owns its own server, room and summary:
+
+```bash
+# both arms, 400 MiB, three repetitions; prints the goal verdict
+SIZE_MB=400 REPS=3 scripts/perf/web_transfer_lan.sh
+# a real name and a real certificate (the shape an acceptance claim uses)
+CERT=/etc/ssl/full.pem KEY=/etc/ssl/key.pem BASE_URL=https://files.example/ \
+  scripts/perf/web_transfer_lan.sh
+```
+
 A change to the data path re-runs this harness and records the ratio it moved,
 in this file, with its samples. "No regression observed" is not a measurement.
+
+## 7.6 — two real hosts over a WAN, and the queue depth that was killing the direct path
+
+`T-WEB-PERF-WAN` — `scripts/perf/web_transfer_wan.sh`, 2026-09-18. Server and
+recipient on an AWS host in `eu-central-1`, source on the workstation; 21 ms
+RTT, 222 Mbit/s measured on the uplink with `scp` before the first arm (V-9:
+qualify the link before quoting any absolute figure). Payload 128 MiB per arm,
+arms alternated INSIDE each repetition (V-13), raw samples always printed
+(V-11). Bytes travel workstation -> cloud, which is ingress and is not billed;
+that direction is a property of the topology, not a convenience.
+
+### The defect the first run found
+
+The direct arm did not merely run slower — it **died**, every time, and the
+transfer finished on the relay:
+
+```
+direct/c4  rep=0  peak=4462400  reason=channel-closed  commits=['direct','relay']
+```
+
+The trace now carries the engine's own verdict (`RTCErrorEvent.error`):
+`errorDetail: "sctp-failure"`, `sctpCauseCode: 12`. Before this campaign the
+mark read `channel-error` and nothing else, which is the difference between
+"the peer went away" and "we overran the SCTP send queue" — opposite remedies.
+
+Two things were wrong, and the second hid the first:
+
+1. **The group's backpressure ignored the per-carrier mark.** `waitLow`
+   compared each carrier's `bufferedAmount` against the module constant
+   `RTC_HIGH_WATER` instead of against that carrier's own effective mark, so
+   a harness that lowered the mark changed nothing. MEASURED: with the knob at
+   4 MiB, 1 MiB and 256 KiB the peak queued depth read 4.46 MB, 4.46 MB and
+   4.46 MB — three settings, one number, which is what a knob nobody reads
+   looks like from the outside.
+2. **4 MiB per carrier is past the optimum.** With the mark honoured, the
+   depth ladder (five repetitions each, carriers=4):
+
+   | per carrier | median MiB/s | failures in 5 | peak queued | drain waits |
+   |-------------|--------------|---------------|-------------|-------------|
+   | 2 MiB       | 18.76        | 1 fallback    | 2.36 MB     | 23–25 |
+   | 1 MiB       | 20.19        | 1 sctp-failure| 1.32 MB     | 46–51 |
+   | **512 KiB** | **21.45**    | **0**         | 0.80 MB     | 78–86 |
+
+   The deepest queue is the SLOWEST **and** the least stable — the same shape
+   the native uplink's own depth ladder reached (V-13: "deeper is better" is
+   false and there is an optimum). Shipped: `RTC_HIGH_WATER` 512 KiB,
+   `RTC_LOW_WATER` 128 KiB.
+
+### And it is not a WAN-only fix: loopback said the same thing, quietly
+
+Phase 5's own ladder had "confirmed" 4 MiB/1 MiB on loopback — but it compared
+"only the healthy repetitions", and the repetitions it set aside were bimodal
+in exactly the way a queue that aborts is. Re-measured on loopback with the
+same six repetitions at 8 MiB, the shipped 512 KiB reads **46.27 MiB/s**
+median against 45.82 for 4 MiB, and the catastrophic samples are gone: the
+worst repetition moves from **2.36 MiB/s to 14.02**. The deep queue was never
+buying anything; it was producing the outliers the earlier ladder excluded.
+
+### Carriers, measured rather than chosen
+
+Three repetitions per value, at the shipped 512 KiB mark:
+
+| carriers | direct median MiB/s | ratio to relay | direct attempts that died (of 3) |
+|----------|---------------------|----------------|----------------------------------|
+| 1        | 10.84               | 0.248x         | 1 |
+| 2        | 23.05               | 0.528x         | 2 |
+| **4**    | **22.08**           | 0.502x         | **0** |
+| 8        | 33.85               | 0.780x         | 2 |
+
+One carrier cannot fill this path and is half of every other value. Eight is
+the fastest median but two of its three attempts aborted mid-transfer and
+finished on the relay. Four is the only value that completed every attempt on
+the path it negotiated, across 11 repetitions in this campaign. The default
+stays **4**.
+
+### The finding that matters most, and it is not a tuning one
+
+**On this WAN the relay is twice as fast as the direct path, and far steadier:**
+43.5 MiB/s with a spread of 43.1–46.3 across twelve repetitions, against
+10.8–33.9 for direct depending on the carrier count. The relay arm never
+failed, never fell back and its verification time is half the direct arm's
+(3.1 s vs 4.0–12.0 s for the same 128 MiB). A browser DataChannel is SCTP over
+DTLS over UDP implemented in the tab; the relay leg is kernel TCP with the
+server applying backpressure, and on a 21 ms path with no packet loss that is
+simply the faster machine.
+
+So "direct is the fast path and relay is the fallback" is **false on a clean
+WAN**. Direct is the path that does not spend the operator's bandwidth and
+does not put the payload through a third party; it is chosen for that, and
+this document is the reason the choice is now an informed one. The transfer
+falls back to the relay by itself whenever the direct path dies, and this
+campaign exercised that fallback dozens of times end to end — every aborted
+attempt completed, resuming from the ranges the recipient had already
+verified.
+
+### Re-running it
+
+```bash
+# one setting, both arms, three repetitions
+SIZE_MB=128 REPS=3 ARMS=direct,relay CARRIERS=4 scripts/perf/web_transfer_wan.sh
+
+# the carrier sweep (one server lifetime per value)
+SWEEP=1,2,4,8 SIZE_MB=128 REPS=3 scripts/perf/web_transfer_wan.sh
+
+# the queue-depth ladder: the marks reach the page through `__borePerf`
+WT_HIGH_WATER=524288 WT_LOW_WATER=131072 SIZE_MB=128 REPS=5 ARMS=direct \
+  CARRIERS=4 scripts/perf/web_transfer_wan.sh
+```
+
+`REMOTE` names an ssh host (default `awstest`) that holds `bore` and a
+`node_modules` with Playwright's chromium under `REMOTE_DIR`
+(`/home/ubuntu/wt`). Size it against the LINE, not against a round number
+(V-19): 128 MiB is ~6 s of transfer on a 222 Mbit/s uplink, which is well past
+the ramp; on a slower link raise it rather than keep the number.

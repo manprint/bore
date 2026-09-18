@@ -24,12 +24,19 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("usage: web_transfer_e2e_owner <host:port>");
         std::process::exit(2);
     });
+    // A second argument of `relay-only` opens the room with the operator's
+    // `--relay-only` policy, which is what lets a BROWSER gate prove the
+    // server never starts a direct attempt in such a room — the Rust units
+    // prove the registry's half, and a page that never constructs an
+    // `RTCPeerConnection` is the half a user can see.
+    let relay_only = std::env::args().nth(2).as_deref() == Some("relay-only");
     let (created_tx, created_rx) = tokio::sync::oneshot::channel();
     let (_lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(4);
     let run = tokio::spawn(run_owner_lease(
         OwnerClientConfig {
             endpoint,
             open_browser: false,
+            relay_only,
             ..OwnerClientConfig::default()
         },
         created_tx,

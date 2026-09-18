@@ -107,7 +107,7 @@ async fn t_web_registry_life() -> Result<()> {
     let owner_token = bore_cli::web_transfer::OwnerToken::from_bytes([owner_byte; 32]);
     let owner_hash = owner_token.sha256_hash();
 
-    let lease = OwnerLease::create(&registry, member_hash, owner_hash)
+    let lease = OwnerLease::create(&registry, member_hash, owner_hash, false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let id = lease.id();
     let room = lease.room().clone();
@@ -129,13 +129,13 @@ async fn t_web_registry_life() -> Result<()> {
     // the monitor fires, and prove the new room survives it.
     let forced = RoomId::from_bytes([0xabu8; 16]);
     let first = registry
-        .create_room_with_id(member_hash, owner_hash, forced)
+        .create_room_with_id(member_hash, owner_hash, forced, false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     OwnerLease::detach_with_grace(&first, Duration::from_millis(200));
     assert!(registry.remove_room_if_current(forced, &first));
     first.destroy("owner-close");
     let second = registry
-        .create_room_with_id([8u8; 32], [8u8; 32], forced)
+        .create_room_with_id([8u8; 32], [8u8; 32], forced, false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     tokio::time::sleep(Duration::from_millis(400)).await;
     let current = registry.room(forced).expect("reused room survives");
@@ -191,6 +191,7 @@ async fn t_web_native_wire() -> Result<()> {
             version: 1,
             member_token_hash: member_hash,
             owner_token_hash: owner_hash,
+            relay_only: false,
         })
         .await?;
     let (room_id, epoch) = match control.recv::<ServerMessage>().await? {
@@ -266,6 +267,7 @@ async fn t_web_native_wire() -> Result<()> {
             version: 1,
             member_token_hash: member_hash,
             owner_token_hash: owner_hash,
+            relay_only: false,
         })
         .await?;
     match control.recv::<ServerMessage>().await? {
@@ -284,6 +286,7 @@ async fn t_web_native_wire() -> Result<()> {
             version: 2,
             member_token_hash: member_hash,
             owner_token_hash: owner_hash,
+            relay_only: false,
         })
         .await?;
     match control.recv::<ServerMessage>().await? {
@@ -372,6 +375,7 @@ async fn t_web_owner_lease() -> Result<()> {
         insecure: false,
         open_browser: false,
         owner_grace_secs: 5,
+        relay_only: false,
     };
 
     let (created_tx, created_rx) = tokio::sync::oneshot::channel();
@@ -1064,7 +1068,7 @@ async fn t_web_peers() -> Result<()> {
 
     let member = MemberToken::from_bytes([0x41u8; 32]);
     let owner = OwnerToken::from_bytes([0x42u8; 32]);
-    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let token_hex = member.to_string();
@@ -1377,7 +1381,7 @@ async fn t_web_catalog_server() -> Result<()> {
 
     let member = MemberToken::from_bytes([0x61u8; 32]);
     let owner = OwnerToken::from_bytes([0x62u8; 32]);
-    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let token_hex = member.to_string();
@@ -1574,8 +1578,13 @@ async fn t_web_catalog_server() -> Result<()> {
     support::wait_port(port2, true).await;
     let member2 = MemberToken::from_bytes([0x63u8; 32]);
     let owner2 = OwnerToken::from_bytes([0x64u8; 32]);
-    let lease2 = OwnerLease::create(&registry2, member2.sha256_hash(), owner2.sha256_hash())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let lease2 = OwnerLease::create(
+        &registry2,
+        member2.sha256_hash(),
+        owner2.sha256_hash(),
+        false,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room2 = lease2.id().to_string();
     let host2 = format!("127.0.0.1:{port2}");
     let origin2 = format!("http://127.0.0.1:{port2}");
@@ -1657,8 +1666,9 @@ async fn t_web_offer_races() -> Result<()> {
         let owner = OwnerToken::from_bytes([(round as u8).wrapping_add(0xa0); 32]);
         if round % 2 == 0 {
             // Publish races the disconnect: fire both, then converge.
-            let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let lease =
+                OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             let room_hex = lease.id().to_string();
             let mut peer = support::WsPeer::connect(&host, &room_hex, &origin).await?;
             peer.hello(&member.to_string(), None).await?;
@@ -1694,8 +1704,9 @@ async fn t_web_offer_races() -> Result<()> {
         } else {
             // Publish races the explicit close: the room always ends gone
             // with every counter back to baseline.
-            let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let lease =
+                OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             let room = lease.room().clone();
             let room_id = lease.id();
             let mut peer = support::WsPeer::connect(&host, &room.id.to_string(), &origin).await?;
@@ -1762,7 +1773,7 @@ async fn t_web_transfer_state() -> Result<()> {
 
     let member = MemberToken::from_bytes([0x71u8; 32]);
     let owner = OwnerToken::from_bytes([0x72u8; 32]);
-    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let token_hex = member.to_string();
@@ -1961,7 +1972,7 @@ async fn t_web_relay_opaque() -> Result<()> {
 
     let member = MemberToken::from_bytes([0x81u8; 32]);
     let owner = OwnerToken::from_bytes([0x82u8; 32]);
-    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let token_hex = member.to_string();
@@ -2678,7 +2689,7 @@ async fn t_web_perf_relay() -> Result<()> {
 
     let member = MemberToken::from_bytes([0x91u8; 32]);
     let owner = OwnerToken::from_bytes([0x92u8; 32]);
-    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let token_hex = member.to_string();
@@ -2963,7 +2974,7 @@ async fn t_web_limits() -> Result<()> {
 
     let member = MemberToken::from_bytes([0x71u8; 32]);
     let owner = OwnerToken::from_bytes([0x72u8; 32]);
-    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let token_hex = member.to_string();
@@ -4165,6 +4176,12 @@ fn t_web_readme() -> Result<()> {
     // else.
     for promise in [
         "Not yet included:",
+        // 7.1: the flag, what enforces it, and the one thing an operator
+        // would otherwise have to discover by experiment — that an old
+        // server is refused instead of silently obeyed.
+        "never sends a peer the message that starts a direct attempt",
+        "A server that predates the flag is refused, never silently obeyed",
+        "relay (imposto)",
         "WebRTC DataChannel",
         "**opaque WebSocket relay**",
         "tries the direct path first",
@@ -4223,6 +4240,43 @@ fn t_web_readme() -> Result<()> {
         assert!(
             readme.contains(&format!("`{server}`")),
             "README does not quote the default STUN server {server} the server actually offers"
+        );
+    }
+
+    // (6b) V003-C4. Troubleshooting used to name ONE cause as certain in two
+    // places where the measurement says otherwise, and both mistakes pointed
+    // the reader at a setting instead of at the path:
+    //   - on ONE LAN the browsers pair on HOST candidates and STUN is not
+    //     involved, so `--web-transfer-no-stun` is not what forces the relay
+    //     there; what forces it is UDP not crossing between the two machines;
+    //   - a slow RELAY transfer is not explained by the shipped throttle,
+    //     whose default is 100 MiB/s, and a slow DIRECT transfer was not
+    //     mentioned at all although the direct path is measurably bimodal.
+    // The needles are single lines on purpose: the windows runner checks the
+    // tree out with CRLF and a multi-line needle cannot match there (B-A016).
+    for promise in [
+        "the browsers normally pair on their **host** candidates and STUN is not involved at all",
+        "does **not** by itself force the relay",
+        "client isolation (\"AP isolation\", \"guest network\")",
+        "Only if the two are on **different** networks does STUN matter",
+        "the default is already **100 MiB/s**",
+        "and the row reads `diretto`",
+        "`drain_longest` in the report is exactly this wait",
+    ] {
+        assert!(
+            readme.contains(promise),
+            "README troubleshooting no longer matches the measurement ({promise:?})"
+        );
+    }
+    // The old wording must be GONE, not merely contradicted further down: a
+    // reader who finds the wrong row first stops reading.
+    for stale in [
+        "`--web-transfer-no-stun` is set (host candidates only), or outbound UDP is blocked on one of the two sides",
+        "and the relay is throttled per room | Raise or disable",
+    ] {
+        assert!(
+            !readme.contains(stale),
+            "README still carries the corrected troubleshooting wording ({stale:?})"
         );
     }
 
@@ -4431,7 +4485,7 @@ async fn t_web_signaling() -> Result<()> {
 
     let member = MemberToken::from_bytes([0x81u8; 32]);
     let owner = OwnerToken::from_bytes([0x82u8; 32]);
-    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let token_hex = member.to_string();
@@ -5127,7 +5181,7 @@ async fn relay_pair_room(
 
     let member = MemberToken::from_bytes([seed; 32]);
     let owner = OwnerToken::from_bytes([seed ^ 0xff; 32]);
-    let lease = OwnerLease::create(registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let token_hex = member.to_string();
@@ -6284,7 +6338,7 @@ async fn t_web_log_privacy() -> Result<()> {
 
     let member = MemberToken::from_bytes([0x61u8; 32]);
     let owner = OwnerToken::from_bytes([0x62u8; 32]);
-    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let token_hex = member.to_string();
@@ -6368,6 +6422,22 @@ async fn t_web_log_privacy() -> Result<()> {
                 "body": { "transferId": transfer_id, "attemptId": attempt_id,
                           "candidate": format!("candidate:1 1 udp 1 {CANARY_ICE} 1 typ host"),
                           "sdpMid": "0", "sdpMLineIndex": 0 },
+            })
+            .to_string(),
+        )
+        .await?;
+    let _ = expect_type(&mut recipient, "ack", wait).await?;
+    // The direct attempt gives up (V003-C3). This is the one event the
+    // server used to record NOWHERE: the log showed a relay starting and
+    // nothing about the path it replaced. The line it now writes is asserted
+    // below — with the fixed reason and the opaque ids, and with none of the
+    // canaries this peer has been feeding it.
+    recipient
+        .send_text(
+            serde_json::json!({
+                "v": 1, "type": "transfer.direct_failed", "requestId": "b6".repeat(16),
+                "body": { "transferId": transfer_id, "attemptId": attempt_id,
+                          "reason": "ice-failed", "resumeRanges": [] },
             })
             .to_string(),
         )
@@ -6469,6 +6539,23 @@ async fn t_web_log_privacy() -> Result<()> {
             .filter(|line| line.contains("relay") || line.contains(&relay_transfer))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+    // The direct-failure line is the other half of the same contract: an
+    // operator asking "why did this transfer end up on the relay?" gets the
+    // fixed reason and the two opaque ids, and nothing else. Before V003-C3
+    // the answer was silence, and the browser's own trace had no counterpart
+    // on the server at all.
+    let direct_line = logs
+        .lines()
+        .find(|line| line.contains("web-transfer direct attempt failed"))
+        .unwrap_or_else(|| panic!("no direct-failure line in the log: {logs:.800}"));
+    assert!(
+        direct_line.contains("reason=\"ice-failed\"") || direct_line.contains("reason=ice-failed"),
+        "the direct-failure line lost its fixed reason: {direct_line}"
+    );
+    assert!(
+        direct_line.contains(&transfer_id) && direct_line.contains(&attempt_id),
+        "the direct-failure line lost its opaque ids: {direct_line}"
     );
     relay_lease.close_explicit(&registry);
     drop(lease);
@@ -6602,7 +6689,7 @@ async fn web_config_totals_do_not_move_under_load() -> Result<()> {
         let member = MemberToken::from_bytes([0x30 + seed; 32]);
         let owner = OwnerToken::from_bytes([0x40 + seed; 32]);
         leases.push(
-            OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+            OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
                 .map_err(|e| anyhow::anyhow!("{e}"))?,
         );
     }
@@ -6730,7 +6817,7 @@ async fn admin_json_never_contains_canary_names_paths_tokens_sdp_candidates_or_m
 
     let member = MemberToken::from_bytes([0x5du8; 32]);
     let owner = OwnerToken::from_bytes([0x5eu8; 32]);
-    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let token_hex = member.to_string();
@@ -6817,7 +6904,7 @@ async fn web_pre_auth_failures_are_sampled_in_the_log() -> Result<()> {
 
     let member = MemberToken::from_bytes([0x21u8; 32]);
     let owner = OwnerToken::from_bytes([0x22u8; 32]);
-    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let host = format!("127.0.0.1:{port}");
@@ -7105,7 +7192,7 @@ async fn t_web_malformed() -> Result<()> {
 
     let member = MemberToken::from_bytes([0x41u8; 32]);
     let owner = OwnerToken::from_bytes([0x42u8; 32]);
-    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let token_hex = member.to_string();
@@ -7270,6 +7357,89 @@ async fn t_web_malformed() -> Result<()> {
 /// a stronger one. What matters is that no branch returns EARLY, which is
 /// the leak a timing oracle actually needs.
 #[tokio::test]
+/// T-WEB-CARRIER-BUDGET. Signalling for N carriers must not spend the budget
+/// the transfer's own lifecycle needs.
+///
+/// The offer and the answer are singletons PER CARRIER, so with the shipped
+/// default of four carriers a source sends four `rtc.answer`s before the
+/// transfer has moved one byte. While those were charged to the mutation
+/// bucket (4/s, burst 8) the next mutation was refused, and MEASURED on a
+/// real browser pair that next mutation was `transfer.source_ready` for the
+/// relay leg the server had just ticketed: the leg was never attached, the
+/// pair timed out after 30 s and the page read "Percorso interrotto: riprova"
+/// with the file half delivered. The bound that matters is the one
+/// `apply_signal` already enforces — one offer and one answer per carrier per
+/// attempt — plus the control bucket, which still applies to every message.
+async fn t_web_carrier_signalling_does_not_spend_the_mutation_budget() -> Result<()> {
+    use bore_cli::web_transfer::{MemberToken, OwnerLease, OwnerToken};
+
+    let port = support::free_port().await?;
+    let mut args = support::enabled_args();
+    args.base_url = Some(format!("http://127.0.0.1:{port}/"));
+    let resolved = bore_cli::web_transfer::resolve_server_config(&args, false, port)?
+        .expect("config resolves");
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(port);
+    server.set_web_transfer(resolved)?;
+    let registry = server.web_transfer().expect("registry enabled");
+    tokio::spawn(server.listen());
+    support::wait_port(port, true).await;
+
+    let member = MemberToken::from_bytes([0x71u8; 32]);
+    let owner = OwnerToken::from_bytes([0x72u8; 32]);
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let room_hex = lease.id().to_string();
+    let token_hex = member.to_string();
+    let host = format!("127.0.0.1:{port}");
+    let origin = format!("http://127.0.0.1:{port}");
+    let wait = Duration::from_secs(5);
+
+    let mut peer = support::WsPeer::connect(&host, &room_hex, &origin).await?;
+    peer.hello(&token_hex, None).await?;
+    let (typ, _) = control_msg(&peer.next_text(wait).await?.expect("welcome"));
+    assert_eq!(typ, "welcome");
+    let _ = read_snapshot(&mut peer).await?;
+
+    // Twice the shipped carrier count, so the gate still holds if the default
+    // grows. The transfer does not exist, which is the POINT: the answer must
+    // name the transfer, never the rate — a refusal here would be the defect,
+    // whatever it is called.
+    let rounds = 2 * bore_cli::web_transfer::WEB_TRANSFER_MAX_DIRECT_CARRIERS;
+    for carrier in 0..rounds {
+        let request = format!("{:032x}", 0xA000 + carrier);
+        peer.send_text(format!(
+            r#"{{"v":1,"type":"rtc.offer","requestId":"{request}","body":{{"transferId":"{t}","attemptId":"{a}","carrier":{c},"sdp":"v=0"}}}}"#,
+            t = "dd".repeat(16),
+            a = "ee".repeat(16),
+            c = carrier % bore_cli::web_transfer::WEB_TRANSFER_MAX_DIRECT_CARRIERS,
+        ))
+        .await?;
+        let (typ, body) = control_msg(&peer.next_text(wait).await?.expect("offer reply"));
+        assert_eq!(typ, "error", "an unknown transfer is an error");
+        assert_ne!(
+            body["code"].as_str(),
+            Some("RATE_LIMITED"),
+            "carrier {carrier} of {rounds} was refused for RATE, not for the unknown transfer",
+        );
+    }
+
+    // And the budget the bucket exists for is still there: a real mutation
+    // right after the whole signalling round must be served.
+    peer.send_text(format!(
+        r#"{{"v":1,"type":"peer.rename","requestId":"{}","body":{{"displayName":"Ada"}}}}"#,
+        "11".repeat(16),
+    ))
+    .await?;
+    let (typ, body) = control_msg(&peer.next_text(wait).await?.expect("rename reply"));
+    assert_eq!(
+        typ, "ack",
+        "the mutation after the signalling round was refused: {body}",
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn t_web_auth_refusals_are_one_class() -> Result<()> {
     use bore_cli::web_transfer::{
         MemberToken, OwnerLease, OwnerToken, WEB_TRANSFER_AUTH_FAIL_DELAY,
@@ -7289,7 +7459,7 @@ async fn t_web_auth_refusals_are_one_class() -> Result<()> {
 
     let member = MemberToken::from_bytes([0x51u8; 32]);
     let owner = OwnerToken::from_bytes([0x52u8; 32]);
-    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let host = format!("127.0.0.1:{port}");
@@ -7438,7 +7608,7 @@ async fn t_web_deploy_behind_reverse_proxy() -> Result<()> {
 
     let member = MemberToken::from_bytes([0x61u8; 32]);
     let owner = OwnerToken::from_bytes([0x62u8; 32]);
-    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash())
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let room_hex = lease.id().to_string();
     let token_hex = member.to_string();

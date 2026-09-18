@@ -135,6 +135,7 @@ export async function spawnRoomEnv({
   relayRate,
   ownerGrace,
   noStun = false,
+  relayOnly = false,
 } = {}) {
   const port = await freePort();
   const server = track(
@@ -190,7 +191,7 @@ export async function spawnRoomEnv({
     );
   }
   const owner = track(
-    spawn(ownerBin, [`127.0.0.1:${port}`], {
+    spawn(ownerBin, [`127.0.0.1:${port}`, ...(relayOnly ? ["relay-only"] : [])], {
       stdio: ["ignore", "pipe", "pipe"],
     }),
   );
@@ -281,7 +282,18 @@ export function canonicalize(value) {
  */
 export async function openPersistentPeer(
   url,
-  { browserName, channel, init, noWebRtc = false, iceRelayOnly = false } = {},
+  {
+    browserName,
+    channel,
+    init,
+    noWebRtc = false,
+    iceRelayOnly = false,
+    // Off by default, and it stays off for every gate: a suite that ignores
+    // certificate errors cannot notice a broken one. The two-host perf leg
+    // turns it on because it serves a self-signed certificate for a LAN
+    // address on purpose (T-WEB-PERF-LAN).
+    ignoreHttpsErrors = false,
+  } = {},
 ) {
   const engine = PERSISTENT_ENGINES[browserName];
   if (engine === undefined) {
@@ -290,6 +302,7 @@ export async function openPersistentPeer(
   const profile = mkdtempSync(join(tmpdir(), "bore-profile-"));
   const context = await engine.launchPersistentContext(profile, {
     acceptDownloads: true,
+    ...(ignoreHttpsErrors ? { ignoreHTTPSErrors: true } : {}),
     ...(channel === undefined ? {} : { channel }),
   });
   await installTestHooks(context);

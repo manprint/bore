@@ -53,6 +53,10 @@ export function createInitialState() {
     statusText: "",
     selfPeerId: null,
     displayName: null,
+    // The room's owner opened it with `--relay-only`: the SERVER is what
+    // enforces it (it never opens a direct attempt), and this is only what
+    // lets the page say so before a transfer runs.
+    relayOnly: false,
     peers: new Map(),
     offers: new Map(),
     // transferId → row (see `transfer.started`); insertion ordered.
@@ -89,6 +93,7 @@ export function reduce(state, event) {
         ...state,
         selfPeerId: event.peerId,
         displayName: event.displayName,
+        relayOnly: event.relayOnly === true,
       };
     }
     case "snapshot.begin": {
@@ -301,6 +306,9 @@ export function messageToEvent(message) {
         kind: "welcome",
         peerId: body.peerId,
         displayName: typeof body.displayName === "string" ? body.displayName : null,
+        // Strictly `true`: an older server omits the field, and "absent"
+        // must read as the historical behaviour, never as the policy.
+        relayOnly: body.relayOnly === true,
       };
     case "snapshot.begin":
       return { kind: "snapshot.begin" };
@@ -445,6 +453,11 @@ const ERROR_TEXT = new Map([
   ["STORAGE_QUOTA", "Spazio su disco insufficiente"],
   ["CANCELLED", "Trasferimento annullato"],
   ["INTERNAL", "Errore del server"],
+  // Answered to signalling about an attempt that is over or already
+  // committed — the ordinary trickle-ICE race. It reaches no user-facing
+  // path today (nothing awaits a reply to `rtc.*`); the label exists so it
+  // cannot surface as a raw code if one ever does.
+  ["STALE_ATTEMPT", "Tentativo non più valido"],
   ["OFFLINE", "Non connesso alla room"],
   ["UNSUPPORTED", "Download non supportato da questo browser"],
   ["OWN_OFFER", "Questa offerta è tua"],

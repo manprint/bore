@@ -46,6 +46,37 @@ export function peekFrameType(data) {
 }
 
 /**
+ * Frame SEQUENCE of a frame that has not been opened yet, or `null` when the
+ * bytes cannot be read here — the same two cases as {@link peekFrameType}.
+ *
+ * Like the type, the sequence lives in the 16-byte CLEARTEXT header, and like
+ * the type it is the AEAD's additional data, so it is readable before the key
+ * is consulted and authenticated afterwards. That is what makes it safe to
+ * ROUTE on: a forged sequence can only put a frame in the wrong place in the
+ * receive queue, and the open at that place then fails — the nonce and the
+ * additional data both carry the position the receiver expects.
+ *
+ * It exists so several transports can carry one frame stream: with more than
+ * one DataChannel the arrival order is no longer the send order, and the
+ * receiver reorders on this value instead of assuming it.
+ */
+export function peekFrameSeq(data) {
+  const bytes =
+    data instanceof Uint8Array
+      ? data
+      : data instanceof ArrayBuffer
+        ? new Uint8Array(data)
+        : null;
+  if (bytes === null || bytes.length < FRAME_HEADER_LEN) {
+    return null;
+  }
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(
+    8,
+    false,
+  );
+}
+
+/**
  * Byte window of one logical chunk.
  * @returns `{ offset, length }` (last chunk may be short).
  */

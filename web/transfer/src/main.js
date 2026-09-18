@@ -21,7 +21,8 @@ import { createOfferManager } from "./offers.js";
 import { createReceiver } from "./receiver.js";
 import { createSender } from "./sender.js";
 import { createRepository, sanitizeDownloadName } from "./storage.js";
-import { createAttemptRtc } from "./webrtc.js";
+import { MAX_CARRIERS, createCarrierGroup } from "./webrtc.js";
+import { createTraceStore } from "./diagnostics.js";
 import { createView } from "./view.js";
 import { bytesToHex, hexToBytes, manifestMac } from "./crypto.js";
 import { canonicalize, directFailedBody, manifestValue } from "./protocol.js";
@@ -230,6 +231,33 @@ const view = createView(document, app, {
       view.announce("Copia non riuscita");
     }
   },
+  /**
+   * The direct-path diagnostic (V003-C3). It exists because a fallback used
+   * to leave no evidence at all: the page abandoned the attempt, the relay
+   * took over and nobody — user, operator or this repository — could say
+   * which path had been selected or what ended it.
+   *
+   * It leaves the page ONLY here, on this click, and it carries no address,
+   * no candidate line, no SDP, no file name, no peer name and no secret:
+   * `diagnostics.js` copies numbers and short enumerations and nothing else.
+   */
+  onCopyDiagnostics: async () => {
+    const text = directTraces.text({
+      live: [...directAttempts.values()].flatMap((entry) =>
+        entry.actor.diagnostics(),
+      ),
+    });
+    try {
+      await navigator.clipboard.writeText(text);
+      view.announce(
+        directTraces.size === 0
+          ? "Diagnostica copiata (nessun tentativo diretto ancora concluso)"
+          : "Diagnostica del percorso copiata negli appunti",
+      );
+    } catch {
+      view.announce("Copia non riuscita");
+    }
+  },
 });
 
 function render() {
@@ -364,6 +392,13 @@ async function startDownload(offerId, mode = "raw", options = {}) {
 /** transferId → `{ actor, attemptId, recipient }` for the live attempt. */
 const directAttempts = new Map();
 
+/**
+ * The last few finished attempts' traces (V003-C3), bounded by the store.
+ * Nothing reads it but the copy button and the test hook: it is evidence
+ * held for the user, never telemetry.
+ */
+const directTraces = createTraceStore();
+
 /** Drops the actor for this transfer, if any, without telling the server. */
 function closeDirect(transferId) {
   const entry = directAttempts.get(transferId);
@@ -372,6 +407,32 @@ function closeDirect(transferId) {
   }
   directAttempts.delete(transferId);
   entry.actor.close();
+  // Read LAZILY: the attempt's last `getStats()` sample is issued inside
+  // `close()` and lands a moment later, so a snapshot taken now would be the
+  // one that is missing exactly the sample describing the failure.
+  directTraces.push(() => entry.actor.diagnostics());
+}
+
+/**
+ * Test-only reader for the traces above. It is a FUNCTION and not an array
+ * because the store resolves its entries when it is read: the sample that
+ * describes a failure lands after the attempt is dropped.
+ */
+function installDiagnosticsHook() {
+  const hook = globalThis.__BORE_TEST__;
+  if (hook === null || typeof hook !== "object") {
+    return;
+  }
+  try {
+    hook.readDirectDiagnostics = () => ({
+      finished: directTraces.all(),
+      live: [...directAttempts.values()].flatMap((entry) =>
+        entry.actor.diagnostics(),
+      ),
+    });
+  } catch {
+    /* a frozen hook object costs the harness one reader, never the app */
+  }
 }
 
 /** Closes every live attempt (room death, page teardown). */
@@ -421,8 +482,25 @@ function sendDirectFailed(
  * the last byte is the end of a successful transfer, not a failure, and a
  * notice there would cost a relay attempt nobody needs.
  */
-async function failDirect(transferId, attemptId, reason, recipient) {
+async function failDirect(transferId, attemptId, reason, recipient, upgrade = false) {
   closeDirect(transferId);
+  if (upgrade) {
+    // A probe that failed changes NOTHING: the relay never stopped carrying,
+    // there is no path to reset and no ranges to report. Telling the server
+    // is what lets it stop offering and try again later on its own grid.
+    if (recipient) {
+      receiver?.abandonUpgrade(transferId, attemptId);
+    } else {
+      sender?.detachUpgrade(transferId, attemptId);
+    }
+    session?.send("transfer.direct_failed", randomRequestId(), {
+      transferId,
+      attemptId,
+      reason,
+    });
+    recordDirect({ kind: "ended", transferId, attemptId, recipient, reason });
+    return;
+  }
   if (recipient) {
     const ranges =
       (await (receiver?.directFailed(transferId, attemptId) ?? null)) ?? null;
@@ -509,6 +587,16 @@ function startDirectAttempt(body) {
   // Roles are the server's, never derived here: the recipient is the offerer
   // and the only side that creates the channel.
   const recipient = role === "offerer";
+  // How many `RTCPeerConnection`s this attempt runs on. The server decides it
+  // (`--web-transfer-direct-carriers`) and omits the field at 1, so a server
+  // that predates carriers reads as one — which is what it can do.
+  const carriers = Math.max(1, Math.min(Number(body.carriers ?? 1) || 1, MAX_CARRIERS));
+  // An UPGRADE runs BESIDE a relay that is still carrying: the peers
+  // negotiate a direct path without disturbing the one moving bytes, and the
+  // server's `transfer.path_commit direct` is what switches them over. The
+  // field is emitted only for a probe, so an ordinary first negotiation
+  // reads it as absent and takes the path it always took.
+  const upgrade = body.upgrade === true;
   closeDirect(transferId);
   if (typeof globalThis.RTCPeerConnection !== "function") {
     // An engine without WebRTC (or a page that had it removed) says so at
@@ -516,14 +604,32 @@ function startDirectAttempt(body) {
     sendDirectFailed(transferId, attemptId, "unsupported", recipient);
     return;
   }
-  if (recipient && receiver?.beginDirect(transferId, attemptId) !== true) {
+  // The recipient arms its reorder window for exactly this count: with more
+  // than one carrier the arrival order is the order N independent
+  // associations happened to deliver in, and the sequence in each frame's own
+  // header is what puts the stream back together.
+  if (upgrade) {
+    const staged = recipient
+      ? receiver?.prepareUpgrade(transferId, attemptId, carriers)
+      : sender?.transfers().has(transferId);
+    if (staged !== true) {
+      // Nothing to upgrade here — the transfer finished, failed, or is not
+      // on the relay after all. Declining is free: the relay is untouched.
+      sendDirectFailed(transferId, attemptId, "protocol", recipient);
+      return;
+    }
+  } else if (
+    recipient &&
+    receiver?.beginDirect(transferId, attemptId, carriers) !== true
+  ) {
     sendDirectFailed(transferId, attemptId, "protocol", recipient);
     return;
   }
-  const actor = createAttemptRtc({
+  const actor = createCarrierGroup({
     role,
     transferId,
     attemptId,
+    carriers,
     iceServers: body.iceServers,
     sendSignal: (type, signalBody) =>
       session?.send(type, randomRequestId(), signalBody) ?? false,
@@ -534,19 +640,34 @@ function startDirectAttempt(body) {
           transferId,
           attemptId,
           recipient,
+          // The negotiated carrier count, so a gate can assert the number of
+          // peer connections the page opened against what the SERVER asked
+          // for instead of against a constant that the default may outgrow.
+          carriers,
+          upgrade,
           fragmentBytes: info?.fragmentBytes ?? null,
         });
-        if (
-          !recipient &&
-          sender?.attachDirect(transferId, attemptId, actor.sink) !== true
-        ) {
-          void failDirect(transferId, attemptId, "protocol", recipient);
+        const attached = recipient
+          ? true
+          : upgrade
+            ? sender?.attachUpgrade(transferId, attemptId, actor.sink) === true
+            : sender?.attachDirect(transferId, attemptId, actor.sink) === true;
+        if (!attached) {
+          void failDirect(transferId, attemptId, "protocol", recipient, upgrade);
           return;
         }
-        session?.send("transfer.direct_ready", randomRequestId(), {
-          transferId,
-          attemptId,
-        });
+        const readyBody = { transferId, attemptId };
+        if (upgrade && recipient) {
+          // Only the recipient knows what is verified on disk, and by now the
+          // relay has delivered a great deal the server never counted: the
+          // commit is built from THESE ranges, so without them the switch
+          // would resend everything already on disk.
+          const ranges = receiver?.upgradeRanges(transferId, attemptId);
+          if (Array.isArray(ranges) && ranges.length > 0) {
+            readyBody.resumeRanges = ranges;
+          }
+        }
+        session?.send("transfer.direct_ready", randomRequestId(), readyBody);
       },
       onMessage: (data) => {
         if (recipient) {
@@ -554,7 +675,7 @@ function startDirectAttempt(body) {
         }
       },
       onFailed: (reason) => {
-        void failDirect(transferId, attemptId, reason, recipient);
+        void failDirect(transferId, attemptId, reason, recipient, upgrade);
       },
     },
   });
@@ -628,6 +749,15 @@ function makeReceiver() {
         showStagedFile(info.transferId);
         view.announce("Download verificato, pronto da salvare");
         refreshResumable();
+      },
+      onAttemptFailed: (transferId, attemptId, reason) => {
+        // The receive pipeline decided this ATTEMPT cannot be followed — a
+        // carrier that stopped rather than fell behind, or a frame stream
+        // that stopped meaning what the attempt assumes. It is the same
+        // outcome as a channel that died, so it takes the same path: the
+        // direct attempt ends, the verified ranges go to the server and the
+        // transfer continues on the relay. The transfer itself is untouched.
+        void failDirect(transferId, attemptId, reason, true);
       },
       onError: (transferId, code, detail) => {
         if (typeof transferId === "string") {
@@ -908,6 +1038,12 @@ function startSession() {
               hook.inboundMarks.push({
                 type: message.type,
                 reads: (hook.fileReads ?? []).length,
+                // The CODE of a refusal, because "an error arrived" and "the
+                // server refused this exact thing" are different findings and
+                // a gate that cannot tell them apart costs a whole run.
+                ...(message.type === "error"
+                  ? { code: message.body?.code ?? null }
+                  : {}),
               });
             }
             if (
@@ -933,7 +1069,10 @@ function startSession() {
               hook.progressNotices.push(message.body);
             }
             if (message.type === "error" && Array.isArray(hook.controlErrors)) {
-              hook.controlErrors.push(message.body);
+              hook.controlErrors.push({
+                ...message.body,
+                sent: hook.outboundById?.[message.body?.requestId] ?? null,
+              });
             }
           } catch {
             /* recording must never break dispatch */
@@ -1141,6 +1280,9 @@ if (
   if (!Array.isArray(hook.controlErrors)) {
     hook.controlErrors = [];
   }
+  if (hook.outboundById === undefined) {
+    hook.outboundById = {};
+  }
   // 4.2 recorders: the direct attempt's lifecycle and the committed path.
   // Neither ever carries SDP, a candidate or a key.
   if (!Array.isArray(hook.directEvents)) {
@@ -1272,6 +1414,8 @@ try {
     }
   }
 }
+
+installDiagnosticsHook();
 
 if (roomId === null || secrets === null) {
   setConnection(CONNECTION.INCOMPLETE, "Link incompleto");

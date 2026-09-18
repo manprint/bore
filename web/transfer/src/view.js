@@ -177,6 +177,10 @@ export function createView(
   const transferList = el(doc, "div", { id: "transfers" });
   transfersSection.appendChild(transferList);
   transfersZone.appendChild(transfersSection);
+  const diagnosticsSection = el(doc, "section", {
+    id: "diagnostics-section",
+    "aria-label": "Diagnostica percorso",
+  });
 
   const shareSection = el(doc, "section", { "aria-label": "Condivisione" });
   const addFile = el(
@@ -331,6 +335,27 @@ export function createView(
     "Copia link room",
   );
   copyLink.addEventListener("click", () => callbacks.onCopyLink());
+  // The direct-path diagnostic (V003-C3). It sits LAST in the document, so
+  // it is last in the tab order and cannot move a control that was already
+  // on the page; and it copies only on this click — the page never sends it
+  // anywhere, and what it holds is numbers and short enumerations, never an
+  // address, a candidate, an SDP, a file name or a secret.
+  const copyDiagnostics = el(
+    doc,
+    "button",
+    {
+      id: "copy-diagnostics",
+      type: "button",
+      title:
+        "Copia negli appunti la traccia tecnica dell'ultimo percorso diretto: solo tempi, stati e contatori, nessun indirizzo e nessun nome",
+    },
+    "Copia diagnostica percorso",
+  );
+  copyDiagnostics.addEventListener("click", () => {
+    callbacks.onCopyDiagnostics?.();
+  });
+  diagnosticsSection.appendChild(copyDiagnostics);
+  transfersZone.appendChild(diagnosticsSection);
   shareSection.appendChild(addFile);
   shareSection.appendChild(fileInput);
   shareSection.appendChild(addFolder);
@@ -947,9 +972,20 @@ export function createView(
           `${direction} ${peerName(other)} · ${humanBytes(row.totalBytes)} · `,
         );
         nodes.path.setAttribute("data-path", row.path);
-        nodes.path.setAttribute("title", PATH_TITLE.get(row.path) ?? "");
+        // In a relay-only room the relay is not a fallback, it is the
+        // policy: saying so on the badge is the difference between "the
+        // direct path failed here" and "this room never tries it".
+        const relayByPolicy = state.relayOnly === true && row.path === PATH.RELAY;
+        nodes.path.setAttribute(
+          "title",
+          relayByPolicy
+            ? "La stanza è stata aperta con --relay-only: il percorso diretto non viene mai tentato"
+            : (PATH_TITLE.get(row.path) ?? ""),
+        );
         nodes.pathMark.textContent = PATH_MARK.get(row.path) ?? "";
-        nodes.pathWord.textContent = PATH_TEXT.get(row.path) ?? row.path;
+        nodes.pathWord.textContent = relayByPolicy
+          ? "relay (imposto)"
+          : (PATH_TEXT.get(row.path) ?? row.path);
         const percent = transferPercent(row);
         nodes.bar.setAttribute("value", String(percent));
         nodes.bar.setAttribute("aria-valuenow", String(percent));

@@ -25,14 +25,14 @@ This is the only execution-state file — position, progress, ledger, and blocke
 
 ## 1. Current unit
 
-- **Type:** `bug`
-- **ID:** `B-A037`
-- **Status:** `none`
-- **Intent:** CHIUSA. La scadenza di negoziazione da 10 s degradava sul relay un percorso diretto COMMESSO e sano — segnalazione dal campo su una LAN, quattro carrier chiusi a t=10000 ms con `reason: null`, coppie ICE `succeeded` a 10-15 ms, ~124 MB gia' passati, `drain.timeouts: 0`. Deterministico: ogni trasferimento diretto piu' lungo di dieci secondi finiva sul relay. `FallbackCause::{Reported, Deadline}` separa dentro l'unico lock cio' che un peer puo' chiudere da cio' che un orologio puo' chiudere; in piu' ogni chiusura del percorso diretto scrive ora la propria CAUSA nella traccia, che e' l'informazione senza la quale la segnalazione non poteva spiegarsi da sola.
+- **Type:** `release`
+- **ID:** `v1.2.0-rc.3`
+- **Status:** `OPEN`
+- **Intent:** Tagliare la prerelease che porta B-A037 — la scadenza di negoziazione non degrada piu' un percorso diretto commesso — piu' la causa della chiusura nella traccia e la correzione dell'harness B-A038. `dev` e' verde su tutti e cinque i workflow a `0518658`.
 - **Phase:** 7 (`phase_08.md`)
-- **Next action:** tagliare la prerelease `v1.2.0-rc.3` su `dev` (bump di `Cargo.toml`/`Cargo.lock`, tag annotato, CI verde, poi Release). Dopo il rilascio resta APERTA in §9 la rimisura di 7.6 con un braccio piu' lungo della scadenza (`SIZE_MB=512`), che e' l'unico modo di sapere quanto vale davvero il diretto su un trasferimento lungo.
+- **Next action:** committare il bump di `Cargo.toml`/`Cargo.lock`, creare il tag annotato `v1.2.0-rc.3`, spingerlo e seguire il workflow Release (preflight, gate-ci, gate-cross, gate-e2e, poi la pubblicazione).
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | HEAD `0fc363e` = origin/dev | albero con le modifiche di B-A037 non ancora committate
+- **Repo state:** branch `dev` | HEAD `0518658` = origin/dev, CI verde | albero con il solo bump di versione
 
 ## 2. Feature context (self-contained recap)
 
@@ -635,7 +635,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 
 ## 6. In-flight work
 
-`none` — tree consistent.
+`v1.2.0-rc.3` claimed — version bumped in `Cargo.toml`/`Cargo.lock`, not yet committed; tag not yet created.
 
 ## 7. Verification state
 

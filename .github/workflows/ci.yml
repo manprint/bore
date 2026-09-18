@@ -49,7 +49,17 @@ jobs:
       # test threads they intermittently hit "connection reset"/"early eof"
       # from resource contention. Run the rest of the suite normally, then
       # run just those two binaries single-threaded.
-      - run: cargo test --all-features -- --skip t_ssh_ --skip t_dmx_
+      #
+      # `t_web_soak` is skipped here and NOT re-run in this job: it is the
+      # heaviest test in the repository (32 peers, 2048 offers, 740 MiB moved,
+      # 80 s) and it MEASURES a budget coming back, so a runner that starves
+      # its server makes it report a leak that is not there — it failed once
+      # with peer 0 of 32 refused, having been green on the three runs before
+      # it, while the `web-transfer` job ran the SAME binary serially and
+      # passed. That job owns `web_transfer_test` with `--test-threads=1`,
+      # which is where a test that binds real ports belongs; running it here
+      # too only bought a second, contended copy.
+      - run: cargo test --all-features -- --skip t_ssh_ --skip t_dmx_ --skip t_web_soak
       - run: cargo test --all-features --test ssh_gateway_test --test ssh_gateway_spike_test -- --test-threads=1
 
   transfer-paths:

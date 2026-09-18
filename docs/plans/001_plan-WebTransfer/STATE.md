@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-18 17:05 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
+> **Last updated:** 2026-09-18 18:10 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
 
 ## 0. Protocol
 
@@ -198,6 +198,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 114 | bug | B-A036 | agent-1:Claude-Opus-5 | `T-WEB-DIRECT-FALLBACK` pretendeva la `reason` sulle tracce del destinatario, che e' il lato che CHIUDE il canale: firefox non gli consegna un `close`. La ragione ora si legge sull'unione dei due lati e le tracce si stampano | web/transfer/tests/e2e/direct.spec.mjs | quel file 48/48 su tre motori, due ripetizioni | uncommitted |
 | 115 | task | T-A013 | agent-1:Claude-Opus-5 | `ci.yml` accetta un input `workflow_dispatch` `only`: con `web-transfer` gli altri dodici job si skippano, cosi' il job che varia di piu' si prova da solo prima di pagare quindici minuti di matrice | .github/workflows/ci.yml | actionlint pulito; `inputs` e' vuoto su push/PR/schedule, quindi il percorso normale non cambia | uncommitted |
 | 116 | task | T-A014 | agent-1:Claude-Opus-5 | i tre motori passano a un job a matrice, un runner ciascuno: la suite aveva superato il suo runner e produceva un fallimento per giro, un test diverso ogni volta | .github/workflows/ci.yml | actionlint pulito | uncommitted |
+| 117 | task | T-A015 | agent-1:Claude-Opus-5 | `t_web_soak` non gira piu' nel passaggio parallelo di `Build, test & lint`: misura un budget che ritorna e un runner affamato glielo fa leggere come una perdita. Resta dov'e' seriale, nel job `web-transfer` | .github/workflows/ci.yml | actionlint pulito | uncommitted |
 ## 5. Files touched
 
 | Path | What was done | Unit |

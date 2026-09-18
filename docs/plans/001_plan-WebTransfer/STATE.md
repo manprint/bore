@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-18 08:05 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
+> **Last updated:** 2026-09-18 15:35 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
 
 ## 0. Protocol
 
@@ -28,11 +28,11 @@ This is the only execution-state file — position, progress, ledger, and blocke
 - **Type:** `release`
 - **ID:** `v1.2.0-rc.1`
 - **Status:** `none`
-- **Intent:** portare la CI di `dev` al verde con B-A034 e poi tagliare la prerelease.
+- **Intent:** portare al verde tutti i workflow di `dev` e tagliare la prerelease.
 - **Phase:** 7 (`phase_08.md`)
-- **Next action:** commit di B-A034 su `dev`, push, seguire la CI fino al verde; poi creare e pushare il tag `v1.2.0-rc.1` e seguire il workflow Release.
+- **Next action:** push di B-A035, seguire la CI; verificare se il fallimento macOS di `transfer_resume_carries_completed_chunks_across_the_interruption` (timeout del listener sul manifest, nessun legame con il diff: tocca solo il bundle browser e i documenti) si ripete o era una flake del runner; poi tag `v1.2.0-rc.1`.
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | HEAD `8b64870` (locale) / `7dabc7b` (origin/dev) | B-A034 in albero, non committato
+- **Repo state:** branch `dev` | HEAD `f39204e` = origin/dev | B-A035 in albero, non committato
 
 ## 2. Feature context (self-contained recap)
 
@@ -194,6 +194,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 110 | sub-phase | 7.6 | agent-1:Claude-Opus-5 | campagna WAN su due host veri: default dei carrier CONFERMATO a 4 misurandolo (c1 e' meta' di tutto il resto, c2 e c8 hanno perso 2 tentativi su 3), profondita' della coda portata a 512 KiB, e il risultato che conta: su una WAN pulita il RELAY e' il doppio del diretto e non ha mai fallito | docs/transfer/WEB_TRANSFER_PERF.md, README.md, scripts/perf/web_transfer_wan.sh, web/transfer/tests/perf/wan-source.mjs | `T-WEB-PERF-WAN`: 12 ripetizioni relay 43,1-46,3 MiB/s contro 10,8-33,9 del diretto | e57fcf4 |
 | 111 | sub-phase | 7.7 | agent-1:Claude-Opus-5 | coerenza del frontend e documentazione: README sul percorso misurato e sui carrier, `STALE_ATTEMPT` etichettato, e il gate browser `T-WEB-RELAY-ONLY` che prova la specifica dell'utente — una room `--relay-only` non fa costruire NESSUNA `RTCPeerConnection` a una coppia di browser pienamente capaci | examples/web_transfer_e2e_owner.rs, web/transfer/tests/e2e/helpers.mjs, web/transfer/tests/e2e/direct.spec.mjs, README.md | `T-WEB-RELAY-ONLY` red-checked (senza la policy `counters.rtc` legge 4) + e2e 157/0 | e57fcf4 |
 | 112 | bug | B-A034 | agent-1:Claude-Opus-5 | la CI su `dev` cancellava 12 test unit del frontend (`Promise resolution is still pending but the event loop has already resolved`) che in locale passano: la CI gira Node 20 e la workstation Node 24, e `unref()` su una scadenza che un test ASPETTA fa dichiarare risolto il loop al runner di Node 20. `unref` resta solo dove nessuno osserva lo scatto | web/transfer/src/webrtc.js, web/transfer/src/receiver.js, web/transfer/dist/app.js | `node:20-slim` PRIMA 176/12 cancelled (identico alla CI) DOPO 202/0/0; Node 24 202/0/0; `cargo test --all-features web_transfer` 178/0; e2e browser 157/0 | uncommitted |
+| 113 | bug | B-A035 | agent-1:Claude-Opus-5 | il gate e2e nuovo `a host-only negotiation delivers the peer's end-of-candidates marker` pretendeva `direct` su webkit in CI: resta duro il marker (che e' cio' che il test misura), il percorso diventa una registrazione con le prove che lo spiegano | web/transfer/tests/e2e/direct.spec.mjs | quel test 3/3 su chromium+firefox+webkit, con la riga di prova stampata | uncommitted |
 ## 5. Files touched
 
 | Path | What was done | Unit |
@@ -614,6 +615,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | web/transfer/src/webrtc.js | `unref()` tolto dalla scadenza di drain e dalla grazia di disconnessione, tenuto sul poller delle stats, con la regola scritta accanto a ciascuno | B-A034 |
 | web/transfer/src/receiver.js | `unref()` tolto dal backoff del retry di `complete`, tenuto su `idleTimer` e `requestTimer` con la ragione accanto | B-A034 |
 | web/transfer/dist/app.js | bundle ricostruito | B-A034 |
+| web/transfer/tests/e2e/direct.spec.mjs | il gate host-only registra il percorso con le prove invece di pretenderlo | B-A035 |
 
 ## 6. In-flight work
 

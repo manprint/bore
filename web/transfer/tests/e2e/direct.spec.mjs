@@ -650,9 +650,18 @@ test.describe.serial("direct", () => {
       );
       await expect(b.page.locator("#save-file")).toBeVisible({ timeout: 60_000 });
 
+      // What this test OWNS is the marker; whether a host-only pair actually
+      // forms is not something the marker decides (B-A035). A browser that
+      // hides its host candidates behind mDNS `.local` names cannot pair on a
+      // host with no responder — a property of the runner, not of the fix
+      // under test — and the transfer then finishes on the relay, which is the
+      // product working. So the marker is HARD and the path is recorded with
+      // the evidence that explains it, the same lesson B-A012 learned one test
+      // over: a preference asserted as a guarantee reports the environment.
+      const observed = [];
       for (const peer of [a, b]) {
+        const side = peer === a ? "source" : "recipient";
         const commits = await peer.page.evaluate(() => [...window.__BORE_TEST__.pathCommits]);
-        expect(commits.map((c) => c.path)).toEqual(commits.map(() => "direct"));
         // The marker was APPLIED, on both sides. The trace is the only
         // observer of it: `addIceCandidate(null)` has no return value and no
         // event, so what is gated is the call the actor makes.
@@ -662,13 +671,27 @@ test.describe.serial("direct", () => {
         const traces = [...diag.finished, ...diag.live];
         expect(
           traces.some((trace) => trace.events.some((e) => e.ev === "remote-candidates-done")),
-          "the peer's end-of-candidates marker reached the ICE agent",
+          `${side}: the peer's end-of-candidates marker reached the ICE agent`,
         ).toBe(true);
         // Host-only really means host-only: no reflexive candidate exists to
         // hide a missing marker behind.
         const gathered = traces.flatMap((trace) => Object.keys(trace.candidates.local));
         expect(gathered).not.toContain("srflx");
+        // A commit is only ever made on a transport a verified chunk proved,
+        // so anything outside these two would be a real defect.
+        for (const commit of commits) {
+          expect(["direct", "relay"]).toContain(commit.path);
+        }
+        observed.push({
+          side,
+          paths: commits.map((c) => c.path),
+          candidates: [...new Set(gathered)],
+          reasons: traces.map((trace) => trace.reason).filter((reason) => reason !== null),
+        });
       }
+      // Printed either way: on the run where the pair does NOT form this is
+      // the whole diagnosis, and it costs nothing on the run where it does.
+      console.log(`[host-only EOC] ${JSON.stringify(observed)}`);
 
       const download = await Promise.all([
         b.page.waitForEvent("download", { timeout: 60_000 }),

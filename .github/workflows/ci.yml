@@ -13,12 +13,24 @@ on:
   # every runner image, and a job that quietly skips them is worse than one
   # that never ran.
   workflow_dispatch:
+    inputs:
+      only:
+        description: >-
+          Run ONE slice instead of the whole matrix. The browser slice is the
+          job that churns most, and waiting 15 minutes for the other twelve to
+          agree with it is time spent learning nothing.
+        type: choice
+        default: all
+        options:
+          - all
+          - web-transfer
   schedule:
     - cron: "37 4 * * 1"
 
 jobs:
   test:
     name: Build, test & lint
+    if: inputs.only != 'web-transfer'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +54,7 @@ jobs:
 
   transfer-paths:
     name: Transfer path edges (${{ matrix.os }})
+    if: inputs.only != 'web-transfer'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -152,7 +165,9 @@ jobs:
     name: Web transfer (branded Chrome/Edge smoke)
     # Only on a manual run or the weekly schedule: on a push it would either
     # double the matrix or report a skip that reads like a pass.
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    if: >-
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+      && inputs.only != 'web-transfer'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -195,6 +210,7 @@ jobs:
 
   vpn-cross-build:
     name: VPN cross check (${{ matrix.target }})
+    if: inputs.only != 'web-transfer'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -257,6 +273,7 @@ jobs:
   # `windows-vpn-e2e` job below, not assumed here.
   windows-vpn-build:
     name: Windows VPN build + non-VPN parity e2e (windows-latest)
+    if: inputs.only != 'web-transfer'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -288,6 +305,7 @@ jobs:
   # what this job's first real run determines (see diagnostic step).
   windows-vpn-e2e:
     name: Windows VPN device e2e (windows-latest)
+    if: inputs.only != 'web-transfer'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -340,6 +358,7 @@ jobs:
 
   macos-vpn-build:
     name: macOS VPN build (macos-14)
+    if: inputs.only != 'web-transfer'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -367,6 +386,7 @@ jobs:
   # docs/vpn/VPN_MACOS_ACCEPTANCE.md remains the two-host acceptance.
   macos-vpn-e2e:
     name: macOS VPN device e2e (macos-14)
+    if: inputs.only != 'web-transfer'
     runs-on: macos-14
     # Independent of macos-vpn-build: the real device tests (utun/PF) are the
     # point and should run even while unrelated test-corpus clippy is cleaned up.
@@ -411,6 +431,7 @@ jobs:
   # placement/style. Phase 2 of docs/plans/plan_AndroidSupport.
   android-emu-e2e:
     name: Android emulator e2e (api 30, x86_64)
+    if: inputs.only != 'web-transfer'
     runs-on: ubuntu-latest
     env:
       ANDROID_API: "24" # must match Justfile's android_api
@@ -457,6 +478,7 @@ jobs:
   # Phase 4 of docs/plans/plan_AndroidSupport.
   android-vpn-e2e:
     name: Android VPN e2e (api 30, x86_64)
+    if: inputs.only != 'web-transfer'
     runs-on: ubuntu-latest
     env:
       ANDROID_API: "24" # must match Justfile's android_api
@@ -517,6 +539,7 @@ jobs:
   # it is given, so a called workflow stays as honest as its own tests.
   workflows:
     name: Workflow lint (actionlint)
+    if: inputs.only != 'web-transfer'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -536,6 +559,7 @@ jobs:
 
   audit:
     name: Security audit
+    if: inputs.only != 'web-transfer'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

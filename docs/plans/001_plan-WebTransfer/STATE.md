@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-18 15:35 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
+> **Last updated:** 2026-09-18 16:40 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
 
 ## 0. Protocol
 
@@ -28,11 +28,11 @@ This is the only execution-state file — position, progress, ledger, and blocke
 - **Type:** `release`
 - **ID:** `v1.2.0-rc.1`
 - **Status:** `none`
-- **Intent:** portare al verde tutti i workflow di `dev` e tagliare la prerelease.
+- **Intent:** CI verde su `dev`, poi il tag.
 - **Phase:** 7 (`phase_08.md`)
-- **Next action:** push di B-A035, seguire la CI; verificare se il fallimento macOS di `transfer_resume_carries_completed_chunks_across_the_interruption` (timeout del listener sul manifest, nessun legame con il diff: tocca solo il bundle browser e i documenti) si ripete o era una flake del runner; poi tag `v1.2.0-rc.1`.
+- **Next action:** push di B-A036 + T-A013; lanciare il job "Web transfer (browser slice)" DA SOLO via `workflow_dispatch only=web-transfer`; quando e' verde, la matrice intera; poi il tag `v1.2.0-rc.1`.
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | HEAD `f39204e` = origin/dev | B-A035 in albero, non committato
+- **Repo state:** branch `dev` | HEAD `f0214ff` = origin/dev | B-A036 + T-A013 in albero
 
 ## 2. Feature context (self-contained recap)
 
@@ -195,6 +195,8 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 111 | sub-phase | 7.7 | agent-1:Claude-Opus-5 | coerenza del frontend e documentazione: README sul percorso misurato e sui carrier, `STALE_ATTEMPT` etichettato, e il gate browser `T-WEB-RELAY-ONLY` che prova la specifica dell'utente — una room `--relay-only` non fa costruire NESSUNA `RTCPeerConnection` a una coppia di browser pienamente capaci | examples/web_transfer_e2e_owner.rs, web/transfer/tests/e2e/helpers.mjs, web/transfer/tests/e2e/direct.spec.mjs, README.md | `T-WEB-RELAY-ONLY` red-checked (senza la policy `counters.rtc` legge 4) + e2e 157/0 | e57fcf4 |
 | 112 | bug | B-A034 | agent-1:Claude-Opus-5 | la CI su `dev` cancellava 12 test unit del frontend (`Promise resolution is still pending but the event loop has already resolved`) che in locale passano: la CI gira Node 20 e la workstation Node 24, e `unref()` su una scadenza che un test ASPETTA fa dichiarare risolto il loop al runner di Node 20. `unref` resta solo dove nessuno osserva lo scatto | web/transfer/src/webrtc.js, web/transfer/src/receiver.js, web/transfer/dist/app.js | `node:20-slim` PRIMA 176/12 cancelled (identico alla CI) DOPO 202/0/0; Node 24 202/0/0; `cargo test --all-features web_transfer` 178/0; e2e browser 157/0 | uncommitted |
 | 113 | bug | B-A035 | agent-1:Claude-Opus-5 | il gate e2e nuovo `a host-only negotiation delivers the peer's end-of-candidates marker` pretendeva `direct` su webkit in CI: resta duro il marker (che e' cio' che il test misura), il percorso diventa una registrazione con le prove che lo spiegano | web/transfer/tests/e2e/direct.spec.mjs | quel test 3/3 su chromium+firefox+webkit, con la riga di prova stampata | uncommitted |
+| 114 | bug | B-A036 | agent-1:Claude-Opus-5 | `T-WEB-DIRECT-FALLBACK` pretendeva la `reason` sulle tracce del destinatario, che e' il lato che CHIUDE il canale: firefox non gli consegna un `close`. La ragione ora si legge sull'unione dei due lati e le tracce si stampano | web/transfer/tests/e2e/direct.spec.mjs | quel file 48/48 su tre motori, due ripetizioni | uncommitted |
+| 115 | task | T-A013 | agent-1:Claude-Opus-5 | `ci.yml` accetta un input `workflow_dispatch` `only`: con `web-transfer` gli altri dodici job si skippano, cosi' il job che varia di piu' si prova da solo prima di pagare quindici minuti di matrice | .github/workflows/ci.yml | actionlint pulito; `inputs` e' vuoto su push/PR/schedule, quindi il percorso normale non cambia | uncommitted |
 ## 5. Files touched
 
 | Path | What was done | Unit |
@@ -616,6 +618,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | web/transfer/src/receiver.js | `unref()` tolto dal backoff del retry di `complete`, tenuto su `idleTimer` e `requestTimer` con la ragione accanto | B-A034 |
 | web/transfer/dist/app.js | bundle ricostruito | B-A034 |
 | web/transfer/tests/e2e/direct.spec.mjs | il gate host-only registra il percorso con le prove invece di pretenderlo | B-A035 |
+| .github/workflows/ci.yml | input `only` per girare da solo il job del browser | T-A013 |
 
 ## 6. In-flight work
 

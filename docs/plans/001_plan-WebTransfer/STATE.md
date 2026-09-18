@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-18 19:05 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
+> **Last updated:** 2026-09-18 19:30 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
 
 ## 0. Protocol
 
@@ -26,13 +26,13 @@ This is the only execution-state file — position, progress, ledger, and blocke
 ## 1. Current unit
 
 - **Type:** `release`
-- **ID:** `v1.2.0-rc.2` (da decidere)
-- **Status:** `none`
-- **Intent:** `dev` e' VERDE su tutti e cinque i workflow a `0a108a7` (CI, Mean Bean CI, Mean Bean Deploy, Docker GHCR, E2E netns). Il tag `v1.2.0-rc.1` esiste GIA', pubblicato e verde dal 2026-09-16, ma punta ad `a31b97d`: contiene `bore transfer web` e NON contiene la campagna a due host ne' le sei correzioni che ha prodotto (`e57fcf4`, B-A028..B-A033) ne' B-A034..B-A036 e l'igiene di CI. Muovere un tag pubblicato riscriverebbe cio' che qualcuno ha gia' scaricato, quindi la scelta e' fra tagliare `v1.2.0-rc.2` e fermarsi qui.
+- **ID:** `v1.2.0-rc.2`
+- **Status:** `OPEN`
+- **Intent:** `v1.2.0-rc.1` resta dov'e', pubblicato e intatto: muovere un tag gia' scaricato darebbe artefatti diversi sotto lo stesso nome. La rc.2 porta le dieci commit successive — la campagna a due host e le sei correzioni di prodotto che ha prodotto (`e57fcf4`), B-A034..B-A036 e l'igiene di CI che ha reso il job del browser leggibile.
 - **Phase:** 7 (`phase_08.md`)
-- **Next action:** attendere la decisione dell'utente sulla rc.2; a valle, tag + workflow Release fino al verde.
+- **Next action:** commit del bump `1.2.0-rc.2`, tag annotato, push, poi il workflow Release fino al verde (preflight, gate-ci, gate-cross, gate-e2e, publish).
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | HEAD `0a108a7` = origin/dev | albero pulito, tutto committato
+- **Repo state:** branch `dev` | HEAD `49453f4` | bump di versione in albero
 
 ## 2. Feature context (self-contained recap)
 
@@ -624,7 +624,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 
 ## 6. In-flight work
 
-`none — tree consistent`.
+`claimed — bump di versione scritto, tag non ancora creato` (v1.2.0-rc.2).
 
 ## 7. Verification state
 

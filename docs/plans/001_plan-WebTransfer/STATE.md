@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-18 18:10 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
+> **Last updated:** 2026-09-18 19:05 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 12
 
 ## 0. Protocol
 
@@ -26,13 +26,13 @@ This is the only execution-state file — position, progress, ledger, and blocke
 ## 1. Current unit
 
 - **Type:** `release`
-- **ID:** `v1.2.0-rc.1`
+- **ID:** `v1.2.0-rc.2` (da decidere)
 - **Status:** `none`
-- **Intent:** CI verde su `dev`, poi il tag.
+- **Intent:** `dev` e' VERDE su tutti e cinque i workflow a `0a108a7` (CI, Mean Bean CI, Mean Bean Deploy, Docker GHCR, E2E netns). Il tag `v1.2.0-rc.1` esiste GIA', pubblicato e verde dal 2026-09-16, ma punta ad `a31b97d`: contiene `bore transfer web` e NON contiene la campagna a due host ne' le sei correzioni che ha prodotto (`e57fcf4`, B-A028..B-A033) ne' B-A034..B-A036 e l'igiene di CI. Muovere un tag pubblicato riscriverebbe cio' che qualcuno ha gia' scaricato, quindi la scelta e' fra tagliare `v1.2.0-rc.2` e fermarsi qui.
 - **Phase:** 7 (`phase_08.md`)
-- **Next action:** push di T-A014; seguire i tre job `web-transfer e2e (<motore>)`; quando sono verdi, il tag `v1.2.0-rc.1`.
+- **Next action:** attendere la decisione dell'utente sulla rc.2; a valle, tag + workflow Release fino al verde.
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | HEAD `20edc4d` = origin/dev | T-A014 in albero
+- **Repo state:** branch `dev` | HEAD `0a108a7` = origin/dev | albero pulito, tutto committato
 
 ## 2. Feature context (self-contained recap)
 

@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-19 07:20 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 13
+> **Last updated:** 2026-09-19 08:05 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 13
 
 ## 0. Protocol
 
@@ -32,7 +32,7 @@ This is the only execution-state file — position, progress, ledger, and blocke
 - **Phase:** 7 (`phase_08.md`)
 - **Next action:** nulla in volo. Il prossimo gesto è operativo e non di piano: pubblicare la prerelease successiva da `dev` una volta che la CI del push è verde.
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | tag `v1.2.0-rc.3` pubblicato su `2e8da87` | B-A041 e T-A017 in `347a743`; B-A042, B-A043 e T-A018 chiusi in `ba281af`
+- **Repo state:** branch `dev` | tag `v1.2.0-rc.4` | B-A041 e T-A017 in `347a743`; B-A042, B-A043 e T-A018 in `ba281af`; `dev` verde su tutti e cinque i workflow a `1e41fe8`
 
 ## 2. Feature context (self-contained recap)
 

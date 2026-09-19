@@ -1626,7 +1626,12 @@ impl Proxy {
                                 // purpose: capability, once declared by a server,
                                 // is a property of that server for the life of
                                 // the control connection.
-                                path_report = path_report || accepts_report;
+                                #[cfg(feature = "udp")]
+                                {
+                                    path_report = path_report || accepts_report;
+                                }
+                                #[cfg(not(feature = "udp"))]
+                                let _ = accepts_report;
                                 if let Some(v2) = &v2 {
                                     debug!(
                                         generation = v2.generation,

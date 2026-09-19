@@ -24,6 +24,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(feature = "udp"))]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
@@ -624,6 +626,7 @@ pub fn direct_gso() -> bool {
 
 /// Read a positive byte count from the environment. Mirrors [`env_ms`]: a zero
 /// or unparseable value is "unset", never a silently applied zero.
+#[cfg(feature = "udp")]
 fn env_bytes(name: &str) -> Option<u64> {
     std::env::var(name)
         .ok()?

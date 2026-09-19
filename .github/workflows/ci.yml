@@ -62,6 +62,41 @@ jobs:
       - run: cargo test --all-features -- --skip t_ssh_ --skip t_dmx_ --skip t_web_soak
       - run: cargo test --all-features --test ssh_gateway_test --test ssh_gateway_spike_test -- --test-threads=1
 
+  transfer-link:
+    name: Transfer link (Rust + HTTPS smoke)
+    if: inputs.only != 'web-transfer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Transfer-link integration tests (QUIC and no-UDP builds)
+        run: |
+          cargo test --all-features --test transfer_link_test -- --test-threads=1
+          cargo test --no-default-features --test transfer_link_test -- --test-threads=1
+
+      - name: Transfer-link HTTPS client smoke
+        run: bash scripts/transfer_link_e2e.sh basic
+
+  transfer-link-docker:
+    name: Transfer link (Docker client)
+    if: inputs.only != 'web-transfer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Docker transfer-link acceptance
+        run: bash scripts/transfer_link_container_test.sh
+
   transfer-paths:
     name: Transfer path edges (${{ matrix.os }})
     if: inputs.only != 'web-transfer'

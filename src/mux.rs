@@ -310,12 +310,39 @@ pub fn client<S: Transport>(socket: S) -> (Opener, Acceptor) {
     spawn_driver(Connection::new(socket.compat(), config(), Mode::Client))
 }
 
+/// Start a client connection whose yamux driver belongs to a transfer-link
+/// lifecycle scope. The scope is supplied before the driver is spawned, so
+/// shutdown can cancel and join the driver just like data-plane child tasks.
+pub(crate) fn client_scoped<S: Transport>(
+    socket: S,
+    scope: Arc<crate::client::ClientScope>,
+) -> (Opener, Acceptor) {
+    spawn_driver_scoped(
+        Connection::new(socket.compat(), config(), Mode::Client),
+        scope,
+    )
+}
+
 /// Start multiplexing as the connection responder (listener).
 pub fn server<S: Transport>(socket: S) -> (Opener, Acceptor) {
     spawn_driver(Connection::new(socket.compat(), config(), Mode::Server))
 }
 
 fn spawn_driver<S: Transport>(conn: Connection<Compat<S>>) -> (Opener, Acceptor) {
+    spawn_driver_inner(conn, None)
+}
+
+fn spawn_driver_scoped<S: Transport>(
+    conn: Connection<Compat<S>>,
+    scope: Arc<crate::client::ClientScope>,
+) -> (Opener, Acceptor) {
+    spawn_driver_inner(conn, Some(scope))
+}
+
+fn spawn_driver_inner<S: Transport>(
+    conn: Connection<Compat<S>>,
+    scope: Option<Arc<crate::client::ClientScope>>,
+) -> (Opener, Acceptor) {
     let (open_tx, open_rx) = mpsc::channel(32);
     let (inbound_tx, inbound_rx) = mpsc::channel(32);
     let liveness: Arc<Liveness> = Arc::default();
@@ -329,7 +356,28 @@ fn spawn_driver<S: Transport>(conn: Connection<Compat<S>>) -> (Opener, Acceptor)
         inbound: inbound_rx,
         _alive: ConnRef::new(&liveness),
     };
-    tokio::spawn(drive(conn, open_rx, inbound_tx, liveness));
+    let scope_for_spawn = scope.clone();
+    let task = async move {
+        if let Some(scope) = scope {
+            let cancel = scope.token();
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = drive(conn, open_rx, inbound_tx, liveness) => {}
+            }
+        } else {
+            drive(conn, open_rx, inbound_tx, liveness).await;
+        }
+    };
+    // A scoped connection is always registered before the task is started. The
+    // legacy branch preserves the detached driver behavior byte-for-byte.
+    match scope_for_spawn {
+        Some(scope) => {
+            let _ = scope.spawn(task);
+        }
+        None => {
+            tokio::spawn(task);
+        }
+    }
     (opener, acceptor)
 }
 

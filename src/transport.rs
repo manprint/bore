@@ -33,6 +33,28 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use crate::client::connect_with_timeout;
 use crate::shared::{CONTROL_PORT, NETWORK_TIMEOUT};
 
+/// Failure category for a control connection attempt.  Link supervision uses
+/// this typed marker instead of inspecting error strings, so a certificate
+/// failure cannot accidentally enter an infinite reconnect loop.
+#[derive(Debug)]
+pub(crate) enum ConnectFailure {
+    /// The TCP connection could not be established or was interrupted.
+    Transport,
+    /// TLS name verification, certificate parsing or handshake failed.
+    Tls,
+}
+
+impl std::fmt::Display for ConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport => f.write_str("control transport failure"),
+            Self::Tls => f.write_str("control TLS verification failure"),
+        }
+    }
+}
+
+impl std::error::Error for ConnectFailure {}
+
 /// A control connection: either plain TCP or a TLS stream over TCP.
 pub enum ControlStream {
     /// Plain TCP.
@@ -110,6 +132,14 @@ pub struct Endpoint {
     pub tls: bool,
 }
 
+/// A fully constructed client TLS configuration owned by one scoped client.
+///
+/// Link sessions use this type to add a private CA while retaining rustls'
+/// normal hostname verification.  Keeping the `Arc<ClientConfig>` behind a
+/// crate-visible alias makes it possible for every carrier/redial dial to use
+/// the exact same trust policy without introducing global mutable state.
+pub(crate) type ClientTlsConfig = Arc<ClientConfig>;
+
 impl Endpoint {
     /// Parse a `--to` value, honouring an optional `http://` / `https://` scheme.
     pub fn parse(to: &str) -> Self {
@@ -143,18 +173,40 @@ impl Endpoint {
 /// `insecure` only applies to TLS endpoints: when set, the server certificate is
 /// not verified (useful for self-signed certificates on a private deployment).
 pub async fn connect(endpoint: &Endpoint, insecure: bool) -> Result<ControlStream> {
-    let tcp = connect_with_timeout(&endpoint.host, endpoint.port).await?;
+    connect_with_config(endpoint, insecure, None).await
+}
+
+/// Open a control connection, optionally using a caller-owned TLS config.
+///
+/// `tls_config` is consulted only for TLS endpoints.  A supplied config is
+/// always a verified config; `insecure` is retained for legacy callers and is
+/// ignored when a scoped config is present.
+pub(crate) async fn connect_with_config(
+    endpoint: &Endpoint,
+    insecure: bool,
+    tls_config: Option<ClientTlsConfig>,
+) -> Result<ControlStream> {
+    let tcp = connect_with_timeout(&endpoint.host, endpoint.port)
+        .await
+        .map_err(|error| anyhow::Error::new(ConnectFailure::Transport).context(error))?;
     if !endpoint.tls {
         return Ok(ControlStream::Plain(tcp));
     }
 
-    let connector = TlsConnector::from(Arc::new(client_config(insecure)?));
+    let config = tls_config
+        .map(Ok)
+        .unwrap_or_else(|| client_config(insecure).map(Arc::new))
+        .map_err(|error| anyhow::Error::new(ConnectFailure::Tls).context(error))?;
+    let connector = TlsConnector::from(config);
     let server_name = ServerName::try_from(endpoint.host.clone())
-        .with_context(|| format!("invalid TLS server name: {}", endpoint.host))?;
+        .with_context(|| format!("invalid TLS server name: {}", endpoint.host))
+        .map_err(|error| anyhow::Error::new(ConnectFailure::Tls).context(error))?;
     let tls = timeout(NETWORK_TIMEOUT, connector.connect(server_name, tcp))
         .await
-        .context("timed out during TLS handshake")?
-        .context("TLS handshake failed")?;
+        .context("timed out during TLS handshake")
+        .map_err(|error| anyhow::Error::new(ConnectFailure::Tls).context(error))?
+        .context("TLS handshake failed")
+        .map_err(|error| anyhow::Error::new(ConnectFailure::Tls).context(error))?;
     Ok(ControlStream::Tls(Box::new(tls)))
 }
 
@@ -168,8 +220,7 @@ fn client_config(insecure: bool) -> Result<ClientConfig> {
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
             .with_no_client_auth()
     } else {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let roots = default_root_store(None)?;
         builder.with_root_certificates(roots).with_no_client_auth()
     };
     // Offer `bore` via ALPN so a server demuxing SSH on the control port
@@ -180,6 +231,39 @@ fn client_config(insecure: bool) -> Result<ClientConfig> {
     // bore server, old and new) ignores the offer entirely.
     config.alpn_protocols = vec![b"bore".to_vec()];
     Ok(config)
+}
+
+/// Build a verified client configuration with optional additional PEM roots.
+///
+/// The system/webpki roots remain present.  Extra roots are additive and do
+/// not disable hostname verification.  An explicitly supplied empty or
+/// malformed PEM is rejected before any network dial.
+pub(crate) fn client_config_with_extra_roots(ca_pem: Option<&[u8]>) -> Result<ClientTlsConfig> {
+    let builder = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .context("failed to configure TLS protocol versions")?;
+    let roots = default_root_store(ca_pem)?;
+    let mut config = builder.with_root_certificates(roots).with_no_client_auth();
+    config.alpn_protocols = vec![b"bore".to_vec()];
+    Ok(Arc::new(config))
+}
+
+fn default_root_store(ca_pem: Option<&[u8]>) -> Result<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(pem) = ca_pem {
+        anyhow::ensure!(!pem.is_empty(), "CA certificate file is empty");
+        let mut found = false;
+        for certificate in CertificateDer::pem_slice_iter(pem) {
+            let certificate = certificate.context("failed to parse CA certificate PEM")?;
+            roots
+                .add(certificate)
+                .context("failed to add CA certificate to trust store")?;
+            found = true;
+        }
+        anyhow::ensure!(found, "CA certificate PEM contains no certificates");
+    }
+    Ok(roots)
 }
 
 /// Build a `TlsConnector` for connecting to a vhost provider's local HTTPS
@@ -294,6 +378,13 @@ mod tests {
         assert_eq!(endpoint.host, "bore.tld");
         assert_eq!(endpoint.port, 1000);
         assert!(!endpoint.tls);
+    }
+
+    #[test]
+    fn extra_root_loader_rejects_empty_or_non_pem_input() {
+        assert!(client_config_with_extra_roots(Some(&[])).is_err());
+        assert!(client_config_with_extra_roots(Some(b"not-a-certificate")).is_err());
+        assert!(client_config_with_extra_roots(None).is_ok());
     }
 
     #[test]

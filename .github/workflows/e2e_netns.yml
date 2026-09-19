@@ -80,6 +80,12 @@ jobs:
           - { script: vhost_netns_test,          secs: 1200, gate: true }
           - { script: vhost_netns_test_hard,     secs: 1200, gate: true }
           - { script: ssh_gateway_test,          secs: 1200, gate: true }
+          # Transfer-link root gate: verifies --exec under sudo/tar metadata,
+          # producer failure and process-group cancellation through the real
+          # release binary. It does not need a network namespace, but keeping
+          # it in this privileged workflow gives it the same root-capability
+          # and artifact provenance as the other acceptance scripts.
+          - { script: transfer_link_privileged_test, secs: 900, gate: true }
           # regression gate for the carriers=1 vhost/local --udp connection-window
           # stall (R3: a fast request must complete <3 s while slow readers pin
           # the shared QUIC connection window). Guards commit 04aac76.

@@ -1,12 +1,14 @@
 //! Client implementation for the `bore` service.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::{net::TcpStream, time::timeout};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::trace;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
@@ -20,7 +22,6 @@ use crate::shared::{
 use crate::transport::{self, Endpoint};
 use crate::weblog::{AccessLogger, PathLayout};
 
-#[cfg(feature = "udp")]
 use std::net::SocketAddr;
 use std::time::Duration;
 #[cfg(feature = "udp")]
@@ -55,6 +56,172 @@ pub struct ProviderMeta {
     /// SNI/hostname sent to the TLS backend (`--backend-tls-sni`). `None` =
     /// `localhost`. Only meaningful with `backend_tls`.
     pub backend_tls_sni: Option<String>,
+}
+
+/// URLs announced by the server for a vhost registration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VhostUrls {
+    /// Public HTTP URL, when the server exposes one.
+    pub http_url: Option<String>,
+    /// Public HTTPS URL, when the server exposes one.
+    pub https_url: Option<String>,
+}
+
+/// Typed outcome for a vhost registration attempt.  The Link supervisor uses
+/// these markers for retry policy and never parses the server's free-form
+/// `ServerMessage::Error` text.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum VhostAttemptError {
+    /// Authentication was rejected or required credentials were absent.
+    Authentication,
+    /// The server rejected this registration before it became ready.
+    RegistrationRejected,
+    /// The peer sent an unexpected response or closed during the handshake.
+    Protocol,
+}
+
+impl std::fmt::Display for VhostAttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Authentication => f.write_str("vhost authentication failed"),
+            Self::RegistrationRejected => f.write_str("vhost registration rejected"),
+            Self::Protocol => f.write_str("vhost registration protocol error"),
+        }
+    }
+}
+
+impl std::error::Error for VhostAttemptError {}
+
+/// The transport used between the public server and this client for one
+/// forwarded backend connection.
+#[cfg_attr(not(feature = "udp"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackendPath {
+    /// The normal yamux/TCP relay.
+    RelayTcp,
+    /// A native QUIC direct connection.
+    DirectQuic,
+}
+
+/// A synchronous callback invoked after the local backend socket is connected.
+/// The returned value is kept alive until the corresponding splice ends. This
+/// gives the transfer-link owner an RAII cleanup point without putting any
+/// transfer-specific state on the normal vhost path.
+pub(crate) type BackendPathHook =
+    Arc<dyn Fn(SocketAddr, BackendPath) -> Option<Box<dyn Send + Sync>> + Send + Sync>;
+
+/// Per-registration ownership for a transfer-link client.
+///
+/// The tracker only observes task lifetime. Cancellation is explicit and the
+/// `closing` gate closes the race between a task registering and shutdown
+/// beginning, so no task can escape the bounded drain.
+pub(crate) struct ClientScope {
+    cancel: CancellationToken,
+    tracker: TaskTracker,
+    closing: AtomicBool,
+    /// Serializes the closing transition with task registration. The atomic
+    /// flag is the fast read, while this mutex closes the check/register versus
+    /// close/wait race: shutdown cannot observe an empty tracker and then have
+    /// a task registered behind its back.
+    registration: Mutex<()>,
+    aborts: Mutex<Vec<tokio::task::AbortHandle>>,
+    backend_path_hook: Option<BackendPathHook>,
+    transport_config: Option<transport::ClientTlsConfig>,
+}
+
+#[allow(dead_code)]
+impl ClientScope {
+    /// Create a scope before constructing the client/mux resources it owns.
+    pub(crate) fn new(backend_path_hook: Option<BackendPathHook>) -> Arc<Self> {
+        Self::new_with_transport(backend_path_hook, None)
+    }
+
+    /// Create a scope with an optional verified TLS configuration shared by
+    /// the control connection and every carrier/redial connection.
+    pub(crate) fn new_with_transport(
+        backend_path_hook: Option<BackendPathHook>,
+        transport_config: Option<transport::ClientTlsConfig>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            cancel: CancellationToken::new(),
+            tracker: TaskTracker::new(),
+            closing: AtomicBool::new(false),
+            registration: Mutex::new(()),
+            aborts: Mutex::new(Vec::new()),
+            backend_path_hook,
+            transport_config,
+        })
+    }
+
+    pub(crate) fn token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    pub(crate) fn backend_path_hook(&self) -> Option<BackendPathHook> {
+        self.backend_path_hook.clone()
+    }
+
+    pub(crate) fn transport_config(&self) -> Option<transport::ClientTlsConfig> {
+        self.transport_config.clone()
+    }
+
+    /// Spawn and register one owned task. `None` means shutdown won the race.
+    pub(crate) fn spawn<F, T>(&self, task: F) -> Option<tokio::task::JoinHandle<T>>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let _registration = self
+            .registration
+            .lock()
+            .expect("client scope registration mutex poisoned");
+        if self.closing.load(Ordering::Acquire) {
+            return None;
+        }
+        let handle = self.tracker.spawn(task);
+        let abort = handle.abort_handle();
+        self.aborts
+            .lock()
+            .expect("client scope abort list poisoned")
+            .push(abort.clone());
+        Some(handle)
+    }
+
+    fn begin_shutdown(&self) {
+        let _registration = self
+            .registration
+            .lock()
+            .expect("client scope registration mutex poisoned");
+        if !self.closing.swap(true, Ordering::AcqRel) {
+            self.cancel.cancel();
+            self.tracker.close();
+        }
+    }
+
+    /// Cancel this scope, wait for cooperative tasks, then abort only its own
+    /// remaining tasks if they ignored cancellation.
+    pub(crate) async fn shutdown(&self) {
+        self.begin_shutdown();
+        if timeout(Duration::from_secs(5), self.tracker.wait())
+            .await
+            .is_err()
+        {
+            let aborts = self
+                .aborts
+                .lock()
+                .expect("client scope abort list poisoned")
+                .clone();
+            for abort in aborts {
+                abort.abort();
+            }
+            let _ = timeout(Duration::from_secs(5), self.tracker.wait()).await;
+        }
+    }
+
+    #[cfg(test)]
+    fn task_count(&self) -> usize {
+        self.tracker.len()
+    }
 }
 
 /// State structure for the client.
@@ -161,6 +328,12 @@ pub struct Client {
     /// Subdomain label for vhost providers; `None` for public/secret tunnels.
     /// Used to determine the correct log filename (vhost: subdomain.log, public: port.log).
     vhost_subdomain: Option<String>,
+
+    /// URLs returned by the vhost registration, retained for scoped callers.
+    vhost_urls: Option<VhostUrls>,
+
+    /// Optional lifecycle owner. Legacy clients keep the detached-task behavior.
+    scope: Option<Arc<ClientScope>>,
 }
 
 /// Parameters retained to (re)open a carrier connection for a public tunnel's
@@ -178,6 +351,7 @@ struct CarrierDialer {
     /// saturating the pool (phase 03.3). It is never lowered below what the
     /// operator asked for.
     target_extra: Arc<AtomicUsize>,
+    scope: Option<Arc<ClientScope>>,
 }
 
 /// Provider-side direct-path configuration, retained on the [`Client`] so the
@@ -241,7 +415,10 @@ impl Client {
         if let Some(secret) = secret {
             Authenticator::new(secret)
                 .client_handshake(&mut control)
-                .await?;
+                .await
+                .map_err(|error| {
+                    anyhow::Error::new(VhostAttemptError::Authentication).context(error)
+                })?;
         }
         let remote_port = match control.recv_timeout().await? {
             Some(ServerMessage::Hello(remote_port)) => remote_port,
@@ -265,7 +442,7 @@ impl Client {
             match control.recv_timeout().await? {
                 Some(ServerMessage::CarrierToken { token, extra }) => {
                     for _ in 0..extra {
-                        match open_carrier(&endpoint, insecure, secret, &token).await {
+                        match open_carrier(&endpoint, insecure, secret, &token, None).await {
                             Ok(pair) => carrier_acceptors.push(pair),
                             Err(err) => warn!(%err, "failed to open carrier connection"),
                         }
@@ -282,6 +459,7 @@ impl Client {
                             secret: secret.map(str::to_string),
                             token,
                             target_extra: Arc::new(AtomicUsize::new(extra as usize)),
+                            scope: None,
                         });
                     }
                 }
@@ -361,6 +539,8 @@ impl Client {
             access_logger,
             access_logger_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             vhost_subdomain: None,
+            vhost_urls: None,
+            scope: None,
         })
     }
 
@@ -453,7 +633,7 @@ impl Client {
             match control.recv_timeout().await? {
                 Some(ServerMessage::CarrierToken { token, extra }) => {
                     for _ in 0..extra {
-                        match open_carrier(&endpoint, insecure, secret, &token).await {
+                        match open_carrier(&endpoint, insecure, secret, &token, None).await {
                             Ok(pair) => carrier_acceptors.push(pair),
                             Err(err) => warn!(%err, "failed to open carrier connection"),
                         }
@@ -470,6 +650,7 @@ impl Client {
                             secret: secret.map(str::to_string),
                             token,
                             target_extra: Arc::new(AtomicUsize::new(extra as usize)),
+                            scope: None,
                         });
                     }
                 }
@@ -565,6 +746,8 @@ impl Client {
             access_logger,
             access_logger_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             vhost_subdomain: None,
+            vhost_urls: None,
+            scope: None,
         })
     }
 
@@ -619,6 +802,74 @@ impl Client {
         meta: ProviderMeta,
         access_logger: Option<Arc<AccessLogger>>,
     ) -> Result<Self> {
+        Self::new_vhost_provider_with_udp_inner(
+            local_host,
+            local_port,
+            to,
+            subdomain,
+            client_id,
+            secret,
+            insecure,
+            carriers,
+            udp,
+            meta,
+            access_logger,
+            None,
+        )
+        .await
+    }
+
+    /// Scoped vhost constructor used by transfer links. The scope must be
+    /// created before this call so the yamux driver and every child task are
+    /// owned from their first poll.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub(crate) async fn new_vhost_provider_with_udp_scoped(
+        local_host: &str,
+        local_port: u16,
+        to: &str,
+        subdomain: &str,
+        client_id: &str,
+        secret: Option<&str>,
+        insecure: bool,
+        carriers: u16,
+        udp: bool,
+        meta: ProviderMeta,
+        access_logger: Option<Arc<AccessLogger>>,
+        scope: Arc<ClientScope>,
+    ) -> Result<Self> {
+        Self::new_vhost_provider_with_udp_inner(
+            local_host,
+            local_port,
+            to,
+            subdomain,
+            client_id,
+            secret,
+            insecure,
+            carriers,
+            udp,
+            meta,
+            access_logger,
+            Some(scope),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn new_vhost_provider_with_udp_inner(
+        local_host: &str,
+        local_port: u16,
+        to: &str,
+        subdomain: &str,
+        client_id: &str,
+        secret: Option<&str>,
+        insecure: bool,
+        carriers: u16,
+        udp: bool,
+        meta: ProviderMeta,
+        access_logger: Option<Arc<AccessLogger>>,
+        scope: Option<Arc<ClientScope>>,
+    ) -> Result<Self> {
         #[cfg(not(feature = "udp"))]
         if udp {
             warn!("built without udp support; ignoring --udp");
@@ -634,8 +885,12 @@ impl Client {
         }
 
         let endpoint = Endpoint::parse(to);
-        let socket = transport::connect(&endpoint, insecure).await?;
-        let (opener, acceptor) = mux::client(socket);
+        let transport_config = scope.as_ref().and_then(|scope| scope.transport_config());
+        let socket = transport::connect_with_config(&endpoint, insecure, transport_config).await?;
+        let (opener, acceptor) = match &scope {
+            Some(scope) => mux::client_scoped(socket, Arc::clone(scope)),
+            None => mux::client(socket),
+        };
         let mut control = Delimited::with_label(
             opener
                 .open()
@@ -680,29 +935,43 @@ impl Client {
                 .await?;
         }
 
-        match control.recv_timeout().await? {
+        let vhost_urls = match control.recv_timeout().await? {
             Some(ServerMessage::VhostReady {
                 http_url,
                 https_url,
             }) => {
-                if let Some(url) = &http_url {
-                    info!(url, "vhost HTTP endpoint");
+                if scope.is_none() {
+                    if let Some(url) = &http_url {
+                        info!(url, "vhost HTTP endpoint");
+                    }
+                    if let Some(url) = &https_url {
+                        info!(url, "vhost HTTPS endpoint");
+                    }
                 }
-                if let Some(url) = &https_url {
-                    info!(url, "vhost HTTPS endpoint");
+                VhostUrls {
+                    http_url,
+                    https_url,
                 }
             }
-            Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
+            Some(ServerMessage::Error(message)) => {
+                return Err(anyhow::Error::new(VhostAttemptError::RegistrationRejected)
+                    .context(format!("server error: {message}")));
+            }
             Some(ServerMessage::Warning(msg)) => {
                 tracing::warn!("{msg}");
-                bail!("unexpected warning during vhost registration")
+                return Err(anyhow::Error::new(VhostAttemptError::Protocol)
+                    .context("unexpected warning during vhost registration"));
             }
             Some(ServerMessage::Challenge(_)) => {
-                bail!("server requires authentication, but no client secret was provided");
+                return Err(anyhow::Error::new(VhostAttemptError::Authentication)
+                    .context("server requires authentication, but no client secret was provided"));
             }
-            Some(_) => bail!("unexpected response to vhost registration"),
+            Some(_) => {
+                return Err(anyhow::Error::new(VhostAttemptError::Protocol)
+                    .context("unexpected response to vhost registration"));
+            }
             None => bail!("unexpected EOF"),
-        }
+        };
         info!(%subdomain, "vhost provider ready");
 
         let auto_carriers = carriers == 0;
@@ -715,7 +984,8 @@ impl Client {
             match control.recv_timeout().await? {
                 Some(ServerMessage::CarrierToken { token, extra }) => {
                     for _ in 0..extra {
-                        match open_carrier(&endpoint, insecure, secret, &token).await {
+                        match open_carrier(&endpoint, insecure, secret, &token, scope.clone()).await
+                        {
                             Ok(pair) => carrier_acceptors.push(pair),
                             Err(err) => warn!(%err, "failed to open vhost carrier connection"),
                         }
@@ -733,6 +1003,7 @@ impl Client {
                             secret: secret.map(str::to_string),
                             token,
                             target_extra: Arc::new(AtomicUsize::new(extra as usize)),
+                            scope: scope.clone(),
                         });
                     }
                 }
@@ -807,12 +1078,73 @@ impl Client {
             access_logger,
             access_logger_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             vhost_subdomain: Some(subdomain.to_string()),
+            vhost_urls: Some(vhost_urls),
+            scope,
         })
     }
 
     /// Returns the port publicly available on the remote.
     pub fn remote_port(&self) -> u16 {
         self.remote_port
+    }
+
+    /// Return the URLs received during vhost registration, if this is a vhost
+    /// client. The returned reference is read-only and remains valid for the
+    /// lifetime of the client.
+    pub fn vhost_urls(&self) -> Option<&VhostUrls> {
+        self.vhost_urls.as_ref()
+    }
+
+    #[cfg(test)]
+    fn test_stub(vhost_urls: Option<VhostUrls>) -> Self {
+        Self {
+            control: None,
+            acceptor: None,
+            local_host: String::new(),
+            local_port: 0,
+            remote_port: 0,
+            sends_ctrl_heartbeat: false,
+            #[cfg(feature = "udp")]
+            udp_socket: None,
+            #[cfg(feature = "udp")]
+            udp_lease: None,
+            #[cfg(feature = "udp")]
+            secret: None,
+            #[cfg(feature = "udp")]
+            udp_cfg: None,
+            #[cfg(feature = "udp")]
+            vhost_udp: false,
+            #[cfg(feature = "udp")]
+            ssh_jump_udp: false,
+            #[cfg(feature = "udp")]
+            direct_endpoint: None,
+            #[cfg(feature = "udp")]
+            direct_key: None,
+            #[cfg(feature = "udp")]
+            direct_udp_carriers: 0,
+            basic_auth: None,
+            carrier_acceptors: Vec::new(),
+            carrier_dialer: None,
+            webserver_log: false,
+            access_logger: None,
+            access_logger_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            vhost_subdomain: None,
+            vhost_urls,
+            scope: None,
+        }
+    }
+
+    /// Spawn a task owned by this client when it has a scoped lifecycle. Legacy
+    /// clients deliberately retain the historical detached-task semantics.
+    fn spawn_task<F, T>(&self, task: F) -> Option<tokio::task::JoinHandle<T>>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        match &self.scope {
+            Some(scope) => scope.spawn(task),
+            None => Some(tokio::spawn(task)),
+        }
     }
 
     /// Register a native SSH jump-host provider over the normal bore control
@@ -903,7 +1235,7 @@ impl Client {
             match control.recv_timeout().await? {
                 Some(ServerMessage::CarrierToken { token, extra }) => {
                     for _ in 0..extra {
-                        match open_carrier(&endpoint, insecure, secret, &token).await {
+                        match open_carrier(&endpoint, insecure, secret, &token, None).await {
                             Ok(pair) => carrier_acceptors.push(pair),
                             Err(err) => warn!(%err, "failed to open SSH jump carrier"),
                         }
@@ -915,6 +1247,7 @@ impl Client {
                             secret: secret.map(str::to_string),
                             token,
                             target_extra: Arc::new(AtomicUsize::new(extra as usize)),
+                            scope: None,
                         });
                     }
                 }
@@ -977,6 +1310,8 @@ impl Client {
             access_logger: None,
             access_logger_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             vhost_subdomain: None,
+            vhost_urls: None,
+            scope: None,
         })
     }
 
@@ -1055,6 +1390,7 @@ impl Client {
         // client stand its heartbeat down for the rest of the session rather
         // than wedge the whole listen loop. See `beat_once`.
         let mut sends_ctrl_heartbeat = self.sends_ctrl_heartbeat;
+        let scope_token = self.scope.as_ref().map(|scope| scope.token());
         let this = Arc::new(self);
 
         // Carrier pool: pump each extra carrier's accepted data substreams into a
@@ -1064,6 +1400,7 @@ impl Client {
         let carrier_live = Arc::new(AtomicUsize::new(0));
         for (control_keepalive, acc) in carrier_acceptors {
             spawn_carrier_pump(
+                &this,
                 control_keepalive,
                 acc,
                 carrier_tx.clone(),
@@ -1091,6 +1428,7 @@ impl Client {
         };
         loop {
             tokio::select! {
+                _ = wait_for_scope_cancel(scope_token.clone()) => return Ok(()),
                 _ = ctrl_heartbeat.tick(), if sends_ctrl_heartbeat => {
                     match beat_once(&mut control).await {
                         CtrlBeat::Sent => {}
@@ -1143,6 +1481,7 @@ impl Client {
                                     if extra > previous {
                                         info!(target, "server raised the carrier target");
                                         maybe_redial_carriers(
+                                            &this,
                                             dialer,
                                             &carrier_tx,
                                             &carrier_live,
@@ -1199,11 +1538,19 @@ impl Client {
                                         .as_ref()
                                         .map(|c| Arc::clone(&c.permits))
                                         .expect("provider udp cfg present when a socket exists");
-                                    let this = Arc::clone(&this);
-                                    tokio::spawn(async move {
+                                    let owner = Arc::clone(&this);
+                                    let task_client = Arc::clone(&this);
+                                    owner.spawn_task(async move {
                                         if let Err(err) =
                                             provider_direct(
-                                                socket, peer, token, tuning, this, rx, permits, v2,
+                                                socket,
+                                                peer,
+                                                token,
+                                                tuning,
+                                                task_client,
+                                                rx,
+                                                permits,
+                                                v2,
                                             )
                                             .await
                                         {
@@ -1585,7 +1932,7 @@ impl Client {
                 // dead carrier just stops feeding (and is re-dialed below).
                 stream = carrier_rx.recv() => {
                     if let Some(stream) = stream {
-                        spawn_handle(&this, stream);
+                        spawn_handle(&this, stream, BackendPath::RelayTcp);
                     }
                 }
                 // Keep the carrier pool topped up: if any carrier dropped, re-dial
@@ -1593,6 +1940,7 @@ impl Client {
                 _ = carrier_redial.tick() => {
                     if let Some(dialer) = &carrier_dialer {
                         maybe_redial_carriers(
+                            &this,
                             dialer,
                             &carrier_tx,
                             &carrier_live,
@@ -1604,7 +1952,7 @@ impl Client {
                     let Some(stream) = stream else {
                         return Ok(());
                     };
-                    spawn_handle(&this, stream);
+                    spawn_handle(&this, stream, BackendPath::RelayTcp);
                 }
             }
         }
@@ -1616,6 +1964,7 @@ impl Client {
     async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         mut stream: S,
+        path: BackendPath,
     ) -> Result<()> {
         // Read the server's readiness marker with optional caller IP forwarding (Phase 3).
         let real_ip = mux::read_stream_ready(&mut stream, self.webserver_log).await?;
@@ -1632,7 +1981,28 @@ impl Client {
             Vec::new()
         };
 
-        let mut local_conn = connect_with_timeout(&self.local_host, self.local_port).await?;
+        let mut local_conn = if let Some(scope) = &self.scope {
+            tokio::select! {
+                _ = scope.cancel.cancelled() => return Ok(()),
+                result = connect_with_timeout(&self.local_host, self.local_port) => result?,
+            }
+        } else {
+            connect_with_timeout(&self.local_host, self.local_port).await?
+        };
+        // Register the backend before forwarding any request bytes. The lease is
+        // deliberately kept in this stack frame until the splice returns, and
+        // therefore also covers half-close flushing.
+        let _backend_path_lease = self
+            .scope
+            .as_ref()
+            .and_then(|scope| scope.backend_path_hook())
+            .and_then(|hook| match local_conn.local_addr() {
+                Ok(peer) => hook(peer, path),
+                Err(err) => {
+                    debug!(%err, "could not observe local backend socket address");
+                    None
+                }
+            });
         if !prefix.is_empty() {
             local_conn.write_all(&prefix).await?;
         }
@@ -1653,11 +2023,26 @@ impl Client {
                 tx,
                 Arc::clone(&self.access_logger_dropped),
             );
-            tokio::io::copy_bidirectional_with_sizes(&mut local_conn, &mut tap, buf, buf).await?;
+            if let Some(scope) = &self.scope {
+                tokio::select! {
+                    result = tokio::io::copy_bidirectional_with_sizes(&mut local_conn, &mut tap, buf, buf) => { result?; }
+                    _ = scope.cancel.cancelled() => {}
+                }
+            } else {
+                tokio::io::copy_bidirectional_with_sizes(&mut local_conn, &mut tap, buf, buf)
+                    .await?;
+            }
         } else {
             // No logging: use stream directly.
-            tokio::io::copy_bidirectional_with_sizes(&mut local_conn, &mut stream, buf, buf)
-                .await?;
+            if let Some(scope) = &self.scope {
+                tokio::select! {
+                    result = tokio::io::copy_bidirectional_with_sizes(&mut local_conn, &mut stream, buf, buf) => { result?; }
+                    _ = scope.cancel.cancelled() => {}
+                }
+            } else {
+                tokio::io::copy_bidirectional_with_sizes(&mut local_conn, &mut stream, buf, buf)
+                    .await?;
+            }
         }
 
         Ok(())
@@ -1667,12 +2052,13 @@ impl Client {
 /// Spawn a task that dials the local service for a forwarded substream and splices
 /// the two together. Shared by the main acceptor and every carrier-pool acceptor
 /// so they handle a forwarded connection identically.
-fn spawn_handle(this: &Arc<Client>, stream: mux::Stream) {
-    let this = Arc::clone(this);
-    tokio::spawn(
+fn spawn_handle(this: &Arc<Client>, stream: mux::Stream, path: BackendPath) {
+    let owner = Arc::clone(this);
+    let task_client = Arc::clone(this);
+    owner.spawn_task(
         async move {
             info!("new connection");
-            match this.handle_connection(stream).await {
+            match task_client.handle_connection(stream, path).await {
                 // Per-connection success is high-frequency, low-value: log it at
                 // trace, matching the server and secret-relay paths (which trace
                 // their per-connection closes). The arrival above stays at info.
@@ -1721,6 +2107,13 @@ pub(crate) fn direct_renewal_stands_down(live: usize, target: usize) -> bool {
     live >= target
 }
 
+async fn wait_for_scope_cancel(token: Option<CancellationToken>) {
+    match token {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Establish one QUIC direct carrier toward the server and serve its
 /// accepted streams to the local service. Works for both vhost providers and
 /// public tunnels (server opens streams; client accepts them).
@@ -1742,7 +2135,13 @@ fn spawn_direct(
     renew_tx: mpsc::UnboundedSender<()>,
     up_tx: mpsc::UnboundedSender<()>,
 ) {
-    tokio::spawn(async move {
+    let scope_token = client.scope.as_ref().map(|scope| scope.token());
+    let owner = Arc::clone(&client);
+    // Reserve the slot before the task is submitted. If shutdown won the
+    // registration race, `spawn_task` returns `None` and the reservation must
+    // be released synchronously because the task body will never run.
+    let reserved_live = Arc::clone(&live);
+    let spawned = owner.spawn_task(async move {
         // Release the reserved slot and ask for a renewal. Used on every exit
         // path (bind/connect failure or a later carrier close).
         let release = |live: &AtomicUsize, renew_tx: &mpsc::UnboundedSender<()>| {
@@ -1771,7 +2170,10 @@ fn spawn_direct(
         let _ = up_tx.send(());
         info!(key, "direct udp carrier ready, accepting streams");
         loop {
-            let stream = match direct.accept_stream().await {
+            let stream = match tokio::select! {
+                _ = wait_for_scope_cancel(scope_token.clone()) => break,
+                result = direct.accept_stream() => result,
+            } {
                 Ok(stream) => stream,
                 Err(err) => {
                     debug!(%err, key, "direct udp carrier closed");
@@ -1779,16 +2181,23 @@ fn spawn_direct(
                 }
             };
 
-            let client = Arc::clone(&client);
-            tokio::spawn(async move {
+            let owner = Arc::clone(&client);
+            let task_client = Arc::clone(&client);
+            owner.spawn_task(async move {
                 debug!("serving local connection over direct udp path");
-                if let Err(err) = client.handle_connection(stream).await {
+                if let Err(err) = task_client
+                    .handle_connection(stream, BackendPath::DirectQuic)
+                    .await
+                {
                     warn!(%err, "direct connection closed with error");
                 }
             });
         }
         release(&live, &renew_tx);
     });
+    if spawned.is_none() {
+        reserved_live.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Open one extra carrier connection for a public tunnel's pool: dial the server,
@@ -1800,9 +2209,14 @@ async fn open_carrier(
     insecure: bool,
     secret: Option<&str>,
     token: &str,
+    scope: Option<Arc<ClientScope>>,
 ) -> Result<(Delimited<mux::Stream>, mux::Acceptor)> {
-    let socket = transport::connect(endpoint, insecure).await?;
-    let (opener, acceptor) = mux::client(socket);
+    let transport_config = scope.as_ref().and_then(|scope| scope.transport_config());
+    let socket = transport::connect_with_config(endpoint, insecure, transport_config).await?;
+    let (opener, acceptor) = match scope {
+        Some(scope) => mux::client_scoped(socket, scope),
+        None => mux::client(socket),
+    };
     let mut control = Delimited::with_label(
         opener
             .open()
@@ -1830,28 +2244,75 @@ async fn open_carrier(
 /// lifetime (the server uses it to keep the carrier in the pool) and maintains the
 /// liveness counter so [`maybe_redial_carriers`] can top the pool back up.
 fn spawn_carrier_pump(
+    client: &Arc<Client>,
     control: Delimited<mux::Stream>,
     mut acceptor: mux::Acceptor,
     tx: mpsc::UnboundedSender<mux::Stream>,
     live: Arc<AtomicUsize>,
 ) {
     live.fetch_add(1, Ordering::Relaxed);
-    tokio::spawn(async move {
+    let scope_token = client.scope.as_ref().map(|scope| scope.token());
+    let owner = Arc::clone(client);
+    let task_live = Arc::clone(&live);
+    let spawned = owner.spawn_task(async move {
         // Held only to keep the substream (and thus the carrier) open; never read.
         let _control = control;
-        while let Some(stream) = acceptor.accept().await {
-            if tx.send(stream).is_err() {
-                break;
+        loop {
+            tokio::select! {
+                _ = wait_for_scope_cancel(scope_token.clone()) => break,
+                stream = acceptor.accept() => {
+                    let Some(stream) = stream else { break; };
+                    if tx.send(stream).is_err() { break; }
+                }
             }
         }
-        live.fetch_sub(1, Ordering::Relaxed);
+        task_live.fetch_sub(1, Ordering::Relaxed);
     });
+    if spawned.is_none() {
+        live.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn spawn_carrier_pump_scoped(
+    scope: Option<Arc<ClientScope>>,
+    control: Delimited<mux::Stream>,
+    mut acceptor: mux::Acceptor,
+    tx: mpsc::UnboundedSender<mux::Stream>,
+    live: Arc<AtomicUsize>,
+) {
+    live.fetch_add(1, Ordering::Relaxed);
+    let scope_token = scope.as_ref().map(|scope| scope.token());
+    let task_live = Arc::clone(&live);
+    let task = async move {
+        let _control = control;
+        loop {
+            tokio::select! {
+                _ = wait_for_scope_cancel(scope_token.clone()) => break,
+                stream = acceptor.accept() => {
+                    let Some(stream) = stream else { break; };
+                    if tx.send(stream).is_err() { break; }
+                }
+            }
+        }
+        task_live.fetch_sub(1, Ordering::Relaxed);
+    };
+    match scope {
+        Some(scope) => {
+            if scope.spawn(task).is_none() {
+                live.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        None => {
+            tokio::spawn(task);
+        }
+    }
 }
 
 /// If the carrier pool has dropped below its target width, re-dial the shortfall in
 /// a spawned task so the listen loop never blocks on the dial. `inflight` prevents
 /// stacking re-dial batches when a carrier stays unreachable.
 fn maybe_redial_carriers(
+    client: &Arc<Client>,
     dialer: &CarrierDialer,
     tx: &mpsc::UnboundedSender<mux::Stream>,
     live: &Arc<AtomicUsize>,
@@ -1871,18 +2332,38 @@ fn maybe_redial_carriers(
     let tx = tx.clone();
     let live = Arc::clone(live);
     let inflight = Arc::clone(inflight);
-    tokio::spawn(async move {
+    let scope = dialer.scope.clone();
+    let scope_token = scope.as_ref().map(|scope| scope.token());
+    client.spawn_task(async move {
         for _ in 0..need {
-            match open_carrier(
+            let opening = open_carrier(
                 &dialer.endpoint,
                 dialer.insecure,
                 dialer.secret.as_deref(),
                 &dialer.token,
-            )
-            .await
-            {
+                scope.clone(),
+            );
+            let result = match &scope_token {
+                Some(token) => {
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        result = opening => result,
+                    }
+                }
+                None => opening.await,
+            };
+            match result {
                 Ok((control, acceptor)) => {
-                    spawn_carrier_pump(control, acceptor, tx.clone(), Arc::clone(&live));
+                    // The client is not available inside this detached redial
+                    // future, but the dialer carries the same scoped mux owner.
+                    // The pump is registered by the scope directly below.
+                    spawn_carrier_pump_scoped(
+                        scope.clone(),
+                        control,
+                        acceptor,
+                        tx.clone(),
+                        Arc::clone(&live),
+                    );
                     info!("re-dialed a carrier connection");
                 }
                 Err(err) => {
@@ -2015,6 +2496,7 @@ async fn provider_direct(
     permits: Arc<Semaphore>,
     v2: Option<crate::shared::UdpPunchV2>,
 ) -> Result<()> {
+    let scope_token = client.scope.as_ref().map(|scope| scope.token());
     let check_generation = v2.as_ref().and_then(|v| v.check_generation());
     let listener = match check_generation {
         // Fase 2: the authenticated check round doubles as the punch, opens
@@ -2094,17 +2576,26 @@ async fn provider_direct(
     info!("direct udp path ready, accepting connections");
     loop {
         tokio::select! {
+            _ = wait_for_scope_cancel(scope_token.clone()) => {
+                listener.close();
+                return Ok(());
+            }
             res = listener.accept(token) => {
                 match res {
                     Ok(conn) => {
                         // Each proxied connection rides its own native QUIC stream
                         // (no yamux): accept them and dial the local service per
                         // stream. The consumer opens the streams.
-                        let client = Arc::clone(&client);
+                        let owner = Arc::clone(&client);
+                        let task_client = Arc::clone(&client);
                         let permits = Arc::clone(&permits);
-                        tokio::spawn(async move {
+                        owner.spawn_task(async move {
+                            let scope_token = task_client.scope.as_ref().map(|scope| scope.token());
                             loop {
-                                let stream = match conn.accept_stream().await {
+                                let stream = match tokio::select! {
+                                    _ = wait_for_scope_cancel(scope_token.clone()) => break,
+                                    result = conn.accept_stream() => result,
+                                } {
                                     Ok(stream) => stream,
                                     // Connection closed (consumer gone): stop.
                                     Err(err) => {
@@ -2122,12 +2613,16 @@ async fn provider_direct(
                                         continue;
                                     }
                                 };
-                                let client = Arc::clone(&client);
-                                tokio::spawn(
+                                let stream_owner = Arc::clone(&task_client);
+                                let stream_client = Arc::clone(&task_client);
+                                stream_owner.spawn_task(
                                     async move {
                                         let _permit = permit;
                                         debug!("serving local connection over direct udp path");
-                                        if let Err(err) = client.handle_connection(stream).await {
+                                        if let Err(err) = stream_client
+                                            .handle_connection(stream, BackendPath::DirectQuic)
+                                            .await
+                                        {
                                             warn!(%err, "direct connection closed with error");
                                         }
                                     }
@@ -2268,8 +2763,71 @@ where
 mod tests {
     #[cfg(feature = "udp")]
     use super::direct_renewal_stands_down;
-    use super::{beat_once, lease_changed, CtrlBeat, Delimited};
+    use super::{beat_once, lease_changed, Client, ClientScope, CtrlBeat, Delimited, VhostUrls};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn vhost_ready_urls_are_retained() {
+        let urls = VhostUrls {
+            http_url: Some("http://transfer.example.test/file".to_string()),
+            https_url: Some("https://transfer.example.test/file".to_string()),
+        };
+        let client = Client::test_stub(Some(urls.clone()));
+        assert_eq!(client.vhost_urls(), Some(&urls));
+    }
+
+    #[test]
+    fn non_vhost_client_has_no_urls() {
+        let client = Client::test_stub(None);
+        assert_eq!(client.vhost_urls(), None);
+    }
+
+    #[tokio::test]
+    async fn scope_cancel_joins_nested_tasks() {
+        let scope = ClientScope::new(None);
+        let child_ready = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(AtomicUsize::new(0));
+        let outer_token = scope.token();
+        let outer_scope = Arc::clone(&scope);
+        let outer_ready = Arc::clone(&child_ready);
+        let outer_completed = Arc::clone(&completed);
+
+        assert!(scope
+            .spawn(async move {
+                let child_token = outer_scope.token();
+                let child_completed = Arc::clone(&outer_completed);
+                assert!(outer_scope
+                    .spawn(async move {
+                        child_token.cancelled().await;
+                        child_completed.fetch_add(1, Ordering::Relaxed);
+                    })
+                    .is_some());
+                outer_ready.notify_one();
+                outer_token.cancelled().await;
+                outer_completed.fetch_add(1, Ordering::Relaxed);
+            })
+            .is_some());
+
+        child_ready.notified().await;
+        scope.shutdown().await;
+        assert_eq!(scope.task_count(), 0, "all nested tasks must be joined");
+        assert_eq!(completed.load(Ordering::Relaxed), 2);
+        assert!(
+            scope.spawn(async {}).is_none(),
+            "closed scopes reject new tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_scope_none_keeps_stream_bytes_identical() {
+        let client = Client::test_stub(None);
+        let handle = client
+            .spawn_task(async { b"legacy-payload".to_vec() })
+            .expect("legacy clients still spawn detached tasks");
+        assert_eq!(handle.await.unwrap(), b"legacy-payload");
+    }
 
     /// `lease_changed` is the DORMANT half of a `select!` arm, and a `select!`
     /// arm that returns when it has nothing to say is a busy loop, not a

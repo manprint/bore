@@ -57,6 +57,9 @@ pub mod sshgw;
 #[cfg(feature = "ssh-gateway")]
 pub mod sshgw_auth;
 pub mod transfer;
+pub mod transfer_link;
+#[doc(hidden)]
+pub mod transfer_link_cli;
 pub mod transport;
 pub mod udp_diagnostic;
 pub mod vhost;

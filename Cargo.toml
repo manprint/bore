@@ -60,10 +60,12 @@ ssh-gateway = ["dep:russh", "dep:argon2", "dep:password-hash", "dep:ssh-key", "d
 [dependencies]
 anyhow = { version = "1.0.56", features = ["backtrace"] }
 bytes = "1"
+async_zip = { version = "0.0.18", default-features = false, features = ["tokio"] }
 clap = { version = "4.5.0", features = ["derive", "env"] }
 dashmap = "5.2.0"
 fastrand = "2"
 futures-util = { version = "0.3.21", features = ["sink", "io"] }
+futures-lite = "2.6.1"
 hex = "0.4.3"
 hmac = "0.12.1"
 # Reuses the lockfile's subtle 2.x resolution; canonical constant-time digest
@@ -82,9 +84,12 @@ sha2 = "0.10.2"
 socket2 = "0.6.4"
 blake3 = "1.5.5"
 httparse = "1.8"
-tokio = { version = "1.41.0", features = ["fs", "rt-multi-thread", "io-std", "io-util", "macros", "net", "signal", "sync", "time"] }
+hyper = { version = "1.10.1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
+http-body-util = "0.1.3"
+tokio = { version = "1.41.0", features = ["fs", "rt-multi-thread", "io-std", "io-util", "macros", "net", "process", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
-tokio-util = { version = "0.7.1", features = ["codec", "compat"] }
+tokio-util = { version = "0.7.1", features = ["codec", "compat", "rt"] }
 tracing = "0.1.32"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = { version = "1.2.1", features = ["serde", "v4"] }
@@ -128,7 +133,7 @@ ssh-key = { version = "=0.7.0-rc.11", optional = true, features = ["rand_core"] 
 rand = { version = "0.10", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29.0", features = ["fs", "user", "socket", "resource"] }
+nix = { version = "0.29.0", features = ["fs", "user", "socket", "resource", "process", "signal"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.18"

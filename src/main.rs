@@ -1,5 +1,8 @@
+use std::ffi::OsString;
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 #[cfg(all(
@@ -38,10 +41,20 @@ use bore_cli::{
         CollisionPolicy, DeviceMode, ListenerOptions as TransferListenerOptions,
         SenderOptions as TransferSenderOptions, SymlinkMode,
     },
+    transfer_link::{
+        prepare_exec, prepare_selection, prepare_stdin, LinkOptions, PreparedSource,
+        DEFAULT_MAX_DOWNLOADS, DEFAULT_STATS_INTERVAL, MAX_STATS_INTERVAL_SECS,
+        MIN_STATS_INTERVAL_SECS,
+    },
+    transfer_link_cli::{bind_source_supervisor, public_file_url, LinkSupervisorConfig},
     weblog::{AccessLogConfig, AccessLogger},
 };
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand};
 use std::sync::Arc;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Full version string: "bore 1.0.0 - <branch> - <sha8>".
@@ -1354,6 +1367,64 @@ enum TransferCommand {
         #[clap(long)]
         relay_only: bool,
     },
+
+    /// Publish files, directories, or one producer stream through the existing HTTPS vhost.
+    Link {
+        /// Files/directories to publish. Multiple paths become one ZIP archive.
+        #[clap(value_name = "PATH", num_args = 0..)]
+        paths: Vec<PathBuf>,
+
+        /// Read one binary stream from standard input. The first GET consumes it.
+        #[clap(long, conflicts_with = "exec")]
+        stdin: bool,
+
+        /// Run one literal producer command after the first GET (Unix only).
+        /// The command starts after a `--` separator and is never interpreted by a shell.
+        #[clap(long, conflicts_with = "stdin")]
+        exec: bool,
+
+        /// Literal executable and arguments following the `--exec --` separator.
+        #[clap(last = true, value_name = "COMMAND", num_args = 0..)]
+        command: Vec<OsString>,
+
+        /// Address of the remote server hosting the vhost rendezvous.
+        #[clap(short, long, value_name = "ADDR", env = "BORE_SERVER", default_value = DEFAULT_SERVER)]
+        to: String,
+
+        /// Optional secret for authentication.
+        #[clap(
+            short,
+            long,
+            value_name = "SECRET",
+            env = "BORE_SECRET",
+            hide_env_values = true
+        )]
+        secret: Option<String>,
+
+        /// Add PEM CA certificates while retaining hostname verification.
+        #[clap(long, value_name = "PATH", env = "BORE_CA_CERT")]
+        ca_cert: Option<PathBuf>,
+
+        /// Force the encrypted TCP relay instead of requesting QUIC.
+        #[clap(long)]
+        relay_only: bool,
+
+        /// Number of independent relay/direct carriers (1..=32).
+        #[clap(long, value_name = "N", default_value_t = 1u16, value_parser = clap::value_parser!(u16).range(1..=32), env = "BORE_CARRIERS")]
+        carriers: u16,
+
+        /// Filename advertised to HTTP clients; defaults to the source basename.
+        #[clap(long, value_name = "NAME")]
+        filename: Option<String>,
+
+        /// Maximum concurrent downloads (default 8).
+        #[clap(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=256), env = "BORE_TRANSFER_MAX_DOWNLOADS")]
+        max_downloads: Option<u16>,
+
+        /// Progress log interval in whole seconds (1..=60).
+        #[clap(long, value_name = "SECS", default_value_t = DEFAULT_STATS_INTERVAL.as_secs(), value_parser = clap::value_parser!(u64).range(MIN_STATS_INTERVAL_SECS..=MAX_STATS_INTERVAL_SECS), env = "BORE_TRANSFER_STATS_INTERVAL")]
+        stats_interval: u64,
+    },
 }
 
 #[cfg(all(
@@ -1728,7 +1799,7 @@ async fn run(command: Command) -> Result<()> {
     if matches!(
         &command,
         Command::Transfer {
-            command: TransferCommand::Web { .. }
+            command: TransferCommand::Web { .. } | TransferCommand::Link { .. }
         }
     ) {
         return dispatch(command).await;
@@ -1762,6 +1833,163 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+    }
+}
+
+/// Run the transfer-link command.  The function owns the link
+/// cancellation token and joins the supervisor on every exit path, including
+/// a signal received while registration is still in progress.
+#[allow(clippy::too_many_arguments)]
+async fn run_transfer_link(
+    paths: Vec<PathBuf>,
+    stdin: bool,
+    exec: bool,
+    command: Vec<OsString>,
+    to: String,
+    secret: Option<String>,
+    ca_cert: Option<PathBuf>,
+    relay_only: bool,
+    carriers: u16,
+    filename: Option<String>,
+    max_downloads: Option<u16>,
+    stats_interval: u64,
+) -> Result<()> {
+    if stdin && exec {
+        anyhow::bail!("--stdin and --exec are mutually exclusive");
+    }
+    if (stdin || exec) && !paths.is_empty() {
+        anyhow::bail!("source paths cannot be combined with --stdin or --exec");
+    }
+    if !stdin && !exec && paths.is_empty() {
+        anyhow::bail!("provide at least one PATH, or use --stdin/--exec");
+    }
+    if !exec && !command.is_empty() {
+        anyhow::bail!("a producer command requires --exec");
+    }
+    if exec && command.is_empty() {
+        anyhow::bail!("--exec requires a command after the `--` separator");
+    }
+    let prepared = if stdin {
+        let filename = filename
+            .as_deref()
+            .context("--filename is required with --stdin")?;
+        PreparedSource::OneShot(
+            prepare_stdin(filename.to_owned()).context("invalid --stdin filename")?,
+        )
+    } else if exec {
+        #[cfg(not(unix))]
+        anyhow::bail!("--exec is supported only on Unix platforms");
+        #[cfg(unix)]
+        {
+            let filename = filename
+                .as_deref()
+                .context("--filename is required with --exec")?;
+            PreparedSource::OneShot(
+                prepare_exec(filename.to_owned(), command).context("invalid --exec source")?,
+            )
+        }
+    } else {
+        prepare_selection(paths, filename.as_deref())
+            .await
+            .context("cannot prepare transfer-link source")?
+    };
+    let one_shot = stdin || exec;
+    if one_shot && max_downloads.unwrap_or(1) != 1 {
+        anyhow::bail!("--stdin and --exec require exactly one download");
+    }
+    let advertised_filename = prepared.filename().to_owned();
+    let options = LinkOptions::new(
+        advertised_filename.clone(),
+        usize::from(if one_shot {
+            1
+        } else {
+            max_downloads.unwrap_or(DEFAULT_MAX_DOWNLOADS as u16)
+        }),
+        Duration::from_secs(stats_interval),
+    )
+    .context("invalid transfer-link limits")?;
+    let effective_max_downloads = if one_shot {
+        1
+    } else {
+        max_downloads.unwrap_or(DEFAULT_MAX_DOWNLOADS as u16)
+    };
+    let supervisor = bind_source_supervisor(
+        prepared.clone(),
+        options,
+        LinkSupervisorConfig {
+            to,
+            secret,
+            ca_cert,
+            relay_only,
+            carriers,
+        },
+    )
+    .await
+    .context("cannot start transfer-link listener")?;
+
+    let label = supervisor.label().to_owned();
+    let shutdown = CancellationToken::new();
+    let (ready_tx, mut ready_rx) = oneshot::channel();
+    let mut task: JoinHandle<Result<()>> = tokio::spawn(supervisor.run(shutdown.clone(), ready_tx));
+
+    let base_url = tokio::select! {
+        announced = &mut ready_rx => match announced {
+            Ok(url) => url,
+            Err(_) => {
+                // The one-shot sender is owned by the supervisor.  If it is
+                // dropped before publication, wait for that task here so the
+                // actual typed TLS/registration error is preserved instead
+                // of reporting only the generic `channel closed` message.
+                let result = task
+                    .await
+                    .context("transfer-link supervisor task failed")?;
+                result.context("transfer-link stopped before announcing a URL")?;
+                anyhow::bail!("transfer-link stopped before announcing a URL")
+            }
+        },
+        result = &mut task => {
+            let result = result.context("transfer-link supervisor task failed")?;
+            result.context("transfer-link stopped before announcing a URL")?;
+            anyhow::bail!("transfer-link stopped before announcing a URL")
+        }
+        _ = shutdown_signal() => {
+            shutdown.cancel();
+            finish_transfer_link_task(&mut task).await?;
+            return Ok(());
+        }
+    };
+    let public_url = public_file_url(&base_url, &advertised_filename)
+        .context("server announced an invalid transfer-link URL")?;
+    println!("{public_url}");
+    std::io::stdout()
+        .flush()
+        .context("failed to flush transfer-link URL")?;
+    info!(
+        label = %label,
+        filename = %advertised_filename,
+        size = ?prepared.known_size(),
+        max_downloads = effective_max_downloads,
+        relay_only,
+        carriers,
+        "transfer-link session ready"
+    );
+
+    tokio::select! {
+        result = &mut task => {
+            result.context("transfer-link supervisor task failed")??;
+        }
+        _ = shutdown_signal() => {
+            shutdown.cancel();
+            finish_transfer_link_task(&mut task).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn finish_transfer_link_task(task: &mut JoinHandle<Result<()>>) -> Result<()> {
+    match timeout(Duration::from_secs(10), task).await {
+        Ok(result) => result.context("transfer-link supervisor task failed")?,
+        Err(_) => anyhow::bail!("transfer-link supervisor did not stop within 10 seconds"),
     }
 }
 
@@ -2166,6 +2394,36 @@ async fn dispatch(command: Command) -> Result<()> {
                         relay_only,
                         ..Default::default()
                     },
+                )
+                .await?;
+            }
+            TransferCommand::Link {
+                paths,
+                stdin,
+                exec,
+                command,
+                to,
+                secret,
+                ca_cert,
+                relay_only,
+                carriers,
+                filename,
+                max_downloads,
+                stats_interval,
+            } => {
+                run_transfer_link(
+                    paths,
+                    stdin,
+                    exec,
+                    command,
+                    to,
+                    secret,
+                    ca_cert,
+                    relay_only,
+                    carriers,
+                    filename,
+                    max_downloads,
+                    stats_interval,
                 )
                 .await?;
             }
@@ -4206,13 +4464,65 @@ mod tests {
                 "stall-timeout",
             ]
         );
+        assert_eq!(
+            flags("link"),
+            [
+                "stdin",
+                "exec",
+                "to",
+                "secret",
+                "ca-cert",
+                "relay-only",
+                "carriers",
+                "filename",
+                "max-downloads",
+                "stats-interval",
+            ]
+        );
         // Help ordering: the new mode comes last, so no existing entry moved.
         let modes: Vec<&str> = transfer
             .get_subcommands()
             .map(|sub| sub.get_name())
             .filter(|name| *name != "help")
             .collect();
-        assert_eq!(modes, ["listener", "sender", "web"]);
+        assert_eq!(modes, ["listener", "sender", "web", "link"]);
+    }
+
+    #[test]
+    fn transfer_link_cli_defaults_and_single_path_shape() {
+        let args = Args::parse_from(["bore", "transfer", "link", "backup.bin"]);
+        let Command::Transfer { command } = args.command else {
+            panic!("expected transfer command");
+        };
+        let TransferCommand::Link {
+            paths,
+            stdin,
+            exec,
+            command,
+            to,
+            secret,
+            ca_cert,
+            relay_only,
+            carriers,
+            filename,
+            max_downloads,
+            stats_interval,
+        } = command
+        else {
+            panic!("expected transfer link command");
+        };
+        assert_eq!(paths, vec![PathBuf::from("backup.bin")]);
+        assert!(!stdin);
+        assert!(!exec);
+        assert!(command.is_empty());
+        assert_eq!(to, DEFAULT_SERVER);
+        assert!(secret.is_none());
+        assert!(ca_cert.is_none());
+        assert!(!relay_only);
+        assert_eq!(carriers, 1);
+        assert!(filename.is_none());
+        assert!(max_downloads.is_none());
+        assert_eq!(stats_interval, DEFAULT_STATS_INTERVAL.as_secs());
     }
 
     #[test]

@@ -53,6 +53,7 @@ frills attached.
 - [Secret tunnels (no public port)](#secret-tunnels-no-public-port)
   - [Direct UDP path (hole-punching)](#direct-udp-path-hole-punching)
 - [Secure file transfer (`bore transfer`)](#secure-file-transfer-bore-transfer)
+  - [Public download link (`bore transfer link`)](#public-download-link-bore-transfer-link)
   - [Browser-to-browser transfer (`bore transfer web`)](#browser-to-browser-transfer-bore-transfer-web)
 - [Diagnosing UDP / NAT (`bore test-udp`)](#diagnosing-udp--nat-bore-test-udp)
 - [VPN — point-to-point L3 tunnel (`bore vpn`)](#vpn--point-to-point-l3-tunnel)
@@ -332,6 +333,7 @@ variable shown in each table — handy for Docker/systemd.
 | `bore sshjhost <TARGET>` | Publish an SSH daemon as a namespaced stock-OpenSSH ProxyJump target | [SSH jump hosts](#ssh-jump-hosts) |
 | `bore server` | Run the relay server (control port, tunnels, vhost, VPN broker, SSH gateway, admin page) | [Self-hosting](#self-hosting) |
 | `bore transfer listener` / `bore transfer sender` | Resumable, BLAKE3-verified file transfer over the tunnel transport | [Secure file transfer](#secure-file-transfer-bore-transfer) |
+| `bore transfer link` | Publish files, directories or one-shot producer output as an HTTPS download link | [Public download link](#public-download-link-bore-transfer-link) |
 | `bore transfer web` | Open a browser-to-browser end-to-end encrypted transfer room and hold it | [Browser-to-browser transfer](#browser-to-browser-transfer-bore-transfer-web) |
 | `bore test-udp` | NAT/UDP diagnostic; two-peer latency/bandwidth test with `--tcp-secret-id` | [Diagnosing UDP/NAT](#diagnosing-udp--nat-bore-test-udp) |
 | `bore vpn listen` / `bore vpn connect` | Point-to-point L3 VPN (`--features vpn`, root/`CAP_NET_ADMIN`) | [VPN](#vpn--point-to-point-l3-tunnel) |
@@ -2253,6 +2255,163 @@ Notes:
   elevated privileges to recreate the device node.
 - `bore transfer listener` also accepts the legacy `--tcp-secret-id` flag as an alias of
   `--transfer-id`.
+
+### Public download link (`bore transfer link`)
+
+`bore transfer link` publishes a file, a directory, or a mixed selection through the
+existing HTTPS vhost. The command prints one URL on stdout and remains in the foreground
+until you interrupt it. The URL has a random 16-character label, for example
+`https://transfer-k3m8q1z7p4n6c2xd.bore.example.com/archive.tar`, and anyone who has that
+URL can download it with an ordinary browser, `curl` or `wget`. A single regular file is
+served byte-for-byte. Multiple paths or any directory are streamed as a ZIP archive named
+`download.zip` by default. ZIP entries use the STORED method (no compression) and ZIP64 is
+used when the size or entry count requires it. The server relays bytes and coordinates the
+vhost registration; it does not write a copy of the payload to disk. HTTPS terminates at
+the vhost, so the server operator can see the plaintext while it is relaying it.
+
+The vhost must already have a DNS wildcard and a certificate that cover one subdomain of
+the base domain. No certificate is issued for an individual transfer. A minimal server
+configuration is:
+
+```shell
+bore server --control-port 7835 \
+  --cert-file /etc/bore/control-cert.pem --key-file /etc/bore/control-key.pem \
+  --vhost-base-domain bore.example.com --vhost-mode https \
+  --vhost-cert-file /etc/bore/wildcard-bore.example.com.pem \
+  --vhost-key-file /etc/bore/wildcard-bore.example.com.key \
+  --udp --vhost-quic-port 443
+```
+
+Point `*.bore.example.com` at this server. The control certificate must match the host in
+`--to`; the vhost certificate must match `*.bore.example.com`. The `--udp` server option
+enables the preferred QUIC path from the publishing machine to bore. If QUIC cannot be
+used, bore keeps an encrypted TCP/TLS relay available and selects it before the HTTP body
+starts. `--relay-only` skips the QUIC attempt.
+
+```shell
+# One regular file: the original bytes are downloaded.
+bore transfer link --to https://relay.example.net:7835 \
+  --secret "$BORE_SECRET" --ca-cert /etc/bore/private-ca.pem \
+  /srv/backup/archive.tar
+
+# A directory and a file: download one uncompressed ZIP.
+bore transfer link --filename backup.zip \
+  /srv/backup/myfolder /srv/backup/manifest.txt
+```
+
+The source paths must remain stable for each download. The manifest is checked before and
+after the stream; additions, removals, replacements, unreadable files, symlinks, special
+files, non-UTF-8 names, path collisions and unsafe ZIP names fail the download. The link
+does not create a snapshot, and the command must be run again after a source changes. A
+manifest is limited to 100,000 entries, 32 MiB of encoded names and depth 256. ZIP restores
+carry file contents and directory names, but do not promise Unix ownership, ACLs, xattrs or
+hardlink identity.
+
+The flags for this command are:
+
+| Flag | Default / environment | Meaning |
+| --- | --- | --- |
+| `PATH...` | required unless `--stdin`/`--exec` | One path is byte-for-byte when it is a regular file; any directory or multiple paths produce a ZIP. |
+| `--to ADDR` | `https://brp.0912345.xyz` / `BORE_SERVER` | HTTPS control endpoint used to register the vhost. |
+| `--secret SECRET` | empty / `BORE_SECRET` | Optional server authentication secret. |
+| `--ca-cert PATH` | system roots / `BORE_CA_CERT` | Add PEM CA certificates while keeping hostname verification enabled. |
+| `--relay-only` | off | Use the encrypted TCP relay and do not request QUIC. |
+| `--carriers N` | `1` / `BORE_CARRIERS` | Number of independent backend carriers, from 1 through 32. |
+| `--filename NAME` | source basename, or `download.zip` for an archive | Name used in the download URL and `Content-Disposition`; required for `--stdin` and `--exec`. |
+| `--stdin` | off | Read one producer stream from bore's standard input. It is one-shot and has no replay buffer. |
+| `--exec -- COMMAND ARG...` | off | Start one literal Unix argv vector on the first GET; no shell is inserted. The child stdout is the download and exit status must be zero. |
+| `--max-downloads N` | `8` / `BORE_TRANSFER_MAX_DOWNLOADS` | Maximum simultaneous GET bodies for files/ZIPs; excess requests receive `503`. One-shot stdin/exec sources require `1`. |
+| `--stats-interval SECS` | `1` / `BORE_TRANSFER_STATS_INTERVAL` | Progress log interval, from 1 through 60 seconds. |
+| `-v`, `-vv` | normal logging | Increase diagnostic logging; `RUST_LOG` can override the filter. |
+
+Copy the URL printed by the running command and download it. With a public CA no trust
+override is needed; with the private CA from the example, pass the same CA to the client:
+
+```shell
+curl --fail --cacert /etc/bore/private-ca.pem -o archive.tar \
+  'https://transfer-k3m8q1z7p4n6c2xd.bore.example.com/archive.tar'
+wget --ca-certificate=/etc/bore/private-ca.pem -O archive-copy.tar \
+  'https://transfer-k3m8q1z7p4n6c2xd.bore.example.com/archive.tar'
+```
+
+GET requests may be repeated and run concurrently until the publishing process receives
+`Ctrl+C` (or `SIGTERM`). `HEAD` returns metadata without consuming the source. A `Range`
+request is deliberately served as a complete `200` response; use `curl -o` or `wget -O`
+for a complete copy. The sender logs each request's observed backend path (`direct-udp` or
+`relay` when known), bytes, elapsed time, rate, SHA-256 and outcome on stderr. A completed
+sender-side write only means that bore sent all bytes to the HTTP peer; it cannot certify
+that the recipient flushed them to stable storage. If a QUIC path is lost after a download
+has started, that HTTP request fails; retry the same URL, or start the session with
+`--relay-only` on networks where QUIC is unreliable.
+
+#### Streaming stdin and supervised exec
+
+For a producer that is already running, connect its stdout to bore. The producer can start
+before the downloader and will pause naturally when the bounded pipe is full:
+
+```shell
+sudo tar -cpf - myfolder | bore transfer link --stdin --filename backup.tar \
+  --to https://relay.example.net:7835 --secret "$BORE_SECRET"
+```
+
+`--stdin` accepts exactly one consuming GET. `HEAD` does not consume it; a simultaneous
+second GET receives `409`, and after completion or interruption later requests receive
+`410`. The stream is not spooled, so bytes already read cannot be replayed: after a failed
+download, rerun the producer and bore command. An EOF from an external pipe only means
+that the stream ended; bore cannot know whether that producer exited successfully.
+
+For a backup whose producer exit status must be checked, let bore supervise it:
+
+```shell
+sudo bore transfer link --filename backup.tar --exec -- \
+  tar -cpf - myfolder
+```
+
+The `--` separator protects tar options and filenames from bore's parser. `--exec` passes
+the exact argv without a shell, starts the child only when the first GET claims the link,
+drains and logs stderr, and requires exit status 0 before it emits a successful HTTP end.
+`sudo` belongs around bore when tar must read root-only files; the child inherits bore's
+UID/GID and supplementary privileges. GNU tar records ownership and modes while creating
+the archive. At restore time, `-p` preserves permissions and `--same-owner` preserves
+numeric ownership when extraction runs as root:
+
+```shell
+sudo tar --numeric-owner --same-owner -xpf backup.tar -C restore
+```
+
+`-p` is an extraction option; it is not a substitute for `--same-owner`. ACLs and xattrs
+need tar's explicit ACL/xattr options on both creation and extraction. The sender's SHA-256
+is logged after a successful producer completion and can be compared with `sha256sum` on
+the receiver. It still proves bytes sent to the HTTP peer, not that the peer flushed them
+to stable storage.
+
+#### Docker client
+
+The published `:client` image is the root scratch image built by
+`docker/Dockerfile.client`. Mount source files read-only and use `--workdir` (Docker has no
+`--wd` option). `-i` is required for stdin; do not add `-t`, because a pseudo-TTY can alter
+binary bytes. `--privileged` is optional for correctness and gives the client permission to
+request larger UDP socket buffers for the direct path:
+
+```shell
+docker run --pull always -i --rm --privileged --network host \
+  -v "$PWD:/dir:ro" --workdir /dir \
+  ghcr.io/manprint/bore:client-1.2.0-rc.2 \
+  transfer link myfile myfolder --to https://relay.example.net:7835 \
+  --ca-cert /dir/private-ca.pem
+
+sudo tar -cpf - myfolder | docker run --pull always -i --rm --network host \
+  -v "$PWD:/dir:ro" --workdir /dir \
+  ghcr.io/manprint/bore:client-1.2.0-rc.2 \
+  transfer link --stdin --filename backup.tar \
+  --to https://relay.example.net:7835
+```
+
+The scratch image contains only `/bore`: it has no `tar`, shell or `sudo`, so use native
+`--exec` on the host when a producer command must run under `sudo bore`, or build a separate
+image that deliberately includes that producer. A container UID/user namespace may also
+change which ownership values a restore can recreate; the root TAR gate in this repository
+checks the native `sudo bore --exec` case.
 
 ### Browser-to-browser transfer (`bore transfer web`)
 

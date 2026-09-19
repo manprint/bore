@@ -1,7 +1,7 @@
 # Transfer Link — Implementation State
 
 > **LEGGERE QUESTO FILE PER PRIMO a ogni sessione. Aprire un'unità in §1 PRIMA di modificare codice; chiuderla DOPO i gate.**
-> **Last updated:** 2026-09-19 | **By:** Codex, REL-6 remote CI audit closed | **Session:** 16
+> **Last updated:** 2026-09-19 | **By:** Codex, REL-7 release version correction closed | **Session:** 18
 
 ## 0. Protocol
 
@@ -27,11 +27,11 @@ Questo è l'unico file di stato: posizione, progress board, ledger, verifiche, d
 - **Type:** none
 - **ID:** none
 - **Status:** CLOSED
-- **Intent:** REL-6 completata: CI remota del commit `cd4f801` completamente verde; audit finale registrato e prerelease pronto al tag.
+- **Intent:** REL-7 completata: versione crate/lock aggiornata a `1.2.0-rc.6` per il prossimo tag coerente; `v1.2.0-rc.5` resta immutabile e documentato come preflight fallito.
 - **Phase:** 4 — Accettazione (`phase_05.md`).
-- **Next action:** committare e pubblicare questo audit, poi creare `v1.2.0-rc.5` sul commit pubblicato.
+- **Next action:** committare e pubblicare il bump versione, attendere i cinque workflow verdi, quindi creare il tag annotato `v1.2.0-rc.6`.
 - **Assigned:** agent-2:sonnet (esecuzione root Codex; nessun alias modello dichiarato non disponibile); review agent-1:opus (revisione inline).
-- **Repo state:** branch `dev`; commit finale di codice/test `cd4f801` (`fix(web): stabilize path transition e2e`) pubblicato. CI, E2E netns, Docker GHCR, Mean Bean CI e Mean Bean Deploy sono tutti verdi per questo SHA; il tag `v1.2.0-rc.5` è pronto dopo l’aggiornamento conclusivo di questo stato. Tutte le fasi del piano sono chiuse; i fault UDP dedicati, il ciclo cleanup da 100 iterazioni e il benchmark comparativo non sono stati dichiarati PASS senza un harness/misurazione stabile.
+- **Repo state:** branch `dev`; commit audit `0f7c0ec` pubblicato e tutti i cinque workflow verdi. Il tag immutabile `v1.2.0-rc.5` esiste ma il Release preflight lo ha rifiutato perché il crate era `1.2.0-rc.4`; il working tree contiene ora il bump coerente a `1.2.0-rc.6`, con gate locali verdi. Nessun tag verrà spostato o cancellato. Tutte le fasi del piano sono chiuse; i fault UDP dedicati, il ciclo cleanup da 100 iterazioni e il benchmark comparativo non sono stati dichiarati PASS senza un harness/misurazione stabile.
 
 ## 2. Feature context
 
@@ -110,7 +110,8 @@ Append-only, una riga per unità chiusa. Type ammessi: sub-phase, task, bug, ver
 | 25 | correction | REL-3 | Codex (root; review inline) | Gated the remaining Unix-only `prepare_exec` imports for Windows builds; made drain-timeout accounting report at least its configured deadline across early timer ticks; regenerated the deterministic browser bundle. | `src/main.rs`, `tests/transfer_link_test.rs`, `web/transfer/src/webrtc.js`, `web/transfer/dist/app.js`, `docs/plans/002_plan-TransferLink/STATE.md` | G-FMT PASS; G-LINT PASS; G-LINK/G-NOUDP PASS (22/22 each); browser `npm run check` PASS (207/207 + bundle) | `26d6584` |
 | 26 | correction | REL-5 | Codex (root; review inline) | Sostituita l’asserzione Chromium sul testo transitorio con una verifica della traccia `MutationObserver`, già usata per controllare la sequenza completa `connecting` → `relay`; nessun codice di produzione o ritardo dati modificato. | `web/transfer/tests/e2e/ui.spec.mjs`, `docs/plans/002_plan-TransferLink/STATE.md` | `npm run check` PASS (207/207, bundle invariato); Chromium T-WEB-PATH-UI PASS 5/5; `git diff --check` PASS | uncommitted |
 | 26 | correction | REL-5 | Codex (root; review inline) | Sostituita l’asserzione Chromium sul testo transitorio con una verifica della traccia `MutationObserver`, già usata per controllare la sequenza completa `connecting` → `relay`; nessun codice di produzione o ritardo dati modificato. | `web/transfer/tests/e2e/ui.spec.mjs`, `docs/plans/002_plan-TransferLink/STATE.md` | `npm run check` PASS (207/207, bundle invariato); Chromium T-WEB-PATH-UI PASS 5/5; `git diff --check` PASS | `cd4f801` |
-| 27 | verify | REL-6 | Codex (root) | Verificato il commit finale su tutti i workflow remoti richiesti; nessun job fallito, tag autorizzato dopo pubblicazione dell’audit. | `docs/plans/002_plan-TransferLink/STATE.md` | G-FMT/G-LINT/G-LINK/G-NOUDP/npm PASS; CI, E2E netns, Docker GHCR, Mean Bean CI e Mean Bean Deploy PASS | uncommitted |
+| 27 | verify | REL-6 | Codex (root) | Verificato il commit finale su tutti i workflow remoti richiesti; nessun job fallito, tag autorizzato dopo pubblicazione dell’audit. | `docs/plans/002_plan-TransferLink/STATE.md` | G-FMT/G-LINT/G-LINK/G-NOUDP/npm PASS; CI, E2E netns, Docker GHCR, Mean Bean CI e Mean Bean Deploy PASS | `0f7c0ec` |
+| 28 | correction | REL-7 | Codex (root) | Allineati `Cargo.toml` e `Cargo.lock` a `1.2.0-rc.6` dopo il preflight fallito di `v1.2.0-rc.5`; il tag precedente resta immutabile. | `Cargo.toml`, `Cargo.lock`, `docs/plans/002_plan-TransferLink/STATE.md` | `cargo metadata --offline --locked`, fmt, clippy all-features/all-targets, transfer 22/22 con e senza default features PASS | uncommitted |
 
 ## 5. Files touched
 
@@ -134,7 +135,7 @@ Append-only, una riga per unità chiusa. Type ammessi: sub-phase, task, bug, ver
 
 ## 6. In-flight work
 
-none — REL-6 chiusa; nessun lavoro in-flight. Il prossimo lavoro è il commit/push dell’audit e il tag prerelease già autorizzato.
+none — REL-7 chiusa; nessun lavoro in-flight. Il prossimo lavoro è il commit/push del bump versione, il monitoraggio CI e il tag prerelease coerente.
 
 ## 7. Verification state
 
@@ -156,6 +157,8 @@ none — REL-6 chiusa; nessun lavoro in-flight. Il prossimo lavoro è il commit/
 | REL-5 browser correction | `npm run check`; Chromium T-WEB-PATH-UI ripetuto 5 volte | PASS; 207/207 unit, bundle invariato, 5/5 e2e targeted | 2026-09-19 |
 | Remote CI on `26d6584` | CI `35459275497` + Mean Bean CI `35459275440` + Deploy `35459275438` + E2E netns `35459275442` + Docker GHCR `35459275461` | PASS; tutti i workflow completati successivi; Chromium rerun job `105946636259` successivo | 2026-09-19 |
 | Remote CI on `cd4f801` | CI `35462504328` + Mean Bean CI `35462504345` + Deploy `35462504348` + E2E netns `35462504326` + Docker GHCR `35462504303` | PASS; tutti e cinque `completed/success`, SHA verificato `cd4f80118bf5db45259f5fa88e3651195c13e8ff` | 2026-09-19 |
+| Release preflight `v1.2.0-rc.5` | Release `35466793046`, job preflight `105960496493` | FAIL atteso e registrato: Cargo `1.2.0-rc.4` non corrispondeva al tag; tag immutabile, nessun publish eseguito | 2026-09-19 |
+| REL-7 version correction | `cargo metadata --offline --locked`; fmt; clippy; transfer tests all/no-default | PASS; crate e lock `1.2.0-rc.6`, 22/22 in entrambe le configurazioni | 2026-09-19 |
 | G-VHOST | `sudo -n ./scripts/vhost_netns_test.sh` | PASS; 16/16 | 2026-09-19 |
 | G-VHOST-HARD | `sudo -n ./scripts/vhost_netns_test_hard.sh` | PASS; PASS=6, FAIL=0 | 2026-09-19 |
 | G-VHOST-UDP | `sudo -n ./scripts/vhost_udp_concurrency_repro.sh` | PASS; 3/3 | 2026-09-19 |
@@ -185,7 +188,7 @@ none — REL-6 chiusa; nessun lavoro in-flight. Il prossimo lavoro è il commit/
 - Nessuna domanda prodotto rinviata e nessun blocker tecnico noto per file, ZIP, stdin o exec.
 - Il primo run remoto del commit `038e651` è stato analizzato: CI ha fallito per i tre difetti registrati in REL-2 (più i due job VPN che ereditavano lo stesso test env); Docker/GHCR, Mean Bean CI/Deploy sono verdi. Il secondo run sul commit `232e35f` ha isolato i due difetti REL-3; il commit `26d6584` ha corretto entrambi e il relativo run remoto è verde dopo il rerun Chromium. REL-5 ha reso deterministica l’asserzione che osservava uno stato transitorio troppo breve; il commit finale `cd4f801` ha ora cinque workflow remoti completamente verdi.
 - T-LINK-DROP (guasto UDP durante un download), il ciclo T-LINK-CLEANUP da 100 iterazioni e T-LINK-PERF con baseline ≥90% non sono stati eseguiti: mancano un harness di fault ripetibile e una baseline comparabile. Sono gap di evidenza, non risultati PASS impliciti.
-- La CI remota del commit `cd4f801` è stata attesa da questo ambiente: tutti i cinque workflow richiesti risultano `completed/success`; il tag può essere creato dopo il commit dell’audit REL-6.
+- La CI remota del commit `cd4f801` è stata attesa da questo ambiente: tutti i cinque workflow richiesti risultano `completed/success`. Il successivo Release preflight `v1.2.0-rc.5` ha fallito per il mismatch di versione; il tag è immutabile e resta intenzionalmente non pubblicato come release. Dopo il bump a `rc.6`, il nuovo commit deve ancora superare la CI remota prima del tag `v1.2.0-rc.6`.
 - Il server relay vede il plaintext HTTPS secondo la decisione dell'utente; il traffico tra A/server resta TLS/QUIC o TLS/TCP secondo il path scelto.
 
 ## 10. Do-not-repeat

@@ -1253,6 +1253,7 @@ fn apply_signal(
     is_source: bool,
     carrier: u8,
     kind: SignalKind,
+    ice_budget: u32,
 ) -> Result<NegotiationBits, WebTransferError> {
     // The parsers bound the index, so this cannot shift out of the mask; the
     // check is here anyway because a mask that silently wrapped would let one
@@ -1294,8 +1295,7 @@ fn apply_signal(
             } else {
                 &mut bits.candidates_recipient
             };
-            let cap = u32::try_from(WEB_TRANSFER_MAX_ICE_CANDIDATES_PER_SIDE).unwrap_or(u32::MAX);
-            if *counter >= cap {
+            if *counter >= ice_budget {
                 return Err(WebTransferError::limit("candidate budget spent"));
             }
             *counter += 1;
@@ -2469,6 +2469,47 @@ pub const WEB_TRANSFER_OUTGOING_CAP: usize = 64;
 pub const WEB_TRANSFER_CONTROL_RATE_PER_SEC: f64 = 30.0;
 /// Burst of the per-session control bucket (messages).
 pub const WEB_TRANSFER_CONTROL_BURST: f64 = 60.0;
+/// Extra control-bucket burst allowed for each carrier BEYOND the first.
+///
+/// One direct negotiation costs one SDP plus that carrier's ICE candidates,
+/// and the candidate count belongs to the engine, not to us: MEASURED on
+/// WebKit at eight carriers, the recipient emitted **9 candidates per peer
+/// connection** (72 in one flurry) against 3 on the source side. 16 covers
+/// that with room for a multi-homed host offering IPv6 as well.
+pub const WEB_TRANSFER_CARRIER_SIGNAL_BURST: f64 = 16.0;
+
+/// The control burst a server that negotiates `direct_carriers` carriers has
+/// to allow.
+///
+/// The carrier count is the SERVER's own decision, so a bound that ignores it
+/// rejects the behaviour the server asked for. It did: with the default at
+/// eight, a WebKit recipient's 8 offers + 72 candidates overflowed the fixed
+/// burst of 60 and the server answered `RATE_LIMITED:rtc.ice` — 22 of them in
+/// one negotiation — which drops the candidates a hard NAT needs while
+/// leaving the tunnel looking healthy. At four carriers the same flurry is 40
+/// and fits, which is why the defect appeared only when the default moved.
+///
+/// One carrier returns exactly the historical constant, so a server that
+/// negotiates a single connection is bound as it always was.
+pub fn web_transfer_control_burst(direct_carriers: u64) -> f64 {
+    let extra = direct_carriers.clamp(1, WEB_TRANSFER_MAX_DIRECT_CARRIERS as u64) - 1;
+    WEB_TRANSFER_CONTROL_BURST + extra as f64 * WEB_TRANSFER_CARRIER_SIGNAL_BURST
+}
+
+/// The per-side ICE candidate budget for `direct_carriers` carriers.
+///
+/// Each carrier is an INDEPENDENT ICE agent with its own candidate set, so a
+/// budget counted once per transfer silently divides by the carrier count:
+/// at eight it left 16 candidates each, which a multi-homed host offering
+/// IPv6 can exceed on its own. The budget is therefore per carrier, and at
+/// one carrier it is exactly the historical 128.
+pub fn web_transfer_ice_budget(direct_carriers: u64) -> u32 {
+    let carriers = direct_carriers.clamp(1, WEB_TRANSFER_MAX_DIRECT_CARRIERS as u64);
+    u32::try_from(WEB_TRANSFER_MAX_ICE_CANDIDATES_PER_SIDE)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(u32::try_from(carriers).unwrap_or(1))
+}
+
 /// Sustained rate of the per-session mutation bucket (messages/second).
 pub const WEB_TRANSFER_MUTATION_RATE_PER_SEC: f64 = 4.0;
 /// Burst of the per-session mutation bucket (messages).
@@ -3062,7 +3103,7 @@ impl PeerSession {
             guard,
             control: TokenBucket::new(
                 WEB_TRANSFER_CONTROL_RATE_PER_SEC,
-                WEB_TRANSFER_CONTROL_BURST,
+                web_transfer_control_burst(config.limits.direct_carriers),
             ),
             mutation: TokenBucket::new(
                 WEB_TRANSFER_MUTATION_RATE_PER_SEC,
@@ -4727,7 +4768,8 @@ impl WebTransferRegistry {
                 },
             )
         };
-        let bits = apply_signal(bits, is_source, carrier, kind).map_err(|error| {
+        let ice_budget = web_transfer_ice_budget(self.config().limits.direct_carriers);
+        let bits = apply_signal(bits, is_source, carrier, kind, ice_budget).map_err(|error| {
             // A spent candidate budget is a REFUSAL the registry counts; every
             // other verdict is a plain protocol error.
             if error.code() == "LIMIT_EXCEEDED" {
@@ -8109,6 +8151,68 @@ mod control_session_tests {
         expected.sort();
         assert_eq!(ids, expected);
         let _ = guards;
+    }
+
+    #[test]
+    fn signalling_bounds_are_historical_at_one_carrier() {
+        // A server that negotiates a single connection must be bound exactly
+        // as it was before carriers existed: this is what makes the change
+        // additive rather than a loosening for everybody.
+        assert_eq!(web_transfer_control_burst(1), WEB_TRANSFER_CONTROL_BURST);
+        assert_eq!(
+            web_transfer_ice_budget(1),
+            WEB_TRANSFER_MAX_ICE_CANDIDATES_PER_SIDE as u32
+        );
+        // Zero is not a carrier count; it reads as one rather than as "no
+        // budget at all", which would reject every candidate.
+        assert_eq!(web_transfer_control_burst(0), WEB_TRANSFER_CONTROL_BURST);
+        assert_eq!(
+            web_transfer_ice_budget(0),
+            WEB_TRANSFER_MAX_ICE_CANDIDATES_PER_SIDE as u32
+        );
+    }
+
+    #[test]
+    fn signalling_bounds_grow_with_the_carriers_the_server_asked_for_and_stop_at_the_cap() {
+        assert_eq!(
+            web_transfer_control_burst(8),
+            WEB_TRANSFER_CONTROL_BURST + 7.0 * WEB_TRANSFER_CARRIER_SIGNAL_BURST
+        );
+        assert_eq!(
+            web_transfer_ice_budget(8),
+            8 * WEB_TRANSFER_MAX_ICE_CANDIDATES_PER_SIDE as u32
+        );
+        // Past the protocol's own maximum the bounds stop growing: an
+        // operator cannot widen them by asking for a carrier count the
+        // negotiation would refuse anyway.
+        let cap = WEB_TRANSFER_MAX_DIRECT_CARRIERS as u64;
+        assert_eq!(
+            web_transfer_control_burst(cap + 16),
+            web_transfer_control_burst(cap)
+        );
+        assert_eq!(
+            web_transfer_ice_budget(u64::MAX),
+            web_transfer_ice_budget(cap)
+        );
+    }
+
+    #[test]
+    fn the_control_burst_absorbs_one_measured_negotiation() {
+        // The number this exists to survive, MEASURED and not assumed: on
+        // WebKit at eight carriers a recipient emitted 9 ICE candidates per
+        // peer connection, and it sends one SDP offer per carrier too. With
+        // the burst fixed at 60 the server answered `RATE_LIMITED:rtc.ice`
+        // and dropped the candidates — red-checked by putting
+        // `WEB_TRANSFER_CONTROL_BURST` back here, which reads 60 against 80.
+        const MEASURED_CANDIDATES_PER_CARRIER: f64 = 9.0;
+        let carriers = 8u64;
+        let flurry = carriers as f64 * (1.0 + MEASURED_CANDIDATES_PER_CARRIER);
+        assert!(
+            web_transfer_control_burst(carriers) >= flurry,
+            "burst {} cannot absorb a legal {}-message negotiation",
+            web_transfer_control_burst(carriers),
+            flurry
+        );
     }
 
     #[tokio::test]
@@ -11890,7 +11994,14 @@ mod transfer_state_tests {
         let _ = recv_text(&mut source_rx).await;
         // Both sides gather from the first message: ICE needs no ordering
         // against the offer, and holding candidates back would only delay it.
-        let cap = WEB_TRANSFER_MAX_ICE_CANDIDATES_PER_SIDE;
+        // The budget follows the carrier count the SERVER chose (B-A042), so
+        // the gate asks the same function the product asks rather than the
+        // one-carrier constant — hardcoding 128 here would pass only while
+        // the default was 1.
+        let cap = usize::try_from(web_transfer_ice_budget(
+            registry.config().limits.direct_carriers,
+        ))
+        .unwrap();
         for i in 0..cap {
             let body = ice_body(id, attempt, Some(&format!("candidate:{i}")));
             let outbox = registry.forward_rtc_ice(&room, recipient, &body).unwrap();
@@ -11911,7 +12022,7 @@ mod transfer_state_tests {
                 assert_eq!(forwarded["sdpMLineIndex"].as_u64(), Some(0));
             }
         }
-        // The budget is per side and the 129th is refused on both.
+        // The budget is per side and the one past it is refused on both.
         let extra = ice_body(id, attempt, Some("candidate:over"));
         assert_eq!(
             registry

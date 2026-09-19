@@ -1,9 +1,81 @@
-/* Accessible base styles for the web-transfer shell. No framework. */
+/* Web-transfer shell. No framework, no external font, no CDN asset: this
+   file is the whole of the design, and it ships inside the binary.
+
+   Two constraints come from the gates and not from taste, so they are
+   written here where someone about to redesign will read them.
+
+   1. `T-WEB-UI` asserts that the tab order IS the visual order and never
+      moves up the page. The three zones therefore stay in ONE COLUMN at
+      every width — a two-column desktop layout would send the tab sequence
+      down the left column and back up to the right one, which is exactly
+      the assertion that would break, and the assertion is right.
+   2. The same gate asserts the zones do not move while a transfer runs, so
+      nothing here transitions a property that affects layout. Hover and
+      focus change colour and shadow, never size or position. */
+
 :root {
   color-scheme: light dark;
-  --fg: CanvasText;
-  --bg: Canvas;
-  --accent: LinkText;
+
+  /* Spacing: one scale, used everywhere, so the rhythm is a decision made
+     once instead of a number guessed per rule. */
+  --s-1: 0.25rem;
+  --s-2: 0.5rem;
+  --s-3: 0.75rem;
+  --s-4: 1rem;
+  --s-5: 1.5rem;
+  --s-6: 2rem;
+
+  --r-sm: 0.375rem;
+  --r-md: 0.625rem;
+  --r-lg: 1rem;
+  --r-pill: 999px;
+
+  /* Light palette. `Canvas`/`CanvasText` stay as the fallback the forced-
+     colours user gets; everything else is stated so the page is not at the
+     mercy of a link colour for every border it draws. */
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-sunken: #eef0f4;
+  --fg: #16181d;
+  --fg-muted: #5c6170;
+  --border: #d7dae2;
+  --border-strong: #b9bec9;
+  --accent: #1d4ed8;
+  --accent-fg: #ffffff;
+  --accent-soft: #e7edfd;
+  --ok: #15803d;
+  --warn: #b45309;
+  --danger: #b42318;
+
+
+  /* The reading measure. Wider than the old 40rem — the catalogue tree and
+     the transfer rows are tabular, not prose — but still bounded, because a
+     full-width line of file names on a 27" screen is unreadable. */
+  --measure: 56rem;
+
+  /* Every interactive control is at least this tall. 44px is the pointer
+     target size a touch screen needs; below it a phone user misses. */
+  --tap: 2.75rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115;
+    --surface: #171a21;
+    --surface-sunken: #12151b;
+    --fg: #e8eaf0;
+    --fg-muted: #a1a7b6;
+    --border: #2b3039;
+    --border-strong: #3c424e;
+    --accent: #6f9bff;
+    --accent-fg: #0f1115;
+    --accent-soft: #1b2436;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --danger: #f87171;
+    --shadow-sm: 0 1px 2px rgb(0 0 0 / 40%);
+    --shadow-md: 0 2px 6px rgb(0 0 0 / 35%), 0 10px 24px rgb(0 0 0 / 35%);
+  }
 }
 
 * {
@@ -15,25 +87,86 @@ body {
   background: var(--bg);
   color: var(--fg);
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-  line-height: 1.5;
+  font-size: 1rem;
+  line-height: 1.55;
+  -webkit-text-size-adjust: 100%;
 }
 
 main {
-  max-width: 40rem;
+  max-width: var(--measure);
   margin: 0 auto;
-  padding: 2rem 1rem;
+  /* Fluid gutter: 1rem on a phone, 2rem once there is room for it. The
+     side padding never falls below 1rem, so text never touches the edge. */
+  padding: clamp(var(--s-4), 4vw, var(--s-6)) clamp(var(--s-4), 3vw, var(--s-6))
+    var(--s-6);
 }
 
 h1 {
-  font-size: 1.5rem;
-  margin: 0 0 0.5rem;
+  font-size: clamp(1.35rem, 1.1rem + 1.2vw, 1.75rem);
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  margin: 0 0 var(--s-3);
 }
 
+h2 {
+  font-size: 1.0625rem;
+  line-height: 1.3;
+  margin: 0 0 var(--s-3);
+  letter-spacing: 0.01em;
+}
+
+h3 {
+  font-size: 0.8125rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+  margin: 0 0 var(--s-2);
+}
+
+h4 {
+  font-size: 0.9375rem;
+  line-height: 1.35;
+  margin: 0 0 var(--s-1);
+}
+
+/* A file name is arbitrary text from another peer: it must wrap rather than
+   push the page sideways. This is the single commonest way a layout like
+   this breaks on a phone, so it is stated on the headings and rows that
+   carry names and not left to chance. */
+h4,
+.tree-name,
+.offer-meta,
+.transfer-meta,
+#save-name,
+#peer-list li {
+  overflow-wrap: anywhere;
+}
+
+/* --- room status and announcements ---------------------------------- */
+
 #room-status {
-  margin: 0 0 1rem;
-  padding: 0.75rem 1rem;
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin: 0 0 var(--s-3);
+  padding: var(--s-3) var(--s-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  font-size: 0.9375rem;
+}
+
+/* The announcement line is seen as well as announced: a message only a
+   screen reader receives is a message the product did not deliver. */
+.app-toast-live {
+  margin: 0 0 var(--s-4);
+  padding: var(--s-2) var(--s-3);
   border: 1px solid var(--accent);
-  border-radius: 0.5rem;
+  border-left-width: 4px;
+  border-radius: var(--r-sm);
+  background: var(--accent-soft);
+  color: var(--fg);
+  font-size: 0.9375rem;
 }
 
 .visually-hidden {
@@ -45,40 +178,59 @@ h1 {
   white-space: nowrap;
 }
 
-section {
-  margin: 1.25rem 0;
+/* --- the three zones -------------------------------------------------- */
+
+.zone {
+  margin: 0 0 var(--s-4);
+  padding: clamp(var(--s-3), 2.5vw, var(--s-5));
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
 }
 
-h2 {
-  font-size: 1.125rem;
-  margin: 0 0 0.5rem;
+/* The zone heading carries a short accent rule so the three sections are
+   told apart at a glance without relying on their titles being read. */
+.zone > h2 {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin-top: 0;
 }
 
-h3 {
-  font-size: 1rem;
-  margin: 0.75rem 0 0.25rem;
+.zone > h2::before {
+  content: "";
+  flex: none;
+  width: 0.25rem;
+  height: 1.05em;
+  border-radius: var(--r-pill);
+  background: var(--accent);
 }
 
-h4 {
-  font-size: 1rem;
-  margin: 0 0 0.25rem;
+.zone section {
+  margin: 0 0 var(--s-4);
 }
 
-#peer-list {
-  margin: 0;
-  padding-left: 1.25rem;
+.zone section:last-of-type {
+  margin-bottom: 0;
 }
+
+/* --- controls --------------------------------------------------------- */
 
 button {
   font: inherit;
-  margin-right: 0.5rem;
-  margin-bottom: 0.5rem;
-  padding: 0.4rem 0.8rem;
-  border: 1px solid var(--accent);
-  border-radius: 0.375rem;
-  background: var(--bg);
+  font-weight: 500;
+  min-height: var(--tap);
+  padding: var(--s-2) var(--s-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
   color: var(--fg);
   cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: var(--surface-sunken);
+  border-color: var(--accent);
 }
 
 button:disabled {
@@ -86,116 +238,182 @@ button:disabled {
   cursor: not-allowed;
 }
 
+/* One primary action per zone, and it is the one that moves the user
+   forward. Everything else stays quiet so the primary is findable. */
+#add-file,
+#save-file,
+#rename-form button {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+#add-file:hover:not(:disabled),
+#save-file:hover:not(:disabled),
+#rename-form button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 85%, var(--fg));
+  border-color: color-mix(in srgb, var(--accent) 85%, var(--fg));
+}
+
+/* Destructive, and it says so before it is pressed. */
+#discard-file {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+
+#discard-file:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface));
+  border-color: var(--danger);
+}
+
 button:focus-visible,
 input:focus-visible,
+summary:focus-visible,
 #dropzone:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
+/* Rows of buttons wrap instead of overflowing, and on a narrow screen each
+   one takes the full width rather than being squeezed under the tap size. */
+#share-actions,
+#save-section,
+#diagnostics-section {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  align-items: center;
+}
+
 #rename-form {
   display: flex;
-  gap: 0.5rem;
+  flex-wrap: wrap;
+  gap: var(--s-2);
   align-items: center;
 }
 
 #rename-input {
   font: inherit;
-  padding: 0.4rem 0.6rem;
-  border: 1px solid var(--accent);
-  border-radius: 0.375rem;
-  background: var(--bg);
+  flex: 1 1 12rem;
+  /* Without this a flex item refuses to shrink below its content and the
+     form pushes the page wider than the screen. */
+  min-width: 0;
+  min-height: var(--tap);
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
   color: var(--fg);
 }
 
-#dropzone {
-  margin: 0.5rem 0;
-  padding: 1.5rem 1rem;
-  border: 2px dashed var(--accent);
-  border-radius: 0.5rem;
-  text-align: center;
+/* iOS zooms the page when a focused input's text is under 16px. Keeping the
+   font at 1rem is what prevents that, so it is not a stylistic choice. */
+#rename-input,
+button {
+  font-size: 1rem;
 }
 
-.offer-group {
-  border-top: 1px solid var(--accent);
-  padding-top: 0.25rem;
-}
-
-.offer-card {
-  border: 1px solid var(--accent);
-  border-radius: 0.5rem;
-  padding: 0.5rem 0.75rem;
-  margin: 0.5rem 0;
-}
-
-.offer-meta {
+#peer-list {
   margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+}
+
+#peer-list li {
+  padding: var(--s-1) var(--s-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface-sunken);
   font-size: 0.875rem;
 }
 
+/* --- dropzone --------------------------------------------------------- */
+
+#dropzone {
+  flex: 1 1 100%;
+  margin: var(--s-2) 0 0;
+  padding: clamp(var(--s-4), 4vw, var(--s-6)) var(--s-4);
+  border: 2px dashed var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--surface-sunken);
+  color: var(--fg-muted);
+  text-align: center;
+  font-size: 0.9375rem;
+}
+
+/* Drag feedback. The change is a THICKER border and a tinted background,
+   not a hue swap: a target that only changes colour tells a colour-blind
+   user nothing, and a filter/animation would fight prefers-reduced-motion.
+   The border width is part of the box, so it is compensated by the padding
+   staying put — the zone does not resize under the pointer. */
+#dropzone[data-dragging="true"] {
+  border-style: solid;
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  color: var(--fg);
+  font-weight: 600;
+}
+
+#dropzone[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* --- offers ----------------------------------------------------------- */
+
+.offer-group {
+  margin: 0 0 var(--s-3);
+  padding: 0;
+  border: 0;
+}
+
+.offer-group > h3 {
+  padding-bottom: var(--s-1);
+  border-bottom: 1px solid var(--border);
+}
+
+.offer-card,
 .transfer-row {
-  border: 1px solid var(--accent);
-  border-radius: 0.5rem;
-  padding: 0.5rem 0.75rem;
-  margin: 0.5rem 0;
+  padding: var(--s-3);
+  margin: var(--s-2) 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
 }
 
-.transfer-row h4 {
-  margin: 0 0 0.25rem;
-}
-
+.offer-meta,
 .transfer-meta,
 .transfer-state {
   margin: 0;
   font-size: 0.875rem;
+  color: var(--fg-muted);
 }
 
-/* The path badge answers the one question this feature exists for: are the
-   bytes going peer to peer, or through the server? It reads `in connessione`
-   until the recipient has VERIFIED a chunk over the committed transport. */
-.transfer-path {
-  display: inline-block;
-  padding: 0.05rem 0.4rem;
-  border-radius: 999px;
-  border: 1px solid currentColor;
-  font-size: 0.8125rem;
-  font-weight: 600;
-  line-height: 1.4;
+.offer-error {
+  margin: var(--s-2) 0 0;
+  padding: var(--s-2) var(--s-3);
+  border-left: 3px solid var(--danger);
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+  color: var(--fg);
+  font-size: 0.875rem;
 }
 
-.transfer-path[data-path="connecting"] {
-  color: #6b7280;
-}
+/* --- catalogue tree --------------------------------------------------- */
 
-.transfer-path[data-path="direct"] {
-  color: #15803d;
-}
-
-.transfer-path[data-path="relay"] {
-  color: #b45309;
-}
-
-.transfer-progress {
-  width: 100%;
-}
-
-/* State is carried by text as well as colour: colour alone is not a signal. */
-.transfer-state[data-state="failed"] {
-  font-weight: 600;
-}
-
-.transfer-state[data-state="cancelled"] {
-  font-style: italic;
-}
-
-/* Catalog tree: one indent level per directory, sizes right of the name.
-   The disclosure triangle is the native one, so keyboard and screen reader
-   behaviour comes from the engine and not from this file. */
+/* One indent level per directory, sizes right of the name. The disclosure
+   triangle is the native one, so keyboard and screen-reader behaviour comes
+   from the engine and not from this file. */
 .offer-tree,
 .tree-children {
   list-style: none;
-  margin: 0.25rem 0 0;
-  padding-left: 1rem;
+  margin: var(--s-1) 0 0;
+  /* A deep tree on a 360px screen runs out of width before it runs out of
+     depth, so the indent is small and shrinks no further. */
+  padding-left: var(--s-3);
 }
 
 .offer-tree {
@@ -205,77 +423,105 @@ input:focus-visible,
 .tree-file,
 .offer-tree summary {
   display: flex;
-  gap: 0.5rem;
+  flex-wrap: wrap;
+  gap: var(--s-2);
   align-items: baseline;
+  /* Lets the long name wrap instead of widening the row. */
+  min-width: 0;
+  padding: var(--s-1) 0;
 }
 
 .offer-tree summary {
   cursor: pointer;
+  border-radius: var(--r-sm);
 }
 
-.offer-tree summary:focus-visible {
-  outline: 2px solid #1d4ed8;
-  outline-offset: 2px;
+.tree-name {
+  min-width: 0;
 }
 
 .tree-size {
-  color: #6b7280;
+  color: var(--fg-muted);
   font-size: 0.85em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
-/* --- 5.6: three stable zones, drag feedback, empty states --------------
-
-   The page is three zones in a fixed order — la mia room, offerte,
-   trasferimenti — and nothing moves between them while a transfer runs. The
-   visual order IS the DOM order, which is what makes the tab order match it
-   without a single `tabindex`. */
-.zone {
-  margin: 1.5rem 0;
-  padding: 0.75rem 1rem;
-  border: 1px solid var(--accent);
-  border-radius: 0.75rem;
+.tree-download {
+  min-height: auto;
+  padding: var(--s-1) var(--s-2);
+  font-size: 0.8125rem;
 }
 
-.zone > h2 {
-  margin-top: 0;
+/* --- transfers -------------------------------------------------------- */
+
+.transfer-row h4 {
+  margin: 0 0 var(--s-1);
 }
 
-.zone section {
-  margin: 0.75rem 0;
+.transfer-info {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  align-items: center;
 }
 
-/* Drag feedback. The change is a THICKER border and a tinted background,
-   not a hue swap: a target that only changes colour tells a colour-blind
-   user nothing, and a filter/animation would fight prefers-reduced-motion. */
-#dropzone[data-dragging="true"] {
-  border-width: 3px;
-  border-style: solid;
-  background: color-mix(in srgb, var(--accent) 12%, var(--bg));
+.transfer-progress {
+  width: 100%;
+  height: 0.5rem;
+  margin: var(--s-2) 0;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: var(--surface-sunken);
+  /* Firefox honours these directly; the pseudo-elements below cover the
+     WebKit/Blink pair. All three end up with the same two colours. */
+  color: var(--accent);
+  accent-color: var(--accent);
+  overflow: hidden;
+}
+
+.transfer-progress::-webkit-progress-bar {
+  background: var(--surface-sunken);
+  border-radius: var(--r-pill);
+}
+
+.transfer-progress::-webkit-progress-value {
+  background: var(--accent);
+  border-radius: var(--r-pill);
+}
+
+.transfer-progress::-moz-progress-bar {
+  background: var(--accent);
+  border-radius: var(--r-pill);
+}
+
+/* The path badge answers the one question this feature exists for: are the
+   bytes going peer to peer, or through the server? It reads `in connessione`
+   until the recipient has VERIFIED a chunk over the committed transport. */
+.transfer-path {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem 0.5rem;
+  border-radius: var(--r-pill);
+  border: 1px solid currentColor;
+  font-size: 0.8125rem;
   font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
 }
 
-#dropzone[aria-disabled="true"] {
-  opacity: 0.55;
-  cursor: not-allowed;
+.transfer-path[data-path="connecting"] {
+  color: var(--fg-muted);
 }
 
-/* Empty states are text, in the zone they describe, and they say what to do
-   next rather than only that something is missing. */
-/* The announcement line is seen as well as announced: a message only a
-   screen reader receives is a message the product did not deliver. */
-.app-toast-live {
-  margin: 0 0 1rem;
-  padding: 0.5rem 0.75rem;
-  border-left: 4px solid var(--accent);
-  border-radius: 0.25rem;
-  background: color-mix(in srgb, var(--accent) 8%, var(--bg));
-  font-size: 0.9375rem;
+.transfer-path[data-path="direct"] {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
 }
 
-.empty-state {
-  margin: 0.25rem 0;
-  font-size: 0.9375rem;
-  opacity: 0.85;
+.transfer-path[data-path="relay"] {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
 }
 
 /* The badge's shape sits before its word. Both carry the answer, so losing
@@ -284,29 +530,96 @@ input:focus-visible,
   margin-right: 0.3rem;
 }
 
-/* Dark scheme: the two hardcoded greys above are chosen for a light Canvas
-   and fall under AA on a dark one, so they are restated here rather than
-   left to be read at 2.9:1. */
-@media (prefers-color-scheme: dark) {
-  .tree-size {
-    color: #a1a1aa;
+/* State is carried by text as well as colour: colour alone is not a signal. */
+.transfer-state[data-state="failed"] {
+  font-weight: 600;
+  color: var(--danger);
+}
+
+.transfer-state[data-state="cancelled"] {
+  font-style: italic;
+}
+
+/* --- verified-file panel --------------------------------------------- */
+
+#save-section {
+  margin: var(--s-4) 0 0;
+  padding: var(--s-3);
+  border: 1px solid var(--ok);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--ok) 8%, var(--surface));
+}
+
+#save-name {
+  flex: 1 1 100%;
+  margin: 0 0 var(--s-2);
+  font-weight: 600;
+}
+
+/* --- diagnostics ------------------------------------------------------ */
+
+#diagnostics-section {
+  margin-top: var(--s-4);
+  padding-top: var(--s-3);
+  border-top: 1px solid var(--border);
+}
+
+#copy-diagnostics {
+  font-size: 0.875rem;
+  color: var(--fg-muted);
+}
+
+/* Empty states are text, in the zone they describe, and they say what to do
+   next rather than only that something is missing. */
+.empty-state {
+  margin: var(--s-2) 0;
+  padding: var(--s-3);
+  border: 1px dashed var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-sunken);
+  color: var(--fg-muted);
+  font-size: 0.9375rem;
+}
+
+/* --- narrow screens --------------------------------------------------- */
+
+@media (max-width: 30rem) {
+  /* Under ~480px a row of two buttons leaves neither of them a readable
+     label, so each action takes the line. The dropzone already spans. */
+  #share-actions > button,
+  #save-section > button,
+  #rename-form > button {
+    flex: 1 1 100%;
   }
 
-  .transfer-path[data-path="connecting"] {
-    color: #a1a1aa;
+  .zone {
+    border-radius: var(--r-md);
   }
 
-  .transfer-path[data-path="direct"] {
-    color: #4ade80;
-  }
-
-  .transfer-path[data-path="relay"] {
-    color: #fbbf24;
+  /* A file name plus its size plus a button does not fit one line here;
+     wrapping is already allowed, this keeps the wrapped size aligned with
+     the name instead of hanging under the indent. */
+  .tree-file,
+  .offer-tree summary {
+    row-gap: 0;
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  * {
-    transition: none;
+/* Forced-colours (Windows high contrast) throws away every colour above.
+   The layout must still read, so the borders are restored from the system
+   palette rather than left invisible. */
+@media (forced-colors: active) {
+  .zone,
+  .offer-card,
+  .transfer-row,
+  #room-status,
+  #dropzone,
+  .empty-state {
+    border: 1px solid CanvasText;
+  }
+
+  .zone > h2::before {
+    background: CanvasText;
   }
 }
+

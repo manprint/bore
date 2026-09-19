@@ -2965,6 +2965,7 @@ async fn t_web_limits() -> Result<()> {
     args.max_peers_per_room = 3;
     let config = bore_cli::web_transfer::resolve_server_config(&args, false, port)?
         .expect("config resolves");
+    let carriers_for_bounds = config.limits.direct_carriers;
     let mut server = Server::new(1024..=65535, None);
     server.set_control_port(port);
     server.set_web_transfer(config)?;
@@ -3095,7 +3096,9 @@ async fn t_web_limits() -> Result<()> {
     // from the server's own constants, so a bucket that really moves still
     // fails in either direction.
     let flood_elapsed = flood_started.elapsed();
-    let burst = bore_cli::web_transfer::WEB_TRANSFER_CONTROL_BURST as u32;
+    // ...and the burst is the one the SERVER sized for its carrier count
+    // (B-A042): at one carrier this is the historical constant.
+    let burst = bore_cli::web_transfer::web_transfer_control_burst(carriers_for_bounds) as u32;
     let refilled = (bore_cli::web_transfer::WEB_TRANSFER_CONTROL_RATE_PER_SEC
         * flood_elapsed.as_secs_f64())
     .ceil() as u32;
@@ -4474,8 +4477,18 @@ async fn t_web_signaling() -> Result<()> {
     let port = support::free_port().await?;
     let mut args = support::enabled_args();
     args.base_url = Some(format!("http://127.0.0.1:{port}/"));
+    // ONE carrier, and the reason is the cost of the gate rather than the
+    // shape of it: the per-side ICE budget is `128 x carriers` (B-A042), so at
+    // the shipped eight this loop would put 1024 control messages per side on
+    // a bucket that refills at 30/s — about thirty-five seconds of the test
+    // spent waiting for tokens, to prove a multiplication that three unit
+    // gates already pin. What only the WIRE can prove is that the budget is
+    // per side and that the marker still travels, and one carrier proves that
+    // at the historical 128.
+    args.direct_carriers = 1;
     let config = bore_cli::web_transfer::resolve_server_config(&args, false, port)?
         .expect("config resolves");
+    let carriers_for_bounds = config.limits.direct_carriers;
     let mut server = Server::new(1024..=65535, None);
     server.set_control_port(port);
     server.set_web_transfer(config)?;
@@ -4639,7 +4652,12 @@ async fn t_web_signaling() -> Result<()> {
     assert_eq!(forwarded["sdp"].as_str(), Some("v=0 real answer"));
 
     // 128 candidates from the recipient, then the 129th is refused.
-    for n in 0..128u32 {
+    // The per-side budget is `128 x carriers` (B-A042), so the gate asks the
+    // same function the server asks: a hardcoded 128 would pass only while the
+    // shipped default was one carrier, and this test deliberately runs on the
+    // shipped defaults.
+    let ice_budget = bore_cli::web_transfer::web_transfer_ice_budget(carriers_for_bounds);
+    for n in 0..ice_budget {
         // The control bucket is 30/s with a burst of 60; pace past the burst
         // so this test measures the CANDIDATE budget and not that one.
         if n >= 50 {
@@ -4669,7 +4687,7 @@ async fn t_web_signaling() -> Result<()> {
         "3f".repeat(16),
         serde_json::json!({
             "transferId": transfer_id, "attemptId": attempt_id,
-            "candidate": "candidate:129 1 udp",
+            "candidate": "candidate:over-budget 1 udp",
         })
     );
     assert_eq!(got, "error", "{err}");

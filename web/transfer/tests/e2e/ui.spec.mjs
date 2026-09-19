@@ -560,4 +560,126 @@ test.describe.serial("ui", () => {
     await a.cleanup();
     await b.cleanup();
   });
+
+  // T-WEB-UI-RESPONSIVE (T-A018). A layout is responsive when it survives the
+  // narrowest screen people actually use AND the content the page does not
+  // choose: a file name arrives from another peer and can be any length, and
+  // an unbreakable one is the single commonest way a page like this starts
+  // scrolling sideways. So the gate publishes a 180-character name and then
+  // asks the ENGINE whether the document is wider than the window — the
+  // measurement a screenshot cannot make and an eye misses.
+  test("T-WEB-UI-RESPONSIVE a phone screen fits, with a name the page did not choose", async () => {
+    test.setTimeout(180_000);
+    // No hyphen, no underscore, no dot until the extension: an engine breaks
+    // a line at those, so a name that HAS them is not the hard case. This one
+    // offers the layout no break opportunity at all, which is what makes the
+    // gate red without `overflow-wrap`.
+    // 121 characters: just under `MAX_LABEL_CHARS` (128), which is the
+    // longest name the product itself accepts — a longer one is refused at
+    // publish and would measure the validator instead of the layout.
+    const longName = `${"Registrazione".repeat(9)}.bin`;
+    writeFileSync(join(roomDir, longName), filler(4096, 9));
+
+    const peer = await openPeer();
+    await expectConnected(peer.page);
+    await publish(peer, longName);
+
+    // 320 is the narrowest phone still in use; 360 is the common one. The
+    // claim has to hold at both, so both are measured rather than assumed
+    // from one.
+    for (const width of [320, 360, 414]) {
+      await peer.page.setViewportSize({ width, height: 740 });
+      const overflow = await peer.page.evaluate(() => ({
+        doc: document.documentElement.scrollWidth,
+        win: window.innerWidth,
+        widest: [...document.querySelectorAll("#app *")]
+          .map((node) => {
+            const box = node.getBoundingClientRect();
+            return [node.id || node.className || node.tagName, Math.round(box.right)];
+          })
+          .sort((a, b) => b[1] - a[1])[0],
+      }));
+      // One pixel of tolerance: a fractional layout rounds up, and a
+      // sub-pixel is not a sideways scroll.
+      expect(
+        overflow.doc,
+        `at ${width}px the document is ${overflow.doc}px wide; the widest box is ${JSON.stringify(overflow.widest)}`,
+      ).toBeLessThanOrEqual(overflow.win + 1);
+    }
+
+    // The three zones stay ONE COLUMN and in order — the same property
+    // `T-WEB-UI` asserts for the tab sequence, here at phone width where a
+    // careless grid would have wrapped them side by side.
+    await peer.page.setViewportSize({ width: 360, height: 740 });
+    const zones = await peer.page.evaluate(() =>
+      ["zone-room", "zone-offers", "zone-transfers"].map((id) => {
+        const box = document.getElementById(id).getBoundingClientRect();
+        return {
+          id,
+          top: Math.round(box.top + window.scrollY),
+          left: Math.round(box.left),
+          width: Math.round(box.width),
+        };
+      }),
+    );
+    for (let i = 1; i < zones.length; i += 1) {
+      expect(zones[i].top).toBeGreaterThan(zones[i - 1].top);
+      expect(zones[i].left).toBe(zones[0].left);
+    }
+
+    // Touch targets. A control under ~44px is one a thumb misses, and the
+    // stylesheet claims `--tap`; this is what makes the claim true rather
+    // than written. Measured on the controls a first-time user needs, not on
+    // every button in the tree.
+    const targets = await peer.page.evaluate(() =>
+      ["add-file", "add-folder", "copy-link", "rename-input"]
+        .map((id) => document.getElementById(id))
+        .filter((node) => node !== null && node.offsetParent !== null)
+        .map((node) => [node.id, Math.round(node.getBoundingClientRect().height)]),
+    );
+    expect(targets.length).toBeGreaterThan(3);
+    for (const [id, height] of targets) {
+      expect(height, `${id} is ${height}px tall`).toBeGreaterThanOrEqual(43);
+    }
+
+    expect(peer.failures).toEqual([]);
+    await peer.cleanup();
+  });
+
+  // The other half of the same claim: a wide screen must not simply stretch.
+  // An unbounded line of file names on a 27-inch monitor is as unusable as a
+  // sideways scroll on a phone, and it is the failure that gets shipped
+  // because the developer's own window hides it.
+  test("T-WEB-UI-RESPONSIVE a wide screen keeps one column and a bounded measure", async () => {
+    test.setTimeout(120_000);
+    const peer = await openPeer();
+    await expectConnected(peer.page);
+    await peer.page.setViewportSize({ width: 1600, height: 900 });
+
+    const layout = await peer.page.evaluate(() => {
+      const main = document.getElementById("app");
+      const box = main.getBoundingClientRect();
+      return {
+        width: Math.round(box.width),
+        left: Math.round(box.left),
+        right: Math.round(window.innerWidth - box.right),
+        zones: ["zone-room", "zone-offers", "zone-transfers"].map((id) => {
+          const z = document.getElementById(id).getBoundingClientRect();
+          return { top: Math.round(z.top + window.scrollY), left: Math.round(z.left) };
+        }),
+      };
+    });
+    // Bounded: the measure is 56rem, so the container never spans 1600px.
+    expect(layout.width).toBeLessThanOrEqual(900);
+    // Centred, so the content is not pinned to one edge of a wide screen.
+    expect(Math.abs(layout.left - layout.right)).toBeLessThanOrEqual(2);
+    // Still one column, still in order.
+    for (let i = 1; i < layout.zones.length; i += 1) {
+      expect(layout.zones[i].top).toBeGreaterThan(layout.zones[i - 1].top);
+      expect(layout.zones[i].left).toBe(layout.zones[0].left);
+    }
+
+    expect(peer.failures).toEqual([]);
+    await peer.cleanup();
+  });
 });

@@ -812,7 +812,14 @@ export function createAttemptRtc({
           // the sequence and cost the whole direct attempt. So the deadline
           // asks for PROGRESS, not for a level: no progress in a full
           // deadline is a dead path, and anything else re-arms.
-          const movedTo = sink.transmittedBytes;
+          // ...and it asks the LIVE channel. A channel that closed reports
+          // `bufferedAmount` 0 because the queue was DISCARDED, so the
+          // difference this reads as "transmitted" is exactly the bytes that
+          // were lost — the one reading that must never re-arm.
+          const movedTo =
+            channel !== null && channel.readyState === "open"
+              ? sink.transmittedBytes
+              : transmittedAt;
           if (movedTo > transmittedAt) {
             transmittedAt = movedTo;
             timer = setTimeout(onDeadline, drainTimeoutMs);

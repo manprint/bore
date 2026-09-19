@@ -4,7 +4,8 @@
 // `cargo test --all-features` / `cargo build --all-features`.
 import { spawn } from "node:child_process";
 import net from "node:net";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -179,16 +180,27 @@ export async function spawnRoomEnv({
     );
   }
   await waitPort(port);
-  // Freshness: the server embeds dist at compile time; a stale binary
-  // serves a shell with no room logic and every test times out.
-  const asset = await fetch(`http://127.0.0.1:${port}/transfer/assets/app.js`, {
-    headers: { Host: `127.0.0.1:${port}` },
-  }).then((response) => response.text());
-  if (!asset.includes("peer-list")) {
-    server.kill("SIGKILL");
-    throw new Error(
-      "stale embedded app bundle: run cargo build --all-features after npm run build",
-    );
+  // Freshness: the server embeds dist at COMPILE time, so `npm run build`
+  // alone changes nothing the suite can see. This used to look for one
+  // string inside `app.js`, which answers "is there a bundle at all" and not
+  // "is it the one on disk" — and it is blind to `app.css` entirely, so a
+  // stylesheet gate ran against whatever CSS the binary was built with. The
+  // check is now a hash comparison, per asset, and it names the file: a
+  // stale stylesheet and a stale script need the same command but produce
+  // very different confusion.
+  for (const name of ["app.js", "app.css"]) {
+    const served = await fetch(`http://127.0.0.1:${port}/transfer/assets/${name}`, {
+      headers: { Host: `127.0.0.1:${port}` },
+    }).then((response) => response.arrayBuffer());
+    const onDisk = readFileSync(join(root, "web", "transfer", "dist", name));
+    const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
+    if (digest(Buffer.from(served)) !== digest(onDisk)) {
+      server.kill("SIGKILL");
+      throw new Error(
+        `stale embedded ${name}: the server is serving a different build than web/transfer/dist/${name}. ` +
+          "Run `npm run build --prefix web/transfer` then `cargo build --all-features`.",
+      );
+    }
   }
   const owner = track(
     spawn(ownerBin, [`127.0.0.1:${port}`, ...(relayOnly ? ["relay-only"] : [])], {

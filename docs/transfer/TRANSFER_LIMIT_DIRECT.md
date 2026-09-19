@@ -5,8 +5,10 @@
 > wire, and both judged a queue by how FULL it was instead of by whether it
 > was CHANGING: the recipient's reorder window (B-A040) and the sender's drain
 > deadline (B-A041). Both are fixed and re-measured on the wire, and the
-> carrier default moved from 4 to 8 on the result. §0 is the answer,
-> §8 is the resolution and what it cost to find. Everything from §1 to §7 is
+> carrier default moved from 4 to 8 on the result — and §9 is what that move
+> then exposed: two signalling bounds that ignored the carrier count, and a
+> progress signal that read its own opposite on a closed channel. §0 is the
+> answer, §8 is the resolution and what it cost to find. Everything from §1 to §7 is
 > kept as it was WRITTEN — hypotheses, dead ends and all — because the lesson
 > of this campaign is where the five hypotheses were looking, and editing them
 > after the fact would delete it.
@@ -644,3 +646,51 @@ downloads pays eight peer connections each time for a saving it does not
 need. Making the server scale the count to the offer's size is strictly
 better than any constant and is recorded as an open improvement rather than
 done at the hour this was measured.
+
+## 9. What raising the default cost, and what it exposed (B-A042, B-A043)
+
+Moving the default from four carriers to eight made two latent defects
+reachable. Neither was in the data path: both were in what the data path needs
+in order to start.
+
+**A bound that ignored a number the server itself chose.** Two signalling
+bounds were constants sized for one negotiation — the control burst (60,
+refilling at 30/s) and the per-side ICE candidate budget (128, counted per
+TRANSFER rather than per carrier). At eight carriers eight offers, eight
+answers and eight swarms of candidates leave at once, so the product spends
+its own burst: WebKit collected 22 `RATE_LIMITED:rtc.ice` refusals in a single
+room, and a carrier whose candidates are refused never pairs.
+
+The headroom recorded a few hours earlier — "≈24 candidates per side against
+128, 5× of margin, documented rather than fixed unmeasured" — was measured on
+**one engine**. Chromium emits about 2 local candidates per peer connection;
+**WebKit emits 9** (`web/transfer/tests/perf/ice-count.mjs`, recipient side,
+`perConnection=[9,9,9,9,9,9,9,9]` — 72 per side against Chromium's 24). A
+capacity measured on the thriftiest engine is not a bound, it is a best case.
+
+Both bounds now derive from the carrier count —
+`web_transfer_control_burst(n) = 60 + (n−1)×16` and
+`web_transfer_ice_budget(n) = 128 × n`, pure, clamped to the maximum carrier
+count, and at one carrier exactly the historical values, so no existing server
+changes behaviour. The gate that already existed for the ICE budget asked for
+a hardcoded 128 and **failed the moment the default became 8**; it now asks
+the same function the product asks, which is also what proves the wiring is
+live.
+
+**A progress signal that read its opposite on a closed channel.** §8.5's fix
+re-arms the drain deadline while `handedBytes − bufferedAmount` grows. A
+channel that has CLOSED reports `bufferedAmount` 0 because its queue was
+discarded — so the difference the function reads as "transmitted" is exactly
+the block of bytes that was LOST, and the one reading that must end the
+attempt is the one that re-armed it. On WebKit the sender then never declared
+the direct path dead and the relay leg never started. Progress is now asked
+only of a channel whose `readyState` is `open`.
+
+**And one finding that belongs to neither layer.** The room page's redesign
+(T-A018) first shipped with box shadows and colour transitions on every card.
+Under the load of the browser suite, on WebKit, their rendering cost was
+enough to starve the control socket's ping: the page fell to `Riconnessione…`
+and the transfer died, with a trace that never mentions CSS. The same repro
+without those two properties is 15 of 15. Separation is carried by borders
+instead. A presentation-only change goes through the browser gate like a
+transport change.

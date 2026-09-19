@@ -182,7 +182,14 @@ export function createView(
     "aria-label": "Diagnostica percorso",
   });
 
-  const shareSection = el(doc, "section", { "aria-label": "Condivisione" });
+  // `share-actions` is a styling hook, not a new control: the stylesheet
+  // lays this row out as a wrapping flex line so the two buttons and the
+  // dropzone reflow on a phone instead of overflowing. Nothing is added to
+  // the document and nothing moves, so the tab order is untouched.
+  const shareSection = el(doc, "section", {
+    id: "share-actions",
+    "aria-label": "Condivisione",
+  });
   const addFile = el(
     doc,
     "button",

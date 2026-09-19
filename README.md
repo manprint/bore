@@ -2382,6 +2382,15 @@ launched, so a pipe reading stdout is never beaten by the browser.
   additive, so an old server would create an ordinary room and answer success; the CLI
   compares what it asked for with what the server confirms, closes the room it will not use
   and exits with an error naming the flag.
+- **The room page is one column at every width, and that is a constraint rather than a
+  style.** A gate asserts that the tab order is the visual order and never jumps backwards,
+  which a multi-column layout cannot honour at every breakpoint, and that the three zones
+  (room, offers, transfers) do not move while a transfer runs. Within that: fluid spacing,
+  a light and a dark palette taken from the system preference, controls at least 44 px tall
+  so a phone can hit them, and any name the page did not choose — a file name is the user's
+  — wrapped mid-word rather than allowed to widen the page. Gated at 320, 360 and 414 px
+  with a 121-character unbreakable file name, and at 1600 px, where the content stops
+  widening and stays centred.
 - **The path is chosen per transfer, and it is chosen twice.** A transfer starts by trying
   the direct WebRTC path and falls back to the relay when it cannot be built or when it
   breaks. Two things make the fall reliable rather than lucky. The recipient runs an

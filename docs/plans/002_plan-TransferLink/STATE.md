@@ -1,7 +1,7 @@
 # Transfer Link — Implementation State
 
 > **LEGGERE QUESTO FILE PER PRIMO a ogni sessione. Aprire un'unità in §1 PRIMA di modificare codice; chiuderla DOPO i gate.**
-> **Last updated:** 2026-09-19 | **By:** Codex, REL-5 browser race closed | **Session:** 15
+> **Last updated:** 2026-09-19 | **By:** Codex, REL-6 remote CI audit closed | **Session:** 16
 
 ## 0. Protocol
 
@@ -27,11 +27,11 @@ Questo è l'unico file di stato: posizione, progress board, ledger, verifiche, d
 - **Type:** none
 - **ID:** none
 - **Status:** CLOSED
-- **Intent:** REL-5 completata: resa deterministica l’asserzione Chromium che osserva la transizione `connecting` → `relay`, senza modificare il percorso dati.
+- **Intent:** REL-6 completata: CI remota del commit `cd4f801` completamente verde; audit finale registrato e prerelease pronto al tag.
 - **Phase:** 4 — Accettazione (`phase_05.md`).
-- **Next action:** committare e pubblicare su `dev`, attendere tutte le pipeline remote del commit finale; creare `v1.2.0-rc.5` soltanto sul commit con CI completamente verde.
+- **Next action:** committare e pubblicare questo audit, poi creare `v1.2.0-rc.5` sul commit pubblicato.
 - **Assigned:** agent-2:sonnet (esecuzione root Codex; nessun alias modello dichiarato non disponibile); review agent-1:opus (revisione inline).
-- **Repo state:** branch `dev`; commit `26d6584` (`fix(transfer): stabilize cross-platform CI`) già pubblicato; REL-5 è pronta per il commit finale e la nuova CI. Il workflow `35459275497` e gli altri workflow del commit precedente sono verdi dopo rerun Chromium; il tag resta bloccato fino al commit finale con CI completamente verde. Tutte le fasi del piano sono chiuse; i fault UDP dedicati, il ciclo cleanup da 100 iterazioni e il benchmark comparativo non sono stati dichiarati PASS senza un harness/misurazione stabile.
+- **Repo state:** branch `dev`; commit finale di codice/test `cd4f801` (`fix(web): stabilize path transition e2e`) pubblicato. CI, E2E netns, Docker GHCR, Mean Bean CI e Mean Bean Deploy sono tutti verdi per questo SHA; il tag `v1.2.0-rc.5` è pronto dopo l’aggiornamento conclusivo di questo stato. Tutte le fasi del piano sono chiuse; i fault UDP dedicati, il ciclo cleanup da 100 iterazioni e il benchmark comparativo non sono stati dichiarati PASS senza un harness/misurazione stabile.
 
 ## 2. Feature context
 
@@ -109,6 +109,8 @@ Append-only, una riga per unità chiusa. Type ammessi: sub-phase, task, bug, ver
 | 24 | correction | REL-2 | Codex (root) | Gated Unix-only `oneshot` imports/constants so Windows clippy is clean; serialized the env-sensitive Link CLI parser test and restored `BORE_SERVER`; removed forced offline resolution from the Docker acceptance fallback so clean runners can fetch the locked graph. | `src/transfer_link/oneshot.rs`, `src/main.rs`, `scripts/transfer_link_container_test.sh`, `docs/plans/002_plan-TransferLink/STATE.md` | fmt PASS; clippy all-features/all-targets PASS; selected regression 0 failed; CLI unit PASS; Docker acceptance PASS | `232e35f` |
 | 25 | correction | REL-3 | Codex (root; review inline) | Gated the remaining Unix-only `prepare_exec` imports for Windows builds; made drain-timeout accounting report at least its configured deadline across early timer ticks; regenerated the deterministic browser bundle. | `src/main.rs`, `tests/transfer_link_test.rs`, `web/transfer/src/webrtc.js`, `web/transfer/dist/app.js`, `docs/plans/002_plan-TransferLink/STATE.md` | G-FMT PASS; G-LINT PASS; G-LINK/G-NOUDP PASS (22/22 each); browser `npm run check` PASS (207/207 + bundle) | `26d6584` |
 | 26 | correction | REL-5 | Codex (root; review inline) | Sostituita l’asserzione Chromium sul testo transitorio con una verifica della traccia `MutationObserver`, già usata per controllare la sequenza completa `connecting` → `relay`; nessun codice di produzione o ritardo dati modificato. | `web/transfer/tests/e2e/ui.spec.mjs`, `docs/plans/002_plan-TransferLink/STATE.md` | `npm run check` PASS (207/207, bundle invariato); Chromium T-WEB-PATH-UI PASS 5/5; `git diff --check` PASS | uncommitted |
+| 26 | correction | REL-5 | Codex (root; review inline) | Sostituita l’asserzione Chromium sul testo transitorio con una verifica della traccia `MutationObserver`, già usata per controllare la sequenza completa `connecting` → `relay`; nessun codice di produzione o ritardo dati modificato. | `web/transfer/tests/e2e/ui.spec.mjs`, `docs/plans/002_plan-TransferLink/STATE.md` | `npm run check` PASS (207/207, bundle invariato); Chromium T-WEB-PATH-UI PASS 5/5; `git diff --check` PASS | `cd4f801` |
+| 27 | verify | REL-6 | Codex (root) | Verificato il commit finale su tutti i workflow remoti richiesti; nessun job fallito, tag autorizzato dopo pubblicazione dell’audit. | `docs/plans/002_plan-TransferLink/STATE.md` | G-FMT/G-LINT/G-LINK/G-NOUDP/npm PASS; CI, E2E netns, Docker GHCR, Mean Bean CI e Mean Bean Deploy PASS | uncommitted |
 
 ## 5. Files touched
 
@@ -132,7 +134,7 @@ Append-only, una riga per unità chiusa. Type ammessi: sub-phase, task, bug, ver
 
 ## 6. In-flight work
 
-none — REL-5 gates verdi localmente; nessun lavoro in-flight. Il prossimo lavoro è il commit/push autorizzato e il monitoraggio CI remoto del commit finale.
+none — REL-6 chiusa; nessun lavoro in-flight. Il prossimo lavoro è il commit/push dell’audit e il tag prerelease già autorizzato.
 
 ## 7. Verification state
 
@@ -153,6 +155,7 @@ none — REL-5 gates verdi localmente; nessun lavoro in-flight. Il prossimo lavo
 | REL-3 local correction | fmt, clippy all-features/all-targets, Link tests con e senza default features, `web/transfer` `npm run check` | PASS; import Unix gated, drain deadline stable, browser 207/207 e bundle riproducibile | 2026-09-19 |
 | REL-5 browser correction | `npm run check`; Chromium T-WEB-PATH-UI ripetuto 5 volte | PASS; 207/207 unit, bundle invariato, 5/5 e2e targeted | 2026-09-19 |
 | Remote CI on `26d6584` | CI `35459275497` + Mean Bean CI `35459275440` + Deploy `35459275438` + E2E netns `35459275442` + Docker GHCR `35459275461` | PASS; tutti i workflow completati successivi; Chromium rerun job `105946636259` successivo | 2026-09-19 |
+| Remote CI on `cd4f801` | CI `35462504328` + Mean Bean CI `35462504345` + Deploy `35462504348` + E2E netns `35462504326` + Docker GHCR `35462504303` | PASS; tutti e cinque `completed/success`, SHA verificato `cd4f80118bf5db45259f5fa88e3651195c13e8ff` | 2026-09-19 |
 | G-VHOST | `sudo -n ./scripts/vhost_netns_test.sh` | PASS; 16/16 | 2026-09-19 |
 | G-VHOST-HARD | `sudo -n ./scripts/vhost_netns_test_hard.sh` | PASS; PASS=6, FAIL=0 | 2026-09-19 |
 | G-VHOST-UDP | `sudo -n ./scripts/vhost_udp_concurrency_repro.sh` | PASS; 3/3 | 2026-09-19 |
@@ -180,9 +183,9 @@ none — REL-5 gates verdi localmente; nessun lavoro in-flight. Il prossimo lavo
 ## 9. Blockers and open questions
 
 - Nessuna domanda prodotto rinviata e nessun blocker tecnico noto per file, ZIP, stdin o exec.
-- Il primo run remoto del commit `038e651` è stato analizzato: CI ha fallito per i tre difetti registrati in REL-2 (più i due job VPN che ereditavano lo stesso test env); Docker/GHCR, Mean Bean CI/Deploy sono verdi. Il secondo run sul commit `232e35f` ha isolato i due difetti REL-3; il commit `26d6584` ha corretto entrambi e il relativo run remoto è verde dopo il rerun Chromium. REL-5 rende deterministica l’asserzione che aveva osservato uno stato transitorio troppo breve; la CI del nuovo commit finale resta obbligatoria prima del tag.
+- Il primo run remoto del commit `038e651` è stato analizzato: CI ha fallito per i tre difetti registrati in REL-2 (più i due job VPN che ereditavano lo stesso test env); Docker/GHCR, Mean Bean CI/Deploy sono verdi. Il secondo run sul commit `232e35f` ha isolato i due difetti REL-3; il commit `26d6584` ha corretto entrambi e il relativo run remoto è verde dopo il rerun Chromium. REL-5 ha reso deterministica l’asserzione che osservava uno stato transitorio troppo breve; il commit finale `cd4f801` ha ora cinque workflow remoti completamente verdi.
 - T-LINK-DROP (guasto UDP durante un download), il ciclo T-LINK-CLEANUP da 100 iterazioni e T-LINK-PERF con baseline ≥90% non sono stati eseguiti: mancano un harness di fault ripetibile e una baseline comparabile. Sono gap di evidenza, non risultati PASS impliciti.
-- La CI remota del commit `26d6584` è stata attesa da questo ambiente: tutti i cinque workflow richiesti sono successivi. Il monitoraggio remoto del commit finale che includerà REL-5 resta obbligatorio prima del tag.
+- La CI remota del commit `cd4f801` è stata attesa da questo ambiente: tutti i cinque workflow richiesti risultano `completed/success`; il tag può essere creato dopo il commit dell’audit REL-6.
 - Il server relay vede il plaintext HTTPS secondo la decisione dell'utente; il traffico tra A/server resta TLS/QUIC o TLS/TCP secondo il path scelto.
 
 ## 10. Do-not-repeat

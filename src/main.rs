@@ -17,6 +17,8 @@ use anyhow::{Context, Result};
 use bore_cli::shared::{AdvertiseEntry, Ipv4Net, VpnAddrRequest};
 #[cfg(feature = "ssh-gateway")]
 use bore_cli::sshgw_auth;
+#[cfg(unix)]
+use bore_cli::transfer_link::prepare_exec;
 #[cfg(all(
     feature = "vpn",
     any(
@@ -42,9 +44,8 @@ use bore_cli::{
         SenderOptions as TransferSenderOptions, SymlinkMode,
     },
     transfer_link::{
-        prepare_exec, prepare_selection, prepare_stdin, LinkOptions, PreparedSource,
-        DEFAULT_MAX_DOWNLOADS, DEFAULT_STATS_INTERVAL, MAX_STATS_INTERVAL_SECS,
-        MIN_STATS_INTERVAL_SECS,
+        prepare_selection, prepare_stdin, LinkOptions, PreparedSource, DEFAULT_MAX_DOWNLOADS,
+        DEFAULT_STATS_INTERVAL, MAX_STATS_INTERVAL_SECS, MIN_STATS_INTERVAL_SECS,
     },
     transfer_link_cli::{bind_source_supervisor, public_file_url, LinkSupervisorConfig},
     weblog::{AccessLogConfig, AccessLogger},

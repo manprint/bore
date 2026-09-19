@@ -828,7 +828,11 @@ export function createAttemptRtc({
           settled = true;
           waiters.delete(finish);
           signal?.removeEventListener("abort", onAbort);
-          const waited = Date.now() - startedAt;
+          // A timer is allowed to fire one scheduler tick before its nominal
+          // delay on some Node/browser clocks. The event is still the
+          // configured deadline, so report at least that deadline rather than
+          // publishing a trace that claims a shorter timeout than the policy.
+          const waited = Math.max(drainTimeoutMs, Date.now() - startedAt);
           trace.drainTimedOut(waited, channel?.bufferedAmount ?? queued);
           trace.mark("drain-timeout", {
             waitedMs: waited,

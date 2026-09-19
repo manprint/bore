@@ -3,8 +3,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(unix)]
+use bore_cli::transfer_link::prepare_exec;
 use bore_cli::transfer_link::{
-    content_disposition, encode_path_segment, filename_from_path, prepare_exec, prepare_selection,
+    content_disposition, encode_path_segment, filename_from_path, prepare_selection,
     spawn_file_producer_with_options, validate_filename, FileProducerOptions, LinkConfigError,
     LinkLimits, LinkOptions, ManifestEntryKind, PreparedFile, PreparedSource, SourceMessage,
     TransferLinkHttp, ValidationGate, MAX_DOWNLOADS, MAX_FILENAME_BYTES,

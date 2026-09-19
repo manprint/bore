@@ -332,12 +332,32 @@ pub struct WebTransferLimits {
     /// 12.98, four 21.57, eight 31.45, relay 44.0. `1` is the path as it was
     /// before carriers, message for message.
     ///
-    /// `4` is kept as the default deliberately. Eight is 46 % faster on THAT
-    /// link and is now stable there (B-A040), but it is one wired path at one
-    /// RTT: this repository has twice been wrong generalising a single link's
-    /// ladder, and the recipient — who does not choose the count — pays the
-    /// reorder window's memory for it. Operators who have qualified their
-    /// link raise it with `--web-transfer-direct-carriers 8`.
+    /// `8` is the default since 2026-09-19, raised from `4`. The bound this
+    /// works around is MECHANICAL and not a property of the link that
+    /// measured it — one SCTP association delivers at most its send buffer
+    /// divided by the RTT, and no knob reaches that buffer from JavaScript —
+    /// so a longer path makes carriers matter MORE, not less. That is what
+    /// separates this from the ladders V-10 warns about generalising: those
+    /// tuned a queue DEPTH to one radio's behaviour, this one adds
+    /// independent flows against an arithmetic ceiling.
+    ///
+    /// Two things had to be true before raising it, and both were measured.
+    /// **Stability at the hard size:** 1 GiB, three repetitions, eight
+    /// carriers — 3/3 stayed on the direct path at 31.00 MiB/s, where before
+    /// B-A040 and B-A041 it fell back 3/3. **No fixed tax:** the count is a
+    /// room constant, so a 10 KiB file pays it too; on 8 MiB, eight carriers
+    /// cost +15 ms to the first byte (publish 148 -> 163 ms) and saved
+    /// 1128 ms of transfer (1812 -> 684 ms). Break-even is near 110 KiB, and
+    /// below it both counts finish inside 40 ms.
+    ///
+    /// The cost that remains is the recipient's, who does not choose the
+    /// count: the reorder window's budget grows per carrier
+    /// (`reorderBudget`), so eight carriers raise the worst-case ceiling
+    /// to 64 MiB per transfer, and `max_transfers_per_peer` transfers can
+    /// hold one each. It is a CEILING and not a reservation — the measured
+    /// peak on a 1 GiB eight-carrier transfer was 12-17 MB — but an operator
+    /// serving memory-constrained recipients lowers this to `4`, which is
+    /// the path this default shipped on until today.
     ///
     /// The earlier note here read "four 41.42", which is the RELAY's rate on
     /// that link: the arm had fallen back and nothing checked.
@@ -359,7 +379,7 @@ impl Default for WebTransferLimits {
             max_relays_global: 256,
             relay_rate_bytes_per_s: 104857600,
             owner_grace_secs: 60,
-            direct_carriers: 4,
+            direct_carriers: 8,
         }
     }
 }

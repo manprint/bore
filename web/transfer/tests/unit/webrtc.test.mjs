@@ -429,6 +429,55 @@ test("web-transfer webrtc", async (t) => {
     assert.deepEqual(missed.events.failed, []);
   });
 
+  // B-A041. The deadline used to fire on a LEVEL — "the queue never reached
+  // the low mark" — and the fullest queue belongs to the SLOWEST carrier,
+  // which is exactly the one the writer keeps fed and which may therefore
+  // never dip inside any deadline. MEASURED on the wire: the carrier this
+  // killed had transmitted 28.3 MB at 2.4-2.8 MB/s throughout the very ten
+  // seconds it was killed for. Killing it lost the frames it still held,
+  // which put a permanent hole in the ordered stream and cost the whole
+  // direct attempt.
+  await t.test("a_busy_carrier_is_not_a_stalled_one", async () => {
+    const h = harness("answerer", { drainTimeoutMs: 40 });
+    await h.actor.start();
+    const channel = new FakeChannel(CHANNEL_LABEL, { protocol: CHANNEL_PROTOCOL });
+    h.pc().handOverChannel(channel);
+    await h.actor.handleSignal("rtc.offer", { sdp: "v=0 remote" });
+    channel.becomeOpen();
+    const sink = h.actor.sink;
+
+    // Above the high mark and it STAYS there: this carrier is never idle.
+    sink.send(new Uint8Array(RTC_HIGH_WATER + 1));
+    assert.ok(channel.bufferedAmount > RTC_HIGH_WATER);
+
+    let outcome = null;
+    const parked = sink
+      .waitLow(new AbortController().signal)
+      .then(() => "resolved", (error) => error.name)
+      .then((value) => {
+        outcome = value;
+        return value;
+      });
+
+    // Four deadline periods of real progress: each round puts 50 KB on the
+    // wire and hands 50 KB more, so the QUEUE never moves and the carrier
+    // plainly does.
+    for (let round = 0; round < 4; round += 1) {
+      await wait(20);
+      channel.bufferedAmount -= 50_000;
+      sink.send(new Uint8Array(50_000));
+    }
+    await wait(20);
+    assert.equal(outcome, null, "a carrier that is moving bytes is still waiting, not dead");
+    assert.deepEqual(h.events.failed, [], "and it was not failed");
+
+    // Stop moving, and the same deadline still ends it — the protection
+    // V003-F02 added is intact, it just asks the right question now.
+    await wait(120);
+    assert.equal(await parked, "AbortError");
+    assert.deepEqual(h.events.failed, ["timeout"]);
+  });
+
   await t.test("ready_requires_open_valid_channel_and_min_message_size", async () => {
     // A channel that opens before the answer is NOT ready: the server refuses
     // a `direct_ready` from a side that has not finished its own SDP step.

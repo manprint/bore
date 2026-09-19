@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-19 03:45 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 13
+> **Last updated:** 2026-09-19 05:05 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 13
 
 ## 0. Protocol
 
@@ -25,14 +25,14 @@ This is the only execution-state file — position, progress, ledger, and blocke
 
 ## 1. Current unit
 
-- **Type:** `bug`
-- **ID:** `B-A041`
-- **Status:** `OPEN`
-- **Intent:** su un trasferimento LUNGO un carrier muore a meta' strada e porta con se' i frame gia' accodati, quindi il flusso ha un buco permanente e il tentativo e' irrecuperabile. MISURATO due volte, a 4 e a 8 carrier: `drain-timeout waitedMs=10000 queued=552980` e `queued=555276` — sempre ~553 KB, cioe' appena sopra `RTC_HIGH_WATER` (524288). Il destinatario NON e' saturo (occupato al 27%, `opfs.sync` 5,3 ms/chunk = 188 MiB/s), quindi l'ipotesi "finestra di ricezione chiusa dal destinatario" e' gia' indebolita.
+- **Type:** `task`
+- **ID:** `T-A018`
+- **Status:** `none`
+- **Intent:** rivedere il frontend delle room: organizzazione e dimensioni dei componenti, resa gradevole, e responsive fino al mobile — con i test che lo tengono.
 - **Phase:** 7 (`phase_08.md`)
-- **Next action:** con la serie per carrier appena aggiunta all'harness, confrontare `channel.bytesSent` e `pair.bytesSent` del carrier che muore: trasporto che sale a canale fermo = SCTP che ritrasmette; entrambi fermi = non gli e' permesso spedire.
+- **Next action:** aprire T-A018 e partire dal layout di `web/transfer/src/view.js` + `app.css`, censendo le tre zone stabili che la 5.6 ha fissato prima di toccarle.
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | tag `v1.2.0-rc.3` pubblicato su `2e8da87` | albero pulito a `f74a14d`, piu' il rapporto `TRANSFER_LIMIT_DIRECT.md`
+- **Repo state:** branch `dev` | tag `v1.2.0-rc.3` pubblicato su `2e8da87` | B-A041 e T-A017 chiusi, in attesa di commit
 
 ## 2. Feature context (self-contained recap)
 
@@ -208,6 +208,8 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 
 | 123 | task | T-A016 | agent-1:Claude-Opus-5 | misurato il percorso diretto OLTRE la scadenza di negoziazione (il regime che B-A037 ha reso possibile) e indagato sul codice: a 1 carrier 3/3 sopravvivono a 512 MiB, a 4 carrier 1/6, a 1 GiB il percorso oscilla; il guasto scala con la DURATA e la vecchia scadenza lo mascherava | docs/transfer/TRANSFER_LIMIT_DIRECT.md, docs/transfer/WEB_TRANSFER_PERF.md, README.md | 28 trasferimenti reali tutti completi e verificati; nessun default toccato (WiFi + istanza a credito, V-10) | uncommitted |
 | 124 | bug | B-A040 | agent-1:Claude-Opus-5 | il destinatario abbandonava un percorso diretto SANO: finestra di riordino con tetto FISSO a 8 MiB, dimensionata sulla velocita' di UNA associazione mentre si riempie a quella delle altre N-1. Budget ora per-carrier (`reorderBudget`) e verdetto di stallo spostato dai byte al TEMPO (`REORDER_STALL_MS`) | web/transfer/src/receiver.js, web/transfer/src/perf.js, web/transfer/src/webrtc.js, src/web_transfer.rs, web/transfer/tests/unit/attempt.test.mjs, web/transfer/tests/perf/wan-source.mjs, web/transfer/dist/app.js, README.md, docs/transfer/TRANSFER_LIMIT_DIRECT.md | `npm run check` 206/206 (3 nuovi gate, 2 red-checked); e2e 3 motori 160 passati/0 falliti; `cargo fmt` + `clippy -D warnings` puliti; SUL CAMPO sweep 256 MiB x3 con bracci alternati: zero MISMATCH su 12 bracci diretti, 5,9/12,98/21,57/31,45 MiB/s a 1/2/4/8 carrier (prima: c4 cadeva 1/3, c8 3/3) | uncommitted |
+| 125 | bug | B-A041 | agent-1:Claude-Opus-5 | la scadenza di drenaggio del MITTENTE scattava su un LIVELLO, non su uno stallo: `waitLow` ammazzava un carrier che non fosse sceso sotto `RTC_LOW_WATER` entro `DRAIN_TIMEOUT_MS`, e il carrier piu' lento di un gruppo tenuto pieno dallo scrittore non ci scende MAI. Ucciderlo perde i frame gia' accodati (~553 KB misurati) = buco permanente nel flusso ordinato. Ora la scadenza chiede PROGRESSO (`transmittedBytes = handedBytes - bufferedAmount`) e si riarma finche' i byte si muovono | web/transfer/src/webrtc.js, web/transfer/tests/unit/webrtc.test.mjs, web/transfer/tests/perf/wan-source.mjs, web/transfer/dist/app.js | `npm run check` 207/207 (nuovo gate `a_busy_carrier_is_not_a_stalled_one`, red-checked: senza il riarmo il carrier occupato viene ucciso); SUL CAMPO il caso peggiore, 1 GiB a 8 carrier x3: 3/3 diretto puro a 31,00 MiB/s [31,00 30,24 31,75] contro 0/3 prima. Al default spedito, 1 GiB a 4 carrier x3: 3/3 a 22,30 MiB/s (prima 2/3) | uncommitted |
+| 126 | task | T-A017 | agent-1:Claude-Opus-5 | `--web-transfer-direct-carriers` da 4 a 8. Il bound su cui i carrier lavorano e' ARITMETICO (una associazione SCTP consegna al piu' il suo buffer diviso l'RTT, e nessuna API del browser lo raggiunge), quindi un percorso piu' LUNGO e' limitato di piu' per associazione e i carrier servono di piu', non di meno: e' cio' che distingue questo caso dai ladder che V-10 vieta di generalizzare, che tararono una PROFONDITA' di coda sul comportamento di un link | src/web_transfer.rs, web/transfer/src/webrtc.js, README.md, docs/transfer/TRANSFER_LIMIT_DIRECT.md | soak 20/20 `direct` puro a 1 GiB x 8 carrier (30,17 MiB/s mediana, 20 GiB spostati, zero cadute); tassa fissa misurata +15 ms al primo byte contro -1128 ms di trasferimento a 8 MiB; e2e browser **rieseguita col nuovo default** 160 passati / 0 falliti su 3 motori; `cargo test --lib` 820/0; `cargo fmt` + `clippy -D warnings` puliti | uncommitted |
 
 ## 5. Files touched
 
@@ -643,10 +645,15 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | docs/transfer/TRANSFER_LIMIT_DIRECT.md | nuovo: il limite misurato del percorso diretto, l'indagine sul codice e il protocollo per la ripetizione su cavo | T-A016 |
 | docs/transfer/WEB_TRANSFER_PERF.md | §7.6: la riga `carriers=1` non e' piu' contaminata, e si spiega | T-A016 |
 | README.md | il limite su trasferimenti grandi, detto per intero e con le sue riserve | T-A016 |
+| web/transfer/src/webrtc.js | la scadenza di drenaggio chiede PROGRESSO (`transmittedBytes = handedBytes - bufferedAmount`) e si riarma finche' i byte si muovono; commento del gruppo aggiornato con le misure a 1 GiB e col default | B-A041, T-A017 |
+| web/transfer/tests/unit/webrtc.test.mjs | `a_busy_carrier_is_not_a_stalled_one`: un carrier tenuto pieno dallo scrittore non viene ucciso, uno davvero fermo si | B-A041 |
+| src/web_transfer.rs | `direct_carriers` da 4 a 8, con la ragione per cui questo caso NON e' il ladder che V-10 vieta di generalizzare | T-A017 |
+| docs/transfer/TRANSFER_LIMIT_DIRECT.md | §0 e §8.5 riscritte sul secondo difetto; la sezione del default ora dice perche' e' salito | B-A041, T-A017 |
+| README.md | il default dei carrier, la tassa fissa misurata e il 3 di 3 a 1 GiB | B-A041, T-A017 |
 
 ## 6. In-flight work
 
-`B-A041` aperto: scritta finora SOLO la cattura diagnostica `series` in `web/transfer/tests/perf/wan-source.mjs` (per-carrier, opt-in con `WT_CARRIER_EVENTS`). Nessuna modifica al prodotto.
+`none — tree consistent`
 
 ## 7. Verification state
 
@@ -744,6 +751,15 @@ the exact corrected full regression now passes.
 | T-A016 — sweep WAN 512 MiB | `SWEEP=1,2,4,8 SIZE_MB=512 REPS=3 scripts/perf/web_transfer_wan.sh` | diretto puro 3/3 a c1, 2/3 a c2, 0/3 a c4 e c8; relay 12/12 a ~43,7 MiB/s | T-A016, 2026-09-19 |
 | T-A016 — 1 GiB al default spedito | `SIZE_MB=1024 REPS=2 ARMS=direct,relay ...` | `['direct','relay','direct']` e `['direct','relay','direct','relay']`; 4/4 completi, byte esatti | T-A016, 2026-09-19 |
 | T-A016 — CI del gate B-A039 | i cinque workflow su `f74a14d` | tutti `success` | T-A016, 2026-09-19 |
+| B-A040 — picchi di riordino a 1 GiB / 8 carrier | `dst.reorder.bytes` letto da `__borePerf` | picco 12,1 / 14,9 / 17,1 MB nelle tre ripetizioni: OGNUNA sopra il vecchio tetto fisso di 8 MiB | B-A041, 2026-09-19 |
+| B-A040 — picchi al default spedito (1 GiB / 4 carrier) | idem | 6,9 / 8,4 / 5,8 MB; la seconda a 21 KB dal vecchio tetto — il filo del rasoio che spiegava il 2/3 | B-A041, 2026-09-19 |
+| B-A041 — campo, caso peggiore | `WT_CARRIER_EVENTS=1 CARRIERS=8 SIZE_MB=1024 REPS=3 ARMS=direct` | `commits=['direct']` 3/3, 31,00 MiB/s [31,00 30,24 31,75]; prima della correzione 0/3 | B-A041, 2026-09-19 |
+| B-A041 — campo, default spedito | `CARRIERS=4 SIZE_MB=1024 REPS=3 ARMS=direct` | `commits=['direct']` 3/3, 22,30 MiB/s [21,69 23,95 22,30] | B-A041, 2026-09-19 |
+| B-A041 — frontend | `npm run build && npm run check --prefix web/transfer` | `pass 207/207` | B-A041, 2026-09-19 |
+| T-A017 — soak di stabilita' a 8 carrier | `CARRIERS=8 SIZE_MB=1024 REPS=20 ARMS=direct` sul percorso reale | **20/20 `direct` puro**, zero cadute, 20 GiB spostati; 30,17 MiB/s mediana su 29,66-31,63 (escursione 6,6%), primo byte in 142-169 ms | T-A017, 2026-09-19 |
+| T-A017 — tassa fissa dei carrier | `SWEEP=1,8 SIZE_MB=8 REPS=5 ARMS=direct` | c1 `publishMs` 148 / `sendMs` 1812; c8 163 / 684. +15 ms al primo byte, -1128 ms di trasferimento; pareggio ~110 KiB | T-A017, 2026-09-19 |
+| T-A017 — candidati ICE a 8 carrier | letti da `trace.candidates` | 2 locali per carrier (`host` + `srflx`) => ~24 per lato contro un tetto di 128: 5x di margine, bound lasciato intatto di proposito (§9) | T-A017, 2026-09-19 |
+| T-A017 — egress AWS del soak | delta di `/proc/net/dev` sulla VM attraverso i 20 GiB | 1414,57 MB, cioe' **6,59%** del payload: il percorso e' ingress (workstation -> VM) e l'egress e' solo il ritorno | T-A017, 2026-09-19 |
 
 ## 8. Runtime deviations from the plan
 
@@ -910,7 +926,31 @@ the exact corrected full regression now passes.
 
 **2026-09-18, B-A030/B-A031 — due commenti che affermavano un fatto sbagliato, e cio' che e' costato.** Il parser di `rtc.ice` rifiutava l'end-of-candidates per sezione m con il commento «una forma che nessuno produce»: la producono Firefox e WebKit, perche' la specifica la prescrive, e il costo e' stato 62 messaggi rifiutati in una singola esecuzione. `signal_slot` chiamava `INVALID_MESSAGE` la segnalazione in ritardo, cioe' la corsa ORDINARIA fra un trickle ICE che dura secondi e una negoziazione che finisce in millisecondi. Regola operativa: **un commento che dice «nessuno fa X» e' un'ipotesi, e va misurata come tale** — qui bastava un gate che leggesse gli errori di controllo della pagina, che infatti non esisteva e ora esiste. Corollario trovato subito dopo: aggiungere un codice d'errore in UN solo elenco lo fa uscire sul filo come `INTERNAL` (`error_envelope` riscrive gli sconosciuti), e un `INTERNAL` che non lascia traccia nel log non e' diagnosticabile — per questo `WebTransferError::internal` ora logga.
 
+**2026-09-19, B-A040/B-A041 — due guardie che giudicavano uno STATO invece di un ANDAMENTO, una per capo del filo.** Il destinatario abbandonava un percorso diretto sano perche' la finestra di riordino aveva un tetto FISSO di 8 MiB: dimensionato sulla velocita' di UNA associazione mentre a riempirlo sono le altre N-1, quindi «troppi byte in attesa» diventava vero al crescere dei carrier senza che nulla fosse rotto. Il mittente uccideva un carrier sano perche' la scadenza di drenaggio chiedeva un LIVELLO: «sei sceso sotto il segno basso entro 10 s?», domanda a cui il carrier piu' lento di un gruppo tenuto pieno risponde no per sempre, mentre trasmette 28,3 MB a 2,4 MB/s. Le due correzioni sono la stessa correzione: la prima sposta il verdetto dai byte al TEMPO (`REORDER_STALL_MS`, una lacuna che non si chiude), la seconda dal livello al PROGRESSO (`transmittedBytes`, byte che non si muovono). **Regola generale:** in un gruppo di carrier una coda piena e' la firma del lavoro, non del guasto — occupato e bloccato hanno lo stesso stato istantaneo e si distinguono solo guardando se qualcosa cambia. Il prezzo di sbagliare non e' simmetrico: uccidere un carrier che trasmette perde i frame che aveva in coda (~553 KB misurati) e apre nel flusso ordinato un buco che nessuno rispedira', cioe' un tentativo perduto per proteggere il percorso da un guasto che non c'era. Corollario di misura: entrambi i difetti scalano con la DURATA e con i carrier, e nessuna delle due campagne precedenti poteva vederli perche' guardavano il mittente e il trasporto — il primo difetto era nel controllo di ammissione del DESTINATARIO e il secondo nella guardia del mittente contro se stesso.
+
 ## 9. Blockers and open questions
+
+**APERTO (registrato, non corretto) — il budget ICE non scala con i carrier.**
+`WEB_TRANSFER_MAX_ICE_CANDIDATES_PER_SIDE` (128) e' contato in
+`NegotiationBits.candidates_{source,recipient}`, cioe' **per trasferimento e
+non per carrier**: portare il default da 4 a 8 dimezza il budget effettivo per
+carrier, da 32 a 16. MISURATO sul percorso reale a 8 carrier: 2 candidati
+locali per carrier (un `host`, un `srflx`) piu' il marcatore di fine, cioe'
+~24 per lato contro 128 — **5x di margine**. Un host multi-homed (piu'
+interfacce, IPv6, bridge docker) puo' avvicinarsi; nessuno lo ha ancora
+prodotto. Il bound NON e' stato cambiato di proposito, per la norma che questo
+repository applica altrove (`DirectPool::close_all`: «not measured, do not fix
+it without measuring first»). Se va corretto, la forma e' un budget per
+carrier — `128 * carriers`, identico a oggi a 1 carrier — e non un numero piu'
+grande. Il sintomo da cercare prima di agire: un `rtc.ice` rifiutato con
+`candidate budget spent`, che scarta i candidati TARDIVI, cioe' proprio quelli
+che servono su un NAT difficile.
+
+**APERTO — il conteggio dei carrier e' una costante di room.** Una stanza fatta
+di download piccoli paga otto `RTCPeerConnection` ogni volta per un risparmio
+che non le serve (misurato: +15 ms di tassa fissa, pareggio a ~110 KiB). Farlo
+scalare con la dimensione dell'offerta e' strettamente meglio di qualunque
+costante; il server la conosce gia'.
 
 **2026-09-18 — il confronto diretto/relay di 7.6 va RIFATTO con un braccio piu'
 lungo della scadenza (B-A037).** ~~APERTA~~ **CHIUSA 2026-09-19, e ha aperto una
@@ -971,6 +1011,7 @@ inferenza a misura.
 
 ## 10. Do-not-repeat
 
+- Do not judge a carrier, a queue or a window by its instantaneous STATE. In a carrier group a full queue is the signature of work, not of failure: busy and stuck look identical from a level and are opposite diagnoses (B-A040, B-A041). A guard on this path asks whether something CHANGED — bytes that moved, a gap that closed — never how full something is right now.
 - Do not trust a green frontend gate run only on the workstation's Node: la CI e' su Node 20, la workstation su Node 24, e sotto Node 20 un timer `unref`ato che un test aspetta fa cancellare il test (B-A034). Non rimettere `unref()` su una scadenza il cui scatto e' il comportamento.
 - Do not ask the CLI to select or read paths; selection belongs to every browser peer.
 - Do not reuse native QUIC/holepunch types for browser data or bind another UDP socket.

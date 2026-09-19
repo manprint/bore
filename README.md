@@ -1041,7 +1041,7 @@ Browser-to-browser transfer (always available; see "Browser-to-browser transfer"
       --web-transfer-max-relays <N>               Maximum live opaque web-transfer relay pairs server-wide [env: BORE_WEB_TRANSFER_MAX_RELAYS=] [default: 256]
       --web-transfer-relay-rate <N>               Web-transfer relay throttle per room (bytes/s); 0 disables it [env: BORE_WEB_TRANSFER_RELAY_RATE=] [default: 104857600 (100 MiB/s)]
       --web-transfer-owner-grace <SECS>           Grace after abnormal web-transfer owner loss before the room dies; accepted range 5-600 [env: BORE_WEB_TRANSFER_OWNER_GRACE=] [default: 60]
-      --web-transfer-direct-carriers <N>          Parallel WebRTC connections one direct web-transfer uses (1..=8) [env: BORE_WEB_TRANSFER_DIRECT_CARRIERS=] [default: 4]
+      --web-transfer-direct-carriers <N>          Parallel WebRTC connections one direct web-transfer uses (1..=8) [env: BORE_WEB_TRANSFER_DIRECT_CARRIERS=] [default: 8]
 
 Access logging (always available):
       --webserver-log <DIR>                   Write access logs in nginx-combined format to <DIR> (off by default) [env: BORE_WEBSERVER_LOG=]
@@ -2328,7 +2328,7 @@ without it is rejected rather than silently ignored. On a development box a loop
 | `--web-transfer-max-relays <N>` | `BORE_WEB_TRANSFER_MAX_RELAYS` | 256 | Live relay pairs server-wide |
 | `--web-transfer-relay-rate <N>` | `BORE_WEB_TRANSFER_RELAY_RATE` | 104857600 (100 MiB/s) | Relay throttle per room in bytes/s |
 | `--web-transfer-owner-grace <SECS>` | `BORE_WEB_TRANSFER_OWNER_GRACE` | 60 | Grace after an abnormal owner loss before the room dies |
-| `--web-transfer-direct-carriers <N>` | `BORE_WEB_TRANSFER_DIRECT_CARRIERS` | 4 | Parallel WebRTC connections one direct transfer uses |
+| `--web-transfer-direct-carriers <N>` | `BORE_WEB_TRANSFER_DIRECT_CARRIERS` | 8 | Parallel WebRTC connections one direct transfer uses |
 
 **What the server refuses at startup**, rather than accepting and behaving oddly later:
 
@@ -2407,27 +2407,34 @@ launched, so a pipe reading stdout is never beaten by the browser.
   nobody else — not because it is quicker. The numbers behind the current defaults are in
   `docs/transfer/WEB_TRANSFER_PERF.md` §7.6 and
   `docs/transfer/TRANSFER_LIMIT_DIRECT.md`.
-- **`--web-transfer-direct-carriers` defaults to 4, and 8 is faster on a path you have
-  measured.** Wired, 21 ms apart, three repetitions per rung with every arm checked
-  against the transport it claims, the direct path completed **every** attempt at every
-  carrier count: 5.9 / 12.98 / 21.57 / 31.45 MiB/s at 1 / 2 / 4 / 8. Eight is 46 % faster
-  than four and now stable, but that is one wired path at one RTT, and the recipient — who
-  does not choose the count — pays the reorder window's memory for it, so the default
-  stays 4. Raise it with `--web-transfer-direct-carriers 8` on a link you have qualified.
-  The transfer stays correct either way: an aborted direct attempt resumes on the relay
-  from the chunks the recipient has already verified.
+- **`--web-transfer-direct-carriers` now defaults to 8, raised from 4.** Wired, 21 ms
+  apart, three repetitions per rung with every arm checked against the transport it
+  claims, the direct path completed **every** attempt at every carrier count: 5.9 / 12.98
+  / 21.57 / 31.45 MiB/s at 1 / 2 / 4 / 8. The bound carriers work around is arithmetic —
+  one SCTP association delivers at most its send buffer over the round-trip time, and no
+  browser API reaches that buffer — so a *longer* path is bounded harder per association
+  and carriers help more there, not less. The count is a room constant, so a small file
+  pays it too: measured on 8 MiB, eight carriers cost **+15 ms** to the first byte and
+  saved 1128 ms of transfer, with break-even near 110 KiB. Soaked wired, **twenty consecutive 1 GiB transfers
+  at eight carriers all stayed direct**, 30.17 MiB/s median. Lower it
+  with `--web-transfer-direct-carriers 4` if your recipients are memory-constrained: the
+  reorder window's budget grows per carrier, so eight raise its worst case to 64 MiB per
+  transfer (a ceiling, not a reservation — the measured peak on 1 GiB was 12–17 MB). The
+  transfer stays correct either way: an aborted direct attempt resumes on the relay from
+  the chunks the recipient has already verified.
 - **A large transfer usually stays on the direct path now, and did not before.** Until
   this release the recipient abandoned a *healthy* direct path, because its reorder window
   was sized against one carrier's rate while the other N−1 filled it — so the fallback got
   more likely the more carriers a transfer used (at 8 carriers, every time). That is fixed
-  (`docs/transfer/TRANSFER_LIMIT_DIRECT.md` §8). Measured wired at the shipped default,
-  **1 GiB** now stays a single `direct` commit in **2 of 3** repetitions at 20.8–21.3
-  MiB/s, against 14.0 and 29.5 MiB/s with a visible `direct → relay → direct` oscillation
-  before. The fallback that remains has a different cause — one carrier dying mid-transfer
-  (§8.5) — and is not yet fixed. Either way the transfer is correct: every one of them
-  arrived whole and hash-verified with no user action. What a fallback costs is roughly
-  half the throughput, and the direct path is the one that keeps the operator's bandwidth
-  off the wire.
+  (`docs/transfer/TRANSFER_LIMIT_DIRECT.md` §8). A second defect sat at the other end of
+  the same wire: the sender killed a carrier for not having emptied its send queue within
+  ten seconds, while that carrier was transmitting 28.3 MB at 2.4 MB/s — and the frames it
+  had queued die with it, leaving a hole nobody resends. Its deadline now asks whether
+  bytes MOVED rather than how full the queue is (§8.5). Measured wired, **1 GiB** is now a
+  single `direct` commit in **3 of 3** repetitions at four carriers (22.30 MiB/s) and at
+  eight (31.00 MiB/s), against 2 of 3 and 0 of 3 before. Either way the transfer is
+  correct: every one of them arrived whole and hash-verified with no user action, and the
+  direct path is the one that keeps the operator's bandwidth off the wire.
 - **The fragment (`#m=…&k=…`) is the capability.** It holds the room key and the member
   token, and a URL fragment is never sent to a server: not to bore, not to a proxy, not into
   a log or the admin API. Share the whole link only with the people who may join, over a

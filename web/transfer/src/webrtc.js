@@ -148,6 +148,8 @@ export function createAttemptRtc({
   let pc = null;
   let channel = null;
   let fragmentBytes = null;
+  /** Bytes handed to this carrier's channel, for the drain deadline (B-A041). */
+  let handedBytes = 0;
   // Read ONCE per attempt: a mark that moved under a live channel would make
   // the pipeline and the engine's own `bufferedamountlow` threshold disagree.
   const marks = perfWaterMarks();
@@ -703,6 +705,10 @@ export function createAttemptRtc({
     get fragmentBytes() {
       return fragmentBytes ?? MAX_FRAGMENT_BYTES;
     },
+    /** Bytes this carrier has transmitted: handed to it, less what it holds. */
+    get transmittedBytes() {
+      return handedBytes - (channel?.bufferedAmount ?? 0);
+    },
     get bufferedAmount() {
       return channel?.bufferedAmount ?? 0;
     },
@@ -729,6 +735,11 @@ export function createAttemptRtc({
         fail("send-error");
         throw new DOMException("direct channel send failed", "AbortError");
       }
+      // Everything this carrier has been GIVEN. Minus what is still queued,
+      // it is everything the carrier has actually put on the wire — the only
+      // progress signal available synchronously, and the one the drain
+      // deadline needs (B-A041).
+      handedBytes += bytes.byteLength ?? bytes.length ?? 0;
     },
     /**
      * Waits for the channel to drain below the low-water mark. Awaiting
@@ -743,8 +754,11 @@ export function createAttemptRtc({
       }
       const startedAt = Date.now();
       const queued = channel.bufferedAmount;
+      let transmittedAt = sink.transmittedBytes;
       await new Promise((resolve, reject) => {
         let settled = false;
+        /** Re-armed by `onDeadline` while the carrier keeps making progress. */
+        let timer = null;
         const finish = () => {
           if (settled) {
             return;
@@ -787,6 +801,23 @@ export function createAttemptRtc({
             finish();
             return;
           }
+          // A carrier that is still PUTTING BYTES ON THE WIRE is not a dead
+          // path, however full its queue is — and the fullest queue belongs
+          // to the SLOWEST carrier, which is the one the writer keeps fed
+          // and which therefore may never dip to the low mark inside any
+          // deadline. MEASURED (B-A041), the carrier this used to kill had
+          // transmitted 28.3 MB at 2.4-2.8 MB/s throughout the very ten
+          // seconds it was killed for, with its rtt steady at 22 ms; losing
+          // it lost the frames it still held, which put a permanent hole in
+          // the sequence and cost the whole direct attempt. So the deadline
+          // asks for PROGRESS, not for a level: no progress in a full
+          // deadline is a dead path, and anything else re-arms.
+          const movedTo = sink.transmittedBytes;
+          if (movedTo > transmittedAt) {
+            transmittedAt = movedTo;
+            timer = setTimeout(onDeadline, drainTimeoutMs);
+            return;
+          }
           settled = true;
           waiters.delete(finish);
           signal?.removeEventListener("abort", onAbort);
@@ -817,7 +848,7 @@ export function createAttemptRtc({
         // behaviour. Nothing is held open by reffing it: every exit path
         // clears it, and the one that does not (`onDeadline`) IS the timer
         // firing.
-        const timer = setTimeout(onDeadline, drainTimeoutMs);
+        timer = setTimeout(onDeadline, drainTimeoutMs);
         waiters.add(finish);
         signal?.addEventListener("abort", onAbort, { once: true });
       });
@@ -888,7 +919,10 @@ export function createAttemptRtc({
  * repetitions per rung, arms alternating, every arm checked to have stayed on
  * the transport it claims: one association 5.9 MiB/s, two 12.98, four 21.57,
  * eight 31.45, against 44.0 for the relay. The scaling is roughly linear to
- * four and flattens after it.
+ * four and sublinear after it. At 1 GiB the same rungs read 22.30 (four) and
+ * 31.00 (eight), each 3 of 3 on a committed direct path once B-A040 and
+ * B-A041 were fixed; the server's default moved to eight on that result
+ * (`WebTransferLimits::direct_carriers`).
  *
  * The figures this comment used to carry — "one 5.38, two 10.57, four 41.42"
  * — were taken before any arm verified its own transport, and 41.42 is the

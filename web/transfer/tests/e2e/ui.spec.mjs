@@ -290,11 +290,16 @@ test.describe.serial("ui", () => {
     });
     await watchPath(relayOnly.page);
     await relayOnly.page.locator(`button[data-download="${offer}"]`).click();
-    // The word, not only the attribute: this is what the user reads.
-    await expect(relayOnly.page.locator(".transfer-path .path-word")).toHaveText(
-      "in connessione",
-      { timeout: 30_000 },
-    );
+    // The word, not only the attribute: this is what the user reads. The
+    // relay can verify its first chunk before Playwright's next sample, so
+    // observe the transition trace rather than requiring an ephemeral text
+    // value to remain visible for a whole polling interval.
+    await expect
+      .poll(
+        async () => (await pathTrail(relayOnly.page)).includes("connecting"),
+        { timeout: 30_000 },
+      )
+      .toBe(true);
     await expect(relayOnly.page.locator(".transfer-path")).toHaveAttribute(
       "data-path",
       "relay",

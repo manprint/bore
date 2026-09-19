@@ -2396,35 +2396,38 @@ launched, so a pipe reading stdout is never beaten by the browser.
   chunks the relay already delivered rather than restarting. A room opened with
   `--relay-only` is never offered a probe.
 - **Which path is FASTER is a measurement, and on a clean WAN it is the relay.** Between
-  two real hosts 21 ms apart on a 222 Mbit/s uplink (`scripts/perf/web_transfer_wan.sh`,
-  128 MiB per arm, arms alternated inside each repetition) the relay moved **43.5 MiB/s**
-  with a spread of 43.1–46.3 across twelve repetitions, while the direct path moved
-  10.8–33.9 MiB/s depending on `--web-transfer-direct-carriers` and occasionally aborted
-  mid-transfer. A browser DataChannel is SCTP over DTLS over UDP implemented inside the
-  tab; a relay leg is kernel TCP with the server applying backpressure. So choose the
-  direct path because it spends no server bandwidth and puts the payload through nobody
-  else — not because it is quicker. The numbers, the carrier ladder and the send-queue
-  ladder behind the current defaults are in `docs/transfer/WEB_TRANSFER_PERF.md` §7.6.
-- **`--web-transfer-direct-carriers` defaults to 4 because 4 was the value that finished**
-  — on transfers of 128 MiB. One carrier reaches half the throughput of any other value on
-  that path; eight has the best median but two of its three attempts aborted mid-transfer
-  and completed on the relay; four completed every attempt it started across eleven
-  repetitions. Raising it is reasonable on a path you have measured, and the transfer
-  stays correct either way — an aborted direct attempt resumes on the relay from the
-  chunks the recipient has already verified.
-- **On a LARGE transfer the direct path currently falls back, and comes back, and may fall
-  again.** Measured 2026-09-19 at the shipped default: a **1 GiB** transfer ended
-  `direct → relay → direct` on one repetition and `direct → relay → direct → relay` on the
-  other. Both delivered the whole file, byte-exact and hash-verified, with no user action —
-  the fallback is transparent, which is what it is for. What it costs is throughput:
-  14.0 and 29.5 MiB/s against 43.3 MiB/s for the same file carried entirely by the relay.
-  At 512 MiB the same default survived one attempt in six, while **one** carrier survived
-  three in three (at a fifth of the speed). So today, for a multi-gigabyte transfer, more
-  carriers buys speed and loses the direct path; fewer keeps it and is slow. Both
-  measurements were taken over WiFi and against a burstable cloud instance, so the rates
-  are provisional and no default has been changed on their account; the full report, the
-  code investigation and the wired re-run protocol are in
+  two real hosts 21 ms apart, **wired** (`scripts/perf/web_transfer_wan.sh`, 256 MiB per
+  arm, three repetitions, arms alternated inside each repetition, every arm checked to
+  have stayed on the transport it claims) the relay moved **44.0 MiB/s** while the direct
+  path moved **5.9 / 12.98 / 21.57 / 31.45 MiB/s** at 1 / 2 / 4 / 8 carriers. A browser
+  DataChannel is SCTP over DTLS over UDP implemented inside the tab, and one SCTP
+  association sustains about 5–6 MiB/s at this RTT whatever you tune — carriers are the
+  only lever. A relay leg is kernel TCP with the server applying backpressure. So choose
+  the direct path because it spends no server bandwidth and puts the payload through
+  nobody else — not because it is quicker. The numbers behind the current defaults are in
+  `docs/transfer/WEB_TRANSFER_PERF.md` §7.6 and
   `docs/transfer/TRANSFER_LIMIT_DIRECT.md`.
+- **`--web-transfer-direct-carriers` defaults to 4, and 8 is faster on a path you have
+  measured.** Wired, 21 ms apart, three repetitions per rung with every arm checked
+  against the transport it claims, the direct path completed **every** attempt at every
+  carrier count: 5.9 / 12.98 / 21.57 / 31.45 MiB/s at 1 / 2 / 4 / 8. Eight is 46 % faster
+  than four and now stable, but that is one wired path at one RTT, and the recipient — who
+  does not choose the count — pays the reorder window's memory for it, so the default
+  stays 4. Raise it with `--web-transfer-direct-carriers 8` on a link you have qualified.
+  The transfer stays correct either way: an aborted direct attempt resumes on the relay
+  from the chunks the recipient has already verified.
+- **A large transfer usually stays on the direct path now, and did not before.** Until
+  this release the recipient abandoned a *healthy* direct path, because its reorder window
+  was sized against one carrier's rate while the other N−1 filled it — so the fallback got
+  more likely the more carriers a transfer used (at 8 carriers, every time). That is fixed
+  (`docs/transfer/TRANSFER_LIMIT_DIRECT.md` §8). Measured wired at the shipped default,
+  **1 GiB** now stays a single `direct` commit in **2 of 3** repetitions at 20.8–21.3
+  MiB/s, against 14.0 and 29.5 MiB/s with a visible `direct → relay → direct` oscillation
+  before. The fallback that remains has a different cause — one carrier dying mid-transfer
+  (§8.5) — and is not yet fixed. Either way the transfer is correct: every one of them
+  arrived whole and hash-verified with no user action. What a fallback costs is roughly
+  half the throughput, and the direct path is the one that keeps the operator's bandwidth
+  off the wire.
 - **The fragment (`#m=…&k=…`) is the capability.** It holds the room key and the member
   token, and a URL fragment is never sent to a server: not to bore, not to a proxy, not into
   a log or the admin API. Share the whole link only with the people who may join, over a

@@ -1,10 +1,12 @@
 # The direct web-transfer path: its measured limit, and what the code says about it
 
-> **Resume from this file.** It holds one campaign (2026-09-19, night), the
-> limit it measured, and a code investigation into the mechanism. Nothing here
-> has been acted on: no default was changed, no code was touched. The first
-> section says what is settled, the last says what to do next and in what
-> order.
+> **CLOSED 2026-09-19.** The campaign this file opened is finished and its
+> question is answered: the fallback was a defect in the recipient's reorder
+> window (B-A040), now fixed and re-measured on the wire. §0 is the answer,
+> §8 is the resolution and what it cost to find. Everything from §1 to §7 is
+> kept as it was WRITTEN — hypotheses, dead ends and all — because the lesson
+> of this campaign is where the five hypotheses were looking, and editing them
+> after the fact would delete it.
 
 Companion documents: `WEB_TRANSFER_PERF.md` §7.6 is the earlier campaign this
 one extends (and partly decontaminates); `docs/plans/001_plan-WebTransfer/`
@@ -14,17 +16,42 @@ holds the plan state and the bug ledger.
 
 ## 0. The one-paragraph answer
 
-With the shipped default (`--web-transfer-direct-carriers 4`), a transfer of
-**1 GiB falls off the direct path** — measured twice, twice it fell. It does
-not stay down: the server's relay→direct probe re-establishes it, so the path
-**oscillates** (`direct → relay → direct`, and once
-`direct → relay → direct → relay`). Every transfer completed: 1 073 741 824
-bytes exactly, `errors: []`, hash verified, no user action. So the fallback is
-transparent, which is what it was built to be. What it costs is bandwidth:
-**14.00 and 29.53 MiB/s against 43.33 MiB/s for the same file carried entirely
-by the relay** — 0.32x and 0.69x. And the direct path is the one that keeps the
-operator's bandwidth off the wire, so every byte that reroutes is paid for
-twice.
+**RESOLVED 2026-09-19 (B-A040).** The direct path was being abandoned by the
+RECIPIENT, not lost by the network. Its reorder window — the buffer that holds
+frames arriving out of order across N independent SCTP associations — had a
+**fixed 8 MiB ceiling**, and the comment that sized it says why that is wrong
+in as many words: *"about a second of skew at the rate a single association
+sustains"*. That is the wrong rate. While one carrier is paused the window
+fills at the rate of the **other N−1 combined**, so the time the ceiling buys
+collapses as the carrier count rises — at 8 carriers, one ordinary SCTP
+retransmission fills 8 MiB in about 200 ms. The window is now sized per
+carrier and the stall verdict is a **deadline** rather than a byte count,
+because a carrier that is *behind* keeps advancing the stream and one that has
+*stopped* does not, which is the distinction the ceiling could not make.
+
+Measured after the fix, wired, two hosts 21 ms apart, 256 MiB per arm, three
+repetitions, arms alternating, **every arm checked to have stayed on the
+transport it claims**: **zero fallbacks in twelve direct arms**, at 5.9 /
+12.98 / 21.57 / 31.45 MiB/s for 1 / 2 / 4 / 8 carriers against 44.0 for the
+relay. Before the fix the same default fell back once in three, and eight
+carriers fell back every time.
+
+At **1 GiB** the shipped default now holds the direct path in **2 of 3**
+repetitions (20.83–21.31 MiB/s, against 14.0 and 29.5 with a visible
+`direct → relay → direct` oscillation before). The one that still falls back
+does so for a DIFFERENT and legitimate reason — a carrier that genuinely dies
+mid-transfer, §8.5 — not the defect this campaign fixed. Long transfers are
+therefore better and more predictable, **not** yet guaranteed to stay
+direct.
+
+**The single-flow rate is NOT a defect and not a mis-set parameter.** One SCTP
+association in the browser sustains ~5–6 MiB/s at this RTT, and every knob we
+own was swept against it: queue depth moves it ±25 % (4.70 → 5.90 MiB/s from
+512 KiB to 4 MiB), fragment size is flat across 24/16/8/4 KiB, `discardedOnSend`
+is 0, RTT is steady at 21 ms, SCTP+DTLS overhead is 9.2 % (so no retransmission
+storm), the sender is parked 97 % of the transfer and the recipient is idle
+91 % of it. There is no SCTP knob reachable from JavaScript. Carriers are the
+only lever, which is why making them work was the whole of the win.
 
 ---
 
@@ -393,3 +420,143 @@ SWEEP=1,2,4,8 SIZE_MB=512 REPS=3 bash scripts/perf/web_transfer_wan.sh
 # the shipped default, at the size the question was asked about
 SIZE_MB=1024 REPS=2 ARMS=direct,relay bash scripts/perf/web_transfer_wan.sh
 ```
+
+---
+
+## 8. Resolution (2026-09-19) — B-A040
+
+### What it actually was
+
+The recipient's reorder window, `receiver.js`. With N carriers the frame
+stream is striped across N independent SCTP associations, so frames arrive out
+of order and the window holds them until the gap fills. Its ceiling was a
+fixed **8 MiB / 512 frames**, and overflowing it called
+`failAttempt(transfer, "stalled")` — abandoning the whole direct attempt.
+
+The sizing comment named the error itself:
+
+> 8 MiB is roughly 256 fragments … about a second of skew **at the rate a
+> single association sustains** over a 30 ms path
+
+The window does not fill at one association's rate. While one carrier is
+paused it fills at the rate of the **other N−1 combined**, so the time the
+ceiling buys falls as 1/(N−1). At 8 carriers and ~5.5 MB/s per association,
+one ordinary SCTP retransmission on one carrier fills 8 MiB in ~200 ms.
+
+### The evidence, in the order it arrived
+
+| what | reading |
+|---|---|
+| recipient's own trace | `closed cause=failed-here code=stalled` at t=1281 ms and t=1956 ms |
+| source, all 8 carriers | `sctp-failure sctpCauseCode 12` within **9 ms** of each other |
+| cause code 12 | `User Initiated Abort` — the ABORT is the consequence of the recipient's decision, not its cause |
+| ICE/DTLS/channels | all eight `ready` within 121 ms; nothing failed to establish |
+| measured window peak | **8 407 808 bytes** in 344 frames after 1 270 holds — the ceiling, exactly |
+| frames vs bytes | 344 ≪ 512, so the BYTE ceiling fired, as its own comment predicted |
+
+Eight independent associations aborting inside a 9 ms window is one cause, not
+eight failures — that is what turned the search from the transport to the
+peer.
+
+### The fix
+
+`reorderBudget(carriers)` — pure, unit-testable without a transport — scales
+the budget with the carrier count the server announced: 512 frames / 8 MiB per
+carrier, capped absolutely at 4096 frames / 64 MiB because the window lives in
+the tab's own heap and the peer chooses the count. At one carrier the budget
+is byte-for-byte what shipped, so the single-channel path does not move.
+
+The second half is what makes the diagnosis true: the stall verdict moved from
+bytes to **time** (`REORDER_STALL_MS`, 4 s, injectable exactly as
+`directIdleTimeoutMs` already was). A carrier that is BEHIND advances
+`reorderNext`; one that has STOPPED does not. A byte ceiling measures neither
+— it measures how fast the *other* carriers are, so on a fast path it fires on
+healthy skew and on a slow one it lets a genuinely dead carrier hold the
+transfer for minutes. Both remain: **the deadline is the verdict, the budget
+is the memory bound.**
+
+### After, on the wire
+
+256 MiB per arm, 3 repetitions, arms alternating, every arm checked against
+the transport it claims. Zero fallbacks in twelve direct arms.
+
+| carriers | before | after | window peak | vs relay |
+|---|---|---|---|---|
+| 1 | 5.9 | 5.9 | never reorders | 0.13× |
+| 2 | 10.6 | 12.98 | 1.8–2.1 MB | 0.29× |
+| 4 (shipped) | ~20.9, **1 fallback in 3** | 21.57, **3/3 pure** | 3.5–**8.0 MB** | 0.49× |
+| 8 | **0 of 3 usable** | 31.45, **3/3 pure** | 10.1–**12.3 MB** | 0.71× |
+
+The peaks straddle the old 8 388 608-byte ceiling exactly where the failures
+were: at 4 carriers one run reached 7 997 696 — just under — which is why it
+failed one time in three; at 8 all three crossed it, which is why it failed
+every time. That is the threshold itself, not a correlation with it.
+
+At **1 GiB** the shipped default, over three repetitions, stayed pure
+`['direct']` in **two** and fell back in one, at 21.31 / 20.83 / 20.91 MiB/s.
+§2.3 measured the same size the other way twice out of twice, oscillating,
+at 14.0 and 29.5 MiB/s. The remaining fallback is §8.5's cause, not this one.
+
+### 8.5 What still falls back on a LONG transfer, and why it is a different bug
+
+On 1 GiB transfers a fallback still happens — once in three at four carriers,
+once in one at eight — and both times the trace says the same thing, which is
+NOT the window being too small:
+
+```
+src c2  reason=timeout  sent=184 258 816
+        drain-timeout  waitedMs=10000  queued=552 980      (4 carriers)
+src c6  reason=timeout  sent=44 696 896
+        drain-timeout  waitedMs=10000  queued=555 276      (8 carriers)
+```
+
+One carrier delivers hundreds of megabytes and then stops draining entirely
+for a full ten seconds, holding ~553 KB. Frames already queued on a carrier
+that dies are gone, so `reorderNext` can never advance past them: the attempt
+really is unrecoverable and abandoning it is right. The window did its job —
+it held 32.0 MiB (4 carriers) and 64.0 MiB (8), its budget exactly, for 11.6 s
+instead of 1.3 s, and gave up only when the carrier was provably dead.
+
+**Both stalls are at ~553 KB, just above `RTC_HIGH_WATER` (524 288).** That is
+too consistent to be coincidence and is the next thing to investigate. The
+suspicion, unproven: on a long transfer the recipient is holding tens of MiB
+of reordered frames while writing to OPFS, and a busy main thread plus that
+memory closes the SCTP receive window on one association, which then never
+fires `bufferedamountlow` and is killed by the sender's own 10 s drain
+deadline. If that is right the loop is self-reinforcing — a fuller window
+makes the next stall likelier — and the fix is on the recipient, not the
+sender's deadline.
+
+**Not fixed, and deliberately:** when the sender loses a carrier holding
+queued frames the attempt is already doomed, and it could say so instead of
+letting the recipient hold tens of MiB first. That needs a wire message and
+was not worth adding on the night the defect was found.
+
+### What this campaign got wrong, kept here on purpose
+
+All five hypotheses (§4, H1–H5) looked at the **sender** and the transport —
+the queue bound, a stalled carrier never reaped, the per-association window,
+competing congestion controllers, CPU. The defect was in the **recipient's
+admission control**, which none of them names. The reading that found it was
+not a new hypothesis but one number: eight separate associations aborting
+within 9 ms of each other cannot be eight failures.
+
+Two numbers in this repository were also wrong in the same way, and both are
+now corrected at their source (`webrtc.js`, `web_transfer.rs`): the
+justification for `direct_carriers: 4` read *"one association 5.38 MiB/s, two
+10.57, four 41.42"*. 41.42 is the RELAY's rate on that link — at four carriers
+the arm had fallen back and nothing checked which transport it used. A
+superlinear 3.9× from doubling the carriers was the tell. **Any measurement of
+this path must assert the committed path per arm, or it will measure the relay
+and call it direct** — a rule the harness now enforces by printing `MISMATCH`,
+and one this campaign broke twice before catching itself.
+
+### Carrier default: still 4, and why
+
+Eight carriers are 46 % faster than four on this link and now stable there.
+The default stays 4: it is **one wired path at one RTT with three
+repetitions**, this repository has twice been wrong generalising a single
+link's ladder (V-10, V-13), and the reorder window's memory is paid by the
+recipient, who does not choose the count. Operators who have qualified their
+link raise it with `--web-transfer-direct-carriers 8`. Settling it properly
+needs the sweep repeated on a second path with a different RTT and on a radio.

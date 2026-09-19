@@ -109,3 +109,25 @@ export function perfCount(stage, bytes = 0) {
   row.calls += 1;
   row.bytes += bytes;
 }
+
+/**
+ * Records the HIGH-WATER value of a gauge, or does nothing when accounting is
+ * disabled. A stage timing answers "how long", which cannot describe a queue:
+ * a reorder window that overflowed once and a window that never passed a
+ * tenth of its ceiling produce the same elapsed time and opposite diagnoses.
+ * Stored in the same sink under the same shape the stages use, so the harness
+ * reads it with no new plumbing.
+ * @param {string} gauge gauge name, e.g. `dst.reorder.bytes`
+ * @param {number} value the current value
+ */
+export function perfPeak(gauge, value) {
+  const sink = globalThis.__borePerf;
+  if (sink === undefined || !Number.isFinite(value)) {
+    return;
+  }
+  const row = sink[gauge] ?? (sink[gauge] = { ms: 0, calls: 0, bytes: 0 });
+  if (value > row.bytes) {
+    row.bytes = value;
+  }
+  row.calls += 1;
+}

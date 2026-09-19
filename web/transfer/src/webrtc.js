@@ -880,11 +880,24 @@ export function createAttemptRtc({
  *
  * The direct path's throughput is bound PER SCTP ASSOCIATION — the send
  * buffer divided by the round-trip time — and every DataChannel of one
- * `RTCPeerConnection` shares that association's window. MEASURED between two
- * hosts 31 ms apart: one association 5.38 MiB/s, two 10.57, four 41.42, with
- * the receiving host's CPU idle throughout and the sender spending 84 % of
- * the transfer parked in `waitLow`. So carriers are separate peer
- * connections, and more channels on one connection would buy nothing.
+ * `RTCPeerConnection` shares that association's window. So carriers are
+ * separate peer connections, and more channels on one connection would buy
+ * nothing.
+ *
+ * RE-MEASURED 2026-09-19 between two hosts 21 ms apart, WIRED, 256 MiB, three
+ * repetitions per rung, arms alternating, every arm checked to have stayed on
+ * the transport it claims: one association 5.9 MiB/s, two 12.98, four 21.57,
+ * eight 31.45, against 44.0 for the relay. The scaling is roughly linear to
+ * four and flattens after it.
+ *
+ * The figures this comment used to carry — "one 5.38, two 10.57, four 41.42"
+ * — were taken before any arm verified its own transport, and 41.42 is the
+ * RELAY's rate on that link: at four carriers the attempt had almost
+ * certainly fallen back, which B-A040 then explained (the recipient abandoned
+ * a healthy direct path, more often the more carriers it ran on). A superlinear
+ * 3.9x from doubling the carriers was the tell, and it was there to read.
+ * Whatever measures this again must assert the committed path per arm, or it
+ * will measure the relay and call it direct.
  *
  * The group is a thin multiplexer over the single-carrier actor above, which
  * is unchanged: each carrier negotiates its own offer/answer/candidates under

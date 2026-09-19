@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-19 02:40 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 13
+> **Last updated:** 2026-09-19 03:45 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 13
 
 ## 0. Protocol
 
@@ -25,12 +25,12 @@ This is the only execution-state file — position, progress, ledger, and blocke
 
 ## 1. Current unit
 
-- **Type:** `none`
-- **ID:** `-`
-- **Status:** `none`
-- **Intent:** `v1.2.0-rc.3` e' pubblicata e B-A039 e' chiuso; nessuna unita' in volo.
+- **Type:** `bug`
+- **ID:** `B-A041`
+- **Status:** `OPEN`
+- **Intent:** su un trasferimento LUNGO un carrier muore a meta' strada e porta con se' i frame gia' accodati, quindi il flusso ha un buco permanente e il tentativo e' irrecuperabile. MISURATO due volte, a 4 e a 8 carrier: `drain-timeout waitedMs=10000 queued=552980` e `queued=555276` — sempre ~553 KB, cioe' appena sopra `RTC_HIGH_WATER` (524288). Il destinatario NON e' saturo (occupato al 27%, `opfs.sync` 5,3 ms/chunk = 188 MiB/s), quindi l'ipotesi "finestra di ricezione chiusa dal destinatario" e' gia' indebolita.
 - **Phase:** 7 (`phase_08.md`)
-- **Next action:** riprendere da `docs/transfer/TRANSFER_LIMIT_DIRECT.md` §6: riqualificare il collegamento SU CAVO, poi l'esperimento H2 da una corsa sola (i `bytesSent` per carrier), poi ripetere lo sweep.
+- **Next action:** con la serie per carrier appena aggiunta all'harness, confrontare `channel.bytesSent` e `pair.bytesSent` del carrier che muore: trasporto che sale a canale fermo = SCTP che ritrasmette; entrambi fermi = non gli e' permesso spedire.
 - **Assigned:** `agent-1:Claude-Opus-5`
 - **Repo state:** branch `dev` | tag `v1.2.0-rc.3` pubblicato su `2e8da87` | albero pulito a `f74a14d`, piu' il rapporto `TRANSFER_LIMIT_DIRECT.md`
 
@@ -207,6 +207,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 122 | bug | B-A039 | agent-1:Claude-Opus-5 | il gate `T-WEB-DIRECT-FALLBACK` non costruiva la finestra che pretende di usare: su un runner dal filo veloce e dalla pipeline di hash lenta il file INTERO atterrava prima che il badge nominasse il percorso, e lo shim — armato solo sull'evento `message` — non si risvegliava mai piu' | web/transfer/tests/e2e/direct.spec.mjs | red-check deterministico (badge ritardato di 2,5 s: tre motori rossi senza il pacing, tre verdi con) + suite e2e 160/0/23 | uncommitted |
 
 | 123 | task | T-A016 | agent-1:Claude-Opus-5 | misurato il percorso diretto OLTRE la scadenza di negoziazione (il regime che B-A037 ha reso possibile) e indagato sul codice: a 1 carrier 3/3 sopravvivono a 512 MiB, a 4 carrier 1/6, a 1 GiB il percorso oscilla; il guasto scala con la DURATA e la vecchia scadenza lo mascherava | docs/transfer/TRANSFER_LIMIT_DIRECT.md, docs/transfer/WEB_TRANSFER_PERF.md, README.md | 28 trasferimenti reali tutti completi e verificati; nessun default toccato (WiFi + istanza a credito, V-10) | uncommitted |
+| 124 | bug | B-A040 | agent-1:Claude-Opus-5 | il destinatario abbandonava un percorso diretto SANO: finestra di riordino con tetto FISSO a 8 MiB, dimensionata sulla velocita' di UNA associazione mentre si riempie a quella delle altre N-1. Budget ora per-carrier (`reorderBudget`) e verdetto di stallo spostato dai byte al TEMPO (`REORDER_STALL_MS`) | web/transfer/src/receiver.js, web/transfer/src/perf.js, web/transfer/src/webrtc.js, src/web_transfer.rs, web/transfer/tests/unit/attempt.test.mjs, web/transfer/tests/perf/wan-source.mjs, web/transfer/dist/app.js, README.md, docs/transfer/TRANSFER_LIMIT_DIRECT.md | `npm run check` 206/206 (3 nuovi gate, 2 red-checked); e2e 3 motori 160 passati/0 falliti; `cargo fmt` + `clippy -D warnings` puliti; SUL CAMPO sweep 256 MiB x3 con bracci alternati: zero MISMATCH su 12 bracci diretti, 5,9/12,98/21,57/31,45 MiB/s a 1/2/4/8 carrier (prima: c4 cadeva 1/3, c8 3/3) | uncommitted |
 
 ## 5. Files touched
 
@@ -645,7 +646,7 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 
 ## 6. In-flight work
 
-none — tree consistent
+`B-A041` aperto: scritta finora SOLO la cattura diagnostica `series` in `web/transfer/tests/perf/wan-source.mjs` (per-carrier, opt-in con `WT_CARRIER_EVENTS`). Nessuna modifica al prodotto.
 
 ## 7. Verification state
 

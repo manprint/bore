@@ -326,10 +326,21 @@ pub struct WebTransferLimits {
     ///
     /// The direct path's throughput is bound PER ASSOCIATION — the send
     /// buffer divided by the round-trip time — and that bound does not move
-    /// with the size of the transfer. MEASURED between two hosts 31 ms apart:
-    /// one association 5.38 MiB/s, two 10.57, four 41.42, with the receiving
-    /// host idle throughout. `1` is the path as it was before carriers,
-    /// message for message.
+    /// with the size of the transfer. RE-MEASURED 2026-09-19, two hosts 21 ms
+    /// apart, wired, 256 MiB, three repetitions, every arm checked to have
+    /// stayed on the transport it claims: one association 5.9 MiB/s, two
+    /// 12.98, four 21.57, eight 31.45, relay 44.0. `1` is the path as it was
+    /// before carriers, message for message.
+    ///
+    /// `4` is kept as the default deliberately. Eight is 46 % faster on THAT
+    /// link and is now stable there (B-A040), but it is one wired path at one
+    /// RTT: this repository has twice been wrong generalising a single link's
+    /// ladder, and the recipient — who does not choose the count — pays the
+    /// reorder window's memory for it. Operators who have qualified their
+    /// link raise it with `--web-transfer-direct-carriers 8`.
+    ///
+    /// The earlier note here read "four 41.42", which is the RELAY's rate on
+    /// that link: the arm had fallen back and nothing checked.
     pub direct_carriers: u64,
 }
 

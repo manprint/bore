@@ -15,7 +15,7 @@ import {
   sealFrame,
 } from "../../src/crypto.js";
 import { FRAME_FINAL } from "../../src/framing.js";
-import { REORDER_MAX_FRAMES } from "../../src/receiver.js";
+import { reorderBudget } from "../../src/receiver.js";
 import { canonicalize, manifestValue } from "../../src/protocol.js";
 import { createReceiver } from "../../src/receiver.js";
 import { createSender } from "../../src/sender.js";
@@ -562,7 +562,8 @@ describe("web-transfer attempt coordination", () => {
     await tick(20);
     // Sequence 0 never arrives. Small frames so the FRAME ceiling is the one
     // that binds and the test stays quick.
-    for (let seq = 1; seq <= REORDER_MAX_FRAMES + 1; seq += 1) {
+    const ceiling = reorderBudget(4).frames;
+    for (let seq = 1; seq <= ceiling + 1; seq += 1) {
       dst.receiver.deliverDirectFrame(
         TRANSFER_ID,
         ATTEMPT_A,
@@ -580,6 +581,106 @@ describe("web-transfer attempt coordination", () => {
     assert.equal(dst.events.attemptFailed[0][1], ATTEMPT_A);
     assert.equal(dst.events.attemptFailed[0][2], "stalled");
     assert.deepEqual(dst.events.errors, [], "the TRANSFER is untouched");
+    assert.ok(
+      dst.receiver.transfers().has(TRANSFER_ID),
+      "the transfer is still open for the relay attempt",
+    );
+  });
+
+  it("the_reorder_budget_grows_with_the_carrier_count_and_stops_at_the_cap", () => {
+    // B-A040: the window fills at the rate of the OTHER carriers, so a fixed
+    // ceiling means something different at every carrier count. One carrier
+    // keeps exactly the budget that shipped before this existed.
+    assert.deepEqual(reorderBudget(1), {
+      frames: 512,
+      bytes: 8 * 1024 * 1024,
+    });
+    assert.deepEqual(reorderBudget(4), {
+      frames: 2048,
+      bytes: 32 * 1024 * 1024,
+    });
+    // At 8 the frame budget reaches its absolute cap and stops there; the
+    // byte budget reaches its own at the same count.
+    assert.deepEqual(reorderBudget(8), {
+      frames: 4096,
+      bytes: 64 * 1024 * 1024,
+    });
+    // A peer that announces nonsense cannot enlarge the tab's heap.
+    assert.deepEqual(reorderBudget(1024), reorderBudget(8));
+    assert.deepEqual(reorderBudget(0), reorderBudget(1));
+    assert.deepEqual(reorderBudget("x"), reorderBudget(1));
+  });
+
+  it("a_gap_that_fills_past_the_old_fixed_ceiling_keeps_the_attempt", async () => {
+    // THE regression B-A040 fixed, in the shape it was measured in: at eight
+    // carriers the window reached 8 407 808 bytes of ordinary skew — one
+    // paused carrier while the other seven kept delivering — and the old
+    // fixed 8 MiB ceiling abandoned a direct path that was working. Here the
+    // gap DOES fill, so nothing has stopped and the attempt must survive.
+    const bytes = payload(CHUNK);
+    const dst = await sinkHarness(bytes);
+    const key = await keyFor(ATTEMPT_A);
+    assert.equal(dst.receiver.beginDirect(TRANSFER_ID, ATTEMPT_A, 8), true);
+    dst.receiver.handleControl({
+      type: "transfer.path_commit",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, path: "direct" },
+    });
+    await tick(20);
+    // Frames of 24 KiB, the size the direct path actually sends, so the held
+    // bytes are the held bytes of the field report and not a scaled model.
+    const fragment = bytes.subarray(0, 24 * 1024);
+    const held = 400;
+    for (let seq = 1; seq <= held; seq += 1) {
+      dst.receiver.deliverDirectFrame(
+        TRANSFER_ID,
+        ATTEMPT_A,
+        await sealFrame(key, seq, 1, fragment),
+      );
+    }
+    assert.deepEqual(
+      dst.events.attemptFailed,
+      [],
+      `${held} frames of 24 KiB is ${held * 24} KiB of skew — more than the ` +
+        "old fixed ceiling — and at eight carriers it is within budget",
+    );
+    assert.ok(
+      held * 24 * 1024 > 8 * 1024 * 1024,
+      "the test must actually cross the ceiling it is about",
+    );
+  });
+
+  it("a_gap_that_never_fills_ends_the_attempt_on_the_deadline", async () => {
+    // The other half: the budget is the memory bound, the DEADLINE is the
+    // verdict. A carrier that stopped is caught by time, so it is caught on a
+    // slow path too — where the byte ceiling alone could take minutes.
+    const bytes = payload(CHUNK);
+    const dst = await sinkHarness(bytes, { reorderStallMs: 60 });
+    const key = await keyFor(ATTEMPT_A);
+    assert.equal(dst.receiver.beginDirect(TRANSFER_ID, ATTEMPT_A, 8), true);
+    dst.receiver.handleControl({
+      type: "transfer.path_commit",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, path: "direct" },
+    });
+    await tick(20);
+    // Sequence 0 never arrives, and the window stays far below its budget —
+    // so the ONLY thing that can end this attempt is the deadline.
+    dst.receiver.deliverDirectFrame(
+      TRANSFER_ID,
+      ATTEMPT_A,
+      await sealFrame(key, 1, 1, bytes.subarray(0, 64)),
+    );
+    assert.deepEqual(dst.events.attemptFailed, [], "not yet: the gap is young");
+    await tick(90);
+    dst.receiver.deliverDirectFrame(
+      TRANSFER_ID,
+      ATTEMPT_A,
+      await sealFrame(key, 2, 1, bytes.subarray(0, 64)),
+    );
+    await waitFor(
+      () => dst.events.attemptFailed.length === 1,
+      "the deadline to end the attempt",
+    );
+    assert.equal(dst.events.attemptFailed[0][2], "stalled");
     assert.ok(
       dst.receiver.transfers().has(TRANSFER_ID),
       "the transfer is still open for the relay attempt",

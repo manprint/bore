@@ -51,14 +51,25 @@ const marks = {
   high: Number(process.env.WT_HIGH_WATER ?? 0),
   low: Number(process.env.WT_LOW_WATER ?? 0),
 };
-await context.addInitScript(([high, low]) => {
+// `WT_FRAGMENT_BYTES` reaches the page through `__borePerf`, which
+// `perfFragmentBytes` already reads. It can only LOWER the size the peer
+// allows, which is exactly what a per-message-cost experiment needs: if the
+// rate falls in proportion to the fragment, the ceiling is per-message and
+// raising `MAX_FRAGMENT_BYTES` is the lever.
+const fragment = Number(process.env.WT_FRAGMENT_BYTES ?? 0);
+// Per-carrier event timelines are diagnostic-only: off unless asked for.
+const WT_CARRIER_EVENTS = process.env.WT_CARRIER_EVENTS === "1";
+await context.addInitScript(([high, low, frag]) => {
   window.__BORE_TEST__ = window.__BORE_TEST__ ?? {};
   window.__borePerf = {};
   if (high > 0 && low > 0 && low < high) {
     window.__borePerf.highWater = high;
     window.__borePerf.lowWater = low;
   }
-}, [marks.high, marks.low]);
+  if (frag > 0) {
+    window.__borePerf.fragmentBytes = frag;
+  }
+}, [marks.high, marks.low, fragment]);
 const page = context.pages()[0] ?? (await context.newPage());
 const errors = [];
 page.on("pageerror", (e) => { const line = `pageerror: ${e.message}`; errors.push(line); console.log(`WTERR src ${line}`); });
@@ -81,13 +92,16 @@ for (let rep = 0; rep < reps; rep += 1) {
   // to differ, because a second request for the same live selection is
   // idempotently re-acked and the repetition would measure nothing.
   linkSync(master, path);
-  await page.evaluate(([high, low]) => {
+  await page.evaluate(([high, low, frag]) => {
     window.__borePerf = {};
     if (high > 0 && low > 0 && low < high) {
       window.__borePerf.highWater = high;
       window.__borePerf.lowWater = low;
     }
-  }, [marks.high, marks.low]);
+    if (frag > 0) {
+      window.__borePerf.fragmentBytes = frag;
+    }
+  }, [marks.high, marks.low, fragment]);
   const offeredAt = Date.now();
   await page.locator("#file-input").setInputFiles([path]);
 
@@ -147,6 +161,31 @@ for (let rep = 0; rep < reps; rep += 1) {
     rateMiBs: bytes / MIB / ((endedAt - started.at) / 1000),
     stages,
     trace: traces.at(-1) ?? null,
+    // EVERY carrier, not just the last: "four carriers were configured and
+    // three carried" is a statement about the SET, and one trace cannot make
+    // it. Additive so the existing report keeps reading `trace`.
+    carrierBytes: traces.map((t) => ({
+      carrier: t.carrier ?? null,
+      reason: t.reason ?? null,
+      sent: (t.stats ?? []).at(-1)?.channel?.bytesSent ?? null,
+      msgs: (t.stats ?? []).at(-1)?.channel?.messagesSent ?? null,
+      // WHEN a carrier died is what separates "never opened" from "opened and
+      // was killed", and one end-state cannot tell them apart. Bounded by the
+      // trace's own event cap, so this cannot grow without bound.
+      events: WT_CARRIER_EVENTS ? (t.events ?? null) : null,
+      // The last samples of each carrier, TRANSPORT bytes beside CHANNEL
+      // bytes. A carrier whose channel is frozen while its transport keeps
+      // climbing is SCTP retransmitting; one where both are frozen is not
+      // being allowed to send. One end-state cannot tell those apart.
+      series: WT_CARRIER_EVENTS
+        ? (t.stats ?? []).slice(-14).map((x) => [
+            x.t ?? null,
+            x.channel?.bytesSent ?? null,
+            x.pair?.bytesSent ?? null,
+            x.pair?.rttMs ?? null,
+          ])
+        : null,
+    })),
     errors: errors.splice(0),
   })}`);
   rmSync(path, { force: true });

@@ -21,7 +21,7 @@ import {
   manifestMac,
   sha256Hex,
 } from "./crypto.js";
-import { perfEnd, perfStart } from "./perf.js";
+import { perfEnd, perfPeak, perfStart } from "./perf.js";
 import { canonicalize, manifestValue } from "./protocol.js";
 import {
   ARCHIVE_ENTRY_ID,
@@ -54,25 +54,70 @@ export const FRAME_PIPELINE_DEPTH = 8;
 
 /**
  * Frames held out of order while their predecessors are still in flight, and
- * the bytes they may occupy. Whichever is reached first ends the attempt.
+ * the bytes they may occupy — PER CARRIER, which is the correction B-A040
+ * made and the whole of it.
  *
  * One transport delivers a frame stream in order and never holds anything
  * here, so this costs nothing until a transfer runs on SEVERAL carriers, when
  * the arrival order is the order N independent associations happened to
  * deliver in. The window absorbs the skew between them; it does not absorb a
- * carrier that has stopped. 8 MiB is roughly 256 fragments at the 32 KiB
- * ceiling — about a second of skew at the rate a single association sustains
- * over a 30 ms path, which is far more than carriers between the same pair of
- * hosts can drift.
+ * carrier that has stopped.
+ *
+ * The ceiling used to be a FIXED 8 MiB, sized — the old comment said so in as
+ * many words — as "about a second of skew at the rate a single association
+ * sustains". That is the wrong rate. While one carrier is paused the window
+ * fills at the rate of the OTHER N-1 combined, so the time it buys falls as
+ * the carrier count rises: at 8 carriers and ~5.5 MB/s per association, one
+ * ordinary SCTP retransmission on one carrier fills 8 MiB in about 200 ms.
+ * MEASURED between two hosts 21 ms apart, 128 MiB, wired: at 8 carriers the
+ * window peaked at 8 407 808 bytes — its ceiling — in 344 frames after 1 270
+ * holds, and the recipient abandoned a direct path that was delivering, 1.3 s
+ * after the channels opened. 3/3 transfers fell back at 8 carriers, 1/3 at
+ * the shipped default of 4, never at 1 or 2. Scaling the budget with the
+ * carrier count is what makes the window mean the same thing at every count.
+ *
+ * The absolute ceiling exists because this lives in the tab's own heap and a
+ * peer chooses the carrier count: the budget grows with carriers, never past
+ * this.
  *
  * Overflowing is a failure of the ATTEMPT, not of the transfer: the direct
  * path is abandoned, the transfer continues on the relay from the ranges
  * already verified on disk, and the user sees a slower transfer rather than a
  * failed one.
  */
-export const REORDER_MAX_FRAMES = 512;
+export const REORDER_MAX_FRAMES_PER_CARRIER = 512;
 /** … and the byte ceiling, reached first whenever fragments are full size. */
-export const REORDER_MAX_BYTES = 8 * 1024 * 1024;
+export const REORDER_MAX_BYTES_PER_CARRIER = 8 * 1024 * 1024;
+/** Hard caps on the scaled budget, whatever carrier count a peer announces. */
+export const REORDER_ABS_MAX_FRAMES = 4096;
+export const REORDER_ABS_MAX_BYTES = 64 * 1024 * 1024;
+/**
+ * How long the window may hold a gap that is not filling before the attempt
+ * is abandoned.
+ *
+ * This is the test the byte ceiling was standing in for, and it is the one
+ * that actually distinguishes the two cases the old comment named: a carrier
+ * that is BEHIND keeps advancing `reorderNext` and a carrier that has STOPPED
+ * does not. A byte ceiling measures neither — it measures how fast the other
+ * carriers are, so on a fast path it fires on healthy skew and on a slow one
+ * it lets a genuinely dead carrier hold the transfer for minutes. Both
+ * remain: the deadline is the verdict, the budget is the memory bound.
+ */
+export const REORDER_STALL_MS = 4_000;
+
+/**
+ * The window budget for a transfer announced with `carriers` carriers.
+ * Pure so the sizing can be tested without a transport.
+ * @param {number} carriers
+ * @returns {{frames: number, bytes: number}}
+ */
+export function reorderBudget(carriers) {
+  const n = Math.max(1, Math.min(Number(carriers) || 1, 64));
+  return {
+    frames: Math.min(REORDER_ABS_MAX_FRAMES, REORDER_MAX_FRAMES_PER_CARRIER * n),
+    bytes: Math.min(REORDER_ABS_MAX_BYTES, REORDER_MAX_BYTES_PER_CARRIER * n),
+  };
+}
 
 /**
  * How long a DIRECT attempt may deliver NOTHING, while the recipient has
@@ -202,6 +247,7 @@ export function createReceiver({
   events = {},
   directIdleTimeoutMs = DIRECT_IDLE_TIMEOUT_MS,
   directIdleCheckMs = DIRECT_IDLE_CHECK_MS,
+  reorderStallMs = REORDER_STALL_MS,
 }) {
   /** transferId → live download state (deleted at every terminal step). */
   const transfers = new Map();
@@ -342,6 +388,7 @@ export function createReceiver({
     transfer.inbox = [];
     transfer.reorder = new Map();
     transfer.reorderBytes = 0;
+    transfer.reorderGapSince = 0;
     transfer.reorderNext = 0;
     transfer.reorderWindow = false;
     // A pump still draining the DEAD attempt's last batch returns without
@@ -744,6 +791,10 @@ export function createReceiver({
       // Armed only by an attempt that runs on MORE THAN ONE carrier, which
       // is the only way frames can arrive out of order.
       reorderWindow: false,
+      /** Budget for the held frames, sized from the announced carrier count. */
+      reorderLimits: reorderBudget(1),
+      /** When the current gap opened, or 0 when nothing is held (B-A040). */
+      reorderGapSince: 0,
       /** Direct-path idle clock: handle, and when a frame last arrived. */
       idleTimer: null,
       lastFrameAt: 0,
@@ -1129,6 +1180,9 @@ export function createReceiver({
     if (seq === null || seq === transfer.reorderNext) {
       transfer.inbox.push(data);
       transfer.reorderNext += 1;
+      // The gap just closed, so the deadline starts again from whatever
+      // opens the NEXT one. A window that keeps draining never trips it.
+      transfer.reorderGapSince = 0;
       // Whatever was waiting on this frame can go now, and so can whatever
       // was waiting on THAT — a single carrier catching up releases its whole
       // run in one pass.
@@ -1150,13 +1204,31 @@ export function createReceiver({
     }
     transfer.reorder.set(seq, data);
     transfer.reorderBytes += frameByteLength(data);
+    // How close the window came to its ceiling is the only way to tell a
+    // skew the window absorbs from one it is about to refuse, and the
+    // overflow itself reports neither.
+    perfPeak("dst.reorder.bytes", transfer.reorderBytes);
+    perfPeak("dst.reorder.frames", transfer.reorder.size);
+    if (transfer.reorderGapSince === 0) {
+      // The gap opened now. Timing it from the FIRST held frame, and not
+      // from every later one, is what makes the deadline measure the gap
+      // rather than the traffic still arriving past it.
+      transfer.reorderGapSince = Date.now();
+    }
+    const budget = transfer.reorderLimits ?? reorderBudget(1);
     if (
-      transfer.reorder.size > REORDER_MAX_FRAMES ||
-      transfer.reorderBytes > REORDER_MAX_BYTES
+      transfer.reorder.size > budget.frames ||
+      transfer.reorderBytes > budget.bytes
     ) {
-      // One carrier is not merely behind, it has stopped. Abandoning the
-      // ATTEMPT hands the transfer to the relay, which finishes it from the
-      // ranges already verified on disk.
+      // The window cannot hold more. It lives in the tab's own heap, so
+      // there is nothing else to do but abandon the attempt.
+      failAttempt(transfer, "stalled");
+      return false;
+    }
+    if (reorderStallMs > 0 && Date.now() - transfer.reorderGapSince >= reorderStallMs) {
+      // The gap has not filled inside the deadline: a carrier that is behind
+      // advances this, and one that has stopped does not. THIS is the test
+      // the byte ceiling used to stand in for.
       failAttempt(transfer, "stalled");
       return false;
     }
@@ -1825,6 +1897,11 @@ export function createReceiver({
       // carrier the window stays disarmed and the path is the one that
       // existed before carriers, down to which failures are which.
       transfer.reorderWindow = Number(carriers) > 1;
+      // The budget is sized from the count the server announced, because the
+      // skew the window must absorb is what the OTHER carriers deliver while
+      // one is paused (B-A040).
+      transfer.reorderLimits = reorderBudget(carriers);
+      transfer.reorderGapSince = 0;
       transfer.state = "direct";
       startIdleClock(transfer);
       void deriveAttemptKey(transfer);
@@ -2099,6 +2176,10 @@ export function createReceiver({
             adoptAttempt(transfer, body.attemptId);
             transfer.upgrade = null;
             transfer.reorderWindow = carriers > 1;
+            // Same sizing as `beginDirect`: an upgraded attempt runs on the
+            // same carriers and needs the same window (B-A040).
+            transfer.reorderLimits = reorderBudget(carriers);
+            transfer.reorderGapSince = 0;
             transfer.transport = "direct";
             applyCommitPlan(transfer, body.resumeRanges);
             transfer.state = "receiving";

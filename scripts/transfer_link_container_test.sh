@@ -21,7 +21,7 @@ repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 static_bin="$repo/target/x86_64-unknown-linux-gnu/debug/bore"
 if [[ ! -x "$static_bin" ]] || ! file "$static_bin" 2>/dev/null | grep -q 'static'; then
     RUSTFLAGS='-C target-feature=+crt-static' \
-        cargo build --offline --locked --all-features \
+        cargo build --locked --all-features \
             --target x86_64-unknown-linux-gnu --quiet
 fi
 [[ -x "$static_bin" ]] || {

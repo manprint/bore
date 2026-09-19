@@ -1,7 +1,7 @@
 # Transfer Link — Implementation State
 
 > **LEGGERE QUESTO FILE PER PRIMO a ogni sessione. Aprire un'unità in §1 PRIMA di modificare codice; chiuderla DOPO i gate.**
-> **Last updated:** 2026-09-19 | **By:** Codex, release handoff commit created | **Session:** 12
+> **Last updated:** 2026-09-19 | **By:** Codex, CI correction unit opened | **Session:** 13
 
 ## 0. Protocol
 
@@ -24,14 +24,14 @@ Questo è l'unico file di stato: posizione, progress board, ledger, verifiche, d
 
 ## 1. Current unit
 
-- **Type:** release
-- **ID:** REL-1
+- **Type:** bug-fix
+- **ID:** REL-2
 - **Status:** OPEN
-- **Intent:** Preparare il commit autorizzato su `dev`, attendere CI verde e pubblicare il prerelease numerato successivo.
+- **Intent:** Correggere i failure CI riproducibili su Windows/macOS/Linux e Docker senza alterare il protocollo Link.
 - **Phase:** 4 — Accettazione (`phase_05.md`).
-- **Next action:** aggiornare il conteggio G-FULL, verificare il tree, committare su `dev`, pushare e seguire tutti i workflow del commit prima del tag.
+- **Next action:** applicare guard Unix/env e rimuovere offline dal fallback Docker, eseguire gate locali, registrare risultati e pushare una correzione.
 - **Assigned:** agent-2:sonnet (esecuzione root Codex; nessun alias modello dichiarato non disponibile); review agent-1:opus (revisione inline).
-- **Repo state:** branch `dev`; commit locale corrente (`feat(transfer): add public transfer links`), basato su `v1.2.0-rc.4`; il push e la CI remota sono ancora da eseguire. Lo SHA viene registrato dopo l'amend finale per evitare riferimenti circolari nello stato. Tutte le fasi del piano sono chiuse; i fault UDP dedicati, il ciclo cleanup da 100 iterazioni e il benchmark comparativo non sono stati dichiarati PASS senza un harness/misurazione stabile.
+- **Repo state:** branch `dev`; commit `038e651` (`feat(transfer): add public transfer links`) già pubblicato. CI ha rilevato failure correggibili in clippy Windows, test env-parallel e fallback Docker offline; il tag resta bloccato fino a una nuova CI completamente verde. Tutte le fasi del piano sono chiuse; i fault UDP dedicati, il ciclo cleanup da 100 iterazioni e il benchmark comparativo non sono stati dichiarati PASS senza un harness/misurazione stabile.
 
 ## 2. Feature context
 
@@ -106,6 +106,7 @@ Append-only, una riga per unità chiusa. Type ammessi: sub-phase, task, bug, ver
 | 21 | sub-phase | 4.3 | Codex (role agent-2:sonnet) | Collegati gate Rust, e2e Linux, Docker e privileged nella CI; ricostruito debug/release e completata regressione seriale. | `.github/workflows/ci.yml`, `.github/workflows/e2e_netns.yml`, `Cargo.toml`, `Cargo.lock` | G-FMT/G-LINT/G-BUILD/G-FULL/G-DOCKER/regressioni netns+SSH PASS | uncommitted |
 | 22 | verify | 4.4 | Codex (role agent-2:sonnet; review inline agent-1:opus) | Audit finale requisito→codice→README→CI→test; corretto trattamento del completamento archive/one-shot nel body HTTP, timeout drain stderr e kill del process group; STATE reso coerente. | `src/transfer_link/http.rs`, `src/transfer_link/oneshot.rs`, `docs/plans/002_plan-TransferLink/STATE.md` | fmt/clippy/transfer tests/no-default/LARGE/ROOT/FULL PASS; gap non-run espliciti sotto | uncommitted |
 | 23 | correction | 4.5 | Codex (role agent-2:sonnet) | Aggiunto test esplicito per producer `--exec` vuoto con exit 0: risposta HTTP 200 chunked vuota, claim consumato e secondo GET 410. Nessun codice di produzione cambiato. | `tests/transfer_link_test.rs`, `docs/plans/002_plan-TransferLink/STATE.md` | G-FMT PASS; G-LINT PASS; G-LINK PASS (22/22) | uncommitted |
+| 24 | correction | REL-2 | Codex (root) | Gated Unix-only `oneshot` imports/constants so Windows clippy is clean; serialized the env-sensitive Link CLI parser test and restored `BORE_SERVER`; removed forced offline resolution from the Docker acceptance fallback so clean runners can fetch the locked graph. | `src/transfer_link/oneshot.rs`, `src/main.rs`, `scripts/transfer_link_container_test.sh`, `docs/plans/002_plan-TransferLink/STATE.md` | fmt PASS; clippy all-features/all-targets PASS; selected regression 0 failed; CLI unit PASS; Docker acceptance PASS | uncommitted |
 
 ## 5. Files touched
 
@@ -127,7 +128,7 @@ Append-only, una riga per unità chiusa. Type ammessi: sub-phase, task, bug, ver
 
 ## 6. In-flight work
 
-claimed — REL-1 release handoff: aggiornamento conteggi e stato, commit autorizzato su `dev`, push/CI, tag prerelease successivo. Nessuna modifica di codice prevista.
+claimed — REL-2 CI correction: guard Unix-only oneshot symbols, serialize the env-sensitive CLI test, and make the Docker fallback resolve dependencies on a clean runner.
 
 ## 7. Verification state
 
@@ -144,6 +145,7 @@ claimed — REL-1 release handoff: aggiornamento conteggi e stato, commit autori
 | G-LARGE | `bash scripts/transfer_link_e2e.sh large` | PASS; ZIP64 >4 GiB/65.536 entry, decoder Python e RSS: sender +34,616 KiB, server +3,256 KiB | 2026-09-19 |
 | G-ROOT | `sudo -n ./scripts/transfer_link_privileged_test.sh all` | PASS; TAR owner/gid/mode/link, exit failure e cancellazione gruppo | 2026-09-19 |
 | G-DOCKER | `bash scripts/transfer_link_container_test.sh` | PASS; raw, stdin `-i`, scratch image exec failure | 2026-09-19 |
+| REL-2 local correction | fmt, clippy all-features/all-targets, selected CI test command, CLI test, Docker acceptance with forced static rebuild | PASS; env race fixed, Unix-only symbols gated, clean-runner dependency resolution fixed | 2026-09-19 |
 | G-VHOST | `sudo -n ./scripts/vhost_netns_test.sh` | PASS; 16/16 | 2026-09-19 |
 | G-VHOST-HARD | `sudo -n ./scripts/vhost_netns_test_hard.sh` | PASS; PASS=6, FAIL=0 | 2026-09-19 |
 | G-VHOST-UDP | `sudo -n ./scripts/vhost_udp_concurrency_repro.sh` | PASS; 3/3 | 2026-09-19 |
@@ -171,6 +173,7 @@ claimed — REL-1 release handoff: aggiornamento conteggi e stato, commit autori
 ## 9. Blockers and open questions
 
 - Nessuna domanda prodotto rinviata e nessun blocker tecnico noto per file, ZIP, stdin o exec.
+- Il primo run remoto del commit `038e651` è stato analizzato: CI ha fallito per i tre difetti registrati in REL-2 (più i due job VPN che ereditavano lo stesso test env); Docker/GHCR, Mean Bean CI/Deploy sono verdi. La correzione va pubblicata e verificata su una nuova CI prima del tag.
 - T-LINK-DROP (guasto UDP durante un download), il ciclo T-LINK-CLEANUP da 100 iterazioni e T-LINK-PERF con baseline ≥90% non sono stati eseguiti: mancano un harness di fault ripetibile e una baseline comparabile. Sono gap di evidenza, non risultati PASS impliciti.
 - La CI remota non è stata attesa da questo ambiente; i workflow YAML sono stati parsati con PyYAML e i job locali equivalenti sono passati.
 - Il server relay vede il plaintext HTTPS secondo la decisione dell'utente; il traffico tra A/server resta TLS/QUIC o TLS/TCP secondo il path scelto.

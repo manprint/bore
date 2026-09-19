@@ -13,9 +13,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+#[cfg(unix)]
 use tracing::{debug, warn};
 
 use super::source::{validate_filename, FileProducerHandle, SourceError};
@@ -23,7 +25,9 @@ use super::stats::{SourceCompletion, SourceFailure, SourceMessage};
 
 const STREAM_CHUNK: usize = 256 * 1024;
 const STREAM_QUEUE: usize = 2;
+#[cfg(unix)]
 const STDERR_CHUNK: usize = 16 * 1024;
+#[cfg(unix)]
 const STDERR_LOG_LIMIT: usize = 64 * 1024;
 
 /// State of a one-shot stream source.

@@ -4490,6 +4490,10 @@ mod tests {
 
     #[test]
     fn transfer_link_cli_defaults_and_single_path_shape() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = std::env::var_os("BORE_SERVER");
+        std::env::remove_var("BORE_SERVER");
+
         let args = Args::parse_from(["bore", "transfer", "link", "backup.bin"]);
         let Command::Transfer { command } = args.command else {
             panic!("expected transfer command");
@@ -4523,6 +4527,11 @@ mod tests {
         assert!(filename.is_none());
         assert!(max_downloads.is_none());
         assert_eq!(stats_interval, DEFAULT_STATS_INTERVAL.as_secs());
+
+        match saved {
+            Some(value) => std::env::set_var("BORE_SERVER", value),
+            None => std::env::remove_var("BORE_SERVER"),
+        }
     }
 
     #[test]

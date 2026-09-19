@@ -707,7 +707,13 @@ Three repetitions per value, at the shipped 512 KiB mark:
 | 8        | 33.85               | 0.780x         | 2 |
 
 † **This row is contaminated and is the only one that is** — see "The defect
-this campaign was one row away from finding" below.
+this campaign was one row away from finding" below. **RESOLVED 2026-09-19:** it
+has since been re-measured on the fixed build and the one attempt that "died"
+was the server demoting a transfer merely for lasting longer than ten seconds,
+not the transport failing. At one carrier the direct path now survives 3 of 3
+at 512 MiB — 64 seconds per transfer, one `path_commit` each. See
+`TRANSFER_LIMIT_DIRECT.md`, which also reports what the same re-measurement
+found at 4 and 8 carriers, and it is not good news.
 
 One carrier cannot fill this path and is half of every other value. Eight is
 the fastest median but two of its three attempts aborted mid-transfer and

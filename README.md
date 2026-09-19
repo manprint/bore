@@ -2405,15 +2405,26 @@ launched, so a pipe reading stdout is never beaten by the browser.
   direct path because it spends no server bandwidth and puts the payload through nobody
   else — not because it is quicker. The numbers, the carrier ladder and the send-queue
   ladder behind the current defaults are in `docs/transfer/WEB_TRANSFER_PERF.md` §7.6.
-- **`--web-transfer-direct-carriers` defaults to 4 because 4 was the value that finished.**
-  One carrier reaches half the throughput of any other value on that path (that row is the
-  one the deadline defect below contaminated, so read it as "clearly the slowest" and not
-  as a number); eight has the best median but two of its three attempts aborted
-  mid-transfer and completed on the relay; four completed every attempt it started across
-  eleven repetitions. Raising it is
-  reasonable on a path you have measured, and the transfer stays correct either way — an
-  aborted direct attempt resumes on the relay from the chunks the recipient has already
-  verified.
+- **`--web-transfer-direct-carriers` defaults to 4 because 4 was the value that finished**
+  — on transfers of 128 MiB. One carrier reaches half the throughput of any other value on
+  that path; eight has the best median but two of its three attempts aborted mid-transfer
+  and completed on the relay; four completed every attempt it started across eleven
+  repetitions. Raising it is reasonable on a path you have measured, and the transfer
+  stays correct either way — an aborted direct attempt resumes on the relay from the
+  chunks the recipient has already verified.
+- **On a LARGE transfer the direct path currently falls back, and comes back, and may fall
+  again.** Measured 2026-09-19 at the shipped default: a **1 GiB** transfer ended
+  `direct → relay → direct` on one repetition and `direct → relay → direct → relay` on the
+  other. Both delivered the whole file, byte-exact and hash-verified, with no user action —
+  the fallback is transparent, which is what it is for. What it costs is throughput:
+  14.0 and 29.5 MiB/s against 43.3 MiB/s for the same file carried entirely by the relay.
+  At 512 MiB the same default survived one attempt in six, while **one** carrier survived
+  three in three (at a fifth of the speed). So today, for a multi-gigabyte transfer, more
+  carriers buys speed and loses the direct path; fewer keeps it and is slow. Both
+  measurements were taken over WiFi and against a burstable cloud instance, so the rates
+  are provisional and no default has been changed on their account; the full report, the
+  code investigation and the wired re-run protocol are in
+  `docs/transfer/TRANSFER_LIMIT_DIRECT.md`.
 - **The fragment (`#m=…&k=…`) is the capability.** It holds the room key and the member
   token, and a URL fragment is never sent to a server: not to bore, not to a proxy, not into
   a log or the admin API. Share the whole link only with the people who may join, over a

@@ -1,7 +1,7 @@
 # Web Transfer multipeer — Implementation State
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-19 01:05 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 13
+> **Last updated:** 2026-09-19 02:40 CEST | **By:** `agent-1:Claude-Opus-5` | **Session:** 13
 
 ## 0. Protocol
 
@@ -30,9 +30,9 @@ This is the only execution-state file — position, progress, ledger, and blocke
 - **Status:** `none`
 - **Intent:** `v1.2.0-rc.3` e' pubblicata e B-A039 e' chiuso; nessuna unita' in volo.
 - **Phase:** 7 (`phase_08.md`)
-- **Next action:** rimisurare il confronto diretto/relay di `WEB_TRANSFER_PERF.md` §7.6 con un braccio piu' lungo della scadenza (`SIZE_MB=512`), l'unica domanda che B-A037 ha lasciato aperta.
+- **Next action:** riprendere da `docs/transfer/TRANSFER_LIMIT_DIRECT.md` §6: riqualificare il collegamento SU CAVO, poi l'esperimento H2 da una corsa sola (i `bytesSent` per carrier), poi ripetere lo sweep.
 - **Assigned:** `agent-1:Claude-Opus-5`
-- **Repo state:** branch `dev` | tag `v1.2.0-rc.3` pubblicato su `2e8da87` | albero con la sola correzione del gate B-A039
+- **Repo state:** branch `dev` | tag `v1.2.0-rc.3` pubblicato su `2e8da87` | albero pulito a `f74a14d`, piu' il rapporto `TRANSFER_LIMIT_DIRECT.md`
 
 ## 2. Feature context (self-contained recap)
 
@@ -205,6 +205,8 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | 121 | release | v1.2.0-rc.3 | agent-1:Claude-Opus-5 | prerelease tagliata su `dev`: porta B-A037 (la scadenza di negoziazione non degrada piu' un percorso diretto commesso), la causa della chiusura su ogni marker della traccia e la correzione d'harness B-A038 | Cargo.toml, Cargo.lock | Release verde e pubblicata (26 asset, prerelease). Due gate rossi al PRIMO campione — `cross/macos aarch64-apple-darwin` e `Web transfer e2e (firefox)` — verdi al secondo sullo stesso albero, senza toccare nulla; il secondo ha lasciato una scoperta vera sul gate, aperta come B-A039 | 2e8da87 |
 
 | 122 | bug | B-A039 | agent-1:Claude-Opus-5 | il gate `T-WEB-DIRECT-FALLBACK` non costruiva la finestra che pretende di usare: su un runner dal filo veloce e dalla pipeline di hash lenta il file INTERO atterrava prima che il badge nominasse il percorso, e lo shim — armato solo sull'evento `message` — non si risvegliava mai piu' | web/transfer/tests/e2e/direct.spec.mjs | red-check deterministico (badge ritardato di 2,5 s: tre motori rossi senza il pacing, tre verdi con) + suite e2e 160/0/23 | uncommitted |
+
+| 123 | task | T-A016 | agent-1:Claude-Opus-5 | misurato il percorso diretto OLTRE la scadenza di negoziazione (il regime che B-A037 ha reso possibile) e indagato sul codice: a 1 carrier 3/3 sopravvivono a 512 MiB, a 4 carrier 1/6, a 1 GiB il percorso oscilla; il guasto scala con la DURATA e la vecchia scadenza lo mascherava | docs/transfer/TRANSFER_LIMIT_DIRECT.md, docs/transfer/WEB_TRANSFER_PERF.md, README.md | 28 trasferimenti reali tutti completi e verificati; nessun default toccato (WiFi + istanza a credito, V-10) | uncommitted |
 
 ## 5. Files touched
 
@@ -637,6 +639,9 @@ Every unit type shares this ledger, in the order it closed. `Commit` is `uncommi
 | web/transfer/tests/e2e/direct.spec.mjs | il gate host-only registra il percorso con le prove invece di pretenderlo | B-A035 |
 | .github/workflows/ci.yml | input `only` per girare da solo il job del browser | T-A013 |
 | web/transfer/tests/e2e/direct.spec.mjs | `paceSendAfter` sulla sorgente del gate di fallback: la finestra in cui l'uccisione puo' scattare esiste per costruzione | B-A039 |
+| docs/transfer/TRANSFER_LIMIT_DIRECT.md | nuovo: il limite misurato del percorso diretto, l'indagine sul codice e il protocollo per la ripetizione su cavo | T-A016 |
+| docs/transfer/WEB_TRANSFER_PERF.md | §7.6: la riga `carriers=1` non e' piu' contaminata, e si spiega | T-A016 |
+| README.md | il limite su trasferimenti grandi, detto per intero e con le sue riserve | T-A016 |
 
 ## 6. In-flight work
 
@@ -735,6 +740,9 @@ the exact corrected full regression now passes.
 | B-A037 — regressione workspace | `cargo test --all-features -- --skip t_ssh_ --skip t_dmx_ --skip t_web_soak --test-threads=1` | `exit 0`, 32 suite tutte `ok`, 0 fail | B-A037, 2026-09-18 |
 | B-A039 — red-check del gate | badge ritardato di 2,5 s nello shim, `-g T-WEB-DIRECT-FALLBACK` sui tre motori | senza pacing `3 failed` (`the kill never fired on the wire`), con pacing `3 passed` | B-A039, 2026-09-19 |
 | B-A039 — e2e browser completa | `npx playwright test --project=chromium --project=firefox --project=webkit` | `pass 160, fail 0, skipped 23` (2,3 min) | B-A039, 2026-09-19 |
+| T-A016 — sweep WAN 512 MiB | `SWEEP=1,2,4,8 SIZE_MB=512 REPS=3 scripts/perf/web_transfer_wan.sh` | diretto puro 3/3 a c1, 2/3 a c2, 0/3 a c4 e c8; relay 12/12 a ~43,7 MiB/s | T-A016, 2026-09-19 |
+| T-A016 — 1 GiB al default spedito | `SIZE_MB=1024 REPS=2 ARMS=direct,relay ...` | `['direct','relay','direct']` e `['direct','relay','direct','relay']`; 4/4 completi, byte esatti | T-A016, 2026-09-19 |
+| T-A016 — CI del gate B-A039 | i cinque workflow su `f74a14d` | tutti `success` | T-A016, 2026-09-19 |
 
 ## 8. Runtime deviations from the plan
 
@@ -904,18 +912,21 @@ the exact corrected full regression now passes.
 ## 9. Blockers and open questions
 
 **2026-09-18 — il confronto diretto/relay di 7.6 va RIFATTO con un braccio piu'
-lungo della scadenza (B-A037).** Fino a questa correzione ogni trasferimento
-diretto piu' lungo di dieci secondi veniva degradato sul relay dal server, e i
-bracci della campagna duravano 2,9-6,8 s: sotto la scadenza, per caso. La
-contaminazione e' quindi STRETTA e localizzata — la riga `carriers=1` (10,84
-MiB/s, cioe' 11,8 s di sola portata) e' l'unica che l'ha attraversata, e la sua
-unica "morte" e' il server che la degrada, non un guasto di trasporto. Tutto il
-resto di 7.6 resta valido come misurato. Quello che NON e' stato misurato da
-nessuno e' il diretto su un trasferimento LUNGO, che fino a ieri non poteva
-esistere: e' l'unico modo di sapere se il rapporto 0,5x verso il relay tiene
-oltre la finestra in cui il prodotto lo teneva prigioniero. `SIZE_MB=512` sullo
-stesso collegamento e' il braccio minimo che lo dice.
-
+lungo della scadenza (B-A037).** ~~APERTA~~ **CHIUSA 2026-09-19, e ha aperto una
+domanda piu' grossa.** Misurato: a 512 MiB il diretto a UN carrier sopravvive
+3 volte su 3 (64 s per trasferimento, un solo `path_commit`) — quindi la riga
+`carriers=1` di 7.6 non era un trasporto che cedeva, era il server che degradava,
+e la correzione e' provata sul percorso reale. Ma a 4 e 8 carrier lo stesso
+trasferimento e' sopravvissuto **1 volta su 6** e **0 su 3**, contro il 3 su 3
+che 7.6 misurava a 128 MiB: il guasto scala con la DURATA e la vecchia scadenza
+lo mascherava. A 1 GiB con il default spedito il percorso OSCILLA
+(`direct -> relay -> direct`), il file arriva sempre intero e verificato, e
+costa lo 0,32-0,69x della banda del relay. Rapporto completo, con l'indagine sul
+codice e cinque ipotesi ciascuna col proprio modo di essere confermata o
+uccisa: `docs/transfer/TRANSFER_LIMIT_DIRECT.md`. **Nessun default e' stato
+toccato** — la campagna girava su WiFi e su una `c7i-flex.large`, e cambiare una
+costante su dati cosi' e' esattamente l'errore che V-10 documenta. La prossima
+mossa e' la §6 di quel file, nell'ordine in cui e' scritta.
 
 **2026-09-18 — il percorso diretto ha margine, e non e' stato esaurito.** La
 campagna 7.6 ha spazzato DUE assi (profondita' della coda, numero di carrier) e

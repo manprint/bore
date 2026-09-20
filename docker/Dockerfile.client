@@ -19,9 +19,10 @@
 # This image does NOT recompile: it copies the binary out of the multi-arch
 # image the SAME pipeline run just published, so `:client` is bit-identical to
 # that run's non-root image and the build costs seconds instead of a full cargo
-# compile. `BORE_IMAGE` must be a multi-arch reference — buildx resolves the
-# matching arch per `--platform`, and since there is no `RUN` step the build
-# needs no emulation.
+# compile. The small Debian runtime also supplies GNU `tar`, gzip, xz, zstd,
+# lz4 and CA certificates for `transfer link --exec` and HTTPS downloads.
+# `BORE_IMAGE` must be a multi-arch reference — buildx resolves the matching
+# binary per `--platform`.
 #
 # Local build:
 #   docker build -f docker/Dockerfile.client \
@@ -29,7 +30,11 @@
 ARG BORE_IMAGE=ghcr.io/manprint/bore:latest
 FROM ${BORE_IMAGE} AS bin
 
-FROM scratch
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes \
+       ca-certificates tar gzip xz-utils zstd lz4 \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=bin /bore /bore
 # Deliberately NO `USER`: stay uid 0 so `--privileged` / `--cap-add NET_ADMIN`
 # actually reach the process.

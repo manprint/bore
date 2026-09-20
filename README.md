@@ -2392,31 +2392,50 @@ to stable storage.
 
 #### Docker client
 
-The published `:client` image is the root scratch image built by
-`docker/Dockerfile.client`. Mount source files read-only and use `--workdir` (Docker has no
-`--wd` option). `-i` is required for stdin; do not add `-t`, because a pseudo-TTY can alter
-binary bytes. `--privileged` is optional for correctness and gives the client permission to
-request larger UDP socket buffers for the direct path:
+The published `:client` image is a root Debian slim runtime built by
+`docker/Dockerfile.client`. It contains GNU `tar`, `gzip`, `xz`, `zstd`, `lz4`
+and CA certificates, so an `--exec` producer can run inside the image. Mount
+source files read-only and use `--workdir` (Docker has no `--wd` option). `-i`
+is required for stdin; do not add `-t`, because a pseudo-TTY can alter binary
+bytes. `--privileged` is optional for correctness and gives the client
+permission to request larger UDP socket buffers for the direct path:
 
 ```shell
 docker run --pull always -i --rm --privileged --network host \
   -v "$PWD:/dir:ro" --workdir /dir \
-  ghcr.io/manprint/bore:client-1.2.0-rc.2 \
+  ghcr.io/manprint/bore:client-1.2.0-rc.8 \
   transfer link myfile myfolder --to https://relay.example.net:7835 \
   --ca-cert /dir/private-ca.pem
 
-sudo tar -cpf - myfolder | docker run --pull always -i --rm --network host \
+docker run --pull always -i --rm --privileged --network host \
   -v "$PWD:/dir:ro" --workdir /dir \
-  ghcr.io/manprint/bore:client-1.2.0-rc.2 \
+  ghcr.io/manprint/bore:client-1.2.0-rc.8 \
+  transfer link --secret "$BORE_SECRET" --filename films.tar \
+  --exec -- tar -cpf - myfolder
+
+sudo tar -cpf - myfolder | docker run --pull always -i --rm --network host \
+  ghcr.io/manprint/bore:client-1.2.0-rc.8 \
   transfer link --stdin --filename backup.tar \
   --to https://relay.example.net:7835
 ```
 
-The scratch image contains only `/bore`: it has no `tar`, shell or `sudo`, so use native
-`--exec` on the host when a producer command must run under `sudo bore`, or build a separate
-image that deliberately includes that producer. A container UID/user namespace may also
-change which ownership values a restore can recreate; the root TAR gate in this repository
-checks the native `sudo bore --exec` case.
+There are two producer modes:
+
+| Mode | Producer and status | Use |
+| --- | --- | --- |
+| `--exec` | Bore starts the command on the first GET, streams stdout, drains stderr and requires exit status 0. The client image includes GNU `tar` and the requested compressors. | Recommended for backups: a failed producer fails the download. |
+| `--stdin` | A shell process such as host `tar` writes into `docker run -i`; bore sees EOF but cannot receive that process's exit code. | Use when the producer must run outside the container or is already running. |
+
+Both modes are one-shot and accept one consuming GET. If a download fails,
+restart bore and the producer. For an uncompressed archive use `--filename
+films.tar` with `tar -cpf -`; `.tar.gz` requires `tar -czpf -`, `.tar.xz`
+requires `tar -cJpf -`, `.tar.zst` requires `tar --zstd -cpf -`, and `.tar.lz4`
+requires `tar --use-compress-program=lz4 -cpf -`. The extension alone never
+enables compression; extract LZ4 with `tar --use-compress-program=lz4 -xpf`.
+A rootful Docker container can read root-only files from a
+bind mount; rootless Docker and user namespaces still apply their normal UID
+mapping. The native form `sudo bore ... --exec -- tar ...` remains available when
+the producer must use the host's root environment.
 
 ### Browser-to-browser transfer (`bore transfer web`)
 

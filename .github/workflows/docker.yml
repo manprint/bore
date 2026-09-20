@@ -172,8 +172,8 @@ jobs:
           docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
 
   # ── Root-running client variant, tag `:client` ─────────────────────────────
-  # Same binary, no `USER 1000:1000` (see docker/Dockerfile.client for why the
-  # non-root default silently loses CAP_NET_ADMIN even under --privileged).
+  # Same binary, root runtime and GNU tar (see docker/Dockerfile.client for why
+  # the non-root default silently loses CAP_NET_ADMIN even under --privileged).
   # Runs on EVERY pipeline run and moves `:client` to the image this run just
   # built, so `:client` always tracks the newest application build. The
   # immutable `client-<branch>` / `client-sha-<sha>` / `client-<version>` tags
@@ -205,6 +205,9 @@ jobs:
             type=ref,event=branch,prefix=client-
             type=sha,prefix=client-sha-
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -220,8 +223,9 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.client
-          # No RUN step (pure COPY from the just-published multi-arch image), so
-          # both arches build on this amd64 runner without QEMU.
+          # The Debian runtime installs GNU tar for transfer-link --exec. QEMU
+          # is configured above because the arm64 image executes that package
+          # install during the multi-platform build.
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

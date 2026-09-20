@@ -295,13 +295,17 @@ codice di uscita di curl/wget e `sha256sum`.
 
 ## Uso con Docker
 
-L'immagine client è scratch e contiene solo `/bore`: non contiene shell, `tar`
-o `sudo`. Per un file o una cartella montata:
+La release `ghcr.io/manprint/bore:client-<version>` usa un runtime Debian slim,
+esegue `/bore` come `root` e contiene GNU `tar`, `gzip`, `xz`, `zstd`, `lz4` e
+i certificati CA. Il binario resta identico a quello dell'immagine normale; il
+runtime aggiunge gli strumenti necessari per eseguire un produttore nel
+container. Montare le sorgenti in sola lettura e usare `--workdir` (Docker non
+ha l'opzione `--wd`):
 
 ```shell
 docker run --pull always -i --rm --privileged --network host \
   -v "$PWD:/dir:ro" --workdir /dir \
-  ghcr.io/manprint/bore:client-1.2.0-rc.7 \
+  ghcr.io/manprint/bore:client-1.2.0-rc.8 \
   transfer link myfile myfolder \
   --to https://relay.example.net:7835
 ```
@@ -309,22 +313,77 @@ docker run --pull always -i --rm --privileged --network host \
 Usare il tag immagine che corrisponde alla release installata. L'opzione
 Docker corretta è `--workdir`; `--wd` non è un'opzione Docker. `-i` mantiene
 aperto stdin. Per una pipe binaria **non** aggiungere `-t`: un pseudo-TTY può
-alterare o troncare i byte. Esempio stdin:
+alterare o troncare i byte. `--privileged` non concede permessi di lettura oltre
+quelli del filesystem montato, ma consente al client di chiedere buffer UDP più
+grandi per il percorso QUIC.
+
+### Le due modalità per un produttore
+
+| Modalità | Comando produttore | Controllo dell'esito | Quando usarla |
+| --- | --- | --- | --- |
+| `--exec` nel client | Viene avviato da bore al primo GET; nel container sono disponibili `tar` e i compressori | Bore legge `stdout`, drena `stderr` e richiede codice di uscita `0`; un fallimento rende il download fallito | Backup importanti, soprattutto quando serve sapere che il produttore è terminato correttamente |
+| `--stdin` | Il produttore è già avviato dalla shell e la sua stdout entra in `docker run -i` | Bore vede solo EOF: non riceve il codice di uscita del processo a monte | Pipe già esistenti o produttori che devono partire prima della richiesta HTTP |
+
+Entrambe sono **one-shot**: un solo GET consuma lo stream. Se il download si
+interrompe, rilanciare bore e il produttore; i byte già letti non vengono
+conservati. Per `--stdin` usare `-i` senza `-t`.
+
+#### `--exec` nel container (raccomandato per backup)
+
+Il client image è già root, quindi non serve `sudo` dentro il container. Il
+comando seguente supervisiona GNU tar e controlla il suo codice di uscita:
+
+```shell
+docker run --pull always -i --rm --privileged --network host \
+  -v "$PWD:/wdir:ro" --workdir /wdir \
+  ghcr.io/manprint/bore:client-1.2.0-rc.8 \
+  transfer link --secret "$BORE_SECRET" \
+  --filename films.tar --exec -- \
+  tar -cpf - Inception_av1.mp4 Inception.mp4 logan_av1.mp4 logan.mp4
+```
+
+`-s` è l'abbreviazione di `--secret`, quindi la stessa forma con il segreto
+fornito direttamente è:
+
+```shell
+docker run --pull always -i --rm --privileged --network host \
+  -v "$PWD:/wdir:ro" --workdir /wdir \
+  ghcr.io/manprint/bore:client-1.2.0-rc.8 \
+  transfer link -s "$BORE_SECRET" --filename films.tar --exec -- \
+  tar -cpf - Inception_av1.mp4 Inception.mp4 logan_av1.mp4 logan.mp4
+```
+
+`tar -cpf -` crea un archivio TAR senza compressione: il nome corretto è
+`films.tar`. Se si vuole davvero gzip, usare `--filename films.tar.gz` insieme a
+`tar -czpf -`; l'estensione da sola non abilita la compressione. Per gli altri
+formati sono disponibili, per esempio, `tar -cJpf -` + `films.tar.xz`,
+`tar --zstd -cpf -` + `films.tar.zst` e `tar --use-compress-program=lz4 -cpf -`
++ `films.tar.lz4`. Il ricevitore deve usare il formato corrispondente; per LZ4
+usare `tar --use-compress-program=lz4 -xpf films.tar.lz4`.
+
+L'immagine esegue il processo come root, perciò può leggere file root-only
+presenti nel bind mount su una macchina Linux con Docker rootful. Con Docker
+rootless o user namespace restano valide le normali regole di mapping degli
+UID.
+
+#### `--stdin` con tar eseguito sull'host
+
+Questa forma mantiene `tar` e i suoi privilegi sul computer A e passa i byte
+nel container:
 
 ```shell
 sudo tar -cpf - myfolder | \
   docker run --pull always -i --rm --network host \
-    -v "$PWD:/dir:ro" --workdir /dir \
-    ghcr.io/manprint/bore:client-1.2.0-rc.7 \
+    ghcr.io/manprint/bore:client-1.2.0-rc.8 \
     transfer link --stdin --filename backup.tar \
     --to https://relay.example.net:7835
 ```
 
-`--privileged` può servire all'ambiente per i buffer UDP del percorso QUIC; il
-trasferimento in relay non richiede privilegi di filesystem. Se il produttore
-deve essere eseguito con `sudo`, la forma più semplice è il comando nativo sul
-host con `sudo bore --exec`; in alternativa costruire un'immagine separata che
-contenga intenzionalmente `tar` e le utilità necessarie.
+Qui `tar` può usare `sudo` e vede esattamente il filesystem dell'host, ma bore
+non può sapere se `tar` è terminato con errore: EOF può significare sia fine
+corretta sia fallimento del produttore. Per un backup serio preferire
+`--exec`, oppure controllare separatamente il codice della pipe e confrontare
+lo SHA-256 stampato da bore con quello calcolato sul destinatario.
 
 ## Ciclo di vita e sicurezza
 

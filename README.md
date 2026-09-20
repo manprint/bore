@@ -54,6 +54,7 @@ frills attached.
   - [Direct UDP path (hole-punching)](#direct-udp-path-hole-punching)
 - [Secure file transfer (`bore transfer`)](#secure-file-transfer-bore-transfer)
   - [Public download link (`bore transfer link`)](#public-download-link-bore-transfer-link)
+  - [Guida italiana completa](docs/transfer/TRANSFER_LINK.md)
   - [Browser-to-browser transfer (`bore transfer web`)](#browser-to-browser-transfer-bore-transfer-web)
 - [Diagnosing UDP / NAT (`bore test-udp`)](#diagnosing-udp--nat-bore-test-udp)
 - [VPN — point-to-point L3 tunnel (`bore vpn`)](#vpn--point-to-point-l3-tunnel)
@@ -2257,6 +2258,8 @@ Notes:
   `--transfer-id`.
 
 ### Public download link (`bore transfer link`)
+
+**Guida italiana completa:** [`docs/transfer/TRANSFER_LINK.md`](docs/transfer/TRANSFER_LINK.md).
 
 `bore transfer link` publishes a file, a directory, or a mixed selection through the
 existing HTTPS vhost. The command prints one URL on stdout and remains in the foreground

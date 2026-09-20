@@ -3,7 +3,7 @@
 | Audit | Date | Scope | Verdict | Findings | Report |
 |-------|------|-------|---------|----------|--------|
 | V001 | 2026-09-20 | phases 0–4, `7ea6b9f..1446f2a` | FAIL pending C10–C12 | 2 BLOCKER, 8 MAJOR, 0 MINOR open after C09 | [verify_001_2026-09-20.md](verify_001_2026-09-20.md) |
-| V001 final | 2026-09-20 | C10–C12, commit `f50a9db` e gate remoti | PASS | F01–F15 FIXED; relay threshold deviation documented; no open blockers | [verify_002_2026-09-20.md](verify_002_2026-09-20.md) |
+| V001 final | 2026-09-20 | C10–C12, commit `f50a9db`, docs `f51fd21`, release `v1.2.0-rc.7` | PASS | F01–F15 FIXED; relay threshold deviation documented; no open blockers; Release `35500329001` green, 26 assets | [verify_002_2026-09-20.md](verify_002_2026-09-20.md) |
 
 ## Findings
 

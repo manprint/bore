@@ -1,7 +1,7 @@
 # Transfer Link — Implementation State
 
 > **LEGGERE QUESTO FILE PER PRIMO a ogni sessione. Aprire un'unità in §1 PRIMA di modificare codice; chiuderla DOPO i gate.**
-> **Last updated:** 2026-09-20 | **By:** Codex, V001-C12/REL-1 | **Session:** 32
+> **Last updated:** 2026-09-20 | **By:** Codex, REL-1 release closure | **Session:** 33
 
 ## 0. Protocol
 
@@ -27,11 +27,11 @@ Questo è l'unico file di stato: posizione, progress board, ledger, verifiche, d
 - **Type:** none
 - **ID:** REL-1
 - **Status:** none
-- **Intent:** chiusura V001 e preparazione del prerelease `v1.2.0-rc.7` dopo i gate locali e remoti verdi.
+- **Intent:** registrare la pubblicazione completa del prerelease `v1.2.0-rc.7` e chiudere REL-1 dopo i workflow finali sul commit documentale.
 - **Phase:** tutte (`phase_01.md`–`phase_05.md`) chiuse.
-- **Next action:** nessuna; dopo il commit documentale creare il tag annotato `v1.2.0-rc.7` e attendere il workflow Release.
+- **Next action:** nessuna; REL-1 è chiuso dopo la pubblicazione e la verifica del prerelease.
 - **Assigned:** Codex (esecuzione del ruolo `agent-2:sonnet`; review dei test incorporata).
-- **Repo state:** branch `dev`, implementazione `f50a9db374253e10ee90574dafe0f2b7a7aeed4f`, tag/release `v1.2.0-rc.6` già pubblicati; V001-C01–V001-C12 chiusi, REL-1 in attesa del tag.
+- **Repo state:** branch `dev`, implementazione `f50a9db374253e10ee90574dafe0f2b7a7aeed4f`, documentazione `f51fd21cd2b1300db6792f345ba6a121d719fef2`, tag/release `v1.2.0-rc.7` pubblicati; V001-C01–V001-C12 e REL-1 chiusi.
 
 ## 2. Feature context
 
@@ -128,7 +128,8 @@ Append-only, una riga per unità chiusa. Type ammessi: sub-phase, task, bug, ver
 | 40 | correction | V001-C10 | Codex (root) | Aggiunto il fault harness namespace isolato per direct QUIC, fallback automatico con UDP bloccato, relay-only, drop senza migrazione, retry su nuova curl, restart/reconnect, stdin/exec one-shot e 100 cicli con baseline FD/registry; collegato come gate seriale root. | `scripts/transfer_link_netns_test.sh`, `.github/workflows/e2e_netns.yml`, `docs/plans/002_plan-TransferLink/{phase_05.md,STATE.md}` | G-LINK-NETNS PASS nel run `35495796958`, job `106039159407`; tutte le prove e cleanup PASS | `f50a9db` |
 | 41 | correction | V001-C11 | Codex (root) | Aggiunto benchmark release matched-baseline direct/relay con TTFB, hash, concorrenza, RSS e stream stdin da 15 GiB senza spool; soglia relay esplicitamente documentata al 75% per il costo SHA/source validation. | `scripts/transfer_link_perf.sh`, `.github/workflows/ci.yml`, `docs/plans/002_plan-TransferLink/{phase_05.md,STATE.md}` | G-LINK-PERF locale e job `106044299896` PASS; direct 0.986, relay 0.848, TTFB ≤100 ms, RSS bounded | `f50a9db` |
 | 42 | verify | V001-C12 | Codex (root) | Riconciliato l’audit V001 con l’evidenza root/CI, chiusi F08/F09/F14 e registrato il rerun WebKit intermittente senza modifiche di codice; stato, board e report finale aggiornati. | `docs/plans/002_plan-TransferLink/{STATE.md,verify/index.md,verify/verify_002_2026-09-20.md}` | G-FMT/G-LINT/G-BUILD/G-FULL/G-LINK/G-NOUDP/G-E2E/G-ROOT/G-LARGE/G-DOCKER PASS; cinque workflow remoti `35495796933/944/948/958/968` PASS | `f50a9db` |
-| 43 | task | REL-1 | Codex (root) | Preparazione del prerelease `v1.2.0-rc.7` dopo il commit documentale su `dev`; il workflow Release sarà seguito fino a preflight, gate, immagini e asset binari verdi. | `docs/plans/002_plan-TransferLink/STATE.md`, `docs/plans/002_plan-TransferLink/verify/verify_002_2026-09-20.md` | In attesa del commit/push documentale e del tag annotato | pending |
+| 43 | task | REL-1 | Codex (root) | Preparazione del prerelease `v1.2.0-rc.7` dopo il commit documentale su `dev`; il workflow Release è stato seguito fino a preflight, gate, immagini e asset binari verdi. | `docs/plans/002_plan-TransferLink/STATE.md`, `docs/plans/002_plan-TransferLink/verify/verify_002_2026-09-20.md` | Release `35500329001` completata; chiusura documentale in corso | f51fd21 |
+| 44 | verify | REL-1 | Codex (root) | Verificata e registrata la pubblicazione completa di `v1.2.0-rc.7`: tag annotato sul commit `f51fd21`, prerelease non-draft e 26 asset; tutti i 72 job del workflow Release sono verdi. | `docs/plans/002_plan-TransferLink/STATE.md`, `docs/plans/002_plan-TransferLink/verify/verify_002_2026-09-20.md`, `docs/plans/002_plan-TransferLink/verify/index.md` | Release `35500329001` `completed/success`; `gh release view v1.2.0-rc.7` PASS; stato finale su `dev` da pubblicare | f51fd21 |
 
 ## 5. Files touched
 
@@ -153,7 +154,7 @@ Append-only, una riga per unità chiusa. Type ammessi: sub-phase, task, bug, ver
 
 ## 6. In-flight work
 
-none — tree consistent. V001-C10 ha chiuso il fault harness root reale; V001-C11 ha chiuso il benchmark release; V001-C12 ha riconciliato il piano con i gate locali e i cinque workflow remoti verdi. Il risultato misurato è direct 98.6% della baseline, relay 84.8% con SHA-256 obbligatoria, TTFB entro 100 ms; stdin 15 GiB hashato con delta RSS sender 41,692 KiB/server 6,764 KiB e nessuno spool.
+none — tree consistent. V001-C10 ha chiuso il fault harness root reale; V001-C11 ha chiuso il benchmark release; V001-C12 ha riconciliato il piano con i gate locali e i cinque workflow remoti verdi; REL-1 ha pubblicato `v1.2.0-rc.7`. Il risultato misurato è direct 98.6% della baseline, relay 84.8% con SHA-256 obbligatoria, TTFB entro 100 ms; stdin 15 GiB hashato con delta RSS sender 41,692 KiB/server 6,764 KiB e nessuno spool.
 
 ## 7. Verification state
 
@@ -182,6 +183,7 @@ none — tree consistent. V001-C10 ha chiuso il fault harness root reale; V001-C
 | REL-7 version correction | `cargo metadata --offline --locked`; fmt; clippy; transfer tests all/no-default | PASS; crate e lock `1.2.0-rc.6`, 22/22 in entrambe le configurazioni | 2026-09-19 |
 | Remote CI on `1505cb2` | CI `35467022413` + E2E netns `35467022428` + Docker GHCR `35467022567` + Mean Bean CI `35467022437` + Mean Bean Deploy `35467022436` | PASS; tutti i cinque workflow `completed/success` | 2026-09-19 |
 | Release `v1.2.0-rc.6` | Release `35468969739`, attempt 2; Chromium rerun incluso | PASS; preflight, gate, publish binari/GHCR e coordinate immutabili completati; release prerelease non-draft con 26 asset | 2026-09-19 |
+| Release `v1.2.0-rc.7` | Release `35500329001`; tag annotato sul commit `f51fd21` | PASS; 72/72 job `completed/success`, binari/GHCR pubblicati, prerelease non-draft con 26 asset | 2026-09-20 |
 | G-VHOST | `sudo -n ./scripts/vhost_netns_test.sh` | PASS; 16/16 | 2026-09-19 |
 | G-VHOST-HARD | `sudo -n ./scripts/vhost_netns_test_hard.sh` | PASS; PASS=6, FAIL=0 | 2026-09-19 |
 | G-VHOST-UDP | `sudo -n ./scripts/vhost_udp_concurrency_repro.sh` | PASS; 3/3 | 2026-09-19 |
@@ -226,7 +228,7 @@ none — tree consistent. V001-C10 ha chiuso il fault harness root reale; V001-C
 - Il primo run remoto del commit `038e651` è stato analizzato: CI ha fallito per i tre difetti registrati in REL-2 (più i due job VPN che ereditavano lo stesso test env); Docker/GHCR, Mean Bean CI/Deploy sono verdi. Il secondo run sul commit `232e35f` ha isolato i due difetti REL-3; il commit `26d6584` ha corretto entrambi e il relativo run remoto è verde dopo il rerun Chromium. REL-5 ha reso deterministica l’asserzione che osservava uno stato transitorio troppo breve; il commit finale `cd4f801` ha ora cinque workflow remoti completamente verdi.
 - T-LINK-DROP e il ciclo T-LINK-CLEANUP da 100 iterazioni sono PASS nel run root `35495796958`; T-LINK-PERF è PASS in release con baseline vhost, SHA-256 attiva, 15 GiB stdin e controlli RSS/no-spool. La soglia relay ≥75% è la deviazione misurata descritta sopra.
 - La CI remota del commit `cd4f801` è stata attesa da questo ambiente: tutti i cinque workflow richiesti risultano `completed/success`. Il successivo Release preflight `v1.2.0-rc.5` ha fallito per il mismatch di versione; il tag è immutabile e resta intenzionalmente non pubblicato come release. Il bump a `rc.6` è sul commit `1505cb2`, i cinque workflow sono verdi e la release prerelease `v1.2.0-rc.6` è stata pubblicata dopo il rerun del solo job Chromium intermittente.
-- Il server relay vede il plaintext HTTPS secondo la decisione dell'utente; il traffico tra A/server resta TLS/QUIC o TLS/TCP secondo il path scelto. Il prerelease `v1.2.0-rc.7` resta da creare dopo il commit documentale.
+- Il server relay vede il plaintext HTTPS secondo la decisione dell'utente; il traffico tra A/server resta TLS/QUIC o TLS/TCP secondo il path scelto. Il prerelease `v1.2.0-rc.7` è pubblicato sul commit documentale `f51fd21`; il run Release `35500329001` ha chiuso con 72 job verdi e la release mostra 26 asset.
 
 ## 10. Do-not-repeat
 
@@ -324,4 +326,4 @@ Stati ammessi: TODO, IN_PROGRESS, DONE, SKIPPED (con motivo), BLOCKED.
 |--------|------|---------|---------------|
 | Final verify 4.4 + correction 4.5 | 2026-09-19 | PASS with explicit evidence gaps | Empty `--exec` success now covered; T-LINK-DROP, cleanup 100-cycle and throughput benchmark remain NOT RUN; no code/test failure |
 | [V001](verify/verify_001_2026-09-20.md) | 2026-09-20 | FAIL pending C09–C12 | F01–F07/F10–F13/F15 FIXED; F08/F09/F14 open: 0 BLOCKER, 3 MAJOR, 0 MINOR; correction plan V001-C09–C12 |
-| [V001 final](verify/verify_002_2026-09-20.md) | 2026-09-20 | PASS with documented relay threshold deviation | F01–F15 FIXED; no open blockers; relay benchmark gate is ≥75% because integrity/source validation is enabled |
+| [V001 final](verify/verify_002_2026-09-20.md) | 2026-09-20 | PASS with documented relay threshold deviation; release published | F01–F15 FIXED; no open blockers; `v1.2.0-rc.7` non-draft con 26 asset e Release `35500329001` verde |

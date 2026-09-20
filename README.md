@@ -44,6 +44,7 @@ frills attached.
   - [HTTPS on the tunnel port](#https-on-the-tunnel-port)
   - [WebSocket support](#websocket-support)
 - [Self-hosting (`bore server`)](#self-hosting)
+  - [Nginx on ports 80/443](#nginx-on-ports-80443)
   - [Full server flag reference](#full-server-flag-reference)
   - [Serving over HTTPS/HTTP](#serving-over-httpshttp)
   - [Basic auth on tunnels](#basic-auth-on-tunnels)
@@ -937,6 +938,15 @@ The control port also serves the browser surface of
 started with `--web-transfer-base-url`; no additional port is bound for it. That stays
 true when two browsers transfer **directly**: the WebRTC path runs between them and
 needs outbound UDP from each, never an inbound port on the server.
+
+### Nginx on ports 80/443
+
+For a production VM where Nginx already owns TCP 80/443, use the complete
+[Nginx deployment kit](nginx/README.md). It preserves native bore-over-TLS,
+plain SSH and SSH-over-TLS, dynamic HTTP/HTTPS vhosts, WebSockets, admin and Web
+Transfer on TCP 443 while bore owns UDP 443 for shared QUIC. The guide also
+lists the separate STUN and public-tunnel firewall ports required to keep every
+feature available; an HTTP reverse proxy alone cannot carry those protocols.
 
 ### Full server flag reference
 

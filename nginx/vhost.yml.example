@@ -1,0 +1,24 @@
+# Install as /etc/bore/vhost.yml after replacing the example domain.
+base_domain: bore.example.com
+
+# TCP 80 reaches 8080 through nginx's HTTP proxy. Browser TLS on TCP 443 is
+# passed through by nginx stream to 8444, so bore retains per-vhost HTTPS policy.
+mode: both
+http_port: 8080
+https_port: 8444
+
+# One certificate containing bore.example.com and *.bore.example.com.
+cert_file: /etc/bore/tls/fullchain.pem
+key_file: /etc/bore/tls/privkey.pem
+
+# Optional headers sent to every local HTTP backend.
+default_headers:
+  X-Forwarded-By: bore
+
+default_response_headers:
+  X-Content-Type-Options: nosniff
+
+# Lock important names to a client id if desired.
+reservations: []
+#  - subdomain: app
+#    client_id: app-production

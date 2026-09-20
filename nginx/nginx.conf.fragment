@@ -1,0 +1,6 @@
+# Add this block at the top level of /etc/nginx/nginx.conf, next to `http {}`.
+# The files included here are stream/TCP configuration and MUST NOT be included
+# from /etc/nginx/conf.d (which is normally inside `http {}`).
+stream {
+    include /etc/nginx/stream-conf.d/*.conf;
+}

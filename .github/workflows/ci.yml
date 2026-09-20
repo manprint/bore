@@ -82,6 +82,9 @@ jobs:
       - name: Transfer-link HTTPS client smoke
         run: bash scripts/transfer_link_e2e.sh basic
 
+      - name: Transfer-link performance smoke
+        run: bash scripts/transfer_link_perf.sh
+
   transfer-link-docker:
     name: Transfer link (Docker client)
     if: inputs.only != 'web-transfer'

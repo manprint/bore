@@ -6,7 +6,10 @@
 //! ownership, and the cancellable vhost registration supervisor.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -28,8 +31,17 @@ use crate::transport::{self, ConnectFailure, Endpoint};
 /// Number of characters in a transfer-link vhost label.
 pub const LINK_LABEL_LENGTH: usize = 16;
 
+/// Stable prefix that makes transfer-link hostnames distinguishable from
+/// ordinary vhost names while keeping the random portion short enough to copy.
+pub const LINK_LABEL_PREFIX: &str = "transfer-";
+
 /// Alphabet used for the public transfer-link label.
 pub const LINK_LABEL_ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Monotonic, process-local correlation ids are deliberately separate from
+/// the random vhost label.  They are safe to put in logs because they are not
+/// accepted by the server and cannot grant access to a download.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum time allowed for a registration rejection after a URL was already
 /// published.  This is longer than the server's default control reaper so the
@@ -92,6 +104,7 @@ pub struct TransferLinkSupervisor {
     endpoint: Endpoint,
     endpoint_text: String,
     label: String,
+    session_id: u64,
     client_id: String,
     secret: Option<String>,
     relay_only: bool,
@@ -106,7 +119,7 @@ impl std::fmt::Debug for TransferLinkSupervisor {
         f.debug_struct("TransferLinkSupervisor")
             .field("http_port", &self.http_port)
             .field("endpoint", &self.endpoint)
-            .field("label", &self.label)
+            .field("session_id", &self.session_id)
             .field("relay_only", &self.relay_only)
             .field("carriers", &self.carriers)
             .field("state", &self.state())
@@ -137,6 +150,7 @@ impl TransferLinkSupervisor {
         let tls_config = transport::client_config_with_extra_roots(ca_pem.as_deref())?;
         let http_port = http.local_addr()?.port();
         let label = generate_link_label()?;
+        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let client_id = generate_client_id()?;
         let path_registry = crate::transfer_link::BackendPathRegistry::new(256);
         http.set_path_registry(Arc::clone(&path_registry));
@@ -146,6 +160,7 @@ impl TransferLinkSupervisor {
             endpoint,
             endpoint_text: config.to,
             label,
+            session_id,
             client_id,
             secret: config.secret,
             relay_only: config.relay_only,
@@ -159,6 +174,11 @@ impl TransferLinkSupervisor {
     /// Return the fixed random label used for this session's vhost.
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// Return the non-secret id used to correlate this session's logs.
+    pub fn session_id(&self) -> u64 {
+        self.session_id
     }
 
     /// Return the current lifecycle state.
@@ -181,7 +201,7 @@ impl TransferLinkSupervisor {
             .take()
             .expect("transfer-link supervisor HTTP listener already consumed");
         let http_cancel = shutdown.child_token();
-        let http_task = tokio::spawn(http.run(http_cancel.clone()));
+        let mut http_task = tokio::spawn(http.run(http_cancel.clone()));
         let mut ready = Some(ready);
         let mut expected_url: Option<String> = None;
         let mut published = false;
@@ -261,7 +281,7 @@ impl TransferLinkSupervisor {
             rejection_started = None;
             backoff.reset();
             self.set_state(LinkState::Ready);
-            info!(label = %self.label, "transfer-link vhost ready");
+            info!(session_id = self.session_id, "transfer-link vhost ready");
 
             let listen_result = tokio::select! {
                 _ = shutdown.cancelled() => Ok(()),
@@ -280,7 +300,7 @@ impl TransferLinkSupervisor {
 
         self.set_state(LinkState::Stopping);
         http_cancel.cancel();
-        match timeout(Duration::from_secs(5), http_task).await {
+        match timeout(Duration::from_secs(5), &mut http_task).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(error))) => {
                 if result.is_ok() {
@@ -289,7 +309,12 @@ impl TransferLinkSupervisor {
                 debug!(error = %error, "transfer-link HTTP task ended after supervisor failure");
             }
             Ok(Err(error)) => warn!(error = %error, "transfer-link HTTP task join failed"),
-            Err(_) => warn!("transfer-link HTTP task did not stop within 5 seconds"),
+            Err(_) => {
+                warn!("transfer-link HTTP task did not stop within 5 seconds; aborting");
+                if !abort_and_join(&mut http_task, Duration::from_secs(5)).await {
+                    warn!("transfer-link HTTP task remained after abort");
+                }
+            }
         }
         self.set_state(LinkState::Stopped);
         result
@@ -306,6 +331,14 @@ impl TransferLinkSupervisor {
     fn set_state(&self, state: LinkState) {
         *self.state.lock().expect("transfer-link state poisoned") = state;
     }
+}
+
+/// Abort a non-cooperative task and retain its join handle until the abort is
+/// observed. Dropping a `JoinHandle` after a timeout would detach the task and
+/// let it keep the listener and its resources alive after the CLI returned.
+async fn abort_and_join<T>(task: &mut tokio::task::JoinHandle<T>, wait: Duration) -> bool {
+    task.abort();
+    timeout(wait, task).await.is_ok()
 }
 
 /// Validate a transfer-link control endpoint without invoking permissive
@@ -397,9 +430,10 @@ pub fn public_file_url(base: &str, filename: &str) -> Result<String> {
 /// sampling, avoiding modulo bias (256 is not divisible by 36).
 pub fn generate_link_label() -> Result<String> {
     let random = SystemRandom::new();
-    let mut output = String::with_capacity(LINK_LABEL_LENGTH);
+    let mut output = String::with_capacity(LINK_LABEL_PREFIX.len() + LINK_LABEL_LENGTH);
+    output.push_str(LINK_LABEL_PREFIX);
     let mut byte = [0u8; 1];
-    while output.len() < LINK_LABEL_LENGTH {
+    while output.len() < LINK_LABEL_PREFIX.len() + LINK_LABEL_LENGTH {
         random
             .fill(&mut byte)
             .map_err(|_| anyhow::anyhow!("failed to generate link identity"))?;
@@ -439,6 +473,7 @@ pub fn classify_attempt_error(error: &anyhow::Error) -> LinkAttemptClass {
     } else if error.downcast_ref::<ConnectFailure>().is_some() {
         match error.downcast_ref::<ConnectFailure>().unwrap() {
             ConnectFailure::Transport => LinkAttemptClass::Transient,
+            ConnectFailure::TlsTransient => LinkAttemptClass::Transient,
             ConnectFailure::Tls => LinkAttemptClass::TlsVerification,
         }
     } else {
@@ -517,8 +552,10 @@ mod tests {
     fn generated_labels_have_fixed_uniform_alphabet() {
         for _ in 0..64 {
             let label = generate_link_label().unwrap();
-            assert_eq!(label.len(), LINK_LABEL_LENGTH);
-            assert!(label
+            assert!(label.starts_with(LINK_LABEL_PREFIX));
+            let random = &label[LINK_LABEL_PREFIX.len()..];
+            assert_eq!(random.len(), LINK_LABEL_LENGTH);
+            assert!(random
                 .bytes()
                 .all(|byte| LINK_LABEL_ALPHABET.contains(&byte)));
         }
@@ -544,10 +581,53 @@ mod tests {
     }
 
     #[test]
+    fn transient_tls_failures_retry_but_verification_failures_stop() {
+        let transient = anyhow::Error::new(ConnectFailure::TlsTransient);
+        let verification = anyhow::Error::new(ConnectFailure::Tls);
+        assert_eq!(
+            classify_attempt_error(&transient),
+            LinkAttemptClass::Transient
+        );
+        assert!(!should_stop_after_error(
+            classify_attempt_error(&transient),
+            true,
+            None
+        ));
+        assert_eq!(
+            classify_attempt_error(&verification),
+            LinkAttemptClass::TlsVerification
+        );
+        assert!(should_stop_after_error(
+            classify_attempt_error(&verification),
+            true,
+            None
+        ));
+    }
+
+    #[test]
     fn public_url_encodes_filename_without_changing_host() {
         assert_eq!(
             public_file_url("https://abc.example/", "my file.bin").unwrap(),
             "https://abc.example/my%20file.bin"
         );
+    }
+
+    #[tokio::test]
+    async fn timed_out_http_task_is_aborted_and_joined() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let mut task = tokio::spawn(async move {
+            struct Marker(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Marker {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _marker = Marker(task_dropped);
+            std::future::pending::<()>().await;
+        });
+        assert!(timeout(Duration::from_millis(5), &mut task).await.is_err());
+        assert!(abort_and_join(&mut task, Duration::from_secs(1)).await);
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
     }
 }

@@ -7,8 +7,8 @@
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -26,7 +26,7 @@ use hyper::{Method, Request, Response, StatusCode, Version};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -38,7 +38,7 @@ use super::source::{
     content_disposition, open_prepared_file, spawn_file_producer, FileProducerHandle,
     LinkConfigError, LinkOptions, PreparedFile, MIME_OCTET_STREAM,
 };
-use super::stats::{DownloadId, SourceMessage};
+use super::stats::{DownloadId, SourceCompletion, SourceMessage};
 use super::zip::spawn_archive_producer;
 
 /// Maximum number of request headers accepted by the HTTP/1 parser.
@@ -108,6 +108,7 @@ struct HttpState {
     options: LinkOptions,
     path_registry: Option<Arc<super::path::BackendPathRegistry>>,
     downloads: Arc<Semaphore>,
+    active_downloads: Arc<AtomicUsize>,
     connections: Arc<Semaphore>,
     shutdown: CancellationToken,
     next_download: AtomicU64,
@@ -145,6 +146,7 @@ impl TransferLinkHttp {
             state: Arc::new(HttpState {
                 prepared,
                 downloads: Arc::new(Semaphore::new(options.limits.max_downloads)),
+                active_downloads: Arc::new(AtomicUsize::new(0)),
                 connections: Arc::new(Semaphore::new(connection_limit)),
                 shutdown: CancellationToken::new(),
                 next_download: AtomicU64::new(1),
@@ -232,8 +234,16 @@ async fn serve_connection(
 ) -> io::Result<()> {
     let io = TokioIo::new(stream);
     let service_state = Arc::clone(&state);
-    let service =
-        service_fn(move |request| handle_request(Arc::clone(&service_state), peer, request));
+    let connection_outcome = Arc::new(HttpConnectionOutcome::default());
+    let service_outcome = Arc::clone(&connection_outcome);
+    let service = service_fn(move |request| {
+        handle_request(
+            Arc::clone(&service_state),
+            peer,
+            request,
+            Arc::clone(&service_outcome),
+        )
+    });
     let mut builder = http1::Builder::new();
     builder
         .keep_alive(false)
@@ -242,16 +252,31 @@ async fn serve_connection(
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT);
     let connection = builder.serve_connection(io, service);
-    tokio::select! {
+    let result = tokio::select! {
         result = connection => result.map_err(io::Error::other),
-        _ = state.shutdown.cancelled() => Ok(()),
+        _ = state.shutdown.cancelled() => Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "transfer-link HTTP server shutting down",
+        )),
+    };
+    match &result {
+        Ok(()) => connection_outcome.connection_succeeded(),
+        Err(error) => {
+            connection_outcome.connection_failed(error.to_string());
+            connection_outcome.cancel_producer();
+        }
     }
+    if let Err(error) = connection_outcome.join_producer().await {
+        warn!(error = %error, peer = %peer, "transfer-link producer supervisor failed to join");
+    }
+    result
 }
 
 async fn handle_request(
     state: Arc<HttpState>,
     peer: SocketAddr,
     request: Request<Incoming>,
+    connection_outcome: Arc<HttpConnectionOutcome>,
 ) -> Result<Response<TransferBody>, Infallible> {
     let response = if request_has_body_or_upgrade(&request) {
         error_response(
@@ -281,7 +306,7 @@ async fn handle_request(
     } else if request.method() == Method::HEAD {
         metadata_response(&state).await
     } else {
-        get_response(state, peer).await
+        get_response(state, peer, connection_outcome).await
     };
     Ok(response)
 }
@@ -314,7 +339,11 @@ async fn metadata_response(state: &HttpState) -> Response<TransferBody> {
     build_file_response(state, body, true)
 }
 
-async fn get_response(state: Arc<HttpState>, peer: SocketAddr) -> Response<TransferBody> {
+async fn get_response(
+    state: Arc<HttpState>,
+    peer: SocketAddr,
+    connection_outcome: Arc<HttpConnectionOutcome>,
+) -> Response<TransferBody> {
     // Claim a one-shot before checking the download semaphore so a concurrent
     // GET receives the precise 409 state instead of a misleading capacity 503.
     let claimed_oneshot = match &state.prepared {
@@ -391,7 +420,15 @@ async fn get_response(state: Arc<HttpState>, peer: SocketAddr) -> Response<Trans
             (producer, None, claimed_oneshot)
         }
     };
+    state.active_downloads.fetch_add(1, Ordering::Relaxed);
     debug!(download_id = id, "transfer-link download started");
+    let download_outcome = Arc::new(DownloadOutcome::new(
+        DownloadId(id),
+        size,
+        path,
+        oneshot.clone(),
+    ));
+    connection_outcome.attach(Arc::clone(&download_outcome));
     let body = body_from_producer(
         producer,
         cancellation,
@@ -401,16 +438,14 @@ async fn get_response(state: Arc<HttpState>, peer: SocketAddr) -> Response<Trans
         state.options.limits.stats_interval,
         path,
         oneshot,
+        Some(download_outcome),
+        Some(Arc::clone(&state.active_downloads)),
     );
-    // Deliberately omit Content-Length for a streaming GET. Hyper can then
-    // poll through SourceMessage::Complete and observe the producer's final
-    // fingerprint/hash validation before ending the response. HEAD still
-    // advertises the known size through `metadata_response`.
-    build_file_response(
-        &state,
-        body,
-        matches!(&state.prepared, PreparedSource::File(_)),
-    )
+    // Omit Content-Length for every GET. Hyper must poll the terminal source
+    // message so final fingerprint/hash validation and transport outcome are
+    // both known before the response is committed. HEAD still advertises the
+    // known file size through `metadata_response`.
+    build_file_response(&state, body, false)
 }
 
 fn build_file_response(
@@ -489,19 +524,20 @@ pub fn body_from_messages(
 ) -> TransferBody {
     message_body(MessageBodyState {
         receiver,
-        task: None,
+        owner: None,
         cancellation,
         permit: None,
         complete: false,
         id: None,
         size: None,
         started: Instant::now(),
-        last_report: Instant::now(),
+        next_report: Instant::now() + Duration::from_secs(1),
         bytes_for_http: 0,
         stats_interval: Duration::from_secs(1),
         path: None,
-        completion: None,
         oneshot: None,
+        outcome: None,
+        active_downloads: None,
     })
 }
 
@@ -515,104 +551,311 @@ fn body_from_producer(
     stats_interval: Duration,
     path: Option<BackendPath>,
     oneshot: Option<Arc<OneShotState>>,
+    outcome: Option<Arc<DownloadOutcome>>,
+    active_downloads: Option<Arc<AtomicUsize>>,
 ) -> TransferBody {
-    let (receiver, task, completion) = producer.into_parts_with_completion();
+    let (receiver, owner, _completion) = producer.into_parts_with_completion();
+    if let Some(outcome) = &outcome {
+        outcome.attach_producer(Arc::clone(&owner));
+    }
     message_body(MessageBodyState {
         receiver,
-        task: Some(task),
+        owner: Some(owner),
         cancellation,
         permit,
         complete: false,
         id: Some(id),
         size,
         started: Instant::now(),
-        last_report: Instant::now(),
+        next_report: Instant::now() + stats_interval,
         bytes_for_http: 0,
         stats_interval,
         path,
-        completion: Some(completion),
         oneshot,
+        outcome,
+        active_downloads,
     })
 }
 
 struct MessageBodyState {
     receiver: mpsc::Receiver<SourceMessage>,
-    task: Option<JoinHandle<()>>,
+    owner: Option<Arc<super::source::ProducerTaskOwner>>,
     cancellation: CancellationToken,
     permit: Option<OwnedSemaphorePermit>,
     complete: bool,
     id: Option<DownloadId>,
     size: Option<u64>,
     started: Instant,
-    last_report: Instant,
+    next_report: Instant,
     bytes_for_http: u64,
     stats_interval: Duration,
     path: Option<BackendPath>,
-    completion: Option<Arc<std::sync::Mutex<Option<super::stats::SourceCompletion>>>>,
     oneshot: Option<Arc<OneShotState>>,
+    outcome: Option<Arc<DownloadOutcome>>,
+    active_downloads: Option<Arc<AtomicUsize>>,
+}
+
+/// Per-connection hand-off between the Hyper future and its response body.
+///
+/// A transfer body can observe a valid source completion before Hyper has
+/// finished writing the socket.  Keeping the download outcome behind this
+/// connection owner prevents that candidate from being published as success
+/// until the connection future also reports success.
+#[derive(Default)]
+struct HttpConnectionOutcome {
+    download: Mutex<Option<Arc<DownloadOutcome>>>,
+}
+
+impl HttpConnectionOutcome {
+    fn attach(&self, download: Arc<DownloadOutcome>) {
+        *self
+            .download
+            .lock()
+            .expect("connection outcome mutex poisoned") = Some(download);
+    }
+
+    fn connection_succeeded(&self) {
+        if let Some(download) = self
+            .download
+            .lock()
+            .expect("connection outcome mutex poisoned")
+            .clone()
+        {
+            download.connection_succeeded();
+        }
+    }
+
+    fn connection_failed(&self, error: String) {
+        if let Some(download) = self
+            .download
+            .lock()
+            .expect("connection outcome mutex poisoned")
+            .clone()
+        {
+            download.connection_failed(error);
+        }
+    }
+
+    fn cancel_producer(&self) {
+        if let Some(download) = self
+            .download
+            .lock()
+            .expect("connection outcome mutex poisoned")
+            .clone()
+        {
+            download.cancel_producer();
+        }
+    }
+
+    async fn join_producer(&self) -> Result<(), tokio::task::JoinError> {
+        let download = self
+            .download
+            .lock()
+            .expect("connection outcome mutex poisoned")
+            .clone();
+        match download {
+            Some(download) => download.join_producer().await,
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum SourceTerminal {
+    Complete(SourceCompletion),
+    Failed(String),
+}
+
+/// Single terminal outcome owner for one GET.
+struct DownloadOutcome {
+    id: DownloadId,
+    size: Option<u64>,
+    path: Option<BackendPath>,
+    started: Instant,
+    bytes_for_http: AtomicU64,
+    source: Mutex<Option<SourceTerminal>>,
+    connection: Mutex<Option<Result<(), String>>>,
+    finalized: AtomicBool,
+    oneshot: Option<Arc<OneShotState>>,
+    producer: Mutex<Option<Arc<super::source::ProducerTaskOwner>>>,
+}
+
+impl DownloadOutcome {
+    fn new(
+        id: DownloadId,
+        size: Option<u64>,
+        path: Option<BackendPath>,
+        oneshot: Option<Arc<OneShotState>>,
+    ) -> Self {
+        Self {
+            id,
+            size,
+            path,
+            started: Instant::now(),
+            bytes_for_http: AtomicU64::new(0),
+            source: Mutex::new(None),
+            connection: Mutex::new(None),
+            finalized: AtomicBool::new(false),
+            oneshot,
+            producer: Mutex::new(None),
+        }
+    }
+
+    fn attach_producer(&self, owner: Arc<super::source::ProducerTaskOwner>) {
+        *self
+            .producer
+            .lock()
+            .expect("download producer mutex poisoned") = Some(owner);
+    }
+
+    fn cancel_producer(&self) {
+        if let Some(owner) = self
+            .producer
+            .lock()
+            .expect("download producer mutex poisoned")
+            .clone()
+        {
+            owner.cancel();
+        }
+    }
+
+    async fn join_producer(&self) -> Result<(), tokio::task::JoinError> {
+        let owner = self
+            .producer
+            .lock()
+            .expect("download producer mutex poisoned")
+            .clone();
+        match owner {
+            Some(owner) => owner.join().await,
+            None => Ok(()),
+        }
+    }
+
+    fn add_bytes(&self, bytes: u64) {
+        self.bytes_for_http.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn source_complete(&self, summary: SourceCompletion) {
+        self.set_source(SourceTerminal::Complete(summary));
+    }
+
+    fn source_failed(&self, error: impl Into<String>) {
+        self.set_source(SourceTerminal::Failed(error.into()));
+    }
+
+    fn set_source(&self, terminal: SourceTerminal) {
+        let mut source = self.source.lock().expect("download outcome mutex poisoned");
+        if source.is_none() {
+            *source = Some(terminal);
+        }
+        drop(source);
+        self.try_finalize();
+    }
+
+    fn connection_succeeded(&self) {
+        self.set_connection(Ok(()));
+    }
+
+    fn connection_failed(&self, error: impl Into<String>) {
+        self.set_connection(Err(error.into()));
+    }
+
+    fn set_connection(&self, result: Result<(), String>) {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("download outcome mutex poisoned");
+        if connection.is_none() {
+            *connection = Some(result);
+        }
+        drop(connection);
+        self.try_finalize();
+    }
+
+    fn try_finalize(&self) {
+        let source = self
+            .source
+            .lock()
+            .expect("download outcome mutex poisoned")
+            .clone();
+        let connection = self
+            .connection
+            .lock()
+            .expect("download outcome mutex poisoned")
+            .clone();
+        let Some(connection) = connection.as_ref() else {
+            return;
+        };
+        let success =
+            connection.is_ok() && matches!(source.as_ref(), Some(SourceTerminal::Complete(_)));
+        let failure = if connection.is_err() {
+            connection.as_ref().err().cloned()
+        } else {
+            match source.as_ref() {
+                Some(SourceTerminal::Failed(error)) => Some(error.clone()),
+                Some(SourceTerminal::Complete(_)) => None,
+                None => return,
+            }
+        };
+        let summary = match source.as_ref() {
+            Some(SourceTerminal::Complete(summary)) => Some(summary.clone()),
+            _ => None,
+        };
+        if self
+            .finalized
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if success {
+            if let Some(oneshot) = &self.oneshot {
+                oneshot.consumed();
+            }
+            let sha256 = summary.as_ref().map(|summary| hex::encode(summary.sha256));
+            info!(
+                download_id = self.id.0,
+                path = ?self.path,
+                bytes_for_http = self.bytes_for_http.load(Ordering::Relaxed),
+                size = self.size,
+                elapsed_ms = self.started.elapsed().as_millis() as u64,
+                sha256 = ?sha256,
+                "transfer-link download completed"
+            );
+        } else {
+            if let Some(oneshot) = &self.oneshot {
+                oneshot.failed();
+            }
+            warn!(
+                download_id = self.id.0,
+                path = ?self.path,
+                bytes_for_http = self.bytes_for_http.load(Ordering::Relaxed),
+                size = self.size,
+                elapsed_ms = self.started.elapsed().as_millis() as u64,
+                error = failure.as_deref().unwrap_or("source did not complete"),
+                "transfer-link download failed"
+            );
+        }
+    }
 }
 
 impl Drop for MessageBodyState {
     fn drop(&mut self) {
-        // A streaming archive/one-shot has no advertised size.  Once its
-        // terminal Complete frame was observed, it is just as successful as a
-        // sized file that reached its byte boundary.  Treating `size=None` as
-        // incomplete here would mark a successful one-shot Failed while the
-        // HTTP response was being dropped.
-        let fully_sent = self.complete
-            || self
-                .size
-                .map(|size| self.bytes_for_http >= size)
-                .unwrap_or(false);
-        if fully_sent {
-            if !self.complete {
-                if let (Some(id), Some(completion)) = (self.id, self.completion.take()) {
-                    let path = self.path;
-                    let size = self.size;
-                    let bytes_for_http = self.bytes_for_http;
-                    let started = self.started;
-                    tokio::spawn(async move {
-                        for _ in 0..100 {
-                            if let Some(summary) = completion
-                                .lock()
-                                .expect("completion mutex poisoned")
-                                .clone()
-                            {
-                                info!(
-                                    download_id = id.0,
-                                    path = ?path,
-                                    bytes_for_http,
-                                    size,
-                                    elapsed_ms = started.elapsed().as_millis() as u64,
-                                    sha256 = %hex::encode(summary.sha256),
-                                    "transfer-link download completed"
-                                );
-                                return;
-                            }
-                            tokio::task::yield_now().await;
-                        }
-                        warn!(
-                            download_id = id.0,
-                            "transfer-link completion metadata unavailable"
-                        );
-                    });
-                }
-            }
-            // The producer has already emitted every validated data byte.  It
-            // may still be placing its terminal Complete message in the small
-            // queue; let that task finish instead of aborting it at the HTTP
-            // content-length boundary.
-            self.task.take();
-        } else {
+        if !self.complete {
             self.cancellation.cancel();
-            if let Some(oneshot) = &self.oneshot {
+            if let Some(outcome) = &self.outcome {
+                outcome.source_failed("HTTP body dropped before source completion");
+            } else if let Some(oneshot) = &self.oneshot {
                 oneshot.failed();
             }
-            if let Some(task) = self.task.take() {
-                task.abort();
+            if let Some(owner) = self.owner.as_ref() {
+                owner.cancel();
             }
         }
         self.permit.take();
+        if let Some(active_downloads) = self.active_downloads.take() {
+            active_downloads.fetch_sub(1, Ordering::Relaxed);
+        }
         if !self.complete {
             if let Some(id) = self.id {
                 debug!(
@@ -625,88 +868,114 @@ impl Drop for MessageBodyState {
     }
 }
 
+enum BodyEvent {
+    Message(Option<SourceMessage>),
+    Tick,
+}
+
+fn log_progress(state: &MessageBodyState) {
+    let Some(id) = state.id else {
+        return;
+    };
+    let elapsed = state.started.elapsed().as_secs_f64().max(0.001);
+    let active_downloads = state
+        .active_downloads
+        .as_ref()
+        .map(|active| active.load(Ordering::Relaxed));
+    info!(
+        download_id = id.0,
+        path = ?state.path,
+        bytes_for_http = state.bytes_for_http,
+        size = state.size,
+        active_downloads,
+        elapsed_ms = state.started.elapsed().as_millis() as u64,
+        rate_mib_s = state.bytes_for_http as f64 / elapsed / (1024.0 * 1024.0),
+        "transfer-link download progress"
+    );
+}
+
 fn message_body(state: MessageBodyState) -> TransferBody {
     let stream = stream::unfold(state, |mut state| async move {
         if state.complete {
             return None;
         }
-        let message = state.receiver.recv().await;
-        let item = match message {
-            Some(SourceMessage::Data(bytes)) => {
-                state.bytes_for_http = state.bytes_for_http.saturating_add(bytes.len() as u64);
-                if state.last_report.elapsed() >= state.stats_interval {
+        let event = if state.id.is_some() {
+            let delay = state.next_report.saturating_duration_since(Instant::now());
+            tokio::select! {
+                message = state.receiver.recv() => BodyEvent::Message(message),
+                _ = tokio::time::sleep(delay) => BodyEvent::Tick,
+            }
+        } else {
+            BodyEvent::Message(state.receiver.recv().await)
+        };
+        let item = match event {
+            BodyEvent::Tick => {
+                log_progress(&state);
+                state.next_report = Instant::now() + state.stats_interval;
+                Ok(Frame::data(Bytes::new()))
+            }
+            BodyEvent::Message(message) => match message {
+                Some(SourceMessage::Data(bytes)) => {
+                    state.bytes_for_http = state.bytes_for_http.saturating_add(bytes.len() as u64);
+                    if let Some(outcome) = &state.outcome {
+                        outcome.add_bytes(bytes.len() as u64);
+                    }
+                    Ok(Frame::data(bytes))
+                }
+                Some(SourceMessage::Complete(summary)) => {
+                    state.complete = true;
+                    if let Some(outcome) = &state.outcome {
+                        outcome.source_complete(summary);
+                    } else if let Some(oneshot) = &state.oneshot {
+                        // This branch is retained for the small public helper
+                        // used by callers that do not install a connection owner.
+                        oneshot.consumed();
+                    }
+                    Ok(Frame::data(Bytes::new()))
+                }
+                Some(SourceMessage::Failed(failure)) => {
+                    state.complete = true;
+                    if let Some(outcome) = &state.outcome {
+                        outcome.source_failed(failure.error.clone());
+                    } else if let Some(oneshot) = &state.oneshot {
+                        oneshot.failed();
+                    }
                     if let Some(id) = state.id {
-                        let elapsed = state.started.elapsed().as_secs_f64().max(0.001);
-                        info!(
+                        warn!(
                             download_id = id.0,
                             path = ?state.path,
                             bytes_for_http = state.bytes_for_http,
                             size = state.size,
                             elapsed_ms = state.started.elapsed().as_millis() as u64,
-                            rate_mib_s = state.bytes_for_http as f64 / elapsed / (1024.0 * 1024.0),
-                            "transfer-link download progress"
+                            error = %failure.error,
+                            "transfer-link download failed"
                         );
                     }
-                    state.last_report = Instant::now();
+                    Err(io::Error::other(failure.error))
                 }
-                Ok(Frame::data(bytes))
-            }
-            Some(SourceMessage::Complete(summary)) => {
-                state.complete = true;
-                if let Some(oneshot) = &state.oneshot {
-                    oneshot.consumed();
+                None => {
+                    state.complete = true;
+                    if let Some(outcome) = &state.outcome {
+                        outcome.source_failed("source ended without completion");
+                    } else if let Some(oneshot) = &state.oneshot {
+                        oneshot.failed();
+                    }
+                    if let Some(id) = state.id {
+                        warn!(
+                            download_id = id.0,
+                            path = ?state.path,
+                            bytes_for_http = state.bytes_for_http,
+                            size = state.size,
+                            elapsed_ms = state.started.elapsed().as_millis() as u64,
+                            "transfer-link download failed without source completion"
+                        );
+                    }
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "source ended without completion",
+                    ))
                 }
-                if let Some(id) = state.id {
-                    info!(
-                        download_id = id.0,
-                        path = ?state.path,
-                        bytes_for_http = state.bytes_for_http,
-                        size = state.size,
-                        elapsed_ms = state.started.elapsed().as_millis() as u64,
-                        sha256 = %hex::encode(summary.sha256),
-                        "transfer-link download completed"
-                    );
-                }
-                Ok(Frame::data(Bytes::new()))
-            }
-            Some(SourceMessage::Failed(failure)) => {
-                state.complete = true;
-                if let Some(oneshot) = &state.oneshot {
-                    oneshot.failed();
-                }
-                if let Some(id) = state.id {
-                    warn!(
-                        download_id = id.0,
-                        path = ?state.path,
-                        bytes_for_http = state.bytes_for_http,
-                        size = state.size,
-                        elapsed_ms = state.started.elapsed().as_millis() as u64,
-                        error = %failure.error,
-                        "transfer-link download failed"
-                    );
-                }
-                Err(io::Error::other(failure.error))
-            }
-            None => {
-                state.complete = true;
-                if let Some(oneshot) = &state.oneshot {
-                    oneshot.failed();
-                }
-                if let Some(id) = state.id {
-                    warn!(
-                        download_id = id.0,
-                        path = ?state.path,
-                        bytes_for_http = state.bytes_for_http,
-                        size = state.size,
-                        elapsed_ms = state.started.elapsed().as_millis() as u64,
-                        "transfer-link download failed without source completion"
-                    );
-                }
-                Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "source ended without completion",
-                ))
-            }
+            },
         };
         Some((item, state))
     });
@@ -718,6 +987,52 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
 
+    fn completion() -> SourceCompletion {
+        SourceCompletion {
+            bytes_read: 3,
+            sha256: [7; 32],
+        }
+    }
+
+    fn one_shot_outcome() -> (Arc<DownloadOutcome>, Arc<OneShotState>) {
+        let oneshot = Arc::new(OneShotState::new());
+        oneshot.claim().unwrap();
+        let outcome = Arc::new(DownloadOutcome::new(
+            DownloadId(1),
+            Some(3),
+            None,
+            Some(Arc::clone(&oneshot)),
+        ));
+        (outcome, oneshot)
+    }
+
+    #[test]
+    fn source_completion_is_only_a_candidate_until_connection_success() {
+        let (outcome, oneshot) = one_shot_outcome();
+        outcome.source_complete(completion());
+        assert_eq!(oneshot.status(), OneShotStatus::Streaming);
+        outcome.connection_succeeded();
+        assert_eq!(oneshot.status(), OneShotStatus::Consumed);
+    }
+
+    #[test]
+    fn transport_failure_wins_over_source_success() {
+        let (outcome, oneshot) = one_shot_outcome();
+        outcome.source_complete(completion());
+        outcome.connection_failed("peer reset");
+        assert_eq!(oneshot.status(), OneShotStatus::Failed);
+    }
+
+    #[test]
+    fn body_disconnect_wins_when_source_was_ready_to_complete() {
+        let (outcome, oneshot) = one_shot_outcome();
+        outcome.source_complete(completion());
+        // Hyper reports the client disconnect on the connection future even
+        // when the body had already observed the producer's final frame.
+        outcome.connection_failed("peer reset");
+        assert_eq!(oneshot.status(), OneShotStatus::Failed);
+    }
+
     #[tokio::test]
     async fn download_permit_released_on_body_drop() {
         let semaphore = Arc::new(Semaphore::new(1));
@@ -725,23 +1040,58 @@ mod tests {
         let (_sender, receiver) = mpsc::channel(1);
         let body = message_body(MessageBodyState {
             receiver,
-            task: None,
+            owner: None,
             cancellation: CancellationToken::new(),
             permit: Some(permit),
             complete: false,
             id: None,
             size: None,
             started: Instant::now(),
-            last_report: Instant::now(),
+            next_report: Instant::now() + Duration::from_secs(1),
             bytes_for_http: 0,
             stats_interval: Duration::from_secs(1),
             path: None,
-            completion: None,
             oneshot: None,
+            outcome: None,
+            active_downloads: None,
         });
         assert_eq!(semaphore.available_permits(), 0);
         drop(body);
         assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn progress_timer_emits_without_source_data() {
+        let (_sender, receiver) = mpsc::channel(1);
+        let active_downloads = Arc::new(AtomicUsize::new(1));
+        let mut body = message_body(MessageBodyState {
+            receiver,
+            owner: None,
+            cancellation: CancellationToken::new(),
+            permit: None,
+            complete: false,
+            id: Some(DownloadId(1)),
+            size: Some(10),
+            started: Instant::now(),
+            next_report: Instant::now() + Duration::from_millis(10),
+            bytes_for_http: 0,
+            stats_interval: Duration::from_millis(10),
+            path: None,
+            oneshot: None,
+            outcome: None,
+            active_downloads: Some(Arc::clone(&active_downloads)),
+        });
+        let frame = tokio::time::timeout(Duration::from_millis(250), body.frame())
+            .await
+            .expect("progress timer did not wake the body")
+            .expect("body ended before progress tick")
+            .expect("progress frame failed");
+        assert_eq!(
+            frame.into_data().expect("progress was not a data frame"),
+            Bytes::new()
+        );
+        drop(body);
+        assert_eq!(active_downloads.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

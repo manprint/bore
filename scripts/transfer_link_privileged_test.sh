@@ -284,9 +284,22 @@ PY
 fi
 
 if [[ "$mode" == all || "$mode" == cancel ]]; then
+    producer_pid_file="$tmp/producer.pids"
+    producer_script="$tmp/cancel-producer.sh"
+    cat >"$producer_script" <<'EOF'
+#!/bin/sh
+set -eu
+pidfile=$1
+printf '%s\n' "$$" >"$pidfile"
+(trap '' TERM; while :; do sleep 1; done) &
+printf '%s\n' "$!" >>"$pidfile"
+trap 'exit 0' TERM
+while :; do sleep 1; done
+EOF
+    chmod 0755 "$producer_script"
     "$bin" transfer link --filename cancelled.tar --max-downloads 1 \
         --to "https://localhost:$control_port" --ca-cert "$tmp/ca.pem" \
-        --exec -- sh -c 'trap "" TERM; sleep 30 & wait' \
+        --exec -- "$producer_script" "$producer_pid_file" \
         >"$tmp/cancel-url.txt" 2>"$tmp/cancel.log" &
     cancel_pid=$!
     wait_url "$tmp/cancel-url.txt" "$tmp/cancel.log" "$cancel_pid"
@@ -304,30 +317,41 @@ PY
         -o "$tmp/cancelled.tar" &
     curl_pid=$!
     set -e
-    child_pid=''
+    producer_pid=''
+    grandchild_pid=''
     deadline=$((SECONDS + 10))
     while (( SECONDS < deadline )); do
-        child_pid=$(pgrep -P "$cancel_pid" | head -n 1 || true)
-        [[ -n "$child_pid" ]] && break
+        if [[ -s "$producer_pid_file" ]]; then
+            producer_pid=$(sed -n '1p' "$producer_pid_file")
+            grandchild_pid=$(sed -n '2p' "$producer_pid_file")
+            [[ -n "$producer_pid" && -n "$grandchild_pid" ]] && break
+        fi
         sleep 0.05
     done
-    [[ -n "$child_pid" ]] || {
-        printf 'exec cancellation test did not observe a child\n' >&2
+    [[ -n "$producer_pid" && -n "$grandchild_pid" ]] || {
+        cat "$tmp/cancel.log" >&2 || true
+        printf 'exec cancellation test did not observe producer process group\n' >&2
         exit 1
     }
-    kill -TERM "$cancel_pid"
-    wait "$cancel_pid" 2>/dev/null || true
-    cancel_pid=''
+    kill -TERM "$curl_pid"
     wait "$curl_pid" 2>/dev/null || true
     curl_pid=''
     deadline=$((SECONDS + 7))
-    while kill -0 "$child_pid" 2>/dev/null && (( SECONDS < deadline )); do
+    while kill -0 -- "-$producer_pid" 2>/dev/null && (( SECONDS < deadline )); do
         sleep 0.05
     done
-    if kill -0 "$child_pid" 2>/dev/null; then
-        printf 'exec cancellation left child pid %s alive\n' "$child_pid" >&2
+    if kill -0 -- "-$producer_pid" 2>/dev/null; then
+        printf 'exec cancellation left process group %s alive\n' "$producer_pid" >&2
         exit 1
     fi
+    if kill -0 "$producer_pid" 2>/dev/null || kill -0 "$grandchild_pid" 2>/dev/null; then
+        printf 'exec cancellation left a producer process alive (%s, %s)\n' \
+            "$producer_pid" "$grandchild_pid" >&2
+        exit 1
+    fi
+    kill -INT "$cancel_pid"
+    wait "$cancel_pid" 2>/dev/null || true
+    cancel_pid=''
     printf 'transfer-link privileged exec cancellation: PASS\n'
 fi
 

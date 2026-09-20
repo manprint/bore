@@ -2260,7 +2260,8 @@ Notes:
 
 `bore transfer link` publishes a file, a directory, or a mixed selection through the
 existing HTTPS vhost. The command prints one URL on stdout and remains in the foreground
-until you interrupt it. The URL has a random 16-character label, for example
+until you interrupt it. The URL has the stable `transfer-` prefix followed by a random
+16-character lowercase alphanumeric id, for example
 `https://transfer-k3m8q1z7p4n6c2xd.bore.example.com/archive.tar`, and anyone who has that
 URL can download it with an ordinary browser, `curl` or `wget`. A single regular file is
 served byte-for-byte. Multiple paths or any directory are streamed as a ZIP archive named
@@ -2314,9 +2315,9 @@ The flags for this command are:
 | `PATH...` | required unless `--stdin`/`--exec` | One path is byte-for-byte when it is a regular file; any directory or multiple paths produce a ZIP. |
 | `--to ADDR` | `https://brp.0912345.xyz` / `BORE_SERVER` | HTTPS control endpoint used to register the vhost. |
 | `--secret SECRET` | empty / `BORE_SECRET` | Optional server authentication secret. |
-| `--ca-cert PATH` | system roots / `BORE_CA_CERT` | Add PEM CA certificates while keeping hostname verification enabled. |
+| `--ca-cert PATH` | bundled WebPKI roots / `BORE_CA_CERT` | Add PEM CA certificates while keeping hostname verification enabled. |
 | `--relay-only` | off | Use the encrypted TCP relay and do not request QUIC. |
-| `--carriers N` | `1` / `BORE_CARRIERS` | Number of independent backend carriers, from 1 through 32. |
+| `--carriers N` | `1` / `BORE_CARRIERS` | `0` selects adaptive carrier sizing; `1` through `32` fixes the number of independent backend carriers. |
 | `--filename NAME` | source basename, or `download.zip` for an archive | Name used in the download URL and `Content-Disposition`; required for `--stdin` and `--exec`. |
 | `--stdin` | off | Read one producer stream from bore's standard input. It is one-shot and has no replay buffer. |
 | `--exec -- COMMAND ARG...` | off | Start one literal Unix argv vector on the first GET; no shell is inserted. The child stdout is the download and exit status must be zero. |
@@ -2337,10 +2338,11 @@ wget --ca-certificate=/etc/bore/private-ca.pem -O archive-copy.tar \
 GET requests may be repeated and run concurrently until the publishing process receives
 `Ctrl+C` (or `SIGTERM`). `HEAD` returns metadata without consuming the source. A `Range`
 request is deliberately served as a complete `200` response; use `curl -o` or `wget -O`
-for a complete copy. The sender logs each request's observed backend path (`direct-udp` or
-`relay` when known), bytes, elapsed time, rate, SHA-256 and outcome on stderr. A completed
-sender-side write only means that bore sent all bytes to the HTTP peer; it cannot certify
-that the recipient flushed them to stable storage. If a QUIC path is lost after a download
+for a complete copy. While each download is active, the sender emits timer-based progress
+records with the request id, active download count, path, bytes, elapsed time and rate. The
+completion record includes SHA-256 and means source validation finished and the HTTP
+connection completed successfully; it cannot certify that the recipient flushed bytes to
+stable storage. If a QUIC path is lost after a download
 has started, that HTTP request fails; retry the same URL, or start the session with
 `--relay-only` on networks where QUIC is unreliable.
 
@@ -2357,7 +2359,7 @@ sudo tar -cpf - myfolder | bore transfer link --stdin --filename backup.tar \
 `--stdin` accepts exactly one consuming GET. `HEAD` does not consume it; a simultaneous
 second GET receives `409`, and after completion or interruption later requests receive
 `410`. The stream is not spooled, so bytes already read cannot be replayed: after a failed
-download, rerun the producer and bore command. An EOF from an external pipe only means
+download, bore exits nonzero and you must rerun both the producer and bore command. An EOF from an external pipe only means
 that the stream ended; bore cannot know whether that producer exited successfully.
 
 For a backup whose producer exit status must be checked, let bore supervise it:

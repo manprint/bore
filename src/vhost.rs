@@ -878,7 +878,7 @@ async fn send_vhost_udp_offer(
             tuning,
         })
         .await?;
-    info!(subdomain, port, "offered vhost direct udp path");
+    info!(port, "offered vhost direct udp path");
     Ok(())
 }
 
@@ -923,7 +923,7 @@ pub async fn serve_vhost_provider(
             response_headers,
         } => (request_headers, response_headers),
         RouteDecision::Reject { reason } => {
-            warn!(%subdomain, %reason, "vhost registration rejected");
+            warn!(%reason, "vhost registration rejected");
             control.send(ServerMessage::Error(reason)).await?;
             return Ok(());
         }
@@ -950,7 +950,7 @@ pub async fn serve_vhost_provider(
     // Atomic insert: reject if subdomain already live.
     let pool = match registry.entry(subdomain.clone()) {
         Entry::Occupied(_) => {
-            warn!(%subdomain, "vhost subdomain already in use");
+            warn!("vhost subdomain already in use");
             control
                 .send(ServerMessage::Error(format!(
                     "subdomain '{subdomain}' in use"
@@ -1057,7 +1057,7 @@ pub async fn serve_vhost_provider(
             https_url,
         })
         .await?;
-    info!(%subdomain, "vhost provider registered");
+    info!("vhost provider registered");
 
     // Carrier pool setup (same pattern as secret provider).
     let effective = carriers.clamp(1, max_carriers.max(1));
@@ -1092,8 +1092,12 @@ pub async fn serve_vhost_provider(
                 extra,
             })
             .await?;
-        info!(%subdomain, extra, auto = auto_carriers, ceiling = auto_ceiling,
-            "vhost carrier pool offered");
+        info!(
+            extra,
+            auto = auto_carriers,
+            ceiling = auto_ceiling,
+            "vhost carrier pool offered"
+        );
         Some((rx, TokenGuard::new(pending_carriers.clone(), token)))
     } else {
         None
@@ -1112,11 +1116,11 @@ pub async fn serve_vhost_provider(
     }
     #[cfg(feature = "udp")]
     if udp && !server_udp_enabled {
-        debug!(%subdomain, "vhost udp requested but server udp is disabled; using TCP relay");
+        debug!("vhost udp requested but server udp is disabled; using TCP relay");
     }
     #[cfg(not(feature = "udp"))]
     if udp {
-        debug!(%subdomain, "vhost udp requested but binary was built without udp support; using TCP relay");
+        debug!("vhost udp requested but binary was built without udp support; using TCP relay");
     }
 
     // 2.3: Send the HTTPS downgrade warning LAST, after every one-shot handshake
@@ -1134,7 +1138,7 @@ pub async fn serve_vhost_provider(
                 "vhost server not configured for HTTPS (mode={mode:?}, cert={}); serving this subdomain over HTTP",
                 if cert_present(&cfg) { "present" } else { "missing" }
             );
-            warn!(%subdomain, "{msg}");
+            warn!("{msg}");
             let _ = control.send(ServerMessage::Warning(msg)).await;
         }
     }
@@ -1167,7 +1171,7 @@ pub async fn serve_vhost_provider(
                 }
                 if let Some(deadline) = ctrl_timeout {
                     if last_recv.elapsed() >= deadline {
-                        warn!(%subdomain, timeout = ?deadline,
+                        warn!(timeout = ?deadline,
                             "vhost provider control idle; reaping (peer wedged/abandoned)");
                         return Ok(());
                     }
@@ -1186,7 +1190,7 @@ pub async fn serve_vhost_provider(
                     last_target_change = Some(TokioInstant::now());
                     carrier_target_pub
                         .store(carrier_target as usize, std::sync::atomic::Ordering::Relaxed);
-                    info!(%subdomain, target = carrier_target,
+                    info!(target = carrier_target,
                         "vhost carrier pool quiet; lowering target (live carriers are kept)");
                     if control
                         .send(ServerMessage::SetCarrierTarget { target: carrier_target })
@@ -1206,11 +1210,11 @@ pub async fn serve_vhost_provider(
                     | Some(ClientMessage::HelloSecret { .. })
                     | Some(ClientMessage::ConnectSecret { .. })
                     | Some(ClientMessage::Authenticate(_)) => {
-                        warn!(%subdomain, "unexpected message from vhost provider");
+                        warn!("unexpected message from vhost provider");
                     }
                     Some(ClientMessage::VhostUdpRenew { subdomain: renew_subdomain }) => {
                         if renew_subdomain != subdomain {
-                            warn!(%subdomain, requested = %renew_subdomain, "unexpected vhost udp renew request");
+                            warn!(requested = "<redacted>", "unexpected vhost udp renew request");
                         }
                         #[cfg(feature = "udp")]
                         if renew_subdomain == subdomain && udp && server_udp_enabled {
@@ -1225,10 +1229,10 @@ pub async fn serve_vhost_provider(
                         }
                         #[cfg(any(not(feature = "udp"), feature = "udp"))]
                         if renew_subdomain == subdomain && (!udp || !server_udp_enabled) {
-                            debug!(%subdomain, "ignoring vhost udp renew request while udp is disabled");
+                            debug!("ignoring vhost udp renew request while udp is disabled");
                         }
                     }
-                    Some(_) => warn!(%subdomain, "unexpected message from vhost provider"),
+                    Some(_) => warn!("unexpected message from vhost provider"),
                     None => return Ok(()),
                 }
             }
@@ -1238,7 +1242,7 @@ pub async fn serve_vhost_provider(
                     // that already paid for its dial is never thrown away
                     // because the target moved down under it mid-flight.
                     if pool.push(carrier, auto_ceiling as usize) {
-                        info!(%subdomain, size = pool.len(), "vhost carrier joined pool");
+                        info!(size = pool.len(), "vhost carrier joined pool");
                     }
                 }
             }
@@ -1256,7 +1260,7 @@ pub async fn serve_vhost_provider(
                     last_target_change = Some(TokioInstant::now());
                     carrier_target_pub
                         .store(carrier_target as usize, std::sync::atomic::Ordering::Relaxed);
-                    info!(%subdomain, target = carrier_target, ceiling = auto_ceiling,
+                    info!(target = carrier_target, ceiling = auto_ceiling,
                         "vhost bulk contention on every carrier; raising carrier target");
                     if control
                         .send(ServerMessage::SetCarrierTarget { target: carrier_target })

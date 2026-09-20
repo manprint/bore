@@ -420,6 +420,7 @@ async fn build_manifest(
         seen_names: HashSet::new(),
         seen_folded: HashMap::new(),
         path_bytes: 0,
+        reserved_entries: 0,
     };
     for root in &roots {
         let metadata = fs::symlink_metadata(root)
@@ -459,6 +460,10 @@ struct ManifestBuilder {
     seen_names: HashSet<String>,
     seen_folded: HashMap<String, String>,
     path_bytes: usize,
+    /// Entries reserved while enumerating directories, including pending
+    /// nodes that have not yet been walked.  This keeps the memory bound
+    /// global rather than applying it independently to each directory.
+    reserved_entries: usize,
 }
 
 struct PendingNode {
@@ -466,6 +471,8 @@ struct PendingNode {
     zip_name: String,
     kind: ManifestEntryKind,
     depth: usize,
+    /// Directory enumeration already reserved this node's manifest budget.
+    reserved: bool,
 }
 
 impl ManifestBuilder {
@@ -481,6 +488,7 @@ impl ManifestBuilder {
             zip_name: root_zip_name,
             kind: root_kind,
             depth: root_depth,
+            reserved: false,
         }];
         while let Some(node) = stack.pop() {
             if node.depth > MAX_MANIFEST_DEPTH {
@@ -489,7 +497,9 @@ impl ManifestBuilder {
                     limit: MAX_MANIFEST_DEPTH,
                 });
             }
-            self.reserve_entry(&node.path, &node.zip_name)?;
+            if !node.reserved {
+                self.reserve_entry(&node.path, &node.zip_name)?;
+            }
             let metadata = fs::symlink_metadata(&node.path)
                 .await
                 .map_err(|error| ManifestError::io("stat manifest entry", error))?;
@@ -499,7 +509,7 @@ impl ManifestBuilder {
             }
             let node_fingerprint = fingerprint(&metadata, node.kind);
             if node.kind == ManifestEntryKind::Directory {
-                let (children, pending) = read_directory(&node.path, &node.zip_name).await?;
+                let (children, pending) = self.read_directory(&node.path, &node.zip_name).await?;
                 let after = fs::symlink_metadata(&node.path)
                     .await
                     .map_err(|error| ManifestError::io("restat manifest directory", error))?;
@@ -535,7 +545,7 @@ impl ManifestBuilder {
     }
 
     fn reserve_entry(&mut self, source_path: &Path, zip_name: &str) -> Result<(), ManifestError> {
-        if self.entries.len() >= MAX_MANIFEST_ENTRIES {
+        if self.reserved_entries >= MAX_MANIFEST_ENTRIES {
             return Err(ManifestError::TooManyEntries {
                 limit: MAX_MANIFEST_ENTRIES,
             });
@@ -570,18 +580,60 @@ impl ManifestBuilder {
             });
         }
         self.path_bytes = next;
+        self.reserved_entries += 1;
         Ok(())
+    }
+
+    async fn read_directory(
+        &mut self,
+        path: &Path,
+        parent_zip_name: &str,
+    ) -> Result<(Vec<ManifestChild>, Vec<PendingNode>), ManifestError> {
+        let remaining_entries = MAX_MANIFEST_ENTRIES.saturating_sub(self.reserved_entries);
+        let remaining_path_bytes = MAX_MANIFEST_PATH_BYTES.saturating_sub(self.path_bytes);
+        let children = enumerate_directory(
+            path,
+            parent_zip_name,
+            remaining_entries,
+            remaining_path_bytes,
+        )
+        .await?;
+        let mut snapshots = Vec::with_capacity(children.len());
+        let mut pending = Vec::with_capacity(children.len());
+        for (name, child_path, kind, child_fingerprint) in children {
+            let zip_name = zip_name_for_child(parent_zip_name, &name, kind);
+            let depth = zip_name.trim_end_matches('/').split('/').count();
+            self.reserve_entry(&child_path, &zip_name)?;
+            snapshots.push(ManifestChild {
+                name,
+                kind,
+                fingerprint: child_fingerprint,
+            });
+            pending.push(PendingNode {
+                path: child_path,
+                zip_name,
+                kind,
+                depth,
+                reserved: true,
+            });
+        }
+        Ok((snapshots, pending))
     }
 }
 
-async fn read_directory(
+type RawDirectoryChild = (String, PathBuf, ManifestEntryKind, NodeFingerprint);
+
+async fn enumerate_directory(
     path: &Path,
     parent_zip_name: &str,
-) -> Result<(Vec<ManifestChild>, Vec<PendingNode>), ManifestError> {
+    max_entries: usize,
+    max_path_bytes: usize,
+) -> Result<Vec<RawDirectoryChild>, ManifestError> {
     let mut directory = fs::read_dir(path)
         .await
         .map_err(|error| ManifestError::io("read manifest directory", error))?;
     let mut children = Vec::new();
+    let mut path_bytes = 0usize;
     while let Some(entry) = directory
         .next_entry()
         .await
@@ -601,6 +653,29 @@ async fn read_directory(
             .await
             .map_err(|error| ManifestError::io("stat manifest child", error))?;
         let kind = node_kind(&metadata, &child_path)?;
+        if children.len() >= max_entries {
+            return Err(ManifestError::TooManyEntries {
+                limit: MAX_MANIFEST_ENTRIES,
+            });
+        }
+        let zip_name = zip_name_for_child(parent_zip_name, name, kind);
+        let bytes = source_path_bytes(&child_path)
+            .checked_add(zip_name.len())
+            .ok_or(ManifestError::TooManyPathBytes {
+                limit: MAX_MANIFEST_PATH_BYTES,
+            })?;
+        let next_path_bytes =
+            path_bytes
+                .checked_add(bytes)
+                .ok_or(ManifestError::TooManyPathBytes {
+                    limit: MAX_MANIFEST_PATH_BYTES,
+                })?;
+        if next_path_bytes > max_path_bytes {
+            return Err(ManifestError::TooManyPathBytes {
+                limit: MAX_MANIFEST_PATH_BYTES,
+            });
+        }
+        path_bytes = next_path_bytes;
         children.push((
             name.to_owned(),
             child_path,
@@ -609,28 +684,15 @@ async fn read_directory(
         ));
     }
     children.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut snapshots = Vec::with_capacity(children.len());
-    let mut pending = Vec::with_capacity(children.len());
-    for (name, child_path, kind, child_fingerprint) in children {
-        snapshots.push(ManifestChild {
-            name: name.clone(),
-            kind,
-            fingerprint: child_fingerprint,
-        });
-        let zip_name = if kind == ManifestEntryKind::Directory {
-            format!("{parent_zip_name}{name}/")
-        } else {
-            format!("{parent_zip_name}{name}")
-        };
-        let depth = zip_name.trim_end_matches('/').split('/').count();
-        pending.push(PendingNode {
-            path: child_path,
-            zip_name,
-            kind,
-            depth,
-        });
+    Ok(children)
+}
+
+fn zip_name_for_child(parent_zip_name: &str, name: &str, kind: ManifestEntryKind) -> String {
+    if kind == ManifestEntryKind::Directory {
+        format!("{parent_zip_name}{name}/")
+    } else {
+        format!("{parent_zip_name}{name}")
     }
-    Ok((snapshots, pending))
 }
 
 async fn validate_entry(entry: &ManifestEntry) -> Result<(), ManifestError> {
@@ -644,7 +706,21 @@ async fn validate_entry(entry: &ManifestEntry) -> Result<(), ManifestError> {
         });
     }
     if kind == ManifestEntryKind::Directory {
-        let (children, _) = read_directory(&entry.source_path, &entry.zip_name).await?;
+        let children = enumerate_directory(
+            &entry.source_path,
+            &entry.zip_name,
+            MAX_MANIFEST_ENTRIES,
+            MAX_MANIFEST_PATH_BYTES,
+        )
+        .await?;
+        let children = children
+            .into_iter()
+            .map(|(name, _path, kind, fingerprint)| ManifestChild {
+                name,
+                kind,
+                fingerprint,
+            })
+            .collect::<Vec<_>>();
         let expected = entry
             .directory
             .as_ref()
@@ -748,5 +824,36 @@ fn source_path_bytes(path: &Path) -> usize {
     #[cfg(not(unix))]
     {
         path.to_string_lossy().len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn directory_enumeration_rejects_entry_budget_before_collecting() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::write(directory.path().join("payload"), b"payload")
+            .await
+            .expect("create child");
+
+        let error = enumerate_directory(directory.path(), "root/", 0, MAX_MANIFEST_PATH_BYTES)
+            .await
+            .expect_err("zero entry budget must reject the child");
+        assert!(matches!(error, ManifestError::TooManyEntries { .. }));
+    }
+
+    #[tokio::test]
+    async fn directory_enumeration_rejects_path_budget_before_collecting() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::write(directory.path().join("payload"), b"payload")
+            .await
+            .expect("create child");
+
+        let error = enumerate_directory(directory.path(), "root/", 1, 0)
+            .await
+            .expect_err("zero path budget must reject the child");
+        assert!(matches!(error, ManifestError::TooManyPathBytes { .. }));
     }
 }

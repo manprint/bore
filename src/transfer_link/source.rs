@@ -2,11 +2,11 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
+use ring::digest::{Context, SHA256};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, Notify};
@@ -22,13 +22,17 @@ use std::os::unix::fs::MetadataExt;
 pub const MIME_OCTET_STREAM: &str = "application/octet-stream";
 
 /// Default payload chunk size used by the bounded file producer.
-pub const DEFAULT_CHUNK_SIZE: usize = 256 * 1024;
+///
+/// 1 MiB keeps each producer bounded while giving QUIC enough in-flight
+/// application data to avoid a tiny stream window becoming the throughput
+/// limiter on low-latency links.
+pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Default number of payload chunks retained by the producer channel.
-pub const DEFAULT_QUEUE_CAPACITY: usize = 2;
+pub const DEFAULT_QUEUE_CAPACITY: usize = 4;
 
 /// Largest queue capacity accepted by the producer options.
-pub const MAX_QUEUE_CAPACITY: usize = 2;
+pub const MAX_QUEUE_CAPACITY: usize = 4;
 
 /// Maximum encoded filename input accepted by the link API, in bytes.
 pub const MAX_FILENAME_BYTES: usize = 255;
@@ -419,10 +423,54 @@ async fn open_file_no_follow(path: &Path) -> Result<File, SourceError> {
     Ok(File::from_std(opened))
 }
 
+/// The non-abortable owner for a source producer task.
+///
+/// The HTTP body may be dropped while a producer still owns process resources.
+/// Cancellation is cooperative; the task is joined by the HTTP connection
+/// supervisor after the connection outcome is known.  Dropping this owner
+/// never calls `JoinHandle::abort`, because that would bypass process-group
+/// teardown in the `--exec` producer.
+pub(crate) struct ProducerTaskOwner {
+    task: Mutex<Option<JoinHandle<()>>>,
+    cancellation: CancellationToken,
+}
+
+impl ProducerTaskOwner {
+    fn new(task: JoinHandle<()>, cancellation: CancellationToken) -> Arc<Self> {
+        Arc::new(Self {
+            task: Mutex::new(Some(task)),
+            cancellation,
+        })
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub(crate) async fn join(&self) -> Result<(), JoinError> {
+        let task = self
+            .task
+            .lock()
+            .expect("producer task mutex poisoned")
+            .take();
+        match task {
+            Some(task) => task.await,
+            None => Ok(()),
+        }
+    }
+
+    fn into_task(self) -> JoinHandle<()> {
+        self.task
+            .into_inner()
+            .expect("producer task mutex poisoned")
+            .expect("producer task owned by handle")
+    }
+}
+
 /// A bounded handle owning one source producer task and its receiver.
 pub struct FileProducerHandle {
     receiver: mpsc::Receiver<SourceMessage>,
-    task: Option<JoinHandle<()>>,
+    owner: Option<Arc<ProducerTaskOwner>>,
     completion: Arc<std::sync::Mutex<Option<SourceCompletion>>>,
 }
 
@@ -431,10 +479,11 @@ impl FileProducerHandle {
         receiver: mpsc::Receiver<SourceMessage>,
         task: JoinHandle<()>,
         completion: Arc<std::sync::Mutex<Option<SourceCompletion>>>,
+        cancellation: CancellationToken,
     ) -> Self {
         Self {
             receiver,
-            task: Some(task),
+            owner: Some(ProducerTaskOwner::new(task, cancellation)),
             completion,
         }
     }
@@ -451,32 +500,32 @@ impl FileProducerHandle {
 
     /// Wait for the producer task after the receiver has been consumed.
     pub async fn join(mut self) -> Result<(), JoinError> {
-        self.task
+        self.owner
             .take()
             .expect("producer task owned by handle")
+            .join()
             .await
     }
 
     /// Transfer receiver and task ownership to a caller that supervises both.
     pub fn into_parts(mut self) -> (mpsc::Receiver<SourceMessage>, JoinHandle<()>) {
         let receiver = std::mem::replace(&mut self.receiver, mpsc::channel(1).1);
-        (
-            receiver,
-            self.task.take().expect("producer task owned by handle"),
-        )
+        let owner = Arc::try_unwrap(self.owner.take().expect("producer task owned by handle"))
+            .unwrap_or_else(|_| panic!("producer task has another supervisor"));
+        (receiver, owner.into_task())
     }
 
     pub(crate) fn into_parts_with_completion(
         mut self,
     ) -> (
         mpsc::Receiver<SourceMessage>,
-        JoinHandle<()>,
+        Arc<ProducerTaskOwner>,
         Arc<std::sync::Mutex<Option<SourceCompletion>>>,
     ) {
         let receiver = std::mem::replace(&mut self.receiver, mpsc::channel(1).1);
         (
             receiver,
-            self.task.take().expect("producer task owned by handle"),
+            self.owner.take().expect("producer task owned by handle"),
             Arc::clone(&self.completion),
         )
     }
@@ -484,8 +533,8 @@ impl FileProducerHandle {
 
 impl Drop for FileProducerHandle {
     fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
+        if let Some(owner) = self.owner.as_ref() {
+            owner.cancel();
         }
     }
 }
@@ -523,10 +572,11 @@ fn spawn_file_producer_inner(
     let (sender, receiver) = mpsc::channel(options.queue_capacity);
     let completion = Arc::new(std::sync::Mutex::new(None));
     let task_completion = Arc::clone(&completion);
+    let owner_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
         run_file_producer(prepared, cancellation, options, sender, task_completion).await;
     });
-    FileProducerHandle::from_parts_with_completion(receiver, task, completion)
+    FileProducerHandle::from_parts_with_completion(receiver, task, completion, owner_cancellation)
 }
 
 async fn run_file_producer(
@@ -559,7 +609,7 @@ async fn produce_file(
     let mut file = open_prepared_file(prepared)
         .await
         .map_err(|error| (0, error))?;
-    let mut hasher = Sha256::new();
+    let mut hasher = Context::new(&SHA256);
     let mut bytes_read = 0u64;
     let mut pending: Option<Bytes> = None;
     let mut buffer = vec![0u8; options.chunk_size];
@@ -582,13 +632,16 @@ async fn produce_file(
         bytes_read = bytes_read
             .checked_add(read as u64)
             .ok_or((bytes_read, SourceError::SizeOverflow))?;
-        hasher.update(&buffer[..read]);
         let current = Bytes::copy_from_slice(&buffer[..read]);
         if let Some(previous) = pending.replace(current) {
             send_message(sender, SourceMessage::Data(previous), cancellation)
                 .await
                 .map_err(|error| (bytes_read, error))?;
         }
+        // Hash after handing the previous chunk to the bounded queue.  This
+        // lets the HTTP/transport consumer make progress while the integrity
+        // work for the next chunk runs, without retaining an unbounded copy.
+        hasher.update(&buffer[..read]);
     }
 
     let mut extra = [0u8; 1];
@@ -631,7 +684,11 @@ async fn produce_file(
     }
     Ok(SourceCompletion {
         bytes_read,
-        sha256: hasher.finalize().into(),
+        sha256: hasher
+            .finish()
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 is 32 bytes"),
     })
 }
 

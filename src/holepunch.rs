@@ -3866,7 +3866,7 @@ pub async fn vhost_connect(
         }
 
         let _ = send.finish();
-        info!(server = %server_addr, subdomain, "vhost direct udp connection established");
+        info!(server = %server_addr, "vhost direct udp connection established");
         let dc = DirectConn { conn, endpoint };
         debug!(max_datagram = ?dc.max_datagram_size(), "direct conn established (vhost consumer)");
         Ok(dc)
@@ -4043,21 +4043,22 @@ pub async fn vhost_server_handshake(
 
         let mut subdomain = vec![0u8; sub_len];
         recv.read_exact(&mut subdomain).await?;
-        let subdomain = String::from_utf8(subdomain).context("vhost auth subdomain is not UTF-8")?;
+        let subdomain =
+            String::from_utf8(subdomain).context("vhost auth subdomain is not UTF-8")?;
 
         let mut received = [0u8; TOKEN_LEN];
         recv.read_exact(&mut received).await?;
 
         let expected = lookup(&subdomain).context("unknown vhost direct-path subdomain")?;
         if !tokens_match(&expected, &received) {
-            warn!(%peer, subdomain = %subdomain, "rejected vhost direct udp connection: token mismatch");
+            warn!(%peer, "rejected vhost direct udp connection: token mismatch");
             bail!("vhost direct path token mismatch");
         }
 
         send.write_all(&expected).await?;
         send.flush().await?;
         let _ = send.finish();
-        info!(%peer, subdomain = %subdomain, "accepted vhost direct udp connection");
+        info!(%peer, "accepted vhost direct udp connection");
         let dc = DirectConn { conn, endpoint };
         debug!(max_datagram = ?dc.max_datagram_size(), "direct conn established (vhost provider)");
         Ok((subdomain, dc))

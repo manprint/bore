@@ -31,6 +31,7 @@ pub(crate) fn spawn_archive_producer(
     let (sender, receiver) = mpsc::channel(2);
     let completion = std::sync::Arc::new(std::sync::Mutex::new(None));
     let task_completion = std::sync::Arc::clone(&completion);
+    let owner_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
         match produce_archive(&archive, &cancellation, &sender).await {
             Ok(completion) => {
@@ -50,7 +51,7 @@ pub(crate) fn spawn_archive_producer(
             }
         }
     });
-    FileProducerHandle::from_parts_with_completion(receiver, task, completion)
+    FileProducerHandle::from_parts_with_completion(receiver, task, completion, owner_cancellation)
 }
 
 fn invalidates_manifest(error: &SourceError) -> bool {

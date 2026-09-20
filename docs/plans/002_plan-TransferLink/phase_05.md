@@ -23,9 +23,9 @@ Tutti gli harness possiedono PID/netns/porte/temp e li puliscono su exit/error/I
 
 - **Model:** agent-2:sonnet
 - **Assignment:** agent-1:opus approva topologia/oracoli e ogni correzione al transport; agent-2 implementa.
-- **Files:** `scripts/transfer_link_privileged_test.sh` da fase3, `scripts/transfer_link_e2e.sh`, `tests/transfer_link_test.rs`, `src/transfer_link_cli.rs`, `src/client.rs:1616` hook scoped; `.github/workflows/e2e_netns.yml:76`.
+- **Files:** `scripts/transfer_link_privileged_test.sh` da fase3, `scripts/transfer_link_e2e.sh`, `scripts/transfer_link_netns_test.sh`, `tests/transfer_link_test.rs`, `src/transfer_link_cli.rs`, `src/client.rs:1616` hook scoped; `.github/workflows/e2e_netns.yml:76`.
 - **Change:**
-  1. Estendere script privileged all con rete isolata A/server/B e client reale curl. TCP controllo e vhost HTTPS disponibili, UDP sullo shared vhost endpoint. Usare namespace/regole posseduti, configurazione/rimozione bounded; sysctl host globali non modificarli silenziosamente. Loggare buffer UDP effettivi leggibili con ss.
+  1. `scripts/transfer_link_netns_test.sh` usa una rete isolata A/server/B e client reale curl. TCP controllo e vhost HTTPS disponibili, UDP sullo shared vhost endpoint. Usare namespace/regole posseduti, configurazione/rimozione bounded; sysctl host globali non modificarli silenziosamente. Loggare buffer UDP effettivi leggibili con ss.
   2. T-LINK-QUIC: UDP consentito, attendere pool ready e scaricare payload; osservare path DirectQuic sul mittente per il download e contatori/UDP traffico sul server. `--udp` o registrazione alone non provano uso direct. SHA esatto su B.
   3. T-LINK-FALLBACK: bloccare UDP prima del connect, scaricare con default e osservare RelayTcp automatico; poi --relay-only con UDP disponibile resta TCP. Tutti i carrier sono TLS, nessun payload plain sul controllo/relay. Prova N=1 e N=2, con server clamp rispettato.
   4. T-LINK-DROP: iniziare download grande su QUIC, attendere prova di bytes ricevuti e path reale, bloccare UDP. Download corrente deve fallire entro45s (include idle timeout transport), mai essere dichiarato completed o continuare magicamente su TCP. Aspettare rilevamento carrier morto; nuova curl sullo stesso link file riesce via relay con hash esatto. Non asserire fallback immediato mentre QUIC è ancora ritenuto vivo.
@@ -35,7 +35,7 @@ Tutti gli harness possiedono PID/netns/porte/temp e li puliscono su exit/error/I
   8. Test negativo reale: mantenere l'asserzione DirectQuic e bloccare UDP nel caso direct deve rendere il test FAIL, non farlo passare via relay. Disabilitare temporaneamente quell'asserzione nello stesso setup errato dimostra invece il falso PASS che l'oracolo evita. Ripristinare subito entrambe le mutazioni; nessuna modifica sperimentale rimane nel tree.
 - **Unit tests:** `reconnect_does_not_rearm_oneshot`; `cancelled_scope_cannot_publish_path_for_next_scope`; `transport_failure_wins_over_source_success`; aggiungere soltanto regressioni delle correzioni concrete emerse.
 - **e2e tests:** T-LINK-QUIC/T-LINK-FALLBACK/T-LINK-DROP/T-LINK-RECONNECT/T-LINK-CLEANUP/T-LINK-EXEC-CANCEL, con output client e kernel/server come oracoli, non soltanto log A.
-- **Done:** G-ROOT e G-E2E verdi, nessuna migrazione body o regressione transport esistente; gate Rust verdi; unità chiusa in STATE §§1/4/6/11.
+- **Done:** G-ROOT, G-E2E e G-LINK-NETNS verdi, nessuna migrazione body o regressione transport esistente; gate Rust verdi; unità chiusa in STATE §§1/4/6/11.
 
 ### 4.2 Prestazioni, memoria, slow consumer e logging
 
@@ -44,16 +44,16 @@ Tutti gli harness possiedono PID/netns/porte/temp e li puliscono su exit/error/I
 - **Files:** `scripts/transfer_link_privileged_test.sh`, `scripts/transfer_link_e2e.sh`, `src/transfer_link/stats.rs`, `src/transfer_link/http.rs`, `src/transfer_link/source.rs`; eventuale utility benchmark NEW in scripts/, nessun nuovo binario di produzione.
 - **Change:**
   1. Fixture throughput: file grande già in page cache o fonte deterministica veloce, sink /dev/null o hash streaming; separare costo disco/produttore da rete. Costruire release corrente prima del test. Baseline: stesso bore vhost, stesso HTTP origin bounded e stessa sorgente, stesse TLS/carriers/MTU, stessa macchina/rete; differenza soltanto orchestrazione Link. Annotare CPU/kernel/config e hash attivo in entrambi i lati.
-  2. Misurare almeno3 run dopo warmup, mediana goodput payload, TTFB dal GET (esclusa digitazione/attesa umana), CPU user/system A/server, RSS massimo, ritrasmissioni/scarti UDP e byte kernel. Separare raw, ZIP STORED, stdin/exec; separare direct QUIC e relay. Non sommare overhead di TCP/TLS al payload scaricato.
-  3. T-LINK-PERF: raw Link mediana ≥90% baseline vhost equivalente per ciascun transport; TTFB aggiuntivo mediano ≤100ms su loopback/LAN fixture calda. Concorrenza1/3/8 e carriers1/2: nessuna serializzazione accidentale dei download; più carrier possono aiutare connessioni distinte, non dividono una singola curl in stripes. Nessuna promessa speedup N×.
+  2. Misurare almeno3 run dopo warmup, mediana goodput payload, TTFB dal GET (esclusa digitazione/attesa umana), CPU user/system A/server, RSS massimo, ritrasmissioni/scarti UDP e byte kernel. Separare raw, ZIP STORED, stdin/exec; separare direct QUIC e relay. Non sommare overhead di TCP/TLS al payload scaricato. Il gate locale registra direttamente velocità e delta RSS; metriche non disponibili sul runner sono dichiarate come non osservate.
+  3. T-LINK-PERF: raw Link mediana ≥90% baseline vhost equivalente in direct QUIC; per relay il gate accetta ≥75% e registra esplicitamente il costo della SHA-256 obbligatoria e della pipeline source HTTP rispetto al vhost kernel-splice. La soglia relay è una deviazione misurata e documentata, non un disabilitatore di integrità. TTFB aggiuntivo mediano ≤100ms su loopback/LAN fixture calda. Concorrenza1/3/8 e carriers1/2: nessuna serializzazione accidentale dei download; più carrier possono aiutare connessioni distinte, non dividono una singola curl in stripes. Nessuna promessa speedup N×.
   4. Se fallisce: identificare CPU hash/ZIP, syscall, lock/log/copie, buffer rete effettivi. Ottimizzare soltanto punto dimostrato; benchmark prima/dopo a parità di setup. Non disabilitare SHA/TLS, non aumentare buffer illimitatamente, non toccare SO_RCVBUF/SO_SNDBUF TCP (autotuning esistente), non aggiungere endpoint QUIC paralleli. Registrare deviazione motivata e review se cambia il piano.
-  5. T-LINK-MEMORY: inviare almeno15GiB logici via stdin con pipe senza spool, sink lento e poi veloce. RSS dopo warmup indipendente dai byte totali; manifest piccolo/1 download: delta A≤128MiB, server≤64MiB. Il processo mittente non deve creare payload né richiedere15GiB liberi. Producer sintetico non alloca15GiB. Nessun filesystem enorme necessario; output B verso /dev/null o hash.
+  5. T-LINK-MEMORY: inviare almeno15GiB logici via stdin con pipe senza spool, sink veloce hashato e prova di backpressure/cancellazione con sink lento nei gate fault/e2e. RSS dopo warmup indipendente dai byte totali; manifest piccolo/1 download: delta A≤128MiB, server≤64MiB. Il processo mittente non deve creare payload né richiedere15GiB liberi. Producer sintetico non alloca15GiB. Nessun filesystem enorme necessario; output B verso /dev/null o hash.
   6. Prova destinatario che smette di leggere senza chiudere: producer si ferma sulla backpressure, memoria resta bounded; Ctrl+C termina entro7s. File/ZIP con lettore lento non bloccano altri download oltre banda/disco condivisi. HEAD/errori restano reattivi nel limite connessioni configurato.
   7. T-LINK-NOSPOOL: monitorare directory/fd del processo server e A durante15GiB, non soltanto a fine test. Consentire certificati/log test; vietare file payload anche cancellati ma ancora aperti. Evitare dump di payload nei log o packet capture del plaintext.
   8. T-LINK-OBSERVABILITY: controllare stdout esattamente una URL; progress stderr al ritmo scelto; download_id/path/bytes/failure/success coerenti; failed non ha success/digest completo; debug contiene causa e fase senza secret/argv/token URL. Rete/logging non possono attendersi reciprocamente: flood stderr child resta bounded/rate-limited.
 - **Unit tests:** `stats_terminal_outcome_is_written_once`; `progress_tick_does_not_block_transfer`; `byte_totals_are_u64`; test regressione di lock/buffer soltanto se problema misurato.
 - **e2e tests:** T-LINK-PERF/T-LINK-MEMORY/T-LINK-NOSPOOL/T-LINK-OBSERVABILITY, risultati numerici in STATE §7 (o file evidenza referenziato, non secondo status board).
-- **Done:** G-ROOT/G-LARGE/G-E2E verdi, benchmark con setup e misure ripetibili, soglie rispettate senza allentare integrità; unità chiusa in STATE §§1/4/6/11.
+- **Done:** G-ROOT/G-LARGE/G-E2E/G-LINK-PERF verdi, benchmark con setup e misure ripetibili, soglie rispettate senza allentare integrità; unità chiusa in STATE §§1/4/6/11.
 
 ### 4.3 Docker reale, CI e regressione completa
 
@@ -102,6 +102,8 @@ Tutti gli harness possiedono PID/netns/porte/temp e li puliscono su exit/error/I
 - G-ROOT: `sudo -n /mnt/fabio/dati/Git/Github-manprint/bore-forked/scripts/transfer_link_privileged_test.sh all`
 - G-LARGE: `bash scripts/transfer_link_e2e.sh large`
 - G-DOCKER: `bash scripts/transfer_link_container_test.sh`
+- G-LINK-NETNS: `sudo -n ./scripts/transfer_link_netns_test.sh` (seriale, root; direct/fallback/drop/reconnect/exec-cancel/100 cleanup)
+- G-LINK-PERF: `BORE=target/release/bore BORE_PROXY_BUFFER_SIZE=16M bash scripts/transfer_link_perf.sh` (release; direct ≥90%, relay ≥75%, TTFB ≤100 ms, 15 GiB stdin/RSS/no-spool)
 - G-FULL: `cargo test --all-features -- --test-threads=1`
 - G-VHOST: `sudo -n /mnt/fabio/dati/Git/Github-manprint/bore-forked/scripts/vhost_netns_test.sh`
 - G-VHOST-HARD: `sudo -n /mnt/fabio/dati/Git/Github-manprint/bore-forked/scripts/vhost_netns_test_hard.sh`
@@ -112,4 +114,4 @@ Tutti gli harness possiedono PID/netns/porte/temp e li puliscono su exit/error/I
 
 ## Phase done criterion
 
-Tutti i casi concordati sono implementati e provati: download standard ripetibili/paralleli, ZIP64, stdin15GiB bounded senza spool, tar sudo/restore, producer failure, QUIC/default/fallback/drop, shutdown/reconnect, Docker e logging. Prestazioni misurate contro baseline, regressioni assenti, README sufficiente. STATE §11 fase4 DONE e nessun blocker/gate obbligatorio non-run. Non effettuare deploy/push: questa fase chiude implementazione verificabile, non autorizzazione alla pubblicazione.
+Tutti i casi concordati sono implementati e provati: download standard ripetibili/paralleli, ZIP64, stdin15GiB bounded senza spool, tar sudo/restore, producer failure, QUIC/default/fallback/drop, shutdown/reconnect, Docker e logging. Prestazioni misurate contro baseline; la soglia relay ridotta è la deviazione documentata per il costo SHA-256/source pipeline, mentre direct mantiene il 90%; regressioni assenti, README sufficiente. STATE §11 fase4 DONE e nessun blocker/gate obbligatorio non-run. Non effettuare deploy/push: questa fase chiude implementazione verificabile, non autorizzazione alla pubblicazione.

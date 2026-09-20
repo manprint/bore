@@ -1868,7 +1868,7 @@ impl Server {
                                                 {
                                                     match entry.direct.install(direct.clone()) {
                                                         Some(id) => {
-                                                            info!(subdomain = %key, id, carriers = entry.direct.len(), "vhost QUIC direct carrier established");
+                                                            info!(id, carriers = entry.direct.len(), "vhost QUIC direct carrier established");
                                                             // Same defect, same fix as the public branch above:
                                                             // a provider that reconnects gets a fresh VhostEntry
                                                             // under the same label, whose DirectPool ids restart
@@ -1884,17 +1884,17 @@ impl Server {
                                                                     entry_ref.upgrade()
                                                                 {
                                                                     entry.direct.remove(id);
-                                                                    debug!(subdomain = %key, id, carriers = entry.direct.len(), "vhost QUIC direct carrier closed");
+                                                                    debug!(id, carriers = entry.direct.len(), "vhost QUIC direct carrier closed");
                                                                 }
                                                             });
                                                         }
                                                         None => {
-                                                            debug!(subdomain = %key, "vhost QUIC direct pool full; dropping extra carrier");
+                                                            debug!("vhost QUIC direct pool full; dropping extra carrier");
                                                             direct.close();
                                                         }
                                                     }
                                                 } else {
-                                                    debug!(subdomain = %key, "vhost QUIC connection arrived after provider deregistered");
+                                                    debug!("vhost QUIC connection arrived after provider deregistered");
                                                 }
                                             }
                                         }

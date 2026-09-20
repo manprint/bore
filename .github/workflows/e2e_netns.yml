@@ -86,6 +86,11 @@ jobs:
           # it in this privileged workflow gives it the same root-capability
           # and artifact provenance as the other acceptance scripts.
           - { script: transfer_link_privileged_test, secs: 900, gate: true }
+          # Transfer-link transport gate: isolated sender/server/receiver
+          # namespaces prove direct QUIC, pre-connect relay fallback, a
+          # mid-stream UDP loss without body migration, reconnect, one-shot
+          # producer cancellation and 100-cycle resource cleanup.
+          - { script: transfer_link_netns_test,       secs: 1800, gate: true }
           # regression gate for the carriers=1 vhost/local --udp connection-window
           # stall (R3: a fast request must complete <3 s while slow readers pin
           # the shared QUIC connection window). Guards commit 04aac76.
@@ -125,7 +130,7 @@ jobs:
           # them, so the install failing softly here just narrows coverage,
           # never breaks the run.
           sudo apt-get update -qq
-          sudo apt-get install -y -qq socat iperf3
+          sudo apt-get install -y -qq socat iperf3 nftables iproute2
           sudo apt-get install -y -qq wrk || true
           sudo apt-get install -y -qq autossh sshpass || true
           test -c /dev/net/tun || sudo modprobe tun

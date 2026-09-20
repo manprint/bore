@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # containing the current static binary, so the test never silently exercises an
 # older registry tag.
 
-for tool in docker openssl curl python3; do
+for tool in docker openssl curl python3 file; do
     command -v "$tool" >/dev/null || {
         printf 'missing prerequisite: %s\n' "$tool" >&2
         exit 2
@@ -19,21 +19,13 @@ docker info >/dev/null 2>&1 || {
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 static_bin="$repo/target/x86_64-unknown-linux-gnu/debug/bore"
-if [[ ! -x "$static_bin" ]] || ! file "$static_bin" 2>/dev/null | grep -q 'static'; then
-    RUSTFLAGS='-C target-feature=+crt-static' \
-        cargo build --locked --all-features \
-            --target x86_64-unknown-linux-gnu --quiet
-fi
-[[ -x "$static_bin" ]] || {
-    printf 'static binary was not built: %s\n' "$static_bin" >&2
-    exit 2
-}
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/bore-transfer-link-docker.XXXXXX")
 server_pid=''
 raw_pid=''
 stdin_pid=''
 exec_pid=''
+stale_probe=''
 base_image="bore-transfer-link-base-$$"
 client_image="bore-transfer-link-client-$$"
 cleanup() {
@@ -45,10 +37,45 @@ cleanup() {
         fi
     done
     docker image rm -f "$client_image" "$base_image" >/dev/null 2>&1 || true
+    [[ -z "$stale_probe" ]] || rm -f -- "$stale_probe"
     rm -rf -- "$tmp"
     exit "$status"
 }
 trap cleanup EXIT INT TERM
+
+build_static() {
+    # Remove the output first so Cargo must materialize the current checked-out
+    # source.  A pre-existing executable, even if it is static and runnable,
+    # can never satisfy this acceptance gate.
+    rm -f -- "$static_bin"
+    RUSTFLAGS='-C target-feature=+crt-static' \
+        cargo build --locked --all-features \
+            --target x86_64-unknown-linux-gnu --quiet
+}
+
+# Always build the current source, then red-check the stale-artifact case with
+# a valid static executable deliberately aged in the expected output path.  A
+# gate that only tests "file exists" would keep that artifact and fail below.
+build_static
+[[ -x "$static_bin" ]] || {
+    printf 'static binary was not built: %s\n' "$static_bin" >&2
+    exit 2
+}
+file "$static_bin" | grep -q 'static' || {
+    printf 'binary is not statically linked: %s\n' "$static_bin" >&2
+    exit 2
+}
+stale_probe="$tmp/stale-static-bore"
+cp -- "$static_bin" "$stale_probe"
+cp -- "$stale_probe" "$static_bin"
+touch -d '2000-01-01 00:00:00 UTC' "$static_bin"
+stale_mtime=$(stat -c '%Y' "$static_bin")
+build_static
+fresh_mtime=$(stat -c '%Y' "$static_bin")
+(( fresh_mtime > stale_mtime )) || {
+    printf 'Docker gate reused a stale static binary\n' >&2
+    exit 1
+}
 
 free_port() {
     python3 - <<'PY'

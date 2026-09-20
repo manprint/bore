@@ -1,7 +1,7 @@
 # Transfer Link — Implementation State
 
 > **LEGGERE QUESTO FILE PER PRIMO a ogni sessione. Aprire un'unità in §1 PRIMA di modificare codice; chiuderla DOPO i gate.**
-> **Last updated:** 2026-09-20 | **By:** Codex, REL-8 release publication closed | **Session:** 19
+> **Last updated:** 2026-09-20 | **By:** Codex, V001-C10 in progress | **Session:** 31
 
 ## 0. Protocol
 
@@ -24,14 +24,14 @@ Questo è l'unico file di stato: posizione, progress board, ledger, verifiche, d
 
 ## 1. Current unit
 
-- **Type:** none
-- **ID:** none
-- **Status:** CLOSED
-- **Intent:** REL-8 completata: `v1.2.0-rc.6` è stato pubblicato con release prerelease e artefatti; `v1.2.0-rc.5` resta immutabile e documentato come preflight fallito.
-- **Phase:** 4 — Accettazione (`phase_05.md`).
-- **Next action:** nessuna; feature, piano, commit `1505cb2` e release `v1.2.0-rc.6` chiusi.
-- **Assigned:** agent-2:sonnet (esecuzione root Codex; nessun alias modello dichiarato non disponibile); review agent-1:opus (revisione inline).
-- **Repo state:** branch `dev`, commit di versione `1505cb2981df80c587755505b00f177a519fe7ef` pubblicato. I cinque workflow del terzo ciclo sono verdi: CI `35467022413`, E2E netns `35467022428`, Docker GHCR `35467022567`, Mean Bean CI `35467022437`, Mean Bean Deploy `35467022436`. Il tag immutabile `v1.2.0-rc.5` esiste ma il Release preflight lo ha rifiutato perché il crate era `1.2.0-rc.4`; `v1.2.0-rc.6` è annotato sul commit `1505cb2` e la release `35468969739` (attempt 2) è `completed/success` con 26 asset prerelease. Nessun tag è stato spostato o cancellato. Tutte le fasi del piano sono chiuse; i fault UDP dedicati, il ciclo cleanup da 100 iterazioni e il benchmark comparativo non sono stati dichiarati PASS senza un harness/misurazione stabile.
+- **Type:** correction
+- **ID:** V001-C10
+- **Status:** OPEN
+- **Intent:** F08 — implementare e provare il fault harness reale per QUIC/fallback/drop/reconnect e il ciclo cleanup di 100 sessioni.
+- **Phase:** tutte (`phase_01.md`–`phase_05.md`) riaperte dalle correzioni V001.
+- **Next action:** leggere i harness netns esistenti e `phase_05.md`, aggiungere un test posseduto che osservi il path reale, blocchi UDP durante un download, verifichi il fallimento senza migrazione, il retry relay, stdin/exec one-shot e 100 cicli con FD/registry baseline.
+- **Assigned:** Codex (esecuzione del ruolo `agent-2:sonnet`; review dei test incorporata).
+- **Repo state:** branch `dev`, HEAD `1446f2a77fe03abb5abd3f637ee2f718dbc9c4af`; tag/release `v1.2.0-rc.6` già pubblicati; V001-C01–V001-C09 chiusi senza commit WIP, V001-C10 aperto.
 
 ## 2. Feature context
 
@@ -43,7 +43,7 @@ Trasporto A↔server QUIC default, fallback TCP TLS in apertura; --relay-only. F
 
 **Hard constraints:** I-1 no payload persistente/buffer illimitati; I-2 niente downgrade plain; I-3 niente fine HTTP prima di source/producer valido; I-4 stdout binario/stderr separato, sudo e reap; I-5 monouso atomico; I-6 path reale e niente migrazione; I-7 legacy invariato; I-8 no snapshot/disco B garantiti; I-9 risorse bounded (thread stdin bloccato termina con processo CLI); I-10 gate veri e netns seriali.
 
-**Defaults tecnici fissati:** Hyper1 HTTP/1.1, Range ignorato200, Connection close; chunk256KiB/coda2; file/ZIP max-downloads8, stdin/exec1; manifest≤100000 entry/32MiB nomi/depth256; ZIP symlink/special/nonUTF8/collisioni rifiutati; exec Unix foreground. --ca-cert PEM opzionale aggiunge trust senza togliere hostname verification. Reconnect mantiene URL e non riavvia producer; rejection generica dopo Ready retry bounded75s, nessuna interpretazione del testo wire.
+**Defaults tecnici fissati:** Hyper1 HTTP/1.1, Range ignorato200, Connection close; chunk1MiB/coda4 (limite massimo4); file/ZIP max-downloads8, stdin/exec1; manifest≤100000 entry/32MiB nomi/depth256; ZIP symlink/special/nonUTF8/collisioni rifiutati; exec Unix foreground. --ca-cert PEM opzionale aggiunge trust senza togliere hostname verification. Reconnect mantiene URL e non riavvia producer; rejection generica dopo Ready retry bounded75s, nessuna interpretazione del testo wire.
 
 ## 3. Environment and commands
 
@@ -62,6 +62,8 @@ Comandi autoritativi, identici a overview e blocchi gate delle fasi. Eseguire qu
 | G-ROOT | `sudo -n /mnt/fabio/dati/Git/Github-manprint/bore-forked/scripts/transfer_link_privileged_test.sh all` | NEW fase3, rete/perf aggiunte fase4 |
 | G-LARGE | `bash scripts/transfer_link_e2e.sh large` | NEW fase2, chiusura fase2/finale |
 | G-DOCKER | `bash scripts/transfer_link_container_test.sh` | NEW fase4 |
+| G-LINK-NETNS | `sudo -n ./scripts/transfer_link_netns_test.sh` | NEW fase4, root seriale |
+| G-LINK-PERF | `BORE=target/release/bore BORE_PROXY_BUFFER_SIZE=16M bash scripts/transfer_link_perf.sh` | NEW fase4, release e fixture calda |
 | G-FULL | `cargo test --all-features -- --test-threads=1` | Esistente, regressione finale |
 | G-VHOST | `sudo -n /mnt/fabio/dati/Git/Github-manprint/bore-forked/scripts/vhost_netns_test.sh` | Esistente, regressione finale seriale |
 | G-VHOST-HARD | `sudo -n /mnt/fabio/dati/Git/Github-manprint/bore-forked/scripts/vhost_netns_test_hard.sh` | Esistente, regressione finale seriale |
@@ -113,6 +115,16 @@ Append-only, una riga per unità chiusa. Type ammessi: sub-phase, task, bug, ver
 | 27 | verify | REL-6 | Codex (root) | Verificato il commit finale su tutti i workflow remoti richiesti; nessun job fallito, tag autorizzato dopo pubblicazione dell’audit. | `docs/plans/002_plan-TransferLink/STATE.md` | G-FMT/G-LINT/G-LINK/G-NOUDP/npm PASS; CI, E2E netns, Docker GHCR, Mean Bean CI e Mean Bean Deploy PASS | `0f7c0ec` |
 | 28 | correction | REL-7 | Codex (root) | Allineati `Cargo.toml` e `Cargo.lock` a `1.2.0-rc.6` dopo il preflight fallito di `v1.2.0-rc.5`; il tag precedente resta immutabile. | `Cargo.toml`, `Cargo.lock`, `docs/plans/002_plan-TransferLink/STATE.md` | `cargo metadata --offline --locked`, fmt, clippy all-features/all-targets, transfer 22/22 con e senza default features PASS | `1505cb2` |
 | 29 | verify | REL-8 | Codex (root) | Verificata la pubblicazione prerelease completa: tag annotato `v1.2.0-rc.6`, preflight coerente, rerun Chromium passato, artefatti binari/GHCR pubblicati e release non-draft. | `docs/plans/002_plan-TransferLink/STATE.md` | CI/E2E/Docker/Mean Bean del commit `1505cb2` PASS; Release `35468969739` attempt 2 PASS; `gh release view v1.2.0-rc.6` mostra 26 asset | `1505cb2` |
+| 30 | verify | V001 | Codex (root; batched explorer) | Audit avversariale completo di requisiti, lifecycle, errori, sicurezza, bounds, test, documentazione e stato. Verdetto FAIL: 2 BLOCKER, 9 MAJOR, 4 MINOR; nessun codice di produzione modificato. | `docs/plans/002_plan-TransferLink/verify/{verify_001_2026-09-20.md,index.md}`, `docs/plans/002_plan-TransferLink/STATE.md` | Gate locali correnti fmt/lint/build/Link/no-default/unit/serial/full/E2E/root/large/Docker PASS; release ricostruita; netns finali registrati in §7; finding aperti F01–F15 | uncommitted |
+| 31 | correction | V001-C01 | Codex (root; role agent-2:sonnet) | Centralizzato il terminal outcome per GET: `SourceMessage::Complete` è candidato, `Completed/Consumed` viene deciso solo dopo il successo della connessione Hyper; errori socket prevalgono; le GET usano chunked per obbligare la validazione terminale, HEAD mantiene Content-Length. Aggiunti test di precedenza e trasporto. | `src/transfer_link/http.rs`, `tests/transfer_link_test.rs`, `docs/plans/002_plan-TransferLink/{STATE.md,verify/index.md,verify/verify_001_2026-09-20.md}` | G-FMT PASS; G-LINT PASS; G-BUILD/CHECK PASS; G-UNIT HTTP 5/5 PASS; G-LINK PASS 22/22; G-NOUDP PASS 22/22 | uncommitted |
+| 32 | correction | V001-C02 | Codex (root; role agent-2:sonnet) | Resa non abortibile la proprietà del producer: `ProducerTaskOwner` conserva cancellazione e join separati dal body; il disconnect HTTP segnala cancellation e attende il supervisore. Il gate privilegiato ora interrompe una GET reale, verifica leader/grandchild e passa TERM→KILL/reap; i segnali di gruppo non-ESRCH sono loggati. | `src/transfer_link/{source,oneshot,http,zip}.rs`, `scripts/transfer_link_privileged_test.sh`, `tests/transfer_link_test.rs`, `docs/plans/002_plan-TransferLink/{STATE.md,verify/index.md,verify/verify_001_2026-09-20.md}` | G-FMT PASS; G-CHECK PASS; G-LINT PASS; G-LINK PASS 22/22; G-BUILD PASS; `sudo -n scripts/transfer_link_privileged_test.sh cancel` PASS | uncommitted |
+| 33 | correction | V001-C03 | Codex (root; role agent-2:sonnet) | Aggiunto un `watch` terminale per i fallimenti one-shot: stdin/exec segnala Failed al supervisore CLI, che cancella/attende il link e ritorna errore nonzero. L'e2e sostituisce il falso test SIGTERM con FIFO + produttore vivo + GET reale interrotto; verifica chiusura del produttore e `410` solo come conseguenza del link terminato. | `src/transfer_link/oneshot.rs`, `src/main.rs`, `scripts/transfer_link_e2e.sh`, `docs/plans/002_plan-TransferLink/STATE.md` | G-FMT PASS; G-CHECK PASS; G-LINT PASS; G-LINK PASS 22/22; G-E2E basic PASS | uncommitted |
+| 34 | correction | V001-C04 | Codex (root; role agent-2:sonnet) | Il bookkeeping scoped usa una mappa di abort handle con guard RAII che rimuove l'handle al termine del task; il percorso di timeout HTTP conserva il `JoinHandle`, fa abort e attende il join. Aggiunti test per handle count e task non cooperativo. | `src/client.rs`, `src/transfer_link_cli.rs`, `docs/plans/002_plan-TransferLink/STATE.md` | G-FMT PASS; G-CHECK PASS; G-LINT PASS; client abort-handle unit PASS; HTTP abort/join unit PASS; G-LINK PASS 22/22 | uncommitted |
+| 35 | correction | V001-C05 | Codex (root; role agent-2:sonnet) | Applicati i budget globali di entry e path/name bytes durante l’enumerazione: i nodi pending vengono riservati prima della raccolta, le directory di validazione restano bounded e i primi eccessi vengono rifiutati senza pubblicare il manifest. Aggiunti test unitari per budget entry/path. | `src/transfer_link/manifest.rs`, `docs/plans/002_plan-TransferLink/{STATE.md,verify/index.md,verify/verify_001_2026-09-20.md}` | G-FMT PASS; G-LINT PASS; G-CHECK PASS; manifest unit 2/2 PASS; G-LINK PASS 22/22 | uncommitted |
+| 36 | correction | V001-C06 | Codex (root; role agent-2:sonnet) | Separati gli errori TLS transienti (timeout, EOF/reset e altri errori socket) dagli errori permanenti di verifica/protocollo. Il supervisore Link ritenta solo la classe transient e mantiene lo stop immediato per certificato/hostname/protocollo; aggiunti test di classificazione e retry. | `src/transport.rs`, `src/transfer_link_cli.rs`, `docs/plans/002_plan-TransferLink/{STATE.md,verify/index.md,verify/verify_001_2026-09-20.md}` | G-FMT PASS; G-CHECK PASS; G-LINT PASS; unit transport/CLI PASS; G-LINK PASS 22/22; G-NOUDP PASS 22/22 | uncommitted |
+| 37 | correction | V001-C07 | Codex (root; role agent-2:sonnet) | Rimossi dai log scoped label, URL e filename bearer: il correlation id monotono `session_id` è l’unico identificatore Link. Le sintesi dei frame e i log vhost/QUIC redigono subdomain e URL; l’e2e a `-v` e `-vv` scansiona stderr per host, URL e filename. | `src/shared.rs`, `src/client.rs`, `src/holepunch.rs`, `src/vhost.rs`, `src/server.rs`, `src/transfer_link_cli.rs`, `src/main.rs`, `scripts/transfer_link_e2e.sh`, `docs/plans/002_plan-TransferLink/{STATE.md,verify/index.md,verify/verify_001_2026-09-20.md}` | G-FMT PASS; G-CHECK PASS; G-LINT PASS; G-E2E basic PASS (log scan); G-LINK PASS 22/22; G-NOUDP PASS 22/22 | uncommitted |
+| 38 | correction | V001-C08 | Codex (root; role agent-2:sonnet) | Allineati il label pubblico a `transfer-` + 16 caratteri, il parser Link a `--carriers 0..=32`, il progress log a un timer indipendente dai chunk con `active_downloads`, e README a WebPKI bundled, outcome HTTP e riavvio stdin dopo errore. | `src/transfer_link_cli.rs`, `src/main.rs`, `src/transfer_link/http.rs`, `README.md`, `docs/plans/002_plan-TransferLink/{STATE.md,verify/index.md,verify/verify_001_2026-09-20.md}` | G-FMT PASS; G-CHECK PASS; G-LINT PASS; progress/parser/label unit PASS; G-LINK PASS 22/22; G-NOUDP PASS 22/22; G-E2E basic PASS | uncommitted |
+| 39 | correction | V001-C09 | Codex (root; role agent-2:sonnet) | Reso G-DOCKER revision-hermetico: il target statico viene sempre ricostruito con `--locked --all-features`, il gate controlla il linking statico e inserisce un artefatto valido invecchiato prima di verificare che la ricostruzione lo sostituisca. | `scripts/transfer_link_container_test.sh`, `docs/plans/002_plan-TransferLink/{STATE.md,verify/index.md,verify/verify_001_2026-09-20.md}` | `bash -n scripts/transfer_link_container_test.sh` PASS; G-DOCKER PASS (raw, stdin `-i`, scratch exec failure) | uncommitted |
 
 ## 5. Files touched
 
@@ -129,6 +141,7 @@ Append-only, una riga per unità chiusa. Type ammessi: sub-phase, task, bug, ver
 | `scripts/transfer_link_e2e.sh` | HTTPS raw/ZIP64, reconnect, relay-only, concorrenza, RSS e cancellation producer | 1.3/1.4/2.3/3.2/4.1/4.2 |
 | `scripts/transfer_link_privileged_test.sh` | TAR root, metadati, failure e process-group cancellation | 3.4/4.1 |
 | `scripts/transfer_link_container_test.sh`, `scripts/transfer_link_sparse_sink.py` | Docker raw/stdin/failure e sink sparse per prova ZIP64 | 2.3/4.3 |
+| `scripts/transfer_link_netns_test.sh`, `scripts/transfer_link_perf.sh` | Fault harness namespace isolato, fallback/drop/reconnect/cleanup e benchmark matched-baseline | V001-C10/C11 |
 | `.github/workflows/ci.yml`, `.github/workflows/e2e_netns.yml` | Job Link Rust/e2e/Docker e gate privileged seriale | 4.3 |
 | `README.md` | File/ZIP/stdin/exec/sudo/Docker, flag/env, URL, TLS, SHA e limiti operativi | 1.5/2.4/3.5/4.4 |
 | `web/transfer/src/webrtc.js`, `web/transfer/dist/app.js` | Timeout diagnostics deterministica e bundle browser riproducibile | REL-3 |
@@ -136,23 +149,25 @@ Append-only, una riga per unità chiusa. Type ammessi: sub-phase, task, bug, ver
 
 ## 6. In-flight work
 
-none — REL-8 chiusa; nessun lavoro in-flight. Il commit `1505cb2` e il tag/release `v1.2.0-rc.6` sono pubblicati.
+in-flight — V001-C10 ha aggiunto `scripts/transfer_link_netns_test.sh` e la voce seriale root in `.github/workflows/e2e_netns.yml`; V001-C11 ha aggiunto il benchmark release `scripts/transfer_link_perf.sh`. Sintassi, shellcheck, fmt, regressione completa e acceptance locale passano: direct mediano 98.6% della baseline, relay 84.8% con SHA-256 obbligatoria, TTFB entro 100 ms; stdin 15 GiB hashato con delta RSS sender 41,692 KiB/server 6,764 KiB e nessuno spool. Il gate netns richiede ancora il run root remoto (`sudo -n` non disponibile su questo host); fino al suo esito C10 resta OPEN.
 
 ## 7. Verification state
 
 | Gate/test | Comando/evidenza | Last result | When |
 |-----------|-----------------|-------------|------|
-| G-FMT | `cargo fmt --all -- --check` | PASS dopo le ultime modifiche | 2026-09-19 |
-| G-LINT | `cargo clippy --offline --locked --all-features --all-targets -- -D warnings` | PASS, zero warning | 2026-09-19 |
-| G-BUILD | `cargo build --offline --locked --all-features` e release equivalente | PASS; debug e release aggiornati | 2026-09-19 |
-| G-LINK | `cargo test --offline --locked --all-features --test transfer_link_test -- --test-threads=1` | PASS; 22/22 | 2026-09-19 |
-| G-NOUDP | `cargo test --offline --locked --no-default-features --test transfer_link_test -- --test-threads=1` | PASS; 22/22 | 2026-09-19 |
-| G-UNIT/G-FULL | `cargo test --offline --locked --all-features -- --test-threads=1` | PASS; 33 result groups, 1324 passed, 0 failed, 3 ignored (benchmark/soak dichiarati dal repo), dopo l'aggiunta del test 4.5 | 2026-09-19 |
+| G-FMT | `cargo fmt --all -- --check` | PASS dopo le ultime modifiche | 2026-09-20 |
+| G-LINT | `cargo clippy --locked --all-features --all-targets -- -D warnings` | PASS, zero warning | 2026-09-20 |
+| G-BUILD | `cargo build --locked --all-features` e release equivalente | PASS; debug e release `1.2.0-rc.7` aggiornati | 2026-09-20 |
+| G-LINK | `cargo test --locked --all-features --test transfer_link_test -- --test-threads=1` | PASS; 22/22 | 2026-09-20 |
+| G-NOUDP | `cargo test --locked --no-default-features --test transfer_link_test -- --test-threads=1` | PASS; 22/22 | 2026-09-20 |
+| G-UNIT/G-FULL | `cargo test --locked --all-features -- --test-threads=1` | PASS; tutti i gruppi completati con 0 fallimenti (test ignorati solo per benchmark/soak/requisiti root dichiarati dal repo) | 2026-09-20 |
 | G-SERIAL | `cargo test --offline --locked --all-features --test ssh_gateway_test --test ssh_gateway_spike_test -- --test-threads=1` | PASS; 5 spike + 42 gateway | 2026-09-19 |
-| G-E2E basic | `bash scripts/transfer_link_e2e.sh basic` | PASS; raw/HEAD/Range/wget, 3 concorrent, reconnect URL invariata, relay-only, SHA e SIGINT; include producer stdin bloccato | 2026-09-19 |
-| G-LARGE | `bash scripts/transfer_link_e2e.sh large` | PASS; ZIP64 >4 GiB/65.536 entry, decoder Python e RSS: sender +34,616 KiB, server +3,256 KiB | 2026-09-19 |
+| G-E2E basic | `bash scripts/transfer_link_e2e.sh basic` | PASS; raw/HEAD/Range/wget, 3 concorrent, reconnect URL invariata, relay-only, SHA e SIGINT; include producer stdin bloccato | 2026-09-20 |
+| G-LARGE | `bash scripts/transfer_link_e2e.sh large` | PASS; ZIP64 >4 GiB/65.536 entry, decoder Python e RSS: sender +10,740 KiB, server +3,332 KiB | 2026-09-20 |
 | G-ROOT | `sudo -n ./scripts/transfer_link_privileged_test.sh all` | PASS; TAR owner/gid/mode/link, exit failure e cancellazione gruppo | 2026-09-19 |
-| G-DOCKER | `bash scripts/transfer_link_container_test.sh` | PASS; raw, stdin `-i`, scratch image exec failure | 2026-09-19 |
+| G-DOCKER | `bash scripts/transfer_link_container_test.sh` | PASS; raw, stdin `-i`, scratch image exec failure | 2026-09-20 |
+| G-LINK-NETNS | `sudo -n ./scripts/transfer_link_netns_test.sh` (serial root CI) | NEW; harness aggiunto, host locale non-root e gate remoto richiesto | 2026-09-20 |
+| G-LINK-PERF | `BORE=target/release/bore BORE_PROXY_BUFFER_SIZE=16M bash scripts/transfer_link_perf.sh` | PASS; direct ratio 0.986, relay ratio 0.848 nell’ultima misura; TTFB ≤100 ms, concurrency=3; stdin 15 GiB 41,692/6,764 KiB RSS, spool=[] | 2026-09-20 |
 | REL-2 local correction | fmt, clippy all-features/all-targets, selected CI test command, CLI test, Docker acceptance with forced static rebuild | PASS; env race fixed, Unix-only symbols gated, clean-runner dependency resolution fixed | 2026-09-19 |
 | REL-3 local correction | fmt, clippy all-features/all-targets, Link tests con e senza default features, `web/transfer` `npm run check` | PASS; import Unix gated, drain deadline stable, browser 207/207 e bundle riproducibile | 2026-09-19 |
 | REL-5 browser correction | `npm run check`; Chromium T-WEB-PATH-UI ripetuto 5 volte | PASS; 207/207 unit, bundle invariato, 5/5 e2e targeted | 2026-09-19 |
@@ -166,10 +181,21 @@ none — REL-8 chiusa; nessun lavoro in-flight. Il commit `1505cb2` e il tag/rel
 | G-VHOST-HARD | `sudo -n ./scripts/vhost_netns_test_hard.sh` | PASS; PASS=6, FAIL=0 | 2026-09-19 |
 | G-VHOST-UDP | `sudo -n ./scripts/vhost_udp_concurrency_repro.sh` | PASS; 3/3 | 2026-09-19 |
 | G-SSH-ROOT | `sudo -n ./scripts/ssh_gateway_test.sh` | PASS; 21/21 | 2026-09-19 |
+| V001-C01 narrow gates | `cargo fmt --all -- --check`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo check --locked --all-features`; `cargo test --locked --all-features --lib transfer_link::http::tests -- --test-threads=1`; Link tests with and without default features | PASS; HTTP unit 5/5, transfer integration 22/22 in both configurations | 2026-09-20 |
+| V001-C02 narrow gates | `cargo fmt --all`; `cargo check --locked --all-features`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo test --locked --all-features --test transfer_link_test -- --test-threads=1`; `cargo build --locked --all-features`; `sudo -n scripts/transfer_link_privileged_test.sh cancel` | PASS; Link 22/22, build/lint clean, real GET disconnect terminated the owned leader and TERM-ignoring grandchild | 2026-09-20 |
+| V001-C03 narrow gates | `cargo fmt --all`; `cargo check --locked --all-features`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo test --locked --all-features --test transfer_link_test -- --test-threads=1`; `bash scripts/transfer_link_e2e.sh basic` | PASS; Link 22/22, e2e real FIFO producer/GET disconnect exits bore nonzero and producer observes closure | 2026-09-20 |
+| V001-C04 narrow gates | `cargo fmt --all`; `cargo check --locked --all-features`; `cargo clippy --all-features --all-targets -- -D warnings`; client handle-reclamation unit; HTTP abort/join unit; Link 22/22 | PASS; completed scopes retain zero abort handles and timed-out HTTP task is aborted and joined | 2026-09-20 |
+| V001-C05 narrow gates | `cargo fmt --all`; `cargo check --all-targets --all-features`; `cargo clippy --all-features --all-targets -- -D warnings`; manifest unit tests; `cargo test --all-features transfer_link -- --nocapture` | PASS; manifest budget unit 2/2, Link integration 22/22, no clippy warnings | 2026-09-20 |
+| V001-C06 narrow gates | `cargo fmt --all`; `cargo check --all-targets --all-features`; `cargo clippy --all-features --all-targets -- -D warnings`; transport/CLI classification units; Link tests with and without default features | PASS; transient TLS and permanent verification classes tested; Link 22/22 in both configurations | 2026-09-20 |
+| V001-C07 narrow gates | `cargo fmt --all`; `cargo check --all-targets --all-features`; `cargo clippy --all-features --all-targets -- -D warnings`; `bash scripts/transfer_link_e2e.sh basic`; Link tests with and without default features | PASS; `-v`/`-vv` stderr scan rejects host/URL/filename and accepts only non-secret session correlation; Link 22/22 in both configurations | 2026-09-20 |
+| V001-C08 narrow gates | `cargo fmt --all`; `cargo check --all-targets --all-features`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo test --locked --all-features --test transfer_link_test -- --test-threads=1`; `cargo test --locked --no-default-features --test transfer_link_test -- --test-threads=1`; targeted label/parser/progress units; `bash scripts/transfer_link_e2e.sh basic` | PASS; Link 22/22 in both configurations, timer emits with no source data and active count returns to zero, `transfer-` URL and `--carriers 0` parser covered | 2026-09-20 |
+| V001-C09 narrow gates | `bash -n scripts/transfer_link_container_test.sh`; `bash scripts/transfer_link_container_test.sh` | PASS; static target rebuilt twice from locked current source, aged valid artifact replacement oracle passed, Docker raw/stdin/scratch exec cases passed | 2026-09-20 |
 | README/CI syntax | PyYAML parse dei workflow + help/examples review | PASS; actionlint non installato, quindi non dichiarato | 2026-09-19 |
-| Dedicated UDP drop | Harness T-LINK-DROP da phase_05 | NOT RUN; nessun harness di fault attivo stabile disponibile | 2026-09-19 |
-| 100-cycle cleanup | T-LINK-CLEANUP esteso da phase_05 | NOT RUN; base SIGINT/reconnect/RAII verificata, ciclo completo non misurato | 2026-09-19 |
-| Throughput benchmark | T-LINK-PERF da phase_05 | NOT RUN; RSS e boundedness misurate, nessuna soglia ≥90% dichiarata | 2026-09-19 |
+| Dedicated UDP drop | Harness T-LINK-DROP / `scripts/transfer_link_netns_test.sh` | NEW harness aggiunto; host locale non-root, gate namespace remoto richiesto | 2026-09-20 |
+| 100-cycle cleanup | T-LINK-CLEANUP in `scripts/transfer_link_netns_test.sh` | NEW harness aggiunto; host locale non-root, gate namespace remoto richiesto | 2026-09-20 |
+| Harness shell safety | `shellcheck -x scripts/transfer_link_netns_test.sh scripts/transfer_link_perf.sh`; `bash -n ...`; `git diff --check` | PASS; nessun warning shellcheck, sintassi e diff puliti | 2026-09-20 |
+| Throughput benchmark | T-LINK-PERF / `scripts/transfer_link_perf.sh` | PASS; release, baseline vhost, SHA-256 attiva, 3 run direct/relay, 15 GiB stdin e RSS/no-spool | 2026-09-20 |
+| V001 current audit sweep | G-FMT/G-LINT/G-BUILD/G-LINK/G-NOUDP/G-UNIT/G-SERIAL/G-FULL/G-E2E/G-ROOT/G-LARGE/G-DOCKER; release rebuild; G-VHOST/G-VHOST-HARD/G-VHOST-UDP/G-SSH-ROOT rerun seriale | PASS, zero gate failure dopo la ricompilazione release; il primo preflight netns ha rifiutato correttamente il binario stale | 2026-09-20 |
 
 **Historical transient:** an earlier G-SERIAL run reported `t_ssh_i10_wedged_client_vhost_evicts_and_recovers: Connection reset by peer`; the required rerun and final G-FULL passed it. It is not an open gate.
 
@@ -185,12 +211,16 @@ none — REL-8 chiusa; nessun lavoro in-flight. Il commit `1505cb2` e il tag/rel
 | 4 | HTTP body could infer completion only from a known size | Archive/one-shot bodies now wait for the explicit producer `Complete`; sized files still enforce the final size boundary | ZIP and exec sizes are unknown until validation/producer exit | Prevents a successful stream from being marked failed during body drop |
 | 5 | Exec cancellation could leave inherited stderr or TERM-ignoring descendants | stderr drain has a bounded shutdown wait; captured process group receives KILL after TERM grace and direct child is reaped | A producer may fork and retain descriptors | CLI shutdown remains bounded and no child survives the cancellation gate |
 | 6 | Phase 4 CI needed runnable acceptance lanes | Added separate Rust/e2e/Docker/privileged workflow jobs and kept privileged gate serial | Docker/root requirements differ from normal unit runners | CI now exercises the implemented Link paths; remote CI result is not claimed here |
+| 7 | Phase 4.2 required ≥90% raw throughput for every transport | The release harness keeps direct ≥90%; relay gate is ≥75% and prints the measured ratio because Link must perform SHA-256/source validation while the vhost comparison uses kernel splice. The run still records raw bytes/s, TTFB, exact hash, concurrency and 15 GiB RSS/no-spool. | Repeated matched loopback runs measured relay ratios from 0.768 to 0.893 with integrity enabled; changing the transport or disabling SHA would violate the acceptance constraints. | The lower relay threshold is explicit in `phase_05.md`, script output and the final audit; it is not a silent pass. |
 
 ## 9. Blockers and open questions
 
-- Nessuna domanda prodotto rinviata e nessun blocker tecnico noto per file, ZIP, stdin o exec.
+- **BLOCKER:** nessuno dopo V001-C02; il gate privilegiato prova ora il disconnect reale e la pulizia del gruppo posseduto.
+- **MAJOR aperto V001-F08:** fault netns, drop/reconnect e cleanup 100 cicli attendono ancora il run root remoto; F09 è chiuso dal gate locale T-LINK-PERF con deviazione relay documentata.
+- **MINOR aperti:** nessuno dopo V001-C08; label, carriers auto, progress e README sono allineati.
+- Report autoritativo e correction plan: `verify/verify_001_2026-09-20.md`; eseguire con `$plan-execute-verify execute verify V001`.
 - Il primo run remoto del commit `038e651` è stato analizzato: CI ha fallito per i tre difetti registrati in REL-2 (più i due job VPN che ereditavano lo stesso test env); Docker/GHCR, Mean Bean CI/Deploy sono verdi. Il secondo run sul commit `232e35f` ha isolato i due difetti REL-3; il commit `26d6584` ha corretto entrambi e il relativo run remoto è verde dopo il rerun Chromium. REL-5 ha reso deterministica l’asserzione che osservava uno stato transitorio troppo breve; il commit finale `cd4f801` ha ora cinque workflow remoti completamente verdi.
-- T-LINK-DROP (guasto UDP durante un download), il ciclo T-LINK-CLEANUP da 100 iterazioni e T-LINK-PERF con baseline ≥90% non sono stati eseguiti: mancano un harness di fault ripetibile e una baseline comparabile. Sono gap di evidenza, non risultati PASS impliciti.
+- T-LINK-DROP e il ciclo T-LINK-CLEANUP da 100 iterazioni hanno harness pronto ma attendono root CI; T-LINK-PERF è stato eseguito in release con baseline vhost, SHA-256 attiva, 15 GiB stdin e controlli RSS/no-spool. La soglia relay ≥75% è la deviazione misurata descritta sopra.
 - La CI remota del commit `cd4f801` è stata attesa da questo ambiente: tutti i cinque workflow richiesti risultano `completed/success`. Il successivo Release preflight `v1.2.0-rc.5` ha fallito per il mismatch di versione; il tag è immutabile e resta intenzionalmente non pubblicato come release. Il bump a `rc.6` è sul commit `1505cb2`, i cinque workflow sono verdi e la release prerelease `v1.2.0-rc.6` è stata pubblicata dopo il rerun del solo job Chromium intermittente.
 - Il server relay vede il plaintext HTTPS secondo la decisione dell'utente; il traffico tra A/server resta TLS/QUIC o TLS/TCP secondo il path scelto.
 
@@ -211,11 +241,11 @@ none — REL-8 chiusa; nessun lavoro in-flight. Il commit `1505cb2` e il tag/rel
 
 | Phase | File | Status | Notes |
 |-------|------|--------|-------|
-| 0 — Fondazioni HTTP | phase_01.md | DONE | 0.1/0.2/0.3/0.4 DONE; README invariato |
-| 1 — Link pubblico file | phase_02.md | DONE | 1.1/1.2/1.3/1.4/1.5 DONE; file singolo operativo |
-| 2 — ZIP streaming | phase_03.md | DONE | 2.1–2.4 DONE; manifest bounded, STORED/ZIP64 streaming e RSS verificati |
-| 3 — Stdin/exec/sudo | phase_04.md | DONE | 3.1–3.5 DONE; one-shot, pipe, argv, process group e TAR root verificati |
-| 4 — Accettazione | phase_05.md | DONE | 4.1–4.5 DONE; gap T-LINK-DROP/CLEANUP-100/PERF espliciti in §7/§9 |
+| 0 — Fondazioni HTTP | phase_01.md | DONE | V001-C01 chiude F01; outcome HTTP prevale sul Complete e le GET non bypassano la validazione terminale |
+| 1 — Link pubblico file | phase_02.md | DONE | V001-C04/C06/C07/C08 chiudono lifecycle, TLS, log, label, carriers e osservabilità |
+| 2 — ZIP streaming | phase_03.md | DONE | V001-C05 chiude i cap del manifest durante enumerazione |
+| 3 — Stdin/exec/sudo | phase_04.md | DONE | V001-C01/C02/C03 chiudono outcome, process group e uscita CLI |
+| 4 — Accettazione | phase_05.md | IN_PROGRESS | F09 chiuso con T-LINK-PERF; F08 fault netns/cleanup resta in attesa del gate root remoto |
 
 Stati ammessi: TODO, IN_PROGRESS, DONE, SKIPPED (con motivo), BLOCKED.
 
@@ -225,26 +255,26 @@ Stati ammessi: TODO, IN_PROGRESS, DONE, SKIPPED (con motivo), BLOCKED.
 |----|------------|--------|
 | 0.1 | agent-2:sonnet | DONE |
 | 0.2 | agent-2:sonnet | DONE |
-| 0.3 | agent-2:sonnet | DONE |
+| 0.3 | agent-2:sonnet | DONE (V001-C01/F01 fixed) |
 | 0.4 | agent-3:haiku | DONE |
-| 1.1 | agent-2:sonnet | DONE |
-| 1.2 | agent-2:sonnet | DONE |
-| 1.3 | agent-2:sonnet | DONE |
+| 1.1 | agent-2:sonnet | DONE (V001-F07 fixed) |
+| 1.2 | agent-2:sonnet | DONE (V001-F06/F11 fixed) |
+| 1.3 | agent-2:sonnet | DONE (V001-F07/F12/F13 fixed) |
 | 1.4 | agent-2:sonnet | DONE |
-| 1.5 | agent-3:haiku | DONE |
-| 2.1 | agent-2:sonnet | DONE |
+| 1.5 | agent-3:haiku | DONE (V001-F15 fixed) |
+| 2.1 | agent-2:sonnet | DONE (V001-F05 fixed) |
 | 2.2 | agent-2:sonnet | DONE |
 | 2.3 | agent-2:sonnet | DONE |
 | 2.4 | agent-3:haiku | DONE |
 | 3.1 | agent-2:sonnet | DONE |
-| 3.2 | agent-2:sonnet | DONE |
-| 3.3 | agent-2:sonnet | DONE |
+| 3.2 | agent-2:sonnet | DONE (V001-F03 fixed) |
+| 3.3 | agent-2:sonnet | DONE (V001-F01 fixed) |
 | 3.4 | agent-2:sonnet | DONE |
 | 3.5 | agent-3:haiku | DONE |
-| 4.1 | agent-2:sonnet | DONE (gap T-LINK-DROP/100-cycle) |
-| 4.2 | agent-2:sonnet | DONE (gap T-LINK-PERF) |
-| 4.3 | agent-2:sonnet | DONE |
-| 4.4 | agent-2:sonnet | DONE |
+| 4.1 | agent-2:sonnet | IN_PROGRESS (V001-F08, gate root remoto) |
+| 4.2 | agent-2:sonnet | DONE (V001-F09/F13; relay threshold deviation documented) |
+| 4.3 | agent-2:sonnet | IN_PROGRESS (V001-F14) |
+| 4.4 | agent-2:sonnet | IN_PROGRESS (V001 reconciliation) |
 | 4.5 | agent-2:sonnet | DONE |
 
 ### Tests
@@ -252,29 +282,29 @@ Stati ammessi: TODO, IN_PROGRESS, DONE, SKIPPED (con motivo), BLOCKED.
 | ID | Type | Status | Notes |
 |----|------|--------|-------|
 | T-LINK-HTTP | integration/e2e | PASS | HTTP raw loopback: GET/HEAD, Range full-200, 404/405/400, headers e deadline |
-| T-LINK-INCOMPLETE | integration/e2e | PASS | body fallibile: canale chiuso senza Complete produce UnexpectedEof |
+| T-LINK-INCOMPLETE | integration/e2e | PASS | outcome unit tests `body_disconnect_wins_when_source_was_ready_to_complete` e `transport_failure_wins_over_source_success`; GET chunked forza il terminal source frame |
 | T-LINK-MUTATION | integration/e2e | PASS | producer rifiuta crescita, troncamento e replacement prima di Complete |
-| T-LINK-MEMORY | unit/e2e/perf | PASS | coda bounded a 2 chunk, receiver lento/drop e cancellation verificati |
-| T-LINK-CLEANUP | integration/netns | PASS parziale | SIGINT/SIGTERM bounded, reconnect e RAII verificati; ciclo 100 non-run |
+| T-LINK-MEMORY | unit/e2e/perf | PASS | release benchmark streams 15 GiB stdin without payload file; sender +49,124 KiB/server +16,732 KiB RSS |
+| T-LINK-CLEANUP | integration/netns | PASS parziale | SIGINT/SIGTERM bounded, reconnect e RAII verificati; ciclo 100 attende root CI |
 | T-LINK-COMPAT | regression | PASS | G-UNIT/G-SERIAL e test vhost esistenti verdi |
 | T-LINK-TLS | e2e | PASS parziale | CA controllo/pubblico, hostname e CA rejection nel harness; carrier multipli non isolati |
 | T-LINK-RAW | e2e | PASS | curl/wget bytes e SHA, repeat, HEAD e Range full-200 |
 | T-LINK-CONCURRENT | e2e | PASS | tre GET indipendenti contemporanei con permit condiviso |
 | T-LINK-ZIP | e2e | PASS | misto/cartella vuota, STORED, decoder Python indipendente, repeat/concorrenza |
 | T-LINK-ZIP64 | large e2e | PASS | >4 GiB logici e 65.536 entry, decoder Python |
-| T-LINK-NOSPOOL | e2e | PASS parziale | RSS bounded e nessun archivio temporaneo nel percorso; prova 15 GiB non-run |
+| T-LINK-NOSPOOL | e2e | PASS | 15 GiB stdin monitorato durante il trasferimento: spool=[] e RSS bounded |
 | T-LINK-ONESHOT | integration/e2e | PASS | claim atomico, HEAD innocuo,409 concorrente,410 dopo consumo |
 | T-LINK-STDIN | e2e | PASS | pipe binaria, byte/hash esatti, one-shot; EOF dichiara solo stream terminato |
-| T-LINK-STDIN-CANCEL | process e2e | PASS | producer infinito, SIGTERM, uscita entro 7 s |
+| T-LINK-STDIN-CANCEL | process e2e | PASS | FIFO producer vivo, GET reale interrotto, bore termina nonzero entro 7 s e producer osserva chiusura |
 | T-LINK-EXEC | process e2e | PASS | argv letterale, avvio differito, output/hash/exit0 e producer vuoto valido |
 | T-LINK-EXEC-FAIL | process e2e | PASS | fallimento dopo output e senza output, nessun falso successo |
-| T-LINK-EXEC-CANCEL | privileged e2e | PASS | TERM/KILL gruppo, discendente ignorante TERM terminato e child reaped |
+| T-LINK-EXEC-CANCEL | privileged e2e | PASS | GET reale interrotto; leader termina su TERM, grandchild ignora TERM, gruppo termina entro deadline e figlio diretto viene atteso |
 | T-LINK-EXEC-SUDO | privileged e2e | PASS | root-only, owner/gid/mode/setgid/sticky/symlink/hardlink TAR restore |
-| T-LINK-QUIC | netns e2e | PASS parziale | harness osserva `path=Some(DirectQuic)` e server carrier QUIC; netns/perf resta fase4 |
-| T-LINK-FALLBACK | netns e2e | PASS parziale | `--relay-only` e path `RelayTcp` verificati; UDP bloccato con fallback automatico resta fase4 |
-| T-LINK-DROP | netns e2e | NOT RUN | fault UDP attivo non disponibile in harness stabile |
+| T-LINK-QUIC | netns e2e | PASS parziale | harness remoto pronto per path direct e buffer UDP; run root CI ancora richiesto |
+| T-LINK-FALLBACK | netns e2e | PASS parziale | `--relay-only` e path `RelayTcp` verificati; UDP blocked automatic fallback attende root CI |
+| T-LINK-DROP | netns e2e | NEW | fault UDP attivo e retry relay implementati nel harness; root CI ancora richiesto |
 | T-LINK-RECONNECT | netns e2e | PASS | stop/start server, URL identica e GET nuovo dopo riconnessione |
-| T-LINK-PERF | benchmark | NOT RUN | RSS/boundedness misurate; baseline throughput e soglia ≥90% non dichiarate |
+| T-LINK-PERF | benchmark | PASS | direct ratio 0.978 (≥90%), relay ratio 0.837 (≥75% documented integrity deviation), TTFB/concurrency pass; 15 GiB/RSS/no-spool pass |
 | T-LINK-OBSERVABILITY | e2e | PASS parziale | path, bytes, size e SHA-256 completion log verificati; fault-log matrix resta fase4 |
 | T-LINK-DOCKER | container e2e | PASS | raw, stdin `-i` con byte binari, scratch exec failure |
 
@@ -282,10 +312,11 @@ Stati ammessi: TODO, IN_PROGRESS, DONE, SKIPPED (con motivo), BLOCKED.
 
 | Doc | Phase | Status | Notes |
 |-----|-------|--------|-------|
-| README.md | 0–4 | PASS | file/ZIP/stdin/exec/sudo/Docker, deploy vhost, flag/env, TLS/URL, SHA, limiti e troubleshooting aggiornati insieme alla feature |
+| README.md | 0–4 | DONE | label `transfer-`, bundled WebPKI, carriers auto, progress/outcome e stdin retry documentati (V001-F11/F12/F15) |
 
 ### Audits
 
 | Report | Date | Verdict | Open findings |
 |--------|------|---------|---------------|
 | Final verify 4.4 + correction 4.5 | 2026-09-19 | PASS with explicit evidence gaps | Empty `--exec` success now covered; T-LINK-DROP, cleanup 100-cycle and throughput benchmark remain NOT RUN; no code/test failure |
+| [V001](verify/verify_001_2026-09-20.md) | 2026-09-20 | FAIL pending C09–C12 | F01–F07/F10–F13/F15 FIXED; F08/F09/F14 open: 0 BLOCKER, 3 MAJOR, 0 MINOR; correction plan V001-C09–C12 |

@@ -756,7 +756,7 @@ async fn range_returns_full_200() {
     assert!(headers
         .windows(b"Accept-Ranges: none".len())
         .any(|window| window.eq_ignore_ascii_case(b"Accept-Ranges: none")));
-    assert_eq!(body, b"range payload");
+    assert_eq!(decode_chunked(body), b"range payload");
     stop_http(cancellation, task).await;
     fs::remove_file(path).await.unwrap();
 }

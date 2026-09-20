@@ -1,7 +1,8 @@
 //! Client implementation for the `bore` service.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -124,7 +125,8 @@ pub(crate) struct ClientScope {
     /// close/wait race: shutdown cannot observe an empty tracker and then have
     /// a task registered behind its back.
     registration: Mutex<()>,
-    aborts: Mutex<Vec<tokio::task::AbortHandle>>,
+    aborts: Mutex<HashMap<u64, tokio::task::AbortHandle>>,
+    next_task_id: AtomicU64,
     backend_path_hook: Option<BackendPathHook>,
     transport_config: Option<transport::ClientTlsConfig>,
 }
@@ -147,7 +149,8 @@ impl ClientScope {
             tracker: TaskTracker::new(),
             closing: AtomicBool::new(false),
             registration: Mutex::new(()),
-            aborts: Mutex::new(Vec::new()),
+            aborts: Mutex::new(HashMap::new()),
+            next_task_id: AtomicU64::new(1),
             backend_path_hook,
             transport_config,
         })
@@ -166,7 +169,7 @@ impl ClientScope {
     }
 
     /// Spawn and register one owned task. `None` means shutdown won the race.
-    pub(crate) fn spawn<F, T>(&self, task: F) -> Option<tokio::task::JoinHandle<T>>
+    pub(crate) fn spawn<F, T>(self: &Arc<Self>, task: F) -> Option<tokio::task::JoinHandle<T>>
     where
         F: std::future::Future<Output = T> + Send + 'static,
         T: Send + 'static,
@@ -178,12 +181,20 @@ impl ClientScope {
         if self.closing.load(Ordering::Acquire) {
             return None;
         }
-        let handle = self.tracker.spawn(task);
+        let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+        let weak_scope = Arc::downgrade(self);
+        let handle = self.tracker.spawn(async move {
+            let _guard = ScopedAbortGuard {
+                scope: weak_scope,
+                task_id,
+            };
+            task.await
+        });
         let abort = handle.abort_handle();
         self.aborts
             .lock()
             .expect("client scope abort list poisoned")
-            .push(abort.clone());
+            .insert(task_id, abort);
         Some(handle)
     }
 
@@ -210,7 +221,9 @@ impl ClientScope {
                 .aborts
                 .lock()
                 .expect("client scope abort list poisoned")
-                .clone();
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
             for abort in aborts {
                 abort.abort();
             }
@@ -221,6 +234,36 @@ impl ClientScope {
     #[cfg(test)]
     fn task_count(&self) -> usize {
         self.tracker.len()
+    }
+
+    #[cfg(test)]
+    fn abort_count(&self) -> usize {
+        self.aborts
+            .lock()
+            .expect("client scope abort list poisoned")
+            .len()
+    }
+}
+
+struct ScopedAbortGuard {
+    scope: Weak<ClientScope>,
+    task_id: u64,
+}
+
+impl Drop for ScopedAbortGuard {
+    fn drop(&mut self) {
+        let Some(scope) = self.scope.upgrade() else {
+            return;
+        };
+        let _registration = scope
+            .registration
+            .lock()
+            .expect("client scope registration mutex poisoned");
+        scope
+            .aborts
+            .lock()
+            .expect("client scope abort list poisoned")
+            .remove(&self.task_id);
     }
 }
 
@@ -972,7 +1015,12 @@ impl Client {
             }
             None => bail!("unexpected EOF"),
         };
-        info!(%subdomain, "vhost provider ready");
+        // A scoped transfer-link subdomain is a bearer credential.  Keep the
+        // legacy vhost diagnostic for ordinary providers, but never emit the
+        // scoped label because it would reconstruct the public URL in logs.
+        if scope.is_none() {
+            info!(%subdomain, "vhost provider ready");
+        }
 
         let auto_carriers = carriers == 0;
         let mut carrier_acceptors = Vec::new();
@@ -1590,7 +1638,7 @@ impl Client {
                                 let server_addr = match resolve_direct_server_addr(endpoint, port).await {
                                     Ok(addr) => addr,
                                     Err(err) => {
-                                        warn!(%err, key, "failed to resolve direct udp endpoint; using TCP relay");
+                                        warn!(%err, "failed to resolve direct udp endpoint; using TCP relay");
                                         let _ = direct_renew_tx.send(());
                                         continue;
                                     }
@@ -1602,7 +1650,7 @@ impl Client {
                                 if need == 0 {
                                     continue;
                                 }
-                                info!(key, need, target = direct_udp_target, "establishing direct udp carriers");
+                                info!(need, target = direct_udp_target, "establishing direct udp carriers");
                                 for _ in 0..need {
                                     direct_live.fetch_add(1, Ordering::Relaxed);
                                     spawn_direct(
@@ -1754,7 +1802,7 @@ impl Client {
                                 return Ok(());
                             }
                         } else if vhost_udp {
-                            info!(key, "requesting vhost udp renewal");
+                            info!("requesting vhost udp renewal");
                             if control
                                 .send(ClientMessage::VhostUdpRenew {
                                     subdomain: key.to_string(),
@@ -1787,11 +1835,15 @@ impl Client {
                     #[cfg(feature = "udp")]
                     if renew.is_some() && direct_key.is_some() && direct_renew_sleep.is_none() {
                         let delay = direct_renew_backoff.next_delay();
-                        info!(
-                            key = direct_key.as_deref().unwrap_or_default(),
-                            next_retry_s = delay.as_secs(),
-                            "scheduling direct udp renewal"
-                        );
+                        if vhost_udp {
+                            info!(next_retry_s = delay.as_secs(), "scheduling direct udp renewal");
+                        } else {
+                            info!(
+                                key = direct_key.as_deref().unwrap_or_default(),
+                                next_retry_s = delay.as_secs(),
+                                "scheduling direct udp renewal"
+                            );
+                        }
                         direct_renew_sleep = Some(Box::pin(tokio::time::sleep(delay)));
                     }
                 }
@@ -2136,6 +2188,7 @@ fn spawn_direct(
     up_tx: mpsc::UnboundedSender<()>,
 ) {
     let scope_token = client.scope.as_ref().map(|scope| scope.token());
+    let scoped_vhost = client.scope.is_some() && client.vhost_udp;
     let owner = Arc::clone(&client);
     // Reserve the slot before the task is submitted. If shutdown won the
     // registration race, `spawn_task` returns `None` and the reservation must
@@ -2152,7 +2205,11 @@ fn spawn_direct(
         let socket = match crate::holepunch::bind_socket(0).await {
             Ok(socket) => socket,
             Err(err) => {
-                warn!(%err, key, "failed to bind direct udp socket; using TCP relay");
+                if scoped_vhost {
+                    warn!(%err, "failed to bind direct udp socket; using TCP relay");
+                } else {
+                    warn!(%err, key, "failed to bind direct udp socket; using TCP relay");
+                }
                 release(&live, &renew_tx);
                 return;
             }
@@ -2161,14 +2218,22 @@ fn spawn_direct(
             match crate::holepunch::vhost_connect(socket, server_addr, &key, token, tuning).await {
                 Ok(direct) => direct,
                 Err(err) => {
-                    warn!(%err, key, "direct udp carrier unavailable; using TCP relay");
+                    if scoped_vhost {
+                        warn!(%err, "direct udp carrier unavailable; using TCP relay");
+                    } else {
+                        warn!(%err, key, "direct udp carrier unavailable; using TCP relay");
+                    }
                     release(&live, &renew_tx);
                     return;
                 }
             };
 
         let _ = up_tx.send(());
-        info!(key, "direct udp carrier ready, accepting streams");
+        if scoped_vhost {
+            info!("direct udp carrier ready, accepting streams");
+        } else {
+            info!(key, "direct udp carrier ready, accepting streams");
+        }
         loop {
             let stream = match tokio::select! {
                 _ = wait_for_scope_cancel(scope_token.clone()) => break,
@@ -2176,7 +2241,11 @@ fn spawn_direct(
             } {
                 Ok(stream) => stream,
                 Err(err) => {
-                    debug!(%err, key, "direct udp carrier closed");
+                    if scoped_vhost {
+                        debug!(%err, "direct udp carrier closed");
+                    } else {
+                        debug!(%err, key, "direct udp carrier closed");
+                    }
                     break;
                 }
             };
@@ -2818,6 +2887,22 @@ mod tests {
             scope.spawn(async {}).is_none(),
             "closed scopes reject new tasks"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_scoped_tasks_release_abort_handles() {
+        let scope = ClientScope::new(None);
+        for _ in 0..128 {
+            let handle = scope.spawn(async {}).expect("scope is open");
+            handle.await.expect("task completes");
+            assert_eq!(
+                scope.abort_count(),
+                0,
+                "completed task handle must be removed"
+            );
+        }
+        scope.shutdown().await;
+        assert_eq!(scope.abort_count(), 0);
     }
 
     #[tokio::test]

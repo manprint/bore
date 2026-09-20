@@ -32,6 +32,9 @@ server_pid=''
 link_pid=''
 stdin_pipeline_pid=''
 stdin_blocker_pid=''
+stdin_cancel_link_pid=''
+stdin_cancel_curl_pid=''
+stdin_cancel_producer_pid=''
 rss_monitor_pid=''
 cleanup() {
     local status=$?
@@ -47,6 +50,12 @@ cleanup() {
         kill -TERM "$stdin_blocker_pid" 2>/dev/null || true
         wait "$stdin_blocker_pid" 2>/dev/null || true
     fi
+    for pid in "$stdin_cancel_curl_pid" "$stdin_cancel_link_pid" "$stdin_cancel_producer_pid"; do
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
     if [[ -n "$rss_monitor_pid" ]] && kill -0 "$rss_monitor_pid" 2>/dev/null; then
         kill -TERM "$rss_monitor_pid" 2>/dev/null || true
         wait "$rss_monitor_pid" 2>/dev/null || true
@@ -184,7 +193,7 @@ start_server() {
 
 start_server
 
-"$bin" transfer link "$source_arg" \
+"$bin" -vv transfer link "$source_arg" \
     --to "https://localhost:$control_port" \
     --ca-cert "$tmp/ca.pem" --max-downloads 4 \
     >"$tmp/url.txt" 2>"$tmp/link.log" &
@@ -219,6 +228,16 @@ print(u.hostname, u.port)
 PY
 )"
 resolve="$host:$port:127.0.0.1"
+
+# The vhost label and the URL path are bearer credentials.  At trace logging
+# the only Link correlation field allowed is the process-local session id;
+# neither the host/URL nor the advertised filename may appear in stderr.
+if grep -F -e "$host" -e "$url" -e 'source.bin' "$tmp/link.log" >/dev/null; then
+    printf 'transfer-link verbose log leaked a bearer URL component\n' >&2
+    cat "$tmp/link.log" >&2
+    exit 1
+fi
+grep -q 'session_id=' "$tmp/link.log"
 
 curl_args=(--fail --silent --show-error --cacert "$tmp/ca.pem" --resolve "$resolve")
 
@@ -460,7 +479,7 @@ grep -q 'transfer-link download completed' "$tmp/link.log"
 grep -q 'sha256=' "$tmp/link.log"
 
 # Reuse the server for a second scoped registration with explicit TCP relay.
-"$bin" transfer link "$tmp/source.bin" \
+"$bin" -v transfer link "$tmp/source.bin" \
     --to "https://localhost:$control_port" \
     --ca-cert "$tmp/ca.pem" --relay-only --max-downloads 4 \
     >"$tmp/relay-url.txt" 2>"$tmp/relay-link.log" &
@@ -490,6 +509,12 @@ print(u.hostname, u.port)
 PY
 )"
 relay_resolve="$relay_host:$relay_port:127.0.0.1"
+if grep -F -e "$relay_host" -e "$relay_url" -e 'source.bin' "$tmp/relay-link.log" >/dev/null; then
+    printf 'transfer-link info log leaked a bearer URL component\n' >&2
+    cat "$tmp/relay-link.log" >&2
+    exit 1
+fi
+grep -q 'session_id=' "$tmp/relay-link.log"
 curl --fail --silent --show-error --cacert "$tmp/ca.pem" \
     --resolve "$relay_resolve" "$relay_url" -o "$tmp/relay.bin"
 cmp "$tmp/expected.bin" "$tmp/relay.bin"
@@ -557,46 +582,103 @@ kill -INT "$stdin_pipeline_pid"
 wait "$stdin_pipeline_pid" 2>/dev/null || true
 stdin_pipeline_pid=''
 
-# A producer that has not reached EOF must not keep the CLI alive after the
-# operator cancels the one-shot session.  This uses no payload and therefore
-# checks the blocked stdin reader itself rather than a fast producer finishing
-# before the signal is delivered.
-python3 - <<'PY' | "$bin" transfer link --stdin \
-    --filename blocked.bin --to "https://localhost:$control_port" \
-    --ca-cert "$tmp/ca.pem" --max-downloads 1 \
-    >"$tmp/stdin-blocked-url.txt" 2>"$tmp/stdin-blocked.log" &
+# A real consuming GET is interrupted while the external writer keeps stdin
+# open.  The one-shot failure must terminate bore nonzero and close its stdin
+# so the writer observes EPIPE/EOF; a URL-only SIGTERM would not exercise this
+# contract because the producer starts only after GET claims the stream.
+mkfifo "$tmp/stdin-cancel.fifo"
+cat >"$tmp/stdin-cancel-producer.py" <<'PY'
 import os
+import sys
+import time
+
+fifo, marker = sys.argv[1:]
+fd = os.open(fifo, os.O_WRONLY)
 try:
     while True:
-        os.write(1, b"x" * 65536)
-except BrokenPipeError:
-    pass
+        os.write(fd, b"cancel-payload-" * 4096)
+except (BrokenPipeError, OSError):
+    with open(marker, "w", encoding="ascii") as output:
+        output.write("closed\n")
+finally:
+    os.close(fd)
 PY
-stdin_blocker_pid=$!
+python3 "$tmp/stdin-cancel-producer.py" "$tmp/stdin-cancel.fifo" \
+    "$tmp/stdin-cancel-producer.status" &
+stdin_cancel_producer_pid=$!
+"$bin" transfer link --stdin \
+    --filename cancelled.bin --to "https://localhost:$control_port" \
+    --ca-cert "$tmp/ca.pem" --max-downloads 1 \
+    <"$tmp/stdin-cancel.fifo" \
+    >"$tmp/stdin-cancel-url.txt" 2>"$tmp/stdin-cancel.log" &
+stdin_cancel_link_pid=$!
 deadline=$((SECONDS + 20))
-while [[ ! -s "$tmp/stdin-blocked-url.txt" ]] && (( SECONDS < deadline )); do
-    if ! kill -0 "$stdin_blocker_pid" 2>/dev/null; then
-        cat "$tmp/stdin-blocked.log" >&2 || true
-        printf 'blocked stdin transfer-link exited before URL publication\n' >&2
+while [[ ! -s "$tmp/stdin-cancel-url.txt" ]] && (( SECONDS < deadline )); do
+    if ! kill -0 "$stdin_cancel_link_pid" 2>/dev/null; then
+        cat "$tmp/stdin-cancel.log" >&2 || true
+        printf 'stdin cancellation transfer-link exited before URL publication\n' >&2
         exit 1
     fi
     sleep 0.05
 done
-[[ -s "$tmp/stdin-blocked-url.txt" ]] || {
-    cat "$tmp/stdin-blocked.log" >&2 || true
-    printf 'timed out waiting for blocked stdin URL\n' >&2
+[[ -s "$tmp/stdin-cancel-url.txt" ]] || {
+    cat "$tmp/stdin-cancel.log" >&2 || true
+    printf 'timed out waiting for stdin cancellation URL\n' >&2
     exit 1
 }
-kill -TERM "$stdin_blocker_pid"
-deadline=$((SECONDS + 7))
-while kill -0 "$stdin_blocker_pid" 2>/dev/null && (( SECONDS < deadline )); do
+stdin_cancel_url=$(head -n 1 "$tmp/stdin-cancel-url.txt")
+read -r cancel_host cancel_port <<<"$(python3 - "$stdin_cancel_url" <<'PY'
+from urllib.parse import urlparse
+import sys
+u = urlparse(sys.argv[1])
+if u.scheme != 'https' or not u.hostname or not u.port:
+    raise SystemExit('cancel URL has no explicit HTTPS host/port')
+print(u.hostname, u.port)
+PY
+)"
+cancel_resolve="$cancel_host:$cancel_port:127.0.0.1"
+curl --fail --silent --show-error --cacert "$tmp/ca.pem" \
+    --resolve "$cancel_resolve" "$stdin_cancel_url" \
+    -o "$tmp/stdin-cancel.bin" &
+stdin_cancel_curl_pid=$!
+deadline=$((SECONDS + 10))
+while [[ ! -s "$tmp/stdin-cancel.bin" ]] && kill -0 "$stdin_cancel_curl_pid" 2>/dev/null && (( SECONDS < deadline )); do
     sleep 0.05
 done
-if kill -0 "$stdin_blocker_pid" 2>/dev/null; then
-    printf 'blocked stdin transfer-link did not stop after SIGTERM\n' >&2
+[[ -s "$tmp/stdin-cancel.bin" ]] || {
+    printf 'cancel GET did not receive any payload before interruption\n' >&2
+    exit 1
+}
+kill -TERM "$stdin_cancel_curl_pid" 2>/dev/null || true
+wait "$stdin_cancel_curl_pid" 2>/dev/null || true
+stdin_cancel_curl_pid=''
+deadline=$((SECONDS + 7))
+while kill -0 "$stdin_cancel_link_pid" 2>/dev/null && (( SECONDS < deadline )); do
+    sleep 0.05
+done
+if kill -0 "$stdin_cancel_link_pid" 2>/dev/null; then
+    printf 'stdin cancellation did not stop bore within 7 seconds\n' >&2
     exit 1
 fi
-wait "$stdin_blocker_pid" 2>/dev/null || true
-stdin_blocker_pid=''
+set +e
+wait "$stdin_cancel_link_pid"
+stdin_cancel_status=$?
+set -e
+stdin_cancel_link_pid=''
+(( stdin_cancel_status != 0 )) || {
+    cat "$tmp/stdin-cancel.log" >&2 || true
+    printf 'stdin cancellation unexpectedly returned success\n' >&2
+    exit 1
+}
+deadline=$((SECONDS + 7))
+while [[ ! -s "$tmp/stdin-cancel-producer.status" ]] && (( SECONDS < deadline )); do
+    sleep 0.05
+done
+grep -qx 'closed' "$tmp/stdin-cancel-producer.status" || {
+    printf 'external stdin producer did not observe closure\n' >&2
+    exit 1
+}
+wait "$stdin_cancel_producer_pid" 2>/dev/null || true
+stdin_cancel_producer_pid=''
 
 printf 'transfer-link basic: PASS\n'

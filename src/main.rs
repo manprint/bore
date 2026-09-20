@@ -52,7 +52,7 @@ use bore_cli::{
 };
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand};
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -1410,8 +1410,8 @@ enum TransferCommand {
         #[clap(long)]
         relay_only: bool,
 
-        /// Number of independent relay/direct carriers (1..=32).
-        #[clap(long, value_name = "N", default_value_t = 1u16, value_parser = clap::value_parser!(u16).range(1..=32), env = "BORE_CARRIERS")]
+        /// Number of independent relay/direct carriers (0 = automatic, 1..=32 fixed).
+        #[clap(long, value_name = "N", default_value_t = 1u16, value_parser = clap::value_parser!(u16).range(0..=32), env = "BORE_CARRIERS")]
         carriers: u16,
 
         /// Filename advertised to HTTP clients; defaults to the source basename.
@@ -1899,6 +1899,10 @@ async fn run_transfer_link(
         anyhow::bail!("--stdin and --exec require exactly one download");
     }
     let advertised_filename = prepared.filename().to_owned();
+    let one_shot_failure = match &prepared {
+        PreparedSource::OneShot(stream) => Some(stream.failure_receiver()),
+        PreparedSource::File(_) | PreparedSource::Archive(_) => None,
+    };
     let options = LinkOptions::new(
         advertised_filename.clone(),
         usize::from(if one_shot {
@@ -1928,7 +1932,7 @@ async fn run_transfer_link(
     .await
     .context("cannot start transfer-link listener")?;
 
-    let label = supervisor.label().to_owned();
+    let session_id = supervisor.session_id();
     let shutdown = CancellationToken::new();
     let (ready_tx, mut ready_rx) = oneshot::channel();
     let mut task: JoinHandle<Result<()>> = tokio::spawn(supervisor.run(shutdown.clone(), ready_tx));
@@ -1966,8 +1970,7 @@ async fn run_transfer_link(
         .flush()
         .context("failed to flush transfer-link URL")?;
     info!(
-        label = %label,
-        filename = %advertised_filename,
+        session_id,
         size = ?prepared.known_size(),
         max_downloads = effective_max_downloads,
         relay_only,
@@ -1975,9 +1978,16 @@ async fn run_transfer_link(
         "transfer-link session ready"
     );
 
+    let one_shot_failure = wait_for_one_shot_failure(one_shot_failure);
+    tokio::pin!(one_shot_failure);
     tokio::select! {
         result = &mut task => {
             result.context("transfer-link supervisor task failed")??;
+        }
+        _ = &mut one_shot_failure => {
+            shutdown.cancel();
+            finish_transfer_link_task(&mut task).await?;
+            anyhow::bail!("transfer-link one-shot producer failed; restart the producer and download")
         }
         _ = shutdown_signal() => {
             shutdown.cancel();
@@ -1985,6 +1995,21 @@ async fn run_transfer_link(
         }
     }
     Ok(())
+}
+
+async fn wait_for_one_shot_failure(receiver: Option<watch::Receiver<bool>>) {
+    let Some(mut receiver) = receiver else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *receiver.borrow() {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 async fn finish_transfer_link_task(task: &mut JoinHandle<Result<()>>) -> Result<()> {
@@ -4533,6 +4558,18 @@ mod tests {
             Some(value) => std::env::set_var("BORE_SERVER", value),
             None => std::env::remove_var("BORE_SERVER"),
         }
+    }
+
+    #[test]
+    fn transfer_link_accepts_adaptive_carriers() {
+        let args = Args::parse_from(["bore", "transfer", "link", "--carriers", "0", "backup.bin"]);
+        let Command::Transfer { command } = args.command else {
+            panic!("expected transfer command");
+        };
+        let TransferCommand::Link { carriers, .. } = command else {
+            panic!("expected transfer link command");
+        };
+        assert_eq!(carriers, 0);
     }
 
     #[test]

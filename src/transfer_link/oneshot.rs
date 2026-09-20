@@ -15,7 +15,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 #[cfg(unix)]
 use tracing::{debug, warn};
@@ -67,12 +67,15 @@ impl OneShotStatus {
 #[derive(Debug)]
 pub(crate) struct OneShotState {
     status: AtomicU8,
+    failure: watch::Sender<bool>,
 }
 
 impl OneShotState {
     pub(crate) fn new() -> Self {
+        let (failure, _) = watch::channel(false);
         Self {
             status: AtomicU8::new(OneShotStatus::Ready.as_u8()),
+            failure,
         }
     }
 
@@ -100,6 +103,11 @@ impl OneShotState {
     pub(crate) fn failed(&self) {
         self.status
             .store(OneShotStatus::Failed.as_u8(), Ordering::Release);
+        let _ = self.failure.send(true);
+    }
+
+    pub(crate) fn failure_receiver(&self) -> watch::Receiver<bool> {
+        self.failure.subscribe()
     }
 }
 
@@ -119,6 +127,13 @@ pub struct PreparedStream {
     pub(crate) filename: String,
     pub(crate) state: Arc<OneShotState>,
     pub(crate) kind: StreamKind,
+}
+
+impl PreparedStream {
+    /// Observe the terminal failure signal used by the CLI supervisor.
+    pub fn failure_receiver(&self) -> watch::Receiver<bool> {
+        self.state.failure_receiver()
+    }
 }
 
 /// Prepare a one-shot source backed by the bore process's standard input.
@@ -213,6 +228,7 @@ fn spawn_message_producer(
     let (sender, receiver) = mpsc::channel(STREAM_QUEUE);
     let completion = Arc::new(std::sync::Mutex::new(None));
     let task_completion = Arc::clone(&completion);
+    let owner_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
         let mut hasher = Sha256::new();
         let mut bytes_read = 0u64;
@@ -274,7 +290,7 @@ fn spawn_message_producer(
             }
         }
     });
-    FileProducerHandle::from_parts_with_completion(receiver, task, completion)
+    FileProducerHandle::from_parts_with_completion(receiver, task, completion, owner_cancellation)
 }
 
 async fn send_source(
@@ -326,6 +342,7 @@ async fn spawn_exec(
     let (sender, receiver) = mpsc::channel(STREAM_QUEUE);
     let completion = Arc::new(std::sync::Mutex::new(None));
     let task_completion = Arc::clone(&completion);
+    let owner_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
         let result = produce_exec(&mut child, pid, stdout, stderr, &sender, &cancellation).await;
         match result {
@@ -341,7 +358,10 @@ async fn spawn_exec(
         }
     });
     Ok(FileProducerHandle::from_parts_with_completion(
-        receiver, task, completion,
+        receiver,
+        task,
+        completion,
+        owner_cancellation,
     ))
 }
 
@@ -489,10 +509,7 @@ async fn drain_stderr(stderr: &mut tokio::process::ChildStderr, cancellation: &C
 #[cfg(unix)]
 async fn terminate_child(child: &mut tokio::process::Child, pid: Option<u32>) {
     if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGTERM,
-        );
+        signal_process_group(pid, nix::sys::signal::Signal::SIGTERM);
     }
     let needs_reap =
         match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
@@ -507,12 +524,36 @@ async fn terminate_child(child: &mut tokio::process::Child, pid: Option<u32>) {
     // stderr or ignores SIGTERM.  Always signal the captured process group so
     // cancellation cannot leave that descendant running in the background.
     if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
+        signal_process_group(pid, nix::sys::signal::Signal::SIGKILL);
     }
     if needs_reap {
         let _ = child.wait().await;
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: i32, signal: nix::sys::signal::Signal) {
+    match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), signal) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => {}
+        Err(error) => {
+            warn!(pid, ?signal, %error, "transfer-link producer process-group signal failed")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OneShotState, OneShotStatus};
+
+    #[tokio::test]
+    async fn failure_receiver_notifies_the_terminal_failure() {
+        let state = OneShotState::new();
+        let mut receiver = state.failure_receiver();
+        assert!(!*receiver.borrow());
+        state.failed();
+        receiver.changed().await.expect("failure signal");
+        assert!(*receiver.borrow());
+        assert_eq!(state.status(), OneShotStatus::Failed);
     }
 }

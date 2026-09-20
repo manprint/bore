@@ -40,6 +40,8 @@ use crate::shared::{CONTROL_PORT, NETWORK_TIMEOUT};
 pub(crate) enum ConnectFailure {
     /// The TCP connection could not be established or was interrupted.
     Transport,
+    /// The TLS handshake timed out or was interrupted by the peer/network.
+    TlsTransient,
     /// TLS name verification, certificate parsing or handshake failed.
     Tls,
 }
@@ -48,6 +50,7 @@ impl std::fmt::Display for ConnectFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transport => f.write_str("control transport failure"),
+            Self::TlsTransient => f.write_str("transient control TLS transport failure"),
             Self::Tls => f.write_str("control TLS verification failure"),
         }
     }
@@ -203,11 +206,38 @@ pub(crate) async fn connect_with_config(
         .map_err(|error| anyhow::Error::new(ConnectFailure::Tls).context(error))?;
     let tls = timeout(NETWORK_TIMEOUT, connector.connect(server_name, tcp))
         .await
-        .context("timed out during TLS handshake")
-        .map_err(|error| anyhow::Error::new(ConnectFailure::Tls).context(error))?
-        .context("TLS handshake failed")
-        .map_err(|error| anyhow::Error::new(ConnectFailure::Tls).context(error))?;
+        .map_err(|_| {
+            anyhow::Error::new(ConnectFailure::TlsTransient)
+                .context("timed out during TLS handshake")
+        })?
+        .map_err(|error| {
+            let failure = if is_transient_tls_io(&error) {
+                ConnectFailure::TlsTransient
+            } else {
+                ConnectFailure::Tls
+            };
+            anyhow::Error::new(failure)
+                .context(error)
+                .context("TLS handshake failed")
+        })?;
     Ok(ControlStream::Tls(Box::new(tls)))
+}
+
+/// Classify an error returned while rustls is driving the TCP socket.  Rustls
+/// reports certificate/name/protocol failures as `InvalidData`; socket
+/// shutdowns and timeouts retain their I/O kind and are safe to retry.
+fn is_transient_tls_io(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NotConnected
+    )
 }
 
 fn client_config(insecure: bool) -> Result<ClientConfig> {
@@ -430,6 +460,23 @@ mod tests {
         // The backend TLS connector must build with the accept-any verifier and
         // an http/1.1-only ALPN offer.
         assert!(insecure_tls_connector().is_ok());
+    }
+
+    #[test]
+    fn tls_io_classification_keeps_socket_failures_retryable() {
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            assert!(is_transient_tls_io(&io::Error::from(kind)));
+        }
+        assert!(!is_transient_tls_io(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "certificate rejected",
+        )));
     }
 
     #[test]

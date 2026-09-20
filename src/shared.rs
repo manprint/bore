@@ -2199,8 +2199,8 @@ impl ControlFrameSummary for ClientMessage {
                 )
             }
             ClientMessage::HelloVhost {
-                subdomain,
-                client_id,
+                subdomain: _,
+                client_id: _,
                 notes,
                 basic_auth,
                 carriers,
@@ -2210,9 +2210,7 @@ impl ControlFrameSummary for ClientMessage {
                 ..
             } => {
                 format!(
-                    "HelloVhost {{ subdomain={}, client_id={}, notes={}, basic_auth={}, carriers={}, udp={}, webserver_log={}, auto_reconnect={} }}",
-                    subdomain,
-                    client_id,
+                    "HelloVhost {{ subdomain=<redacted>, client_id=<redacted>, notes={}, basic_auth={}, carriers={}, udp={}, webserver_log={}, auto_reconnect={} }}",
                     if notes.is_some() { "present" } else { "none" },
                     if *basic_auth { "on" } else { "off" },
                     carriers,
@@ -2221,8 +2219,8 @@ impl ControlFrameSummary for ClientMessage {
                     if *auto_reconnect { "on" } else { "off" },
                 )
             }
-            ClientMessage::VhostUdpRenew { subdomain } => {
-                format!("VhostUdpRenew {{ subdomain={} }}", subdomain)
+            ClientMessage::VhostUdpRenew { .. } => {
+                "VhostUdpRenew { subdomain=<redacted> }".to_string()
             }
             ClientMessage::PublicUdpRenew { port } => {
                 format!("PublicUdpRenew {{ port={} }}", port)
@@ -2380,14 +2378,9 @@ impl ControlFrameSummary for ServerMessage {
                 )
             }
             ServerMessage::UdpUnavailable => "UdpUnavailable".to_string(),
-            ServerMessage::VhostReady {
-                http_url,
-                https_url,
-            } => format!(
-                "VhostReady {{ http_url={}, https_url={} }}",
-                http_url.as_deref().unwrap_or("<none>"),
-                https_url.as_deref().unwrap_or("<none>"),
-            ),
+            ServerMessage::VhostReady { .. } => {
+                "VhostReady { http_url=<redacted>, https_url=<redacted> }".to_string()
+            }
             ServerMessage::VhostUdp {
                 port,
                 nonce,

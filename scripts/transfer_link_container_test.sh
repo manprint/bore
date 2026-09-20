@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Real Docker acceptance test.  The client image is built from the repository's
+# Real Docker acceptance test. The client image is built from the repository's
 # docker/Dockerfile.client; its base image is a locally tagged scratch image
 # containing the current static binary, so the test never silently exercises an
-# older registry tag.
+# older registry tag. The client runtime is Debian slim and must provide GNU
+# tar plus the compression tools documented for transfer-link producers.
 
 for tool in docker openssl curl python3 file; do
     command -v "$tool" >/dev/null || {
@@ -200,8 +201,8 @@ printf 'nested Docker payload\0\xff\n' >"$tmp/mixed-root/nested.bin"
 server_pid=$!
 wait_tcp "$control_port"
 
-# The scratch client needs no shell, tar or helper binary.  --workdir/-w and a
-# readonly bind mount are the same shape users get for ordinary source files.
+# --workdir/-w and a readonly bind mount are the same shape users get for
+# ordinary source files.
 docker run --rm --network host --workdir /dir \
     -v "$tmp:/dir:ro" "$client_image" \
     transfer link /dir/source.bin --to "https://localhost:$control_port" \
@@ -255,12 +256,24 @@ kill -INT "$stdin_pid"
 wait "$stdin_pid" 2>/dev/null || true
 stdin_pid=''
 
-# The scratch image has no /bin/sh or tar.  Exec must fail as a producer error,
-# never emit a successful terminator, and never hang the container.
+# The client runtime supplies the producer tools requested by the Docker
+# interface. Check the commands through the runtime shell before exercising
+# supervised --exec, so a package omission cannot hide behind a later failure.
+for tool in tar gzip xz zstd lz4; do
+    docker run --rm --entrypoint /bin/sh "$client_image" \
+        -c "command -v $tool >/dev/null" || {
+        printf 'client image is missing producer tool: %s\n' "$tool" >&2
+        exit 1
+    }
+done
+
+# --exec starts and supervises GNU tar. A successful producer must result in a
+# successful HTTP body and a readable archive, while the client process remains
+# in the foreground until Ctrl+C for later downloads.
 docker run --rm --network host --workdir /dir \
     -v "$tmp:/dir:ro" "$client_image" \
-    transfer link --exec --filename failed.tar --to "https://localhost:$control_port" \
-    --ca-cert /dir/ca.pem --max-downloads 1 -- tar -cpf - /dir/source.bin \
+    transfer link --exec --filename exec.tar --to "https://localhost:$control_port" \
+    --ca-cert /dir/ca.pem --max-downloads 1 -- tar -cpf - -C /dir source.bin \
     >"$tmp/exec-url.txt" 2>"$tmp/exec.log" &
 exec_pid=$!
 wait_url "$tmp/exec-url.txt" "$tmp/exec.log" "$exec_pid"
@@ -272,21 +285,25 @@ u = urlparse(sys.argv[1])
 print(u.hostname, u.port)
 PY
 )"
-set +e
 curl --fail --silent --show-error --max-time 15 --cacert "$tmp/ca.pem" \
-    --resolve "$exec_host:$exec_port:127.0.0.1" "$exec_url" -o "$tmp/failed.tar"
-exec_status=$?
-set -e
-(( exec_status != 0 )) || {
-    printf 'scratch --exec tar unexpectedly succeeded\n' >&2
-    exit 1
-}
-if grep -q 'transfer-link download completed' "$tmp/exec.log"; then
-    printf 'scratch --exec failure was logged as completed\n' >&2
+    --resolve "$exec_host:$exec_port:127.0.0.1" "$exec_url" -o "$tmp/exec.tar"
+python3 - "$tmp/exec.tar" "$tmp/source.bin" <<'PY'
+import sys
+import tarfile
+
+archive, source = sys.argv[1:]
+with tarfile.open(archive, mode="r:") as tar:
+    member = tar.getmember("source.bin")
+    extracted = tar.extractfile(member)
+    if extracted is None or extracted.read() != open(source, "rb").read():
+        raise SystemExit("--exec tar archive content mismatch")
+PY
+if ! grep -q 'transfer-link download completed' "$tmp/exec.log"; then
+    printf '--exec tar was not logged as completed\n' >&2
     exit 1
 fi
 kill -INT "$exec_pid"
 wait "$exec_pid" 2>/dev/null || true
 exec_pid=''
 
-printf 'transfer-link Docker: PASS (raw, stdin -i, scratch exec failure)\n'
+printf 'transfer-link Docker: PASS (raw, stdin -i, exec tar, gzip/xz/zstd/lz4 tools)\n'

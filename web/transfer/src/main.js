@@ -1,12 +1,5 @@
 import "./styles.css";
-import {
-  buildRoomUrl,
-  clearSecrets,
-  loadSecrets,
-  parseRoomUrl,
-  saveSecrets,
-  scrubFragment,
-} from "./secrets.js";
+import { buildShortRoomUrl, parseShortRoomUrl } from "./secrets.js";
 import {
   CONNECTION,
   TRANSFER,
@@ -24,11 +17,16 @@ import { createRepository, sanitizeDownloadName } from "./storage.js";
 import { MAX_CARRIERS, createCarrierGroup } from "./webrtc.js";
 import { createTraceStore } from "./diagnostics.js";
 import { createView } from "./view.js";
-import { bytesToHex, hexToBytes, manifestMac } from "./crypto.js";
+import {
+  bytesToHex,
+  deriveRoomLinkMaterial,
+  hexToBytes,
+  manifestMac,
+} from "./crypto.js";
 import { canonicalize, directFailedBody, manifestValue } from "./protocol.js";
 
-// Browser bootstrap (Phase 3.5): secrets from the fragment into
-// sessionStorage (scrubbed immediately), one control session, peer/catalog
+// Browser bootstrap: derive room credentials from the persistent short-link
+// fragment in memory, then open one control session and peer/catalog
 // rendering, local offer preparation (hash in a worker, publish on the
 // control channel), the source transfer actor (auto-ready on incoming,
 // relay leg on ticket, payload pipeline on path_commit) and the recipient
@@ -43,6 +41,7 @@ const app = document.getElementById("app");
 let state = createInitialState();
 let secrets = null;
 let roomId = null;
+let roomSeed = null;
 let session = null;
 let serverLimits = null;
 let offers = null;
@@ -219,11 +218,10 @@ const view = createView(document, app, {
     refreshResumable();
   },
   onCopyLink: async () => {
-    if (secrets === null || roomId === null) {
+    if (roomSeed === null) {
       return;
     }
-    // Reconstructed ONLY here, inside the click handler, then discarded.
-    const url = buildRoomUrl(window.location.origin, roomId, secrets);
+    const url = buildShortRoomUrl(window.location.origin, roomSeed);
     try {
       await navigator.clipboard.writeText(url);
       view.announce("Link copiato negli appunti");
@@ -275,14 +273,9 @@ function teardownUnavailable(statusText) {
     session = null;
   }
   revokeSpentAnchorUrls();
-  if (roomId !== null) {
-    try {
-      clearSecrets(window.sessionStorage, roomId);
-    } catch {
-      /* storage may be unavailable; nothing else to purge */
-    }
-    secrets = null;
-  }
+  roomSeed = null;
+  roomId = null;
+  secrets = null;
   setConnection(CONNECTION.UNAVAILABLE, statusText);
   view.announce(statusText);
 }
@@ -1404,34 +1397,47 @@ if (
   };
 }
 
-// Boot: fragment secrets move to sessionStorage and are scrubbed at once;
-// a reload without fragment recovers from the same tab only.
-try {
-  const parsed = parseRoomUrl(window.location.href);
-  roomId = parsed.roomId;
-  secrets = { memberToken: parsed.memberToken, roomKey: parsed.roomKey };
-  saveSecrets(window.sessionStorage, roomId, secrets);
-  scrubFragment(window.history, `${window.location.origin}/transfer/${roomId}`);
-} catch {
-  const match = /^\/transfer\/([0-9a-f]{32})$/.exec(window.location.pathname);
-  if (match !== null) {
-    roomId = match[1];
-    try {
-      const loaded = loadSecrets(window.sessionStorage, roomId);
-      if (loaded !== null) {
-        secrets = loaded;
-      }
-    } catch {
-      secrets = null;
-    }
+const UNSUPPORTED_BROWSER =
+  "Browser non supportato: WebCrypto HKDF non disponibile";
+
+/// Boot order is deliberate: parse the persistent fragment, await all three
+/// independent HKDF derivations, publish credentials only in module memory,
+/// then start the control session. A malformed link never opens a socket.
+async function boot() {
+  installDiagnosticsHook();
+
+  let parsed;
+  try {
+    parsed = parseShortRoomUrl(window.location.href);
+  } catch {
+    setConnection(CONNECTION.INCOMPLETE, "Link incompleto");
+    render();
+    return;
   }
-}
 
-installDiagnosticsHook();
+  let material;
+  try {
+    material = await deriveRoomLinkMaterial(parsed.seed);
+  } catch {
+    setConnection(CONNECTION.UNAVAILABLE, UNSUPPORTED_BROWSER);
+    render();
+    return;
+  }
 
-if (roomId === null || secrets === null) {
-  setConnection(CONNECTION.INCOMPLETE, "Link incompleto");
-} else {
+  roomSeed = parsed.seed;
+  roomId = material.roomId;
+  secrets = {
+    memberToken: material.memberToken,
+    roomKey: material.roomKey,
+  };
   startSession();
+  render();
 }
-render();
+
+boot().catch(() => {
+  roomSeed = null;
+  roomId = null;
+  secrets = null;
+  setConnection(CONNECTION.UNAVAILABLE, UNSUPPORTED_BROWSER);
+  render();
+});

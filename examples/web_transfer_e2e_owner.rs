@@ -8,7 +8,7 @@
 //! ```sh
 //! cargo build --all-features --example web_transfer_e2e_owner
 //! ./target/debug/examples/web_transfer_e2e_owner 127.0.0.1:7835
-//! # stdout: WEB_TRANSFER_ROOM_URL=https://…/transfer/<room>#m=…&k=…
+//! # stdout: WEB_TRANSFER_ROOM_URL=https://…/transfer/#YVCYDRDYkjNIIyoIIHIH_w
 //! ```
 //!
 //! Only the `WEB_TRANSFER_ROOM_URL=` line is machine-read (by

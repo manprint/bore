@@ -6,6 +6,9 @@ mod support;
 
 use anyhow::{Context, Result};
 use bore_cli::server::Server;
+use bore_cli::web_transfer_protocol::{
+    decode_room_link_seed, derive_room_link_material, RoomLinkMaterial,
+};
 use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::time::Duration;
@@ -715,6 +718,11 @@ async fn t_web_http() -> Result<()> {
         &req(&format!("/transfer/{room_a}"), &host),
     )
     .await?;
+    let short_shell = http_exchange(
+        TcpStream::connect(("127.0.0.1", port)).await?,
+        &req("/transfer/", &host),
+    )
+    .await?;
     let shell_b = http_exchange(
         TcpStream::connect(("127.0.0.1", port)).await?,
         &req(&format!("/transfer/{room_b}"), &host),
@@ -749,6 +757,16 @@ async fn t_web_http() -> Result<()> {
     }
     let body = |resp: &str| resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
     assert_eq!(body(&shell_a), body(&shell_b), "shell bodies must match");
+    assert!(
+        short_shell.starts_with("HTTP/1.1 200"),
+        "short shell: {short_shell:.60}"
+    );
+    assert!(short_shell.contains(WEB_CSP), "short shell CSP");
+    assert_eq!(
+        body(&shell_a),
+        body(&short_shell),
+        "short shell body must match"
+    );
     assert!(
         !body(&shell_a).is_empty(),
         "shell carries the embedded page"
@@ -2342,22 +2360,28 @@ fn read_doc_text(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
     Ok(std::fs::read_to_string(path)?.replace("\r\n", "\n"))
 }
 
-/// Splits a room URL into `(room_id_hex, member_token_hex)`. The fragment is
-/// the capability: this is the only place the test reads it, and it never
-/// reaches the server.
+/// Splits a short room URL into `(room_id_hex, member_token_hex)`. The
+/// fragment carries only the seed; credentials are derived independently for
+/// the real control probe and never sent to the server as URL material.
 fn split_room_url(url: &str) -> Result<(String, String)> {
-    let (path, fragment) = url.split_once('#').context("room URL has no fragment")?;
-    let room = path
+    let material = room_link_material(url)?;
+    Ok((
+        material.room_id.to_string(),
+        material.member_token.to_string(),
+    ))
+}
+
+fn room_link_material(url: &str) -> Result<RoomLinkMaterial> {
+    let (path, seed_text) = url.split_once('#').context("room URL has no fragment")?;
+    let (_, transfer_tail) = path
         .rsplit_once("/transfer/")
-        .context("room URL has no /transfer/ path")?
-        .1
-        .to_string();
-    let member = fragment
-        .split('&')
-        .find_map(|part| part.strip_prefix("m="))
-        .context("fragment carries no member token")?
-        .to_string();
-    Ok((room, member))
+        .context("room URL has no /transfer/ path")?;
+    anyhow::ensure!(
+        transfer_tail.is_empty(),
+        "room URL has a non-canonical path"
+    );
+    let seed = decode_room_link_seed(seed_text)?;
+    Ok(derive_room_link_material(&seed))
 }
 
 /// `true` when the room still answers a real control hello with a welcome.
@@ -3287,11 +3311,7 @@ async fn t_web_nostore() -> Result<()> {
         .context("first line is `room: <url>`")?
         .to_string();
     let (room_hex, token_hex) = split_room_url(&url)?;
-    let room_key = url
-        .split_once('#')
-        .and_then(|(_, frag)| frag.split('&').find_map(|p| p.strip_prefix("k=")))
-        .context("fragment carries no room key")?
-        .to_string();
+    let room_key = room_link_material(&url)?.room_key.to_string();
 
     let host = format!("127.0.0.1:{port}");
     let origin = format!("http://127.0.0.1:{port}");

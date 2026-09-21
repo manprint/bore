@@ -24,9 +24,9 @@ use crate::mux;
 use crate::shared::{ClientMessage, ControlFrameSummary, Delimited, ServerMessage};
 use crate::transport::{self, Endpoint};
 use crate::web_transfer::{
-    MemberToken, OwnerToken, RoomId, RoomKey, RoomLinkSeed, WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+    MemberToken, OwnerToken, RoomId, RoomLinkSeed, WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
 };
-use crate::web_transfer_protocol::derive_room_link_material;
+use crate::web_transfer_protocol::{derive_room_link_material, encode_room_link_seed};
 
 /// Owner heartbeat period: the server reaps past its own (longer) deadline.
 pub const OWNER_HEARTBEAT: Duration = Duration::from_secs(20);
@@ -117,7 +117,7 @@ impl Default for OwnerClientConfig {
 /// A created room: the capability URL plus its public room ID. `Debug` shows
 /// the room ID only so logs can carry this value safely.
 pub struct CreatedRoom {
-    /// Full capability URL (fragment holds member token and room key).
+    /// Short capability URL (fragment holds the room-link seed).
     pub display_url: String,
     /// Room ID (URL path; safe to log).
     pub room_id: RoomId,
@@ -136,7 +136,6 @@ struct OwnerSecrets {
     room_id: RoomId,
     member: MemberToken,
     owner: OwnerToken,
-    key: RoomKey,
 }
 
 impl OwnerSecrets {
@@ -152,7 +151,6 @@ impl OwnerSecrets {
             room_id: material.room_id,
             member: material.member_token,
             owner,
-            key: material.room_key,
         })
     }
 
@@ -177,18 +175,14 @@ impl OwnerSecrets {
     }
 }
 
-/// Builds the temporary v1 capability URL: origin + `/transfer/<room>` +
-/// fragment secrets. Phase 1.2 replaces this with the short-link fragment;
-/// keeping it here during 1.1 makes the owner protocol cutover independently
-/// testable.
+/// Builds the canonical short capability URL: normalized origin plus
+/// `/transfer/#<22-char seed>`. The seed is the only capability material
+/// published by the owner process; the derived member token and room key stay
+/// in their respective peers.
 /// Pure, so the exact shape is unit-pinned without a network.
-pub fn build_display_url(
-    origin: &str,
-    room_id: RoomId,
-    member: &MemberToken,
-    key: &RoomKey,
-) -> String {
-    format!("{origin}/transfer/{room_id}#m={member}&k={key}")
+pub fn build_display_url(origin: &str, seed: RoomLinkSeed) -> String {
+    let origin = origin.trim_end_matches('/');
+    format!("{origin}/transfer/#{}", encode_room_link_seed(&seed))
 }
 
 /// Resume delay for attempt `n` (0-based): ladder, then the ceiling holds.
@@ -508,7 +502,7 @@ where
             bail!(OLD_SERVER_ERROR);
         }
     };
-    let display_url = build_display_url(&base_url, room_id, &secrets.member, &secrets.key);
+    let display_url = build_display_url(&base_url, secrets.seed);
     if created_tx
         .send(CreatedRoom {
             display_url: display_url.clone(),
@@ -788,7 +782,6 @@ mod tests {
         assert_eq!(first.seed, same_seed_other_owner.seed);
         assert_eq!(first.room_id, same_seed_other_owner.room_id);
         assert_eq!(first.member, same_seed_other_owner.member);
-        assert_eq!(first.key, same_seed_other_owner.key);
         assert_ne!(first.owner, same_seed_other_owner.owner);
     }
 
@@ -802,22 +795,17 @@ mod tests {
         assert_eq!(first.room_id, reconnected.room_id);
         assert_eq!(first.member, reconnected.member);
         assert_eq!(first.owner, reconnected.owner);
-        assert_eq!(first.key, reconnected.key);
     }
 
     #[test]
     fn owner_url_has_exact_path_and_fragment() {
-        let room = RoomId::from_bytes([0xabu8; 16]);
-        let member = MemberToken::from_bytes([0x11u8; 32]);
-        let key = RoomKey::from_bytes([0x33u8; 32]);
+        let seed = RoomLinkSeed::from_bytes([
+            0x61, 0x50, 0x98, 0x0d, 0x10, 0xd8, 0x92, 0x33, 0x48, 0x23, 0x2a, 0x08, 0x20, 0x72,
+            0x07, 0xff,
+        ]);
         assert_eq!(
-            build_display_url("https://files.example.com", room, &member, &key),
-            format!(
-                "https://files.example.com/transfer/{}#m={}&k={}",
-                "ab".repeat(16),
-                "11".repeat(32),
-                "33".repeat(32)
-            )
+            build_display_url("https://files.example.com/", seed),
+            "https://files.example.com/transfer/#YVCYDRDYkjNIIyoIIHIH_w"
         );
     }
 
@@ -825,11 +813,14 @@ mod tests {
     fn owner_logs_and_errors_redact_all_secrets() {
         let room = RoomId::from_bytes([0xabu8; 16]);
         let created = CreatedRoom {
-            display_url: "https://h/transfer/ab#m=11&k=33".to_string(),
+            display_url: "https://h/transfer/#YVCYDRDYkjNIIyoIIHIH_w".to_string(),
             room_id: room,
         };
         let debug = format!("{created:?}");
-        assert!(!debug.contains("11"), "display URL leaks: {debug}");
+        assert!(
+            !debug.contains("YVCYDRDYkjNIIyoIIHIH_w"),
+            "display URL leaks: {debug}"
+        );
         assert!(debug.contains(&"ab".repeat(16)), "room ID stays: {debug}");
     }
 
@@ -1174,8 +1165,7 @@ mod tests {
         }
     }
 
-    const CANARY_URL: &str =
-        "http://127.0.0.1:8080/transfer/aabb#m=CANARY-MEMBER-TOKEN&k=CANARY-ROOM-KEY";
+    const CANARY_URL: &str = "http://127.0.0.1:8080/transfer/#YVCYDRDYkjNIIyoIIHIH_w";
 
     #[test]
     fn web_stdout_is_exactly_two_lines_and_flush_precedes_open() {
@@ -1250,6 +1240,7 @@ mod tests {
         assert!(!warning.contains("CANARY-MEMBER-TOKEN"));
         assert!(!warning.contains("CANARY-ROOM-KEY"));
         assert!(!warning.contains("#m="));
+        assert!(!warning.contains("YVCYDRDYkjNIIyoIIHIH_w"));
     }
 
     #[tokio::test]

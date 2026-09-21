@@ -49,6 +49,7 @@ async function readmeRoom() {
     throw new Error("stale embedded app bundle: run cargo build --all-features after npm run build");
   }
   // README, "Opening a room": bore transfer web --to https://files.example.com
+  // stdout: room: https://…/transfer/#YVCYDRDYkjNIIyoIIHIH_w
   owner = spawn(boreBin, ["transfer", "web", "--to", `http://127.0.0.1:${port}`], {
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -72,7 +73,7 @@ async function readmeRoom() {
     owner.stdout.on("error", reject);
   });
   expect(lines[0]).toMatch(
-    /^room: http:\/\/127\.0\.0\.1:\d+\/transfer\/[0-9a-f]{32}#m=[0-9a-f]{64}&k=[0-9a-f]{64}$/,
+    /^room: http:\/\/127\.0\.0\.1:\d+\/transfer\/#[A-Za-z0-9_-]{22}$/,
   );
   expect(lines[1].trim()).toBe("room active; press Ctrl+C to close");
   return lines[0].slice("room: ".length).trim();

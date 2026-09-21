@@ -55,7 +55,7 @@ async function readmeRoom() {
 
   // README, "Opening a room":
   //   bore transfer web --to https://files.example.com
-  //   room: https://…/transfer/8f1c…#m=…&k=…
+  //   room: https://…/transfer/#YVCYDRDYkjNIIyoIIHIH_w
   //   room active; press Ctrl+C to close
   owner = spawn(boreBin, ["transfer", "web", "--to", `http://127.0.0.1:${port}`], {
     stdio: ["ignore", "pipe", "pipe"],
@@ -77,7 +77,7 @@ async function readmeRoom() {
     owner.stdout.on("error", reject);
   });
   // Exactly the two documented lines, in the documented order.
-  expect(url[0]).toMatch(/^room: http:\/\/127\.0\.0\.1:\d+\/transfer\/[0-9a-f]{32}#m=[0-9a-f]{64}&k=[0-9a-f]{64}$/);
+  expect(url[0]).toMatch(/^room: http:\/\/127\.0\.0\.1:\d+\/transfer\/#[A-Za-z0-9_-]{22}$/);
   expect(url[1].trim()).toBe("room active; press Ctrl+C to close");
   expect(url.slice(2).join("").trim()).toBe("");
   return url[0].slice("room: ".length).trim();

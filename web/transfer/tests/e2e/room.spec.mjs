@@ -10,6 +10,7 @@ import net from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test, expect } from "@playwright/test";
+import { deriveShortLinkMaterial } from "./helpers.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
 const boreBin = join(root, "target", "debug", "bore");
@@ -21,6 +22,7 @@ let port;
 let roomUrl;
 let roomId;
 let memberToken;
+let roomSeedText;
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -91,12 +93,10 @@ test.beforeAll(async () => {
     });
     owner.stdout.on("error", reject);
   });
-  const parsed = new URL(roomUrl);
-  roomId = parsed.pathname.split("/").pop();
-  memberToken = parsed.hash.match(/m=([0-9a-f]{64})/)?.[1];
-  if (!roomId || !memberToken) {
-    throw new Error(`unparseable room URL ${roomUrl}`);
-  }
+  const material = deriveShortLinkMaterial(roomUrl);
+  roomId = material.roomId;
+  memberToken = material.memberToken;
+  roomSeedText = material.seedText;
 }, 60_000);
 
 test.afterAll(async () => {
@@ -195,22 +195,21 @@ test.describe.serial("room", () => {
     return page.locator("#peer-list li").count();
   }
 
-  test("valid link joins, scrubs the fragment and stores session secrets", async ({
+  test("valid link joins and preserves the short fragment without storage", async ({
     browser,
   }) => {
     const peer = await openRoom(browser, roomUrl);
     const { page, failures } = peer;
     await expectConnected(page);
-    // Fragment gone from the address bar, secrets in this tab only.
-    expect(page.url()).not.toContain("#");
-    expect(page.url()).toContain(`/transfer/${roomId}`);
-    const stored = await page.evaluate(
-      (id) => window.sessionStorage.getItem(`bore-transfer-v1:${id}`),
-      roomId,
-    );
-    expect(JSON.parse(stored).m).toBe(memberToken);
-    const localCount = await page.evaluate(() => window.localStorage.length);
-    expect(localCount).toBe(0);
+    // The capability stays in the address bar and derived secrets stay only
+    // in module memory, including after the session reaches the ready state.
+    expect(page.url()).toBe(roomUrl);
+    expect(page.url()).toContain(`#${roomSeedText}`);
+    const storage = await page.evaluate(() => ({
+      session: window.sessionStorage.length,
+      local: window.localStorage.length,
+    }));
+    expect(storage).toEqual({ session: 0, local: 0 });
     // Self peer renders with the default name.
     await expect(page.locator("#peer-list li")).toHaveCount(1);
     // Production path: no development note element at all.
@@ -259,7 +258,7 @@ test.describe.serial("room", () => {
     await peer.page.reload();
     await expectConnected(peer.page);
     await expect(peer.page.locator("#peer-list li")).toHaveCount(1, { timeout: 10_000 });
-    expect(peer.page.url()).not.toContain("#");
+    expect(peer.page.url()).toBe(roomUrl);
     expect(peer.failures).toEqual([]);
     await peer.context.close();
   });
@@ -270,7 +269,8 @@ test.describe.serial("room", () => {
     await peer.page.locator("#copy-link").click();
     await expect(peer.page.locator("#app-toast")).toContainText("copiato", { timeout: 10_000 });
     const copied = await peer.page.evaluate(() => window.__clipboard);
-    expect(copied).toContain(`/transfer/${roomId}#m=${memberToken}`);
+    expect(copied).toBe(roomUrl);
+    expect(peer.page.url()).toBe(roomUrl);
     const other = await openRoom(browser, copied);
     await expectConnected(other.page);
     await expect(peer.page.locator("#peer-list li")).toHaveCount(2, { timeout: 10_000 });
@@ -312,7 +312,7 @@ test.describe.serial("room", () => {
 
   test("invalid links never connect", async ({ browser }) => {
     // Unknown room, valid shape: no welcome, room becomes unavailable.
-    const ghost = `http://127.0.0.1:${port}/transfer/${"f".repeat(32)}#m=${memberToken}&k=${"b".repeat(64)}`;
+    const ghost = `http://127.0.0.1:${port}/transfer/#AAAAAAAAAAAAAAAAAAAAAA`;
     const lost = await openRoom(browser, ghost);
     await expect(lost.page.locator("#room-status")).toContainText("non disponibile", {
       timeout: 15_000,
@@ -328,7 +328,7 @@ test.describe.serial("room", () => {
     expect(lost.failures).toEqual([]);
     await lost.context.close();
     // Malformed fragment on a valid path: incomplete, not a socket opens.
-    const broken = await openRoom(browser, `http://127.0.0.1:${port}/transfer/${roomId}#m=1`);
+    const broken = await openRoom(browser, `http://127.0.0.1:${port}/transfer/#m=1`);
     await expect(broken.page.locator("#room-status")).toContainText("Link incompleto", {
       timeout: 10_000,
     });

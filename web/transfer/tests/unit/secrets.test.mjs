@@ -1,116 +1,58 @@
-// Unit tests: room-URL secrets (parse, store, recover, scrub, rebuild).
+// Unit tests: persistent short room-link parsing and canonical rebuilding.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
-  SESSION_KEY_PREFIX,
-  buildRoomUrl,
-  clearSecrets,
-  loadSecrets,
-  parseRoomUrl,
-  saveSecrets,
-  scrubFragment,
-  storageKey,
+  buildShortRoomUrl,
+  parseShortRoomUrl,
 } from "../../src/secrets.js";
+import {
+  decodeRoomLinkSeed,
+  encodeRoomLinkSeed,
+} from "../../src/crypto.js";
 
-const ROOM = "0123456789abcdef0123456789abcdef";
-const MEMBER = "a".repeat(64);
-const KEY = "b".repeat(64);
-const GOOD = `https://files.example/transfer/${ROOM}#m=${MEMBER}&k=${KEY}`;
+const ORIGIN = "https://files.example";
+const SEED_TEXT = "YVCYDRDYkjNIIyoIIHIH_w";
+const SEED = decodeRoomLinkSeed(SEED_TEXT);
+const GOOD = `${ORIGIN}/transfer/#${SEED_TEXT}`;
 
-function memStorage() {
-  const map = new Map();
-  return {
-    getItem: (key) => (map.has(key) ? map.get(key) : null),
-    setItem: (key, value) => map.set(key, String(value)),
-    removeItem: (key) => map.delete(key),
-    keys: () => [...map.keys()],
-  };
-}
-
-function memHistory() {
-  return {
-    replaced: null,
-    replaceState(_state, _title, url) {
-      this.replaced = url;
-    },
-  };
-}
-
-describe("room secrets", () => {
-  it("fragment_is_validated_stored_per_room_and_scrubbed", () => {
-    const parsed = parseRoomUrl(GOOD);
-    assert.equal(parsed.roomId, ROOM);
-    assert.equal(parsed.memberToken, MEMBER);
-    assert.equal(parsed.roomKey, KEY);
-    assert.equal(storageKey(ROOM), `${SESSION_KEY_PREFIX}${ROOM}`);
-
-    const storage = memStorage();
-    saveSecrets(storage, ROOM, parsed);
-    assert.deepEqual(storage.keys(), [storageKey(ROOM)]);
-
-    const history = memHistory();
-    scrubFragment(history, `https://files.example/transfer/${ROOM}`);
-    assert.equal(history.replaced, `https://files.example/transfer/${ROOM}`);
-    assert.ok(!history.replaced.includes("#"));
-    assert.ok(!history.replaced.includes(MEMBER));
-    assert.ok(!history.replaced.includes(KEY));
-  });
-
-  it("reload_recovers_only_same_tab_secrets", () => {
-    const storage = memStorage();
-    assert.equal(loadSecrets(storage, ROOM), null);
-    saveSecrets(storage, ROOM, { memberToken: MEMBER, roomKey: KEY });
-    assert.deepEqual(loadSecrets(storage, ROOM), { memberToken: MEMBER, roomKey: KEY });
-    // Another room and a fresh tab recover nothing.
-    assert.equal(loadSecrets(storage, "f".repeat(32)), null);
-    assert.equal(loadSecrets(memStorage(), ROOM), null);
-    // Corrupt or misshapen entries recover nothing (never throw).
-    storage.setItem(storageKey(ROOM), "not-json");
-    assert.equal(loadSecrets(storage, ROOM), null);
-    storage.setItem(storageKey(ROOM), JSON.stringify({ m: "short", k: KEY }));
-    assert.equal(loadSecrets(storage, ROOM), null);
-    // Clearing drops the room silently, twice.
-    clearSecrets(storage, ROOM);
-    clearSecrets(storage, ROOM);
-    assert.equal(loadSecrets(storage, ROOM), null);
-  });
-
-  it("copy_link_reconstructs_only_inside_user_action", () => {
-    const rebuilt = buildRoomUrl("https://files.example", ROOM, {
-      memberToken: MEMBER,
-      roomKey: KEY,
+describe("room links", () => {
+  it("parses_and_builds_the_canonical_short_link", () => {
+    assert.deepEqual(parseShortRoomUrl(GOOD), {
+      seed: SEED,
+      seedText: SEED_TEXT,
     });
-    assert.equal(rebuilt, GOOD);
-    // Round-trips through the validator (what the next tab parses).
-    assert.deepEqual(parseRoomUrl(rebuilt), { roomId: ROOM, memberToken: MEMBER, roomKey: KEY });
+    assert.equal(buildShortRoomUrl(`${ORIGIN}/`, SEED), GOOD);
+    assert.equal(encodeRoomLinkSeed(SEED), SEED_TEXT);
   });
 
-  it("no_secret_is_rendered_logged_or_persisted_elsewhere", () => {
-    const storage = memStorage();
-    saveSecrets(storage, ROOM, { memberToken: MEMBER, roomKey: KEY });
-    // Exactly one key, room-scoped; the value carries only m/k.
-    assert.deepEqual(storage.keys(), [`${SESSION_KEY_PREFIX}${ROOM}`]);
-    const stored = JSON.parse(storage.getItem(storageKey(ROOM)));
-    assert.deepEqual(Object.keys(stored).sort(), ["k", "m"]);
-    // Storage keys never embed secret material.
-    assert.ok(!storageKey(ROOM).includes(MEMBER));
-    assert.ok(!storageKey(ROOM).includes(KEY));
-  });
-
-  it("malformed_links_throw_without_side_effects", () => {
+  it("rejects_legacy_forms_queries_and_noncanonical_seeds", () => {
     const bad = [
-      "https://files.example/transfer/short#m=1&k=2",
-      `https://files.example/transfer/${ROOM.toUpperCase()}#m=${MEMBER}&k=${KEY}`,
-      `https://files.example/transfer/${ROOM}#m=${MEMBER}`,
-      `https://files.example/transfer/${ROOM}#m=${MEMBER}&k=${KEY}&x=1`,
-      `https://files.example/transfer/${ROOM}#m=${MEMBER}&m=${MEMBER}&k=${KEY}`,
-      `https://files.example/transfer/${ROOM}#m=${"Z".repeat(64)}&k=${KEY}`,
-      `https://files.example/transfer/${ROOM}#k=${KEY}`,
-      `https://files.example/transfer/${ROOM}`,
-      "https://files.example/other",
+      `${ORIGIN}/transfer/${"c5e230000f48c492799fe9ea32d18d8c"}#m=${"a".repeat(64)}&k=${"b".repeat(64)}`,
+      `${ORIGIN}/transfer/#${"!".repeat(22)}`,
+      `${ORIGIN}/transfer/#${SEED_TEXT.slice(0, 21)}`,
+      `${ORIGIN}/transfer/#${SEED_TEXT}?query=1`,
+      `${ORIGIN}/transfer/?room=1#${SEED_TEXT}`,
+      `${ORIGIN}/transfer/#${SEED_TEXT}&extra`,
+      `${ORIGIN}/other/#${SEED_TEXT}`,
     ];
     for (const href of bad) {
-      assert.throws(() => parseRoomUrl(href), undefined, href);
+      assert.throws(() => parseShortRoomUrl(href), undefined, href);
+    }
+  });
+
+  it("does_not_export_the_legacy_storage_or_fragment_apis", async () => {
+    const secrets = await import("../../src/secrets.js");
+    for (const obsolete of [
+      "SESSION_KEY_PREFIX",
+      "storageKey",
+      "saveSecrets",
+      "loadSecrets",
+      "clearSecrets",
+      "scrubFragment",
+      "parseRoomUrl",
+      "buildRoomUrl",
+    ]) {
+      assert.equal(secrets[obsolete], undefined, obsolete);
     }
   });
 });

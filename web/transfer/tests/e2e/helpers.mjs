@@ -5,7 +5,7 @@
 import { spawn } from "node:child_process";
 import net from "node:net";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, hkdfSync } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +36,55 @@ export const boreBin =
 export const ownerBin =
   process.env.BORE_E2E_OWNER_BIN ??
   join(root, "target", "debug", "examples", "web_transfer_e2e_owner");
+
+const ROOM_LINK_SEED_TEXT_BYTES = 22;
+const ROOM_LINK_SALT = Buffer.from("bore-web-transfer-link-v1");
+const ROOM_LINK_INFO = {
+  roomId: Buffer.from("bore-web-transfer-room-id-v1"),
+  memberToken: Buffer.from("bore-web-transfer-member-token-v1"),
+  roomKey: Buffer.from("bore-web-transfer-room-key-v1"),
+};
+
+function decodeRoomLinkSeed(seedText) {
+  if (!/^[A-Za-z0-9_-]{22}$/.test(seedText)) {
+    throw new Error("invalid short room-link seed");
+  }
+  const seed = Buffer.from(seedText, "base64url");
+  if (
+    seed.length !== 16 ||
+    seed.toString("base64url") !== seedText
+  ) {
+    throw new Error("invalid short room-link seed");
+  }
+  return seed;
+}
+
+/** Independent Node oracle for the browser's three HKDF calls. */
+export function deriveShortLinkMaterial(roomUrl) {
+  let parsed;
+  try {
+    parsed = new URL(roomUrl);
+  } catch {
+    throw new Error("invalid short room URL");
+  }
+  const seedText = parsed.hash.startsWith("#") ? parsed.hash.slice(1) : "";
+  if (
+    parsed.pathname !== "/transfer/" ||
+    parsed.search !== "" ||
+    seedText.length !== ROOM_LINK_SEED_TEXT_BYTES
+  ) {
+    throw new Error("invalid short room URL");
+  }
+  const seed = decodeRoomLinkSeed(seedText);
+  const derive = (info) =>
+    Buffer.from(hkdfSync("sha256", seed, ROOM_LINK_SALT, info, 32));
+  return {
+    seedText,
+    roomId: derive(ROOM_LINK_INFO.roomId).subarray(0, 16).toString("hex"),
+    memberToken: derive(ROOM_LINK_INFO.memberToken).toString("hex"),
+    roomKey: derive(ROOM_LINK_INFO.roomKey).toString("hex"),
+  };
+}
 
 export function freePort() {
   return new Promise((resolve, reject) => {
@@ -91,11 +140,12 @@ export function externalRoomEnv() {
   if (!roomUrl) {
     return null;
   }
-  const url = new URL(roomUrl);
+  const parsed = new URL(roomUrl);
+  const material = deriveShortLinkMaterial(roomUrl);
   return {
     roomUrl,
-    port: Number(url.port),
-    roomId: url.pathname.split("/").pop(),
+    port: Number(parsed.port),
+    ...material,
     cleanup: () => {},
   };
 }
@@ -230,21 +280,18 @@ export async function spawnRoomEnv({
     });
     owner.stdout.on("error", reject);
   });
-  const parsed = new URL(roomUrl);
-  const roomId = parsed.pathname.split("/").pop();
-  const memberToken = parsed.hash.match(/m=([0-9a-f]{64})/)?.[1];
-  const roomKey = parsed.hash.match(/k=([0-9a-f]{64})/)?.[1];
-  if (!roomId || !memberToken || !roomKey) {
+  let material;
+  try {
+    material = deriveShortLinkMaterial(roomUrl);
+  } catch {
     server.kill("SIGKILL");
     owner.kill("SIGKILL");
-    throw new Error(`unparseable room URL ${roomUrl}`);
+    throw new Error("unparseable short room URL");
   }
   return {
     port,
     roomUrl,
-    roomId,
-    memberToken,
-    roomKey,
+    ...material,
     // Kills ONLY the lease holder: the server keeps running, so the room's
     // own expiry is what the test observes.
     killOwner: () => owner.kill("SIGKILL"),

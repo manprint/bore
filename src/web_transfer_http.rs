@@ -265,10 +265,14 @@ fn is_canonical_id(s: &str) -> bool {
 pub enum WebDecision {
     /// Not under `/transfer/` — the caller falls through to vhost/admin.
     NotWeb,
-    /// `GET|HEAD /transfer/<room>` — generic shell, 200 even if absent.
+    /// `GET|HEAD /transfer/` or `/transfer/<room>` — generic shell, 200 even
+    /// if the room is absent. The short-link cutover keeps the room seed in
+    /// the URL fragment, so the shell itself no longer needs an ID in its
+    /// path; the legacy canonical path remains accepted for compatibility.
     RoomShell {
-        /// Canonical room ID from the path (never checked for existence).
-        room: String,
+        /// Optional canonical room ID from the legacy path (never checked for
+        /// existence). A short-link shell has no room ID in its path.
+        room: Option<String>,
     },
     /// `GET|HEAD /transfer/assets/{app.js,app.css,offer-worker.js,stage-worker.js}`.
     Asset {
@@ -367,9 +371,14 @@ pub fn classify(method: &str, target: &str) -> WebDecision {
         }
     }
     if let Some(room) = path.strip_prefix("/transfer/") {
-        if room.is_empty() || room.contains('/') {
-            // `/transfer/` bare or deeper unknown shape — malformed web path.
+        if room.contains('/') {
             return WebDecision::BadRequest;
+        }
+        if room.is_empty() {
+            if method != "GET" && method != "HEAD" {
+                return WebDecision::MethodNotAllowed;
+            }
+            return WebDecision::RoomShell { room: None };
         }
         if !is_canonical_id(room) {
             return WebDecision::BadRequest;
@@ -378,7 +387,7 @@ pub fn classify(method: &str, target: &str) -> WebDecision {
             return WebDecision::MethodNotAllowed;
         }
         return WebDecision::RoomShell {
-            room: room.to_string(),
+            room: Some(room.to_string()),
         };
     }
     WebDecision::NotWeb
@@ -2077,14 +2086,22 @@ mod tests {
         assert_eq!(
             classify("GET", &format!("/transfer/{present}")),
             WebDecision::RoomShell {
-                room: present.to_string()
+                room: Some(present.to_string())
             }
         );
         assert_eq!(
             classify("GET", &format!("/transfer/{absent}")),
             WebDecision::RoomShell {
-                room: absent.to_string()
+                room: Some(absent.to_string())
             }
+        );
+        assert_eq!(
+            classify("GET", "/transfer/"),
+            WebDecision::RoomShell { room: None }
+        );
+        assert_eq!(
+            classify("HEAD", "/transfer/"),
+            WebDecision::RoomShell { room: None }
         );
         // HEAD is served like GET; anything else is 405, never content.
         assert!(matches!(
@@ -2158,7 +2175,6 @@ mod tests {
             "0123456789abcdef0123456789abcde",
             "0123456789abcdef0123456789abcdef00",
             "0123456789abcdef0123456789abcdeg",
-            "",
         ] {
             assert_eq!(
                 classify("GET", &format!("/transfer/{bad}")),

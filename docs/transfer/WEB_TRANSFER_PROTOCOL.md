@@ -1,7 +1,7 @@
 # Web Transfer Protocol v1 (normative)
 
 > **Status:** normative for `bore transfer web` v1. Breaking changes require v2.
-> **Fixtures:** [`../../tests/fixtures/web_transfer/v1/`](../../tests/fixtures/web_transfer/v1/)
+> **Fixtures:** [`../../tests/fixtures/web_transfer/v1/`](../../tests/fixtures/web_transfer/v1/) and the deterministic link vector [`../../tests/fixtures/web_transfer/link_v1.json`](../../tests/fixtures/web_transfer/link_v1.json)
 > — every example below is executed by `cargo test --all-features --lib
 > web_transfer` and `npm run check --prefix web/transfer`. Prose-only examples
 > are non-normative; on conflict the fixtures and the byte tables win.
@@ -14,17 +14,51 @@ whitespace: `RoomId`/`PeerId`/`OfferId`/`TransferId`/`AttemptId` 32 chars
 `RelayTicket` 32 chars (16 bytes); `requestId` 32 chars (16 bytes).
 Uppercase, short, long or non-hex input is rejected (`INVALID_MESSAGE`).
 
-Room URL (capability; secrets live in the fragment, never the query):
+Room URL (capability; the only accepted browser form):
 
 ```text
-https://<authority>/transfer/<room:32hex>#m=<member:64hex>&k=<key:64hex>
+https://<authority>/transfer/#<seed22>
 ```
 
-The fragment never reaches the server (RFC 3986 §3.5): the browser moves
-`m`/`k` into `sessionStorage` on load and scrubs them from the address bar.
-`m` authenticates the peer on the control WebSocket; `k` never leaves the
-browser (payload key derivation only). The CLI owner holds a separate
-`OwnerToken` and never sees `m`/`k`.
+`seed22` is exactly 16 random bytes encoded as 22 unpadded Base64URL
+characters (`A-Z`, `a-z`, `0-9`, `-`, `_`). Decoding is canonical: padding,
+classic Base64 symbols, whitespace, percent escapes, Unicode, wrong decoded
+length and non-zero trailing pad bits are rejected. The old
+`32hex#m=<member>&k=<key>` form and the old room path are rejected before a
+WebSocket is opened.
+
+The fragment never reaches the server (RFC 3986 §3.5). It intentionally stays
+visible in the address bar and browser history so reload and copy-link keep
+working; the browser holds only the derived values in module memory. There is
+no browser-storage recovery path, no fragment removal and no JavaScript crypto
+fallback. A bare `/transfer/` may serve the shell, but it is not a room link
+and opens no control socket.
+
+The seed is the sole browser input. It is expanded with three independent
+HKDF-SHA256 calls, each using the same IKM and salt but a different info label:
+
+| Value | Salt | Info | Output | Use |
+|---|---|---|---:|---|
+| `RoomId` | `bore-web-transfer-link-v1` | `bore-web-transfer-room-id-v1` | first 16 bytes of 32 | registry and WebSocket route |
+| `MemberToken` | `bore-web-transfer-link-v1` | `bore-web-transfer-member-token-v1` | 32 bytes | browser `hello` capability |
+| `RoomKey` | `bore-web-transfer-link-v1` | `bore-web-transfer-room-key-v1` | 32 bytes | payload encryption and MAC |
+
+The full HKDF output is 32 bytes for all three derivations; only `RoomId` is
+truncated. The labels are domain separators, so the values are independent
+even though the seed is shared. The link has 128-bit effective security: the
+derived 256-bit values do not add entropy beyond the 16-byte seed.
+
+The native owner holds a separate random `OwnerToken`; it is never derived
+from the seed. Its owner-control handshake is protocol v2 and sends the
+client-selected `RoomId`. That v2 applies only to native owner create/resume,
+not to the browser payload/control protocol, which remains v1 with
+`bore-transfer-v1`.
+
+Room creation installs the requested derived `RoomId` atomically only when it
+is vacant. A collision returns a generic room-unavailable error, does not
+echo the seed or derived secrets, and leaves the existing room, owner lease
+and relay mode unchanged. A collision is therefore safe even though the
+derived room identifier is public.
 
 ## 2. Control envelopes (WebSocket text, `bore-transfer-v1`)
 
@@ -376,11 +410,20 @@ nonce = u64be(seq) || u32be(0)   (12 bytes; unique per key via seq)
 
 ## 7. Key hygiene
 
-Room key, member/owner tokens and attempt keys never reach the server log,
-admin state or error text. Attempt IDs, keys and sequences are fresh per
-attempt; sequence numbers restart at `0` per attempt. Nonce reuse across
-messages is impossible by construction (attempt-bound key + per-key unique
-seq); reusing a sequence within an attempt is a decode error.
+The seed and `RoomKey` never reach server logs, admin state, control frames or
+error text. `MemberToken` crosses the browser control WebSocket only in the
+initial `hello`; it is never logged, repeated or put in a URL after derivation.
+The native `OwnerToken` is used only by owner create/resume and is compared by
+hash, never echoed. Attempt IDs, keys and sequences are fresh per attempt;
+sequence numbers restart at `0` per attempt. Nonce reuse across messages is
+impossible by construction (attempt-bound key + per-key unique seq); reusing a
+sequence within an attempt is a decode error.
+
+The fragment is not a server request field, but it is intentionally observable
+to the user agent: it can appear in the address bar, browser history,
+screenshots and browser-extension or same-origin script observations. This
+protocol does not promise secrecy against a compromised page, extension or
+same-origin code.
 
 ### 7.1 A refusal says only "no"
 
@@ -408,6 +451,13 @@ unusable — so this is a client obligation, gated by
 `remote_markup_and_bidi_do_not_execute_or_spoof_controls` and by the browser
 half of `T-WEB-XSS-CSRF`.
 
+### 7.3 Room-link derivation
+
+The browser must use native WebCrypto HKDF with the exact table in §1. A
+missing or failing `deriveBits` implementation is a pre-WebSocket unsupported
+browser error; the page must preserve the fragment and construct no control
+socket. No fallback KDF, storage recovery or server lookup is permitted.
+
 ## 8. Bounds reference
 
 Timings/sizes live as `WEB_TRANSFER_*` constants in `src/web_transfer.rs`:
@@ -423,17 +473,23 @@ segment 255 B.
 
 ## 9. Fixture generation
 
-`tests/fixtures/web_transfer/v1/*.json` are generated, not handwritten:
+The deterministic short-link vector is
+`tests/fixtures/web_transfer/link_v1.json`; the wire and payload vectors remain
+under `tests/fixtures/web_transfer/v1/`. These fixtures are deterministic and
+must not be regenerated with a fresh random seed on each run.
 
 ```sh
-node web/transfer/tests/unit/vectors.mjs > /tmp/vectors.json  # inputs → outputs
+node --test web/transfer/tests/unit/crypto.test.mjs
 ```
 
-`crypto-vectors.json` carries `{inputs, expected}`; both the Rust codecs
+The crypto test reads `link_v1.json`, checks the Rust/browser constants and
+derivation, and uses independent `node:crypto.hkdfSync` as the oracle for the
+three outputs. Both the Rust implementation
 (`src/web_transfer_protocol.rs`) and the JS mirror
-(`web/transfer/src/{protocol,crypto}.js`) must reproduce `expected`
-byte-for-byte. `T-WEB-E2EE-FIXTURE` runs the JS runner live and compares
-against the Rust computation.
+(`web/transfer/src/crypto.js`) must reproduce the expected values byte-for-byte.
+`T-WEB-E2EE-FIXTURE` runs the JS side live and compares against the Rust
+computation. The fixture is the normative source for the seed, salt, labels,
+truncation and expected hex values.
 
 ## 10. Error table
 

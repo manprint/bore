@@ -1,6 +1,6 @@
 # Web Transfer Short Links — Implementation State
 
-Last updated: 2026-09-22 (sub-phase 1.3 closed; sub-phase 1.4 opened)
+Last updated: 2026-09-22 (sub-phase 1.4 closed; sub-phase 1.5 opened)
 
 ## 0. Resume protocol
 
@@ -24,11 +24,11 @@ All implementation and verification units are assigned to `agent:gpt-5.6-luna` a
 | Field | Value |
 |---|---|
 | Mode | Execute; WIP commits enabled |
-| Current sub-phase | `1.4` |
+| Current sub-phase | `1.5` |
 | Status | `OPEN` |
-| Intent | Protocol documentation |
+| Intent | Bundle, package and phase regression |
 | Phase file | `phase_02.md` |
-| Next action | Execute sub-phase `1.4` in `phase_02.md` |
+| Next action | Execute sub-phase `1.5` in `phase_02.md` |
 | Assigned model | `agent:gpt-5.6-luna` |
 | Baseline branch | `dev` |
 | Baseline commit | `ad7d0f47d497` |
@@ -71,8 +71,8 @@ Commit mode: WIP commits ON — explicit operator request on 2026-09-21; commit 
 | 5 | `1.1` | `agent:gpt-5.6-luna` | Native owner protocol v2 and client-selected room ID | DONE |
 | 6 | `1.2` | `agent:gpt-5.6-luna` | CLI/browser switch to persistent short fragment | DONE |
 | 7 | `1.3` | `agent:gpt-5.6-luna` | Negative, legacy-removal, and secrecy tests | DONE |
-| 8 | `1.4` | `agent:gpt-5.6-luna` | Protocol documentation | TODO |
-| 9 | `1.5` | `agent:gpt-5.6-luna` | Rebuild assets/package and run regressions | TODO |
+| 8 | `1.4` | `agent:gpt-5.6-luna` | Protocol documentation | DONE |
+| 9 | `1.5` | `agent:gpt-5.6-luna` | Rebuild assets/package and run regressions | OPEN |
 | 10 | `1.6` | `agent:gpt-5.6-luna` | Phase 1 README synchronization | TODO |
 | 11 | `2.1` | `agent:gpt-5.6-luna` | Chromium/Firefox/WebKit compatibility gates | TODO |
 | 12 | `2.2` | `agent:gpt-5.6-luna` | Chrome/Edge/Brave branded smoke coverage | TODO |
@@ -97,6 +97,7 @@ Append one row after every completed or attempted sub-phase. Use exact commands,
 | 2026-09-21 | `1.1` | `src/shared.rs`, `src/web_transfer.rs`, `src/web_transfer_cli.rs`, `tests/web_transfer_test.rs`, `STATE.md` | `cargo fmt --all -- --check`; `cargo clippy --locked --all-features --all-targets -- -D warnings`; `cargo build --locked --all-features`; `cargo test --locked --all-features --lib web_transfer -- --test-threads=1`; `cargo test --locked --all-features --test web_transfer_test -- --test-threads=1`; `npm run check --prefix web/transfer`; `git diff --check` | PASS | 194 Rust unit tests; web-transfer integration 40 passed, 1 ignored benchmark; 218 browser tests; v2 owner wire, exact requested IDs, duplicate protection, old/missing-ID rejection, derived reconnect invariants and response mismatch secrecy are covered; URL remains intentionally long for 1.2 cutover | `758e1f2` |
 | 2026-09-21 | `1.2` | `src/web_transfer_cli.rs`, `src/web_transfer_http.rs`, `tests/web_transfer_test.rs`, `examples/web_transfer_e2e_owner.rs`, `web/transfer/src/{main.js,secrets.js}`, `web/transfer/dist/app.js`, `web/transfer/tests/{unit,e2e}`, `STATE.md` | `cargo fmt --all -- --check`; `cargo clippy --locked --all-features --all-targets -- -D warnings`; `cargo build --locked --all-features`; `cargo build --locked --all-features --example web_transfer_e2e_owner`; `cargo test --locked --all-features --lib web_transfer -- --test-threads=1`; `cargo test --locked --all-features --test web_transfer_test -- --test-threads=1`; `npm run check --prefix web/transfer`; `npm run test:e2e -- tests/e2e/room.spec.mjs`; `git diff --check` | PASS | 194 Rust unit tests; web-transfer integration 40 passed, 1 ignored benchmark; 216 browser unit tests; room E2E 27 passed across Chromium/Firefox/WebKit; HTTP shell 14 unit tests plus `t_web_http`; canonical short fragment persists, storage stays empty, copy/reload/two-peer flow passes, and bare `/transfer/` serves the shell | `15477f3` |
 | 2026-09-22 | `1.3` | `src/web_transfer.rs`, `src/web_transfer_cli.rs`, `web/transfer/tests/unit/secrets.test.mjs`, `web/transfer/tests/e2e/{helpers.mjs,room.spec.mjs,security.spec.mjs}`, `STATE.md` | `cargo fmt --all -- --check`; `cargo clippy --locked --all-features --all-targets -- -D warnings`; `cargo build --locked --all-features`; `cargo test --locked --all-features --lib web_transfer -- --test-threads=1`; `cargo test --locked --all-features --test web_transfer_test -- --test-threads=1`; `npm run check --prefix web/transfer`; `npm run test:e2e -- tests/e2e/room.spec.mjs`; `npm run test:e2e -- tests/e2e/security.spec.mjs`; `git diff --check` | PASS | 195 Rust unit tests; web-transfer integration 40 passed, 1 ignored benchmark; 216 browser unit tests; room E2E 30/30 and security E2E 15/15 across Chromium/Firefox/WebKit; collision returns generic error and preserves the existing room; three red-checks (legacy parser, replaceState, early startSession) failed as expected and were restored | pending |
+| 2026-09-22 | `1.4` | `docs/transfer/WEB_TRANSFER_PROTOCOL.md`, `STATE.md` (fixture read-only verification) | `node --test tests/unit/crypto.test.mjs` from `web/transfer`; `cargo test --locked --all-features --lib web_transfer_protocol -- --test-threads=1`; deterministic doc/fixture literal audit; `git diff --check` | PASS | 16 browser crypto tests; 35 Rust protocol tests; canonical short URL, strict rejection, three HKDF labels/outputs, owner v2 separation, 128-bit security, collision behavior, key hygiene and fragment threat model verified against `link_v1.json`; no legacy session-storage/scrub wording remains | `pending` |
 
 ## 5. Decision and deviation ledger
 
@@ -123,7 +124,7 @@ evidence during execution.
 | Rust clippy, all features, warnings denied | PASS | `cargo clippy --all-features --all-targets -- -D warnings` |
 | Rust unit/integration tests, all features | PASS | `cargo test --locked --all-features --lib web_transfer -- --test-threads=1`: 195 passed, 0 failed; `cargo test --locked --all-features --test web_transfer_test -- --test-threads=1`: 40 passed, 1 ignored |
 | Rust build, all features | PASS | `cargo build --locked --all-features` |
-| Browser unit tests | PASS | `npm run check --prefix web/transfer`: 218 passed, 0 failed |
+| Browser unit tests | PASS | `npm run check --prefix web/transfer`: 216 passed, 0 failed |
 | Browser Chromium E2E | PASS | room 30/30 + security 5/5 on Chromium; all selected suites passed |
 | Browser Firefox E2E | PASS | room 30/30 + security 5/5 on Firefox; all selected suites passed |
 | Browser WebKit E2E | PASS | room 30/30 + security 5/5 on WebKit; all selected suites passed |
@@ -137,7 +138,7 @@ evidence during execution.
 | Secret/fragment leak audit | PASS | Runtime/source audit plus unit/E2E assertions: no storage recovery, no legacy parser, seed/member/key absent from error/URL paths; negative literals remain only in dedicated tests/docs |
 | `git diff --check` | PASS | `git diff --check` |
 
-In-flight: 1.4 — opened after 1.3 PASS; protocol documentation and fixture synchronization are next.
+In-flight: 1.5 — opened after 1.4 PASS; regenerate package assets and run the phase regression gates.
 
 Branded-browser rules:
 

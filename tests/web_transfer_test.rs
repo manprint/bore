@@ -3596,12 +3596,24 @@ async fn t_web_room_life() -> Result<()> {
     // --- L1: abnormal loss holds the room for the grace, then destroys it ---
     let (mut owner, owner_pid, room_hex, token_hex) = spawn_owner(&binary, port).await?;
 
-    let mut a = support::WsPeer::connect(&host, &room_hex, &origin).await?;
+    let mut a = support::WsPeer::connect_from(
+        std::net::Ipv4Addr::new(127, 0, 0, 2),
+        &host,
+        &room_hex,
+        &origin,
+    )
+    .await?;
     a.hello(&token_hex, Some("A")).await?;
     let (_, welcome_a) = control_msg(&a.next_text(wait).await?.expect("welcome A"));
     let peer_a = welcome_a["peerId"].as_str().unwrap().to_string();
     read_snapshot(&mut a).await?;
-    let mut b = support::WsPeer::connect(&host, &room_hex, &origin).await?;
+    let mut b = support::WsPeer::connect_from(
+        std::net::Ipv4Addr::new(127, 0, 0, 3),
+        &host,
+        &room_hex,
+        &origin,
+    )
+    .await?;
     b.hello(&token_hex, Some("B")).await?;
     let (_, welcome_b) = control_msg(&b.next_text(wait).await?.expect("welcome B"));
     let peer_b = welcome_b["peerId"].as_str().unwrap().to_string();
@@ -3784,7 +3796,13 @@ async fn t_web_room_life() -> Result<()> {
 
     // --- L2: a clean close is immediate, never graced ------------------------
     let (mut owner2, owner2_pid, room2, token2) = spawn_owner(&binary, port).await?;
-    let mut c = support::WsPeer::connect(&host, &room2, &origin).await?;
+    let mut c = support::WsPeer::connect_from(
+        std::net::Ipv4Addr::new(127, 0, 0, 4),
+        &host,
+        &room2,
+        &origin,
+    )
+    .await?;
     c.hello(&token2, Some("C")).await?;
     assert_eq!(
         control_msg(&c.next_text(wait).await?.expect("welcome C")).0,

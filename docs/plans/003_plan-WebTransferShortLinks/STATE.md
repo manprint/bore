@@ -1,6 +1,6 @@
 # Web Transfer Short Links — Implementation State
 
-Last updated: 2026-09-21 (execution started; WIP commits enabled by explicit operator request)
+Last updated: 2026-09-21 (sub-phase 0.2 closed; 0.3 opened)
 
 ## 0. Resume protocol
 
@@ -24,11 +24,11 @@ All implementation and verification units are assigned to `agent:gpt-5.6-luna` a
 | Field | Value |
 |---|---|
 | Mode | Execute; WIP commits enabled |
-| Current sub-phase | `0.2` |
-| Status | `none` |
-| Intent | Mirror the seed codec and HKDF derivation in browser WebCrypto |
+| Current sub-phase | `0.3` |
+| Status | `OPEN` |
+| Intent | Cross-language contract and red-check audit |
 | Phase file | `phase_01.md` |
-| Next action | Open `phase_01.md` and execute sub-phase `0.2` exactly as written |
+| Next action | Execute sub-phase `0.3` in `phase_01.md` |
 | Assigned model | `agent:gpt-5.6-luna` |
 | Baseline branch | `dev` |
 | Baseline commit | `ad7d0f47d497` |
@@ -65,7 +65,7 @@ Commit mode: WIP commits ON — explicit operator request on 2026-09-21; commit 
 | Order | Sub-phase | Owner | Purpose | Status |
 |---:|---|---|---|---|
 | 1 | `0.1` | `agent:gpt-5.6-luna` | Rust seed codec, HKDF derivation, fixture | DONE |
-| 2 | `0.2` | `agent:gpt-5.6-luna` | Browser codec/KDF mirror and failure behavior | TODO |
+| 2 | `0.2` | `agent:gpt-5.6-luna` | Browser codec/KDF mirror and failure behavior | DONE |
 | 3 | `0.3` | `agent:gpt-5.6-luna` | Cross-language contract and red-check audit | TODO |
 | 4 | `0.4` | `agent:gpt-5.6-luna` | Phase 0 README synchronization | TODO |
 | 5 | `1.1` | `agent:gpt-5.6-luna` | Native owner protocol v2 and client-selected room ID | TODO |
@@ -87,10 +87,11 @@ earlier units.
 
 Append one row after every completed or attempted sub-phase. Use exact commands, not summaries.
 
-| Date/time | Sub-phase | Files changed | Gates run | Result | Notes |
-|---|---|---|---|---|---|
-| 2026-09-21 | Planning | `docs/plans/003_plan-WebTransferShortLinks/*` | Plan structure checks only | Plan authored | No production code or tests changed/run |
-| 2026-09-21 | `0.1` | `Cargo.toml`, `Cargo.lock`, `src/web_transfer.rs`, `src/web_transfer_protocol.rs`, `tests/fixtures/web_transfer/link_v1.json`, `STATE.md` | `cargo fmt --all -- --check`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo build --locked --all-features`; `cargo test --locked --all-features --lib web_transfer`; `git diff --check` | PASS | 189 web_transfer tests passed; first WIP commit recorded after state close |
+| Date/time | Sub-phase | Files changed | Gates run | Result | Notes | Commit |
+|---|---|---|---|---|---|---|
+| 2026-09-21 | Planning | `docs/plans/003_plan-WebTransferShortLinks/*` | Plan structure checks only | Plan authored | No production code or tests changed/run | — |
+| 2026-09-21 | `0.1` | `Cargo.toml`, `Cargo.lock`, `src/web_transfer.rs`, `src/web_transfer_protocol.rs`, `tests/fixtures/web_transfer/link_v1.json`, `STATE.md` | `cargo fmt --all -- --check`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo build --locked --all-features`; `cargo test --locked --all-features --lib web_transfer`; `git diff --check` | PASS | 189 web_transfer tests passed | `09ed559` |
+| 2026-09-21 | `0.2` | `web/transfer/src/crypto.js`, `web/transfer/src/secrets.js`, `web/transfer/tests/unit/crypto.test.mjs`, `web/transfer/dist/app.js`, `web/transfer/dist/offer-worker.js`, `STATE.md` | `npm run check --prefix web/transfer`; `rg -n '\\bBuffer\\b' web/transfer/src web/transfer/tests/unit/crypto.test.mjs web/transfer/dist`; `git diff --check` | PASS | 217 browser unit tests passed; bundle rebuild reproduced tracked assets; no Buffer references; offer-worker changed because the normal build emitted the shared browser update | pending |
 
 ## 5. Decision and deviation ledger
 
@@ -117,7 +118,7 @@ evidence during execution.
 | Rust clippy, all features, warnings denied | PASS | `cargo clippy --all-features --all-targets -- -D warnings` |
 | Rust unit/integration tests, all features | PASS | `cargo test --locked --all-features --lib web_transfer`: 189 passed, 0 failed |
 | Rust build, all features | PASS | `cargo build --locked --all-features` |
-| Browser unit tests | NOT RUN | Implementation not started |
+| Browser unit tests | PASS | `npm run check --prefix web/transfer`: 217 passed, 0 failed |
 | Browser Chromium E2E | NOT RUN | Implementation not started |
 | Browser Firefox E2E | NOT RUN | Implementation not started |
 | Browser WebKit E2E | NOT RUN | Implementation not started |
@@ -125,12 +126,12 @@ evidence during execution.
 | Branded Edge smoke | NOT RUN | Implementation not started |
 | Branded Brave smoke | NOT RUN | Implementation not started |
 | Web Transfer shell/E2E harness | NOT RUN | Implementation not started |
-| Asset rebuild cleanliness | NOT RUN | Implementation not started |
+| Asset rebuild cleanliness | PASS | `npm run check --prefix web/transfer`: unit asset reproducibility assertion passed; normal build completed |
 | README contract audit | NOT RUN | Implementation not started |
 | Secret/fragment leak audit | NOT RUN | Implementation not started |
 | `git diff --check` | PASS | `git diff --check` |
 
-In-flight: none — tree consistent.
+In-flight: 0.3 — claimed — no implementation written yet.
 
 Branded-browser rules:
 

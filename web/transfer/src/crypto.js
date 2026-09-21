@@ -1,7 +1,20 @@
 // Web-transfer crypto helpers (protocol v1). WebCrypto only, no transport.
 // Mirror of the Rust codecs in src/web_transfer_protocol.rs: every formula,
 // domain separator and byte layout must stay identical on both sides.
-const textEncoder = new TextEncoder();
+export const textEncoder = new TextEncoder();
+
+export const ROOM_LINK_SEED_BYTES = 16;
+export const ROOM_LINK_SEED_TEXT_BYTES = 22;
+export const ROOM_LINK_ID_BYTES = 16;
+export const ROOM_LINK_MEMBER_TOKEN_BYTES = 32;
+export const ROOM_LINK_KEY_BYTES = 32;
+
+export const ROOM_LINK_HKDF_SALT = textEncoder.encode("bore-web-transfer-link-v1");
+export const ROOM_LINK_ROOM_ID_INFO = textEncoder.encode("bore-web-transfer-room-id-v1");
+export const ROOM_LINK_MEMBER_TOKEN_INFO = textEncoder.encode(
+  "bore-web-transfer-member-token-v1",
+);
+export const ROOM_LINK_ROOM_KEY_INFO = textEncoder.encode("bore-web-transfer-room-key-v1");
 
 function getSubtle() {
   const subtle = globalThis.crypto?.subtle;
@@ -31,14 +44,90 @@ export async function sha256Hex(data) {
   return bytesToHex(new Uint8Array(digest));
 }
 
-export async function hkdf32(ikm, salt, info) {
-  const key = await getSubtle().importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
-  const bits = await getSubtle().deriveBits(
+export async function hkdf32(ikm, salt, info, subtle = getSubtle()) {
+  const key = await subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
+  const bits = await subtle.deriveBits(
     { name: "HKDF", hash: "SHA-256", salt, info },
     key,
     256,
   );
   return new Uint8Array(bits);
+}
+
+function invalidRoomLinkSeed() {
+  return new Error("invalid room link seed");
+}
+
+function encodeBase64Url(bytes) {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return globalThis
+    .btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+/// Encodes exactly 16 bytes in canonical unpadded Base64URL form.
+export function encodeRoomLinkSeed(seed) {
+  if (!(seed instanceof Uint8Array) || seed.length !== ROOM_LINK_SEED_BYTES) {
+    throw invalidRoomLinkSeed();
+  }
+  const encoded = encodeBase64Url(seed);
+  if (encoded.length !== ROOM_LINK_SEED_TEXT_BYTES) {
+    throw invalidRoomLinkSeed();
+  }
+  return encoded;
+}
+
+/// Decodes a canonical unpadded Base64URL room-link seed.
+export function decodeRoomLinkSeed(value) {
+  if (
+    typeof value !== "string" ||
+    value.length !== ROOM_LINK_SEED_TEXT_BYTES ||
+    !/^[A-Za-z0-9_-]{22}$/.test(value)
+  ) {
+    throw invalidRoomLinkSeed();
+  }
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "==";
+  let binary;
+  try {
+    binary = globalThis.atob(padded);
+  } catch {
+    throw invalidRoomLinkSeed();
+  }
+  if (binary.length !== ROOM_LINK_SEED_BYTES) {
+    throw invalidRoomLinkSeed();
+  }
+  const seed = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  if (encodeBase64Url(seed) !== value) {
+    throw invalidRoomLinkSeed();
+  }
+  return seed;
+}
+
+/// Derives the three short-link outputs with independent HKDF labels.
+export async function deriveRoomLinkMaterial(seed, subtle) {
+  if (!(seed instanceof Uint8Array) || seed.length !== ROOM_LINK_SEED_BYTES) {
+    throw invalidRoomLinkSeed();
+  }
+  const crypto = subtle ?? getSubtle();
+  try {
+    const [roomIdFull, memberToken, roomKey] = await Promise.all([
+      hkdf32(seed, ROOM_LINK_HKDF_SALT, ROOM_LINK_ROOM_ID_INFO, crypto),
+      hkdf32(seed, ROOM_LINK_HKDF_SALT, ROOM_LINK_MEMBER_TOKEN_INFO, crypto),
+      hkdf32(seed, ROOM_LINK_HKDF_SALT, ROOM_LINK_ROOM_KEY_INFO, crypto),
+    ]);
+    return {
+      roomId: bytesToHex(roomIdFull.slice(0, ROOM_LINK_ID_BYTES)),
+      memberToken: bytesToHex(memberToken),
+      roomKey: bytesToHex(roomKey),
+    };
+  } catch {
+    throw new Error("room link derivation failed");
+  }
 }
 
 export async function hmacSign(keyBytes, data) {

@@ -6,6 +6,12 @@
 // copy these values anywhere else — no localStorage, IndexedDB, attributes,
 // text nodes, exceptions or console output.
 
+import {
+  decodeRoomLinkSeed,
+  encodeRoomLinkSeed,
+  ROOM_LINK_SEED_TEXT_BYTES,
+} from "./crypto.js";
+
 export const SESSION_KEY_PREFIX = "bore-transfer-v1:";
 
 const ROOM_ID_RE = /^[0-9a-f]{32}$/;
@@ -57,6 +63,35 @@ export function parseRoomUrl(href) {
     throw new Error("room fragment must carry 64-hex m and k");
   }
   return { roomId, memberToken, roomKey };
+}
+
+/// Parses the additive short-link form /transfer/#<22 Base64URL chars>.
+/// The fragment is intentionally left intact by callers; this helper only
+/// validates and decodes it for the future cutover path.
+export function parseShortRoomUrl(href) {
+  if (typeof href !== "string" || /[\t\n\r ]/.test(href)) {
+    throw new Error("short room link is invalid");
+  }
+  let url;
+  try {
+    url = new URL(href, "http://room.invalid");
+  } catch {
+    throw new Error("short room link is invalid");
+  }
+  if (
+    url.pathname !== "/transfer/" ||
+    url.search !== "" ||
+    url.hash.length !== ROOM_LINK_SEED_TEXT_BYTES + 1 ||
+    !url.hash.startsWith("#")
+  ) {
+    throw new Error("short room link is invalid");
+  }
+  const seedText = url.hash.slice(1);
+  try {
+    return { seed: decodeRoomLinkSeed(seedText), seedText };
+  } catch {
+    throw new Error("short room link is invalid");
+  }
 }
 
 /// sessionStorage key for one room's secrets.
@@ -115,4 +150,10 @@ export function scrubFragment(history, cleanHref) {
 export function buildRoomUrl(origin, roomId, secrets) {
   const url = `${origin}/transfer/${roomId}#m=${secrets.memberToken}&k=${secrets.roomKey}`;
   return url;
+}
+
+/// Builds the canonical additive short-link form without a query or secret
+/// material outside the visible fragment.
+export function buildShortRoomUrl(origin, seed) {
+  return `${origin}/transfer/#${encodeRoomLinkSeed(seed)}`;
 }

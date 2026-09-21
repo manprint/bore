@@ -1,5 +1,5 @@
 // Crypto unit tests: roots, keys, nonces and encrypted frames against the
-// shared fixtures. Mirror of the Rust codec tests.
+// shared fixtures, plus the short-link seed and WebCrypto KDF mirror.
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
@@ -10,6 +10,9 @@ import {
   FINAL_RAW_BYTES,
   attemptKey,
   bytesToHex,
+  decodeRoomLinkSeed,
+  deriveRoomLinkMaterial,
+  encodeRoomLinkSeed,
   fileRoot,
   frameNonce,
   hexToBytes,
@@ -19,10 +22,17 @@ import {
   manifestKey,
   openFrame,
   openFrameWithKey,
+  ROOM_LINK_HKDF_SALT,
+  ROOM_LINK_MEMBER_TOKEN_INFO,
+  ROOM_LINK_ROOM_ID_INFO,
+  ROOM_LINK_ROOM_KEY_INFO,
+  ROOM_LINK_SEED_BYTES,
+  ROOM_LINK_SEED_TEXT_BYTES,
   sealFrame,
   sealFrameWithKey,
   sha256Hex,
 } from "../../src/crypto.js";
+import { buildShortRoomUrl, parseShortRoomUrl } from "../../src/secrets.js";
 
 const fixtureDir = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -214,5 +224,111 @@ describe("web-transfer crypto", () => {
     msg = (await sealFrame(key, 0, 1, new TextEncoder().encode("hi"))).slice();
     new DataView(msg.buffer).setUint32(12, 0xffffffff, false);
     await assert.rejects(openFrame(key, msg, 0));
+  });
+});
+
+const decodeText = (bytes) => new TextDecoder().decode(bytes);
+const FIXTURE = JSON.parse(
+  readFileSync(
+    new URL("../../../../tests/fixtures/web_transfer/link_v1.json", import.meta.url),
+    "utf8",
+  ),
+);
+const SEED = decodeRoomLinkSeed(FIXTURE.seed_base64url);
+
+describe("short-link seed and KDF", () => {
+  it("short_url_round_trips_exact_seed", () => {
+    const url = buildShortRoomUrl("https://files.example", SEED);
+    assert.equal(url, `https://files.example/transfer/#${FIXTURE.seed_base64url}`);
+    const parsed = parseShortRoomUrl(url);
+    assert.deepEqual([...parsed.seed], [...SEED]);
+    assert.equal(parsed.seedText, FIXTURE.seed_base64url);
+  });
+
+  it("shared_fixture_derives_exact_rust_values", async () => {
+    assert.equal(decodeText(ROOM_LINK_HKDF_SALT), FIXTURE.salt);
+    assert.equal(
+      bytesToHex(ROOM_LINK_ROOM_ID_INFO),
+      bytesToHex(new TextEncoder().encode(FIXTURE.info.room_id)),
+    );
+    assert.equal(
+      bytesToHex(ROOM_LINK_MEMBER_TOKEN_INFO),
+      bytesToHex(new TextEncoder().encode(FIXTURE.info.member_token)),
+    );
+    assert.equal(
+      bytesToHex(ROOM_LINK_ROOM_KEY_INFO),
+      bytesToHex(new TextEncoder().encode(FIXTURE.info.room_key)),
+    );
+    const material = await deriveRoomLinkMaterial(SEED);
+    assert.equal(material.roomId, FIXTURE.room_id_hex);
+    assert.equal(material.memberToken, FIXTURE.member_token_hex);
+    assert.equal(material.roomKey, FIXTURE.room_key_hex);
+  });
+
+  it("malformed_short_urls_are_rejected", () => {
+    const bad = [
+      `https://files.example/transfer/#${FIXTURE.seed_base64url}=`,
+      `https://files.example/transfer/#${FIXTURE.seed_base64url.slice(0, 21)}x`,
+      `https://files.example/transfer/#${FIXTURE.seed_base64url.slice(0, 21)}+`,
+      `https://files.example/transfer/#${FIXTURE.seed_base64url.slice(0, 21)}/`,
+      `https://files.example/transfer/#${FIXTURE.seed_base64url.slice(0, 10)}%3D`,
+      `https://files.example/transfer/#${FIXTURE.seed_base64url.slice(0, 21)}`,
+      `https://files.example/transfer/#${FIXTURE.seed_base64url.slice(0, 22)} `,
+    ];
+    for (const href of bad) {
+      assert.throws(() => parseShortRoomUrl(href), /short room link is invalid/);
+    }
+  });
+
+  it("noncanonical_final_sextet_is_rejected", () => {
+    const noncanonical = `${FIXTURE.seed_base64url.slice(0, -1)}x`;
+    assert.throws(() => decodeRoomLinkSeed(noncanonical), /invalid room link seed/);
+  });
+
+  it("query_and_old_path_are_rejected_by_short_parser", () => {
+    assert.throws(
+      () => parseShortRoomUrl(`https://files.example/transfer/?seed=${FIXTURE.seed_base64url}`),
+      /short room link is invalid/,
+    );
+    assert.throws(
+      () => parseShortRoomUrl(`https://files.example/transfer/${"a".repeat(32)}#${FIXTURE.seed_base64url}`),
+      /short room link is invalid/,
+    );
+  });
+
+  it("missing_subtle_fails_without_fallback", async () => {
+    const noSubtle = {
+      importKey: async () => {
+        throw new Error("subtle unavailable");
+      },
+      deriveBits: async () => {
+        throw new Error("fallback must not run");
+      },
+    };
+    await assert.rejects(
+      () => deriveRoomLinkMaterial(SEED, noSubtle),
+      (error) => error.message === "room link derivation failed",
+    );
+  });
+
+  it("deriveBits_failure_does_not_include_the_seed", async () => {
+    const noSubtle = {
+      importKey: async () => ({ mocked: true }),
+      deriveBits: async () => {
+        throw new Error(`failed for ${FIXTURE.seed_base64url}`);
+      },
+    };
+    await assert.rejects(
+      () => deriveRoomLinkMaterial(SEED, noSubtle),
+      (error) =>
+        error.message === "room link derivation failed" &&
+        !error.message.includes(FIXTURE.seed_base64url),
+    );
+  });
+
+  it("seed_codec_uses_exact_widths", () => {
+    assert.equal(SEED.length, ROOM_LINK_SEED_BYTES);
+    assert.equal(FIXTURE.seed_base64url.length, ROOM_LINK_SEED_TEXT_BYTES);
+    assert.equal(encodeRoomLinkSeed(SEED), FIXTURE.seed_base64url);
   });
 });

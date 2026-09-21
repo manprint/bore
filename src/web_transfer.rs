@@ -28,6 +28,16 @@ use tracing::{debug, warn};
 
 /// Browser/native protocol version. Versioned envelopes reject anything else.
 pub const WEB_TRANSFER_PROTOCOL_VERSION: u16 = 1;
+/// Number of random bytes carried by a short Web Transfer room link.
+pub const ROOM_LINK_SEED_BYTES: usize = 16;
+/// Canonical Base64URL characters for [`ROOM_LINK_SEED_BYTES`] bytes.
+pub const ROOM_LINK_SEED_TEXT_BYTES: usize = 22;
+/// Bytes retained from the RoomId derivation output.
+pub const ROOM_ID_BYTES: usize = 16;
+/// Bytes in the derived member capability token.
+pub const MEMBER_TOKEN_BYTES: usize = 32;
+/// Bytes in the derived room encryption key.
+pub const ROOM_KEY_BYTES: usize = 32;
 /// Owner-lease heartbeat the CLI sends on an idle control connection.
 pub const WEB_TRANSFER_CLIENT_HEARTBEAT: Duration = Duration::from_secs(20);
 /// Control-connection liveness timeout (server reaper, tick-checked).
@@ -111,6 +121,31 @@ pub const WEB_TRANSFER_MAX_DISPLAY_NAME_CHARS: usize = 48;
 pub const WEB_TRANSFER_MAX_PATH_BYTES: usize = 4096;
 /// Largest accepted single manifest path segment (bytes).
 pub const WEB_TRANSFER_MAX_PATH_SEGMENT_BYTES: usize = 255;
+
+/// The 128-bit bearer capability encoded in a short room URL.
+///
+/// Deliberately does not implement `Display`: the seed must only be rendered
+/// by the canonical URL helper, never through an arbitrary log or error path.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RoomLinkSeed([u8; ROOM_LINK_SEED_BYTES]);
+
+impl RoomLinkSeed {
+    /// Builds a seed from the exact-width random bytes used by the link codec.
+    pub fn from_bytes(bytes: [u8; ROOM_LINK_SEED_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the raw seed for codec and KDF operations.
+    pub(crate) fn as_bytes(&self) -> &[u8; ROOM_LINK_SEED_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RoomLinkSeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RoomLinkSeed(redacted)")
+    }
+}
 
 /// Parses strict lowercase hex into `[u8; N]`: exact length, `0-9a-f` only.
 /// Shared with the protocol codecs so both sides accept identical input.
@@ -253,6 +288,13 @@ define_web_id!(MemberToken, 32, secret);
 define_web_id!(OwnerToken, 32, secret);
 define_web_id!(RoomKey, 32, secret);
 define_web_id!(RelayTicket, 16, secret);
+
+impl RoomId {
+    /// Returns whether this ID is usable for client-side room generation.
+    pub fn is_nonzero(&self) -> bool {
+        self.0.iter().any(|byte| *byte != 0)
+    }
+}
 
 /// SHA-256 over arbitrary bytes.
 fn sha256_bytes(data: &[u8]) -> [u8; 32] {

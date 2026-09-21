@@ -9,17 +9,91 @@
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use anyhow::{bail, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ring::{aead, digest, hkdf};
 
 use crate::web_transfer::{
-    AttemptId, OfferId, PeerId, RelayTicket, RoomId, RoomKey, TransferId, WebTransferLimits,
-    WEB_TRANSFER_MAX_CONTROL_BYTES,
+    AttemptId, MemberToken, OfferId, PeerId, RelayTicket, RoomId, RoomKey, RoomLinkSeed,
+    TransferId, WebTransferLimits, MEMBER_TOKEN_BYTES, ROOM_ID_BYTES, ROOM_KEY_BYTES,
+    ROOM_LINK_SEED_BYTES, ROOM_LINK_SEED_TEXT_BYTES, WEB_TRANSFER_MAX_CONTROL_BYTES,
 };
 
 /// Browser control-protocol version; envelopes with another `v` are rejected.
 pub const PROTOCOL_VERSION: u16 = crate::web_transfer::WEB_TRANSFER_PROTOCOL_VERSION;
 /// Exact WebSocket subprotocol required on `/transfer/ws/control/<room>`.
 pub const CONTROL_SUBPROTOCOL: &str = "bore-transfer-v1";
+
+/// Salt shared by the native and browser short-link derivations.
+pub const ROOM_LINK_HKDF_SALT: &[u8] = b"bore-web-transfer-link-v1";
+/// HKDF domain separator for the client-selected RoomId.
+pub const ROOM_LINK_ROOM_ID_INFO: &[u8] = b"bore-web-transfer-room-id-v1";
+/// HKDF domain separator for the member capability token.
+pub const ROOM_LINK_MEMBER_TOKEN_INFO: &[u8] = b"bore-web-transfer-member-token-v1";
+/// HKDF domain separator for the room encryption key.
+pub const ROOM_LINK_ROOM_KEY_INFO: &[u8] = b"bore-web-transfer-room-key-v1";
+
+/// Material derived independently from one short-link seed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomLinkMaterial {
+    /// Client-selected room identifier derived from the seed.
+    pub room_id: RoomId,
+    /// Member capability derived from the seed; never logged.
+    pub member_token: MemberToken,
+    /// Payload encryption key derived from the seed; never sent to the server.
+    pub room_key: RoomKey,
+}
+
+/// Encodes a seed using the only accepted short-link representation.
+pub fn encode_room_link_seed(seed: &RoomLinkSeed) -> String {
+    let encoded = URL_SAFE_NO_PAD.encode(seed.as_bytes());
+    debug_assert_eq!(encoded.len(), ROOM_LINK_SEED_TEXT_BYTES);
+    encoded
+}
+
+/// Decodes a canonical, unpadded Base64URL room-link seed.
+pub fn decode_room_link_seed(value: &str) -> Result<RoomLinkSeed> {
+    let invalid = || anyhow::anyhow!("invalid room link seed");
+    if value.len() != ROOM_LINK_SEED_TEXT_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(invalid());
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(value).map_err(|_| invalid())?;
+    if decoded.len() != ROOM_LINK_SEED_BYTES {
+        return Err(invalid());
+    }
+    let seed = RoomLinkSeed::from_bytes(decoded.try_into().map_err(|_| invalid())?);
+    if encode_room_link_seed(&seed) != value {
+        return Err(invalid());
+    }
+    Ok(seed)
+}
+
+/// Derives the RoomId, member capability and room key with separate HKDF
+/// expansions and distinct domain-separation labels.
+pub fn derive_room_link_material(seed: &RoomLinkSeed) -> RoomLinkMaterial {
+    let room_id_full = hkdf32(seed.as_bytes(), ROOM_LINK_HKDF_SALT, ROOM_LINK_ROOM_ID_INFO);
+    let member_token: [u8; MEMBER_TOKEN_BYTES] = hkdf32(
+        seed.as_bytes(),
+        ROOM_LINK_HKDF_SALT,
+        ROOM_LINK_MEMBER_TOKEN_INFO,
+    );
+    let room_key: [u8; ROOM_KEY_BYTES] = hkdf32(
+        seed.as_bytes(),
+        ROOM_LINK_HKDF_SALT,
+        ROOM_LINK_ROOM_KEY_INFO,
+    );
+
+    let mut room_id = [0u8; ROOM_ID_BYTES];
+    room_id.copy_from_slice(&room_id_full[..ROOM_ID_BYTES]);
+    RoomLinkMaterial {
+        room_id: RoomId::from_bytes(room_id),
+        member_token: MemberToken::from_bytes(member_token),
+        room_key: RoomKey::from_bytes(room_key),
+    }
+}
 
 /// Client → server control message names, in protocol order.
 pub const CLIENT_TYPES: &[&str] = &[
@@ -2713,7 +2787,7 @@ impl hkdf::KeyType for OneKey {
 }
 
 /// HKDF-SHA256 to exactly 32 bytes.
-fn hkdf32(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
+pub(crate) fn hkdf32(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
     let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, salt);
     let prk = salt.extract(ikm);
     let mut out = [0u8; 32];
@@ -3028,6 +3102,142 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         );
         std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("read fixture {name}"))
+    }
+
+    fn link_fixture() -> serde_json::Value {
+        let path = format!(
+            "{}/tests/fixtures/web_transfer/link_v1.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read short-link fixture"))
+            .expect("parse short-link fixture")
+    }
+
+    fn fixture_seed() -> RoomLinkSeed {
+        let fixture = link_fixture();
+        let bytes = hex::decode(fixture["seed_hex"].as_str().unwrap()).unwrap();
+        RoomLinkSeed::from_bytes(bytes.try_into().unwrap())
+    }
+
+    #[test]
+    fn fixture_example_encodes_to_22_chars() {
+        let fixture = link_fixture();
+        let seed = fixture_seed();
+        let encoded = encode_room_link_seed(&seed);
+        assert_eq!(
+            encoded,
+            fixture["seed_base64url"]
+                .as_str()
+                .expect("fixture seed text")
+        );
+        assert_eq!(encoded.len(), ROOM_LINK_SEED_TEXT_BYTES);
+        assert!(!encoded.contains('='));
+        assert_eq!(decode_room_link_seed(&encoded).unwrap(), seed);
+    }
+
+    #[test]
+    fn fixture_example_derives_exact_material() {
+        let fixture = link_fixture();
+        let material = derive_room_link_material(&fixture_seed());
+        assert_eq!(fixture["algorithm"].as_str(), Some("HKDF-SHA256"));
+        assert_eq!(
+            fixture["salt"].as_str(),
+            std::str::from_utf8(ROOM_LINK_HKDF_SALT).ok()
+        );
+        assert_eq!(
+            fixture["info"]["room_id"].as_str(),
+            std::str::from_utf8(ROOM_LINK_ROOM_ID_INFO).ok()
+        );
+        assert_eq!(
+            fixture["info"]["member_token"].as_str(),
+            std::str::from_utf8(ROOM_LINK_MEMBER_TOKEN_INFO).ok()
+        );
+        assert_eq!(
+            fixture["info"]["room_key"].as_str(),
+            std::str::from_utf8(ROOM_LINK_ROOM_KEY_INFO).ok()
+        );
+        assert_eq!(
+            material.room_id.to_string(),
+            fixture["room_id_hex"].as_str().unwrap()
+        );
+        assert_eq!(
+            material.member_token.to_string(),
+            fixture["member_token_hex"].as_str().unwrap()
+        );
+        assert_eq!(
+            material.room_key.to_string(),
+            fixture["room_key_hex"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn seed_debug_is_redacted() {
+        let seed = fixture_seed();
+        let debug = format!("{seed:?}");
+        assert_eq!(debug, "RoomLinkSeed(redacted)");
+        assert!(!debug.contains(&encode_room_link_seed(&seed)));
+        assert!(!debug.contains("6150980d10d8923348232a08207207ff"));
+    }
+
+    #[test]
+    fn seed_decoder_rejects_padding_and_standard_base64() {
+        let fixture = link_fixture();
+        let encoded = fixture["seed_base64url"].as_str().unwrap().to_owned();
+        for invalid in [
+            format!("{}=", &encoded[..21]),
+            format!("+{}", &encoded[1..]),
+            format!("/{}", &encoded[1..]),
+            format!("{}%3D", &encoded[..18]),
+            format!(" {}", encoded),
+        ] {
+            let error = decode_room_link_seed(&invalid).expect_err("non-canonical seed accepted");
+            assert_eq!(error.to_string(), "invalid room link seed");
+        }
+    }
+
+    #[test]
+    fn seed_decoder_rejects_noncanonical_tail_bits() {
+        let fixture = link_fixture();
+        let encoded = fixture["seed_base64url"].as_str().unwrap();
+        let mut noncanonical = encoded.to_owned();
+        noncanonical.pop();
+        noncanonical.push('x');
+        assert!(noncanonical.len() == ROOM_LINK_SEED_TEXT_BYTES);
+        assert_eq!(
+            decode_room_link_seed(&noncanonical)
+                .expect_err("non-zero Base64URL pad bits accepted")
+                .to_string(),
+            "invalid room link seed"
+        );
+    }
+
+    #[test]
+    fn all_zero_room_id_is_not_accepted_for_generation() {
+        assert!(!RoomId::from_bytes([0; ROOM_ID_BYTES]).is_nonzero());
+        assert!(derive_room_link_material(&fixture_seed())
+            .room_id
+            .is_nonzero());
+    }
+
+    #[test]
+    fn distinct_room_link_labels_produce_distinct_outputs() {
+        let seed = fixture_seed();
+        let outputs = [
+            hkdf32(seed.as_bytes(), ROOM_LINK_HKDF_SALT, ROOM_LINK_ROOM_ID_INFO),
+            hkdf32(
+                seed.as_bytes(),
+                ROOM_LINK_HKDF_SALT,
+                ROOM_LINK_MEMBER_TOKEN_INFO,
+            ),
+            hkdf32(
+                seed.as_bytes(),
+                ROOM_LINK_HKDF_SALT,
+                ROOM_LINK_ROOM_KEY_INFO,
+            ),
+        ];
+        assert_ne!(outputs[0], outputs[1]);
+        assert_ne!(outputs[0], outputs[2]);
+        assert_ne!(outputs[1], outputs[2]);
     }
 
     /// 6.3: a repeated key is refused, at every nesting level, on both the

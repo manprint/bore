@@ -59,6 +59,7 @@ ssh-gateway = ["dep:russh", "dep:argon2", "dep:password-hash", "dep:ssh-key", "d
 
 [dependencies]
 anyhow = { version = "1.0.56", features = ["backtrace"] }
+base64 = "0.22.1"
 bytes = "1"
 async_zip = { version = "0.0.18", default-features = false, features = ["tokio"] }
 clap = { version = "4.5.0", features = ["derive", "env"] }

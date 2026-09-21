@@ -1,0 +1,14 @@
+{
+  "algorithm": "HKDF-SHA256",
+  "seed_base64url": "YVCYDRDYkjNIIyoIIHIH_w",
+  "seed_hex": "6150980d10d8923348232a08207207ff",
+  "salt": "bore-web-transfer-link-v1",
+  "info": {
+    "room_id": "bore-web-transfer-room-id-v1",
+    "member_token": "bore-web-transfer-member-token-v1",
+    "room_key": "bore-web-transfer-room-key-v1"
+  },
+  "room_id_hex": "c5e230000f48c492799fe9ea32d18d8c",
+  "member_token_hex": "cfa20bcf70b2a0fd23ba06651bdfb9c6291f66df8e9deb5b342974fc2e3d45d6",
+  "room_key_hex": "585579f6a4e991c4b8e632e9d79fb73d89fe02e60ec43a8a69158f704cbc61d2"
+}

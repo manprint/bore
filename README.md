@@ -2456,7 +2456,8 @@ stores nothing on disk.
 
 > **What this release does.** One browser publishes **a file, a selection of files or
 > a whole folder**, another browser downloads it — a single file as itself, and a
-> folder or a multi-file selection as **one ZIP archive** — and the bytes
+> folder or a multi-file selection as **one ZIP archive** or one of its files
+> individually from the offer tree — and the bytes
 > travel as AES-256-GCM ciphertext — **browser to
 > browser over a WebRTC DataChannel** when the two ends can reach each other, and
 > over an **opaque WebSocket relay** on the bore server when they cannot. One click
@@ -2464,8 +2465,8 @@ stores nothing on disk.
 > relay by itself, keeping what is already on disk. The row in the page says which
 > one carried the bytes (`diretto` or `relay`), and it says so only once a chunk has
 > actually been verified over it.
-> Both kinds of download resume after an interruption, and a folder offer can also be
-> opened to download **one file out of it** rather than the whole archive.
+> Both kinds of download resume after an interruption, and every multi-entry offer can
+> also be opened to download **one file out of it** rather than the whole archive.
 > **Not yet included:** picking an arbitrary *subset* of a folder (several files at
 > once, but not all of them) — that is the next milestone, not a hidden limitation.
 

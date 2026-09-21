@@ -1419,13 +1419,15 @@ pub fn parse_complete_body(env: &ParsedEnvelope) -> Result<(RequestId, CompleteB
     ))
 }
 
-/// Builds `transfer.incoming {transferId, offerId, fromPeerId, attemptId}`.
+/// Builds `transfer.incoming`; `entryId` tells the source which file a raw
+/// request selected from a multi-entry offer.
 pub fn transfer_incoming_envelope(
     transfer_id: TransferId,
     offer_id: OfferId,
     from_peer: PeerId,
     attempt_id: AttemptId,
     mode: &str,
+    entry_id: Option<u32>,
 ) -> String {
     let mut body = BTreeMap::new();
     body.insert(
@@ -1453,6 +1455,12 @@ pub fn transfer_incoming_envelope(
         "mode".to_string(),
         serde_json::Value::String(mode.to_string()),
     );
+    if let Some(entry_id) = entry_id {
+        body.insert(
+            "entryId".to_string(),
+            serde_json::Value::String(entry_id.to_string()),
+        );
+    }
     server_envelope("transfer.incoming", None, body)
 }
 
@@ -4059,7 +4067,7 @@ mod transfer_bodies_tests {
         for (typ, raw) in [
             (
                 "transfer.incoming",
-                transfer_incoming_envelope(transfer, offer, peer, attempt, "raw"),
+                transfer_incoming_envelope(transfer, offer, peer, attempt, "raw", Some(0)),
             ),
             (
                 "transfer.relay_ticket",

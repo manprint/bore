@@ -396,6 +396,68 @@ describe("web-transfer sender", () => {
     }
   });
 
+  it("sender_serves_the_selected_file_from_a_multi_file_offer", async () => {
+    const h = harness();
+    await h.publish();
+    const first = countedFile(new Uint8Array([1, 2, 3]), "first.bin");
+    const secondBytes = new Uint8Array([4, 5, 6, 7]);
+    const second = countedFile(secondBytes, "second.bin");
+    const digest = async (bytes) =>
+      bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
+    const manifest = {
+      label: "files",
+      entries: [
+        {
+          id: "0",
+          path: "first.bin",
+          size: "3",
+          mtime: "1757779200",
+          chunks: [await digest(new Uint8Array([1, 2, 3]))],
+          chunkCount: "1",
+          root: "00".repeat(32),
+        },
+        {
+          id: "1",
+          path: "second.bin",
+          size: String(secondBytes.length),
+          mtime: "1757779200",
+          chunks: [await digest(secondBytes)],
+          chunkCount: "1",
+          root: "11".repeat(32),
+        },
+      ],
+    };
+    h.manager.records.set(OFFER, {
+      status: "live",
+      manifest,
+      macHex: "ef".repeat(32),
+      files: new Map([
+        ["first.bin", { file: first.file }],
+        ["second.bin", { file: second.file }],
+      ]),
+    });
+
+    assert.equal(h.sender.handleControl(incoming({ entryId: "1" })), true);
+    await tick();
+
+    const ready = h.control.find((message) => message.type === "transfer.source_ready");
+    assert.ok(ready, "the selected entry must be accepted");
+    const expectedDigest = await sha256Hex(
+      new TextEncoder().encode(
+        canonicalize({
+          entryIds: ["1"],
+          manifestMac: "ef".repeat(32),
+          mode: "raw",
+          offerId: OFFER,
+        }),
+      ),
+    );
+    assert.equal(ready.body.selectionDigest, expectedDigest);
+    assert.equal(h.sender.transfers().get(TRANSFER)?.entryId, "1");
+    assert.equal(h.sender.transfers().get(TRANSFER)?.file, second.file);
+    assert.equal(h.events.started[0]?.label, "second.bin");
+  });
+
   it("source_incoming_auto_ready_requires_local_file", async () => {
     // No local offer for that ID: the incoming is refused, no ready leaves,
     // no row appears — a source with nothing to send never opens a leg.

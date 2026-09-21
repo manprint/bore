@@ -3419,6 +3419,7 @@ impl WebTransferRegistry {
         struct Checked {
             source: PeerId,
             attempt_id: AttemptId,
+            entry_id: Option<u32>,
             upgraded: bool,
             id: TransferId,
         }
@@ -3458,7 +3459,7 @@ impl WebTransferRegistry {
             // until the source generates it — so the record carries `None`
             // for both and the expectation moves to the recipient, which
             // authenticates them from the sealed FINAL frame (5.2).
-            let entry_number =
+            let selected_entry_id =
                 match crate::web_transfer_protocol::validate_selection(mode, &entry_ids, &manifest)
                     .map_err(|e| WebTransferError::invalid(e.to_string()))?
                 {
@@ -3472,7 +3473,7 @@ impl WebTransferRegistry {
             // recipient authenticates the dynamic tuple from the sealed
             // FINAL frame instead. That is the whole difference between the
             // two modes on this side.
-            let entry = match entry_number {
+            let entry = match selected_entry_id {
                 Some(id) => Some(
                     manifest
                         .entries
@@ -3490,13 +3491,13 @@ impl WebTransferRegistry {
                     None => None,
                 };
             let entry_size = entry.map(|entry| entry.size);
-            let transfer_mode = if entry_number.is_some() {
+            let transfer_mode = if selected_entry_id.is_some() {
                 TransferMode::Raw
             } else {
                 TransferMode::Zip
             };
             let entry_number =
-                entry_number.unwrap_or(crate::web_transfer_protocol::RESERVED_ZIP_ENTRY_ID);
+                selected_entry_id.unwrap_or(crate::web_transfer_protocol::RESERVED_ZIP_ENTRY_ID);
             let expected = compute_digest(&offer_id, &offer.mac, &entry_ids, mode);
             if !token_digests_equal(&expected, &selection_digest) {
                 return Err(WebTransferError::source_changed(
@@ -3581,6 +3582,7 @@ impl WebTransferRegistry {
                 Checked {
                     source,
                     attempt_id,
+                    entry_id: selected_entry_id,
                     upgraded: true,
                     id,
                 }
@@ -3632,6 +3634,7 @@ impl WebTransferRegistry {
                 Checked {
                     source,
                     attempt_id,
+                    entry_id: selected_entry_id,
                     upgraded: false,
                     id: new_id,
                 }
@@ -3647,6 +3650,7 @@ impl WebTransferRegistry {
                 recipient,
                 checked.attempt_id,
                 mode,
+                checked.entry_id,
             ),
         ) {
             let mut state = room
@@ -10063,6 +10067,7 @@ mod transfer_state_tests {
             body["attemptId"].as_str(),
             Some(attempt.to_string()).as_deref()
         );
+        assert_eq!(body["entryId"].as_str(), Some("0"));
         let state = room.state.lock().unwrap().transfers.get(&id).unwrap().state;
         assert_eq!(state, TransferState::WaitingSource);
         assert_eq!(registry.current_transfers(), 1);

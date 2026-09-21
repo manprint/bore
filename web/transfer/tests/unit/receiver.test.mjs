@@ -251,6 +251,37 @@ async function seedPartial(repository, entry, parts, ranges, mac) {
 }
 
 describe("web-transfer receiver", () => {
+  it("a_recipient_can_cancel_while_the_path_is_still_connecting", async () => {
+    const h = harness();
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const manifest = await manifestFor(bytes);
+    const started = await h.receiver.startDownload({
+      offerId: OFFER,
+      manifest,
+      macHex: macOf(manifest),
+      sourcePeerId: SOURCE_PEER,
+    });
+    assert.deepEqual(started, { pending: true });
+    const request = h.control.find((message) => message.type === "transfer.request");
+    const transferId = "aa".repeat(16);
+    assert.equal(
+      h.receiver.handleControl({
+        type: "ack",
+        requestId: request.requestId,
+        body: { result: { transferId } },
+      }),
+      true,
+    );
+
+    assert.equal(h.receiver.transfers().get(transferId)?.state, "requested");
+    assert.equal(h.receiver.cancelTransfer(transferId), true);
+    assert.equal(h.receiver.transfers().has(transferId), false);
+    assert.equal(
+      h.control.filter((message) => message.type === "transfer.cancel").length,
+      1,
+    );
+  });
+
   it("a_manifest_that_does_not_authenticate_is_refused_before_anything_leaves", async () => {
     // The manifest reaches the recipient THROUGH the server, which holds no
     // room key and so cannot produce this tag. Without the check, a forged

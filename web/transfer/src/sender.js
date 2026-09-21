@@ -561,8 +561,8 @@ export function createSender({
   }
 
   /**
-   * Finds what the request selected — the single servable file entry for
-   * `raw`, or the whole offer for `zip` — or rejects the incoming.
+   * Finds what the request selected — the named file entry for `raw`, or the
+   * whole offer for `zip` — or rejects the incoming.
    */
   async function startIncoming(message) {
     const incomingAt = perfStart();
@@ -572,6 +572,7 @@ export function createSender({
       attemptId,
       recipientPeerId = null,
       mode = "raw",
+      entryId = null,
     } = message;
     if (transfers.has(transferId)) {
       // Duplicate/redelivered incoming for a tracked transfer: the ready
@@ -589,9 +590,18 @@ export function createSender({
     const fileEntries = allEntries.filter(
       (entry) => Array.isArray(entry.chunks) && entry.chunks.length > 0,
     );
+    // Current servers name the selected raw entry. If an older server omits
+    // it, only a genuinely single-file offer is unambiguous and safe to
+    // serve; a multi-entry offer must be refused rather than sending the
+    // wrong file under a digest for another selection.
+    const entry = archive
+      ? null
+      : entryId === null || entryId === undefined
+        ? (fileEntries.length === 1 ? fileEntries[0] : null)
+        : (fileEntries.find((each) => String(each.id) === String(entryId)) ?? null);
     // `ready` (published, ack in flight) serves too: the server only sends
     // `incoming` for offers it knows, so a racing ack never over-serves.
-    const servable = archive ? allEntries.length > 0 : fileEntries.length === 1;
+    const servable = archive ? allEntries.length > 0 : entry !== null;
     if (
       (record?.status !== "live" && record?.status !== "ready") ||
       !servable
@@ -603,7 +613,6 @@ export function createSender({
     // an archive reads every file in the offer and checks each of them as
     // `writeArchive` reaches it, which is also the only moment the check
     // would still be true. Both answer `SOURCE_CHANGED`.
-    const entry = archive ? null : fileEntries[0];
     const fileFor = (path) => record.files.get(path)?.file ?? null;
     if (!archive) {
       const file = fileFor(entry.path);
@@ -802,6 +811,11 @@ export function createSender({
           // silently serve the other selection. Absent on an older server:
           // `raw` is what that server could only have meant.
           mode: body.mode === "zip" ? "zip" : "raw",
+          // A raw selection can name any file in a multi-entry offer. Older
+          // servers omit this additive field; startIncoming accepts that
+          // legacy shape only when the offer has one unambiguous file.
+          entryId:
+            typeof body.entryId === "string" ? body.entryId : null,
         });
         return true;
       }

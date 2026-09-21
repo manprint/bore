@@ -152,7 +152,7 @@
  {
   "name": "transfer.incoming",
   "direction": "server",
-  "json": "{\"v\":1,\"type\":\"transfer.incoming\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offerId\":\"cccccccccccccccccccccccccccccccc\",\"fromPeerId\":\"11111111111111111111111111111111\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"mode\":\"raw\"}}"
+  "json": "{\"v\":1,\"type\":\"transfer.incoming\",\"body\":{\"transferId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offerId\":\"cccccccccccccccccccccccccccccccc\",\"fromPeerId\":\"11111111111111111111111111111111\",\"attemptId\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"mode\":\"raw\",\"entryId\":\"0\"}}"
  },
  {
   "name": "transfer.incoming.zip",

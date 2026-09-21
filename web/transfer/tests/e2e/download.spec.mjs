@@ -6,13 +6,22 @@ import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import {
+  Uint8ArrayReader,
+  Uint8ArrayWriter,
+  ZipReader,
+  configure,
+} from "@zip.js/zip.js";
 import { spawnRoomEnv, openPersistentPeer, opfsWorks } from "./helpers.mjs";
 import { hookCounters } from "./fixtures.js";
+
+configure({ useWebWorkers: false });
 
 let env = null;
 let roomDir = null;
 let fileBytes = null;
 let fileHashHex = null;
+const multiFiles = new Map();
 
 test.beforeAll(async () => {
   env = await spawnRoomEnv();
@@ -23,6 +32,20 @@ test.beforeAll(async () => {
   }
   fileHashHex = createHash("sha256").update(fileBytes).digest("hex");
   writeFileSync(join(roomDir, "big.bin"), fileBytes);
+  for (const [name, size, seed] of [
+    ["one.bin", 128 * 1024 + 1, 11],
+    ["two.bin", 192 * 1024 + 2, 17],
+    ["three.bin", 256 * 1024 + 3, 23],
+    ["four.bin", 320 * 1024 + 4, 29],
+    ["cancel-while-connecting.bin", 8 * 1024 * 1024 + 5, 31],
+  ]) {
+    const bytes = Buffer.alloc(size);
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = (i * seed + 7) % 251;
+    }
+    multiFiles.set(name, bytes);
+    writeFileSync(join(roomDir, name), bytes);
+  }
 }, 60_000);
 
 test.afterAll(async () => {
@@ -108,6 +131,91 @@ test.describe.serial("download-relay", () => {
     expect(saved.length).toBe(fileBytes.length);
     // Saving purges the staging: the panel hides and stays hidden.
     await expect(b.page.locator("#save-section")).toHaveCount(0, { timeout: 10_000 });
+
+    for (const peer of [a, b]) {
+      expect(peer.failures).toEqual([]);
+      await peer.cleanup();
+    }
+  });
+
+  test("a five-file offer supports connecting cancel, single download and ZIP", async () => {
+    const a = await openPeer(env.roomUrl);
+    const b = await openPeer(env.roomUrl);
+    await expectConnected(a.page);
+    await expectConnected(b.page);
+    expect(await opfsWorks(b.page)).toBe(true);
+
+    await a.page.locator("#file-input").setInputFiles(
+      [...multiFiles.keys()].map((name) => join(roomDir, name)),
+    );
+    const offer = await poll(b.page, () => {
+      const catalog = window.__BORE_TEST__.getCatalogSnapshot();
+      return catalog.length === 1 && catalog[0].manifest.entries.length === 5
+        ? catalog[0]
+        : null;
+    });
+    const byPath = new Map(
+      offer.manifest.entries.map((entry) => [entry.path, entry.id]),
+    );
+
+    const cancelEntry = byPath.get("cancel-while-connecting.bin");
+    await b.page
+      .locator(
+        `button[data-download-entry="${offer.offerId}:${cancelEntry}"]`,
+      )
+      .click();
+    const liveRow = b.page.locator(
+      '.transfer-row:has([data-path="connecting"])',
+    );
+    await expect(liveRow.locator("button[data-cancel]")).toBeVisible({
+      timeout: 15_000,
+    });
+    const cancelledId = await liveRow.getAttribute("data-transfer");
+    const cancelledRow = b.page.locator(
+      `.transfer-row[data-transfer="${cancelledId}"]`,
+    );
+    await liveRow.locator("button[data-cancel]").click();
+    await expect(cancelledRow.locator(".transfer-state")).toContainText(
+      "Annullato",
+    );
+
+    const wanted = "three.bin";
+    const entryId = byPath.get(wanted);
+    await b.page
+      .locator(`button[data-download-entry="${offer.offerId}:${entryId}"]`)
+      .click();
+    await expect(b.page.locator("#save-file")).toBeVisible({ timeout: 60_000 });
+    await expect(b.page.locator("#save-name")).toHaveText(wanted);
+    const download = await Promise.all([
+      b.page.waitForEvent("download", { timeout: 30_000 }),
+      b.page.locator("#save-file").click(),
+    ]).then(([event]) => event);
+    const saved = readFileSync(await download.path());
+    expect(saved.equals(multiFiles.get(wanted))).toBe(true);
+
+    await b.page
+      .locator(`button[data-download-zip="${offer.offerId}"]`)
+      .click();
+    await expect(b.page.locator("#save-file")).toBeVisible({ timeout: 60_000 });
+    const zipDownload = await Promise.all([
+      b.page.waitForEvent("download", { timeout: 30_000 }),
+      b.page.locator("#save-file").click(),
+    ]).then(([event]) => event);
+    const zipBytes = readFileSync(await zipDownload.path());
+    const reader = new ZipReader(
+      new Uint8ArrayReader(new Uint8Array(zipBytes)),
+    );
+    const entries = await reader.getEntries();
+    expect(entries.map((entry) => entry.filename).sort()).toEqual(
+      [...multiFiles.keys()].sort(),
+    );
+    for (const entry of entries) {
+      const bytes = Buffer.from(
+        await entry.getData(new Uint8ArrayWriter()),
+      );
+      expect(bytes.equals(multiFiles.get(entry.filename))).toBe(true);
+    }
+    await reader.close();
 
     for (const peer of [a, b]) {
       expect(peer.failures).toEqual([]);

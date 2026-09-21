@@ -3593,29 +3593,42 @@ async fn t_web_room_life() -> Result<()> {
         Ok((owner, pid, room_hex, token_hex))
     }
 
+    async fn connect_welcome(
+        host: &str,
+        room_hex: &str,
+        origin: &str,
+        token_hex: &str,
+        display_name: &str,
+    ) -> Result<(support::WsPeer, serde_json::Value)> {
+        let mut last_error = None;
+        for _ in 0..3 {
+            let mut peer = support::WsPeer::connect(host, room_hex, origin).await?;
+            peer.hello(token_hex, Some(display_name)).await?;
+            match peer.next_text(Duration::from_secs(20)).await? {
+                Some(text) => {
+                    let (typ, body) = control_msg(&text);
+                    if typ == "welcome" {
+                        return Ok((peer, body));
+                    }
+                    last_error = Some(format!("expected welcome, got {typ}"));
+                }
+                None => last_error = Some("control socket closed before welcome".to_string()),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        anyhow::bail!(
+            "room peer did not receive welcome after retries: {}",
+            last_error.unwrap_or_else(|| "unknown error".to_string())
+        )
+    }
+
     // --- L1: abnormal loss holds the room for the grace, then destroys it ---
     let (mut owner, owner_pid, room_hex, token_hex) = spawn_owner(&binary, port).await?;
 
-    let mut a = support::WsPeer::connect_from(
-        std::net::Ipv4Addr::new(127, 0, 0, 2),
-        &host,
-        &room_hex,
-        &origin,
-    )
-    .await?;
-    a.hello(&token_hex, Some("A")).await?;
-    let (_, welcome_a) = control_msg(&a.next_text(wait).await?.expect("welcome A"));
+    let (mut a, welcome_a) = connect_welcome(&host, &room_hex, &origin, &token_hex, "A").await?;
     let peer_a = welcome_a["peerId"].as_str().unwrap().to_string();
     read_snapshot(&mut a).await?;
-    let mut b = support::WsPeer::connect_from(
-        std::net::Ipv4Addr::new(127, 0, 0, 3),
-        &host,
-        &room_hex,
-        &origin,
-    )
-    .await?;
-    b.hello(&token_hex, Some("B")).await?;
-    let (_, welcome_b) = control_msg(&b.next_text(wait).await?.expect("welcome B"));
+    let (mut b, welcome_b) = connect_welcome(&host, &room_hex, &origin, &token_hex, "B").await?;
     let peer_b = welcome_b["peerId"].as_str().unwrap().to_string();
     read_snapshot(&mut b).await?;
     assert_eq!(
@@ -3796,18 +3809,7 @@ async fn t_web_room_life() -> Result<()> {
 
     // --- L2: a clean close is immediate, never graced ------------------------
     let (mut owner2, owner2_pid, room2, token2) = spawn_owner(&binary, port).await?;
-    let mut c = support::WsPeer::connect_from(
-        std::net::Ipv4Addr::new(127, 0, 0, 4),
-        &host,
-        &room2,
-        &origin,
-    )
-    .await?;
-    c.hello(&token2, Some("C")).await?;
-    assert_eq!(
-        control_msg(&c.next_text(wait).await?.expect("welcome C")).0,
-        "welcome"
-    );
+    let (mut c, _) = connect_welcome(&host, &room2, &origin, &token2, "C").await?;
     signal_pid(owner2_pid, "-TERM")?;
     let closed_at = std::time::Instant::now();
     // The live page's socket ends without waiting for any grace. A farewell

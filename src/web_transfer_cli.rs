@@ -807,6 +807,10 @@ mod tests {
             build_display_url("https://files.example.com/", seed),
             "https://files.example.com/transfer/#YVCYDRDYkjNIIyoIIHIH_w"
         );
+        assert_eq!(
+            build_display_url("https://files.example.com///", seed),
+            "https://files.example.com/transfer/#YVCYDRDYkjNIIyoIIHIH_w"
+        );
     }
 
     #[test]

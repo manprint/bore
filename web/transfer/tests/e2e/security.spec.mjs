@@ -52,6 +52,31 @@ const RECORD_SENT = () => {
   };
 };
 
+// Test-only fault injection: preserve the seed-derived RoomId/member token,
+// but flip one bit of the independent RoomKey HKDF output. The production
+// bundle never installs this wrapper; the browser context is torn down after
+// the assertion, so the mutation cannot escape the test.
+const FLIP_ROOM_KEY = () => {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) {
+    return;
+  }
+  const realDeriveBits = subtle.deriveBits.bind(subtle);
+  Object.defineProperty(subtle, "deriveBits", {
+    configurable: true,
+    value: async (params, key, length) => {
+      const bits = await realDeriveBits(params, key, length);
+      const info = new TextDecoder().decode(params?.info ?? new Uint8Array());
+      if (info !== "bore-web-transfer-room-key-v1") {
+        return bits;
+      }
+      const bytes = new Uint8Array(bits);
+      bytes[0] ^= 1;
+      return bytes.buffer;
+    },
+  });
+};
+
 async function openPeer(url, init) {
   const { browserName, defaultBrowserType, channel } = test.info().project.use;
   // The security gates are written against the RELAY leg (opaque frames,
@@ -130,12 +155,11 @@ test.describe.serial("web transfer security", () => {
     }
   });
 
-  test("a peer with the wrong room key learns nothing from an offer", async () => {
+test("a peer with the wrong room key learns nothing from an offer", async () => {
     const a = await openPeer(env.roomUrl);
     // Same room, same member token, one flipped nibble of the room key: the
     // server cannot tell the difference, which is the point.
-    const wrongKey = `${env.roomKey.slice(0, 63)}${env.roomKey[63] === "0" ? "1" : "0"}`;
-    const bad = await openPeer(env.roomUrl.replace(env.roomKey, wrongKey));
+    const bad = await openPeer(env.roomUrl, FLIP_ROOM_KEY);
     await expectConnected(a.page);
     await expectConnected(bad.page);
 
@@ -152,7 +176,7 @@ test.describe.serial("web transfer security", () => {
     expect(await bad.page.evaluate(() => window.__BORE_TEST__.getCatalogSnapshot())).toEqual([]);
     // The other entry point: a peer that joins AFTER the publish receives the
     // same offer in its join snapshot, and must refuse it there too.
-    const late = await openPeer(env.roomUrl.replace(env.roomKey, wrongKey));
+    const late = await openPeer(env.roomUrl, FLIP_ROOM_KEY);
     await expectConnected(late.page);
     await new Promise((r) => setTimeout(r, 1500));
     expect(await late.page.evaluate(() => window.__BORE_TEST__.getCatalogSnapshot())).toEqual([]);

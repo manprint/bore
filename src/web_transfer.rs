@@ -6636,14 +6636,25 @@ where
                 linger_after_error(control).await;
                 return Ok(idle());
             };
-            let lease = OwnerLease::create_with_id(
+            let lease = match OwnerLease::create_with_id(
                 &registry,
                 member_token_hash,
                 owner_token_hash,
                 room_id,
                 relay_only,
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            ) {
+                Ok(lease) => lease,
+                Err(_) => {
+                    // A requested ID is a capability-derived public value.
+                    // Never disclose whether the collision came from an
+                    // existing room, and never echo the seed or hashes.
+                    control
+                        .send(ServerMessage::Error("room unavailable".to_string()))
+                        .await?;
+                    linger_after_error(control).await;
+                    return Ok(idle());
+                }
+            };
             let (id, epoch) = (lease.id(), lease.epoch());
             let base_url = registry.config().base_url.origin().to_string();
             control
@@ -7552,6 +7563,52 @@ mod owner_control_tests {
         let current = registry.room(requested).expect("original room remains");
         assert!(Arc::ptr_eq(&first, &current));
         assert!(!current.relay_only);
+        first.destroy("test-cleanup");
+        assert!(registry.remove_room_if_current(requested, &current));
+    }
+
+    #[tokio::test]
+    async fn create_collision_keeps_existing_room_and_returns_generic_error() {
+        let registry = test_registry();
+        let requested = RoomId::from_bytes([0x93u8; 16]);
+        let first = registry
+            .create_room_with_id([1u8; 32], [2u8; 32], requested, false)
+            .unwrap();
+        let before_state = format!("{:?}", first.state.lock().unwrap());
+        let (_, member_hash, owner_hash) = owner_pair();
+        let (mut client, mut server) = duplex_pair().await;
+        let server_task = tokio::spawn({
+            let server_registry = Arc::new(registry.clone());
+            async move {
+                serve_owner_first_message(
+                    Some(server_registry),
+                    &mut server,
+                    ClientMessage::CreateWebTransferRoom {
+                        version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+                        room_id: requested,
+                        member_token_hash: member_hash,
+                        owner_token_hash: owner_hash,
+                        relay_only: true,
+                    },
+                    Duration::from_secs(60),
+                )
+                .await
+            }
+        });
+        let reply = client.recv::<ServerMessage>().await.unwrap();
+        assert!(matches!(
+            reply,
+            Some(ServerMessage::Error(ref message)) if message == "room unavailable"
+        ));
+        let json = serde_json::to_string(&reply).unwrap();
+        assert!(!json.contains('#'));
+        assert_eq!(registry.current_rooms(), 1);
+        let current = registry.room(requested).expect("original room remains");
+        assert!(Arc::ptr_eq(&first, &current));
+        assert!(!current.relay_only);
+        assert_eq!(format!("{:?}", current.state.lock().unwrap()), before_state);
+        drop(client);
+        server_task.await.unwrap().unwrap();
         first.destroy("test-cleanup");
         assert!(registry.remove_room_if_current(requested, &current));
     }

@@ -140,7 +140,12 @@ export function externalRoomEnv() {
   if (!roomUrl) {
     return null;
   }
-  const parsed = new URL(roomUrl);
+  let parsed;
+  try {
+    parsed = new URL(roomUrl);
+  } catch {
+    throw new Error("invalid short room URL");
+  }
   const material = deriveShortLinkMaterial(roomUrl);
   return {
     roomUrl,

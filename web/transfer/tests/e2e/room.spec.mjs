@@ -119,7 +119,7 @@ function isEngineNoise(text) {
   return /was interrupted while the page was loading/i.test(text);
 }
 
-async function openRoom(browser, url, {rtcHook = true} = {}) {
+async function openRoom(browser, url, {rtcHook = true, init} = {}) {
   const context = await browser.newContext();
   if (rtcHook) {
     await context.addInitScript(() => {
@@ -155,6 +155,9 @@ async function openRoom(browser, url, {rtcHook = true} = {}) {
         }
       }
     });
+  }
+  if (init) {
+    await context.addInitScript(init);
   }
   const page = await context.newPage();
   const failures = [];
@@ -311,6 +314,31 @@ test.describe.serial("room", () => {
   });
 
   test("invalid links never connect", async ({ browser }) => {
+    const malformed = [
+      ["21 chars", `${roomUrl.slice(0, roomUrl.indexOf("#") + 1)}${roomSeedText.slice(0, 21)}`],
+      ["23 chars", `${roomUrl.slice(0, roomUrl.indexOf("#") + 1)}${"A".repeat(23)}`],
+      ["padding bits", `${roomUrl.slice(0, roomUrl.indexOf("#") + 1)}${roomSeedText.slice(0, -1)}x`],
+      ["equals", `${roomUrl}=`],
+      ["plus", `${roomUrl.slice(0, -1)}+`],
+      ["slash", `${roomUrl.slice(0, -1)}/`],
+      ["space escape", `${roomUrl.slice(0, -1)}%20`],
+      ["unicode", `${roomUrl.slice(0, -1)}é`],
+      ["empty hash", roomUrl.slice(0, roomUrl.indexOf("#") + 1)],
+      ["hash query", `${roomUrl}?query=1`],
+      ["path query", `${roomUrl.slice(0, roomUrl.indexOf("#")).replace("/transfer/", "/transfer/?room=1")}${roomUrl.slice(roomUrl.indexOf("#"))}`],
+      ["legacy path", `${roomUrl.slice(0, roomUrl.indexOf("/transfer/"))}/transfer/c5e230000f48c492799fe9ea32d18d8c#m=${"a".repeat(64)}&k=${"b".repeat(64)}`],
+      ["legacy fragment", `${roomUrl.slice(0, roomUrl.indexOf("#"))}#m=${"a".repeat(64)}&k=${"b".repeat(64)}`],
+    ];
+    for (const [label, href] of malformed) {
+      const broken = await openRoom(browser, href);
+      await expect(broken.page.locator("#room-status")).toContainText("Link incompleto", {
+        timeout: 10_000,
+      });
+      expect(broken.frames.urls, label).toEqual([]);
+      expect(broken.failures, label).toEqual([]);
+      await broken.context.close();
+    }
+
     // Unknown room, valid shape: no welcome, room becomes unavailable.
     const ghost = `http://127.0.0.1:${port}/transfer/#AAAAAAAAAAAAAAAAAAAAAA`;
     const lost = await openRoom(browser, ghost);
@@ -327,14 +355,48 @@ test.describe.serial("room", () => {
     expect(inbound).not.toContain("welcome");
     expect(lost.failures).toEqual([]);
     await lost.context.close();
-    // Malformed fragment on a valid path: incomplete, not a socket opens.
-    const broken = await openRoom(browser, `http://127.0.0.1:${port}/transfer/#m=1`);
+    // An old link must not recover through browser storage. It is rejected
+    // before the control socket, even when a legacy-looking value is present.
+    const broken = await openRoom(
+      browser,
+      `http://127.0.0.1:${port}/transfer/#m=1`,
+      {
+        init: () => {
+          sessionStorage.setItem("bore.transfer.legacy", JSON.stringify({ member: "a", key: "b" }));
+        },
+      },
+    );
     await expect(broken.page.locator("#room-status")).toContainText("Link incompleto", {
       timeout: 10_000,
     });
     expect(broken.frames.urls).toEqual([]);
+    expect(await broken.page.evaluate(() => sessionStorage.length)).toBe(1);
     expect(broken.failures).toEqual([]);
     await broken.context.close();
+  });
+
+  test("WebCrypto failure is stable, preserves the hash and never connects", async ({ browser }) => {
+    const failed = await openRoom(browser, roomUrl, {
+      init: () => {
+        const realDeriveBits = crypto.subtle.deriveBits.bind(crypto.subtle);
+        Object.defineProperty(crypto.subtle, "deriveBits", {
+          configurable: true,
+          value: async (...args) => {
+            void realDeriveBits;
+            void args;
+            throw new Error("test HKDF failure");
+          },
+        });
+      },
+    });
+    await expect(failed.page.locator("#room-status")).toContainText(
+      "WebCrypto HKDF non disponibile",
+      { timeout: 10_000 },
+    );
+    expect(failed.page.url()).toBe(roomUrl);
+    expect(failed.frames.urls).toEqual([]);
+    expect(failed.failures).toEqual([]);
+    await failed.context.close();
   });
 
   test("a name being typed survives a room event", async ({ browser }) => {

@@ -14,6 +14,9 @@ const ORIGIN = "https://files.example";
 const SEED_TEXT = "YVCYDRDYkjNIIyoIIHIH_w";
 const SEED = decodeRoomLinkSeed(SEED_TEXT);
 const GOOD = `${ORIGIN}/transfer/#${SEED_TEXT}`;
+const LEGACY_ROOM_ID = "c5e230000f48c492799fe9ea32d18d8c";
+const LEGACY_MEMBER = "a".repeat(64);
+const LEGACY_KEY = "b".repeat(64);
 
 describe("room links", () => {
   it("parses_and_builds_the_canonical_short_link", () => {
@@ -22,14 +25,24 @@ describe("room links", () => {
       seedText: SEED_TEXT,
     });
     assert.equal(buildShortRoomUrl(`${ORIGIN}/`, SEED), GOOD);
+    assert.equal(buildShortRoomUrl(`${ORIGIN}///`, SEED), GOOD);
+    assert(!buildShortRoomUrl(`${ORIGIN}///`, SEED).includes("//transfer"));
     assert.equal(encodeRoomLinkSeed(SEED), SEED_TEXT);
   });
 
   it("rejects_legacy_forms_queries_and_noncanonical_seeds", () => {
     const bad = [
-      `${ORIGIN}/transfer/${"c5e230000f48c492799fe9ea32d18d8c"}#m=${"a".repeat(64)}&k=${"b".repeat(64)}`,
+      `${ORIGIN}/transfer/${LEGACY_ROOM_ID}#m=${LEGACY_MEMBER}&k=${LEGACY_KEY}`,
+      `${ORIGIN}/transfer/#m=${LEGACY_MEMBER}&k=${LEGACY_KEY}`,
       `${ORIGIN}/transfer/#${"!".repeat(22)}`,
       `${ORIGIN}/transfer/#${SEED_TEXT.slice(0, 21)}`,
+      `${ORIGIN}/transfer/#${SEED_TEXT}x`,
+      `${ORIGIN}/transfer/#${SEED_TEXT}=`,
+      `${ORIGIN}/transfer/#${SEED_TEXT.slice(0, 21)}+`,
+      `${ORIGIN}/transfer/#${SEED_TEXT.slice(0, 21)}/`,
+      `${ORIGIN}/transfer/#${SEED_TEXT.slice(0, 21)}%20`,
+      `${ORIGIN}/transfer/#${SEED_TEXT.slice(0, 21)}é`,
+      `${ORIGIN}/transfer/#`,
       `${ORIGIN}/transfer/#${SEED_TEXT}?query=1`,
       `${ORIGIN}/transfer/?room=1#${SEED_TEXT}`,
       `${ORIGIN}/transfer/#${SEED_TEXT}&extra`,

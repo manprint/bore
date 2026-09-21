@@ -1,6 +1,6 @@
 # Web Transfer Short Links — Implementation State
 
-Last updated: 2026-09-21 (sub-phase 0.3 closed; 0.4 opened)
+Last updated: 2026-09-21 (phase 0 closed; sub-phase 1.1 opened)
 
 ## 0. Resume protocol
 
@@ -24,11 +24,11 @@ All implementation and verification units are assigned to `agent:gpt-5.6-luna` a
 | Field | Value |
 |---|---|
 | Mode | Execute; WIP commits enabled |
-| Current sub-phase | `0.4` |
+| Current sub-phase | `1.1` |
 | Status | `OPEN` |
-| Intent | Phase 0 README synchronization |
-| Phase file | `phase_01.md` |
-| Next action | Execute sub-phase `0.4` in `phase_01.md` |
+| Intent | Native owner protocol v2 and client-selected room ID |
+| Phase file | `phase_02.md` |
+| Next action | Execute sub-phase `1.1` in `phase_02.md` |
 | Assigned model | `agent:gpt-5.6-luna` |
 | Baseline branch | `dev` |
 | Baseline commit | `ad7d0f47d497` |
@@ -67,7 +67,7 @@ Commit mode: WIP commits ON — explicit operator request on 2026-09-21; commit 
 | 1 | `0.1` | `agent:gpt-5.6-luna` | Rust seed codec, HKDF derivation, fixture | DONE |
 | 2 | `0.2` | `agent:gpt-5.6-luna` | Browser codec/KDF mirror and failure behavior | DONE |
 | 3 | `0.3` | `agent:gpt-5.6-luna` | Cross-language contract and red-check audit | DONE |
-| 4 | `0.4` | `agent:gpt-5.6-luna` | Phase 0 README synchronization | TODO |
+| 4 | `0.4` | `agent:gpt-5.6-luna` | Phase 0 README synchronization | DONE |
 | 5 | `1.1` | `agent:gpt-5.6-luna` | Native owner protocol v2 and client-selected room ID | TODO |
 | 6 | `1.2` | `agent:gpt-5.6-luna` | CLI/browser switch to persistent short fragment | TODO |
 | 7 | `1.3` | `agent:gpt-5.6-luna` | Negative, legacy-removal, and secrecy tests | TODO |
@@ -92,7 +92,8 @@ Append one row after every completed or attempted sub-phase. Use exact commands,
 | 2026-09-21 | Planning | `docs/plans/003_plan-WebTransferShortLinks/*` | Plan structure checks only | Plan authored | No production code or tests changed/run | — |
 | 2026-09-21 | `0.1` | `Cargo.toml`, `Cargo.lock`, `src/web_transfer.rs`, `src/web_transfer_protocol.rs`, `tests/fixtures/web_transfer/link_v1.json`, `STATE.md` | `cargo fmt --all -- --check`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo build --locked --all-features`; `cargo test --locked --all-features --lib web_transfer`; `git diff --check` | PASS | 189 web_transfer tests passed | `09ed559` |
 | 2026-09-21 | `0.2` | `web/transfer/src/crypto.js`, `web/transfer/src/secrets.js`, `web/transfer/tests/unit/crypto.test.mjs`, `web/transfer/dist/app.js`, `web/transfer/dist/offer-worker.js`, `STATE.md` | `npm run check --prefix web/transfer`; `rg -n '\\bBuffer\\b' web/transfer/src web/transfer/tests/unit/crypto.test.mjs web/transfer/dist`; `git diff --check` | PASS | 217 browser unit tests passed; bundle rebuild reproduced tracked assets; no Buffer references; offer-worker changed because the normal build emitted the shared browser update | `240dc5e` |
-| 2026-09-21 | `0.3` | `web/transfer/tests/unit/crypto.test.mjs`, `STATE.md` | `node --test tests/unit/crypto.test.mjs`; independent `node:crypto.hkdfSync` oracle; controlled label/seed/truncation red-checks; label duplicate audit; no test stdout/stderr audit; `cargo fmt --all -- --check`; `cargo clippy --locked --all-features --all-targets -- -D warnings`; `cargo build --locked --all-features`; `cargo test --locked --all-features --lib web_transfer`; `npm run check --prefix web/transfer`; `git diff --check`; Cargo.lock diff inspection | PASS | 16 crypto tests; 218 browser tests; 189 Rust tests; all red-checks failed as expected and tree was restored/untouched | pending |
+| 2026-09-21 | `0.3` | `web/transfer/tests/unit/crypto.test.mjs`, `STATE.md` | `node --test tests/unit/crypto.test.mjs`; independent `node:crypto.hkdfSync` oracle; controlled label/seed/truncation red-checks; label duplicate audit; no test stdout/stderr audit; `cargo fmt --all -- --check`; `cargo clippy --locked --all-features --all-targets -- -D warnings`; `cargo build --locked --all-features`; `cargo test --locked --all-features --lib web_transfer`; `npm run check --prefix web/transfer`; `git diff --check`; Cargo.lock diff inspection | PASS | 16 crypto tests; 218 browser tests; 189 Rust tests; all red-checks failed as expected and tree was restored/untouched | `6b6c002` |
+| 2026-09-21 | `0.4` | `README.md` (read-only audit), `docs/transfer/WEB_TRANSFER_PROTOCOL.md` (read-only audit), `STATE.md` | `rg -n -i 'web.?transfer|browser.?to.?browser|room|owner' README.md`; protocol section audit; `npx playwright test tests/e2e/readme.spec.mjs --project=chromium --project=firefox --project=webkit`; inherited phase gates G-FMT/G-LINT/G-BUILD/G-RUST-UNIT/G-JS/G-DIFF | PASS | README remains truthful for the active long URL; no premature short-link promise; README flow 3/3 engines passed; no README/protocol edit needed | pending |
 
 ## 5. Decision and deviation ledger
 
@@ -129,11 +130,11 @@ evidence during execution.
 | Web Transfer shell/E2E harness | NOT RUN | Implementation not started |
 | Asset rebuild cleanliness | PASS | `npm run check --prefix web/transfer`: unit asset reproducibility assertion passed; normal build completed |
 | Independent Node HKDF oracle and primitive red-check audit | PASS | `node:crypto.hkdfSync` matched fixture; label, final-seed-character, and RoomId-width mutations failed as expected; no source mutation remained |
-| README contract audit | NOT RUN | Implementation not started |
+| README contract audit | PASS | README opening example and security prose still describe `/transfer/<32hex>#m=...&k=...`; no short format announced before phase 1 cutover |
 | Secret/fragment leak audit | NOT RUN | Implementation not started |
 | `git diff --check` | PASS | `git diff --check` |
 
-In-flight: 0.4 — claimed — no implementation written yet.
+In-flight: 1.1 — claimed — no implementation written yet.
 
 Branded-browser rules:
 
@@ -188,7 +189,7 @@ mapping here before editing. Do not revive a stale path or duplicate an existing
 
 | Document | Required content | Status |
 |---|---|---|
-| `README.md` phase 0 update | Link shape, 128-bit seed, derivation/error contract as user-visible | TODO |
+| `README.md` phase 0 update | Link shape, 128-bit seed, derivation/error contract as user-visible | PASS — verified active long format remains the only documented user format; no premature short-link text added |
 | Protocol/design documentation | Owner protocol v2, client-selected room ID, hard cutover, vectors | TODO |
 | `README.md` phase 1 update | Complete CLI/browser flow, copy/address-bar behavior, no legacy links | TODO |
 | `README.md` phase 2 update | Browser support matrix, branded/manual gates, security consequences | TODO |

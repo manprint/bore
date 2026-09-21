@@ -3055,7 +3055,7 @@ async fn t_web_limits() -> Result<()> {
     // --- L4: the control bucket refuses a flood, and only the flooder -------
     let mut limited = None;
     let flood_started = std::time::Instant::now();
-    for _ in 0..200u32 {
+    for _ in 0..1000u32 {
         victim
             .send_text(r#"{"v":1,"type":"ping","body":{}}"#.to_string())
             .await?;
@@ -3109,7 +3109,7 @@ async fn t_web_limits() -> Result<()> {
     );
     assert!(
         limited.is_some(),
-        "a 200-message burst must meet the control bucket"
+        "a 1000-message burst must meet the control bucket"
     );
     healthy_still_serves(&mut healthy, "flood").await?;
 

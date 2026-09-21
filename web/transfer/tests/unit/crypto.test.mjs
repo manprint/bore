@@ -1,6 +1,7 @@
 // Crypto unit tests: roots, keys, nonces and encrypted frames against the
 // shared fixtures, plus the short-link seed and WebCrypto KDF mirror.
 import { readFileSync } from "node:fs";
+import { hkdfSync } from "node:crypto";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -23,6 +24,7 @@ import {
   openFrame,
   openFrameWithKey,
   ROOM_LINK_HKDF_SALT,
+  ROOM_LINK_ID_BYTES,
   ROOM_LINK_MEMBER_TOKEN_INFO,
   ROOM_LINK_ROOM_ID_INFO,
   ROOM_LINK_ROOM_KEY_INFO,
@@ -235,6 +237,12 @@ const FIXTURE = JSON.parse(
   ),
 );
 const SEED = decodeRoomLinkSeed(FIXTURE.seed_base64url);
+const hexBytes = (hex) =>
+  Uint8Array.from({ length: hex.length / 2 }, (_, index) =>
+    Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16),
+  );
+const nodeHkdf32 = (seed, salt, info) =>
+  new Uint8Array(hkdfSync("sha256", seed, salt, info, 32));
 
 describe("short-link seed and KDF", () => {
   it("short_url_round_trips_exact_seed", () => {
@@ -263,6 +271,25 @@ describe("short-link seed and KDF", () => {
     assert.equal(material.roomId, FIXTURE.room_id_hex);
     assert.equal(material.memberToken, FIXTURE.member_token_hex);
     assert.equal(material.roomKey, FIXTURE.room_key_hex);
+  });
+
+  it("node_crypto_hkdf_oracle_matches_fixture", () => {
+    const seed = hexBytes(FIXTURE.seed_hex);
+    const salt = new TextEncoder().encode(FIXTURE.salt);
+    const derive = (info) =>
+      nodeHkdf32(seed, salt, new TextEncoder().encode(info));
+    assert.equal(
+      bytesToHex(derive(FIXTURE.info.room_id).slice(0, ROOM_LINK_ID_BYTES)),
+      FIXTURE.room_id_hex,
+    );
+    assert.equal(
+      bytesToHex(derive(FIXTURE.info.member_token)),
+      FIXTURE.member_token_hex,
+    );
+    assert.equal(
+      bytesToHex(derive(FIXTURE.info.room_key)),
+      FIXTURE.room_key_hex,
+    );
   });
 
   it("malformed_short_urls_are_rejected", () => {

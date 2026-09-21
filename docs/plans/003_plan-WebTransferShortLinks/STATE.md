@@ -1,6 +1,6 @@
 # Web Transfer Short Links — Implementation State
 
-Last updated: 2026-09-21 (phase 0 closed; sub-phase 1.1 opened)
+Last updated: 2026-09-21 (sub-phase 1.1 closed; sub-phase 1.2 opened)
 
 ## 0. Resume protocol
 
@@ -24,11 +24,11 @@ All implementation and verification units are assigned to `agent:gpt-5.6-luna` a
 | Field | Value |
 |---|---|
 | Mode | Execute; WIP commits enabled |
-| Current sub-phase | `1.1` |
+| Current sub-phase | `1.2` |
 | Status | `OPEN` |
-| Intent | Native owner protocol v2 and client-selected room ID |
+| Intent | CLI/browser switch to persistent short fragment |
 | Phase file | `phase_02.md` |
-| Next action | Execute sub-phase `1.1` in `phase_02.md` |
+| Next action | Execute sub-phase `1.2` in `phase_02.md` |
 | Assigned model | `agent:gpt-5.6-luna` |
 | Baseline branch | `dev` |
 | Baseline commit | `ad7d0f47d497` |
@@ -68,7 +68,7 @@ Commit mode: WIP commits ON — explicit operator request on 2026-09-21; commit 
 | 2 | `0.2` | `agent:gpt-5.6-luna` | Browser codec/KDF mirror and failure behavior | DONE |
 | 3 | `0.3` | `agent:gpt-5.6-luna` | Cross-language contract and red-check audit | DONE |
 | 4 | `0.4` | `agent:gpt-5.6-luna` | Phase 0 README synchronization | DONE |
-| 5 | `1.1` | `agent:gpt-5.6-luna` | Native owner protocol v2 and client-selected room ID | TODO |
+| 5 | `1.1` | `agent:gpt-5.6-luna` | Native owner protocol v2 and client-selected room ID | DONE |
 | 6 | `1.2` | `agent:gpt-5.6-luna` | CLI/browser switch to persistent short fragment | TODO |
 | 7 | `1.3` | `agent:gpt-5.6-luna` | Negative, legacy-removal, and secrecy tests | TODO |
 | 8 | `1.4` | `agent:gpt-5.6-luna` | Protocol documentation | TODO |
@@ -93,7 +93,8 @@ Append one row after every completed or attempted sub-phase. Use exact commands,
 | 2026-09-21 | `0.1` | `Cargo.toml`, `Cargo.lock`, `src/web_transfer.rs`, `src/web_transfer_protocol.rs`, `tests/fixtures/web_transfer/link_v1.json`, `STATE.md` | `cargo fmt --all -- --check`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo build --locked --all-features`; `cargo test --locked --all-features --lib web_transfer`; `git diff --check` | PASS | 189 web_transfer tests passed | `09ed559` |
 | 2026-09-21 | `0.2` | `web/transfer/src/crypto.js`, `web/transfer/src/secrets.js`, `web/transfer/tests/unit/crypto.test.mjs`, `web/transfer/dist/app.js`, `web/transfer/dist/offer-worker.js`, `STATE.md` | `npm run check --prefix web/transfer`; `rg -n '\\bBuffer\\b' web/transfer/src web/transfer/tests/unit/crypto.test.mjs web/transfer/dist`; `git diff --check` | PASS | 217 browser unit tests passed; bundle rebuild reproduced tracked assets; no Buffer references; offer-worker changed because the normal build emitted the shared browser update | `240dc5e` |
 | 2026-09-21 | `0.3` | `web/transfer/tests/unit/crypto.test.mjs`, `STATE.md` | `node --test tests/unit/crypto.test.mjs`; independent `node:crypto.hkdfSync` oracle; controlled label/seed/truncation red-checks; label duplicate audit; no test stdout/stderr audit; `cargo fmt --all -- --check`; `cargo clippy --locked --all-features --all-targets -- -D warnings`; `cargo build --locked --all-features`; `cargo test --locked --all-features --lib web_transfer`; `npm run check --prefix web/transfer`; `git diff --check`; Cargo.lock diff inspection | PASS | 16 crypto tests; 218 browser tests; 189 Rust tests; all red-checks failed as expected and tree was restored/untouched | `6b6c002` |
-| 2026-09-21 | `0.4` | `README.md` (read-only audit), `docs/transfer/WEB_TRANSFER_PROTOCOL.md` (read-only audit), `STATE.md` | `rg -n -i 'web.?transfer|browser.?to.?browser|room|owner' README.md`; protocol section audit; `npx playwright test tests/e2e/readme.spec.mjs --project=chromium --project=firefox --project=webkit`; inherited phase gates G-FMT/G-LINT/G-BUILD/G-RUST-UNIT/G-JS/G-DIFF | PASS | README remains truthful for the active long URL; no premature short-link promise; README flow 3/3 engines passed; no README/protocol edit needed | pending |
+| 2026-09-21 | `0.4` | `README.md` (read-only audit), `docs/transfer/WEB_TRANSFER_PROTOCOL.md` (read-only audit), `STATE.md` | `rg -n -i 'web.?transfer|browser.?to.?browser|room|owner' README.md`; protocol section audit; `npx playwright test tests/e2e/readme.spec.mjs --project=chromium --project=firefox --project=webkit`; inherited phase gates G-FMT/G-LINT/G-BUILD/G-RUST-UNIT/G-JS/G-DIFF | PASS | README remains truthful for the active long URL; no premature short-link promise; README flow 3/3 engines passed; no README/protocol edit needed | `a249929` |
+| 2026-09-21 | `1.1` | `src/shared.rs`, `src/web_transfer.rs`, `src/web_transfer_cli.rs`, `tests/web_transfer_test.rs`, `STATE.md` | `cargo fmt --all -- --check`; `cargo clippy --locked --all-features --all-targets -- -D warnings`; `cargo build --locked --all-features`; `cargo test --locked --all-features --lib web_transfer -- --test-threads=1`; `cargo test --locked --all-features --test web_transfer_test -- --test-threads=1`; `npm run check --prefix web/transfer`; `git diff --check` | PASS | 194 Rust unit tests; web-transfer integration 40 passed, 1 ignored benchmark; 218 browser tests; v2 owner wire, exact requested IDs, duplicate protection, old/missing-ID rejection, derived reconnect invariants and response mismatch secrecy are covered; URL remains intentionally long for 1.2 cutover | pending |
 
 ## 5. Decision and deviation ledger
 
@@ -118,7 +119,7 @@ evidence during execution.
 |---|---|---|
 | Rust formatting | PASS | `cargo fmt --all -- --check` |
 | Rust clippy, all features, warnings denied | PASS | `cargo clippy --all-features --all-targets -- -D warnings` |
-| Rust unit/integration tests, all features | PASS | `cargo test --locked --all-features --lib web_transfer`: 189 passed, 0 failed |
+| Rust unit/integration tests, all features | PASS | `cargo test --locked --all-features --lib web_transfer`: 194 passed, 0 failed; `cargo test --locked --all-features --test web_transfer_test -- --test-threads=1`: 40 passed, 1 ignored |
 | Rust build, all features | PASS | `cargo build --locked --all-features` |
 | Browser unit tests | PASS | `npm run check --prefix web/transfer`: 218 passed, 0 failed |
 | Browser Chromium E2E | NOT RUN | Implementation not started |
@@ -134,7 +135,7 @@ evidence during execution.
 | Secret/fragment leak audit | NOT RUN | Implementation not started |
 | `git diff --check` | PASS | `git diff --check` |
 
-In-flight: 1.1 — claimed — no implementation written yet.
+In-flight: 1.2 — claimed — no implementation written yet.
 
 Branded-browser rules:
 
@@ -226,8 +227,8 @@ facts without claiming that a fragment is globally secret.
 
 ### Phase status
 
-- Phase 0 — deterministic primitives and parity: TODO
-- Phase 1 — protocol and URL hard cutover: TODO
+- Phase 0 — deterministic primitives and parity: DONE
+- Phase 1 — protocol and URL hard cutover: IN PROGRESS
 - Phase 2 — browser matrix, security audit, final verification: TODO
 
 ### Completion conditions

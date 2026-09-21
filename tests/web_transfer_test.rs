@@ -165,10 +165,11 @@ async fn raw_owner_control(
 #[tokio::test]
 async fn t_web_native_wire() -> Result<()> {
     use bore_cli::shared::{ClientMessage, ServerMessage};
-    use bore_cli::web_transfer::{OwnerToken, WebTransferLimits};
+    use bore_cli::web_transfer::{OwnerToken, RoomId, WebTransferLimits};
 
     let member = OwnerToken::from_bytes([0x31u8; 32]);
     let owner = OwnerToken::from_bytes([0x32u8; 32]);
+    let requested_room_id = RoomId::from_bytes([0x41u8; 16]);
     let member_hash = member.sha256_hash();
     let owner_hash = owner.sha256_hash();
 
@@ -188,7 +189,8 @@ async fn t_web_native_wire() -> Result<()> {
     let (_opener, mut control) = raw_owner_control(port).await?;
     control
         .send(ClientMessage::CreateWebTransferRoom {
-            version: 1,
+            version: 2,
+            room_id: requested_room_id,
             member_token_hash: member_hash,
             owner_token_hash: owner_hash,
             relay_only: false,
@@ -203,6 +205,7 @@ async fn t_web_native_wire() -> Result<()> {
         }) => {
             assert_eq!(base_url, "http://127.0.0.1:8080");
             assert!(!base_url.contains('#'));
+            assert_eq!(room_id, requested_room_id);
             (room_id, owner_epoch)
         }
         other => panic!("expected Created, got {other:?}"),
@@ -226,7 +229,7 @@ async fn t_web_native_wire() -> Result<()> {
     let (_opener, mut control) = raw_owner_control(port).await?;
     control
         .send(ClientMessage::ResumeWebTransferRoom {
-            version: 1,
+            version: 2,
             room_id,
             owner_token: owner,
         })
@@ -264,7 +267,8 @@ async fn t_web_native_wire() -> Result<()> {
     let (_opener, mut control) = raw_owner_control(port).await?;
     control
         .send(ClientMessage::CreateWebTransferRoom {
-            version: 1,
+            version: 2,
+            room_id: RoomId::from_bytes([0x42u8; 16]),
             member_token_hash: member_hash,
             owner_token_hash: owner_hash,
             relay_only: false,
@@ -283,7 +287,8 @@ async fn t_web_native_wire() -> Result<()> {
     let (_opener, mut control) = raw_owner_control(port).await?;
     control
         .send(ClientMessage::CreateWebTransferRoom {
-            version: 2,
+            version: 1,
+            room_id: RoomId::from_bytes([0x43u8; 16]),
             member_token_hash: member_hash,
             owner_token_hash: owner_hash,
             relay_only: false,

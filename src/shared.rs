@@ -1766,14 +1766,21 @@ pub enum ClientMessage {
         reason: Option<String>,
     },
 
-    /// Creates a web-transfer room and takes its owner lease (Phase 1.3).
+    /// Creates a web-transfer room and takes its owner lease (native owner
+    /// protocol v2). The browser control envelopes remain protocol v1; this
+    /// version is deliberately separate because this message is not a
+    /// browser envelope.
     /// Appended LAST: an old server fails the whole frame, so a new client
     /// maps the failure to "upgrade the server and set
     /// --web-transfer-base-url". Carries only token HASHES, never the raw
     /// member token or room key.
     CreateWebTransferRoom {
-        /// Browser/native protocol version (must be 1).
+        /// Native owner protocol version (must be 2).
         version: u16,
+        /// Client-selected room ID derived from the short-link seed.
+        /// Required: a new server must reject an old create frame before it
+        /// allocates a room.
+        room_id: crate::web_transfer::RoomId,
         /// SHA-256 of the member token browsers will present.
         member_token_hash: [u8; 32],
         /// SHA-256 of the CLI owner token.
@@ -1793,7 +1800,7 @@ pub enum ClientMessage {
     /// rides ONLY this authenticated yamux stream; the server hashes it
     /// immediately and drops the stack value after comparison.
     ResumeWebTransferRoom {
-        /// Browser/native protocol version (must be 1).
+        /// Native owner protocol version (must be 2).
         version: u16,
         /// Room to resume.
         room_id: crate::web_transfer::RoomId,
@@ -2067,7 +2074,7 @@ pub enum ServerMessage {
     /// that the client predates web transfer. `base_url` is the origin only,
     /// never carrying a fragment.
     WebTransferRoomCreated {
-        /// Browser/native protocol version.
+        /// Native owner protocol version (must be 2).
         version: u16,
         /// New room ID.
         room_id: crate::web_transfer::RoomId,
@@ -2087,7 +2094,7 @@ pub enum ServerMessage {
     /// attached to this connection under a fresh epoch. Appended LAST, same
     /// wire-compat reason as above.
     WebTransferRoomResumed {
-        /// Browser/native protocol version.
+        /// Native owner protocol version (must be 2).
         version: u16,
         /// Resumed room ID.
         room_id: crate::web_transfer::RoomId,
@@ -2948,7 +2955,8 @@ mod tests {
         let room_id = crate::web_transfer::RoomId::from_bytes([0xabu8; 16]);
         let owner_token = crate::web_transfer::OwnerToken::from_bytes([0xcdu8; 32]);
         let create = ClientMessage::CreateWebTransferRoom {
-            version: 1,
+            version: 2,
+            room_id,
             member_token_hash: [1u8; 32],
             owner_token_hash: [2u8; 32],
             relay_only: false,
@@ -2959,7 +2967,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
 
         let resume = ClientMessage::ResumeWebTransferRoom {
-            version: 1,
+            version: 2,
             room_id,
             owner_token,
         };
@@ -2981,7 +2989,7 @@ mod tests {
         for (msg, tag) in [
             (
                 ServerMessage::WebTransferRoomCreated {
-                    version: 1,
+                    version: 2,
                     room_id,
                     base_url: "https://files.example.com".to_string(),
                     owner_epoch: 0,
@@ -2991,7 +2999,7 @@ mod tests {
             ),
             (
                 ServerMessage::WebTransferRoomResumed {
-                    version: 1,
+                    version: 2,
                     room_id,
                     base_url: "https://files.example.com".to_string(),
                     owner_epoch: 1,
@@ -3004,6 +3012,39 @@ mod tests {
             let back: ServerMessage = serde_json::from_str(&json).unwrap();
             assert_eq!(serde_json::to_string(&back).unwrap(), json);
         }
+    }
+
+    #[test]
+    fn create_v2_round_trips_with_required_room_id() {
+        let create = ClientMessage::CreateWebTransferRoom {
+            version: 2,
+            room_id: crate::web_transfer::RoomId::from_bytes([0xabu8; 16]),
+            member_token_hash: [1u8; 32],
+            owner_token_hash: [2u8; 32],
+            relay_only: false,
+        };
+        let json = serde_json::to_string(&create).unwrap();
+        assert!(json.contains(&"ab".repeat(16)), "{json}");
+        let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), json);
+    }
+
+    #[test]
+    fn missing_room_id_does_not_deserialize() {
+        let mut value = serde_json::to_value(ClientMessage::CreateWebTransferRoom {
+            version: 2,
+            room_id: crate::web_transfer::RoomId::from_bytes([0xabu8; 16]),
+            member_token_hash: [1u8; 32],
+            owner_token_hash: [2u8; 32],
+            relay_only: false,
+        })
+        .unwrap();
+        value
+            .get_mut("CreateWebTransferRoom")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("create object")
+            .remove("room_id");
+        assert!(serde_json::from_value::<ClientMessage>(value).is_err());
     }
 
     #[test]

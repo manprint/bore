@@ -23,8 +23,10 @@ use crate::client::{beat_once, CtrlBeat};
 use crate::mux;
 use crate::shared::{ClientMessage, ControlFrameSummary, Delimited, ServerMessage};
 use crate::transport::{self, Endpoint};
-use crate::web_transfer::{MemberToken, OwnerToken, RoomId, RoomKey};
-use crate::web_transfer_protocol::PROTOCOL_VERSION;
+use crate::web_transfer::{
+    MemberToken, OwnerToken, RoomId, RoomKey, RoomLinkSeed, WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+};
+use crate::web_transfer_protocol::derive_room_link_material;
 
 /// Owner heartbeat period: the server reaps past its own (longer) deadline.
 pub const OWNER_HEARTBEAT: Duration = Duration::from_secs(20);
@@ -39,6 +41,10 @@ pub const RESUME_BACKOFF_MAX_MS: u64 = 5000;
 /// server-chosen string), so this is the whole message.
 pub const OLD_SERVER_ERROR: &str =
     "web transfer requires an upgraded server configured with --web-transfer-base-url";
+/// A peer answered the native owner handshake with a version or room ID that
+/// was not requested. No capability URL is delivered on this path.
+pub const OWNER_PROTOCOL_MISMATCH_ERROR: &str =
+    "web transfer owner protocol mismatch: upgrade the client and server together";
 /// `--relay-only` asked for and NOT confirmed by the server. The field is
 /// additive, so a server that predates it parses the request, creates an
 /// ordinary room and answers success: silence would hand the owner a room
@@ -126,29 +132,55 @@ impl fmt::Debug for CreatedRoom {
 /// Room secrets, generated once per `run_owner_lease` and retained across
 /// reconnects. Only hashes cross the control stream.
 struct OwnerSecrets {
+    seed: RoomLinkSeed,
+    room_id: RoomId,
     member: MemberToken,
     owner: OwnerToken,
     key: RoomKey,
 }
 
 impl OwnerSecrets {
-    fn generate() -> Self {
+    const MAX_SEED_ATTEMPTS: usize = 8;
+
+    fn from_seed(seed: RoomLinkSeed, owner: OwnerToken) -> Result<Self> {
+        let material = derive_room_link_material(&seed);
+        if !material.room_id.is_nonzero() {
+            bail!("short-link seed derived an unusable room ID");
+        }
+        Ok(Self {
+            seed,
+            room_id: material.room_id,
+            member: material.member_token,
+            owner,
+            key: material.room_key,
+        })
+    }
+
+    fn generate() -> Result<Self> {
         use ring::rand::{SecureRandom, SystemRandom};
         let random = SystemRandom::new();
-        let mut bytes = [0u8; 32];
-        let mut fill = || {
-            random.fill(&mut bytes).expect("OS CSPRNG");
-            bytes
-        };
-        Self {
-            member: MemberToken::from_bytes(fill()),
-            owner: OwnerToken::from_bytes(fill()),
-            key: RoomKey::from_bytes(fill()),
+        let mut owner_bytes = [0u8; 32];
+        random
+            .fill(&mut owner_bytes)
+            .map_err(|_| anyhow::anyhow!("OS CSPRNG failed"))?;
+        let owner = OwnerToken::from_bytes(owner_bytes);
+        for _ in 0..Self::MAX_SEED_ATTEMPTS {
+            let mut seed_bytes = [0u8; crate::web_transfer::ROOM_LINK_SEED_BYTES];
+            random
+                .fill(&mut seed_bytes)
+                .map_err(|_| anyhow::anyhow!("OS CSPRNG failed"))?;
+            if let Ok(secrets) = Self::from_seed(RoomLinkSeed::from_bytes(seed_bytes), owner) {
+                return Ok(secrets);
+            }
         }
+        bail!("could not generate a usable short-link room ID")
     }
 }
 
-/// Builds the capability URL: origin + `/transfer/<room>` + fragment secrets.
+/// Builds the temporary v1 capability URL: origin + `/transfer/<room>` +
+/// fragment secrets. Phase 1.2 replaces this with the short-link fragment;
+/// keeping it here during 1.1 makes the owner protocol cutover independently
+/// testable.
 /// Pure, so the exact shape is unit-pinned without a network.
 pub fn build_display_url(
     origin: &str,
@@ -359,13 +391,30 @@ where
             }
         }
         match connect(ClientMessage::ResumeWebTransferRoom {
-            version: PROTOCOL_VERSION,
+            version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
             room_id,
             owner_token,
         })
         .await
         {
-            Ok((control, ServerMessage::WebTransferRoomResumed { owner_epoch, .. })) => {
+            Ok((
+                control,
+                ServerMessage::WebTransferRoomResumed {
+                    version,
+                    room_id: resumed_room_id,
+                    owner_epoch,
+                    ..
+                },
+            )) => {
+                if version != WEB_TRANSFER_OWNER_PROTOCOL_VERSION || resumed_room_id != room_id {
+                    let mut session = OwnerSession {
+                        control,
+                        room_id: resumed_room_id,
+                        epoch: owner_epoch,
+                    };
+                    session.close_bounded().await;
+                    bail!(OWNER_PROTOCOL_MISMATCH_ERROR);
+                }
                 return Ok(ResumeEnd::Resumed(OwnerSession {
                     control,
                     room_id,
@@ -398,13 +447,18 @@ where
     C: FnMut(ClientMessage) -> F,
     F: Future<Output = Result<(Delimited<S>, ServerMessage)>>,
 {
-    let secrets = OwnerSecrets::generate();
+    let secrets = OwnerSecrets::generate()?;
+    debug_assert_eq!(
+        derive_room_link_material(&secrets.seed).room_id,
+        secrets.room_id
+    );
     let member_hash = secrets.member.sha256_hash();
     let owner_hash = secrets.owner.sha256_hash();
     let grace = Duration::from_secs(config.owner_grace_secs);
 
     let (control, reply) = connect(ClientMessage::CreateWebTransferRoom {
-        version: PROTOCOL_VERSION,
+        version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+        room_id: secrets.room_id,
         member_token_hash: member_hash,
         owner_token_hash: owner_hash,
         relay_only: config.relay_only,
@@ -412,12 +466,22 @@ where
     .await?;
     let (room_id, epoch, base_url) = match reply {
         ServerMessage::WebTransferRoomCreated {
+            version,
             room_id,
             base_url,
             owner_epoch,
             relay_only,
             ..
         } => {
+            if version != WEB_TRANSFER_OWNER_PROTOCOL_VERSION || room_id != secrets.room_id {
+                let mut session = OwnerSession {
+                    control,
+                    room_id,
+                    epoch: owner_epoch,
+                };
+                session.close_bounded().await;
+                bail!(OWNER_PROTOCOL_MISMATCH_ERROR);
+            }
             if config.relay_only && !relay_only {
                 // The room EXISTS on the server and would serve direct
                 // transfers. Closing it is part of the refusal: a room the
@@ -703,14 +767,42 @@ mod tests {
 
     #[test]
     fn owner_secrets_are_generated_once_and_only_hashes_are_created() {
-        let first = OwnerSecrets::generate();
-        let second = OwnerSecrets::generate();
+        let first = OwnerSecrets::generate().unwrap();
+        let second = OwnerSecrets::generate().unwrap();
         assert_ne!(first.member.sha256_hash(), second.member.sha256_hash());
         assert_ne!(first.owner.sha256_hash(), second.owner.sha256_hash());
+        assert_ne!(first.room_id, second.room_id);
         // The create message carries hashes, comparable server-side, while the
         // raw values stay in this scope.
         assert_eq!(first.member.sha256_hash().len(), 32);
         assert_eq!(first.owner.sha256_hash().len(), 32);
+    }
+
+    #[test]
+    fn owner_token_is_independent_from_seed() {
+        let seed = RoomLinkSeed::from_bytes([0x55u8; crate::web_transfer::ROOM_LINK_SEED_BYTES]);
+        let first_owner = OwnerToken::from_bytes([0x11u8; 32]);
+        let second_owner = OwnerToken::from_bytes([0x22u8; 32]);
+        let first = OwnerSecrets::from_seed(seed, first_owner).unwrap();
+        let same_seed_other_owner = OwnerSecrets::from_seed(seed, second_owner).unwrap();
+        assert_eq!(first.seed, same_seed_other_owner.seed);
+        assert_eq!(first.room_id, same_seed_other_owner.room_id);
+        assert_eq!(first.member, same_seed_other_owner.member);
+        assert_eq!(first.key, same_seed_other_owner.key);
+        assert_ne!(first.owner, same_seed_other_owner.owner);
+    }
+
+    #[test]
+    fn reconnect_reuses_seed_room_and_owner() {
+        let seed = RoomLinkSeed::from_bytes([0x66u8; crate::web_transfer::ROOM_LINK_SEED_BYTES]);
+        let owner = OwnerToken::from_bytes([0x33u8; 32]);
+        let first = OwnerSecrets::from_seed(seed, owner).unwrap();
+        let reconnected = OwnerSecrets::from_seed(first.seed, first.owner).unwrap();
+        assert_eq!(first.seed, reconnected.seed);
+        assert_eq!(first.room_id, reconnected.room_id);
+        assert_eq!(first.member, reconnected.member);
+        assert_eq!(first.owner, reconnected.owner);
+        assert_eq!(first.key, reconnected.key);
     }
 
     #[test]
@@ -785,7 +877,7 @@ mod tests {
         let room = RoomId::from_bytes([1u8; 16]);
         let token = OwnerToken::from_bytes([2u8; 32]);
         let resume = ClientMessage::ResumeWebTransferRoom {
-            version: 1,
+            version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
             room_id: room,
             owner_token: token,
         };
@@ -794,7 +886,8 @@ mod tests {
             ClientMessage::ResumeWebTransferRoom { .. }
         ));
         let create = ClientMessage::CreateWebTransferRoom {
-            version: 1,
+            version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+            room_id: room,
             member_token_hash: [3u8; 32],
             owner_token_hash: [4u8; 32],
             relay_only: false,
@@ -805,12 +898,14 @@ mod tests {
         ));
     }
 
-    /// Fake connector over fresh duplex pairs: answers Create with a fixed
-    /// room, records every Close. Drives `run_owner_lease_with` with zero
+    /// Fake connector over fresh duplex pairs: answers Create with the
+    /// client-selected room, records every Close. Drives `run_owner_lease_with` with zero
     /// sockets; the recording server task per connection counts closes.
     struct FakeConnector {
-        room: RoomId,
+        room: std::sync::Arc<tokio::sync::Mutex<Option<RoomId>>>,
         closes: std::sync::Arc<tokio::sync::Mutex<Vec<RoomId>>>,
+        response_room: Option<RoomId>,
+        response_version: u16,
         /// A server that knows `relay_only` echoes what it installed. `false`
         /// stands for one that predates the field: it parses the request,
         /// creates an ordinary room and answers success — which is exactly
@@ -824,7 +919,14 @@ mod tests {
             first: ClientMessage,
         ) -> Result<(Delimited<tokio::io::DuplexStream>, ServerMessage)> {
             match first {
-                ClientMessage::CreateWebTransferRoom { relay_only, .. } => {
+                ClientMessage::CreateWebTransferRoom {
+                    room_id,
+                    relay_only,
+                    ..
+                } => {
+                    *self.room.lock().await = Some(room_id);
+                    let response_room = self.response_room.unwrap_or(room_id);
+                    let response_version = self.response_version;
                     let (run_io, srv_io) = tokio::io::duplex(65536);
                     let mut srv = Delimited::new(srv_io);
                     let closes = std::sync::Arc::clone(&self.closes);
@@ -838,8 +940,8 @@ mod tests {
                     Ok((
                         Delimited::new(run_io),
                         ServerMessage::WebTransferRoomCreated {
-                            version: PROTOCOL_VERSION,
-                            room_id: self.room,
+                            version: response_version,
+                            room_id: response_room,
                             base_url: "http://127.0.0.1:8080".to_string(),
                             owner_epoch: 0,
                             relay_only: relay_only && self.relay_only_supported,
@@ -857,12 +959,21 @@ mod tests {
     fn fake_pair() -> (FakeConnector, OwnerClientConfig) {
         (
             FakeConnector {
-                room: RoomId::from_bytes([0x77u8; 16]),
+                room: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
                 closes: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                response_room: None,
+                response_version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
                 relay_only_supported: true,
             },
             OwnerClientConfig::default(),
         )
+    }
+
+    async fn requested_room(fake: &FakeConnector) -> RoomId {
+        fake.room
+            .lock()
+            .await
+            .expect("fake create must have been called")
     }
 
     #[tokio::test]
@@ -890,7 +1001,7 @@ mod tests {
         assert_eq!(outcome, OwnerShutdown::DeliveryAborted);
         // Exactly one close, for the created room.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(*fake.closes.lock().await, vec![fake.room]);
+        assert_eq!(*fake.closes.lock().await, vec![requested_room(&fake).await]);
     }
 
     #[tokio::test]
@@ -925,7 +1036,7 @@ mod tests {
         .expect("run ends")
         .unwrap();
         assert_eq!(outcome, OwnerShutdown::CleanClose);
-        assert_eq!(interrupter.await.unwrap(), fake.room);
+        assert_eq!(interrupter.await.unwrap(), requested_room(&fake).await);
     }
 
     #[tokio::test]
@@ -962,7 +1073,35 @@ mod tests {
         // server did create is closed rather than left reachable.
         assert!(created_rx.await.is_err(), "no room URL is delivered");
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(*fake.closes.lock().await, vec![fake.room]);
+        assert_eq!(*fake.closes.lock().await, vec![requested_room(&fake).await]);
+    }
+
+    #[tokio::test]
+    async fn response_room_mismatch_closes_and_prints_nothing() {
+        let (mut fake, config) = fake_pair();
+        let wrong_room = RoomId::from_bytes([0xa1u8; 16]);
+        fake.response_room = Some(wrong_room);
+        let fake = std::sync::Arc::new(fake);
+        let (created_tx, created_rx) = oneshot::channel();
+        let (_lifecycle_tx, mut lifecycle_rx) = mpsc::channel(4);
+        let mut connect = {
+            let fake = std::sync::Arc::clone(&fake);
+            move |first: ClientMessage| {
+                let fake = std::sync::Arc::clone(&fake);
+                async move { fake.call(first).await }
+            }
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_owner_lease_with(&config, created_tx, &mut lifecycle_rx, &mut connect),
+        )
+        .await
+        .expect("mismatch handling must be bounded")
+        .expect_err("a mismatched response is not a usable room");
+        assert_eq!(error.to_string(), OWNER_PROTOCOL_MISMATCH_ERROR);
+        assert!(created_rx.await.is_err(), "no capability URL is delivered");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(*fake.closes.lock().await, vec![wrong_room]);
     }
 
     #[tokio::test]
@@ -994,7 +1133,7 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, OwnerShutdown::CleanClose);
         let room = interrupter.await.unwrap();
-        assert_eq!(room, fake.room);
+        assert_eq!(room, requested_room(&fake).await);
         // Exactly one close inside a fraction of the one-second bound.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(*fake.closes.lock().await, vec![room]);

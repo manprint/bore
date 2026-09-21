@@ -28,6 +28,9 @@ use tracing::{debug, warn};
 
 /// Browser/native protocol version. Versioned envelopes reject anything else.
 pub const WEB_TRANSFER_PROTOCOL_VERSION: u16 = 1;
+/// Native owner-control protocol version. This is intentionally separate from
+/// [`WEB_TRANSFER_PROTOCOL_VERSION`], which versions the browser envelopes.
+pub const WEB_TRANSFER_OWNER_PROTOCOL_VERSION: u16 = 2;
 /// Number of random bytes carried by a short Web Transfer room link.
 pub const ROOM_LINK_SEED_BYTES: usize = 16;
 /// Canonical Base64URL characters for [`ROOM_LINK_SEED_BYTES`] bytes.
@@ -6301,6 +6304,25 @@ impl OwnerLease {
         })
     }
 
+    /// Creates a room under the client-selected ID and takes its initial
+    /// owner lease. The registry insertion is vacant-only, so a duplicate ID
+    /// cannot replace an existing room.
+    pub fn create_with_id(
+        registry: &WebTransferRegistry,
+        member_hash: [u8; 32],
+        owner_hash: [u8; 32],
+        id: RoomId,
+        relay_only: bool,
+    ) -> Result<Self, WebTransferError> {
+        let room = registry.create_room_with_id(member_hash, owner_hash, id, relay_only)?;
+        Ok(Self {
+            id: room.id,
+            epoch: 0,
+            room: Some(room),
+            closed: false,
+        })
+    }
+
     /// Room this lease holds.
     pub fn room(&self) -> &Arc<WebTransferRoom> {
         self.room
@@ -6577,7 +6599,6 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     use crate::shared::{ClientMessage, ServerMessage};
-    use crate::web_transfer_protocol::PROTOCOL_VERSION;
 
     let idle = || OwnerControlOutcome {
         closed_explicit: false,
@@ -6587,14 +6608,22 @@ where
     match msg {
         ClientMessage::CreateWebTransferRoom {
             version,
+            room_id,
             member_token_hash,
             owner_token_hash,
             relay_only,
         } => {
-            if version != PROTOCOL_VERSION {
+            if version != WEB_TRANSFER_OWNER_PROTOCOL_VERSION {
                 control.send(ServerMessage::Error(format!(
                     "unsupported web-transfer version {version}: upgrade the client and server together"
                 ))).await?;
+                linger_after_error(control).await;
+                return Ok(idle());
+            }
+            if !room_id.is_nonzero() {
+                control
+                    .send(ServerMessage::Error("invalid room ID".to_string()))
+                    .await?;
                 linger_after_error(control).await;
                 return Ok(idle());
             }
@@ -6607,14 +6636,19 @@ where
                 linger_after_error(control).await;
                 return Ok(idle());
             };
-            let lease =
-                OwnerLease::create(&registry, member_token_hash, owner_token_hash, relay_only)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let lease = OwnerLease::create_with_id(
+                &registry,
+                member_token_hash,
+                owner_token_hash,
+                room_id,
+                relay_only,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (id, epoch) = (lease.id(), lease.epoch());
             let base_url = registry.config().base_url.origin().to_string();
             control
                 .send(ServerMessage::WebTransferRoomCreated {
-                    version: PROTOCOL_VERSION,
+                    version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
                     room_id: id,
                     base_url,
                     owner_epoch: epoch,
@@ -6631,10 +6665,17 @@ where
             room_id,
             owner_token,
         } => {
-            if version != PROTOCOL_VERSION {
+            if version != WEB_TRANSFER_OWNER_PROTOCOL_VERSION {
                 control.send(ServerMessage::Error(format!(
                     "unsupported web-transfer version {version}: upgrade the client and server together"
                 ))).await?;
+                linger_after_error(control).await;
+                return Ok(idle());
+            }
+            if !room_id.is_nonzero() {
+                control
+                    .send(ServerMessage::Error("invalid room ID".to_string()))
+                    .await?;
                 linger_after_error(control).await;
                 return Ok(idle());
             }
@@ -6657,7 +6698,7 @@ where
                     let base_url = registry.config().base_url.origin().to_string();
                     control
                         .send(ServerMessage::WebTransferRoomResumed {
-                            version: PROTOCOL_VERSION,
+                            version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
                             room_id: id,
                             base_url,
                             owner_epoch: epoch,
@@ -7330,7 +7371,7 @@ mod owner_control_tests {
     }
 
     #[tokio::test]
-    async fn create_rejects_disabled_service_and_wrong_version_without_allocating() {
+    async fn create_v1_is_rejected_before_allocation() {
         let (owner, member_hash, owner_hash) = owner_pair();
         let _ = owner;
         // Disabled service: generic error, no room. The call is SPAWNED and the
@@ -7342,7 +7383,8 @@ mod owner_control_tests {
                 None,
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
-                    version: 1,
+                    version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+                    room_id: RoomId::from_bytes([1u8; 16]),
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
                     relay_only: false,
@@ -7378,7 +7420,8 @@ mod owner_control_tests {
                 Some(task_registry),
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
-                    version: 2,
+                    version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION - 1,
+                    room_id: RoomId::from_bytes([2u8; 16]),
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
                     relay_only: false,
@@ -7417,7 +7460,8 @@ mod owner_control_tests {
                 None,
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
-                    version: 1,
+                    version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+                    room_id: RoomId::from_bytes([3u8; 16]),
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
                     relay_only: false,
@@ -7457,7 +7501,8 @@ mod owner_control_tests {
                 Some(Arc::new(registry)),
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
-                    version: 1,
+                    version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+                    room_id: RoomId::from_bytes([4u8; 16]),
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
                     relay_only: false,
@@ -7482,6 +7527,35 @@ mod owner_control_tests {
         server_task.await.unwrap().unwrap();
     }
 
+    #[test]
+    fn requested_room_id_is_installed_exactly() {
+        let registry = test_registry();
+        let requested = RoomId::from_bytes([0x91u8; 16]);
+        let lease =
+            OwnerLease::create_with_id(&registry, [1u8; 32], [2u8; 32], requested, false).unwrap();
+        assert_eq!(lease.id(), requested);
+        assert!(registry.room(requested).is_some());
+        lease.close_explicit(&registry);
+        assert!(registry.room(requested).is_none());
+    }
+
+    #[test]
+    fn duplicate_room_id_never_overwrites_existing_room() {
+        let registry = test_registry();
+        let requested = RoomId::from_bytes([0x92u8; 16]);
+        let first = registry
+            .create_room_with_id([1u8; 32], [2u8; 32], requested, false)
+            .unwrap();
+        assert!(registry
+            .create_room_with_id([3u8; 32], [4u8; 32], requested, true)
+            .is_err());
+        let current = registry.room(requested).expect("original room remains");
+        assert!(Arc::ptr_eq(&first, &current));
+        assert!(!current.relay_only);
+        first.destroy("test-cleanup");
+        assert!(registry.remove_room_if_current(requested, &current));
+    }
+
     #[tokio::test]
     async fn resume_zeroizes_or_drops_raw_owner_token_after_hash_scope() {
         let (owner, member_hash, owner_hash) = owner_pair();
@@ -7504,7 +7578,7 @@ mod owner_control_tests {
                 Some(Arc::new(registry)),
                 &mut server,
                 ClientMessage::ResumeWebTransferRoom {
-                    version: 1,
+                    version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
                     room_id: id,
                     owner_token: owner,
                 },
@@ -7530,7 +7604,8 @@ mod owner_control_tests {
                 Some(Arc::new(registry)),
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
-                    version: 1,
+                    version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+                    room_id: RoomId::from_bytes([5u8; 16]),
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
                     relay_only: false,
@@ -7602,7 +7677,8 @@ mod owner_control_tests {
                 Some(task_registry),
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
-                    version: 1,
+                    version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+                    room_id: RoomId::from_bytes([6u8; 16]),
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
                     relay_only: false,
@@ -7652,7 +7728,8 @@ mod owner_control_tests {
                 Some(task_registry),
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
-                    version: 1,
+                    version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+                    room_id: RoomId::from_bytes([7u8; 16]),
                     member_token_hash: member_hash,
                     owner_token_hash: owner_hash,
                     relay_only: false,

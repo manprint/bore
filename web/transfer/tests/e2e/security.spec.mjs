@@ -134,11 +134,40 @@ test.describe.serial("web transfer security", () => {
       // The key is the whole of the confidentiality claim: it decrypts every
       // payload byte and every manifest, and it exists only in this tab.
       for (const frame of sent) {
+        expect(frame, `${name} put the seed on the wire`).not.toContain(env.seedText);
         expect(frame, `${name} put the room key on the wire`).not.toContain(env.roomKey);
       }
       for (const url of urls) {
+        expect(url, `${name} put the seed in a URL`).not.toContain(env.seedText);
         expect(url, `${name} put a secret in a URL`).not.toContain(env.roomKey);
         expect(url, `${name} put the member token in a URL`).not.toContain(env.memberToken);
+      }
+      for (const request of peer.requests) {
+        expect(request.url, `${name} put the seed in an HTTP URL`).not.toContain(env.seedText);
+        expect(request.url, `${name} put a secret in an HTTP URL`).not.toContain(env.roomKey);
+        expect(request.url, `${name} put the member token in an HTTP URL`).not.toContain(env.memberToken);
+        const referer = request.headers.referer;
+        if (referer !== undefined) {
+          expect(referer, `${name} sent a fragment in Referer`).not.toContain("#");
+          expect(referer, `${name} put the seed in Referer`).not.toContain(env.seedText);
+          expect(referer, `${name} put a secret in Referer`).not.toContain(env.roomKey);
+          expect(referer, `${name} put the member token in Referer`).not.toContain(env.memberToken);
+        }
+      }
+      for (const url of peer.websocketUrls) {
+        expect(url, `${name} put the seed in an observed WebSocket URL`).not.toContain(env.seedText);
+        expect(url, `${name} put a secret in an observed WebSocket URL`).not.toContain(env.roomKey);
+        expect(url, `${name} put the member token in an observed WebSocket URL`).not.toContain(env.memberToken);
+      }
+      const pageExposed = await peer.page.evaluate(() => ({
+        body: document.documentElement.outerHTML,
+        title: document.title,
+        diagnostics: JSON.stringify(window.__BORE_TEST__ ?? {}),
+      }));
+      for (const [surface, value] of Object.entries(pageExposed)) {
+        expect(value, `${name} exposed a secret in ${surface}`).not.toContain(env.seedText);
+        expect(value, `${name} exposed a secret in ${surface}`).not.toContain(env.roomKey);
+        expect(value, `${name} exposed a secret in ${surface}`).not.toContain(env.memberToken);
       }
       // The token is a bearer credential for the room: it authenticates the
       // hello and must never be repeated afterwards.

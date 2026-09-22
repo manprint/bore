@@ -358,6 +358,7 @@ test.describe.serial("room", () => {
     await expect(lost.page.locator("#room-status")).toContainText("non disponibile", {
       timeout: 15_000,
     });
+    expect(lost.page.url()).toBe(ghost);
     const inbound = lost.frames.received.map((payload) => {
       try {
         return JSON.parse(String(payload)).type;

@@ -722,6 +722,14 @@ mod tests {
     }
 
     #[test]
+    fn room_link_seed_debug_is_redacted() {
+        let seed = RoomLinkSeed::from_bytes([0xabu8; ROOM_LINK_SEED_BYTES]);
+        let debug = format!("{seed:?}");
+        assert_eq!(debug, "RoomLinkSeed(redacted)");
+        assert!(!debug.contains("ab"), "seed leaked: {debug}");
+    }
+
+    #[test]
     fn token_digest_comparison_is_constant_time_api() {
         let a = sha256_bytes(b"member-token-a");
         let b = sha256_bytes(b"member-token-a");

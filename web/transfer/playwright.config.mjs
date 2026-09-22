@@ -17,7 +17,7 @@ export default defineConfig({
     // Failure-only artifacts, and VIDEO ONLY.
     //
     // A recording of a passing run is a copy of a room's page for no reason;
-    // on a failure it is the only way to see what a headless engine did. It
+    // on a failure it is the only way to see what a headless engine did.
     // The room fragment intentionally remains in the address bar, so a
     // failure recording can contain the capability link. Artifacts stay
     // local/CI-private and are never part of the published web bundle.

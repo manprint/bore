@@ -381,17 +381,25 @@ export async function openPersistentPeer(
   }
   const page = context.pages()[0] ?? (await context.newPage());
   const failures = [];
+  const requests = [];
+  const websocketUrls = [];
   page.on("pageerror", (error) => failures.push(`pageerror: ${error.message}`));
   page.on("console", (message) => {
     if (message.type() === "error") {
       failures.push(`console: ${message.text()}`);
     }
   });
+  page.on("request", (request) => {
+    requests.push({ url: request.url(), headers: request.headers() });
+  });
+  page.on("websocket", (socket) => websocketUrls.push(socket.url()));
   await page.goto(url);
   return {
     context,
     page,
     failures,
+    requests,
+    websocketUrls,
     cleanup: async () => {
       await context.close().catch(() => {});
       rmSync(profile, { recursive: true, force: true });

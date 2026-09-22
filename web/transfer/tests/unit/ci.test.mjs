@@ -34,6 +34,8 @@ describe("ci contract", () => {
     assert.match(config, /executablePath:\s*braveExecutablePath/);
     // Artifacts only on failure: a passing run leaves no copy of a room.
     assert.match(config, /video:\s*"retain-on-failure"/);
+    assert.match(config, /outputDir:\s*"test-results"/);
+    assert.doesNotMatch(config, /outputDir[\s\S]{0,160}(roomUrl|roomSeed|memberToken|roomKey)/i);
     // Traces and screenshots stay OFF: both instrument the page, and this
     // page's CSP refuses what they inject — turning either on makes a WebKit
     // spec fail on the policy working. Measured one at a time, not assumed.

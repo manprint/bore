@@ -610,6 +610,20 @@ describe("room state", () => {
     assert.equal(errorText({ toString: () => "x" }), "Trasferimento non riuscito");
   });
 
+  it("error_text_never_echoes_short_link_material", () => {
+    const capability = [
+      "YVCYDRDYkjNIIyoIIHIH_w",
+      "cfa20bcf70b2a0fd23ba06651bdfb9c6291f66df8e9deb5b342974fc2e3d45d6",
+      "585579f6a4e991c4b8e632e9d79fb73d89fe02e60ec43a8a69158f704cbc61d2",
+    ];
+    for (const code of ["ROOM_UNAVAILABLE", "INTERNAL", "FAILED", "UNKNOWN"]) {
+      const text = errorText(code);
+      for (const secret of capability) {
+        assert.ok(!text.includes(secret), `${code} leaked short-link material`);
+      }
+    }
+  });
+
   it("republish_waits_out_ghost_offers", () => {
     // Absent IDs publish now; IDs still held by our ghost session wait for
     // their offer.removed (the server reaper always ends that wait).

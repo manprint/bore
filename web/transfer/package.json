@@ -12,7 +12,7 @@
     "check": "node --test tests/unit/*.test.mjs && npm run build",
     "test:unit": "node --test tests/unit/*.test.mjs",
     "test:e2e": "playwright test --project=chromium --project=firefox --project=webkit",
-    "test:e2e:branded": "playwright test --project=branded-chrome --project=branded-edge",
+    "test:e2e:branded": "playwright test --project=branded-chrome --project=branded-edge --project=branded-brave",
     "test:perf": "playwright test --config=playwright.perf.config.mjs --project=chromium",
     "perf:crypto": "node tests/perf/crypto-bench.mjs"
   },

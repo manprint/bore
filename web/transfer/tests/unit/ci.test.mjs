@@ -27,9 +27,11 @@ describe("ci contract", () => {
         `the engine matrix lost ${project}`,
       );
     }
-    for (const branded of ["branded-chrome", "branded-edge"]) {
+    for (const branded of ["branded-chrome", "branded-edge", "branded-brave"]) {
       assert.ok(config.includes(`name: "${branded}"`), `${branded} is not declared`);
     }
+    assert.match(config, /BORE_BRAVE_EXECUTABLE_PATH/);
+    assert.match(config, /executablePath:\s*braveExecutablePath/);
     // Artifacts only on failure: a passing run leaves no copy of a room.
     assert.match(config, /video:\s*"retain-on-failure"/);
     // Traces and screenshots stay OFF: both instrument the page, and this
@@ -59,8 +61,23 @@ describe("ci contract", () => {
     assert.ok(!pkg.scripts["test:e2e"].includes("branded"));
     assert.ok(
       pkg.scripts["test:e2e:branded"].includes("--project=branded-chrome") &&
-        pkg.scripts["test:e2e:branded"].includes("--project=branded-edge"),
+        pkg.scripts["test:e2e:branded"].includes("--project=branded-edge") &&
+        pkg.scripts["test:e2e:branded"].includes("--project=branded-brave"),
       "the branded smoke has no script of its own",
+    );
+
+    const workflow = readFileSync(
+      join(root, "..", "..", ".github", "workflows", "ci.yml"),
+      "utf8",
+    );
+    assert.match(workflow, /Web transfer \(branded Chrome\/Edge\/Brave smoke\)/);
+    assert.match(workflow, /brave-browser-archive-keyring\.gpg/);
+    assert.match(workflow, /command -v brave-browser/);
+    assert.match(workflow, /brave-browser --version/);
+    assert.match(
+      workflow,
+      /github\.event_name == 'schedule'[\s\S]*inputs\.only == 'web-transfer'/,
+      "manual web-transfer dispatch must run the branded job",
     );
   });
 

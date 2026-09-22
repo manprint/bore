@@ -9,7 +9,7 @@ on:
   # it. A release gate that duplicated these jobs would drift from them, and the
   # drift would only ever be discovered by shipping something CI had not run.
   workflow_call:
-  # The branded-channel smoke below is opt-in: Chrome and Edge are not on
+  # The branded-channel smoke below is opt-in: Chrome, Edge and Brave are not on
   # every runner image, and a job that quietly skips them is worse than one
   # that never ran.
   workflow_dispatch:
@@ -287,12 +287,14 @@ jobs:
           retention-days: 7
 
   web-transfer-branded:
-    name: Web transfer (branded Chrome/Edge smoke)
-    # Only on a manual run or the weekly schedule: on a push it would either
-    # double the matrix or report a skip that reads like a pass.
+    name: Web transfer (branded Chrome/Edge/Brave smoke)
+    # Only on the weekly schedule or an explicit web-transfer dispatch: on a
+    # push it would either double the matrix or report a skip that reads like
+    # a pass. The explicit input is important: `only: web-transfer` must not
+    # accidentally suppress this job.
     if: >-
-      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
-      && inputs.only != 'web-transfer'
+      github.event_name == 'schedule'
+      || (github.event_name == 'workflow_dispatch' && inputs.only == 'web-transfer')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -321,6 +323,36 @@ jobs:
       - name: Install branded channels
         working-directory: web/transfer
         run: npx playwright install --with-deps chrome msedge
+
+      - name: Install Brave browser
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes curl
+          sudo install --directory --mode=0755 /etc/apt/keyrings
+          curl --fail --silent --show-error --location \
+            --output /tmp/brave-browser-archive-keyring.gpg \
+            https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
+          sudo install --owner=root --group=root --mode=0644 \
+            /tmp/brave-browser-archive-keyring.gpg \
+            /etc/apt/keyrings/brave-browser-archive-keyring.gpg
+          cat <<'EOF' | sudo tee /etc/apt/sources.list.d/brave-browser-release.sources >/dev/null
+          Types: deb
+          URIs: https://brave-browser-apt-release.s3.brave.com/
+          Suites: stable
+          Components: main
+          Signed-By: /etc/apt/keyrings/brave-browser-archive-keyring.gpg
+          EOF
+          sudo apt-get update
+          sudo apt-get install --yes brave-browser
+
+      - name: Preflight branded browsers
+        run: |
+          command -v brave-browser
+          brave-browser --version
+          command -v google-chrome
+          google-chrome --version
+          command -v microsoft-edge
+          microsoft-edge --version
 
       - name: Branded smoke (T-WEB-BRANDED)
         working-directory: web/transfer

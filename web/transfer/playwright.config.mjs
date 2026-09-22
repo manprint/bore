@@ -1,5 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const braveExecutablePath =
+  process.env.BORE_BRAVE_EXECUTABLE_PATH?.trim() || "/usr/bin/brave-browser";
+
 // Default run covers the three open engines. Branded Chrome/Edge are optional
 // named projects (release smoke only), excluded via the --project selection in
 // the test:e2e script, never by deleting them here.
@@ -47,6 +50,13 @@ export default defineConfig({
     {
       name: "branded-edge",
       use: { ...devices["Desktop Chrome"], channel: "msedge" },
+    },
+    {
+      name: "branded-brave",
+      use: {
+        ...devices["Desktop Chrome"],
+        launchOptions: { executablePath: braveExecutablePath },
+      },
     },
   ],
 });

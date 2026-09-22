@@ -1,6 +1,6 @@
 # Web Transfer Short Links — Implementation State
 
-Last updated: 2026-09-22 (sub-phase 2.1 closed; sub-phase 2.2 opened)
+Last updated: 2026-09-22 (sub-phase 2.2 closed; sub-phase 2.3 opened)
 
 ## 0. Resume protocol
 
@@ -24,11 +24,11 @@ All implementation and verification units are assigned to `agent:gpt-5.6-luna` a
 | Field | Value |
 |---|---|
 | Mode | Execute; WIP commits enabled |
-| Current sub-phase | `2.2` |
+| Current sub-phase | `2.3` |
 | Status | `OPEN` |
-| Intent | Chrome/Edge/Brave branded smoke |
+| Intent | Leak audit, history and artifacts |
 | Phase file | `phase_03.md` |
-| Next action | Execute sub-phase `2.2` in `phase_03.md` |
+| Next action | Execute sub-phase `2.3` in `phase_03.md` |
 | Assigned model | `agent:gpt-5.6-luna` |
 | Baseline branch | `dev` |
 | Baseline commit | `ad7d0f47d497` |
@@ -75,8 +75,8 @@ Commit mode: WIP commits ON — explicit operator request on 2026-09-21; commit 
 | 9 | `1.5` | `agent:gpt-5.6-luna` | Rebuild assets/package and run regressions | DONE |
 | 10 | `1.6` | `agent:gpt-5.6-luna` | Phase 1 README synchronization | DONE |
 | 11 | `2.1` | `agent:gpt-5.6-luna` | Chromium/Firefox/WebKit compatibility gates | DONE |
-| 12 | `2.2` | `agent:gpt-5.6-luna` | Chrome/Edge/Brave branded smoke coverage | OPEN |
-| 13 | `2.3` | `agent:gpt-5.6-luna` | Fragment persistence and leak audit | TODO |
+| 12 | `2.2` | `agent:gpt-5.6-luna` | Chrome/Edge/Brave branded smoke coverage | DONE |
+| 13 | `2.3` | `agent:gpt-5.6-luna` | Fragment persistence and leak audit | OPEN |
 | 14 | `2.4` | `agent:gpt-5.6-luna` | Full regression and requirement self-review | TODO |
 | 15 | `2.5` | `agent:gpt-5.6-luna` | Final README synchronization | TODO |
 
@@ -100,7 +100,8 @@ Append one row after every completed or attempted sub-phase. Use exact commands,
 | 2026-09-22 | `1.4` | `docs/transfer/WEB_TRANSFER_PROTOCOL.md`, `STATE.md` (fixture read-only verification) | `node --test tests/unit/crypto.test.mjs` from `web/transfer`; `cargo test --locked --all-features --lib web_transfer_protocol -- --test-threads=1`; deterministic doc/fixture literal audit; `git diff --check` | PASS | 16 browser crypto tests; 35 Rust protocol tests; canonical short URL, strict rejection, three HKDF labels/outputs, owner v2 separation, 128-bit security, collision behavior, key hygiene and fragment threat model verified against `link_v1.json`; no legacy session-storage/scrub wording remains | `4d25de9` |
 | 2026-09-22 | `1.5` | `scripts/web_transfer_e2e.sh`, `web/transfer/playwright.config.mjs`, `web/transfer/tests/e2e/{catalog.spec.mjs,download.spec.mjs,sender-relay.spec.mjs}`, `STATE.md` | `npm run build --prefix web/transfer`; `cargo fmt --all -- --check`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo build --locked --all-features`; `cargo test --locked --all-features --lib web_transfer -- --test-threads=1`; `cargo test --locked --all-features --test web_transfer_test -- --test-threads=1`; `npm run check --prefix web/transfer`; `npm run test:e2e --prefix web/transfer`; `bash scripts/web_transfer_package_test.sh`; `bash scripts/web_transfer_container_test.sh`; `git diff --check` | PASS | 195 Rust unit tests; web-transfer integration 40 passed, 1 ignored benchmark; 216 browser checks; full Playwright matrix 172 passed, 23 skipped; package and container gates passed; browser harness was started but deferred on operator instruction so the repository-level full harness runs once at final verification; targeted browser runs remained green | `10130b0` |
 | 2026-09-22 | `1.6` | `README.md`, `STATE.md` | README legacy-format audit; `npx playwright test tests/e2e/readme.spec.mjs tests/e2e/readme-direct.spec.mjs --project=chromium --project=firefox --project=webkit --workers=1 --reporter=line`; `git diff --check` | PASS | Six README flow tests passed across Chromium, Firefox and WebKit; canonical 22-character short-link example, persistent fragment, copy/refresh behavior, exposure warning and coordinated hard cutover are documented; no active legacy URL/storage wording remains | `a0fc672` |
-| 2026-09-22 | `2.1` | `web/transfer/tests/e2e/room.spec.mjs`, `web/transfer/tests/unit/ci.test.mjs`, `STATE.md` | `node --test tests/unit/ci.test.mjs`; `npm run check --prefix web/transfer`; `npx playwright test tests/e2e/room.spec.mjs --project=chromium --project=firefox --project=webkit --workers=1 --reporter=line`; `git diff --check` | PASS | CI-contract 2/2; JavaScript unit/build check 216/216; room matrix 30/30 on Chromium, Firefox and WebKit; exact short hash, reload/copy, no-storage, no-HKDF/no-WebSocket and shell/WS URL boundaries verified | `pending` |
+| 2026-09-22 | `2.1` | `web/transfer/tests/e2e/room.spec.mjs`, `web/transfer/tests/unit/ci.test.mjs`, `STATE.md` | `node --test tests/unit/ci.test.mjs`; `npm run check --prefix web/transfer`; `npx playwright test tests/e2e/room.spec.mjs --project=chromium --project=firefox --project=webkit --workers=1 --reporter=line`; `git diff --check` | PASS | CI-contract 2/2; JavaScript unit/build check 216/216; room matrix 30/30 on Chromium, Firefox and WebKit; exact short hash, reload/copy, no-storage, no-HKDF/no-WebSocket and shell/WS URL boundaries verified | `cde7776` |
+| 2026-09-22 | `2.2` | `web/transfer/playwright.config.mjs`, `web/transfer/package.json`, `web/transfer/tests/unit/ci.test.mjs`, `.github/workflows/ci.yml`, `STATE.md` | `node --test tests/unit/ci.test.mjs`; `npm run test:e2e:branded -- --list`; `npx playwright test tests/e2e/room.spec.mjs tests/e2e/sender-relay.spec.mjs --project=branded-chrome --project=branded-brave --workers=1 --reporter=line`; `actionlint -no-color -oneline .github/workflows/ci.yml` (NOT RUN: actionlint unavailable); `git diff --check` | PASS WITH CI REQUIRED | CI-contract 2/2; branded Chrome+Brave smoke 22/22; package script enumerates all three branded projects and workflow installs/preflights Brave without silent skip; Edge executable is absent locally and remains a required CI result | `pending` |
 
 ## 5. Decision and deviation ledger
 
@@ -131,9 +132,9 @@ evidence during execution.
 | Browser Chromium E2E | PASS | `npm run test:e2e --prefix web/transfer`: full matrix completed with no failures |
 | Browser Firefox E2E | PASS | `npm run test:e2e --prefix web/transfer`: full matrix completed with no failures |
 | Browser WebKit E2E | PASS | `npm run test:e2e --prefix web/transfer`: full matrix completed with no failures |
-| Branded Chrome smoke | NOT RUN | Implementation not started |
-| Branded Edge smoke | NOT RUN | Implementation not started |
-| Branded Brave smoke | NOT RUN | Implementation not started |
+| Branded Chrome smoke | PASS | Local targeted smoke: 11/11 on `branded-chrome` |
+| Branded Edge smoke | NOT RUN | `microsoft-edge` is not installed locally; `.github/workflows/ci.yml` installs and preflights it; final CI result required |
+| Branded Brave smoke | PASS | Local targeted smoke: 11/11 on `branded-brave` using `/usr/bin/brave-browser` |
 | Web Transfer shell/E2E harness | DEFERRED | Targeted Rust HTTP tests and full package Playwright matrix passed; repository-level `scripts/web_transfer_e2e.sh` is intentionally deferred to final verification per operator instruction |
 | Asset rebuild cleanliness | PASS | `npm run check --prefix web/transfer`: unit asset reproducibility assertion passed; normal build completed |
 | Independent Node HKDF oracle and primitive red-check audit | PASS | `node:crypto.hkdfSync` matched fixture; label, final-seed-character, and RoomId-width mutations failed as expected; no source mutation remained |
@@ -141,7 +142,7 @@ evidence during execution.
 | Secret/fragment leak audit | PASS | Runtime/source audit plus unit/E2E assertions: no storage recovery, no legacy parser, seed/member/key absent from error/URL paths; negative literals remain only in dedicated tests/docs |
 | `git diff --check` | PASS | `git diff --check` |
 
-In-flight: 2.2 — opened after 2.1 PASS; extend the branded Chrome/Edge/Brave smoke configuration and CI contract.
+In-flight: 2.3 — opened after 2.2 PASS; audit secret boundaries, history persistence and failure artifacts.
 
 Branded-browser rules:
 

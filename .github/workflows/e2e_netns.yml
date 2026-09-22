@@ -121,6 +121,12 @@ jobs:
           # newer than src/ so the netns harness staleness guard passes.
           chmod +x target/release/bore
           touch target/release/bore
+          # The privileged transfer-link harness keeps the local debug-path
+          # default, while this workflow deliberately ships the release build.
+          # Point that path at the exact artifact under test; never rebuild a
+          # second binary or let the harness silently test a stale checkout.
+          mkdir -p target/debug
+          ln -sfn ../release/bore target/debug/bore
           chmod +x scripts/*.sh
           # socat / iperf3 are required by the netns tests (else they SKIP);
           # wrk is an optional load generator for the bench scripts (they fall

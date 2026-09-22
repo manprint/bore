@@ -6,15 +6,18 @@ import { defineConfig, devices } from "@playwright/test";
 export default defineConfig({
   testDir: "./tests/e2e",
   fullyParallel: true,
+  // Each spec starts real loopback servers. A single worker keeps Chromium's
+  // file/relay scenarios deterministic without changing per-spec checks.
+  workers: 1,
   reporter: "list",
   use: {
     // Failure-only artifacts, and VIDEO ONLY.
     //
     // A recording of a passing run is a copy of a room's page for no reason;
     // on a failure it is the only way to see what a headless engine did. It
-    // is safe to keep because the app scrubs the room fragment out of the
-    // address bar as soon as it has read it (`src/secrets.js`), so the
-    // recording never shows the member token or the room key.
+    // The room fragment intentionally remains in the address bar, so a
+    // failure recording can contain the capability link. Artifacts stay
+    // local/CI-private and are never part of the published web bundle.
     //
     // Traces and screenshots are OFF, and that is a MEASUREMENT rather than a
     // preference: both INSTRUMENT the page — trace snapshots inject their

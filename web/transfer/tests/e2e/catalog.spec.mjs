@@ -124,11 +124,10 @@ async function catalogSnapshot(page) {
   return page.evaluate(() => window.__BORE_TEST__.getCatalogSnapshot());
 }
 
-async function roomKeyOf(page) {
-  return page.evaluate((id) => {
-    const raw = window.sessionStorage.getItem(`bore-transfer-v1:${id}`);
-    return JSON.parse(raw).k;
-  }, env.roomId);
+function roomKeyOf(roomEnv) {
+  // The short-link cutover deliberately keeps secrets out of browser
+  // storage. The independent Node oracle is the test's cross-check view.
+  return roomEnv.roomKey;
 }
 
 function checkMac(roomIdHex, roomKeyHex, manifest, macHex) {
@@ -165,7 +164,7 @@ test.describe.serial("offer", () => {
     // MAC cross-check from B's independent view and session key.
     const catalog = await catalogSnapshot(b.page);
     expect(catalog.length).toBe(2);
-    const keyB = await roomKeyOf(b.page);
+    const keyB = roomKeyOf(env);
     for (const offer of catalog) {
       expect(checkMac(env.roomId, keyB, offer.manifest, offer.mac)).toBe(true);
     }
@@ -235,7 +234,10 @@ test.describe.serial("folder offer", () => {
     browser,
     browserName,
   }) => {
-    const handlePath = browserName === "chromium";
+    const handlePath =
+      browser.browserType().name() === "chromium" ||
+      test.info().project.name === "chromium" ||
+      (browserName ?? test.info().project.use.defaultBrowserType) === "chromium";
     const a = await openCatalogPeer(browser, env.roomUrl, { seedPicker: handlePath });
     const b = await openCatalogPeer(browser, env.roomUrl);
     const c = await openCatalogPeer(browser, env.roomUrl);
@@ -264,7 +266,7 @@ test.describe.serial("folder offer", () => {
     const offer = catalog[0];
     expect(offer.manifest.kind).toBe("folder");
     expect(offer.manifest.label).toBe("albero");
-    expect(checkMac(env.roomId, await roomKeyOf(b.page), offer.manifest, offer.mac)).toBe(true);
+    expect(checkMac(env.roomId, roomKeyOf(env), offer.manifest, offer.mac)).toBe(true);
 
     const files = [
       "albero/alfa.txt",

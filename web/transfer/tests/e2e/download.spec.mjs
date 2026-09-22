@@ -24,7 +24,10 @@ let fileHashHex = null;
 const multiFiles = new Map();
 
 test.beforeAll(async () => {
-  env = await spawnRoomEnv();
+  // Keep the 8 MiB cancellation fixture in `connecting` long enough for the
+  // assertion to observe and cancel it; the gate is about cancellation, not
+  // the host's unconstrained loopback throughput.
+    env = await spawnRoomEnv({ relayRate: 1024 * 1024 });
   roomDir = mkdtempSync(join(tmpdir(), "bore-download-"));
   fileBytes = Buffer.alloc(2 * 1024 * 1024 + 7);
   for (let i = 0; i < fileBytes.length; i++) {

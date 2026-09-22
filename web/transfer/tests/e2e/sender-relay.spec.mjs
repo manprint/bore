@@ -271,10 +271,7 @@ test.describe.serial("sender-relay", () => {
         transferId: ticket.transferId,
         attemptId: ticket.attemptId,
         ticketHex: ticket.ticket,
-        roomKeyHex: await b.page.evaluate(
-          (id) => JSON.parse(window.sessionStorage.getItem(`bore-transfer-v1:${id}`)).k,
-          env.roomId,
-        ),
+        roomKeyHex: env.roomKey,
         expectedHash: fileHashHex,
       },
     );

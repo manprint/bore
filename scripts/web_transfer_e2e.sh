@@ -146,12 +146,12 @@ fi
 
 if wants browser; then
   say "browser — Playwright on $ENGINES"
-  projects=""
   IFS=',' read -r -a engines <<<"$ENGINES"
   for engine in "${engines[@]}"; do
-    projects="$projects --project=$engine"
+    # Match CI's engine matrix: one browser process owns the runner, and the
+    # cross-engine negotiation matrix is exercised by its dedicated stage.
+    run "browser-$engine" bash -c 'cd "$0" && npx playwright test --project="$1" --grep-invert "T-WEB-CROSS" --workers=1 --reporter=line' "$web" "$engine"
   done
-  run browser bash -c 'cd "$0" && npx playwright test "$@" --reporter=line' "$web" $projects
 else
   echo "SKIP browser (not in STAGES=$STAGES)"
 fi

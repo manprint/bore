@@ -1,6 +1,6 @@
 # Web Transfer Short Links — Implementation State
 
-Last updated: 2026-09-22 (sub-phase 2.3 closed; sub-phase 2.4 opened)
+Last updated: 2026-09-22 (sub-phase 2.4 closed; sub-phase 2.5 opened)
 
 ## 0. Resume protocol
 
@@ -24,11 +24,11 @@ All implementation and verification units are assigned to `agent:gpt-5.6-luna` a
 | Field | Value |
 |---|---|
 | Mode | Execute; WIP commits enabled |
-| Current sub-phase | `2.4` |
+| Current sub-phase | `2.5` |
 | Status | `OPEN` |
-| Intent | Full regression and requirement self-review |
+| Intent | Final README synchronization |
 | Phase file | `phase_03.md` |
-| Next action | Execute sub-phase `2.4` in `phase_03.md` |
+| Next action | Execute sub-phase `2.5` in `phase_03.md` |
 | Assigned model | `agent:gpt-5.6-luna` |
 | Baseline branch | `dev` |
 | Baseline commit | `ad7d0f47d497` |
@@ -77,8 +77,8 @@ Commit mode: WIP commits ON — explicit operator request on 2026-09-21; commit 
 | 11 | `2.1` | `agent:gpt-5.6-luna` | Chromium/Firefox/WebKit compatibility gates | DONE |
 | 12 | `2.2` | `agent:gpt-5.6-luna` | Chrome/Edge/Brave branded smoke coverage | DONE |
 | 13 | `2.3` | `agent:gpt-5.6-luna` | Fragment persistence and leak audit | DONE |
-| 14 | `2.4` | `agent:gpt-5.6-luna` | Full regression and requirement self-review | OPEN |
-| 15 | `2.5` | `agent:gpt-5.6-luna` | Final README synchronization | TODO |
+| 14 | `2.4` | `agent:gpt-5.6-luna` | Full regression and requirement self-review | DONE |
+| 15 | `2.5` | `agent:gpt-5.6-luna` | Final README synchronization | OPEN |
 
 Never overlap these units. Later units depend on the frozen outputs and protocol choices made by
 earlier units.
@@ -103,6 +103,8 @@ Append one row after every completed or attempted sub-phase. Use exact commands,
 | 2026-09-22 | `2.1` | `web/transfer/tests/e2e/room.spec.mjs`, `web/transfer/tests/unit/ci.test.mjs`, `STATE.md` | `node --test tests/unit/ci.test.mjs`; `npm run check --prefix web/transfer`; `npx playwright test tests/e2e/room.spec.mjs --project=chromium --project=firefox --project=webkit --workers=1 --reporter=line`; `git diff --check` | PASS | CI-contract 2/2; JavaScript unit/build check 216/216; room matrix 30/30 on Chromium, Firefox and WebKit; exact short hash, reload/copy, no-storage, no-HKDF/no-WebSocket and shell/WS URL boundaries verified | `cde7776` |
 | 2026-09-22 | `2.2` | `web/transfer/playwright.config.mjs`, `web/transfer/package.json`, `web/transfer/tests/unit/ci.test.mjs`, `.github/workflows/ci.yml`, `STATE.md` | `node --test tests/unit/ci.test.mjs`; `npm run test:e2e:branded -- --list`; `npx playwright test tests/e2e/room.spec.mjs tests/e2e/sender-relay.spec.mjs --project=branded-chrome --project=branded-brave --workers=1 --reporter=line`; `actionlint -no-color -oneline .github/workflows/ci.yml` (NOT RUN: actionlint unavailable); `git diff --check` | PASS WITH CI REQUIRED | CI-contract 2/2; branded Chrome+Brave smoke 22/22; package script enumerates all three branded projects and workflow installs/preflights Brave without silent skip; Edge executable is absent locally and remains a required CI result | `c85eea2` |
 | 2026-09-22 | `2.3` | `src/web_transfer.rs`, `web/transfer/playwright.config.mjs`, `web/transfer/src/state.js`, `web/transfer/tests/e2e/{helpers.mjs,room.spec.mjs,security.spec.mjs}`, `web/transfer/tests/unit/{ci.test.mjs,state.test.mjs}`, `STATE.md` | `cargo fmt --all -- --check`; `cargo test --locked --all-features --lib debug_is_redacted -- --test-threads=1`; `node --test tests/unit/secrets.test.mjs tests/unit/ci.test.mjs`; `node --test tests/unit/state.test.mjs`; `npm run check --prefix web/transfer`; `npx playwright test tests/e2e/security.spec.mjs tests/e2e/room.spec.mjs --project=chromium --project=firefox --project=webkit --workers=1 --reporter=line`; `git diff --check` | PASS WITH CI REQUIRED | Rust redaction 3/3; JS targeted state 25/25 plus CI/secrets 5/5; npm check 216/216 before the added state assertion; security+room 45/45 on Chromium, Firefox and WebKit; HTTP/WS/Referer/DOM/diagnostics boundaries, hash persistence, static artifact path verified; controlled red-check failed 24/25 with a temporary seed-in-error mutation and passed after restore; full final gates intentionally deferred to CI per operator instruction | `pending` |
+| 2026-09-22 | `2.3` | `src/web_transfer.rs`, `web/transfer/playwright.config.mjs`, `web/transfer/src/state.js`, `web/transfer/tests/e2e/{helpers.mjs,room.spec.mjs,security.spec.mjs}`, `web/transfer/tests/unit/{ci.test.mjs,state.test.mjs}`, `STATE.md` | `cargo fmt --all -- --check`; `cargo test --locked --all-features --lib debug_is_redacted -- --test-threads=1`; `node --test tests/unit/secrets.test.mjs tests/unit/ci.test.mjs`; `node --test tests/unit/state.test.mjs`; `npm run check --prefix web/transfer`; `npx playwright test tests/e2e/security.spec.mjs tests/e2e/room.spec.mjs --project=chromium --project=firefox --project=webkit --workers=1 --reporter=line`; `git diff --check` | PASS WITH CI REQUIRED | Rust redaction 3/3; JS targeted state 25/25 plus CI/secrets 5/5; npm check 216/216 before the added state assertion; security+room 45/45 on Chromium, Firefox and WebKit; HTTP/WS/Referer/DOM/diagnostics boundaries, hash persistence, static artifact path verified; controlled red-check failed 24/25 with a temporary seed-in-error mutation and passed after restore; full final gates intentionally deferred to CI per operator instruction | `344f69f` |
+| 2026-09-22 | `2.4` | `STATE.md` | Targeted self-review: diff/name/status audit; canonical fixture and stdout URL regex audit; D1–D10 mapping; protocol-version and room-ID path review; runtime legacy/storage/history audit; Playwright artifact policy audit; `git diff --check` | PASS WITH CI REQUIRED | Zero blocker/major findings; mapping recorded below; final full Rust/browser/harness/package/container gates intentionally deferred to CI per operator instruction; working tree clean | `pending` |
 
 ## 5. Decision and deviation ledger
 
@@ -117,6 +119,21 @@ changes only.
 If a deviation becomes necessary, add a new row with: observed evidence, affected tests/files,
 security and compatibility impact, operator decision, and the phase updates required. Never edit
 the original decision away.
+
+### 5.1 Frozen decision evidence
+
+| Decision | Code and tests that prove it |
+|---|---|
+| D1 | `src/web_transfer_cli.rs`, `web/transfer/src/secrets.js`, fixture `tests/fixtures/web_transfer/link_v1.json`; `secrets.test.mjs` and room E2E assert `/transfer/#` plus exactly 22 canonical Base64URL characters |
+| D2 | `src/web_transfer.rs`, `web/transfer/src/crypto.js`, `web/transfer/tests/unit/crypto.test.mjs`, `src/web_transfer_protocol.rs`; deterministic fixture and independent Node HKDF oracle cover the three labels and RoomId truncation |
+| D3 | `web/transfer/src/crypto.js` native WebCrypto HKDF path and `main.js` pre-session error; crypto/unit and room/security E2E cover unavailable support before WebSocket |
+| D4 | `CreateWebTransferRoom` in `src/shared.rs`, `OwnerLease::create_with_id`/`serve_owner_first_message` in `src/web_transfer.rs`, `tests/web_transfer_test.rs`; owner protocol v2 and relay-only echo tests cover coordinated cutover |
+| D5 | `web/transfer/src/secrets.js` leaves `URL.hash` intact and `main.js` reuses it; room/security E2E cover reload, copy and unavailable-room persistence |
+| D6 | `parseShortRoomUrl` rejects legacy/query/path variants; `web/transfer/tests/unit/secrets.test.mjs` and security E2E cover pre-WebSocket rejection and no fallback/storage |
+| D7 | `web/transfer/playwright.config.mjs`, `package.json`, `.github/workflows/ci.yml`; Chromium/Firefox/WebKit matrix plus branded Chrome/Edge/Brave workflow and explicit local Chrome/Brave smoke |
+| D8 | Browser sends only derived `/transfer/ws/control/<RoomId>` and `src/web_transfer_http.rs` handles the derived room channel; HTTP/WS/Referer assertions prove seed/key absence from server-facing paths |
+| D9 | `OwnerToken` remains independently generated in `src/web_transfer_cli.rs`; owner lifecycle, resume and response-redaction tests keep it separate from the browser seed/member capability |
+| D10 | Browser `PROTOCOL_VERSION = 1` in `web/transfer/src/protocol.js`; native `WEB_TRANSFER_OWNER_PROTOCOL_VERSION = 2` in `src/web_transfer.rs`; Rust protocol and integration suites cover both domains |
 
 ## 6. Gate ledger
 
@@ -137,13 +154,14 @@ evidence during execution.
 | Branded Edge smoke | NOT RUN | `microsoft-edge` is not installed locally; `.github/workflows/ci.yml` installs and preflights it; final CI result required |
 | Branded Brave smoke | PASS | Local targeted smoke: 11/11 on `branded-brave` using `/usr/bin/brave-browser` |
 | Web Transfer shell/E2E harness | DEFERRED | Targeted Rust HTTP tests and full package Playwright matrix passed; repository-level `scripts/web_transfer_e2e.sh` is intentionally deferred to final verification per operator instruction |
+| Final full CI gate | PENDING CI | Full Rust/browser/harness/package/container regression is intentionally not run locally; `dev` push and the required CI result are the release gate |
 | Asset rebuild cleanliness | PASS | `npm run check --prefix web/transfer`: unit asset reproducibility assertion passed; normal build completed |
 | Independent Node HKDF oracle and primitive red-check audit | PASS | `node:crypto.hkdfSync` matched fixture; label, final-seed-character, and RoomId-width mutations failed as expected; no source mutation remained |
 | README contract audit | PASS | Active README audit found 0 legacy URL/storage hits; canonical short-link and persistent-fragment behavior are covered by the six README E2E tests |
 | Secret/fragment leak audit | PASS | Runtime/source audit plus unit/E2E assertions: no storage recovery, no legacy parser, seed/member/key absent from error/URL paths; negative literals remain only in dedicated tests/docs |
 | `git diff --check` | PASS | `git diff --check` |
 
-In-flight: 2.3 — opened after 2.2 PASS; audit secret boundaries, history persistence and failure artifacts.
+In-flight: 2.5 — opened after 2.4 PASS WITH CI REQUIRED; synchronize README with the final browser matrix, security consequences and CI commands.
 
 Branded-browser rules:
 

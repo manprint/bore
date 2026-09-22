@@ -2547,9 +2547,15 @@ same-origin requirement and the page will not load.
 
 ```bash
 bore transfer web --to https://files.example.com
-room: https://files.example.com/transfer/8f1c…#m=…&k=…
+room: https://files.example.com/transfer/#YVCYDRDYkjNIIyoIIHIH_w
 room active; press Ctrl+C to close
 ```
+
+The printed URL is the complete room capability. The part after `#` is a 22-character
+URL-safe seed; the browser derives the room ID, member token and room key locally from it.
+The `#` is essential: URL fragments are not sent to bore, a reverse proxy, or a server
+log. This is a hard cutover, so upgrade the server and CLI together; links from older
+builds are not supported.
 
 | Client flag | Env | Default | Meaning |
 |---|---|---|---|
@@ -2638,10 +2644,17 @@ launched, so a pipe reading stdout is never beaten by the browser.
   eight (31.00 MiB/s), against 2 of 3 and 0 of 3 before. Either way the transfer is
   correct: every one of them arrived whole and hash-verified with no user action, and the
   direct path is the one that keeps the operator's bandwidth off the wire.
-- **The fragment (`#m=…&k=…`) is the capability.** It holds the room key and the member
-  token, and a URL fragment is never sent to a server: not to bore, not to a proxy, not into
-  a log or the admin API. Share the whole link only with the people who may join, over a
-  channel you trust. Anyone who has it can join the room.
+- **The fragment (`#YVCYDRDYkjNIIyoIIHIH_w`) is the capability.** It is a 22-character,
+  unpadded Base64URL seed from which the browser derives the room ID, member token and room
+  key. The `#` is required because a URL fragment is never sent to bore, a proxy, a log or
+  the admin API. The fragment stays in the address bar and is copied with the complete URL;
+  `Copia link room` copies the same capability and a refresh uses the same fragment. Share
+  the whole link only with the people who may join, over a channel you trust. Anyone who
+  has it can join the room.
+- **Treat the link as a secret.** Browser history, screenshots and screen sharing can show
+  the fragment. If it leaks, close that room with Ctrl+C and create a new one. The short-link
+  format is a hard cutover: update the server and CLI together, and do not expect links from
+  older builds to work.
 - **Ctrl+C destroys the room immediately** — the page, the control sockets and any transfer
   in flight. So do `SIGTERM` (`docker stop`, systemd) and `SIGHUP` (the shell that started
   it going away). A second signal forces the process out without waiting.
@@ -2769,12 +2782,12 @@ saved, because nothing verified as a whole. A `Riparti da zero` ("start over") b
 the only thing that discards those bytes and downloads the new content — one explicit
 gesture, never automatic.
 
-**Reloading the tab.** The fragment is consumed once, moved into that tab's
-`sessionStorage` and scrubbed from the address bar — so the room key never sits in the
-browser history. Reloading the *same* tab therefore works; opening
-`https://…/transfer/<id>` in another tab or another browser without the fragment shows
-`Link incompleto` ("incomplete link"). Use the full link again, or `Copia link room`
-("copy room link") from a tab that is already in.
+**Reloading the tab.** The fragment remains in the address bar and browser history; it is
+never moved into page storage or scrubbed. Reloading the *same* tab therefore uses the same
+capability, and opening the full copied URL in another tab or browser joins the same room.
+Opening only `/transfer/` without the `#TOKEN` shows `Link incompleto` ("incomplete link").
+Use the complete URL again, or `Copia link room` ("copy room link") from a tab that is
+already in.
 
 **Browsers.** The room runs on Chrome/Chromium, Firefox and Safari (WebKit); every browser
 test in this repository runs on all three engines. A transfer needs OPFS to stage the
@@ -2897,7 +2910,7 @@ Nothing below needs a second tool: one server, one `bore transfer web`, three br
 |---|---|---|
 | `web transfer requires an upgraded server configured with --web-transfer-base-url` | The server has the feature off, or is older than the command | Start the server with `--web-transfer-base-url`, and check `bore --version` on both sides |
 | The room link 404s, or the page loads but never connects | `--web-transfer-base-url` is not the origin the browser actually uses, or a proxy is not forwarding the WebSocket upgrade | Set the base URL to the browser-facing origin; allow `Upgrade: websocket` on that path |
-| `Link incompleto` ("incomplete link") | The URL was opened without its `#…` fragment — usually copied from the address bar of a tab that had already scrubbed it, or pasted into another browser | Share the link the CLI printed, or use `Copia link room` from a tab that is in the room |
+| `Link incompleto` ("incomplete link") | The URL was opened without its `#…` fragment — for example only the `/transfer/` path was copied, or a browser/share tool dropped the fragment | Share the complete link the CLI printed, or use `Copia link room` from a tab that is in the room |
 | `Room non disponibile` ("room unavailable") | The `bore transfer web` process exited, or stayed away past `--web-transfer-owner-grace` | Start a new room; the old URL is dead by design. Raise the grace if flaky links are normal for you |
 | `Spazio su disco insufficiente` ("not enough disk space") | The browser's storage estimate cannot hold the staged file | Free space, save/discard old staged downloads, or leave private/incognito mode — its quota is much smaller |
 | `Download non supportato da questo browser` | No OPFS in this browser or context | Use an up-to-date Chrome/Firefox/Safari over HTTPS or loopback; publishing still works without OPFS |

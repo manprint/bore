@@ -1,6 +1,6 @@
 # Web Transfer Short Links — Implementation State
 
-Last updated: 2026-09-22 (sub-phase 2.4 closed; sub-phase 2.5 opened)
+Last updated: 2026-09-22 (sub-phase 2.5 closed; implementation ready for final CI)
 
 ## 0. Resume protocol
 
@@ -24,11 +24,11 @@ All implementation and verification units are assigned to `agent:gpt-5.6-luna` a
 | Field | Value |
 |---|---|
 | Mode | Execute; WIP commits enabled |
-| Current sub-phase | `2.5` |
-| Status | `OPEN` |
-| Intent | Final README synchronization |
+| Current sub-phase | `COMPLETE` |
+| Status | `PASS WITH CI REQUIRED` |
+| Intent | Implementation complete; final full regression belongs to CI |
 | Phase file | `phase_03.md` |
-| Next action | Execute sub-phase `2.5` in `phase_03.md` |
+| Next action | Push `dev`, follow the final CI gate, and tag only after green |
 | Assigned model | `agent:gpt-5.6-luna` |
 | Baseline branch | `dev` |
 | Baseline commit | `ad7d0f47d497` |
@@ -78,7 +78,7 @@ Commit mode: WIP commits ON — explicit operator request on 2026-09-21; commit 
 | 12 | `2.2` | `agent:gpt-5.6-luna` | Chrome/Edge/Brave branded smoke coverage | DONE |
 | 13 | `2.3` | `agent:gpt-5.6-luna` | Fragment persistence and leak audit | DONE |
 | 14 | `2.4` | `agent:gpt-5.6-luna` | Full regression and requirement self-review | DONE |
-| 15 | `2.5` | `agent:gpt-5.6-luna` | Final README synchronization | OPEN |
+| 15 | `2.5` | `agent:gpt-5.6-luna` | Final README synchronization | DONE |
 
 Never overlap these units. Later units depend on the frozen outputs and protocol choices made by
 earlier units.
@@ -105,6 +105,7 @@ Append one row after every completed or attempted sub-phase. Use exact commands,
 | 2026-09-22 | `2.3` | `src/web_transfer.rs`, `web/transfer/playwright.config.mjs`, `web/transfer/src/state.js`, `web/transfer/tests/e2e/{helpers.mjs,room.spec.mjs,security.spec.mjs}`, `web/transfer/tests/unit/{ci.test.mjs,state.test.mjs}`, `STATE.md` | `cargo fmt --all -- --check`; `cargo test --locked --all-features --lib debug_is_redacted -- --test-threads=1`; `node --test tests/unit/secrets.test.mjs tests/unit/ci.test.mjs`; `node --test tests/unit/state.test.mjs`; `npm run check --prefix web/transfer`; `npx playwright test tests/e2e/security.spec.mjs tests/e2e/room.spec.mjs --project=chromium --project=firefox --project=webkit --workers=1 --reporter=line`; `git diff --check` | PASS WITH CI REQUIRED | Rust redaction 3/3; JS targeted state 25/25 plus CI/secrets 5/5; npm check 216/216 before the added state assertion; security+room 45/45 on Chromium, Firefox and WebKit; HTTP/WS/Referer/DOM/diagnostics boundaries, hash persistence, static artifact path verified; controlled red-check failed 24/25 with a temporary seed-in-error mutation and passed after restore; full final gates intentionally deferred to CI per operator instruction | `pending` |
 | 2026-09-22 | `2.3` | `src/web_transfer.rs`, `web/transfer/playwright.config.mjs`, `web/transfer/src/state.js`, `web/transfer/tests/e2e/{helpers.mjs,room.spec.mjs,security.spec.mjs}`, `web/transfer/tests/unit/{ci.test.mjs,state.test.mjs}`, `STATE.md` | `cargo fmt --all -- --check`; `cargo test --locked --all-features --lib debug_is_redacted -- --test-threads=1`; `node --test tests/unit/secrets.test.mjs tests/unit/ci.test.mjs`; `node --test tests/unit/state.test.mjs`; `npm run check --prefix web/transfer`; `npx playwright test tests/e2e/security.spec.mjs tests/e2e/room.spec.mjs --project=chromium --project=firefox --project=webkit --workers=1 --reporter=line`; `git diff --check` | PASS WITH CI REQUIRED | Rust redaction 3/3; JS targeted state 25/25 plus CI/secrets 5/5; npm check 216/216 before the added state assertion; security+room 45/45 on Chromium, Firefox and WebKit; HTTP/WS/Referer/DOM/diagnostics boundaries, hash persistence, static artifact path verified; controlled red-check failed 24/25 with a temporary seed-in-error mutation and passed after restore; full final gates intentionally deferred to CI per operator instruction | `344f69f` |
 | 2026-09-22 | `2.4` | `STATE.md` | Targeted self-review: diff/name/status audit; canonical fixture and stdout URL regex audit; D1–D10 mapping; protocol-version and room-ID path review; runtime legacy/storage/history audit; Playwright artifact policy audit; `git diff --check` | PASS WITH CI REQUIRED | Zero blocker/major findings; mapping recorded below; final full Rust/browser/harness/package/container gates intentionally deferred to CI per operator instruction; working tree clean | `pending` |
+| 2026-09-22 | `2.5` | `README.md`, `STATE.md` | `npx playwright test tests/e2e/readme.spec.mjs tests/e2e/readme-direct.spec.mjs --project=chromium --project=firefox --project=webkit --workers=1 --reporter=line`; `npm --prefix web/transfer run test:e2e:branded -- --list`; active-section legacy/storage/history audit; local Markdown target audit; `git diff --check` | PASS WITH CI REQUIRED | README E2E 6/6; branded command lists all three projects (195 tests per project); active web-transfer section has zero forbidden runtime/legacy literals; browser matrix, WebCrypto failure, persistent bearer fragment, lockstep cutover and final bundle-before-Rust order documented; final full acceptance remains CI-owned | `pending` |
 
 ## 5. Decision and deviation ledger
 
@@ -161,7 +162,7 @@ evidence during execution.
 | Secret/fragment leak audit | PASS | Runtime/source audit plus unit/E2E assertions: no storage recovery, no legacy parser, seed/member/key absent from error/URL paths; negative literals remain only in dedicated tests/docs |
 | `git diff --check` | PASS | `git diff --check` |
 
-In-flight: 2.5 — opened after 2.4 PASS WITH CI REQUIRED; synchronize README with the final browser matrix, security consequences and CI commands.
+In-flight: final CI gate — all implementation sub-phases are DONE; push `dev`, wait for the complete required workflow set, and tag only after every required job is green.
 
 Branded-browser rules:
 
@@ -219,7 +220,7 @@ mapping here before editing. Do not revive a stale path or duplicate an existing
 | `README.md` phase 0 update | Link shape, 128-bit seed, derivation/error contract as user-visible | PASS — verified active long format remains the only documented user format; no premature short-link text added |
 | Protocol/design documentation | Owner protocol v2, client-selected room ID, hard cutover, vectors | PASS — `docs/transfer/WEB_TRANSFER_PROTOCOL.md` synchronized in sub-phase 1.4 |
 | `README.md` phase 1 update | Complete CLI/browser flow, copy/address-bar behavior, no legacy links | PASS — synchronized in sub-phase 1.6 and verified by README E2E |
-| `README.md` phase 2 update | Browser support matrix, branded/manual gates, security consequences | TODO |
+| `README.md` phase 2 update | Browser support matrix, branded/manual gates, security consequences | PASS — Chrome/Edge/Brave branded command, Chromium/Firefox/WebKit CI distinction, Safari manual status, WebCrypto prerequisite, persistent bearer-fragment warning and lockstep troubleshooting documented |
 
 README is the user-facing single source of truth. A phase is not complete while its README
 sub-phase remains TODO.
@@ -255,7 +256,7 @@ facts without claiming that a fragment is globally secret.
 
 - Phase 0 — deterministic primitives and parity: DONE
 - Phase 1 — protocol and URL hard cutover: DONE
-- Phase 2 — browser matrix, security audit, final verification: IN PROGRESS
+- Phase 2 — browser matrix, security audit, final verification: READY FOR FINAL CI
 
 ### Completion conditions
 

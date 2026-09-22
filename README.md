@@ -222,7 +222,7 @@ to a tag, and it runs the gates FIRST:
 |---|---|
 | CI matrix | `cargo fmt` / `clippy -D warnings` / `cargo test --all-features` on Linux; transfer-path tests on macOS and Windows; VPN cross-checks for windows-msvc, apple-darwin and both Android ABIs; **real device e2e** on `windows-latest` (WinTun adapter, routes, firewall, WinNAT, stale-reclaim) and on `macos-14` (utun, PF); two Android emulator e2e suites; `cargo audit`; `actionlint` over the workflows themselves |
 | Cross-architecture | build **and test** on every target the release ships: 7 Linux targets under `cross` (x86_64/aarch64/armv7/arm/i686, musl + gnueabi), `i686`/`x86_64-pc-windows-msvc`, `aarch64-apple-darwin`; `x86_64-apple-darwin` is cross-built here (the hosted macOS runner is arm64) |
-| Browser slice | the `web-transfer` job: frontend unit tests, a bundle rebuild that must leave `web/transfer/dist` unchanged, the serial Rust web-transfer suite, the full browser e2e on **Chromium, Firefox and WebKit**, the cross-engine pair matrix, a time-budgeted fuzz pass over every wire decoder and the packaging gate. Real Chrome and Edge run in a separate `web-transfer-branded` job, on demand and weekly |
+| Browser slice | the `web-transfer` job: frontend unit tests, a bundle rebuild that must leave `web/transfer/dist` unchanged, the serial Rust web-transfer suite, the full browser e2e on **Chromium, Firefox and WebKit**, the cross-engine pair matrix, a time-budgeted fuzz pass over every wire decoder and the packaging gate. Real Chrome, Edge and Brave run in a separate `web-transfer-branded` job, on demand and weekly |
 | netns e2e | the nine root network-namespace correctness suites — admin dashboard, local/proxy, secret, vhost (+ hard), SSH gateway, the `--udp` connection-window regression, VPN (+ hard) — **blocking** for a release, unlike on a branch push |
 
 Only then do the three publishing workflows run, as called workflows: the GHCR images, the
@@ -2557,6 +2557,10 @@ The `#` is essential: URL fragments are not sent to bore, a reverse proxy, or a 
 log. This is a hard cutover, so upgrade the server and CLI together; links from older
 builds are not supported.
 
+The browser requires native WebCrypto HKDF support. If it is unavailable, the page shows
+`Browser non supportato: WebCrypto HKDF non disponibile` and stops before opening the
+WebSocket; there is no JavaScript crypto fallback.
+
 | Client flag | Env | Default | Meaning |
 |---|---|---|---|
 | `-t`, `--to <ADDR>` | `BORE_SERVER` | `https://brp.0912345.xyz` | Server hosting the room |
@@ -2789,9 +2793,13 @@ Opening only `/transfer/` without the `#TOKEN` shows `Link incompleto` ("incompl
 Use the complete URL again, or `Copia link room` ("copy room link") from a tab that is
 already in.
 
-**Browsers.** The room runs on Chrome/Chromium, Firefox and Safari (WebKit); every browser
-test in this repository runs on all three engines. A transfer needs OPFS to stage the
-download — a browser without it can still publish and send, and says so
+**Browsers.** The supported browser set is Chrome, Edge, Brave, Firefox and Safari. The
+routine automated gate runs Playwright Chromium, Firefox and WebKit on Linux. Periodic or
+manual branded smoke runs real Chrome, Edge and Brave with
+`npm --prefix web/transfer run test:e2e:branded`. WebKit on Linux is an
+engine-compatibility gate, not literal Safari; a real Safari smoke is a separate
+macOS/manual release check. A transfer needs OPFS to stage the download — a browser
+without it can still publish and send, and says so
 (`Download non supportato da questo browser`) instead of failing silently. The engines
 differ in how fast their own storage and crypto are, so the benchmark below reports each
 one separately and never averages them.
@@ -2910,7 +2918,7 @@ Nothing below needs a second tool: one server, one `bore transfer web`, three br
 |---|---|---|
 | `web transfer requires an upgraded server configured with --web-transfer-base-url` | The server has the feature off, or is older than the command | Start the server with `--web-transfer-base-url`, and check `bore --version` on both sides |
 | The room link 404s, or the page loads but never connects | `--web-transfer-base-url` is not the origin the browser actually uses, or a proxy is not forwarding the WebSocket upgrade | Set the base URL to the browser-facing origin; allow `Upgrade: websocket` on that path |
-| `Link incompleto` ("incomplete link") | The URL was opened without its `#…` fragment — for example only the `/transfer/` path was copied, or a browser/share tool dropped the fragment | Share the complete link the CLI printed, or use `Copia link room` from a tab that is in the room |
+| `Link incompleto` ("incomplete link") | The URL was opened without its `#…` fragment, or it uses the removed legacy long format — for example only the `/transfer/` path was copied, or an older CLI/server link was reused | Upgrade the server and CLI together and create a new room; share the complete short link the CLI printed, or use `Copia link room` from a tab that is in the room |
 | `Room non disponibile` ("room unavailable") | The `bore transfer web` process exited, or stayed away past `--web-transfer-owner-grace` | Start a new room; the old URL is dead by design. Raise the grace if flaky links are normal for you |
 | `Spazio su disco insufficiente` ("not enough disk space") | The browser's storage estimate cannot hold the staged file | Free space, save/discard old staged downloads, or leave private/incognito mode — its quota is much smaller |
 | `Download non supportato da questo browser` | No OPFS in this browser or context | Use an up-to-date Chrome/Firefox/Safari over HTTPS or loopback; publishing still works without OPFS |
@@ -3150,6 +3158,11 @@ and spawns real servers), and Playwright on chromium, firefox and webkit. Exampl
 `ENGINES=chromium scripts/web_transfer_e2e.sh`. One of those browser legs runs the
 server and room commands **copied out of this section**, so a documented command that
 stopped working fails the acceptance run rather than a reader's evening.
+The order is intentional: rebuild and verify the browser bundle first, then build/run the
+Rust paths that embed it. The branded subset is
+`npm --prefix web/transfer run test:e2e:branded`; it covers Chrome, Edge and Brave and
+must fail clearly when one requested executable is unavailable, never report a silent skip
+as success.
 
 **Secret-tunnel resource gate.** `scripts/perf/secret_leak_hunt.sh` runs a server, a
 `bore local --tcp-secret-id` provider and a `bore proxy` consumer inside a *rootless*

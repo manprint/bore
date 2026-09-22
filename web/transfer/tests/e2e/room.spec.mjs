@@ -22,6 +22,7 @@ let port;
 let roomUrl;
 let roomId;
 let memberToken;
+let roomKey;
 let roomSeedText;
 
 function freePort() {
@@ -96,6 +97,7 @@ test.beforeAll(async () => {
   const material = deriveShortLinkMaterial(roomUrl);
   roomId = material.roomId;
   memberToken = material.memberToken;
+  roomKey = material.roomKey;
   roomSeedText = material.seedText;
 }, 60_000);
 
@@ -162,19 +164,21 @@ async function openRoom(browser, url, {rtcHook = true, init} = {}) {
   const page = await context.newPage();
   const failures = [];
   const frames = { sent: [], received: [], urls: [] };
+  const requests = [];
   page.on("pageerror", (error) => failures.push(`pageerror: ${error.message}`));
   page.on("console", (message) => {
     if (message.type() === "error" && !isEngineNoise(message.text())) {
       failures.push(`console: ${message.text()}`);
     }
   });
+  page.on("request", (request) => requests.push(request.url()));
   page.on("websocket", (socket) => {
     frames.urls.push(socket.url());
     socket.on("framesent", (frame) => frames.sent.push(frame.payload));
     socket.on("framereceived", (frame) => frames.received.push(frame.payload));
   });
   await page.goto(url);
-  return { context, page, failures, frames };
+  return { context, page, failures, frames, requests };
 }
 
 function outboundTypes(frames) {
@@ -202,12 +206,21 @@ test.describe.serial("room", () => {
     browser,
   }) => {
     const peer = await openRoom(browser, roomUrl);
-    const { page, failures } = peer;
+    const { page, failures, frames, requests } = peer;
     await expectConnected(page);
     // The capability stays in the address bar and derived secrets stay only
     // in module memory, including after the session reaches the ready state.
     expect(page.url()).toBe(roomUrl);
     expect(page.url()).toContain(`#${roomSeedText}`);
+    expect(
+      requests.some((url) => new URL(url).pathname === "/transfer/"),
+      "the shell request must stay on /transfer/",
+    ).toBe(true);
+    for (const url of [...requests, ...frames.urls]) {
+      expect(url).not.toContain(roomSeedText);
+      expect(url).not.toContain(memberToken);
+      expect(url).not.toContain(roomKey);
+    }
     const storage = await page.evaluate(() => ({
       session: window.sessionStorage.length,
       local: window.localStorage.length,

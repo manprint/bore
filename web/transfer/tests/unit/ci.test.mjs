@@ -38,6 +38,13 @@ describe("ci contract", () => {
     assert.match(config, /trace:\s*"off"/);
     assert.match(config, /screenshot:\s*"off"/);
 
+    const esbuild = readFileSync(join(root, "esbuild.mjs"), "utf8");
+    assert.match(
+      esbuild,
+      /target:\s*\["chrome120",\s*"edge120",\s*"firefox120",\s*"safari17"\]/,
+      "the bundle target matrix drifted from the supported engines",
+    );
+
     const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
     // The default e2e run names its engines; a project dropped from the
     // config would otherwise just stop running, silently and green.

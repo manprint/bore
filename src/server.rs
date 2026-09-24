@@ -25,7 +25,7 @@ use crate::edge;
 use crate::holepunch;
 use crate::mux;
 use crate::pool::{self, Carrier, CarrierPool, PendingCarriers, TokenGuard};
-use crate::prefixed::Prefixed;
+use crate::prefixed::{ConnSecurity, Prefixed};
 use crate::secret::{self, Registry, UdpRegistry};
 use crate::shared::{
     proxy_buffer_size, resolve_https_policy, tune_tcp, ClientMessage, Delimited, ServerMessage,
@@ -976,13 +976,17 @@ impl Server {
         }
 
         // A loaded vhost certificate is not enough on its own: `mode: http`
-        // keeps the HTTPS frontend closed, and a fast host reachable only
-        // over plain HTTP could never serve a single upload (D9).
+        // keeps the HTTPS frontend closed, and an HTTPS port equal to the
+        // control port is served by the control port's own TLS (unified
+        // topology, `listen`). A fast host reachable only over plain HTTP
+        // could never serve a single upload (D9).
+        let control_port = self.control_port;
         let vhost_https = self.vhost_tls.read().unwrap().is_some()
             && self.vhost_config.as_ref().is_some_and(|cfg| {
                 let cfg = cfg.read().unwrap();
-                vhost::resolve_mode(&cfg, vhost::cert_present(&cfg))
-                    .is_ok_and(|mode| mode.serves_https())
+                cfg.https_port != control_port
+                    && vhost::resolve_mode(&cfg, vhost::cert_present(&cfg))
+                        .is_ok_and(|mode| mode.serves_https())
             });
         if !vhost_https && self.tls.is_none() {
             anyhow::bail!(
@@ -1595,7 +1599,6 @@ impl Server {
                                 let access_logger_dropped =
                                     Arc::clone(&this3.access_logger_dropped);
                                 tokio::spawn(async move {
-                                    let _permit = permit;
                                     if let Err(e) = vhost::handle_http(
                                         stream,
                                         addr,
@@ -1608,6 +1611,8 @@ impl Server {
                                             logger: access_logger,
                                             dropped: access_logger_dropped,
                                         },
+                                        this3.fast_link.clone(),
+                                        Some(permit),
                                     )
                                     .await
                                     {
@@ -1654,7 +1659,6 @@ impl Server {
                                 let access_logger_dropped =
                                     Arc::clone(&this3.access_logger_dropped);
                                 tokio::spawn(async move {
-                                    let _permit = permit;
                                     if let Err(e) = vhost::handle_https(
                                         stream,
                                         addr,
@@ -1667,6 +1671,8 @@ impl Server {
                                             logger: access_logger,
                                             dropped: access_logger_dropped,
                                         },
+                                        this3.fast_link.clone(),
+                                        Some(permit),
                                     )
                                     .await
                                     {
@@ -2173,7 +2179,7 @@ impl Server {
     /// (vhost routing by Host, then admin / 404), anything else falls through to the
     /// bore protocol. When neither is enabled this is a thin pass-through to
     /// [`Server::handle_connection`], so the plain protocol path is unchanged.
-    async fn route_connection<S: mux::Transport>(
+    async fn route_connection<S: mux::Transport + ConnSecurity>(
         &self,
         mut socket: S,
         peer: SocketAddr,
@@ -2219,7 +2225,7 @@ impl Server {
     /// would just garbage-close it mid-request later; closing it idle is
     /// exactly what any web server's keep-alive timeout does.
     #[cfg(feature = "ssh-gateway")]
-    async fn route_connection_known_http<S: mux::Transport>(
+    async fn route_connection_known_http<S: mux::Transport + ConnSecurity>(
         &self,
         mut socket: S,
         peer: SocketAddr,
@@ -2261,7 +2267,7 @@ impl Server {
     /// 443) serves both the bore control protocol and the vhost reverse proxy.
     /// A request that matches no subdomain falls through to the admin status
     /// page (if enabled) or a 404.
-    async fn serve_control_http<S: mux::Transport>(
+    async fn serve_control_http<S: mux::Transport + ConnSecurity>(
         &self,
         mut stream: Prefixed<S>,
         peer: SocketAddr,
@@ -2290,7 +2296,7 @@ impl Server {
 
     /// Vhost-first/admin-fallback chain shared by the legacy path (no
     /// pre-read head) and the web-transfer fallthrough (exact replayed head).
-    async fn serve_control_http_after_web<S: mux::Transport>(
+    async fn serve_control_http_after_web<S: mux::Transport + ConnSecurity>(
         &self,
         mut stream: Prefixed<S>,
         pre_read: Option<Vec<u8>>,
@@ -2305,6 +2311,27 @@ impl Server {
                     _ => return Ok(()),
                 },
             };
+            // Fast link transfer (D17) on the unified port: only when enabled,
+            // on the head already read, metered against `--max-conns` like the
+            // vhost relay below. The permit travels with the stream, so a
+            // downloader handed to its uploader's task keeps holding it.
+            if let Some(fast) = &self.fast_link {
+                if vhost::extract_host_from_head(&head).is_some_and(|h| fast.matches_host(h)) {
+                    let permit = match Arc::clone(&self.conn_permits).try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            self.conn_rejections
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            debug!(
+                                "fast link connection on control port dropped: max-conns reached"
+                            );
+                            return vhost::send_service_unavailable(stream).await;
+                        }
+                    };
+                    fast.serve(stream, head, None, S::TLS, Some(permit)).await;
+                    return Ok(());
+                }
+            }
             let cfg = cfg_lock.read().unwrap().clone();
             let sub = vhost::extract_host_from_head(&head)
                 .and_then(|h| vhost::extract_subdomain(h, &cfg.base_domain));
@@ -3953,6 +3980,22 @@ mod fast_link_config_tests {
         let mut server = Server::new(20206..=20206, None);
         server.set_vhost(with_cert(VhostModeCfg::Auto)).unwrap();
         server.set_fast_link(fast_config("fast.bore.tld")).unwrap();
+        // Unified topology: the vhost HTTPS port IS the control port, whose
+        // plain listener never uses the vhost certificate.
+        let mut server = Server::new(20207..=20207, None);
+        server.set_control_port(7835);
+        server
+            .set_vhost(VhostConfig {
+                https_port: 7835,
+                ..with_cert(VhostModeCfg::Auto)
+            })
+            .unwrap();
+        let err = server
+            .set_fast_link(fast_config("fast.bore.tld"))
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .starts_with("fast link transfer requires HTTPS"));
 
         // 3. HTTPS present (control port), but the host is also the web
         //    transfer origin.

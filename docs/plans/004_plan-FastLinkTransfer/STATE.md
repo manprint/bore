@@ -24,16 +24,16 @@ State writer: agent-1:opus coordinator session; ownership: active.
 - Active scope: plan 004 (tutte le fasi, fino a G-FINAL)
 - Scope result: RUNNING
 - Type: sub-phase
-- ID / attempt: 1.2 / 1
+- ID / attempt: 1.3 / 1
 - Status: OPEN
-- Intent: `ConnSecurity`, hook sui tre ingressi (vhost HTTP, vhost HTTPS, control port unificato), permit `--max-conns`
+- Intent: test d'integrazione `tests/fast_link_test.rs` (T-FL-I1..I7), test SSH, card admin Metrics + npm test, passo CI `npm test`, sezione README
 - Assigned: agent-2:sonnet (worker delegato); supervisor: agent-1:opus
-- File / unit heading: phase_02.md § 1.2
+- File / unit heading: phase_02.md § 1.3
 - Current step: S1 (delegato)
-- Next action: attendere il worker, review I-1 + I-SSH1 (`git diff` loop di accept), G-U1
-- Next eligible plan unit: 1.2 (phase_02.md)
-- Unit base: commit unit:1.1:1; branch: dev; owned changes: none
-- Repo state: HEAD = commit 1.1
+- Next action: attendere il worker, review, G-I1 + G-NPM
+- Next eligible plan unit: 1.3 (phase_02.md)
+- Unit base: commit unit:1.2:1; branch: dev; owned changes: none
+- Repo state: HEAD = commit 1.2
 
 ## 2. Feature context and readiness
 
@@ -77,6 +77,7 @@ Required supervisor reviews cannot be silently replaced by weaker self-review.
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
 | plan | 004 / 1 | 1 | agent-1:opus | docs/plans/004_plan-FastLinkTransfer/* | recon + R1 probe locale + R2–R5 | unit:0.1:1 (incluso) |
+| sub-phase | 1.2 / 1 | 3 | agent-1:opus (implementato dal supervisore invece di delegare: unità piccola e critica per I-SSH1) | src/prefixed.rs (`ConnSecurity`), src/vhost.rs (`handle_http`/`handle_https` + hook), src/server.rs (bound, chiamanti frontend con `Some(permit)`, hook su `serve_control_http_after_web`, controllo HTTPS unificato) | clippy/fmt/nodef ok; lib 927/0; `conn_security_is_static_per_type` + `set_fast_link_*` 2/2; vhost_test 53/0; I-SSH1: `git diff src/server.rs` nessuna riga del loop di accept del control port cambiata (solo firme dei 4 metodi e i due listener vhost dedicati, come da contratto); I-1: con `fast_link` None l'unica differenza in `handle_http`/`handle_https` è l'estrazione dell'host spostata prima della lettura della config (pura); ALPN: gli acceptor server non annunciano h2 → curl resta su HTTP/1.1; estensione D20: `https_port == control_port` senza TLS sul control port = nessun HTTPS (topologia unificata) + caso nel test | unit:1.2:1 |
 | sub-phase | 1.1 / 1 | 3 | agent-2:sonnet (worker), review agent-1:opus | src/{vhost,server,sshgw,main,admin_api,admin_views}.rs, tests/admin_test.rs | G-U1 (4 filtri ≥1 test ciascuno), lib 926/0, admin_test 20/0, clippy/fmt/nodef ok; prova binario: `ENABLED=false` → warn per flag ignorata, `ENABLED=true` senza vhost → errore; review: ordine main (set_web_transfer → set_tls → set_vhost → set_fast_link → set_ssh_gateway → listen), riserva nativa + SSH prima di `peek_takeover`, nessuna credenziale nelle viste; fix del supervisore: controllo HTTPS di `set_fast_link` richiede un modo vhost che serva HTTPS (cert caricato con `mode: http` passava ma il fast host non era raggiungibile in HTTPS) + caso 2b nel test, red-checked; commento snapshot ConfigView corretto | unit:1.1:1 |
 | phase closure | P0 / 1 | 3 | agent-1:opus | STATE.md | G-FMT ok, G-CLIPPY 0 warning, G-NODEF compila, G-U0 52/52, lib completa 923/0 (baseline 871 + 52); README invariato (`git diff 8d2032d4 -- README.md` vuoto); review di tutto `src/fast_link/` | unit:P0:1 |
 | sub-phase | 0.4 / 1 | 3 | agent-2:sonnet (worker), review agent-1:opus | src/fast_link/session.rs NEW, mod.rs, pump.rs (tolto `allow(dead_code)`) | G-U0 52/52, loop 3x senza flake; review: stato D13 sotto lock mai attraverso `.await`, gauge idempotenti, re-arm solo con replay intatto (I-3), fallimenti senza terminatore (I-4), authority rev 2; fix del supervisore: scrittura head+replay al downloader e `# download started` limitate da `stall_timeout` (downloader che non legge bloccava l'upload per sempre) + nuovo test `a_downloader_that_never_reads_the_replay_is_bounded` red-checked; `debug_assert!(false)` su handoff chiuso → `warn!` (raggiungibile in una corsa); 4 deviazioni test accettate (S6 finestra 2 MiB/1 MiB, S7 duplex 32 KiB, S12 timeout reali brevi, read_link salta 100 Continue) | unit:0.4:1 |
@@ -141,8 +142,8 @@ none
 | 0.3 | phase_01.md | 0.2 | DONE | 1 | G-U0 36/36, 2 red-check, review ok |
 | 0.4 | phase_01.md | 0.1, 0.2, 0.3 | DONE | 1 | G-U0 52/52, red-check replay limitato, review ok |
 | 1.1 | phase_02.md | P0 | DONE | 1 | G-U1 verdi, red-check modo vhost, review ok |
-| 1.2 | phase_02.md | 1.1 | IN_PROGRESS | 1 | — |
-| 1.3 | phase_02.md | 1.1, 1.2 | TODO | 1 | — |
+| 1.2 | phase_02.md | 1.1 | DONE | 1 | G-U1, vhost_test 53/0, I-SSH1 diff ok |
+| 1.3 | phase_02.md | 1.1, 1.2 | IN_PROGRESS | 1 | — |
 | 2.1 | phase_03.md | P1 | TODO | 1 | — |
 | 2.2 | phase_03.md | 2.1 | TODO | 1 | — |
 | 2.3 | phase_03.md | P1 | TODO | 1 | — |
@@ -167,7 +168,7 @@ Statuses: TODO, IN_PROGRESS, IN_REVIEW, DONE, SKIPPED, BLOCKED.
 | pump_* (10) incl. red-check `pump_writes_are_flushed_before_waiting`, `pump_coalesces_small_reads` | 0.3 | G-U0 | PASS | 10/10, loop 5x senza flake |
 | T-FL-S1..S12, S14..S16 + S7b `a_downloader_that_never_reads_the_replay_is_bounded` | 0.4 | G-U0 | PASS | 16/16 (52 totali), loop 3x |
 | reserved_label_reason_*, set_fast_link_*, config_and_metrics_publish_fast_link_*, server_fast_link_flags_* | 1.1 | G-U1 | PASS | 4/4 |
-| conn_security_is_static_per_type | 1.2 | G-U1 | TODO | — |
+| conn_security_is_static_per_type | 1.2 | G-U1 | PASS | 1/1 |
 | T-FL-I1..I7, t_ssh_fast_link_label_is_reserved, metrics-fast-link.test.js | 1.3 | G-I1, G-NPM | TODO | — |
 | T-FL-E1..E12 | 2.1 | G-E2E | TODO | — |
 | T-FL-PERF, T-FL-TRANSIT | 2.2 | G-PERF | TODO | — |

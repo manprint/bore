@@ -1888,17 +1888,31 @@ pub async fn handle_http(
     grx: std::sync::Arc<std::sync::atomic::AtomicU64>,
     gtx: std::sync::Arc<std::sync::atomic::AtomicU64>,
     log_ctx: LogContext,
+    fast_link: Option<Arc<crate::fast_link::FastLink>>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<()> {
     use tokio::time::timeout;
+
+    // Held for the whole connection, exactly as the caller's `let _permit`
+    // used to; the fast link path hands it on with the stream instead.
+    let permit = permit;
 
     let head = timeout(NETWORK_TIMEOUT, edge::read_request_head(&mut stream))
         .await
         .context("timed out reading HTTP request head")??;
 
+    let host = extract_host_from_head(&head);
+    // Fast link transfer (D17): only when enabled, on the head already read.
+    // Plain HTTP: `serve` answers 308/403 itself (D9, HTTPS only).
+    if let (Some(fast), Some(h)) = (fast_link.as_ref(), host) {
+        if fast.matches_host(h) {
+            fast.serve(stream, head, Some(addr), false, permit).await;
+            return Ok(());
+        }
+    }
+
     let cfg = vhost_config.as_ref().map(|c| c.read().unwrap().clone());
     let base_domain = cfg.as_deref().map(|c| c.base_domain.as_str()).unwrap_or("");
-
-    let host = extract_host_from_head(&head);
     let sub = match host.and_then(|h| extract_subdomain(h, base_domain)) {
         Some(s) => s,
         None => {
@@ -1966,8 +1980,13 @@ pub async fn handle_https(
     grx: std::sync::Arc<std::sync::atomic::AtomicU64>,
     gtx: std::sync::Arc<std::sync::atomic::AtomicU64>,
     log_ctx: LogContext,
+    fast_link: Option<Arc<crate::fast_link::FastLink>>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<()> {
     use tokio::time::timeout;
+
+    // Held for the whole connection (see `handle_http`).
+    let permit = permit;
 
     let acceptor = vhost_tls.read().unwrap().clone();
     let acceptor = match acceptor {
@@ -1987,10 +2006,17 @@ pub async fn handle_https(
         .await
         .context("timed out reading HTTPS request head")??;
 
+    let host = extract_host_from_head(&head);
+    // Fast link transfer (D17): only when enabled, on the head already read.
+    if let (Some(fast), Some(h)) = (fast_link.as_ref(), host) {
+        if fast.matches_host(h) {
+            fast.serve(tls_stream, head, Some(addr), true, permit).await;
+            return Ok(());
+        }
+    }
+
     let cfg = vhost_config.as_ref().map(|c| c.read().unwrap().clone());
     let base_domain = cfg.as_deref().map(|c| c.base_domain.as_str()).unwrap_or("");
-
-    let host = extract_host_from_head(&head);
     let sub = match host.and_then(|h| extract_subdomain(h, base_domain)) {
         Some(s) => s,
         None => {

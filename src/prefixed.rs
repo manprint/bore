@@ -80,10 +80,47 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
     }
 }
 
+/// Whether a stream type carries TLS end to end from the client, decided
+/// statically by the type (never by inspecting the connection): the
+/// control-port router hands one concrete type per path, so routing code can
+/// ask `S::TLS` without the accept loop threading a flag through (I-SSH1).
+pub trait ConnSecurity {
+    /// `true` when this server terminated TLS for the client on this stream.
+    const TLS: bool;
+}
+
+impl ConnSecurity for tokio::net::TcpStream {
+    const TLS: bool = false;
+}
+
+impl<S> ConnSecurity for tokio_rustls::server::TlsStream<S> {
+    const TLS: bool = true;
+}
+
+impl<S: ConnSecurity> ConnSecurity for Prefixed<S> {
+    const TLS: bool = S::TLS;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn conn_security_is_static_per_type() {
+        use tokio::net::TcpStream;
+        use tokio_rustls::server::TlsStream;
+        let observed = [
+            <TcpStream as ConnSecurity>::TLS,
+            <TlsStream<TcpStream> as ConnSecurity>::TLS,
+            <Prefixed<TlsStream<TcpStream>> as ConnSecurity>::TLS,
+            <Prefixed<TcpStream> as ConnSecurity>::TLS,
+            // The control port's post-TLS demux wraps a TLS stream that
+            // itself wraps the pre-TLS peek: still TLS.
+            <Prefixed<TlsStream<Prefixed<TcpStream>>> as ConnSecurity>::TLS,
+        ];
+        assert_eq!(observed, [false, true, true, false, true]);
+    }
 
     #[tokio::test]
     async fn replays_prefix_then_inner() {

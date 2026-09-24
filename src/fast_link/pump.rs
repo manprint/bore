@@ -19,10 +19,8 @@
 //! channel close and shutting down as if the transfer had completed (I-5:
 //! a truncated transfer must never look complete).
 //!
-//! Nothing in this module is called from production code yet: the session
-//! task that owns it (`FastLink::serve_upload`) lands in plan 004 unit 0.4.
-// used by plan 004 unit 0.4
-#![allow(dead_code)]
+//! The session task that owns this module (`FastLink::serve_upload`) lands
+//! in plan 004 unit 0.4 (`src/fast_link/session.rs`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

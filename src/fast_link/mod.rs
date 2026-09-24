@@ -15,6 +15,7 @@ mod framing;
 mod pump;
 mod request;
 mod response;
+mod session;
 
 use std::time::Duration;
 
@@ -31,6 +32,7 @@ pub use response::{
     abort_close, chunk, download_head, linger_close, simple_response, upload_head, usage_text,
     CONTINUE, LAST_CHUNK, PREVIEW_HTML,
 };
+pub use session::{FastLink, FastLinkConfigView, FastLinkMetricsView};
 
 /// Length, in characters, of a generated download id.
 pub const FAST_LINK_ID_LEN: usize = 16;

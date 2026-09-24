@@ -23,17 +23,17 @@ State writer: agent-1:opus coordinator session; ownership: active.
 
 - Active scope: plan 004 (tutte le fasi, fino a G-FINAL)
 - Scope result: RUNNING
-- Type: sub-phase
-- ID / attempt: 0.4 / 1
+- Type: phase closure
+- ID / attempt: P0 / 1
 - Status: OPEN
-- Intent: sessione (slot, dispatch, upload, download, handoff, re-arm, scadenza, metriche)
-- Assigned: agent-2:sonnet (nuovo worker delegato); supervisor: agent-1:opus
-- File / unit heading: phase_01.md § 0.4
-- Current step: S1 (delegato)
-- Next action: attendere il worker, review (D13, I-3, I-4, I-7, I-8), gate
-- Next eligible plan unit: 0.4 (phase_01.md)
-- Unit base: (dopo commit 0.2); branch: dev; owned changes: none
-- Repo state: HEAD 8d2032d4; tree pulito salvo `docs/plans/004_plan-FastLinkTransfer/` (artefatti di piano, da includere nel commit di 0.1)
+- Intent: chiusura fase 0 (gate completi della fase, README invariato, review)
+- Assigned: agent-1:opus
+- File / unit heading: phase_01.md § Phase closure
+- Current step: S1
+- Next action: gate P0, commit P0, poi 1.1
+- Next eligible plan unit: 1.1 (phase_02.md)
+- Unit base: commit unit:0.4:1; branch: dev; owned changes: none
+- Repo state: HEAD = commit 0.4
 
 ## 2. Feature context and readiness
 
@@ -77,6 +77,7 @@ Required supervisor reviews cannot be silently replaced by weaker self-review.
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
 | plan | 004 / 1 | 1 | agent-1:opus | docs/plans/004_plan-FastLinkTransfer/* | recon + R1 probe locale + R2–R5 | unit:0.1:1 (incluso) |
+| sub-phase | 0.4 / 1 | 3 | agent-2:sonnet (worker), review agent-1:opus | src/fast_link/session.rs NEW, mod.rs, pump.rs (tolto `allow(dead_code)`) | G-U0 52/52, loop 3x senza flake; review: stato D13 sotto lock mai attraverso `.await`, gauge idempotenti, re-arm solo con replay intatto (I-3), fallimenti senza terminatore (I-4), authority rev 2; fix del supervisore: scrittura head+replay al downloader e `# download started` limitate da `stall_timeout` (downloader che non legge bloccava l'upload per sempre) + nuovo test `a_downloader_that_never_reads_the_replay_is_bounded` red-checked; `debug_assert!(false)` su handoff chiuso → `warn!` (raggiungibile in una corsa); 4 deviazioni test accettate (S6 finestra 2 MiB/1 MiB, S7 duplex 32 KiB, S12 timeout reali brevi, read_link salta 100 Continue) | unit:0.4:1 |
 | sub-phase | 0.3 / 1 | 3 | agent-2:sonnet (worker), review agent-1:opus | src/fast_link/pump.rs NEW, mod.rs | G-U0 36/36; red-check flush (fallisce senza flush) e coalescenza (4096 msg senza); 3 deviazioni accettate (written sempre restituito, free_rx None→Cancelled, assert prefisso su abort) | unit:0.3:1 |
 | sub-phase | 0.2 / 1 | 2 | agent-2:sonnet (worker), review agent-1:opus | src/fast_link/framing.rs NEW, mod.rs | G-U0 26/26; review: grammatica chunked conforme, skip dati in blocco, errori sticky; derive additive accettate | unit:0.2:1 |
 | sub-phase | 0.1 / 1 | 2 | agent-2:sonnet (worker), review agent-1:opus | src/lib.rs, src/fast_link/{mod,request,response}.rs NEW | G-FMT/G-CLIPPY/G-NODEF ok; G-U0 19/19; review: contratto ok, 3 deviazioni additive accettate (Debug su RequestHead, helper expect_err nei test, input CL 21 cifre) | unit:0.1:1 |
@@ -104,6 +105,7 @@ none
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
 | plan readiness | agent-1:opus | rev 1 | checklist Plan readiness; cold read di 0.4 | READY |
+| 0.4 | agent-1:opus | rev 3, diff src/fast_link/session.rs | D13 (claim solo downloader, uploader unico a uscire da Streaming, InFlight atteso ≤ HANDOFF_RECV_TIMEOUT), I-3, I-4, I-7, I-8, nessun lock attraverso await, gauge | APPROVED (dopo fix scrittura limitata) |
 | 0.3 | agent-1:opus | rev 3, diff src/fast_link/pump.rs | D8 due task, zero alloc, cancel prima di drop full_tx, flush dopo write, resume_unwind, coalescenza now_or_never | APPROVED (dopo rev 3) |
 | 0.2 | agent-1:opus | rev 2, diff src/fast_link/framing.rs | stati SizeDigits..Done, forward prefisso, overflow, LF nudo, trailer | APPROVED |
 | 0.1 | agent-1:opus | rev 1, diff src/fast_link/{mod,request,response}.rs | D19/D20 messaggi e ordine, nessuna credenziale in Debug/errori, regole parse/target/preview | APPROVED (nota authority → rev 2) |
@@ -135,7 +137,7 @@ none
 | 0.1 | phase_01.md | none | DONE | 1 | G-U0 19/19, review ok |
 | 0.2 | phase_01.md | 0.1 | DONE | 1 | G-U0 26/26, review ok |
 | 0.3 | phase_01.md | 0.2 | DONE | 1 | G-U0 36/36, 2 red-check, review ok |
-| 0.4 | phase_01.md | 0.1, 0.2, 0.3 | IN_PROGRESS | 1 | — |
+| 0.4 | phase_01.md | 0.1, 0.2, 0.3 | DONE | 1 | G-U0 52/52, red-check replay limitato, review ok |
 | 1.1 | phase_02.md | P0 | TODO | 1 | — |
 | 1.2 | phase_02.md | 1.1 | TODO | 1 | — |
 | 1.3 | phase_02.md | 1.1, 1.2 | TODO | 1 | — |
@@ -161,7 +163,7 @@ Statuses: TODO, IN_PROGRESS, IN_REVIEW, DONE, SKIPPED, BLOCKED.
 | resolve_* / generate_id / parse_* / upload_* / download_target / preview / host_matches / response_bytes_exact | 0.1 | G-U0 | PASS | 19/19 |
 | cl_* / chunked_* / error_is_sticky | 0.2 | G-U0 | PASS | 7/7 (26 totali) |
 | pump_* (10) incl. red-check `pump_writes_are_flushed_before_waiting`, `pump_coalesces_small_reads` | 0.3 | G-U0 | PASS | 10/10, loop 5x senza flake |
-| T-FL-S1..S12, S14..S16 | 0.4 | G-U0 | TODO | — |
+| T-FL-S1..S12, S14..S16 + S7b `a_downloader_that_never_reads_the_replay_is_bounded` | 0.4 | G-U0 | PASS | 16/16 (52 totali), loop 3x |
 | reserved_label_reason_*, set_fast_link_*, config_and_metrics_publish_fast_link_*, server_fast_link_flags_* | 1.1 | G-U1 | TODO | — |
 | conn_security_is_static_per_type | 1.2 | G-U1 | TODO | — |
 | T-FL-I1..I7, t_ssh_fast_link_label_is_reserved, metrics-fast-link.test.js | 1.3 | G-I1, G-NPM | TODO | — |

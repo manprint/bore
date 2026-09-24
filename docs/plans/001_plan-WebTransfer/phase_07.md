@@ -115,7 +115,7 @@ vero di cui si legge la RSS dal kernel.
 | `transfers` per peer | ≤ `max_transfers_per_peer` | 8 |
 | coppie relay | semaforo globale `max_relays_global`, 2 socket ciascuna | 256 |
 | handshake in volo | semaforo `WEB_TRANSFER_PENDING_HANDSHAKES`, timeout 10 s | 256 |
-| coda uscita per peer | `mpsc::channel(WEB_TRANSFER_OUTGOING_CAP)` | 64 messaggi |
+| coda uscita per peer | `mpsc::channel(web_transfer_outgoing_cap(direct_carriers))` | 64 messaggi + 16 per carrier oltre il primo (176 a 8 carrier) |
 | eventi per room | `broadcast::channel(256)`, il lag risincronizza | 256 |
 | cache richieste per peer | `WEB_TRANSFER_REQUEST_CACHE_CAP`, TTL 5 min | 256 |
 | limiter pre-auth | LRU `WEB_TRANSFER_PRE_AUTH_MAX_IPS` + overflow, TTL 10 min | 8192 IP |

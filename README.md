@@ -2665,7 +2665,10 @@ launched, so a pipe reading stdout is never beaten by the browser.
 - **A network drop is not a closed room.** The owner reconnects with backoff and keeps the
   same URL for up to `--web-transfer-owner-grace` seconds; it never prints a second URL and
   never silently creates a replacement room. Past the grace the room and its transfers are
-  gone.
+  gone. Ctrl+C during a drop still ends the room: the owner makes ONE bounded (1 s) attempt
+  to resume and close it; only when the server cannot be reached at all does the room live
+  on until the grace runs out. A close is accepted only from the owner's own session, never
+  as the first frame of a new connection.
 - **A page whose room is gone says so.** While the owner is away the tab reconnects with
   backoff; once the room is really gone the tab stops and reports the room unavailable,
   instead of showing "reconnecting" about something that can never come back. Open the link
@@ -2768,6 +2771,13 @@ drops anything truncated or corrupt, and asks the source only for what is missin
 is **click-only** — reconnecting, reloading the tab or coming back to the room never
 restarts a transfer on its own. Resume state is per browser profile and per room: it
 survives a reload of the same tab, not a different browser or a new room.
+
+A **reconnect interrupts** whatever the tab had in flight. When the page's control
+connection drops and comes back (a network change, a laptop waking up) the tab rejoins as a
+new participant, and the server has already ended every transfer the old one took part in.
+So the tab ends those rows at once — `Non riuscito`, announced as `Connessione persa:
+trasferimento interrotto` — keeps what was verified, and the offer shows `Riprendi`; the
+other side sees the transfer cancelled. One click resumes it.
 
 A **ZIP download resumes too**, with one difference that follows from what an archive is:
 a generated archive has no per-chunk fingerprint in any manifest, so only a *contiguous*
@@ -2922,7 +2932,8 @@ Nothing below needs a second tool: one server, one `bore transfer web`, three br
 | `Room non disponibile` ("room unavailable") | The `bore transfer web` process exited, or stayed away past `--web-transfer-owner-grace` | Start a new room; the old URL is dead by design. Raise the grace if flaky links are normal for you |
 | `Spazio su disco insufficiente` ("not enough disk space") | The browser's storage estimate cannot hold the staged file | Free space, save/discard old staged downloads, or leave private/incognito mode — its quota is much smaller |
 | `Download non supportato da questo browser` | No OPFS in this browser or context | Use an up-to-date Chrome/Firefox/Safari over HTTPS or loopback; publishing still works without OPFS |
-| `Relay occupato: riprova tra poco` ("relay busy") | `--web-transfer-max-relays` reached server-wide, or the peer already has `--web-transfer-max-transfers-per-peer` transfers | Retry; raise the limit if this is normal load |
+| `Relay occupato: riprova tra poco` ("relay busy") | `--web-transfer-max-relays` reached server-wide: no relay slot freed up within 30 s | The row ends as `Non riuscito` and keeps what was verified; press `Riprendi` to resume it once a slot is free. Raise the limit if this is normal load |
+| `Limite della room raggiunto` ("room limit reached") | A NEW transfer would exceed `--web-transfer-max-transfers-per-peer` for you or for the source (or a room/peer/offer budget was reached) | Wait for a running transfer to finish; retrying a transfer you already have is never refused by this budget |
 | `Offerta non autentica: ignorata` ("offer not authentic") | An announcement arrived whose tag does not verify against the room key | Expected and correct — the offer is dropped. If it repeats, treat the room link as compromised and open a new room |
 | Every transfer reads `relay`, even between two machines on the same LAN | Two different things, and they need different fixes. On one LAN the browsers normally pair on their **host** candidates and STUN is not involved at all, so `--web-transfer-no-stun` does **not** by itself force the relay — it only removes the reflexive candidates two machines on the same subnet were not going to need. What does force it here is the two machines being unable to send UDP to each other: client isolation ("AP isolation", "guest network") on the access point, a host firewall dropping inbound UDP, or the two devices being on different subnets/VLANs with no route between them | First read `Copia diagnostica percorso` on the receiving tab: it names the **type** of candidate pair that carried the bytes (`host`, `srflx`, `prflx`) and the reason the direct attempt ended. If it never pairs at all, test UDP between the two machines directly (for example `nc -u`), turn off client isolation on the access point, and allow UDP on both host firewalls. Only if the two are on **different** networks does STUN matter: drop `--web-transfer-no-stun` or point `--web-transfer-stun` at a server both browsers can reach. The direct path needs outbound UDP from **both** browsers and an inbound port from neither |
 | A row changed from `diretto` to `relay` while it was running | The DataChannel died mid-transfer, or it stopped draining for 10 s (a path that is up but no longer moving bytes counts as dead); the replacement attempt took over | Nothing to do. The verified chunks were kept and only the rest was re-requested; the saved file is byte-identical either way. `Copia diagnostica percorso` says which of the two it was |

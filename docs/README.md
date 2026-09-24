@@ -10,7 +10,7 @@ solo questo indice.
 | [`vpn/`](vpn/) | la VPN L3: piani, port su macOS/Windows/Android, hardening, NAT 1:1, hub multi‑client, guida utente |
 | [`vhost/`](vhost/) | il reverse proxy per sottodominio: piano, audit, TLS verso il backend, il fix del flush iniettato, la concorrenza `--udp` |
 | [`ssh-gateway/`](ssh-gateway/) | l'ingresso SSH (`--ssh-gateway`): guida operativa, jump host, demux ALPN, audit e bug hunt |
-| [`transfer/`](transfer/) | `bore transfer`: [guida italiana completa a `bore transfer link`](transfer/TRANSFER_LINK.md), fattibilità, piano di upgrade, audit, matrice di test |
+| [`transfer/`](transfer/) | `bore transfer`: [guida italiana completa a `bore transfer link`](transfer/TRANSFER_LINK.md), fattibilità, piano di upgrade, audit, matrice di test, [prossima campagna prestazioni web (non misurata)](transfer/FUTURE_CAMPAIGN_WEB_PERFORMANCE.md) |
 | [`secret/`](secret/) | i tunnel segreti punto‑punto: hardening |
 | [`local/`](local/) | `bore local` / `bore proxy`: assessment e il piano UDP per i tunnel pubblici |
 | [`nat/`](nat/) | traversal UDP: riferimento del traversal, NAT adattivo, candidati manuali, confronto con lo stato dell'arte, limitazioni di firewall |

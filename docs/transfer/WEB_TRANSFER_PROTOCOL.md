@@ -31,8 +31,9 @@ The fragment never reaches the server (RFC 3986 §3.5). It intentionally stays
 visible in the address bar and browser history so reload and copy-link keep
 working; the browser holds only the derived values in module memory. There is
 no browser-storage recovery path, no fragment removal and no JavaScript crypto
-fallback. A bare `/transfer/` may serve the shell, but it is not a room link
-and opens no control socket.
+fallback. A bare `/transfer/` serves the shell because it IS the short room
+link, `/transfer/#<seed>`: the room id is derived in the page from the
+fragment. Without a valid fragment the page opens no control socket.
 
 The seed is the sole browser input. It is expanded with three independent
 HKDF-SHA256 calls, each using the same IKM and salt but a different info label:
@@ -150,6 +151,24 @@ the Phase 3 relay admission with `transfer.relay_ticket` and
 `transfer.path_commit {path:"relay"}`. The last three are terminal and win
 over both the timer and any signaling still in flight. A message naming an
 attempt that is no longer current is acked and ignored, never applied.
+
+A relay attempt with no free slot is QUEUED and waits up to 30 s for one —
+whether it came from a fallback or, in a `--relay-only` room, straight from
+`transfer.source_ready`. Past the wait the recipient hears an anonymous
+`RELAY_BUSY` naming the transfer; the page then ends the row, keeps what it
+verified and releases the record with `transfer.cancel`, so a click on
+`Riprendi` resumes it.
+
+A **relay→direct upgrade** (a probe offered beside a relay that is still
+carrying) commits on the same second-ready rule, and its `resumeRanges` are
+always the RECIPIENT's: they are held from the recipient's own ready,
+whichever side readies last. On the commit both pages let go of the relay
+leg; a close of that leg afterwards is not a failure of the transfer.
+
+A peer's live transfers end when its control socket does (§12). A page that
+reconnects is a NEW peer and is never told about the old one's transfers, so
+on a `welcome` with a new `peerId` it ends every row still running itself,
+keeping the verified partial for a click to resume.
 
 ### 2.2 The direct channel itself
 
@@ -468,7 +487,11 @@ deadline 10 s, relay attach 30 s, control send 10 s, relay admit 30 s
 (`WEB_TRANSFER_TERMINAL_RETENTION`); manifest 256 KiB,
 control 320 KiB, relay message/frame 32 KiB, plaintext fragment 24 KiB,
 chunk 1 MiB, high/low water 4/1 MiB; SDP 64 KiB, ICE candidate 4 KiB × 128
-per side with `sdpMid` 64 B; display name 48 chars; path 4096 B,
+per side and per carrier with `sdpMid` 64 B; control bucket 30/s, burst
+60 + 16 per carrier beyond the first; per-session outgoing queue 64 + 16 per
+carrier beyond the first (176 at the default eight), so a counterpart's whole
+legal burst fits — a targeted delivery that still finds it full is dropped and
+logged, sampled at every power of two; display name 48 chars; path 4096 B,
 segment 255 B.
 
 ## 9. Fixture generation
@@ -522,11 +545,12 @@ Exactly five routes exist under `/transfer/`, and nothing else is served:
 
 | Route | Method | Answer |
 |-------|--------|--------|
+| `/transfer/` | `GET`, `HEAD` | the room shell, served for the short room link `/transfer/#<seed>` (the seed rides the fragment and never reaches the server) |
 | `/transfer/<room-id>` | `GET`, `HEAD` | the room shell (an HTML page; the id must be 32 lowercase hex) |
 | `/transfer/assets/{index.html,app.js,app.css,offer-worker.js,stage-worker.js}` | `GET`, `HEAD` | the embedded bundle |
 | `/transfer/ws/control/<room-id>` | `GET` + `Upgrade` | the control WebSocket |
 | `/transfer/ws/relay/<room-id>/<transfer-id>` | `GET` + `Upgrade` | the opaque relay leg |
-| anything else under `/transfer/` | any | `400`, including a bare `/transfer/` — a room shell without a room id is malformed by construction, not a listing |
+| anything else under `/transfer/` | any | `400`; a non-`GET`/`HEAD` method on a shell route is `405` |
 
 Both WebSocket routes require, and the server verifies:
 
@@ -556,7 +580,7 @@ itself; none of them waits for a peer to be polite.
 | a control socket closes | that peer, its offers, its metadata budget, its live transfers (the counterpart is told), its rate buckets |
 | a peer stops answering | same, after `WEB_TRANSFER_CTRL_TIMEOUT` (60 s), decided on the reaper tick against `last_recv` — never a `timeout(recv)` |
 | the owner lease is DROPPED (the shell died, the process was killed) | nothing immediately: the room DETACHES and lives out the owner grace, so a reconnect resumes it |
-| the owner closes explicitly | the room, its peers and its offers, at once — a later `hello` is refused, not told the room is gone |
+| the owner closes explicitly | the room, its peers and its offers, at once — a later `hello` is refused, not told the room is gone. Honoured only inside the owner's own session (after a create or a token-checked resume): a `CloseWebTransferRoom` sent as the FIRST message of a connection proves nothing — the room id is public — and is ignored |
 | the owner grace expires | as above |
 | a transfer reaches a terminal state | its relay slot and its tickets; the terminal RECORD is kept `WEB_TRANSFER_TERMINAL_RETENTION` (5 min) so a reconnecting peer learns the outcome instead of re-requesting |
 | a relay leg ends (`FINAL`, or either side vanishing) | the leg, its buffers and its slot |

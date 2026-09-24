@@ -1,7 +1,7 @@
 # Fast Link Transfer — Implementation state
 
 Read first at every session. Updated 2026-09-25 by agent-1:opus (planning).
-Plan ID: 004_plan-FastLinkTransfer. Revision: 2. Repo root: /mnt/fabio/dati/Git/Github-manprint/bore-forked.
+Plan ID: 004_plan-FastLinkTransfer. Revision: 3. Repo root: /mnt/fabio/dati/Git/Github-manprint/bore-forked.
 Plan baseline: 8d2032d4 (`dev`, "chore: bump release to v1.2.1-rc.1"); pre-existing changes: none (clean tree).
 Roster: agent-1:opus, agent-2:sonnet, agent-3:haiku. Active execution style: delegated (coordinator = agent-1:opus session; workers = agent-2:sonnet via Agent tool).
 State writer: agent-1:opus coordinator session; ownership: active.
@@ -24,14 +24,14 @@ State writer: agent-1:opus coordinator session; ownership: active.
 - Active scope: plan 004 (tutte le fasi, fino a G-FINAL)
 - Scope result: RUNNING
 - Type: sub-phase
-- ID / attempt: 0.3 / 1
+- ID / attempt: 0.4 / 1
 - Status: OPEN
-- Intent: pompa di streaming a due task
+- Intent: sessione (slot, dispatch, upload, download, handoff, re-arm, scadenza, metriche)
 - Assigned: agent-2:sonnet (nuovo worker delegato); supervisor: agent-1:opus
-- File / unit heading: phase_01.md § 0.3
+- File / unit heading: phase_01.md § 0.4
 - Current step: S1 (delegato)
-- Next action: attendere il worker, review (parallelismo, riciclo buffer, cancellazione), gate
-- Next eligible plan unit: 0.3 (phase_01.md)
+- Next action: attendere il worker, review (D13, I-3, I-4, I-7, I-8), gate
+- Next eligible plan unit: 0.4 (phase_01.md)
 - Unit base: (dopo commit 0.2); branch: dev; owned changes: none
 - Repo state: HEAD 8d2032d4; tree pulito salvo `docs/plans/004_plan-FastLinkTransfer/` (artefatti di piano, da includere nel commit di 0.1)
 
@@ -77,6 +77,7 @@ Required supervisor reviews cannot be silently replaced by weaker self-review.
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
 | plan | 004 / 1 | 1 | agent-1:opus | docs/plans/004_plan-FastLinkTransfer/* | recon + R1 probe locale + R2–R5 | unit:0.1:1 (incluso) |
+| sub-phase | 0.3 / 1 | 3 | agent-2:sonnet (worker), review agent-1:opus | src/fast_link/pump.rs NEW, mod.rs | G-U0 36/36; red-check flush (fallisce senza flush) e coalescenza (4096 msg senza); 3 deviazioni accettate (written sempre restituito, free_rx None→Cancelled, assert prefisso su abort) | unit:0.3:1 |
 | sub-phase | 0.2 / 1 | 2 | agent-2:sonnet (worker), review agent-1:opus | src/fast_link/framing.rs NEW, mod.rs | G-U0 26/26; review: grammatica chunked conforme, skip dati in blocco, errori sticky; derive additive accettate | unit:0.2:1 |
 | sub-phase | 0.1 / 1 | 2 | agent-2:sonnet (worker), review agent-1:opus | src/lib.rs, src/fast_link/{mod,request,response}.rs NEW | G-FMT/G-CLIPPY/G-NODEF ok; G-U0 19/19; review: contratto ok, 3 deviazioni additive accettate (Debug su RequestHead, helper expect_err nei test, input CL 21 cifre) | unit:0.1:1 |
 
@@ -103,6 +104,7 @@ none
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
 | plan readiness | agent-1:opus | rev 1 | checklist Plan readiness; cold read di 0.4 | READY |
+| 0.3 | agent-1:opus | rev 3, diff src/fast_link/pump.rs | D8 due task, zero alloc, cancel prima di drop full_tx, flush dopo write, resume_unwind, coalescenza now_or_never | APPROVED (dopo rev 3) |
 | 0.2 | agent-1:opus | rev 2, diff src/fast_link/framing.rs | stati SizeDigits..Done, forward prefisso, overflow, LF nudo, trailer | APPROVED |
 | 0.1 | agent-1:opus | rev 1, diff src/fast_link/{mod,request,response}.rs | D19/D20 messaggi e ordine, nessuna credenziale in Debug/errori, regole parse/target/preview | APPROVED (nota authority → rev 2) |
 
@@ -110,6 +112,7 @@ none
 
 | Revision | Previous decision/step | Approved replacement and reason | Supervisor | Dependents/revalidation |
 |----------|------------------------|---------------------------------|------------|------------------------|
+| 3 | 0.3 R: una read = un messaggio | R coalesce le read pronte (`now_or_never`) nello stesso buffer prima di inviarlo a W: tokio-rustls rende ~1 record (≤16 KiB) per read → senza coalescenza ~64k messaggi/wakeup/flush al s a 1 GB/s (review 0.3); nuovo test `pump_coalesces_small_reads` red-checked | agent-1:opus | solo 0.3 |
 | 2 | 0.4 serve step 2: `authority` = header Host lowercase | `authority` = `config.host` + porta numerica dell'header se presente: nessun byte dell'header nel link stampato (review 0.1) | agent-1:opus | 0.4 (non ancora iniziata) |
 | 1 (pre-READY) | pompa a una task sola | D8: pompa a due task con buffer riciclati — la versione a una task mette decifratura e cifratura TLS sullo stesso core (utente: priorità banda) | agent-1:opus | 0.3 nuova, 0.4 la usa; I-2/I-11 aggiornati |
 
@@ -131,8 +134,8 @@ none
 |----|------------|------------|--------|---------|-------------------|
 | 0.1 | phase_01.md | none | DONE | 1 | G-U0 19/19, review ok |
 | 0.2 | phase_01.md | 0.1 | DONE | 1 | G-U0 26/26, review ok |
-| 0.3 | phase_01.md | 0.2 | IN_PROGRESS | 1 | — |
-| 0.4 | phase_01.md | 0.1, 0.2, 0.3 | TODO | 1 | — |
+| 0.3 | phase_01.md | 0.2 | DONE | 1 | G-U0 36/36, 2 red-check, review ok |
+| 0.4 | phase_01.md | 0.1, 0.2, 0.3 | IN_PROGRESS | 1 | — |
 | 1.1 | phase_02.md | P0 | TODO | 1 | — |
 | 1.2 | phase_02.md | 1.1 | TODO | 1 | — |
 | 1.3 | phase_02.md | 1.1, 1.2 | TODO | 1 | — |
@@ -157,7 +160,7 @@ Statuses: TODO, IN_PROGRESS, IN_REVIEW, DONE, SKIPPED, BLOCKED.
 |---------|-------------|------|--------|----------|
 | resolve_* / generate_id / parse_* / upload_* / download_target / preview / host_matches / response_bytes_exact | 0.1 | G-U0 | PASS | 19/19 |
 | cl_* / chunked_* / error_is_sticky | 0.2 | G-U0 | PASS | 7/7 (26 totali) |
-| pump_* (8) incl. red-check `pump_writes_are_flushed_before_waiting` | 0.3 | G-U0 | TODO | — |
+| pump_* (10) incl. red-check `pump_writes_are_flushed_before_waiting`, `pump_coalesces_small_reads` | 0.3 | G-U0 | PASS | 10/10, loop 5x senza flake |
 | T-FL-S1..S12, S14..S16 | 0.4 | G-U0 | TODO | — |
 | reserved_label_reason_*, set_fast_link_*, config_and_metrics_publish_fast_link_*, server_fast_link_flags_* | 1.1 | G-U1 | TODO | — |
 | conn_security_is_static_per_type | 1.2 | G-U1 | TODO | — |

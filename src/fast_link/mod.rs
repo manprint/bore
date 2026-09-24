@@ -12,6 +12,7 @@
 //! framing; [`response`] builds the fixed response byte sequences.
 
 mod framing;
+mod pump;
 mod request;
 mod response;
 

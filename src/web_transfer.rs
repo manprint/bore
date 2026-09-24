@@ -1665,6 +1665,10 @@ pub struct WebTransferRoom {
     /// tickets, cancel/complete notices). Bounded by the per-room peer cap.
     /// Lock order: `state` first, then `sessions` — never the reverse.
     pub(crate) sessions: std::sync::Mutex<HashMap<PeerId, mpsc::Sender<String>>>,
+    /// Targeted deliveries `send_to` could not queue because the session's
+    /// outgoing queue was full. Drives the sampled warning there; a room
+    /// that never overflows never reads it.
+    send_drops: AtomicU64,
     /// Shared relay throttle for this room's pumps (rate from limits, burst
     /// exactly 2×rate capped at 200 MiB, disabled when the rate is 0).
     /// Short lock per forwarded frame; never held across await.
@@ -1673,17 +1677,43 @@ pub struct WebTransferRoom {
 
 impl WebTransferRoom {
     /// Best-effort targeted delivery to one live control session. Never
-    /// blocks: a full queue means the peer's own slow-path machinery reaps
-    /// it; the transition already committed.
+    /// blocks — the transition it reports has already committed, and a
+    /// producer must never wait on another peer's socket. A full queue
+    /// therefore DROPS the message, and a dropped ticket, commit or ICE
+    /// candidate is a protocol step the peer never sees. The queue is sized
+    /// so the counterpart's whole legal burst fits
+    /// ([`web_transfer_outgoing_cap`]); what still overflows is logged,
+    /// sampled at every power of two, because it used to vanish without a
+    /// trace.
     pub(crate) fn send_to(&self, peer_id: PeerId, message: String) -> bool {
         let sender = match self.sessions.lock() {
             Ok(sessions) => sessions.get(&peer_id).cloned(),
             Err(_) => None,
         };
         match sender {
-            Some(tx) => tx.try_send(message).is_ok(),
+            Some(tx) => match tx.try_send(message) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let dropped = self.send_drops.fetch_add(1, Ordering::Relaxed) + 1;
+                    if dropped.is_power_of_two() {
+                        warn!(
+                            peer = %peer_id,
+                            dropped,
+                            "web-transfer control queue full: targeted message dropped",
+                        );
+                    }
+                    false
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            },
             None => false,
         }
+    }
+
+    /// Targeted deliveries dropped on a full outgoing queue (tests).
+    #[cfg(test)]
+    pub(crate) fn send_drops(&self) -> u64 {
+        self.send_drops.load(Ordering::Relaxed)
     }
 }
 
@@ -2057,6 +2087,7 @@ impl WebTransferRegistry {
                 registry: Arc::downgrade(&self.inner),
                 room_permit: permit,
                 sessions: std::sync::Mutex::new(HashMap::new()),
+                send_drops: AtomicU64::new(0),
                 relay_throttle: std::sync::Mutex::new(RelayThrottle::new(
                     self.inner.config.limits.relay_rate_bytes_per_s,
                 )),
@@ -2515,8 +2546,11 @@ pub const WEB_TRANSFER_TICKET_TTL: Duration = Duration::from_secs(30);
 pub const WEB_TRANSFER_TERMINAL_RETENTION: Duration = Duration::from_secs(5 * 60);
 /// Peer-ID/transfer/attempt ID collision retries before failing `INTERNAL`.
 pub const WEB_TRANSFER_PEER_ID_RETRIES: usize = 8;
-/// Capacity of one session's outgoing control queue; a full queue closes the
-/// slow peer and lets its `PeerGuard` clean up.
+/// Capacity of one session's outgoing control queue at ONE carrier (see
+/// [`web_transfer_outgoing_cap`] for the carrier-scaled size). A reply that
+/// cannot be queued inside `WEB_TRANSFER_CTRL_SEND_TIMEOUT` closes the slow
+/// peer and lets its `PeerGuard` clean up; a targeted `send_to` that finds it
+/// full drops the message and logs it.
 pub const WEB_TRANSFER_OUTGOING_CAP: usize = 64;
 /// Sustained rate of the per-session control bucket (messages/second).
 pub const WEB_TRANSFER_CONTROL_RATE_PER_SEC: f64 = 30.0;
@@ -2547,6 +2581,24 @@ pub const WEB_TRANSFER_CARRIER_SIGNAL_BURST: f64 = 16.0;
 pub fn web_transfer_control_burst(direct_carriers: u64) -> f64 {
     let extra = direct_carriers.clamp(1, WEB_TRANSFER_MAX_DIRECT_CARRIERS as u64) - 1;
     WEB_TRANSFER_CONTROL_BURST + extra as f64 * WEB_TRANSFER_CARRIER_SIGNAL_BURST
+}
+
+/// Capacity of one session's outgoing control queue for `direct_carriers`
+/// carriers.
+///
+/// That queue is where a COUNTERPART's forwarded signalling lands
+/// ([`WebTransferRoom::send_to`], which never waits), and a counterpart may
+/// legally deliver its whole control burst in one flurry — a burst that grows
+/// by [`WEB_TRANSFER_CARRIER_SIGNAL_BURST`] per carrier
+/// ([`web_transfer_control_burst`]). A queue fixed at 64 sat BELOW the
+/// 172-message burst an eight-carrier server permits, so the flurry the burst
+/// was widened for could still be dropped on arrival whenever this session's
+/// writer fell a moment behind — and the dropped candidate can be the only
+/// one a hard NAT can use. The queue therefore grows by the same step. One
+/// carrier returns exactly the historical constant.
+pub fn web_transfer_outgoing_cap(direct_carriers: u64) -> usize {
+    let extra = direct_carriers.clamp(1, WEB_TRANSFER_MAX_DIRECT_CARRIERS as u64) - 1;
+    WEB_TRANSFER_OUTGOING_CAP + extra as usize * WEB_TRANSFER_CARRIER_SIGNAL_BURST as usize
 }
 
 /// The per-side ICE candidate budget for `direct_carriers` carriers.
@@ -3146,7 +3198,8 @@ impl PeerSession {
         ));
         initial.extend(snapshot_offer_strings(revision, &peers, &offers)?);
         let now = Instant::now();
-        let (out_tx, out_rx) = mpsc::channel(WEB_TRANSFER_OUTGOING_CAP);
+        let (out_tx, out_rx) =
+            mpsc::channel(web_transfer_outgoing_cap(config.limits.direct_carriers));
         if let Ok(mut sessions) = room.sessions.lock() {
             sessions.insert(peer_id, out_tx.clone());
         }
@@ -3584,11 +3637,6 @@ impl WebTransferRegistry {
                     })
                 }
             };
-            if live_count_for(&state, source) >= room.limits.max_transfers_per_peer as usize
-                || live_count_for(&state, recipient) >= room.limits.max_transfers_per_peer as usize
-            {
-                return Err(self.refused(WebTransferError::limit("peer transfer budget exhausted")));
-            }
             // Same parties + same selection + live: no duplicate. A
             // permit-less WaitingRelay match is a busy retry and upgrades to
             // a fresh attempt; anything else re-acks the same ID.
@@ -3640,6 +3688,21 @@ impl WebTransferRegistry {
                     id,
                 }
             } else {
+                // The budget bounds how many LIVE transfers a peer holds, so
+                // it is charged only by a request that would create one. It
+                // used to run before the duplicate check above, so a peer at
+                // its budget clicking a transfer it ALREADY had — a re-ack,
+                // or the retry that is the only way out of a permit-less
+                // `WaitingRelay` after `RELAY_BUSY` — was refused with
+                // `LIMIT_EXCEEDED` for the very transfer it was counting.
+                if live_count_for(&state, source) >= room.limits.max_transfers_per_peer as usize
+                    || live_count_for(&state, recipient)
+                        >= room.limits.max_transfers_per_peer as usize
+                {
+                    return Err(
+                        self.refused(WebTransferError::limit("peer transfer budget exhausted"))
+                    );
+                }
                 let mut new_id = generate_transfer_id();
                 for _ in 0..8 {
                     if !state.transfers.contains_key(&new_id) {
@@ -4119,6 +4182,19 @@ impl WebTransferRegistry {
         if !both {
             if let Some(up) = record.upgrade.as_mut() {
                 up.bits = bits;
+            }
+            // The commit is computed on whichever ready comes SECOND, and the
+            // recipient's ranges arrive on the recipient's — the first of the
+            // two as often as not. They were read only from the current call,
+            // so a source that readied last committed on `record.resume`
+            // alone and every chunk the relay had delivered travelled again.
+            // Held on the record now; they are the recipient's verified word,
+            // so they are also what any later attempt may skip.
+            if !is_source && !recipient_ranges.is_empty() {
+                record.resume = Some(ResumeDescriptor {
+                    verified_ranges: recipient_ranges.to_vec(),
+                    output_length,
+                });
             }
             return Ok(Some(Vec::new()));
         }
@@ -5890,6 +5966,25 @@ impl WebTransferRegistry {
                     "relay pair cancelled",
                 );
             }
+            failed
+                if self
+                    .current_attempt(room, transfer_id)
+                    .is_some_and(|current| current != attempt_id) =>
+            {
+                // An upgrade committed the transfer onto a direct attempt and
+                // both peers then let go of this leg: the pair ending IS the
+                // switch, not a failure, and the attempt it would abort is no
+                // longer the transfer's. Logged at WARN it read as a relay
+                // failure on every successful upgrade.
+                debug!(
+                    transfer = %transfer_id,
+                    attempt = %attempt_id,
+                    bytes = stats.bytes,
+                    frames = stats.frames,
+                    outcome = ?failed,
+                    "relay pair ended after its attempt was superseded",
+                );
+            }
             failed => {
                 warn!(
                     transfer = %transfer_id,
@@ -6536,6 +6631,7 @@ impl WebTransferRegistry {
             registry: Arc::downgrade(&self.inner),
             room_permit: permit,
             sessions: std::sync::Mutex::new(HashMap::new()),
+            send_drops: AtomicU64::new(0),
             relay_throttle: std::sync::Mutex::new(RelayThrottle::new(
                 self.inner.config.limits.relay_rate_bytes_per_s,
             )),
@@ -6735,11 +6831,8 @@ where
             };
             Ok(outcome)
         }
-        ClientMessage::CloseWebTransferRoom {
-            room_id,
-            owner_epoch,
-        } => {
-            let Some(registry) = registry else {
+        ClientMessage::CloseWebTransferRoom { .. } => {
+            if registry.is_none() {
                 control
                     .send(ServerMessage::Error(
                         WEB_TRANSFER_DISABLED_ERROR.to_string(),
@@ -6747,15 +6840,17 @@ where
                     .await?;
                 linger_after_error(control).await;
                 return Ok(idle());
-            };
-            // Idempotent close: a missing room is already gone (success).
-            // A present room must match the live epoch or nothing happens.
-            if let Some(room) = registry.room(room_id) {
-                let current = room.epoch.load(Ordering::Relaxed);
-                if current == owner_epoch && registry.remove_room_if_current(room_id, &room) {
-                    room.destroy("owner-close");
-                }
             }
+            // A close is honoured ONLY inside an owner session, i.e. after a
+            // create or a token-checked resume (`serve_owner_control`). As a
+            // FIRST message it carries nothing but the room ID — a public,
+            // capability-derived value that is in every member's URL path and
+            // in every reverse-proxy access log — and an epoch that starts at
+            // zero. Honouring it here let anyone who had seen the path destroy
+            // the owner's room with one frame and a guess. The owner client
+            // never sends it first (`OwnerSession::close_bounded` runs on the
+            // session that created or resumed the room), so ignoring it costs
+            // no legitimate caller anything.
             Ok(idle())
         }
         // Anything else as a first owner message terminates the stream.
@@ -7781,6 +7876,43 @@ mod owner_control_tests {
         drop(room);
     }
 
+    /// A close that arrives as the FIRST message of a control stream has
+    /// proven nothing: the room ID is in every member's URL path and the
+    /// epoch starts at zero. It used to destroy the room on the spot, so any
+    /// member — or anyone reading a reverse-proxy access log — could end the
+    /// owner's room with one frame. Red-check: restore the old branch and the
+    /// room reads destroyed.
+    #[tokio::test]
+    async fn first_message_close_never_destroys_a_room() {
+        let registry = Arc::new(test_registry());
+        let lease = OwnerLease::create(&registry, [1u8; 32], [2u8; 32], false).unwrap();
+        let (id, epoch) = (lease.id(), lease.epoch());
+        let (client, mut server) = duplex_pair().await;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_owner_first_message(
+                Some(Arc::clone(&registry)),
+                &mut server,
+                ClientMessage::CloseWebTransferRoom {
+                    room_id: id,
+                    owner_epoch: epoch,
+                },
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("a first-message close must return at once")
+        .unwrap();
+        assert!(!outcome.closed_explicit);
+        let room = registry
+            .room(id)
+            .expect("an unauthenticated close must leave the room registered");
+        assert!(!room.is_destroyed());
+        drop(client);
+        drop(room);
+        drop(lease);
+    }
+
     #[tokio::test]
     async fn owner_eof_detaches() {
         let (owner, member_hash, owner_hash) = owner_pair();
@@ -8234,10 +8366,15 @@ mod control_session_tests {
             PeerSession::establish(&registry, &room, peer, None).unwrap();
         assert_eq!(registry.current_peers(), 1);
         let tx = session.sender();
-        for _ in 0..WEB_TRANSFER_OUTGOING_CAP {
+        let cap = web_transfer_outgoing_cap(registry.config().limits.direct_carriers);
+        for _ in 0..cap {
             tx.try_send("queued".to_string()).unwrap();
         }
         assert!(tx.try_send("overflow".to_string()).is_err());
+        // A targeted delivery into the full queue is dropped — never awaited
+        // — and counted, which is what the sampled warning reads.
+        assert!(!room.send_to(peer, "dropped".to_string()));
+        assert_eq!(room.send_drops(), 1);
         drop(session);
         drop(tx);
         assert!(!room.state.lock().unwrap().peers.contains_key(&peer));
@@ -8400,6 +8537,31 @@ mod control_session_tests {
             "burst {} cannot absorb a legal {}-message negotiation",
             web_transfer_control_burst(carriers),
             flurry
+        );
+    }
+
+    /// The counterpart's burst is admitted by ITS bucket and lands in OUR
+    /// queue through a `send_to` that never waits, so a queue smaller than
+    /// the burst drops part of a negotiation the bucket just allowed. At
+    /// eight carriers the old fixed 64 held 64 of a legal 172. Red-check:
+    /// return `WEB_TRANSFER_OUTGOING_CAP` from `web_transfer_outgoing_cap`.
+    #[test]
+    fn the_outgoing_queue_holds_a_counterparts_whole_burst() {
+        assert_eq!(web_transfer_outgoing_cap(1), WEB_TRANSFER_OUTGOING_CAP);
+        assert_eq!(web_transfer_outgoing_cap(0), WEB_TRANSFER_OUTGOING_CAP);
+        for carriers in 1..=WEB_TRANSFER_MAX_DIRECT_CARRIERS as u64 {
+            assert!(
+                web_transfer_outgoing_cap(carriers) as f64 >= web_transfer_control_burst(carriers),
+                "queue {} below the {}-carrier burst {}",
+                web_transfer_outgoing_cap(carriers),
+                carriers,
+                web_transfer_control_burst(carriers)
+            );
+        }
+        let cap = WEB_TRANSFER_MAX_DIRECT_CARRIERS as u64;
+        assert_eq!(
+            web_transfer_outgoing_cap(u64::MAX),
+            web_transfer_outgoing_cap(cap)
         );
     }
 
@@ -9724,6 +9886,46 @@ mod transfer_state_tests {
         }
     }
 
+    /// The budget counts LIVE transfers, so only a request that would CREATE
+    /// one may be charged against it. It used to be checked before the
+    /// duplicate lookup, so a peer at its budget re-clicking the transfer it
+    /// already held got `LIMIT_EXCEEDED` for the very transfer being counted
+    /// — including the retry that is the ONLY way out of a permit-less
+    /// `WaitingRelay` after `RELAY_BUSY`. Red-check: move the cap back above
+    /// the lookup and both halves below fail with `LIMIT_EXCEEDED`.
+    #[tokio::test]
+    async fn per_peer_cap_never_refuses_the_transfer_it_is_counting() {
+        let file_hex = "cccccccccccccccccccccccccccccccc";
+        let registry = tight_transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _guard_a, _rx_a) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _guard_b, _rx_b) = live_peer(&registry, &room, Some("B"));
+        let mac = offer_fixture(&registry, &room, source, file_hex);
+        let offer: OfferId = file_hex.parse().unwrap();
+        let ids = vec!["0".to_string()];
+        let digest = selection_digest(&offer, &mac, &ids, "raw");
+        let (first, outcome) = registry
+            .request_transfer(&room, recipient, offer, ids.clone(), digest, "raw", None)
+            .unwrap();
+        assert_eq!(outcome, RequestOutcome::Created);
+        // At the budget: the same selection is a re-ack, not a new transfer.
+        let (again, outcome) = registry
+            .request_transfer(&room, recipient, offer, ids.clone(), digest, "raw", None)
+            .expect("a duplicate request must re-ack, not exhaust the budget");
+        assert_eq!((again, outcome), (first, RequestOutcome::Existing));
+        // And the busy-relay retry: a permit-less `WaitingRelay` upgrades to
+        // a fresh attempt on the SAME transfer, still within the budget.
+        let before = registry.current_attempt(&room, first).unwrap();
+        if let Some(record) = room.state.lock().unwrap().transfers.get_mut(&first) {
+            record.state = TransferState::WaitingRelay;
+        }
+        let (retried, _) = registry
+            .request_transfer(&room, recipient, offer, ids, digest, "raw", None)
+            .expect("the RELAY_BUSY retry must not be refused by the budget");
+        assert_eq!(retried, first);
+        assert_ne!(registry.current_attempt(&room, first).unwrap(), before);
+    }
+
     /// `cli_owner_has_no_browser_privileges_or_peer_id`: the CLI that opens
     /// the room holds a LEASE, not a seat. There is no owner `PeerId`
     /// anywhere in the room state — `OwnerState` carries an epoch and a
@@ -10362,6 +10564,57 @@ mod transfer_state_tests {
             record.attempt.as_ref().unwrap().relay_permit.is_none(),
             "an upgraded transfer stops costing a relay slot"
         );
+    }
+
+    /// Same switch, the other ready ORDER. The commit is computed on the
+    /// second ready, and it read the recipient's ranges only off the CURRENT
+    /// call — so a source that readied last committed on the server's stale
+    /// view and the direct attempt resent everything the relay had already
+    /// delivered. Found by `T-WEB-UPGRADE`, whose commit carried no ranges at
+    /// all. Red-check: drop the `!both` store and this reads no ranges.
+    #[tokio::test]
+    async fn an_upgrade_keeps_the_recipients_ranges_when_the_source_readies_last() {
+        let registry = transfer_registry();
+        let (_lease, room) = transfer_room(&registry);
+        let (source, _ga, mut source_rx) = live_peer(&registry, &room, Some("A"));
+        let (recipient, _gb, mut recipient_rx) = live_peer(&registry, &room, Some("B"));
+        let (id, _attempt) = fallen_back(&registry, &room, source, recipient).await;
+        let _ = recv_until(&mut source_rx, "transfer.relay_ticket").await;
+        let _ = recv_until(&mut recipient_rx, "transfer.relay_ticket").await;
+        active_relay(&room, id);
+        registry.direct_upgrade_elapsed(&room, id);
+        let body = recv_until(&mut recipient_rx, "transfer.direct_start").await;
+        let _ = recv_until(&mut source_rx, "transfer.direct_start").await;
+        let probe: AttemptId = body["attemptId"].as_str().unwrap().parse().unwrap();
+        let outbox = registry
+            .forward_rtc_offer(&room, recipient, &sdp_body_on(id, probe, "v=0", 0))
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_until(&mut source_rx, "rtc.offer").await;
+        let outbox = registry
+            .forward_rtc_answer(&room, source, &sdp_body_on(id, probe, "v=0", 0))
+            .unwrap();
+        drain_transfer_outbox(&room, outbox);
+        let _ = recv_until(&mut recipient_rx, "rtc.answer").await;
+
+        let outbox = registry
+            .direct_ready(&room, recipient, id, probe, vec![(0, 7)])
+            .unwrap();
+        assert!(outbox.is_empty(), "one side ready is not a commit");
+        let outbox = registry
+            .direct_ready(&room, source, id, probe, Vec::new())
+            .unwrap();
+        assert_eq!(outbox.len(), 2, "both peers hear the same commit");
+        drain_transfer_outbox(&room, outbox);
+        for rx in [&mut recipient_rx, &mut source_rx] {
+            let body = recv_until(rx, "transfer.path_commit").await;
+            assert_eq!(body["path"].as_str(), Some("direct"));
+            assert_eq!(
+                body["resumeRanges"],
+                serde_json::json!([[0, 7]]),
+                "the recipient's ranges survive a source that readies last"
+            );
+        }
     }
 
     #[tokio::test]

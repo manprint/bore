@@ -1480,12 +1480,28 @@ async fn handle_text(registry: &WebTransferRegistry, session: &mut PeerSession, 
                     // armed here, outside the lock and after the ack. The
                     // relay is reached only through that timer or an explicit
                     // `transfer.direct_failed` — never from this path.
-                    if matches!(outcome, ReadyOutcome::Negotiating) {
-                        registry.spawn_direct_deadline(
+                    match outcome {
+                        ReadyOutcome::Negotiating => registry.spawn_direct_deadline(
                             session.room(),
                             body.transfer_id,
                             body.attempt_id,
-                        );
+                        ),
+                        // A relay-only room goes to the relay on its OWN
+                        // attempt, and a full pool QUEUES it: the 30 s
+                        // admission waiter must own it exactly as it owns a
+                        // fallback's (`transfer.direct_failed` below). Without
+                        // it the transfer sat in `WaitingRelay` with no
+                        // ticket, no `RELAY_BUSY` and no timer — the row spun
+                        // for ever and only a cancel could end it.
+                        ReadyOutcome::Queued => {
+                            let registry = registry.clone();
+                            let room = session.room().clone();
+                            let (transfer_id, attempt_id) = (body.transfer_id, body.attempt_id);
+                            tokio::spawn(async move {
+                                registry.admit_relay(&room, transfer_id, attempt_id).await;
+                            });
+                        }
+                        ReadyOutcome::Admitted | ReadyOutcome::Ignored => {}
                     }
                     queued
                 }
@@ -2646,6 +2662,89 @@ mod transfer_actor_tests {
         let (typ, _) = drain_text(&mut source_rx).await;
         assert_eq!(typ, "transfer.incoming");
         let _ = recipient;
+    }
+
+    /// A relay-only room sends the transfer to the relay on `source_ready`,
+    /// and a full pool answers `Queued`. The waiter that turns a freed slot
+    /// into tickets was spawned only for a direct FALLBACK, so this transfer
+    /// sat in `WaitingRelay` for ever: no ticket, no `RELAY_BUSY`, no timer.
+    /// Red-check: drop the `Queued` arm and the ticket below never arrives.
+    #[tokio::test]
+    async fn relay_only_ready_on_a_full_pool_is_admitted_when_a_slot_frees() {
+        use crate::web_transfer::generate_peer_id;
+        let registry = WebTransferRegistry::new(
+            WebTransferConfig::new(
+                WebTransferBaseUrl::parse("http://127.0.0.1:8080/").unwrap(),
+                WebTransferLimits {
+                    max_relays_global: 1,
+                    ..WebTransferLimits::default()
+                },
+                IceServerConfig {
+                    servers: Vec::new(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        registry.set_relay_admit_timeout(std::time::Duration::from_secs(10));
+        let member = MemberToken::from_bytes([0x95u8; 32]);
+        let owner = OwnerToken::from_bytes([0x96u8; 32]);
+        let lease =
+            OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), true).unwrap();
+        let room = lease.room().clone();
+        let source = generate_peer_id();
+        let (mut recipient_session, mut recipient_rx, _) =
+            PeerSession::establish(&registry, &room, generate_peer_id(), None).unwrap();
+        let (mut source_session, mut source_rx, _) =
+            PeerSession::establish(&registry, &room, source, None).unwrap();
+        let offer_hex = "cccccccccccccccccccccccccccccccc";
+        let mac = offer_fixture(&registry, &room, source, offer_hex);
+        let offer_id: crate::web_transfer::OfferId = offer_hex.parse().unwrap();
+        let digest = hex::encode(selection_digest(&offer_id, &mac, &["0".to_string()], "raw"));
+        assert!(
+            handle_text(
+                &registry,
+                &mut recipient_session,
+                &request_json(&"d".repeat(32), offer_hex, &digest)
+            )
+            .await
+        );
+        let (typ, _) = drain_text(&mut recipient_rx).await;
+        assert_eq!(typ, "ack");
+        let (typ, incoming) = drain_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.incoming");
+        let transfer_id = incoming["transferId"].as_str().unwrap().to_string();
+        let attempt_id = incoming["attemptId"].as_str().unwrap().to_string();
+        // The only slot is taken, so the ready below QUEUES rather than
+        // being admitted on the spot.
+        let held = registry.try_acquire_relay().unwrap();
+        let ready = serde_json::json!({
+            "v": 1,
+            "type": "transfer.source_ready",
+            "requestId": "a".repeat(32),
+            "body": {
+                "transferId": transfer_id,
+                "attemptId": attempt_id,
+                "selectionDigest": digest,
+            },
+        })
+        .to_string();
+        assert!(handle_text(&registry, &mut source_session, &ready).await);
+        let (typ, _) = drain_text(&mut source_rx).await;
+        assert_eq!(typ, "ack");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), recipient_rx.recv())
+                .await
+                .is_err(),
+            "nothing may be issued while the pool is full"
+        );
+        drop(held);
+        let (typ, ticket) = drain_text(&mut recipient_rx).await;
+        assert_eq!(typ, "transfer.relay_ticket");
+        assert_eq!(ticket["transferId"].as_str(), Some(transfer_id.as_str()));
+        let (typ, _) = drain_text(&mut source_rx).await;
+        assert_eq!(typ, "transfer.relay_ticket");
+        drop(lease);
     }
 
     #[tokio::test]

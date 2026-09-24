@@ -543,7 +543,8 @@ type ControlWs =
 
 /// A control peer whose socket is DRAINED by a background task.
 ///
-/// The server's per-peer outgoing queue holds 64 messages. A soak with 32
+/// The server's per-peer outgoing queue holds 64 messages at one carrier
+/// (`web_transfer_outgoing_cap`: 176 at eight). A soak with 32
 /// peers publishing 64 offers each broadcasts about two thousand events to
 /// every one of them, so a peer that reads only the message it is waiting for
 /// fills that queue and is dropped for being slow — the run would then

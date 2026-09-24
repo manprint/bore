@@ -345,10 +345,58 @@ async fn heartbeat_phase<S: AsyncRead + AsyncWrite + Unpin>(
 enum ResumeEnd<S> {
     /// Re-attached under a fresh epoch; heartbeat resumes.
     Resumed(OwnerSession<S>),
-    /// A clean event fired mid-backoff: give up (server grace expires it).
+    /// A clean event fired mid-backoff: one bounded resume-and-close was
+    /// tried ([`close_while_detached`]); if the server could not be reached
+    /// the owner grace ends the room.
     Clean,
     /// The grace ran out with no successful resume.
     Expired,
+}
+
+/// Ends a room whose owner control is DOWN, on the owner's own request.
+///
+/// A close is honoured only inside an owner session, so the one way to end a
+/// detached room early is to resume it and close it at once. Without this a
+/// Ctrl+C that landed during a network drop gave up and left the room — and
+/// its URL — live for the rest of the owner grace, while the README promises
+/// that Ctrl+C destroys the room immediately and names it as THE remedy for a
+/// leaked link. The server may well be unreachable (that is why the control
+/// is down), so the attempt is bounded and its failure changes nothing: the
+/// grace ends the room exactly as it would have.
+async fn close_while_detached<S, C, F>(connect: &mut C, owner_token: OwnerToken, room_id: RoomId)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    C: FnMut(ClientMessage) -> F,
+    F: Future<Output = Result<(Delimited<S>, ServerMessage)>>,
+{
+    let resumed = tokio::time::timeout(
+        OWNER_CLOSE_TIMEOUT,
+        connect(ClientMessage::ResumeWebTransferRoom {
+            version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+            room_id,
+            owner_token,
+        }),
+    )
+    .await;
+    if let Ok(Ok((
+        control,
+        ServerMessage::WebTransferRoomResumed {
+            version,
+            room_id: resumed_room_id,
+            owner_epoch,
+            ..
+        },
+    ))) = resumed
+    {
+        if version == WEB_TRANSFER_OWNER_PROTOCOL_VERSION && resumed_room_id == room_id {
+            let mut session = OwnerSession {
+                control,
+                room_id,
+                epoch: owner_epoch,
+            };
+            session.close_bounded().await;
+        }
+    }
 }
 
 /// Reconnects with resume-only backoff until the grace expires. This path
@@ -380,7 +428,10 @@ where
             event = lifecycle_rx.recv() => {
                 match event {
                     Some(OwnerLifecycle::Fatal) => bail!("owner fatal for room {room_id}"),
-                    _ => return Ok(ResumeEnd::Clean),
+                    _ => {
+                        close_while_detached(connect, owner_token, room_id).await;
+                        return Ok(ResumeEnd::Clean);
+                    }
                 }
             }
         }
@@ -969,6 +1020,105 @@ mod tests {
             .lock()
             .await
             .expect("fake create must have been called")
+    }
+
+    /// Ctrl+C while the owner control is DOWN must still end the room: one
+    /// bounded resume, then the in-session close the server honours. It
+    /// used to give up and leave the URL live for the rest of the grace,
+    /// against the README's "Ctrl+C destroys the room immediately".
+    /// Red-check: return `ResumeEnd::Clean` without `close_while_detached`
+    /// and `closes` stays empty.
+    #[tokio::test]
+    async fn interrupt_while_detached_resumes_once_and_closes() {
+        let room = RoomId::from_bytes([0x5au8; 16]);
+        let token = OwnerToken::from_bytes([0x5bu8; 32]);
+        let closes = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let mut connect = {
+            let closes = std::sync::Arc::clone(&closes);
+            move |first: ClientMessage| {
+                let closes = std::sync::Arc::clone(&closes);
+                async move {
+                    let ClientMessage::ResumeWebTransferRoom { room_id, .. } = first else {
+                        bail!("a detached close must RESUME, never create");
+                    };
+                    let (run_io, srv_io) = tokio::io::duplex(65536);
+                    let mut srv = Delimited::new(srv_io);
+                    tokio::spawn(async move {
+                        // Honour exactly what the real server honours: a close
+                        // naming the resumed room and its epoch ends the stream.
+                        while let Ok(Some(msg)) = srv.recv::<ClientMessage>().await {
+                            if let ClientMessage::CloseWebTransferRoom {
+                                room_id,
+                                owner_epoch: 3,
+                            } = msg
+                            {
+                                closes.lock().await.push(room_id);
+                                return;
+                            }
+                        }
+                    });
+                    Ok((
+                        Delimited::new(run_io),
+                        ServerMessage::WebTransferRoomResumed {
+                            version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+                            room_id,
+                            base_url: "http://127.0.0.1:8080".to_string(),
+                            owner_epoch: 3,
+                        },
+                    ))
+                }
+            }
+        };
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(4);
+        lifecycle_tx.send(OwnerLifecycle::Interrupt).await.unwrap();
+        let end = tokio::time::timeout(
+            Duration::from_secs(5),
+            resume_phase(
+                &mut connect,
+                token,
+                room,
+                Instant::now(),
+                Duration::from_secs(60),
+                &mut lifecycle_rx,
+            ),
+        )
+        .await
+        .expect("a detached close is bounded")
+        .unwrap();
+        assert!(matches!(end, ResumeEnd::Clean));
+        assert_eq!(*closes.lock().await, vec![room]);
+    }
+
+    /// The same Ctrl+C against a server that cannot be reached: the attempt
+    /// is bounded and the shutdown is not held hostage by it.
+    #[tokio::test]
+    async fn interrupt_while_detached_against_a_dead_server_still_ends_promptly() {
+        let room = RoomId::from_bytes([0x5cu8; 16]);
+        let token = OwnerToken::from_bytes([0x5du8; 32]);
+        let mut connect = |_first: ClientMessage| async move {
+            // Never answers: a black-holed server.
+            std::future::pending::<Result<(Delimited<tokio::io::DuplexStream>, ServerMessage)>>()
+                .await
+        };
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(4);
+        lifecycle_tx.send(OwnerLifecycle::Terminate).await.unwrap();
+        let started = Instant::now();
+        let end = tokio::time::timeout(
+            Duration::from_secs(5),
+            resume_phase(
+                &mut connect,
+                token,
+                room,
+                Instant::now(),
+                Duration::from_secs(60),
+                &mut lifecycle_rx,
+            ),
+        )
+        .await
+        .expect("a black-holed server must not pin shutdown")
+        .unwrap();
+        assert!(matches!(end, ResumeEnd::Clean));
+        assert!(started.elapsed() < OWNER_CLOSE_TIMEOUT * 3);
     }
 
     #[tokio::test]

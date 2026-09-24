@@ -11,6 +11,7 @@
 //! lands in a later phase). [`request`] parses the HTTP head, target and
 //! framing; [`response`] builds the fixed response byte sequences.
 
+mod framing;
 mod request;
 mod response;
 
@@ -20,6 +21,7 @@ use ring::rand::SecureRandom;
 
 use crate::basicauth::BasicAuth;
 
+pub use framing::{BodyFramer, FramingError, Progress, MAX_CHUNK_LINE};
 pub use request::{
     expects_continue, head_len, host_matches, parse_download_target, parse_head,
     parse_upload_target, preview_verdict, upload_framing, Framing, HeadError, Preview, RequestHead,

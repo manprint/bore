@@ -24,15 +24,15 @@ State writer: agent-1:opus coordinator session; ownership: active.
 - Active scope: plan 004 (tutte le fasi, fino a G-FINAL)
 - Scope result: RUNNING
 - Type: sub-phase
-- ID / attempt: — / —
-- Status: none
-- Intent: —
-- Assigned: —; supervisor: agent-1:opus
-- File / unit heading: —
-- Current step: none
-- Next action: aprire 0.2 (phase_01.md § 0.2) e delegarla
-- Next eligible plan unit: 0.2 (phase_01.md)
-- Unit base: 8d2032d4; branch: dev; owned changes: none
+- ID / attempt: 0.3 / 1
+- Status: OPEN
+- Intent: pompa di streaming a due task
+- Assigned: agent-2:sonnet (nuovo worker delegato); supervisor: agent-1:opus
+- File / unit heading: phase_01.md § 0.3
+- Current step: S1 (delegato)
+- Next action: attendere il worker, review (parallelismo, riciclo buffer, cancellazione), gate
+- Next eligible plan unit: 0.3 (phase_01.md)
+- Unit base: (dopo commit 0.2); branch: dev; owned changes: none
 - Repo state: HEAD 8d2032d4; tree pulito salvo `docs/plans/004_plan-FastLinkTransfer/` (artefatti di piano, da includere nel commit di 0.1)
 
 ## 2. Feature context and readiness
@@ -77,6 +77,7 @@ Required supervisor reviews cannot be silently replaced by weaker self-review.
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
 | plan | 004 / 1 | 1 | agent-1:opus | docs/plans/004_plan-FastLinkTransfer/* | recon + R1 probe locale + R2–R5 | unit:0.1:1 (incluso) |
+| sub-phase | 0.2 / 1 | 2 | agent-2:sonnet (worker), review agent-1:opus | src/fast_link/framing.rs NEW, mod.rs | G-U0 26/26; review: grammatica chunked conforme, skip dati in blocco, errori sticky; derive additive accettate | unit:0.2:1 |
 | sub-phase | 0.1 / 1 | 2 | agent-2:sonnet (worker), review agent-1:opus | src/lib.rs, src/fast_link/{mod,request,response}.rs NEW | G-FMT/G-CLIPPY/G-NODEF ok; G-U0 19/19; review: contratto ok, 3 deviazioni additive accettate (Debug su RequestHead, helper expect_err nei test, input CL 21 cifre) | unit:0.1:1 |
 
 Commit references match trailers PEV-Plan, PEV-Unit, PEV-Attempt, PEV-Result.
@@ -102,6 +103,7 @@ none
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
 | plan readiness | agent-1:opus | rev 1 | checklist Plan readiness; cold read di 0.4 | READY |
+| 0.2 | agent-1:opus | rev 2, diff src/fast_link/framing.rs | stati SizeDigits..Done, forward prefisso, overflow, LF nudo, trailer | APPROVED |
 | 0.1 | agent-1:opus | rev 1, diff src/fast_link/{mod,request,response}.rs | D19/D20 messaggi e ordine, nessuna credenziale in Debug/errori, regole parse/target/preview | APPROVED (nota authority → rev 2) |
 
 ## 8. Technical revisions and deviations
@@ -128,8 +130,8 @@ none
 | ID | Phase file | Depends on | Status | Attempt | Evidence / reason |
 |----|------------|------------|--------|---------|-------------------|
 | 0.1 | phase_01.md | none | DONE | 1 | G-U0 19/19, review ok |
-| 0.2 | phase_01.md | 0.1 | TODO | 1 | — |
-| 0.3 | phase_01.md | 0.2 | TODO | 1 | — |
+| 0.2 | phase_01.md | 0.1 | DONE | 1 | G-U0 26/26, review ok |
+| 0.3 | phase_01.md | 0.2 | IN_PROGRESS | 1 | — |
 | 0.4 | phase_01.md | 0.1, 0.2, 0.3 | TODO | 1 | — |
 | 1.1 | phase_02.md | P0 | TODO | 1 | — |
 | 1.2 | phase_02.md | 1.1 | TODO | 1 | — |
@@ -154,7 +156,7 @@ Statuses: TODO, IN_PROGRESS, IN_REVIEW, DONE, SKIPPED, BLOCKED.
 | ID/name | Owning unit | Gate | Status | Evidence |
 |---------|-------------|------|--------|----------|
 | resolve_* / generate_id / parse_* / upload_* / download_target / preview / host_matches / response_bytes_exact | 0.1 | G-U0 | PASS | 19/19 |
-| cl_* / chunked_* / error_is_sticky | 0.2 | G-U0 | TODO | — |
+| cl_* / chunked_* / error_is_sticky | 0.2 | G-U0 | PASS | 7/7 (26 totali) |
 | pump_* (8) incl. red-check `pump_writes_are_flushed_before_waiting` | 0.3 | G-U0 | TODO | — |
 | T-FL-S1..S12, S14..S16 | 0.4 | G-U0 | TODO | — |
 | reserved_label_reason_*, set_fast_link_*, config_and_metrics_publish_fast_link_*, server_fast_link_flags_* | 1.1 | G-U1 | TODO | — |

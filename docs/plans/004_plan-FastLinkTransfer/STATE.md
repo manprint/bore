@@ -23,17 +23,17 @@ State writer: agent-1:opus coordinator session; ownership: active.
 
 - Active scope: plan 004 (tutte le fasi, fino a G-FINAL)
 - Scope result: RUNNING
-- Type: phase closure
-- ID / attempt: P0 / 1
-- Status: OPEN
-- Intent: chiusura fase 0 (gate completi della fase, README invariato, review)
-- Assigned: agent-1:opus
-- File / unit heading: phase_01.md § Phase closure
-- Current step: S1
-- Next action: gate P0, commit P0, poi 1.1
+- Type: sub-phase
+- ID / attempt: 1.1 / 1
+- Status: TODO (prossima)
+- Intent: flag CLI/env, `Server::set_fast_link`, riserva etichetta (nativo + SSH), config/metrics admin API
+- Assigned: agent-2:sonnet (worker delegato); supervisor: agent-1:opus
+- File / unit heading: phase_02.md § 1.1
+- Current step: —
+- Next action: aprire 1.1 e delegare
 - Next eligible plan unit: 1.1 (phase_02.md)
-- Unit base: commit unit:0.4:1; branch: dev; owned changes: none
-- Repo state: HEAD = commit 0.4
+- Unit base: commit unit:P0:1; branch: dev; owned changes: none
+- Repo state: HEAD = commit P0
 
 ## 2. Feature context and readiness
 
@@ -77,6 +77,7 @@ Required supervisor reviews cannot be silently replaced by weaker self-review.
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
 | plan | 004 / 1 | 1 | agent-1:opus | docs/plans/004_plan-FastLinkTransfer/* | recon + R1 probe locale + R2–R5 | unit:0.1:1 (incluso) |
+| phase closure | P0 / 1 | 3 | agent-1:opus | STATE.md | G-FMT ok, G-CLIPPY 0 warning, G-NODEF compila, G-U0 52/52, lib completa 923/0 (baseline 871 + 52); README invariato (`git diff 8d2032d4 -- README.md` vuoto); review di tutto `src/fast_link/` | unit:P0:1 |
 | sub-phase | 0.4 / 1 | 3 | agent-2:sonnet (worker), review agent-1:opus | src/fast_link/session.rs NEW, mod.rs, pump.rs (tolto `allow(dead_code)`) | G-U0 52/52, loop 3x senza flake; review: stato D13 sotto lock mai attraverso `.await`, gauge idempotenti, re-arm solo con replay intatto (I-3), fallimenti senza terminatore (I-4), authority rev 2; fix del supervisore: scrittura head+replay al downloader e `# download started` limitate da `stall_timeout` (downloader che non legge bloccava l'upload per sempre) + nuovo test `a_downloader_that_never_reads_the_replay_is_bounded` red-checked; `debug_assert!(false)` su handoff chiuso → `warn!` (raggiungibile in una corsa); 4 deviazioni test accettate (S6 finestra 2 MiB/1 MiB, S7 duplex 32 KiB, S12 timeout reali brevi, read_link salta 100 Continue) | unit:0.4:1 |
 | sub-phase | 0.3 / 1 | 3 | agent-2:sonnet (worker), review agent-1:opus | src/fast_link/pump.rs NEW, mod.rs | G-U0 36/36; red-check flush (fallisce senza flush) e coalescenza (4096 msg senza); 3 deviazioni accettate (written sempre restituito, free_rx None→Cancelled, assert prefisso su abort) | unit:0.3:1 |
 | sub-phase | 0.2 / 1 | 2 | agent-2:sonnet (worker), review agent-1:opus | src/fast_link/framing.rs NEW, mod.rs | G-U0 26/26; review: grammatica chunked conforme, skip dati in blocco, errori sticky; derive additive accettate | unit:0.2:1 |
@@ -151,7 +152,7 @@ README obligation per phase: 0 → nessuna sezione cambia (verifica a P0); 1 →
 ### Phases
 | ID | File | Closure unit | Status | Review / commit reference |
 |----|------|--------------|--------|---------------------------|
-| 0 | phase_01.md | P0 | IN_PROGRESS | — |
+| 0 | phase_01.md | P0 | DONE | review agent-1:opus; unit:P0:1 |
 | 1 | phase_02.md | P1 | TODO | — |
 | 2 | phase_03.md | P2 | TODO | — |
 

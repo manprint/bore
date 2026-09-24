@@ -558,6 +558,10 @@ pub struct ConfigView {
     /// publishes infrastructure the admin view has no reason to expose.
     #[serde(default)]
     pub web_transfer_stun_count: Option<u64>,
+    /// Fast link transfer configuration, or `null` when the service is
+    /// disabled (D6). Never includes the upload credential.
+    #[serde(default)]
+    pub fast_link: Option<crate::fast_link::FastLinkConfigView>,
     /// Bind domain for control/tunnel endpoints.
     pub bind_domain: Option<String>,
     /// HSTS header value for HTTPS control port.
@@ -732,6 +736,10 @@ pub struct MetricsView {
     /// Cumulative admissions refused because a cap or rate was reached.
     #[serde(default)]
     pub web_transfer_rejected_total: Option<u64>,
+    /// Live fast link transfer gauges and totals, or `null` when the service
+    /// is disabled (D6). Never includes the upload credential.
+    #[serde(default)]
+    pub fast_link: Option<crate::fast_link::FastLinkMetricsView>,
     /// Number of SSH gateway tunnels (SecretProvider/Consumer/Vhost with Transport::Ssh).
     pub ssh_tunnels: usize,
     /// Count of native Bore transport tunnels.
@@ -861,6 +869,7 @@ mod tests {
             web_transfer_relay_rate_bytes_per_second: None,
             web_transfer_owner_grace_seconds: None,
             web_transfer_stun_count: None,
+            fast_link: None,
             bind_domain: None,
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]
@@ -942,6 +951,7 @@ mod tests {
             web_transfer_completed_total: None,
             web_transfer_cancelled_total: None,
             web_transfer_rejected_total: None,
+            fast_link: None,
             ssh_tunnels: 0,
             transport_bore: 0,
             transport_ssh: 0,
@@ -986,6 +996,7 @@ mod tests {
             web_transfer_completed_total: None,
             web_transfer_cancelled_total: None,
             web_transfer_rejected_total: None,
+            fast_link: None,
             ssh_tunnels: 0,
             transport_bore: 0,
             transport_ssh: 0,
@@ -1118,6 +1129,7 @@ mod tests {
             web_transfer_relay_rate_bytes_per_second: None,
             web_transfer_owner_grace_seconds: None,
             web_transfer_stun_count: None,
+            fast_link: None,
             bind_domain: None,
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]

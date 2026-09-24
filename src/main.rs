@@ -1022,6 +1022,31 @@ enum Command {
         /// Parallel WebRTC connections one direct web-transfer uses (1..=8).
         #[clap(long, value_name = "N", default_value_t = bore_cli::web_transfer::WebTransferLimits::default().direct_carriers, env = "BORE_WEB_TRANSFER_DIRECT_CARRIERS")]
         web_transfer_direct_carriers: u64,
+
+        /// Enable the fast link transfer service (`curl -T` one-shot upload/download).
+        #[clap(long, env = "BORE_FAST_LINK_TRANSFER_ENABLED")]
+        fast_link_transfer: bool,
+
+        /// Dedicated vhost subdomain the fast link transfer service serves.
+        #[clap(long, value_name = "HOST", env = "BORE_FAST_LINK_TRANSFER_VHOST")]
+        fast_link_transfer_vhost: Option<String>,
+
+        /// Upload-only HTTP Basic credential (`USER:PASS`) for fast link transfer.
+        #[clap(
+            long,
+            value_name = "USER:PASS",
+            env = "BORE_FAST_LINK_TRANSFER_AUTH",
+            hide_env_values = true
+        )]
+        fast_link_transfer_auth: Option<String>,
+
+        /// Seconds a fast link transfer upload waits for a downloader.
+        #[clap(long, value_name = "SECS", default_value_t = bore_cli::fast_link::DEFAULT_WAIT_TIMEOUT_SECS, env = "BORE_FAST_LINK_TRANSFER_WAIT_TIMEOUT")]
+        fast_link_transfer_wait_timeout: u64,
+
+        /// Maximum concurrent fast link transfer uploads.
+        #[clap(long, value_name = "N", default_value_t = bore_cli::fast_link::DEFAULT_MAX_ACTIVE, env = "BORE_FAST_LINK_TRANSFER_MAX_ACTIVE")]
+        fast_link_transfer_max_active: usize,
     },
 
     /// Diagnose this host's UDP / NAT / firewall for hole-punching (opens no
@@ -2666,6 +2691,11 @@ async fn dispatch(command: Command) -> Result<()> {
             web_transfer_relay_rate,
             web_transfer_owner_grace,
             web_transfer_direct_carriers,
+            fast_link_transfer,
+            fast_link_transfer_vhost,
+            fast_link_transfer_auth,
+            fast_link_transfer_wait_timeout,
+            fast_link_transfer_max_active,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -2918,6 +2948,33 @@ async fn dispatch(command: Command) -> Result<()> {
                     server.set_vhost_config_path(config_path.clone());
                 }
             }
+            // Fast link transfer (D4/D19/D20): every input is validated in
+            // `resolve_server_config`, never duplicated in clap. Must follow
+            // `set_vhost`/`set_tls` (needs the live vhost base domain and
+            // HTTPS state) and precede `set_ssh_gateway`/`listen` (reserves
+            // the vhost label against SSH registrations too).
+            let fast_link_args = bore_cli::fast_link::FastLinkServerArgs {
+                enabled: fast_link_transfer,
+                vhost: fast_link_transfer_vhost,
+                auth: fast_link_transfer_auth,
+                wait_timeout_secs: fast_link_transfer_wait_timeout,
+                max_active: fast_link_transfer_max_active,
+            };
+            let resolution = bore_cli::fast_link::resolve_server_config(
+                &fast_link_args,
+                server.vhost_base_domain().as_deref(),
+            )?;
+            for flag in &resolution.ignored {
+                warn!(
+                    flag,
+                    "fast link transfer is disabled (--fast-link-transfer / BORE_FAST_LINK_TRANSFER_ENABLED=true); ignoring this setting"
+                );
+            }
+            if let Some(config) = resolution.config {
+                let host = config.host.clone();
+                server.set_fast_link(config)?;
+                info!(%host, "fast link transfer enabled");
+            }
             // Build and store the server configuration snapshot (D11: sanitized, no secrets).
             let udp_socket_send_buffer =
                 bore_cli::shared::parse_size_bytes(&udp_socket_send_buffer).map(|b| b as usize);
@@ -2962,6 +3019,10 @@ async fn dispatch(command: Command) -> Result<()> {
                 web_transfer_relay_rate_bytes_per_second: None,
                 web_transfer_owner_grace_seconds: None,
                 web_transfer_stun_count: None,
+                // Always None in the snapshot: `admin_api::config` overlays
+                // the live `Server::fast_link()` view on every read, so a
+                // disabled server publishes null, never an object (D6).
+                fast_link: None,
                 bind_domain: bind_domain.clone(),
                 control_hsts,
                 #[cfg(feature = "vpn")]
@@ -5260,5 +5321,86 @@ mod tests {
             "stun:stun.example.com:3478",
         ]);
         assert!(result.is_err(), "clap must reject the conflicting pair");
+    }
+
+    #[test]
+    fn server_fast_link_flags_parse_and_default() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        for var in [
+            "BORE_FAST_LINK_TRANSFER_ENABLED",
+            "BORE_FAST_LINK_TRANSFER_VHOST",
+            "BORE_FAST_LINK_TRANSFER_AUTH",
+            "BORE_FAST_LINK_TRANSFER_WAIT_TIMEOUT",
+            "BORE_FAST_LINK_TRANSFER_MAX_ACTIVE",
+        ] {
+            std::env::remove_var(var);
+        }
+
+        // No flags: every value at its default, feature off.
+        let args = Args::parse_from(["bore", "server"]);
+        let Command::Server {
+            fast_link_transfer,
+            fast_link_transfer_vhost,
+            fast_link_transfer_auth,
+            fast_link_transfer_wait_timeout,
+            fast_link_transfer_max_active,
+            ..
+        } = args.command
+        else {
+            panic!("expected server command");
+        };
+        assert!(!fast_link_transfer);
+        assert_eq!(fast_link_transfer_vhost, None);
+        assert_eq!(fast_link_transfer_auth, None);
+        assert_eq!(
+            fast_link_transfer_wait_timeout,
+            bore_cli::fast_link::DEFAULT_WAIT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            fast_link_transfer_max_active,
+            bore_cli::fast_link::DEFAULT_MAX_ACTIVE
+        );
+
+        // All 5 flags: parsed values, and `BORE_FAST_LINK_TRANSFER_AUTH` must
+        // never leak into a `--help`/error message (`hide_env_values = true`).
+        let args = Args::parse_from([
+            "bore",
+            "server",
+            "--fast-link-transfer",
+            "--fast-link-transfer-vhost",
+            "fast.bore.tld",
+            "--fast-link-transfer-auth",
+            "u:supersecretpassword",
+            "--fast-link-transfer-wait-timeout",
+            "120",
+            "--fast-link-transfer-max-active",
+            "7",
+        ]);
+        let Command::Server {
+            fast_link_transfer,
+            fast_link_transfer_vhost,
+            fast_link_transfer_auth,
+            fast_link_transfer_wait_timeout,
+            fast_link_transfer_max_active,
+            ..
+        } = args.command
+        else {
+            panic!("expected server command");
+        };
+        assert!(fast_link_transfer);
+        assert_eq!(fast_link_transfer_vhost.as_deref(), Some("fast.bore.tld"));
+        assert_eq!(
+            fast_link_transfer_auth.as_deref(),
+            Some("u:supersecretpassword")
+        );
+        assert_eq!(fast_link_transfer_wait_timeout, 120);
+        assert_eq!(fast_link_transfer_max_active, 7);
+
+        // `hide_env_values = true`: with the credential set via env, `--help`
+        // must never echo it.
+        std::env::set_var("BORE_FAST_LINK_TRANSFER_AUTH", "u:supersecretpassword");
+        let err = Args::try_parse_from(["bore", "server", "--help"]).unwrap_err();
+        assert!(!err.to_string().contains("supersecretpassword"));
+        std::env::remove_var("BORE_FAST_LINK_TRANSFER_AUTH");
     }
 }

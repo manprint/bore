@@ -464,6 +464,7 @@ fn t_views_serialize_stable() {
         web_transfer_relay_rate_bytes_per_second: None,
         web_transfer_owner_grace_seconds: None,
         web_transfer_stun_count: None,
+        fast_link: None,
         bind_domain: None,
         control_hsts: "max-age=31536000".into(),
         #[cfg(feature = "vpn")]
@@ -707,6 +708,7 @@ fn t_views_serialize_stable() {
         web_transfer_completed_total: None,
         web_transfer_cancelled_total: None,
         web_transfer_rejected_total: None,
+        fast_link: None,
         ssh_tunnels: 0,
         transport_bore: 0,
         transport_ssh: 0,

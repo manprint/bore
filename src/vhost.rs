@@ -193,6 +193,25 @@ pub fn extract_subdomain(host: &str, base_domain: &str) -> Option<String> {
     Some(label.to_string())
 }
 
+/// A vhost subdomain label reserved for the fast link transfer service (D16),
+/// set at most once (`OnceLock`) when `Server::set_fast_link` succeeds and
+/// shared with [`crate::sshgw::SshGateway`]. `None`/unset means no label is
+/// reserved.
+pub type ReservedVhostLabel = std::sync::Arc<std::sync::OnceLock<String>>;
+
+/// If `label` (case-insensitive) is the reserved fast link transfer label,
+/// return the human-readable rejection reason; otherwise `None`.
+pub fn reserved_label_reason(label: &str, reserved: &ReservedVhostLabel) -> Option<String> {
+    let reserved_label = reserved.get()?;
+    if reserved_label.eq_ignore_ascii_case(label) {
+        Some(format!(
+            "subdomain '{label}' is reserved for the fast link transfer service"
+        ))
+    } else {
+        None
+    }
+}
+
 /// Outcome of a route decision.
 #[derive(Debug, PartialEq)]
 pub enum RouteDecision {
@@ -2218,6 +2237,26 @@ mod tests {
             extract_subdomain("MySub.Bore.Example.Com", "bore.example.com"),
             Some("mysub".to_string())
         );
+    }
+
+    // ── reserved_label_reason ──────────────────────────────────────────────
+
+    #[test]
+    fn reserved_label_reason_is_case_insensitive_and_empty_when_unset() {
+        let reserved: ReservedVhostLabel = Arc::new(std::sync::OnceLock::new());
+        // Unset: never reserved, whatever the label.
+        assert_eq!(reserved_label_reason("fast", &reserved), None);
+
+        reserved.set("Fast".to_string()).unwrap();
+        assert_eq!(
+            reserved_label_reason("fast", &reserved),
+            Some("subdomain 'fast' is reserved for the fast link transfer service".to_string())
+        );
+        assert_eq!(
+            reserved_label_reason("FAST", &reserved),
+            Some("subdomain 'FAST' is reserved for the fast link transfer service".to_string())
+        );
+        assert_eq!(reserved_label_reason("other", &reserved), None);
     }
 
     #[test]

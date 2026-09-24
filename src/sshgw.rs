@@ -381,6 +381,10 @@ pub struct SshGateway {
     /// `force-https=on` when the client's `Host` header is absent (same
     /// fallback the native `edge::accept` path uses).
     bind_domain: Option<String>,
+    /// The vhost subdomain label reserved for the fast link transfer service
+    /// (D16), shared with `Server`; unset when fast link transfer is
+    /// disabled.
+    reserved_vhost_label: crate::vhost::ReservedVhostLabel,
 }
 
 impl SshGateway {
@@ -407,6 +411,7 @@ impl SshGateway {
         conn_rejections: Arc<AtomicU64>,
         tls: Option<tokio_rustls::TlsAcceptor>,
         bind_domain: Option<String>,
+        reserved_vhost_label: crate::vhost::ReservedVhostLabel,
     ) -> Result<Self> {
         config.validate()?;
         // A window below one maximum packet would wedge every channel; clamp up
@@ -445,6 +450,7 @@ impl SshGateway {
             conn_rejections,
             tls,
             bind_domain,
+            reserved_vhost_label,
         })
     }
 
@@ -1151,6 +1157,13 @@ impl GatewayHandler {
             self.state.queue_message(format!(
                 "bore ssh-gateway: this key's permit= list does not allow vhost/{label}"
             ));
+            return Ok(false);
+        }
+        if let Some(reason) =
+            crate::vhost::reserved_label_reason(&label, &self.gateway.reserved_vhost_label)
+        {
+            self.state
+                .queue_message(format!("bore ssh-gateway: {reason}"));
             return Ok(false);
         }
         if matches!(
@@ -4198,6 +4211,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             None,
             None,
+            Arc::new(std::sync::OnceLock::new()),
         )
     }
 

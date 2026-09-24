@@ -518,6 +518,15 @@ pub struct Server {
     /// makes a disabled server publish `null` and never a zero.
     web_transfer_view: Option<WebTransferConfigView>,
 
+    /// Fast link transfer engine; `None` keeps every legacy path unchanged
+    /// (I-1). Set at most once by `set_fast_link`.
+    fast_link: Option<Arc<crate::fast_link::FastLink>>,
+
+    /// The vhost subdomain label reserved for the fast link transfer service
+    /// (D16), shared with [`crate::sshgw::SshGateway`]. Unset when fast link
+    /// transfer is disabled.
+    reserved_vhost_label: crate::vhost::ReservedVhostLabel,
+
     /// Registry of live public-tunnel UDP direct paths, keyed by `port:{N}`.
     #[cfg(feature = "udp")]
     public_udp_registry: Arc<DashMap<String, Arc<PublicDirectEntry>>>,
@@ -683,6 +692,8 @@ impl Server {
             vhost_config_path: None,
             web_transfer: None,
             web_transfer_view: None,
+            fast_link: None,
+            reserved_vhost_label: Arc::new(std::sync::OnceLock::new()),
             #[cfg(feature = "udp")]
             public_udp_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "udp")]
@@ -754,6 +765,7 @@ impl Server {
                 web_transfer_owner_grace_seconds: None,
                 web_transfer_stun_count: None,
                 web_transfer_base_origin: None,
+                fast_link: None,
                 bind_domain: None,
                 control_hsts: "max-age=31536000".into(),
                 #[cfg(feature = "vpn")]
@@ -941,6 +953,70 @@ impl Server {
     /// Shared web-transfer room registry, or `None` when disabled.
     pub fn web_transfer(&self) -> Option<Arc<crate::web_transfer::WebTransferRegistry>> {
         self.web_transfer.clone()
+    }
+
+    /// The live vhost base domain (e.g. `bore.mydomain.com`), or `None` when
+    /// the vhost frontend is not configured.
+    pub fn vhost_base_domain(&self) -> Option<String> {
+        self.vhost_config
+            .as_ref()
+            .map(|cfg| cfg.read().unwrap().base_domain.clone())
+    }
+
+    /// Enable the fast link transfer service from an already-validated
+    /// configuration (D20). Requires the vhost frontend, HTTPS on either the
+    /// vhost frontend or the control port, and a host distinct from the
+    /// web-transfer origin; reserves the vhost label against native and SSH
+    /// registrations (D16) and refuses a second call.
+    pub fn set_fast_link(&mut self, config: crate::fast_link::FastLinkConfig) -> Result<()> {
+        if self.vhost_config.is_none() {
+            anyhow::bail!(
+                "fast link transfer requires the vhost frontend (--vhost-config or --vhost-base-domain)"
+            );
+        }
+
+        // A loaded vhost certificate is not enough on its own: `mode: http`
+        // keeps the HTTPS frontend closed, and a fast host reachable only
+        // over plain HTTP could never serve a single upload (D9).
+        let vhost_https = self.vhost_tls.read().unwrap().is_some()
+            && self.vhost_config.as_ref().is_some_and(|cfg| {
+                let cfg = cfg.read().unwrap();
+                vhost::resolve_mode(&cfg, vhost::cert_present(&cfg))
+                    .is_ok_and(|mode| mode.serves_https())
+            });
+        if !vhost_https && self.tls.is_none() {
+            anyhow::bail!(
+                "fast link transfer requires HTTPS: configure --vhost-cert-file/--vhost-key-file or the control port --cert-file/--key-file"
+            );
+        }
+
+        if let Some(web_transfer) = &self.web_transfer {
+            if web_transfer_http::host_matches_authority(
+                &config.host,
+                &web_transfer.config().base_url,
+            ) {
+                let host = &config.host;
+                anyhow::bail!(
+                    "fast link transfer host '{host}' is also the web transfer origin; use a different label"
+                );
+            }
+        }
+
+        self.reserved_vhost_label
+            .set(config.label.clone())
+            .map_err(|_| anyhow::anyhow!("fast link transfer is already configured"))?;
+
+        self.fast_link = Some(Arc::new(crate::fast_link::FastLink::new(
+            config,
+            Arc::clone(&self.total_rx_bytes),
+            Arc::clone(&self.total_tx_bytes),
+        )));
+        Ok(())
+    }
+
+    /// Shared fast link transfer engine, or `None` when disabled.
+    pub fn fast_link(&self) -> Option<Arc<crate::fast_link::FastLink>> {
+        self.fast_link.clone()
     }
 
     /// Set the direct-UDP transport tuning brokered to peers.
@@ -1406,6 +1482,7 @@ impl Server {
             Arc::clone(&self.conn_rejections),
             self.tls.clone(),
             self.bind_domain.clone(),
+            Arc::clone(&self.reserved_vhost_label),
         )?;
         self.ssh_gateway = Some(Arc::new(gateway));
         let view = Arc::make_mut(&mut self.config_view);
@@ -2476,6 +2553,13 @@ impl Server {
                         .await;
                     return Ok(());
                 };
+                if let Some(reason) =
+                    vhost::reserved_label_reason(&subdomain, &self.reserved_vhost_label)
+                {
+                    warn!(%reason, "vhost registration rejected");
+                    let _ = control.send(ServerMessage::Error(reason)).await;
+                    return Ok(());
+                }
                 vhost::serve_vhost_provider(
                     control,
                     opener,
@@ -3774,5 +3858,141 @@ mod web_transfer_config_tests {
         let view = serde_json::to_value(plain.config_view().as_ref()).unwrap();
         assert_eq!(view["web_transfer_enabled"], false);
         assert!(view["web_transfer_max_rooms"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod fast_link_config_tests {
+    use super::Server;
+    use crate::vhost::{VhostConfig, VhostModeCfg};
+
+    fn vhost_cfg(base_domain: &str) -> VhostConfig {
+        VhostConfig {
+            base_domain: base_domain.to_string(),
+            mode: VhostModeCfg::Http,
+            http_port: 0,
+            https_port: 0,
+            cert_file: None,
+            key_file: None,
+            default_headers: Default::default(),
+            default_response_headers: Default::default(),
+            reservations: Vec::new(),
+        }
+    }
+
+    fn fast_config(host: &str) -> crate::fast_link::FastLinkConfig {
+        crate::fast_link::FastLinkConfig {
+            host: host.to_string(),
+            label: host.split('.').next().unwrap().to_string(),
+            auth: crate::basicauth::BasicAuth::parse("u:p").unwrap(),
+            wait_timeout: std::time::Duration::from_secs(3600),
+            max_active: 32,
+        }
+    }
+
+    /// A self-signed certificate covering `fast.bore.tld`, built entirely in
+    /// memory (no disk I/O): enough to make the control-port HTTPS check pass.
+    fn test_tls_acceptor() -> tokio_rustls::TlsAcceptor {
+        let cert = rcgen::generate_simple_self_signed(vec!["fast.bore.tld".to_string()])
+            .expect("self-signed cert");
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.signing_key.serialize_pem();
+        crate::transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())
+            .expect("build TLS acceptor")
+    }
+
+    /// D20: every validation `Server::set_fast_link` performs, in order, each
+    /// with its exact error message, plus the success case.
+    #[test]
+    fn set_fast_link_requires_vhost_https_and_a_distinct_web_origin() {
+        // 1. No vhost frontend configured at all.
+        let mut server = Server::new(20200..=20200, None);
+        let err = server
+            .set_fast_link(fast_config("fast.bore.tld"))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "fast link transfer requires the vhost frontend (--vhost-config or --vhost-base-domain)"
+        );
+
+        // 2. Vhost configured, but no HTTPS anywhere (no vhost cert, no
+        //    control-port TLS).
+        let mut server = Server::new(20201..=20201, None);
+        server.set_vhost(vhost_cfg("bore.tld")).unwrap();
+        let err = server
+            .set_fast_link(fast_config("fast.bore.tld"))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "fast link transfer requires HTTPS: configure --vhost-cert-file/--vhost-key-file or the control port --cert-file/--key-file"
+        );
+
+        // 2b. A vhost certificate is loaded but `mode: http` keeps the HTTPS
+        //     frontend closed: still no HTTPS. The same certificate under
+        //     `mode: auto` serves HTTPS and is accepted.
+        let dir = tempfile::tempdir().unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["*.bore.tld".to_string()]).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+        let with_cert = |mode: VhostModeCfg| VhostConfig {
+            mode,
+            cert_file: Some(cert_path.clone()),
+            key_file: Some(key_path.clone()),
+            ..vhost_cfg("bore.tld")
+        };
+        let mut server = Server::new(20205..=20205, None);
+        server.set_vhost(with_cert(VhostModeCfg::Http)).unwrap();
+        let err = server
+            .set_fast_link(fast_config("fast.bore.tld"))
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .starts_with("fast link transfer requires HTTPS"));
+        let mut server = Server::new(20206..=20206, None);
+        server.set_vhost(with_cert(VhostModeCfg::Auto)).unwrap();
+        server.set_fast_link(fast_config("fast.bore.tld")).unwrap();
+
+        // 3. HTTPS present (control port), but the host is also the web
+        //    transfer origin.
+        let mut server = Server::new(20202..=20202, None);
+        server.set_vhost(vhost_cfg("bore.tld")).unwrap();
+        server.set_tls(test_tls_acceptor());
+        let web_args = crate::web_transfer::WebTransferServerArgs {
+            base_url: Some("https://fast.bore.tld".to_string()),
+            ..crate::web_transfer::WebTransferServerArgs::default()
+        };
+        let web_config = crate::web_transfer::resolve_server_config(&web_args, false, 7835)
+            .unwrap()
+            .unwrap();
+        server.set_web_transfer(web_config).unwrap();
+        let err = server
+            .set_fast_link(fast_config("fast.bore.tld"))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "fast link transfer host 'fast.bore.tld' is also the web transfer origin; use a different label"
+        );
+
+        // 4. Already configured: a second call is rejected even for a
+        //    different host.
+        let mut server = Server::new(20203..=20203, None);
+        server.set_vhost(vhost_cfg("bore.tld")).unwrap();
+        server.set_tls(test_tls_acceptor());
+        server.set_fast_link(fast_config("fast.bore.tld")).unwrap();
+        let err = server
+            .set_fast_link(fast_config("other.bore.tld"))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "fast link transfer is already configured");
+
+        // Ok case: vhost + HTTPS + a distinct host, first call.
+        let mut server = Server::new(20204..=20204, None);
+        server.set_vhost(vhost_cfg("bore.tld")).unwrap();
+        server.set_tls(test_tls_acceptor());
+        server.set_fast_link(fast_config("fast.bore.tld")).unwrap();
+        let fast = server.fast_link().expect("fast link installed");
+        assert_eq!(fast.host(), "fast.bore.tld");
+        assert_eq!(fast.label(), "fast");
     }
 }

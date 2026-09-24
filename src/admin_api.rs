@@ -752,6 +752,7 @@ pub fn config(server: &Server) -> ConfigView {
         let mut view = (*server.config_view()).clone();
         overlay_vhost_config(&mut view, server);
         overlay_runtime_tunables(&mut view, server);
+        view.fast_link = server.fast_link().map(|f| f.config_view());
 
         // Populate SSH gateway config from the running gateway instance.
         if let Some(gateway) = server.ssh_gateway() {
@@ -773,6 +774,7 @@ pub fn config(server: &Server) -> ConfigView {
         let mut view = (*server.config_view()).clone();
         overlay_vhost_config(&mut view, server);
         overlay_runtime_tunables(&mut view, server);
+        view.fast_link = server.fast_link().map(|f| f.config_view());
         view
     }
 }
@@ -880,6 +882,7 @@ pub fn metrics(server: &Server) -> MetricsView {
         web_transfer_completed_total: web_gauge(|r| r.completed_total()),
         web_transfer_cancelled_total: web_gauge(|r| r.cancelled_total()),
         web_transfer_rejected_total: web_gauge(|r| r.rejected_total()),
+        fast_link: server.fast_link().map(|f| f.metrics_view()),
         ssh_tunnels,
         transport_bore,
         transport_ssh,
@@ -1581,6 +1584,7 @@ reservations:
             web_transfer_completed_total: None,
             web_transfer_cancelled_total: None,
             web_transfer_rejected_total: None,
+            fast_link: None,
             ssh_tunnels: 0,
             transport_bore: 0,
             transport_ssh: 0,
@@ -1753,6 +1757,7 @@ reservations:
             web_transfer_relay_rate_bytes_per_second: None,
             web_transfer_owner_grace_seconds: None,
             web_transfer_stun_count: None,
+            fast_link: None,
             bind_domain: None,
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]
@@ -1864,6 +1869,7 @@ reservations:
             web_transfer_relay_rate_bytes_per_second: None,
             web_transfer_owner_grace_seconds: None,
             web_transfer_stun_count: None,
+            fast_link: None,
             bind_domain: Some("bore.example.com".into()),
             control_hsts: "max-age=31536000".into(),
             #[cfg(feature = "vpn")]
@@ -2088,5 +2094,79 @@ reservations:
         assert_eq!(json["webserver_log"], true);
         assert_eq!(json["relay_tx_bytes"], 1024);
         assert_eq!(json["uptime_secs"], 600);
+    }
+
+    /// D6: a server without fast link transfer publishes `null` in both
+    /// `config` and `metrics`; a server with it publishes an object carrying
+    /// the configured host/timeout/cap/replay window and never the upload
+    /// credential (Basic `u:supersecretpassword`, neither raw nor base64).
+    #[test]
+    fn config_and_metrics_publish_fast_link_only_when_enabled() {
+        let disabled = Server::new(20700..=20700, None);
+        assert!(config(&disabled).fast_link.is_none());
+        assert!(metrics(&disabled).fast_link.is_none());
+
+        let mut server = Server::new(20701..=20701, None);
+        let vhost_cfg = crate::vhost::VhostConfig {
+            base_domain: "bore.tld".to_string(),
+            mode: crate::vhost::VhostModeCfg::Http,
+            http_port: 0,
+            https_port: 0,
+            cert_file: None,
+            key_file: None,
+            default_headers: Default::default(),
+            default_response_headers: Default::default(),
+            reservations: Vec::new(),
+        };
+        server.set_vhost(vhost_cfg).expect("install vhost config");
+
+        let cert = rcgen::generate_simple_self_signed(vec!["fast.bore.tld".to_string()])
+            .expect("self-signed cert");
+        let acceptor = crate::transport::server_tls_from_pem(
+            cert.cert.pem().as_bytes(),
+            cert.signing_key.serialize_pem().as_bytes(),
+        )
+        .expect("build TLS acceptor");
+        server.set_tls(acceptor);
+
+        let fast_config = crate::fast_link::FastLinkConfig {
+            host: "fast.bore.tld".to_string(),
+            label: "fast".to_string(),
+            auth: crate::basicauth::BasicAuth::parse("u:supersecretpassword").unwrap(),
+            wait_timeout: std::time::Duration::from_secs(120),
+            max_active: 7,
+        };
+        server
+            .set_fast_link(fast_config)
+            .expect("install fast link config");
+
+        let config_view = config(&server);
+        let fast_config_view = config_view.fast_link.as_ref().expect("fast_link present");
+        assert_eq!(fast_config_view.host, "fast.bore.tld");
+        assert_eq!(fast_config_view.wait_timeout_seconds, 120);
+        assert_eq!(fast_config_view.max_active, 7);
+        assert_eq!(
+            fast_config_view.replay_window_bytes,
+            crate::fast_link::REPLAY_WINDOW_BYTES as u64
+        );
+
+        let metrics_view = metrics(&server);
+        assert!(metrics_view.fast_link.is_some());
+
+        let config_json = serde_json::to_string(&config_view).unwrap();
+        let metrics_json = serde_json::to_string(&metrics_view).unwrap();
+        // `dTpzdXBlcnNlY3JldHBhc3N3b3Jk` is the base64 of `u:supersecretpassword`
+        // (the exact `Authorization: Basic` token `BasicAuth` compares
+        // against); precomputed rather than depending on a base64 crate.
+        for secret in ["supersecretpassword", "dTpzdXBlcnNlY3JldHBhc3N3b3Jk"] {
+            assert!(
+                !config_json.contains(secret),
+                "config JSON must never contain the credential"
+            );
+            assert!(
+                !metrics_json.contains(secret),
+                "metrics JSON must never contain the credential"
+            );
+        }
     }
 }
